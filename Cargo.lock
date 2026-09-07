@@ -949,6 +949,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kio-process"
+version = "0.1.0-rc.3"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "kio-search"
 version = "0.1.0-rc.3"
 dependencies = [

@@ -6,6 +6,7 @@ members = [
     "crates/kio-eval",
     "crates/kio-index",
     "crates/kio-pipeline",
+    "crates/kio-process",
     "crates/kio-search",
 ]
 resolver = "3"
@@ -22,6 +23,7 @@ clap = { version = "4.6", features = ["derive"] }
 kio-core = { path = "crates/kio-core" }
 kio-index = { path = "crates/kio-index" }
 kio-pipeline = { path = "crates/kio-pipeline" }
+kio-process = { path = "crates/kio-process" }
 kio-search = { path = "crates/kio-search" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -50,3 +52,4 @@ ureq = { version = "3.4", default-features = false, features = ["json", "rustls"
 rusqlite = { version = "0.40", features = ["bundled", "fallible_uint"] }
 windows-sys = { version = "0.61.2", features = ["Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_IO", "Win32_System_Threading", "Win32_UI_Shell"] }
 sqlite-vec = "0.1.9"
+tempfile = "3"
