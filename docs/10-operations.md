@@ -1053,7 +1053,7 @@ Reading Path の正本は [README.md §1](README.md)。docs/ 直下のファイ�
 双方の運用正本である。公開済み `v0.1.0-rc.1` archive 内の `OPERATIONS.md` は immutable な
 published artifact bytes であり、本修正では差し替えない。本節の更新は main と将来の candidate に
 適用する。
-RC version の正本は workspace package version であり、現在の候補は `0.1.0-rc.2` とする。
+RC version の正本は workspace package version であり、現在の候補は `0.1.0-rc.3` とする。
 platform support policy は [09-mvp-scope.md §1.2](09-mvp-scope.md) だけを正本とし、
 macOS / Linux は `supported`、Windows は `experimental` とする。
 
@@ -1061,8 +1061,8 @@ macOS / Linux は `supported`、Windows は `experimental` とする。
 一組として保持する。
 
 ```text
-kio-0.1.0-rc.2-<target>.tar.gz
-kio-0.1.0-rc.2-<target>.checksums.json
+kio-0.1.0-rc.3-<target>.tar.gz
+kio-0.1.0-rc.3-<target>.checksums.json
 smoke.json
 ```
 
@@ -1139,10 +1139,10 @@ verification 済み archive を新しい directory へ展開し、archive 内 bi
 build tree の `target/release` を直接 install してはならない。
 
 ```sh
-tar -xzf kio-0.1.0-rc.2-<target>.tar.gz
-./kio-0.1.0-rc.2-<target>/bin/kio --version
+tar -xzf kio-0.1.0-rc.3-<target>.tar.gz
+./kio-0.1.0-rc.3-<target>/bin/kio --version
 install -d "$HOME/.local/bin"
-install -m 0755 ./kio-0.1.0-rc.2-<target>/bin/kio "$HOME/.local/bin/kio"
+install -m 0755 ./kio-0.1.0-rc.3-<target>/bin/kio "$HOME/.local/bin/kio"
 ```
 
 `$HOME/.local/bin` を `PATH` へ追加する操作は shell 設定の所有者が明示的に行う。system directory
@@ -1161,9 +1161,9 @@ PowerShell で verification 済み archive を新しい directory へ展開し�
 `kio.exe` を copy する。PATH の永続変更は自動化しない。
 
 ```powershell
-tar -xzf kio-0.1.0-rc.2-x86_64-pc-windows-msvc.tar.gz
+tar -xzf kio-0.1.0-rc.3-x86_64-pc-windows-msvc.tar.gz
 New-Item -ItemType Directory -Force "$env:LOCALAPPDATA\Kio\bin" | Out-Null
-Copy-Item ".\kio-0.1.0-rc.2-x86_64-pc-windows-msvc\bin\kio.exe" "$env:LOCALAPPDATA\Kio\bin\kio.exe"
+Copy-Item ".\kio-0.1.0-rc.3-x86_64-pc-windows-msvc\bin\kio.exe" "$env:LOCALAPPDATA\Kio\bin\kio.exe"
 & "$env:LOCALAPPDATA\Kio\bin\kio.exe" --version
 ```
 

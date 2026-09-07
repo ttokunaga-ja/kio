@@ -817,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "kio-adapter"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "base64",
  "getrandom 0.4.3",
@@ -837,7 +837,7 @@ dependencies = [
 
 [[package]]
 name = "kio-cli"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "assert_cmd",
  "base64",
@@ -864,7 +864,7 @@ dependencies = [
 
 [[package]]
 name = "kio-core"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "cap-primitives",
  "jsonschema",
@@ -882,7 +882,7 @@ dependencies = [
 
 [[package]]
 name = "kio-eval"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "base64",
  "cap-primitives",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "kio-index"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "cap-primitives",
  "getrandom 0.4.3",
@@ -929,7 +929,7 @@ dependencies = [
 
 [[package]]
 name = "kio-pipeline"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "cap-primitives",
  "getrandom 0.4.3",
@@ -950,7 +950,7 @@ dependencies = [
 
 [[package]]
 name = "kio-search"
-version = "0.1.0-rc.2"
+version = "0.1.0-rc.3"
 dependencies = [
  "base64",
  "serde",
