@@ -28541,7 +28541,7 @@ mod tests {
 
         let private_root = PathBuf::from(std::env::var_os("KIO_TEST_BUDGET_MONTH_CHILD").unwrap());
         assert_eq!(
-            std::env::current_dir().unwrap(),
+            std::env::current_dir().unwrap().canonicalize().unwrap(),
             private_root.canonicalize().unwrap()
         );
         for (name, expected) in [
