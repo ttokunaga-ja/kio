@@ -698,13 +698,13 @@ struct SearchArgs {
     #[arg(long, value_name = "MODE", value_enum)]
     mode: Option<SearchModeArg>,
     /// Restrict the search to one scope root.
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, value_name = "PATH", conflicts_with = "all_scopes")]
     scope: Option<PathBuf>,
     /// With `--scope`: include scopes below it.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "all_scopes")]
     descendants: bool,
     /// Search every registered scope (the default when `--scope` is absent).
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["scope", "descendants"])]
     all_scopes: bool,
     /// Search a past snapshot. Requires a single `--scope` (06 §3).
     #[arg(long, value_name = "COMMIT")]
@@ -2170,7 +2170,14 @@ fn run_index(args: IndexArgs) -> Result<Value> {
             ));
         }
     } else {
-        Repository::open_current()?
+        // `index --preview` is read-only all the way through opening the
+        // repository: the ordinary open path may repair a missing HEAD, which
+        // would violate preview's no-state-creation contract before scanning.
+        if args.preview {
+            Repository::open_current_without_head_repair()?
+        } else {
+            Repository::open_current()?
+        }
     };
     run_index_for_repo(args, repo, !internal)
 }
@@ -2207,27 +2214,21 @@ fn run_index_for_repo(args: IndexArgs, repo: Repository, discover_children: bool
             }
         }
     };
-    // M1(a): serialize the whole index command against concurrent index/repair/
-    // reindex (05 §6). Held end-to-end, not just across the snapshot sub-step, so
-    // two processes cannot interleave chunk writes / sqlite rebuilds. The lock is
-    // reentrant, so the internal auto-snapshot re-acquisition does not deadlock.
-    let lock = repo.lock_store()?;
-    validate_repo_tool_lock(&repo)?;
-    if args.revoke_network {
-        write_network_revoke_record(&repo)?;
-        return Ok(json!({ "status": "network revoked" }));
-    }
-    let preview = build_repository_scan_preview(
-        &repo,
-        ScanPreviewRequest {
-            scope_path: repo.root().display().to_string(),
-            include_raw_hashes: !args.preview,
-            require_network_approval: !args.offline,
-        },
-    )
-    .map_err(pipeline_to_kio)?;
-
     if args.preview {
+        // Preview is an observational operation: taking the writer lock itself
+        // materializes `.kio/.lock`, so construct its scan before any store
+        // writer is acquired.  This stays descriptor-bound for internal child
+        // scopes through `build_repository_scan_preview`.
+        validate_repo_tool_lock(&repo)?;
+        let preview = build_repository_scan_preview(
+            &repo,
+            ScanPreviewRequest {
+                scope_path: repo.root().display().to_string(),
+                include_raw_hashes: false,
+                require_network_approval: !args.offline,
+            },
+        )
+        .map_err(pipeline_to_kio)?;
         let mut output = index_preview_json(repo.canonical_root(), &preview);
         if let Some(plan) = child_plan {
             let mut children = Vec::new();
@@ -2293,6 +2294,28 @@ fn run_index_for_repo(args: IndexArgs, repo: Repository, discover_children: bool
         }
         return Ok(output);
     }
+
+    // M1(a): serialize every mutating index path against concurrent
+    // index/repair/reindex (05 §6).  The preview above intentionally runs
+    // without this writer lock; therefore the write path acquires it first and
+    // only then constructs a fresh preview, binding approvals and writes to the
+    // current tree rather than a stale pre-lock observation. The lock is
+    // reentrant, so the internal auto-snapshot re-acquisition does not deadlock.
+    let lock = repo.lock_store()?;
+    validate_repo_tool_lock(&repo)?;
+    if args.revoke_network {
+        write_network_revoke_record(&repo)?;
+        return Ok(json!({ "status": "network revoked" }));
+    }
+    let preview = build_repository_scan_preview(
+        &repo,
+        ScanPreviewRequest {
+            scope_path: repo.root().display().to_string(),
+            include_raw_hashes: true,
+            require_network_approval: !args.offline,
+        },
+    )
+    .map_err(pipeline_to_kio)?;
 
     let approved = approval_exists(&repo)?;
     if !approved && !args.approve && !args.yes {
@@ -5879,8 +5902,7 @@ fn run_search_inner(args: SearchArgs, started: Instant) -> Result<Value> {
     // status observes preflight totals, excluding later writers and this
     // invocation's charge even if the command crosses a month boundary.
     let ledger_path = ledger_db_path();
-    let budget_month = utc_month(&now_utc_seconds());
-    let budget_ledger = open_search_budget_snapshot(&ledger_path)?;
+    let (budget_month, budget_ledger) = capture_search_budget_observation(&ledger_path)?;
 
     // Only now, and only when the pre-resolved mode uses vectors, compute (send)
     // the query embedding. In --text this branch is never taken, so the query is
@@ -15994,6 +16016,39 @@ fn open_search_budget_snapshot(path: &Path) -> Result<Option<LedgerReadSnapshot>
             kio_pipeline::PipelineError::ledger_snapshot(path.display().to_string(), error),
         )),
     }
+}
+
+/// Capture the ledger snapshot and the month it is allowed to describe as one
+/// observation. A rollover while opening a snapshot would otherwise pair a
+/// September clock read with an October snapshot (or the reverse), so retry the
+/// whole observation once. Two consecutive rollover crossings are surfaced as
+/// retryable partial work rather than looping around a changing wall clock.
+fn capture_search_budget_observation(path: &Path) -> Result<(String, Option<LedgerReadSnapshot>)> {
+    capture_search_budget_observation_with(path, now_utc_seconds)
+}
+
+fn capture_search_budget_observation_with<F>(
+    path: &Path,
+    mut clock: F,
+) -> Result<(String, Option<LedgerReadSnapshot>)>
+where
+    F: FnMut() -> String,
+{
+    const MAX_ATTEMPTS: usize = 2;
+    for _ in 0..MAX_ATTEMPTS {
+        let before_month = utc_month(&clock());
+        let snapshot = open_search_budget_snapshot(path)?;
+        let after_month = utc_month(&clock());
+        if before_month == after_month {
+            return Ok((before_month, snapshot));
+        }
+    }
+    Err(KioError::new(
+        "KIO-E-LEDGER-SNAPSHOT-ROLLOVER-001",
+        "cost ledger month changed while capturing a budget snapshot; retry the command",
+        json!({ "ledger_path": path, "reason": "month_rollover" }),
+        ExitCode::PartialFailure,
+    ))
 }
 
 fn ledger_snapshot_to_kio(path: &str, error: LedgerSnapshotError) -> KioError {
@@ -28617,6 +28672,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn search_budget_observation_retries_a_month_rollover_once() {
+        use super::capture_search_budget_observation_with;
+        use kio_pipeline::ledger::LedgerDb;
+
+        let root = tempfile::tempdir().unwrap();
+        let ledger_path = root.path().join("cost-ledger.sqlite");
+        drop(LedgerDb::open(&ledger_path).unwrap());
+        let ticks = std::cell::RefCell::new(
+            [
+                "2026-09-30T23:59:59Z",
+                "2026-10-01T00:00:00Z",
+                "2026-10-01T00:00:00Z",
+                "2026-10-01T00:00:01Z",
+            ]
+            .into_iter(),
+        );
+        let (month, snapshot) = capture_search_budget_observation_with(&ledger_path, || {
+            ticks.borrow_mut().next().unwrap().to_owned()
+        })
+        .unwrap();
+
+        assert_eq!(month, "2026-10");
+        assert!(snapshot.is_some());
+
+        let exhausted_ticks = std::cell::RefCell::new(
+            [
+                "2026-10-31T23:59:59Z",
+                "2026-11-01T00:00:00Z",
+                "2026-11-30T23:59:59Z",
+                "2026-12-01T00:00:00Z",
+            ]
+            .into_iter(),
+        );
+        let error = capture_search_budget_observation_with(&ledger_path, || {
+            exhausted_ticks.borrow_mut().next().unwrap().to_owned()
+        })
+        .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-LEDGER-SNAPSHOT-ROLLOVER-001");
+        assert_eq!(error.exit_code(), ExitCode::PartialFailure);
     }
 
     #[test]
