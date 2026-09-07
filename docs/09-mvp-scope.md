@@ -8,6 +8,11 @@
 
 # 1. MVP に含める / 捨てる
 
+> 本書の Phase、Step、RC matrix と内部評価基準は historical/current implementation contract である。
+> v1 の製品要件、ロードマップの製品境界、未充足状態の正本は
+> [11-product-requirements.md](11-product-requirements.md)。相違する場合は同書を優先し、
+> 本書の古い実装計画から v1 の機能完了を推論してはならない。
+
 ## 1.1 MVP に含める (Phase 1〜3)
 
 ```
@@ -19,7 +24,7 @@
 - Hybrid search (paging / MMR / cursor)
 - Evidence Pointer
 - snapshot DAG (commit / tree)
-- kio index 完了時の auto snapshot (定期 auto snapshot / watch は Phase 4。[05-runtime.md §8](05-runtime.md))
+- kio index 完了時の auto snapshot (定期 auto snapshot / watch の Phase 記述は historical RC plan であり、v1 の変更検出要件は [11-product-requirements.md](11-product-requirements.md) を参照)
 - restore (--to 必須)
 - time-travel search (--at / --all-history / --include-deleted)
 - ベースライン index (deterministic 抽出 + FTS。API キーなしで init→index→search→open が成立 — [01-positioning.md §3](01-positioning.md))
@@ -51,7 +56,10 @@ Windows で新しい scope を導入する正式な手動手順は次の 3 ス�
 public pathname を再解決する fallback ではない。Windows の自動子 scope に
 `current_dir(path)` 型の handoff を追加せず、junction / reparse point も追跡しない。
 
-# 2. 将来ロードマップ（非規範・非承認）
+# 2. 将来ロードマップ（historical。製品境界は 11 を参照）
+
+直前の RC matrix は RC.3 の制約であり、v1 の platform support を表明しない。特に Windows の
+自動 child mutation は RC で未対応である。
 
 以下は実装を許可せず、CLI syntax、schema、error code、default、互換性を定めない名称だけの記録である。
 
@@ -73,6 +81,11 @@ public pathname を再解決する fallback ではない。Windows の自動子 
 - Summary / Classification adapters
 
 `tasks/` は過去の受入記録であり、現在の契約や将来実装を承認する文書ではない。
+
+v2 は GUI で CLI の全機能を提供し、履歴の選択と最新版への復元を含む。v3 は cloud sharing、
+collaboration、複数利用者を扱う。revert の transaction、CLI、線形履歴 schema は未決の提案であり、
+この文書は実装詳細を課さない。v1 で user/group ACL は要求しない。外部送信への consent は
+multiuser ACL ではない。
 
 ---
 
@@ -165,6 +178,9 @@ Step 1 開始日: **2026-07-16**。本日 (2026-07-02) 時点の Step 1 ブロ�
 ---
 
 # 4. 北極星シナリオ (Phase 3 完成時の Done 条件)
+
+この節の PersonaScope/personaCorpus による性能・品質評価は v1 の nonblocking とし、準備後に行う。
+これは機能、security、recovery の受入を不要にするものではなく、v1 の定義を上書きしない。
 
 実装中の機能追加判断は「**3 シナリオのどれに resp するか**」で評価する。該当しないなら Phase 4-5 へ送る。
 

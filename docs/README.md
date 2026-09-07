@@ -3,7 +3,7 @@
 > **Local-first knowledge archive, powered by frontier AI.**
 > **データはローカル、計算は最強の AI を使う。**
 
-Kio は **local-first** な知識アーカイブ。データの主権はあなたのマシンにあり、Markdownize や Embedding には Mistral OCR / Gemini / Claude / GPT 等の frontier AI を使う。"offline-first 原理主義" ではない。
+Kio は **local-first** な知識アーカイブ。データの主権はあなたのマシンにあり、Markdownize や Embedding には外部 Adapter を opt-in で利用できる。現行 RC の組込み接続は Mistral OCR と Gemini embedding が中心であり、任意の Claude / GPT 等を呼ぶ汎用 dispatcher は未提供である。実 provider の利用可能性は接続試験で確認する。
 
 二次表現: **Evidence-grounded local knowledge archive (原文根拠付きローカル知識アーカイブ)**。
 
@@ -42,7 +42,8 @@ kio open <検索結果の pointer>
 # 0.2 二層構造 — truth と cache
 
 ```
-truth = folder-local .kio                正本: raw object / normalized / chunks / commits / refs
+truth = folder-local .kio                知識・scope・送信承認の正本: raw object / normalized / chunks / commits / refs
+truth = device/central operational state 課金台帳・in-flight intent 等の非知識運用正本
 cache = scope_registry                   探索対象一覧 / stale 検出
 cache = aggregator                       全 scope の chunk (live + 過去) の read replica
                                          (横断検索の採点・候補選択 / 権限状態の横断投影)
@@ -56,7 +57,8 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 
 # 1. ドキュメント構成 と Reading Path
 
-`docs/` 直下を実装スペックの **正本** とし、ファイル名の **数字プレフィックスがそのまま読む順番** を表す。`README.md` (本書) を最初に読み、続いて `01-` から `10-` の順に読めば、概念がぶつからない (`11-` は ARCHIVED — 読む順番に含めない)。
+`docs/` 直下に実装スペック、製品要件、明示した設計提案を置く。`README.md` (本書) を最初に読み、
+続いて `01-` から `13-` の順に読む。`11-` は製品要件、`12-` と `13-` は未実装の設計提案である。
 
 | 順 | ファイル | 役割 |
 | --- | --- | --- |
@@ -71,16 +73,19 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 | **08** | [08-evidence-pointer-spec.md](08-evidence-pointer-spec.md) | Evidence Pointer schema / 解決手順 / **Dead Pointer (purge) のセマンティクス** / exact-only retarget / 外部 Agent 相互運用 |
 | **09** | [09-mvp-scope.md](09-mvp-scope.md) | MVP scope / RC platform support matrix / non-authorizing roadmap / Step 1-4 + 規模上限 / 北極星シナリオ / 凍結ゲート |
 | **10** | [10-operations.md](10-operations.md) | 横断規約 (semver / 観測ログ / 命名リネーム表 / 初回スキャン承認 / Adapter セキュリティ) |
-各 spec は前番の概念を前提にできる構成。逆順参照 (例: 03 が 06 を前提) は基本的に発生しない。旧統合要件ドラフトは current consumer がなく、旧 CLI/schema を残すだけだったため削除済みである。`01-` 〜 `10-` のみで完結する。
+| **11** | [11-product-requirements.md](11-product-requirements.md) | **製品要件の正本**: v1 の到達要求、RCとの区別、v2/v3 の境界、検証要求 |
+| **12** | [12-change-detection.md](12-change-detection.md) | **設計提案**: OSイベント、差分走査、欠落復旧、子scope自動管理 |
+| **13** | [13-linear-history.md](13-linear-history.md) | **設計提案**: 線形履歴、全体・選択パスの復元、公開と復旧 |
+01〜10 は実装・運用契約、11 は製品要件である。契約が RC の現状や提案を記録する場合、v1 の到達要求と実装済みを混同しない。旧統合要件ドラフトは current consumer がなく、旧 CLI/schema を残すだけだったため削除済みである。
 
 ## 1.1 設計検討メモ (撤去済み)
 
 旧 `docs/research/` (LLM 出力由来の設計検討メモ + folder-history 独立設計書) は 2026-07-18 に docs から
-撤去した — 正本は `01-` 〜 `10-` の spec のみ。経緯を参照する場合は git 履歴 (撤去直前のコミット) を辿る。
+撤去した — 実装・運用契約は `01-` 〜 `10-`、製品要件は `11-` を参照する。経緯を参照する場合は git 履歴 (撤去直前のコミット) を辿る。
 
 ## 1.2 非規範の戦略文書
 
-[`strategy/`](../strategy/) は市場・事業・将来製品の意思決定材料を置く領域であり、`01-`〜`10-` のReading Pathや実装specには含めない。現在の将来Cloud仮説は [cloud-competitive-advantage.md](../strategy/cloud-competitive-advantage.md) を参照する。同文書の機能・roadmap・設計判断は、明示的にspecへ採用されるまで未承認である。
+[`strategy/`](../strategy/) は市場・事業・将来製品の意思決定材料を置く領域であり、`01-`〜`13-` のReading Pathや実装specには含めない。現在の将来Cloud仮説は [cloud-competitive-advantage.md](../strategy/cloud-competitive-advantage.md) を参照する。同文書の機能・roadmap・設計判断は、明示的にspecへ採用されるまで未承認である。
 
 ---
 
@@ -150,7 +155,7 @@ ADR (Architecture Decision Records) フォルダは廃止しました。本プ�
 - **言語**: 日本語。固有名詞・コード片は原語のまま。
 - **コードブロック**: 言語タグ必須 (`bash`, `toml`, `json`, `rust`, `sql`, `text`)。既存の列挙・図示 block の無タグ fence は `text` 扱い (新規追加時にタグ必須)。
 - **相対リンク**: docs/ ルート相対。
-- **スキーマ変更**: 03-data-model.md / 07-adapter-spec.md の変更は破壊的変更扱い。`tool_profile_hash` / `tool_lock_hash` / Evidence Pointer schema の変更には migration plan を伴う (`commit_type` enum は値域**永久固定** — [10-operations.md §8](10-operations.md)。migration の対象にしない)。
+- **スキーマ変更**: 03-data-model.md / 07-adapter-spec.md の変更は破壊的変更扱い。安定版前は旧 format を明示的に reject し、migration / alias / compatibility reader を要件にしない。利用者ファイルと knowledge を明示操作なしに破壊しない。
 - **発言禁止フレーズ**:
   - ✗ "Git for knowledge" / "個人 AI アシスタント" / "OS 級" / "Knowledge Graph for personal data" / "Notion / Obsidian キラー"
   - ✗ "offline-first" (誤解を招く。"local-first" を使う — 禁止はプロダクトの呼称・訴求としての使用であり、否定・対比文での言及は可)

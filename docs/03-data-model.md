@@ -2,6 +2,10 @@
 
 統合元: 旧 `research/git_kio.md` (CAS / DAG) + 旧 `research/kio.md` (.kio layout) + 旧 `research/hash.md` (identity) + 旧 `research/read_only.md` (write boundary)。いずれも正本ではなく、2026-07-18 に docs から撤去 (経緯は git 履歴で参照可)。
 
+> 本書は現行 format / 実装契約を定める。v1 の製品到達要求と RC の未充足事項は
+> [11-product-requirements.md](11-product-requirements.md) を正本とする。本書の詳細な RC 制約は、
+> v1 の実装済み表明ではない。
+
 ---
 
 # 1. 概念モデル — CAS + Snapshot DAG
@@ -265,7 +269,7 @@ view の存在は使わない。
 各 `.kio` が管理するのは **その `.kio` が配置されたフォルダ直下のファイルのみ** である。この規則は次の 3 点で一意に定まる:
 
 1. 管理対象は scope フォルダ **直下** のファイルに限る。サブフォルダ配下のファイルは、そのサブフォルダに `.kio` が存在するか否かに関わらず、親 `.kio` の管理対象に **ならない** (再帰包含は行わない)。
-2. サブフォルダは常に独立スコープの候補である。自動子 scope mutation が RC 対象の platform では、対象ファイルを含むサブフォルダに `kio index` が子 `.kio` を生成する ([06-cli-spec.md §1](06-cli-spec.md), [10-operations.md §4](10-operations.md))。ignore されたサブツリーには子 `.kio` を生成しない。親で有効な config ignore → `.kioignore` は子の直下スキャン、孫の探索、後日の child-only `index` / task 再検査にも同じ順序で適用される。実装は子 `.kio/config.toml` の strict な生成済み親ポリシーとして prefix 付きで保持し、子固有の config / `.kioignore` はその後に評価する。preview は親直下だけでなく各 planned child の直下件数・bytes と全 scope 合計を表示する。**VCS リポジトリ root (`.git` 等の VCS 管理ディレクトリを持つフォルダ) とその配下にも既定では子 `.kio` を生成しない** (skip + status 表示。`[scope] index_vcs_repos = true` で opt-in) — リポジトリの履歴は VCS 自身が持ち、`.kio` の自動生成はリポジトリを汚す ([01-positioning.md §8](01-positioning.md) の方針の機械化)。既存子 scope を grandfather する分岐は置かない。
+2. サブフォルダは常に独立スコープの候補である。v1 は ignore されない全子フォルダ（空フォルダを含む）へ `.kio` を自動作成することを要求する。発火の debounce/SLA と一般的でない filesystem の対応範囲は未決であり、現行 RC の条件は v1 完了を表さない。自動子 scope mutation が RC 対象の platform では、対象ファイルを含むサブフォルダに `kio index` が子 `.kio` を生成する ([06-cli-spec.md §1](06-cli-spec.md), [10-operations.md §4](10-operations.md))。ignore されたサブツリーには子 `.kio` を生成しない。親で有効な config ignore → `.kioignore` は子の直下スキャン、孫の探索、後日の child-only `index` / task 再検査にも同じ順序で適用される。実装は子 `.kio/config.toml` の strict な生成済み親ポリシーとして prefix 付きで保持し、子固有の config / `.kioignore` はその後に評価する。preview は親直下だけでなく各 planned child の直下件数・bytes と全 scope 合計を表示する。**VCS リポジトリ root (`.git` 等の VCS 管理ディレクトリを持つフォルダ) とその配下にも既定では子 `.kio` を生成しない** (skip + status 表示。`[scope] index_vcs_repos = true` で opt-in) — リポジトリの履歴は VCS 自身が持ち、`.kio` の自動生成はリポジトリを汚す ([01-positioning.md §8](01-positioning.md) の方針の機械化)。既存子 scope を grandfather する分岐は置かない。
    RC の platform support level と子 scope 経路の対象範囲は [09-mvp-scope.md §1.2](09-mvp-scope.md) が正本である。現行の mutation authority は macOS / Linux の retained-handle child launcher だけが満たす。Windows は discovery と read-only preview を行うが、planned child ごとの mutation は public pathname / `current_dir(path)` へ戻らず `KIO-E-SCOPE-BOUND-UNSUPPORTED-001` で fail-closed し、子 `.kio` を作らない。親結果には structured partial failure として残す。
 3. したがって tree entry の `path`、Evidence Pointer の `path_at_commit`、task の `input_path` は **パス区切り (`/`) を含まないファイル名** である。`/` を含む path を持つ tree / pointer は schema violation (`KIO-E-STORE-PATH-001`) として拒否する。同様に `\` ・単独の `.` / `..`・NUL・control 文字を含む path、および **well-formed UTF-8 でない byte 列の path** も拒否する (tag の portable leaf 規則と同水準 — §2。JCS 直列化と UTF-8 バイト列昇順ソート (§8.1・§8) は well-formed UTF-8 を前提とするため、不正 byte 列は可逆に表現できない)。restore 等の物理化は canonical join 後に対象ディレクトリ配下であることを検査する ([06-cli-spec.md §5](06-cli-spec.md))。この検証は read/write を問わず current canonical object に適用する。区切りを含む旧 tree/path や raw-name pointer を読取専用で受理・安全名 mapping・legacy warning に落とす分岐は持たない。
 
@@ -284,6 +288,11 @@ truth = folder-local .kio           raw object / normalized / chunks / commits /
 cache = scope_registry             検索の探索対象一覧 / stale 検出
         aggregator                 全 scope の index を複製した device-level read replica
 ```
+
+この二層図は**知識・scope・送信承認**についての分類である。課金台帳、provider へ送った
+in-flight intent、回復・照合に必要な運用記録は knowledge ではなく、device/central に置ける
+非再構築可能な運用上の truth である。`.kio` の復元から reset してはならず、`.kio` の backup とは
+別に backup と reconcile を行う。詳細な現行手順は [10-operations.md §7.5.2](10-operations.md)。
 
 `scope_registry` 保存先: `~/.local/share/kio/scope-registry.sqlite`。**device data dir の実体は
 `${XDG_DATA_HOME:-$HOME/.local/share}/kio` であり、本仕様の `~/.local/share/kio/` 表記は全て
@@ -380,7 +389,7 @@ purge を残すのは法務・秘匿の操作であり**文書名だけでも意
 | `~/.local/share/kio/scope-registry.sqlite` | **SQLite** (`scopes` 1 表) | cache | 各 `.kio` の rescan | [10-operations.md §3](10-operations.md) |
 | `~/.cache/kio/aggregator.sqlite` | **SQLite** (`agg_scopes` / `agg_chunks` / `agg_fts` / `agg_embeddings` / `agg_image_embeddings` / `agg_image_refs` / `agg_bindings` / `agg_projection_markers` の 8 表) | cache | writer の完全再射影、または device-global の `kio repair replica` (`-r`)。source SQLite も含めて検証・再構築する場合は `kio repair all` (`-a`)。欠落・不完全時は `kio search` が source index を読まず fail-closed | [05-runtime.md §1.8](05-runtime.md) |
 | `${XDG_CACHE_HOME:-$HOME/.cache}/kio/search-query-cache/<query_vector_digest>` | file (canonical float32 little-endian vector) | device-local cursor replay cache（query 本文は保存しない） | 欠落・digest 不一致は当該 cursor を `KIO-E-SEARCH-CURSOR-001` で拒否。再 embedding や source SQLite 読みには戻らない | [05-runtime.md §1.5](05-runtime.md) |
-| `~/.local/share/kio/cost-ledger.sqlite` | **SQLite** (`cost_ledger` / `batch_requests` / `schema_migrations` の 3 表、WAL) | 運用データ (課金台帳 + **in-flight intent (Batch job / sync request) の正本** — [04-pipeline.md §5.8](04-pipeline.md)。tasks.jsonl と異なり喪失許容ではない) | 確定課金は再構築不可 (Adapter 報告値の記録であり再導出元がない)。in-flight は batch 行が provider job 一覧の intent_token 全走査、sync 行が provider request id 照会 (照会不能は estimated 確定 — [04-pipeline.md §5.4](04-pipeline.md)) で回収 | [04-pipeline.md §5.4](04-pipeline.md) (SQL 正本) |
+| `~/.local/share/kio/cost-ledger.sqlite` | **SQLite** (`cost_ledger` / `batch_requests` / `schema_migrations` の 3 表、WAL) | **device/central operational truth** (課金台帳 + **in-flight intent (Batch job / sync request) の正本** — [04-pipeline.md §5.8](04-pipeline.md)。knowledge ではなく、tasks.jsonl と異なり喪失許容ではない) | 確定課金は再構築不可 (Adapter 報告値の記録であり再導出元がない)。in-flight は batch 行が provider job 一覧の intent_token 全走査、sync 行が provider request id 照会 (照会不能は estimated 確定 — [04-pipeline.md §5.4](04-pipeline.md)) で回収 | [04-pipeline.md §5.4](04-pipeline.md) (SQL 正本) |
 
 **SQLite を使うのはこの表の 4 ファイル (public logical object は計 21 表 / virtual table)**。内訳は index/sqlite.db 9、scope-registry.sqlite 1、aggregator.sqlite 8、cost-ledger.sqlite 3 である。FTS5 / sqlite-vec の shadow table は SQLite の内部実装であり、この logical-object 数にも public schema 契約にも含めない。うち index/sqlite.db・scope-registry.sqlite・aggregator.sqlite は正本から再構築可能な検索キャッシュ、**cost-ledger.sqlite だけは再構築不可の運用台帳** (cache ではない — current schema と不一致な既存 bytes は fail-closed、[10-operations.md §7.5.3](10-operations.md))。cursor replay の query vector は source の `embeddings` 表ではなく上記の device-local file cache に置くため、破棄・欠落の影響は cursor 拒否だけである。**SQLite ファイルとして cache root (`$XDG_CACHE_HOME`) に置かれるのは aggregator.sqlite だけ**だが、query-vector replay cache も同じ cache root の file である — 他の 3 SQLite は data root。区別の基準は「ユーザーが知る情報を失うか」であり、aggregator は各 `.kio` の射影に過ぎず何も失わない (§4 不変条件 2)。コンテンツの truth は引き続きファイル (CAS objects/ ほか) が正本であり、tasks.jsonl は喪失許容の JSONL のまま。`schema_migrations` は current operational marker 専用であり、旧 JSONL cutover の importer marker は置かない。課金 + in-flight intent の current SQLite record は UNIQUE・単一 Tx・ON CONFLICT 冪等の保証を正本要件とする ([04-pipeline.md §5.4](04-pipeline.md))。
 

@@ -360,6 +360,15 @@ scope registry は共有 `.kio` の正本ではない。フォルダ移動や外
 
 # 4. フォルダごとの `.kio` 運用
 
+v1 の到達要求は、ignore されない全子フォルダ（空フォルダを含む）を自動発見し、`.kio` を自動作成して
+独立 scope として管理できることである。root からの native OS event を契機に reconciliation し、手動
+`kio index` は同じ engine を使う。起動・再接続・event overflow の後と定期 fallback は rescan して
+取りこぼしから回復する。event stream は最適化であり consent を与えず、directory size/mtime は再帰的な
+完全性の証明ではない。exact debounce/SLA と一般的でない filesystem の対応範囲は未決であり、現行 RC の
+挙動から確定済みと扱わない。RC の制約と Windows の自動 child mutation 未対応状態は [11-product-requirements.md](11-product-requirements.md) を参照する。
+
+以下の具体的な生成条件は現行 RC contract であり、v1 の完了状態を表すものではない。
+
 `.kio` は基本的に各フォルダに生成される。ただし、空フォルダや未到達フォルダへ先回りして作る必要はない。
 
 推奨:
@@ -691,6 +700,9 @@ manifest/normalized-unit/embedding/未公開tool-lockのdiagnostic candidateも�
 
 ## 7.5.2 バックアップ運用
 
+この節はすでに現行の backup / restore-reconcile 手順を定めている。知識の `.kio` backup と、
+device/central operational truth の backup は別物であり、後者を `.kio` restore で初期化・上書きしてはならない。
+
 正式なバックアップ手段は次の 2 つとし、専用コマンドは MVP では追加しない。
 
 ```text
@@ -762,6 +774,10 @@ current schema で作成する。この gate は最初の書込みより前に�
 ---
 
 # 8. commit_type の固定 enum について
+
+この節の固定値は現行 RC format の契約である。安定版前の製品設計で旧形式を明示的に廃止する場合は
+[11-product-requirements.md](11-product-requirements.md) の破壊的変更方針を優先する。
+復元 provenance を持つ新形式の提案は [13-linear-history.md](13-linear-history.md) を参照する。
 
 現在の正本では、`commit_type` を `manual / auto / repaired / purged` の4種に閉じる。`migrated` を含む store は current reader の受理対象ではない。
 
