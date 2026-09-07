@@ -1,6 +1,7 @@
-# 12 Change Detection — v1 design proposal
+# 12 Change Detection — v1 design direction
 
-本書は 2026-09-07 の要件議論に対する設計提案であり、実装済みの契約ではない。
+本書の設計方針は 2026-09-07 に承認済みであり、実装済みの契約ではない。
+詳細な実装契約を固定する工程は [v1-implementation-plan.md](../tasks/v1-implementation-plan.md) を参照する。
 製品の到達要求は [11-product-requirements.md](11-product-requirements.md) を参照する。
 
 ## 1. 方針

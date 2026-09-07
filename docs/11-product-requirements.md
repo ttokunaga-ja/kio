@@ -18,8 +18,8 @@
 
 変更検出は root からの native OS event を契機に reconciliation し、手動 `kio index` は同じ engine を使う。
 起動・再接続・event overflow の後と定期 fallback では rescan し、取りこぼしから回復する。event stream は
-最適化であって consent を与えず、directory の size/mtime も再帰的な完全性の証明にはならない。これは推奨する
-v1 architecture であり、現時点で実装済みとは表明しない。詳細は [12-change-detection.md](12-change-detection.md)。
+最適化であって consent を与えず、directory の size/mtime も再帰的な完全性の証明にはならない。この方針は
+2026-09-07 に承認済みであり、現時点で実装済みとは表明しない。詳細は [12-change-detection.md](12-change-detection.md)。
 
 ## 2. 正本と復旧
 
@@ -43,9 +43,10 @@ security、recovery の受入を不要にするものではない。
 ## 4. バージョン境界と破壊的変更
 
 v2 は GUI で CLI の全機能を提供し、履歴選択と最新版への復元を提供する。v3 は cloud sharing、
-collaboration、複数利用者と user/group ACL を扱う。最新版へ戻す revert の transaction、CLI、
-ブランチを持たない線形履歴 schema は提案段階であり、ここでは決めない。
-具体案は [13-linear-history.md](13-linear-history.md) に記録する。
+collaboration、複数利用者と user/group ACL を扱う。ブランチを持たず現在の HEAD の子として過去状態を復元する
+方針は 2026-09-07 に承認済みである。transaction、CLI、schema の詳細は実装契約として別途固定する。
+設計は [13-linear-history.md](13-linear-history.md)、工程と受入条件の提案は
+[v1-implementation-plan.md](../tasks/v1-implementation-plan.md) に記録する。
 
 安定版前は破壊的変更を許可する。後方互換性、alias、migration は要求しない。旧 format は明示的に
 reject し、曖昧な読み替えをしない。ただし、breaking code は knowledge や利用者ファイルを破棄する

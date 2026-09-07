@@ -58,7 +58,7 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 # 1. ドキュメント構成 と Reading Path
 
 `docs/` 直下に実装スペック、製品要件、明示した設計提案を置く。`README.md` (本書) を最初に読み、
-続いて `01-` から `13-` の順に読む。`11-` は製品要件、`12-` と `13-` は未実装の設計提案である。
+続いて `01-` から `13-` の順に読む。`11-` は製品要件、`12-` と `13-` は承認済み・未実装の設計方針である。
 
 | 順 | ファイル | 役割 |
 | --- | --- | --- |
@@ -74,8 +74,8 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 | **09** | [09-mvp-scope.md](09-mvp-scope.md) | MVP scope / RC platform support matrix / non-authorizing roadmap / Step 1-4 + 規模上限 / 北極星シナリオ / 凍結ゲート |
 | **10** | [10-operations.md](10-operations.md) | 横断規約 (semver / 観測ログ / 命名リネーム表 / 初回スキャン承認 / Adapter セキュリティ) |
 | **11** | [11-product-requirements.md](11-product-requirements.md) | **製品要件の正本**: v1 の到達要求、RCとの区別、v2/v3 の境界、検証要求 |
-| **12** | [12-change-detection.md](12-change-detection.md) | **設計提案**: OSイベント、差分走査、欠落復旧、子scope自動管理 |
-| **13** | [13-linear-history.md](13-linear-history.md) | **設計提案**: 線形履歴、全体・選択パスの復元、公開と復旧 |
+| **12** | [12-change-detection.md](12-change-detection.md) | **承認済み方針・未実装**: OSイベント、差分走査、欠落復旧、子scope自動管理 |
+| **13** | [13-linear-history.md](13-linear-history.md) | **承認済み方針・未実装**: 線形履歴、全体・選択パスの復元、公開と復旧 |
 01〜10 は実装・運用契約、11 は製品要件である。契約が RC の現状や提案を記録する場合、v1 の到達要求と実装済みを混同しない。旧統合要件ドラフトは current consumer がなく、旧 CLI/schema を残すだけだったため削除済みである。
 
 ## 1.1 設計検討メモ (撤去済み)

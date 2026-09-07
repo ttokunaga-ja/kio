@@ -1,6 +1,7 @@
-# 13 Linear History and Restore — design proposal
+# 13 Linear History and Restore — design direction
 
-本書は安定版前の設計提案である。新しい CLI、schema、transaction はまだ実装されていない。
+本書の線形履歴・復元の設計方針は 2026-09-07 に承認済みである。新しい CLI、schema、transaction はまだ実装されていない。
+詳細を固定する工程と CLI 復元の v1 先行実装案は [v1-implementation-plan.md](../tasks/v1-implementation-plan.md) を参照する。
 現行 RC.3 は通常一つの親を持つ commit を生成するが、保存形式は最大 64 parents の DAG と複数 refs を許す。
 実装根拠: `crates/kio-core/src/dag.rs:14,251-379`、`history.rs:414-456`、`scope.rs:4389-4411`。
 線形であることを通常の writer の振る舞いだけに依存させず、形式・読込・公開で強制することを提案する。
