@@ -5873,6 +5873,15 @@ fn run_search_inner(args: SearchArgs, started: Instant) -> Result<Value> {
         query_embeddable,
     );
     let precheck_mode = resolve_search_mode(requested_mode, &vector_precheck, fail_behavior)?;
+    // Fail closed on an unsafe/unstable ledger before a fresh page 1 can open
+    // it for writing, claim a charge, or send the query embedding. Keep this
+    // one owned snapshot and its UTC month through response assembly: budget
+    // status observes preflight totals, excluding later writers and this
+    // invocation's charge even if the command crosses a month boundary.
+    let ledger_path = ledger_db_path();
+    let budget_month = utc_month(&now_utc_seconds());
+    let budget_ledger = open_search_budget_snapshot(&ledger_path)?;
+
     // Only now, and only when the pre-resolved mode uses vectors, compute (send)
     // the query embedding. In --text this branch is never taken, so the query is
     // never sent.
@@ -7035,16 +7044,12 @@ fn run_search_inner(args: SearchArgs, started: Instant) -> Result<Value> {
             entry
         })
         .collect::<Vec<_>>();
-    // Search status must retain the documented exhausted-cap observation, but
-    // SQLite must never see the mutable source ledger merely to compute it.
-    // Capture one owned main+WAL snapshot for the whole invocation and reuse
-    // that frozen connection for the device total and every scope total.  A
-    // fresh vector/hybrid page 1 may already have used the ordinary writable
-    // ledger for the metered query embedding; this status read does not reopen
-    // that source and cursor/text paths remain source-ledger read-only.
-    let ledger_path = ledger_db_path();
-    let budget_ledger = open_search_budget_snapshot(&ledger_path)?;
-    let index_status = compute_index_status(&searched, budget_ledger.as_ref(), &ledger_path)?;
+    let index_status = compute_index_status(
+        &searched,
+        budget_ledger.as_ref(),
+        &ledger_path,
+        &budget_month,
+    )?;
     // PC45/PC46: a scope that skipped shallow ancestors mid-walk is not fully
     // complete even though it was not excluded — same partial-failure
     // treatment (exit 3) as an excluded_scopes entry (05 §1.6 "黙って欠落
@@ -8082,6 +8087,7 @@ fn compute_index_status(
     searched: &[SearchedScopeInfo],
     budget_ledger: Option<&LedgerReadSnapshot>,
     ledger_path: &Path,
+    budget_month: &str,
 ) -> Result<Value> {
     let mut total = 0u64;
     let mut done = 0u64;
@@ -8091,14 +8097,15 @@ fn compute_index_status(
     let mut unsupported_input_errors = Vec::new();
     let mut task_errors = Vec::new();
     let mut office_conversion_unavailable_inputs = Vec::new();
-    let month = utc_month(&now_utc_seconds());
     let device_spent = match budget_ledger {
-        Some(snapshot) => snapshot.month_total(None, None, &month).map_err(|error| {
-            pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
-                ledger_path.display().to_string(),
-                error,
-            ))
-        })?,
+        Some(snapshot) => snapshot
+            .month_total(None, None, budget_month)
+            .map_err(|error| {
+                pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
+                    ledger_path.display().to_string(),
+                    error,
+                ))
+            })?,
         None => 0.0,
     };
 
@@ -8244,7 +8251,7 @@ fn compute_index_status(
                 {
                     let folder_spent = match budget_ledger {
                         Some(snapshot) => snapshot
-                            .month_total(Some(&identity.scope_id), None, &month)
+                            .month_total(Some(&identity.scope_id), None, budget_month)
                             .map_err(|error| {
                                 pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
                                     ledger_path.display().to_string(),
@@ -18824,8 +18831,8 @@ fn compute_query_embedding_page1(
     }
     let profile = declared_embedding_profile(execution);
 
-    // PC6: the final authorization check is deliberately before *any* source
-    // ledger action. A revoked auto/hybrid candidate therefore resolves to its
+    // PC6: the final authorization check is deliberately before *any* writable
+    // source ledger action. A revoked auto/hybrid candidate therefore resolves to its
     // normal text fallback without opening the ledger, refreshing write-seq,
     // sweeping stale rows, or creating a claim. Once the check succeeds, later
     // claim/reservation/send/settlement outcomes remain the normal fresh-page-1
@@ -28501,6 +28508,117 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
+    #[test]
+    fn search_index_status_uses_preflight_month() {
+        use super::{
+            DebugTestControl, LedgerDb, LedgerReadSnapshot, PathBuf, Repository, SearchedScopeInfo,
+            compute_index_status, now_utc_seconds, user_config_toml_path, utc_month,
+        };
+
+        // Re-exec only this unit test with private HOME/XDG/TMP roots so its
+        // budget-policy reads cannot depend on the user's config. This is
+        // test-harness code, not a production clock or authorization seam.
+        if std::env::var_os("KIO_TEST_BUDGET_MONTH_CHILD").is_none() {
+            let dir = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "tests::search_index_status_uses_preflight_month"])
+                .env_clear()
+                .env("KIO_TEST_BUDGET_MONTH_CHILD", dir.path())
+                .env("HOME", dir.path())
+                .env("XDG_CONFIG_HOME", dir.path().join("config"))
+                .env("XDG_DATA_HOME", dir.path().join("data"))
+                .env("XDG_CACHE_HOME", dir.path().join("cache"))
+                .env("TMPDIR", dir.path())
+                .env("TMP", dir.path())
+                .env("TEMP", dir.path())
+                .current_dir(dir.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+
+        let private_root = PathBuf::from(std::env::var_os("KIO_TEST_BUDGET_MONTH_CHILD").unwrap());
+        assert_eq!(
+            std::env::current_dir().unwrap(),
+            private_root.canonicalize().unwrap()
+        );
+        for (name, expected) in [
+            ("HOME", private_root.clone()),
+            ("XDG_CONFIG_HOME", private_root.join("config")),
+            ("XDG_DATA_HOME", private_root.join("data")),
+            ("XDG_CACHE_HOME", private_root.join("cache")),
+        ] {
+            assert_eq!(std::env::var_os(name), Some(expected.into_os_string()));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let scope_id = repo.scope_identity().unwrap().scope_id;
+        let device_config = user_config_toml_path();
+        fs::create_dir_all(device_config.parent().unwrap()).unwrap();
+        fs::write(&device_config, "[budget]\nmonthly_usd_cap = 100.0\n").unwrap();
+        let folder_config = repo.kio_dir().join("config.toml");
+        let mut config: toml_edit::DocumentMut =
+            fs::read_to_string(&folder_config).unwrap().parse().unwrap();
+        config["budget"]["monthly_usd_cap"] = toml_edit::value(1.0);
+        fs::write(&folder_config, config.to_string()).unwrap();
+
+        let ledger_path = dir.path().join("cost-ledger.sqlite");
+        let ledger = LedgerDb::open(&ledger_path).unwrap();
+        ledger
+            .connection()
+            .execute(
+                "INSERT INTO cost_ledger (
+                scope_id, adapter_kind, input_hash, tool_profile_hash, submission_seq,
+                batch_job_id, usd, estimated, outcome, month, recorded_at
+             ) VALUES (?1, 'embedding', 'month-input', 'month-profile', 1,
+                'month-job', 1.0, 0, 'succeeded', '2026-09', ?2)",
+                rusqlite::params![
+                    scope_id,
+                    kio_pipeline::ledger::time::month_start_millis(2026, 9)
+                ],
+            )
+            .unwrap();
+        drop(ledger);
+        let snapshot = LedgerReadSnapshot::open(&ledger_path).unwrap();
+        let searched = [SearchedScopeInfo {
+            scope_id,
+            scope_path: repo.kio_dir().to_path_buf(),
+            repo_root: dir.path().to_path_buf(),
+            snapshot_at: "sha256:month".to_owned(),
+            max_rowid: 0,
+            max_association_rowid: 0,
+            chunking_config_hash: "sha256:config".to_owned(),
+            index_generation: "01TEST0000000000000000000".to_owned(),
+            journal_active_at_prepare: false,
+            shallow_skipped: 0,
+            runtime_binding_filter: None,
+        }];
+        let _clock = kio_core::test_control::install_scoped(DebugTestControl {
+            fixed_now: kio_core::test_control::Selector::Known("2026-10-01T00:00:00Z".to_owned()),
+            ..Default::default()
+        });
+        // The response clock is October, but September's preflight month
+        // must still govern both folder and device exhaustion observations.
+        assert_eq!(utc_month(&now_utc_seconds()), "2026-10");
+        for device_only in [false, true] {
+            if device_only {
+                fs::write(&device_config, "[budget]\nmonthly_usd_cap = 1.0\n").unwrap();
+                config["budget"]["monthly_usd_cap"] = toml_edit::value(100.0);
+                fs::write(&folder_config, config.to_string()).unwrap();
+            }
+            for (month, paused) in [("2026-09", true), ("2026-10", false)] {
+                let status =
+                    compute_index_status(&searched, Some(&snapshot), &ledger_path, month).unwrap();
+                assert_eq!(
+                    status["budget_paused"], paused,
+                    "device_only={device_only} month={month}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn r23_aggregate_index_status_fails_closed_for_corrupt_scope_state() {
         use super::{SearchedScopeInfo, compute_index_status};
@@ -28567,6 +28685,7 @@ mod tests {
             &searched,
             None,
             std::path::Path::new("/private/test/cost-ledger.sqlite"),
+            "2026-09",
         )
         .unwrap();
         assert_eq!(status["tasks_complete"], false);

@@ -74,6 +74,21 @@ enum LedgerLeafState {
 }
 
 fn ledger_leaf_state(path: &std::path::Path) -> LedgerLeafState {
+    ledger_leaf_state_with_link_policy(path, true)
+}
+
+/// Observe the exact four-leaf state even when the fixture deliberately makes
+/// one leaf unsafe.  The normal helper above keeps its single-link assertion:
+/// tests that create a hard link opt into this narrower observer explicitly.
+#[cfg(unix)]
+fn unsafe_ledger_leaf_state(path: &std::path::Path) -> LedgerLeafState {
+    ledger_leaf_state_with_link_policy(path, false)
+}
+
+fn ledger_leaf_state_with_link_policy(
+    path: &std::path::Path,
+    require_single_link: bool,
+) -> LedgerLeafState {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -83,12 +98,16 @@ fn ledger_leaf_state(path: &std::path::Path) -> LedgerLeafState {
     };
     assert!(metadata.file_type().is_file(), "{}", path.display());
     #[cfg(unix)]
-    assert_eq!(
-        metadata.nlink(),
-        1,
-        "ledger leaf must not be hard-linked: {}",
-        path.display()
-    );
+    if require_single_link {
+        assert_eq!(
+            metadata.nlink(),
+            1,
+            "ledger leaf must not be hard-linked: {}",
+            path.display()
+        );
+    }
+    #[cfg(not(unix))]
+    let _ = require_single_link;
     let bytes = fs::read(path).unwrap();
     LedgerLeafState::Present(PresentLedgerLeafState {
         sha256: kio_core::cas::lower_hex(&Sha256::digest(&bytes)),
@@ -120,6 +139,20 @@ fn ledger_leaf_states(dir: &TempDir) -> [LedgerLeafState; 4] {
     ]
 }
 
+#[cfg(unix)]
+fn unsafe_ledger_leaf_states(dir: &TempDir) -> [LedgerLeafState; 4] {
+    let main = dir.path().join(".test-data/kio/cost-ledger.sqlite");
+    [
+        unsafe_ledger_leaf_state(&main),
+        unsafe_ledger_leaf_state(&std::path::PathBuf::from(format!(
+            "{}.write-seq",
+            main.display()
+        ))),
+        unsafe_ledger_leaf_state(&std::path::PathBuf::from(format!("{}-wal", main.display()))),
+        unsafe_ledger_leaf_state(&std::path::PathBuf::from(format!("{}-shm", main.display()))),
+    ]
+}
+
 fn seed_current_scope_charge(dir: &TempDir, usd: f64) {
     let repo = Repository::open(dir.path()).unwrap();
     let scope_id = repo.scope_identity().unwrap().scope_id;
@@ -138,6 +171,21 @@ fn seed_current_scope_charge(dir: &TempDir, usd: f64) {
             params![scope_id, usd],
         )
         .unwrap();
+}
+
+fn write_budget_caps(dir: &TempDir, device_cap: f64, folder_cap: f64) {
+    let device_dir = dir.path().join(".test-config/kio");
+    fs::create_dir_all(&device_dir).unwrap();
+    fs::write(
+        device_dir.join("config.toml"),
+        format!("[budget]\nmonthly_usd_cap = {device_cap}\n"),
+    )
+    .unwrap();
+    let folder_config_path = dir.path().join(".kio/config.toml");
+    let existing = fs::read_to_string(&folder_config_path).unwrap_or_default();
+    let mut document = existing.parse::<toml_edit::DocumentMut>().unwrap();
+    document["budget"]["monthly_usd_cap"] = toml_edit::value(folder_cap);
+    fs::write(folder_config_path, document.to_string()).unwrap();
 }
 
 fn assert_no_budget_paused_task(dir: &TempDir) {
@@ -586,6 +634,262 @@ fn pc6_auto_post_attempt_failure_retains_authorized_ledger_accounting() {
         fs::read_to_string(trace).unwrap().lines().count(),
         1,
         "the failure must occur after exactly one attempted query send"
+    );
+}
+
+/// A fresh hybrid page 1 must capture the read-only ledger snapshot before it
+/// can open the writable ledger, claim a query charge, or send the query to
+/// the online adapter.  A hard-linked source main is therefore a command-level
+/// integrity failure, with no trace and no source-leaf side effect.
+#[cfg(unix)]
+#[test]
+fn search_hybrid_unsafe_ledger_preflight_precedes_writable_claim_and_send() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("unsafe-hybrid-ledger.md"),
+        "# Unsafe hybrid ledger\n\nunsafehybridledgerneedle\n",
+    )
+    .unwrap();
+    kio(&dir, &["init"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index", "--approve"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+
+    let ledger_main = dir.path().join(".test-data/kio/cost-ledger.sqlite");
+    let alias = dir.path().join("unsafe-hybrid-ledger-alias.sqlite");
+    fs::hard_link(&ledger_main, &alias).unwrap();
+    let before = unsafe_ledger_leaf_states(&dir);
+    assert!(matches!(before[0], LedgerLeafState::Present(_)));
+    #[cfg(unix)]
+    assert_eq!(
+        match &before[0] {
+            LedgerLeafState::Present(leaf) => leaf.nlink,
+            LedgerLeafState::Absent => unreachable!("fixture must retain ledger main"),
+        },
+        2,
+        "fixture must make only the source main unsafe"
+    );
+
+    let trace = dir.path().join("unsafe-hybrid-query-embed.trace");
+    let output = private_kio_process(
+        &dir,
+        &[
+            "search",
+            "unsafehybridledgerneedle",
+            "--mode",
+            "hybrid",
+            "--limit",
+            "1",
+        ],
+    )
+    .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+    .env("KIO_TEST_QUERY_EMBED_TRACE", &trace)
+    .arg("--json")
+    .output()
+    .unwrap();
+
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(
+        error["error_code"], "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001",
+        "{error}"
+    );
+
+    let after = unsafe_ledger_leaf_states(&dir);
+    let changed_leaves = before
+        .iter()
+        .zip(after.iter())
+        .enumerate()
+        .filter_map(|(index, (before, after))| (before != after).then_some(index))
+        .collect::<Vec<_>>();
+    assert!(
+        !trace.exists() && changed_leaves.is_empty(),
+        "unsafe preflight must precede query send and every source leaf mutation; \
+         trace_exists={} changed_leaf_indexes={changed_leaves:?}",
+        trace.exists(),
+    );
+}
+
+/// Pure query-input validation still has precedence over the command-level
+/// ledger preflight.  The fixture combines an empty-token query with an unsafe
+/// source main and proves validation does not open, send, or normalize away
+/// that unsafe state.
+#[cfg(unix)]
+#[test]
+fn search_query_syntax_validation_precedes_unsafe_ledger_preflight() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("unsafe-input-precedence.md"),
+        "# Unsafe input precedence\n\nunsafeinputprecedenceneedle\n",
+    )
+    .unwrap();
+    kio(&dir, &["init"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index", "--approve"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+
+    let ledger_main = dir.path().join(".test-data/kio/cost-ledger.sqlite");
+    fs::hard_link(
+        &ledger_main,
+        dir.path().join("unsafe-input-precedence-alias.sqlite"),
+    )
+    .unwrap();
+    let before = unsafe_ledger_leaf_states(&dir);
+    let trace = dir.path().join("unsafe-input-precedence.trace");
+    let output = private_kio_process(&dir, &["search", "\u{2003}", "--mode", "hybrid"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .env("KIO_TEST_QUERY_EMBED_TRACE", &trace)
+        .arg("--json")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error_code"], "KIO-E-CONFIG-USAGE-001", "{error}");
+    assert!(
+        !trace.exists(),
+        "input validation must not send a query embedding"
+    );
+    assert_eq!(
+        unsafe_ledger_leaf_states(&dir),
+        before,
+        "input validation must leave the unsafe source main/write-seq/WAL/SHM exact"
+    );
+}
+
+/// `index_status` is bound to the invocation's preflight snapshot.  A folder
+/// writer that reaches its cap at the final-consent barrier affects the next
+/// invocation, but cannot retroactively turn this response into
+/// `budget_paused=true`.
+#[test]
+fn search_response_budget_status_reuses_preflight_snapshot_after_folder_cap_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(
+        dir.path().join("preflight-budget-snapshot.md"),
+        "# Preflight budget snapshot\n\npreflightbudgetsnapshotneedle\n",
+    )
+    .unwrap();
+    kio(&dir, &["init"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index", "--approve"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    assert_no_budget_paused_task(&dir);
+    write_budget_caps(&dir, 10.0, 1.0);
+    let folder_config: toml::Value =
+        toml::from_str(&fs::read_to_string(dir.path().join(".kio/config.toml")).unwrap()).unwrap();
+    assert_eq!(
+        folder_config["adapter"]["policy"]["allow_network"].as_bool(),
+        Some(true),
+        "the race fixture must retain index --approve's online consent gate"
+    );
+    let baseline = private_kio_process(
+        &dir,
+        &[
+            "search",
+            "preflightbudgetsnapshotneedle",
+            "--mode",
+            "text",
+            "--limit",
+            "1",
+        ],
+    )
+    .arg("--json")
+    .output()
+    .unwrap();
+    assert!(baseline.status.success(), "{baseline:?}");
+    let baseline: Value = serde_json::from_slice(&baseline.stdout).unwrap();
+    assert_eq!(
+        baseline["index_status"]["budget_paused"], false,
+        "fixture must begin below the folder cap: {baseline}"
+    );
+
+    let ready = dir.path().join("preflight-budget-final-consent.ready");
+    let release = ready.with_extension("release");
+    let trace = dir.path().join("preflight-budget-query-embed.trace");
+    let mut child = private_kio_process(
+        &dir,
+        &[
+            "search",
+            "preflightbudgetsnapshotneedle",
+            "--mode",
+            "hybrid",
+            "--limit",
+            "1",
+        ],
+    )
+    .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+    .env("KIO_TEST_SEARCH_FINAL_CONSENT_BARRIER_READY", &ready)
+    .env("KIO_TEST_QUERY_EMBED_TRACE", &trace)
+    .arg("--json")
+    .stdout(std::process::Stdio::piped())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+    wait_for_search_response_barrier(&ready, &mut child);
+    #[cfg(target_os = "macos")]
+    assert_search_child_process_tree(&child);
+
+    seed_current_scope_charge(&dir, 1.0);
+    fs::write(&release, b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["requested_mode"], "hybrid", "{response}");
+    assert_eq!(response["resolved_mode"], "hybrid", "{response}");
+    assert_eq!(
+        response["index_status"]["budget_paused"], false,
+        "this response must retain its preflight budget observation: {response}"
+    );
+    assert_no_budget_paused_task(&dir);
+    assert_eq!(
+        fs::read_to_string(&trace).unwrap().lines().count(),
+        1,
+        "preflight success still permits exactly one fresh hybrid query send"
+    );
+
+    let following = private_kio_process(
+        &dir,
+        &[
+            "search",
+            "preflightbudgetsnapshotneedle",
+            "--mode",
+            "text",
+            "--limit",
+            "1",
+        ],
+    )
+    .arg("--json")
+    .output()
+    .unwrap();
+    assert!(
+        following.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&following.stdout),
+        String::from_utf8_lossy(&following.stderr)
+    );
+    let following: Value = serde_json::from_slice(&following.stdout).unwrap();
+    assert_eq!(
+        following["index_status"]["budget_paused"], true,
+        "the next invocation must observe the writer-raised folder cap: {following}"
     );
 }
 
@@ -1232,6 +1536,19 @@ fn r23_01_fresh_vector_page_one_retains_allowed_ledger_open_semantics() {
         .success();
     assert_no_budget_paused_task(&dir);
 
+    // Leave enough device headroom for the query reservation, but less than
+    // the mock's measured charge (one reported token per input character).
+    // This invocation must report the below-cap preflight state even though
+    // its own settlement exhausts the cap for the following search.
+    let ledger_path = dir.path().join(".test-data/kio/cost-ledger.sqlite");
+    let month = kio_pipeline::ledger::time::utc_month_of(kio_pipeline::ledger::time::now_millis());
+    let spent_before = kio_pipeline::ledger::LedgerReadSnapshot::open(&ledger_path)
+        .unwrap()
+        .month_total(None, None, &month)
+        .unwrap();
+    let device_cap = spent_before + 0.000_002;
+    write_budget_caps(&dir, device_cap, 1.0);
+
     let write_seq = dir
         .path()
         .join(".test-data/kio/cost-ledger.sqlite.write-seq");
@@ -1254,6 +1571,19 @@ fn r23_01_fresh_vector_page_one_retains_allowed_ledger_open_semantics() {
     );
     assert_eq!(response["requested_mode"], "vector", "{response}");
     assert_eq!(response["resolved_mode"], "vector", "{response}");
+    assert_eq!(
+        response["index_status"]["budget_paused"], false,
+        "{response}"
+    );
+    let spent_after = kio_pipeline::ledger::LedgerReadSnapshot::open(&ledger_path)
+        .unwrap()
+        .month_total(None, None, &month)
+        .unwrap();
+    assert!(
+        spent_after >= device_cap,
+        "the fresh query must settle a charge that exhausts the cap: \
+         before={spent_before} after={spent_after} cap={device_cap}"
+    );
     assert!(
         matches!(ledger_leaf_states(&dir)[1], LedgerLeafState::Present(_)),
         "fresh vector page 1 remains allowed to open the ledger and recreate write-seq"
@@ -1263,6 +1593,16 @@ fn r23_01_fresh_vector_page_one_retains_allowed_ledger_open_semantics() {
         fs::read_to_string(trace).unwrap().lines().count(),
         1,
         "fresh vector page 1 performs exactly one embedding request"
+    );
+    let following = private_kio_process(&dir, &["search", "vectorpageoneneedle", "--mode", "text"])
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert!(following.status.success(), "{following:?}");
+    let following: Value = serde_json::from_slice(&following.stdout).unwrap();
+    assert_eq!(
+        following["index_status"]["budget_paused"], true,
+        "{following}"
     );
 }
 
