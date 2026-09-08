@@ -49,6 +49,16 @@ pub const MAX_XLSX_ROWS_PER_SHEET: usize = 50_000;
 /// Columns read per row.
 pub const MAX_XLSX_COLUMNS: usize = 1_024;
 
+/// Cells materialized across a complete workbook, including the empty cells
+/// introduced to preserve a sparse row's column positions.
+pub const MAX_XLSX_CELLS_PER_WORKBOOK: usize = 1_000_000;
+
+/// Text bytes materialized into cells across a complete workbook.
+pub const MAX_XLSX_CELL_TEXT_BYTES: usize = 16 * 1024 * 1024;
+
+/// Markdown bytes rendered across a complete workbook.
+pub const MAX_XLSX_MARKDOWN_BYTES: usize = 16 * 1024 * 1024;
+
 /// Ceiling on any single inflated ZIP member. `xl/worksheets/sheetN.xml` is the
 /// large one; 64 MB of sheet XML is far past any real document and stops a ZIP
 /// bomb from being decompressed into memory.
@@ -116,6 +126,9 @@ pub fn extract_xlsx(bytes: &[u8]) -> Result<XlsxDocument> {
     };
 
     let mut sheets = Vec::with_capacity(sheet_refs.len());
+    let mut materialized_cells = 0;
+    let mut materialized_cell_text_bytes = 0;
+    let mut rendered_markdown_bytes = 0;
     for (index, sheet_ref) in sheet_refs.iter().enumerate() {
         // Resolve through the relationship id when it is present; fall back to
         // positional `sheetN.xml`, which is what every writer emits anyway.
@@ -131,10 +144,19 @@ pub fn extract_xlsx(bytes: &[u8]) -> Result<XlsxDocument> {
                 sheet_ref.name
             )));
         };
-        let grid = parse_sheet(&inflate_entry(bytes, entry)?, &shared, &formats)?;
+        let grid = parse_sheet(
+            &inflate_entry(bytes, entry)?,
+            &shared,
+            &formats,
+            &mut materialized_cells,
+            &mut materialized_cell_text_bytes,
+        )?;
+        let markdown =
+            grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES - rendered_markdown_bytes)?;
+        rendered_markdown_bytes += markdown.len();
         sheets.push(XlsxSheet {
             name: sheet_ref.name.clone(),
-            markdown: grid_to_markdown(&grid),
+            markdown,
         });
     }
 
@@ -543,7 +565,13 @@ fn parse_styles(xml: &[u8]) -> Result<CellFormats> {
     Ok(formats)
 }
 
-fn parse_sheet(xml: &[u8], shared: &[String], formats: &CellFormats) -> Result<Vec<Vec<String>>> {
+fn parse_sheet(
+    xml: &[u8],
+    shared: &[String],
+    formats: &CellFormats,
+    materialized_cells: &mut usize,
+    materialized_cell_text_bytes: &mut usize,
+) -> Result<Vec<Vec<String>>> {
     let mut reader = reader_for(xml);
     let mut buf = Vec::new();
     let mut grid: Vec<Vec<String>> = Vec::new();
@@ -558,33 +586,66 @@ fn parse_sheet(xml: &[u8], shared: &[String], formats: &CellFormats) -> Result<V
     /// over the columns the writer omitted because they were empty. Without
     /// the padding a sparse row would shift left and a Markdown column would
     /// stop meaning one spreadsheet column.
-    fn place(row: &mut Vec<String>, column: usize, value: String) {
-        while row.len() < column {
-            row.push(String::new());
+    fn place(
+        row: &mut Vec<String>,
+        column: usize,
+        value: String,
+        materialized_cells: &mut usize,
+    ) -> Result<()> {
+        if column >= MAX_XLSX_COLUMNS {
+            return Err(AdapterError::ContractViolation(format!(
+                "XLSX row references column {}, over the {MAX_XLSX_COLUMNS}-column bound",
+                column + 1
+            )));
         }
+        if column < row.len() {
+            return Err(AdapterError::ContractViolation(
+                "XLSX row has duplicate or backwards cell references".to_owned(),
+            ));
+        }
+        let additions = column + 1 - row.len();
+        if materialized_cells.saturating_add(additions) > MAX_XLSX_CELLS_PER_WORKBOOK {
+            return Err(AdapterError::ContractViolation(format!(
+                "XLSX workbook exceeds the {MAX_XLSX_CELLS_PER_WORKBOOK}-cell bound"
+            )));
+        }
+        row.reserve(additions);
+        row.resize_with(column, String::new);
         row.push(value);
+        *materialized_cells += additions;
+        Ok(())
+    }
+
+    fn admit_row(grid: &[Vec<String>], in_row: bool, cell: &Option<CellState>) -> Result<()> {
+        if in_row || cell.is_some() {
+            return Err(AdapterError::ContractViolation(
+                "XLSX sheet has nested rows".to_owned(),
+            ));
+        }
+        if grid.len() >= MAX_XLSX_ROWS_PER_SHEET {
+            return Err(AdapterError::ContractViolation(format!(
+                "XLSX sheet exceeds the {MAX_XLSX_ROWS_PER_SHEET}-row bound"
+            )));
+        }
+        Ok(())
     }
 
     loop {
         match reader.read_event_into(&mut buf).map_err(xml_error)? {
             Event::Start(event) => match local_name(event.name().as_ref()) {
                 b"row" => {
-                    if grid.len() >= MAX_XLSX_ROWS_PER_SHEET {
-                        return Err(AdapterError::ContractViolation(format!(
-                            "XLSX sheet exceeds the {MAX_XLSX_ROWS_PER_SHEET}-row bound"
-                        )));
-                    }
+                    admit_row(&grid, in_row, &cell)?;
                     in_row = true;
                     row = Vec::new();
                 }
                 b"c" => {
-                    if row.len() >= MAX_XLSX_COLUMNS {
-                        return Err(AdapterError::ContractViolation(format!(
-                            "XLSX row exceeds the {MAX_XLSX_COLUMNS}-column bound"
-                        )));
+                    if !in_row || cell.is_some() {
+                        return Err(AdapterError::ContractViolation(
+                            "XLSX sheet has nested or out-of-row cells".to_owned(),
+                        ));
                     }
                     text.clear();
-                    cell = Some(CellState::from(&event, row.len()));
+                    cell = Some(CellState::from(&event, row.len())?);
                 }
                 b"v" => in_value = true,
                 // `<is><t>` — an inline string, used by writers that skip the
@@ -595,25 +656,40 @@ fn parse_sheet(xml: &[u8], shared: &[String], formats: &CellFormats) -> Result<V
             // `<row/>` and `<c r="B2" s="4"/>` are self-closing: a styled but
             // empty cell is extremely common, and it never sees an `End`.
             Event::Empty(event) => match local_name(event.name().as_ref()) {
-                b"row" => grid.push(Vec::new()),
+                b"row" => {
+                    admit_row(&grid, in_row, &cell)?;
+                    grid.push(Vec::new());
+                }
                 b"c" => {
-                    let state = CellState::from(&event, row.len());
-                    place(&mut row, state.column, String::new());
+                    if !in_row || cell.is_some() {
+                        return Err(AdapterError::ContractViolation(
+                            "XLSX sheet has nested or out-of-row cells".to_owned(),
+                        ));
+                    }
+                    let state = CellState::from(&event, row.len())?;
+                    place(&mut row, state.column, String::new(), materialized_cells)?;
                 }
                 _ => {}
             },
             Event::End(event) => match local_name(event.name().as_ref()) {
                 b"row" => {
-                    if in_row {
-                        grid.push(std::mem::take(&mut row));
+                    if !in_row || cell.is_some() {
+                        return Err(AdapterError::ContractViolation(
+                            "XLSX sheet has an unmatched row boundary".to_owned(),
+                        ));
                     }
+                    grid.push(std::mem::take(&mut row));
                     in_row = false;
                 }
                 b"c" => {
-                    if let Some(state) = cell.take() {
-                        let value = resolve_cell(&text, &state, shared, formats)?;
-                        place(&mut row, state.column, value);
-                    }
+                    let state = cell.take().ok_or_else(|| {
+                        AdapterError::ContractViolation(
+                            "XLSX sheet has an unmatched cell boundary".to_owned(),
+                        )
+                    })?;
+                    let value =
+                        resolve_cell(&text, &state, shared, formats, materialized_cell_text_bytes)?;
+                    place(&mut row, state.column, value, materialized_cells)?;
                     text.clear();
                 }
                 b"v" => in_value = false,
@@ -626,7 +702,14 @@ fn parse_sheet(xml: &[u8], shared: &[String], formats: &CellFormats) -> Result<V
             Event::GeneralRef(reference) if in_value || in_inline_text => {
                 text.push_str(&decoded_reference(&reference)?);
             }
-            Event::Eof => break,
+            Event::Eof => {
+                if in_row || cell.is_some() {
+                    return Err(AdapterError::ContractViolation(
+                        "XLSX sheet ends inside a row or cell".to_owned(),
+                    ));
+                }
+                break;
+            }
             _ => {}
         }
         buf.clear();
@@ -641,15 +724,22 @@ struct CellState {
 }
 
 impl CellState {
-    fn from(event: &quick_xml::events::BytesStart<'_>, fallback_column: usize) -> Self {
-        Self {
-            column: attribute(event, "r")
-                .as_deref()
-                .map(column_index_from_ref)
-                .unwrap_or(fallback_column),
+    fn from(event: &quick_xml::events::BytesStart<'_>, fallback_column: usize) -> Result<Self> {
+        let column = match attribute(event, "r") {
+            Some(reference) => column_index_from_ref_checked(&reference)?,
+            None => fallback_column,
+        };
+        if column >= MAX_XLSX_COLUMNS {
+            return Err(AdapterError::ContractViolation(format!(
+                "XLSX row references column {}, over the {MAX_XLSX_COLUMNS}-column bound",
+                column + 1
+            )));
+        }
+        Ok(Self {
+            column,
             kind: attribute(event, "t"),
             style: attribute(event, "s").and_then(|value| value.parse::<usize>().ok()),
-        }
+        })
     }
 }
 
@@ -694,7 +784,28 @@ fn resolve_cell(
     state: &CellState,
     shared: &[String],
     formats: &CellFormats,
+    materialized_cell_text_bytes: &mut usize,
 ) -> Result<String> {
+    fn admit_text_bytes(used: &mut usize, bytes: usize) -> Result<()> {
+        if used.saturating_add(bytes) > MAX_XLSX_CELL_TEXT_BYTES {
+            return Err(AdapterError::ContractViolation(format!(
+                "XLSX workbook exceeds the {MAX_XLSX_CELL_TEXT_BYTES}-byte cell-text bound"
+            )));
+        }
+        *used += bytes;
+        Ok(())
+    }
+
+    fn formatted_value_bound(raw: &str, format_code: Option<&str>) -> usize {
+        // A finite f64 needs at most 309 integral digits, a sign, decimal
+        // separator, and the percent/date punctuation. The custom code bounds
+        // the requested decimal places, so its byte length covers the only
+        // unbounded part of the rendered numeric representation.
+        raw.len()
+            .saturating_add(format_code.map_or(0, str::len))
+            .saturating_add(320)
+    }
+
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(String::new());
@@ -706,20 +817,40 @@ fn resolve_cell(
                     "XLSX shared-string cell holds a non-numeric index `{raw}`"
                 ))
             })?;
-            shared.get(index).cloned().ok_or_else(|| {
+            let value = shared.get(index).ok_or_else(|| {
                 AdapterError::ContractViolation(format!(
                     "XLSX cell references shared string {index}, past the {} in the table",
                     shared.len()
                 ))
-            })
+            })?;
+            admit_text_bytes(materialized_cell_text_bytes, value.len())?;
+            Ok(value.clone())
         }
         // Inline string, boolean, error, formula-string: already text.
-        Some("inlineStr") | Some("str") => Ok(raw.to_owned()),
-        Some("b") => Ok(if raw == "1" { "TRUE" } else { "FALSE" }.to_owned()),
-        Some("e") => Ok(raw.to_owned()),
+        Some("inlineStr") | Some("str") | Some("e") => {
+            admit_text_bytes(materialized_cell_text_bytes, raw.len())?;
+            Ok(raw.to_owned())
+        }
+        Some("b") => {
+            let value = if raw == "1" { "TRUE" } else { "FALSE" };
+            admit_text_bytes(materialized_cell_text_bytes, value.len())?;
+            Ok(value.to_owned())
+        }
         // Numeric (`t` absent or `n`) — the branch where the stored value and
         // the document's meaning diverge.
-        _ => Ok(format_cell(raw, formats.code_for_style(state.style))),
+        _ => {
+            let format_code = formats.code_for_style(state.style);
+            let reserved = formatted_value_bound(raw, format_code);
+            admit_text_bytes(materialized_cell_text_bytes, reserved)?;
+            let value = format_cell(raw, format_code);
+            if value.len() > reserved {
+                return Err(AdapterError::ContractViolation(
+                    "XLSX numeric cell exceeds its checked render bound".to_owned(),
+                ));
+            }
+            *materialized_cell_text_bytes -= reserved - value.len();
+            Ok(value)
+        }
     }
 }
 
@@ -903,19 +1034,34 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// `"C2"` → 2 (0-based column). Ignores the row part.
-fn column_index_from_ref(cell_ref: &str) -> usize {
+fn column_index_from_ref_checked(cell_ref: &str) -> Result<usize> {
     let mut index = 0usize;
+    let mut saw_column = false;
     for ch in cell_ref.chars() {
         if !ch.is_ascii_alphabetic() {
             break;
         }
-        index = index * 26 + (ch.to_ascii_uppercase() as usize - 'A' as usize + 1);
+        saw_column = true;
+        index = index
+            .checked_mul(26)
+            .and_then(|value| {
+                value.checked_add(ch.to_ascii_uppercase() as usize - 'A' as usize + 1)
+            })
+            .ok_or_else(|| {
+                AdapterError::ContractViolation("XLSX cell reference column overflows".to_owned())
+            })?;
         if index > MAX_XLSX_COLUMNS {
-            return MAX_XLSX_COLUMNS;
+            return Err(AdapterError::ContractViolation(format!(
+                "XLSX row references column {index}, over the {MAX_XLSX_COLUMNS}-column bound"
+            )));
         }
     }
-    index.saturating_sub(1)
+    if !saw_column {
+        return Err(AdapterError::ContractViolation(
+            "XLSX cell reference has no column".to_owned(),
+        ));
+    }
+    Ok(index - 1)
 }
 
 // ---------------------------------------------------------------------------
@@ -937,45 +1083,103 @@ fn populated(row: &[String]) -> usize {
 ///
 /// So a blank row ends a region, and each region is rendered on its own terms:
 /// its own header row and its own column trimming.
-fn grid_to_markdown(grid: &[Vec<String>]) -> String {
-    let mut blocks = Vec::new();
+fn grid_to_markdown_with_limit(grid: &[Vec<String>], limit: usize) -> Result<String> {
+    let mut out = BoundedMarkdown::new(limit);
+    let mut has_block = false;
     for region in grid.split(|row| populated(row) == 0) {
         if region.is_empty() {
             continue;
         }
-        let block = region_to_markdown(region);
-        if !block.is_empty() {
-            blocks.push(block);
+        if !region.iter().any(|row| populated(row) != 0) {
+            continue;
+        }
+        if has_block {
+            out.push_str("\n\n")?;
+        }
+        region_to_markdown(region, &mut out)?;
+        out.trim_end();
+        has_block = true;
+    }
+    out.trim_end();
+    Ok(out.into_string())
+}
+
+struct BoundedMarkdown {
+    out: String,
+    limit: usize,
+}
+
+impl BoundedMarkdown {
+    fn new(limit: usize) -> Self {
+        Self {
+            out: String::new(),
+            limit,
         }
     }
-    blocks.join("\n\n")
+
+    fn push_str(&mut self, value: &str) -> Result<()> {
+        let length = self.out.len().checked_add(value.len()).ok_or_else(|| {
+            AdapterError::ContractViolation("XLSX Markdown length overflows".to_owned())
+        })?;
+        if length > self.limit {
+            return Err(AdapterError::ContractViolation(format!(
+                "XLSX workbook Markdown exceeds the {MAX_XLSX_MARKDOWN_BYTES}-byte bound"
+            )));
+        }
+        self.out.push_str(value);
+        Ok(())
+    }
+
+    fn push_cell(&mut self, value: &str) -> Result<()> {
+        let mut parts = value.split('|').peekable();
+        while let Some(part) = parts.next() {
+            self.push_str(part)?;
+            if parts.peek().is_some() {
+                self.push_str("\\|")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn trim_end(&mut self) {
+        let length = self.out.trim_end().len();
+        self.out.truncate(length);
+    }
+
+    fn into_string(self) -> String {
+        self.out
+    }
 }
 
 /// One blank-row-delimited region. A region whose rows never reach two
 /// populated cells is prose (a title, a trailing note), not a table.
-fn region_to_markdown(region: &[Vec<String>]) -> String {
+fn region_to_markdown(region: &[Vec<String>], out: &mut BoundedMarkdown) -> Result<()> {
     let width = region.iter().map(Vec::len).max().unwrap_or(0);
     if width == 0 {
-        return String::new();
+        return Ok(());
     }
     let header_at = region.iter().position(|row| populated(row) >= 2);
 
-    let mut out = String::new();
     let preamble_end = header_at.unwrap_or(region.len());
     for row in &region[..preamble_end] {
-        let line = row
+        let mut has_cell = false;
+        for cell in row
             .iter()
             .map(|cell| cell.trim())
             .filter(|cell| !cell.is_empty())
-            .collect::<Vec<_>>()
-            .join(" ");
-        if !line.is_empty() {
-            out.push_str(&line);
-            out.push_str("\n\n");
+        {
+            if has_cell {
+                out.push_str(" ")?;
+            }
+            out.push_str(cell)?;
+            has_cell = true;
+        }
+        if has_cell {
+            out.push_str("\n\n")?;
         }
     }
     let Some(header_at) = header_at else {
-        return out.trim_end().to_owned();
+        return Ok(());
     };
 
     let table = &region[header_at..];
@@ -990,30 +1194,27 @@ fn region_to_markdown(region: &[Vec<String>]) -> String {
         })
         .collect();
     if keep.is_empty() {
-        return out.trim_end().to_owned();
+        return Ok(());
     }
-    let cell_at = |row: &Vec<String>, column: usize| -> String {
-        row.get(column)
-            .map(|cell| cell.trim().replace('|', "\\|"))
-            .unwrap_or_default()
-    };
     for (index, row) in table.iter().enumerate() {
-        out.push('|');
+        out.push_str("|")?;
         for column in &keep {
-            out.push(' ');
-            out.push_str(&cell_at(row, *column));
-            out.push_str(" |");
-        }
-        out.push('\n');
-        if index == 0 {
-            out.push('|');
-            for _ in &keep {
-                out.push_str(" --- |");
+            out.push_str(" ")?;
+            if let Some(cell) = row.get(*column) {
+                out.push_cell(cell.trim())?;
             }
-            out.push('\n');
+            out.push_str(" |")?;
+        }
+        out.push_str("\n")?;
+        if index == 0 {
+            out.push_str("|")?;
+            for _ in &keep {
+                out.push_str(" --- |")?;
+            }
+            out.push_str("\n")?;
         }
     }
-    out.trim_end().to_owned()
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1080,10 +1281,165 @@ mod tests {
 
     #[test]
     fn a_cell_reference_resolves_to_its_column() {
-        assert_eq!(column_index_from_ref("A1"), 0);
-        assert_eq!(column_index_from_ref("C2"), 2);
-        assert_eq!(column_index_from_ref("Z9"), 25);
-        assert_eq!(column_index_from_ref("AA1"), 26);
+        assert_eq!(column_index_from_ref_checked("A1").unwrap(), 0);
+        assert_eq!(column_index_from_ref_checked("C2").unwrap(), 2);
+        assert_eq!(column_index_from_ref_checked("Z9").unwrap(), 25);
+        assert_eq!(column_index_from_ref_checked("AA1").unwrap(), 26);
+    }
+
+    #[test]
+    fn self_closing_rows_and_cells_share_the_same_bounds_as_start_events() {
+        let mut cells = 0;
+        let mut text_bytes = 0;
+        let self_closing_row = b"<worksheet><sheetData><row/></sheetData></worksheet>";
+        let grid = parse_sheet(
+            self_closing_row,
+            &[],
+            &CellFormats::default(),
+            &mut cells,
+            &mut text_bytes,
+        )
+        .expect("self-closing row");
+        assert_eq!(grid, vec![Vec::<String>::new()]);
+
+        let overflow = b"<worksheet><sheetData><row><c r=\"AMK1\"/></row></sheetData></worksheet>";
+        assert!(
+            parse_sheet(
+                overflow,
+                &[],
+                &CellFormats::default(),
+                &mut cells,
+                &mut text_bytes,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn self_closing_rows_and_cells_cannot_bypass_cardinality_limits() {
+        let mut rows = String::from("<worksheet><sheetData>");
+        for _ in 0..=MAX_XLSX_ROWS_PER_SHEET {
+            rows.push_str("<row/>");
+        }
+        rows.push_str("</sheetData></worksheet>");
+        let mut cells = 0;
+        let mut text_bytes = 0;
+        assert!(
+            parse_sheet(
+                rows.as_bytes(),
+                &[],
+                &CellFormats::default(),
+                &mut cells,
+                &mut text_bytes,
+            )
+            .is_err()
+        );
+
+        let mut repeated_cells = String::from("<worksheet><sheetData><row>");
+        for _ in 0..=MAX_XLSX_COLUMNS {
+            repeated_cells.push_str("<c/>");
+        }
+        repeated_cells.push_str("</row></sheetData></worksheet>");
+        let mut cells = 0;
+        let mut text_bytes = 0;
+        assert!(
+            parse_sheet(
+                repeated_cells.as_bytes(),
+                &[],
+                &CellFormats::default(),
+                &mut cells,
+                &mut text_bytes,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sparse_huge_and_backwards_references_are_refused_before_padding() {
+        let mut cells = 0;
+        let mut text_bytes = 0;
+        let huge = b"<worksheet><sheetData><row><c r=\"ZZZ1\"/></row></sheetData></worksheet>";
+        assert!(
+            parse_sheet(
+                huge,
+                &[],
+                &CellFormats::default(),
+                &mut cells,
+                &mut text_bytes
+            )
+            .is_err()
+        );
+
+        let backwards =
+            b"<worksheet><sheetData><row><c r=\"B1\"/><c r=\"A1\"/></row></sheetData></worksheet>";
+        assert!(
+            parse_sheet(
+                backwards,
+                &[],
+                &CellFormats::default(),
+                &mut cells,
+                &mut text_bytes
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn mixed_start_and_empty_cells_preserve_sparse_columns() {
+        let mut cells = 0;
+        let mut text_bytes = 0;
+        let xml = b"<worksheet><sheetData><row><c r=\"A1\"/><c r=\"C1\"><v>value</v></c></row><row/></sheetData></worksheet>";
+        let grid = parse_sheet(
+            xml,
+            &[],
+            &CellFormats::default(),
+            &mut cells,
+            &mut text_bytes,
+        )
+        .expect("parse");
+        assert_eq!(
+            grid[0],
+            vec![String::new(), String::new(), "value".to_owned()]
+        );
+        assert_eq!(grid[1], Vec::<String>::new());
+        assert_eq!(cells, 3);
+    }
+
+    #[test]
+    fn workbook_cell_and_markdown_budgets_are_checked_before_growth() {
+        let mut cells = MAX_XLSX_CELLS_PER_WORKBOOK - 1;
+        let mut text_bytes = 0;
+        let xml =
+            b"<worksheet><sheetData><row><c r=\"A1\"/><c r=\"B1\"/></row></sheetData></worksheet>";
+        assert!(
+            parse_sheet(
+                xml,
+                &[],
+                &CellFormats::default(),
+                &mut cells,
+                &mut text_bytes
+            )
+            .is_err()
+        );
+
+        let mut cells = 0;
+        let mut text_bytes = MAX_XLSX_CELL_TEXT_BYTES;
+        let shared = vec!["x".repeat(1024)];
+        let shared_cell =
+            b"<worksheet><sheetData><row><c r=\"A1\" t=\"s\"><v>0</v></c></row></sheetData></worksheet>";
+        assert!(
+            parse_sheet(
+                shared_cell,
+                &shared,
+                &CellFormats::default(),
+                &mut cells,
+                &mut text_bytes,
+            )
+            .is_err()
+        );
+
+        let grid = vec![vec!["a|b".to_owned(), "c".to_owned()]];
+        assert!(grid_to_markdown_with_limit(&grid, 5).is_err());
     }
 
     // ---- markdown --------------------------------------------------------
@@ -1095,7 +1451,7 @@ mod tests {
             vec!["対象領域".into(), "状態".into()],
             vec!["決済ルーティング".into(), "確認済".into()],
         ];
-        let md = grid_to_markdown(&grid);
+        let md = grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES).expect("render");
         assert_eq!(
             md,
             "タイトル\n\n| 対象領域 | 状態 |\n| --- | --- |\n| 決済ルーティング | 確認済 |"
@@ -1105,7 +1461,23 @@ mod tests {
     #[test]
     fn a_pipe_in_a_cell_cannot_break_the_table() {
         let grid = vec![vec!["a|b".into(), "c".into()], vec!["d".into(), "e".into()]];
-        assert!(grid_to_markdown(&grid).contains("a\\|b"));
+        assert!(
+            grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES)
+                .expect("render")
+                .contains("a\\|b")
+        );
+    }
+
+    #[test]
+    fn a_normal_sparse_table_still_renders_with_escaped_cells() {
+        let grid = vec![
+            vec!["title".into(), String::new(), "state".into()],
+            vec!["Kio|v1".into(), String::new(), "ready".into()],
+        ];
+        assert_eq!(
+            grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES).expect("render"),
+            "| title | state |\n| --- | --- |\n| Kio\\|v1 | ready |"
+        );
     }
 
     #[test]
@@ -1116,7 +1488,7 @@ mod tests {
             vec!["h1".into(), String::new(), "h2".into()],
             vec!["v1".into(), String::new(), "v2".into()],
         ];
-        let md = grid_to_markdown(&grid);
+        let md = grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES).expect("render");
         assert_eq!(md, "| h1 | h2 |\n| --- | --- |\n| v1 | v2 |");
     }
 
@@ -1133,7 +1505,7 @@ mod tests {
             vec!["領域".into(), "状態".into(), "担当".into()],
             vec!["決済".into(), "確認済".into(), "Platform".into()],
         ];
-        let md = grid_to_markdown(&grid);
+        let md = grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES).expect("render");
         assert_eq!(
             md,
             "| 確認率 | 影響行 |\n| --- | --- |\n| 50% | 74 |\n\n\
@@ -1148,7 +1520,7 @@ mod tests {
             vec![String::new(), String::new()],
             vec!["メモ：状態を更新してから統合判断へ進みます。".into()],
         ];
-        let md = grid_to_markdown(&grid);
+        let md = grid_to_markdown_with_limit(&grid, MAX_XLSX_MARKDOWN_BYTES).expect("render");
         assert!(md.ends_with("メモ：状態を更新してから統合判断へ進みます。"));
         assert!(!md.contains("| メモ"));
     }

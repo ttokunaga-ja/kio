@@ -76,9 +76,13 @@ Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱す�
 > (TeX / LibreOffice 出力) は FlateDecode 圧縮 content stream + subset font の glyph index +
 > font ごとの ToUnicode CMap (TeX Live はさらに `/Type /ObjStm` 内へ辞書を格納) で構成される。
 > deterministic Adapter の text layer 抽出はここまでを対象とする: **FlateDecode の有界展開**
-> (stream あたり 16 MiB 上限 — 超過は既存の 256 page 上限と同型の contract 違反)、`/Type /ObjStm`
+> (stream あたり 16 MiB 上限)、`/Type /ObjStm`
 > の展開、Page → Resources → Font → ToUnicode の解決、CMap (`bfchar`/`bfrange`) による glyph
-> index 復号。**確信を持って復号できないファイルは空抽出へ縮退し (fail-empty)、従来どおり
+> index 復号。1 decode の resource ceiling は object 8,192 個 / materialized object 128 MiB /
+> decoded stream 合計 64 MiB / page content 16 MiB / emitted text 32 MiB / materialized CMap
+> 65,536 entries・32 MiB / page あたり content reference 8,192 個である。これらの超過と malformed
+> object-stream admission は `contract_violation` として拒否し、より弱い fallback へ送らない。
+> **確信を持って復号できないファイルは空抽出へ縮退し (fail-empty)、従来どおり
 > online OCR ルーティングに乗る** — FlateDecode 以外の filter (DCTDecode 等)・ToUnicode を
 > 持たない font の glyph 列・スキャン/画像系は引き続き OCR の領分である。この抽出意味論の
 > 変更は deterministic profile の `model_version_pin` 1.0.0 → 1.1.0 として**新
@@ -449,7 +453,12 @@ unit** だからであり、sheet にはそれが無い。実測: 10 列 1 シ�
 指し先として誤りであり、OCR を通せばさらに劣化する。加えて cell は**既に構造化テキスト**であり、
 画素へ落として読み戻すのは失われていない構造を壊す往復である。
 
-したがって XLSX は**ローカルで決定論的に直接抽出する** (`kio_adapter::xlsx_extract`)。
+したがって XLSX は**ローカルで決定論的に直接抽出する** (`kio_adapter::xlsx_extract`)。受理上限は
+workbook あたり 256 sheets・1,000,000 cells（疎な列位置の padding を含む）・セル文字列合計 16 MiB・
+出力 Markdown 合計 16 MiB、sheet あたり 50,000 rows・1,024 columns、ZIP central-directory 4,096 entries、
+任意の inflated ZIP member 64 MiB とする。self-closing row/cell にも同じ上限を適用し、
+共有文字列の複写・列 padding・Markdown escape より前に残量を検査する。超過・不正 ZIP/XML は部分抽出や空成功にせず
+`KIO-E-PREPARE-XLSX-EXTRACT-001` の contract violation とする。
 
 - **unit = worksheet 1 枚**。`unit_key` は 04 §2 / QB27 の `sheet:` 規則 —
   NFC 正規化 → 元名の `#` を `##` へ escape → **その後で**同名 2 枚目以降に `#2` / `#3` を付す
