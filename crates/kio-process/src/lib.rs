@@ -305,13 +305,13 @@ impl SupervisedChild {
                 let _ = child.wait();
                 return Err(BoundedProcessError::Isolation(error));
             }
-            return Ok(Self {
+            Ok(Self {
                 child,
                 deadline,
                 max_lifetime,
                 terminal_status: None,
                 job,
-            });
+            })
         }
 
         #[cfg(not(windows))]
@@ -517,12 +517,12 @@ fn resume_suspended_process(child: &Child) -> Result<(), std::io::Error> {
             }
             let mut owner_thread = None;
             loop {
-                if entry.th32OwnerProcessID == child.id() {
-                    if owner_thread.replace(entry.th32ThreadID).is_some() {
-                        return Err(std::io::Error::other(
-                            "suspended bounded process created more than one thread before isolation",
-                        ));
-                    }
+                if entry.th32OwnerProcessID == child.id()
+                    && owner_thread.replace(entry.th32ThreadID).is_some()
+                {
+                    return Err(std::io::Error::other(
+                        "suspended bounded process created more than one thread before isolation",
+                    ));
                 }
                 entry = THREADENTRY32 {
                     dwSize: std::mem::size_of::<THREADENTRY32>() as u32,

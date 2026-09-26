@@ -151,10 +151,12 @@ pub(crate) fn protect_owner_private_scratch(path: &Path) -> Result<(), Confineme
         return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
     }
     let sid = unsafe { (&*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    let mut entry = EXPLICIT_ACCESS_W::default();
-    entry.grfAccessPermissions = GENERIC_ALL;
-    entry.grfAccessMode = SET_ACCESS;
-    entry.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    let mut entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: GENERIC_ALL,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        ..Default::default()
+    };
     entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
     entry.Trustee.TrusteeType = TRUSTEE_IS_USER;
     entry.Trustee.ptstrName = sid.cast();
@@ -945,10 +947,12 @@ fn grant_scratch_access(path: &Path, app_sid: PSID) -> Result<(), ConfinementErr
         ));
     }
     let mut acl = std::ptr::null_mut();
-    let mut entry = EXPLICIT_ACCESS_W::default();
-    entry.grfAccessPermissions = GENERIC_ALL;
-    entry.grfAccessMode = SET_ACCESS;
-    entry.grfInheritance = OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE;
+    let mut entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: GENERIC_ALL,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+        ..Default::default()
+    };
     entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
     entry.Trustee.TrusteeType = TRUSTEE_IS_USER;
     entry.Trustee.ptstrName = app_sid.cast();
