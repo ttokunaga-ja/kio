@@ -30,8 +30,8 @@ const MAX_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_WATCH_OUTPUT_BYTES: u64 = 256 * 1024;
 const MAX_SCOPE_COUNT: usize = 4096;
 const MAX_DIRECTORY_ENTRIES: usize = 16384;
-const PRE_IGNORED_SEARCH_TOKEN: &str = "kio-preignored-child-token";
-const POST_IGNORED_SEARCH_TOKEN: &str = "kio-postignored-child-token";
+const PRE_IGNORED_SEARCH_TOKEN: &str = "preignoredchildsentinelword";
+const POST_IGNORED_SEARCH_TOKEN: &str = "postignoredchildsentinelword";
 // This bounds a semantic convergence check over 39 independently durable
 // scopes, including a 33-level chain. It is not the v1 performance benchmark:
 // the observed macOS pass took 28s even without concurrent build load.
@@ -208,6 +208,13 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
             "native watcher did not index the child before Ignore revocation".into(),
         ));
     }
+    let ignored_child = watched.root.join("managed-then-ignored");
+    let ignored_scope_id = read_scope_id(&ignored_child)?;
+    let expected_exclusions = serde_json::json!([{
+        "scope_id": ignored_scope_id,
+        "scope_path": ignored_child.join(".kio"),
+        "reason": "policy_denied",
+    }]);
     let before = required_raw_hash(
         &collect_scope_manifests(&watched.root)?,
         "",
@@ -223,8 +230,9 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
     wait_running(options, &watched, &mut restarted)?;
     let after_scopes = collect_scope_manifests(&watched.root)?;
     assert_ignored_child_not_indexed(&after_scopes, &before_ignored)?;
-    assert_effective_search_excludes(options, &watched, PRE_IGNORED_SEARCH_TOKEN)?;
-    assert_effective_search_excludes(options, &watched, POST_IGNORED_SEARCH_TOKEN)?;
+    for query in [PRE_IGNORED_SEARCH_TOKEN, POST_IGNORED_SEARCH_TOKEN] {
+        assert_effective_search_excludes(options, &watched, query, &expected_exclusions)?;
+    }
     command_must_fail(
         &options.binary,
         &watched.device,
@@ -322,6 +330,7 @@ fn assert_effective_search_excludes(
     options: &NativeOptions,
     watched: &DeviceRoot,
     query: &str,
+    expected_exclusions: &serde_json::Value,
 ) -> Result<(), AcceptanceError> {
     for (args, label) in [
         (
@@ -351,18 +360,78 @@ fn assert_effective_search_excludes(
             "all-scope search",
         ),
     ] {
-        let value = json(&options.binary, &watched.device, &watched.root, &args)?;
-        let results = value
-            .get("results")
+        let output = base(&options.binary, &watched.device, Some(&watched.root))?
+            .args(&args)
+            .output()
+            .map_err(io)?;
+        validate_excluded_search_output(
+            output.status.code(),
+            &output.stdout,
+            query,
+            expected_exclusions,
+            label,
+        )?;
+    }
+    Ok(())
+}
+
+// Exit 3 alone is not evidence of Ignore enforcement: it also covers unrelated
+// partial failures. Require the exact child identity captured before revocation.
+fn validate_excluded_search_output(
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    query: &str,
+    expected_exclusions: &serde_json::Value,
+    label: &str,
+) -> Result<(), AcceptanceError> {
+    if exit_code != Some(3) {
+        return Err(AcceptanceError::Command(format!(
+            "{label} expected policy exclusion exit 3, got {exit_code:?}"
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|error| AcceptanceError::Json(format!("{label}: {error}")))?;
+    let empty_array = serde_json::json!([]);
+    if value.get("results") != Some(&empty_array)
+        || value.get("excluded_scopes") != Some(expected_exclusions)
+        || value.get("query").and_then(serde_json::Value::as_str) != Some(query)
+        || value
+            .get("requested_mode")
+            .and_then(serde_json::Value::as_str)
+            != Some("text")
+        || value
+            .get("resolved_mode")
+            .and_then(serde_json::Value::as_str)
+            != Some("text")
+        || value.get("error_code") != Some(&serde_json::Value::Null)
+        || value.get("fallback") != Some(&serde_json::Value::Bool(false))
+        || value.get("fallback_reason") != Some(&serde_json::Value::Null)
+        || value.get("warnings") != Some(&empty_array)
+        || ["error", "errors", "failed_scopes"]
+            .iter()
+            .any(|key| value.get(key).is_some())
+        || !value
+            .get("searched_scopes")
             .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
-                AcceptanceError::Command(format!("{label} omitted its results array"))
-            })?;
-        if !results.is_empty() {
-            return Err(AcceptanceError::Command(format!(
-                "{label} returned an ignored child result"
-            )));
-        }
+            .is_some_and(|scopes| {
+                !scopes.is_empty()
+                    && scopes.iter().all(|scope| {
+                        scope
+                            .get("scope_id")
+                            .and_then(serde_json::Value::as_str)
+                            .is_some_and(|id| !id.is_empty())
+                            && scope
+                                .get("scope_path")
+                                .and_then(serde_json::Value::as_str)
+                                .is_some_and(|path| !path.is_empty())
+                            && scope.get("shallow_skipped").is_none()
+                            && scope.get("error_code").is_none()
+                    })
+            })
+    {
+        return Err(AcceptanceError::Command(format!(
+            "{label} did not return only the expected policy-denied child exclusion with empty results"
+        )));
     }
     Ok(())
 }
@@ -1480,4 +1549,132 @@ fn private_dir(_path: &Path) -> Result<(), AcceptanceError> {
 
 fn io(error: std::io::Error) -> AcceptanceError {
     AcceptanceError::Io(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn expected_exclusions() -> Value {
+        json!([{"scope_id": "child-id", "scope_path": "/root/child/.kio", "reason": "policy_denied"}])
+    }
+
+    fn excluded_response() -> Value {
+        json!({
+            "query": PRE_IGNORED_SEARCH_TOKEN,
+            "requested_mode": "text", "resolved_mode": "text",
+            "fallback": false, "fallback_reason": null, "error_code": null,
+            "warnings": [], "results": [],
+            "searched_scopes": [{"scope_id": "root-id", "scope_path": "/root/.kio", "snapshot_at": "now"}],
+            "excluded_scopes": expected_exclusions(),
+        })
+    }
+
+    fn validate(code: Option<i32>, value: &Value) -> Result<(), AcceptanceError> {
+        validate_excluded_search_output(
+            code,
+            &serde_json::to_vec(value).unwrap(),
+            PRE_IGNORED_SEARCH_TOKEN,
+            &expected_exclusions(),
+            "test search",
+        )
+    }
+
+    #[test]
+    fn excluded_search_accepts_exact_policy_denied_child() {
+        assert!(validate(Some(3), &excluded_response()).is_ok());
+    }
+
+    #[test]
+    fn excluded_search_rejects_missing_extra_or_wrong_exclusions() {
+        for exclusions in [
+            json!([]),
+            Value::Null,
+            json!([{"scope_id": "other-id", "scope_path": "/root/child/.kio", "reason": "policy_denied"}]),
+            json!([{"scope_id": "child-id", "scope_path": "/wrong/.kio", "reason": "policy_denied"}]),
+            json!([{"scope_id": "child-id", "scope_path": "/root/child/.kio", "reason": "unreachable"}]),
+            json!([expected_exclusions()[0], expected_exclusions()[0]]),
+        ] {
+            let mut value = excluded_response();
+            value["excluded_scopes"] = exclusions;
+            assert!(validate(Some(3), &value).is_err());
+        }
+        let mut value = excluded_response();
+        value.as_object_mut().unwrap().remove("excluded_scopes");
+        assert!(validate(Some(3), &value).is_err());
+    }
+
+    #[test]
+    fn excluded_search_rejects_other_exit_statuses() {
+        for code in [None, Some(0), Some(1), Some(2), Some(4), Some(5), Some(6)] {
+            assert!(validate(code, &excluded_response()).is_err(), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn excluded_search_rejects_malformed_payload() {
+        for bytes in [b"not JSON".as_slice(), b"{} trailing", b"[]", b"null"] {
+            assert!(
+                validate_excluded_search_output(
+                    Some(3),
+                    bytes,
+                    PRE_IGNORED_SEARCH_TOKEN,
+                    &expected_exclusions(),
+                    "test search",
+                )
+                .is_err()
+            );
+        }
+        for key in [
+            "results",
+            "query",
+            "requested_mode",
+            "resolved_mode",
+            "error_code",
+            "warnings",
+            "fallback",
+            "fallback_reason",
+            "searched_scopes",
+        ] {
+            let mut value = excluded_response();
+            value.as_object_mut().unwrap().remove(key);
+            assert!(validate(Some(3), &value).is_err(), "missing {key}");
+        }
+    }
+
+    #[test]
+    fn excluded_search_rejects_results_and_additional_failures() {
+        for (key, replacement) in [
+            ("results", json!([{"scope_id": "child-id"}])),
+            ("results", json!({})),
+            ("error_code", json!("E_IO")),
+            ("error", json!({"message": "failure"})),
+            ("errors", json!(["failure"])),
+            ("failed_scopes", json!(["other-id"])),
+            ("warnings", json!(["degraded"])),
+            ("fallback", json!(true)),
+            ("searched_scopes", json!([])),
+            (
+                "searched_scopes",
+                json!([{"scope_id": "root-id", "scope_path": "/root/.kio", "shallow_skipped": 1}]),
+            ),
+        ] {
+            let mut value = excluded_response();
+            value[key] = replacement;
+            assert!(validate(Some(3), &value).is_err(), "{key}");
+        }
+        let mut value = excluded_response();
+        value["excluded_scopes"][0]["error_code"] = json!("E_IO");
+        assert!(validate(Some(3), &value).is_err());
+    }
+
+    #[test]
+    fn ignored_search_markers_are_distinct_uninterrupted_ascii_words() {
+        assert_ne!(PRE_IGNORED_SEARCH_TOKEN, POST_IGNORED_SEARCH_TOKEN);
+        for marker in [PRE_IGNORED_SEARCH_TOKEN, POST_IGNORED_SEARCH_TOKEN] {
+            assert!(marker.bytes().all(|byte| byte.is_ascii_alphabetic()));
+            assert!(!"kio v1 A03 native watcher fixture".contains(marker));
+        }
+    }
 }
