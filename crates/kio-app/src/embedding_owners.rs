@@ -314,12 +314,31 @@ pub(super) fn collect_retained_embedding_chunks(
         if let Some(owner) = owners.get_mut(&key) {
             owner.paths.extend(paths);
         } else {
+            let units = match exact_unit_authorities(repo, &instance.raw_hash, &instance.normalize)
+            {
+                Ok(units) => units,
+                Err(error) => {
+                    if error.error_code() == "KIO-E-STORE-NOT-FOUND-001"
+                        && purge_explains_missing_pinned_manifest(
+                            repo,
+                            &instance.raw_hash,
+                            instance.introductions.clone(),
+                        )?
+                    {
+                        // Only this exact old owner's removed closure is
+                        // explained. Raw-wide alias taint was already gathered
+                        // from every retained tree and must remain in force.
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
             owners.insert(
                 key.clone(),
                 OwnerAuthority {
                     paths,
                     head_paths: bindings.head_paths.get(&key).cloned().unwrap_or_default(),
-                    units: exact_unit_authorities(repo, &instance.raw_hash, &instance.normalize)?,
+                    units,
                 },
             );
         }

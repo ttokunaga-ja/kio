@@ -630,6 +630,114 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
 }
 
 #[test]
+fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
+    use crate::commands::PurgeArgs;
+
+    if !isolated_child_for(
+        "contextual_embedding_tests::collector_missing_manifest_requires_retired_purge_for_every_introduction",
+    ) {
+        return;
+    }
+    let root = private_tempdir();
+    let context = AppContext {
+        working_directory: root.path().to_path_buf(),
+        interaction: Arc::new(QuietInteraction),
+    };
+    let document = "# Retained\n\nA purged document can be explicitly restored.\n";
+    fs::write(root.path().join(CURRENT_PATH), document).unwrap();
+    execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+    index(&context);
+    let repo = open_existing_managed_root(root.path()).unwrap();
+    let old_head = repo.head_commit_hash().unwrap().unwrap();
+    let retained = retained_history_instances(repo.kio_dir(), &old_head).unwrap();
+    assert_eq!(retained.len(), 1);
+    let instance = &retained[0];
+    // Test-only corruption targets the authenticated fixture repo's physical
+    // CAS leaf; bound ObjectStore deliberately exposes no ambient content path.
+    let manifest = cas_object_path(
+        repo.kio_dir(),
+        "manifests",
+        &instance.normalize.manifest_hash,
+    )
+    .unwrap();
+    let manifest_bytes = fs::read(&manifest).unwrap();
+    let collect = |instances: &[RetainedNormalizedInstance]| {
+        embedding_owners::collect_retained_embedding_chunks(
+            &repo,
+            &connection(&repo),
+            instances,
+            None,
+            None,
+        )
+    };
+    assert!(!collect(&retained).unwrap().is_empty());
+    fs::remove_file(&manifest).unwrap();
+    assert_eq!(
+        collect(&retained).unwrap_err().error_code(),
+        "KIO-E-STORE-NOT-FOUND-001",
+        "an unexplained missing manifest must not be skipped"
+    );
+    fs::write(&manifest, &manifest_bytes).unwrap();
+
+    fs::remove_file(root.path().join(CURRENT_PATH)).unwrap();
+    execute(
+        &context,
+        CommandRequest::Purge(PurgeArgs {
+            path: None,
+            raw_hash: Some(instance.raw_hash.clone()),
+            reason: "misingest".to_owned(),
+            erase_tombstone: true,
+            yes: true,
+        }),
+    )
+    .unwrap();
+    assert!(
+        !manifest.exists(),
+        "purge must remove the old immutable closure"
+    );
+    fs::write(root.path().join(CURRENT_PATH), document).unwrap();
+    // Republish raw bytes and retire the receipt without creating replacement
+    // normalized content that could conceal the old pinned manifest's absence.
+    let resurrection = repo
+        .auto_snapshot_with_bound_normalize(
+            Some("resurrection without replacement manifest"),
+            None,
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+        )
+        .unwrap()
+        .commit_hash
+        .unwrap();
+    let state = PurgeState::open(repo.kio_dir()).unwrap();
+    let receipt = state
+        .read_erase_receipt(&instance.raw_hash)
+        .unwrap()
+        .unwrap();
+    assert_eq!(receipt.tail().kind, EventKind::Retired);
+    assert!(!purge_blocks_rebuild_raw(repo.kio_dir(), &instance.raw_hash).unwrap());
+    assert!(
+        collect(&retained).unwrap().is_empty(),
+        "the validated old owner may be skipped"
+    );
+
+    let mut wrong_introduction = retained.clone();
+    wrong_introduction[0].introductions.push(resurrection);
+    assert_eq!(
+        collect(&wrong_introduction).unwrap_err().error_code(),
+        "KIO-E-STORE-NOT-FOUND-001",
+        "even one post-purge introduction must prevent the exception"
+    );
+
+    // A valid retired receipt explains absence, never corrupt bytes at the
+    // immutable object address. It must not turn malformed content into a skip.
+    fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    fs::write(&manifest, b"not an authenticated manifest").unwrap();
+    let corrupt = collect(&retained).unwrap_err();
+    assert_ne!(corrupt.error_code(), "KIO-E-STORE-NOT-FOUND-001");
+}
+
+#[test]
 fn batch_result_admission_validates_all_keys_and_vectors_before_returning_any() {
     use kio_adapter::gemini_batch_client::GeminiBatchEmbedOutput;
     let first = hash_bytes(b"first contextual input");
