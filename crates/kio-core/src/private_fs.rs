@@ -408,7 +408,11 @@ mod unix {
             // current account, root, and the retained object owner.
             let owner_uid = file.metadata().map_err(|_| ())?.uid();
             let mut values = Vec::with_capacity(3);
-            for uid in [current_uid, 0, owner_uid] {
+            let uids = [current_uid, 0, owner_uid];
+            for (index, uid) in uids.into_iter().enumerate() {
+                if uids[..index].contains(&uid) {
+                    continue;
+                }
                 let mut uuid = [0_u8; 16];
                 if unsafe { mbr_uid_to_uuid(uid, uuid.as_mut_ptr()) } != 0 {
                     return Err(());
@@ -442,7 +446,7 @@ mod unix {
                 if unsafe { acl_valid(acl) } != 0 {
                     return Err(());
                 }
-                let trusted = trusted_uuids(file, current_uid)?;
+                let mut trusted = None;
                 let mut entry = std::ptr::null_mut();
                 let mut selector = ACL_FIRST_ENTRY;
                 let mut reached_end = false;
@@ -481,18 +485,6 @@ mod unix {
                         // macOS deny-delete entries on private home directories.
                         continue;
                     }
-                    let qualifier = unsafe { acl_get_qualifier(entry) };
-                    if qualifier.is_null() {
-                        return Err(());
-                    }
-                    let uuid = unsafe { std::slice::from_raw_parts(qualifier.cast::<u8>(), 16) };
-                    let trusted_grant = trusted.iter().any(|candidate| uuid == candidate);
-                    unsafe { acl_free(qualifier) };
-                    if trusted_grant {
-                        continue;
-                    }
-                    // A group UUID is untrusted: evaluating group membership
-                    // safely would otherwise authorize another local account.
                     let forbidden = match scope {
                         Scope::PrivateParent | Scope::PrivateLeaf => {
                             mask & ACL_ALL_KNOWN_PERMISSIONS
@@ -502,7 +494,28 @@ mod unix {
                         }
                         Scope::ExecutableLeaf => mask & MUTATE_FILE,
                     };
-                    if forbidden != 0 {
+                    if forbidden == 0 {
+                        continue;
+                    }
+                    // Resolve identities only for effective, relevant grants,
+                    // once per verification, using fresh retained metadata.
+                    // Resolve before allocating the qualifier so lookup errors
+                    // cannot leak it.
+                    if trusted.is_none() {
+                        trusted = Some(trusted_uuids(file, current_uid)?);
+                    }
+                    let qualifier = unsafe { acl_get_qualifier(entry) };
+                    if qualifier.is_null() {
+                        return Err(());
+                    }
+                    let uuid = unsafe { std::slice::from_raw_parts(qualifier.cast::<u8>(), 16) };
+                    let trusted_grant = trusted
+                        .as_ref()
+                        .is_some_and(|values| values.iter().any(|candidate| uuid == candidate));
+                    unsafe { acl_free(qualifier) };
+                    // A group UUID is untrusted: evaluating group membership
+                    // safely would otherwise authorize another local account.
+                    if !trusted_grant {
                         return Err(());
                     }
                 }

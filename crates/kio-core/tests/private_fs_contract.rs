@@ -340,6 +340,41 @@ mod unix {
     }
 
     #[cfg(target_os = "macos")]
+    #[test]
+    fn retained_extended_acl_accepts_empty_deny_only_and_trusted_allow() {
+        let dir = private_dir();
+        let private = private_file(dir.path(), "device-ca.pem", b"certificate");
+        for entries in [
+            vec![],
+            vec![macos_acl_fixture::deny_untrusted_write_entry()],
+            vec![macos_acl_fixture::allow_current_user_write_entry()],
+        ] {
+            macos_acl_fixture::set_entries(dir.path(), &entries).expect("directory ACL fixture");
+            macos_acl_fixture::set_entries(&private, &entries).expect("file ACL fixture");
+            verify_private_directory(dir.path()).expect("safe directory ACL");
+            assert_eq!(read_private_file(&private, 1024).unwrap(), b"certificate");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn retained_extended_acl_read_grant_depends_on_scope() {
+        let dir = private_dir();
+        let executable = private_file(dir.path(), "kio", b"fixture");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        let read = [macos_acl_fixture::allow_untrusted_read_entry()];
+        macos_acl_fixture::set_entries(dir.path(), &read).expect("ancestor read ACL");
+        assert_eq!(verify_trusted_executable(&executable).unwrap(), executable);
+        assert!(verify_private_directory(dir.path()).is_err());
+        // The same read grant is forbidden on a private parent.
+        assert!(read_private_file(&executable, 1024).is_err());
+        macos_acl_fixture::set_entries(dir.path(), &[]).expect("empty parent ACL");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o600)).unwrap();
+        macos_acl_fixture::set_entries(&executable, &read).expect("leaf read ACL");
+        assert!(read_private_file(&executable, 1024).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
     mod macos_acl_fixture {
         use std::{ffi::c_void, fs::OpenOptions, os::fd::AsRawFd, path::Path};
 
@@ -349,6 +384,8 @@ mod unix {
 
         const ACL_TYPE_EXTENDED: i32 = 0x100;
         const ACL_EXTENDED_ALLOW: i32 = 1;
+        const ACL_EXTENDED_DENY: i32 = 2;
+        const ACL_READ_DATA: u64 = 1 << 1;
         const ACL_WRITE_DATA: u64 = 1 << 2;
         const ACL_ENTRY_FILE_INHERIT: i32 = 1 << 5;
         const ACL_ENTRY_ONLY_INHERIT: i32 = 1 << 8;
@@ -364,36 +401,69 @@ mod unix {
             fn acl_add_flag_np(flags: AclFlagset, flag: i32) -> i32;
             fn acl_set_fd_np(fd: i32, acl: Acl, ty: i32) -> i32;
             fn mbr_gid_to_uuid(gid: u32, uuid: *mut u8) -> i32;
+            fn mbr_uid_to_uuid(uid: u32, uuid: *mut u8) -> i32;
         }
 
         pub(super) fn allow_untrusted_write(
             path: &Path,
             inherit_only: bool,
         ) -> std::io::Result<()> {
+            set_entries(
+                path,
+                &[(ACL_EXTENDED_ALLOW, false, ACL_WRITE_DATA, inherit_only)],
+            )
+        }
+
+        // tag, current user (otherwise current group), permissions, inherit-only
+        pub(super) type Entry = (i32, bool, u64, bool);
+
+        pub(super) fn deny_untrusted_write_entry() -> Entry {
+            (ACL_EXTENDED_DENY, false, ACL_WRITE_DATA, false)
+        }
+
+        pub(super) fn allow_current_user_write_entry() -> Entry {
+            (ACL_EXTENDED_ALLOW, true, ACL_WRITE_DATA, false)
+        }
+
+        pub(super) fn allow_untrusted_read_entry() -> Entry {
+            (ACL_EXTENDED_ALLOW, false, ACL_READ_DATA, false)
+        }
+
+        pub(super) fn set_entries(path: &Path, entries: &[Entry]) -> std::io::Result<()> {
             let file = OpenOptions::new().read(true).open(path)?;
-            let mut acl = unsafe { acl_init(1) };
+            let mut acl = unsafe { acl_init(entries.len() as i32) };
             if acl.is_null() {
                 return Err(std::io::Error::last_os_error());
             }
             let result = (|| {
-                let mut entry = std::ptr::null_mut();
-                let untrusted_uuid = current_group_uuid()?;
-                if unsafe { acl_create_entry(&mut acl, &mut entry) } != 0
-                    || entry.is_null()
-                    || unsafe { acl_set_tag_type(entry, ACL_EXTENDED_ALLOW) } != 0
-                    || unsafe { acl_set_qualifier(entry, untrusted_uuid.as_ptr().cast()) } != 0
-                    || unsafe { acl_set_permset_mask_np(entry, ACL_WRITE_DATA) } != 0
-                {
-                    return Err(std::io::Error::last_os_error());
-                }
-                if inherit_only {
-                    let mut flags = std::ptr::null_mut();
-                    if unsafe { acl_get_flagset_np(entry.cast(), &mut flags) } != 0
-                        || flags.is_null()
-                        || unsafe { acl_add_flag_np(flags, ACL_ENTRY_FILE_INHERIT) } != 0
-                        || unsafe { acl_add_flag_np(flags, ACL_ENTRY_ONLY_INHERIT) } != 0
+                for &(tag, current_user, mask, inherit_only) in entries {
+                    let mut entry = std::ptr::null_mut();
+                    let uuid = if current_user {
+                        let mut uuid = [0_u8; 16];
+                        if unsafe { mbr_uid_to_uuid(libc::geteuid(), uuid.as_mut_ptr()) } != 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        uuid
+                    } else {
+                        current_group_uuid()?
+                    };
+                    if unsafe { acl_create_entry(&mut acl, &mut entry) } != 0
+                        || entry.is_null()
+                        || unsafe { acl_set_tag_type(entry, tag) } != 0
+                        || unsafe { acl_set_qualifier(entry, uuid.as_ptr().cast()) } != 0
+                        || unsafe { acl_set_permset_mask_np(entry, mask) } != 0
                     {
                         return Err(std::io::Error::last_os_error());
+                    }
+                    if inherit_only {
+                        let mut flags = std::ptr::null_mut();
+                        if unsafe { acl_get_flagset_np(entry.cast(), &mut flags) } != 0
+                            || flags.is_null()
+                            || unsafe { acl_add_flag_np(flags, ACL_ENTRY_FILE_INHERIT) } != 0
+                            || unsafe { acl_add_flag_np(flags, ACL_ENTRY_ONLY_INHERIT) } != 0
+                        {
+                            return Err(std::io::Error::last_os_error());
+                        }
                     }
                 }
                 if unsafe { acl_set_fd_np(file.as_raw_fd(), acl, ACL_TYPE_EXTENDED) } != 0 {
