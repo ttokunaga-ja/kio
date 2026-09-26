@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::process::Command;
 
@@ -44,7 +48,7 @@ fn dimension_bomb_png() -> Vec<u8> {
 
 #[test]
 fn standalone_png_is_an_image_object_and_normalized_reference_never_binary_text() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     ok(&dir, &["init"]);
     let bytes = png();
     fs::write(dir.path().join("pixel[proof].png"), &bytes).unwrap();
@@ -78,7 +82,7 @@ fn standalone_png_is_an_image_object_and_normalized_reference_never_binary_text(
 
 #[test]
 fn malformed_or_oversized_image_never_publishes_image_cas() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     ok(&dir, &["init"]);
     let bytes = dimension_bomb_png();
     let hash = kio_pipeline::prepare::hash_bytes(&bytes);
@@ -108,7 +112,7 @@ fn truncated_and_crc_invalid_pngs_publish_no_image_objects() {
             bytes
         }),
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         ok(&dir, &["init"]);
         let hash = kio_pipeline::prepare::hash_bytes(&bytes);
         fs::write(dir.path().join(name), &bytes).unwrap();

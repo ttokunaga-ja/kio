@@ -3,6 +3,10 @@
 //! Keep the clock and all input material local so idle decisions are fully
 //! repeatable and never require a network service.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -96,7 +100,7 @@ fn configure(dir: &TempDir, threshold: u64) {
 }
 
 fn indexed(threshold: u64) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("note.md"), "baseline\n").unwrap();
     json(&dir, &["init"], T0);
     json(&dir, &["index", "--offline", "--yes"], T0);
@@ -107,7 +111,7 @@ fn indexed(threshold: u64) -> TempDir {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn stale_candidate() -> (TempDir, String) {
     let old = "2025-01-01T00:00:00Z";
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("note.md"), "old candidate\n").unwrap();
     json(&dir, &["init"], old);
     let first = json(&dir, &["index", "--offline", "--yes"], old);
@@ -120,7 +124,7 @@ fn stale_candidate() -> (TempDir, String) {
 
 #[test]
 fn only_enabled_and_indexed_scopes_activate_on_idle_without_store_mutation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("note.md"), "unindexed\n").unwrap();
     json(&dir, &["init"], T0);
     configure(&dir, 10);
@@ -292,7 +296,7 @@ fn post_publication_index_replacement_fails_closed_without_retiring_stale_tree()
         .unwrap();
     let tree_before = fs::read(&tree_path).unwrap();
     json(&dir, &["snapshot", "auto"], T0);
-    let control = tempfile::tempdir().unwrap();
+    let control = canonical_tempdir();
     let ready = control.path().join("post-publication.ready");
     let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
         .current_dir(dir.path())
@@ -347,7 +351,7 @@ fn post_publication_snapshot_auto_disable_fails_closed_before_on_idle_sweep() {
         .unwrap();
     let tree_before = fs::read(&tree_path).unwrap();
     json(&dir, &["snapshot", "auto"], T0);
-    let control = tempfile::tempdir().unwrap();
+    let control = canonical_tempdir();
     let ready = control.path().join("post-publication.ready");
     let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
         .current_dir(dir.path())
@@ -429,7 +433,7 @@ fn manual_snapshot_and_index_commands_never_fresh_trigger_on_idle_gc() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn parent_on_idle_does_not_consume_child_gc_state_and_child_handles_its_own_tree() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("parent.md"), "parent\n").unwrap();
     fs::create_dir_all(dir.path().join("child")).unwrap();
     fs::write(dir.path().join("child/note.md"), "child\n").unwrap();

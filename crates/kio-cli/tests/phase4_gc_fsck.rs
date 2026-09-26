@@ -1,5 +1,9 @@
 //! GC shallow-sweep fsck and export barriers.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::PathBuf;
@@ -64,7 +68,7 @@ fn fixture_without_index() -> (TempDir, String, String) {
 }
 
 fn fixture_with_index(with_index: bool) -> (TempDir, String, String) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("doc.md"), "# receipt sweep\n").unwrap();
     json_success(&dir, &["init"]);
     if with_index {
@@ -465,7 +469,7 @@ fn phase_impossible_marker_is_corruption_not_recovery_pending() {
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn final_shallow_ancestor_with_chunks_keeps_verify_and_rebuild_available() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("doc.md"),
         "# old snapshot\n\nA sufficiently long chunked paragraph for the old snapshot.\n",

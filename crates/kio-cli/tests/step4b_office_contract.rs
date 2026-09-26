@@ -18,6 +18,10 @@
 //! the office input files below are deliberately arbitrary small bytes named
 //! `*.docx` / `*.pptx` (the seam ignores their content entirely).
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -220,7 +224,7 @@ fn online_markdownize_task_for<'a>(status: &'a Value, input_path: &str) -> Optio
 
 #[test]
 fn office_01_docx_offline_pages_searchable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // Fixtures live OUTSIDE the scope root so `kio index` never scans/indexes
     // the fixture PDF itself as a second, unrelated document.
     let fixtures = tempfile::tempdir().unwrap();
@@ -319,7 +323,7 @@ fn office_01_docx_offline_pages_searchable() {
 
 #[test]
 fn office_02_pptx_slide_units_offline() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // Fixtures live OUTSIDE the scope root — see office_01's comment.
     let fixtures = tempfile::tempdir().unwrap();
     let fixture = write_office_fixture_pdf(
@@ -383,7 +387,7 @@ fn office_02_pptx_slide_units_offline() {
 
 #[test]
 fn office_03_online_send_uses_converted_pdf() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // Fixtures live OUTSIDE the scope root — see office_01's comment.
     let fixtures = tempfile::tempdir().unwrap();
     let fixture =
@@ -452,7 +456,7 @@ fn office_03_online_send_uses_converted_pdf() {
 
 #[test]
 fn office_04_converter_absent_no_doomed_task() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // Fixtures live OUTSIDE the scope root — see office_01's comment.
     let fixtures = tempfile::tempdir().unwrap();
     write_office_input(&dir, "report.docx");
@@ -534,7 +538,7 @@ fn office_04_converter_absent_no_doomed_task() {
 
 #[test]
 fn office_05_qb41_renderer_drift_prompts_then_gen1() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // Fixtures live OUTSIDE the scope root — see office_01's comment.
     let fixtures = tempfile::tempdir().unwrap();
     let fixture_a = write_office_fixture_pdf(
@@ -635,7 +639,7 @@ fn office_05_qb41_renderer_drift_prompts_then_gen1() {
 
 #[test]
 fn office_06_conversion_failure_contract_violation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // Fixtures live OUTSIDE the scope root — see office_01's comment.
     let fixtures = tempfile::tempdir().unwrap();
     let fixture =
@@ -719,7 +723,7 @@ fn office_06_conversion_failure_contract_violation() {
 /// whichever layer is doing the work.
 #[test]
 fn office_07_scanned_pdf_done_instance_is_not_drift() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // PDF magic, no `BT` text operator anywhere: prepare extracts nothing
     // real and garbage-gates to an empty unit set, routing to online OCR.
     fs::write(

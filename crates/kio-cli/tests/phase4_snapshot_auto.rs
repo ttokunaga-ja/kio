@@ -4,6 +4,10 @@
 //! authorization decision from the same descriptor-bound state it later
 //! publishes through.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -285,7 +289,7 @@ fn configure_gc(dir: &TempDir, mode: &str, interval: u64, threshold: u64) {
 }
 
 fn indexed_fixture(interval: u64, threshold: u64) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("note.md"), "baseline scheduled snapshot\n").unwrap();
     json(&dir, &["init"], T0);
     json(&dir, &["index", "--offline", "--yes"], T0);
@@ -319,7 +323,7 @@ fn tree_paths(dir: &TempDir) -> Vec<String> {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn stale_gc_candidate(mode: &str) -> (TempDir, String, String) {
     let old = "2025-01-01T00:00:00Z";
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("note.md"), "old scheduled candidate\n").unwrap();
     json(&dir, &["init"], old);
     let first = json(&dir, &["index", "--offline", "--yes"], old);
@@ -342,7 +346,7 @@ fn stale_gc_candidate(mode: &str) -> (TempDir, String, String) {
 
 #[test]
 fn skips_disabled_missing_and_not_indexed_without_mutating_kio() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("note.md"), "unindexed\n").unwrap();
     json(&dir, &["init"], T0);
     let before = kio_bytes(&dir.path().join(".kio"));
@@ -468,7 +472,7 @@ fn scheduled_counts_add_edit_delete_and_rename() {
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn ignored_and_tier_a_inputs_do_not_change_snapshot() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("note.md"), "baseline scheduled snapshot\n").unwrap();
     json(&dir, &["init"], T0);
     fs::write(
@@ -1264,7 +1268,7 @@ fn object_namespace_replacement_after_binding_cannot_redirect_publication() {
 fn scope_replacement_before_lock_cannot_write_the_replacement_store() {
     let dir = indexed_fixture(60, 1);
     fs::write(dir.path().join("new.md"), "eligible scope race\n").unwrap();
-    let victim = tempfile::tempdir().unwrap();
+    let victim = canonical_tempdir();
     fs::write(victim.path().join("victim.md"), "victim\n").unwrap();
     json(&victim, &["init"], T0);
     let victim_before = kio_bytes(&victim.path().join(".kio"));

@@ -9,6 +9,10 @@
 //! 1.2.0). These tests pin the end-to-end behavior for exactly the two
 //! corpus kinds that failed.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use assert_cmd::Command;
 use serde_json::Value;
 use std::fs;
@@ -62,7 +66,7 @@ fn assert_search_hit(dir: &TempDir, needle: &str, title: &str) {
 
 #[test]
 fn octet_xml_and_html_index_offline_and_search() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("record-037.xml"),
         "<record><title>quartzledger evidence</title><count>3600</count></record>",

@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -89,7 +93,7 @@ fn windows_no_home_json(cwd: &Path, profile: &Path, args: &[&str]) -> Value {
 #[test]
 fn home_and_xdg_unset_use_windows_profile_without_cwd_device_state() {
     let scope = tempfile::tempdir().unwrap();
-    let profile = tempfile::tempdir().unwrap();
+    let profile = canonical_tempdir();
     windows_no_home_json(scope.path(), profile.path(), &["init"]);
     fs::write(
         scope.path().join("profile.md"),
@@ -125,7 +129,7 @@ fn home_and_xdg_unset_use_windows_profile_without_cwd_device_state() {
 #[test]
 fn tag_names_use_portable_leaves_and_case_insensitive_collisions() {
     let scope = tempfile::tempdir().unwrap();
-    let device = tempfile::tempdir().unwrap();
+    let device = canonical_tempdir();
     json_success(scope.path(), device.path(), &["init"]);
     fs::write(scope.path().join("doc.md"), "first").unwrap();
     let first = json_success(
@@ -200,7 +204,7 @@ fn tag_names_use_portable_leaves_and_case_insensitive_collisions() {
 #[test]
 fn open_cache_derives_a_portable_leaf_from_hostile_logical_basename() {
     let scope = tempfile::tempdir().unwrap();
-    let device = tempfile::tempdir().unwrap();
+    let device = canonical_tempdir();
     json_success(scope.path(), device.path(), &["init"]);
     fs::write(
         scope.path().join("report.md"),

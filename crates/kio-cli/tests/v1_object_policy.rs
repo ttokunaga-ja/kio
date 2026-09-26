@@ -1,5 +1,9 @@
 //! Current-policy authorization for image object URIs.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
@@ -67,7 +71,7 @@ fn indexed_image_uri(dir: &TempDir) -> String {
 
 #[test]
 fn image_object_open_requires_a_currently_eligible_authenticated_owner() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let uri = indexed_image_uri(&dir);
     ok(&dir, &["open", &uri]);
 
@@ -80,12 +84,12 @@ fn image_object_open_requires_a_currently_eligible_authenticated_owner() {
 
 #[test]
 fn copied_image_cas_without_an_authenticated_source_is_not_openable() {
-    let source = tempfile::tempdir().unwrap();
+    let source = canonical_tempdir();
     let uri = indexed_image_uri(&source);
     let hash = uri.rsplit('/').next().unwrap();
     let bytes = png();
 
-    let target = tempfile::tempdir().unwrap();
+    let target = canonical_tempdir();
     ok(&target, &["init"]);
     let target_repo = Repository::open(target.path()).unwrap();
     assert_eq!(
@@ -107,7 +111,7 @@ fn copied_image_cas_without_an_authenticated_source_is_not_openable() {
 
 #[test]
 fn same_scope_markdown_link_cannot_reauthorize_an_ignored_image_owner() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let uri = indexed_image_uri(&dir);
 
     // `public.md` keeps a syntactically valid URI in the same scope, but its
@@ -129,7 +133,7 @@ fn same_scope_markdown_link_cannot_reauthorize_an_ignored_image_owner() {
 
 #[test]
 fn stale_replica_image_candidate_is_hidden_after_owner_ignore_without_reindex() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     ok(&dir, &["init"]);
     let repo = Repository::open(dir.path()).unwrap();
     let bytes = png();
@@ -193,7 +197,7 @@ fn evidence_pointer(dir: &TempDir, query: &str) -> Value {
 
 #[test]
 fn evidence_and_chunk_short_hash_obey_current_ignore_without_hiding_allowed_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     ok(&dir, &["init"]);
     fs::write(dir.path().join("denied.md"), "denied witness\n").unwrap();
     fs::write(dir.path().join("allowed.md"), "allowed witness\n").unwrap();
@@ -215,7 +219,7 @@ fn evidence_and_chunk_short_hash_obey_current_ignore_without_hiding_allowed_file
 
 #[test]
 fn pathless_evidence_uri_selects_an_allowed_exact_generation_alias() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     ok(&dir, &["init"]);
     fs::write(dir.path().join("a-denied.md"), "identical alias witness\n").unwrap();
     fs::write(dir.path().join("b-allowed.md"), "identical alias witness\n").unwrap();
@@ -248,7 +252,7 @@ fn pathless_evidence_uri_selects_an_allowed_exact_generation_alias() {
 
 #[test]
 fn ancestor_ignore_denies_a_childs_direct_evidence_uri() {
-    let root = tempfile::tempdir().unwrap();
+    let root = canonical_tempdir();
     ok(&root, &["init"]);
     fs::create_dir(root.path().join("child")).unwrap();
     fs::write(root.path().join("child/child.md"), "child-only witness\n").unwrap();

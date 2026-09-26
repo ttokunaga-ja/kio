@@ -8,6 +8,11 @@ use kio_adapter::gemini_batch_client::{
 };
 use kio_pipeline::ledger::ops::{cost_ledger_rows_for_key, phase1_intent};
 
+fn canonical_tempdir() -> tempfile::TempDir {
+    // Strict store ancestry checks require the resolved macOS temporary root.
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+}
+
 fn unreadable() -> kio_adapter::AdapterError {
     kio_adapter::AdapterError::Network("synthetic unavailable".into())
 }
@@ -70,7 +75,7 @@ fn gemini_collection_requires_scope_profile_and_returned_job_attribution() {
         "wrong_job",
         "wrong_token",
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let ledger = LedgerDb::initialize(root.path().join("device/ledger.sqlite")).unwrap();
         let row = reserved_row(
             &ledger,
@@ -242,7 +247,7 @@ fn mistral_collection_holds_unbound_scope_profile_and_job_without_effects() {
             "missing_key",
             "malformed_key",
         ] {
-            let root = tempfile::tempdir().unwrap();
+            let root = canonical_tempdir();
             let repo = Repository::init(root.path()).unwrap();
             let ledger = LedgerDb::initialize(root.path().join("device/ledger.sqlite")).unwrap();
             let row = reserved_row(
@@ -331,7 +336,7 @@ fn mistral_collection_holds_unbound_scope_profile_and_job_without_effects() {
 #[test]
 fn mistral_matching_job_fetches_output_and_matching_failure_settles_and_cleans() {
     for failed in [false, true] {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let repo = Repository::init(root.path()).unwrap();
         let ledger = LedgerDb::initialize(root.path().join("device/ledger.sqlite")).unwrap();
         let mut row = reserved_row(&ledger, "markdownize", "profile", Some("mistral:workspace"));
@@ -401,7 +406,7 @@ fn mistral_cleanup_requires_exact_scope_but_finishes_pre_upload_cancellation_loc
         "pre_upload",
         "unrecorded_upload",
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let ledger = LedgerDb::initialize(root.path().join("device/ledger.sqlite")).unwrap();
         let row = reserved_row(
             &ledger,
@@ -473,7 +478,7 @@ fn credential_or_device_key_rotation_holds_existing_rows_without_provider_effect
     let _guard = kio_core::test_control::test_env_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let root = tempfile::tempdir().unwrap();
+    let root = canonical_tempdir();
     let base = root.path().canonicalize().unwrap();
     let parent = StoreDirectory::open(&base).unwrap();
     let directory = parent.create_directory(Path::new("credentials")).unwrap();
@@ -527,7 +532,7 @@ fn credential_or_device_key_rotation_holds_existing_rows_without_provider_effect
         (before, capture(&original), device_rotated)
     });
     for current in [credential_rotated, device_rotated] {
-        let ledger_dir = tempfile::tempdir().unwrap();
+        let ledger_dir = canonical_tempdir();
         // tempfile directories inherit default directory permissions. This
         // fixture uses the directory itself as the ledger parent, so restrict
         // its newly created retained handle before initializing private state.
@@ -578,7 +583,7 @@ fn reconcile_json_and_inventory_debug_do_not_expose_recovery_scope() {
     let _guard = kio_core::test_control::test_env_lock()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    let root = tempfile::tempdir().unwrap();
+    let root = canonical_tempdir();
     let _data = kio_core::test_control::TestEnvGuard::set("XDG_DATA_HOME", root.path());
     let ledger = LedgerDb::initialize(root.path().join("device/ledger.sqlite")).unwrap();
     let inventory = kio_adapter::batch_inventory::ProviderInventory {

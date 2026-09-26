@@ -1730,6 +1730,10 @@ fn contract_violation(message: &str) -> PipelineError {
 mod tests {
     use super::*;
 
+    fn canonical_tempdir() -> tempfile::TempDir {
+        tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
+
     fn initialize_persist_store(path: &Path) {
         let directory = StoreDirectory::open(path).unwrap();
         directory
@@ -2840,7 +2844,7 @@ mod tests {
 
     #[test]
     fn cand_049_061_validated_loader_accepts_control_and_rejects_poisoned_unit() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         initialize_persist_store(dir.path());
         let (identity, manifest, units) = normalized_fixture();
         persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
@@ -2882,7 +2886,7 @@ mod tests {
 
     #[test]
     fn ct4_fsck_normalized_budget_charges_corrupt_unit_bytes_before_load() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         initialize_persist_store(dir.path());
         let (identity, manifest, units) = normalized_fixture();
         persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
@@ -2937,7 +2941,7 @@ mod tests {
 
     #[test]
     fn canonical_normalized_layout_allows_retry_overwrite() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         initialize_persist_store(dir.path());
         let (identity, mut manifest, mut units) = normalized_fixture();
         persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
@@ -2972,7 +2976,7 @@ mod tests {
 
     #[test]
     fn persist_returns_stamped_manifest_and_publishes_its_canonical_cas_object() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         initialize_persist_store(dir.path());
         let (_, mut manifest, units) = normalized_fixture();
         manifest.units[0].unit_object_hash = None;
@@ -3017,7 +3021,7 @@ mod tests {
 
     #[test]
     fn normalized_unit_pins_are_immutable_and_mutable_cache_is_not_authority() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         initialize_persist_store(dir.path());
         let (identity, mut manifest, mut units) = normalized_fixture();
         persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
@@ -3082,7 +3086,7 @@ mod tests {
 
     #[test]
     fn cand_061_writer_enforces_loader_size_boundaries_before_publish() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         initialize_persist_store(dir.path());
         let manifest_path = dir.path().join("manifest.json");
         let unit_path = dir.path().join("unit.json");
@@ -3119,7 +3123,7 @@ mod tests {
 
     #[test]
     fn ct4_fsck_normalized_read_budget_bounds_physical_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         initialize_persist_store(dir.path());
         let (identity, manifest, units) = normalized_fixture();
         persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
@@ -3160,9 +3164,9 @@ mod tests {
             ("normalized_units", "normalized"),
             ("normalized", "normalized_units"),
         ] {
-            let kio = tempfile::tempdir().unwrap();
+            let kio = canonical_tempdir();
             initialize_persist_store(kio.path());
-            let outside = tempfile::tempdir().unwrap();
+            let outside = canonical_tempdir();
             fs::create_dir_all(kio.path().join("objects")).unwrap();
             fs::write(outside.path().join("marker"), b"unchanged").unwrap();
             symlink(
@@ -3192,9 +3196,9 @@ mod tests {
     fn cand_047_061_validated_loader_rejects_normalized_units_root_symlink() {
         use std::os::unix::fs::symlink;
 
-        let trusted = tempfile::tempdir().unwrap();
+        let trusted = canonical_tempdir();
         initialize_persist_store(trusted.path());
-        let poisoned = tempfile::tempdir().unwrap();
+        let poisoned = canonical_tempdir();
         let (identity, manifest, units) = normalized_fixture();
         persist_normalized_instance(trusted.path(), &manifest, &units).unwrap();
         assert!(
@@ -3229,9 +3233,9 @@ mod tests {
     fn cand_049_validated_loader_ignores_symlinked_unit_cache() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         initialize_persist_store(dir.path());
-        let outside = tempfile::tempdir().unwrap();
+        let outside = canonical_tempdir();
         let (identity, manifest, units) = normalized_fixture();
         persist_normalized_instance(dir.path(), &manifest, &units).unwrap();
         let instance_dir = normalized_instance_dir(
@@ -3259,7 +3263,7 @@ mod tests {
 
     #[test]
     fn cand_061_missing_mutable_unit_cache_does_not_affect_pinned_load() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         initialize_persist_store(dir.path());
         let (identity, manifest, units) = normalized_fixture();
         persist_normalized_instance(dir.path(), &manifest, &units).unwrap();

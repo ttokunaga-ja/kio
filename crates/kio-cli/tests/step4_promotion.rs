@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 
 use assert_cmd::Command;
@@ -189,7 +193,7 @@ fn faulted_batch(dir: &TempDir, phase: &str) -> Value {
 
 #[test]
 fn ct4_promotion_done_batch_updates_provenance_search_and_is_idempotent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(
         dir.path().join("a.pdf"),
@@ -304,7 +308,7 @@ fn ct4_promotion_done_batch_updates_provenance_search_and_is_idempotent() {
 
 #[test]
 fn ct4_bbox_006_ocr_from_scratch_promotes_scanned_pdf_and_image() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     // Neither input has locally extractable text. The provider response must become
     // the first canonical Prepared unit set (page:1 and image:0 respectively).
@@ -411,7 +415,7 @@ fn ct4_bbox_006_ocr_from_scratch_promotes_scanned_pdf_and_image() {
 
 #[test]
 fn ct4_promotion_respects_bbox_disabled_profile_identity() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     let config_path = dir.path().join(".kio/config.toml");
     let mut config = fs::read_to_string(&config_path).unwrap();
@@ -448,7 +452,7 @@ fn ct4_promotion_respects_bbox_disabled_profile_identity() {
 
 #[test]
 fn ct4_idempotent_mixed_profile_resume_uses_current_bbox_policy() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["bbox true first"])).unwrap();
     json_success(&dir, &["index", "--yes"], None);
@@ -511,7 +515,7 @@ fn ct4_idempotent_mixed_profile_resume_uses_current_bbox_policy() {
 
 #[test]
 fn ct4_promotion_partial_and_stale_outputs_never_advance_head() {
-    let partial = tempfile::tempdir().unwrap();
+    let partial = canonical_tempdir();
     init(&partial);
     fs::write(
         partial.path().join("partial.pdf"),
@@ -536,7 +540,7 @@ fn ct4_promotion_partial_and_stale_outputs_never_advance_head() {
         "Partial output must not promote"
     );
 
-    let stale = tempfile::tempdir().unwrap();
+    let stale = canonical_tempdir();
     init(&stale);
     fs::write(
         stale.path().join("stale.pdf"),
@@ -567,7 +571,7 @@ fn ct4_promotion_partial_and_stale_outputs_never_advance_head() {
 
 #[test]
 fn ct4_promotion_004_fault_before_head_preserves_old_live_tool_lock_and_retries_once() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(
         dir.path().join("before-head.pdf"),
@@ -611,7 +615,7 @@ fn ct4_promotion_004_fault_before_head_preserves_old_live_tool_lock_and_retries_
 
 #[test]
 fn ct4_promotion_004_after_head_and_after_index_swap_faults_converge() {
-    let after_head = tempfile::tempdir().unwrap();
+    let after_head = canonical_tempdir();
     init(&after_head);
     fs::write(
         after_head.path().join("after-head.pdf"),
@@ -663,7 +667,7 @@ fn ct4_promotion_004_after_head_and_after_index_swap_faults_converge() {
     );
     assert_eq!(search["results"].as_array().unwrap().len(), 1);
 
-    let after_swap = tempfile::tempdir().unwrap();
+    let after_swap = canonical_tempdir();
     init(&after_swap);
     fs::write(
         after_swap.path().join("after-swap.pdf"),

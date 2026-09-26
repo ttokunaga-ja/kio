@@ -1,5 +1,9 @@
 //! Credential settings must never become diagnostic or log payloads.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::Path;
 
@@ -30,7 +34,7 @@ fn command(root: &Path, home: &Path, args: &[&str]) -> Command {
 fn malformed_plain_credential_stays_out_of_terminal_and_error_log() {
     const CANARY: &str = "CANARY_SYNTHETIC_CREDENTIAL_3812";
     for json_mode in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let root = temp.path().join("root");
         let home = temp.path().join("home");
         fs::create_dir(&root).unwrap();

@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::Path;
 
@@ -132,7 +136,7 @@ fn active_permitted_grant(status: &Value, tool_id: &str) -> bool {
 
 #[test]
 fn cand_069_inline_pointer_rejects_malformed_hash_before_resolution() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_tempdir();
     let xdg = temp.path().join("xdg");
     let scope = temp.path().join("scope");
     fs::create_dir_all(&scope).unwrap();
@@ -174,7 +178,7 @@ fn cand_069_inline_pointer_rejects_malformed_hash_before_resolution() {
 
 #[test]
 fn cand_025_portable_approvals_do_not_grant_new_root_but_local_approval_does() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_tempdir();
     let xdg = temp.path().join("xdg");
     let approved = temp.path().join("approved");
     let copied = temp.path().join("copied");
@@ -261,7 +265,7 @@ fn cand_025_portable_approvals_do_not_grant_new_root_but_local_approval_does() {
 
 #[test]
 fn cand_064_malformed_tool_lock_blocks_batch_before_task_mutation() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_tempdir();
     let xdg = temp.path().join("xdg");
     let scope = temp.path().join("scope");
     fs::create_dir_all(&scope).unwrap();
@@ -362,7 +366,7 @@ fn cand_064_malformed_tool_lock_blocks_batch_before_task_mutation() {
 
 #[test]
 fn cand_059_human_log_escapes_controls_while_json_preserves_message() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_tempdir();
     let xdg = temp.path().join("xdg");
     let scope = temp.path().join("scope");
     fs::create_dir_all(&scope).unwrap();

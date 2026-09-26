@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
@@ -74,7 +78,7 @@ fn path_text(path: &std::path::Path) -> String {
 
 #[test]
 fn ct4_restore_commit_restores_verified_files_and_empty_commit() {
-    let dir = TempDir::new().unwrap();
+    let dir = canonical_tempdir();
     // PA16/17 (§D, U25): `--to` must resolve OUTSIDE the scope root
     // entirely (not merely outside `.kio`) — a sibling TempDir stands in for
     // "some other directory on disk" throughout this file.
@@ -107,7 +111,7 @@ fn ct4_restore_commit_restores_verified_files_and_empty_commit() {
 
 #[test]
 fn ct4_restore_deleted_path_uses_newest_first_parent_binding() {
-    let dir = TempDir::new().unwrap();
+    let dir = canonical_tempdir();
     let out = TempDir::new().unwrap();
     init(&dir);
     fs::write(dir.path().join("deleted.md"), b"historical").unwrap();
@@ -131,7 +135,7 @@ fn ct4_restore_deleted_path_uses_newest_first_parent_binding() {
 
 #[test]
 fn ct4_restore_preflight_no_clobber_and_force_confirmation() {
-    let dir = TempDir::new().unwrap();
+    let dir = canonical_tempdir();
     let out = TempDir::new().unwrap();
     init(&dir);
     fs::write(dir.path().join("a.md"), b"alpha").unwrap();
@@ -193,7 +197,7 @@ fn ct4_restore_preflight_no_clobber_and_force_confirmation() {
 /// own `--force`/`--yes` assertions.
 #[test]
 fn r23_26_restore_conflict_no_force_is_exit_3_with_retry_disposition() {
-    let dir = TempDir::new().unwrap();
+    let dir = canonical_tempdir();
     let out = TempDir::new().unwrap();
     init(&dir);
     fs::write(dir.path().join("notes.md"), b"fresh content").unwrap();
@@ -233,7 +237,7 @@ fn r23_26_restore_conflict_no_force_is_exit_3_with_retry_disposition() {
 
 #[test]
 fn ct4_restore_source_preflight_is_atomic_and_raw_shorthand_is_invalid() {
-    let dir = TempDir::new().unwrap();
+    let dir = canonical_tempdir();
     let out = TempDir::new().unwrap();
     init(&dir);
     fs::write(dir.path().join("a.md"), b"alpha").unwrap();
@@ -273,7 +277,7 @@ fn ct4_restore_source_preflight_is_atomic_and_raw_shorthand_is_invalid() {
 
 #[test]
 fn ct4_restore_source_authorization_is_serialized_by_purge_publication_lock() {
-    let dir = TempDir::new().unwrap();
+    let dir = canonical_tempdir();
     let out = TempDir::new().unwrap();
     init(&dir);
     fs::write(dir.path().join("doc.md"), b"authorized bytes").unwrap();
@@ -297,7 +301,7 @@ fn ct4_restore_source_authorization_is_serialized_by_purge_publication_lock() {
 
 #[test]
 fn ct4_restore_rejects_shallow_tombstoned_and_store_destinations() {
-    let tombstoned = TempDir::new().unwrap();
+    let tombstoned = canonical_tempdir();
     let tombstoned_out = TempDir::new().unwrap();
     init(&tombstoned);
     fs::write(tombstoned.path().join("doc.md"), b"secret").unwrap();
@@ -355,7 +359,7 @@ fn ct4_restore_rejects_shallow_tombstoned_and_store_destinations() {
         assert_eq!(error["error_code"], "KIO-E-CONFIG-USAGE-001");
     }
 
-    let shallow = TempDir::new().unwrap();
+    let shallow = canonical_tempdir();
     let shallow_out = TempDir::new().unwrap();
     init(&shallow);
     fs::write(shallow.path().join("doc.md"), b"content").unwrap();
@@ -414,7 +418,7 @@ fn ct4_restore_rejects_shallow_tombstoned_and_store_destinations() {
 
 #[test]
 fn ct4_restore_tag_wins_over_same_named_historical_path() {
-    let dir = TempDir::new().unwrap();
+    let dir = canonical_tempdir();
     let out = TempDir::new().unwrap();
     init(&dir);
     fs::write(dir.path().join("tagged.md"), b"tag target").unwrap();
@@ -436,7 +440,7 @@ fn ct4_restore_tag_wins_over_same_named_historical_path() {
 
 #[test]
 fn ct4_restore_evidence_uses_exact_attested_commit_path_and_raw() {
-    let dir = TempDir::new().unwrap();
+    let dir = canonical_tempdir();
     let out = TempDir::new().unwrap();
     init(&dir);
     fs::write(dir.path().join("evidence.md"), b"attested bytes").unwrap();
@@ -525,7 +529,7 @@ fn ct4_restore_evidence_uses_exact_attested_commit_path_and_raw() {
 
 #[test]
 fn ct4_restore_cli_requires_to_and_rejects_extras_and_yes_without_force() {
-    let dir = TempDir::new().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("doc.md"), b"content").unwrap();
     let commit = snapshot(&dir, "source");
@@ -558,7 +562,7 @@ fn ct4_restore_cli_requires_to_and_rejects_extras_and_yes_without_force() {
 fn ct4_restore_refuses_symlink_and_hardlink_destination_leaves() {
     use std::os::unix::fs::symlink;
 
-    let dir = TempDir::new().unwrap();
+    let dir = canonical_tempdir();
     let out = TempDir::new().unwrap();
     init(&dir);
     fs::write(dir.path().join("doc.md"), b"restored").unwrap();

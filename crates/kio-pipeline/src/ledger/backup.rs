@@ -223,7 +223,8 @@ mod tests {
     }
 
     fn private_tempdir() -> PrivateTestDirectory {
-        let temporary = tempfile::tempdir().expect("backup fixture container");
+        let temporary = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap())
+            .expect("backup fixture container");
         let retained = StoreDirectory::open(temporary.path()).expect("fixture container");
         let _private = retained
             .create_directory(Path::new("private"))

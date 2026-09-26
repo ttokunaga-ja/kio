@@ -25,6 +25,10 @@
 //! mechanics themselves are `kio-adapter` unit tests; this file only proves
 //! the CLI-to-Adapter-boundary wiring).
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 
 use assert_cmd::Command;
@@ -141,7 +145,7 @@ fn ledger_row_counts(dir: &TempDir) -> (i64, i64) {
 /// forcing the caller to filter the raw task array client-side.
 #[test]
 fn qa1_qa4_status_reports_budget_paused_task_with_hold_reason() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
     json_success(&dir, &["index", "--yes"]);
@@ -236,7 +240,7 @@ fn online_markdownize_task(status: &Value) -> Value {
 /// and completes it.
 #[test]
 fn qa2_auth_error_send_lands_paused_hold_reason_auth() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello qa2"])).unwrap();
     init(&dir);
     init_paid(&dir);
@@ -282,7 +286,7 @@ fn qa2_auth_error_send_lands_paused_hold_reason_auth() {
 /// `next_retry_at`, and an elapsed one completes.
 #[test]
 fn qa3_rate_limit_send_stays_pending_with_retry_after() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.pdf"),
         fake_pdf(&["hello qa3 retry after"]),
@@ -333,7 +337,7 @@ fn qa3_rate_limit_send_stays_pending_with_retry_after() {
 /// synthetic +2s backoff.
 #[test]
 fn qa3_rate_limit_headerless_uses_synthetic_backoff() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.pdf"),
         fake_pdf(&["hello qa3 headerless"]),
@@ -368,7 +372,7 @@ fn qa3_rate_limit_headerless_uses_synthetic_backoff() {
 /// backoff elapses.
 #[test]
 fn qa3_embedding_rate_limit_pending_and_gated() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // A single flat section (no sub-heading) so this chunks to exactly one
     // embedding task — a nested `##` sub-heading (as in some other fixtures)
     // would split into multiple chunks/tasks here.
@@ -445,7 +449,7 @@ fn qa3_embedding_rate_limit_pending_and_gated() {
 /// §1 L101-113 required fields.
 #[test]
 fn qa5_scope_json_records_scan_approval_after_index_yes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
     assert!(
@@ -484,7 +488,7 @@ fn qa5_scope_json_records_scan_approval_after_index_yes() {
 /// original scan_approval (scope-level approval is recorded once).
 #[test]
 fn qa5_scan_approval_is_recorded_once_not_per_index_run() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
     json_success(&dir, &["index", "--yes"]);
@@ -513,7 +517,7 @@ fn qa5_scan_approval_is_recorded_once_not_per_index_run() {
 /// derived, not a hardcoded constant reused verbatim).
 #[test]
 fn qa7_effective_ignore_hash_is_derived_from_real_pattern_content() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
     json_success(&dir, &["index", "--yes"]);
@@ -540,7 +544,7 @@ fn qa7_effective_ignore_hash_is_derived_from_real_pattern_content() {
 /// but-unused key.
 #[test]
 fn qa12_folder_config_per_adapter_is_a_schema_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
     fs::write(
@@ -557,7 +561,7 @@ fn qa12_folder_config_per_adapter_is_a_schema_error() {
 /// device-layer one appears.
 #[test]
 fn qa11_status_budget_report_has_no_folder_per_adapter_key() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
     json_success(&dir, &["index", "--yes"]);
@@ -584,7 +588,7 @@ fn qa11_status_budget_report_has_no_folder_per_adapter_key() {
 /// mechanics directly; this is the end-to-end CLI wiring proof).
 #[test]
 fn qa13_sync_send_threads_intent_token_to_adapter() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello qa13"])).unwrap();
     init(&dir);
     init_paid(&dir);
@@ -616,7 +620,7 @@ fn qa13_sync_send_threads_intent_token_to_adapter() {
 /// embedding task must land `done`, never a `ContractViolation` failure.
 #[test]
 fn qa13_embedding_sync_send_threads_intent_token_to_adapter() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# Doc\n\nQA13 embedding idempotency threading body text.\n",
@@ -667,7 +671,7 @@ fn qa13_embedding_sync_send_threads_intent_token_to_adapter() {
 /// (`validate_user_tools_config`, exit 2).
 #[test]
 fn qa19_tools_toml_pricing_example_is_accepted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
     fs::create_dir_all(dir.path().join(".test-config/kio")).unwrap();
@@ -685,7 +689,7 @@ fn qa19_tools_toml_pricing_example_is_accepted() {
 /// `[pricing]`.
 #[test]
 fn qa19_tools_toml_pricing_unknown_kind_is_a_schema_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
     fs::create_dir_all(dir.path().join(".test-config/kio")).unwrap();
@@ -706,7 +710,7 @@ fn qa19_tools_toml_pricing_unknown_kind_is_a_schema_error() {
 /// `0.0` unconditionally, cited by name in the old code comment).
 #[test]
 fn qa19_scan_approval_estimated_markdownize_usd_reflects_declared_pricing() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // A non-text-native candidate (skips the text-native exclusion in the
     // markdownize byte sum) — any positive size rounds up to at least 1
     // estimated page under the fixed 3_000-byte/page assumption, so a small,
@@ -761,7 +765,7 @@ fn qa32_bbox_annotation_toggle_changes_tool_profile_hash() {
 /// error (type mismatch: boolean expected, object found).
 #[test]
 fn qa33_bbox_annotation_flat_key_is_accepted_nested_shape_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
     fs::write(
@@ -825,7 +829,7 @@ fn qa35_tool_lock_hash_ignores_capabilities_and_mode() {
 /// accept.
 #[test]
 fn qa61_include_neighbors_key_removed_from_schema() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
     fs::write(
@@ -842,7 +846,7 @@ fn qa61_include_neighbors_key_removed_from_schema() {
 // ===========================================================================
 
 fn make_registry_duplicate(dir_a: &TempDir, scope_id: &str) -> TempDir {
-    let dir_b = tempfile::tempdir().unwrap();
+    let dir_b = canonical_tempdir();
     fs::write(dir_b.path().join("other.md"), "# Other\n\nOther body.\n").unwrap();
     kio(&dir_b, &["init"]).assert().success();
     let scope_path = dir_b.path().join(".kio/scope.json");
@@ -880,7 +884,7 @@ fn make_registry_duplicate(dir_a: &TempDir, scope_id: &str) -> TempDir {
 /// cannot exercise this guard.
 #[test]
 fn qa66_qa67_online_reservation_fails_closed_on_registry_duplicate() {
-    let dir_a = tempfile::tempdir().unwrap();
+    let dir_a = canonical_tempdir();
     fs::write(dir_a.path().join("seed.pdf"), fake_pdf(&["seed"])).unwrap();
     kio(&dir_a, &["init"]).assert().success();
     init_paid(&dir_a);
@@ -919,7 +923,7 @@ fn qa66_qa67_online_reservation_fails_closed_on_registry_duplicate() {
 /// extension above.
 #[test]
 fn qa68_evidence_verify_still_fails_closed_on_registry_duplicate() {
-    let dir_a = tempfile::tempdir().unwrap();
+    let dir_a = canonical_tempdir();
     fs::write(
         dir_a.path().join("seed.md"),
         "# Seed\n\nTTL is 3600 seconds.\n",
@@ -999,7 +1003,7 @@ fn write_scope_allow_network_true(dir: &TempDir) {
 /// positive control that creates the active record.
 #[test]
 fn qa21_config_only_requires_explicit_approval_and_read_gate_is_immutable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
     init(&dir);
     // `--yes` records a local scan grant. Establish it before capturing the
@@ -1051,7 +1055,7 @@ fn qa21_config_only_requires_explicit_approval_and_read_gate_is_immutable() {
 /// check and a single-Adapter revoke both need.
 #[test]
 fn qa22_approval_row_is_stored_in_scope_json_approvals_not_a_device_global_file() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
     init(&dir);
     assert!(
@@ -1104,7 +1108,7 @@ fn qa22_approval_row_is_stored_in_scope_json_approvals_not_a_device_global_file(
 /// marker — a no-op revoke must not alter portable consent state.
 #[test]
 fn qa25_revoke_with_nothing_approved_is_idempotent_no_target() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     let output = json_success(&dir, &["adapter", "revoke", "some_tool_id"]);
     assert_eq!(output["status"], "no_target");
@@ -1120,7 +1124,7 @@ fn qa25_revoke_with_nothing_approved_is_idempotent_no_target() {
 /// preservation).
 #[test]
 fn qa25_revoke_single_tool_id_flips_status_without_deleting_row() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
     init(&dir);
     json_success(
@@ -1161,7 +1165,7 @@ fn qa25_revoke_single_tool_id_flips_status_without_deleting_row() {
 /// preserved by `--all`.
 #[test]
 fn qa25_revoke_all_revokes_every_row_without_touching_allow_network_boolean() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
     init(&dir);
     json_success(
@@ -1195,7 +1199,7 @@ fn qa25_revoke_all_revokes_every_row_without_touching_allow_network_boolean() {
 /// otherwise).
 #[test]
 fn qa25_revoke_requires_tool_id_or_all() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     let err = json_failure(&dir, &["adapter", "revoke"], 2);
     assert_eq!(err["error_code"], "KIO-E-CONFIG-USAGE-001");
@@ -1211,7 +1215,7 @@ fn qa25_revoke_requires_tool_id_or_all() {
 /// driven deterministically through the CLI.
 #[test]
 fn qa26_publish_detects_concurrent_revoke_removing_the_pending() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let repo = Repository::init(dir.path()).unwrap();
     let scope_id = repo.scope_identity().unwrap().scope_id;
     let tool_id = "mistral_ocr_markdownize";
@@ -1254,7 +1258,7 @@ fn qa26_publish_detects_concurrent_revoke_removing_the_pending() {
 /// `approvals_initialized` marker in the same write.
 #[test]
 fn qa27_revoke_removes_stale_profile_pending_and_sets_marker() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let repo = Repository::init(dir.path()).unwrap();
     let scope_id = repo.scope_identity().unwrap().scope_id;
     let tool_id = "mistral_ocr_markdownize";
@@ -1302,7 +1306,7 @@ fn qa27_revoke_removes_stale_profile_pending_and_sets_marker() {
 /// QA28's regression lock — so revoke cannot be used to build this
 /// fixture).
 fn setup_pending_mock_embedding_scope() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# Doc\n\nSome body text to embed.\n",
@@ -1439,7 +1443,7 @@ fn qa30_batch_retry_online_reaches_the_embedding_enrichment_pass() {
 /// together.
 #[test]
 fn qa30_batch_resume_online_and_offline_are_mutually_exclusive() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     let err = json_failure(&dir, &["batch", "resume", "--online", "--offline"], 2);
     assert_eq!(err["error_code"], "KIO-E-CONFIG-USAGE-001");
@@ -1484,7 +1488,7 @@ fn qa31_reindex_force_online_reaches_the_embedding_enrichment_pass() {
 /// `historical_reindex::run`), not just `--force`'s.
 #[test]
 fn qa31_reindex_at_online_flag_is_accepted_not_a_usage_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
     json_success(&dir, &["index", "--offline"]);

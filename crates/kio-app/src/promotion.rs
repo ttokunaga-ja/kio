@@ -643,6 +643,11 @@ mod tests {
 
     use super::validated_online_promotions;
 
+    fn canonical_tempdir() -> tempfile::TempDir {
+        // Strict store ancestry checks require the resolved macOS temporary root.
+        tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
+
     fn done_task(output_ref: String, raw_hash: String) -> TaskDescriptor {
         TaskDescriptor {
             task_id: "task_01TEST".to_owned(),
@@ -672,7 +677,7 @@ mod tests {
 
     #[test]
     fn accepts_only_complete_done_online_instances() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         Repository::init(dir.path()).unwrap();
         let kio_dir = dir.path().join(".kio");
         let raw_hash = hash_bytes(b"raw");
@@ -732,7 +737,7 @@ mod tests {
 
     #[test]
     fn rejects_completed_online_instance_without_bbox_policy_stamp() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         Repository::init(dir.path()).unwrap();
         let kio_dir = dir.path().join(".kio");
         let raw_hash = hash_bytes(b"raw");

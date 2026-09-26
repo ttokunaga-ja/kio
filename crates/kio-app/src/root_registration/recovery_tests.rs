@@ -14,6 +14,11 @@ use std::process::Command;
 
 const GATE: &str = "KIO_ROOT_REGISTRATION_RECOVERY_CHILD";
 
+fn canonical_tempdir() -> tempfile::TempDir {
+    // Strict store ancestry checks require the resolved macOS temporary root.
+    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+}
+
 fn child(path: &Path) -> BoundPlannedChild {
     let canonical_root = path.canonicalize().unwrap();
     let root = StoreDirectory::open(&canonical_root)
@@ -33,7 +38,7 @@ fn run_isolated(name: &str) {
     if std::env::var_os(GATE).is_some() {
         return;
     }
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_tempdir();
     let home = temp.path().join("device");
     for leaf in ["home", "data", "config", "cache", "tmp"] {
         fs::create_dir_all(home.join(leaf)).unwrap();
@@ -75,7 +80,7 @@ fn run_isolated(name: &str) {
 }
 
 fn setup() -> (tempfile::TempDir, PathBuf, Vec<u8>, String, String) {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = canonical_tempdir();
     let old = temp.path().join("old");
     let child_path = old.join("child");
     fs::create_dir_all(&child_path).unwrap();

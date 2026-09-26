@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::BTreeSet;
 use std::fs;
 
@@ -228,7 +232,7 @@ fn collect_all_history_by_cursor(dir: &TempDir, query: &str) -> Vec<(String, Str
 
 #[test]
 fn ct4_timetravel_001_parser_exclusivity_duration_and_no_mutation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(
         dir.path().join("parser.md"),
@@ -353,7 +357,7 @@ fn ct4_timetravel_001_parser_exclusivity_duration_and_no_mutation() {
 
 #[test]
 fn ct4_timetravel_002_exact_at_hash_tag_head_and_normalize_none() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     let a = b"# Version\n\nversionfixture payload alpha\n";
     let b = b"# Version\n\nversionfixture payload beta\n";
@@ -474,7 +478,7 @@ fn ct4_timetravel_002_exact_at_hash_tag_head_and_normalize_none() {
 /// SQLite to reconstruct it.
 #[test]
 fn ct4_timetravel_013_disconnected_at_uses_writer_published_replica() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
 
     fs::write(
@@ -613,7 +617,7 @@ fn ct4_timetravel_013_disconnected_at_uses_writer_published_replica() {
 /// completed empty marker before a replica-only reader needs it.
 #[test]
 fn ct4_timetravel_014_historical_reindex_publishes_empty_disconnected_at_snapshot() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
 
     fs::write(
@@ -702,7 +706,7 @@ fn ct4_timetravel_014_historical_reindex_publishes_empty_disconnected_at_snapsho
 /// the exact historical selector without source-index history.
 #[test]
 fn ct4_timetravel_015_historical_reindex_durably_publishes_existing_disconnected_chunk() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
 
     let content = b"# Durable publication\n\ndurablepublicationfixture existing chunk binding\n";
@@ -801,7 +805,7 @@ fn ct4_timetravel_015_historical_reindex_durably_publishes_existing_disconnected
 
 #[test]
 fn ct4_timetravel_016_historical_reindex_keeps_ancestor_introduction_for_unchanged_descendant() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
 
     let content = b"# Ancestor authority\n\nancestorpublicationfixture unchanged binding\n";
@@ -876,7 +880,7 @@ fn ct4_timetravel_016_historical_reindex_keeps_ancestor_introduction_for_unchang
 
 #[test]
 fn ct4_timetravel_017_historical_reindex_introduces_config_transition_at_descendant() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
 
     fs::write(
@@ -932,7 +936,7 @@ fn ct4_timetravel_017_historical_reindex_introduces_config_transition_at_descend
 
 #[test]
 fn ct4_timetravel_018_historical_reindex_keeps_one_linear_introduction_through_copy_and_delete() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("base.md"), "# Base\n\nbasefixture\n").unwrap();
     index_at(&dir, "2026-07-12T00:00:00Z");
@@ -974,7 +978,7 @@ fn ct4_timetravel_018_historical_reindex_keeps_one_linear_introduction_through_c
 
 #[test]
 fn ct4_timetravel_003_edit_rename_aliases_twins_and_cursor_paging() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     let edit_old = b"# Edit\n\nhistoryfixture edited value oldneedle\n";
     let edit_new = b"# Edit\n\nhistoryfixture edited value newneedle\n";
@@ -1061,7 +1065,7 @@ fn ct4_timetravel_003_edit_rename_aliases_twins_and_cursor_paging() {
 
 #[test]
 fn ct4_timetravel_004_include_deleted_uses_final_version_and_frozen_tree() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     let a = b"# Gone\n\ntimelinefixture deleted alpha old version\n";
     let b = b"# Gone\n\ntimelinefixture deleted beta final version\n";
@@ -1208,7 +1212,7 @@ fn ct4_timetravel_004_include_deleted_uses_final_version_and_frozen_tree() {
 
 #[test]
 fn ct4_timetravel_006_cursor_binds_and_inherits_selector() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     for name in ["a.md", "b.md", "c.md"] {
         fs::write(
@@ -1377,7 +1381,7 @@ fn ct4_timetravel_006_cursor_binds_and_inherits_selector() {
 
 #[test]
 fn ct4_timetravel_005_since_includes_cutoff_and_freezes_it_in_cursor() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(
         dir.path().join("before.md"),
@@ -1552,7 +1556,7 @@ fn ct4_timetravel_005_since_includes_cutoff_and_freezes_it_in_cursor() {
 
 #[test]
 fn ct4_timetravel_006_cursor_rejects_write_through_visible_append() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     for name in ["rank-a.md", "rank-b.md"] {
         fs::write(
@@ -1622,7 +1626,7 @@ fn ct4_timetravel_006_cursor_rejects_write_through_visible_append() {
 
 #[test]
 fn ct4_timetravel_011_historical_reindex_rejects_config_drift_without_mutation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     kio(&dir, &["ledger", "init"], None).assert().success();
     json_success(&dir, &["adapter", "approve", "--all", "--yes"]);
@@ -1769,7 +1773,7 @@ fn write_shallow_receipt(dir: &TempDir, commit_hash: &str) {
 
 #[test]
 fn ct4_timetravel_007_replica_revalidates_history_after_cas_becomes_shallow() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(
         dir.path().join("history.md"),
@@ -1888,7 +1892,7 @@ fn ct4_timetravel_007_replica_revalidates_history_after_cas_becomes_shallow() {
 
     // A cursor snapshot that becomes shallow also hard-fails; it cannot serve a
     // partial page from cached HEAD rows.
-    let cursor_dir = tempfile::tempdir().unwrap();
+    let cursor_dir = canonical_tempdir();
     init(&cursor_dir);
     for name in ["a.md", "b.md"] {
         fs::write(
@@ -1975,7 +1979,7 @@ fn synthetic_commit(
 
 #[test]
 fn ct4_timetravel_012_walks_one_linear_parent_chain_and_keeps_original_introduction() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(
         dir.path().join("base.md"),

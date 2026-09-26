@@ -5,6 +5,10 @@
 //! output fields `resolve_pointer_for_cli` does not produce yet). This file
 //! does not fabricate coverage for those.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -451,7 +455,7 @@ fn assert_search_child_process_tree(child: &std::process::Child) {
 /// not mutate device-ledger SQLite or lifecycle artifacts.
 #[test]
 fn pb_text_search_preserves_cost_ledger_and_write_sequence_identity() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("ledger-text-search.md"),
         "# Ledger text search\n\ntextledgerneedle\n",
@@ -513,7 +517,7 @@ fn pb_text_search_preserves_cost_ledger_and_write_sequence_identity() {
 #[cfg(unix)]
 #[test]
 fn pb_text_search_unsafe_ledger_hardlink_fails_closed_without_search_fallback() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("unsafe-ledger-search.md"),
         "# Unsafe ledger\n\nunsafeledgerneedle\n",
@@ -565,7 +569,7 @@ fn pb_text_search_unsafe_ledger_hardlink_fails_closed_without_search_fallback() 
 /// discovering that policy error).
 #[test]
 fn pb_text_search_budget_policy_error_remains_best_effort_and_non_mutating() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("invalid-budget-policy.md"),
         "# Invalid budget policy\n\ninvalidbudgetpolicyneedle\n",
@@ -603,7 +607,7 @@ fn pb_text_search_budget_policy_error_remains_best_effort_and_non_mutating() {
 /// or SQLite sidecars merely to render `index_status`.
 #[test]
 fn pb_text_search_missing_ledger_is_zero_spend_and_no_create() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("missing-ledger-search.md"),
         "# Missing ledger\n\nmissingledgerneedle\n",
@@ -645,7 +649,7 @@ fn pb_text_search_missing_ledger_is_zero_spend_and_no_create() {
 #[cfg(unix)]
 #[test]
 fn pb_text_search_retries_absent_to_present_ledger_before_budget_status() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("appearing-ledger-search.md"),
         "# Appearing ledger\n\nappearingledgerneedle\n",
@@ -720,7 +724,7 @@ fn pb_text_search_retries_absent_to_present_ledger_before_budget_status() {
 /// source SQLite database or creating WAL/SHM sidecars.
 #[test]
 fn pb_text_and_auto_preserve_device_cap_exhaustion_without_ledger_mutation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("device-budget.md"),
         "# Device budget\n\ndevicebudgetneedle\n",
@@ -738,7 +742,7 @@ fn pb_text_and_auto_preserve_device_cap_exhaustion_without_ledger_mutation() {
 /// visible to text/auto status while the source device ledger stays untouched.
 #[test]
 fn pb_text_and_auto_preserve_folder_cap_exhaustion_without_ledger_mutation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("folder-budget.md"),
         "# Folder budget\n\nfolderbudgetneedle\n",
@@ -757,7 +761,7 @@ fn pb_text_and_auto_preserve_folder_cap_exhaustion_without_ledger_mutation() {
 /// nor the `state=1` job-created reservation alone reaches the cap.
 #[test]
 fn pb_text_and_auto_preserve_device_reservation_exhaustion_without_ledger_mutation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("device-reservation.md"),
         "# Device reservation\n\ndevicereservationneedle\n",
@@ -777,7 +781,7 @@ fn pb_text_and_auto_preserve_device_reservation_exhaustion_without_ledger_mutati
 /// non-paused status. No settled charge is present here.
 #[test]
 fn pb_text_and_auto_preserve_folder_reservation_exhaustion_without_ledger_mutation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("folder-reservation.md"),
         "# Folder reservation\n\nfolderreservationneedle\n",
@@ -794,7 +798,7 @@ fn pb_text_and_auto_preserve_folder_reservation_exhaustion_without_ledger_mutati
 
 /// init + index + search, returning (dir, evidence_pointer, evidence_uri).
 fn fixture() -> (TempDir, Value, String) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("evidence.md"),
         "# Evidence\n\nTTL is 3600 seconds.\n",
@@ -946,7 +950,7 @@ fn pb46_same_generation_immutable_bodies_remain_commit_pinned_after_rebuild() {
     const BODY_A: &str = "samegenbodyalphaonly";
     const BODY_B: &str = "samegenbodybetaonly";
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("evidence.md"),
         format!("# Evidence\n\n{BODY_A}\n"),
@@ -1657,7 +1661,7 @@ fn pb21_pb22_live_duplicate_fails_closed_even_without_a_last_seen_tie() {
     let (dir_a, pointer, _) = fixture();
     let scope_id = pointer["scope_id"].as_str().unwrap().to_owned();
 
-    let dir_b = tempfile::tempdir().unwrap();
+    let dir_b = canonical_tempdir();
     kio(&dir_b, &["init"]).arg("--json").assert().success();
     let scope_path = dir_b.path().join(".kio/scope.json");
     let mut scope: Value = serde_json::from_slice(&fs::read(&scope_path).unwrap()).unwrap();
@@ -2040,7 +2044,7 @@ fn pb45_historical_reindex_reads_the_pinned_manifest_not_the_working_copy() {
 /// error — exit 0 without `--strict`.
 #[test]
 fn pb53_scope_unreachable_is_a_structured_status_exit_zero() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let pointer = serde_json::json!({
         "schema_version": 1,
         "commit": format!("sha256:{}", "a".repeat(64)),
@@ -2463,7 +2467,7 @@ fn pb62_batch_complete_single_status_and_exit_parity() {
 
     let (registry_dir, mut duplicate, _) = fixture();
     let duplicate_scope = duplicate["scope_id"].as_str().unwrap().to_owned();
-    let clone = tempfile::tempdir().unwrap();
+    let clone = canonical_tempdir();
     success(&clone, &["init"]);
     let scope_path = clone.path().join(".kio/scope.json");
     let mut scope: Value = serde_json::from_slice(&fs::read(&scope_path).unwrap()).unwrap();
@@ -2722,7 +2726,7 @@ fn pb68_verify_and_open_agree_on_canonical_erased_raw_absent() {
 /// `view`, and `evidence verify` alike (PB68's cross-command agreement).
 #[test]
 fn pb48_pb49_manifest_missing_resolves_via_resurrection_link_after_reingest() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("evidence.md"),
         "# Evidence\n\nTTL is 3600 seconds.\n",

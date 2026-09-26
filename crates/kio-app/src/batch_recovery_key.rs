@@ -67,7 +67,7 @@ mod tests {
     use std::fs;
 
     fn private_tempdir() -> tempfile::TempDir {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         let directory = StoreDirectory::open(root.path()).unwrap();
         kio_core::store_dir::restrict_new_private_directory(&directory.root_handle()).unwrap();
         root

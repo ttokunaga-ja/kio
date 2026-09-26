@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -56,7 +60,7 @@ fn file_tree(root: &Path) -> BTreeMap<PathBuf, TreeEntry> {
 #[test]
 fn index_preview_leaves_the_repository_file_tree_unchanged() {
     let repo = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = canonical_tempdir();
     kio(home.path())
         .arg("init")
         .current_dir(repo.path())
@@ -76,7 +80,7 @@ fn index_preview_leaves_the_repository_file_tree_unchanged() {
 
 #[test]
 fn search_all_scopes_rejects_scope_selectors_at_parse_time() {
-    let home = tempfile::tempdir().unwrap();
+    let home = canonical_tempdir();
     for args in [
         ["search", "needle", "--all-scopes", "--scope", "."].as_slice(),
         ["search", "needle", "--all-scopes", "--descendants"].as_slice(),

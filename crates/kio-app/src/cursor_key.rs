@@ -88,7 +88,7 @@ mod tests {
     use super::{CURSOR_KEY_LEAF, load_or_create_at};
 
     fn private_tempdir() -> tempfile::TempDir {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         #[cfg(unix)]
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
         directory

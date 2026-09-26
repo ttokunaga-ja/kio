@@ -5,6 +5,10 @@
 //! Test names carry their PA number(s) so failures map directly back to the
 //! contract text. Sections mirror the spec's §A-§O structure.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -89,7 +93,7 @@ struct IndexedFixture {
 }
 
 fn indexed_fixture() -> IndexedFixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("doc.md"),
         "# Private\n\nneedle-p2a-content must round-trip\n",
@@ -351,7 +355,7 @@ fn pa03_pa06_image_and_raw_cache_directories_are_type_separated_for_a_shared_dig
     // A raw object and an image object that happen to share the exact same
     // byte content (hence the same digest) must materialize into DIFFERENT
     // cache directories.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let shared_bytes = b"pa03 shared raw/image byte content";
     fs::write(dir.path().join("shared.bin"), shared_bytes).unwrap();
     init(&dir);
@@ -394,7 +398,7 @@ fn pa03_pa06_image_and_raw_cache_directories_are_type_separated_for_a_shared_dig
 
 #[test]
 fn pa04_tombstone_priority_wins_over_working_tree_and_cache() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("doc.md"), "pa04 content").unwrap();
     init(&dir);
     json_success(&dir, &["index", "--offline"]);
@@ -444,7 +448,7 @@ fn pa04_tombstone_priority_wins_over_working_tree_and_cache() {
 
 #[test]
 fn pa05_image_barrier_is_journal_only_tombstone_of_a_same_digest_raw_does_not_apply() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let shared_bytes = b"pa05 shared raw/image content, tombstoned as raw only";
     fs::write(dir.path().join("shared.md"), shared_bytes).unwrap();
     init(&dir);
@@ -685,7 +689,7 @@ fn pa14_pa15_prune_orphans_recovers_purged_raw_and_type_separated_image_cache() 
 
 #[test]
 fn pa16_pa17_destination_rejects_scope_root_dot_kio_and_ordinary_subdir_with_config_usage() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("doc.md"), b"pa16 content").unwrap();
     let commit = json_success(&dir, &["snapshot", "create", "-m", "source"])["commit_hash"]
@@ -730,7 +734,7 @@ fn pa16_pa17_destination_rejects_scope_root_dot_kio_and_ordinary_subdir_with_con
 
 #[test]
 fn pa20_reserved_evacuation_namespace_source_names_are_rejected_before_expansion() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(
         dir.path().join("notes.md.kio-export-bak"),
@@ -756,7 +760,7 @@ fn pa20_reserved_evacuation_namespace_source_names_are_rejected_before_expansion
 
 #[test]
 fn pa21_stale_backup_residue_is_rejected_before_mutation_regardless_of_force() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("notes.md"), b"pa21 content").unwrap();
     let commit = json_success(&dir, &["snapshot", "create", "-m", "source"])["commit_hash"]
@@ -807,7 +811,7 @@ fn pa21_stale_backup_residue_is_rejected_before_mutation_regardless_of_force() {
 
 #[test]
 fn pa22_pa23_force_overwrite_evacuates_old_file_before_no_replace_publish() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("notes.md"), b"pa22 restored content").unwrap();
     let commit = json_success(&dir, &["snapshot", "create", "-m", "source"])["commit_hash"]
@@ -860,7 +864,7 @@ fn pa23_non_force_publish_race_is_a_transient_conflict_leaving_destination_untou
     // `restore_conflict_error` classifies) -- it shares
     // KIO-E-COMMIT-EXPORT-CONFLICT-001's exit 3 but carries
     // `retry_disposition=manual_action` (add --force), not `transient`.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("a.md"), b"alpha").unwrap();
     fs::write(dir.path().join("b.md"), b"beta").unwrap();
@@ -890,7 +894,7 @@ fn pa23_non_force_publish_race_is_a_transient_conflict_leaving_destination_untou
 
 #[test]
 fn pa27_pa28_pa29_conflict_kind_is_closed_and_retry_disposition_follows_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("notes.md"), b"pa27 content").unwrap();
     let commit = json_success(&dir, &["snapshot", "create", "-m", "source"])["commit_hash"]
@@ -934,7 +938,7 @@ fn pa27_pa28_pa29_conflict_kind_is_closed_and_retry_disposition_follows_it() {
 
 #[test]
 fn pa30_purge_cli_syntax_matches_spec_path_raw_hash_exclusive_reason_enum_yes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("doc.md"), b"pa30 content").unwrap();
     json_success(&dir, &["index", "--offline"]);
@@ -1225,7 +1229,7 @@ fn pa37_pa38_pa39_working_tree_residual_warns_instead_of_the_retired_hard_block(
     // `KIO-E-PURGE-WORKING-COPY-001` hard block is gone, purge reaches
     // `status: "purged"` (not `purge_incomplete`), and the
     // `working_tree_warning` is still surfaced on that success response.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("report-v1.pdf"), b"pa37 shared bytes").unwrap();
     init(&dir);
     json_success(&dir, &["index", "--offline"]);
@@ -1722,7 +1726,7 @@ fn pa50_all_three_restore_call_sites_share_the_same_corrupt_verdict_for_a_retire
     // PA47/48(b). This test confirms the SAME verdict from the local-path
     // preflight call site (`preflight`/`preflight_in_dir`'s shared
     // `check_purge_state`, reached identically regardless of source kind).
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("doc.md"), b"pa50 content").unwrap();
     let commit = json_success(&dir, &["snapshot", "create", "-m", "source"])["commit_hash"]

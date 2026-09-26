@@ -1,5 +1,9 @@
 //! End-to-end contracts for explicit recovery of a moved managed root.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use assert_cmd::Command;
 use kio_index::registry::RegistryDb;
 use serde_json::Value;
@@ -16,7 +20,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let device = temp.path().join("device");
         let root_parent = temp.path().join("managed");
         for path in std::iter::once(temp.path().to_path_buf())

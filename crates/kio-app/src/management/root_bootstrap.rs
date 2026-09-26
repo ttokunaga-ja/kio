@@ -510,6 +510,11 @@ mod tests {
     use kio_pipeline::scan::BoundPlannedChild;
     use std::fs;
 
+    fn canonical_tempdir() -> tempfile::TempDir {
+        // Strict store ancestry checks require the resolved macOS temporary root.
+        tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
+
     fn bound(path: &Path) -> BoundPlannedChild {
         let canonical_root = path.canonicalize().unwrap();
         let root = StoreDirectory::open(&canonical_root)
@@ -552,7 +557,7 @@ mod tests {
 
     #[test]
     fn empty_store_is_bootstrapped_and_reopens_as_existing() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let created = initialize(root.path()).unwrap();
         assert!(matches!(created, ExplicitRoot::Created(_)));
         assert!(matches!(
@@ -566,7 +571,7 @@ mod tests {
     #[test]
     fn read_shared_root_control_is_admitted() {
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(
             initialize(root.path()).unwrap(),
@@ -578,7 +583,7 @@ mod tests {
     #[test]
     fn unsafe_root_control_is_rejected_before_bootstrap_writes() {
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
         let before = tree_fingerprint(root.path());
         assert!(initialize(root.path()).is_err());
@@ -590,7 +595,7 @@ mod tests {
     #[test]
     fn preexisting_nonprivate_empty_store_is_rejected_without_changes() {
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let path = root.path().join(".kio");
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
@@ -606,7 +611,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn preexisting_permissive_dacl_is_rejected_without_changes() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let path = root.path().join(".kio");
         fs::create_dir(&path).unwrap();
         let status = std::process::Command::new("icacls.exe")
@@ -624,7 +629,7 @@ mod tests {
 
     #[test]
     fn unmarked_nonempty_store_is_preserved() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         fs::create_dir(root.path().join(".kio")).unwrap();
         fs::write(root.path().join(".kio").join("legacy"), b"do not touch").unwrap();
         let before = tree_fingerprint(root.path());
@@ -634,7 +639,7 @@ mod tests {
 
     #[test]
     fn malformed_journal_is_preserved() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         fs::create_dir(root.path().join(".kio")).unwrap();
         let marker = root.path().join(".kio").join(JOURNAL);
         fs::write(&marker, b"{}").unwrap();
@@ -645,7 +650,7 @@ mod tests {
 
     #[test]
     fn empty_initial_directory_is_the_only_unmarked_fresh_state() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         fs::create_dir(root.path().join(".kio")).unwrap();
         let kio = StoreDirectory::open(&root.path().join(".kio")).unwrap();
         assert!(preflight_unmarked_retry(&kio).is_ok());
@@ -681,7 +686,7 @@ mod tests {
     #[test]
     fn unmarked_bootstrap_gate_and_atomic_write_residue_resume() {
         for staged in [false, true] {
-            let root = tempfile::tempdir().unwrap();
+            let root = canonical_tempdir();
             let kio = unmarked_atomic_residue(root.path(), staged);
             let before = tree_fingerprint(root.path());
             preflight_unmarked_retry(&kio).unwrap();
@@ -701,7 +706,7 @@ mod tests {
     #[test]
     fn unmarked_bootstrap_residue_rejects_foreign_leaves_without_changes() {
         for leaf in ["foreign", ".kio-atomic/foreign"] {
-            let root = tempfile::tempdir().unwrap();
+            let root = canonical_tempdir();
             let kio = unmarked_atomic_residue(root.path(), true);
             fs::write(kio.path().join(leaf), b"preserve").unwrap();
             let before = tree_fingerprint(root.path());
@@ -713,7 +718,7 @@ mod tests {
     #[test]
     fn unmarked_bootstrap_residue_rejects_malformed_gates_without_changes() {
         for leaf in [GATE, ".kio-atomic/.gate"] {
-            let root = tempfile::tempdir().unwrap();
+            let root = canonical_tempdir();
             let kio = unmarked_atomic_residue(root.path(), true);
             fs::write(kio.path().join(leaf), b"not empty").unwrap();
             let before = tree_fingerprint(root.path());
@@ -727,7 +732,7 @@ mod tests {
     fn unmarked_bootstrap_residue_rejects_nonprivate_and_hardlinked_gates() {
         use std::os::unix::fs::PermissionsExt;
         for hardlinked in [false, true] {
-            let root = tempfile::tempdir().unwrap();
+            let root = canonical_tempdir();
             let kio = unmarked_atomic_residue(root.path(), true);
             let gate = kio.path().join(GATE);
             if hardlinked {
@@ -745,7 +750,7 @@ mod tests {
 
     #[test]
     fn unmarked_bootstrap_residue_rejects_ready_removal_without_changes() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let kio = unmarked_atomic_residue(root.path(), false);
         let atomic = StoreDirectory::from_retained(
             kio.open_directory(Path::new(".kio-atomic")).unwrap(),
@@ -780,7 +785,7 @@ mod tests {
 
     #[test]
     fn partial_planned_layout_resumes_with_its_original_scope_id() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let canonical = root.path().canonicalize().unwrap();
         let root_dir = StoreDirectory::open(&canonical).unwrap();
         let kio = StoreDirectory::from_retained(
@@ -823,7 +828,7 @@ mod tests {
     #[test]
     fn changed_root_control_refuses_resume_and_preserves_journal() {
         use std::os::unix::fs::PermissionsExt;
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let canonical = root.path().canonicalize().unwrap();
         let root_dir = StoreDirectory::open(&canonical).unwrap();
         let kio = StoreDirectory::from_retained(
@@ -852,7 +857,7 @@ mod tests {
 
     #[test]
     fn journal_identity_refuses_a_replaced_root_or_store() {
-        let root = tempfile::tempdir().unwrap();
+        let root = canonical_tempdir();
         let canonical = root.path().canonicalize().unwrap();
         let root_dir = StoreDirectory::open(&canonical).unwrap();
         let kio = StoreDirectory::from_retained(
@@ -869,7 +874,7 @@ mod tests {
             kio_identity: directory_identity_from_handle(kio.root_handle().as_ref()).unwrap(),
             case_insensitive: None,
         };
-        let other = tempfile::tempdir().unwrap();
+        let other = canonical_tempdir();
         let other_identity = directory_identity_from_handle(
             StoreDirectory::open(other.path())
                 .unwrap()
@@ -893,7 +898,7 @@ mod tests {
 
     #[test]
     fn enrolled_same_identity_child_without_kio_cannot_become_a_root() {
-        let parent_path = tempfile::tempdir().unwrap();
+        let parent_path = canonical_tempdir();
         let parent = match initialize(parent_path.path()).unwrap() {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("fresh parent unexpectedly existed"),
@@ -918,7 +923,7 @@ mod tests {
 
     #[test]
     fn healthy_parent_allows_unenrolled_sibling_and_preserves_existing_child() {
-        let parent_path = tempfile::tempdir().unwrap();
+        let parent_path = canonical_tempdir();
         let parent = match initialize(parent_path.path()).unwrap() {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("fresh parent unexpectedly existed"),
@@ -947,7 +952,7 @@ mod tests {
 
     #[test]
     fn corrupt_parent_kio_refuses_before_child_writes() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = canonical_tempdir();
         let child = parent.path().join("child");
         fs::create_dir(&child).unwrap();
         fs::write(parent.path().join(".kio"), b"not a directory").unwrap();

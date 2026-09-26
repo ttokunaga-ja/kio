@@ -8,6 +8,10 @@
 //! module (an established convention, not an oversight — see those files'
 //! own header comments).
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -321,7 +325,7 @@ fn write_inventory_fixture(dir: &TempDir, inventories: &Value) -> PathBuf {
 /// ordinary reconcile; neither command may silently repair the ledger.
 #[test]
 fn qa14_restore_detection_gates_new_submissions() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
 
     // Send #1: the ledger gets its first row and the authority-bound checkpoint
@@ -405,7 +409,7 @@ fn qa14_restore_detection_gates_new_submissions() {
 /// checkpoint to manufacture a new baseline.
 #[test]
 fn qa14_sequence_gap_blocks_status_without_mutating_lifecycle_artifacts() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["alpha"])).unwrap();
     json_success(&dir, &["index", "--yes"]);
@@ -460,7 +464,7 @@ fn qa14_sequence_gap_blocks_status_without_mutating_lifecycle_artifacts() {
 /// mutated, and rerunning produces an identical report.
 #[test]
 fn qa15_orphan_attribution_walk() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     let local_scope_id = scope_json(&dir)["scope_id"].as_str().unwrap().to_owned();
 
@@ -575,7 +579,7 @@ fn qa15_orphan_attribution_walk() {
 /// `unlistable` and untouched.
 #[test]
 fn qa15_batch_recovery_walk_first_wiring() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init_scope(&dir);
     let scope_id = scope_json(&dir)["scope_id"].as_str().unwrap().to_owned();
 

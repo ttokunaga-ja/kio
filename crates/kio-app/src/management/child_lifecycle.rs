@@ -890,6 +890,11 @@ mod tests {
     use kio_pipeline::scan::BoundPlannedChild;
     use std::fs;
 
+    fn canonical_tempdir() -> tempfile::TempDir {
+        // Strict store ancestry checks require the resolved macOS temporary root.
+        tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    }
+
     fn bound(path: &std::path::Path) -> BoundPlannedChild {
         let canonical_root = path.canonicalize().unwrap();
         let root = kio_core::store_dir::StoreDirectory::open(&canonical_root)
@@ -1030,7 +1035,7 @@ mod tests {
 
     #[test]
     fn empty_unpinned_stage_is_adopted_and_completed() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1045,7 +1050,7 @@ mod tests {
 
     #[test]
     fn pinned_partial_stage_is_completed_without_replacement() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1056,7 +1061,7 @@ mod tests {
 
     #[test]
     fn pinned_missing_stage_is_refused_without_new_allocation() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1078,7 +1083,7 @@ mod tests {
 
     #[test]
     fn ignored_private_pending_child_does_not_block_other_child_and_resumes_same_scope() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1109,7 +1114,7 @@ mod tests {
 
     #[test]
     fn ignored_published_pending_child_remains_inert_then_resumes() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1136,7 +1141,7 @@ mod tests {
 
     #[test]
     fn nonempty_unpinned_stage_is_refused_without_cleanup() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1158,7 +1163,7 @@ mod tests {
     fn unsafe_child_refuses_initialization_without_creating_lifecycle_artifacts() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1186,7 +1191,7 @@ mod tests {
     fn unsafe_pending_child_refuses_resume_without_changing_journal_or_stage() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1212,7 +1217,7 @@ mod tests {
 
     #[test]
     fn published_marker_blocks_normal_read_until_enrollment_recovery() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1231,7 +1236,7 @@ mod tests {
 
     #[test]
     fn enrolled_markerless_publication_only_cleans_parent_journal() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1273,7 +1278,7 @@ mod tests {
 
     #[test]
     fn retirement_replay_after_authority_cutoff_cleans_journal() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1325,7 +1330,7 @@ mod tests {
 
     #[test]
     fn same_identity_missing_metadata_keeps_enrollment_and_refuses_child_write() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
@@ -1350,7 +1355,7 @@ mod tests {
 
     #[test]
     fn replacement_directory_retires_old_membership_then_mints_fresh_scope() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();

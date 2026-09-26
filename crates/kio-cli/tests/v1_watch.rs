@@ -1,5 +1,9 @@
 //! Native watcher to application/CLI integration, with synthetic documents and
 //! isolated device state. No provider credentials or user configuration inherit.
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -14,7 +18,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let root = temp.path().join("root");
         let home = temp.path().join("home");
         fs::create_dir_all(&root).unwrap();

@@ -18,6 +18,10 @@
 //! `kio index`, which must leave portable consent state untouched. The positive
 //! controls use the existing explicit `--approve` flow.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -143,7 +147,7 @@ fn init_with_allow_network(dir: &TempDir) -> String {
 /// through the explicit approval flow.
 #[test]
 fn selfheal_01_pending_fails_closed_until_explicit_approval() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let scope_id = init_with_allow_network(&dir);
     let (tool_id, tool_profile_hash) = standard_markdownize_identity();
 
@@ -203,7 +207,7 @@ fn selfheal_01_pending_fails_closed_until_explicit_approval() {
 /// A mismatched pending also remains opaque to a read-only gate.
 #[test]
 fn selfheal_02_mismatched_profile_pending_is_left_untouched_and_gate_stays_closed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let scope_id = init_with_allow_network(&dir);
     let (tool_id, _real_hash) = standard_markdownize_identity();
     let stale_hash = format!("sha256:{}", "0".repeat(64));
@@ -243,7 +247,7 @@ fn selfheal_02_mismatched_profile_pending_is_left_untouched_and_gate_stays_close
 /// violation. It must fail closed without being cleaned up or inferred.
 #[test]
 fn selfheal_03_malformed_pending_fails_closed_without_mutation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let scope_id = init_with_allow_network(&dir);
     let (tool_id, tool_profile_hash) = standard_markdownize_identity();
 
@@ -283,7 +287,7 @@ fn selfheal_03_malformed_pending_fails_closed_without_mutation() {
 /// markdownize identity) sits unpublished.
 #[test]
 fn selfheal_04_second_tool_pending_requires_explicit_approval() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let scope_id = init_with_allow_network(&dir);
     let (tool_id_b, tool_profile_hash_b) = standard_markdownize_identity();
     let tool_id_a = "kio_selfheal_test_tool_a";

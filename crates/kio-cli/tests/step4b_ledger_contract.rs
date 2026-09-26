@@ -28,6 +28,10 @@
 //! last commit (before either agent's changes), with only this task's own files
 //! overlaid — see the implementation report.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 
@@ -2577,7 +2581,7 @@ fn cl67_abandon_applies_to_sync_rows_with_immediate_token_clear() {
 /// itself, matching the contract's literal "ユーザー確認で..." framing).
 #[test]
 fn cl64_abandon_cli_confirmation_records_estimated_charge_and_terminal_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init_scope(&dir);
     let task_key = key("device-test-scope", "markdownize", "cl64-task");
     let db = LedgerDb::open_existing(ledger_path_for(&dir)).unwrap();
@@ -2807,7 +2811,7 @@ fn retired_jsonl_files_fail_closed_without_modification() {
 
 #[test]
 fn ledger_opens_normally_when_no_retired_jsonl_files_exist() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let path = dir.path().join("kio/cost-ledger.sqlite");
     LedgerDb::initialize(&path).unwrap();
     let db = LedgerDb::open_existing(&path).unwrap();
@@ -2829,7 +2833,7 @@ fn ledger_opens_normally_when_no_retired_jsonl_files_exist() {
 
 #[test]
 fn legacy_rejection_does_not_change_existing_sqlite_bytes_or_rows() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let data_dir = dir.path().join("kio");
     let path = data_dir.join("cost-ledger.sqlite");
     {
@@ -2980,7 +2984,7 @@ fn init_scope(dir: &TempDir) {
 /// resolves it — after which `kio status` no longer lists it as stalled.
 #[test]
 fn cl65_cl68_status_to_abandon_round_trip() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init_scope(&dir);
     let task_key = key("device-test-scope", "markdownize", "stalled-task");
     let intent_token = seed_ledger_row_for_cli(&dir, &task_key);
@@ -3010,7 +3014,7 @@ fn cl65_cl68_status_to_abandon_round_trip() {
 /// is an idempotent exit-0 success.
 #[test]
 fn cl65_cl66_confirmation_rejection_and_no_target_idempotence() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init_scope(&dir);
     let task_key = key("device-test-scope", "markdownize", "stalled-task-2");
     let intent_token = seed_ledger_row_for_cli(&dir, &task_key);
@@ -3044,7 +3048,7 @@ fn cl65_cl66_confirmation_rejection_and_no_target_idempotence() {
 /// rejected as ambiguous.
 #[test]
 fn cl62_ambiguous_three_tuple_selector_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init_scope(&dir);
     let db = LedgerDb::open_existing(ledger_path_for(&dir)).unwrap();
     for profile in ["profile-a", "profile-b"] {
@@ -3074,7 +3078,7 @@ fn cl62_ambiguous_three_tuple_selector_is_rejected() {
 /// `count > 0` resets; a `count == 0` row reports "unchanged", not an error).
 #[test]
 fn reset_violations_resets_terminal_row_and_is_a_noop_at_zero() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init_scope(&dir);
     let db = LedgerDb::open_existing(ledger_path_for(&dir)).unwrap();
     let task_key = key("device-test-scope", "markdownize", "violating-task");

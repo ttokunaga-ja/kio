@@ -4,6 +4,10 @@
 //! republishes the raw retires the marker (appends `retired`; never deletes
 //! it — LC33).
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 
@@ -102,7 +106,7 @@ fn fake_pdf(text: &str) -> String {
 /// pointing at the republishing commit, in the same operation.
 #[test]
 fn ct4_purge_reingest_after_default_tombstone_republishes_and_retires() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let bytes = b"# Reintroduced\n\ndefault tombstone allows resurrection\n";
     let raw_hash = hash_bytes(bytes);
     fs::write(dir.path().join("doc.md"), bytes).unwrap();
@@ -208,7 +212,7 @@ fn ct4_purge_reingest_after_default_tombstone_republishes_and_retires() {
 /// removed — reversing the old "delete the receipt on republish" rule).
 #[test]
 fn ct4_purge_erase_receipt_is_ignored_then_retired_by_explicit_ingest() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let bytes = b"# Reintroduced\n\nerase receipt permits explicit ingest\n";
     fs::write(dir.path().join("doc.md"), bytes).unwrap();
     json_success(&dir, &["init"]);
@@ -260,7 +264,7 @@ fn ct4_purge_erase_receipt_is_ignored_then_retired_by_explicit_ingest() {
 /// transaction is genuinely in flight.
 #[test]
 fn ct4_purge_active_barrier_blocks_index_and_leaves_no_raw_or_temp() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let bytes = fake_pdf("active purge blocks resurrection");
     fs::write(dir.path().join("doc.pdf"), &bytes).unwrap();
     json_success(&dir, &["init"]);

@@ -12,6 +12,10 @@
 //! is the worse of the two failures — the archive would assert the local
 //! pipeline's identity over bytes it never touched.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::BTreeMap;
 use std::fs;
 #[cfg(unix)]
@@ -171,7 +175,7 @@ fn ledger_charge_rows(dir: &TempDir) -> i64 {
 }
 
 fn scanned_pdf_fixture() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // No text layer, so the deterministic Prepare mints no units and the file
     // is enqueued for enrichment. That is the whole point: this is the shape a
     // local OCR pipeline exists to handle.
@@ -200,7 +204,7 @@ fn write_scan_png(dir: &TempDir) {
 }
 
 fn scanned_image_fixture() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     write_scan_png(&dir);
     dir
 }

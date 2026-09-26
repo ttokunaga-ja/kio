@@ -7,6 +7,10 @@
 //! is the positive control: a zero offline trace cannot be explained by an
 //! invalid task or a missing approval.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -51,7 +55,7 @@ struct Fixture {
 
 impl Fixture {
     fn new(lane: Lane) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let root = temp.path().join("root");
         let home = temp.path().join("home");
         // The managed root and operational HOME must be siblings.  Otherwise

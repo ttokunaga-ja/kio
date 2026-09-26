@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::Path;
 use std::thread;
@@ -78,7 +82,7 @@ fn value_path_ends_with(value: &Value, suffix: &str) -> bool {
 /// Rust test harness runs each test on one thread.
 fn isolated_home() -> std::path::PathBuf {
     thread_local! {
-        static HOME: tempfile::TempDir = tempfile::tempdir().unwrap();
+        static HOME: tempfile::TempDir = canonical_tempdir();
     }
     HOME.with(|home| home.path().to_path_buf())
 }
@@ -368,7 +372,7 @@ fn ct_snapshot_auto_config_schema_is_strict() {
 #[test]
 fn ct_lock_001_concurrent_snapshots_fail_fast() {
     let temp = tempfile::tempdir().unwrap();
-    let device_home = tempfile::tempdir().unwrap();
+    let device_home = canonical_tempdir();
     assert_command_with_device_home(device_home.path())
         .arg("init")
         .current_dir(temp.path())
@@ -413,7 +417,7 @@ fn ct_lock_001_concurrent_snapshots_fail_fast() {
 #[test]
 fn m1_concurrent_index_loser_is_locked_and_store_intact() {
     let temp = tempfile::tempdir().unwrap();
-    let device_home = tempfile::tempdir().unwrap();
+    let device_home = canonical_tempdir();
     let bin = assert_cmd::cargo::cargo_bin("kio");
 
     let init = process_command_with_device_home(&bin, device_home.path())
@@ -720,7 +724,7 @@ fn ct_cli_011_012_013_lock_and_schema_errors_are_structured() {
 #[test]
 fn ct_obs_001_002_events_and_errors_jsonl() {
     let temp = tempfile::tempdir().unwrap();
-    let data = tempfile::tempdir().unwrap();
+    let data = canonical_tempdir();
     kio()
         .arg("init")
         .current_dir(temp.path())

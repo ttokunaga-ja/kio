@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -174,7 +178,7 @@ fn response_incremental(
 }
 
 fn scope() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     kio(&dir, ["init"]).assert().success();
     dir
 }
@@ -944,7 +948,7 @@ fn ct2_management_grant_allows_noninteractive_local_index_without_an_egress_gran
 // KIO-E-CONFIG-USAGE-001 envelope on stderr with clap's exit code (2).
 #[test]
 fn r11_1_derive_usage_error_honors_json_envelope() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let error = json_failure(&dir, ["diff"], 2);
     assert_eq!(error["error_code"], "KIO-E-CONFIG-USAGE-001");
     assert!(error["message"].as_str().is_some_and(|m| !m.is_empty()));
@@ -955,7 +959,7 @@ fn r11_1_derive_usage_error_honors_json_envelope() {
 // errors that must honor the machine contract under `--json`.
 #[test]
 fn r11_1_unknown_subcommand_and_flag_return_json_envelope() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let bogus = json_failure(&dir, ["bogus"], 2);
     assert_eq!(bogus["error_code"], "KIO-E-CONFIG-USAGE-001");
     let flag = json_failure(&dir, ["index", "--nope"], 2);
@@ -966,7 +970,7 @@ fn r11_1_unknown_subcommand_and_flag_return_json_envelope() {
 // verbatim (the envelope is a machine-mode-only affordance).
 #[test]
 fn r11_1_usage_error_without_json_stays_plaintext() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let stderr = kio(&dir, ["diff"])
         .assert()
         .code(2)
@@ -987,7 +991,7 @@ fn r11_1_usage_error_without_json_stays_plaintext() {
 // exit 0 — the try_parse wrapper must not regress them into the error path.
 #[test]
 fn r11_1_help_and_version_still_exit_zero() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     kio(&dir, ["--help"]).assert().success();
     kio(&dir, ["--version"]).assert().success();
 }
@@ -2849,7 +2853,7 @@ fn r13_6_absolute_xdg_lets_commands_run_even_without_home() {
     // An absolute XDG override is a valid base even when HOME is unset — the guard
     // must NOT block that case (XDG takes precedence over HOME).
     let work = tempfile::tempdir().unwrap();
-    let xdg = tempfile::tempdir().unwrap();
+    let xdg = canonical_tempdir();
     let mut command = hermetic_kio_command();
     command
         .current_dir(work.path())

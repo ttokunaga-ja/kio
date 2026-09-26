@@ -1,5 +1,9 @@
 //! Exact-only Evidence retarget integration contracts.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -87,7 +91,7 @@ fn registry_path(dir: &TempDir) -> std::path::PathBuf {
 }
 
 fn make_registry_duplicate(dir_a: &TempDir, scope_id: &str) -> TempDir {
-    let dir_b = tempfile::tempdir().unwrap();
+    let dir_b = canonical_tempdir();
     success(&dir_b, &["init"]);
     let scope_path = dir_b.path().join(".kio/scope.json");
     let mut scope: Value = serde_json::from_slice(&fs::read(&scope_path).unwrap()).unwrap();
@@ -162,7 +166,7 @@ fn kio_file_snapshot(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 }
 
 fn fixture_with_later_commit() -> (TempDir, Value, String) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("evidence.md"),
         "# Evidence\n\nTTL is 3600 seconds.\n",
@@ -187,7 +191,7 @@ fn fixture_with_later_commit() -> (TempDir, Value, String) {
 }
 
 fn fixture_with_duplicate_heading_candidates() -> (TempDir, Value, String) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("evidence.md"),
         "# Evidence\n\nFirst 3600-second statement.\n\n# Evidence\n\nSecond 3600-second statement.\n",
@@ -341,7 +345,7 @@ fn retarget_at_is_a_direct_exact_commit_object_not_a_ref() {
 
 #[test]
 fn retarget_zero_target_match_is_dedicated_not_found_without_stdout() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("evidence.md"),
         "# Evidence\n\nTTL is 3600 seconds.\n",

@@ -1,6 +1,10 @@
 //! Live ancestor policy must apply to durable projections without a watch pass.
 //! All adapters and credentials in this fixture are synthetic and process-local.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -19,7 +23,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let root = temp.path().join("root");
         let child = root.join("child");
         let home = temp.path().join("home");

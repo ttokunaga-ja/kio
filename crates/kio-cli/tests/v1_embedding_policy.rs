@@ -1,5 +1,9 @@
 //! Current-policy egress regressions for retained and historical embeddings.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use assert_cmd::Command;
 use tempfile::TempDir;
 
@@ -39,7 +43,7 @@ fn embedding_batch_rows(dir: &TempDir) -> i64 {
 /// remains subject to the live Ignore authority before any batch reservation.
 #[test]
 fn ignored_historical_owner_never_submits_or_reserves_a_new_embedding_job() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     std::fs::write(
         dir.path().join("history.md"),
         "# Historical\n\nretained body\n",

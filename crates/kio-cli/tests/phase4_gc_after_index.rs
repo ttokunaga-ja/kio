@@ -4,6 +4,10 @@
 //! debug-only checkpoint seam so bounded recovery does not depend on machine
 //! speed.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -135,7 +139,7 @@ fn scope_replacement_after_publication_cannot_redirect_automatic_gc() {
     let (victim, _victim_commit, victim_tree) = stale_candidate();
     configure(&victim, "after_index");
     let victim_tree_before = fs::read(tree_path(&victim, &victim_tree)).unwrap();
-    let control = tempfile::tempdir().unwrap();
+    let control = canonical_tempdir();
     let ready = control.path().join("post-publication.ready");
 
     let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
@@ -230,7 +234,7 @@ fn configure(dir: &TempDir, mode: &str) {
 
 /// Create a genuine, stale shallow-GC candidate and return its commit/tree.
 fn stale_candidate() -> (TempDir, String, String) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("document.md"), "# old\n\nold candidate\n").unwrap();
     json_success(&dir, &["init"], NOW);
     let old = json_success(&dir, &["index", "--offline", "--yes"], OLD);
@@ -357,7 +361,7 @@ fn manual_only_leaves_a_stale_candidate_byte_for_byte_unswept() {
 
 #[test]
 fn after_index_with_no_candidates_skips_without_creating_gc_state() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("note.md"), "candidate-free\n").unwrap();
     json_success(&dir, &["init"], NOW);
     configure(&dir, "after_index");
@@ -533,7 +537,7 @@ fn manual_only_snapshots_preserve_gc_state_tree_and_sqlite_generation() {
 
 #[test]
 fn snapshot_success_and_noop_report_after_index_without_gc_state_for_empty_plan() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("note.md"), "snapshot body\n").unwrap();
     json_success(&dir, &["init"], NOW);
     // Establish the public index first.  A candidate-free automatic hook must
@@ -583,7 +587,7 @@ fn preview_and_failed_index_never_start_after_index_gc() {
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn child_scope_runs_its_explicit_after_index_hook_once_and_reports_it_to_parent() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("parent.md"), "parent\n").unwrap();
     fs::create_dir_all(dir.path().join("child")).unwrap();
     fs::write(dir.path().join("child/note.md"), "child\n").unwrap();
@@ -635,7 +639,7 @@ fn child_scope_runs_its_explicit_after_index_hook_once_and_reports_it_to_parent(
 
 #[test]
 fn genuine_partial_index_result_never_starts_after_index_gc() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&["one", "two", "three", "four"]),
@@ -728,7 +732,7 @@ fn after_index_retains_a_tree_still_shared_by_a_protected_ref_tip() {
 #[test]
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn automatic_sweep_receipts_all_eligible_repaired_sharers_before_one_tree_removal() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("current.md"), "current\n").unwrap();
     json_success(&dir, &["init"], NOW);
     json_success(&dir, &["index", "--offline", "--yes"], NOW);

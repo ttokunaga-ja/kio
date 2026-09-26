@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::process::Command;
 
@@ -41,7 +45,7 @@ fn index(dir: &TempDir) -> String {
 }
 
 fn fixture() -> (TempDir, String, String) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     ok(&dir, &["init"]);
     fs::write(dir.path().join("a.md"), b"old unique orchid phrase").unwrap();
     fs::write(dir.path().join("b.md"), b"old b").unwrap();

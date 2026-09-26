@@ -21,6 +21,10 @@
 //! `bbox_annotation_format`, so the Batch lane only engages for
 //! bbox-disabled tasks (`markdownize_send_lane`'s documented gate).
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::PathBuf;
 
@@ -259,7 +263,7 @@ fn success_body(marker: &str) -> Value {
 
 #[test]
 fn b1_submit_records_upload_then_create_job_and_leaves_task_pending() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let input_hash = setup_scanned_scope(&dir);
     let capture = dir.path().join("batch-capture.jsonl");
     let state = dir.path().join("batch-poll-state");
@@ -342,7 +346,7 @@ fn b1_submit_records_upload_then_create_job_and_leaves_task_pending() {
 
 #[test]
 fn b2_collect_completes_task_and_makes_output_searchable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let input_hash = setup_scanned_scope(&dir);
     let capture = dir.path().join("batch-capture.jsonl");
     let state = dir.path().join("batch-poll-state");
@@ -416,7 +420,7 @@ fn b2_collect_completes_task_and_makes_output_searchable() {
 
 #[test]
 fn b3_create_job_crash_window_reconcile_found_then_resume_collects() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let input_hash = setup_scanned_scope(&dir);
     let capture = dir.path().join("batch-capture.jsonl");
     let state = dir.path().join("batch-poll-state");
@@ -525,7 +529,7 @@ fn b3_create_job_crash_window_reconcile_found_then_resume_collects() {
 
 #[test]
 fn b4_failed_job_settles_zero_charge_and_fails_task_permanently() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let input_hash = setup_scanned_scope(&dir);
     let capture = dir.path().join("batch-capture.jsonl");
     let state = dir.path().join("batch-poll-state");
@@ -576,7 +580,7 @@ fn b4_failed_job_settles_zero_charge_and_fails_task_permanently() {
 
 #[test]
 fn b5_inflight_only_resume_exits_retryable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let input_hash = setup_scanned_scope(&dir);
     let state = dir.path().join("batch-poll-state");
     let script = json!({

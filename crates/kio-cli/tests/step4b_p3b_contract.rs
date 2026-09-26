@@ -35,6 +35,10 @@
 //! reuse and PC33/44 per-binding chunking-config wiring — both
 //! need QB33/34/64/65's infra first).
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::str::FromStr;
 
@@ -139,7 +143,7 @@ fn registry_path(dir: &TempDir) -> std::path::PathBuf {
 
 /// A single-file indexed scope with one search-eligible pointer.
 fn fixture() -> (TempDir, Value) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("evidence.md"),
         "# Evidence\n\nTTL is 3600 seconds.\n",
@@ -210,7 +214,7 @@ fn make_index_generation_stale(dir: &TempDir, raw_hash: &str) {
 /// fixture. Returns the second scope's directory (kept alive for the
 /// registry row to remain "live"/reachable).
 fn make_registry_duplicate(dir_a: &TempDir, scope_id: &str) -> TempDir {
-    let dir_b = tempfile::tempdir().unwrap();
+    let dir_b = canonical_tempdir();
     kio(&dir_b, &["init"]).arg("--json").assert().success();
     let scope_path = kio_dir(&dir_b).join("scope.json");
     let mut scope: Value = serde_json::from_slice(&fs::read(&scope_path).unwrap()).unwrap();
@@ -262,7 +266,7 @@ fn qb1_scope_unreachable_is_exit_3_across_open_view_restore() {
         "scope_id": "scope_totally_unregistered_and_unreachable",
     });
     let pointer_json = serde_json::to_string(&pointer).unwrap();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
 
     let (code, err) = run(&dir, &["open", &pointer_json]);
     assert_eq!(code, 3, "open: {err}");
@@ -315,7 +319,7 @@ fn qb2_success_exit_is_independent_of_error_code_value() {
 /// at tool-lock materialize time with `KIO-E-EMBED-MODALITY-001` / exit 2.
 #[test]
 fn qb3a_non_multimodal_embedding_profile_rejected_exit_2() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("doc.md"), "# document\n").unwrap();
     success(&dir, &["init"]);
     let tool_lock_path = kio_dir(&dir).join("tool-lock.json");
@@ -344,7 +348,7 @@ fn qb3a_non_multimodal_embedding_profile_rejected_exit_2() {
 /// values.
 #[test]
 fn qb3b_fallback_reason_is_open_vocabulary_string() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("doc.md"), "# document\n").unwrap();
     success(&dir, &["init"]);
     success(&dir, &["ledger", "init"]);
@@ -630,8 +634,8 @@ fn qb9_new_version_store_write_command_rejects_with_zero_writes() {
 /// in another XDG registry is not discovered or copied into this registry.
 #[test]
 fn qb14a_index_registers_only_the_requested_root() {
-    let primary = tempfile::tempdir().unwrap();
-    let sibling = tempfile::tempdir().unwrap();
+    let primary = canonical_tempdir();
+    let sibling = canonical_tempdir();
     fs::write(primary.path().join("primary.md"), "# primary\n").unwrap();
     fs::write(sibling.path().join("sibling.md"), "# sibling\n").unwrap();
 
@@ -670,7 +674,7 @@ fn qb14a_index_registers_only_the_requested_root() {
 #[test]
 fn qb14b_xdg_data_home_fallback_resolves_under_home() {
     let scope_dir = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = canonical_tempdir();
     fs::write(scope_dir.path().join("a.md"), "# A\n\nbody\n").unwrap();
     Command::cargo_bin("kio")
         .unwrap()
@@ -738,7 +742,7 @@ fn qb14b_xdg_data_home_fallback_resolves_under_home() {
 /// gitfile; opt-in permits them. Preview reports its plan without mutation.
 #[test]
 fn qb15_child_scopes_vcs_default_opt_in_and_preview() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::create_dir_all(dir.path().join("ordinary/nested")).unwrap();
     fs::create_dir_all(dir.path().join("ignored")).unwrap();
     fs::write(dir.path().join("ordinary/note.md"), "ordinary").unwrap();
@@ -900,7 +904,7 @@ fn qb15_child_scopes_vcs_default_opt_in_and_preview() {
 #[cfg(windows)]
 #[test]
 fn windows_child_scope_auto_and_manual_index_share_retained_authority() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let child = dir.path().join("manual-child");
     fs::create_dir_all(&child).unwrap();
     fs::write(dir.path().join("parent.md"), "parent scope stable evidence").unwrap();
@@ -1020,7 +1024,7 @@ fn windows_child_scope_auto_and_manual_index_share_retained_authority() {
 #[cfg(windows)]
 #[test]
 fn windows_child_scope_junction_is_not_followed_or_mutated() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let victim = tempfile::tempdir().unwrap();
     fs::write(victim.path().join("victim.md"), "junction victim").unwrap();
     let victim_bytes = fs::read(victim.path().join("victim.md")).unwrap();
@@ -1080,7 +1084,7 @@ fn windows_child_scope_junction_is_not_followed_or_mutated() {
 
 #[test]
 fn qb15_parent_ignore_remains_live_without_copying_policy_into_child_config() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::create_dir_all(dir.path().join("project")).unwrap();
     fs::write(dir.path().join("project/private.md"), "private").unwrap();
     fs::write(dir.path().join("project/public.md"), "public").unwrap();
@@ -1162,7 +1166,7 @@ fn qb19_scrub_lock_contention_suppresses_only_matching_search_log_append() {
 #[cfg(unix)]
 #[test]
 fn qb20_symlink_ingest_is_skipped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let outside = tempfile::tempdir().unwrap();
     let target = outside.path().join("outside.md");
     fs::write(&target, "# Outside\n\nsymlink-only token\n").unwrap();
@@ -1177,7 +1181,7 @@ fn qb20_symlink_ingest_is_skipped() {
 /// A registered management root is the local scan grant. Open still needs a pointer.
 #[test]
 fn qb23_registered_root_indexes_without_confirmation_and_open_requires_a_pointer() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     success(&dir, &["init"]);
     fs::write(dir.path().join("a.md"), "# A\n\nbody\n").unwrap();
     let indexed = success(&dir, &["index"]);
@@ -1196,7 +1200,7 @@ fn qb23_registered_root_indexes_without_confirmation_and_open_requires_a_pointer
 /// with the frozen tokenizer and embedding schema.
 #[test]
 fn qb31_chunk_fts_and_chunk_vec_schema_is_executable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     success(&dir, &["init"]);
     success(&dir, &["index", "--offline"]);
     let conn = rusqlite::Connection::open(kio_dir(&dir).join("index/sqlite.db")).unwrap();
@@ -1222,7 +1226,7 @@ fn qb31_chunk_fts_and_chunk_vec_schema_is_executable() {
 /// enforced by their public runtime APIs.
 #[test]
 fn qb37_non_current_tables_are_absent_from_runtime_schema() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     success(&dir, &["init"]);
     success(&dir, &["index", "--offline"]);
     let conn = rusqlite::Connection::open(kio_dir(&dir).join("index/sqlite.db")).unwrap();
@@ -1294,7 +1298,7 @@ fn index_at(dir: &TempDir, fixed_now: &str, content: &str) -> String {
 /// 3 auto-snapshot commits C1 -> C2 -> C3(HEAD), each with a distinct
 /// `created_at`, oldest to newest.
 fn three_commit_history() -> (TempDir, [String; 3]) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     kio(&dir, &["init"]).arg("--json").assert().success();
     let c1 = index_at(&dir, "2026-01-01T00:00:00Z", "# A\n\nv1\n");
     let c2 = index_at(&dir, "2026-01-08T00:00:00Z", "# A\n\nv2\n");
@@ -1517,7 +1521,7 @@ fn index_metadata_row(dir: &TempDir) -> (String, i64) {
 /// cursor-invalidation ULID) — neither subsumes the other.
 #[test]
 fn qb61_lifecycle_retire_advances_both_index_generation_and_last_lifecycle_epoch() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let bytes = b"# Resurrection\n\nQB61 lifecycle coexistence probe\n";
     let raw_hash = hash_bytes(bytes);
     fs::write(dir.path().join("doc.md"), bytes).unwrap();

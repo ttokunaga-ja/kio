@@ -1,5 +1,9 @@
 //! Phase 4 milestone 1: the public GC surface is a deterministic read-only plan.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -64,7 +68,7 @@ fn store_image(root: &Path) -> StoreImage {
 #[test]
 fn gc_dry_run_is_deterministic_and_does_not_change_the_store() {
     let scope = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = canonical_tempdir();
     kio(home.path())
         .arg("init")
         .current_dir(scope.path())
@@ -127,7 +131,7 @@ fn gc_dry_run_is_deterministic_and_does_not_change_the_store() {
 #[test]
 fn gc_json_execution_requires_yes_even_when_the_plan_is_empty() {
     let scope = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = canonical_tempdir();
     kio(home.path())
         .arg("init")
         .current_dir(scope.path())
@@ -161,7 +165,7 @@ fn gc_json_execution_requires_yes_even_when_the_plan_is_empty() {
 #[test]
 fn gc_dry_run_and_yes_is_invalid_usage() {
     let scope = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = canonical_tempdir();
     kio(home.path())
         .arg("init")
         .current_dir(scope.path())
@@ -181,7 +185,7 @@ fn gc_dry_run_and_yes_is_invalid_usage() {
 #[test]
 fn gc_outside_a_scope_is_invalid_usage_without_creating_a_store() {
     let directory = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = canonical_tempdir();
     let before = fs::read_dir(directory.path()).unwrap().count();
 
     let output = kio(home.path())

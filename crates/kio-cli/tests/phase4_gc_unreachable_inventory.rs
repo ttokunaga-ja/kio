@@ -2,6 +2,10 @@
 
 #![cfg(unix)]
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
@@ -42,7 +46,7 @@ fn image(root: &Path) -> BTreeMap<String, Vec<u8>> {
 #[test]
 fn inventory_is_deterministic_read_only_and_prune_requires_dry_run() {
     let scope = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = canonical_tempdir();
     kio(home.path())
         .arg("init")
         .current_dir(scope.path())
@@ -114,7 +118,7 @@ fn inventory_is_deterministic_read_only_and_prune_requires_dry_run() {
 #[test]
 fn inventory_human_output_is_deterministic_and_failures_do_not_write_stdout() {
     let scope = tempfile::tempdir().unwrap();
-    let home = tempfile::tempdir().unwrap();
+    let home = canonical_tempdir();
     kio(home.path())
         .arg("init")
         .current_dir(scope.path())

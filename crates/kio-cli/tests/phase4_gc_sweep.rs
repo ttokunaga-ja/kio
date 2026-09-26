@@ -8,6 +8,10 @@
 // successful mutation and crash recovery only where those primitives exist.
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
@@ -107,7 +111,7 @@ fn json_failure(dir: &TempDir, args: &[&str], now: &str, code: i32) -> Value {
 /// A reachable, stale auto commit followed by a current ref tip.  The first
 /// commit is a genuine planner candidate, never a hand-written plan.
 fn candidate_fixture() -> (TempDir, String, String) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("document.md"), "# old\n\nold candidate\n").unwrap();
     // Keep several current rows so the pagination contract is observable
     // without fabricating an index or a cursor.
@@ -395,14 +399,14 @@ fn public_scope_replacement_before_bound_lock_never_touches_victim_lock_or_store
     use std::os::unix::fs::symlink;
 
     let (dir, _commit, _tree) = candidate_fixture();
-    let victim = tempfile::tempdir().unwrap();
+    let victim = canonical_tempdir();
     fs::write(victim.path().join("victim.md"), "do not touch\n").unwrap();
     json_success(&victim, &["init"], NOW);
     let victim_before = regular_file_snapshot(&victim.path().join(".kio"));
     assert!(!victim.path().join(".kio/.lock").exists());
 
     let ready = dir.path().with_extension("gc-bound-lock-ready");
-    let isolated_runtime = tempfile::tempdir().unwrap();
+    let isolated_runtime = canonical_tempdir();
     let child = kio_process(&dir, &["gc", "--yes"])
         .env("KIO_FIXED_NOW", NOW)
         .env("KIO_TEST_GC_PRELOCK_READY", &ready)

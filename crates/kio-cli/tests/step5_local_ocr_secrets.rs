@@ -13,6 +13,10 @@
 //! Mistral: a durable record asserting the user consented to send a credential
 //! to a cloud API that never received it.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -111,7 +115,7 @@ fn configure_local_ocr(dir: &TempDir, env: &[(&str, &str)]) {
 }
 
 fn fixture() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("credentials_scan.pdf"),
         "%PDF-1.4\nscanned page\n",

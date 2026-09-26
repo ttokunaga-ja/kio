@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -110,7 +114,7 @@ struct IndexedFixture {
 }
 
 fn indexed_fixture() -> IndexedFixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("doc.md"),
         "# Private\n\nneedle-purge-content must disappear\n",
@@ -286,7 +290,7 @@ struct EmbeddedImageFixture {
 }
 
 fn embedded_image_fixture() -> EmbeddedImageFixture {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("figures.pdf"), "%PDF-1.4\ntest\n").unwrap();
     json_success(&dir, &["init"]);
     json_success(&dir, &["ledger", "init"]);
@@ -360,7 +364,7 @@ fn ct4_purge_typed_path_preview_warns_on_live_working_copy_and_purges_all_versio
     // residual present; see
     // `pa37_pa38_pa39_working_tree_residual_warns_instead_of_the_retired_hard_block`
     // in `step4b_p2a_contract.rs` for the fuller note.)
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("doc.md"), "version one").unwrap();
     json_success(&dir, &["init"]);
     json_success(&dir, &["index", "--offline", "--yes"]);
@@ -393,7 +397,7 @@ fn ct4_purge_typed_path_preview_warns_on_live_working_copy_and_purges_all_versio
 
     // A fresh scope with no working-tree residual purges both historical
     // versions to completion, exactly as before this ruling.
-    let clean = tempfile::tempdir().unwrap();
+    let clean = canonical_tempdir();
     fs::write(clean.path().join("doc.md"), "version one").unwrap();
     json_success(&clean, &["init"]);
     json_success(&clean, &["index", "--offline", "--yes"]);
@@ -678,7 +682,7 @@ fn ct4_purge_deletes_target_immutable_normalized_unit_objects() {
 
 #[test]
 fn ct4_purge_preserves_other_raws_immutable_normalized_unit_objects() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("target.md"), "target-only secret").unwrap();
     fs::write(dir.path().join("survivor.md"), "survivor-only text").unwrap();
     json_success(&dir, &["init"]);
@@ -721,7 +725,7 @@ fn ct4_purge_preserves_other_raws_immutable_normalized_unit_objects() {
 
 #[test]
 fn ct4_purge_rejects_forged_target_ledger_row_before_deleting_survivor_chunk() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("target.md"), "target-only secret").unwrap();
     fs::write(dir.path().join("survivor.md"), "unrelated survivor content").unwrap();
     json_success(&dir, &["init"]);
@@ -796,7 +800,7 @@ fn ct4_purge_fails_closed_on_cross_raw_reachable_manifest_reuse() {
     // reuses its manifest hash: de-duplicating before validating each binding
     // used to skip that second tuple check and could delete content still
     // named by the surviving tree.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a-target.md"), "target-only secret").unwrap();
     fs::write(dir.path().join("z-survivor.md"), "survivor-only text").unwrap();
     json_success(&dir, &["init"]);
@@ -975,7 +979,7 @@ fn ct4_purge_erase_leaves_only_private_receipt_and_is_repeatable() {
 
 #[test]
 fn ct4_purge_preserves_shared_image_until_last_reference_is_removed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# A\n\nshared-image-a").unwrap();
     fs::write(dir.path().join("b.md"), "# B\n\nshared-image-b").unwrap();
     json_success(&dir, &["init"]);
@@ -1102,7 +1106,7 @@ fn ct4_purge_deletes_image_and_embedding_objects_of_an_embedded_document() {
 /// construction.
 #[test]
 fn ct4_purge_deletes_the_image_vector_of_a_locally_embedded_document() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("figures.pdf"), "%PDF-1.4\ntest\n").unwrap();
     json_success(&dir, &["init"]);
     json_success(&dir, &["ledger", "init"]);
@@ -1351,7 +1355,7 @@ fn ct4_purge_faults_publish_no_prebarrier_state_and_resume_every_visible_phase()
 #[cfg(debug_assertions)]
 fn removal_restart_fixture() -> (TempDir, String, String, Vec<String>) {
     use kio_core::cas::EmbeddingObject;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let shared =
         "## Shared\n\nshared restart vector content remains referenced by the keeper document.\n";
     fs::write(

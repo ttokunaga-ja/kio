@@ -30,6 +30,10 @@
 //! PC44's per-binding introduction ancestry is covered by the history
 //! projection tests below together with the existing deleted-history suite.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -367,7 +371,7 @@ fn init(dir: &TempDir) {
 /// configured — every `--at`/basic-search PC test uses this so `auto` mode is
 /// unambiguously text with `fallback_reason = embedding_endpoint_not_configured`).
 fn indexed_scope() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("auth.md"),
         "# Auth spec\n\n## API Token\ntokentestterm TTL is 3600 seconds.\n",
@@ -513,7 +517,7 @@ fn pc5_online_and_offline_are_mutually_exclusive() {
 /// separate public CLI invocation in the fixture's private HOME/XDG roots.
 #[test]
 fn pc6_auto_final_revoke_before_attempt_falls_back_to_text_without_ledger_mutation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("final-consent-recheck.md"),
         "# Final consent recheck\n\nfinalconsentneedle searchable text\n",
@@ -600,7 +604,7 @@ fn pc6_auto_final_revoke_before_attempt_falls_back_to_text_without_ledger_mutati
 /// silently treat the ledger as a zero-spend cache miss.
 #[test]
 fn pc6_missing_checkpoint_refuses_before_authorized_attempt() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("post-attempt-fallback.md"),
         "# Post-attempt fallback\n\npostattemptneedle searchable text\n",
@@ -660,7 +664,7 @@ fn pc6_missing_checkpoint_refuses_before_authorized_attempt() {
 #[cfg(unix)]
 #[test]
 fn search_hybrid_unsafe_ledger_preflight_precedes_writable_claim_and_send() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("unsafe-hybrid-ledger.md"),
         "# Unsafe hybrid ledger\n\nunsafehybridledgerneedle\n",
@@ -743,7 +747,7 @@ fn search_hybrid_unsafe_ledger_preflight_precedes_writable_claim_and_send() {
 #[cfg(unix)]
 #[test]
 fn search_query_syntax_validation_precedes_unsafe_ledger_preflight() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("unsafe-input-precedence.md"),
         "# Unsafe input precedence\n\nunsafeinputprecedenceneedle\n",
@@ -799,7 +803,7 @@ fn search_query_syntax_validation_precedes_unsafe_ledger_preflight() {
 /// `budget_paused=true`.
 #[test]
 fn search_response_budget_status_reuses_preflight_snapshot_after_folder_cap_writer() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("preflight-budget-snapshot.md"),
         "# Preflight budget snapshot\n\npreflightbudgetsnapshotneedle\n",
@@ -934,7 +938,7 @@ fn search_response_budget_status_reuses_preflight_snapshot_after_folder_cap_writ
 /// instead of being silently capped at 200 regardless of configuration.
 #[test]
 fn pc15_pc17_candidate_depth_configuration_is_not_hardcoded_to_200() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // One document deliberately contains 210 distinct, nonempty heading
     // records. The indexer still has to parse, chunk, persist, and search all
     // 210 real Markdown chunks, without paying filesystem setup/teardown for
@@ -1012,7 +1016,7 @@ fn pc15_pc17_candidate_depth_configuration_is_not_hardcoded_to_200() {
 /// a current-search `candidate_depth=2` slot ahead of the survivor.
 #[test]
 fn r23_17_replica_filters_ineligible_rows_before_candidate_depth() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     for i in 0..4 {
         fs::write(
             dir.path().join(format!("victim{i}.md")),
@@ -1111,7 +1115,7 @@ fn pc19_cursor_scope_carries_index_generation() {
 /// depends on for a real content change).
 #[test]
 fn pc21_cursor_replay_rejects_a_stale_index_generation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     for name in ["a.md", "b.md", "c.md"] {
         fs::write(
             dir.path().join(name),
@@ -1177,7 +1181,7 @@ fn pc21_cursor_replay_rejects_a_stale_index_generation() {
 /// the remap at the search cursor-replay call site.
 #[test]
 fn r23_25_cursor_replay_registry_duplicate_is_exit_3() {
-    let dir_a = tempfile::tempdir().unwrap();
+    let dir_a = canonical_tempdir();
     for name in ["a.md", "b.md", "c.md"] {
         fs::write(
             dir_a.path().join(name),
@@ -1239,7 +1243,7 @@ fn read_scope_id(dir: &TempDir) -> String {
 /// per-TempDir, so the new dir's own `init`/`index` are pointed at `dir_a`'s
 /// data home to make the two `.kio` clones share one live registry).
 fn clone_scope_id_into(dir_a: &TempDir, scope_id: &str) -> TempDir {
-    let dir_b = tempfile::tempdir().unwrap();
+    let dir_b = canonical_tempdir();
     fs::write(dir_b.path().join("other.md"), "# Other\n\nOther body.\n").unwrap();
     let xdg_config = dir_a.path().join(".test-config");
     let xdg_data = dir_a.path().join(".test-data");
@@ -1295,7 +1299,7 @@ fn clone_scope_id_into(dir_a: &TempDir, scope_id: &str) -> TempDir {
 /// generic SCOPE-ALL-FAILED-001.
 #[test]
 fn r23_27_default_search_excludes_live_registry_duplicate_scope() {
-    let dir_a = tempfile::tempdir().unwrap();
+    let dir_a = canonical_tempdir();
     fs::write(
         dir_a.path().join("a.md"),
         "# A\n\nglobalduplicateprobe body\n",
@@ -1330,7 +1334,7 @@ fn r23_27_default_search_excludes_live_registry_duplicate_scope() {
 /// not every enumerated target.
 #[test]
 fn r23_27_default_search_partial_excludes_only_the_duplicate_scope() {
-    let dir_a = tempfile::tempdir().unwrap();
+    let dir_a = canonical_tempdir();
     fs::write(
         dir_a.path().join("a.md"),
         "# A\n\npartialduplicateprobe healthy body\n",
@@ -1340,7 +1344,7 @@ fn r23_27_default_search_partial_excludes_only_the_duplicate_scope() {
     success(&dir_a, &["index", "--offline"]);
     let scope_id_a = read_scope_id(&dir_a);
 
-    let dir_c = tempfile::tempdir().unwrap();
+    let dir_c = canonical_tempdir();
     fs::write(
         dir_c.path().join("c.md"),
         "# C\n\npartialduplicateprobe duplicated body\n",
@@ -1415,7 +1419,7 @@ fn r23_27_default_search_partial_excludes_only_the_duplicate_scope() {
 /// usable ranking, not merely "didn't crash."
 #[test]
 fn r23_01_cursor_replay_never_re_embeds_the_query() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     for i in 0..3 {
         fs::write(
             dir.path().join(format!("doc{i}.md")),
@@ -1555,7 +1559,7 @@ fn r23_01_cursor_replay_never_re_embeds_the_query() {
 /// the ledger path unreachable for an actual fresh vector request.
 #[test]
 fn r23_01_fresh_vector_page_one_retains_allowed_ledger_open_semantics() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("vector-page-one.md"),
         "# Vector page one\n\nvectorpageoneneedle\n",
@@ -1648,7 +1652,7 @@ fn r23_01_fresh_vector_page_one_retains_allowed_ledger_open_semantics() {
 /// trace file gains no second line even on this failure path.
 #[test]
 fn r23_01_cursor_replay_with_evicted_cache_fails_closed_not_re_embed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     for i in 0..3 {
         fs::write(
             dir.path().join(format!("doc{i}.md")),
@@ -1770,7 +1774,7 @@ fn pc24_pc27_query_vector_digest_omitted_in_text_mode() {
 /// `unreachable`/SCOPE-ALL-FAILED path.
 #[test]
 fn pc34_head_unset_scope_is_index_rebuilding_not_generic_all_failed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     init(&dir);
     // No `kio index` — HEAD is unset (bare scope).
     let (code, err) = run(&dir, &["search", "anything", "--scope", "."]);
@@ -1784,7 +1788,7 @@ fn pc34_head_unset_scope_is_index_rebuilding_not_generic_all_failed() {
 /// checked for ancestor-or-equal against the target commit.
 #[test]
 fn pc38_pc39_at_excludes_chunks_introduced_only_at_a_descendant_commit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("root.md"),
         "# Root\n\nrootonlyterm content\n",
@@ -1868,7 +1872,7 @@ fn pc38_pc39_at_excludes_chunks_introduced_only_at_a_descendant_commit() {
 /// exercises both this case and PC45's skip-and-continue side by side).
 #[test]
 fn pc47_at_a_shallow_commit_itself_still_hard_fails() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("doc.md"),
         "# Doc\n\nshallowtargetterm body\n",
@@ -1928,7 +1932,7 @@ fn pc47_at_a_shallow_commit_itself_still_hard_fails() {
 /// (`/work/a` vs `/work/ab`) is not included.
 #[test]
 fn pc48_scope_flag_is_exact_match_not_string_prefix() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("scope-a");
     let ab = parent.path().join("scope-ab");
@@ -2031,7 +2035,7 @@ fn pc50_single_explicit_scope_search_applies_folder_default_mode() {
 /// the named target directories (created, initialized, but left unindexed;
 /// callers index/mutate them as each test needs).
 fn multi_scope_env(names: &[&str]) -> (TempDir, std::path::PathBuf, Vec<std::path::PathBuf>) {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let runner = parent.path().join("runner");
     fs::create_dir_all(&runner).unwrap();
@@ -2184,7 +2188,7 @@ fn pc57_non_current_scope_aborts_multi_scope_search_without_partial_success() {
 /// (single-scope registry) with a genuinely multi-scope registry.
 #[test]
 fn pc59_at_without_scope_is_invalid_usage_with_multiple_registered_scopes() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2249,7 +2253,7 @@ fn pc59_at_without_scope_is_invalid_usage_with_multiple_registered_scopes() {
 /// `RetainedNormalizedInstance::introductions`).
 #[test]
 fn pc37_chunk_publications_table_exists_and_is_populated_after_index() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# A\n\nintroductioncontenttoken\n").unwrap();
     init(&dir);
     let head = success(&dir, &["index", "--offline"])["commit_hash"]
@@ -2306,7 +2310,7 @@ fn pc37_chunk_publications_table_exists_and_is_populated_after_index() {
 /// `chunk_publications`.
 #[test]
 fn pc40_config_association_creation_is_stable_and_publication_is_separate() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# A\n\nconfigintroductiontoken\n").unwrap();
     init(&dir);
     let ca = success(&dir, &["index", "--offline"])["commit_hash"]
@@ -2369,7 +2373,7 @@ fn pc40_config_association_creation_is_stable_and_publication_is_separate() {
 
 #[test]
 fn pc40_publication_cannot_backdate_a_later_config_to_an_older_tree() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# A\n\nconfigbindingattacktoken configbindingattacktoken\n",
@@ -2432,7 +2436,7 @@ fn pc40_publication_cannot_backdate_a_later_config_to_an_older_tree() {
 /// `--at Ca` must keep resolving Ca's own pre-split (old-config) shape.
 #[test]
 fn pc22_pc23_pc31_at_uses_the_target_trees_config_not_current() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let long_body = "atreeconfigtoken ".repeat(50);
     fs::write(dir.path().join("a.md"), format!("# A\n\n{long_body}\n")).unwrap();
     init(&dir);
@@ -2571,7 +2575,7 @@ fn chunk_hash_set(search: &Value) -> std::collections::BTreeSet<String> {
 /// substitute.
 #[test]
 fn pc33_history_selectors_use_each_binding_trees_config() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let body = "perbindingconfigtoken ".repeat(40);
     fs::write(dir.path().join("old.md"), format!("# Old\n\n{body}\n")).unwrap();
     init(&dir);
@@ -2642,7 +2646,7 @@ fn pc33_history_selectors_use_each_binding_trees_config() {
 /// association. There is no live-value or association-order substitution.
 #[test]
 fn pc61_pc62_pc63_head_limited_reassociation_still_leaves_at_searchable() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# A\n\nheadonlytoken content\n").unwrap();
     fs::write(dir.path().join("b.md"), "# B\n\nhistoryonlytoken content\n").unwrap();
     init(&dir);
@@ -2720,7 +2724,7 @@ fn pc61_pc62_pc63_head_limited_reassociation_still_leaves_at_searchable() {
 /// confirmed unaffected by this change).
 #[test]
 fn pc52_explicit_vector_excludes_only_the_incompatible_scope() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2858,7 +2862,7 @@ fn pc52_explicit_vector_excludes_only_the_incompatible_scope() {
 /// `purge.rs`).
 #[test]
 fn pc20_purge_rotates_index_generation() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# A\n\npurgerotationtoken\n").unwrap();
     init(&dir);
     success(&dir, &["index", "--offline"]);
@@ -2906,7 +2910,7 @@ fn pc20_purge_rotates_index_generation() {
 /// measured as the dominant Recall@10 failure mode).
 #[test]
 fn pc12_pc13_short_token_in_mixed_query_is_dropped_not_an_and_filter() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("with_ai.md"),
         "# Doc1\n\nauthentication uses AI heuristics here.\n",
@@ -2951,7 +2955,7 @@ fn pc12_pc13_short_token_in_mixed_query_is_dropped_not_an_and_filter() {
 /// falls back entirely to the bounded LIKE (`instr`) scan.
 #[test]
 fn pc11_all_short_tokens_use_the_bounded_like_fallback_only() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# A\n\nan ai driven doc\n").unwrap();
     init(&dir);
     success(&dir, &["index", "--offline"]);
@@ -2971,7 +2975,7 @@ fn pc11_all_short_tokens_use_the_bounded_like_fallback_only() {
 /// error or being parsed as boolean operators.
 #[test]
 fn pc8_fts5_operator_keywords_and_quotes_are_literal_not_syntax() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# A\n\nThe \"OR\" operator combines conditions in boolean logic.\n",
@@ -3001,7 +3005,7 @@ fn pc8_fts5_operator_keywords_and_quotes_are_literal_not_syntax() {
 /// synonym/history/context injection (PC8's actual, narrower ban).
 #[test]
 fn pc8_deterministic_numeric_and_bilingual_equivalence_forms_are_restored() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("numeral-grouped.md"),
         "# Numeral grouped\n\n## Body\nThe retry budget expires after 3,600 idle units.\n",
@@ -3070,7 +3074,7 @@ fn pc8_deterministic_numeric_and_bilingual_equivalence_forms_are_restored() {
 /// never "が").
 #[test]
 fn r_addendum_feedback2_mixed_query_short_particle_does_not_exclude_a_document_lacking_it() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("token-ttl.md"),
         "# Auth spec\n\n## Token\nトークン TTL は 3,600 秒、リフレッシュは 24 時間ごと。\n",
@@ -3115,7 +3119,7 @@ fn r_addendum_feedback2_mixed_query_short_particle_does_not_exclude_a_document_l
 /// so a document using "は" instead is not excluded.
 #[test]
 fn r_addendum_feedback2_mixed_query_slash_joined_unit_and_short_particle() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("scope-kinds.md"),
         "# Auth memo\n\n## Scopes\nスコープは read / write / admin の 3 種類。\n",
@@ -3164,7 +3168,7 @@ fn r_addendum_feedback2_mixed_query_slash_joined_unit_and_short_particle() {
 /// `instr(c.text, ?)` is what has to see the unescaped text.
 #[test]
 fn f3_escaped_punctuation_is_findable_by_the_plain_query_and_shown_unescaped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("slip.md"), "# 回覧\n\n期限 7\\/10 まで\n").unwrap();
     init(&dir);
     success(&dir, &["index", "--offline"]);
@@ -3195,7 +3199,7 @@ fn f3_escaped_punctuation_is_findable_by_the_plain_query_and_shown_unescaped() {
 /// escapes. The runtime vector below carries the same distinct behavior signal.
 #[test]
 fn f3_fenced_code_keeps_the_backslashes_the_corpus_actually_contains() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("gather.md"),
         "# gather\n\n```sh\nfind . -type f -exec shasum -a 256 {} \\;\n```\n",

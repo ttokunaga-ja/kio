@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 
 use assert_cmd::Command;
@@ -34,7 +38,7 @@ fn success(dir: &TempDir, args: &[&str]) -> Value {
 }
 
 fn fixture() -> (TempDir, Value, String) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("evidence.md"),
         "# Evidence\n\nTTL is 3600 seconds.\n",
@@ -693,7 +697,7 @@ fn ct4_fsck_live_raw_with_republication_commit_backfills_retired_receipt() {
 
 #[test]
 fn ct4_fsck_unindexed_scope_recovers_lifecycle_epoch_before_retired_backfill() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("evidence.md"), "# Evidence\n\nstill live\n").unwrap();
     let repo = kio_core::scope::Repository::init(dir.path()).unwrap();
     let snapshot = repo

@@ -17,6 +17,10 @@
 //! Harness conventions mirror `step4b_office_contract.rs` (per-Command env,
 //! CAS-store inspection, `kio status --json` task assertions).
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -245,7 +249,7 @@ fn assert_search_hit(dir: &TempDir, needle: &str, title: &str) {
 
 #[test]
 fn flate_01_compressed_cid_pdf_indexes_offline_with_enhancement_pending() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("report.pdf"),
         one_byte_flate_pdf(["flateround", "evidence", "ledger"]),
@@ -302,7 +306,7 @@ fn flate_01_compressed_cid_pdf_indexes_offline_with_enhancement_pending() {
 
 #[test]
 fn flate_03_chance_bt_raster_pdf_routes_to_ocr_without_schema_error() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // Structure mirrors an img2pdf raster: one /Type /Page whose content
     // stream draws an image XObject; the "pixel" stream is raw binary noise
     // (NOT valid deflate) that embeds a bare "BT" so the raw text-layer scan
@@ -371,7 +375,7 @@ fn flate_03_chance_bt_raster_pdf_routes_to_ocr_without_schema_error() {
 
 #[test]
 fn flate_02_objstm_two_byte_codes_index_offline() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("paper.pdf"),
         objstm_two_byte_flate_pdf(["twobyte", "harvest"]),

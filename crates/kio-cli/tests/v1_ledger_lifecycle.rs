@@ -3,6 +3,10 @@
 //! The ledger is an opt-in device-global store.  These tests deliberately use
 //! empty, isolated homes and never inherit credentials or account settings.
 
+mod support;
+
+use support::canonical_tempdir;
+
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -33,7 +37,7 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = canonical_tempdir();
         let repo = temp.path().join("repo");
         let home = temp.path().join("home");
         fs::create_dir(&repo).unwrap();
