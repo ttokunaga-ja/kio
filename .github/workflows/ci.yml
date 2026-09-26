@@ -25,6 +25,8 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Test pinned SDK preparation planning
+        run: python3 -I scripts/tests/test_prepare_macos_sdk.py
       - name: Parse fixed shell controllers
         shell: bash
         run: |
@@ -258,6 +260,13 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      # Run the checked-out helper before toolchain setup or other repository code.
+      - name: Prepare the pinned macOS SDK installation
+        if: runner.os == 'macOS'
+        run: sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/python3 -I scripts/prepare-macos-sdk.py
+
       - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
       - run: cargo test --workspace --all-targets --locked
 

@@ -48,6 +48,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # Run the checked-out helper before toolchain setup or other repository code.
+      - name: Prepare the pinned macOS SDK installation
+        if: runner.os == 'macOS'
+        run: sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/python3 -I scripts/prepare-macos-sdk.py
+
       - name: Confirm checkout is the requested immutable commit
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
@@ -182,6 +187,11 @@ jobs:
           ref: ${{ inputs.candidate_sha }}
           fetch-depth: 0
           persist-credentials: false
+
+      # Run the checked-out helper before toolchain setup or other repository code.
+      - name: Prepare the pinned macOS SDK installation
+        if: runner.os == 'macOS'
+        run: sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/python3 -I scripts/prepare-macos-sdk.py
 
       - name: Confirm checkout is the requested immutable commit
         env:
