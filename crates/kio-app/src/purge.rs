@@ -44,7 +44,7 @@ use kio_pipeline::markdownize::{
     NormalizedInstanceManifest, NormalizedUnitObject, UnitStatus,
     load_validated_normalized_units_from_manifest,
 };
-use kio_pipeline::task::{MAX_TASK_STORE_BYTES, TaskStore, TaskType};
+use kio_pipeline::task::{EmbeddingWorkKey, MAX_TASK_STORE_BYTES, TaskStore, TaskType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -1984,10 +1984,8 @@ fn delete_target_tasks(
     let mut kept = Vec::new();
     for task in tasks {
         let embedding_target = task.task_type == TaskType::Embedding
-            && task
-                .output_ref
-                .strip_prefix("embedding:")
-                .is_some_and(|chunk_id| chunk_ids.contains(chunk_id));
+            && EmbeddingWorkKey::parse(&task.output_ref)
+                .is_some_and(|key| chunk_ids.contains(key.chunk_id()));
         if targets.contains(task.input_hash.as_str())
             || task
                 .previous_raw_hash
@@ -3097,6 +3095,78 @@ fn confirm(preview: &PurgePreview, yes: bool) -> Result<()> {
         }),
         ExitCode::ConfirmationRejected,
     ))
+}
+
+#[cfg(test)]
+mod task_retirement_tests {
+    use super::*;
+    use kio_pipeline::task::{TaskDescriptor, TaskStatus};
+
+    #[test]
+    fn purge_retires_all_embedding_variants_of_target_chunks_and_keeps_other_owners() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repository::init(directory.path()).unwrap();
+        let chunk = hash_bytes(b"target chunk");
+        let other_chunk = hash_bytes(b"surviving chunk");
+        let raw = hash_bytes(b"purged raw");
+        let first_embedding = hash_bytes(b"first profile embedding");
+        let second_embedding = hash_bytes(b"second profile embedding");
+        let task = |id: &str, chunk: &str, embedding: &str| TaskDescriptor {
+            task_id: id.to_owned(),
+            task_type: TaskType::Embedding,
+            mode: None,
+            input_path: "document.md".to_owned(),
+            input_hash: hash_bytes(b"shared chunk text"),
+            previous_raw_hash: None,
+            parent_run_id: None,
+            changed_unit_keys: vec![chunk.to_owned()],
+            output_ref: EmbeddingWorkKey::new(chunk, embedding)
+                .unwrap()
+                .output_ref(),
+            unit_keys: None,
+            status: TaskStatus::Pending,
+            attempts: 0,
+            next_retry_at: None,
+            deadline: None,
+            heartbeat_at: None,
+            fallback_reason: None,
+            created_at: "2026-09-26T00:00:00Z".to_owned(),
+            bbox_annotation_enabled: None,
+            hold_reason: None,
+            reserved_usd: None,
+            reserved_month: None,
+            reservation_id: None,
+        };
+        let survivor = task("task_survivor", &other_chunk, &first_embedding);
+        let mut direct_raw = task("task_direct_raw", &other_chunk, &second_embedding);
+        direct_raw.input_hash = raw.clone();
+        let mut previous_raw = task(
+            "task_previous_raw",
+            &other_chunk,
+            &hash_bytes(b"previous raw contextual embedding"),
+        );
+        previous_raw.previous_raw_hash = Some(raw.clone());
+        let store = TaskStore::new(repo.kio_dir());
+        store
+            .replace_all(&[
+                task("task_first_profile", &chunk, &first_embedding),
+                task("task_second_profile", &chunk, &second_embedding),
+                survivor.clone(),
+                direct_raw,
+                previous_raw,
+            ])
+            .unwrap();
+        let mut report = PurgeReport::default();
+        delete_target_tasks(
+            &repo,
+            &BTreeSet::from([raw.as_str()]),
+            &BTreeSet::from([chunk]),
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(store.all().unwrap(), vec![survivor]);
+        assert_eq!(report.deleted.tasks, 4);
+    }
 }
 
 #[cfg(test)]

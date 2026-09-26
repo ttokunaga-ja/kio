@@ -17,9 +17,8 @@ use cap_primitives::fs as cap_fs;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use unicode_normalization::UnicodeNormalization;
 
-use crate::search_projection::resolve_markdown_escapes;
+use crate::project_search_text;
 use crate::{ChunkRow, IndexError, Result, chunking::validate_unit_hash};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -2130,8 +2129,7 @@ impl SqliteFtsIndex {
         // `期限 7\/10` and the query `7/10` never even becomes a candidate. See
         // `search_projection` for why code is exempted rather than unescaped
         // along with everything else.
-        let indexed_text =
-            resolve_markdown_escapes(&row.text.nfc().collect::<String>().replace('\u{0}', ""));
+        let indexed_text = project_search_text(&row.text);
         with_savepoint(&self.conn, "kio_index_chunk", || {
             let requested_chunk_rowid = chunk_rowid.map(sql_rowid).transpose()?;
             let existing_chunk_rowid = self

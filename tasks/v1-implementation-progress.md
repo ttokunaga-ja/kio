@@ -4,7 +4,57 @@ Implementation of the approved [plan](v1-implementation-plan.md) began on
 2026-09-07, from `f198c26` on `main`. Entries below distinguish implementation,
 local verification, and the final native acceptance evidence.
 
-## Current checkpoint — 2026-09-26
+## Current checkpoint — 2026-09-27
+
+**v1.0 remains incomplete.** Work resumed after the app restart on local `main`
+at `c89b7ec`; the changes below are undergoing local validation before final
+candidate acceptance. Unrelated untracked work is preserved. No push, Actions dispatch,
+paid-provider call, credential creation or host/network permission change was
+performed in this checkpoint.
+
+- Contextual embedding work now has an exact chunk/context identity. Retained
+  manifests and canonical objects authenticate each owner and body; all raw
+  aliases contribute secret classification before Ignore filtering. Candidate
+  planning is bounded, scalar vector selection is deterministic, cached new
+  associations do not count as new execution, and resume repairs an interrupted
+  replica publication without another provider request.
+- The Linux r163 synthetic-history counterpart completed all 24 commands,
+  including history preparation's four-new-embedding gate for all 20 scopes,
+  independent attestation, replay, cross-scope and M3 scenarios. Its wrapper
+  returned 97 because evaluation wrote ignored `eval/report.md` and
+  `eval/results.json` inside the isolated export; every original source digest
+  remained unchanged. These results bind that immutable snapshot, not later
+  approval changes or native Actions acceptance.
+- macOS pipeline and index libraries passed 228 and 166 tests. The search CLI
+  suite then passed 282 of 284 tests and exposed incorrect approval-role
+  inference during database rebuild. Approval queries now carry an explicit
+  Markdown/Embedding role and require the current exact tool/profile. All seven
+  rebuild tests, twelve approval tests and six contextual embedding tests pass
+  after the fix. Formatting and workspace/all-target Clippy with warnings denied
+  pass after correcting three style violations. The final lint run's 1,624-path
+  source manifests are identical.
+- Test harnesses must create private HOME/XDG roots beneath a canonical temporary
+  directory. The macOS `/var` alias correctly fails production ancestry checks.
+  Fixture corrections retain those guards and deliberately unsafe test targets.
+  All 49 CLI integration targets were inspected; private fixture roots now use
+  shared canonical construction or their verified existing resolution. The
+  complete workspace run remains pending.
+- Independent routine review accepted replica recovery and removal of obsolete
+  embedding-path data. Daybreak-designated reviews of candidate bounds, cached
+  accounting and typed approval roles reported no actionable security finding.
+  Requested model and unobservable actual runtime model metadata remain distinct.
+  These are bounded static cross-checks; the earlier sealed scans do not cover
+  these later changes.
+
+Remaining gates are the complete current macOS/Linux regression and lint runs,
+clean candidate packaging/reproducibility and actual A05/A06/A10 drivers, the
+concrete private Actions route approval and installation, and all required native
+Windows/Linux/macOS receipts on one candidate SHA. The ten-minute independent
+monitor is active. Logs for this recovery are under
+`~/Documents/Codex/2026-09-27/kio-resume-validation/recovery/`; r163 evidence is
+retained under the previous day's validation directory.
+
+## Historical checkpoint — 2026-09-26
 
 **v1.0 is still incomplete.** The local v1 implementation milestone is committed
 as `265a472` from base `d98e0f6`; local CI parity has exposed further work below.

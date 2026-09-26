@@ -81,6 +81,40 @@ pub(crate) fn requests_with_intent_for_scope(
         .map_err(Into::into)
 }
 
+/// Current terminal Batch contract violations remain authoritative after cleanup.
+/// Historical outcomes and diagnostic error strings are not retry authority.
+pub(crate) fn unreset_contract_violations_for_scope_adapter(
+    conn: &Connection,
+    scope_id: &str,
+    adapter_kind: &str,
+) -> Result<Vec<BatchRequestRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT b.scope_id, b.adapter_kind, b.input_hash, b.tool_profile_hash, b.state, b.request_kind,
+                b.intent_token, b.upload_id, b.batch_job_id, b.provider_scope_id, b.job_create_started_at,
+                b.stale_after_at, b.submission_seq, b.attempts, b.contract_violation_count, b.estimated_usd,
+                b.error, b.completed_at, b.created_at
+         FROM batch_requests b JOIN cost_ledger c
+           ON c.scope_id = b.scope_id AND c.adapter_kind = b.adapter_kind
+          AND c.input_hash = b.input_hash AND c.tool_profile_hash = b.tool_profile_hash
+          AND c.submission_seq = b.submission_seq
+         WHERE b.scope_id = ?1 AND b.adapter_kind = ?2 AND b.request_kind = ?3
+           AND b.state = ?4 AND b.contract_violation_count > 0 AND c.outcome = ?5
+         ORDER BY b.created_at, b.input_hash, b.tool_profile_hash",
+    )?;
+    stmt.query_map(
+        params![
+            scope_id,
+            adapter_kind,
+            RequestKind::Batch.as_str(),
+            BatchState::Terminal.as_i64(),
+            Outcome::ContractViolation.as_str()
+        ],
+        row_to_batch_request,
+    )?
+    .collect::<rusqlite::Result<Vec<_>>>()
+    .map_err(Into::into)
+}
+
 fn row_to_batch_request(row: &rusqlite::Row<'_>) -> rusqlite::Result<BatchRequestRow> {
     let state_value = row.get::<_, i64>(4)?;
     let state = BatchState::from_i64(state_value).ok_or_else(|| {
@@ -2107,6 +2141,146 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn unreset_batch_contract_violations_require_exact_current_attempt() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::ledger::schema::CREATE_BATCH_REQUESTS_SQL)
+            .unwrap();
+        conn.execute_batch(crate::ledger::schema::CREATE_COST_LEDGER_SQL)
+            .unwrap();
+        let cases = [
+            (
+                "current",
+                "scope",
+                "embedding",
+                "batch",
+                3,
+                1,
+                2,
+                "contract_violation",
+            ),
+            (
+                "prior",
+                "scope",
+                "embedding",
+                "batch",
+                3,
+                1,
+                1,
+                "contract_violation",
+            ),
+            ("expired", "scope", "embedding", "batch", 3, 1, 2, "expired"),
+            (
+                "reset",
+                "scope",
+                "embedding",
+                "batch",
+                3,
+                0,
+                2,
+                "contract_violation",
+            ),
+            (
+                "other-scope",
+                "elsewhere",
+                "embedding",
+                "batch",
+                3,
+                1,
+                2,
+                "contract_violation",
+            ),
+            (
+                "other-adapter",
+                "scope",
+                "markdownize",
+                "batch",
+                3,
+                1,
+                2,
+                "contract_violation",
+            ),
+            (
+                "sync",
+                "scope",
+                "embedding",
+                "sync",
+                3,
+                1,
+                2,
+                "contract_violation",
+            ),
+            (
+                "completed",
+                "scope",
+                "embedding",
+                "batch",
+                2,
+                1,
+                2,
+                "contract_violation",
+            ),
+            (
+                "inflight",
+                "scope",
+                "embedding",
+                "batch",
+                1,
+                1,
+                2,
+                "contract_violation",
+            ),
+        ];
+        for (input, scope, adapter, kind, state, count, cost_seq, outcome) in cases {
+            conn.execute("INSERT INTO batch_requests(scope_id,adapter_kind,input_hash,tool_profile_hash,state,request_kind,submission_seq,contract_violation_count,estimated_usd,created_at,completed_at,error)
+                VALUES (?1,?2,?3,'profile',?4,?5,2,?6,0.0,0,1,'contract_violation diagnostic is not authority')",
+                params![scope, adapter, input, state, kind, count]).unwrap();
+            conn.execute("INSERT INTO cost_ledger(scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,outcome,month,recorded_at)
+                VALUES (?1,?2,?3,'profile',?4,'job',0.0,?5,'2026-09',1)",
+                params![scope, adapter, input, cost_seq, outcome]).unwrap();
+        }
+        // An old violation plus a current expired attempt must not block new work.
+        conn.execute("INSERT INTO cost_ledger(scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,outcome,month,recorded_at)
+            VALUES ('scope','embedding','expired','profile',1,'old-job',0.0,'contract_violation','2026-09',0)", []).unwrap();
+        // Each full-key component must match; a same-input current outcome from a
+        // different profile, scope, or adapter cannot supply missing authority.
+        for (scope, adapter, profile) in [
+            ("scope", "embedding", "other-profile"),
+            ("other-scope", "embedding", "profile"),
+            ("scope", "markdownize", "profile"),
+        ] {
+            conn.execute("INSERT INTO cost_ledger(scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,outcome,month,recorded_at)
+                VALUES (?1,?2,'prior',?3,2,'unrelated-job',0.0,'contract_violation','2026-09',0)",
+                params![scope, adapter, profile]).unwrap();
+        }
+        let rows =
+            unreset_contract_violations_for_scope_adapter(&conn, "scope", "embedding").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key.input_hash, "current");
+        assert_eq!(rows[0].submission_seq, 2);
+        assert!(
+            rows[0].intent_token.is_none(),
+            "cleaned terminal attempts remain visible"
+        );
+        assert!(rows[0].upload_id.is_none());
+        assert_eq!(
+            rows[0].completed_at,
+            Some(1),
+            "old terminal timestamps do not expire the breaker"
+        );
+        assert!(
+            unreset_contract_violations_for_scope_adapter(&conn, "scope' OR 1=1 --", "embedding")
+                .unwrap()
+                .is_empty()
+        );
+        reset_contract_violations(&conn, &rows[0].key).unwrap();
+        assert!(
+            unreset_contract_violations_for_scope_adapter(&conn, "scope", "embedding")
+                .unwrap()
+                .is_empty()
+        );
+    }
 
     // CL13 (partial — the pure "is this a valid UUIDv7" / "does it embed the
     // right timestamp" checks; the DB-side INSERT contents are covered by the

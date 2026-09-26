@@ -563,21 +563,69 @@ CREATE VIRTUAL TABLE image_vec USING vec0(
 
 `embeddings` テーブル (メタデータ + vector BLOB) と `chunk_vec` / `image_vec` (vec0 virtual table) は、いずれも `objects/` から再構築可能な加速層であり、真実は `objects/` にある (§4 冒頭)。これらの間では **`embeddings` テーブルを正** とし、`chunk_vec` / `image_vec` は `embeddings` からの導出物として扱う。不整合を検出した場合および `kio repair rebuild-db` では、`objects/` → `embeddings` → `chunk_vec` → `image_vec` の順に再構築する。**`objects/embeddings/` への書き出しは vector を persist する経路が行い、SQLite 行より先に書く** (2026-07-26、R25-6)
 — 両者の間で crash した場合、object があって行が無い状態は次の rebuild が復元できるが、行があって object が無い状態は
-`rebuild-db` が復元できない vector になる。**object から `embeddings` への replay は complete predicate で `chunks` と結合する**
-(object は「この vector が何の vector か」を持つが、その本文を今どの chunk 行が担っているかは持たない —
-それこそ rebuild が再導出している部分である)。chunk 行 `c` と embedding 行 `e` の候補条件は、
-`e.target_type='chunk'`、`e.target_id = c.text_hash`、および現行 tool-lock と
-`(e.profile_hash, e.dimensions, e.distance, e.modality)` が一致することに加え、`c.raw_path` の basename stem から
-`chunk_filename_context_v1`（`-` / `_` の空白化、ASCII camelCase 境界、空白畳み込み。英数字を含まない stem は
-NULL）を**再導出**し、`e.context_key` と **NULL-safe equality** で一致すること、とする。SQL では
-`e.context_key IS canonical_context(c.raw_path)` 相当（両方 NULL も一致）であり、通常の `=` で NULL を落としてはならない。
-これは 07 §5.3 の addendum 以降 vector が `(text_hash, context, profile)` の関数であり、同一本文・別ファイル名の
-2 chunk を交差させてはならないためである。rebuild の source は current objects/CAS のみであり、pre-object SQLite
-snapshot を読み、そこから object を backfill する fallback は置かない。同一 `text_hash` を持つ複数 chunk には、
-この predicate に一致する embedding をそれぞれの `chunk_vec` 行へ展開する (content ベース再利用 §5.5 の裏面)。
-**0 件または 1 件の candidate 判定はこの complete predicate の適用後に行う** (0 件 = 未 enrichment — chunk_vec 行を
-作らず pending として text-only で検索を継続する ([05-runtime.md §1](05-runtime.md)。offline / budget pause 中の rebuild
-で正常に生じる)。2 件以上のみ corruption として rebuild 停止)。
+`rebuild-db` が復元できない vector になる。
+
+chunk の embedding は `(text_hash, context, profile)` ごとに保持する。同じ chunk が改名・コピーによって
+複数の名前を持つ場合、保持済みの正本履歴から各 owner 名を導出し、現行 policy が許可する名前の context
+ごとに処理する。owner は `(raw_hash, tool_profile_hash, gen, manifest_hash)` の exact normalized identity
+を固定する tree binding を持ち、その manifest が対象 chunk の unit と本文を実際に固定していなければならない。
+同じ raw というだけで別 generation / manifest の名前を借用しない。同じ context になる名前は同じ embedding
+を再利用できる。
+
+一回の候補収集は、重複を除いた `(chunk_id, path)` を最大 100,000 件、候補が保持する文字列の
+合計を最大 128 MiB とする。認証済み本文の検索用変換結果は chunk ごとに共有し、一度だけ計上する。
+chunk ごとの map key と、各候補の chunk ID・本文 hash・path・path map key も計上する。
+これは文字列 payload の上限であり、allocator / map / Arc の管理領域や履歴認証用データの総メモリ量ではない。
+新しい候補の文字列を複製・挿入する前に checked arithmetic で判定し、超過・overflow は
+`KIO-E-EMBED-PLAN-LIMIT-001`（exit 4）で候補収集全体を拒否する。途中までの集合を成功扱いしない。
+容量判定のために一時生成する本文一件には、既存の chunk object の読取り上限を適用する。
+
+秘密分類は、保持済み履歴の raw に属する**全 alias** から、Ignore の評価より先に導出する。その後で
+各 owner 名に現行 policy を適用する。Ignore はその名前の context を候補から除外するが、同じ raw の
+秘密分類や他の context の承認待ちを解除しない。公開名の alias による分類の迂回も認めない。
+その raw の全 context は、実行 mode に応じて必要な現在の秘密送信承認を要求する。
+許可されない名前を新たな送信や検索 vector の根拠にしてはならない。purge は raw に属する全 context を対象とする。
+
+CAS から `embeddings` への再構築は、正本履歴・chunk 本文・現行 tool-lock の
+`(profile_hash, dimensions, distance, modality)` に合致する全 context の保存済み vector を復元する。
+保存済み context の存在と、現行 policy に基づく送信・検索利用の許可は区別する。古い SQLite から object を
+backfill する fallback は持たない。
+再構築時の秘密送信承認は、同じ読取りで検証した tool-lock の recipient / profile を、明示した
+embedding role の現行設定と照合する。role を稼働中の tool ID から推測せず、設定の不在や
+tool / profile の不一致では秘密送信承認なしとする。通常文書の保存済み vector は、稼働中の
+embedding Adapter がなくても再送信せず復元できる。現行の一致する設定では、scope policy と
+device grant の destination / credential / trust の完全な照合を省略せず、不正な状態をエラーとして保持する。
+in-process の免除は `kind` だけで判断せず、組込みの
+決定的 Adapter と tool id / profile / 次元 / distance / modality が完全一致する場合だけ認める。
+
+`chunk_vec` は chunk ごとに一つの検索 vector を持つ。その選択は送信・応答順序に依存させない。
+対象 chunk の exact normalized identity を参照し、現行 policy が許可する HEAD の名前のうち UTF-8 byte 順で
+最小の名前を選ぶ。HEAD に許可された名前がなければ、保持済み履歴中の許可された名前から同じ順序で選ぶ。
+許可された名前がない、または必要な秘密送信承認を欠く場合は、その chunk の vector を検索へ公開しない。
+chunk 作成時の `raw_path` は来歴として保持し、選択した名前で書き換えない。
+
+選択した名前の basename stem から `chunk_filename_context_v1`（`-` / `_` の空白化、ASCII camelCase 境界、
+空白畳み込み。英数字を含まない stem は NULL）を再導出し、`e.target_type='chunk'`、
+`e.target_id=c.text_hash`、現行 profile と一致する行の中で `e.context_key` が NULL-safe equality で
+一致する vector だけを投影する。候補の 0 / 1 件判定はこの全条件を適用した後に行う。
+0 件なら未 enrichment として vector 行を作らず text-only 検索を継続する。別名の vector で代用しない。
+2 件以上は corruption として停止する。通常 index、結果収集、キャッシュ再利用、DB 再構築、中央 replica
+への反映で同じ選択規則を使う。各 context の完了と scalar projection の完了は別々に判定する。
+
+本文の一部編集などで新しい chunk ID が生じても、その context / profile の vector が既に利用可能なら、
+新しい association のタスク記録だけを Done にできる。この記録作成は送信・予約・新規実行数への加算を行わない。
+対象は同じ output ref のタスクが一件もなく、現在の policy と秘密承認条件を満たす association に限る。
+既存の paused / retired / 予約付きタスクは従来の回復経路で扱い、過去版の限定処理で他の履歴のタスクを変更しない。
+
+scalar が既に期待値と一致していても、中央 replica の Ready / 世代 / HEAD / chunking config が一致しなければ、
+writer は replica への反映を再試行する。scalar 保存後の中断は、未完了の埋め込みがない場合も
+`kio batch resume` で回復できる。正常な no-op は source 世代や replica の公開時刻を更新しない。
+
+候補作成には新たに取得した current-policy snapshot を使い、外部送信の直前と scalar / 中央 replica の
+公開直前に、その snapshot が現在も有効か再検証する。途中の Ignore / config 変更で失効していれば停止し、
+再計画する。保存済み CAS / cache は承認を代替しない。承認済みの過去の batch から返った結果は、固定済みの
+job・credential・入力の binding に基づいて source CAS に保存・課金処理できるが、検索へ公開するには現在も
+許可された同一 context の owner を別途確認する。失効した scalar の除去と中央 replica の世代更新も同じ選択に従う。
 
 `image_vec` の導出は同型だが**結合が要らない**点だけが異なる — 結合対象は **`target_type='image'` の行のみ**で、`embeddings.target_id` がそのまま `image_vec.image_id` (= `objects/image/` の `image_hash`) になる。chunk 側の `chunks.text_hash` 結合は「その本文を今どの chunk 行が担っているか」を再導出するためのものだが、画像は content-addressed object そのものが target であり、担い手を探す必要が無いためである (`context_key` も画像には適用しない — 入力構築 ([07-adapter-spec.md §5.3](07-adapter-spec.md) の `chunk_filename_context_v1`) は chunk 本文に対する規約であり画像には掛からない)。**現行 tool-lock の embedding profile への限定は chunk 側と同一**に適用し、`image_hash` ごとに候補が 0 件または 1 件であることを検証する (0 件 = 未 enrichment で行を作らない。2 件以上は corruption)。
 
@@ -706,7 +754,25 @@ order_index             unit の出現順 (03-data-model.md §2.1 の順序)
 }
 ```
 
-`output_ref` の Markdownize instance は `normalized:<raw64>.<tool64>.g<gen>` の portable taskref に固定する。`raw64` は `input_hash`、`tool64` は `tool_profile_hash` の lowercase digest-only hex、`gen` は leading zero なしの canonical decimal であり、全体が完全一致しなければ mutation 前に拒否する。absolute / relative pathref を task journal へ書く互換経路はない。`online:<adapter_id>`、`offline:<adapter_id>`、`embedding:<chunk_hash>` の既存 typed placeholder は変更しない。
+`output_ref` の Markdownize instance は `normalized:<raw64>.<tool64>.g<gen>` の portable taskref に固定する。`raw64` は `input_hash`、`tool64` は `tool_profile_hash` の lowercase digest-only hex、`gen` は leading zero なしの canonical decimal であり、全体が完全一致しなければ mutation 前に拒否する。absolute / relative pathref を task journal へ書く互換経路はない。`online:<adapter_id>`、`offline:<adapter_id>` は typed placeholder とする。
+Embedding の `output_ref` は `embedding:<chunk_hash>/<embedding_hash>` に固定し、両 hash は
+`sha256:` と 64 桁の lowercase hex からなる canonical hash とする。`changed_unit_keys` は同じ
+`chunk_hash` 一つだけを持つ。`embedding_hash` は本文・ファイル名 context・profile を固定する。
+旧 chunk-only ref、複数 chunk、未知形式は mutation 前に拒否し、互換変換を行わない。
+タスクの完了・失敗・再試行・課金予約はこの組を識別子として扱う。一つの context の成功や承認で、
+別の context の状態を変更してはならない。同じ embedding を使う複数 chunk の provider 呼出しは
+`embedding_hash` でまとめられるが、各 task への結果反映と現在の権限確認を省略しない。
+
+`EmbeddingWorkKey` の parse は表記検査であり、実行権限の証明ではない。新規処理の cache 参照、予約、再試行、
+状態変更、provider 入出力の対応付け、結果の公開では、正本から chunk と許可された owner を解決し、
+`task.input_hash == chunk.text_hash` を確認する。その本文・owner の context・使用 profile から embedding hash を
+再計算し、work key と完全一致することを要求する。構文上正しい他の hash を受理しない。既に送信した試行の
+取消・結果不明の保守的精算には元の固定済み ledger / job binding を使い、現在の profile の hash に置き換えない。
+同じく既に送信した batch の結果回収は、元の job / 入力集合の binding を正本とする。可変な task 行を
+元のメンバ集合の証明として使わず、task 行の喪失によって精算・検証済み成果の保存を妨げない。
+現在の検索へ公開するには認証済み owner / profile と現在の権限を確認し、その後 task 行を完了・再試行などへ
+変更する場合には、上記の task と現在の candidate の一致検査を省略しない。
+
 
 root registration と Q_hard snapshot は `tasks.jsonl` を byte-identical にコピーし、portable ref を path へ rebase しない。resume 等の runtime consumer だけが retained current `.kio` を基点に instance directory を解決・再検証する。
 
@@ -793,6 +859,10 @@ running が heartbeat_at + 5min を超えたら stale。別 worker が pull 可�
   prune-orphans の blocker からも除外する ([10-operations.md §7.5.1](10-operations.md))
 
 `task` テーブルが消えても問題ない設計 (object store と tool profile から再検出可能)。ただし `attempts` 履歴は失われる (リトライ予算がリセットされる) 点を許容。**§5.3 の max_attempts 判定はこの task 側の揮発カウンタで行う**。`batch_requests.attempts` は reject 終端 (§5.8 相 3) で耐久更新される監査・表示用カウンタであり、**「同一 mode で 1 回のみ」再試行の durable 判定源は `contract_violation_count` である** (§5.8 / §5.4 DDL コメントが正本 — 三つのカウンタは役割が異なる: task 側 = §5.3 retry budget、attempts = 監査・表示、contract_violation_count = 「1 回のみ」ゲート)。「1 回のみ」は task 通算である — 再投入できるのは count <= 1 のとき (0 = 未違反・`--reset-violations` 後を含む — §5.8 が正本) だけで、mode 切替後に別枠は生じない (「mode 切替後の違反も加算」の意図的帰結)。
+
+embedding の Batch には、上記の共通上限に加えて §5.8 / [07-adapter-spec.md §5.3](07-adapter-spec.md) の
+scope / adapter 単位の停止規則を適用する。未解除の契約違反が一件でもあれば、count が 1 でも
+新規 Batch を自動再投入しない。
 
 ## 5.3 エラー種別と Retry Budget
 
@@ -1044,7 +1114,7 @@ collect」の各段の間にクラッシュ窓があり、provider 側に課金�
 **記録の正本**: `cost-ledger.sqlite` の `batch_requests` 行 (DDL は §5.4 が SQL 正本)。tasks.jsonl は
 喪失許容 (§5.7) のため、in-flight Batch の回復は batch_requests だけで可能でなければならない。各段の
 記録は同 DB の単一 Tx で行う。cost-ledger.sqlite ごと喪失した場合の最終回収線は、provider job 一覧の
-metadata から intent_token 規約に一致する job を全走査することである (帰属は metadata の (scope_id, adapter_kind, input_hash, tool_profile_hash) と出力 JSONL の custom_id が担う — 新規 UUIDv7 の token 単独では帰属できない)。tasks.jsonl の task 記述子 (mode / unit_keys / output_ref) は喪失しうるが、**確定先と対象 unit は決定論的に再導出できる**: 出力の取り込み先はタスクキー (input_hash = raw、tool_profile_hash) と gen 規則から (**gen 規則 = 当該タスクキーの最新 instance の未完了 unit を補完する、に固定** — 当該 attempt が `--force` 由来かは再導出不能のため、force の意図は tasks.jsonl 喪失で失われ得る (再実行で回復)。誤 gen への上書き・二重課金は first-instance-wins と記帳の冪等性が防ぐ)、対象 unit は provider 出力 JSONL の custom_id (= unit_key) から復元し (**失敗 unit は出力に現れない — 期待 unit 集合は prepared units (raw から決定論的に再導出) との差集合で判定する**)、mode が不明な場合は full として扱う (§5.7 の安全側規定と同型)。**この full 扱いの受け入れ検査では、差集合の unit を当該 job の failed_units と見なして §3.2 (V6 を含む) を評価する** — 部分 retry 由来の sparse な正当出力を V6 の全集合違反として reject しない (既 done unit への影響は first-instance-wins が遮断する)。**合成する failed_units の error_kind は `network_error` (retryable — §5.3) に固定する** — 回復時は転送欠落と provider 明示の unit 失敗を区別できないため安全側 (再試行) に倒す (合成失敗 unit は通常の retry 経路で回復し、既 done unit は first-instance-wins が保全する)。この回復経路の V6 は差集合の定義により被覆を構造的に満たす — 検証強度は mode 既知の通常経路より意図的に低く、転送欠落の検出は retry の自己回復に委ねる。**この差集合 → failed_units 合成は Markdownize の回復規則である** — Embedding Batch ([07-adapter-spec.md §5.3](07-adapter-spec.md)) は `failed_units` を持たない all-or-nothing 契約のため回復単位は request 全体: collect した出力が受入検査を通れば全体を確定し、id 全単射の欠落側違反は転送欠落と区別できないため contract violation でなく **request 全体を `network_error` (retryable — §5.3) の失敗として再試行に載せる** (本合成と同じ安全側。期待 id 集合は入力 chunk 集合から決定論的に再導出できる)。その他の受入違反 (次元・有限性・profile 不一致等) は通常どおり contract violation とする。
+metadata から intent_token 規約に一致する job を全走査することである (帰属は metadata の (scope_id, adapter_kind, input_hash, tool_profile_hash) と出力 JSONL の custom_id が担う — 新規 UUIDv7 の token 単独では帰属できない)。tasks.jsonl の task 記述子 (mode / unit_keys / output_ref) は喪失しうるが、**確定先と対象 unit は決定論的に再導出できる**: 出力の取り込み先はタスクキー (input_hash = raw、tool_profile_hash) と gen 規則から (**gen 規則 = 当該タスクキーの最新 instance の未完了 unit を補完する、に固定** — 当該 attempt が `--force` 由来かは再導出不能のため、force の意図は tasks.jsonl 喪失で失われ得る (再実行で回復)。誤 gen への上書き・二重課金は first-instance-wins と記帳の冪等性が防ぐ)、対象 unit は provider 出力 JSONL の custom_id (= unit_key) から復元し (**失敗 unit は出力に現れない — 期待 unit 集合は prepared units (raw から決定論的に再導出) との差集合で判定する**)、mode が不明な場合は full として扱う (§5.7 の安全側規定と同型)。**この full 扱いの受け入れ検査では、差集合の unit を当該 job の failed_units と見なして §3.2 (V6 を含む) を評価する** — 部分 retry 由来の sparse な正当出力を V6 の全集合違反として reject しない (既 done unit への影響は first-instance-wins が遮断する)。**合成する failed_units の error_kind は `network_error` (retryable — §5.3) に固定する** — 回復時は転送欠落と provider 明示の unit 失敗を区別できないため安全側 (再試行) に倒す (合成失敗 unit は通常の retry 経路で回復し、既 done unit は first-instance-wins が保全する)。この回復経路の V6 は差集合の定義により被覆を構造的に満たす — 検証強度は mode 既知の通常経路より意図的に低く、転送欠落の検出は retry の自己回復に委ねる。**この差集合 → failed_units 合成は Markdownize の回復規則である** — Embedding Batch ([07-adapter-spec.md §5.3](07-adapter-spec.md)) は `failed_units` を持たない all-or-nothing 契約のため回復単位は request 全体とする。出力の完全な id 集合を保存済み job の `input_hash` と照合し、現在の chunk 集合や不完全な応答から元のメンバを推測しない。欠落を含む受入違反は全体を `Outcome::ContractViolation` / `BatchState::Terminal` として保守的に精算し、同じ scope / embedding adapter の新規 Batch 送信を明示的 reset まで停止する。既に送信した job の照会・精算と、別途承認された sync レーンは継続できる。書込み前の全件検証、停止条件、解除手順の正本は [07 §5.3](07-adapter-spec.md) とする。
 
 手順 (1 job 単位):
 
@@ -1089,7 +1159,10 @@ metadata から intent_token 規約に一致する job を全走査すること�
    再 collect ループに入らない・記帳を落とさない)。再投入の mode は原則同一 — tasks.jsonl 喪失で
    mode が復元不能な場合は full で 1 回 (§5.7 の安全側規定と同型)。**「1 回のみ」の判定は durable**:
    reject 終端 Tx で `contract_violation_count` を increment する (相 1 の NULL 戻しの対象外)。
-   再投入できるのは count <= 1 のとき (0 = 未違反・`--reset-violations` 後を含む) だけで、count >= 2 は failed permanent
+   共通の再試行上限として、再投入できるのは count <= 1 のとき (0 = 未違反・`--reset-violations` 後を含む)
+   だけで、count >= 2 は failed permanent。ただし embedding の Batch は、さらに
+   [07-adapter-spec.md §5.3](07-adapter-spec.md) の scope / adapter 単位の停止規則を適用するため、
+   一件目の未解除の契約違反から新規予約・送信を停止する。
    (tasks.jsonl 喪失後もこの判定は batch_requests から回復できる。error 列は最新状態の表示であり
    判定源にしない — 相 1 が NULL へ戻すため)。count は**タスクキー単位の通算**であり mode 別に
    数えない (mode 切替後の違反も加算)。検証済み Adapter 更新後の脱出路として

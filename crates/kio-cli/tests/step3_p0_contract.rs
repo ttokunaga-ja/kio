@@ -1,3 +1,7 @@
+mod support;
+
+use support::canonical_tempdir;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -12,6 +16,7 @@ use kio_core::{
     portable::portable_tag_leaf,
 };
 use kio_index::aggregator::{AggIndexStatus, Aggregator};
+use kio_pipeline::task::EmbeddingWorkKey;
 use rusqlite::Connection;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -330,7 +335,7 @@ fn replace_scope_id(path: &Path, scope_id: &str) {
 }
 
 fn indexed_scope() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("auth.md"),
         "# 認証仕様\n\n## API Token\nトークン TTL は 3600 秒です。\n\n## Scopes\nスコープは read write admin です。\n",
@@ -357,7 +362,7 @@ static RANKING_FIXTURE: OnceLock<RankingFixture> = OnceLock::new();
 
 fn ranking_fixture() -> &'static RankingFixture {
     RANKING_FIXTURE.get_or_init(|| {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         let documents = [
             ("target-short.md", "# 廃止手続き\n\n管理画面で承認して完了します。\n"),
             ("target-japanese.md", "# 認証トークンの期限\n\n認証トークンの有効期限は 3,600 秒です。認証トークンの有効期限は 3,600 秒です。\n"),
@@ -412,7 +417,7 @@ fn ranking_search(query: &str) -> Value {
     let fixture = ranking_fixture();
     // Search creates a cursor-signing key in XDG data. Each test gets a copy
     // of the once-indexed corpus so parallel test threads cannot race on it.
-    let copy = tempfile::tempdir().unwrap();
+    let copy = canonical_tempdir();
     copy_tree(fixture.dir.path(), copy.path());
     json_success(&copy, &["search", query, "--mode", "text", "--limit", "10"])
 }
@@ -580,7 +585,7 @@ fn run_embed_path(path: &Path, data_home: &Path, embed: &str, args: &[&str]) -> 
 
 /// The `indexed_scope` fixture indexed with a configured embedding adapter.
 fn indexed_scope_embed(embed: &str) -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("auth.md"),
         "# 認証仕様\n\n## API Token\nトークン TTL は 3600 秒です。\n\n## Scopes\nスコープは read write admin です。\n",
@@ -697,7 +702,7 @@ fn ct3_hybrid_006_text_mode_uses_text_rank_without_fusion() {
 // (a silent false negative — exit 0, empty).
 #[test]
 fn f2_nfd_body_is_found_by_nfc_query() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // Body word "café" written in NFD: "cafe" + U+0301 COMBINING ACUTE ACCENT.
     fs::write(
         dir.path().join("menu.md"),
@@ -980,7 +985,7 @@ fn r11_9_view_json_exposes_temporary_field() {
 fn view_offset_translation_is_correct_for_a_chunk_past_the_first_unit() {
     use kio_core::cas::ObjectStore;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&[
@@ -1427,7 +1432,7 @@ fn ct3_chunk_007_search_only_serves_current_chunking_config_generation() {
 
 #[test]
 fn ct4_current_config_association_is_added_for_deleted_history() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("historical.md"),
         "# Historical\n\nretained-history-config-fixture\n",
@@ -1493,7 +1498,7 @@ fn ct4_current_config_association_is_added_for_deleted_history() {
 
 #[test]
 fn ct4_historical_only_current_config_chunks_enqueue_embeddings() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("historical.md"),
         "# Historical\n\nretained embedding history alpha bravo charlie delta echo\n",
@@ -1549,13 +1554,18 @@ fn ct4_historical_only_current_config_chunks_enqueue_embeddings() {
     assert!(!historical_current_ids.is_empty());
 
     let status = json_success_embed(&dir, "mock", &["status"]);
-    let task_refs = tasks_of_type(&status, "embedding")
+    let task_chunk_ids = tasks_of_type(&status, "embedding")
         .into_iter()
-        .filter_map(|task| task["output_ref"].as_str())
+        .map(|task| {
+            EmbeddingWorkKey::parse(task["output_ref"].as_str().unwrap())
+                .expect("embedding task must bind a chunk and contextual embedding identity")
+                .chunk_id()
+                .to_owned()
+        })
         .collect::<std::collections::BTreeSet<_>>();
     for chunk_id in historical_current_ids {
         assert!(
-            task_refs.contains(format!("embedding:{chunk_id}").as_str()),
+            task_chunk_ids.contains(&chunk_id),
             "every retained historical current-config chunk needs an embedding task: {status}"
         );
     }
@@ -1563,7 +1573,7 @@ fn ct4_historical_only_current_config_chunks_enqueue_embeddings() {
 
 #[test]
 fn ct4_rebuild_rederives_historical_tree_projection_from_cas() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("cached.md"), "# C1\n\nfirst snapshot\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     let first = json_success(&dir, &["index"]);
@@ -2006,7 +2016,7 @@ fn pc11_short_cjk_query_falls_back_to_bounded_like_and_finds_the_substring() {
 // the registry, and a `participates_in_global_search=false` scope is excluded.
 #[test]
 fn ct3_multi_001_default_searches_participating_indexed_scopes() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2056,7 +2066,7 @@ fn ct3_multi_001_default_searches_participating_indexed_scopes() {
 
 #[test]
 fn ct3_multi_008_all_scopes_flag_targets_all_indexed_scopes() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2087,7 +2097,7 @@ fn ct3_multi_008_all_scopes_flag_targets_all_indexed_scopes() {
 
 #[test]
 fn ct3_repair_device_replica_rebuilds_all_indexed_scopes_outside_a_scope() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2145,7 +2155,7 @@ fn ct3_repair_device_replica_rebuilds_all_indexed_scopes_outside_a_scope() {
 
 #[test]
 fn ct3_repair_device_all_recovers_missing_source_and_replica_outside_a_scope() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2191,7 +2201,7 @@ fn ct3_repair_device_all_recovers_missing_source_and_replica_outside_a_scope() {
 #[test]
 fn ct3_device_repairs_reject_non_current_scope_before_any_mutation() {
     for operation in ["replica", "all"] {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = canonical_tempdir();
         let data_home = parent.path().join("xdg");
         let current = parent.path().join("a-current");
         let non_current = parent.path().join("z-non-current");
@@ -2262,7 +2272,7 @@ fn ct3_device_repairs_reject_non_current_scope_before_any_mutation() {
 
 #[test]
 fn ct3_repair_device_unreachable_registry_scope_is_partial_without_cwd_fallback() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2315,7 +2325,7 @@ fn ct3_repair_device_unreachable_registry_scope_is_partial_without_cwd_fallback(
 
 #[test]
 fn ct3_repair_device_registry_unavailable_never_falls_back_to_cwd() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let scope = parent.path().join("scope");
     fs::create_dir_all(&scope).unwrap();
@@ -2342,7 +2352,7 @@ fn ct3_repair_device_registry_unavailable_never_falls_back_to_cwd() {
 
 #[test]
 fn ct3_repair_device_all_failed_homogeneous_promotes_scope_error() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let scope = parent.path().join("scope");
     fs::create_dir_all(&scope).unwrap();
@@ -2370,7 +2380,7 @@ fn ct3_repair_device_all_failed_homogeneous_promotes_scope_error() {
 
 #[test]
 fn ct3_repair_device_active_purge_is_partial_and_leaves_no_stale_replica_rows() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let blocked = parent.path().join("blocked");
     let healthy = parent.path().join("healthy");
@@ -2455,7 +2465,7 @@ fn ct3_repair_device_active_purge_is_partial_and_leaves_no_stale_replica_rows() 
 // no longer matches — a re-init'd scope is searched exactly once.
 #[test]
 fn r15_3_reinit_same_path_does_not_duplicate_registry_target() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let b = parent.path().join("b");
     fs::create_dir_all(&b).unwrap();
@@ -2494,7 +2504,7 @@ fn r15_3_reinit_same_path_does_not_duplicate_registry_target() {
 // (1/(60+1)) despite skewed corpus statistics, and tie-break is (scope_id, ...).
 #[test]
 fn ct3_multi_002_cross_scope_merge_is_rank_based() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2553,7 +2563,7 @@ fn ct3_multi_002_cross_scope_merge_is_rank_based() {
 /// are rank 1 and score identically. Globally, `b` must win.
 #[test]
 fn ct3_multi_009_text_rank_is_global_not_per_scope() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2601,7 +2611,7 @@ fn ct3_multi_009_text_rank_is_global_not_per_scope() {
 /// so it is the one that prunes.
 #[test]
 fn ct3_multi_011_a_departed_scope_stops_skewing_corpus_statistics() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let (a, b, c) = (
         parent.path().join("a"),
@@ -2699,7 +2709,7 @@ fn ct3_multi_011_a_departed_scope_stops_skewing_corpus_statistics() {
 /// full re-projection on the next default search.
 #[test]
 fn ct3_multi_012_a_narrowed_search_does_not_prune_the_replica() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let nest = parent.path().join("nest");
     let sub = nest.join("sub");
@@ -2789,7 +2799,7 @@ fn ct3_multi_012_a_narrowed_search_does_not_prune_the_replica() {
 /// fix is direction, not detection — the writer tells the replica.
 #[test]
 fn ct3_multi_013_indexing_replicates_without_waiting_for_a_search() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2839,7 +2849,7 @@ fn ct3_multi_013_indexing_replicates_without_waiting_for_a_search() {
 /// scope resolver's liveness projection to choose the requested snapshot.
 #[test]
 fn ct3_multi_014_a_history_search_is_ranked_by_the_replica() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2893,7 +2903,7 @@ fn ct3_multi_014_a_history_search_is_ranked_by_the_replica() {
 /// queries are a primary path, not an exceptional one.
 #[test]
 fn ct3_multi_015_short_tokens_are_ranked_by_the_replica() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -2942,7 +2952,7 @@ fn ct3_multi_015_short_tokens_are_ranked_by_the_replica() {
 /// returned nothing but zeroes.
 #[test]
 fn ct3_multi_016_a_narrowed_search_is_ranked_among_the_scopes_it_searched() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let nest = parent.path().join("nest");
     let sub = nest.join("sub");
@@ -3042,7 +3052,7 @@ fn ct3_multi_016_a_narrowed_search_is_ranked_among_the_scopes_it_searched() {
 /// already gives for the per-scope case: re-run without a cursor.
 #[test]
 fn ct3_multi_017_a_cursor_replays_against_the_collection_that_ranked_page_1() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -3094,7 +3104,7 @@ fn ct3_multi_017_a_cursor_replays_against_the_collection_that_ranked_page_1() {
 /// selector.
 #[test]
 fn ct3_multi_020_the_replica_retains_committed_chunks_across_liveness_changes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     for n in 1..=3 {
         fs::write(
             dir.path().join(format!("d{n}.md")),
@@ -3153,7 +3163,7 @@ fn ct3_multi_020_the_replica_retains_committed_chunks_across_liveness_changes() 
 /// search fails closed; it is never repaired lazily by a reader.
 #[test]
 fn ct3_multi_018_reindex_at_rotates_the_generation_it_publishes_under() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# A\n\n## Sec\nzephyrterm here\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     json_success(&dir, &["index", "--offline"]);
@@ -3187,7 +3197,7 @@ fn ct3_multi_018_reindex_at_rotates_the_generation_it_publishes_under() {
 /// root, of the text the user invoked a legal instrument to make stop existing.
 #[test]
 fn ct3_multi_019_purge_fails_closed_when_the_replica_cannot_be_cleared() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     fs::create_dir_all(&a).unwrap();
@@ -3276,7 +3286,7 @@ fn ct3_multi_019_purge_fails_closed_when_the_replica_cannot_be_cleared() {
 /// fails if the replica route stops checking the candidate scopes it returns.
 #[test]
 fn ct3_multi_021_replica_candidates_exclude_an_active_purge_scope() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -3382,7 +3392,7 @@ fn ct3_multi_021_replica_candidates_exclude_an_active_purge_scope() {
 /// even a title or Evidence Pointer from the newly blocked scope is a leak.
 #[test]
 fn ct3_multi_022_replica_response_boundary_rechecks_a_late_purge() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let scope = parent.path().join("scope");
     fs::create_dir_all(&scope).unwrap();
@@ -3506,7 +3516,7 @@ fn ct3_multi_022_replica_response_boundary_rechecks_a_late_purge() {
 /// missing from the collection the moment a second one appeared.
 #[test]
 fn ct3_multi_010_single_scope_search_uses_the_collection_candidate_route() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     fs::create_dir_all(&a).unwrap();
@@ -3546,7 +3556,7 @@ fn ct3_multi_010_single_scope_search_uses_the_collection_candidate_route() {
 // diversify runs on the merged pool: max_per_raw_hash caps a raw_hash across scopes.
 #[test]
 fn ct3_multi_003_diversify_caps_raw_hash_across_scopes() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let dirs = ["s0", "s1", "s2", "s3"]
         .iter()
@@ -3573,7 +3583,7 @@ fn ct3_multi_003_diversify_caps_raw_hash_across_scopes() {
 #[cfg(unix)]
 #[test]
 fn ct3_multi_005_partial_failure_returns_results_with_exit_3() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -3628,7 +3638,7 @@ fn ct3_multi_005_partial_failure_returns_results_with_exit_3() {
 fn ct3_multi_005_all_failed_returns_exit_4() {
     // A scope that is init'd but not indexed is not a search target; with no other
     // indexed scope the search is a permanent all-scope failure.
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# A\n\n## Sec\nalpha\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     let err = json_failure(&dir, &["search", "alpha"], 4);
@@ -3637,7 +3647,7 @@ fn ct3_multi_005_all_failed_returns_exit_4() {
 
 #[test]
 fn ct3_multi_006_completion_order_does_not_change_results_or_cursor() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -3686,7 +3696,7 @@ fn ct3_multi_006_completion_order_does_not_change_results_or_cursor() {
 
 #[test]
 fn ct3_multi_006_timeout_preserves_fresh_all_failed_and_cursor_contracts() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -3790,7 +3800,7 @@ fn ct3_multi_006_timeout_preserves_fresh_all_failed_and_cursor_contracts() {
 // fresh search instead of silently shrinking to the surviving scopes.
 #[test]
 fn ct4_cursor_replay_with_unresolvable_active_scope_hard_fails() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     // "a" sorts first → page 1 serves its chunk (RRF tie-break by scope_path),
     // so the survivor "b" has consumed 0 and still owns results for page 2.
@@ -3847,7 +3857,7 @@ fn ct4_cursor_replay_with_unresolvable_active_scope_hard_fails() {
 // search must merge on text only and record the fallback (05 §1.8(5) / 03 §7).
 #[test]
 fn ct3_embed_003_cross_scope_incompatibility_falls_back_to_text_merge() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -3881,7 +3891,7 @@ fn ct3_embed_003_cross_scope_incompatibility_falls_back_to_text_merge() {
 // ct3_embed_modality_..., missing the CT3-EMBED-008 number.
 #[test]
 fn ct3_embed_008_non_multimodal_profile_is_rejected_at_index() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# A\n\n## One\nalpha 111\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     let err = json_failure_embed(&dir, "non_multimodal", &["index"], 2);
@@ -4099,7 +4109,7 @@ fn ct3_obs_001_index_status_reports_partial_enrichment() {
     // R9-2: text-native files no longer enqueue an online task, so the pending
     // enrichment CT3-OBS-001 measures comes from a PDF whose online markdownize
     // stays Pending after an offline index (the deterministic baseline is Done).
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&["認証仕様 トークン TTL 3600 のテスト本文"]),
@@ -4123,7 +4133,7 @@ fn ct3_obs_001_index_status_reports_partial_enrichment() {
 /// database even if the assertion fails.
 #[test]
 fn ct3_replica_001_direct_search_survives_a_temporarily_hidden_source_index() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("replica.md"),
         "# Replica-only route\n\nreplicaonlydirectneedle must come from aggregator\n",
@@ -4516,7 +4526,7 @@ fn ct3_replica_005_same_content_snapshot_republishes_ready_projection() {
 /// use the preserved projection without requiring another source-index write.
 #[test]
 fn ct3_replica_003_temporarily_excluded_scope_keeps_its_replica_projection() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -4618,7 +4628,7 @@ fn ct3_replica_003_temporarily_excluded_scope_keeps_its_replica_projection() {
 /// replica query to successfully prepared scope stores instead.
 #[test]
 fn ct3_replica_008_unresolvable_scope_identity_cannot_serve_a_ready_projection() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -4710,7 +4720,7 @@ fn ct3_replica_008_unresolvable_scope_identity_cannot_serve_a_ready_projection()
 /// the device-wide replica and must leave siblings alone.
 #[test]
 fn ct3_replica_004_registry_fallback_does_not_prune_unenumerated_siblings() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -4851,7 +4861,7 @@ fn ct3_fts_004_replica_serves_search_while_source_fts_is_rebuilt() {
 /// query's).
 #[test]
 fn r23_21_hybrid_collection_pool_is_the_union_of_per_lane_candidate_depth() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // Contextual-embedding addendum (07 §5.3, 2026-07-24): the mock vector is
     // `deterministic_embedding_vector(item.text)`, and the send path now prepends
     // the humanized filename to a chunk's body. This doc must be the VECTOR top-1,
@@ -5000,7 +5010,7 @@ fn registry_path(data_home: &Path) -> std::path::PathBuf {
 
 #[test]
 fn ct3_evidence_003_scope_resolves_via_path_then_registry() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let scope = parent.path().join("research");
     let elsewhere = parent.path().join("elsewhere");
@@ -5055,7 +5065,7 @@ fn ct3_evidence_003_scope_resolves_via_path_then_registry() {
 
 #[test]
 fn ct3_evidence_004_resolves_through_pointer_commit_tree() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let scope = parent.path().join("research");
     fs::create_dir_all(&scope).unwrap();
@@ -5308,7 +5318,7 @@ fn ct3_embed_009_batch_retry_and_resume_execute_pending_embedding_tasks() {
     // 積まれた embedding タスクは、`batch retry`/`resume` の executor が
     // Markdownize 専用だったため永遠に実行されなかった。retry → (seam 回復) →
     // 実行完了までを検証する。
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# メモ\n回収率のテスト。\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     initialize_paid_ledger(&dir);
@@ -5367,7 +5377,7 @@ fn ct3_embed_009_batch_retry_and_resume_execute_pending_embedding_tasks() {
 // `pending`, not `failed` — this test used to assert `status=="failed"`.
 #[test]
 fn r11_5_aggregated_writeback_preserves_embedding_fallback_reason() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# メモ\n\n## 本文\n集約書き戻しの回帰テスト本文です。\n",
@@ -5420,7 +5430,7 @@ fn r11_5_aggregated_writeback_preserves_embedding_fallback_reason() {
 // test pins is unchanged either way.
 #[test]
 fn r11_8_retryable_failed_enrichment_counts_as_pending_in_index_status() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# メモ\n\n## 本文\n再試行可能な失敗の可視化テスト本文です。\n",
@@ -5450,7 +5460,7 @@ fn ct3_embed_010_retry_executes_after_snapshot_advances_head() {
     // 射影せず HEAD だけ進めるため、enrichment の live-chunk JOIN が 0 件になり
     // retry/resume が何も実行しなかった。enrichment は writer 側で source
     // relation を materialize し、search に補完を委ねてはならない。
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# メモ\n射影テスト。\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     initialize_paid_ledger(&dir);
@@ -5594,7 +5604,7 @@ fn ct3_l1_reindex_enriches_new_generation_embeddings() {
 // `index_status` reported enriched_ratio = 1.0 / pending = 0 for them.
 #[test]
 fn ct3_l1_reindex_offline_surfaces_pending_embeddings_in_index_status() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("note.md"),
         "# ノート\n\n## 本文\n埋め込み保留の可視化テストです。\n",
@@ -5632,7 +5642,7 @@ fn ct3_l1_reindex_offline_surfaces_pending_embeddings_in_index_status() {
 // not a HEAD-only phantom to terminalize.
 #[test]
 fn ct4_deleted_historical_chunk_embedding_stays_pending() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("keep.md"),
         "# Keep\n\n## Body\n生き残るチャンクの本文です。\n",
@@ -5696,7 +5706,7 @@ fn ct4_deleted_historical_chunk_embedding_stays_pending() {
 // assert `status=="failed"`.
 #[test]
 fn r11_2_index_embedding_auth_error_exits_5() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("note.md"),
         "# ノート\n\n## 本文\n認証失敗の可視化テスト本文です。\n",
@@ -5733,7 +5743,7 @@ fn r11_2_index_embedding_auth_error_exits_5() {
 // even a Paused task without any override.
 #[test]
 fn ct3_l2_budget_paused_resume_symmetry_across_adapters() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // R9-2: the markdownize online task only exists for a non-text-native file, so
     // the both-adapters budget-pause symmetry is exercised with a PDF (its
     // deterministic baseline still produces chunks for the embedding adapter).
@@ -5804,7 +5814,7 @@ fn ct3_l2_budget_paused_resume_symmetry_across_adapters() {
 // The second recheck raises the configured folder cap and completes both paths.
 #[test]
 fn ct3_l2_recheck_budget_enforces_the_current_cap_for_both_adapters() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("budget-recheck.pdf"),
         fake_pdf(&["現在の上限を再判定する対称性テスト本文です。"]),
@@ -5927,7 +5937,7 @@ fn ct3_l3_bare_snapshot_rejects_chunk_evidence_but_opens_current_raw_short_hash(
 // the adapter; granting the embedding opt-in then embeds them.
 #[test]
 fn ct3_l4_embedding_without_own_optin_is_enqueue_only() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("adapter.md"),
         "# アダプタ\n\n## 本文\nアダプタ単位 opt-in のテスト本文です。\n",
@@ -6041,7 +6051,7 @@ fn m3_short_chunk_hash_view_resolves_chunk() {
 // already received its candidate material and is the read boundary.
 #[test]
 fn m4_corrupt_source_sqlite_does_not_exclude_multiscope_replica_search() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -6173,7 +6183,7 @@ fn m7_object_uri_dispatches_by_type_directory() {
     use base64::Engine as _;
     use kio_core::cas::hash_bytes;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let png = base64::engine::general_purpose::STANDARD
         .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=")
         .unwrap();
@@ -6241,7 +6251,7 @@ fn m7_object_uri_dispatches_by_type_directory() {
 // rejected at startup with exit 2, exactly like the folder config already was.
 #[test]
 fn m8_user_config_negative_budget_cap_rejected() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     kio(&dir, &["init"]).assert().success();
     let user_config = dir.path().join(".test-config/kio/config.toml");
     fs::create_dir_all(user_config.parent().unwrap()).unwrap();
@@ -6253,7 +6263,7 @@ fn m8_user_config_negative_budget_cap_rejected() {
 // M8: a valid user config with a non-negative cap passes (no over-rejection).
 #[test]
 fn m8_user_config_valid_budget_cap_accepted() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     kio(&dir, &["init"]).assert().success();
     let user_config = dir.path().join(".test-config/kio/config.toml");
     fs::create_dir_all(user_config.parent().unwrap()).unwrap();
@@ -6321,7 +6331,7 @@ fn pc60_search_at_with_descendants_is_invalid_usage() {
 // REGISTRY namespace).
 #[test]
 fn minor_evidence_scope_ambiguous_error_code_is_emitted() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -6388,7 +6398,7 @@ fn minor_evidence_scope_ambiguous_error_code_is_emitted() {
 // stays visible in `kio status` quarantine + as a held task the whole time.
 #[test]
 fn n1_tier_b_online_send_held_until_send_secrets() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("notes.md"),
         "# Notes\n\n## Body\n通常の本文です。十分な長さの段落を含みます。\n",
@@ -6456,7 +6466,7 @@ fn n1_tier_b_online_send_held_until_send_secrets() {
 #[test]
 fn n2_manual_snapshot_excludes_tier_a() {
     use kio_core::cas::hash_bytes;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
     fs::write(dir.path().join(".env"), "TOKEN=supersecret").unwrap();
     kio(&dir, &["init"]).assert().success();
@@ -6485,7 +6495,7 @@ fn n2_manual_snapshot_excludes_tier_a() {
 // (c) / N3: errors.jsonl must mask the `path` field under redact_logs (default on).
 #[test]
 fn n3_errors_jsonl_redacts_path() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
     kio(&dir, &["init"]).assert().success();
     fs::write(dir.path().join(".kio/tasks.jsonl"), "{ not json\n").unwrap();
@@ -6515,7 +6525,7 @@ fn n4_diff_and_tag_reject_traversal_operands() {
 // "success". Ordinary tag names are unaffected.
 #[test]
 fn f4_tag_rejects_reserved_head_and_hash_names() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# T\n\n## S\nbody text here.\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     // A commit must exist so a legitimate tag (resolving HEAD) can be created.
@@ -6578,7 +6588,7 @@ fn n5_pointer_rejects_generation_mixing_after_reindex() {
 // markdownize honored the flag; embedding stayed Pending).
 #[test]
 fn n7_online_flag_drives_embedding_enrichment() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("notes.md"),
         "# Notes\n\n## Body\n通常本文の十分な長さのテキストです。\n",
@@ -6607,7 +6617,7 @@ fn n7_online_flag_drives_embedding_enrichment() {
 // tampered/forged cursor also fails HMAC verification.
 #[test]
 fn o1_cursor_scope_restriction_and_signature() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let safe = parent.path().join("safe");
     let vault = parent.path().join("vault");
@@ -6742,7 +6752,7 @@ fn o2_text_search_never_sends_query_embedding() {
 // than racing tasks.jsonl / the ledger into a double send.
 #[test]
 fn o3_batch_resume_takes_the_store_lock() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.md"), "# A\n\n## B\n本文です。\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     // A live (non-stale) lock held by "another process".
@@ -6755,7 +6765,7 @@ fn o3_batch_resume_takes_the_store_lock() {
 // window indexes cleanly (no char-boundary panic / exit 101, no body dump).
 #[test]
 fn o4_crafted_multibyte_pdf_does_not_panic() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // "/PageXあ": the 3-byte あ sits across the +8 byte window from "/Page"; the
     // old str slice panicked here. `BT` gives the file a text layer.
     let mut pdf = Vec::new();
@@ -6776,7 +6786,7 @@ fn o4_crafted_multibyte_pdf_does_not_panic() {
 // half-initialized "commit but no index" that fails every re-index with exit 2.
 #[test]
 fn o5_empty_scope_indexes_with_exit_0() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     kio(&dir, &["init"]).assert().success();
     kio(&dir, &["index", "--json"]).assert().success();
     // Re-index is also clean (no stuck "commit, no index" state).
@@ -6803,7 +6813,7 @@ fn o6_short_sha256_operand_is_usage_error() {
 // exit 4 default (`registry_duplicate_error`, unaffected by this fix).
 #[test]
 fn o7_cursor_replay_detects_scope_id_collision() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -6877,7 +6887,7 @@ fn p1_batch_resume_rejects_out_of_scope_task_input_path() {
         "../../../../../../etc/hosts",
         "sub/secret.txt",
     ] {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = canonical_tempdir();
         // R9-2: a PDF so `index` enqueues a real online task whose
         // output_ref the poison row reuses (text-native files enqueue none).
         fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello world content"])).unwrap();
@@ -6946,7 +6956,7 @@ fn p1_batch_resume_rejects_out_of_scope_task_input_path() {
 /// Display embedded the path verbatim).
 #[test]
 fn p4_corrupt_store_error_message_has_no_absolute_path() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.txt"), "hi").unwrap();
     kio(&dir, &["init"]).assert().success();
     json_success(&dir, &["index"]);
@@ -6987,7 +6997,7 @@ fn p4_corrupt_store_error_message_has_no_absolute_path() {
 #[test]
 fn p2_init_restricts_kio_and_data_dir_to_owner() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.txt"), "secret-ish bytes").unwrap();
     kio(&dir, &["init"]).assert().success();
 
@@ -7042,7 +7052,7 @@ fn p5_concurrent_search_during_rebuild_is_never_silently_empty() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# Alpha\n\n## S\nalphaunique alphaunique alphaunique\n",
@@ -7119,7 +7129,7 @@ fn p5_concurrent_search_during_rebuild_is_never_silently_empty() {
 /// approval or mutate the durable adapter-grant store.
 #[test]
 fn p7_index_yes_does_not_create_adapter_approval() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
     kio(&dir, &["init"]).assert().success();
     let approvals = dir.path().join(".kio/approvals.jsonl");
@@ -7271,7 +7281,7 @@ fn r9_3_open_reuse_rehardens_stale_permissions() {
 /// replica projection and makes the state searchable again.
 #[test]
 fn p10_replica_rebuilding_returns_not_silent_empty() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# Alpha\n\n## S\nalphaunique alphaunique content here\n",
@@ -7324,7 +7334,7 @@ fn p10_replica_rebuilding_returns_not_silent_empty() {
 /// returns its hit at exit 0, never a spurious REBUILDING.
 #[test]
 fn p10_partial_index_window_does_not_false_rebuilding() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# Alpha\n\n## S\nalphaword alphaword\n",
@@ -7382,7 +7392,7 @@ fn p10_genuine_no_hit_and_empty_scope_stay_exit_zero() {
     assert!(miss["excluded_scopes"].as_array().unwrap().is_empty());
 
     // Empty scope (no documents): exit-0 empty page (no tree_entries for HEAD).
-    let empty = tempfile::tempdir().unwrap();
+    let empty = canonical_tempdir();
     kio(&empty, &["init"]).assert().success();
     kio(&empty, &["index"]).assert().success();
     let search = json_success(&empty, &["search", "anything", "--mode", "text"]);
@@ -7403,7 +7413,7 @@ fn p10_concurrent_search_during_reindex_is_never_silently_empty() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // Enough documents that the all-document re-generation + rebuild spans a window
     // a concurrent search can land in.
     for i in 0..12 {
@@ -7494,7 +7504,7 @@ fn p10_concurrent_search_during_reindex_is_never_silently_empty() {
 // no duplicate chunk_id.
 #[test]
 fn q1_torn_chunk_tail_fully_self_heals_across_index_repair_index() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("auth.md"),
         "# 認証仕様\n\n## API Token\nトークン TTL は 3600 秒です。\n\n## Scopes\nスコープは read write admin です。\n",
@@ -7568,14 +7578,14 @@ fn q1_torn_chunk_tail_fully_self_heals_across_index_repair_index() {
 
 #[test]
 fn r6_foreign_approval_rows_do_not_grant_online_embedding() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("note.md"),
         "# Note\nforeign approval probe\n",
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    let other = tempfile::tempdir().unwrap();
+    let other = canonical_tempdir();
     fs::write(other.path().join("other.md"), "# Other\napproval source\n").unwrap();
     kio(&other, &["init"]).assert().success();
     initialize_paid_ledger(&other);
@@ -7610,7 +7620,7 @@ fn r6_foreign_approval_rows_do_not_grant_online_embedding() {
 
 #[test]
 fn r6_empty_approvals_file_does_not_satisfy_online_flag() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("note.md"), "# Note\nempty approval probe\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     fs::write(dir.path().join(".kio/approvals.jsonl"), "").unwrap();
@@ -7659,9 +7669,9 @@ fn r6_inline_json_pointer_rejects_unsupported_schema_version() {
 
 #[test]
 fn r6_default_search_rereads_current_global_opt_out() {
-    let data_home = tempfile::tempdir().unwrap();
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
+    let data_home = canonical_tempdir();
+    let a = canonical_tempdir();
+    let b = canonical_tempdir();
     fs::write(a.path().join("a.md"), "# A\nalphaonly optout leak\n").unwrap();
     fs::write(b.path().join("b.md"), "# B\nbetapublic\n").unwrap();
     json_success_path(a.path(), data_home.path(), &["init"]);
@@ -7705,7 +7715,7 @@ fn r6_tool_lock_rejects_future_spec_version() {
 
 #[test]
 fn r6_corrupt_normalized_unit_is_store_corrupt_not_config_schema() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("note.md"),
         "# Note\nnormalized corruption searchable\n",
@@ -7728,7 +7738,7 @@ fn r6_corrupt_normalized_unit_is_store_corrupt_not_config_schema() {
 
 #[test]
 fn r7_empty_secrets_approval_file_does_not_lift_tier_b_hold() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("api_secret.md"),
         "# Secret\nprobable secret body\n",
@@ -7772,9 +7782,9 @@ fn pc4_multiscope_query_embedding_sent_when_any_target_scope_opts_in() {
     // 1 回であり scope 別の再送信は発生しない"). This replaces the pre-PC4
     // AND-gate contract (a single unapproved scope no longer silently vetoes
     // sending for an already-approved sibling).
-    let data_home = tempfile::tempdir().unwrap();
-    let a = tempfile::tempdir().unwrap();
-    let b = tempfile::tempdir().unwrap();
+    let data_home = canonical_tempdir();
+    let a = canonical_tempdir();
+    let b = canonical_tempdir();
     fs::write(a.path().join("a.md"), "# A\nsharedterm alpha\n").unwrap();
     fs::write(b.path().join("b.md"), "# B\nsharedterm beta\n").unwrap();
     run_embed_path(a.path(), data_home.path(), "mock", &["init"]);
@@ -7860,7 +7870,7 @@ fn r7_repair_rejects_unknown_flags_and_extra_operands() {
 
 #[test]
 fn r7_embedding_profile_change_requires_a_new_explicit_grant() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("doc.md"), "# Doc\nalpha profile flip\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     initialize_paid_ledger(&dir);
@@ -7989,7 +7999,7 @@ fn first_immutable_normalized_unit_object(kio_dir: &Path) -> std::path::PathBuf 
 /// old gen dir, and reindex succeeds and the index still resolves the document.
 #[test]
 fn r9_5_reindex_survives_junk_in_gen_dir() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("doc.md"),
         "# Title\n\n## Section\nr9five unique body text here\n",
@@ -8161,7 +8171,7 @@ fn r12_2_unknown_policy_key_is_schema_error() {
 // rejected the key before it could ever be read).
 #[test]
 fn r12_2_user_config_redact_logs_false_records_path() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
     kio(&dir, &["init"]).assert().success();
     // Device-global user config (XDG_CONFIG_HOME/kio/config.toml).
@@ -8193,7 +8203,7 @@ fn r12_2_user_config_redact_logs_false_records_path() {
 // adapter processing (never normalized) but the index still succeeds.
 #[test]
 fn r12_2_max_input_bytes_gates_oversized_input() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     kio(&dir, &["init"]).assert().success();
     // Cap at 50 bytes; write a markdown file well over that.
     fs::write(
@@ -8219,7 +8229,7 @@ fn r12_2_max_input_bytes_gates_oversized_input() {
 /// A single-file scope whose file has 5 heading sections all sharing one token
 /// (so one raw_hash, 5 chunks) — the fixture for diversify dedup behavior.
 fn multi_chunk_scope() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("doc.md"),
         "# Doc\n\n\
@@ -8477,7 +8487,7 @@ fn r23_materialized_embedding_completes_failed_task_without_charge() {
 // Enrichment auth failure (exit 5 via __exit_code) must now reach errors.jsonl.
 #[test]
 fn r12_4_enrichment_auth_failure_reaches_errors_jsonl() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("note.md"),
         "# ノート\n\n## 本文\n認証失敗の可視化テスト本文です。\n",
@@ -8503,7 +8513,7 @@ fn r12_4_enrichment_auth_failure_reaches_errors_jsonl() {
 #[cfg(unix)]
 #[test]
 fn r12_4_multi_scope_partial_records_exclusion_in_errors_jsonl() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -8575,7 +8585,7 @@ fn r12_4_failed_search_writes_metrics_and_errors() {
 // run() entirely, exiting inside exit_from_clap_error).
 #[test]
 fn r12_4_clap_usage_error_reaches_errors_jsonl() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     kio(&dir, &["index", "--this-flag-does-not-exist"])
         .assert()
         .code(2);
@@ -8716,7 +8726,7 @@ fn json_success_deterministic_embed(dir: &TempDir, args: &[&str]) -> Value {
 
 /// A scope indexed entirely through the deterministic evaluator adapter.
 fn indexed_scope_deterministic_embed() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("auth.md"),
         "# 認証仕様\n\n## API Token\nトークン TTL は 3600 秒です。\n\n## Scopes\nスコープは read write admin です。\n",
@@ -8871,7 +8881,7 @@ fn the_online_adapter_still_records_online_provenance() {
 /// A scope whose OCR path produced image objects, indexed through the
 /// deterministic evaluator adapter (which declares `image_object`).
 fn indexed_scope_deterministic_embed_with_images() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // R9-2: image extraction only happens on the online OCR path, which
     // non-text-native files reach → PDF fixture.
     fs::write(
@@ -9002,7 +9012,7 @@ fn image_embedding_is_idempotent_across_reindex() {
 /// `image_object`, and must therefore write no image vectors at all.
 #[test]
 fn the_online_adapter_embeds_no_images_because_it_declares_no_capability() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("figures.pdf"),
         fake_pdf(&["figure page one"]),
@@ -9187,7 +9197,7 @@ fn an_image_row_carries_the_referencing_chunks_evidence_pointer() {
 /// test, which is the whole reason the rule names `chunk_hash`.
 #[test]
 fn v6_the_pointer_is_the_lowest_chunk_hash_citing_the_image() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // Different page text so the two files are different units; same page
     // POSITION so the mock gives them the same figure.
     fs::write(dir.path().join("alpha.pdf"), fake_pdf(&["figure alpha"])).unwrap();
@@ -9274,7 +9284,7 @@ fn v6_the_pointer_is_the_lowest_chunk_hash_citing_the_image() {
 /// equally mean the search path silently dropped them.
 #[test]
 fn the_online_adapter_returns_no_image_rows_because_it_embeds_none() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("figures.pdf"),
         fake_pdf(&["figure page one"]),
@@ -9705,7 +9715,7 @@ fn r17_1_n5_forged_commit_cannot_bypass_generation_binding() {
 // recent commits too). Reads that only need HEAD stay fully healthy.
 #[test]
 fn r16_1_log_truncates_at_missing_ancestor_commit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("d.md"), "# D\n\n## S\nv1 body\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     let c1 = json_success(&dir, &["snapshot", "create", "-m", "first"]);
@@ -9751,7 +9761,7 @@ fn r16_1_log_truncates_at_missing_ancestor_commit() {
 // whole search died exit 4.
 #[test]
 fn r16_2_one_scope_store_corruption_is_partial_not_all_failed() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -9808,7 +9818,7 @@ fn r16_2_one_scope_store_corruption_is_partial_not_all_failed() {
 // it in searched_scopes with an empty result set.
 #[test]
 fn r16_3_fresh_search_unreceipted_tree_loss_excludes_not_silent_empty() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -9890,7 +9900,7 @@ fn r16_4_repair_on_unreceipted_missing_head_reports_corruption() {
 // It must fail closed rather than let repair substitute mutable cache content.
 #[test]
 fn r16_4_repair_skips_missing_unit_and_rebuilds_the_rest() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("keep.md"),
         "# Keep\n\n## Body\nkeepsurvivor token here\n",
@@ -9917,7 +9927,7 @@ fn r16_4_repair_skips_missing_unit_and_rebuilds_the_rest() {
 // opaque KIO-E-STORE-NOT-FOUND-001 whose hash the user cannot map to an operand.
 #[test]
 fn r16_5_diff_with_shallow_side_names_the_side() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("d.md"), "# D\n\n## S\nv1 body\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     let c1 = json_success(&dir, &["index", "--yes"]);
@@ -9968,7 +9978,7 @@ fn r16_5_diff_with_shallow_side_names_the_side() {
 // escape as a raw KIO-E-STORE-NOT-FOUND-001 (exit 4).
 #[test]
 fn r17_5_shallow_commit_via_hash_tag_and_implicit_head_folds_to_commit_shallow() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("d.md"), "# D\n\n## S\nv1 body\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     let c1 = json_success(&dir, &["snapshot", "create", "-m", "first"]);
@@ -10024,7 +10034,7 @@ fn r17_5_shallow_commit_via_hash_tag_and_implicit_head_folds_to_commit_shallow()
 // skipped_units; the healthy document is re-normalized and the scope stays searchable.
 #[test]
 fn r17_2_reindex_force_skips_corrupt_unit_and_renormalizes_healthy() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("healthy.md"),
         "# Healthy\n\n## Body\nhealthytoken alpha content here\n",
@@ -10089,7 +10099,7 @@ fn r17_2_reindex_force_skips_corrupt_unit_and_renormalizes_healthy() {
 // device-global path that verifies/rebuilds both the store and its derived indexes.
 #[test]
 fn r17_4_store_corrupt_all_scopes_returns_recovery_guidance() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# A\n\n## Sec\nalphacorrupt token\n",
@@ -10133,7 +10143,7 @@ fn r17_4_store_corrupt_all_scopes_returns_recovery_guidance() {
 // store-corrupt recovery guidance. Valid GC shallow commits are never ref tips.
 #[test]
 fn r17_4_unreceipted_missing_head_returns_store_corrupt_guidance() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# A\n\n## Sec\nalphashallow token\n",
@@ -10183,7 +10193,7 @@ fn r17_4_unreceipted_missing_head_returns_store_corrupt_guidance() {
 // neither influence reconstruction nor produce a false stale-source warning.
 #[test]
 fn r17_6_repair_ignores_corrupt_mutable_cache_when_chunks_survive() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("a.md"),
         "# A\n\n## Body\ncachedserving unique token\n",
@@ -10210,7 +10220,7 @@ fn r17_6_repair_ignores_corrupt_mutable_cache_when_chunks_survive() {
 // unit CAS rather than a mutable cache body.
 #[test]
 fn r17_6_repair_rebuilds_from_immutable_unit_when_no_cached_chunks_survive() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("only.md"),
         "# Only\n\n## Body\nonlydoc unique token\n",
@@ -10399,7 +10409,7 @@ fn markdown_ledger_rows(dir: &TempDir) -> usize {
 // this test used to assert `attempts >= 2` after N retries.
 #[test]
 fn r16_7_rate_limit_retry_does_not_reaccrue_charge() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("doc.pdf"),
         fake_pdf(&["レート制限リトライの課金累積回帰テスト本文です。"]),
@@ -10478,7 +10488,7 @@ fn r16_7_rate_limit_retry_does_not_reaccrue_charge() {
 // reflects) does not reappear — it is simply no longer visible as row-count growth.
 #[test]
 fn r16_7_network_error_retry_does_not_reaccrue_charge() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("doc.pdf"),
         fake_pdf(&["ネットワークエラーリトライの課金回帰テスト本文です。"]),
@@ -10570,7 +10580,7 @@ const R17_3_BODY_V2: &str = "R17-3 phantom reclaim regression 本文あいうえ
 // outcome as discriminator (b) below (the two converge under the new ledger).
 #[test]
 fn r17_3_rate_limit_phantom_settles_and_still_pauses_edited_doc() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     assert_eq!(
         R17_3_BODY_V1.len(),
         R17_3_BODY_V2.len(),
@@ -10653,7 +10663,7 @@ fn r17_3_rate_limit_phantom_settles_and_still_pauses_edited_doc() {
 // was never reclaimed even under the retired design).
 #[test]
 fn r17_3_network_error_reservation_settles_pauses_edited_doc() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V1])).unwrap();
     kio(&dir, &["init"]).assert().success();
     initialize_paid_ledger(&dir);
@@ -10770,7 +10780,7 @@ const R18_1_BODY_V2: &str =
 // competes with the edited document under a cap sized for one send.
 #[test]
 fn ct4_retained_embedding_reservation_is_not_reclaimed_on_edit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     assert_eq!(R18_1_BODY_V1.len(), R18_1_BODY_V2.len());
     fs::write(dir.path().join("doc.md"), R18_1_BODY_V1).unwrap();
     kio(&dir, &["init"]).assert().success();
@@ -10856,7 +10866,7 @@ fn ct4_retained_embedding_reservation_is_not_reclaimed_on_edit() {
 // posture: never an under-charge).
 #[test]
 fn r18_2_markdownize_deleted_file_phantom_settles_still_pauses_doc2() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V1])).unwrap();
     kio(&dir, &["init"]).assert().success();
     initialize_paid_ledger(&dir);
@@ -10918,7 +10928,7 @@ fn r18_2_markdownize_deleted_file_phantom_settles_still_pauses_doc2() {
 // conservative complement to the retired design's netting).
 #[test]
 fn r18_3_status_budget_reports_settled_phantom_as_real_spend() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V1])).unwrap();
     kio(&dir, &["init"]).assert().success();
     initialize_paid_ledger(&dir);
@@ -10955,7 +10965,7 @@ fn r18_3_status_budget_reports_settled_phantom_as_real_spend() {
 // `recovery`. R18-4 attaches the hint to each individual excluded entry. (Models r16_2.)
 #[test]
 fn r18_4_partial_store_corruption_entry_carries_recovery_hint() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -11030,7 +11040,7 @@ fn env_online_tasks<'a>(status: &'a Value, path: &str) -> Vec<&'a Value> {
 // (a risk-gradient inversion) and left no quarantine audit record.
 #[test]
 fn r19_1_lifted_tier_a_secret_held_from_online_send() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join(".env"),
         "AWS_SECRET_ACCESS_KEY=FAKE_TESTKEY_abcdefghijklmnop\n",
@@ -11113,7 +11123,7 @@ fn r19_1_lifted_tier_a_secret_held_from_online_send() {
 // bytes reuses the same task without a retire/revive cycle or duplicate output_ref.
 #[test]
 fn ct4_reverted_chunk_reuses_retained_embedding_task() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     assert_eq!(R18_1_BODY_V1.len(), R18_1_BODY_V2.len());
     fs::write(dir.path().join("doc.md"), R18_1_BODY_V1).unwrap();
     kio(&dir, &["init"]).assert().success();
@@ -11173,7 +11183,7 @@ fn ct4_reverted_chunk_reuses_retained_embedding_task() {
 // convergence leaves no speculative reservation open.
 #[test]
 fn r19_4_duplicate_content_failed_chunk_converges_via_twin() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let shared = "## 共有セクション\n\n共有される段落です。十分な長さの本文をここに置きます。あいうえお かきくけこ さしすせそ。\n";
     // Contextual-embedding addendum (07 §5.3, 2026-07-24): a content twin now
     // requires the same body AND the same humanized filename context. Two DIFFERENT
@@ -11241,7 +11251,7 @@ fn r19_4_duplicate_content_failed_chunk_converges_via_twin() {
 // seam, so the terminal state is crafted directly (as the round's control repro did).
 #[test]
 fn r19_2_exhausted_quota_phantom_settled_on_sweep() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V1])).unwrap();
     kio(&dir, &["init"]).assert().success();
     initialize_paid_ledger(&dir);
@@ -11309,7 +11319,7 @@ fn r19_2_exhausted_quota_phantom_settled_on_sweep() {
 // at all.
 #[test]
 fn r19_6_corrupt_source_index_does_not_create_a_search_exclusion() {
-    let parent = tempfile::tempdir().unwrap();
+    let parent = canonical_tempdir();
     let data_home = parent.path().join("xdg");
     let a = parent.path().join("a");
     let b = parent.path().join("b");
@@ -11352,7 +11362,7 @@ fn r19_6_corrupt_source_index_does_not_create_a_search_exclusion() {
 // (the sibling `allow_network` key is likewise re-checked at send).
 #[test]
 fn r19_8_lowered_max_input_bytes_blocks_queued_online_send() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let pdf = fake_pdf(&[R17_3_BODY_V1]);
     fs::write(dir.path().join("doc.pdf"), &pdf).unwrap();
     kio(&dir, &["init"]).assert().success();
@@ -11411,7 +11421,7 @@ const R21_TWIN_BODY: &str =
 /// task Done — shipping the Tier B file's text online with no `--send-secrets`.
 #[test]
 fn r21_1_byte_identical_twin_does_not_bypass_tier_b_hold() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(dir.path().join("notes.md"), R21_TWIN_BODY).unwrap();
     fs::write(dir.path().join("password_backup.md"), R21_TWIN_BODY).unwrap();
     kio(&dir, &["init"]).assert().success();
@@ -11438,13 +11448,11 @@ fn r21_1_byte_identical_twin_does_not_bypass_tier_b_hold() {
     }
 }
 
-/// R21-2: two byte-identical NON-secret files share one content-addressed `chunk_id`, so
-/// they must produce exactly ONE embedding task per `output_ref` — not a duplicate that is
-/// double-sent and double-charged (the R20-2 one-task-per-output_ref invariant, broken here
-/// from a second source: the `tree_entries` JOIN fan-out).
+/// Byte-identical files share a chunk, but distinct filename contexts require
+/// independently keyed embedding tasks. Each contextual identity appears once.
 #[test]
-fn r21_2_byte_identical_twins_share_single_embedding_task() {
-    let dir = tempfile::tempdir().unwrap();
+fn r21_2_byte_identical_twins_have_distinct_contextual_tasks() {
+    let dir = canonical_tempdir();
     let body = "# Shared\nalpha bravo charlie delta echo foxtrot golf hotel india.\n";
     fs::write(dir.path().join("a.md"), body).unwrap();
     fs::write(dir.path().join("b.md"), body).unwrap();
@@ -11466,6 +11474,28 @@ fn r21_2_byte_identical_twins_share_single_embedding_task() {
         embedding.len(),
         distinct.len()
     );
+    assert_eq!(
+        embedding.len(),
+        2,
+        "both filename contexts need work: {status}"
+    );
+    let keys = embedding
+        .iter()
+        .map(|task| EmbeddingWorkKey::parse(task["output_ref"].as_str().unwrap()).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(keys[0].chunk_id(), keys[1].chunk_id());
+    assert_ne!(keys[0].embedding_hash(), keys[1].embedding_hash());
+    assert_eq!(
+        embedding
+            .iter()
+            .map(|task| task["input_path"].as_str().unwrap())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["a.md", "b.md"])
+    );
+    assert!(
+        embedding.iter().all(|task| task["status"] == "done"),
+        "both contexts must complete: {status}"
+    );
 }
 
 /// R21-4: a TEXT file the extension table folds to `application/octet-stream` — an
@@ -11474,7 +11504,7 @@ fn r21_2_byte_identical_twins_share_single_embedding_task() {
 /// online OCR task (R9-2: shipping its bytes to Mistral OCR is a routing violation).
 #[test]
 fn r21_4_uppercase_and_octet_stream_text_enqueue_no_online_ocr() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("README.MD"),
         "# Upper\nreadme text body here.\n",
@@ -11513,7 +11543,7 @@ fn r21_4_uppercase_and_octet_stream_text_enqueue_no_online_ocr() {
 /// `failed` — this test used to assert `status=="failed"`.
 #[test]
 fn r21_6_auth_error_live_task_recovers_after_credentials_fixed() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("notes.txt"),
         "plain readable content alpha bravo charlie delta echo.\n",
@@ -11555,7 +11585,7 @@ fn r21_6_auth_error_live_task_recovers_after_credentials_fixed() {
 /// task remains truthful, but the derived vector row is withheld until approval.
 #[test]
 fn ct4_historical_secret_path_withholds_existing_vector() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let v1 = "# Notes\n\nordinary paragraph alpha bravo charlie delta echo foxtrot.\n";
     let v2 = "# Notes\n\nCOMPLETELY different body xray yankee zulu whiskey victor.\n";
     fs::write(dir.path().join("notes.md"), v1).unwrap();
@@ -11573,7 +11603,10 @@ fn ct4_historical_secret_path_withholds_existing_vector() {
         .as_str()
         .unwrap()
         .to_owned();
-    let v1_chunk_id = v1_output_ref.strip_prefix("embedding:").unwrap().to_owned();
+    let v1_chunk_id = EmbeddingWorkKey::parse(&v1_output_ref)
+        .expect("embedding task must bind a chunk and contextual embedding identity")
+        .chunk_id()
+        .to_owned();
     // Edit: v1 stays retained by history and may complete on the next pass.
     fs::write(dir.path().join("notes.md"), v2).unwrap();
     approve_embed(&dir, "mock");
@@ -11608,7 +11641,7 @@ fn ct4_historical_secret_path_withholds_existing_vector() {
 /// staying Pending forever or churning replacement tasks.
 #[test]
 fn ct4_bbox_006_scanned_pdf_completes_without_churn() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // %PDF header but no text layer (no `BT`): prepare_units returns empty.
     let mut scan = b"%PDF-1.4\n".to_vec();
     scan.extend((0u32..4000).map(|i| (i.wrapping_mul(97) & 0x7f) as u8 | 0x80));
@@ -11655,7 +11688,7 @@ fn ct4_bbox_006_scanned_pdf_completes_without_churn() {
 /// alias remains reachable and secret-any-path wins until explicit approval.
 #[test]
 fn ct4_historical_secret_alias_keeps_hold_after_public_rename() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let body = "# Notes\n\nalpha bravo charlie delta echo foxtrot golf hotel india juliet.\n";
     fs::write(dir.path().join("password_notes.md"), body).unwrap();
     kio(&dir, &["init"]).assert().success();
@@ -11672,6 +11705,7 @@ fn ct4_historical_secret_alias_keeps_hold_after_public_rename() {
                 .all(|t| t["status"] == "paused" && t["fallback_reason"] == "secrets_tier_b_hold"),
         "R22-1 precondition: the Tier B embedding task must be held: {status}"
     );
+    let original_ref = embedding[0]["output_ref"].as_str().unwrap().to_owned();
     // Rename to a NON-secret live name. The historical secret alias is retained.
     fs::rename(
         dir.path().join("password_notes.md"),
@@ -11681,22 +11715,38 @@ fn ct4_historical_secret_alias_keeps_hold_after_public_rename() {
     json_success_embed(&dir, "mock", &["index", "--online"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     let embedding = tasks_of_type(&status, "embedding");
+    assert_eq!(
+        embedding.len(),
+        2,
+        "both retained filename contexts must remain represented: {status}"
+    );
+    let original = embedding
+        .iter()
+        .find(|task| task["output_ref"] == original_ref)
+        .unwrap();
+    assert_eq!(original["input_path"], "password_notes.md");
+    let renamed = embedding
+        .iter()
+        .find(|task| task["input_path"] == "notes.md")
+        .unwrap();
+    let original_key = EmbeddingWorkKey::parse(&original_ref).unwrap();
+    let renamed_key = EmbeddingWorkKey::parse(renamed["output_ref"].as_str().unwrap()).unwrap();
+    assert_eq!(original_key.chunk_id(), renamed_key.chunk_id());
+    assert_ne!(original_key.embedding_hash(), renamed_key.embedding_hash());
     assert!(
         embedding
             .iter()
             .all(|task| task["status"] == "paused"
                 && task["fallback_reason"] == "secrets_tier_b_hold"),
-        "a reachable historical secret alias must keep the shared task held: {status}"
+        "a reachable historical secret alias must keep both contextual tasks held: {status}"
     );
 }
 
-/// R22-1 NEGATIVE control: while a secret twin is STILL live, the hold must NOT release.
-/// The content-addressed dedup keeps the secret path as the survivor, so the single shared
-/// task stays held even though a byte-identical non-secret twin is also live — and a plain
-/// `batch resume` must not un-hold it either (only `--send-secrets` may).
+/// While a secret twin is live, secret-any-path holds both independently keyed
+/// contexts. Plain `batch resume` must not release either hold.
 #[test]
 fn r22_1b_secret_hold_survives_while_a_secret_twin_is_live() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let body = "# Notes\n\nalpha bravo charlie delta echo foxtrot golf hotel india juliet.\n";
     fs::write(dir.path().join("notes.md"), body).unwrap();
     fs::write(dir.path().join("password_backup.md"), body).unwrap();
@@ -11704,27 +11754,40 @@ fn r22_1b_secret_hold_survives_while_a_secret_twin_is_live() {
     initialize_paid_ledger(&dir);
     approve_embed(&dir, "mock");
     json_success_embed(&dir, "mock", &["index", "--online"]);
-    let assert_single_hold = |status: &Value, when: &str| {
+    let assert_context_holds = |status: &Value, when: &str| {
         let embedding = tasks_of_type(status, "embedding");
         assert_eq!(
             embedding.len(),
-            1,
-            "R22-1b ({when}): byte-identical twins must share exactly one embedding task: {status}"
+            2,
+            "R22-1b ({when}): both filename contexts require independently held tasks: {status}"
         );
+        assert_eq!(
+            embedding
+                .iter()
+                .map(|task| task["input_path"].as_str().unwrap())
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["notes.md", "password_backup.md"])
+        );
+        let keys = embedding
+            .iter()
+            .map(|task| EmbeddingWorkKey::parse(task["output_ref"].as_str().unwrap()).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(keys[0].chunk_id(), keys[1].chunk_id());
+        assert_ne!(keys[0].embedding_hash(), keys[1].embedding_hash());
         assert!(
             embedding
                 .iter()
                 .all(|t| t["status"] == "paused" && t["fallback_reason"] == "secrets_tier_b_hold"),
-            "R22-1b ({when}): the shared task must stay held while a secret twin is live: {status}"
+            "R22-1b ({when}): both contextual tasks must stay held while a secret twin is live: {status}"
         );
     };
-    assert_single_hold(
+    assert_context_holds(
         &json_success_embed(&dir, "mock", &["status"]),
         "after index",
     );
     // A plain `batch resume` must not release the hold (N1: only --send-secrets lifts it).
     json_success_embed(&dir, "mock", &["batch", "resume"]);
-    assert_single_hold(
+    assert_context_holds(
         &json_success_embed(&dir, "mock", &["status"]),
         "after batch resume",
     );
@@ -11745,7 +11808,7 @@ fn r22_2_secret_hold_preserves_a_claim_without_a_ledger() {
 }
 
 fn assert_secret_hold_without_a_ledger(with_retained_claim: bool) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let body = "# Plain\n\nalpha bravo charlie delta echo foxtrot golf hotel india juliet.\n";
     fs::write(dir.path().join("plain.md"), body).unwrap();
     kio(&dir, &["init"]).assert().success();
@@ -11759,6 +11822,10 @@ fn assert_secret_hold_without_a_ledger(with_retained_claim: bool) {
             .any(|t| t["status"] == "pending" && t["fallback_reason"] == "network_opt_in_required"),
         "R22-2 precondition: a Pending/network_opt_in_required embedding task must exist: {status}"
     );
+    let original_ref = tasks_of_type(&status, "embedding")[0]["output_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     const CLAIM_ID: &str = "01992840-5c00-7000-8000-000000000001";
     if with_retained_claim {
         // A scope can retain a task claim when the device ledger is unavailable.
@@ -11786,26 +11853,47 @@ fn assert_secret_hold_without_a_ledger(with_retained_claim: bool) {
     json_success_embed(&dir, "mock", &["index", "--yes"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     let embedding = tasks_of_type(&status, "embedding");
-    let held = embedding
-        .iter()
-        .find(|t| t["status"] == "paused" && t["fallback_reason"] == "secrets_tier_b_hold");
-    assert!(
-        held.is_some(),
-        "R22-2: the existing task must be demoted to a secrets hold: {status}"
+    assert_eq!(
+        embedding.len(),
+        2,
+        "the retained and renamed contexts need separate tasks: {status}"
     );
     assert!(
-        held.unwrap()["input_path"]
-            .as_str()
-            .unwrap()
-            .ends_with("credentials_backup.md"),
-        "R22-2: the demoted hold must name the current secret path: {status}"
-    );
-    assert!(
-        !embedding
+        embedding
             .iter()
-            .any(|t| t["fallback_reason"] == "network_opt_in_required"),
-        "R22-2: no task may remain Pending/network_opt_in_required after the demotion: {status}"
+            .all(|task| task["status"] == "paused"
+                && task["fallback_reason"] == "secrets_tier_b_hold"),
+        "R22-2: every retained context must be held after the secret rename: {status}"
     );
+    let original = embedding
+        .iter()
+        .find(|task| task["output_ref"] == original_ref)
+        .unwrap();
+    assert_eq!(
+        original["input_path"], "plain.md",
+        "the retained task must keep its original input binding: {status}"
+    );
+    let renamed = embedding
+        .iter()
+        .find(|task| task["input_path"] == "credentials_backup.md")
+        .unwrap();
+    assert_ne!(renamed["output_ref"], original["output_ref"]);
+    let original_key = EmbeddingWorkKey::parse(&original_ref).unwrap();
+    let renamed_key = EmbeddingWorkKey::parse(renamed["output_ref"].as_str().unwrap()).unwrap();
+    assert_eq!(original_key.chunk_id(), renamed_key.chunk_id());
+    assert_ne!(original_key.embedding_hash(), renamed_key.embedding_hash());
+    if with_retained_claim {
+        assert_eq!(
+            original["reservation_id"], CLAIM_ID,
+            "old authority must remain on its original context: {status}"
+        );
+        assert_eq!(original["reserved_usd"], 0.25);
+        assert_eq!(original["reserved_month"], "2026-09");
+        assert!(
+            renamed["reservation_id"].is_null(),
+            "new context must not inherit old authority: {status}"
+        );
+    }
     assert!(
         !dir.path()
             .join(".test-data/kio/cost-ledger.sqlite")
@@ -11813,12 +11901,12 @@ fn assert_secret_hold_without_a_ledger(with_retained_claim: bool) {
     );
 }
 
-/// R22-2 NEGATIVE control: a DONE embedding task must NOT be demoted when the path later
-/// becomes a Tier B secret name — its vector is real spend that already exists, so demoting
-/// it would fake outstanding work and strand the stored vector.
+/// A Done task remains terminal for its original contextual identity. Renaming
+/// into a Tier B name creates separate held work; terminal history does not
+/// authorize exposing the chunk's scalar projection.
 #[test]
 fn r22_2b_done_task_is_not_demoted_when_path_becomes_secret() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let body = "# Plain\n\nalpha bravo charlie delta echo foxtrot golf hotel india juliet.\n";
     fs::write(dir.path().join("plain.md"), body).unwrap();
     kio(&dir, &["init"]).assert().success();
@@ -11833,6 +11921,10 @@ fn r22_2b_done_task_is_not_demoted_when_path_becomes_secret() {
             .any(|t| t["status"] == "done"),
         "R22-2b precondition: the embedding task must be Done: {status}"
     );
+    let original_ref = tasks_of_type(&status, "embedding")[0]["output_ref"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     // Rename into a Tier B name and re-index: the Done task must stay Done.
     fs::rename(
         dir.path().join("plain.md"),
@@ -11842,15 +11934,49 @@ fn r22_2b_done_task_is_not_demoted_when_path_becomes_secret() {
     json_success_embed(&dir, "mock", &["index", "--online"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     let embedding = tasks_of_type(&status, "embedding");
-    assert!(
-        embedding.iter().any(|t| t["status"] == "done"),
-        "R22-2b: the Done embedding task must remain Done after the rename-in: {status}"
+    assert_eq!(
+        embedding.len(),
+        2,
+        "rename creates a separate contextual task: {status}"
     );
+    let original = embedding
+        .iter()
+        .find(|task| task["output_ref"] == original_ref)
+        .unwrap();
+    assert_eq!(
+        original["status"], "done",
+        "the original completed context stays terminal: {status}"
+    );
+    assert_eq!(
+        original["input_path"], "plain.md",
+        "the retained task must keep its original input binding: {status}"
+    );
+    let renamed = embedding
+        .iter()
+        .find(|task| task["input_path"] == "credentials_backup.md")
+        .unwrap();
+    assert_eq!(renamed["status"], "paused");
+    assert_eq!(renamed["fallback_reason"], "secrets_tier_b_hold");
     assert!(
-        !embedding
-            .iter()
-            .any(|t| t["fallback_reason"] == "secrets_tier_b_hold"),
-        "R22-2b: a Done task must never be demoted to a secrets hold: {status}"
+        renamed["reservation_id"].is_null(),
+        "new context must not inherit a prior reservation: {status}"
+    );
+    let original_key = EmbeddingWorkKey::parse(&original_ref).unwrap();
+    let renamed_key = EmbeddingWorkKey::parse(renamed["output_ref"].as_str().unwrap()).unwrap();
+    assert_eq!(original_key.chunk_id(), renamed_key.chunk_id());
+    assert_ne!(original_key.embedding_hash(), renamed_key.embedding_hash());
+    kio_index::vec::ensure_registered();
+    let conn = rusqlite::Connection::open(dir.path().join(".kio/index/sqlite.db")).unwrap();
+    let projected: u64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM chunk_vec WHERE chunk_id = ?1",
+            rusqlite::params![original_key.chunk_id()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        projected, 0,
+        "terminal history does not bypass the live secret projection hold"
     );
 }
 
@@ -11858,7 +11984,7 @@ fn r22_2b_done_task_is_not_demoted_when_path_becomes_secret() {
 /// real outstanding historical vector work, not an orphan to retire.
 #[test]
 fn ct4_edited_secret_history_keeps_each_version_held() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     let v1 = "# Secret\n\nalpha bravo charlie delta echo foxtrot golf hotel india.\n";
     let v2 = "# Secret\n\nkilo lima mike november oscar papa quebec romeo sierra.\n";
     let v3 = "# Secret\n\ntango uniform victor whiskey xray yankee zulu juliet.\n";
@@ -11904,7 +12030,7 @@ fn ct4_edited_secret_history_keeps_each_version_held() {
 /// not silently dropped with a false `enriched_ratio: 1.0`. An all-text scope reports 0.
 #[test]
 fn r22_4_unrecognized_binary_is_disclosed_not_silently_dropped() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     // `BM` header + high-bit bytes → a genuine binary (no text layer; folds to
     // application/octet-stream because `.bmp` is not in the MIME table).
     let mut bmp = b"BM".to_vec();
@@ -11933,7 +12059,7 @@ fn r22_4_unrecognized_binary_is_disclosed_not_silently_dropped() {
     let status = json_success(&dir, &["status"]);
     assert_eq!(status["unsupported_inputs"].as_array().unwrap().len(), 1);
     // NEGATIVE control: a scope of only recognized text reports zero.
-    let clean = tempfile::tempdir().unwrap();
+    let clean = canonical_tempdir();
     fs::write(
         clean.path().join("ok.md"),
         "# OK\n\nplain readable body charlie delta echo.\n",
@@ -11949,7 +12075,7 @@ fn r22_4_unrecognized_binary_is_disclosed_not_silently_dropped() {
 
 #[test]
 fn r23_cand_014_status_fails_closed_on_corrupt_unsupported_store() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     kio(&dir, &["init"]).assert().success();
     fs::write(
         dir.path().join(".kio/unsupported-inputs.jsonl"),
@@ -11974,7 +12100,7 @@ fn r23_cand_014_status_fails_closed_on_corrupt_unsupported_store() {
 /// cannot cause an OCR charge.
 #[test]
 fn r22_5_missing_online_bbox_stamp_is_rejected_before_send() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("document.pdf"),
         fake_pdf(&["online markdownize bbox stamp regression"]),
@@ -12036,7 +12162,7 @@ fn r22_5_missing_online_bbox_stamp_is_rejected_before_send() {
 /// revive and execute it. This test used to assert `status=="failed"` throughout.
 #[test]
 fn r22_6_auth_error_markdownize_revives_on_resume_not_retry() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("doc.pdf"),
         fake_pdf(&["認証エラー markdownize 復活の回帰テスト本文です。"]),
@@ -12099,7 +12225,7 @@ fn r22_6_auth_error_markdownize_revives_on_resume_not_retry() {
 /// operator to "raise the budget" instead of `--send-secrets`.
 #[test]
 fn r22_7_budget_paused_false_for_secrets_hold() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = canonical_tempdir();
     fs::write(
         dir.path().join("password_reset_flow.md"),
         "# Reset\n\nalpha bravo charlie delta echo foxtrot golf hotel india juliet.\n",

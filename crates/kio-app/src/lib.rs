@@ -1,8 +1,12 @@
 mod approvals;
 mod batch_recovery_key;
+#[cfg(test)]
+mod contextual_embedding_tests;
 mod cursor_key;
 mod discovery;
+mod embedding_owners;
 mod export;
+use embedding_owners::RetainedEmbeddingChunk;
 mod gc;
 mod grants;
 mod historical_reindex;
@@ -156,13 +160,13 @@ use kio_pipeline::scan::{
     read_bound_verified_scan_input,
 };
 use kio_pipeline::task::{
+    EmbeddingWorkKey, TaskDescriptor, TaskOutputRef, TaskStatus, TaskStore, TaskType,
+    normalized_task_output_ref, validate_task_output_ref,
+};
+use kio_pipeline::task::{
     HoldReason, LEDGER_INITIALIZATION_REQUIRED_REASON, RESULT_UNKNOWN_REASON, RetryErrorKind,
     hold_reason_for_reason, retry_policy, task_can_complete_from_materialized_output,
     task_can_enter_secret_hold, task_status_from_unit_counts,
-};
-use kio_pipeline::task::{
-    TaskDescriptor, TaskOutputRef, TaskStatus, TaskStore, TaskType, normalized_task_output_ref,
-    validate_task_output_ref,
 };
 use kio_pipeline::unsupported::{
     UNSUPPORTED_REASON_RESOLVED, UNSUPPORTED_REASON_UNRECOGNIZED_BINARY,
@@ -1778,6 +1782,7 @@ fn run_index_for_repo_inner(
     let markdown_profile = active_markdownize_profile_for(repo)?;
     let secrets_approved = secrets_send_approved(
         repo,
+        approvals::AdapterRole::Markdown,
         &markdown_profile.adapter_id,
         &markdown_profile.tool_profile_hash,
     );
@@ -9207,9 +9212,7 @@ fn held_secret_embedding_chunk_ids(kio_dir: &Path) -> Result<BTreeSet<String>> {
                 && task.fallback_reason.as_deref() == Some(SECRETS_TIER_B_HOLD)
         })
         .filter_map(|task| {
-            task.output_ref
-                .strip_prefix("embedding:")
-                .map(str::to_owned)
+            EmbeddingWorkKey::parse(&task.output_ref).map(|key| key.chunk_id().to_owned())
         })
         .collect())
 }
@@ -11265,8 +11268,8 @@ struct ReplayedChunkEmbedding {
 
 fn embeddings_from_objects(
     repo: &Repository,
-    conn: &Connection,
     expected_profile: Option<&embedding_store::EmbeddingProfileSummary>,
+    retained_chunks: &[RetainedEmbeddingChunk],
 ) -> Result<Vec<ReplayedChunkEmbedding>> {
     let store = repo.object_store();
     let hashes = store.embedding_hashes()?;
@@ -11278,30 +11281,14 @@ fn embeddings_from_objects(
     // activation: an offline repair must restore the space recorded at index
     // time, while a lock without `embedding` is an explicitly text-only scope.
     let mut chunks_by_text: BTreeMap<String, Vec<(String, Option<String>)>> = BTreeMap::new();
-    {
-        let mut statement = conn
-            .prepare("SELECT chunk_id, text_hash, raw_path FROM chunks")
-            .map_err(|error| KioError::schema(error.to_string()))?;
-        let rows = statement
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                ))
-            })
-            .map_err(|error| KioError::schema(error.to_string()))?;
-        for row in rows {
-            let (chunk_id, text_hash, raw_path) =
-                row.map_err(|error| KioError::schema(error.to_string()))?;
-            let context = raw_path
-                .as_deref()
-                .and_then(embedding_store::chunk_embedding_context);
-            chunks_by_text
-                .entry(text_hash)
-                .or_default()
-                .push((chunk_id, context));
-        }
+    for chunk in retained_chunks {
+        chunks_by_text
+            .entry(chunk.text_hash.clone())
+            .or_default()
+            .push((
+                chunk.chunk_id.clone(),
+                embedding_store::chunk_embedding_context(&chunk.raw_path),
+            ));
     }
 
     let mut replayed = Vec::new();
@@ -11548,7 +11535,7 @@ fn build_sqlite_index_at(
     tree_entries: &[TreeEntryRow],
     retained_instances: &[RetainedNormalizedInstance],
     retained_unit_introductions: &AuthenticatedNormalizedUnits,
-    chunking_config_hash: &str,
+    _chunking_config_hash: &str,
 ) -> Result<()> {
     let kio_dir = repository.kio_dir();
     ensure_no_visible_purge_journal(kio_dir)?;
@@ -11676,20 +11663,41 @@ fn build_sqlite_index_at(
     // `objects/` are the sole vector source.  An old SQLite row may be stale,
     // malformed, or a remnant of a previous contract and must never be carried
     // through a rebuild.
-    let expected_embedding_profile = rebuild_embedding_profile_from_tool_lock(kio_dir)?;
-    for row in embeddings_from_objects(
+    let locked_embedding = rebuild_embedding_entry_from_tool_lock(kio_dir)?;
+    let expected_embedding_profile = locked_embedding.as_ref().map(embedding_profile_summary);
+    let secrets_allowed = match locked_embedding.as_ref() {
+        Some(entry) if persisted_embedding_is_deterministic(entry) => true,
+        Some(entry) => approvals::allowed(
+            repository,
+            approvals::AdapterRole::Embedding,
+            &entry.tool_id,
+            &entry.profile_hash,
+            grants::GrantOperation::SendSecrets,
+        )?,
+        None => false,
+    };
+    let retained_embedding_chunks = embedding_owners::collect_retained_embedding_chunks(
         repository,
         fts.connection(),
+        retained_instances,
+        None,
+        None,
+    )?;
+    let embedding_policy = current_embedding_policy(repository)?;
+    let selected_contexts =
+        selected_embedding_contexts(&retained_embedding_chunks, &embedding_policy)?;
+    for row in embeddings_from_objects(
+        repository,
         expected_embedding_profile.as_ref(),
+        &retained_embedding_chunks,
     )? {
         if !live_chunk_ids.contains(&row.chunk_id) {
             continue;
         }
-        embedding_store::write_chunk_embedding(
+        embedding_store::write_chunk_embedding_source(
             fts.connection(),
             &row.embedding_hash,
             &row.text_hash,
-            &row.chunk_id,
             &row.vector,
             row.dimensions,
             &row.distance,
@@ -11701,25 +11709,22 @@ fn build_sqlite_index_at(
     }
     // R20-10: exclude secret-held chunks so the content-hash rebuild can't link a held
     // (Tier B) chunk to a non-secret content-twin's vector and expose it in vector search.
-    let mut held_chunk_ids = held_secret_embedding_chunk_ids(kio_dir)?;
-    if !secrets_send_approved_in_kio_dir(kio_dir) {
+    let mut held_chunk_ids = BTreeSet::new();
+    if !secrets_allowed {
+        held_chunk_ids.extend(held_secret_embedding_chunk_ids(kio_dir)?);
         held_chunk_ids.extend(
-            retained_history_chunks(
-                fts.connection(),
-                kio_dir,
-                retained_instances,
-                chunking_config_hash,
-                None,
-            )?
-            .into_iter()
-            .filter(|chunk| chunk.requires_secret_approval)
-            .map(|chunk| chunk.chunk_id),
+            retained_embedding_chunks
+                .iter()
+                .filter(|chunk| chunk.requires_secret_approval)
+                .map(|chunk| chunk.chunk_id.clone()),
         );
     }
-    embedding_store::rebuild_chunk_vec(
+    embedding_policy.revalidate().map_err(pipeline_to_kio)?;
+    embedding_store::rebuild_chunk_vec_for_contexts(
         fts.connection(),
         expected_embedding_profile.as_ref(),
         &held_chunk_ids,
+        &selected_contexts,
     )
     .map_err(index_to_kio)?;
     // 04 §4.3's rebuild order ends `… → chunk_vec → image_vec`.
@@ -15711,6 +15716,7 @@ fn run_batch(args: BatchArgs) -> Result<Value> {
     let online_profile = online_markdownize_profile_for(&repo)?;
     let secrets_approved = secrets_send_approved(
         &repo,
+        approvals::AdapterRole::Markdown,
         &online_profile.adapter_id,
         &online_profile.tool_profile_hash,
     );
@@ -16907,11 +16913,12 @@ fn current_embedding_unknown_group_task_ids(
     let policy = current_embedding_policy(repo)?;
     let retained = retained_history_chunks(
         &conn,
-        repo.kio_dir(),
+        repo,
         &retained_instances,
         &chunking_config_hash,
         Some(&policy),
     )?;
+    let retained = bind_embedding_work(retained, profile)?;
     let pending = retained_chunks_without_embedding(&conn, retained, profile)?;
     let plan = plan_embed_batch(&conn, profile, &pending)
         .map_err(|_| KioError::invalid_usage("cannot establish current embedding content group"))?;
@@ -16934,7 +16941,7 @@ fn current_embedding_unknown_group_task_ids(
         let mut group_unknown = Vec::new();
         let mut well_formed = true;
         for member in group.members {
-            let output_ref = embedding_task_output_ref(&member.chunk_id);
+            let output_ref = embedding_task_output_ref(member);
             let Some(member_tasks) = tasks_by_ref.get(&output_ref) else {
                 well_formed = false;
                 break;
@@ -16946,6 +16953,13 @@ fn current_embedding_unknown_group_task_ids(
                 break;
             }
             let task = member_tasks[0];
+            if task.input_hash != member.text_hash
+                || task.changed_unit_keys != [member.chunk_id.clone()]
+            {
+                return Err(KioError::schema(
+                    "embedding recovery task does not match authenticated work",
+                ));
+            }
             if task.status == TaskStatus::Failed
                 && task.fallback_reason.as_deref() == Some(RESULT_UNKNOWN_REASON)
             {
@@ -17410,6 +17424,7 @@ fn execute_pending_markdownize_tasks(
     let online_profile = online_markdownize_profile_for(repo)?;
     let secrets_approved = secrets_send_approved(
         repo,
+        approvals::AdapterRole::Markdown,
         &online_profile.adapter_id,
         &online_profile.tool_profile_hash,
     );
@@ -18142,11 +18157,27 @@ fn persistent_network_allowed(repo: &Repository) -> Result<bool> {
         Some(execution) => kio_adapter::local_ocr_markdownize::profile_for(execution),
         None => online_markdownize_profile_for(repo)?,
     };
-    persistent_network_allowed_for(repo, &profile.adapter_id, &profile.tool_profile_hash)
+    persistent_network_allowed_for(
+        repo,
+        approvals::AdapterRole::Markdown,
+        &profile.adapter_id,
+        &profile.tool_profile_hash,
+    )
 }
 
-fn persistent_network_allowed_for(repo: &Repository, tool_id: &str, profile: &str) -> Result<bool> {
-    approvals::allowed(repo, tool_id, profile, grants::GrantOperation::Network)
+fn persistent_network_allowed_for(
+    repo: &Repository,
+    role: approvals::AdapterRole,
+    tool_id: &str,
+    profile: &str,
+) -> Result<bool> {
+    approvals::allowed(
+        repo,
+        role,
+        tool_id,
+        profile,
+        grants::GrantOperation::Network,
+    )
 }
 
 fn local_markdownize_transport_allowed(
@@ -18157,11 +18188,21 @@ fn local_markdownize_transport_allowed(
     current_embedding_policy(repo)?
         .revalidate()
         .map_err(pipeline_to_kio)?;
-    if !persistent_network_allowed_for(repo, &profile.adapter_id, &profile.tool_profile_hash)? {
+    if !persistent_network_allowed_for(
+        repo,
+        approvals::AdapterRole::Markdown,
+        &profile.adapter_id,
+        &profile.tool_profile_hash,
+    )? {
         return Ok(false);
     }
     Ok(!needs_secret
-        || secrets_send_approved(repo, &profile.adapter_id, &profile.tool_profile_hash))
+        || secrets_send_approved(
+            repo,
+            approvals::AdapterRole::Markdown,
+            &profile.adapter_id,
+            &profile.tool_profile_hash,
+        ))
 }
 
 /// Admission at the last safe boundary before a non-deterministic embedding
@@ -18178,7 +18219,12 @@ fn admit_embedding_transport(
         return Ok(());
     }
     current_policy.revalidate().map_err(pipeline_to_kio)?;
-    if !persistent_network_allowed_for(repo, &profile.tool_id, &profile.profile_hash)? {
+    if !persistent_network_allowed_for(
+        repo,
+        approvals::AdapterRole::Embedding,
+        &profile.tool_id,
+        &profile.profile_hash,
+    )? {
         return Err(KioError::new(
             "KIO-E-ADAPTER-APPROVAL-REQUIRED-001",
             "embedding network approval is no longer current",
@@ -18203,6 +18249,7 @@ fn embedding_secrets_allowed(
 ) -> Result<bool> {
     approvals::allowed(
         repo,
+        approvals::AdapterRole::Embedding,
         &profile.tool_id,
         &profile.profile_hash,
         grants::GrantOperation::SendSecrets,
@@ -18211,10 +18258,17 @@ fn embedding_secrets_allowed(
 
 fn persistent_network_allowed_for_kio_dir(
     kio_dir: &Path,
+    role: approvals::AdapterRole,
     tool_id: &str,
     profile: &str,
 ) -> Result<bool> {
-    approvals::allowed_at(kio_dir, tool_id, profile, grants::GrantOperation::Network)
+    approvals::allowed_at(
+        kio_dir,
+        role,
+        tool_id,
+        profile,
+        grants::GrantOperation::Network,
+    )
 }
 
 /// Query text is supplied by this invocation. One currently authorized eligible
@@ -18229,8 +18283,12 @@ fn embedding_opt_in_for_scopes(
         return Ok(false);
     }
     for exec in exec_scopes {
-        if persistent_network_allowed_for_kio_dir(&exec.target.kio_dir, tool_id, tool_profile_hash)?
-        {
+        if persistent_network_allowed_for_kio_dir(
+            &exec.target.kio_dir,
+            approvals::AdapterRole::Embedding,
+            tool_id,
+            tool_profile_hash,
+        )? {
             return Ok(true);
         }
     }
@@ -18253,7 +18311,12 @@ fn embedding_online_allowed(
         return Ok(false);
     }
     let profile = declared_embedding_profile(execution);
-    persistent_network_allowed_for(repo, &profile.tool_id, &profile.profile_hash)
+    persistent_network_allowed_for(
+        repo,
+        approvals::AdapterRole::Embedding,
+        &profile.tool_id,
+        &profile.profile_hash,
+    )
 }
 
 /// QA21/23: `active_embedding_adapter_id()` plus the adapter's CURRENT
@@ -19548,7 +19611,12 @@ fn compute_query_embedding_page1(
     candidates.sort_by_key(|(scope_id, _)| *scope_id);
     let mut authorizing_repo = None;
     for (_, repo) in candidates {
-        if persistent_network_allowed_for(repo, tool_id, &profile.profile_hash)? {
+        if persistent_network_allowed_for(
+            repo,
+            approvals::AdapterRole::Embedding,
+            tool_id,
+            &profile.profile_hash,
+        )? {
             authorizing_repo = Some(repo);
             break;
         }
@@ -19559,7 +19627,12 @@ fn compute_query_embedding_page1(
     maybe_wait_at_test_search_final_consent_barrier();
     let _authorizing_scope_lock = authorizing_repo.lock_store()?;
     revalidate_current_policy_map(current_policies, false)?;
-    if !persistent_network_allowed_for(authorizing_repo, tool_id, &profile.profile_hash)? {
+    if !persistent_network_allowed_for(
+        authorizing_repo,
+        approvals::AdapterRole::Embedding,
+        tool_id,
+        &profile.profile_hash,
+    )? {
         return Ok(Some(QueryEmbeddingOutcome::NotAuthorized));
     }
 
@@ -19770,162 +19843,104 @@ fn embedding_execution_labels(mode: ExecutionMode) -> (&'static str, &'static st
     }
 }
 
-/// A retained-history chunk eligible for the effective current config.
+/// Context-qualified unit of task lifecycle work. Raw retained candidates are
+/// bound only after the current embedding profile is known.
 #[derive(Clone)]
 struct EmbeddableChunk {
-    chunk_id: String,
-    text: String,
-    text_hash: String,
-    raw_path: String,
-    requires_secret_approval: bool,
+    retained: RetainedEmbeddingChunk,
+    work_key: EmbeddingWorkKey,
 }
 
-/// Materialize the current-config chunk set for every exact normalized identity
-/// retained by the bounded CAS graph. Purge barriers are applied here, before
-/// content-vector reuse or any adapter enqueue can observe the chunk text.
+impl std::ops::Deref for EmbeddableChunk {
+    type Target = RetainedEmbeddingChunk;
+    fn deref(&self) -> &Self::Target {
+        &self.retained
+    }
+}
+
+impl AsRef<RetainedEmbeddingChunk> for EmbeddableChunk {
+    fn as_ref(&self) -> &RetainedEmbeddingChunk {
+        &self.retained
+    }
+}
+impl AsRef<RetainedEmbeddingChunk> for RetainedEmbeddingChunk {
+    fn as_ref(&self) -> &RetainedEmbeddingChunk {
+        self
+    }
+}
+
+fn bind_embedding_work(
+    candidates: Vec<RetainedEmbeddingChunk>,
+    profile: &DeclaredEmbeddingProfile,
+) -> Result<Vec<EmbeddableChunk>> {
+    let mut work = BTreeMap::new();
+    for retained in candidates {
+        let hash = chunk_embedding_hash(&retained, profile)?;
+        let work_key = EmbeddingWorkKey::new(&retained.chunk_id, &hash)
+            .ok_or_else(|| KioError::schema("invalid contextual embedding work identity"))?;
+        work.entry(work_key.clone())
+            .or_insert(EmbeddableChunk { retained, work_key });
+    }
+    Ok(work.into_values().collect())
+}
+
 fn retained_history_chunks(
     conn: &Connection,
-    kio_dir: &Path,
+    repo: &Repository,
     retained_instances: &[RetainedNormalizedInstance],
     chunking_config_hash: &str,
     current_policy: Option<&CurrentPolicyEvaluator>,
-) -> Result<Vec<EmbeddableChunk>> {
-    let purge = PurgeState::open(kio_dir)?;
-    let in_progress = purge
-        .read_journal()?
-        .map(|journal| {
-            journal
-                .target_raw_hashes
-                .into_iter()
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
-    let mut blocked_raw_hashes = in_progress;
-    let raw_hashes = retained_instances
-        .iter()
-        .map(|instance| instance.raw_hash.clone())
-        .collect::<BTreeSet<_>>();
-    // R23-10 (05-runtime.md §3.5 L813/L934): `purge.read_tombstone(...).is_some()`
-    // blocks on marker EXISTENCE (any tombstone at all, even a
-    // retired/resurrected one), not the canonical final event across both
-    // markers -- `purge_blocks_rebuild_raw` is the same canonical-final-event
-    // predicate the rest of the historical-reindex/embedding path already
-    // uses (`historical_reindex::retained_history_instances`,
-    // `historical_reindex::project_selected_snapshot`), so a resurrected
-    // raw_hash is not excluded from retained-history embedding forever after
-    // its first purge.
-    for raw_hash in raw_hashes {
-        if purge_blocks_rebuild_raw(kio_dir, &raw_hash)? {
-            blocked_raw_hashes.insert(raw_hash);
-        }
-    }
+) -> Result<Vec<RetainedEmbeddingChunk>> {
+    embedding_owners::collect_retained_embedding_chunks(
+        repo,
+        conn,
+        retained_instances,
+        Some(chunking_config_hash),
+        current_policy,
+    )
+}
 
-    let mut identities = BTreeMap::<(String, String, u64), (BTreeSet<String>, String)>::new();
-    for instance in retained_instances
-        .iter()
-        .filter(|instance| !blocked_raw_hashes.contains(&instance.raw_hash))
-    {
-        let identity = (
-            instance.raw_hash.clone(),
-            instance.normalize.tool_profile_hash.clone(),
-            instance.normalize.r#gen,
-        );
-        identities
-            .entry(identity)
-            .and_modify(|(paths, embedding_path)| {
-                paths.extend(instance.policy_paths.iter().cloned());
-                let existing_secret = classify_secret(embedding_path).is_some();
-                let candidate_secret = classify_secret(&instance.embedding_path).is_some();
-                if (candidate_secret && !existing_secret)
-                    || (candidate_secret == existing_secret
-                        && instance.embedding_path.as_bytes() < embedding_path.as_bytes())
+/// HEAD aliases win over retained history; path order breaks ties. The
+/// collector has already authenticated every candidate against its exact
+/// pinned normalized unit. Creation provenance is never modified.
+fn selected_embedding_contexts(
+    candidates: &[RetainedEmbeddingChunk],
+    policy: &CurrentPolicyEvaluator,
+) -> Result<BTreeMap<String, Option<String>>> {
+    policy.revalidate().map_err(pipeline_to_kio)?;
+    let mut selected = BTreeMap::<String, &RetainedEmbeddingChunk>::new();
+    for candidate in candidates {
+        if !policy
+            .allows_path(&candidate.raw_path)
+            .map_err(pipeline_to_kio)?
+        {
+            continue;
+        }
+        selected
+            .entry(candidate.chunk_id.clone())
+            .and_modify(|old| {
+                if (!candidate.is_head_owner, candidate.raw_path.as_bytes())
+                    < (!old.is_head_owner, old.raw_path.as_bytes())
                 {
-                    *embedding_path = instance.embedding_path.clone();
+                    *old = candidate;
                 }
             })
-            .or_insert_with(|| {
-                (
-                    instance.policy_paths.clone(),
-                    instance.embedding_path.clone(),
-                )
-            });
+            .or_insert(candidate);
     }
-    let mut statement = conn
-        .prepare(
-            "SELECT c.chunk_id, c.text, c.text_hash,
-                    c.raw_hash, c.tool_profile_hash, c.gen
-             FROM chunks c
-             WHERE EXISTS (
-                 SELECT 1 FROM chunk_publications p
-                 WHERE p.chunk_id = c.chunk_id
-                   AND p.chunking_config_hash = ?1
-             )
-               AND EXISTS (
-                   SELECT 1 FROM chunk_config_generations cg
-                   WHERE cg.chunk_id = c.chunk_id
-                     AND cg.chunking_config_hash = ?1
-               )
-             ORDER BY c.rowid",
-        )
-        .map_err(|error| KioError::schema(error.to_string()))?;
-    let rows = statement
-        .query_map(rusqlite::params![chunking_config_hash], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, u64>(5)?,
-            ))
+    Ok(selected
+        .into_iter()
+        .map(|(id, candidate)| {
+            (
+                id,
+                embedding_store::chunk_embedding_context(&candidate.raw_path),
+            )
         })
-        .map_err(|error| KioError::schema(error.to_string()))?;
-    let mut chunks = Vec::new();
-    for row in rows {
-        let (chunk_id, text, text_hash, raw_hash, tool_profile_hash, r#gen) =
-            row.map_err(|error| KioError::schema(error.to_string()))?;
-        let Some((policy_paths, embedding_path)) =
-            identities.get(&(raw_hash, tool_profile_hash, r#gen))
-        else {
-            continue;
-        };
-        // Current authority is checked before reuse, task enqueue, or any
-        // ledger admission.  A deleted historical name remains a valid policy
-        // subject; `allows_path` intentionally evaluates its name only.
-        let raw_path = match current_policy {
-            Some(current_policy) => {
-                let mut allowed_owner = None;
-                for path in policy_paths {
-                    if current_policy.allows_path(path).map_err(pipeline_to_kio)? {
-                        allowed_owner.get_or_insert_with(|| path.clone());
-                    }
-                }
-                let Some(raw_path) = allowed_owner else {
-                    continue;
-                };
-                raw_path
-            }
-            // Rebuild-only callers do not perform any send/reuse/enqueue work.
-            // Retain the existing conservative secret alias choice there.
-            None => embedding_path.clone(),
-        };
-        chunks.push(EmbeddableChunk {
-            chunk_id,
-            text,
-            text_hash,
-            raw_path,
-            // A non-secret allowed alias must not erase the hold attached to a
-            // secret alias of identical content.
-            requires_secret_approval: policy_paths
-                .iter()
-                .any(|path| classify_secret(path).is_some()),
-        });
-    }
-    Ok(chunks)
+        .collect())
 }
 
 /// Generate chunk embeddings for the scope after the SQLite index is rebuilt
-/// (04 §4.3 / 07 §5.3). Enqueues one `TaskType::Embedding` task per pending chunk,
+/// (04 §4.3 / 07 §5.3). Enqueues one `TaskType::Embedding` task per pending
+/// `(chunk_id, embedding_hash)` contextual work item,
 /// then — if the online opt-in and budget allow — embeds them (batched), writing
 /// the `embeddings` rows (source of truth) and `chunk_vec` (derived KNN copy),
 /// charging the cost ledger under `adapter_kind="embedding"`. Offline leaves tasks
@@ -20043,32 +20058,100 @@ fn run_embedding_enrichment_for_instances(
     let current_policy = current_embedding_policy(repo)?;
     let retained_chunks = retained_history_chunks(
         &conn,
-        repo.kio_dir(),
+        repo,
         retained_instances,
         &chunking_config_hash,
         Some(&current_policy),
     )?;
-    let active_chunk_ids = retained_chunks
+    let projection_instances_owned;
+    let projection_instances = if selected_instances.is_some() {
+        projection_instances_owned = retained_history_instances(repo.kio_dir(), &head)?;
+        &projection_instances_owned
+    } else {
+        retained_instances
+    };
+    let projection_chunks = embedding_owners::collect_retained_embedding_chunks(
+        repo,
+        &conn,
+        projection_instances,
+        None,
+        Some(&current_policy),
+    )?;
+    let selected_contexts = selected_embedding_contexts(&projection_chunks, &current_policy)?;
+    let projection_chunks = bind_embedding_work(projection_chunks, &profile)?;
+    let retained_chunks = bind_embedding_work(retained_chunks, &profile)?;
+    let active_work_refs = retained_chunks
         .iter()
-        .map(|chunk| chunk.chunk_id.clone())
+        .map(|chunk| chunk.work_key.output_ref())
         .collect::<BTreeSet<_>>();
     // The online sync ledger identifies a provider call by the exact
     // contextualized embedding input, not the task's bare text hash. Keep the
     // same identity available to crash reconciliation, where an embedded
     // chunk is intentionally absent from `pending`.
-    let active_embedding_hashes_by_chunk_id = retained_chunks
+    let active_embedding_hashes_by_work_ref = retained_chunks
         .iter()
         .map(|chunk| {
-            Ok((
-                chunk.chunk_id.clone(),
-                chunk_embedding_hash(chunk, &profile)?,
-            ))
+            (
+                chunk.work_key.output_ref(),
+                chunk.work_key.embedding_hash().to_owned(),
+            )
         })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    let pending = retained_chunks_without_embedding(&conn, retained_chunks.clone(), &profile)?;
-
+        .collect::<BTreeMap<_, _>>();
     let task_store = TaskStore::new(repo.kio_dir());
+    validate_embedding_task_bindings(&task_store, &retained_chunks)?;
+    let secrets_approved = embedding_secrets_allowed(repo, &profile)?;
+    let mut pending = retained_chunks_without_embedding(&conn, retained_chunks.clone(), &profile)?;
+    let existing_tasks = task_store.all().map_err(pipeline_to_kio)?;
+    // Fresh bookkeeping must never revive, complete, or restamp an existing
+    // task (including retired records); those retain their recovery path.
+    let all_task_refs = existing_tasks
+        .iter()
+        .map(|task| task.output_ref.as_str())
+        .collect::<BTreeSet<_>>();
+    let existing_task_refs = existing_tasks
+        .iter()
+        .filter(|task| {
+            task.task_type == TaskType::Embedding
+                && task.fallback_reason.as_deref() != Some(RETIRED_NON_LIVE)
+        })
+        .map(|task| task.output_ref.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut pending_keys = pending
+        .iter()
+        .map(|chunk| chunk.work_key.clone())
+        .collect::<BTreeSet<_>>();
+    let mut fresh_cached = Vec::new();
+    for chunk in &retained_chunks {
+        let output_ref = chunk.work_key.output_ref();
+        let secret_hold = secret_embedding_hold_required(
+            execution.execution_mode(),
+            secrets_approved,
+            chunk.requires_secret_approval,
+        );
+        if !pending_keys.contains(&chunk.work_key)
+            && !all_task_refs.contains(output_ref.as_str())
+            && !secret_hold
+        {
+            // The exact contextual vector/association is already materialized.
+            // A new chunk identity needs a Done record, not another execution.
+            fresh_cached.push(chunk.clone());
+        } else if (!existing_task_refs.contains(output_ref.as_str()) || secret_hold)
+            && pending_keys.insert(chunk.work_key.clone())
+        {
+            // Cache presence never authorizes a currently secret-tainted alias.
+            pending.push(chunk.clone());
+        }
+    }
     let now = now_utc_seconds();
+    if !fresh_cached.is_empty() {
+        current_policy.revalidate().map_err(pipeline_to_kio)?;
+        enqueue_embedding_tasks(&task_store, repo, &fresh_cached, online, &now)?;
+        let mut transitions = BTreeMap::new();
+        record_embedding_transitions(&mut transitions, &fresh_cached, embedding_done_transition());
+        // Only these genuinely fresh, selected refs are completed. In
+        // particular, a historical pass cannot retire unrelated scope work.
+        apply_embedding_transitions(&task_store, &transitions, &now, &BTreeMap::new())?;
+    }
     // R12-3: reconcile task accounting for chunks that ARE embedded but whose task a
     // crash stranded Pending/Running (chunk_vec committed per batch, the task Done
     // write-back deferred to after the loop — R11-5). Must run BEFORE the
@@ -20081,8 +20164,8 @@ fn run_embedding_enrichment_for_instances(
             &task_store,
             ledger.as_ref(),
             EmbeddingReconcileContext {
-                active_chunk_ids: &active_chunk_ids,
-                active_embedding_hashes_by_chunk_id: &active_embedding_hashes_by_chunk_id,
+                active_work_refs: &active_work_refs,
+                active_embedding_hashes_by_work_ref: &active_embedding_hashes_by_work_ref,
                 pending: &pending,
                 now: &now,
                 profile_hash: &profile.profile_hash,
@@ -20090,7 +20173,6 @@ fn run_embedding_enrichment_for_instances(
             },
         )?;
     }
-    let secrets_approved = embedding_secrets_allowed(repo, &profile)?;
     // Image objects are embedded on their own schedule, before the chunk
     // early-return below: a corpus can have every chunk embedded and still have
     // images outstanding — the first index after an image-capable adapter is
@@ -20101,7 +20183,31 @@ fn run_embedding_enrichment_for_instances(
         execution,
         profile: &profile,
         current_policy: &current_policy,
+        projection: EmbeddingProjection {
+            repo,
+            policy: &current_policy,
+            selected_contexts: &selected_contexts,
+            invalidated: std::cell::Cell::new(false),
+        },
     };
+    let mut projection_held = BTreeSet::new();
+    if secret_embedding_hold_required(execution.execution_mode(), secrets_approved, true) {
+        projection_held.extend(held_secret_embedding_chunk_ids(repo.kio_dir())?);
+        projection_held.extend(
+            projection_chunks
+                .iter()
+                .filter(|chunk| chunk.requires_secret_approval)
+                .map(|chunk| chunk.chunk_id.clone()),
+        );
+    }
+    refresh_embedding_projection(
+        repo,
+        &conn,
+        &projection_chunks,
+        &profile,
+        &embedding_context.projection,
+        &projection_held,
+    )?;
     run_image_embedding_enrichment(
         &embedding_context,
         &conn,
@@ -20216,6 +20322,7 @@ fn run_embedding_enrichment_for_instances(
             &budget_caps,
             override_budget,
             &current_policy,
+            &embedding_context.projection,
             &mut batch_transitions,
             &mut replica,
         )? {
@@ -20229,6 +20336,7 @@ fn run_embedding_enrichment_for_instances(
             // them too, rotation included: a content-addressed reuse hit writes
             // `chunk_vec` with no adapter call and no rebuild, and a vector
             // appearing is exactly the kind of change LC25 retires cursors for.
+            current_policy.revalidate().map_err(pipeline_to_kio)?;
             publish_in_place_delta(repo.kio_dir(), replica_before.as_deref(), &replica)?;
             return Ok(submitted);
         }
@@ -20286,7 +20394,13 @@ fn run_embedding_enrichment_for_instances(
         // front so an API failure on the *sent* portion can never contaminate an
         // already-materialized (chunk_vec written) chunk into a stuck Failed task.
         if !plan.reuse.is_empty() {
-            match link_reused_chunks(&conn, &profile, &plan.reuse, &mut replica) {
+            match link_reused_chunks(
+                &conn,
+                &profile,
+                &plan.reuse,
+                &embedding_context.projection,
+                &mut replica,
+            ) {
                 Ok(()) => {
                     record_embedding_transitions(
                         &mut transitions,
@@ -20325,7 +20439,7 @@ fn run_embedding_enrichment_for_instances(
         }
         let mut charge_by_group: Vec<GroupCharge> = Vec::with_capacity(plan.to_send.len());
         for group in &plan.to_send {
-            let output_ref = embedding_task_output_ref(&group.representative.chunk_id);
+            let output_ref = embedding_task_output_ref(group.representative);
             if !embedding_tasks_by_ref.contains_key(&output_ref) {
                 return Err(KioError::schema(
                     "embedding send has no matching task reservation owner",
@@ -20410,6 +20524,14 @@ fn run_embedding_enrichment_for_instances(
                     );
                     continue;
                 }
+                validate_embedding_aliases(
+                    &current_policy,
+                    &profile,
+                    group.members.iter().copied(),
+                )
+                .map_err(|_| {
+                    KioError::schema("embedding owner policy changed before reservation")
+                })?;
                 admit_embedding_transport(
                     repo,
                     execution,
@@ -20483,7 +20605,7 @@ fn run_embedding_enrichment_for_instances(
                         // `task.reservation_id` without reconstructing the key from
                         // possibly-since-changed config.
                         reserved_by_ref.insert(
-                            embedding_task_output_ref(&group.representative.chunk_id),
+                            embedding_task_output_ref(group.representative),
                             (reserved_usd, month.clone(), intent_token.clone()),
                         );
                     }
@@ -20567,7 +20689,11 @@ fn run_embedding_enrichment_for_instances(
     // reached from `kio batch resume` when the batch lane is unavailable, and
     // there nothing else rotates at all — leaving both the cursor contract and
     // the replica's only staleness signal on a stamp that never moves.
+    current_policy.revalidate().map_err(pipeline_to_kio)?;
     publish_in_place_delta(repo.kio_dir(), replica_before.as_deref(), &replica)?;
+    if outcome.executed > 0 && replica.is_empty() {
+        write_through_projection_or_log_for_repo(repo);
+    }
     Ok(outcome)
 }
 
@@ -20694,7 +20820,7 @@ fn record_embedding_transitions<'a>(
     transition: EmbeddingTransition,
 ) {
     for chunk in chunks {
-        transitions.insert(embedding_task_output_ref(&chunk.chunk_id), transition);
+        transitions.insert(embedding_task_output_ref(chunk), transition);
     }
 }
 
@@ -20786,6 +20912,165 @@ struct EmbeddingExecutionContext<'a> {
     execution: EmbeddingExecution,
     profile: &'a DeclaredEmbeddingProfile,
     current_policy: &'a CurrentPolicyEvaluator,
+    projection: EmbeddingProjection<'a>,
+}
+
+/// A frozen policy and the deterministic scalar choice derived from retained
+/// owner bindings. Revalidation is required at every live publication edge.
+struct EmbeddingProjection<'a> {
+    repo: &'a Repository,
+    policy: &'a CurrentPolicyEvaluator,
+    selected_contexts: &'a BTreeMap<String, Option<String>>,
+    invalidated: std::cell::Cell<bool>,
+}
+
+fn validate_embedding_aliases<'a>(
+    policy: &CurrentPolicyEvaluator,
+    profile: &DeclaredEmbeddingProfile,
+    chunks: impl IntoIterator<Item = &'a EmbeddableChunk>,
+) -> std::result::Result<(), TaskExecutionFailure> {
+    let denied = || TaskExecutionFailure {
+        retry_kind: RetryErrorKind::AuthError,
+        retry_after_ms: None,
+    };
+    policy.revalidate().map_err(|_| denied())?;
+    for chunk in chunks {
+        if chunk.work_key.chunk_id() != chunk.chunk_id
+            || chunk_embedding_hash(chunk, profile).map_err(|_| TaskExecutionFailure {
+                retry_kind: RetryErrorKind::ContractViolation,
+                retry_after_ms: None,
+            })? != chunk.work_key.embedding_hash()
+        {
+            return Err(TaskExecutionFailure {
+                retry_kind: RetryErrorKind::ContractViolation,
+                retry_after_ms: None,
+            });
+        }
+        if !policy.allows_path(&chunk.raw_path).map_err(|_| denied())? {
+            return Err(denied());
+        }
+    }
+    Ok(())
+}
+
+/// A vector writer must not mutate source scalars while an old Ready header
+/// can remain observable. Unlike best-effort repair logging, failure here
+/// aborts before the source mutation.
+fn invalidate_embedding_projection(repo: &Repository) -> Result<()> {
+    let scope_id = repo.scope_identity()?.scope_id;
+    let mut replica =
+        kio_index::aggregator::Aggregator::open(&aggregator_path()).map_err(index_to_kio)?;
+    if let Some(mut header) = replica.scope_header(&scope_id).map_err(index_to_kio)? {
+        header.index_status = kio_index::aggregator::AggIndexStatus::Rebuilding;
+        replica
+            .update_scope_header(&scope_id, &header, replica_now_ms())
+            .map_err(index_to_kio)?;
+    }
+    rotate_index_generation_unconditionally(repo.kio_dir())
+}
+
+fn invalidate_embedding_projection_once(projection: &EmbeddingProjection<'_>) -> Result<()> {
+    if !projection.invalidated.get() {
+        invalidate_embedding_projection(projection.repo)?;
+        projection.invalidated.set(true);
+    }
+    Ok(())
+}
+
+/// Scalar equality alone cannot certify publication: a prior writer may have
+/// committed vectors and stopped while the replica was still Rebuilding.
+/// Cache probe failures take the ordinary best-effort publication path below.
+fn embedding_replica_projection_is_current(repo: &Repository) -> bool {
+    let Some((scope_id, generation)) = replica_scope_stamp(repo.kio_dir()) else {
+        return false;
+    };
+    let Ok(head) = repo.head_commit_hash() else {
+        return false;
+    };
+    let config = match head.as_deref() {
+        Some(head) => match snapshot_chunking_config_hash(repo, head) {
+            Ok(config) => Some(config),
+            Err(_) => return false,
+        },
+        None => None,
+    };
+    let Ok(replica) = kio_index::aggregator::Aggregator::open(&aggregator_path()) else {
+        return false;
+    };
+    let Ok(Some(header)) = replica.scope_header(&scope_id) else {
+        return false;
+    };
+    header.index_status == kio_index::aggregator::AggIndexStatus::Ready
+        && header.index_generation == generation
+        && header.current_snapshot_commit == head
+        && header.current_chunking_config_hash == config
+}
+
+/// Refresh cached scalar choices before task completion is considered. Full
+/// publication is required because an owner-policy change can remove vectors;
+/// the additive fast-path delta cannot describe that mutation.
+fn refresh_embedding_projection(
+    repo: &Repository,
+    conn: &Connection,
+    chunks: &[EmbeddableChunk],
+    profile: &DeclaredEmbeddingProfile,
+    projection: &EmbeddingProjection<'_>,
+    held: &BTreeSet<String>,
+) -> Result<()> {
+    projection.policy.revalidate().map_err(pipeline_to_kio)?;
+    let mut expected = BTreeMap::new();
+    for chunk in chunks {
+        if held.contains(&chunk.chunk_id) || !selected_embedding_member(chunk, projection) {
+            continue;
+        }
+        if let Some(bytes) = embedding_store::content_vector(conn, chunk.work_key.embedding_hash())
+            .map_err(index_to_kio)?
+        {
+            expected.insert(chunk.chunk_id.clone(), bytes);
+        }
+    }
+    let existing = conn
+        .prepare("SELECT chunk_id, embedding FROM chunk_vec")
+        .map_err(|e| KioError::schema(e.to_string()))?
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| KioError::schema(e.to_string()))?
+        .collect::<std::result::Result<BTreeMap<_, _>, _>>()
+        .map_err(|e| KioError::schema(e.to_string()))?;
+    if expected == existing {
+        if !embedding_replica_projection_is_current(repo) {
+            projection.policy.revalidate().map_err(pipeline_to_kio)?;
+            write_through_projection_or_log_for_repo(repo);
+        }
+        return Ok(());
+    }
+    // Invalidate readiness and cursor generation before the first scalar write.
+    invalidate_embedding_projection(repo)?;
+    let summary = embedding_store::EmbeddingProfileSummary {
+        dimensions: profile.dimensions,
+        distance: profile.distance.clone(),
+        modality: profile.modality.clone(),
+        profile_hash: profile.profile_hash.clone(),
+    };
+    embedding_store::rebuild_chunk_vec_for_contexts(
+        conn,
+        Some(&summary),
+        held,
+        projection.selected_contexts,
+    )
+    .map_err(index_to_kio)?;
+    projection.policy.revalidate().map_err(pipeline_to_kio)?;
+    write_through_projection_or_log_for_repo(repo);
+    Ok(())
+}
+
+fn selected_embedding_member(
+    chunk: &EmbeddableChunk,
+    projection: &EmbeddingProjection<'_>,
+) -> bool {
+    projection.selected_contexts.get(&chunk.chunk_id)
+        == Some(&embedding_store::chunk_embedding_context(&chunk.raw_path))
 }
 
 #[derive(Clone)]
@@ -20837,9 +21122,22 @@ fn link_reused_chunks(
     conn: &Connection,
     profile: &DeclaredEmbeddingProfile,
     reuse: &[(&EmbeddableChunk, Vec<u8>)],
+    projection: &EmbeddingProjection<'_>,
     replica: &mut kio_index::aggregator::ScopeDelta,
 ) -> std::result::Result<(), TaskExecutionFailure> {
+    validate_embedding_aliases(
+        projection.policy,
+        profile,
+        reuse.iter().map(|(chunk, _)| *chunk),
+    )?;
     for (chunk, bytes) in reuse {
+        if !selected_embedding_member(chunk, projection) {
+            continue;
+        }
+        invalidate_embedding_projection_once(projection).map_err(|_| TaskExecutionFailure {
+            retry_kind: RetryErrorKind::ContractViolation,
+            retry_after_ms: None,
+        })?;
         let linked =
             embedding_store::link_chunk_vec(conn, &chunk.chunk_id, bytes, profile.dimensions)
                 .map_err(|_| TaskExecutionFailure {
@@ -20885,9 +21183,14 @@ fn send_embed_group(
     // the humanized filename context prepended to the chunk body. Every member
     // of a group shares one `embedding_hash` = one `(text_hash, context,
     // profile)`, so the representative's context is the whole group's context.
+    validate_embedding_aliases(
+        embedding.current_policy,
+        embedding.profile,
+        group.members.iter().copied(),
+    )?;
     let context = embedding_store::chunk_embedding_context(&group.representative.raw_path);
     let items = vec![EmbeddingItem::text(
-        group.representative.chunk_id.clone(),
+        group.embedding_hash.clone(),
         embedding_store::contextualized_embedding_input(
             context.as_deref(),
             &group.representative.text,
@@ -20917,11 +21220,10 @@ fn send_embed_group(
         EmbeddingInputType::MarkdownChunk,
         idempotency_token,
     )?;
-    let chunk = group.representative;
     let Some(vector) = outcome
         .vectors
         .iter()
-        .find(|vector| vector.id == chunk.chunk_id)
+        .find(|vector| vector.id == group.embedding_hash)
     else {
         return Err(TaskExecutionFailure {
             retry_kind: RetryErrorKind::ContractViolation,
@@ -20930,11 +21232,11 @@ fn send_embed_group(
     };
     persist_group_vector(
         conn,
-        embedding.repo,
         embedding.profile,
         group,
         &vector.vector,
         &BTreeSet::new(),
+        &embedding.projection,
         replica,
     )?;
     Ok(outcome.usage)
@@ -20955,14 +21257,26 @@ fn send_embed_group(
 /// The caller flushes once, with `write_through_delta`.
 fn persist_group_vector(
     conn: &Connection,
-    repo: &Repository,
     profile: &DeclaredEmbeddingProfile,
     group: &EmbeddingSendGroup<'_>,
     vector: &[f32],
     held: &BTreeSet<String>,
+    projection: &EmbeddingProjection<'_>,
     replica: &mut kio_index::aggregator::ScopeDelta,
 ) -> std::result::Result<(), TaskExecutionFailure> {
+    let repo = projection.repo;
     let chunk = group.representative;
+    if chunk_embedding_hash(chunk, profile).map_err(|_| TaskExecutionFailure {
+        retry_kind: RetryErrorKind::ContractViolation,
+        retry_after_ms: None,
+    })? != group.embedding_hash
+        || chunk.work_key.embedding_hash() != group.embedding_hash
+    {
+        return Err(TaskExecutionFailure {
+            retry_kind: RetryErrorKind::ContractViolation,
+            retry_after_ms: None,
+        });
+    }
     let bytes = f32_to_le_bytes(vector);
     let context_key = embedding_store::chunk_embedding_context(&chunk.raw_path);
     // CAS first, table second (04 §4.3: `objects/` → `embeddings` → `chunk_vec`).
@@ -20981,11 +21295,21 @@ fn persist_group_vector(
         retry_kind: RetryErrorKind::ContractViolation,
         retry_after_ms: None,
     })?;
-    embedding_store::write_chunk_embedding(
+    projection
+        .policy
+        .revalidate()
+        .map_err(|_| TaskExecutionFailure {
+            retry_kind: RetryErrorKind::AuthError,
+            retry_after_ms: None,
+        })?;
+    invalidate_embedding_projection_once(projection).map_err(|_| TaskExecutionFailure {
+        retry_kind: RetryErrorKind::ContractViolation,
+        retry_after_ms: None,
+    })?;
+    embedding_store::write_chunk_embedding_source(
         conn,
         &group.embedding_hash,
         &chunk.text_hash,
-        &chunk.chunk_id,
         &bytes,
         profile.dimensions,
         &profile.distance,
@@ -20997,10 +21321,15 @@ fn persist_group_vector(
         retry_kind: RetryErrorKind::ContractViolation,
         retry_after_ms: None,
     })?;
+    validate_embedding_aliases(projection.policy, profile, group.members.iter().copied())?;
     let linked = embedding_store::link_chunk_vecs_to_content_vector(
         conn,
         &group.embedding_hash,
-        group.members.iter().map(|member| member.chunk_id.as_str()),
+        group
+            .members
+            .iter()
+            .filter(|member| selected_embedding_member(member, projection))
+            .map(|member| member.chunk_id.as_str()),
         held,
     )
     .map_err(|_| TaskExecutionFailure {
@@ -21056,7 +21385,7 @@ const EMBEDDING_BATCH_JOB_MAX_MEMBERS: usize = 512;
 /// pass until the budget cap hard-stopped the scope.
 ///
 /// Counted on `contract_violation_count`, NOT on `attempts`, specifically
-/// because **`kio batch reset-violations` already exists as the operator escape
+/// because **`kio batch retry --reset-violations <selector> --yes` already exists as the operator escape
 /// hatch for it** (CL62-CL68) and nothing resets `attempts`. Bounding on
 /// `attempts` would have made an exhausted member set permanently
 /// unsubmittable — a dead end with no way out. 07 §5.3 already routes a
@@ -21122,6 +21451,25 @@ fn reported_prompt_tokens(
 /// different selection is a different task, and any member already embedded by
 /// the earlier job drops out through content-addressed reuse before it is ever
 /// selected again.
+const EMBEDDING_BATCH_RESULT_CONTRACT_ERROR: &str =
+    "embedding batch result violates the complete response contract";
+
+fn embedding_batch_results_match_job(
+    results: &[kio_adapter::gemini_batch_client::GeminiBatchEmbedOutput],
+    input_hash: &str,
+) -> bool {
+    let keys = results
+        .iter()
+        .map(|result| result.key.clone())
+        .collect::<BTreeSet<_>>();
+    !results.is_empty()
+        && keys.len() == results.len()
+        && results
+            .iter()
+            .all(|result| is_hash(&result.key) && result.values.is_some() && result.error.is_none())
+        && embedding_job_input_hash(&keys) == input_hash
+}
+
 fn embedding_job_input_hash(embedding_hashes: &BTreeSet<String>) -> String {
     let joined = embedding_hashes
         .iter()
@@ -21129,6 +21477,35 @@ fn embedding_job_input_hash(embedding_hashes: &BTreeSet<String>) -> String {
         .collect::<Vec<_>>()
         .join("\n");
     kio_core::cas::hash_bytes(joined.as_bytes())
+}
+
+/// Validate the entire response before the caller can persist its first line.
+/// An old profile is settlement-only; never reinterpret its dimensions under
+/// the currently configured vector space.
+fn validated_embedding_batch_vectors(
+    results: &[kio_adapter::gemini_batch_client::GeminiBatchEmbedOutput],
+    input_hash: &str,
+    current_profile: Option<&DeclaredEmbeddingProfile>,
+) -> Result<BTreeMap<String, Vec<f32>>> {
+    if !embedding_batch_results_match_job(results, input_hash) {
+        return Err(KioError::schema(EMBEDDING_BATCH_RESULT_CONTRACT_ERROR));
+    }
+    let Some(profile) = current_profile else {
+        return Ok(BTreeMap::new());
+    };
+    results
+        .iter()
+        .map(|result| {
+            normalize_embedding_vector(
+                result
+                    .values
+                    .as_deref()
+                    .expect("complete result was checked"),
+                profile,
+            )
+            .map(|vector| (result.key.clone(), vector))
+        })
+        .collect()
 }
 
 /// 07 §5.3 (3)/(4): validate the provider's raw values, convert deterministically
@@ -21172,10 +21549,44 @@ fn submit_embedding_batch_jobs(
     budget_caps: &BudgetCaps,
     override_budget: bool,
     current_policy: &CurrentPolicyEvaluator,
+    projection: &EmbeddingProjection<'_>,
     transitions: &mut BTreeMap<String, EmbeddingTransition>,
     replica: &mut kio_index::aggregator::ScopeDelta,
 ) -> Result<Option<ExecOutcome>> {
     let mut outcome = ExecOutcome::default();
+    let contract_holds = kio_pipeline::ledger::ops::unreset_contract_violations_for_scope_adapter(
+        ledger,
+        scope_id,
+        EMBEDDING_ADAPTER_KIND,
+    )
+    .map_err(pipeline_to_kio)?;
+    let plan = plan_embed_batch(conn, profile, embeddable).map_err(|failure| {
+        KioError::schema(format!(
+            "embedding batch planning failed: {:?}",
+            failure.retry_kind
+        ))
+    })?;
+    // The durable batch breaker precedes client resolution: losing the batch
+    // client must not turn a blocked batch into an automatic sync resend.
+    if !contract_holds.is_empty() && !plan.to_send.is_empty() {
+        let attempts = contract_holds
+            .iter()
+            .map(|row| {
+                json!({
+                    "input_hash": row.key.input_hash,
+                    "tool_profile_hash": row.key.tool_profile_hash,
+                    "submission_seq": row.submission_seq,
+                    "selector": format!("{}/{}/{}/{}", row.key.scope_id, row.key.adapter_kind, row.key.input_hash, row.key.tool_profile_hash),
+                })
+            })
+            .collect::<Vec<_>>();
+        return Err(KioError::new(
+            "KIO-E-EMBED-BATCH-CONTRACT-HOLD-001",
+            "new embedding batch submissions are held after a malformed result; run kio batch retry --reset-violations <selector> --yes for each blocked attempt",
+            json!({"scope_id": scope_id, "adapter_kind": EMBEDDING_ADAPTER_KIND, "blocked_attempts": attempts}),
+            ExitCode::PermanentFailure,
+        ));
+    }
     // The lazy context is loaded only for a configured real client. Invalid
     // recovery authority is a hard hold, never permission to switch lanes.
     let Some(client) = kio_adapter::gemini_batch_client::resolve_gemini_batch_client(|| {
@@ -21189,17 +21600,11 @@ fn submit_embedding_batch_jobs(
         // the work pending forever would be worse than paying the sync rate.
         return Ok(None);
     };
-    let plan = plan_embed_batch(conn, profile, embeddable).map_err(|failure| {
-        KioError::schema(format!(
-            "embedding batch planning failed: {:?}",
-            failure.retry_kind
-        ))
-    })?;
     // Reuse links are free and always succeed — settle them here exactly as the
     // sync lane does, so an unavailable provider cannot strand an already
     // materialized chunk.
     if !plan.reuse.is_empty() {
-        match link_reused_chunks(conn, profile, &plan.reuse, replica) {
+        match link_reused_chunks(conn, profile, &plan.reuse, projection, replica) {
             Ok(()) => {
                 record_embedding_transitions(
                     transitions,
@@ -21242,7 +21647,7 @@ fn submit_embedding_batch_jobs(
         // the same task key and created another job, forever, recording an
         // estimate every time. Neither counter is in that ON CONFLICT SET list,
         // so both survive re-reservation; this uses `contract_violation_count`
-        // because `kio batch reset-violations` can clear it and nothing clears
+        // because `kio batch retry --reset-violations <selector> --yes` can clear it and nothing clears
         // `attempts` (see `EMBEDDING_BATCH_JOB_MAX_FAILURES`).
         let existing = get_batch_request(ledger, &key).map_err(pipeline_to_kio)?;
         if existing.as_ref().is_some_and(|row| {
@@ -21291,7 +21696,7 @@ fn submit_embedding_batch_jobs(
                 kio_adapter::gemini_batch_client::GeminiBatchEmbedInput {
                     // The provider echoes this back in `metadata.key`; the
                     // collect side keys on it to find the chunk again.
-                    key: group.representative.chunk_id.clone(),
+                    key: group.embedding_hash.clone(),
                     text: embedding_store::contextualized_embedding_input(
                         context.as_deref(),
                         &group.representative.text,
@@ -21299,6 +21704,14 @@ fn submit_embedding_batch_jobs(
                 }
             })
             .collect::<Vec<_>>();
+        validate_embedding_aliases(
+            current_policy,
+            profile,
+            job_groups
+                .iter()
+                .flat_map(|group| group.members.iter().copied()),
+        )
+        .map_err(|_| KioError::schema("embedding owner policy changed before batch admission"))?;
         // One reservation for the whole job — the cap is checked once against
         // the job's total, which is also what the provider will bill.
         let candidate_usd: f64 = inputs
@@ -21454,25 +21867,43 @@ fn poll_batch_embedding_jobs(repo: &Repository, ledger: &LedgerDb) -> Result<Exe
     };
     // Batch collection is likewise scoped by the required HEAD TreeObject
     // field, never by a mutable working-tree config.toml.
-    let chunking_config_hash = snapshot_chunking_config_hash(repo, &head)?;
     let instances = retained_history_instances(repo.kio_dir(), &head)?;
-    let chunks = retained_history_chunks(
-        &conn,
-        repo.kio_dir(),
-        &instances,
-        &chunking_config_hash,
-        None,
-    )?;
-    let by_chunk_id = chunks
+    let chunks =
+        embedding_owners::collect_retained_embedding_chunks(repo, &conn, &instances, None, None)?;
+    let current_policy = current_embedding_policy(repo)?;
+    let selected_contexts = selected_embedding_contexts(&chunks, &current_policy)?;
+    let chunks = bind_embedding_work(chunks, &profile)?;
+    let by_embedding_hash = chunks
         .iter()
-        .map(|chunk| (chunk.chunk_id.clone(), chunk))
+        .map(|chunk| (chunk.work_key.embedding_hash().to_owned(), chunk))
         .collect::<BTreeMap<_, _>>();
-    let held = BTreeSet::new();
+    let mut held = BTreeSet::new();
+    if secret_embedding_hold_required(
+        execution.execution_mode(),
+        embedding_secrets_allowed(repo, &profile)?,
+        true,
+    ) {
+        held.extend(held_secret_embedding_chunk_ids(repo.kio_dir())?);
+        held.extend(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.requires_secret_approval)
+                .map(|chunk| chunk.chunk_id.clone()),
+        );
+    }
+    let projection = EmbeddingProjection {
+        repo,
+        policy: &current_policy,
+        selected_contexts: &selected_contexts,
+        invalidated: std::cell::Cell::new(false),
+    };
+    refresh_embedding_projection(repo, &conn, &chunks, &profile, &projection, &held)?;
     // 05 §1.8 write-through, accumulated across every collected job and flushed
     // once below — see the sync lane's identical accumulator, including why the
     // generation is read here rather than at the flush.
     let replica_before = replica_scope_stamp(repo.kio_dir()).map(|(_, generation)| generation);
     let mut replica = kio_index::aggregator::ScopeDelta::default();
+    let mut source_written = false;
     for row in rows {
         let (Some(job_name), Some(intent_token)) =
             (row.batch_job_id.as_ref(), row.intent_token.as_ref())
@@ -21488,9 +21919,7 @@ fn poll_batch_embedding_jobs(repo: &Repository, ledger: &LedgerDb) -> Result<Exe
         // so asking twice downloaded a finished job's payload twice and let the
         // two reads take different byte bounds — which is how every job past
         // ~20 members came to be silently unreadable.
-        let Some(poll) =
-            poll_attributed_embedding_batch_job(client.as_ref(), &row, Some(&profile.profile_hash))
-        else {
+        let Some(poll) = poll_attributed_embedding_batch_job(client.as_ref(), &row, None) else {
             outcome.inflight += 1;
             outcome.held_unreadable += 1;
             continue;
@@ -21520,7 +21949,7 @@ fn poll_batch_embedding_jobs(repo: &Repository, ledger: &LedgerDb) -> Result<Exe
                     estimated: true,
                 },
                 // R24: count it. This is the durable counter the submit side
-                // bounds re-sends on, and `kio batch reset-violations` is its
+                // bounds re-sends on, and `kio batch retry --reset-violations <selector> --yes` is its
                 // operator escape hatch.
                 true,
                 true,
@@ -21538,6 +21967,34 @@ fn poll_batch_embedding_jobs(repo: &Repository, ledger: &LedgerDb) -> Result<Exe
             outcome.held_unreadable += 1;
             continue;
         };
+        // The row binds only a digest of the original member set. Establish
+        // the complete bijection before the first CAS or source-table write.
+        let validated_vectors = match validated_embedding_batch_vectors(
+            &results,
+            &row.key.input_hash,
+            (row.key.tool_profile_hash == profile.profile_hash).then_some(&profile),
+        ) {
+            Ok(vectors) => vectors,
+            Err(_) => {
+                settle_batch_charge_terminal(
+                    ledger,
+                    &row.key,
+                    intent_token,
+                    job_name,
+                    Outcome::ContractViolation,
+                    BatchState::Terminal,
+                    Some(EMBEDDING_BATCH_RESULT_CONTRACT_ERROR),
+                    BilledAmount {
+                        usd: row.estimated_usd,
+                        estimated: true,
+                    },
+                    true,
+                    true,
+                )?;
+                outcome.failed += 1;
+                continue;
+            }
+        };
         let mut persisted = 0usize;
         // R24 (4 系統一致): 07 §5.3 (1) requires the result ids to be a BIJECTION
         // onto the input ids, and this loop checked neither direction — it
@@ -21551,27 +22008,26 @@ fn poll_batch_embedding_jobs(repo: &Repository, ledger: &LedgerDb) -> Result<Exe
         // IS the member digest (design A): re-derive the digest from the
         // results that actually resolved and compare it with the row's own
         // `input_hash`.
-        let mut collected_identities = BTreeSet::new();
         for result in &results {
-            let Some(chunk) = by_chunk_id.get(&result.key) else {
+            let Some(chunk) = by_embedding_hash.get(&result.key) else {
                 // The chunk is gone (purged / reconfigured) since submission —
                 // nothing to write, and nothing to fail either.
                 continue;
             };
-            let Some(values) = result.values.as_ref() else {
+            let Some(normalized) = validated_vectors.get(&result.key) else {
                 continue;
             };
             let embedding_hash = chunk_embedding_hash(chunk, &profile)?;
-            collected_identities.insert(embedding_hash.clone());
             // Re-derive the group from the CURRENT chunk set rather than
             // trusting the submitted membership: a chunk added since
             // submission that shares this content identity must be linked too.
             let members = chunks
                 .iter()
                 .filter(|candidate| {
-                    chunk_embedding_hash(candidate, &profile)
-                        .map(|hash| hash == embedding_hash)
-                        .unwrap_or(false)
+                    candidate.work_key.embedding_hash() == embedding_hash
+                        && current_policy
+                            .allows_path(&candidate.raw_path)
+                            .unwrap_or(false)
                 })
                 .collect::<Vec<_>>();
             let group = EmbeddingSendGroup {
@@ -21579,14 +22035,13 @@ fn poll_batch_embedding_jobs(repo: &Repository, ledger: &LedgerDb) -> Result<Exe
                 representative: chunk,
                 members,
             };
-            let normalized = normalize_embedding_vector(values, &profile)?;
             persist_group_vector(
                 &conn,
-                repo,
                 &profile,
                 &group,
-                &normalized,
+                normalized,
                 &held,
+                &projection,
                 &mut replica,
             )
             .map_err(|failure| {
@@ -21595,68 +22050,37 @@ fn poll_batch_embedding_jobs(repo: &Repository, ledger: &LedgerDb) -> Result<Exe
                     failure.retry_kind
                 ))
             })?;
+            source_written = true;
             persisted += group.members.len();
         }
-        // Everything that resolved has been persisted, so a shortfall costs no
-        // re-send of what DID arrive (content-addressed reuse drops it from the
-        // next plan). What must not happen is calling the row Succeeded: settle
-        // it as a contract violation instead, which leaves the still-missing
-        // members eligible for a fresh, smaller job under a different task key.
-        let complete = embedding_job_input_hash(&collected_identities) == row.key.input_hash;
+        // Membership was authenticated before persistence. A retired profile
+        // or denied context can settle under its original job binding without
+        // becoming a current live vector.
+        let reported = reported_prompt_tokens(&results).map(|tokens| {
+            kio_adapter::types::AdapterUsage::BillableUnits {
+                billable_units: vec![kio_adapter::types::BillableUnit {
+                    kind: kio_adapter::types::BillableUnitKind::TokensIn,
+                    count: tokens,
+                }],
+            }
+        });
         settle_batch_charge_terminal(
             ledger,
             &row.key,
             intent_token,
             job_name,
-            if complete {
-                Outcome::Succeeded
-            } else {
-                Outcome::Expired
-            },
-            if complete {
-                BatchState::Completed
-            } else {
-                BatchState::Terminal
-            },
-            (!complete)
-                .then_some("embedding batch results are not a bijection onto the job's inputs"),
-            // I4: the endpoint DOES report a token count per result line, so a
-            // complete job settles on what was actually billed rather than on
-            // the reservation. The old QA17 posture ("no token count, the
-            // estimate stands") was written from a comment in the sync adapter
-            // that the wire contradicts.
-            //
-            // An INCOMPLETE job keeps the reservation: its results are, by
-            // definition, not the whole job, so their token sum would
-            // under-state the charge — and under-stating is the one direction
-            // the budget cap cannot defend against.
-            if complete {
-                let reported = reported_prompt_tokens(&results).map(|tokens| {
-                    kio_adapter::types::AdapterUsage::BillableUnits {
-                        billable_units: vec![kio_adapter::types::BillableUnit {
-                            kind: kio_adapter::types::BillableUnitKind::TokensIn,
-                            count: tokens,
-                        }],
-                    }
-                });
-                embedding_billed_from_usage(
-                    reported.as_ref(),
-                    PreferredRequestKind::Batch,
-                    row.estimated_usd,
-                )
-            } else {
-                BilledAmount {
-                    usd: row.estimated_usd,
-                    estimated: true,
-                }
-            },
-            !complete,
+            Outcome::Succeeded,
+            BatchState::Completed,
+            None,
+            embedding_billed_from_usage(
+                reported.as_ref(),
+                PreferredRequestKind::Batch,
+                row.estimated_usd,
+            ),
+            false,
             true,
         )?;
         outcome.executed += persisted;
-        if !complete {
-            outcome.failed += 1;
-        }
     }
     // A collected batch writes vectors straight into the LIVE index, and
     // `run_batch` — unlike `run_index`/`run_reindex` — never rebuilds it
@@ -21672,7 +22096,11 @@ fn poll_batch_embedding_jobs(repo: &Repository, ledger: &LedgerDb) -> Result<Exe
     // `chunk_vec`, and search reads `chunk_vec`. No replay can rank
     // differently, so LC25 asks for no rotation — the old trigger retired
     // cursors for a change no search could see.
+    current_policy.revalidate().map_err(pipeline_to_kio)?;
     publish_in_place_delta(repo.kio_dir(), replica_before.as_deref(), &replica)?;
+    if source_written && replica.is_empty() {
+        write_through_projection_or_log_for_repo(repo);
+    }
     Ok(outcome)
 }
 
@@ -21771,6 +22199,7 @@ fn filter_embeddable_by_task_state(
     pending: Vec<EmbeddableChunk>,
     override_budget: bool,
 ) -> Result<Vec<EmbeddableChunk>> {
+    validate_embedding_task_bindings(task_store, &pending)?;
     let tasks = task_store.all().map_err(pipeline_to_kio)?;
     let mut by_ref = BTreeMap::<String, Vec<&TaskDescriptor>>::new();
     for task in tasks
@@ -21785,7 +22214,7 @@ fn filter_embeddable_by_task_state(
     Ok(pending
         .into_iter()
         .filter(|chunk| {
-            let output_ref = embedding_task_output_ref(&chunk.chunk_id);
+            let output_ref = embedding_task_output_ref(chunk);
             match by_ref.get(&output_ref) {
                 Some(tasks) => tasks
                     .iter()
@@ -21910,7 +22339,7 @@ fn publish_verified_embedding(
 }
 
 fn chunk_embedding_hash(
-    chunk: &EmbeddableChunk,
+    chunk: &RetainedEmbeddingChunk,
     profile: &DeclaredEmbeddingProfile,
 ) -> Result<String> {
     // Contextual-embedding addendum (07 §5.3, 2026-07-24): fold the chunk's
@@ -22191,23 +22620,13 @@ fn retained_chunks_without_embedding(
     candidates: Vec<EmbeddableChunk>,
     profile: &DeclaredEmbeddingProfile,
 ) -> Result<Vec<EmbeddableChunk>> {
-    let mut existing_stmt = conn
-        .prepare("SELECT chunk_id FROM chunk_vec")
-        .map_err(|err| KioError::schema(err.to_string()))?;
-    let existing = existing_stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .map_err(|err| KioError::schema(err.to_string()))?
-        .collect::<std::result::Result<BTreeSet<String>, _>>()
-        .map_err(|err| KioError::schema(err.to_string()))?;
-    drop(existing_stmt);
-
     let mut pending = Vec::new();
     for chunk in candidates {
         let embedding_hash = chunk_embedding_hash(&chunk, profile)?;
         let has_current_profile = embedding_store::content_vector(conn, &embedding_hash)
             .map_err(index_to_kio)?
             .is_some();
-        if has_current_profile && existing.contains(&chunk.chunk_id) {
+        if has_current_profile {
             continue;
         }
         pending.push(chunk);
@@ -22435,7 +22854,7 @@ fn verified_image_mime(bytes: &[u8]) -> Result<&'static str> {
 /// currently eligible retained unit. Markdown is only a citation relation;
 /// immutable typed ownership is what permits a local CAS read or vector row.
 fn referenced_authorized_image_hashes_for_chunks(
-    chunks: &[EmbeddableChunk],
+    chunks: &[impl AsRef<RetainedEmbeddingChunk>],
     scope_id: &str,
     authority: &image_authority::ImageAuthorityMap,
     secrets_approved: bool,
@@ -22443,6 +22862,7 @@ fn referenced_authorized_image_hashes_for_chunks(
     let mut hashes = BTreeSet::new();
     for chunk in chunks
         .iter()
+        .map(AsRef::as_ref)
         .filter(|chunk| secrets_approved || !chunk.requires_secret_approval)
     {
         for image in extract_related_images(&chunk.text) {
@@ -22477,8 +22897,32 @@ fn authorized_local_image_object_hash(
     authority.permits(&hash).then_some(hash)
 }
 
-fn embedding_task_output_ref(chunk_id: &str) -> String {
-    format!("embedding:{chunk_id}")
+fn validate_embedding_task_bindings(
+    task_store: &TaskStore,
+    chunks: &[EmbeddableChunk],
+) -> Result<()> {
+    let by_ref = chunks
+        .iter()
+        .map(|chunk| (chunk.work_key.output_ref(), chunk))
+        .collect::<BTreeMap<_, _>>();
+    for task in task_store.all().map_err(pipeline_to_kio)? {
+        if task.task_type != TaskType::Embedding {
+            continue;
+        }
+        if let Some(chunk) = by_ref.get(&task.output_ref)
+            && (task.input_hash != chunk.text_hash
+                || task.changed_unit_keys != [chunk.chunk_id.clone()])
+        {
+            return Err(KioError::schema(
+                "embedding task does not match authenticated contextual work",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn embedding_task_output_ref(chunk: &EmbeddableChunk) -> String {
+    chunk.work_key.output_ref()
 }
 
 /// R12-3: complete embedding tasks stranded `Pending`/`Running` by a crash between
@@ -22490,11 +22934,11 @@ fn embedding_task_output_ref(chunk_id: &str) -> String {
 /// `Done` (idempotent, no adapter call, no re-charge — the vector is already stored,
 /// so search/data are unaffected; only task accounting + the Agent contract heal).
 struct EmbeddingReconcileContext<'a> {
-    active_chunk_ids: &'a BTreeSet<String>,
+    active_work_refs: &'a BTreeSet<String>,
     /// Exact current sync ledger identity per live chunk. This includes the
     /// contextualized input and avoids reconstructing a ledger selector from
     /// a task's bare text hash.
-    active_embedding_hashes_by_chunk_id: &'a BTreeMap<String, String>,
+    active_embedding_hashes_by_work_ref: &'a BTreeMap<String, String>,
     pending: &'a [EmbeddableChunk],
     now: &'a str,
     /// The active embedding profile's `tool_profile_hash` — one of the ledger
@@ -22511,12 +22955,12 @@ fn reconcile_committed_embedding_tasks(
     ledger: Option<&LedgerDb>,
     context: EmbeddingReconcileContext<'_>,
 ) -> Result<()> {
-    let pending_ids: BTreeSet<&str> = context
+    let pending_ids: BTreeSet<String> = context
         .pending
         .iter()
-        .map(|chunk| chunk.chunk_id.as_str())
+        .map(|chunk| chunk.work_key.output_ref())
         .collect();
-    let live_ids = context.active_chunk_ids;
+    let live_ids = context.active_work_refs;
     // R18-1: release the ledger reservation of a NON-LIVE embedding task whose send
     // is now stranded. Once the chunk is edited/deleted (non-live) the task can
     // never be retried, so an open ledger row would eat the embedding
@@ -22565,9 +23009,10 @@ fn reconcile_committed_embedding_tasks(
         // lands Failed anymore, so no Failed-auth compatibility path is needed
         // (再 init 方針).
         let auth_revive_candidate = context.allow_auth_revive && auth_paused;
-        let Some(chunk_id) = task.output_ref.strip_prefix("embedding:") else {
+        let Some(work_key) = EmbeddingWorkKey::parse(&task.output_ref) else {
             continue;
         };
+        let chunk_id = task.output_ref.as_str();
         let live = live_ids.contains(chunk_id);
         let live_embedded = live && !pending_ids.contains(chunk_id);
         let materialized_completion =
@@ -22610,7 +23055,7 @@ fn reconcile_committed_embedding_tasks(
                 AbandonResolution::Ambiguous => continue,
             },
             None => {
-                let Some(input_hash) = context.active_embedding_hashes_by_chunk_id.get(chunk_id)
+                let Some(input_hash) = context.active_embedding_hashes_by_work_ref.get(chunk_id)
                 else {
                     // A non-live, unstamped task has no durable contextualized
                     // identity. Leave it for explicit stale recovery rather
@@ -22629,7 +23074,10 @@ fn reconcile_committed_embedding_tasks(
         // only a lookup hint. It must never expand this scope's authority to
         // mutate a row belonging to another scope or adapter.
         if let Some(key) = key {
-            if key.scope_id != reservation_scope_id || key.adapter_kind != EMBEDDING_ADAPTER_KIND {
+            if key.scope_id != reservation_scope_id
+                || key.adapter_kind != EMBEDDING_ADAPTER_KIND
+                || key.input_hash != work_key.embedding_hash()
+            {
                 continue;
             }
             if let Some(ledger) = ledger {
@@ -22689,9 +23137,10 @@ fn reconcile_committed_embedding_tasks(
         ) {
             continue;
         }
-        let Some(chunk_id) = task.output_ref.strip_prefix("embedding:") else {
+        let Some(_work_key) = EmbeddingWorkKey::parse(&task.output_ref) else {
             continue;
         };
+        let chunk_id = task.output_ref.as_str();
         // A genuinely un-embedded LIVE chunk stays pending (real outstanding work).
         if pending_ids.contains(chunk_id) {
             continue;
@@ -22741,6 +23190,7 @@ fn hold_secret_embedding_tasks(
     if held.is_empty() {
         return Ok(());
     }
+    validate_embedding_task_bindings(task_store, held)?;
     let all_tasks = task_store.all().map_err(pipeline_to_kio)?;
     // R22-2: `existing` used to mean "any non-retired task ⇒ already classified", which
     // silently assumed a chunk's secret classification never changes after its task is
@@ -22818,7 +23268,7 @@ fn hold_secret_embedding_tasks(
     // that is actually being held rather than whatever it was called when first indexed.
     let mut to_demote: BTreeMap<String, String> = BTreeMap::new();
     for chunk in held {
-        let output_ref = embedding_task_output_ref(&chunk.chunk_id);
+        let output_ref = embedding_task_output_ref(chunk);
         if already_held.contains(&output_ref) || done.contains(&output_ref) {
             continue;
         }
@@ -22944,6 +23394,7 @@ fn enqueue_embedding_tasks(
     online: bool,
     now: &str,
 ) -> Result<()> {
+    validate_embedding_task_bindings(task_store, pending)?;
     let all_tasks = task_store.all().map_err(pipeline_to_kio)?;
     // R22-1: a Paused `secrets_tier_b_hold` must not block this enqueue either. Reaching
     // `enqueue_embedding_tasks` means the chunk landed in `sendable`, i.e. NO live path of
@@ -22998,7 +23449,7 @@ fn enqueue_embedding_tasks(
     // `input_path` stops naming the file it was held under.
     let mut to_unhold: BTreeMap<String, String> = BTreeMap::new();
     for chunk in pending {
-        let output_ref = embedding_task_output_ref(&chunk.chunk_id);
+        let output_ref = embedding_task_output_ref(chunk);
         if existing.contains(&output_ref) {
             continue;
         }
@@ -27348,14 +27799,19 @@ fn enqueue_online_placeholder_task(
     let (output_ref, secrets_approved) = match local_ocr {
         Some(execution) => {
             let profile = kio_adapter::local_ocr_markdownize::profile_for(execution);
-            let approved =
-                secrets_send_approved(repo, &profile.adapter_id, &profile.tool_profile_hash);
+            let approved = secrets_send_approved(
+                repo,
+                approvals::AdapterRole::Markdown,
+                &profile.adapter_id,
+                &profile.tool_profile_hash,
+            );
             (offline_output_ref(&profile.adapter_id), approved)
         }
         None => (
             online_output_ref(&online_profile.adapter_id),
             secrets_send_approved(
                 repo,
+                approvals::AdapterRole::Markdown,
                 &online_profile.adapter_id,
                 &online_profile.tool_profile_hash,
             ),
@@ -27657,24 +28113,13 @@ fn network_allowed(repo: &Repository, args: &IndexArgs) -> Result<bool> {
 }
 
 /// Current paired device and scope permission for this exact secret recipient.
-fn secrets_send_approved(repo: &Repository, tool_id: &str, profile: &str) -> bool {
-    approvals::secrets_allowed(repo, tool_id, profile).unwrap_or(false)
-}
-
-fn secrets_send_approved_in_kio_dir(kio_dir: &Path) -> bool {
-    kio_dir
-        .parent()
-        .and_then(|root| management::open_existing_managed_root(root).ok())
-        .is_some_and(|repo| {
-            let Some(execution) = embedding_execution() else {
-                return false;
-            };
-            if embedding_is_deterministic(execution) {
-                return true;
-            }
-            let profile = declared_embedding_profile(execution);
-            embedding_secrets_allowed(&repo, &profile).unwrap_or(false)
-        })
+fn secrets_send_approved(
+    repo: &Repository,
+    role: approvals::AdapterRole,
+    tool_id: &str,
+    profile: &str,
+) -> bool {
+    approvals::secrets_allowed(repo, role, tool_id, profile).unwrap_or(false)
 }
 
 fn active_markdownize_profile_for(repo: &Repository) -> Result<AdapterProfile> {
@@ -27781,8 +28226,12 @@ fn record_quarantine_candidates(repo: &Repository, preview: &ScanPreview) -> Res
             Some(execution) => kio_adapter::local_ocr_markdownize::profile_for(execution),
             None => online_markdownize_profile_for(repo)?,
         };
-        let secrets_approved =
-            secrets_send_approved(repo, &profile.adapter_id, &profile.tool_profile_hash);
+        let secrets_approved = secrets_send_approved(
+            repo,
+            approvals::AdapterRole::Markdown,
+            &profile.adapter_id,
+            &profile.tool_profile_hash,
+        );
         // N1b: record Tier A (excluded from ingest) AND Tier B (ingested locally
         // but held from online send) so `kio status` surfaces both. Tier B carries
         // its live disposition — "hold" until `--send-secrets`, then "send_approved".
@@ -28055,9 +28504,9 @@ fn validate_repo_tool_lock(repo: &Repository) -> Result<()> {
 /// `repair rebuild-db` may replay.  This intentionally does not consult the
 /// active adapter: recovery must work while its environment is unavailable.
 /// A missing lock or a lock without `embedding` means text-only replay.
-fn rebuild_embedding_profile_from_tool_lock(
+fn rebuild_embedding_entry_from_tool_lock(
     kio_dir: &Path,
-) -> Result<Option<embedding_store::EmbeddingProfileSummary>> {
+) -> Result<Option<kio_adapter::tool_lock::EmbeddingToolLockEntry>> {
     let path = kio_dir.join("tool-lock.json");
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => {}
@@ -28068,14 +28517,40 @@ fn rebuild_embedding_profile_from_tool_lock(
     let bytes = fs::read(&path)
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
     let lock = load_tool_lock(&bytes).map_err(adapter_to_kio)?;
-    Ok(lock
-        .embedding
-        .map(|embedding| embedding_store::EmbeddingProfileSummary {
-            dimensions: u64::from(embedding.dimensions),
-            distance: embedding.distance,
-            modality: embedding.modality,
-            profile_hash: embedding.profile_hash,
-        }))
+    Ok(lock.embedding)
+}
+
+fn embedding_profile_summary(
+    entry: &kio_adapter::tool_lock::EmbeddingToolLockEntry,
+) -> embedding_store::EmbeddingProfileSummary {
+    embedding_store::EmbeddingProfileSummary {
+        dimensions: u64::from(entry.dimensions),
+        distance: entry.distance.clone(),
+        modality: entry.modality.clone(),
+        profile_hash: entry.profile_hash.clone(),
+    }
+}
+
+/// The optional provenance label is not itself authority: only the exact
+/// built-in, in-process identity can avoid a recipient secret-send grant.
+fn persisted_embedding_is_deterministic(
+    entry: &kio_adapter::tool_lock::EmbeddingToolLockEntry,
+) -> bool {
+    let builtin = declared_embedding_profile(EmbeddingExecution::DeterministicEvaluator);
+    entry.kind == Some(ExecutionMode::DeterministicLibrary)
+        && entry.tool_id == builtin.tool_id
+        && entry.profile_hash == builtin.profile_hash
+        && u64::from(entry.dimensions) == builtin.dimensions
+        && entry.distance == builtin.distance
+        && entry.modality == builtin.modality
+}
+
+fn rebuild_embedding_profile_from_tool_lock(
+    kio_dir: &Path,
+) -> Result<Option<embedding_store::EmbeddingProfileSummary>> {
+    Ok(rebuild_embedding_entry_from_tool_lock(kio_dir)?
+        .as_ref()
+        .map(embedding_profile_summary))
 }
 
 fn require_repo_tool_lock(repo: &Repository) -> Result<()> {
@@ -29051,7 +29526,7 @@ mod tests {
         use kio_pipeline::prepare::{PreparedUnit, UnitFingerprint, UnitType, hash_bytes};
         use kio_pipeline::task::RetryErrorKind;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
         Repository::init(root.path()).unwrap();
         let kio_dir = root.path().join(".kio");
         std::fs::create_dir_all(&kio_dir).unwrap();
@@ -29190,9 +29665,15 @@ mod tests {
 
     #[test]
     fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
+        if !super::contextual_embedding_tests::isolated_child_for(
+            "tests::embedding_cas_failure_cannot_publish_source_or_replica_vectors",
+        ) {
+            return;
+        }
         use super::{
-            DeclaredEmbeddingProfile, EmbeddableChunk, EmbeddingSendGroup, FtsSchemaConfig,
-            FtsTokenizer, SqliteFtsIndex, chunk_embedding_hash, persist_group_vector,
+            DeclaredEmbeddingProfile, EmbeddingProjection, EmbeddingSendGroup, FtsSchemaConfig,
+            FtsTokenizer, RetainedEmbeddingChunk, SqliteFtsIndex, bind_embedding_work,
+            chunk_embedding_hash, current_embedding_policy, embedding_store, persist_group_vector,
         };
         use kio_core::cas::ObjectStore;
 
@@ -29200,7 +29681,10 @@ mod tests {
             let temp = tempfile::tempdir().unwrap();
             let root = temp.path().join("scope");
             fs::create_dir(&root).unwrap();
-            let repo = Repository::init(&root).unwrap();
+            let repo = match super::initialize_explicit_root(&root).unwrap() {
+                super::ExplicitRoot::Created(repo) => repo,
+                super::ExplicitRoot::Existing(_) => panic!("fresh root"),
+            };
             let mut index = SqliteFtsIndex::open(
                 temp.path().join("projection.sqlite"),
                 FtsSchemaConfig {
@@ -29210,12 +29694,13 @@ mod tests {
             .unwrap();
             let row = ledger_test_chunk().row;
             index.index_chunk(&row).unwrap();
-            let chunk = EmbeddableChunk {
+            let chunk = RetainedEmbeddingChunk {
                 chunk_id: row.chunk_id,
-                text: row.text,
+                text: row.text.into(),
                 text_hash: row.text_hash,
                 raw_path: row.raw_path,
                 requires_secret_approval: false,
+                is_head_owner: false,
             };
             let profile = DeclaredEmbeddingProfile {
                 tool_id: "test_embedding".into(),
@@ -29224,6 +29709,9 @@ mod tests {
                 modality: "multimodal".into(),
                 profile_hash: kio_core::cas::hash_bytes(b"embedding profile"),
             };
+            let chunk = bind_embedding_work(vec![chunk], &profile)
+                .unwrap()
+                .remove(0);
             let group = EmbeddingSendGroup {
                 embedding_hash: chunk_embedding_hash(&chunk, &profile).unwrap(),
                 representative: &chunk,
@@ -29239,13 +29727,24 @@ mod tests {
                 fs::write(&object_path, b"corrupt immutable object").unwrap();
             }
             let mut replica = kio_index::aggregator::ScopeDelta::default();
+            let policy = current_embedding_policy(&repo).unwrap();
+            let contexts = BTreeMap::from([(
+                chunk.chunk_id.clone(),
+                embedding_store::chunk_embedding_context(&chunk.raw_path),
+            )]);
+            let projection = EmbeddingProjection {
+                repo: &repo,
+                policy: &policy,
+                selected_contexts: &contexts,
+                invalidated: std::cell::Cell::new(false),
+            };
             let result = persist_group_vector(
                 index.connection(),
-                &repo,
                 &profile,
                 &group,
                 &vector,
                 &BTreeSet::new(),
+                &projection,
                 &mut replica,
             );
             assert_eq!(result.is_ok(), !corrupt_cas);
@@ -29930,12 +30429,11 @@ mod tests {
                 manifest_hash: kio_core::cas::hash_bytes(b"manifest"),
             },
             raw_path: "reintroduced.md".to_owned(),
-            embedding_path: "reintroduced.md".to_owned(),
             policy_paths: BTreeSet::from(["reintroduced.md".to_owned()]),
             introductions: vec![commit_hash],
         }];
         let chunks =
-            super::retained_history_chunks(&conn, &kio_dir, &retained, "config", None).unwrap();
+            super::retained_history_chunks(&conn, &repo, &retained, "config", None).unwrap();
         assert_eq!(chunks.len(), 0);
     }
 
@@ -30192,7 +30690,7 @@ mod tests {
     #[test]
     fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
         use super::{
-            EmbeddableChunk, embedding_task_output_ref, hold_secret_embedding_tasks,
+            embedding_task_output_ref, hold_secret_embedding_tasks,
             prune_terminal_embedding_secret_holds,
         };
         use kio_adapter::catalog::DeclaredEmbeddingProfile;
@@ -30212,7 +30710,20 @@ mod tests {
             profile_hash: format!("sha256:{}", "e".repeat(64)),
         };
         let chunk_id = format!("sha256:{}", "a".repeat(64));
-        let output_ref = embedding_task_output_ref(&chunk_id);
+        let chunk = super::bind_embedding_work(
+            vec![super::RetainedEmbeddingChunk {
+                chunk_id: chunk_id.clone(),
+                text: "secret".into(),
+                text_hash: format!("sha256:{}", "b".repeat(64)),
+                raw_path: "credentials_backup.md".to_owned(),
+                requires_secret_approval: true,
+                is_head_owner: false,
+            }],
+            &profile,
+        )
+        .unwrap()
+        .remove(0);
+        let output_ref = embedding_task_output_ref(&chunk);
         store
             .append(&TaskDescriptor {
                 task_id: "task_terminal".to_owned(),
@@ -30245,13 +30756,7 @@ mod tests {
             &repo,
             Some(&ledger),
             &profile,
-            &[EmbeddableChunk {
-                chunk_id,
-                text: "secret".to_owned(),
-                text_hash: format!("sha256:{}", "b".repeat(64)),
-                raw_path: "credentials_backup.md".to_owned(),
-                requires_secret_approval: true,
-            }],
+            std::slice::from_ref(&chunk),
             "2026-07-12T00:00:01Z",
         )
         .unwrap();
@@ -30275,8 +30780,8 @@ mod tests {
     #[test]
     fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
         use super::{
-            EmbeddableChunk, SECRETS_TIER_B_HOLD, embedding_task_output_ref,
-            filter_embeddable_by_task_state, prune_terminal_embedding_secret_holds,
+            SECRETS_TIER_B_HOLD, embedding_task_output_ref, filter_embeddable_by_task_state,
+            prune_terminal_embedding_secret_holds,
         };
         use kio_core::scope::Repository;
         use kio_pipeline::task::{HoldReason, TaskDescriptor, TaskStatus, TaskStore, TaskType};
@@ -30285,7 +30790,27 @@ mod tests {
         let repo = Repository::init(root.path()).unwrap();
         let store = TaskStore::new(repo.kio_dir());
         let chunk_id = format!("sha256:{}", "c".repeat(64));
-        let output_ref = embedding_task_output_ref(&chunk_id);
+        let profile = kio_adapter::catalog::DeclaredEmbeddingProfile {
+            tool_id: "test_embedding".into(),
+            dimensions: 768,
+            distance: "cosine".into(),
+            modality: "multimodal".into(),
+            profile_hash: format!("sha256:{}", "e".repeat(64)),
+        };
+        let chunk = super::bind_embedding_work(
+            vec![super::RetainedEmbeddingChunk {
+                chunk_id: chunk_id.clone(),
+                text: "must not send".into(),
+                text_hash: format!("sha256:{}", "d".repeat(64)),
+                raw_path: "credentials_backup.md".to_owned(),
+                requires_secret_approval: true,
+                is_head_owner: false,
+            }],
+            &profile,
+        )
+        .unwrap()
+        .remove(0);
+        let output_ref = embedding_task_output_ref(&chunk);
         let terminal = TaskDescriptor {
             task_id: "task_terminal".to_owned(),
             task_type: TaskType::Embedding,
@@ -30336,25 +30861,14 @@ mod tests {
         poisoned_pending.created_at = "2026-07-12T00:00:02Z".to_owned();
         store.append(&poisoned_pending).unwrap();
 
-        let sendable = filter_embeddable_by_task_state(
-            &store,
-            vec![EmbeddableChunk {
-                chunk_id,
-                text: "must not send".to_owned(),
-                text_hash: format!("sha256:{}", "d".repeat(64)),
-                raw_path: "credentials_backup.md".to_owned(),
-                requires_secret_approval: true,
-            }],
-            false,
-        )
-        .unwrap();
+        let sendable = filter_embeddable_by_task_state(&store, vec![chunk.clone()], false).unwrap();
         assert!(sendable.is_empty());
         assert_eq!(tasks[0].output_ref, output_ref);
     }
 
     #[test]
     fn r23_secret_classification_preserves_retry_backoff_state() {
-        use super::{EmbeddableChunk, embedding_task_output_ref, hold_secret_embedding_tasks};
+        use super::{embedding_task_output_ref, hold_secret_embedding_tasks};
         use kio_adapter::catalog::DeclaredEmbeddingProfile;
         use kio_core::scope::Repository;
         use kio_pipeline::ledger::LedgerDb;
@@ -30372,7 +30886,20 @@ mod tests {
             profile_hash: format!("sha256:{}", "e".repeat(64)),
         };
         let chunk_id = format!("sha256:{}", "e".repeat(64));
-        let output_ref = embedding_task_output_ref(&chunk_id);
+        let chunk = super::bind_embedding_work(
+            vec![super::RetainedEmbeddingChunk {
+                chunk_id: chunk_id.clone(),
+                text: "retryable".into(),
+                text_hash: format!("sha256:{}", "f".repeat(64)),
+                raw_path: "credentials_backup.md".to_owned(),
+                requires_secret_approval: true,
+                is_head_owner: false,
+            }],
+            &profile,
+        )
+        .unwrap()
+        .remove(0);
+        let output_ref = embedding_task_output_ref(&chunk);
         store
             .append(&TaskDescriptor {
                 task_id: "task_retry_backoff".to_owned(),
@@ -30405,13 +30932,7 @@ mod tests {
             &repo,
             Some(&ledger),
             &profile,
-            &[EmbeddableChunk {
-                chunk_id,
-                text: "retryable".to_owned(),
-                text_hash: format!("sha256:{}", "f".repeat(64)),
-                raw_path: "credentials_backup.md".to_owned(),
-                requires_secret_approval: true,
-            }],
+            std::slice::from_ref(&chunk),
             "2026-07-12T00:00:01Z",
         )
         .unwrap();
@@ -32489,7 +33010,7 @@ mod tests {
     #[test]
     fn only_typed_same_scope_image_ownership_selects_local_bytes_or_projection() {
         use super::{
-            EmbeddableChunk, authorized_local_image_object_hash, local_image_object_hash,
+            RetainedEmbeddingChunk, authorized_local_image_object_hash, local_image_object_hash,
             referenced_authorized_image_hashes_for_chunks,
         };
         use crate::image_authority::{ImageAuthorityEntry, ImageAuthorityMap};
@@ -32500,19 +33021,21 @@ mod tests {
         let foreign = format!("![foreign]({foreign_uri})");
         let local = format!("![unowned]({local_uri})");
         let chunks = vec![
-            EmbeddableChunk {
+            RetainedEmbeddingChunk {
                 chunk_id: "foreign".to_owned(),
-                text: foreign,
+                text: foreign.into(),
                 text_hash: "foreign".to_owned(),
                 raw_path: "public.md".to_owned(),
                 requires_secret_approval: false,
+                is_head_owner: false,
             },
-            EmbeddableChunk {
+            RetainedEmbeddingChunk {
                 chunk_id: "local".to_owned(),
-                text: local,
+                text: local.into(),
                 text_hash: "local".to_owned(),
                 raw_path: "public.md".to_owned(),
                 requires_secret_approval: false,
+                is_head_owner: false,
             },
         ];
         let unowned = ImageAuthorityMap::default();
@@ -32548,16 +33071,17 @@ mod tests {
 
     #[test]
     fn secret_typed_owner_cannot_be_bypassed_by_a_public_same_scope_link() {
-        use super::{EmbeddableChunk, referenced_authorized_image_hashes_for_chunks};
+        use super::{RetainedEmbeddingChunk, referenced_authorized_image_hashes_for_chunks};
         use crate::image_authority::{ImageAuthorityEntry, ImageAuthorityMap};
 
         let hash = format!("sha256:{}", "b".repeat(64));
-        let chunks = [EmbeddableChunk {
+        let chunks = [RetainedEmbeddingChunk {
             chunk_id: "public-link".to_owned(),
-            text: format!("![public](kio://scope-a/object/image/{hash})"),
+            text: format!("![public](kio://scope-a/object/image/{hash})").into(),
             text_hash: "public".to_owned(),
             raw_path: "public.md".to_owned(),
             requires_secret_approval: false,
+            is_head_owner: false,
         }];
         let authority = ImageAuthorityMap::test_map(BTreeMap::from([(
             hash.clone(),

@@ -69,6 +69,8 @@ typed_write!(sync_record_provider_request_id(key: &TaskKey, intent_token: &str,
     provider_request_id: &str) -> bool);
 typed_write!(terminal_transaction(write: &TerminalWrite<'_>) -> TerminalReceipt);
 typed_read!(recovery_candidates() -> Vec<BatchRequestRow>);
+// Unreset Batch contract failures for the exact current attempt, including cleaned rows.
+typed_read!(unreset_contract_violations_for_scope_adapter(scope_id: &str, adapter_kind: &str) -> Vec<BatchRequestRow>);
 typed_read!(batch_poll_candidates(scope_id: &str, adapter_kind: &str) -> Vec<BatchRequestRow>);
 typed_read!(sync_recovery_candidates(scope_id: &str, now_ms: i64) -> Vec<BatchRequestRow>);
 typed_read!(distinct_scope_ids_with_sync_rows() -> Vec<String>);

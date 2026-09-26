@@ -239,6 +239,42 @@ pub enum TaskRecoveryMode {
     Retry,
 }
 
+/// Exact embedding work identity: a chunk in one embedding context.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EmbeddingWorkKey {
+    chunk_id: String,
+    embedding_hash: String,
+}
+
+impl EmbeddingWorkKey {
+    pub fn new(chunk_id: &str, embedding_hash: &str) -> Option<Self> {
+        if !kio_core::cas::is_hash(chunk_id) || !kio_core::cas::is_hash(embedding_hash) {
+            return None;
+        }
+        Some(Self {
+            chunk_id: chunk_id.to_owned(),
+            embedding_hash: embedding_hash.to_owned(),
+        })
+    }
+
+    pub fn parse(output_ref: &str) -> Option<Self> {
+        let (chunk_id, embedding_hash) = output_ref.strip_prefix("embedding:")?.split_once('/')?;
+        Self::new(chunk_id, embedding_hash)
+    }
+
+    pub fn output_ref(&self) -> String {
+        format!("embedding:{}/{}", self.chunk_id, self.embedding_hash)
+    }
+
+    pub fn chunk_id(&self) -> &str {
+        &self.chunk_id
+    }
+
+    pub fn embedding_hash(&self) -> &str {
+        &self.embedding_hash
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TaskOutputRef {
     Online {
@@ -256,7 +292,7 @@ pub enum TaskOutputRef {
         adapter_id: String,
     },
     Embedding {
-        chunk_id: String,
+        work_key: EmbeddingWorkKey,
     },
     NormalizedInstance {
         path: PathBuf,
@@ -666,13 +702,16 @@ pub fn validate_task_output_ref(
             adapter_id: adapter_id.to_owned(),
         });
     }
-    if let Some(chunk_id) = descriptor.output_ref.strip_prefix("embedding:") {
-        if descriptor.task_type != TaskType::Embedding || !kio_core::cas::is_hash(chunk_id) {
+    if descriptor.output_ref.starts_with("embedding:") {
+        let work_key = EmbeddingWorkKey::parse(&descriptor.output_ref)
+            .ok_or_else(|| invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref))?;
+        if descriptor.task_type != TaskType::Embedding
+            || descriptor.changed_unit_keys.len() != 1
+            || descriptor.changed_unit_keys[0] != work_key.chunk_id()
+        {
             return Err(invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref));
         }
-        return Ok(TaskOutputRef::Embedding {
-            chunk_id: chunk_id.to_owned(),
-        });
+        return Ok(TaskOutputRef::Embedding { work_key });
     }
     if descriptor.task_type != TaskType::Markdownize {
         return Err(invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref));
@@ -1684,11 +1723,121 @@ mod tests {
         );
         task.task_type = TaskType::Embedding;
         assert!(validate_task_output_ref(dir.path(), &task).is_err());
-        task.output_ref = format!("embedding:sha256:{}", "c".repeat(64));
+        let work_key = EmbeddingWorkKey::new(
+            &format!("sha256:{}", "c".repeat(64)),
+            &format!("sha256:{}", "d".repeat(64)),
+        )
+        .unwrap();
+        task.output_ref = work_key.output_ref();
+        task.changed_unit_keys = vec![work_key.chunk_id().to_owned()];
         assert!(matches!(
             validate_task_output_ref(dir.path(), &task).unwrap(),
             TaskOutputRef::Embedding { .. }
         ));
+    }
+
+    #[test]
+    fn embedding_work_key_roundtrips_and_distinguishes_contexts() {
+        let chunk = format!("sha256:{}", "a".repeat(64));
+        let embedding = format!("sha256:{}", "b".repeat(64));
+        let key = EmbeddingWorkKey::new(&chunk, &embedding).unwrap();
+        assert_eq!(key.chunk_id(), chunk);
+        assert_eq!(key.embedding_hash(), embedding);
+        assert_eq!(key.output_ref(), format!("embedding:{chunk}/{embedding}"));
+        assert_eq!(
+            EmbeddingWorkKey::parse(&key.output_ref()),
+            Some(key.clone())
+        );
+        assert_ne!(key, EmbeddingWorkKey::new(&chunk, &chunk).unwrap());
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut task = valid_task();
+        task.task_type = TaskType::Embedding;
+        task.output_ref = key.output_ref();
+        task.changed_unit_keys = vec![chunk];
+        assert_eq!(
+            validate_task_output_ref(dir.path(), &task).unwrap(),
+            TaskOutputRef::Embedding { work_key: key }
+        );
+        let store = TaskStore::new(dir.path());
+        store.append(&task).unwrap();
+        assert_eq!(store.all().unwrap(), vec![task]);
+    }
+
+    #[test]
+    fn embedding_work_key_rejects_legacy_and_noncanonical_references_without_writes() {
+        let chunk = format!("sha256:{}", "a".repeat(64));
+        let embedding = format!("sha256:{}", "b".repeat(64));
+        let canonical = format!("embedding:{chunk}/{embedding}");
+        let invalid = [
+            format!("embedding:{chunk}"),
+            format!("embedding:{chunk}/"),
+            format!("embedding:/{embedding}"),
+            format!("{canonical}/"),
+            format!("{canonical}/{chunk}"),
+            format!(" {canonical}"),
+            canonical.to_uppercase(),
+            format!("embedding:{}/{embedding}", "a".repeat(64)),
+            format!("embedding:{chunk}/sha256:{}", "b".repeat(63)),
+            format!("embedding:sha256:{}/{embedding}", "A".repeat(64)),
+            format!("embedding:{chunk}/sha256:{}", "B".repeat(64)),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("tasks.jsonl");
+        let mut task = valid_task();
+        task.task_type = TaskType::Embedding;
+        task.changed_unit_keys = vec![chunk];
+        for output_ref in invalid {
+            assert!(
+                EmbeddingWorkKey::parse(&output_ref).is_none(),
+                "{output_ref}"
+            );
+            task.output_ref = output_ref;
+            let mut bytes = serde_json::to_vec(&task).unwrap();
+            bytes.push(b'\n');
+            fs::write(&journal, &bytes).unwrap();
+            let store = TaskStore::new(dir.path());
+            assert!(validate_task_output_ref(dir.path(), &task).is_err());
+            assert!(store.all().is_err());
+            assert!(store.append(&task).is_err());
+            assert_eq!(fs::read(&journal).unwrap(), bytes);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn embedding_work_key_requires_exact_single_chunk_membership_and_canonical_input() {
+        let chunk = format!("sha256:{}", "a".repeat(64));
+        let embedding = format!("sha256:{}", "b".repeat(64));
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("tasks.jsonl");
+        let mut valid = valid_task();
+        valid.task_type = TaskType::Embedding;
+        valid.output_ref = EmbeddingWorkKey::new(&chunk, &embedding)
+            .unwrap()
+            .output_ref();
+        valid.changed_unit_keys = vec![chunk.clone()];
+        let mut invalid = Vec::new();
+        for members in [vec![], vec![embedding], vec![chunk.clone(), chunk]] {
+            let mut task = valid.clone();
+            task.changed_unit_keys = members;
+            invalid.push(task);
+        }
+        let mut wrong_type = valid.clone();
+        wrong_type.task_type = TaskType::Markdownize;
+        invalid.push(wrong_type);
+        let mut wrong_input = valid;
+        wrong_input.input_hash = "not-a-hash".to_owned();
+        invalid.push(wrong_input);
+        for task in invalid {
+            let mut bytes = serde_json::to_vec(&task).unwrap();
+            bytes.push(b'\n');
+            fs::write(&journal, &bytes).unwrap();
+            assert!(validate_task_output_ref(dir.path(), &task).is_err());
+            assert!(TaskStore::new(dir.path()).all().is_err());
+            assert_eq!(fs::read(&journal).unwrap(), bytes);
+            assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
     }
 
     #[test]
@@ -1880,7 +2029,13 @@ mod tests {
     fn cand_001_012_013_recovery_helpers_preserve_security_state() {
         let mut task = valid_task();
         task.task_type = TaskType::Embedding;
-        task.output_ref = format!("embedding:sha256:{}", "c".repeat(64));
+        let work_key = EmbeddingWorkKey::new(
+            &format!("sha256:{}", "c".repeat(64)),
+            &format!("sha256:{}", "d".repeat(64)),
+        )
+        .unwrap();
+        task.output_ref = work_key.output_ref();
+        task.changed_unit_keys = vec![work_key.chunk_id().to_owned()];
         assert!(task_can_enter_secret_hold(&task));
 
         task.status = TaskStatus::Failed;

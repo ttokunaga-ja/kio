@@ -514,6 +514,9 @@ metadata:
 
 **Embedding 応答の受入検査** (markdownize の V1〜V6 に相当する): (1) `vectors[].id` は入力 id 集合と**全単射** (欠落・過剰・重複は違反)、(2) `dimensions` は profile と一致し全 vector が同次元、(3) 全要素が**有限値** (NaN/Inf 拒否) かつ**非ゼロ vector**、(4) float32 への決定的変換と **L2 正規化は core 側で実施**する (Adapter の正規化有無に依存しない)。**変換・正規化後の最終 vector にも (3) と同じ有限・非ゼロ (かつ単位ノルム — 許容誤差内) を再検査する** (underflow の零 vector / overflow の Inf を index に入れない — 違反は同じ contract violation)、(5) 応答 metadata の `embedding_profile_hash`・`modality`・`distance` が期待 profile と一致する (同次元の別 vector space の混入を契約で拒否する — 不一致は同じ contract violation)。違反応答は全体 reject — contract violation として課金・再試行は §5.8 相 3 と同じ規則に従う ([04-pipeline.md §5.8](04-pipeline.md)。再試行分類は [04-pipeline.md §5.3](04-pipeline.md))。`failed_units` 相当の部分失敗 field を持たない **all-or-nothing 契約**である。
 
+Batch 応答の契約違反には、本節の「契約違反後の新規 Batch 停止」を優先して適用する。
+共通の再試行予算が残っていても、未解除の違反がある scope / embedding adapter の新規 Batch は送信しない。
+
 Text Embedding Adapter / Image Embedding Adapter は**採用しない**。同一 Embedding Adapter が同一 profile で多モダリティを単一 vector space へ写像する。
 
 > **実地検証済み — 単一 multimodal profile を採用 (2026-07-03 再検証で確定)**: 初回調査は「Gemini Embedding 2 multimodal は preview で pin 不可」を根拠に text-only 緩和を適用したが、事実誤認 (`gemini-embedding-2` は 2026-04-22 に GA、pinned stable 版あり) が判明し**撤回**。再検証 (`tasks/step3-embedding-verify.md` の再検証節) により本節冒頭の本来の契約どおり **単一マルチモーダル Embedding Adapter** を採用する。確定 profile: **`gemini-embedding-2` (GA 版を Adapter が起動時解決して pin、§6) / 768 次元 (MRL 切り詰め — 切り詰め後次元も profile に固定) / cosine / `modality="multimodal"` / `mode="online"`** (Vertex はバッチ推論非対応のため sync 呼出 — client 側の並列は**タスク間** (別 batch_requests 行) で行い、単一タスク内の複数 request は直列 ([04-pipeline.md §5.4](04-pipeline.md) の縮退 2 相)。429 は rate_limit 分類で backoff — §5.5)。current enrichment は text chunk と chunk から参照される image object を同じ vector space に埋め込む。audio は現在の入力種別に含めない。text 品質は MTEB で前世代 text 専用モデルを上回り日本語も同格 (再検証節)。コスト: 10 万 chunk 初回 ≈ $10 (単月 budget 内)。**非 multimodal の embedding profile (`modality="text"` 等、別ベクトル空間への埋め込み) は採用不可** — tool-lock materialize / adapter 登録時に `KIO-E-EMBED-MODALITY-001` (exit 2) で拒否する ([03-data-model.md §7](03-data-model.md))。
@@ -611,8 +614,20 @@ Text Embedding Adapter / Image Embedding Adapter は**採用しない**。同一
 > - **回収は入力との全単射を検査する (2026-07-25 R24 で確定)**: 本節 (1) の全単射契約は
 >   collect 側にも適用する。task キーが**メンバ集合の digest** である (上記「task 単位 = job」)
 >   ことを利用し、**回収できた結果から digest を再計算して行の `input_hash` と突き合わせる**。
->   一致しなければ `Succeeded` ではなく contract violation として終端し、
->   欠けたメンバを次の (より小さい) job の対象として残す。スキーマ変更は不要。
+>   canonical な全 id が一意で、完全な集合の digest が一致することを、最初の CAS / DB 書込みより
+>   前に検証する。現在の profile に属する応答は全 vector の受入検査・正規化も先に完了する。
+>   不一致・欠落・余分・重複・不正 vector は、応答全体を `Outcome::ContractViolation` /
+>   `BatchState::Terminal` として保守的な予約見積りで精算する。部分保存しない。
+> - **契約違反後の新規 Batch 停止**: 同じ scope / embedding adapter に、未 reset の
+>   typed contract violation が一件でもあれば、新しい Batch 予約・送信を停止する。
+>   判定は terminal 行の `contract_violation_count > 0` と、その完全な task key / 現在の
+>   `submission_seq` に一致する cost ledger の outcome に基づく。自由文の error は判定に使わない。
+>   新しいメンバ集合・profile へ組み直しても解除しない。digest だけから不正応答の元メンバを
+>   推測しないための scope 単位の停止規則であり、既に送信した job の照会・精算は継続できる。
+>   明示した sync レーンにはこの Batch 停止を適用せず、その承認・予算・再試行規則を適用する。
+>   `KIO-E-EMBED-BATCH-CONTRACT-HOLD-001`（exit 4）は対象 attempt と完全な selector を示す。
+>   原因確認後の `kio batch retry --reset-violations <selector> --yes` で該当 count を解除する。
+>   過去の cost ledger は削除しない。通常の provider 失敗・期限切れはこの停止条件に含めない。
 >
 > - **実物の wire 形 (2026-07-25 実 API 実行で確定)**: 上の「照会」「回収」の記述は
 >   公式リファレンスの語彙に沿ったもので、**実際の応答とは 3 点ずれていた**。実行時に
@@ -711,13 +726,20 @@ sqlite-vec の制約で vector table を物理分割してもよいが、概念�
 >   (04 §4.1 の識別フィールド許可リストに追加、embedding 専用で他 profile のハッシュ不変)。
 >   これにより (a) 03 §7 の互換ゲートが非 contextual な旧ベクトル空間を **incompatible** と
 >   正しく判定し、(b) profile hash 変化が全 chunk の再埋め込みを再起動する。
+> - **本文の構築**: 認証済み chunk CAS の本文から、NFC 正規化 → NUL 除去 → Markdown の
+>   escape / entity 解決の順で検索用本文を導出し、上記 filename prefix と結合する。
+>   fenced block / inline code 内の escape は解決しない。FTS と embedding は同じ純粋関数を使い、
+>   SQLite の `chunks.text` を送信本文の正本として読まない。`text_hash` は変換前の認証済み
+>   本文に対する hash のままとする。この構築規則を変更するときは `input_construction` を更新し、
+>   同じ profile / embedding identity に異なる入力を混在させない。
 > - **content dedup の縮退**: cross-file の content-twin 再利用 (CT3-EMBED-006 / R19-4) は
 >   同一 `(text_hash, context)` = 実質同一ファイル名に縮退する。これは意図した挙動 (contextual
 >   ベクトルはファイルごとに異なるべき)。twin 収束の自己修復経路自体はコード上は健在
 >   (同一 context の twin で発火)。
-> - **rebuild/snapshot**: 1 つの `text_hash` が複数 `embeddings` 行を持ち得るため、
->   `embeddings.context_key` 列で chunk ごとに正しい行を選ぶ (単一候補は従来どおり素通り =
->   pre-addendum ストア不変)。
+> - **rebuild/snapshot**: 一つの `text_hash` が複数の filename context を持ち得る。
+>   保存済み embedding を全 context について再構築し、現行 policy が許可する HEAD の名前を優先して
+>   scalar 検索 vector を決定する。詳細は [04 §4.3](04-pipeline.md) の選択規則に従う。
+>   候補が一つでも context 不一致を受理せず、応答順序による上書きで選択しない。
 >
 > **ローカル multimodal embedding の identity 規約 (2026-07-26 確定)**:
 > `execution_mode = "offline_api"` の Embedding Adapter (ローカル embedding server) を

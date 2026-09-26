@@ -13,6 +13,21 @@ use serde_json::{Value, json};
 use crate::commands::{AdapterStatusArgs, AdapterTarget, ApproveArgs, RevokeArgs};
 use crate::grants::{GrantBinding, GrantOperation, GrantRecord, GrantState, PrivateGrantStore};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdapterRole {
+    Markdown,
+    Embedding,
+}
+
+impl AdapterRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Markdown => "markdown",
+            Self::Embedding => "embedding",
+        }
+    }
+}
+
 pub(crate) fn store_path() -> PathBuf {
     super::data_home().join("kio/grants/grants.json")
 }
@@ -34,7 +49,7 @@ fn selected_tool(target: &AdapterTarget) -> Result<Option<&str>> {
 /// nor this command's config update must silently invalidate an unrelated grant.
 fn binding(
     repo: &Repository,
-    role: &str,
+    role: AdapterRole,
     tool_id: &str,
     profile: &str,
     operation: GrantOperation,
@@ -62,7 +77,7 @@ fn binding(
         })
         .collect::<Vec<_>>();
     let identity = runtime_execution_identity(RuntimeExecutionIdentityRequest {
-        role,
+        role: role.as_str(),
         tool_id,
         tool_profile_hash: profile,
     })
@@ -83,36 +98,55 @@ fn binding(
     })
 }
 
-fn configured_bindings(repo: &Repository) -> Result<Vec<GrantBinding>> {
-    let markdown = match super::active_local_ocr_execution() {
-        Some(execution) => kio_adapter::local_ocr_markdownize::profile_for(execution),
-        None => super::online_markdownize_profile_for(repo)?,
+fn configured_profile(repo: &Repository, role: AdapterRole) -> Result<Option<(String, String)>> {
+    // Validate the declared role before its optional execution resolver: an
+    // invalid declaration must remain an error, not look like an absent lane.
+    if let Some(declared) = kio_adapter::tool_lock::registered_declared_adapter(role.as_str()) {
+        kio_adapter::tool_lock::validate_declared_runtime_target(role.as_str(), &declared)
+            .map_err(super::adapter_to_kio)?;
+    }
+    let (tool_id, profile) = match role {
+        AdapterRole::Markdown => {
+            let profile = match super::active_local_ocr_execution() {
+                Some(execution) => kio_adapter::local_ocr_markdownize::profile_for(execution),
+                None => super::online_markdownize_profile_for(repo)?,
+            };
+            (profile.adapter_id, profile.tool_profile_hash)
+        }
+        AdapterRole::Embedding => {
+            let Some(execution) = super::embedding_execution() else {
+                return Ok(None);
+            };
+            // A library has no external recipient to approve.
+            if super::embedding_is_deterministic(execution) {
+                return Ok(None);
+            }
+            let profile = super::declared_embedding_profile(execution);
+            (profile.tool_id, profile.profile_hash)
+        }
     };
-    let mut bindings = vec![binding(
-        repo,
-        "markdown",
-        &markdown.adapter_id,
-        &markdown.tool_profile_hash,
-        GrantOperation::Network,
-    )?];
-    if let Some(execution) = super::embedding_execution() {
-        let profile = super::declared_embedding_profile(execution);
-        // A library executes inside Kio and has no external recipient to grant.
-        if matches!(
-            execution,
-            kio_adapter::catalog::EmbeddingExecution::Online(_)
-                | kio_adapter::catalog::EmbeddingExecution::Offline(_)
-        ) {
-            bindings.push(binding(
-                repo,
-                "embedding",
-                &profile.tool_id,
-                &profile.profile_hash,
-                GrantOperation::Network,
-            )?);
+    Ok(Some((tool_id, profile)))
+}
+
+fn configured_binding(
+    repo: &Repository,
+    role: AdapterRole,
+    operation: GrantOperation,
+) -> Result<Option<GrantBinding>> {
+    let Some((tool_id, profile)) = configured_profile(repo, role)? else {
+        return Ok(None);
+    };
+    binding(repo, role, &tool_id, &profile, operation).map(Some)
+}
+
+fn configured_bindings(repo: &Repository) -> Result<Vec<(AdapterRole, GrantBinding)>> {
+    let mut bindings = Vec::new();
+    for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
+        if let Some(binding) = configured_binding(repo, role, GrantOperation::Network)? {
+            bindings.push((role, binding));
         }
     }
-    bindings.sort_by(|a, b| a.tool_id.cmp(&b.tool_id));
+    bindings.sort_by(|a, b| a.1.tool_id.cmp(&b.1.tool_id));
     Ok(bindings)
 }
 
@@ -120,9 +154,10 @@ fn configured_bindings(repo: &Repository) -> Result<Vec<GrantBinding>> {
 /// still require their own exact grant at dispatch: an embedding grant must
 /// neither authorize Markdown conversion nor require that unrelated grant.
 pub(crate) fn any_network_allowed(repo: &Repository) -> Result<bool> {
-    for binding in configured_bindings(repo)? {
+    for (role, binding) in configured_bindings(repo)? {
         if allowed(
             repo,
+            role,
             &binding.tool_id,
             &binding.tool_profile_hash,
             GrantOperation::Network,
@@ -160,6 +195,7 @@ fn matching_record<'a>(
 
 pub(crate) fn allowed(
     repo: &Repository,
+    role: AdapterRole,
     tool_id: &str,
     profile: &str,
     operation: GrantOperation,
@@ -175,13 +211,15 @@ pub(crate) fn allowed(
     }) {
         return Ok(false);
     }
-    let role = if super::embedding_execution()
-        .is_some_and(|execution| super::declared_embedding_profile(execution).tool_id == tool_id)
-    {
-        "embedding"
-    } else {
-        "markdown"
+    let Some((current_tool, current_profile)) = configured_profile(repo, role)? else {
+        return Ok(false);
     };
+    // Persisted output identity is not current execution authority. In
+    // particular, rebuild may replay old public vectors with no active lane.
+    // Do not resolve an unrelated recipient when the requested identity drifted.
+    if current_tool != tool_id || current_profile != profile {
+        return Ok(false);
+    }
     let expected = binding(repo, role, tool_id, profile, operation)?;
     if expected.execution_mode == "online_api" {
         let document = repo.read_config_document()?;
@@ -204,6 +242,7 @@ pub(crate) fn allowed(
 
 pub(crate) fn allowed_at(
     kio_dir: &Path,
+    role: AdapterRole,
     tool_id: &str,
     profile: &str,
     operation: GrantOperation,
@@ -212,13 +251,18 @@ pub(crate) fn allowed_at(
         .parent()
         .ok_or_else(|| KioError::invalid_usage("scope store has no parent"))?;
     let repo = super::management::open_existing_managed_root(root)?;
-    allowed(&repo, tool_id, profile, operation)
+    allowed(&repo, role, tool_id, profile, operation)
 }
 
 /// Whether this exact external recipient may receive secret content. A grant
 /// for another configured adapter is neither required nor sufficient.
-pub(crate) fn secrets_allowed(repo: &Repository, tool_id: &str, profile: &str) -> Result<bool> {
-    allowed(repo, tool_id, profile, GrantOperation::SendSecrets)
+pub(crate) fn secrets_allowed(
+    repo: &Repository,
+    role: AdapterRole,
+    tool_id: &str,
+    profile: &str,
+) -> Result<bool> {
+    allowed(repo, role, tool_id, profile, GrantOperation::SendSecrets)
 }
 
 fn open_network_policy(repo: &Repository) -> Result<()> {
@@ -240,7 +284,7 @@ pub(crate) fn approve(args: ApproveArgs) -> Result<Value> {
     let repo = super::open_current_recovery_repository()?;
     let selected = configured_bindings(&repo)?
         .into_iter()
-        .filter(|b| tool.is_none_or(|tool| b.tool_id == tool))
+        .filter(|(_, b)| tool.is_none_or(|tool| b.tool_id == tool))
         .collect::<Vec<_>>();
     if selected.is_empty() {
         return Err(KioError::invalid_usage(
@@ -248,7 +292,7 @@ pub(crate) fn approve(args: ApproveArgs) -> Result<Value> {
         ));
     }
     let preview = json!({"status":"preview", "scope_id":repo.scope_identity()?.scope_id,
-        "adapters":selected, "send_secrets":args.send_secrets, "resume":args.resume});
+        "adapters":selected.iter().map(|(_, binding)| binding).collect::<Vec<_>>(), "send_secrets":args.send_secrets, "resume":args.resume});
     if args.preview {
         return Ok(preview);
     }
@@ -266,14 +310,14 @@ pub(crate) fn approve(args: ApproveArgs) -> Result<Value> {
     let _lock = repo.lock_store()?;
     let refreshed = configured_bindings(&repo)?
         .into_iter()
-        .filter(|b| tool.is_none_or(|tool| b.tool_id == tool))
+        .filter(|(_, b)| tool.is_none_or(|tool| b.tool_id == tool))
         .collect::<Vec<_>>();
     if refreshed != selected {
         return Err(denied("adapter identity changed after confirmation"));
     }
     let mut store = PrivateGrantStore::open_or_create(&store_path())?;
     let mut outcomes = Vec::new();
-    for expected in selected {
+    for (role, expected) in selected {
         let rows = repo.read_network_approvals()?;
         let row = rows
             .iter()
@@ -382,21 +426,7 @@ pub(crate) fn approve(args: ApproveArgs) -> Result<Value> {
         published["status"] = json!("active");
         repo.publish_network_approval(published, Some(&intent))?;
         approval_checkpoint("scope_published")?;
-        let role = if super::embedding_execution()
-            .is_some_and(|e| super::declared_embedding_profile(e).tool_id == expected.tool_id)
-        {
-            "embedding"
-        } else {
-            "markdown"
-        };
-        if binding(
-            &repo,
-            role,
-            &expected.tool_id,
-            &expected.tool_profile_hash,
-            GrantOperation::Network,
-        )? != expected
-        {
+        if configured_binding(&repo, role, GrantOperation::Network)?.as_ref() != Some(&expected) {
             return Err(denied(
                 "adapter authority changed during approval publication",
             ));
@@ -462,13 +492,27 @@ pub(crate) fn status(args: AdapterStatusArgs) -> Result<Value> {
             .is_none_or(|id| row.get("tool_id").and_then(Value::as_str) == Some(id))
     });
     let mut effective = Vec::new();
+    let configured = configured_bindings(&repo);
     for record in &records {
-        let check = allowed(
-            &repo,
-            &record.binding.tool_id,
-            &record.binding.tool_profile_hash,
-            record.binding.operation,
-        );
+        // Roles are carried by current configuration, never guessed from a
+        // historical grant's tool ID. Unsupported/absent identities stay inert.
+        let check = match &configured {
+            Ok(bindings) => match bindings.iter().find(|(_, binding)| {
+                binding.tool_id == record.binding.tool_id
+                    && binding.tool_profile_hash == record.binding.tool_profile_hash
+            }) {
+                Some((role, _)) => allowed(
+                    &repo,
+                    *role,
+                    &record.binding.tool_id,
+                    &record.binding.tool_profile_hash,
+                    record.binding.operation,
+                )
+                .map_err(|error| error.error_code().to_owned()),
+                None => Ok(false),
+            },
+            Err(error) => Err(error.error_code().to_owned()),
+        };
         let (permitted, reason) = match check {
             Ok(true)
                 if record.state == GrantState::Active
@@ -482,7 +526,7 @@ pub(crate) fn status(args: AdapterStatusArgs) -> Result<Value> {
                 false,
                 Some("current_scope_or_device_binding_does_not_match".to_owned()),
             ),
-            Err(error) => (false, Some(error.error_code().to_owned())),
+            Err(error_code) => (false, Some(error_code)),
         };
         effective.push(json!({"grant_id":record.grant_id, "permitted":permitted, "reason":reason}));
     }

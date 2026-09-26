@@ -21,6 +21,8 @@ pub use rows::{
     ChunkRow, EmbeddingDistance, EmbeddingModality, EmbeddingRow, EmbeddingTargetType, TreeEntryRow,
 };
 
+pub use search_projection::project_search_text;
+
 pub type Result<T> = std::result::Result<T, IndexError>;
 
 #[derive(Debug, Error)]

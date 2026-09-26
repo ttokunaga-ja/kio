@@ -11,8 +11,7 @@
 //! never a candidate at all.
 //!
 //! So the escapes are resolved here, in the derived projection, exactly like
-//! the NUL stripping and the NFC normalization that already live beside this
-//! call. Identity is untouched — `chunk_id`, `text_hash`, `byte_start/end` and
+//! the NUL stripping and the NFC normalization in `project_search_text`. Identity is untouched — `chunk_id`, `text_hash`, `byte_start/end` and
 //! the persisted `chunks.jsonl` / normalized Markdown all still carry the
 //! escaped bytes, and evidence offsets still resolve against those.
 //!
@@ -33,18 +32,21 @@
 //! `\(\s*\)`, `AppData\Local\Temp`, JSON `\"` — to repair 23. Inside code a
 //! backslash is not an escape and a reader sees it, so the projection keeps it.
 //!
-//! One consequence is worth naming, and it belongs to the projection as a whole
-//! rather than to this step: `chunks.text` is also what the embedding path
-//! sends to the adapter (`retained_history_chunks` selects it), while the
-//! embedding identity is keyed on `text_hash` over the ORIGINAL bytes. That
-//! stays consistent, because the projection is a pure function of the text — one
-//! `text_hash` still means exactly one embedding input — but a vector computed
-//! before this change is reused rather than recomputed. The documents this
-//! actually reaches are the recovered-OCR ones, and their `markdown.text` moved
-//! in the same round for an unrelated reason, so their `text_hash` moved with it
-//! and they re-embed on their own.
+//! FTS and embedding inputs share this pure projection. Embedding callers derive
+//! it from authenticated canonical CAS text, never from the mutable SQLite text
+//! column. Canonical text hashes and evidence offsets remain over original bytes.
+
+use unicode_normalization::UnicodeNormalization;
 
 use crate::chunking::is_fence_delimiter;
+
+/// Derive searchable text without changing canonical text identity or offsets.
+/// Apply NFC first, strip U+0000 second, then resolve Markdown escapes outside
+/// code spans and fences. The transformation order is part of the projection.
+#[must_use]
+pub fn project_search_text(text: &str) -> String {
+    resolve_markdown_escapes(&text.nfc().collect::<String>().replace('\u{0}', ""))
+}
 
 /// Resolve Markdown escapes so the index holds the text a reader sees.
 ///
@@ -137,6 +139,13 @@ fn decode_entity(characters: &mut std::iter::Peekable<std::str::Chars<'_>>) -> O
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn projection_applies_nfc_then_nul_removal_then_body_escape_resolution() {
+        let source = "e\u{301} e\0\u{301} \\\0! &a\0mp; `e\u{301} \\\0! &amp;`\n```\ne\u{301} \\\0! &amp;\n```\n";
+        let expected = "é e\u{301} ! & `é \\! &amp;`\n```\né \\! &amp;\n```\n";
+        assert_eq!(project_search_text(source), expected);
+    }
 
     #[test]
     fn escaped_punctuation_is_resolved_in_body_text() {

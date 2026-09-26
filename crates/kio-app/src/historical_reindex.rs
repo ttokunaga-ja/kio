@@ -158,7 +158,6 @@ struct SelectedInstance {
     raw_hash: String,
     normalize: NormalizeRef,
     raw_path: String,
-    embedding_path: String,
     /// Every exact owner name carried by aliases of this normalized identity in
     /// the selected tree.  Policy is evaluated against these names before a
     /// presentation/context alias is reduced.
@@ -179,10 +178,9 @@ pub(super) struct RetainedNormalizedInstance {
     pub(super) raw_hash: String,
     pub(super) normalize: NormalizeRef,
     pub(super) raw_path: String,
-    pub(super) embedding_path: String,
-    /// Complete exact owner-name set for this identity.  `raw_path` remains
-    /// presentation-only and `embedding_path` preserves conservative secret
-    /// consent; neither may discard an alias before current policy evaluates it.
+    /// Complete owner-name set, including raw aliases from retained history.
+    /// `raw_path` is presentation-only; policy must evaluate every alias before
+    /// reducing the set. Embedding authority comes from the exact owner collector.
     pub(super) policy_paths: BTreeSet<String>,
     /// PC37/PC41/PC43 (05 §1.6 L265-266): every ancestor-most (mutually
     /// incomparable) introduction commit for this content identity, sorted by
@@ -214,16 +212,15 @@ pub(super) fn retained_history_instances(
     head: &str,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
     let graph = HistoryReader::new(kio_dir).walk(head)?;
-    retained_history_instances_from_graph(kio_dir, &graph, std::iter::once(head))
+    retained_history_instances_from_graph(kio_dir, &graph)
 }
 
 /// Derive retained instances from a complete strict graph.  Keeping the graph
 /// shared across all durable roots prevents repeated CAS walks of overlapping
 /// ancestry while calculating introductions against the complete union.
-fn retained_history_instances_from_graph<'a>(
+fn retained_history_instances_from_graph(
     kio_dir: &Path,
     graph: &kio_core::history::LinearHistory,
-    roots: impl IntoIterator<Item = &'a str>,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
     let mut all_paths_by_raw = BTreeMap::<String, BTreeSet<String>>::new();
     for appearance in graph.bindings() {
@@ -231,17 +228,6 @@ fn retained_history_instances_from_graph<'a>(
             .entry(appearance.binding.raw_hash)
             .or_default()
             .insert(appearance.binding.path);
-    }
-    let mut current_paths_by_raw = BTreeMap::<String, BTreeSet<String>>::new();
-    for root in roots {
-        if let Some(snapshot) = graph.node(root) {
-            for entry in &snapshot.tree.entries {
-                current_paths_by_raw
-                    .entry(entry.raw_hash.clone())
-                    .or_default()
-                    .insert(entry.path.clone());
-            }
-        }
     }
     let exact_bindings = graph
         .bindings()
@@ -325,17 +311,6 @@ fn retained_history_instances_from_graph<'a>(
         let all_paths = all_paths_by_raw
             .get(&raw_hash)
             .ok_or_else(|| KioError::schema("retained raw identity has no historical path"))?;
-        let embedding_path = all_paths
-            .iter()
-            .find(|path| classify_secret(path).is_some())
-            .or_else(|| {
-                current_paths_by_raw
-                    .get(&raw_hash)
-                    .and_then(|paths| paths.first())
-            })
-            .or_else(|| all_paths.first())
-            .cloned()
-            .ok_or_else(|| KioError::schema("retained raw identity has no embedding path"))?;
         instances.push(RetainedNormalizedInstance {
             raw_hash,
             normalize: NormalizeRef {
@@ -348,7 +323,6 @@ fn retained_history_instances_from_graph<'a>(
                 manifest_hash,
             },
             raw_path: binding.path,
-            embedding_path,
             policy_paths: all_paths.clone(),
             introductions: ancestor_most,
         });
@@ -372,7 +346,7 @@ pub(super) fn retained_history_instances_for_roots(
         return Ok(Vec::new());
     }
     let (graph, _) = HistoryReader::new(kio_dir).walk_for_roots_allow_shallowed(roots)?;
-    retained_history_instances_from_graph(kio_dir, &graph, roots.iter().map(String::as_str))
+    retained_history_instances_from_graph(kio_dir, &graph)
 }
 
 pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool) -> Result<Value> {
@@ -462,19 +436,10 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
         selected
             .entry(key)
             .and_modify(|instance| {
-                // Chunk identity is path-independent. Keep output deterministic,
-                // while conservatively retaining a secret-classified alias for the
-                // embedding consent gate when any selected alias is secret.
+                // Chunk identity is path-independent. Keep presentation output
+                // deterministic while retaining all aliases for policy evaluation.
                 if entry.path.as_bytes() < instance.raw_path.as_bytes() {
                     instance.raw_path = entry.path.clone();
-                }
-                let existing_secret = classify_secret(&instance.embedding_path).is_some();
-                let candidate_secret = classify_secret(&entry.path).is_some();
-                if (candidate_secret && !existing_secret)
-                    || (candidate_secret == existing_secret
-                        && entry.path.as_bytes() < instance.embedding_path.as_bytes())
-                {
-                    instance.embedding_path = entry.path.clone();
                 }
                 instance.policy_paths.insert(entry.path.clone());
             })
@@ -482,7 +447,6 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
                 raw_hash: entry.raw_hash.clone(),
                 normalize: normalize.clone(),
                 raw_path: entry.path.clone(),
-                embedding_path: entry.path.clone(),
                 policy_paths: BTreeSet::from([entry.path.clone()]),
                 introductions: Vec::new(),
             });
@@ -678,7 +642,6 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
             raw_hash: instance.raw_hash,
             normalize: instance.normalize,
             raw_path: instance.raw_path,
-            embedding_path: instance.embedding_path,
             policy_paths: instance.policy_paths,
             introductions: instance.introductions,
         })
@@ -1056,12 +1019,7 @@ mod tests {
         let public_root = commit("public", "z-public.md", Some(secret_root.clone()));
         let roots = BTreeSet::from([public_root.clone(), secret_root.clone()]);
         let graph = HistoryReader::new(&kio_dir).walk_for_roots(&roots).unwrap();
-        let instances = retained_history_instances_from_graph(
-            &kio_dir,
-            &graph,
-            roots.iter().map(String::as_str),
-        )
-        .unwrap();
+        let instances = retained_history_instances_from_graph(&kio_dir, &graph).unwrap();
 
         assert_eq!(instances.len(), 1);
         let instance = &instances[0];
@@ -1071,8 +1029,9 @@ mod tests {
         assert_eq!(instance.raw_path, ".env");
         assert_eq!(instance.normalize.manifest_hash, normalize.manifest_hash);
         assert_eq!(
-            instance.embedding_path, ".env",
-            "embedding selection remains secret-conservative"
+            instance.policy_paths,
+            BTreeSet::from([".env".to_owned(), "z-public.md".to_owned()]),
+            "policy retains both secret and public aliases"
         );
     }
 

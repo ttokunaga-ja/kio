@@ -767,6 +767,19 @@ DOMAIN:
 
 GC planner 固有の `KIO-E-GC-PLAN-LIMIT-001` は commit / tree entry / verified byte / ref / receipt / directory entry / path depth / graph traversal cap 超過を表し、exit 4 とする (§6.1)。`KIO-E-GC-RUNTIME-LIMIT-001` はbounded automatic sliceが安全なcheckpointで期限へ達したことを表すretryable exit 3であり、corruptionではない。`KIO-E-GC-CONFIG-CHANGED-001` はautomatic writer開始時に固定した`[gc]` authorityがpublication-to-GC handoff中に変化したため、publicationを保持したままGCを開始しなかったことを表すretryable exit 3である。
 
+`KIO-E-EMBED-PLAN-LIMIT-001` は保持済み履歴からの埋め込み候補収集が、100,000 件または
+128 MiB の文字列 payload 上限を超過したことを表す（exit 4）。context の `dimension` は
+`candidate_pairs` / `payload_bytes`、`count` は超過予定値（算術 overflow 時は `"overflow"`）、
+`limit` はその上限である。部分的な候補集合は返さない。計上範囲は [04-pipeline.md §4.3](04-pipeline.md) を参照。
+
+`KIO-E-EMBED-BATCH-CONTRACT-HOLD-001` は同じ scope / embedding adapter に未解除の
+Batch 応答契約違反があるため、新規 Batch の予約・送信を停止したことを表す（exit 4）。
+context は `scope_id`、`adapter_kind` と、各 `blocked_attempts` の `input_hash`、
+`tool_profile_hash`、`submission_seq`、完全な selector を含む。原因確認後、対象ごとに
+`kio batch retry --reset-violations <selector> --yes` を実行して解除する。
+既に送信した job の照会・精算、別途承認された sync レーンはこの停止の対象外とする。
+停止判定の正本は [07-adapter-spec.md §5.3](07-adapter-spec.md)。
+
 Evidence 解決の現行 code は、purged raw の tombstone 応答を
 `KIO-E-PURGE-TOMBSTONED-001` (exit 4)、raw/chunk の両方に一致する短縮 hash を
 `KIO-E-EVIDENCE-SCOPE-AMBIGUOUS-001` (exit 2)、同一 profile の chunk 未実体化を

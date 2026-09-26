@@ -191,7 +191,13 @@ impl Fixture {
     }
 
     fn network_allowed(&self, profile: &str) -> bool {
-        super::persistent_network_allowed_for(&self.repo, TOOL_ID, profile).unwrap()
+        super::persistent_network_allowed_for(
+            &self.repo,
+            super::approvals::AdapterRole::Markdown,
+            TOOL_ID,
+            profile,
+        )
+        .unwrap()
     }
 
     fn in_context<T>(
@@ -394,7 +400,15 @@ fn interrupted_approval_recovers_only_with_the_exact_pending_pair_and_resume_sel
                 !fixture.network_allowed(&profile),
                 "{phase} must not authorize before device activation"
             );
-            assert!(!super::approvals::secrets_allowed(&fixture.repo, TOOL_ID, &profile).unwrap());
+            assert!(
+                !super::approvals::secrets_allowed(
+                    &fixture.repo,
+                    super::approvals::AdapterRole::Markdown,
+                    TOOL_ID,
+                    &profile
+                )
+                .unwrap()
+            );
         }
 
         let resumed = fixture
@@ -407,8 +421,13 @@ fn interrupted_approval_recovers_only_with_the_exact_pending_pair_and_resume_sel
         assert_eq!(resumed["status"], "approved");
         assert!(fixture.network_allowed(&fixture.active_profile()));
         assert!(
-            super::approvals::secrets_allowed(&fixture.repo, TOOL_ID, &fixture.active_profile(),)
-                .unwrap()
+            super::approvals::secrets_allowed(
+                &fixture.repo,
+                super::approvals::AdapterRole::Markdown,
+                TOOL_ID,
+                &fixture.active_profile(),
+            )
+            .unwrap()
         );
     }
 }
@@ -437,7 +456,15 @@ fn revoke_after_an_interrupted_pair_prevents_resume_and_any_send() {
         .unwrap_err();
     assert_eq!(error.error_code(), "KIO-E-ADAPTER-APPROVAL-REQUIRED-001");
     assert!(!fixture.network_allowed(&profile));
-    assert!(!super::approvals::secrets_allowed(&fixture.repo, TOOL_ID, &profile).unwrap());
+    assert!(
+        !super::approvals::secrets_allowed(
+            &fixture.repo,
+            super::approvals::AdapterRole::Markdown,
+            TOOL_ID,
+            &profile
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -464,7 +491,15 @@ fn copied_scope_approval_reference_cannot_reuse_the_source_device_grant() {
     copied.publish_network_approval(source_row, None).unwrap();
 
     assert_eq!(copied.read_network_approvals().unwrap().len(), 1);
-    assert!(!super::persistent_network_allowed_for(&copied, TOOL_ID, &profile).unwrap());
+    assert!(
+        !super::persistent_network_allowed_for(
+            &copied,
+            super::approvals::AdapterRole::Markdown,
+            TOOL_ID,
+            &profile
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -488,18 +523,205 @@ fn profile_or_network_policy_change_denies_until_an_explicit_approval_command() 
 }
 
 #[test]
+fn embedding_grants_require_the_explicit_current_role_and_profile() {
+    use super::approvals::{AdapterRole, allowed};
+    use super::grants::GrantOperation;
+    use kio_adapter::tool_lock::{AdapterRuntimeSettings, DeclaredAdapter, with_runtime_settings};
+    use kio_core::test_control::{DebugTestControl, GeminiEmbedMode, Selector, install_scoped};
+
+    let fixture = Fixture::new();
+    let _control = install_scoped(DebugTestControl::default());
+    let settings = AdapterRuntimeSettings {
+        declarations: [(
+            "embedding".to_owned(),
+            DeclaredAdapter {
+                tool_id: Some("gemini_embedding_2".to_owned()),
+                auth: Some("env:KIO_TEST_APPROVAL_EMBED_KEY".to_owned()),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    with_runtime_settings(settings, || {
+        let profile = super::declared_embedding_profile(super::embedding_execution().unwrap());
+        let target = AdapterTarget::Tool(profile.tool_id.clone());
+        let preview = fixture
+            .in_context(|| {
+                super::approvals::approve(ApproveArgs {
+                    target: target.clone(),
+                    preview: true,
+                    yes: false,
+                    resume: None,
+                    send_secrets: true,
+                })
+            })
+            .unwrap();
+        assert_eq!(preview["adapters"][0]["tool_id"], profile.tool_id);
+        assert!(
+            preview["adapters"][0].get("role").is_none(),
+            "role does not alter preview schema"
+        );
+        fixture.approve_with(target, None, true).unwrap();
+        let grants = fs::read(fixture.grant_path()).unwrap();
+        let scope_approvals = fixture.repo.read_network_approvals().unwrap();
+        let query = |role, requested_profile: &str, operation| {
+            allowed(
+                &fixture.repo,
+                role,
+                &profile.tool_id,
+                requested_profile,
+                operation,
+            )
+        };
+        for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
+            assert!(query(AdapterRole::Embedding, &profile.profile_hash, operation).unwrap());
+            assert!(!query(AdapterRole::Markdown, &profile.profile_hash, operation).unwrap());
+            assert!(!query(AdapterRole::Embedding, "sha256:drifted-profile", operation).unwrap());
+        }
+        assert!(
+            fixture.status()["effective"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|row| row["permitted"] == true)
+        );
+
+        // Persisted embedding grants cannot borrow Markdown runtime authority
+        // when rebuild has no active embedding adapter.
+        with_runtime_settings(AdapterRuntimeSettings::default(), || {
+            assert!(super::embedding_execution().is_none());
+            for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
+                assert!(!query(AdapterRole::Embedding, &profile.profile_hash, operation).unwrap());
+            }
+            assert!(
+                fixture.status()["effective"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|row| row["permitted"] == false)
+            );
+        });
+        {
+            // The existing CLI rebuild regression uses this mismatched profile.
+            let mut control = DebugTestControl::default();
+            control.adapters.gemini_embed = Selector::Known(GeminiEmbedMode::IncompatibleProfile);
+            let _drift = install_scoped(control);
+            let current = super::declared_embedding_profile(super::embedding_execution().unwrap());
+            assert_ne!(current.profile_hash, profile.profile_hash);
+            for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
+                assert!(!query(AdapterRole::Embedding, &profile.profile_hash, operation).unwrap());
+            }
+        }
+        // Querying absence/drift never rewrites grants; restoring the exact
+        // currently configured identity restores its existing exact approval.
+        assert!(
+            query(
+                AdapterRole::Embedding,
+                &profile.profile_hash,
+                GrantOperation::SendSecrets
+            )
+            .unwrap()
+        );
+        assert_eq!(fs::read(fixture.grant_path()).unwrap(), grants);
+        assert_eq!(
+            fixture.repo.read_network_approvals().unwrap(),
+            scope_approvals
+        );
+    });
+}
+
+#[test]
+fn approval_query_preserves_current_runtime_and_config_errors() {
+    use super::approvals::{AdapterRole, allowed};
+    use super::grants::GrantOperation;
+    use kio_adapter::tool_lock::{AdapterRuntimeSettings, DeclaredAdapter, with_runtime_settings};
+    use kio_core::test_control::{DebugTestControl, install_scoped};
+
+    let fixture = Fixture::new();
+    let _control = install_scoped(DebugTestControl::default());
+    fixture.approve(true);
+    let profile = fixture.active_profile();
+    let malformed = AdapterRuntimeSettings {
+        declarations: [(
+            "markdown".to_owned(),
+            DeclaredAdapter {
+                tool_id: Some(TOOL_ID.to_owned()),
+                kind: Some("online_api".to_owned()),
+                url: Some("https://unexpected.example".to_owned()),
+                ..Default::default()
+            },
+        )]
+        .into_iter()
+        .collect(),
+        ..Default::default()
+    };
+    with_runtime_settings(malformed, || {
+        assert!(
+            allowed(
+                &fixture.repo,
+                AdapterRole::Markdown,
+                TOOL_ID,
+                &profile,
+                GrantOperation::SendSecrets
+            )
+            .is_err()
+        );
+    });
+    let before = fixture.repo.read_config_document().unwrap();
+    // Simulate external corruption; the production replacement API correctly
+    // refuses malformed config before it can be written.
+    fs::write(fixture.repo.kio_dir().join("config.toml"), "[invalid").unwrap();
+    assert!(
+        allowed(
+            &fixture.repo,
+            AdapterRole::Markdown,
+            TOOL_ID,
+            &profile,
+            GrantOperation::SendSecrets
+        )
+        .is_err()
+    );
+    fs::write(fixture.repo.kio_dir().join("config.toml"), &before).unwrap();
+    assert!(
+        allowed(
+            &fixture.repo,
+            AdapterRole::Markdown,
+            TOOL_ID,
+            &profile,
+            GrantOperation::SendSecrets
+        )
+        .unwrap()
+    );
+}
+
+#[test]
 fn network_and_send_secrets_grants_are_distinct_permissions() {
     let fixture = Fixture::new();
     fixture.approve(false);
     let profile = fixture.active_profile();
     assert!(fixture.network_allowed(&profile));
-    assert!(!super::approvals::secrets_allowed(&fixture.repo, TOOL_ID, &profile).unwrap());
+    assert!(
+        !super::approvals::secrets_allowed(
+            &fixture.repo,
+            super::approvals::AdapterRole::Markdown,
+            TOOL_ID,
+            &profile
+        )
+        .unwrap()
+    );
 
     fixture.approve(true);
     assert!(fixture.network_allowed(&fixture.active_profile()));
     assert!(
-        super::approvals::secrets_allowed(&fixture.repo, TOOL_ID, &fixture.active_profile())
-            .unwrap()
+        super::approvals::secrets_allowed(
+            &fixture.repo,
+            super::approvals::AdapterRole::Markdown,
+            TOOL_ID,
+            &fixture.active_profile()
+        )
+        .unwrap()
     );
 }
 
@@ -513,7 +735,15 @@ fn reregistration_generation_invalidates_network_and_secret_grants_without_path_
     let grant_bytes = fs::read(fixture.grant_path()).unwrap();
     let scope_rows = fixture.repo.read_network_approvals().unwrap();
     assert!(fixture.network_allowed(&profile));
-    assert!(super::approvals::secrets_allowed(&fixture.repo, TOOL_ID, &profile).unwrap());
+    assert!(
+        super::approvals::secrets_allowed(
+            &fixture.repo,
+            super::approvals::AdapterRole::Markdown,
+            TOOL_ID,
+            &profile
+        )
+        .unwrap()
+    );
 
     advance_registration_generation(&fixture.repo);
 
@@ -524,7 +754,15 @@ fn reregistration_generation_invalidates_network_and_secret_grants_without_path_
     assert_eq!(fs::read(fixture.grant_path()).unwrap(), grant_bytes);
     assert_eq!(fixture.repo.read_network_approvals().unwrap(), scope_rows);
     assert!(!fixture.network_allowed(&profile));
-    assert!(!super::approvals::secrets_allowed(&fixture.repo, TOOL_ID, &profile).unwrap());
+    assert!(
+        !super::approvals::secrets_allowed(
+            &fixture.repo,
+            super::approvals::AdapterRole::Markdown,
+            TOOL_ID,
+            &profile
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -563,8 +801,24 @@ fn ancestor_reregistration_invalidates_a_childs_network_and_secret_grants() {
     let parent_generation = registration_generation(&fixture.repo);
     let grant_bytes = fs::read(fixture.grant_path()).unwrap();
     let scope_rows = child.read_network_approvals().unwrap();
-    assert!(super::persistent_network_allowed_for(&child, TOOL_ID, &profile).unwrap());
-    assert!(super::approvals::secrets_allowed(&child, TOOL_ID, &profile).unwrap());
+    assert!(
+        super::persistent_network_allowed_for(
+            &child,
+            super::approvals::AdapterRole::Markdown,
+            TOOL_ID,
+            &profile
+        )
+        .unwrap()
+    );
+    assert!(
+        super::approvals::secrets_allowed(
+            &child,
+            super::approvals::AdapterRole::Markdown,
+            TOOL_ID,
+            &profile
+        )
+        .unwrap()
+    );
 
     advance_registration_generation(&fixture.repo);
 
@@ -578,8 +832,24 @@ fn ancestor_reregistration_invalidates_a_childs_network_and_secret_grants() {
     );
     assert_eq!(fs::read(fixture.grant_path()).unwrap(), grant_bytes);
     assert_eq!(child.read_network_approvals().unwrap(), scope_rows);
-    assert!(!super::persistent_network_allowed_for(&child, TOOL_ID, &profile).unwrap());
-    assert!(!super::approvals::secrets_allowed(&child, TOOL_ID, &profile).unwrap());
+    assert!(
+        !super::persistent_network_allowed_for(
+            &child,
+            super::approvals::AdapterRole::Markdown,
+            TOOL_ID,
+            &profile
+        )
+        .unwrap()
+    );
+    assert!(
+        !super::approvals::secrets_allowed(
+            &child,
+            super::approvals::AdapterRole::Markdown,
+            TOOL_ID,
+            &profile
+        )
+        .unwrap()
+    );
 }
 
 #[test]
