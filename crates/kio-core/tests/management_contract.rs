@@ -8,8 +8,8 @@ use kio_core::management::{
     detect_case_insensitive, detect_case_insensitive_in_directory, directory_identity_from_handle,
     enroll_child, finish_registration, initialize_child, initialize_root, observe_direct_child,
     peek_registration_marker, planned_child_management_record, publish_registration_record,
-    read_record, read_registration_recovery_record, recorded_child_root, validate_case_probe,
-    validate_live_chain, write_planned_child_management_record,
+    read_record, read_registration_recovery_record, recorded_child_root, revoke_child,
+    validate_case_probe, validate_live_chain, write_planned_child_management_record,
 };
 #[cfg(unix)]
 use kio_core::management::{
@@ -130,6 +130,42 @@ fn root_child_grandchild_requires_a_complete_reciprocal_chain() {
     assert_eq!(chain.scopes[0].record.scope_id, grandchild_id);
     assert_eq!(chain.scopes[2].record.scope_id, root_id);
     assert!(!chain.digest_input.is_empty());
+}
+
+#[test]
+fn retained_target_binding_observes_ancestor_grant_revocation() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = scope(temp.path(), "root");
+    initialize_root(&root, scope_id(&root), false).unwrap();
+    let child = scope(root.canonical_root(), "child");
+    let child_id = scope_id(&child);
+    enroll_child(
+        &root,
+        "child",
+        &child_id,
+        "child-token",
+        child.directory_identity(),
+    )
+    .unwrap();
+    initialize_child(&root, &child, &child_id, "child-token").unwrap();
+    let grandchild = scope(child.canonical_root(), "grandchild");
+    let grandchild_id = scope_id(&grandchild);
+    enroll_child(
+        &child,
+        "grandchild",
+        &grandchild_id,
+        "grandchild-token",
+        grandchild.directory_identity(),
+    )
+    .unwrap();
+    initialize_child(&child, &grandchild, &grandchild_id, "grandchild-token").unwrap();
+
+    assert_eq!(validate_live_chain(&grandchild).unwrap().scopes.len(), 3);
+    assert!(revoke_child(&root, "child").unwrap());
+    assert_eq!(
+        validate_live_chain(&grandchild).unwrap_err().error_code(),
+        "KIO-E-MANAGEMENT-AUTHORITY-001"
+    );
 }
 
 #[test]

@@ -842,8 +842,8 @@ pub fn planned_management_record_bytes(record: &ManagementRecord) -> Result<Vec<
 }
 pub fn validate_live_chain(target: &ManagementBinding) -> Result<ValidatedManagementChain> {
     let (mut current, mut seen, mut scopes) = (target.clone(), BTreeSet::new(), Vec::new());
+    let mut r = read_record(&current)?;
     for _ in 0..MAX_MANAGEMENT_CHAIN_DEPTH {
-        let r = read_record(&current)?;
         if !seen.insert(r.scope_id.clone()) {
             return Err(err(
                 "management chain contains duplicate scope identity or cycle",
@@ -897,7 +897,10 @@ pub fn validate_live_chain(target: &ManagementBinding) -> Result<ValidatedManage
                 if parent_root != &root_scope_id {
                     return Err(err("child root identity does not match parent chain"));
                 }
-                current = parent
+                // Carry the same fresh record used for the reciprocal grant into
+                // the next authority check and the returned chain digest.
+                current = parent;
+                r = pr;
             }
         }
     }
