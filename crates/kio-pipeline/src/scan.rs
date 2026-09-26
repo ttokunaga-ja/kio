@@ -5,6 +5,8 @@ use std::fs::File;
 #[cfg(not(windows))]
 use std::fs::Metadata;
 use std::io::Read;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use cap_primitives::{ambient_authority, fs as cap_fs};

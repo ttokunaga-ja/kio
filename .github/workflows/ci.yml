@@ -40,6 +40,14 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install Linux renderer confinement runtime
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap
+          dpkg-query --show bubblewrap
+          /usr/bin/bwrap --unshare-net --unshare-pid --die-with-parent --new-session \
+            --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp -- /usr/bin/true
       - name: Check canonical workflow action references
         shell: bash
         run: |

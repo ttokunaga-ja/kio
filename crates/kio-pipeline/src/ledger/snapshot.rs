@@ -1142,11 +1142,14 @@ fn validate_test_barrier_parent(parent: &fs::File) -> Result<(), AttemptError> {
     }
     #[cfg(windows)]
     {
-        return Err(AttemptError::Unsafe(
+        Err(AttemptError::Unsafe(
             "test ledger barrier is unsupported on Windows without owner-DACL binding".into(),
-        ));
+        ))
     }
-    Ok(())
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
 }
 
 fn verify_private_leaf(
