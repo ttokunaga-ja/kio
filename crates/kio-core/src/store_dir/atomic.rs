@@ -741,7 +741,7 @@ fn recover_locked(
 mod tests {
     use std::{fs, io::Write, path::Path};
 
-    use tempfile::tempdir;
+    use tempfile::tempdir_in;
 
     use super::{
         AtomicWorkspaceState, Publication, RemoveIntent, StoreDirectory, directory_id, hash_file,
@@ -823,7 +823,12 @@ mod tests {
     }
 
     fn directories() -> (tempfile::TempDir, StoreDirectory, StoreDirectory) {
-        let root = tempdir().expect("temporary root");
+        let root = tempdir_in(
+            std::env::temp_dir()
+                .canonicalize()
+                .expect("canonical temporary root"),
+        )
+        .expect("temporary root");
         fs::create_dir(root.path().join("owner")).expect("owner directory");
         fs::create_dir(root.path().join("target")).expect("target directory");
         let owner = StoreDirectory::open(&root.path().join("owner")).expect("retained owner");

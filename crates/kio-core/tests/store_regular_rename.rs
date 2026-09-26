@@ -9,7 +9,7 @@ fn store(path: &Path) -> StoreDirectory {
 
 #[test]
 fn retained_owner_publishes_a_regular_file_into_a_distinct_retained_parent() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let owner = store(&root.path().join("owner"));
     let target = store(&root.path().join("target"));
 
@@ -31,7 +31,7 @@ fn retained_owner_publishes_a_regular_file_into_a_distinct_retained_parent() {
 
 #[test]
 fn create_only_does_not_replace_an_existing_regular_file() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let owner = store(&root.path().join("owner"));
     let target = store(&root.path().join("target"));
     target
@@ -61,7 +61,7 @@ fn create_only_does_not_replace_an_existing_regular_file() {
 
 #[test]
 fn upsert_replaces_a_verified_regular_file_across_retained_parents() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let owner = store(&root.path().join("owner"));
     let target = store(&root.path().join("target"));
     target
@@ -85,7 +85,7 @@ fn upsert_replaces_a_verified_regular_file_across_retained_parents() {
 
 #[test]
 fn private_gate_rejects_a_nonempty_existing_regular_file() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let store = store(root.path());
     store
         .write_atomic(Path::new("gate"), b"occupied", Publication::CreateOnly)
@@ -97,7 +97,7 @@ fn private_gate_rejects_a_nonempty_existing_regular_file() {
 #[cfg(windows)]
 #[test]
 fn atomic_write_rejects_ads_leaf_before_creating_a_workspace() {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
     let owner = store(&root.path().join("owner"));
     let target = store(&root.path().join("target"));
     std::fs::write(root.path().join("target/existing"), b"base").unwrap();

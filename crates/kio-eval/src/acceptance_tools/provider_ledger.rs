@@ -1175,7 +1175,7 @@ mod tests {
         let mut api = FakeApi::default();
         initialize(&mut api, &args()).unwrap();
         let reservation = reserve_all(&mut api, &args()).unwrap();
-        let root = tempfile::tempdir().unwrap();
+        let root = super::super::canonical_tempdir();
         let private = root.path().join("private");
         fs::create_dir(&private).unwrap();
         kio_core::store_dir::restrict_new_private_directory(&fs::File::open(&private).unwrap())
@@ -1295,7 +1295,7 @@ mod tests {
         let mut api = FakeApi::default();
         initialize(&mut api, &args()).unwrap();
         let reserved = reserve_all(&mut api, &args()).unwrap();
-        let root = tempfile::tempdir().unwrap();
+        let root = super::super::canonical_tempdir();
         let private = root.path().join("private");
         fs::create_dir(&private).unwrap();
         kio_core::store_dir::restrict_new_private_directory(&fs::File::open(&private).unwrap())

@@ -462,7 +462,7 @@ mod tests {
     }
     #[test]
     fn materializes_and_refuses_overwrite() {
-        let t = tempfile::tempdir().unwrap();
+        let t = super::super::canonical_tempdir();
         let r = "0123456789abcdef0123456789abcdef01234567";
         let c = t.path().join("cache");
         private_dir(&c);
@@ -479,7 +479,7 @@ mod tests {
     #[test]
     fn rejects_linked_source() {
         use std::os::unix::fs::symlink;
-        let t = tempfile::tempdir().unwrap();
+        let t = super::super::canonical_tempdir();
         let r = "0123456789abcdef0123456789abcdef01234567";
         let c = t.path().join("cache");
         private_dir(&c);

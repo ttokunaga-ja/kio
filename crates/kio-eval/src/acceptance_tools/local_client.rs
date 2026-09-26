@@ -807,7 +807,7 @@ mod tests {
 
     #[test]
     fn route_material_is_private_at_birth_and_existing_paths_are_unchanged() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::super::canonical_tempdir();
         let path = temp.path().join("route");
         write_route_material(&path, "private test key\n", "pinned test hosts\n").unwrap();
         verify_private_directory(&path).unwrap();
@@ -824,7 +824,7 @@ mod tests {
 
     #[test]
     fn invalid_route_material_cannot_create_a_directory() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::super::canonical_tempdir();
         let path = temp.path().join("route");
         assert!(write_route_material(&path, "", "hosts").is_err());
         assert!(write_route_material(&path, "key", &"x".repeat(PUBLIC_MAX + 1)).is_err());
@@ -931,7 +931,7 @@ mod tests {
     fn route_root_owns_the_pinned_two_hop_configuration() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::super::canonical_tempdir();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         let known_hosts = temp.path().join("known_hosts");
         let identity_file = temp.path().join("id");

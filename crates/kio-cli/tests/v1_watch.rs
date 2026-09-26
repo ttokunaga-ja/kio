@@ -4,6 +4,7 @@ mod support;
 
 use support::canonical_tempdir;
 
+use std::collections::VecDeque;
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -98,6 +99,64 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+    /// Require published idle observations, rather than silence while a long
+    /// reconciliation leaves the previous idle snapshot visible to readers.
+    /// None permits finite enrollment catch-up; Some pins the final assertion.
+    fn observed_idle(&self, stable_success: Option<u64>) -> Value {
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(25);
+        let mut candidate: Option<(u64, u64, u64)> = None;
+        let mut recent = VecDeque::new();
+        loop {
+            let status = self.status();
+            let observation = &status["last_observation"];
+            let success = observation["last_success_ms"].as_u64();
+            let observed = observation["observed_at_ms"].as_u64();
+            let idle = status["status"] == "running"
+                && observation["backlog"] == 0
+                && observation["degraded"] == false;
+            recent.push_back(serde_json::json!({
+                "elapsed_ms": started.elapsed().as_millis(),
+                "status": status["status"],
+                "success": success,
+                "observed": observed,
+                "backlog": observation["backlog"],
+                "degraded": observation["degraded"],
+                "failure": observation["last_failure"],
+            }));
+            if recent.len() > 40 {
+                recent.pop_front();
+            }
+            assert!(
+                Instant::now() < deadline,
+                "watch never published stable idle observations; recent samples: {recent:?}"
+            );
+            if let Some(expected) = stable_success {
+                assert!(
+                    idle && success == Some(expected),
+                    "watch resumed work after observed idle; recent samples: {recent:?}"
+                );
+            }
+            match (idle, success, observed) {
+                (true, Some(success), Some(observed)) => {
+                    let (start, previous) = match candidate {
+                        Some((previous_success, start, previous))
+                            if previous_success == success && observed >= previous =>
+                        {
+                            (start, previous)
+                        }
+                        _ => (observed, observed),
+                    };
+                    candidate = Some((success, start, observed));
+                    if observed > previous && observed.saturating_sub(start) >= 3_000 {
+                        return status;
+                    }
+                }
+                _ => candidate = None,
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
 }
 struct Guard(Option<Child>);
 impl Guard {
@@ -164,7 +223,11 @@ fn native_watch_enrolls_empty_descendants_and_stops_without_self_event_loop() {
     );
     fs::write(fixture.root.join(".kioignore"), "ignored/\n").unwrap();
     let process = fixture.start("300");
-    fixture.wait(|s| s["last_observation"]["last_success_ms"].is_number());
+    let startup = fixture.wait(|s| s["last_observation"]["last_success_ms"].is_number());
+    let startup_success = startup["last_observation"]["last_success_ms"].as_u64();
+    let startup_observed = startup["last_observation"]["observed_at_ms"]
+        .as_u64()
+        .unwrap();
     let duplicate = fixture.command(&["watch", "run"]).output().unwrap();
     assert!(
         !duplicate.status.success(),
@@ -177,18 +240,25 @@ fn native_watch_enrolls_empty_descendants_and_stops_without_self_event_loop() {
             .root
             .join("empty/deep/.kio/management.json")
             .exists()
+            && s["last_observation"]["last_success_ms"].as_u64().is_some()
+            && s["last_observation"]["last_success_ms"].as_u64() != startup_success
+            && s["last_observation"]["observed_at_ms"]
+                .as_u64()
+                .is_some_and(|observed| observed > startup_observed)
             && s["last_observation"]["backlog"] == 0
             && s["last_observation"]["degraded"] == false
     });
     assert!(!fixture.root.join("ignored/.kio").exists());
-    // Allow coalesced control notifications from enrollment to drain, then
-    // prove that HEAD, manifest, task and index writes do not dirty forever.
-    std::thread::sleep(Duration::from_secs(3));
-    let settled = fixture.status()["last_observation"]["last_success_ms"].clone();
-    std::thread::sleep(Duration::from_secs(3));
+    // Enrollment controls may need a finite catch-up pass. Require fresh idle
+    // publications before asserting that generated writes stay quiescent.
+    let settled = fixture.observed_idle(None);
+    let settled_success = settled["last_observation"]["last_success_ms"]
+        .as_u64()
+        .unwrap();
+    let stable = fixture.observed_idle(Some(settled_success));
     assert_eq!(
-        settled,
-        fixture.status()["last_observation"]["last_success_ms"]
+        settled["last_observation"]["last_success_ms"],
+        stable["last_observation"]["last_success_ms"]
     );
     assert_eq!(fixture.ok(&["watch", "stop"])["status"], "stop_requested");
     process.stopped();

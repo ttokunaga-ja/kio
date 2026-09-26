@@ -288,7 +288,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn private_fixture() -> (tempfile::TempDir, StoreDirectory, PathBuf, PathBuf, String) {
-        let temp = tempfile::tempdir().expect("fixture directory");
+        let temp = super::super::canonical_tempdir();
         let root = StoreDirectory::open(temp.path()).expect("retained fixture root");
         for source in FIXED_SOURCES {
             let relative = Path::new(source);

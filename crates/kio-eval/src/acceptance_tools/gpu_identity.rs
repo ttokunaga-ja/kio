@@ -447,7 +447,7 @@ mod tests {
     }
     #[test]
     fn create_check_and_inconsistent_source_are_deterministic() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::super::canonical_tempdir();
         let (binding, source, staged) = fixture(temp.path());
         create(Create {
             binding: binding.clone(),

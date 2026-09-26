@@ -297,7 +297,7 @@ mod tests {
             fs,
             os::unix::fs::{PermissionsExt, symlink},
         };
-        let temp = tempfile::tempdir().unwrap();
+        let temp = super::super::canonical_tempdir();
         fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         assert!(load(temp.path(), true).unwrap().is_none());
         assert!(load(temp.path(), false).is_err());
@@ -307,7 +307,7 @@ mod tests {
             sample(1222)
         );
         assert!(capture(temp.path(), sample(1000)).is_err());
-        let other = tempfile::tempdir().unwrap();
+        let other = super::super::canonical_tempdir();
         fs::set_permissions(other.path(), fs::Permissions::from_mode(0o700)).unwrap();
         fs::copy(temp.path().join(FILE), other.path().join(FILE)).unwrap();
         assert!(load(other.path(), true).is_err());

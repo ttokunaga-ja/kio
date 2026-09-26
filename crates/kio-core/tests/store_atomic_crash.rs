@@ -37,7 +37,12 @@ fn target(root: &Path) -> StoreDirectory {
 }
 
 fn fixture() -> TempDir {
-    tempfile::tempdir().expect("fixture root")
+    tempfile::tempdir_in(
+        std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temporary root"),
+    )
+    .expect("fixture root")
 }
 
 fn wait_ready(child: &mut Child, path: &Path, point: &str, stderr_path: &Path) {
