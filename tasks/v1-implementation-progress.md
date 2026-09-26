@@ -46,9 +46,48 @@ performed in this checkpoint.
   These are bounded static cross-checks; the earlier sealed scans do not cover
   these later changes.
 
+### Follow-up regression fixes
+
+The two local implementation commits `d5c577f` and `25abcc0` were tested without
+modifying their 1,624 tracked files. The macOS application library passed 315
+tests and the search CLI passed all 284 tests. Both macOS and Linux full runs
+then stopped at two purge/resurrection failures. Linux continued the remaining
+targets separately with `--no-fail-fast`; two further lifecycle tests exposed
+the same missing historical object, and one batch test parsed empty stdout
+instead of the newly documented error on stderr. These failed runs remain
+failure evidence, not full-suite passes.
+
+- `a1bc9a2` makes the embedding owner collector use the existing authenticated
+  retired-purge exception for a missing old pinned closure. It never substitutes
+  another manifest, clears raw-wide secret taint, or suppresses unexplained
+  absence, corrupt content or a post-purge introduction. The seven contextual
+  tests, all three resurrection tests and the two additional lifecycle
+  regressions pass on macOS after this fix.
+- `7537a0a` strengthens the short batch-response test: exact hold error/exit,
+  terminal typed violation, conservative reservation settlement, no partial
+  vector publication and no second job or charge on repeated resume. All 17
+  batch-lane tests pass. Formatting and workspace/all-target Clippy with warnings
+  denied also pass; tracked pre/post manifests remain identical.
+- README and the runtime/CLI contracts now describe exact paired grants for
+  cloud and local HTTP, the distinction between ingestion confirmation and
+  adapter approval, all-HTTP blocking by `--offline`, current cursor replay
+  checks, and retry after a conflicting revoke cannot acquire the writer lease.
+- The `c89b7ec..25abcc0` security review inspected all 72 changed paths and found
+  no reportable candidate. Its sealed report nevertheless retains stale pending
+  surfaces from an earlier checkpoint and reports partial coverage. A separate
+  closure addendum records the completed reviews without altering the seal;
+  this report is not a fully closed release receipt. The later purge fix also
+  received a bounded static review. Actual serving-model metadata remains
+  unobservable despite the explicit Daybreak request.
+- Read-only refresh confirms the private Actions route is still unconfigured:
+  the Windows CI user and WSL forced CI key are absent, the GitHub Environment
+  returns 404, and Tailscale still has its wildcard grant. No setting was saved.
+  The 132 unrelated untracked paths remain byte- and mode-identical.
+
 Remaining gates are the complete current macOS/Linux regression and lint runs,
 clean candidate packaging/reproducibility and actual A05/A06/A10 drivers, the
-concrete private Actions route approval and installation, and all required native
+closed final security receipt, concrete private Actions route approval and
+installation, and all required native
 Windows/Linux/macOS receipts on one candidate SHA. The ten-minute independent
 monitor is active. Logs for this recovery are under
 `~/Documents/Codex/2026-09-27/kio-resume-validation/recovery/`; r163 evidence is

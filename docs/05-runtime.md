@@ -42,9 +42,9 @@ fail_behavior = "fallback"       # "fallback" | "error" | "warn"
 `auto` の解決順:
 
 ```
---offline 指定 かつ embedding Adapter が online_api → text fallback (fallback_reason="offline" — 送信自体を行わない短絡。下記)
+--offline 指定 かつ embedding Adapter が HTTP を使う (online_api / offline_api) → text fallback (fallback_reason="offline" — 送信自体を行わない短絡。下記)
 embedding profile_hash 不一致 → text fallback (KIO-E-SEARCH-VEC-INCOMPAT-001)
-embedding 承認なし (下記 consent gate。online_api のみ) → text fallback (KIO-E-SEARCH-VEC-UNAUTHORIZED-001)
+embedding 承認なし (下記 consent gate。online_api / offline_api) → text fallback (KIO-E-SEARCH-VEC-UNAUTHORIZED-001)
 同一 query が in-flight ([04-pipeline.md §5.4](04-pipeline.md)) → text fallback (fallback_reason="embedding_in_flight")
 query embedding 応答が受入検査 ([07-adapter-spec.md §5.3](07-adapter-spec.md)) で contract violation → text fallback (fallback_reason="embedding_contract_violation")
 上記のいずれにも該当せず vector のみ利用不能 (index 未構築等の技術的理由) → text
@@ -58,50 +58,54 @@ query embedding 応答が受入検査 ([07-adapter-spec.md §5.3](07-adapter-spe
 構造化 warning を stderr / `--json` の `warnings[]` へ出す — exit code も fallback と同じ (error に
 しない)。
 
-**query embedding の consent gate**: vector | hybrid の page 1 は query embedding (07 §5.3 の
-`input_type: "query"` — sync 呼出) を要する。**採用中の embedding Adapter の `execution_mode` が
-`online_api` の場合に限り**、これは新規送信として [07-adapter-spec.md §3](07-adapter-spec.md)
-の opt-in gate の対象である (payload は query 文字列のみで folder 内容を含まない)。**送信可否 =
-参加 scope の 1 つ以上に当該 embedding Adapter の active な `approvals[]` 行があり、かつ当該 scope の
-実効 `allow_network` が true であること** (未設定・設定 key の喪失は gate 不成立 —
-[07-adapter-spec.md §3](07-adapter-spec.md) と同一規範。`--online` が開くのは未設定の既定閉鎖のみ —
-明示 revoke (`allow_network = false`・行の revoked) は上書きしない)。**この可否は
-source cost ledger を開く・stale sweep / claim を開始する**前**に approvals[] / boolean を再読して最終検証する**
-(読み取り開始時の値を使い回さない。ここで revoke が先行した auto / hybrid は ledger を開かず text fallback になる。
-検証後に revoke が完了した場合の当該送信は in-flight として許容し、以後の claim / reservation / send / settlement は
-fresh page 1 の通常の記帳経路に従う — 送信済みの取り消し非保証 — [07-adapter-spec.md §3](07-adapter-spec.md)))。承認ゼロ
-(かつ `--online` 一時 opt-in なし) の場合、auto / `--mode hybrid` は text fallback
-(`fallback_reason="embedding_not_authorized"`)、`--mode vector` 明示は KIO-E-SEARCH-VEC-UNAUTHORIZED-001
-で error。**ユーザー意思由来の text fallback は `fail_behavior` の対象外である** — `fail_behavior` は技術的
-失敗 (INCOMPAT / UNAVAIL 等) への応答方針であり、`embedding_not_authorized` (承認なし) と `offline`
-(`--offline` 指定) には適用しない (設定値に関わらず auto / `--mode hybrid` は常に text fallback、`--mode vector`
-のみ error — §1.2 / [06-cli-spec.md §3](06-cli-spec.md) の `--mode hybrid` 行の注記も同旨)。一方
-**`embedding_in_flight` (同一 query の並行実行 — [04-pipeline.md §5.4](04-pipeline.md)) と
-`embedding_contract_violation` (query embedding 応答の受入検査違反 — [07-adapter-spec.md §5.3](07-adapter-spec.md))
-は技術的な過渡失敗であり `fail_behavior` の対象**: auto は text fallback、`--mode hybrid` は fail_behavior に従い、
-`--mode vector` 明示は KIO-E-SEARCH-VEC-UNAVAIL-001 で error。`--online` / `--offline` は他コマンドと
-同義の当該実行限りの上書き (07 §3)。**`--offline` 指定時は承認の有無に関わらず query embedding を送信
-しない** — auto / `--mode hybrid` は text fallback (`fallback_reason="offline"`)、`--mode vector` 明示は
-KIO-E-SEARCH-VEC-UNAVAIL-001 で error。課金は
-`scope_id='device'` の sync request として縮退 2 相に記帳する ([04-pipeline.md §5.4](04-pipeline.md)
-— folder cap 対象外・device cap / per_adapter は通常合算)。
+**query embedding の consent gate**: vector | hybrid の fresh page 1 は query embedding
+(07 §5.3 の `input_type: "query"` — sync 呼出) を要する。`online_api` と `offline_api` の
+HTTP 呼出は、いずれも [07-adapter-spec.md §3](07-adapter-spec.md) の paired grant の対象である
+(payload は query 文字列のみで folder 内容を含まない)。**現在の policy で許可された参加 scope の
+1 つ以上について、当該 embedding Adapter の scope 側 active approval reference と device-private
+active network grant が完全な current identity に一致すること**を要求する。照合対象は
+scope/membership、tool_id、execution_mode、tool_profile_hash、destination、credential binding、
+trust binding、operation である。scope 行や device grant の片方だけでは成立しない。
+`online_api` では scope の `adapter.policy.allow_network = false` も閉鎖条件になる。
+`allow_network = true` だけでは承認にならず、`--online` も grant の作成、revoke や identity 不一致、
+policy 拒否の上書きを行わない。承認は `kio adapter approve <tool_id>` で明示的に成立させる。
 
-> **`offline_api` は本 gate の対象外 (2026-07-26 確定)**: ローカル embedding server
-> ([07-adapter-spec.md §3](07-adapter-spec.md) — url は loopback リテラルに限定される) は
-> 送信を行わないため、**送信を gate する本節の機構には適用対象が無い**。
-> `approvals[]` 行・`allow_network` boolean のいずれも要求せず、上の解決順の
-> `embedding_not_authorized` / `offline` にも該当しない (どちらも「送信の可否」に
-> 由来する縮退であり、送信が存在しない経路には生じ得ない)。したがって
-> **`--offline` 指定下でも local embedding による vector / hybrid 検索は成立する**
-> (上の「`--offline` 指定時は承認の有無に関わらず query embedding を送信しない」は
-> online_api Adapter についての規範である — 送信しない Adapter に禁止する送信は無い)。
-> `--online` も同様に無関係である (開くべき閉鎖が存在しない)。
-> ローカル処理は課金台帳にゼロ単価の行を作成しない。処理の provenance は各 `.kio` に保持し、device cap を消費しない。
->
-> **本節の残りの規範は execution_mode に依らず適用する** — profile_hash 不一致
-> (INCOMPAT)・`embedding_in_flight`・`embedding_contract_violation`・
-> [07-adapter-spec.md §5.3](07-adapter-spec.md) の受入検査はいずれも「送信してよいか」
-> ではなく **vector が正当か**を問う規範であり、ローカル生成のベクトルにも等しく効く。
+fresh page 1 は、許可を与える参加 scope の writer lease を取得し、**current policy と exact
+paired grant を再検証してから** HTTP dispatch に進む。`online_api` では、この最終検証は writable
+source cost ledger の open・stale sweep・claim より前に行う。先行した revoke は送信を拒否し、
+取得済み lease と別プロセスで競合する revoke は待機せず `KIO-E-STORE-LOCKED-001` (exit 3) で失敗し、
+当該 in-flight 処理の終了後に明示的な再試行が必要となる。送信済み bytes は取り消せない。
+
+承認が成立しない場合、通常の auto / `--mode hybrid` は text fallback
+(`fallback_reason="embedding_not_authorized"`)、`--mode vector` 明示は
+`KIO-E-SEARCH-VEC-UNAUTHORIZED-001` で error。**ユーザー意思由来の text fallback は
+`fail_behavior` の対象外である** — `embedding_not_authorized` と `offline` は、設定値に関わらず
+通常の auto / `--mode hybrid` では text fallback になる。一方、`embedding_in_flight`
+(同一 query の並行実行 — [04-pipeline.md §5.4](04-pipeline.md)) と
+`embedding_contract_violation` (応答の受入検査違反 — [07-adapter-spec.md §5.3](07-adapter-spec.md))
+は技術的な過渡失敗であり `fail_behavior` の対象: auto は text fallback、`--mode hybrid` は
+fail_behavior に従い、`--mode vector` 明示は `KIO-E-SEARCH-VEC-UNAVAIL-001` で error。
+
+**`search --online` は active な HTTP embedding Adapter と利用可能な vector 経路を要求する**。
+cloud / authenticated local HTTPS の両方を選べるが、一時 opt-in ではなく既存の exact paired grant
+が必要である。この明示指定時は、通常の auto / hybrid の precheck fallback に任せず、承認・
+Adapter・index の不足を error にする。**`--offline` は当該 invocation の全 HTTP dispatch を禁止する**。
+`online_api` と `offline_api` の query embedding はともに禁止され、通常の auto / `--mode hybrid`
+は text fallback (`fallback_reason="offline"`)、`--mode vector` 明示は
+`KIO-E-SEARCH-VEC-UNAVAIL-001` で error になる。
+
+`offline_api` の local HTTPS Adapter にも exact paired network grant と device-local managed CA
+trust が必要であり、loopback は承認の免除ではない。local 呼出は paid ledger にゼロ単価の行を作らず、
+device cap を消費しない。`online_api` の query 課金は `scope_id='device'` の sync request として
+縮退 2 相に記帳し、folder cap の対象外、device cap / per_adapter には通常合算する
+([04-pipeline.md §5.4](04-pipeline.md))。**in-process の `deterministic_library` は HTTP を使わず、
+network grant と `--offline` の禁止対象から除外される**。この経路に `search --online` は指定できない。
+profile 互換性と vector の受入検査は local / deterministic にも適用する。
+
+**page 2+ の cursor replay は page 1 の device-local query vector を再利用し、再送信・再課金しない**
+(§1.5)。ただし、現在の policy・grant・`--offline` を含む mode precheck と cursor の整合性検査は残る。
+キャッシュ済み vector は失効した grant の代わりにはならず、条件変更で mode / query hash が変われば
+replay は拒否される。cache の欠落・破損時も再送信せず `KIO-E-SEARCH-CURSOR-001` で拒否する。
 
 ## 1.2 CLI
 
@@ -109,8 +113,8 @@ KIO-E-SEARCH-VEC-UNAVAIL-001 で error。課金は
 kio search "..."             # auto
 kio search "..." --mode text    # text only
 kio search "..." --mode vector  # vector only。失敗時は error
-kio search "..." --mode hybrid  # hybrid 強制。vector 失敗時は fail_behavior に従う (承認なし・--offline は対象外 — 常に text fallback。embedding_in_flight は対象 — §1.1)
-kio search "..." [--online|--offline]  # query embedding の一時 opt-in / 当該実行の新規送信禁止 (§1.1 consent gate)
+kio search "..." --mode hybrid  # hybrid 強制。vector 失敗時は fail_behavior に従う (承認なし・--offline は通常 text fallback。--online 明示時の例外は §1.1。embedding_in_flight は対象)
+kio search "..." [--online|--offline]  # 既存 paired grant による HTTP 検索要求 / 全 HTTP dispatch 禁止 (§1.1)
 ```
 
 ## 1.3 RRF (Reciprocal Rank Fusion)
@@ -865,7 +869,7 @@ aggregate 上の bounded `instr` レーンを用い、FTS5 の trigram 下限に
    異なる folder 値の統合は定義しない。cursor が bind する実効値 (§1.5) もこの解決に従う —
    **ただし fail_behavior は挙動方針であり確定順序に影響しないため bind / query_hash preimage の
    対象外**)
-6. vector / hybrid の横断条件は [03-data-model.md §7](03-data-model.md) に従う。embedding profile が全 scope で一致しない場合、横断部分は text (BM25 rank) のみで統合し、`fallback_reason` に記録する (**`--mode vector` 明示時は fallback しない** — profile 不一致の scope を KIO-E-SEARCH-VEC-INCOMPAT-001 の excluded_scopes として除外し、全 scope 除外なら error — §1.2 の「失敗時は error」と同じ)。各 selected scope は replica/source-index candidate を読む前に `kio_format_version == KIO_FORMAT_VERSION` を検証する。missing、非 string、malformed、older/newer、未知を含む任意の不一致は `KIO-E-STORE-VERSION-001` / exit 8 で**command 全体を直ちに停止**し、当該 scope を `excluded_scopes` や `fallback_reason` に入れて healthy scope の partial result を返さない。source SQLite への書込みは行わない。**全 scope の除外理由が同一 code の場合、command は当該 code とその単独実行時の exit を返す (一般規則)** — REBUILDING → exit 3・INCOMPAT → exit 8・journal (`KIO-E-PURGE-JOURNAL-ACTIVE-001` — §3.5) → exit 3・DUP → exit 3 (ユーザーの dedupe 後に回復可能 — [08-evidence-pointer-spec.md §4.3](08-evidence-pointer-spec.md) の registry_duplicate = 3 と同一分類)。理由が混在して全 scope 除外となった場合は通常の SCOPE-ALL-FAILED とし、**exit は除外理由の retryability で分割する — 単独時 exit 3 の code (REBUILDING・journal・DUP・timeout 等の retryable 系) を 1 つでも含めば exit 3、全て permanent 系なら exit 4** (横断規約の「4 = 再試行で進展しない」([06-cli-spec.md §7](06-cli-spec.md)) と整合 — retryable 理由の scope は再試行で回復し得る)。個別理由は excluded_scopes[].reason で判別する。embedding 承認の consent gate (§1.1) は**送信 gate であり per-scope の除外条件ではない** — 承認ゼロなら検索全体が text fallback (excluded_scopes には計上しない)。§1.1 の送信 gate を満たして送信された query vector は profile 互換な全参加 scope の vector 検索に用いる (未承認 scope も含む — 送信は 1 回であり scope 別の再送信は発生しない)
+6. vector / hybrid の横断条件は [03-data-model.md §7](03-data-model.md) に従う。embedding profile が全 scope で一致しない場合、横断部分は text (BM25 rank) のみで統合し、`fallback_reason` に記録する (**`--mode vector` 明示時は fallback しない** — profile 不一致の scope を KIO-E-SEARCH-VEC-INCOMPAT-001 の excluded_scopes として除外し、全 scope 除外なら error — §1.2 の「失敗時は error」と同じ)。各 selected scope は replica/source-index candidate を読む前に `kio_format_version == KIO_FORMAT_VERSION` を検証する。missing、非 string、malformed、older/newer、未知を含む任意の不一致は `KIO-E-STORE-VERSION-001` / exit 8 で**command 全体を直ちに停止**し、当該 scope を `excluded_scopes` や `fallback_reason` に入れて healthy scope の partial result を返さない。source SQLite への書込みは行わない。**全 scope の除外理由が同一 code の場合、command は当該 code とその単独実行時の exit を返す (一般規則)** — REBUILDING → exit 3・INCOMPAT → exit 8・journal (`KIO-E-PURGE-JOURNAL-ACTIVE-001` — §3.5) → exit 3・DUP → exit 3 (ユーザーの dedupe 後に回復可能 — [08-evidence-pointer-spec.md §4.3](08-evidence-pointer-spec.md) の registry_duplicate = 3 と同一分類)。理由が混在して全 scope 除外となった場合は通常の SCOPE-ALL-FAILED とし、**exit は除外理由の retryability で分割する — 単独時 exit 3 の code (REBUILDING・journal・DUP・timeout 等の retryable 系) を 1 つでも含めば exit 3、全て permanent 系なら exit 4** (横断規約の「4 = 再試行で進展しない」([06-cli-spec.md §7](06-cli-spec.md)) と整合 — retryable 理由の scope は再試行で回復し得る)。個別理由は excluded_scopes[].reason で判別する。embedding 承認の consent gate (§1.1) は**送信 gate であり per-scope の除外条件ではない** — 承認ゼロなら通常の auto / hybrid は検索全体が text fallback (--mode vector / --online 明示時は error。excluded_scopes には計上しない)。§1.1 の送信 gate を満たして送信された query vector は profile 互換な全参加 scope の vector 検索に用いる (未承認 scope も含む — 送信は 1 回であり scope 別の再送信は発生しない)
 
 ### replica の候補経路と cursor
 
@@ -1729,7 +1733,7 @@ kio batch resume / kio batch retry / kio batch abandon / kio reindex /
 kio adapter revoke
 ```
 
-承認系の scope.json 更新 — 承認操作（対話 / `--approve` の行 publish）、approval_pending の記録、
+承認系の scope.json 更新 — 承認操作（`kio adapter approve` の paired record publish）、approval_pending の記録、
 `kio adapter revoke` — は、いずれも retained store lock と束縛済み metadata handle を使う
 locked mutation として直列化する。atomic rename は publication であり CAS ではない。並行する
 approve × revoke の比較不一致は `KIO-E-ADAPTER-APPROVAL-CONFLICT-001` (exit 5) で終端し、
@@ -1741,7 +1745,7 @@ batch 系と reindex は外部副作用 (upload / job 作成) と batch_requests
 
 規約:
 
-- 読み取り系 (search / log / view / open / inspect / evidence verify / export / status / diff) は `.kio/.lock` を取得しない。`kio index` と `kio search` の同時実行は許容する。検索は `.kio/index/sqlite.db` の WAL snapshot を読まず、公開済み `aggregator.sqlite` の projection だけを読む。`index_status.budget_paused` の月次 cap 観測は、1 search invocation につき device-global cost-ledger の owned read-only snapshot を command preflight で1個だけ作る。取得は既存の入力・mode 判定後、fresh vector / hybrid page 1 の writable ledger open・claim / reservation・query embedding 送信より前に完了する。同じ snapshot と取得時の UTC 集計月を response まで保持し、取得後の別 writer や同一 invocation による charge はその response の月次 cap 観測へ混ぜない。source main / `-wal` / `-shm` を NOFOLLOW・regular・single-link・identity・size・SHA で前後観測し、owner-private temp へ main と存在する WAL だけを複写して `READ_ONLY` + `query_only` で読む (SHM は複写しない)。全3 leaf absent のみ no-ledger / spent=0 とし、partial leaf・unsafe link / replacement・stable-copy integrity failure は `KIO-E-LEDGER-SNAPSHOT-UNSAFE-001` / exit 4、presence/hash drift・busy・retry exhaustion・temp/copy/open/query の不確定性は `KIO-E-LEDGER-SNAPSHOT-001` / exit 3 で stdout を返さず fail-closed する。これは開始と終了の一致を要求する stable-or-fail 観測であり、cross-file formal atomic snapshot の主張ではない。例外的に `kio search` は final consent check を通過した vector|hybrid の fresh page 1 に限り cost-ledger.sqlite の device 行 (`scope_id='device'`) への相 1 / stale 回収・剪定の書込を行う。claim 開始後の adapter failure で最終結果が text fallback になってもこの例外は維持される。一方、offline / profile incompatibility / final consent rejection による pre-attempt auto→text はこの書込を行わない。これも `.kio/.lock` の対象外である — device 行はどの scope にも属さず、直列化は cost-ledger 側の `BEGIN IMMEDIATE` Tx が担う ([04-pipeline.md §5.4](04-pipeline.md))
+- 読み取り系 (search / log / view / open / inspect / evidence verify / export / status / diff) は通常 `.kio/.lock` を取得しない。ただし fresh page 1 で HTTP query embedding を送る search は、許可を与える参加 scope の writer lease を取得し、current policy / paired grant を最終検証して処理終了まで保持する (§1.1)。`kio index` と `kio search` の同時実行は許容する。検索は `.kio/index/sqlite.db` の WAL snapshot を読まず、公開済み `aggregator.sqlite` の projection だけを読む。`index_status.budget_paused` の月次 cap 観測は、1 search invocation につき device-global cost-ledger の owned read-only snapshot を command preflight で1個だけ作る。取得は既存の入力・mode 判定後、fresh vector / hybrid page 1 の writable ledger open・claim / reservation・query embedding 送信より前に完了する。同じ snapshot と取得時の UTC 集計月を response まで保持し、取得後の別 writer や同一 invocation による charge はその response の月次 cap 観測へ混ぜない。source main / `-wal` / `-shm` を NOFOLLOW・regular・single-link・identity・size・SHA で前後観測し、owner-private temp へ main と存在する WAL だけを複写して `READ_ONLY` + `query_only` で読む (SHM は複写しない)。全3 leaf absent のみ no-ledger / spent=0 とし、partial leaf・unsafe link / replacement・stable-copy integrity failure は `KIO-E-LEDGER-SNAPSHOT-UNSAFE-001` / exit 4、presence/hash drift・busy・retry exhaustion・temp/copy/open/query の不確定性は `KIO-E-LEDGER-SNAPSHOT-001` / exit 3 で stdout を返さず fail-closed する。これは開始と終了の一致を要求する stable-or-fail 観測であり、cross-file formal atomic snapshot の主張ではない。例外的に `kio search` は final consent check を通過した online_api の vector|hybrid fresh page 1 に限り cost-ledger.sqlite の device 行 (`scope_id='device'`) への相 1 / stale 回収・剪定の書込を行う。claim 開始後の adapter failure で最終結果が text fallback になってもこの例外は維持される。一方、offline / profile incompatibility / final consent rejection による pre-attempt auto→text はこの書込を行わない。device 行自体の直列化は cost-ledger 側の `BEGIN IMMEDIATE` Tx が担う — device 行はどの scope にも属さないが、query dispatch の承認には上述の authorizing scope の writer lease を保持する ([04-pipeline.md §5.4](04-pipeline.md))
 - `.kio/.lock` を取得できない場合、書き込み系コマンドは**待機せず即座に失敗する**: error code `KIO-E-STORE-LOCKED-001`、exit code 3 (retryable、[06-cli-spec.md §7](06-cli-spec.md))。lock ファイルには保持プロセスの pid と取得時刻を記録し、保持プロセスが存在しない stale lock は次の取得試行時に回収してよい。Unixでは acquire/reclaim/release 全体を crash-release される directory `flock` でも直列化し、release はcheck-then-unlinkでなくdead canonical sentinelとのatomic exchangeを使う。このため非保持時にもdead sentinel leafが残り得るが、次writerが同じgate下で回収し、単なる`.lock`存在だけをlive判定に使わない。
 - refs (refs/heads/main, refs/tags-v1/*) の更新は `.kio/.lock` 保持下で、temp file 書き込み + atomic rename により行う (部分書き込みを外部に見せない)
 - `kio repair verify-objects` の raw object 復旧と repaired commit publication も、同じ lock の下で private temp + hash 再検証 + atomic publish を使う

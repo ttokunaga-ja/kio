@@ -42,7 +42,7 @@ the whole archive to someone else's cloud.
 ```bash
 kio init
 kio index --preview      # inspect what would be sent, before approving anything
-kio index --approve      # ingest + baseline index (snapshots on success)
+kio index --offline --yes  # local ingest + baseline index; no HTTP dispatch
 kio search "あの PDF"
 kio open <pointer from the results>
 ```
@@ -62,15 +62,20 @@ you explicitly opt in for a scope.
 
 OCR and embedding send file contents to external adapters (Mistral OCR, Gemini,
 and others). Run `kio index --preview` to inspect the network transmission
-policy before you approve anything — `--approve` records the approval and does
-not itself display the policy. Kio logs which input was sent (identified by
+policy before you approve anything. Review `kio adapter approve <tool_id> --preview`,
+then use `kio adapter approve <tool_id> --yes` to create the paired scope/device
+grant. `index --yes` confirms local ingestion and does not create adapter grants;
+existing grants may still allow HTTP calls unless `--offline` is specified.
+`--online` does not create a grant. Kio logs which input was sent (identified by
 hash), when, and to which adapter; it does not log the file contents or the API
 request and response bodies.
 
 Once you opt in, the contents of the affected files are transmitted to that
 adapter, and **the provider's own terms govern what it does with them** —
-including any retention or logging on their side. Choosing local or
-deterministic adapters keeps everything offline.
+including any retention or logging on their side. Local HTTPS adapters also
+require an exact paired grant and managed local trust; `--offline` blocks their
+HTTP calls as well as cloud calls. In-process deterministic adapters do not use
+HTTP and can run with `--offline`.
 
 See [docs/07-adapter-spec.md](docs/07-adapter-spec.md) for the opt-in scope,
 lifetime, and revocation rules.
@@ -158,13 +163,19 @@ AI 検索は試したいがアーカイブ全体をクラウドに丸投げし�
 データがマシンの外に出ることはありません。
 
 OCR と Embedding では外部 Adapter へファイル内容が送信されます。承認の前に
-`kio index --preview` で network transmission policy を確認してください
-(`--approve` は承認を記録するもので、それ自体はポリシーを表示しません)。Kio が記録するのは
+`kio index --preview` で network transmission policy を確認してください。
+`kio adapter approve <tool_id> --preview` を確認し、
+`kio adapter approve <tool_id> --yes` で scope/device の paired grant を成立させます。
+`index --yes` はローカル取り込みの確認を省略するもので、Adapter grant は作成しません。
+既存の grant があれば HTTP 呼出は許可され得るため、ローカル処理に限る場合は
+`kio index --offline --yes` を使います。`--online` も grant を作成しません。Kio が記録するのは
 「どの入力を (hash で識別)・いつ・どの Adapter へ送ったか」であり、**ファイル本文や API の
 リクエスト/レスポンス本体は記録しません**。
 
 opt-in 後は対象ファイルの内容が当該 Adapter へ送信され、**送信先での取り扱い (保持・ログ等) は
-その提供者の規約に従います**。ローカル / deterministic Adapter を選べば完全オフラインで運用できます。
+その提供者の規約に従います**。local HTTPS Adapter にも exact paired grant と managed local trust が
+必要で、`--offline` は cloud と local の両方の HTTP 呼出を禁止します。in-process の deterministic
+Adapter は HTTP を使わず、`--offline` でも実行できます。
 
 ## 貢献
 
