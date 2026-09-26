@@ -1,0 +1,717 @@
+name: V1 native acceptance supplement
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Full 40-character commit SHA to build, verify, and exercise
+        required: true
+        type: string
+
+# This workflow reads the selected candidate and creates only ephemeral Actions
+# artifacts. It does not publish a release, create a tag, or write repository state.
+permissions:
+  contents: read
+
+jobs:
+  candidate-archives:
+    name: ${{ matrix.label }} candidate archive
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux
+            native_os: linux
+          - os: macos-26
+            label: macOS
+            native_os: macos
+          - os: windows-latest
+            label: Windows
+            native_os: windows
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate the exact candidate input
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm checkout is the requested immutable commit
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+        with:
+          components: clippy, rustfmt
+
+      - name: Build the Rust-owned release verifier
+        run: cargo +1.98.0 build -p kio-eval --bin kio-eval --locked
+
+      - name: Prefetch the exact locked candidate graph
+        run: |
+          set -euo pipefail
+          cargo +1.98.0 fetch --locked --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
+          CARGO_NET_OFFLINE=true cargo +1.98.0 metadata \
+            --locked --all-features --format-version 1 \
+            --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" >/dev/null
+
+      - name: Build two isolated, reproducible release archives bound to the candidate
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          eval_bin=target/debug/kio-eval
+          if [[ "$RUNNER_OS" == "Windows" ]]; then eval_bin="${eval_bin}.exe"; fi
+          target="$("$eval_bin" release native-target)"
+          lock_sha256="$("$eval_bin" release lock-sha256 --repo "$GITHUB_WORKSPACE")"
+          printf '%s\n' "$target" > "$RUNNER_TEMP/kio-v1-target"
+          cargo_home="$RUNNER_TEMP/kio-v1-cargo-home"
+          "$eval_bin" release prepare-cargo-home \
+            --repo "$GITHUB_WORKSPACE" \
+            --source-cargo-home "${CARGO_HOME:-$HOME/.cargo}" \
+            --out "$cargo_home"
+          tools_dir="$RUNNER_TEMP/kio-v1-tools"
+          "$eval_bin" release prepare-tools --out "$tools_dir" --cargo-home "$cargo_home"
+          build_dir="$RUNNER_TEMP/kio-v1-build"
+          artifact_dir="$RUNNER_TEMP/kio-v1-artifacts"
+          "$eval_bin" release build \
+            --repo "$GITHUB_WORKSPACE" --candidate-sha "$CANDIDATE_SHA" \
+            --target "$target" --target-dir "$build_dir" --cargo-home "$cargo_home"
+          binary="$build_dir/$target/release/kio"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then binary="${binary}.exe"; fi
+          "$eval_bin" release package \
+            --repo "$GITHUB_WORKSPACE" --binary "$binary" --target "$target" \
+            --tools-dir "$tools_dir" --cargo-home "$cargo_home" --out "$artifact_dir"
+          printf '%s\n' "$lock_sha256" > "$artifact_dir/kio-v1-lock-sha256"
+          set -- "$artifact_dir"/*.tar.gz
+          test "$#" = 1
+          archive="$1"
+          checksums="${archive%.tar.gz}.checksums.json"
+          archive_sha256="$("$eval_bin" release archive-sha256 --archive "$archive")"
+          binary_sha256="$(jq -er '.binary_sha256' "$checksums")"
+          version="$(cargo +1.98.0 metadata --locked --no-deps --format-version 1 | jq -er '.packages[] | select(.name == "kio-cli") | .version')"
+          "$eval_bin" acceptance target-binding \
+            --candidate-sha "$CANDIDATE_SHA" --os "${{ matrix.native_os }}" \
+            --target "$target" --archive-sha256 "$archive_sha256" \
+            --binary-sha256 "$binary_sha256" --version "$version" \
+            --out "$artifact_dir/target-binding.json"
+          second_build_dir="$RUNNER_TEMP/kio-v1-build-reproducible"
+          "$eval_bin" release build \
+            --repo "$GITHUB_WORKSPACE" --candidate-sha "$CANDIDATE_SHA" \
+            --target "$target" --target-dir "$second_build_dir" --cargo-home "$cargo_home"
+          second_binary="$second_build_dir/$target/release/kio"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then second_binary="${second_binary}.exe"; fi
+          reproducible_dir="$artifact_dir/reproducible"
+          "$eval_bin" release package \
+            --repo "$GITHUB_WORKSPACE" --binary "$second_binary" --target "$target" \
+            --tools-dir "$tools_dir" --cargo-home "$cargo_home" --out "$reproducible_dir"
+          set -- "$reproducible_dir"/*.tar.gz
+          test "$#" = 1
+          reproducible_archive="$1"
+          reproducible_sha256="$("$eval_bin" release archive-sha256 --archive "$reproducible_archive")"
+          test "$reproducible_sha256" = "$archive_sha256"
+
+      - name: Upload candidate archive and target binding
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: kio-v1-package-${{ matrix.native_os }}-${{ inputs.candidate_sha }}
+          path: |
+            ${{ runner.temp }}/kio-v1-artifacts/*.tar.gz
+            ${{ runner.temp }}/kio-v1-artifacts/*.checksums.json
+            ${{ runner.temp }}/kio-v1-artifacts/reproducible/*.tar.gz
+            ${{ runner.temp }}/kio-v1-artifacts/reproducible/*.checksums.json
+            ${{ runner.temp }}/kio-v1-artifacts/target-binding.json
+            ${{ runner.temp }}/kio-v1-artifacts/kio-v1-lock-sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  native-a01-a09:
+    name: ${{ matrix.label }} native acceptance supplement
+    needs: candidate-archives
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            label: Linux
+            native_os: linux
+          - os: macos-26
+            label: macOS
+            native_os: macos
+          - os: windows-latest
+            label: Windows
+            native_os: windows
+    defaults:
+      run:
+        shell: bash
+    env:
+      KIO_REAL_OFFICE: "1"
+      OFFICE_VERSION: "26.2.5"
+      OFFICE_LINUX_SHA256: "2f03bfb2ac9f33ea7c77331b4b7a23300fb0ed7443566046bf8b5bc51c1bed1e"
+      OFFICE_MACOS_AARCH64_SHA256: "c99fb4fe574437fc4cb820a4ca15271bca325920861f7139858b36d7f9df78ad"
+      OFFICE_WINDOWS_X64_SHA256: "f15ba07bfcb0186986cf3171063506f5d207c11f8cc051ba0d135209e9e915f9"
+
+    steps:
+      - name: Validate the exact candidate input
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm checkout is the requested immutable commit
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+        with:
+          components: clippy, rustfmt
+
+      # These URLs name immutable Document Foundation release artifacts. Check
+      # their pinned SHA-256 values before installation; do not accept a
+      # package-manager-selected Office build from a mutable channel.
+      - name: Provision Linux Office and user scheduler prerequisites
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = x86_64
+          office_archive="$RUNNER_TEMP/LibreOffice_${OFFICE_VERSION}_Linux_x86-64_deb.tar.gz"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$office_archive" \
+            "https://download.documentfoundation.org/libreoffice/stable/${OFFICE_VERSION}/deb/x86_64/LibreOffice_${OFFICE_VERSION}_Linux_x86-64_deb.tar.gz"
+          printf '%s  %s\n' "$OFFICE_LINUX_SHA256" "$office_archive" | sha256sum --check --status
+          office_unpack="$RUNNER_TEMP/kio-v1-office-unpack"
+          mkdir "$office_unpack"
+          tar -xzf "$office_archive" -C "$office_unpack"
+          deb_directory="$(find "$office_unpack" -type d -name DEBS -print -quit)"
+          test -n "$deb_directory"
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends bubblewrap "$deb_directory"/*.deb
+          sudo loginctl enable-linger "$USER"
+          uid="$(id -u)"
+          sudo systemctl start "user@${uid}.service"
+          test -x /usr/bin/soffice
+          {
+            echo 'KIO_OFFICE_CONVERTER=/usr/bin/soffice'
+            echo "XDG_RUNTIME_DIR=/run/user/${uid}"
+            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus"
+          } >> "$GITHUB_ENV"
+          {
+            sha256sum "$office_archive"
+            /usr/bin/soffice --version
+            dpkg-query --show bubblewrap
+          } > "$RUNNER_TEMP/kio-v1-provisioning.txt"
+
+      - name: Provision macOS Office prerequisite
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          office_dmg="$RUNNER_TEMP/LibreOffice_${OFFICE_VERSION}_MacOS_aarch64.dmg"
+          curl --fail --location --proto '=https' --tlsv1.2 --retry 3 \
+            --output "$office_dmg" \
+            "https://download.documentfoundation.org/libreoffice/stable/${OFFICE_VERSION}/mac/aarch64/LibreOffice_${OFFICE_VERSION}_MacOS_aarch64.dmg"
+          printf '%s  %s\n' "$OFFICE_MACOS_AARCH64_SHA256" "$office_dmg" | shasum -a 256 --check --status
+          office_mount="$RUNNER_TEMP/kio-v1-office-mount"
+          mkdir "$office_mount"
+          hdiutil attach -nobrowse -readonly -mountpoint "$office_mount" "$office_dmg"
+          sudo ditto "$office_mount/LibreOffice.app" /Applications/LibreOffice.app
+          hdiutil detach "$office_mount"
+          converter=/Applications/LibreOffice.app/Contents/MacOS/soffice
+          test -x "$converter"
+          echo "KIO_OFFICE_CONVERTER=$converter" >> "$GITHUB_ENV"
+          {
+            shasum -a 256 "$office_dmg"
+            "$converter" --version
+          } > "$RUNNER_TEMP/kio-v1-provisioning.txt"
+
+      - name: Provision Windows Office prerequisite
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $installer = Join-Path $env:RUNNER_TEMP "LibreOffice_$env:OFFICE_VERSION`_Win_x86-64.msi"
+          Invoke-WebRequest -Uri "https://download.documentfoundation.org/libreoffice/stable/$env:OFFICE_VERSION/win/x86_64/LibreOffice_$env:OFFICE_VERSION`_Win_x86-64.msi" -OutFile $installer
+          if ((Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:OFFICE_WINDOWS_X64_SHA256) {
+            throw 'downloaded LibreOffice MSI hash differs from the pinned release hash'
+          }
+          $install = Start-Process msiexec.exe -Wait -PassThru -NoNewWindow -ArgumentList @('/i', $installer, '/qn', '/norestart')
+          if ($install.ExitCode -ne 0) { throw "LibreOffice MSI exited with $($install.ExitCode)" }
+          $converter = Join-Path $env:ProgramFiles 'LibreOffice\program\soffice.exe'
+          if (-not (Test-Path -LiteralPath $converter -PathType Leaf)) {
+            throw "LibreOffice converter was not installed at $converter"
+          }
+          "KIO_OFFICE_CONVERTER=$converter" | Add-Content -LiteralPath $env:GITHUB_ENV
+          "$(Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash" | Out-File -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
+          & $converter '--version' | Add-Content -LiteralPath "$env:RUNNER_TEMP\kio-v1-provisioning.txt" -Encoding utf8
+
+      - name: Build the evaluator and separately bound debug contract binary
+        run: cargo +1.98.0 build --locked -p kio-cli -p kio-eval --bins
+
+      - name: Fail closed when the native host cannot support the real checks
+        run: |
+          set -euo pipefail
+          case "$RUNNER_OS" in
+            Linux) native_os=linux ;;
+            macOS) native_os=macos ;;
+            Windows) native_os=windows ;;
+            *) echo "unsupported native runner OS: $RUNNER_OS" >&2; exit 1 ;;
+          esac
+          eval_bin=target/debug/kio-eval
+          if [[ "$RUNNER_OS" == "Windows" ]]; then eval_bin="${eval_bin}.exe"; fi
+          "$eval_bin" acceptance preflight \
+            --runner-os "$native_os" \
+            --office-converter "${KIO_OFFICE_CONVERTER:-}" \
+            --out "$RUNNER_TEMP/kio-v1-preflight.json"
+
+      - name: Prefetch the exact locked candidate graph
+        run: |
+          set -euo pipefail
+          cargo +1.98.0 fetch --locked --manifest-path "$GITHUB_WORKSPACE/Cargo.toml"
+          CARGO_NET_OFFLINE=true cargo +1.98.0 metadata \
+            --locked --all-features --format-version 1 \
+            --manifest-path "$GITHUB_WORKSPACE/Cargo.toml" >/dev/null
+
+      - name: Download every candidate target binding
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: kio-v1-package-*-${{ inputs.candidate_sha }}
+          path: ${{ runner.temp }}/kio-v1-packages
+
+      - name: Verify, extract, and bind the sole product binary
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          eval_bin=target/debug/kio-eval
+          if [[ "$RUNNER_OS" == "Windows" ]]; then eval_bin="${eval_bin}.exe"; fi
+          package_dir="$RUNNER_TEMP/kio-v1-packages/kio-v1-package-${{ matrix.native_os }}-${CANDIDATE_SHA}"
+          test -d "$package_dir"
+          artifact_dir="$package_dir"
+          set -- "$artifact_dir"/*.tar.gz
+          test "$#" = 1
+          archive="$1"
+          checksums="${archive%.tar.gz}.checksums.json"
+          reproducible_dir="$artifact_dir/reproducible"
+          test -d "$reproducible_dir"
+          set -- "$reproducible_dir"/*.tar.gz
+          test "$#" = 1
+          reproducible_archive="$1"
+          reproducible_checksums="${reproducible_archive%.tar.gz}.checksums.json"
+          test -f "$reproducible_checksums"
+          lock_sha256="$(<"$artifact_dir/kio-v1-lock-sha256")"
+          archive_sha256="$("$eval_bin" release archive-sha256 --archive "$archive")"
+          "$eval_bin" release verify \
+            --archive "$archive" --checksums "$checksums" \
+            --expected-archive-sha256 "$archive_sha256" \
+            --source-repo "$GITHUB_WORKSPACE" --expected-commit "$CANDIDATE_SHA" \
+            --expected-lock-sha256 "$lock_sha256" \
+            | tee "$RUNNER_TEMP/kio-v1-release-verify.json"
+          extract_dir="$RUNNER_TEMP/kio-v1-extract"
+          mkdir "$extract_dir"
+          # release verify rejects unsafe archive entries before this extraction.
+          tar -xzf "$archive" -C "$extract_dir"
+          roots=()
+          while IFS= read -r root; do roots+=("$root"); done < <(
+            find "$extract_dir" -mindepth 1 -maxdepth 1 -type d -print
+          )
+          test "${#roots[@]}" = 1
+          release_bin="${roots[0]}/bin/kio"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then release_bin="${release_bin}.exe"; fi
+          test -f "$release_bin"
+          printf 'KIO_RELEASE_BIN=%s\n' "$release_bin" >> "$GITHUB_ENV"
+          printf 'KIO_RELEASE_ARCHIVE=%s\n' "$archive" >> "$GITHUB_ENV"
+          printf 'KIO_RELEASE_CHECKSUMS=%s\n' "$checksums" >> "$GITHUB_ENV"
+          printf 'KIO_RELEASE_REPRO_ARCHIVE=%s\n' "$reproducible_archive" >> "$GITHUB_ENV"
+          printf 'KIO_RELEASE_REPRO_CHECKSUMS=%s\n' "$reproducible_checksums" >> "$GITHUB_ENV"
+          printf 'KIO_RELEASE_LOCK_SHA256=%s\n' "$lock_sha256" >> "$GITHUB_ENV"
+          printf 'KIO_RELEASE_ARCHIVE_SHA256=%s\n' "$archive_sha256" >> "$GITHUB_ENV"
+          target_binding="$artifact_dir/target-binding.json"
+          test -f "$target_binding"
+          target_binding_sha256="$("$eval_bin" release archive-sha256 --archive "$target_binding")"
+          workflow_path='.github/workflows/v1-acceptance.yml'
+          workflow_sha256="$("$eval_bin" release archive-sha256 --archive "$workflow_path")"
+          architecture="$(uname -m)"
+          contract_bin="$GITHUB_WORKSPACE/target/debug/kio"
+          if [[ "$RUNNER_OS" == "Windows" ]]; then contract_bin="${contract_bin}.exe"; fi
+          test -f "$contract_bin"
+          contract_binary_sha256="$("$eval_bin" release archive-sha256 --archive "$contract_bin")"
+          fixture_a01="$RUNNER_TEMP/kio-v1-a01-fixture.txt"
+          fixture_a02="$RUNNER_TEMP/kio-v1-a02-fixture.txt"
+          fixture_a03_native="$RUNNER_TEMP/kio-v1-a03-native-fixture.txt"
+          fixture_a03_service="$RUNNER_TEMP/kio-v1-a03-service-fixture.txt"
+          fixture_a04="$RUNNER_TEMP/kio-v1-a04-policy-fixture.txt"
+          fixture_a08="$GITHUB_WORKSPACE/crates/kio-eval/acceptance-fixtures/v1/provider-public/ocr.pdf"
+          fixture_a09="$RUNNER_TEMP/kio-v1-a09-fixture.txt"
+          fixture_a10="$RUNNER_TEMP/kio-v1-a10-fixture.txt"
+          fixture_a11_service="$RUNNER_TEMP/kio-v1-a11-service-fixture.txt"
+          printf 'kio v1 A01 immutable fixture\n' > "$fixture_a01"
+          printf 'kio v1 A02 native watcher fixture\n' > "$fixture_a02"
+          printf 'kio v1 A03 native watcher fixture\n' > "$fixture_a03_native"
+          printf 'kio v1 A03 native service fixture\n' > "$fixture_a03_service"
+          printf 'kio v1 A04 policy fixture\n' > "$fixture_a04"
+          printf 'kio v1 A09 immutable history fixture\n' > "$fixture_a09"
+          printf 'kio v1 A10 tiny durability fixture\n' > "$fixture_a10"
+          printf 'kio v1 A11 native service fixture\n' > "$fixture_a11_service"
+          fixture_a01_sha256="$("$eval_bin" release archive-sha256 --archive "$fixture_a01")"
+          fixture_a02_sha256="$("$eval_bin" release archive-sha256 --archive "$fixture_a02")"
+          fixture_a03_native_sha256="$("$eval_bin" release archive-sha256 --archive "$fixture_a03_native")"
+          fixture_a03_service_sha256="$("$eval_bin" release archive-sha256 --archive "$fixture_a03_service")"
+          fixture_a04_sha256="$("$eval_bin" release archive-sha256 --archive "$fixture_a04")"
+          fixture_a08_sha256='b48ae7a300b21746e078ffceb3865d324940d2d62595fb7fd201bac9f7906f90'
+          fixture_a09_sha256="$("$eval_bin" release archive-sha256 --archive "$fixture_a09")"
+          fixture_a10_sha256="$("$eval_bin" release archive-sha256 --archive "$fixture_a10")"
+          fixture_a11_service_sha256="$("$eval_bin" release archive-sha256 --archive "$fixture_a11_service")"
+          fixture_a05_a06="$GITHUB_WORKSPACE/crates/kio-eval/acceptance-fixtures/v1/a05-full-image-unavailable"
+          fixture_a05_a06_sha256='57a440e69d708c9464e2a266d214661547562f31e882f466d16949cb5b6dc6fb'
+          fixture_a07="$GITHUB_WORKSPACE/crates/kio-eval/acceptance-fixtures/v1/office-public"
+          fixture_a07_sha256='79fdea154a9f61138349e560f2a8e3b8e14126b01f384e4951f2c85247216827'
+          expected_a01="$RUNNER_TEMP/kio-v1-a01-expected.json"
+          expected_a02="$RUNNER_TEMP/kio-v1-a02-expected.json"
+          expected_a03_native="$RUNNER_TEMP/kio-v1-a03-native-expected.json"
+          expected_a03_service="$RUNNER_TEMP/kio-v1-a03-service-expected.json"
+          expected_a04="$RUNNER_TEMP/kio-v1-a04-expected.json"
+          expected_a04_local_trust="$RUNNER_TEMP/kio-v1-a04-local-trust-expected.json"
+          expected_a05="$RUNNER_TEMP/kio-v1-a05-expected.json"
+          expected_a06="$RUNNER_TEMP/kio-v1-a06-expected.json"
+          expected_a07="$RUNNER_TEMP/kio-v1-a07-expected.json"
+          expected_a08="$RUNNER_TEMP/kio-v1-a08-mock-failure-expected.json"
+          expected_a09="$RUNNER_TEMP/kio-v1-a09-expected.json"
+          expected_a10="$RUNNER_TEMP/kio-v1-a10-expected.json"
+          expected_a11_service="$RUNNER_TEMP/kio-v1-a11-service-expected.json"
+          expected_a12="$RUNNER_TEMP/kio-v1-a12-expected.json"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A01 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-native-a01 \
+            --fixture-sha256 "$fixture_a01_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a01"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A02 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-native-a02 \
+            --fixture-sha256 "$fixture_a02_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a02"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A03 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-native-a03 \
+            --fixture-sha256 "$fixture_a03_native_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a03_native"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A03 --lane service-native --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-service-a03 \
+            --fixture-sha256 "$fixture_a03_service_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a03_service"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A04 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-native-a04-policy \
+            --fixture-sha256 "$fixture_a04_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a04"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A04 --lane native-contract --subcase local-trust \
+            --os "${{ matrix.native_os }}" --fixture-id v1-native-a04-local-trust \
+            --fixture-sha256 "$fixture_a04_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a04_local_trust"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A05 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-native-a05-image \
+            --fixture-sha256 "$fixture_a05_a06_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a05"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A06 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-native-a06-image \
+            --fixture-sha256 "$fixture_a05_a06_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a06"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A07 --lane office-real --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-office-a07-public \
+            --fixture-sha256 "$fixture_a07_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a07"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A08 --lane native-contract --subcase mock-failure \
+            --os "${{ matrix.native_os }}" --fixture-id v1-native-a08-public-pdf \
+            --fixture-sha256 "$fixture_a08_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --contract-binary-sha256 "$contract_binary_sha256" \
+            --out "$expected_a08"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A09 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-native-a09 \
+            --fixture-sha256 "$fixture_a09_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a09"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A10 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-native-a10-durability \
+            --fixture-sha256 "$fixture_a10_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --contract-binary-sha256 "$contract_binary_sha256" \
+            --out "$expected_a10"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A11 --lane service-native --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-service-a11 \
+            --fixture-sha256 "$fixture_a11_service_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a11_service"
+          "$eval_bin" acceptance expected-case \
+            --target-binding "$target_binding" --case A12 --lane distribution --subcase core \
+            --os "${{ matrix.native_os }}" --fixture-id v1-distribution-a12 \
+            --fixture-sha256 "$target_binding_sha256" --workflow-path "$workflow_path" \
+            --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" \
+            --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" \
+            --architecture "$architecture" --out "$expected_a12"
+          printf 'KIO_A01_EXPECTED_CASE=%s\n' "$expected_a01" >> "$GITHUB_ENV"
+          printf 'KIO_A02_EXPECTED_CASE=%s\n' "$expected_a02" >> "$GITHUB_ENV"
+          printf 'KIO_A03_NATIVE_EXPECTED_CASE=%s\n' "$expected_a03_native" >> "$GITHUB_ENV"
+          printf 'KIO_A03_SERVICE_EXPECTED_CASE=%s\n' "$expected_a03_service" >> "$GITHUB_ENV"
+          printf 'KIO_A04_EXPECTED_CASE=%s\n' "$expected_a04" >> "$GITHUB_ENV"
+          printf 'KIO_A04_LOCAL_TRUST_EXPECTED_CASE=%s\n' "$expected_a04_local_trust" >> "$GITHUB_ENV"
+          printf 'KIO_A05_EXPECTED_CASE=%s\n' "$expected_a05" >> "$GITHUB_ENV"
+          printf 'KIO_A06_EXPECTED_CASE=%s\n' "$expected_a06" >> "$GITHUB_ENV"
+          printf 'KIO_A07_EXPECTED_CASE=%s\n' "$expected_a07" >> "$GITHUB_ENV"
+          printf 'KIO_A08_EXPECTED_CASE=%s\n' "$expected_a08" >> "$GITHUB_ENV"
+          printf 'KIO_A09_EXPECTED_CASE=%s\n' "$expected_a09" >> "$GITHUB_ENV"
+          printf 'KIO_A10_EXPECTED_CASE=%s\n' "$expected_a10" >> "$GITHUB_ENV"
+          printf 'KIO_A11_SERVICE_EXPECTED_CASE=%s\n' "$expected_a11_service" >> "$GITHUB_ENV"
+          printf 'KIO_A12_EXPECTED_CASE=%s\n' "$expected_a12" >> "$GITHUB_ENV"
+          printf 'KIO_A01_FIXTURE=%s\n' "$fixture_a01" >> "$GITHUB_ENV"
+          printf 'KIO_A02_FIXTURE=%s\n' "$fixture_a02" >> "$GITHUB_ENV"
+          printf 'KIO_A03_NATIVE_FIXTURE=%s\n' "$fixture_a03_native" >> "$GITHUB_ENV"
+          printf 'KIO_A03_SERVICE_FIXTURE=%s\n' "$fixture_a03_service" >> "$GITHUB_ENV"
+          printf 'KIO_A04_FIXTURE=%s\n' "$fixture_a04" >> "$GITHUB_ENV"
+          printf 'KIO_A05_A06_FIXTURE=%s\n' "$fixture_a05_a06" >> "$GITHUB_ENV"
+          printf 'KIO_A07_FIXTURE=%s\n' "$fixture_a07" >> "$GITHUB_ENV"
+          printf 'KIO_A08_FIXTURE=%s\n' "$fixture_a08" >> "$GITHUB_ENV"
+          printf 'KIO_A09_FIXTURE=%s\n' "$fixture_a09" >> "$GITHUB_ENV"
+          printf 'KIO_A10_FIXTURE=%s\n' "$fixture_a10" >> "$GITHUB_ENV"
+          printf 'KIO_A11_SERVICE_FIXTURE=%s\n' "$fixture_a11_service" >> "$GITHUB_ENV"
+          printf 'KIO_CONTRACT_BIN=%s\n' "$contract_bin" >> "$GITHUB_ENV"
+
+      - name: Execute A12 distribution proof against both isolated candidate archives
+        run: |
+          set -euo pipefail
+          eval_bin=target/debug/kio-eval
+          if [[ "$RUNNER_OS" == "Windows" ]]; then eval_bin="${eval_bin}.exe"; fi
+          "$eval_bin" acceptance distribution \
+            --expected-case "$KIO_A12_EXPECTED_CASE" --os "${{ matrix.native_os }}" \
+            --archive "$KIO_RELEASE_ARCHIVE" --checksums "$KIO_RELEASE_CHECKSUMS" \
+            --repro-archive "$KIO_RELEASE_REPRO_ARCHIVE" \
+            --repro-checksums "$KIO_RELEASE_REPRO_CHECKSUMS" \
+            --source-repo "$GITHUB_WORKSPACE" \
+            --expected-lock-sha256 "$KIO_RELEASE_LOCK_SHA256" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a12-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a12-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a12-summary.json"
+
+      - name: Collect A01 through A07 and A09 release-binary receipts
+        run: |
+          set -euo pipefail
+          eval_bin=target/debug/kio-eval
+          if [[ "$RUNNER_OS" == "Windows" ]]; then eval_bin="${eval_bin}.exe"; fi
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A01_EXPECTED_CASE" --case A01 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --fixture "$KIO_A01_FIXTURE" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a01-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a01-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a01-summary.json"
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A02_EXPECTED_CASE" --case A02 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --fixture "$KIO_A02_FIXTURE" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a02-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a02-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a02-summary.json"
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A03_NATIVE_EXPECTED_CASE" --case A03 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --fixture "$KIO_A03_NATIVE_FIXTURE" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a03-native-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a03-native-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a03-native-summary.json"
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A04_EXPECTED_CASE" --case A04 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --fixture "$KIO_A04_FIXTURE" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a04-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a04-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a04-summary.json"
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A04_LOCAL_TRUST_EXPECTED_CASE" --case A04 --lane native-contract --subcase local-trust \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --fixture "$KIO_A04_FIXTURE" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a04-local-trust-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a04-local-trust-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a04-local-trust-summary.json"
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A05_EXPECTED_CASE" --case A05 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --fixture "$KIO_A05_A06_FIXTURE" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a05-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a05-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a05-summary.json"
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A06_EXPECTED_CASE" --case A06 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --fixture "$KIO_A05_A06_FIXTURE" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a06-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a06-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a06-summary.json"
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A09_EXPECTED_CASE" --case A09 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --fixture "$KIO_A09_FIXTURE" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a09-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a09-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a09-summary.json"
+
+      - name: Collect A08 mock-failure and A10 durability contract receipts
+        run: |
+          set -euo pipefail
+          eval_bin=target/debug/kio-eval
+          if [[ "$RUNNER_OS" == "Windows" ]]; then eval_bin="${eval_bin}.exe"; fi
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A08_EXPECTED_CASE" --case A08 --lane native-contract --subcase mock-failure \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --contract-bin "$KIO_CONTRACT_BIN" --fixture "$KIO_A08_FIXTURE" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a08-mock-failure-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a08-mock-failure-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a08-mock-failure-summary.json"
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A10_EXPECTED_CASE" --case A10 --lane native-contract --subcase core \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --contract-bin "$KIO_CONTRACT_BIN" --fixture "$KIO_A10_FIXTURE" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a10-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a10-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a10-summary.json"
+
+      - name: Collect the real Office A07 release-binary receipt
+        run: |
+          set -euo pipefail
+          eval_bin=target/debug/kio-eval
+          if [[ "$RUNNER_OS" == "Windows" ]]; then eval_bin="${eval_bin}.exe"; fi
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A07_EXPECTED_CASE" --case A07 --lane office-real --subcase core \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --fixture "$KIO_A07_FIXTURE" --office-converter "$KIO_OFFICE_CONVERTER" \
+            --preflight-report "$RUNNER_TEMP/kio-v1-preflight.json" \
+            --work-dir "$RUNNER_TEMP/kio-v1-a07-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a07-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a07-summary.json"
+
+      - name: Collect A03 and A11 native scheduler receipts
+        run: |
+          set -euo pipefail
+          eval_bin=target/debug/kio-eval
+          if [[ "$RUNNER_OS" == "Windows" ]]; then eval_bin="${eval_bin}.exe"; fi
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A03_SERVICE_EXPECTED_CASE" --case A03 --lane service-native --subcase core \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --fixture "$KIO_A03_SERVICE_FIXTURE" \
+            --preflight-report "$RUNNER_TEMP/kio-v1-preflight.json" --allow-native-service \
+            --work-dir "$RUNNER_TEMP/kio-v1-a03-service-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a03-service-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a03-service-summary.json"
+          "$eval_bin" acceptance run \
+            --expected-case "$KIO_A11_SERVICE_EXPECTED_CASE" --case A11 --lane service-native --subcase core \
+            --os "${{ matrix.native_os }}" --bin "$KIO_RELEASE_BIN" \
+            --fixture "$KIO_A11_SERVICE_FIXTURE" \
+            --preflight-report "$RUNNER_TEMP/kio-v1-preflight.json" --allow-native-service \
+            --work-dir "$RUNNER_TEMP/kio-v1-a11-service-work" \
+            --receipt "$RUNNER_TEMP/kio-v1-a11-service-receipt.json" \
+            > "$RUNNER_TEMP/kio-v1-a11-service-summary.json"
+
+      - name: Label this native lane as finished evidence, not a full matrix
+        if: always()
+        run: |
+          {
+            echo '## Native lane terminal state'
+            echo
+            echo "OS: \`${{ matrix.native_os }}\`"
+            echo "Current step status: \`${{ job.status }}\`"
+            echo 'A01/A02/A03-native/A03-service/A04-core/A04-local-trust/A05/A06/A07/A08-mock-failure/A09/A10/A11/A12 receipts are retained only as a partial subset.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload native diagnostics and evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: kio-v1-native-${{ matrix.native_os }}-${{ inputs.candidate_sha }}
+          path: |
+            ${{ runner.temp }}/kio-v1-provisioning.txt
+            ${{ runner.temp }}/kio-v1-preflight.json
+            ${{ runner.temp }}/kio-v1-release-verify.json
+            ${{ runner.temp }}/kio-v1-*-expected.json
+            ${{ runner.temp }}/kio-v1-*-receipt.json
+            ${{ runner.temp }}/kio-v1-*-summary.json
+          if-no-files-found: warn
+          compression-level: 0
+
+  native-a01-a09-summary:
+    name: V1 native acceptance supplement summary
+    needs: native-a01-a09
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Reject a missing, skipped, cancelled, or failed native lane
+        env:
+          NATIVE_RESULT: ${{ needs.native-a01-a09.result }}
+        run: |
+          set -euo pipefail
+          {
+            echo '## V1 native acceptance supplement'
+            echo
+            echo "Native acceptance result: \`$NATIVE_RESULT\`"
+            echo
+            echo 'This workflow proves every native and local acceptance requirement against extracted release binaries on each OS; A08 mock-failure and A10 additionally bind a separately hashed debug contract binary.'
+            echo 'It is not a completed v1 acceptance matrix: the A08 provider-live requirements remain in their owning provider lane and the full manifest verifier remains the final gate.'
+          } >> "$GITHUB_STEP_SUMMARY"
+          test "$NATIVE_RESULT" = success

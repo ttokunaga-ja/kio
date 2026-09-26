@@ -113,7 +113,8 @@ fn ct_cli_001_init_layout_and_idempotent_noop() {
         .success();
     let kio_dir = temp.path().join(".kio");
     assert!(kio_dir.join("HEAD").is_file());
-    assert!(kio_dir.join("refs/heads").is_dir());
+    assert!(!kio_dir.join("refs/heads").exists());
+    assert!(kio_dir.join("refs/tags-v1").is_dir());
     assert!(kio_dir.join("objects/raw").is_dir());
     assert!(kio_dir.join("objects/trees").is_dir());
     assert!(kio_dir.join("objects/commits").is_dir());
@@ -230,7 +231,7 @@ fn ct_cli_snapshot_create_log_inspect_tag_diff() {
         .clone();
     let inspected: Value = serde_json::from_slice(&inspect_out).unwrap();
     assert_eq!(inspected["object_type"], "commit");
-    assert_eq!(inspected["parents"][0], snap["commit_hash"]);
+    assert_eq!(inspected["parent"], snap["commit_hash"]);
 
     let tag_out = kio()
         .args([
@@ -435,7 +436,7 @@ fn m1_concurrent_index_loser_is_locked_and_store_intact() {
     // Process A holds the lock across its snapshot sub-step until this test releases
     // it, guaranteeing the contention window without timing assumptions.
     let first = process_command_with_device_home(&bin, device_home.path())
-        .args(["index", "--approve", "--json"])
+        .args(["index", "--json"])
         .env("KIO_TEST_HOLD_LOCK_READY", temp.path().join("lock.ready"))
         .current_dir(temp.path())
         .stdout(Stdio::piped())
@@ -447,7 +448,7 @@ fn m1_concurrent_index_loser_is_locked_and_store_intact() {
     let mut first = HeldLockChild::new(wait_for_lock_ready(first, &ready), &ready);
 
     let second = process_command_with_device_home(&bin, device_home.path())
-        .args(["index", "--approve", "--json"])
+        .args(["index", "--json"])
         .current_dir(temp.path())
         .output()
         .unwrap();
@@ -651,8 +652,7 @@ fn ct_cli_011_012_013_lock_and_schema_errors_are_structured() {
     assert_eq!(err["error_code"], "KIO-E-STORE-NOT-FOUND-001");
 
     let bad_commit = write_invalid_commit_type(temp.path());
-    fs::write(temp.path().join(".kio/HEAD"), &bad_commit).unwrap();
-    fs::write(temp.path().join(".kio/refs/heads/main"), bad_commit).unwrap();
+    fs::write(temp.path().join(".kio/HEAD"), format!("{bad_commit}\n")).unwrap();
     let out = kio()
         .args(["log", "--json"])
         .current_dir(temp.path())
@@ -663,8 +663,7 @@ fn ct_cli_011_012_013_lock_and_schema_errors_are_structured() {
         .clone();
     let err: Value = serde_json::from_slice(&out).unwrap();
     assert_eq!(err["error_code"], "KIO-E-CONFIG-SCHEMA-001");
-    fs::write(temp.path().join(".kio/HEAD"), "").unwrap();
-    fs::write(temp.path().join(".kio/refs/heads/main"), "").unwrap();
+    fs::write(temp.path().join(".kio/HEAD"), "unborn\n").unwrap();
 
     fs::write(temp.path().join(".kio/.lock"), "{}").unwrap();
     fs::write(temp.path().join("a.pdf"), b"a").unwrap();
@@ -1024,7 +1023,7 @@ fn write_invalid_commit_type(root: &Path) -> String {
         "created_at": "2026-04-29T12:00:00Z",
         "message": "bad commit type",
         "object_type": "commit",
-        "parents": [],
+        "parent": null,
         "stats": { "files_added": 0, "files_deleted": 0, "files_modified": 0 },
         "tool_lock_hash": "sha256:8a32a740871b1dd9db1bda186dce07e8e6c60d2cd316f21683ea2bd857c16ffb",
         "tree": "sha256:849dc4fa25bc1a7b09b74dba30c0bb85224fb8f659c3b2b177b7189b0327a967"

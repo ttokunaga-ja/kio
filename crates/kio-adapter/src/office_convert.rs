@@ -17,9 +17,21 @@
 //! changes (07 §5.1: "renderer の名称・版は provenance として記録し、hash 入力には
 //! しない").
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    time::Duration,
+};
+
+use kio_process::{
+    BoundedProcessOptions,
+    confinement::{RenderResourceLimits, RenderSandbox},
+};
+use sha2::{Digest, Sha256};
+use tempfile::{Builder, TempDir};
+
+#[cfg(target_os = "macos")]
+use quick_xml::{Reader, events::Event};
 
 use crate::{AdapterError, Result};
 
@@ -34,6 +46,45 @@ pub const TEST_OFFICE_CONVERT_ENV: &str = "KIO_TEST_OFFICE_CONVERT";
 pub const OFFICE_CONVERTER_ENV: &str = "KIO_OFFICE_CONVERTER";
 /// The PATH-resolved program name probed as the last resolution step.
 const DEFAULT_OFFICE_CONVERTER_PROGRAM: &str = "soffice";
+const OFFICE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const OFFICE_CONVERT_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_OFFICE_INPUT_BYTES: usize = 100 * 1024 * 1024;
+const MAX_OFFICE_PDF_BYTES: usize = 250 * 1024 * 1024;
+const MAX_OFFICE_LOG_BYTES: usize = 64 * 1024;
+const OFFICE_NORMALIZATION_PROFILE: &str = "pdf-volatile-fields-v1";
+const MACOS_UNO_FILTER_VERSION: &str = "macos-spell-component-v1";
+
+// This thread-local switch is intentionally test-only. It permits bounded
+// renderer stderr to appear in the assertion from the explicit synthetic
+// native acceptance lane, while production errors never forward renderer
+// output into application logs or user-visible diagnostics.
+#[cfg(test)]
+thread_local! {
+    static NATIVE_ACCEPTANCE_DIAGNOSTICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+struct NativeAcceptanceDiagnosticGuard;
+
+#[cfg(test)]
+impl NativeAcceptanceDiagnosticGuard {
+    fn enable() -> Self {
+        NATIVE_ACCEPTANCE_DIAGNOSTICS.with(|enabled| enabled.set(true));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for NativeAcceptanceDiagnosticGuard {
+    fn drop(&mut self) {
+        NATIVE_ACCEPTANCE_DIAGNOSTICS.with(|enabled| enabled.set(false));
+    }
+}
+
+#[cfg(test)]
+fn native_acceptance_diagnostics_enabled() -> bool {
+    NATIVE_ACCEPTANCE_DIAGNOSTICS.with(std::cell::Cell::get)
+}
 
 const DOCX_MEDIA_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
@@ -55,7 +106,18 @@ enum ConverterBackend {
     #[cfg(debug_assertions)]
     Seam { fixture_path: PathBuf },
     /// A real `soffice`-compatible binary invoked via [`Command`].
-    Real { program: PathBuf },
+    Real {
+        program: PathBuf,
+        program_digest: String,
+        uno_catalog: Option<PrivateUnoCatalog>,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct PrivateUnoCatalog {
+    #[cfg(target_os = "macos")]
+    source: PathBuf,
+    source_digest: String,
 }
 
 /// A resolved Office → PDF converter (07 §5.1). Obtain one via
@@ -72,6 +134,44 @@ impl OfficeConverter {
     #[must_use]
     pub fn version(&self) -> &str {
         &self.version
+    }
+
+    /// Stable preparation-profile input for this renderer. It binds the
+    /// selected executable and all conversion-affecting Kio/UNO filter
+    /// definitions without treating the renderer's display version as content.
+    #[must_use]
+    pub fn profile_identity(&self) -> String {
+        let mut digest = Sha256::new();
+        digest.update(b"kio-office-preparation-profile-v1\0");
+        digest.update(std::env::consts::OS.as_bytes());
+        digest.update(b"\0");
+        digest.update(OFFICE_NORMALIZATION_PROFILE.as_bytes());
+        digest.update(b"\0");
+        digest.update(MACOS_UNO_FILTER_VERSION.as_bytes());
+        digest.update(b"\0");
+        match &self.backend {
+            #[cfg(debug_assertions)]
+            ConverterBackend::Seam { fixture_path } => {
+                digest.update(fixture_path.as_os_str().as_encoded_bytes())
+            }
+            ConverterBackend::Real {
+                program,
+                program_digest,
+                uno_catalog,
+            } => {
+                digest.update(program.as_os_str().as_encoded_bytes());
+                digest.update(b"\0");
+                digest.update(program_digest.as_bytes());
+                digest.update(b"\0");
+                digest.update(
+                    uno_catalog
+                        .as_ref()
+                        .map_or("none", |catalog| &catalog.source_digest)
+                        .as_bytes(),
+                );
+            }
+        }
+        hex_digest(&digest.finalize())
     }
 
     /// Convert `input` (DOCX or PPTX bytes, per `media_type`) to
@@ -96,8 +196,16 @@ impl OfficeConverter {
                     fixture_path.display()
                 ))
             }),
-            ConverterBackend::Real { program } => {
-                let pdf = convert_with_real_binary(program, input, media_type)?;
+            ConverterBackend::Real {
+                program,
+                program_digest,
+                uno_catalog,
+            } => {
+                crate::ooxml_package::validate_real_office_package(input, media_type)?;
+                verify_renderer_fingerprint(program, program_digest, "before conversion")?;
+                let pdf =
+                    convert_with_real_binary(program, uno_catalog.as_ref(), input, media_type)?;
+                verify_renderer_fingerprint(program, program_digest, "after conversion")?;
                 Ok(normalize_converted_pdf(&pdf))
             }
         }
@@ -130,28 +238,160 @@ pub fn resolve_office_converter() -> Option<OfficeConverter> {
         if explicit.is_empty() {
             return None;
         }
-        return probe_real_converter(PathBuf::from(explicit));
+        return resolve_program(PathBuf::from(explicit)).and_then(probe_real_converter);
     }
-    probe_real_converter(PathBuf::from(DEFAULT_OFFICE_CONVERTER_PROGRAM))
+    resolve_program(PathBuf::from(DEFAULT_OFFICE_CONVERTER_PROGRAM)).and_then(probe_real_converter)
+}
+
+/// Resolve the executable before dropping the ambient environment.  The
+/// spawned renderer receives a fixed runtime PATH, while this lookup preserves
+/// the documented `soffice`-on-PATH resolution at the trusted CLI boundary.
+fn resolve_program(program: PathBuf) -> Option<PathBuf> {
+    if program.is_absolute() {
+        return canonical_renderer_program(program);
+    }
+    if program.components().count() > 1 {
+        return canonical_renderer_program(program);
+    }
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(&program))
+        .find_map(canonical_renderer_program)
+}
+
+fn canonical_renderer_program(candidate: PathBuf) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(&candidate).ok()?;
+    if !canonical.is_file() {
+        return None;
+    }
+    // Recognize only the known passthrough wrapper by both location and bytes.
+    // A command installed at the Homebrew name may select another application
+    // or add arguments; its name alone cannot authorize substituting this app.
+    #[cfg(target_os = "macos")]
+    {
+        let known_location = ["/opt/homebrew/bin/soffice", "/usr/local/bin/soffice"]
+            .into_iter()
+            .filter_map(|path| std::fs::canonicalize(path).ok())
+            .any(|path| path == canonical);
+        let known_passthrough = known_location
+            && kio_core::cas::read_bounded_regular_file(&canonical, 4096)
+                .is_ok_and(|bytes| is_macos_office_passthrough_wrapper(&bytes));
+        if known_passthrough {
+            return std::fs::canonicalize("/Applications/LibreOffice.app/Contents/MacOS/soffice")
+                .ok()
+                .filter(|program| program.is_file());
+        }
+    }
+    Some(canonical)
+}
+
+#[cfg(target_os = "macos")]
+fn is_macos_office_passthrough_wrapper(bytes: &[u8]) -> bool {
+    bytes == b"#!/bin/bash\nexec \"/Applications/LibreOffice.app/Contents/MacOS/soffice\"  \"$@\"\n"
 }
 
 /// Probe a candidate converter binary via `--version`. ANY failure (spawn
 /// error / missing binary, non-zero exit, empty stdout) resolves to `None`
 /// — never an `Err`, per [`resolve_office_converter`]'s contract.
 fn probe_real_converter(program: PathBuf) -> Option<OfficeConverter> {
-    let output = Command::new(&program).arg("--version").output().ok()?;
+    probe_real_converter_diagnostic(program).ok()
+}
+
+/// Diagnostic variant for native acceptance tests. Production availability
+/// remains optional, but a required real-renderer lane can expose a bounded,
+/// non-secret failure reason rather than silently treating a broken sandbox as
+/// an absent binary.
+fn probe_real_converter_diagnostic(program: PathBuf) -> Result<OfficeConverter> {
+    let program_digest = fingerprint_renderer_program(&program)?;
+    let uno_catalog = private_uno_catalog_for_program(&program)?;
+    let scratch = private_temp_dir()?;
+    let profile_dir = create_private_renderer_state(scratch.path(), "probe")?;
+    let profile_url = file_url(&profile_dir)?;
+    let sandbox = RenderSandbox::new(
+        &program,
+        scratch.path(),
+        renderer_runtime_roots(&program)?,
+        RenderResourceLimits::default(),
+    )
+    .map_err(|error| {
+        AdapterError::ContractViolation(format!(
+            "office converter confinement setup failed: {error}"
+        ))
+    })?;
+    let mut environment = renderer_environment(&program, Some(&profile_dir));
+    if let Some(catalog) = uno_catalog.as_ref() {
+        let private_catalog = write_private_uno_catalog(catalog, scratch.path())?;
+        environment.push((
+            OsString::from("URE_MORE_SERVICES"),
+            file_url(&private_catalog)?.into(),
+        ));
+    }
+    let output = sandbox
+        .run(
+            [
+                OsString::from("--headless"),
+                OsString::from("--norestore"),
+                OsString::from(format!("-env:UserInstallation={profile_url}")),
+                OsString::from("--version"),
+            ],
+            &environment,
+            BoundedProcessOptions {
+                timeout: OFFICE_PROBE_TIMEOUT,
+                max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
+                max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
+            },
+        )
+        .map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "office converter bounded probe failed: {error}"
+            ))
+        })?;
     if !output.status.success() {
-        return None;
+        return Err(AdapterError::ContractViolation(format!(
+            "office converter probe exited with {}",
+            output.status
+        )));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let version = stdout.lines().next()?.trim();
-    if version.is_empty() {
-        return None;
-    }
-    Some(OfficeConverter {
-        backend: ConverterBackend::Real { program },
+    let version = output
+        .stdout
+        .lines()
+        .next()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AdapterError::ContractViolation(
+                "office converter probe returned no version line".to_owned(),
+            )
+        })?;
+    Ok(OfficeConverter {
+        backend: ConverterBackend::Real {
+            program,
+            program_digest,
+            uno_catalog,
+        },
         version: version.to_owned(),
     })
+}
+
+fn fingerprint_renderer_program(program: &Path) -> Result<String> {
+    const MAX_RENDERER_PROGRAM_BYTES: u64 = 32 * 1024 * 1024;
+    let bytes = kio_core::cas::read_bounded_regular_file(program, MAX_RENDERER_PROGRAM_BYTES)
+        .map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "cannot safely fingerprint Office renderer executable: {error}"
+            ))
+        })?;
+    Ok(hex_digest(&Sha256::digest(bytes)))
+}
+
+fn verify_renderer_fingerprint(program: &Path, expected: &str, stage: &str) -> Result<()> {
+    let actual = fingerprint_renderer_program(program)?;
+    if actual != expected {
+        return Err(AdapterError::ContractViolation(format!(
+            "office converter executable changed {stage}; resolve a fresh converter before retrying"
+        )));
+    }
+    Ok(())
 }
 
 fn office_extension(media_type: &str) -> Option<&'static str> {
@@ -162,40 +402,500 @@ fn office_extension(media_type: &str) -> Option<&'static str> {
     }
 }
 
-/// RAII cleanup for the per-conversion scratch directory (staged input,
-/// output dir, LibreOffice user-profile dir) — removed best-effort on every
-/// exit path, including an early `?` return from [`convert_with_real_binary`].
-struct TempDirGuard(PathBuf);
+/// Create an exclusively allocated, owner-private scratch directory.  The
+/// `tempfile` implementation uses a random name and atomic create; on Unix we
+/// also set the mode explicitly instead of inheriting the caller's umask.
+fn private_temp_dir() -> Result<TempDir> {
+    let directory = {
+        let mut builder = Builder::new();
+        builder.prefix("kio-");
+        #[cfg(target_os = "macos")]
+        {
+            // LibreOffice's Unix-domain socket names must fit sun_path. A
+            // canonical short parent leaves room for its generated suffixes;
+            // the directory remains exclusively created and owner-private.
+            let socket_root = std::fs::canonicalize("/private/tmp").map_err(|error| {
+                AdapterError::ContractViolation(format!(
+                    "failed to resolve private Office socket root: {error}"
+                ))
+            })?;
+            builder.tempdir_in(socket_root)
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            builder.tempdir()
+        }
+    }
+    .map_err(|error| {
+        AdapterError::ContractViolation(format!(
+            "failed to create private office scratch directory: {error}"
+        ))
+    })?;
+    #[cfg(windows)]
+    kio_process::confinement::protect_owner_private_scratch(directory.path()).map_err(|error| {
+        AdapterError::ContractViolation(format!(
+            "failed to establish owner-private office scratch directory: {error}"
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
+            .map_err(|error| {
+                AdapterError::ContractViolation(format!(
+                    "failed to restrict office scratch directory permissions: {error}"
+                ))
+            })?;
+    }
+    Ok(directory)
+}
 
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
+/// Construct all renderer-owned mutable state before process creation. These
+/// names are derived only from an exclusively-created private scratch parent;
+/// on Windows they inherit its protected owner DACL before AppContainer
+/// access is granted, and on Unix each leaf is explicitly mode 0700.
+fn create_private_renderer_state(scratch: &Path, purpose: &str) -> Result<PathBuf> {
+    let profile = scratch.join("lo-profile");
+    let cache = scratch.join("cache");
+    let config = scratch.join("config");
+    for (path, label) in [
+        (&profile, "LibreOffice profile"),
+        (&cache, "renderer cache"),
+        (&config, "renderer configuration"),
+    ] {
+        std::fs::create_dir(path).map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "failed to create private {purpose} {label}: {error}"
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+                |error| {
+                    AdapterError::ContractViolation(format!(
+                        "failed to restrict private {purpose} {label}: {error}"
+                    ))
+                },
+            )?;
+        }
+    }
+    Ok(profile)
+}
+
+#[cfg(target_os = "macos")]
+fn private_uno_catalog_for_program(program: &Path) -> Result<Option<PrivateUnoCatalog>> {
+    const BUNDLE: &str = "/Applications/LibreOffice.app";
+    let bundle = PathBuf::from(BUNDLE);
+    let recognized = std::fs::canonicalize(bundle.join("Contents/MacOS/soffice"))
+        .is_ok_and(|candidate| candidate == program);
+    if !recognized {
+        return Ok(None);
+    }
+    let source = bundle.join("Contents/Resources/services/services.rdb");
+    let bytes = read_stable_catalog(&source)?;
+    let _ = macos_spell_component_range(&bytes)?;
+    let digest = Sha256::digest(&bytes);
+    Ok(Some(PrivateUnoCatalog {
+        source,
+        source_digest: hex_digest(&digest),
+    }))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn private_uno_catalog_for_program(_program: &Path) -> Result<Option<PrivateUnoCatalog>> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn read_stable_catalog(path: &Path) -> Result<Vec<u8>> {
+    const MAX_CATALOG_BYTES: usize = 1024 * 1024;
+    kio_core::cas::read_bounded_regular_file(path, MAX_CATALOG_BYTES as u64).map_err(|error| {
+        AdapterError::ContractViolation(format!(
+            "cannot safely read Office service catalog: {error}"
+        ))
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn macos_spell_component_range(bytes: &[u8]) -> Result<(usize, usize)> {
+    const IMPLEMENTATION: &[u8] = b"org.openoffice.lingu.MacOSXSpellChecker";
+    const CONSTRUCTOR: &[u8] = b"lingucomponent_MacSpellChecker_get_implementation";
+    let mut reader = Reader::from_reader(bytes);
+    reader.config_mut().check_end_names = true;
+    let mut buffer = Vec::new();
+    let mut previous = 0_usize;
+    let mut component: Option<(usize, usize, usize, bool)> = None;
+    let mut match_range = None;
+    let mut root_started = false;
+    let mut root_closed = false;
+    let mut root_depth = 0_usize;
+    loop {
+        let start = previous;
+        let event = reader.read_event_into(&mut buffer).map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "Office service catalog XML is invalid: {error}"
+            ))
+        })?;
+        previous = reader.buffer_position() as usize;
+        match event {
+            Event::DocType(_) => {
+                return Err(AdapterError::ContractViolation(
+                    "Office service catalog must not contain a DOCTYPE".to_owned(),
+                ));
+            }
+            Event::Start(ref tag) | Event::Empty(ref tag) => {
+                let empty = matches!(&event, Event::Empty(_));
+                let tag_name = tag.name();
+                let name = tag_name.as_ref();
+                // `quick-xml` reports attribute syntax failures lazily. Walk
+                // every element's attributes before interpreting its shape so
+                // a malformed unrelated component cannot survive the filtered
+                // copy unchanged.
+                let mut declared_namespace = None;
+                let mut implementation = None;
+                let mut constructor = None;
+                for attribute in tag.attributes().with_checks(true) {
+                    let attribute = attribute.map_err(|error| {
+                        AdapterError::ContractViolation(format!(
+                            "Office service catalog attribute is invalid: {error}"
+                        ))
+                    })?;
+                    match attribute.key.as_ref() {
+                        b"xmlns" => {
+                            declared_namespace = Some(
+                                attribute.value.as_ref()
+                                    == b"http://openoffice.org/2010/uno-components",
+                            )
+                        }
+                        b"name" if name == b"implementation" => {
+                            implementation = Some(attribute.value.as_ref() == IMPLEMENTATION)
+                        }
+                        b"constructor" if name == b"implementation" => {
+                            constructor = Some(attribute.value.as_ref() == CONSTRUCTOR)
+                        }
+                        _ => {}
+                    }
+                }
+                if !root_started {
+                    if empty || name != b"components" || declared_namespace != Some(true) {
+                        return Err(AdapterError::ContractViolation("Office service catalog must have one components root in the UNO namespace".to_owned()));
+                    }
+                    root_started = true;
+                    root_depth = 1;
+                    buffer.clear();
+                    continue;
+                }
+                if root_closed {
+                    return Err(AdapterError::ContractViolation(
+                        "Office service catalog has content after its root element".to_owned(),
+                    ));
+                }
+                root_depth += 1;
+                if name == b"component" && root_depth != 2 {
+                    return Err(AdapterError::ContractViolation(
+                        "Office service catalog components must be direct children of the root"
+                            .to_owned(),
+                    ));
+                }
+                if (name == b"component" || name == b"implementation")
+                    && declared_namespace == Some(false)
+                {
+                    return Err(AdapterError::ContractViolation(
+                        "Office service catalog direct component namespace is invalid".to_owned(),
+                    ));
+                }
+                if name == b"component" && component.is_none() {
+                    component = Some((start, 1, 0, false));
+                } else if let Some((_, depth, _, _)) = component.as_mut() {
+                    *depth += 1;
+                }
+                if name == b"implementation" {
+                    if component.as_ref().map(|(_, depth, _, _)| *depth) != Some(2) {
+                        return Err(AdapterError::ContractViolation(
+                            "Office service catalog implementations must be direct component children"
+                                .to_owned(),
+                        ));
+                    }
+                    if implementation == Some(true) {
+                        if constructor != Some(true) || match_range.is_some() {
+                            return Err(AdapterError::ContractViolation("Office service catalog spell checker is not the expected single implementation".to_owned()));
+                        }
+                        let Some((_, _, implementations, target)) = component.as_mut() else {
+                            return Err(AdapterError::ContractViolation(
+                                "Office spell checker is outside a component".to_owned(),
+                            ));
+                        };
+                        *implementations += 1;
+                        *target = true;
+                    } else if let Some((_, _, implementations, _)) = component.as_mut() {
+                        *implementations += 1;
+                    }
+                }
+                if empty {
+                    if let Some((component_start, depth, implementations, target)) =
+                        component.as_mut()
+                    {
+                        *depth = depth.saturating_sub(1);
+                        if *depth == 0 {
+                            if *target {
+                                if *implementations != 1 {
+                                    return Err(AdapterError::ContractViolation("Office spell checker component contains additional implementations".to_owned()));
+                                }
+                                match_range = Some((*component_start, previous));
+                            }
+                            component = None;
+                        }
+                    }
+                    root_depth = root_depth.saturating_sub(1);
+                }
+            }
+            Event::End(tag) => {
+                if !root_started || root_closed || root_depth == 0 {
+                    return Err(AdapterError::ContractViolation(
+                        "Office service catalog has an invalid closing element".to_owned(),
+                    ));
+                }
+                if tag.name().as_ref() == b"component" {
+                    if let Some((component_start, depth, implementations, target)) =
+                        component.as_mut()
+                    {
+                        *depth = depth.saturating_sub(1);
+                        if *depth == 0 {
+                            if *target {
+                                if *implementations != 1 {
+                                    return Err(AdapterError::ContractViolation("Office spell checker component contains additional implementations".to_owned()));
+                                }
+                                match_range = Some((*component_start, previous));
+                            }
+                            component = None;
+                        }
+                    }
+                } else if let Some((_, depth, _, _)) = component.as_mut() {
+                    *depth = depth.saturating_sub(1);
+                }
+                root_depth -= 1;
+                if root_depth == 0 {
+                    if tag.name().as_ref() != b"components" || component.is_some() {
+                        return Err(AdapterError::ContractViolation(
+                            "Office service catalog has an invalid components root".to_owned(),
+                        ));
+                    }
+                    root_closed = true;
+                }
+            }
+            Event::Text(text) => {
+                let raw: &[u8] = text.as_ref();
+                if (!root_started || root_closed) && !raw.iter().all(u8::is_ascii_whitespace) {
+                    return Err(AdapterError::ContractViolation(
+                        "Office service catalog has non-whitespace text outside its root"
+                            .to_owned(),
+                    ));
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buffer.clear();
+    }
+    if !root_closed || component.is_some() {
+        return Err(AdapterError::ContractViolation(
+            "Office service catalog is truncated or has no closed root".to_owned(),
+        ));
+    }
+    match_range.ok_or_else(|| {
+        AdapterError::ContractViolation(
+            "Office service catalog has no expected macOS spell checker component".to_owned(),
+        )
+    })
+}
+
+fn write_private_uno_catalog(catalog: &PrivateUnoCatalog, scratch: &Path) -> Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let bytes = read_stable_catalog(&catalog.source)?;
+        if hex_digest(&Sha256::digest(&bytes)) != catalog.source_digest {
+            return Err(AdapterError::ContractViolation(
+                "Office service catalog changed after converter probe".to_owned(),
+            ));
+        }
+        let (start, end) = macos_spell_component_range(&bytes)?;
+        let destination = scratch.join("services-without-macos-spell.rdb");
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&destination)
+            .map_err(|error| {
+                AdapterError::ContractViolation(format!(
+                    "cannot create private Office service catalog: {error}"
+                ))
+            })?;
+        use std::io::Write as _;
+        output
+            .write_all(&bytes[..start])
+            .and_then(|()| output.write_all(&bytes[end..]))
+            .and_then(|()| output.sync_all())
+            .map_err(|error| {
+                AdapterError::ContractViolation(format!(
+                    "cannot write private Office service catalog: {error}"
+                ))
+            })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    AdapterError::ContractViolation(format!(
+                        "cannot restrict private Office service catalog: {error}"
+                    ))
+                })?;
+        }
+        Ok(destination)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (catalog, scratch);
+        Err(AdapterError::ContractViolation(
+            "private UNO catalogs are unsupported on this platform".to_owned(),
+        ))
     }
 }
 
-/// A process-unique scratch directory under the OS temp dir. `tempfile` (the
-/// crate used elsewhere in this workspace for this) is a dev-dependency
-/// only in every crate's `Cargo.toml` — unavailable to non-test runtime code
-/// — so this hand-rolls the same PID + monotonic-counter + nanosecond-
-/// timestamp uniqueness strategy rather than promoting a new dependency.
-fn unique_temp_dir(label: &str) -> Result<PathBuf> {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!(
-        "kio-office-{label}-{}-{nanos}-{counter}",
-        std::process::id()
-    ));
-    std::fs::create_dir_all(&dir).map_err(|err| {
-        AdapterError::ContractViolation(format!(
-            "failed to create office-convert scratch dir at {}: {err}",
-            dir.display()
-        ))
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A renderer receives no ambient credentials, proxy, loader, or application
+/// configuration.  This is intentionally a narrow OS-runtime allowlist; the
+/// private profile replaces `HOME` so LibreOffice cannot read user state.
+fn renderer_environment(_program: &Path, home: Option<&Path>) -> Vec<(OsString, OsString)> {
+    let mut environment = Vec::new();
+    #[cfg(unix)]
+    {
+        let path = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")])
+            .expect("fixed Unix runtime paths contain no separators");
+        environment.push((OsString::from("PATH"), path));
+    }
+    #[cfg(windows)]
+    for name in ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
+        if let Some(value) = std::env::var_os(name) {
+            environment.push((OsString::from(name), value));
+        }
+    }
+    #[cfg(windows)]
+    {
+        let mut paths = Vec::new();
+        if let Some(system_root) = std::env::var_os("SystemRoot") {
+            let root = PathBuf::from(system_root);
+            paths.push(root.join("System32"));
+            paths.push(root);
+        }
+        if let Ok(path) = std::env::join_paths(paths) {
+            environment.push((OsString::from("PATH"), path));
+        }
+    }
+    if let Some(home) = home {
+        environment.push((OsString::from("HOME"), home.as_os_str().to_owned()));
+        #[cfg(unix)]
+        {
+            environment.push((OsString::from("TMPDIR"), home.as_os_str().to_owned()));
+            if let Some(scratch) = home.parent() {
+                environment.push((
+                    OsString::from("OSL_SOCKET_PATH"),
+                    scratch.as_os_str().to_owned(),
+                ));
+                environment.push((
+                    OsString::from("XDG_CACHE_HOME"),
+                    scratch.join("cache").into_os_string(),
+                ));
+                environment.push((
+                    OsString::from("XDG_CONFIG_HOME"),
+                    scratch.join("config").into_os_string(),
+                ));
+            }
+        }
+        #[cfg(windows)]
+        environment.push((OsString::from("USERPROFILE"), home.as_os_str().to_owned()));
+    }
+    environment
+}
+
+fn renderer_runtime_roots(_program: &Path) -> Result<Vec<PathBuf>> {
+    let mut roots = Vec::new();
+    #[cfg(target_os = "macos")]
+    for root in [
+        "/System",
+        "/bin",
+        "/usr/bin",
+        "/usr/lib",
+        "/usr/share",
+        "/Library/Fonts",
+        "/System/Library/Fonts",
+        "/private/var/db/timezone",
+    ] {
+        if Path::new(root).exists() {
+            roots.push(PathBuf::from(root));
+        }
+    }
+    #[cfg(target_os = "macos")]
+    if private_uno_catalog_for_program(_program)?.is_some() {
+        roots.push(PathBuf::from("/Applications/LibreOffice.app"));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let package_program = Path::new("/usr/lib/libreoffice/program/soffice");
+        if std::fs::canonicalize(package_program).ok().as_deref() == Some(_program) {
+            let share = PathBuf::from("/usr/lib/libreoffice/share");
+            if !share.is_dir() {
+                return Err(AdapterError::ContractViolation(
+                    "recognized Linux LibreOffice package is missing its share runtime".to_owned(),
+                ));
+            }
+            roots.push(share);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    for root in [
+        "/bin",
+        "/usr/bin",
+        "/usr/lib",
+        "/usr/share",
+        "/lib",
+        "/lib64",
+        "/etc/fonts",
+    ] {
+        if Path::new(root).exists() {
+            roots.push(PathBuf::from(root));
+        }
+    }
+    #[cfg(windows)]
+    if let Some(root) = std::env::var_os("SystemRoot") {
+        roots.push(PathBuf::from(root));
+    }
+    Ok(roots)
+}
+
+fn file_url(path: &Path) -> Result<String> {
+    let text = path.to_str().ok_or_else(|| {
+        AdapterError::ContractViolation("office scratch path is not valid Unicode".to_owned())
     })?;
-    Ok(dir)
+    #[cfg(windows)]
+    let path = text.replace('\\', "/");
+    #[cfg(not(windows))]
+    let path = text.to_owned();
+    let mut encoded = String::new();
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    #[cfg(windows)]
+    return Ok(format!("file:///{encoded}"));
+    #[cfg(not(windows))]
+    Ok(format!("file://{encoded}"))
 }
 
 /// Run the real renderer: stage `input` under the correct extension, convert
@@ -206,14 +906,25 @@ fn unique_temp_dir(label: &str) -> Result<PathBuf> {
 /// calls); verified against the real `/opt/homebrew/bin/soffice` 26.2.4.2 on
 /// the implementing machine. Any failure (spawn, non-zero exit, missing or
 /// non-PDF output) is `AdapterError::ContractViolation`.
-fn convert_with_real_binary(program: &Path, input: &[u8], media_type: &str) -> Result<Vec<u8>> {
+fn convert_with_real_binary(
+    program: &Path,
+    uno_catalog: Option<&PrivateUnoCatalog>,
+    input: &[u8],
+    media_type: &str,
+) -> Result<Vec<u8>> {
     let extension = office_extension(media_type).ok_or_else(|| {
         AdapterError::ContractViolation(format!(
             "office converter invoked for a non-office media type: {media_type}"
         ))
     })?;
-    let workdir = unique_temp_dir("convert")?;
-    let _cleanup = TempDirGuard(workdir.clone());
+    if input.len() > MAX_OFFICE_INPUT_BYTES {
+        return Err(AdapterError::ContractViolation(format!(
+            "office input exceeds the {} byte limit",
+            MAX_OFFICE_INPUT_BYTES
+        )));
+    }
+    let scratch = private_temp_dir()?;
+    let workdir = scratch.path();
 
     let input_path = workdir.join(format!("input.{extension}"));
     std::fs::write(&input_path, input).map_err(|err| {
@@ -224,53 +935,121 @@ fn convert_with_real_binary(program: &Path, input: &[u8], media_type: &str) -> R
     })?;
 
     let outdir = workdir.join("out");
-    std::fs::create_dir_all(&outdir).map_err(|err| {
+    std::fs::create_dir(&outdir).map_err(|err| {
         AdapterError::ContractViolation(format!(
             "failed to create office-convert output dir at {}: {err}",
             outdir.display()
         ))
     })?;
-    let profile_dir = workdir.join("lo-profile");
-
-    let output = Command::new(program)
-        .arg("--headless")
-        .arg(format!(
-            "-env:UserInstallation=file://{}",
-            profile_dir.display()
+    // Retain this directory before launching the renderer. It is the only
+    // namespace used to recover output: the renderer can replace path names
+    // underneath it, but cannot redirect a descriptor-relative no-follow
+    // read to a file outside this retained directory.
+    let output_directory = kio_core::store_dir::StoreDirectory::from_retained(
+        std::fs::File::open(&outdir).map_err(|err| {
+            AdapterError::ContractViolation(format!(
+                "failed to retain office-convert output dir at {}: {err}",
+                outdir.display()
+            ))
+        })?,
+        outdir.clone(),
+    )
+    .map_err(|err| {
+        AdapterError::ContractViolation(format!(
+            "failed to validate office-convert output dir at {}: {err}",
+            outdir.display()
         ))
-        .arg("--convert-to")
-        .arg("pdf")
-        .arg("--outdir")
-        .arg(&outdir)
-        .arg(&input_path)
-        .output()
+    })?;
+    let profile_dir = create_private_renderer_state(workdir, "conversion")?;
+
+    let profile_url = file_url(&profile_dir)?;
+    let sandbox = RenderSandbox::new(
+        program,
+        workdir,
+        renderer_runtime_roots(program)?,
+        RenderResourceLimits::default(),
+    )
+    .map_err(|err| {
+        AdapterError::ContractViolation(format!(
+            "office converter confinement is unavailable: {err}"
+        ))
+    })?;
+    let arguments = vec![
+        OsString::from("--headless"),
+        OsString::from(format!("-env:UserInstallation={profile_url}")),
+        OsString::from("--convert-to"),
+        OsString::from("pdf"),
+        OsString::from("--outdir"),
+        outdir.as_os_str().to_owned(),
+        input_path.as_os_str().to_owned(),
+    ];
+    let mut environment = renderer_environment(program, Some(&profile_dir));
+    #[cfg(test)]
+    if native_acceptance_diagnostics_enabled() {
+        // This is a fixed diagnostic switch for checked-in synthetic OOXML
+        // fixtures only. It never accepts ambient log configuration.
+        environment.push((
+            OsString::from("SAL_LOG"),
+            OsString::from("+WARN+INFO.sal.osl.pipe"),
+        ));
+    }
+    if let Some(catalog) = uno_catalog {
+        let catalog = write_private_uno_catalog(catalog, workdir)?;
+        environment.push((
+            OsString::from("URE_MORE_SERVICES"),
+            file_url(&catalog)?.into(),
+        ));
+    }
+    let output = sandbox
+        .run(
+            arguments,
+            &environment,
+            BoundedProcessOptions {
+                timeout: OFFICE_CONVERT_TIMEOUT,
+                max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
+                max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
+            },
+        )
         .map_err(|err| {
             AdapterError::ContractViolation(format!(
-                "failed to spawn office converter {}: {err}",
+                "office converter {} failed within confinement: {err}",
                 program.display()
             ))
         })?;
     if !output.status.success() {
+        #[cfg(test)]
+        if native_acceptance_diagnostics_enabled() {
+            return Err(AdapterError::ContractViolation(format!(
+                "office converter {} exited with {} after {:?}; bounded stdout for the synthetic native acceptance fixture: {}; bounded stderr: {}",
+                program.display(),
+                output.status,
+                output.duration,
+                output.stdout.trim(),
+                output.stderr.trim(),
+            )));
+        }
         return Err(AdapterError::ContractViolation(format!(
-            "office converter {} exited with {}: {}",
+            "office converter {} exited with {}",
             program.display(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+            output.status
         )));
     }
 
-    let produced_pdf = outdir.join("input.pdf");
-    let pdf_bytes = std::fs::read(&produced_pdf).map_err(|err| {
-        AdapterError::ContractViolation(format!(
-            "office converter did not produce {}: {err}",
-            produced_pdf.display()
-        ))
-    })?;
+    let pdf_bytes = output_directory
+        .read_optional(Path::new("input.pdf"), MAX_OFFICE_PDF_BYTES as u64)
+        .map_err(|err| {
+            AdapterError::ContractViolation(format!(
+                "office converter output is absent, unsafe, or exceeded the {} byte limit: {err}",
+                MAX_OFFICE_PDF_BYTES
+            ))
+        })?
+        .ok_or_else(|| {
+            AdapterError::ContractViolation("office converter did not produce input.pdf".to_owned())
+        })?;
     if !pdf_bytes.starts_with(b"%PDF") {
-        return Err(AdapterError::ContractViolation(format!(
-            "office converter output at {} is not a PDF (missing %PDF magic)",
-            produced_pdf.display()
-        )));
+        return Err(AdapterError::ContractViolation(
+            "office converter output is not a PDF (missing %PDF magic)".to_owned(),
+        ));
     }
     Ok(pdf_bytes)
 }
@@ -538,6 +1317,82 @@ mod tests {
     use super::*;
     use base64::Engine;
 
+    #[cfg(unix)]
+    fn executable_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).expect("write renderer fixture");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("mark renderer fixture executable");
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_catalog(component_body: &str) -> Vec<u8> {
+        format!(
+            r#"<components xmlns="http://openoffice.org/2010/uno-components">{component_body}</components>"#
+        )
+        .into_bytes()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn macos_spell_component() -> &'static str {
+        r#"<component><implementation name="org.openoffice.lingu.MacOSXSpellChecker" constructor="lingucomponent_MacSpellChecker_get_implementation"/></component>"#
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn homebrew_name_does_not_substitute_an_unrecognized_wrapper() {
+        assert!(is_macos_office_passthrough_wrapper(
+            b"#!/bin/bash\nexec \"/Applications/LibreOffice.app/Contents/MacOS/soffice\"  \"$@\"\n"
+        ));
+        assert!(!is_macos_office_passthrough_wrapper(
+            b"#!/bin/bash\nexec \"/Applications/OtherOffice.app/Contents/MacOS/soffice\"  \"$@\"\n"
+        ));
+        assert!(!is_macos_office_passthrough_wrapper(
+            b"#!/bin/bash\nexec \"/Applications/LibreOffice.app/Contents/MacOS/soffice\" --changed \"$@\"\n"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_uno_catalog_requires_well_formed_direct_uno_components() {
+        let valid = macos_catalog(macos_spell_component());
+        assert!(macos_spell_component_range(&valid).is_ok());
+
+        let malformed_root =
+            br#"<components xmlns=http://openoffice.org/2010/uno-components></components>"#;
+        assert!(macos_spell_component_range(malformed_root).is_err());
+
+        let malformed_nested_attribute = macos_catalog(
+            r#"<component broken=><implementation name="org.openoffice.lingu.MacOSXSpellChecker" constructor="lingucomponent_MacSpellChecker_get_implementation"/></component>"#,
+        );
+        assert!(macos_spell_component_range(&malformed_nested_attribute).is_err());
+
+        let doctype = format!(
+            r#"<!DOCTYPE components SYSTEM "untrusted"><components xmlns="http://openoffice.org/2010/uno-components">{}</components>"#,
+            macos_spell_component()
+        );
+        assert!(macos_spell_component_range(doctype.as_bytes()).is_err());
+
+        let wrong_namespace = b"<components xmlns=\"urn:other\">\
+            <component><implementation name=\"org.openoffice.lingu.MacOSXSpellChecker\" constructor=\"lingucomponent_MacSpellChecker_get_implementation\"/></component>\
+            </components>";
+        assert!(macos_spell_component_range(wrong_namespace).is_err());
+
+        let nested_component =
+            macos_catalog(&format!("<wrapper>{}</wrapper>", macos_spell_component()));
+        assert!(macos_spell_component_range(&nested_component).is_err());
+
+        let nested_implementation = macos_catalog(
+            r#"<component><wrapper><implementation name="org.openoffice.lingu.MacOSXSpellChecker" constructor="lingucomponent_MacSpellChecker_get_implementation"/></wrapper></component>"#,
+        );
+        assert!(macos_spell_component_range(&nested_implementation).is_err());
+
+        let component_namespace_override = macos_catalog(
+            r#"<component xmlns="urn:other"><implementation name="org.openoffice.lingu.MacOSXSpellChecker" constructor="lingucomponent_MacSpellChecker_get_implementation"/></component>"#,
+        );
+        assert!(macos_spell_component_range(&component_namespace_override).is_err());
+    }
+
     // ---- is_office_media -------------------------------------------------
 
     #[test]
@@ -622,6 +1477,187 @@ mod tests {
         assert!(
             resolve_office_converter().is_none(),
             "a probe failure on an explicit override must resolve to None, not fall through to PATH"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_renderer_does_not_inherit_secret_environment_and_handles_special_paths() {
+        let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
+        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
+        let directory = tempfile::Builder::new()
+            .prefix("kio office ; $ ")
+            .tempdir()
+            .expect("fixture directory");
+        let script = directory.path().join("renderer with spaces");
+        executable_script(
+            &script,
+            "#!/bin/sh\n\
+             if [ \"$KIO_CONVERTER_SECRET\" = leak ]; then exit 91; fi\n\
+             if [ \"$1\" = --version ] || [ \"$4\" = --version ]; then printf 'fixture renderer 1\\n'; exit 0; fi\n\
+             out=\n\
+             while [ \"$#\" -gt 0 ]; do\n\
+               if [ \"$1\" = --outdir ]; then shift; out=$1; fi\n\
+               shift\n\
+             done\n\
+             printf '%%PDF-1.4\\nfixture\\n%%%%EOF\\n' > \"$out/input.pdf\"\n",
+        );
+        let _secret = kio_core::test_control::TestEnvGuard::set("KIO_CONVERTER_SECRET", "leak");
+        let _explicit =
+            kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
+        let converter = probe_real_converter_diagnostic(script.clone())
+            .expect("fixture renderer probes with a secret-free bounded environment");
+        let pdf = converter
+            .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
+            .expect("secret must not be inherited and special paths must work");
+        assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_renderer_rejects_executable_replacement_after_probe() {
+        let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
+        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
+        let directory = tempfile::tempdir().expect("fixture directory");
+        let script = directory.path().join("renderer");
+        executable_script(&script, "#!/bin/sh\nprintf 'fixture renderer 1\\n'\n");
+        let _explicit =
+            kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
+        let converter = resolve_office_converter().expect("fixture renderer probes");
+
+        executable_script(&script, "#!/bin/sh\nprintf 'replacement renderer 2\\n'\n");
+        let error = converter
+            .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
+            .expect_err("a converter replacement must invalidate the resolved identity");
+        assert!(
+            error
+                .to_string()
+                .contains("executable changed before conversion")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renderer_output_symlink_is_rejected_without_reading_its_target() {
+        let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
+        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
+        let directory = tempfile::Builder::new()
+            .prefix("kio-office-symlink-")
+            .tempdir()
+            .expect("fixture directory");
+        let script = directory.path().join("renderer");
+        let private_target = PathBuf::from(format!("{}-private.pdf", script.display()));
+        std::fs::write(&private_target, b"%PDF-1.4\nprivate fixture bytes\n%%EOF\n")
+            .expect("private target");
+        executable_script(
+            &script,
+            "#!/usr/bin/perl\n\
+             if (grep { $_ eq '--version' } @ARGV) { print qq(fixture renderer 1\\n); exit 0; }\n\
+             my $out; for (my $i=0; $i < @ARGV-1; $i++) { $out=$ARGV[$i+1] if $ARGV[$i] eq '--outdir'; }\n\
+             defined($out) or die 'no output directory';\n\
+             symlink(qq($0-private.pdf), qq($out/input.pdf)) or die qq(symlink: $!);\n",
+        );
+        let _explicit =
+            kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
+        let converter = resolve_office_converter().expect("fixture renderer probes");
+        let error = converter
+            .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
+            .expect_err("a renderer-controlled output symlink must be rejected");
+        let message = error.to_string();
+        assert!(message.contains("unsafe") || message.contains("absent"));
+        assert!(!message.contains("private fixture bytes"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn renderer_cannot_redirect_replaced_output_directory() {
+        let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
+        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
+        let directory = tempfile::Builder::new()
+            .prefix("kio-office-output-dir-")
+            .tempdir()
+            .expect("fixture directory");
+        let script = directory.path().join("renderer");
+        let private_target = PathBuf::from(format!("{}-private-dir", script.display()));
+        std::fs::create_dir(&private_target).expect("private target directory");
+        std::fs::write(
+            private_target.join("input.pdf"),
+            b"%PDF-1.4\nprivate fixture bytes\n%%EOF\n",
+        )
+        .expect("private target");
+        executable_script(
+            &script,
+            "#!/usr/bin/perl\n\
+             if (grep { $_ eq '--version' } @ARGV) { print qq(fixture renderer 1\\n); exit 0; }\n\
+             my $out; for (my $i=0; $i < @ARGV-1; $i++) { $out=$ARGV[$i+1] if $ARGV[$i] eq '--outdir'; }\n\
+             defined($out) or die 'no output directory';\n\
+             rmdir($out) or die qq(rmdir: $!);\n\
+             symlink(qq($0-private-dir), $out) or die qq(symlink: $!);\n",
+        );
+        let _explicit =
+            kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
+        let converter = resolve_office_converter().expect("fixture renderer probes");
+        let error = converter
+            .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
+            .expect_err("a replaced output directory must not redirect the retained read");
+        let message = error.to_string();
+        assert!(
+            message.contains("did not produce")
+                || message.contains("absent")
+                || message.contains("unsafe"),
+            "unexpected safe renderer rejection: {message}"
+        );
+        assert!(!message.contains("private fixture bytes"));
+    }
+
+    #[test]
+    fn file_url_percent_encodes_reserved_characters() {
+        let path = Path::new("/private/kio office#?%.profile");
+        let url = file_url(path).expect("Unicode fixture path");
+        #[cfg(not(windows))]
+        assert_eq!(url, "file:///private/kio%20office%23%3F%25.profile");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn renderer_runtime_roots_never_admit_program_directory_or_ancestors() {
+        let fixture = tempfile::Builder::new()
+            .prefix("kio-office-runtime-")
+            .tempdir()
+            .expect("fixture directory");
+        let home = fixture.path().join("home");
+        let program = home.join("bin").join("soffice");
+        let roots = renderer_runtime_roots(&program).expect("runtime roots");
+        assert!(
+            !roots.contains(&home.join("bin")) && !roots.contains(&home),
+            "a caller-selected converter must not grant its directory or home"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn office_scratch_directory_is_owner_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = private_temp_dir().expect("private scratch directory");
+        assert_eq!(
+            std::fs::metadata(directory.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn office_scratch_uses_the_short_private_socket_root() {
+        let directory = private_temp_dir().expect("private scratch directory");
+        let socket_root = std::fs::canonicalize("/private/tmp").expect("private socket root");
+        assert!(
+            directory.path().starts_with(socket_root),
+            "Office scratch must leave room for Unix-domain socket names"
         );
     }
 
@@ -792,25 +1828,54 @@ mod tests {
     const DOCX_FIXTURE_B64: &str = "UEsDBBQAAAAAAAAAIQDMg9OxswEAALMBAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbDw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz4KPFR5cGVzIHhtbG5zPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvcGFja2FnZS8yMDA2L2NvbnRlbnQtdHlwZXMiPgo8RGVmYXVsdCBFeHRlbnNpb249InJlbHMiIENvbnRlbnRUeXBlPSJhcHBsaWNhdGlvbi92bmQub3BlbnhtbGZvcm1hdHMtcGFja2FnZS5yZWxhdGlvbnNoaXBzK3htbCIvPgo8RGVmYXVsdCBFeHRlbnNpb249InhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3htbCIvPgo8T3ZlcnJpZGUgUGFydE5hbWU9Ii93b3JkL2RvY3VtZW50LnhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3ZuZC5vcGVueG1sZm9ybWF0cy1vZmZpY2Vkb2N1bWVudC53b3JkcHJvY2Vzc2luZ21sLmRvY3VtZW50Lm1haW4reG1sIi8+CjwvVHlwZXM+ClBLAwQUAAAAAAAAACEAA9VLhC0BAAAtAQAACwAAAF9yZWxzLy5yZWxzPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9InllcyI/Pgo8UmVsYXRpb25zaGlwcyB4bWxucz0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL3BhY2thZ2UvMjAwNi9yZWxhdGlvbnNoaXBzIj4KPFJlbGF0aW9uc2hpcCBJZD0icklkMSIgVHlwZT0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL29mZmljZURvY3VtZW50LzIwMDYvcmVsYXRpb25zaGlwcy9vZmZpY2VEb2N1bWVudCIgVGFyZ2V0PSJ3b3JkL2RvY3VtZW50LnhtbCIvPgo8L1JlbGF0aW9uc2hpcHM+ClBLAwQUAAAAAAAAACEAjUhHZOYAAADmAAAAEQAAAHdvcmQvZG9jdW1lbnQueG1sPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9InllcyI/Pgo8dzpkb2N1bWVudCB4bWxuczp3PSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvd29yZHByb2Nlc3NpbmdtbC8yMDA2L21haW4iPgo8dzpib2R5Pgo8dzpwPjx3OnI+PHc6dD5LQ1Mgb2ZmaWNlIGNvbnZlcnQgdGVzdDwvdzp0PjwvdzpyPjwvdzpwPgo8L3c6Ym9keT4KPC93OmRvY3VtZW50PgpQSwECFAMUAAAAAAAAACEAzIPTsbMBAACzAQAAEwAAAAAAAAAAAAAAgAEAAAAAW0NvbnRlbnRfVHlwZXNdLnhtbFBLAQIUAxQAAAAAAAAAIQAD1UuELQEAAC0BAAALAAAAAAAAAAAAAACAAeQBAABfcmVscy8ucmVsc1BLAQIUAxQAAAAAAAAAIQCNSEdk5gAAAOYAAAARAAAAAAAAAAAAAACAAToDAAB3b3JkL2RvY3VtZW50LnhtbFBLBQYAAAAAAwADALkAAABPBAAAAAA=";
     const PPTX_FIXTURE_B64: &str = "UEsDBBQAAAAAAAAAIQCMwBYR2AMAANgDAAATAAAAW0NvbnRlbnRfVHlwZXNdLnhtbDw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz4KPFR5cGVzIHhtbG5zPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvcGFja2FnZS8yMDA2L2NvbnRlbnQtdHlwZXMiPgo8RGVmYXVsdCBFeHRlbnNpb249InJlbHMiIENvbnRlbnRUeXBlPSJhcHBsaWNhdGlvbi92bmQub3BlbnhtbGZvcm1hdHMtcGFja2FnZS5yZWxhdGlvbnNoaXBzK3htbCIvPgo8RGVmYXVsdCBFeHRlbnNpb249InhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3htbCIvPgo8T3ZlcnJpZGUgUGFydE5hbWU9Ii9wcHQvcHJlc2VudGF0aW9uLnhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3ZuZC5vcGVueG1sZm9ybWF0cy1vZmZpY2Vkb2N1bWVudC5wcmVzZW50YXRpb25tbC5wcmVzZW50YXRpb24ubWFpbit4bWwiLz4KPE92ZXJyaWRlIFBhcnROYW1lPSIvcHB0L3NsaWRlcy9zbGlkZTEueG1sIiBDb250ZW50VHlwZT0iYXBwbGljYXRpb24vdm5kLm9wZW54bWxmb3JtYXRzLW9mZmljZWRvY3VtZW50LnByZXNlbnRhdGlvbm1sLnNsaWRlK3htbCIvPgo8T3ZlcnJpZGUgUGFydE5hbWU9Ii9wcHQvc2xpZGVMYXlvdXRzL3NsaWRlTGF5b3V0MS54bWwiIENvbnRlbnRUeXBlPSJhcHBsaWNhdGlvbi92bmQub3BlbnhtbGZvcm1hdHMtb2ZmaWNlZG9jdW1lbnQucHJlc2VudGF0aW9ubWwuc2xpZGVMYXlvdXQreG1sIi8+CjxPdmVycmlkZSBQYXJ0TmFtZT0iL3BwdC9zbGlkZU1hc3RlcnMvc2xpZGVNYXN0ZXIxLnhtbCIgQ29udGVudFR5cGU9ImFwcGxpY2F0aW9uL3ZuZC5vcGVueG1sZm9ybWF0cy1vZmZpY2Vkb2N1bWVudC5wcmVzZW50YXRpb25tbC5zbGlkZU1hc3Rlcit4bWwiLz4KPE92ZXJyaWRlIFBhcnROYW1lPSIvcHB0L3RoZW1lL3RoZW1lMS54bWwiIENvbnRlbnRUeXBlPSJhcHBsaWNhdGlvbi92bmQub3BlbnhtbGZvcm1hdHMtb2ZmaWNlZG9jdW1lbnQudGhlbWUreG1sIi8+CjwvVHlwZXM+ClBLAwQUAAAAAAAAACEACaoHxzABAAAwAQAACwAAAF9yZWxzLy5yZWxzPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9InllcyI/Pgo8UmVsYXRpb25zaGlwcyB4bWxucz0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL3BhY2thZ2UvMjAwNi9yZWxhdGlvbnNoaXBzIj4KPFJlbGF0aW9uc2hpcCBJZD0icklkMSIgVHlwZT0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL29mZmljZURvY3VtZW50LzIwMDYvcmVsYXRpb25zaGlwcy9vZmZpY2VEb2N1bWVudCIgVGFyZ2V0PSJwcHQvcHJlc2VudGF0aW9uLnhtbCIvPgo8L1JlbGF0aW9uc2hpcHM+ClBLAwQUAAAAAAAAACEATomFuAUCAAAFAgAAFAAAAHBwdC9wcmVzZW50YXRpb24ueG1sPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9InllcyI/Pgo8cDpwcmVzZW50YXRpb24geG1sbnM6YT0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL2RyYXdpbmdtbC8yMDA2L21haW4iIHhtbG5zOnI9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9vZmZpY2VEb2N1bWVudC8yMDA2L3JlbGF0aW9uc2hpcHMiIHhtbG5zOnA9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9wcmVzZW50YXRpb25tbC8yMDA2L21haW4iPgo8cDpzbGRNYXN0ZXJJZExzdD48cDpzbGRNYXN0ZXJJZCBpZD0iMjE0NzQ4MzY0OCIgcjppZD0icklkMSIvPjwvcDpzbGRNYXN0ZXJJZExzdD4KPHA6c2xkSWRMc3Q+PHA6c2xkSWQgaWQ9IjI1NiIgcjppZD0icklkMiIvPjwvcDpzbGRJZExzdD4KPHA6c2xkU3ogY3g9IjkxNDQwMDAiIGN5PSI2ODU4MDAwIi8+CjxwOm5vdGVzU3ogY3g9IjY4NTgwMDAiIGN5PSI5MTQ0MDAwIi8+CjwvcDpwcmVzZW50YXRpb24+ClBLAwQUAAAAAAAAACEAFMCPq7wBAAC8AQAAHwAAAHBwdC9fcmVscy9wcmVzZW50YXRpb24ueG1sLnJlbHM8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCIgc3RhbmRhbG9uZT0ieWVzIj8+CjxSZWxhdGlvbnNoaXBzIHhtbG5zPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvcGFja2FnZS8yMDA2L3JlbGF0aW9uc2hpcHMiPgo8UmVsYXRpb25zaGlwIElkPSJySWQxIiBUeXBlPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvb2ZmaWNlRG9jdW1lbnQvMjAwNi9yZWxhdGlvbnNoaXBzL3NsaWRlTWFzdGVyIiBUYXJnZXQ9InNsaWRlTWFzdGVycy9zbGlkZU1hc3RlcjEueG1sIi8+CjxSZWxhdGlvbnNoaXAgSWQ9InJJZDIiIFR5cGU9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9vZmZpY2VEb2N1bWVudC8yMDA2L3JlbGF0aW9uc2hpcHMvc2xpZGUiIFRhcmdldD0ic2xpZGVzL3NsaWRlMS54bWwiLz4KPC9SZWxhdGlvbnNoaXBzPgpQSwMEFAAAAAAAAAAhAFyz5RdbAgAAWwIAABUAAABwcHQvc2xpZGVzL3NsaWRlMS54bWw8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCIgc3RhbmRhbG9uZT0ieWVzIj8+CjxwOnNsZCB4bWxuczphPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvZHJhd2luZ21sLzIwMDYvbWFpbiIgeG1sbnM6cj0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL29mZmljZURvY3VtZW50LzIwMDYvcmVsYXRpb25zaGlwcyIgeG1sbnM6cD0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL3ByZXNlbnRhdGlvbm1sLzIwMDYvbWFpbiI+CjxwOmNTbGQ+CjxwOnNwVHJlZT4KPHA6bnZHcnBTcFByPjxwOmNOdlByIGlkPSIxIiBuYW1lPSIiLz48cDpjTnZHcnBTcFByLz48cDpudlByLz48L3A6bnZHcnBTcFByPgo8cDpncnBTcFByLz4KPHA6c3A+CjxwOm52U3BQcj48cDpjTnZQciBpZD0iMiIgbmFtZT0iVGl0bGUiLz48cDpjTnZTcFByLz48cDpudlByLz48L3A6bnZTcFByPgo8cDpzcFByLz4KPHA6dHhCb2R5PjxhOmJvZHlQci8+PGE6cD48YTpyPjxhOnQ+S0NTIG9mZmljZSBjb252ZXJ0IHRlc3Q8L2E6dD48L2E6cj48L2E6cD48L3A6dHhCb2R5Pgo8L3A6c3A+CjwvcDpzcFRyZWU+CjwvcDpjU2xkPgo8L3A6c2xkPgpQSwMEFAAAAAAAAAAhADTsLLQ5AQAAOQEAACAAAABwcHQvc2xpZGVzL19yZWxzL3NsaWRlMS54bWwucmVsczw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz4KPFJlbGF0aW9uc2hpcHMgeG1sbnM9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9wYWNrYWdlLzIwMDYvcmVsYXRpb25zaGlwcyI+CjxSZWxhdGlvbnNoaXAgSWQ9InJJZDEiIFR5cGU9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9vZmZpY2VEb2N1bWVudC8yMDA2L3JlbGF0aW9uc2hpcHMvc2xpZGVMYXlvdXQiIFRhcmdldD0iLi4vc2xpZGVMYXlvdXRzL3NsaWRlTGF5b3V0MS54bWwiLz4KPC9SZWxhdGlvbnNoaXBzPgpQSwMEFAAAAAAAAAAhADYpqHbGAQAAxgEAACEAAABwcHQvc2xpZGVMYXlvdXRzL3NsaWRlTGF5b3V0MS54bWw8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCIgc3RhbmRhbG9uZT0ieWVzIj8+CjxwOnNsZExheW91dCB4bWxuczphPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvZHJhd2luZ21sLzIwMDYvbWFpbiIgeG1sbnM6cj0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL29mZmljZURvY3VtZW50LzIwMDYvcmVsYXRpb25zaGlwcyIgeG1sbnM6cD0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL3ByZXNlbnRhdGlvbm1sLzIwMDYvbWFpbiIgdHlwZT0iYmxhbmsiIHByZXNlcnZlPSIxIj4KPHA6Y1NsZD4KPHA6c3BUcmVlPgo8cDpudkdycFNwUHI+PHA6Y052UHIgaWQ9IjEiIG5hbWU9IiIvPjxwOmNOdkdycFNwUHIvPjxwOm52UHIvPjwvcDpudkdycFNwUHI+CjxwOmdycFNwUHIvPgo8L3A6c3BUcmVlPgo8L3A6Y1NsZD4KPC9wOnNsZExheW91dD4KUEsDBBQAAAAAAAAAIQAmX7qVOQEAADkBAAAsAAAAcHB0L3NsaWRlTGF5b3V0cy9fcmVscy9zbGlkZUxheW91dDEueG1sLnJlbHM8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCIgc3RhbmRhbG9uZT0ieWVzIj8+CjxSZWxhdGlvbnNoaXBzIHhtbG5zPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvcGFja2FnZS8yMDA2L3JlbGF0aW9uc2hpcHMiPgo8UmVsYXRpb25zaGlwIElkPSJySWQxIiBUeXBlPSJodHRwOi8vc2NoZW1hcy5vcGVueG1sZm9ybWF0cy5vcmcvb2ZmaWNlRG9jdW1lbnQvMjAwNi9yZWxhdGlvbnNoaXBzL3NsaWRlTWFzdGVyIiBUYXJnZXQ9Ii4uL3NsaWRlTWFzdGVycy9zbGlkZU1hc3RlcjEueG1sIi8+CjwvUmVsYXRpb25zaGlwcz4KUEsDBBQAAAAAAAAAIQBB3XZ8wAIAAMACAAAhAAAAcHB0L3NsaWRlTWFzdGVycy9zbGlkZU1hc3RlcjEueG1sPD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiIHN0YW5kYWxvbmU9InllcyI/Pgo8cDpzbGRNYXN0ZXIgeG1sbnM6YT0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL2RyYXdpbmdtbC8yMDA2L21haW4iIHhtbG5zOnI9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9vZmZpY2VEb2N1bWVudC8yMDA2L3JlbGF0aW9uc2hpcHMiIHhtbG5zOnA9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9wcmVzZW50YXRpb25tbC8yMDA2L21haW4iPgo8cDpjU2xkPgo8cDpzcFRyZWU+CjxwOm52R3JwU3BQcj48cDpjTnZQciBpZD0iMSIgbmFtZT0iIi8+PHA6Y052R3JwU3BQci8+PHA6bnZQci8+PC9wOm52R3JwU3BQcj4KPHA6Z3JwU3BQci8+CjwvcDpzcFRyZWU+CjwvcDpjU2xkPgo8cDpjbHJNYXAgYmcxPSJsdDEiIHR4MT0iZGsxIiBiZzI9Imx0MiIgdHgyPSJkazIiIGFjY2VudDE9ImFjY2VudDEiIGFjY2VudDI9ImFjY2VudDIiIGFjY2VudDM9ImFjY2VudDMiIGFjY2VudDQ9ImFjY2VudDQiIGFjY2VudDU9ImFjY2VudDUiIGFjY2VudDY9ImFjY2VudDYiIGhsaW5rPSJobGluayIgZm9sSGxpbms9ImZvbEhsaW5rIi8+CjxwOnNsZExheW91dElkTHN0PjxwOnNsZExheW91dElkIGlkPSIyMTQ3NDgzNjQ5IiByOmlkPSJySWQxIi8+PC9wOnNsZExheW91dElkTHN0Pgo8L3A6c2xkTWFzdGVyPgpQSwMEFAAAAAAAAAAhAFIh0dPBAQAAwQEAACwAAABwcHQvc2xpZGVNYXN0ZXJzL19yZWxzL3NsaWRlTWFzdGVyMS54bWwucmVsczw/eG1sIHZlcnNpb249IjEuMCIgZW5jb2Rpbmc9IlVURi04IiBzdGFuZGFsb25lPSJ5ZXMiPz4KPFJlbGF0aW9uc2hpcHMgeG1sbnM9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9wYWNrYWdlLzIwMDYvcmVsYXRpb25zaGlwcyI+CjxSZWxhdGlvbnNoaXAgSWQ9InJJZDEiIFR5cGU9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9vZmZpY2VEb2N1bWVudC8yMDA2L3JlbGF0aW9uc2hpcHMvc2xpZGVMYXlvdXQiIFRhcmdldD0iLi4vc2xpZGVMYXlvdXRzL3NsaWRlTGF5b3V0MS54bWwiLz4KPFJlbGF0aW9uc2hpcCBJZD0icklkMiIgVHlwZT0iaHR0cDovL3NjaGVtYXMub3BlbnhtbGZvcm1hdHMub3JnL29mZmljZURvY3VtZW50LzIwMDYvcmVsYXRpb25zaGlwcy90aGVtZSIgVGFyZ2V0PSIuLi90aGVtZS90aGVtZTEueG1sIi8+CjwvUmVsYXRpb25zaGlwcz4KUEsDBBQAAAAAAAAAIQANajFPDgcAAA4HAAAUAAAAcHB0L3RoZW1lL3RoZW1lMS54bWw8P3htbCB2ZXJzaW9uPSIxLjAiIGVuY29kaW5nPSJVVEYtOCIgc3RhbmRhbG9uZT0ieWVzIj8+CjxhOnRoZW1lIHhtbG5zOmE9Imh0dHA6Ly9zY2hlbWFzLm9wZW54bWxmb3JtYXRzLm9yZy9kcmF3aW5nbWwvMjAwNi9tYWluIiBuYW1lPSJLQ1MiPgo8YTp0aGVtZUVsZW1lbnRzPgo8YTpjbHJTY2hlbWUgbmFtZT0iS0NTIj4KPGE6ZGsxPjxhOnN5c0NsciB2YWw9IndpbmRvd1RleHQiIGxhc3RDbHI9IjAwMDAwMCIvPjwvYTpkazE+CjxhOmx0MT48YTpzeXNDbHIgdmFsPSJ3aW5kb3ciIGxhc3RDbHI9IkZGRkZGRiIvPjwvYTpsdDE+CjxhOmRrMj48YTpzcmdiQ2xyIHZhbD0iMUY0OTdEIi8+PC9hOmRrMj4KPGE6bHQyPjxhOnNyZ2JDbHIgdmFsPSJFRUVDRTEiLz48L2E6bHQyPgo8YTphY2NlbnQxPjxhOnNyZ2JDbHIgdmFsPSI0RjgxQkQiLz48L2E6YWNjZW50MT4KPGE6YWNjZW50Mj48YTpzcmdiQ2xyIHZhbD0iQzA1MDREIi8+PC9hOmFjY2VudDI+CjxhOmFjY2VudDM+PGE6c3JnYkNsciB2YWw9IjlCQkI1OSIvPjwvYTphY2NlbnQzPgo8YTphY2NlbnQ0PjxhOnNyZ2JDbHIgdmFsPSI4MDY0QTIiLz48L2E6YWNjZW50ND4KPGE6YWNjZW50NT48YTpzcmdiQ2xyIHZhbD0iNEJBQ0M2Ii8+PC9hOmFjY2VudDU+CjxhOmFjY2VudDY+PGE6c3JnYkNsciB2YWw9IkY3OTY0NiIvPjwvYTphY2NlbnQ2Pgo8YTpobGluaz48YTpzcmdiQ2xyIHZhbD0iMDAwMEZGIi8+PC9hOmhsaW5rPgo8YTpmb2xIbGluaz48YTpzcmdiQ2xyIHZhbD0iODAwMDgwIi8+PC9hOmZvbEhsaW5rPgo8L2E6Y2xyU2NoZW1lPgo8YTpmb250U2NoZW1lIG5hbWU9IktDUyI+CjxhOm1ham9yRm9udD48YTpsYXRpbiB0eXBlZmFjZT0iQ2FsaWJyaSIvPjwvYTptYWpvckZvbnQ+CjxhOm1pbm9yRm9udD48YTpsYXRpbiB0eXBlZmFjZT0iQ2FsaWJyaSIvPjwvYTptaW5vckZvbnQ+CjwvYTpmb250U2NoZW1lPgo8YTpmbXRTY2hlbWUgbmFtZT0iS0NTIj4KPGE6ZmlsbFN0eWxlTHN0PjxhOnNvbGlkRmlsbD48YTpzY2hlbWVDbHIgdmFsPSJwaENsciIvPjwvYTpzb2xpZEZpbGw+PGE6c29saWRGaWxsPjxhOnNjaGVtZUNsciB2YWw9InBoQ2xyIi8+PC9hOnNvbGlkRmlsbD48YTpzb2xpZEZpbGw+PGE6c2NoZW1lQ2xyIHZhbD0icGhDbHIiLz48L2E6c29saWRGaWxsPjwvYTpmaWxsU3R5bGVMc3Q+CjxhOmxuU3R5bGVMc3Q+PGE6bG4+PGE6c29saWRGaWxsPjxhOnNjaGVtZUNsciB2YWw9InBoQ2xyIi8+PC9hOnNvbGlkRmlsbD48L2E6bG4+PGE6bG4+PGE6c29saWRGaWxsPjxhOnNjaGVtZUNsciB2YWw9InBoQ2xyIi8+PC9hOnNvbGlkRmlsbD48L2E6bG4+PGE6bG4+PGE6c29saWRGaWxsPjxhOnNjaGVtZUNsciB2YWw9InBoQ2xyIi8+PC9hOnNvbGlkRmlsbD48L2E6bG4+PC9hOmxuU3R5bGVMc3Q+CjxhOmVmZmVjdFN0eWxlTHN0PjxhOmVmZmVjdFN0eWxlPjxhOmVmZmVjdExzdC8+PC9hOmVmZmVjdFN0eWxlPjxhOmVmZmVjdFN0eWxlPjxhOmVmZmVjdExzdC8+PC9hOmVmZmVjdFN0eWxlPjxhOmVmZmVjdFN0eWxlPjxhOmVmZmVjdExzdC8+PC9hOmVmZmVjdFN0eWxlPjwvYTplZmZlY3RTdHlsZUxzdD4KPGE6YmdGaWxsU3R5bGVMc3Q+PGE6c29saWRGaWxsPjxhOnNjaGVtZUNsciB2YWw9InBoQ2xyIi8+PC9hOnNvbGlkRmlsbD48YTpzb2xpZEZpbGw+PGE6c2NoZW1lQ2xyIHZhbD0icGhDbHIiLz48L2E6c29saWRGaWxsPjxhOnNvbGlkRmlsbD48YTpzY2hlbWVDbHIgdmFsPSJwaENsciIvPjwvYTpzb2xpZEZpbGw+PC9hOmJnRmlsbFN0eWxlTHN0Pgo8L2E6Zm10U2NoZW1lPgo8L2E6dGhlbWVFbGVtZW50cz4KPC9hOnRoZW1lPgpQSwECFAMUAAAAAAAAACEAjMAWEdgDAADYAwAAEwAAAAAAAAAAAAAAgAEAAAAAW0NvbnRlbnRfVHlwZXNdLnhtbFBLAQIUAxQAAAAAAAAAIQAJqgfHMAEAADABAAALAAAAAAAAAAAAAACAAQkEAABfcmVscy8ucmVsc1BLAQIUAxQAAAAAAAAAIQBOiYW4BQIAAAUCAAAUAAAAAAAAAAAAAACAAWIFAABwcHQvcHJlc2VudGF0aW9uLnhtbFBLAQIUAxQAAAAAAAAAIQAUwI+rvAEAALwBAAAfAAAAAAAAAAAAAACAAZkHAABwcHQvX3JlbHMvcHJlc2VudGF0aW9uLnhtbC5yZWxzUEsBAhQDFAAAAAAAAAAhAFyz5RdbAgAAWwIAABUAAAAAAAAAAAAAAIABkgkAAHBwdC9zbGlkZXMvc2xpZGUxLnhtbFBLAQIUAxQAAAAAAAAAIQA07Cy0OQEAADkBAAAgAAAAAAAAAAAAAACAASAMAABwcHQvc2xpZGVzL19yZWxzL3NsaWRlMS54bWwucmVsc1BLAQIUAxQAAAAAAAAAIQA2Kah2xgEAAMYBAAAhAAAAAAAAAAAAAACAAZcNAABwcHQvc2xpZGVMYXlvdXRzL3NsaWRlTGF5b3V0MS54bWxQSwECFAMUAAAAAAAAACEAJl+6lTkBAAA5AQAALAAAAAAAAAAAAAAAgAGcDwAAcHB0L3NsaWRlTGF5b3V0cy9fcmVscy9zbGlkZUxheW91dDEueG1sLnJlbHNQSwECFAMUAAAAAAAAACEAQd12fMACAADAAgAAIQAAAAAAAAAAAAAAgAEfEQAAcHB0L3NsaWRlTWFzdGVycy9zbGlkZU1hc3RlcjEueG1sUEsBAhQDFAAAAAAAAAAhAFIh0dPBAQAAwQEAACwAAAAAAAAAAAAAAIABHhQAAHBwdC9zbGlkZU1hc3RlcnMvX3JlbHMvc2xpZGVNYXN0ZXIxLnhtbC5yZWxzUEsBAhQDFAAAAAAAAAAhAA1qMU8OBwAADgcAABQAAAAAAAAAAAAAAIABKRYAAHBwdC90aGVtZS90aGVtZTEueG1sUEsFBgAAAAALAAsALgMAAGkdAAAAAA==";
 
-    /// Skips (returns early) unless a REAL renderer resolves — i.e. the seam
-    /// env var is unset and a real `soffice`-compatible binary is reachable
-    /// (explicit `KIO_OFFICE_CONVERTER` or `soffice` on PATH; left as
-    /// whatever the ambient environment provides). On the implementing
-    /// machine that real binary is `/opt/homebrew/bin/soffice` (LibreOffice
-    /// 26.2.4.2).
+    #[test]
+    fn bundled_office_fixtures_pass_offline_package_preflight() {
+        crate::ooxml_package::validate_real_office_package(
+            &decode_fixture(DOCX_FIXTURE_B64),
+            DOCX_MEDIA_TYPE,
+        )
+        .expect("bundled DOCX package");
+        crate::ooxml_package::validate_real_office_package(
+            &decode_fixture(PPTX_FIXTURE_B64),
+            PPTX_MEDIA_TYPE,
+        )
+        .expect("bundled PPTX package");
+    }
+
+    /// Native Office acceptance is intentionally opt-in so regular unit tests
+    /// never discover or launch an ambient renderer. `KIO_REAL_OFFICE=1`
+    /// makes an unavailable or broken explicit/PATH-resolved renderer a test
+    /// failure rather than a skip.
+    fn required_real_office_converter() -> Option<OfficeConverter> {
+        if std::env::var_os("KIO_REAL_OFFICE").as_deref() != Some(std::ffi::OsStr::new("1")) {
+            eprintln!(
+                "skipping native Office acceptance; set KIO_REAL_OFFICE=1 and \
+                 KIO_OFFICE_CONVERTER or PATH to require it"
+            );
+            return None;
+        }
+        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
+        let selected = std::env::var_os(OFFICE_CONVERTER_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(DEFAULT_OFFICE_CONVERTER_PROGRAM));
+        let program = resolve_program(selected).expect(
+            "KIO_REAL_OFFICE=1 requires KIO_OFFICE_CONVERTER or PATH to resolve a converter",
+        );
+        let converter = probe_real_converter_diagnostic(program)
+            .expect("KIO_REAL_OFFICE=1 requires a working sandboxed Office converter");
+        assert_ne!(converter.version(), "test-converter");
+        Some(converter)
+    }
+
     #[test]
     fn office_real_soffice_docx_converts_deterministically() {
-        let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
-        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
-        let Some(converter) = resolve_office_converter() else {
-            eprintln!(
-                "skipping office_real_soffice_docx_converts_deterministically: \
-                 no real office converter available (install soffice on PATH \
-                 or set KIO_OFFICE_CONVERTER to exercise this test)"
-            );
+        let _lock = kio_core::test_control::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _diagnostic = NativeAcceptanceDiagnosticGuard::enable();
+        let Some(converter) = required_real_office_converter() else {
             return;
         };
-        assert_ne!(converter.version(), "test-converter");
 
         let docx = decode_fixture(DOCX_FIXTURE_B64);
         let first = converter
@@ -849,14 +1914,11 @@ mod tests {
     /// machine, so this is included rather than falling back to docx-only.
     #[test]
     fn office_real_soffice_pptx_converts_deterministically() {
-        let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
-        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
-        let Some(converter) = resolve_office_converter() else {
-            eprintln!(
-                "skipping office_real_soffice_pptx_converts_deterministically: \
-                 no real office converter available (install soffice on PATH \
-                 or set KIO_OFFICE_CONVERTER to exercise this test)"
-            );
+        let _lock = kio_core::test_control::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _diagnostic = NativeAcceptanceDiagnosticGuard::enable();
+        let Some(converter) = required_real_office_converter() else {
             return;
         };
 

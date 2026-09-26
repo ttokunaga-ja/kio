@@ -145,7 +145,7 @@ fn candidate_binding(package_version: &str, actual_target: &str, actual_profile:
 fn repro_recipe_for_target(target: &str) -> &'static str {
     match target {
         "x86_64-unknown-linux-gnu" => "linux-rustc-default-v1",
-        "aarch64-apple-darwin" => "macos-rust-lld-no-uuid-macos11-v1",
+        "aarch64-apple-darwin" => "macos-rust-lld-no-uuid-macos11-sdk26.5-25F70-v2",
         "x86_64-pc-windows-msvc" => "windows-msvc-brepro-v1",
         _ => fail(format!("unsupported RC target {target}")),
     }

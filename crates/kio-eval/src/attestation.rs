@@ -30,7 +30,6 @@ const MAX_SCOPE_RECORD_BYTES: u64 = 64 * 1024;
 /// historical attestation, so reject a large chunk before JSON parsing.
 const MAX_CURRENT_CHUNK_OBJECT_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TREE_ENTRIES: usize = 10_000;
-const MAX_COMMIT_PARENTS: usize = 64;
 
 fn deserialize_present_heading_path<'de, D>(
     deserializer: D,
@@ -154,7 +153,7 @@ struct CommitWire {
     created_at: String,
     message: String,
     object_type: String,
-    parents: Vec<String>,
+    parent: Option<String>,
     stats: CommitStatsWire,
     tool_lock_hash: String,
     tree: String,
@@ -682,8 +681,10 @@ fn validate_commit_wire(commit: &CommitWire) -> AttestationResult<()> {
         )
         || !is_hash(&commit.tree)
         || !is_hash(&commit.tool_lock_hash)
-        || commit.parents.len() > MAX_COMMIT_PARENTS
-        || commit.parents.iter().any(|parent| !is_hash(parent))
+        || commit
+            .parent
+            .as_deref()
+            .is_some_and(|parent| !is_hash(parent))
         || !is_valid_created_at(&commit.created_at)
     {
         return Err(PointerAttestationError::new(
@@ -854,30 +855,22 @@ fn read_scope_id(kio_dir: &fs::File) -> AttestationResult<String> {
     Ok(scope_id.to_owned())
 }
 
-/// Bind current-tree extraction to both authority records. A populated HEAD
-/// and branch ref must agree; accepting only a historical CAS path would let a
-/// search result smuggle an old snapshot into a current-tree dump.
+/// Bind current-tree extraction to the sole mutable authority record. The
+/// linear-history schema deliberately has no branch ref: accepting only a
+/// historical CAS path would let a search result smuggle an old snapshot into
+/// a current-tree dump.
 fn read_current_head(kio_dir: &fs::File) -> AttestationResult<Option<String>> {
     let head = read_cap_regular_file(kio_dir, "HEAD", MAX_SCOPE_RECORD_BYTES)
         .map_err(|_| PointerAttestationError::new("current HEAD unavailable"))?;
-    let refs = cap_fs::open_dir_nofollow(kio_dir, Path::new("refs"))
-        .and_then(|refs| cap_fs::open_dir_nofollow(&refs, Path::new("heads")))
-        .map_err(|_| PointerAttestationError::new("current branch ref unavailable"))?;
-    let branch = read_cap_regular_file(&refs, "main", MAX_SCOPE_RECORD_BYTES)
-        .map_err(|_| PointerAttestationError::new("current branch ref unavailable"))?;
     let head = std::str::from_utf8(&head)
         .map_err(|_| PointerAttestationError::new("current HEAD is not UTF-8"))?
-        .trim();
-    let branch = std::str::from_utf8(&branch)
-        .map_err(|_| PointerAttestationError::new("current branch ref is not UTF-8"))?
-        .trim();
-    if head.is_empty() && branch.is_empty() {
+        .strip_suffix('\n')
+        .ok_or_else(|| PointerAttestationError::new("current HEAD is not canonical"))?;
+    if head == "unborn" {
         return Ok(None);
     }
-    if !is_hash(head) || head != branch {
-        return Err(PointerAttestationError::new(
-            "current HEAD and branch ref are invalid or disagree",
-        ));
+    if !is_hash(head) {
+        return Err(PointerAttestationError::new("current HEAD is invalid"));
     }
     Ok(Some(head.to_owned()))
 }
@@ -1097,7 +1090,7 @@ mod tests {
             .unwrap();
         let commit = CommitObject::new(
             tree_hash.clone(),
-            vec![],
+            None,
             "2026-07-13T00:00:00Z".to_owned(),
             "synthetic attestation".to_owned(),
             TOOL_LOCK_HASH.to_owned(),
@@ -1170,7 +1163,7 @@ mod tests {
             .unwrap();
         let commit = CommitObject::new(
             tree_hash.clone(),
-            vec![],
+            None,
             "2026-07-13T00:00:00Z".to_owned(),
             "current candidate".to_owned(),
             TOOL_LOCK_HASH.to_owned(),
@@ -1189,10 +1182,9 @@ mod tests {
         pointer["commit"] = json!(commit_hash);
         pointer["tree"] = json!(tree_hash);
         let kio = fixture.root.path().join(&fixture.scope).join(".kio");
-        fs::write(kio.join("HEAD"), pointer["commit"].as_str().unwrap()).unwrap();
         fs::write(
-            kio.join("refs/heads/main"),
-            pointer["commit"].as_str().unwrap(),
+            kio.join("HEAD"),
+            format!("{}\n", pointer["commit"].as_str().unwrap()),
         )
         .unwrap();
 
@@ -1220,12 +1212,7 @@ mod tests {
         // authority points at it (a freshly initialized repository is unborn).
         fs::write(
             kio.join("HEAD"),
-            b"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        )
-        .unwrap();
-        fs::write(
-            kio.join("refs/heads/main"),
-            b"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            b"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n",
         )
         .unwrap();
         let mut attestor =
@@ -1381,7 +1368,7 @@ mod tests {
         let target = fixture.root.path().join("outside.json");
         fs::write(
             &target,
-            br#"{"kio_format_version":"0.1.0","scope_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
+            br#"{"kio_format_version":"1.0.0","scope_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
         )
         .unwrap();
         fs::remove_file(&scope_json).unwrap();

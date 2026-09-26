@@ -107,7 +107,7 @@ fn ct4_purge_reingest_after_default_tombstone_republishes_and_retires() {
     let raw_hash = hash_bytes(bytes);
     fs::write(dir.path().join("doc.md"), bytes).unwrap();
     json_success(&dir, &["init"]);
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline", "--yes"]);
     assert_eq!(current_raw(&dir, "doc.md"), raw_hash);
     fs::remove_file(dir.path().join("doc.md")).unwrap();
     json_success(
@@ -122,7 +122,7 @@ fn ct4_purge_reingest_after_default_tombstone_republishes_and_retires() {
         ],
     );
     assert!(!raw_exists(&dir, &raw_hash));
-    let purge = PurgeState::new(dir.path().join(".kio"));
+    let purge = PurgeState::open(dir.path().join(".kio")).unwrap();
     assert!(
         purge
             .read_tombstone(&raw_hash)
@@ -192,7 +192,7 @@ fn ct4_purge_reingest_after_default_tombstone_republishes_and_retires() {
             .is_active()
     );
     fs::write(dir.path().join("doc.md"), bytes).unwrap();
-    let index_output = json_success(&dir, &["index", "--offline", "--approve"]);
+    let index_output = json_success(&dir, &["index", "--offline", "--yes"]);
     assert!(index_output.get("error_code").is_none(), "{index_output}");
     assert!(raw_exists(&dir, &raw_hash));
     assert!(
@@ -212,7 +212,7 @@ fn ct4_purge_erase_receipt_is_ignored_then_retired_by_explicit_ingest() {
     let bytes = b"# Reintroduced\n\nerase receipt permits explicit ingest\n";
     fs::write(dir.path().join("doc.md"), bytes).unwrap();
     json_success(&dir, &["init"]);
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline", "--yes"]);
     let historical_head = fs::read_to_string(dir.path().join(".kio/HEAD"))
         .unwrap()
         .trim()
@@ -231,7 +231,7 @@ fn ct4_purge_erase_receipt_is_ignored_then_retired_by_explicit_ingest() {
             "--yes",
         ],
     );
-    let purge = PurgeState::new(dir.path().join(".kio"));
+    let purge = PurgeState::open(dir.path().join(".kio")).unwrap();
     assert!(
         purge
             .read_erase_receipt(&raw_hash)
@@ -244,7 +244,7 @@ fn ct4_purge_erase_receipt_is_ignored_then_retired_by_explicit_ingest() {
     assert_eq!(historical["blocked_raw_hashes"], 0);
 
     fs::write(dir.path().join("doc.md"), bytes).unwrap();
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline", "--yes"]);
     assert!(raw_exists(&dir, &raw_hash));
     // LC33: the receipt file persists (append-only), now retired rather than
     // deleted — it still explains any older commit's manifest gap (LC17).
@@ -264,7 +264,9 @@ fn ct4_purge_active_barrier_blocks_index_and_leaves_no_raw_or_temp() {
     let bytes = fake_pdf("active purge blocks resurrection");
     fs::write(dir.path().join("doc.pdf"), &bytes).unwrap();
     json_success(&dir, &["init"]);
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["ledger", "init"]);
+    json_success(&dir, &["adapter", "approve", "--all", "--yes"]);
+    json_success(&dir, &["index", "--yes"]);
     let raw_hash = current_raw(&dir, "doc.pdf");
     fs::remove_file(dir.path().join("doc.pdf")).unwrap();
     let stdout = kio(
@@ -340,7 +342,7 @@ fn ct4_purge_active_barrier_blocks_index_and_leaves_no_raw_or_temp() {
             .all(|task| !matches!(task.status, TaskStatus::Pending | TaskStatus::Running))
     );
 
-    let error = json_failure(&dir, &["index", "--offline", "--approve"], 3);
+    let error = json_failure(&dir, &["index", "--offline", "--yes"], 3);
     assert_eq!(error["error_code"], "KIO-E-PURGE-INCOMPLETE-001");
     assert!(!raw_exists(&dir, &raw_hash));
     assert!(ingest_temps(&dir).is_empty());

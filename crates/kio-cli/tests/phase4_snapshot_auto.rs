@@ -288,7 +288,7 @@ fn indexed_fixture(interval: u64, threshold: u64) -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("note.md"), "baseline scheduled snapshot\n").unwrap();
     json(&dir, &["init"], T0);
-    json(&dir, &["index", "--offline", "--approve"], T0);
+    json(&dir, &["index", "--offline", "--yes"], T0);
     configure(&dir, true, interval, threshold);
     dir
 }
@@ -322,10 +322,10 @@ fn stale_gc_candidate(mode: &str) -> (TempDir, String, String) {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("note.md"), "old scheduled candidate\n").unwrap();
     json(&dir, &["init"], old);
-    let first = json(&dir, &["index", "--offline", "--approve"], old);
+    let first = json(&dir, &["index", "--offline", "--yes"], old);
     let commit = first["commit_hash"].as_str().unwrap().to_owned();
     fs::write(dir.path().join("note.md"), "current ref tip\n").unwrap();
-    json(&dir, &["index", "--offline", "--approve"], T0);
+    json(&dir, &["index", "--offline", "--yes"], T0);
     configure_gc(&dir, mode, 60, 99);
     let repo = Repository::open(dir.path()).unwrap();
     let tree = repo.read_commit(&commit).unwrap().tree;
@@ -477,7 +477,7 @@ fn ignored_and_tier_a_inputs_do_not_change_snapshot() {
     )
     .unwrap();
     fs::write(dir.path().join(".kioignore"), "ignored-local.md\n").unwrap();
-    json(&dir, &["index", "--offline", "--approve"], T0);
+    json(&dir, &["index", "--offline", "--yes"], T0);
     auto(&dir, T0);
     fs::write(dir.path().join("ignored.md"), "ignore this\n").unwrap();
     fs::write(dir.path().join("ignored-local.md"), "ignore this locally\n").unwrap();
@@ -602,7 +602,7 @@ fn auto_preserves_existing_normalize_refs_and_never_runs_after_index_gc() {
         "changed raw cannot retain normalize ref"
     );
     // The descriptor-bound writer lock may retain its own crash-recovery
-    // sentinel under gc/internal/locks. Scheduled publication must not start
+    // sentinel under internal/locks. Scheduled publication must not start
     // an after_index sweep: no active marker, receipts, or tree retirement.
     assert!(!dir.path().join(".kio/gc/in_progress").exists());
     assert!(!dir.path().join(".kio/gc/shallowed").exists());
@@ -722,8 +722,7 @@ fn ref_advance_at_checkpoint_boundary_is_preserved_and_rejected() {
         .unwrap()
         .to_owned();
     fs::remove_file(dir.path().join("alternate.md")).unwrap();
-    fs::write(dir.path().join(".kio/HEAD"), &original_head).unwrap();
-    fs::write(dir.path().join(".kio/refs/heads/main"), &original_head).unwrap();
+    fs::write(dir.path().join(".kio/HEAD"), format!("{original_head}\n")).unwrap();
     fs::write(dir.path().join(".kio/manifest.json"), original_manifest).unwrap();
     fs::write(dir.path().join("new.md"), "scheduled candidate\n").unwrap();
 
@@ -733,8 +732,7 @@ fn ref_advance_at_checkpoint_boundary_is_preserved_and_rejected() {
     let child = child.spawn().unwrap();
     wait_for_path(&ready);
 
-    fs::write(dir.path().join(".kio/HEAD"), &alternate).unwrap();
-    fs::write(dir.path().join(".kio/refs/heads/main"), &alternate).unwrap();
+    fs::write(dir.path().join(".kio/HEAD"), format!("{alternate}\n")).unwrap();
     fs::write(ready.with_extension("release"), b"release").unwrap();
 
     let output = child.wait_with_output().unwrap();
@@ -749,10 +747,9 @@ fn ref_advance_at_checkpoint_boundary_is_preserved_and_rejected() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
-fn torn_ref_capture_is_rejected_as_authority_change() {
+fn torn_head_capture_is_rejected_as_authority_change() {
     let dir = indexed_fixture(60, 1);
     fs::write(dir.path().join("new.md"), "eligible torn ref race\n").unwrap();
-    let before_head = head(&dir);
     let ready = barrier_path(&dir, "snapshot-authority-capture.ready");
     let mut child = kio_process(&dir, &["snapshot", "auto", "--json"], T0);
     child.env("KIO_TEST_SNAPSHOT_AUTO_AUTHORITY_CAPTURE_READY", &ready);
@@ -760,7 +757,7 @@ fn torn_ref_capture_is_rejected_as_authority_change() {
     wait_for_path(&ready);
 
     let competing = format!("sha256:{}", "c".repeat(64));
-    fs::write(dir.path().join(".kio/refs/heads/main"), &competing).unwrap();
+    fs::write(dir.path().join(".kio/HEAD"), format!("{competing}\n")).unwrap();
     fs::write(ready.with_extension("release"), b"release").unwrap();
 
     let output = child.wait_with_output().unwrap();
@@ -769,10 +766,10 @@ fn torn_ref_capture_is_rejected_as_authority_change() {
         output_json(&output)["error_code"],
         "KIO-E-SNAPSHOT-AUTHORITY-CHANGED-001"
     );
-    assert_eq!(head(&dir), before_head);
+    assert_eq!(head(&dir).as_deref(), Some(competing.as_str()));
     assert_eq!(
-        fs::read_to_string(dir.path().join(".kio/refs/heads/main")).unwrap(),
-        competing
+        fs::read_to_string(dir.path().join(".kio/HEAD")).unwrap(),
+        format!("{competing}\n")
     );
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
@@ -1209,7 +1206,7 @@ fn scope_replacement_at_writer_boundary_cannot_mutate_either_store() {
     assert_eq!(kio_bytes(&dir.path().join(".kio")), victim_before);
     assert_eq!(
         String::from_utf8(fs::read(retained.join("HEAD")).unwrap()).unwrap(),
-        before_head
+        format!("{before_head}\n")
     );
     assert!(!retained.join("snapshot-auto.json").exists());
     assert!(

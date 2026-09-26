@@ -28,14 +28,16 @@
 use serde_json::{Value, json};
 
 use crate::http_policy::{
-    EMBEDDING_RESPONSE_MAX_BYTES, HttpPolicy, HttpResponse, authenticated_agent, read_json_bounded,
-    require_success,
+    EMBEDDING_RESPONSE_MAX_BYTES, HttpPolicy, HttpResponse, authenticated_local_agent,
+    read_json_bounded, require_success,
 };
 use crate::identity::tool_profile_hash;
+use crate::local_peer::{AuthenticatedLocalEndpoint, is_local_peer_tls_error};
 use crate::traits::EmbeddingAdapter;
 use crate::types::{
-    AdapterKind, AdapterProfile, EmbeddingItem, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingVector, ExecutionMode, validate_cosine_vector,
+    AdapterKind, AdapterProfile, EmbeddingContent, EmbeddingItem, EmbeddingRequest,
+    EmbeddingResponse, EmbeddingVector, ExecutionMode, validate_cosine_vector,
+    validate_embedding_request_bytes,
 };
 use crate::{AdapterError, Result};
 
@@ -94,8 +96,8 @@ const LOCAL_EMBEDDING_V4_RESULT_DIGEST: &str =
 /// Kio's own name for that template, per 03 §5.1's `prompt_template_id`.
 pub const LOCAL_EMBEDDING_PROMPT_TEMPLATE_ID: &str = "kio-local-embedding-v1";
 
-/// Declared by an embedding adapter that genuinely embeds image OBJECTS — i.e.
-/// one that reads `EmbeddingItem::path`/`mime` rather than only `text`.
+/// Declared by an embedding adapter that genuinely embeds supplied image
+/// OBJECT bytes rather than only text.
 ///
 /// `modality: "multimodal"` does not answer this. It describes the vector
 /// space (03 §7 fixes one space for every modality), not what a given
@@ -134,7 +136,7 @@ pub trait LocalEmbeddingClient: Clone {
 /// was needed, but nothing here depends on that being vLLM.
 #[derive(Debug, Clone)]
 pub struct EnvLocalEmbeddingClient {
-    base_url: String,
+    endpoint: AuthenticatedLocalEndpoint,
     model: String,
     http_policy: HttpPolicy,
 }
@@ -150,12 +152,12 @@ impl EnvLocalEmbeddingClient {
     /// value to Stage 3's local-OCR measurement.
     #[must_use]
     pub fn new(
-        base_url: impl Into<String>,
+        endpoint: AuthenticatedLocalEndpoint,
         model: impl Into<String>,
         timeout_seconds: Option<u64>,
     ) -> Self {
         Self {
-            base_url: base_url.into(),
+            endpoint,
             model: model.into(),
             http_policy: timeout_seconds
                 .map_or_else(HttpPolicy::default, HttpPolicy::with_timeout_seconds),
@@ -165,12 +167,8 @@ impl EnvLocalEmbeddingClient {
 
 impl LocalEmbeddingClient for EnvLocalEmbeddingClient {
     fn embed_messages(&self, messages: Value) -> Result<Vec<f32>> {
-        let url = format!("{}/v1/embeddings", self.base_url.trim_end_matches('/'));
-        // `authenticated_agent` is reused for its posture, not its name: it
-        // refuses to follow redirects and pins the timeout policy. A redirect
-        // off a loopback origin is exactly the thing D1's literal-loopback
-        // check would otherwise be talked out of.
-        let response = authenticated_agent(self.http_policy)
+        let url = format!("{}/v1/embeddings", self.endpoint.base_url());
+        let response = authenticated_local_agent(&self.endpoint, self.http_policy)?
             .post(&url)
             .send_json(json!({
                 "model": self.model,
@@ -192,6 +190,11 @@ impl LocalEmbeddingClient for EnvLocalEmbeddingClient {
 /// online adapters need (`Auth`, `QuotaExceeded`) cannot arise. What can is a
 /// full request queue, which is a retry, and everything else, which is not.
 fn local_http_error(error: ureq::Error) -> AdapterError {
+    if is_local_peer_tls_error(&error) {
+        return AdapterError::LocalPeerAuth(format!(
+            "local embedding server TLS authentication failed: {error}"
+        ));
+    }
     AdapterError::Network(format!("local embedding server unreachable: {error}"))
 }
 
@@ -287,25 +290,15 @@ fn truncate_and_renormalize(raw: &[f32], dimensions: usize) -> Result<Vec<f32>> 
 ///
 /// **No system message.** See the module docs.
 fn user_messages(item: &EmbeddingItem) -> Result<Value> {
-    let content = if let Some(text) = item.text.as_deref() {
-        json!([{ "type": "text", "text": text }])
-    } else {
-        let path = item.path.as_deref().ok_or_else(|| {
-            violation("embedding item carries neither `text` nor an image `path`")
-        })?;
-        let mime = item
-            .mime
-            .as_deref()
-            .ok_or_else(|| violation(format!("image embedding item `{path}` declares no mime")))?;
-        let bytes = std::fs::read(path).map_err(|err| AdapterError::Io {
-            path: path.to_owned(),
-            message: err.to_string(),
-        })?;
-        // Adapter-to-server wire only. 07 §4.4's ban on base64 concerns what
-        // goes into a SEARCH RESPONSE, which is a different direction.
-        use base64::Engine as _;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-        json!([{ "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{encoded}") } }])
+    let content = match &item.content {
+        EmbeddingContent::Text { text } => json!([{ "type": "text", "text": text }]),
+        EmbeddingContent::Image { bytes, mime } => {
+            // Adapter-to-server wire only. 07 §4.4's ban on base64 concerns what
+            // goes into a SEARCH RESPONSE, which is a different direction.
+            use base64::Engine as _;
+            let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
+            json!([{ "type": "image_url", "image_url": { "url": format!("data:{mime};base64,{encoded}") } }])
+        }
     };
     Ok(json!([{ "role": "user", "content": content }]))
 }
@@ -434,6 +427,7 @@ impl<C: LocalEmbeddingClient> EmbeddingAdapter for LocalEmbeddingAdapter<C> {
     }
 
     fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        validate_embedding_request_bytes(&request)?;
         let vectors = match &self.backend {
             // One request per item, in order. 07 §5.3 (2) forbids the batching
             // form, and the local server's continuous batching is what absorbs
@@ -483,7 +477,10 @@ impl<C: LocalEmbeddingClient> EmbeddingAdapter for LocalEmbeddingAdapter<C> {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
-    use crate::types::{EmbeddingInputType, EmbeddingItem};
+    use crate::types::{
+        EmbeddingContent, EmbeddingInputType, EmbeddingItem, MAX_EMBEDDING_ITEM_BYTES,
+        MAX_EMBEDDING_REQUEST_BYTES,
+    };
     use sha2::{Digest, Sha256};
 
     fn sha256(bytes: &[u8]) -> String {
@@ -501,12 +498,7 @@ mod tests {
             items: texts
                 .iter()
                 .enumerate()
-                .map(|(index, text)| EmbeddingItem {
-                    id: format!("item-{index}"),
-                    text: Some((*text).to_owned()),
-                    path: None,
-                    mime: None,
-                })
+                .map(|(index, text)| EmbeddingItem::text(format!("item-{index}"), *text))
                 .collect(),
             idempotency_token: None,
         }
@@ -746,11 +738,7 @@ mod tests {
     /// here is the ADAPTER-to-server wire, which §4.4's ban does not concern.
     #[test]
     fn an_image_item_travels_as_a_data_uri_in_the_same_message_shape() {
-        let dir = std::env::temp_dir().join(format!("kio-local-embed-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("figure.png");
         let bytes: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
-        std::fs::write(&path, bytes).unwrap();
 
         let client = RecordingClient::new();
         LocalEmbeddingAdapter::with_client(client.clone())
@@ -758,14 +746,14 @@ mod tests {
                 input_type: crate::types::EmbeddingInputType::ImageObject,
                 items: vec![EmbeddingItem {
                     id: "sha256:aaa".to_owned(),
-                    text: None,
-                    path: Some(path.display().to_string()),
-                    mime: Some("image/png".to_owned()),
+                    content: EmbeddingContent::Image {
+                        bytes: bytes.to_vec(),
+                        mime: "image/png".to_owned(),
+                    },
                 }],
                 idempotency_token: None,
             })
             .unwrap();
-        std::fs::remove_dir_all(&dir).ok();
 
         let sent = client.sent();
         let content = &sent[0][0]["content"][0];
@@ -783,16 +771,31 @@ mod tests {
     }
 
     #[test]
-    fn an_image_item_without_a_mime_is_a_contract_violation() {
+    fn image_payload_debug_redacts_the_source_bytes() {
+        let item = EmbeddingItem {
+            id: "sha256:aaa".to_owned(),
+            content: EmbeddingContent::Image {
+                bytes: b"private image bytes".to_vec(),
+                mime: "image/png".to_owned(),
+            },
+        };
+        let rendered = format!("{item:?}");
+        assert!(rendered.contains("bytes_len"));
+        assert!(!rendered.contains("private image bytes"));
+    }
+
+    #[test]
+    fn oversized_image_is_rejected_before_the_client_or_base64_wire() {
         let client = RecordingClient::new();
         let error = LocalEmbeddingAdapter::with_client(client)
             .embed(EmbeddingRequest {
                 input_type: crate::types::EmbeddingInputType::ImageObject,
                 items: vec![EmbeddingItem {
                     id: "sha256:aaa".to_owned(),
-                    text: None,
-                    path: Some("/nonexistent".to_owned()),
-                    mime: None,
+                    content: EmbeddingContent::Image {
+                        bytes: vec![0; MAX_EMBEDDING_ITEM_BYTES + 1],
+                        mime: "image/png".to_owned(),
+                    },
                 }],
                 idempotency_token: None,
             })
@@ -801,6 +804,36 @@ mod tests {
             matches!(error, AdapterError::ContractViolation(_)),
             "{error:?}"
         );
+    }
+
+    #[test]
+    fn aggregate_payload_cap_is_enforced_before_any_client_call() {
+        let client = RecordingClient::new();
+        let half = MAX_EMBEDDING_REQUEST_BYTES / 2 + 1;
+        let error = LocalEmbeddingAdapter::with_client(client.clone())
+            .embed(EmbeddingRequest {
+                input_type: crate::types::EmbeddingInputType::ImageObject,
+                items: vec![
+                    EmbeddingItem {
+                        id: "a".to_owned(),
+                        content: EmbeddingContent::Image {
+                            bytes: vec![0; half],
+                            mime: "image/png".to_owned(),
+                        },
+                    },
+                    EmbeddingItem {
+                        id: "b".to_owned(),
+                        content: EmbeddingContent::Image {
+                            bytes: vec![0; half],
+                            mime: "image/png".to_owned(),
+                        },
+                    },
+                ],
+                idempotency_token: None,
+            })
+            .unwrap_err();
+        assert!(matches!(error, AdapterError::ContractViolation(_)));
+        assert!(client.sent().is_empty());
     }
 
     /// More vectors back than items sent means the server batched something we
@@ -878,88 +911,17 @@ mod tests {
         assert!(profile.get("prompt_template_id").is_some());
     }
 
-    /// The transport itself, against a socket. The fake client above proves
-    /// what the adapter *asks* for; this proves what actually leaves the
-    /// process — the url it is composed onto, the body keys, and that a
-    /// well-formed reply is read back. Same stub-listener shape the
-    /// `http_policy` tests use.
+    /// Plain loopback HTTP used to be accepted here.  It is now rejected before
+    /// a client exists, so a listener cannot observe even a request body.
     #[test]
-    fn the_real_client_posts_to_v1_embeddings_and_reads_the_vector_back() {
-        use std::io::{Read as _, Write as _};
-        use std::net::TcpListener;
-
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            // One `read` is not one request: TCP may hand back the headers
-            // without the body, which made an earlier version of this test
-            // pass or fail by timing. Read until `Content-Length` is satisfied.
-            let mut raw: Vec<u8> = Vec::new();
-            let mut buffer = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buffer).unwrap();
-                if read == 0 {
-                    break;
-                }
-                raw.extend_from_slice(&buffer[..read]);
-                let Some(header_end) = raw.windows(4).position(|window| window == b"\r\n\r\n")
-                else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&raw[..header_end]).to_ascii_lowercase();
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| line.strip_prefix("content-length:"))
-                    .and_then(|value| value.trim().parse::<usize>().ok())
-                    .unwrap_or(0);
-                if raw.len() >= header_end + 4 + content_length {
-                    break;
-                }
-            }
-            let request = String::from_utf8_lossy(&raw).into_owned();
-            let body = r#"{"data":[{"embedding":[0.6,0.8]}]}"#;
-            stream
-                .write_all(
-                    format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    )
-                    .as_bytes(),
-                )
-                .unwrap();
-            request
-        });
-
-        // A trailing slash on the configured base must not produce `//v1`.
-        let client = EnvLocalEmbeddingClient::new(
-            format!("http://{address}/"),
-            LOCAL_EMBEDDING_DEFAULT_MODEL,
-            None,
-        );
-        let vector = client
-            .embed_messages(
-                json!([{"role": "user", "content": [{"type": "text", "text": "alpha"}]}]),
-            )
-            .unwrap();
-        assert_eq!(vector, vec![0.6, 0.8], "native width is returned unchanged");
-
-        let request = server.join().unwrap();
-        assert!(
-            request.starts_with("POST /v1/embeddings "),
-            "request line was: {}",
-            request.lines().next().unwrap_or_default()
-        );
-        let (_, body) = request.split_once("\r\n\r\n").expect("request has a body");
-        let sent: Value = serde_json::from_str(body).unwrap();
-        assert_eq!(sent["model"], LOCAL_EMBEDDING_DEFAULT_MODEL);
-        assert_eq!(sent["encoding_format"], "float");
-        assert_eq!(sent["messages"][0]["role"], "user");
-        assert!(
-            sent.get("input").is_none(),
-            "07 §5.3 (2): the `input[]` form must never be sent — it is a \
-             different vector space (V4 measured cosine 0.474 between them)"
-        );
+    fn plain_http_cannot_construct_the_real_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let error = AuthenticatedLocalEndpoint::new(
+            "http://127.0.0.1:8000",
+            directory.path().join("peer-ca.pem"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, AdapterError::LocalPeerConfig { .. }));
     }
 
     /// A busy local server is a retry; anything else is not. There is no

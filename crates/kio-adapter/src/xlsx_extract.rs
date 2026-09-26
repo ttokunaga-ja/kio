@@ -24,9 +24,9 @@
 //!
 //! # Container
 //!
-//! The ZIP layer is read here rather than through a crate: its failure mode is
-//! a loud refusal, and the decompression bounds are the security-relevant part
-//! (a small XLSX can inflate to gigabytes). The XML inside is parsed with
+//! The ZIP layer is shared with Office package validation. It refuses malformed
+//! archive metadata before opening the maintained ZIP parser and bounds every
+//! decompressed read. The XML inside is parsed with
 //! `quick-xml` — namespaced OOXML with entity escaping is where a hand-rolled
 //! reader fails *silently*, and silent wrongness is the failure mode this
 //! module must not have.
@@ -36,7 +36,10 @@ use std::collections::BTreeMap;
 use quick_xml::Reader;
 use quick_xml::events::Event;
 
-use crate::{AdapterError, Result};
+use crate::{
+    AdapterError, Result,
+    ooxml_package::{BoundedZip, BoundedZipLimits},
+};
 
 /// Sheets extracted from one workbook. A workbook past this is a contract
 /// violation rather than a truncation — a silently half-read spreadsheet is
@@ -64,8 +67,78 @@ pub const MAX_XLSX_MARKDOWN_BYTES: usize = 16 * 1024 * 1024;
 /// bomb from being decompressed into memory.
 pub const MAX_XLSX_MEMBER_BYTES: usize = 64 * 1024 * 1024;
 
-/// Entries read from the ZIP central directory.
-const MAX_ZIP_ENTRIES: usize = 4_096;
+/// Total uncompressed bytes materialized from one workbook.
+const MAX_XLSX_TOTAL_READ_BYTES: usize = 256 * 1024 * 1024;
+
+/// Maximum nesting accepted in one OOXML XML member. This bounds the parser's
+/// end-tag tracking before a deeply nested member can consume its input cap.
+const MAX_XLSX_XML_DEPTH: usize = 256;
+
+/// Maximum attributes on one OOXML XML element. OOXML uses only a handful;
+/// this is a structural safety bound, not a schema requirement.
+const MAX_XLSX_XML_ATTRIBUTES: usize = 1_024;
+
+// Metadata can be tiny on disk but expensive as owned collection entries.
+// One million shared strings matches the admitted workbook cell count;
+// 65,536 styles/custom formats exceeds ordinary Excel style usage, and
+// 16,384 relationships leaves ample room beyond the 256 admitted sheets.
+const MAX_XLSX_SHARED_STRINGS: usize = MAX_XLSX_CELLS_PER_WORKBOOK;
+const MAX_XLSX_RELATIONSHIPS: usize = 16_384;
+const MAX_XLSX_FORMAT_RECORDS: usize = 65_536;
+const MAX_XLSX_METADATA_STRING_BYTES: usize = 16 * 1024 * 1024;
+
+struct MetadataBudget {
+    records: usize,
+    bytes: usize,
+    record_limit: usize,
+    byte_limit: usize,
+}
+
+impl MetadataBudget {
+    fn new(record_limit: usize) -> Self {
+        Self {
+            records: 0,
+            bytes: 0,
+            record_limit,
+            byte_limit: MAX_XLSX_METADATA_STRING_BYTES,
+        }
+    }
+
+    fn admit(counter: &mut usize, amount: usize, limit: usize) -> Result<()> {
+        let next = counter
+            .checked_add(amount)
+            .filter(|next| *next <= limit)
+            .ok_or_else(|| {
+                AdapterError::ContractViolation("XLSX metadata admission bound exceeded".to_owned())
+            })?;
+        *counter = next;
+        Ok(())
+    }
+
+    fn record(&mut self) -> Result<()> {
+        Self::admit(&mut self.records, 1, self.record_limit)
+    }
+
+    fn string_bytes(&mut self, amount: usize) -> Result<()> {
+        Self::admit(&mut self.bytes, amount, self.byte_limit)
+    }
+
+    fn attribute(
+        &mut self,
+        event: &quick_xml::events::BytesStart<'_>,
+        wanted: &str,
+    ) -> Result<Option<String>> {
+        // XML's predefined/numeric escapes never expand past their source
+        // byte length. Charge before unescaping or making an owned string.
+        for attr in event.attributes().with_checks(true) {
+            let attr = attr.map_err(xml_error)?;
+            if local_name(attr.key.as_ref()) == wanted.as_bytes() {
+                self.string_bytes(attr.value.len())?;
+            }
+        }
+        attribute(event, wanted)
+    }
+}
 
 /// One worksheet, already rendered to Markdown.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,12 +171,17 @@ pub struct XlsxDocument {
 /// degrade into an empty-but-successful extraction, which would index the file
 /// as "present with no content".
 pub fn extract_xlsx(bytes: &[u8]) -> Result<XlsxDocument> {
-    let entries = read_zip_entries(bytes)?;
-    let get = |name: &str| -> Option<&ZipEntry> { entries.iter().find(|entry| entry.name == name) };
+    let mut archive = BoundedZip::open(
+        bytes,
+        BoundedZipLimits::new(
+            "XLSX",
+            100 * 1024 * 1024,
+            MAX_XLSX_MEMBER_BYTES,
+            MAX_XLSX_TOTAL_READ_BYTES,
+        ),
+    )?;
 
-    let workbook = get("xl/workbook.xml")
-        .ok_or_else(|| AdapterError::ContractViolation("XLSX has no xl/workbook.xml".to_owned()))?;
-    let workbook_xml = inflate_entry(bytes, workbook)?;
+    let workbook_xml = archive.read_required("xl/workbook.xml")?;
     let sheet_refs = parse_workbook_sheets(&workbook_xml)?;
     if sheet_refs.len() > MAX_XLSX_SHEETS {
         return Err(AdapterError::ContractViolation(format!(
@@ -112,16 +190,16 @@ pub fn extract_xlsx(bytes: &[u8]) -> Result<XlsxDocument> {
         )));
     }
 
-    let rels = match get("xl/_rels/workbook.xml.rels") {
-        Some(entry) => parse_relationships(&inflate_entry(bytes, entry)?)?,
+    let rels = match archive.read_optional("xl/_rels/workbook.xml.rels")? {
+        Some(xml) => parse_relationships(&xml)?,
         None => BTreeMap::new(),
     };
-    let shared = match get("xl/sharedStrings.xml") {
-        Some(entry) => parse_shared_strings(&inflate_entry(bytes, entry)?)?,
+    let shared = match archive.read_optional("xl/sharedStrings.xml")? {
+        Some(xml) => parse_shared_strings(&xml)?,
         None => Vec::new(),
     };
-    let formats = match get("xl/styles.xml") {
-        Some(entry) => parse_styles(&inflate_entry(bytes, entry)?)?,
+    let formats = match archive.read_optional("xl/styles.xml")? {
+        Some(xml) => parse_styles(&xml)?,
         None => CellFormats::default(),
     };
 
@@ -138,14 +216,14 @@ pub fn extract_xlsx(bytes: &[u8]) -> Result<XlsxDocument> {
             .and_then(|id| rels.get(id))
             .map(|target| normalize_rel_target(target))
             .unwrap_or_else(|| format!("xl/worksheets/sheet{}.xml", index + 1));
-        let Some(entry) = get(&target) else {
+        if !archive.contains(&target) {
             return Err(AdapterError::ContractViolation(format!(
                 "XLSX sheet `{}` points at missing part {target}",
                 sheet_ref.name
             )));
-        };
+        }
         let grid = parse_sheet(
-            &inflate_entry(bytes, entry)?,
+            &archive.read_required(&target)?,
             &shared,
             &formats,
             &mut materialized_cells,
@@ -160,10 +238,11 @@ pub fn extract_xlsx(bytes: &[u8]) -> Result<XlsxDocument> {
         });
     }
 
-    let media_paths = entries
+    let media_paths = archive
+        .member_names()
         .iter()
-        .filter(|entry| entry.name.starts_with("xl/media/"))
-        .map(|entry| entry.name.clone())
+        .filter(|name| name.starts_with("xl/media/"))
+        .cloned()
         .collect();
 
     Ok(XlsxDocument {
@@ -183,151 +262,6 @@ pub fn extract_xlsx(bytes: &[u8]) -> Result<XlsxDocument> {
 #[must_use]
 pub fn is_xlsx_media(media_type: &str) -> bool {
     media_type == "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-}
-
-// ---------------------------------------------------------------------------
-// ZIP container
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone)]
-struct ZipEntry {
-    name: String,
-    /// Offset of the local file header.
-    local_header_offset: usize,
-    compression: u16,
-    compressed_size: usize,
-    uncompressed_size: usize,
-}
-
-/// Read the central directory. Only what an XLSX needs: stored and deflated
-/// members, no encryption, no ZIP64 (a >4 GB spreadsheet is refused, loudly).
-fn read_zip_entries(bytes: &[u8]) -> Result<Vec<ZipEntry>> {
-    const EOCD_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x05, 0x06];
-    const CD_SIGNATURE: [u8; 4] = [0x50, 0x4b, 0x01, 0x02];
-
-    if bytes.len() < 22 || !bytes.starts_with(b"PK") {
-        return Err(AdapterError::ContractViolation(
-            "XLSX is not a ZIP container".to_owned(),
-        ));
-    }
-    // The EOCD is last, after a comment of up to 64 KiB. Scan backwards.
-    let scan_start = bytes.len().saturating_sub(22 + 65_536);
-    let eocd = (scan_start..=bytes.len() - 22)
-        .rev()
-        .find(|&offset| bytes[offset..offset + 4] == EOCD_SIGNATURE)
-        .ok_or_else(|| {
-            AdapterError::ContractViolation(
-                "XLSX has no ZIP end-of-central-directory record".to_owned(),
-            )
-        })?;
-
-    let entry_count = read_u16(bytes, eocd + 10)? as usize;
-    let cd_size = read_u32(bytes, eocd + 12)? as usize;
-    let cd_offset = read_u32(bytes, eocd + 16)? as usize;
-    if entry_count > MAX_ZIP_ENTRIES {
-        return Err(AdapterError::ContractViolation(format!(
-            "XLSX declares {entry_count} ZIP entries, over the {MAX_ZIP_ENTRIES} bound"
-        )));
-    }
-    if cd_offset.saturating_add(cd_size) > bytes.len() {
-        return Err(AdapterError::ContractViolation(
-            "XLSX central directory runs past the end of the file".to_owned(),
-        ));
-    }
-
-    let mut entries = Vec::with_capacity(entry_count);
-    let mut cursor = cd_offset;
-    for _ in 0..entry_count {
-        if cursor + 46 > bytes.len() || bytes[cursor..cursor + 4] != CD_SIGNATURE {
-            return Err(AdapterError::ContractViolation(
-                "XLSX central directory entry is malformed".to_owned(),
-            ));
-        }
-        let compression = read_u16(bytes, cursor + 10)?;
-        let compressed_size = read_u32(bytes, cursor + 20)? as usize;
-        let uncompressed_size = read_u32(bytes, cursor + 24)? as usize;
-        let name_len = read_u16(bytes, cursor + 28)? as usize;
-        let extra_len = read_u16(bytes, cursor + 30)? as usize;
-        let comment_len = read_u16(bytes, cursor + 32)? as usize;
-        let local_header_offset = read_u32(bytes, cursor + 42)? as usize;
-        let name_start = cursor + 46;
-        let name_end = name_start + name_len;
-        if name_end > bytes.len() {
-            return Err(AdapterError::ContractViolation(
-                "XLSX central directory name runs past the end of the file".to_owned(),
-            ));
-        }
-        // OOXML part names are ASCII paths; anything else is not a part we read.
-        let name = String::from_utf8_lossy(&bytes[name_start..name_end]).into_owned();
-        entries.push(ZipEntry {
-            name,
-            local_header_offset,
-            compression,
-            compressed_size,
-            uncompressed_size,
-        });
-        cursor = name_end + extra_len + comment_len;
-    }
-    Ok(entries)
-}
-
-fn inflate_entry(bytes: &[u8], entry: &ZipEntry) -> Result<Vec<u8>> {
-    if entry.uncompressed_size > MAX_XLSX_MEMBER_BYTES {
-        return Err(AdapterError::ContractViolation(format!(
-            "XLSX part `{}` declares {} bytes, over the {MAX_XLSX_MEMBER_BYTES} bound",
-            entry.name, entry.uncompressed_size
-        )));
-    }
-    let header = entry.local_header_offset;
-    if header + 30 > bytes.len() || bytes[header..header + 4] != [0x50, 0x4b, 0x03, 0x04] {
-        return Err(AdapterError::ContractViolation(format!(
-            "XLSX part `{}` has no local file header",
-            entry.name
-        )));
-    }
-    // The local header repeats the name/extra lengths, and they may differ from
-    // the central directory's — the data starts after the LOCAL ones.
-    let name_len = read_u16(bytes, header + 26)? as usize;
-    let extra_len = read_u16(bytes, header + 28)? as usize;
-    let data_start = header + 30 + name_len + extra_len;
-    let data_end = data_start
-        .checked_add(entry.compressed_size)
-        .filter(|end| *end <= bytes.len())
-        .ok_or_else(|| {
-            AdapterError::ContractViolation(format!(
-                "XLSX part `{}` runs past the end of the file",
-                entry.name
-            ))
-        })?;
-    let data = &bytes[data_start..data_end];
-    match entry.compression {
-        0 => Ok(data.to_vec()),
-        8 => miniz_oxide::inflate::decompress_to_vec_with_limit(data, MAX_XLSX_MEMBER_BYTES)
-            .map_err(|err| {
-                AdapterError::ContractViolation(format!(
-                    "XLSX part `{}` failed to inflate: {err:?}",
-                    entry.name
-                ))
-            }),
-        other => Err(AdapterError::ContractViolation(format!(
-            "XLSX part `{}` uses unsupported ZIP compression method {other}",
-            entry.name
-        ))),
-    }
-}
-
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16> {
-    bytes
-        .get(offset..offset + 2)
-        .map(|slice| u16::from_le_bytes([slice[0], slice[1]]))
-        .ok_or_else(|| AdapterError::ContractViolation("XLSX ZIP structure truncated".to_owned()))
-}
-
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32> {
-    bytes
-        .get(offset..offset + 4)
-        .map(|slice| u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]]))
-        .ok_or_else(|| AdapterError::ContractViolation("XLSX ZIP structure truncated".to_owned()))
 }
 
 /// `../media/x.png` and `worksheets/sheet1.xml` are both relative to `xl/`.
@@ -360,21 +294,120 @@ fn local_name(raw: &[u8]) -> &[u8] {
     }
 }
 
-fn attribute(event: &quick_xml::events::BytesStart<'_>, wanted: &str) -> Option<String> {
-    event.attributes().flatten().find_map(|attr| {
-        (local_name(attr.key.as_ref()) == wanted.as_bytes())
-            .then(|| String::from_utf8_lossy(&attr.value).into_owned())
-    })
+fn attribute(event: &quick_xml::events::BytesStart<'_>, wanted: &str) -> Result<Option<String>> {
+    let mut found = None;
+    for attribute in event.attributes().with_checks(true) {
+        let attribute = attribute.map_err(xml_error)?;
+        if local_name(attribute.key.as_ref()) == wanted.as_bytes() {
+            let value = std::str::from_utf8(&attribute.value).map_err(|error| {
+                AdapterError::ContractViolation(format!("XLSX XML attribute is malformed: {error}"))
+            })?;
+            let value = quick_xml::escape::unescape(value)
+                .map(|value| value.into_owned())
+                .map_err(|error| {
+                    AdapterError::ContractViolation(format!(
+                        "XLSX XML attribute is malformed: {error}"
+                    ))
+                })?;
+            if found.replace(value).is_some() {
+                return Err(AdapterError::ContractViolation(format!(
+                    "XLSX XML element has duplicate `{wanted}` attributes"
+                )));
+            }
+        }
+    }
+    Ok(found)
 }
 
 fn reader_for(xml: &[u8]) -> Reader<&[u8]> {
     let mut reader = Reader::from_reader(xml);
     reader.config_mut().trim_text(false);
-    reader.config_mut().check_end_names = false;
     reader
 }
 
-fn xml_error(err: quick_xml::Error) -> AdapterError {
+/// Verify every OOXML XML member before its semantic reader starts consuming
+/// it. The semantic readers intentionally only understand their narrow OOXML
+/// vocabulary, so they must not also be responsible for proving that ignored
+/// elements, attributes, or trailing bytes were structurally well-formed.
+fn validate_xml_member(xml: &[u8]) -> Result<()> {
+    let mut reader = reader_for(xml);
+    let mut buf = Vec::new();
+    let mut open_elements = 0usize;
+    loop {
+        match reader.read_event_into(&mut buf).map_err(xml_error)? {
+            Event::Start(event) => {
+                if open_elements >= MAX_XLSX_XML_DEPTH {
+                    return Err(AdapterError::ContractViolation(format!(
+                        "XLSX XML exceeds the {MAX_XLSX_XML_DEPTH}-element nesting bound"
+                    )));
+                }
+                validate_xml_attributes(&event, reader.decoder())?;
+                open_elements += 1;
+            }
+            Event::Empty(event) => validate_xml_attributes(&event, reader.decoder())?,
+            Event::End(_) => {
+                open_elements = open_elements.checked_sub(1).ok_or_else(|| {
+                    AdapterError::ContractViolation(
+                        "XLSX XML has an unmatched end element".to_owned(),
+                    )
+                })?;
+            }
+            Event::Text(text) => {
+                text.decode().map_err(|error| {
+                    AdapterError::ContractViolation(format!("XLSX XML is malformed: {error}"))
+                })?;
+            }
+            Event::CData(text) => {
+                text.decode().map_err(|error| {
+                    AdapterError::ContractViolation(format!("XLSX XML is malformed: {error}"))
+                })?;
+            }
+            Event::GeneralRef(reference) => {
+                let _ = decoded_reference(&reference)?;
+            }
+            Event::DocType(_) => {
+                return Err(AdapterError::ContractViolation(
+                    "XLSX XML must not declare a DTD or entity definitions".to_owned(),
+                ));
+            }
+            Event::Eof => {
+                if open_elements != 0 {
+                    return Err(AdapterError::ContractViolation(
+                        "XLSX XML ends with unclosed elements".to_owned(),
+                    ));
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        buf.clear();
+    }
+}
+
+fn validate_xml_attributes(
+    event: &quick_xml::events::BytesStart<'_>,
+    decoder: quick_xml::Decoder,
+) -> Result<()> {
+    for (attribute_count, attribute) in event.attributes().with_checks(true).enumerate() {
+        if attribute_count >= MAX_XLSX_XML_ATTRIBUTES {
+            return Err(AdapterError::ContractViolation(format!(
+                "XLSX XML element exceeds the {MAX_XLSX_XML_ATTRIBUTES}-attribute bound"
+            )));
+        }
+        let attribute = attribute.map_err(xml_error)?;
+        attribute
+            .decoded_and_normalized_value(quick_xml::XmlVersion::Implicit1_0, decoder)
+            .map_err(xml_error)?;
+    }
+    Ok(())
+}
+
+fn validated_reader_for(xml: &[u8]) -> Result<Reader<&[u8]>> {
+    validate_xml_member(xml)?;
+    Ok(reader_for(xml))
+}
+
+fn xml_error(err: impl std::fmt::Display) -> AdapterError {
     AdapterError::ContractViolation(format!("XLSX XML is malformed: {err}"))
 }
 
@@ -412,7 +445,14 @@ fn decoded_reference(reference: &quick_xml::events::BytesRef<'_>) -> Result<Stri
 }
 
 fn parse_workbook_sheets(xml: &[u8]) -> Result<Vec<SheetRef>> {
-    let mut reader = reader_for(xml);
+    parse_workbook_sheets_with_budget(xml, &mut MetadataBudget::new(MAX_XLSX_SHEETS))
+}
+
+fn parse_workbook_sheets_with_budget(
+    xml: &[u8],
+    budget: &mut MetadataBudget,
+) -> Result<Vec<SheetRef>> {
+    let mut reader = validated_reader_for(xml)?;
     let mut buf = Vec::new();
     let mut sheets = Vec::new();
     loop {
@@ -420,14 +460,15 @@ fn parse_workbook_sheets(xml: &[u8]) -> Result<Vec<SheetRef>> {
             Event::Empty(event) | Event::Start(event)
                 if local_name(event.name().as_ref()) == b"sheet" =>
             {
-                let Some(name) = attribute(&event, "name") else {
+                budget.record()?;
+                let Some(name) = budget.attribute(&event, "name")? else {
                     return Err(AdapterError::ContractViolation(
                         "XLSX workbook declares a sheet with no name".to_owned(),
                     ));
                 };
                 sheets.push(SheetRef {
                     name,
-                    rel_id: attribute(&event, "id"),
+                    rel_id: budget.attribute(&event, "id")?,
                 });
             }
             Event::Eof => break,
@@ -444,7 +485,14 @@ fn parse_workbook_sheets(xml: &[u8]) -> Result<Vec<SheetRef>> {
 }
 
 fn parse_relationships(xml: &[u8]) -> Result<BTreeMap<String, String>> {
-    let mut reader = reader_for(xml);
+    parse_relationships_with_budget(xml, &mut MetadataBudget::new(MAX_XLSX_RELATIONSHIPS))
+}
+
+fn parse_relationships_with_budget(
+    xml: &[u8],
+    budget: &mut MetadataBudget,
+) -> Result<BTreeMap<String, String>> {
+    let mut reader = validated_reader_for(xml)?;
     let mut buf = Vec::new();
     let mut map = BTreeMap::new();
     loop {
@@ -452,9 +500,11 @@ fn parse_relationships(xml: &[u8]) -> Result<BTreeMap<String, String>> {
             Event::Empty(event) | Event::Start(event)
                 if local_name(event.name().as_ref()) == b"Relationship" =>
             {
-                if let (Some(id), Some(target)) =
-                    (attribute(&event, "Id"), attribute(&event, "Target"))
-                {
+                budget.record()?;
+                if let (Some(id), Some(target)) = (
+                    budget.attribute(&event, "Id")?,
+                    budget.attribute(&event, "Target")?,
+                ) {
                     map.insert(id, target);
                 }
             }
@@ -470,7 +520,14 @@ fn parse_relationships(xml: &[u8]) -> Result<BTreeMap<String, String>> {
 /// Rich-text runs split one string across several `<t>` children, so the
 /// concatenation is per `<si>`, not per `<t>`.
 fn parse_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
-    let mut reader = reader_for(xml);
+    parse_shared_strings_with_budget(xml, &mut MetadataBudget::new(MAX_XLSX_SHARED_STRINGS))
+}
+
+fn parse_shared_strings_with_budget(
+    xml: &[u8],
+    budget: &mut MetadataBudget,
+) -> Result<Vec<String>> {
+    let mut reader = validated_reader_for(xml)?;
     let mut buf = Vec::new();
     let mut strings = Vec::new();
     let mut current: Option<String> = None;
@@ -478,10 +535,17 @@ fn parse_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
     loop {
         match reader.read_event_into(&mut buf).map_err(xml_error)? {
             Event::Start(event) => match local_name(event.name().as_ref()) {
-                b"si" => current = Some(String::new()),
+                b"si" => {
+                    budget.record()?;
+                    current = Some(String::new());
+                }
                 b"t" => in_text = true,
                 _ => {}
             },
+            Event::Empty(event) if local_name(event.name().as_ref()) == b"si" => {
+                budget.record()?;
+                strings.push(String::new());
+            }
             Event::End(event) => match local_name(event.name().as_ref()) {
                 b"si" => strings.push(current.take().unwrap_or_default()),
                 b"t" => in_text = false,
@@ -489,11 +553,14 @@ fn parse_shared_strings(xml: &[u8]) -> Result<Vec<String>> {
             },
             Event::Text(text) if in_text => {
                 if let Some(buffer) = current.as_mut() {
+                    let encoded: &[u8] = text.as_ref();
+                    budget.string_bytes(encoded.len())?;
                     buffer.push_str(&decoded_text(&text)?);
                 }
             }
             Event::GeneralRef(reference) if in_text => {
                 if let Some(buffer) = current.as_mut() {
+                    budget.string_bytes(4)?;
                     buffer.push_str(&decoded_reference(&reference)?);
                 }
             }
@@ -525,7 +592,11 @@ impl CellFormats {
 }
 
 fn parse_styles(xml: &[u8]) -> Result<CellFormats> {
-    let mut reader = reader_for(xml);
+    parse_styles_with_budget(xml, &mut MetadataBudget::new(MAX_XLSX_FORMAT_RECORDS))
+}
+
+fn parse_styles_with_budget(xml: &[u8], budget: &mut MetadataBudget) -> Result<CellFormats> {
+    let mut reader = validated_reader_for(xml)?;
     let mut buf = Vec::new();
     let mut formats = CellFormats::default();
     let mut in_cell_xfs = false;
@@ -534,9 +605,12 @@ fn parse_styles(xml: &[u8]) -> Result<CellFormats> {
             Event::Start(event) | Event::Empty(event) => {
                 match local_name(event.name().as_ref()) {
                     b"numFmt" => {
+                        budget.record()?;
                         if let (Some(id), Some(code)) = (
-                            attribute(&event, "numFmtId").and_then(|v| v.parse::<u32>().ok()),
-                            attribute(&event, "formatCode"),
+                            budget
+                                .attribute(&event, "numFmtId")?
+                                .and_then(|v| v.parse::<u32>().ok()),
+                            budget.attribute(&event, "formatCode")?,
                         ) {
                             formats.custom.insert(id, code);
                         }
@@ -545,8 +619,10 @@ fn parse_styles(xml: &[u8]) -> Result<CellFormats> {
                     // `cellStyleXfs` also contains `<xf>` elements; only the
                     // `cellXfs` ones are what a cell's `s=` indexes into.
                     b"xf" if in_cell_xfs => {
+                        budget.record()?;
                         formats.style_formats.push(
-                            attribute(&event, "numFmtId")
+                            budget
+                                .attribute(&event, "numFmtId")?
                                 .and_then(|v| v.parse::<u32>().ok())
                                 .unwrap_or(0),
                         );
@@ -572,7 +648,7 @@ fn parse_sheet(
     materialized_cells: &mut usize,
     materialized_cell_text_bytes: &mut usize,
 ) -> Result<Vec<Vec<String>>> {
-    let mut reader = reader_for(xml);
+    let mut reader = validated_reader_for(xml)?;
     let mut buf = Vec::new();
     let mut grid: Vec<Vec<String>> = Vec::new();
     let mut row: Vec<String> = Vec::new();
@@ -725,7 +801,7 @@ struct CellState {
 
 impl CellState {
     fn from(event: &quick_xml::events::BytesStart<'_>, fallback_column: usize) -> Result<Self> {
-        let column = match attribute(event, "r") {
+        let column = match attribute(event, "r")? {
             Some(reference) => column_index_from_ref_checked(&reference)?,
             None => fallback_column,
         };
@@ -737,8 +813,8 @@ impl CellState {
         }
         Ok(Self {
             column,
-            kind: attribute(event, "t"),
-            style: attribute(event, "s").and_then(|value| value.parse::<usize>().ok()),
+            kind: attribute(event, "t")?,
+            style: attribute(event, "s")?.and_then(|value| value.parse::<usize>().ok()),
         })
     }
 }
@@ -1219,7 +1295,100 @@ fn region_to_markdown(region: &[Vec<String>], out: &mut BoundedMarkdown) -> Resu
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::*;
+    use zip::{ZipWriter, write::SimpleFileOptions};
+
+    fn metadata_budget(records: usize, bytes: usize) -> MetadataBudget {
+        MetadataBudget {
+            records: 0,
+            bytes: 0,
+            record_limit: records,
+            byte_limit: bytes,
+        }
+    }
+
+    #[test]
+    fn workbook_sheet_limit_is_checked_inside_metadata_parser() {
+        let exact = format!(
+            "<workbook>{}</workbook>",
+            "<sheet name=\"a\"/>".repeat(MAX_XLSX_SHEETS)
+        );
+        assert_eq!(
+            parse_workbook_sheets(exact.as_bytes()).unwrap().len(),
+            MAX_XLSX_SHEETS
+        );
+        let over = format!(
+            "<workbook>{}</workbook>",
+            "<sheet name=\"a\"/>".repeat(MAX_XLSX_SHEETS + 1)
+        );
+        assert!(matches!(
+            parse_workbook_sheets(over.as_bytes()),
+            Err(AdapterError::ContractViolation(_))
+        ));
+    }
+
+    #[test]
+    fn metadata_record_limits_count_duplicate_ids_and_empty_records() {
+        let workbook = br#"<workbook><sheet name="a"/><sheet name="b"/></workbook>"#;
+        assert!(parse_workbook_sheets_with_budget(workbook, &mut metadata_budget(2, 100)).is_ok());
+        assert!(parse_workbook_sheets_with_budget(workbook, &mut metadata_budget(1, 100)).is_err());
+        let rels = br#"<Relationships><Relationship Id="a" Target="x"/><Relationship Id="a" Target="y"/></Relationships>"#;
+        assert_eq!(
+            parse_relationships_with_budget(rels, &mut metadata_budget(2, 100))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(parse_relationships_with_budget(rels, &mut metadata_budget(1, 100)).is_err());
+        let shared = b"<sst><si/><si><t>x</t></si></sst>";
+        assert_eq!(
+            parse_shared_strings_with_budget(shared, &mut metadata_budget(2, 100)).unwrap(),
+            vec!["", "x"]
+        );
+        assert!(parse_shared_strings_with_budget(shared, &mut metadata_budget(1, 100)).is_err());
+        let custom = br#"<styleSheet><numFmt numFmtId="164" formatCode="0%"/><numFmt numFmtId="164" formatCode="0%"/></styleSheet>"#;
+        assert_eq!(
+            parse_styles_with_budget(custom, &mut metadata_budget(2, 100))
+                .unwrap()
+                .custom
+                .len(),
+            1
+        );
+        assert!(parse_styles_with_budget(custom, &mut metadata_budget(1, 100)).is_err());
+        let styles = b"<styleSheet><cellXfs><xf/><xf/></cellXfs></styleSheet>";
+        assert_eq!(
+            parse_styles_with_budget(styles, &mut metadata_budget(2, 100))
+                .unwrap()
+                .style_formats
+                .len(),
+            2
+        );
+        assert!(parse_styles_with_budget(styles, &mut metadata_budget(1, 100)).is_err());
+    }
+
+    #[test]
+    fn metadata_string_bytes_are_admitted_at_exact_boundary() {
+        let workbook = br#"<workbook><sheet name="abc"/></workbook>"#;
+        assert!(parse_workbook_sheets_with_budget(workbook, &mut metadata_budget(1, 3)).is_ok());
+        assert!(parse_workbook_sheets_with_budget(workbook, &mut metadata_budget(1, 2)).is_err());
+        let shared = b"<sst><si><t>abc</t><t>def</t></si></sst>";
+        assert_eq!(
+            parse_shared_strings_with_budget(shared, &mut metadata_budget(1, 6)).unwrap(),
+            vec!["abcdef"]
+        );
+        assert!(parse_shared_strings_with_budget(shared, &mut metadata_budget(1, 5)).is_err());
+        let rels = br#"<Relationships><Relationship Id="a" Target="bc"/></Relationships>"#;
+        assert!(parse_relationships_with_budget(rels, &mut metadata_budget(1, 3)).is_ok());
+        assert!(parse_relationships_with_budget(rels, &mut metadata_budget(1, 2)).is_err());
+        let custom = br#"<styleSheet><numFmt numFmtId="164" formatCode="0%"/></styleSheet>"#;
+        assert!(parse_styles_with_budget(custom, &mut metadata_budget(1, 5)).is_ok());
+        assert!(parse_styles_with_budget(custom, &mut metadata_budget(1, 4)).is_err());
+        let mut budget = metadata_budget(usize::MAX, usize::MAX);
+        budget.bytes = usize::MAX;
+        assert!(budget.string_bytes(1).is_err());
+    }
 
     // ---- number formats --------------------------------------------------
 
@@ -1535,45 +1704,17 @@ mod tests {
 
     // ---- end to end ------------------------------------------------------
 
-    /// Build a ZIP with stored (uncompressed) members. Enough for a workbook
-    /// fixture, and it exercises the container reader for real rather than
-    /// asserting against a hand-built parse tree.
+    /// Build a CRC-valid ZIP with stored members. This exercises the same
+    /// maintained reader used for production workbooks.
     fn zip_of(members: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut out = Vec::new();
-        let mut directory = Vec::new();
+        let mut writer = ZipWriter::new(std::io::Cursor::new(Vec::new()));
         for (name, body) in members {
-            let offset = out.len() as u32;
-            let crc = 0u32; // unchecked by the reader; the length fields are what it uses
-            out.extend_from_slice(&[0x50, 0x4b, 0x03, 0x04]);
-            out.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]); // version..time/date
-            out.extend_from_slice(&crc.to_le_bytes());
-            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            out.extend_from_slice(&0u16.to_le_bytes());
-            out.extend_from_slice(name.as_bytes());
-            out.extend_from_slice(body);
-
-            directory.extend_from_slice(&[0x50, 0x4b, 0x01, 0x02]);
-            directory.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-            directory.extend_from_slice(&crc.to_le_bytes());
-            directory.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            directory.extend_from_slice(&(body.len() as u32).to_le_bytes());
-            directory.extend_from_slice(&(name.len() as u16).to_le_bytes());
-            directory.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
-            directory.extend_from_slice(&offset.to_le_bytes());
-            directory.extend_from_slice(name.as_bytes());
+            writer
+                .start_file(*name, SimpleFileOptions::default())
+                .expect("start ZIP fixture member");
+            writer.write_all(body).expect("write ZIP fixture member");
         }
-        let cd_offset = out.len() as u32;
-        let cd_size = directory.len() as u32;
-        out.extend_from_slice(&directory);
-        out.extend_from_slice(&[0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0]);
-        out.extend_from_slice(&(members.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(members.len() as u16).to_le_bytes());
-        out.extend_from_slice(&cd_size.to_le_bytes());
-        out.extend_from_slice(&cd_offset.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out
+        writer.finish().expect("finish ZIP fixture").into_inner()
     }
 
     /// Namespace-prefixed, like the writer this corpus was produced with —
@@ -1594,6 +1735,27 @@ mod tests {
             ("xl/worksheets/sheet1.xml", SHEET.as_bytes()),
             ("xl/media/image1.png", b"\x89PNG-not-really"),
         ])
+    }
+
+    fn workbook_fixture_replacing(member: &str, replacement: &[u8]) -> Vec<u8> {
+        let members = [
+            ("xl/workbook.xml", WORKBOOK.as_bytes()),
+            ("xl/_rels/workbook.xml.rels", RELS.as_bytes()),
+            ("xl/sharedStrings.xml", SHARED.as_bytes()),
+            ("xl/styles.xml", STYLES.as_bytes()),
+            ("xl/worksheets/sheet1.xml", SHEET.as_bytes()),
+        ];
+        let members = members
+            .into_iter()
+            .map(|(name, body)| {
+                if name == member {
+                    (name, replacement)
+                } else {
+                    (name, body)
+                }
+            })
+            .collect::<Vec<_>>();
+        zip_of(&members)
     }
 
     #[test]
@@ -1631,6 +1793,58 @@ mod tests {
             br#"<?xml version="1.0"?><workbook><sheets/></workbook>"# as &[u8],
         )]);
         assert!(extract_xlsx(&empty).is_err());
+    }
+
+    #[test]
+    fn malformed_xml_members_fail_before_partial_xlsx_extraction() {
+        let malformed_members = [
+            (
+                "xl/workbook.xml",
+                br#"<?xml version="1.0"?><workbook><sheets></workbook>"# as &[u8],
+            ),
+            (
+                "xl/sharedStrings.xml",
+                br#"<!DOCTYPE sst [<!ENTITY injected "not allowed">]><sst><si><t>&injected;</t></si></sst>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                br#"<worksheet><sheetData><row><c x:r="A1" y:r="B1"><v>1</v></c></row></sheetData></worksheet>"#,
+            ),
+            (
+                "xl/worksheets/sheet1.xml",
+                br#"<worksheet><sheetData><row><c r="A1"><v>1</v></c>"#,
+            ),
+        ];
+        for (member, malformed) in malformed_members {
+            let error = extract_xlsx(&workbook_fixture_replacing(member, malformed))
+                .expect_err("malformed XML member must reject the workbook");
+            assert!(matches!(error, AdapterError::ContractViolation(_)));
+        }
+    }
+
+    #[test]
+    fn xml_structural_limits_reject_deep_or_attribute_dense_members() {
+        let nested = format!(
+            "<worksheet>{}</worksheet>",
+            "<level>".repeat(MAX_XLSX_XML_DEPTH) + &"</level>".repeat(MAX_XLSX_XML_DEPTH),
+        );
+        let error = extract_xlsx(&workbook_fixture_replacing(
+            "xl/worksheets/sheet1.xml",
+            nested.as_bytes(),
+        ))
+        .expect_err("over-deep XML member must reject the workbook");
+        assert!(matches!(error, AdapterError::ContractViolation(_)));
+
+        let attributes = (0..=MAX_XLSX_XML_ATTRIBUTES)
+            .map(|index| format!(" a{index}=\"value\""))
+            .collect::<String>();
+        let dense = format!("<worksheet{attributes}/>");
+        let error = extract_xlsx(&workbook_fixture_replacing(
+            "xl/worksheets/sheet1.xml",
+            dense.as_bytes(),
+        ))
+        .expect_err("over-attribute XML member must reject the workbook");
+        assert!(matches!(error, AdapterError::ContractViolation(_)));
     }
 
     #[test]

@@ -1,12 +1,11 @@
-//! Step4b crash self-heal contract tests: `docs/07-adapter-spec.md` §3
-//! L191-206's "途中で crash した中間 (true × 行なし) は、次回実行の self-heal
-//! が approval_pending と完全一致する場合に限り行 publish を完遂する" letter
-//! — `kio-cli`'s `try_self_heal_network_approval` (the fallthrough
-//! `persistent_network_allowed_for_kio_dir` takes when `approval_pending` is
-//! present and no `active` row matches).
+//! Step4b interrupted-approval contract tests. Persistent network-consent
+//! checks are read-only: a pending approval left by an interrupted explicit
+//! approval must fail closed until the operator runs the explicit approval
+//! flow again. This prevents a search or index read from resurrecting consent
+//! after a concurrent revoke.
 //!
 //! This file is deliberately SEPARATE from `step4b_p3a_contract.rs` (which
-//! already owns QA21/22/25/26/27, the materialize/revoke/explicit-approval
+//! already owns QA21/22/25/26/27, the explicit-approval/revoke
 //! side of this same 07 §3 area) — harness helpers below are self-contained
 //! copies of that file's `kio`/`json_success`/`init`/`scope_json`/
 //! `write_scope_allow_network_true`/`fake_pdf` (integration test binaries in
@@ -14,16 +13,10 @@
 //! its own copies; this mirrors the established convention rather than
 //! introducing a new one).
 //!
-//! Every scenario drives the gate through the exact CLI invocation QA21 uses
-//! (`kio index --yes`) rather than `--approve`: `--approve` runs the FULL
-//! explicit write-order (`publish_online_network_approval`, gated on
-//! `args.approve` inside `write_approval_record`) and would overwrite the
-//! hand-crafted `approval_pending` fixture before the gate is ever
-//! evaluated. `--yes` only unlocks the scan-approval flow (07 §3's (a) path
-//! explicitly does NOT accept `--yes`: "対話承認 または --approve。--yes で
-//! は成立しない") and leaves `approval_pending`/`approvals`/
-//! `approvals_initialized` untouched except through the read+fallthrough
-//! gate (`persistent_network_allowed`) this file targets.
+//! Each fixture first establishes the separate local scan grant with
+//! `kio index --yes`. It then drives the external-consent gate through plain
+//! `kio index`, which must leave portable consent state untouched. The positive
+//! controls use the existing explicit `--approve` flow.
 
 use std::fs;
 use std::path::PathBuf;
@@ -86,7 +79,7 @@ fn scope_json(dir: &TempDir) -> Value {
 }
 
 fn kio_dir(dir: &TempDir) -> PathBuf {
-    dir.path().join(".kio")
+    fs::canonicalize(dir.path().join(".kio")).unwrap()
 }
 
 /// The SCOPE-local `.kio/config.toml` — 07 §3's (b) path (mirrors
@@ -133,6 +126,10 @@ fn standard_markdownize_identity() -> (String, String) {
 fn init_with_allow_network(dir: &TempDir) -> String {
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
     init(dir);
+    // Establish the local scan grant before testing the external-consent read
+    // gate. `--yes` records that separate grant, so it must not be part of
+    // the immutable gate invocation below.
+    json_success(dir, &["index", "--yes"]);
     write_scope_allow_network_true(dir);
     scope_json(dir)["scope_id"]
         .as_str()
@@ -140,16 +137,12 @@ fn init_with_allow_network(dir: &TempDir) -> String {
         .to_owned()
 }
 
-/// selfheal_01 (07 §3 L191-198/L195-196): a crash mid-flight between step
-/// (0) (pending write) and step (2) (row publish) — boolean already `true`,
-/// a well-formed pending exact-matching the scope's actual first-tool
-/// identity, no rows, no marker. The NEXT `kio index --yes` must complete
-/// the publish from the pending's payload VERBATIM: `approved_at`/
-/// `approval_method` copied as-is (NOT re-stamped with "now"/"materialize"),
-/// `status` set to `active`, the marker set true, and `approval_pending`
-/// removed — all in one self-heal, not a fabricated materialize row.
+/// An interrupted explicit approval is not recoverable through a read gate.
+/// A matching pending keeps the gate closed and leaves all portable consent
+/// state untouched. An operator can then intentionally replace and publish it
+/// through the explicit approval flow.
 #[test]
-fn selfheal_01_crash_pending_completes_publish_verbatim() {
+fn selfheal_01_pending_fails_closed_until_explicit_approval() {
     let dir = tempfile::tempdir().unwrap();
     let scope_id = init_with_allow_network(&dir);
     let (tool_id, tool_profile_hash) = standard_markdownize_identity();
@@ -165,52 +158,49 @@ fn selfheal_01_crash_pending_completes_publish_verbatim() {
         "approval_method": "approve",
     });
     write_network_approval_pending(&kio_dir(&dir), pending).unwrap();
+    let scope_path = kio_dir(&dir).join("scope.json");
+    let before_scope = fs::read(&scope_path).unwrap();
+    let before_config = fs::read(kio_dir(&dir).join("config.toml")).unwrap();
     assert!(
         scope_json(&dir).get("approvals").is_none(),
-        "no row must exist before the self-heal run"
+        "no row must exist before the read-only gate"
     );
 
-    let output = json_success(&dir, &["index", "--yes"]);
+    let output = json_success(&dir, &["index"]);
     assert_eq!(
-        output["network_opt_in"], true,
-        "self-heal must complete the publish and open the gate: {output}"
+        output["network_opt_in"], false,
+        "a pending approval must not be published by a read-only gate: {output}"
+    );
+    assert_eq!(fs::read(&scope_path).unwrap(), before_scope);
+    assert_eq!(
+        fs::read(kio_dir(&dir).join("config.toml")).unwrap(),
+        before_config
     );
 
-    let scope = scope_json(&dir);
-    let approvals = scope["approvals"]
-        .as_array()
-        .expect("approvals[] must exist after self-heal");
-    assert_eq!(approvals.len(), 1, "exactly the healed row: {approvals:?}");
-    let row = &approvals[0];
-    assert_eq!(row["scope_id"], json!(scope_id));
-    assert_eq!(row["tool_id"], json!(tool_id));
-    assert_eq!(row["execution_mode"], json!("online_api"));
-    assert_eq!(row["tool_profile_hash"], json!(tool_profile_hash));
-    assert_eq!(
-        row["approved_at"], "2020-01-01T00:00:00Z",
-        "approved_at must be copied VERBATIM from the pending, not re-stamped: {row}"
+    json_success(&dir, &["index", "--yes"]);
+    let revoked = json_success(&dir, &["adapter", "revoke", "mistral_ocr_markdownize"]);
+    assert_eq!(revoked["status"], "revoked", "{revoked}");
+    let approved = json_success(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
     );
-    assert_eq!(
-        row["approval_method"], "approve",
-        "approval_method must be copied VERBATIM from the pending, not overwritten with \
-         \"materialize\": {row}"
-    );
-    assert_eq!(row["status"], "active");
-    assert_eq!(scope["approvals_initialized"], true);
+    assert_eq!(approved["status"], "approved", "{approved}");
+    let explicit = json_success(&dir, &["index"]);
+    assert_eq!(explicit["network_opt_in"], true, "{explicit}");
+    let approvals = scope_json(&dir)["approvals"].as_array().unwrap().clone();
+    assert_eq!(approvals.len(), 1, "{approvals:?}");
+    assert_eq!(approvals[0]["scope_id"], json!(scope_id));
+    assert_eq!(approvals[0]["tool_id"], json!(tool_id));
+    assert_eq!(approvals[0]["tool_profile_hash"], json!(tool_profile_hash));
+    assert_eq!(approvals[0]["approval_method"], "approve");
+    assert_eq!(approvals[0]["status"], "active");
     assert!(
-        scope.get("approval_pending").is_none(),
-        "approval_pending must be removed in the same write: {scope}"
+        scope_json(&dir).get("approval_pending").is_none(),
+        "the explicit approval must consume its own pending record"
     );
 }
 
-/// selfheal_02 (07 §3 L196-198): a pending whose `tool_profile_hash` does
-/// NOT match the scope's actual current identity (well-formed otherwise) —
-/// self-heal must NOT publish, must leave the STALE pending untouched (the
-/// next EXPLICIT approval's own step (0) is what overwrites it), and must
-/// NOT let the fallthrough fall back to fabricating a materialize row
-/// either, even though `approvals[]` is empty and no marker is set (the
-/// pending's mere PRESENCE rules out materialize regardless of whether
-/// self-heal itself fires for it).
+/// A mismatched pending also remains opaque to a read-only gate.
 #[test]
 fn selfheal_02_mismatched_profile_pending_is_left_untouched_and_gate_stays_closed() {
     let dir = tempfile::tempdir().unwrap();
@@ -228,7 +218,7 @@ fn selfheal_02_mismatched_profile_pending_is_left_untouched_and_gate_stays_close
     });
     write_network_approval_pending(&kio_dir(&dir), pending.clone()).unwrap();
 
-    let output = json_success(&dir, &["index", "--yes"]);
+    let output = json_success(&dir, &["index"]);
     assert_eq!(
         output["network_opt_in"], false,
         "a profile-mismatched pending must not open the gate: {output}"
@@ -237,24 +227,20 @@ fn selfheal_02_mismatched_profile_pending_is_left_untouched_and_gate_stays_close
     let scope = scope_json(&dir);
     assert!(
         scope.get("approvals").is_none(),
-        "no row must be published — neither self-heal (mismatch) nor a \
-         fabricated materialize (pending present): {scope}"
+        "no row must be published by the read-only gate: {scope}"
     );
     assert!(
         scope.get("approvals_initialized").is_none(),
-        "the marker must stay unset — nothing consumed the initial-materialize \
-         exception: {scope}"
+        "the marker must stay unset: {scope}"
     );
     assert_eq!(
         scope["approval_pending"], pending,
-        "the stale pending must be left byte-for-byte untouched for a future \
-         explicit approval's step (0) to overwrite: {scope}"
+        "the stale pending must be left byte-for-byte untouched: {scope}"
     );
 }
 
 /// A present pending missing a required audit field is a current scope-schema
-/// violation. It must fail closed before self-heal and must not be cleaned up,
-/// inferred, or otherwise mutate the portable approval record.
+/// violation. It must fail closed without being cleaned up or inferred.
 #[test]
 fn selfheal_03_malformed_pending_fails_closed_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
@@ -275,7 +261,7 @@ fn selfheal_03_malformed_pending_fails_closed_without_mutation() {
     fs::write(&scope_path, serde_json::to_vec_pretty(&scope).unwrap()).unwrap();
     let before = fs::read(&scope_path).unwrap();
 
-    let stderr = kio(&dir, &["index", "--yes", "--json"])
+    let stderr = kio(&dir, &["index", "--json"])
         .assert()
         .failure()
         .get_output()
@@ -286,16 +272,17 @@ fn selfheal_03_malformed_pending_fails_closed_without_mutation() {
     assert_eq!(fs::read(&scope_path).unwrap(), before);
 }
 
-/// selfheal_04 (07 §3 L186-190, 197-198): a SECOND tool's crash mid-flight —
+/// An interrupted approval for a second tool must stay pending even if another
+/// tool already has an active row. A later explicit approval can publish the
+/// second row without changing the first.
+///
+/// The fixture models a SECOND tool's crash mid-flight —
 /// `approvals_initialized` is already `true` and an unrelated tool_id
 /// already carries an `active` row (a previously, fully-completed
 /// approval), while a well-formed pending for THIS run's tool (the standard
-/// markdownize identity) sits unpublished. Self-heal must still complete
-/// tool B's publish from its pending verbatim, independent of the marker
-/// already being consumed by tool A, and leave tool A's row completely
-/// unmodified.
+/// markdownize identity) sits unpublished.
 #[test]
-fn selfheal_04_second_tool_crash_pending_heals_without_disturbing_the_first_tools_row() {
+fn selfheal_04_second_tool_pending_requires_explicit_approval() {
     let dir = tempfile::tempdir().unwrap();
     let scope_id = init_with_allow_network(&dir);
     let (tool_id_b, tool_profile_hash_b) = standard_markdownize_identity();
@@ -324,25 +311,45 @@ fn selfheal_04_second_tool_crash_pending_heals_without_disturbing_the_first_tool
     });
     write_network_approval_pending(&kio_dir(&dir), pending_b).unwrap();
 
-    let output = json_success(&dir, &["index", "--yes"]);
+    let before_scope = fs::read(kio_dir(&dir).join("scope.json")).unwrap();
+    let output = json_success(&dir, &["index"]);
     assert_eq!(
-        output["network_opt_in"], true,
-        "self-heal must fire for tool B despite the marker already being \
-         consumed by tool A: {output}"
+        output["network_opt_in"], false,
+        "tool A's approval must not open tool B's pending approval: {output}"
     );
+    assert_eq!(
+        fs::read(kio_dir(&dir).join("scope.json")).unwrap(),
+        before_scope
+    );
+
+    json_success(&dir, &["index", "--yes"]);
+    let revoked = json_success(&dir, &["adapter", "revoke", "mistral_ocr_markdownize"]);
+    assert_eq!(revoked["status"], "revoked", "{revoked}");
+    let approved = json_success(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+    );
+    assert_eq!(approved["status"], "approved", "{approved}");
+    let explicit = json_success(&dir, &["index"]);
+    assert_eq!(explicit["network_opt_in"], true, "{explicit}");
 
     let scope = scope_json(&dir);
     let approvals = scope["approvals"].as_array().unwrap();
     assert_eq!(
         approvals.len(),
         2,
-        "tool A's row plus the healed tool B row: {approvals:?}"
+        "tool A's row plus the explicitly approved tool B row: {approvals:?}"
     );
     let row_b_after = approvals
         .iter()
         .find(|row| row["tool_id"] == json!(tool_id_b))
-        .expect("tool B's healed row must exist");
-    assert_eq!(row_b_after["approved_at"], "2021-02-02T00:00:00Z");
+        .expect("tool B's newly approved row must exist");
+    assert_ne!(row_b_after["approved_at"], "2021-02-02T00:00:00Z");
+    assert!(
+        row_b_after["approved_at"]
+            .as_str()
+            .is_some_and(|at| at.ends_with('Z'))
+    );
     assert_eq!(row_b_after["approval_method"], "approve");
     assert_eq!(row_b_after["status"], "active");
     assert_eq!(row_b_after["tool_profile_hash"], json!(tool_profile_hash_b));
@@ -353,7 +360,7 @@ fn selfheal_04_second_tool_crash_pending_heals_without_disturbing_the_first_tool
         .expect("tool A's row must still exist");
     assert_eq!(
         row_a_after, &row_a,
-        "tool A's row must be completely unmodified by tool B's self-heal: {row_a_after}"
+        "tool A's row must be completely unmodified by tool B's explicit approval: {row_a_after}"
     );
     assert!(
         scope.get("approval_pending").is_none(),

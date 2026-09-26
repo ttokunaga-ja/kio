@@ -1,6 +1,7 @@
 use std::fs;
 
 use assert_cmd::Command;
+use base64::Engine as _;
 use kio_adapter::tool_lock::tool_lock_hash;
 use kio_core::scope::Repository;
 use kio_pipeline::markdownize::load_validated_normalized_instance;
@@ -51,6 +52,12 @@ fn json_success(dir: &TempDir, args: &[&str], online_mock: Option<&str>) -> Valu
 
 fn init(dir: &TempDir) {
     json_success(dir, &["init"], None);
+    json_success(dir, &["ledger", "init"], None);
+    json_success(
+        dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+        Some("mock"),
+    );
 }
 
 fn head(dir: &TempDir) -> String {
@@ -85,10 +92,7 @@ fn fake_pdf(pages: &[&str]) -> String {
 /// file being append-only — comparing every row of both tables here is the
 /// direct SQLite-era equivalent of "nothing new was charged or reserved").
 fn cost_ledger(dir: &TempDir) -> Vec<String> {
-    let db =
-        kio_pipeline::ledger::LedgerDb::open(dir.path().join(".test-data/kio/cost-ledger.sqlite"))
-            .unwrap();
-    let conn = db.connection();
+    let conn = Connection::open(dir.path().join(".test-data/kio/cost-ledger.sqlite")).unwrap();
     let mut rows = Vec::new();
     let mut stmt = conn
         .prepare(
@@ -197,7 +201,7 @@ fn ct4_promotion_done_batch_updates_provenance_search_and_is_idempotent() {
         fake_pdf(&["promotion fixture beta"]),
     )
     .unwrap();
-    json_success(&dir, &["index", "--approve"], None);
+    json_success(&dir, &["index", "--yes"], None);
     let baseline_head = head(&dir);
 
     json_success(&dir, &["batch", "resume"], Some("mock"));
@@ -207,8 +211,8 @@ fn ct4_promotion_done_batch_updates_provenance_search_and_is_idempotent() {
     let repo = Repository::open(dir.path()).unwrap();
     let commit = repo.read_commit(&promoted_head).unwrap();
     assert_eq!(
-        commit.parents,
-        vec![baseline_head],
+        commit.parent,
+        Some(baseline_head),
         "the two accepted files must promote in one batch commit"
     );
     let tree = repo.read_tree(&commit.tree).unwrap();
@@ -293,7 +297,7 @@ fn ct4_promotion_done_batch_updates_provenance_search_and_is_idempotent() {
 
     // Ordinary index reconciles the Done online instances before its one snapshot;
     // it must not demote to baseline or create a second promotion commit.
-    json_success(&dir, &["index", "--approve"], Some("mock"));
+    json_success(&dir, &["index", "--yes"], Some("mock"));
     assert_eq!(head(&dir), promoted_head);
     assert_eq!(cost_ledger(&dir), charged);
 }
@@ -311,11 +315,13 @@ fn ct4_bbox_006_ocr_from_scratch_promotes_scanned_pdf_and_image() {
     .unwrap();
     fs::write(
         dir.path().join("diagram.png"),
-        b"\x89PNG\r\n\x1a\nmock-image-body",
+        base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=")
+            .unwrap(),
     )
     .unwrap();
 
-    json_success(&dir, &["index", "--approve"], None);
+    json_success(&dir, &["index", "--yes"], None);
     let baseline_head = head(&dir);
     json_success(&dir, &["batch", "resume"], Some("mock"));
     let promoted_head = head(&dir);
@@ -388,7 +394,7 @@ fn ct4_bbox_006_ocr_from_scratch_promotes_scanned_pdf_and_image() {
 
     let charged = cost_ledger(&dir);
     json_success(&dir, &["batch", "resume"], Some("mock"));
-    json_success(&dir, &["index", "--approve"], Some("mock"));
+    json_success(&dir, &["index", "--yes"], Some("mock"));
     assert_eq!(head(&dir), promoted_head, "idle retries must not recommit");
     assert_eq!(cost_ledger(&dir), charged, "idle retries must not recharge");
     assert_eq!(
@@ -411,12 +417,19 @@ fn ct4_promotion_respects_bbox_disabled_profile_identity() {
     let mut config = fs::read_to_string(&config_path).unwrap();
     config.push_str("\n[markdownize]\nbbox_annotation = false\n");
     fs::write(config_path, config).unwrap();
+    // A grant binds the immutable processing profile, including bbox policy.
+    // Profile drift must be explicitly re-approved before the mock OCR send.
+    json_success(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+        Some("mock"),
+    );
     fs::write(
         dir.path().join("no-bbox.pdf"),
         fake_pdf(&["promotion without bbox"]),
     )
     .unwrap();
-    json_success(&dir, &["index", "--approve"], None);
+    json_success(&dir, &["index", "--yes"], None);
     let baseline_head = head(&dir);
 
     json_success(&dir, &["batch", "resume"], Some("mock"));
@@ -438,7 +451,7 @@ fn ct4_idempotent_mixed_profile_resume_uses_current_bbox_policy() {
     let dir = tempfile::tempdir().unwrap();
     init(&dir);
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["bbox true first"])).unwrap();
-    json_success(&dir, &["index", "--approve"], None);
+    json_success(&dir, &["index", "--yes"], None);
     json_success(&dir, &["batch", "resume"], Some("mock"));
     let tool_lock_path = dir.path().join(".kio/tool-lock.json");
     let true_policy_tool_lock = fs::read(&tool_lock_path).unwrap();
@@ -447,8 +460,13 @@ fn ct4_idempotent_mixed_profile_resume_uses_current_bbox_policy() {
     let mut config = fs::read_to_string(&config_path).unwrap();
     config.push_str("\n[markdownize]\nbbox_annotation = false\n");
     fs::write(&config_path, config).unwrap();
+    json_success(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+        Some("mock"),
+    );
     fs::write(dir.path().join("b.pdf"), fake_pdf(&["bbox false second"])).unwrap();
-    json_success(&dir, &["index", "--approve"], None);
+    json_success(&dir, &["index", "--yes"], None);
 
     // The config toggle also enqueues a false-policy replacement for a.pdf. Keep
     // that task non-live so this pass produces a deliberately mixed HEAD: the
@@ -473,7 +491,15 @@ fn ct4_idempotent_mixed_profile_resume_uses_current_bbox_policy() {
         .unwrap()
         .replace("bbox_annotation = false", "bbox_annotation = true");
     fs::write(&config_path, config).unwrap();
+    json_success(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+        Some("mock"),
+    );
 
+    // The false-policy replacement was explicitly terminalized above. Restoring
+    // the current policy must not revive a terminal task or manufacture a new
+    // promotion; it only selects the configured profile for this no-op resume.
     json_success(&dir, &["batch", "resume"], Some("mock"));
     assert_eq!(head(&dir), mixed_head, "idempotent resume must not commit");
     assert_eq!(
@@ -492,9 +518,18 @@ fn ct4_promotion_partial_and_stale_outputs_never_advance_head() {
         fake_pdf(&["promotion partial one", "promotion partial two"]),
     )
     .unwrap();
-    json_success(&partial, &["index", "--approve"], None);
+    json_success(&partial, &["index", "--yes"], None);
     let partial_head = head(&partial);
-    json_success(&partial, &["batch", "resume"], Some("partial"));
+    let output = kio(&partial, &["batch", "resume"], Some("partial"))
+        .assert()
+        .code(4)
+        .get_output()
+        .stdout
+        .clone();
+    let response: Value = serde_json::from_slice(&output).unwrap();
+    assert_eq!(response["tasks_attempted"], 1);
+    assert_eq!(response["tasks_executed"], 0);
+    assert_eq!(response["tasks_failed"], 1);
     assert_eq!(
         head(&partial),
         partial_head,
@@ -508,7 +543,7 @@ fn ct4_promotion_partial_and_stale_outputs_never_advance_head() {
         fake_pdf(&["promotion stale old"]),
     )
     .unwrap();
-    json_success(&stale, &["index", "--approve"], None);
+    json_success(&stale, &["index", "--yes"], None);
     let stale_head = head(&stale);
     fs::write(
         stale.path().join("stale.pdf"),
@@ -539,7 +574,7 @@ fn ct4_promotion_004_fault_before_head_preserves_old_live_tool_lock_and_retries_
         fake_pdf(&["promotion before head fault"]),
     )
     .unwrap();
-    json_success(&dir, &["index", "--approve"], None);
+    json_success(&dir, &["index", "--yes"], None);
     let baseline_head = head(&dir);
     let baseline_tool_lock = fs::read(dir.path().join(".kio/tool-lock.json")).unwrap();
 
@@ -561,8 +596,8 @@ fn ct4_promotion_004_fault_before_head_preserves_old_live_tool_lock_and_retries_
     assert_ne!(promoted_head, baseline_head);
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(
-        repo.read_commit(&promoted_head).unwrap().parents,
-        vec![baseline_head],
+        repo.read_commit(&promoted_head).unwrap().parent,
+        Some(baseline_head),
         "retry must publish exactly one promotion commit"
     );
     assert_live_tool_lock_matches_head(&dir);
@@ -583,7 +618,7 @@ fn ct4_promotion_004_after_head_and_after_index_swap_faults_converge() {
         fake_pdf(&["promotion after head fault"]),
     )
     .unwrap();
-    json_success(&after_head, &["index", "--approve"], None);
+    json_success(&after_head, &["index", "--yes"], None);
     let baseline_head = head(&after_head);
 
     faulted_batch(&after_head, "after_head");
@@ -635,7 +670,7 @@ fn ct4_promotion_004_after_head_and_after_index_swap_faults_converge() {
         fake_pdf(&["promotion after index swap fault"]),
     )
     .unwrap();
-    json_success(&after_swap, &["index", "--approve"], None);
+    json_success(&after_swap, &["index", "--yes"], None);
     let baseline_head = head(&after_swap);
 
     faulted_batch(&after_swap, "after_index_swap");

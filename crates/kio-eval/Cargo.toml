@@ -13,26 +13,40 @@ path = "src/lib.rs"
 name = "kio-eval"
 path = "src/main.rs"
 
+[[bin]]
+name = "kio-acceptance-tools"
+path = "src/acceptance_tools_main.rs"
+
 [dependencies]
 base64.workspace = true
 cap-primitives.workspace = true
 clap.workspace = true
 flate2.workspace = true
 getrandom.workspace = true
+kio-adapter = { path = "../kio-adapter" }
 kio-core.workspace = true
+kio-app.workspace = true
 kio-index.workspace = true
 kio-pipeline.workspace = true
+kio-process.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true
 sha2.workspace = true
+subtle = "=2.6.1"
 tar.workspace = true
 toml.workspace = true
 rusqlite.workspace = true
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 tempfile = "3"
 thiserror.workspace = true
 unicode-normalization.workspace = true
 ureq.workspace = true
+zip.workspace = true
+
+[dev-dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

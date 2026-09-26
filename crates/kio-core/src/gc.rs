@@ -21,15 +21,16 @@ use crate::cas::{
     MAX_COMMIT_OBJECT_BYTES, MAX_RAW_OBJECT_BYTES, MAX_TREE_OBJECT_BYTES, canonical_json_bytes,
     hash_bytes, is_hash,
 };
-use crate::dag::{CommitObject, CommitType, MAX_COMMIT_PARENTS, MAX_TREE_ENTRIES, TreeObject};
+use crate::dag::{CommitObject, CommitType, MAX_TREE_ENTRIES, TreeObject};
 use crate::error::{KioError, Result};
 use crate::schema::{SchemaKind, validate_json_schema};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
 use crate::scope::acquire_bound_reentrant_store_lock;
 use crate::scope::{
     BoundReentrantStoreLock, BoundStoreLock, KIO_FORMAT_VERSION, Repository,
-    acquire_bound_store_lock, enforce_config_semantics, format_utc_seconds, parse_utc_seconds,
+    acquire_bound_store_lock, enforce_scope_config_semantics, format_utc_seconds,
+    parse_utc_seconds, reject_pending_managed_restore,
 };
+use crate::store_dir::StoreDirectory;
 
 const MAX_METADATA: u64 = 1024 * 1024;
 const MAX_REF: u64 = 4096;
@@ -486,6 +487,15 @@ pub fn ensure_no_active_sweep(kio_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Retained-authority counterpart for repository and scheduler writers which
+/// already own the exact `.kio` directory and must not reopen its pathname.
+pub(crate) fn ensure_no_active_sweep_bound(kio: &std::fs::File) -> Result<()> {
+    if let Some(marker) = read_active_marker_bound(kio)? {
+        return Err(active_sweep_error(&marker));
+    }
+    Ok(())
+}
+
 fn active_sweep_error(marker: &GcInProgressMarker) -> KioError {
     KioError::new(
         "KIO-E-GC-SWEEP-ACTIVE-001",
@@ -807,6 +817,19 @@ pub enum GcReceiptPublication {
 }
 
 impl GcSweepSession {
+    /// Recheck the managed-restore exclusion using the retained `.kio`
+    /// capability.  Public mutation entry points call this after their caller
+    /// holds the bound writer lock, closing the bind-to-first-write race.
+    fn ensure_no_pending_managed_restore_under_lock(&self) -> Result<()> {
+        let directory = StoreDirectory::from_retained(
+            self.kio
+                .try_clone()
+                .map_err(|error| ioerr(error, &self.root))?,
+            self.root.join(".kio"),
+        )?;
+        reject_pending_managed_restore(&directory)
+    }
+
     pub fn bind(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         if !root.is_absolute() {
@@ -825,6 +848,11 @@ impl GcSweepSession {
         if id_file(&scope)? != id_path(&canonical)? || id_file(&kio)? != id_child(&scope, ".kio")? {
             return Err(corrupt("scope changed while binding GC sweep"));
         }
+        let kio_directory = StoreDirectory::from_retained(
+            kio.try_clone().map_err(|error| ioerr(error, &canonical))?,
+            canonical.join(".kio"),
+        )?;
+        reject_pending_managed_restore(&kio_directory)?;
         Ok(Self {
             root: canonical,
             scope,
@@ -912,30 +940,16 @@ impl GcSweepSession {
     /// closed through the underlying bound-lock primitive.
     pub fn acquire_snapshot_auto_store_lock(&self) -> Result<BoundReentrantStoreLock> {
         self.recheck_binding()?;
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-        {
-            return Err(snapshot_auto_platform_unsupported());
+        let lock = acquire_bound_reentrant_store_lock(&self.kio)?;
+        if let Err(error) = self.recheck_binding() {
+            drop(lock);
+            return Err(error);
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
-        {
-            let lock = acquire_bound_reentrant_store_lock(
-                &self.kio,
-                vec![self.root.join(".kio/.lock"), PathBuf::from("./.lock")],
-            )?;
-            if let Err(error) = self.recheck_binding() {
-                drop(lock);
-                return Err(error);
-            }
-            // `BoundStoreLock` is also used by GC itself and therefore cannot
-            // reject its own marker.  The scheduler is an ordinary writer: inspect
-            // the marker through the same retained `.kio` capability after owning
-            // the lock and before making nested `StoreLock` calls reentrant.
-            if let Some(marker) = read_active_marker_bound(&self.kio)? {
-                drop(lock);
-                return Err(active_sweep_error(&marker));
-            }
-            Ok(lock)
+        if let Err(error) = ensure_no_active_sweep_bound(&self.kio) {
+            drop(lock);
+            return Err(error);
         }
+        Ok(lock)
     }
     /// Read the validated complete GC authority subtree and retain a canonical
     /// semantic digest for the publication-to-GC handoff. Both reads are
@@ -1440,6 +1454,7 @@ impl GcSweepSession {
     }
     pub fn publish_marker(&self, marker: &GcInProgressMarker) -> Result<()> {
         self.recheck_binding()?;
+        self.ensure_no_pending_managed_restore_under_lock()?;
         let gc = ensure_child_dir(&self.kio, "gc")?;
         let internal = ensure_child_dir(&gc, "internal")?;
         let markers = ensure_child_dir(&internal, "markers")?;
@@ -1461,6 +1476,7 @@ impl GcSweepSession {
     }
     pub fn advance_marker(&self, marker: &GcInProgressMarker) -> Result<()> {
         self.recheck_binding()?;
+        self.ensure_no_pending_managed_restore_under_lock()?;
         let (current, observed) = self.read_marker_observed()?;
         if current.sweep_id != marker.sweep_id
             || phase_rank(&marker.phase) < phase_rank(&current.phase)
@@ -1524,6 +1540,7 @@ impl GcSweepSession {
         at: String,
     ) -> Result<GcReceiptPublication> {
         self.recheck_binding()?;
+        self.ensure_no_pending_managed_restore_under_lock()?;
         if !is_hash(&candidate.commit_hash) || !is_hash(&candidate.tree_hash) {
             return Err(corrupt("invalid GC candidate"));
         }
@@ -1603,6 +1620,7 @@ impl GcSweepSession {
         tree_hash: &str,
     ) -> Result<bool> {
         self.recheck_binding()?;
+        self.ensure_no_pending_managed_restore_under_lock()?;
         self.validate_tree_removal_permit(permit, marker)?;
         if marker.phase != GcSweepPhase::Sweeping
             || marker.index_pre_sweep.is_none()
@@ -1842,6 +1860,7 @@ impl GcSweepSession {
     }
     pub fn remove_marker(&self, expected: &GcInProgressMarker) -> Result<()> {
         self.recheck_binding()?;
+        self.ensure_no_pending_managed_restore_under_lock()?;
         let (current, observation) = self.read_marker_observed()?;
         if &current != expected {
             return Err(corrupt("GC marker changed before finalization"));
@@ -3232,7 +3251,7 @@ pub struct GcPolicy {
     pub keep_hourly_days: u32,
     pub keep_daily_weeks: u32,
     pub keep_weekly_months: u32,
-    pub keep_repaired_per_branch: u32,
+    pub keep_repaired: u32,
 }
 impl Default for GcPolicy {
     fn default() -> Self {
@@ -3241,7 +3260,7 @@ impl Default for GcPolicy {
             keep_hourly_days: 7,
             keep_daily_weeks: 4,
             keep_weekly_months: 6,
-            keep_repaired_per_branch: 5,
+            keep_repaired: 5,
         }
     }
 }
@@ -3487,7 +3506,6 @@ impl GcPlanner {
     fn require_layout(&self) -> Result<()> {
         for d in [
             "refs",
-            "refs/heads",
             "refs/tags-v1",
             "objects",
             "objects/commits",
@@ -3513,11 +3531,15 @@ impl GcPlanner {
             "HEAD",
         )?)
         .map_err(|_| corrupt("ref is not utf8"))?;
-        if !h.trim().is_empty() {
-            add_ref(&mut o, "HEAD".into(), h.trim(), s, &self.limits)?
+        if h == "unborn\n" {
+            // The only valid empty-history HEAD encoding.
+        } else if let Some(hash) = h.strip_suffix('\n') {
+            add_ref(&mut o, "HEAD".into(), hash, s, &self.limits)?
+        } else {
+            return Err(corrupt("HEAD is not newline-terminated"));
         }
         let refs = open_path(&self.kio, "refs")?;
-        for (dir, tag) in [("heads", false), ("tags-v1", true)] {
+        for (dir, tag) in [("tags-v1", true)] {
             let d = open_dir(&refs, dir)?;
             for n in names(&d, s, &self.limits, 2)? {
                 if tag && n == "names.jsonl" {
@@ -3546,9 +3568,7 @@ impl GcPlanner {
                 )?)
                 .map_err(|_| corrupt("ref is not utf8"))?;
                 if v.trim().is_empty() {
-                    if tag || n != "main" {
-                        return Err(corrupt("ref is empty"));
-                    }
+                    return Err(corrupt("ref is empty"));
                 } else {
                     add_ref(&mut o, format!("{dir}/{n}"), v.trim(), s, &self.limits)?;
                 }
@@ -3630,9 +3650,6 @@ impl GcPlanner {
                     }
                     let c: CommitObject =
                         serde_json::from_slice(&x).map_err(|_| corrupt("invalid commit object"))?;
-                    if c.parents.len() > MAX_COMMIT_PARENTS {
-                        return Err(corrupt("commit parent limit exceeded"));
-                    }
                     c.validate().map_err(|_| corrupt("invalid commit object"))?;
                     if o.insert(h, c).is_some() {
                         return Err(corrupt("duplicate commit"));
@@ -4016,11 +4033,7 @@ fn read_policy_bytes(bytes: &[u8]) -> Result<(GcPolicy, String)> {
                 num(retention, "keep_weekly_months", policy.keep_weekly_months)?;
         }
         if let Some(retention) = value.get("gc").and_then(|gc| gc.get("derived_retention")) {
-            policy.keep_repaired_per_branch = num(
-                retention,
-                "keep_repaired_per_branch",
-                policy.keep_repaired_per_branch,
-            )?;
+            policy.keep_repaired = num(retention, "keep_repaired", policy.keep_repaired)?;
         }
     }
     let hourly_hours = policy
@@ -4058,7 +4071,7 @@ fn parse_config_bytes(bytes: &[u8]) -> Result<Option<toml::Value>> {
     .map_err(|error| KioError::schema(error.to_string()))?;
     let json = serde_json::to_value(&value).map_err(|error| KioError::schema(error.to_string()))?;
     validate_json_schema(SchemaKind::Config, &json)?;
-    enforce_config_semantics(&json)?;
+    enforce_scope_config_semantics(&json)?;
     Ok(Some(value))
 }
 
@@ -4282,16 +4295,6 @@ pub(crate) fn validated_snapshot_auto_direct_entries(
         names.insert(name);
     }
     Ok(names)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn snapshot_auto_platform_unsupported() -> KioError {
-    KioError::new(
-        "KIO-E-SNAPSHOT-PLATFORM-UNSUPPORTED-001",
-        "scheduled snapshot mutation requires a verified descriptor-relative writer lock",
-        json!({}),
-        ExitCode::PermanentFailure,
-    )
 }
 
 fn open_bound_absolute(path: &Path) -> Result<std::fs::File> {
@@ -4612,7 +4615,10 @@ fn link_count(metadata: &cap_fs::Metadata) -> Result<u64> {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct Identity(u64, u64);
+struct Identity(
+    #[serde(serialize_with = "crate::identity_serde::u64_hex::serialize")] u64,
+    #[serde(serialize_with = "crate::identity_serde::u64_hex::serialize")] u64,
+);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct FileState {
@@ -4842,9 +4848,9 @@ fn num(t: &toml::Value, k: &str, d: u32) -> Result<u32> {
 fn validate_commit_links(commits: &HashMap<String, CommitObject>) -> Result<()> {
     if commits.values().any(|commit| {
         commit
-            .parents
-            .iter()
-            .any(|parent| !commits.contains_key(parent))
+            .parent
+            .as_ref()
+            .is_some_and(|parent| !commits.contains_key(parent))
     }) {
         Err(corrupt("commit parent is missing"))
     } else {
@@ -4891,7 +4897,7 @@ fn closure(
         if o.insert(h.clone())
             && let Some(c) = all.get(&h)
         {
-            q.extend(c.parents.iter().cloned())
+            q.extend(c.parent.iter().cloned())
         }
     }
     Ok(o)
@@ -5046,30 +5052,24 @@ fn retention_candidate_pairs(
             let commit = all
                 .get(&hash)
                 .ok_or_else(|| corrupt("ref or parent commit is missing"))?;
-            queue.extend(commit.parents.iter().cloned());
+            queue.extend(commit.parent.iter().cloned());
         }
     }
     for _ in all.keys().filter(|hash| !reachable.contains(*hash)) {
         inc(exclusions, "unreachable_commit");
     }
     let tips: HashSet<_> = refs.values().cloned().collect();
-    let branches: BTreeSet<_> = refs
-        .iter()
-        .filter(|(name, _)| name.starts_with("heads/"))
-        .map(|(_, hash)| hash.clone())
-        .collect();
+    let head_reachable = match refs.get("HEAD") {
+        Some(head) => closure(head, all, stats, limits)?,
+        None => HashSet::new(),
+    };
+    let keep = policy.keep_repaired as usize;
     let mut retained_repaired = HashSet::new();
-    let mut branch_reachable = HashSet::new();
-    for branch in &branches {
-        let branch_closure = closure(branch, all, stats, limits)?;
-        branch_reachable.extend(branch_closure.iter().cloned());
-        let keep = policy.keep_repaired_per_branch as usize;
-        if keep == 0 {
-            continue;
-        }
-        let mut repaired: Vec<_> = branch_closure
-            .into_iter()
-            .filter(|hash| all[hash].commit_type == CommitType::Repaired)
+    if keep > 0 {
+        let mut repaired: Vec<_> = head_reachable
+            .iter()
+            .filter(|hash| all[*hash].commit_type == CommitType::Repaired)
+            .cloned()
             .collect();
         if keep < repaired.len() {
             repaired.select_nth_unstable_by(keep, |left, right| {
@@ -5090,8 +5090,8 @@ fn retention_candidate_pairs(
             Some("protected_commit_type")
         } else if commit.commit_type == CommitType::Repaired && retained_repaired.contains(hash) {
             Some("retained_repaired")
-        } else if commit.commit_type == CommitType::Repaired && !branch_reachable.contains(hash) {
-            Some("repaired_without_branch")
+        } else if commit.commit_type == CommitType::Repaired && !head_reachable.contains(hash) {
+            Some("repaired_outside_head")
         } else {
             None
         };
@@ -5178,10 +5178,93 @@ mod tests {
     use crate::dag::CommitStats;
     use crate::scope::Repository;
 
+    #[test]
+    fn gc_identity_jcs_preserves_all_bits() {
+        for value in [(1_u64 << 53) + 1, 9_851_624_185_183_609, u64::MAX] {
+            let identity = Identity(value, value);
+            let bytes = serde_jcs::to_vec(&identity).unwrap();
+            let components: Vec<String> = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(components, vec![format!("{value:016x}"); 2]);
+            assert_eq!(
+                canonical_json_bytes(&serde_json::to_value(&identity).unwrap()).unwrap(),
+                bytes
+            );
+        }
+    }
+
+    #[test]
+    fn gc_identity_truth_and_receipt_digests_distinguish_adjacent_large_ids() {
+        fn digests(identity: Identity) -> [String; 3] {
+            let commit_hash = hash_bytes(b"commit");
+            let tree_hash = hash_bytes(b"tree");
+            let observation = FileObservation {
+                identity,
+                state: FileState {
+                    len: 1,
+                    modified_seconds: 0,
+                    modified_nanos: 0,
+                    changed_seconds: 0,
+                    changed_nanos: 0,
+                },
+                digest: hash_bytes(b"file"),
+            };
+            let observations = BTreeMap::from([
+                ("HEAD".into(), observation.clone()),
+                (format!("gc/shallowed/{}", &commit_hash[7..]), observation),
+            ]);
+            let receipts = HashMap::from([(commit_hash, tree_hash)]);
+            let policy = GcPolicy::default();
+            let refs = BTreeMap::new();
+            let commits = HashMap::new();
+            [
+                semantic_truth_digest(
+                    "scope",
+                    "config",
+                    &policy,
+                    &refs,
+                    &receipts,
+                    &commits,
+                    &HashMap::new(),
+                    &observations,
+                )
+                .unwrap(),
+                semantic_stable_truth_digest(
+                    "scope",
+                    "config",
+                    &policy,
+                    &refs,
+                    &commits,
+                    &observations,
+                )
+                .unwrap(),
+                receipt_observation_digest(&receipts, &observations).unwrap(),
+            ]
+        }
+
+        // Each pair collapses to the same IEEE-754 number if encoded numerically.
+        // The middle value is an observed NTFS file index (0x002300000004bd79).
+        for value in [(1_u64 << 53) + 1, 9_851_624_185_183_609, u64::MAX] {
+            for (left, right) in [
+                (Identity(value - 1, 42), Identity(value, 42)),
+                (Identity(42, value - 1), Identity(42, value)),
+            ] {
+                assert_ne!(left, right);
+                let before = digests(left);
+                let after = digests(right);
+                for (index, label) in ["truth", "stable truth", "receipt"].iter().enumerate() {
+                    assert_ne!(
+                        before[index], after[index],
+                        "{label} digest lost identity bits"
+                    );
+                }
+            }
+        }
+    }
+
     fn commit(created_at: &str) -> CommitObject {
         CommitObject::new(
             format!("sha256:{}", "a".repeat(64)),
-            vec![],
+            None,
             created_at.into(),
             "x".into(),
             format!("sha256:{}", "b".repeat(64)),
@@ -5231,6 +5314,15 @@ mod tests {
         ] {
             assert!(read_snapshot_auto_config_bytes(invalid).is_err());
         }
+    }
+
+    #[test]
+    fn gc_scope_config_rejects_device_local_ca_path() {
+        let error = parse_config_bytes(
+            b"[adapter.policy.offline_api]\nca_pem_path = \"/private/device-ca.pem\"\n",
+        )
+        .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-CONFIG-NOT-IMPLEMENTED-001");
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

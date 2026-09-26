@@ -129,29 +129,6 @@ fn success_in(dir: &TempDir, cwd: &std::path::Path, args: &[&str]) -> Value {
     serde_json::from_slice(&output).unwrap()
 }
 
-/// Child scopes require a retained-handle launcher. Windows intentionally has
-/// no pathname-based substitute, so an otherwise successful parent index is a
-/// result-on-stdout partial failure and every planned child is reported as an
-/// explicit fail-closed error.
-#[cfg(windows)]
-fn assert_windows_bound_children_unsupported(result: &Value, paths: &[&str]) {
-    assert_eq!(result["error_code"], "KIO-E-INDEX-PARTIAL-001");
-    let children = result["child_scopes"]
-        .as_array()
-        .expect("index partial result must retain child scope rows");
-    for path in paths {
-        let row = children
-            .iter()
-            .find(|row| row["path"] == *path)
-            .unwrap_or_else(|| panic!("missing discovered child row for {path}"));
-        assert_eq!(row["status"], "skipped_error", "{path}: {row}");
-        assert_eq!(
-            row["error_code"], "KIO-E-SCOPE-BOUND-UNSUPPORTED-001",
-            "{path}: {row}"
-        );
-    }
-}
-
 fn kio_dir(dir: &TempDir) -> std::path::PathBuf {
     dir.path().join(".kio")
 }
@@ -169,7 +146,7 @@ fn fixture() -> (TempDir, Value) {
     )
     .unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
     let search = success(&dir, &["search", "3600", "--mode", "text"]);
     let pointer = search["results"][0]["evidence_pointer"].clone();
     (dir, pointer)
@@ -187,7 +164,7 @@ fn bump_format_version(dir: &TempDir, version: &str) {
 /// Sufficient to make `ReadBarrierCheckpoint::open`'s journal-active check
 /// fire; the target raw_hash need not correspond to anything real.
 fn begin_active_purge_journal(dir: &TempDir) {
-    let purge = PurgeState::new(kio_dir(dir));
+    let purge = PurgeState::open(kio_dir(dir)).unwrap();
     purge
         .begin(
             vec![hash_bytes(b"qb4/qb12 placeholder purge target")],
@@ -211,7 +188,7 @@ fn begin_active_purge_journal(dir: &TempDir) {
 /// `KIO-E-INDEX-REBUILDING-001` (mirrors `step4b_p2b_contract.rs`'s
 /// `resync_index_metadata` doc comment, deliberately NOT calling it here).
 fn make_index_generation_stale(dir: &TempDir, raw_hash: &str) {
-    let purge = PurgeState::new(kio_dir(dir));
+    let purge = PurgeState::open(kio_dir(dir)).unwrap();
     let repo = Repository::open(dir.path()).unwrap();
     let commit_hash = repo.head_commit_hash().unwrap().unwrap();
     purge
@@ -268,7 +245,7 @@ fn make_registry_duplicate(dir_a: &TempDir, scope_id: &str) -> TempDir {
 // §A — K 領域: error code / exit code / preflight order (QB1-QB9)
 // ===========================================================================
 
-/// QB1: `open`/`view`/`restore` all classify a scope_unreachable dead
+/// QB1: `open`/`view`/`export` all classify a scope_unreachable dead
 /// pointer as retryable exit 3 (`KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001`), not
 /// the permanent exit 4 dead-pointer class — `scope_unreachable_error` is
 /// their one shared helper (main.rs), so all three callers are fixed by the
@@ -299,13 +276,13 @@ fn qb1_scope_unreachable_is_exit_3_across_open_view_restore() {
     let (code, err) = run(
         &dir,
         &[
-            "restore",
+            "export",
             &pointer_json,
             "--to",
             restore_to.to_str().unwrap(),
         ],
     );
-    assert_eq!(code, 3, "restore: {err}");
+    assert_eq!(code, 3, "export: {err}");
     assert_eq!(err["error_code"], "KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001");
 }
 
@@ -345,7 +322,7 @@ fn qb3a_non_multimodal_embedding_profile_rejected_exit_2() {
     let tool_lock_before = fs::read(&tool_lock_path).unwrap();
     let (code, error) = run_with_env(
         &dir,
-        &["index", "--approve"],
+        &["index"],
         TEST_ADOPTED_EMBEDDING_ENV,
         "non_multimodal",
     );
@@ -370,7 +347,12 @@ fn qb3b_fallback_reason_is_open_vocabulary_string() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("doc.md"), "# document\n").unwrap();
     success(&dir, &["init"]);
-    kio(&dir, &["index", "--approve"])
+    success(&dir, &["ledger", "init"]);
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
@@ -477,7 +459,7 @@ fn qb4b_qb4c_registry_duplicate_outranks_journal_and_index_generation_via_view()
     assert_eq!(err["error_code"], "KIO-E-REGISTRY-DUP-001");
 }
 
-/// QB5 [regression-lock]: `restore` already checks (0) `kio_format_version`
+/// QB5 [regression-lock]: `export` already checks (0) `kio_format_version`
 /// before (1) the purge read barrier (unlike the pre-QB6-fix `open`/`view`) —
 /// pin the currently-correct order so it cannot silently drift.
 #[test]
@@ -491,7 +473,7 @@ fn qb5_restore_checks_format_version_before_purge_journal() {
     let (code, err) = run(
         &dir,
         &[
-            "restore",
+            "export",
             &pointer_json,
             "--to",
             restore_to.to_str().unwrap(),
@@ -537,15 +519,8 @@ fn qb6_evidence_verify_agrees_with_diff_and_open() {
     assert_eq!(err["error_code"], "KIO-E-STORE-VERSION-001");
 }
 
-/// QB7 [regression-lock — the check already exists, just not where the task
-/// doc's "現状" survey looked]: a registry live duplicate fail-closes `kio
-/// index --approve`. Not via an up-front preflight call in `run_index`
-/// itself, but via `registry_duplicate_guard` (QA67,
-/// step4b-contract-tests-p3a.md §T) — called from every device-ledger
-/// charge-recording path (`record_free_local_charge` /
-/// `reserve_or_reuse_task_charge`) `run_index_pipeline` reaches for its
-/// first file, before any raw object or SQLite write. Exit 4 (registry-dup's
-/// documented default outside `kio evidence verify`), not exit 3.
+/// A duplicate scope identity blocks local indexing before grants, objects or
+/// projection publication. This preflight is independent of the paid ledger.
 #[test]
 fn qb7_index_approve_fail_closes_on_registry_duplicate() {
     let (dir_a, pointer) = fixture();
@@ -553,9 +528,37 @@ fn qb7_index_approve_fail_closes_on_registry_duplicate() {
     let _dir_b = make_registry_duplicate(&dir_a, &scope_id);
 
     fs::write(dir_a.path().join("more.md"), "# More\n\nMore content.\n").unwrap();
-    let (code, err) = run(&dir_a, &["index", "--offline", "--approve"]);
+    let before_head = fs::read(kio_dir(&dir_a).join("HEAD")).unwrap();
+    let before_scope = fs::read(kio_dir(&dir_a).join("scope.json")).unwrap();
+    let before_index = fs::read(kio_dir(&dir_a).join("index/sqlite.db")).unwrap();
+    let (code, err) = run(&dir_a, &["index", "--offline"]);
     assert_eq!(code, 4, "{err}");
     assert_eq!(err["error_code"], "KIO-E-REGISTRY-DUP-001");
+    assert_eq!(fs::read(kio_dir(&dir_a).join("HEAD")).unwrap(), before_head);
+    assert_eq!(
+        fs::read(kio_dir(&dir_a).join("scope.json")).unwrap(),
+        before_scope
+    );
+    assert_eq!(
+        fs::read(kio_dir(&dir_a).join("index/sqlite.db")).unwrap(),
+        before_index
+    );
+    assert!(
+        !dir_a
+            .path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
+    );
+    let store = kio_core::cas::ObjectStore::new(kio_dir(&dir_a));
+    assert!(
+        !store
+            .object_path(
+                kio_core::cas::ObjectKind::Raw,
+                &hash_bytes(b"# More\n\nMore content.\n")
+            )
+            .unwrap()
+            .exists()
+    );
 }
 
 /// QB8: an incompatible `kio_format_version` in `scope.json` is detected
@@ -596,7 +599,7 @@ fn qb9_new_version_store_write_command_rejects_with_zero_writes() {
     let sqlite_path = kio_dir(&dir).join("index/sqlite.db");
     let before_mtime = fs::metadata(&sqlite_path).unwrap().modified().unwrap();
 
-    let (code, err) = run(&dir, &["index", "--offline", "--approve"]);
+    let (code, err) = run(&dir, &["index", "--offline"]);
     assert_eq!(code, 8, "write side: {err}");
     assert_eq!(err["error_code"], "KIO-E-STORE-VERSION-001");
 
@@ -644,7 +647,7 @@ fn qb14a_index_registers_only_the_requested_root() {
         .assert()
         .success();
     success(&primary, &["init"]);
-    success(&primary, &["index", "--offline", "--approve"]);
+    success(&primary, &["index", "--offline"]);
 
     let entries = RegistryDb::open(registry_path(&primary))
         .unwrap()
@@ -689,7 +692,7 @@ fn qb14b_xdg_data_home_fallback_resolves_under_home() {
     );
 
     for args in [
-        &["index", "--offline", "--approve", "--json"][..],
+        &["index", "--offline", "--json"][..],
         &["search", "body", "--mode", "text", "--json"][..],
     ] {
         Command::cargo_bin("kio")
@@ -801,25 +804,9 @@ fn qb15_child_scopes_vcs_default_opt_in_and_preview() {
             .iter()
             .any(|row| row["path"] == "linked-child" && row["status"] == "skipped_symlink")
     );
-    #[cfg(not(windows))]
-    let indexed = success(&dir, &["index", "--offline", "--approve"]);
-    #[cfg(windows)]
-    let indexed = {
-        let (code, output) = run(&dir, &["index", "--offline", "--approve"]);
-        assert_eq!(code, 3, "{output}");
-        assert_windows_bound_children_unsupported(&output, &["ordinary", "ordinary/nested"]);
-        output
-    };
-    #[cfg(not(windows))]
+    let indexed = success(&dir, &["index", "--offline"]);
     assert!(dir.path().join("ordinary/.kio").is_dir());
-    #[cfg(not(windows))]
     assert!(dir.path().join("ordinary/nested/.kio").is_dir());
-    #[cfg(windows)]
-    assert!(
-        !dir.path().join("ordinary/.kio").exists()
-            && !dir.path().join("ordinary/nested/.kio").exists(),
-        "Windows must fail closed rather than initialize a child by pathname"
-    );
     assert!(!dir.path().join("git-dir/.kio").exists());
     assert!(!dir.path().join("git-file/.kio").exists());
     assert!(!dir.path().join("ignored/.kio").exists());
@@ -845,7 +832,6 @@ fn qb15_child_scopes_vcs_default_opt_in_and_preview() {
             .iter()
             .any(|row| row["path"] == "git-file" && row["status"] == "skipped_vcs")
     );
-    #[cfg(not(windows))]
     {
         let nested = success(&dir, &["search", "nested", "--mode", "text"]);
         assert!(
@@ -887,44 +873,15 @@ fn qb15_child_scopes_vcs_default_opt_in_and_preview() {
             "VCS opt-in preview must not initialize {path}"
         );
     }
-    #[cfg(not(windows))]
-    let opted_in = success(&dir, &["index", "--offline", "--approve"]);
-    #[cfg(windows)]
-    let opted_in = {
-        let (code, output) = run(&dir, &["index", "--offline", "--approve"]);
-        assert_eq!(code, 3, "{output}");
-        assert_windows_bound_children_unsupported(
-            &output,
-            &["ordinary", "ordinary/nested", "git-dir", "git-file/inner"],
-        );
-        output
-    };
-    #[cfg(not(windows))]
+    let opted_in = success(&dir, &["index", "--offline"]);
     assert!(dir.path().join("git-dir/.kio").is_dir());
-    #[cfg(not(windows))]
     assert!(dir.path().join("git-file/inner/.kio").is_dir());
-    #[cfg(windows)]
-    assert!(
-        !dir.path().join("ordinary/.kio").exists()
-            && !dir.path().join("ordinary/nested/.kio").exists()
-            && !dir.path().join("git-dir/.kio").exists()
-            && !dir.path().join("git-file/inner/.kio").exists(),
-        "VCS opt-in must not bypass the retained-handle requirement for any planned child"
-    );
     assert!(
         opted_in["child_scopes"]
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| {
-                row["path"] == "git-dir"
-                    && row["status"]
-                        == if cfg!(windows) {
-                            "skipped_error"
-                        } else {
-                            "indexed"
-                        }
-            })
+            .any(|row| { row["path"] == "git-dir" && row["status"] == "indexed" })
     );
     assert!(
         opted_in["child_scopes"]
@@ -934,18 +891,15 @@ fn qb15_child_scopes_vcs_default_opt_in_and_preview() {
             .any(|row| row["path"] == "ignored" && row["status"] == "skipped_ignored")
     );
     assert!(
-        !dir.path().join("git-file/.kio").exists(),
-        "a gitfile marker alone is not file-bearing"
+        dir.path().join("git-file/.kio").is_dir(),
+        "VCS opt-in enrolls empty directories as well as file-bearing descendants"
     );
 }
 
-/// Windows has no safe retained-handle child launcher. Automatic discovery
-/// therefore remains a typed partial failure, while an operator may explicitly
-/// initialize and index one chosen child scope. The two paths must never be
-/// conflated through a pathname fallback.
+/// Windows automatic and direct indexing use the same retained child authority.
 #[cfg(windows)]
 #[test]
-fn windows_child_scope_auto_is_fail_closed_but_explicit_manual_scope_indexes() {
+fn windows_child_scope_auto_and_manual_index_share_retained_authority() {
     let dir = tempfile::tempdir().unwrap();
     let child = dir.path().join("manual-child");
     fs::create_dir_all(&child).unwrap();
@@ -967,13 +921,15 @@ fn windows_child_scope_auto_is_fail_closed_but_explicit_manual_scope_indexes() {
         "preview must not mutate a planned child scope"
     );
 
-    let (code, partial) = run(&dir, &["index", "--approve", "--offline"]);
-    assert_eq!(code, 3, "{partial}");
-    assert_windows_bound_children_unsupported(&partial, &["manual-child"]);
+    let indexed = success(&dir, &["index", "--offline"]);
     assert!(
-        !child.join(".kio").exists(),
-        "automatic child handling must fail closed before creating .kio"
+        indexed["child_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["path"] == "manual-child" && row["status"] == "indexed")
     );
+    assert!(child.join(".kio").is_dir());
     let parent_status = success(&dir, &["status"]);
     assert!(parent_status.get("error_code").is_none(), "{parent_status}");
     let parent_root = dir.path().canonicalize().unwrap().display().to_string();
@@ -1008,14 +964,11 @@ fn windows_child_scope_auto_is_fail_closed_but_explicit_manual_scope_indexes() {
         "the parent must remain searchable after the child partial failure: {parent_search}"
     );
 
-    // This is the documented Windows path: an explicit path selected by the
-    // operator, followed by indexing from that child's own working directory.
-    success(&dir, &["init", "manual-child"]);
-    assert!(child.join(".kio").is_dir());
-    let first_index = success_in(&dir, &child, &["index", "--approve", "--offline"]);
-    assert_eq!(first_index["status"], "indexed", "{first_index}");
+    // Direct indexing reuses the exact child enrolled by root reconciliation.
+    let first_index = success_in(&dir, &child, &["index", "--offline"]);
+    assert_eq!(first_index["status"], "noop", "{first_index}");
     let head_before_noop = fs::read(child.join(".kio/HEAD")).unwrap();
-    let second_index = success_in(&dir, &child, &["index", "--approve", "--offline"]);
+    let second_index = success_in(&dir, &child, &["index", "--offline"]);
     assert_eq!(second_index["status"], "noop", "{second_index}");
     assert!(second_index["commit_hash"].is_null(), "{second_index}");
     assert_eq!(
@@ -1102,7 +1055,7 @@ fn windows_child_scope_junction_is_not_followed_or_mutated() {
         victim_bytes
     );
 
-    let indexed = success(&dir, &["index", "--approve", "--offline"]);
+    let indexed = success(&dir, &["index", "--offline"]);
     let indexed_junction = indexed["child_scopes"]
         .as_array()
         .unwrap()
@@ -1126,7 +1079,7 @@ fn windows_child_scope_junction_is_not_followed_or_mutated() {
 }
 
 #[test]
-fn qb15_parent_ignore_is_persisted_and_excludes_child_cas() {
+fn qb15_parent_ignore_remains_live_without_copying_policy_into_child_config() {
     let dir = tempfile::tempdir().unwrap();
     fs::create_dir_all(dir.path().join("project")).unwrap();
     fs::write(dir.path().join("project/private.md"), "private").unwrap();
@@ -1137,61 +1090,38 @@ fn qb15_parent_ignore_is_persisted_and_excludes_child_cas() {
         "[scope]\nignore = [\"project/private.md\"]\n",
     )
     .unwrap();
-
-    #[cfg(not(windows))]
-    success(&dir, &["index", "--offline", "--approve"]);
-    #[cfg(windows)]
-    {
-        let (code, output) = run(&dir, &["index", "--offline", "--approve"]);
-        assert_eq!(code, 3, "{output}");
-        assert_windows_bound_children_unsupported(&output, &["project"]);
-    }
+    success(&dir, &["index", "--offline"]);
     let child_kio = dir.path().join("project/.kio");
-    #[cfg(windows)]
-    {
-        assert!(
-            !child_kio.exists(),
-            "an unsupported child must not receive a pathname-based .kio store"
-        );
-        let status = success(&dir, &["status"]);
-        assert!(status["tasks"].as_array().unwrap().iter().all(|task| {
-            !task["input_path"]
-                .as_str()
-                .is_some_and(|path| path.starts_with("project/"))
-        }));
-        let parent_store = ObjectStore::new(&kio_dir(&dir));
-        assert!(
-            !parent_store
-                .object_path(ObjectKind::Raw, &hash_bytes(b"public"))
-                .unwrap()
-                .exists()
-        );
-        assert!(
-            !parent_store
-                .object_path(ObjectKind::Raw, &hash_bytes(b"private"))
-                .unwrap()
-                .exists()
-        );
-    }
-    #[cfg(not(windows))]
-    {
-        let child_config = fs::read_to_string(child_kio.join("config.toml")).unwrap();
-        assert!(child_config.contains("generated_parent_policy"));
-        assert!(child_config.contains("scope_prefix = \"project\""));
-        let store = ObjectStore::new(&child_kio);
-        assert!(
-            store
-                .object_path(ObjectKind::Raw, &hash_bytes(b"public"))
-                .unwrap()
-                .exists()
-        );
-        assert!(
-            !store
-                .object_path(ObjectKind::Raw, &hash_bytes(b"private"))
-                .unwrap()
-                .exists()
-        );
-    }
+    let child_config = fs::read_to_string(child_kio.join("config.toml")).unwrap();
+    assert!(!child_config.contains("generated_parent_policy"));
+    let record: Value =
+        serde_json::from_slice(&fs::read(child_kio.join("management.json")).unwrap()).unwrap();
+    assert_eq!(record["authority"]["kind"], "child");
+    let store = ObjectStore::new(&child_kio);
+    assert!(
+        store
+            .object_path(ObjectKind::Raw, &hash_bytes(b"public"))
+            .unwrap()
+            .exists()
+    );
+    assert!(
+        !store
+            .object_path(ObjectKind::Raw, &hash_bytes(b"private"))
+            .unwrap()
+            .exists()
+    );
+    // Current ancestor policy changes apply even without a parent index pass.
+    fs::write(
+        kio_dir(&dir).join("config.toml"),
+        "[scope]\nignore = [\"project/public.md\"]\n",
+    )
+    .unwrap();
+    let result = success(&dir, &["search", "public", "--mode", "text"]);
+    assert!(result["results"].as_array().unwrap().is_empty(), "{result}");
+    assert_eq!(
+        fs::read_to_string(child_kio.join("config.toml")).unwrap(),
+        child_config
+    );
 }
 
 /// QB19: a purge's device/scope scrub exclusions suppress only the matching
@@ -1238,27 +1168,21 @@ fn qb20_symlink_ingest_is_skipped() {
     fs::write(&target, "# Outside\n\nsymlink-only token\n").unwrap();
     std::os::unix::fs::symlink(&target, dir.path().join("linked.md")).unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     let search = success(&dir, &["search", "symlink-only", "--mode", "text"]);
     assert!(search["results"].as_array().unwrap().is_empty(), "{search}");
 }
 
-/// QB23: `kio index` and `kio open` both refuse a bare, argument-less
-/// invocation in a non-interactive environment with exit 2
-/// (`KIO-E-CONFIG-USAGE-001`) — the lowest-friction entry points require an
-/// explicit `--approve`/`--yes` or a pointer argument, matching the
-/// documented `kio index --approve` / `kio open <pointer>` entry gate.
+/// A registered management root is the local scan grant. Open still needs a pointer.
 #[test]
-fn qb23_index_and_open_reject_bare_invocation_exit_2() {
+fn qb23_registered_root_indexes_without_confirmation_and_open_requires_a_pointer() {
     let dir = tempfile::tempdir().unwrap();
-    kio(&dir, &["init"]).arg("--json").assert().success();
+    success(&dir, &["init"]);
     fs::write(dir.path().join("a.md"), "# A\n\nbody\n").unwrap();
-
-    let (code, err) = run(&dir, &["index"]);
-    assert_eq!(code, 2, "{err}");
-    assert_eq!(err["error_code"], "KIO-E-CONFIG-USAGE-001");
-
+    let indexed = success(&dir, &["index"]);
+    assert_eq!(indexed["status"], "indexed");
+    assert_eq!(indexed["network_allowed"], false);
     let (code, err) = run(&dir, &["open"]);
     assert_eq!(code, 2, "{err}");
     assert_eq!(err["error_code"], "KIO-E-CONFIG-USAGE-001");
@@ -1274,7 +1198,7 @@ fn qb23_index_and_open_reject_bare_invocation_exit_2() {
 fn qb31_chunk_fts_and_chunk_vec_schema_is_executable() {
     let dir = tempfile::tempdir().unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
     let conn = rusqlite::Connection::open(kio_dir(&dir).join("index/sqlite.db")).unwrap();
     let table_sql = |name: &str| {
         conn.query_row(
@@ -1300,7 +1224,7 @@ fn qb31_chunk_fts_and_chunk_vec_schema_is_executable() {
 fn qb37_non_current_tables_are_absent_from_runtime_schema() {
     let dir = tempfile::tempdir().unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
     let conn = rusqlite::Connection::open(kio_dir(&dir).join("index/sqlite.db")).unwrap();
     for table in ["files", "normalization_runs", "prepared_units", "commits"] {
         let exists: bool = conn
@@ -1328,7 +1252,7 @@ fn qb37_non_current_tables_are_absent_from_runtime_schema() {
         created_at: "2026-01-01T00:00:00Z".to_owned(),
         message: "purge".to_owned(),
         object_type: "commit".to_owned(),
-        parents: Vec::new(),
+        parent: None,
         stats: kio_core::dag::CommitStats {
             files_added: 0,
             files_modified: 0,
@@ -1337,6 +1261,7 @@ fn qb37_non_current_tables_are_absent_from_runtime_schema() {
         tool_lock_hash: hash.clone(),
         tree: hash,
         purged_raws: Vec::new(),
+        restore_provenance: None,
     };
     assert!(
         invalid_purged.validate().is_err(),
@@ -1354,7 +1279,7 @@ fn qb37_non_current_tables_are_absent_from_runtime_schema() {
 /// otherwise skip an unchanged tree).
 fn index_at(dir: &TempDir, fixed_now: &str, content: &str) -> String {
     fs::write(dir.path().join("a.md"), content).unwrap();
-    let output = kio(dir, &["index", "--offline", "--approve"])
+    let output = kio(dir, &["index", "--offline"])
         .env("KIO_FIXED_NOW", fixed_now)
         .arg("--json")
         .assert()
@@ -1404,7 +1329,7 @@ fn qb50_at_moves_the_walk_origin_and_excludes_descendants() {
 /// QB51(a) [recommended interpretation]: a `--at` target whose commit object
 /// is present but tree is discarded (genuinely shallow) still resolves —
 /// `log` only walks the commit-object parent chain, never a tree, so tree
-/// discard is irrelevant to it (unlike `restore`/`search --at`).
+/// discard is irrelevant to it (unlike `export`/`search --at`).
 #[test]
 fn qb51_at_shallow_commit_tree_discarded_still_resolves() {
     let (dir, [c1, c2, _c3]) = three_commit_history();
@@ -1548,7 +1473,7 @@ fn qb57_json_shape_is_unchanged_by_at_and_since() {
 /// QB58 [verified against the real precedent it cites, superseding the task
 /// doc's original exit-2 guess]: `--at` with a well-formed-but-unresolvable
 /// commit hash reuses `Repository::resolve_commit` — the SAME function
-/// `diff`/`tag`/`restore` already use for their own commit operands — so it
+/// `diff`/`tag`/`export` already use for their own commit operands — so it
 /// gets the IDENTICAL classification those commands already give an unknown
 /// hash: `KIO-E-COMMIT-SHALLOW-001` (a hash that resolves to no commit
 /// object folds into "shallow" there, R17-5), not a bespoke
@@ -1597,7 +1522,7 @@ fn qb61_lifecycle_retire_advances_both_index_generation_and_last_lifecycle_epoch
     let raw_hash = hash_bytes(bytes);
     fs::write(dir.path().join("doc.md"), bytes).unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
     let (generation_before, epoch_before) = index_metadata_row(&dir);
 
     fs::remove_file(dir.path().join("doc.md")).unwrap();
@@ -1613,7 +1538,7 @@ fn qb61_lifecycle_retire_advances_both_index_generation_and_last_lifecycle_epoch
         ],
     );
     fs::write(dir.path().join("doc.md"), bytes.as_slice()).unwrap();
-    let index_output = success(&dir, &["index", "--offline", "--approve"]);
+    let index_output = success(&dir, &["index", "--offline"]);
     assert!(index_output.get("error_code").is_none(), "{index_output}");
 
     let (generation_after, epoch_after) = index_metadata_row(&dir);

@@ -1,0 +1,86 @@
+# The same service as compose.yaml + compose.override.yaml + .env, with the two
+# images pinned by digest and every variable resolved. Self-contained: run it as
+#
+#   docker compose -f compose.pinned.yaml up
+#
+# with backend-config.yaml sitting next to it.
+#
+# Why this file exists
+# --------------------
+# compose.yaml names both images by the TAG `latest-nvidia-gpu-offline`. A tag
+# moves. Everything measured in rounds 1-5 -- the weights digest the code pins,
+# the determinism result, every capture in
+# crates/kio-adapter/tests/fixtures/layout-parsing/ -- was produced by two
+# specific images, and a `docker compose pull` on any later day can silently
+# fetch different ones under the same tag. Preserving a compose file that says
+# `latest` preserves the recipe but not the ingredients.
+#
+# The digests below were read on 2026-08-09 from the containers that had been
+# running since round 4 (`docker image inspect --format {{.RepoDigests}}`), and
+# they match what this repo has recorded since 2026-08-03. The full inspect
+# output is in ../paddleocr-pipeline-inspect.json and ../paddleocr-vllm-inspect.json.
+#
+# What is NOT pinned here
+# -----------------------
+# The model weights. They are baked into the VLM image, so pinning the image
+# pins them transitively -- but the sha256 that actually matters is asserted in
+# code (LOCAL_OCR_MODEL_VERSION_PIN in kio-adapter), measured at
+#   sha256:85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db
+# for /home/paddleocr/.paddlex/official_models/PaddleOCR-VL-1.6/model.safetensors
+# (1,917,255,968 B, single file, no shards). Check it after any image change:
+#   docker compose -f compose.pinned.yaml exec paddleocr-vlm-server \
+#     sha256sum /home/paddleocr/.paddlex/official_models/PaddleOCR-VL-1.6/model.safetensors
+services:
+  paddleocr-vl-api:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-vl@sha256:6c735bdf9e758ffdd58ccc067db0c2d84e37e5e6a2cbd47156069d4d7ea5d709
+    container_name: paddleocr-vl-api
+    ports:
+      - 8080:8080
+    depends_on:
+      paddleocr-vlm-server:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    # 8g, not the stock 64g: Docker Desktop's WSL2 VM cannot back a 64 GB tmpfs
+    # and this pipeline does not need it.
+    shm_size: 8g
+    user: root
+    restart: unless-stopped
+    environment:
+      - VLM_BACKEND=vllm
+    command: /bin/bash -c "paddlex --serve --pipeline /home/paddleocr/pipeline_config_vllm.yaml"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+
+  paddleocr-vlm-server:
+    image: ccr-2vdh3abv-pub.cnc.bj.baidubce.com/paddlepaddle/paddleocr-genai-vllm-server@sha256:d0d32c04a2119613d25a0a4c292e165ccc107954b74580613cf59e378037f8f5
+    container_name: paddleocr-vlm-server
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    shm_size: 8g
+    user: root
+    restart: unless-stopped
+    # Without this mount the shipped vLLM defaults leave a negative KV cache on a
+    # 12 GB card and the engine refuses to start. Every capture in this repo was
+    # taken with it, so it is part of the reproduction, not a local convenience.
+    volumes:
+      - ./backend-config.yaml:/cfg/backend-config.yaml:ro
+    command: >
+      /bin/bash -c "paddleocr genai_server
+      --model_name PaddleOCR-VL-1.6-0.9B
+      --host 0.0.0.0 --port 8080
+      --backend vllm
+      --backend_config /cfg/backend-config.yaml"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8080/health || exit 1"]
+      start_period: 300s

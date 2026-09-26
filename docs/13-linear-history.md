@@ -1,10 +1,11 @@
 # 13 Linear History and Restore — design direction
 
-本書の線形履歴・復元の設計方針は 2026-09-07 に承認済みである。新しい CLI、schema、transaction はまだ実装されていない。
-詳細を固定する工程と CLI 復元の v1 先行実装案は [v1-implementation-plan.md](../tasks/v1-implementation-plan.md) を参照する。
-現行 RC.3 は通常一つの親を持つ commit を生成するが、保存形式は最大 64 parents の DAG と複数 refs を許す。
-実装根拠: `crates/kio-core/src/dag.rs:14,251-379`、`history.rs:414-456`、`scope.rs:4389-4411`。
-線形であることを通常の writer の振る舞いだけに依存させず、形式・読込・公開で強制することを提案する。
+本書の線形履歴・復元の設計方針は 2026-09-07 に承認済みである。
+現在の実装は format `1.0.0`、必須の単一 `parent`、唯一の可変参照 `HEAD`、条件付き公開 journal へ移行している。
+旧 `parents` 配列と旧 format を暗黙に移行しない。CLI の管理対象への `restore` と別出力先への `export` の分離、
+作業ファイルを含む復元 transaction は未実装であり、線形保存形式の実装と区別する。
+実装・試験の状況は [進捗記録](../tasks/v1-implementation-progress.md)、受入条件は
+[v1 実装計画](../tasks/v1-implementation-plan.md) を参照する。
 
 ## 1. 過去の状態を新しい commit として採用する
 
@@ -61,7 +62,9 @@ kio restore --from <commit> --path report.pdf --expect-head <current-commit> --y
 - 可変の current HEAD を一つの正本にする。`HEAD` と `refs/heads/main` の二重書き込みを廃止する。
   現行 `scope.rs:2380` は二つの atomic rename 間の crash 不整合を明記している。
 - branch は導入しない。保持する tag は一本の chain 上の commit を指す不変の名前とし、
-  切断した別履歴を新しい公開 root として認めない。
+  切断した別履歴を新しい公開 root として認めない。タグ作成・取り込んだタグの読取・台帳由来の
+  rebuild root は、現在の HEAD から parent を逆にたどって到達できることを検証する。
+  未公開の子 commit と unborn HEAD に残ったタグも拒否し、タグから HEAD を推測して復旧しない。
 - 復元 commit は `type=restored` 相当の typed metadata を持ち、復元元 commit/tree、選択方式、
   正規化したパス集合の digest、現在の親を immutable に結び付ける。復元元は同 scope の過去に限定する。
 - 「親としてたどる辺」と「監査のための参照」を区別する。復元元への参照を無期限の GC pin とすると

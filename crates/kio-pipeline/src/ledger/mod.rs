@@ -9,14 +9,20 @@
 //!   outcome validation, crash recovery, sync degenerate 2-phase, the
 //!   query-embedding device row, budget cap check-then-reserve, and abandon.
 
+pub mod backup;
+pub(crate) mod lifecycle;
+pub(crate) mod lifecycle_fs;
 pub mod model;
 pub mod ops;
+pub(crate) mod ops_sql;
 pub mod schema;
 pub mod snapshot;
 #[cfg(windows)]
 pub(crate) mod snapshot_windows_security;
 pub mod time;
 
+pub use backup::{LedgerBackup, RestoreReadiness};
+pub use lifecycle::{LedgerDb, PendingWriteRecovery};
 pub use model::{BatchRequestRow, BatchState, CostLedgerRow, Outcome, RequestKind, TaskKey};
-pub use schema::{LedgerDb, default_ledger_path};
+pub use schema::default_ledger_path;
 pub use snapshot::{LedgerReadSnapshot, LedgerSnapshotError};

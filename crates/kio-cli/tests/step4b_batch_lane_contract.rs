@@ -78,6 +78,7 @@ fn json_success(dir: &TempDir, args: &[&str]) -> Value {
 
 fn init(dir: &TempDir) {
     kio(dir, &["init"]).assert().success();
+    kio(dir, &["ledger", "init"]).assert().success();
 }
 
 /// A `%PDF` header followed by high-bit binary noise and no text layer (no
@@ -204,9 +205,12 @@ fn setup_scanned_scope(dir: &TempDir) -> String {
         "[markdownize]\nbbox_annotation = false\n",
     )
     .unwrap();
-    kio(dir, &["index", "--approve"])
+    kio(dir, &["index", "--yes"])
         .env("KIO_TEST_MISTRAL_OCR", "mock")
         .arg("--json")
+        .assert()
+        .success();
+    kio(dir, &["adapter", "approve", "--all", "--yes"])
         .assert()
         .success();
     let status = json_success(dir, &["status"]);
@@ -229,6 +233,8 @@ fn run_with_batch_script(
     args: &[&str],
     expected_code: i32,
 ) -> Value {
+    let mut script = script.clone();
+    script["attribution_path"] = json!(dir.path().join("mistral-provider-jobs.json"));
     let assert = kio(dir, args)
         .env("KIO_TEST_MISTRAL_OCR", "mock")
         .env("KIO_TEST_MISTRAL_BATCH", script.to_string())
@@ -467,6 +473,7 @@ fn b3_create_job_crash_window_reconcile_found_then_resume_collects() {
         "status_sequence": ["SUCCESS"],
         "state_path": state.display().to_string(),
         "capture_path": capture.display().to_string(),
+        "job_metadata": listing_metadata,
         "jobs_listing": [{
             "job_id": "batch-mock-job-1",
             "status": "QUEUED",

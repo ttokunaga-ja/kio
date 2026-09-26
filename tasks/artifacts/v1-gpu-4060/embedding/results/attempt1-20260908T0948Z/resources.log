@@ -1,0 +1,1014 @@
+=== before_pull 2026-09-08T09:40:30Z ===
+mem_total=16644722688 mem_used=1251500032 mem_available=15393222656
+swap_total=4294967296 swap_used=167936 swap_free=4294799360
+wsl_disk_total=1081101176832 wsl_disk_used=3418263552 wsl_disk_available=1022690557952
+windows_c_disk_total=999098937344 windows_c_disk_used=439300304896 windows_c_disk_available=559798632448
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== before_up 2026-09-08T09:46:11Z ===
+mem_total=16644722688 mem_used=1231474688 mem_available=15413248000
+swap_total=4294967296 swap_used=4648960 swap_free=4290318336
+wsl_disk_total=1081101176832 wsl_disk_used=3418939392 wsl_disk_available=1022689882112
+windows_c_disk_total=999098937344 windows_c_disk_used=467652546560 windows_c_disk_available=531446390784
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:11Z ===
+mem_total=16644722688 mem_used=1247191040 mem_available=15397531648
+swap_total=4294967296 swap_used=4648960 swap_free=4290318336
+wsl_disk_total=1081101176832 wsl_disk_used=3418939392 wsl_disk_available=1022689882112
+windows_c_disk_total=999098937344 windows_c_disk_used=467652546560 windows_c_disk_available=531446390784
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:12Z ===
+mem_total=16644722688 mem_used=1516802048 mem_available=15127920640
+swap_total=4294967296 swap_used=4648960 swap_free=4290318336
+wsl_disk_total=1081101176832 wsl_disk_used=3418980352 wsl_disk_available=1022689841152
+windows_c_disk_total=999098937344 windows_c_disk_used=467652620288 windows_c_disk_available=531446317056
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:13Z ===
+mem_total=16644722688 mem_used=1596678144 mem_available=15048044544
+swap_total=4294967296 swap_used=4648960 swap_free=4290318336
+wsl_disk_total=1081101176832 wsl_disk_used=3418980352 wsl_disk_available=1022689841152
+windows_c_disk_total=999098937344 windows_c_disk_used=467652620288 windows_c_disk_available=531446317056
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:14Z ===
+mem_total=16644722688 mem_used=1667039232 mem_available=14977683456
+swap_total=4294967296 swap_used=4648960 swap_free=4290318336
+wsl_disk_total=1081101176832 wsl_disk_used=3418980352 wsl_disk_available=1022689841152
+windows_c_disk_total=999098937344 windows_c_disk_used=467652620288 windows_c_disk_available=531446317056
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:15Z ===
+mem_total=16644722688 mem_used=1712734208 mem_available=14931988480
+swap_total=4294967296 swap_used=4648960 swap_free=4290318336
+wsl_disk_total=1081101176832 wsl_disk_used=3418980352 wsl_disk_available=1022689841152
+windows_c_disk_total=999098937344 windows_c_disk_used=467652620288 windows_c_disk_available=531446317056
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:17Z ===
+mem_total=16644722688 mem_used=1759199232 mem_available=14885523456
+swap_total=4294967296 swap_used=4648960 swap_free=4290318336
+wsl_disk_total=1081101176832 wsl_disk_used=3418980352 wsl_disk_available=1022689841152
+windows_c_disk_total=999098937344 windows_c_disk_used=467652620288 windows_c_disk_available=531446317056
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:18Z ===
+mem_total=16644722688 mem_used=1788948480 mem_available=14855774208
+swap_total=4294967296 swap_used=4648960 swap_free=4290318336
+wsl_disk_total=1081101176832 wsl_disk_used=3418984448 wsl_disk_available=1022689837056
+windows_c_disk_total=999098937344 windows_c_disk_used=467652685824 windows_c_disk_available=531446251520
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:19Z ===
+mem_total=16644722688 mem_used=1781972992 mem_available=14862749696
+swap_total=4294967296 swap_used=4648960 swap_free=4290318336
+wsl_disk_total=1081101176832 wsl_disk_used=3418988544 wsl_disk_available=1022689832960
+windows_c_disk_total=999098937344 windows_c_disk_used=467686240256 windows_c_disk_available=531412697088
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:20Z ===
+mem_total=16644722688 mem_used=1770242048 mem_available=14874480640
+swap_total=4294967296 swap_used=4648960 swap_free=4290318336
+wsl_disk_total=1081101176832 wsl_disk_used=3418988544 wsl_disk_available=1022689832960
+windows_c_disk_total=999098937344 windows_c_disk_used=467686240256 windows_c_disk_available=531412697088
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:21Z ===
+mem_total=16644722688 mem_used=1787797504 mem_available=14856925184
+swap_total=4294967296 swap_used=4698112 swap_free=4290269184
+wsl_disk_total=1081101176832 wsl_disk_used=3418988544 wsl_disk_available=1022689832960
+windows_c_disk_total=999098937344 windows_c_disk_used=467686240256 windows_c_disk_available=531412697088
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:22Z ===
+mem_total=16644722688 mem_used=1801367552 mem_available=14843355136
+swap_total=4294967296 swap_used=4698112 swap_free=4290269184
+wsl_disk_total=1081101176832 wsl_disk_used=3418992640 wsl_disk_available=1022689828864
+windows_c_disk_total=999098937344 windows_c_disk_used=467686240256 windows_c_disk_available=531412697088
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:23Z ===
+mem_total=16644722688 mem_used=1814159360 mem_available=14830563328
+swap_total=4294967296 swap_used=4747264 swap_free=4290220032
+wsl_disk_total=1081101176832 wsl_disk_used=3418996736 wsl_disk_available=1022689824768
+windows_c_disk_total=999098937344 windows_c_disk_used=467686240256 windows_c_disk_available=531412697088
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:24Z ===
+mem_total=16644722688 mem_used=1855725568 mem_available=14788997120
+swap_total=4294967296 swap_used=4747264 swap_free=4290220032
+wsl_disk_total=1081101176832 wsl_disk_used=3418996736 wsl_disk_available=1022689824768
+windows_c_disk_total=999098937344 windows_c_disk_used=467686240256 windows_c_disk_available=531412697088
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:25Z ===
+mem_total=16644722688 mem_used=1874780160 mem_available=14769942528
+swap_total=4294967296 swap_used=4747264 swap_free=4290220032
+wsl_disk_total=1081101176832 wsl_disk_used=3418996736 wsl_disk_available=1022689824768
+windows_c_disk_total=999098937344 windows_c_disk_used=467686240256 windows_c_disk_available=531412697088
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:26Z ===
+mem_total=16644722688 mem_used=1869537280 mem_available=14775185408
+swap_total=4294967296 swap_used=4747264 swap_free=4290220032
+wsl_disk_total=1081101176832 wsl_disk_used=3419045888 wsl_disk_available=1022689775616
+windows_c_disk_total=999098937344 windows_c_disk_used=467686240256 windows_c_disk_available=531412697088
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:27Z ===
+mem_total=16644722688 mem_used=2143309824 mem_available=14501412864
+swap_total=4294967296 swap_used=4964352 swap_free=4290002944
+wsl_disk_total=1081101176832 wsl_disk_used=3419049984 wsl_disk_available=1022689771520
+windows_c_disk_total=999098937344 windows_c_disk_used=467686240256 windows_c_disk_available=531412697088
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:28Z ===
+mem_total=16644722688 mem_used=2292928512 mem_available=14351794176
+swap_total=4294967296 swap_used=4964352 swap_free=4290002944
+wsl_disk_total=1081101176832 wsl_disk_used=3419058176 wsl_disk_available=1022689763328
+windows_c_disk_total=999098937344 windows_c_disk_used=467686371328 windows_c_disk_available=531412566016
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:29Z ===
+mem_total=16644722688 mem_used=2335055872 mem_available=14309666816
+swap_total=4294967296 swap_used=4964352 swap_free=4290002944
+wsl_disk_total=1081101176832 wsl_disk_used=3419058176 wsl_disk_available=1022689763328
+windows_c_disk_total=999098937344 windows_c_disk_used=467686473728 windows_c_disk_available=531412463616
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:30Z ===
+mem_total=16644722688 mem_used=2412847104 mem_available=14231875584
+swap_total=4294967296 swap_used=4964352 swap_free=4290002944
+wsl_disk_total=1081101176832 wsl_disk_used=3419058176 wsl_disk_available=1022689763328
+windows_c_disk_total=999098937344 windows_c_disk_used=467686473728 windows_c_disk_available=531412463616
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:31Z ===
+mem_total=16644722688 mem_used=2461380608 mem_available=14183342080
+swap_total=4294967296 swap_used=5029888 swap_free=4289937408
+wsl_disk_total=1081101176832 wsl_disk_used=3419062272 wsl_disk_available=1022689759232
+windows_c_disk_total=999098937344 windows_c_disk_used=467686473728 windows_c_disk_available=531412463616
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:32Z ===
+mem_total=16644722688 mem_used=2554089472 mem_available=14090633216
+swap_total=4294967296 swap_used=5373952 swap_free=4289593344
+wsl_disk_total=1081101176832 wsl_disk_used=3419062272 wsl_disk_available=1022689759232
+windows_c_disk_total=999098937344 windows_c_disk_used=467686473728 windows_c_disk_available=531412463616
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:33Z ===
+mem_total=16644722688 mem_used=2552741888 mem_available=14091980800
+swap_total=4294967296 swap_used=5373952 swap_free=4289593344
+wsl_disk_total=1081101176832 wsl_disk_used=3419066368 wsl_disk_available=1022689755136
+windows_c_disk_total=999098937344 windows_c_disk_used=467686473728 windows_c_disk_available=531412463616
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:34Z ===
+mem_total=16644722688 mem_used=2570158080 mem_available=14074564608
+swap_total=4294967296 swap_used=5373952 swap_free=4289593344
+wsl_disk_total=1081101176832 wsl_disk_used=3419066368 wsl_disk_available=1022689755136
+windows_c_disk_total=999098937344 windows_c_disk_used=467686473728 windows_c_disk_available=531412463616
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:35Z ===
+mem_total=16644722688 mem_used=2563186688 mem_available=14081536000
+swap_total=4294967296 swap_used=5373952 swap_free=4289593344
+wsl_disk_total=1081101176832 wsl_disk_used=3419066368 wsl_disk_available=1022689755136
+windows_c_disk_total=999098937344 windows_c_disk_used=467686473728 windows_c_disk_available=531412463616
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:36Z ===
+mem_total=16644722688 mem_used=1913573376 mem_available=14731149312
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3419066368 wsl_disk_available=1022689755136
+windows_c_disk_total=999098937344 windows_c_disk_used=467686473728 windows_c_disk_available=531412463616
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:37Z ===
+mem_total=16644722688 mem_used=2034040832 mem_available=14610681856
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3419086848 wsl_disk_available=1022689734656
+windows_c_disk_total=999098937344 windows_c_disk_used=467686539264 windows_c_disk_available=531412398080
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:38Z ===
+mem_total=16644722688 mem_used=2011774976 mem_available=14632947712
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3423539200 wsl_disk_available=1022685282304
+windows_c_disk_total=999098937344 windows_c_disk_used=467686539264 windows_c_disk_available=531412398080
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:39Z ===
+mem_total=16644722688 mem_used=2049839104 mem_available=14594883584
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3423592448 wsl_disk_available=1022685229056
+windows_c_disk_total=999098937344 windows_c_disk_used=467686539264 windows_c_disk_available=531412398080
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:40Z ===
+mem_total=16644722688 mem_used=2055094272 mem_available=14589628416
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3423600640 wsl_disk_available=1022685220864
+windows_c_disk_total=999098937344 windows_c_disk_used=467686539264 windows_c_disk_available=531412398080
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:41Z ===
+mem_total=16644722688 mem_used=2143047680 mem_available=14501675008
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3435044864 wsl_disk_available=1022673776640
+windows_c_disk_total=999098937344 windows_c_disk_used=467686539264 windows_c_disk_available=531412398080
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:42Z ===
+mem_total=16644722688 mem_used=2268438528 mem_available=14376284160
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3435048960 wsl_disk_available=1022673772544
+windows_c_disk_total=999098937344 windows_c_disk_used=467686604800 windows_c_disk_available=531412332544
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:44Z ===
+mem_total=16644722688 mem_used=2493829120 mem_available=14150893568
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3435048960 wsl_disk_available=1022673772544
+windows_c_disk_total=999098937344 windows_c_disk_used=467686604800 windows_c_disk_available=531412332544
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:45Z ===
+mem_total=16644722688 mem_used=2482167808 mem_available=14162554880
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3435048960 wsl_disk_available=1022673772544
+windows_c_disk_total=999098937344 windows_c_disk_used=467686604800 windows_c_disk_available=531412332544
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:46Z ===
+mem_total=16644722688 mem_used=2555908096 mem_available=14088814592
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3435053056 wsl_disk_available=1022673768448
+windows_c_disk_total=999098937344 windows_c_disk_used=467686604800 windows_c_disk_available=531412332544
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:47Z ===
+mem_total=16644722688 mem_used=2597761024 mem_available=14046961664
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3435057152 wsl_disk_available=1022673764352
+windows_c_disk_total=999098937344 windows_c_disk_used=467686604800 windows_c_disk_available=531412332544
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:48Z ===
+mem_total=16644722688 mem_used=2610290688 mem_available=14034432000
+swap_total=4294967296 swap_used=5509120 swap_free=4289458176
+wsl_disk_total=1081101176832 wsl_disk_used=3435061248 wsl_disk_available=1022673760256
+windows_c_disk_total=999098937344 windows_c_disk_used=467686604800 windows_c_disk_available=531412332544
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:49Z ===
+mem_total=16644722688 mem_used=2644586496 mem_available=14000136192
+swap_total=4294967296 swap_used=5693440 swap_free=4289273856
+wsl_disk_total=1081101176832 wsl_disk_used=3435065344 wsl_disk_available=1022673756160
+windows_c_disk_total=999098937344 windows_c_disk_used=467686604800 windows_c_disk_available=531412332544
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:50Z ===
+mem_total=16644722688 mem_used=2694881280 mem_available=13949841408
+swap_total=4294967296 swap_used=5693440 swap_free=4289273856
+wsl_disk_total=1081101176832 wsl_disk_used=3435065344 wsl_disk_available=1022673756160
+windows_c_disk_total=999098937344 windows_c_disk_used=467686604800 windows_c_disk_available=531412332544
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:51Z ===
+mem_total=16644722688 mem_used=2824699904 mem_available=13820022784
+swap_total=4294967296 swap_used=5705728 swap_free=4289261568
+wsl_disk_total=1081101176832 wsl_disk_used=3435065344 wsl_disk_available=1022673756160
+windows_c_disk_total=999098937344 windows_c_disk_used=467686563840 windows_c_disk_available=531412373504
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:52Z ===
+mem_total=16644722688 mem_used=2997190656 mem_available=13647532032
+swap_total=4294967296 swap_used=5853184 swap_free=4289114112
+wsl_disk_total=1081101176832 wsl_disk_used=3435065344 wsl_disk_available=1022673756160
+windows_c_disk_total=999098937344 windows_c_disk_used=467686563840 windows_c_disk_available=531412373504
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:53Z ===
+mem_total=16644722688 mem_used=3088986112 mem_available=13555736576
+swap_total=4294967296 swap_used=5853184 swap_free=4289114112
+wsl_disk_total=1081101176832 wsl_disk_used=3435073536 wsl_disk_available=1022673747968
+windows_c_disk_total=999098937344 windows_c_disk_used=467686563840 windows_c_disk_available=531412373504
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:54Z ===
+mem_total=16644722688 mem_used=3139297280 mem_available=13505425408
+swap_total=4294967296 swap_used=5853184 swap_free=4289114112
+wsl_disk_total=1081101176832 wsl_disk_used=3435073536 wsl_disk_available=1022673747968
+windows_c_disk_total=999098937344 windows_c_disk_used=467686563840 windows_c_disk_available=531412373504
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:55Z ===
+mem_total=16644722688 mem_used=3178504192 mem_available=13466218496
+swap_total=4294967296 swap_used=5853184 swap_free=4289114112
+wsl_disk_total=1081101176832 wsl_disk_used=3435077632 wsl_disk_available=1022673743872
+windows_c_disk_total=999098937344 windows_c_disk_used=467686563840 windows_c_disk_available=531412373504
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:56Z ===
+mem_total=16644722688 mem_used=3224215552 mem_available=13420507136
+swap_total=4294967296 swap_used=5853184 swap_free=4289114112
+wsl_disk_total=1081101176832 wsl_disk_used=3435077632 wsl_disk_available=1022673743872
+windows_c_disk_total=999098937344 windows_c_disk_used=467686563840 windows_c_disk_available=531412373504
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:57Z ===
+mem_total=16644722688 mem_used=3326234624 mem_available=13318488064
+swap_total=4294967296 swap_used=5935104 swap_free=4289032192
+wsl_disk_total=1081101176832 wsl_disk_used=3435077632 wsl_disk_available=1022673743872
+windows_c_disk_total=999098937344 windows_c_disk_used=467686563840 windows_c_disk_available=531412373504
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:58Z ===
+mem_total=16644722688 mem_used=3919740928 mem_available=12724981760
+swap_total=4294967296 swap_used=5935104 swap_free=4289032192
+wsl_disk_total=1081101176832 wsl_disk_used=3435085824 wsl_disk_available=1022673735680
+windows_c_disk_total=999098937344 windows_c_disk_used=467686694912 windows_c_disk_available=531412242432
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:46:59Z ===
+mem_total=16644722688 mem_used=4044652544 mem_available=12600070144
+swap_total=4294967296 swap_used=6066176 swap_free=4288901120
+wsl_disk_total=1081101176832 wsl_disk_used=3435085824 wsl_disk_available=1022673735680
+windows_c_disk_total=999098937344 windows_c_disk_used=467686694912 windows_c_disk_available=531412242432
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382
+=== sampled 2026-09-08T09:47:00Z ===
+mem_total=16644722688 mem_used=4313829376 mem_available=12330893312
+swap_total=4294967296 swap_used=6066176 swap_free=4288901120
+wsl_disk_total=1081101176832 wsl_disk_used=3435085824 wsl_disk_available=1022673735680
+windows_c_disk_total=999098937344 windows_c_disk_used=467686694912 windows_c_disk_available=531412242432
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=703 gpu_memory_free_mib=7254
+=== sampled 2026-09-08T09:47:01Z ===
+mem_total=16644722688 mem_used=4364443648 mem_available=12280279040
+swap_total=4294967296 swap_used=6127616 swap_free=4288839680
+wsl_disk_total=1081101176832 wsl_disk_used=3435085824 wsl_disk_available=1022673735680
+windows_c_disk_total=999098937344 windows_c_disk_used=467686694912 windows_c_disk_available=531412242432
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=703 gpu_memory_free_mib=7254
+=== sampled 2026-09-08T09:47:02Z ===
+mem_total=16644722688 mem_used=4455579648 mem_available=12189143040
+swap_total=4294967296 swap_used=6127616 swap_free=4288839680
+wsl_disk_total=1081101176832 wsl_disk_used=3435085824 wsl_disk_available=1022673735680
+windows_c_disk_total=999098937344 windows_c_disk_used=467686694912 windows_c_disk_available=531412242432
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=703 gpu_memory_free_mib=7254
+=== sampled 2026-09-08T09:47:03Z ===
+mem_total=16644722688 mem_used=3987197952 mem_available=12657524736
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3435089920 wsl_disk_available=1022673731584
+windows_c_disk_total=999098937344 windows_c_disk_used=467687350272 windows_c_disk_available=531411587072
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=703 gpu_memory_free_mib=7254
+=== sampled 2026-09-08T09:47:04Z ===
+mem_total=16644722688 mem_used=4003442688 mem_available=12641280000
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3435094016 wsl_disk_available=1022673727488
+windows_c_disk_total=999098937344 windows_c_disk_used=467687350272 windows_c_disk_available=531411587072
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=703 gpu_memory_free_mib=7254
+=== sampled 2026-09-08T09:47:05Z ===
+mem_total=16644722688 mem_used=4068794368 mem_available=12575928320
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3435094016 wsl_disk_available=1022673727488
+windows_c_disk_total=999098937344 windows_c_disk_used=467687350272 windows_c_disk_available=531411587072
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=703 gpu_memory_free_mib=7254
+=== sampled 2026-09-08T09:47:06Z ===
+mem_total=16644722688 mem_used=4118310912 mem_available=12526411776
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3435098112 wsl_disk_available=1022673723392
+windows_c_disk_total=999098937344 windows_c_disk_used=467687350272 windows_c_disk_available=531411587072
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=703 gpu_memory_free_mib=7254
+=== sampled 2026-09-08T09:47:07Z ===
+mem_total=16644722688 mem_used=4088303616 mem_available=12556419072
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3435098112 wsl_disk_available=1022673723392
+windows_c_disk_total=999098937344 windows_c_disk_used=467687350272 windows_c_disk_available=531411587072
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:08Z ===
+mem_total=16644722688 mem_used=4093636608 mem_available=12551086080
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3435171840 wsl_disk_available=1022673649664
+windows_c_disk_total=999098937344 windows_c_disk_used=467687362560 windows_c_disk_available=531411574784
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:09Z ===
+mem_total=16644722688 mem_used=4104327168 mem_available=12540395520
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3435188224 wsl_disk_available=1022673633280
+windows_c_disk_total=999098937344 windows_c_disk_used=467687362560 windows_c_disk_available=531411574784
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:10Z ===
+mem_total=16644722688 mem_used=4163698688 mem_available=12481024000
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3435188224 wsl_disk_available=1022673633280
+windows_c_disk_total=999098937344 windows_c_disk_used=467687362560 windows_c_disk_available=531411574784
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:12Z ===
+mem_total=16644722688 mem_used=4238024704 mem_available=12406697984
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3435188224 wsl_disk_available=1022673633280
+windows_c_disk_total=999098937344 windows_c_disk_used=467690528768 windows_c_disk_available=531408408576
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:13Z ===
+mem_total=16644722688 mem_used=4264914944 mem_available=12379807744
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3435188224 wsl_disk_available=1022673633280
+windows_c_disk_total=999098937344 windows_c_disk_used=467690528768 windows_c_disk_available=531408408576
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:14Z ===
+mem_total=16644722688 mem_used=3902291968 mem_available=12742430720
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3703484416 wsl_disk_available=1022405337088
+windows_c_disk_total=999098937344 windows_c_disk_used=467690528768 windows_c_disk_available=531408408576
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:15Z ===
+mem_total=16644722688 mem_used=3993489408 mem_available=12651233280
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3703488512 wsl_disk_available=1022405332992
+windows_c_disk_total=999098937344 windows_c_disk_used=467690528768 windows_c_disk_available=531408408576
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:16Z ===
+mem_total=16644722688 mem_used=4115558400 mem_available=12529164288
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3703496704 wsl_disk_available=1022405324800
+windows_c_disk_total=999098937344 windows_c_disk_used=467690528768 windows_c_disk_available=531408408576
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:17Z ===
+mem_total=16644722688 mem_used=4225478656 mem_available=12419244032
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3703500800 wsl_disk_available=1022405320704
+windows_c_disk_total=999098937344 windows_c_disk_used=467690528768 windows_c_disk_available=531408408576
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:18Z ===
+mem_total=16644722688 mem_used=4291264512 mem_available=12353458176
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3703508992 wsl_disk_available=1022405312512
+windows_c_disk_total=999098937344 windows_c_disk_used=467690528768 windows_c_disk_available=531408408576
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:19Z ===
+mem_total=16644722688 mem_used=4433915904 mem_available=12210806784
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3703513088 wsl_disk_available=1022405308416
+windows_c_disk_total=999098937344 windows_c_disk_used=467724091392 windows_c_disk_available=531374845952
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:20Z ===
+mem_total=16644722688 mem_used=4430016512 mem_available=12214706176
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3770601472 wsl_disk_available=1022338220032
+windows_c_disk_total=999098937344 windows_c_disk_used=467724095488 windows_c_disk_available=531374841856
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:21Z ===
+mem_total=16644722688 mem_used=4510941184 mem_available=12133781504
+swap_total=4294967296 swap_used=7458816 swap_free=4287508480
+wsl_disk_total=1081101176832 wsl_disk_used=3770605568 wsl_disk_available=1022338215936
+windows_c_disk_total=999098937344 windows_c_disk_used=467724099584 windows_c_disk_available=531374837760
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:22Z ===
+mem_total=16644722688 mem_used=4571447296 mem_available=12073275392
+swap_total=4294967296 swap_used=7925760 swap_free=4287041536
+wsl_disk_total=1081101176832 wsl_disk_used=3881947136 wsl_disk_available=1022226874368
+windows_c_disk_total=999098937344 windows_c_disk_used=468059762688 windows_c_disk_available=531039174656
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:23Z ===
+mem_total=16644722688 mem_used=4508033024 mem_available=12136689664
+swap_total=4294967296 swap_used=7925760 swap_free=4287041536
+wsl_disk_total=1081101176832 wsl_disk_used=3971805184 wsl_disk_available=1022137016320
+windows_c_disk_total=999098937344 windows_c_disk_used=468059889664 windows_c_disk_available=531039047680
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:24Z ===
+mem_total=16644722688 mem_used=4626608128 mem_available=12018114560
+swap_total=4294967296 swap_used=7925760 swap_free=4287041536
+wsl_disk_total=1081101176832 wsl_disk_used=3971813376 wsl_disk_available=1022137008128
+windows_c_disk_total=999098937344 windows_c_disk_used=468059889664 windows_c_disk_available=531039047680
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:25Z ===
+mem_total=16644722688 mem_used=4689879040 mem_available=11954843648
+swap_total=4294967296 swap_used=7925760 swap_free=4287041536
+wsl_disk_total=1081101176832 wsl_disk_used=3971821568 wsl_disk_available=1022136999936
+windows_c_disk_total=999098937344 windows_c_disk_used=468059889664 windows_c_disk_available=531039047680
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:26Z ===
+mem_total=16644722688 mem_used=4807536640 mem_available=11837186048
+swap_total=4294967296 swap_used=7983104 swap_free=4286984192
+wsl_disk_total=1081101176832 wsl_disk_used=3971829760 wsl_disk_available=1022136991744
+windows_c_disk_total=999098937344 windows_c_disk_used=468059889664 windows_c_disk_available=531039047680
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:27Z ===
+mem_total=16644722688 mem_used=4879843328 mem_available=11764879360
+swap_total=4294967296 swap_used=7983104 swap_free=4286984192
+wsl_disk_total=1081101176832 wsl_disk_used=3971837952 wsl_disk_available=1022136983552
+windows_c_disk_total=999098937344 windows_c_disk_used=468059889664 windows_c_disk_available=531039047680
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:28Z ===
+mem_total=16644722688 mem_used=4808237056 mem_available=11836485632
+swap_total=4294967296 swap_used=7983104 swap_free=4286984192
+wsl_disk_total=1081101176832 wsl_disk_used=4203302912 wsl_disk_available=1021905518592
+windows_c_disk_total=999098937344 windows_c_disk_used=468059955200 windows_c_disk_available=531038982144
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:29Z ===
+mem_total=16644722688 mem_used=4869414912 mem_available=11775307776
+swap_total=4294967296 swap_used=7983104 swap_free=4286984192
+wsl_disk_total=1081101176832 wsl_disk_used=4203307008 wsl_disk_available=1021905514496
+windows_c_disk_total=999098937344 windows_c_disk_used=468059955200 windows_c_disk_available=531038982144
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:30Z ===
+mem_total=16644722688 mem_used=4965515264 mem_available=11679207424
+swap_total=4294967296 swap_used=7987200 swap_free=4286980096
+wsl_disk_total=1081101176832 wsl_disk_used=4203315200 wsl_disk_available=1021905506304
+windows_c_disk_total=999098937344 windows_c_disk_used=468059955200 windows_c_disk_available=531038982144
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:31Z ===
+mem_total=16644722688 mem_used=5068873728 mem_available=11575848960
+swap_total=4294967296 swap_used=7987200 swap_free=4286980096
+wsl_disk_total=1081101176832 wsl_disk_used=4203319296 wsl_disk_available=1021905502208
+windows_c_disk_total=999098937344 windows_c_disk_used=468057595904 windows_c_disk_available=531041341440
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:33Z ===
+mem_total=16644722688 mem_used=5160357888 mem_available=11484364800
+swap_total=4294967296 swap_used=8069120 swap_free=4286898176
+wsl_disk_total=1081101176832 wsl_disk_used=4203331584 wsl_disk_available=1021905489920
+windows_c_disk_total=999098937344 windows_c_disk_used=468493803520 windows_c_disk_available=530605133824
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:34Z ===
+mem_total=16644722688 mem_used=5264728064 mem_available=11379994624
+swap_total=4294967296 swap_used=8069120 swap_free=4286898176
+wsl_disk_total=1081101176832 wsl_disk_used=4203343872 wsl_disk_available=1021905477632
+windows_c_disk_total=999098937344 windows_c_disk_used=468493803520 windows_c_disk_available=530605133824
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:35Z ===
+mem_total=16644722688 mem_used=5353807872 mem_available=11290914816
+swap_total=4294967296 swap_used=8187904 swap_free=4286779392
+wsl_disk_total=1081101176832 wsl_disk_used=4203343872 wsl_disk_available=1021905477632
+windows_c_disk_total=999098937344 windows_c_disk_used=468493807616 windows_c_disk_available=530605129728
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:36Z ===
+mem_total=16644722688 mem_used=5458579456 mem_available=11186143232
+swap_total=4294967296 swap_used=8187904 swap_free=4286779392
+wsl_disk_total=1081101176832 wsl_disk_used=4203343872 wsl_disk_available=1021905477632
+windows_c_disk_total=999098937344 windows_c_disk_used=468493807616 windows_c_disk_available=530605129728
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:37Z ===
+mem_total=16644722688 mem_used=5489135616 mem_available=11155587072
+swap_total=4294967296 swap_used=8192000 swap_free=4286775296
+wsl_disk_total=1081101176832 wsl_disk_used=4275453952 wsl_disk_available=1021833367552
+windows_c_disk_total=999098937344 windows_c_disk_used=468493807616 windows_c_disk_available=530605129728
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:38Z ===
+mem_total=16644722688 mem_used=5368381440 mem_available=11276341248
+swap_total=4294967296 swap_used=8192000 swap_free=4286775296
+wsl_disk_total=1081101176832 wsl_disk_used=4493213696 wsl_disk_available=1021615607808
+windows_c_disk_total=999098937344 windows_c_disk_used=468728688640 windows_c_disk_available=530370248704
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:39Z ===
+mem_total=16644722688 mem_used=5505290240 mem_available=11139432448
+swap_total=4294967296 swap_used=8192000 swap_free=4286775296
+wsl_disk_total=1081101176832 wsl_disk_used=4493221888 wsl_disk_available=1021615599616
+windows_c_disk_total=999098937344 windows_c_disk_used=468728688640 windows_c_disk_available=530370248704
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:40Z ===
+mem_total=16644722688 mem_used=5571817472 mem_available=11072905216
+swap_total=4294967296 swap_used=8192000 swap_free=4286775296
+wsl_disk_total=1081101176832 wsl_disk_used=4493221888 wsl_disk_available=1021615599616
+windows_c_disk_total=999098937344 windows_c_disk_used=468728688640 windows_c_disk_available=530370248704
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:41Z ===
+mem_total=16644722688 mem_used=5690732544 mem_available=10953990144
+swap_total=4294967296 swap_used=8192000 swap_free=4286775296
+wsl_disk_total=1081101176832 wsl_disk_used=4493225984 wsl_disk_available=1021615595520
+windows_c_disk_total=999098937344 windows_c_disk_used=468728688640 windows_c_disk_available=530370248704
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:42Z ===
+mem_total=16644722688 mem_used=5769867264 mem_available=10874855424
+swap_total=4294967296 swap_used=8192000 swap_free=4286775296
+wsl_disk_total=1081101176832 wsl_disk_used=4493230080 wsl_disk_available=1021615591424
+windows_c_disk_total=999098937344 windows_c_disk_used=468728688640 windows_c_disk_available=530370248704
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:43Z ===
+mem_total=16644722688 mem_used=5860495360 mem_available=10784227328
+swap_total=4294967296 swap_used=8863744 swap_free=4286103552
+wsl_disk_total=1081101176832 wsl_disk_used=4493234176 wsl_disk_available=1021615587328
+windows_c_disk_total=999098937344 windows_c_disk_used=468728688640 windows_c_disk_available=530370248704
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:44Z ===
+mem_total=16644722688 mem_used=5953531904 mem_available=10691190784
+swap_total=4294967296 swap_used=9674752 swap_free=4285292544
+wsl_disk_total=1081101176832 wsl_disk_used=4493238272 wsl_disk_available=1021615583232
+windows_c_disk_total=999098937344 windows_c_disk_used=468795801600 windows_c_disk_available=530303135744
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:45Z ===
+mem_total=16644722688 mem_used=6055018496 mem_available=10589704192
+swap_total=4294967296 swap_used=10051584 swap_free=4284915712
+wsl_disk_total=1081101176832 wsl_disk_used=4493238272 wsl_disk_available=1021615583232
+windows_c_disk_total=999098937344 windows_c_disk_used=468795801600 windows_c_disk_available=530303135744
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:46Z ===
+mem_total=16644722688 mem_used=6151122944 mem_available=10493599744
+swap_total=4294967296 swap_used=10051584 swap_free=4284915712
+wsl_disk_total=1081101176832 wsl_disk_used=4493238272 wsl_disk_available=1021615583232
+windows_c_disk_total=999098937344 windows_c_disk_used=468795801600 windows_c_disk_available=530303135744
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:47Z ===
+mem_total=16644722688 mem_used=6251126784 mem_available=10393595904
+swap_total=4294967296 swap_used=10403840 swap_free=4284563456
+wsl_disk_total=1081101176832 wsl_disk_used=4493242368 wsl_disk_available=1021615579136
+windows_c_disk_total=999098937344 windows_c_disk_used=468795805696 windows_c_disk_available=530303131648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:48Z ===
+mem_total=16644722688 mem_used=6329417728 mem_available=10315304960
+swap_total=4294967296 swap_used=10403840 swap_free=4284563456
+wsl_disk_total=1081101176832 wsl_disk_used=4493242368 wsl_disk_available=1021615579136
+windows_c_disk_total=999098937344 windows_c_disk_used=468795805696 windows_c_disk_available=530303131648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:49Z ===
+mem_total=16644722688 mem_used=6094548992 mem_available=10550173696
+swap_total=4294967296 swap_used=10403840 swap_free=4284563456
+wsl_disk_total=1081101176832 wsl_disk_used=4861562880 wsl_disk_available=1021247258624
+windows_c_disk_total=999098937344 windows_c_disk_used=468795928576 windows_c_disk_available=530303008768
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:50Z ===
+mem_total=16644722688 mem_used=6201446400 mem_available=10443276288
+swap_total=4294967296 swap_used=10403840 swap_free=4284563456
+wsl_disk_total=1081101176832 wsl_disk_used=4861571072 wsl_disk_available=1021247250432
+windows_c_disk_total=999098937344 windows_c_disk_used=468795928576 windows_c_disk_available=530303008768
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:51Z ===
+mem_total=16644722688 mem_used=6273601536 mem_available=10371121152
+swap_total=4294967296 swap_used=10403840 swap_free=4284563456
+wsl_disk_total=1081101176832 wsl_disk_used=4861575168 wsl_disk_available=1021247246336
+windows_c_disk_total=999098937344 windows_c_disk_used=468795928576 windows_c_disk_available=530303008768
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:52Z ===
+mem_total=16644722688 mem_used=6359154688 mem_available=10285568000
+swap_total=4294967296 swap_used=10403840 swap_free=4284563456
+wsl_disk_total=1081101176832 wsl_disk_used=4861575168 wsl_disk_available=1021247246336
+windows_c_disk_total=999098937344 windows_c_disk_used=468795928576 windows_c_disk_available=530303008768
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:54Z ===
+mem_total=16644722688 mem_used=6371254272 mem_available=10273468416
+swap_total=4294967296 swap_used=10559488 swap_free=4284407808
+wsl_disk_total=1081101176832 wsl_disk_used=4861575168 wsl_disk_available=1021247246336
+windows_c_disk_total=999098937344 windows_c_disk_used=468795928576 windows_c_disk_available=530303008768
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:55Z ===
+mem_total=16644722688 mem_used=6409072640 mem_available=10235650048
+swap_total=4294967296 swap_used=10559488 swap_free=4284407808
+wsl_disk_total=1081101176832 wsl_disk_used=4861579264 wsl_disk_available=1021247242240
+windows_c_disk_total=999098937344 windows_c_disk_used=469165027328 windows_c_disk_available=529933910016
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:56Z ===
+mem_total=16644722688 mem_used=6430195712 mem_available=10214526976
+swap_total=4294967296 swap_used=10575872 swap_free=4284391424
+wsl_disk_total=1081101176832 wsl_disk_used=4861579264 wsl_disk_available=1021247242240
+windows_c_disk_total=999098937344 windows_c_disk_used=469165027328 windows_c_disk_available=529933910016
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:57Z ===
+mem_total=16644722688 mem_used=6454767616 mem_available=10189955072
+swap_total=4294967296 swap_used=10575872 swap_free=4284391424
+wsl_disk_total=1081101176832 wsl_disk_used=4861579264 wsl_disk_available=1021247242240
+windows_c_disk_total=999098937344 windows_c_disk_used=469165027328 windows_c_disk_available=529933910016
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:58Z ===
+mem_total=16644722688 mem_used=6458122240 mem_available=10186600448
+swap_total=4294967296 swap_used=10575872 swap_free=4284391424
+wsl_disk_total=1081101176832 wsl_disk_used=4861579264 wsl_disk_available=1021247242240
+windows_c_disk_total=999098937344 windows_c_disk_used=469165027328 windows_c_disk_available=529933910016
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:47:59Z ===
+mem_total=16644722688 mem_used=5769437184 mem_available=10875285504
+swap_total=4294967296 swap_used=10575872 swap_free=4284391424
+wsl_disk_total=1081101176832 wsl_disk_used=5869686784 wsl_disk_available=1020239134720
+windows_c_disk_total=999098937344 windows_c_disk_used=469634789376 windows_c_disk_available=529464147968
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:48:00Z ===
+mem_total=16644722688 mem_used=4134309888 mem_available=12510412800
+swap_total=4294967296 swap_used=10575872 swap_free=4284391424
+wsl_disk_total=1081101176832 wsl_disk_used=7325364224 wsl_disk_available=1018783457280
+windows_c_disk_total=999098937344 windows_c_disk_used=470540759040 windows_c_disk_available=528558178304
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:48:01Z ===
+mem_total=16644722688 mem_used=4229885952 mem_available=12414836736
+swap_total=4294967296 swap_used=10575872 swap_free=4284391424
+wsl_disk_total=1081101176832 wsl_disk_used=7325368320 wsl_disk_available=1018783453184
+windows_c_disk_total=999098937344 windows_c_disk_used=470540759040 windows_c_disk_available=528558178304
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:48:02Z ===
+mem_total=16644722688 mem_used=4323987456 mem_available=12320735232
+swap_total=4294967296 swap_used=10575872 swap_free=4284391424
+wsl_disk_total=1081101176832 wsl_disk_used=7325368320 wsl_disk_available=1018783453184
+windows_c_disk_total=999098937344 windows_c_disk_used=470540759040 windows_c_disk_available=528558178304
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:48:03Z ===
+mem_total=16644722688 mem_used=4329201664 mem_available=12315521024
+swap_total=4294967296 swap_used=10575872 swap_free=4284391424
+wsl_disk_total=1081101176832 wsl_disk_used=7392448512 wsl_disk_available=1018716372992
+windows_c_disk_total=999098937344 windows_c_disk_used=470542069760 windows_c_disk_available=528556867584
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:48:04Z ===
+mem_total=16644722688 mem_used=4221222912 mem_available=12423499776
+swap_total=4294967296 swap_used=10575872 swap_free=4284391424
+wsl_disk_total=1081101176832 wsl_disk_used=7593631744 wsl_disk_available=1018515189760
+windows_c_disk_total=999098937344 windows_c_disk_used=470743396352 windows_c_disk_available=528355540992
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:48:05Z ===
+mem_total=16644722688 mem_used=5902020608 mem_available=10742702080
+swap_total=4294967296 swap_used=10575872 swap_free=4284391424
+wsl_disk_total=1081101176832 wsl_disk_used=7690584064 wsl_disk_available=1018418237440
+windows_c_disk_total=999098937344 windows_c_disk_used=471984910336 windows_c_disk_available=527114027008
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:48:07Z ===
+mem_total=16644722688 mem_used=5491023872 mem_available=11153698816
+swap_total=4294967296 swap_used=1068302336 swap_free=3226664960
+wsl_disk_total=1081101176832 wsl_disk_used=7690584064 wsl_disk_available=1018418237440
+windows_c_disk_total=999098937344 windows_c_disk_used=472549400576 windows_c_disk_available=526549536768
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:48:08Z ===
+mem_total=16644722688 mem_used=7507460096 mem_available=9137262592
+swap_total=4294967296 swap_used=1525702656 swap_free=2769264640
+wsl_disk_total=1081101176832 wsl_disk_used=7690584064 wsl_disk_available=1018418237440
+windows_c_disk_total=999098937344 windows_c_disk_used=473019162624 windows_c_disk_available=526079774720
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:48:09Z ===
+mem_total=16644722688 mem_used=6998851584 mem_available=9645871104
+swap_total=4294967296 swap_used=1532710912 swap_free=2762256384
+wsl_disk_total=1081101176832 wsl_disk_used=7690588160 wsl_disk_available=1018418233344
+windows_c_disk_total=999098937344 windows_c_disk_used=473019162624 windows_c_disk_available=526079774720
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6155 gpu_memory_free_mib=1802
+=== sampled 2026-09-08T09:48:10Z ===
+mem_total=16644722688 mem_used=6259683328 mem_available=10385039360
+swap_total=4294967296 swap_used=1525612544 swap_free=2769354752
+wsl_disk_total=1081101176832 wsl_disk_used=7690592256 wsl_disk_available=1018418229248
+windows_c_disk_total=999098937344 windows_c_disk_used=473019170816 windows_c_disk_available=526079766528
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5131 gpu_memory_free_mib=2826
+=== sampled 2026-09-08T09:48:11Z ===
+mem_total=16644722688 mem_used=6346289152 mem_available=10298433536
+swap_total=4294967296 swap_used=1525198848 swap_free=2769768448
+wsl_disk_total=1081101176832 wsl_disk_used=7690596352 wsl_disk_available=1018418225152
+windows_c_disk_total=999098937344 windows_c_disk_used=473019170816 windows_c_disk_available=526079766528
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5483 gpu_memory_free_mib=2474
+=== sampled 2026-09-08T09:48:12Z ===
+mem_total=16644722688 mem_used=6400864256 mem_available=10243858432
+swap_total=4294967296 swap_used=1518587904 swap_free=2776379392
+wsl_disk_total=1081101176832 wsl_disk_used=7690596352 wsl_disk_available=1018418225152
+windows_c_disk_total=999098937344 windows_c_disk_used=473019170816 windows_c_disk_available=526079766528
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=7211 gpu_memory_free_mib=746
+=== sampled 2026-09-08T09:48:13Z ===
+mem_total=16644722688 mem_used=6435287040 mem_available=10209435648
+swap_total=4294967296 swap_used=1517588480 swap_free=2777378816
+wsl_disk_total=1081101176832 wsl_disk_used=7690596352 wsl_disk_available=1018418225152
+windows_c_disk_total=999098937344 windows_c_disk_used=473019170816 windows_c_disk_available=526079766528
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=7211 gpu_memory_free_mib=746
+=== sampled 2026-09-08T09:48:14Z ===
+mem_total=16644722688 mem_used=6437552128 mem_available=10207170560
+swap_total=4294967296 swap_used=1517318144 swap_free=2777649152
+wsl_disk_total=1081101176832 wsl_disk_used=7690596352 wsl_disk_available=1018418225152
+windows_c_disk_total=999098937344 windows_c_disk_used=473019170816 windows_c_disk_available=526079766528
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=7211 gpu_memory_free_mib=746
+=== sampled 2026-09-08T09:48:15Z ===
+mem_total=16644722688 mem_used=6473940992 mem_available=10170781696
+swap_total=4294967296 swap_used=1512771584 swap_free=2782195712
+wsl_disk_total=1081101176832 wsl_disk_used=7690604544 wsl_disk_available=1018418216960
+windows_c_disk_total=999098937344 windows_c_disk_used=473019293696 windows_c_disk_available=526079643648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=7211 gpu_memory_free_mib=746
+=== sampled 2026-09-08T09:48:16Z ===
+mem_total=16644722688 mem_used=6491521024 mem_available=10153201664
+swap_total=4294967296 swap_used=1512763392 swap_free=2782203904
+wsl_disk_total=1081101176832 wsl_disk_used=7690604544 wsl_disk_available=1018418216960
+windows_c_disk_total=999098937344 windows_c_disk_used=473019293696 windows_c_disk_available=526079643648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=7211 gpu_memory_free_mib=746
+=== sampled 2026-09-08T09:48:17Z ===
+mem_total=16644722688 mem_used=6492979200 mem_available=10151743488
+swap_total=4294967296 swap_used=1512759296 swap_free=2782208000
+wsl_disk_total=1081101176832 wsl_disk_used=7690604544 wsl_disk_available=1018418216960
+windows_c_disk_total=999098937344 windows_c_disk_used=473019293696 windows_c_disk_available=526079643648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=7211 gpu_memory_free_mib=746
+=== sampled 2026-09-08T09:48:18Z ===
+mem_total=16644722688 mem_used=6524039168 mem_available=10120683520
+swap_total=4294967296 swap_used=1512337408 swap_free=2782629888
+wsl_disk_total=1081101176832 wsl_disk_used=7690608640 wsl_disk_available=1018418212864
+windows_c_disk_total=999098937344 windows_c_disk_used=473019293696 windows_c_disk_available=526079643648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=7211 gpu_memory_free_mib=746
+=== sampled 2026-09-08T09:48:19Z ===
+mem_total=16644722688 mem_used=6532296704 mem_available=10112425984
+swap_total=4294967296 swap_used=1512308736 swap_free=2782658560
+wsl_disk_total=1081101176832 wsl_disk_used=7690612736 wsl_disk_available=1018418208768
+windows_c_disk_total=999098937344 windows_c_disk_used=473019293696 windows_c_disk_available=526079643648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=7211 gpu_memory_free_mib=746
+=== sampled 2026-09-08T09:48:20Z ===
+mem_total=16644722688 mem_used=6533365760 mem_available=10111356928
+swap_total=4294967296 swap_used=1510993920 swap_free=2783973376
+wsl_disk_total=1081101176832 wsl_disk_used=7690616832 wsl_disk_available=1018418204672
+windows_c_disk_total=999098937344 windows_c_disk_used=473019293696 windows_c_disk_available=526079643648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=7211 gpu_memory_free_mib=746
+=== sampled 2026-09-08T09:48:22Z ===
+mem_total=16644722688 mem_used=6532685824 mem_available=10112036864
+swap_total=4294967296 swap_used=1510985728 swap_free=2783981568
+wsl_disk_total=1081101176832 wsl_disk_used=7690616832 wsl_disk_available=1018418204672
+windows_c_disk_total=999098937344 windows_c_disk_used=473019293696 windows_c_disk_available=526079643648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=7213 gpu_memory_free_mib=744
+=== sampled 2026-09-08T09:48:23Z ===
+mem_total=16644722688 mem_used=6512599040 mem_available=10132123648
+swap_total=4294967296 swap_used=1508831232 swap_free=2786136064
+wsl_disk_total=1081101176832 wsl_disk_used=7690616832 wsl_disk_available=1018418204672
+windows_c_disk_total=999098937344 windows_c_disk_used=473019293696 windows_c_disk_available=526079643648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:24Z ===
+mem_total=16644722688 mem_used=6506897408 mem_available=10137825280
+swap_total=4294967296 swap_used=1508143104 swap_free=2786824192
+wsl_disk_total=1081101176832 wsl_disk_used=7690616832 wsl_disk_available=1018418204672
+windows_c_disk_total=999098937344 windows_c_disk_used=473019293696 windows_c_disk_available=526079643648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:25Z ===
+mem_total=16644722688 mem_used=6514499584 mem_available=10130223104
+swap_total=4294967296 swap_used=1447628800 swap_free=2847338496
+wsl_disk_total=1081101176832 wsl_disk_used=7690616832 wsl_disk_available=1018418204672
+windows_c_disk_total=999098937344 windows_c_disk_used=473019293696 windows_c_disk_available=526079643648
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:26Z ===
+mem_total=16644722688 mem_used=6546272256 mem_available=10098450432
+swap_total=4294967296 swap_used=1440104448 swap_free=2854862848
+wsl_disk_total=1081101176832 wsl_disk_used=7690620928 wsl_disk_available=1018418200576
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:27Z ===
+mem_total=16644722688 mem_used=6581362688 mem_available=10063360000
+swap_total=4294967296 swap_used=1444286464 swap_free=2850680832
+wsl_disk_total=1081101176832 wsl_disk_used=7690625024 wsl_disk_available=1018418196480
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:28Z ===
+mem_total=16644722688 mem_used=6630678528 mem_available=10014044160
+swap_total=4294967296 swap_used=1444352000 swap_free=2850615296
+wsl_disk_total=1081101176832 wsl_disk_used=7690629120 wsl_disk_available=1018418192384
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:29Z ===
+mem_total=16644722688 mem_used=6713225216 mem_available=9931497472
+swap_total=4294967296 swap_used=1444151296 swap_free=2850816000
+wsl_disk_total=1081101176832 wsl_disk_used=7690633216 wsl_disk_available=1018418188288
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:30Z ===
+mem_total=16644722688 mem_used=6788079616 mem_available=9856643072
+swap_total=4294967296 swap_used=1449275392 swap_free=2845691904
+wsl_disk_total=1081101176832 wsl_disk_used=7690637312 wsl_disk_available=1018418184192
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:31Z ===
+mem_total=16644722688 mem_used=6827065344 mem_available=9817657344
+swap_total=4294967296 swap_used=1449050112 swap_free=2845917184
+wsl_disk_total=1081101176832 wsl_disk_used=7690637312 wsl_disk_available=1018418184192
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:32Z ===
+mem_total=16644722688 mem_used=6845480960 mem_available=9799241728
+swap_total=4294967296 swap_used=1449033728 swap_free=2845933568
+wsl_disk_total=1081101176832 wsl_disk_used=7690637312 wsl_disk_available=1018418184192
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:33Z ===
+mem_total=16644722688 mem_used=6844620800 mem_available=9800101888
+swap_total=4294967296 swap_used=1455218688 swap_free=2839748608
+wsl_disk_total=1081101176832 wsl_disk_used=7690637312 wsl_disk_available=1018418184192
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:34Z ===
+mem_total=16644722688 mem_used=6845124608 mem_available=9799598080
+swap_total=4294967296 swap_used=1454825472 swap_free=2840141824
+wsl_disk_total=1081101176832 wsl_disk_used=7690637312 wsl_disk_available=1018418184192
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== ready 2026-09-08T09:48:35Z ===
+mem_total=16644722688 mem_used=6842851328 mem_available=9801871360
+swap_total=4294967296 swap_used=1454751744 swap_free=2840215552
+wsl_disk_total=1081101176832 wsl_disk_used=7690637312 wsl_disk_available=1018418184192
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:35Z ===
+mem_total=16644722688 mem_used=6700892160 mem_available=9943830528
+swap_total=4294967296 swap_used=1454751744 swap_free=2840215552
+wsl_disk_total=1081101176832 wsl_disk_used=7690645504 wsl_disk_available=1018418176000
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:36Z ===
+mem_total=16644722688 mem_used=6699302912 mem_available=9945419776
+swap_total=4294967296 swap_used=1454743552 swap_free=2840223744
+wsl_disk_total=1081101176832 wsl_disk_used=7690649600 wsl_disk_available=1018418171904
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:37Z ===
+mem_total=16644722688 mem_used=6711676928 mem_available=9933045760
+swap_total=4294967296 swap_used=1454731264 swap_free=2840236032
+wsl_disk_total=1081101176832 wsl_disk_used=7690649600 wsl_disk_available=1018418171904
+windows_c_disk_total=999098937344 windows_c_disk_used=473019359232 windows_c_disk_available=526079578112
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:38Z ===
+mem_total=16644722688 mem_used=6723796992 mem_available=9920925696
+swap_total=4294967296 swap_used=1454727168 swap_free=2840240128
+wsl_disk_total=1081101176832 wsl_disk_used=7690649600 wsl_disk_available=1018418171904
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:39Z ===
+mem_total=16644722688 mem_used=6730231808 mem_available=9914490880
+swap_total=4294967296 swap_used=1462415360 swap_free=2832551936
+wsl_disk_total=1081101176832 wsl_disk_used=7690649600 wsl_disk_available=1018418171904
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:40Z ===
+mem_total=16644722688 mem_used=6754709504 mem_available=9890013184
+swap_total=4294967296 swap_used=1462374400 swap_free=2832592896
+wsl_disk_total=1081101176832 wsl_disk_used=7690649600 wsl_disk_available=1018418171904
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:41Z ===
+mem_total=16644722688 mem_used=6759428096 mem_available=9885294592
+swap_total=4294967296 swap_used=1462353920 swap_free=2832613376
+wsl_disk_total=1081101176832 wsl_disk_used=7690649600 wsl_disk_available=1018418171904
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:42Z ===
+mem_total=16644722688 mem_used=6762708992 mem_available=9882013696
+swap_total=4294967296 swap_used=1460834304 swap_free=2834132992
+wsl_disk_total=1081101176832 wsl_disk_used=7693176832 wsl_disk_available=1018415644672
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:43Z ===
+mem_total=16644722688 mem_used=6766989312 mem_available=9877733376
+swap_total=4294967296 swap_used=1464381440 swap_free=2830585856
+wsl_disk_total=1081101176832 wsl_disk_used=7693176832 wsl_disk_available=1018415644672
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:44Z ===
+mem_total=16644722688 mem_used=6790508544 mem_available=9854214144
+swap_total=4294967296 swap_used=1464004608 swap_free=2830962688
+wsl_disk_total=1081101176832 wsl_disk_used=7693185024 wsl_disk_available=1018415636480
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:45Z ===
+mem_total=16644722688 mem_used=6780776448 mem_available=9863946240
+swap_total=4294967296 swap_used=1463865344 swap_free=2831101952
+wsl_disk_total=1081101176832 wsl_disk_used=7693185024 wsl_disk_available=1018415636480
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:46Z ===
+mem_total=16644722688 mem_used=6869606400 mem_available=9775116288
+swap_total=4294967296 swap_used=1478885376 swap_free=2816081920
+wsl_disk_total=1081101176832 wsl_disk_used=7693185024 wsl_disk_available=1018415636480
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== sampled 2026-09-08T09:48:47Z ===
+mem_total=16644722688 mem_used=6855806976 mem_available=9788915712
+swap_total=4294967296 swap_used=1478856704 swap_free=2816110592
+wsl_disk_total=1081101176832 wsl_disk_used=7693185024 wsl_disk_available=1018415636480
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5875 gpu_memory_free_mib=2082
+=== after_text_request 2026-09-08T09:48:48Z ===
+mem_total=16644722688 mem_used=6844149760 mem_available=9800572928
+swap_total=4294967296 swap_used=1484079104 swap_free=2810888192
+wsl_disk_total=1081101176832 wsl_disk_used=7693230080 wsl_disk_available=1018415591424
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== after_text_request 2026-09-08T09:48:48Z ===
+mem_total=16644722688 mem_used=6859010048 mem_available=9785712640
+swap_total=4294967296 swap_used=1484066816 swap_free=2810900480
+wsl_disk_total=1081101176832 wsl_disk_used=7693275136 wsl_disk_available=1018415546368
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== sampled 2026-09-08T09:48:49Z ===
+mem_total=16644722688 mem_used=6877085696 mem_available=9767636992
+swap_total=4294967296 swap_used=1480708096 swap_free=2814259200
+wsl_disk_total=1081101176832 wsl_disk_used=7693275136 wsl_disk_available=1018415546368
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== sampled 2026-09-08T09:48:50Z ===
+mem_total=16644722688 mem_used=7060324352 mem_available=9584398336
+swap_total=4294967296 swap_used=1480683520 swap_free=2814283776
+wsl_disk_total=1081101176832 wsl_disk_used=7693275136 wsl_disk_available=1018415546368
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== sampled 2026-09-08T09:48:51Z ===
+mem_total=16644722688 mem_used=7153201152 mem_available=9491521536
+swap_total=4294967296 swap_used=1493614592 swap_free=2801352704
+wsl_disk_total=1081101176832 wsl_disk_used=7693275136 wsl_disk_available=1018415546368
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== sampled 2026-09-08T09:48:52Z ===
+mem_total=16644722688 mem_used=7208615936 mem_available=9436106752
+swap_total=4294967296 swap_used=1493594112 swap_free=2801373184
+wsl_disk_total=1081101176832 wsl_disk_used=7693283328 wsl_disk_available=1018415538176
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== sampled 2026-09-08T09:48:53Z ===
+mem_total=16644722688 mem_used=7222337536 mem_available=9422385152
+swap_total=4294967296 swap_used=1485914112 swap_free=2809053184
+wsl_disk_total=1081101176832 wsl_disk_used=7693283328 wsl_disk_available=1018415538176
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== sampled 2026-09-08T09:48:54Z ===
+mem_total=16644722688 mem_used=7231062016 mem_available=9413660672
+swap_total=4294967296 swap_used=1485189120 swap_free=2809778176
+wsl_disk_total=1081101176832 wsl_disk_used=7693283328 wsl_disk_available=1018415538176
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== sampled 2026-09-08T09:48:55Z ===
+mem_total=16644722688 mem_used=7242625024 mem_available=9402097664
+swap_total=4294967296 swap_used=1497808896 swap_free=2797158400
+wsl_disk_total=1081101176832 wsl_disk_used=7693283328 wsl_disk_available=1018415538176
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== sampled 2026-09-08T09:48:56Z ===
+mem_total=16644722688 mem_used=7203393536 mem_available=9441329152
+swap_total=4294967296 swap_used=1497112576 swap_free=2797854720
+wsl_disk_total=1081101176832 wsl_disk_used=7693283328 wsl_disk_available=1018415538176
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== sampled 2026-09-08T09:48:57Z ===
+mem_total=16644722688 mem_used=7259459584 mem_available=9385263104
+swap_total=4294967296 swap_used=1497104384 swap_free=2797862912
+wsl_disk_total=1081101176832 wsl_disk_used=7693283328 wsl_disk_available=1018415538176
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== sampled 2026-09-08T09:48:58Z ===
+mem_total=16644722688 mem_used=7298531328 mem_available=9346191360
+swap_total=4294967296 swap_used=1486557184 swap_free=2808410112
+wsl_disk_total=1081101176832 wsl_disk_used=7693283328 wsl_disk_available=1018415538176
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=5887 gpu_memory_free_mib=2070
+=== after_image_request 2026-09-08T09:48:59Z ===
+mem_total=16644722688 mem_used=7311593472 mem_available=9333129216
+swap_total=4294967296 swap_used=1486548992 swap_free=2808418304
+wsl_disk_total=1081101176832 wsl_disk_used=7693328384 wsl_disk_available=1018415493120
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6115 gpu_memory_free_mib=1842
+=== after_image_request 2026-09-08T09:48:59Z ===
+mem_total=16644722688 mem_used=7302037504 mem_available=9342685184
+swap_total=4294967296 swap_used=1486110720 swap_free=2808856576
+wsl_disk_total=1081101176832 wsl_disk_used=7693377536 wsl_disk_available=1018415443968
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+=== sampled 2026-09-08T09:48:59Z ===
+mem_total=16644722688 mem_used=7331172352 mem_available=9313550336
+swap_total=4294967296 swap_used=1486110720 swap_free=2808856576
+wsl_disk_total=1081101176832 wsl_disk_used=7693381632 wsl_disk_available=1018415439872
+windows_c_disk_total=999098937344 windows_c_disk_used=473019379712 windows_c_disk_available=526079557632
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6115 gpu_memory_free_mib=1842
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=6115 gpu_memory_free_mib=1842
+=== after_down 2026-09-08T09:49:03Z ===
+mem_total=16644722688 mem_used=1106632704 mem_available=15538089984
+swap_total=4294967296 swap_used=327888896 swap_free=3967078400
+wsl_disk_total=1081101176832 wsl_disk_used=7693430784 wsl_disk_available=1018415390720
+windows_c_disk_total=999098937344 windows_c_disk_used=473019768832 windows_c_disk_available=526079168512
+gpu_name=NVIDIA GeForce RTX 4060 gpu_memory_total_mib=8188 gpu_memory_used_mib=575 gpu_memory_free_mib=7382

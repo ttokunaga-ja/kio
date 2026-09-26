@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
+use crate::local_peer::AuthenticatedLocalEndpoint;
 use crate::types::ProviderIdempotency;
 use crate::{AdapterError, Result};
 
@@ -69,8 +70,8 @@ impl HttpPolicy {
     }
 }
 
-/// Authenticated provider requests fail closed on redirects. This prevents a
-/// provider-specific credential header from being replayed to a new origin.
+/// Authenticated provider requests use HTTPS without proxies or redirects,
+/// matching the online runtime trust identity.
 pub(crate) fn authenticated_agent(policy: HttpPolicy) -> ureq::Agent {
     // ureq 3's global timeout covers DNS through response-body completion.
     // Keep the strictest cap as the global deadline and explicitly return
@@ -78,13 +79,29 @@ pub(crate) fn authenticated_agent(policy: HttpPolicy) -> ureq::Agent {
     // 429 classifications (including Retry-After) without losing the body or
     // headers to the transport error type.
     let effective_overall_timeout = effective_overall_timeout(policy);
-    ureq::Agent::config_builder()
+    let config = ureq::Agent::config_builder()
+        .https_only(true)
+        .proxy(None)
         .max_redirects(0)
         .http_status_as_error(false)
         .timeout_connect(Some(policy.connect_timeout))
-        .timeout_global(Some(effective_overall_timeout))
-        .build()
-        .into()
+        .timeout_global(Some(effective_overall_timeout));
+    #[cfg(test)]
+    let config = match test_tls::current_config() {
+        Some(tls) => config.tls_config(tls),
+        None => config,
+    };
+    config.build().into()
+}
+
+/// The only transport constructor for an `offline_api` request.  Unlike the
+/// online helper above it uses an explicit device CA instead of web roots.
+/// Both constructors disable proxy inheritance.
+pub(crate) fn authenticated_local_agent(
+    endpoint: &AuthenticatedLocalEndpoint,
+    policy: HttpPolicy,
+) -> Result<ureq::Agent> {
+    endpoint.agent(policy)
 }
 
 /// Convert every non-success response into the adapter-specific error while
@@ -233,6 +250,97 @@ pub(crate) fn parse_json_bytes_bounded(
         .map_err(|err| AdapterError::ContractViolation(format!("invalid {context} JSON: {err}")))
 }
 
+/// TLS fixtures keep the production HTTPS/proxy/redirect policy, replacing only
+/// the trust roots within an explicit test-thread scope. No production override
+/// or certificate-verification bypass is exposed.
+#[cfg(test)]
+pub(crate) mod test_tls {
+    use std::cell::RefCell;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+    use ureq::tls::{Certificate, RootCerts, TlsConfig};
+
+    thread_local! {
+        static CONFIG: RefCell<Option<TlsConfig>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn current_config() -> Option<TlsConfig> {
+        CONFIG.with(|config| config.borrow().clone())
+    }
+
+    pub(crate) struct TrustGuard {
+        previous: Option<TlsConfig>,
+        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl Drop for TrustGuard {
+        fn drop(&mut self) {
+            CONFIG.with(|config| *config.borrow_mut() = self.previous.take());
+        }
+    }
+
+    pub(crate) struct Fixture {
+        server: Arc<rustls::ServerConfig>,
+        client: TlsConfig,
+    }
+
+    impl Fixture {
+        pub(crate) fn new() -> Self {
+            let rcgen::CertifiedKey { cert, signing_key } =
+                rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
+            let certificate = rustls::pki_types::CertificateDer::from(cert.der().to_vec());
+            let key = rustls::pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der());
+            let server = rustls::ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(vec![certificate], key.into())
+                .unwrap();
+            let client = TlsConfig::builder()
+                .root_certs(RootCerts::new_with_certs(&[Certificate::from_der(
+                    cert.der(),
+                )
+                .to_owned()]))
+                .build();
+            Self {
+                server: Arc::new(server),
+                client,
+            }
+        }
+
+        pub(crate) fn trust(&self) -> TrustGuard {
+            let previous = CONFIG.with(|config| config.replace(Some(self.client.clone())));
+            TrustGuard {
+                previous,
+                _thread: std::marker::PhantomData,
+            }
+        }
+
+        pub(crate) fn accept(
+            &self,
+            listener: &TcpListener,
+        ) -> rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+            const TIMEOUT: Duration = Duration::from_secs(5);
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + TIMEOUT;
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "TLS fixture accept timed out");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("TLS fixture accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream.set_read_timeout(Some(TIMEOUT)).unwrap();
+            stream.set_write_timeout(Some(TIMEOUT)).unwrap();
+            let connection = rustls::ServerConnection::new(self.server.clone()).unwrap();
+            rustls::StreamOwned::new(connection, stream)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -312,6 +420,62 @@ mod tests {
     }
 
     #[test]
+    fn authenticated_agent_effective_config_matches_online_trust_identity() {
+        // Exercise inherited proxy settings without mutating the environment
+        // shared by concurrent tests. The child runs this exact test once.
+        const CHILD: &str = "KIO_TEST_ONLINE_PROXY_CONFIG_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "http_policy::tests::authenticated_agent_effective_config_matches_online_trust_identity",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("HTTPS_PROXY", "http://127.0.0.1:9")
+                .env("https_proxy", "http://127.0.0.1:9")
+                .env("ALL_PROXY", "http://127.0.0.1:9")
+                .env("all_proxy", "http://127.0.0.1:9")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "proxy-environment child failed: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let agent = authenticated_agent(HttpPolicy::default());
+        let config = agent.config();
+        assert!(config.https_only());
+        assert!(config.proxy().is_none());
+        assert_eq!(config.max_redirects(), 0);
+        assert!(matches!(
+            config.tls_config().root_certs(),
+            ureq::tls::RootCerts::WebPki
+        ));
+    }
+
+    #[test]
+    fn authenticated_agent_rejects_http_before_connecting() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let error = authenticated_agent(HttpPolicy::default())
+            .post(&format!(
+                "http://{}/capture",
+                listener.local_addr().unwrap()
+            ))
+            .header("x-provider-secret", "synthetic")
+            .send("synthetic private payload")
+            .expect_err("online authenticated transport requires HTTPS");
+        assert!(matches!(error, ureq::Error::RequireHttpsOnly(_)));
+        assert_eq!(
+            listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
     fn authenticated_agent_rejects_redirect_responses() {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
@@ -321,8 +485,11 @@ mod tests {
         let redirect_target = TcpListener::bind("127.0.0.1:0").unwrap();
         redirect_target.set_nonblocking(true).unwrap();
         let redirect_address = redirect_target.local_addr().unwrap();
+        let tls = std::sync::Arc::new(test_tls::Fixture::new());
+        let _trust = tls.trust();
+        let server_tls = tls.clone();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = server_tls.accept(&listener);
             let mut request = [0_u8; 2048];
             let _ = stream.read(&mut request).unwrap();
             let response = format!(
@@ -332,7 +499,7 @@ mod tests {
         });
 
         let result = authenticated_agent(HttpPolicy::default())
-            .get(&format!("http://{address}/start"))
+            .get(&format!("https://{address}/start"))
             .header("x-provider-secret", "synthetic")
             .call();
         let response = result.expect("redirect is returned instead of followed");
@@ -378,9 +545,15 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let (request_seen_tx, request_seen_rx) = mpsc::channel();
         let (release_server_tx, release_server_rx) = mpsc::channel();
+        let tls = std::sync::Arc::new(test_tls::Fixture::new());
+        let _trust = tls.trust();
+        let server_tls = tls.clone();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream.set_read_timeout(Some(CLEANUP_DEADLINE)).unwrap();
+            let mut stream = server_tls.accept(&listener);
+            stream
+                .sock
+                .set_read_timeout(Some(CLEANUP_DEADLINE))
+                .unwrap();
             let mut request = [0_u8; 2048];
             let request_bytes = stream.read(&mut request).unwrap();
             assert!(request_bytes > 0, "client must send a request");
@@ -390,7 +563,7 @@ mod tests {
             // client-side timeout. The cleanup deadline prevents a panic in
             // the test thread from leaving this server thread blocked.
             let _ = release_server_rx.recv_timeout(CLEANUP_DEADLINE);
-            let _ = stream.shutdown(Shutdown::Both);
+            let _ = stream.sock.shutdown(Shutdown::Both);
         });
         let policy = HttpPolicy {
             connect_timeout: Duration::from_secs(2),
@@ -403,9 +576,10 @@ mod tests {
 
         let (client_result_tx, client_result_rx) = mpsc::channel();
         let client = std::thread::spawn(move || {
+            let _trust = tls.trust();
             let started = Instant::now();
             let result = authenticated_agent(policy)
-                .get(&format!("http://{address}/slow"))
+                .get(&format!("https://{address}/slow"))
                 .call();
             client_result_tx.send((started.elapsed(), result)).unwrap();
         });
@@ -490,8 +664,11 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
+        let tls = std::sync::Arc::new(test_tls::Fixture::new());
+        let _trust = tls.trust();
+        let server_tls = tls.clone();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = server_tls.accept(&listener);
             let mut request = [0_u8; 2048];
             let _ = stream.read(&mut request).unwrap();
             stream
@@ -501,7 +678,7 @@ mod tests {
                 .unwrap();
         });
         let response = authenticated_agent(HttpPolicy::default())
-            .get(&format!("http://{address}/compressed"))
+            .get(&format!("https://{address}/compressed"))
             .call()
             .unwrap();
         let err = read_json_bounded(response, 1024, "test response").unwrap_err();

@@ -119,10 +119,10 @@ fn candidate_fixture() -> (TempDir, String, String) {
         .unwrap();
     }
     json_success(&dir, &["init"], NOW);
-    let old = json_success(&dir, &["index", "--offline", "--approve"], OLD);
+    let old = json_success(&dir, &["index", "--offline", "--yes"], OLD);
     let old_commit = old["commit_hash"].as_str().unwrap().to_owned();
     fs::write(dir.path().join("document.md"), "# current\n\ncurrent tip\n").unwrap();
-    json_success(&dir, &["index", "--offline", "--approve"], NOW);
+    json_success(&dir, &["index", "--offline", "--yes"], NOW);
     let repo = Repository::open(dir.path()).unwrap();
     let old_tree = repo.read_commit(&old_commit).unwrap().tree;
     let preview = json_success(&dir, &["gc", "--dry-run"], NOW);
@@ -356,11 +356,7 @@ fn locked_replan_rejects_preview_changes_without_marker_receipt_or_tree_deletion
             .unwrap();
         wait_for_ready(&ready);
         match change {
-            "ref" => fs::write(
-                dir.path().join(".kio/refs/heads/main"),
-                format!("{old_commit}\n"),
-            )
-            .unwrap(),
+            "ref" => fs::write(dir.path().join(".kio/HEAD"), format!("{old_commit}\n")).unwrap(),
             // A syntactically inert configuration change is still part of the
             // plan's bound truth and must invalidate the preview.
             "config" => {
@@ -1063,7 +1059,7 @@ fn active_marker_blocks_representative_writer_entrypoints_without_touching_marke
     // These are deliberately distinct writer families.  They must all acquire
     // the normal GC-aware StoreLock before their first durable side effect.
     for args in [
-        &["index", "--offline", "--approve"][..],
+        &["index", "--offline", "--yes"][..],
         &["batch", "resume", "--offline"][..],
         &["adapter", "revoke", "--all"][..],
         &["repair", "rebuild-db", "--offline"][..],
@@ -1173,7 +1169,7 @@ fn shared_tree_requires_all_receipts_before_one_removal() {
     let store = ObjectStore::new(repo.kio_dir());
     let sibling = CommitObject::new(
         old_tree.clone(),
-        vec![old_commit.clone()],
+        Some(old_commit.clone()),
         OLD.into(),
         "same stale tree".into(),
         head_object.tool_lock_hash.clone(),
@@ -1191,9 +1187,9 @@ fn shared_tree_requires_all_receipts_before_one_removal() {
         .0;
     let merged = CommitObject::new(
         head_object.tree,
-        vec![head, sibling_hash.clone()],
+        Some(sibling_hash.clone()),
         NOW.into(),
-        "current merge tip".into(),
+        "current linear tip after two commits sharing the stale tree".into(),
         head_object.tool_lock_hash,
         CommitStats {
             files_added: 0,
@@ -1208,11 +1204,6 @@ fn shared_tree_requires_all_receipts_before_one_removal() {
         .unwrap()
         .0;
     fs::write(dir.path().join(".kio/HEAD"), format!("{merged_hash}\n")).unwrap();
-    fs::write(
-        dir.path().join(".kio/refs/heads/main"),
-        format!("{merged_hash}\n"),
-    )
-    .unwrap();
 
     let interrupted = kio(&dir, &["gc", "--yes"])
         .env("KIO_FIXED_NOW", NOW)

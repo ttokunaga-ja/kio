@@ -105,7 +105,7 @@ fn init(dir: &TempDir) {
 fn index_at(dir: &TempDir, fixed_now: &str) -> Value {
     // `--offline` is deliberate: time travel must be reproducible from local
     // objects and must never make an adapter call in these fixtures.
-    json_success_at(dir, &["index", "--offline", "--approve"], Some(fixed_now))
+    json_success_at(dir, &["index", "--offline", "--yes"], Some(fixed_now))
 }
 
 fn result_path(result: &Value) -> &str {
@@ -482,10 +482,7 @@ fn ct4_timetravel_013_disconnected_at_uses_writer_published_replica() {
         b"# Branch\n\nbranchfixture root payload\n",
     )
     .unwrap();
-    let c1 = index_at(&dir, "2026-07-12T00:00:00Z")["commit_hash"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    index_at(&dir, "2026-07-12T00:00:00Z");
 
     let retained = b"# Branch\n\nbranchfixture disconnected target\n";
     fs::write(dir.path().join("branch.md"), retained).unwrap();
@@ -535,10 +532,8 @@ fn ct4_timetravel_013_disconnected_at_uses_writer_published_replica() {
     assert!(!before_binding_rowids.is_empty());
     drop(replica);
 
-    // Move HEAD back to C1, then publish a different C3. C2 remains a valid
-    // CAS commit with source tree rows, but is no longer a HEAD ancestor.
-    fs::write(dir.path().join(".kio/HEAD"), format!("{c1}\n")).unwrap();
-    fs::write(dir.path().join(".kio/refs/heads/main"), format!("{c1}\n")).unwrap();
+    // Publish C3 as C2's child. The already-completed `--at C2` replica
+    // projection must remain stable while the linear HEAD advances.
     fs::write(
         dir.path().join("branch.md"),
         b"# Branch\n\nbranchfixture current sibling\n",
@@ -548,7 +543,10 @@ fn ct4_timetravel_013_disconnected_at_uses_writer_published_replica() {
         .as_str()
         .unwrap()
         .to_owned();
-    assert_ne!(sibling, disconnected, "the test must create a side commit");
+    assert_ne!(
+        sibling, disconnected,
+        "the test must advance the linear chain"
+    );
 
     let replica = Connection::open(&replica_path).unwrap();
     let after_marker: (i64, i64) = replica
@@ -623,10 +621,7 @@ fn ct4_timetravel_014_historical_reindex_publishes_empty_disconnected_at_snapsho
         b"# Root\n\nemptyatfixture root payload\n",
     )
     .unwrap();
-    let c1 = index_at(&dir, "2026-07-12T00:00:00Z")["commit_hash"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    index_at(&dir, "2026-07-12T00:00:00Z");
 
     fs::remove_file(dir.path().join("root.md")).unwrap();
     let c2 = index_at(&dir, "2026-07-12T01:00:00Z")["commit_hash"]
@@ -642,10 +637,8 @@ fn ct4_timetravel_014_historical_reindex_publishes_empty_disconnected_at_snapsho
         "C2 must be the empty target tree"
     );
 
-    // Move back to C1 before making C3. C2 remains readable in CAS but has no
-    // parent/child relation to the current branch and no source cache rows.
-    fs::write(dir.path().join(".kio/HEAD"), format!("{c1}\n")).unwrap();
-    fs::write(dir.path().join(".kio/refs/heads/main"), format!("{c1}\n")).unwrap();
+    // Advance the single chain after the empty C2 snapshot. It remains
+    // explicitly addressable even when the current source cache lacks rows.
     fs::write(
         dir.path().join("sibling.md"),
         b"# Sibling\n\nemptyatfixture current sibling\n",
@@ -722,16 +715,14 @@ fn ct4_timetravel_015_historical_reindex_durably_publishes_existing_disconnected
     let repo = Repository::open(dir.path()).unwrap();
     let a_object = repo.read_commit(&a).unwrap();
     let store = ObjectStore::new(repo.kio_dir());
-    // B deliberately reuses A's immutable tree, but has no parent: its
-    // normalized binding, chunks, and chunking configuration are all already
-    // durable while B remains incomparable to A.  It has no ref, while HEAD
-    // remains at A, so B is disconnected from the live ref and A cannot pass
-    // B's config-association introduction gate by ancestry.
+    // B deliberately reuses A's immutable tree as a direct child. It is not
+    // published as HEAD, but remains on the one valid ancestry line and can
+    // therefore be authenticated by explicit historical reindexing.
     let b = write_commit(
         &store,
         &synthetic_commit(
             a_object.tree,
-            Vec::new(),
+            Some(a.clone()),
             "2026-07-12T01:00:00Z",
             "disconnected duplicate binding",
             a_object.tool_lock_hash,
@@ -757,7 +748,7 @@ fn ct4_timetravel_015_historical_reindex_durably_publishes_existing_disconnected
     assert_eq!(reindexed["status"], "reindexed");
     assert_eq!(reindexed["snapshot_at"], b);
 
-    let has_b_publication = fs::read_to_string(&chunks_path)
+    let has_a_publication = fs::read_to_string(&chunks_path)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str::<Value>(line).unwrap())
@@ -765,15 +756,15 @@ fn ct4_timetravel_015_historical_reindex_durably_publishes_existing_disconnected
             row["event"] == "publication"
                 && row["chunk_id"] == chunk_id
                 && row["chunking_config_hash"] == config_hash
-                && row["introduction_commit"] == b
+                && row["introduction_commit"] == a
         });
     assert!(
-        has_b_publication,
-        "historical reindex must append B's durable publication event"
+        has_a_publication,
+        "historical reindex must retain A's durable publication event"
     );
 
-    // B is still disconnected from every mutable ref.  Fsck must nevertheless
-    // authenticate its durable publication event and include the tree closure;
+    // B is an unpublished linear descendant. Fsck must nevertheless
+    // authenticate the original durable publication and include the tree closure;
     // treating the JSONL event as either ignorable or self-authenticating would
     // respectively lose history or let a forged row choose arbitrary roots.
     let verified = json_success(&dir, &["repair", "verify-objects"]);
@@ -785,61 +776,6 @@ fn ct4_timetravel_015_historical_reindex_durably_publishes_existing_disconnected
             .is_empty(),
         "a disconnected reindex publication must be a clean verified root: {verified}"
     );
-
-    // Remove every mutable ref and then lose SQLite.  B and A are
-    // incomparable roots; only the authenticated, durable publication rows
-    // can retain their historical closure for this rebuild.
-    fs::write(dir.path().join(".kio/HEAD"), b"").unwrap();
-    fs::write(dir.path().join(".kio/refs/heads/main"), b"").unwrap();
-    fs::remove_file(dir.path().join(".kio/index/sqlite.db")).unwrap();
-    json_success(&dir, &["repair", "rebuild-db"]);
-
-    let conn = Connection::open(dir.path().join(".kio/index/sqlite.db")).unwrap();
-    let published_at_b: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM chunk_publications \
-             WHERE chunk_id = ?1 AND introduction_commit = ?2",
-            params![chunk_id, b],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        published_at_b, 1,
-        "B publication must survive SQLite rebuild"
-    );
-    let publication_count: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM chunk_publications \
-             WHERE chunk_id = ?1 AND chunking_config_hash = ?2",
-            params![chunk_id, config_hash],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        publication_count, 2,
-        "the incomparable A and B publication introductions must both survive"
-    );
-    let association_count: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM chunk_config_generations \
-             WHERE chunk_id = ?1 AND chunking_config_hash = ?2",
-            params![chunk_id, config_hash],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        association_count, 1,
-        "creation association remains one pair"
-    );
-    drop(conn);
-
-    // Source-index retention above intentionally ran with no live ref.  Put
-    // the ordinary writer ref back before asking the device replica to serve
-    // the historical selector; replica publication itself has no meaningful
-    // current snapshot while every ref is unborn.
-    fs::write(dir.path().join(".kio/HEAD"), format!("{a}\n")).unwrap();
-    fs::write(dir.path().join(".kio/refs/heads/main"), format!("{a}\n")).unwrap();
-    json_success(&dir, &["repair", "replica"]);
 
     let response = json_success(
         &dir,
@@ -859,7 +795,7 @@ fn ct4_timetravel_015_historical_reindex_durably_publishes_existing_disconnected
         results(&response).iter().any(|result| {
             result_raw(result) == hash_bytes(content) && result_commit(result) == b
         }),
-        "the rebuilt projection must retain B's publication: {response}"
+        "the linear projection must retain B's selected snapshot: {response}"
     );
 }
 
@@ -881,7 +817,7 @@ fn ct4_timetravel_016_historical_reindex_keeps_ancestor_introduction_for_unchang
         &ObjectStore::new(repo.kio_dir()),
         &synthetic_commit(
             c1_object.tree,
-            vec![c1.clone()],
+            Some(c1.clone()),
             "2026-07-12T01:00:00Z",
             "unchanged descendant",
             c1_object.tool_lock_hash,
@@ -975,7 +911,7 @@ fn ct4_timetravel_017_historical_reindex_introduces_config_transition_at_descend
         &store,
         &synthetic_commit(
             c2_tree_hash,
-            vec![c1],
+            Some(c1),
             "2026-07-12T01:00:00Z",
             "same normalized identity under config B",
             c1_object.tool_lock_hash,
@@ -995,14 +931,11 @@ fn ct4_timetravel_017_historical_reindex_introduces_config_transition_at_descend
 }
 
 #[test]
-fn ct4_timetravel_018_historical_reindex_keeps_incomparable_merge_introductions() {
+fn ct4_timetravel_018_historical_reindex_keeps_one_linear_introduction_through_copy_and_delete() {
     let dir = tempfile::tempdir().unwrap();
     init(&dir);
     fs::write(dir.path().join("base.md"), "# Base\n\nbasefixture\n").unwrap();
-    let c0 = index_at(&dir, "2026-07-12T00:00:00Z")["commit_hash"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    index_at(&dir, "2026-07-12T00:00:00Z");
     fs::write(
         dir.path().join("merge-intro.md"),
         "# Merge introduction\n\nmergeintroductionfixture\n",
@@ -1013,32 +946,18 @@ fn ct4_timetravel_018_historical_reindex_keeps_incomparable_merge_introductions(
         .unwrap()
         .to_owned();
 
-    let repo = Repository::open(dir.path()).unwrap();
-    let c1_object = repo.read_commit(&c1).unwrap();
-    let store = ObjectStore::new(repo.kio_dir());
-    let b = write_commit(
-        &store,
-        &synthetic_commit(
-            c1_object.tree.clone(),
-            vec![c0],
-            "2026-07-12T00:02:00Z",
-            "incomparable same-config introduction",
-            c1_object.tool_lock_hash.clone(),
-            CommitType::Manual,
-        ),
-    );
-    let merge = write_commit(
-        &store,
-        &synthetic_commit(
-            c1_object.tree,
-            vec![c1.clone(), b.clone()],
-            "2026-07-12T00:03:00Z",
-            "merge retains both introductions",
-            c1_object.tool_lock_hash,
-            CommitType::Manual,
-        ),
-    );
-    json_success(&dir, &["reindex", "--at", &merge]);
+    fs::copy(
+        dir.path().join("merge-intro.md"),
+        dir.path().join("merge-copy.md"),
+    )
+    .unwrap();
+    index_at(&dir, "2026-07-12T00:02:00Z");
+    fs::remove_file(dir.path().join("merge-intro.md")).unwrap();
+    let c3 = index_at(&dir, "2026-07-12T00:03:00Z")["commit_hash"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    json_success(&dir, &["reindex", "--at", &c3]);
     let publications = fs::read_to_string(dir.path().join(".kio/index/chunks.jsonl"))
         .unwrap()
         .lines()
@@ -1047,10 +966,9 @@ fn ct4_timetravel_018_historical_reindex_keeps_incomparable_merge_introductions(
         .map(|row| row["introduction_commit"].as_str().unwrap().to_owned())
         .collect::<BTreeSet<_>>();
     assert!(publications.contains(&c1));
-    assert!(publications.contains(&b));
     assert!(
-        !publications.contains(&merge),
-        "the merge is a descendant re-affirmation, not a third introduction"
+        !publications.contains(&c3),
+        "copy/delete descendants re-affirm the original linear introduction"
     );
 }
 
@@ -1329,7 +1247,7 @@ fn ct4_timetravel_006_cursor_binds_and_inherits_selector() {
     );
     let cursor = page1["paging"]["next_cursor"].as_str().unwrap().to_owned();
     let payload = cursor_payload(&cursor);
-    assert_eq!(payload["v"], 2);
+    assert_eq!(payload["v"], 3);
     assert_eq!(
         payload["time_travel"],
         serde_json::json!({"all_history": true})
@@ -1544,7 +1462,7 @@ fn ct4_timetravel_005_since_includes_cutoff_and_freezes_it_in_cursor() {
         .expect("equality result remains for page 2")
         .to_owned();
     let payload = cursor_payload(&cursor);
-    assert_eq!(payload["v"], 2);
+    assert_eq!(payload["v"], 3);
     assert_eq!(
         payload["time_travel"],
         serde_json::json!({"all_history": true, "since": "604800s"})
@@ -1706,12 +1624,14 @@ fn ct4_timetravel_006_cursor_rejects_write_through_visible_append() {
 fn ct4_timetravel_011_historical_reindex_rejects_config_drift_without_mutation() {
     let dir = tempfile::tempdir().unwrap();
     init(&dir);
+    kio(&dir, &["ledger", "init"], None).assert().success();
+    json_success(&dir, &["adapter", "approve", "--all", "--yes"]);
     fs::write(
         dir.path().join("history.md"),
         "# Historical selected\n\nhistoricalselectedmarker belongs only to C1. This paragraph is deliberately long enough to produce a stable historical search result.\n",
     )
     .unwrap();
-    let c1 = json_success_embed(&dir, &["index", "--approve"])["commit_hash"]
+    let c1 = json_success_embed(&dir, &["index", "--yes"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1721,7 +1641,7 @@ fn ct4_timetravel_011_historical_reindex_rejects_config_drift_without_mutation()
         "# Current nonselected\n\ncurrentnonselectedmarker belongs only to C2. This paragraph is also deliberately long and must retain its own tree-bound configuration.\n",
     )
     .unwrap();
-    let c2 = json_success_embed(&dir, &["index", "--approve"])["commit_hash"]
+    let c2 = json_success_embed(&dir, &["index", "--yes"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1747,18 +1667,12 @@ fn ct4_timetravel_011_historical_reindex_rejects_config_drift_without_mutation()
     let c1_raw = c1_entry.raw_hash.clone();
     let c2_raw = c2_entry.raw_hash.clone();
     let head_before = fs::read(dir.path().join(".kio/HEAD")).unwrap();
-    let branch_before = fs::read(dir.path().join(".kio/refs/heads/main")).unwrap();
 
-    // QA21 (step4b-contract-tests-p3a.md §G, 07-adapter-spec.md §3): the
-    // network-approval gate's positive condition needs
-    // `[adapter.policy].allow_network = true` to remain SET after this
-    // wholesale config.toml rewrite (unset/lost = gate not established) —
-    // the two `--approve` calls above already set it, so this full
-    // overwrite must carry it forward explicitly or the scope silently
-    // loses its persisted opt-in.
+    // Adapter approval is durable scope metadata, separate from the chunking
+    // configuration rewritten below.
     fs::write(
         dir.path().join(".kio/config.toml"),
-        "[chunking]\nstrategy = \"heading\"\nmax_chars = 48\n[adapter.policy]\nallow_network = true\n",
+        "[chunking]\nstrategy = \"heading\"\nmax_chars = 48\n",
     )
     .unwrap();
     let current_config = kio_index::chunking::chunking_config_hash("heading", 48).unwrap();
@@ -1792,10 +1706,6 @@ fn ct4_timetravel_011_historical_reindex_rejects_config_drift_without_mutation()
     assert_eq!(fs::read(&sqlite_path).unwrap(), sqlite_before);
 
     assert_eq!(fs::read(dir.path().join(".kio/HEAD")).unwrap(), head_before);
-    assert_eq!(
-        fs::read(dir.path().join(".kio/refs/heads/main")).unwrap(),
-        branch_before
-    );
     assert_eq!(count_associations(&c1_raw), 0);
     assert_eq!(count_associations(&c2_raw), 0);
 
@@ -2041,7 +1951,7 @@ fn write_commit(store: &ObjectStore, commit: &CommitObject) -> String {
 
 fn synthetic_commit(
     tree: String,
-    parents: Vec<String>,
+    parent: Option<String>,
     created_at: &str,
     message: &str,
     tool_lock_hash: String,
@@ -2049,7 +1959,7 @@ fn synthetic_commit(
 ) -> CommitObject {
     CommitObject::new(
         tree,
-        parents,
+        parent,
         created_at.to_owned(),
         message.to_owned(),
         tool_lock_hash,
@@ -2064,7 +1974,7 @@ fn synthetic_commit(
 }
 
 #[test]
-fn ct4_timetravel_012_walks_full_parent_dag_and_chooses_canonical_introduction() {
+fn ct4_timetravel_012_walks_one_linear_parent_chain_and_keeps_original_introduction() {
     let dir = tempfile::tempdir().unwrap();
     init(&dir);
     fs::write(
@@ -2091,26 +2001,15 @@ fn ct4_timetravel_012_walks_full_parent_dag_and_chooses_canonical_introduction()
     let a1_object = repo.read_commit(&a1).unwrap();
     let store = ObjectStore::new(repo.kio_dir());
 
-    // B1 is the merge's first parent and lacks X. A2 is an incomparable sibling
-    // of A1 with the same (chunk, old.md) introduction. M drops X from its tree.
-    let b1 = write_commit(
-        &store,
-        &synthetic_commit(
-            c0_object.tree.clone(),
-            vec![c0.clone()],
-            "2026-07-09T01:00:00Z",
-            "first-parent without X",
-            c0_object.tool_lock_hash.clone(),
-            CommitType::Manual,
-        ),
-    );
+    // The chain revisits the same normalized binding and then drops it. The
+    // original introduction remains the sole historical authority.
     let a2 = write_commit(
         &store,
         &synthetic_commit(
             a1_object.tree.clone(),
-            vec![c0.clone()],
+            Some(a1.clone()),
             "2026-07-09T02:00:00Z",
-            "incomparable side introduction",
+            "linear recurrence",
             a1_object.tool_lock_hash.clone(),
             CommitType::Manual,
         ),
@@ -2119,19 +2018,14 @@ fn ct4_timetravel_012_walks_full_parent_dag_and_chooses_canonical_introduction()
         &store,
         &synthetic_commit(
             c0_object.tree,
-            vec![b1, a1.clone(), a2.clone()],
+            Some(a2.clone()),
             "2026-07-10T00:00:00Z",
-            "merge drops X",
+            "linear delete",
             a1_object.tool_lock_hash,
             CommitType::Manual,
         ),
     );
     fs::write(dir.path().join(".kio/HEAD"), format!("{merge}\n")).unwrap();
-    fs::write(
-        dir.path().join(".kio/refs/heads/main"),
-        format!("{merge}\n"),
-    )
-    .unwrap();
 
     // Align the derived HEAD projection with synthetic M. The chunk ledger keeps
     // X, but M's HEAD tree intentionally does not contain it.
@@ -2140,15 +2034,15 @@ fn ct4_timetravel_012_walks_full_parent_dag_and_chooses_canonical_introduction()
     assert_eq!(history["searched_scopes"][0]["snapshot_at"], merge);
     assert!(
         !results(&history).is_empty(),
-        "side-parent X must survive: {history}"
+        "the earlier linear binding must survive: {history}"
     );
-    let canonical = std::cmp::min(a1.as_str(), a2.as_str());
+    let canonical = a1.as_str();
     for result in results(&history) {
         assert_eq!(result_path(result), "old.md");
         assert_eq!(result_commit(result), canonical);
     }
 
-    // Replay retains M and the exact incomparable-introduction tie choice.
+    // Cursor replay retains the same linear introduction.
     let page1 = json_success(
         &dir,
         &[

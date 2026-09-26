@@ -5,7 +5,7 @@
   "properties": {
     "kio_format_version": {
       "type": "string",
-      "const": "0.1.0"
+      "const": "1.0.0"
     },
     "scope_id": {
       "type": "string",
@@ -53,6 +53,8 @@
           "tool_id": { "type": "string", "minLength": 1 },
           "execution_mode": { "type": "string" },
           "tool_profile_hash": { "type": "string" },
+          "grant_id": { "type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$" },
+          "secrets_grant_id": { "type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$" },
           "approved_at": { "type": "string" },
           "approval_method": { "type": "string" },
           "status": { "type": "string", "enum": ["active", "revoked"] },
@@ -87,6 +89,8 @@
         "tool_id": { "type": "string", "minLength": 1 },
         "execution_mode": { "type": "string" },
         "tool_profile_hash": { "type": "string" },
+          "grant_id": { "type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$" },
+          "secrets_grant_id": { "type": "string", "pattern": "^[0-9A-HJKMNP-TV-Z]{26}$" },
         "approved_at": { "type": "string" },
         "approval_method": { "type": "string" }
       },

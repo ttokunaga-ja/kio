@@ -1,17 +1,18 @@
 //! Scan preview contracts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 #[cfg(not(windows))]
 use std::fs::Metadata;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
 
 use cap_primitives::{ambient_authority, fs as cap_fs};
+use kio_core::management::{DirectoryIdentity, ManagementBinding, read_record};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
+use crate::policy::CurrentPolicyEvaluator;
 use crate::prepare::{hash_bytes, hash_reader};
 use crate::{IoResultExt, Result};
 
@@ -20,7 +21,20 @@ const MAX_GLOB_STATES: usize = 100_000;
 /// never a general filesystem crawler.
 const MAX_CHILD_SCOPE_DEPTH: usize = 32;
 const MAX_CHILD_SCOPE_DIRECTORIES: usize = 512;
-const MAX_CHILD_SCOPE_PROBE_ENTRIES: usize = 10_000;
+/// One resumable discovery slice never returns or retains more than this many
+/// candidate rows. The caller must durable-store the continuation before a
+/// later slice; this is intentionally separate from the legacy one-shot cap.
+pub const CHILD_SCOPE_DISCOVERY_PAGE_SIZE: usize = 128;
+const CHILD_SCOPE_DISCOVERY_SELECTION_SIZE: usize = CHILD_SCOPE_DISCOVERY_PAGE_SIZE + 1;
+const CHILD_SCOPE_DISCOVERY_TOKEN_VERSION: u8 = 1;
+const MAX_CHILD_SCOPE_DISCOVERY_TOKEN_BYTES: usize = 1024 * 1024;
+/// A Unix pathname is bounded by the operating system at open time. This cap
+/// bounds continuation serialization without imposing Unix's short path
+/// limit on Windows, whose normal long-path ceiling is 32,767 UTF-16 units.
+#[cfg(not(windows))]
+const MAX_CHILD_SCOPE_DISCOVERY_RELATIVE_BYTES: usize = 128 * 1024;
+#[cfg(windows)]
+const MAX_CHILD_SCOPE_DISCOVERY_RELATIVE_UTF16: usize = 32_767;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildScopeDiscovery {
@@ -59,13 +73,51 @@ pub struct ChildScopePlan {
     effective_ignore_rules: Vec<IgnoreRule>,
 }
 
-/// Outcome of binding a planned child to an internal index subprocess.  A
-/// VCS marker is checked *after* binding, so a marker created after discovery
-/// cannot turn an opt-out scope into an indexed one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PlannedChildCommand {
-    Spawn { canonical_root: PathBuf },
-    SkippedVcs,
+/// A discovery-time child rebound through its retained parent directory.
+/// `root` is the only I/O authority for the child; `canonical_root` is for
+/// display and repository identity binding, not a reopening instruction.
+pub struct BoundPlannedChild {
+    pub canonical_root: PathBuf,
+    pub root: File,
+    pub inherited_rules: Vec<IgnoreRule>,
+}
+
+/// Durable, path-only DFS state for one child-scope discovery continuation.
+/// Handles are deliberately absent: a later process must establish a fresh
+/// [`ManagementBinding`] and re-open every frame no-follow under its retained
+/// root before it may continue.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildScopeDiscoveryContinuation {
+    pub version: u8,
+    pub scope_id: String,
+    pub root_identity: DirectoryIdentity,
+    pub case_insensitive: bool,
+    pub policy_digest: String,
+    pub index_vcs_repos: bool,
+    pub frames: Vec<ChildScopeDiscoveryFrame>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ChildScopeDiscoveryFrame {
+    /// Relative to the managed root, empty only for the root frame.
+    pub relative_dir: String,
+    pub expected_identity: DirectoryIdentity,
+    /// Last name whose result has been committed to this traversal. Names are
+    /// UTF-8 and compared bytewise; non-UTF-8 names remain unsupported exactly
+    /// as in the legacy discovery API.
+    pub after_entry: Option<String>,
+    /// The next bounded, sorted page after `after_entry`. Holding at most 129
+    /// names avoids rescanning once per child while keeping token memory finite.
+    pub pending_entries: Vec<String>,
+}
+
+/// A retained-handle page. Its `plan` is valid only for this process; callers
+/// must bind/enroll planned children before persisting `continuation`.
+pub struct ChildScopeDiscoverySlice {
+    pub plan: ChildScopePlan,
+    pub continuation: Option<ChildScopeDiscoveryContinuation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -147,73 +199,6 @@ struct GeneratedParentPolicy {
     rules: Vec<IgnoreRule>,
 }
 
-/// The internal policy crosses an exec boundary as one argv element. Keep it
-/// well below common platform argument ceilings after allowing for the binary,
-/// the rest of the command line, and the caller's environment.
-const MAX_GENERATED_PARENT_IGNORE_PAYLOAD_BYTES: usize = 64 * 1024;
-
-/// Parse the hidden parent-to-child policy envelope.  This is kept in the
-/// pipeline crate so the process boundary and on-disk reader share one strict
-/// grammar and size limit.
-pub fn parse_generated_parent_policy_payload(payload: &str) -> Result<Vec<IgnoreRule>> {
-    if payload.len() > MAX_GENERATED_PARENT_IGNORE_PAYLOAD_BYTES {
-        return Err(crate::PipelineError::Schema(
-            "generated parent ignore payload exceeds byte cap".to_owned(),
-        ));
-    }
-    let policy: GeneratedParentPolicy = serde_json::from_str(payload).map_err(|err| {
-        crate::PipelineError::Schema(format!("invalid generated parent ignore payload: {err}"))
-    })?;
-    if policy.rules.len() > MAX_GENERATED_PARENT_IGNORE_RULES {
-        return Err(crate::PipelineError::Schema(
-            "generated parent ignore policy exceeds rule cap".to_owned(),
-        ));
-    }
-    for rule in &policy.rules {
-        if rule.scope_prefix.is_none() {
-            return Err(crate::PipelineError::Schema(
-                "generated parent ignore rule requires scope_prefix".to_owned(),
-            ));
-        }
-        validate_ignore_rule(rule)?;
-    }
-    Ok(policy.rules)
-}
-
-/// Serialize the strict wire envelope shared by the parent process and the
-/// child parser.  Keeping this in one place means a policy is rejected before
-/// spawning, rather than after parent work has already been committed or by an
-/// OS-specific `E2BIG` failure.
-pub fn serialize_generated_parent_policy_payload(rules: &[IgnoreRule]) -> Result<String> {
-    if rules.len() > MAX_GENERATED_PARENT_IGNORE_RULES {
-        return Err(crate::PipelineError::Schema(
-            "generated parent ignore policy exceeds rule cap".to_owned(),
-        ));
-    }
-    for rule in rules {
-        if rule.scope_prefix.is_none() {
-            return Err(crate::PipelineError::Schema(
-                "generated parent ignore rule requires scope_prefix".to_owned(),
-            ));
-        }
-        validate_ignore_rule(rule)?;
-    }
-    let payload = serde_json::to_string(&GeneratedParentPolicy {
-        rules: rules.to_vec(),
-    })
-    .map_err(|error| {
-        crate::PipelineError::Schema(format!(
-            "generated parent ignore serialization failed: {error}"
-        ))
-    })?;
-    if payload.len() > MAX_GENERATED_PARENT_IGNORE_PAYLOAD_BYTES {
-        return Err(crate::PipelineError::Schema(
-            "generated parent ignore payload exceeds byte cap".to_owned(),
-        ));
-    }
-    Ok(payload)
-}
-
 /// Return the effective parent policy as it applies beneath `relative`.
 /// This payload is deliberately bounded before it crosses the internal CLI
 /// process boundary.  The receiving child validates it again before persisting.
@@ -237,15 +222,6 @@ pub fn generated_parent_policy_for_child(
             Ok(rule)
         })
         .collect()
-}
-
-/// Build and bound the exact policy payload supplied to one child process.
-pub fn generated_parent_policy_payload_for_child(
-    plan: &ChildScopePlan,
-    relative: &str,
-) -> Result<String> {
-    let rules = generated_parent_policy_for_child(plan, relative)?;
-    serialize_generated_parent_policy_payload(&rules)
 }
 
 pub fn build_scan_preview(request: ScanPreviewRequest) -> Result<ScanPreview> {
@@ -277,6 +253,7 @@ pub fn build_scan_preview_with_inherited_rules(
         case_insensitive,
         &mut candidates,
     )?;
+    apply_inherited_denials(&mut candidates, inherited_rules, case_insensitive)?;
     candidates.sort_by(|a, b| a.input_path.cmp(&b.input_path));
     let markdownize_pricing = kio_adapter::tool_lock::registered_declared_pricing("markdown");
     let embedding_pricing = kio_adapter::tool_lock::registered_declared_pricing("embedding");
@@ -319,6 +296,7 @@ pub fn build_bound_scan_preview(
         case_insensitive,
         &mut candidates,
     )?;
+    apply_inherited_denials(&mut candidates, inherited_rules, case_insensitive)?;
     candidates.sort_by(|left, right| left.input_path.cmp(&right.input_path));
     let markdownize_pricing = kio_adapter::tool_lock::registered_declared_pricing("markdown");
     let embedding_pricing = kio_adapter::tool_lock::registered_declared_pricing("embedding");
@@ -336,6 +314,177 @@ pub fn build_bound_scan_preview(
         }),
         approval_required: request.require_network_approval,
     })
+}
+
+/// Build a current-policy preview through retained management handles. Policy
+/// eligibility is checked before a candidate's raw bytes are opened or hashed.
+/// The request path is presentation-only; it cannot redirect this operation.
+pub fn build_managed_scan_preview(
+    binding: &ManagementBinding,
+    request: ScanPreviewRequest,
+) -> Result<ScanPreview> {
+    let record = read_record(binding).map_err(management_pipeline_error)?;
+    let policy = CurrentPolicyEvaluator::load(binding, record.case_insensitive)?;
+    let mut candidates = Vec::new();
+    for entry in cap_fs::read_base_dir(binding.root_handle()).pipeline_io(Path::new("."))? {
+        let entry = entry.pipeline_io(Path::new("."))?;
+        let name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+        let path = Path::new(&name);
+        let metadata = cap_fs::stat(binding.root_handle(), path, cap_fs::FollowSymlinks::No)
+            .pipeline_io(path)?;
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        let allowed = policy.allows_path(&name)?;
+        let raw_hash = if allowed && request.include_raw_hashes {
+            Some(
+                hash_bound_verified_scan_input(binding.root_handle(), &name, metadata.len())?
+                    .raw_hash,
+            )
+        } else {
+            None
+        };
+        let secret = classify_secret(&name);
+        let media_type = media_type_for_path(path).to_owned();
+        candidates.push(ScanCandidate {
+            input_path: name,
+            media_type,
+            size_bytes: metadata.len(),
+            raw_hash,
+            ignored: !allowed,
+            quarantine_reason: match secret {
+                Some(SecretTier::TierA) if !allowed => Some("secrets_tier_a_excluded".to_owned()),
+                Some(SecretTier::TierA) => Some("secrets_tier_a_online_hold".to_owned()),
+                Some(SecretTier::TierB) => Some("secrets_tier_b_warning".to_owned()),
+                None => None,
+            },
+        });
+    }
+    candidates.sort_by(|left, right| left.input_path.cmp(&right.input_path));
+    policy.revalidate()?;
+    let markdownize_pricing = kio_adapter::tool_lock::registered_declared_pricing("markdown");
+    let embedding_pricing = kio_adapter::tool_lock::registered_declared_pricing("embedding");
+    let (estimated_markdownize_usd, estimated_embedding_usd) =
+        estimated_enrichment_cost_usd(&candidates, &markdownize_pricing, &embedding_pricing);
+    Ok(ScanPreview {
+        scope_id: record.scope_id,
+        candidates,
+        estimated_cost: Some(CostPreview {
+            estimated_usd: estimated_markdownize_usd + estimated_embedding_usd,
+            budget_cap_usd: None,
+            budget_warning: None,
+            estimated_markdownize_usd,
+            estimated_embedding_usd,
+        }),
+        approval_required: request.require_network_approval,
+    })
+}
+
+/// Preview one newly discovered child without creating its `.kio` directory or
+/// resolving its pathname again. The parent supplies its persisted filesystem
+/// case capability; ancestor policy is the in-memory projection retained by
+/// [`BoundPlannedChild`].
+pub fn build_planned_child_scan_preview(
+    child: &BoundPlannedChild,
+    request: ScanPreviewRequest,
+    case_insensitive: bool,
+) -> Result<ScanPreview> {
+    let local_rules = load_bound_kioignore(&child.root)?;
+    let mut candidates = Vec::new();
+    for entry in cap_fs::read_base_dir(&child.root).pipeline_io(Path::new("."))? {
+        let entry = entry.pipeline_io(Path::new("."))?;
+        let name = match entry.file_name().into_string() {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+        let path = Path::new(&name);
+        let metadata =
+            cap_fs::stat(&child.root, path, cap_fs::FollowSymlinks::No).pipeline_io(path)?;
+        if !metadata.file_type().is_file() {
+            continue;
+        }
+        // This ordering is intentional: a parent denial prevents all raw-byte
+        // opens, even if a child `.kioignore` contains a matching negation.
+        let ancestor_denied =
+            rules_ignore_path(&name, false, &child.inherited_rules, case_insensitive)?;
+        let local_denied = rules_ignore_path(&name, false, &local_rules, case_insensitive)?;
+        let tier_a_denied = classify_secret(&name) == Some(SecretTier::TierA)
+            && !rules_explicitly_unignore_path(&name, false, &local_rules, case_insensitive)?;
+        let allowed = !ancestor_denied && !local_denied && !tier_a_denied;
+        let raw_hash = if allowed && request.include_raw_hashes {
+            Some(hash_bound_verified_scan_input(&child.root, &name, metadata.len())?.raw_hash)
+        } else {
+            None
+        };
+        let secret = classify_secret(&name);
+        let media_type = media_type_for_path(path).to_owned();
+        candidates.push(ScanCandidate {
+            input_path: name,
+            media_type,
+            size_bytes: metadata.len(),
+            raw_hash,
+            ignored: !allowed,
+            quarantine_reason: match secret {
+                Some(SecretTier::TierA) if !allowed => Some("secrets_tier_a_excluded".to_owned()),
+                Some(SecretTier::TierA) => Some("secrets_tier_a_online_hold".to_owned()),
+                Some(SecretTier::TierB) => Some("secrets_tier_b_warning".to_owned()),
+                None => None,
+            },
+        });
+    }
+    candidates.sort_by(|left, right| left.input_path.cmp(&right.input_path));
+    let markdownize_pricing = kio_adapter::tool_lock::registered_declared_pricing("markdown");
+    let embedding_pricing = kio_adapter::tool_lock::registered_declared_pricing("embedding");
+    let (estimated_markdownize_usd, estimated_embedding_usd) =
+        estimated_enrichment_cost_usd(&candidates, &markdownize_pricing, &embedding_pricing);
+    Ok(ScanPreview {
+        scope_id: "unmanaged-child".to_owned(),
+        candidates,
+        estimated_cost: Some(CostPreview {
+            estimated_usd: estimated_markdownize_usd + estimated_embedding_usd,
+            budget_cap_usd: None,
+            budget_warning: None,
+            estimated_markdownize_usd,
+            estimated_embedding_usd,
+        }),
+        approval_required: request.require_network_approval,
+    })
+}
+
+/// Live pre-send eligibility check. This has no existence or byte-read gate,
+/// so callers can use it for current and historical names alike.
+pub fn managed_scan_policy_allows_file(binding: &ManagementBinding, path: &str) -> Result<bool> {
+    let record = read_record(binding).map_err(management_pipeline_error)?;
+    let policy = CurrentPolicyEvaluator::load(binding, record.case_insensitive)?;
+    let allowed = policy.allows_path(path)?;
+    policy.revalidate()?;
+    Ok(allowed)
+}
+
+fn management_pipeline_error(error: kio_core::KioError) -> crate::PipelineError {
+    crate::PipelineError::contract("KIO-E-POLICY-MANAGEMENT-001", error.to_string())
+}
+
+fn apply_inherited_denials(
+    candidates: &mut [ScanCandidate],
+    inherited_rules: &[IgnoreRule],
+    case_insensitive: bool,
+) -> Result<()> {
+    for candidate in candidates {
+        if rules_ignore_path(
+            &candidate.input_path,
+            false,
+            inherited_rules,
+            case_insensitive,
+        )? {
+            candidate.ignored = true;
+            candidate.raw_hash = None;
+        }
+    }
+    Ok(())
 }
 
 fn collect_bound_direct_candidates(
@@ -458,85 +607,560 @@ pub fn discover_child_scopes(scope_path: &Path) -> Result<ChildScopePlan> {
         index_vcs_repos,
         effective_ignore_rules: rules,
     };
-    // Reject an unrepresentable inherited policy before the parent starts its
-    // own mutation-heavy index pipeline. This avoids a parent success followed
-    // by child-only partial failures (or `E2BIG`) for a policy the child can
-    // never receive safely.
-    for child in plan
-        .candidates
-        .iter()
-        .filter(|child| child.status == "planned")
-    {
-        generated_parent_policy_payload_for_child(&plan, &child.path)?;
-    }
     Ok(plan)
 }
 
-/// Re-open a planned child beneath the retained parent handle and compare its
-/// directory identity with the discovery-time handle immediately before the
-/// CLI mutates it. This closes the discovery-to-init symlink/replacement gap
-/// as far as `Repository::init`'s path API permits.
-pub fn validate_planned_child(plan: &ChildScopePlan, relative: &str) -> Result<()> {
-    let _ = bound_child_handle(plan, relative)?;
+/// Retained-handle managed discovery. The filesystem case capability and every
+/// ancestor rule come from live management/policy authority; this path never
+/// creates a probe file or reopens the scope by its public pathname.
+pub fn discover_managed_child_scopes(binding: &ManagementBinding) -> Result<ChildScopePlan> {
+    let record = read_record(binding).map_err(management_pipeline_error)?;
+    let policy = CurrentPolicyEvaluator::load(binding, record.case_insensitive)?;
+    if !policy.allows_scope()? {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-POLICY-SCOPE-DENIED-001",
+            "managed scope is denied by current ancestor policy",
+        ));
+    }
+    let rules = policy.projected_rules_for_child("")?;
+    let index_vcs_repos = load_bound_index_vcs_repos(binding.kio_handle())?;
+    let root_handle =
+        binding
+            .root_handle()
+            .try_clone()
+            .map_err(|error| crate::PipelineError::Io {
+                path: binding.canonical_root().display().to_string(),
+                message: error.to_string(),
+            })?;
+    if !index_vcs_repos && is_vcs_root(&root_handle) {
+        let mut row = child_status(String::new(), "skipped_vcs");
+        row.reason = Some("scope_root_is_vcs".to_owned());
+        return Ok(ChildScopePlan {
+            candidates: vec![row],
+            root_handle,
+            planned_handles: BTreeMap::new(),
+            canonical_roots: BTreeMap::new(),
+            index_vcs_repos,
+            effective_ignore_rules: rules,
+        });
+    }
+    let mut result = Vec::new();
+    let mut planned_handles = BTreeMap::new();
+    let mut canonical_roots = BTreeMap::new();
+    let mut visited = 0;
+    discover_child_scopes_inner(
+        binding.canonical_root(),
+        &root_handle,
+        Path::new(""),
+        0,
+        &rules,
+        record.case_insensitive,
+        index_vcs_repos,
+        &mut result,
+        &mut planned_handles,
+        &mut canonical_roots,
+        &mut visited,
+    )?;
+    result.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.status.cmp(&right.status))
+    });
+    policy.revalidate()?;
+    Ok(ChildScopePlan {
+        candidates: result,
+        root_handle,
+        planned_handles,
+        canonical_roots,
+        index_vcs_repos,
+        effective_ignore_rules: rules,
+    })
+}
+
+/// Discover one bounded, resumable page of managed child scopes.
+///
+/// This is deliberately not a wrapper around [`discover_managed_child_scopes`]:
+/// it uses an iterative DFS frontier and only retains the current depth plus a
+/// 129-name directory page. Unlike the legacy one-shot entrypoint, this
+/// continuation has no depth cap; token bytes and OS path admission are the
+/// bounded frontier. A continuation is invalidated on root identity,
+/// management/policy, VCS-policy, or retained-frame identity drift; callers
+/// must restart at the root rather than using stale traversal authority.
+pub fn discover_managed_child_scopes_page(
+    binding: &ManagementBinding,
+    continuation: Option<&ChildScopeDiscoveryContinuation>,
+) -> Result<ChildScopeDiscoverySlice> {
+    let record = read_record(binding).map_err(management_pipeline_error)?;
+    let policy = CurrentPolicyEvaluator::load(binding, record.case_insensitive)?;
+    if !policy.allows_scope()? {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-POLICY-SCOPE-DENIED-001",
+            "managed scope is denied by current ancestor policy",
+        ));
+    }
+    let rules = policy.projected_rules_for_child("")?;
+    // Enrolling a child mutates ManagementRecord.children, which is not policy
+    // authority. Hash the effective rules/case mode instead, while fresh
+    // CurrentPolicyEvaluator loading still validates the live chain per page.
+    let discovery_policy_digest = child_discovery_policy_digest(&rules, record.case_insensitive)?;
+    let index_vcs_repos = load_bound_index_vcs_repos(binding.kio_handle())?;
+    let root_handle =
+        binding
+            .root_handle()
+            .try_clone()
+            .map_err(|error| crate::PipelineError::Io {
+                path: binding.canonical_root().display().to_string(),
+                message: error.to_string(),
+            })?;
+    let root_identity = directory_identity(&root_handle)?;
+    let mut frames = match continuation {
+        Some(token) => {
+            validate_discovery_continuation(
+                token,
+                &record.scope_id,
+                &root_identity,
+                record.case_insensitive,
+                &discovery_policy_digest,
+                index_vcs_repos,
+            )?;
+            token.frames.clone()
+        }
+        None => vec![ChildScopeDiscoveryFrame {
+            relative_dir: String::new(),
+            expected_identity: root_identity.clone(),
+            after_entry: None,
+            pending_entries: Vec::new(),
+        }],
+    };
+    if !index_vcs_repos && is_vcs_root(&root_handle) {
+        let mut row = child_status(String::new(), "skipped_vcs");
+        row.reason = Some("scope_root_is_vcs".to_owned());
+        return Ok(ChildScopeDiscoverySlice {
+            plan: empty_child_scope_plan(root_handle, index_vcs_repos, rules, vec![row]),
+            continuation: None,
+        });
+    }
+
+    let mut result = Vec::new();
+    let mut planned_handles = BTreeMap::new();
+    let mut canonical_roots = BTreeMap::new();
+    while result.len() < CHILD_SCOPE_DISCOVERY_PAGE_SIZE && !frames.is_empty() {
+        let index = frames.len() - 1;
+        let directory = reopen_continuation_directory(&root_handle, &frames[index])?;
+        if frames[index].pending_entries.is_empty() {
+            frames[index].pending_entries =
+                select_discovery_entry_page(&directory, frames[index].after_entry.as_deref())?;
+        }
+        let Some(name) = frames[index].pending_entries.first().cloned() else {
+            frames.pop();
+            continue;
+        };
+        frames[index].pending_entries.remove(0);
+        frames[index].after_entry = Some(name.clone());
+        if name == ".kio" {
+            continue;
+        }
+        let relative_path = if frames[index].relative_dir.is_empty() {
+            PathBuf::from(&name)
+        } else {
+            Path::new(&frames[index].relative_dir).join(&name)
+        };
+        validate_discovery_relative(&relative_path)?;
+        let relative = relative_scope_path(&relative_path);
+        let metadata = match cap_fs::stat(&directory, Path::new(&name), cap_fs::FollowSymlinks::No)
+        {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                let mut row = child_status(relative, "skipped_unreadable");
+                row.reason = Some("changed_or_unreadable".to_owned());
+                result.push(row);
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            result.push(child_status(relative, "skipped_symlink"));
+            continue;
+        }
+        if !metadata.file_type().is_dir() {
+            continue;
+        }
+        if is_xdg_state_inside_scope(
+            binding.canonical_root(),
+            &binding.canonical_root().join(&relative_path),
+        ) {
+            result.push(child_status(relative, "skipped_xdg_state"));
+            continue;
+        }
+        if try_ignored_by_rules(&relative, true, &rules, record.case_insensitive)? {
+            result.push(child_status(relative, "skipped_ignored"));
+            continue;
+        }
+        let child = match cap_fs::open_dir_nofollow(&directory, Path::new(&name)) {
+            Ok(child) => child,
+            Err(_) => {
+                let mut row = child_status(relative, "skipped_unreadable");
+                row.reason = Some("changed_or_unreadable".to_owned());
+                result.push(row);
+                continue;
+            }
+        };
+        #[cfg(windows)]
+        if kio_core::cas::windows_directory_handle_identity(&child).is_none() {
+            let mut row = child_status(relative, "skipped_symlink");
+            row.reason = Some("windows_reparse_point".to_owned());
+            result.push(row);
+            continue;
+        }
+        if !same_cap_directory_volume(&directory, &child)? {
+            let mut row = child_status(relative, "skipped_mount");
+            row.reason = Some("independent_root_required_for_volume".to_owned());
+            result.push(row);
+            continue;
+        }
+        if !index_vcs_repos && is_vcs_root(&child) {
+            result.push(child_status(relative, "skipped_vcs"));
+            continue;
+        }
+        result.push(child_status(relative.clone(), "planned"));
+        planned_handles.insert(
+            relative.clone(),
+            child
+                .try_clone()
+                .map_err(|error| crate::PipelineError::Io {
+                    path: relative.clone(),
+                    message: error.to_string(),
+                })?,
+        );
+        canonical_roots.insert(
+            relative.clone(),
+            binding.canonical_root().join(&relative_path),
+        );
+        frames.push(ChildScopeDiscoveryFrame {
+            relative_dir: relative,
+            expected_identity: directory_identity(&child)?,
+            after_entry: None,
+            pending_entries: Vec::new(),
+        });
+    }
+    policy.revalidate()?;
+    let continuation = if frames.is_empty() {
+        None
+    } else {
+        let token = ChildScopeDiscoveryContinuation {
+            version: CHILD_SCOPE_DISCOVERY_TOKEN_VERSION,
+            scope_id: record.scope_id,
+            root_identity,
+            case_insensitive: record.case_insensitive,
+            policy_digest: discovery_policy_digest,
+            index_vcs_repos,
+            frames,
+        };
+        validate_discovery_token_size(&token)?;
+        Some(token)
+    };
+    Ok(ChildScopeDiscoverySlice {
+        plan: ChildScopePlan {
+            candidates: result,
+            root_handle,
+            planned_handles,
+            canonical_roots,
+            index_vcs_repos,
+            effective_ignore_rules: rules,
+        },
+        continuation,
+    })
+}
+
+fn child_discovery_policy_digest(rules: &[IgnoreRule], case_insensitive: bool) -> Result<String> {
+    let bytes = serde_json::to_vec(&(case_insensitive, rules))
+        .map_err(|error| crate::PipelineError::Schema(error.to_string()))?;
+    Ok(hash_bytes(&bytes))
+}
+
+fn empty_child_scope_plan(
+    root_handle: File,
+    index_vcs_repos: bool,
+    rules: Vec<IgnoreRule>,
+    candidates: Vec<ChildScopeDiscovery>,
+) -> ChildScopePlan {
+    ChildScopePlan {
+        candidates,
+        root_handle,
+        planned_handles: BTreeMap::new(),
+        canonical_roots: BTreeMap::new(),
+        index_vcs_repos,
+        effective_ignore_rules: rules,
+    }
+}
+
+fn validate_discovery_continuation(
+    token: &ChildScopeDiscoveryContinuation,
+    scope_id: &str,
+    root_identity: &DirectoryIdentity,
+    case_insensitive: bool,
+    policy_digest: &str,
+    index_vcs_repos: bool,
+) -> Result<()> {
+    validate_discovery_token_size(token)?;
+    if token.version != CHILD_SCOPE_DISCOVERY_TOKEN_VERSION
+        || token.scope_id != scope_id
+        || &token.root_identity != root_identity
+        || token.case_insensitive != case_insensitive
+        || token.policy_digest != policy_digest
+        || token.index_vcs_repos != index_vcs_repos
+    {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            "child discovery continuation no longer matches live root identity or policy; restart from the root",
+        ));
+    }
+    validate_discovery_token_syntax(token)?;
     Ok(())
 }
 
-/// Bind `command` to the discovery-time child directory. On Unix the child
-/// performs `fchdir` on a clone of the retained descriptor immediately before
-/// exec; it therefore cannot be redirected by replacing the public path.
-/// Windows deliberately fails closed until its launcher can make a process
-/// current directory from a retained handle without re-entering the public
-/// reparse-point namespace.
-pub fn configure_planned_child_index_command(
+/// Parse an untrusted persisted continuation after enforcing the allocation
+/// bound. App storage should use this rather than deserializing the token
+/// directly.
+pub fn parse_child_scope_discovery_continuation(
+    bytes: &[u8],
+) -> Result<ChildScopeDiscoveryContinuation> {
+    if bytes.len() > MAX_CHILD_SCOPE_DISCOVERY_TOKEN_BYTES {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            "child discovery continuation exceeds its bounded token size",
+        ));
+    }
+    let token = serde_json::from_slice(bytes).map_err(|error| {
+        crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            format!("invalid child discovery continuation: {error}"),
+        )
+    })?;
+    validate_discovery_token_size(&token)?;
+    validate_discovery_token_syntax(&token)?;
+    Ok(token)
+}
+
+fn is_discovery_entry_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".." && !name.contains('/') && !name.contains('\\')
+}
+
+fn validate_discovery_token_syntax(token: &ChildScopeDiscoveryContinuation) -> Result<()> {
+    if token.frames.is_empty() || !token.frames[0].relative_dir.is_empty() {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            "child discovery continuation has an invalid frontier",
+        ));
+    }
+    let mut parent = PathBuf::new();
+    let mut seen = BTreeSet::new();
+    for frame in &token.frames {
+        let path = Path::new(&frame.relative_dir);
+        validate_discovery_relative(path)?;
+        if !seen.insert(frame.relative_dir.as_str())
+            || (!parent.as_os_str().is_empty() && !path.starts_with(&parent))
+        {
+            return Err(crate::PipelineError::contract(
+                "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+                "child discovery continuation has duplicate or unordered frames",
+            ));
+        }
+        if frame.pending_entries.len() > CHILD_SCOPE_DISCOVERY_SELECTION_SIZE
+            || !frame
+                .pending_entries
+                .windows(2)
+                .all(|pair| pair[0] < pair[1])
+            || frame.pending_entries.iter().any(|name| {
+                !is_discovery_entry_name(name)
+                    || frame
+                        .after_entry
+                        .as_ref()
+                        .is_some_and(|after| name <= after)
+            })
+            || frame
+                .after_entry
+                .as_ref()
+                .is_some_and(|name| !is_discovery_entry_name(name))
+        {
+            return Err(crate::PipelineError::contract(
+                "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+                "child discovery continuation has an invalid directory page",
+            ));
+        }
+        parent = path.to_path_buf();
+    }
+    Ok(())
+}
+
+fn validate_discovery_token_size(token: &ChildScopeDiscoveryContinuation) -> Result<()> {
+    let bytes = serde_json::to_vec(token)
+        .map_err(|error| crate::PipelineError::Schema(error.to_string()))?;
+    if bytes.len() > MAX_CHILD_SCOPE_DISCOVERY_TOKEN_BYTES {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            "child discovery continuation exceeds its bounded token size",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_discovery_relative(path: &Path) -> Result<()> {
+    if path
+        .components()
+        .any(|component| !matches!(component, Component::Normal(_)))
+        && !path.as_os_str().is_empty()
+    {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            "child discovery continuation contains a non-relative path",
+        ));
+    }
+    #[cfg(windows)]
+    if path.as_os_str().encode_wide().count() > MAX_CHILD_SCOPE_DISCOVERY_RELATIVE_UTF16 {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            "child discovery path exceeds the Windows supported limit",
+        ));
+    }
+    #[cfg(not(windows))]
+    if path.as_os_str().as_encoded_bytes().len() > MAX_CHILD_SCOPE_DISCOVERY_RELATIVE_BYTES {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            "child discovery path exceeds the supported token limit",
+        ));
+    }
+    Ok(())
+}
+
+fn reopen_continuation_directory(root: &File, frame: &ChildScopeDiscoveryFrame) -> Result<File> {
+    let mut current = root.try_clone().map_err(|error| crate::PipelineError::Io {
+        path: frame.relative_dir.clone(),
+        message: error.to_string(),
+    })?;
+    for component in Path::new(&frame.relative_dir).components() {
+        let Component::Normal(component) = component else {
+            continue;
+        };
+        current = cap_fs::open_dir_nofollow(&current, Path::new(component)).map_err(|error| {
+            crate::PipelineError::contract(
+                "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+                format!(
+                    "cannot rebind discovery frontier {}: {error}",
+                    frame.relative_dir
+                ),
+            )
+        })?;
+    }
+    if directory_identity(&current)? != frame.expected_identity {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            "child discovery frontier directory identity changed; restart from the root",
+        ));
+    }
+    Ok(current)
+}
+
+fn select_discovery_entry_page(dir: &File, after: Option<&str>) -> Result<Vec<String>> {
+    let mut names = BTreeSet::new();
+    for entry in cap_fs::read_base_dir(dir).pipeline_io(Path::new("."))? {
+        let entry = entry.pipeline_io(Path::new("."))?;
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
+        if after.is_some_and(|cursor| name.as_str() <= cursor) {
+            continue;
+        }
+        names.insert(name);
+        if names.len() > CHILD_SCOPE_DISCOVERY_SELECTION_SIZE {
+            names.pop_last();
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+#[cfg(unix)]
+fn directory_identity(file: &File) -> Result<DirectoryIdentity> {
+    use cap_fs::MetadataExt;
+    let metadata = cap_fs::Metadata::from_file(file).pipeline_io(Path::new("."))?;
+    if !metadata.file_type().is_dir() {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            "discovery frontier is not a directory",
+        ));
+    }
+    Ok(DirectoryIdentity::Unix {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+#[cfg(windows)]
+fn directory_identity(file: &File) -> Result<DirectoryIdentity> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Err(crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            "discovery frontier is not a real directory",
+        ));
+    }
+    Ok(DirectoryIdentity::Windows {
+        volume_serial_number: information.dwVolumeSerialNumber,
+        file_index: ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
+    })
+}
+#[cfg(not(any(unix, windows)))]
+fn directory_identity(_file: &File) -> Result<DirectoryIdentity> {
+    Err(crate::PipelineError::contract(
+        "KIO-E-SCAN-DIRECTORY-IDENTITY-001",
+        "directory identities are unsupported on this platform",
+    ))
+}
+
+fn load_bound_index_vcs_repos(kio: &File) -> Result<bool> {
+    let Some(text) = read_bound_optional_regular_text(kio, "config.toml")? else {
+        return Ok(false);
+    };
+    let value: toml::Value =
+        toml::from_str(&text).map_err(|error| crate::PipelineError::Schema(error.to_string()))?;
+    match value
+        .get("scope")
+        .and_then(|scope| scope.get("index_vcs_repos"))
+    {
+        None => Ok(false),
+        Some(value) => value.as_bool().ok_or_else(|| {
+            crate::PipelineError::Schema("scope.index_vcs_repos must be boolean".to_owned())
+        }),
+    }
+}
+
+/// Rebind a planned child immediately before direct execution. The parent
+/// discovery handle is reopened without following links and compared with its
+/// discovery-time identity. A VCS marker is also checked after rebinding;
+/// `None` means the child must remain excluded.
+pub fn bind_planned_child(
     plan: &ChildScopePlan,
     relative: &str,
-    command: &mut Command,
-) -> Result<PlannedChildCommand> {
-    let child = bound_child_handle(plan, relative)?;
-    if !plan.index_vcs_repos && is_vcs_root(&child) {
-        return Ok(PlannedChildCommand::SkippedVcs);
+) -> Result<Option<BoundPlannedChild>> {
+    let root = bound_child_handle(plan, relative)?;
+    if !plan.index_vcs_repos && is_vcs_root(&root) {
+        return Ok(None);
     }
     let canonical_root = plan.canonical_roots.get(relative).cloned().ok_or_else(|| {
         crate::PipelineError::Schema(format!("unknown planned child scope: {relative}"))
     })?;
-    #[cfg(unix)]
-    {
-        use std::os::{fd::AsRawFd, unix::process::CommandExt};
-        let mut options = cap_fs::OpenOptions::new();
-        options.read(true);
-        let runner_cwd = cap_fs::open(&child, Path::new("."), &options).map_err(|err| {
-            crate::PipelineError::Io {
-                path: relative.to_owned(),
-                message: err.to_string(),
-            }
-        })?;
-        // `fchdir` is async-signal-safe. Keeping this descriptor in the
-        // pre-exec closure is the execution boundary: public-path replacement
-        // after discovery has no effect on the child's working directory.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::fchdir(runner_cwd.as_raw_fd()) == 0 {
-                    Ok(())
-                } else {
-                    Err(std::io::Error::last_os_error())
-                }
-            });
-        }
-        Ok(PlannedChildCommand::Spawn { canonical_root })
-    }
-    #[cfg(windows)]
-    {
-        let _ = (child, canonical_root, command);
-        Err(crate::PipelineError::contract(
-            "KIO-E-SCOPE-BOUND-UNSUPPORTED-001",
-            "Windows child scope execution requires a retained-handle launcher",
-        ))
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (child, command);
-        Ok(PlannedChildCommand::Spawn { canonical_root })
-    }
+    let inherited_rules = generated_parent_policy_for_child(plan, relative)?;
+    Ok(Some(BoundPlannedChild {
+        canonical_root,
+        root,
+        inherited_rules,
+    }))
 }
 
 fn bound_child_handle(plan: &ChildScopePlan, relative: &str) -> Result<File> {
@@ -686,49 +1310,28 @@ fn discover_child_scopes_inner(
             result.push(row);
             continue;
         }
+        if !same_cap_directory_volume(dir, &child)? {
+            let mut row = child_status(relative, "skipped_mount");
+            row.reason = Some("independent_root_required_for_volume".to_owned());
+            result.push(row);
+            continue;
+        }
         if !index_vcs_repos && is_vcs_root(&child) {
             result.push(child_status(relative, "skipped_vcs"));
             continue;
         }
-        let has_file = match directory_has_includable_regular_file(
-            &child,
-            &relative_path,
-            rules,
-            case_insensitive,
-        ) {
-            Ok(RegularFileProbe::Found) => true,
-            Ok(RegularFileProbe::Absent) => false,
-            Ok(RegularFileProbe::LimitExceeded) => {
-                let mut row = child_status(relative, "skipped_limit");
-                row.reason = Some("file_probe_entry_cap".to_owned());
-                result.push(row);
-                continue;
-            }
-            Err(_) => {
-                let mut row = child_status(relative, "skipped_unreadable");
-                row.reason = Some("read_dir_failed".to_owned());
-                result.push(row);
-                continue;
-            }
-        };
-        if has_file {
-            result.push(child_status(relative.clone(), "planned"));
-            planned_handles.insert(
-                relative.clone(),
-                child.try_clone().map_err(|err| crate::PipelineError::Io {
-                    path: relative.clone(),
-                    message: err.to_string(),
-                })?,
-            );
-            // This is captured while the discovered directory is still known
-            // to be the public child. The subprocess itself uses only the
-            // retained descriptor; this path is identity/registry metadata.
-            // `root` is the parent's already-canonical repository root.
-            // Do not canonicalize the child public name here: a replacement
-            // in that interval could otherwise turn identity metadata into a
-            // victim path even though the retained handle stays correct.
-            canonical_roots.insert(relative.clone(), root.join(&relative_path));
-        }
+        // Management covers directories themselves, including empty folders
+        // and folders whose current files are all ignored. File eligibility is
+        // evaluated later by the managed scan, never used as enrollment proof.
+        result.push(child_status(relative.clone(), "planned"));
+        planned_handles.insert(
+            relative.clone(),
+            child.try_clone().map_err(|err| crate::PipelineError::Io {
+                path: relative.clone(),
+                message: err.to_string(),
+            })?,
+        );
+        canonical_roots.insert(relative.clone(), root.join(&relative_path));
         if depth + 1 >= MAX_CHILD_SCOPE_DEPTH {
             let mut row = child_status(relative, "skipped_limit");
             row.reason = Some("depth_cap".to_owned());
@@ -756,53 +1359,27 @@ fn relative_scope_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-enum RegularFileProbe {
-    Found,
-    Absent,
-    LimitExceeded,
-}
-
-fn directory_has_includable_regular_file(
-    path: &File,
-    relative_dir: &Path,
-    rules: &[IgnoreRule],
-    case_insensitive: bool,
-) -> Result<RegularFileProbe> {
-    let entries = cap_fs::read_base_dir(path).map_err(|err| crate::PipelineError::Io {
-        path: relative_scope_path(relative_dir),
-        message: err.to_string(),
-    })?;
-    for (index, entry) in entries.enumerate() {
-        if index >= MAX_CHILD_SCOPE_PROBE_ENTRIES {
-            return Ok(RegularFileProbe::LimitExceeded);
-        }
-        let entry = entry.map_err(|err| crate::PipelineError::Io {
-            path: relative_scope_path(relative_dir),
-            message: err.to_string(),
-        })?;
-        let name = entry.file_name();
-        if name != ".git"
-            && name != ".kioignore"
-            && name != ".kio"
-            && entry
-                .file_type()
-                .map_err(|err| crate::PipelineError::Io {
-                    path: relative_scope_path(relative_dir),
-                    message: err.to_string(),
-                })?
-                .is_file()
-        {
-            let relative = relative_scope_path(&relative_dir.join(&name));
-            let secret = classify_secret(&relative);
-            let ignored = try_ignored_by_rules(&relative, false, rules, case_insensitive)?
-                || secret == Some(SecretTier::TierA)
-                    && !try_explicitly_unignored(&relative, false, rules, case_insensitive)?;
-            if !ignored {
-                return Ok(RegularFileProbe::Found);
-            }
-        }
+fn same_cap_directory_volume(left: &File, right: &File) -> Result<bool> {
+    let left = cap_fs::Metadata::from_file(left).pipeline_io(Path::new("."))?;
+    let right = cap_fs::Metadata::from_file(right).pipeline_io(Path::new("."))?;
+    #[cfg(unix)]
+    {
+        use cap_fs::MetadataExt;
+        Ok(left.dev() == right.dev())
     }
-    Ok(RegularFileProbe::Absent)
+    #[cfg(windows)]
+    {
+        use cap_fs::_WindowsByHandle;
+        Ok(left.volume_serial_number() == right.volume_serial_number())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (left, right);
+        Err(crate::PipelineError::contract(
+            "KIO-E-SCAN-VOLUME-001",
+            "platform has no retained filesystem identity",
+        ))
+    }
 }
 
 fn is_vcs_root(path: &File) -> bool {
@@ -830,15 +1407,8 @@ fn same_cap_directory_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata
 
 pub fn load_index_vcs_repos(scope_path: &Path) -> Result<bool> {
     let path = scope_path.join(".kio/config.toml");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(err) => {
-            return Err(crate::PipelineError::Io {
-                path: path.display().to_string(),
-                message: err.to_string(),
-            });
-        }
+    let Some(text) = read_optional_bounded_local_text(&path)? else {
+        return Ok(false);
     };
     let value: toml::Value =
         toml::from_str(&text).map_err(|err| crate::PipelineError::Schema(err.to_string()))?;
@@ -1260,8 +1830,8 @@ pub fn current_scan_policy_allows_file(scope_path: &Path, input_path: &str) -> R
 }
 
 /// Re-evaluate policy from retained directory handles without resolving a
-/// public scope pathname. Stored generated-parent rules are loaded from the
-/// bound config, followed by local rules and the root `.kioignore`.
+/// public scope pathname. Ancestor denial is evaluated as a separate authority
+/// group, so a target-local negation can never restore an inherited exclusion.
 pub fn current_bound_scan_policy_allows_file(
     root: &File,
     kio: &File,
@@ -1287,13 +1857,15 @@ pub fn current_bound_scan_policy_allows_file(
         return Ok(false);
     }
     let case_insensitive = probe_bound_case_insensitive(kio);
-    let mut ignore_rules = inherited_rules.to_vec();
-    ignore_rules.extend(load_bound_config_ignore(kio)?);
-    ignore_rules.extend(load_bound_kioignore(root)?);
+    if rules_ignore_path(input_path, false, inherited_rules, case_insensitive)? {
+        return Ok(false);
+    }
+    let mut local_rules = load_bound_config_ignore(kio)?;
+    local_rules.extend(load_bound_kioignore(root)?);
     let secret = classify_secret(input_path);
-    let ignored = try_ignored_by_rules(input_path, false, &ignore_rules, case_insensitive)?
+    let ignored = try_ignored_by_rules(input_path, false, &local_rules, case_insensitive)?
         || secret == Some(SecretTier::TierA)
-            && !try_explicitly_unignored(input_path, false, &ignore_rules, case_insensitive)?;
+            && !try_explicitly_unignored(input_path, false, &local_rules, case_insensitive)?;
     Ok(!ignored)
 }
 
@@ -1572,38 +2144,10 @@ fn is_xdg_state_inside_scope(scope_path: &Path, path: &Path) -> bool {
 
 pub fn load_kioignore(scope_path: &Path) -> Result<Vec<IgnoreRule>> {
     let path = scope_path.join(".kioignore");
-    if !path.is_file() {
+    let Some(content) = read_optional_bounded_local_text(&path)? else {
         return Ok(Vec::new());
-    }
-    let content = std::fs::read_to_string(&path).pipeline_io(&path)?;
-    let rules = content
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            if trimmed.is_empty() || trimmed.starts_with('#') {
-                return None;
-            }
-            let (negated, pattern) = trimmed
-                .strip_prefix('!')
-                .map(|pattern| (true, pattern))
-                .unwrap_or((false, trimmed));
-            Some(IgnoreRule {
-                pattern: pattern.to_owned(),
-                negated,
-                scope_prefix: None,
-            })
-        })
-        .map(|rule| {
-            validate_ignore_rule(&rule)?;
-            Ok(rule)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if rules.len() > MAX_GENERATED_PARENT_IGNORE_RULES {
-        return Err(crate::PipelineError::Schema(
-            "ignore file exceeds rule cap".to_owned(),
-        ));
-    }
-    Ok(rules)
+    };
+    parse_kioignore_text(&content)
 }
 
 pub fn load_config_ignore(scope_path: &Path) -> Result<Vec<IgnoreRule>> {
@@ -1614,15 +2158,8 @@ pub fn load_config_ignore(scope_path: &Path) -> Result<Vec<IgnoreRule>> {
 
 fn load_generated_parent_ignore(scope_path: &Path) -> Result<Vec<IgnoreRule>> {
     let path = scope_path.join(".kio/config.toml");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(crate::PipelineError::Io {
-                path: path.display().to_string(),
-                message: err.to_string(),
-            });
-        }
+    let Some(text) = read_optional_bounded_local_text(&path)? else {
+        return Ok(Vec::new());
     };
     let value: toml::Value =
         toml::from_str(&text).map_err(|err| crate::PipelineError::Schema(err.to_string()))?;
@@ -1653,18 +2190,18 @@ fn load_generated_parent_ignore(scope_path: &Path) -> Result<Vec<IgnoreRule>> {
 
 fn load_local_config_ignore(scope_path: &Path) -> Result<Vec<IgnoreRule>> {
     let path = scope_path.join(".kio/config.toml");
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(err) => {
-            return Err(crate::PipelineError::Io {
-                path: path.display().to_string(),
-                message: err.to_string(),
-            });
-        }
+    let Some(text) = read_optional_bounded_local_text(&path)? else {
+        return Ok(Vec::new());
     };
+    parse_local_config_ignore_text(&text)
+}
+
+/// Parse only the local `[scope].ignore` authority.  In particular this never
+/// consults the deprecated generated-parent-policy field: callers which need
+/// a live effective policy must read every validated ancestor themselves.
+pub(crate) fn parse_local_config_ignore_text(text: &str) -> Result<Vec<IgnoreRule>> {
     let value: toml::Value =
-        toml::from_str(&text).map_err(|err| crate::PipelineError::Schema(err.to_string()))?;
+        toml::from_str(text).map_err(|err| crate::PipelineError::Schema(err.to_string()))?;
     let Some(ignore) = value
         .get("scope")
         .and_then(|scope| scope.get("ignore"))
@@ -1688,6 +2225,41 @@ fn load_local_config_ignore(scope_path: &Path) -> Result<Vec<IgnoreRule>> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(local)
+}
+
+fn read_optional_bounded_local_text(path: &Path) -> Result<Option<String>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() || metadata.file_type().is_symlink() => {
+            Err(crate::PipelineError::contract(
+                "KIO-E-SCAN-FILE-IDENTITY-001",
+                format!(
+                    "scan configuration is not a bounded regular file: {}",
+                    path.display()
+                ),
+            ))
+        }
+        Ok(_) => {
+            let bytes =
+                kio_core::cas::read_bounded_regular_file(path, MAX_BOUND_SCAN_METADATA_BYTES)
+                    .map_err(|error| {
+                        crate::PipelineError::contract(
+                            "KIO-E-SCAN-FILE-IDENTITY-001",
+                            format!(
+                                "scan configuration is absent, unsafe, or changed: {}: {error}",
+                                path.display()
+                            ),
+                        )
+                    })?;
+            let text = String::from_utf8(bytes)
+                .map_err(|error| crate::PipelineError::Schema(error.to_string()))?;
+            Ok(Some(text))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(crate::PipelineError::Io {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        }),
+    }
 }
 
 /// Read the strict child policy from the retained `.kio` directory. Generated
@@ -1747,6 +2319,11 @@ fn load_bound_kioignore(root: &File) -> Result<Vec<IgnoreRule>> {
     let Some(content) = read_bound_optional_regular_text(root, ".kioignore")? else {
         return Ok(Vec::new());
     };
+    parse_kioignore_text(&content)
+}
+
+/// Parse the direct `.kioignore` file with the shared bounded rule grammar.
+pub(crate) fn parse_kioignore_text(content: &str) -> Result<Vec<IgnoreRule>> {
     let rules = content
         .lines()
         .filter_map(|line| {
@@ -1818,22 +2395,28 @@ fn read_bound_optional_regular_text(dir: &File, name: &str) -> Result<Option<Str
             format!("scan configuration cannot fit in process memory: {name}"),
         )
     })?;
-    let mut text = String::new();
-    text.try_reserve_exact(capacity).map_err(|_| {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(capacity).map_err(|_| {
         crate::PipelineError::contract(
             "KIO-E-SCAN-INPUT-OVERSIZED-001",
             format!("scan configuration cannot fit in process memory: {name}"),
         )
     })?;
-    file.read_to_string(&mut text).pipeline_io(path)?;
-    if text.len() as u64 != opened.len() {
+    // Bound the descriptor read as well as the pre-open observation. A writer
+    // can extend a regular file after metadata was checked; `read_to_string`
+    // would then grow until EOF before the later identity check could reject.
+    let mut limited = (&mut file).take(opened.len().saturating_add(1));
+    limited.read_to_end(&mut bytes).pipeline_io(path)?;
+    if bytes.len() as u64 != opened.len() {
         return Err(crate::PipelineError::contract(
             "KIO-E-SCAN-INPUT-CHANGED-001",
             format!("scan configuration changed while it was being read: {name}"),
         ));
     }
     ensure_bound_file_unchanged(&file, &opened, path)?;
-    Ok(Some(text))
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|error| crate::PipelineError::Schema(error.to_string()))
 }
 
 /// QA7 (step4b-contract-tests-p3a.md §B): the Tier B needle set, exposed so
@@ -1914,7 +2497,7 @@ fn probe_bound_case_insensitive(kio: &File) -> bool {
     insensitive
 }
 
-fn try_ignored_by_rules(
+pub(crate) fn rules_ignore_path(
     path: &str,
     is_dir: bool,
     rules: &[IgnoreRule],
@@ -1930,7 +2513,7 @@ fn try_ignored_by_rules(
     Ok(ignored)
 }
 
-fn try_explicitly_unignored(
+pub(crate) fn rules_explicitly_unignore_path(
     path: &str,
     is_dir: bool,
     rules: &[IgnoreRule],
@@ -1943,6 +2526,26 @@ fn try_explicitly_unignored(
         }
     }
     Ok(false)
+}
+
+// Existing scan call sites use these private spellings. Keep their behavior
+// routed through the policy helpers so the matcher has one implementation.
+fn try_ignored_by_rules(
+    path: &str,
+    is_dir: bool,
+    rules: &[IgnoreRule],
+    case_insensitive: bool,
+) -> Result<bool> {
+    rules_ignore_path(path, is_dir, rules, case_insensitive)
+}
+
+fn try_explicitly_unignored(
+    path: &str,
+    is_dir: bool,
+    rules: &[IgnoreRule],
+    case_insensitive: bool,
+) -> Result<bool> {
+    rules_explicitly_unignore_path(path, is_dir, rules, case_insensitive)
 }
 
 fn apply_scope_prefix(path: &str, rule: &IgnoreRule) -> Result<String> {
@@ -2130,7 +2733,7 @@ fn media_type_for_path(path: &Path) -> &'static str {
 }
 
 fn scope_id_from_scope_json(scope_path: &Path) -> Option<String> {
-    let value = std::fs::read_to_string(scope_path.join(".kio/scope.json")).ok()?;
+    let value = read_optional_bounded_local_text(&scope_path.join(".kio/scope.json")).ok()??;
     let value = serde_json::from_str::<serde_json::Value>(&value).ok()?;
     value.get("scope_id")?.as_str().map(str::to_owned)
 }
@@ -2242,7 +2845,7 @@ mod tests {
     }
 
     #[test]
-    fn child_scope_discovery_rejects_an_unspawnable_parent_policy_up_front() {
+    fn child_scope_discovery_keeps_large_typed_inherited_rules_in_memory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join(".kio")).unwrap();
         std::fs::create_dir_all(dir.path().join("child")).unwrap();
@@ -2261,37 +2864,21 @@ mod tests {
         )
         .unwrap();
 
-        let error = match discover_child_scopes(dir.path()) {
-            Ok(_) => panic!("oversized inherited policy must be rejected before planning"),
-            Err(error) => error,
-        };
-        assert!(
-            error
-                .to_string()
-                .contains("generated parent ignore payload exceeds byte cap"),
-            "the parent must fail before spawning a child with an E2BIG-prone argv"
-        );
+        let plan = discover_child_scopes(dir.path()).unwrap();
+        let child = bind_planned_child(&plan, "child").unwrap().unwrap();
+        assert_eq!(child.canonical_root, dir.path().join("child"));
+        assert_eq!(child.inherited_rules.len(), rules.len());
     }
 
     #[test]
-    fn generated_parent_policy_wire_payload_round_trips_at_the_shared_limit() {
-        let rules = vec![IgnoreRule {
-            pattern: "private.md".to_owned(),
-            negated: false,
-            scope_prefix: Some("child".to_owned()),
-        }];
-        let payload = serialize_generated_parent_policy_payload(&rules).unwrap();
-        assert_eq!(
-            parse_generated_parent_policy_payload(&payload).unwrap(),
-            rules
-        );
-
-        let oversized = vec![IgnoreRule {
-            pattern: "x".repeat(MAX_GENERATED_PARENT_IGNORE_PAYLOAD_BYTES),
-            negated: false,
-            scope_prefix: Some("child".to_owned()),
-        }];
-        assert!(serialize_generated_parent_policy_payload(&oversized).is_err());
+    fn bound_child_rechecks_vcs_exclusion_after_discovery() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(".kio")).unwrap();
+        std::fs::create_dir_all(dir.path().join("child")).unwrap();
+        std::fs::write(dir.path().join("child/note.md"), "body").unwrap();
+        let plan = discover_child_scopes(dir.path()).unwrap();
+        std::fs::write(dir.path().join("child/.git"), "gitdir: elsewhere\n").unwrap();
+        assert!(bind_planned_child(&plan, "child").unwrap().is_none());
     }
 
     #[test]
@@ -2816,10 +3403,6 @@ mod tests {
             })
             .is_err()
         );
-        assert!(parse_generated_parent_policy_payload(
-            r#"{\"rules\":[{\"pattern\":\"private.md\",\"negated\":false,\"scope_prefix\":\"../escape\"}]}"#
-        )
-        .is_err());
     }
 
     #[test]
@@ -2836,7 +3419,7 @@ mod tests {
     }
 
     #[test]
-    fn qb15_ignored_only_child_directory_is_not_planned_as_an_empty_scope() {
+    fn ignored_files_do_not_prevent_management_of_their_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(dir.path().join("private")).unwrap();
         std::fs::create_dir_all(dir.path().join(".kio")).unwrap();
@@ -2850,7 +3433,7 @@ mod tests {
         assert!(
             plan.candidates
                 .iter()
-                .all(|candidate| candidate.path != "private" || candidate.status != "planned")
+                .any(|candidate| candidate.path == "private" && candidate.status == "planned")
         );
     }
 }

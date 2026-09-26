@@ -1771,15 +1771,22 @@ mod macos {
         fn fixture() -> (TempDir, PathBuf, PathBuf, u32, u32) {
             let temporary = tempfile::tempdir().unwrap();
             let anchor = fs::canonicalize(temporary.path()).unwrap();
+            let metadata = fs::symlink_metadata(&anchor).unwrap();
+            let (uid, gid) = (metadata.uid(), metadata.gid());
+            assert_eq!(uid, unsafe { libc::getuid() });
+            // macOS children inherit their parent directory's group, which
+            // can differ from getgid() when TMPDIR is beneath /private/tmp.
             let parent = anchor.join("trusted");
             fs::create_dir(&parent).unwrap();
             fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
             let leaf = parent.join("kio-eval");
             fs::write(&leaf, b"sealed evaluator").unwrap();
             fs::set_permissions(&leaf, fs::Permissions::from_mode(0o600)).unwrap();
-            (temporary, anchor, leaf, unsafe { libc::getuid() }, unsafe {
-                libc::getgid()
-            })
+            for path in [&parent, &leaf] {
+                let metadata = fs::symlink_metadata(path).unwrap();
+                assert_eq!((metadata.uid(), metadata.gid()), (uid, gid));
+            }
+            (temporary, anchor, leaf, uid, gid)
         }
 
         fn bind(anchor: &Path, leaf: &Path, uid: u32, gid: u32) -> Vec<RetainedAuthority> {
@@ -1792,6 +1799,15 @@ mod macos {
             let retained = bind(&anchor, &leaf, uid, gid);
             assert_eq!(retained.len(), 3);
             recheck_authority(&retained, "test evaluator").unwrap();
+        }
+
+        #[test]
+        fn authority_binding_rejects_a_mismatched_expected_group() {
+            let (_temporary, anchor, leaf, uid, gid) = fixture();
+            assert!(
+                require_authority_from(&anchor, &leaf, uid, gid.wrapping_add(1), "test evaluator")
+                    .is_err()
+            );
         }
 
         #[test]

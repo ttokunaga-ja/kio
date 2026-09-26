@@ -419,6 +419,7 @@ fn markdown_unit_from_hint(
         // every branch above (raw passthrough, fenced code, PDF-extracted
         // text, the baseline sentinel) is covered uniformly.
         markdown: normalize_to_markdown_v1(&markdown),
+        owned_image_hashes: Default::default(),
         metadata: Default::default(),
     }
 }

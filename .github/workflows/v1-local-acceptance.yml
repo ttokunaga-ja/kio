@@ -1,0 +1,137 @@
+name: V1 private local GPU acceptance
+run-name: v1 local GPU acceptance ${{ inputs.candidate_sha }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha: { description: Exact 40-character main SHA, required: true, type: string }
+      package_run_id: { description: Successful v1-acceptance.yml run ID, required: true, type: string }
+
+# Serializes all three native clients against one leased WSL GPU.  A failed job
+# never cancels a lease-owning sibling.
+concurrency: { group: v1-local-acceptance-global, cancel-in-progress: false }
+permissions: { actions: read, contents: read, id-token: write }
+
+jobs:
+  local-a08:
+    name: ${{ matrix.os }} authenticated local A08
+    environment: v1-local-acceptance
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 70
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - { os: linux, runner: ubuntu-latest }
+          - { os: macos, runner: macos-26 }
+          - { os: windows, runner: windows-latest }
+    defaults: { run: { shell: bash } }
+    env:
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      PACKAGE_RUN_ID: ${{ inputs.package_run_id }}
+    steps:
+      - name: Reject any non-main or unverified package source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]; [[ "$PACKAGE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          main_sha="$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq .object.sha)"
+          test "$GITHUB_SHA" = "$main_sha"; test "$GITHUB_SHA" = "$CANDIDATE_SHA"
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}" | jq -e --arg sha "$CANDIDATE_SHA" \
+            '.event == "workflow_dispatch" and .status == "completed" and .conclusion == "success" and .head_sha == $sha and .path == ".github/workflows/v1-acceptance.yml"' >/dev/null
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - run: test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+      - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+      - name: Build the exact candidate acceptance binaries
+        run: |
+          set -euo pipefail
+          cargo +1.98.0 build -p kio-eval --bin kio-eval --bin kio-acceptance-tools --locked
+          tools_bin=target/debug/kio-acceptance-tools
+          if [[ "$RUNNER_OS" == Windows ]]; then tools_bin="${tools_bin}.exe"; fi
+          test -f "$tools_bin"
+          printf 'KIO_ACCEPTANCE_TOOLS=%s\n' "$tools_bin" >> "$GITHUB_ENV"
+      - name: Extract exactly one strict native package leaf
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          row="$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}/artifacts?per_page=100" --jq '.artifacts[] | [.id,.name,(.expired|tostring),.size_in_bytes] | @tsv' | awk -F '\t' -v n="kio-v1-package-${{ matrix.os }}-${CANDIDATE_SHA}" '$2 == n {print}')"
+          test "$(printf '%s\n' "$row" | sed '/^$/d' | wc -l | tr -d ' ')" = 1; IFS=$'\t' read -r id _ expired bytes <<< "$row"
+          test "$expired" = false; test "$bytes" -le 805306368
+          root="$RUNNER_TEMP/kio-v1-local-package"; (umask 077; mkdir "$root")
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${id}/zip" > "$root/package.zip"
+          "$KIO_ACCEPTANCE_TOOLS" package-extract --archive "$root/package.zip" --output "$root/package"
+          root="$root/package"
+          archive="$(find "$root" -maxdepth 1 -name '*.tar.gz' -type f -print)"; sums="$(find "$root" -maxdepth 1 -name '*.checksums.json' -type f -print)"
+          eval_bin=target/debug/kio-eval; test "$RUNNER_OS" != Windows || eval_bin="${eval_bin}.exe"
+          lock="$(<"$root/kio-v1-lock-sha256")"; hash="$($eval_bin release archive-sha256 --archive "$archive")"
+          "$eval_bin" release verify --archive "$archive" --checksums "$sums" --expected-archive-sha256 "$hash" --source-repo "$GITHUB_WORKSPACE" --expected-commit "$CANDIDATE_SHA" --expected-lock-sha256 "$lock"
+          mkdir "$root/extract"; tar -xzf "$archive" -C "$root/extract"; release="$(find "$root/extract" -mindepth 1 -maxdepth 1 -type d -print)"; test -n "$release"
+          bin="$release/bin/kio"; test "$RUNNER_OS" != Windows || bin="${bin}.exe"; test -f "$bin"
+          printf 'KIO_EVAL=%s\nKIO_RELEASE_BIN=%s\nKIO_PACKAGE_ROOT=%s\n' "$eval_bin" "$bin" "$root" >> "$GITHUB_ENV"
+
+      - uses: tailscale/github-action@306e68a486fd2350f2bfc3b19fcd143891a4a2d8 # v4
+        with:
+          oauth-client-id: ${{ vars.KIO_TS_CLIENT_ID }}
+          audience: ${{ vars.KIO_TS_AUDIENCE }}
+          tags: tag:kio-ci
+          version: 1.94.2
+      - name: Materialize the dedicated route privately at creation on every OS
+        env:
+          KIO_LAB_KEY: ${{ secrets.KIO_LAB_SSH_PRIVATE_KEY }}
+          KIO_LAB_HOSTS: ${{ vars.KIO_LAB_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          d="$RUNNER_TEMP/kio-local-route"
+          "$KIO_ACCEPTANCE_TOOLS" route-materialize --root "$d"
+          printf 'KIO_ROUTE_DIR=%s\n' "$d" >> "$GITHUB_ENV"
+      - name: Acquire one lease and bind its public service identity
+        id: prepare
+        env:
+          KIO_LAB_JUMP_HOST: ${{ vars.KIO_LAB_JUMP_HOST }}
+          KIO_LAB_JUMP_USER: ${{ vars.KIO_LAB_JUMP_USER }}
+        run: |
+          set -euo pipefail; test -n "$KIO_LAB_JUMP_HOST"; test "$KIO_LAB_JUMP_USER" = kio-ci
+          "$KIO_ACCEPTANCE_TOOLS" local-client prepare --candidate "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --os '${{ matrix.os }}' --jump-host "$KIO_LAB_JUMP_HOST" --jump-user "$KIO_LAB_JUMP_USER" --known-hosts "$KIO_ROUTE_DIR/known_hosts" --identity-file "$KIO_ROUTE_DIR/id" --identity-out "$KIO_ROUTE_DIR/kio-v1-local-identity.json" --capability-file "$KIO_ROUTE_DIR/kio-v1-local-capability" > "$RUNNER_TEMP/kio-v1-local-prepare.json"
+          echo "service_identity_sha256=$(jq -er .service_identity_sha256 "$RUNNER_TEMP/kio-v1-local-prepare.json")" >> "$GITHUB_OUTPUT"
+      - name: Bind the A08 expected case after public identity observation
+        run: |
+          set -euo pipefail; root="$KIO_PACKAGE_ROOT"; target="$RUNNER_TEMP/kio-v1-local-target.json"; expected="$RUNNER_TEMP/kio-v1-local-a08-expected.json"
+          hash="$($KIO_EVAL release archive-sha256 --archive "$(find "$root" -maxdepth 1 -name '*.tar.gz' -type f -print)")"; workflow_hash="$(shasum -a 256 .github/workflows/v1-local-acceptance.yml | awk '{print $1}')"
+          "$KIO_EVAL" acceptance target-binding --candidate-sha "$CANDIDATE_SHA" --os '${{ matrix.os }}' --target "$(jq -er .target "$root/target-binding.json")" --archive-sha256 "$hash" --binary-sha256 "$(jq -er .binary_sha256 "$root/target-binding.json")" --version "$(jq -er .version "$root/target-binding.json")" --out "$target"
+          "$KIO_EVAL" acceptance expected-case --target-binding "$target" --case A08 --lane provider-live --subcase authenticated-local --os '${{ matrix.os }}' --fixture-id v1-authenticated-local-public --fixture-sha256 8a61250a8a21ac49d3edaa03b55e5a9e0b45e7bda92f678c53811ffc080e2cc3 --workflow-path .github/workflows/v1-local-acceptance.yml --workflow-sha256 "$workflow_hash" --workflow-commit "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --architecture "$(uname -m)" --service-identity-sha256 '${{ steps.prepare.outputs.service_identity_sha256 }}' --out "$expected"
+      - name: Run ordered authenticated local A08 and clean only this lease
+        if: always()
+        env:
+          KIO_LAB_JUMP_HOST: ${{ vars.KIO_LAB_JUMP_HOST }}
+          KIO_LAB_JUMP_USER: ${{ vars.KIO_LAB_JUMP_USER }}
+        run: |
+          set -euo pipefail; test -n "$KIO_LAB_JUMP_HOST"; test "$KIO_LAB_JUMP_USER" = kio-ci
+          "$KIO_ACCEPTANCE_TOOLS" local-client run --candidate "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --os '${{ matrix.os }}' --jump-host "$KIO_LAB_JUMP_HOST" --jump-user "$KIO_LAB_JUMP_USER" --known-hosts "$KIO_ROUTE_DIR/known_hosts" --identity-file "$KIO_ROUTE_DIR/id" --identity-out "$KIO_ROUTE_DIR/kio-v1-local-identity.json" --capability-file "$KIO_ROUTE_DIR/kio-v1-local-capability" --expected "$RUNNER_TEMP/kio-v1-local-a08-expected.json" --eval-bin "$KIO_EVAL" --candidate-bin "$KIO_RELEASE_BIN" --fixture "$GITHUB_WORKSPACE/crates/kio-eval/acceptance-fixtures/v1/authenticated-local-public" --work-dir "$RUNNER_TEMP/kio-v1-local-a08-work" --receipt "$RUNNER_TEMP/kio-v1-local-a08-receipt.json"
+      - name: Upload public service identity
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: kio-gpu-runtime-identity-${{ inputs.candidate_sha }}-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/kio-local-route/kio-v1-local-identity.json
+            ${{ runner.temp }}/kio-local-route/kio-v1-local-observed-*.json
+          if-no-files-found: error
+          overwrite: false
+      - name: Upload expected A08 binding
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: kio-v1-local-${{ inputs.candidate_sha }}-${{ matrix.os }}
+          path: |
+            ${{ runner.temp }}/kio-v1-local-a08-expected.json
+            ${{ runner.temp }}/kio-v1-local-a08-receipt.json
+          if-no-files-found: error
+          overwrite: false

@@ -15,18 +15,19 @@
 //! mutation as the republication's snapshot finalize (05-runtime.md §3.5).
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Write};
-use std::path::{Component, Path, PathBuf};
+#[cfg(any(test, windows))]
+use std::fs;
+#[cfg(not(windows))]
+use std::fs::File;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::cas::{canonical_json_bytes, fanout_path, is_hash};
+use crate::store_dir::{Publication, StoreDirectory};
 use crate::{ExitCode, KioError, Result};
 
 pub const MAX_PURGE_TARGETS: usize = 100_000;
@@ -50,8 +51,6 @@ pub const MAX_EPOCH_COUNTER_BYTES: u64 = 64;
 // `.kio/purge/journal-closure` sidecar ([`PurgeClosure`]).
 const JOURNAL_SCHEMA_VERSION: u64 = 3;
 const RECEIPT_SCHEMA_VERSION: u64 = 2;
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PurgeReason {
@@ -483,7 +482,7 @@ pub fn canonical_final_event(
 
 /// LC46/PA43's `closure` item: one `(object_type, hash)` deletion target.
 /// `object_type` is one of `"raw"`, `"prepared"`, `"image"`, `"chunk"`,
-/// `"manifest"`, or `"normalized_unit"`
+/// `"manifest"`, `"normalized_unit"`, or `"embedding"`
 /// (`hash` is a `chunk_id`, which is itself a canonical `sha256:` hash — see
 /// `crate::cas::is_hash`). The full enumeration — including the
 /// shared-derived live-reference resolution result for `prepared`/`image` —
@@ -524,7 +523,10 @@ pub struct PurgeClosure {
     pub preserved: Vec<ClosureItem>,
 }
 
-const CLOSURE_SCHEMA_VERSION: u64 = 1;
+// v2 freezes semantic embedding identities before derived SQLite deletion.
+// A v1 closure cannot prove that an absent embedding item means no target;
+// reject it rather than resume with incomplete physical-deletion authority.
+const CLOSURE_SCHEMA_VERSION: u64 = 2;
 
 impl PurgeClosure {
     /// Construct and validate a fresh closure for `purge_id`. `items`/
@@ -553,7 +555,9 @@ impl PurgeClosure {
 
     fn validate(&self) -> Result<()> {
         if self.schema_version != CLOSURE_SCHEMA_VERSION {
-            return Err(corrupt_state("purge closure schema_version is invalid"));
+            return Err(corrupt_state(
+                "purge closure schema_version is unsupported; complete frozen embedding authority requires version 2",
+            ));
         }
         if !crate::scope::is_ulid(&self.purge_id) {
             return Err(corrupt_state("purge closure purge_id must be a ULID"));
@@ -748,7 +752,7 @@ pub enum BeginOutcome {
 
 #[derive(Debug, Clone)]
 pub struct PurgeState {
-    kio_dir: PathBuf,
+    directory: StoreDirectory,
 }
 
 /// Result of [`PurgeState::recover_lifecycle_epoch`] (LC43/LC44).
@@ -762,25 +766,46 @@ pub struct LifecycleEpochRecovery {
 }
 
 impl PurgeState {
+    /// Open a scope store once and retain its filesystem capability for every
+    /// purge lifecycle operation. The supplied pathname is used only for this
+    /// explicit initial capability acquisition. The parent is canonicalized
+    /// before the `.kio` leaf is appended: this accommodates platform-owned
+    /// aliases such as macOS `/var` without ever resolving a `.kio` link.
+    pub fn open(kio_dir: impl AsRef<Path>) -> Result<Self> {
+        let kio_dir = kio_dir.as_ref();
+        let parent = kio_dir
+            .parent()
+            .ok_or_else(|| corrupt_state("Kio directory has no parent"))?;
+        let leaf = kio_dir
+            .file_name()
+            .ok_or_else(|| corrupt_state("Kio directory has no final component"))?;
+        let parent = parent
+            .canonicalize()
+            .map_err(|error| KioError::io(error.to_string(), parent.display().to_string()))?;
+        Ok(Self::from_directory(StoreDirectory::open(
+            &parent.join(leaf),
+        )?))
+    }
+
+    /// Construct purge state from a scope capability retained by the caller.
+    /// No lifecycle operation below re-opens `directory.path()`.
     #[must_use]
-    pub fn new(kio_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            kio_dir: kio_dir.into(),
-        }
+    pub fn from_directory(directory: StoreDirectory) -> Self {
+        Self { directory }
     }
 
     #[must_use]
     pub fn journal_path(&self) -> PathBuf {
-        self.kio_dir.join("purge/in-progress.json")
+        self.directory.path().join("purge/in-progress.json")
     }
 
     /// PA43-46 (§R ruling #2): the `.kio/purge/journal-closure` sidecar path —
     /// a single JSON file, same temp+rename+fsync discipline as the journal
-    /// (`write_private_replace`), holding the full closure enumeration that
+    /// (retained-directory atomic publication), holding the full closure enumeration that
     /// `PurgeJournal::closure_hash` references by content hash.
     #[must_use]
     pub fn closure_path(&self) -> PathBuf {
-        self.kio_dir.join("purge/journal-closure")
+        self.directory.path().join("purge/journal-closure")
     }
 
     /// Durably write the closure sidecar. The caller must do this *before*
@@ -788,9 +813,8 @@ impl PurgeState {
     /// references a closure_hash whose sidecar is not yet durable.
     pub fn write_closure(&self, closure: &PurgeClosure) -> Result<()> {
         closure.validate()?;
-        write_private_replace(
-            &self.kio_dir,
-            &self.closure_path(),
+        self.write_relative(
+            Self::closure_relative(),
             &closure_bytes(closure)?,
             MAX_PURGE_CLOSURE_BYTES,
         )
@@ -802,28 +826,29 @@ impl PurgeState {
     /// `closure_hash` (this method only enforces internal structural
     /// validity, not the binding to any particular journal).
     pub fn read_closure(&self) -> Result<Option<PurgeClosure>> {
-        let Some(bytes) = read_bounded_regular(&self.closure_path(), MAX_PURGE_CLOSURE_BYTES)?
+        let Some(bytes) = self.read_relative(Self::closure_relative(), MAX_PURGE_CLOSURE_BYTES)?
         else {
             return Ok(None);
         };
-        ensure_owner_private(&self.closure_path())?;
+        self.directory
+            .ensure_owner_private(Self::closure_relative())?;
         let closure: PurgeClosure = parse_record(&bytes, "purge closure")?;
         closure.validate()?;
         Ok(Some(closure))
     }
 
     pub fn tombstone_path(&self, raw_hash: &str) -> Result<PathBuf> {
-        fanout_path(self.kio_dir.join("tombstones"), raw_hash)
+        fanout_path(self.directory.path().join("tombstones"), raw_hash)
     }
 
     pub fn erase_receipt_path(&self, raw_hash: &str) -> Result<PathBuf> {
-        fanout_path(self.kio_dir.join("purge/erase-receipts"), raw_hash)
+        fanout_path(self.directory.path().join("purge/erase-receipts"), raw_hash)
     }
 
     /// `.kio/purge/epoch` (LC39/LC120): the ABA barrier's monotonic counter.
     #[must_use]
     pub fn purge_epoch_path(&self) -> PathBuf {
-        self.kio_dir.join("purge/epoch")
+        self.directory.path().join("purge/epoch")
     }
 
     /// `.kio/tombstones/lifecycle-epoch` (LC41/LC120): the lifecycle-event
@@ -831,7 +856,62 @@ impl PurgeState {
     /// `purge/epoch` (LC41's note: the two must never share storage).
     #[must_use]
     pub fn lifecycle_epoch_path(&self) -> PathBuf {
-        self.kio_dir.join("tombstones/lifecycle-epoch")
+        self.directory.path().join("tombstones/lifecycle-epoch")
+    }
+
+    fn write_relative(&self, relative: &Path, bytes: &[u8], max_bytes: u64) -> Result<()> {
+        if bytes.len() as u64 > max_bytes {
+            return Err(corrupt_state("purge record exceeds its size limit"));
+        }
+        if let Some(parent) = relative.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            self.directory.create_directory_all(parent)?;
+        }
+        self.directory
+            .write_atomic(relative, bytes, Publication::Upsert)
+    }
+
+    fn read_relative(&self, relative: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> {
+        self.directory
+            .read_optional(relative, max_bytes)
+            .map_err(Self::map_store_state_error)
+    }
+
+    fn entries_relative(
+        &self,
+        relative: &Path,
+    ) -> Result<Option<Vec<crate::store_dir::StoreEntry>>> {
+        self.directory
+            .entries_optional(relative)
+            .map_err(Self::map_store_state_error)
+    }
+
+    fn map_store_state_error(error: KioError) -> KioError {
+        if error.error_code() == "KIO-E-STORE-UNSAFE-001" {
+            corrupt_state("purge state entry is unsafe")
+        } else {
+            error
+        }
+    }
+
+    fn journal_relative() -> &'static Path {
+        Path::new("purge/in-progress.json")
+    }
+    fn closure_relative() -> &'static Path {
+        Path::new("purge/journal-closure")
+    }
+    fn purge_epoch_relative() -> &'static Path {
+        Path::new("purge/epoch")
+    }
+    fn lifecycle_epoch_relative() -> &'static Path {
+        Path::new("tombstones/lifecycle-epoch")
+    }
+    fn tombstone_relative(raw_hash: &str) -> Result<PathBuf> {
+        fanout_path(PathBuf::from("tombstones"), raw_hash)
+    }
+    fn erase_receipt_relative(raw_hash: &str) -> Result<PathBuf> {
+        fanout_path(PathBuf::from("purge/erase-receipts"), raw_hash)
     }
 
     /// Start, resume, or recognize an already-completed default purge. The
@@ -858,6 +938,7 @@ impl PurgeState {
         closure_hash: impl Into<String>,
         purge_id: impl Into<String>,
     ) -> Result<BeginOutcome> {
+        crate::scope::reject_pending_managed_restore(&self.directory)?;
         let desired = PurgeJournal::new(
             target_raw_hashes,
             reason,
@@ -919,8 +1000,8 @@ impl PurgeState {
             // weight contract, since this is a per-invocation check, not
             // fsck's own bulk scan).
             for record in &existing_tombstones {
-                verify_marker_binding_bounded(
-                    &self.kio_dir,
+                verify_marker_binding_in_directory(
+                    &self.directory,
                     &record.raw_hash,
                     record.tail(),
                     &desired.started_at,
@@ -929,9 +1010,8 @@ impl PurgeState {
             return Ok(BeginOutcome::AlreadyComplete(existing_tombstones));
         }
 
-        write_private_replace(
-            &self.kio_dir,
-            &self.journal_path(),
+        self.write_relative(
+            Self::journal_relative(),
             &journal_bytes(&desired)?,
             MAX_PURGE_JOURNAL_BYTES,
         )?;
@@ -939,11 +1019,12 @@ impl PurgeState {
     }
 
     pub fn read_journal(&self) -> Result<Option<PurgeJournal>> {
-        let Some(bytes) = read_bounded_regular(&self.journal_path(), MAX_PURGE_JOURNAL_BYTES)?
+        let Some(bytes) = self.read_relative(Self::journal_relative(), MAX_PURGE_JOURNAL_BYTES)?
         else {
             return Ok(None);
         };
-        ensure_owner_private(&self.journal_path())?;
+        self.directory
+            .ensure_owner_private(Self::journal_relative())?;
         let journal: PurgeJournal = parse_record(&bytes, "purge journal")?;
         journal.validate()?;
         Ok(Some(journal))
@@ -960,9 +1041,8 @@ impl PurgeState {
         let mut updated = current;
         updated.phase = next;
         updated.validate()?;
-        write_private_replace(
-            &self.kio_dir,
-            &self.journal_path(),
+        self.write_relative(
+            Self::journal_relative(),
             &journal_bytes(&updated)?,
             MAX_PURGE_JOURNAL_BYTES,
         )?;
@@ -985,15 +1065,15 @@ impl PurgeState {
 
     pub fn read_tombstone(&self, raw_hash: &str) -> Result<Option<TombstoneRecord>> {
         validate_hash("tombstone lookup", raw_hash)?;
-        read_bounded_regular(&self.tombstone_path(raw_hash)?, MAX_PURGE_RECORD_BYTES)?
+        self.read_relative(&Self::tombstone_relative(raw_hash)?, MAX_PURGE_RECORD_BYTES)?
             .map(|bytes| parse_tombstone_bytes(&bytes, raw_hash))
             .transpose()
     }
 
     pub fn read_erase_receipt(&self, raw_hash: &str) -> Result<Option<EraseReceipt>> {
         validate_hash("erase receipt lookup", raw_hash)?;
-        let path = self.erase_receipt_path(raw_hash)?;
-        let Some(bytes) = read_bounded_regular(&path, MAX_PURGE_RECORD_BYTES)? else {
+        let relative = Self::erase_receipt_relative(raw_hash)?;
+        let Some(bytes) = self.read_relative(&relative, MAX_PURGE_RECORD_BYTES)? else {
             return Ok(None);
         };
         Ok(Some(parse_erase_receipt_bytes(&bytes, raw_hash)?))
@@ -1029,9 +1109,8 @@ impl PurgeState {
         event.lifecycle_epoch = Some(self.increment_lifecycle_epoch()?);
         record.events.push(event);
         record.validate_structure()?;
-        write_private_replace(
-            &self.kio_dir,
-            &self.tombstone_path(raw_hash)?,
+        self.write_relative(
+            &Self::tombstone_relative(raw_hash)?,
             &record_bytes(&record)?,
             MAX_PURGE_RECORD_BYTES,
         )?;
@@ -1064,9 +1143,8 @@ impl PurgeState {
         event.lifecycle_epoch = Some(self.increment_lifecycle_epoch()?);
         receipt.events.push(event);
         receipt.validate_structure()?;
-        write_private_replace(
-            &self.kio_dir,
-            &self.erase_receipt_path(raw_hash)?,
+        self.write_relative(
+            &Self::erase_receipt_relative(raw_hash)?,
             &record_bytes(&receipt)?,
             MAX_PURGE_RECORD_BYTES,
         )?;
@@ -1152,7 +1230,14 @@ impl PurgeState {
                 "a visible purge barrier cannot be aborted",
             ));
         }
-        quarantine_then_unlink(&self.journal_path(), MAX_PURGE_JOURNAL_BYTES)
+        let expected = self
+            .read_relative(Self::journal_relative(), MAX_PURGE_JOURNAL_BYTES)?
+            .ok_or_else(|| incomplete_state("purge journal is missing"))?;
+        self.directory.quarantine_then_remove(
+            Self::journal_relative(),
+            &expected,
+            MAX_PURGE_JOURNAL_BYTES,
+        )
     }
 
     /// `done` (LC51): fixed order — (1) advance `.kio/purge/epoch` to
@@ -1167,7 +1252,14 @@ impl PurgeState {
             ));
         }
         self.write_purge_epoch(current.target_epoch)?;
-        quarantine_then_unlink(&self.journal_path(), MAX_PURGE_JOURNAL_BYTES)
+        let expected = self
+            .read_relative(Self::journal_relative(), MAX_PURGE_JOURNAL_BYTES)?
+            .ok_or_else(|| incomplete_state("purge journal is missing"))?;
+        self.directory.quarantine_then_remove(
+            Self::journal_relative(),
+            &expected,
+            MAX_PURGE_JOURNAL_BYTES,
+        )
     }
 
     fn require_current(&self, expected: &PurgeJournal) -> Result<PurgeJournal> {
@@ -1190,7 +1282,8 @@ impl PurgeState {
     }
 
     fn read_purge_epoch_lenient(&self) -> Result<Option<u64>> {
-        let Some(bytes) = read_bounded_regular(&self.purge_epoch_path(), MAX_EPOCH_COUNTER_BYTES)?
+        let Some(bytes) =
+            self.read_relative(Self::purge_epoch_relative(), MAX_EPOCH_COUNTER_BYTES)?
         else {
             return Ok(None);
         };
@@ -1198,9 +1291,8 @@ impl PurgeState {
     }
 
     fn write_purge_epoch(&self, value: u64) -> Result<()> {
-        write_private_replace(
-            &self.kio_dir,
-            &self.purge_epoch_path(),
+        self.write_relative(
+            Self::purge_epoch_relative(),
             value.to_string().as_bytes(),
             MAX_EPOCH_COUNTER_BYTES,
         )
@@ -1235,7 +1327,7 @@ impl PurgeState {
 
     fn read_lifecycle_epoch_lenient(&self) -> Result<Option<u64>> {
         let Some(bytes) =
-            read_bounded_regular(&self.lifecycle_epoch_path(), MAX_EPOCH_COUNTER_BYTES)?
+            self.read_relative(Self::lifecycle_epoch_relative(), MAX_EPOCH_COUNTER_BYTES)?
         else {
             return Ok(None);
         };
@@ -1243,9 +1335,8 @@ impl PurgeState {
     }
 
     fn write_lifecycle_epoch(&self, value: u64) -> Result<()> {
-        write_private_replace(
-            &self.kio_dir,
-            &self.lifecycle_epoch_path(),
+        self.write_relative(
+            Self::lifecycle_epoch_relative(),
             value.to_string().as_bytes(),
             MAX_EPOCH_COUNTER_BYTES,
         )
@@ -1337,21 +1428,64 @@ impl PurgeState {
     /// malformed marker aborts the scan (fail-closed: undercounting a max used
     /// for monotonic-recreation could reissue an epoch value).
     fn scan_all_events(&self, mut visit: impl FnMut(&LifecycleEvent)) -> Result<()> {
-        for path in walk_fanout_leaves(&self.kio_dir.join("tombstones"))? {
-            if let Some(bytes) = read_bounded_regular(&path, MAX_PURGE_RECORD_BYTES)? {
-                let raw_hash = leaf_raw_hash(&path);
+        for relative in self.fanout_leaf_relatives(Path::new("tombstones"))? {
+            if let Some(bytes) = self.read_relative(&relative, MAX_PURGE_RECORD_BYTES)? {
+                let raw_hash = leaf_raw_hash(&relative);
                 let record = parse_tombstone_bytes(&bytes, &raw_hash)?;
                 record.events.iter().for_each(&mut visit);
             }
         }
-        for path in walk_fanout_leaves(&self.kio_dir.join("purge/erase-receipts"))? {
-            if let Some(bytes) = read_bounded_regular(&path, MAX_PURGE_RECORD_BYTES)? {
-                let raw_hash = leaf_raw_hash(&path);
+        for relative in self.fanout_leaf_relatives(Path::new("purge/erase-receipts"))? {
+            if let Some(bytes) = self.read_relative(&relative, MAX_PURGE_RECORD_BYTES)? {
+                let raw_hash = leaf_raw_hash(&relative);
                 let receipt = parse_erase_receipt_bytes(&bytes, &raw_hash)?;
                 receipt.events.iter().for_each(&mut visit);
             }
         }
         Ok(())
+    }
+
+    fn fanout_leaf_relatives(&self, base: &Path) -> Result<Vec<PathBuf>> {
+        let mut leaves = Vec::new();
+        let Some(top_entries) = self.entries_relative(base)? else {
+            return Ok(leaves);
+        };
+        for top in top_entries {
+            // `tombstones/lifecycle-epoch` is the only flat file in either
+            // fanout root. Any other non-directory could conceal a bucket
+            // from epoch recovery and must stop the scan.
+            if !top.is_directory {
+                if base == Path::new("tombstones")
+                    && top.is_regular_file
+                    && top.name == "lifecycle-epoch"
+                {
+                    continue;
+                }
+                return Err(corrupt_state("purge fanout root has a non-directory entry"));
+            }
+            let top_relative = base.join(&top.name);
+            let Some(mid_entries) = self.entries_relative(&top_relative)? else {
+                continue;
+            };
+            for mid in mid_entries {
+                if !mid.is_directory {
+                    return Err(corrupt_state(
+                        "purge fanout bucket has a non-directory entry",
+                    ));
+                }
+                let mid_relative = top_relative.join(&mid.name);
+                let Some(leaf_entries) = self.entries_relative(&mid_relative)? else {
+                    continue;
+                };
+                for leaf in leaf_entries {
+                    if !leaf.is_regular_file {
+                        return Err(corrupt_state("purge fanout bucket has a non-regular entry"));
+                    }
+                    leaves.push(mid_relative.join(leaf.name));
+                }
+            }
+        }
+        Ok(leaves)
     }
 }
 
@@ -1364,56 +1498,6 @@ fn leaf_raw_hash(path: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or("");
     format!("sha256:{name}")
-}
-
-/// Enumerate every leaf file under a two-level fanout directory
-/// (`base/xx/yy/<leaf>`), tolerating a missing `base` (nothing recorded yet)
-/// or non-directory siblings (e.g. `tombstones/lifecycle-epoch`, a flat file
-/// directly under `tombstones/`, is skipped by the top-level directory
-/// check). R23-23: only `NotFound` is tolerated at every level — any other
-/// `read_dir` error (permission denied, I/O error, a path component that
-/// changed into a non-directory mid-walk) is propagated fail-closed rather
-/// than silently treated as "nothing here." A silently-skipped fanout bucket
-/// previously caused the epoch-recovery max-scans
-/// ([`PurgeState::max_recorded_purge_epoch`]/[`PurgeState::max_recorded_lifecycle_epoch`])
-/// to undercount, letting a rollback-recovery step reissue an already-used
-/// epoch value (an ABA collision) instead of surfacing the I/O failure.
-fn walk_fanout_leaves(base: &Path) -> Result<Vec<PathBuf>> {
-    let mut leaves = Vec::new();
-    let top_entries = match fs::read_dir(base) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(leaves),
-        Err(error) => return Err(state_io(error)),
-    };
-    for top in top_entries {
-        let top = top.map_err(state_io)?;
-        if !top.file_type().map_err(state_io)?.is_dir() {
-            continue;
-        }
-        let mid_entries = match fs::read_dir(top.path()) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(state_io(error)),
-        };
-        for mid in mid_entries {
-            let mid = mid.map_err(state_io)?;
-            if !mid.file_type().map_err(state_io)?.is_dir() {
-                continue;
-            }
-            let leaf_entries = match fs::read_dir(mid.path()) {
-                Ok(entries) => entries,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(state_io(error)),
-            };
-            for leaf in leaf_entries {
-                let leaf = leaf.map_err(state_io)?;
-                if leaf.file_type().map_err(state_io)?.is_file() {
-                    leaves.push(leaf.path());
-                }
-            }
-        }
-    }
-    Ok(leaves)
 }
 
 /// R23-11 (05-runtime.md §3.5 L934/L942, 10-operations.md §7.5.1): the pure
@@ -1484,6 +1568,37 @@ pub fn verify_marker_binding_bounded(
     }
     let object = crate::cas::ObjectStore::new(kio_dir)
         .read_by_hash(&event.in_commit)
+        .map_err(|_| {
+            corrupt_state("lifecycle event in_commit does not resolve to a verified commit object")
+        })?;
+    if object.kind != crate::cas::ObjectKind::Commit {
+        return Err(corrupt_state(
+            "lifecycle event in_commit does not identify a commit object",
+        ));
+    }
+    let commit: crate::dag::CommitObject = serde_json::from_slice(&object.bytes)
+        .map_err(|_| corrupt_state("lifecycle event in_commit is not a valid commit object"))?;
+    commit
+        .validate()
+        .map_err(|_| corrupt_state("lifecycle event in_commit is not a valid commit object"))?;
+    verify_marker_binding(raw_hash, event, &commit, now)
+}
+
+/// Retained-directory counterpart of [`verify_marker_binding_bounded`].
+/// Purge re-entry uses this form so the marker's commit lookup stays within
+/// the exact `.kio` capability that owns the active purge journal.
+pub fn verify_marker_binding_in_directory(
+    directory: &StoreDirectory,
+    raw_hash: &str,
+    event: &LifecycleEvent,
+    now: &str,
+) -> Result<()> {
+    if !matches!(event.kind, EventKind::Purged | EventKind::Erased) {
+        return Ok(());
+    }
+    let root = directory.root_handle();
+    let object = crate::cas::ObjectStore::from_bound_kio(root.as_ref())
+        .and_then(|store| store.read_by_hash(&event.in_commit))
         .map_err(|_| {
             corrupt_state("lifecycle event in_commit does not resolve to a verified commit object")
         })?;
@@ -1645,376 +1760,14 @@ fn is_valid_utc(value: &str) -> bool {
     (1..=max_day).contains(&day) && hour <= 23 && minute <= 59 && second <= 59
 }
 
-fn read_bounded_regular(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> {
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) if error.kind() == std::io::ErrorKind::NotADirectory => {
-            return Err(corrupt_state("purge state ancestor is not a directory"));
-        }
-        Err(error) => return Err(state_io(error)),
-    };
-    if before.file_type().is_symlink() || !before.file_type().is_file() || before.len() > max_bytes
-    {
-        return Err(corrupt_state("purge state is not a bounded regular file"));
-    }
-    reject_multiple_links(&before)?;
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    configure_no_follow(&mut options);
-    let mut file = options.open(path).map_err(state_io)?;
-    let opened = file.metadata().map_err(state_io)?;
-    let after = fs::symlink_metadata(path).map_err(state_io)?;
-    #[cfg(windows)]
-    let same_identity = {
-        let mut verification_options = OpenOptions::new();
-        verification_options.read(true);
-        configure_no_follow(&mut verification_options);
-        let verification = verification_options.open(path).map_err(state_io)?;
-        same_windows_private_file(&file, &verification)
-    };
-    #[cfg(not(windows))]
-    let same_identity = same_file_identity(&opened, &after);
-    if after.file_type().is_symlink() || !after.file_type().is_file() || !same_identity {
-        return Err(corrupt_state("purge state identity changed during open"));
-    }
-    reject_multiple_links(&opened)?;
-    let mut bytes = Vec::new();
-    std::io::Read::by_ref(&mut file)
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(state_io)?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(corrupt_state("purge state exceeds its size limit"));
-    }
-    Ok(Some(bytes))
-}
-
-/// Durable full-file replace: temp write -> fsync -> atomic rename -> parent
-/// directory fsync (LC4's primitive, [04-pipeline.md §1.1]-equivalent). Used
-/// for the journal and, since Step4b, for tombstone/erase-receipt records too
-/// (their `events[]` grows over the record's lifetime, unlike the old
-/// write-once-then-immutable terminal record).
-fn write_private_replace(kio_dir: &Path, path: &Path, bytes: &[u8], max_bytes: u64) -> Result<()> {
-    if bytes.len() as u64 > max_bytes {
-        return Err(corrupt_state("purge record exceeds its size limit"));
-    }
-    let parent = ensure_secure_parent(kio_dir, path)?;
-    if path.exists() {
-        read_bounded_regular(path, max_bytes)?
-            .ok_or_else(|| corrupt_state("purge state disappeared"))?;
-    }
-    let (temp_path, mut temp) = create_private_temp(&parent)?;
-    let result = (|| -> Result<()> {
-        temp.write_all(bytes).map_err(state_io)?;
-        temp.sync_all().map_err(state_io)?;
-        drop(temp);
-        replace_file(&temp_path, path)?;
-        // R23-07: propagate a failed parent-directory fsync instead of
-        // treating it as success -- callers (marker append, epoch-counter
-        // write, journal phase advance) must not proceed to the next phase
-        // (object deletion, journal removal) on an unconfirmed rename.
-        sync_directory(&parent).map_err(state_io)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp_path);
-    }
-    result
-}
-
-fn ensure_secure_parent(kio_dir: &Path, path: &Path) -> Result<PathBuf> {
-    let root_metadata = fs::symlink_metadata(kio_dir).map_err(state_io)?;
-    if !directory_is_real(kio_dir, &root_metadata)? {
-        return Err(corrupt_state("Kio root is not a real directory"));
-    }
-    let root = kio_dir.canonicalize().map_err(state_io)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| corrupt_state("purge state path has no parent"))?;
-    let relative = parent
-        .strip_prefix(kio_dir)
-        .map_err(|_| corrupt_state("purge state path escapes Kio root"))?;
-    let mut current = kio_dir.to_path_buf();
-    for component in relative.components() {
-        let Component::Normal(component) = component else {
-            return Err(corrupt_state("purge state path is not normalized"));
-        };
-        current.push(component);
-        match fs::create_dir(&current) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(state_io(error)),
-        }
-        let metadata = fs::symlink_metadata(&current).map_err(state_io)?;
-        if !directory_is_real(&current, &metadata)? {
-            return Err(corrupt_state(
-                "purge state ancestor is not a real directory",
-            ));
-        }
-        let canonical = current.canonicalize().map_err(state_io)?;
-        if !canonical.starts_with(&root) {
-            return Err(corrupt_state("purge state ancestor escapes Kio root"));
-        }
-    }
-    Ok(parent.to_path_buf())
-}
-
-fn directory_is_real(path: &Path, metadata: &fs::Metadata) -> Result<bool> {
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-        return Ok(false);
-    }
-    #[cfg(windows)]
-    {
-        return crate::cas::windows_directory_is_real(path).map_err(state_io);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        Ok(true)
-    }
-}
-
-#[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    fs::rename(source, destination).map_err(state_io)
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: both UTF-16 buffers are NUL-terminated and remain alive for the call.
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(state_io(std::io::Error::last_os_error()))
-    } else {
-        Ok(())
-    }
-}
-
-fn create_private_temp(parent: &Path) -> Result<(PathBuf, File)> {
-    for _ in 0..32 {
-        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let path = parent.join(format!(
-            ".purge-tmp-{}-{nanos}-{sequence}",
-            std::process::id()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        match options.open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(state_io(error)),
-        }
-    }
-    Err(state_io(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not allocate purge temp file",
-    )))
-}
-
-fn quarantine_then_unlink(path: &Path, max_bytes: u64) -> Result<()> {
-    let Some(expected_bytes) = read_bounded_regular(path, max_bytes)? else {
-        return Ok(());
-    };
-    let parent = path
-        .parent()
-        .ok_or_else(|| corrupt_state("purge state path has no parent"))?;
-    let quarantine = parent.join(format!(
-        ".purge-remove-{}-{}",
-        std::process::id(),
-        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    fs::rename(path, &quarantine).map_err(state_io)?;
-    match read_bounded_regular(&quarantine, max_bytes) {
-        Ok(Some(actual_bytes)) if actual_bytes == expected_bytes => {}
-        Ok(_) => {
-            restore_private_no_clobber(parent, path, &expected_bytes);
-            return Err(corrupt_state("purge state changed before removal"));
-        }
-        Err(error) => {
-            restore_private_no_clobber(parent, path, &expected_bytes);
-            return Err(error);
-        }
-    }
-    fs::remove_file(&quarantine).map_err(state_io)?;
-    // R23-07: an unpropagated fsync failure here previously let `finish()`
-    // (05 §3.5's `done` step: epoch bump then journal removal) and
-    // `abort_before_barrier()` report success while the journal's removal
-    // was not yet durable -- exactly the "journal 不在 × 旧 epoch" ABA
-    // window §3.5's fixed `done` ordering exists to close.
-    sync_directory(parent).map_err(state_io)?;
-    Ok(())
-}
-
-/// Best-effort fail-closed recovery for a remove race. Never overwrites a path
-/// another actor published while the state file was quarantined. R23-07:
-/// `sync_directory` now returns a `Result`; this function's own contract
-/// (best-effort, caller already discards `result`) is unchanged, but the
-/// call itself must use `?` rather than the old bare void call so a failed
-/// fsync is at least captured in `result` (still discarded below) instead of
-/// silently type-checking as success.
-fn restore_private_no_clobber(parent: &Path, path: &Path, expected_bytes: &[u8]) {
-    let Ok((temp_path, mut temp)) = create_private_temp(parent) else {
-        return;
-    };
-    let result = (|| -> std::io::Result<()> {
-        temp.write_all(expected_bytes)?;
-        temp.sync_all()?;
-        drop(temp);
-        match fs::hard_link(&temp_path, path) {
-            Ok(()) => sync_directory(parent)?,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-        Ok(())
-    })();
-    let _ = fs::remove_file(&temp_path);
-    let _ = result;
-}
-
-fn ensure_owner_private(path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = fs::metadata(path).map_err(state_io)?.permissions().mode();
-        if mode & 0o077 != 0 {
-            return Err(corrupt_state("purge journal is not owner-private"));
-        }
-    }
-    let _ = path;
-    Ok(())
-}
-
-#[cfg(unix)]
-fn reject_multiple_links(metadata: &fs::Metadata) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    if metadata.nlink() == 1 {
-        Ok(())
-    } else {
-        Err(corrupt_state("purge state has an unexpected hardlink"))
-    }
-}
-
-#[cfg(windows)]
-fn reject_multiple_links(_metadata: &fs::Metadata) -> Result<()> {
-    // File-handle identity and link count are checked together below.
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn reject_multiple_links(_metadata: &fs::Metadata) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-fn configure_no_follow(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    options.custom_flags(0x20_800);
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    options.custom_flags(0x104);
-    let _ = options;
-}
-
-#[cfg(windows)]
-fn configure_no_follow(options: &mut OpenOptions) {
-    use std::os::windows::fs::OpenOptionsExt;
-    options.custom_flags(0x0020_0000);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_no_follow(_options: &mut OpenOptions) {}
-
-#[cfg(unix)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
-}
-
-#[cfg(windows)]
-fn same_windows_private_file(left: &File, right: &File) -> bool {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-
-    fn information(file: &File) -> Option<BY_HANDLE_FILE_INFORMATION> {
-        let mut information = BY_HANDLE_FILE_INFORMATION::default();
-        // SAFETY: `file` owns a valid handle and the output pointer is writable.
-        let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
-        (ok != 0).then_some(information)
-    }
-
-    let (Some(left), Some(right)) = (information(left), information(right)) else {
-        return false;
-    };
-    let left_index = (u64::from(left.nFileIndexHigh) << 32) | u64::from(left.nFileIndexLow);
-    let right_index = (u64::from(right.nFileIndexHigh) << 32) | u64::from(right.nFileIndexLow);
-    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
-    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-    let forbidden = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT;
-    left.dwVolumeSerialNumber == right.dwVolumeSerialNumber
-        && left_index == right_index
-        && left.nNumberOfLinks == 1
-        && right.nNumberOfLinks == 1
-        && left.dwFileAttributes & forbidden == 0
-        && right.dwFileAttributes & forbidden == 0
-}
-
 /// Fsync a directory so a prior rename/unlink within it is durable (R23-07,
 /// 05-runtime.md §3.5 L834-836 "temp 書込 → file fsync → atomic rename →
 /// 親 directory fsync" and L843-845 "journal を除去 + directory fsync").
 /// Must propagate failure to its caller: silently swallowing a failed
-/// open/fsync here let [`write_private_replace`] report success for a
-/// tombstone/erase-receipt marker append whose directory entry was never
-/// actually made durable, and let [`quarantine_then_unlink`] report success
-/// for a journal removal with the same gap — either opens exactly the
-/// "markerless absence" / "journal reappears after crash" window §3.5
-/// exists to close (LC49's ordering guarantee already depended on this
-/// being durable; only the failure path was silently discarded).
+/// open/fsync here would let a legacy path-based object-store publication
+/// report success before its directory entry was durable. Retained
+/// `StoreDirectory` purge operations enforce the corresponding ordering by
+/// descriptor-relative primitives.
 ///
 /// `pub(crate)` because the object store needs the identical guarantee for its
 /// own post-`remove_file` entries: [`crate::cas`] carried two hand-rolled
@@ -2029,24 +1782,6 @@ pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
 
 /// Windows counterpart. **Windows has no directory fsync**, so this arm cannot
 /// make the same durability promise as the POSIX one above.
-///
-/// The POSIX body does not merely degrade here -- it fails outright, every
-/// time. `File::open` on a directory returns ERROR_ACCESS_DENIED (os error 5)
-/// because Rust does not pass `FILE_FLAG_BACKUP_SEMANTICS`, which is what
-/// getting a directory handle requires. Opening one by hand does not rescue
-/// it: `sync_all` calls `FlushFileBuffers`, which wants write access that a
-/// directory handle cannot carry. So the three purge call sites
-/// (`write_private_replace`, `quarantine_then_unlink`,
-/// `restore_private_no_clobber`) turned every purge-journal write on Windows
-/// into `KIO-E-STORE-IO-001`, which is what four tests were failing on.
-/// The ordering §3.5 buys from the POSIX fsync comes from NTFS's own metadata
-/// journalling instead; that is a weaker promise and is recorded as such in
-/// 05-runtime.md §3.5.
-///
-/// The [`crate::cas`] callers would have hit that same wall the moment their
-/// swallowed `let _ =` became a propagated `?` — on Windows the old block was
-/// not merely lossy but a permanent no-op — which is why they must adopt this
-/// arm and not just the POSIX one.
 ///
 /// What survives is the *fail-closed* half of R23-07: a parent that is missing
 /// or is not a directory still surfaces to the caller rather than
@@ -2090,15 +1825,6 @@ fn purge_epoch_fail_closed() -> KioError {
     )
 }
 
-fn state_io(error: std::io::Error) -> KioError {
-    KioError::new(
-        "KIO-E-STORE-IO-001",
-        error.to_string(),
-        json!({ "component": "purge_state" }),
-        ExitCode::Failure,
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2111,7 +1837,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let kio_dir = dir.path().join(".kio");
         fs::create_dir(&kio_dir).unwrap();
-        (dir, PurgeState::new(kio_dir))
+        (dir, PurgeState::open(kio_dir).unwrap())
     }
 
     fn raw() -> String {
@@ -2177,7 +1903,7 @@ mod tests {
     fn test_commit(kind: crate::dag::CommitType, created_at: &str) -> crate::dag::CommitObject {
         crate::dag::CommitObject::new(
             hash_bytes(b"tree"),
-            Vec::new(),
+            None,
             created_at.to_owned(),
             "marker test".to_owned(),
             hash_bytes(b"toollock"),
@@ -2196,7 +1922,7 @@ mod tests {
     fn test_purged_commit(created_at: &str, purged_raws: Vec<String>) -> crate::dag::CommitObject {
         crate::dag::CommitObject::new_purged(
             hash_bytes(b"tree"),
-            Vec::new(),
+            None,
             created_at.to_owned(),
             "marker test".to_owned(),
             hash_bytes(b"toollock"),
@@ -2221,6 +1947,16 @@ mod tests {
         let commit = test_purged_commit(created_at, raw_hashes);
         let bytes = canonical_json_bytes(&serde_json::to_value(&commit).unwrap()).unwrap();
         let hash = hash_bytes(&bytes);
+        // The retained reader validates the complete CAS namespace, rather
+        // than opening only `objects/commits`. Build the same initialized
+        // layout a real scope has before exercising that reader.
+        for kind in [
+            crate::cas::ObjectKind::Raw,
+            crate::cas::ObjectKind::Tree,
+            crate::cas::ObjectKind::Commit,
+        ] {
+            fs::create_dir_all(kio_dir.join("objects").join(kind.directory())).unwrap();
+        }
         crate::cas::ObjectStore::new(kio_dir)
             .write_object_bytes(crate::cas::ObjectKind::Commit, &hash, &bytes)
             .unwrap();
@@ -2587,6 +2323,25 @@ mod tests {
     }
 
     #[test]
+    fn closure_v2_rejects_v1_without_rewriting_persisted_state() {
+        let (_dir, state) = setup();
+        let journal = started(&state);
+        let current = state.read_closure().unwrap().unwrap();
+        assert_eq!(current.schema_version, 2);
+        let mut legacy = current;
+        legacy.schema_version = 1;
+        let bytes = record_bytes(&legacy).unwrap();
+        fs::write(state.closure_path(), &bytes).unwrap();
+        let journal_bytes = fs::read(state.journal_path()).unwrap();
+        let error = state.read_closure().unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
+        assert!(error.message().contains("version 2"));
+        assert_eq!(fs::read(state.closure_path()).unwrap(), bytes);
+        assert_eq!(fs::read(state.journal_path()).unwrap(), journal_bytes);
+        assert_eq!(state.read_journal().unwrap().unwrap(), journal);
+    }
+
+    #[test]
     fn lc49_marker_is_durable_before_journal_reaches_deleted() {
         let (_dir, state) = setup();
         let journal = started(&state);
@@ -2852,6 +2607,13 @@ mod tests {
             state.read_tombstone(&raw()).unwrap_err().error_code(),
             "KIO-E-STORE-CORRUPT-001"
         );
+        assert_eq!(
+            state
+                .max_recorded_lifecycle_epoch()
+                .unwrap_err()
+                .error_code(),
+            "KIO-E-STORE-CORRUPT-001"
+        );
         assert_eq!(fs::read(&outside).unwrap(), b"outside");
 
         fs::remove_file(&path).unwrap();
@@ -2912,7 +2674,7 @@ mod tests {
         // pre-fix version (`if let Ok(directory) = File::open(path) { let _
         // = directory.sync_all(); }`, which silently no-oped on either an
         // open OR a sync failure), the failure must now surface to callers
-        // (`write_private_replace`/`quarantine_then_unlink`).
+        // (the legacy path-based object-store publication adapter).
         let (dir, _state) = setup();
         let missing = dir.path().join("does-not-exist");
         assert!(sync_directory(&missing).is_err());
@@ -2944,18 +2706,14 @@ mod tests {
     }
 
     #[test]
-    fn r23_23_walk_fanout_leaves_fails_closed_on_non_notfound_errors() {
+    fn r23_23_fanout_scan_fails_closed_on_non_directory_store_entry() {
         let (dir, state) = setup();
         let kio_dir = dir.path().join(".kio");
-        // `tombstones` exists but is a regular file, not a directory --
-        // `read_dir` fails with something other than `NotFound`, which must
-        // propagate (fail-closed) instead of being silently treated as
-        // "nothing recorded yet" (the pre-fix `let Ok(top_entries) =
-        // fs::read_dir(base) else { return Ok(leaves) }` pattern swallowed
-        // every error, not just `NotFound` -- an undercounted epoch-recovery
-        // max-scan can reissue an already-used epoch value).
+        // A regular file cannot stand in for the tombstone fanout directory.
+        // Treating it as absent would undercount epoch recovery and could
+        // reissue an already-used epoch value.
         fs::write(kio_dir.join("tombstones"), b"not a directory").unwrap();
         let error = state.max_recorded_lifecycle_epoch().unwrap_err();
-        assert_eq!(error.error_code(), "KIO-E-STORE-IO-001");
+        assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
     }
 }

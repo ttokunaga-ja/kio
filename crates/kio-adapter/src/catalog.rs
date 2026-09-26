@@ -25,9 +25,9 @@ use crate::office_convert::{is_office_media, resolve_office_converter};
 use crate::traits::{EmbeddingAdapter, MarkdownizeAdapter, PrepareAdapter};
 use crate::types::{
     AdapterProfile, AdapterUsage, EmbeddingInputType, EmbeddingItem, EmbeddingRequest,
-    EmbeddingVector, ExecutionMode, IncrementalHints, MarkdownizeMode, MarkdownizeRequest,
-    MarkdownizeResponse, PreparedUnitHint, PreviousMarkdownizeContext, ProviderIdempotency,
-    RawInput,
+    EmbeddingVector, ExecutionMode, FailedUnit, IncrementalHints, MarkdownizeMode,
+    MarkdownizeRequest, MarkdownizeResponse, PreparedUnitHint, PreviousMarkdownizeContext,
+    ProviderIdempotency, RawInput,
 };
 use crate::{AdapterError, Result};
 
@@ -57,6 +57,9 @@ mod test_control {
                 MistralOcrMode::NetworkError => "network_error",
                 MistralOcrMode::Mock => "mock",
                 MistralOcrMode::Partial => "partial",
+                MistralOcrMode::PartialNetwork => "partial_network",
+                MistralOcrMode::AllFailedNetwork => "all_failed_network",
+                MistralOcrMode::AllFailedInvalidInput => "all_failed_invalid_input",
                 MistralOcrMode::MockLinkImage => "mock_link_image",
                 MistralOcrMode::IncrementalIncomplete => "incr_incomplete",
                 MistralOcrMode::PinChanged => "pin_changed",
@@ -82,6 +85,9 @@ mod test_control {
             MistralOcrMode::NetworkError => "network_error",
             MistralOcrMode::Mock => "mock",
             MistralOcrMode::Partial => "partial",
+            MistralOcrMode::PartialNetwork => "partial_network",
+            MistralOcrMode::AllFailedNetwork => "all_failed_network",
+            MistralOcrMode::AllFailedInvalidInput => "all_failed_invalid_input",
             MistralOcrMode::MockLinkImage => "mock_link_image",
             MistralOcrMode::IncrementalIncomplete => "incr_incomplete",
             MistralOcrMode::PinChanged => "pin_changed",
@@ -227,12 +233,13 @@ pub fn local_ocr_markdownize_adapter(
                     "an offline_api markdownize adapter must declare `url`".to_owned(),
                 )
             })?;
+            let endpoint = crate::tool_lock::authenticated_local_endpoint("markdown", &base_url)?;
             // D7: `[adapter.policy.offline_api].timeout_seconds` (07 §7). A
             // document pipeline is the case that number exists for — a
             // multi-page PDF can hold the socket quiet for minutes.
             let timeout_seconds = crate::tool_lock::registered_execution_timeout("offline_api");
             LocalOcrMarkdownizeAdapter::new(
-                EnvLocalOcrClient::new(base_url, timeout_seconds),
+                EnvLocalOcrClient::new(endpoint, timeout_seconds),
                 LocalOcrExecution::Real,
                 scope_id,
             )
@@ -420,6 +427,9 @@ pub fn run_standard_online_markdownize_with_bytes(
         // KIO-side acceptance check fails and the online route falls back to Full.
         Some("mock")
         | Some("partial")
+        | Some("partial_network")
+        | Some("all_failed_network")
+        | Some("all_failed_invalid_input")
         | Some("mock_link_image")
         | Some("incr_incomplete")
         | Some("pin_changed")
@@ -447,10 +457,31 @@ pub fn run_standard_online_markdownize_with_bytes(
                 &response,
             )?;
             // Test-only Kio response seams run after the provider page mapping has
-            // passed its exact-bijection checks. This preserves partial/fallback
-            // lifecycle coverage without weakening the OCR transport contract.
+            // passed its exact-bijection checks. `partial_network` preserves the
+            // valid Partial lifecycle; `partial` deliberately remains a malformed
+            // dropped-output response for contract-rejection coverage.
             if test_mode == Some("partial") {
                 response.updated_units.pop();
+            }
+            if test_mode == Some("partial_network")
+                && let Some(unit) = response.updated_units.pop()
+            {
+                response.failed_units.push(FailedUnit {
+                    unit_key: unit.unit_key,
+                    error_kind: "network_error".to_owned(),
+                });
+            }
+            if let Some(error_kind) = match test_mode {
+                Some("all_failed_network") => Some("network_error"),
+                Some("all_failed_invalid_input") => Some("invalid_input"),
+                _ => None,
+            } {
+                response
+                    .failed_units
+                    .extend(response.updated_units.drain(..).map(|unit| FailedUnit {
+                        unit_key: unit.unit_key,
+                        error_kind: error_kind.to_owned(),
+                    }));
             }
             if test_mode == Some("incr_incomplete")
                 && response_mode == MarkdownizeMode::Incremental
@@ -651,6 +682,9 @@ pub fn resolve_standard_online_markdownize_profile_with_bbox(
         }
         Some("mock")
         | Some("partial")
+        | Some("partial_network")
+        | Some("all_failed_network")
+        | Some("all_failed_invalid_input")
         | Some("mock_link_image")
         | Some("incr_incomplete")
         | Some("pin_changed")
@@ -697,6 +731,34 @@ pub fn resolve_standard_online_markdownize_profile_with_bbox(
 struct MockStandardOnlineMarkdownizeClient {
     test_mode: Option<&'static str>,
     capture_sent_media: Option<std::path::PathBuf>,
+}
+
+// A decodable, deterministic 1x1 RGB PNG. Distinct unit keys retain distinct
+// image content so mock OCR exercises content-addressed image deduplication.
+fn mock_ocr_png(unit_key: &str) -> Vec<u8> {
+    use sha2::{Digest, Sha256};
+
+    fn chunk(png: &mut Vec<u8>, kind: &[u8; 4], bytes: &[u8]) {
+        png.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        png.extend_from_slice(kind);
+        png.extend_from_slice(bytes);
+        let mut crc = !0u32;
+        for byte in kind.iter().chain(bytes) {
+            crc ^= u32::from(*byte);
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xedb88320 & 0u32.wrapping_sub(crc & 1));
+            }
+        }
+        png.extend_from_slice(&(!crc).to_be_bytes());
+    }
+
+    let color = Sha256::digest(unit_key.as_bytes());
+    let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut png, b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0]);
+    let pixels = miniz_oxide::deflate::compress_to_vec_zlib(&[0, color[0], color[1], color[2]], 6);
+    chunk(&mut png, b"IDAT", &pixels);
+    chunk(&mut png, b"IEND", &[]);
+    png
 }
 
 impl MistralOcrClient for MockStandardOnlineMarkdownizeClient {
@@ -800,7 +862,7 @@ impl MistralOcrClient for MockStandardOnlineMarkdownizeClient {
                         )
                     },
                     images: vec![OcrImage {
-                        bytes: format!("image-{}", hint.unit_key).into_bytes(),
+                        bytes: mock_ocr_png(&hint.unit_key),
                         media_type: "image/png".to_owned(),
                         bbox: Some([index as i64, 0, index as i64 + 1, 1]),
                         confidence: Some("0.99".to_owned()),
@@ -844,6 +906,8 @@ pub enum AdoptedEmbeddingExecution {
     /// +2s backoff).
     #[cfg(debug_assertions)]
     RateLimitAfter,
+    #[cfg(debug_assertions)]
+    NetworkError,
     /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): behaves like
     /// `Mock`, but the adapter declares `ProviderIdempotency::HttpHeader` —
     /// proving the CLI threads `EmbeddingRequest.idempotency_token`
@@ -982,6 +1046,7 @@ pub fn embedding_adapter_for(execution: EmbeddingExecution) -> Result<Box<dyn Em
                     "an offline_api embedding adapter must declare `url`".to_owned(),
                 )
             })?;
+            let endpoint = crate::tool_lock::authenticated_local_endpoint("embedding", &base_url)?;
             let model = declared
                 .model
                 .clone()
@@ -993,7 +1058,7 @@ pub fn embedding_adapter_for(execution: EmbeddingExecution) -> Result<Box<dyn Em
             let timeout_seconds = crate::tool_lock::registered_execution_timeout("offline_api");
             Ok(Box::new(LocalEmbeddingAdapter::with_client(
                 crate::local_embedding::EnvLocalEmbeddingClient::new(
-                    base_url,
+                    endpoint,
                     model,
                     timeout_seconds,
                 ),
@@ -1074,6 +1139,9 @@ fn active_adopted_embedding_execution_from(
         }
         Some(kio_core::test_control::GeminiEmbedMode::RateLimitAfter) => {
             Some(AdoptedEmbeddingExecution::RateLimitAfter)
+        }
+        Some(kio_core::test_control::GeminiEmbedMode::NetworkError) => {
+            Some(AdoptedEmbeddingExecution::NetworkError)
         }
         Some(kio_core::test_control::GeminiEmbedMode::RequireIdempotencyToken) => {
             Some(AdoptedEmbeddingExecution::RequireIdempotencyToken)
@@ -1369,6 +1437,9 @@ impl GeminiEmbeddingClient for MockAdoptedEmbeddingClient {
                     retry_after_ms: Some(30_000),
                 });
             }
+            AdoptedEmbeddingExecution::NetworkError => {
+                return Err(AdapterError::Network("mock network failure".to_owned()));
+            }
             _ => {}
         }
         Ok(crate::gemini_embedding::EmbedBatchOutput {
@@ -1376,10 +1447,18 @@ impl GeminiEmbeddingClient for MockAdoptedEmbeddingClient {
                 .iter()
                 .map(|item| EmbeddingVector {
                     id: item.id.clone(),
-                    vector: deterministic_embedding_vector(
-                        item.text.as_deref().unwrap_or(""),
-                        dimensions as usize,
-                    ),
+                    vector: match &item.content {
+                        crate::types::EmbeddingContent::Text { text } => {
+                            deterministic_embedding_vector(text, dimensions as usize)
+                        }
+                        crate::types::EmbeddingContent::Image { bytes, .. } => {
+                            // The test seam cannot issue an online multimodal request,
+                            // but image bytes still determine its synthetic vector.
+                            let seed =
+                                format!("image:sha256:{}", crate::identity::hash_bytes(bytes));
+                            deterministic_embedding_vector(&seed, dimensions as usize)
+                        }
+                    },
                 })
                 .collect(),
             // I12: this used to be `None` on the reasoning that "a mock cannot
@@ -1396,7 +1475,14 @@ impl GeminiEmbeddingClient for MockAdoptedEmbeddingClient {
                 || {
                     items
                         .iter()
-                        .map(|item| item.text.as_deref().unwrap_or("").chars().count() as u64)
+                        .map(|item| match &item.content {
+                            crate::types::EmbeddingContent::Text { text } => {
+                                text.chars().count() as u64
+                            }
+                            crate::types::EmbeddingContent::Image { bytes, .. } => {
+                                bytes.len() as u64
+                            }
+                        })
                         .sum()
                 },
             ),
@@ -1486,18 +1572,8 @@ mod tests {
         let outcome = run_adopted_embedding(
             AdoptedEmbeddingExecution::Mock,
             vec![
-                EmbeddingItem {
-                    id: "a".to_owned(),
-                    text: Some("hello".to_owned()),
-                    path: None,
-                    mime: None,
-                },
-                EmbeddingItem {
-                    id: "b".to_owned(),
-                    text: Some("world".to_owned()),
-                    path: None,
-                    mime: None,
-                },
+                EmbeddingItem::text("a", "hello"),
+                EmbeddingItem::text("b", "world"),
             ],
             EmbeddingInputType::MarkdownChunk,
             None,

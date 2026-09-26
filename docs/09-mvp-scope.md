@@ -25,7 +25,7 @@
 - Evidence Pointer
 - snapshot DAG (commit / tree)
 - kio index 完了時の auto snapshot (定期 auto snapshot / watch の Phase 記述は historical RC plan であり、v1 の変更検出要件は [11-product-requirements.md](11-product-requirements.md) を参照)
-- restore (--to 必須)
+- export (--to 必須)
 - time-travel search (--at / --all-history / --include-deleted)
 - ベースライン index (deterministic 抽出 + FTS。API キーなしで init→index→search→open が成立 — [01-positioning.md §3](01-positioning.md))
 - 初回スキャン preview + 明示承認
@@ -34,32 +34,26 @@
 - kio evidence verify <pointer> / kio evidence verify --batch <pointers.jsonl> (Phase 4 milestone 6 の implemented target/current)
 ```
 
-## 1.2 RC platform support policy
+## 1.2 v1 automatic-child implementation boundary
 
-本表が RC の platform support level と、子 scope 生成経路が RC 対象かどうかの
-**唯一の正本**である。他の spec は個々の実装・CLI・運用上の帰結だけを定め、
-support level を別に定義しない。
+本表が v1 の実装済み child-scope 経路の正本である。各 OS の native Actions は同じ候補へ結び付けた
+受入証跡をまだ必要とするため、本表は acceptance pass を表明しない。
 
-| platform | RC support level | ユーザーが直接選択した scope の `init` / `index` | 親 scope からの再帰的な子 scope 自動 mutation |
+| platform | ユーザーが直接選択した scope の `init` / `index` | 管理済み親からの child scope 自動 mutation | acceptance |
 | --- | --- | --- | --- |
-| macOS | supported | RC 対象 | RC 対象 (retained-handle launcher) |
-| Linux | supported | RC 対象 | RC 対象 (retained-handle launcher) |
-| Windows | experimental | RC 対象 | RC 対象外。preview は planned child を報告するが、approve は mutation 前に `KIO-E-SCOPE-BOUND-UNSUPPORTED-001` の structured partial failure として fail-closed する |
+| macOS | 実装済み | 実装済み。空 directory を含む retained-handle child discovery | native Actions receipt 未完了 |
+| Linux | 実装済み | 実装済み。空 directory を含む retained-handle child discovery | native Actions receipt 未完了 |
+| Windows | 実装済み | 実装済み。空 directory を含む retained-handle child discovery | native Actions receipt 未完了 |
 
-Windows で新しい scope を導入する正式な手動手順は次の 3 ステップに限る。
-
-1. `kio init <child-path>` を実行する。
-2. `<child-path>` をプロセスの cwd とする。
-3. その cwd で `kio index --approve --offline` を実行する。
-
-これはユーザーが直接選択した独立 scope への操作であり、親 scope の discovery 結果から
-public pathname を再解決する fallback ではない。Windows の自動子 scope に
-`current_dir(path)` 型の handoff を追加せず、junction / reparse point も追跡しない。
+全 OS で明示 `init` は利用者が選択した root に限る。自動経路は retained parent handle から直接 child を
+検証し、public pathname の再解決や `current_dir(path)` 型 handoff を使わない。独立 root、policy 除外、
+identity 不一致、symlink / junction / reparse point は採用しない。child の管理開始は device-private egress
+grant、trust、ledger authority を作成・継承しない。
 
 # 2. 将来ロードマップ（historical。製品境界は 11 を参照）
 
-直前の RC matrix は RC.3 の制約であり、v1 の platform support を表明しない。特に Windows の
-自動 child mutation は RC で未対応である。
+直前の RC matrix は RC.3 時点の制約であり、v1 の実装境界や acceptance 結果を表明しない。特に Windows の
+自動 child mutation 未対応という RC の制約は現行実装には適用しない。
 
 以下は実装を許可せず、CLI syntax、schema、error code、default、互換性を定めない名称だけの記録である。
 
@@ -101,7 +95,7 @@ Step 2 (2-3ヶ月): kio-pipeline + kio-adapter
                   → tree は manifest_hash と必須 chunking_config_hash を保持し、検索の publication
                     authority は tagged `chunk_publications` event triple に置く (03 §8 / 04 §4.1)
 Step 3 (2-3ヶ月): kio-index + kio-search (hybrid + Evidence Pointer)
-Step 4 (1.5-2ヶ月): restore + --at + time-travel
+Step 4 (1.5-2ヶ月): export + --at + time-travel
                     + purge 最小形 (tombstone) + evidence verify (単発)
 ```
 
@@ -118,7 +112,7 @@ Step 別の目安 (テスト除く):
   Step 1   2,500 -  4,000 LOC   CAS / DAG / init / status / snapshot / log / diff
   Step 2   3,500 -  5,000 LOC   pipeline / adapter / budget / resume / retry
   Step 3   3,500 -  5,000 LOC   FTS / vector / hybrid / Evidence Pointer
-  Step 4   1,500 -  2,500 LOC   restore / time-travel / purge 最小形 / verify
+  Step 4   1,500 -  2,500 LOC   export / time-travel / purge 最小形 / verify
   合計    11,000 - 16,000 LOC   (総期間 7-10 ヶ月。Step 別最大の単純合計 16,500 は
                                  総額上限 16,000 に切られる — 全 Step 同時に上限へ達する配分は取らない)
 ```
@@ -153,7 +147,7 @@ Step 別の目安 (テスト除く):
 | `kio search --json` (外部 Agent 向け最小契約) + `index_status` | [05-runtime.md §1.7](05-runtime.md) | Step 3 |
 | `kio reindex` (gen+1 の再 Markdownize / 再 index) | [07-adapter-spec.md §9](07-adapter-spec.md) / [09-mvp-scope.md §5.1](09-mvp-scope.md) | Step 3 |
 | 観測ログ `metrics.jsonl` / `access.jsonl` (M3 の latency 計測に必要) | [06-cli-spec.md §12](06-cli-spec.md) / [05-runtime.md §7](05-runtime.md) | Step 3 |
-| `restore --to` / `--at` / `--all-history` / `--include-deleted` | [05-runtime.md §4](05-runtime.md) | Step 4 |
+| `export --to` / `--at` / `--all-history` / `--include-deleted` | [05-runtime.md §4](05-runtime.md) | Step 4 |
 | purge 最小形 (tombstone + `commit_type=purged` + 検索除外 + `--erase-tombstone` + ログスクラブ [10-operations.md §7](10-operations.md)) | [05-runtime.md §3](05-runtime.md) / [08-evidence-pointer-spec.md §4.1](08-evidence-pointer-spec.md) | Step 4 |
 | `kio repair rebuild-db` (SQLite index 再構築 — 破損時の復旧経路) | [10-operations.md §7.5.3](10-operations.md) | Step 3 |
 | `kio repair verify-objects` (CAS object 整合性検証) / `--prune-orphans` (orphan prepared/image 削除 — 法務 purge の完結手段) | [10-operations.md §7.5](10-operations.md) | Step 4 |
@@ -215,11 +209,11 @@ Step 1 開始日: **2026-07-16**。本日 (2026-07-02) 時点の Step 1 ブロ�
 
 ```
 状況:  半年前に削除した資料の中の数字をもう一度見たい。
-操作:  kio search "API リミット 1000" --include-deleted → kio restore <ev> --to ./recovered/
-検証:  CAS 永続性 / --include-deleted / restore の working tree 非破壊
+操作:  kio search "API リミット 1000" --include-deleted → kio export <ev> --to ./recovered/
+検証:  CAS 永続性 / --include-deleted / export の working tree 非破壊
 完了:  - 削除済みファイルの chunk が結果に出る
-       - kio restore は --to <dir> を必須 (working tree 直接書き戻し禁止)
-       - purge 済み (canonical final event = purged — 08 §3.1 手順 5。commit_type=purged はその監査痕跡) は検索結果から除外される (purged chunk 行は物理削除済み — search 経由では到達しない)。tombstone 応答は既存 Evidence Pointer (過去回答の保存分) を restore / verify / open に与えた場合の挙動 (08 §4)
+       - kio export は --to <dir> を必須 (working tree 直接書き戻し禁止)
+       - purge 済み (canonical final event = purged — 08 §3.1 手順 5。commit_type=purged はその監査痕跡) は検索結果から除外される (purged chunk 行は物理削除済み — search 経由では到達しない)。tombstone 応答は既存 Evidence Pointer (過去回答の保存分) を export / verify / open に与えた場合の挙動 (08 §4)
 ```
 
 ## 4.1 計測項目
@@ -459,7 +453,7 @@ docs/
   02-philosophy.md             理念
   03-data-model.md             ★契約: CAS / identity / 書き込み境界
   04-pipeline.md               ★契約: パイプライン / SQLite / batch
-  05-runtime.md                ★契約: 検索 / commit / GC / purge / restore
+  05-runtime.md                ★契約: 検索 / commit / GC / purge / export
   06-cli-spec.md               CLI / exit code / error / JSON output
   07-adapter-spec.md           Adapter / incremental プロンプト規約
   08-evidence-pointer-spec.md  Evidence Pointer / Dead Pointer

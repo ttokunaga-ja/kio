@@ -10,6 +10,8 @@ use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
+use crate::durability::DurabilityPoint;
+
 /// A finite test selector read from the environment.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub enum Selector<T> {
@@ -51,7 +53,9 @@ macro_rules! finite_selector {
 finite_selector!(MistralOcrMode {
     "auth_error" => AuthError, "rate_limit" => RateLimit,
     "rate_limit_after" => RateLimitAfter, "network_error" => NetworkError,
-    "mock" => Mock, "partial" => Partial, "mock_link_image" => MockLinkImage,
+    "mock" => Mock, "partial" => Partial, "partial_network" => PartialNetwork,
+    "all_failed_network" => AllFailedNetwork,
+    "all_failed_invalid_input" => AllFailedInvalidInput, "mock_link_image" => MockLinkImage,
     "incr_incomplete" => IncrementalIncomplete, "pin_changed" => PinChanged,
     "no_change_no_send" => NoChangeNoSend,
     "require_idempotency_token" => RequireIdempotencyToken,
@@ -60,6 +64,7 @@ finite_selector!(GeminiEmbedMode {
     "mock" => Mock, "incompatible_profile" => IncompatibleProfile,
     "non_multimodal" => NonMultimodal, "auth_error" => AuthError,
     "rate_limit" => RateLimit, "rate_limit_after" => RateLimitAfter,
+    "network_error" => NetworkError,
     "require_idempotency_token" => RequireIdempotencyToken,
     "no_usage_report" => NoUsageReport,
 });
@@ -159,6 +164,8 @@ pub struct CoreTestControl {
     pub gc_tree_quarantine_ready: Option<PathBuf>,
     pub gc_fault: Selector<GcFault>,
     pub gc_index_copy_ready: Option<PathBuf>,
+    pub durability_point: Selector<DurabilityPoint>,
+    pub durability_ready: Option<PathBuf>,
 }
 
 /// CLI-only seams and process coordination controls.
@@ -313,6 +320,8 @@ impl DebugTestControl {
                 gc_tree_quarantine_ready: path("KIO_TEST_GC_TREE_QUARANTINE_READY"),
                 gc_fault: selector("KIO_TEST_GC_FAULT", GcFault::parse),
                 gc_index_copy_ready: path("KIO_TEST_GC_INDEX_COPY_READY"),
+                durability_point: selector("KIO_TEST_DURABILITY_POINT", DurabilityPoint::parse),
+                durability_ready: path("KIO_TEST_DURABILITY_READY"),
             },
             cli: CliTestControl {
                 snapshot_pre_gc_preflight_ready: path(
@@ -416,6 +425,23 @@ mod tests {
         assert_eq!(
             current_or_default().cli.gc_prelock_ready,
             Some(PathBuf::from("/tmp/initial-ready"))
+        );
+    }
+
+    #[test]
+    fn parses_durability_control_as_a_finite_selector() {
+        let _lock = test_env_lock().lock().unwrap();
+        let _point = TestEnvGuard::set("KIO_TEST_DURABILITY_POINT", "publication_head");
+        let _ready = TestEnvGuard::set("KIO_TEST_DURABILITY_READY", "/tmp/kio-durability-ready");
+        let control = DebugTestControl::from_env();
+
+        assert_eq!(
+            control.core.durability_point,
+            Selector::Known(DurabilityPoint::PublicationHead)
+        );
+        assert_eq!(
+            control.core.durability_ready,
+            Some(PathBuf::from("/tmp/kio-durability-ready"))
         );
     }
 }

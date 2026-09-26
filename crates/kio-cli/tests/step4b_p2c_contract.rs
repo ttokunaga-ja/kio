@@ -40,7 +40,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use kio_core::cas::{ObjectKind, ObjectStore};
 use kio_core::gc::ShallowReceipt;
 use kio_core::scope::Repository;
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -49,6 +49,16 @@ use tempfile::TempDir;
 use std::os::unix::fs::MetadataExt;
 
 const TEST_ADOPTED_EMBEDDING_ENV: &str = "KIO_TEST_GEMINI_EMBED";
+
+fn initialized_ledger_path(dir: &TempDir) -> std::path::PathBuf {
+    let path = dir.path().join(".test-data/kio/cost-ledger.sqlite");
+    if path.exists() {
+        kio_pipeline::ledger::LedgerDb::open_existing(&path).unwrap();
+    } else {
+        kio_pipeline::ledger::LedgerDb::initialize(&path).unwrap();
+    }
+    path
+}
 
 #[derive(Debug, Eq, PartialEq)]
 struct PresentLedgerLeafState {
@@ -77,7 +87,7 @@ fn ledger_leaf_state(path: &std::path::Path) -> LedgerLeafState {
     ledger_leaf_state_with_link_policy(path, true)
 }
 
-/// Observe the exact four-leaf state even when the fixture deliberately makes
+/// Observe the exact lifecycle artifact state even when the fixture deliberately makes
 /// one leaf unsafe.  The normal helper above keeps its single-link assertion:
 /// tests that create a hard link opt into this narrower observer explicitly.
 #[cfg(unix)]
@@ -126,41 +136,56 @@ fn ledger_leaf_state_with_link_policy(
     })
 }
 
-fn ledger_leaf_states(dir: &TempDir) -> [LedgerLeafState; 4] {
+fn ledger_leaf_states(dir: &TempDir) -> [LedgerLeafState; 7] {
     let main = dir.path().join(".test-data/kio/cost-ledger.sqlite");
     [
         ledger_leaf_state(&main),
-        ledger_leaf_state(&std::path::PathBuf::from(format!(
-            "{}.write-seq",
-            main.display()
-        ))),
         ledger_leaf_state(&std::path::PathBuf::from(format!("{}-wal", main.display()))),
         ledger_leaf_state(&std::path::PathBuf::from(format!("{}-shm", main.display()))),
+        ledger_leaf_state(&std::path::PathBuf::from(format!(
+            "{}.authority.json",
+            main.display()
+        ))),
+        ledger_leaf_state(&std::path::PathBuf::from(format!(
+            "{}.checkpoint.json",
+            main.display()
+        ))),
+        ledger_leaf_state(&std::path::PathBuf::from(format!(
+            "{}.init.pending",
+            main.display()
+        ))),
+        ledger_leaf_state(&main.parent().unwrap().join("ledger.lifecycle.lock")),
     ]
 }
 
 #[cfg(unix)]
-fn unsafe_ledger_leaf_states(dir: &TempDir) -> [LedgerLeafState; 4] {
+fn unsafe_ledger_leaf_states(dir: &TempDir) -> [LedgerLeafState; 7] {
     let main = dir.path().join(".test-data/kio/cost-ledger.sqlite");
     [
         unsafe_ledger_leaf_state(&main),
-        unsafe_ledger_leaf_state(&std::path::PathBuf::from(format!(
-            "{}.write-seq",
-            main.display()
-        ))),
         unsafe_ledger_leaf_state(&std::path::PathBuf::from(format!("{}-wal", main.display()))),
         unsafe_ledger_leaf_state(&std::path::PathBuf::from(format!("{}-shm", main.display()))),
+        unsafe_ledger_leaf_state(&std::path::PathBuf::from(format!(
+            "{}.authority.json",
+            main.display()
+        ))),
+        unsafe_ledger_leaf_state(&std::path::PathBuf::from(format!(
+            "{}.checkpoint.json",
+            main.display()
+        ))),
+        unsafe_ledger_leaf_state(&std::path::PathBuf::from(format!(
+            "{}.init.pending",
+            main.display()
+        ))),
+        unsafe_ledger_leaf_state(&main.parent().unwrap().join("ledger.lifecycle.lock")),
     ]
 }
 
 fn seed_current_scope_charge(dir: &TempDir, usd: f64) {
     let repo = Repository::open(dir.path()).unwrap();
     let scope_id = repo.scope_identity().unwrap().scope_id;
-    let ledger =
-        kio_pipeline::ledger::LedgerDb::open(dir.path().join(".test-data/kio/cost-ledger.sqlite"))
-            .unwrap();
-    ledger
-        .connection()
+    Connection::open(initialized_ledger_path(dir))
+        .unwrap()
         .execute(
             "INSERT INTO cost_ledger (
             scope_id, adapter_kind, input_hash, tool_profile_hash, submission_seq,
@@ -204,7 +229,7 @@ fn assert_no_budget_paused_task(dir: &TempDir) {
 // ---------------------------------------------------------------------------
 
 fn kio(dir: &TempDir, args: &[&str]) -> Command {
-    let temp_dir = dir.path().join(".test-tmp");
+    let temp_dir = dir.path().join(".test-data/tmp");
     fs::create_dir_all(&temp_dir).unwrap();
     let mut command = Command::cargo_bin("kio").unwrap();
     command
@@ -228,7 +253,7 @@ fn kio(dir: &TempDir, args: &[&str]) -> Command {
 /// bound HOME/XDG roots and the process attribution are observable without a
 /// process-global environment mutation.
 fn private_kio_process(dir: &TempDir, args: &[&str]) -> std::process::Command {
-    let temp_dir = dir.path().join(".test-tmp");
+    let temp_dir = dir.path().join(".test-data/tmp");
     fs::create_dir_all(&temp_dir).unwrap();
     let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"));
     command
@@ -354,7 +379,7 @@ fn indexed_scope() -> TempDir {
     )
     .unwrap();
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
     dir
 }
 
@@ -498,7 +523,12 @@ fn pc6_auto_final_revoke_before_attempt_falls_back_to_text_without_ledger_mutati
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["ledger", "init"]).assert().success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
@@ -557,7 +587,7 @@ fn pc6_auto_final_revoke_before_attempt_falls_back_to_text_without_ledger_mutati
     assert_eq!(
         ledger_leaf_states(&dir),
         before,
-        "a final consent revoke before any attempt must preserve source ledger main/write-seq/WAL/SHM"
+        "a final consent revoke before any attempt must preserve source lifecycle artifacts"
     );
     assert!(
         !trace.exists(),
@@ -565,13 +595,11 @@ fn pc6_auto_final_revoke_before_attempt_falls_back_to_text_without_ledger_mutati
     );
 }
 
-/// Once final consent has passed, an online query embedding uses the existing
-/// durable claim/reservation/settlement protocol. A provider failure may make
-/// auto return text results, but that post-attempt fallback remains inside the
-/// documented fresh vector/hybrid page-one ledger-write exception: it must not
-/// be "fixed" by moving the claim after the send or dropping unknown billing.
+/// A missing current checkpoint is incomplete lifecycle state. Auto must refuse
+/// before an authorized query attempt; it may not recreate checkpoint state or
+/// silently treat the ledger as a zero-spend cache miss.
 #[test]
-fn pc6_auto_post_attempt_failure_retains_authorized_ledger_accounting() {
+fn pc6_missing_checkpoint_refuses_before_authorized_attempt() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(
         dir.path().join("post-attempt-fallback.md"),
@@ -582,20 +610,27 @@ fn pc6_auto_post_attempt_failure_retains_authorized_ledger_accounting() {
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["ledger", "init"]).assert().success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
     assert_no_budget_paused_task(&dir);
 
-    let write_seq = dir
+    let checkpoint = dir
         .path()
-        .join(".test-data/kio/cost-ledger.sqlite.write-seq");
-    if write_seq.exists() {
-        fs::remove_file(&write_seq).unwrap();
-    }
+        .join(".test-data/kio/cost-ledger.sqlite.checkpoint.json");
+    assert!(
+        checkpoint.exists(),
+        "explicit ledger init must create the lifecycle checkpoint"
+    );
+    fs::remove_file(&checkpoint).unwrap();
     let before = ledger_leaf_states(&dir);
-    assert!(matches!(before[1], LedgerLeafState::Absent));
+    assert!(matches!(before[4], LedgerLeafState::Absent));
     let trace = dir.path().join("post-attempt-query-embed.trace");
     let output = private_kio_process(&dir, &["search", "postattemptneedle"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "auth_error")
@@ -603,37 +638,18 @@ fn pc6_auto_post_attempt_failure_retains_authorized_ledger_accounting() {
         .arg("--json")
         .output()
         .unwrap();
-    assert!(
-        output.status.success(),
-        "stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(response["requested_mode"], "auto", "{response}");
-    assert_eq!(response["resolved_mode"], "text", "{response}");
+    assert!(!output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(
-        response["fallback_reason"], "query_embedding_unavailable",
-        "{response}"
+        error["error_code"], "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001",
+        "{error}"
     );
+    assert_eq!(error["context"]["reason"], "unsafe_integrity");
+    assert_eq!(ledger_leaf_states(&dir), before);
     assert!(
-        !response["results"].as_array().unwrap().is_empty(),
-        "{response}"
-    );
-    assert_no_budget_paused_task(&dir);
-    let after = ledger_leaf_states(&dir);
-    assert!(
-        matches!(after[1], LedgerLeafState::Present(_)),
-        "an authorized post-attempt failure must retain the durable ledger open/settlement boundary"
-    );
-    assert_ne!(
-        after, before,
-        "post-attempt fallback must not erase or disguise authorized ledger accounting"
-    );
-    assert_eq!(
-        fs::read_to_string(trace).unwrap().lines().count(),
-        1,
-        "the failure must occur after exactly one attempted query send"
+        !trace.exists(),
+        "incomplete lifecycle state must prevent a query send"
     );
 }
 
@@ -654,7 +670,12 @@ fn search_hybrid_unsafe_ledger_preflight_precedes_writable_claim_and_send() {
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["ledger", "init"]).assert().success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
@@ -732,7 +753,12 @@ fn search_query_syntax_validation_precedes_unsafe_ledger_preflight() {
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["ledger", "init"]).assert().success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
@@ -763,7 +789,7 @@ fn search_query_syntax_validation_precedes_unsafe_ledger_preflight() {
     assert_eq!(
         unsafe_ledger_leaf_states(&dir),
         before,
-        "input validation must leave the unsafe source main/write-seq/WAL/SHM exact"
+        "input validation must leave unsafe source and lifecycle artifacts exact"
     );
 }
 
@@ -783,7 +809,12 @@ fn search_response_budget_status_reuses_preflight_snapshot_after_folder_cap_writ
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["ledger", "init"]).assert().success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
@@ -921,7 +952,7 @@ fn pc15_pc17_candidate_depth_configuration_is_not_hardcoded_to_200() {
         "[search.diversify]\nenabled = false\n",
     )
     .unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     // `--limit` itself caps at 100 (unrelated, pre-existing), so probe the
     // candidate POOL size via `--offset` instead: with the default
@@ -995,7 +1026,7 @@ fn r23_17_replica_filters_ineligible_rows_before_candidate_depth() {
     )
     .unwrap();
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     // Sanity: with the default (large) candidate_depth, all 5 rank and the
     // survivor is present.
@@ -1023,7 +1054,7 @@ fn r23_17_replica_filters_ineligible_rows_before_candidate_depth() {
         "[search.rrf]\ncandidate_depth = 2\n",
     )
     .unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
     let escalated = success(
         &dir,
         &[
@@ -1089,7 +1120,7 @@ fn pc21_cursor_replay_rejects_a_stale_index_generation() {
         .unwrap();
     }
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
     let page1 = success(
         &dir,
         &[
@@ -1155,7 +1186,7 @@ fn r23_25_cursor_replay_registry_duplicate_is_exit_3() {
         .unwrap();
     }
     init(&dir_a);
-    success(&dir_a, &["index", "--offline", "--approve"]);
+    success(&dir_a, &["index", "--offline"]);
     let page1 = success(
         &dir_a,
         &[
@@ -1230,18 +1261,26 @@ fn clone_scope_id_into(dir_a: &TempDir, scope_id: &str) -> TempDir {
         serde_json::from_str(&fs::read_to_string(&scope_path_b).unwrap()).unwrap();
     value["scope_id"] = Value::String(scope_id.to_owned());
     fs::write(&scope_path_b, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
-    Command::cargo_bin("kio")
-        .unwrap()
-        .current_dir(dir_b.path())
-        .env("XDG_CONFIG_HOME", &xdg_config)
-        .env("XDG_DATA_HOME", &xdg_data)
-        .env("XDG_CACHE_HOME", &xdg_cache)
-        .env_remove("GEMINI_API_KEY")
-        .env_remove("MISTRAL_API_KEY")
-        .env_remove("KIO_FIXED_NOW")
-        .args(["index", "--offline", "--approve"])
-        .assert()
-        .success();
+    let record_path = dir_b.path().join(".kio/management.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(record["authority"]["kind"], "root");
+    assert!(record["children"].as_object().unwrap().is_empty());
+    record["scope_id"] = Value::String(scope_id.to_owned());
+    fs::write(record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
+    // Simulate a copied/imported registry record directly. An index command
+    // must now refuse this duplicate before it can publish any local state.
+    let registry =
+        kio_index::registry::RegistryDb::open(xdg_data.join("kio/scope-registry.sqlite")).unwrap();
+    registry
+        .upsert(&kio_index::registry::RegistryEntry {
+            scope_id: scope_id.to_owned(),
+            kio_path: dir_b.path().join(".kio").display().to_string(),
+            root_path: dir_b.path().display().to_string(),
+            participates_in_global_search: true,
+            indexed: true,
+            last_seen_at: "2026-09-08T00:00:00Z".to_owned(),
+        })
+        .unwrap();
     dir_b
 }
 
@@ -1263,7 +1302,7 @@ fn r23_27_default_search_excludes_live_registry_duplicate_scope() {
     )
     .unwrap();
     init(&dir_a);
-    success(&dir_a, &["index", "--offline", "--approve"]);
+    success(&dir_a, &["index", "--offline"]);
     let scope_id = read_scope_id(&dir_a);
     let _dir_b = clone_scope_id_into(&dir_a, &scope_id);
 
@@ -1298,7 +1337,7 @@ fn r23_27_default_search_partial_excludes_only_the_duplicate_scope() {
     )
     .unwrap();
     init(&dir_a);
-    success(&dir_a, &["index", "--offline", "--approve"]);
+    success(&dir_a, &["index", "--offline"]);
     let scope_id_a = read_scope_id(&dir_a);
 
     let dir_c = tempfile::tempdir().unwrap();
@@ -1328,7 +1367,7 @@ fn r23_27_default_search_partial_excludes_only_the_duplicate_scope() {
         .env_remove("GEMINI_API_KEY")
         .env_remove("MISTRAL_API_KEY")
         .env_remove("KIO_FIXED_NOW")
-        .args(["index", "--offline", "--approve"])
+        .args(["index", "--offline"])
         .assert()
         .success();
     let scope_id_c = read_scope_id(&dir_c);
@@ -1388,28 +1427,24 @@ fn r23_01_cursor_replay_never_re_embeds_the_query() {
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["ledger", "init"]).assert().success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
     assert_no_budget_paused_task(&dir);
 
     // A fresh vector/hybrid page 1 is the one search path allowed to open
-    // the device ledger: it may charge / settle the query embedding and
-    // `LedgerDb::open` refreshes this advisory companion atomically. Remove
-    // it first so the page-1 assertion is a positive discriminator, rather
-    // than merely observing an artifact left by indexing.
+    // the device ledger: it may charge / settle the query embedding through
+    // the existing authority/checkpoint lifecycle.
     let ledger_main = dir.path().join(".test-data/kio/cost-ledger.sqlite");
-    let ledger_write_seq = dir
-        .path()
-        .join(".test-data/kio/cost-ledger.sqlite.write-seq");
-    assert!(ledger_main.is_file(), "index must create the test ledger");
-    if ledger_write_seq.exists() {
-        fs::remove_file(&ledger_write_seq).unwrap();
-    }
     assert!(
-        !ledger_write_seq.exists(),
-        "page-1 discriminator starts with no write-seq companion"
+        ledger_main.is_file(),
+        "explicit ledger init must create the test ledger"
     );
 
     let trace = dir.path().join("query-embed.trace");
@@ -1439,8 +1474,8 @@ fn r23_01_cursor_replay_never_re_embeds_the_query() {
         .to_owned();
 
     assert!(
-        ledger_write_seq.is_file(),
-        "fresh hybrid page 1 must retain its permitted ledger-open side effect"
+        matches!(ledger_leaf_states(&dir)[4], LedgerLeafState::Present(_)),
+        "fresh hybrid page 1 must retain a valid lifecycle checkpoint"
     );
 
     // Make the cap exhausted only after this fresh vector/hybrid page 1. That
@@ -1459,7 +1494,7 @@ fn r23_01_cursor_replay_never_re_embeds_the_query() {
     seed_current_scope_charge(&dir, 1.0);
     let ledger_after_page1 = ledger_leaf_states(&dir);
     assert!(matches!(ledger_after_page1[0], LedgerLeafState::Present(_)));
-    assert!(matches!(ledger_after_page1[1], LedgerLeafState::Present(_)));
+    assert!(matches!(ledger_after_page1[4], LedgerLeafState::Present(_)));
 
     let after_page1 = fs::read_to_string(&trace).unwrap();
     assert_eq!(
@@ -1490,12 +1525,12 @@ fn r23_01_cursor_replay_never_re_embeds_the_query() {
 
     // A cursor replay reuses page 1's cached vector. It must neither make a
     // second metered query request nor reopen the ledger merely for
-    // `index_status`: that would atomically replace the write-seq companion
-    // even when its bytes are unchanged.
+    // `index_status`: lifecycle artifacts remain byte-identical when the
+    // cached vector is reused.
     assert_eq!(
         ledger_leaf_states(&dir),
         ledger_after_page1,
-        "cursor replay must preserve source ledger main/write-seq/WAL/SHM Present|Absent state"
+        "cursor replay must preserve source ledger and lifecycle Present|Absent state"
     );
 
     // The trace file gained NO new lines: replay never re-embedded.
@@ -1530,7 +1565,12 @@ fn r23_01_fresh_vector_page_one_retains_allowed_ledger_open_semantics() {
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["ledger", "init"]).assert().success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
@@ -1549,12 +1589,6 @@ fn r23_01_fresh_vector_page_one_retains_allowed_ledger_open_semantics() {
     let device_cap = spent_before + 0.000_002;
     write_budget_caps(&dir, device_cap, 1.0);
 
-    let write_seq = dir
-        .path()
-        .join(".test-data/kio/cost-ledger.sqlite.write-seq");
-    if write_seq.exists() {
-        fs::remove_file(&write_seq).unwrap();
-    }
     let trace = dir.path().join("vector-page-one.trace");
     let response = run_bound_vector_search(
         &dir,
@@ -1585,8 +1619,8 @@ fn r23_01_fresh_vector_page_one_retains_allowed_ledger_open_semantics() {
          before={spent_before} after={spent_after} cap={device_cap}"
     );
     assert!(
-        matches!(ledger_leaf_states(&dir)[1], LedgerLeafState::Present(_)),
-        "fresh vector page 1 remains allowed to open the ledger and recreate write-seq"
+        matches!(ledger_leaf_states(&dir)[4], LedgerLeafState::Present(_)),
+        "fresh vector page 1 retains the required lifecycle checkpoint"
     );
     assert_no_budget_paused_task(&dir);
     assert_eq!(
@@ -1626,7 +1660,12 @@ fn r23_01_cursor_replay_with_evicted_cache_fails_closed_not_re_embed() {
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["ledger", "init"]).assert().success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .assert()
+        .success();
+    kio(&dir, &["index"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .assert()
         .success();
@@ -1752,7 +1791,7 @@ fn pc38_pc39_at_excludes_chunks_introduced_only_at_a_descendant_commit() {
     )
     .unwrap();
     init(&dir);
-    let ca = success(&dir, &["index", "--offline", "--approve"])["commit_hash"]
+    let ca = success(&dir, &["index", "--offline"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1762,7 +1801,7 @@ fn pc38_pc39_at_excludes_chunks_introduced_only_at_a_descendant_commit() {
         "# Later\n\nintroducedlaterterm only exists from here on\n",
     )
     .unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     // The term from Ca's own tree is still found at --at Ca.
     let at_root = success(
@@ -1836,7 +1875,7 @@ fn pc47_at_a_shallow_commit_itself_still_hard_fails() {
     )
     .unwrap();
     init(&dir);
-    let head = success(&dir, &["index", "--offline", "--approve"])["commit_hash"]
+    let head = success(&dir, &["index", "--offline"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -1851,7 +1890,7 @@ fn pc47_at_a_shallow_commit_itself_still_hard_fails() {
         "# Advance\n\nhead advance\n",
     )
     .unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
     let receipt_path = dir
         .path()
         .join(".kio/gc/shallowed")
@@ -1917,8 +1956,8 @@ fn pc48_scope_flag_is_exact_match_not_string_prefix() {
     };
     run_path(&a, &["init"]);
     run_path(&ab, &["init"]);
-    run_path(&a, &["index", "--offline", "--approve"]);
-    run_path(&ab, &["index", "--offline", "--approve"]);
+    run_path(&a, &["index", "--offline"]);
+    run_path(&ab, &["index", "--offline"]);
 
     let a_str = a.display().to_string();
     let result = run_path(
@@ -2017,7 +2056,7 @@ fn multi_scope_env(names: &[&str]) -> (TempDir, std::path::PathBuf, Vec<std::pat
         "[scope]\nparticipates_in_global_search = false\n",
     )
     .unwrap();
-    run_path(&runner, &["index", "--offline", "--approve"]);
+    run_path(&runner, &["index", "--offline"]);
 
     let mut targets = Vec::new();
     for name in names {
@@ -2074,7 +2113,7 @@ fn pc53_pc54_incompatible_format_version_scope_is_store_version_exit_8() {
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .env_remove("GEMINI_API_KEY")
         .env_remove("MISTRAL_API_KEY")
-        .args(["index", "--offline", "--approve", "--json"])
+        .args(["index", "--offline", "--json"])
         .assert()
         .success();
     bump_format_version(target);
@@ -2115,7 +2154,7 @@ fn pc57_non_current_scope_aborts_multi_scope_search_without_partial_success() {
             .env("XDG_CACHE_HOME", data_home.join("cache"))
             .env_remove("GEMINI_API_KEY")
             .env_remove("MISTRAL_API_KEY")
-            .args(["index", "--offline", "--approve", "--json"])
+            .args(["index", "--offline", "--json"])
             .assert()
             .success();
     }
@@ -2169,7 +2208,7 @@ fn pc59_at_without_scope_is_invalid_usage_with_multiple_registered_scopes() {
     run_path(&a, &["init"]).success();
     run_path(&b, &["init"]).success();
     let head = serde_json::from_slice::<Value>(
-        &run_path(&a, &["index", "--offline", "--approve"])
+        &run_path(&a, &["index", "--offline"])
             .success()
             .get_output()
             .stdout,
@@ -2178,7 +2217,7 @@ fn pc59_at_without_scope_is_invalid_usage_with_multiple_registered_scopes() {
         .as_str()
         .unwrap()
         .to_owned();
-    run_path(&b, &["index", "--offline", "--approve"]).success();
+    run_path(&b, &["index", "--offline"]).success();
 
     let output = Command::cargo_bin("kio")
         .unwrap()
@@ -2213,7 +2252,7 @@ fn pc37_chunk_publications_table_exists_and_is_populated_after_index() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# A\n\nintroductioncontenttoken\n").unwrap();
     init(&dir);
-    let head = success(&dir, &["index", "--offline", "--approve"])["commit_hash"]
+    let head = success(&dir, &["index", "--offline"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2270,7 +2309,7 @@ fn pc40_config_association_creation_is_stable_and_publication_is_separate() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# A\n\nconfigintroductiontoken\n").unwrap();
     init(&dir);
-    let ca = success(&dir, &["index", "--offline", "--approve"])["commit_hash"]
+    let ca = success(&dir, &["index", "--offline"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2337,7 +2376,7 @@ fn pc40_publication_cannot_backdate_a_later_config_to_an_older_tree() {
     )
     .unwrap();
     init(&dir);
-    let old_commit = success(&dir, &["index", "--offline", "--approve"])["commit_hash"]
+    let old_commit = success(&dir, &["index", "--offline"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2347,7 +2386,7 @@ fn pc40_publication_cannot_backdate_a_later_config_to_an_older_tree() {
         "[chunking]\nstrategy = \"heading\"\nmax_chars = 10\n",
     )
     .unwrap();
-    let new_commit = success(&dir, &["index", "--offline", "--approve"])["commit_hash"]
+    let new_commit = success(&dir, &["index", "--offline"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2397,7 +2436,7 @@ fn pc22_pc23_pc31_at_uses_the_target_trees_config_not_current() {
     let long_body = "atreeconfigtoken ".repeat(50);
     fs::write(dir.path().join("a.md"), format!("# A\n\n{long_body}\n")).unwrap();
     init(&dir);
-    let ca = success(&dir, &["index", "--offline", "--approve"])["commit_hash"]
+    let ca = success(&dir, &["index", "--offline"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2437,7 +2476,7 @@ fn pc22_pc23_pc31_at_uses_the_target_trees_config_not_current() {
     )
     .unwrap();
     fs::write(dir.path().join("b.md"), "# B\n\nunrelated filler content\n").unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     let bare = success(&dir, &["search", "atreeconfigtoken", "--mode", "text"]);
     let chunks_bare = chunk_hash_set(&bare);
@@ -2480,7 +2519,7 @@ fn pc22_pc23_pc31_at_uses_the_target_trees_config_not_current() {
     )
     .unwrap();
     fs::write(dir.path().join("c.md"), "# C\n\nadvance back to config A\n").unwrap();
-    let c3 = success(&dir, &["index", "--offline", "--approve"])["commit_hash"]
+    let c3 = success(&dir, &["index", "--offline"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2536,7 +2575,7 @@ fn pc33_history_selectors_use_each_binding_trees_config() {
     let body = "perbindingconfigtoken ".repeat(40);
     fs::write(dir.path().join("old.md"), format!("# Old\n\n{body}\n")).unwrap();
     init(&dir);
-    let c1 = success(&dir, &["index", "--offline", "--approve"])["commit_hash"]
+    let c1 = success(&dir, &["index", "--offline"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
@@ -2567,7 +2606,7 @@ fn pc33_history_selectors_use_each_binding_trees_config() {
         "# Current\n\nconfig B head\n",
     )
     .unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     for selector in ["--all-history", "--include-deleted"] {
         let result = success(
@@ -2607,20 +2646,20 @@ fn pc61_pc62_pc63_head_limited_reassociation_still_leaves_at_searchable() {
     fs::write(dir.path().join("a.md"), "# A\n\nheadonlytoken content\n").unwrap();
     fs::write(dir.path().join("b.md"), "# B\n\nhistoryonlytoken content\n").unwrap();
     init(&dir);
-    let c1 = success(&dir, &["index", "--offline", "--approve"])["commit_hash"]
+    let c1 = success(&dir, &["index", "--offline"])["commit_hash"]
         .as_str()
         .unwrap()
         .to_owned();
 
     fs::remove_file(dir.path().join("b.md")).unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     fs::write(
         dir.path().join(".kio/config.toml"),
         "[chunking]\nstrategy = \"heading\"\nmax_chars = 42\n",
     )
     .unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     let conn = rusqlite::Connection::open(sqlite_path(&dir)).unwrap();
     let a_config_count: i64 = conn
@@ -2711,13 +2750,68 @@ fn pc52_explicit_vector_excludes_only_the_incompatible_scope() {
 
     run_embed(&a, &data_home, "mock", &["init"]);
     run_embed(&b, &data_home, "mock", &["init"]);
-    run_embed(&a, &data_home, "mock", &["index", "--approve"]);
+    run_embed(&a, &data_home, "mock", &["ledger", "init"]);
+    run_embed(
+        &a,
+        &data_home,
+        "mock",
+        &["adapter", "approve", "gemini_embedding_2", "--yes"],
+    );
     run_embed(
         &b,
         &data_home,
-        "incompatible_profile",
-        &["index", "--approve"],
+        "mock",
+        &["adapter", "approve", "gemini_embedding_2", "--yes"],
     );
+    run_embed(&a, &data_home, "mock", &["index"]);
+    run_embed(&b, &data_home, "mock", &["index"]);
+    // A foreign/stale vector profile is derived index state. Do not attempt to
+    // authorize a foreign runtime identity merely to construct this fixture.
+    let b_index = b.join(".kio/index/sqlite.db");
+    let b_index = Connection::open(&b_index).unwrap();
+    assert!(
+        b_index
+            .execute(
+                "UPDATE embeddings SET profile_hash = ?1 WHERE target_type = 'chunk'",
+                ["sha256:00000000000000000000000000000000000000000000000000000000incompat"],
+            )
+            .unwrap()
+            > 0,
+        "the incompatible scope fixture must contain derived chunk embeddings"
+    );
+    drop(b_index);
+    let b_scope_id = Repository::open(&b)
+        .unwrap()
+        .scope_identity()
+        .unwrap()
+        .scope_id;
+    let replica = Connection::open(data_home.join("cache/kio/aggregator.sqlite")).unwrap();
+    let profiles_json: String = replica
+        .query_row(
+            "SELECT embedding_profiles_json FROM agg_scopes WHERE scope_id = ?1",
+            [&b_scope_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut profiles: Value = serde_json::from_str(&profiles_json).unwrap();
+    let profiles = profiles
+        .as_array_mut()
+        .expect("aggregator embedding profiles must be an array");
+    assert_eq!(profiles.len(), 1, "unexpected b profile set: {profiles:?}");
+    profiles[0]["profile_hash"] = serde_json::json!(
+        "sha256:00000000000000000000000000000000000000000000000000000000incompat"
+    );
+    assert_eq!(
+        replica
+            .execute(
+                "UPDATE agg_scopes SET embedding_profiles_json = ?1 WHERE scope_id = ?2",
+                [serde_json::to_string(&profiles).unwrap(), b_scope_id],
+            )
+            .unwrap(),
+        1,
+        "only b's authoritative search projection may be made incompatible"
+    );
+    drop(replica);
 
     let output = embed_command(&a, &data_home, "mock")
         .args([
@@ -2767,7 +2861,7 @@ fn pc20_purge_rotates_index_generation() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# A\n\npurgerotationtoken\n").unwrap();
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     let before: String = {
         let conn = rusqlite::Connection::open(sqlite_path(&dir)).unwrap();
@@ -2824,7 +2918,7 @@ fn pc12_pc13_short_token_in_mixed_query_is_dropped_not_an_and_filter() {
     )
     .unwrap();
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     let search = success(&dir, &["search", "authentication AI", "--mode", "text"]);
     let results = search["results"].as_array().unwrap();
@@ -2860,7 +2954,7 @@ fn pc11_all_short_tokens_use_the_bounded_like_fallback_only() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# A\n\nan ai driven doc\n").unwrap();
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     // "an" and "ai" are both 2 Unicode scalars — no token reaches the
     // trigram MATCH threshold, so this must resolve via LIKE alone.
@@ -2884,7 +2978,7 @@ fn pc8_fts5_operator_keywords_and_quotes_are_literal_not_syntax() {
     )
     .unwrap();
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     // A raw double quote inside the query must be escaped (`""`) rather than
     // breaking the generated MATCH expression's own quoting.
@@ -2924,7 +3018,7 @@ fn pc8_deterministic_numeric_and_bilingual_equivalence_forms_are_restored() {
     )
     .unwrap();
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     let path_matches = |search: &Value, needle: &str| {
         search["results"].as_array().unwrap().iter().any(|result| {
@@ -2983,7 +3077,7 @@ fn r_addendum_feedback2_mixed_query_short_particle_does_not_exclude_a_document_l
     )
     .unwrap();
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     let search = success(
         &dir,
@@ -3028,7 +3122,7 @@ fn r_addendum_feedback2_mixed_query_slash_joined_unit_and_short_particle() {
     )
     .unwrap();
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     let search = success(
         &dir,
@@ -3073,7 +3167,7 @@ fn f3_escaped_punctuation_is_findable_by_the_plain_query_and_shown_unescaped() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("slip.md"), "# 回覧\n\n期限 7\\/10 まで\n").unwrap();
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     let search = success(&dir, &["search", "7/10", "--mode", "text"]);
     let results = search["results"].as_array().unwrap();
@@ -3108,7 +3202,7 @@ fn f3_fenced_code_keeps_the_backslashes_the_corpus_actually_contains() {
     )
     .unwrap();
     init(&dir);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     let search = success(&dir, &["search", "shasum", "--mode", "text"]);
     let results = search["results"].as_array().unwrap();

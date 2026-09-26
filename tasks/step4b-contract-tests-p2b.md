@@ -91,7 +91,7 @@ P2 = 参考 (Phase 4+ 依存・文書のみ)。「**現行実装との既知の�
 | PB32-33 (§K) | schema_version wire 表現統一 | U48 | 08 §2.1 L56, §2.3 L100-104 |
 | PB34-36 (§L) | 表示フィールド canonical 優先・URI opaque | U49 | 08 §2.2 L73-79 |
 | PB37-38 (§M) | object URI type=image 限定 | U50 | 08 §2.3 L107-117 |
-| PB39-41 (§N) | shallow commit 手順 2a 厳密固定 | U51 | 08 §3.1 L164-169 |
+| PB39-41 (§N) | receipt-backed shallow の open/view fail-closed と verify-only 観測 | U51 | 08 §3.1 手順 2a / §4.3 |
 | PB42-44 (§O) | 手順 4: 多重 entry 決定的選択 | U52 | 08 §3.1 L172-178 |
 | PB45-47 (§P) | 手順 6a: 時点帰属検証 | U54 | 08 §3.1 L207-221 |
 | PB48-50 (§Q) | 手順 6b: manifest 欠落降格 | U55 | 08 §3.1 L222-253 |
@@ -598,16 +598,14 @@ P2 = 参考 (Phase 4+ 依存・文書のみ)。「**現行実装との既知の�
   時 (`main.rs` L2054-2055 等) には同名フィールドが存在するが、これは新規発行時の canonical 値であり
   「解決時に pointer 入力値を上書きする」という本契約の対象ではない。
 
-### PB35 shallow 解決は path_at_commit をヒントで代替せず欠落表示にする [P0]
-- 正本: 08 §2.2 L76-79『**shallow 解決 (§3.1 手順 2a) では tree 由来の canonical 値が得られない
-  field (`path_at_commit`) を pointer 入力値で代替表示しない** — `path unavailable (commit_shallow)`
-  等の欠落表示とする (chunk object 由来の field は通常どおり canonical 値を表示する)』
-- 前提: shallow commit (tree object が GC 済み) を指す pointer を用意し、`path_at_commit` に
-  もっともらしい値を仕込む。
-- 操作: `kio open`/`kio view` (PB34 が実装され表示フィールドが出力されるようになった前提) を実行する。
-- 期待: `path_at_commit` は pointer 入力値ではなく `"path unavailable (commit_shallow)"` 相当の
-  欠落表示になる。`heading_path`/`section_id` 等の chunk object 由来フィールドは (chunk object が
-  shallow でも解決できるため) 通常どおり canonical 値を表示する。
+### PB35 receipt-backed shallow pointer は表示 metadata を推測しない [P0]
+- 正本: 08 §2.2 / §3.1 手順 2a。tree が欠落した pointer の本文解決では optional
+  `path_at_commit` を表示 authority にせず、raw / chunk / HEAD も tree membership の代替にしない。
+- 前提: 有効 shallow receipt により tree object が欠落する commit を指す pointer を用意し、
+  `path_at_commit` にもっともらしい値を仕込む。
+- 操作: `kio open` / `kio view` を実行する。
+- 期待: 本文・表示 metadata は返さず `KIO-E-COMMIT-SHALLOW-001` で fail-closed する。tree を
+  backup から復元してから再実行するまで、pointer 入力値を canonical path として表示しない。
 
 ### PB36 [regression-lock] Evidence Pointer URI は opaque で authority の大文字小文字を保存する [P1]
 - 正本: 08 §2.3 L102-104『**URI は opaque として扱い、authority 位置 (scope_id) の大文字小文字を
@@ -652,25 +650,20 @@ P2 = 参考 (Phase 4+ 依存・文書のみ)。「**現行実装との既知の�
 
 ---
 
-## N. shallow commit (手順 2a) 適用ステップの厳密固定 (U51)
+## N. receipt-backed shallow tree の fail-closed 境界 (U51)
 
-### PB39 [regression-lock] shallow 経路は tree 依存ステップ (3/4/6/6a/6b) を実際にスキップしている [P1]
-- 正本: 08 §3.1 手順 2a L164-169『適用可能な手順を「手順 5 → chunk_hash → chunk object → gen →
-  手順 7 → 手順 8」に厳密固定し、tree/entry を要する手順 3-4・6・6a・6b は対象外と明記する』
-- 前提: 現行実装 `resolve_pointer_for_cli` (`main.rs` L6216-6257) は `repo.read_tree` が
-  `is_store_not_found` の場合 `(commit_shallow=true, entry_gen=None)` として tree 読み取り (手順
-  3-4 相当) を丸ごとスキップし、以降 raw_present 判定 (手順 5) → chunk 解決 (手順 6-7) → 整合検証
-  (手順 8、`entry_gen` が `None` のため gen 一致チェックのみスキップ) に進む。
-- 操作: shallow commit を指す pointer を `kio open`/`kio view` で解決する。
-- 期待: tree entry に依存する処理 (手順 3-4 の tree 取得・raw_hash entry 検索、当時未実装の手順
-  6a/6b) が一切実行されず、chunk_hash から直接 chunk を解決する — regression-lock (新規実装は不要)。
-  非 strict では `commit_shallow: true` を伴い解決成功として返る (08§3.2 L294 の
-  「shallow commit は pointer 解決の失敗要因ではない」)。
+### PB39 [regression-lock] open/view は shallow tree を raw/chunk で代替解決しない [P1]
+- 正本: 08 §3.1 手順 2a。tree が欠落し valid shallow receipt がそれを正当化するとき、本文を返す
+  resolver は membership / profile / gen / 時点帰属を検証できないため成功へ降格しない。
+- 前提: valid shallow receipt に対応する tree object を欠落させた commit を指す pointer を用意する。
+- 操作: shallow commit を指す pointer を `kio open` / `kio view` で解決する。
+- 期待: 両方が `KIO-E-COMMIT-SHALLOW-001` (exit 1) で失敗する。chunk_hash からの直接本文解決、
+  current HEAD / SQLite cache への fallback、tree entry 検証の省略はいずれも発生しない。tree を backup
+  から復元した後だけ full-tree resolver が通常の検証を再開する。
 
 ### PB40 `kio evidence verify --strict` は shallow 解決を alive でなく unverifiable(exit 3) に降格する [P0]
-- 正本: 08 §3.1 手順 8 L266『`--strict` verify は shallow 経路の解決を alive でなく **unverifiable
-  (exit 3)** として返す (時点帰属の偽装を「検証済み」と誤認させない)』/ 08 §4.3 L365『exit は reason
-  の再試行可能性に従い分岐する — `commit_shallow` のみなら 3』
+- 正本: 08 §4.3。本文を返さない verify は shallow を verify-only の `commit_shallow` として観測し、
+  `--strict` では **unverifiable (exit 3)** として返す。
 - 前提: shallow commit を指す pointer で `kio evidence verify <pointer> --strict` を実行する。
 - 操作: 上記コマンドを実行し `status` と exit code を検査する。
 - 期待: `status: "unverifiable"`, `details.reason: "commit_shallow"`, exit code 3。**現行実装との

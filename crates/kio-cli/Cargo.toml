@@ -11,6 +11,7 @@ name = "kio"
 path = "src/main.rs"
 
 [dependencies]
+kio-app.workspace = true
 cap-primitives.workspace = true
 clap.workspace = true
 getrandom.workspace = true

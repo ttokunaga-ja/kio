@@ -7,6 +7,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 #[cfg(any(unix, windows))]
 use std::path::Component;
 use std::path::{Path, PathBuf};
+use std::rc::{Rc, Weak};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -20,7 +21,7 @@ use crate::ExitCode;
 use crate::cas::lower_hex;
 use crate::cas::{
     CAS_STREAM_BUFFER_BYTES, ContentObjectKind, MAX_RAW_OBJECT_BYTES, ObjectKind, ObjectStore,
-    append_jsonl, atomic_overwrite, atomic_write, canonical_json_bytes, is_hash,
+    append_jsonl, canonical_json_bytes, is_hash, read_bounded_regular_file,
 };
 use crate::dag::{
     CommitObject, CommitStats, CommitType, DEFAULT_CHUNKING_MAX_CHARS, DEFAULT_CHUNKING_STRATEGY,
@@ -35,19 +36,37 @@ use crate::portable::{
 };
 use crate::purge::PurgeState;
 use crate::schema::{SchemaKind, validate_json_schema};
+use crate::store_dir::StoreDirectory;
+
+mod managed_restore;
+pub(crate) use managed_restore::reject_pending_managed_restore;
+pub use managed_restore::{
+    ManagedRestoreChange, ManagedRestoreOutcome, ManagedRestorePlan, ManagedRestoreRequest,
+};
 
 /// Exact on-disk scope format understood by this pre-stable reader.
-pub const KIO_FORMAT_VERSION: &str = "0.1.0";
+pub const KIO_FORMAT_VERSION: &str = "1.0.0";
 pub const DEFAULT_MAX_ARCHIVE_FILE_BYTES: u64 = MAX_RAW_OBJECT_BYTES;
 pub const DEFAULT_MAX_ARCHIVE_SCOPE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-pub use crate::dag::{MAX_COMMIT_PARENTS, MAX_TREE_ENTRIES};
+pub use crate::dag::MAX_TREE_ENTRIES;
 const MAX_TAG_REF_BYTES: u64 = 128;
-/// The bound-child bootstrap accepts a complete config document only long
-/// enough to preserve normal scope policy while it adds the generated parent
-/// envelope.  Keeping this finite prevents a retained descriptor from turning
-/// into an unbounded parser/allocation sink before regular repository limits
-/// take over.
-#[cfg(unix)]
+const MAX_TAG_NAMES_BYTES: u64 = 16 * 1024 * 1024;
+const PUBLICATION_JOURNAL_LEAF: &str = "publication-v1.json";
+const MAX_PUBLICATION_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Durable intent for the only mutable history publication.  The journal is
+/// deliberately separate from the CAS: it records the two mutable files that
+/// cannot be committed as one filesystem transaction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicationJournal {
+    version: u8,
+    expected_head: Option<String>,
+    new_head: String,
+    manifest: Value,
+}
+/// Bound structured scope metadata on every supported operating system.
+/// Management and policy reads must never become unbounded parser inputs.
 const MAX_BOUND_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// One operation-local snapshot of the debug-only core controls.  This stays
@@ -157,7 +176,7 @@ struct WorkingFileCandidate {
     file_name: String,
     /// Bound-child candidates are re-opened relative to this retained scope
     /// directory. `path` remains diagnostic-only in that mode.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     bound_root: Option<Arc<File>>,
 }
 
@@ -186,12 +205,19 @@ pub struct Repository {
     store: ObjectStore,
     /// Retained descriptors used only by an internal child-index process.
     ///
-    /// A bound child changes cwd to `bound_kio`, so every operational store
-    /// path is relative to the opened directory rather than the replaceable
-    /// public `.kio` entry.  Source-file operations use `bound_root` through
-    /// capability APIs; callers must not reconstruct a public parent path.
+    /// A bound repository retains both authority directories.  Operational
+    /// I/O must resolve from these handles, never from a replaceable public
+    /// `.kio` path or process-wide current directory.
     bound_root: Option<Arc<File>>,
     bound_kio: Option<Arc<File>>,
+}
+
+impl Repository {
+    /// Clone the repository's retained CAS authority for bounded object reads.
+    #[must_use]
+    pub fn object_store(&self) -> ObjectStore {
+        self.store.clone()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -298,94 +324,53 @@ impl Repository {
         }
 
         let root = root.canonicalize().kio_io(root)?;
-        let kio_dir = root.join(".kio");
-        match fs::symlink_metadata(&kio_dir) {
-            Ok(_) => return Self::open(root),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(KioError::io(
-                    error.to_string(),
-                    kio_dir.display().to_string(),
-                ));
-            }
+        let scope = StoreDirectory::open(&root)?;
+        let retained_root = scope
+            .root_handle()
+            .as_ref()
+            .try_clone()
+            .map_err(|error| KioError::io(error.to_string(), "."))?;
+        match Self::create_bound(root.clone(), retained_root) {
+            Ok(repo) => Ok(repo),
+            // Preserve `init`'s existing-store behavior, but make the second
+            // open a fresh retained binding rather than trusting the failed
+            // create attempt's public name.
+            Err(error) if error.error_code() == "KIO-E-STORE-EXISTS-001" => Self::open(root),
+            Err(error) => Err(error),
         }
-
-        for dir in [
-            kio_dir.join("objects/raw"),
-            kio_dir.join("objects/trees"),
-            kio_dir.join("objects/commits"),
-            kio_dir.join("refs/heads"),
-            kio_dir.join("refs").join(PORTABLE_TAGS_DIRECTORY),
-            kio_dir.join("logs"),
-        ] {
-            fs::create_dir_all(&dir).kio_io(&dir)?;
-        }
-
-        // P2: restrict the `.kio` tree to the owner (0700). objects/raw holds the
-        // verbatim document bytes (secrets included, even unclassified ones), and
-        // approvals/tasks/quarantine logs plus sqlite.db carry actor names and
-        // usage patterns — none of it should be world/group-readable on a
-        // multi-user host (07 §1 secrecy posture). A 0700 parent blocks traversal
-        // into the whole subtree regardless of child file modes; no-op on non-unix.
-        restrict_dir_to_owner(&kio_dir)?;
-
-        atomic_write(&kio_dir.join("HEAD"), b"")?;
-        atomic_write(&kio_dir.join("refs/heads/main"), b"")?;
-        // 裁定2 (step4b-contract-tests-p3b.md §Z2): `kio_format_version` is a
-        // scope.json-only concept (03 §2 L154) — config.toml no longer
-        // carries a redundant copy. An empty config.toml is a valid, fully
-        // default configuration under `config.schema.json` (no required
-        // keys).
-        atomic_write(&kio_dir.join("config.toml"), b"")?;
-        atomic_write(
-            &kio_dir.join("scope.json"),
-            serde_json::to_string_pretty(&json!({
-                "kio_format_version": KIO_FORMAT_VERSION,
-                "scope_id": new_ulid(&root),
-                "scope_path": root,
-            }))
-            .map_err(|err| KioError::schema(err.to_string()))?
-            .as_bytes(),
-        )?;
-        atomic_write(
-            &kio_dir.join("manifest.json"),
-            b"{\n  \"schema_version\": 1,\n  \"files\": []\n}\n",
-        )?;
-        atomic_write(
-            &kio_dir.join("tool-lock.json"),
-            b"{\n  \"spec_version\": 1\n}\n",
-        )?;
-
-        Self::open(root)
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let repo = Self::open_without_head_repair(path)?;
-        // R13-4: repair a corrupt (empty/missing) HEAD from refs/heads/main before
-        // any command reads or advances HEAD. Done on every ordinary `open` so
-        // `log`/`status` display the real history and `snapshot` extends it.
-        repo.self_heal_head()?;
+        let repo = Self::open_for_recovery(path)?;
+        repo.ensure_no_pending_managed_restore()?;
+        // A normal open is observational when no interrupted publication is
+        // present. This preserves read access to a legitimate read-only scope;
+        // the store lock is needed only to replay a durable journal.
+        if repo.publication_journal()?.is_some() {
+            repo.recover_publication()?;
+        }
+        repo.validate()?;
+        // A journal which appeared after the initial observation must never be
+        // hidden behind a freshly validated mutable projection.
+        repo.ensure_no_pending_publication()?;
         Ok(repo)
     }
 
-    /// Validate and open a repository without performing HEAD self-healing.
-    /// Mutating repair commands use this to acquire `.kio/.lock` before invoking
-    /// [`Self::self_heal_head_for_repair`].
-    pub fn open_without_head_repair(path: impl AsRef<Path>) -> Result<Self> {
-        let root = path.as_ref().canonicalize().kio_io(path.as_ref())?;
-        let kio_dir = root.join(".kio");
-        validate_store_directory(&kio_dir)?;
-
-        let repo = Self {
-            canonical_root: root.clone(),
-            root,
-            kio_dir: kio_dir.clone(),
-            store: ObjectStore::new(kio_dir),
-            bound_root: None,
-            bound_kio: None,
-        };
+    /// Open only after proving no incomplete mutable publication exists.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let repo = Self::open_for_recovery(path)?;
+        repo.ensure_no_pending_managed_restore()?;
+        repo.ensure_no_pending_publication()?;
         repo.validate()?;
         Ok(repo)
+    }
+
+    /// Open the minimal durable authority required to replay a publication.
+    /// This is intentionally not a general read API: callers must lock and
+    /// call [`Self::recover_publication`] before observing mutable projections.
+    pub fn open_for_recovery(path: impl AsRef<Path>) -> Result<Self> {
+        let root = path.as_ref().canonicalize().kio_io(path.as_ref())?;
+        Self::open_retained_for_recovery(root)
     }
 
     pub fn open_current() -> Result<Self> {
@@ -393,158 +378,143 @@ impl Repository {
         Self::open(cwd)
     }
 
-    pub fn open_current_without_head_repair() -> Result<Self> {
+    pub fn open_current_read_only() -> Result<Self> {
         let cwd = std::env::current_dir().map_err(|err| KioError::io(err.to_string(), "."))?;
-        Self::open_without_head_repair(cwd)
+        Self::open_read_only(cwd)
     }
 
-    /// Initialize/open a child scope after the caller bound this process cwd to
-    /// a retained child descriptor. Public child paths are intentionally not
-    /// consulted for operational I/O. The process remains in the retained
-    /// child directory: operational paths are `.` / `.kio`, never `..`.
-    #[cfg(unix)]
-    pub fn init_bound_current(canonical_root: PathBuf) -> Result<Self> {
-        Self::init_bound_current_with_generated_parent_policy(canonical_root, None)
-    }
-
-    /// Initialize/open a descriptor-bound child scope and persist the strict
-    /// parent policy while the `.kio` directory is still addressed solely by
-    /// its retained no-follow handle.  The caller must have parsed the policy
-    /// before crossing the process boundary; this method deliberately accepts
-    /// a generic TOML value to keep `kio-core` independent of pipeline types.
-    #[cfg(unix)]
-    pub fn init_bound_current_with_generated_parent_policy(
-        canonical_root: PathBuf,
-        generated_parent_policy: Option<toml::Value>,
-    ) -> Result<Self> {
-        use cap_primitives::{ambient_authority, fs as cap_fs};
-        let scope = cap_fs::open_ambient_dir(Path::new("."), ambient_authority())
-            .map_err(|err| KioError::io(err.to_string(), "."))?;
-        let (kio, newly_created) = match cap_fs::open_dir_nofollow(&scope, Path::new(".kio")) {
-            Ok(handle) => (handle, false),
-            Err(_) => match cap_fs::stat(&scope, Path::new(".kio"), cap_fs::FollowSymlinks::No) {
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    let mut options = cap_fs::DirOptions::new();
-                    use cap_fs::DirBuilderExt;
-                    options.mode(0o700);
-                    match cap_fs::create_dir(&scope, Path::new(".kio"), &options) {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-                        Err(err) => return Err(KioError::io(err.to_string(), ".kio")),
-                    }
-                    (
-                        cap_fs::open_dir_nofollow(&scope, Path::new(".kio"))
-                            .map_err(|err| KioError::io(err.to_string(), ".kio"))?,
-                        true,
-                    )
-                }
-                Ok(_) => return Err(KioError::invalid_usage(".kio must be a real directory")),
-                Err(err) => return Err(KioError::io(err.to_string(), ".kio")),
-            },
+    /// Initialize a scope from a retained root directory. The process current
+    /// directory is never observed or changed.
+    pub fn init_bound(canonical_root: PathBuf, scope: File) -> Result<Self> {
+        let scope_directory = StoreDirectory::from_retained(scope, canonical_root.clone())?;
+        crate::management::validate_controlled_root(
+            scope_directory.root_handle().as_ref(),
+            &canonical_root,
+        )?;
+        let existing = scope_directory.contains_entry(Path::new(".kio"))?;
+        let kio = if existing {
+            scope_directory.open_directory(Path::new(".kio"))?
+        } else {
+            let created = scope_directory.create_directory(Path::new(".kio"))?;
+            crate::store_dir::restrict_new_private_directory(&created)?;
+            let directory = StoreDirectory::from_retained(
+                created
+                    .try_clone()
+                    .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
+                canonical_root.join(".kio"),
+            )?;
+            crate::management::validate_controlled_root(
+                scope_directory.root_handle().as_ref(),
+                &canonical_root,
+            )?;
+            initialize_bound_kio_layout_directory(&directory, &canonical_root)?;
+            created
         };
-        if newly_created {
-            initialize_bound_kio_layout(&kio, &canonical_root)?;
-        }
-        if let Some(policy) = generated_parent_policy {
-            persist_bound_generated_parent_policy(&kio, policy)?;
-        }
-        // `.kio` was opened with no-follow immediately above. Move the child
-        // process into that retained directory *before* constructing the
-        // repository. All existing store operations then address `.` and stay
-        // on the opened inode even if a same-UID process replaces the public
-        // `.kio` entry. Source access is kept separate through `bound_root`.
-        use std::os::fd::AsRawFd;
-        let kio_cwd = open_bound_directory_for_io(&kio, Path::new(".kio"))?;
-        if unsafe { libc::fchdir(kio_cwd.as_raw_fd()) } != 0 {
-            return Err(KioError::io(
-                std::io::Error::last_os_error().to_string(),
-                ".kio",
-            ));
-        }
-        let repo = Self {
-            root: PathBuf::from("."),
+        Self::open_bound_existing(
             canonical_root,
-            kio_dir: PathBuf::from("."),
-            store: ObjectStore::from_bound_kio(&kio)?,
-            bound_root: Some(Arc::new(scope)),
-            bound_kio: Some(Arc::new(kio)),
-        };
-        // Do not flatten schema/version/store errors into generic I/O here:
-        // the parent must retain the child error's typed exit semantics.
-        repo.validate()?;
-        repo.self_heal_head()?;
-        Ok(repo)
+            scope_directory
+                .root_handle()
+                .as_ref()
+                .try_clone()
+                .map_err(|error| KioError::io(error.to_string(), "."))?,
+            kio,
+        )
     }
 
-    /// Enter an already-initialized repository through retained scope and
-    /// `.kio` capabilities. This is the scheduler counterpart to the bound
-    /// child-index constructor: after the caller owns the descriptor-relative
-    /// store lock, every store path is resolved from the retained `.kio`
-    /// directory and every working-file read is resolved from `scope`.
-    ///
-    /// This changes the process working directory and is therefore intended
-    /// only for a dedicated CLI process immediately before its terminal
-    /// publication phase.
-    #[cfg(unix)]
+    /// Create a new retained scope and reject an existing `.kio` leaf.
+    pub fn create_bound(canonical_root: PathBuf, scope: File) -> Result<Self> {
+        let scope_directory = StoreDirectory::from_retained(scope, canonical_root.clone())?;
+        crate::management::validate_controlled_root(
+            scope_directory.root_handle().as_ref(),
+            &canonical_root,
+        )?;
+        let kio = scope_directory
+            .create_directory(Path::new(".kio"))
+            .map_err(|error| {
+                KioError::new(
+                    "KIO-E-STORE-EXISTS-001",
+                    "refusing to create over an existing .kio store",
+                    json!({"cause": error.error_code()}),
+                    ExitCode::InvalidUsage,
+                )
+            })?;
+        crate::store_dir::restrict_new_private_directory(&kio)?;
+        let directory = StoreDirectory::from_retained(
+            kio.try_clone()
+                .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
+            canonical_root.join(".kio"),
+        )?;
+        crate::management::validate_controlled_root(
+            scope_directory.root_handle().as_ref(),
+            &canonical_root,
+        )?;
+        initialize_bound_kio_layout_directory(&directory, &canonical_root)?;
+        Self::open_bound_existing(
+            canonical_root,
+            scope_directory
+                .root_handle()
+                .as_ref()
+                .try_clone()
+                .map_err(|error| KioError::io(error.to_string(), "."))?,
+            kio,
+        )
+    }
+
+    /// Open an initialized scope exclusively through retained root and `.kio`
+    /// handles. `ManagementBinding` compares the named child to the retained
+    /// handle on every supported platform before any operational I/O begins.
     pub fn open_bound_existing(canonical_root: PathBuf, scope: File, kio: File) -> Result<Self> {
-        use cap_primitives::fs as cap_fs;
-        use cap_primitives::fs::MetadataExt;
-        use std::os::fd::AsRawFd;
-
-        let named = cap_fs::stat(&scope, Path::new(".kio"), cap_fs::FollowSymlinks::No)
-            .map_err(|error| KioError::io(error.to_string(), ".kio"))?;
-        let retained = cap_fs::Metadata::from_file(&kio)
-            .map_err(|error| KioError::io(error.to_string(), ".kio"))?;
-        if !named.is_dir()
-            || !retained.is_dir()
-            || named.dev() != retained.dev()
-            || named.ino() != retained.ino()
-        {
-            return Err(unsafe_store_error(
-                Path::new(".kio"),
-                "retained .kio capability no longer matches the selected scope",
-            ));
-        }
-        // SAFETY: `kio` is a retained, no-follow directory descriptor verified
-        // above and remains owned by the repository for its full lifetime.
-        let kio_cwd = open_bound_directory_for_io(&kio, Path::new(".kio"))?;
-        if unsafe { libc::fchdir(kio_cwd.as_raw_fd()) } != 0 {
-            return Err(KioError::io(
-                std::io::Error::last_os_error().to_string(),
-                ".kio",
-            ));
-        }
-        let repo = Self {
-            root: PathBuf::from("."),
-            canonical_root,
-            kio_dir: PathBuf::from("."),
-            store: ObjectStore::from_bound_kio(&kio)?,
-            bound_root: Some(Arc::new(scope)),
-            bound_kio: Some(Arc::new(kio)),
-        };
-        // Test-only seam: at this point ObjectStore has retained no-follow
-        // handles for objects/{raw,trees,commits}, while no scheduled source
-        // staging or CAS write has started.  A replacement of the public
-        // descendants here must not redirect this repository.
+        let repo = Self::open_bound_for_recovery(canonical_root, scope, kio)?;
         wait_at_bound_snapshot_auto_layout_barrier();
         repo.validate()?;
         Ok(repo)
     }
 
-    #[cfg(not(unix))]
-    pub fn open_bound_existing(_: PathBuf, _: File, _: File) -> Result<Self> {
-        Err(KioError::new(
-            "KIO-E-SNAPSHOT-PLATFORM-UNSUPPORTED-001",
-            "scheduled snapshot mutation requires retained repository capabilities",
-            json!({}),
-            ExitCode::PermanentFailure,
-        ))
+    /// Bind retained scope authority for publication recovery without reading
+    /// mutable projections. Callers may lock and replay a pending journal
+    /// before invoking the normal validating open path.
+    pub fn open_bound_for_recovery(
+        canonical_root: PathBuf,
+        scope: File,
+        kio: File,
+    ) -> Result<Self> {
+        crate::management::ManagementBinding::from_retained(
+            scope
+                .try_clone()
+                .map_err(|error| KioError::io(error.to_string(), "."))?,
+            kio.try_clone()
+                .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
+            canonical_root.clone(),
+        )?;
+        let repo = Self {
+            root: canonical_root.clone(),
+            kio_dir: canonical_root.join(".kio"),
+            canonical_root,
+            store: ObjectStore::from_bound_kio(&kio)?,
+            bound_root: Some(Arc::new(scope)),
+            bound_kio: Some(Arc::new(kio)),
+        };
+        repo.validate_config()?;
+        repo.validate_scope()?;
+        Ok(repo)
     }
 
-    /// Perform the established HEAD self-heal after a repair command has
-    /// acquired the scope store lock. The lock is process-reentrant.
-    pub fn self_heal_head_for_repair(&self) -> Result<()> {
-        self.self_heal_head().map(|_| ())
+    /// Bind an ordinary public-path request to retained root and `.kio`
+    /// directories before any repository read.  The displayed paths remain
+    /// useful diagnostics only; operational metadata and CAS access use the
+    /// retained handles constructed here.
+    fn open_retained_for_recovery(canonical_root: PathBuf) -> Result<Self> {
+        let scope = StoreDirectory::open(&canonical_root)?;
+        let kio = scope.open_directory(Path::new(".kio"))?;
+        Self::open_bound_for_recovery(
+            canonical_root,
+            scope
+                .root_handle()
+                .as_ref()
+                .try_clone()
+                .map_err(|error| KioError::io(error.to_string(), "."))?,
+            kio,
+        )
     }
 
     /// Open a scope for immutable CAS/index search while treating
@@ -554,38 +524,21 @@ impl Repository {
     /// validated exactly as in [`Self::open`].
     pub fn open_for_search(path: impl AsRef<Path>) -> Result<Self> {
         let root = path.as_ref().canonicalize().kio_io(path.as_ref())?;
-        let kio_dir = root.join(".kio");
-        validate_store_directory(&kio_dir)?;
-        let repo = Self {
-            canonical_root: root.clone(),
-            root,
-            kio_dir: kio_dir.clone(),
-            store: ObjectStore::new(kio_dir),
-            bound_root: None,
-            bound_kio: None,
-        };
-        repo.validate_config()?;
-        repo.validate_scope()?;
-        repo.self_heal_head()?;
+        let repo = Self::open_retained_for_recovery(root)?;
+        repo.ensure_no_pending_managed_restore()?;
+        repo.head_commit_hash()?;
+        repo.ensure_no_pending_publication()?;
         Ok(repo)
     }
 
     /// The read-only counterpart to [`Self::open_for_search`]. It validates the
     /// same immutable store and scope state but never repairs HEAD or refs.
-    pub fn open_for_search_without_head_repair(path: impl AsRef<Path>) -> Result<Self> {
+    pub fn open_for_search_read_only(path: impl AsRef<Path>) -> Result<Self> {
         let root = path.as_ref().canonicalize().kio_io(path.as_ref())?;
-        let kio_dir = root.join(".kio");
-        validate_store_directory(&kio_dir)?;
-        let repo = Self {
-            canonical_root: root.clone(),
-            root,
-            kio_dir: kio_dir.clone(),
-            store: ObjectStore::new(kio_dir),
-            bound_root: None,
-            bound_kio: None,
-        };
-        repo.validate_config()?;
-        repo.validate_scope()?;
+        let repo = Self::open_retained_for_recovery(root)?;
+        repo.ensure_no_pending_managed_restore()?;
+        repo.head_commit_hash()?;
+        repo.ensure_no_pending_publication()?;
         Ok(repo)
     }
 
@@ -609,10 +562,8 @@ impl Repository {
         &self.kio_dir
     }
 
-    /// Retained scope-root descriptor for an internal descriptor-bound child
-    /// index process. It is deliberately absent for ordinary public-path
-    /// repositories.
-    #[cfg(unix)]
+    /// Retained scope-root descriptor for normal and internal repository I/O.
+    #[cfg(any(unix, windows))]
     #[must_use]
     pub fn bound_root_handle(&self) -> Option<&File> {
         self.bound_root.as_deref()
@@ -620,21 +571,60 @@ impl Repository {
 
     /// Retained `.kio` descriptor for an internal descriptor-bound child index
     /// process. Operational store paths are relative to this directory.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[must_use]
     pub fn bound_kio_handle(&self) -> Option<&File> {
         self.bound_kio.as_deref()
     }
 
-    /// Enumerate the commit targets named by every current on-disk ref.
+    /// Enumerate targets named by the sole mutable HEAD and immutable tags.
     ///
-    /// This is deliberately a filesystem-validation boundary rather than a
-    /// convenience wrapper around `HEAD`: repair must be able to reconstruct
-    /// projections for history retained solely by a branch or a tag.  The
-    /// returned hashes are not dereferenced here; [`HistoryReader`] owns the
-    /// subsequent strict commit/tree walk and reports a shallow object with its
-    /// precise object cause.
+    /// Tags must belong to the published HEAD ancestry. Detached CAS objects,
+    /// unpublished descendants, and tags in an unborn store cannot introduce
+    /// additional history roots. Trees are validated by the subsequent reader;
+    /// this proof needs only immutable commit predecessor edges.
     pub fn current_ref_targets(&self) -> Result<BTreeSet<String>> {
+        #[cfg(any(unix, windows))]
+        if self.bound_kio.is_some() {
+            let directory = self.store_directory()?;
+            let head = directory
+                .read_optional(Path::new("HEAD"), MAX_TAG_REF_BYTES)?
+                .ok_or_else(|| KioError::schema("HEAD is missing"))?;
+            let head =
+                std::str::from_utf8(&head).map_err(|_| KioError::schema("HEAD must be UTF-8"))?;
+            let mut targets = BTreeSet::new();
+            if let Some(hash) = parse_head_ref(head)? {
+                targets.insert(hash);
+            }
+            let tags = Path::new("refs").join(PORTABLE_TAGS_DIRECTORY);
+            for entry in directory.entries(&tags)? {
+                let name = entry.name.to_string_lossy();
+                if name == "names.jsonl" {
+                    continue;
+                }
+                if !entry.is_regular_file
+                    || name.len() != 68
+                    || !name.starts_with("tag-")
+                    || !name[4..]
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+                {
+                    return Err(KioError::schema("canonical tag leaf is invalid"));
+                }
+                let bytes = directory
+                    .read_optional(&tags.join(entry.name), MAX_TAG_REF_BYTES)?
+                    .ok_or_else(|| KioError::schema("tag ref disappeared"))?;
+                let hash = std::str::from_utf8(&bytes)
+                    .map_err(|_| KioError::schema("tag ref must be UTF-8"))?
+                    .trim();
+                if !is_hash(hash) {
+                    return Err(KioError::schema("tag ref target is invalid"));
+                }
+                targets.insert(hash.to_owned());
+            }
+            self.validate_published_history_roots(&targets)?;
+            return Ok(targets);
+        }
         let mut targets = BTreeSet::new();
         let head = read_commit_ref(&self.kio_dir.join("HEAD"), true)?;
         if let Some(hash) = head {
@@ -642,9 +632,158 @@ impl Repository {
         }
 
         let refs = self.kio_dir.join("refs");
-        collect_branch_ref_targets(&refs.join("heads"), &mut targets)?;
         collect_tag_ref_targets(&refs.join(PORTABLE_TAGS_DIRECTORY), &mut targets)?;
+        self.validate_published_history_roots(&targets)?;
         Ok(targets)
+    }
+
+    fn publication_journal(&self) -> Result<Option<PublicationJournal>> {
+        let Some(bytes) = self.store_directory()?.read_optional(
+            Path::new(PUBLICATION_JOURNAL_LEAF),
+            MAX_PUBLICATION_JOURNAL_BYTES,
+        )?
+        else {
+            return Ok(None);
+        };
+        let value: PublicationJournal =
+            serde_json::from_slice(&bytes).map_err(|error| KioError::schema(error.to_string()))?;
+        if value.version != 1
+            || !is_hash(&value.new_head)
+            || value
+                .expected_head
+                .as_deref()
+                .is_some_and(|head| !is_hash(head))
+        {
+            return Err(KioError::schema(
+                "publication journal has invalid authority fields",
+            ));
+        }
+        validate_json_schema(SchemaKind::Manifest, &value.manifest)?;
+        Ok(Some(value))
+    }
+
+    fn ensure_no_pending_publication(&self) -> Result<()> {
+        if self.publication_journal()?.is_some() {
+            return Err(KioError::new(
+                "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001",
+                "an incomplete history publication requires explicit recovery",
+                json!({ "journal": PUBLICATION_JOURNAL_LEAF }),
+                ExitCode::PartialFailure,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Finish an interrupted journaled publication. The caller must hold the
+    /// store lock. It refuses a changed HEAD, a missing commit, or a commit
+    /// that is not the exact child named by the journal.
+    pub fn recover_publication(&self) -> Result<bool> {
+        let _lock = self.lock_store()?;
+        let atomic_recovered = self.recover_atomic_storage()?;
+        // A publication journal may be the last phase of a managed restore.
+        // It must never advance HEAD while that restore's working-tree journal
+        // still authorizes rollback rather than finalization.
+        self.ensure_no_pending_managed_restore()?;
+        let Some(journal) = self.publication_journal()? else {
+            return Ok(atomic_recovered);
+        };
+        let current = self.head_commit_hash()?;
+        if current.as_deref() != journal.expected_head.as_deref()
+            && current.as_deref() != Some(journal.new_head.as_str())
+        {
+            return Err(KioError::new(
+                "KIO-E-PUBLICATION-CONFLICT-001",
+                "publication journal does not match the current HEAD",
+                json!({ "expected_head": journal.expected_head, "current_head": current, "new_head": journal.new_head }),
+                ExitCode::PartialFailure,
+            ));
+        }
+        let commit = self.read_commit(&journal.new_head)?;
+        if commit.parent != journal.expected_head {
+            return Err(KioError::schema(
+                "publication journal target is not the expected HEAD child",
+            ));
+        }
+        let tree = self.read_tree(&commit.tree)?;
+        validate_manifest_matches_tree(&journal.manifest, &tree)?;
+        if current.as_deref() != Some(journal.new_head.as_str()) {
+            let head_bytes = format!("{}\n", journal.new_head);
+            self.replace_metadata("HEAD", head_bytes.as_bytes())?;
+        }
+        self.write_manifest_value(&journal.manifest)?;
+        self.remove_publication_journal()?;
+        Ok(true)
+    }
+
+    fn publish_with_journal(
+        &self,
+        expected_head: Option<&str>,
+        new_head: &str,
+        commit: &CommitObject,
+        manifest: Value,
+    ) -> Result<()> {
+        self.ensure_no_pending_publication()?;
+        if commit.parent.as_deref() != expected_head {
+            return Err(KioError::schema(
+                "published commit is not an exact child of HEAD",
+            ));
+        }
+        if self.head_commit_hash()?.as_deref() != expected_head {
+            return Err(KioError::new(
+                "KIO-E-PUBLICATION-CONFLICT-001",
+                "HEAD changed before publication",
+                json!({ "expected_head": expected_head, "new_head": new_head }),
+                ExitCode::PartialFailure,
+            ));
+        }
+        let stored = self.store.read_by_hash(new_head)?;
+        if stored.kind != ObjectKind::Commit
+            || serde_json::from_slice::<CommitObject>(&stored.bytes)
+                .map_err(|error| KioError::schema(error.to_string()))?
+                != *commit
+        {
+            return Err(KioError::schema(
+                "publication hash does not name the supplied commit",
+            ));
+        }
+        let tree = self.read_tree(&commit.tree)?;
+        validate_manifest_matches_tree(&manifest, &tree)?;
+        let journal = PublicationJournal {
+            version: 1,
+            expected_head: expected_head.map(str::to_owned),
+            new_head: new_head.to_owned(),
+            manifest,
+        };
+        let value =
+            serde_json::to_value(&journal).map_err(|error| KioError::schema(error.to_string()))?;
+        let bytes = canonical_json_bytes(&value)?;
+        if bytes.len() as u64 > MAX_PUBLICATION_JOURNAL_BYTES {
+            return Err(KioError::schema(
+                "publication journal exceeds its durable size limit",
+            ));
+        }
+        let directory = self.store_directory()?;
+        directory.write_atomic(
+            Path::new(PUBLICATION_JOURNAL_LEAF),
+            &bytes,
+            crate::store_dir::Publication::CreateOnly,
+        )?;
+        crate::durability::checkpoint(crate::durability::DurabilityPoint::PublicationJournal)?;
+        directory.write_atomic(
+            Path::new("HEAD"),
+            format!("{new_head}\n").as_bytes(),
+            crate::store_dir::Publication::Replace,
+        )?;
+        crate::durability::checkpoint(crate::durability::DurabilityPoint::PublicationHead)?;
+        self.write_manifest_value(&journal.manifest)?;
+        crate::durability::checkpoint(crate::durability::DurabilityPoint::PublicationManifest)?;
+        self.remove_publication_journal()?;
+        Ok(())
+    }
+
+    fn remove_publication_journal(&self) -> Result<()> {
+        self.store_directory()?
+            .remove_file(Path::new(PUBLICATION_JOURNAL_LEAF))
     }
 
     /// QA5 (step4b-contract-tests-p3a.md §B, 10 §1 L97-113): record the
@@ -658,9 +797,9 @@ impl Repository {
     /// effective_ignore_hash / estimated_file_count / estimated_total_bytes /
     /// estimated_markdownize_usd / estimated_embedding_usd).
     pub fn record_scan_approval(&self, fields: Value) -> Result<bool> {
-        let path = self.kio_dir.join("scope.json");
-        let mut value: Value = serde_json::from_str(&fs::read_to_string(&path).kio_io(&path)?)
-            .map_err(|err| KioError::schema(err.to_string()))?;
+        let mut value: Value =
+            serde_json::from_str(&self.metadata_text("scope.json", MAX_BOUND_CONFIG_BYTES)?)
+                .map_err(|err| KioError::schema(err.to_string()))?;
         let Some(object) = value.as_object_mut() else {
             return Err(KioError::schema("scope.json must be an object"));
         };
@@ -669,13 +808,10 @@ impl Repository {
         }
         object.insert("scan_approval".to_owned(), fields);
         validate_json_schema(SchemaKind::Scope, &value)?;
-        // `atomic_write` is CAS-only semantics (a no-op when `path` already
-        // exists, R9-8) — wrong here since `scope.json` already exists from
-        // `Repository::init` and this call must actually replace its
-        // content. `atomic_overwrite` is the mutable-file primitive already
-        // used for HEAD/manifest.json elsewhere in this file.
-        atomic_overwrite(
-            &path,
+        // Scope approval is mutable metadata: replace through the retained
+        // store capability while the caller holds its publication lock.
+        self.replace_metadata(
+            "scope.json",
             serde_json::to_string_pretty(&value)
                 .map_err(|err| KioError::schema(err.to_string()))?
                 .as_bytes(),
@@ -687,7 +823,7 @@ impl Repository {
     /// Authorization callers must bind both values to protected device-local
     /// state; `scope.json` alone is portable audit data, not active consent.
     pub fn scope_identity(&self) -> Result<ScopeIdentity> {
-        validate_store_directory(&self.kio_dir)?;
+        self.validate_store_authority()?;
         Ok(ScopeIdentity {
             scope_id: self.validated_scope_id()?,
             canonical_root: self.canonical_root.clone(),
@@ -701,16 +837,99 @@ impl Repository {
     /// held guard does not deadlock when `snapshot` re-acquires it internally.
     /// The loser of a concurrent acquisition gets `KIO-E-STORE-LOCKED-001`
     /// (exit 3), the same contract as `snapshot` / `tag`.
-    pub fn lock_store(&self) -> Result<StoreLock> {
-        StoreLock::acquire(&self.kio_dir)
+    pub fn lock_store(&self) -> Result<RetainedStoreLock> {
+        let kio = self.bound_kio.as_deref().ok_or_else(|| {
+            KioError::invalid_usage("repository store lock requires retained .kio authority")
+        })?;
+        let lock = acquire_retained_store_lock(kio)?;
+        if let Err(error) = crate::gc::ensure_no_active_sweep_bound(kio) {
+            drop(lock);
+            return Err(error);
+        }
+        Ok(lock)
+    }
+
+    /// Narrow retained publication barrier shared by purge and restore. It is
+    /// a distinct leaf, so a purge holding the writer lease can acquire it
+    /// without reopening a pathname or contending on the directory flock.
+    pub fn lock_purge_publication(&self) -> Result<RetainedPublicationLock> {
+        let kio = self.bound_kio.as_deref().ok_or_else(|| {
+            KioError::invalid_usage("publication lock requires retained .kio authority")
+        })?;
+        acquire_retained_publication_lock(kio)
+    }
+
+    fn purge_state(&self) -> Result<PurgeState> {
+        #[cfg(any(unix, windows))]
+        if let Some(kio) = self.bound_kio.as_deref() {
+            return Ok(PurgeState::from_directory(StoreDirectory::from_retained(
+                kio.try_clone()
+                    .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
+                self.kio_dir.clone(),
+            )?));
+        }
+        PurgeState::open(&self.kio_dir)
+    }
+
+    fn store_directory(&self) -> Result<StoreDirectory> {
+        #[cfg(any(unix, windows))]
+        if let Some(kio) = self.bound_kio.as_deref() {
+            return StoreDirectory::from_retained(
+                kio.try_clone()
+                    .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
+                self.kio_dir.clone(),
+            );
+        }
+        StoreDirectory::open(&self.kio_dir)
+    }
+
+    fn metadata_text(&self, leaf: &str, max_bytes: u64) -> Result<String> {
+        let bytes = self
+            .store_directory()?
+            .read_optional(Path::new(leaf), max_bytes)?
+            .ok_or_else(|| KioError::schema(format!("{leaf} is missing")))?;
+        String::from_utf8(bytes).map_err(|_| KioError::schema(format!("{leaf} must be UTF-8")))
+    }
+
+    fn replace_metadata(&self, leaf: &str, bytes: &[u8]) -> Result<()> {
+        self.store_directory()?.write_atomic(
+            Path::new(leaf),
+            bytes,
+            crate::store_dir::Publication::Replace,
+        )
     }
 
     pub fn validate(&self) -> Result<()> {
-        validate_store_directory(&self.kio_dir)?;
+        self.ensure_no_pending_managed_restore()?;
+        self.validate_store_authority()?;
         self.validate_config()?;
         self.validate_scope()?;
+        self.head_commit_hash()?;
         self.validate_manifest()?;
         Ok(())
+    }
+
+    /// Revalidate the public names against the retained capabilities, then
+    /// re-open each CAS namespace descriptor-relative.  This deliberately
+    /// does not read or create `management.json`: enrollment is owned by the
+    /// application layer, while every ordinary repository open still needs a
+    /// current named-identity and store-layout safety check.
+    fn validate_store_authority(&self) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        if let (Some(root), Some(kio)) = (self.bound_root.as_deref(), self.bound_kio.as_deref()) {
+            let binding = crate::management::ManagementBinding::from_retained(
+                root.try_clone()
+                    .map_err(|error| KioError::io(error.to_string(), "."))?,
+                kio.try_clone()
+                    .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
+                self.canonical_root.clone(),
+            )?;
+            binding.revalidate()?;
+            validate_retained_store_directory(kio, &self.kio_dir)?;
+            self.store.validate_bound_layout()?;
+            return Ok(());
+        }
+        validate_store_directory(&self.kio_dir)
     }
 
     /// Replace the scope configuration only after the same schema and semantic
@@ -722,13 +941,167 @@ impl Repository {
         let json_value =
             serde_json::to_value(&value).map_err(|err| KioError::schema(err.to_string()))?;
         validate_json_schema(SchemaKind::Config, &json_value)?;
-        enforce_config_semantics(&json_value)?;
+        enforce_scope_config_semantics(&json_value)?;
         let text = toml::to_string(&value).map_err(|err| KioError::schema(err.to_string()))?;
-        #[cfg(unix)]
-        if let Some(kio) = self.bound_kio.as_deref() {
-            return replace_bound_regular_file(kio, "config.toml", text.as_bytes());
+        self.replace_metadata("config.toml", text.as_bytes())
+    }
+
+    /// Read the current retained `config.toml` document after schema and
+    /// scope-semantic validation. The returned text is suitable as the exact
+    /// expected value for [`Self::compare_replace_config_document`].
+    pub fn read_config_document(&self) -> Result<String> {
+        self.validate_store_authority()?;
+        let result = (|| {
+            let text = self.metadata_text("config.toml", MAX_BOUND_CONFIG_BYTES)?;
+            validate_scope_config_document(&text)?;
+            Ok(text)
+        })();
+        let authority_after = self.validate_store_authority();
+        match (result, authority_after) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(text), Ok(())) => Ok(text),
         }
-        atomic_overwrite(&self.kio_dir.join("config.toml"), text.as_bytes())
+    }
+
+    /// Replace retained `config.toml` only when its current bytes exactly
+    /// equal `expected`. This preserves comments and ordering produced by an
+    /// application-layer editor while refusing a stale overwrite.
+    pub fn compare_replace_config_document(&self, expected: &str, replacement: &str) -> Result<()> {
+        if replacement.len() as u64 > MAX_BOUND_CONFIG_BYTES {
+            return Err(KioError::schema("config.toml exceeds the byte limit"));
+        }
+        validate_scope_config_document(replacement)?;
+        self.validate_store_authority()?;
+        let _lock = self.lock_store()?;
+        self.validate_store_authority()?;
+        let result = (|| {
+            let directory = self.store_directory()?;
+            let current = read_bound_config_document(&directory)?;
+            if current != expected {
+                return Err(KioError::new(
+                    "KIO-E-CONFIG-CONFLICT-001",
+                    "config.toml changed before the requested replacement; retry from a fresh document",
+                    json!({}),
+                    ExitCode::AuthError,
+                ));
+            }
+            directory.write_atomic(
+                Path::new("config.toml"),
+                replacement.as_bytes(),
+                crate::store_dir::Publication::Replace,
+            )
+        })();
+        let authority_after = self.validate_store_authority();
+        match (result, authority_after) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(()), Ok(())) => Ok(()),
+        }
+    }
+
+    /// Read approval state through this repository's retained `.kio`
+    /// capability. The public `.kio` binding is checked both before and after
+    /// the read so a replaced scope cannot be silently treated as this one.
+    pub fn read_network_approvals(&self) -> Result<Vec<Value>> {
+        self.with_retained_scope_approval_read(network_approvals_from_value)
+    }
+
+    /// Whether this retained scope has recorded an approval lifecycle.
+    pub fn network_approvals_initialized(&self) -> Result<bool> {
+        self.with_retained_scope_approval_read(network_approvals_initialized_from_value)
+    }
+
+    /// Return the one pending approval intent from the retained scope.
+    pub fn read_network_approval_pending(&self) -> Result<Option<Value>> {
+        self.with_retained_scope_approval_read(network_approval_pending_from_value)
+    }
+
+    /// Test a strict active approval row against the retained scope.
+    pub fn network_approval_active(
+        &self,
+        tool_id: &str,
+        execution_mode: &str,
+        tool_profile_hash: &str,
+    ) -> Result<bool> {
+        self.with_retained_scope_approval_read(|value| {
+            network_approval_active_from_value(value, tool_id, execution_mode, tool_profile_hash)
+        })
+    }
+
+    /// Test whether this retained scope has any active row for `tool_id`.
+    pub fn network_approval_row_present(&self, tool_id: &str) -> Result<bool> {
+        self.with_retained_scope_approval_read(|value| {
+            network_approval_row_present_from_value(value, tool_id)
+        })
+    }
+
+    /// Durably record an approval intent through the retained store boundary.
+    pub fn write_network_approval_pending(&self, pending: Value) -> Result<()> {
+        self.with_retained_scope_approval_write(|directory| {
+            write_network_approval_pending_in_directory(directory, pending)
+        })
+    }
+
+    /// Publish a pending approval only when the retained current state still
+    /// equals `expected_pending`.
+    pub fn publish_network_approval(
+        &self,
+        row: Value,
+        expected_pending: Option<&Value>,
+    ) -> Result<()> {
+        self.with_retained_scope_approval_write(|directory| {
+            publish_network_approval_in_directory(directory, row, expected_pending)
+        })
+    }
+
+    /// Revoke matching approval rows and any matching pending intent through
+    /// the retained store boundary.
+    pub fn revoke_network_approval(
+        &self,
+        tool_id: Option<&str>,
+        revoked_at: &str,
+    ) -> Result<NetworkRevokeOutcome> {
+        self.with_retained_scope_approval_write(|directory| {
+            revoke_network_approval_in_directory(directory, tool_id, revoked_at)
+        })
+    }
+
+    fn with_retained_scope_approval_read<T>(
+        &self,
+        operation: impl FnOnce(&Value) -> Result<T>,
+    ) -> Result<T> {
+        self.validate_store_authority()?;
+        let result = (|| {
+            let directory = self.store_directory()?;
+            let value = read_bound_scope_json_value(&directory)?;
+            operation(&value)
+        })();
+        let authority_after = self.validate_store_authority();
+        match (result, authority_after) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+        }
+    }
+
+    fn with_retained_scope_approval_write<T>(
+        &self,
+        operation: impl FnOnce(&StoreDirectory) -> Result<T>,
+    ) -> Result<T> {
+        self.validate_store_authority()?;
+        let _lock = self.lock_store()?;
+        self.validate_store_authority()?;
+        let result = (|| {
+            let directory = self.store_directory()?;
+            operation(&directory)
+        })();
+        let authority_after = self.validate_store_authority();
+        match (result, authority_after) {
+            (Err(error), _) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            (Ok(value), Ok(())) => Ok(value),
+        }
     }
 
     pub fn build_working_tree(&self, store_raw: bool) -> Result<WorkingTree> {
@@ -808,7 +1181,7 @@ impl Repository {
             // Raw publication and erase-receipt retirement are one store-locked
             // operation even for direct callers of this public builder. Snapshot
             // callers already hold this reentrant lock.
-            let _lock = StoreLock::acquire(&self.kio_dir)?;
+            let _lock = self.lock_store()?;
             // Every caller of this public builder except `snapshot_with_type`'s
             // purge path is a non-purge write (`purge_self_targets` empty —
             // see `archive_staged_working_tree`'s doc comment): the barrier
@@ -1102,7 +1475,7 @@ impl Repository {
         // the next ordinary `kio index` (05 §3.5 L743), once no journal
         // remains to block it.
         if !scheduled_bound {
-            let purge = PurgeState::new(&self.kio_dir);
+            let purge = self.purge_state()?;
             for file in &staged {
                 if purge_self_targets.contains(&file.raw_hash) {
                     continue;
@@ -1150,7 +1523,7 @@ impl Repository {
     ) -> Result<Vec<WorkingFileCandidate>> {
         let mut candidates = Vec::new();
         let mut declared_scope_bytes = 0_u64;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(root) = &self.bound_root {
             use cap_primitives::fs as cap_fs;
 
@@ -1161,9 +1534,16 @@ impl Repository {
                 let entry = entry.map_err(|error| {
                     KioError::io(error.to_string(), self.canonical_root.display().to_string())
                 })?;
-                let file_name = match entry.file_name().into_string() {
+                let raw_file_name = entry.file_name();
+                let file_name = match raw_file_name.into_string() {
                     Ok(name) => name,
-                    Err(_) => continue,
+                    Err(file_name) => {
+                        eprintln!(
+                            "warning: skipping non-UTF-8 file name: {}",
+                            self.canonical_root.join(file_name).display()
+                        );
+                        continue;
+                    }
                 };
                 if file_name == ".kio" {
                     continue;
@@ -1271,7 +1651,7 @@ impl Repository {
             candidates.push(WorkingFileCandidate {
                 path,
                 file_name,
-                #[cfg(unix)]
+                #[cfg(any(unix, windows))]
                 bound_root: None,
             });
         }
@@ -1456,34 +1836,10 @@ impl Repository {
             ));
         }
         let authority = self.capture_scheduled_snapshot_authority(test_control)?;
-        let head = authority.head.trim();
-        let branch = authority.branch.trim();
-        match (head.is_empty(), branch.is_empty()) {
-            (true, true) => {}
-            (true, false) => {
-                return Err(snapshot_authority_changed(
-                    "scheduled snapshot rejects an empty HEAD with a populated refs/heads/main",
-                ));
-            }
-            (false, true) => {
-                return Err(snapshot_authority_changed(
-                    "scheduled snapshot rejects a populated HEAD with an empty refs/heads/main",
-                ));
-            }
-            (false, false) if head != branch => {
-                return Err(snapshot_authority_changed(
-                    "scheduled snapshot rejects a HEAD/ref mismatch",
-                ));
-            }
-            (false, false) => {}
-        }
-        if !head.is_empty() {
-            if !is_hash(head) {
-                return Err(KioError::schema("HEAD must contain a commit_hash"));
-            }
+        if let Some(head) = parse_head_ref(&authority.head)? {
             // Both objects are CAS-bound in this repository.  Do not permit a
             // scheduled writer to extend a shallow/corrupt history.
-            let commit = self.read_commit(head)?;
+            let commit = self.read_commit(&head)?;
             self.read_tree(&commit.tree)?;
         }
         self.reject_scheduled_bound_purge_state()?;
@@ -1504,8 +1860,6 @@ impl Repository {
         let (head, head_observation) =
             read_bound_regular_text_observed_at(kio, "HEAD", MAX_BOUND_CONFIG_BYTES)?;
         wait_at_bound_snapshot_auto_barrier(test_control.authority_capture_ready());
-        let (branch, branch_observation) =
-            read_bound_regular_text_observed_at(kio, "refs/heads/main", MAX_BOUND_CONFIG_BYTES)?;
         let (tool_lock, tool_lock_observation) =
             read_bound_regular_text_observed_at(kio, "tool-lock.json", MAX_BOUND_CONFIG_BYTES)?;
         let tool_lock_value: Value = serde_json::from_str(&tool_lock)
@@ -1513,10 +1867,8 @@ impl Repository {
         canonical_tool_lock_value(&tool_lock_value)?;
         Ok(ScheduledSnapshotAuthority {
             head,
-            branch,
             tool_lock,
             head_observation,
-            branch_observation,
             tool_lock_observation,
         })
     }
@@ -1534,7 +1886,7 @@ impl Repository {
             })?;
         if actual != *expected {
             return Err(snapshot_authority_changed(
-                "scheduled snapshot HEAD, branch ref, or tool lock changed",
+                "scheduled snapshot HEAD or tool lock changed",
             ));
         }
         Ok(())
@@ -1554,14 +1906,12 @@ impl Repository {
                 snapshot_authority_changed("scheduled snapshot metadata authority changed")
             })?;
         if actual.head.trim() != commit_hash
-            || actual.branch.trim() != commit_hash
             || actual.head_observation != published.head_observation
-            || actual.branch_observation != published.branch_observation
             || actual.tool_lock != expected.tool_lock
             || actual.tool_lock_observation != expected.tool_lock_observation
         {
             return Err(snapshot_authority_changed(
-                "scheduled snapshot refs or tool lock changed after publication",
+                "scheduled snapshot HEAD or tool lock changed after publication",
             ));
         }
         Ok(())
@@ -1698,20 +2048,6 @@ impl Repository {
         Ok(())
     }
 
-    #[cfg(unix)]
-    fn publish_scheduled_bound_refs(&self, commit_hash: &str) -> Result<()> {
-        let kio = self.bound_kio.as_deref().ok_or_else(|| {
-            KioError::invalid_usage("scheduled snapshot requires retained .kio capability")
-        })?;
-        replace_bound_regular_file_at(kio, "refs/heads/main", commit_hash.as_bytes())?;
-        replace_bound_regular_file_at(kio, "HEAD", commit_hash.as_bytes())
-    }
-
-    #[cfg(not(unix))]
-    fn publish_scheduled_bound_refs(&self, _: &str) -> Result<()> {
-        unreachable!("scheduled snapshots are unsupported without descriptor capabilities")
-    }
-
     #[cfg(not(unix))]
     fn bound_snapshot_auto_direct_entries(&self) -> Result<BTreeSet<String>> {
         Err(KioError::new(
@@ -1740,7 +2076,7 @@ impl Repository {
         // critical section as the eventual snapshot. Otherwise a concurrent
         // promotion on unchanged raw bytes could be replaced by the older
         // reference captured just before the nested snapshot lock.
-        let _lock = StoreLock::acquire(&self.kio_dir)?;
+        let _lock = self.lock_store()?;
         // This entrypoint is only valid for the retained-descriptor repository
         // constructed by the scheduler handoff.  In particular, do not apply
         // the ordinary empty-HEAD recovery here: a scheduled writer must never
@@ -1845,7 +2181,7 @@ impl Repository {
         staged_tool_lock_hash: Option<&str>,
     ) -> Result<SnapshotOutcome> {
         self.validate()?;
-        let _lock = StoreLock::acquire(&self.kio_dir)?;
+        let _lock = self.lock_store()?;
         let head_hash = self
             .head_commit_hash()?
             .ok_or_else(|| KioError::invalid_usage("cannot promote in an unborn scope"))?;
@@ -1876,7 +2212,7 @@ impl Repository {
         };
         let current = self.build_working_tree(false)?.tree;
         let current_raw = tree_map(&current);
-        let purge = PurgeState::new(&self.kio_dir);
+        let purge = self.purge_state()?;
         let mut promoted_tree = prior_tree.clone();
         let mut changed = false;
         for entry in &mut promoted_tree.entries {
@@ -1914,7 +2250,7 @@ impl Repository {
         let created_at = fixed_now_override().unwrap_or_else(now_utc_seconds);
         let commit = CommitObject::new(
             tree_hash.clone(),
-            vec![head_hash],
+            Some(head_hash.clone()),
             created_at.clone(),
             message
                 .map(str::to_owned)
@@ -1929,12 +2265,8 @@ impl Repository {
         let commit_value =
             serde_json::to_value(&commit).map_err(|error| KioError::schema(error.to_string()))?;
         let (commit_hash, _) = self.store.write_json(ObjectKind::Commit, &commit_value)?;
-        atomic_overwrite(
-            &self.kio_dir.join("refs/heads/main"),
-            commit_hash.as_bytes(),
-        )?;
-        atomic_overwrite(&self.kio_dir.join("HEAD"), commit_hash.as_bytes())?;
-        self.write_manifest(&promoted_tree, Some(&prior_tree))?;
+        let manifest = self.manifest_value(&promoted_tree, Some(&prior_tree))?;
+        self.publish_with_journal(Some(&head_hash), &commit_hash, &commit, manifest)?;
         Ok(SnapshotOutcome {
             noop: false,
             message: "online Markdownize promotion created".to_owned(),
@@ -1952,7 +2284,7 @@ impl Repository {
     ///
     /// `publish_ref=false` (05-runtime.md §3.5's `prepared` phase, LC48)
     /// computes and durably CAS-writes the commit object — fixing its hash as
-    /// `planned_commit` — without publishing `refs/heads/main`/`HEAD` or
+    /// `planned_commit` — without publishing `HEAD` or
     /// running the resurrection-retire scan; the purge orchestration (this
     /// journal's `prepared` step) uses this to fix `planned_commit` before any
     /// tombstone/erase-receipt is durable. `publish_ref=true` (the journal's
@@ -1968,7 +2300,7 @@ impl Repository {
         publish_ref: bool,
     ) -> Result<SnapshotOutcome> {
         self.validate()?;
-        let _lock = StoreLock::acquire(&self.kio_dir)?;
+        let _lock = self.lock_store()?;
         let head = self
             .head_commit_hash()?
             .ok_or_else(|| KioError::invalid_usage("cannot purge an unborn scope"))?;
@@ -2014,7 +2346,7 @@ impl Repository {
     /// commit object is durable.
     pub fn record_repaired_commit(&self, message: Option<&str>) -> Result<String> {
         self.validate()?;
-        let _lock = StoreLock::acquire(&self.kio_dir)?;
+        let _lock = self.lock_store()?;
         let head = self
             .head_commit_hash()?
             .ok_or_else(|| KioError::invalid_usage("cannot record repair in an unborn scope"))?;
@@ -2023,8 +2355,8 @@ impl Repository {
         self.read_tree(&head_commit.tree)?;
         let created_at = now_utc_seconds();
         let commit = CommitObject::new(
-            head_commit.tree,
-            vec![head],
+            head_commit.tree.clone(),
+            Some(head.clone()),
             created_at.clone(),
             message
                 .map(str::to_owned)
@@ -2040,11 +2372,9 @@ impl Repository {
         let commit_value =
             serde_json::to_value(&commit).map_err(|error| KioError::schema(error.to_string()))?;
         let (commit_hash, _) = self.store.write_json(ObjectKind::Commit, &commit_value)?;
-        atomic_overwrite(
-            &self.kio_dir.join("refs/heads/main"),
-            commit_hash.as_bytes(),
-        )?;
-        atomic_overwrite(&self.kio_dir.join("HEAD"), commit_hash.as_bytes())?;
+        let tree = self.read_tree(&head_commit.tree)?;
+        let manifest = self.manifest_value(&tree, Some(&tree))?;
+        self.publish_with_journal(Some(&head), &commit_hash, &commit, manifest)?;
         Ok(commit_hash)
     }
 
@@ -2081,7 +2411,7 @@ impl Repository {
         // is the only caller that supplies its validated authority binding.
         let scheduled_bound = expected_scheduled_authority.is_some();
         self.validate()?;
-        let _lock = StoreLock::acquire(&self.kio_dir)?;
+        let _lock = self.lock_store()?;
         maybe_hold_lock_for_tests(test_control.hold_lock_ready());
         let chunking_config_hash = self.effective_chunking_config_hash()?;
 
@@ -2164,7 +2494,7 @@ impl Repository {
             ArchiveLimits::default(),
         )?;
         let working = {
-            let _archive_lock = StoreLock::acquire(&self.kio_dir)?;
+            let _archive_lock = self.lock_store()?;
             self.archive_staged_working_tree(
                 working_candidates,
                 normalize_by_path,
@@ -2196,7 +2526,7 @@ impl Repository {
         let resurrection_candidates = if scheduled_bound || commit_type == CommitType::Purged {
             BTreeSet::new()
         } else {
-            let purge = PurgeState::new(&self.kio_dir);
+            let purge = self.purge_state()?;
             let mut candidates = BTreeSet::new();
             for entry in &working.entries {
                 let tombstoned = purge
@@ -2309,11 +2639,11 @@ impl Repository {
                 CommitType::Auto => format!("index auto snapshot at {created_at}"),
                 _ => format!("snapshot at {created_at}"),
             });
-        let parents = head_hash.into_iter().collect::<Vec<_>>();
+        let parent = head_hash.clone();
         let commit = if commit_type == CommitType::Purged {
             CommitObject::new_purged(
                 tree_hash.clone(),
-                parents,
+                parent.clone(),
                 created_at,
                 message,
                 current_tool_lock_hash,
@@ -2323,7 +2653,7 @@ impl Repository {
         } else {
             CommitObject::new(
                 tree_hash.clone(),
-                parents,
+                parent.clone(),
                 created_at,
                 message,
                 current_tool_lock_hash,
@@ -2377,14 +2707,7 @@ impl Repository {
             None => None,
         };
 
-        // Known durability limitation: refs/heads/main and HEAD are
-        // advanced by two separate atomic renames. Each rename is individually
-        // crash-safe (temp file + rename, never a torn value), but a power loss
-        // *between* them can leave refs/heads/main advanced while HEAD still
-        // points at the parent. The commit object is already durable in the CAS,
-        // so recovery is a matter of re-pointing HEAD; no data is lost. A single
-        // atomic multi-ref transaction is outside the current single-user
-        // publication model.
+        let manifest = self.manifest_value(&working, prior_tree.as_ref())?;
         let published_authority = if scheduled_bound {
             self.store.validate_bound_layout()?;
             if let Some(authority) = expected_scheduled_authority {
@@ -2417,17 +2740,12 @@ impl Repository {
             self.reject_scheduled_marker_targets(
                 working.entries.iter().map(|entry| &entry.raw_hash),
             )?;
-            self.publish_scheduled_bound_refs(&commit_hash)?;
+            self.publish_with_journal(parent.as_deref(), &commit_hash, &commit, manifest.clone())?;
             Some(self.capture_scheduled_snapshot_authority(test_control)?)
         } else {
-            atomic_overwrite(
-                &self.kio_dir.join("refs/heads/main"),
-                commit_hash.as_bytes(),
-            )?;
-            atomic_overwrite(&self.kio_dir.join("HEAD"), commit_hash.as_bytes())?;
+            self.publish_with_journal(parent.as_deref(), &commit_hash, &commit, manifest.clone())?;
             None
         };
-        self.write_manifest(&working, prior_tree.as_ref())?;
         if scheduled_bound {
             self.store.validate_bound_layout()?;
             if let Some(authority) = expected_scheduled_authority {
@@ -2459,7 +2777,7 @@ impl Repository {
         // raw_hash (this same code path, naturally re-run) or an explicit
         // `kio repair verify-objects` backfill (LC27) completes it later.
         if !resurrection_candidates.is_empty() {
-            let purge = PurgeState::new(&self.kio_dir);
+            let purge = self.purge_state()?;
             let actor = std::env::var("USER").unwrap_or_else(|_| "local-user".to_owned());
             purge.retire_resurrected(
                 &resurrection_candidates,
@@ -2547,7 +2865,7 @@ impl Repository {
                 }
                 Err(error) => return Err(error),
             };
-            next = commit.parents.first().cloned();
+            next = commit.parent.clone();
             entries.push(LogEntry {
                 commit_hash: hash,
                 commit,
@@ -2653,7 +2971,7 @@ impl Repository {
                 "tag name is not a portable filesystem leaf: {reason}"
             )));
         }
-        let _lock = StoreLock::acquire(&self.kio_dir)?;
+        let _lock = self.lock_store()?;
         let commit_hash = match commit {
             Some(value) => self.resolve_commit(value)?,
             None => self
@@ -2712,8 +3030,22 @@ impl Repository {
             Ok(_) => {}
             Err(error) => return Err(error),
         }
-        let canonical_tags_dir = ensure_portable_tags_directory(&self.kio_dir)?;
-        if matching_tag_ref_path(&canonical_tags_dir, name)?.is_some() {
+        if !self
+            .unpublished_history_roots(&BTreeSet::from([commit_hash.clone()]))?
+            .is_empty()
+        {
+            return Err(KioError::invalid_usage(
+                "a tag must name the current HEAD or one of its ancestors",
+            ));
+        }
+        let directory = self.store_directory()?;
+        let tags = Path::new("refs").join(PORTABLE_TAGS_DIRECTORY);
+        directory.create_directory_all(&tags)?;
+        let leaf = portable_tag_leaf(name);
+        if directory
+            .read_optional(&tags.join(&leaf), MAX_TAG_REF_BYTES)?
+            .is_some()
+        {
             return Err(KioError::new(
                 "KIO-E-COMMIT-TAG-001",
                 "tag already exists (tag names collide case-insensitively)",
@@ -2721,24 +3053,87 @@ impl Repository {
                 ExitCode::InvalidUsage,
             ));
         }
-        // §Z ruling 1 (step4b-contract-tests-p2b.md PB07, 03-data-model.md §2
-        // L140-152): names.jsonl is the truth for the digest -> logical_name
-        // mapping (the canonical ref's hashed leaf is one-way). Write order is
-        // fixed: names row append (fsync'd by `append_jsonl`'s single
-        // `write_all` on an O_APPEND handle) BEFORE the ref — the reverse
-        // order would let a crash publish a ref with no names row to explain
-        // it (fsck reports that as corruption, PB09).
-        append_jsonl(
-            &names_jsonl_path(&self.kio_dir),
-            &json!({
-                "digest64": portable_tag_digest64(name),
-                "logical_name": name.nfc().collect::<String>(),
-                "recorded_at": now_utc_seconds(),
-            }),
+        let row = canonical_json_bytes(&json!({
+            "digest64": portable_tag_digest64(name),
+            "logical_name": name.nfc().collect::<String>(),
+            "recorded_at": now_utc_seconds(),
+        }))?;
+        let mut row = row;
+        row.push(b'\n');
+        let names = tags.join("names.jsonl");
+        match directory.read_optional(&names, MAX_TAG_NAMES_BYTES)? {
+            None => {
+                directory.write_atomic(&names, &row, crate::store_dir::Publication::CreateOnly)?
+            }
+            Some(existing) => {
+                if (existing.len() as u64).saturating_add(row.len() as u64) > MAX_TAG_NAMES_BYTES {
+                    return Err(KioError::invalid_usage(
+                        "tag name ledger exceeds its byte limit",
+                    ));
+                }
+                directory.append(&names, &row)?;
+            }
+        }
+        directory.write_atomic(
+            &tags.join(leaf),
+            commit_hash.as_bytes(),
+            crate::store_dir::Publication::CreateOnly,
         )?;
-        let path = canonical_tags_dir.join(portable_tag_leaf(name));
-        atomic_write(&path, commit_hash.as_bytes())?;
         Ok(commit_hash)
+    }
+
+    /// Verify that retained refs and publication records cannot expand the
+    /// single HEAD ancestry. This is also used before rebuilding projections.
+    pub fn validate_published_history_roots(&self, roots: &BTreeSet<String>) -> Result<()> {
+        let unpublished = self.unpublished_history_roots(roots)?;
+        if !unpublished.is_empty() {
+            return Err(KioError::schema(
+                "history roots are outside the current HEAD linear ancestry chain",
+            ));
+        }
+        Ok(())
+    }
+
+    /// A detached CAS object is not a published history root. Retired ancestor
+    /// trees are irrelevant: only verified commit predecessor edges are read.
+    fn unpublished_history_roots(&self, roots: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+        let mut pending = roots.clone();
+        let mut current = self.head_commit_hash()?;
+        let mut visited = BTreeSet::new();
+        let mut verified_bytes = 0_u64;
+        while !pending.is_empty() {
+            let Some(hash) = current else { break };
+            if visited.len() as u64 >= crate::history::DEFAULT_MAX_HISTORY_COMMITS {
+                return Err(KioError::new(
+                    "KIO-E-HISTORY-LIMIT-001",
+                    "published ancestry proof exceeds the commit limit",
+                    json!({ "limit": crate::history::DEFAULT_MAX_HISTORY_COMMITS }),
+                    ExitCode::PermanentFailure,
+                ));
+            }
+            if !visited.insert(hash.clone()) {
+                return Err(KioError::schema("commit history contains a parent cycle"));
+            }
+            let (object, bytes) = self
+                .store
+                .read_object_accounted(ObjectKind::Commit, &hash)
+                .map_err(|error| error.error)?;
+            verified_bytes = verified_bytes.saturating_add(bytes);
+            if verified_bytes > crate::history::DEFAULT_MAX_HISTORY_VERIFIED_BYTES {
+                return Err(KioError::new(
+                    "KIO-E-HISTORY-LIMIT-001",
+                    "published ancestry proof exceeds the byte limit",
+                    json!({ "limit": crate::history::DEFAULT_MAX_HISTORY_VERIFIED_BYTES }),
+                    ExitCode::PermanentFailure,
+                ));
+            }
+            let commit: CommitObject = serde_json::from_slice(&object.bytes)
+                .map_err(|error| KioError::schema(error.to_string()))?;
+            commit.validate()?;
+            pending.remove(&hash);
+            current = commit.parent;
+        }
+        Ok(pending)
     }
 
     pub fn resolve_commit(&self, value: &str) -> Result<String> {
@@ -2777,9 +3172,22 @@ impl Repository {
                 "commit reference collides with a reserved operand",
             ));
         }
-        let canonical_tags_dir = self.kio_dir.join("refs").join(PORTABLE_TAGS_DIRECTORY);
-        if let Some(tag) = matching_tag_ref_path(&canonical_tags_dir, value)? {
-            let hash = read_tag_ref(&tag)?;
+        let tag = Path::new("refs")
+            .join(PORTABLE_TAGS_DIRECTORY)
+            .join(portable_tag_leaf(value));
+        if let Some(bytes) = self
+            .store_directory()?
+            .read_optional(&tag, MAX_TAG_REF_BYTES)?
+        {
+            let text = std::str::from_utf8(&bytes)
+                .map_err(|_| tag_ref_corrupt(&self.kio_dir.join(&tag), "tag ref is not UTF-8"))?;
+            let hash = text.trim().to_owned();
+            if !is_hash(&hash) {
+                return Err(tag_ref_corrupt(
+                    &self.kio_dir.join(&tag),
+                    "tag ref target is invalid",
+                ));
+            }
             // R17-5: a tag whose target commit object is shallow (discarded / corrupt)
             // folds into COMMIT-SHALLOW too, for the same reason as the hash-literal
             // branch above.
@@ -2802,11 +3210,6 @@ impl Repository {
         }
         let commit: CommitObject = serde_json::from_slice(&object.bytes)
             .map_err(|err| KioError::schema(err.to_string()))?;
-        if commit.parents.len() > MAX_COMMIT_PARENTS {
-            return Err(KioError::schema(format!(
-                "commit parents exceed the limit of {MAX_COMMIT_PARENTS}"
-            )));
-        }
         commit.validate()?;
         Ok(commit)
     }
@@ -2828,89 +3231,24 @@ impl Repository {
     }
 
     pub fn head_commit_hash(&self) -> Result<Option<String>> {
+        #[cfg(any(unix, windows))]
+        if let Some(kio) = self.bound_kio.as_deref() {
+            let directory = StoreDirectory::from_retained(
+                kio.try_clone()
+                    .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
+                self.kio_dir.clone(),
+            )?;
+            let bytes = directory
+                .read_optional(Path::new("HEAD"), MAX_TAG_REF_BYTES)?
+                .ok_or_else(|| KioError::schema("HEAD is missing"))?;
+            return parse_head_ref(
+                std::str::from_utf8(&bytes).map_err(|_| KioError::schema("HEAD must be UTF-8"))?,
+            );
+        }
         let path = self.kio_dir.join("HEAD");
-        let value = fs::read_to_string(&path).kio_io(&path)?;
-        let value = value.trim();
-        if value.is_empty() {
-            // R15-1 / R15-1b: an empty HEAD is EITHER a corrupt HEAD (a crash
-            // truncated it while `refs/heads/main` still names a real commit) OR a
-            // genuinely unborn branch (both HEAD and refs empty). Recover the commit
-            // from refs in the corrupt case so a `snapshot` extends the real history
-            // instead of orphaning it under a fresh `parents=[]` root (R15-1), and so
-            // a pure read (`log`/`status`/`search`) does not misreport an indexed
-            // scope as unindexed (R15-1b). `empty_head_recovery_hash` is side-effect-
-            // free — it only reads and validates the ref against the store — so it is
-            // safe to call while holding the store lock (e.g. inside `snapshot`) and
-            // on a read-only `.kio`. A genuinely unborn branch still returns `None`
-            // (refs empty too), preserving the first-`snapshot`-creates-root path.
-            empty_head_recovery_hash(&self.kio_dir)
-        } else if is_hash(value) {
-            Ok(Some(value.to_owned()))
-        } else {
-            Err(KioError::schema("HEAD must contain a commit_hash"))
-        }
-    }
-
-    /// R13-4 / R13-5: restore an empty or missing `HEAD` from a healthy
-    /// `refs/heads/main`, recording the repair to `events.jsonl` (never silent).
-    /// HEAD is the durable truth and refs is derived, so the *only* time this
-    /// fires is the corruption asymmetry Opus found: `head_commit_hash` returns
-    /// `None` for an empty HEAD, which `snapshot` reads as "unborn" and then
-    /// orphans all history under a fresh `parents=[]` root commit. When refs still
-    /// names a real commit, HEAD is corrupt (not unborn) and is repaired from it.
-    /// Idempotent no-op when HEAD is populated or the branch is genuinely unborn
-    /// (HEAD and refs both empty). Returns the restored commit hash on a repair.
-    pub fn self_heal_head(&self) -> Result<Option<String>> {
-        // Fast path (no lock, no side effect): nothing to repair. Reads succeed on a
-        // read-only `.kio`, so a healthy scope is completely unaffected below.
-        if empty_head_recovery_hash(&self.kio_dir)?.is_none() {
-            return Ok(None);
-        }
-        // R14-3: the repair below is a best-effort *write* on the common `open()`
-        // entrypoint. A read-only `.kio` (archive / forensic mount) cannot take the
-        // store lock or overwrite HEAD; before R14-3 those permission errors propagated
-        // out of `open()` (the `?`) and bricked even pure-read commands
-        // (status/log/search/inspect) on a scope with a corrupt (empty) HEAD — an R13-4
-        // regression. Follow the R12-5/R13-3 rule that observation/repair writes are
-        // non-fatal: if we cannot take the lock (read-only permission, or a live
-        // concurrent holder), defer the heal (warn + `Ok(None)`) so reads still run; a
-        // later *writable* open completes it. R13-4's guarantee is preserved because a
-        // writable scope still heals here — before any `snapshot` advances HEAD — so no
-        // snapshot can orphan history under a fresh `parents=[]` root.
-        let Ok(_lock) = StoreLock::acquire(&self.kio_dir) else {
-            let _ = append_warn_log(
-                "KIO-W-STORE-HEAD-HEAL-DEFERRED-001",
-                "corrupt HEAD detected but the store lock is unavailable (read-only scope or a \
-                 concurrent holder); deferring self-heal so read-only commands still run",
-                json!({ "kio_dir": self.kio_dir.display().to_string() }),
-            );
-            return Ok(None);
-        };
-        // Re-check under the lock in case another process healed it first.
-        let Some(hash) = empty_head_recovery_hash(&self.kio_dir)? else {
-            return Ok(None);
-        };
-        // R14-3: a read-only scope can hold the lock (it existed before the mount went
-        // read-only, or the `.lock` create raced) yet still reject the HEAD overwrite.
-        // Treat a write failure the same way — defer, do not brick reads.
-        if atomic_overwrite(&self.kio_dir.join("HEAD"), hash.as_bytes()).is_err() {
-            let _ = append_warn_log(
-                "KIO-W-STORE-HEAD-HEAL-DEFERRED-001",
-                "corrupt HEAD detected but HEAD is not writable (read-only scope); deferring \
-                 self-heal so read-only commands still run",
-                json!({ "kio_dir": self.kio_dir.display().to_string() }),
-            );
-            return Ok(None);
-        }
-        // A successful repair is never silent (R13-4): record it to events.jsonl. The
-        // record is itself best-effort — a logging failure must not undo a completed
-        // HEAD repair.
-        let _ = append_event_log(
-            "KIO-I-STORE-HEAD-REPAIRED-001",
-            "restored empty/missing HEAD from refs/heads/main (corrupt HEAD, not unborn)",
-            json!({ "commit_hash": hash }),
-        );
-        Ok(Some(hash))
+        let value = String::from_utf8(read_bounded_regular_file(&path, MAX_TAG_REF_BYTES)?)
+            .map_err(|_| KioError::schema("HEAD must be UTF-8"))?;
+        parse_head_ref(&value)
     }
 
     /// R15-4: read the HEAD commit's tree object, distinguishing an unborn branch
@@ -2948,18 +3286,7 @@ impl Repository {
     }
 
     fn validated_config_value(&self) -> Result<Value> {
-        #[cfg(unix)]
-        let text = if let Some(kio) = self.bound_kio.as_deref() {
-            read_bound_regular_text_at(kio, "config.toml", MAX_BOUND_CONFIG_BYTES)?
-        } else {
-            let path = self.kio_dir.join("config.toml");
-            fs::read_to_string(&path).kio_io(&path)?
-        };
-        #[cfg(not(unix))]
-        let text = {
-            let path = self.kio_dir.join("config.toml");
-            fs::read_to_string(&path).kio_io(&path)?
-        };
+        let text = self.metadata_text("config.toml", MAX_BOUND_CONFIG_BYTES)?;
         let toml: toml::Value =
             toml::from_str(&text).map_err(|error| KioError::schema(error.to_string()))?;
         let value =
@@ -2968,7 +3295,7 @@ impl Repository {
         // R12-2 / R12-1: reject documented-but-unwired values the schema can only
         // type-check (e.g. `allowed_scope != "."`) LOUDLY, so a scope config never
         // silently ignores a policy the user set.
-        enforce_config_semantics(&value)?;
+        enforce_scope_config_semantics(&value)?;
         Ok(value)
     }
 
@@ -3007,18 +3334,7 @@ impl Repository {
     /// `KIO-E-STORE-VERSION-001` / exit 8; this ordering supplies a stable
     /// rejection code and does not permit read-only degradation.
     fn validated_scope_id(&self) -> Result<String> {
-        #[cfg(unix)]
-        let text = if let Some(kio) = self.bound_kio.as_deref() {
-            read_bound_regular_text_at(kio, "scope.json", MAX_BOUND_CONFIG_BYTES)?
-        } else {
-            let path = self.kio_dir.join("scope.json");
-            fs::read_to_string(&path).kio_io(&path)?
-        };
-        #[cfg(not(unix))]
-        let text = {
-            let path = self.kio_dir.join("scope.json");
-            fs::read_to_string(&path).kio_io(&path)?
-        };
+        let text = self.metadata_text("scope.json", MAX_BOUND_CONFIG_BYTES)?;
         let value: Value =
             serde_json::from_str(&text).map_err(|err| KioError::schema(err.to_string()))?;
         validate_scope_json_value(&value)?;
@@ -3035,18 +3351,7 @@ impl Repository {
     }
 
     fn validate_manifest(&self) -> Result<()> {
-        #[cfg(unix)]
-        let text = if let Some(kio) = self.bound_kio.as_deref() {
-            read_bound_regular_text_at(kio, "manifest.json", MAX_BOUND_CONFIG_BYTES)?
-        } else {
-            let path = self.kio_dir.join("manifest.json");
-            fs::read_to_string(&path).kio_io(&path)?
-        };
-        #[cfg(not(unix))]
-        let text = {
-            let path = self.kio_dir.join("manifest.json");
-            fs::read_to_string(&path).kio_io(&path)?
-        };
+        let text = self.metadata_text("manifest.json", MAX_BOUND_CONFIG_BYTES)?;
         let value: Value =
             serde_json::from_str(&text).map_err(|err| KioError::schema(err.to_string()))?;
         validate_json_schema(SchemaKind::Manifest, &value)?;
@@ -3101,7 +3406,7 @@ impl Repository {
     /// truth, `03 §2`) merged with the prior manifest's `deleted` rows (older
     /// deletions that no tree carries). The manifest's live rows are never
     /// trusted: a stale or hand-edited manifest cannot lose a deletion this way.
-    fn write_manifest(&self, tree: &TreeObject, prior_tree: Option<&TreeObject>) -> Result<()> {
+    fn manifest_value(&self, tree: &TreeObject, prior_tree: Option<&TreeObject>) -> Result<Value> {
         let mut previous: BTreeMap<String, String> = prior_tree
             .map(|prior| {
                 prior
@@ -3146,18 +3451,23 @@ impl Repository {
         }
 
         let files = rows.into_values().collect::<Vec<_>>();
-        let value = json!({
+        Ok(json!({
             "schema_version": 1,
             "files": files,
             "updated_at": now_utc_seconds(),
-        });
+        }))
+    }
+
+    fn write_manifest_value(&self, value: &Value) -> Result<()> {
+        validate_json_schema(SchemaKind::Manifest, value)?;
         let bytes =
-            serde_json::to_vec_pretty(&value).map_err(|err| KioError::schema(err.to_string()))?;
-        #[cfg(unix)]
-        if let Some(kio) = self.bound_kio.as_deref() {
-            return replace_bound_regular_file_at(kio, "manifest.json", &bytes);
+            serde_json::to_vec_pretty(value).map_err(|err| KioError::schema(err.to_string()))?;
+        if bytes.len() as u64 > MAX_PUBLICATION_JOURNAL_BYTES {
+            return Err(KioError::schema(
+                "manifest exceeds the publication size limit",
+            ));
         }
-        atomic_overwrite(&self.kio_dir.join("manifest.json"), &bytes)
+        self.replace_metadata("manifest.json", &bytes)
     }
 
     /// Read the current `manifest.json` `deleted` rows as a
@@ -3168,24 +3478,14 @@ impl Repository {
     /// validated before `snapshot` runs, so entries are well formed here.
     fn read_manifest_deleted_hashes(&self) -> Result<BTreeMap<String, String>> {
         let mut map = BTreeMap::new();
-        #[cfg(unix)]
-        let text = if let Some(kio) = self.bound_kio.as_deref() {
-            read_bound_regular_text_at(kio, "manifest.json", MAX_BOUND_CONFIG_BYTES)?
-        } else {
-            let path = self.kio_dir.join("manifest.json");
-            if !path.is_file() {
-                return Ok(map);
-            }
-            fs::read_to_string(&path).kio_io(&path)?
+        let Some(bytes) = self
+            .store_directory()?
+            .read_optional(Path::new("manifest.json"), MAX_BOUND_CONFIG_BYTES)?
+        else {
+            return Ok(map);
         };
-        #[cfg(not(unix))]
-        let text = {
-            let path = self.kio_dir.join("manifest.json");
-            if !path.is_file() {
-                return Ok(map);
-            }
-            fs::read_to_string(&path).kio_io(&path)?
-        };
+        let text = String::from_utf8(bytes)
+            .map_err(|_| KioError::schema("manifest.json must be UTF-8"))?;
         let value: Value =
             serde_json::from_str(&text).map_err(|err| KioError::schema(err.to_string()))?;
         if let Some(files) = value.get("files").and_then(Value::as_array) {
@@ -3218,18 +3518,9 @@ impl Repository {
     }
 
     fn tool_lock_identity(&self) -> Result<(String, Vec<u8>)> {
-        #[cfg(unix)]
-        if let Some(kio) = self.bound_kio.as_deref() {
-            let text = read_bound_regular_text_at(kio, "tool-lock.json", MAX_BOUND_CONFIG_BYTES)?;
-            let value: Value =
-                serde_json::from_str(&text).map_err(|err| KioError::schema(err.to_string()))?;
-            let canonical = canonical_tool_lock_value(&value)?;
-            let bytes = canonical_json_bytes(&canonical)?;
-            return Ok((crate::cas::hash_bytes(&bytes), bytes));
-        }
-        let path = self.kio_dir.join("tool-lock.json");
-        let value: Value = serde_json::from_str(&fs::read_to_string(&path).kio_io(&path)?)
-            .map_err(|err| KioError::schema(err.to_string()))?;
+        let text = self.metadata_text("tool-lock.json", MAX_BOUND_CONFIG_BYTES)?;
+        let value: Value =
+            serde_json::from_str(&text).map_err(|err| KioError::schema(err.to_string()))?;
         let canonical = canonical_tool_lock_value(&value)?;
         let bytes = canonical_json_bytes(&canonical)?;
         Ok((crate::cas::hash_bytes(&bytes), bytes))
@@ -3240,186 +3531,263 @@ impl Repository {
 /// handle. This is intentionally separate from [`Repository::init`]: a bound
 /// child must not use `create_dir_all` or any public child path while its name
 /// can be replaced by another same-UID process.
-#[cfg(unix)]
-fn initialize_bound_kio_layout(kio: &File, canonical_root: &Path) -> Result<()> {
-    for relative in [
-        "objects/raw",
-        "objects/trees",
-        "objects/commits",
-        "refs/heads",
-        "logs",
-    ] {
-        create_bound_dir_all(kio, relative)?;
+fn initialize_bound_kio_layout_directory(
+    directory: &StoreDirectory,
+    canonical_root: &Path,
+) -> Result<()> {
+    initialize_planned_kio_layout(directory, canonical_root, &new_ulid(canonical_root))
+}
+
+const PLANNED_KIO_DIRECTORIES: &[&str] = &[
+    "objects/raw",
+    "objects/trees",
+    "objects/commits",
+    "logs",
+    "refs/tags-v1",
+];
+const PLANNED_KIO_ROOT_DIRECTORIES: &[&str] = &["objects", "logs", "refs"];
+
+/// Populate a private, caller-owned staging directory with a complete unborn
+/// store whose identity was durably planned before allocation. This does not
+/// activate management authority or publish the stage at the scope root.
+/// Every initial leaf is create-only; an interrupted stage must be handled by
+/// its owning journal rather than adopted as an existing live repository.
+pub fn initialize_planned_kio_layout(
+    directory: &StoreDirectory,
+    canonical_root: &Path,
+    scope_id: &str,
+) -> Result<()> {
+    let files = planned_kio_files(canonical_root, scope_id)?;
+    for name in files.keys() {
+        if directory
+            .read_optional(Path::new(name), MAX_BOUND_CONFIG_BYTES)?
+            .is_some()
+        {
+            return Err(KioError::schema("planned initial leaf already exists"));
+        }
     }
-    create_bound_dir_all(kio, &format!("refs/{PORTABLE_TAGS_DIRECTORY}"))?;
-    write_bound_new(kio, "HEAD", b"")?;
-    write_bound_new(kio, "refs/heads/main", b"")?;
-    write_bound_new(kio, "config.toml", b"")?;
-    write_bound_new(
-        kio,
-        "scope.json",
-        serde_json::to_string_pretty(&json!({
-            "kio_format_version": KIO_FORMAT_VERSION,
-            "scope_id": new_ulid(canonical_root),
-            "scope_path": canonical_root,
-        }))
-        .map_err(|err| KioError::schema(err.to_string()))?
-        .as_bytes(),
-    )?;
-    write_bound_new(
-        kio,
-        "manifest.json",
-        b"{\n  \"schema_version\": 1,\n  \"files\": []\n}\n",
-    )?;
-    write_bound_new(kio, "tool-lock.json", b"{\n  \"spec_version\": 1\n}\n")?;
+    for relative in PLANNED_KIO_DIRECTORIES {
+        directory.create_directory_all(Path::new(relative))?;
+    }
+    for (name, bytes) in &files {
+        directory.write_atomic(
+            Path::new(name),
+            bytes,
+            crate::store_dir::Publication::CreateOnly,
+        )?;
+    }
     Ok(())
 }
 
-#[cfg(unix)]
-fn create_bound_dir_all(root: &File, relative: &str) -> Result<()> {
-    use cap_primitives::fs as cap_fs;
-    let mut current = root
-        .try_clone()
-        .map_err(|err| KioError::io(err.to_string(), relative))?;
-    for component in Path::new(relative).components() {
-        let Component::Normal(component) = component else {
-            continue;
-        };
-        current = match cap_fs::open_dir_nofollow(&current, Path::new(component)) {
-            Ok(handle) => handle,
-            Err(_) => {
-                match cap_fs::stat(&current, Path::new(component), cap_fs::FollowSymlinks::No) {
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                        let mut options = cap_fs::DirOptions::new();
-                        use cap_fs::DirBuilderExt;
-                        options.mode(0o700);
-                        match cap_fs::create_dir(&current, Path::new(component), &options) {
-                            Ok(()) => {}
-                            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
-                            Err(err) => return Err(KioError::io(err.to_string(), relative)),
-                        }
-                        cap_fs::open_dir_nofollow(&current, Path::new(component))
-                            .map_err(|err| KioError::io(err.to_string(), relative))?
-                    }
-                    Ok(_) => {
-                        return Err(KioError::invalid_usage(
-                            ".kio layout component must be a directory",
-                        ));
-                    }
-                    Err(err) => return Err(KioError::io(err.to_string(), relative)),
-                }
+/// Resume a private planned `.kio` stage only when every extant entry belongs
+/// to the unborn-store inventory and every extant leaf has its exact planned
+/// bytes. Missing entries are then filled through retained create-only writes.
+pub fn complete_planned_kio_layout(
+    directory: &StoreDirectory,
+    canonical_root: &Path,
+    scope_id: &str,
+    expected_aux: &[(&str, &[u8])],
+) -> Result<()> {
+    use crate::store_dir::Publication;
+    let files = planned_kio_layout_files(canonical_root, scope_id, expected_aux)?;
+    validate_planned_stage(directory, &files)?;
+    directory.recover_atomic(&[directory])?;
+    validate_planned_stage(directory, &files)?;
+    for relative in PLANNED_KIO_DIRECTORIES {
+        directory.create_directory_all(Path::new(relative))?;
+    }
+    for (name, bytes) in &files {
+        match directory.read_optional(Path::new(name), bytes.len() as u64)? {
+            Some(actual) if actual == *bytes => {}
+            Some(_) => {
+                return Err(KioError::schema(
+                    "planned stage leaf differs from expected bytes",
+                ));
             }
-        };
+            None => directory.write_atomic(Path::new(name), bytes, Publication::CreateOnly)?,
+        }
     }
-    Ok(())
+    validate_planned_stage(directory, &files)
 }
 
-#[cfg(unix)]
-fn write_bound_new(root: &File, relative: &str, contents: &[u8]) -> Result<()> {
-    use cap_primitives::fs as cap_fs;
-    let path = Path::new(relative);
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let leaf = path
-        .file_name()
-        .ok_or_else(|| KioError::invalid_usage("bound layout file must have a name"))?;
-    let mut directory = root
-        .try_clone()
-        .map_err(|err| KioError::io(err.to_string(), relative))?;
-    for component in parent.components() {
-        let Component::Normal(component) = component else {
-            continue;
-        };
-        directory = cap_fs::open_dir_nofollow(&directory, Path::new(component))
-            .map_err(|err| KioError::io(err.to_string(), relative))?;
+/// Validate a private planned `.kio` stage without creating or changing any
+/// entry. The stage may be empty or partial, but every existing entry must be
+/// part of the unborn-store inventory and have its exact planned bytes.
+pub fn validate_planned_kio_layout(
+    directory: &StoreDirectory,
+    canonical_root: &Path,
+    scope_id: &str,
+    expected_aux: &[(&str, &[u8])],
+) -> Result<()> {
+    let files = planned_kio_layout_files(canonical_root, scope_id, expected_aux)?;
+    validate_planned_stage(directory, &files)
+}
+
+fn planned_kio_layout_files(
+    canonical_root: &Path,
+    scope_id: &str,
+    expected_aux: &[(&str, &[u8])],
+) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    let mut files = planned_kio_files(canonical_root, scope_id)?;
+    for (name, bytes) in expected_aux {
+        validate_planned_aux_name(name)?;
+        if PLANNED_KIO_ROOT_DIRECTORIES.contains(name)
+            || files.insert((*name).to_owned(), bytes.to_vec()).is_some()
+        {
+            return Err(KioError::schema(
+                "planned auxiliary leaf conflicts with built-in layout",
+            ));
+        }
     }
-    let mut options = cap_fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    let mut file = cap_fs::open(&directory, Path::new(leaf), &options)
-        .map_err(|err| KioError::io(err.to_string(), relative))?;
-    file.write_all(contents)
-        .map_err(|err| KioError::io(err.to_string(), relative))?;
-    file.sync_all()
-        .map_err(|err| KioError::io(err.to_string(), relative))?;
-    Ok(())
+    Ok(files)
 }
 
-/// Merge a generated parent policy into `config.toml` through the retained
-/// no-follow `.kio` descriptor.  This is intentionally done before a bound
-/// child returns a path-backed [`Repository`]: a same-UID rename of the public
-/// `.kio` entry therefore cannot redirect the inherited-policy read or write.
-#[cfg(unix)]
-fn persist_bound_generated_parent_policy(kio: &File, policy: toml::Value) -> Result<()> {
-    let text = read_bound_regular_text_at(kio, "config.toml", MAX_BOUND_CONFIG_BYTES)?;
-    let mut config: toml::Value =
-        toml::from_str(&text).map_err(|error| KioError::schema(error.to_string()))?;
-    let table = config
-        .as_table_mut()
-        .ok_or_else(|| KioError::schema("config.toml must be a table"))?;
-    table.insert("generated_parent_policy".to_owned(), policy);
-
-    let json_value =
-        serde_json::to_value(&config).map_err(|error| KioError::schema(error.to_string()))?;
-    validate_json_schema(SchemaKind::Config, &json_value)?;
-    enforce_config_semantics(&json_value)?;
-    let text = toml::to_string(&config).map_err(|error| KioError::schema(error.to_string()))?;
-    replace_bound_regular_file(kio, "config.toml", text.as_bytes())
+fn planned_kio_files(
+    canonical_root: &Path,
+    scope_id: &str,
+) -> Result<std::collections::BTreeMap<String, Vec<u8>>> {
+    validate_planned_layout_inputs(canonical_root, scope_id)?;
+    let mut files = std::collections::BTreeMap::new();
+    files.insert("HEAD".into(), b"unborn\n".to_vec());
+    files.insert("config.toml".into(), Vec::new());
+    files.insert("scope.json".into(), serde_json::to_string_pretty(&json!({"kio_format_version": KIO_FORMAT_VERSION,"scope_id": scope_id,"scope_path": canonical_root})).map_err(|e| KioError::schema(e.to_string()))?.into_bytes());
+    files.insert(
+        "manifest.json".into(),
+        b"{\n  \"schema_version\": 1,\n  \"files\": []\n}\n".to_vec(),
+    );
+    files.insert(
+        "tool-lock.json".into(),
+        b"{\n  \"spec_version\": 1\n}\n".to_vec(),
+    );
+    Ok(files)
 }
 
-/// Read a regular `.kio` metadata leaf through a retained directory
-/// descriptor.  Every component is opened no-follow, so replacing a
-/// descendant directory after the scheduler has acquired its capability
-/// cannot redirect the read.
-#[cfg(unix)]
-fn read_bound_regular_text_at(kio: &File, relative: &str, max_bytes: u64) -> Result<String> {
-    use cap_primitives::fs as cap_fs;
-
-    let path = Path::new(relative);
-    if path
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
+fn validate_planned_layout_inputs(canonical_root: &Path, scope_id: &str) -> Result<()> {
+    if !is_ulid(scope_id) {
+        return Err(KioError::schema("planned scope_id must be a ULID"));
+    }
+    if !canonical_root.is_absolute()
+        || canonical_root
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
     {
         return Err(KioError::invalid_usage(
-            "bound metadata path must contain only normal components",
+            "planned scope root must be absolute and canonical",
         ));
     }
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let leaf = path
-        .file_name()
-        .ok_or_else(|| KioError::invalid_usage("bound metadata path must name a regular file"))?;
-    let mut directory = kio
-        .try_clone()
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    for component in parent.components() {
-        let Component::Normal(component) = component else {
-            continue;
-        };
-        directory = cap_fs::open_dir_nofollow(&directory, Path::new(component))
-            .map_err(|error| KioError::io(error.to_string(), relative))?;
-    }
-    let listed = cap_fs::stat(&directory, Path::new(leaf), cap_fs::FollowSymlinks::No)
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    if !listed.is_file() || listed.len() > max_bytes {
+    Ok(())
+}
+
+fn validate_planned_aux_name(name: &str) -> Result<()> {
+    if name == crate::store_dir::ATOMIC_WORKSPACE_DIR || name == crate::management::CASE_PROBE_LEAF
+    {
         return Err(KioError::schema(
-            "bound metadata must be a bounded regular file",
+            "planned auxiliary leaf conflicts with reserved recovery state",
         ));
     }
-    let mut options = cap_fs::OpenOptions::new();
-    options.read(true);
-    options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut file = cap_fs::open(&directory, Path::new(leaf), &options)
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    let opened = cap_fs::Metadata::from_file(&file)
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    if !opened.is_file() || opened.len() != listed.len() || opened.len() > max_bytes {
-        return Err(KioError::schema("bound metadata changed while opening"));
+    if name.as_bytes().contains(&0) {
+        return Err(KioError::schema(
+            "planned auxiliary leaf must be one normal filename",
+        ));
     }
-    let mut text = String::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
-    file.read_to_string(&mut text)
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    if text.len() as u64 != opened.len() {
-        return Err(KioError::schema("bound metadata changed while reading"));
+    let mut components = Path::new(name).components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
+        return Err(KioError::schema(
+            "planned auxiliary leaf must be one normal filename",
+        ));
     }
-    Ok(text)
+    Ok(())
+}
+fn validate_planned_stage(
+    directory: &StoreDirectory,
+    files: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    // Only the exact, bounded private workspace and reserved case probe may
+    // accompany a partial layout. Read-only validation never clears either.
+    directory.inspect_atomic()?;
+    crate::management::validate_case_probe(directory)?;
+    let allowed_root: std::collections::BTreeSet<String> = files
+        .keys()
+        .cloned()
+        .chain([
+            "objects".into(),
+            "logs".into(),
+            "refs".into(),
+            crate::store_dir::ATOMIC_WORKSPACE_DIR.into(),
+            crate::management::CASE_PROBE_LEAF.into(),
+        ])
+        .collect();
+    validate_planned_root_entries(directory, &allowed_root, files)?;
+    for (path, allowed) in [
+        ("objects", &["raw", "trees", "commits"][..]),
+        ("refs", &["tags-v1"][..]),
+    ] {
+        let allowed = allowed.iter().map(|name| (*name).to_owned()).collect();
+        validate_planned_entries(directory, Path::new(path), &allowed, files)?;
+    }
+    for path in PLANNED_KIO_DIRECTORIES {
+        validate_planned_entries(
+            directory,
+            Path::new(path),
+            &std::collections::BTreeSet::new(),
+            files,
+        )?;
+    }
+    for (name, expected) in files {
+        if let Some(actual) = directory.read_optional(Path::new(name), expected.len() as u64)?
+            && actual != *expected
+        {
+            return Err(KioError::schema(
+                "planned stage leaf differs from expected bytes",
+            ));
+        }
+    }
+    Ok(())
+}
+fn validate_planned_entries(
+    directory: &StoreDirectory,
+    path: &Path,
+    allowed: &std::collections::BTreeSet<String>,
+    files: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    let Some(entries) = directory.entries_optional(path)? else {
+        return Ok(());
+    };
+    for entry in entries {
+        let name = entry.name.to_string_lossy().to_string();
+        if !allowed.contains(&name) {
+            return Err(KioError::schema("planned stage contains an unknown entry"));
+        }
+        if files.contains_key(&name) {
+            if !entry.is_regular_file {
+                return Err(KioError::schema("planned stage leaf is unsafe"));
+            }
+        } else if !entry.is_directory {
+            return Err(KioError::schema("planned stage directory is unsafe"));
+        }
+    }
+    Ok(())
+}
+fn validate_planned_root_entries(
+    directory: &StoreDirectory,
+    allowed: &std::collections::BTreeSet<String>,
+    files: &std::collections::BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    let entries = directory.entries(Path::new(""))?;
+    for entry in entries {
+        let name = entry.name.to_string_lossy().to_string();
+        if !allowed.contains(&name) {
+            return Err(KioError::schema("planned stage contains an unknown entry"));
+        }
+        if files.contains_key(&name) || name == crate::management::CASE_PROBE_LEAF {
+            if !entry.is_regular_file {
+                return Err(KioError::schema("planned stage leaf is unsafe"));
+            }
+        } else if !entry.is_directory {
+            return Err(KioError::schema("planned stage directory is unsafe"));
+        }
+    }
+    Ok(())
 }
 
 /// Exact identity and content observation for a descriptor-relative metadata
@@ -3437,10 +3805,8 @@ struct BoundMetadataObservation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScheduledSnapshotAuthority {
     head: String,
-    branch: String,
     tool_lock: String,
     head_observation: BoundMetadataObservation,
-    branch_observation: BoundMetadataObservation,
     tool_lock_observation: BoundMetadataObservation,
 }
 
@@ -3527,88 +3893,6 @@ fn read_bound_regular_text_observed_at(
             nlink: opened.nlink(),
             digest: lower_hex(&Sha256::digest(&bytes)),
         },
-    ))
-}
-
-#[cfg(unix)]
-fn replace_bound_regular_file(kio: &File, relative: &str, contents: &[u8]) -> Result<()> {
-    replace_bound_regular_file_at(kio, relative, contents)
-}
-
-#[cfg(unix)]
-fn replace_bound_regular_file_at(kio: &File, relative: &str, contents: &[u8]) -> Result<()> {
-    use cap_primitives::fs as cap_fs;
-
-    let path = Path::new(relative);
-    if path
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(KioError::invalid_usage(
-            "bound metadata path must contain only normal components",
-        ));
-    }
-    if contents.len() as u64 > MAX_BOUND_CONFIG_BYTES {
-        return Err(KioError::schema(
-            "bound config.toml exceeds the bootstrap byte limit",
-        ));
-    }
-
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let leaf = path
-        .file_name()
-        .ok_or_else(|| KioError::invalid_usage("bound metadata path must name a regular file"))?;
-    let mut directory = kio
-        .try_clone()
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    for component in parent.components() {
-        let Component::Normal(component) = component else {
-            continue;
-        };
-        directory = cap_fs::open_dir_nofollow(&directory, Path::new(component))
-            .map_err(|error| KioError::io(error.to_string(), relative))?;
-    }
-
-    for attempt in 0..8_u8 {
-        let temporary = format!(
-            ".kio-config-{}-{}-{attempt}",
-            std::process::id(),
-            unix_nanos()
-        );
-        let temporary_path = Path::new(&temporary);
-        let mut options = cap_fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        let mut file = match cap_fs::open(&directory, temporary_path, &options) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(KioError::io(error.to_string(), relative)),
-        };
-        let write_result = (|| -> Result<()> {
-            file.write_all(contents)
-                .map_err(|error| KioError::io(error.to_string(), relative))?;
-            file.sync_all()
-                .map_err(|error| KioError::io(error.to_string(), relative))?;
-            Ok(())
-        })();
-        drop(file);
-        if let Err(error) = write_result {
-            let _ = cap_fs::remove_file(&directory, temporary_path);
-            return Err(error);
-        }
-        if let Err(error) = cap_fs::rename(&directory, temporary_path, &directory, Path::new(leaf))
-        {
-            let _ = cap_fs::remove_file(&directory, temporary_path);
-            return Err(KioError::io(error.to_string(), relative));
-        }
-        // The directory that directly contains the renamed leaf is the
-        // durability boundary.  Syncing only the retained `.kio` ancestor is
-        // insufficient for nested metadata such as `refs/heads/main`.
-        sync_bound_directory(&directory, relative)?;
-        return Ok(());
-    }
-    Err(KioError::io(
-        "unable to allocate a unique bound config temporary file",
-        relative,
     ))
 }
 
@@ -3720,51 +4004,6 @@ fn required_lock_integer(object: &Map<String, Value>, key: &str, field: &str) ->
         .and_then(Value::as_u64)
         .map(Value::from)
         .ok_or_else(|| KioError::schema(format!("{key}.{field} must be an integer")))
-}
-
-/// R13-4: the commit hash an empty/missing `HEAD` should be restored to, or
-/// `None` when there is nothing to repair. Returns `Some(hash)` only when HEAD is
-/// empty/missing AND `refs/heads/main` names a commit object that actually exists
-/// in the store — never adopts a dangling ref (that would move corruption into
-/// HEAD instead of fixing it). Both HEAD and refs empty = a legitimately unborn
-/// branch (fresh `init`), which stays `None` so a first `snapshot` still creates
-/// the root commit. Shared by `Repository::self_heal_head` (the repair) and the
-/// CLI re-`init` path (R13-5 damage detection before the repair runs).
-pub fn empty_head_recovery_hash(kio_dir: &Path) -> Result<Option<String>> {
-    let head_path = kio_dir.join("HEAD");
-    let head_present_nonempty = match fs::read_to_string(&head_path) {
-        Ok(value) => !value.trim().is_empty(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => false,
-        Err(err) => {
-            return Err(KioError::io(
-                err.to_string(),
-                head_path.display().to_string(),
-            ));
-        }
-    };
-    if head_present_nonempty {
-        return Ok(None);
-    }
-    let refs_path = kio_dir.join("refs/heads/main");
-    let refs_value = match fs::read_to_string(&refs_path) {
-        Ok(value) => value.trim().to_owned(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(err) => {
-            return Err(KioError::io(
-                err.to_string(),
-                refs_path.display().to_string(),
-            ));
-        }
-    };
-    if refs_value.is_empty() || !is_hash(&refs_value) {
-        return Ok(None);
-    }
-    // Only restore from a ref that resolves to a real commit object.
-    let store = ObjectStore::new(kio_dir.to_path_buf());
-    match store.read_by_hash(&refs_value) {
-        Ok(object) if object.kind == ObjectKind::Commit => Ok(Some(refs_value)),
-        _ => Ok(None),
-    }
 }
 
 /// Default log retention when `[observability] retention_days` is unset
@@ -4170,6 +4409,22 @@ fn config_home() -> PathBuf {
 /// `markdownize.incremental` enabled/threshold/max_consecutive, and the whole
 /// `[search]` block) are NOT checked here — they change behavior, they are not
 /// rejected.
+pub(crate) fn enforce_scope_config_semantics(config: &Value) -> Result<()> {
+    enforce_config_semantics(config)?;
+    if config
+        .get("adapter")
+        .and_then(|adapter| adapter.get("policy"))
+        .and_then(|policy| policy.get("offline_api"))
+        .and_then(|offline| offline.get("ca_pem_path"))
+        .is_some()
+    {
+        return Err(KioError::not_implemented(
+            "adapter.policy.offline_api.ca_pem_path is device-local and cannot be stored in .kio/config.toml",
+        ));
+    }
+    Ok(())
+}
+
 pub fn enforce_config_semantics(config: &Value) -> Result<()> {
     // Child scopes persist the parent's rules through a bounded, strict
     // generated-policy envelope. Reject source config that cannot make that
@@ -4291,22 +4546,6 @@ fn validate_ref_operand(value: &str) -> Result<()> {
     Ok(())
 }
 
-/// The canonical hashed ref is the only physical representation of a tag. The
-/// leaf is `sha256` over the NFC + simple-case-folded logical name, so
-/// case-insensitive collision is decided by the leaf itself — there is nothing
-/// to enumerate and no second namespace that could alias it.
-fn matching_tag_ref_path(canonical_tags_dir: &Path, logical_name: &str) -> Result<Option<PathBuf>> {
-    if !validate_tag_refs_directory(canonical_tags_dir, true)? {
-        return Ok(None);
-    }
-    let path = canonical_tags_dir.join(portable_tag_leaf(logical_name));
-    match fs::symlink_metadata(&path) {
-        Ok(_) => Ok(Some(path)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(KioError::io(error.to_string(), path.display().to_string())),
-    }
-}
-
 /// `.kio/refs/tags-v1/names.jsonl` (03-data-model.md §2 L80/141): the
 /// append-only logical-tag-name ledger, co-located with the canonical
 /// `tags-v1/` ref directory it describes. Public so fsck (verify_objects.rs,
@@ -4317,26 +4556,6 @@ pub fn names_jsonl_path(kio_dir: &Path) -> PathBuf {
         .join("refs")
         .join(PORTABLE_TAGS_DIRECTORY)
         .join("names.jsonl")
-}
-
-fn ensure_portable_tags_directory(kio_dir: &Path) -> Result<PathBuf> {
-    let refs_dir = kio_dir.join("refs");
-    validate_tag_refs_directory(&refs_dir, false)?;
-    let canonical_tags_dir = refs_dir.join(PORTABLE_TAGS_DIRECTORY);
-    if !validate_tag_refs_directory(&canonical_tags_dir, true)? {
-        match fs::create_dir(&canonical_tags_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => {
-                return Err(KioError::io(
-                    error.to_string(),
-                    canonical_tags_dir.display().to_string(),
-                ));
-            }
-        }
-        validate_tag_refs_directory(&canonical_tags_dir, false)?;
-    }
-    Ok(canonical_tags_dir)
 }
 
 /// Validate a store-owned tag directory without following a symlink/junction.
@@ -4386,31 +4605,6 @@ fn validate_tag_refs_directory(path: &Path, allow_missing: bool) -> Result<bool>
     Ok(true)
 }
 
-/// `refs/heads/` is intentionally flat: branch names are not a second path
-/// namespace.  Ref enumeration treats every unexpected entry as corruption so
-/// a repair never quietly omits history because a symlink, directory, or bad
-/// leaf was planted beneath `.kio/refs`.
-fn collect_branch_ref_targets(path: &Path, targets: &mut BTreeSet<String>) -> Result<()> {
-    if !validate_tag_refs_directory(path, true)? {
-        return Ok(());
-    }
-    for entry in fs::read_dir(path).kio_io(path)? {
-        let entry = entry.kio_io(path)?;
-        let leaf = entry.file_name();
-        let leaf = leaf
-            .to_str()
-            .ok_or_else(|| tag_ref_corrupt(&entry.path(), "branch ref leaf is not UTF-8"))?;
-        if leaf.is_empty() || leaf == "." || leaf == ".." {
-            return Err(tag_ref_corrupt(&entry.path(), "branch ref leaf is invalid"));
-        }
-        let value = read_commit_ref(&entry.path(), leaf == "main")?;
-        if let Some(hash) = value {
-            targets.insert(hash);
-        }
-    }
-    Ok(())
-}
-
 /// Add canonical tag targets while excluding the adjacent logical-name ledger.
 fn collect_tag_ref_targets(path: &Path, targets: &mut BTreeSet<String>) -> Result<()> {
     if !validate_tag_refs_directory(path, true)? {
@@ -4446,8 +4640,9 @@ fn collect_tag_ref_targets(path: &Path, targets: &mut BTreeSet<String>) -> Resul
 }
 
 /// Read one bounded, regular, single-link commit ref without following it.
-/// `HEAD` and the unborn `main` branch are the only refs permitted to be empty.
-fn read_commit_ref(path: &Path, allow_empty: bool) -> Result<Option<String>> {
+/// Only the literal `unborn` sentinel represents an empty history. Empty,
+/// missing, or malformed HEAD is corruption and is never treated as genesis.
+fn read_commit_ref(path: &Path, allow_unborn: bool) -> Result<Option<String>> {
     let listed = fs::symlink_metadata(path).kio_io(path)?;
     if !listed.file_type().is_file() || listed.len() > MAX_TAG_REF_BYTES {
         return Err(tag_ref_corrupt(
@@ -4482,10 +4677,10 @@ fn read_commit_ref(path: &Path, allow_empty: bool) -> Result<Option<String>> {
     }
     let text = std::str::from_utf8(&bytes)
         .map_err(|_| tag_ref_corrupt(path, "commit ref is not UTF-8"))?;
-    let hash = text.trim();
-    if hash.is_empty() && allow_empty {
-        return Ok(None);
+    if allow_unborn {
+        return parse_head_ref(text).map_err(|_| tag_ref_corrupt(path, "HEAD is not canonical"));
     }
+    let hash = text.trim();
     if !is_hash(hash) {
         return Err(tag_ref_corrupt(
             path,
@@ -4493,6 +4688,26 @@ fn read_commit_ref(path: &Path, allow_empty: bool) -> Result<Option<String>> {
         ));
     }
     Ok(Some(hash.to_owned()))
+}
+
+/// Parse the one mutable ref's fixed wire format.  `unborn\n` is the only
+/// empty-history representation; every committed HEAD is a canonical hash plus
+/// exactly one trailing newline.  This keeps empty and whitespace-only files
+/// distinguishable from an initialized repository.
+fn parse_head_ref(text: &str) -> Result<Option<String>> {
+    if text == "unborn\n" {
+        return Ok(None);
+    }
+    let Some(hash) = text.strip_suffix('\n') else {
+        return Err(KioError::schema(
+            "HEAD must use the canonical newline-terminated format",
+        ));
+    };
+    if is_hash(hash) {
+        Ok(Some(hash.to_owned()))
+    } else {
+        Err(KioError::schema("HEAD must contain a commit_hash"))
+    }
 }
 
 fn read_tag_ref(path: &Path) -> Result<String> {
@@ -4645,6 +4860,42 @@ fn validate_store_directory(kio_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The retained equivalent of [`validate_store_directory`].  Name binding is
+/// verified by `ManagementBinding`; this checks the still-open store itself so
+/// a permissive or foreign-owned `.kio` is not accepted merely because its
+/// descriptor remains valid.
+#[cfg(any(unix, windows))]
+fn validate_retained_store_directory(kio: &File, label: &Path) -> Result<()> {
+    let metadata = kio
+        .metadata()
+        .map_err(|error| KioError::io(error.to_string(), label.display().to_string()))?;
+    if !metadata.is_dir() {
+        return Err(unsafe_store_error(
+            label,
+            "retained .kio handle is not a directory",
+        ));
+    }
+    #[cfg(windows)]
+    crate::private_fs::verify_owner_private_handle(kio)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if metadata.permissions().mode() & 0o077 != 0 {
+            return Err(unsafe_store_error(
+                label,
+                ".kio must not be accessible to group or other principals",
+            ));
+        }
+        if metadata.uid() != effective_uid() {
+            return Err(unsafe_store_error(
+                label,
+                ".kio must be owned by the current effective user",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn effective_uid() -> u32 {
     unsafe extern "C" {
@@ -4664,7 +4915,7 @@ fn unsafe_store_error(path: &Path, message: &str) -> KioError {
 }
 
 fn open_working_file_candidate(candidate: &WorkingFileCandidate) -> Result<File> {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if let Some(root) = candidate.bound_root.as_deref() {
         return open_bound_scope_file_nofollow(root, &candidate.file_name, &candidate.path);
     }
@@ -4713,6 +4964,28 @@ fn open_bound_scope_file_nofollow(
         return Err(scope_file_changed_path(display_path));
     }
     Ok(file)
+}
+
+#[cfg(windows)]
+fn open_bound_scope_file_nofollow(
+    root: &File,
+    file_name: &str,
+    display_path: &Path,
+) -> Result<File> {
+    let name = Path::new(file_name);
+    if name.components().count() != 1
+        || !matches!(name.components().next(), Some(Component::Normal(_)))
+    {
+        return Err(scope_file_changed_path(display_path));
+    }
+    let directory = StoreDirectory::from_retained(
+        root.try_clone().kio_io(display_path)?,
+        display_path
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf(),
+    )?;
+    directory.open_regular_read(name, MAX_RAW_OBJECT_BYTES)
 }
 
 fn open_scope_file_nofollow(path: &Path) -> Result<File> {
@@ -5101,7 +5374,7 @@ fn wait_at_bound_snapshot_auto_layout_barrier() {
     wait_at_bound_snapshot_auto_barrier(test_control.snapshot_bound_layout_ready.as_deref());
 }
 
-#[cfg(all(unix, not(debug_assertions)))]
+#[cfg(not(all(unix, debug_assertions)))]
 fn wait_at_bound_snapshot_auto_layout_barrier() {}
 
 #[cfg(debug_assertions)]
@@ -5259,6 +5532,40 @@ fn commit_stats(prior: Option<&TreeObject>, working: &TreeObject) -> CommitStats
 /// object into the shallow-commit policy (degrade reads / fail writes loudly).
 fn is_store_not_found(error: &KioError) -> bool {
     error.error_code() == "KIO-E-STORE-NOT-FOUND-001"
+}
+
+fn validate_manifest_matches_tree(manifest: &Value, tree: &TreeObject) -> Result<()> {
+    validate_json_schema(SchemaKind::Manifest, manifest)?;
+    let files = manifest
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| KioError::schema("publication manifest missing files"))?;
+    let live: BTreeMap<_, _> = files
+        .iter()
+        .filter(|file| file.get("status").and_then(Value::as_str) != Some("deleted"))
+        .map(|file| {
+            let path = file
+                .get("path")
+                .and_then(Value::as_str)
+                .ok_or_else(|| KioError::schema("publication manifest file path missing"))?;
+            let raw = file
+                .get("raw_hash")
+                .and_then(Value::as_str)
+                .ok_or_else(|| KioError::schema("publication manifest raw hash missing"))?;
+            Ok((path, raw))
+        })
+        .collect::<Result<_>>()?;
+    let expected: BTreeMap<_, _> = tree
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry.raw_hash.as_str()))
+        .collect();
+    if live != expected {
+        return Err(KioError::schema(
+            "publication manifest does not describe the new commit tree",
+        ));
+    }
+    Ok(())
 }
 
 /// R17-5: a commit operand (`diff`/`tag` hash literal, or a tag-name target) whose
@@ -6295,85 +6602,114 @@ pub(crate) fn acquire_bound_store_read_guard(_kio: &File) -> Result<BoundStoreRe
 /// Windows and other non-Unix platforms deliberately expose the same type so
 /// the GC state machine remains portable, but do not provide a path-based
 /// substitute for descriptor-relative no-follow locking.
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub struct BoundStoreLock {
+    _kio: File,
+    owner: File,
+    pid: u32,
+    token: String,
+}
+
+#[cfg(not(any(unix, windows)))]
 pub struct BoundStoreLock {
     _private: (),
 }
 
-/// Bridges a descriptor-bound writer lock to [`StoreLock`]'s existing
-/// thread-local reentrancy protocol.  Automatic snapshot operations first
-/// acquire the public `.lock` leaf relative to a retained `.kio` descriptor;
-/// repository helpers may then call `StoreLock::acquire` without reopening or
-/// replacing that lock through a public path.
-///
-/// The caller must supply exactly the public `.kio/.lock` path that ordinary
-/// repository operations use as their `LOCK_DEPTH` key.  The path is never
-/// opened by this type.
-pub struct BoundReentrantStoreLock {
-    paths: Vec<PathBuf>,
-    inner: Option<BoundStoreLock>,
+/// A same-thread lease of the descriptor-relative `.kio/.lock` owner.  The
+/// `Rc` deliberately makes it !Send: a different thread must contend through
+/// the real retained lock rather than inheriting reentrancy by path spelling.
+pub struct RetainedStoreLock {
+    _owner: Rc<BoundStoreLock>,
 }
 
-/// Acquire the retained-descriptor lock protocol and register it as the outer
-/// owner in the current thread's ordinary lock-depth table.  On platforms
-/// without a descriptor-relative primitive, `acquire_bound_store_lock` fails
-/// closed rather than falling back to an ambient lock path.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-pub(crate) fn acquire_bound_reentrant_store_lock(
-    kio: &File,
-    ordinary_lock_paths: Vec<PathBuf>,
-) -> Result<BoundReentrantStoreLock> {
-    let mut paths = ordinary_lock_paths;
-    paths.sort();
-    paths.dedup();
-    if paths.is_empty() {
-        return Err(KioError::invalid_usage(
-            "bound reentrant store lock requires at least one lock key",
-        ));
-    }
-    let already_held = LOCK_DEPTH.with(|depth| {
-        let depth = depth.borrow();
-        paths.iter().any(|path| depth.contains_key(path))
-    });
-    if already_held {
-        return Err(KioError::locked(paths[0].display().to_string()));
-    }
+pub struct RetainedPublicationLock {
+    _owner: RetainedStoreLock,
+}
 
-    let inner = acquire_bound_store_lock(kio)?;
-    LOCK_DEPTH.with(|depth| {
-        let mut depth = depth.borrow_mut();
-        for path in &paths {
-            depth.insert(path.clone(), 1);
-        }
-    });
-    Ok(BoundReentrantStoreLock {
-        paths,
-        inner: Some(inner),
+fn acquire_retained_publication_lock(kio: &File) -> Result<RetainedPublicationLock> {
+    let directory = StoreDirectory::from_retained(
+        kio.try_clone()
+            .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
+        PathBuf::from(".kio"),
+    )?;
+    // A distinct retained child gives publication its own OS-lock identity,
+    // including the existing stale-owner recovery protocol, without taking a
+    // second flock on the writer's `.kio` directory.
+    let publication = directory.create_directory_all(Path::new("internal/publication"))?;
+    Ok(RetainedPublicationLock {
+        _owner: acquire_retained_store_lock(&publication)?,
     })
 }
 
-impl Drop for BoundReentrantStoreLock {
-    fn drop(&mut self) {
-        // Remove only this outer registration.  Well-scoped Rust callers drop
-        // all nested StoreLock guards first; decrementing defensively avoids
-        // corrupting the depth accounting if a caller intentionally leaks one.
-        LOCK_DEPTH.with(|depth| {
-            let mut depth = depth.borrow_mut();
-            for path in &self.paths {
-                let Some(count) = depth.get_mut(path) else {
-                    continue;
-                };
-                *count -= 1;
-                if *count == 0 {
-                    depth.remove(path);
-                }
-            }
-        });
-        // Drop after unpublishing the synthetic reentrancy owner.  The bound
-        // guard releases only the descriptor-relative entry it originally
-        // acquired; it never resolves `self.path`.
-        drop(self.inner.take());
+/// Scheduler and ordinary repository writers use the identical retained
+/// identity lease; the historical path-alias bridge no longer exists.
+pub type BoundReentrantStoreLock = RetainedStoreLock;
+
+#[derive(Clone, PartialEq, Eq)]
+struct BoundLeaseIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(windows)]
+    identity: crate::cas::WindowsDirectoryIdentity,
+}
+
+thread_local! {
+    static BOUND_STORE_LEASES: RefCell<Vec<(BoundLeaseIdentity, Weak<BoundStoreLock>)>> = const { RefCell::new(Vec::new()) };
+}
+
+fn bound_lease_identity(kio: &File) -> Result<BoundLeaseIdentity> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = kio
+            .metadata()
+            .map_err(|error| KioError::io(error.to_string(), ".kio"))?;
+        Ok(BoundLeaseIdentity {
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+        })
     }
+    #[cfg(windows)]
+    {
+        let identity = crate::cas::windows_directory_handle_identity(kio)
+            .ok_or_else(|| KioError::locked(".kio"))?;
+        Ok(BoundLeaseIdentity { identity })
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = kio;
+        Err(KioError::new(
+            "KIO-E-STORE-CORRUPT-001",
+            "platform lacks a retained writer identity",
+            json!({}),
+            ExitCode::PermanentFailure,
+        ))
+    }
+}
+
+/// Acquire or share the physical lock only for the same retained directory
+/// identity in this thread. A weak entry never keeps an old store alive after
+/// the final guard is dropped.
+pub(crate) fn acquire_retained_store_lock(kio: &File) -> Result<RetainedStoreLock> {
+    let identity = bound_lease_identity(kio)?;
+    if let Some(owner) = BOUND_STORE_LEASES.with(|leases| {
+        let mut leases = leases.borrow_mut();
+        leases.retain(|(_, owner)| owner.strong_count() != 0);
+        leases
+            .iter()
+            .find_map(|(known, owner)| (known == &identity).then(|| owner.upgrade()).flatten())
+    }) {
+        return Ok(RetainedStoreLock { _owner: owner });
+    }
+    let owner = Rc::new(acquire_bound_store_lock(kio)?);
+    BOUND_STORE_LEASES.with(|leases| leases.borrow_mut().push((identity, Rc::downgrade(&owner))));
+    Ok(RetainedStoreLock { _owner: owner })
+}
+
+pub(crate) fn acquire_bound_reentrant_store_lock(kio: &File) -> Result<BoundReentrantStoreLock> {
+    acquire_retained_store_lock(kio)
 }
 
 #[cfg(unix)]
@@ -6396,7 +6732,7 @@ pub(crate) fn acquire_bound_store_lock(kio: &File) -> Result<BoundStoreLock> {
     let bytes = canonical_lock_bytes(pid, &token)?;
     // Every fallible resource needed by `BoundStoreLock::drop` is prepared
     // before the authoritative lock is published.  In particular, a broken
-    // `gc/internal/locks` must not turn a failed acquisition into a live lock
+    // Generic `.kio/internal/locks` setup must not turn a failed acquisition into a live lock
     // that no guard owns to release.  Inspect the current entry first so a
     // live ordinary writer sees no GC-internal directory creation.
     preflight_bound_lock_entry(kio)?;
@@ -6434,7 +6770,46 @@ pub(crate) fn acquire_bound_store_lock(kio: &File) -> Result<BoundStoreLock> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn acquire_bound_store_lock(kio: &File) -> Result<BoundStoreLock> {
+    if crate::cas::windows_directory_handle_identity(kio).is_none() {
+        return Err(KioError::locked(
+            "retained .kio is not an ordinary directory",
+        ));
+    }
+    let retained = kio
+        .try_clone()
+        .map_err(|error| KioError::io(error.to_string(), ".kio"))?;
+    let pid = std::process::id();
+    let token = new_lock_token(pid);
+    let bytes = canonical_lock_bytes(pid, &token)?;
+    let leaf = Path::new(".lock");
+    let owner = match create_windows_lock(&retained, leaf, &bytes) {
+        Ok(owner) => owner,
+        Err(error) if is_windows_lock_contention(&error) => {
+            reclaim_windows_stale_lock(&retained, leaf, &bytes)?
+                .ok_or_else(|| KioError::locked(".kio/.lock"))?
+        }
+        Err(error) => return Err(KioError::io(error.to_string(), ".kio/.lock")),
+    };
+    Ok(BoundStoreLock {
+        _kio: retained,
+        owner,
+        pid,
+        token,
+    })
+}
+
+#[cfg(windows)]
+impl Drop for BoundStoreLock {
+    fn drop(&mut self) {
+        // The owner handle denies replacement and retains DELETE access. The
+        // release routine checks its token and deletes that exact object.
+        let _ = release_windows_owned_lock(&self.owner, self.pid, &self.token);
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn acquire_bound_store_lock(_kio: &File) -> Result<BoundStoreLock> {
     Err(KioError::new(
         "KIO-E-STORE-CORRUPT-001",
@@ -6681,8 +7056,9 @@ fn bound_lock_archive_dir(kio: &File) -> Result<File> {
             }
         }
     }
-    let gc = ensure(kio, "gc")?;
-    let internal = ensure(&gc, "internal")?;
+    // Stale writer-lock archival is generic store plumbing, never GC state:
+    // normal writer acquisition must not create a `gc/` namespace.
+    let internal = ensure(kio, "internal")?;
     let locks = ensure(&internal, "locks")?;
     // Re-open validation is descriptor-relative; `ensure` never follows a
     // public path and refuses a non-directory/reparse child.
@@ -7161,50 +7537,94 @@ fn validate_scope_json_value(value: &Value) -> Result<()> {
     validate_json_schema(SchemaKind::Scope, value)
 }
 
-fn overwrite_scope_json_value(kio_dir: &Path, value: &Value) -> Result<()> {
-    let path = kio_dir.join("scope.json");
-    atomic_overwrite(
-        &path,
-        serde_json::to_string_pretty(value)
-            .map_err(|err| KioError::schema(err.to_string()))?
-            .as_bytes(),
+/// Bind an approval mutation to a retained `.kio` directory and serialize its
+/// complete read/compare/write sequence with every other store writer.  The
+/// public path is used only to acquire the initial no-follow directory
+/// capability; the closure never resolves it again.
+///
+/// Approval writers are also called while a repository command already holds
+/// [`Repository::lock_store`].  `acquire_retained_store_lock` keys leases by
+/// the retained directory identity, so that case shares the caller's guard
+/// instead of attempting a second OS lock.
+fn with_bound_scope_approval_write<T>(
+    kio_dir: &Path,
+    operation: impl FnOnce(&StoreDirectory) -> Result<T>,
+) -> Result<T> {
+    let directory = StoreDirectory::open(kio_dir)?;
+    let retained = directory
+        .root_handle()
+        .as_ref()
+        .try_clone()
+        .map_err(|error| KioError::io(error.to_string(), ".kio"))?;
+    let _lock = acquire_retained_store_lock(&retained)?;
+    operation(&directory)
+}
+
+fn read_bound_scope_json_value(directory: &StoreDirectory) -> Result<Value> {
+    let bytes = directory
+        .read_optional(Path::new("scope.json"), MAX_BOUND_CONFIG_BYTES)?
+        .ok_or_else(|| KioError::schema("scope.json is missing"))?;
+    let value = serde_json::from_slice(&bytes).map_err(|err| KioError::schema(err.to_string()))?;
+    validate_scope_json_value(&value)?;
+    Ok(value)
+}
+
+fn overwrite_bound_scope_json_value(directory: &StoreDirectory, value: &Value) -> Result<()> {
+    let bytes =
+        serde_json::to_string_pretty(value).map_err(|err| KioError::schema(err.to_string()))?;
+    directory.write_atomic(
+        Path::new("scope.json"),
+        bytes.as_bytes(),
+        crate::store_dir::Publication::Replace,
     )
 }
 
-/// Current `.kio/scope.json` `approvals[]` rows. Empty when the key is
-/// absent — no adapter has ever been approved for this scope (10 §11.3).
-pub fn read_network_approvals(kio_dir: &Path) -> Result<Vec<Value>> {
-    Ok(read_scope_json_value(kio_dir)?
+fn read_bound_config_document(directory: &StoreDirectory) -> Result<String> {
+    let bytes = directory
+        .read_optional(Path::new("config.toml"), MAX_BOUND_CONFIG_BYTES)?
+        .ok_or_else(|| KioError::schema("config.toml is missing"))?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| KioError::schema("config.toml must be UTF-8"))?;
+    validate_scope_config_document(&text)?;
+    Ok(text)
+}
+
+fn validate_scope_config_document(text: &str) -> Result<()> {
+    if text.len() as u64 > MAX_BOUND_CONFIG_BYTES {
+        return Err(KioError::schema("config.toml exceeds the byte limit"));
+    }
+    let toml: toml::Value =
+        toml::from_str(text).map_err(|error| KioError::schema(error.to_string()))?;
+    let value = serde_json::to_value(&toml).map_err(|error| KioError::schema(error.to_string()))?;
+    validate_json_schema(SchemaKind::Config, &value)?;
+    enforce_scope_config_semantics(&value)
+}
+
+fn network_approvals_from_value(value: &Value) -> Result<Vec<Value>> {
+    Ok(value
         .get("approvals")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default())
 }
 
-/// The `approvals_initialized` consumed-marker (07 §3 L176-205): true once
-/// this scope's initial approval — explicit or the one-time "materialize"
-/// exception — has been recorded, independent of whether any row currently
-/// remains (a subsequent revoke or a lost/restored backup must not
-/// resurrect the initial-materialize exception).
-pub fn network_approvals_initialized(kio_dir: &Path) -> Result<bool> {
-    Ok(read_scope_json_value(kio_dir)?
+fn network_approvals_initialized_from_value(value: &Value) -> Result<bool> {
+    Ok(value
         .get("approvals_initialized")
         .and_then(Value::as_bool)
         .unwrap_or(false))
 }
 
-/// Whether an `active` `approvals[]` row exists for `tool_id` whose
-/// `scope_id`/`execution_mode`/`tool_profile_hash` match the CURRENT values
-/// exactly (07 §3's send-gate AND condition: "現在の execution_mode/
-/// tool_profile_hash に一致する status=active 行が存在する" — a profile
-/// change invalidates the row until re-approval, QA23).
-pub fn network_approval_active(
-    kio_dir: &Path,
+fn network_approval_pending_from_value(value: &Value) -> Result<Option<Value>> {
+    Ok(value.get("approval_pending").cloned())
+}
+
+fn network_approval_active_from_value(
+    value: &Value,
     tool_id: &str,
     execution_mode: &str,
     tool_profile_hash: &str,
 ) -> Result<bool> {
-    let value = read_scope_json_value(kio_dir)?;
     let Some(scope_id) = value.get("scope_id").and_then(Value::as_str) else {
         return Ok(false);
     };
@@ -7220,13 +7640,7 @@ pub fn network_approval_active(
     }))
 }
 
-/// Whether ANY `active` `approvals[]` row currently exists for `tool_id` in
-/// this scope, regardless of `execution_mode`/`tool_profile_hash` — the
-/// coarser presence check `--online`'s one-shot branch uses to "trust an
-/// existing row for one more send" even across a profile change (07 §3),
-/// distinct from [`network_approval_active`]'s strict steady-state match.
-pub fn network_approval_row_present(kio_dir: &Path, tool_id: &str) -> Result<bool> {
-    let value = read_scope_json_value(kio_dir)?;
+fn network_approval_row_present_from_value(value: &Value, tool_id: &str) -> Result<bool> {
     let Some(scope_id) = value.get("scope_id").and_then(Value::as_str) else {
         return Ok(false);
     };
@@ -7240,15 +7654,53 @@ pub fn network_approval_row_present(kio_dir: &Path, tool_id: &str) -> Result<boo
     }))
 }
 
+/// Current `.kio/scope.json` `approvals[]` rows. Empty when the key is
+/// absent — no adapter has ever been approved for this scope (10 §11.3).
+pub fn read_network_approvals(kio_dir: &Path) -> Result<Vec<Value>> {
+    network_approvals_from_value(&read_scope_json_value(kio_dir)?)
+}
+
+/// Whether this scope has recorded an explicit approval lifecycle. The marker
+/// is audit state only; it never authorizes sending or automatic recovery.
+pub fn network_approvals_initialized(kio_dir: &Path) -> Result<bool> {
+    network_approvals_initialized_from_value(&read_scope_json_value(kio_dir)?)
+}
+
+/// Whether an `active` `approvals[]` row exists for `tool_id` whose
+/// `scope_id`/`execution_mode`/`tool_profile_hash` match the CURRENT values
+/// exactly (07 §3's send-gate AND condition: "現在の execution_mode/
+/// tool_profile_hash に一致する status=active 行が存在する" — a profile
+/// change invalidates the row until re-approval, QA23).
+pub fn network_approval_active(
+    kio_dir: &Path,
+    tool_id: &str,
+    execution_mode: &str,
+    tool_profile_hash: &str,
+) -> Result<bool> {
+    network_approval_active_from_value(
+        &read_scope_json_value(kio_dir)?,
+        tool_id,
+        execution_mode,
+        tool_profile_hash,
+    )
+}
+
+/// Whether ANY `active` `approvals[]` row currently exists for `tool_id` in
+/// this scope, regardless of `execution_mode`/`tool_profile_hash` — the
+/// coarser presence check `--online`'s one-shot branch uses to "trust an
+/// existing row for one more send" even across a profile change (07 §3),
+/// distinct from [`network_approval_active`]'s strict steady-state match.
+pub fn network_approval_row_present(kio_dir: &Path, tool_id: &str) -> Result<bool> {
+    network_approval_row_present_from_value(&read_scope_json_value(kio_dir)?, tool_id)
+}
+
 /// The single in-flight `approval_pending` object, or `None` when absent (07
 /// §3 L191-205: the write-order's step (0) pending intent — a
 /// single object, never an array, since approval operations are serialized
 /// under `.kio/.lock`). Persisted scopes are fully version- and schema-validated
 /// before this value is returned.
 pub fn read_network_approval_pending(kio_dir: &Path) -> Result<Option<Value>> {
-    Ok(read_scope_json_value(kio_dir)?
-        .get("approval_pending")
-        .cloned())
+    network_approval_pending_from_value(&read_scope_json_value(kio_dir)?)
 }
 
 /// 07 §3 step (0) of the approval write-order: durably record the pending
@@ -7256,13 +7708,22 @@ pub fn read_network_approval_pending(kio_dir: &Path) -> Result<Option<Value>> {
 /// steps leaves a recoverable trail and a concurrent `kio adapter revoke`
 /// has something to detect/remove (QA26/27).
 pub fn write_network_approval_pending(kio_dir: &Path, pending: Value) -> Result<()> {
-    let mut value = read_scope_json_value(kio_dir)?;
+    with_bound_scope_approval_write(kio_dir, |directory| {
+        write_network_approval_pending_in_directory(directory, pending)
+    })
+}
+
+fn write_network_approval_pending_in_directory(
+    directory: &StoreDirectory,
+    pending: Value,
+) -> Result<()> {
+    let mut value = read_bound_scope_json_value(directory)?;
     let Some(object) = value.as_object_mut() else {
         return Err(KioError::schema("scope.json must be an object"));
     };
     object.insert("approval_pending".to_owned(), pending);
     validate_json_schema(SchemaKind::Scope, &value)?;
-    overwrite_scope_json_value(kio_dir, &value)
+    overwrite_bound_scope_json_value(directory, &value)
 }
 
 /// 07 §3 step (2) (QA21/23/26/27): publish the `approvals[]` row — upserted
@@ -7272,13 +7733,14 @@ pub fn write_network_approval_pending(kio_dir: &Path, pending: Value) -> Result<
 /// atomic write.
 ///
 /// `expected_pending` is the exact pending payload the caller durably wrote
-/// in step (0) via [`write_network_approval_pending`] (or `None` when
-/// materializing with no separate pending step — QA21's initial-materialize
-/// exception publishes directly). This function re-reads scope.json and
-/// requires the CURRENTLY-persisted `approval_pending` to equal
-/// `expected_pending` exactly (CAS) before publishing — a mismatch means a
-/// concurrent `kio adapter revoke` already removed/changed it, and the
-/// publish must not resurrect a stale intent. Returns
+/// in step (0) via [`write_network_approval_pending`] (or `None` for an
+/// explicit direct publication with no pending intent). This function serializes its complete
+/// re-read/compare/write sequence under the retained `.kio/.lock` and requires
+/// the CURRENTLY-persisted `approval_pending` to equal `expected_pending`
+/// exactly before publishing. The durable replacement is atomic publication,
+/// not a filesystem compare-and-swap; the retained lock supplies the compare
+/// exclusion. A mismatch means a concurrent `kio adapter revoke` already
+/// removed/changed it, and the publish must not resurrect a stale intent. Returns
 /// `KIO-E-ADAPTER-APPROVAL-CONFLICT-001` (exit 5, QA26) on mismatch without
 /// writing anything.
 pub fn publish_network_approval(
@@ -7286,7 +7748,17 @@ pub fn publish_network_approval(
     row: Value,
     expected_pending: Option<&Value>,
 ) -> Result<()> {
-    let mut value = read_scope_json_value(kio_dir)?;
+    with_bound_scope_approval_write(kio_dir, |directory| {
+        publish_network_approval_in_directory(directory, row, expected_pending)
+    })
+}
+
+fn publish_network_approval_in_directory(
+    directory: &StoreDirectory,
+    row: Value,
+    expected_pending: Option<&Value>,
+) -> Result<()> {
+    let mut value = read_bound_scope_json_value(directory)?;
     let Some(object) = value.as_object_mut() else {
         return Err(KioError::schema("scope.json must be an object"));
     };
@@ -7335,7 +7807,7 @@ pub fn publish_network_approval(
     object.insert("approvals_initialized".to_owned(), Value::Bool(true));
     object.remove("approval_pending");
     validate_json_schema(SchemaKind::Scope, &value)?;
-    overwrite_scope_json_value(kio_dir, &value)
+    overwrite_bound_scope_json_value(directory, &value)
 }
 
 /// QA25/26/27: the outcome of a `kio adapter revoke` scope.json mutation.
@@ -7387,7 +7859,17 @@ pub fn revoke_network_approval(
     tool_id: Option<&str>,
     revoked_at: &str,
 ) -> Result<NetworkRevokeOutcome> {
-    let mut value = read_scope_json_value(kio_dir)?;
+    with_bound_scope_approval_write(kio_dir, |directory| {
+        revoke_network_approval_in_directory(directory, tool_id, revoked_at)
+    })
+}
+
+fn revoke_network_approval_in_directory(
+    directory: &StoreDirectory,
+    tool_id: Option<&str>,
+    revoked_at: &str,
+) -> Result<NetworkRevokeOutcome> {
+    let mut value = read_bound_scope_json_value(directory)?;
     let Some(scope_id) = value
         .get("scope_id")
         .and_then(Value::as_str)
@@ -7446,28 +7928,148 @@ pub fn revoke_network_approval(
         outcome.marker_written = true;
     }
     validate_json_schema(SchemaKind::Scope, &value)?;
-    overwrite_scope_json_value(kio_dir, &value)?;
+    overwrite_bound_scope_json_value(directory, &value)?;
     Ok(outcome)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::enforce_config_semantics;
     use super::{
-        ArchiveLimits, DEFAULT_MAX_ARCHIVE_FILE_BYTES, MAX_COMMIT_PARENTS, MAX_TREE_ENTRIES,
-        PendingNormalizeRef, RELEASED_LOCK_PID, Repository, StoreLock, append_jsonl_rotating,
-        civil_from_days, format_unix_seconds, format_utc_seconds, open_scope_file_nofollow,
-        parse_utc_seconds, process_is_alive, prune_rotated_logs, read_adapter_lane,
+        ArchiveLimits, DEFAULT_MAX_ARCHIVE_FILE_BYTES, MAX_TREE_ENTRIES, PendingNormalizeRef,
+        RELEASED_LOCK_PID, Repository, StoreLock, append_jsonl_rotating, civil_from_days,
+        format_unix_seconds, format_utc_seconds, open_scope_file_nofollow, parse_utc_seconds,
+        process_is_alive, prune_rotated_logs, publish_network_approval, read_adapter_lane,
         read_logs_retention_days, read_network_approval_pending, read_network_approvals,
-        redact_context, redact_message_paths, rotate_stale_log, write_network_approval_pending,
+        redact_context, redact_message_paths, revoke_network_approval, rotate_stale_log,
+        write_network_approval_pending,
     };
     #[cfg(windows)]
     use super::{
         canonical_lock_bytes, create_windows_lock, is_windows_lock_contention,
         open_windows_lock_parent, read_windows_lock, release_windows_owned_lock, windows_lock_leaf,
     };
+    use super::{enforce_config_semantics, enforce_scope_config_semantics};
+    use crate::cas::canonical_json_bytes;
+    use serde_json::Value;
     #[cfg(windows)]
     use std::path::PathBuf;
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_root_control_refuses_init_and_bound_initialization_without_kio() {
+        use crate::store_dir::StoreDirectory;
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(Repository::init(root.path()).is_err());
+        assert!(!root.path().join(".kio").exists());
+
+        let canonical = root.path().canonicalize().unwrap();
+        let retained = StoreDirectory::open(&canonical)
+            .unwrap()
+            .root_handle()
+            .as_ref()
+            .try_clone()
+            .unwrap();
+        assert!(Repository::init_bound(canonical, retained).is_err());
+        assert!(!root.path().join(".kio").exists());
+
+        let canonical = root.path().canonicalize().unwrap();
+        let retained = StoreDirectory::open(&canonical)
+            .unwrap()
+            .root_handle()
+            .as_ref()
+            .try_clone()
+            .unwrap();
+        assert!(Repository::create_bound(canonical, retained).is_err());
+        assert!(!root.path().join(".kio").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_open_resolves_existing_tags_from_the_retained_store_after_public_replacement() {
+        use crate::cas::{ObjectKind, ObjectStore, hash_bytes};
+        use crate::dag::{CommitObject, CommitStats, CommitType, build_tree};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let kio = fixture.path().join(".kio");
+        Repository::init(fixture.path()).unwrap();
+        let store = ObjectStore::new(&kio);
+        let tree = build_tree(Vec::new()).unwrap();
+        let (tree_hash, _) = store
+            .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
+            .unwrap();
+        let commit = CommitObject::new(
+            tree_hash,
+            None,
+            "2026-09-08T00:00:00Z".into(),
+            "tag binding fixture".into(),
+            hash_bytes(b"tag binding tool lock"),
+            CommitStats {
+                files_added: 0,
+                files_modified: 0,
+                files_deleted: 0,
+            },
+            CommitType::Manual,
+        )
+        .unwrap();
+        let (commit_hash, _) = store
+            .write_json(ObjectKind::Commit, &serde_json::to_value(commit).unwrap())
+            .unwrap();
+        fs::write(kio.join("HEAD"), format!("{commit_hash}\n")).unwrap();
+        fs::write(kio.join("refs/tags-v1/names.jsonl"), b"").unwrap();
+
+        let repo = Repository::open(fixture.path()).unwrap();
+        repo.tag("retained-tag", None).unwrap();
+        let displaced = fixture.path().join("displaced-kio");
+        fs::rename(&kio, &displaced).unwrap();
+        fs::create_dir(&kio).unwrap();
+
+        assert_eq!(repo.resolve_commit("retained-tag").unwrap(), commit_hash);
+        assert!(!kio.join("refs/tags-v1").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_open_replaces_metadata_through_the_retained_store_after_public_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let kio = fixture.path().join(".kio");
+        Repository::init(fixture.path()).unwrap();
+        let repo = Repository::open(fixture.path()).unwrap();
+        let displaced = fixture.path().join("displaced-kio");
+        fs::rename(&kio, &displaced).unwrap();
+        fs::create_dir(&kio).unwrap();
+
+        repo.replace_config_value(
+            toml::from_str("[chunking]\nstrategy = \"heading\"\nmax_chars = 123").unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            fs::read_to_string(displaced.join("config.toml"))
+                .unwrap()
+                .contains("max_chars = 123")
+        );
+        assert!(kio.join("config.toml").read_dir().is_err());
+    }
+
+    #[test]
+    fn normal_open_does_not_materialize_lazy_content_namespaces() {
+        let fixture = tempfile::tempdir().unwrap();
+        Repository::init(fixture.path()).unwrap();
+        let objects = fixture.path().join(".kio/objects");
+        let before: std::collections::BTreeSet<_> = fs::read_dir(&objects)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        Repository::open(fixture.path()).unwrap();
+        let after: std::collections::BTreeSet<_> = fs::read_dir(&objects)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(after, before);
+    }
 
     #[cfg(unix)]
     #[test]
@@ -7514,7 +8116,7 @@ mod tests {
         assert!(active.get("pid").is_some());
         assert!(active.get("token").is_some());
         assert!(active.get("created_at").is_some());
-        let lock_archive = repo.kio_dir().join("gc/internal/locks");
+        let lock_archive = repo.kio_dir().join("internal/locks");
         assert_eq!(std::fs::read_dir(lock_archive).unwrap().count(), 0);
         drop(recovered);
         // A normal writer can parse the GC lock after the GC process crashed
@@ -7530,29 +8132,80 @@ mod tests {
         let scope = tempfile::tempdir().unwrap();
         let repo = Repository::init(scope.path()).unwrap();
         let retained = cap_fs::open_ambient_dir(repo.kio_dir(), ambient_authority()).unwrap();
-        let path = repo.kio_dir().join(".lock");
-
-        let outer = super::acquire_bound_reentrant_store_lock(&retained, vec![path]).unwrap();
-        // Model the descriptor inherited across a concurrent fork before its
-        // exec closes CLOEXEC handles. The logical guard must explicitly
-        // unlock the shared open-file description even while this duplicate
-        // remains open.
-        let inherited_gate = outer
-            .inner
-            .as_ref()
-            .unwrap()
-            ._gate
-            .file
-            .try_clone()
-            .unwrap();
+        let outer = super::acquire_bound_reentrant_store_lock(&retained).unwrap();
+        // Model a fork-inherited duplicate of the directory open-file
+        // description. The final logical lease must explicitly unlock it.
+        let inherited_gate = outer._owner._gate.file.try_clone().unwrap();
         let nested = repo.lock_store().unwrap();
-        drop(nested);
         drop(outer);
-
-        // The descriptor-bound owner released its own entry, and no synthetic
-        // depth remains to make a later ordinary writer spuriously reentrant.
+        // Each logical guard owns the same Rc lease; dropping the outer
+        // scheduler guard cannot release the physical lock while nested work
+        // is still executing.
+        assert!(super::acquire_bound_store_lock(&retained).is_err());
+        drop(nested);
         assert!(StoreLock::acquire(repo.kio_dir()).is_ok());
         drop(inherited_gate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_repository_lock_contends_across_threads() {
+        let scope = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scope.path()).unwrap();
+        let held = repo.lock_store().unwrap();
+        let root = scope.path().to_path_buf();
+        let contender =
+            std::thread::spawn(move || Repository::open(&root).unwrap().lock_store().map(drop));
+        assert!(contender.join().unwrap().is_err());
+        drop(held);
+        assert!(Repository::open(scope.path()).unwrap().lock_store().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_repository_lock_keys_replaced_public_stores_by_identity() {
+        let scope = tempfile::tempdir().unwrap();
+        let original = Repository::init(scope.path()).unwrap();
+        let retained = scope.path().join("retained-kio");
+        fs::rename(scope.path().join(".kio"), &retained).unwrap();
+        let replacement = Repository::init(scope.path()).unwrap();
+
+        let original_lock = original.lock_store().unwrap();
+        let replacement_lock = replacement.lock_store().unwrap();
+        assert!(retained.join(".lock").exists());
+        assert!(scope.path().join(".kio/.lock").exists());
+        drop(replacement_lock);
+        drop(original_lock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_publication_lock_is_distinct_from_writer_and_stays_on_retained_parent() {
+        let scope = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scope.path()).unwrap();
+        let writer = repo.lock_store().unwrap();
+        let publication = repo.lock_purge_publication().unwrap();
+        assert!(
+            scope
+                .path()
+                .join(".kio/internal/publication/.lock")
+                .exists()
+        );
+        drop(publication);
+        drop(writer);
+
+        let retained = scope.path().join("retained-kio");
+        fs::rename(scope.path().join(".kio"), &retained).unwrap();
+        Repository::init(scope.path()).unwrap();
+        let publication = repo.lock_purge_publication().unwrap();
+        assert!(retained.join("internal/publication/.lock").exists());
+        assert!(
+            !scope
+                .path()
+                .join(".kio/internal/publication/.lock")
+                .exists()
+        );
+        drop(publication);
     }
 
     #[cfg(unix)]
@@ -7601,13 +8254,13 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn bound_gc_lock_setup_failure_does_not_publish_an_unowned_live_lock() {
+    fn bound_store_lock_generic_archive_setup_failure_does_not_publish_an_unowned_live_lock() {
         use cap_primitives::{ambient_authority, fs as cap_fs};
 
         let scope = tempfile::tempdir().unwrap();
         let repo = Repository::init(scope.path()).unwrap();
         let retained = cap_fs::open_ambient_dir(repo.kio_dir(), ambient_authority()).unwrap();
-        std::fs::write(repo.kio_dir().join("gc"), b"not a directory").unwrap();
+        std::fs::write(repo.kio_dir().join("internal"), b"not a directory").unwrap();
 
         assert!(super::acquire_bound_store_lock(&retained).is_err());
         assert!(
@@ -7615,8 +8268,70 @@ mod tests {
             "failed archive setup must not strand a live lock"
         );
 
-        std::fs::remove_file(repo.kio_dir().join("gc")).unwrap();
+        std::fs::remove_file(repo.kio_dir().join("internal")).unwrap();
         assert!(super::acquire_bound_store_lock(&retained).is_ok());
+    }
+
+    #[test]
+    fn tags_and_retained_roots_cannot_publish_detached_or_future_history() {
+        use crate::cas::ObjectKind;
+
+        let scope = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scope.path()).unwrap();
+        fs::write(scope.path().join("note.md"), b"ancestor").unwrap();
+        let ancestor = repo
+            .snapshot(Some("ancestor"), None)
+            .unwrap()
+            .commit_hash
+            .unwrap();
+        fs::write(scope.path().join("note.md"), b"head").unwrap();
+        let head = repo
+            .snapshot(Some("head"), None)
+            .unwrap()
+            .commit_hash
+            .unwrap();
+        repo.tag("ancestor", Some(&ancestor)).unwrap();
+        repo.tag("current", None).unwrap();
+        assert_eq!(
+            repo.current_ref_targets().unwrap(),
+            BTreeSet::from([ancestor, head.clone()])
+        );
+        let names = repo.kio_dir().join("refs/tags-v1/names.jsonl");
+        let original_names = fs::read(&names).unwrap();
+        let original_refs = fs::read_dir(names.parent().unwrap()).unwrap().count();
+
+        for (name, parent) in [("detached", None), ("future", Some(head.clone()))] {
+            let mut commit = repo.read_commit(&head).unwrap();
+            commit.parent = parent;
+            commit.message = name.to_owned();
+            let (hash, _) = repo
+                .object_store()
+                .write_json(ObjectKind::Commit, &serde_json::to_value(commit).unwrap())
+                .unwrap();
+            assert!(repo.tag(name, Some(&hash)).is_err());
+            assert!(
+                repo.validate_published_history_roots(&BTreeSet::from([
+                    head.clone(),
+                    hash.clone()
+                ]))
+                .is_err()
+            );
+            assert_eq!(fs::read(&names).unwrap(), original_names);
+            assert_eq!(
+                fs::read_dir(names.parent().unwrap()).unwrap().count(),
+                original_refs
+            );
+
+            // Imported refs cannot bypass the same ancestry boundary.
+            let injected = names.parent().unwrap().join(super::portable_tag_leaf(name));
+            fs::write(&injected, &hash).unwrap();
+            assert!(repo.current_ref_targets().is_err());
+            fs::remove_file(injected).unwrap();
+        }
+        fs::write(repo.kio_dir().join("HEAD"), b"unborn\n").unwrap();
+        assert!(repo.tag("unborn", Some(&head)).is_err());
+        assert!(repo.current_ref_targets().is_err());
+        assert_eq!(fs::read(&names).unwrap(), original_names);
     }
 
     #[test]
@@ -7746,59 +8461,6 @@ mod tests {
         assert_eq!(repo.head_commit_hash().unwrap(), Some(base));
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn bound_parent_policy_write_stays_on_the_retained_kio_handle() {
-        use cap_primitives::{ambient_authority, fs as cap_fs};
-        use std::os::unix::fs::symlink;
-
-        let scope = tempfile::tempdir().unwrap();
-        let repo = Repository::init(scope.path()).unwrap();
-        let retained = cap_fs::open_ambient_dir(repo.kio_dir(), ambient_authority()).unwrap();
-        let victim = tempfile::tempdir().unwrap();
-        std::fs::write(victim.path().join("config.toml"), "sentinel = true\n").unwrap();
-
-        // Model a same-UID public-name replacement after the parent retained
-        // its no-follow child store descriptor. The helper must update the
-        // original inode, never the replacement target.
-        let original = scope.path().join(".kio-original");
-        std::fs::rename(repo.kio_dir(), &original).unwrap();
-        symlink(victim.path(), scope.path().join(".kio")).unwrap();
-        let policy = toml::Value::try_from(serde_json::json!({
-            "rules": [{
-                "pattern": "child/private.md",
-                "negated": false,
-                "scope_prefix": "child"
-            }]
-        }))
-        .unwrap();
-
-        super::persist_bound_generated_parent_policy(&retained, policy).unwrap();
-
-        assert_eq!(
-            std::fs::read_to_string(victim.path().join("config.toml")).unwrap(),
-            "sentinel = true\n",
-            "a public .kio replacement must not receive the generated policy"
-        );
-        let original_config = std::fs::read_to_string(original.join("config.toml")).unwrap();
-        assert!(original_config.contains("generated_parent_policy"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn bound_parent_policy_write_preserves_schema_error_identity() {
-        use cap_primitives::{ambient_authority, fs as cap_fs};
-
-        let scope = tempfile::tempdir().unwrap();
-        let repo = Repository::init(scope.path()).unwrap();
-        std::fs::write(repo.kio_dir().join("config.toml"), "unknown = true\n").unwrap();
-        let retained = cap_fs::open_ambient_dir(repo.kio_dir(), ambient_authority()).unwrap();
-        let policy = toml::Value::try_from(serde_json::json!({ "rules": [] })).unwrap();
-
-        let error = super::persist_bound_generated_parent_policy(&retained, policy).unwrap_err();
-        assert_eq!(error.error_code(), "KIO-E-CONFIG-SCHEMA-001");
-    }
-
     #[test]
     fn config_rejects_retired_format_version_key() {
         let scope = tempfile::tempdir().unwrap();
@@ -7861,20 +8523,27 @@ mod tests {
     }
 
     #[test]
-    fn current_ref_targets_reads_head_branch_and_canonical_tags_without_names_ledger() {
+    fn current_ref_targets_reads_head_and_canonical_tags_without_names_ledger() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
-        let head = format!("sha256:{}", "a".repeat(64));
-        let branch = format!("sha256:{}", "b".repeat(64));
-        let tag = format!("sha256:{}", "c".repeat(64));
-        fs::write(repo.kio_dir().join("HEAD"), &head).unwrap();
-        fs::write(repo.kio_dir().join("refs/heads/main"), &branch).unwrap();
+        fs::write(dir.path().join("note.md"), b"ancestor").unwrap();
+        let tag = repo
+            .snapshot(Some("ancestor"), None)
+            .unwrap()
+            .commit_hash
+            .unwrap();
+        fs::write(dir.path().join("note.md"), b"head").unwrap();
+        let head = repo
+            .snapshot(Some("head"), None)
+            .unwrap()
+            .commit_hash
+            .unwrap();
         let tags = repo.kio_dir().join("refs/tags-v1");
         fs::create_dir_all(&tags).unwrap();
         fs::write(tags.join(format!("tag-{}", "d".repeat(64))), &tag).unwrap();
         fs::write(tags.join("names.jsonl"), b"not a ref\n").unwrap();
 
-        let expected = BTreeSet::from([head, branch, tag]);
+        let expected = BTreeSet::from([head, tag]);
         assert_eq!(repo.current_ref_targets().unwrap(), expected);
     }
 
@@ -7897,6 +8566,20 @@ mod tests {
             "adapter": { "policy": { "offline_api": { "timeout_seconds": 1800 } } }
         });
         assert!(enforce_config_semantics(&config).is_ok());
+    }
+
+    #[test]
+    fn device_ca_is_accepted_for_user_config_but_refused_in_scope_config() {
+        let config = serde_json::json!({
+            "adapter": {
+                "policy": {
+                    "offline_api": { "ca_pem_path": "/private/device-ca.pem" }
+                }
+            }
+        });
+        assert!(enforce_config_semantics(&config).is_ok());
+        let error = enforce_scope_config_semantics(&config).unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-CONFIG-NOT-IMPLEMENTED-001");
     }
 
     /// The parent value is untouched by D7 — still only the documented default.
@@ -7966,6 +8649,65 @@ mod tests {
     }
 
     #[test]
+    fn approval_publication_is_serialized_with_revoke_and_stale_pending_cannot_resurrect_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let scope_id = repo.scope_identity().unwrap().scope_id;
+        let pending = json!({
+            "scope_id": scope_id,
+            "tool_id": "mistral_ocr_markdownize",
+            "execution_mode": "online_api",
+            "tool_profile_hash": format!("sha256:{}", "a".repeat(64)),
+            "approved_at": "2026-07-22T00:00:00Z",
+            "approval_method": "approve",
+        });
+        let row = json!({
+            "scope_id": scope_id,
+            "tool_id": "mistral_ocr_markdownize",
+            "execution_mode": "online_api",
+            "tool_profile_hash": format!("sha256:{}", "a".repeat(64)),
+            "approved_at": "2026-07-22T00:00:00Z",
+            "approval_method": "approve",
+            "status": "active",
+        });
+        write_network_approval_pending(repo.kio_dir(), pending.clone()).unwrap();
+
+        // The cross-thread call cannot enter revoke's read/modify/write
+        // region while this command owns the same retained store identity.
+        // This is a deterministic contention check, not a scheduling race.
+        let held = repo.lock_store().unwrap();
+        let kio = repo.kio_dir().to_path_buf();
+        let blocked = std::thread::spawn(move || {
+            revoke_network_approval(
+                &kio,
+                Some("mistral_ocr_markdownize"),
+                "2026-07-23T00:00:00Z",
+            )
+        })
+        .join()
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(blocked.error_code(), "KIO-E-STORE-LOCKED-001");
+        assert_eq!(
+            read_network_approval_pending(repo.kio_dir()).unwrap(),
+            Some(pending.clone())
+        );
+        drop(held);
+
+        let revoked = revoke_network_approval(
+            repo.kio_dir(),
+            Some("mistral_ocr_markdownize"),
+            "2026-07-23T00:00:00Z",
+        )
+        .unwrap();
+        assert!(revoked.pending_removed);
+        let error = publish_network_approval(repo.kio_dir(), row, Some(&pending)).unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-ADAPTER-APPROVAL-CONFLICT-001");
+        assert!(read_network_approvals(repo.kio_dir()).unwrap().is_empty());
+        assert_eq!(read_network_approval_pending(repo.kio_dir()).unwrap(), None);
+    }
+
+    #[test]
     fn scope_validation_rejects_missing_or_non_string_version_as_incompatible() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
@@ -7988,7 +8730,7 @@ mod tests {
 
     #[test]
     fn incompatible_scope_versions_precede_current_schema_validation() {
-        for version in ["0.0.0", "0.1.1", "0.2.0", "1.0.0", "malformed"] {
+        for version in ["0.0.0", "0.1.0", "0.2.0", "1.0.1", "malformed"] {
             let dir = tempfile::tempdir().unwrap();
             let repo = Repository::init(dir.path()).unwrap();
             let scope_path = repo.kio_dir().join("scope.json");
@@ -8002,6 +8744,32 @@ mod tests {
             assert_eq!(error.error_code(), "KIO-E-STORE-VERSION-001");
             assert_eq!(error.context()["found"], version);
         }
+    }
+
+    #[test]
+    fn old_format_is_rejected_before_any_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let scope_path = repo.kio_dir().join("scope.json");
+        let mut scope: Value = serde_json::from_slice(&fs::read(&scope_path).unwrap()).unwrap();
+        scope["kio_format_version"] = json!("0.1.0");
+        fs::write(&scope_path, serde_json::to_vec(&scope).unwrap()).unwrap();
+        let before_scope = fs::read(&scope_path).unwrap();
+        let before_head = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+        let error = Repository::open(dir.path()).unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-VERSION-001");
+        assert_eq!(fs::read(&scope_path).unwrap(), before_scope);
+        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), before_head);
+    }
+
+    #[test]
+    fn unborn_head_is_explicit_and_blank_head_is_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), b"unborn\n");
+        assert_eq!(repo.head_commit_hash().unwrap(), None);
+        fs::write(repo.kio_dir().join("HEAD"), b"").unwrap();
+        assert!(repo.head_commit_hash().is_err());
     }
 
     #[test]
@@ -8061,6 +8829,51 @@ mod tests {
     fn process_liveness_recognizes_current_process_and_released_sentinel() {
         assert!(process_is_alive(std::process::id()));
         assert!(!process_is_alive(RELEASED_LOCK_PID));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_retained_lock_contends_with_ordinary_writer_and_releases_exact_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let kio = repo.bound_kio_handle().unwrap();
+        let held = super::acquire_bound_store_lock(kio).unwrap();
+        assert!(repo.lock_store().is_err());
+        drop(held);
+        let ordinary = repo.lock_store().unwrap();
+        assert!(super::acquire_bound_store_lock(kio).is_err());
+        drop(ordinary);
+        assert!(super::acquire_bound_store_lock(kio).is_ok());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_working_file_read_remains_bound_after_root_rename() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("scope");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("doc.md"), b"retained input").unwrap();
+        let repo = Repository::init(&root).unwrap();
+        let candidates = repo
+            .working_file_candidates(
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                true,
+                ArchiveLimits::default(),
+            )
+            .unwrap();
+        let candidate = candidates
+            .iter()
+            .find(|item| item.file_name == "doc.md")
+            .unwrap();
+        fs::rename(&root, dir.path().join("moved")).unwrap();
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("doc.md"), b"replacement must not be read").unwrap();
+        let mut file = super::open_working_file_candidate(candidate).unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"retained input");
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -9000,13 +9813,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         let store = ObjectStore::new(repo.kio_dir());
-        let parent = hash_bytes(b"parent");
         let commit = json!({
             "commit_type":"manual",
             "created_at":"2026-07-12T00:00:00Z",
             "message":"bounded",
             "object_type":"commit",
-            "parents":vec![parent; MAX_COMMIT_PARENTS + 1],
+            "parents":[hash_bytes(b"parent")],
             "stats":{"files_added":0,"files_modified":0,"files_deleted":0},
             "tool_lock_hash":hash_bytes(b"tool"),
             "tree":hash_bytes(b"tree")
@@ -9032,7 +9844,6 @@ mod tests {
         }
 
         let head_before = fs::read(repo.kio_dir().join("HEAD")).unwrap();
-        let branch_before = fs::read(repo.kio_dir().join("refs/heads/main")).unwrap();
         let error = repo.snapshot(Some("over-limit"), None).unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-SCOPE-INPUT-OVERSIZED-001");
         assert_eq!(
@@ -9041,10 +9852,6 @@ mod tests {
         );
         assert_eq!(error.context()["max_tree_entries"], json!(MAX_TREE_ENTRIES));
         assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head_before);
-        assert_eq!(
-            fs::read(repo.kio_dir().join("refs/heads/main")).unwrap(),
-            branch_before
-        );
         for kind in ["raw", "trees", "commits"] {
             assert_eq!(
                 fs::read_dir(repo.kio_dir().join("objects").join(kind))
@@ -9064,70 +9871,76 @@ mod tests {
         assert_eq!(boundary.tree.entries.len(), MAX_TREE_ENTRIES);
     }
 
-    // R15-1 / R15-1b: an empty HEAD whose `refs/heads/main` still names a real commit
-    // is CORRUPT, not unborn. `head_commit_hash` must recover the commit from refs
-    // (side-effect-free) so a `snapshot` extends real history instead of orphaning it
-    // under a fresh `parents=[]` root, and so a pure read does not misreport. This
-    // exercises the fallback DIRECTLY, without `open()` (whose `self_heal_head` would
-    // otherwise repair HEAD first) — i.e. the exact window R15-1 found (heal deferred).
     #[test]
-    fn r15_1_empty_head_recovers_from_refs_and_snapshot_does_not_orphan() {
-        use super::Repository;
-        use crate::cas::ObjectStore;
-
+    fn publication_journal_recovers_only_the_expected_head_child() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
-        let kio_dir = repo.kio_dir().to_path_buf();
-        let root = repo.root().to_path_buf();
-
-        fs::write(root.join("doc.txt"), "v1").unwrap();
+        fs::write(dir.path().join("doc.txt"), "v1").unwrap();
         let c1_hash = repo
             .snapshot(Some("c1"), None)
             .unwrap()
             .commit_hash
             .unwrap();
-
-        // Corrupt HEAD to empty (crash truncation); refs still names C1.
-        fs::write(kio_dir.join("HEAD"), "").unwrap();
-
-        // A Repository built WITHOUT `open()` (so `self_heal_head` never runs) still
-        // recovers the real HEAD from refs.
-        let direct = Repository {
-            root: root.clone(),
-            canonical_root: root.clone(),
-            kio_dir: kio_dir.clone(),
-            store: ObjectStore::new(kio_dir.clone()),
-            bound_root: None,
-            bound_kio: None,
-        };
-        assert_eq!(
-            direct.head_commit_hash().unwrap(),
-            Some(c1_hash.clone()),
-            "empty HEAD + healthy refs must recover the refs commit"
-        );
-
-        // A snapshot taken while HEAD is still physically empty must PARENT on C1,
-        // not orphan under a fresh root.
-        fs::write(root.join("doc.txt"), "v2").unwrap();
-        let c2_hash = direct
+        fs::write(dir.path().join("doc.txt"), "v2").unwrap();
+        let c2_hash = repo
             .snapshot(Some("c2"), None)
             .unwrap()
             .commit_hash
             .unwrap();
+        let manifest: Value =
+            serde_json::from_slice(&fs::read(repo.kio_dir().join("manifest.json")).unwrap())
+                .unwrap();
+        let journal = super::PublicationJournal {
+            version: 1,
+            expected_head: Some(c1_hash.clone()),
+            new_head: c2_hash.clone(),
+            manifest: manifest.clone(),
+        };
+        fs::write(
+            repo.kio_dir().join(super::PUBLICATION_JOURNAL_LEAF),
+            canonical_json_bytes(&serde_json::to_value(journal).unwrap()).unwrap(),
+        )
+        .unwrap();
+        fs::write(repo.kio_dir().join("HEAD"), format!("{c1_hash}\n")).unwrap();
         assert_eq!(
-            direct.read_commit(&c2_hash).unwrap().parents,
-            vec![c1_hash],
-            "snapshot under a corrupt (empty) HEAD must extend the recovered history"
+            Repository::open_read_only(dir.path())
+                .unwrap_err()
+                .error_code(),
+            "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001"
+        );
+        let recover = Repository::open_for_recovery(dir.path()).unwrap();
+        let _lock = recover.lock_store().unwrap();
+        assert!(recover.recover_publication().unwrap());
+        assert_eq!(recover.head_commit_hash().unwrap(), Some(c2_hash.clone()));
+        assert!(
+            !repo
+                .kio_dir()
+                .join(super::PUBLICATION_JOURNAL_LEAF)
+                .exists()
         );
 
-        // Genuinely unborn (HEAD and refs both empty) still returns None.
-        fs::write(kio_dir.join("HEAD"), "").unwrap();
-        fs::write(kio_dir.join("refs/heads/main"), "").unwrap();
+        fs::write(dir.path().join("doc.txt"), "v3").unwrap();
+        let c3_hash = recover
+            .snapshot(Some("c3"), None)
+            .unwrap()
+            .commit_hash
+            .unwrap();
+        let conflicting = super::PublicationJournal {
+            version: 1,
+            expected_head: Some(c1_hash),
+            new_head: c2_hash,
+            manifest,
+        };
+        fs::write(
+            repo.kio_dir().join(super::PUBLICATION_JOURNAL_LEAF),
+            canonical_json_bytes(&serde_json::to_value(conflicting).unwrap()).unwrap(),
+        )
+        .unwrap();
         assert_eq!(
-            direct.head_commit_hash().unwrap(),
-            None,
-            "both HEAD and refs empty is a genuinely unborn branch"
+            recover.recover_publication().unwrap_err().error_code(),
+            "KIO-E-PUBLICATION-CONFLICT-001"
         );
+        assert_eq!(recover.head_commit_hash().unwrap(), Some(c3_hash));
     }
 
     #[test]
@@ -9165,7 +9978,7 @@ mod tests {
         let commit = repo.read_commit(&commit_hash).unwrap();
         assert_eq!(commit.commit_type, CommitType::Purged);
         assert_eq!(commit.message, "legal");
-        assert_eq!(commit.parents, vec![parent]);
+        assert_eq!(commit.parent, Some(parent));
         assert_eq!(commit.tree, parent_tree);
         assert_eq!(commit.created_at, "2026-07-13T00:00:00Z");
         assert_eq!(commit.purged_raws, vec![hash_bytes(b"version one")]);
@@ -9196,7 +10009,7 @@ mod tests {
         // purge journal whose barrier now covers this raw_hash (05 §3.5's
         // `tombstoned`/`deleted` phases), WITHOUT deleting the working-tree
         // original (purge never does — this is the residual).
-        let purge = PurgeState::new(repo.kio_dir());
+        let purge = PurgeState::open(repo.kio_dir()).unwrap();
         let closure = crate::purge::PurgeClosure::new(
             "01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
             vec![crate::purge::ClosureItem {
@@ -9329,7 +10142,7 @@ mod tests {
         let commit = outcome.commit.unwrap();
         let tree = repo.read_tree(&commit.tree).unwrap();
         assert_eq!(commit.commit_type, CommitType::Purged);
-        assert_eq!(commit.parents, vec![parent]);
+        assert_eq!(commit.parent, Some(parent));
         assert_eq!(outcome.stats.files_deleted, 1);
         assert_eq!(
             tree.entries

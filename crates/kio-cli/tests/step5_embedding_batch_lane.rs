@@ -15,13 +15,44 @@ use assert_cmd::Command;
 use serde_json::Value;
 use tempfile::TempDir;
 
+fn fixture_dir() -> TempDir {
+    // macOS's per-user TMPDIR has an inherited ACL.  v1 correctly declines to
+    // create durable private state below that unchecked path; the system
+    // sticky temporary root is an explicitly permitted ancestor instead.
+    #[cfg(target_os = "macos")]
+    {
+        tempfile::tempdir_in("/private/tmp").unwrap()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tempfile::tempdir().unwrap()
+    }
+}
+
+fn root(dir: &TempDir) -> std::path::PathBuf {
+    dir.path().join("repo")
+}
+
 fn kio(dir: &TempDir) -> Command {
     let mut command = Command::cargo_bin("kio").unwrap();
+    command.env_clear();
+    // Keep the device-scoped ledger and approvals beneath an existing,
+    // owner-private fixture home.  The v1 private-state lifecycle deliberately
+    // refuses to create this state below an unchecked temporary ancestor.
+    let home = dir.path().join("home");
+    if let Some(system_root) = std::env::var_os("SystemRoot") {
+        command.env("SystemRoot", system_root);
+    }
     command
-        .current_dir(dir.path())
-        .env("XDG_DATA_HOME", dir.path().join(".test-data"))
-        .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
-        .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
+        .current_dir(root(dir))
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env("XDG_DATA_HOME", home.join("data"))
+        .env("XDG_CONFIG_HOME", home.join("config"))
+        .env("XDG_CACHE_HOME", home.join("cache"))
+        .env("TMPDIR", home.join("tmp"))
+        .env("TEMP", home.join("tmp"))
+        .env("TMP", home.join("tmp"))
         .env("KIO_TEST_MARKDOWNIZE_ADAPTER", "deterministic")
         .env("KIO_TEST_GEMINI_EMBED", "mock")
         .env_remove("GEMINI_API_KEY")
@@ -29,9 +60,18 @@ fn kio(dir: &TempDir) -> Command {
     command
 }
 
+fn script_with_attribution(dir: &TempDir, raw: &str) -> String {
+    let mut script: Value = serde_json::from_str(raw).unwrap();
+    script["attribution_path"] = serde_json::json!(dir.path().join("gemini-provider-jobs.json"));
+    script.to_string()
+}
+
 fn json(dir: &TempDir, batch_script: &str, args: &[&str]) -> Value {
     let assert = kio(dir)
-        .env("KIO_TEST_GEMINI_BATCH", batch_script)
+        .env(
+            "KIO_TEST_GEMINI_BATCH",
+            script_with_attribution(dir, batch_script),
+        )
         .arg("--json")
         .args(args)
         .assert()
@@ -44,7 +84,10 @@ fn json(dir: &TempDir, batch_script: &str, args: &[&str]) -> Value {
 /// `KIO-E-BATCH-PARTIAL-001` (exit 3) by design.
 fn json_any(dir: &TempDir, batch_script: &str, args: &[&str]) -> Value {
     let output = kio(dir)
-        .env("KIO_TEST_GEMINI_BATCH", batch_script)
+        .env(
+            "KIO_TEST_GEMINI_BATCH",
+            script_with_attribution(dir, batch_script),
+        )
         .arg("--json")
         .args(args)
         .output()
@@ -56,7 +99,10 @@ fn json_any(dir: &TempDir, batch_script: &str, args: &[&str]) -> Value {
 /// stderr, where the caller only cares about the state left behind.
 fn run_ignoring_output(dir: &TempDir, batch_script: &str, args: &[&str]) {
     let _ = kio(dir)
-        .env("KIO_TEST_GEMINI_BATCH", batch_script)
+        .env(
+            "KIO_TEST_GEMINI_BATCH",
+            script_with_attribution(dir, batch_script),
+        )
         .arg("--json")
         .args(args)
         .output()
@@ -64,21 +110,67 @@ fn run_ignoring_output(dir: &TempDir, batch_script: &str, args: &[&str]) {
 }
 
 fn ledger_query(dir: &TempDir, sql: &str) -> String {
-    let db = dir.path().join(".test-data/kio/cost-ledger.sqlite");
+    let db = dir.path().join("home/data/kio/cost-ledger.sqlite");
     let conn = rusqlite::Connection::open(db).unwrap();
     conn.query_row(sql, [], |row| row.get::<_, String>(0))
         .unwrap_or_default()
 }
 
+fn approve_online_profiles(dir: &TempDir) {
+    // `index --online` is the explicit external-send mode for the whole
+    // pipeline.  Grant the deterministic Markdown fixture's exact active
+    // profile as well as the Gemini embedding profile; neither grant is
+    // inferred from the other.
+    kio(dir)
+        .args(["adapter", "approve", "mistral_ocr_markdownize", "--yes"])
+        .assert()
+        .success();
+    kio(dir)
+        .args(["adapter", "approve", "gemini_embedding_2", "--yes"])
+        .assert()
+        .success();
+}
+
+/// Prepare the exact owner-private device home required by the v1 ledger and
+/// grant stores before any CLI command tries to initialize them.
+fn prepare_private_home(dir: &TempDir) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let home = dir.path().join("home");
+    let root = root(dir);
+    std::fs::create_dir(&root).unwrap();
+    for path in [
+        &root,
+        &home,
+        &home.join("data"),
+        &home.join("config"),
+        &home.join("cache"),
+        &home.join("tmp"),
+    ] {
+        std::fs::create_dir_all(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+    }
+}
+
 /// A scope with one indexable document, not yet indexed.
 fn scope() -> TempDir {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = fixture_dir();
+    prepare_private_home(&dir);
     std::fs::write(
-        dir.path().join("auth.md"),
+        root(&dir).join("auth.md"),
         "# 認証仕様\n\nトークン TTL は 3600 秒です。\n",
     )
     .unwrap();
     kio(&dir).arg("init").assert().success();
+    kio(&dir).args(["ledger", "init"]).assert().success();
+    approve_online_profiles(&dir);
     dir
 }
 
@@ -166,7 +258,7 @@ fn success_script_without_usage(job: &str, key: &str) -> String {
 #[test]
 fn a_result_without_a_usage_report_settles_at_the_reservation_estimate() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     json(
         &dir,
         &serde_json::json!({
@@ -175,7 +267,7 @@ fn a_result_without_a_usage_report_settles_at_the_reservation_estimate() {
             "capture_path": capture.to_string_lossy(),
         })
         .to_string(),
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
     let key = submitted_key(&capture);
 
@@ -212,7 +304,7 @@ fn a_result_without_a_usage_report_settles_at_the_reservation_estimate() {
 #[test]
 fn index_submits_a_batch_job_instead_of_embedding_inline() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     let submit_script = serde_json::json!({
         "state_sequence": ["BATCH_STATE_PENDING"],
         "job_name": "batches/contract-1",
@@ -220,7 +312,7 @@ fn index_submits_a_batch_job_instead_of_embedding_inline() {
     })
     .to_string();
 
-    let indexed = json(&dir, &submit_script, &["index", "--approve", "--online"]);
+    let indexed = json(&dir, &submit_script, &["index", "--online"]);
     assert_eq!(indexed["status"], "indexed", "{indexed}");
     assert_eq!(
         indexed["embedding_tasks_executed"], 0,
@@ -265,14 +357,14 @@ fn index_submits_a_batch_job_instead_of_embedding_inline() {
 #[test]
 fn batch_resume_collects_the_vectors_and_clears_the_intent_token() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     let submit_script = serde_json::json!({
         "state_sequence": ["BATCH_STATE_PENDING"],
         "job_name": "batches/contract-2",
         "capture_path": capture.to_string_lossy(),
     })
     .to_string();
-    json(&dir, &submit_script, &["index", "--approve", "--online"]);
+    json(&dir, &submit_script, &["index", "--online"]);
     let key = submitted_key(&capture);
 
     let resumed = json(
@@ -330,14 +422,14 @@ fn batch_resume_collects_the_vectors_and_clears_the_intent_token() {
 #[test]
 fn a_sync_query_embed_settles_on_the_reported_tokens() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     let submit = serde_json::json!({
         "state_sequence": ["BATCH_STATE_PENDING"],
         "job_name": "batches/query-usage",
         "capture_path": capture.to_string_lossy(),
     })
     .to_string();
-    json(&dir, &submit, &["index", "--approve", "--online"]);
+    json(&dir, &submit, &["index", "--online"]);
     let key = submitted_key(&capture);
     json(
         &dir,
@@ -372,14 +464,14 @@ fn a_sync_query_embed_settles_on_the_reported_tokens() {
 #[test]
 fn a_sync_query_embed_without_a_usage_report_keeps_the_reservation() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     let submit = serde_json::json!({
         "state_sequence": ["BATCH_STATE_PENDING"],
         "job_name": "batches/query-no-usage",
         "capture_path": capture.to_string_lossy(),
     })
     .to_string();
-    json(&dir, &submit, &["index", "--approve", "--online"]);
+    json(&dir, &submit, &["index", "--online"]);
     let key = submitted_key(&capture);
     json(
         &dir,
@@ -391,7 +483,7 @@ fn a_sync_query_embed_without_a_usage_report_keeps_the_reservation() {
         .env("KIO_TEST_GEMINI_EMBED", "no_usage_report")
         .env(
             "KIO_TEST_GEMINI_BATCH",
-            success_script("batches/query-no-usage", &key),
+            script_with_attribution(&dir, &success_script("batches/query-no-usage", &key)),
         )
         .args(["--json", "search", "rollback", "--mode", "vector"])
         .output()
@@ -414,7 +506,7 @@ fn a_sync_query_embed_without_a_usage_report_keeps_the_reservation() {
 #[test]
 fn a_failed_batch_job_terminates_the_row_instead_of_hanging() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     json(
         &dir,
         &serde_json::json!({
@@ -423,7 +515,7 @@ fn a_failed_batch_job_terminates_the_row_instead_of_hanging() {
             "capture_path": capture.to_string_lossy(),
         })
         .to_string(),
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
 
     let failed_script = serde_json::json!({
@@ -467,7 +559,7 @@ fn a_failed_batch_job_terminates_the_row_instead_of_hanging() {
 #[test]
 fn a_failed_job_is_retried_within_the_same_pass() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     json(
         &dir,
         &serde_json::json!({
@@ -476,7 +568,7 @@ fn a_failed_job_is_retried_within_the_same_pass() {
             "capture_path": capture.to_string_lossy(),
         })
         .to_string(),
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
     json_any(
         &dir,
@@ -505,7 +597,7 @@ fn a_failed_job_is_retried_within_the_same_pass() {
 #[test]
 fn a_permanently_failing_job_stops_being_resubmitted() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     json(
         &dir,
         &serde_json::json!({
@@ -514,7 +606,7 @@ fn a_permanently_failing_job_stops_being_resubmitted() {
             "capture_path": capture.to_string_lossy(),
         })
         .to_string(),
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
     let failing = serde_json::json!({
         "state_sequence": ["BATCH_STATE_FAILED"],
@@ -537,7 +629,7 @@ fn a_permanently_failing_job_stops_being_resubmitted() {
     );
 
     // And the charging stops with it: no more cost_ledger rows than jobs.
-    let db = dir.path().join(".test-data/kio/cost-ledger.sqlite");
+    let db = dir.path().join("home/data/kio/cost-ledger.sqlite");
     let conn = rusqlite::Connection::open(db).unwrap();
     let charges: i64 = conn
         .query_row(
@@ -558,7 +650,7 @@ fn a_permanently_failing_job_stops_being_resubmitted() {
 #[test]
 fn a_running_batch_job_stays_in_flight_across_repeated_polls() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     json(
         &dir,
         &serde_json::json!({
@@ -567,7 +659,7 @@ fn a_running_batch_job_stays_in_flight_across_repeated_polls() {
             "capture_path": capture.to_string_lossy(),
         })
         .to_string(),
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
     let running = serde_json::json!({
         "state_sequence": ["BATCH_STATE_RUNNING"],
@@ -604,7 +696,7 @@ fn a_running_batch_job_stays_in_flight_across_repeated_polls() {
 #[test]
 fn realtime_uses_the_synchronous_lane_and_never_creates_a_batch_row() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     let script = serde_json::json!({
         "state_sequence": ["BATCH_STATE_PENDING"],
         "job_name": "batches/contract-5",
@@ -612,11 +704,7 @@ fn realtime_uses_the_synchronous_lane_and_never_creates_a_batch_row() {
     })
     .to_string();
 
-    let indexed = json(
-        &dir,
-        &script,
-        &["index", "--approve", "--online", "--realtime"],
-    );
+    let indexed = json(&dir, &script, &["index", "--online", "--realtime"]);
     assert_eq!(indexed["status"], "indexed", "{indexed}");
     assert_eq!(
         indexed["embedding_tasks_executed"], 1,
@@ -652,7 +740,8 @@ fn realtime_uses_the_synchronous_lane_and_never_creates_a_batch_row() {
 /// has an arithmetic answer rather than an approximate one.
 #[test]
 fn every_row_of_a_realtime_pass_settles_on_its_own_reported_tokens() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = fixture_dir();
+    prepare_private_home(&dir);
     for (name, body) in [
         (
             "alpha.md",
@@ -667,15 +756,13 @@ fn every_row_of_a_realtime_pass_settles_on_its_own_reported_tokens() {
             "# Handoff notes\n\nThe operator owns the bridge decision.\n",
         ),
     ] {
-        std::fs::write(dir.path().join(name), body).unwrap();
+        std::fs::write(root(&dir).join(name), body).unwrap();
     }
     kio(&dir).arg("init").assert().success();
+    kio(&dir).args(["ledger", "init"]).assert().success();
+    approve_online_profiles(&dir);
 
-    let indexed = json(
-        &dir,
-        "{}",
-        &["index", "--approve", "--online", "--realtime"],
-    );
+    let indexed = json(&dir, "{}", &["index", "--online", "--realtime"]);
     let executed = indexed["embedding_tasks_executed"].as_u64().unwrap();
     assert!(
         executed > 1,
@@ -717,14 +804,14 @@ fn every_row_of_a_realtime_pass_settles_on_its_own_reported_tokens() {
 #[test]
 fn resubmitting_the_same_member_set_reuses_the_row_and_creates_no_second_job() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     let script = serde_json::json!({
         "state_sequence": ["BATCH_STATE_PENDING"],
         "job_name": "batches/contract-6",
         "capture_path": capture.to_string_lossy(),
     })
     .to_string();
-    json(&dir, &script, &["index", "--approve", "--online"]);
+    json(&dir, &script, &["index", "--online"]);
     json_any(&dir, &script, &["index", "--online"]);
 
     let creates = std::fs::read_to_string(&capture)
@@ -753,29 +840,32 @@ fn resubmitting_the_same_member_set_reuses_the_row_and_creates_no_second_job() {
 /// what actually came back and compares it against the row's `input_hash`.
 #[test]
 fn a_short_result_set_does_not_settle_the_row_as_succeeded() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = fixture_dir();
+    prepare_private_home(&dir);
     // Two documents with distinct content → two distinct embedding groups in
     // one job, so the provider can answer one and drop the other.
     std::fs::write(
-        dir.path().join("auth.md"),
+        root(&dir).join("auth.md"),
         "# 認証仕様\n\nトークン TTL は 3600 秒です。\n",
     )
     .unwrap();
     std::fs::write(
-        dir.path().join("billing.md"),
+        root(&dir).join("billing.md"),
         "# 請求仕様\n\n締め日は毎月 15 日です。\n",
     )
     .unwrap();
     kio(&dir).arg("init").assert().success();
+    kio(&dir).args(["ledger", "init"]).assert().success();
+    approve_online_profiles(&dir);
 
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
     let submit = serde_json::json!({
         "state_sequence": ["BATCH_STATE_PENDING"],
         "job_name": "batches/short-1",
         "capture_path": capture.to_string_lossy(),
     })
     .to_string();
-    json(&dir, &submit, &["index", "--approve", "--online"]);
+    json(&dir, &submit, &["index", "--online"]);
 
     let keys = submitted_keys(&capture);
     assert_eq!(keys.len(), 2, "fixture must submit two members: {keys:?}");
@@ -826,7 +916,7 @@ fn reconcile_recovers_a_row_stranded_in_the_job_creation_window() {
     run_ignoring_output(
         &dir,
         r#"{"fail_phase":"create_job","job_name":"batches/never","state_sequence":["BATCH_STATE_PENDING"]}"#,
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
     // Stranded exactly as described: reserved, 相 2b started, no job id.
     assert_eq!(
@@ -879,7 +969,7 @@ fn reconcile_does_not_claim_a_foreign_provider_job() {
     run_ignoring_output(
         &dir,
         r#"{"fail_phase":"create_job","job_name":"batches/never","state_sequence":["BATCH_STATE_PENDING"]}"#,
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
     let listing = r#"{
         "job_name": "batches/other",
@@ -919,10 +1009,10 @@ fn a_submit_failure_does_not_abort_the_invocation() {
     let output = kio(&dir)
         .env(
             "KIO_TEST_GEMINI_BATCH",
-            r#"{"fail_phase":"create_job","job_name":"batches/nope","state_sequence":["BATCH_STATE_PENDING"]}"#,
+            script_with_attribution(&dir, r#"{"fail_phase":"create_job","job_name":"batches/nope","state_sequence":["BATCH_STATE_PENDING"]}"#),
         )
         .arg("--json")
-        .args(["index", "--approve", "--online"])
+        .args(["index", "--online"])
         .output()
         .unwrap();
     let report: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(|_| {
@@ -947,7 +1037,7 @@ fn a_submit_failure_does_not_abort_the_invocation() {
 #[test]
 fn an_unreachable_row_does_not_block_collection_of_the_others() {
     let dir = scope();
-    let capture = dir.path().join("capture.jsonl");
+    let capture = root(&dir).join("capture.jsonl");
 
     // Row A.
     json(
@@ -958,11 +1048,11 @@ fn an_unreachable_row_does_not_block_collection_of_the_others() {
             "capture_path": capture.to_string_lossy(),
         })
         .to_string(),
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
     // A second document makes a different member set, hence a second row.
     std::fs::write(
-        dir.path().join("billing.md"),
+        root(&dir).join("billing.md"),
         "# 請求仕様\n\n締め日は毎月 15 日です。\n",
     )
     .unwrap();
@@ -974,7 +1064,7 @@ fn an_unreachable_row_does_not_block_collection_of_the_others() {
             "capture_path": capture.to_string_lossy(),
         })
         .to_string(),
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
     assert_eq!(
         ledger_query(

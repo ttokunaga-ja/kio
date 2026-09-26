@@ -92,7 +92,7 @@ code          | doc:1 (symbol 分割は chunk の責務)
 ```text
 .kio/objects/prepared/ab/cd/<prepared64>           # unit 単位の中間表現 (CAS)
 .kio/objects/normalized_units/ab/cd/<raw64>.<tool64>.g<gen>/
-  manifest.json                                   # current working projection
+  manifest.json                                   # retained current .kio 下の runtime projection（taskref ではない）
   <unit_ref>.json                                 # current mutable view/cache
 .kio/objects/normalized_unit_objects/ab/cd/<unit-object64>
                                                   # immutable full NormalizedUnitObject CAS
@@ -114,10 +114,13 @@ unit object (schema は [03-data-model.md §2.1](03-data-model.md) と同一。u
   "unit_type": "page",
   "raw_hash": "sha256:abc...",
   "prepared_hash": "sha256:...",
+  "preparation_profile_hash": "sha256:...",
   "tool_profile_hash": "sha256:tool1...",
   "gen": 0,
   "mode": "full",
   "markdown": "## 3.2 認証仕様\n...",
+  "owned_image_hashes": [],
+  "metadata": {},
   "reused_from": null,
   "generated_at": "2026-04-25T12:00:00Z"
 }
@@ -152,6 +155,8 @@ unit が「変わったか」の判定:
 
 ```
 prepared_hash が変わった
+  または
+preparation_profile_hash が変わった
   または
 raw_hash が変わり、unit に対応する page_fingerprint が変わった
   または
@@ -360,14 +365,15 @@ full / incremental / retry 合成のいずれも、合成後の集合に対し�
 検査する)。衝突があれば persist 先 `<unit_ref>.json` が競合するため当該応答を whole-response
 reject とする (実用上は起こらない 64bit 衝突の防衛線 — 検査は persist 前の V 検査と同時に行う)。
 
-**制御応答 (fallback_to_full=true)**: `fallback_to_full=true` の応答は V1〜V6 に**先立ち**制御応答として評価する — unit 配列・unchanged / removed は空であること (非空は contract violation)。Kio は当該応答を成功・失敗のどちらの終端にもせず、**同一 task を `mode=full` で再発行する** (§3.1 の発動条件は再評価しない — Adapter 判断を尊重。full 応答での `fallback_to_full=true` は contract violation = ループ防止)。この評価順が無いと、§8.1 の「短絡」拒否権 ([07-adapter-spec.md §8.1](07-adapter-spec.md)) が V1 被覆違反 → 再試行 → failed permanent の死路になる。**終端の単位は request である**: 正常な制御応答の受領は当該 request の終端 (task は非終端) — 実測 usage を `outcome='fallback_to_full'` で確定記帳し state=3 を同一 Tx で行い (§5.4 / §5.8。sync 行は同 Tx で intent_token を NULL 化、batch 行は残骸掃除完了時 = 通常規則)、その後 `mode=full` の新 request を相 1 (submission_seq = MAX+1) として開始する (§5.4 の直列化規範を満たす)。正常な制御応答は `attempts` / `contract_violation_count` のどちらにも数えない (違反ではなく §5.2 の retry でもない) — 発動条件 5 の連続 incremental カウンタにも数えない (§3.1)。
+**制御応答 (fallback_to_full=true)**: validatorはV1〜V6より先に制御応答を識別する。unit配列・unchanged・removedは空であり、Full要求に対する同制御応答は契約違反とする。制御応答は正規化本文として保存しない。外部送信前の適用可否判定や、送信を行わない再利用の判定ではFullへ切り替えられる。同期の有料incremental要求を送信した後は、同じ予約でFullを再送しない。現行の同期Adapterは受信結果の耐久再取得を提供しないため、受理・保存できない応答は§5.4の`result_unknown`として停止する。`batch retry --resend-unknown <selector> --yes`で追加試行を承認すると、次のonline実行は新しい予約でFull要求を行う（既存の失敗unit subsetがある場合はそのsubsetを維持）。この承認も現在のpolicy、Adapter grant、予算判定を省略しない。
 
 違反時の挙動:
 
 ```text
 error_code:      KIO-E-ADAPTER-CONTRACT-001
 当該応答は unit 1 つも persist しない (全体 reject)
-run は failed (retryable — 同一 mode で 1 回のみ再試行 (§5.2 表)。再違反は failed permanent)。
+run は failed。同期有料requestの受理・保存失敗は result_unknown とし、自動再送しない (§5.4)。
+既知Batch応答の再収集と契約拒否は §5.8、無償local処理は §5.3 のretry policyに従う。
 full への自動 fallback は行わない
 (fallback は incremental capability 非互換の場合のみ — 正本 [07-adapter-spec.md §8.1](07-adapter-spec.md))
 Batch 経由の場合の課金記帳・旧 intent の終端・再投入手順は §5.8 相 3 の reject 終端が正本
@@ -683,7 +689,7 @@ order_index             unit の出現順 (03-data-model.md §2.1 の順序)
   "previous_raw_hash": "sha256:old...", // incremental 時
   "parent_run_id": "run_01H...",        // incremental 時
   "changed_unit_keys": ["page:12"],     // incremental 時
-  "output_ref": ".kio/objects/normalized_units/ab/cd/<raw64>.<tool64>.g0/",
+  "output_ref": "normalized:<raw64>.<tool64>.g0",
   "unit_keys": null,
   "status": "pending",
   "attempts": 0,
@@ -699,6 +705,10 @@ order_index             unit の出現順 (03-data-model.md §2.1 の順序)
   "reservation_id": null
 }
 ```
+
+`output_ref` の Markdownize instance は `normalized:<raw64>.<tool64>.g<gen>` の portable taskref に固定する。`raw64` は `input_hash`、`tool64` は `tool_profile_hash` の lowercase digest-only hex、`gen` は leading zero なしの canonical decimal であり、全体が完全一致しなければ mutation 前に拒否する。absolute / relative pathref を task journal へ書く互換経路はない。`online:<adapter_id>`、`offline:<adapter_id>`、`embedding:<chunk_hash>` の既存 typed placeholder は変更しない。
+
+root registration と Q_hard snapshot は `tasks.jsonl` を byte-identical にコピーし、portable ref を path へ rebase しない。resume 等の runtime consumer だけが retained current `.kio` を基点に instance directory を解決・再検証する。
 
 `unit_keys` は unit スコープの再投入 (partial の retry) 時のみ非 null で、対象 unit_key の配列。
 null は全 unit 対象。**この object に列挙した key は全て current format では必須**であり、
@@ -719,15 +729,22 @@ pending → running → partial                  1 unit 以上 done かつ 1 uni
 pending → running → failed → pending         全 unit 失敗、または run 前提の失敗 (prepare 失敗等)。retryable
 partial → done                               失敗 unit の再投入がすべて成功
 pending → paused → pending                   保留。hold_reason = budget (§5.4) | auth |
-                                             tier_b_approval (10-operations.md §1.1)。解除条件 =
-                                             理由の解消 (budget は §5.4 の再開規則、tier_b は明示承認)。
+                                             tier_b_approval (10-operations.md §1.1) |
+                                             ledger_initialization_required。解除条件 =
+                                             理由の解消 (budget は §5.4 の再開規則、tier_b は明示承認、
+                                             ledger は明示的な ledger init 後の再開)。
                                              rate_limit は paused ではなく pending + next_retry_at で
                                              表現する (§5.3 — 呼出後に判明し Retry-After が解除条件)。
                                              paused は Adapter 未呼出のため AdapterRun には現れない
 running が heartbeat_at + 5min を超えたら stale。別 worker が pull 可能
 ```
 
-**partial の規範** (markdownize task):
+受け入れ検査を通った応答でも、要求した全 unit が `failed_units` のときは `partial` ではなく
+`failed` とする。この場合も manifest は耐久化するが成功 unit object は 0 件であり、既知の応答として
+通常どおり課金を終端する。`result_unknown` や Batch の結果再収集へ変換しない。成功 unit と failed unit が
+併存する受理応答だけが `partial` である。
+
+**不完全な既知応答の規範** (partial / 全 unit failed の markdownize task):
 
 - 状態表現と immutable body binding の正本は normalized instance の manifest (`units[].status` /
   `units[].unit_object_hash`,
@@ -735,14 +752,24 @@ running が heartbeat_at + 5min を超えたら stale。別 worker が pull 可�
 - done unit は保全する (first-instance-wins)。chunking / embedding / index は done unit 由来のみ実行し、
   failed unit 由来の chunk は index に載せない (= 検索対象は成功 unit のみ)
 - `kio status` は partial のファイルについて失敗 unit_key と error_kind を表示する (silent 欠落の禁止)
+- 応答の `failed_units[].error_kind` を各 unit の manifest に保存し、全失敗を一律の通信エラーへ置換しない。
+  受理した不完全応答ごとに task の `attempts` を一度だけ増やす。`batch retry` は manifest の失敗 unit を
+  個別に判定し、その種別の有限上限に達した unit を再投入しない。別 unit の `rate_limit` が無制限でも、
+  `network_error` 等の上限を解除しない。カウンタは task 共通であり、後から失敗した unit に対しても
+  既に消費した回数を差し引く保守的な判定とする。
+- unit の `rate_limit` は既知応答内の失敗理由であり、明示的な `batch retry` の回数上限は設けない。
+  unit 応答には Retry-After がないため、存在しない待機期限を生成しない。HTTP 全体の 429 拒否は
+  別の契約であり、課金 0 の終端と実際の Retry-After を扱う (§5.3 / §5.4)。いずれも次の実送信には
+  現行承認・cap 判定と新しい予約が必要となる。
 - retry は **失敗 unit のみ** を対象とする:
   - Adapter が `incremental_update` を持つ場合: `mode=incremental`、
     `hints.changed_unit_keys = 失敗 unit のキー`、`previous = 同一 instance の done unit 群` で再投入
     (§3.1 の発動条件 4 (変化率 < threshold) は失敗 unit 集合に対して評価し (= 分子のみ失敗 unit 集合に
     置き換え、分母は §3.1 の定義どおり max(|新 unit 集合|, 1) = instance の全 unit 数)、超過時は full で
-    再投入 — **この full 再投入は下記「持たない場合」の分岐と同一規範に従う**: `mode=full`・受け入れ検査は
-    V6 の通常定義 (prepared unit 全集合が母集合) で行い、既 done の unit は first-instance-wins で保持して
-    失敗 unit の出力のみ採用する。**この full 再投入は §5.2 の retry の一部であり、attempts は通常規則
+    再投入 — **この full 再投入は下記「持たない場合」の分岐と同一規範に従う**: `mode=full` でも
+    request の prepared input は失敗 unit subset のみとし、V6 の母集合もその request に渡した subset とする。
+    既 done unit を全 manifest の出力として再要求・再検査しない。既 done の unit は first-instance-wins で
+    保持して、失敗 unit の成功出力だけを immutable manifest へ併合する。**この full 再投入は §5.2 の retry の一部であり、attempts は通常規則
     (task 側の retry budget — §5.3) を消費する** — §3.2 の「attempts 不算入」は Adapter 発の正常な
     制御応答 (fallback_to_full) 起因の full にのみ適用する)。
     **合成 hints の残余 field は `added_unit_keys = []`・`removed_unit_keys = []` と定める** — 元 run で
@@ -752,9 +779,11 @@ running が heartbeat_at + 5min を超えたら stale。別 worker が pull 可�
     既 done の unit は N に含まれず、応答への再掲 (unchanged への列挙を含む) も要求しない —
     **合成 hints に対する §2.2 の unchanged 候補集合は空であり、V1 の完全一致は
     `unchanged_unit_keys = []` として評価する** (元 run の unchanged 候補集合との一致は要求しない)
-    (この N 規定は `mode=incremental` の再投入にのみ適用する — full 再投入の母集合は上記のとおり V6 の通常定義)
-  - 持たない場合: `mode=full` で再実行するが、既に done の unit は first-instance-wins で既存を保持し、
-    失敗していた unit の出力のみ採用する
+    (この N 規定は `mode=incremental` の再投入にのみ適用する。full 再投入は上記の request-scoped prepared
+    subset に対して V6 を厳格に評価する)
+  - 持たない場合: `mode=full` で、失敗 unit subset だけを prepared input として再実行する。V6 はその subset
+    を完全被覆する updated / added / failed_units を要求し、既に done の unit は first-instance-wins で既存を
+    保持して、失敗していた unit の成功出力のみ採用する
 - manifest の unit status 遷移は `failed → done` の一方向のみ。error_kind が permanent
   (invalid_input 等, §5.3) の unit は再投入せず、partial のまま `kio status` に表示し続ける
   (error_kind は §5.3 の閉 enum — [10-operations.md §11.1](10-operations.md) の機械判定規約の明示例外)。
@@ -776,6 +805,9 @@ auth_error         user action required  max_attempts=0
                                          KIO-E-BATCH-AUTH-001
 quota_exceeded     retryable             max_attempts=3,  fixed(1h)
                                          KIO-E-BATCH-QUOTA-001
+result_unknown     failed permanent      max_attempts=0。同期の送信後結果が不明であり、通常 retry / resume /
+                                         reindex は再送しない。`batch retry --resend-unknown <selector> --yes`
+                                         による一度だけの明示承認後だけ、新しい予約で送信できる (§5.4)
 invalid_input      failed permanent      max_attempts=0
                                          KIO-E-BATCH-INPUT-001
 contract_violation retryable             max_attempts=1 (同一 mode で 1 回のみ再投入 — 出力揺れ対策。
@@ -811,10 +843,16 @@ monthly_usd_cap = 10.0
 ```
 
 - cap は二層で判定する。**device cap** (`~/.config/kio/config.toml`、デバイス上の全 `.kio` の当月合算に適用、既定 $50) が正であり、**folder cap** (`.kio/config.toml`、その `.kio` の当月消費のみに適用) は任意の追加制限。folder cap 未設定なら device cap のみが効く
-- 判定式: scope S の新規タスクを起動できるのは `ledger(S, 当月) + candidate < folder_cap(S)` **かつ** `ledger(device, 当月) + candidate < device_cap` のとき (= effective cap は両者の残余の min。candidate = 起動しようとするタスク自身の予約額)。**candidate = 0 のタスク (単価 0 のローカル LLM — 下記) は cap 判定の対象外として起動できる** (cap は外部支出の上限であり、超過状態でも無償タスクは封鎖しない)。`per_adapter` の下限は **device 層専用** (folder cap は total のみ — folder 側 `[budget.per_adapter]` は定義しない) で、**第三条件として同様に判定する**: `ledger(device, adapter_kind, 当月) + candidate < per_adapter_cap(adapter_kind)` (設定キー名 = adapter_kind と同一 enum: markdownize / embedding。**enum 外の未知キーは schema error** — [10-operations.md §11.3](10-operations.md))。`ledger(...)` は cost_ledger の当月合算 (estimated 行も usd 非 NULL のため数値として効く — §5.8) + 未終端 batch_requests (state 0/1) の `estimated_usd` 合算 (= 予約)。**判定と相 1 の reservation 作成は同一の `BEGIN IMMEDIATE` Tx で行う** (check-then-act の並行超過を防ぐ — cap 超過なら相 1 を作らない)。**sync online 呼出は縮退 2 相に従う**: reservation は cost_ledger ではなく **batch_requests 行**で行う — 相 1 = 行作成 + `estimated_usd` 予約を cap 判定と同一 Tx で (intent_token = attempt token。§5.8 と同じ状態機械の縮約 — upload / job 相は無い)。呼出後、終端 (成功・billable reject・contract reject) の**確定記帳と state=2/3 を同一 Tx** で行い、**cost_ledger へは終端の確定行のみ**を追記する (cost_ledger は追記台帳のため予約 → 確定の書換えはできない — 予約の実体は batch_requests 側が持つ)。複数 external call を行うタスクは request を直列化し、request ごとに新しい相 1 (submission_seq = MAX+1) → 終端を完了してから次の request を開始する (request 単位の冪等記帳 — 並行 request は作らない。課金済み call の盲目再試行を禁止)。**provider request id は応答受信直後・終端 Tx より前に行の `batch_job_id` へ耐久記録する** (下記 DDL — sync 行の照会キー)。**crash 回収** (書き込み系コマンド冒頭 — §5.8 の回復と同時): 残った state 0/1 の `request_kind='sync'` 行は、`batch_job_id` (provider request id) が記録済みで照会可能なら結果を確定し、未記録・照会不能なら unknown として estimated を確定記帳し state=3 で terminal 化する (過大計上を許容 — 未記帳の過少計上より安全側)。**照会で得た応答が §3.2 の正常な制御応答 (`fallback_to_full=true`) だった場合も同節の規則を適用し `outcome='fallback_to_full'` で確定記帳する** (task 非終端 — 通常規則どおり)。なお sync 行の「照会」は provider が request id による結果照会を提供する場合の**任意経路**であり、[07-adapter-spec.md §5.5](07-adapter-spec.md) の Batch trait 契約には含めない — 提供の無い Adapter では常に「照会不能」(unknown 精算) 側で回収する。**`mode=full` の新 request の開始が crash で失われても義務は失われない** — task は非終端のまま残るため、次回の書き込み系実行の task 再検出 (§5.2 末尾 — task テーブル喪失許容と同じ再検出) が §3.1 の mode 選択から再実行する (制御応答は発動条件 5 に不算入のため再び incremental → 再び制御応答となり得るが、その受領は冪等な正常終端であり追加コストは実測 usage 分のみ)。sync 行は §5.8 の job / upload 照合・可視化猶予・回復期限の対象外 (job / upload 相が無い) だが、abandon (同じ intent_token / 4 組指定) は適用できる。**sync 行は provider 側に残骸 (upload / job) を作らないため、全ての終端 Tx (成功・reject・unknown 精算・abandon・fallback_to_full — §3.2) で同一 Tx 内に `intent_token` を NULL 化する** — 「NULL 化は残骸掃除の完了時のみ」(§5.8) は batch 行の規則であり、sync では終端 = 掃除完了である (これが無いと「旧 token の消し込み完了後にのみ再投入可」の順序規範と衝突し、同一タスクキーの再投入が恒久停止する)。複数 request の途中 (前 request 終端済み・次 request 未開始) で crash した場合は、終端済み行 (token NULL) への通常の相 1 (新 token・MAX+1) で次の request から再開する。**crash 回収が確定するのは記帳と state のみ** — 照会で得た出力は persist しない (出力が必要なら新しい相 1 で再実行する。出力を persist する経路は相 3 と同じく persist 直前の tombstone 再検査に従う — [05-runtime.md §3.5](05-runtime.md))
+- 新規requestの予約条件は、当月の確定・推定課金と未終端予約の合計にcandidateを加えた額が、device、folder、device専用per-adapterの全capを下回ること。adapter_kindは`markdownize` / `embedding`の閉enumとし、未知キーはschema errorとする。candidate=0の無償処理はcap判定の対象外。判定と相1の予約は同じ`BEGIN IMMEDIATE` transactionで行う。
+- 同期requestの相1は`batch_requests`に新しいintent token、submission sequence、見積額、開始時刻、stale期限を保存する。この時点以降は送信された可能性がある。予約は一つの実送信の直前に作り、未送信の後続groupを先取りして予約しない。`cost_ledger`は追記専用であり、終端の課金記録とstate更新を同じtransactionで確定する。
+- 成功は報告usageを使い、usageが使えない場合は予約見積を使う。明示的な認証・rate limit・quota拒否は`submit_rejected`、課金0で終端する。再試行が許可される既知の拒否でも、次の実送信には新しいcap判定・予約が必要となる。
+- 同期OCRまたはdocument embeddingの通信結果、応答の受理、ローカル保存を確定できない場合は、見積額を`unknown_settled`として一度精算し、taskを非自動再試行の`result_unknown`にする。保存失敗を一般的なネットワーク再試行へ変換しない。既存の未終端sync行は再送せず、保存されたstale期限に従って回収する。現行Adapterは同期要求の結果を後から取得するAPIを提供していないため、回収から出力の成功を推測しない。
+- `result_unknown`の追加試行は、`kio batch retry --resend-unknown <selector> --yes`で一つのrequest identityを明示承認する。これは送信操作ではなく、現在のscopeに属する対象を再びqueueへ載せる操作である。既存課金を保持し、端末台帳の`unknown_resend_authorized`を一度だけ新しい相1へ消費する。次のonline実行は通常のscope/policy/Adapter承認と予算を再検証する。承認なしのlane切替、task再生成、再起動、月境界でこの制約を迂回できない。unknownと承認待ちのtask行は通常のdevice行剪定で削除しない。
+- Batchは既知のjob/outputを再取得する回復経路を持つ。結果のローカル保存失敗ではjobと予約を保持し、同じoutputを再収集する。新規job作成を結果回収の代わりに行わない。Batchのupload/jobの掃除は§5.8に従う。
+- 同期requestはupload/job残骸を持たず、終端transactionでintent tokenを解放する。解放は未知の結果の再送許可を意味しない。検索queryのdevice行は、利用者が実行する個々の検索の予約として次項の独立したclaim規則に従う。
 - **query embedding request** (vector|hybrid 検索の page 1 — [05-runtime.md §1](05-runtime.md)) は `scope_id = 'device'` (予約値 — scope_id は ULID のため実 scope と衝突しない) の `request_kind='sync'` 行として上記縮退 2 相に載せる。`adapter_kind = 'embedding'`・`input_hash = NFC 正規化した query 文字列の sha256` (query 本文は保存しない — [05-runtime.md §1.5](05-runtime.md) と同じ方針)。folder cap 判定 (scope 別集計) には現れず、device cap / `per_adapter` (embedding) の合算には通常どおり含まれる — 判定式は不変。送信可否の consent gate は [05-runtime.md §1.1](05-runtime.md) / [07-adapter-spec.md §3](07-adapter-spec.md)。**回収と並行 claim**: `kio search` は読み取り系だが ([05-runtime.md §6](05-runtime.md))、vector|hybrid の page 1 に限り device 行の書込主体である。**sync 行は相 1 で `job_create_started_at` に開始時刻を記録し** (batch 行の猶予起点と同じ既存列 — sync では staleness 判定にのみ使う)、**回収の対象は `stale_after_at` (下記 DDL — 相 1 で耐久保存する絶対期限) を過ぎた stale 行に限る**。`stale_after_at` は相 1 Tx で「当該 request に適用する実効 `timeout_seconds` ([07-adapter-spec.md §7](07-adapter-spec.md) `[adapter.policy]` — **device 行では参加 scope の実効値の最大値**) + 60 秒マージン (下限 600 秒)」から算出して保存し、**回収は保存値のみを参照する** — config を後から変更しても、rate_limit の Retry-After 追従 (§5.3 max_attempts=∞) で呼出が長引いても、生存中の呼出を stale と誤認しない (Retry-After を受信した保持プロセスは自 token の CAS UPDATE で `stale_after_at` を **`max(現行値, 現在 + Retry-After + timeout + 60 秒)`** へ延長する — **単調**: 短い Retry-After で期限を縮めない。Retry-After は有限・非負を検証する (**不正値のみ 3600 秒の代替値とし、有効な実値は clamp しない** — 実待機より短い保護期限を作ると、待機中の stale 回収と覚醒後の provider 再呼出という二重呼出窓が再発する)。**延長 UPDATE が 0 行 (= 他プロセスが回収済み) なら claim 喪失として以後の待機・provider 再呼出・記帳を全て中止する** — 下記の状態遷移 CAS 敗者規則と同じ非記帳。累積延長に上限は設けない (§5.3 max_attempts=∞ / Retry-After 追従の設計意図 — 解放の脱出路は `kio batch abandon`))。§5.8 の可視化猶予 (既定 10 分) とは独立の機構である。猶予内の crash 残骸が device cap 予約 (`estimated_usd`) を最大猶予時間保持することは既知の有界挙動として許容する。相 1 の claim に先立ち、**`scope_id='device'` の全 sync stale 行を回収する (同一 4 組 key に限らない — 別 query の crash 残骸も search-only 運用で回収されるように)**。回収は上記 crash 回収と同じ規則で行う (`BEGIN IMMEDIATE` Tx 下。下記剪定と合わせて **1 回の実行あたり合計 256 行を上限とする bounded 処理**とし、**配分と順序を固定する: (1) 自 key (今回 claim する 4 組 key) の stale 行は上限枠外で常に最優先に回収する / (2) 剪定に最低 128 行を保証する / (3) 残余枠を一般 stale 回収に充てる (対象不足の側の未使用枠は相互融通)。各集合の処理・持ち越しの選択順は (sync stale 行 = `job_create_started_at`、terminal 行 = `completed_at`) の昇順 + 4 組 PK の byte 順で完全に決定的とする。残余は次回実行へ持ち越す**。`.kio/.lock` は不要 — device 行はどの scope にも属さず、直列化は cost-ledger 側の Tx が担う。**inline 回収では provider 照会を行わない** — 常に unknown 精算とする (検索応答性の保護。照会つき回収は書き込み系冒頭の crash 回収のみ))。同一 key が stale でない in-flight (他プロセスの生存 claim) のときは当該実行を text fallback (`fallback_reason="embedding_in_flight"` — mode 別の扱いは [05-runtime.md §1.1](05-runtime.md)) に落とし、送信しない (同一 query の並行 claim・token 上書きを作らない)。**device 行の全ての状態遷移 UPDATE (request id 記録・終端) は `WHERE intent_token = <自 token>` の条件付き (CAS) で行う** — 0 行更新 = 他プロセスに回収済みであり、自プロセスは応答・課金のどちらも記帳しない (回収側の unknown 精算が既に確定記帳されており二重計上を作らない。受信済み vector を当該検索の結果に使うことは課金と独立に可)。**terminal device 行の剪定**: `scope_id='device'` ∧ **`state IN (2, 3)`** (成功終端 = state 2 を含む — 含めないと成功 query 行が恒久蓄積する) ∧ `intent_token IS NULL` ∧ **`contract_violation_count = 0`** (「1 回のみ」の durable 判定源を消さない) ∧ `completed_at` が前月以前 (**UTC 暦月** — 当月 UTC 月初の epoch ms 未満。`cost_ledger.month` も `recorded_at` の UTC 暦月から導出する) の行は、書き込み系コマンド冒頭の掃除 (§5.8 の回復と同時) **および `kio search` の inline 回収と同一 Tx** で DELETE してよい (device 行の唯一の作成者は search — search-only の定常運用でも剪定が発火するための併設。**上記 bounded 上限 256 行/回を回収と共有し、超過分は次回へ持ち越す** — 月替わり直後の一括削除で検索応答性 (M3-1) を損なわないための上限)。当月の cap 判定は cost_ledger 合算 + state 0/1 予約のみを参照するため影響せず、確定課金の台帳は cost_ledger 側が恒久保持する (**恒久保持は監査台帳としての既定** — 行数は request 数に比例して増えるが、当月 cap 判定は月次 index (下記 DDL) で有界)。剪定は `submission_seq` の直列化と両立する (通算連番の高水位の正本は cost_ledger — 行の再作成は ledger の MAX から継承するため衝突しない。下記 DDL コメント)。剪定・確定済みの 4 組 key への `kio batch abandon` は**対象なしの冪等成功** (exit 0 + 「対象なし」表示 — [06-cli-spec.md §1](06-cli-spec.md))
-- 累積コストは Adapter 報告値 (input/output token × 単価) を `~/.local/share/kio/cost-ledger.sqlite` (デバイスグローバル 1 個。WAL + busy_timeout — [05-runtime.md §6](05-runtime.md)) に記録する。folder cap の判定はこの ledger の scope 別集計で行う (`.kio` 内に ledger は置かない。cache/truth 規約上、課金台帳はデバイスローカルの運用データであり `.kio` の truth ではないが、**再構築不可のため cache でもない** — [03-data-model.md §4.1](03-data-model.md)。schema が current DDL と不一致の既存 ledger は bytes を保全して fail-closed とする ([10-operations.md §7.5.3](10-operations.md)))
-- store は 3 表で構成し、**以下の DDL を SQL 正本とする**。2 相プロトコルは UNIQUE 制約・単一 Tx・ON CONFLICT 冪等という SQLite の保証を前提に監査された機構であり、append-only JSONL では等価の保証を構成できない。`schema_migrations` は current operational marker 用であり、旧 JSONL + lock 構成の importer / cutover marker は持たない ([10-operations.md §7.5.3](10-operations.md)):
+- 累積コストは Adapter 報告値を device-global `cost-ledger.sqlite` に記録する。これは `.kio` truth でも cache でもない非再構築の運用台帳である。明示 `kio ledger init` だけが完全に空の artifact set を初期化できる。通常は authority / checkpoint / stable lifecycle lock を検証して既存 ledger を開き、欠損・不一致・unknown budget は支出 0 と扱わず paused/unknown とする。ローカル offline 処理は金融行を作らない。central billing の確認済み artifact はこの非知識原則の明示的例外である。
+- store は **4 表**で構成し、以下の DDL を SQL 正本とする。`ledger_metadata` は random ledger_id と era、signed SQLite sequence を保持し、`cost-ledger.sqlite.authority.json` / `cost-ledger.sqlite.checkpoint.json` と同一性・完全一致を要求する。外側の write は checkpoint を fsync してから SQLite `COMMIT` し、失敗後の mismatch は通常処理を拒否する。schema/index の auto-create、repair、`user_version` write-seq は持たない:
 
 ```sql
 CREATE TABLE cost_ledger (               -- 確定・推定課金の追記台帳 (行の UPDATE / DELETE 禁止)
@@ -915,6 +953,13 @@ CREATE TABLE schema_migrations (         -- current operational marker のみ（
     applied_at  INTEGER NOT NULL         -- UTC ミリ秒
 );
 -- 旧 JSONL cutover/import の marker は置かない。
+
+CREATE TABLE ledger_metadata (
+    singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+    ledger_id TEXT NOT NULL,
+    era TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0)
+) WITHOUT ROWID;
 ```
 - いずれかの cap 超過時、走行中タスクは完了させ、新規タスクは `paused` 状態へ。`kio status` は超過した cap の種別 (`device` | `folder`) と scope を表示する
 - configured cap を上げた後は `kio batch resume --recheck-budget` で budget pause を Pending に戻し、**各** markdownize / embedding の新規 reservation 時点で現在の device / folder cap を原子的に再判定する。したがって、新しい cap にも収まらない task は Adapter を呼ばず再び `paused` のままになる。`--recheck-budget` は cap を無視しない。
@@ -925,7 +970,7 @@ CREATE TABLE schema_migrations (         -- current operational marker のみ（
 
 ## 5.5 冪等性
 
-`(input_hash, tool_profile_hash) → output_ref` 一致なら done として短絡 (キャッシュヒット)。これは **first-instance-wins** ([03-data-model.md §6](03-data-model.md), [09-mvp-scope.md §設計宿題](09-mvp-scope.md))。LLM API の二重課金防止は二段構え: sync 呼出は provider が idempotency key を提供する場合にそれを要求し、**Batch 投入 (job 作成に idempotency key の無い provider が現実) は §5.8 の 2 相プロトコルを正本とする**。
+`(input_hash, tool_profile_hash) → output_ref` 一致なら done として短絡 (キャッシュヒット)。これは **first-instance-wins** ([03-data-model.md §6](03-data-model.md), [09-mvp-scope.md §設計宿題](09-mvp-scope.md))。LLM APIの二重課金防止はrequestごとの予約・終端と送信回復で行う。providerのidempotency keyを利用できる場合も、ローカルのintent token自体をproviderの重複排除保証とは扱わない。同期taskの不確定結果は§5.4の明示再試行承認を必要とし、Batch投入と結果回収は§5.8のprotocolに従う。
 
 **embedding の content ベース再利用**: embedding タスクは上記の短絡に加え、対象 chunk の
 `(text_hash, embedding profile_hash, dimensions, distance, modality)` に一致する既存 embedding が
@@ -1012,6 +1057,12 @@ metadata から intent_token 規約に一致する job を全走査すること�
    MAX + 1 へ採番する** (基準 = cost_ledger 同キーの MAX と自行現値の大きい方。同一 attempt の
    回復・再開では変えない。採番を怠ると、次の実課金記帳が旧 attempt の seq と UNIQUE 衝突して
    ON CONFLICT DO NOTHING に黙って吸収される — 行再作成時も同じ規則)
+   recovery scope は [07 §5.5](07-adapter-spec.md) の credential-bound HMAC であり、account ID や
+   credential の環境変数名ではない。client は検証済み credential・origin・qualifier を一度だけ固定する。
+   回復時も記録済み scope の完全一致を先に確認し、不一致・読取不能・欠落なら network effect / settlement /
+   cleanup を行わず reservation と intent を保持する。Gemini は現在 profile と返却 job name / intent display name、
+   Mistral は返却 job ID / intent metadata / task key 4 組も一致するまで state・output を処理しない。
+
 2. **相 2a — upload**: upload の**直前に `provider_scope_id` を行へ記録する** (これから呼び出す
    client instance から取得。相 2b まで遅らせると upload 後のクラッシュで残骸の存在する scope を
    再特定できない)。入力・中間ファイル (JSONL 等) の filename に intent_token を埋め込んで upload し、

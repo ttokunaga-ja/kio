@@ -48,9 +48,10 @@ use serde_json::{Value, json};
 
 use crate::bbox_annotation::{canonical_source_escape, validate_bbox as validate_annotation_bbox};
 use crate::http_policy::{
-    HttpPolicy, HttpResponse, authenticated_agent, read_json_bounded, require_success,
+    HttpPolicy, HttpResponse, authenticated_local_agent, read_json_bounded, require_success,
 };
 use crate::identity::tool_profile_hash;
+use crate::local_peer::{AuthenticatedLocalEndpoint, is_local_peer_tls_error};
 use crate::mistral_ocr::{OcrImage, image_hash};
 use crate::traits::MarkdownizeAdapter;
 use crate::types::{
@@ -80,6 +81,31 @@ pub const LAYOUT_PARSING_RESPONSE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
 /// Per-response cap on persisted image bytes, mirroring the online OCR policy.
 pub const LOCAL_OCR_MAX_PERSISTED_IMAGE_BYTES: usize = 64 * 1024 * 1024;
+
+// Bound bookkeeping even for empty images. Count source entries and Markdown
+// references together; 16,384 leaves room for two figures per maximum-size page.
+const LOCAL_OCR_MAX_IMAGE_ITEMS: usize = 16_384;
+
+struct ImageAdmissionBudget {
+    bytes_remaining: usize,
+    items_remaining: usize,
+}
+
+impl ImageAdmissionBudget {
+    fn charge(&mut self, bytes: usize, items: usize) -> Result<()> {
+        let remaining_bytes = self
+            .bytes_remaining
+            .checked_sub(bytes)
+            .ok_or_else(|| violation("layout-parsing decoded image byte limit exceeded"))?;
+        let remaining_items = self
+            .items_remaining
+            .checked_sub(items)
+            .ok_or_else(|| violation("layout-parsing image item limit exceeded"))?;
+        self.bytes_remaining = remaining_bytes;
+        self.items_remaining = remaining_items;
+        Ok(())
+    }
+}
 
 /// Upper bound on pages accepted from one response, so a malformed or hostile
 /// reply cannot mint unbounded units.
@@ -159,7 +185,7 @@ pub trait LocalOcrClient: Clone {
 /// Talks `POST {base_url}/layout-parsing` to a loopback pipeline service.
 #[derive(Debug, Clone)]
 pub struct EnvLocalOcrClient {
-    base_url: String,
+    endpoint: AuthenticatedLocalEndpoint,
     http_policy: HttpPolicy,
 }
 
@@ -169,9 +195,9 @@ impl EnvLocalOcrClient {
     /// pipeline is the case D7 was written for — a multi-page PDF can occupy
     /// the server for minutes with nothing on the socket.
     #[must_use]
-    pub fn new(base_url: impl Into<String>, timeout_seconds: Option<u64>) -> Self {
+    pub fn new(endpoint: AuthenticatedLocalEndpoint, timeout_seconds: Option<u64>) -> Self {
         Self {
-            base_url: base_url.into(),
+            endpoint,
             http_policy: timeout_seconds
                 .map_or_else(HttpPolicy::default, HttpPolicy::with_timeout_seconds),
         }
@@ -180,12 +206,8 @@ impl EnvLocalOcrClient {
 
 impl LocalOcrClient for EnvLocalOcrClient {
     fn layout_parse(&self, file_base64: &str, file_type: LayoutFileType) -> Result<Value> {
-        let url = format!("{}/layout-parsing", self.base_url.trim_end_matches('/'));
-        // Same reuse of `authenticated_agent` as the local embedding client:
-        // it is taken for its posture — no redirect following, pinned timeouts
-        // — not for its name. A redirect off a loopback origin is precisely
-        // what D1's literal-loopback check must not be talked out of.
-        let response = authenticated_agent(self.http_policy)
+        let url = format!("{}/layout-parsing", self.endpoint.base_url());
+        let response = authenticated_local_agent(&self.endpoint, self.http_policy)?
             .post(&url)
             .send_json(json!({
                 "file": file_base64,
@@ -209,6 +231,11 @@ impl LocalOcrClient for EnvLocalOcrClient {
 /// A local pipeline has no credential and no invoice, so `Auth` and
 /// `QuotaExceeded` cannot arise. A full queue can, and that is a retry.
 fn local_ocr_http_error(error: ureq::Error) -> AdapterError {
+    if is_local_peer_tls_error(&error) {
+        return AdapterError::LocalPeerAuth(format!(
+            "local OCR service TLS authentication failed: {error}"
+        ));
+    }
     AdapterError::Network(format!("local OCR service unreachable: {error}"))
 }
 
@@ -287,6 +314,19 @@ const RECOVERED_BLOCK_LABELS: [&str; 3] = ["header", "footer", "number"];
 /// to the wrong figure is frozen for the life of the archive and can only be
 /// undone by re-running markdownize over everything.
 pub fn parse_layout_parsing(body: &Value) -> Result<Vec<LayoutParsedPage>> {
+    parse_layout_parsing_with_budget(
+        body,
+        ImageAdmissionBudget {
+            bytes_remaining: LOCAL_OCR_MAX_PERSISTED_IMAGE_BYTES,
+            items_remaining: LOCAL_OCR_MAX_IMAGE_ITEMS,
+        },
+    )
+}
+
+fn parse_layout_parsing_with_budget(
+    body: &Value,
+    mut budget: ImageAdmissionBudget,
+) -> Result<Vec<LayoutParsedPage>> {
     // The service answers inside an envelope — `{logId, errorCode, errorMsg,
     // result}` — and the pages live under `result`, not at the top level.
     // Measured 2026-08-02 against paddleocr-vl:latest-nvidia-gpu-offline; the
@@ -326,11 +366,15 @@ pub fn parse_layout_parsing(body: &Value) -> Result<Vec<LayoutParsedPage>> {
     results
         .iter()
         .enumerate()
-        .map(|(index, result)| parse_one_page(index, result))
+        .map(|(index, result)| parse_one_page(index, result, &mut budget))
         .collect()
 }
 
-fn parse_one_page(index: usize, result: &Value) -> Result<LayoutParsedPage> {
+fn parse_one_page(
+    index: usize,
+    result: &Value,
+    budget: &mut ImageAdmissionBudget,
+) -> Result<LayoutParsedPage> {
     let markdown_obj = result
         .get("markdown")
         .and_then(Value::as_object)
@@ -355,28 +399,32 @@ fn parse_one_page(index: usize, result: &Value) -> Result<LayoutParsedPage> {
     // `markdown.images` is a relative-path → bytes map. It is keyed by the path
     // the Markdown refers to, which is what lets a bbox be matched to a figure
     // by name instead of by position.
-    let mut image_bytes: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    // Validate and admit every source entry, including unreferenced images,
+    // before allocating any decoded bytes. Keep only borrowed encoded strings.
+    let mut image_sources = BTreeMap::new();
     if let Some(images) = markdown_obj.get("images").and_then(Value::as_object) {
+        budget.charge(0, images.len())?;
         for (relative_path, encoded) in images {
             let encoded = encoded.as_str().ok_or_else(|| {
                 violation(format!(
                     "page {index} image {relative_path} is not a base64 string"
                 ))
             })?;
-            let bytes = decode_base64(encoded).ok_or_else(|| {
+            let decoded_len = base64_decoded_len(encoded).ok_or_else(|| {
                 violation(format!(
                     "page {index} image {relative_path} is not valid base64"
                 ))
             })?;
-            image_bytes.insert(relative_path.clone(), bytes);
+            budget.charge(decoded_len, 0)?;
+            image_sources.insert(relative_path.as_str(), (encoded, decoded_len, false));
         }
     }
 
     require_layout_parsing_response(index, result)?;
     let blocks = page_blocks(result);
     let markdown = append_recovered_blocks(&markdown, &blocks);
-    let referenced = markdown_image_paths(&markdown);
-    let images = images_with_their_own_boxes(index, &referenced, &image_bytes)?;
+    let referenced = markdown_image_paths_with_budget(&markdown, budget)?;
+    let images = images_with_their_own_boxes(index, &referenced, image_sources, budget)?;
     Ok(LayoutParsedPage {
         index,
         markdown,
@@ -504,7 +552,22 @@ fn require_layout_parsing_response(page_index: usize, result: &Value) -> Result<
 /// Order is what pairs a figure with a box, so this walks the text rather than
 /// reading `markdown.images`' keys — a map is sorted by key, and key order has
 /// nothing to do with where a figure sits on the page.
+#[cfg(test)]
 fn markdown_image_paths(markdown: &str) -> Vec<String> {
+    markdown_image_paths_with_budget(
+        markdown,
+        &mut ImageAdmissionBudget {
+            bytes_remaining: LOCAL_OCR_MAX_PERSISTED_IMAGE_BYTES,
+            items_remaining: LOCAL_OCR_MAX_IMAGE_ITEMS,
+        },
+    )
+    .unwrap()
+}
+
+fn markdown_image_paths_with_budget(
+    markdown: &str,
+    budget: &mut ImageAdmissionBudget,
+) -> Result<Vec<String>> {
     // CommonMark only, because `normalize_html_image_refs` has already run and
     // every figure on this page is in that spelling by now.
     let bytes = markdown.as_bytes();
@@ -521,6 +584,7 @@ fn markdown_image_paths(markdown: &str) -> Vec<String> {
         };
         let target = markdown[target_start..target_start + target_len].trim();
         if !target.is_empty() {
+            budget.charge(0, 1)?;
             paths.push(target.to_owned());
         }
         cursor = target_start + target_len + 1;
@@ -528,7 +592,7 @@ fn markdown_image_paths(markdown: &str) -> Vec<String> {
             break;
         }
     }
-    paths
+    Ok(paths)
 }
 
 /// Rewrite PaddleOCR-VL's HTML figure markup into the CommonMark image form,
@@ -932,12 +996,13 @@ fn attribute_value(
 fn images_with_their_own_boxes(
     page_index: usize,
     referenced: &[String],
-    image_bytes: &BTreeMap<String, Vec<u8>>,
+    mut image_sources: BTreeMap<&str, (&str, usize, bool)>,
+    budget: &mut ImageAdmissionBudget,
 ) -> Result<Vec<OcrImage>> {
     referenced
         .iter()
         .map(|relative_path| {
-            let bytes = image_bytes.get(relative_path).ok_or_else(|| {
+            let (encoded, decoded_len, used) = image_sources.get_mut(relative_path.as_str()).ok_or_else(|| {
                 violation(format!(
                     "page {page_index} Markdown references {relative_path}, which markdown.images \
                      does not carry"
@@ -950,9 +1015,17 @@ fn images_with_their_own_boxes(
                 ))
             })?;
             validate_annotation_bbox(bbox)?;
+            // The source admission covers the first occurrence. Each repeated
+            // reference owns another buffer and must be admitted separately.
+            if *used {
+                budget.charge(*decoded_len, 0)?;
+            }
+            *used = true;
+            let bytes = decode_base64(encoded).ok_or_else(|| violation("invalid admitted base64"))?;
+            let media_type = sniff_media_type(&bytes, relative_path);
             Ok(OcrImage {
-                bytes: bytes.clone(),
-                media_type: sniff_media_type(bytes, relative_path),
+                bytes,
+                media_type,
                 bbox: Some(bbox),
                 confidence: None,
                 // 07 §5.2's bbox_annotation is a Mistral-specific extra prompt
@@ -1011,45 +1084,68 @@ fn sniff_media_type(bytes: &[u8], relative_path: &str) -> String {
     }
 }
 
-/// Minimal standard-alphabet base64 decoder with padding.
-///
-/// Written out rather than pulled in: the crate has no base64 dependency, and
-/// adding one for a 30-line function that only ever reads a service's own
-/// output is not a trade worth making.
-fn decode_base64(encoded: &str) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(encoded.len() / 4 * 3);
-    let mut accumulator = 0_u32;
-    let mut bits = 0_u32;
+/// Exact decoded length, checked without allocating. Whitespace is accepted,
+/// but padding, trailing bits and alphabet must form canonical padded base64.
+/// Data URIs remain unsupported: their punctuation fails alphabet validation.
+/// Counting symbols rather than input bytes prevents whitespace from inflating
+/// the decoder's allocation beyond the admitted decoded-byte count.
+fn base64_decoded_len(encoded: &str) -> Option<usize> {
+    let mut symbols = 0_usize;
     let mut padding = 0_usize;
+    let mut last = 0_u8;
     for byte in encoded.bytes() {
         if byte.is_ascii_whitespace() {
             continue;
         }
         if byte == b'=' {
             padding += 1;
+            if padding > 2 {
+                return None;
+            }
+        } else {
+            if padding != 0 {
+                return None;
+            }
+            last = base64_value(byte)?;
+            symbols = symbols.checked_add(1)?;
+        }
+    }
+    if symbols.checked_add(padding)? % 4 != 0
+        || (padding == 1 && last & 3 != 0)
+        || (padding == 2 && last & 15 != 0)
+    {
+        return None;
+    }
+    symbols.checked_mul(6).map(|bits| bits / 8)
+}
+
+fn base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn decode_base64(encoded: &str) -> Option<Vec<u8>> {
+    let decoded_len = base64_decoded_len(encoded)?;
+    let mut out = Vec::with_capacity(decoded_len);
+    let mut accumulator = 0_u32;
+    let mut bits = 0_u32;
+    for byte in encoded.bytes() {
+        if byte.is_ascii_whitespace() || byte == b'=' {
             continue;
         }
-        if padding > 0 {
-            // Data after padding is malformed, not something to skip past.
-            return None;
-        }
-        let value = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => return None,
-        };
+        let value = base64_value(byte)?;
         accumulator = (accumulator << 6) | u32::from(value);
         bits += 6;
         if bits >= 8 {
             bits -= 8;
             out.push(((accumulator >> bits) & 0xFF) as u8);
         }
-    }
-    if padding > 2 {
-        return None;
     }
     Some(out)
 }
@@ -1219,13 +1315,14 @@ impl<C: LocalOcrClient> MarkdownizeAdapter for LocalOcrMarkdownizeAdapter<C> {
             None => discovered_page_hints(&request.media_type, &request.raw.raw_hash, &pages)?,
         };
 
+        let images_persisted = self.image_store_dir.is_some();
         if let Some(kio_dir) = &self.image_store_dir {
             persist_pages_images(kio_dir, &pages)?;
         }
 
         let updated_units = hints
             .iter()
-            .map(|hint| unit_from_hint(hint, &pages, &self.scope_id))
+            .map(|hint| unit_from_hint(hint, &pages, &self.scope_id, images_persisted))
             .collect::<Result<Vec<_>>>()?;
 
         Ok(MarkdownizeResponse {
@@ -1248,6 +1345,7 @@ fn unit_from_hint(
     hint: &PreparedUnitHint,
     pages: &[LayoutParsedPage],
     scope_id: &str,
+    images_persisted: bool,
 ) -> Result<MarkdownUnit> {
     let page_index = usize::try_from(hint.order)
         .map_err(|_| violation("prepared page order exceeds platform range"))?;
@@ -1275,6 +1373,17 @@ fn unit_from_hint(
         unit_key: hint.unit_key.clone(),
         unit_type: hint.unit_kind,
         markdown,
+        // The layout response's free-form markdown does not establish image
+        // ownership. For persisted pages, hashes are re-derived from decoded
+        // image bytes.
+        owned_image_hashes: if images_persisted {
+            page.images
+                .iter()
+                .map(|image| image_hash(&image.bytes))
+                .collect()
+        } else {
+            Default::default()
+        },
         metadata: page_metadata(&page.images, &page.blocks),
     })
 }
@@ -1616,6 +1725,170 @@ mod tests {
     fn png_base64() -> String {
         // 8-byte PNG signature is enough for the sniffing path.
         encode_base64(b"\x89PNG\r\n\x1a\nrest")
+    }
+
+    fn parse_with_image_limits(
+        body: &Value,
+        bytes: usize,
+        items: usize,
+    ) -> Result<Vec<LayoutParsedPage>> {
+        parse_layout_parsing_with_budget(
+            body,
+            ImageAdmissionBudget {
+                bytes_remaining: bytes,
+                items_remaining: items,
+            },
+        )
+    }
+
+    #[test]
+    fn decoded_image_admission_accepts_exact_limit_and_rejects_one_byte_over() {
+        let body = page_body(
+            "![](imgs/a_box_0_0_1_1.png)",
+            json!({"imgs/a_box_0_0_1_1.png": " YW Jj \n"}),
+            json!([]),
+        );
+        let pages = parse_with_image_limits(&body, 3, 2).unwrap();
+        assert_eq!(pages[0].images[0].bytes, b"abc");
+        let error = parse_with_image_limits(&body, 2, 2)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("decoded image byte limit"), "{error}");
+    }
+
+    #[test]
+    fn decoded_image_admission_is_aggregate_across_pages() {
+        let mut body = page_body(
+            "![](imgs/a_box_0_0_1_1.png)",
+            json!({"imgs/a_box_0_0_1_1.png": "YWI="}),
+            json!([]),
+        );
+        let pages = body["result"]["layoutParsingResults"]
+            .as_array_mut()
+            .unwrap();
+        pages.push(pages[0].clone());
+        assert!(parse_with_image_limits(&body, 4, 4).is_ok());
+        assert!(
+            parse_with_image_limits(&body, 3, 4)
+                .unwrap_err()
+                .to_string()
+                .contains("decoded image byte limit")
+        );
+        assert!(
+            parse_with_image_limits(&body, 4, 3)
+                .unwrap_err()
+                .to_string()
+                .contains("image item limit")
+        );
+    }
+
+    #[test]
+    fn unreferenced_images_are_validated_and_charged() {
+        let body = page_body("text", json!({"unused": "YWJj"}), json!([]));
+        assert!(
+            parse_with_image_limits(&body, 3, 1).unwrap()[0]
+                .images
+                .is_empty()
+        );
+        assert!(
+            parse_with_image_limits(&body, 2, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("decoded image byte limit")
+        );
+        let invalid = page_body("text", json!({"unused": "!!!!"}), json!([]));
+        assert!(
+            parse_with_image_limits(&invalid, 3, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("not valid base64")
+        );
+    }
+
+    #[test]
+    fn repeated_image_references_keep_order_and_charge_each_owned_buffer() {
+        let body = page_body(
+            "![](z_box_1_2_3_4.png) ![](a_box_0_0_1_1.png) ![](z_box_1_2_3_4.png)",
+            json!({"a_box_0_0_1_1.png": "Yg==", "z_box_1_2_3_4.png": "YWE="}),
+            json!([]),
+        );
+        let pages = parse_with_image_limits(&body, 5, 5).unwrap();
+        let images = &pages[0].images;
+        assert_eq!(images.len(), 3);
+        assert_eq!(images[0].bytes, b"aa");
+        assert_eq!(images[1].bytes, b"b");
+        assert_eq!(images[0], images[2]);
+        assert_eq!(images[0].bbox, Some([1, 2, 3, 4]));
+        assert!(
+            parse_with_image_limits(&body, 4, 5)
+                .unwrap_err()
+                .to_string()
+                .contains("decoded image byte limit")
+        );
+        assert!(
+            parse_with_image_limits(&body, 5, 4)
+                .unwrap_err()
+                .to_string()
+                .contains("image item limit")
+        );
+    }
+
+    #[test]
+    fn empty_images_still_consume_admission_items() {
+        let body = page_body("text", json!({"a": "", "b": ""}), json!([]));
+        assert!(parse_with_image_limits(&body, 0, 2).is_ok());
+        assert!(
+            parse_with_image_limits(&body, 0, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("image item limit")
+        );
+    }
+
+    #[test]
+    fn base64_admission_checks_padding_trailing_bits_and_data_uris() {
+        for (encoded, len) in [
+            ("", 0),
+            ("YQ==", 1),
+            ("YWI=", 2),
+            ("YWJj", 3),
+            (" Y Q = = \n", 1),
+        ] {
+            assert_eq!(base64_decoded_len(encoded), Some(len), "{encoded:?}");
+            let bytes = decode_base64(encoded).unwrap();
+            assert_eq!(bytes.len(), len);
+            assert_eq!(bytes.capacity(), len);
+        }
+        for encoded in [
+            "=",
+            "==",
+            "====",
+            "Y",
+            "YQ",
+            "YQ=",
+            "YWJj=",
+            "YQ===",
+            "YR==",
+            "YWJ=",
+            "YQ==YQ==",
+            "!!!!",
+            "data:image/png;base64,YQ==",
+        ] {
+            assert_eq!(base64_decoded_len(encoded), None, "{encoded:?}");
+            assert!(decode_base64(encoded).is_none(), "{encoded:?}");
+        }
+    }
+
+    #[test]
+    fn image_admission_budget_underflow_is_rejected_without_mutation() {
+        let mut budget = ImageAdmissionBudget {
+            bytes_remaining: 1,
+            items_remaining: 1,
+        };
+        assert!(budget.charge(usize::MAX, 0).is_err());
+        assert!(budget.charge(1, usize::MAX).is_err());
+        assert_eq!(budget.bytes_remaining, 1);
+        assert_eq!(budget.items_remaining, 1);
     }
 
     #[test]

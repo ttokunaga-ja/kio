@@ -101,12 +101,33 @@ fn init(dir: &TempDir) {
     kio(dir, &["init"]).assert().success();
 }
 
+/// Paid-provider assertions must exercise a real initialized device ledger;
+/// absence is tested separately as an explicit hold, never as a zero-cost path.
+fn init_paid(dir: &TempDir) {
+    kio(dir, &["ledger", "init"]).assert().success();
+}
+
 fn scope_json(dir: &TempDir) -> Value {
     serde_json::from_str(&fs::read_to_string(dir.path().join(".kio/scope.json")).unwrap()).unwrap()
 }
 
 fn registry_path(dir: &TempDir) -> std::path::PathBuf {
     dir.path().join(".test-data/kio/scope-registry.sqlite")
+}
+
+fn ledger_row_counts(dir: &TempDir) -> (i64, i64) {
+    let conn = rusqlite::Connection::open_with_flags(
+        dir.path().join(".test-data/kio/cost-ledger.sqlite"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let requests = conn
+        .query_row("SELECT COUNT(*) FROM batch_requests", [], |row| row.get(0))
+        .unwrap();
+    let charges = conn
+        .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row.get(0))
+        .unwrap();
+    (requests, charges)
 }
 
 // ===========================================================================
@@ -123,7 +144,7 @@ fn qa1_qa4_status_reports_budget_paused_task_with_hold_reason() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
     let status = json_success(&dir, &["status"]);
     let breakdown = &status["paused_by_hold_reason"];
     for reason in ["budget", "auth", "tier_b_approval"] {
@@ -156,6 +177,15 @@ fn run_markdownize_seam(
     serde_json::from_slice(&output).unwrap_or(Value::Null)
 }
 
+fn approve_markdownize(dir: &TempDir, seam: &str) -> Value {
+    run_markdownize_seam(
+        dir,
+        seam,
+        None,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+    )
+}
+
 /// The embedding-seam analog of [`run_markdownize_seam`] (QA3's embedding twin).
 fn run_embedding_seam(dir: &TempDir, seam: &str, fixed_now: Option<&str>, args: &[&str]) -> Value {
     let mut command = kio(dir, args);
@@ -165,6 +195,15 @@ fn run_embedding_seam(dir: &TempDir, seam: &str, fixed_now: Option<&str>, args: 
     }
     let output = command.arg("--json").assert().get_output().stdout.clone();
     serde_json::from_slice(&output).unwrap_or(Value::Null)
+}
+
+fn approve_embedding(dir: &TempDir, seam: &str) -> Value {
+    run_embedding_seam(
+        dir,
+        seam,
+        None,
+        &["adapter", "approve", "gemini_embedding_2", "--yes"],
+    )
 }
 
 /// The online-OCR markdownize task — distinguished from the LOCAL deterministic
@@ -200,7 +239,9 @@ fn qa2_auth_error_send_lands_paused_hold_reason_auth() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello qa2"])).unwrap();
     init(&dir);
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    init_paid(&dir);
+    approve_markdownize(&dir, "mock");
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
 
     kio(&dir, &["batch", "resume"])
         .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "auth_error")
@@ -248,7 +289,9 @@ fn qa3_rate_limit_send_stays_pending_with_retry_after() {
     )
     .unwrap();
     init(&dir);
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    init_paid(&dir);
+    approve_markdownize(&dir, "mock");
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
 
     kio(&dir, &["batch", "resume"])
         .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "rate_limit_after")
@@ -297,7 +340,9 @@ fn qa3_rate_limit_headerless_uses_synthetic_backoff() {
     )
     .unwrap();
     init(&dir);
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    init_paid(&dir);
+    approve_markdownize(&dir, "mock");
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
 
     kio(&dir, &["batch", "resume"])
         .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "rate_limit")
@@ -333,11 +378,13 @@ fn qa3_embedding_rate_limit_pending_and_gated() {
     )
     .unwrap();
     init(&dir);
+    init_paid(&dir);
+    approve_embedding(&dir, "rate_limit_after");
     run_embedding_seam(
         &dir,
         "rate_limit_after",
         Some("2026-07-03T00:00:00Z"),
-        &["index", "--approve"],
+        &["index"],
     );
 
     let status = run_embedding_seam(&dir, "mock", None, &["status"]);
@@ -394,10 +441,10 @@ fn qa3_embedding_rate_limit_pending_and_gated() {
 // ===========================================================================
 
 /// QA5: `.kio/scope.json` carries a `scan_approval` key (distinct from the
-/// adapter-level `approvals.jsonl`) after `kio index --approve`, with the 10
+/// adapter-level grants) after `kio index --yes`, with the 10
 /// §1 L101-113 required fields.
 #[test]
-fn qa5_scope_json_records_scan_approval_after_index_approve() {
+fn qa5_scope_json_records_scan_approval_after_index_yes() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
@@ -406,11 +453,11 @@ fn qa5_scope_json_records_scan_approval_after_index_approve() {
         "scan_approval must not exist before any approval"
     );
 
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
     let scope = scope_json(&dir);
     let scan_approval = scope
         .get("scan_approval")
-        .expect("scan_approval must exist after `index --approve`");
+        .expect("scan_approval must exist after `index --yes`");
     for field in [
         "scope_id",
         "root_path",
@@ -429,25 +476,25 @@ fn qa5_scope_json_records_scan_approval_after_index_approve() {
             "scan_approval missing required field {field}: {scan_approval}"
         );
     }
-    assert_eq!(scan_approval["approval_method"], "approve");
+    assert_eq!(scan_approval["approval_method"], "yes");
     assert_eq!(scan_approval["scope_id"], scope["scope_id"]);
 }
 
-/// QA5 (idempotency): a second `index --approve` does not overwrite the
+/// QA5 (idempotency): a second `index --yes` does not overwrite the
 /// original scan_approval (scope-level approval is recorded once).
 #[test]
 fn qa5_scan_approval_is_recorded_once_not_per_index_run() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
     let first_approved_at = scope_json(&dir)["scan_approval"]["approved_at"]
         .as_str()
         .unwrap()
         .to_owned();
 
     fs::write(dir.path().join("b.md"), "# Doc2\n\nmore text.\n").unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
     let second_approved_at = scope_json(&dir)["scan_approval"]["approved_at"]
         .as_str()
         .unwrap()
@@ -469,7 +516,7 @@ fn qa7_effective_ignore_hash_is_derived_from_real_pattern_content() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
     let scope = scope_json(&dir);
     let hash = scope["scan_approval"]["effective_ignore_hash"]
         .as_str()
@@ -513,7 +560,7 @@ fn qa11_status_budget_report_has_no_folder_per_adapter_key() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
     let status = json_success(&dir, &["status"]);
     let budget = &status["budget"];
     assert!(budget.get("device_per_adapter").is_some());
@@ -540,9 +587,11 @@ fn qa13_sync_send_threads_intent_token_to_adapter() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello qa13"])).unwrap();
     init(&dir);
+    init_paid(&dir);
+    approve_markdownize(&dir, "mock");
     // R14-2: the online markdownize send is deferred — `index --approve`
     // only enqueues it (mirrors QA2/QA3's two-step flow above).
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
 
     let resumed = run_markdownize_seam(
         &dir,
@@ -574,12 +623,9 @@ fn qa13_embedding_sync_send_threads_intent_token_to_adapter() {
     )
     .unwrap();
     init(&dir);
-    run_embedding_seam(
-        &dir,
-        "require_idempotency_token",
-        None,
-        &["index", "--approve"],
-    );
+    init_paid(&dir);
+    approve_embedding(&dir, "require_idempotency_token");
+    run_embedding_seam(&dir, "require_idempotency_token", None, &["index"]);
 
     let status = run_embedding_seam(&dir, "mock", None, &["status"]);
     let embedding_tasks: Vec<&Value> = status["tasks"]
@@ -679,7 +725,7 @@ fn qa19_scan_approval_estimated_markdownize_usd_reflects_declared_pricing() {
     // No `--online`: the online OCR task is enqueued Pending, never sent —
     // this proves the PREVIEW estimate is wired, independent of any real
     // network call.
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
     let scope = scope_json(&dir);
     let estimated_markdownize_usd = scope["scan_approval"]["estimated_markdownize_usd"]
         .as_f64()
@@ -828,28 +874,43 @@ fn make_registry_duplicate(dir_a: &TempDir, scope_id: &str) -> TempDir {
     dir_b
 }
 
-/// QA67 (+ QA66 as a consequence — both write paths share the
-/// `reserve_or_reuse_task_charge`/`record_free_local_charge` choke point):
-/// online task phase 1 (and, transitively, `kio index`'s free-local-baseline
-/// bookkeeping through the same functions) must fail-close
-/// (`KIO-E-REGISTRY-DUP-001`) on a live registry scope_id duplicate, instead
-/// of writing a device-global `batch_requests`/`cost_ledger` row two clones
-/// could collide on.
+/// QA66/67: an online task's phase-1 reservation must fail closed on a live
+/// registry scope-id duplicate, before a device-global ledger row or provider
+/// call can be made. Offline local indexing has no reservation and therefore
+/// cannot exercise this guard.
 #[test]
-fn qa66_qa67_index_fails_closed_on_registry_duplicate_before_charging() {
+fn qa66_qa67_online_reservation_fails_closed_on_registry_duplicate() {
     let dir_a = tempfile::tempdir().unwrap();
-    fs::write(dir_a.path().join("seed.md"), "# Seed\n\nSeed body.\n").unwrap();
+    fs::write(dir_a.path().join("seed.pdf"), fake_pdf(&["seed"])).unwrap();
     kio(&dir_a, &["init"]).assert().success();
-    json_success(&dir_a, &["index", "--offline", "--approve"]);
+    init_paid(&dir_a);
+    approve_markdownize(&dir_a, "mock");
+    run_markdownize_seam(&dir_a, "mock", None, &["index"]);
+    let before_status = run_markdownize_seam(&dir_a, "mock", None, &["status"]);
+    let before_task = online_markdownize_task(&before_status);
+    assert_eq!(before_task["status"], "pending", "{before_status}");
     let scope_id = scope_json(&dir_a)["scope_id"].as_str().unwrap().to_owned();
     let _dir_b = make_registry_duplicate(&dir_a, &scope_id);
+    let before_ledger = ledger_row_counts(&dir_a);
 
-    fs::write(dir_a.path().join("more.md"), "# More\n\nMore body.\n").unwrap();
     // `registry_duplicate_error` uses `ExitCode::PermanentFailure` (4) — this
-    // scenario has no partial success to report (the only new file this pass
-    // never reaches a charge decision at all).
-    let err = json_failure(&dir_a, &["index", "--offline", "--approve"], 4);
+    // existing pending task must never reach either reservation or the mock
+    // adapter. `auth_error` would pause the task if the provider boundary ran.
+    let stderr = kio(&dir_a, &["batch", "resume"])
+        .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "auth_error")
+        .arg("--json")
+        .assert()
+        .code(4)
+        .get_output()
+        .stderr
+        .clone();
+    let err: Value = serde_json::from_slice(&stderr).unwrap();
     assert_eq!(err["error_code"], "KIO-E-REGISTRY-DUP-001");
+    assert_eq!(ledger_row_counts(&dir_a), before_ledger);
+    let after_status = run_markdownize_seam(&dir_a, "mock", None, &["status"]);
+    let after_task = online_markdownize_task(&after_status);
+    assert_eq!(after_task["status"], "pending", "{after_status}");
+    assert_eq!(after_task["attempts"], before_task["attempts"]);
 }
 
 /// QA68 [regression-lock]: the read-only registry-dup check
@@ -865,7 +926,7 @@ fn qa68_evidence_verify_still_fails_closed_on_registry_duplicate() {
     )
     .unwrap();
     kio(&dir_a, &["init"]).assert().success();
-    json_success(&dir_a, &["index", "--offline", "--approve"]);
+    json_success(&dir_a, &["index", "--offline"]);
     let search = json_success(&dir_a, &["search", "3600", "--mode", "text"]);
     let pointer = search["results"][0]["evidence_pointer"].clone();
     let scope_id = scope_json(&dir_a)["scope_id"].as_str().unwrap().to_owned();
@@ -921,13 +982,9 @@ fn fake_pdf(pages: &[&str]) -> String {
     out
 }
 
-/// The SCOPE-local `.kio/config.toml` — 07 §3's (b) path for both the
-/// steady-state gate's positive condition and the "初回 materialize"
-/// trigger (2026-07-22 ruling: NOT the device-global
-/// `~/.config/kio/config.toml` — a crafted `.kio` can ship the
-/// `approvals[]` row directly regardless of which file gates materialize,
-/// so keying the trigger off device-global buys no real defense while
-/// breaking the spec's documented scope-local UX).
+/// The SCOPE-local `.kio/config.toml` carries the persistent policy half of
+/// the network gate. It is necessary but never sufficient: a matching,
+/// explicit approval record is also required.
 fn write_scope_allow_network_true(dir: &TempDir) {
     fs::write(
         dir.path().join(".kio/config.toml"),
@@ -936,65 +993,53 @@ fn write_scope_allow_network_true(dir: &TempDir) {
     .unwrap();
 }
 
-/// QA21 (step4b-contract-tests-p3a.md §G, 07-adapter-spec.md §3 L106-112/
-/// 176-190): the "初回 materialize" exception — a SCOPE-local `.kio/
-/// config.toml` `allow_network = true` pre-set BEFORE any approval has ever
-/// run for this scope auto-materializes exactly the scope's first-ever
-/// tool_id (proving the exception exists and fires) — but a second,
-/// otherwise-identical scope whose `approvals_initialized` marker is
-/// already `true` (with `approvals` empty — e.g. after a revoke or a lossy
-/// backup restore) stays CLOSED under the exact same boolean, proving the
-/// AND-gate really requires the row (the exception is genuinely a one-time,
-/// consumable allowance, not just the boolean reasserting itself as an
-/// OR-bypass).
+/// QA21: setting `allow_network = true` alone never materializes consent.
+/// A non-approval index invocation is read-only with respect to the portable
+/// policy and approval state; the existing explicit `--approve` flow is the
+/// positive control that creates the active record.
 #[test]
-fn qa21_initial_materialize_fires_once_then_and_gate_stays_closed_after_consumption() {
-    let dir_fresh = tempfile::tempdir().unwrap();
-    fs::write(dir_fresh.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
-    init(&dir_fresh);
-    write_scope_allow_network_true(&dir_fresh);
+fn qa21_config_only_requires_explicit_approval_and_read_gate_is_immutable() {
+    let dir = tempfile::tempdir().unwrap();
+    fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
+    init(&dir);
+    // `--yes` records a local scan grant. Establish it before capturing the
+    // external-consent state, then exercise the read gate without an approval
+    // flag so whole-state equality has a precise meaning.
+    json_success(&dir, &["index", "--yes"]);
+    write_scope_allow_network_true(&dir);
+    let scope_path = dir.path().join(".kio/scope.json");
+    let config_path = dir.path().join(".kio/config.toml");
+    let before_scope = fs::read(&scope_path).unwrap();
+    let before_config = fs::read(&config_path).unwrap();
 
-    let output = json_success(&dir_fresh, &["index", "--yes"]);
+    let output = json_success(&dir, &["index"]);
     assert_eq!(
-        output["network_opt_in"], true,
-        "materialize must open the scope's first-ever tool: {output}"
+        output["network_opt_in"], false,
+        "policy alone must not create or activate consent: {output}"
     );
-    let scope = scope_json(&dir_fresh);
+    assert_eq!(fs::read(&scope_path).unwrap(), before_scope);
+    assert_eq!(fs::read(&config_path).unwrap(), before_config);
+    assert!(
+        scope_json(&dir).get("approvals").is_none(),
+        "read-only policy evaluation must not materialize an approval"
+    );
+
+    json_success(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+    );
+    let explicit = json_success(&dir, &["index"]);
+    assert_eq!(explicit["network_opt_in"], true, "{explicit}");
+    let scope = scope_json(&dir);
     let approvals = scope["approvals"]
         .as_array()
-        .expect("approvals[] must exist after materialize");
+        .expect("approvals[] must exist after explicit approval");
     assert_eq!(approvals.len(), 1);
     assert_eq!(approvals[0]["status"], "active");
-    assert_eq!(approvals[0]["approval_method"], "materialize");
+    assert_eq!(approvals[0]["approval_method"], "approve");
     assert_eq!(approvals[0]["execution_mode"], "online_api");
     assert_eq!(approvals[0]["scope_id"], scope["scope_id"]);
     assert_eq!(scope["approvals_initialized"], true);
-
-    // Second scope: same scope-local boolean, but the exception is already
-    // consumed (marker true, no rows) — the AND-gate must stay closed
-    // instead of the boolean alone reopening it.
-    let dir_consumed = tempfile::tempdir().unwrap();
-    fs::write(dir_consumed.path().join("b.pdf"), fake_pdf(&["hello"])).unwrap();
-    init(&dir_consumed);
-    write_scope_allow_network_true(&dir_consumed);
-    let mut scope_consumed = scope_json(&dir_consumed);
-    scope_consumed["approvals_initialized"] = json!(true);
-    fs::write(
-        dir_consumed.path().join(".kio/scope.json"),
-        serde_json::to_vec_pretty(&scope_consumed).unwrap(),
-    )
-    .unwrap();
-
-    let output_consumed = json_success(&dir_consumed, &["index", "--yes"]);
-    assert_eq!(
-        output_consumed["network_opt_in"], false,
-        "boolean alone must not reopen a consumed initial-materialize exception: {output_consumed}"
-    );
-    assert!(
-        scope_json(&dir_consumed).get("approvals").is_none(),
-        "a closed gate must not have materialized a row: {}",
-        scope_json(&dir_consumed)
-    );
 }
 
 /// QA22 (step4b-contract-tests-p3a.md §G, 07 §3 L148-168, 10 §11.3): the
@@ -1014,7 +1059,11 @@ fn qa22_approval_row_is_stored_in_scope_json_approvals_not_a_device_global_file(
         "no approvals[] before any approve"
     );
 
-    json_success(&dir, &["index", "--approve"]);
+    json_success(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+    );
+    json_success(&dir, &["index"]);
     let scope = scope_json(&dir);
     let approvals = scope["approvals"]
         .as_array()
@@ -1052,8 +1101,7 @@ fn qa22_approval_row_is_stored_in_scope_json_approvals_not_a_device_global_file(
 /// QA25 (step4b-contract-tests-p3a.md §H, 07 §3 L134-136): `kio adapter
 /// revoke <tool_id>` with nothing ever approved is an idempotent success
 /// (exit 0, "no_target") that does NOT write the `approvals_initialized`
-/// marker — an unused scope's initial-materialize exception must not be
-/// consumed by a no-op revoke.
+/// marker — a no-op revoke must not alter portable consent state.
 #[test]
 fn qa25_revoke_with_nothing_approved_is_idempotent_no_target() {
     let dir = tempfile::tempdir().unwrap();
@@ -1075,7 +1123,11 @@ fn qa25_revoke_single_tool_id_flips_status_without_deleting_row() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
     init(&dir);
-    json_success(&dir, &["index", "--approve"]);
+    json_success(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+    );
+    json_success(&dir, &["index"]);
     let tool_id = scope_json(&dir)["approvals"][0]["tool_id"]
         .as_str()
         .unwrap()
@@ -1112,7 +1164,11 @@ fn qa25_revoke_all_revokes_every_row_without_touching_allow_network_boolean() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
     init(&dir);
-    json_success(&dir, &["index", "--approve"]);
+    json_success(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+    );
+    json_success(&dir, &["index"]);
     fs::write(
         dir.path().join(".kio/config.toml"),
         "[adapter.policy]\nallow_network = true\n",
@@ -1264,33 +1320,27 @@ fn setup_pending_mock_embedding_scope() -> TempDir {
         .args(["init"])
         .assert()
         .success();
-    // `--offline` leaves the embedding task enqueued-but-Pending even though
-    // `--approve` publishes an `active` `approvals[]` row for it (the mock
-    // embedding adapter counts as "active", 07 §2.1) — `write_approval_record`
-    // is not gated on `--offline`.
-    mock_embed_command(&dir, &["index", "--approve", "--offline"])
+    kio(&dir, &["ledger", "init"]).assert().success();
+    // Explicit adapter approvals establish the paired device grants; offline
+    // indexing then leaves the embedding task enqueued-but-Pending.
+    mock_embed_command(&dir, &["adapter", "approve", "gemini_embedding_2", "--yes"])
         .assert()
         .success();
-    let mut scope = scope_json(&dir);
-    let approvals = scope["approvals"].as_array_mut().expect("approvals[]");
+    mock_embed_command(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+    )
+    .assert()
+    .success();
+    mock_embed_command(&dir, &["index", "--offline"])
+        .assert()
+        .success();
+    let scope = scope_json(&dir);
+    let approvals = scope["approvals"].as_array().expect("approvals[]");
     assert!(
         approvals.len() >= 2,
         "expected markdownize + mock embedding rows: {approvals:?}"
     );
-    // Go stale on every row's `tool_profile_hash` (the markdownize row is
-    // irrelevant here — `a.md` is text-native, so no online markdownize
-    // task exists to accidentally re-enable) so the exact-match steady
-    // -state gate closes while `--online`'s coarser, tool_id-only fallback
-    // still finds an active row.
-    for row in approvals.iter_mut() {
-        row["tool_profile_hash"] = json!(format!("sha256:{}", "0".repeat(64)));
-    }
-    fs::write(
-        dir.path().join(".kio/scope.json"),
-        serde_json::to_vec_pretty(&scope).unwrap(),
-    )
-    .unwrap();
-
     let baseline = mock_embed_json(&dir, &["status"]);
     assert!(
         baseline["tasks"]
@@ -1334,7 +1384,7 @@ fn qa29_repair_rebuild_db_online_reaches_the_post_rebuild_enrichment() {
 
     // Without --online, the gate stays closed (key loss) and rebuild-db's
     // enrichment pass sends nothing.
-    let without_online = mock_embed_json(&dir, &["repair", "rebuild-db"]);
+    let without_online = mock_embed_json(&dir, &["repair", "rebuild-db", "--offline"]);
     assert_eq!(
         without_online["embedding_tasks_executed"], 0,
         "no --online: nothing should send: {without_online}"
@@ -1356,7 +1406,7 @@ fn qa29_repair_rebuild_db_online_reaches_the_post_rebuild_enrichment() {
 fn qa30_batch_resume_online_reaches_the_embedding_enrichment_pass() {
     let dir = setup_pending_mock_embedding_scope();
 
-    let without_online = mock_embed_json(&dir, &["batch", "resume"]);
+    let without_online = mock_embed_json(&dir, &["batch", "resume", "--offline"]);
     assert_eq!(
         without_online["tasks_executed"], 0,
         "no --online: nothing should send: {without_online}"
@@ -1409,7 +1459,10 @@ fn qa31_reindex_force_online_reaches_the_embedding_enrichment_pass() {
     // generations' worth of Pending embedding tasks for the second call to
     // pick up, confounding the count.
     let dir_without = setup_pending_mock_embedding_scope();
-    let without_online = mock_embed_json(&dir_without, &["reindex", "--regenerate", "--yes"]);
+    let without_online = mock_embed_json(
+        &dir_without,
+        &["reindex", "--regenerate", "--yes", "--offline"],
+    );
     assert_eq!(
         without_online["embedding_tasks_executed"], 0,
         "no --online: nothing should send: {without_online}"
@@ -1434,7 +1487,7 @@ fn qa31_reindex_at_online_flag_is_accepted_not_a_usage_error() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# Doc\n\nbody text.\n").unwrap();
     init(&dir);
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
     let log = json_success(&dir, &["log"]);
     let head_commit = log["commits"][0]["commit_hash"]
         .as_str()

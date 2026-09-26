@@ -118,6 +118,18 @@ fn tasks_of_type<'a>(status: &'a Value, kind: &str) -> Vec<&'a Value> {
         .collect()
 }
 
+fn active_permitted_grant(status: &Value, tool_id: &str) -> bool {
+    let active = status["grants"].as_array().is_some_and(|grants| {
+        grants
+            .iter()
+            .any(|grant| grant["state"] == "active" && grant["binding"]["tool_id"] == tool_id)
+    });
+    active
+        && status["effective"]
+            .as_array()
+            .is_some_and(|effective| effective.iter().any(|grant| grant["permitted"] == true))
+}
+
 #[test]
 fn cand_069_inline_pointer_rejects_malformed_hash_before_resolution() {
     let temp = tempfile::tempdir().unwrap();
@@ -131,7 +143,7 @@ fn cand_069_inline_pointer_rejects_malformed_hash_before_resolution() {
     .unwrap();
 
     init_scope(&scope, &xdg);
-    json_success(&scope, &xdg, &["index", "--approve"]);
+    json_success(&scope, &xdg, &["index"]);
     let search = json_success(&scope, &xdg, &["search", "alphaunique"]);
     let pointer = first_search_result(&search)["evidence_pointer"].clone();
 
@@ -181,13 +193,37 @@ fn cand_025_portable_approvals_do_not_grant_new_root_but_local_approval_does() {
 
     init_scope(&approved, &xdg);
     init_scope(&copied, &xdg);
-    let approved_index = json_success_embed(&approved, &xdg, &["index", "--approve"]);
-    assert_eq!(approved_index["network_opt_in"], true);
+    json_success(&approved, &xdg, &["ledger", "init"]);
+    json_success_embed(
+        &approved,
+        &xdg,
+        &["adapter", "approve", "gemini_embedding_2", "--yes"],
+    );
+    let approved_status = json_success_embed(
+        &approved,
+        &xdg,
+        &["adapter", "status", "gemini_embedding_2"],
+    );
+    assert!(
+        active_permitted_grant(&approved_status, "gemini_embedding_2"),
+        "explicit source approval must permit the embedding adapter: {approved_status}"
+    );
 
-    let portable_approvals = fs::read_to_string(approved.join(".kio/approvals.jsonl")).unwrap();
-    fs::write(copied.join(".kio/approvals.jsonl"), portable_approvals).unwrap();
+    // Scope approval references are portable audit data, while the matching
+    // authenticated device grant remains bound to the original root. Copy the
+    // portable row only to prove that it cannot authorize this new root.
+    let approved_scope: Value =
+        serde_json::from_slice(&fs::read(approved.join(".kio/scope.json")).unwrap()).unwrap();
+    let mut copied_scope: Value =
+        serde_json::from_slice(&fs::read(copied.join(".kio/scope.json")).unwrap()).unwrap();
+    copied_scope["approvals"] = approved_scope["approvals"].clone();
+    fs::write(
+        copied.join(".kio/scope.json"),
+        serde_json::to_vec_pretty(&copied_scope).unwrap(),
+    )
+    .unwrap();
 
-    let copied_without_local = json_success_embed(&copied, &xdg, &["index", "--yes"]);
+    let copied_without_local = json_success_embed(&copied, &xdg, &["index"]);
     assert_eq!(copied_without_local["network_allowed"], false);
     assert_eq!(copied_without_local["network_opt_in"], false);
     let status = json_success_embed(&copied, &xdg, &["status"]);
@@ -203,8 +239,18 @@ fn cand_025_portable_approvals_do_not_grant_new_root_but_local_approval_does() {
         "copied portable approvals must not execute embedding: {status}"
     );
 
-    let copied_with_local = json_success_embed(&copied, &xdg, &["index", "--approve"]);
-    assert_eq!(copied_with_local["network_opt_in"], true);
+    json_success_embed(
+        &copied,
+        &xdg,
+        &["adapter", "approve", "gemini_embedding_2", "--yes"],
+    );
+    let copied_approval_status =
+        json_success_embed(&copied, &xdg, &["adapter", "status", "gemini_embedding_2"]);
+    assert!(
+        active_permitted_grant(&copied_approval_status, "gemini_embedding_2"),
+        "explicit local approval must permit the copied root: {copied_approval_status}"
+    );
+    json_success_embed(&copied, &xdg, &["index"]);
     let status = json_success_embed(&copied, &xdg, &["status"]);
     let embedding = tasks_of_type(&status, "embedding");
     assert!(

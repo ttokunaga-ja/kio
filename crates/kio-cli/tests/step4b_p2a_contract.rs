@@ -1,4 +1,4 @@
-//! Step4b Phase 2-A contract tests: `open` image cache / `restore` safety
+//! Step4b Phase 2-A contract tests: `open` image cache / `export` safety
 //! and evacuation protocol / `purge` scope and closure completion.
 //!
 //! Source: `tasks/step4b-contract-tests-p2a.md` (PA01-PA50, §R rulings 1-3).
@@ -10,9 +10,13 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use kio_core::cas::{ContentObjectKind, ObjectKind, ObjectStore, fanout_path, hash_bytes};
+use kio_core::dag::{CommitObject, CommitStats, CommitType, TreeObject, build_tree};
 use kio_core::purge::{PurgeReason, PurgeState};
 use kio_core::scope::Repository;
-use kio_pipeline::markdownize::{load_validated_normalized_instance, persist_normalized_instance};
+use kio_pipeline::markdownize::{
+    NormalizedInstanceManifest, NormalizedUnitObject, load_validated_normalized_instance,
+    persist_normalized_instance,
+};
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -92,7 +96,7 @@ fn indexed_fixture() -> IndexedFixture {
     )
     .unwrap();
     json_success(&dir, &["init"]);
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
     let search = json_success(&dir, &["search", "needle-p2a-content", "--mode", "text"]);
     let pointer = search["results"][0]["evidence_pointer"].clone();
     IndexedFixture {
@@ -114,6 +118,53 @@ fn current_raw_for(dir: &TempDir, path: &str) -> String {
         .find(|entry| entry.path == path)
         .unwrap()
         .raw_hash
+}
+
+/// Publish a fixture mutation through the same immutable tree edge that the
+/// object-URI authority check traverses. The mutable normalized-instance view
+/// alone is deliberately not authority for local image objects.
+fn persist_and_pin_normalized_instance(
+    repo: &Repository,
+    parent_hash: String,
+    mut tree: TreeObject,
+    raw_hash: &str,
+    manifest: &NormalizedInstanceManifest,
+    units: &[NormalizedUnitObject],
+) {
+    let persisted = persist_normalized_instance(repo.kio_dir(), manifest, units).unwrap();
+    let manifest_hash =
+        kio_core::cas::hash_json(&serde_json::to_value(&persisted).unwrap()).unwrap();
+    tree.entries
+        .iter_mut()
+        .find(|entry| entry.raw_hash == raw_hash)
+        .and_then(|entry| entry.normalize.as_mut())
+        .unwrap()
+        .manifest_hash = manifest_hash;
+
+    let tree = build_tree(tree.entries).unwrap();
+    let store = ObjectStore::new(repo.kio_dir());
+    let (tree_hash, _) = store
+        .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
+        .unwrap();
+    let parent = repo.read_commit(&parent_hash).unwrap();
+    let commit = CommitObject::new(
+        tree_hash,
+        Some(parent_hash),
+        "2026-09-09T00:00:00Z".to_owned(),
+        "fixture: pin typed image ownership".to_owned(),
+        parent.tool_lock_hash,
+        CommitStats {
+            files_added: 0,
+            files_modified: 1,
+            files_deleted: 0,
+        },
+        CommitType::Manual,
+    )
+    .unwrap();
+    let (commit_hash, _) = store
+        .write_json(ObjectKind::Commit, &serde_json::to_value(&commit).unwrap())
+        .unwrap();
+    fs::write(repo.kio_dir().join("HEAD"), format!("{commit_hash}\n")).unwrap();
 }
 
 /// Attaches an image reference to `raw_hash`'s normalized instance and writes
@@ -144,7 +195,17 @@ fn add_image_reference(dir: &TempDir, raw_hash: &str, image_bytes: &[u8]) -> Str
     instance.units[0]
         .metadata
         .insert("images".to_owned(), json!([{ "hash": image_hash }]));
-    persist_normalized_instance(repo.kio_dir(), &instance.manifest, &instance.units).unwrap();
+    instance.units[0]
+        .owned_image_hashes
+        .insert(image_hash.clone());
+    persist_and_pin_normalized_instance(
+        &repo,
+        head,
+        tree,
+        raw_hash,
+        &instance.manifest,
+        &instance.units,
+    );
     image_hash
 }
 
@@ -178,13 +239,58 @@ fn add_image_references(dir: &TempDir, raw_hash: &str, images: &[&[u8]]) -> Vec<
         fs::create_dir_all(image_path.parent().unwrap()).unwrap();
         fs::write(&image_path, image_bytes).unwrap();
         entries.push(json!({ "hash": image_hash }));
+        instance.units[0]
+            .owned_image_hashes
+            .insert(image_hash.clone());
         hashes.push(image_hash);
     }
     instance.units[0]
         .metadata
         .insert("images".to_owned(), Value::Array(entries));
-    persist_normalized_instance(repo.kio_dir(), &instance.manifest, &instance.units).unwrap();
+    persist_and_pin_normalized_instance(
+        &repo,
+        head,
+        tree,
+        raw_hash,
+        &instance.manifest,
+        &instance.units,
+    );
     hashes
+}
+
+/// Declare a hash as the normalized unit's immutable local image ownership
+/// without creating its CAS leaf. This deliberately models a missing owned
+/// object so `open` reaches the object-store not-found path rather than the
+/// earlier unowned-image policy denial.
+fn authorize_missing_image(dir: &TempDir, raw_hash: &str, image_hash: &str) {
+    let repo = Repository::open(dir.path()).unwrap();
+    let head = repo.head_commit_hash().unwrap().unwrap();
+    let commit = repo.read_commit(&head).unwrap();
+    let tree = repo.read_tree(&commit.tree).unwrap();
+    let normalize = tree
+        .entries
+        .iter()
+        .find(|entry| entry.raw_hash == raw_hash)
+        .and_then(|entry| entry.normalize.clone())
+        .unwrap();
+    let mut instance = load_validated_normalized_instance(
+        repo.kio_dir(),
+        raw_hash,
+        &normalize.tool_profile_hash,
+        normalize.r#gen,
+    )
+    .unwrap();
+    instance.units[0]
+        .owned_image_hashes
+        .insert(image_hash.to_owned());
+    persist_and_pin_normalized_instance(
+        &repo,
+        head,
+        tree,
+        raw_hash,
+        &instance.manifest,
+        &instance.units,
+    );
 }
 
 fn scope_id_of(dir: &TempDir) -> String {
@@ -249,7 +355,7 @@ fn pa03_pa06_image_and_raw_cache_directories_are_type_separated_for_a_shared_dig
     let shared_bytes = b"pa03 shared raw/image byte content";
     fs::write(dir.path().join("shared.bin"), shared_bytes).unwrap();
     init(&dir);
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
     let raw_hash = current_raw_for(&dir, "shared.bin");
     assert_eq!(raw_hash, hash_bytes(shared_bytes));
 
@@ -257,7 +363,7 @@ fn pa03_pa06_image_and_raw_cache_directories_are_type_separated_for_a_shared_dig
     // referencing an image object with the SAME digest as `shared.bin`'s raw
     // object, to construct the same-digest raw/image collision scenario.
     fs::write(dir.path().join("other.md"), "other text content").unwrap();
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
     let other_raw = current_raw_for(&dir, "other.md");
     let image_hash = add_image_reference(&dir, &other_raw, shared_bytes);
     assert_eq!(image_hash, raw_hash, "constructed same-digest collision");
@@ -291,8 +397,11 @@ fn pa04_tombstone_priority_wins_over_working_tree_and_cache() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("doc.md"), "pa04 content").unwrap();
     init(&dir);
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
     let raw_hash = current_raw_for(&dir, "doc.md");
+    let pointer = json_success(&dir, &["search", "pa04 content", "--mode", "text"])
+        ["results"][0]["evidence_pointer"]
+        .to_string();
     // `open` must resolve from CAS (not the working tree) to actually
     // publish a cache dir, so remove the working copy first. The purge
     // itself also runs with the file absent (full completion with a live
@@ -328,7 +437,7 @@ fn pa04_tombstone_priority_wins_over_working_tree_and_cache() {
     assert!(dir.path().join("doc.md").exists());
     assert!(cache_dir.exists());
 
-    let error = json_failure(&dir, &["open", &raw_hash], 4);
+    let error = json_failure(&dir, &["open", &pointer], 4);
     assert_eq!(error["error_code"], "KIO-E-PURGE-TOMBSTONED-001");
     assert_eq!(error["context"]["status"], "tombstoned");
 }
@@ -337,18 +446,21 @@ fn pa04_tombstone_priority_wins_over_working_tree_and_cache() {
 fn pa05_image_barrier_is_journal_only_tombstone_of_a_same_digest_raw_does_not_apply() {
     let dir = tempfile::tempdir().unwrap();
     let shared_bytes = b"pa05 shared raw/image content, tombstoned as raw only";
-    fs::write(dir.path().join("shared.bin"), shared_bytes).unwrap();
+    fs::write(dir.path().join("shared.md"), shared_bytes).unwrap();
     init(&dir);
-    json_success(&dir, &["index", "--offline", "--approve"]);
-    let raw_hash = current_raw_for(&dir, "shared.bin");
+    json_success(&dir, &["index", "--offline"]);
+    let raw_hash = current_raw_for(&dir, "shared.md");
+    let pointer = json_success(&dir, &["search", "pa05 shared raw", "--mode", "text"])["results"]
+        [0]["evidence_pointer"]
+        .to_string();
 
     fs::write(dir.path().join("other.md"), "other pa05 text").unwrap();
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
     let other_raw = current_raw_for(&dir, "other.md");
     let image_hash = add_image_reference(&dir, &other_raw, shared_bytes);
     assert_eq!(image_hash, raw_hash);
 
-    fs::remove_file(dir.path().join("shared.bin")).unwrap();
+    fs::remove_file(dir.path().join("shared.md")).unwrap();
     json_success(
         &dir,
         &[
@@ -362,7 +474,7 @@ fn pa05_image_barrier_is_journal_only_tombstone_of_a_same_digest_raw_does_not_ap
     );
 
     // The raw side is now tombstoned...
-    let raw_error = json_failure(&dir, &["open", &raw_hash], 4);
+    let raw_error = json_failure(&dir, &["open", &pointer], 4);
     assert_eq!(raw_error["error_code"], "KIO-E-PURGE-TOMBSTONED-001");
 
     // ...but the image object (same digest, different type) still resolves —
@@ -382,6 +494,7 @@ fn pa07_image_not_found_uses_the_same_terminal_code_as_raw_not_found() {
     // uses uniformly.
     let fixture = indexed_fixture();
     let missing_hash = hash_bytes(b"pa07 never ingested as any object type");
+    authorize_missing_image(&fixture.dir, &fixture.raw_hash, &missing_hash);
     let image_error = json_failure(
         &fixture.dir,
         &["open", &image_uri(&fixture.scope_id, &missing_hash)],
@@ -398,7 +511,7 @@ fn pa08_cache_reuse_reverifies_bytes_every_time_and_fails_closed_on_torn_content
     let output = json_success(&fixture.dir, &["open", &fixture.raw_hash]);
     let cache_path = PathBuf::from(output["path"].as_str().unwrap());
     // Corrupt the previously-published cache leaf in place. The published
-    // leaf is read-only (0400, R10-6/R9-3 hardening) — restore write
+    // leaf is read-only (0400, R10-6/R9-3 hardening) — export write
     // permission first so the corruption itself can land.
     #[cfg(unix)]
     {
@@ -446,7 +559,8 @@ fn pa09_startup_recheck_removes_published_cache_on_tombstone_race() {
             "--yes",
         ],
     );
-    let error = json_failure(&fixture.dir, &["open", &fixture.raw_hash], 4);
+    let pointer = fixture.pointer.to_string();
+    let error = json_failure(&fixture.dir, &["open", &pointer], 4);
     assert_eq!(error["error_code"], "KIO-E-PURGE-TOMBSTONED-001");
     // The purge closure itself evicted the cache (PA11); re-opening after a
     // tombstone must not resurrect a served cache dir either.
@@ -461,7 +575,7 @@ fn pa11_pa12_pa13_purge_closure_evicts_type_separated_cache_and_preserves_shared
     // survive the target's purge; the target's OTHER image is unreferenced
     // elsewhere and must be removed.
     fs::write(fixture.dir.path().join("other.md"), "pa13 other text").unwrap();
-    json_success(&fixture.dir, &["index", "--offline", "--approve"]);
+    json_success(&fixture.dir, &["index", "--offline"]);
     let other_raw = current_raw_for(&fixture.dir, "other.md");
     let target_images = add_image_references(
         &fixture.dir,
@@ -566,7 +680,7 @@ fn pa14_pa15_prune_orphans_recovers_purged_raw_and_type_separated_image_cache() 
 }
 
 // ---------------------------------------------------------------------------
-// §D (U25): restore destination safety.
+// §D (U25): export destination safety.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -588,7 +702,7 @@ fn pa16_pa17_destination_rejects_scope_root_dot_kio_and_ordinary_subdir_with_con
     ] {
         let error = json_failure(
             &dir,
-            &["restore", &commit, "--to", &path_text(&forbidden)],
+            &["export", &commit, "--to", &path_text(&forbidden)],
             2,
         );
         assert_eq!(
@@ -599,7 +713,7 @@ fn pa16_pa17_destination_rejects_scope_root_dot_kio_and_ordinary_subdir_with_con
 
     // PA17: `--to .` from inside the scope root resolves to the same
     // canonical path and is rejected identically (no relative-path bypass).
-    let error = kio(&dir, &["restore", &commit, "--to", "."])
+    let error = kio(&dir, &["export", &commit, "--to", "."])
         .arg("--json")
         .assert()
         .code(2)
@@ -611,7 +725,7 @@ fn pa16_pa17_destination_rejects_scope_root_dot_kio_and_ordinary_subdir_with_con
 }
 
 // ---------------------------------------------------------------------------
-// §E (U26): restore evacuation / quarantine / no-replace publish protocol.
+// §E (U26): export evacuation / quarantine / no-replace publish protocol.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -619,24 +733,24 @@ fn pa20_reserved_evacuation_namespace_source_names_are_rejected_before_expansion
     let dir = tempfile::tempdir().unwrap();
     init(&dir);
     fs::write(
-        dir.path().join("notes.md.kio-restore-bak"),
+        dir.path().join("notes.md.kio-export-bak"),
         b"pa20 legitimately-named historical file",
     )
     .unwrap();
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
     let destination = dir.path().join("pa20-out");
 
     let error = json_failure(
         &dir,
         &[
-            "restore",
-            "notes.md.kio-restore-bak",
+            "export",
+            "notes.md.kio-export-bak",
             "--to",
             &path_text(&destination),
         ],
         1,
     );
-    assert_eq!(error["error_code"], "KIO-E-COMMIT-RESTORE-UNSAFE-001");
+    assert_eq!(error["error_code"], "KIO-E-COMMIT-EXPORT-UNSAFE-001");
     assert!(!destination.exists() || fs::read_dir(&destination).unwrap().next().is_none());
 }
 
@@ -653,7 +767,7 @@ fn pa21_stale_backup_residue_is_rejected_before_mutation_regardless_of_force() {
     let destination = out.path().join("pa21-out");
     fs::create_dir(&destination).unwrap();
     fs::write(
-        destination.join("notes.md.kio-restore-bak"),
+        destination.join("notes.md.kio-export-bak"),
         b"stale backup from a crashed prior attempt",
     )
     .unwrap();
@@ -661,10 +775,10 @@ fn pa21_stale_backup_residue_is_rejected_before_mutation_regardless_of_force() {
     // (a) non-force: destination file absent, but the stale backup blocks it.
     let error = json_failure(
         &dir,
-        &["restore", &commit, "--to", &path_text(&destination)],
+        &["export", &commit, "--to", &path_text(&destination)],
         3,
     );
-    assert_eq!(error["error_code"], "KIO-E-COMMIT-RESTORE-CONFLICT-001");
+    assert_eq!(error["error_code"], "KIO-E-COMMIT-EXPORT-CONFLICT-001");
     assert_eq!(error["context"]["conflict_kind"], "stale_backup");
     assert!(!destination.join("notes.md").exists());
 
@@ -673,7 +787,7 @@ fn pa21_stale_backup_residue_is_rejected_before_mutation_regardless_of_force() {
     let error = json_failure(
         &dir,
         &[
-            "restore",
+            "export",
             &commit,
             "--to",
             &path_text(&destination),
@@ -682,11 +796,11 @@ fn pa21_stale_backup_residue_is_rejected_before_mutation_regardless_of_force() {
         ],
         3,
     );
-    assert_eq!(error["error_code"], "KIO-E-COMMIT-RESTORE-CONFLICT-001");
+    assert_eq!(error["error_code"], "KIO-E-COMMIT-EXPORT-CONFLICT-001");
     assert_eq!(error["context"]["conflict_kind"], "stale_backup");
     assert_eq!(fs::read(destination.join("notes.md")).unwrap(), b"existing");
     assert_eq!(
-        fs::read(destination.join("notes.md.kio-restore-bak")).unwrap(),
+        fs::read(destination.join("notes.md.kio-export-bak")).unwrap(),
         b"stale backup from a crashed prior attempt"
     );
 }
@@ -708,7 +822,7 @@ fn pa22_pa23_force_overwrite_evacuates_old_file_before_no_replace_publish() {
     let output = json_success(
         &dir,
         &[
-            "restore",
+            "export",
             &commit,
             "--to",
             &path_text(&destination),
@@ -716,7 +830,7 @@ fn pa22_pa23_force_overwrite_evacuates_old_file_before_no_replace_publish() {
             "--yes",
         ],
     );
-    assert_eq!(output["status"], "restored");
+    assert_eq!(output["status"], "exported");
     assert_eq!(output["overwritten_count"], 1);
     // The new content published under a no-replace claim of the (evacuated)
     // name.
@@ -726,7 +840,7 @@ fn pa22_pa23_force_overwrite_evacuates_old_file_before_no_replace_publish() {
     );
     // The old content survives, moved aside rather than destroyed.
     assert_eq!(
-        fs::read(destination.join("notes.md.kio-restore-bak")).unwrap(),
+        fs::read(destination.join("notes.md.kio-export-bak")).unwrap(),
         b"old destination content"
     );
 }
@@ -744,7 +858,7 @@ fn pa23_non_force_publish_race_is_a_transient_conflict_leaving_destination_untou
     // `conflict_kind=publish_race` race it stands in for (that kind, and its
     // `transient` disposition, are reserved for the actual publish-time race
     // `restore_conflict_error` classifies) -- it shares
-    // KIO-E-COMMIT-RESTORE-CONFLICT-001's exit 3 but carries
+    // KIO-E-COMMIT-EXPORT-CONFLICT-001's exit 3 but carries
     // `retry_disposition=manual_action` (add --force), not `transient`.
     let dir = tempfile::tempdir().unwrap();
     init(&dir);
@@ -761,17 +875,17 @@ fn pa23_non_force_publish_race_is_a_transient_conflict_leaving_destination_untou
 
     let error = json_failure(
         &dir,
-        &["restore", &commit, "--to", &path_text(&destination)],
+        &["export", &commit, "--to", &path_text(&destination)],
         3,
     );
-    assert_eq!(error["error_code"], "KIO-E-COMMIT-RESTORE-CONFLICT-001");
+    assert_eq!(error["error_code"], "KIO-E-COMMIT-EXPORT-CONFLICT-001");
     assert_eq!(error["context"]["retry_disposition"], "manual_action");
     assert!(!destination.join("a.md").exists());
     assert_eq!(fs::read(destination.join("b.md")).unwrap(), b"existing");
 }
 
 // ---------------------------------------------------------------------------
-// §F (U27): restore conflict error unification.
+// §F (U27): export conflict error unification.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -787,17 +901,17 @@ fn pa27_pa28_pa29_conflict_kind_is_closed_and_retry_disposition_follows_it() {
     let destination = out.path().join("pa27-out");
     fs::create_dir(&destination).unwrap();
     fs::write(
-        destination.join("notes.md.kio-restore-quarantine"),
+        destination.join("notes.md.kio-export-quarantine"),
         b"stale quarantine residue",
     )
     .unwrap();
 
     let error = json_failure(
         &dir,
-        &["restore", &commit, "--to", &path_text(&destination)],
+        &["export", &commit, "--to", &path_text(&destination)],
         3,
     );
-    assert_eq!(error["error_code"], "KIO-E-COMMIT-RESTORE-CONFLICT-001");
+    assert_eq!(error["error_code"], "KIO-E-COMMIT-EXPORT-CONFLICT-001");
     let conflict_kind = error["context"]["conflict_kind"].as_str().unwrap();
     assert_eq!(conflict_kind, "stale_quarantine");
     const CLOSED_KINDS: &[&str] = &[
@@ -823,7 +937,7 @@ fn pa30_purge_cli_syntax_matches_spec_path_raw_hash_exclusive_reason_enum_yes() 
     let dir = tempfile::tempdir().unwrap();
     init(&dir);
     fs::write(dir.path().join("doc.md"), b"pa30 content").unwrap();
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
     let raw_hash = current_raw_for(&dir, "doc.md");
 
     // (a) both path and --raw-hash: usage error.
@@ -886,7 +1000,7 @@ fn pa31_tombstone_is_durable_before_physical_deletion_and_history_is_append_only
         ],
     );
     assert_eq!(output["status"], "purged");
-    let state = PurgeState::new(&kio_dir);
+    let state = PurgeState::open(&kio_dir).unwrap();
     assert_eq!(
         state
             .read_tombstone(&fixture.raw_hash)
@@ -1114,11 +1228,11 @@ fn pa37_pa38_pa39_working_tree_residual_warns_instead_of_the_retired_hard_block(
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("report-v1.pdf"), b"pa37 shared bytes").unwrap();
     init(&dir);
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
     let raw_hash = current_raw_for(&dir, "report-v1.pdf");
     // A renamed alias with the exact same bytes under a DIFFERENT path.
     fs::write(dir.path().join("backup-copy.pdf"), b"pa37 shared bytes").unwrap();
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
 
     let output = json_success(
         &dir,
@@ -1247,7 +1361,7 @@ fn pa42_re_purge_of_an_already_active_tombstone_is_idempotent_regardless_of_reas
         ],
     );
     assert_eq!(second["status"], "purged");
-    let state = PurgeState::new(fixture.dir.path().join(".kio"));
+    let state = PurgeState::open(fixture.dir.path().join(".kio")).unwrap();
     assert_eq!(
         state
             .read_tombstone(&fixture.raw_hash)
@@ -1460,11 +1574,11 @@ fn pa46_sqlite_target_chunk_ids_are_seeded_from_the_closure_not_rescanned_at_del
 }
 
 // ---------------------------------------------------------------------------
-// §O (Phase 1 handoff): restore canonical dispatch branches ii-iv.
+// §O (Phase 1 handoff): export canonical dispatch branches ii-iv.
 // ---------------------------------------------------------------------------
 
 fn write_erase_receipt(kio_dir: &Path, raw_hash: &str, in_commit: &str) {
-    let state = PurgeState::new(kio_dir);
+    let state = PurgeState::open(kio_dir).unwrap();
     let path = state.erase_receipt_path(raw_hash).unwrap();
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
@@ -1493,7 +1607,7 @@ fn write_retired_tombstone(
     purged_commit: &str,
     retired_commit: &str,
 ) {
-    let state = PurgeState::new(kio_dir);
+    let state = PurgeState::open(kio_dir).unwrap();
     let path = state.tombstone_path(raw_hash).unwrap();
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(
@@ -1541,7 +1655,7 @@ fn pa47_pa48_restore_distinguishes_erased_retired_and_unmarked_raw_absence() {
     let pointer = fixture.pointer.to_string();
     let error = kio(
         &fixture.dir,
-        &["restore", &pointer, "--to", &path_text(&destination)],
+        &["export", &pointer, "--to", &path_text(&destination)],
     )
     .arg("--json")
     .assert()
@@ -1567,7 +1681,7 @@ fn pa47_pa48_restore_distinguishes_erased_retired_and_unmarked_raw_absence() {
     let pointer2 = fixture2.pointer.to_string();
     let error2 = kio(
         &fixture2.dir,
-        &["restore", &pointer2, "--to", &path_text(&destination2)],
+        &["export", &pointer2, "--to", &path_text(&destination2)],
     )
     .arg("--json")
     .assert()
@@ -1596,10 +1710,10 @@ fn pa49_erased_with_raw_present_restores_normally() {
     let pointer = fixture.pointer.to_string();
     let output = json_success(
         &fixture.dir,
-        &["restore", &pointer, "--to", &path_text(&destination)],
+        &["export", &pointer, "--to", &path_text(&destination)],
     );
-    assert_eq!(output["status"], "restored");
-    assert_eq!(output["restored_count"], 1);
+    assert_eq!(output["status"], "exported");
+    assert_eq!(output["exported_count"], 1);
 }
 
 #[test]
@@ -1627,12 +1741,12 @@ fn pa50_all_three_restore_call_sites_share_the_same_corrupt_verdict_for_a_retire
     let destination = out.path().join("pa50-out");
     let error = json_failure(
         &dir,
-        &["restore", &commit, "--to", &path_text(&destination)],
+        &["export", &commit, "--to", &path_text(&destination)],
         4,
     );
     assert_eq!(
         error["error_code"], "KIO-E-STORE-CORRUPT-001",
-        "commit-source restore (preflight/preflight_in_dir path) must reach the \
-         same canonical verdict as evidence-source restore (PA47/48(b))"
+        "commit-source export (preflight/preflight_in_dir path) must reach the \
+         same canonical verdict as evidence-source export (PA47/48(b))"
     );
 }

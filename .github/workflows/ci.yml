@@ -16,6 +16,22 @@ permissions:
   contents: read
 
 jobs:
+  acceptance-tooling:
+    # The Rust workspace owns acceptance tests; retain only syntax checks for
+    # the fixed shell controllers used by the private route.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Parse fixed shell controllers
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/v1-local-gpu/gpu-phase.sh
+          bash -n scripts/v1-local-gpu/ocr_api_entrypoint.sh
+
   rust:
     runs-on: ubuntu-latest
     # Attempt 1 took 50:53 before duplicate Full/FD stress was removed. The
@@ -227,10 +243,10 @@ jobs:
       - run: target/release/kio-eval --scenario M3-3 --corpus /tmp/kio-eval-corpus --bin target/release/kio
 
   macos-security-r23:
-    runs-on: macos-latest
-    # The failed host-dependent attempt ran 23:45; the portable suite keeps
-    # measured headroom while rejecting another unbounded platform lane.
-    timeout-minutes: 35
+    runs-on: macos-26
+    # The full native suite now exceeds 40 minutes locally. Keep an explicit,
+    # finite cap with sufficient macOS host headroom.
+    timeout-minutes: 90
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7

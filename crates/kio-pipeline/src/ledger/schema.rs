@@ -1,17 +1,15 @@
-//! `cost-ledger.sqlite` schema: DDL SQL-of-record (04-pipeline.md §5.4), device
-//! path resolution, connection bootstrap (WAL + busy_timeout, same precedent as
-//! `crates/kio-index/src/registry.rs`'s scope-registry.sqlite), and the shape
-//! detection/self-heal machinery required by 10-operations.md §7.5.3 ("形状検出は
-//! sqlite_master の CREATE 文 (列・CHECK 制約を含む) の canonical 比較で行う").
+//! Canonical device-ledger schema and strict existing-state validation.
+//! Lifecycle alone creates a fresh schema. Existing tables, constraints and
+//! indexes must match exactly; this module never migrates or repairs them.
 
-use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::path::PathBuf;
 
 use rusqlite::{Connection, OptionalExtension, params};
 
-use crate::ledger::time::now_millis;
 use crate::{PipelineError, Result};
+
+#[cfg(test)]
+use crate::ledger::time::now_millis;
 
 /// `04-pipeline.md §5.4` SQL-of-record, copied verbatim (comments included —
 /// comments are inert for `CREATE TABLE`/`CREATE INDEX` and are stripped by
@@ -114,6 +112,16 @@ pub const CREATE_SCHEMA_MIGRATIONS_SQL: &str =
     applied_at  INTEGER NOT NULL         -- UTC ミリ秒
 );";
 
+/// Immutable identity bound to the authority and checkpoint records.  The
+/// SQLite header's `user_version` is intentionally not used as a counter.
+pub const CREATE_LEDGER_METADATA_SQL: &str = "CREATE TABLE ledger_metadata (
+    singleton INTEGER NOT NULL PRIMARY KEY CHECK (singleton = 1),
+    ledger_id TEXT NOT NULL,
+    era TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    security_token TEXT NOT NULL
+) WITHOUT ROWID;";
+
 /// Retired pre-release ledger files, including the abandoned cutover's
 /// `.migrated` outputs. Their bytes have no lossless mapping to the current
 /// SQLite schema, so startup refuses them rather than importing, renaming, or
@@ -144,148 +152,10 @@ pub fn default_ledger_path() -> Result<PathBuf> {
     Ok(data_home.join("kio/cost-ledger.sqlite"))
 }
 
-/// Open (creating/repairing as needed) the device-global cost ledger.
-pub struct LedgerDb {
-    pub(crate) conn: Connection,
-}
-
-impl LedgerDb {
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref();
-        let parent = path.parent().unwrap_or_else(|| Path::new("."));
-        reject_retired_ledger_files(parent)?;
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| PipelineError::Io {
-                path: parent.display().to_string(),
-                message: err.to_string(),
-            })?;
-            // P2 precedent (registry.rs): the device data dir carries a
-            // device-global budget/audit trail — owner-only best effort.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-        // The detector above catches a pre-existing retired store before this
-        // function creates or opens SQLite. Recheck immediately before
-        // `Connection::open` to narrow the race with an external writer. A
-        // process that can mutate this device-global directory without using
-        // Kio's lifecycle remains outside this store's synchronization/trust
-        // boundary; Rust/SQLite offer no atomic "directory is clean + create DB"
-        // primitive across these distinct pathnames.
-        reject_retired_ledger_files(parent)?;
-        let conn = Connection::open(path)?;
-        // CL70: WAL + busy_timeout, the same precedent as scope-registry.sqlite.
-        conn.busy_timeout(Duration::from_millis(5000))?;
-        let _journal_mode: String =
-            conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-
-        // QA14 (10-operations.md §7.5.2, step4b-contract-tests-p3a.md L307-321):
-        // restore-from-backup detection. `PRAGMA user_version` is a monotonic
-        // write-sequence counter this module bumps on every mutating ledger
-        // operation (see `ops::phase1_intent`/`ops::terminal_transaction`/
-        // `ops::cas_update_one`'s doc comments for the exact — and, between
-        // them, exhaustive — bump sites). Unlike an in-table column, the
-        // counter lives in the SQLite file HEADER, so it travels with the raw
-        // file 10 §7.5.2's documented `sqlite3 ... .backup` procedure copies.
-        // A companion file next to the DB (`<path>.write-seq`) records the
-        // highest value THIS device has observed. If the DB we just opened
-        // reports a value LOWER than the companion remembers, the file must
-        // have been replaced by an older snapshot (ordinary forward operation
-        // only ever increases the counter) — flag it.
-        let current_write_seq = read_write_seq(&conn)?;
-        let companion_path = write_seq_companion_path(path);
-        let restored = match read_write_seq_companion(&companion_path) {
-            // Companion absent: first run on this device, or this feature was
-            // just introduced against a pre-existing store — adopt the
-            // current value as the new baseline rather than flagging
-            // (operator-honesty mechanism, not a security boundary: the
-            // documented 10 §7.5.2 backup/restore procedure replaces only the
-            // DB file, which is exactly the case this detects; there is
-            // nothing to compare the very first observation against).
-            None => false,
-            Some(companion_value) => current_write_seq < companion_value,
-        };
-        if restored {
-            // 10 §7.5.2 L650: report a corrupt restore as corrupt BEFORE
-            // anything else — integrity_check runs first, so a truncated or
-            // partial backup file is diagnosed clearly rather than surfacing
-            // as a confusing table-shape mismatch (`ensure_schema`, below) or
-            // an opaque SQL error (the marker INSERT below needs
-            // `schema_migrations` to already be verified).
-            let integrity = integrity_check(&conn)?;
-            if integrity != "ok" {
-                return Err(PipelineError::corrupt(
-                    path.display().to_string(),
-                    format!(
-                        "PRAGMA integrity_check reported corruption after a detected \
-                         restore-from-backup (10-operations.md §7.5.2): {integrity}"
-                    ),
-                ));
-            }
-        }
-
-        ensure_schema(&conn)?;
-
-        if restored {
-            // Idempotent: `record_marker` uses a bare INSERT (schema_migrations.name
-            // is PRIMARY KEY) — guard with `marker_present` so a marker already
-            // persisted by an earlier detection (not yet cleared by `kio ledger
-            // reconcile`) cannot cause a duplicate-key error on a later `open`.
-            if !marker_present(&conn, RESTORE_RECONCILE_PENDING_MARKER)? {
-                record_marker(&conn, RESTORE_RECONCILE_PENDING_MARKER)?;
-            }
-        }
-        // Refresh the companion to the DB's current value in every case
-        // (first-run adoption, ordinary forward progress that left the
-        // companion trailing from a crash between a prior commit and its
-        // companion write, or the post-detection re-arm so the flag does not
-        // re-fire on the next open — the PERSISTED marker above is the gate's
-        // durable source of truth from here on). Best-effort: never fails
-        // `open` — the companion is an operator-honesty aid, not a
-        // correctness requirement of the writes it trails.
-        let _ = write_write_seq_companion(&companion_path, current_write_seq);
-
-        Ok(Self { conn })
-    }
-
-    pub fn open_default() -> Result<Self> {
-        Self::open(default_ledger_path()?)
-    }
-
-    #[must_use]
-    pub fn connection(&self) -> &Connection {
-        &self.conn
-    }
-}
-
-// ---------------------------------------------------------------------------
-// QA14 — write-sequence counter (`PRAGMA user_version`) + restore-from-backup
-// detection (10-operations.md §7.5.2, step4b-contract-tests-p3a.md L307-321)
-// ---------------------------------------------------------------------------
-
-/// Marker recorded in `schema_migrations` when [`LedgerDb::open`] detects a
-/// restored-from-backup DB. `schema_migrations` is this store's generic
-/// operational-marker table, and this marker is exactly that shape: a durable,
-/// idempotent completion flag — not
-/// ledger row DATA, so it does not belong in `cost_ledger`/`batch_requests`.
-/// While present, `ops::phase1_intent` refuses new online submissions
-/// (`KIO-E-BATCH-RESTORE-RECONCILE-001`). Cleared by `kio ledger reconcile`
-/// (`clear_restore_reconcile_marker`) once the 10 §7.5.2 recovery walk
-/// completes.
+/// A historical restore-reconcile marker.  It is a refusal artifact only:
+/// ordinary lifecycle work never clears or repairs it, because missing remote
+/// spend cannot be proven from a local SQLite file.
 pub const RESTORE_RECONCILE_PENDING_MARKER: &str = "restore-reconcile-pending";
-
-/// Clear the QA14 restore-reconcile marker (idempotent — `false` when it was
-/// already absent, e.g. a `kio ledger reconcile` run when no restore was ever
-/// detected).
-pub fn clear_restore_reconcile_marker(conn: &Connection) -> Result<bool> {
-    let changed = conn.execute(
-        "DELETE FROM schema_migrations WHERE name = ?1",
-        rusqlite::params![RESTORE_RECONCILE_PENDING_MARKER],
-    )?;
-    Ok(changed > 0)
-}
 
 /// Whether the QA14 restore-reconcile marker is currently set — the gate
 /// `ops::phase1_intent` checks before issuing a new submission.
@@ -303,8 +173,9 @@ pub(crate) fn marker_present(conn: &Connection, name: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
-/// Persist a named operational marker. Callers requiring idempotency should
-/// first use [`marker_present`], since the marker name is the primary key.
+/// Test fixture helper for the historical refusal marker.  Runtime code has
+/// no generic marker writer and cannot clear or repair this artifact.
+#[cfg(test)]
 pub(crate) fn record_marker(conn: &Connection, name: &str) -> Result<()> {
     conn.execute(
         "INSERT INTO schema_migrations (name, applied_at) VALUES (?1, ?2)",
@@ -313,206 +184,54 @@ pub(crate) fn record_marker(conn: &Connection, name: &str) -> Result<()> {
     Ok(())
 }
 
-fn reject_retired_ledger_files(dir: &Path) -> Result<()> {
-    let mut present = Vec::new();
-    for basename in RETIRED_LEDGER_BASENAMES {
-        let candidate = dir.join(basename);
-        match std::fs::symlink_metadata(&candidate) {
-            Ok(_) => present.push(candidate),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-            Err(err) => {
-                return Err(PipelineError::Io {
-                    path: candidate.display().to_string(),
-                    message: err.to_string(),
-                });
-            }
+/// Create the complete schema only while an explicit initialization owns a
+/// fresh database.  Ordinary opens never create, migrate, or repair objects.
+pub(crate) fn create_fresh_schema(conn: &Connection) -> Result<()> {
+    conn.execute_batch(CREATE_COST_LEDGER_SQL)?;
+    conn.execute_batch(CREATE_IDX_COST_LEDGER_MONTH_SQL)?;
+    conn.execute_batch(CREATE_BATCH_REQUESTS_SQL)?;
+    conn.execute_batch(CREATE_IDX_BATCH_REQUESTS_INFLIGHT_SQL)?;
+    conn.execute_batch(CREATE_SCHEMA_MIGRATIONS_SQL)?;
+    conn.execute_batch(CREATE_LEDGER_METADATA_SQL)?;
+    Ok(())
+}
+
+/// Strictly validate every required table and index.  This intentionally has
+/// no recovery path: a missing or changed object is recovery-required.
+pub(crate) fn validate_schema(conn: &Connection) -> Result<()> {
+    detect_table_shape_mismatch(conn)?;
+    for (name, sql) in [
+        ("idx_cost_ledger_month", CREATE_IDX_COST_LEDGER_MONTH_SQL),
+        (
+            "idx_batch_requests_inflight",
+            CREATE_IDX_BATCH_REQUESTS_INFLIGHT_SQL,
+        ),
+    ] {
+        let actual = object_sql(conn, "index", name)?.ok_or_else(|| {
+            PipelineError::contract(
+                "KIO-E-LEDGER-SCHEMA-001",
+                format!("required index {name} is missing"),
+            )
+        })?;
+        if canonical_sql_tokens(&actual) != canonical_sql_tokens(sql) {
+            return Err(PipelineError::contract(
+                "KIO-E-LEDGER-SCHEMA-001",
+                format!("required index {name} shape differs"),
+            ));
         }
     }
-    if present.is_empty() {
-        return Ok(());
-    }
-    let paths = present
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(PipelineError::contract(
-        "KIO-E-LEDGER-LEGACY-JSONL-001",
-        format!(
-            "retired pre-release cost-ledger files were found ({paths}); they were left untouched because their contents cannot be losslessly imported into cost-ledger.sqlite. Preserve these files and resolve the ledger manually before retrying."
-        ),
-    ))
-}
-
-/// Runs `PRAGMA integrity_check`, returning the raw result string (`"ok"` on
-/// a healthy store; otherwise SQLite's own description of the first problem
-/// found). Exposed (not just used internally by [`LedgerDb::open`]'s
-/// restore-detection) so `kio ledger reconcile` (QA14 design step a) can run
-/// the same check explicitly as its own first action, independent of whether
-/// `open` already ran it this process.
-pub fn integrity_check(conn: &Connection) -> Result<String> {
-    conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .map_err(Into::into)
-}
-
-/// Read the DB's current write-sequence counter (`PRAGMA user_version`) — a
-/// plain 32-bit signed integer stored in the SQLite file header (present on
-/// every valid SQLite file regardless of whether this crate's tables exist
-/// yet, and read here strictly BEFORE `ensure_schema` runs).
-fn read_write_seq(conn: &Connection) -> Result<i64> {
-    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
-        .map_err(Into::into)
-}
-
-/// Bump the write-sequence counter by 1, saturating at `i32::MAX` (`PRAGMA
-/// user_version` is a 32-bit SIGNED integer — SQLite truncates/wraps a value
-/// written past that range rather than rejecting it, so the cap must be
-/// enforced here). `PRAGMA user_version = <literal>` does not accept a bound
-/// parameter, but `next` is always a value this function computed itself
-/// (never attacker/user-controlled text), so string interpolation is safe.
-///
-/// **Transactional by construction** (verified by
-/// `ops::qa14_bump_write_seq_is_rolled_back_with_its_transaction`): the
-/// user_version field is part of the database file's normal page/header
-/// state, so a write to it inside an open transaction or SAVEPOINT commits or
-/// rolls back with everything else in that same transaction — no different
-/// from an ordinary table UPDATE. Callers rely on this to keep the counter
-/// bump atomic with the row mutation it accompanies (see `ops.rs`'s 3 call
-/// sites: `phase1_intent`, `terminal_transaction`, `cas_update_one`).
-pub(crate) fn bump_write_seq(conn: &Connection) -> Result<()> {
-    let current = read_write_seq(conn)?;
-    let next = current.saturating_add(1).min(i64::from(i32::MAX));
-    conn.execute_batch(&format!("PRAGMA user_version = {next};"))?;
     Ok(())
 }
 
-/// `<db path>.write-seq` — the companion file design point 2 names literally
-/// (e.g. `cost-ledger.sqlite.write-seq`).
-pub(crate) fn write_seq_companion_path(db_path: &Path) -> PathBuf {
-    let mut os = db_path.as_os_str().to_owned();
-    os.push(".write-seq");
-    PathBuf::from(os)
-}
-
-/// `None` on any I/O or parse failure — treated identically to "absent" by
-/// [`LedgerDb::open`]'s caller (a malformed companion is exactly as
-/// uninformative as a missing one; this is an operator-honesty aid, not a
-/// security boundary, so failing open rather than degrading would be the
-/// wrong tradeoff).
-fn read_write_seq_companion(companion_path: &Path) -> Option<i64> {
-    std::fs::read_to_string(companion_path)
-        .ok()?
-        .trim()
-        .parse::<i64>()
-        .ok()
-}
-
-/// Write the companion file atomically (temp file + rename, so a concurrent
-/// reader never observes a torn/partial write) — best-effort: I/O errors are
-/// the caller's to decide whether to ignore (every call site in this crate
-/// does, per the companion's "advisory, not correctness-bearing" contract).
-fn write_write_seq_companion(companion_path: &Path, value: i64) -> std::io::Result<()> {
-    let mut tmp_os = companion_path.as_os_str().to_owned();
-    tmp_os.push(".tmp");
-    let tmp_path = PathBuf::from(tmp_os);
-    std::fs::write(&tmp_path, value.to_string())?;
-    std::fs::rename(&tmp_path, companion_path)
-}
-
-/// Best-effort: after a mutating ledger call's own SAVEPOINT (or the outer
-/// `BEGIN IMMEDIATE` transaction it may be nested inside) has fully released,
-/// refresh the write-seq companion file to match the CURRENT `user_version`
-/// — but only when `conn.is_autocommit()` reports there is no ambient
-/// transaction still pending above the caller. A released SAVEPOINT does not
-/// mean "durably committed to disk" when it is nested inside an outer,
-/// still-open transaction (e.g. `phase1_intent` called from within
-/// `with_immediate_transaction`) — writing the companion at that point would
-/// advance it past a value the DB could still roll back to, which is exactly
-/// the dangerous self-inflicted false positive this guard exists to prevent
-/// (a later, genuinely-outermost commit calls this again and captures the
-/// final state correctly). A no-op when the connection has no backing file
-/// (`:memory:`/temp — no companion concept applies) or when `user_version`
-/// cannot be read. Never propagates an error — see [`write_write_seq_companion`].
-pub(crate) fn sync_write_seq_companion_if_committed(conn: &Connection) {
-    if !conn.is_autocommit() {
-        return;
-    }
-    let Some(db_path) = conn.path().filter(|path| !path.is_empty()) else {
-        return;
-    };
-    let db_path = PathBuf::from(db_path);
-    let Ok(current) = read_write_seq(conn) else {
-        return;
-    };
-    let _ = write_write_seq_companion(&write_seq_companion_path(&db_path), current);
-}
-
-/// Create the 3-table schema on a fresh store, or self-heal a missing/malformed
-/// required index on an existing one (CL08 / 10 §7.5.3). Table-shape MIGRATION
-/// beyond the one-time JSONL cutover is deliberately not attempted here (R23-24
-/// reduced scope — see [`detect_table_shape_mismatch`]'s doc comment): the only
-/// self-healing this routine performs on an existing store is the index repair
-/// below. A table whose shape does not match this build's DDL-of-record is
-/// detected and refused (fail-closed), not silently migrated in place.
-fn ensure_schema(conn: &Connection) -> Result<()> {
-    let tables = table_names(conn)?;
-    let has_any = tables.contains("cost_ledger")
-        || tables.contains("batch_requests")
-        || tables.contains("schema_migrations");
-    if !has_any {
-        with_savepoint(conn, "kio_ledger_create_schema", || {
-            conn.execute_batch(CREATE_COST_LEDGER_SQL)?;
-            conn.execute_batch(CREATE_IDX_COST_LEDGER_MONTH_SQL)?;
-            conn.execute_batch(CREATE_BATCH_REQUESTS_SQL)?;
-            conn.execute_batch(CREATE_IDX_BATCH_REQUESTS_INFLIGHT_SQL)?;
-            conn.execute_batch(CREATE_SCHEMA_MIGRATIONS_SQL)?;
-            Ok(())
-        })?;
-        return Ok(());
-    }
-    // R23-24: fail-closed on a table-shape mismatch (or a partial table set)
-    // BEFORE any index self-heal DDL runs against a store this build cannot
-    // verify the row invariants of.
-    detect_table_shape_mismatch(conn)?;
-    // CL08: repair a missing or shape-mismatched required index without
-    // touching the tables themselves.
-    repair_index_shape(
-        conn,
-        "idx_cost_ledger_month",
-        "cost_ledger",
-        CREATE_IDX_COST_LEDGER_MONTH_SQL,
-    )?;
-    repair_index_shape(
-        conn,
-        "idx_batch_requests_inflight",
-        "batch_requests",
-        CREATE_IDX_BATCH_REQUESTS_INFLIGHT_SQL,
-    )?;
-    Ok(())
-}
-
-/// R23-24 (10 §7.5.3: "形状検出は sqlite_master の CREATE 文 (列・CHECK 制約を
-/// 含む) の canonical 比較で行う — 対象は `cost_ledger` / `batch_requests` /
-/// `schema_migrations` の 3 表すべて"; reduced adjudicated scope — the
-/// in-place table-shape MIGRATION 10 §7.5.3 also describes is explicit backlog,
-/// not implemented here): on an EXISTING store (this is only called once
-/// `ensure_schema` has already established at least one of the 3 tables is
-/// present), every one of the 3 tables must both exist and canonical-compare
-/// equal to this build's DDL-of-record. A table existing with a non-canonical
-/// shape (an added/removed/retyped column, a changed CHECK constraint, ...)
-/// means the store was created or migrated by a different code version than
-/// this build expects — this build's row invariants (the CHECK constraints
-/// `classify_check_violation`/§5.8's "1 回のみ" durability rely on, among
-/// others) cannot be trusted to hold, so this refuses to open rather than
-/// operate silently against an unverified shape. A table missing while
-/// `ensure_schema`'s caller already determined `has_any` is torn/partial store
-/// state no legitimate code path produces (all 3 tables are always created
-/// together, in one savepoint) — treated identically to a shape mismatch.
+/// Validate all four required tables against their canonical DDL, including
+/// constraints. A missing or differently shaped table is corrupt/unsupported
+/// operational truth and cannot be adopted as an empty accounting baseline.
 fn detect_table_shape_mismatch(conn: &Connection) -> Result<()> {
     for (table_name, create_sql) in [
         ("cost_ledger", CREATE_COST_LEDGER_SQL),
         ("batch_requests", CREATE_BATCH_REQUESTS_SQL),
         ("schema_migrations", CREATE_SCHEMA_MIGRATIONS_SQL),
+        ("ledger_metadata", CREATE_LEDGER_METADATA_SQL),
     ] {
         let current = object_sql(conn, "table", table_name)?.ok_or_else(|| {
             PipelineError::corrupt(
@@ -542,16 +261,6 @@ fn detect_table_shape_mismatch(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn table_names(conn: &Connection) -> Result<BTreeSet<String>> {
-    let mut stmt = conn.prepare("SELECT name FROM sqlite_master WHERE type = 'table'")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
-    let mut set = BTreeSet::new();
-    for row in rows {
-        set.insert(row?);
-    }
-    Ok(set)
-}
-
 /// The literal `sql` text sqlite_master stores for a table/index, or `None` if
 /// it does not exist.
 pub fn object_sql(conn: &Connection, kind: &str, name: &str) -> Result<Option<String>> {
@@ -562,40 +271,6 @@ pub fn object_sql(conn: &Connection, kind: &str, name: &str) -> Result<Option<St
     )
     .optional()
     .map_err(Into::into)
-}
-
-/// CL08: detect a missing or shape-mismatched index and converge it to
-/// canonical inside one savepoint, recording completion to `schema_migrations`
-/// (idempotent — `INSERT OR IGNORE`, since a no-op repair never gets here: the
-/// canonical-match check short-circuits first).
-fn repair_index_shape(
-    conn: &Connection,
-    index_name: &str,
-    table_name: &str,
-    create_sql: &'static str,
-) -> Result<()> {
-    let expected = canonical_sql_tokens(create_sql);
-    let current = object_sql(conn, "index", index_name)?;
-    if current.as_deref().map(canonical_sql_tokens).as_ref() == Some(&expected) {
-        return Ok(());
-    }
-    let _ = table_name; // documents which table this index belongs to at call sites
-    with_savepoint(conn, "kio_ledger_repair_index", || {
-        if current.is_some() {
-            // IF NOT EXISTS alone cannot fix a same-named, differently-shaped
-            // index (10 §7.5.3): drop and recreate canonical.
-            conn.execute_batch(&format!("DROP INDEX {index_name};"))?;
-        }
-        conn.execute_batch(create_sql)?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name, applied_at) VALUES (?1, ?2)",
-            rusqlite::params![
-                format!("index-shape-repair:{index_name}"),
-                crate::ledger::time::now_millis()
-            ],
-        )?;
-        Ok(())
-    })
 }
 
 /// Named-savepoint helper (same idiom as `kio_index::embedding_store`'s
@@ -675,416 +350,79 @@ pub fn canonical_sql_tokens(sql: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
-    fn open_temp() -> (tempfile::TempDir, LedgerDb) {
-        let dir = tempfile::tempdir().unwrap();
-        let db = LedgerDb::open(dir.path().join("cost-ledger.sqlite")).unwrap();
-        (dir, db)
+    fn fresh() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        create_fresh_schema(&conn).unwrap();
+        conn
     }
 
     #[test]
-    fn open_creates_all_three_tables_and_two_indexes() {
-        let (_dir, db) = open_temp();
-        let tables = table_names(&db.conn).unwrap();
-        assert!(tables.contains("cost_ledger"));
-        assert!(tables.contains("batch_requests"));
-        assert!(tables.contains("schema_migrations"));
-        assert!(
-            object_sql(&db.conn, "index", "idx_cost_ledger_month")
-                .unwrap()
-                .is_some()
-        );
-        assert!(
-            object_sql(&db.conn, "index", "idx_batch_requests_inflight")
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[test]
-    fn open_sets_wal_and_busy_timeout() {
-        let (_dir, db) = open_temp();
-        let journal: String = db
-            .conn
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(journal.to_lowercase(), "wal");
-        let timeout: i64 = db
-            .conn
-            .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
-            .unwrap();
-        assert!(timeout > 0);
-    }
-
-    #[test]
-    fn reopen_is_idempotent_and_preserves_rows() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cost-ledger.sqlite");
-        {
-            let db = LedgerDb::open(&path).unwrap();
-            db.conn
-                .execute(
-                    "INSERT INTO schema_migrations (name, applied_at) VALUES ('probe', 1)",
-                    [],
-                )
-                .unwrap();
+    fn fresh_schema_has_all_authority_bound_objects() {
+        let conn = fresh();
+        validate_schema(&conn).unwrap();
+        for table in [
+            "cost_ledger",
+            "batch_requests",
+            "schema_migrations",
+            "ledger_metadata",
+        ] {
+            assert!(
+                object_sql(&conn, "table", table).unwrap().is_some(),
+                "{table}"
+            );
         }
-        let db2 = LedgerDb::open(&path).unwrap();
-        let count: i64 = db2
-            .conn
-            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert_eq!(count, 1, "reopening must not recreate/wipe the schema");
+        for index in ["idx_cost_ledger_month", "idx_batch_requests_inflight"] {
+            assert!(
+                object_sql(&conn, "index", index).unwrap().is_some(),
+                "{index}"
+            );
+        }
     }
 
-    // CL08(a): a missing `idx_batch_requests_inflight` is created via the same
-    // savepoint-guarded self-heal path `ensure_schema` uses on open, and the
-    // completion is recorded to schema_migrations.
     #[test]
-    fn missing_index_is_self_healed_on_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cost-ledger.sqlite");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(CREATE_COST_LEDGER_SQL).unwrap();
-            conn.execute_batch(CREATE_IDX_COST_LEDGER_MONTH_SQL)
-                .unwrap();
-            conn.execute_batch(CREATE_BATCH_REQUESTS_SQL).unwrap();
-            conn.execute_batch(CREATE_SCHEMA_MIGRATIONS_SQL).unwrap();
-            // Deliberately omit idx_batch_requests_inflight.
-        }
-        let db = LedgerDb::open(&path).unwrap();
-        let sql = object_sql(&db.conn, "index", "idx_batch_requests_inflight")
-            .unwrap()
-            .expect("self-healed");
-        assert_eq!(
-            canonical_sql_tokens(&sql),
-            canonical_sql_tokens(CREATE_IDX_BATCH_REQUESTS_INFLIGHT_SQL)
-        );
-        let marker: i64 = db
-            .conn
+    fn strict_schema_validation_refuses_missing_index() {
+        let conn = fresh();
+        conn.execute_batch("DROP INDEX idx_batch_requests_inflight;")
+            .unwrap();
+        let error = validate_schema(&conn).unwrap_err();
+        assert!(matches!(
+            error,
+            PipelineError::Contract {
+                code: "KIO-E-LEDGER-SCHEMA-001",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn strict_schema_validation_refuses_malformed_metadata_table() {
+        let conn = fresh();
+        conn.execute_batch("DROP TABLE ledger_metadata; CREATE TABLE ledger_metadata (singleton INTEGER PRIMARY KEY);").unwrap();
+        assert!(matches!(
+            validate_schema(&conn),
+            Err(PipelineError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn metadata_sequence_is_a_signed_sqlite_value() {
+        let conn = fresh();
+        conn.execute("INSERT INTO ledger_metadata (singleton, ledger_id, era, sequence, security_token) VALUES (1, 'a', 'b', ?1, 'c')", params![i64::MAX]).unwrap();
+        let value: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM schema_migrations WHERE name = 'index-shape-repair:idx_batch_requests_inflight'",
+                "SELECT sequence FROM ledger_metadata WHERE singleton = 1",
                 [],
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(marker, 1);
+        assert_eq!(value, i64::MAX);
     }
 
-    // CL08(b): a same-named but differently-shaped index (missing the WHERE
-    // clause) is DROP+CREATE converged to canonical — IF NOT EXISTS alone would
-    // leave the wrong shape in place.
     #[test]
-    fn malformed_index_is_dropped_and_recreated_on_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cost-ledger.sqlite");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(CREATE_COST_LEDGER_SQL).unwrap();
-            conn.execute_batch(CREATE_IDX_COST_LEDGER_MONTH_SQL)
-                .unwrap();
-            conn.execute_batch(CREATE_BATCH_REQUESTS_SQL).unwrap();
-            conn.execute_batch(CREATE_SCHEMA_MIGRATIONS_SQL).unwrap();
-            // Malformed: no partial-index WHERE clause.
-            conn.execute_batch(
-                "CREATE INDEX idx_batch_requests_inflight ON batch_requests(state);",
-            )
-            .unwrap();
-        }
-        let db = LedgerDb::open(&path).unwrap();
-        let sql = object_sql(&db.conn, "index", "idx_batch_requests_inflight")
-            .unwrap()
-            .expect("still present");
+    fn canonical_sql_tokens_ignores_comments_and_layout() {
         assert_eq!(
-            canonical_sql_tokens(&sql),
-            canonical_sql_tokens(CREATE_IDX_BATCH_REQUESTS_INFLIGHT_SQL)
+            canonical_sql_tokens("CREATE INDEX foo ON t(a); -- comment\n"),
+            canonical_sql_tokens("CREATE INDEX foo ON t(a);")
         );
-    }
-
-    #[test]
-    fn canonical_sql_tokens_ignores_comments_and_whitespace_layout() {
-        let a = "CREATE INDEX foo ON t(a); -- trailing comment\n";
-        let b = "CREATE   INDEX\nfoo\nON\nt(a);";
-        assert_eq!(canonical_sql_tokens(a), canonical_sql_tokens(b));
-    }
-
-    // R23-24 (10 §7.5.3 shape detection, reduced scope: detection only, no
-    // in-place migration): a `cost_ledger` table that exists but is missing the
-    // `usd` CHECK constraint entirely (same columns, weaker invariants — the
-    // exact "CHECK differs, column existence check would miss it" case 10
-    // §7.5.3 calls out) must refuse to open rather than silently trust a
-    // shape this build never validated.
-    #[test]
-    fn r23_24_table_shape_mismatch_refuses_to_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cost-ledger.sqlite");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(
-                "CREATE TABLE cost_ledger (
-                    scope_id          TEXT NOT NULL,
-                    adapter_kind      TEXT NOT NULL,
-                    input_hash        TEXT NOT NULL,
-                    tool_profile_hash TEXT NOT NULL,
-                    submission_seq    INTEGER NOT NULL,
-                    batch_job_id      TEXT NOT NULL,
-                    usd               REAL NOT NULL,
-                    estimated         INTEGER NOT NULL DEFAULT 0 CHECK (estimated IN (0, 1)),
-                    outcome           TEXT NOT NULL,
-                    month             TEXT NOT NULL,
-                    recorded_at       INTEGER NOT NULL,
-                    UNIQUE (scope_id, adapter_kind, input_hash, tool_profile_hash, submission_seq)
-                );",
-            )
-            .unwrap();
-            conn.execute_batch(CREATE_IDX_COST_LEDGER_MONTH_SQL)
-                .unwrap();
-            conn.execute_batch(CREATE_BATCH_REQUESTS_SQL).unwrap();
-            conn.execute_batch(CREATE_IDX_BATCH_REQUESTS_INFLIGHT_SQL)
-                .unwrap();
-            conn.execute_batch(CREATE_SCHEMA_MIGRATIONS_SQL).unwrap();
-        }
-        // `LedgerDb` does not implement `Debug` (its `rusqlite::Connection`
-        // field does not), so `.unwrap_err()` (which requires `T: Debug`) is
-        // not usable here — match instead.
-        let err = match LedgerDb::open(&path) {
-            Ok(_) => panic!("expected LedgerDb::open to refuse a shape-mismatched cost_ledger"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("KIO-E-STORE-CORRUPT-001"),
-            "got {err:?}"
-        );
-    }
-
-    // R23-24: a store with only SOME of the 3 required tables (a torn/partial
-    // shape no legitimate code path produces — `ensure_schema`'s fresh-create
-    // branch always creates all 3 together in one savepoint) must also refuse
-    // to open, rather than let a later `CREATE INDEX ... ON <missing table>`
-    // fail with an opaque, uncategorized SQL error.
-    #[test]
-    fn r23_24_partial_table_set_refuses_to_open() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cost-ledger.sqlite");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(CREATE_COST_LEDGER_SQL).unwrap();
-            conn.execute_batch(CREATE_IDX_COST_LEDGER_MONTH_SQL)
-                .unwrap();
-            // batch_requests and schema_migrations deliberately omitted.
-        }
-        let err = match LedgerDb::open(&path) {
-            Ok(_) => panic!("expected LedgerDb::open to refuse a partial table set"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string().contains("KIO-E-STORE-CORRUPT-001"),
-            "got {err:?}"
-        );
-    }
-
-    // R23-24: a store whose 3 tables exactly match the DDL-of-record must open
-    // normally and still reach the existing CL08 index self-heal — the new
-    // detection must not false-positive on a legitimately-shaped store (every
-    // OTHER test in this module already exercises this implicitly; this test
-    // names the R23-24 non-regression explicitly).
-    #[test]
-    fn r23_24_matching_table_shape_opens_and_still_self_heals_index() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cost-ledger.sqlite");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(CREATE_COST_LEDGER_SQL).unwrap();
-            conn.execute_batch(CREATE_IDX_COST_LEDGER_MONTH_SQL)
-                .unwrap();
-            conn.execute_batch(CREATE_BATCH_REQUESTS_SQL).unwrap();
-            conn.execute_batch(CREATE_SCHEMA_MIGRATIONS_SQL).unwrap();
-            // idx_batch_requests_inflight deliberately omitted — proves shape
-            // detection runs (and passes) BEFORE the pre-existing index repair.
-        }
-        let db = LedgerDb::open(&path).unwrap();
-        assert!(
-            object_sql(&db.conn, "index", "idx_batch_requests_inflight")
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    // -----------------------------------------------------------------
-    // QA14 — write-sequence counter + restore-from-backup detection
-    // (step4b-contract-tests-p3a.md L307-321, 10-operations.md §7.5.2)
-    // -----------------------------------------------------------------
-
-    /// `PRAGMA user_version` writes participate in the ambient transaction
-    /// like any ordinary table write — a `bump_write_seq` call inside a
-    /// transaction that later ROLLS BACK must leave the counter unchanged
-    /// (this is what makes `phase1_intent`/`terminal_transaction`/
-    /// `cas_update_one`'s own SAVEPOINT-wrapped bumps safe: an error midway
-    /// through the wrapped write correctly un-bumps too).
-    #[test]
-    fn qa14_bump_write_seq_is_rolled_back_with_its_transaction() {
-        let (_dir, db) = open_temp();
-        let before = read_write_seq(&db.conn).unwrap();
-        db.conn.execute_batch("BEGIN;").unwrap();
-        bump_write_seq(&db.conn).unwrap();
-        assert_eq!(
-            read_write_seq(&db.conn).unwrap(),
-            before + 1,
-            "the bump is visible within its own still-open transaction"
-        );
-        db.conn.execute_batch("ROLLBACK;").unwrap();
-        assert_eq!(
-            read_write_seq(&db.conn).unwrap(),
-            before,
-            "a rolled-back transaction must not leave the bump in place"
-        );
-    }
-
-    /// The COMMIT-side counterpart: a bump inside a transaction that
-    /// actually commits persists (sanity check the rollback test above is
-    /// exercising a real transactional property, not merely "writes never
-    /// stick").
-    #[test]
-    fn qa14_bump_write_seq_persists_across_commit() {
-        let (_dir, db) = open_temp();
-        let before = read_write_seq(&db.conn).unwrap();
-        db.conn.execute_batch("BEGIN;").unwrap();
-        bump_write_seq(&db.conn).unwrap();
-        db.conn.execute_batch("COMMIT;").unwrap();
-        assert_eq!(read_write_seq(&db.conn).unwrap(), before + 1);
-    }
-
-    /// `bump_write_seq` saturates at `i32::MAX` rather than wrapping past it.
-    #[test]
-    fn qa14_bump_write_seq_saturates_at_i32_max() {
-        let (_dir, db) = open_temp();
-        db.conn
-            .execute_batch(&format!("PRAGMA user_version = {};", i32::MAX))
-            .unwrap();
-        bump_write_seq(&db.conn).unwrap();
-        assert_eq!(read_write_seq(&db.conn).unwrap(), i64::from(i32::MAX));
-    }
-
-    /// The companion file: absent -> `None`; written -> read back exactly;
-    /// atomic (temp+rename leaves no `.tmp` litter behind).
-    #[test]
-    fn qa14_write_seq_companion_roundtrips_and_absent_reads_as_none() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("cost-ledger.sqlite");
-        let companion_path = write_seq_companion_path(&db_path);
-        assert_eq!(read_write_seq_companion(&companion_path), None);
-
-        write_write_seq_companion(&companion_path, 42).unwrap();
-        assert_eq!(read_write_seq_companion(&companion_path), Some(42));
-
-        write_write_seq_companion(&companion_path, 43).unwrap();
-        assert_eq!(read_write_seq_companion(&companion_path), Some(43));
-
-        let mut tmp_os = companion_path.as_os_str().to_owned();
-        tmp_os.push(".tmp");
-        assert!(
-            !PathBuf::from(tmp_os).exists(),
-            "the temp file must be renamed away, not left behind"
-        );
-    }
-
-    /// A fresh store (no companion, no prior observation) never flags a
-    /// restore — first-run adoption — and leaves a companion behind for the
-    /// next open to compare against.
-    #[test]
-    fn qa14_fresh_store_first_open_adopts_baseline_without_flagging() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cost-ledger.sqlite");
-        let db = LedgerDb::open(&path).unwrap();
-        assert!(!restore_reconcile_marker_present(&db.conn).unwrap());
-        let companion = write_seq_companion_path(&path);
-        assert_eq!(
-            read_write_seq_companion(&companion),
-            Some(read_write_seq(&db.conn).unwrap())
-        );
-    }
-
-    /// The full QA14 detection flow, driven purely through this module's own
-    /// primitives (no dependency on `ops.rs`): open once (baseline
-    /// companion=0) -> the DB's `user_version` is advanced (simulating any
-    /// mutating ledger operation) -> the companion is refreshed to observe
-    /// that advance (simulating the post-commit sync every real bump site
-    /// performs) -> the DB is rolled back to an OLDER `user_version` without
-    /// touching the companion (simulating a `.backup`/restore, which is
-    /// indistinguishable at this layer from "someone rewrote the header") ->
-    /// the next `open` must flag it, persist the marker (idempotently on a
-    /// THIRD open), and re-arm the companion to the restored value.
-    #[test]
-    fn qa14_open_detects_restore_persists_marker_and_refreshes_companion() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cost-ledger.sqlite");
-        let companion = write_seq_companion_path(&path);
-
-        {
-            let db = LedgerDb::open(&path).unwrap();
-            assert_eq!(read_write_seq(&db.conn).unwrap(), 0);
-        }
-        assert_eq!(read_write_seq_companion(&companion), Some(0));
-
-        // Simulate ordinary forward operation advancing the counter, and the
-        // post-commit companion sync every real bump site performs.
-        {
-            let db = LedgerDb::open(&path).unwrap();
-            db.conn.execute_batch("PRAGMA user_version = 5;").unwrap();
-            write_write_seq_companion(&companion, 5).unwrap();
-        }
-        assert_eq!(read_write_seq_companion(&companion), Some(5));
-
-        // Simulate a restore: the DB file now reports an OLDER value than
-        // the companion last observed, with the companion itself untouched
-        // (a real `.backup`/restore only ever replaces the DB file).
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch("PRAGMA user_version = 2;").unwrap();
-        }
-        assert_eq!(read_write_seq_companion(&companion), Some(5));
-
-        let db2 = LedgerDb::open(&path).unwrap();
-        assert!(
-            restore_reconcile_marker_present(&db2.conn).unwrap(),
-            "user_version regressing (2 < companion's 5) must flag a restore"
-        );
-        assert_eq!(
-            read_write_seq_companion(&companion),
-            Some(2),
-            "the companion must re-arm to the (restored) DB's current value"
-        );
-        drop(db2);
-
-        // A THIRD open (no further tampering): the companion now equals the
-        // DB's value, so detection does not re-fire — but the marker,
-        // already persisted, is the durable source of truth and must still
-        // be present (and re-persisting it must not panic on the
-        // schema_migrations PRIMARY KEY — this is the idempotency guard).
-        let db3 = LedgerDb::open(&path).unwrap();
-        assert!(restore_reconcile_marker_present(&db3.conn).unwrap());
-    }
-
-    /// `clear_restore_reconcile_marker`: idempotent (`false` when absent),
-    /// and actually removes a present marker.
-    #[test]
-    fn qa14_clear_restore_reconcile_marker_is_idempotent() {
-        let (_dir, db) = open_temp();
-        assert!(!clear_restore_reconcile_marker(&db.conn).unwrap());
-        record_marker(&db.conn, RESTORE_RECONCILE_PENDING_MARKER).unwrap();
-        assert!(restore_reconcile_marker_present(&db.conn).unwrap());
-        assert!(clear_restore_reconcile_marker(&db.conn).unwrap());
-        assert!(!restore_reconcile_marker_present(&db.conn).unwrap());
-        // A second clear on an already-absent marker is a no-op, not an error.
-        assert!(!clear_restore_reconcile_marker(&db.conn).unwrap());
-    }
-
-    /// `PRAGMA integrity_check` on a healthy store reports `"ok"`.
-    #[test]
-    fn qa14_integrity_check_reports_ok_on_a_healthy_store() {
-        let (_dir, db) = open_temp();
-        assert_eq!(integrity_check(&db.conn).unwrap(), "ok");
     }
 }

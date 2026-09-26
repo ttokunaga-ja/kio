@@ -779,30 +779,30 @@ fn validate_log(
                 reason: "noncanonical commit or tree hash".into(),
             });
         }
-        let expected_parents = if index + 1 == commits.len() {
-            Vec::new()
+        let expected_parent = if index + 1 == commits.len() {
+            None
         } else {
-            vec![
+            Some(
                 commits[index + 1]
                     .get("commit_hash")
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
-            ]
+            )
         };
-        let parents = commit
-            .get("parents")
-            .and_then(Value::as_array)
+        let parent = commit
+            .get("parent")
+            .and_then(|parent| {
+                if parent.is_null() {
+                    Some(None)
+                } else {
+                    parent.as_str().map(Some)
+                }
+            })
             .ok_or_else(|| ReplayError::Result {
                 command: "log",
-                reason: "parents missing".into(),
+                reason: "parent missing".into(),
             })?;
-        if parents
-            .iter()
-            .map(Value::as_str)
-            .collect::<Option<Vec<_>>>()
-            .as_deref()
-            != Some(expected_parents.as_slice())
-        {
+        if parent != expected_parent {
             return Err(ReplayError::Result {
                 command: "log",
                 reason: "parent chain mismatch".into(),
@@ -871,8 +871,7 @@ mod tests {
         for index in 0..commits.len() {
             let parent =
                 (index + 1 < commits.len()).then(|| commits[index + 1]["commit_hash"].clone());
-            commits[index]["parents"] =
-                parent.map_or_else(|| serde_json::json!([]), |value| serde_json::json!([value]));
+            commits[index]["parent"] = parent.unwrap_or(serde_json::Value::Null);
         }
         BoundedProcessOutput {
             status: Command::new("true").status().unwrap(),
@@ -947,7 +946,7 @@ mod tests {
         let good = valid_research_log();
         assert!(validate_log(&good, "research", 8).is_ok());
         let mut value: Value = serde_json::from_str(&good.stdout).unwrap();
-        value["commits"][0]["parents"] = serde_json::json!([]);
+        value["commits"][0]["parent"] = serde_json::Value::Null;
         let broken = BoundedProcessOutput {
             stdout: value.to_string(),
             ..good.clone()

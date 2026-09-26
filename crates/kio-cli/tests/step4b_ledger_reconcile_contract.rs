@@ -92,8 +92,15 @@ fn json_failure_mock_send(dir: &TempDir, args: &[&str]) -> (i32, Value) {
     (code, stderr)
 }
 
-fn init(dir: &TempDir) {
+fn init_scope(dir: &TempDir) {
     json_success(dir, &["init"]);
+}
+
+/// Paid-ledger tests initialize a ledger explicitly.  Scope initialization
+/// never creates a device-global billing authority as a side effect.
+fn init(dir: &TempDir) {
+    init_scope(dir);
+    LedgerDb::initialize(ledger_path(dir)).unwrap();
 }
 
 fn scope_json(dir: &TempDir) -> Value {
@@ -120,7 +127,9 @@ fn fake_pdf(pages: &[&str]) -> String {
 }
 
 fn ledger_path(dir: &TempDir) -> PathBuf {
-    dir.path().join(".test-data/kio/cost-ledger.sqlite")
+    fs::canonicalize(dir.path())
+        .unwrap()
+        .join(".test-data/kio/cost-ledger.sqlite")
 }
 
 fn wal_sidecar_paths(ledger_path: &Path) -> (PathBuf, PathBuf) {
@@ -307,29 +316,30 @@ fn write_inventory_fixture(dir: &TempDir, inventories: &Value) -> PathBuf {
 // QA14 — restore-from-backup detection gates new submissions
 // ---------------------------------------------------------------------------
 
-/// QA14: a restored (older) `cost-ledger.sqlite` is detected on the next
-/// `LedgerDb::open`, refuses any NEW online submission
-/// (`KIO-E-BATCH-RESTORE-RECONCILE-001`) until `kio ledger reconcile` runs,
-/// and resumes normal operation afterward.
+/// QA14: restoring an older SQLite main file leaves the current checkpoint in
+/// place. The resulting sequence gap blocks both a new paid operation and an
+/// ordinary reconcile; neither command may silently repair the ledger.
 #[test]
 fn qa14_restore_detection_gates_new_submissions() {
     let dir = tempfile::tempdir().unwrap();
     init(&dir);
 
-    // Send #1: the ledger gets its first row, the write-seq counter and its
-    // companion file both advance for the first time.
+    // Send #1: the ledger gets its first row and the authority-bound checkpoint
+    // advances for the first time.
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["alpha"])).unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
+    json_success(&dir, &["adapter", "approve", "--all", "--yes"]);
     json_success_mock_send(&dir, &["batch", "resume"]);
 
     let ledger = ledger_path(&dir);
     let snapshot = dir.path().join("cost-ledger.sqlite.snapshot");
     snapshot_ledger(&ledger, &snapshot);
 
-    // Send #2: the ledger advances further — the companion is now PAST the
+    // Send #2: the ledger advances further — the checkpoint is now PAST the
     // point the snapshot captured.
     fs::write(dir.path().join("b.pdf"), fake_pdf(&["beta"])).unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
+    json_success(&dir, &["adapter", "approve", "--all", "--yes"]);
     json_success_mock_send(&dir, &["batch", "resume"]);
 
     // A third file's task is enqueued BEFORE the restore, so the restore
@@ -337,79 +347,104 @@ fn qa14_restore_detection_gates_new_submissions() {
     // processing does or does not touch the ledger — only the SEND
     // (`batch resume`, below) is under test.
     fs::write(dir.path().join("c.pdf"), fake_pdf(&["gamma"])).unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
+    json_success(&dir, &["adapter", "approve", "--all", "--yes"]);
+
+    let checkpoint_path = ledger.with_file_name("cost-ledger.sqlite.checkpoint.json");
+    let checkpoint_before_restore = fs::read(&checkpoint_path).unwrap();
 
     // "Stop" (nothing running) — restore the snapshot over the live DB,
     // emulating 10 §7.5.2's documented backup/restore procedure.
     restore_ledger(&ledger, &snapshot);
 
-    // The NEW submission (file c's send) must be refused.
+    // The NEW submission (file c's send) must be refused before the mock
+    // provider seam can perform a service call.
     let (code, error) = json_failure_mock_send(&dir, &["batch", "resume"]);
+    assert_eq!(code, 3, "got {error}");
     assert_eq!(
-        error["error_code"], "KIO-E-BATCH-RESTORE-RECONCILE-001",
+        error["error_code"], "KIO-E-LEDGER-SEQUENCE-MISMATCH-001",
         "got {error}"
     );
-    // pipeline_to_kio's `Contract` branch maps every code other than
-    // KIO-E-STORE-CONSTRAINT-001 to the generic ExitCode::Failure (1).
-    assert_eq!(
-        code, 1,
-        "exit code must be the generic Failure (1): {error}"
-    );
-
-    // `kio ledger reconcile` succeeds and reports the marker cleared.
-    let reconcile = json_success(&dir, &["ledger", "reconcile"]);
-    assert_eq!(reconcile["integrity"], "ok", "got {reconcile}");
-    assert_eq!(
-        reconcile["reconcile_marker_cleared"], true,
-        "got {reconcile}"
-    );
-
-    // Sends now proceed normally again — file c's still-Pending task sends.
-    let resumed = json_success_mock_send(&dir, &["batch", "resume"]);
-    assert_eq!(resumed["tasks_failed"], 0, "got {resumed}");
     assert!(
-        resumed["tasks_executed"].as_u64().unwrap_or(0) >= 1,
-        "got {resumed}"
+        error["error_code"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("LEDGER"),
+        "a restored sequence gap must fail at lifecycle validation: {error}"
+    );
+    assert_eq!(
+        fs::read(&checkpoint_path).unwrap(),
+        checkpoint_before_restore
     );
 
-    // A THIRD `kio ledger reconcile` (no restore pending) is a harmless,
-    // idempotent no-op read: marker was already absent.
-    let reconcile_again = json_success(&dir, &["ledger", "reconcile"]);
+    // Ordinary reconciliation has no authority to heal this gap. A future
+    // explicit recovery workflow needs its own test; it must prove no provider
+    // service calls occur before recovery authority is established.
+    let output = kio(&dir, &["ledger", "reconcile"])
+        .arg("--json")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let reconcile_error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert!(
+        reconcile_error["error_code"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("LEDGER"),
+        "ordinary reconcile must not report a successful repair: {reconcile_error}"
+    );
     assert_eq!(
-        reconcile_again["reconcile_marker_cleared"], false,
-        "got {reconcile_again}"
+        fs::read(&checkpoint_path).unwrap(),
+        checkpoint_before_restore
     );
 }
 
-/// QA14: the CLEANUP-PENDING precedent's "Reused arm stays allowed" mirror —
-/// resending an EXISTING open reservation must not be blocked by the restore
-/// gate. Exercised implicitly: `qa14_restore_detection_gates_new_submissions`
-/// already proves the SOLE Pending (never-yet-reserved) task is what trips
-/// the gate; this test confirms an ALREADY-reserved row (one whose
-/// `phase1_intent` ran before the restore was ever taken) still resolves via
-/// the "Reused" path without hitting `phase1_intent`'s INSERT at all — i.e.
-/// it does not error, even while the marker is present — by directly
-/// inspecting the ledger state around a restore with no new file added.
+/// QA14: a restored database behind its authority-bound checkpoint also blocks
+/// status. The read must not silently accept the old database or rewrite the
+/// checkpoint to manufacture a new baseline.
 #[test]
-fn qa14_marker_present_does_not_disturb_read_only_status() {
+fn qa14_sequence_gap_blocks_status_without_mutating_lifecycle_artifacts() {
     let dir = tempfile::tempdir().unwrap();
     init(&dir);
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["alpha"])).unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
+    json_success(&dir, &["adapter", "approve", "--all", "--yes"]);
     json_success_mock_send(&dir, &["batch", "resume"]);
 
     let ledger = ledger_path(&dir);
     let snapshot = dir.path().join("cost-ledger.sqlite.snapshot");
     snapshot_ledger(&ledger, &snapshot);
     fs::write(dir.path().join("b.pdf"), fake_pdf(&["beta"])).unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index", "--yes"]);
+    json_success(&dir, &["adapter", "approve", "--all", "--yes"]);
     json_success_mock_send(&dir, &["batch", "resume"]);
     restore_ledger(&ledger, &snapshot);
+    let checkpoint_path = ledger.with_file_name("cost-ledger.sqlite.checkpoint.json");
+    let checkpoint_before_status = fs::read(&checkpoint_path).unwrap();
+    let authority_path = ledger.with_file_name("cost-ledger.sqlite.authority.json");
+    let authority_before_status = fs::read(&authority_path).unwrap();
 
-    // `kio status` is read-only and must succeed even with a restore
-    // pending — "Read-only commands and non-ledger writes are unaffected."
-    let status = json_success(&dir, &["status"]);
-    assert!(status.get("files").is_some(), "got {status}");
+    // Status reads an owned snapshot rather than reopening the mutable source.
+    // The stable lifecycle mismatch therefore reaches its public read path as
+    // an unsafe snapshot, while the paid submission path remains the direct
+    // sequence-mismatch exit checked above.
+    let output = kio(&dir, &["status"])
+        .arg("--json")
+        .assert()
+        .code(4)
+        .get_output()
+        .clone();
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(
+        error["error_code"], "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001",
+        "{error}"
+    );
+    assert_eq!(
+        fs::read(&checkpoint_path).unwrap(),
+        checkpoint_before_status
+    );
+    assert_eq!(fs::read(&authority_path).unwrap(), authority_before_status);
 }
 
 // ---------------------------------------------------------------------------
@@ -507,10 +542,10 @@ fn qa15_orphan_attribution_walk() {
 
     // Nothing was mutated: no batch_requests row exists for any of these
     // task keys (they were never created).
-    let ledger = LedgerDb::open(ledger_path(&dir)).unwrap();
-    let conn = ledger.connection();
+    let ledger = LedgerDb::open_existing(ledger_path(&dir)).unwrap();
+    let conn = Connection::open(ledger.path()).unwrap();
     assert!(!batch_request_row_exists(
-        conn,
+        &conn,
         &local_scope_id,
         "markdownize",
         "sha256:orphan-input",
@@ -541,7 +576,7 @@ fn qa15_orphan_attribution_walk() {
 #[test]
 fn qa15_batch_recovery_walk_first_wiring() {
     let dir = tempfile::tempdir().unwrap();
-    init(&dir);
+    init_scope(&dir);
     let scope_id = scope_json(&dir)["scope_id"].as_str().unwrap().to_owned();
 
     let old_millis = (now_millis() - 50 * 3_600 * 1_000) as u64; // 50h ago
@@ -550,15 +585,14 @@ fn qa15_batch_recovery_walk_first_wiring() {
     let token_unlistable = synthetic_uuid_v7(old_millis, 0x03);
 
     {
-        // `LedgerDb::open` (not a raw `Connection::open`) so the schema
-        // exists — `init` alone does not create `cost-ledger.sqlite`; only a
-        // ledger-touching command (or, here, this direct open) does.
-        let ledger = LedgerDb::open(ledger_path(&dir)).unwrap();
-        let conn = ledger.connection();
+        // The paid-ledger fixture creates a fresh authority-bound ledger
+        // explicitly; `init` itself does not implicitly create one.
+        let ledger = LedgerDb::initialize(ledger_path(&dir)).unwrap();
+        let conn = Connection::open(ledger.path()).unwrap();
         // Row A: provider scope is covered by the inventory, and the
         // inventory lists a job with this exact intent_token -> found.
         insert_batch_request_row(
-            conn,
+            &conn,
             &scope_id,
             "markdownize",
             "sha256:row-a-input",
@@ -572,7 +606,7 @@ fn qa15_batch_recovery_walk_first_wiring() {
         // deadline (48h default) and the visibility grace period (10min
         // default) -> confirmed-absent -> settled unknown.
         insert_batch_request_row(
-            conn,
+            &conn,
             &scope_id,
             "markdownize",
             "sha256:row-b-input",
@@ -584,7 +618,7 @@ fn qa15_batch_recovery_walk_first_wiring() {
         // Row C: a provider scope with NO configured inventory at all ->
         // unlistable, must stay completely untouched.
         insert_batch_request_row(
-            conn,
+            &conn,
             &scope_id,
             "markdownize",
             "sha256:row-c-input",

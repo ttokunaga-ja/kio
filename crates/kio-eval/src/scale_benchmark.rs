@@ -485,7 +485,7 @@ fn verify_deleted_restore(
     let mut command = executable.command().map_err(boundary)?;
     command
         .arg("--json")
-        .arg("restore")
+        .arg("export")
         .arg(serde_json::to_string(pointer)?)
         .arg("--to")
         .arg(destination.path());
@@ -510,7 +510,7 @@ fn verify_deleted_restore(
     let receipt: Value = serde_json::from_str(&output.stdout)
         .map_err(|_| ScaleBenchmarkError::Input("restore returned invalid JSON".into()))?;
     if receipt.get("source_kind").and_then(Value::as_str) != Some("evidence")
-        || receipt.get("restored_count").and_then(Value::as_u64) != Some(1)
+        || receipt.get("exported_count").and_then(Value::as_u64) != Some(1)
     {
         return Err(ScaleBenchmarkError::Input(
             "restore receipt does not bind one evidence object".into(),

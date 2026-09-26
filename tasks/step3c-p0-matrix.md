@@ -102,7 +102,7 @@ what was wrong before and what closed it.
 | EVIDENCE-002 | `ct3_evidence_002_live_pointer_commit_matches_searched_scope_snapshot` | CLI | ok |
 | EVIDENCE-003 | `ct3_evidence_003_scope_resolves_via_path_then_registry` | CLI | ok — exercises all 3 branches (a: scope_path stage only, via empty registry; b: broken scope_path + registry lookup by scope_id; c: both fail → scope_unreachable) |
 | EVIDENCE-004 | `ct3_evidence_004_resolves_through_pointer_commit_tree` | CLI | ok — strong discriminator: advances HEAD, proves the old pointer still resolves via its own commit's tree (not HEAD's), then proves pointing a newer file's pointer at the *older* commit fails (rules out a naive working-tree-scan shortcut) |
-| EVIDENCE-005 | `ct3_evidence_005_shallow_commit_resolves_directly` | CLI | ok — hand-deletes the tree object, confirms `commit_shallow: true` and direct raw_hash/chunk_hash resolution for both `view` and `open` |
+| EVIDENCE-005 | `ct3_evidence_005_shallow_commit_rejects_pointer_and_preserves_tree_controls` | CLI | ok — valid shallow receipt により tree object が欠落する pointer は、`view` / `open` の両方で `KIO-E-COMMIT-SHALLOW-001` となる。raw_hash / chunk_hash / HEAD による代替解決を行わず、tree を backup から復元して再実行する |
 | EVIDENCE-006 | `ct3_evidence_006_three_valued_resolution_failures` | CLI | ok — all 3 branches (tombstoned via hand-placed tombstone file / not_found via missing raw object / scope_unreachable) |
 | EVIDENCE-009 | `ct3_evidence_009_eval_reads_raw_hash_and_section_from_pointer` | CLI | ok |
 

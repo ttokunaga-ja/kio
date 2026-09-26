@@ -13,8 +13,9 @@ use crate::identity::tool_profile_hash;
 use crate::local_embedding::IMAGE_OBJECT_CAPABILITY;
 use crate::traits::EmbeddingAdapter;
 use crate::types::{
-    AdapterKind, AdapterProfile, BillingDeclaration, EmbeddingRequest, EmbeddingResponse,
-    EmbeddingVector, ExecutionMode, ProviderIdempotency, validate_cosine_vector,
+    AdapterKind, AdapterProfile, BillingDeclaration, EmbeddingContent, EmbeddingRequest,
+    EmbeddingResponse, EmbeddingVector, ExecutionMode, ProviderIdempotency, validate_cosine_vector,
+    validate_embedding_request_bytes,
 };
 
 pub const DETERMINISTIC_EVAL_EMBEDDING_ADAPTER_ID: &str = "kio_eval_deterministic_embedding";
@@ -140,12 +141,22 @@ impl EmbeddingAdapter for DeterministicEmbeddingAdapter {
     }
 
     fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        validate_embedding_request_bytes(&request)?;
         let vectors = request
             .items
             .iter()
             .map(|item| {
-                let seed = item.text.as_deref().unwrap_or(item.id.as_str());
-                let vector = deterministic_token_embedding(seed);
+                let vector = match &item.content {
+                    EmbeddingContent::Text { text } => deterministic_token_embedding(text),
+                    EmbeddingContent::Image { bytes, .. } => {
+                        let digest = Sha256::digest(bytes);
+                        let fingerprint = digest
+                            .iter()
+                            .map(|byte| format!("{byte:02x}"))
+                            .collect::<String>();
+                        deterministic_token_embedding(&format!("image:{fingerprint}"))
+                    }
+                };
                 validate_cosine_vector(&vector, DETERMINISTIC_EVAL_EMBEDDING_DIMENSIONS)?;
                 Ok(EmbeddingVector {
                     id: item.id.clone(),
@@ -167,7 +178,7 @@ impl EmbeddingAdapter for DeterministicEmbeddingAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{EmbeddingInputType, EmbeddingItem};
+    use crate::types::{EmbeddingContent, EmbeddingInputType, EmbeddingItem};
 
     #[test]
     fn profile_is_non_network_non_billable_deterministic_library() {
@@ -190,18 +201,8 @@ mod tests {
         let request = EmbeddingRequest {
             input_type: EmbeddingInputType::MarkdownChunk,
             items: vec![
-                EmbeddingItem {
-                    id: "a".to_owned(),
-                    text: Some("alpha".to_owned()),
-                    path: None,
-                    mime: None,
-                },
-                EmbeddingItem {
-                    id: "b".to_owned(),
-                    text: Some("beta".to_owned()),
-                    path: None,
-                    mime: None,
-                },
+                EmbeddingItem::text("a", "alpha"),
+                EmbeddingItem::text("b", "beta"),
             ],
             idempotency_token: None,
         };
@@ -214,6 +215,31 @@ mod tests {
             validate_cosine_vector(&vector.vector, DETERMINISTIC_EVAL_EMBEDDING_DIMENSIONS)
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn image_embedding_fingerprints_the_supplied_bytes() {
+        let adapter = DeterministicEmbeddingAdapter;
+        let embed = |bytes| {
+            adapter
+                .embed(EmbeddingRequest {
+                    input_type: EmbeddingInputType::ImageObject,
+                    items: vec![EmbeddingItem {
+                        id: "image".to_owned(),
+                        content: EmbeddingContent::Image {
+                            bytes,
+                            mime: "image/png".to_owned(),
+                        },
+                    }],
+                    idempotency_token: None,
+                })
+                .unwrap()
+                .vectors
+                .pop()
+                .unwrap()
+                .vector
+        };
+        assert_ne!(embed(vec![1, 2, 3]), embed(vec![1, 2, 4]));
     }
 
     #[test]

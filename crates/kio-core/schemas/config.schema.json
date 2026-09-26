@@ -134,7 +134,7 @@
         "derived_retention": {
           "type": "object",
           "properties": {
-            "keep_repaired_per_branch": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
+            "keep_repaired": { "type": "integer", "minimum": 0, "maximum": 4294967295 }
           },
           "additionalProperties": false
         }
@@ -223,7 +223,8 @@
             "offline_api": {
               "type": "object",
               "properties": {
-                "timeout_seconds": { "type": "integer", "minimum": 1 }
+                "timeout_seconds": { "type": "integer", "minimum": 1 },
+                "ca_pem_path": { "type": "string", "minLength": 1 }
               },
               "additionalProperties": false
             },

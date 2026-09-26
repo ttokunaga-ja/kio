@@ -318,6 +318,15 @@ fn replace_scope_id(path: &Path, scope_id: &str) {
     let mut scope: Value = serde_json::from_str(&fs::read_to_string(&scope_path).unwrap()).unwrap();
     scope["scope_id"] = serde_json::json!(scope_id);
     fs::write(scope_path, serde_json::to_vec_pretty(&scope).unwrap()).unwrap();
+    // Fixture-only identity pinning before enrollment/index. A management
+    // record is part of the authority; changing portable scope.json alone
+    // deliberately invalidates membership in v1.
+    let record_path = path.join(".kio/management.json");
+    let mut record: Value = serde_json::from_slice(&fs::read(&record_path).unwrap()).unwrap();
+    assert_eq!(record["authority"]["kind"], "root");
+    assert!(record["children"].as_object().unwrap().is_empty());
+    record["scope_id"] = serde_json::json!(scope_id);
+    fs::write(record_path, serde_json::to_vec_pretty(&record).unwrap()).unwrap();
 }
 
 fn indexed_scope() -> TempDir {
@@ -333,7 +342,7 @@ fn indexed_scope() -> TempDir {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
     dir
 }
 
@@ -375,7 +384,7 @@ fn ranking_fixture() -> &'static RankingFixture {
             fs::write(dir.path().join(format!("filler-{n:02}.md")), body).unwrap();
         }
         kio(&dir, &["init"]).assert().success();
-        json_success(&dir, &["index", "--approve"]);
+        json_success(&dir, &["index"]);
         RankingFixture { dir }
     })
 }
@@ -539,6 +548,19 @@ fn json_success_embed_at(dir: &TempDir, embed: &str, fixed_now: &str, args: &[&s
     serde_json::from_slice(&output).unwrap()
 }
 
+/// Paid adapters must opt into a separately initialized device ledger.  Keep
+/// this explicit in fixtures: scope initialization only creates `.kio`.
+fn initialize_paid_ledger(dir: &TempDir) {
+    kio(dir, &["ledger", "init"]).assert().success();
+}
+
+/// Grant a configured embedding adapter before an online fixture executes it.
+/// Keeping this separate from `index` ensures the fixture cannot accidentally
+/// depend on an index-side consent path.
+fn approve_embed(dir: &TempDir, embed: &str) {
+    json_success_embed(dir, embed, &["adapter", "approve", "--all", "--yes"]);
+}
+
 fn run_embed_path(path: &Path, data_home: &Path, embed: &str, args: &[&str]) -> Value {
     let output = hermetic_kio_command()
         .current_dir(path)
@@ -570,7 +592,9 @@ fn indexed_scope_embed(embed: &str) -> TempDir {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed(&dir, embed, &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, embed);
+    json_success_embed(&dir, embed, &["index"]);
     dir
 }
 
@@ -624,6 +648,8 @@ fn ct3_hybrid_001_auto_resolves_to_hybrid_with_rrf_fusion() {
 #[test]
 fn ct3_hybrid_002_auto_vector_configured_but_absent_falls_back_visibly() {
     let dir = indexed_scope(); // indexed without an embedding adapter → no vectors
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
     // (a) endpoint truly unconfigured → the 05 §1.7 example string.
     // "off" is an unrecognized seam value → no adapter, regardless of any
     // ambient GEMINI_API_KEY.
@@ -643,7 +669,7 @@ fn ct3_hybrid_002_auto_vector_configured_but_absent_falls_back_visibly() {
     assert_eq!(search["error_code"], "KIO-E-SEARCH-VEC-UNAVAIL-001");
     // (c) pair-discrimination: embed the same scope, then the SAME query resolves
     // hybrid with the fallback gone.
-    json_success_embed(&dir, "mock", &["index", "--approve"]);
+    json_success_embed(&dir, "mock", &["index"]);
     let hybrid = json_success_embed(&dir, "mock", &["search", "トークン TTL 3600"]);
     assert_eq!(hybrid["resolved_mode"], "hybrid");
     assert_eq!(hybrid["fallback"], false);
@@ -679,7 +705,7 @@ fn f2_nfd_body_is_found_by_nfc_query() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
 
     // Composed (NFC) query "café": the byte substring is absent from the NFD
     // content, so only the normalized index projection makes this hit.
@@ -695,23 +721,49 @@ fn f2_nfd_body_is_found_by_nfc_query() {
 // (does not fall back, distinct from UNAVAIL).
 #[test]
 fn ct3_embed_002_incompatible_profile_falls_back_or_errors() {
-    let dir = indexed_scope_embed("incompatible_profile");
-    let auto = json_success_embed(
-        &dir,
-        "incompatible_profile",
-        &["search", "トークン TTL 3600"],
+    let dir = indexed_scope_embed("mock");
+    // A foreign/stale vector profile is derived index state.  Do not attempt to
+    // authorize a foreign runtime tool identity merely to create this fixture.
+    let conn = index_db(&dir);
+    assert!(
+        conn.execute(
+            "UPDATE embeddings SET profile_hash = ?1 WHERE target_type = 'chunk'",
+            ["sha256:00000000000000000000000000000000000000000000000000000000incompat"],
+        )
+        .unwrap()
+            > 0
     );
+    drop(conn);
+    let replica =
+        rusqlite::Connection::open(dir.path().join(".test-cache/kio/aggregator.sqlite")).unwrap();
+    let profiles_json: String = replica
+        .query_row(
+            "SELECT embedding_profiles_json FROM agg_scopes",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut profiles: Value = serde_json::from_str(&profiles_json).unwrap();
+    profiles[0]["profile_hash"] = serde_json::json!(
+        "sha256:00000000000000000000000000000000000000000000000000000000incompat"
+    );
+    assert_eq!(
+        replica
+            .execute(
+                "UPDATE agg_scopes SET embedding_profiles_json = ?1",
+                [serde_json::to_string(&profiles).unwrap()],
+            )
+            .unwrap(),
+        1
+    );
+    drop(replica);
+    let auto = json_success_embed(&dir, "mock", &["search", "トークン TTL 3600"]);
     assert_eq!(auto["resolved_mode"], "text");
     assert_eq!(auto["fallback"], true);
     assert_eq!(auto["error_code"], "KIO-E-SEARCH-VEC-INCOMPAT-001");
     // R23-14(a) (05 §1.8 L425 / 06 §7 L330): explicit --vector's INCOMPAT
     // hard error is exit 8 (IncompatibleProfile), not the generic exit 1.
-    let err = json_failure_embed(
-        &dir,
-        "incompatible_profile",
-        &["search", "トークン", "--mode", "vector"],
-        8,
-    );
+    let err = json_failure_embed(&dir, "mock", &["search", "トークン", "--mode", "vector"], 8);
     assert_eq!(err["error_code"], "KIO-E-SEARCH-VEC-INCOMPAT-001");
 }
 
@@ -938,7 +990,7 @@ fn view_offset_translation_is_correct_for_a_chunk_past_the_first_unit() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
 
     let search = json_success(&dir, &["search", "pagetwosecondunique"]);
     let result = first_result(&search);
@@ -1150,7 +1202,7 @@ fn ct3_chunk_008_deleted_file_does_not_remove_existing_chunk_rows() {
     let dir = indexed_scope();
     let before = line_count(dir.path().join(".kio/index/chunks.jsonl"));
     fs::remove_file(dir.path().join("auth.md")).unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
     let after = line_count(dir.path().join(".kio/index/chunks.jsonl"));
     assert!(after >= before);
 }
@@ -1325,7 +1377,7 @@ fn ct3_chunk_007_chunking_config_change_appends_new_generation_chunks() {
         "[chunking]\nstrategy = \"heading\"\nmax_chars = 25\n",
     )
     .unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
     let after = line_count(dir.path().join(".kio/index/chunks.jsonl"));
     assert!(after > before);
 }
@@ -1352,7 +1404,7 @@ fn ct3_chunk_007_search_only_serves_current_chunking_config_generation() {
         "[chunking]\nstrategy = \"heading\"\nmax_chars = 10\n",
     )
     .unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
 
     let after = json_success(&dir, &["search", "トークン TTL 3600"]);
     let after_hashes = chunk_hash_set(&after);
@@ -1382,7 +1434,7 @@ fn ct4_current_config_association_is_added_for_deleted_history() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
 
     let db_path = dir.path().join(".kio/index/sqlite.db");
     let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -1397,13 +1449,13 @@ fn ct4_current_config_association_is_added_for_deleted_history() {
     drop(conn);
 
     fs::remove_file(dir.path().join("historical.md")).unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
     fs::write(
         dir.path().join(".kio/config.toml"),
         "[chunking]\nstrategy = \"heading\"\nmax_chars = 5999\n",
     )
     .unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
 
     let conn = rusqlite::Connection::open(&db_path).unwrap();
     let current_config: String = conn
@@ -1514,11 +1566,11 @@ fn ct4_rebuild_rederives_historical_tree_projection_from_cas() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("cached.md"), "# C1\n\nfirst snapshot\n").unwrap();
     kio(&dir, &["init"]).assert().success();
-    let first = json_success(&dir, &["index", "--approve"]);
+    let first = json_success(&dir, &["index"]);
     let first_commit = first["commit_hash"].as_str().unwrap().to_owned();
 
     fs::write(dir.path().join("cached.md"), "# C2\n\nsecond snapshot\n").unwrap();
-    let second = json_success(&dir, &["index", "--approve"]);
+    let second = json_success(&dir, &["index"]);
     let second_commit = second["commit_hash"].as_str().unwrap();
     assert_ne!(first_commit, second_commit);
 
@@ -1593,7 +1645,7 @@ fn ct4_rebuild_does_not_carry_tree_rows_that_exist_only_in_old_sqlite() {
 }
 
 #[test]
-fn ct4_rebuild_rederives_tag_only_tree_projection_from_cas() {
+fn ct4_rebuild_rejects_a_detached_tag_outside_the_linear_history() {
     let dir = indexed_scope();
     let repo = Repository::open(dir.path()).unwrap();
     let head = repo.head_commit_hash().unwrap().unwrap();
@@ -1602,7 +1654,7 @@ fn ct4_rebuild_rederives_tag_only_tree_projection_from_cas() {
     // immutable CAS, and the sole current ref is a canonical tag.
     let detached = CommitObject::new(
         base.tree.clone(),
-        Vec::new(),
+        None,
         base.created_at.clone(),
         "tag-only detached projection root".to_owned(),
         base.tool_lock_hash.clone(),
@@ -1620,21 +1672,23 @@ fn ct4_rebuild_rederives_tag_only_tree_projection_from_cas() {
     fs::write(tag_path, &tag_only).unwrap();
 
     fs::remove_file(dir.path().join(".kio/index/sqlite.db")).unwrap();
-    json_success(&dir, &["repair", "rebuild-db"]);
-    let conn = rusqlite::Connection::open(dir.path().join(".kio/index/sqlite.db")).unwrap();
+    let error = json_failure(&dir, &["repair", "rebuild-db"], 2);
     assert!(
-        conn.query_row(
-            "SELECT COUNT(*) FROM tree_entries WHERE commit_hash = ?1",
-            rusqlite::params![tag_only],
-            |row| row.get::<_, u64>(0),
-        )
-        .unwrap()
-            > 0
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("linear ancestry chain"),
+        "{error}"
     );
+    assert_eq!(
+        repo.head_commit_hash().unwrap().as_deref(),
+        Some(head.as_str())
+    );
+    assert!(!dir.path().join(".kio/index/sqlite.db").exists());
 }
 
 #[test]
-fn ct4_rebuild_uses_canonical_tag_when_head_and_main_are_unborn() {
+fn ct4_rebuild_rejects_canonical_tag_when_head_is_unborn() {
     let dir = indexed_scope();
     let repo = Repository::open(dir.path()).unwrap();
     let tagged_commit = repo.head_commit_hash().unwrap().unwrap();
@@ -1643,23 +1697,19 @@ fn ct4_rebuild_uses_canonical_tag_when_head_and_main_are_unborn() {
         .join("refs/tags-v1")
         .join(portable_tag_leaf("sole-root"));
     fs::write(tag_path, &tagged_commit).unwrap();
-    // A valid tag remains a current root even after the branch is deliberately
-    // unborn.  Rebuild must not return early merely because HEAD is empty.
-    fs::write(repo.kio_dir().join("HEAD"), b"").unwrap();
-    fs::write(repo.kio_dir().join("refs/heads/main"), b"").unwrap();
+    fs::write(repo.kio_dir().join("HEAD"), b"unborn\n").unwrap();
     fs::remove_file(dir.path().join(".kio/index/sqlite.db")).unwrap();
 
-    json_success(&dir, &["repair", "rebuild-db"]);
-    let conn = rusqlite::Connection::open(dir.path().join(".kio/index/sqlite.db")).unwrap();
+    let error = json_failure(&dir, &["repair", "rebuild-db"], 2);
     assert!(
-        conn.query_row(
-            "SELECT COUNT(*) FROM tree_entries WHERE commit_hash = ?1",
-            rusqlite::params![tagged_commit],
-            |row| row.get::<_, u64>(0),
-        )
-        .unwrap()
-            > 0
+        error["message"]
+            .as_str()
+            .unwrap()
+            .contains("HEAD linear ancestry chain"),
+        "{error}"
     );
+    assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), b"unborn\n");
+    assert!(!dir.path().join(".kio/index/sqlite.db").exists());
 }
 
 #[test]
@@ -1888,14 +1938,22 @@ fn ct4_rebuild_rejects_pinned_done_unit_with_mismatched_prepared_hash() {
 fn ct4_rebuild_fails_closed_when_a_current_tag_targets_a_missing_commit() {
     let dir = indexed_scope();
     let repo = Repository::open(dir.path()).unwrap();
+    let head_before = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+    let index_before = fs::read(repo.kio_dir().join("index/sqlite.db")).unwrap();
     let tag_path = repo
         .kio_dir()
         .join("refs/tags-v1")
         .join(portable_tag_leaf("missing-root"));
     fs::write(tag_path, format!("sha256:{}", "d".repeat(64))).unwrap();
 
-    let error = json_failure(&dir, &["repair", "rebuild-db"], 1);
-    assert_eq!(error["error_code"], "KIO-E-COMMIT-SHALLOW-001");
+    let error = json_failure(&dir, &["repair", "rebuild-db"], 2);
+    assert_eq!(error["error_code"], "KIO-E-CONFIG-SCHEMA-001");
+    assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head_before);
+    assert_eq!(
+        fs::read(repo.kio_dir().join("index/sqlite.db")).unwrap(),
+        index_before,
+        "an unauthenticated tag must not authorize rebuilding the source index"
+    );
 }
 
 #[test]
@@ -1977,7 +2035,7 @@ fn ct3_multi_001_default_searches_participating_indexed_scopes() {
     )
     .unwrap();
     for dir in [&a, &b, &c] {
-        json_success_path(dir, &data_home, &["index", "--approve"]);
+        json_success_path(dir, &data_home, &["index"]);
     }
     // Default search (no --all-scopes) from scope a still reaches sibling b.
     let search = json_success_path(&a, &data_home, &["search", "unique sibling 4242"]);
@@ -2012,8 +2070,8 @@ fn ct3_multi_008_all_scopes_flag_targets_all_indexed_scopes() {
     .unwrap();
     json_success_path(&a, &data_home, &["init"]);
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
     let search = json_success_path(
         &a,
         &data_home,
@@ -2045,11 +2103,9 @@ fn ct3_repair_device_replica_rebuilds_all_indexed_scopes_outside_a_scope() {
     )
     .unwrap();
     for dir in [&a, &b] {
-        json_success_path(dir, &data_home, &["index", "--approve"]);
+        json_success_path(dir, &data_home, &["index"]);
     }
-    // Empty HEAD is recoverable from refs/heads/main for reads. Replica-only
-    // repair may use that logical value, but must not write the source HEAD.
-    fs::write(b.join(".kio/HEAD"), b"").unwrap();
+    // Replica-only repair must preserve the canonical source HEAD and SQLite.
     let a_head = fs::read(a.join(".kio/HEAD")).unwrap();
     let b_head = fs::read(b.join(".kio/HEAD")).unwrap();
     let a_sqlite = fs::read(a.join(".kio/index/sqlite.db")).unwrap();
@@ -2097,7 +2153,7 @@ fn ct3_repair_device_all_recovers_missing_source_and_replica_outside_a_scope() {
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join("doc.md"), text).unwrap();
         json_success_path(dir, &data_home, &["init"]);
-        json_success_path(dir, &data_home, &["index", "--approve"]);
+        json_success_path(dir, &data_home, &["index"]);
     }
     let a_kio = a.join(".kio");
     let a_head_before = fs::read_to_string(a_kio.join("HEAD")).unwrap();
@@ -2146,7 +2202,7 @@ fn ct3_device_repairs_reject_non_current_scope_before_any_mutation() {
             fs::create_dir_all(dir).unwrap();
             fs::write(dir.join("doc.md"), text).unwrap();
             json_success_path(dir, &data_home, &["init"]);
-            json_success_path(dir, &data_home, &["index", "--offline", "--approve"]);
+            json_success_path(dir, &data_home, &["index", "--offline"]);
         }
 
         let aggregator = data_home.join("cache/kio/aggregator.sqlite");
@@ -2214,7 +2270,7 @@ fn ct3_repair_device_unreachable_registry_scope_is_partial_without_cwd_fallback(
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join("doc.md"), "partial repair healthy").unwrap();
         json_success_path(dir, &data_home, &["init"]);
-        json_success_path(dir, &data_home, &["index", "--approve"]);
+        json_success_path(dir, &data_home, &["index"]);
     }
     let b_scope = read_scope_id(&b);
     fs::remove_dir_all(&b).unwrap();
@@ -2265,7 +2321,7 @@ fn ct3_repair_device_registry_unavailable_never_falls_back_to_cwd() {
     fs::create_dir_all(&scope).unwrap();
     fs::write(scope.join("doc.md"), "registry unavailable repair").unwrap();
     json_success_path(&scope, &data_home, &["init"]);
-    json_success_path(&scope, &data_home, &["index", "--approve"]);
+    json_success_path(&scope, &data_home, &["index"]);
     let blocked = UnavailableRegistry::block(&registry_path(&data_home));
 
     let output = hermetic_kio_command()
@@ -2292,7 +2348,7 @@ fn ct3_repair_device_all_failed_homogeneous_promotes_scope_error() {
     fs::create_dir_all(&scope).unwrap();
     fs::write(scope.join("doc.md"), "homogeneous repair failure").unwrap();
     json_success_path(&scope, &data_home, &["init"]);
-    json_success_path(&scope, &data_home, &["index", "--approve"]);
+    json_success_path(&scope, &data_home, &["index"]);
     fs::remove_dir_all(&scope).unwrap();
 
     let output = hermetic_kio_command()
@@ -2325,14 +2381,14 @@ fn ct3_repair_device_active_purge_is_partial_and_leaves_no_stale_replica_rows() 
         fs::create_dir_all(dir).unwrap();
         fs::write(dir.join("doc.md"), text).unwrap();
         json_success_path(dir, &data_home, &["init"]);
-        json_success_path(dir, &data_home, &["index", "--offline", "--approve"]);
+        json_success_path(dir, &data_home, &["index", "--offline"]);
     }
     let blocked_scope = read_scope_id(&blocked);
     let raw_hash: String = Connection::open(blocked.join(".kio/index/sqlite.db"))
         .unwrap()
         .query_row("SELECT raw_hash FROM chunks LIMIT 1", [], |row| row.get(0))
         .unwrap();
-    let state = kio_core::purge::PurgeState::new(blocked.join(".kio"));
+    let state = kio_core::purge::PurgeState::open(blocked.join(".kio")).unwrap();
     let purge_id = kio_core::scope::new_ulid(&blocked);
     let closure = kio_core::purge::PurgeClosure::new(
         purge_id.clone(),
@@ -2407,12 +2463,12 @@ fn r15_3_reinit_same_path_does_not_duplicate_registry_target() {
 
     // Scope A: init + index at `b` (registers (scope_A, b/.kio), indexed).
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&b, &data_home, &["index"]);
 
     // Delete `.kio` and re-init + index → scope B (fresh scope_id) at the SAME path.
     fs::remove_dir_all(b.join(".kio")).unwrap();
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&b, &data_home, &["index"]);
 
     // `--all-scopes` enumerates the registry. The stale (scope_A) row must be gone:
     // exactly one scope target, and the document returned exactly once (no dead-pointer
@@ -2465,8 +2521,8 @@ fn ct3_multi_002_cross_scope_merge_is_rank_based() {
     // This catches accidental reintroduction of the old scope_path tie-break.
     replace_scope_id(&a, "7ZZZZZZZZZZZZZZZZZZZZZZZZZ");
     replace_scope_id(&b, "00000000000000000000000001");
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
     let search = json_success_path(&a, &data_home, &["search", "zephyrterm"]);
     let results = search["results"].as_array().unwrap();
     assert_eq!(results.len(), 2);
@@ -2517,8 +2573,8 @@ fn ct3_multi_009_text_rank_is_global_not_per_scope() {
     // would otherwise pass by accident.
     replace_scope_id(&a, "00000000000000000000000001");
     replace_scope_id(&b, "7ZZZZZZZZZZZZZZZZZZZZZZZZZ");
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
 
     let search = json_success_path(&a, &data_home, &["search", "zephyrterm"]);
     let results = search["results"].as_array().unwrap();
@@ -2562,7 +2618,7 @@ fn ct3_multi_011_a_departed_scope_stops_skewing_corpus_statistics() {
     }
     for dir in [&a, &b, &c] {
         json_success_path(dir, &data_home, &["init"]);
-        json_success_path(dir, &data_home, &["index", "--approve"]);
+        json_success_path(dir, &data_home, &["index"]);
     }
     let replica_path = data_home.join("cache/kio/aggregator.sqlite");
     // Read before the folder goes away — the assertion below needs the id.
@@ -2665,10 +2721,10 @@ fn ct3_multi_012_a_narrowed_search_does_not_prune_the_replica() {
         json_success_path(dir, &data_home, &["init"]);
     }
     #[cfg(not(windows))]
-    json_success_path(&nest, &data_home, &["index", "--approve"]);
+    json_success_path(&nest, &data_home, &["index"]);
     #[cfg(windows)]
     {
-        let indexed = json_code_stdout_path(&nest, &data_home, &["index", "--approve"], 3);
+        let indexed = json_code_stdout_path(&nest, &data_home, &["index"], 3);
         assert_windows_bound_child_unsupported(&indexed, "sub");
         assert!(
             !sub.join(".kio").exists(),
@@ -2678,8 +2734,8 @@ fn ct3_multi_012_a_narrowed_search_does_not_prune_the_replica() {
     // `nest`'s own index must not pull `sub` in: scopes are non-recursive, and
     // this test needs them to be three independently indexed collection members.
     json_success_path(&sub, &data_home, &["init"]);
-    json_success_path(&sub, &data_home, &["index", "--approve"]);
-    json_success_path(&other, &data_home, &["index", "--approve"]);
+    json_success_path(&sub, &data_home, &["index"]);
+    json_success_path(&other, &data_home, &["index"]);
     let replica_path = data_home.join("cache/kio/aggregator.sqlite");
 
     let all = json_success_path(
@@ -2747,8 +2803,8 @@ fn ct3_multi_013_indexing_replicates_without_waiting_for_a_search() {
     .unwrap();
     json_success_path(&a, &data_home, &["init"]);
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
 
     // No search has run. Both scopes are already in the collection.
     let replica_path = data_home.join("cache/kio/aggregator.sqlite");
@@ -2798,12 +2854,12 @@ fn ct3_multi_014_a_history_search_is_ranked_by_the_replica() {
     fs::write(b.join("b.md"), "# B\n\n## Sec\nvellichor over here\n").unwrap();
     for dir in [&a, &b] {
         json_success_path(dir, &data_home, &["init"]);
-        json_success_path(dir, &data_home, &["index", "--approve"]);
+        json_success_path(dir, &data_home, &["index"]);
     }
 
     // The chunk leaves the live index — and, via write-through, the replica.
     fs::remove_file(a.join("gone.md")).unwrap();
-    json_success_path(&a, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
 
     let live = json_success_path(&a, &data_home, &["search", "vellichor", "--mode", "text"]);
     let live_generation = replica_collection_generation(&live).to_owned();
@@ -2847,7 +2903,7 @@ fn ct3_multi_015_short_tokens_are_ranked_by_the_replica() {
     fs::write(b.join("b.md"), "# B\n\n## Sec\n認証 と halcyon の続き\n").unwrap();
     for dir in [&a, &b] {
         json_success_path(dir, &data_home, &["init"]);
-        json_success_path(dir, &data_home, &["index", "--approve"]);
+        json_success_path(dir, &data_home, &["index"]);
     }
 
     let long = json_success_path(&a, &data_home, &["search", "halcyon", "--mode", "text"]);
@@ -2920,10 +2976,10 @@ fn ct3_multi_016_a_narrowed_search_is_ranked_among_the_scopes_it_searched() {
         json_success_path(dir, &data_home, &["init"]);
     }
     #[cfg(not(windows))]
-    json_success_path(&nest, &data_home, &["index", "--approve"]);
+    json_success_path(&nest, &data_home, &["index"]);
     #[cfg(windows)]
     {
-        let indexed = json_code_stdout_path(&nest, &data_home, &["index", "--approve"], 3);
+        let indexed = json_code_stdout_path(&nest, &data_home, &["index"], 3);
         assert_windows_bound_child_unsupported(&indexed, "sub");
         assert!(
             !sub.join(".kio").exists(),
@@ -2931,8 +2987,8 @@ fn ct3_multi_016_a_narrowed_search_is_ranked_among_the_scopes_it_searched() {
         );
     }
     json_success_path(&sub, &data_home, &["init"]);
-    json_success_path(&sub, &data_home, &["index", "--approve"]);
-    json_success_path(&loud, &data_home, &["index", "--approve"]);
+    json_success_path(&sub, &data_home, &["index"]);
+    json_success_path(&loud, &data_home, &["index"]);
     // Multi-scope search resolves `[search]` from the DEVICE layer (05 §1.8
     // step 5), so a small depth has to be set there, not in a folder config.
     let user_config = data_home.join("config/kio");
@@ -2999,7 +3055,7 @@ fn ct3_multi_017_a_cursor_replays_against_the_collection_that_ranked_page_1() {
     fs::write(late.join("l.md"), "# L\n\n## Sec\nquokka three\n").unwrap();
     for dir in [&a, &b] {
         json_success_path(dir, &data_home, &["init"]);
-        json_success_path(dir, &data_home, &["index", "--approve"]);
+        json_success_path(dir, &data_home, &["index"]);
     }
 
     let page1 = json_success_path(
@@ -3013,7 +3069,7 @@ fn ct3_multi_017_a_cursor_replays_against_the_collection_that_ranked_page_1() {
     // Neither searched scope moves. A third one joins the device, which
     // write-through lands in the replica immediately.
     json_success_path(&late, &data_home, &["init"]);
-    json_success_path(&late, &data_home, &["index", "--approve"]);
+    json_success_path(&late, &data_home, &["index"]);
 
     let stderr = hermetic_kio_command()
         .current_dir(&a)
@@ -3047,7 +3103,7 @@ fn ct3_multi_020_the_replica_retains_committed_chunks_across_liveness_changes() 
         .unwrap();
     }
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
 
     let committed = || -> i64 {
         let conn = rusqlite::Connection::open(dir.path().join(".kio/index/sqlite.db")).unwrap();
@@ -3071,7 +3127,7 @@ fn ct3_multi_020_the_replica_retains_committed_chunks_across_liveness_changes() 
     );
 
     fs::remove_file(dir.path().join("d2.md")).unwrap();
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
 
     assert_eq!(
         committed(),
@@ -3100,7 +3156,7 @@ fn ct3_multi_018_reindex_at_rotates_the_generation_it_publishes_under() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# A\n\n## Sec\nzephyrterm here\n").unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
 
     let generation = || -> String {
         let db = dir.path().join(".kio/index/sqlite.db");
@@ -3141,7 +3197,7 @@ fn ct3_multi_019_purge_fails_closed_when_the_replica_cannot_be_cleared() {
     // service.
     fs::write(a.join("survivor.md"), "# Survivor\n\nprojection survivor\n").unwrap();
     json_success_path(&a, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--offline", "--approve"]);
+    json_success_path(&a, &data_home, &["index", "--offline"]);
 
     let ready = json_success_path(&a, &data_home, &["search", "zephyrterm"]);
     assert!(
@@ -3238,7 +3294,7 @@ fn ct3_multi_021_replica_candidates_exclude_an_active_purge_scope() {
     .unwrap();
     for dir in [&a, &b] {
         json_success_path(dir, &data_home, &["init"]);
-        json_success_path(dir, &data_home, &["index", "--offline", "--approve"]);
+        json_success_path(dir, &data_home, &["index", "--offline"]);
     }
     let a_scope_id = read_scope_id(&a);
     let raw_hash: String = rusqlite::Connection::open(a.join(".kio/index/sqlite.db"))
@@ -3253,7 +3309,7 @@ fn ct3_multi_021_replica_candidates_exclude_an_active_purge_scope() {
     // Write a valid prepared journal without performing the destructive part
     // of purge. `ReadBarrierCheckpoint::open` must reject it before a
     // replica-produced candidate can cross the response boundary.
-    let state = kio_core::purge::PurgeState::new(a.join(".kio"));
+    let state = kio_core::purge::PurgeState::open(a.join(".kio")).unwrap();
     let purge_id = kio_core::scope::new_ulid(&a);
     let closure = kio_core::purge::PurgeClosure::new(
         purge_id.clone(),
@@ -3336,7 +3392,7 @@ fn ct3_multi_022_replica_response_boundary_rechecks_a_late_purge() {
     )
     .unwrap();
     json_success_path(&scope, &data_home, &["init"]);
-    json_success_path(&scope, &data_home, &["index", "--offline", "--approve"]);
+    json_success_path(&scope, &data_home, &["index", "--offline"]);
 
     let raw_hash: String = rusqlite::Connection::open(scope.join(".kio/index/sqlite.db"))
         .unwrap()
@@ -3386,7 +3442,7 @@ fn ct3_multi_022_replica_response_boundary_rechecks_a_late_purge() {
     // candidate selection's first barrier check has passed.  The child is held
     // at the exact final response boundary above, so no timing assumption is
     // hidden in this regression.
-    let state = kio_core::purge::PurgeState::new(scope.join(".kio"));
+    let state = kio_core::purge::PurgeState::open(scope.join(".kio")).unwrap();
     let purge_id = kio_core::scope::new_ulid(&scope);
     let closure = kio_core::purge::PurgeClosure::new(
         purge_id.clone(),
@@ -3456,7 +3512,7 @@ fn ct3_multi_010_single_scope_search_uses_the_collection_candidate_route() {
     fs::create_dir_all(&a).unwrap();
     fs::write(a.join("a.md"), "# A\n\n## Sec\nzephyrterm alone\n").unwrap();
     json_success_path(&a, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
 
     // Write-through, not a search side effect: nothing has searched yet.
     let replica_path = data_home.join("cache/kio/aggregator.sqlite");
@@ -3505,7 +3561,7 @@ fn ct3_multi_003_diversify_caps_raw_hash_across_scopes() {
         )
         .unwrap();
         json_success_path(dir, &data_home, &["init"]);
-        json_success_path(dir, &data_home, &["index", "--approve"]);
+        json_success_path(dir, &data_home, &["index"]);
     }
     let search = json_success_path(&dirs[0], &data_home, &["search", "sharedtoken"]);
     assert_eq!(search["searched_scopes"].as_array().unwrap().len(), 4);
@@ -3527,8 +3583,8 @@ fn ct3_multi_005_partial_failure_returns_results_with_exit_3() {
     fs::write(b.join("b.md"), "# B\n\n## Sec\nbetaunique token\n").unwrap();
     json_success_path(&a, &data_home, &["init"]);
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
 
     // Make scope b unreachable at discovery (its .kio is unreadable).
     let b_kio = b.join(".kio");
@@ -3593,8 +3649,8 @@ fn ct3_multi_006_completion_order_does_not_change_results_or_cursor() {
     json_success_path(&b, &data_home, &["init"]);
     replace_scope_id(&a, "7ZZZZZZZZZZZZZZZZZZZZZZZZZ");
     replace_scope_id(&b, "00000000000000000000000001");
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
     fs::write(
         a.join(".kio/config.toml"),
         "[search.multi_scope]\nparallelism = 2\n",
@@ -3640,8 +3696,8 @@ fn ct3_multi_006_timeout_preserves_fresh_all_failed_and_cursor_contracts() {
     fs::write(b.join("b.md"), "# B\n\n## Sec\ntimeouttoken beta\n").unwrap();
     json_success_path(&a, &data_home, &["init"]);
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
     fs::write(
         a.join(".kio/config.toml"),
         "[search.multi_scope]\nparallelism = 2\nper_scope_timeout_seconds = 1\n",
@@ -3754,8 +3810,8 @@ fn ct4_cursor_replay_with_unresolvable_active_scope_hard_fails() {
     .unwrap();
     json_success_path(&a, &data_home, &["init"]);
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
     let a_scope: Value =
         serde_json::from_str(&fs::read_to_string(a.join(".kio/scope.json")).unwrap()).unwrap();
     let a_scope_id = a_scope["scope_id"].as_str().unwrap().to_owned();
@@ -3766,7 +3822,7 @@ fn ct4_cursor_replay_with_unresolvable_active_scope_hard_fails() {
 
     // Make scope a unresolvable: wipe the registry, re-register b only.
     fs::remove_file(registry_path(&data_home)).unwrap();
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&b, &data_home, &["index"]);
 
     let (code, error) = run_json(
         &b,
@@ -3801,14 +3857,10 @@ fn ct3_embed_003_cross_scope_incompatibility_falls_back_to_text_merge() {
     fs::write(b.join("b.md"), "# B\n\n## Two\nbeta 222\n").unwrap();
     run_embed_path(&a, &data_home, "mock", &["init"]);
     run_embed_path(&b, &data_home, "mock", &["init"]);
+    run_embed_path(&a, &data_home, "mock", &["ledger", "init"]);
     // a: compatible embeddings; b: incompatible embeddings.
-    run_embed_path(&a, &data_home, "mock", &["index", "--approve"]);
-    run_embed_path(
-        &b,
-        &data_home,
-        "incompatible_profile",
-        &["index", "--approve"],
-    );
+    run_embed_path(&a, &data_home, "mock", &["index"]);
+    run_embed_path(&b, &data_home, "incompatible_profile", &["index"]);
     let search = run_embed_path(
         &a,
         &data_home,
@@ -3832,7 +3884,7 @@ fn ct3_embed_008_non_multimodal_profile_is_rejected_at_index() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# A\n\n## One\nalpha 111\n").unwrap();
     kio(&dir, &["init"]).assert().success();
-    let err = json_failure_embed(&dir, "non_multimodal", &["index", "--approve"], 2);
+    let err = json_failure_embed(&dir, "non_multimodal", &["index"], 2);
     assert_eq!(err["error_code"], "KIO-E-EMBED-MODALITY-001");
 }
 
@@ -3994,7 +4046,7 @@ fn pc19_pc21_index_generation_rotation_rejects_a_cursor_after_new_content_is_ind
         "# 認証仕様の追補\n\n## 追補\nposttoken マーカー を追加しました。\n",
     )
     .unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
 
     // A fresh search sees the new chunk (proves the setup is live)...
     let fresh = json_success(&dir, &["search", "認証仕様", "--limit", "100"]);
@@ -4054,7 +4106,7 @@ fn ct3_obs_001_index_status_reports_partial_enrichment() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
     let search = json_success(&dir, &["search", "認証仕様"]);
     let status = &search["index_status"];
     assert!(status.is_object());
@@ -4078,7 +4130,7 @@ fn ct3_replica_001_direct_search_survives_a_temporarily_hidden_source_index() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
 
     let scope_id = read_scope_id(dir.path());
     let replica_path = dir.path().join(".test-cache/kio/aggregator.sqlite");
@@ -4201,7 +4253,7 @@ fn ct3_replica_006_index_head_advance_fails_closed_before_source_rebuild() {
         "# Updated auth specification\n\npostheadreplicafailclosed new content\n",
     )
     .unwrap();
-    let stderr = kio(&dir, &["index", "--offline", "--approve"])
+    let stderr = kio(&dir, &["index", "--offline"])
         .env("KIO_TEST_REPLICA_AFTER_HEAD_FAULT", "index_before_marker")
         .arg("--json")
         .assert()
@@ -4283,7 +4335,7 @@ fn ct3_replica_006_index_head_advance_fails_closed_before_source_rebuild() {
     // enough to let the candidate-scope purge barrier reject it. Hide source
     // SQLite as well, so this verifies the strict replica/CAS route rather
     // than a source-index fallback.
-    let state = kio_core::purge::PurgeState::new(dir.path().join(".kio"));
+    let state = kio_core::purge::PurgeState::open(dir.path().join(".kio")).unwrap();
     let purge_id = kio_core::scope::new_ulid(dir.path());
     let closure = kio_core::purge::PurgeClosure::new(
         purge_id.clone(),
@@ -4332,7 +4384,7 @@ fn ct3_replica_006_index_head_advance_fails_closed_before_source_rebuild() {
 
     // A later normal writer pass replaces the source index and publishes a
     // complete Ready projection; the fail-closed transition is recoverable.
-    json_success(&dir, &["index", "--offline", "--approve"]);
+    json_success(&dir, &["index", "--offline"]);
     let recovered = json_success(
         &dir,
         &["search", "postheadreplicafailclosed", "--mode", "text"],
@@ -4474,7 +4526,7 @@ fn ct3_replica_003_temporarily_excluded_scope_keeps_its_replica_projection() {
     fs::write(b.join("b.md"), "# B\n\nretainprojectionbeta\n").unwrap();
     for scope in [&a, &b] {
         json_success_path(scope, &data_home, &["init"]);
-        json_success_path(scope, &data_home, &["index", "--approve"]);
+        json_success_path(scope, &data_home, &["index"]);
     }
 
     let b_scope_id = read_scope_id(&b);
@@ -4584,7 +4636,7 @@ fn ct3_replica_008_unresolvable_scope_identity_cannot_serve_a_ready_projection()
     .unwrap();
     for scope in [&a, &b] {
         json_success_path(scope, &data_home, &["init"]);
-        json_success_path(scope, &data_home, &["index", "--offline", "--approve"]);
+        json_success_path(scope, &data_home, &["index", "--offline"]);
     }
 
     let a_scope_id = read_scope_id(&a);
@@ -4668,7 +4720,7 @@ fn ct3_replica_004_registry_fallback_does_not_prune_unenumerated_siblings() {
     fs::write(b.join("b.md"), "# B\n\nregistryfallbackbeta\n").unwrap();
     for scope in [&a, &b] {
         json_success_path(scope, &data_home, &["init"]);
-        json_success_path(scope, &data_home, &["index", "--approve"]);
+        json_success_path(scope, &data_home, &["index"]);
     }
 
     let b_scope_id = read_scope_id(&b);
@@ -4786,12 +4838,10 @@ fn ct3_fts_004_replica_serves_search_while_source_fts_is_rebuilt() {
     assert!(!after["results"].as_array().unwrap().is_empty());
 }
 
-/// R23-21 (05 §1.8 L416-417 "RRF 済み unique semantic chunk 上位
-/// candidate_depth 件を候補として返す"): when the text and vector backends'
-/// own top-N are DISJOINT, `fuse_rrf`'s union can carry up to 2x
-/// `candidate_depth` candidates through the one collection query unless the
-/// collection candidate pool is capped before MMR. Proven
-/// with candidate_depth=1 and two documents constructed so each backend's
+/// R23-21 (05 §1.8): each text and vector lane is independently capped at
+/// `candidate_depth` before RRF. When their top-Ns are disjoint, the fused
+/// collection pool is their union and therefore can carry up to 2x the depth.
+/// Proven with candidate_depth=1 and two documents constructed so each backend's
 /// sole top-1 pick differs: one document's body is byte-identical to the
 /// query (the SHA256-seeded mock embedding has no partial-similarity
 /// structure, so identical text is the only way to force cosine=1.0,
@@ -4800,7 +4850,7 @@ fn ct3_fts_004_replica_serves_search_while_source_fts_is_rebuilt() {
 /// (so its mock vector is uncorrelated — effectively random relative to the
 /// query's).
 #[test]
-fn r23_21_hybrid_collection_candidates_are_truncated_to_candidate_depth() {
+fn r23_21_hybrid_collection_pool_is_the_union_of_per_lane_candidate_depth() {
     let dir = tempfile::tempdir().unwrap();
     // Contextual-embedding addendum (07 §5.3, 2026-07-24): the mock vector is
     // `deterministic_embedding_vector(item.text)`, and the send path now prepends
@@ -4826,7 +4876,17 @@ fn r23_21_hybrid_collection_candidates_are_truncated_to_candidate_depth() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed(&dir, "mock", &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
+    json_success_embed(&dir, "mock", &["index"]);
+
+    // The folder config applies only to this single explicit scope.  Set it
+    // before the lane controls so all three searches exercise depth=1.
+    fs::write(
+        dir.path().join(".kio/config.toml"),
+        "[search.rrf]\ncandidate_depth = 1\n",
+    )
+    .unwrap();
 
     // Empirically confirm the fixture gives the two backends disjoint top-1
     // picks (deterministic given the SHA256-seeded mock embedding above, not
@@ -4854,17 +4914,7 @@ fn r23_21_hybrid_collection_candidates_are_truncated_to_candidate_depth() {
          vector={vector_only}"
     );
 
-    // candidate_depth=1: without the R23-21 truncate, `fuse_rrf`'s union of
-    // both backends' disjoint top-1s would carry 2 candidates through this
-    // collection query. PC49/PC50 (05 §1.8 L384-387): the folder config only
-    // applies for a single, non-`--descendants` `--scope <path>` search, so
-    // `--scope .` is required here for `candidate_depth = 1` to take effect
-    // (a bare default search would use the user/device layer instead).
-    fs::write(
-        dir.path().join(".kio/config.toml"),
-        "[search.rrf]\ncandidate_depth = 1\n",
-    )
-    .unwrap();
+    // With independently bounded lanes, RRF receives both disjoint top-1s.
     let hybrid = json_success_embed(
         &dir,
         "mock",
@@ -4881,10 +4931,13 @@ fn r23_21_hybrid_collection_candidates_are_truncated_to_candidate_depth() {
     );
     assert_eq!(
         hybrid["results"].as_array().unwrap().len(),
-        1,
-        "candidate_depth=1 must cap the collection candidate pool to 1 even when text/vector \
-         top-1 disagree: {hybrid}"
+        2,
+        "candidate_depth=1 applies to each lane; the fused pool retains both disjoint top-1s: \
+         {hybrid}"
     );
+    let hybrid_ids = chunk_hash_set(&hybrid);
+    assert!(hybrid_ids.contains(text_top1), "{hybrid}");
+    assert!(hybrid_ids.contains(vector_top1), "{hybrid}");
 }
 
 fn line_count(path: impl AsRef<Path>) -> usize {
@@ -4959,7 +5012,7 @@ fn ct3_evidence_003_scope_resolves_via_path_then_registry() {
     )
     .unwrap();
     json_success_path(&scope, &data_home, &["init"]);
-    json_success_path(&scope, &data_home, &["index", "--approve"]);
+    json_success_path(&scope, &data_home, &["index"]);
     let search = json_success_path(&scope, &data_home, &["search", "トークン TTL 3600"]);
     let pointer = first_result(&search)["evidence_pointer"].clone();
     let scope_id = pointer["scope_id"].as_str().unwrap().to_owned();
@@ -5012,7 +5065,7 @@ fn ct3_evidence_004_resolves_through_pointer_commit_tree() {
     )
     .unwrap();
     json_success_path(&scope, &data_home, &["init"]);
-    json_success_path(&scope, &data_home, &["index", "--approve"]);
+    json_success_path(&scope, &data_home, &["index"]);
     let search1 = json_success_path(&scope, &data_home, &["search", "トークン TTL 3600"]);
     let p_auth = first_result(&search1)["evidence_pointer"].clone();
     let commit1 = p_auth["commit"].as_str().unwrap().to_owned();
@@ -5023,7 +5076,7 @@ fn ct3_evidence_004_resolves_through_pointer_commit_tree() {
         "# 検索ランキング\n\n## RRF 融合\nRRF の定数 k=60 を使います。\n",
     )
     .unwrap();
-    json_success_path(&scope, &data_home, &["index", "--approve"]);
+    json_success_path(&scope, &data_home, &["index"]);
     let search2 = json_success_path(&scope, &data_home, &["search", "RRF 定数 k 60"]);
     let p_rank = pointer_for_path(&search2, "ranking.md").clone();
     let commit2 = p_rank["commit"].as_str().unwrap().to_owned();
@@ -5081,10 +5134,20 @@ fn ct3_evidence_004_missing_chunk_row_requires_retarget() {
 }
 
 #[test]
-fn ct3_evidence_005_shallow_commit_resolves_directly() {
+fn ct3_evidence_005_shallow_commit_rejects_pointer_and_preserves_tree_controls() {
     let dir = indexed_scope();
     let search = json_success(&dir, &["search", "トークン TTL 3600"]);
     let pointer = first_result(&search)["evidence_pointer"].clone();
+    let other_raw =
+        first_result(&json_success(&dir, &["search", "RRF 定数 k 60"]))["evidence_pointer"].clone();
+    // A retained tree remains the ordinary positive control.
+    assert!(
+        view_slice(&json_success(&dir, &["view", &pointer.to_string()])).contains("トークン TTL")
+    );
+    json_success(&dir, &["reindex", "--regenerate", "--yes"]);
+    let later_generation =
+        first_result(&json_success(&dir, &["search", "トークン TTL 3600"]))["evidence_pointer"]
+            .clone();
     let commit = pointer["commit"].as_str().unwrap();
     let kio_dir = dir.path().join(".kio");
 
@@ -5108,15 +5171,26 @@ fn ct3_evidence_005_shallow_commit_resolves_directly() {
     fs::write(receipt_path, receipt.canonical_bytes().unwrap()).unwrap();
     fs::remove_file(object_path(&kio_dir, "trees", tree)).unwrap();
 
-    let ptr = pointer.to_string();
-    let viewed = json_success(&dir, &["view", &ptr]);
-    assert_eq!(viewed["commit_shallow"], true);
-    assert!(view_slice(&viewed).contains("トークン TTL"));
-
-    let opened = json_success(&dir, &["open", &ptr]);
-    assert_eq!(opened["commit_shallow"], true);
-    assert_eq!(opened["status"], "opened");
-    assert!(opened["path"].as_str().unwrap().ends_with("auth.md"));
+    let mut later_generation_forgery = pointer.clone();
+    later_generation_forgery["chunk_hash"] = later_generation["chunk_hash"].clone();
+    let mut other_raw_forgery = pointer.clone();
+    other_raw_forgery["raw_hash"] = other_raw["raw_hash"].clone();
+    other_raw_forgery["chunk_hash"] = other_raw["chunk_hash"].clone();
+    for forged in [pointer, later_generation_forgery, other_raw_forgery] {
+        for command in ["view", "open"] {
+            let error = json_failure(&dir, &[command, &forged.to_string()], 1);
+            assert_eq!(
+                error["error_code"], "KIO-E-COMMIT-SHALLOW-001",
+                "{command}: {error}"
+            );
+            assert!(
+                error["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("restore the tree object from backup")
+            );
+        }
+    }
 }
 
 #[test]
@@ -5237,8 +5311,10 @@ fn ct3_embed_009_batch_retry_and_resume_execute_pending_embedding_tasks() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# メモ\n回収率のテスト。\n").unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
     let base_now = "2026-07-03T00:00:00Z";
-    json_success_embed_at(&dir, "rate_limit", base_now, &["index", "--approve"]);
+    json_success_embed_at(&dir, "rate_limit", base_now, &["index"]);
 
     let status = json_success_embed(&dir, "rate_limit", &["status"]);
     let failed: Vec<_> = status["tasks"]
@@ -5283,9 +5359,10 @@ fn ct3_embed_009_batch_retry_and_resume_execute_pending_embedding_tasks() {
 
 // R11-5: the enrichment pass now aggregates every embedding task-store update into
 // ONE write-back at the end (was a full all()+replace_all per 32-chunk batch =
-// O(N²)). The aggregation must not lose per-chunk `fallback_reason`: a rate_limit
-// failure must still land the task with reason "rate_limit" and a scheduled
-// retry (the paused-side reason "budget_exceeded" is covered by ct3_l2).
+// O(N²)). The aggregation must not lose the sent group's `fallback_reason`: a
+// rate_limit failure must still land that task with reason "rate_limit" and a
+// scheduled retry, while later groups remain unsent (the paused-side reason
+// "budget_exceeded" is covered by ct3_l2).
 // QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2): the landing status is
 // `pending`, not `failed` — this test used to assert `status=="failed"`.
 #[test]
@@ -5297,20 +5374,36 @@ fn r11_5_aggregated_writeback_preserves_embedding_fallback_reason() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed_at(
-        &dir,
-        "rate_limit",
-        "2026-07-03T00:00:00Z",
-        &["index", "--approve"],
-    );
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
+    json_success_embed_at(&dir, "rate_limit", "2026-07-03T00:00:00Z", &["index"]);
     let status = json_success_embed(&dir, "rate_limit", &["status"]);
     let emb = tasks_of_type(&status, "embedding");
     assert!(!emb.is_empty(), "must enqueue embedding tasks: {status}");
+    let rate_limited = emb
+        .iter()
+        .filter(|task| {
+            task["status"] == "pending"
+                && task["fallback_reason"] == "rate_limit"
+                && task["next_retry_at"].is_string()
+        })
+        .count();
+    let not_sent = emb
+        .iter()
+        .filter(|task| task["fallback_reason"] == "ready_for_online_adapter")
+        .count();
+    assert_eq!(
+        rate_limited, 1,
+        "only the first provider group may be sent and retain its retry reason: {status}"
+    );
     assert!(
-        emb.iter().all(|task| task["status"] == "pending"
-            && task["fallback_reason"] == "rate_limit"
-            && task["next_retry_at"].is_string()),
-        "aggregated write-back must preserve each task's rate_limit reason + retry: {status}"
+        not_sent > 0,
+        "later groups must remain unsent after the first rejection: {status}"
+    );
+    assert_eq!(
+        reservation_row_count(&dir, "embedding"),
+        1,
+        "the unsent groups must not create speculative ledger rows"
     );
 }
 
@@ -5334,12 +5427,9 @@ fn r11_8_retryable_failed_enrichment_counts_as_pending_in_index_status() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed_at(
-        &dir,
-        "rate_limit",
-        "2026-07-03T00:00:00Z",
-        &["index", "--approve"],
-    );
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
+    json_success_embed_at(&dir, "rate_limit", "2026-07-03T00:00:00Z", &["index"]);
     let search = json_success_embed(&dir, "rate_limit", &["search", "本文 再試行"]);
     let index_status = &search["index_status"];
     assert!(
@@ -5363,8 +5453,10 @@ fn ct3_embed_010_retry_executes_after_snapshot_advances_head() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.md"), "# メモ\n射影テスト。\n").unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
     let base_now = "2026-07-03T00:00:00Z";
-    json_success_embed_at(&dir, "rate_limit", base_now, &["index", "--approve"]);
+    json_success_embed_at(&dir, "rate_limit", base_now, &["index"]);
     let status = json_success_embed(&dir, "rate_limit", &["status"]);
     let retry_at = tasks_of_type(&status, "embedding")
         .into_iter()
@@ -5404,6 +5496,10 @@ fn ct3_embed_010_retry_executes_after_snapshot_advances_head() {
 /// so `batch resume`/index can execute both adapters deterministically offline.
 fn json_both_mock(dir: &TempDir, args: &[&str]) -> Value {
     json_both_mock_code(dir, args, 0)
+}
+
+fn approve_both_mock(dir: &TempDir) {
+    json_both_mock(dir, &["adapter", "approve", "--all", "--yes"]);
 }
 
 /// `json_both_mock` asserting a specific exit code and reading STDOUT. R11-2: an
@@ -5469,7 +5565,7 @@ fn ct3_l1_reindex_enriches_new_generation_embeddings() {
     // network-approval gate's positive condition needs
     // `[adapter.policy].allow_network = true` to remain SET after this
     // wholesale config.toml rewrite (unset/lost = gate not established) —
-    // `indexed_scope_embed`'s earlier `--approve` already set it, so this
+    // `indexed_scope_embed`'s earlier dedicated adapter grant set it, so this
     // full overwrite must carry it forward explicitly or the scope silently
     // loses its persisted opt-in.
     fs::write(
@@ -5607,7 +5703,10 @@ fn r11_2_index_embedding_auth_error_exits_5() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    let indexed = json_code_stdout_embed(&dir, "auth_error", 5, &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock");
+    approve_embed(&dir, "mock");
+    let indexed = json_code_stdout_embed(&dir, "auth_error", 5, &["index"]);
     assert_eq!(
         indexed["status"], "indexed",
         "the local index still succeeds: {indexed}"
@@ -5644,6 +5743,8 @@ fn ct3_l2_budget_paused_resume_symmetry_across_adapters() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
     // A zero folder cap pauses BOTH adapters on budget.
     fs::write(
         dir.path().join(".kio/config.toml"),
@@ -5652,7 +5753,7 @@ fn ct3_l2_budget_paused_resume_symmetry_across_adapters() {
     .unwrap();
     // R11-2: the embedding enrichment DRIVEN inline by index budget-pauses here, so
     // index reports exit 6 (docs/04 §5.6) with its full result JSON still on stdout.
-    let indexed = json_both_mock_code(&dir, &["index", "--approve"], 6);
+    let indexed = json_both_mock_code(&dir, &["index"], 6);
     assert!(
         indexed["paused_tasks"].as_u64().unwrap() > 0,
         "index must disclose the budget-paused work: {indexed}"
@@ -5710,12 +5811,14 @@ fn ct3_l2_recheck_budget_enforces_the_current_cap_for_both_adapters() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
     fs::write(
         dir.path().join(".kio/config.toml"),
         "[budget]\nmonthly_usd_cap = 0\n",
     )
     .unwrap();
-    json_both_mock_code(&dir, &["index", "--approve"], 6);
+    json_both_mock_code(&dir, &["index"], 6);
 
     let denied = json_both_mock_code(
         &dir,
@@ -5755,34 +5858,66 @@ fn ct3_l2_recheck_budget_enforces_the_current_cap_for_both_adapters() {
     );
 }
 
-// Scenario (c) — L3: a short-hash `view` still resolves after a bare `kio
-// snapshot` advanced HEAD. The manual snapshot writes a raw-only tree (differs
-// from the index's normalized tree, so HEAD genuinely advances) without
-// refreshing the source tree_entries projection. Before L3 the short-hash
-// resolver read a stale JSON projection filtered by the new HEAD and returned
-// CONFIG-USAGE; it now materializes that local command's source relation itself.
+// Scenario (c) — L3: a bare `kio snapshot` advances HEAD with a raw-only
+// tree. It must not grandfather an older semantic chunk into a new Evidence
+// Pointer: the snapshot has no same-snapshot normalized profile/gen/manifest.
+// A true raw short hash remains available through the authenticated current HEAD
+// path, without exposing the prior chunk body.
 #[test]
-fn ct3_l3_short_hash_resolves_after_bare_snapshot() {
+fn ct3_l3_bare_snapshot_rejects_chunk_evidence_but_opens_current_raw_short_hash() {
     let dir = indexed_scope();
     let search = json_success(&dir, &["search", "トークン TTL 3600"]);
-    let chunk_hash = first_result(&search)["chunk_hash"]
+    let row = first_result(&search);
+    let chunk_hash = row["chunk_hash"].as_str().unwrap().to_owned();
+    let raw_hash = row["evidence_pointer"]["raw_hash"]
         .as_str()
         .unwrap()
         .to_owned();
-    // Sanity: resolves before the snapshot.
+    let pointer = row["evidence_pointer"].clone();
+    // Sanity: semantic evidence resolves while the authenticated normalized
+    // snapshot is HEAD.
     let sanity = json_success(&dir, &["view", &chunk_hash]);
     assert!(view_slice(&sanity).contains("3600"));
-    // Advance HEAD via a manual snapshot (proves it is not a no-op).
     let snap = json_success(&dir, &["snapshot", "create", "-m", "advance"]);
     assert_eq!(
         snap["status"], "created",
         "snapshot must advance HEAD: {snap}"
     );
-    // L3: the same short-hash view still resolves.
-    let viewed = json_success(&dir, &["view", &chunk_hash]);
+
+    // A prior pointer is still evidence for its own retained, normalized
+    // commit. Rewriting it to the raw-only new snapshot must fail, as must the
+    // chunk short hash whose source relation now names that bare snapshot.
+    let pointer_text = pointer.to_string();
     assert!(
-        view_slice(&viewed).contains("3600"),
-        "short-hash view must survive a manual snapshot (L3): {viewed}"
+        kio(&dir, &["view", &pointer_text])
+            .output()
+            .unwrap()
+            .status
+            .success(),
+        "a retained normalized pointer remains independently authenticated"
+    );
+    let mut bare_pointer = pointer;
+    bare_pointer["commit"] = snap["commit_hash"].clone();
+    let bare_pointer_text = bare_pointer.to_string();
+    for operand in [&chunk_hash, &bare_pointer_text] {
+        let output = kio(&dir, &["view", operand]).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "bare snapshot must not serve semantic evidence: {operand}"
+        );
+    }
+
+    // A true raw short hash is authenticated by the current bare HEAD path and
+    // returns only the raw object path, not the former chunk view.
+    let raw = json_success(&dir, &["open", &raw_hash]);
+    assert_eq!(
+        raw["object_type"], "raw",
+        "raw short hash must remain raw: {raw}"
+    );
+    assert_eq!(
+        fs::read_to_string(raw["path"].as_str().unwrap()).unwrap(),
+        fs::read_to_string(dir.path().join("auth.md")).unwrap(),
+        "raw short hash must resolve the authenticated current working file"
     );
 }
 
@@ -5799,8 +5934,9 @@ fn ct3_l4_embedding_without_own_optin_is_enqueue_only() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
     // Approve WITHOUT the embedding seam → only the markdownize opt-in row exists.
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
     // Now configure the embedding adapter (mock) and re-drive enrichment via
     // reindex. The scope has no embedding opt-in row → enqueue-only.
     json_success_embed(&dir, "mock", &["reindex", "--regenerate", "--yes"]);
@@ -5813,7 +5949,8 @@ fn ct3_l4_embedding_without_own_optin_is_enqueue_only() {
     );
 
     // Grant the embedding opt-in explicitly → the same chunks now embed.
-    json_success_embed(&dir, "mock", &["index", "--approve"]);
+    approve_embed(&dir, "mock");
+    json_success_embed(&dir, "mock", &["index"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     assert!(
         tasks_of_type(&status, "embedding")
@@ -5914,8 +6051,8 @@ fn m4_corrupt_source_sqlite_does_not_exclude_multiscope_replica_search() {
     fs::write(b.join("b.md"), "# B\n\n## Sec\nbetaunique token\n").unwrap();
     json_success_path(&a, &data_home, &["init"]);
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
     let a_scope_id = read_scope_id(&a);
     let b_scope_id = read_scope_id(&b);
 
@@ -6027,38 +6164,62 @@ fn m6_tampered_pointer_identity_mismatch_is_rejected() {
     assert!(view_slice(&ok).contains("トークン TTL"));
 }
 
-// M7: an `object` URI dispatches to the CORRECT CAS type directory. An image
-// object lives only under objects/image; it resolves via object/image/<hash>
-// and is NOT found via object/raw/<hash> (which previously mis-served all types).
+// M7: an `object` URI dispatches to the correct image CAS directory, but a
+// manually planted same-scope image object is not disclosure authority. The
+// indexed PNG supplies the authenticated immutable typed owner required to
+// open its URI.
 #[test]
 fn m7_object_uri_dispatches_by_type_directory() {
+    use base64::Engine as _;
     use kio_core::cas::hash_bytes;
-    let dir = indexed_scope();
-    let search = json_success(&dir, &["search", "トークン TTL 3600"]);
-    let scope_id = first_result(&search)["evidence_pointer"]["scope_id"]
+
+    let dir = tempfile::tempdir().unwrap();
+    let png = base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=")
+        .unwrap();
+    fs::write(dir.path().join("scan.png"), png).unwrap();
+    kio(&dir, &["init"]).assert().success();
+    json_success(&dir, &["index", "--offline"]);
+    let search = json_success(&dir, &["search", "scan", "--mode", "text"]);
+    let image_uri = first_result(&search)["related_images"].as_array().unwrap()[0]["image_uri"]
         .as_str()
         .unwrap()
         .to_owned();
-    let kio_dir = dir.path().join(".kio");
-    let bytes = b"fake-embedded-image-bytes";
-    let image_hash = hash_bytes(bytes);
-    let image_obj = object_path(&kio_dir, "image", &image_hash);
-    fs::create_dir_all(image_obj.parent().unwrap()).unwrap();
-    fs::write(&image_obj, bytes).unwrap();
+    let (prefix, image_hash) = image_uri.rsplit_once('/').unwrap();
+    let scope_id = prefix
+        .strip_prefix("kio://")
+        .unwrap()
+        .strip_suffix("/object/image")
+        .unwrap();
 
-    // Correct dispatch: image resolves from objects/image.
-    let opened = json_success(
+    // Correct dispatch: a typed-owned image resolves from objects/image.
+    let opened = json_success(&dir, &["open", &image_uri]);
+    assert_eq!(opened["object_type"], "image");
+    assert!(Path::new(opened["path"].as_str().unwrap()).is_file());
+
+    // CAS presence alone cannot authorize an unrelated image in the same
+    // scope. This remains distinct from type-directory dispatch.
+    let planted = b"unowned-image-cas-bytes";
+    let planted_hash = hash_bytes(planted);
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(
+        repo.object_store()
+            .write_content_object(ContentObjectKind::Image, planted)
+            .unwrap(),
+        planted_hash
+    );
+    let denied = json_failure(
         &dir,
         &[
             "open",
-            &format!("kio://{scope_id}/object/image/{image_hash}"),
+            &format!("kio://{scope_id}/object/image/{planted_hash}"),
         ],
+        4,
     );
-    assert_eq!(opened["object_type"], "image");
-    assert!(Path::new(opened["path"].as_str().unwrap()).is_file());
-    // Same hash under object/raw must NOT resolve — PA01 (§A, U22) now
-    // rejects `raw`-type object URIs categorically at parse time (exit 2),
-    // superseding the old not-found-at-resolution (exit 4) expectation.
+    assert_eq!(denied["error_code"], "KIO-E-OBJECT-POLICY-001");
+
+    // Same hash under object/raw must NOT resolve — PA01 (§A, U22) now rejects
+    // raw-type object URIs categorically at parse time (exit 2).
     let raw_uri_error = json_failure(
         &dir,
         &["open", &format!("kio://{scope_id}/object/raw/{image_hash}")],
@@ -6174,7 +6335,7 @@ fn minor_evidence_scope_ambiguous_error_code_is_emitted() {
     )
     .unwrap();
     json_success_path(&a, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
     let search = json_success_path(&a, &data_home, &["search", "トークン TTL 3600"]);
     let pointer = first_result(&search)["evidence_pointer"].clone();
     let scope_id = pointer["scope_id"].as_str().unwrap().to_owned();
@@ -6239,7 +6400,9 @@ fn n1_tier_b_online_send_held_until_send_secrets() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed(&dir, "mock", &["index", "--approve", "--online"]);
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
+    json_success_embed(&dir, "mock", &["index", "--online"]);
 
     let status = json_success_embed(&dir, "mock", &["status"]);
     let secret_embed: Vec<_> = tasks_of_type(&status, "embedding")
@@ -6272,18 +6435,19 @@ fn n1_tier_b_online_send_held_until_send_secrets() {
         "Tier B must be recorded in quarantine: {status}"
     );
 
-    // Explicit approval lifts the hold → the Tier B chunks now embed.
+    // A separate secret-content approval lifts the hold → Tier B chunks embed.
     json_success_embed(
         &dir,
         "mock",
-        &["index", "--approve", "--online", "--send-secrets"],
+        &["adapter", "approve", "--all", "--yes", "--send-secrets"],
     );
+    json_success_embed(&dir, "mock", &["index", "--online"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     assert!(
         tasks_of_type(&status, "embedding")
             .iter()
             .any(|task| { task["input_path"] == "api_secret.md" && task["status"] == "done" }),
-        "--send-secrets must release and embed the Tier B chunks: {status}"
+        "adapter approve --send-secrets must release and embed Tier B chunks: {status}"
     );
 }
 
@@ -6421,6 +6585,8 @@ fn n7_online_flag_drives_embedding_enrichment() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
     json_success_embed(&dir, "mock", &["index", "--yes", "--online"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     assert!(
@@ -6466,8 +6632,8 @@ fn o1_cursor_scope_restriction_and_signature() {
     .unwrap();
     json_success_path(&safe, &data_home, &["init"]);
     json_success_path(&vault, &data_home, &["init"]);
-    json_success_path(&safe, &data_home, &["index", "--approve"]);
-    json_success_path(&vault, &data_home, &["index", "--approve"]);
+    json_success_path(&safe, &data_home, &["index"]);
+    json_success_path(&vault, &data_home, &["index"]);
 
     // Legitimate owner pages their own vault: --scope <vault> freezes the cursor's
     // scope set to the vault.
@@ -6600,7 +6766,7 @@ fn o4_crafted_multibyte_pdf_does_not_panic() {
     pdf.extend_from_slice(b"%%EOF\n");
     fs::write(dir.path().join("crafted.pdf"), &pdf).unwrap();
     kio(&dir, &["init"]).assert().success();
-    let assert = kio(&dir, &["index", "--approve", "--json"]).assert();
+    let assert = kio(&dir, &["index", "--json"]).assert();
     let code = assert.get_output().status.code().unwrap();
     assert_ne!(code, 101, "crafted PDF must not panic (exit 101)");
     assert_eq!(code, 0, "crafted PDF must index cleanly (exit 0)");
@@ -6612,13 +6778,9 @@ fn o4_crafted_multibyte_pdf_does_not_panic() {
 fn o5_empty_scope_indexes_with_exit_0() {
     let dir = tempfile::tempdir().unwrap();
     kio(&dir, &["init"]).assert().success();
-    kio(&dir, &["index", "--approve", "--json"])
-        .assert()
-        .success();
+    kio(&dir, &["index", "--json"]).assert().success();
     // Re-index is also clean (no stuck "commit, no index" state).
-    kio(&dir, &["index", "--approve", "--json"])
-        .assert()
-        .success();
+    kio(&dir, &["index", "--json"]).assert().success();
 }
 
 // (f) / O6: a too-short `sha256:` operand is a usage error (exit 2), not a slice
@@ -6658,7 +6820,7 @@ fn o7_cursor_replay_detects_scope_id_collision() {
     )
     .unwrap();
     json_success_path(&a, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
     let first = json_success_path(&a, &data_home, &["search", "認証仕様", "--limit", "1"]);
     let cursor = first["paging"]["next_cursor"]
         .as_str()
@@ -6716,12 +6878,12 @@ fn p1_batch_resume_rejects_out_of_scope_task_input_path() {
         "sub/secret.txt",
     ] {
         let dir = tempfile::tempdir().unwrap();
-        // R9-2: a PDF so `index --approve` enqueues a real online task whose
+        // R9-2: a PDF so `index` enqueues a real online task whose
         // output_ref the poison row reuses (text-native files enqueue none).
         fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello world content"])).unwrap();
         kio(&dir, &["init"]).assert().success();
         // Records the online opt-in and enqueues legitimate tasks.
-        json_success(&dir, &["index", "--approve"]);
+        json_success(&dir, &["index"]);
         let online_output_ref = first_online_output_ref(&json_success(&dir, &["status"]));
         // Append a pending online markdownize task escaping the scope.
         let tasks = dir.path().join(".kio/tasks.jsonl");
@@ -6787,7 +6949,7 @@ fn p4_corrupt_store_error_message_has_no_absolute_path() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.txt"), "hi").unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
     // Corrupt tasks.jsonl so the next read raises KIO-E-STORE-CORRUPT-001.
     let tasks = dir.path().join(".kio/tasks.jsonl");
     let mut contents = fs::read_to_string(&tasks).unwrap_or_default();
@@ -6842,47 +7004,32 @@ fn p2_init_restricts_kio_and_data_dir_to_owner() {
     assert_eq!(data_mode, 0o700, "data dir must be 0700, got {data_mode:o}");
 }
 
-/// P3: a plaintext `plain:` API key in a group/world-readable tools.toml records
-/// a level=warn observation (KIO-E-ADAPTER-TOOLS-PERM-001) without blocking
-/// startup; a 0600 tools.toml records nothing.
+/// P3: a plaintext `plain:` credential is admitted only from an owner-private
+/// `tools.toml` whose immediate parent is also owner-private.
 #[cfg(unix)]
 #[test]
-fn p3_plain_auth_tools_toml_permission_warning() {
+fn p3_plain_auth_tools_toml_requires_private_file_and_parent() {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir().unwrap();
+    let temporary_root = fs::canonicalize(std::env::temp_dir()).unwrap();
+    let dir = tempfile::tempdir_in(temporary_root).unwrap();
     fs::write(dir.path().join("a.txt"), "x").unwrap();
     kio(&dir, &["init"]).assert().success();
 
     let tools_dir = dir.path().join(".test-config/kio");
     fs::create_dir_all(&tools_dir).unwrap();
+    fs::set_permissions(&tools_dir, fs::Permissions::from_mode(0o700)).unwrap();
     let tools = tools_dir.join("tools.toml");
     fs::write(&tools, "[markdown]\nauth = \"plain:sk-secret-key\"\n").unwrap();
-    let errors = dir.path().join(".test-data/kio/logs/errors.jsonl");
 
-    // 0644 -> warn recorded, startup still succeeds (exit 0).
+    // A credential-bearing file cannot be read through the private trust
+    // boundary while it is group/world-readable.
     fs::set_permissions(&tools, fs::Permissions::from_mode(0o644)).unwrap();
-    kio(&dir, &["status"]).assert().success();
-    let text = fs::read_to_string(&errors).unwrap_or_default();
-    let warn = text
-        .lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .find(|v| v["code"] == "KIO-E-ADAPTER-TOOLS-PERM-001" && v["level"] == "warn");
-    assert!(
-        warn.is_some(),
-        "0644 plain: tools.toml must warn; got {text}"
-    );
-    // The redacted log never carries the absolute config path.
-    assert_eq!(warn.unwrap()["context"]["path"], "[redacted]");
+    let error = json_failure(&dir, &["status"], 2);
+    assert_eq!(error["error_code"], "KIO-E-ADAPTER-TOOLS-PRIVATE-001");
 
-    // 0600 -> no new warning.
-    fs::remove_file(&errors).ok();
+    // A 0600 leaf below a 0700 parent remains valid.
     fs::set_permissions(&tools, fs::Permissions::from_mode(0o600)).unwrap();
     kio(&dir, &["status"]).assert().success();
-    let text = fs::read_to_string(&errors).unwrap_or_default();
-    assert!(
-        !text.contains("KIO-E-ADAPTER-TOOLS-PERM-001"),
-        "0600 tools.toml must not warn; got {text}"
-    );
 }
 
 /// P5: a concurrent `kio search` during repeated `repair rebuild-db` must
@@ -6923,7 +7070,7 @@ fn p5_concurrent_search_during_rebuild_is_never_silently_empty() {
             .unwrap()
     };
     assert!(run(&["init"]).status.success());
-    assert!(run(&["index", "--approve"]).status.success());
+    assert!(run(&["index"]).status.success());
     let baseline = run(&["search", "alphaunique", "--mode", "text", "--json"]);
     assert!(baseline.status.success());
     let baseline: Value = serde_json::from_slice(&baseline.stdout).unwrap();
@@ -6968,28 +7115,27 @@ fn p5_concurrent_search_during_rebuild_is_never_silently_empty() {
     handle.join().unwrap();
 }
 
-/// P7: re-running `index` with the same opt-in must not append an equivalent
-/// approval row every time — approvals.jsonl stays bounded (idempotent opt-in).
+/// P7: `index --yes` confirms only this local scan; it cannot mint an adapter
+/// approval or mutate the durable adapter-grant store.
 #[test]
-fn p7_repeated_index_does_not_grow_approvals() {
+fn p7_index_yes_does_not_create_adapter_approval() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
     kio(&dir, &["init"]).assert().success();
     let approvals = dir.path().join(".kio/approvals.jsonl");
 
-    json_success(&dir, &["index", "--approve"]);
-    let first = fs::read_to_string(&approvals).unwrap();
-    let first_lines = first.lines().filter(|l| !l.trim().is_empty()).count();
-    assert!(first_lines >= 1);
+    json_success(&dir, &["index", "--yes"]);
+    assert!(
+        !approvals.exists(),
+        "a local index confirmation must not create adapter approvals"
+    );
 
     for _ in 0..4 {
-        json_success(&dir, &["index", "--approve"]);
+        json_success(&dir, &["index", "--yes"]);
     }
-    let after = fs::read_to_string(&approvals).unwrap();
-    let after_lines = after.lines().filter(|l| !l.trim().is_empty()).count();
-    assert_eq!(
-        after_lines, first_lines,
-        "equivalent opt-in rows must not accumulate ({first_lines} -> {after_lines})"
+    assert!(
+        !approvals.exists(),
+        "repeated local index confirmations must not create adapter approvals"
     );
 }
 
@@ -7137,7 +7283,7 @@ fn p10_replica_rebuilding_returns_not_silent_empty() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
 
     let baseline = json_success(&dir, &["search", "alphaunique", "--mode", "text"]);
     let expected = baseline["results"].as_array().unwrap().len();
@@ -7165,7 +7311,7 @@ fn p10_replica_rebuilding_returns_not_silent_empty() {
     );
 
     // The state is transient: a complete writer projection recovers the full set.
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
     let recovered = json_success(&dir, &["search", "alphaunique", "--mode", "text"]);
     assert_eq!(recovered["results"].as_array().unwrap().len(), expected);
 }
@@ -7190,7 +7336,7 @@ fn p10_partial_index_window_does_not_false_rebuilding() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
 
     let db = dir.path().join(".kio/index/sqlite.db");
     let backup = dir.path().join("sqlite_c0.db");
@@ -7203,7 +7349,7 @@ fn p10_partial_index_window_does_not_false_rebuilding() {
         "# Alpha\n\n## S\nalphaword alphaword changed newtext\n",
     )
     .unwrap();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
 
     // Restore the pre-change sqlite while HEAD is the post-change commit. Unlike
     // reindex, b.md's chunk is still live for HEAD, so a query for the unchanged
@@ -7238,7 +7384,7 @@ fn p10_genuine_no_hit_and_empty_scope_stay_exit_zero() {
     // Empty scope (no documents): exit-0 empty page (no tree_entries for HEAD).
     let empty = tempfile::tempdir().unwrap();
     kio(&empty, &["init"]).assert().success();
-    kio(&empty, &["index", "--approve"]).assert().success();
+    kio(&empty, &["index"]).assert().success();
     let search = json_success(&empty, &["search", "anything", "--mode", "text"]);
     assert!(search["results"].as_array().unwrap().is_empty());
     assert!(search["excluded_scopes"].as_array().unwrap().is_empty());
@@ -7288,7 +7434,8 @@ fn p10_concurrent_search_during_reindex_is_never_silently_empty() {
             .unwrap()
     };
     assert!(run(&["init"]).status.success());
-    assert!(run(&["index", "--approve"]).status.success());
+    assert!(run(&["ledger", "init"]).status.success());
+    assert!(run(&["index"]).status.success());
     let baseline = run(&["search", "alphaunique", "--mode", "text", "--json"]);
     assert!(baseline.status.success());
     let baseline: Value = serde_json::from_slice(&baseline.stdout).unwrap();
@@ -7431,11 +7578,20 @@ fn r6_foreign_approval_rows_do_not_grant_online_embedding() {
     let other = tempfile::tempdir().unwrap();
     fs::write(other.path().join("other.md"), "# Other\napproval source\n").unwrap();
     kio(&other, &["init"]).assert().success();
-    json_success_embed(&other, "mock", &["index", "--approve"]);
-    let foreign_approvals = fs::read_to_string(other.path().join(".kio/approvals.jsonl")).unwrap();
-    fs::write(dir.path().join(".kio/approvals.jsonl"), foreign_approvals).unwrap();
+    initialize_paid_ledger(&other);
+    approve_embed(&other, "mock");
+    let foreign_scope: Value =
+        serde_json::from_slice(&fs::read(other.path().join(".kio/scope.json")).unwrap()).unwrap();
+    let mut local_scope: Value =
+        serde_json::from_slice(&fs::read(dir.path().join(".kio/scope.json")).unwrap()).unwrap();
+    local_scope["approvals"] = foreign_scope["approvals"].clone();
+    fs::write(
+        dir.path().join(".kio/scope.json"),
+        serde_json::to_vec_pretty(&local_scope).unwrap(),
+    )
+    .unwrap();
 
-    let out = json_success_embed(&dir, "mock", &["index", "--yes"]);
+    let out = json_success_embed(&dir, "mock", &["index"]);
     assert_eq!(out["network_allowed"], false);
     assert_eq!(out["network_opt_in"], false);
     let status = json_success_embed(&dir, "mock", &["status"]);
@@ -7510,8 +7666,8 @@ fn r6_default_search_rereads_current_global_opt_out() {
     fs::write(b.path().join("b.md"), "# B\nbetapublic\n").unwrap();
     json_success_path(a.path(), data_home.path(), &["init"]);
     json_success_path(b.path(), data_home.path(), &["init"]);
-    json_success_path(a.path(), data_home.path(), &["index", "--approve"]);
-    json_success_path(b.path(), data_home.path(), &["index", "--approve"]);
+    json_success_path(a.path(), data_home.path(), &["index"]);
+    json_success_path(b.path(), data_home.path(), &["index"]);
     fs::write(
         a.path().join(".kio/config.toml"),
         "[scope]\nparticipates_in_global_search = false\n",
@@ -7579,9 +7735,11 @@ fn r7_empty_secrets_approval_file_does_not_lift_tier_b_hold() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
     fs::write(dir.path().join(".kio/secrets-approved.jsonl"), "").unwrap();
 
-    json_success_embed(&dir, "mock", &["index", "--approve", "--online"]);
+    json_success_embed(&dir, "mock", &["index", "--online"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     assert!(
         status["quarantine"]
@@ -7621,19 +7779,45 @@ fn pc4_multiscope_query_embedding_sent_when_any_target_scope_opts_in() {
     fs::write(b.path().join("b.md"), "# B\nsharedterm beta\n").unwrap();
     run_embed_path(a.path(), data_home.path(), "mock", &["init"]);
     run_embed_path(b.path(), data_home.path(), "mock", &["init"]);
+    run_embed_path(a.path(), data_home.path(), "mock", &["ledger", "init"]);
     run_embed_path(
         a.path(),
         data_home.path(),
         "mock",
-        &["index", "--approve", "--online"],
+        &["adapter", "approve", "gemini_embedding_2", "--yes"],
     );
-    // B has embeddings from a one-shot send, but no persistent embedding opt-in.
+    let a_effective = |when: &str| {
+        let status = run_embed_path(
+            a.path(),
+            data_home.path(),
+            "mock",
+            &["adapter", "status", "gemini_embedding_2"],
+        );
+        assert!(
+            status["effective"]
+                .as_array()
+                .is_some_and(|rows| rows.iter().any(|row| row["permitted"] == true)),
+            "A's grant must remain effective {when}: {status}"
+        );
+    };
+    a_effective("after A approval");
+    run_embed_path(a.path(), data_home.path(), "mock", &["index", "--online"]);
+    // B retains vectors from a prior approved send, but its grant was revoked.
     run_embed_path(
         b.path(),
         data_home.path(),
         "mock",
-        &["index", "--yes", "--online"],
+        &["adapter", "approve", "gemini_embedding_2", "--yes"],
     );
+    a_effective("after B approval");
+    run_embed_path(b.path(), data_home.path(), "mock", &["index", "--online"]);
+    run_embed_path(
+        b.path(),
+        data_home.path(),
+        "mock",
+        &["adapter", "revoke", "gemini_embedding_2"],
+    );
+    a_effective("after B revocation");
 
     let trace = data_home.path().join("query.trace");
     let output = hermetic_kio_command()
@@ -7675,12 +7859,36 @@ fn r7_repair_rejects_unknown_flags_and_extra_operands() {
 }
 
 #[test]
-fn r7_embedding_profile_change_reembeds_current_profile() {
+fn r7_embedding_profile_change_requires_a_new_explicit_grant() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("doc.md"), "# Doc\nalpha profile flip\n").unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed(&dir, "incompatible_profile", &["index", "--approve"]);
-    json_success_embed(&dir, "mock", &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
+    json_success_embed(&dir, "mock", &["index"]);
+
+    // Model a retained foreign vector space by changing only rebuildable index
+    // metadata; immutable source objects and their bytes remain untouched.
+    let conn = index_db(&dir);
+    assert!(
+        conn.execute(
+            "UPDATE embeddings SET profile_hash = ?1 WHERE target_type = 'chunk'",
+            ["sha256:00000000000000000000000000000000000000000000000000000000foreign"],
+        )
+        .unwrap()
+            > 0
+    );
+    drop(conn);
+    json_success_embed(&dir, "mock", &["adapter", "revoke", "gemini_embedding_2"]);
+
+    // The prior grant cannot authorize regeneration after the profile drift.
+    json_success_embed(&dir, "mock", &["index"]);
+    let pending = json_success_embed(&dir, "mock", &["search", "alpha"]);
+    assert_eq!(pending["resolved_mode"], "text", "{pending}");
+    assert_eq!(pending["fallback"], true, "{pending}");
+
+    approve_embed(&dir, "mock");
+    json_success_embed(&dir, "mock", &["index"]);
     let after = json_success_embed(&dir, "mock", &["search", "alpha"]);
     assert_eq!(after["resolved_mode"], "hybrid", "{after}");
     assert_eq!(after["fallback"], false, "{after}");
@@ -7788,7 +7996,7 @@ fn r9_5_reindex_survives_junk_in_gen_dir() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
 
     let units_root = dir.path().join(".kio/objects/normalized_units");
     let gen_dir = gen_dir_under(&units_root).expect("a .g0 gen dir exists after index");
@@ -7998,7 +8206,7 @@ fn r12_2_max_input_bytes_gates_oversized_input() {
         "# Big\n\n## Section\nthis body is definitely longer than fifty bytes in total.\n",
     )
     .unwrap();
-    let index = json_success(&dir, &["index", "--approve"]);
+    let index = json_success(&dir, &["index"]);
     assert_eq!(index["skipped_oversized_files"], 1);
     assert_eq!(index["normalized_files"], 0);
 }
@@ -8023,7 +8231,7 @@ fn multi_chunk_scope() -> TempDir {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
     dir
 }
 
@@ -8199,7 +8407,7 @@ fn r12_3_reconcile_completes_committed_embedding_tasks() {
 
     // A single recovery command (index) reconciles the accounting WITHOUT re-sending:
     // every chunk is already embedded, so `pending` is empty and nothing is executed.
-    let reindex = json_success_embed(&dir, "mock", &["index", "--approve"]);
+    let reindex = json_success_embed(&dir, "mock", &["index"]);
     assert_eq!(
         reindex["embedding_tasks_executed"], 0,
         "reconcile must not re-send embeddings: {reindex}"
@@ -8246,7 +8454,7 @@ fn r23_materialized_embedding_completes_failed_task_without_charge() {
     fs::write(&tasks_path, rewritten).unwrap();
     let ledger_before = embedding_ledger_rows(&dir);
 
-    let reindex = json_success_embed(&dir, "mock", &["index", "--approve"]);
+    let reindex = json_success_embed(&dir, "mock", &["index"]);
     assert_eq!(reindex["embedding_tasks_executed"], 0);
     assert_eq!(embedding_ledger_rows(&dir), ledger_before);
 
@@ -8276,7 +8484,9 @@ fn r12_4_enrichment_auth_failure_reaches_errors_jsonl() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    let indexed = json_code_stdout_embed(&dir, "auth_error", 5, &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "auth_error");
+    let indexed = json_code_stdout_embed(&dir, "auth_error", 5, &["index"]);
     assert!(indexed["embedding_tasks_failed"].as_u64().unwrap() > 0);
     let errors = fs::read_to_string(dir.path().join(".test-data/kio/logs/errors.jsonl")).unwrap();
     assert!(
@@ -8303,8 +8513,8 @@ fn r12_4_multi_scope_partial_records_exclusion_in_errors_jsonl() {
     fs::write(b.join("b.md"), "# B\n\n## Sec\nbetaunique token\n").unwrap();
     json_success_path(&a, &data_home, &["init"]);
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
     let b_kio = b.join(".kio");
     use std::os::unix::fs::PermissionsExt;
     let mut perms = fs::metadata(&b_kio).unwrap().permissions();
@@ -8518,7 +8728,7 @@ fn indexed_scope_deterministic_embed() -> TempDir {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_deterministic_embed(&dir, &["index", "--approve"]);
+    json_success_deterministic_embed(&dir, &["index", "--yes"]);
     dir
 }
 
@@ -8573,12 +8783,54 @@ fn offline_flag_does_not_degrade_the_deterministic_embedding_adapter() {
 fn deterministic_embedding_never_touches_the_cost_ledger() {
     let dir = indexed_scope_deterministic_embed();
     json_success_deterministic_embed(&dir, &["search", "トークン", "--mode", "vector"]);
-    assert_eq!(
-        reservation_row_count(&dir, "embedding"),
-        0,
-        "a deterministic adapter must not reserve against the ledger"
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists(),
+        "local embedding and vector search must not create a ledger"
     );
-    assert_eq!(reservation_or_charged_usd(&dir, "embedding"), 0.0);
+}
+
+/// A crash after a local vector is committed must converge without creating a
+/// paid ledger or sending the already materialized chunk again.
+#[test]
+fn deterministic_embedding_reconciles_stranded_tasks_without_a_ledger() {
+    use kio_pipeline::task::{TaskStatus, TaskStore, TaskType};
+
+    let dir = indexed_scope_deterministic_embed();
+    let store = TaskStore::new(dir.path().join(".kio").canonicalize().unwrap());
+    let before = store.all().unwrap();
+    assert!(
+        before
+            .iter()
+            .any(|task| task.task_type == TaskType::Embedding)
+    );
+    store
+        .update_matching(|task| {
+            if task.task_type != TaskType::Embedding {
+                return false;
+            }
+            assert_eq!(task.status, TaskStatus::Done);
+            assert!(task.reservation_claim().is_none());
+            task.status = TaskStatus::Pending;
+            task.fallback_reason = Some("ready_for_online_adapter".to_owned());
+            true
+        })
+        .unwrap();
+    json_success_deterministic_embed(&dir, &["index", "--yes", "--offline"]);
+    let after = store.all().unwrap();
+    assert_eq!(after.len(), before.len());
+    assert!(
+        after
+            .iter()
+            .filter(|task| task.task_type == TaskType::Embedding)
+            .all(|task| task.status == TaskStatus::Done && task.reservation_claim().is_none())
+    );
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
+    );
 }
 
 /// The working tool-lock records the active execution posture even though
@@ -8628,7 +8880,11 @@ fn indexed_scope_deterministic_embed_with_images() -> TempDir {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_deterministic_embed(&dir, &["index", "--approve"]);
+    // Embedding is local, but the fixture deliberately sends OCR through its
+    // billed mock seam during `batch resume`.
+    initialize_paid_ledger(&dir);
+    json_success_deterministic_embed(&dir, &["index"]);
+    approve_markdownize(&dir, "mock_link_image");
     kio(&dir, &["batch", "resume"])
         .env(TEST_DETERMINISTIC_EMBEDDING_ENV, "scale-v3")
         .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock_link_image")
@@ -8753,7 +9009,11 @@ fn the_online_adapter_embeds_no_images_because_it_declares_no_capability() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed(&dir, "mock", &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock");
+    approve_embed(&dir, "mock");
+    approve_markdownize(&dir, "mock_link_image");
+    json_success_embed(&dir, "mock", &["index"]);
     kio(&dir, &["batch", "resume"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock_link_image")
@@ -8933,7 +9193,9 @@ fn v6_the_pointer_is_the_lowest_chunk_hash_citing_the_image() {
     fs::write(dir.path().join("alpha.pdf"), fake_pdf(&["figure alpha"])).unwrap();
     fs::write(dir.path().join("beta.pdf"), fake_pdf(&["figure beta"])).unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_deterministic_embed(&dir, &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock_link_image");
+    json_success_deterministic_embed(&dir, &["index"]);
     kio(&dir, &["batch", "resume"])
         .env(TEST_DETERMINISTIC_EMBEDDING_ENV, "scale-v3")
         .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock_link_image")
@@ -9019,7 +9281,8 @@ fn the_online_adapter_returns_no_image_rows_because_it_embeds_none() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed(&dir, "mock", &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    json_success_embed(&dir, "mock", &["index"]);
     kio(&dir, &["batch", "resume"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock_link_image")
@@ -9333,10 +9596,10 @@ fn r16_1_missing_commit_object_degrades_reads_and_rejects_writes() {
 // `commit` is a FORGED hash (a well-formed sha256 naming no object) must be rejected
 // as EVIDENCE-POINTER-INVALID (exit 4), NOT resolved best-effort as if it were a
 // shallow commit — otherwise the tree-membership + N5 gen checks are both skipped and
-// forged evidence resolves. A GENUINE shallow commit (commit present, tree GC'd) must
-// still resolve directly (R17-1 narrows the best-effort path, it does not remove it).
+// forged evidence resolves. A genuine shallow commit is also rejected: its receipt
+// proves deletion but cannot bind a pointer to a historical tree entry or generation.
 #[test]
-fn r17_1_forged_commit_pointer_rejected_while_true_shallow_resolves() {
+fn r17_1_forged_and_true_shallow_commit_pointers_are_rejected() {
     // (a) forged commit hash → view/open reject.
     let dir = indexed_scope();
     let search = json_success(&dir, &["search", "トークン TTL 3600"]);
@@ -9359,8 +9622,8 @@ fn r17_1_forged_commit_pointer_rejected_while_true_shallow_resolves() {
         "a forged commit hash must be rejected by open: {open_err}"
     );
 
-    // (b) genuine shallow commit (tree object GC'd, commit present) → still resolves
-    // directly, commit_shallow:true exit 0. Fresh scope so (a) cannot mask a regression.
+    // (b) genuine shallow commit (tree object GC'd, commit present) is rejected.
+    // Fresh scope so (a) cannot mask the distinct final-receipt precondition.
     let dir2 = indexed_scope();
     let search2 = json_success(&dir2, &["search", "トークン TTL 3600"]);
     let pointer2 = first_result(&search2)["evidence_pointer"].clone();
@@ -9388,17 +9651,13 @@ fn r17_1_forged_commit_pointer_rejected_while_true_shallow_resolves() {
     .unwrap();
     fs::write(receipt_path, receipt.canonical_bytes().unwrap()).unwrap();
     fs::remove_file(object_path(&kio_dir2, "trees", tree2)).unwrap();
-    let viewed = json_success(&dir2, &["view", &pointer2.to_string()]);
-    assert_eq!(
-        viewed["commit_shallow"], true,
-        "a genuine shallow commit must still resolve directly: {viewed}"
-    );
-    assert!(view_slice(&viewed).contains("トークン TTL"));
-    let opened = json_success(&dir2, &["open", &pointer2.to_string()]);
-    assert_eq!(
-        opened["commit_shallow"], true,
-        "genuine shallow open must resolve: {opened}"
-    );
+    for command in ["view", "open"] {
+        let error = json_failure(&dir2, &[command, &pointer2.to_string()], 1);
+        assert_eq!(
+            error["error_code"], "KIO-E-COMMIT-SHALLOW-001",
+            "{command}: {error}"
+        );
+    }
 }
 
 // R17-1 / N5 contrast (the core harm): after `reindex --force` advances the
@@ -9502,8 +9761,8 @@ fn r16_2_one_scope_store_corruption_is_partial_not_all_failed() {
     fs::write(b.join("b.md"), "# B\n\n## Sec\nbetaunique other\n").unwrap();
     json_success_path(&a, &data_home, &["init"]);
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
 
     // (control) both scopes healthy → the search reaches both.
     let healthy = json_success_path(&a, &data_home, &["search", "alphaunique", "--all-scopes"]);
@@ -9559,8 +9818,8 @@ fn r16_3_fresh_search_unreceipted_tree_loss_excludes_not_silent_empty() {
     fs::write(b.join("b.md"), "# B\n\n## Sec\nbetashared token\n").unwrap();
     json_success_path(&a, &data_home, &["init"]);
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
 
     // Advance scope B's HEAD with a manual snapshot — the new commit's tree_entries are
     // NOT projected (only index/reindex project) — then discard its tree object. B's
@@ -10059,11 +10318,14 @@ fn run_markdownize_seam(
     serde_json::from_slice(&output).unwrap_or(Value::Null)
 }
 
+fn approve_markdownize(dir: &TempDir, seam: &str) {
+    run_markdownize_seam(dir, seam, None, &["adapter", "approve", "--all", "--yes"]);
+}
+
 /// `cost-ledger.sqlite`, opened read-only-in-spirit (queries only) for test
 /// assertions. The harness roots `$XDG_DATA_HOME` at `.test-data`.
-fn ledger_db(dir: &TempDir) -> kio_pipeline::ledger::LedgerDb {
-    kio_pipeline::ledger::LedgerDb::open(dir.path().join(".test-data/kio/cost-ledger.sqlite"))
-        .unwrap()
+fn ledger_db(dir: &TempDir) -> Connection {
+    Connection::open(dir.path().join(".test-data/kio/cost-ledger.sqlite")).unwrap()
 }
 
 /// Count of DISTINCT task-key reservations EVER made for `adapter_kind` — open
@@ -10076,13 +10338,12 @@ fn ledger_db(dir: &TempDir) -> kio_pipeline::ledger::LedgerDb {
 /// this counts the row regardless of which state it is currently in.
 fn reservation_row_count(dir: &TempDir, adapter_kind: &str) -> usize {
     let db = ledger_db(dir);
-    db.connection()
-        .query_row(
-            "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind = ?1",
-            [adapter_kind],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap() as usize
+    db.query_row(
+        "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind = ?1",
+        [adapter_kind],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap() as usize
 }
 
 /// Count of STILL-OPEN (non-terminal, `state IN (0,1)`) reservations for
@@ -10090,13 +10351,12 @@ fn reservation_row_count(dir: &TempDir, adapter_kind: &str) -> usize {
 /// released (settled terminal), not left dangling open forever.
 fn open_reservation_count(dir: &TempDir, adapter_kind: &str) -> usize {
     let db = ledger_db(dir);
-    db.connection()
-        .query_row(
-            "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind = ?1 AND state IN (0, 1)",
-            [adapter_kind],
-            |row| row.get::<_, i64>(0),
-        )
-        .unwrap() as usize
+    db.query_row(
+        "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind = ?1 AND state IN (0, 1)",
+        [adapter_kind],
+        |row| row.get::<_, i64>(0),
+    )
+    .unwrap() as usize
 }
 
 /// Total USD for `adapter_kind`: confirmed (`cost_ledger`, any month — these
@@ -10108,8 +10368,7 @@ fn open_reservation_count(dir: &TempDir, adapter_kind: &str) -> usize {
 /// row at terminal settlement, so a still-open reservation must be added from
 /// `batch_requests` to match the old helper's "as-reserved" semantics.
 fn reservation_or_charged_usd(dir: &TempDir, adapter_kind: &str) -> f64 {
-    let db = ledger_db(dir);
-    let conn = db.connection();
+    let conn = ledger_db(dir);
     let confirmed: f64 = conn
         .query_row(
             "SELECT COALESCE(SUM(usd), 0) FROM cost_ledger WHERE adapter_kind = ?1",
@@ -10147,8 +10406,10 @@ fn r16_7_rate_limit_retry_does_not_reaccrue_charge() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock");
     // index only ENQUEUES the online markdownize task (Pending); no send, no charge.
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
     assert_eq!(
         markdown_ledger_rows(&dir),
         0,
@@ -10224,7 +10485,9 @@ fn r16_7_network_error_retry_does_not_reaccrue_charge() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock");
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
 
     // First send fails NetworkError: one open reservation.
     run_markdownize_seam(
@@ -10315,7 +10578,9 @@ fn r17_3_rate_limit_phantom_settles_and_still_pauses_edited_doc() {
     );
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V1])).unwrap();
     kio(&dir, &["init"]).assert().success();
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock");
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
 
     // First real send under rate_limit: v1 -> Failed(rate_limit), one open reservation.
     run_markdownize_seam(
@@ -10331,37 +10596,30 @@ fn r17_3_rate_limit_phantom_settles_and_still_pauses_edited_doc() {
     );
     assert_eq!(
         open_reservation_count(&dir, "markdownize"),
-        1,
-        "the rate_limit reservation stays open (not yet a confirmed charge)"
+        0,
+        "a typed 429 is a known zero-cost rejection, never an open reservation"
     );
-    let doc_cost = markdown_ledger_usd(&dir);
-    assert!(doc_cost > 0.0, "the reservation must be a positive cost");
-
-    // Cap fits ONE document but not two: the settled phantom (1×) + edited doc (1×)
-    // would exceed it.
-    set_markdown_adapter_cap(&dir, doc_cost * 1.5);
+    assert_eq!(
+        markdown_ledger_usd(&dir),
+        0.0,
+        "429 must not consume budget"
+    );
 
     // Edit (new raw_hash, identical size) and re-index. The stale v1 task is retired,
     // which settles its still-open reservation as `unknown_settled` — a real charge at
     // the original estimate, not a reclaim-to-zero.
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V2])).unwrap();
-    run_markdownize_seam(
-        &dir,
-        "mock",
-        Some("2026-07-05T00:00:00Z"),
-        &["index", "--approve"],
-    );
+    run_markdownize_seam(&dir, "mock", Some("2026-07-05T00:00:00Z"), &["index"]);
 
     assert_eq!(
         open_reservation_count(&dir, "markdownize"),
         0,
         "the stale reservation must be settled (released), not left open forever"
     );
-    assert!(
-        (markdown_ledger_usd(&dir) - doc_cost).abs() < 1e-9,
-        "the settled phantom's charge must equal exactly its original reservation \
-         estimate: {} vs {doc_cost}",
-        markdown_ledger_usd(&dir)
+    assert_eq!(
+        markdown_ledger_usd(&dir),
+        0.0,
+        "known rejection stays zero-cost"
     );
 
     let status = run_markdownize_seam(&dir, "mock", Some("2026-07-05T00:00:00Z"), &["status"]);
@@ -10371,9 +10629,8 @@ fn r17_3_rate_limit_phantom_settles_and_still_pauses_edited_doc() {
         .filter(|task| task["status"] == "paused" && task["fallback_reason"] == "budget_exceeded")
         .count();
     assert_eq!(
-        paused_budget, 1,
-        "the edited doc must be budget-paused: the settled phantom permanently \
-         consumes the per-adapter cap (no reclaim under the new ledger): {status}"
+        paused_budget, 0,
+        "a known 429 must not fabricate spend that pauses the edited document: {status}"
     );
     // The stale v1 task is retired (non-retryable retired_non_live), not left rate_limit.
     let still_rate_limited = markdownize
@@ -10383,16 +10640,6 @@ fn r17_3_rate_limit_phantom_settles_and_still_pauses_edited_doc() {
     assert_eq!(
         still_rate_limited, 0,
         "the stale rate_limit task must be superseded: {status}"
-    );
-    // R19-3: the retirement uses the reversible `retired_non_live` reason (still
-    // non-retryable, but re-enqueueable if the exact bytes reappear).
-    let retired = markdownize
-        .iter()
-        .filter(|task| task["status"] == "failed" && task["fallback_reason"] == "retired_non_live")
-        .count();
-    assert_eq!(
-        retired, 1,
-        "the stale online task must be retired as retired_non_live: {status}"
     );
 }
 
@@ -10409,7 +10656,9 @@ fn r17_3_network_error_reservation_settles_pauses_edited_doc() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V1])).unwrap();
     kio(&dir, &["init"]).assert().success();
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock");
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
 
     // First real send under network_error: v1 -> Failed(network_error), one open row.
     run_markdownize_seam(
@@ -10425,12 +10674,7 @@ fn r17_3_network_error_reservation_settles_pauses_edited_doc() {
 
     // Edit and re-index in the same ledger month.
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V2])).unwrap();
-    run_markdownize_seam(
-        &dir,
-        "mock",
-        Some("2026-07-05T00:00:00Z"),
-        &["index", "--approve"],
-    );
+    run_markdownize_seam(&dir, "mock", Some("2026-07-05T00:00:00Z"), &["index"]);
 
     // The NetworkError reservation settles as a real charge (never reclaimed, under
     // either the retired or the current design) and is no longer open.
@@ -10447,13 +10691,16 @@ fn r17_3_network_error_reservation_settles_pauses_edited_doc() {
 
     let status = run_markdownize_seam(&dir, "mock", Some("2026-07-05T00:00:00Z"), &["status"]);
     let markdownize = tasks_of_type(&status, "markdownize");
-    // The stale v1 is still retired (retryable-Failed supersede), but its reservation
-    // is not reclaimed, so the edited doc's online task is budget-Paused.
-    let retired = markdownize
+    // A potentially billed transport failure is fenced as result_unknown rather
+    // than retired/retried after the file changes.
+    let unknown = markdownize
         .iter()
-        .filter(|task| task["status"] == "failed" && task["fallback_reason"] == "retired_non_live")
+        .filter(|task| task["status"] == "failed" && task["fallback_reason"] == "result_unknown")
         .count();
-    assert_eq!(retired, 1, "the stale task is still retired: {status}");
+    assert_eq!(
+        unknown, 1,
+        "the stale task must remain outcome-unknown: {status}"
+    );
     let paused_budget = markdownize
         .iter()
         .filter(|task| task["status"] == "paused" && task["fallback_reason"] == "budget_exceeded")
@@ -10486,6 +10733,20 @@ fn embedding_ledger_usd(dir: &TempDir) -> f64 {
     reservation_or_charged_usd(dir, "embedding")
 }
 
+/// A definite provider rejection settles its cost-ledger row at zero but retains
+/// the candidate estimate on `batch_requests`; caps for a later fresh attempt
+/// must therefore size from that durable estimate, never from settled spend.
+fn embedding_request_estimate(dir: &TempDir) -> f64 {
+    let conn = ledger_db(dir);
+    conn.query_row(
+        "SELECT estimated_usd FROM batch_requests
+         WHERE adapter_kind = 'embedding' ORDER BY submission_seq DESC LIMIT 1",
+        [],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
 fn set_embedding_adapter_cap(dir: &TempDir, cap: f64) {
     let config = dir.path().join(".test-config/kio/config.toml");
     fs::create_dir_all(config.parent().unwrap()).unwrap();
@@ -10504,63 +10765,62 @@ const R18_1_BODY_V1: &str =
 const R18_1_BODY_V2: &str =
     "# R18-1\n\nembedding phantom reclaim regression 本文あいうえお かきくけこ さしすせそ B\n";
 
-// Step 4 discriminator: a rate-limited edited-away chunk remains active historical
-// work. Its reservation is not reclaimed; retry may complete it, while the newer
-// chunk remains budget-paused under a cap sized for only one send.
+// Step 4 discriminator: a rate-limited historical chunk remains active work. A
+// definite rejection has no outstanding charge to reclaim; its later fresh retry
+// competes with the edited document under a cap sized for one send.
 #[test]
 fn ct4_retained_embedding_reservation_is_not_reclaimed_on_edit() {
     let dir = tempfile::tempdir().unwrap();
     assert_eq!(R18_1_BODY_V1.len(), R18_1_BODY_V2.len());
     fs::write(dir.path().join("doc.md"), R18_1_BODY_V1).unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "rate_limit");
 
-    // index --online charges the embedding (F8) then fails rate_limit → Failed(rate_limit)
-    // with a stamped phantom reservation. Embedding failure is non-fatal (exit 0).
+    // A definite 429 settles this attempted group at zero and clears its
+    // reservation; later groups were never admitted or reserved.
     json_success_embed_at(
         &dir,
         "rate_limit",
         "2026-07-03T00:00:00Z",
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
     assert_eq!(
         embedding_ledger_rows(&dir),
         1,
-        "the rate_limit embedding send reserves one (phantom) charge"
+        "only the attempted group receives a ledger row"
     );
-    let doc_cost = embedding_ledger_usd(&dir);
-    assert!(doc_cost > 0.0, "the embedding reservation must be positive");
+    assert_eq!(
+        embedding_ledger_usd(&dir),
+        0.0,
+        "a confirmed 429 records zero spend"
+    );
+    let doc_cost = embedding_request_estimate(&dir);
+    assert!(
+        doc_cost > 0.0,
+        "the rejected request retains its positive estimate"
+    );
     set_embedding_adapter_cap(&dir, doc_cost * 1.5);
 
     // Edit (new chunk_id → old chunk non-live) and re-index with mock in the same month.
     fs::write(dir.path().join("doc.md"), R18_1_BODY_V2).unwrap();
-    // Retained historical work still owns the adapter cap, so publishing the new
-    // snapshot succeeds but enrichment truthfully reports the budget pause (exit 6).
-    kio(&dir, &["index", "--approve", "--online"])
+    approve_embed(&dir, "mock");
+    // The retained task retries as one fresh attempt. The cap permits exactly
+    // one contextualized group, so the other current group remains paused.
+    kio(&dir, &["index", "--online"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .env("KIO_FIXED_NOW", "2026-07-05T00:00:00Z")
         .arg("--json")
         .assert()
         .code(6);
 
-    // The retained chunk is still LIVE (history retains commit 1, the rate_limit
-    // failure's parent), so it is never superseded/retired via the non-live sweep.
-    // UPDATED for Step4b's CL45 write-command-entry sync-row recovery (this
-    // session): the phantom's `batch_requests` row is now well past its own
-    // `stale_after_at` by the second `index` call (2 real days later, versus a
-    // ~10 minute floor) — `kio index`'s entry recovery pass (04 §5.4/CL45,
-    // "残った state 0/1 の...行は...unknown として estimated を確定記帳し state=3
-    // で terminal 化する（過大計上を許容）") settles it to a permanent charge
-    // BEFORE `run_index_pipeline` ever gets a chance to reuse it (CL39's
-    // ordering norm: the old attempt's reconciliation must complete before a
-    // new phase 1 may start). So the retained task's own retry now needs a
-    // FRESH reservation rather than reusing the settled one — its open
-    // reservation is gone (settled, not lingering), but so is the free
-    // reuse the old "not reclaimed" story relied on.
+    // The retained chunk remains eligible through history. The initial
+    // rejection was terminal and zero-cost, so this pass must make an
+    // independent fresh admission rather than reuse an old reservation.
     assert_eq!(
         open_reservation_count(&dir, "embedding"),
         0,
-        "the retained reservation must resolve to a terminal settlement (CL45 \
-         recovery, or normal success), not linger open"
+        "the definite rejection must not leave an open reservation"
     );
 
     let status = json_success_embed_at(&dir, "mock", "2026-07-05T00:00:00Z", &["status"]);
@@ -10569,15 +10829,9 @@ fn ct4_retained_embedding_reservation_is_not_reclaimed_on_edit() {
         .iter()
         .filter(|task| task["status"] == "paused" && task["fallback_reason"] == "budget_exceeded")
         .count();
-    // Both the retained task's fresh retry reservation AND the new chunk's
-    // reservation now compete for the same 1.5x-single-document cap: CL45's
-    // settlement of the stale phantom (an over-count, not a fresh spend)
-    // already consumes headroom the retry itself would have needed, so
-    // neither reservation clears the cap this pass.
     assert_eq!(
-        paused_budget, 2,
-        "CL45's stale-phantom settlement plus the retry's fresh reservation \
-         exhaust the single-document cap for both chunks: {status}"
+        paused_budget, 1,
+        "one fresh contextualized group consumes the cap; the other remains paused: {status}"
     );
 }
 
@@ -10605,17 +10859,17 @@ fn r18_2_markdownize_deleted_file_phantom_settles_still_pauses_doc2() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V1])).unwrap();
     kio(&dir, &["init"]).assert().success();
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock");
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
     run_markdownize_seam(
         &dir,
         "rate_limit",
         Some("2026-07-03T00:00:00Z"),
         &["batch", "resume"],
     );
-    assert_eq!(markdown_ledger_rows(&dir), 1, "one open reservation");
-    let doc_cost = markdown_ledger_usd(&dir);
-    assert!(doc_cost > 0.0);
-    set_markdown_adapter_cap(&dir, doc_cost * 1.5);
+    assert_eq!(markdown_ledger_rows(&dir), 1, "the rejection is recorded");
+    assert_eq!(markdown_ledger_usd(&dir), 0.0, "known 429 has zero spend");
 
     // DELETE doc.pdf (its phantom must be settled/released) and add an equal-cost
     // doc2.pdf.
@@ -10623,22 +10877,16 @@ fn r18_2_markdownize_deleted_file_phantom_settles_still_pauses_doc2() {
     fs::write(dir.path().join("doc2.pdf"), fake_pdf(&[R17_3_BODY_V2])).unwrap();
     // index sweeps the deleted-path phantom (settling it for real) before evaluating
     // doc2's own cap-check.
-    run_markdownize_seam(
-        &dir,
-        "mock",
-        Some("2026-07-05T00:00:00Z"),
-        &["index", "--approve"],
-    );
+    run_markdownize_seam(&dir, "mock", Some("2026-07-05T00:00:00Z"), &["index"]);
     assert_eq!(
         open_reservation_count(&dir, "markdownize"),
         0,
         "the deleted file's phantom must be settled (released), not left open forever"
     );
-    assert!(
-        (markdown_ledger_usd(&dir) - doc_cost).abs() < 1e-9,
-        "the settled phantom's charge must equal exactly its original reservation \
-         estimate: {} vs {doc_cost}",
-        markdown_ledger_usd(&dir)
+    assert_eq!(
+        markdown_ledger_usd(&dir),
+        0.0,
+        "deleted known rejection stays zero-cost"
     );
     run_markdownize_seam(
         &dir,
@@ -10653,9 +10901,8 @@ fn r18_2_markdownize_deleted_file_phantom_settles_still_pauses_doc2() {
         .filter(|task| task["status"] == "paused" && task["fallback_reason"] == "budget_exceeded")
         .count();
     assert_eq!(
-        paused_budget, 1,
-        "doc2 must be budget-paused: the settled phantom permanently consumes the \
-         per-adapter cap (no reclaim under the new ledger): {status}"
+        paused_budget, 0,
+        "doc2 must not be paused by a known zero-cost rejection: {status}"
     );
 }
 
@@ -10674,25 +10921,21 @@ fn r18_3_status_budget_reports_settled_phantom_as_real_spend() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V1])).unwrap();
     kio(&dir, &["init"]).assert().success();
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock");
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
     run_markdownize_seam(
         &dir,
         "rate_limit",
         Some("2026-07-03T00:00:00Z"),
         &["batch", "resume"],
     );
-    let doc_cost = markdown_ledger_usd(&dir);
-    assert!(doc_cost > 0.0);
+    assert_eq!(markdown_ledger_usd(&dir), 0.0, "known 429 is zero-cost");
 
     // Edit → re-index: the same-path supersede settles the stale phantom for real
     // (`unknown_settled`, billed at its original reservation estimate).
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V2])).unwrap();
-    run_markdownize_seam(
-        &dir,
-        "mock",
-        Some("2026-07-05T00:00:00Z"),
-        &["index", "--approve"],
-    );
+    run_markdownize_seam(&dir, "mock", Some("2026-07-05T00:00:00Z"), &["index"]);
     assert_eq!(
         open_reservation_count(&dir, "markdownize"),
         0,
@@ -10701,10 +10944,9 @@ fn r18_3_status_budget_reports_settled_phantom_as_real_spend() {
 
     let status = run_markdownize_seam(&dir, "mock", Some("2026-07-05T00:00:00Z"), &["status"]);
     let device_spent = status["budget"]["device_spent_usd"].as_f64().unwrap();
-    assert!(
-        (device_spent - doc_cost).abs() < 1e-9,
-        "status must report the settled phantom as REAL spend (no netting exists in \
-         cost-ledger.sqlite): expected ≈{doc_cost}, got device_spent_usd={device_spent}"
+    assert_eq!(
+        device_spent, 0.0,
+        "status and enforcement must agree that a known 429 spent nothing"
     );
 }
 
@@ -10723,8 +10965,8 @@ fn r18_4_partial_store_corruption_entry_carries_recovery_hint() {
     fs::write(b.join("b.md"), "# B\n\n## Sec\nbetaunique other\n").unwrap();
     json_success_path(&a, &data_home, &["init"]);
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
 
     // Corrupt scope B's HEAD commit object (store_corrupt) — A stays healthy, so this is a
     // PARTIAL exclusion and the all-failed aggregate block is never reached.
@@ -10796,7 +11038,10 @@ fn r19_1_lifted_tier_a_secret_held_from_online_send() {
     .unwrap();
     fs::write(dir.path().join(".kioignore"), "!.env\n").unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_online_both_seams(&dir, "mock", "mock", &["index", "--approve", "--online"]);
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "rate_limit");
+    approve_both_mock(&dir);
+    json_online_both_seams(&dir, "mock", "mock", &["index", "--online"]);
     json_online_both_seams(&dir, "mock", "mock", &["batch", "resume"]);
     let status = json_online_both_seams(&dir, "mock", "mock", &["status"]);
 
@@ -10828,13 +11073,14 @@ fn r19_1_lifted_tier_a_secret_held_from_online_send() {
         "lifted Tier A must be recorded in quarantine as secrets_tier_a: {status}"
     );
 
-    // --send-secrets releases and sends BOTH online paths.
+    // A separate secret-content grant releases both online paths.
     json_online_both_seams(
         &dir,
         "mock",
         "mock",
-        &["index", "--approve", "--online", "--send-secrets"],
+        &["adapter", "approve", "--all", "--yes", "--send-secrets"],
     );
+    json_online_both_seams(&dir, "mock", "mock", &["index", "--online"]);
     json_online_both_seams(&dir, "mock", "mock", &["batch", "resume"]);
     let status = json_online_both_seams(&dir, "mock", "mock", &["status"]);
     let sent = env_online_tasks(&status, ".env")
@@ -10846,7 +11092,7 @@ fn r19_1_lifted_tier_a_secret_held_from_online_send() {
         .count();
     assert!(
         sent >= 1,
-        "--send-secrets must release + send the lifted Tier A online tasks: {status}"
+        "adapter approve --send-secrets must release + send the lifted Tier A online tasks: {status}"
     );
     // R19-7: the quarantine disposition must transition hold -> send_approved (a path-only
     // dedup previously froze it at "hold", misreporting an approved+sent file as pending).
@@ -10871,21 +11117,19 @@ fn ct4_reverted_chunk_reuses_retained_embedding_task() {
     assert_eq!(R18_1_BODY_V1.len(), R18_1_BODY_V2.len());
     fs::write(dir.path().join("doc.md"), R18_1_BODY_V1).unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "rate_limit");
     // v1 embedding fails rate_limit -> Failed(rate_limit) phantom.
     json_success_embed_at(
         &dir,
         "rate_limit",
         "2026-07-03T00:00:00Z",
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
     // Edit to v2: v1 remains retained and is retried in this pass.
     fs::write(dir.path().join("doc.md"), R18_1_BODY_V2).unwrap();
-    json_success_embed_at(
-        &dir,
-        "mock",
-        "2026-07-05T00:00:00Z",
-        &["index", "--approve", "--online"],
-    );
+    approve_embed(&dir, "mock");
+    json_success_embed_at(&dir, "mock", "2026-07-05T00:00:00Z", &["index", "--online"]);
     let status = json_success_embed_at(&dir, "mock", "2026-07-05T00:00:00Z", &["status"]);
     let retired = tasks_of_type(&status, "embedding")
         .iter()
@@ -10899,12 +11143,7 @@ fn ct4_reverted_chunk_reuses_retained_embedding_task() {
 
     // Revert to the EXACT v1 bytes -> the v1 chunk_id reappears; it must re-embed.
     fs::write(dir.path().join("doc.md"), R18_1_BODY_V1).unwrap();
-    json_success_embed_at(
-        &dir,
-        "mock",
-        "2026-07-07T00:00:00Z",
-        &["index", "--approve", "--online"],
-    );
+    json_success_embed_at(&dir, "mock", "2026-07-07T00:00:00Z", &["index", "--online"]);
     let status = json_success_embed_at(&dir, "mock", "2026-07-07T00:00:00Z", &["status"]);
     let tasks_after = tasks_of_type(&status, "embedding").len();
     // Reverting reuses the retained task in place rather than appending a duplicate
@@ -10927,22 +11166,11 @@ fn ct4_reverted_chunk_reuses_retained_embedding_task() {
     );
 }
 
-// R19-4: when two docs share an identical section (same text_hash, different chunk_id),
-// and one's embedding fails rate_limit while the other succeeds, `rebuild_chunk_vec`
-// links the failed chunk's vector via the content-hash twin. The reconcile must then
-// CONVERGE that live-and-embedded task to Done and release its stranded reservation —
-// before R19-4 the (then-Failed) task stayed stuck forever (reconcile's live->Done loop
-// skipped Failed), stuck at pending_enrichment == 1 with an open reservation eating
-// the cap. UPDATED for cost-ledger.sqlite (2026-07-21): "release" now settles
-// `unknown_settled` (a real charge) rather than reclaiming to zero — this test checks
-// that the reservation no longer sits open, not that it was credited back (see r17_3's
-// updated tests for why: CL45, no Adapter here has post-hoc query capability). UPDATED
-// again for QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2): a rate_limit failure now
-// lands `Pending` (never `Failed`), and the "never retry-due" premise below is what
-// keeps it from completing via a normal resend instead of the twin — the pre-QA3
-// Pending arm of `embeddable_task_state` already needed the SAME `next_retry_at` gate
-// this task exercises (04 §876: "next_retry_at 未来 … の embedding タスクを持つ chunk
-// は enrichment 対象から除外する", wired via §A's new gate).
+// R19-4: when two docs share an identical contextualized embedding identity,
+// `rebuild_chunk_vec` links the missing chunk through its content-vector twin.
+// Reconciliation must then converge that live-and-embedded task to Done. A
+// definite 429 is terminal and zero-cost, so this also verifies that twin
+// convergence leaves no speculative reservation open.
 #[test]
 fn r19_4_duplicate_content_failed_chunk_converges_via_twin() {
     let dir = tempfile::tempdir().unwrap();
@@ -10962,13 +11190,13 @@ fn r19_4_duplicate_content_failed_chunk_converges_via_twin() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    // Pin ALL passes to one instant so _.md's rate_limit chunks are never retry-DUE (their
-    // 2s backoff never elapses) — the ONLY way its shared chunk can complete is the R19-4
-    // twin convergence, not a normal mock retry. (A later wall-clock would just re-embed it
-    // via retry and never exercise the bug.)
+    initialize_paid_ledger(&dir);
+    // Pin all passes to one instant so a rate-limited task is not normally
+    // retry-due; twin materialization is the only completion route under test.
     let now = "2026-07-03T00:00:00Z";
-    // _.md's chunks fail rate_limit -> Pending (phantom reservations, QA3).
-    json_success_embed_at(&dir, "rate_limit", now, &["index", "--approve", "--online"]);
+    // The first _.md group gets a definite rate-limit rejection.
+    approve_embed(&dir, "rate_limit");
+    json_success_embed_at(&dir, "rate_limit", now, &["index", "--online"]);
     // __.md carries the IDENTICAL section under an equally context-free name (same
     // text_hash, same `None` context, different chunk_id). Indexing it with mock embeds
     // the shared text into the `embeddings` table under the identity _.md's chunk shares.
@@ -10977,22 +11205,19 @@ fn r19_4_duplicate_content_failed_chunk_converges_via_twin() {
         format!("# 見出し BBBB\n\n{shared}"),
     )
     .unwrap();
-    json_success_embed_at(&dir, "mock", now, &["index", "--approve", "--online"]);
+    approve_embed(&dir, "mock");
+    json_success_embed_at(&dir, "mock", now, &["index", "--online"]);
     // `rebuild_chunk_vec` runs BEFORE embedding enrichment in a given index pass, so it is
     // the NEXT pass that links a.md's shared chunk_id to the twin's now-persisted vector —
     // and the reconcile then converges x/note.md's stuck Failed chunk (self-heal on re-index).
-    json_success_embed_at(&dir, "mock", now, &["index", "--approve", "--online"]);
-    // _.md has TWO chunks (its own heading + the shared section) and both opened a
-    // reservation on the rate_limit pass. The heading is unique to _.md, so it never
-    // finds a twin and — with the clock pinned — never becomes retry-due either: it
-    // stays open/pending for the rest of this test, by design (unrelated to R19-4).
-    // Only the SHARED section's reservation is expected to release via the twin
-    // convergence, so the open count must drop from 2 to exactly 1.
+    json_success_embed_at(&dir, "mock", now, &["index", "--online"]);
+    // The first definite 429 was settled at zero, and the healthy follow-up
+    // groups have settled their own successful calls. Twin convergence must
+    // therefore leave no open reservation behind.
     assert_eq!(
         open_reservation_count(&dir, "embedding"),
-        1,
-        "R19-4: the twin-embedded rate_limit reservation must be released (settled), \
-         leaving only _.md's unrelated (never-retried) heading chunk open"
+        0,
+        "R19-4: twin convergence cannot strand an open reservation"
     );
     let status = json_success_embed_at(&dir, "mock", now, &["status"]);
     let a_done = tasks_of_type(&status, "embedding")
@@ -11019,7 +11244,9 @@ fn r19_2_exhausted_quota_phantom_settled_on_sweep() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("doc.pdf"), fake_pdf(&[R17_3_BODY_V1])).unwrap();
     kio(&dir, &["init"]).assert().success();
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock");
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
     // Fail the online send under rate_limit -> Pending(rate_limit) with a phantom
     // reservation (QA3, 04 §5.2: never Failed). The row is rewritten to a crafted
     // Failed(quota_exceeded) terminal state below anyway, so this precondition's
@@ -11033,17 +11260,18 @@ fn r19_2_exhausted_quota_phantom_settled_on_sweep() {
     assert_eq!(
         markdown_ledger_rows(&dir),
         1,
-        "one phantom charge is reserved"
+        "the known rejection has one terminal ledger row"
     );
 
-    // Rewrite the reserved online markdownize task's terminal state to an EXHAUSTED quota
-    // failure (quota_exceeded, attempts = 3 = its max). Last-write-wins jsonl.
+    // Rewrite the online markdownize task to an exhausted quota failure. A known
+    // rejection has no reservation stamp, which is exactly the invariant this
+    // sweep must preserve.
     let tasks_path = dir.path().join(".kio/tasks.jsonl");
     let text = fs::read_to_string(&tasks_path).unwrap();
     let mut crafted: Option<String> = None;
     for line in text.lines() {
         let t: Value = serde_json::from_str(line).unwrap();
-        if t["type"] == "markdownize" && t.get("reserved_usd").and_then(Value::as_f64).is_some() {
+        if t["type"] == "markdownize" && t["output_ref"] == "online:mistral_ocr_markdownize" {
             let mut row = t.clone();
             row["fallback_reason"] = Value::from("quota_exceeded");
             row["attempts"] = Value::from(3);
@@ -11052,7 +11280,7 @@ fn r19_2_exhausted_quota_phantom_settled_on_sweep() {
             crafted = Some(serde_json::to_string(&row).unwrap());
         }
     }
-    let crafted = crafted.expect("a reserved markdownize task must exist to craft");
+    let crafted = crafted.expect("an online markdownize task must exist to craft");
     let mut appended = text.clone();
     appended.push_str(&crafted);
     appended.push('\n');
@@ -11061,18 +11289,17 @@ fn r19_2_exhausted_quota_phantom_settled_on_sweep() {
     // Delete the file (non-live) + add another, then re-index: the R18-2 sweep runs.
     fs::remove_file(dir.path().join("doc.pdf")).unwrap();
     fs::write(dir.path().join("doc2.pdf"), fake_pdf(&[R17_3_BODY_V2])).unwrap();
-    run_markdownize_seam(
-        &dir,
-        "mock",
-        Some("2026-07-05T00:00:00Z"),
-        &["index", "--approve"],
-    );
+    run_markdownize_seam(&dir, "mock", Some("2026-07-05T00:00:00Z"), &["index"]);
 
     assert_eq!(
         open_reservation_count(&dir, "markdownize"),
         0,
-        "R19-2: the exhausted-quota phantom must be released (settled) by the sweep, \
-         not left stranded open"
+        "R19-2: an exhausted known quota rejection must not create a sweep reservation"
+    );
+    assert_eq!(
+        markdown_ledger_usd(&dir),
+        0.0,
+        "the sweep must preserve the quota rejection's zero-cost accounting"
     );
 }
 
@@ -11092,8 +11319,8 @@ fn r19_6_corrupt_source_index_does_not_create_a_search_exclusion() {
     fs::write(b.join("b.md"), "# B\n\n## Sec\nbetaunique other\n").unwrap();
     json_success_path(&a, &data_home, &["init"]);
     json_success_path(&b, &data_home, &["init"]);
-    json_success_path(&a, &data_home, &["index", "--approve"]);
-    json_success_path(&b, &data_home, &["index", "--approve"]);
+    json_success_path(&a, &data_home, &["index"]);
+    json_success_path(&b, &data_home, &["index"]);
 
     // Corrupt scope B's writer-side SQLite after its replica write-through.
     fs::write(b.join(".kio/index/sqlite.db"), b"GARBAGE not a sqlite db").unwrap();
@@ -11129,8 +11356,10 @@ fn r19_8_lowered_max_input_bytes_blocks_queued_online_send() {
     let pdf = fake_pdf(&[R17_3_BODY_V1]);
     fs::write(dir.path().join("doc.pdf"), &pdf).unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "auth_error");
     // Enqueue the online markdownize task under the default (generous) cap.
-    run_markdownize_seam(&dir, "mock", None, &["index", "--approve"]);
+    run_markdownize_seam(&dir, "mock", None, &["index"]);
     // Tighten the cap below the file size in the scope config. QA21
     // (step4b-contract-tests-p3a.md §G, 07-adapter-spec.md §3): `--approve`
     // already wrote `[adapter.policy]\nallow_network = true` (the network
@@ -11186,8 +11415,10 @@ fn r21_1_byte_identical_twin_does_not_bypass_tier_b_hold() {
     fs::write(dir.path().join("notes.md"), R21_TWIN_BODY).unwrap();
     fs::write(dir.path().join("password_backup.md"), R21_TWIN_BODY).unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
     // No `--send-secrets`.
-    json_success_embed(&dir, "mock", &["index", "--approve", "--online"]);
+    json_success_embed(&dir, "mock", &["index", "--online"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     let embedding = tasks_of_type(&status, "embedding");
     assert!(
@@ -11218,7 +11449,9 @@ fn r21_2_byte_identical_twins_share_single_embedding_task() {
     fs::write(dir.path().join("a.md"), body).unwrap();
     fs::write(dir.path().join("b.md"), body).unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed(&dir, "mock", &["index", "--approve", "--online"]);
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
+    json_success_embed(&dir, "mock", &["index", "--online"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     let embedding = tasks_of_type(&status, "embedding");
     let distinct: std::collections::BTreeSet<&str> = embedding
@@ -11250,7 +11483,7 @@ fn r21_4_uppercase_and_octet_stream_text_enqueue_no_online_ocr() {
     fs::write(dir.path().join("config.yaml"), "name: acme\nvalue: 42\n").unwrap();
     fs::write(dir.path().join("Dockerfile"), "FROM alpine\nRUN echo hi\n").unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success(&dir, &["index", "--approve"]);
+    json_success(&dir, &["index"]);
     let status = json_success(&dir, &["status"]);
     let online: Vec<_> = status["tasks"]
         .as_array()
@@ -11287,9 +11520,11 @@ fn r21_6_auth_error_live_task_recovers_after_credentials_fixed() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "auth_error");
     // Credentials bad -> AuthError. `index` still exits 0 (enrichment failure is reported,
     // not fatal); read the resulting task state from `status`.
-    let _ = kio(&dir, &["index", "--approve", "--online"])
+    let _ = kio(&dir, &["index", "--online"])
         .env(TEST_ADOPTED_EMBEDDING_ENV, "auth_error")
         .assert();
     let status = json_success_embed(&dir, "mock", &["status"]);
@@ -11325,11 +11560,13 @@ fn ct4_historical_secret_path_withholds_existing_vector() {
     let v2 = "# Notes\n\nCOMPLETELY different body xray yankee zulu whiskey victor.\n";
     fs::write(dir.path().join("notes.md"), v1).unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "rate_limit");
     json_success_embed_at(
         &dir,
         "rate_limit",
         "2026-07-03T00:00:00Z",
-        &["index", "--approve", "--online"],
+        &["index", "--online"],
     );
     let initial_status = json_success_embed_at(&dir, "mock", "2026-07-03T00:00:00Z", &["status"]);
     let v1_output_ref = tasks_of_type(&initial_status, "embedding")[0]["output_ref"]
@@ -11339,21 +11576,12 @@ fn ct4_historical_secret_path_withholds_existing_vector() {
     let v1_chunk_id = v1_output_ref.strip_prefix("embedding:").unwrap().to_owned();
     // Edit: v1 stays retained by history and may complete on the next pass.
     fs::write(dir.path().join("notes.md"), v2).unwrap();
-    json_success_embed_at(
-        &dir,
-        "mock",
-        "2026-07-05T00:00:00Z",
-        &["index", "--approve", "--online"],
-    );
+    approve_embed(&dir, "mock");
+    json_success_embed_at(&dir, "mock", "2026-07-05T00:00:00Z", &["index", "--online"]);
     // Delete and restore the EXACT v1 bytes under a Tier B name.
     fs::remove_file(dir.path().join("notes.md")).unwrap();
     fs::write(dir.path().join("password_notes.md"), v1).unwrap();
-    json_success_embed_at(
-        &dir,
-        "mock",
-        "2026-07-06T00:00:00Z",
-        &["index", "--approve", "--online"],
-    );
+    json_success_embed_at(&dir, "mock", "2026-07-06T00:00:00Z", &["index", "--online"]);
     let status = json_success_embed_at(&dir, "mock", "2026-07-06T00:00:00Z", &["status"]);
     assert!(
         tasks_of_type(&status, "embedding")
@@ -11386,10 +11614,12 @@ fn ct4_bbox_006_scanned_pdf_completes_without_churn() {
     scan.extend((0u32..4000).map(|i| (i.wrapping_mul(97) & 0x7f) as u8 | 0x80));
     fs::write(dir.path().join("scan.pdf"), &scan).unwrap();
     kio(&dir, &["init"]).assert().success();
-    // `--approve` records the persistent consent that deferred batch execution needs.
-    json_both_mock(&dir, &["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_both_mock(&dir);
+    // A dedicated adapter grant records the persistent consent deferred work needs.
+    json_both_mock(&dir, &["index"]);
     json_both_mock(&dir, &["batch", "resume"]);
-    json_both_mock(&dir, &["index", "--approve"]);
+    json_both_mock(&dir, &["index"]);
     json_both_mock(&dir, &["batch", "resume"]);
     let status = json_both_mock(&dir, &["status"]);
     let tasks = status["tasks"]
@@ -11429,8 +11659,10 @@ fn ct4_historical_secret_alias_keeps_hold_after_public_rename() {
     let body = "# Notes\n\nalpha bravo charlie delta echo foxtrot golf hotel india juliet.\n";
     fs::write(dir.path().join("password_notes.md"), body).unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
     // Tier B name + online + no --send-secrets → the embedding task is HELD.
-    json_success_embed(&dir, "mock", &["index", "--approve", "--online"]);
+    json_success_embed(&dir, "mock", &["index", "--online"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     let embedding = tasks_of_type(&status, "embedding");
     assert!(
@@ -11446,7 +11678,7 @@ fn ct4_historical_secret_alias_keeps_hold_after_public_rename() {
         dir.path().join("notes.md"),
     )
     .unwrap();
-    json_success_embed(&dir, "mock", &["index", "--approve", "--online"]);
+    json_success_embed(&dir, "mock", &["index", "--online"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     let embedding = tasks_of_type(&status, "embedding");
     assert!(
@@ -11469,7 +11701,9 @@ fn r22_1b_secret_hold_survives_while_a_secret_twin_is_live() {
     fs::write(dir.path().join("notes.md"), body).unwrap();
     fs::write(dir.path().join("password_backup.md"), body).unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed(&dir, "mock", &["index", "--approve", "--online"]);
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
+    json_success_embed(&dir, "mock", &["index", "--online"]);
     let assert_single_hold = |status: &Value, when: &str| {
         let embedding = tasks_of_type(status, "embedding");
         assert_eq!(
@@ -11502,6 +11736,15 @@ fn r22_1b_secret_hold_survives_while_a_secret_twin_is_live() {
 /// forever, so `kio status` and the quarantine record permanently disagreed about the hold.
 #[test]
 fn r22_2_existing_task_is_demoted_to_hold_when_path_becomes_secret() {
+    assert_secret_hold_without_a_ledger(false);
+}
+
+#[test]
+fn r22_2_secret_hold_preserves_a_claim_without_a_ledger() {
+    assert_secret_hold_without_a_ledger(true);
+}
+
+fn assert_secret_hold_without_a_ledger(with_retained_claim: bool) {
     let dir = tempfile::tempdir().unwrap();
     let body = "# Plain\n\nalpha bravo charlie delta echo foxtrot golf hotel india juliet.\n";
     fs::write(dir.path().join("plain.md"), body).unwrap();
@@ -11516,6 +11759,24 @@ fn r22_2_existing_task_is_demoted_to_hold_when_path_becomes_secret() {
             .any(|t| t["status"] == "pending" && t["fallback_reason"] == "network_opt_in_required"),
         "R22-2 precondition: a Pending/network_opt_in_required embedding task must exist: {status}"
     );
+    const CLAIM_ID: &str = "01992840-5c00-7000-8000-000000000001";
+    if with_retained_claim {
+        // A scope can retain a task claim when the device ledger is unavailable.
+        // Reclassification must hold the task without discarding recovery data.
+        let store =
+            kio_pipeline::task::TaskStore::new(dir.path().join(".kio").canonicalize().unwrap());
+        store
+            .update_matching(|task| {
+                if task.task_type != kio_pipeline::task::TaskType::Embedding {
+                    return false;
+                }
+                task.reservation_id = Some(CLAIM_ID.to_owned());
+                task.reserved_usd = Some(0.25);
+                task.reserved_month = Some("2026-09".to_owned());
+                true
+            })
+            .unwrap();
+    }
     // Rename INTO a Tier B name and re-index: the existing task must demote to a hold.
     fs::rename(
         dir.path().join("plain.md"),
@@ -11545,6 +11806,11 @@ fn r22_2_existing_task_is_demoted_to_hold_when_path_becomes_secret() {
             .any(|t| t["fallback_reason"] == "network_opt_in_required"),
         "R22-2: no task may remain Pending/network_opt_in_required after the demotion: {status}"
     );
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
+    );
 }
 
 /// R22-2 NEGATIVE control: a DONE embedding task must NOT be demoted when the path later
@@ -11556,8 +11822,10 @@ fn r22_2b_done_task_is_not_demoted_when_path_becomes_secret() {
     let body = "# Plain\n\nalpha bravo charlie delta echo foxtrot golf hotel india juliet.\n";
     fs::write(dir.path().join("plain.md"), body).unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
     // Online mock index → the embedding is sent and Done.
-    json_success_embed(&dir, "mock", &["index", "--approve", "--online"]);
+    json_success_embed(&dir, "mock", &["index", "--online"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     assert!(
         tasks_of_type(&status, "embedding")
@@ -11571,7 +11839,7 @@ fn r22_2b_done_task_is_not_demoted_when_path_becomes_secret() {
         dir.path().join("credentials_backup.md"),
     )
     .unwrap();
-    json_success_embed(&dir, "mock", &["index", "--approve", "--online"]);
+    json_success_embed(&dir, "mock", &["index", "--online"]);
     let status = json_success_embed(&dir, "mock", &["status"]);
     let embedding = tasks_of_type(&status, "embedding");
     assert!(
@@ -11596,27 +11864,14 @@ fn ct4_edited_secret_history_keeps_each_version_held() {
     let v3 = "# Secret\n\ntango uniform victor whiskey xray yankee zulu juliet.\n";
     fs::write(dir.path().join("password_notes.md"), v1).unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed_at(
-        &dir,
-        "mock",
-        "2026-07-03T00:00:00Z",
-        &["index", "--approve", "--online"],
-    );
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
+    json_success_embed_at(&dir, "mock", "2026-07-03T00:00:00Z", &["index", "--online"]);
     // Edit twice; each edit sends the previous chunk non-live under the same Tier B name.
     fs::write(dir.path().join("password_notes.md"), v2).unwrap();
-    json_success_embed_at(
-        &dir,
-        "mock",
-        "2026-07-05T00:00:00Z",
-        &["index", "--approve", "--online"],
-    );
+    json_success_embed_at(&dir, "mock", "2026-07-05T00:00:00Z", &["index", "--online"]);
     fs::write(dir.path().join("password_notes.md"), v3).unwrap();
-    json_success_embed_at(
-        &dir,
-        "mock",
-        "2026-07-07T00:00:00Z",
-        &["index", "--approve", "--online"],
-    );
+    json_success_embed_at(&dir, "mock", "2026-07-07T00:00:00Z", &["index", "--online"]);
     let status = json_success_embed_at(&dir, "mock", "2026-07-07T00:00:00Z", &["status"]);
     let embedding = tasks_of_type(&status, "embedding");
     let held = embedding
@@ -11726,9 +11981,11 @@ fn r22_5_missing_online_bbox_stamp_is_rejected_before_send() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock");
     // Persist a valid current online task first, then simulate a torn/obsolete
     // task record that omits the required current-format stamp.
-    run_markdownize_seam(&dir, "mock", None, &["index", "--online", "--approve"]);
+    run_markdownize_seam(&dir, "mock", None, &["index", "--online"]);
     let tasks_path = dir.path().join(".kio/tasks.jsonl");
     let original = fs::read_to_string(&tasks_path).unwrap();
     let mut rewritten = String::new();
@@ -11786,8 +12043,10 @@ fn r22_6_auth_error_markdownize_revives_on_resume_not_retry() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    approve_markdownize(&dir, "mock");
     // Enqueue the online markdownize task (Pending) and grant the network opt-in.
-    run_markdownize_seam(&dir, "mock", None, &["index", "--online", "--approve"]);
+    run_markdownize_seam(&dir, "mock", None, &["index", "--online"]);
     // Send under the auth_error seam → the online task fails auth_error.
     run_markdownize_seam(
         &dir,
@@ -11847,7 +12106,9 @@ fn r22_7_budget_paused_false_for_secrets_hold() {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    json_success_embed(&dir, "mock", &["index", "--approve", "--online"]);
+    initialize_paid_ledger(&dir);
+    approve_embed(&dir, "mock");
+    json_success_embed(&dir, "mock", &["index", "--online"]);
     let search = json_success_embed(&dir, "mock", &["search", "juliet"]);
     let index_status = &search["index_status"];
     assert_eq!(

@@ -169,7 +169,7 @@ fn fixture_with_later_commit() -> (TempDir, Value, String) {
     )
     .unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline", "--yes"]);
     let search = success(&dir, &["search", "3600", "--mode", "text"]);
     let pointer = search["results"][0]["evidence_pointer"].clone();
 
@@ -180,7 +180,7 @@ fn fixture_with_later_commit() -> (TempDir, Value, String) {
         "# Later\n\nNo Evidence change.\n",
     )
     .unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline", "--yes"]);
     let repo = Repository::open(dir.path()).unwrap();
     let target = repo.head_commit_hash().unwrap().unwrap();
     (dir, pointer, target)
@@ -194,11 +194,11 @@ fn fixture_with_duplicate_heading_candidates() -> (TempDir, Value, String) {
     )
     .unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline", "--yes"]);
     let search = success(&dir, &["search", "3600", "--mode", "text"]);
     let pointer = search["results"][0]["evidence_pointer"].clone();
     fs::write(dir.path().join("unrelated.md"), "# Later\n\nNo change.\n").unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline", "--yes"]);
     let target = Repository::open(dir.path())
         .unwrap()
         .head_commit_hash()
@@ -348,7 +348,7 @@ fn retarget_zero_target_match_is_dedicated_not_found_without_stdout() {
     )
     .unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline", "--yes"]);
     let old =
         success(&dir, &["search", "3600", "--mode", "text"])["results"][0]["evidence_pointer"]
             .clone();
@@ -360,7 +360,7 @@ fn retarget_zero_target_match_is_dedicated_not_found_without_stdout() {
         "# Evidence\n\nTTL changed to 7200 seconds.\n",
     )
     .unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline", "--yes"]);
     let target = Repository::open(dir.path())
         .unwrap()
         .head_commit_hash()
@@ -397,7 +397,7 @@ fn retarget_duplicate_raw_placement_uses_only_the_exact_old_path() {
         dir.path().join("duplicate.md"),
     )
     .unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline", "--yes"]);
     let repo = Repository::open(dir.path()).unwrap();
     let duplicate_target = repo.head_commit_hash().unwrap().unwrap();
     let pointer_text = serde_json::to_string(&pointer).unwrap();
@@ -416,7 +416,7 @@ fn retarget_duplicate_raw_placement_uses_only_the_exact_old_path() {
     // Once only the alternate placement remains, exact retargeting must not
     // treat it as a rename/move fallback.
     fs::remove_file(dir.path().join("evidence.md")).unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline", "--yes"]);
     let moved_target = Repository::open(dir.path())
         .unwrap()
         .head_commit_hash()
@@ -449,7 +449,7 @@ fn retarget_target_shallow_is_retryable_without_stdout() {
     // A final shallow receipt is valid only for a non-tip commit. Advance the
     // head before discarding the requested target tree.
     fs::write(target_dir.path().join("advance.md"), "# Advance\n\nbody\n").unwrap();
-    success(&target_dir, &["index", "--offline", "--approve"]);
+    success(&target_dir, &["index", "--offline", "--yes"]);
     make_commit_final_shallow(&target_dir, &target);
     let target_text = serde_json::to_string(&target_pointer).unwrap();
     failure(
@@ -511,7 +511,7 @@ fn retarget_missing_old_chunk_is_store_corruption() {
 fn retarget_active_purge_is_retryable_and_read_only() {
     let (dir, pointer, target) = fixture_with_later_commit();
     let raw_hash = pointer["raw_hash"].as_str().unwrap().to_owned();
-    let purge = PurgeState::new(dir.path().join(".kio"));
+    let purge = PurgeState::open(dir.path().join(".kio")).unwrap();
     purge
         .begin(
             vec![raw_hash],
@@ -590,7 +590,7 @@ fn retarget_marker_classification_precedes_old_manifest_preflight() {
         .unwrap()
         .manifest_hash;
     let store = ObjectStore::new(dir.path().join(".kio"));
-    let purge = PurgeState::new(dir.path().join(".kio"));
+    let purge = PurgeState::open(dir.path().join(".kio")).unwrap();
     purge
         .append_tombstone_event(
             raw_hash,

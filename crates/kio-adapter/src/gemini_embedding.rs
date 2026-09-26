@@ -17,8 +17,9 @@ use crate::http_policy::{
 use crate::identity::{is_mutable_model_alias, tool_profile_hash};
 use crate::traits::{EmbeddingAdapter, PreferredRequestKind};
 use crate::types::{
-    AdapterKind, AdapterProfile, AdapterUsage, BillableUnit, BillableUnitKind, EmbeddingItem,
-    EmbeddingRequest, EmbeddingResponse, EmbeddingVector, ExecutionMode, validate_cosine_vector,
+    AdapterKind, AdapterProfile, AdapterUsage, BillableUnit, BillableUnitKind, EmbeddingContent,
+    EmbeddingItem, EmbeddingRequest, EmbeddingResponse, EmbeddingVector, ExecutionMode,
+    validate_cosine_vector, validate_embedding_request_bytes,
 };
 use crate::{AdapterError, Result};
 use serde_json::{Value, json};
@@ -181,13 +182,18 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
         let requests = items
             .iter()
             .map(|item| {
-                json!({
+                let EmbeddingContent::Text { text } = &item.content else {
+                    return Err(AdapterError::ContractViolation(
+                        "Gemini embedding adapter does not accept image content".to_owned(),
+                    ));
+                };
+                Ok(json!({
                     "model": format!("models/{model_pin}"),
-                    "content": { "parts": [{ "text": item.text.clone().unwrap_or_default() }] },
+                    "content": { "parts": [{ "text": text }] },
                     "outputDimensionality": dimensions,
-                })
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let mut http_request = authenticated_agent(self.http_policy)
             .post(&format!(
                 "{}/v1beta/models/{model_pin}:batchEmbedContents",
@@ -422,6 +428,16 @@ impl<C: GeminiEmbeddingClient> EmbeddingAdapter for GeminiEmbeddingAdapter<C> {
     }
 
     fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+        validate_embedding_request_bytes(&request)?;
+        if request
+            .items
+            .iter()
+            .any(|item| matches!(item.content, EmbeddingContent::Image { .. }))
+        {
+            return Err(AdapterError::ContractViolation(
+                "Gemini embedding adapter does not accept image content".to_owned(),
+            ));
+        }
         // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): resolve (and
         // fail closed on) the provider idempotency header BEFORE any network
         // call — a `HttpHeader`-declaring provider with no caller-supplied
@@ -521,7 +537,7 @@ fn http_status_error(response: &HttpResponse) -> AdapterError {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
-    use crate::types::EmbeddingInputType;
+    use crate::types::{EmbeddingContent, EmbeddingInputType};
 
     #[derive(Clone)]
     struct StubClient;
@@ -567,12 +583,7 @@ mod tests {
         let response = adapter
             .embed(EmbeddingRequest {
                 input_type: EmbeddingInputType::MarkdownChunk,
-                items: vec![EmbeddingItem {
-                    id: "a".to_owned(),
-                    text: Some("hello".to_owned()),
-                    path: None,
-                    mime: None,
-                }],
+                items: vec![EmbeddingItem::text("a", "hello")],
                 idempotency_token: None,
             })
             .expect("embed");
@@ -643,12 +654,7 @@ mod tests {
                 .with_provider_idempotency(crate::types::ProviderIdempotency::HttpHeader(
                     "Idempotency-Key".to_owned(),
                 ));
-        let item = EmbeddingItem {
-            id: "a".to_owned(),
-            text: Some("hello".to_owned()),
-            path: None,
-            mime: None,
-        };
+        let item = EmbeddingItem::text("a", "hello");
         let missing_token_request = EmbeddingRequest {
             input_type: EmbeddingInputType::MarkdownChunk,
             items: vec![item.clone()],
@@ -677,18 +683,8 @@ mod tests {
             .embed(EmbeddingRequest {
                 input_type: EmbeddingInputType::MarkdownChunk,
                 items: vec![
-                    EmbeddingItem {
-                        id: "a".to_owned(),
-                        text: Some("hello".to_owned()),
-                        path: None,
-                        mime: None,
-                    },
-                    EmbeddingItem {
-                        id: "b".to_owned(),
-                        text: Some("world".to_owned()),
-                        path: None,
-                        mime: None,
-                    },
+                    EmbeddingItem::text("a", "hello"),
+                    EmbeddingItem::text("b", "world"),
                 ],
                 idempotency_token: None,
             })
@@ -701,20 +697,7 @@ mod tests {
 
     #[test]
     fn batch_embed_response_is_parsed_in_order() {
-        let items = vec![
-            EmbeddingItem {
-                id: "x".to_owned(),
-                text: Some("a".to_owned()),
-                path: None,
-                mime: None,
-            },
-            EmbeddingItem {
-                id: "y".to_owned(),
-                text: Some("b".to_owned()),
-                path: None,
-                mime: None,
-            },
-        ];
+        let items = vec![EmbeddingItem::text("x", "a"), EmbeddingItem::text("y", "b")];
         let response = json!({
             "embeddings": [
                 { "values": [1.0, 2.0] },
@@ -732,12 +715,7 @@ mod tests {
     // the chunk permanently invisible to KNN yet billed and marked done).
     #[test]
     fn embedding_wrong_dimension_is_contract_violation() {
-        let items = vec![EmbeddingItem {
-            id: "x".to_owned(),
-            text: Some("a".to_owned()),
-            path: None,
-            mime: None,
-        }];
+        let items = vec![EmbeddingItem::text("x", "a")];
         // 768 requested, but the backend returns a 5-element vector.
         let response = json!({
             "embeddings": [
@@ -753,12 +731,7 @@ mod tests {
 
     #[test]
     fn embedding_numeric_domain_is_validated_after_f32_conversion() {
-        let items = vec![EmbeddingItem {
-            id: "x".to_owned(),
-            text: Some("a".to_owned()),
-            path: None,
-            mime: None,
-        }];
+        let items = vec![EmbeddingItem::text("x", "a")];
         let over_range = json!({
             "embeddings": [{ "values": [3.5e38, 1.0] }]
         });
@@ -776,5 +749,25 @@ mod tests {
             parse_embeddings(&valid, &items, 2).unwrap()[0].vector,
             vec![1.0, 0.0]
         );
+    }
+
+    #[test]
+    fn image_content_is_rejected_before_any_client_call() {
+        let adapter =
+            GeminiEmbeddingAdapter::new(StubClient, ADOPTED_MODEL_PIN, ADOPTED_DIMENSIONS);
+        let error = adapter
+            .embed(EmbeddingRequest {
+                input_type: EmbeddingInputType::ImageObject,
+                items: vec![EmbeddingItem {
+                    id: "image".to_owned(),
+                    content: EmbeddingContent::Image {
+                        bytes: vec![1, 2, 3],
+                        mime: "image/png".to_owned(),
+                    },
+                }],
+                idempotency_token: None,
+            })
+            .unwrap_err();
+        assert!(matches!(error, AdapterError::ContractViolation(_)));
     }
 }

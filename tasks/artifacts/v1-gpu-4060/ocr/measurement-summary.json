@@ -1,0 +1,10 @@
+{
+  "experiment": "kio-v1-ocr-r32",
+  "fixture": {"path": "crates/kio-eval/acceptance-fixtures/v1/provider-public/ocr.pdf", "sha256": "b48ae7a300b21746e078ffceb3865d324940d2d62595fb7fd201bac9f7906f90"},
+  "images": ["paddleocr-vl@sha256:6c735bdf9e758ffdd58ccc067db0c2d84e37e5e6a2cbd47156069d4d7ea5d709", "paddleocr-genai-vllm-server@sha256:d0d32c04a2119613d25a0a4c292e165ccc107954b74580613cf59e378037f8f5"],
+  "config_sha256": "b4d9319afd04eb011e02379245fa3a373e0d4ced6eccc482b99023fe09d79642",
+  "result": {"http_status": 200, "requests": 2, "deterministic_excluding_logId": true, "canonical_sha256": "b765ca3a8fd7967d1720e2acb2c97cc2ebdb5a1d8c4e3cf959aafcf33c54e608", "pages": 1, "blocks": 1, "images": 0},
+  "resources_mib": {"baseline_vram": 575, "peak_vram": 6716, "delta_vram": 6141, "after_cleanup_vram": 575},
+  "required_model_sha256": "85a479d506a11e724e7285d395c551be69f41dbc16b6342d3cacfb189aed71db",
+  "oom_killed": false
+}

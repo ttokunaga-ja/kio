@@ -232,7 +232,7 @@ fn office_01_docx_offline_pages_searchable() {
     write_office_input(&dir, "report.docx");
     init(&dir);
 
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["index", "--yes"])
         .env(TEST_OFFICE_CONVERT_ENV, fixture.display().to_string())
         .arg("--json")
         .assert()
@@ -300,7 +300,17 @@ fn office_01_docx_offline_pages_searchable() {
                 .is_some_and(|output_ref| output_ref.starts_with("online:"))
         })
         .unwrap_or_else(|| panic!("expected an enqueued (Pending) online task: {status}"));
-    assert_eq!((*online_task)["status"], "pending", "{status}");
+    assert_eq!((*online_task)["status"], "paused", "{status}");
+    assert_eq!(
+        (*online_task)["hold_reason"],
+        "ledger_initialization_required",
+        "{status}"
+    );
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
+    );
 }
 
 // ===========================================================================
@@ -324,7 +334,7 @@ fn office_02_pptx_slide_units_offline() {
     write_office_input(&dir, "deck.pptx");
     init(&dir);
 
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["index", "--yes"])
         .env(TEST_OFFICE_CONVERT_ENV, fixture.display().to_string())
         .arg("--json")
         .assert()
@@ -380,11 +390,15 @@ fn office_03_online_send_uses_converted_pdf() {
         write_office_fixture_pdf(&fixtures, "fixture_c.pdf", &["office03 online send text"]);
     write_office_input(&dir, "report.docx");
     init(&dir);
+    kio(&dir, &["ledger", "init"]).assert().success();
 
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["index", "--yes"])
         .env(TEST_OFFICE_CONVERT_ENV, fixture.display().to_string())
         .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
         .arg("--json")
+        .assert()
+        .success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
         .assert()
         .success();
 
@@ -447,7 +461,7 @@ fn office_04_converter_absent_no_doomed_task() {
     // Seam unset + explicit override unset + PATH scrubbed (per-Command env,
     // not process-global mutation) — no converter resolves, even on a
     // machine with a real soffice on PATH.
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["index", "--yes"])
         .env_remove(TEST_OFFICE_CONVERT_ENV)
         .env_remove(OFFICE_CONVERTER_ENV)
         .env("PATH", "/nonexistent-kio-test-path-office04")
@@ -486,7 +500,7 @@ fn office_04_converter_absent_no_doomed_task() {
         "fixture_d.pdf",
         &["office04 recovered searchable text"],
     );
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["index", "--yes"])
         .env(TEST_OFFICE_CONVERT_ENV, fixture.display().to_string())
         .arg("--json")
         .assert()
@@ -531,7 +545,7 @@ fn office_05_qb41_renderer_drift_prompts_then_gen1() {
     write_office_input(&dir, "report.docx");
     init(&dir);
 
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["index", "--yes"])
         .env(TEST_OFFICE_CONVERT_ENV, fixture_a.display().to_string())
         .arg("--json")
         .assert()
@@ -628,11 +642,15 @@ fn office_06_conversion_failure_contract_violation() {
         write_office_fixture_pdf(&fixtures, "fixture_e.pdf", &["office06 initial ok text"]);
     write_office_input(&dir, "report.docx");
     init(&dir);
+    kio(&dir, &["ledger", "init"]).assert().success();
 
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["index", "--yes"])
         .env(TEST_OFFICE_CONVERT_ENV, fixture.display().to_string())
         .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
         .arg("--json")
+        .assert()
+        .success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
         .assert()
         .success();
     let status = json_success(&dir, &["status"]);
@@ -710,10 +728,14 @@ fn office_07_scanned_pdf_done_instance_is_not_drift() {
     )
     .unwrap();
     init(&dir);
+    kio(&dir, &["ledger", "init"]).assert().success();
 
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["index", "--yes"])
         .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
         .arg("--json")
+        .assert()
+        .success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
         .assert()
         .success();
     kio(&dir, &["batch", "resume"])

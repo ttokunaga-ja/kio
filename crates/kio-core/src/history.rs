@@ -11,17 +11,15 @@ use serde_json::json;
 
 use crate::ExitCode;
 use crate::cas::{ObjectKind, ObjectStore, StoredObject};
-use crate::dag::{
-    CommitObject, MAX_COMMIT_PARENTS, MAX_TREE_ENTRIES, NormalizeRef, TreeEntry, TreeObject,
-};
+use crate::dag::{CommitObject, MAX_TREE_ENTRIES, NormalizeRef, TreeEntry, TreeObject};
 use crate::error::{KioError, Result};
 
 pub const DEFAULT_MAX_HISTORY_COMMITS: u64 = 100_000;
 pub const DEFAULT_MAX_HISTORY_TREE_ENTRIES: u64 = 10_000_000;
 pub const DEFAULT_MAX_HISTORY_VERIFIED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-/// Aggregate limits for one history walk. A reader applies a fresh set of
-/// counters to every all-parent or first-parent invocation.
+/// Aggregate limits for one linear history walk. A reader applies a fresh set
+/// of counters to every invocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HistoryLimits {
     pub max_commits: u64,
@@ -116,16 +114,16 @@ impl HistoryNode {
     }
 }
 
-/// A complete all-parent graph reachable from one snapshot commit.
+/// A complete newest-first linear history reachable from one snapshot commit.
 #[derive(Debug, Clone)]
-pub struct HistoryGraph {
+pub struct LinearHistory {
     start_commit: String,
     nodes: BTreeMap<String, HistoryNode>,
     visit_order: Vec<String>,
     stats: HistoryStats,
 }
 
-impl HistoryGraph {
+impl LinearHistory {
     #[must_use]
     pub fn start_commit(&self) -> &str {
         &self.start_commit
@@ -141,8 +139,8 @@ impl HistoryGraph {
         self.nodes.get(commit_hash)
     }
 
-    /// Deterministic traversal order: each commit's persisted parent order is
-    /// honored depth-first, and every reachable commit appears exactly once.
+    /// Deterministic newest-first traversal order. Every reachable commit
+    /// appears exactly once.
     pub fn nodes_in_visit_order(&self) -> impl Iterator<Item = &HistoryNode> {
         self.visit_order
             .iter()
@@ -181,16 +179,16 @@ impl HistoryGraph {
             if !visited.insert(hash) {
                 continue;
             }
-            if let Some(node) = self.nodes.get(hash) {
-                for parent in node.commit.parents.iter().rev() {
-                    pending.push(parent);
-                }
+            if let Some(node) = self.nodes.get(hash)
+                && let Some(parent) = node.commit.parent.as_deref()
+            {
+                pending.push(parent);
             }
         }
         false
     }
 
-    /// Commits where `binding` is present and absent from every parent.
+    /// The earliest linear commit where `binding` appears.
     #[must_use]
     pub fn introduction_candidates(&self, binding: &TreeBinding) -> Vec<HistoryBinding> {
         let mut candidates = self
@@ -198,7 +196,7 @@ impl HistoryGraph {
             .values()
             .filter(|node| {
                 node.contains_binding(binding)
-                    && node.commit.parents.iter().all(|parent| {
+                    && node.commit.parent.as_deref().is_none_or(|parent| {
                         self.nodes
                             .get(parent)
                             .is_none_or(|parent_node| !parent_node.contains_binding(binding))
@@ -210,82 +208,31 @@ impl HistoryGraph {
         candidates
     }
 
-    /// Introduction candidates with every descendant re-introduction removed.
-    /// The result is sorted by full commit hash, giving the frozen incomparable
-    /// introduction tie order.
-    ///
-    /// Same boundary-node generalization as [`validate_acyclic`] (a
-    /// module-private free function): a parent hash absent from `self.nodes`
-    /// (a shallow-skipped ancestor on a tolerant graph, PC45) does not count
-    /// against its children's readiness. This is a no-op for a complete graph.
+    /// The unique earliest introduction in a linear history.
     #[must_use]
     pub fn ancestor_most_introductions(&self, binding: &TreeBinding) -> Vec<HistoryBinding> {
-        let candidates = self.introduction_candidates(binding);
-        let candidate_hashes = candidates
+        // `visit_order` is newest-first. The oldest matching introduction is
+        // the first one encountered from its reverse, irrespective of how its
+        // content-addressed commit hash happens to sort.
+        self.visit_order
             .iter()
-            .map(|candidate| candidate.commit_hash.clone())
-            .collect::<BTreeSet<_>>();
-        let mut remaining_parents = self
-            .nodes
-            .iter()
-            .map(|(hash, node)| {
-                let present = node
-                    .commit
-                    .parents
-                    .iter()
-                    .filter(|parent| self.nodes.contains_key(parent.as_str()))
-                    .count();
-                (hash.clone(), present)
+            .rev()
+            .filter_map(|hash| self.nodes.get(hash))
+            .find_map(|node| {
+                (node.contains_binding(binding)
+                    && node.commit.parent.as_deref().is_none_or(|parent| {
+                        self.nodes
+                            .get(parent)
+                            .is_none_or(|parent_node| !parent_node.contains_binding(binding))
+                    }))
+                .then(|| node.entry(&binding.path).map(|entry| node.binding(entry)))
+                .flatten()
             })
-            .collect::<BTreeMap<_, _>>();
-        let mut children = BTreeMap::<&str, Vec<&str>>::new();
-        for (child_hash, node) in &self.nodes {
-            for parent in &node.commit.parents {
-                if !self.nodes.contains_key(parent.as_str()) {
-                    continue;
-                }
-                children
-                    .entry(parent)
-                    .or_default()
-                    .push(child_hash.as_str());
-            }
-        }
-        let mut ready = remaining_parents
-            .iter()
-            .filter_map(|(hash, count)| (*count == 0).then_some(hash.clone()))
-            .collect::<BTreeSet<_>>();
-        let mut has_candidate_ancestor = BTreeSet::new();
-        let mut retained = BTreeSet::new();
-        while let Some(hash) = ready.pop_first() {
-            let inherited = has_candidate_ancestor.contains(&hash);
-            let is_candidate = candidate_hashes.contains(&hash);
-            if is_candidate && !inherited {
-                retained.insert(hash.clone());
-            }
-            let lineage_contains_candidate = inherited || is_candidate;
-            if let Some(node_children) = children.get(hash.as_str()) {
-                for child in node_children {
-                    if lineage_contains_candidate {
-                        has_candidate_ancestor.insert((*child).to_owned());
-                    }
-                    let count = remaining_parents
-                        .get_mut(*child)
-                        .expect("child was collected from graph nodes");
-                    *count -= 1;
-                    if *count == 0 {
-                        ready.insert((*child).to_owned());
-                    }
-                }
-            }
-        }
-        candidates
             .into_iter()
-            .filter(|candidate| retained.contains(&candidate.commit_hash))
             .collect()
     }
 
-    /// Canonical introduction: the sole ancestor-most introduction, or the
-    /// bytewise-smallest full hash when multiple candidates are incomparable.
+    /// Canonical introduction in the unique linear ancestry.
     #[must_use]
     pub fn canonical_introduction(&self, binding: &TreeBinding) -> Option<HistoryBinding> {
         self.ancestor_most_introductions(binding).into_iter().next()
@@ -302,49 +249,15 @@ impl HistoryGraph {
             .map(|entry| entry.path.clone())
             .collect()
     }
-}
-
-/// A complete newest-first first-parent ancestry.
-#[derive(Debug, Clone)]
-pub struct FirstParentHistory {
-    start_commit: String,
-    nodes: BTreeMap<String, HistoryNode>,
-    newest_first: Vec<String>,
-    stats: HistoryStats,
-}
-
-impl FirstParentHistory {
-    #[must_use]
-    pub fn start_commit(&self) -> &str {
-        &self.start_commit
-    }
-
-    #[must_use]
-    pub const fn stats(&self) -> HistoryStats {
-        self.stats
-    }
-
-    #[must_use]
-    pub fn node(&self, commit_hash: &str) -> Option<&HistoryNode> {
-        self.nodes.get(commit_hash)
-    }
-
-    pub fn nodes_newest_first(&self) -> impl Iterator<Item = &HistoryNode> {
-        self.newest_first
-            .iter()
-            .filter_map(|hash| self.nodes.get(hash))
-    }
-
-    /// The newest exact persisted binding for `path` on the snapshot's
-    /// first-parent ancestry.
+    /// The newest exact persisted binding for `path`.
     #[must_use]
     pub fn newest_binding_for_path(&self, path: &str) -> Option<HistoryBinding> {
-        self.nodes_newest_first()
+        self.nodes_in_visit_order()
             .find_map(|node| node.entry(path).map(|entry| node.binding(entry)))
     }
 
     /// For every path absent from the snapshot tree, return its newest exact
-    /// first-parent binding. Results are sorted by path bytes. A binding whose
+    /// linear-ancestry binding. Results are sorted by path bytes. A binding whose
     /// normalize reference is absent remains present here with `normalize=None`;
     /// downstream chunk projection must treat it as ineligible.
     #[must_use]
@@ -356,7 +269,7 @@ impl FirstParentHistory {
             .flat_map(|node| node.tree.entries.iter().map(|entry| entry.path.as_str()))
             .collect::<BTreeSet<_>>();
         let mut newest_by_path = BTreeMap::new();
-        for node in self.nodes_newest_first() {
+        for node in self.nodes_in_visit_order() {
             for entry in &node.tree.entries {
                 if !live_paths.contains(entry.path.as_str()) {
                     newest_by_path
@@ -411,130 +324,81 @@ impl HistoryReader {
             .map(|(node, _)| node)
     }
 
-    pub fn all_parents(&self, start_commit: &str) -> Result<HistoryGraph> {
-        let walk = self.walk_many([start_commit], ParentMode::All)?;
-        validate_acyclic(&walk.nodes)?;
-        Ok(HistoryGraph {
+    /// Read the strict newest-first ancestry of one commit.
+    pub fn walk(&self, start_commit: &str) -> Result<LinearHistory> {
+        let walk = self.walk_many([start_commit])?;
+        ensure_acyclic(&walk.nodes)?;
+        let edges = parent_edges_from_nodes(&walk.nodes);
+        let visit_order = linear_order(&edges, &walk.nodes, start_commit)?;
+        Ok(LinearHistory {
             start_commit: start_commit.to_owned(),
             nodes: walk.nodes,
-            visit_order: walk.order,
+            visit_order,
             stats: walk.stats,
         })
     }
 
-    /// Read the strict all-parent union reachable from every supplied root.
+    /// Read a strict union of roots that belong to one linear history.
     ///
-    /// Shared ancestors are decoded and verified once.  Unlike invoking
-    /// [`Self::all_parents`] once per root, the bounds apply to the union and
-    /// any corrupt root or ancestor still fails the entire operation.
-    pub fn all_parents_for_roots(&self, roots: &BTreeSet<String>) -> Result<HistoryGraph> {
-        let start_commit = roots
-            .first()
-            .cloned()
-            .ok_or_else(|| KioError::schema("history root set is empty"))?;
-        let walk = self.walk_many(roots.iter().map(String::as_str), ParentMode::All)?;
-        validate_acyclic(&walk.nodes)?;
-        Ok(HistoryGraph {
-            // `start_commit` is the graph's representative-root accessor. For
-            // a multi-root graph it is the bytewise-first root; callers that
-            // need a particular root must use `node(root)`.
+    /// Shared ancestry is decoded and verified once. Roots that are not on one
+    /// chain are a schema violation rather than implicit branches.
+    pub fn walk_for_roots(&self, roots: &BTreeSet<String>) -> Result<LinearHistory> {
+        let walk = self.walk_many(roots.iter().map(String::as_str))?;
+        ensure_acyclic(&walk.nodes)?;
+        let edges = parent_edges_from_nodes(&walk.nodes);
+        let start_commit = linear_tip(&edges, roots)?;
+        let visit_order = linear_order(&edges, &walk.nodes, &start_commit)?;
+        Ok(LinearHistory {
             start_commit,
             nodes: walk.nodes,
-            visit_order: walk.order,
+            visit_order,
             stats: walk.stats,
         })
     }
 
-    pub fn first_parent(&self, start_commit: &str) -> Result<FirstParentHistory> {
-        let walk = self.walk(start_commit, ParentMode::First)?;
-        Ok(FirstParentHistory {
-            start_commit: start_commit.to_owned(),
-            nodes: walk.nodes,
-            newest_first: walk.order,
-            stats: walk.stats,
-        })
-    }
-
-    /// PC45/PC46 (05 §1.6 / §2.2): the all-parent walk used by `--all-history` /
-    /// `--since`, tolerant of a shallow (tree-discarded) *ancestor* — it is
+    /// PC45/PC46 (05 §1.6 / §2.2): a linear walk tolerant of a shallow
+    /// (tree-discarded) *ancestor* — it is
     /// skipped (recorded in the returned `shallow_skipped` list, sorted/deduped)
-    /// and the walk continues through that commit's parents (still readable from
-    /// its commit object, which shallow GC never discards, §2.2). The **start**
+    /// and the walk continues through that commit's predecessor (still readable
+    /// from its commit object, which shallow GC never discards, §2.2). The **start**
     /// commit itself is never tolerated this way: if its own tree is gone the
-    /// call hard-fails exactly like `all_parents` (PC47 — a cursor's or `--at`'s
+    /// call hard-fails exactly like [`Self::walk`] (PC47 — a cursor's or `--at`'s
     /// snapshot commit needs its whole tree, so there is no partial degradation
     /// to fall back to). A missing *commit* object (not just its tree) is never
     /// shallow-tolerated either — shallow GC only ever discards trees (§2.2), so
     /// a missing commit is corruption, and this call fails exactly like
-    /// `all_parents` in that case too.
-    pub fn all_parents_tolerant(&self, start_commit: &str) -> Result<(HistoryGraph, Vec<String>)> {
-        self.all_parents_for_roots_tolerant(&BTreeSet::from([start_commit.to_owned()]))
+    /// `walk` in that case too.
+    pub fn walk_allow_shallowed(&self, start_commit: &str) -> Result<(LinearHistory, Vec<String>)> {
+        self.walk_for_roots_allow_shallowed(&BTreeSet::from([start_commit.to_owned()]))
     }
 
-    /// The receipt-gated tolerant counterpart of [`Self::all_parents_for_roots`].
+    /// The receipt-gated tolerant counterpart of [`Self::walk_for_roots`].
     /// Every supplied root remains strict; only a non-root ancestor with a
-    /// markerless, exact shallow receipt may be skipped while its parents keep
+    /// markerless, exact shallow receipt may be skipped while its predecessor keeps
     /// being traversed. This is intended for derived-state rebuilds, not for
     /// explicit snapshot selection.
-    pub fn all_parents_for_roots_tolerant(
+    pub fn walk_for_roots_allow_shallowed(
         &self,
         roots: &BTreeSet<String>,
-    ) -> Result<(HistoryGraph, Vec<String>)> {
-        let start_commit = roots
-            .first()
-            .cloned()
-            .ok_or_else(|| KioError::schema("history root set is empty"))?;
+    ) -> Result<(LinearHistory, Vec<String>)> {
         let allowed_shallow = self.markerless_shallow_receipts()?;
-        let walk = self.walk_many_tolerant(
-            roots.iter().map(String::as_str),
-            ParentMode::All,
-            &allowed_shallow,
-        )?;
-        // `validate_acyclic` counts only parent hashes that are themselves keys
-        // of `nodes` (a no-op generalization for a complete, non-tolerant graph,
-        // where every referenced parent is always present) — a shallow-skipped
-        // ancestor is simply not a "remaining parent" any walked descendant
-        // needs to wait on.
-        validate_acyclic(&walk.nodes)?;
+        let walk = self.walk_many_tolerant(roots.iter().map(String::as_str), &allowed_shallow)?;
+        ensure_acyclic(&walk.nodes)?;
+        ensure_acyclic_edges(&walk.parents)?;
+        let start_commit = linear_tip(&walk.parents, roots)?;
+        let visit_order = linear_order(&walk.parents, &walk.nodes, &start_commit)?;
         Ok((
-            HistoryGraph {
+            LinearHistory {
                 start_commit,
                 nodes: walk.nodes,
-                visit_order: walk.order,
+                visit_order,
                 stats: walk.stats,
             },
             walk.shallow_skipped,
         ))
     }
 
-    /// The `first_parent` counterpart of [`Self::all_parents_tolerant`], used by
-    /// `--include-deleted`'s first-parent ancestry walk.
-    pub fn first_parent_tolerant(
-        &self,
-        start_commit: &str,
-    ) -> Result<(FirstParentHistory, Vec<String>)> {
-        let allowed_shallow = self.markerless_shallow_receipts()?;
-        let walk = self.walk_tolerant(start_commit, ParentMode::First, &allowed_shallow)?;
-        Ok((
-            FirstParentHistory {
-                start_commit: start_commit.to_owned(),
-                nodes: walk.nodes,
-                newest_first: walk.order,
-                stats: walk.stats,
-            },
-            walk.shallow_skipped,
-        ))
-    }
-
-    fn walk(&self, start_commit: &str, mode: ParentMode) -> Result<WalkState> {
-        self.walk_many([start_commit], mode)
-    }
-
-    fn walk_many<'a>(
-        &self,
-        starts: impl IntoIterator<Item = &'a str>,
-        mode: ParentMode,
-    ) -> Result<WalkState> {
+    fn walk_many<'a>(&self, starts: impl IntoIterator<Item = &'a str>) -> Result<WalkState> {
         let mut state = WalkState::default();
         let scheduled = starts
             .into_iter()
@@ -546,22 +410,13 @@ impl HistoryReader {
         while let Some(commit_hash) = pending.pop() {
             let (node, next_stats) = self.read_node(&commit_hash, state.stats)?;
 
-            let parents = match mode {
-                ParentMode::All => node.commit.parents.as_slice(),
-                ParentMode::First => node.commit.parents.get(..1).unwrap_or_default(),
-            };
-            for parent in parents.iter().rev() {
-                if scheduled.insert(parent.clone()) {
-                    pending.push(parent.clone());
-                } else if matches!(mode, ParentMode::First) {
-                    return Err(KioError::schema(
-                        "commit history contains a first-parent cycle",
-                    ));
-                }
+            if let Some(parent) = node.commit.parent.as_ref()
+                && scheduled.insert(parent.clone())
+            {
+                pending.push(parent.clone());
             }
 
             state.stats = next_stats;
-            state.order.push(commit_hash.clone());
             state.nodes.insert(commit_hash, node);
         }
 
@@ -575,19 +430,9 @@ impl HistoryReader {
     /// tolerated. Skipped hashes are still counted against `HistoryStats` for
     /// their commit bytes (their tree contributes zero entries/bytes, same as a
     /// legitimately empty tree would).
-    fn walk_tolerant(
-        &self,
-        start_commit: &str,
-        mode: ParentMode,
-        _allowed_shallow: &BTreeMap<String, String>,
-    ) -> Result<TolerantWalkState> {
-        self.walk_many_tolerant([start_commit], mode, _allowed_shallow)
-    }
-
     fn walk_many_tolerant<'a>(
         &self,
         starts: impl IntoIterator<Item = &'a str>,
-        mode: ParentMode,
         _allowed_shallow: &BTreeMap<String, String>,
     ) -> Result<TolerantWalkState> {
         let mut state = TolerantWalkState::default();
@@ -602,24 +447,14 @@ impl HistoryReader {
             let is_start = strict_starts.contains(&commit_hash);
             let outcome =
                 self.read_node_tolerant(&commit_hash, state.stats, is_start, _allowed_shallow)?;
-            let (parents, next_stats) = match outcome {
+            let (parent, next_stats) = match outcome {
                 TolerantNodeOutcome::Full(node, next_stats) => {
-                    let parents = match mode {
-                        ParentMode::All => node.commit.parents.clone(),
-                        ParentMode::First => {
-                            node.commit.parents.get(..1).unwrap_or_default().to_vec()
-                        }
-                    };
-                    state.order.push(commit_hash.clone());
+                    let parent = node.commit.parent.clone();
                     state.nodes.insert(commit_hash.clone(), *node);
-                    (parents, next_stats)
+                    (parent, next_stats)
                 }
-                TolerantNodeOutcome::ShallowSkipped { parents, stats } => {
+                TolerantNodeOutcome::ShallowSkipped { parent, stats } => {
                     state.shallow_skipped.push(commit_hash.clone());
-                    let parents = match mode {
-                        ParentMode::All => parents,
-                        ParentMode::First => parents.get(..1).unwrap_or_default().to_vec(),
-                    };
                     // A shallow ancestor still occupies a position in the
                     // newest-first / visit order for `--include-deleted`'s
                     // `nodes_newest_first()` — but that method already
@@ -627,17 +462,14 @@ impl HistoryReader {
                     // is silently and correctly skipped there. Do not push it
                     // into `order` — nothing downstream needs it and every
                     // consumer indexes through `self.nodes` first.
-                    (parents, stats)
+                    (parent, stats)
                 }
             };
-            for parent in parents.iter().rev() {
-                if scheduled.insert(parent.clone()) {
-                    pending.push(parent.clone());
-                } else if matches!(mode, ParentMode::First) {
-                    return Err(KioError::schema(
-                        "commit history contains a first-parent cycle",
-                    ));
-                }
+            state.parents.insert(commit_hash.clone(), parent.clone());
+            if let Some(parent) = parent
+                && scheduled.insert(parent.clone())
+            {
+                pending.push(parent);
             }
             state.stats = next_stats;
         }
@@ -789,7 +621,7 @@ impl HistoryReader {
                     ));
                 }
                 return Ok(TolerantNodeOutcome::ShallowSkipped {
-                    parents: commit.parents,
+                    parent: commit.parent,
                     stats: HistoryStats {
                         commits: next_commit_count,
                         tree_entries: stats.tree_entries,
@@ -850,7 +682,7 @@ enum TolerantNodeOutcome {
     // this enum is returned by value on every walked commit.
     Full(Box<HistoryNode>, HistoryStats),
     ShallowSkipped {
-        parents: Vec<String>,
+        parent: Option<String>,
         stats: HistoryStats,
     },
 }
@@ -858,34 +690,22 @@ enum TolerantNodeOutcome {
 #[derive(Debug, Default)]
 struct TolerantWalkState {
     nodes: BTreeMap<String, HistoryNode>,
-    order: Vec<String>,
+    parents: BTreeMap<String, Option<String>>,
     stats: HistoryStats,
     /// Commit hashes skipped because their tree was gone (PC45/PC46), sorted +
     /// deduped once the walk completes.
     shallow_skipped: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum ParentMode {
-    All,
-    First,
-}
-
 #[derive(Debug, Default)]
 struct WalkState {
     nodes: BTreeMap<String, HistoryNode>,
-    order: Vec<String>,
     stats: HistoryStats,
 }
 
 fn decode_commit(object: StoredObject) -> Result<CommitObject> {
     let commit: CommitObject = serde_json::from_slice(&object.bytes)
         .map_err(|error| KioError::schema(error.to_string()))?;
-    if commit.parents.len() > MAX_COMMIT_PARENTS {
-        return Err(KioError::schema(format!(
-            "commit parents exceed the limit of {MAX_COMMIT_PARENTS}"
-        )));
-    }
     commit.validate()?;
     Ok(commit)
 }
@@ -902,63 +722,130 @@ fn decode_tree(object: StoredObject) -> Result<TreeObject> {
     Ok(tree)
 }
 
-/// Kahn's-algorithm cycle check. Counts only parent hashes that are themselves
-/// keys of `nodes` — for a *complete* graph (every `all_parents()` caller today)
-/// this is a no-op, because a walk that referenced an unread parent would
-/// already have failed with an `Err` before reaching this call. It is a real
-/// generalization for `all_parents_tolerant`'s graph (PC45), where a
-/// shallow-skipped ancestor is a legitimate "boundary" node: present as a
-/// parent reference in its children's commit objects, but deliberately absent
-/// from `nodes` (its tree was never read). Such a boundary parent must not
-/// block its children from ever becoming "ready" — it contributes no further
-/// ancestor information (its own tree is gone), so it is correct to treat it as
-/// if it were not there at all for topological-order purposes.
-fn validate_acyclic(nodes: &BTreeMap<String, HistoryNode>) -> Result<()> {
-    let mut remaining_parents = nodes
+fn parent_edges_from_nodes(
+    nodes: &BTreeMap<String, HistoryNode>,
+) -> BTreeMap<String, Option<String>> {
+    nodes
         .iter()
-        .map(|(hash, node)| {
-            let present = node
-                .commit
-                .parents
-                .iter()
-                .filter(|parent| nodes.contains_key(parent.as_str()))
-                .count();
-            (hash.clone(), present)
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut children = BTreeMap::<&str, Vec<&str>>::new();
-    for (child_hash, node) in nodes {
-        for parent in &node.commit.parents {
-            if !nodes.contains_key(parent.as_str()) {
-                continue;
+        .map(|(hash, node)| (hash.clone(), node.commit.parent.clone()))
+        .collect()
+}
+
+/// Return the unique newest supplied root. Every other supplied root must be
+/// reachable through immutable predecessor edges. This remains sound across a
+/// receipt-authorized shallow commit because its commit object supplies its
+/// predecessor edge even though its tree is absent.
+fn linear_tip(
+    edges: &BTreeMap<String, Option<String>>,
+    roots: &BTreeSet<String>,
+) -> Result<String> {
+    if roots.is_empty() {
+        return Err(KioError::schema("history root set is empty"));
+    }
+    // Visit each predecessor at most once across all roots. Pairwise ancestry
+    // comparisons multiply full history walks for every tag pair and can make
+    // an otherwise bounded 100,000-commit history impractical to read.
+    let mut non_tips = BTreeSet::new();
+    let mut walked = BTreeSet::new();
+    for root in roots {
+        let mut cursor = edges
+            .get(root)
+            .ok_or_else(|| KioError::schema("cannot prove linear ancestry across missing history"))?
+            .as_deref();
+        while let Some(hash) = cursor {
+            if roots.contains(hash) {
+                non_tips.insert(hash);
             }
-            children
-                .entry(parent)
-                .or_default()
-                .push(child_hash.as_str());
+            if !walked.insert(hash) {
+                break;
+            }
+            cursor = edges
+                .get(hash)
+                .ok_or_else(|| {
+                    KioError::schema("cannot prove linear ancestry across missing history")
+                })?
+                .as_deref();
         }
     }
-    let mut ready = remaining_parents
+    let newest = roots
         .iter()
-        .filter_map(|(hash, count)| (*count == 0).then_some(hash.clone()))
-        .collect::<BTreeSet<_>>();
-    let mut processed = 0_usize;
-    while let Some(hash) = ready.pop_first() {
-        processed += 1;
-        if let Some(node_children) = children.get(hash.as_str()) {
-            for child in node_children {
-                let count = remaining_parents
-                    .get_mut(*child)
-                    .expect("child was collected from nodes");
-                *count -= 1;
-                if *count == 0 {
-                    ready.insert((*child).to_owned());
-                }
-            }
-        }
+        .filter(|root| !non_tips.contains(root.as_str()))
+        .collect::<Vec<_>>();
+    if newest.len() != 1 {
+        return Err(KioError::schema(
+            "history roots are not on one linear ancestry chain",
+        ));
     }
-    if processed != nodes.len() {
-        return Err(KioError::schema("commit history contains a parent cycle"));
+    let tip = (*newest[0]).clone();
+    let mut cursor = Some(tip.as_str());
+    let mut seen = BTreeSet::new();
+    while let Some(hash) = cursor {
+        if !seen.insert(hash) {
+            return Err(KioError::schema("commit history contains a parent cycle"));
+        }
+        cursor = match edges.get(hash) {
+            Some(parent) => parent.as_deref(),
+            None => {
+                return Err(KioError::schema(
+                    "cannot prove linear ancestry across shallow history",
+                ));
+            }
+        };
+    }
+    if roots.iter().all(|root| seen.contains(root.as_str())) {
+        Ok(tip)
+    } else {
+        Err(KioError::schema(
+            "history roots are not on one linear ancestry chain",
+        ))
+    }
+}
+
+/// Rebuild a canonical newest-first node order from the selected tip. Shallow
+/// commits remain in the predecessor proof but have no `HistoryNode`, so they
+/// do not appear in the returned iterator.
+fn linear_order(
+    edges: &BTreeMap<String, Option<String>>,
+    nodes: &BTreeMap<String, HistoryNode>,
+    tip: &str,
+) -> Result<Vec<String>> {
+    let mut order = Vec::new();
+    let mut cursor = Some(tip);
+    let mut seen = BTreeSet::new();
+    while let Some(hash) = cursor {
+        if !seen.insert(hash) {
+            return Err(KioError::schema("commit history contains a parent cycle"));
+        }
+        if nodes.contains_key(hash) {
+            order.push(hash.to_owned());
+        }
+        cursor = edges
+            .get(hash)
+            .ok_or_else(|| KioError::schema("cannot prove linear history order"))?
+            .as_deref();
+    }
+    Ok(order)
+}
+
+fn ensure_acyclic(nodes: &BTreeMap<String, HistoryNode>) -> Result<()> {
+    ensure_acyclic_edges(&parent_edges_from_nodes(nodes))
+}
+
+fn ensure_acyclic_edges(edges: &BTreeMap<String, Option<String>>) -> Result<()> {
+    let mut completed = BTreeSet::new();
+    for start in edges.keys() {
+        let mut cursor = Some(start.as_str());
+        let mut active = BTreeSet::new();
+        while let Some(hash) = cursor {
+            if completed.contains(hash) {
+                break;
+            }
+            if !active.insert(hash) {
+                return Err(KioError::schema("commit history contains a parent cycle"));
+            }
+            cursor = edges.get(hash).and_then(|parent| parent.as_deref());
+        }
+        completed.extend(active);
     }
     Ok(())
 }
@@ -1031,7 +918,7 @@ fn history_shallow_error(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::PathBuf;
 
@@ -1056,7 +943,7 @@ mod tests {
             fs::create_dir_all(kio_dir.join("refs/heads")).unwrap();
             fs::create_dir_all(kio_dir.join("refs/tags-v1")).unwrap();
             fs::create_dir_all(kio_dir.join("objects/trees")).unwrap();
-            fs::write(kio_dir.join("HEAD"), b"").unwrap();
+            fs::write(kio_dir.join("HEAD"), b"unborn\n").unwrap();
             let store = ObjectStore::new(&kio_dir);
             Self {
                 _temp: temp,
@@ -1074,9 +961,13 @@ mod tests {
         }
 
         fn commit(&self, label: &str, tree: &str, parents: Vec<String>) -> String {
+            assert!(
+                parents.len() <= 1,
+                "linear history test fixture rejects merge parents"
+            );
             let commit = CommitObject::new(
                 tree.to_owned(),
-                parents,
+                parents.into_iter().next(),
                 "2026-07-13T00:00:00Z".to_owned(),
                 label.to_owned(),
                 hash_bytes(b"tool-lock"),
@@ -1118,26 +1009,50 @@ mod tests {
     }
 
     #[test]
-    fn all_parent_graph_keeps_merge_side_bindings_and_hash_ties_introductions() {
+    fn all_tagged_linear_history_uses_shared_ancestry_and_rejects_other_roots() {
+        let names = (0..20_000)
+            .map(|index| format!("commit-{index:05}"))
+            .collect::<Vec<_>>();
+        let mut edges = BTreeMap::new();
+        for (index, name) in names.iter().enumerate() {
+            edges.insert(
+                name.clone(),
+                index.checked_sub(1).map(|previous| names[previous].clone()),
+            );
+        }
+        let mut roots = names.iter().cloned().collect::<BTreeSet<_>>();
+        super::ensure_acyclic_edges(&edges).unwrap();
+        assert_eq!(
+            super::linear_tip(&edges, &roots).unwrap(),
+            *names.last().unwrap()
+        );
+        edges.insert("detached".into(), None);
+        roots.insert("detached".into());
+        assert!(super::linear_tip(&edges, &roots).is_err());
+        roots.remove("detached");
+        edges.insert(names[0].clone(), Some(names[1].clone()));
+        assert!(super::ensure_acyclic_edges(&edges).is_err());
+        edges.remove(&names[1]);
+        assert!(super::linear_tip(&edges, &roots).is_err());
+    }
+
+    #[test]
+    fn linear_history_has_one_earliest_introduction() {
         let fixture = Fixture::new();
         let empty = fixture.tree(Vec::new());
         let with_x = fixture.tree(vec![entry("x.md", b"x", Some(profile()))]);
         let root = fixture.commit("root", &empty, Vec::new());
-        let left = fixture.commit("left", &with_x, vec![root.clone()]);
-        let right = fixture.commit("right", &with_x, vec![root]);
-        let merge = fixture.commit("merge", &with_x, vec![left.clone(), right.clone()]);
+        let first = fixture.commit("first", &with_x, vec![root.clone()]);
+        let head = fixture.commit("head", &with_x, vec![first.clone()]);
 
-        let graph = HistoryReader::new(&fixture.kio_dir)
-            .all_parents(&merge)
-            .unwrap();
+        let graph = HistoryReader::new(&fixture.kio_dir).walk(&head).unwrap();
         let binding = TreeBinding {
             path: "x.md".to_owned(),
             raw_hash: hash_bytes(b"x"),
             normalize: Some(profile()),
         };
         let candidates = graph.introduction_candidates(&binding);
-        let mut expected = vec![left.as_str(), right.as_str()];
-        expected.sort_unstable();
+        let expected = vec![first.as_str()];
         assert_eq!(
             candidates
                 .iter()
@@ -1148,23 +1063,20 @@ mod tests {
         assert_eq!(graph.ancestor_most_introductions(&binding), candidates);
         assert_eq!(
             graph.canonical_introduction(&binding).unwrap().commit_hash,
-            left.min(right)
+            first
         );
     }
 
     #[test]
-    fn all_parent_walk_finds_binding_dropped_by_merge_first_parent() {
+    fn linear_walk_finds_historical_binding_after_deletion() {
         let fixture = Fixture::new();
         let empty = fixture.tree(Vec::new());
         let with_x = fixture.tree(vec![entry("side.md", b"side", Some(profile()))]);
         let root = fixture.commit("root", &empty, Vec::new());
-        let main = fixture.commit("main", &empty, vec![root.clone()]);
         let side = fixture.commit("side", &with_x, vec![root]);
-        let merge = fixture.commit("merge-drops-side", &empty, vec![main, side.clone()]);
+        let head = fixture.commit("delete-side", &empty, vec![side.clone()]);
 
-        let graph = HistoryReader::new(&fixture.kio_dir)
-            .all_parents(&merge)
-            .unwrap();
+        let graph = HistoryReader::new(&fixture.kio_dir).walk(&head).unwrap();
         let binding = TreeBinding {
             path: "side.md".to_owned(),
             raw_hash: hash_bytes(b"side"),
@@ -1176,34 +1088,33 @@ mod tests {
     }
 
     #[test]
-    fn all_parent_union_walk_deduplicates_shared_ancestors_and_keeps_all_roots() {
+    fn root_union_requires_one_linear_chain() {
         let fixture = Fixture::new();
         let empty = fixture.tree(Vec::new());
         let root = fixture.commit("root", &empty, Vec::new());
-        let left = fixture.commit("left", &empty, vec![root.clone()]);
-        let right = fixture.commit("right", &empty, vec![root]);
-        let roots = BTreeSet::from([left.clone(), right.clone()]);
+        let head = fixture.commit("head", &empty, vec![root.clone()]);
+        let roots = BTreeSet::from([root.clone(), head.clone()]);
 
         let graph = HistoryReader::new(&fixture.kio_dir)
-            .all_parents_for_roots(&roots)
+            .walk_for_roots(&roots)
             .unwrap();
 
-        assert_eq!(graph.stats().commits, 3);
-        assert!(graph.node(&left).is_some());
-        assert!(graph.node(&right).is_some());
+        assert_eq!(graph.stats().commits, 2);
+        assert!(graph.node(&root).is_some());
+        assert!(graph.node(&head).is_some());
         assert_eq!(
             graph
                 .nodes_in_visit_order()
                 .map(|node| node.commit_hash.as_str())
                 .collect::<BTreeSet<_>>()
                 .len(),
-            3
+            2
         );
 
-        let roots_with_missing = BTreeSet::from([left, hash_bytes(b"missing-root")]);
+        let roots_with_missing = BTreeSet::from([head, hash_bytes(b"missing-root")]);
         assert!(
             HistoryReader::new(&fixture.kio_dir)
-                .all_parents_for_roots(&roots_with_missing)
+                .walk_for_roots(&roots_with_missing)
                 .is_err()
         );
     }
@@ -1217,9 +1128,7 @@ mod tests {
         let deletion = fixture.commit("delete", &empty, vec![root.clone()]);
         let readd = fixture.commit("readd", &with_x, vec![deletion]);
 
-        let graph = HistoryReader::new(&fixture.kio_dir)
-            .all_parents(&readd)
-            .unwrap();
+        let graph = HistoryReader::new(&fixture.kio_dir).walk(&readd).unwrap();
         let binding = TreeBinding {
             path: "x.md".to_owned(),
             raw_hash: hash_bytes(b"x"),
@@ -1232,16 +1141,58 @@ mod tests {
     }
 
     #[test]
-    fn first_parent_derives_final_deleted_binding_and_preserves_none_normalize() {
+    fn root_union_reconstructs_newest_first_order_when_hash_order_is_opposite() {
+        let fixture = Fixture::new();
+        let empty = fixture.tree(Vec::new());
+        let with_x = fixture.tree(vec![entry("x.md", b"x", Some(profile()))]);
+        let root = fixture.commit("root", &empty, Vec::new());
+        let (first, deletion, readd) = (0_u32..1024)
+            .find_map(|attempt| {
+                let first =
+                    fixture.commit(&format!("first-{attempt}"), &with_x, vec![root.clone()]);
+                let deletion =
+                    fixture.commit(&format!("delete-{attempt}"), &empty, vec![first.clone()]);
+                let readd =
+                    fixture.commit(&format!("readd-{attempt}"), &with_x, vec![deletion.clone()]);
+                (first < readd).then_some((first, deletion, readd))
+            })
+            .expect("hash prefix search must find a lexically earlier ancestor");
+        let roots = BTreeSet::from([first.clone(), readd.clone()]);
+
+        let history = HistoryReader::new(&fixture.kio_dir)
+            .walk_for_roots(&roots)
+            .unwrap();
+        assert_eq!(history.start_commit(), readd);
+        assert_eq!(
+            history
+                .nodes_in_visit_order()
+                .map(|node| node.commit_hash.clone())
+                .collect::<Vec<_>>(),
+            vec![readd.clone(), deletion, first.clone(), root],
+        );
+        let binding = TreeBinding {
+            path: "x.md".to_owned(),
+            raw_hash: hash_bytes(b"x"),
+            normalize: Some(profile()),
+        };
+        assert_eq!(
+            history
+                .canonical_introduction(&binding)
+                .unwrap()
+                .commit_hash,
+            first
+        );
+    }
+
+    #[test]
+    fn linear_walk_derives_final_deleted_binding_and_preserves_none_normalize() {
         let fixture = Fixture::new();
         let old = fixture.tree(vec![entry("old.md", b"old", None)]);
         let current = fixture.tree(vec![entry("live.md", b"live", Some(profile()))]);
         let root = fixture.commit("old", &old, Vec::new());
         let head = fixture.commit("head", &current, vec![root.clone()]);
 
-        let history = HistoryReader::new(&fixture.kio_dir)
-            .first_parent(&head)
-            .unwrap();
+        let history = HistoryReader::new(&fixture.kio_dir).walk(&head).unwrap();
         let newest = history.newest_binding_for_path("old.md").unwrap();
         assert_eq!(newest.commit_hash, root);
         assert_eq!(newest.binding.normalize, None);
@@ -1254,9 +1205,7 @@ mod tests {
                 .all(|binding| binding.binding.path != "live.md")
         );
 
-        let graph = HistoryReader::new(&fixture.kio_dir)
-            .all_parents(&head)
-            .unwrap();
+        let graph = HistoryReader::new(&fixture.kio_dir).walk(&head).unwrap();
         let binding = TreeBinding {
             path: "old.md".to_owned(),
             raw_hash: hash_bytes(b"old"),
@@ -1279,12 +1228,12 @@ mod tests {
         let root = fixture.commit("root", &tree, Vec::new());
         let head = fixture.commit("head", &tree, vec![root]);
         let baseline = HistoryReader::new(&fixture.kio_dir)
-            .all_parents(&head)
+            .walk(&head)
             .unwrap()
             .stats();
         assert_eq!(
             HistoryReader::new(&fixture.kio_dir)
-                .first_parent(&head)
+                .walk(&head)
                 .unwrap()
                 .stats(),
             baseline
@@ -1296,11 +1245,10 @@ mod tests {
             baseline.verified_bytes,
         );
         let exact_reader = HistoryReader::with_limits(&fixture.kio_dir, exact);
-        assert_eq!(exact_reader.all_parents(&head).unwrap().stats(), baseline);
-        assert_eq!(exact_reader.first_parent(&head).unwrap().stats(), baseline);
-        // A second invocation proves that all-parent and first-parent counters are
-        // fresh per walk rather than retained on the reader.
-        assert_eq!(exact_reader.all_parents(&head).unwrap().stats(), baseline);
+        assert_eq!(exact_reader.walk(&head).unwrap().stats(), baseline);
+        // A second invocation proves counters are fresh per walk rather than
+        // retained on the reader.
+        assert_eq!(exact_reader.walk(&head).unwrap().stats(), baseline);
 
         let cases = [
             (
@@ -1330,13 +1278,9 @@ mod tests {
         ];
         for (expected_dimension, limits) in cases {
             let reader = HistoryReader::with_limits(&fixture.kio_dir, limits);
-            for error in [
-                reader.all_parents(&head).unwrap_err(),
-                reader.first_parent(&head).unwrap_err(),
-            ] {
-                assert_eq!(error.error_code(), "KIO-E-COMMIT-HISTORY-LIMIT-001");
-                assert_eq!(error.context()["exceeded"], json!(expected_dimension));
-            }
+            let error = reader.walk(&head).unwrap_err();
+            assert_eq!(error.error_code(), "KIO-E-COMMIT-HISTORY-LIMIT-001");
+            assert_eq!(error.context()["exceeded"], json!(expected_dimension));
         }
     }
 
@@ -1352,7 +1296,7 @@ mod tests {
         let root = fixture.commit("root", &tree, Vec::new());
         let head = fixture.commit("head", &tree, vec![root]);
         let baseline = HistoryReader::new(&fixture.kio_dir)
-            .all_parents(&head)
+            .walk(&head)
             .unwrap()
             .stats();
         let limits = HistoryLimits::new(
@@ -1361,13 +1305,9 @@ mod tests {
             baseline.verified_bytes,
         );
         let reader = HistoryReader::with_limits(&fixture.kio_dir, limits);
-        for error in [
-            reader.all_parents(&head).unwrap_err(),
-            reader.first_parent(&head).unwrap_err(),
-        ] {
-            assert_eq!(error.error_code(), "KIO-E-COMMIT-HISTORY-LIMIT-001");
-            assert_eq!(error.exit_code(), crate::ExitCode::PermanentFailure);
-        }
+        let error = reader.walk(&head).unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-COMMIT-HISTORY-LIMIT-001");
+        assert_eq!(error.exit_code(), crate::ExitCode::PermanentFailure);
     }
 
     #[test]
@@ -1384,7 +1324,7 @@ mod tests {
             head
         );
         let error = HistoryReader::new(&fixture.kio_dir)
-            .all_parents(&head)
+            .walk(&head)
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-COMMIT-SHALLOW-001");
         assert_eq!(error.context()["commit_hash"], json!(missing_parent));
@@ -1396,7 +1336,7 @@ mod tests {
         let missing_tree = hash_bytes(b"missing-tree");
         let shallow = fixture.commit("shallow", &missing_tree, Vec::new());
         let error = HistoryReader::new(&fixture.kio_dir)
-            .first_parent(&shallow)
+            .walk(&shallow)
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
         assert_eq!(error.context()["commit_hash"], json!(shallow));
@@ -1415,41 +1355,35 @@ mod tests {
         let tree = fixture.tree(Vec::new());
         let head = fixture.commit("head", &tree, Vec::new());
         let reader = HistoryReader::new(&fixture.kio_dir);
-        reader.all_parents(&head).unwrap();
+        reader.walk(&head).unwrap();
 
         let tree_path = fixture.store.object_path(ObjectKind::Tree, &tree).unwrap();
         fs::remove_file(tree_path).unwrap();
-        let error = reader.all_parents(&head).unwrap_err();
+        let error = reader.walk(&head).unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
     }
 
     #[test]
-    fn first_parent_ignores_merge_side_parent_but_all_parent_does_not() {
+    fn root_union_rejects_sibling_branches() {
         let fixture = Fixture::new();
         let empty = fixture.tree(Vec::new());
         let root = fixture.commit("root", &empty, Vec::new());
         let main = fixture.commit("main", &empty, vec![root.clone()]);
         let side = fixture.commit("side", &empty, vec![root]);
-        let merge = fixture.commit("merge", &empty, vec![main.clone(), side.clone()]);
-
-        let first = HistoryReader::new(&fixture.kio_dir)
-            .first_parent(&merge)
-            .unwrap();
-        assert!(first.node(&main).is_some());
-        assert!(first.node(&side).is_none());
-        let all = HistoryReader::new(&fixture.kio_dir)
-            .all_parents(&merge)
-            .unwrap();
-        assert!(all.node(&main).is_some());
-        assert!(all.node(&side).is_some());
+        let roots = BTreeSet::from([main, side]);
+        assert!(
+            HistoryReader::new(&fixture.kio_dir)
+                .walk_for_roots(&roots)
+                .is_err()
+        );
     }
 
-    /// PC45: an all-parent walk with a shallow (tree-discarded) *ancestor*
+    /// PC45: a linear walk with a shallow (tree-discarded) *ancestor*
     /// skips it and keeps walking through commits reachable beyond it, instead
-    /// of failing the whole walk the way plain `all_parents` still does
+    /// of failing the whole walk does
     /// (regression guard: the non-tolerant path is unchanged).
     #[test]
-    fn pc45_all_parents_tolerant_skips_a_shallow_ancestor_and_keeps_walking() {
+    fn pc45_linear_walk_allow_shallowed_skips_an_ancestor_and_keeps_walking() {
         let fixture = Fixture::new();
         let root_tree = fixture.tree(vec![entry("root.md", b"root", Some(profile()))]);
         let root = fixture.commit("root", &root_tree, Vec::new());
@@ -1461,12 +1395,12 @@ mod tests {
 
         // Unchanged baseline: the non-tolerant walk still hard-fails.
         let error = HistoryReader::new(&fixture.kio_dir)
-            .all_parents(&head)
+            .walk(&head)
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-COMMIT-SHALLOW-001");
 
         let (graph, shallow_skipped) = HistoryReader::new(&fixture.kio_dir)
-            .all_parents_tolerant(&head)
+            .walk_allow_shallowed(&head)
             .unwrap();
         assert_eq!(shallow_skipped, vec![shallow_mid.clone()]);
         // The walk continued past the shallow node to its own parent.
@@ -1501,7 +1435,7 @@ mod tests {
         let head = fixture.commit("head", &head_tree, vec![missing.clone()]);
 
         let error = HistoryReader::new(&fixture.kio_dir)
-            .all_parents_tolerant(&head)
+            .walk_allow_shallowed(&head)
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
         assert_eq!(error.context()["commit_hash"], json!(missing));
@@ -1518,7 +1452,7 @@ mod tests {
         let roots = BTreeSet::from([healthy, shallow_root.clone()]);
 
         let error = HistoryReader::new(&fixture.kio_dir)
-            .all_parents_for_roots_tolerant(&roots)
+            .walk_for_roots_allow_shallowed(&roots)
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-COMMIT-SHALLOW-001");
         assert_eq!(error.context()["commit_hash"], json!(shallow_root));
@@ -1529,23 +1463,23 @@ mod tests {
     /// a blanket exemption; a `--cursor` replay or `--at <shallow-commit>` needs
     /// the whole tree of the exact commit it targets).
     #[test]
-    fn pc47_all_parents_tolerant_still_hard_fails_when_the_start_commit_itself_is_shallow() {
+    fn pc47_linear_walk_allow_shallowed_hard_fails_when_start_is_shallow() {
         let fixture = Fixture::new();
         let missing_tree = hash_bytes(b"pc47-missing-tree");
         let shallow_head = fixture.commit("shallow-head", &missing_tree, Vec::new());
         fixture.shallow_receipt(shallow_head.clone(), missing_tree);
         let error = HistoryReader::new(&fixture.kio_dir)
-            .all_parents_tolerant(&shallow_head)
+            .walk_allow_shallowed(&shallow_head)
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-COMMIT-SHALLOW-001");
         assert_eq!(error.context()["commit_hash"], json!(shallow_head));
     }
 
-    /// PC45's `first_parent` counterpart (used by `--include-deleted`): a
-    /// shallow ancestor on the first-parent chain is skipped and the walk keeps
+    /// PC45's include-deleted path uses the same linear traversal: a shallow
+    /// ancestor is skipped and the walk keeps
     /// going through commits beyond it.
     #[test]
-    fn pc45_first_parent_tolerant_skips_a_shallow_ancestor() {
+    fn pc45_linear_walk_allow_shallowed_skips_a_shallow_ancestor() {
         let fixture = Fixture::new();
         let root_tree = fixture.tree(Vec::new());
         let root = fixture.commit("root", &root_tree, Vec::new());
@@ -1556,7 +1490,7 @@ mod tests {
         let head = fixture.commit("head", &head_tree, vec![shallow_mid.clone()]);
 
         let (history, shallow_skipped) = HistoryReader::new(&fixture.kio_dir)
-            .first_parent_tolerant(&head)
+            .walk_allow_shallowed(&head)
             .unwrap();
         assert_eq!(shallow_skipped, vec![shallow_mid]);
         assert!(history.node(&root).is_some());
@@ -1573,41 +1507,26 @@ mod tests {
         let missing_parent = hash_bytes(b"pc45-missing-commit");
         let head = fixture.commit("head", &tree, vec![missing_parent.clone()]);
         let error = HistoryReader::new(&fixture.kio_dir)
-            .all_parents_tolerant(&head)
+            .walk_allow_shallowed(&head)
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
     }
 
-    /// Two independent branches each carrying a shallow ancestor still merge
-    /// and topologically resolve correctly (the `ancestor_most_introductions`
-    /// generalization holds even with multiple boundary nodes, and duplicate
-    /// shallow hashes reached via different paths are deduped).
     #[test]
-    fn pc45_tolerant_walk_handles_shallow_ancestors_on_both_merge_branches() {
+    fn pc45_tolerant_walk_handles_one_shallow_ancestor() {
         let fixture = Fixture::new();
         let empty = fixture.tree(Vec::new());
         let root = fixture.commit("root", &empty, Vec::new());
-        let missing_tree_left = hash_bytes(b"pc45-merge-left-missing");
-        let missing_tree_right = hash_bytes(b"pc45-merge-right-missing");
-        let shallow_left = fixture.commit("shallow-left", &missing_tree_left, vec![root.clone()]);
-        fixture.shallow_receipt(shallow_left.clone(), missing_tree_left);
-        let shallow_right =
-            fixture.commit("shallow-right", &missing_tree_right, vec![root.clone()]);
-        fixture.shallow_receipt(shallow_right.clone(), missing_tree_right);
-        let merge = fixture.commit(
-            "merge",
-            &empty,
-            vec![shallow_left.clone(), shallow_right.clone()],
-        );
+        let missing_tree = hash_bytes(b"pc45-linear-missing");
+        let shallow = fixture.commit("shallow", &missing_tree, vec![root.clone()]);
+        fixture.shallow_receipt(shallow.clone(), missing_tree);
+        let head = fixture.commit("head", &empty, vec![shallow.clone()]);
 
-        let (graph, mut shallow_skipped) = HistoryReader::new(&fixture.kio_dir)
-            .all_parents_tolerant(&merge)
+        let (graph, shallow_skipped) = HistoryReader::new(&fixture.kio_dir)
+            .walk_allow_shallowed(&head)
             .unwrap();
-        shallow_skipped.sort();
-        let mut expected = vec![shallow_left, shallow_right];
-        expected.sort();
-        assert_eq!(shallow_skipped, expected);
+        assert_eq!(shallow_skipped, vec![shallow]);
         assert!(graph.node(&root).is_some());
-        assert!(graph.node(&merge).is_some());
+        assert!(graph.node(&head).is_some());
     }
 }

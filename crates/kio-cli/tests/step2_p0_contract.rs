@@ -3,6 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use base64::Engine as _;
 use kio_adapter::catalog::{builtin_prepare_profile, standard_online_markdownize_profile};
 use kio_adapter::identity::{prompt_template_hash, tool_profile_hash};
 use kio_adapter::tool_lock::tool_lock_hash;
@@ -17,9 +18,10 @@ use kio_pipeline::prepare::{
     PreparedUnit, UnitFingerprint, UnitType, change_rate, hash_bytes, map_units, unit_ref,
 };
 use kio_pipeline::task::{
-    RetryErrorKind, TaskStatus, TaskType, idempotency_key, retry_policy,
-    task_status_from_unit_counts,
+    RetryErrorKind, TaskOutputRef, TaskStatus, TaskStore, TaskType, idempotency_key, retry_policy,
+    task_status_from_unit_counts, validate_task_output_ref,
 };
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -108,6 +110,7 @@ fn prepared_page(order: u64, key: &str, fp: &str) -> PreparedUnit {
         unit_key: key.to_owned(),
         unit_type: UnitType::Page,
         prepared_hash: format!("sha256:{:0<64}", fp),
+        preparation_profile_hash: "sha256:test-prepare-profile".to_owned(),
         fingerprint: UnitFingerprint {
             perceptual_hash: fp.to_owned(),
             text_hash: fp.to_owned(),
@@ -132,6 +135,7 @@ fn markdown_unit(key: &str, text: &str) -> kio_adapter::types::MarkdownUnit {
             format!("{text}\n")
         },
         metadata: BTreeMap::new(),
+        owned_image_hashes: Default::default(),
     }
 }
 
@@ -173,6 +177,18 @@ fn scope() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     kio(&dir, ["init"]).assert().success();
     dir
+}
+
+/// Only paid-provider or budget fixtures initialize the device ledger. Read-only
+/// and local-only fixtures deliberately retain the missing-ledger state.
+fn initialize_paid_ledger(dir: &TempDir) {
+    kio(dir, ["ledger", "init"]).assert().success();
+}
+
+/// Paid/mock fixtures must grant adapters explicitly; indexing never creates an
+/// egress grant as a side effect.
+fn approve_all_adapters(dir: &TempDir) {
+    json_success(dir, ["adapter", "approve", "--all", "--yes"]);
 }
 
 fn kio<const N: usize>(dir: &TempDir, args: [&str; N]) -> Command {
@@ -278,6 +294,14 @@ fn fake_pdf(pages: &[&str]) -> String {
     out
 }
 
+/// A complete, decodable 1×1 PNG. Image ingestion now validates the complete
+/// container before it reaches the online OCR fixture path.
+fn valid_png() -> Vec<u8> {
+    base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=")
+        .expect("static valid PNG fixture")
+}
+
 fn fake_pdf_stream_strings(pages: Vec<Vec<&str>>) -> String {
     let kids = (0..pages.len())
         .map(|index| format!("{} 0 R", index + 2))
@@ -318,14 +342,15 @@ fn normalized_units(dir: &TempDir) -> Vec<NormalizedUnitObject> {
 /// Every `cost_ledger` row (04-pipeline.md §5.4), shaped like the retired
 /// JSONL `MonthlyCostLedgerEntry` (`month`/`scope_id`/`adapter_kind`/`usd`) so
 /// existing filters/assertions need no restructuring — only the `adapter_kind`
-/// values changed (CL61's "markdown"→"markdownize" rename). `LedgerDb::open`
-/// creates the (empty) schema if the file does not exist yet, matching the old
-/// helper's `unwrap_or_default()` on a missing file.
+/// values changed (CL61's "markdown"→"markdownize" rename). A missing ledger
+/// stays missing; this observation helper never initializes one.
 fn ledger_lines(dir: &TempDir) -> Vec<Value> {
     let path = dir.path().join(".test-data/kio/cost-ledger.sqlite");
-    let db = kio_pipeline::ledger::LedgerDb::open(&path).unwrap();
-    let mut stmt = db
-        .connection()
+    if !path.exists() {
+        return Vec::new();
+    }
+    let conn = Connection::open(&path).unwrap();
+    let mut stmt = conn
         .prepare("SELECT scope_id, adapter_kind, usd, month FROM cost_ledger ORDER BY recorded_at, submission_seq")
         .unwrap();
     let rows = stmt
@@ -447,6 +472,8 @@ fn ct2_unit_003_manifest_schema_and_status() {
             status: UnitStatus::Failed,
             prepared_hash:
                 "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_owned(),
+            preparation_profile_hash:
+                "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
             error_kind: Some("invalid_input".to_owned()),
             unit_object_hash: None,
         }],
@@ -595,11 +622,14 @@ fn ct2_incr_008_identity_vector_ignores_mode() {
         raw_hash: raw.to_owned(),
         prepared_hash: "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
             .to_owned(),
+        preparation_profile_hash:
+            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_owned(),
         tool_profile_hash: tool.to_owned(),
         r#gen: 0,
         mode: MarkdownizeMode::Full,
         markdown: "full".to_owned(),
         metadata: BTreeMap::new(),
+        owned_image_hashes: Default::default(),
         reused_from: None,
         generated_at: "2026-04-25T12:00:00Z".to_owned(),
     };
@@ -694,12 +724,14 @@ fn ct2_accept_006_full_mode_uses_full_contract() {
 #[test]
 fn ct2_accept_007_reject_triggers_full_fallback_path() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&["p1", "p2", "p3", "p4", "p5"]),
     )
     .unwrap();
-    kio(&dir, ["index", "--approve"])
+    kio(&dir, ["index", "--yes"])
         .env("KIO_TEST_MARKDOWNIZE_ADAPTER", "reject_incremental")
         .assert()
         .success();
@@ -729,6 +761,8 @@ fn ct2_accept_007_reject_triggers_full_fallback_path() {
 #[test]
 fn ct2_accept_008_full_fallback_failure_is_per_candidate_partial_exit() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(
         dir.path().join("a_report.pdf"),
         fake_pdf(&["p1", "p2", "p3", "p4"]),
@@ -737,7 +771,7 @@ fn ct2_accept_008_full_fallback_failure_is_per_candidate_partial_exit() {
     fs::write(dir.path().join("z.txt"), "stable").unwrap();
     json_success_with_env(
         &dir,
-        ["index", "--approve"],
+        ["index", "--yes"],
         &[("KIO_TEST_MARKDOWNIZE_ADAPTER", "incremental")],
     );
 
@@ -814,7 +848,7 @@ fn ct2_task_002_retry_budget_matrix() {
 fn ct2_task_003_idempotency_key_is_stable() {
     let dir = scope();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     let before = collect_files(&dir.path().join(".kio/objects/normalized_units"));
     json_success(&dir, ["index", "--yes"]);
     let after = collect_files(&dir.path().join(".kio/objects/normalized_units"));
@@ -874,6 +908,8 @@ fn ct2_budget_003_override_budget_ignores_caps() {
 #[test]
 fn ct2_budget_004_cli_cap_zero_pauses_online_task() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(
         dir.path().join(".kio/config.toml"),
         "[budget]\nmonthly_usd_cap = 0\n",
@@ -883,7 +919,7 @@ fn ct2_budget_004_cli_cap_zero_pauses_online_task() {
     // online-lifecycle fixture is a PDF (the test's intent is budget/pause, not
     // media routing).
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello budget"])).unwrap();
-    let output = json_success(&dir, ["index", "--approve"]);
+    let output = json_success(&dir, ["index", "--yes"]);
     assert!(output["paused_tasks"].as_u64().unwrap() > 0);
     let status = json_success(&dir, ["status"]);
     assert!(status["tasks"].as_array().unwrap().iter().any(|task| {
@@ -894,11 +930,12 @@ fn ct2_budget_004_cli_cap_zero_pauses_online_task() {
 }
 
 #[test]
-fn ct2_approve_001_noninteractive_index_without_approval_exits_2() {
+fn ct2_management_grant_allows_noninteractive_local_index_without_an_egress_grant() {
     let dir = scope();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
-    let error = json_failure(&dir, ["index"], 2);
-    assert_eq!(error["error_code"], "KIO-E-CONFIG-USAGE-001");
+    let output = json_success(&dir, ["index"]);
+    assert_eq!(output["status"], "indexed");
+    assert_eq!(output["network_allowed"], false);
 }
 
 // R11-1: derive-path (`#[derive(Args)]`) commands routed clap's usage error
@@ -959,11 +996,20 @@ fn r11_1_help_and_version_still_exit_zero() {
 fn ct2_approve_002_preview_writes_nothing() {
     let dir = scope();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
-    let before = head(&dir);
-    let preview = json_success(&dir, ["index", "--preview"]);
-    assert_eq!(preview["status"], "preview");
-    assert_eq!(head(&dir), before);
-    assert!(!dir.path().join(".kio/approvals.jsonl").exists());
+    let before_head = head(&dir);
+    let scope_bytes = fs::read(dir.path().join(".kio/scope.json")).unwrap();
+    json_success(&dir, ["adapter", "approve", "--all", "--preview"]);
+    assert_eq!(head(&dir), before_head);
+    assert_eq!(
+        fs::read(dir.path().join(".kio/scope.json")).unwrap(),
+        scope_bytes
+    );
+    let scope: Value = serde_json::from_slice(&scope_bytes).unwrap();
+    assert!(!scope["approvals"].as_array().is_some_and(|approvals| {
+        approvals
+            .iter()
+            .any(|approval| approval["status"] == "active")
+    }));
 }
 
 #[test]
@@ -991,12 +1037,24 @@ fn ct2_approve_003_preview_required_fields() {
 }
 
 #[test]
-fn ct2_approve_004_approve_records_and_starts_index() {
+fn ct2_approve_004_adapter_approve_records_before_index() {
     let dir = scope();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
-    let output = json_success(&dir, ["index", "--approve"]);
-    assert_eq!(output["approval_method"], "approve");
-    assert!(dir.path().join(".kio/approvals.jsonl").is_file());
+    json_success(&dir, ["adapter", "approve", "--all", "--yes"]);
+    let scope: Value =
+        serde_json::from_slice(&fs::read(dir.path().join(".kio/scope.json")).unwrap()).unwrap();
+    assert!(
+        scope["approvals"]
+            .as_array()
+            .is_some_and(|approvals| { approvals.iter().any(|row| row["status"] == "active") })
+    );
+    let scope_bytes = fs::read(dir.path().join(".kio/scope.json")).unwrap();
+    json_success(&dir, ["adapter", "status"]);
+    assert_eq!(
+        fs::read(dir.path().join(".kio/scope.json")).unwrap(),
+        scope_bytes
+    );
+    let output = json_success(&dir, ["index", "--yes"]);
     assert!(output["commit_hash"].as_str().is_some());
 }
 
@@ -1090,7 +1148,7 @@ fn ct2_secrets_003_tier_b_local_but_online_held() {
 fn ct2_secrets_004_added_tier_a_is_quarantined() {
     let dir = scope();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     fs::write(dir.path().join(".env"), "TOKEN=x").unwrap();
     fs::write(dir.path().join("b.txt"), "force commit").unwrap();
     let output = json_success(&dir, ["index", "--yes"]);
@@ -1202,7 +1260,7 @@ fn ct2_ignore_002_scope_ignore_config_is_accepted_and_applied() {
     );
 
     // A full index also validates the schema and must succeed.
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
 }
 
 #[test]
@@ -1214,9 +1272,9 @@ fn ct2_scope_001_subfolder_files_do_not_reach_parent_artifacts() {
     let child_hash = hash_bytes(b"child private");
 
     #[cfg(not(windows))]
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     #[cfg(windows)]
-    let index_output = json_code_stdout_with_env(&dir, ["index", "--approve"], 3, &[]);
+    let index_output = json_code_stdout_with_env(&dir, ["index", "--yes"], 3, &[]);
 
     #[cfg(windows)]
     {
@@ -1252,36 +1310,31 @@ fn ct2_scope_001_subfolder_files_do_not_reach_parent_artifacts() {
     assert!(!object_text.contains(&child_hash));
     assert!(!object_text.contains("child private"));
 
-    // P2b indexes a discovered child as its own scope. The device ledger is
-    // intentionally global, so it now contains the parent's and child's
-    // independent baseline entries. Filter by scope identity before asserting
-    // the parent-boundary contract.
-    let parent_scope_id =
-        serde_json::from_slice::<Value>(&fs::read(dir.path().join(".kio/scope.json")).unwrap())
-            .unwrap()["scope_id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-    let ledger = ledger_lines(&dir);
+    // Local baselines retain provenance in each scope's immutable objects.
+    // They create no fictional billing rows in the device-global ledger.
+    assert!(ledger_lines(&dir).is_empty());
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
+    );
     #[cfg(not(windows))]
-    assert_eq!(ledger.len(), 2);
-    #[cfg(windows)]
-    assert_eq!(ledger.len(), 1);
-    let parent_ledger = ledger
-        .iter()
-        .filter(|entry| entry["scope_id"] == parent_scope_id)
-        .collect::<Vec<_>>();
-    assert_eq!(parent_ledger.len(), 1);
+    {
+        let child = dir.path().join("child/.kio");
+        assert!(child.join("HEAD").is_file());
+        let child_raw = kio_core::cas::fanout_path(child.join("objects/raw"), &child_hash).unwrap();
+        assert_eq!(fs::read(child_raw).unwrap(), b"child private");
+    }
 }
 
 #[test]
 fn ct2_network_001_yes_does_not_issue_online_tasks() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
     // R9-2: only non-text-native files enqueue online tasks; PDF fixture keeps the
     // network-opt-in lifecycle intent.
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
     let output = json_success(&dir, ["index", "--yes"]);
-    assert_eq!(output["network_opt_in"], false);
     assert!(output["pending_online_tasks"].as_u64().unwrap() > 0);
     let status = json_success(&dir, ["status"]);
     assert!(status["tasks"].as_array().unwrap().iter().any(|task| {
@@ -1292,107 +1345,103 @@ fn ct2_network_001_yes_does_not_issue_online_tasks() {
 }
 
 #[test]
-fn ct2_network_002_approve_grants_opt_in_yes_does_not() {
-    // R9-2: PDF fixtures so the online opt-in / ready_for_online_adapter task path
+fn ct2_network_002_adapter_approval_grants_egress_yes_does_not() {
+    // R9-2: PDF fixtures so the adapter-approval / ready_for_online_adapter task path
     // is exercised (text-native files no longer enqueue online tasks).
     let yes_dir = scope();
+    initialize_paid_ledger(&yes_dir);
     fs::write(yes_dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
-    assert_eq!(
-        json_success(&yes_dir, ["index", "--yes"])["network_opt_in"],
-        false
-    );
+    json_success(&yes_dir, ["index", "--yes"]);
+    let yes_scope: Value =
+        serde_json::from_slice(&fs::read(yes_dir.path().join(".kio/scope.json")).unwrap()).unwrap();
+    assert!(!yes_scope["approvals"].as_array().is_some_and(|approvals| {
+        approvals
+            .iter()
+            .any(|approval| approval["status"] == "active")
+    }));
 
     let approve_dir = scope();
+    initialize_paid_ledger(&approve_dir);
     fs::write(approve_dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
-    assert_eq!(
-        json_success(&approve_dir, ["index", "--approve"])["network_opt_in"],
-        true
+    // Grant the current profile, then require that exact device-and-scope grant
+    // for an explicit HTTP invocation. `--online` is only a route selection.
+    approve_all_adapters(&approve_dir);
+    json_success(&approve_dir, ["index", "--yes", "--online"]);
+    let approved = json_success(&approve_dir, ["adapter", "status"]);
+    assert!(
+        approved["effective"]
+            .as_array()
+            .is_some_and(|effective| { effective.iter().any(|grant| grant["permitted"] == true) })
     );
 
     let online_dir = scope();
+    initialize_paid_ledger(&online_dir);
     fs::write(online_dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
-    let error = json_failure(&online_dir, ["index", "--online"], 2);
+    let error = json_failure(&online_dir, ["index", "--yes", "--online"], 2);
     assert_eq!(error["error_code"], "KIO-E-CONFIG-USAGE-001");
-    assert_eq!(
-        json_success(&online_dir, ["index", "--yes", "--online"])["network_opt_in"],
-        false
-    );
-    // R10-7: `--yes --online` grants NO persistent opt-in, and online markdownize can
-    // only be driven by `batch` (which gates on the persistent opt-in). So the task
-    // is NOT actually sendable — it must report `network_opt_in_required`, not a false
-    // `ready_for_online_adapter` that no `batch resume` could ever fulfill.
     assert!(
-        json_success(&online_dir, ["status"])["tasks"]
+        error["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("active external-send approval"))
+    );
+    // Invocation-local `--online` never creates a persistent adapter grant.
+    let online_scope: Value =
+        serde_json::from_slice(&fs::read(online_dir.path().join(".kio/scope.json")).unwrap())
+            .unwrap();
+    assert!(
+        !online_scope["approvals"]
+            .as_array()
+            .is_some_and(|approvals| {
+                approvals
+                    .iter()
+                    .any(|approval| approval["status"] == "active")
+            })
+    );
+}
+
+/// Scope-local configuration selects policy, but never publishes consent.
+#[test]
+fn ct2_network_004_scope_local_config_does_not_publish_approval() {
+    let dir = scope();
+    initialize_paid_ledger(&dir);
+    fs::write(
+        dir.path().join(".kio/config.toml"),
+        "[adapter.policy]\nallow_network = true\n",
+    )
+    .unwrap();
+    fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
+    let before: Value =
+        serde_json::from_slice(&fs::read(dir.path().join(".kio/scope.json")).unwrap()).unwrap();
+    json_success(&dir, ["index", "--yes"]);
+    let after: Value =
+        serde_json::from_slice(&fs::read(dir.path().join(".kio/scope.json")).unwrap()).unwrap();
+    assert_eq!(after["approvals"], before["approvals"]);
+    let status = json_success(&dir, ["status"]);
+    assert!(
+        status["tasks"]
             .as_array()
             .unwrap()
             .iter()
             .any(|task| task["input_path"] == "a.pdf"
                 && task["fallback_reason"] == "network_opt_in_required")
     );
-    assert!(
-        !json_success(&online_dir, ["status"])["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|task| task["fallback_reason"] == "ready_for_online_adapter")
-    );
-    let approvals = fs::read_to_string(online_dir.path().join(".kio/approvals.jsonl")).unwrap();
-    assert!(approvals.contains(r#""network_opt_in":false"#));
-}
-
-/// QA21 (step4b-contract-tests-p3a.md §G, 07-adapter-spec.md §3 L106-112/
-/// 176-190, 2026-07-22 orchestrator ruling): a scope-local
-/// `.kio/config.toml` `allow_network = true` pre-set on a genuinely fresh
-/// scope (no `approvals[]` row, no `approvals_initialized` marker) DOES
-/// bootstrap the first-ever tool's opt-in via the "初回 materialize"
-/// exception — even under `--yes` (which never itself WRITES the boolean,
-/// but does not block a pre-existing one from being observed at gate-check
-/// time).
-///
-/// This test used to assert the opposite (named
-/// `..._portable_scope_config_cannot_grant_network_consent`) on the theory
-/// that scope-local config is "portable" `.kio` content and must never
-/// unilaterally grant network authority. That defense was reconsidered and
-/// rejected: 07 §3's (b) path is explicit that THIS file/key is the
-/// materialize trigger, and a crafted `.kio` could ship the `approvals[]`
-/// row directly instead of relying on materialize at all — gating the
-/// trigger to a different (e.g. device-global) file blocks nothing a
-/// motivated attacker cannot route around, while breaking the spec's
-/// documented (b) UX for every legitimate scope-local-only user.
-#[test]
-fn ct2_network_004_scope_local_config_bootstraps_first_tool_via_materialize() {
-    let dir = scope();
-    fs::write(
-        dir.path().join(".kio/config.toml"),
-        "[adapter.policy]\nallow_network = true\n",
-    )
-    .unwrap();
-    // R9-2: PDF fixture keeps the online-adapter enqueue path (text-native files
-    // no longer enqueue online tasks).
-    fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
-    let output = json_success(&dir, ["index", "--yes"]);
-    assert_eq!(output["network_opt_in"], true);
-    let scope: Value =
-        serde_json::from_str(&fs::read_to_string(dir.path().join(".kio/scope.json")).unwrap())
-            .unwrap();
-    let approvals = scope["approvals"]
-        .as_array()
-        .expect("approvals[] must exist after materialize");
-    assert_eq!(approvals.len(), 1);
-    assert_eq!(approvals[0]["approval_method"], "materialize");
-    assert_eq!(approvals[0]["status"], "active");
+    assert!(ledger_lines(&dir).is_empty());
 }
 
 #[test]
-fn ct2_network_003_revoke_blocks_online_one_shot() {
+fn ct2_network_003_adapter_revoke_blocks_future_online_work() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
-    json_success(&dir, ["index", "--revoke-network"]);
+    json_success(&dir, ["index", "--yes"]);
+    json_success(&dir, ["adapter", "revoke", "--all"]);
     // R9-2: the post-revoke online-task subject is a PDF (non-text-native).
     fs::write(dir.path().join("b.pdf"), fake_pdf(&["new after revoke"])).unwrap();
-    let output = json_success(&dir, ["index", "--yes", "--online"]);
-    assert_eq!(output["network_opt_in"], false);
+    let before_head = fs::read(dir.path().join(".kio/HEAD")).unwrap();
+    json_success(&dir, ["index", "--yes"]);
+    assert_ne!(fs::read(dir.path().join(".kio/HEAD")).unwrap(), before_head);
+    json_success(&dir, ["index", "--offline"]);
     let status = json_success(&dir, ["status"]);
     assert!(status["tasks"].as_array().unwrap().iter().any(|task| {
         task["input_path"] == "b.pdf"
@@ -1405,7 +1454,7 @@ fn ct2_network_003_revoke_blocks_online_one_shot() {
 fn ct2_adapter_001_baseline_index_without_key() {
     let dir = scope();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
-    let output = json_success(&dir, ["index", "--approve"]);
+    let output = json_success(&dir, ["index", "--yes"]);
     assert_eq!(output["status"], "indexed");
     assert!(dir.path().join(".kio/objects/normalized_units").is_dir());
 }
@@ -1426,7 +1475,7 @@ fn ct2_pdf_001_two_page_pdf_produces_page_specific_markdown() {
         fake_pdf(&["First page text", "Second page text"]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     let units = normalized_units(&dir);
     let page1 = units.iter().find(|unit| unit.unit_key == "page:1").unwrap();
     let page2 = units.iter().find(|unit| unit.unit_key == "page:2").unwrap();
@@ -1447,7 +1496,7 @@ fn ct2_pdf_002_uneven_three_page_pdf_preserves_stream_boundaries() {
         ]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     let units = normalized_units(&dir);
     let page1 = units.iter().find(|unit| unit.unit_key == "page:1").unwrap();
     let page2 = units.iter().find(|unit| unit.unit_key == "page:2").unwrap();
@@ -1478,7 +1527,7 @@ fn ct2_pdf_003_endstream_keyword_in_page_text_is_not_a_stream_boundary() {
         ]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     let units = normalized_units(&dir);
     let page1 = units.iter().find(|unit| unit.unit_key == "page:1").unwrap();
     let page2 = units.iter().find(|unit| unit.unit_key == "page:2").unwrap();
@@ -1500,12 +1549,14 @@ fn ct2_pdf_003_endstream_keyword_in_page_text_is_not_a_stream_boundary() {
 #[test]
 fn ct2_incr_009_cli_mock_adapter_uses_incremental_for_light_change() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&["p1", "p2", "p3", "p4", "p5"]),
     )
     .unwrap();
-    kio(&dir, ["index", "--approve"])
+    kio(&dir, ["index", "--yes"])
         .env("KIO_TEST_MARKDOWNIZE_ADAPTER", "incremental")
         .assert()
         .success();
@@ -1538,10 +1589,12 @@ fn ct2_incr_009_cli_mock_adapter_uses_incremental_for_light_change() {
 #[test]
 fn ct2_adapter_013_baseline_and_ai_artifacts_coexist() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     // R9-2: only non-text-native files enqueue an online task, so the coexistence
     // fixture (baseline + online-AI artifacts) is a PDF.
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     let baseline_root = dir.path().join(".kio/objects/normalized_units");
     let before = collect_files(&baseline_root);
     kio(&dir, ["batch", "resume"])
@@ -1559,10 +1612,12 @@ fn ct2_adapter_013_baseline_and_ai_artifacts_coexist() {
 #[test]
 fn ct2_budget_005_online_success_records_ledger_and_caps_next_task() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     // R9-2: online-cost lifecycle uses PDF fixtures (text-native files are baseline
     // only, no online task).
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello online cost"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     json_success_with_env(
         &dir,
         ["batch", "resume"],
@@ -1609,9 +1664,11 @@ fn ct2_budget_005_online_success_records_ledger_and_caps_next_task() {
 #[test]
 fn r11_2_batch_resume_budget_pause_exits_6() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["budget pause body"])).unwrap();
-    // `--approve` records a persistent opt-in, so the online task is Pending-ready.
-    json_success(&dir, ["index", "--approve"]);
+    // The explicit adapter grant makes the online task Pending-ready.
+    json_success(&dir, ["index", "--yes"]);
     // Zero the markdownize per_adapter cap so the pending online send is over budget
     // on resume. CL57 (04 §5.4): per_adapter is DEVICE-layer only ("folder cap は
     // total のみ") — `ops::check_then_reserve`'s third condition reads
@@ -1652,39 +1709,23 @@ fn r11_2_batch_resume_budget_pause_exits_6() {
     );
 }
 
-// F1 (04 §5.4): offline/deterministic markdownize is billed at unit price 0, so
-// free local indexing never consumes the device USD budget cap. Before the fix
-// the baseline row carried `usd = $0.01/MB`; because `device_spent` sums every
-// adapter_kind, that counted against the device cap and could silently pause
-// paid enrichment (and inflate `status.budget.device_spent_usd`).
+// Local indexing records knowledge provenance in the scope, with no billing
+// authority creation and no fictional zero-cost ledger entries.
 #[test]
-fn f1_offline_baseline_records_zero_usd_and_does_not_consume_budget() {
+fn f1_offline_baseline_never_creates_a_ledger() {
     let dir = scope();
     fs::write(dir.path().join("a.txt"), "hello offline baseline cost").unwrap();
     json_success(&dir, ["index", "--offline", "--yes"]);
-
-    let baseline: Vec<_> = ledger_lines(&dir)
-        .into_iter()
-        .filter(|entry| entry["adapter_kind"] == "deterministic_baseline")
-        .collect();
-    assert!(
-        !baseline.is_empty(),
-        "offline index must still record a deterministic_baseline row (provenance)"
-    );
-    assert!(
-        baseline
-            .iter()
-            .all(|entry| entry["usd"].as_f64() == Some(0.0)),
-        "deterministic_baseline usd must be 0.0: {baseline:?}"
-    );
-
-    // Free local work must not lower the remaining device budget.
+    assert!(!normalized_units(&dir).is_empty());
+    assert!(ledger_lines(&dir).is_empty());
     let status = json_success(&dir, ["status"]);
-    assert_eq!(status["budget"]["device_spent_usd"].as_f64(), Some(0.0));
-    assert_eq!(
-        status["budget"]["device_remaining_usd"].as_f64(),
-        status["budget"]["device_monthly_usd_cap"].as_f64(),
-        "device remaining must equal the full cap after free local indexing"
+    assert_eq!(status["budget"]["ledger_status"], "uninitialized");
+    assert_eq!(status["budget"]["device_spent_usd"], Value::Null);
+    assert_eq!(status["budget"]["device_remaining_usd"], Value::Null);
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
     );
 }
 
@@ -1694,6 +1735,8 @@ fn f1_offline_baseline_records_zero_usd_and_does_not_consume_budget() {
 #[test]
 fn f5_soft_stop_runs_over_cap_and_records_charge() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     // R9-2: the over-cap online-task fixture is a PDF (text-native files enqueue no
     // online task, so there would be nothing to soft-stop).
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["soft stop body"])).unwrap();
@@ -1703,7 +1746,7 @@ fn f5_soft_stop_runs_over_cap_and_records_charge() {
         "[budget]\nmonthly_usd_cap = 0\nhard_stop = false\n",
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     let after_index = json_success(&dir, ["status"]);
     assert!(
         !after_index["tasks"]
@@ -1756,9 +1799,9 @@ fn f5_warn_at_percent_surfaces_non_blocking_warning() {
     // not exercise a migration reader or an alternate ledger format.
     let ledger_path = dir.path().join(".test-data/kio/cost-ledger.sqlite");
     fs::create_dir_all(ledger_path.parent().unwrap()).unwrap();
-    kio_pipeline::ledger::LedgerDb::open(&ledger_path)
+    kio_pipeline::ledger::LedgerDb::initialize(&ledger_path).unwrap();
+    Connection::open(&ledger_path)
         .unwrap()
-        .connection()
         .execute(
             "INSERT INTO cost_ledger (scope_id, adapter_kind, input_hash, tool_profile_hash, \
              submission_seq, batch_job_id, usd, estimated, outcome, month, recorded_at) \
@@ -1802,6 +1845,8 @@ fn f5_warn_at_percent_surfaces_non_blocking_warning() {
 #[test]
 fn f5_default_hard_stop_pauses_over_cap() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     // R9-2: the over-cap online-task fixture is a PDF (text-native files enqueue no
     // online task, so there would be nothing to pause).
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hard stop body"])).unwrap();
@@ -1811,7 +1856,7 @@ fn f5_default_hard_stop_pauses_over_cap() {
         "[budget]\nmonthly_usd_cap = 0\n",
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     let status = json_success(&dir, ["status"]);
     assert!(
         status["tasks"].as_array().unwrap().iter().any(|task| {
@@ -1828,10 +1873,12 @@ fn f5_default_hard_stop_pauses_over_cap() {
 #[test]
 fn ct2_image_003_cli_mock_preserves_links_when_replacing_images() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     // R9-2: image-link replacement happens on the online OCR path, only reached by
     // non-text-native files → PDF fixture.
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello image link"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     json_success_with_env(
         &dir,
         ["batch", "resume"],
@@ -1854,6 +1901,8 @@ fn ct2_image_003_cli_mock_preserves_links_when_replacing_images() {
 #[test]
 fn w2_related_images_are_derived_from_chunk_bodies_and_omitted_when_absent() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     // R9-2: image-link replacement only happens on the online OCR path, which
     // non-text-native files reach → PDF fixture.
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello image link"])).unwrap();
@@ -1862,7 +1911,7 @@ fn w2_related_images_are_derived_from_chunk_bodies_and_omitted_when_absent() {
         "# plain\n\nplaintextmarker has no figures at all.\n",
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     json_success_with_env(
         &dir,
         ["batch", "resume"],
@@ -1917,9 +1966,11 @@ fn w2_related_images_are_derived_from_chunk_bodies_and_omitted_when_absent() {
 #[test]
 fn ct2_task_005_auth_error_task_is_not_retried() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     // R9-2: online-task retry lifecycle uses a PDF fixture (non-text-native).
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello auth"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     // R11-2: an auth failure driven this pass → docs/04 §5.6 exit 5, result on stdout.
     let resumed = json_code_stdout_with_env(
         &dir,
@@ -1959,10 +2010,12 @@ fn ct2_task_009_failed_online_task_is_not_reenqueued_by_reindex() {
     // 未変更ファイルを再 index しても、新しい Pending online task が積まれて
     // backoff ゲートを迂回できないこと (Pending の再試行は batch retry の責務)。
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     // R9-2: PDF fixture so a retryable online task exists to guard against reindex
     // re-enqueue.
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello dedup"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     // R11-2: a retryable (rate_limit) failure driven this pass → exit 3 (some
     // retryable work remains), result on stdout.
     json_code_stdout_with_env(
@@ -1998,17 +2051,23 @@ fn ct2_task_009_failed_online_task_is_not_reenqueued_by_reindex() {
 #[test]
 fn ct2_task_006_partial_online_result_persists_partial_status() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&["partial one", "partial two"]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
-    json_success_with_env(
+    json_success(&dir, ["index", "--yes"]);
+    let resumed = json_code_stdout_with_env(
         &dir,
         ["batch", "resume"],
-        &[(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial")],
+        3,
+        &[(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial_network")],
     );
+    assert_eq!(resumed["tasks_attempted"], 1);
+    assert_eq!(resumed["tasks_executed"], 0);
+    assert_eq!(resumed["tasks_failed"], 1);
     let status = json_success(&dir, ["status"]);
     assert!(status["tasks"].as_array().unwrap().iter().any(|task| {
         task["input_path"] == "report.pdf"
@@ -2018,32 +2077,37 @@ fn ct2_task_006_partial_online_result_persists_partial_status() {
 }
 
 /// R9-4: a Partial online markdownize task must be recoverable — `batch retry`
-/// completes its Failed units and drives it to Done (docs/04 §5.2 `partial ->
-/// done`), and `index_status` counts a Partial as incomplete rather than falsely
-/// reporting 100% enrichment. Pre-fix Partial was a dead-end (retry/resume/reindex
-/// all ignored it) and `index_status` showed enriched_ratio 1.0 / pending 0 — a
-/// silent data gap.
+/// completes its Failed units and drives it to Done, and `index_status` counts it
+/// as incomplete rather than falsely reporting full enrichment.
 #[test]
 fn r9_4_partial_task_recovers_via_retry_and_status_counts_it() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&["page one alpha", "page two beta"]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
-    // The `partial` seam drops the last page → a Partial online task.
-    json_success_with_env(
+    json_success(&dir, ["index", "--yes"]);
+    // `partial_network` keeps one accepted unit and explicitly declares the other
+    // as retryable. A dropped output without that declaration is a contract violation.
+    let first = json_code_stdout_with_env(
         &dir,
         ["batch", "resume"],
-        &[(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial")],
+        3,
+        &[
+            (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial_network"),
+            ("KIO_FIXED_NOW", "2026-07-03T00:00:00Z"),
+        ],
     );
+    assert_eq!(first["tasks_failed"], 1);
     let has_partial = |status: &Value| {
-        status["tasks"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|task| task["input_path"] == "report.pdf" && task["status"] == "partial")
+        status["tasks"].as_array().unwrap().iter().any(|task| {
+            task["input_path"] == "report.pdf"
+                && task["status"] == "partial"
+                && task["fallback_reason"] == "online_adapter_done"
+        })
     };
     assert!(has_partial(&json_success(&dir, ["status"])));
     // index_status (surfaced by search) must NOT claim full enrichment while a unit
@@ -2065,7 +2129,10 @@ fn r9_4_partial_task_recovers_via_retry_and_status_counts_it() {
     let retry = json_success_with_env(
         &dir,
         ["batch", "retry"],
-        &[(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")],
+        &[
+            (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock"),
+            ("KIO_FIXED_NOW", "2026-07-03T01:00:00Z"),
+        ],
     );
     assert!(
         retry["tasks_updated"].as_u64().unwrap() >= 1,
@@ -2088,34 +2155,41 @@ fn r9_4_partial_task_recovers_via_retry_and_status_counts_it() {
     );
 }
 
-/// A one-unit OCR-from-scratch response can lose its only normalized output. That
-/// total coverage miss must remain a retryable network failure with the online
-/// placeholder intact; treating it as a permanent contract violation strands every
-/// standalone image because there is no Partial manifest with a Done unit to retain.
+/// A one-unit OCR-from-scratch response with an explicit provider-declared network
+/// failure remains retryable. A response that merely drops its output is instead a
+/// terminal contract violation and must not be reclassified as a network failure.
 #[test]
 fn ct4_bbox_006_single_discovered_unit_total_miss_retries_to_done() {
     let dir = scope();
-    fs::write(
-        dir.path().join("diagram.png"),
-        b"\x89PNG\r\n\x1a\nretryable-image",
-    )
-    .unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
+    fs::write(dir.path().join("diagram.png"), valid_png()).unwrap();
+    json_success(&dir, ["index", "--yes"]);
 
     let first = json_code_stdout_with_env(
         &dir,
         ["batch", "resume"],
         3,
         &[
-            (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial"),
+            (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "all_failed_network"),
             ("KIO_FIXED_NOW", "2026-07-03T00:00:00Z"),
         ],
     );
     assert_eq!(first["tasks_failed"], 1);
     let failed = json_success(&dir, ["status"]);
-    let task = first_online_task(&failed);
+    let task = failed["tasks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|task| {
+            task["input_path"] == "diagram.png"
+                && task["type"] == "markdownize"
+                && task["status"] == "failed"
+                && task["fallback_reason"] == "online_adapter_done"
+        })
+        .expect("known failed OCR task");
     assert_eq!(task["status"], "failed");
-    assert_eq!(task["fallback_reason"], "network_error");
+    assert_eq!(task["attempts"], 1);
 
     let retry = json_success_with_env(
         &dir,
@@ -2136,29 +2210,32 @@ fn ct4_bbox_006_single_discovered_unit_total_miss_retries_to_done() {
     }));
 }
 
-/// R10-4: a Partial online markdownize task whose unit keeps failing must NOT be
-/// re-sent & re-billed forever. Each `batch retry` charges the retry budget
-/// (`attempts`++) and, once `max_attempts` is reached, the task is left Partial and
-/// no further online send is issued (`tasks_updated`/`tasks_executed` == 0). Pre-fix
-/// `attempts` stayed 0 and every retry re-sent (a fresh cost-ledger markdown row),
-/// bounded only by the monthly budget cap.
+/// R10-4: an explicit retryable online failure must not be sent forever. Each
+/// attempt consumes the NetworkError retry budget and, at its limit, no further
+/// online send is issued.
 #[test]
-fn r10_4_partial_retry_respects_budget_and_stops_resending() {
+fn r10_4_retryable_failure_respects_budget_and_stops_resending() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&["page one alpha", "page two beta"]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
-    // The `partial` seam drops the last page -> a Partial online task (attempts 0).
-    json_success_with_env(
+    json_success(&dir, ["index", "--yes"]);
+    let first = json_code_stdout_with_env(
         &dir,
         ["batch", "resume"],
-        &[(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial")],
+        3,
+        &[
+            (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "all_failed_network"),
+            ("KIO_FIXED_NOW", "2026-07-03T00:00:00Z"),
+        ],
     );
-    // A text-layer PDF has TWO markdownize tasks: the Done local baseline and the
-    // online OCR task. Track the online one — at rest it is the Partial task.
+    assert_eq!(first["tasks_failed"], 1);
+    // A known all-unit provider failure is persisted as a normalized Failed task;
+    // the manifest, rather than a task-level error reason, owns retry eligibility.
     let online_task = |status: &Value| -> Value {
         status["tasks"]
             .as_array()
@@ -2167,62 +2244,74 @@ fn r10_4_partial_retry_respects_budget_and_stops_resending() {
             .find(|task| {
                 task["input_path"] == "report.pdf"
                     && task["type"] == "markdownize"
-                    && task["status"] == "partial"
+                    && task["status"] == "failed"
+                    && task["fallback_reason"] == "online_adapter_done"
             })
             .cloned()
-            .expect("partial online markdownize task present")
+            .expect("known failed online markdownize task present")
     };
     let task0 = online_task(&json_success(&dir, ["status"]));
-    assert_eq!(task0["status"], "partial");
+    assert_eq!(task0["status"], "failed");
     let attempts0 = task0["attempts"].as_u64().unwrap();
+    assert_eq!(attempts0, 1);
 
-    // Keep retrying under the SAME still-failing (partial) seam. Attempts must climb
-    // while budget remains, then the loop must halt (no further re-enqueue / re-send).
-    let mut progressed = false;
-    let mut halted = false;
-    for _ in 0..12 {
-        let retry = json_success_with_env(
+    // Keep retrying under the same declared NetworkError. Attempts 2-4 remain
+    // retryable (exit 3); the fifth is terminal (exit 4).
+    for hour in 1..=3 {
+        let retry = json_code_stdout_with_env(
             &dir,
             ["batch", "retry"],
-            &[(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial")],
+            3,
+            &[
+                (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "all_failed_network"),
+                (
+                    "KIO_FIXED_NOW",
+                    match hour {
+                        1 => "2026-07-03T01:00:00Z",
+                        2 => "2026-07-03T02:00:00Z",
+                        3 => "2026-07-03T03:00:00Z",
+                        _ => unreachable!(),
+                    },
+                ),
+            ],
         );
-        if retry["tasks_updated"].as_u64().unwrap() >= 1 {
-            progressed = true;
-        }
-        if retry["tasks_updated"].as_u64().unwrap() == 0
-            && retry["tasks_executed"].as_u64().unwrap() == 0
-        {
-            halted = true;
-            break;
-        }
+        assert_eq!(retry["tasks_updated"], 1);
+        assert_eq!(retry["tasks_failed"], 1);
     }
-    assert!(
-        progressed,
-        "retries must progress attempts while the retry budget remains"
+    let terminal = json_code_stdout_with_env(
+        &dir,
+        ["batch", "retry"],
+        4,
+        &[
+            (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "all_failed_network"),
+            ("KIO_FIXED_NOW", "2026-07-03T04:00:00Z"),
+        ],
     );
-    assert!(
-        halted,
-        "retries must eventually stop re-sending a permanently-failing unit"
-    );
+    assert_eq!(terminal["tasks_updated"], 1);
+    assert_eq!(terminal["tasks_failed"], 1);
 
-    // The task is still Partial (never falsely Done) and attempts advanced then froze.
+    // The task is still Failed (never falsely Done) and its retry budget is exhausted.
     let task1 = online_task(&json_success(&dir, ["status"]));
     assert_eq!(
-        task1["status"], "partial",
-        "a persistently-failing unit stays Partial: {task1}"
+        task1["status"], "failed",
+        "a persistently-failing task stays Failed: {task1}"
     );
     let attempts1 = task1["attempts"].as_u64().unwrap();
-    assert!(
-        attempts1 > attempts0,
-        "attempts must have progressed: {attempts0} -> {attempts1}"
+    assert_eq!(
+        attempts1, 5,
+        "five NetworkError attempts are allowed: {task1}"
     );
+    assert!(task1["next_retry_at"].is_null());
 
     // Once halted, a further retry issues no work at all — the re-billing loop is
     // closed.
     let again = json_success_with_env(
         &dir,
         ["batch", "retry"],
-        &[(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial")],
+        &[
+            (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "all_failed_network"),
+            ("KIO_FIXED_NOW", "2026-07-03T05:00:00Z"),
+        ],
     );
     assert_eq!(
         again["tasks_updated"].as_u64().unwrap(),
@@ -2237,25 +2326,30 @@ fn r10_4_partial_retry_respects_budget_and_stops_resending() {
 }
 
 // R11-6: a unit-scoped retry re-sends and re-bills ONLY the still-failed units, not
-// the whole document, and keeps the already-done units' output verbatim
-// (first-instance-wins). Before R11-6 `unit_keys` was written but never read: every
-// retry re-sent the full document (a full-price ledger row) and regenerated the done
-// units (fingerprint churn → needless re-embedding).
+// the whole document, and keeps the already-done units' output verbatim.
 #[test]
 fn r11_6_unit_scoped_retry_prorates_cost_and_preserves_done_units() {
     let dir = scope();
-    // 3-page PDF: the `partial` seam drops the last page → page:3 fails, page:1/2 done.
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
+    // `partial_network` returns page:1/2 as Done and explicitly declares page:3
+    // retryable, yielding a genuine Partial manifest.
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&["page one alpha", "page two beta", "page three gamma"]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
-    json_success_with_env(
+    json_success(&dir, ["index", "--yes"]);
+    let first_result = json_code_stdout_with_env(
         &dir,
         ["batch", "resume"],
-        &[(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial")],
+        3,
+        &[
+            (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial_network"),
+            ("KIO_FIXED_NOW", "2026-07-03T00:00:00Z"),
+        ],
     );
+    assert_eq!(first_result["tasks_failed"], 1);
 
     let markdown_costs = |dir: &TempDir| -> Vec<f64> {
         ledger_lines(dir)
@@ -2274,7 +2368,7 @@ fn r11_6_unit_scoped_retry_prorates_cost_and_preserves_done_units() {
     );
     let full_cost = first[0];
 
-    // The online (mock) done unit for page:1 before the retry.
+    // The online done unit for page:1 before the retry.
     let online_page1 = |dir: &TempDir| -> NormalizedUnitObject {
         normalized_units(dir)
             .into_iter()
@@ -2283,13 +2377,17 @@ fn r11_6_unit_scoped_retry_prorates_cost_and_preserves_done_units() {
     };
     let before = online_page1(&dir);
 
-    // Unit-scoped retry: re-sends ONLY the still-failing page:3 → a smaller ledger row.
-    json_success_with_env(
+    // Unit-scoped retry: re-sends only page:3, retaining page:1/2.
+    let retry = json_code_stdout_with_env(
         &dir,
         ["batch", "retry"],
-        &[(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial")],
+        3,
+        &[
+            (TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "partial_network"),
+            ("KIO_FIXED_NOW", "2026-07-03T01:00:00Z"),
+        ],
     );
-
+    assert_eq!(retry["tasks_failed"], 1);
     let after_costs = markdown_costs(&dir);
     assert!(
         after_costs.len() >= 2,
@@ -2301,8 +2399,7 @@ fn r11_6_unit_scoped_retry_prorates_cost_and_preserves_done_units() {
         "unit-scoped retry ({retry_cost}) must bill less than the full document ({full_cost})"
     );
 
-    // First-instance-wins: the already-done page:1 output is unchanged across the retry
-    // (regenerating it under Markdown non-determinism would churn its fingerprint).
+    // First-instance-wins: page:1 remains unchanged across the retry.
     let after = online_page1(&dir);
     assert_eq!(
         before.markdown, after.markdown,
@@ -2317,9 +2414,11 @@ fn r11_6_unit_scoped_retry_prorates_cost_and_preserves_done_units() {
 #[test]
 fn r9_7_batch_retry_reports_failed_attempts_in_json() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(dir.path().join("report.pdf"), fake_pdf(&["body text"])).unwrap();
     // Approve network so the Pending online task is ready to send.
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     // Retry drives the Pending online task; the auth_error mock fails the send.
     // R11-2: the auth failure this pass exits 5, with the full result JSON on stdout.
     let retry = json_code_stdout_with_env(
@@ -2354,13 +2453,10 @@ fn r9_7_batch_retry_reports_failed_attempts_in_json() {
 #[test]
 fn r9_2_text_native_files_do_not_enqueue_online_ocr_task() {
     let dir = scope();
-    // Standing network opt-in so the media gate is the ONLY thing that could stop
-    // the enqueue.
-    fs::write(
-        dir.path().join(".kio/config.toml"),
-        "[adapter.policy]\nallow_network = true\n",
-    )
-    .unwrap();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
+    // The explicit adapter grant leaves the media gate as the only condition
+    // that could stop enqueueing.
     fs::write(dir.path().join("note.md"), "# Note\n\nbody text here\n").unwrap();
     fs::write(dir.path().join("main.rs"), "fn main() { let _x = 1; }\n").unwrap();
     fs::write(dir.path().join("plain.txt"), "just some plain text\n").unwrap();
@@ -2403,9 +2499,11 @@ fn ct2_task_007_online_task_not_reissued_for_completed_identity() {
     // unchanged file must not enqueue a duplicate task. The bug was a later
     // `batch resume` re-sending that duplicate and double-charging the ledger.
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     // R9-2: PDF fixture so a real online task is enqueued for the dedup guard.
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello dedup"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     json_success_with_env(
         &dir,
         ["batch", "resume"],
@@ -2490,9 +2588,11 @@ fn ct2_task_008_retryable_failure_defers_until_backoff_elapses() {
     // (exp/retry_after backoff). `batch retry` skips the task until that time
     // is reached, then executes it.
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     // R9-2: PDF fixture so a real online task exists to fail and retry.
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["hello retry backoff"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
 
     // Fail the online task with a rate-limit-like (retryable) error at T0.
     // R11-2: a retryable failure driven this pass exits 3 (result on stdout).
@@ -2561,7 +2661,7 @@ fn ct2_index_001_preview_approve_ingest_auto_snapshot() {
         json_success(&dir, ["index", "--preview"])["status"],
         "preview"
     );
-    let output = json_success(&dir, ["index", "--approve"]);
+    let output = json_success(&dir, ["index", "--yes"]);
     assert!(output["commit_hash"].as_str().is_some());
 }
 
@@ -2569,7 +2669,7 @@ fn ct2_index_001_preview_approve_ingest_auto_snapshot() {
 fn ct2_index_002_successful_index_commit_type_auto() {
     let dir = scope();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
-    let output = json_success(&dir, ["index", "--approve"]);
+    let output = json_success(&dir, ["index", "--yes"]);
     assert_eq!(output["commit"]["commit_type"], "auto");
 }
 
@@ -2577,7 +2677,7 @@ fn ct2_index_002_successful_index_commit_type_auto() {
 fn ct2_index_003_unchanged_tree_auto_snapshot_noop() {
     let dir = scope();
     fs::write(dir.path().join("a.txt"), "hello").unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     let before = head(&dir);
     let second = json_success(&dir, ["index", "--yes"]);
     assert_eq!(second["status"], "noop");
@@ -2606,84 +2706,36 @@ fn collect_files_inner(root: &Path, current: &Path, out: &mut BTreeSet<PathBuf>)
     }
 }
 
-/// R13-4: an empty or missing `.kio/HEAD` with a healthy `refs/heads/main` is a
-/// CORRUPT HEAD, not an unborn branch. Before the fix `head_commit_hash` returned
-/// `None`, so `log` showed nothing and `snapshot` orphaned all history under a
-/// fresh `parents=[]` root commit (silent data loss, exit 0). Now HEAD is
-/// self-repaired from refs on `open`, so `log` shows C1 and the next `snapshot`
-/// extends it. A genuinely unborn branch (both empty) still root-commits.
+/// A single `.kio/HEAD` is the only history authority. Missing or empty HEAD
+/// must never be reconstructed from a legacy ref or another mutable source.
 fn events_log(dir: &TempDir) -> String {
     let path = dir.path().join(".test-data/kio/logs/events.jsonl");
     fs::read_to_string(path).unwrap_or_default()
 }
 
 #[test]
-fn r13_4_empty_head_with_healthy_refs_is_repaired_not_orphaned() {
+fn r13_4_empty_head_is_not_repaired_from_legacy_refs() {
     let dir = scope();
     fs::write(dir.path().join("doc.txt"), "v1").unwrap();
-    let c1 = json_success(&dir, ["snapshot", "create", "-m", "first"]);
-    let c1_hash = c1["commit_hash"].as_str().unwrap().to_owned();
-
-    // Corrupt HEAD to empty; refs/heads/main still names C1.
+    json_success(&dir, ["snapshot", "create", "-m", "first"]);
     fs::write(dir.path().join(".kio/HEAD"), "").unwrap();
-    assert_eq!(
-        fs::read_to_string(dir.path().join(".kio/refs/heads/main")).unwrap(),
-        c1_hash,
-        "precondition: refs still names C1"
-    );
-
-    // (a) `log` must surface C1 (HEAD self-heals on open).
-    let log = json_success(&dir, ["log"]);
+    kio(&dir, ["log"]).arg("--json").assert().failure();
     assert!(
-        log["commits"]
-            .as_array()
+        fs::read_to_string(dir.path().join(".kio/HEAD"))
             .unwrap()
-            .iter()
-            .any(|commit| commit["commit_hash"] == c1_hash),
-        "log must show the recovered C1: {log}"
-    );
-
-    // (a) the next snapshot must extend C1, not orphan it under a root commit.
-    fs::write(dir.path().join("doc.txt"), "v2").unwrap();
-    let c2 = json_success(&dir, ["snapshot", "create", "-m", "after"]);
-    assert_eq!(c2["status"], "created");
-    assert_eq!(
-        c2["commit"]["parents"].as_array().unwrap(),
-        &vec![json!(c1_hash)],
-        "C2 must have C1 as its parent (history preserved): {c2}"
-    );
-
-    // (d) the recovery is recorded (never silent).
-    assert!(
-        events_log(&dir).contains("KIO-I-STORE-HEAD-REPAIRED-001"),
-        "HEAD repair must be logged to events.jsonl"
+            .trim()
+            .is_empty()
     );
 }
 
 #[test]
-fn r13_4_missing_head_with_healthy_refs_is_repaired() {
+fn r13_4_missing_head_is_refused() {
     let dir = scope();
     fs::write(dir.path().join("doc.txt"), "v1").unwrap();
-    let c1 = json_success(&dir, ["snapshot", "create", "-m", "first"]);
-    let c1_hash = c1["commit_hash"].as_str().unwrap().to_owned();
-
-    // (b) delete HEAD entirely; refs/heads/main still healthy.
+    json_success(&dir, ["snapshot", "create", "-m", "first"]);
     fs::remove_file(dir.path().join(".kio/HEAD")).unwrap();
-    let log = json_success(&dir, ["log"]);
-    assert!(
-        log["commits"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|commit| commit["commit_hash"] == c1_hash)
-    );
-    assert_eq!(
-        fs::read_to_string(dir.path().join(".kio/HEAD"))
-            .unwrap()
-            .trim(),
-        c1_hash,
-        "HEAD file must be restored on disk"
-    );
+    kio(&dir, ["log"]).arg("--json").assert().failure();
+    assert!(!dir.path().join(".kio/HEAD").exists());
 }
 
 #[test]
@@ -2696,7 +2748,7 @@ fn r13_4_fresh_init_both_empty_still_root_commits() {
     let first = json_success(&dir, ["snapshot", "create", "-m", "first"]);
     assert_eq!(first["status"], "created");
     assert!(
-        first["commit"]["parents"].as_array().unwrap().is_empty(),
+        first["commit"]["parent"].is_null(),
         "the first snapshot on a fresh scope is a root commit"
     );
     assert!(
@@ -2705,27 +2757,17 @@ fn r13_4_fresh_init_both_empty_still_root_commits() {
     );
 }
 
-/// R13-5: re-`init` on a broken store used to report "already initialized" exit 0
-/// without verifying or repairing anything, leaving the store broken for the very
-/// next command. Now a recoverable HEAD is repaired (via the R13-4 self-heal path)
-/// and reported; unrecoverable corruption (bad scope.json) exits non-zero.
+/// `init` may finish only a verified publication journal. A missing HEAD alone
+/// is never evidence for a replacement history tip.
 #[test]
-fn r13_5_reinit_repairs_missing_head_and_status_recovers() {
+fn r13_5_reinit_refuses_missing_head_without_a_verified_journal() {
     let dir = scope();
     fs::write(dir.path().join("doc.txt"), "v1").unwrap();
     json_success(&dir, ["snapshot", "create", "-m", "first"]);
 
     fs::remove_file(dir.path().join(".kio/HEAD")).unwrap();
-    let reinit = json_success(&dir, ["init", "."]);
-    assert_eq!(
-        reinit["status"], "repaired",
-        "re-init must report the repair"
-    );
-    assert_eq!(reinit["repaired"], json!(["HEAD"]));
-
-    // The natural recovery worked: the next command succeeds (exit 0) instead of
-    // KIO-E-STORE-IO-001.
-    json_success(&dir, ["status"]);
+    kio(&dir, ["init", "."]).arg("--json").assert().failure();
+    assert!(!dir.path().join(".kio/HEAD").exists());
 }
 
 #[test]
@@ -2741,11 +2783,17 @@ fn r13_5_reinit_reports_already_initialized_when_healthy() {
 #[test]
 fn r13_5_reinit_on_unrecoverable_corruption_exits_nonzero() {
     let dir = scope();
+    let scope_path = dir.path().join(".kio/scope.json");
+    let management_path = dir.path().join(".kio/management.json");
+    let corrupt_scope = b"{ not valid json";
+    let management_before = fs::read(&management_path).ok();
     // Corrupt scope.json (unrecoverable) → re-init must NOT swallow it as
-    // "already initialized"; open()'s validate rejects it with a non-zero exit.
-    fs::write(dir.path().join(".kio/scope.json"), "{ not valid json").unwrap();
-    let err = json_failure(&dir, ["init", "."], 2);
-    assert_eq!(err["error_code"], "KIO-E-CONFIG-SCHEMA-001");
+    // "already initialized" or mint replacement management authority.
+    fs::write(&scope_path, corrupt_scope).unwrap();
+    let err = json_failure(&dir, ["init", "."], 4);
+    assert_eq!(err["error_code"], "KIO-E-MANAGEMENT-AUTHORITY-001");
+    assert_eq!(fs::read(&scope_path).unwrap(), corrupt_scope);
+    assert_eq!(fs::read(&management_path).ok(), management_before);
 }
 
 /// R13-6: with no absolute `$HOME` and no `$XDG_*` override, device-global state
@@ -2830,12 +2878,14 @@ fn online_incremental_task(status: &Value) -> Option<&Value> {
 #[test]
 fn r13_1_online_incremental_fires_on_light_revision_and_reuses_unchanged() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&["p1", "p2", "p3", "p4", "p5"]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     json_success_with_env(
         &dir,
         ["batch", "resume"],
@@ -2883,8 +2933,10 @@ fn r13_1_online_incremental_fires_on_light_revision_and_reuses_unchanged() {
 #[test]
 fn r13_1_online_full_when_change_rate_exceeds_threshold() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(dir.path().join("report.pdf"), fake_pdf(&["a1", "a2", "a3"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     json_success_with_env(
         &dir,
         ["batch", "resume"],
@@ -2923,8 +2975,10 @@ fn r13_1_online_full_when_change_rate_exceeds_threshold() {
 }
 
 #[test]
-fn r13_1_online_incremental_acceptance_fail_falls_back_to_full() {
+fn r13_1_online_incremental_incomplete_response_never_falls_back_to_full() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     // 7 pages so a 2-page change is light (2/7 ≈ 0.29 < 0.30) → incremental fires,
     // but the `incr_incomplete` seam drops a requested unit so acceptance fails.
     fs::write(
@@ -2932,7 +2986,7 @@ fn r13_1_online_incremental_acceptance_fail_falls_back_to_full() {
         fake_pdf(&["p1", "p2", "p3", "p4", "p5", "p6", "p7"]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     json_success_with_env(
         &dir,
         ["batch", "resume"],
@@ -2945,21 +2999,25 @@ fn r13_1_online_incremental_acceptance_fail_falls_back_to_full() {
     )
     .unwrap();
     json_success(&dir, ["index", "--yes"]);
-    // incr_incomplete: the incremental response drops a requested page → the Kio
-    // acceptance check fails → the online route re-sends Full (which returns every
-    // page) → the task completes as Full, not incremental.
-    json_success_with_env(
+    // An incomplete incremental response is terminal. It must never cause an
+    // automatic paid Full retry, because the dropped unit has no provider-declared
+    // retry classification.
+    let resumed = json_code_stdout_with_env(
         &dir,
         ["batch", "resume"],
+        4,
         &[(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "incr_incomplete")],
     );
+    assert_eq!(resumed["tasks_attempted"], 1);
+    assert_eq!(resumed["tasks_executed"], 0);
+    assert_eq!(resumed["tasks_failed"], 1);
 
     let status = json_success(&dir, ["status"]);
     assert!(
         online_incremental_task(&status).is_none(),
-        "acceptance failure must fall back to Full (no incremental task): {status}"
+        "an incomplete incremental response must not publish an incremental task: {status}"
     );
-    // The Full fallback succeeded: 2 online done tasks (v1 + v2), no failure.
+    // Only v1 completed. The v2 failure is terminal and no Full fallback was sent.
     let online_done = status["tasks"]
         .as_array()
         .unwrap()
@@ -2970,7 +3028,14 @@ fn r13_1_online_incremental_acceptance_fail_falls_back_to_full() {
                 && task["status"] == "done"
         })
         .count();
-    assert_eq!(online_done, 2, "both online tasks done via Full: {status}");
+    assert_eq!(online_done, 1, "only v1 may be done: {status}");
+    assert!(status["tasks"].as_array().unwrap().iter().any(|task| {
+        task["input_path"] == "report.pdf"
+            && task["status"] == "failed"
+            && task["fallback_reason"] == "result_unknown"
+            && task["attempts"] == 1
+            && task["next_retry_at"].is_null()
+    }));
 }
 
 // R14-1: a partially-corrupt previous instance (`manifest.json` still claims a unit
@@ -2981,11 +3046,11 @@ fn r13_1_online_incremental_acceptance_fail_falls_back_to_full() {
 // corrupt previous and failed identically) and, on the offline route, aborted the
 // whole `kio index`, silently skipping alphabetically-later files.
 
-/// The instance directory (`output_ref`) of the DONE offline markdownize task for a
-/// path — used to plant a corruption inside a prior normalized instance.
-fn offline_instance_output_ref(dir: &TempDir, input_path: &str) -> String {
+/// The typed normalized-instance directory of the DONE offline markdownize task for
+/// a path — used to plant a corruption inside a prior normalized instance.
+fn offline_instance_dir(dir: &TempDir, input_path: &str) -> PathBuf {
     let status = json_success(dir, ["status"]);
-    status["tasks"]
+    let output_ref = status["tasks"]
         .as_array()
         .unwrap()
         .iter()
@@ -3000,7 +3065,24 @@ fn offline_instance_output_ref(dir: &TempDir, input_path: &str) -> String {
         })
         .and_then(|task| task["output_ref"].as_str())
         .unwrap_or_else(|| panic!("offline instance output_ref for {input_path}: {status}"))
-        .to_owned()
+        .to_owned();
+    normalized_instance_dir_for_output_ref(dir, &output_ref)
+}
+
+fn normalized_instance_dir_for_output_ref(dir: &TempDir, output_ref: &str) -> PathBuf {
+    let kio_dir = dir.path().join(".kio");
+    let descriptor = TaskStore::new(&kio_dir)
+        .all()
+        .unwrap()
+        .into_iter()
+        .find(|task| task.output_ref == output_ref)
+        .unwrap_or_else(|| panic!("task store must contain output_ref {output_ref}"));
+    let TaskOutputRef::NormalizedInstance { path, .. } =
+        validate_task_output_ref(&kio_dir, &descriptor).unwrap()
+    else {
+        panic!("task must have a normalized instance output reference");
+    };
+    path
 }
 
 /// Delete one mutable `<unit_ref>.json` cache file while leaving the immutable
@@ -3024,12 +3106,14 @@ fn remove_one_cached_unit_json(instance_dir: &Path) {
 #[test]
 fn r14_1_online_mutable_unit_cache_loss_uses_immutable_incremental_baseline() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&["p1", "p2", "p3", "p4", "p5"]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     json_success_with_env(
         &dir,
         ["batch", "resume"],
@@ -3050,7 +3134,7 @@ fn r14_1_online_mutable_unit_cache_loss_uses_immutable_incremental_baseline() {
         .and_then(|task| task["output_ref"].as_str())
         .unwrap_or_else(|| panic!("v1 online done task with instance output_ref: {status}"))
         .to_owned();
-    remove_one_cached_unit_json(Path::new(&output_ref));
+    remove_one_cached_unit_json(&normalized_instance_dir_for_output_ref(&dir, &output_ref));
 
     // v2 light revision (would be incremental if the previous were intact).
     fs::write(
@@ -3105,9 +3189,9 @@ fn r14_1_offline_mutable_unit_cache_loss_does_not_abort_index() {
     // `report.pdf` sorts before `zzz.pdf`; report.pdf loses one mutable cache body.
     fs::write(dir.path().join("report.pdf"), fake_pdf(&["a1", "a2", "a3"])).unwrap();
     fs::write(dir.path().join("zzz.pdf"), fake_pdf(&["z1", "z2"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
 
-    remove_one_cached_unit_json(Path::new(&offline_instance_output_ref(&dir, "report.pdf")));
+    remove_one_cached_unit_json(&offline_instance_dir(&dir, "report.pdf"));
 
     // Change report.pdf so re-index reaches `previous_instance_for_path` (a new
     // raw_hash bypasses the done-output early return).
@@ -3143,10 +3227,10 @@ fn r14_1_offline_mutable_unit_cache_loss_does_not_abort_index() {
 fn r14_1_offline_previous_missing_manifest_still_degrades_to_full() {
     let dir = scope();
     fs::write(dir.path().join("report.pdf"), fake_pdf(&["a1", "a2"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
 
-    let output_ref = offline_instance_output_ref(&dir, "report.pdf");
-    fs::remove_file(Path::new(&output_ref).join("manifest.json")).unwrap();
+    let instance_dir = offline_instance_dir(&dir, "report.pdf");
+    fs::remove_file(instance_dir.join("manifest.json")).unwrap();
 
     fs::write(dir.path().join("report.pdf"), fake_pdf(&["a1 X", "a2"])).unwrap();
     let reindex = json_success(&dir, ["index", "--yes"]);
@@ -3177,9 +3261,11 @@ fn instance_manifest_count(dir: &TempDir) -> usize {
 #[test]
 fn r14_2_stale_online_task_superseded_then_recovers_on_reindex() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(dir.path().join("report.pdf"), fake_pdf(&["p1", "p2"])).unwrap();
     // `index` enqueues the online task for H(v1) but does NOT run it.
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     let instances_before = instance_manifest_count(&dir);
 
     // (a) Edit to v2 WITHOUT re-indexing → the online task's input_hash is now stale.
@@ -3248,8 +3334,10 @@ fn r14_2_stale_online_task_superseded_then_recovers_on_reindex() {
 #[test]
 fn r14_2_unchanged_online_task_executes_normally() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(dir.path().join("report.pdf"), fake_pdf(&["p1", "p2"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     // No edit between enqueue and execution.
     let resume = json_success_with_env(
         &dir,
@@ -3286,10 +3374,12 @@ fn r14_2_unchanged_online_task_executes_normally() {
 #[test]
 fn r15_2_stale_online_task_supersede_does_not_phantom_charge() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(dir.path().join("report.pdf"), fake_pdf(&["p1", "p2"])).unwrap();
     // `index` enqueues the online task for H(v1) but does NOT run it — so no markdown
     // charge has landed yet (the send is what bills).
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
 
     let markdown_rows = |dir: &TempDir| -> usize {
         ledger_lines(dir)
@@ -3346,10 +3436,12 @@ fn r15_2_stale_online_task_supersede_does_not_phantom_charge() {
 #[test]
 fn r15_6_zero_change_incremental_reuses_without_calling_adapter() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     let v1 = fake_pdf(&["stable page body content"]);
     fs::write(dir.path().join("report.pdf"), &v1).unwrap();
     // v1: enqueue + run the online task (mock) → the prior online instance.
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     json_success_with_env(
         &dir,
         ["batch", "resume"],
@@ -3431,80 +3523,34 @@ fn errors_log(dir: &TempDir) -> String {
     fs::read_to_string(path).unwrap_or_default()
 }
 
-// (a): corrupt HEAD + read-only `.kio` → pure-read commands still run (exit 0), the heal
-// is deferred (not performed, not silent), and a later WRITABLE open completes it.
+// Corrupt HEAD remains a refusal even if the scope is read-only. No ordinary
+// read may infer a tip or mutate the store; recovery is restricted to a
+// separately verified publication journal.
 #[cfg(unix)]
 #[test]
-fn r14_3_corrupt_head_read_only_scope_reads_run_and_defer_heal() {
+fn r14_3_corrupt_head_read_only_scope_is_refused_without_mutation() {
     use std::os::unix::fs::PermissionsExt;
     let dir = scope();
     fs::write(dir.path().join("doc.txt"), "v1").unwrap();
-    let c1 = json_success(&dir, ["snapshot", "create", "-m", "first"]);
-    let c1_hash = c1["commit_hash"].as_str().unwrap().to_owned();
-
-    // Corrupt HEAD to empty (refs still names C1), then make `.kio` read-only so the
-    // self-heal can neither create `.lock` nor overwrite HEAD.
+    json_success(&dir, ["snapshot", "create", "-m", "first"]);
     fs::write(dir.path().join(".kio/HEAD"), "").unwrap();
     let kio_dir = dir.path().join(".kio");
     fs::set_permissions(&kio_dir, fs::Permissions::from_mode(0o500)).unwrap();
 
-    // Pure-read commands must succeed (exit 0). Before R14-3 the self-heal's `.lock`
-    // create failed with PermissionDenied → KIO-E-STORE-IO-001, exit 1.
-    let status = json_success(&dir, ["status"]);
-    assert!(status.is_object(), "status must run read-only: {status}");
-    // R15-1b: even though the physical HEAD file stays empty while the heal is
-    // deferred, `head_commit_hash` now recovers the real commit from `refs/heads/main`
-    // (side-effect-free), so `log` returns the true history (C1) instead of the former
-    // misreport of an empty commit list on an indexed scope.
-    let log = json_success(&dir, ["log"]);
-    let commits = log["commits"].as_array().expect("log commits array");
-    assert_eq!(
-        commits.len(),
-        1,
-        "log must recover the real commit from refs even while HEAD is unhealed: {log}"
-    );
-    assert_eq!(commits[0]["commit_hash"], c1_hash);
-    // `inspect <hash>` resolves the object directly (not via HEAD), so it still returns
-    // the commit object — proving the open path itself no longer bricks.
-    let inspect = json_success(&dir, ["inspect", &c1_hash]);
-    assert!(
-        inspect.is_object(),
-        "inspect must resolve the commit read-only: {inspect}"
-    );
-
-    // The heal was deferred (best-effort warn), not silently performed: HEAD is still
-    // empty and no repair event was written.
+    kio(&dir, ["log"]).arg("--json").assert().failure();
     assert!(
         fs::read_to_string(dir.path().join(".kio/HEAD"))
             .unwrap()
             .trim()
             .is_empty(),
-        "a read-only scope's HEAD stays unhealed (deferred)"
+        "a read-only scope's HEAD stays unhealed"
     );
     assert!(
         !events_log(&dir).contains("KIO-I-STORE-HEAD-REPAIRED-001"),
         "no repair may be claimed while the scope is read-only"
     );
-    assert!(
-        errors_log(&dir).contains("KIO-W-STORE-HEAD-HEAL-DEFERRED-001"),
-        "the deferred heal must be observable as a warn"
-    );
 
-    // A later WRITABLE open completes the heal (never lost): HEAD is restored and the
-    // repair is now recorded.
     fs::set_permissions(&kio_dir, fs::Permissions::from_mode(0o700)).unwrap();
-    json_success(&dir, ["log"]);
-    assert_eq!(
-        fs::read_to_string(dir.path().join(".kio/HEAD"))
-            .unwrap()
-            .trim(),
-        c1_hash,
-        "a writable open must complete the deferred heal"
-    );
-    assert!(
-        events_log(&dir).contains("KIO-I-STORE-HEAD-REPAIRED-001"),
-        "the completed repair must be recorded (never silent)"
-    );
 }
 
 // (c): a HEALTHY HEAD + read-only `.kio` is unchanged — reads run and nothing is healed
@@ -3605,8 +3651,10 @@ fn r15_4_unreceipted_missing_head_tree_is_corruption() {
 #[test]
 fn r14_5_batch_permanent_failure_logs_batch_error_code() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(dir.path().join("report.pdf"), fake_pdf(&["p1", "p2"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     // Edit without re-indexing → the online task is stale (permanent failure) → exit 4.
     fs::write(
         dir.path().join("report.pdf"),
@@ -3636,8 +3684,10 @@ fn r14_5_batch_permanent_failure_logs_batch_error_code() {
 #[test]
 fn r14_5_batch_partial_failure_logs_batch_error_code() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(dir.path().join("report.pdf"), fake_pdf(&["p1", "p2"])).unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     json_code_stdout_with_env(
         &dir,
         ["batch", "resume"],
@@ -3664,12 +3714,14 @@ fn r14_5_batch_partial_failure_logs_batch_error_code() {
 #[test]
 fn r14_6_pin_change_gates_incremental_before_send() {
     let dir = scope();
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
     fs::write(
         dir.path().join("report.pdf"),
         fake_pdf(&["p1", "p2", "p3", "p4", "p5"]),
     )
     .unwrap();
-    json_success(&dir, ["index", "--approve"]);
+    json_success(&dir, ["index", "--yes"]);
     // v1 online instance under the default pin (mistral-ocr-2505).
     json_success_with_env(
         &dir,

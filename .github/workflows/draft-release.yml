@@ -25,7 +25,7 @@ jobs:
           - os: ubuntu-latest
             label: Linux
             support: supported
-          - os: macos-latest
+          - os: macos-26
             label: macOS
             support: supported
           - os: windows-latest

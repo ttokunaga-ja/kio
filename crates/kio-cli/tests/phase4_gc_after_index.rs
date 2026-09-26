@@ -94,7 +94,7 @@ fn config_flip_after_publication_cannot_activate_manual_only_gc() {
         .env("KIO_TEST_GC_POST_PUBLICATION_READY", &ready)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .args(["index", "--offline", "--approve", "--json"])
+        .args(["index", "--offline", "--yes", "--json"])
         .spawn()
         .unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -111,7 +111,13 @@ fn config_flip_after_publication_cannot_activate_manual_only_gc() {
     fs::write(ready.with_extension("release"), b"release").unwrap();
 
     let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let value = output_json(&output);
     assert_eq!(value["publication_status"], "completed");
     assert_eq!(value["error_code"], "KIO-E-GC-CONFIG-CHANGED-001");
@@ -159,10 +165,18 @@ fn scope_replacement_after_publication_cannot_redirect_automatic_gc() {
     fs::write(ready.with_extension("release"), b"release").unwrap();
 
     let output = child.wait_with_output().unwrap();
-    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
     let value = output_json(&output);
     assert_eq!(value["publication_status"], "completed");
-    assert_eq!(value["error_code"], "KIO-E-GC-CONFIG-CHANGED-001");
+    // Replacing the whole scope invalidates the retained identity, a store
+    // integrity failure. The already-published snapshot remains completed.
+    assert_eq!(value["error_code"], "KIO-E-STORE-CORRUPT-001");
     assert_eq!(
         fs::read(tree_path_at(&original, &victim_tree)).unwrap(),
         victim_tree_before
@@ -219,16 +233,64 @@ fn stale_candidate() -> (TempDir, String, String) {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("document.md"), "# old\n\nold candidate\n").unwrap();
     json_success(&dir, &["init"], NOW);
-    let old = json_success(&dir, &["index", "--offline", "--approve"], OLD);
+    let old = json_success(&dir, &["index", "--offline", "--yes"], OLD);
     let commit = old["commit_hash"].as_str().unwrap().to_owned();
     fs::write(dir.path().join("document.md"), "# current\n\ncurrent tip\n").unwrap();
-    json_success(&dir, &["index", "--offline", "--approve"], NOW);
+    json_success(&dir, &["index", "--offline", "--yes"], NOW);
     let tree = Repository::open(dir.path())
         .unwrap()
         .read_commit(&commit)
         .unwrap()
         .tree;
     (dir, commit, tree)
+}
+
+#[test]
+fn legacy_repaired_retention_key_is_rejected_before_gc_store_mutation() {
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(
+            root: &Path,
+            current: &Path,
+            entries: &mut std::collections::BTreeMap<PathBuf, Option<Vec<u8>>>,
+        ) {
+            for entry in fs::read_dir(current).unwrap() {
+                let path = entry.unwrap().path();
+                let relative = path.strip_prefix(root).unwrap().to_owned();
+                if path.is_dir() {
+                    entries.insert(relative, None);
+                    visit(root, &path, entries);
+                } else {
+                    entries.insert(relative, Some(fs::read(&path).unwrap()));
+                }
+            }
+        }
+        let mut entries = std::collections::BTreeMap::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    let (dir, _commit, _tree) = stale_candidate();
+    for fields in [
+        "keep_repaired_per_branch=1",
+        "keep_repaired=1\nkeep_repaired_per_branch=1",
+    ] {
+        fs::write(
+            dir.path().join(".kio/config.toml"),
+            format!("[gc]\nmode=\"manual_only\"\n[gc.derived_retention]\n{fields}\n"),
+        )
+        .unwrap();
+        let before = snapshot(&dir.path().join(".kio"));
+        let output = kio(&dir, &["gc", "--yes", "--json"])
+            .assert()
+            .code(2)
+            .get_output()
+            .clone();
+        assert_eq!(
+            output_json(&output)["error_code"],
+            "KIO-E-CONFIG-SCHEMA-001"
+        );
+        assert_eq!(snapshot(&dir.path().join(".kio")), before);
+    }
 }
 
 fn tree_path(dir: &TempDir, tree: &str) -> PathBuf {
@@ -286,7 +348,7 @@ fn manual_only_leaves_a_stale_candidate_byte_for_byte_unswept() {
     configure(&dir, "manual_only");
     let before_tree = fs::read(tree_path(&dir, &tree)).unwrap();
 
-    let result = json_success(&dir, &["index", "--offline", "--approve"], NOW);
+    let result = json_success(&dir, &["index", "--offline", "--yes"], NOW);
     assert_eq!(result["gc"]["status"], "disabled");
     assert_eq!(result["gc"]["reason"], "manual_only");
     assert_eq!(fs::read(tree_path(&dir, &tree)).unwrap(), before_tree);
@@ -300,7 +362,7 @@ fn after_index_with_no_candidates_skips_without_creating_gc_state() {
     json_success(&dir, &["init"], NOW);
     configure(&dir, "after_index");
 
-    let result = json_success(&dir, &["index", "--offline", "--approve"], NOW);
+    let result = json_success(&dir, &["index", "--offline", "--yes"], NOW);
     assert_eq!(result["gc"]["status"], "skipped");
     assert_eq!(result["gc"]["reason"], "no_candidates");
     assert!(!dir.path().join(".kio/gc/in_progress").exists());
@@ -345,7 +407,7 @@ fn after_index_sweeps_a_real_stale_tree_after_successful_index() {
     configure(&dir, "after_index");
     fs::write(dir.path().join("document.md"), "# newest\n\ncurrent tip\n").unwrap();
 
-    let result = json_success(&dir, &["index", "--offline", "--approve"], NOW);
+    let result = json_success(&dir, &["index", "--offline", "--yes"], NOW);
     assert_eq!(result["gc"]["status"], "completed");
     assert!(!tree_path(&dir, &tree).exists());
     assert!(receipt_path(&dir, &commit).is_file());
@@ -359,7 +421,7 @@ fn after_index_timeout_is_observable_and_next_invocations_converge_recovery() {
     configure(&dir, "after_index");
     fs::write(dir.path().join("document.md"), "# newest\n\ncurrent tip\n").unwrap();
 
-    let first = kio(&dir, &["index", "--offline", "--approve", "--json"])
+    let first = kio(&dir, &["index", "--offline", "--yes", "--json"])
         .env("KIO_TEST_GC_RUNTIME_CHECKPOINTS", "1")
         .output()
         .unwrap();
@@ -372,7 +434,7 @@ fn after_index_timeout_is_observable_and_next_invocations_converge_recovery() {
     assert!(dir.path().join(".kio/gc/in_progress").exists());
 
     for _ in 0..20 {
-        let output = kio(&dir, &["index", "--offline", "--approve", "--json"])
+        let output = kio(&dir, &["index", "--offline", "--yes", "--json"])
             .env("KIO_TEST_GC_RUNTIME_CHECKPOINTS", "1")
             .output()
             .unwrap();
@@ -398,7 +460,7 @@ fn automatic_receipt_crash_recovers_in_preflight_before_next_publication() {
     configure(&dir, "after_index");
     fs::write(dir.path().join("document.md"), "# newest\n\ncurrent tip\n").unwrap();
 
-    let crashed = kio(&dir, &["index", "--offline", "--approve", "--json"])
+    let crashed = kio(&dir, &["index", "--offline", "--yes", "--json"])
         .env("KIO_TEST_GC_FAULT", "after_first_receipt")
         .output()
         .unwrap();
@@ -476,7 +538,7 @@ fn snapshot_success_and_noop_report_after_index_without_gc_state_for_empty_plan(
     json_success(&dir, &["init"], NOW);
     // Establish the public index first.  A candidate-free automatic hook must
     // not rotate this SQLite generation around either manual snapshot.
-    json_success(&dir, &["index", "--offline", "--approve"], NOW);
+    json_success(&dir, &["index", "--offline", "--yes"], NOW);
     let generation_before = index_generation(&dir);
     configure(&dir, "after_index");
 
@@ -530,14 +592,14 @@ fn child_scope_runs_its_explicit_after_index_hook_once_and_reports_it_to_parent(
     // The first parent pass initializes the discovered child.  Configure the
     // two independently-owned scopes explicitly, then the second pass makes
     // one parent publication and exactly one child subprocess publication.
-    json_success(&dir, &["index", "--offline", "--approve"], NOW);
+    json_success(&dir, &["index", "--offline", "--yes"], NOW);
     configure(&dir, "after_index");
     let child_root = dir.path().join("child");
     // Make a genuine stale auto commit inside the already-initialized child.
     // The parent must invoke this child's hook once, and the child must sweep
     // its own tree without lending that work to the parent scope.
     fs::write(child_root.join("note.md"), "child stale\n").unwrap();
-    let stale = json_success_at(&child_root, &["index", "--offline", "--approve"], OLD);
+    let stale = json_success_at(&child_root, &["index", "--offline", "--yes"], OLD);
     let stale_commit = stale["commit_hash"].as_str().unwrap().to_owned();
     let stale_tree = Repository::open(&child_root)
         .unwrap()
@@ -551,7 +613,7 @@ fn child_scope_runs_its_explicit_after_index_hook_once_and_reports_it_to_parent(
     )
     .unwrap();
 
-    let result = json_success(&dir, &["index", "--offline", "--approve"], NOW);
+    let result = json_success(&dir, &["index", "--offline", "--yes"], NOW);
     assert_eq!(result["gc"]["trigger"], "index");
     let children = result["child_scopes"].as_array().unwrap();
     let child = children
@@ -580,10 +642,12 @@ fn genuine_partial_index_result_never_starts_after_index_gc() {
     )
     .unwrap();
     json_success(&dir, &["init"], NOW);
+    json_success(&dir, &["ledger", "init"], NOW);
+    json_success(&dir, &["adapter", "approve", "--all", "--yes"], NOW);
     // Build a real prior normalized instance, then force its changed version
     // through the adapter's full-fallback failure seam.  This is an actual
     // result+exit-3 partial index, not a command-line rejection.
-    let initial = kio(&dir, &["index", "--approve", "--json"])
+    let initial = kio(&dir, &["index", "--yes", "--json"])
         .env("KIO_TEST_MARKDOWNIZE_ADAPTER", "incremental")
         .output()
         .unwrap();
@@ -619,7 +683,7 @@ fn after_index_retains_a_tree_still_shared_by_a_protected_ref_tip() {
     let (dir, _old_commit, tree) = stale_candidate();
     let shared_tip = CommitObject::new(
         tree.clone(),
-        Vec::new(),
+        None,
         NOW.to_owned(),
         "protected shared tree".to_owned(),
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -639,7 +703,9 @@ fn after_index_retains_a_tree_still_shared_by_a_protected_ref_tip() {
         .unwrap()
         .0;
     fs::write(
-        dir.path().join(".kio/refs/heads/protected-shared"),
+        dir.path()
+            .join(".kio/refs/tags-v1")
+            .join(kio_core::portable::portable_tag_leaf("protected-shared")),
         format!("{protected_hash}\n"),
     )
     .unwrap();
@@ -665,7 +731,7 @@ fn automatic_sweep_receipts_all_eligible_repaired_sharers_before_one_tree_remova
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("current.md"), "current\n").unwrap();
     json_success(&dir, &["init"], NOW);
-    json_success(&dir, &["index", "--offline", "--approve"], NOW);
+    json_success(&dir, &["index", "--offline", "--yes"], NOW);
 
     let store = ObjectStore::new(dir.path().join(".kio"));
     let shared_tree =
@@ -687,13 +753,16 @@ fn automatic_sweep_receipts_all_eligible_repaired_sharers_before_one_tree_remova
     let current_tree = Repository::open(dir.path())
         .unwrap()
         .read_commit(
-            fs::read_to_string(dir.path().join(".kio/refs/heads/main"))
+            fs::read_to_string(dir.path().join(".kio/HEAD"))
                 .unwrap()
                 .trim(),
         )
         .unwrap()
         .tree;
-    let mut parent = None;
+    let mut parent = Repository::open(dir.path())
+        .unwrap()
+        .head_commit_hash()
+        .unwrap();
     let mut repaired = Vec::new();
     for index in 0..7 {
         let tree = if index < 2 {
@@ -703,7 +772,7 @@ fn automatic_sweep_receipts_all_eligible_repaired_sharers_before_one_tree_remova
         };
         let commit = CommitObject::new(
             tree,
-            parent.into_iter().collect(),
+            parent,
             format!("2025-01-{:02}T00:00:00Z", index + 1),
             format!("repaired fixture {index}"),
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -724,7 +793,7 @@ fn automatic_sweep_receipts_all_eligible_repaired_sharers_before_one_tree_remova
     }
     let protected_tip = CommitObject::new(
         current_tree,
-        parent.into_iter().collect(),
+        parent,
         NOW.to_owned(),
         "protected repaired tip".to_owned(),
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
@@ -743,15 +812,11 @@ fn automatic_sweep_receipts_all_eligible_repaired_sharers_before_one_tree_remova
         )
         .unwrap()
         .0;
-    fs::write(
-        dir.path().join(".kio/refs/heads/main"),
-        format!("{protected_tip}\n"),
-    )
-    .unwrap();
+    fs::write(dir.path().join(".kio/HEAD"), format!("{protected_tip}\n")).unwrap();
     fs::write(
         dir.path().join(".kio/config.toml"),
         "[gc]\nmode = \"after_index\"\nmax_runtime_seconds = 60\n\
-         [gc.derived_retention]\nkeep_repaired_per_branch = 5\n",
+         [gc.derived_retention]\nkeep_repaired = 5\n",
     )
     .unwrap();
 
@@ -762,11 +827,17 @@ fn automatic_sweep_receipts_all_eligible_repaired_sharers_before_one_tree_remova
     // Stop after the first durable receipt. Even though both commits share a
     // physical tree, the executor must not retire it until every frozen
     // authorizing receipt is durable.
-    let interrupted = kio(&dir, &["index", "--offline", "--approve", "--json"])
+    let interrupted = kio(&dir, &["index", "--offline", "--yes", "--json"])
         .env("KIO_TEST_GC_FAULT", "after_first_receipt")
         .output()
         .unwrap();
-    assert_eq!(interrupted.status.code(), Some(3));
+    assert_eq!(
+        interrupted.status.code(),
+        Some(3),
+        "{}\n{}",
+        String::from_utf8_lossy(&interrupted.stdout),
+        String::from_utf8_lossy(&interrupted.stderr)
+    );
     assert!(tree_path(&dir, &shared_tree).exists());
     assert_eq!(
         repaired

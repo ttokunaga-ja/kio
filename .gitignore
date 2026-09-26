@@ -1,6 +1,10 @@
 /target/
 **/*.rs.bk
 
+# Local Python acceptance-tooling bytecode.
+__pycache__/
+*.pyc
+
 # 運用シークレット (雛形は .env.example — 実値ファイルは絶対にコミットしない)
 .env
 .env.local

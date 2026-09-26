@@ -78,13 +78,23 @@ pub struct ProviderUploadRecord {
 /// One configured Batch client's full job/upload listing — 10 §7.5.2's scan
 /// set is built from `provider_scope_id` values (the "記録済み provider
 /// scope と現在構成の各 Batch client の provider_scope_id を合わせた集合").
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Deserialize)]
 pub struct ProviderInventory {
     pub provider_scope_id: String,
     #[serde(default)]
     pub jobs: Vec<ProviderJobRecord>,
     #[serde(default)]
     pub uploads: Vec<ProviderUploadRecord>,
+}
+
+impl std::fmt::Debug for ProviderInventory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderInventory")
+            .field("provider_scope_id", &"[REDACTED]")
+            .field("jobs", &self.jobs)
+            .field("uploads", &self.uploads)
+            .finish()
+    }
 }
 
 /// Env var naming a JSON fixture file (`Vec<ProviderInventory>`, serde) that
@@ -114,7 +124,9 @@ pub const TEST_BATCH_INVENTORY_ENV: &str = "KIO_TEST_BATCH_INVENTORY";
 /// `KIO_TEST_MISTRAL_BATCH` mock script therefore also reaches here (it IS
 /// the configured client when set), which is how the metadata→attribution
 /// mapping is tested hermetically.
-pub fn configured_inventories() -> Result<Vec<ProviderInventory>> {
+pub fn configured_inventories(
+    mut recovery_context: impl FnMut() -> Result<crate::batch_recovery::BatchRecoveryContext>,
+) -> Result<Vec<ProviderInventory>> {
     #[cfg(debug_assertions)]
     if let Some(fixture_path) = crate::debug_test_control().adapters.batch_inventory {
         let text =
@@ -127,12 +139,16 @@ pub fn configured_inventories() -> Result<Vec<ProviderInventory>> {
         });
     }
     let mut inventories = Vec::new();
-    if let Some(client) = crate::batch_client::configured_mistral_batch_client()? {
+    if let Some(client) =
+        crate::batch_client::configured_mistral_batch_client(&mut recovery_context)?
+    {
         inventories.push(inventory_from_client(client.as_ref())?);
     }
     // G1: the embedding lane's provider. Unconfigured = contributes nothing,
     // exactly as the Mistral arm does.
-    if let Some(client) = crate::gemini_batch_client::resolve_gemini_batch_client()? {
+    if let Some(client) =
+        crate::gemini_batch_client::resolve_gemini_batch_client(&mut recovery_context)?
+    {
         inventories.push(gemini_inventory_from_client(client.as_ref())?);
     }
     Ok(inventories)
@@ -270,7 +286,10 @@ mod tests {
             crate::batch_client::TEST_MISTRAL_BATCH_ENV,
             script.to_string(),
         );
-        let inventories = configured_inventories().unwrap();
+        let inventories = configured_inventories(|| {
+            panic!("mock or unconfigured inventory must not load a private key")
+        })
+        .unwrap();
 
         assert_eq!(inventories.len(), 1);
         let inventory = &inventories[0];
@@ -342,7 +361,10 @@ mod tests {
             TEST_BATCH_INVENTORY_ENV,
             fixture_path.as_os_str(),
         );
-        let inventories = configured_inventories().unwrap();
+        let inventories = configured_inventories(|| {
+            panic!("mock or unconfigured inventory must not load a private key")
+        })
+        .unwrap();
 
         assert_eq!(inventories.len(), 1);
         let inventory = &inventories[0];
@@ -382,7 +404,9 @@ mod tests {
             TEST_BATCH_INVENTORY_ENV,
             "/nonexistent/path/inventory.json",
         );
-        let result = configured_inventories();
+        let result = configured_inventories(|| {
+            panic!("mock or unconfigured inventory must not load a private key")
+        });
         assert!(result.is_err());
     }
 
@@ -400,7 +424,9 @@ mod tests {
             TEST_BATCH_INVENTORY_ENV,
             fixture_path.as_os_str(),
         );
-        let result = configured_inventories();
+        let result = configured_inventories(|| {
+            panic!("mock or unconfigured inventory must not load a private key")
+        });
         match result {
             Err(crate::AdapterError::ConfigSchema(_)) => {}
             other => panic!("expected ConfigSchema error, got {other:?}"),

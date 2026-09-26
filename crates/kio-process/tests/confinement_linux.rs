@@ -112,3 +112,45 @@ fn selecting_a_renderer_file_does_not_admit_its_siblings() {
     assert!(output.status.success(), "{}", output.stderr);
     assert_eq!(output.stdout, "confined");
 }
+
+#[test]
+fn runtime_symlink_is_mounted_at_its_requested_alias() {
+    use std::{
+        fs,
+        os::unix::fs::{PermissionsExt, symlink},
+    };
+    let scratch = tempfile::tempdir().unwrap();
+    let trusted = tempfile::tempdir().unwrap();
+    let renderer = trusted.path().join("renderer");
+    fs::write(trusted.path().join("runtime.txt"), b"alias-visible").unwrap();
+    fs::write(&renderer, b"#!/bin/sh\ncat \"$KIO_ALIAS/runtime.txt\"\n").unwrap();
+    fs::set_permissions(&renderer, fs::Permissions::from_mode(0o700)).unwrap();
+    let alias_dir = tempfile::tempdir_in("/tmp").unwrap();
+    let alias = alias_dir.path().join("runtime-alias");
+    symlink(trusted.path(), &alias).unwrap();
+    let runtime = ["/bin", "/usr/bin", "/lib", "/lib64", "/usr/lib"]
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|path| path.exists())
+        .chain(std::iter::once(alias.clone()));
+    let sandbox = RenderSandbox::new(
+        &renderer,
+        scratch.path(),
+        runtime,
+        RenderResourceLimits::default(),
+    )
+    .unwrap();
+    let output = sandbox
+        .run(
+            std::iter::empty::<OsString>(),
+            &[(OsString::from("KIO_ALIAS"), alias.into_os_string())],
+            BoundedProcessOptions {
+                timeout: Duration::from_secs(10),
+                max_stdout_bytes: 1024,
+                max_stderr_bytes: 1024,
+            },
+        )
+        .unwrap();
+    assert!(output.status.success(), "{}", output.stderr);
+    assert_eq!(output.stdout, "alias-visible");
+}

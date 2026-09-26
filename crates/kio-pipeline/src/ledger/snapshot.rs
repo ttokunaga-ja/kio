@@ -13,10 +13,13 @@ use std::{
 };
 
 use cap_primitives::fs as cap_fs;
-use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
 
-use super::ops::ledger_month_total;
+use super::{
+    model::BatchRequestRow,
+    ops_sql::{ledger_month_total, stalled_rows},
+};
 
 // A device ledger is expected to be compact. These streaming bounds prevent a
 // hostile or accidentally enormous device cache from turning a read-only
@@ -57,6 +60,10 @@ enum AttemptError {
 enum SnapshotPhase {
     AfterInitialManifest,
     BeforePrivateSqliteOpen,
+    BeforeBoundLifecycleRead,
+    AfterBoundLifecycleRead,
+    BeforeBoundLifecycleArtifactRead,
+    AfterBoundLifecycleArtifactRead,
     AfterProbeBeforeRecheck,
     AfterFinalManifestBeforeParentRecheck,
 }
@@ -233,7 +240,18 @@ impl LedgerReadSnapshot {
         #[cfg(test)] hook: Option<SnapshotHook>,
         #[cfg(not(test))] _hook: Option<()>,
     ) -> Result<Self, LedgerSnapshotError> {
-        let path = normalized_absolute(path)?;
+        // Preserve the raw descriptor spelling until the shared resolver binds
+        // it. `Path::components` would normalize an alias such as a doubled
+        // separator before the resolver could reject it.
+        #[cfg(target_os = "linux")]
+        let inherited_path = inherited_ledger_root(path)?.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let inherited_path = false;
+        let path = if inherited_path {
+            path.to_path_buf()
+        } else {
+            normalized_absolute(path)?
+        };
         let started = Instant::now();
         let mut last = None;
         for attempt in 0..attempts {
@@ -300,10 +318,22 @@ impl LedgerReadSnapshot {
     ) -> Result<f64, LedgerSnapshotError> {
         ledger_month_total(&self.conn, scope_id, adapter_kind, month).map_err(snapshot_query_error)
     }
+
+    /// CL37/CL68 stalled batch rows from the owned private snapshot. The
+    /// source SQLite connection remains private, so status cannot create source
+    /// sidecars or acquire a source write lock.
+    pub fn stalled_rows(&self) -> Result<Vec<BatchRequestRow>, LedgerSnapshotError> {
+        stalled_rows(&self.conn).map_err(snapshot_query_error)
+    }
 }
 
 fn snapshot_query_error(error: crate::PipelineError) -> LedgerSnapshotError {
     match error {
+        crate::PipelineError::Contract { .. }
+        | crate::PipelineError::Corrupt { .. }
+        | crate::PipelineError::Schema(_) => {
+            LedgerSnapshotError::UnsafeIntegrity(format!("query ledger snapshot: {error}"))
+        }
         crate::PipelineError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
             if matches!(
                 code.code,
@@ -325,11 +355,6 @@ fn normalized_absolute(path: &Path) -> Result<PathBuf, LedgerSnapshotError> {
             path.display()
         )));
     }
-    // `/dev/fd/N` is a Linux-only descriptor authority spelling.  Preserve no
-    // ambient aliases here: `Path::components` normalizes repeated separators
-    // and dot components, which must never turn an alias into an authority.
-    #[cfg(target_os = "linux")]
-    validate_inherited_ledger_spelling(path)?;
     #[cfg(not(windows))]
     {
         let mut out = PathBuf::from("/");
@@ -392,184 +417,59 @@ fn normalized_absolute(path: &Path) -> Result<PathBuf, LedgerSnapshotError> {
     }
 }
 
-/// Reject aliases to the one inherited-descriptor spelling before path
-/// normalization can erase them.  Other absolute paths retain the ordinary
-/// lexical/no-follow resolver below.
+/// Resolve the sole inherited-descriptor spelling through the shared core
+/// capability boundary.  The resolver validates the raw lexical form before
+/// duplicating the descriptor, so this module never treats `/dev/fd` as an
+/// ambient filesystem path.
 #[cfg(target_os = "linux")]
-fn validate_inherited_ledger_spelling(path: &Path) -> Result<(), LedgerSnapshotError> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let mut components = path.components();
-    let names_descriptor_root = components.next() == Some(Component::RootDir)
-        && matches!(components.next(), Some(Component::Normal(name)) if name.as_bytes() == b"dev")
-        && matches!(components.next(), Some(Component::Normal(name)) if name.as_bytes() == b"fd");
-    if !names_descriptor_root {
-        return Ok(());
-    }
-
-    let raw = path.as_os_str().as_bytes();
-    if raw != b"/dev/fd" && !raw.starts_with(b"/dev/fd/") {
-        return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-            "inherited ledger path is not canonical: {}",
-            path.display()
-        )));
-    }
-    let suffix = raw.strip_prefix(b"/dev/fd/").ok_or_else(|| {
+fn inherited_ledger_root(
+    path: &Path,
+) -> Result<
+    Option<(kio_core::store_dir::StoreDirectory, Vec<std::ffi::OsString>)>,
+    LedgerSnapshotError,
+> {
+    kio_core::private_fs::resolve_inherited_private_root(path).map_err(|error| {
         LedgerSnapshotError::UnsafeIntegrity(format!(
-            "inherited ledger descriptor is missing: {}",
-            path.display()
+            "resolve inherited ledger directory capability: {error}"
         ))
-    })?;
-    if suffix.is_empty()
-        || suffix.starts_with(b"/")
-        || suffix.windows(2).any(|window| window == b"//")
-    {
-        return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-            "inherited ledger path is not canonical: {}",
-            path.display()
-        )));
-    }
-    let mut suffix_components = suffix.split(|byte| *byte == b'/');
-    let descriptor = suffix_components
-        .next()
-        .expect("non-empty inherited descriptor suffix has a first component");
-    if descriptor.is_empty()
-        || !descriptor.iter().all(u8::is_ascii_digit)
-        || (descriptor.len() > 1 && descriptor[0] == b'0')
-        || std::str::from_utf8(descriptor)
-            .ok()
-            .and_then(|value| value.parse::<i32>().ok())
-            .filter(|fd| *fd >= 0)
-            .is_none()
-        || suffix_components.clone().next().is_none()
-        || suffix_components
-            .any(|component| component.is_empty() || component == b"." || component == b"..")
-    {
-        return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-            "inherited ledger path is not canonical: {}",
-            path.display()
-        )));
-    }
-    Ok(())
+    })
 }
 
-/// Return the descriptor in the sole supported `/dev/fd/N` spelling.
-#[cfg(target_os = "linux")]
-fn inherited_ledger_descriptor(path: &Path) -> Result<Option<i32>, LedgerSnapshotError> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let raw = path.as_os_str().as_bytes();
-    if !raw.starts_with(b"/dev/fd/") {
-        return Ok(None);
-    }
-    // `normalized_absolute` has already rejected aliases and malformed
-    // descriptor words.  Keep this parser self-contained so future callers
-    // cannot accidentally route an ambient `/dev/fd` path here.
-    validate_inherited_ledger_spelling(path)?;
-    let descriptor = raw[b"/dev/fd/".len()..]
-        .split(|byte| *byte == b'/')
-        .next()
-        .expect("validated inherited descriptor has a first component");
-    let fd = std::str::from_utf8(descriptor)
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-        .filter(|fd| *fd >= 0)
-        .ok_or_else(|| {
-            LedgerSnapshotError::UnsafeIntegrity(format!(
-                "inherited ledger descriptor is invalid: {}",
-                path.display()
-            ))
-        })?;
-    Ok(Some(fd))
-}
-
-/// Bind an inherited directory descriptor and traverse only its suffix with
-/// no-follow operations.  This is not ambient `/dev/fd` support: the raw
-/// spelling was validated before normalization and the descriptor itself is
-/// duplicated, validated, and retained as the sole root authority.
+/// Bind an inherited directory capability and traverse only the resolver's
+/// validated suffix with no-follow operations.
 #[cfg(target_os = "linux")]
 fn bound_inherited_parent(
     path: &Path,
 ) -> Result<Option<(fs::File, String, PathBuf)>, LedgerSnapshotError> {
-    let Some(root) = duplicate_inherited_ledger_root(path)? else {
+    let Some((root, suffix)) = inherited_ledger_root(path)? else {
         return Ok(None);
     };
-    bound_inherited_parent_from_root(path, root).map(Some)
+    bound_inherited_parent_from_root(path, root, &suffix).map(Some)
 }
 
-/// Duplicate the raw inherited descriptor before using it as a capability.
-#[cfg(target_os = "linux")]
-fn duplicate_inherited_ledger_root(path: &Path) -> Result<Option<fs::File>, LedgerSnapshotError> {
-    use std::os::fd::FromRawFd;
-
-    let Some(fd) = inherited_ledger_descriptor(path)? else {
-        return Ok(None);
-    };
-    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-            "duplicate inherited ledger descriptor {fd}: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    // SAFETY: F_DUPFD_CLOEXEC returned a new owned descriptor.
-    let root = unsafe { fs::File::from_raw_fd(duplicate) };
-    let metadata = root.metadata().map_err(|error| {
-        LedgerSnapshotError::UnsafeIntegrity(format!(
-            "inspect inherited ledger descriptor {fd}: {error}"
-        ))
-    })?;
-    if !metadata.is_dir() {
-        return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-            "inherited ledger descriptor must name a directory: {fd}"
-        )));
-    }
-    Ok(Some(root))
-}
-
-/// Traverse a validated ledger suffix from an already-held inherited root.
+/// Traverse a validated ledger suffix from an already-retained inherited root.
 #[cfg(target_os = "linux")]
 fn bound_inherited_parent_from_root(
     path: &Path,
-    root: fs::File,
+    root: kio_core::store_dir::StoreDirectory,
+    suffix: &[std::ffi::OsString],
 ) -> Result<(fs::File, String, PathBuf), LedgerSnapshotError> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let leaf = path
-        .file_name()
-        .and_then(|name| name.to_str())
+    let (leaf, parent_suffix) = suffix.split_last().ok_or_else(|| {
+        LedgerSnapshotError::UnsafeIntegrity("inherited ledger path has no file name".into())
+    })?;
+    let leaf = leaf
+        .to_str()
         .ok_or_else(|| LedgerSnapshotError::UnsafeIntegrity("ledger file name is invalid".into()))?
         .to_owned();
     let parent_path = path
         .parent()
         .ok_or_else(|| LedgerSnapshotError::UnsafeIntegrity("ledger has no parent".into()))?
         .to_owned();
-    let mut dir = root;
+    let mut dir = root.root_handle().try_clone().map_err(|error| {
+        LedgerSnapshotError::UnstableBusy(format!("clone inherited ledger root: {error}"))
+    })?;
 
-    let mut components = parent_path.components();
-    // Consume the inherited `/dev/fd/N` prefix in ordinary code.  These calls
-    // advance the iterator, so placing them only in `debug_assert!` would make
-    // release builds re-walk the prefix from RootDir and reject it as a suffix
-    // traversal component.
-    let root_component = components.next();
-    let dev_component = components.next();
-    let fd_component = components.next();
-    let descriptor_component = components.next();
-    debug_assert_eq!(root_component, Some(Component::RootDir));
-    debug_assert!(
-        matches!(dev_component, Some(Component::Normal(name)) if name.as_bytes() == b"dev")
-    );
-    debug_assert!(
-        matches!(fd_component, Some(Component::Normal(name)) if name.as_bytes() == b"fd")
-    );
-    debug_assert!(descriptor_component.is_some());
-    for component in components {
-        let Component::Normal(name) = component else {
-            return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-                "inherited ledger path contains traversal: {}",
-                path.display()
-            )));
-        };
+    for name in parent_suffix {
         let label = name.to_string_lossy();
         let before =
             cap_fs::stat(&dir, Path::new(name), cap_fs::FollowSymlinks::No).map_err(|error| {
@@ -682,7 +582,7 @@ fn bound_parent(path: &Path) -> Result<(fs::File, String, PathBuf), LedgerSnapsh
 /// between observations makes the operation retry and bind the new parent.
 fn stable_parent_binding(path: &Path) -> Result<Option<(fs::File, String, PathBuf)>, AttemptError> {
     #[cfg(target_os = "linux")]
-    if inherited_ledger_descriptor(path)
+    if inherited_ledger_root(path)
         .map_err(parent_binding_error)?
         .is_some()
     {
@@ -702,59 +602,53 @@ fn stable_parent_binding(path: &Path) -> Result<Option<(fs::File, String, PathBu
 }
 
 /// Confirm an inherited-path absence against one retained descriptor root,
-/// then prove that the canonical descriptor number still names that root just
-/// before accepting `Missing`.  Re-reading `/dev/fd/N` for both absence walks
-/// would let a same-process fd-table substitution join observations from two
-/// unrelated authority roots.
+/// then prove that the raw descriptor still names that root just before
+/// accepting `Missing`. Re-resolving `/dev/fd/N` for both absence walks would
+/// otherwise join observations from two unrelated authority roots.
 #[cfg(target_os = "linux")]
 fn stable_inherited_parent_binding(
     path: &Path,
 ) -> Result<Option<(fs::File, String, PathBuf)>, AttemptError> {
-    let root = match duplicate_inherited_ledger_root(path) {
-        Ok(Some(root)) => root,
-        Ok(None) => {
-            return Err(AttemptError::Unsafe(
-                "inherited ledger root disappeared".into(),
-            ));
-        }
-        Err(error) => return Err(parent_binding_error(error)),
-    };
-    let first = root
-        .try_clone()
-        .map_err(|error| AttemptError::Unstable(format!("clone inherited ledger root: {error}")))?;
-    match bound_inherited_parent_from_root(path, first) {
+    let (root, suffix) = inherited_ledger_root(path)
+        .map_err(parent_binding_error)?
+        .ok_or_else(|| AttemptError::Unsafe("inherited ledger root disappeared".into()))?;
+    match bound_inherited_parent_from_root(path, root.clone(), &suffix) {
         Ok(binding) => Ok(Some(binding)),
         Err(LedgerSnapshotError::Missing) => {
-            let second = root.try_clone().map_err(|error| {
-                AttemptError::Unstable(format!("re-clone inherited ledger root: {error}"))
-            })?;
-            match bound_inherited_parent_from_root(path, second) {
+            match bound_inherited_parent_from_root(path, root.clone(), &suffix) {
                 Ok(_) => Err(AttemptError::Unstable(
                     "ledger parent appeared while confirming its absence".into(),
                 )),
                 Err(LedgerSnapshotError::Missing) => {
-                    let fresh_root = match duplicate_inherited_ledger_root(path) {
-                        Ok(Some(root)) => root,
-                        Ok(None) => {
-                            return Err(AttemptError::Unstable(
+                    let (fresh_root, fresh_suffix) = inherited_ledger_root(path)
+                        .map_err(parent_binding_error)?
+                        .ok_or_else(|| {
+                            AttemptError::Unstable(
                                 "inherited ledger root disappeared while confirming absence".into(),
-                            ));
-                        }
-                        Err(error) => return Err(parent_binding_error(error)),
-                    };
+                            )
+                        })?;
+                    if fresh_suffix != suffix {
+                        return Err(AttemptError::Unsafe(
+                            "inherited ledger suffix changed while confirming absence".into(),
+                        ));
+                    }
                     require_same_inherited_root(&root, &fresh_root, "while confirming absence")?;
-                    match bound_inherited_parent_from_root(path, fresh_root) {
+                    match bound_inherited_parent_from_root(path, fresh_root, &suffix) {
                         Err(LedgerSnapshotError::Missing) => {
-                            let post_walk_root = match duplicate_inherited_ledger_root(path) {
-                                Ok(Some(root)) => root,
-                                Ok(None) => {
-                                    return Err(AttemptError::Unstable(
+                            let (post_walk_root, post_walk_suffix) = inherited_ledger_root(path)
+                                .map_err(parent_binding_error)?
+                                .ok_or_else(|| {
+                                    AttemptError::Unstable(
                                         "inherited ledger root disappeared after final absence walk"
                                             .into(),
-                                    ));
-                                }
-                                Err(error) => return Err(parent_binding_error(error)),
-                            };
+                                    )
+                                })?;
+                            if post_walk_suffix != suffix {
+                                return Err(AttemptError::Unsafe(
+                                    "inherited ledger suffix changed after final absence walk"
+                                        .into(),
+                                ));
+                            }
                             require_same_inherited_root(
                                 &root,
                                 &post_walk_root,
@@ -777,16 +671,18 @@ fn stable_inherited_parent_binding(
 
 #[cfg(target_os = "linux")]
 fn require_same_inherited_root(
-    held: &fs::File,
-    fresh: &fs::File,
+    held: &kio_core::store_dir::StoreDirectory,
+    fresh: &kio_core::store_dir::StoreDirectory,
     phase: &str,
 ) -> Result<(), AttemptError> {
-    let held_metadata = cap_fs::Metadata::from_file(held).map_err(|error| {
-        AttemptError::Unstable(format!("inspect retained inherited ledger root: {error}"))
-    })?;
-    let fresh_metadata = cap_fs::Metadata::from_file(fresh).map_err(|error| {
-        AttemptError::Unstable(format!("inspect fresh inherited ledger root: {error}"))
-    })?;
+    let held_metadata =
+        cap_fs::Metadata::from_file(held.root_handle().as_ref()).map_err(|error| {
+            AttemptError::Unstable(format!("inspect retained inherited ledger root: {error}"))
+        })?;
+    let fresh_metadata =
+        cap_fs::Metadata::from_file(fresh.root_handle().as_ref()).map_err(|error| {
+            AttemptError::Unstable(format!("inspect fresh inherited ledger root: {error}"))
+        })?;
     if !same_identity(&held_metadata, &fresh_metadata) {
         return Err(AttemptError::Unsafe(format!(
             "inherited ledger root identity changed {phase}"
@@ -1402,51 +1298,6 @@ fn verify_private_storage(
     }
 }
 
-fn validate_schema(conn: &Connection) -> rusqlite::Result<()> {
-    let expected = [
-        (
-            "table",
-            "cost_ledger",
-            super::schema::CREATE_COST_LEDGER_SQL,
-        ),
-        (
-            "table",
-            "batch_requests",
-            super::schema::CREATE_BATCH_REQUESTS_SQL,
-        ),
-        (
-            "table",
-            "schema_migrations",
-            super::schema::CREATE_SCHEMA_MIGRATIONS_SQL,
-        ),
-        (
-            "index",
-            "idx_cost_ledger_month",
-            super::schema::CREATE_IDX_COST_LEDGER_MONTH_SQL,
-        ),
-        (
-            "index",
-            "idx_batch_requests_inflight",
-            super::schema::CREATE_IDX_BATCH_REQUESTS_INFLIGHT_SQL,
-        ),
-    ];
-    for (kind, name, canonical) in expected {
-        let current: Option<String> = conn
-            .query_row(
-                "SELECT sql FROM sqlite_master WHERE type = ?1 AND name = ?2",
-                [kind, name],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if current.as_deref().map(super::schema::canonical_sql_tokens)
-            != Some(super::schema::canonical_sql_tokens(canonical))
-        {
-            return Err(rusqlite::Error::InvalidQuery);
-        }
-    }
-    Ok(())
-}
-
 fn manifest_identity_replaced(before: &Manifest, after: &Manifest) -> bool {
     fn changed(a: &Leaf, b: &Leaf) -> bool {
         matches!((a,b), (Leaf::Present(a), Leaf::Present(b)) if a.identity != b.identity)
@@ -1454,6 +1305,38 @@ fn manifest_identity_replaced(before: &Manifest, after: &Manifest) -> bool {
     changed(&before.main, &after.main)
         || changed(&before.wal, &after.wal)
         || changed(&before.shm, &after.shm)
+}
+
+fn classify_lifecycle_failure(
+    parent: &fs::File,
+    parent_path: &Path,
+    main: &str,
+    initial: &Manifest,
+    error: crate::PipelineError,
+) -> AttemptError {
+    match error {
+        crate::PipelineError::Contract { .. }
+        | crate::PipelineError::Corrupt { .. }
+        | crate::PipelineError::Schema(_) => match manifest_recheck(parent, parent_path, main) {
+            Ok(current) if current != *initial => AttemptError::Unstable(
+                "ledger changed while validating private lifecycle snapshot".into(),
+            ),
+            Ok(_) => AttemptError::Unsafe(format!("validate private ledger snapshot: {error}")),
+            Err(AttemptError::Unsafe(message)) => AttemptError::Unsafe(message),
+            Err(AttemptError::Missing) | Err(AttemptError::Unstable(_)) => AttemptError::Unstable(
+                "ledger unavailable while validating private lifecycle snapshot".into(),
+            ),
+        },
+        crate::PipelineError::Sqlite(error) => classify_sqlite_failure(
+            parent,
+            parent_path,
+            main,
+            initial,
+            error,
+            "validate private ledger snapshot",
+        ),
+        error => AttemptError::Unstable(format!("validate private ledger snapshot: {error}")),
+    }
 }
 
 fn classify_sqlite_failure(
@@ -1519,8 +1402,38 @@ fn attempt_snapshot(
                     parent_path,
                 );
             }
-            fresh_parent_binding(parent, parent_path, main)?;
-            return Err(AttemptError::Missing);
+            let final_parent = fresh_parent_binding(parent, parent_path, main)?;
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook(
+                    SnapshotPhase::BeforeBoundLifecycleArtifactRead,
+                    attempt,
+                    parent_path,
+                );
+            }
+            let artifact_state = super::lifecycle::snapshot_artifact_state_from_retained_parent(
+                &final_parent,
+                parent_path,
+                main,
+            );
+            #[cfg(test)]
+            if let Some(hook) = hook {
+                hook(
+                    SnapshotPhase::AfterBoundLifecycleArtifactRead,
+                    attempt,
+                    parent_path,
+                );
+            }
+            return match artifact_state {
+                Ok(super::lifecycle_fs::ArtifactSetState::Missing) => Err(AttemptError::Missing),
+                Ok(super::lifecycle_fs::ArtifactSetState::Complete)
+                | Ok(super::lifecycle_fs::ArtifactSetState::Partial { .. }) => {
+                    Err(AttemptError::Unsafe(
+                        "ledger lifecycle artifacts remain after database disappearance".into(),
+                    ))
+                }
+                Err(error) => Err(classify_absence_lifecycle_failure(error)),
+            };
         }
         return Err(AttemptError::Unstable(
             "ledger appeared while confirming an all-absent snapshot".into(),
@@ -1553,18 +1466,33 @@ fn attempt_snapshot(
     conn.pragma_update(None, "query_only", "ON").map_err(|e| {
         AttemptError::Unstable(format!("make private ledger snapshot query only: {e}"))
     })?;
-    // Validate the complete ledger shape first: a stable missing table/index
-    // is an integrity failure, never a transient failed `cost_ledger` probe.
-    validate_schema(&conn).map_err(|e| {
-        classify_sqlite_failure(
-            parent,
+    // Preserve the canonical parent binding before consulting lifecycle
+    // sidecars by pathname. This keeps a detached/replaced parent from being
+    // mistaken for a stable authority validation failure.
+    let lifecycle_parent = fresh_parent_binding(parent, parent_path, main)?;
+    // Bind the copied database to the authority/checkpoint sidecars without
+    // reopening the live SQLite source. A missing, partial, or corrupt
+    // authority is unsafe/unstable, never the all-absent `Missing` result.
+    #[cfg(test)]
+    if let Some(hook) = hook {
+        hook(
+            SnapshotPhase::BeforeBoundLifecycleRead,
+            attempt,
             parent_path,
-            main,
-            &initial,
-            e,
-            "validate private ledger schema",
-        )
-    })?;
+        );
+    }
+    let lifecycle_validation = super::lifecycle::validate_read_snapshot_from_retained_parent(
+        &lifecycle_parent,
+        parent_path,
+        main,
+        &conn,
+    );
+    #[cfg(test)]
+    if let Some(hook) = hook {
+        hook(SnapshotPhase::AfterBoundLifecycleRead, attempt, parent_path);
+    }
+    lifecycle_validation
+        .map_err(|error| classify_lifecycle_failure(parent, parent_path, main, &initial, error))?;
     // The real table probe then proves committed WAL visibility before source recheck.
     conn.query_row("SELECT 1 FROM cost_ledger LIMIT 1", [], |r| {
         r.get::<_, i64>(0)
@@ -1618,17 +1546,63 @@ fn attempt_snapshot(
     })
 }
 
+fn classify_absence_lifecycle_failure(error: crate::PipelineError) -> AttemptError {
+    match error {
+        crate::PipelineError::Contract { .. }
+        | crate::PipelineError::Corrupt { .. }
+        | crate::PipelineError::Schema(_) => AttemptError::Unsafe(format!(
+            "inspect absent ledger lifecycle artifacts: {error}"
+        )),
+        error => AttemptError::Unstable(format!(
+            "inspect absent ledger lifecycle artifacts: {error}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::ops::phase1_intent;
+    use crate::ledger::ops_sql::phase1_intent;
     use crate::ledger::{LedgerDb, RequestKind, TaskKey};
 
-    fn ledger() -> (tempfile::TempDir, PathBuf, LedgerDb) {
+    /// Snapshot fixtures initialize through the lifecycle boundary, then use a
+    /// separate raw SQLite connection for deliberate source mutations.  The
+    /// private snapshot connection never receives that writable connection.
+    fn ledger() -> (tempfile::TempDir, PathBuf, Connection) {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cost-ledger.sqlite");
-        let db = LedgerDb::open(&path).unwrap();
-        (dir, path, db)
+        let path = private_test_dir(dir.path(), "device").join("cost-ledger.sqlite");
+        initialize_ledger(&path);
+        let conn = Connection::open(&path).unwrap();
+        (dir, path, conn)
+    }
+
+    fn private_test_dir(parent: &Path, name: &str) -> PathBuf {
+        let path = parent.join(name);
+        fs::create_dir(&path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        fs::canonicalize(path).unwrap()
+    }
+
+    fn private_test_root(dir: &tempfile::TempDir) -> PathBuf {
+        let path = dir.path().join("device");
+        if path.exists() {
+            fs::canonicalize(path).unwrap()
+        } else {
+            private_test_dir(dir.path(), "device")
+        }
+    }
+
+    fn initialize_ledger(path: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        drop(LedgerDb::initialize(path).unwrap());
     }
 
     #[cfg(target_os = "linux")]
@@ -1646,6 +1620,17 @@ mod tests {
             "RLIMIT_NOFILE is too small for descriptor tests"
         );
         upper - 16
+    }
+
+    /// The shared test runner may use umask 022, so inherited-descriptor
+    /// fixtures must make the descriptor root owner-private explicitly.
+    #[cfg(target_os = "linux")]
+    fn private_fd_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut builder = tempfile::Builder::new();
+        builder.permissions(fs::Permissions::from_mode(0o700));
+        builder.tempdir().unwrap()
     }
 
     #[derive(Debug, PartialEq, Eq)]
@@ -1669,50 +1654,65 @@ mod tests {
     }
 
     fn source_bytes(path: &Path) -> Vec<(String, SourceLeaf)> {
-        ["", "-wal", "-shm", ".write-seq"]
-            .into_iter()
-            .map(|suffix| {
-                let leaf = PathBuf::from(format!("{}{}", path.display(), suffix));
-                let state = match fs::symlink_metadata(&leaf) {
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        SourceLeaf::Absent
-                    }
-                    Err(error) => panic!("observe {}: {error}", leaf.display()),
-                    Ok(metadata) => {
-                        let bytes = fs::read(&leaf).unwrap();
+        [
+            "",
+            "-wal",
+            "-shm",
+            ".authority.json",
+            ".checkpoint.json",
+            ".init.pending",
+            ".write.pending.json",
+        ]
+        .into_iter()
+        .map(|suffix| {
+            (
+                suffix.to_owned(),
+                PathBuf::from(format!("{}{}", path.display(), suffix)),
+            )
+        })
+        .chain(std::iter::once((
+            "ledger.lifecycle.lock".to_owned(),
+            path.parent().unwrap().join("ledger.lifecycle.lock"),
+        )))
+        .map(|(name, leaf)| {
+            let state = match fs::symlink_metadata(&leaf) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => SourceLeaf::Absent,
+                Err(error) => panic!("observe {}: {error}", leaf.display()),
+                Ok(metadata) => {
+                    let bytes = fs::read(&leaf).unwrap();
+                    #[cfg(unix)]
+                    use std::os::unix::fs::MetadataExt;
+                    SourceLeaf::Present {
+                        regular: metadata.file_type().is_file(),
+                        symlink: metadata.file_type().is_symlink(),
+                        readonly: metadata.permissions().readonly(),
+                        bytes: metadata.len(),
+                        sha256: Sha256::digest(&bytes).into(),
                         #[cfg(unix)]
-                        use std::os::unix::fs::MetadataExt;
-                        SourceLeaf::Present {
-                            regular: metadata.file_type().is_file(),
-                            symlink: metadata.file_type().is_symlink(),
-                            readonly: metadata.permissions().readonly(),
-                            bytes: metadata.len(),
-                            sha256: Sha256::digest(&bytes).into(),
-                            #[cfg(unix)]
-                            mode: metadata.mode(),
-                            #[cfg(unix)]
-                            nlink: metadata.nlink(),
-                            #[cfg(unix)]
-                            dev: metadata.dev(),
-                            #[cfg(unix)]
-                            ino: metadata.ino(),
-                        }
+                        mode: metadata.mode(),
+                        #[cfg(unix)]
+                        nlink: metadata.nlink(),
+                        #[cfg(unix)]
+                        dev: metadata.dev(),
+                        #[cfg(unix)]
+                        ino: metadata.ino(),
                     }
-                };
-                (suffix.to_owned(), state)
-            })
-            .collect()
+                }
+            };
+            (name, state)
+        })
+        .collect()
     }
 
     #[test]
     fn snapshot_totals_include_costs_and_active_reservations_without_source_writes() {
         let (_dir, path, db) = ledger();
-        db.connection().execute(
+        db.execute(
             "INSERT INTO cost_ledger (scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,estimated,outcome,month,recorded_at)
              VALUES ('scope-a','markdownize','input-a','profile-a',1,'job-a',2.5,0,'succeeded','2026-08',0)", [],
         ).unwrap();
         let key = TaskKey::new("scope-a", "markdownize", "input-b", "profile-a");
-        phase1_intent(db.connection(), &key, RequestKind::Batch, 1.25, None).unwrap();
+        phase1_intent(&db, &key, RequestKind::Batch, 1.25, None).unwrap();
         let before = source_bytes(&path);
         let snapshot = LedgerReadSnapshot::open(&path).unwrap();
         assert_eq!(snapshot.month_total(None, None, "2026-08").unwrap(), 3.75);
@@ -1732,16 +1732,14 @@ mod tests {
     #[test]
     fn snapshot_reads_committed_wal_without_copying_shm() {
         let (_dir, path, db) = ledger();
-        db.connection()
-            .execute_batch("PRAGMA wal_autocheckpoint = 0;")
-            .unwrap();
+        db.execute_batch("PRAGMA wal_autocheckpoint = 0;").unwrap();
         // Keep a reader transaction and the writer alive: WAL must remain the
         // committed source of truth while the private main+WAL copy is opened.
         let reader = rusqlite::Connection::open(&path).unwrap();
         reader
             .execute_batch("BEGIN; SELECT count(*) FROM cost_ledger;")
             .unwrap();
-        db.connection().execute(
+        db.execute(
             "INSERT INTO cost_ledger (scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,estimated,outcome,month,recorded_at)
              VALUES ('scope-w','markdownize','input-w','profile-w',1,'job-w',4.0,0,'succeeded','2026-08',0)", [],
         ).unwrap();
@@ -1757,7 +1755,7 @@ mod tests {
     #[test]
     fn missing_ledger_is_a_no_create_miss() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing.sqlite");
+        let path = private_test_root(&dir).join("missing.sqlite");
         assert!(matches!(
             LedgerReadSnapshot::open(&path),
             Err(LedgerSnapshotError::Missing)
@@ -1766,9 +1764,30 @@ mod tests {
     }
 
     #[test]
+    fn present_ledger_with_missing_authority_is_unsafe_not_zero() {
+        let (_dir, path, _writer) = ledger();
+        fs::remove_file(PathBuf::from(format!("{}.authority.json", path.display()))).unwrap();
+        assert!(matches!(
+            LedgerReadSnapshot::open(&path),
+            Err(LedgerSnapshotError::UnsafeIntegrity(_))
+        ));
+    }
+
+    #[test]
+    fn absent_database_with_lifecycle_artifacts_is_unsafe_not_zero() {
+        let (_dir, path, writer) = ledger();
+        drop(writer);
+        fs::remove_file(&path).unwrap();
+        assert!(matches!(
+            LedgerReadSnapshot::open(&path),
+            Err(LedgerSnapshotError::UnsafeIntegrity(_))
+        ));
+    }
+
+    #[test]
     fn all_absent_miss_never_attempts_private_temp_storage() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing.sqlite");
+        let path = private_test_root(&dir).join("missing.sqlite");
         let attempted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let observed = attempted.clone();
         PRIVATE_STORAGE_CREATE_HOOK.with(|slot| {
@@ -1791,7 +1810,7 @@ mod tests {
     #[test]
     fn missing_parent_is_a_no_create_miss() {
         let dir = tempfile::tempdir().unwrap();
-        let missing_parent = dir.path().join("missing-parent");
+        let missing_parent = private_test_root(&dir).join("missing-parent");
         let path = missing_parent.join("cost-ledger.sqlite");
         assert!(matches!(
             LedgerReadSnapshot::open(&path),
@@ -1803,15 +1822,15 @@ mod tests {
     #[test]
     fn missing_parent_appearing_before_confirmation_is_retried_and_observed() {
         let dir = tempfile::tempdir().unwrap();
-        let missing_parent = dir.path().join("appearing-parent");
+        let missing_parent = private_test_root(&dir).join("appearing-parent");
         let path = missing_parent.join("cost-ledger.sqlite");
         let source = path.clone();
         MISSING_PARENT_HOOK.with(|slot| {
             *slot.borrow_mut() = Some(std::sync::Arc::new(move || {
                 fs::create_dir(&missing_parent).unwrap();
-                let ledger = LedgerDb::open(&source).unwrap();
-                ledger
-                    .connection()
+                initialize_ledger(&source);
+                Connection::open(&source)
+                    .unwrap()
                     .execute(
                         "INSERT INTO cost_ledger (
                             scope_id, adapter_kind, input_hash, tool_profile_hash,
@@ -1835,13 +1854,13 @@ mod tests {
     #[test]
     fn all_absent_source_appearing_before_confirmation_is_retried() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("cost-ledger.sqlite");
+        let path = private_test_root(&dir).join("cost-ledger.sqlite");
         let source = path.clone();
         let hook: SnapshotHook = std::sync::Arc::new(move |phase, attempt, _| {
             if attempt == 0 && matches!(phase, SnapshotPhase::AfterInitialManifest) {
-                let ledger = LedgerDb::open(&source).unwrap();
-                ledger
-                    .connection()
+                initialize_ledger(&source);
+                Connection::open(&source)
+                    .unwrap()
                     .execute(
                         "INSERT INTO cost_ledger (
                             scope_id, adapter_kind, input_hash, tool_profile_hash,
@@ -1863,10 +1882,9 @@ mod tests {
     #[test]
     fn all_absent_whole_parent_substitution_is_unsafe_not_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let canonical_parent = dir.path().join("canonical");
-        fs::create_dir(&canonical_parent).unwrap();
+        let canonical_parent = private_test_dir(&private_test_root(&dir), "canonical");
         let path = canonical_parent.join("cost-ledger.sqlite");
-        let moved_parent = dir.path().join("detached");
+        let moved_parent = private_test_root(&dir).join("detached");
         let replacement_parent = canonical_parent.clone();
         let replacement_path = path.clone();
         let hook: SnapshotHook = std::sync::Arc::new(move |phase, attempt, _| {
@@ -1874,7 +1892,7 @@ mod tests {
             {
                 fs::rename(&replacement_parent, &moved_parent).unwrap();
                 fs::create_dir(&replacement_parent).unwrap();
-                drop(LedgerDb::open(&replacement_path).unwrap());
+                initialize_ledger(&replacement_path);
             }
         });
 
@@ -1891,11 +1909,10 @@ mod tests {
     #[test]
     fn present_snapshot_whole_parent_substitution_is_unsafe() {
         let dir = tempfile::tempdir().unwrap();
-        let canonical_parent = dir.path().join("canonical");
-        fs::create_dir(&canonical_parent).unwrap();
+        let canonical_parent = private_test_dir(&private_test_root(&dir), "canonical");
         let path = canonical_parent.join("cost-ledger.sqlite");
-        drop(LedgerDb::open(&path).unwrap());
-        let moved_parent = dir.path().join("detached");
+        initialize_ledger(&path);
+        let moved_parent = private_test_root(&dir).join("detached");
         let replacement_parent = canonical_parent.clone();
         let replacement_path = path.clone();
         let hook: SnapshotHook = std::sync::Arc::new(move |phase, attempt, _| {
@@ -1903,7 +1920,7 @@ mod tests {
             {
                 fs::rename(&replacement_parent, &moved_parent).unwrap();
                 fs::create_dir(&replacement_parent).unwrap();
-                drop(LedgerDb::open(&replacement_path).unwrap());
+                initialize_ledger(&replacement_path);
             }
         });
 
@@ -1926,10 +1943,9 @@ mod tests {
         use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 
         let dir = tempfile::tempdir().unwrap();
-        let canonical_parent = dir.path().join("canonical");
-        fs::create_dir(&canonical_parent).unwrap();
+        let canonical_parent = private_test_dir(&private_test_root(&dir), "canonical");
         let path = canonical_parent.join("cost-ledger.sqlite");
-        let moved_parent = dir.path().join("detached");
+        let moved_parent = private_test_root(&dir).join("detached");
         let replacement_parent = canonical_parent.clone();
         let hook_moved_parent = moved_parent.clone();
         let rename_checked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1972,12 +1988,11 @@ mod tests {
         use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 
         let dir = tempfile::tempdir().unwrap();
-        let canonical_parent = dir.path().join("canonical");
-        fs::create_dir(&canonical_parent).unwrap();
+        let canonical_parent = private_test_dir(&private_test_root(&dir), "canonical");
         let path = canonical_parent.join("cost-ledger.sqlite");
-        let original = LedgerDb::open(&path).unwrap();
+        initialize_ledger(&path);
+        let original = Connection::open(&path).unwrap();
         original
-            .connection()
             .execute(
                 "INSERT INTO cost_ledger (scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,estimated,outcome,month,recorded_at)
                  VALUES ('scope-original','markdownize','input-original','profile-original',1,'job-original',2.5,0,'succeeded','2026-08',0)",
@@ -1985,7 +2000,7 @@ mod tests {
             )
             .unwrap();
         drop(original);
-        let moved_parent = dir.path().join("detached");
+        let moved_parent = private_test_root(&dir).join("detached");
         let replacement_parent = canonical_parent.clone();
         let hook_moved_parent = moved_parent.clone();
         let rename_checked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2207,7 +2222,6 @@ mod tests {
 
         let (dir, path, writer) = ledger();
         writer
-            .connection()
             .execute(
                 "INSERT INTO cost_ledger (scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,estimated,outcome,month,recorded_at)
                  VALUES ('scope-original','markdownize','input-original','profile-original',1,'job-original',4.0,0,'succeeded','2026-08',0)",
@@ -2258,8 +2272,8 @@ mod tests {
         let source = path.clone();
         let hook: SnapshotHook = std::sync::Arc::new(move |phase, attempt, _| {
             if matches!(phase, SnapshotPhase::AfterProbeBeforeRecheck) {
-                let db = LedgerDb::open(&source).unwrap();
-                db.connection()
+                Connection::open(&source)
+                    .unwrap()
                     .execute_batch(&format!("PRAGMA user_version = {};", attempt + 10))
                     .unwrap();
             }
@@ -2275,12 +2289,12 @@ mod tests {
     fn inherited_directory_descriptor_is_a_capability_relative_ledger_parent() {
         use std::os::fd::AsRawFd;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_fd_root();
         let retained_root = fs::File::open(directory.path()).unwrap();
-        let actual = directory.path().join("kio/cost-ledger.sqlite");
-        fs::create_dir(directory.path().join("kio")).unwrap();
-        let db = LedgerDb::open(&actual).unwrap();
-        db.connection()
+        let actual = private_test_dir(directory.path(), "kio").join("cost-ledger.sqlite");
+        initialize_ledger(&actual);
+        let db = Connection::open(&actual).unwrap();
+        db
             .execute(
                 "INSERT INTO cost_ledger (scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,estimated,outcome,month,recorded_at) VALUES ('descriptor','embedding','input','profile',1,'job',2.0,0,'succeeded','2026-08',0)",
                 [],
@@ -2297,10 +2311,130 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn inherited_snapshot_keeps_lifecycle_reads_on_the_bound_parent_after_fd_swap() {
+        use std::os::fd::AsRawFd;
+
+        let root_a = private_fd_root();
+        let root_b = private_fd_root();
+        let actual = private_test_dir(root_a.path(), "kio").join("cost-ledger.sqlite");
+        initialize_ledger(&actual);
+        let held_a = fs::File::open(root_a.path()).unwrap();
+        let held_b = fs::File::open(root_b.path()).unwrap();
+        let restore_a = fs::File::open(root_a.path()).unwrap();
+        let descriptor = unsafe {
+            libc::fcntl(
+                held_a.as_raw_fd(),
+                libc::F_DUPFD_CLOEXEC,
+                high_test_descriptor_minimum(),
+            )
+        };
+        assert!(descriptor >= high_test_descriptor_minimum());
+        let inherited = PathBuf::from(format!("/dev/fd/{descriptor}/kio/cost-ledger.sqlite"));
+        let swapped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let restored = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_b = held_b;
+        let hook_a = held_a;
+        let hook_swapped = std::sync::Arc::clone(&swapped);
+        let hook_restored = std::sync::Arc::clone(&restored);
+        let hook: SnapshotHook = std::sync::Arc::new(move |phase, _, _| match phase {
+            SnapshotPhase::BeforeBoundLifecycleRead => {
+                assert_eq!(
+                    unsafe { libc::dup2(hook_b.as_raw_fd(), descriptor) },
+                    descriptor
+                );
+                hook_swapped.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            SnapshotPhase::AfterBoundLifecycleRead => {
+                assert_eq!(
+                    unsafe { libc::dup2(hook_a.as_raw_fd(), descriptor) },
+                    descriptor
+                );
+                hook_restored.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            _ => {}
+        });
+
+        let snapshot = LedgerReadSnapshot::open_for_test(&inherited, 1, hook)
+            .expect("lifecycle authority must remain bound to root A");
+        assert_eq!(snapshot.month_total(None, None, "2026-08").unwrap(), 0.0);
+        assert!(swapped.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(restored.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!root_b.path().join("kio").exists());
+        assert_eq!(
+            unsafe { libc::dup2(restore_a.as_raw_fd(), descriptor) },
+            descriptor
+        );
+        assert_eq!(unsafe { libc::close(descriptor) }, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_all_absent_snapshot_checks_retained_lifecycle_artifacts_after_fd_swap() {
+        use std::os::fd::AsRawFd;
+
+        let root_a = private_fd_root();
+        let root_b = private_fd_root();
+        let actual = private_test_dir(root_a.path(), "kio").join("cost-ledger.sqlite");
+        initialize_ledger(&actual);
+        for suffix in ["", "-wal", "-shm"] {
+            let candidate = PathBuf::from(format!("{}{}", actual.display(), suffix));
+            if candidate.exists() {
+                fs::remove_file(candidate).unwrap();
+            }
+        }
+        assert!(actual.with_extension("sqlite.authority.json").exists());
+        assert!(actual.with_extension("sqlite.checkpoint.json").exists());
+
+        let held_a = fs::File::open(root_a.path()).unwrap();
+        let held_b = fs::File::open(root_b.path()).unwrap();
+        let restore_a = fs::File::open(root_a.path()).unwrap();
+        let descriptor = unsafe {
+            libc::fcntl(
+                held_a.as_raw_fd(),
+                libc::F_DUPFD_CLOEXEC,
+                high_test_descriptor_minimum(),
+            )
+        };
+        assert!(descriptor >= high_test_descriptor_minimum());
+        let inherited = PathBuf::from(format!("/dev/fd/{descriptor}/kio/cost-ledger.sqlite"));
+        let hook_b = held_b;
+        let hook_a = held_a;
+        let hook: SnapshotHook = std::sync::Arc::new(move |phase, _, _| match phase {
+            SnapshotPhase::BeforeBoundLifecycleArtifactRead => {
+                assert_eq!(
+                    unsafe { libc::dup2(hook_b.as_raw_fd(), descriptor) },
+                    descriptor
+                );
+            }
+            SnapshotPhase::AfterBoundLifecycleArtifactRead => {
+                assert_eq!(
+                    unsafe { libc::dup2(hook_a.as_raw_fd(), descriptor) },
+                    descriptor
+                );
+            }
+            _ => {}
+        });
+
+        let result = LedgerReadSnapshot::open_for_test(&inherited, 1, hook);
+        assert!(matches!(
+            result,
+            Err(LedgerSnapshotError::UnsafeIntegrity(message))
+                if message.contains("lifecycle artifacts remain")
+        ));
+        assert!(!root_b.path().join("kio").exists());
+        assert_eq!(
+            unsafe { libc::dup2(restore_a.as_raw_fd(), descriptor) },
+            descriptor
+        );
+        assert_eq!(unsafe { libc::close(descriptor) }, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn inherited_ledger_descriptor_rejects_aliases_closed_and_non_directory_fds() {
         use std::os::fd::AsRawFd;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_fd_root();
         let retained_root = fs::File::open(directory.path()).unwrap();
         let fd = retained_root.as_raw_fd();
         let aliases = [
@@ -2333,28 +2467,9 @@ mod tests {
         ));
         assert!(matches!(
             LedgerReadSnapshot::open(&non_directory),
-            Err(LedgerSnapshotError::UnsafeIntegrity(message)) if message.contains("must name a directory")
+            Err(LedgerSnapshotError::UnsafeIntegrity(_))
         ));
         drop(retained_file);
-
-        let held = fs::File::open(directory.path()).unwrap();
-        let closed_fd = unsafe {
-            libc::fcntl(
-                held.as_raw_fd(),
-                libc::F_DUPFD_CLOEXEC,
-                high_test_descriptor_minimum(),
-            )
-        };
-        assert!(
-            closed_fd >= high_test_descriptor_minimum(),
-            "allocate a high deterministic descriptor"
-        );
-        assert_eq!(unsafe { libc::close(closed_fd) }, 0);
-        let closed_path = PathBuf::from(format!("/dev/fd/{closed_fd}/cost-ledger.sqlite"));
-        assert!(matches!(
-            LedgerReadSnapshot::open(&closed_path),
-            Err(LedgerSnapshotError::UnsafeIntegrity(message)) if message.contains("duplicate inherited ledger descriptor")
-        ));
 
         let proc_alias = PathBuf::from(format!("/proc/self/fd/{fd}/kio/cost-ledger.sqlite"));
         assert!(matches!(
@@ -2365,11 +2480,49 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn inherited_closed_descriptor_is_rejected_in_isolated_process() {
+        const CHILD: &str = "KIO_TEST_LEDGER_SNAPSHOT_CLOSED_FD_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ledger::snapshot::tests::inherited_closed_descriptor_is_rejected_in_isolated_process",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        use std::os::fd::AsRawFd;
+
+        let root = private_fd_root();
+        let held = fs::File::open(root.path()).unwrap();
+        let closed_fd = unsafe {
+            libc::fcntl(
+                held.as_raw_fd(),
+                libc::F_DUPFD_CLOEXEC,
+                high_test_descriptor_minimum(),
+            )
+        };
+        assert!(closed_fd >= high_test_descriptor_minimum());
+        assert_eq!(unsafe { libc::close(closed_fd) }, 0);
+        let closed_path = PathBuf::from(format!("/dev/fd/{closed_fd}/cost-ledger.sqlite"));
+        assert!(matches!(
+            LedgerReadSnapshot::open(&closed_path),
+            Err(LedgerSnapshotError::UnsafeIntegrity(_))
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn inherited_missing_cannot_join_absence_across_fd_root_substitution() {
         use std::os::fd::AsRawFd;
 
-        let root_a = tempfile::tempdir().unwrap();
-        let root_b = tempfile::tempdir().unwrap();
+        let root_a = private_fd_root();
+        let root_b = private_fd_root();
         let held_a = fs::File::open(root_a.path()).unwrap();
         let held_b = fs::File::open(root_b.path()).unwrap();
         let descriptor = unsafe {
@@ -2407,8 +2560,8 @@ mod tests {
     fn inherited_missing_rechecks_fd_root_after_final_absence_walk() {
         use std::os::fd::AsRawFd;
 
-        let root_a = tempfile::tempdir().unwrap();
-        let root_b = tempfile::tempdir().unwrap();
+        let root_a = private_fd_root();
+        let root_b = private_fd_root();
         let held_a = fs::File::open(root_a.path()).unwrap();
         let held_b = fs::File::open(root_b.path()).unwrap();
         let descriptor = unsafe {
@@ -2446,8 +2599,8 @@ mod tests {
     fn inherited_ledger_descriptor_rejects_symlink_suffix_without_accepting_victim() {
         use std::{os::fd::AsRawFd, os::unix::fs::symlink};
 
-        let directory = tempfile::tempdir().unwrap();
-        let victim = tempfile::tempdir().unwrap();
+        let directory = private_fd_root();
+        let victim = private_fd_root();
         let retained_root = fs::File::open(directory.path()).unwrap();
         let child = directory.path().join("kio");
         symlink(victim.path(), &child).unwrap();
@@ -2466,8 +2619,7 @@ mod tests {
     #[test]
     fn stable_schema_mismatch_is_unsafe_not_retryable() {
         let (_dir, path, db) = ledger();
-        db.connection()
-            .execute_batch("DROP INDEX idx_cost_ledger_month;")
+        db.execute_batch("DROP INDEX idx_cost_ledger_month;")
             .unwrap();
         assert!(matches!(
             LedgerReadSnapshot::open(&path),
@@ -2478,9 +2630,7 @@ mod tests {
     #[test]
     fn stable_missing_cost_table_is_unsafe_before_probe() {
         let (_dir, path, db) = ledger();
-        db.connection()
-            .execute_batch("DROP TABLE cost_ledger;")
-            .unwrap();
+        db.execute_batch("DROP TABLE cost_ledger;").unwrap();
         assert!(matches!(
             LedgerReadSnapshot::open(&path),
             Err(LedgerSnapshotError::UnsafeIntegrity(_))

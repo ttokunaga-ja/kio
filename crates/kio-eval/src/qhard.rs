@@ -25,8 +25,8 @@ use std::{
 };
 
 use cap_primitives::{ambient_authority, fs as cap_fs};
-use kio_core::cas::hash_bytes;
-use kio_pipeline::task::rebase_normalized_output_refs_for_relocated_store;
+use kio_core::{cas::hash_bytes, store_dir::StoreDirectory};
+use kio_pipeline::task::{MAX_TASK_STORE_BYTES, TaskStore};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -1185,12 +1185,12 @@ fn registry_scope_relative(
     Ok(relative.to_path_buf())
 }
 
-/// The private measurement snapshot has a distinct absolute root, while
-/// current task journals bind completed normalized outputs to their owning
-/// store's canonical absolute path.  Rebase only the already-copied,
-/// attested scope journals through the pipeline's strict capability-safe
-/// relocation boundary; never parse or rewrite journal JSON here.
-fn rebase_snapshot_task_journals(
+/// Validate that private snapshot task journals retain the exact bytes copied
+/// from the attested fixture. Normalized task output references are portable,
+/// so relocating a fixture must never rewrite its journal. Parsing the copied
+/// store also rejects a snapshot whose journal is corrupt or no longer valid
+/// for its destination `.kio` directory.
+fn validate_snapshot_task_journals(
     source_root: &Path,
     snapshot_root: &Path,
     source_scopes: impl IntoIterator<Item = PathBuf>,
@@ -1214,16 +1214,50 @@ fn rebase_snapshot_task_journals(
     for relative in relatives {
         let source_kio = source_root.join(&relative).join(".kio");
         let snapshot_kio = snapshot_root.join(&relative).join(".kio");
-        rebase_normalized_output_refs_for_relocated_store(&source_kio, &snapshot_kio).map_err(
-            |error| {
-                QhardError::Input(format!(
-                    "cannot rebase private fixture task journal for {}: {error}",
-                    relative.display()
-                ))
-            },
-        )?;
+        let source_journal = source_kio.join("tasks.jsonl");
+        let snapshot_journal = snapshot_kio.join("tasks.jsonl");
+        let source_bytes = read_snapshot_task_journal(&source_journal)?;
+        let snapshot_bytes = read_snapshot_task_journal(&snapshot_journal)?;
+        if source_bytes != snapshot_bytes {
+            return Err(QhardError::Input(format!(
+                "private fixture task journal was not copied byte-identically for {}",
+                relative.display()
+            )));
+        }
+        TaskStore::new(&snapshot_kio).all().map_err(|error| {
+            QhardError::Input(format!(
+                "cannot validate private fixture task journal for {}: {error}",
+                relative.display()
+            ))
+        })?;
     }
     Ok(())
+}
+
+fn read_snapshot_task_journal(path: &Path) -> Result<Option<Vec<u8>>, QhardError> {
+    let parent = path
+        .parent()
+        .filter(|parent| parent.is_absolute())
+        .ok_or_else(|| {
+            QhardError::Input(format!(
+                "private fixture task journal parent is not absolute: {}",
+                path.display()
+            ))
+        })?;
+    let directory = StoreDirectory::open(parent).map_err(|error| {
+        QhardError::Input(format!(
+            "cannot retain private fixture task journal parent {}: {error}",
+            parent.display()
+        ))
+    })?;
+    directory
+        .read_optional(Path::new("tasks.jsonl"), MAX_TASK_STORE_BYTES)
+        .map_err(|error| {
+            QhardError::Input(format!(
+                "cannot read private fixture task journal {}: {error}",
+                path.display()
+            ))
+        })
 }
 
 fn snapshot_fixture(fixture: &Fixture) -> Result<FixtureSnapshot, QhardError> {
@@ -1244,7 +1278,7 @@ fn snapshot_fixture(fixture: &Fixture) -> Result<FixtureSnapshot, QhardError> {
         ));
     }
     let snapshot_root = copied_root.public_path.clone();
-    rebase_snapshot_task_journals(
+    validate_snapshot_task_journals(
         &fixture.root.public_path,
         &snapshot_root,
         fixture
@@ -1303,7 +1337,7 @@ fn snapshot_baseline_fixture(
                 .map(|scope| scope.public_path),
         );
     }
-    rebase_snapshot_task_journals(&source.public_path, &snapshot_root, source_scopes)?;
+    validate_snapshot_task_journals(&source.public_path, &snapshot_root, source_scopes)?;
     for persona in baseline_personas() {
         rewrite_snapshot_registry(&snapshot_root, &source.public_path, &persona)?;
     }
@@ -6628,7 +6662,7 @@ mod tests {
     }
 
     #[test]
-    fn fixture_snapshot_rebases_current_task_output_refs() {
+    fn fixture_snapshot_preserves_portable_current_task_output_refs() {
         let source = tempfile::tempdir().unwrap();
         let scope_relative = PathBuf::from("qhard/p01/home/work");
         let source_root = fs::canonicalize(source.path()).unwrap();
@@ -6653,7 +6687,9 @@ mod tests {
                 previous_raw_hash: None,
                 parent_run_id: None,
                 changed_unit_keys: Vec::new(),
-                output_ref: source_output.display().to_string(),
+                output_ref: kio_pipeline::task::normalized_task_output_ref(
+                    &raw_hash, &tool_hash, 0,
+                ),
                 unit_keys: None,
                 status: TaskStatus::Done,
                 attempts: 1,
@@ -6706,19 +6742,16 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(
             tasks[0].output_ref,
-            kio_pipeline::markdownize::normalized_instance_dir(
-                &snapshot_kio,
-                &raw_hash,
-                &tool_hash,
-                0,
-            )
-            .display()
-            .to_string(),
+            kio_pipeline::task::normalized_task_output_ref(&raw_hash, &tool_hash, 0),
+        );
+        assert_eq!(
+            fs::read(source_kio.join("tasks.jsonl")).unwrap(),
+            fs::read(snapshot_kio.join("tasks.jsonl")).unwrap(),
         );
     }
 
     #[test]
-    fn baseline_snapshot_rebases_each_current_scope_journal() {
+    fn baseline_snapshot_preserves_each_current_scope_journal() {
         let source = tempfile::tempdir().unwrap();
         let source_root = fs::canonicalize(source.path()).unwrap();
         let p01_scope = source_root.join("p01/home/work");
@@ -6738,7 +6771,9 @@ mod tests {
                 previous_raw_hash: None,
                 parent_run_id: None,
                 changed_unit_keys: Vec::new(),
-                output_ref: p01_output.display().to_string(),
+                output_ref: kio_pipeline::task::normalized_task_output_ref(
+                    &raw_hash, &tool_hash, 0,
+                ),
                 unit_keys: None,
                 status: TaskStatus::Done,
                 attempts: 1,
@@ -6780,14 +6815,11 @@ mod tests {
         let snapshot_kio = snapshot.public_path.join("p01/home/work/.kio");
         assert_eq!(
             TaskStore::new(&snapshot_kio).all().unwrap()[0].output_ref,
-            kio_pipeline::markdownize::normalized_instance_dir(
-                &snapshot_kio,
-                &raw_hash,
-                &tool_hash,
-                0,
-            )
-            .display()
-            .to_string(),
+            kio_pipeline::task::normalized_task_output_ref(&raw_hash, &tool_hash, 0),
+        );
+        assert_eq!(
+            fs::read(p01_kio.join("tasks.jsonl")).unwrap(),
+            fs::read(snapshot_kio.join("tasks.jsonl")).unwrap(),
         );
     }
 

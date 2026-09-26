@@ -584,12 +584,12 @@ fn verify_sealed_memfd(file: &fs::File) -> ProcessBoundaryResult<()> {
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     #[test]
     fn env_is_allowlisted_and_descriptor_backed() {
         let temp = tempfile::tempdir().unwrap();
         let home = temp.path().join("home");
-        fs::create_dir(&home).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&home).unwrap();
         let f = fs::File::open(&home).unwrap();
         let mut c = Command::new("/bin/sh");
         c.arg("-c")
@@ -602,6 +602,7 @@ mod tests {
     #[test]
     fn descriptor_environment_child_opens_ledger_through_inherited_xdg_fd() {
         const CHILD_MARKER: &str = "KIO_EVAL_DESCRIPTOR_LEDGER_CHILD";
+        const MONTH_MARKER: &str = "KIO_EVAL_DESCRIPTOR_LEDGER_MONTH";
         if matches!(std::env::var(CHILD_MARKER).as_deref(), Ok("1")) {
             use std::os::unix::ffi::OsStrExt;
 
@@ -620,23 +621,61 @@ mod tests {
             let ledger = PathBuf::from(xdg_data).join("kio/cost-ledger.sqlite");
             let snapshot = kio_pipeline::ledger::LedgerReadSnapshot::open(&ledger)
                 .expect("child must bind the inherited XDG descriptor");
-            assert_eq!(snapshot.month_total(None, None, "2026-08").unwrap(), 2.0);
+            let month = std::env::var(MONTH_MARKER).expect("parent supplies the recorded month");
+            assert_eq!(snapshot.month_total(None, None, &month).unwrap(), 2.0);
             return;
         }
 
-        let temp = tempfile::tempdir().unwrap();
-        let data = temp.path().join("data");
-        fs::create_dir(&data).unwrap();
-        let ledger_dir = data.join("kio");
-        fs::create_dir(&ledger_dir).unwrap();
-        let ledger = ledger_dir.join("cost-ledger.sqlite");
-        let db = kio_pipeline::ledger::LedgerDb::open(&ledger).unwrap();
-        db.connection()
-            .execute(
-                "INSERT INTO cost_ledger (scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,estimated,outcome,month,recorded_at) VALUES ('descriptor-child','embedding','input','profile',1,'job',2.0,0,'succeeded','2026-08',0)",
-                [],
-            )
+        let temp = tempfile::Builder::new()
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
             .unwrap();
+        let data = temp.path().join("data");
+        fs::DirBuilder::new().mode(0o700).create(&data).unwrap();
+        let ledger_dir = data.join("kio");
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&ledger_dir)
+            .unwrap();
+        let ledger = ledger_dir.join("cost-ledger.sqlite");
+        use kio_pipeline::ledger::{BatchState, Outcome, RequestKind, TaskKey, ops};
+        let db = kio_pipeline::ledger::LedgerDb::initialize(&ledger).unwrap();
+        let key = TaskKey {
+            scope_id: "descriptor-child".into(),
+            adapter_kind: "embedding".into(),
+            input_hash: "input".into(),
+            tool_profile_hash: "profile".into(),
+        };
+        let intent = ops::phase1_intent(&db, &key, RequestKind::Sync, 2.0, Some(30)).unwrap();
+        assert!(
+            ops::sync_record_provider_request_id(&db, &key, &intent.intent_token, "job").unwrap()
+        );
+        let receipt = ops::terminal_transaction(
+            &db,
+            &ops::TerminalWrite {
+                key: &key,
+                outcome: Outcome::Succeeded,
+                billed: ops::BilledAmount {
+                    usd: 2.0,
+                    estimated: false,
+                },
+                ledger_batch_job_id: "job",
+                next_state: BatchState::Completed,
+                error: None,
+                increment_contract_violation: false,
+                attempts_delta: 0,
+                clear_intent_token: true,
+                intent_token_guard: Some(&intent.intent_token),
+                reseat_submission_seq: false,
+            },
+        )
+        .unwrap();
+        assert!(receipt.recorded);
+        // The parent's durable row supplies the month, including a UTC month
+        // boundary between the settlement and the child process starting.
+        let rows = ops::cost_ledger_rows_for_key(&db, &key).unwrap();
+        assert_eq!(rows.len(), 1);
+        let month = rows[0].month.clone();
         drop(db);
         let data_handle = fs::File::open(&data).unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap());
@@ -648,6 +687,7 @@ mod tests {
         // This marker is deliberately set after `configure_descriptor_environment`,
         // which clears the inherited environment by design.
         child.env(CHILD_MARKER, "1");
+        child.env(MONTH_MARKER, month);
         assert!(child.status().unwrap().success());
     }
     #[test]

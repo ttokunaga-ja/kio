@@ -7,6 +7,7 @@
 //! in each scope.
 
 use std::{
+    collections::BTreeSet,
     fs,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -14,7 +15,7 @@ use std::{
 };
 
 use cap_primitives::fs as cap_fs;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 use crate::Result;
@@ -32,8 +33,26 @@ pub struct RegistryEntry {
     pub last_seen_at: String,
 }
 
+/// One app-prevalidated move of a scope's device-local registration.
+///
+/// `old_kio_paths` is the exact path set observed for `scope_id` before the
+/// app checked those former locations. It may include `new_registration`'s
+/// path when a prior interrupted rebind already inserted the destination row.
+/// This cache helper does not inspect the filesystem or claim that a supplied
+/// old path is absent; that authority remains with the app's preflight.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScopeRegistrationRebind {
+    pub scope_id: String,
+    pub old_kio_paths: Vec<String>,
+    pub new_registration: RegistryEntry,
+}
+
 pub struct RegistryDb {
     conn: Connection,
+    // An inherited `/dev/fd/N` registry is opened through this duplicated
+    // parent descriptor's procfs path. Keep it alive until SQLite closes so a
+    // caller retargeting the original descriptor cannot redirect the database.
+    _inherited_parent: Option<kio_core::store_dir::StoreDirectory>,
     // Declared after `conn`, so the database closes before its private snapshot
     // directory is removed.
     _snapshot: Option<RegistrySnapshot>,
@@ -245,6 +264,133 @@ fn index_error_from_snapshot(error: RegistrySnapshotError) -> crate::IndexError 
     }
 }
 
+#[cfg(target_os = "linux")]
+fn inherited_registry_parent(
+    path: &Path,
+) -> Result<Option<(PathBuf, kio_core::store_dir::StoreDirectory)>> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+
+    let Some((mut parent, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
+        .map_err(|error| {
+            crate::IndexError::Schema(format!(
+                "resolve inherited registry directory capability: {error}"
+            ))
+        })?
+    else {
+        return Ok(None);
+    };
+    let (leaf, parent_suffix) = suffix.split_last().ok_or_else(|| {
+        crate::IndexError::Schema("inherited scope registry path has no file name".to_owned())
+    })?;
+    let verify_owner_private_directory =
+        |directory: &kio_core::store_dir::StoreDirectory| -> Result<()> {
+            let metadata = directory.root_handle().metadata().map_err(|error| {
+                crate::IndexError::Schema(format!("inspect inherited registry parent: {error}"))
+            })?;
+            // SAFETY: geteuid has no arguments and no memory-safety preconditions.
+            let uid = unsafe { libc::geteuid() };
+            if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+                return Err(crate::IndexError::Schema(format!(
+                    "inherited registry parent is not owner-private: {}",
+                    directory.path().display()
+                )));
+            }
+            Ok(())
+        };
+
+    verify_owner_private_directory(&parent)?;
+    let mut logical = parent.path().to_path_buf();
+    for name in parent_suffix {
+        let component = Path::new(name);
+        logical.push(name);
+        let next = if parent
+            .contains_entry(component)
+            .map_err(|error| crate::IndexError::Schema(error.to_string()))?
+        {
+            parent
+                .open_directory(component)
+                .map_err(|error| crate::IndexError::Schema(error.to_string()))?
+        } else {
+            parent
+                .create_directory(component)
+                .map_err(|error| crate::IndexError::Schema(error.to_string()))?
+        };
+        parent = kio_core::store_dir::StoreDirectory::from_retained(next, logical.clone())
+            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+        // Existing directories are only verified, never chmod-repaired. New
+        // directories were restricted by StoreDirectory before this adoption.
+        verify_owner_private_directory(&parent)?;
+    }
+
+    let leaf = Path::new(leaf);
+    let name = CString::new(leaf.as_os_str().as_bytes()).map_err(|_| {
+        crate::IndexError::Schema("inherited scope registry leaf contains NUL".to_owned())
+    })?;
+    // Create a missing SQLite main leaf descriptor-relatively and owner-only
+    // before SQLite sees it. Existing state is opened with O_NOFOLLOW and
+    // validated, never chmod-repaired.
+    if !parent
+        .contains_entry(leaf)
+        .map_err(|error| crate::IndexError::Schema(error.to_string()))?
+    {
+        // SAFETY: `parent` is a retained directory capability and `name` is a
+        // single NUL-free component supplied by core's inherited-root parser.
+        let fd = unsafe {
+            libc::openat(
+                parent.root_handle().as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd >= 0 {
+            // SAFETY: openat returned an owned descriptor above.
+            let created = unsafe { fs::File::from_raw_fd(fd) };
+            let metadata = created.metadata().map_err(|error| {
+                crate::IndexError::Schema(format!(
+                    "inspect created inherited registry leaf: {error}"
+                ))
+            })?;
+            // SAFETY: geteuid has no arguments and no memory-safety preconditions.
+            let uid = unsafe { libc::geteuid() };
+            if !metadata.is_file()
+                || metadata.uid() != uid
+                || metadata.mode() & 0o077 != 0
+                || metadata.nlink() != 1
+            {
+                return Err(crate::IndexError::Schema(
+                    "created inherited registry leaf is not owner-private".to_owned(),
+                ));
+            }
+        } else {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::EEXIST) {
+                parent
+                    .ensure_owner_private(leaf)
+                    .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+            } else {
+                return Err(crate::IndexError::Schema(format!(
+                    "create inherited scope registry leaf: {error}"
+                )));
+            }
+        }
+    } else {
+        parent
+            .ensure_owner_private(leaf)
+            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+    }
+    let sqlite_path = PathBuf::from(format!(
+        "/proc/self/fd/{}",
+        parent.root_handle().as_raw_fd()
+    ))
+    .join(leaf);
+    Ok(Some((sqlite_path, parent)))
+}
+
 fn snapshot_query_error(error: crate::IndexError) -> RegistrySnapshotError {
     match error {
         crate::IndexError::Sqlite(rusqlite::Error::SqliteFailure(code, _))
@@ -292,9 +438,30 @@ enum SnapshotAttemptError {
     Unstable(String),
 }
 
+struct RegistryParentBinding {
+    parent: std::sync::Arc<fs::File>,
+    leaf: String,
+    parent_path: PathBuf,
+    // Keep the core-duplicated inherited root for the complete snapshot
+    // attempt. A later `/dev/fd/N` re-resolution is compared to this retained
+    // capability before a stable read or missing result is accepted.
+    #[cfg(target_os = "linux")]
+    inherited_root: Option<kio_core::store_dir::StoreDirectory>,
+}
+
 fn registry_parent_and_leaf(
     path: &Path,
-) -> std::result::Result<(fs::File, String, PathBuf), RegistrySnapshotError> {
+) -> std::result::Result<RegistryParentBinding, RegistrySnapshotError> {
+    #[cfg(target_os = "linux")]
+    if let Some((root, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
+        .map_err(|error| {
+            RegistrySnapshotError::UnsafeIntegrity(format!(
+                "resolve inherited registry directory capability: {error}"
+            ))
+        })?
+    {
+        return inherited_registry_parent_and_leaf(path, root, &suffix);
+    }
     let path = normalized_absolute_registry_path(path)?;
     let filesystem_root = registry_filesystem_root(&path)?;
     let leaf = path
@@ -394,7 +561,105 @@ fn registry_parent_and_leaf(
             index += 1;
         }
     }
-    Ok((handle, leaf.to_owned(), parent.to_owned()))
+    Ok(RegistryParentBinding {
+        parent: std::sync::Arc::new(handle),
+        leaf: leaf.to_owned(),
+        parent_path: parent.to_owned(),
+        #[cfg(target_os = "linux")]
+        inherited_root: None,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn inherited_registry_parent_and_leaf(
+    path: &Path,
+    root: kio_core::store_dir::StoreDirectory,
+    suffix: &[std::ffi::OsString],
+) -> std::result::Result<RegistryParentBinding, RegistrySnapshotError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let (leaf, parent_suffix) = suffix.split_last().ok_or_else(|| {
+        RegistrySnapshotError::UnsafeIntegrity(
+            "inherited scope registry path has no file name".to_owned(),
+        )
+    })?;
+    let leaf = leaf.to_str().ok_or_else(|| {
+        RegistrySnapshotError::UnsafeIntegrity(
+            "inherited scope registry path has no valid UTF-8 file name".to_owned(),
+        )
+    })?;
+    let parent_path = path.parent().ok_or_else(|| {
+        RegistrySnapshotError::UnsafeIntegrity(
+            "inherited scope registry path has no parent".to_owned(),
+        )
+    })?;
+    let mut parent = root.root_handle();
+    // SAFETY: geteuid has no arguments and no memory-safety preconditions.
+    let uid = unsafe { libc::geteuid() };
+    for name in parent_suffix {
+        let label = name.to_string_lossy();
+        let before =
+            match cap_fs::stat(parent.as_ref(), Path::new(name), cap_fs::FollowSymlinks::No) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(RegistrySnapshotError::Missing);
+                }
+                Err(error) => {
+                    return Err(RegistrySnapshotError::UnstableBusy(format!(
+                        "inspect inherited registry parent component {label}: {error}"
+                    )));
+                }
+            };
+        validate_directory(&before, &label)?;
+        let child =
+            cap_fs::open_dir_nofollow(parent.as_ref(), Path::new(name)).map_err(|error| {
+                RegistrySnapshotError::UnsafeIntegrity(format!(
+                    "open inherited registry parent component {label}: {error}"
+                ))
+            })?;
+        let opened = cap_fs::Metadata::from_file(&child).map_err(|error| {
+            RegistrySnapshotError::UnstableBusy(format!(
+                "inspect inherited registry parent component {label}: {error}"
+            ))
+        })?;
+        let after = cap_fs::stat(parent.as_ref(), Path::new(name), cap_fs::FollowSymlinks::No)
+            .map_err(|error| {
+                RegistrySnapshotError::UnsafeIntegrity(format!(
+                    "reinspect inherited registry parent component {label}: {error}"
+                ))
+            })?;
+        validate_directory(&opened, &label)?;
+        validate_directory(&after, &label)?;
+        let before_identity = leaf_identity(&before).ok_or_else(|| {
+            RegistrySnapshotError::UnsafeIntegrity(format!(
+                "inherited registry parent component has no usable identity: {label}"
+            ))
+        })?;
+        if leaf_identity(&opened).as_ref() != Some(&before_identity)
+            || leaf_identity(&after).as_ref() != Some(&before_identity)
+        {
+            return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
+                "inherited registry parent component changed while opening: {label}"
+            )));
+        }
+        let metadata = child.metadata().map_err(|error| {
+            RegistrySnapshotError::UnstableBusy(format!(
+                "inspect inherited registry parent permissions {label}: {error}"
+            ))
+        })?;
+        if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+            return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
+                "inherited registry parent is not owner-private: {label}"
+            )));
+        }
+        parent = std::sync::Arc::new(child);
+    }
+    Ok(RegistryParentBinding {
+        parent,
+        leaf: leaf.to_owned(),
+        parent_path: parent_path.to_owned(),
+        inherited_root: Some(root),
+    })
 }
 
 fn registry_parent_binding_error(error: RegistrySnapshotError) -> SnapshotAttemptError {
@@ -410,7 +675,53 @@ fn registry_parent_binding_error(error: RegistrySnapshotError) -> SnapshotAttemp
 /// a directory that may have been detached from the canonical path.
 fn stable_registry_parent_binding(
     path: &Path,
-) -> std::result::Result<Option<(fs::File, String, PathBuf)>, SnapshotAttemptError> {
+) -> std::result::Result<Option<RegistryParentBinding>, SnapshotAttemptError> {
+    #[cfg(target_os = "linux")]
+    if let Some((root, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
+        .map_err(|error| {
+            SnapshotAttemptError::Unsafe(format!(
+                "resolve inherited registry directory capability: {error}"
+            ))
+        })?
+    {
+        match inherited_registry_parent_and_leaf(path, root.clone(), &suffix) {
+            Ok(binding) => return Ok(Some(binding)),
+            Err(RegistrySnapshotError::Missing) => {
+                match inherited_registry_parent_and_leaf(path, root.clone(), &suffix) {
+                    Ok(_) => {
+                        return Err(SnapshotAttemptError::Unstable(
+                            "inherited registry parent appeared while confirming its absence"
+                                .to_owned(),
+                        ));
+                    }
+                    Err(RegistrySnapshotError::Missing) => {
+                        let (fresh_root, fresh_suffix) =
+                            kio_core::private_fs::resolve_inherited_private_root(path)
+                                .map_err(|error| {
+                                    SnapshotAttemptError::Unsafe(format!(
+                                        "re-resolve inherited registry directory capability: {error}"
+                                    ))
+                                })?
+                                .ok_or_else(|| {
+                                    SnapshotAttemptError::Unstable(
+                                        "inherited registry root disappeared while confirming absence"
+                                            .to_owned(),
+                                    )
+                                })?;
+                        if fresh_suffix != suffix || !same_inherited_root(&root, &fresh_root)? {
+                            return Err(SnapshotAttemptError::Unsafe(
+                                "inherited registry root changed while confirming absence"
+                                    .to_owned(),
+                            ));
+                        }
+                        return Ok(None);
+                    }
+                    Err(error) => return Err(registry_parent_binding_error(error)),
+                }
+            }
+            Err(error) => return Err(registry_parent_binding_error(error)),
+        }
+    }
     match registry_parent_and_leaf(path) {
         Ok(binding) => Ok(Some(binding)),
         Err(RegistrySnapshotError::Missing) => match registry_parent_and_leaf(path) {
@@ -427,30 +738,43 @@ fn stable_registry_parent_binding(
 /// Freshly bind the canonical parent at the acceptance boundary and require it
 /// to be the same directory as the descriptor used to capture the snapshot.
 fn fresh_registry_parent_binding(
-    held_parent: &fs::File,
-    parent_path: &Path,
-    main: &str,
-) -> std::result::Result<fs::File, SnapshotAttemptError> {
-    let canonical_path = parent_path.join(main);
-    let (fresh_parent, fresh_main, fresh_parent_path) =
-        match registry_parent_and_leaf(&canonical_path) {
-            Ok(binding) => binding,
-            Err(RegistrySnapshotError::Missing) => {
-                return Err(SnapshotAttemptError::Unstable(
-                    "scope registry canonical parent disappeared while snapshotting".to_owned(),
-                ));
-            }
-            Err(error) => return Err(registry_parent_binding_error(error)),
-        };
-    if fresh_main != main || fresh_parent_path != parent_path {
+    held: &RegistryParentBinding,
+) -> std::result::Result<std::sync::Arc<fs::File>, SnapshotAttemptError> {
+    let canonical_path = held.parent_path.join(&held.leaf);
+    let fresh = match registry_parent_and_leaf(&canonical_path) {
+        Ok(binding) => binding,
+        Err(RegistrySnapshotError::Missing) => {
+            return Err(SnapshotAttemptError::Unstable(
+                "scope registry canonical parent disappeared while snapshotting".to_owned(),
+            ));
+        }
+        Err(error) => return Err(registry_parent_binding_error(error)),
+    };
+    if fresh.leaf != held.leaf || fresh.parent_path != held.parent_path {
         return Err(SnapshotAttemptError::Unsafe(
             "scope registry canonical parent rebound to an unexpected path".to_owned(),
         ));
     }
-    let held_metadata = cap_fs::Metadata::from_file(held_parent).map_err(|error| {
+    #[cfg(target_os = "linux")]
+    match (&held.inherited_root, &fresh.inherited_root) {
+        (Some(held_root), Some(fresh_root)) => {
+            if !same_inherited_root(held_root, fresh_root)? {
+                return Err(SnapshotAttemptError::Unsafe(
+                    "inherited registry root changed while snapshotting".to_owned(),
+                ));
+            }
+        }
+        (None, None) => {}
+        _ => {
+            return Err(SnapshotAttemptError::Unsafe(
+                "registry binding changed inherited-root mode while snapshotting".to_owned(),
+            ));
+        }
+    }
+    let held_metadata = cap_fs::Metadata::from_file(held.parent.as_ref()).map_err(|error| {
         SnapshotAttemptError::Unstable(format!("inspect retained registry parent: {error}"))
     })?;
-    let fresh_metadata = cap_fs::Metadata::from_file(&fresh_parent).map_err(|error| {
+    let fresh_metadata = cap_fs::Metadata::from_file(fresh.parent.as_ref()).map_err(|error| {
         SnapshotAttemptError::Unstable(format!("inspect freshly bound registry parent: {error}"))
     })?;
     let held_identity = leaf_identity(&held_metadata).ok_or_else(|| {
@@ -468,7 +792,27 @@ fn fresh_registry_parent_binding(
             "scope registry canonical parent identity changed while snapshotting".to_owned(),
         ));
     }
-    Ok(fresh_parent)
+    Ok(fresh.parent)
+}
+
+#[cfg(target_os = "linux")]
+fn same_inherited_root(
+    held: &kio_core::store_dir::StoreDirectory,
+    fresh: &kio_core::store_dir::StoreDirectory,
+) -> std::result::Result<bool, SnapshotAttemptError> {
+    let held_metadata =
+        cap_fs::Metadata::from_file(held.root_handle().as_ref()).map_err(|error| {
+            SnapshotAttemptError::Unstable(format!(
+                "inspect retained inherited registry root: {error}"
+            ))
+        })?;
+    let fresh_metadata =
+        cap_fs::Metadata::from_file(fresh.root_handle().as_ref()).map_err(|error| {
+            SnapshotAttemptError::Unstable(format!(
+                "inspect fresh inherited registry root: {error}"
+            ))
+        })?;
+    Ok(leaf_identity(&held_metadata) == leaf_identity(&fresh_metadata))
 }
 
 #[cfg(windows)]
@@ -1094,14 +1438,15 @@ fn verify_private_snapshot_before_sqlite(
 }
 
 fn snapshot_attempt(
-    parent: &fs::File,
-    parent_path: &Path,
-    main: &str,
+    binding: &RegistryParentBinding,
     #[cfg(test)] hook: Option<&SnapshotTestHook>,
     #[cfg(not(test))] _hook: Option<&()>,
     #[cfg(test)] attempt: usize,
     #[cfg(not(test))] _attempt: usize,
 ) -> std::result::Result<(Connection, RegistrySnapshot), SnapshotAttemptError> {
+    let parent = binding.parent.as_ref();
+    let parent_path = binding.parent_path.as_path();
+    let main = binding.leaf.as_str();
     let storage = PrivateSnapshotStorage::create()?;
     let initial = match observe_manifest(parent, parent_path, main, Some(&storage), true) {
         Ok(initial) => initial,
@@ -1110,8 +1455,8 @@ fn snapshot_attempt(
             if let Some(hook) = hook {
                 hook(SnapshotTestPhase::AfterInitialManifest, attempt, None);
             }
-            let fresh_parent = fresh_registry_parent_binding(parent, parent_path, main)?;
-            return match observe_manifest(&fresh_parent, parent_path, main, None, true) {
+            let fresh_parent = fresh_registry_parent_binding(binding)?;
+            return match observe_manifest(fresh_parent.as_ref(), parent_path, main, None, true) {
                 Err(SnapshotAttemptError::Missing) => {
                     #[cfg(test)]
                     if let Some(hook) = hook {
@@ -1121,7 +1466,7 @@ fn snapshot_attempt(
                             None,
                         );
                     }
-                    fresh_registry_parent_binding(parent, parent_path, main)?;
+                    fresh_registry_parent_binding(binding)?;
                     Err(SnapshotAttemptError::Missing)
                 }
                 Ok(_) => Err(SnapshotAttemptError::Unstable(
@@ -1227,8 +1572,8 @@ fn snapshot_attempt(
             None,
         );
     }
-    let fresh_parent = fresh_registry_parent_binding(parent, parent_path, main)?;
-    let final_manifest = observe_manifest(&fresh_parent, parent_path, main, None, false)?;
+    let fresh_parent = fresh_registry_parent_binding(binding)?;
+    let final_manifest = observe_manifest(fresh_parent.as_ref(), parent_path, main, None, false)?;
     if initial != final_manifest {
         return Err(SnapshotAttemptError::Unstable(
             "scope registry main/WAL/SHM changed while snapshotting".to_owned(),
@@ -1242,7 +1587,7 @@ fn snapshot_attempt(
             None,
         );
     }
-    fresh_registry_parent_binding(parent, parent_path, main)?;
+    fresh_registry_parent_binding(binding)?;
     Ok((
         conn,
         RegistrySnapshot {
@@ -1274,9 +1619,7 @@ impl RegistryDb {
         let mut saw_instability = None;
         for attempt in 0..MAX_REGISTRY_SNAPSHOT_ATTEMPTS {
             let result = match stable_registry_parent_binding(path) {
-                Ok(Some((parent, leaf, parent_path))) => {
-                    snapshot_attempt(&parent, &parent_path, &leaf, None, attempt)
-                }
+                Ok(Some(binding)) => snapshot_attempt(&binding, None, attempt),
                 Ok(None) => Err(SnapshotAttemptError::Missing),
                 Err(error) => Err(error),
             };
@@ -1284,6 +1627,7 @@ impl RegistryDb {
                 Ok((conn, snapshot)) => {
                     return Ok(Self {
                         conn,
+                        _inherited_parent: None,
                         _snapshot: Some(snapshot),
                     });
                 }
@@ -1325,9 +1669,7 @@ impl RegistryDb {
         let mut saw_instability = None;
         for attempt in 0..attempts {
             let result = match stable_registry_parent_binding(path) {
-                Ok(Some((parent, leaf, parent_path))) => {
-                    snapshot_attempt(&parent, &parent_path, &leaf, Some(&hook), attempt)
-                }
+                Ok(Some(binding)) => snapshot_attempt(&binding, Some(&hook), attempt),
                 Ok(None) => Err(SnapshotAttemptError::Missing),
                 Err(error) => Err(error),
             };
@@ -1335,6 +1677,7 @@ impl RegistryDb {
                 Ok((conn, snapshot)) => {
                     return Ok(Self {
                         conn,
+                        _inherited_parent: None,
                         _snapshot: Some(snapshot),
                     });
                 }
@@ -1359,21 +1702,32 @@ impl RegistryDb {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        if let Some(parent) = path.as_ref().parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| crate::IndexError::Schema(err.to_string()))?;
-            // P2: the device data dir (`~/.local/share/kio`) that holds this
-            // registry, the cost ledger, logs and the open-cache carries usage
-            // patterns and the scope map — restrict it to the owner (0700) so a
-            // multi-user host cannot read another user's data. Best-effort (the
-            // registry is a recoverable cache); no-op on non-unix.
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        #[cfg(target_os = "linux")]
+        let inherited = inherited_registry_parent(path.as_ref())?;
+        #[cfg(not(target_os = "linux"))]
+        let inherited: Option<(PathBuf, kio_core::store_dir::StoreDirectory)> = None;
+
+        let (sqlite_path, inherited_parent) = if let Some((sqlite_path, parent)) = inherited {
+            (sqlite_path, Some(parent))
+        } else {
+            if let Some(parent) = path.as_ref().parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|err| crate::IndexError::Schema(err.to_string()))?;
+                // P2: the device data dir (`~/.local/share/kio`) that holds this
+                // registry, the cost ledger, logs and the open-cache carries usage
+                // patterns and the scope map — restrict it to the owner (0700) so a
+                // multi-user host cannot read another user's data. Best-effort (the
+                // registry is a recoverable cache); no-op on non-unix.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                }
             }
-        }
-        let conn = Connection::open(path)?;
+            (path.as_ref().to_path_buf(), None)
+        };
+        let conn = Connection::open(sqlite_path)?;
         // P6 (05 §1.8 / docs/05:565): serialize concurrent writers with WAL +
         // busy_timeout so a parallel `kio init`/`index` upsert waits (up to 5s)
         // for the write lock instead of hitting SQLITE_BUSY and silently dropping
@@ -1396,6 +1750,7 @@ impl RegistryDb {
         )?;
         Ok(Self {
             conn,
+            _inherited_parent: inherited_parent,
             _snapshot: None,
         })
     }
@@ -1445,6 +1800,96 @@ impl RegistryDb {
                 entry.last_seen_at,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Atomically replace app-prevalidated former registrations with their new
+    /// paths. This is deliberately narrower than pruning: only the exact
+    /// `(scope_id, kio_path)` pairs supplied by the app are deleted.
+    pub fn rebind_scope_registrations(
+        &mut self,
+        rebinds: &[ScopeRegistrationRebind],
+    ) -> Result<()> {
+        let transaction = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut seen_scope_ids = BTreeSet::new();
+        let mut seen_new_kio_paths = BTreeSet::new();
+        for rebind in rebinds {
+            if !seen_scope_ids.insert(rebind.scope_id.as_str()) {
+                return Err(crate::IndexError::Contract(format!(
+                    "scope registration rebind repeats scope_id: {}",
+                    rebind.scope_id
+                )));
+            }
+            if rebind.scope_id != rebind.new_registration.scope_id {
+                return Err(crate::IndexError::Contract(
+                    "scope registration rebind scope_id disagrees with new registration".to_owned(),
+                ));
+            }
+            if !seen_new_kio_paths.insert(rebind.new_registration.kio_path.as_str()) {
+                return Err(crate::IndexError::Contract(format!(
+                    "scope registration rebind repeats destination kio_path: {}",
+                    rebind.new_registration.kio_path
+                )));
+            }
+            let expected = rebind
+                .old_kio_paths
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if expected.len() != rebind.old_kio_paths.len() {
+                return Err(crate::IndexError::Contract(format!(
+                    "scope registration rebind repeats an old kio_path for scope_id: {}",
+                    rebind.scope_id
+                )));
+            }
+            let actual = {
+                let mut statement = transaction
+                    .prepare("SELECT kio_path FROM scopes WHERE scope_id = ?1 ORDER BY kio_path")?;
+                statement
+                    .query_map([&rebind.scope_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<BTreeSet<_>, _>>()?
+            };
+            let resumed = BTreeSet::from([rebind.new_registration.kio_path.clone()]);
+            if actual != expected && actual != resumed {
+                return Err(crate::IndexError::Contract(format!(
+                    "scope registration rebind observed unexpected paths for scope_id: {}",
+                    rebind.scope_id
+                )));
+            }
+
+            for old_kio_path in &rebind.old_kio_paths {
+                if old_kio_path != &rebind.new_registration.kio_path {
+                    transaction.execute(
+                        "DELETE FROM scopes WHERE scope_id = ?1 AND kio_path = ?2",
+                        params![&rebind.scope_id, old_kio_path],
+                    )?;
+                }
+            }
+            // A moved scope must be indexed again before global search uses its
+            // new path, even when a resumed destination was indexed earlier.
+            transaction.execute(
+                "INSERT INTO scopes (
+                    scope_id, kio_path, root_path,
+                    participates_in_global_search, indexed, last_seen_at
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                ON CONFLICT(scope_id, kio_path) DO UPDATE SET
+                    root_path = excluded.root_path,
+                    participates_in_global_search = excluded.participates_in_global_search,
+                    indexed = excluded.indexed,
+                    last_seen_at = excluded.last_seen_at",
+                params![
+                    &rebind.scope_id,
+                    &rebind.new_registration.kio_path,
+                    &rebind.new_registration.root_path,
+                    rebind.new_registration.participates_in_global_search as i64,
+                    false,
+                    &rebind.new_registration.last_seen_at,
+                ],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -1600,6 +2045,17 @@ mod tests {
         (dir, db)
     }
 
+    #[cfg(target_os = "linux")]
+    fn inherited_private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        tempfile::Builder::new()
+            .prefix("kio-registry-inherited-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap()
+    }
+
     #[test]
     fn open_sets_wal_and_busy_timeout() {
         // P6: the registry must open with WAL + a 5000ms busy_timeout so parallel
@@ -1624,6 +2080,163 @@ mod tests {
         assert!(RegistryDb::open_read_only(&path).is_err());
         assert!(!path.exists());
         assert!(!path.parent().unwrap().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_registry_writer_keeps_duplicated_parent_after_fd_retarget() {
+        use std::os::fd::AsRawFd;
+
+        let first = inherited_private_tempdir();
+        let replacement = inherited_private_tempdir();
+        let held_first = fs::File::open(first.path()).unwrap();
+        // SAFETY: fcntl duplicates a live descriptor; the returned descriptor
+        // is owned by this test and closed below.
+        let descriptor = unsafe { libc::fcntl(held_first.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100) };
+        assert!(descriptor >= 100);
+        let inherited = PathBuf::from(format!("/dev/fd/{descriptor}/kio/scope-registry.sqlite"));
+
+        let db = RegistryDb::open(&inherited).unwrap();
+        let replacement_root = fs::File::open(replacement.path()).unwrap();
+        // SAFETY: both descriptors are live directory descriptors. Replacing
+        // the caller-owned spelling must not retarget RegistryDb's duplicate.
+        assert_eq!(
+            unsafe { libc::dup2(replacement_root.as_raw_fd(), descriptor) },
+            descriptor
+        );
+        db.upsert(&entry("scope_fd", "/tmp/fd", true, true))
+            .unwrap();
+        drop(db);
+
+        assert!(first.path().join("kio/scope-registry.sqlite").is_file());
+        assert!(
+            !replacement
+                .path()
+                .join("kio/scope-registry.sqlite")
+                .exists()
+        );
+        // SAFETY: this test owns `descriptor` after the dup2 above.
+        assert_eq!(unsafe { libc::close(descriptor) }, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_reads_inherited_descriptor_registry_without_mutating_source() {
+        use std::os::fd::AsRawFd;
+
+        let root = inherited_private_tempdir();
+        let held_root = fs::File::open(root.path()).unwrap();
+        let path = PathBuf::from(format!(
+            "/dev/fd/{}/kio/scope-registry.sqlite",
+            held_root.as_raw_fd()
+        ));
+        let writer = RegistryDb::open(&path).unwrap();
+        writer
+            .upsert(&entry(
+                "scope_inherited_read",
+                "/tmp/inherited-read",
+                true,
+                true,
+            ))
+            .unwrap();
+        drop(writer);
+        let source = root.path().join("kio/scope-registry.sqlite");
+        let before = snapshot_registry(&source);
+
+        let reader = RegistryDb::open_read_only(&path).unwrap();
+        assert_eq!(
+            reader
+                .lookup_scope_id("scope_inherited_read")
+                .unwrap()
+                .len(),
+            1
+        );
+        drop(reader);
+        assert_eq!(snapshot_registry(&source), before);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_inherited_missing_suffix_is_a_zero_effect_cache_miss() {
+        use std::os::fd::AsRawFd;
+
+        let root = inherited_private_tempdir();
+        let held_root = fs::File::open(root.path()).unwrap();
+        let path = PathBuf::from(format!(
+            "/dev/fd/{}/missing/scope-registry.sqlite",
+            held_root.as_raw_fd()
+        ));
+
+        assert!(matches!(
+            RegistryDb::open_read_only(&path),
+            Err(RegistrySnapshotError::Missing)
+        ));
+        assert!(!root.path().join("missing").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn read_only_rejects_inherited_descriptor_retarget_during_snapshot() {
+        use std::os::fd::AsRawFd;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let first = inherited_private_tempdir();
+        let replacement = inherited_private_tempdir();
+        let first_path = first.path().join("kio/scope-registry.sqlite");
+        let replacement_path = replacement.path().join("kio/scope-registry.sqlite");
+        let writer = RegistryDb::open(&first_path).unwrap();
+        writer
+            .upsert(&entry("scope_first", "/tmp/first", true, true))
+            .unwrap();
+        drop(writer);
+        drop(RegistryDb::open(&replacement_path).unwrap());
+
+        let held_first = fs::File::open(first.path()).unwrap();
+        // SAFETY: fcntl duplicates a live directory descriptor and this test
+        // closes the returned descriptor after the snapshot attempt.
+        let descriptor = unsafe { libc::fcntl(held_first.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 100) };
+        assert!(descriptor >= 100);
+        let inherited = PathBuf::from(format!("/dev/fd/{descriptor}/kio/scope-registry.sqlite"));
+        let replacement_root = fs::File::open(replacement.path()).unwrap();
+        let swapped = std::sync::Arc::new(AtomicBool::new(false));
+        let swapped_once = swapped.clone();
+        let hook: SnapshotTestHook = std::sync::Arc::new(move |phase, _, _| {
+            if phase == SnapshotTestPhase::AfterInitialManifest
+                && !swapped_once.swap(true, Ordering::SeqCst)
+            {
+                // SAFETY: both descriptors remain live for the hook and the
+                // test owns `descriptor` until it closes it below.
+                assert_eq!(
+                    unsafe { libc::dup2(replacement_root.as_raw_fd(), descriptor) },
+                    descriptor
+                );
+            }
+        });
+
+        assert!(matches!(
+            RegistryDb::open_read_only_for_test(&inherited, 1, hook),
+            Err(RegistrySnapshotError::UnsafeIntegrity(_))
+        ));
+        // SAFETY: this test owns `descriptor` after the dup2 above.
+        assert_eq!(unsafe { libc::close(descriptor) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_only_rejects_symlinked_registry_parent_without_touching_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let victim = tempfile::tempdir().unwrap();
+        let linked_parent = root.path().join("registry-parent");
+        symlink(victim.path(), &linked_parent).unwrap();
+        let path = linked_parent.join("scope-registry.sqlite");
+
+        assert!(matches!(
+            RegistryDb::open_read_only(&path),
+            Err(RegistrySnapshotError::UnsafeIntegrity(_))
+        ));
+        assert!(!victim.path().join("scope-registry.sqlite").exists());
     }
 
     #[test]
@@ -2460,6 +3073,89 @@ mod tests {
         db.upsert(&entry("scope_a", "/tmp/a", true, true)).unwrap();
         db.upsert(&entry("scope_a", "/tmp/a", true, false)).unwrap();
         assert!(db.get("scope_a", "/tmp/a/.kio").unwrap().unwrap().indexed);
+    }
+
+    #[test]
+    fn rebind_scope_registrations_replaces_exact_old_rows_in_one_transaction() {
+        let (_dir, mut db) = open_temp();
+        db.upsert(&entry("scope_a", "/tmp/a-old", true, true))
+            .unwrap();
+        db.upsert(&entry("scope_b", "/tmp/b-old", false, true))
+            .unwrap();
+        let mut new_a = entry("scope_a", "/tmp/a-new", true, true);
+        new_a.last_seen_at = "2026-07-05T00:00:00Z".to_owned();
+        let new_b = entry("scope_b", "/tmp/b-new", false, true);
+
+        db.rebind_scope_registrations(&[
+            ScopeRegistrationRebind {
+                scope_id: "scope_a".to_owned(),
+                old_kio_paths: vec!["/tmp/a-old/.kio".to_owned()],
+                new_registration: new_a.clone(),
+            },
+            ScopeRegistrationRebind {
+                scope_id: "scope_b".to_owned(),
+                old_kio_paths: vec!["/tmp/b-old/.kio".to_owned()],
+                new_registration: new_b.clone(),
+            },
+        ])
+        .unwrap();
+
+        let rows_a = db.lookup_scope_id("scope_a").unwrap();
+        let rows_b = db.lookup_scope_id("scope_b").unwrap();
+        assert_eq!(rows_a.len(), 1);
+        assert_eq!(rows_b.len(), 1);
+        assert_eq!(rows_a[0].kio_path, new_a.kio_path);
+        assert_eq!(rows_b[0].kio_path, new_b.kio_path);
+        assert!(!rows_a[0].indexed);
+        assert!(!rows_b[0].indexed);
+    }
+
+    #[test]
+    fn rebind_scope_registrations_rejects_unexpected_rows_and_rolls_back_every_scope() {
+        let (_dir, mut db) = open_temp();
+        db.upsert(&entry("scope_a", "/tmp/a-old", true, true))
+            .unwrap();
+        db.upsert(&entry("scope_a", "/tmp/a-unexpected", true, true))
+            .unwrap();
+        db.upsert(&entry("scope_b", "/tmp/b-old", true, true))
+            .unwrap();
+
+        let result = db.rebind_scope_registrations(&[
+            ScopeRegistrationRebind {
+                scope_id: "scope_b".to_owned(),
+                old_kio_paths: vec!["/tmp/b-old/.kio".to_owned()],
+                new_registration: entry("scope_b", "/tmp/b-new", true, false),
+            },
+            ScopeRegistrationRebind {
+                scope_id: "scope_a".to_owned(),
+                old_kio_paths: vec!["/tmp/a-old/.kio".to_owned()],
+                new_registration: entry("scope_a", "/tmp/a-new", true, false),
+            },
+        ]);
+        assert!(matches!(result, Err(crate::IndexError::Contract(_))));
+        assert!(db.get("scope_b", "/tmp/b-old/.kio").unwrap().is_some());
+        assert!(db.get("scope_b", "/tmp/b-new/.kio").unwrap().is_none());
+    }
+
+    #[test]
+    fn rebind_scope_registrations_accepts_already_completed_singleton() {
+        let (_dir, mut db) = open_temp();
+        db.upsert(&entry("scope_a", "/tmp/a-new", true, true))
+            .unwrap();
+        let new_registration = entry("scope_a", "/tmp/a-new", false, true);
+
+        db.rebind_scope_registrations(&[ScopeRegistrationRebind {
+            scope_id: "scope_a".to_owned(),
+            old_kio_paths: vec!["/tmp/a-old/.kio".to_owned()],
+            new_registration: new_registration.clone(),
+        }])
+        .unwrap();
+
+        let rows = db.lookup_scope_id("scope_a").unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kio_path, new_registration.kio_path);
+        assert!(!rows[0].indexed);
+        assert!(!rows[0].participates_in_global_search);
     }
 
     // R15-3: a deleted-then-re-`init`ed `.kio` mints a fresh scope_id at the same

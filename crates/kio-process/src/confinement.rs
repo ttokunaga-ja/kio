@@ -6,20 +6,24 @@
 //! explicitly selected runtime roots, and one private scratch directory.
 
 use std::{
-    collections::BTreeSet,
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
+#[cfg(not(target_os = "linux"))]
+use std::collections::BTreeSet;
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 use std::process::Command;
 
 use thiserror::Error;
 
-#[cfg(target_os = "linux")]
-use crate::run_bounded_command;
+#[cfg(unix)]
+use crate::run_bounded_command_with_unix_renderer_limits;
 use crate::{BoundedProcessError, BoundedProcessOptions, BoundedProcessOutput};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +96,10 @@ pub fn protect_owner_private_scratch(path: &Path) -> Result<(), ConfinementError
 pub struct RenderSandbox {
     program: PathBuf,
     scratch: PathBuf,
+    #[cfg(not(target_os = "linux"))]
     runtime_roots: Vec<PathBuf>,
+    #[cfg(target_os = "linux")]
+    runtime_mounts: Vec<(PathBuf, PathBuf)>,
     limits: RenderResourceLimits,
 }
 
@@ -107,23 +114,43 @@ impl RenderSandbox {
             canonical_file(program).ok_or_else(|| ConfinementError::Program(program.into()))?;
         let scratch = canonical_directory(scratch)
             .ok_or_else(|| ConfinementError::Scratch(scratch.into()))?;
+        #[cfg(not(target_os = "linux"))]
         let mut roots = BTreeSet::new();
+        #[cfg(target_os = "linux")]
+        let mut mounts = BTreeMap::new();
         for root in runtime_roots {
-            let root =
-                fs::canonicalize(&root).map_err(|_| ConfinementError::Runtime(root.clone()))?;
-            if !root.is_absolute() {
+            if !is_normal_absolute_path(&root) {
                 return Err(ConfinementError::Runtime(root));
             }
-            roots.insert(root);
+            let source =
+                fs::canonicalize(&root).map_err(|_| ConfinementError::Runtime(root.clone()))?;
+            if !source.is_absolute() {
+                return Err(ConfinementError::Runtime(source));
+            }
+            #[cfg(not(target_os = "linux"))]
+            roots.insert(source.clone());
+            #[cfg(target_os = "linux")]
+            mounts.insert(root, source);
         }
         // Selecting an executable authorizes that file, not its siblings.
         // A standalone renderer may live next to private source documents or
         // credentials; package directories must be supplied explicitly.
+        #[cfg(not(target_os = "linux"))]
         roots.insert(program.clone());
+        #[cfg(target_os = "linux")]
+        mounts
+            .entry(program.clone())
+            .or_insert_with(|| program.clone());
         Ok(Self {
             program,
             scratch,
+            #[cfg(not(target_os = "linux"))]
             runtime_roots: roots.into_iter().collect(),
+            #[cfg(target_os = "linux")]
+            runtime_mounts: mounts
+                .into_iter()
+                .map(|(destination, source)| (source, destination))
+                .collect(),
             limits,
         })
     }
@@ -153,10 +180,12 @@ impl RenderSandbox {
         {
             let mut command = self.macos_command(args)?;
             command.env_clear().envs(environment.iter().cloned());
-            Ok(crate::run_bounded_command_with_macos_physical_memory_limit(
+            Ok(run_bounded_command_with_unix_renderer_limits(
                 &mut command,
                 options,
                 None,
+                &self.scratch,
+                self.limits.max_file_bytes,
                 self.limits.max_physical_memory_bytes,
             )?)
         }
@@ -164,10 +193,19 @@ impl RenderSandbox {
         {
             let mut command = self.linux_command(args)?;
             command.env_clear().envs(environment.iter().cloned());
-            return Ok(run_bounded_command(&mut command, options, None)?);
+            Ok(run_bounded_command_with_unix_renderer_limits(
+                &mut command,
+                options,
+                None,
+                &self.scratch,
+                self.limits.max_file_bytes,
+                0,
+            )?)
         }
         #[cfg(windows)]
-        return crate::confinement_windows::run_windows_renderer(self, args, environment, options);
+        {
+            crate::confinement_windows::run_windows_renderer(self, args, environment, options)
+        }
         #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             let _ = (args, environment, options);
@@ -236,8 +274,8 @@ impl RenderSandbox {
             .arg("/dev")
             .arg("--tmpfs")
             .arg("/tmp");
-        for root in &self.runtime_roots {
-            command.arg("--ro-bind").arg(root).arg(root);
+        for (source, destination) in &self.runtime_mounts {
+            command.arg("--ro-bind").arg(source).arg(destination);
         }
         command
             .arg("--bind")
@@ -264,6 +302,15 @@ impl RenderSandbox {
     pub(crate) fn runtime_roots(&self) -> &[PathBuf] {
         &self.runtime_roots
     }
+}
+
+fn is_normal_absolute_path(path: &Path) -> bool {
+    path.is_absolute()
+        && !path
+            .as_os_str()
+            .as_encoded_bytes()
+            .split(|byte| *byte == b'/')
+            .any(|component| matches!(component, b"." | b".."))
 }
 
 fn canonical_file(path: &Path) -> Option<PathBuf> {
@@ -312,7 +359,7 @@ fn apply_unix_limits(
                 // applying it to every process class. CPU and output-file
                 // limits remain mandatory; unsupported address-space limits
                 // are handled by the platform-specific Windows Job path.
-                (libc::RLIMIT_AS, address_space, true),
+                (libc::RLIMIT_AS, address_space, cfg!(target_os = "macos")),
                 (libc::RLIMIT_FSIZE, file_size, false),
             ] {
                 if optional && value == 0 {

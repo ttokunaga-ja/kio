@@ -304,6 +304,10 @@ pub struct AggSearchRequest<'a> {
     /// relation against source CAS.  An empty slice is a verified empty answer,
     /// not an instruction to use every persisted binding.
     pub binding_filter: Option<&'a [AggBindingFilter]>,
+    /// Exact `(scope_id, image_id)` pairs currently authorized by the source
+    /// owner. This is required rather than optional: stale replica image rows
+    /// must be excluded before vector ranking and `candidate_depth` truncate.
+    pub eligible_images: &'a BTreeSet<(String, String)>,
     pub since_cutoff: Option<&'a str>,
     pub match_expr: Option<&'a str>,
     /// Equivalence-expanded forms for each pure-short query token.
@@ -454,10 +458,7 @@ struct BoundCacheParent {
 /// relative to a canonicalized *outer* directory capability.
 fn bind_cache_parent(path: &Path, create_parent: bool) -> Result<BoundCacheParent> {
     #[cfg(target_os = "linux")]
-    {
-        validate_linux_cache_path_lexical(path)?;
-        let _ = inherited_cache_descriptor(path)?;
-    }
+    validate_linux_cache_path_lexical(path)?;
     let lexical_parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().ok_or_else(|| {
         crate::IndexError::Schema(format!(
@@ -593,19 +594,21 @@ fn open_or_create_cache_parent(
                 if create_missing
                     && matches!(cap_fs::stat(&handle, Path::new(component), cap_fs::FollowSymlinks::No), Err(e) if e.kind() == std::io::ErrorKind::NotFound) =>
             {
-                cap_fs::create_dir(&handle, Path::new(component), &cap_fs::DirOptions::new())
-                    .map_err(|e| {
+                let parent = kio_core::store_dir::StoreDirectory::from_retained(
+                    handle.try_clone().map_err(|error| {
+                        crate::IndexError::Schema(format!("retain cache parent: {error}"))
+                    })?,
+                    resolved.clone(),
+                )
+                .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+                parent
+                    .create_directory(Path::new(component))
+                    .map_err(|error| {
                         crate::IndexError::Schema(format!(
-                            "create aggregator cache directory {}: {e}",
+                            "create private aggregator cache directory {}: {error}",
                             path.display()
                         ))
-                    })?;
-                cap_fs::open_dir_nofollow(&handle, Path::new(component)).map_err(|e| {
-                    crate::IndexError::Schema(format!(
-                        "open created aggregator cache directory {}: {e}",
-                        path.display()
-                    ))
-                })?
+                    })?
             }
             Err(e) => {
                 return Err(crate::IndexError::Schema(format!(
@@ -619,177 +622,100 @@ fn open_or_create_cache_parent(
     Ok((handle, resolved))
 }
 
-/// Bind a cache parent below a replay-inherited directory descriptor.
+/// Bind a cache parent below the shared inherited-directory capability.
 ///
-/// Linux's `/dev/fd/N` is a symlink spelling, so it must never reach the
-/// ordinary ambient-path resolver above: that resolver correctly rejects
-/// symlink ancestors, while treating this one specially would follow an
-/// attacker-controlled pathname.  Instead duplicate the already-inherited
-/// descriptor and traverse every remaining component relative to that retained
-/// capability with no-follow operations.
+/// `/dev/fd/N` never reaches the ambient resolver: core validates the raw
+/// spelling, duplicates the descriptor, and returns only normal suffix names.
+/// Every suffix operation below is therefore relative to that retained root.
 #[cfg(target_os = "linux")]
 fn open_or_create_inherited_cache_parent(
     path: &Path,
     create_missing: bool,
 ) -> Result<Option<(std::fs::File, std::path::PathBuf)>> {
-    use std::os::fd::FromRawFd;
-    use std::os::unix::ffi::OsStrExt;
-
-    let Some(fd) = inherited_cache_descriptor(path)? else {
+    let Some((mut current, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
+        .map_err(|error| {
+            crate::IndexError::Schema(format!(
+                "resolve inherited aggregator cache capability: {error}"
+            ))
+        })?
+    else {
         return Ok(None);
     };
-    let mut components = path.components();
-    // `inherited_cache_descriptor` already validated the raw spelling. This
-    // component walk only converts those canonical normal components back to
-    // OS strings for the capability-relative operations below.
-    let root = components.next();
-    let dev = components.next().and_then(component_as_bytes);
-    let fd_directory = components.next().and_then(component_as_bytes);
-    let fd_number = components.next();
-    debug_assert_eq!(root, Some(std::path::Component::RootDir));
-    debug_assert_eq!(dev, Some(&b"dev"[..]));
-    debug_assert_eq!(fd_directory, Some(&b"fd"[..]));
-    debug_assert!(fd_number.is_some());
-    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-    if duplicate < 0 {
-        return Err(crate::IndexError::Schema(format!(
-            "duplicate inherited aggregator cache descriptor {fd}: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    // SAFETY: `F_DUPFD_CLOEXEC` returned a new owned descriptor.
-    let mut handle = unsafe { std::fs::File::from_raw_fd(duplicate) };
-    let metadata = handle.metadata().map_err(|error| {
-        crate::IndexError::Schema(format!(
-            "inspect inherited aggregator cache descriptor {fd}: {error}"
-        ))
-    })?;
-    if !metadata.is_dir() {
-        return Err(crate::IndexError::Schema(format!(
-            "inherited aggregator cache descriptor must name a directory: {fd}"
-        )));
-    }
-
-    for component in components {
-        let Some(component) = component_as_bytes(component) else {
+    let mut logical = current.path().to_path_buf();
+    for component in suffix {
+        let leaf = Path::new(&component);
+        logical.push(&component);
+        let next = if current.contains_entry(leaf).map_err(|error| {
+            crate::IndexError::Schema(format!(
+                "inspect inherited aggregator cache directory {}: {error}",
+                logical.display()
+            ))
+        })? {
+            current.open_directory(leaf).map_err(|error| {
+                crate::IndexError::Schema(format!(
+                    "open inherited aggregator cache directory {} without following links: {error}",
+                    logical.display()
+                ))
+            })?
+        } else if create_missing {
+            current.create_directory(leaf).map_err(|error| {
+                crate::IndexError::Schema(format!(
+                    "create inherited private aggregator cache directory {}: {error}",
+                    logical.display()
+                ))
+            })?
+        } else {
             return Err(crate::IndexError::Schema(format!(
-                "inherited aggregator cache path contains traversal: {}",
-                path.display()
+                "inherited aggregator cache directory is missing: {}",
+                logical.display()
             )));
         };
-        let component = std::ffi::OsStr::from_bytes(component);
-        handle = match cap_fs::open_dir_nofollow(&handle, Path::new(component)) {
-            Ok(child) => child,
-            Err(_)
-                if create_missing
-                    && matches!(cap_fs::stat(&handle, Path::new(component), cap_fs::FollowSymlinks::No), Err(e) if e.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                cap_fs::create_dir(&handle, Path::new(component), &cap_fs::DirOptions::new())
-                    .map_err(|e| {
-                        crate::IndexError::Schema(format!(
-                            "create inherited aggregator cache directory {}: {e}",
-                            path.display()
-                        ))
-                    })?;
-                cap_fs::open_dir_nofollow(&handle, Path::new(component)).map_err(|e| {
-                    crate::IndexError::Schema(format!(
-                        "open created inherited aggregator cache directory {}: {e}",
-                        path.display()
-                    ))
-                })?
-            }
-            Err(e) => {
-                return Err(crate::IndexError::Schema(format!(
-                    "open inherited aggregator cache directory {} without following links: {e}",
-                    path.display()
-                )));
-            }
-        };
+        current = kio_core::store_dir::StoreDirectory::from_retained(next, logical.clone())
+            .map_err(|error| {
+                crate::IndexError::Schema(format!(
+                    "retain inherited aggregator cache directory {}: {error}",
+                    logical.display()
+                ))
+            })?;
+        verify_private_cache_directory(current.root_handle().as_ref(), &logical)?;
     }
-    Ok(Some((handle, path.to_path_buf())))
-}
-
-/// Return the descriptor in the one accepted `/dev/fd` spelling.
-///
-/// This examines raw bytes before `Path::components`, whose separator and dot
-/// normalization would otherwise turn an alias into authority. `None` means
-/// an ordinary cache path; a path under `/dev/fd` which is not canonical is a
-/// structured error rather than a fallback to ambient traversal.
-#[cfg(target_os = "linux")]
-fn inherited_cache_descriptor(path: &Path) -> Result<Option<i32>> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let raw = path.as_os_str().as_bytes();
-    let mut normalized = path.components();
-    let names_retained_descriptor_root = normalized.next() == Some(std::path::Component::RootDir)
-        && normalized.next().and_then(component_as_bytes) == Some(&b"dev"[..])
-        && normalized.next().and_then(component_as_bytes) == Some(&b"fd"[..]);
-    if !names_retained_descriptor_root {
-        return Ok(None);
-    }
-    if raw != b"/dev/fd" && !raw.starts_with(b"/dev/fd/") {
-        return Err(crate::IndexError::Schema(format!(
-            "inherited aggregator cache path is not canonical: {}",
-            path.display()
-        )));
-    }
-    let suffix = raw.strip_prefix(b"/dev/fd/").ok_or_else(|| {
+    let retained = current.root_handle().try_clone().map_err(|error| {
         crate::IndexError::Schema(format!(
-            "inherited aggregator cache descriptor is missing: {}",
+            "retain inherited aggregator cache parent {}: {error}",
             path.display()
         ))
     })?;
-    if suffix.is_empty()
-        || suffix.starts_with(b"/")
-        || suffix.windows(2).any(|window| window == b"//")
-    {
-        return Err(crate::IndexError::Schema(format!(
-            "inherited aggregator cache path is not canonical: {}",
-            path.display()
-        )));
-    }
-    let mut components = suffix.split(|byte| *byte == b'/');
-    let fd = components
-        .next()
-        .expect("non-empty suffix has a first component");
-    if fd.is_empty() || !fd.iter().all(u8::is_ascii_digit) || (fd.len() > 1 && fd[0] == b'0') {
-        return Err(crate::IndexError::Schema(format!(
-            "inherited aggregator cache descriptor is not canonical: {}",
-            path.display()
-        )));
-    }
-    let fd = std::str::from_utf8(fd)
-        .ok()
-        .and_then(|value| value.parse::<i32>().ok())
-        .filter(|fd| *fd >= 0)
-        .ok_or_else(|| {
-            crate::IndexError::Schema(format!(
-                "inherited aggregator cache descriptor is invalid: {}",
-                path.display()
-            ))
-        })?;
-    if components.any(|component| component.is_empty() || component == b"." || component == b"..") {
-        return Err(crate::IndexError::Schema(format!(
-            "inherited aggregator cache path is not canonical: {}",
-            path.display()
-        )));
-    }
-    Ok(Some(fd))
+    Ok(Some((retained, path.to_path_buf())))
 }
 
+/// Core validates the inherited root. Existing suffix directories and newly
+/// created cache directories must have the same owner-private boundary before
+/// they can become the SQLite parent.
 #[cfg(target_os = "linux")]
-fn component_as_bytes(component: std::path::Component<'_>) -> Option<&[u8]> {
-    use std::os::unix::ffi::OsStrExt;
+fn verify_private_cache_directory(file: &std::fs::File, path: &Path) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
 
-    match component {
-        std::path::Component::Normal(component) => Some(component.as_bytes()),
-        _ => None,
+    let metadata = file.metadata().map_err(|error| {
+        crate::IndexError::Schema(format!(
+            "inspect inherited aggregator cache directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    // SAFETY: geteuid has no arguments and no memory-safety preconditions.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
+        return Err(crate::IndexError::Schema(format!(
+            "inherited aggregator cache directory is not owner-private: {}",
+            path.display()
+        )));
     }
+    Ok(())
 }
 
 #[cfg(unix)]
 fn cache_file_identity(file: &std::fs::File) -> Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
+
     let metadata = file
         .metadata()
         .map_err(|e| crate::IndexError::Schema(format!("inspect opened aggregator cache: {e}")))?;
@@ -2592,13 +2518,17 @@ impl Aggregator {
         &self,
         query: &[f32],
         scopes: &BTreeSet<String>,
+        eligible_images: &BTreeSet<(String, String)>,
         limit: u64,
     ) -> Result<Vec<VectorScore>> {
         self.load_query_scopes(scopes)?;
+        self.load_query_eligible_images(eligible_images)?;
         let mut stmt = self.conn.prepare(
             "SELECT i.scope_id, i.image_id, i.vector, i.dimensions
              FROM agg_image_embeddings i
-             JOIN query_scopes q ON q.scope_id = i.scope_id",
+             JOIN query_scopes q ON q.scope_id = i.scope_id
+             JOIN query_eligible_images allowed
+               ON allowed.scope_id = i.scope_id AND allowed.image_id = i.image_id",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -2706,6 +2636,82 @@ impl Aggregator {
         Ok(candidates)
     }
 
+    /// Enumerate the replica bindings which remain statically eligible for one
+    /// resolved scope/selector/snapshot before the application evaluates the
+    /// current filesystem policy.
+    ///
+    /// This intentionally returns the same [`AggBindingFilter`] shape consumed
+    /// by [`AggSearchRequest`].  The application must evaluate every returned
+    /// path against current policy and pass the complete approved set back as
+    /// `binding_filter` before candidate ranking.  It must not filter a ranked
+    /// or limited candidate list afterwards.
+    ///
+    /// The bound is fail-closed: observing more than `max_count` bindings is an
+    /// error, never a truncated policy input.  The error deliberately contains
+    /// no binding payload or path data.
+    pub fn eligible_bindings_for_policy(
+        &self,
+        scope_id: &str,
+        selector: AggSelector,
+        snapshot_commit: &str,
+        max_count: usize,
+    ) -> Result<Vec<AggBindingFilter>> {
+        if !self.has_completed_projection(scope_id, selector, snapshot_commit)? {
+            return Err(crate::IndexError::Contract(
+                "policy binding projection is incomplete".to_owned(),
+            ));
+        }
+        let query_limit = max_count.checked_add(1).ok_or_else(|| {
+            crate::IndexError::Contract("policy binding enumeration limit is invalid".to_owned())
+        })?;
+        let query_limit = i64::try_from(query_limit).map_err(|_| {
+            crate::IndexError::Contract("policy binding enumeration limit is invalid".to_owned())
+        })?;
+        let mut statement = self.conn.prepare(
+            "SELECT DISTINCT raw_hash, tool_profile_hash, gen, manifest_hash,
+                    path_at_commit, pointer_commit, current_paths_json, is_live
+             FROM agg_bindings
+             WHERE scope_id = ?1
+               AND selector_kind = ?2
+               AND snapshot_commit = ?3
+             ORDER BY raw_hash, tool_profile_hash, gen, manifest_hash,
+                      path_at_commit, pointer_commit, current_paths_json, is_live
+             LIMIT ?4",
+        )?;
+        let rows = statement.query_map(
+            params![scope_id, selector.as_str(), snapshot_commit, query_limit],
+            |row| {
+                let current_paths_json: String = row.get(6)?;
+                let current_paths = serde_json::from_str(&current_paths_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        6,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
+                let is_live: i64 = row.get(7)?;
+                Ok(AggBindingFilter {
+                    scope_id: scope_id.to_owned(),
+                    raw_hash: row.get(0)?,
+                    tool_profile_hash: row.get(1)?,
+                    r#gen: row.get::<_, i64>(2)? as u64,
+                    manifest_hash: row.get(3)?,
+                    path_at_commit: row.get(4)?,
+                    pointer_commit: row.get(5)?,
+                    current_paths,
+                    is_live: is_live != 0,
+                })
+            },
+        )?;
+        let bindings = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        if bindings.len() > max_count {
+            return Err(crate::IndexError::Contract(
+                "policy binding enumeration exceeded configured limit".to_owned(),
+            ));
+        }
+        Ok(bindings)
+    }
+
     fn load_query_eligibility(&self, request: &AggSearchRequest<'_>) -> Result<()> {
         self.conn.execute_batch(
             "CREATE TEMP TABLE IF NOT EXISTS query_snapshots (
@@ -2744,10 +2750,16 @@ impl Aggregator {
                  chunk_id TEXT NOT NULL,
                  PRIMARY KEY(scope_id, chunk_id)
              );
+             CREATE TEMP TABLE IF NOT EXISTS query_eligible_images (
+                 scope_id TEXT NOT NULL,
+                 image_id TEXT NOT NULL,
+                 PRIMARY KEY(scope_id, image_id)
+             ) WITHOUT ROWID;
              DELETE FROM query_snapshots;
              DELETE FROM query_runtime_bindings;
              DELETE FROM query_eligible_bindings;
-             DELETE FROM query_eligible_chunks;",
+             DELETE FROM query_eligible_chunks;
+             DELETE FROM query_eligible_images;",
         )?;
         {
             let mut insert = self.conn.prepare(
@@ -2825,6 +2837,28 @@ impl Aggregator {
              SELECT DISTINCT scope_id, chunk_id
              FROM query_eligible_bindings;",
         )?;
+        self.load_query_eligible_images(request.eligible_images)?;
+        Ok(())
+    }
+
+    fn load_query_eligible_images(
+        &self,
+        eligible_images: &BTreeSet<(String, String)>,
+    ) -> Result<()> {
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS query_eligible_images (
+                 scope_id TEXT NOT NULL,
+                 image_id TEXT NOT NULL,
+                 PRIMARY KEY(scope_id, image_id)
+             ) WITHOUT ROWID;
+             DELETE FROM query_eligible_images;",
+        )?;
+        let mut insert = self
+            .conn
+            .prepare("INSERT INTO query_eligible_images(scope_id, image_id) VALUES (?1, ?2)")?;
+        for (scope_id, image_id) in eligible_images {
+            insert.execute(params![scope_id, image_id])?;
+        }
         Ok(())
     }
 
@@ -2975,6 +3009,8 @@ impl Aggregator {
              FROM agg_image_embeddings image
              JOIN agg_image_refs ref
                ON ref.scope_id = image.scope_id AND ref.image_id = image.image_id
+             JOIN query_eligible_images allowed
+               ON allowed.scope_id = image.scope_id AND allowed.image_id = image.image_id
              WHERE EXISTS (
                  SELECT 1 FROM query_eligible_chunks eligible
                  WHERE eligible.scope_id = ref.scope_id
@@ -3450,11 +3486,20 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn private_fd_root() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut builder = tempfile::Builder::new();
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+        builder.tempdir().unwrap()
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn inherited_directory_fd_cache_root_is_capability_relative() {
         use std::os::fd::AsRawFd;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_fd_root();
         let retained_root = std::fs::File::open(directory.path()).unwrap();
         let path = PathBuf::from(format!(
             "/dev/fd/{}/kio/aggregator.sqlite",
@@ -3471,7 +3516,7 @@ mod tests {
     fn inherited_directory_fd_can_be_the_direct_cache_parent() {
         use std::os::fd::AsRawFd;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_fd_root();
         let retained_root = std::fs::File::open(directory.path()).unwrap();
         let path = PathBuf::from(format!(
             "/dev/fd/{}/aggregator.sqlite",
@@ -3493,7 +3538,7 @@ mod tests {
         };
         assert!(error.to_string().contains("descriptor"));
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_fd_root();
         let regular = directory.path().join("not-a-directory");
         std::fs::write(&regular, b"not a directory").unwrap();
         let retained_file = std::fs::File::open(&regular).unwrap();
@@ -3506,7 +3551,28 @@ mod tests {
             Ok(_) => panic!("regular descriptor must fail"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("must name a directory"));
+        assert!(error.to_string().contains("owner-only"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_directory_fd_cache_root_rejects_nonprivate_root_without_writing() {
+        use std::os::{fd::AsRawFd, unix::fs::PermissionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let retained_root = std::fs::File::open(directory.path()).unwrap();
+        let path = PathBuf::from(format!(
+            "/dev/fd/{}/aggregator.sqlite",
+            retained_root.as_raw_fd()
+        ));
+
+        let error = match Aggregator::open(&path) {
+            Ok(_) => panic!("public inherited root must fail"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("owner-only"));
+        assert!(!directory.path().join("aggregator.sqlite").exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -3514,7 +3580,7 @@ mod tests {
     fn inherited_directory_fd_cache_root_rejects_every_noncanonical_alias() {
         use std::os::fd::AsRawFd;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_fd_root();
         let retained_root = std::fs::File::open(directory.path()).unwrap();
         let fd = retained_root.as_raw_fd();
         let aliases = [
@@ -3528,13 +3594,20 @@ mod tests {
             format!("/dev/./fd/{fd}/../victim/aggregator.sqlite"),
             format!("/dev/shm/../fd/{fd}/../victim/aggregator.sqlite"),
         ];
-        for alias in aliases {
+        for (index, alias) in aliases.into_iter().enumerate() {
             let error = match Aggregator::open(Path::new(&alias)) {
                 Ok(_) => panic!("noncanonical inherited descriptor path must fail: {alias}"),
                 Err(error) => error,
             };
+            // The shared capability parser rejects a leading-zero descriptor;
+            // lexical path aliases are rejected before reaching that parser.
+            let expected = if index == 0 {
+                "KIO-E-PRIVATE-FILE-UNSAFE-001"
+            } else {
+                "not canonical"
+            };
             assert!(
-                error.to_string().contains("not canonical"),
+                error.to_string().contains(expected),
                 "unexpected error for {alias}: {error}"
             );
         }
@@ -3555,8 +3628,8 @@ mod tests {
         use std::os::fd::AsRawFd;
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
-        let victim = tempfile::tempdir().unwrap();
+        let directory = private_fd_root();
+        let victim = private_fd_root();
         let retained_root = std::fs::File::open(directory.path()).unwrap();
         let original = directory.path().join("kio");
         std::fs::create_dir(&original).unwrap();
@@ -4006,6 +4079,7 @@ mod tests {
                 snapshots: &snapshots,
                 selector: AggSelector::Current,
                 binding_filter: None,
+                eligible_images: &BTreeSet::new(),
                 since_cutoff: None,
                 match_expr: Some("needle"),
                 short_token_forms: &[],
@@ -4024,6 +4098,7 @@ mod tests {
                 snapshots: &snapshots,
                 selector: AggSelector::AllHistory,
                 binding_filter: None,
+                eligible_images: &BTreeSet::new(),
                 since_cutoff: None,
                 match_expr: Some("needle"),
                 short_token_forms: &[],
@@ -4048,6 +4123,7 @@ mod tests {
                 snapshots: &snapshots,
                 selector: AggSelector::Current,
                 binding_filter: None,
+                eligible_images: &BTreeSet::new(),
                 since_cutoff: None,
                 match_expr: None,
                 short_token_forms: &forms,
@@ -4100,6 +4176,7 @@ mod tests {
                 snapshots: &snapshots,
                 selector: AggSelector::AllHistory,
                 binding_filter: None,
+                eligible_images: &BTreeSet::new(),
                 since_cutoff: None,
                 match_expr: Some("needle"),
                 short_token_forms: &[],
@@ -4128,6 +4205,7 @@ mod tests {
                 snapshots: &snapshots,
                 selector: AggSelector::AllHistory,
                 binding_filter: Some(&allowed),
+                eligible_images: &BTreeSet::new(),
                 since_cutoff: None,
                 match_expr: Some("needle"),
                 short_token_forms: &[],
@@ -4151,6 +4229,7 @@ mod tests {
                 snapshots: &snapshots,
                 selector: AggSelector::AllHistory,
                 binding_filter: Some(&empty),
+                eligible_images: &BTreeSet::new(),
                 since_cutoff: None,
                 match_expr: Some("needle"),
                 short_token_forms: &[],
@@ -4161,6 +4240,65 @@ mod tests {
             })
             .unwrap();
         assert!(empty_result.is_empty());
+    }
+
+    #[test]
+    fn policy_binding_enumeration_is_selector_scoped_bounded_and_complete() {
+        let (_dir, mut index) = store();
+        let incomplete = index
+            .eligible_bindings_for_policy("s", AggSelector::Current, "head", 1)
+            .unwrap_err();
+        assert!(matches!(incomplete, crate::IndexError::Contract(_)));
+        assert!(!incomplete.to_string().contains("head"));
+
+        let current_chunk = chunk("current", "needle");
+        let mut alias_chunk = chunk("old", "needle");
+        alias_chunk.raw_hash = current_chunk.raw_hash.clone();
+        let chunks = [current_chunk, alias_chunk];
+        let bindings = [
+            binding("current", "head", "current", "live.md"),
+            // Two chunk rows with the same policy-relevant binding identity
+            // must produce one filter, which still admits both rows when it is
+            // returned to the candidate query.
+            AggBinding {
+                chunk_id: "old".to_owned(),
+                ..binding("current", "head", "current", "live.md")
+            },
+            binding("all_history", "head", "old", "old.md"),
+        ];
+        index
+            .refresh_scope_with_projection(AggProjectionRequest {
+                scope_id: "s",
+                header: &header("g"),
+                chunks: &chunks,
+                images: &[],
+                bindings: &bindings,
+                completions: &[
+                    completion(AggSelector::Current, "head"),
+                    completion(AggSelector::AllHistory, "head"),
+                ],
+                now_ms: 1,
+            })
+            .unwrap();
+
+        let current = index
+            .eligible_bindings_for_policy("s", AggSelector::Current, "head", 1)
+            .unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].path_at_commit, "live.md");
+
+        let historical = index
+            .eligible_bindings_for_policy("s", AggSelector::AllHistory, "head", 1)
+            .unwrap();
+        assert_eq!(historical.len(), 1);
+        assert_eq!(historical[0].path_at_commit, "old.md");
+
+        let overflow = index
+            .eligible_bindings_for_policy("s", AggSelector::AllHistory, "head", 0)
+            .unwrap_err();
+        assert!(matches!(overflow, crate::IndexError::Contract(_)));
+        assert!(overflow.to_string().contains("exceeded configured limit"));
+        assert!(!overflow.to_string().contains("old.md"));
     }
 
     #[test]
@@ -4213,12 +4351,14 @@ mod tests {
             .unwrap();
         let scopes = only(&["s"]);
         let snapshots = BTreeMap::from([("s".to_owned(), "head".to_owned())]);
+        let eligible_images = BTreeSet::from([("s".to_owned(), "a-image".to_owned())]);
         let candidates = index
             .search_candidates(&AggSearchRequest {
                 scopes: &scopes,
                 snapshots: &snapshots,
                 selector: AggSelector::Current,
                 binding_filter: None,
+                eligible_images: &eligible_images,
                 since_cutoff: None,
                 match_expr: None,
                 short_token_forms: &[],
@@ -4238,6 +4378,53 @@ mod tests {
             .unwrap();
         assert_eq!(image.vector_rank, Some(1));
         assert_eq!(chunk.vector_rank, Some(2));
+    }
+
+    #[test]
+    fn image_authority_allowlist_filters_vectors_before_candidate_depth() {
+        let (_dir, mut index) = store();
+        let chunks = [chunk("image-citation", "caption")];
+        let images = [
+            image("denied-image", vec![1.0, 0.0]),
+            image("allowed-image", vec![0.5, 0.5]),
+        ];
+        let bindings = [binding("current", "head", "image-citation", "figure.md")];
+        index
+            .refresh_scope_with_projection(AggProjectionRequest {
+                scope_id: "s",
+                header: &header("g"),
+                chunks: &chunks,
+                images: &images,
+                bindings: &bindings,
+                completions: &[completion(AggSelector::Current, "head")],
+                now_ms: 1,
+            })
+            .unwrap();
+        let scopes = only(&["s"]);
+        let snapshots = BTreeMap::from([("s".to_owned(), "head".to_owned())]);
+        let eligible_images = BTreeSet::from([("s".to_owned(), "allowed-image".to_owned())]);
+        let candidates = index
+            .search_candidates(&AggSearchRequest {
+                scopes: &scopes,
+                snapshots: &snapshots,
+                selector: AggSelector::Current,
+                binding_filter: None,
+                eligible_images: &eligible_images,
+                since_cutoff: None,
+                match_expr: None,
+                short_token_forms: &[],
+                query_embedding: Some(&[1.0, 0.0]),
+                search_text: false,
+                search_vector: true,
+                candidate_depth: 1,
+            })
+            .unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(
+            candidates[0].image_id.as_deref(),
+            Some("allowed-image"),
+            "a denied higher-score image must not consume the only vector slot"
+        );
     }
 
     #[test]
@@ -4947,9 +5134,10 @@ mod tests {
             })
             .unwrap();
         let mut scores = index.vector_scores(&[1.0, 0.0], &only(&["s"]), 10).unwrap();
+        let eligible_images = BTreeSet::from([("s".to_owned(), "mid-image".to_owned())]);
         scores.extend(
             index
-                .image_vector_scores(&[1.0, 0.0], &only(&["s"]), 10)
+                .image_vector_scores(&[1.0, 0.0], &only(&["s"]), &eligible_images, 10)
                 .unwrap(),
         );
         let ranks = vector_ranks(&scores);
@@ -4981,9 +5169,10 @@ mod tests {
                 now_ms: 1,
             })
             .unwrap();
+        let eligible_images = BTreeSet::from([("s".to_owned(), "fig".to_owned())]);
         assert_eq!(
             index
-                .image_vector_scores(&[1.0, 0.0], &only(&["s"]), 10)
+                .image_vector_scores(&[1.0, 0.0], &only(&["s"]), &eligible_images, 10)
                 .unwrap()
                 .len(),
             1
@@ -5001,7 +5190,7 @@ mod tests {
             .unwrap();
         assert!(
             index
-                .image_vector_scores(&[1.0, 0.0], &only(&["s"]), 10)
+                .image_vector_scores(&[1.0, 0.0], &only(&["s"]), &eligible_images, 10)
                 .unwrap()
                 .is_empty(),
             "an image no live chunk cites must stop being rankable"

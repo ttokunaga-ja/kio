@@ -23,6 +23,22 @@ use kio_core::{
     cas::{MAX_RAW_OBJECT_BYTES, hash_bytes, read_bounded_regular_file},
 };
 use kio_eval::{
+    acceptance::{
+        A01Options, A05Options, A06Options, A09Options, AcceptanceCase, AcceptanceLane,
+        AcceptanceRequirement, AcceptanceSubcase, NativeOs, assemble_expected_cases,
+        read_acceptance_binding, read_expected_manifest, read_expected_receipt, read_receipt,
+        run_a01, run_a05, run_a06, run_a09, write_expected_manifest_create_only,
+    },
+    acceptance_authenticated_local::{AuthenticatedLocalOptions, run_embedding, run_ocr},
+    acceptance_distribution::{ExpectedCaseOptions, write_expected_case},
+    acceptance_failure::{FailureOptions, run_a08 as run_a08_failure},
+    acceptance_fault::{FaultOptions, run_a10},
+    acceptance_local_trust::{LocalTrustOptions, run_a04 as run_local_trust_a04},
+    acceptance_native::{NativeOptions, run_a02, run_a03},
+    acceptance_office::{A07OfficeOptions, run_a07},
+    acceptance_policy::{PolicyOptions, run_a04 as run_policy_a04},
+    acceptance_provider::{A08ProviderOptions, Provider, run_a08_provider},
+    acceptance_service::{ServiceOptions, run_a03 as run_service_a03, run_a11},
     artifact::CreateOnlyArtifact,
     attestation::{MAX_POINTER_ATTESTATIONS_PER_QUERY, PointerAttestor},
     boundary::{BoundCorpus, BoundScope},
@@ -33,6 +49,7 @@ use kio_eval::{
         load_golden_queries, load_history_manifest,
     },
     persona_plan::PersonaProfile,
+    provider_budget::{initialize_campaign, reserve as reserve_provider_budget},
     qhard::{self, BaselineAttestOptions, BaselineOptions, QhardOptions},
     rerank::{
         FixtureRerankDumpOptions, RerankApplyOptions, RerankApplySummary, RerankDataset,
@@ -181,6 +198,265 @@ enum Commands {
     Release {
         #[command(subcommand)]
         command: ReleaseCommands,
+    },
+    /// Verify immutable acceptance bindings and execute one implemented case.
+    Acceptance {
+        #[command(subcommand)]
+        command: AcceptanceCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum AcceptanceCommands {
+    /// Execute one phase of A08 against managed HTTPS local model peers.
+    /// OCR writes a checkpoint; embedding verifies it and emits the final receipt.
+    AuthenticatedLocal {
+        #[arg(long, value_enum)]
+        phase: AuthenticatedLocalPhase,
+        #[arg(long)]
+        expected_case: PathBuf,
+        #[arg(long, value_parser = parse_native_os)]
+        os: NativeOs,
+        #[arg(long)]
+        bin: PathBuf,
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long)]
+        work_dir: PathBuf,
+        #[arg(long)]
+        receipt: PathBuf,
+        #[arg(long)]
+        ocr_endpoint: String,
+        #[arg(long)]
+        embedding_endpoint: String,
+        #[arg(long)]
+        ca_pem: PathBuf,
+        #[arg(long)]
+        service_identity: PathBuf,
+        #[arg(long)]
+        service_identity_sha256: String,
+    },
+    TargetBinding {
+        #[arg(long)]
+        candidate_sha: String,
+        #[arg(long, value_parser = parse_native_os)]
+        os: NativeOs,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        archive_sha256: String,
+        #[arg(long)]
+        binary_sha256: String,
+        #[arg(long)]
+        version: String,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    Distribution {
+        #[arg(
+            long,
+            required_unless_present = "expected_case",
+            conflicts_with = "expected_case"
+        )]
+        expected: Option<PathBuf>,
+        /// Canonical binding for the requested A12 distribution case.
+        #[arg(long, conflicts_with = "expected")]
+        expected_case: Option<PathBuf>,
+        #[arg(long, value_parser = parse_native_os)]
+        os: NativeOs,
+        #[arg(long)]
+        archive: PathBuf,
+        #[arg(long)]
+        checksums: PathBuf,
+        #[arg(long)]
+        repro_archive: PathBuf,
+        #[arg(long)]
+        repro_checksums: PathBuf,
+        #[arg(long)]
+        source_repo: PathBuf,
+        #[arg(long)]
+        expected_lock_sha256: String,
+        #[arg(long)]
+        work_dir: PathBuf,
+        #[arg(long)]
+        receipt: PathBuf,
+    },
+    /// Check native runner prerequisites and write a create-only report.
+    Preflight {
+        #[arg(long, value_parser = parse_native_os)]
+        runner_os: NativeOs,
+        #[arg(long)]
+        office_converter: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Create or reserve immutable provider-acceptance campaign budget state.
+    Budget {
+        #[command(subcommand)]
+        command: ProviderBudgetCommands,
+    },
+    /// Generate the complete fixed v1 expected matrix from reviewed,
+    /// pre-execution bindings for Linux, macOS, and Windows.
+    Expected {
+        #[arg(long)]
+        binding: PathBuf,
+        /// New canonical manifest path; existing output is rejected.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Construct one canonical expected receipt from this workflow's reviewed
+    /// target binding and immutable fixture/workflow inputs.
+    ExpectedCase {
+        #[arg(long)]
+        target_binding: PathBuf,
+        #[arg(long, value_parser = parse_acceptance_case)]
+        case: AcceptanceCase,
+        #[arg(long, value_parser = parse_acceptance_lane)]
+        lane: AcceptanceLane,
+        #[arg(long, value_parser = parse_acceptance_subcase)]
+        subcase: AcceptanceSubcase,
+        #[arg(long, value_parser = parse_native_os)]
+        os: NativeOs,
+        #[arg(long)]
+        fixture_id: String,
+        #[arg(long)]
+        fixture_sha256: String,
+        #[arg(long)]
+        workflow_path: String,
+        #[arg(long)]
+        workflow_sha256: String,
+        #[arg(long)]
+        workflow_commit: String,
+        #[arg(long)]
+        run_id: u64,
+        #[arg(long)]
+        attempt: u32,
+        #[arg(long)]
+        architecture: String,
+        /// SHA-256 of the instrumented contract binary, required only for
+        /// native fault-contract requirements.
+        #[arg(long)]
+        contract_binary_sha256: Option<String>,
+        #[arg(long)]
+        service_identity_sha256: Option<String>,
+        /// New canonical expected-receipt path; existing output is rejected.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Assemble the fixed acceptance matrix from canonical, predeclared
+    /// single-case expectations. Receipt files are not accepted here.
+    AssembleExpected {
+        #[arg(long)]
+        candidate_sha: String,
+        /// One or more canonical files produced by `acceptance expected-case`.
+        #[arg(long, required = true, num_args = 1..)]
+        expected_case: Vec<PathBuf>,
+        /// New canonical expected-manifest path; existing output is rejected.
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Validate and print the canonical fixed v1 expected-receipt manifest.
+    Plan {
+        #[arg(long)]
+        expected: PathBuf,
+    },
+    /// Reject incomplete, duplicate, or differently-bound acceptance receipts.
+    Verify {
+        #[arg(long)]
+        expected: PathBuf,
+        #[arg(long, required = true)]
+        receipt: Vec<PathBuf>,
+    },
+    /// Execute one acceptance case. A05 does not emit a receipt until its required
+    /// release-binary vector/image runtime is configured.
+    Run {
+        #[arg(
+            long,
+            required_unless_present = "expected_case",
+            conflicts_with = "expected_case"
+        )]
+        expected: Option<PathBuf>,
+        /// Canonical binding for this one requested case; receipt aggregation accepts only --expected.
+        #[arg(long, conflicts_with = "expected")]
+        expected_case: Option<PathBuf>,
+        #[arg(long, value_parser = parse_acceptance_case)]
+        case: AcceptanceCase,
+        #[arg(long, value_parser = parse_acceptance_lane)]
+        lane: AcceptanceLane,
+        #[arg(long, default_value = "core", value_parser = parse_acceptance_subcase)]
+        subcase: AcceptanceSubcase,
+        #[arg(long, value_parser = parse_native_os)]
+        os: NativeOs,
+        #[arg(long)]
+        bin: PathBuf,
+        #[arg(long)]
+        fixture: PathBuf,
+        #[arg(long)]
+        work_dir: PathBuf,
+        #[arg(long)]
+        receipt: PathBuf,
+        /// Instrumented contract binary for A10/native/core and
+        /// A08/native/mock-failure only.
+        #[arg(long)]
+        contract_bin: Option<PathBuf>,
+        /// Required only for A07 office-real.
+        #[arg(long)]
+        office_converter: Option<PathBuf>,
+        /// Create-only native preflight binding, required only for A07 office-real.
+        #[arg(long)]
+        preflight_report: Option<PathBuf>,
+        /// Required acknowledgement for native scheduler registration in the
+        /// A03/A11 service-native lane.
+        #[arg(long)]
+        allow_native_service: bool,
+        /// Required only for the real-provider A08 subcases.
+        #[arg(long, value_parser = parse_provider)]
+        provider: Option<Provider>,
+        /// Reconstructed immutable campaign records; required only for A08.
+        #[arg(long)]
+        reservation_state_dir: Option<PathBuf>,
+        #[arg(long)]
+        campaign_id: Option<String>,
+        #[arg(long)]
+        allocation_id: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum AuthenticatedLocalPhase {
+    Ocr,
+    Embedding,
+}
+
+#[derive(Debug, Subcommand)]
+enum ProviderBudgetCommands {
+    /// Bind a new campaign state directory before any provider request can reserve spend.
+    Initialize {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        campaign_id: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        cap_microusd: u64,
+    },
+    /// Reserve an allocation immediately before one paid provider request.
+    Reserve {
+        #[arg(long)]
+        state_dir: PathBuf,
+        #[arg(long)]
+        campaign_id: String,
+        #[arg(long)]
+        candidate_sha: String,
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        allocation_id: String,
+        #[arg(long)]
+        cap_microusd: u64,
+        #[arg(long)]
+        amount_microusd: u64,
     },
 }
 
@@ -732,6 +1008,70 @@ fn parse_scenario(value: &str) -> Result<String, String> {
     match value {
         "M3-1" | "M3-2" | "M3-3" => Ok(value.to_owned()),
         _ => Err("must be M3-1, M3-2, or M3-3".to_owned()),
+    }
+}
+
+fn parse_acceptance_case(value: &str) -> Result<AcceptanceCase, String> {
+    match value {
+        "A01" => Ok(AcceptanceCase::A01),
+        "A02" => Ok(AcceptanceCase::A02),
+        "A03" => Ok(AcceptanceCase::A03),
+        "A04" => Ok(AcceptanceCase::A04),
+        "A05" => Ok(AcceptanceCase::A05),
+        "A06" => Ok(AcceptanceCase::A06),
+        "A07" => Ok(AcceptanceCase::A07),
+        "A08" => Ok(AcceptanceCase::A08),
+        "A09" => Ok(AcceptanceCase::A09),
+        "A10" => Ok(AcceptanceCase::A10),
+        "A11" => Ok(AcceptanceCase::A11),
+        "A12" => Ok(AcceptanceCase::A12),
+        _ => Err("must be one of A01 through A12".into()),
+    }
+}
+
+fn parse_acceptance_lane(value: &str) -> Result<AcceptanceLane, String> {
+    match value {
+        "native-contract" => Ok(AcceptanceLane::NativeContract),
+        "office-real" => Ok(AcceptanceLane::OfficeReal),
+        "service-native" => Ok(AcceptanceLane::ServiceNative),
+        "provider-live" => Ok(AcceptanceLane::ProviderLive),
+        "distribution" => Ok(AcceptanceLane::Distribution),
+        _ => Err(
+            "must be native-contract, office-real, service-native, provider-live, or distribution"
+                .into(),
+        ),
+    }
+}
+
+fn parse_acceptance_subcase(value: &str) -> Result<AcceptanceSubcase, String> {
+    match value {
+        "core" => Ok(AcceptanceSubcase::Core),
+        "local-trust" => Ok(AcceptanceSubcase::LocalTrust),
+        "mock-failure" => Ok(AcceptanceSubcase::MockFailure),
+        "mistral" => Ok(AcceptanceSubcase::Mistral),
+        "gemini" => Ok(AcceptanceSubcase::Gemini),
+        "authenticated-local" => Ok(AcceptanceSubcase::AuthenticatedLocal),
+        _ => Err(
+            "must be core, local-trust, mock-failure, mistral, gemini, or authenticated-local"
+                .into(),
+        ),
+    }
+}
+
+fn parse_provider(value: &str) -> Result<Provider, String> {
+    match value {
+        "mistral" => Ok(Provider::Mistral),
+        "gemini" => Ok(Provider::Gemini),
+        _ => Err("must be mistral or gemini".into()),
+    }
+}
+
+fn parse_native_os(value: &str) -> Result<NativeOs, String> {
+    match value {
+        "linux" => Ok(NativeOs::Linux),
+        "macos" => Ok(NativeOs::Macos),
+        "windows" => Ok(NativeOs::Windows),
+        _ => Err("must be linux, macos, or windows".into()),
     }
 }
 
@@ -1466,7 +1806,7 @@ fn verify_restore(
         let mut command = Command::new(bin);
         command
             .arg("--json")
-            .arg("restore")
+            .arg("export")
             .arg(pointer)
             .arg("--to")
             .arg(destination.path())
@@ -2114,6 +2454,684 @@ pub fn run(args: Args) -> Result<ExitCode, AppError> {
                     Ok(ExitCode::Success)
                 }
             },
+            Commands::Acceptance { command } => match command {
+                AcceptanceCommands::AuthenticatedLocal {
+                    phase,
+                    expected_case,
+                    os,
+                    bin,
+                    fixture,
+                    work_dir,
+                    receipt,
+                    ocr_endpoint,
+                    embedding_endpoint,
+                    ca_pem,
+                    service_identity,
+                    service_identity_sha256,
+                } => {
+                    let expected = read_expected_receipt(expected_case)
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    let requirement = AcceptanceRequirement {
+                        case: AcceptanceCase::A08,
+                        lane: AcceptanceLane::ProviderLive,
+                        subcase: AcceptanceSubcase::AuthenticatedLocal,
+                        os: *os,
+                    };
+                    if expected.requirement != requirement {
+                        return Err(AppError::Input(
+                            "expected binding does not match A08 authenticated-local and the selected OS".into(),
+                        ));
+                    }
+                    let options = AuthenticatedLocalOptions {
+                        binary: bin.clone(),
+                        fixture: fixture.clone(),
+                        expected,
+                        work_dir: work_dir.clone(),
+                        receipt: receipt.clone(),
+                        ocr_endpoint: ocr_endpoint.clone(),
+                        embedding_endpoint: embedding_endpoint.clone(),
+                        ca_pem: ca_pem.clone(),
+                        service_identity: service_identity.clone(),
+                        service_identity_sha256: service_identity_sha256.clone(),
+                    };
+                    match phase {
+                        AuthenticatedLocalPhase::Ocr => {
+                            run_ocr(&options)
+                                .map_err(|error| AppError::Input(error.to_string()))?;
+                            println!(
+                                "[ok] authenticated-local OCR checkpoint written; embedding phase remains"
+                            );
+                        }
+                        AuthenticatedLocalPhase::Embedding => {
+                            run_embedding(&options)
+                                .map_err(|error| AppError::Input(error.to_string()))?;
+                            println!("[ok] authenticated-local acceptance receipt written");
+                        }
+                    }
+                    Ok(ExitCode::Success)
+                }
+                AcceptanceCommands::TargetBinding {
+                    candidate_sha,
+                    os,
+                    target,
+                    archive_sha256,
+                    binary_sha256,
+                    version,
+                    out,
+                } => {
+                    kio_eval::acceptance_distribution::write_target_binding(
+                        &kio_eval::acceptance_distribution::TargetBindingOptions {
+                            candidate_sha: candidate_sha.clone(),
+                            os: *os,
+                            target: target.clone(),
+                            archive_sha256: archive_sha256.clone(),
+                            binary_sha256: binary_sha256.clone(),
+                            version: version.clone(),
+                            out: out.clone(),
+                        },
+                    )
+                    .map_err(|e| AppError::Input(e.to_string()))?;
+                    Ok(ExitCode::Success)
+                }
+                AcceptanceCommands::Distribution {
+                    expected,
+                    expected_case,
+                    os,
+                    archive,
+                    checksums,
+                    repro_archive,
+                    repro_checksums,
+                    source_repo,
+                    expected_lock_sha256,
+                    work_dir,
+                    receipt,
+                } => {
+                    let requirement = AcceptanceRequirement {
+                        case: AcceptanceCase::A12,
+                        lane: AcceptanceLane::Distribution,
+                        subcase: AcceptanceSubcase::Core,
+                        os: *os,
+                    };
+                    let expected = match (expected.as_ref(), expected_case.as_ref()) {
+                        (Some(expected), None) => read_expected_manifest(expected)
+                            .map_err(|e| AppError::Input(e.to_string()))?
+                            .plan()
+                            .map_err(|e| AppError::Input(e.to_string()))?
+                            .expected_for(&requirement)
+                            .map_err(|e| AppError::Input(e.to_string()))?
+                            .clone(),
+                        (None, Some(expected_case)) => {
+                            let expected = read_expected_receipt(expected_case)
+                                .map_err(|e| AppError::Input(e.to_string()))?;
+                            if expected.requirement != requirement {
+                                return Err(AppError::Input(
+                                    "single-case expected binding does not match the requested distribution selector".into(),
+                                ));
+                            }
+                            expected
+                        }
+                        _ => return Err(AppError::Input(
+                            "acceptance distribution requires exactly one of --expected or --expected-case".into(),
+                        )),
+                    };
+                    let summary = kio_eval::acceptance_distribution::run(
+                        &kio_eval::acceptance_distribution::DistributionOptions {
+                            expected,
+                            archive: archive.clone(),
+                            checksums: checksums.clone(),
+                            repro_archive: repro_archive.clone(),
+                            repro_checksums: repro_checksums.clone(),
+                            source_repo: source_repo.clone(),
+                            expected_lock_sha256: expected_lock_sha256.clone(),
+                            work_dir: work_dir.clone(),
+                            receipt: receipt.clone(),
+                        },
+                    )
+                    .map_err(|e| AppError::Input(e.to_string()))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&summary)
+                            .map_err(|e| AppError::Input(e.to_string()))?
+                    );
+                    Ok(ExitCode::Success)
+                }
+                AcceptanceCommands::Preflight {
+                    runner_os,
+                    office_converter,
+                    out,
+                } => {
+                    let outcome = kio_eval::acceptance_preflight::run(
+                        &kio_eval::acceptance_preflight::PreflightOptions {
+                            runner_os: *runner_os,
+                            office_converter: office_converter.clone(),
+                            out: out.clone(),
+                        },
+                    )
+                    .map_err(|error| AppError::Input(error.to_string()))?;
+                    if !outcome.passed {
+                        return Err(AppError::Input(
+                            "native acceptance preflight failed; inspect the create-only report"
+                                .into(),
+                        ));
+                    }
+                    Ok(ExitCode::Success)
+                }
+                AcceptanceCommands::Budget { command } => {
+                    let value = match command {
+                        ProviderBudgetCommands::Initialize {
+                            state_dir,
+                            campaign_id,
+                            provider,
+                            cap_microusd,
+                        } => serde_json::to_value(
+                            initialize_campaign(state_dir, campaign_id, provider, *cap_microusd)
+                                .map_err(|error| AppError::Input(error.to_string()))?,
+                        ),
+                        ProviderBudgetCommands::Reserve {
+                            state_dir,
+                            campaign_id,
+                            candidate_sha,
+                            provider,
+                            allocation_id,
+                            cap_microusd,
+                            amount_microusd,
+                        } => serde_json::to_value(
+                            reserve_provider_budget(
+                                state_dir,
+                                campaign_id,
+                                candidate_sha,
+                                provider,
+                                allocation_id,
+                                *cap_microusd,
+                                *amount_microusd,
+                            )
+                            .map_err(|error| AppError::Input(error.to_string()))?,
+                        ),
+                    }
+                    .map_err(|error| AppError::Input(error.to_string()))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&value)
+                            .map_err(|error| AppError::Input(error.to_string()))?
+                    );
+                    Ok(ExitCode::Success)
+                }
+                AcceptanceCommands::Expected { binding, out } => {
+                    let binding = read_acceptance_binding(binding)
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    let manifest = binding
+                        .expected_manifest()
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    write_expected_manifest_create_only(out, &manifest)
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    println!("[ok] canonical fixed v1 expected manifest written");
+                    Ok(ExitCode::Success)
+                }
+                AcceptanceCommands::ExpectedCase {
+                    target_binding,
+                    case,
+                    lane,
+                    subcase,
+                    os,
+                    fixture_id,
+                    fixture_sha256,
+                    workflow_path,
+                    workflow_sha256,
+                    workflow_commit,
+                    run_id,
+                    attempt,
+                    architecture,
+                    contract_binary_sha256,
+                    service_identity_sha256,
+                    out,
+                } => {
+                    let requirement = AcceptanceRequirement {
+                        case: *case,
+                        lane: *lane,
+                        subcase: *subcase,
+                        os: *os,
+                    };
+                    write_expected_case(&ExpectedCaseOptions {
+                        target_binding: target_binding.clone(),
+                        requirement,
+                        fixture_id: fixture_id.clone(),
+                        fixture_sha256: fixture_sha256.clone(),
+                        workflow_path: workflow_path.clone(),
+                        workflow_sha256: workflow_sha256.clone(),
+                        workflow_commit: workflow_commit.clone(),
+                        run_id: *run_id,
+                        attempt: *attempt,
+                        architecture: architecture.clone(),
+                        contract_binary_sha256: contract_binary_sha256.clone(),
+                        service_identity_sha256: service_identity_sha256.clone(),
+                        out: out.clone(),
+                    })
+                    .map_err(|error| AppError::Input(error.to_string()))?;
+                    println!("[ok] canonical single-case expected receipt written");
+                    Ok(ExitCode::Success)
+                }
+                AcceptanceCommands::AssembleExpected {
+                    candidate_sha,
+                    expected_case,
+                    out,
+                } => {
+                    let expected = expected_case
+                        .iter()
+                        .map(|path| {
+                            read_expected_receipt(path)
+                                .map_err(|error| AppError::Input(error.to_string()))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let manifest = assemble_expected_cases(candidate_sha, expected)
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    write_expected_manifest_create_only(out, &manifest)
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    println!("[ok] canonical fixed v1 expected manifest assembled");
+                    Ok(ExitCode::Success)
+                }
+                AcceptanceCommands::Plan { expected } => {
+                    let manifest = read_expected_manifest(expected)
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    let bytes = manifest
+                        .canonical_bytes()
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    println!("{}", String::from_utf8_lossy(&bytes));
+                    Ok(ExitCode::Success)
+                }
+                AcceptanceCommands::Verify { expected, receipt } => {
+                    let manifest = read_expected_manifest(expected)
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    let plan = manifest
+                        .plan()
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    let receipts = receipt
+                        .iter()
+                        .map(|path| {
+                            read_receipt(path).map_err(|error| AppError::Input(error.to_string()))
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    plan.verify(&receipts)
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    println!("[ok] fixed v1 acceptance receipt set is complete and bound");
+                    Ok(ExitCode::Success)
+                }
+                AcceptanceCommands::Run {
+                    expected,
+                    expected_case,
+                    case,
+                    lane,
+                    subcase,
+                    os,
+                    bin,
+                    fixture,
+                    work_dir,
+                    receipt,
+                    contract_bin,
+                    office_converter,
+                    preflight_report,
+                    allow_native_service,
+                    provider,
+                    reservation_state_dir,
+                    campaign_id,
+                    allocation_id,
+                } => {
+                    let requirement = AcceptanceRequirement {
+                        case: *case,
+                        lane: *lane,
+                        subcase: *subcase,
+                        os: *os,
+                    };
+                    let expected = match (expected.as_ref(), expected_case.as_ref()) {
+                        (Some(expected), None) => read_expected_manifest(expected)
+                            .map_err(|error| AppError::Input(error.to_string()))?
+                            .plan()
+                            .map_err(|error| AppError::Input(error.to_string()))?
+                            .expected_for(&requirement)
+                            .map_err(|error| AppError::Input(error.to_string()))?
+                            .clone(),
+                        (None, Some(expected_case)) => {
+                            let expected = read_expected_receipt(expected_case)
+                                .map_err(|error| AppError::Input(error.to_string()))?;
+                            if expected.requirement != requirement {
+                                return Err(AppError::Input(
+                                    "single-case expected binding does not match the requested acceptance selector".into(),
+                                ));
+                            }
+                            expected
+                        }
+                        _ => return Err(AppError::Input(
+                            "acceptance run requires exactly one of --expected or --expected-case"
+                                .into(),
+                        )),
+                    };
+                    let provider_fields_present = provider.is_some()
+                        || reservation_state_dir.is_some()
+                        || campaign_id.is_some()
+                        || allocation_id.is_some();
+                    let office_converter_present = office_converter.is_some();
+                    let is_provider_a08 = requirement.case == AcceptanceCase::A08
+                        && requirement.lane == AcceptanceLane::ProviderLive
+                        && matches!(
+                            requirement.subcase,
+                            AcceptanceSubcase::Mistral | AcceptanceSubcase::Gemini
+                        );
+                    if provider_fields_present && !is_provider_a08 {
+                        return Err(AppError::Input(
+                            "provider reservation fields are valid only for A08 provider-live"
+                                .into(),
+                        ));
+                    }
+                    let is_office_a07 = requirement.case == AcceptanceCase::A07
+                        && requirement.lane == AcceptanceLane::OfficeReal
+                        && requirement.subcase == AcceptanceSubcase::Core;
+                    let is_service_case = requirement.lane == AcceptanceLane::ServiceNative
+                        && requirement.subcase == AcceptanceSubcase::Core
+                        && matches!(requirement.case, AcceptanceCase::A03 | AcceptanceCase::A11);
+                    let is_contract_binary_case = matches!(
+                        (requirement.case, requirement.lane, requirement.subcase),
+                        (
+                            AcceptanceCase::A10,
+                            AcceptanceLane::NativeContract,
+                            AcceptanceSubcase::Core
+                        ) | (
+                            AcceptanceCase::A08,
+                            AcceptanceLane::NativeContract,
+                            AcceptanceSubcase::MockFailure
+                        )
+                    );
+                    if office_converter_present && !is_office_a07 {
+                        return Err(AppError::Input(
+                            "--office-converter is valid only for A07 office-real".into(),
+                        ));
+                    }
+                    if preflight_report.is_some() && !(is_office_a07 || is_service_case) {
+                        return Err(AppError::Input(
+                            "--preflight-report is valid only for A07 office-real or A03/A11 service-native".into(),
+                        ));
+                    }
+                    if *allow_native_service && !is_service_case {
+                        return Err(AppError::Input(
+                            "--allow-native-service is valid only for A03/A11 service-native"
+                                .into(),
+                        ));
+                    }
+                    if contract_bin.is_some() && !is_contract_binary_case {
+                        return Err(AppError::Input(
+                            "--contract-bin is valid only for A10 native-contract/core or A08 native-contract/mock-failure".into(),
+                        ));
+                    }
+                    if is_contract_binary_case && contract_bin.is_none() {
+                        return Err(AppError::Input(
+                            "this native fault-contract requirement requires --contract-bin".into(),
+                        ));
+                    }
+                    let summary = match requirement.case {
+                        AcceptanceCase::A03 if is_service_case => {
+                            let preflight_report = preflight_report
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AppError::Input(
+                                        "A03 service-native requires --preflight-report".into(),
+                                    )
+                                })?
+                                .clone();
+                            if !*allow_native_service {
+                                return Err(AppError::Input(
+                                    "A03 service-native requires --allow-native-service".into(),
+                                ));
+                            }
+                            run_service_a03(&ServiceOptions {
+                                binary: bin.clone(),
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                                preflight_report,
+                                required_allow_native_service: true,
+                            })
+                        }
+                        AcceptanceCase::A11 if is_service_case => {
+                            let preflight_report = preflight_report
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AppError::Input(
+                                        "A11 service-native requires --preflight-report".into(),
+                                    )
+                                })?
+                                .clone();
+                            if !*allow_native_service {
+                                return Err(AppError::Input(
+                                    "A11 service-native requires --allow-native-service".into(),
+                                ));
+                            }
+                            run_a11(&ServiceOptions {
+                                binary: bin.clone(),
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                                preflight_report,
+                                required_allow_native_service: true,
+                            })
+                        }
+                        AcceptanceCase::A07 if is_office_a07 => {
+                            let office_converter = office_converter
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AppError::Input(
+                                        "A07 office-real requires --office-converter".into(),
+                                    )
+                                })?
+                                .clone();
+                            let preflight_report = preflight_report
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AppError::Input(
+                                        "A07 office-real requires --preflight-report".into(),
+                                    )
+                                })?
+                                .clone();
+                            run_a07(&A07OfficeOptions {
+                                binary: bin.clone(),
+                                office_converter,
+                                preflight_report,
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                            })
+                        }
+                        AcceptanceCase::A04
+                            if requirement.lane == AcceptanceLane::NativeContract
+                                && requirement.subcase == AcceptanceSubcase::Core =>
+                        {
+                            run_policy_a04(&PolicyOptions {
+                                binary: bin.clone(),
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                            })
+                        }
+                        AcceptanceCase::A04
+                            if requirement.lane == AcceptanceLane::NativeContract
+                                && requirement.subcase == AcceptanceSubcase::LocalTrust =>
+                        {
+                            run_local_trust_a04(&LocalTrustOptions {
+                                binary: bin.clone(),
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                            })
+                        }
+                        AcceptanceCase::A08
+                            if requirement.lane == AcceptanceLane::NativeContract
+                                && requirement.subcase == AcceptanceSubcase::MockFailure =>
+                        {
+                            let contract_binary = contract_bin
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AppError::Input(
+                                        "A08 native-contract/mock-failure requires --contract-bin"
+                                            .into(),
+                                    )
+                                })?
+                                .clone();
+                            run_a08_failure(&FailureOptions {
+                                binary: bin.clone(),
+                                contract_binary,
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                            })
+                        }
+                        AcceptanceCase::A08 if is_provider_a08 => {
+                            let provider = provider.ok_or_else(|| {
+                                AppError::Input("A08 provider requires --provider".into())
+                            })?;
+                            let reservation_state_dir = reservation_state_dir
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AppError::Input(
+                                        "A08 provider requires --reservation-state-dir".into(),
+                                    )
+                                })?
+                                .clone();
+                            let campaign_id = campaign_id
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AppError::Input("A08 provider requires --campaign-id".into())
+                                })?
+                                .clone();
+                            let allocation_id = allocation_id
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AppError::Input("A08 provider requires --allocation-id".into())
+                                })?
+                                .clone();
+                            run_a08_provider(&A08ProviderOptions {
+                                binary: bin.clone(),
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                                provider,
+                                reservation_state_dir,
+                                campaign_id,
+                                allocation_id,
+                            })
+                        }
+                        AcceptanceCase::A01
+                            if requirement.lane == AcceptanceLane::NativeContract
+                                && requirement.subcase == AcceptanceSubcase::Core =>
+                        {
+                            run_a01(&A01Options {
+                                binary: bin.clone(),
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                            })
+                        }
+                        AcceptanceCase::A02
+                            if requirement.lane == AcceptanceLane::NativeContract
+                                && requirement.subcase == AcceptanceSubcase::Core =>
+                        {
+                            run_a02(&NativeOptions {
+                                binary: bin.clone(),
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                            })
+                        }
+                        AcceptanceCase::A03
+                            if requirement.lane == AcceptanceLane::NativeContract
+                                && requirement.subcase == AcceptanceSubcase::Core =>
+                        {
+                            run_a03(&NativeOptions {
+                                binary: bin.clone(),
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                            })
+                        }
+                        AcceptanceCase::A05
+                            if requirement.lane == AcceptanceLane::NativeContract
+                                && requirement.subcase == AcceptanceSubcase::Core =>
+                        {
+                            run_a05(&A05Options {
+                                binary: bin.clone(),
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                            })
+                        }
+                        AcceptanceCase::A06
+                            if requirement.lane == AcceptanceLane::NativeContract
+                                && requirement.subcase == AcceptanceSubcase::Core =>
+                        {
+                            run_a06(&A06Options {
+                                binary: bin.clone(),
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                            })
+                        }
+                        AcceptanceCase::A09
+                            if requirement.lane == AcceptanceLane::NativeContract
+                                && requirement.subcase == AcceptanceSubcase::Core =>
+                        {
+                            run_a09(&A09Options {
+                                binary: bin.clone(),
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                            })
+                        }
+                        AcceptanceCase::A10
+                            if requirement.lane == AcceptanceLane::NativeContract
+                                && requirement.subcase == AcceptanceSubcase::Core =>
+                        {
+                            let contract_binary = contract_bin
+                                .as_ref()
+                                .ok_or_else(|| {
+                                    AppError::Input(
+                                        "A10 native-contract/core requires --contract-bin".into(),
+                                    )
+                                })?
+                                .clone();
+                            run_a10(&FaultOptions {
+                                release_binary: bin.clone(),
+                                contract_binary,
+                                fixture: fixture.clone(),
+                                expected,
+                                work_dir: work_dir.clone(),
+                                receipt: receipt.clone(),
+                            })
+                        }
+                        _ => {
+                            return Err(AppError::Input(format!(
+                                "acceptance executor is not implemented for {:?}/{:?}/{:?}",
+                                requirement.case, requirement.lane, requirement.subcase
+                            )));
+                        }
+                    }
+                    .map_err(|error| AppError::Input(error.to_string()))?;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&summary)
+                            .map_err(|error| AppError::Input(error.to_string()))?
+                    );
+                    Ok(ExitCode::Success)
+                }
+            },
         };
     }
     let golden = args
@@ -2472,14 +3490,25 @@ mod tests {
 
     use clap::Parser;
     use kio_core::ExitCode;
-    use kio_eval::boundary::BoundCorpus;
+    use kio_eval::{
+        acceptance::{
+            ACCEPTANCE_MANIFEST_SCHEMA, AcceptanceCase, AcceptanceLane, AcceptanceManifest,
+            AcceptanceSubcase, CandidateBinding, ExpectedReceipt, FixtureBinding, NativeOs,
+            WorkflowBinding, fixed_v1_requirements, read_expected_manifest,
+            write_expected_receipt_create_only,
+        },
+        boundary::BoundCorpus,
+    };
     use serde_json::json;
 
     use super::{
         Args, Commands, PersonaCommands, RerankCommands, bundled_eval_path,
-        output_is_within_input_root, parse_drain_rounds, parse_fixture_mode, parse_recall,
-        parse_rerank_dataset, parse_rerank_limit, parse_scenario, parse_u7_threshold, run,
+        output_is_within_input_root, parse_acceptance_case, parse_acceptance_lane,
+        parse_acceptance_subcase, parse_drain_rounds, parse_fixture_mode, parse_native_os,
+        parse_provider, parse_recall, parse_rerank_dataset, parse_rerank_limit, parse_scenario,
+        parse_u7_threshold, run,
     };
+    use kio_eval::acceptance_provider::Provider;
 
     #[test]
     fn cli_value_parsers_are_strict() {
@@ -2499,6 +3528,323 @@ mod tests {
         assert!(parse_drain_rounds("0").is_err());
         assert_eq!(parse_u7_threshold("0.999").unwrap(), 0.999);
         assert!(parse_u7_threshold("NaN").is_err());
+        assert_eq!(parse_acceptance_case("A01").unwrap(), AcceptanceCase::A01);
+        assert!(parse_acceptance_case("a01").is_err());
+        assert_eq!(
+            parse_acceptance_lane("native-contract").unwrap(),
+            AcceptanceLane::NativeContract
+        );
+        assert!(parse_acceptance_lane("native_contract").is_err());
+        assert_eq!(
+            parse_acceptance_subcase("authenticated-local").unwrap(),
+            AcceptanceSubcase::AuthenticatedLocal
+        );
+        assert_eq!(parse_native_os("macos").unwrap(), NativeOs::Macos);
+        assert!(parse_native_os("darwin").is_err());
+        assert_eq!(parse_provider("mistral").unwrap(), Provider::Mistral);
+        assert!(parse_provider("local").is_err());
+    }
+
+    fn acceptance_manifest() -> AcceptanceManifest {
+        let expected = fixed_v1_requirements()
+            .into_iter()
+            .map(|requirement| {
+                let target = match requirement.os {
+                    NativeOs::Linux => "x86_64-unknown-linux-gnu",
+                    NativeOs::Macos => "aarch64-apple-darwin",
+                    NativeOs::Windows => "x86_64-pc-windows-msvc",
+                };
+                let contract_binary_sha256 = matches!(
+                    (requirement.case, requirement.lane, requirement.subcase),
+                    (
+                        AcceptanceCase::A10,
+                        AcceptanceLane::NativeContract,
+                        AcceptanceSubcase::Core
+                    ) | (
+                        AcceptanceCase::A08,
+                        AcceptanceLane::NativeContract,
+                        AcceptanceSubcase::MockFailure
+                    )
+                )
+                .then(|| "f".repeat(64));
+                ExpectedReceipt {
+                    requirement: requirement.clone(),
+                    candidate: CandidateBinding {
+                        candidate_sha: "a".repeat(40),
+                        target: target.into(),
+                        archive_sha256: "b".repeat(64),
+                        binary_sha256: "c".repeat(64),
+                        version: "1.0.0".into(),
+                    },
+                    fixture: FixtureBinding {
+                        fixture_id: "fixture".into(),
+                        sha256: "d".repeat(64),
+                    },
+                    workflow: WorkflowBinding {
+                        workflow_path: ".github/workflows/acceptance.yml".into(),
+                        workflow_sha256: "e".repeat(64),
+                        workflow_commit: "a".repeat(40),
+                        run_id: 1,
+                        attempt: 1,
+                        architecture: "x86_64".into(),
+                    },
+                    evaluator_sha256: "9".repeat(64),
+                    service_identity_sha256: (requirement.case == AcceptanceCase::A08
+                        && requirement.lane == AcceptanceLane::ProviderLive
+                        && requirement.subcase == AcceptanceSubcase::AuthenticatedLocal)
+                        .then(|| "7".repeat(64)),
+                    contract_binary_sha256,
+                }
+            })
+            .collect();
+        AcceptanceManifest {
+            schema: ACCEPTANCE_MANIFEST_SCHEMA.into(),
+            expected,
+        }
+    }
+
+    #[test]
+    fn acceptance_run_uses_canonical_manifest_and_refuses_unimplemented_cases() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = directory.path().join("expected.json");
+        fs::write(&expected, acceptance_manifest().canonical_bytes().unwrap()).unwrap();
+        let receipt = directory.path().join("receipt.json");
+        let args = Args::try_parse_from([
+            "kio-eval",
+            "acceptance",
+            "run",
+            "--expected",
+            expected.to_str().unwrap(),
+            "--case",
+            "A02",
+            "--lane",
+            "native-contract",
+            "--os",
+            "linux",
+            "--bin",
+            "/definitely/missing/kio",
+            "--fixture",
+            "/definitely/missing/fixture",
+            "--work-dir",
+            directory.path().join("work").to_str().unwrap(),
+            "--receipt",
+            receipt.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(run(args).is_err());
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn acceptance_assemble_expected_builds_only_the_complete_predeclared_matrix() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = acceptance_manifest();
+        let mut arguments = vec![
+            OsString::from("kio-eval"),
+            OsString::from("acceptance"),
+            OsString::from("assemble-expected"),
+            OsString::from("--candidate-sha"),
+            OsString::from("a".repeat(40)),
+        ];
+        for (index, expected) in source.expected.iter().enumerate() {
+            let path = directory.path().join(format!("expected-{index}.json"));
+            write_expected_receipt_create_only(&path, expected).unwrap();
+            arguments.push(OsString::from("--expected-case"));
+            arguments.push(path.into_os_string());
+        }
+        let output = directory.path().join("expected.json");
+        arguments.push(OsString::from("--out"));
+        arguments.push(output.clone().into_os_string());
+        run(Args::try_parse_from(arguments).unwrap()).unwrap();
+        assert_eq!(read_expected_manifest(&output).unwrap(), source);
+    }
+
+    #[test]
+    fn acceptance_assemble_expected_rejects_an_incomplete_case_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = acceptance_manifest();
+        let input = directory.path().join("single-expected.json");
+        write_expected_receipt_create_only(&input, &source.expected[0]).unwrap();
+        let output = directory.path().join("expected.json");
+        let candidate_sha = "a".repeat(40);
+        let args = Args::try_parse_from([
+            "kio-eval",
+            "acceptance",
+            "assemble-expected",
+            "--candidate-sha",
+            &candidate_sha,
+            "--expected-case",
+            input.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(run(args).is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn acceptance_assemble_expected_rejects_a_receipt_file_as_case_input() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = acceptance_manifest();
+        let input = directory.path().join("receipt.json");
+        let mut receipt = serde_json::to_value(&source.expected[0]).unwrap();
+        let fields = receipt.as_object_mut().unwrap();
+        fields.insert("schema".into(), json!("kio.acceptance.receipt/v3"));
+        fields.insert("passed".into(), json!(true));
+        fs::write(
+            &input,
+            kio_core::cas::canonical_json_bytes(&receipt).unwrap(),
+        )
+        .unwrap();
+        let output = directory.path().join("expected.json");
+        let candidate_sha = "a".repeat(40);
+        let args = Args::try_parse_from([
+            "kio-eval",
+            "acceptance",
+            "assemble-expected",
+            "--candidate-sha",
+            &candidate_sha,
+            "--expected-case",
+            input.to_str().unwrap(),
+            "--out",
+            output.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(run(args).is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn acceptance_a01_cli_dispatch_refuses_an_unbound_binary_without_a_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = directory.path().join("expected.json");
+        fs::write(&expected, acceptance_manifest().canonical_bytes().unwrap()).unwrap();
+        let fixture = directory.path().join("fixture.txt");
+        fs::write(&fixture, b"fixture\n").unwrap();
+        let receipt = directory.path().join("receipt.json");
+        let args = Args::try_parse_from([
+            "kio-eval",
+            "acceptance",
+            "run",
+            "--expected",
+            expected.to_str().unwrap(),
+            "--case",
+            "A01",
+            "--lane",
+            "native-contract",
+            "--os",
+            "linux",
+            "--bin",
+            "/definitely/missing/kio",
+            "--fixture",
+            fixture.to_str().unwrap(),
+            "--work-dir",
+            directory.path().join("work").to_str().unwrap(),
+            "--receipt",
+            receipt.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(run(args).is_err());
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn acceptance_a05_cli_dispatch_never_creates_a_receipt_before_full_runtime_proof() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = directory.path().join("expected.json");
+        fs::write(&expected, acceptance_manifest().canonical_bytes().unwrap()).unwrap();
+        let receipt = directory.path().join("receipt.json");
+        let args = Args::try_parse_from([
+            "kio-eval",
+            "acceptance",
+            "run",
+            "--expected",
+            expected.to_str().unwrap(),
+            "--case",
+            "A05",
+            "--lane",
+            "native-contract",
+            "--os",
+            "linux",
+            "--bin",
+            "/definitely/missing/kio",
+            "--fixture",
+            "/definitely/missing/fixture-bundle",
+            "--work-dir",
+            directory.path().join("work").to_str().unwrap(),
+            "--receipt",
+            receipt.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(run(args).is_err());
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn acceptance_a06_cli_dispatch_refuses_an_unbound_binary_without_a_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = directory.path().join("expected.json");
+        fs::write(&expected, acceptance_manifest().canonical_bytes().unwrap()).unwrap();
+        let receipt = directory.path().join("receipt.json");
+        let args = Args::try_parse_from([
+            "kio-eval",
+            "acceptance",
+            "run",
+            "--expected",
+            expected.to_str().unwrap(),
+            "--case",
+            "A06",
+            "--lane",
+            "native-contract",
+            "--os",
+            "linux",
+            "--bin",
+            "/definitely/missing/kio",
+            "--fixture",
+            "/definitely/missing/fixture-bundle",
+            "--work-dir",
+            directory.path().join("work").to_str().unwrap(),
+            "--receipt",
+            receipt.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(run(args).is_err());
+        assert!(!receipt.exists());
+    }
+
+    #[test]
+    fn acceptance_a09_cli_dispatch_refuses_an_unbound_binary_without_a_receipt() {
+        let directory = tempfile::tempdir().unwrap();
+        let expected = directory.path().join("expected.json");
+        fs::write(&expected, acceptance_manifest().canonical_bytes().unwrap()).unwrap();
+        let fixture = directory.path().join("fixture.txt");
+        fs::write(&fixture, b"fixture\n").unwrap();
+        let receipt = directory.path().join("receipt.json");
+        let args = Args::try_parse_from([
+            "kio-eval",
+            "acceptance",
+            "run",
+            "--expected",
+            expected.to_str().unwrap(),
+            "--case",
+            "A09",
+            "--lane",
+            "native-contract",
+            "--os",
+            "linux",
+            "--bin",
+            "/definitely/missing/kio",
+            "--fixture",
+            fixture.to_str().unwrap(),
+            "--work-dir",
+            directory.path().join("work").to_str().unwrap(),
+            "--receipt",
+            receipt.to_str().unwrap(),
+        ])
+        .unwrap();
+        assert!(run(args).is_err());
+        assert!(!receipt.exists());
     }
 
     #[test]

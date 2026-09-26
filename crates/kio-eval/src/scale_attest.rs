@@ -339,7 +339,7 @@ struct CommitWire {
     created_at: String,
     message: String,
     object_type: String,
-    parents: Vec<String>,
+    parent: Option<String>,
     stats: StatsWire,
     tool_lock_hash: String,
     tree: String,
@@ -430,6 +430,7 @@ struct NormalizedUnitEntryWire {
     unit_type: String,
     status: String,
     prepared_hash: String,
+    preparation_profile_hash: String,
     unit_object_hash: Option<String>,
     error_kind: Option<String>,
 }
@@ -440,10 +441,12 @@ struct NormalizedUnitWire {
     unit_type: String,
     raw_hash: String,
     prepared_hash: String,
+    preparation_profile_hash: String,
     tool_profile_hash: String,
     r#gen: u64,
     mode: String,
     markdown: String,
+    owned_image_hashes: BTreeSet<String>,
     metadata: std::collections::BTreeMap<String, serde_json::Value>,
     reused_from: Option<ReusedWire>,
     generated_at: String,
@@ -980,7 +983,7 @@ fn attest_cas(
     attest_deterministic_tool_lock(kio, &commit.tool_lock_hash, bindings)?;
     let history = scope.expected_base_chunks != scope.expected_current_chunks;
     if history {
-        if commit.parents.len() != 1
+        if commit.parent.is_none()
             || commit.stats.files_added != 1
             || commit.stats.files_modified != 1
             || commit.stats.files_deleted != 2
@@ -989,7 +992,7 @@ fn attest_cas(
                 "history overlay HEAD commit differs from the frozen operation plan",
             ));
         }
-    } else if !commit.parents.is_empty()
+    } else if commit.parent.is_some()
         || commit.stats.files_added != scope.files.len() as u64
         || commit.stats.files_modified != 0
         || commit.stats.files_deleted != 0
@@ -1015,7 +1018,10 @@ fn attest_cas(
             .iter()
             .find(|candidate| candidate.name == scope.name)
             .ok_or_else(|| unsafe_state("base manifest omitted history scope"))?;
-        let parent_hash = commit.parents[0].clone();
+        let parent_hash = commit
+            .parent
+            .clone()
+            .ok_or_else(|| unsafe_state("history overlay HEAD is missing its parent"))?;
         let parent_bytes = cas(
             kio,
             "commits",
@@ -1026,7 +1032,7 @@ fn attest_cas(
         let parent: CommitWire = exact_json(&parent_bytes, "history base commit")?;
         validate_auto_commit(&parent)?;
         attest_deterministic_tool_lock(kio, &parent.tool_lock_hash, bindings)?;
-        if !parent.parents.is_empty()
+        if parent.parent.is_some()
             || parent.stats.files_added != base_scope.files.len() as u64
             || parent.stats.files_modified != 0
             || parent.stats.files_deleted != 0
@@ -1076,10 +1082,12 @@ fn validate_auto_commit(commit: &CommitWire) -> Result<(), AttestError> {
         || commit.message != "kio index auto snapshot"
         || !is_hash(&commit.tree)
         || !is_hash(&commit.tool_lock_hash)
-        || commit.parents.len() > 1
         || !scale_spec::is_canonical_utc_second(&commit.created_at)
         || !commit.purged_raws.is_empty()
-        || commit.parents.iter().any(|parent| !is_hash(parent))
+        || commit
+            .parent
+            .as_deref()
+            .is_some_and(|parent| !is_hash(parent))
     {
         return Err(unsafe_state(
             "scale auto commit violates the frozen wire contract",
@@ -1289,6 +1297,7 @@ fn attest_normalize(
             || unit.unit_key.is_empty()
             || unit.unit_ref != unit_ref(&unit.unit_key)
             || !is_hash(&unit.prepared_hash)
+            || !is_hash(&unit.preparation_profile_hash)
             || unit.unit_type != "file"
             || !matches!(unit.status.as_str(), "done" | "failed")
             || unit.error_kind.as_ref().is_some_and(String::is_empty)
@@ -1310,6 +1319,7 @@ fn attest_normalize(
                     || object.unit_type != unit.unit_type
                     || object.raw_hash != *raw_hash
                     || object.prepared_hash != unit.prepared_hash
+                    || object.preparation_profile_hash != unit.preparation_profile_hash
                     || object.tool_profile_hash != reference.tool_profile_hash
                     || object.r#gen != reference.r#gen
                 {
@@ -1322,6 +1332,9 @@ fn attest_normalize(
                 }
                 if object.generated_at.len() < 20
                     || object.mode != "full"
+                    // Scale-v3 uses only deterministic text sources. A claimed
+                    // owned image is outside the fixture's authenticated input.
+                    || !object.owned_image_hashes.is_empty()
                     || object.metadata.len() > 256
                     || object.reused_from.as_ref().is_some_and(|r| {
                         !is_hash(&r.raw_hash) || r.unit_key.is_empty() || r.r#gen > object.r#gen
@@ -2404,21 +2417,6 @@ fn attest_scope_inner(
     }
     let config_binding = check_config(&kio).map_err(corruption)?;
     let tool_lock_binding = check_working_tool_lock(&kio).map_err(corruption)?;
-    let refs = required_dir(&kio, "refs", "refs").map_err(corruption)?;
-    let refs_before = cap_fs::stat(&kio, Path::new("refs"), cap_fs::FollowSymlinks::No)
-        .map_err(|error| other("refs", error))?;
-    let heads = required_dir(&refs, "heads", "heads").map_err(corruption)?;
-    let heads_before = cap_fs::stat(&refs, Path::new("heads"), cap_fs::FollowSymlinks::No)
-        .map_err(|error| other("refs/heads", error))?;
-    let (branch_bytes, branch_binding) =
-        bind_regular(&heads, "main", 256, "refs/heads/main").map_err(corruption)?;
-    let branch = str::from_utf8(&branch_bytes)
-        .map_err(|_| unsafe_state("branch is not UTF-8"))?
-        .trim()
-        .to_owned();
-    if head != branch {
-        return Err(unsafe_state("HEAD and refs/heads/main differ"));
-    }
     let (identity_bytes, identity_binding) =
         bind_regular(&kio, "scope.json", MAX_METADATA, "scope identity").map_err(corruption)?;
     let identity: ScopeIdentity = typed_json(&identity_bytes, "scope identity")?;
@@ -2483,12 +2481,9 @@ fn attest_scope_inner(
     config_binding.recheck()?;
     tool_lock_binding.recheck()?;
     head_binding.recheck()?;
-    branch_binding.recheck()?;
     identity_binding.recheck()?;
     ledger.binding.recheck()?;
     recheck_cas(&kio, &cas_bindings)?;
-    unchanged(&refs, "heads", &heads_before, "refs/heads")?;
-    unchanged(&kio, "refs", &refs_before, "refs")?;
     unchanged(&kio, "index", &index_before, "scope index")?;
     unchanged(&scope_dir, ".kio", &kio_before, "scope .kio")?;
     unchanged(root, &scope.name, &scope_before, "scope")?;

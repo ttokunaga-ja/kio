@@ -374,7 +374,7 @@ struct AutoCommitWire {
     created_at: String,
     message: String,
     object_type: String,
-    parents: Vec<String>,
+    parent: Option<String>,
     stats: AutoCommitStatsWire,
     tool_lock_hash: String,
     tree: String,
@@ -956,8 +956,7 @@ fn strict_history_overlay_commit(
         && parsed.object_type == "commit"
         && parsed.message == "kio index auto snapshot"
         && scale_spec::is_canonical_utc_second(&parsed.created_at)
-        && parsed.parents.len() == 1
-        && parsed.parents[0] == parent
+        && parsed.parent.as_deref() == Some(parent)
         && parsed.stats.files_added == 1
         && parsed.stats.files_modified == 1
         && parsed.stats.files_deleted == 2
@@ -981,7 +980,10 @@ fn strict_auto_commit(
         && parsed.object_type == "commit"
         && parsed.message == "kio index auto snapshot"
         && scale_spec::is_canonical_utc_second(&parsed.created_at)
-        && parsed.parents.iter().all(|parent| valid_hash(Some(parent)))
+        && parsed
+            .parent
+            .as_deref()
+            .is_none_or(|parent| valid_hash(Some(parent)))
         && valid_hash(Some(&parsed.tool_lock_hash))
         && parsed.stats.files_added == expected_files as u64
         && parsed.stats.files_modified == 0
@@ -1047,7 +1049,12 @@ fn create_or_open_dir(
         Ok(dir) => Ok(dir),
         Err(_) => match cap_fs::stat(parent, Path::new(name), cap_fs::FollowSymlinks::No) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let options = cap_fs::DirOptions::new();
+                let mut options = cap_fs::DirOptions::new();
+                #[cfg(unix)]
+                {
+                    use cap_fs::DirBuilderExt;
+                    options.mode(0o700);
+                }
                 match cap_fs::create_dir(parent, Path::new(name), &options) {
                     Ok(()) => open_dir(parent, name, label),
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
@@ -1494,7 +1501,7 @@ mod tests {
             "created_at":"2026-08-15T00:00:00Z",
             "message":"kio index auto snapshot",
             "object_type":"commit",
-            "parents":[],
+            "parent":null,
             "stats":{"files_added":1,"files_modified":0,"files_deleted":0},
             "tool_lock_hash":format!("sha256:{}", "c".repeat(64)),
             "tree":tree,

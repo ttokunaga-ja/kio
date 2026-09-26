@@ -1,7 +1,9 @@
 //! Adapter trait, identity helpers, and built-in Step 2 adapters.
 
+pub mod authority;
 pub mod batch_client;
 pub mod batch_inventory;
+pub mod batch_recovery;
 pub mod bbox_annotation;
 pub mod catalog;
 pub mod deterministic;
@@ -12,9 +14,11 @@ mod http_policy;
 pub mod identity;
 mod local_embedding;
 pub mod local_ocr_markdownize;
+pub mod local_peer;
 pub mod local_rerank;
 mod mistral_ocr;
 pub mod office_convert;
+mod ooxml_package;
 pub mod pdf_decode;
 pub mod tool_lock;
 pub mod traits;
@@ -47,6 +51,16 @@ pub enum AdapterError {
     ContractViolation(String),
     #[error("adapter auth error: {0}")]
     Auth(String),
+    /// The configured local endpoint did not authenticate as the peer bound to
+    /// the device CA.  This is permanent: retrying would only resend private
+    /// input to a listener whose identity remains unproven.
+    #[error("local peer authentication failed: {0}")]
+    LocalPeerAuth(String),
+    /// A local-peer destination or trust-anchor configuration failure.  The
+    /// code is intentionally separate from generic schema errors so callers
+    /// never retry a missing, unsafe, or revoked device trust anchor.
+    #[error("{code}: {message}")]
+    LocalPeerConfig { code: &'static str, message: String },
     /// QA16 (step4b-contract-tests-p3a.md §F, 07 §4 L290): carries the
     /// provider's `Retry-After` in milliseconds when the HTTP response
     /// included one (`http_policy::parse_retry_after_ms`). `None` when the
@@ -106,6 +120,8 @@ impl AdapterError {
     pub fn error_code(&self) -> &'static str {
         match self {
             Self::Auth(_) => "KIO-E-BATCH-AUTH-001",
+            Self::LocalPeerAuth(_) => "KIO-E-LOCAL-PEER-AUTH-001",
+            Self::LocalPeerConfig { .. } => "KIO-E-LOCAL-PEER-CONFIG-001",
             Self::RateLimit { .. } => "KIO-E-BATCH-RATE-001",
             Self::QuotaExceeded(_) => "KIO-E-BATCH-QUOTA-001",
             Self::Network(_) | Self::Io { .. } => "KIO-E-BATCH-NET-001",
@@ -128,6 +144,7 @@ impl AdapterError {
             Self::RateLimit { .. } => ErrorCategory::RateLimit,
             // Non-retryable in 04 §5.3's table (auth_error has max_attempts=0).
             Self::Auth(_) => ErrorCategory::Permanent,
+            Self::LocalPeerAuth(_) | Self::LocalPeerConfig { .. } => ErrorCategory::Permanent,
             // Retryable in 04 §5.3's table (network_error/quota_exceeded/
             // contract_violation all have max_attempts >= 1).
             Self::QuotaExceeded(_)
@@ -169,6 +186,7 @@ impl AdapterError {
     }
 }
 
+pub use mistral_ocr::{BatchOcrMaterializationError, materialize_mistral_batch_ocr_body};
 pub use traits::{EmbeddingAdapter, MarkdownizeAdapter, PrepareAdapter};
 
 #[cfg(test)]
@@ -186,6 +204,19 @@ mod adapter_error_tests {
             (
                 AdapterError::Auth("x".to_owned()),
                 "KIO-E-BATCH-AUTH-001",
+                ErrorCategory::Permanent,
+            ),
+            (
+                AdapterError::LocalPeerAuth("x".to_owned()),
+                "KIO-E-LOCAL-PEER-AUTH-001",
+                ErrorCategory::Permanent,
+            ),
+            (
+                AdapterError::LocalPeerConfig {
+                    code: "KIO-E-LOCAL-PEER-CA-PEM-001",
+                    message: "x".to_owned(),
+                },
+                "KIO-E-LOCAL-PEER-CONFIG-001",
                 ErrorCategory::Permanent,
             ),
             (

@@ -1,0 +1,1 @@
+/kio-v1-embedding-r32-qwen3-vl-embedding-1 running=true oom_killed=false exit_code=0 error= log={"Type":"local","Config":{"max-file":"3","max-size":"10m"}}

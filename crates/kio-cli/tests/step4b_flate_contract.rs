@@ -252,8 +252,11 @@ fn flate_01_compressed_cid_pdf_indexes_offline_with_enhancement_pending() {
     )
     .unwrap();
     init(&dir);
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["index", "--yes"])
         .arg("--json")
+        .assert()
+        .success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
         .assert()
         .success();
 
@@ -277,7 +280,16 @@ fn flate_01_compressed_cid_pdf_indexes_offline_with_enhancement_pending() {
     let status = json_success(&dir, &["status"]);
     let online_task = online_markdownize_task_for(&status, "report.pdf")
         .unwrap_or_else(|| panic!("online enhancement task missing: {status}"));
-    assert_eq!(online_task["status"], "pending", "{status}");
+    assert_eq!(online_task["status"], "paused", "{status}");
+    assert_eq!(
+        online_task["hold_reason"], "ledger_initialization_required",
+        "{status}"
+    );
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
+    );
 }
 
 // ===========================================================================
@@ -326,8 +338,11 @@ fn flate_03_chance_bt_raster_pdf_routes_to_ocr_without_schema_error() {
     fs::write(dir.path().join("scan-like.pdf"), pdf).unwrap();
     init(&dir);
 
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["index", "--yes"])
         .arg("--json")
+        .assert()
+        .success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
         .assert()
         .success();
 
@@ -338,7 +353,16 @@ fn flate_03_chance_bt_raster_pdf_routes_to_ocr_without_schema_error() {
     let status = json_success(&dir, &["status"]);
     let online_task = online_markdownize_task_for(&status, "scan-like.pdf")
         .unwrap_or_else(|| panic!("OCR placeholder missing: {status}"));
-    assert_eq!(online_task["status"], "pending", "{status}");
+    assert_eq!(online_task["status"], "paused", "{status}");
+    assert_eq!(
+        online_task["hold_reason"], "ledger_initialization_required",
+        "{status}"
+    );
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
+    );
 }
 
 // ===========================================================================
@@ -354,8 +378,11 @@ fn flate_02_objstm_two_byte_codes_index_offline() {
     )
     .unwrap();
     init(&dir);
-    kio(&dir, &["index", "--approve"])
+    kio(&dir, &["index", "--yes"])
         .arg("--json")
+        .assert()
+        .success();
+    kio(&dir, &["adapter", "approve", "--all", "--yes"])
         .assert()
         .success();
 

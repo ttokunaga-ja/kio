@@ -34,6 +34,10 @@ pub struct PreparedUnit {
     pub unit_key: String,
     pub unit_type: UnitType,
     pub prepared_hash: String,
+    /// Identity of every preparation component whose output can affect reuse.
+    /// This is deliberately separate from `prepared_hash`, which remains a
+    /// content address for the prepared bytes alone.
+    pub preparation_profile_hash: String,
     pub fingerprint: UnitFingerprint,
     pub mime: Option<String>,
     pub page_number: Option<u64>,
@@ -157,6 +161,9 @@ pub fn prepare_units_from_bytes(
         return Ok(empty_prepare_output());
     }
     let unit_type = unit_type_for_media_type(request.media_type);
+    // The declared prepare profile is part of reuse identity for every input.
+    // Office inputs additionally bind the resolved renderer identity below.
+    let mut preparation_profile_hash = request.tool_profile_hash.to_owned();
     // 07 §5.1 (2026-07-25 ruling): one unit per worksheet, keyed by the sheet's
     // own name (QB27), with the unit's hash and fingerprint taken from the
     // extracted Markdown — the same shape the PDF branch uses for page text, so
@@ -181,6 +188,7 @@ pub fn prepare_units_from_bytes(
                 unit_key,
                 unit_type: UnitType::Sheet,
                 prepared_hash: hash_bytes(markdown),
+                preparation_profile_hash: preparation_profile_hash.clone(),
                 fingerprint: fingerprint_for_bytes(markdown, markdown),
                 mime: Some(request.media_type.to_owned()),
                 page_number: None,
@@ -215,6 +223,10 @@ pub fn prepare_units_from_bytes(
         match kio_adapter::office_convert::resolve_office_converter() {
             None => return Ok(empty_prepare_output()),
             Some(converter) => {
+                preparation_profile_hash = office_preparation_profile_hash(
+                    request.tool_profile_hash,
+                    &converter.profile_identity(),
+                );
                 Some(converter.convert_to_pdf(bytes, media_type).map_err(|err| {
                     crate::PipelineError::contract(
                         "KIO-E-PREPARE-OFFICE-CONVERT-001",
@@ -298,6 +310,7 @@ pub fn prepare_units_from_bytes(
             unit_key,
             unit_type,
             prepared_hash: unit_prepared_hash,
+            preparation_profile_hash: preparation_profile_hash.clone(),
             fingerprint,
             mime: Some(request.media_type.to_owned()),
             // Only Page carries page_number, unchanged from before this
@@ -320,6 +333,15 @@ pub fn prepare_units_from_bytes(
         prepared_units,
         image_object_hashes: Vec::new(),
     })
+}
+
+fn office_preparation_profile_hash(request_profile_hash: &str, converter_profile: &str) -> String {
+    // Delimit and domain-separate the two opaque identities so neither string
+    // can be substituted for the other or create an ambiguous concatenation.
+    hash_bytes(
+        format!("kio-office-preparation-profile-v1\0{request_profile_hash}\0{converter_profile}")
+            .as_bytes(),
+    )
 }
 
 fn empty_prepare_output() -> PrepareStageOutput {
@@ -605,7 +627,7 @@ fn lcs_fingerprint_pairs(
     let mut dp = vec![vec![0usize; n + 1]; m + 1];
     for i in (0..m).rev() {
         for j in (0..n).rev() {
-            dp[i][j] = if old_units[i].fingerprint == new_units[j].fingerprint {
+            dp[i][j] = if reusable_unit_identity_matches(&old_units[i], &new_units[j]) {
                 1 + dp[i + 1][j + 1]
             } else {
                 dp[i + 1][j].max(dp[i][j + 1])
@@ -615,7 +637,7 @@ fn lcs_fingerprint_pairs(
     let mut pairs = Vec::new();
     let (mut i, mut j) = (0, 0);
     while i < m && j < n {
-        if old_units[i].fingerprint == new_units[j].fingerprint {
+        if reusable_unit_identity_matches(&old_units[i], &new_units[j]) {
             pairs.push((i, j));
             i += 1;
             j += 1;
@@ -626,6 +648,11 @@ fn lcs_fingerprint_pairs(
         }
     }
     pairs
+}
+
+fn reusable_unit_identity_matches(old_unit: &PreparedUnit, new_unit: &PreparedUnit) -> bool {
+    old_unit.preparation_profile_hash == new_unit.preparation_profile_hash
+        && old_unit.fingerprint == new_unit.fingerprint
 }
 
 fn lower_hex(bytes: &[u8]) -> String {
@@ -648,6 +675,7 @@ mod tests {
             unit_key: key.to_owned(),
             unit_type: UnitType::Page,
             prepared_hash: format!("sha256:{fp:0<64}"),
+            preparation_profile_hash: "sha256:test-prepare-profile".to_owned(),
             fingerprint: UnitFingerprint {
                 perceptual_hash: fp.to_owned(),
                 text_hash: fp.to_owned(),
@@ -699,6 +727,31 @@ mod tests {
     }
 
     #[test]
+    fn mapping_does_not_reuse_identical_content_across_preparation_profiles() {
+        let old = vec![prepared_page(0, "page:1", "same-content")];
+        let mut new = old.clone();
+        new[0].preparation_profile_hash = "sha256:changed-renderer-profile".to_owned();
+
+        let mapping = map_units(&old, &new);
+        assert!(mapping.unchanged.is_empty());
+        assert_eq!(mapping.changed_unit_keys, vec!["page:1"]);
+        assert!(mapping.added_unit_keys.is_empty());
+        assert!(mapping.removed_unit_keys.is_empty());
+    }
+
+    #[test]
+    fn mapping_reuses_identical_content_with_same_preparation_profile() {
+        let old = vec![prepared_page(0, "page:1", "same-content")];
+        let new = old.clone();
+
+        let mapping = map_units(&old, &new);
+        assert_eq!(mapping.unchanged.len(), 1);
+        assert!(mapping.changed_unit_keys.is_empty());
+        assert!(mapping.added_unit_keys.is_empty());
+        assert!(mapping.removed_unit_keys.is_empty());
+    }
+
+    #[test]
     fn r23_cand_007_lcs_budget_uses_checked_cell_count() {
         assert!(unit_mapping_within_budget(999, 1_999));
         assert!(!unit_mapping_within_budget(1_000, 1_999));
@@ -739,6 +792,10 @@ mod tests {
         .unwrap();
         assert_eq!(prepared.prepared_units.len(), 1);
         assert_eq!(prepared.prepared_units[0].prepared_hash, raw_hash);
+        assert_eq!(
+            prepared.prepared_units[0].preparation_profile_hash,
+            "sha256:test"
+        );
 
         let error = prepare_units_from_bytes(PrepareStageBytesRequest {
             raw_hash: &hash_bytes(b"different"),

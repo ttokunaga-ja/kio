@@ -4,14 +4,13 @@ use std::fmt;
 use std::path::{Component, Path};
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
 use crate::cas::{hash_json, is_hash};
 use crate::error::{KioError, Result};
 
 pub const MAX_TREE_ENTRIES: usize = 10_000;
-pub const MAX_COMMIT_PARENTS: usize = 64;
 /// The only shipped chunking strategy.  Persisted trees bind its exact
 /// configuration hash so a historical publication cannot be interpreted using
 /// a later mutable `config.toml` value.
@@ -248,13 +247,62 @@ pub struct CommitStats {
     pub files_deleted: u64,
 }
 
+/// Immutable evidence for a managed working-tree restore.  A restored commit
+/// remains an ordinary single-parent child of the current HEAD; this field
+/// records which reachable historical commit supplied the selected paths.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreProvenance {
+    pub source_commit: String,
+    /// Strictly byte-sorted, unique direct-child names whose historical state
+    /// was materialized into the restored tree.
+    pub paths: Vec<String>,
+}
+
+impl RestoreProvenance {
+    pub fn validate(&self) -> Result<()> {
+        if !is_hash(&self.source_commit) {
+            return Err(KioError::schema(
+                "restore provenance source_commit must be a sha256 lowercase hex",
+            ));
+        }
+        if self.paths.is_empty() {
+            return Err(KioError::schema(
+                "restore provenance paths must not be empty",
+            ));
+        }
+        let mut previous: Option<&str> = None;
+        for path in &self.paths {
+            // Provenance is immutable logical history and must remain readable
+            // on a different host.  Materialization applies the stricter
+            // platform-specific path rule later.
+            if !is_logical_direct_child(path) || path.starts_with(".kio") {
+                return Err(KioError::path(
+                    "restore provenance path must be a user logical direct child outside .kio",
+                    path.clone(),
+                ));
+            }
+            if previous.is_some_and(|value| value >= path.as_str()) {
+                return Err(KioError::schema(
+                    "restore provenance paths must be strictly sorted ascending",
+                ));
+            }
+            previous = Some(path);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct CommitObject {
     pub commit_type: CommitType,
     pub created_at: String,
     pub message: String,
     pub object_type: String,
-    pub parents: Vec<String>,
+    /// The one immutable predecessor in Kio's linear history. This field is
+    /// required in persisted JSON and is `null` only for genesis.
+    pub parent: Option<String>,
     pub stats: CommitStats,
     pub tool_lock_hash: String,
     pub tree: String,
@@ -266,12 +314,66 @@ pub struct CommitObject {
     /// genuine missing object.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub purged_raws: Vec<String>,
+    /// Required only for `commit_type=restored`; this is deliberately absent
+    /// from every other commit type so a generic snapshot cannot claim restore
+    /// provenance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub restore_provenance: Option<RestoreProvenance>,
+}
+
+impl<'de> Deserialize<'de> for CommitObject {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Wire {
+            commit_type: CommitType,
+            created_at: String,
+            message: String,
+            object_type: String,
+            // `Value` deliberately makes absence a deserialization error while
+            // still preserving the required `null | string` representation.
+            parent: serde_json::Value,
+            stats: CommitStats,
+            tool_lock_hash: String,
+            tree: String,
+            #[serde(default)]
+            purged_raws: Vec<String>,
+            #[serde(default)]
+            restore_provenance: Option<RestoreProvenance>,
+        }
+
+        let wire = Wire::deserialize(deserializer)?;
+        let parent = match wire.parent {
+            serde_json::Value::Null => None,
+            serde_json::Value::String(value) => Some(value),
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "parent must be null or a sha256 hash string",
+                ));
+            }
+        };
+        Ok(Self {
+            commit_type: wire.commit_type,
+            created_at: wire.created_at,
+            message: wire.message,
+            object_type: wire.object_type,
+            parent,
+            stats: wire.stats,
+            tool_lock_hash: wire.tool_lock_hash,
+            tree: wire.tree,
+            purged_raws: wire.purged_raws,
+            restore_provenance: wire.restore_provenance,
+        })
+    }
 }
 
 impl CommitObject {
     pub fn new(
         tree: String,
-        parents: Vec<String>,
+        parent: Option<String>,
         created_at: String,
         message: String,
         tool_lock_hash: String,
@@ -283,11 +385,12 @@ impl CommitObject {
             created_at,
             message,
             object_type: "commit".to_owned(),
-            parents,
+            parent,
             stats,
             tool_lock_hash,
             tree,
             purged_raws: Vec::new(),
+            restore_provenance: None,
         };
         commit.validate()?;
         Ok(commit)
@@ -299,7 +402,7 @@ impl CommitObject {
     /// list sorted, but this constructor does not trust that invariant blindly).
     pub fn new_purged(
         tree: String,
-        parents: Vec<String>,
+        parent: Option<String>,
         created_at: String,
         message: String,
         tool_lock_hash: String,
@@ -313,11 +416,43 @@ impl CommitObject {
             created_at,
             message,
             object_type: "commit".to_owned(),
-            parents,
+            parent,
             stats,
             tool_lock_hash,
             tree,
             purged_raws,
+            restore_provenance: None,
+        };
+        commit.validate()?;
+        Ok(commit)
+    }
+
+    /// Construct a linear child that records the immutable historical source
+    /// of a managed working-tree restore.
+    pub fn new_restored(
+        tree: String,
+        parent: String,
+        created_at: String,
+        message: String,
+        tool_lock_hash: String,
+        stats: CommitStats,
+        mut provenance: RestoreProvenance,
+    ) -> Result<Self> {
+        provenance
+            .paths
+            .sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+        provenance.paths.dedup();
+        let commit = Self {
+            commit_type: CommitType::Restored,
+            created_at,
+            message,
+            object_type: "commit".to_owned(),
+            parent: Some(parent),
+            stats,
+            tool_lock_hash,
+            tree,
+            purged_raws: Vec::new(),
+            restore_provenance: Some(provenance),
         };
         commit.validate()?;
         Ok(commit)
@@ -339,10 +474,10 @@ impl CommitObject {
                 "tool_lock_hash must be sha256 lowercase hex",
             ));
         }
-        for parent in &self.parents {
-            if !is_hash(parent) {
-                return Err(KioError::schema("parent must be sha256 lowercase hex"));
-            }
+        if let Some(parent) = &self.parent
+            && !is_hash(parent)
+        {
+            return Err(KioError::schema("parent must be sha256 lowercase hex"));
         }
         if !is_valid_created_at(&self.created_at) {
             return Err(KioError::schema(
@@ -372,6 +507,23 @@ impl CommitObject {
         } else if !self.purged_raws.is_empty() {
             return Err(KioError::schema(
                 "purged_raws is only valid on a commit_type=purged commit",
+            ));
+        }
+        if self.commit_type == CommitType::Restored {
+            if self.parent.is_none() {
+                return Err(KioError::schema(
+                    "commit_type=restored requires a non-null parent",
+                ));
+            }
+            self.restore_provenance
+                .as_ref()
+                .ok_or_else(|| {
+                    KioError::schema("commit_type=restored requires restore_provenance")
+                })?
+                .validate()?;
+        } else if self.restore_provenance.is_some() {
+            return Err(KioError::schema(
+                "restore_provenance is only valid on a commit_type=restored commit",
             ));
         }
         Ok(())
@@ -452,6 +604,7 @@ pub enum CommitType {
     Auto,
     Repaired,
     Purged,
+    Restored,
 }
 
 impl FromStr for CommitType {
@@ -463,6 +616,7 @@ impl FromStr for CommitType {
             "auto" => Ok(Self::Auto),
             "repaired" => Ok(Self::Repaired),
             "purged" => Ok(Self::Purged),
+            "restored" => Ok(Self::Restored),
             _ => Err(KioError::schema("invalid commit_type")),
         }
     }
@@ -475,6 +629,7 @@ impl fmt::Display for CommitType {
             Self::Auto => "auto",
             Self::Repaired => "repaired",
             Self::Purged => "purged",
+            Self::Restored => "restored",
         })
     }
 }
@@ -490,14 +645,14 @@ pub enum GcPolicy {
 pub const fn gc_policy(commit_type: CommitType) -> GcPolicy {
     match commit_type {
         CommitType::Auto | CommitType::Repaired => GcPolicy::Shallow,
-        CommitType::Manual | CommitType::Purged => GcPolicy::None,
+        CommitType::Manual | CommitType::Purged | CommitType::Restored => GcPolicy::None,
     }
 }
 
 #[must_use]
 pub const fn protected(commit_type: CommitType) -> bool {
     match commit_type {
-        CommitType::Manual | CommitType::Purged => true,
+        CommitType::Manual | CommitType::Purged | CommitType::Restored => true,
         CommitType::Auto | CommitType::Repaired => false,
     }
 }
@@ -528,7 +683,7 @@ mod tests {
     fn commit_with_created_at(created_at: &str) -> Result<CommitObject> {
         CommitObject::new(
             RAW_HASH.to_owned(),
-            Vec::new(),
+            None,
             created_at.to_owned(),
             "m".to_owned(),
             TOOL_HASH.to_owned(),
@@ -581,6 +736,72 @@ mod tests {
                 "commit should reject {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn restored_commit_requires_typed_sorted_provenance_and_is_protected() {
+        let restored = CommitObject::new_restored(
+            RAW_HASH.to_owned(),
+            OTHER_RAW_HASH.to_owned(),
+            "2026-04-29T12:00:00Z".to_owned(),
+            "restore".to_owned(),
+            TOOL_HASH.to_owned(),
+            CommitStats {
+                files_added: 0,
+                files_modified: 1,
+                files_deleted: 0,
+            },
+            super::RestoreProvenance {
+                source_commit: RAW_HASH.to_owned(),
+                paths: vec!["z.txt".to_owned(), "a.txt".to_owned(), "a.txt".to_owned()],
+            },
+        )
+        .unwrap();
+        assert_eq!(restored.commit_type, CommitType::Restored);
+        assert_eq!(
+            restored.restore_provenance.as_ref().unwrap().paths,
+            vec!["a.txt", "z.txt"]
+        );
+        assert_eq!(
+            super::gc_policy(CommitType::Restored),
+            super::GcPolicy::None
+        );
+        assert!(super::protected(CommitType::Restored));
+
+        let mut generic = commit_with_created_at("2026-04-29T12:00:00Z").unwrap();
+        generic.restore_provenance = restored.restore_provenance.clone();
+        assert!(generic.validate().is_err());
+
+        let mut no_parent = restored.clone();
+        no_parent.parent = None;
+        assert!(no_parent.validate().is_err());
+        let mut control = restored;
+        control.restore_provenance.as_mut().unwrap().paths = vec![".kio-control".to_owned()];
+        assert!(control.validate().is_err());
+    }
+
+    #[test]
+    fn restored_provenance_remains_logical_when_a_unix_name_is_not_windows_portable() {
+        let restored = CommitObject::new_restored(
+            RAW_HASH.to_owned(),
+            OTHER_RAW_HASH.to_owned(),
+            "2026-04-29T12:00:00Z".to_owned(),
+            "restore".to_owned(),
+            TOOL_HASH.to_owned(),
+            CommitStats {
+                files_added: 0,
+                files_modified: 1,
+                files_deleted: 0,
+            },
+            super::RestoreProvenance {
+                source_commit: RAW_HASH.to_owned(),
+                paths: vec!["report:2026.md".to_owned()],
+            },
+        )
+        .unwrap();
+        assert!(restored.validate().is_ok());
+        #[cfg(windows)]
+        assert!(!super::is_materializable_direct_child("report:2026.md"));
     }
 
     #[test]
@@ -806,7 +1027,7 @@ mod tests {
         invalid_tool_lock.tool_lock_hash = "not-a-hash".to_owned();
 
         let mut invalid_parent = commit_with_created_at("2026-04-29T12:00:00Z").unwrap();
-        invalid_parent.parents.push("not-a-hash".to_owned());
+        invalid_parent.parent = Some("not-a-hash".to_owned());
 
         for commit in [invalid_tag, invalid_tree, invalid_tool_lock, invalid_parent] {
             assert_eq!(

@@ -99,7 +99,7 @@ fn indexed(threshold: u64) -> TempDir {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("note.md"), "baseline\n").unwrap();
     json(&dir, &["init"], T0);
-    json(&dir, &["index", "--offline", "--approve"], T0);
+    json(&dir, &["index", "--offline", "--yes"], T0);
     configure(&dir, threshold);
     dir
 }
@@ -110,10 +110,10 @@ fn stale_candidate() -> (TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("note.md"), "old candidate\n").unwrap();
     json(&dir, &["init"], old);
-    let first = json(&dir, &["index", "--offline", "--approve"], old);
+    let first = json(&dir, &["index", "--offline", "--yes"], old);
     let commit = first["commit_hash"].as_str().unwrap().to_owned();
     fs::write(dir.path().join("note.md"), "current tip\n").unwrap();
-    json(&dir, &["index", "--offline", "--approve"], T0);
+    json(&dir, &["index", "--offline", "--yes"], T0);
     configure(&dir, 10);
     (dir, commit)
 }
@@ -407,7 +407,7 @@ fn manual_snapshot_and_index_commands_never_fresh_trigger_on_idle_gc() {
     for args in [
         &["snapshot", "create", "-m", "ordinary writer", "--json"][..],
         &["index", "--preview", "--json"][..],
-        &["index", "--offline", "--approve", "--json"][..],
+        &["index", "--offline", "--yes", "--json"][..],
     ] {
         let output = kio(&dir, args, T0).output().unwrap();
         assert!(
@@ -434,7 +434,7 @@ fn parent_on_idle_does_not_consume_child_gc_state_and_child_handles_its_own_tree
     fs::create_dir_all(dir.path().join("child")).unwrap();
     fs::write(dir.path().join("child/note.md"), "child\n").unwrap();
     json(&dir, &["init"], T0);
-    json(&dir, &["index", "--offline", "--approve"], T0);
+    json(&dir, &["index", "--offline", "--yes"], T0);
     configure(&dir, 10);
     let child_root = dir.path().join("child");
     let old = "2025-01-01T00:00:00Z";
@@ -449,7 +449,7 @@ fn parent_on_idle_does_not_consume_child_gc_state_and_child_handles_its_own_tree
             .env("XDG_DATA_HOME", dir.path().join("child-data"))
             .env("XDG_CACHE_HOME", dir.path().join("child-cache"))
             .env("KIO_FIXED_NOW", old)
-            .args(["index", "--offline", "--approve", "--json"])
+            .args(["index", "--offline", "--yes", "--json"])
             .output()
             .unwrap();
         assert!(output.status.success());

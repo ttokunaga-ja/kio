@@ -2,12 +2,12 @@
 
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::io::Seek;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(unix)]
-use std::sync::Arc;
+#[cfg(any(unix, windows))]
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -576,15 +576,15 @@ pub struct AccountedReadError {
 
 #[derive(Debug, Clone)]
 pub struct ObjectStore {
-    kio_dir: PathBuf,
+    kio_dir: Option<PathBuf>,
     /// Scheduled writers retain these handles before taking their writer
     /// boundary.  The ambient `.kio/objects` pathname is deliberately never
     /// consulted by the bound read/write subset below.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     bound: Option<BoundObjectDirs>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug, Clone)]
 struct BoundObjectDirs {
     kio: Arc<File>,
@@ -592,18 +592,25 @@ struct BoundObjectDirs {
     raw: Arc<File>,
     trees: Arc<File>,
     commits: Arc<File>,
+    chunks: Arc<Mutex<Option<Arc<File>>>>,
+    prepared: Arc<Mutex<Option<Arc<File>>>>,
+    image: Arc<Mutex<Option<Arc<File>>>>,
+    embeddings: Arc<Mutex<Option<Arc<File>>>>,
+    manifests: Arc<Mutex<Option<Arc<File>>>>,
+    toollocks: Arc<Mutex<Option<Arc<File>>>>,
+    normalized_units: Arc<Mutex<Option<Arc<File>>>>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 #[derive(Debug)]
 pub struct BoundRawStage {
     parent: Arc<File>,
     name: String,
-    file: File,
+    file: Option<File>,
     raw_hash: String,
     size_bytes: u64,
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl BoundRawStage {
     #[must_use]
     pub fn raw_hash(&self) -> &str {
@@ -614,7 +621,7 @@ impl BoundRawStage {
         self.size_bytes
     }
 }
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl Drop for BoundRawStage {
     fn drop(&mut self) {
         if !self.name.is_empty() {
@@ -627,10 +634,18 @@ impl ObjectStore {
     #[must_use]
     pub fn new(kio_dir: impl Into<PathBuf>) -> Self {
         Self {
-            kio_dir: kio_dir.into(),
-            #[cfg(unix)]
+            kio_dir: Some(kio_dir.into()),
+            #[cfg(any(unix, windows))]
             bound: None,
         }
+    }
+
+    // A retained store deliberately has no fallback pathname. Incomplete API
+    // migrations must fail before touching the process working directory.
+    fn ambient_kio_dir(&self) -> Result<&Path> {
+        self.kio_dir.as_deref().ok_or_else(|| {
+            KioError::invalid_usage("a retained ObjectStore has no ambient pathname")
+        })
     }
 
     /// Construct a CAS capability rooted in an already retained `.kio`
@@ -638,14 +653,38 @@ impl ObjectStore {
     /// namespaces used by the scheduled snapshot writer, and refuses a
     /// missing/replaced/symlinked object namespace rather than recovering via
     /// the public pathname.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn from_bound_kio(kio: &File) -> Result<Self> {
         let objects = bound_open_dir(kio, "objects")?;
         let raw = bound_open_dir(&objects, ObjectKind::Raw.directory())?;
         let trees = bound_open_dir(&objects, ObjectKind::Tree.directory())?;
         let commits = bound_open_dir(&objects, ObjectKind::Commit.directory())?;
+        // Content namespaces are historically lazy. Bind an existing one but
+        // leave an absent kind absent: constructing a read-only Repository
+        // must not repair its on-disk layout. A writer creates a missing base
+        // through `objects` and retains it before its first operation.
+        let optional_dir = |name: &str| match bound_open_dir(&objects, name) {
+            Ok(dir) => Ok(Some(Arc::new(dir))),
+            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => Ok(None),
+            Err(error) => Err(KioError::new(
+                "KIO-E-STORE-NAMESPACE-001",
+                "cannot bind object namespace without following links",
+                serde_json::json!({
+                    "namespace": name,
+                    "cause": error.error_code(),
+                }),
+                crate::ExitCode::PermanentFailure,
+            )),
+        };
+        let chunks = optional_dir("chunks")?;
+        let prepared = optional_dir(ContentObjectKind::Prepared.directory())?;
+        let image = optional_dir(ContentObjectKind::Image.directory())?;
+        let embeddings = optional_dir(ContentObjectKind::Embedding.directory())?;
+        let manifests = optional_dir(ContentObjectKind::Manifest.directory())?;
+        let toollocks = optional_dir(ContentObjectKind::Toollock.directory())?;
+        let normalized_units = optional_dir(ContentObjectKind::NormalizedUnit.directory())?;
         Ok(Self {
-            kio_dir: PathBuf::from("."),
+            kio_dir: None,
             bound: Some(BoundObjectDirs {
                 kio: Arc::new(
                     kio.try_clone()
@@ -655,6 +694,13 @@ impl ObjectStore {
                 raw: Arc::new(raw),
                 trees: Arc::new(trees),
                 commits: Arc::new(commits),
+                chunks: Arc::new(Mutex::new(chunks)),
+                prepared: Arc::new(Mutex::new(prepared)),
+                image: Arc::new(Mutex::new(image)),
+                embeddings: Arc::new(Mutex::new(embeddings)),
+                manifests: Arc::new(Mutex::new(manifests)),
+                toollocks: Arc::new(Mutex::new(toollocks)),
+                normalized_units: Arc::new(Mutex::new(normalized_units)),
             }),
         })
     }
@@ -665,7 +711,7 @@ impl ObjectStore {
         Ok(hash)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn stage_raw_from_reader<R: Read>(
         &self,
         reader: &mut R,
@@ -679,7 +725,7 @@ impl ObjectStore {
             .stage_raw_from_reader(reader, max_bytes)
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn cleanup_bound_raw_stages(&self) -> Result<()> {
         self.bound
             .as_ref()
@@ -689,7 +735,7 @@ impl ObjectStore {
             .cleanup_raw_ingest_orphans()
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn validate_bound_layout(&self) -> Result<()> {
         self.bound
             .as_ref()
@@ -699,7 +745,7 @@ impl ObjectStore {
             .validate_layout()
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     pub fn validate_bound_layout(&self) -> Result<()> {
         Err(KioError::new(
             "KIO-E-SNAPSHOT-PLATFORM-UNSUPPORTED-001",
@@ -709,7 +755,7 @@ impl ObjectStore {
         ))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     pub fn publish_bound_raw_stage(&self, stage: BoundRawStage) -> Result<(String, u64)> {
         self.bound
             .as_ref()
@@ -726,6 +772,10 @@ impl ObjectStore {
     /// noncanonical or conflicting representation remains fail-closed. The caller must
     /// hold the scope store lock for the entire operation.
     pub fn repair_raw(&self, expected_hash: &str, bytes: &[u8]) -> Result<bool> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            return bound.repair_raw(expected_hash, bytes);
+        }
         if !is_hash(expected_hash) || hash_bytes(bytes) != expected_hash {
             return Err(KioError::invalid_usage(
                 "raw repair bytes do not match the expected hash",
@@ -835,6 +885,13 @@ impl ObjectStore {
         if bytes.len() as u64 > MAX_CHUNK_OBJECT_BYTES {
             return Err(chunk_size_error(bytes.len() as u64));
         }
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            let (parent, leaf) = bound.chunk_fanout(&hash, true)?;
+            bound_write_semantic(&parent, &leaf, &bytes, MAX_CHUNK_OBJECT_BYTES)?;
+            bound_read_chunk_accounted(&parent, &leaf, &hash).map_err(|e| e.error)?;
+            return Ok(hash);
+        }
         self.ensure_chunk_parent(&hash)?;
         if let Some(existing) = self.existing_chunk_path(&hash)? {
             verify_existing_bytes(&existing, &hash, &bytes)?;
@@ -879,6 +936,10 @@ impl ObjectStore {
 
     /// Read a semantic chunk and return the exact logical object byte count.
     pub fn read_chunk_with_size(&self, hash: &str) -> Result<(ChunkObject, u64)> {
+        #[cfg(any(unix, windows))]
+        if self.bound.is_some() {
+            return self.read_chunk_accounted(hash).map_err(|e| e.error);
+        }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid chunk hash"));
         }
@@ -896,6 +957,17 @@ impl ObjectStore {
         &self,
         hash: &str,
     ) -> std::result::Result<(ChunkObject, u64), AccountedReadError> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            let (parent, leaf) =
+                bound
+                    .chunk_fanout(hash, false)
+                    .map_err(|error| AccountedReadError {
+                        error,
+                        consumed_bytes: 0,
+                    })?;
+            return bound_read_chunk_accounted(&parent, &leaf, hash);
+        }
         let path = (|| -> Result<PathBuf> {
             if !is_hash(hash) {
                 return Err(KioError::invalid_usage("invalid chunk hash"));
@@ -925,6 +997,10 @@ impl ObjectStore {
         kind: ContentObjectKind,
         hash: &str,
     ) -> Result<StoredContentObjectMetadata> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            return bound.inspect_content_object(kind, hash);
+        }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid content object hash"));
         }
@@ -947,6 +1023,10 @@ impl ObjectStore {
         kind: ContentObjectKind,
         hash: &str,
     ) -> std::result::Result<StoredContentObjectMetadata, AccountedReadError> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            return bound.inspect_content_accounted(kind, hash);
+        }
         let path = (|| -> Result<PathBuf> {
             if !is_hash(hash) {
                 return Err(KioError::invalid_usage("invalid content object hash"));
@@ -974,7 +1054,7 @@ impl ObjectStore {
     }
 
     pub fn embedding_path(&self, hash: &str) -> Result<PathBuf> {
-        fanout_path(self.kio_dir.join("objects/embeddings"), hash)
+        fanout_path(self.ambient_kio_dir()?.join("objects/embeddings"), hash)
     }
 
     /// Publish one embedding vector under its identity hash (03 §8.1).
@@ -997,6 +1077,13 @@ impl ObjectStore {
                 }),
                 crate::ExitCode::PermanentFailure,
             ));
+        }
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            let (parent, leaf) = bound.content_fanout(ContentObjectKind::Embedding, &hash, true)?;
+            bound_write_semantic(&parent, &leaf, &bytes, MAX_EMBEDDING_OBJECT_BYTES)?;
+            bound_read_embedding(&parent, &leaf, &hash)?;
+            return Ok(hash);
         }
         self.ensure_embedding_parent(&hash)?;
         let path = self.embedding_path(&hash)?;
@@ -1034,6 +1121,11 @@ impl ObjectStore {
     /// Read and fully verify one embedding object, including that its identity
     /// hashes back to the name it is stored under.
     pub fn read_embedding(&self, hash: &str) -> Result<EmbeddingObject> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            let (parent, leaf) = bound.content_fanout(ContentObjectKind::Embedding, hash, false)?;
+            return bound_read_embedding(&parent, &leaf, hash);
+        }
         read_embedding_path(&self.embedding_path(hash)?, hash)
     }
 
@@ -1048,21 +1140,57 @@ impl ObjectStore {
     /// as [`Self::remove_chunk`] is for the identity-keyed chunk namespace.
     /// Missing is an idempotent `false`.
     pub fn remove_embedding(&self, hash: &str) -> Result<bool> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            return bound.remove_embedding(hash);
+        }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid embedding hash"));
         }
         if !self.validate_content_parent(ContentObjectKind::Embedding, hash)? {
             return Ok(false);
         }
-        let Some(path) = occupied_slot(self.embedding_path(hash)?)? else {
-            return Ok(false);
-        };
-        // Verify before the first destructive step.
-        read_embedding_path(&path, hash)?;
-        remove_verified_cas_path(&path, |candidate| {
-            read_embedding_path(candidate, hash).map(|_| ())
-        })?;
-        Ok(true)
+        remove_verified_cas_path(
+            self.ambient_kio_dir()?,
+            &self.embedding_path(hash)?,
+            CasRemovalKind::Embedding,
+            hash,
+        )
+    }
+
+    /// Visit every canonical chunk through retained directory handles. Unknown
+    /// entries fail closed. The complete traversal permits at most 100,000
+    /// directory entries and 512 MiB of chunk bodies, including irrelevant rows.
+    /// This preparation inventory does not grant deletion authority.
+    pub fn visit_chunks_bounded(
+        &self,
+        mut visit: impl FnMut(&str, &ChunkObject) -> Result<()>,
+    ) -> Result<()> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            let mut retained = bound
+                .chunks
+                .lock()
+                .map_err(|_| KioError::io("bound chunks directory lock poisoned", "chunks"))?;
+            if retained.is_none() {
+                match bound_open_dir(&bound.objects, "chunks") {
+                    Ok(directory) => *retained = Some(Arc::new(directory)),
+                    Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
+                        return Ok(());
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            let base = retained
+                .as_ref()
+                .expect("retained chunks namespace")
+                .clone();
+            drop(retained);
+            return bound_visit_chunks(&base, &mut visit);
+        }
+        Err(KioError::invalid_usage(
+            "chunk completeness inventory requires a retained object store",
+        ))
     }
 
     /// Every embedding object this scope holds, by storage key.
@@ -1072,7 +1200,11 @@ impl ObjectStore {
     /// empty list when the namespace does not exist, which is the ordinary
     /// state of a scope nothing has embedded yet.
     pub fn embedding_hashes(&self) -> Result<Vec<String>> {
-        let base = self.kio_dir.join("objects/embeddings");
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            return bound.embedding_hashes();
+        }
+        let base = self.ambient_kio_dir()?.join("objects/embeddings");
         let mut hashes = Vec::new();
         let Ok(first_level) = fs::read_dir(&base) else {
             return Ok(hashes);
@@ -1107,9 +1239,9 @@ impl ObjectStore {
     }
 
     fn ensure_embedding_parent(&self, hash: &str) -> Result<()> {
-        ensure_real_directory(&self.kio_dir, false)?;
-        ensure_real_directory(&self.kio_dir.join("objects"), true)?;
-        let base = self.kio_dir.join("objects/embeddings");
+        ensure_real_directory(self.ambient_kio_dir()?, false)?;
+        ensure_real_directory(&self.ambient_kio_dir()?.join("objects"), true)?;
+        let base = self.ambient_kio_dir()?.join("objects/embeddings");
         ensure_real_directory(&base, true)?;
         let digest = hash_path_component(hash)?;
         let first = base.join(&digest[0..2]);
@@ -1119,7 +1251,7 @@ impl ObjectStore {
     }
 
     pub fn chunk_path(&self, hash: &str) -> Result<PathBuf> {
-        fanout_path(self.kio_dir.join("objects/chunks"), hash)
+        fanout_path(self.ambient_kio_dir()?.join("objects/chunks"), hash)
     }
 
     fn existing_chunk_path(&self, hash: &str) -> Result<Option<PathBuf>> {
@@ -1132,7 +1264,19 @@ impl ObjectStore {
     /// bounded semantic read, not just the byte-hash check
     /// [`Self::inspect_content_accounted`] already provides generically.
     pub fn content_path(&self, kind: ContentObjectKind, hash: &str) -> Result<PathBuf> {
-        fanout_path(self.kio_dir.join("objects").join(kind.directory()), hash)
+        #[cfg(any(unix, windows))]
+        if self.bound.is_some() {
+            let _ = (kind, hash);
+            return Err(KioError::invalid_usage(
+                "a bound ObjectStore has no ambient content pathname",
+            ));
+        }
+        fanout_path(
+            self.ambient_kio_dir()?
+                .join("objects")
+                .join(kind.directory()),
+            hash,
+        )
     }
 
     fn existing_content_path(
@@ -1145,11 +1289,17 @@ impl ObjectStore {
 
     fn validate_content_parent(&self, kind: ContentObjectKind, hash: &str) -> Result<bool> {
         let digest = hash_path_component(hash)?;
-        let objects = self.kio_dir.join("objects");
+        let objects = self.ambient_kio_dir()?.join("objects");
         let kind_base = objects.join(kind.directory());
         let first = kind_base.join(&digest[0..2]);
         let second = first.join(&digest[2..4]);
-        for directory in [&self.kio_dir, &objects, &kind_base, &first, &second] {
+        for directory in [
+            self.ambient_kio_dir()?,
+            &objects,
+            &kind_base,
+            &first,
+            &second,
+        ] {
             match fs::symlink_metadata(directory) {
                 Ok(metadata)
                     if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
@@ -1167,9 +1317,9 @@ impl ObjectStore {
     }
 
     fn ensure_chunk_parent(&self, hash: &str) -> Result<()> {
-        ensure_real_directory(&self.kio_dir, false)?;
-        ensure_real_directory(&self.kio_dir.join("objects"), true)?;
-        let base = self.kio_dir.join("objects/chunks");
+        ensure_real_directory(self.ambient_kio_dir()?, false)?;
+        ensure_real_directory(&self.ambient_kio_dir()?.join("objects"), true)?;
+        let base = self.ambient_kio_dir()?.join("objects/chunks");
         ensure_real_directory(&base, true)?;
         let digest = hash_path_component(hash)?;
         let first = base.join(&digest[0..2]);
@@ -1180,11 +1330,11 @@ impl ObjectStore {
 
     fn validate_chunk_parent(&self, hash: &str) -> Result<bool> {
         let digest = hash_path_component(hash)?;
-        let objects = self.kio_dir.join("objects");
+        let objects = self.ambient_kio_dir()?.join("objects");
         let base = objects.join("chunks");
         let first = base.join(&digest[0..2]);
         let second = first.join(&digest[2..4]);
-        for directory in [&self.kio_dir, &objects, &base, &first, &second] {
+        for directory in [self.ambient_kio_dir()?, &objects, &base, &first, &second] {
             match fs::symlink_metadata(directory) {
                 Ok(metadata)
                     if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
@@ -1202,7 +1352,7 @@ impl ObjectStore {
     }
 
     pub fn write_object_bytes(&self, kind: ObjectKind, hash: &str, bytes: &[u8]) -> Result<()> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.write_object_bytes(kind, hash, bytes);
         }
@@ -1253,13 +1403,13 @@ impl ObjectStore {
         reader: &mut R,
         max_bytes: u64,
     ) -> Result<(String, u64)> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.write_raw_reader(reader, max_bytes);
         }
         let max_bytes = max_bytes.min(MAX_RAW_OBJECT_BYTES);
         let raw_base = self
-            .kio_dir
+            .ambient_kio_dir()?
             .join("objects")
             .join(ObjectKind::Raw.directory());
         self.ensure_kind_base(ObjectKind::Raw)?;
@@ -1312,7 +1462,7 @@ impl ObjectStore {
     }
 
     pub fn read_by_hash(&self, hash: &str) -> Result<StoredObject> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.read_by_hash(hash);
         }
@@ -1331,39 +1481,42 @@ impl ObjectStore {
     /// held. Missing is an idempotent `false`; malformed links or bytes fail
     /// closed before unlink.
     pub fn remove_raw(&self, hash: &str) -> Result<bool> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            return bound.remove_raw(hash);
+        }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid raw hash"));
         }
         if !self.validate_object_parent(ObjectKind::Raw, hash)? {
             return Ok(false);
         }
-        let Some(path) = self.existing_object_path(ObjectKind::Raw, hash)? else {
-            return Ok(false);
-        };
-        read_verified_object(&path, ObjectKind::Raw, hash, false)?;
-        remove_verified_cas_path(&path, |candidate| {
-            read_verified_object(candidate, ObjectKind::Raw, hash, false).map(|_| ())
-        })?;
-        Ok(true)
+        remove_verified_cas_path(
+            self.ambient_kio_dir()?,
+            &self.object_path(ObjectKind::Raw, hash)?,
+            CasRemovalKind::Raw,
+            hash,
+        )
     }
 
     /// Remove one semantic chunk object after identity/text verification.
     pub fn remove_chunk(&self, hash: &str) -> Result<bool> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            return bound.remove_chunk(hash);
+        }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid chunk hash"));
         }
         if !self.validate_chunk_parent(hash)? {
             return Ok(false);
         }
-        let Some(path) = self.existing_chunk_path(hash)? else {
-            return Ok(false);
-        };
-        // Verify before the first destructive step.
-        self.read_chunk(hash)?;
-        remove_verified_cas_path(&path, |candidate| {
-            read_chunk_path(candidate, hash).map(|_| ())
-        })?;
-        Ok(true)
+        remove_verified_cas_path(
+            self.ambient_kio_dir()?,
+            &self.chunk_path(hash)?,
+            CasRemovalKind::Chunk,
+            hash,
+        )
     }
 
     /// Verify the single canonical prepared or image slot, then physically
@@ -1372,32 +1525,43 @@ impl ObjectStore {
     /// `false`; malformed links, bytes, or duplicate representations fail closed
     /// before the first unlink.
     pub fn remove_content(&self, kind: ContentObjectKind, hash: &str) -> Result<bool> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            return bound.remove_content(kind, hash);
+        }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid content object hash"));
         }
         if !self.validate_content_parent(kind, hash)? {
             return Ok(false);
         }
-        let Some(path) = self.existing_content_path(kind, hash)? else {
-            return Ok(false);
-        };
-        verify_content_object_path(&path, kind, hash)?;
-        remove_verified_cas_path(&path, |candidate| {
-            verify_content_object_path(candidate, kind, hash).map(|_| ())
-        })?;
-        Ok(true)
+        remove_verified_cas_path(
+            self.ambient_kio_dir()?,
+            &self.content_path(kind, hash)?,
+            CasRemovalKind::Content(kind),
+            hash,
+        )
     }
 
     fn ensure_content_kind_base(&self, kind: ContentObjectKind) -> Result<()> {
-        ensure_real_directory(&self.kio_dir, false)?;
-        ensure_real_directory(&self.kio_dir.join("objects"), true)?;
-        ensure_real_directory(&self.kio_dir.join("objects").join(kind.directory()), true)
+        ensure_real_directory(self.ambient_kio_dir()?, false)?;
+        ensure_real_directory(&self.ambient_kio_dir()?.join("objects"), true)?;
+        ensure_real_directory(
+            &self
+                .ambient_kio_dir()?
+                .join("objects")
+                .join(kind.directory()),
+            true,
+        )
     }
 
     fn ensure_content_parent(&self, kind: ContentObjectKind, hash: &str) -> Result<()> {
         self.ensure_content_kind_base(kind)?;
         let digest = hash_path_component(hash)?;
-        let kind_base = self.kio_dir.join("objects").join(kind.directory());
+        let kind_base = self
+            .ambient_kio_dir()?
+            .join("objects")
+            .join(kind.directory());
         let first = kind_base.join(&digest[0..2]);
         let second = first.join(&digest[2..4]);
         ensure_real_directory(&first, true)?;
@@ -1411,6 +1575,10 @@ impl ObjectStore {
     /// contract) — used by tests to construct fsck fixtures directly, and is
     /// the storage primitive a future write-path integration would call.
     pub fn write_content_object(&self, kind: ContentObjectKind, bytes: &[u8]) -> Result<String> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            return bound.write_content_object(kind, bytes);
+        }
         if bytes.len() as u64 > kind.max_bytes() {
             return Err(content_object_size_error(
                 kind,
@@ -1459,6 +1627,10 @@ impl ObjectStore {
         hash: &str,
         max_bytes: u64,
     ) -> Result<Vec<u8>> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            return bound.read_content_object_bytes(kind, hash, max_bytes);
+        }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid content object hash"));
         }
@@ -1485,7 +1657,7 @@ impl ObjectStore {
         kind: ObjectKind,
         hash: &str,
     ) -> Result<(StoredObject, u64)> {
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.read_object_with_size(kind, hash);
         }
@@ -1512,6 +1684,17 @@ impl ObjectStore {
     /// Verify and count an object through a fixed-size buffer. This is the
     /// metadata-only path used by raw `inspect`; it does not retain the body.
     pub fn inspect_by_hash(&self, hash: &str) -> Result<StoredObjectMetadata> {
+        #[cfg(any(unix, windows))]
+        if self.bound.is_some() {
+            for kind in [ObjectKind::Tree, ObjectKind::Commit, ObjectKind::Raw] {
+                match self.inspect_object(kind, hash) {
+                    Ok(metadata) => return Ok(metadata),
+                    Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {}
+                    Err(error) => return Err(error),
+                }
+            }
+            return Err(KioError::not_found(hash));
+        }
         let (kind, path) = self.locate_object(hash)?;
         let (size_bytes, _) = read_verified_object(&path, kind, hash, false)?;
         Ok(StoredObjectMetadata {
@@ -1524,6 +1707,16 @@ impl ObjectStore {
     /// Stream-verify metadata from one required CAS namespace without accepting
     /// a same-digest object from another namespace as a substitute.
     pub fn inspect_object(&self, kind: ObjectKind, hash: &str) -> Result<StoredObjectMetadata> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            let (parent, leaf) = bound.fanout(kind, hash, false)?;
+            let (size_bytes, _) = bound_read_verified(&parent, &leaf, kind, hash, false)?;
+            return Ok(StoredObjectMetadata {
+                kind,
+                hash: hash.to_owned(),
+                size_bytes,
+            });
+        }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid hash"));
         }
@@ -1549,6 +1742,15 @@ impl ObjectStore {
         kind: ObjectKind,
         hash: &str,
     ) -> std::result::Result<StoredObjectMetadata, AccountedReadError> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            let (size_bytes, _) = bound.read_object_accounted(kind, hash, false)?;
+            return Ok(StoredObjectMetadata {
+                kind,
+                hash: hash.to_owned(),
+                size_bytes,
+            });
+        }
         let path = (|| -> Result<PathBuf> {
             if !is_hash(hash) {
                 return Err(KioError::invalid_usage("invalid hash"));
@@ -1581,6 +1783,18 @@ impl ObjectStore {
         kind: ObjectKind,
         hash: &str,
     ) -> std::result::Result<(StoredObject, u64), AccountedReadError> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            let (size_bytes, bytes) = bound.read_object_accounted(kind, hash, true)?;
+            return Ok((
+                StoredObject {
+                    kind,
+                    hash: hash.to_owned(),
+                    bytes,
+                },
+                size_bytes,
+            ));
+        }
         let path = (|| -> Result<PathBuf> {
             if !is_hash(hash) {
                 return Err(KioError::invalid_usage("invalid hash"));
@@ -1621,6 +1835,30 @@ impl ObjectStore {
         hash: &str,
         writer: &mut W,
     ) -> Result<StoredObjectMetadata> {
+        #[cfg(any(unix, windows))]
+        if let Some(bound) = &self.bound {
+            let (parent, leaf) = bound.fanout(kind, hash, false)?;
+            let mut hasher = Sha256::new();
+            let (result, _) = bound_stream_regular(&parent, &leaf, kind.max_bytes(), |bytes| {
+                hasher.update(bytes);
+                writer.write_all(bytes).kio_io(Path::new(&leaf))
+            });
+            let size_bytes = result?;
+            let actual = format!("sha256:{}", lower_hex(&hasher.finalize()));
+            if actual != hash {
+                return Err(corrupt_object_error(
+                    Path::new(&leaf),
+                    "CAS object hash does not match filename",
+                    hash,
+                    Some(&actual),
+                ));
+            }
+            return Ok(StoredObjectMetadata {
+                kind,
+                hash: hash.to_owned(),
+                size_bytes,
+            });
+        }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid hash"));
         }
@@ -1639,7 +1877,10 @@ impl ObjectStore {
     }
 
     pub fn object_path(&self, kind: ObjectKind, hash: &str) -> Result<PathBuf> {
-        let base = self.kio_dir.join("objects").join(kind.directory());
+        let base = self
+            .ambient_kio_dir()?
+            .join("objects")
+            .join(kind.directory());
         fanout_path(base, hash)
     }
 
@@ -1663,15 +1904,24 @@ impl ObjectStore {
     }
 
     fn ensure_kind_base(&self, kind: ObjectKind) -> Result<()> {
-        ensure_real_directory(&self.kio_dir, false)?;
-        ensure_real_directory(&self.kio_dir.join("objects"), true)?;
-        ensure_real_directory(&self.kio_dir.join("objects").join(kind.directory()), true)
+        ensure_real_directory(self.ambient_kio_dir()?, false)?;
+        ensure_real_directory(&self.ambient_kio_dir()?.join("objects"), true)?;
+        ensure_real_directory(
+            &self
+                .ambient_kio_dir()?
+                .join("objects")
+                .join(kind.directory()),
+            true,
+        )
     }
 
     fn ensure_object_parent(&self, kind: ObjectKind, hash: &str) -> Result<()> {
         self.ensure_kind_base(kind)?;
         let digest = hash_path_component(hash)?;
-        let kind_base = self.kio_dir.join("objects").join(kind.directory());
+        let kind_base = self
+            .ambient_kio_dir()?
+            .join("objects")
+            .join(kind.directory());
         let first = kind_base.join(&digest[0..2]);
         let second = first.join(&digest[2..4]);
         ensure_real_directory(&first, true)?;
@@ -1680,11 +1930,17 @@ impl ObjectStore {
 
     fn validate_object_parent(&self, kind: ObjectKind, hash: &str) -> Result<bool> {
         let digest = hash_path_component(hash)?;
-        let objects = self.kio_dir.join("objects");
+        let objects = self.ambient_kio_dir()?.join("objects");
         let kind_base = objects.join(kind.directory());
         let first = kind_base.join(&digest[0..2]);
         let second = first.join(&digest[2..4]);
-        for directory in [&self.kio_dir, &objects, &kind_base, &first, &second] {
+        for directory in [
+            self.ambient_kio_dir()?,
+            &objects,
+            &kind_base,
+            &first,
+            &second,
+        ] {
             match fs::symlink_metadata(directory) {
                 Ok(metadata)
                     if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
@@ -1702,10 +1958,9 @@ impl ObjectStore {
     }
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 impl BoundObjectDirs {
     fn validate_layout(&self) -> Result<()> {
-        use std::os::unix::fs::MetadataExt;
         let changed = || {
             KioError::new(
                 "KIO-E-SNAPSHOT-AUTHORITY-CHANGED-001",
@@ -1726,13 +1981,31 @@ impl BoundObjectDirs {
             (&trees, &self.trees),
             (&commits, &self.commits),
         ] {
-            let current = current
-                .metadata()
-                .kio_io(Path::new("bound object layout"))?;
-            let retained = retained
-                .metadata()
-                .kio_io(Path::new("retained object layout"))?;
-            if current.dev() != retained.dev() || current.ino() != retained.ino() {
+            if !same_bound_directory(current, retained)? {
+                return Err(changed());
+            }
+        }
+        for kind in [
+            ContentObjectKind::Prepared,
+            ContentObjectKind::Image,
+            ContentObjectKind::Embedding,
+            ContentObjectKind::Manifest,
+            ContentObjectKind::Toollock,
+            ContentObjectKind::NormalizedUnit,
+        ] {
+            let retained = self.content_slot(kind)?;
+            let Some(retained) = retained.as_ref() else {
+                continue;
+            };
+            let current = bound_open_dir(&objects, kind.directory()).map_err(|_| changed())?;
+            if !same_bound_directory(&current, retained)? {
+                return Err(changed());
+            }
+        }
+        let chunks = self.chunks.lock().map_err(|_| changed())?;
+        if let Some(retained) = chunks.as_ref() {
+            let current = bound_open_dir(&objects, "chunks").map_err(|_| changed())?;
+            if !same_bound_directory(&current, retained)? {
                 return Err(changed());
             }
         }
@@ -1777,7 +2050,7 @@ impl BoundObjectDirs {
             Ok((raw_hash, size_bytes)) => Ok(BoundRawStage {
                 parent: Arc::clone(&self.raw),
                 name,
-                file,
+                file: Some(file),
                 raw_hash,
                 size_bytes,
             }),
@@ -1795,7 +2068,12 @@ impl BoundObjectDirs {
                 "bound raw stage belongs to another ObjectStore",
             ));
         }
-        let opened = stage.file.metadata().kio_io(Path::new(&stage.name))?;
+        let opened = stage
+            .file
+            .as_ref()
+            .ok_or_else(|| bound_stage_corrupt("bound raw stage handle is unavailable"))?
+            .metadata()
+            .kio_io(Path::new(&stage.name))?;
         if !opened.is_file() || opened.len() != stage.size_bytes {
             return Err(corrupt_object_error(
                 Path::new(&stage.name),
@@ -1806,6 +2084,12 @@ impl BoundObjectDirs {
         }
         let hash = stage.raw_hash.clone();
         let size = stage.size_bytes;
+        // Windows may reject linking or unlinking a name while its writer
+        // handle remains open. The exact file was checked above; publication
+        // re-opens it through the retained raw directory and verifies hash,
+        // type and single-link identity before accepting it.
+        #[cfg(windows)]
+        drop(stage.file.take());
         let (parent, leaf) = self.fanout(ObjectKind::Raw, &hash, true)?;
         match bound_read_verified(&parent, &leaf, ObjectKind::Raw, &hash, true) {
             Ok((existing_size, existing)) => {
@@ -1839,7 +2123,6 @@ impl BoundObjectDirs {
     }
 
     fn cleanup_raw_ingest_orphans(&self) -> Result<()> {
-        use std::os::unix::ffi::OsStrExt;
         const MAX_ENTRIES: usize = 100_000;
         let mut total = 0_u64;
         let entries = cap_primitives::fs::read_base_dir(&self.raw)
@@ -1853,12 +2136,12 @@ impl BoundObjectDirs {
             let entry =
                 entry.map_err(|e| KioError::io(e.to_string(), "bound raw stage directory"))?;
             let file_name = entry.file_name();
-            let bytes = file_name.as_bytes();
-            if !bytes.starts_with(b".ingest-") {
+            let Some(name) = file_name.to_str() else {
+                return Err(bound_stage_corrupt("bound raw stage name is not UTF-8"));
+            };
+            if !name.starts_with(".ingest-") {
                 continue;
             }
-            let name = std::str::from_utf8(bytes)
-                .map_err(|_| bound_stage_corrupt("bound raw stage name is not UTF-8"))?;
             if !bound_ingest_name(name) {
                 return Err(bound_stage_corrupt("bound raw stage name is malformed"));
             }
@@ -1884,6 +2167,42 @@ impl BoundObjectDirs {
         }
     }
 
+    fn read_object_accounted(
+        &self,
+        kind: ObjectKind,
+        hash: &str,
+        materialize: bool,
+    ) -> std::result::Result<(u64, Vec<u8>), AccountedReadError> {
+        let (parent, leaf) =
+            self.fanout(kind, hash, false)
+                .map_err(|error| AccountedReadError {
+                    error,
+                    consumed_bytes: 0,
+                })?;
+        let (result, consumed_bytes) =
+            bound_read_verified_accounted(&parent, &leaf, kind, hash, materialize);
+        result.map_err(|error| AccountedReadError {
+            error,
+            consumed_bytes,
+        })
+    }
+
+    fn content_slot(
+        &self,
+        kind: ContentObjectKind,
+    ) -> Result<std::sync::MutexGuard<'_, Option<Arc<File>>>> {
+        match kind {
+            ContentObjectKind::Prepared => &self.prepared,
+            ContentObjectKind::Image => &self.image,
+            ContentObjectKind::Embedding => &self.embeddings,
+            ContentObjectKind::Manifest => &self.manifests,
+            ContentObjectKind::Toollock => &self.toollocks,
+            ContentObjectKind::NormalizedUnit => &self.normalized_units,
+        }
+        .lock()
+        .map_err(|_| KioError::io("bound content directory lock poisoned", kind.directory()))
+    }
+
     fn fanout(&self, kind: ObjectKind, hash: &str, create: bool) -> Result<(File, String)> {
         let digest = hash_path_component(hash)?;
         let first = &digest[..2];
@@ -1892,6 +2211,342 @@ impl BoundObjectDirs {
         let first_dir = bound_open_or_create_dir(base, first, create)?;
         let second_dir = bound_open_or_create_dir(&first_dir, second, create)?;
         Ok((second_dir, digest.to_owned()))
+    }
+
+    fn chunk_fanout(&self, hash: &str, create: bool) -> Result<(File, String)> {
+        let digest = hash_path_component(hash)?;
+        let mut retained = self
+            .chunks
+            .lock()
+            .map_err(|_| KioError::io("bound chunks directory lock poisoned", "chunks"))?;
+        if retained.is_none() {
+            if !create {
+                *retained = Some(Arc::new(bound_open_dir(&self.objects, "chunks")?));
+            } else {
+                *retained = Some(Arc::new(bound_open_or_create_dir(
+                    &self.objects,
+                    "chunks",
+                    true,
+                )?));
+            }
+        }
+        let base = retained
+            .as_ref()
+            .expect("created or retained chunks namespace");
+        let first = bound_open_or_create_dir(base, &digest[..2], create)?;
+        let second = bound_open_or_create_dir(&first, &digest[2..4], create)?;
+        Ok((second, digest.to_owned()))
+    }
+
+    fn content_fanout(
+        &self,
+        kind: ContentObjectKind,
+        hash: &str,
+        create: bool,
+    ) -> Result<(File, String)> {
+        let digest = hash_path_component(hash)?;
+        let first = &digest[..2];
+        let second = &digest[2..4];
+        let base = {
+            let mut retained = self.content_slot(kind)?;
+            if let Some(directory) = retained.as_ref() {
+                directory
+                    .try_clone()
+                    .map_err(|error| KioError::io(error.to_string(), kind.directory()))?
+            } else if create {
+                let directory = Arc::new(bound_open_or_create_dir(
+                    &self.objects,
+                    kind.directory(),
+                    true,
+                )?);
+                let clone = directory
+                    .try_clone()
+                    .map_err(|error| KioError::io(error.to_string(), kind.directory()))?;
+                *retained = Some(directory);
+                clone
+            } else {
+                let directory = Arc::new(bound_open_dir(&self.objects, kind.directory())?);
+                let clone = directory
+                    .try_clone()
+                    .map_err(|error| KioError::io(error.to_string(), kind.directory()))?;
+                *retained = Some(directory);
+                clone
+            }
+        };
+        let first_dir = bound_open_or_create_dir(&base, first, create)?;
+        let second_dir = bound_open_or_create_dir(&first_dir, second, create)?;
+        Ok((second_dir, digest.to_owned()))
+    }
+
+    fn repair_raw(&self, expected_hash: &str, bytes: &[u8]) -> Result<bool> {
+        if !is_hash(expected_hash) || hash_bytes(bytes) != expected_hash {
+            return Err(KioError::invalid_usage(
+                "raw repair bytes do not match the expected hash",
+            ));
+        }
+        if bytes.len() as u64 > ObjectKind::Raw.max_bytes() {
+            return Err(object_size_error(
+                ObjectKind::Raw,
+                ObjectKind::Raw.max_bytes(),
+                bytes.len() as u64,
+            ));
+        }
+        let (parent, leaf) = self.fanout(ObjectKind::Raw, expected_hash, true)?;
+        match bound_read_regular(&parent, &leaf, ObjectKind::Raw.max_bytes()) {
+            Ok((_, existing)) if hash_bytes(&existing) == expected_hash => return Ok(false),
+            Ok(_) => {}
+            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
+                self.write_object_bytes(ObjectKind::Raw, expected_hash, bytes)?;
+                return Ok(true);
+            }
+            // `bound_read_regular` rejects symlinks, hardlinks, directories,
+            // unstable entries and over-limit bodies before exposing bytes.
+            // Those unsafe representations are never repairable in place.
+            Err(error) => return Err(error),
+        }
+
+        // Capture an exact safe source handle before linking. The later
+        // quarantine must prove it names this handle, never merely whatever
+        // pathname happened to occupy the leaf after the corrupt read.
+        let mut source = bound_open_regular_handle(&parent, &leaf)?;
+        if bound_hash_open_regular(&mut source, ObjectKind::Raw.max_bytes())? == expected_hash {
+            return Err(corrupt_object_error(
+                Path::new(&leaf),
+                "raw repair observed an unstable CAS slot",
+                expected_hash,
+                Some(expected_hash),
+            ));
+        }
+        let (quarantine, file) = bound_create_temp(&parent)?;
+        drop(file);
+        bound_remove(&parent, &quarantine)?;
+        cap_primitives::fs::hard_link(&parent, Path::new(&leaf), &parent, Path::new(&quarantine))
+            .map_err(|error| KioError::io(error.to_string(), &leaf))?;
+        let result = (|| {
+            if !bound_quarantine_matches(&parent, &quarantine, &source)? {
+                let _ = bound_remove(&parent, &quarantine);
+                return Err(corrupt_object_error(
+                    Path::new(&leaf),
+                    "raw repair leaf changed before quarantine",
+                    expected_hash,
+                    None,
+                ));
+            }
+            bound_remove(&parent, &leaf)?;
+            let (temp, mut replacement) = bound_create_temp(&parent)?;
+            let publish = (|| {
+                replacement.write_all(bytes).kio_io(Path::new(&temp))?;
+                replacement.sync_all().kio_io(Path::new(&temp))?;
+                drop(replacement);
+                bound_publish(
+                    &parent,
+                    &temp,
+                    &leaf,
+                    ObjectKind::Raw,
+                    expected_hash,
+                    bytes.len() as u64,
+                    Some(bytes),
+                )
+            })();
+            if publish.is_err() {
+                let _ = bound_remove(&parent, &temp);
+                return publish;
+            }
+            if let Err(error) =
+                bound_read_verified(&parent, &leaf, ObjectKind::Raw, expected_hash, false)
+            {
+                let _ = bound_remove(&parent, &leaf);
+                let _ = cap_primitives::fs::hard_link(
+                    &parent,
+                    Path::new(&quarantine),
+                    &parent,
+                    Path::new(&leaf),
+                );
+                return Err(error);
+            }
+            bound_remove(&parent, &quarantine)?;
+            sync_bound_directory(&parent, Path::new(&leaf))?;
+            Ok(())
+        })();
+        if result.is_err() {
+            // If removal/republication itself failed, leave the quarantined
+            // corrupt evidence intact for a later explicit recovery attempt.
+            return result.map(|()| true);
+        }
+        Ok(true)
+    }
+
+    fn remove_raw(&self, hash: &str) -> Result<bool> {
+        if !is_hash(hash) {
+            return Err(KioError::invalid_usage("invalid raw hash"));
+        }
+        self.remove_verified(ObjectKind::Raw, hash, |parent, leaf| {
+            bound_read_verified(parent, leaf, ObjectKind::Raw, hash, false).map(|_| ())
+        })
+    }
+
+    fn remove_chunk(&self, hash: &str) -> Result<bool> {
+        if !is_hash(hash) {
+            return Err(KioError::invalid_usage("invalid chunk hash"));
+        }
+        let (parent, leaf) = match self.chunk_fanout(hash, false) {
+            Ok(slot) => slot,
+            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        bound_remove_verified(&parent, &leaf, |parent, leaf| {
+            bound_read_chunk_accounted(parent, leaf, hash)
+                .map(|_| ())
+                .map_err(|error| error.error)
+        })
+    }
+
+    fn remove_embedding(&self, hash: &str) -> Result<bool> {
+        if !is_hash(hash) {
+            return Err(KioError::invalid_usage("invalid embedding hash"));
+        }
+        let (parent, leaf) = match self.content_fanout(ContentObjectKind::Embedding, hash, false) {
+            Ok(slot) => slot,
+            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        bound_remove_verified(&parent, &leaf, |parent, leaf| {
+            bound_read_embedding(parent, leaf, hash).map(|_| ())
+        })
+    }
+
+    fn remove_verified<F>(&self, kind: ObjectKind, hash: &str, verify: F) -> Result<bool>
+    where
+        F: Fn(&File, &str) -> Result<()>,
+    {
+        let (parent, leaf) = match self.fanout(kind, hash, false) {
+            Ok(slot) => slot,
+            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        bound_remove_verified(&parent, &leaf, verify)
+    }
+
+    fn embedding_hashes(&self) -> Result<Vec<String>> {
+        let mut retained = self.content_slot(ContentObjectKind::Embedding)?;
+        if retained.is_none() {
+            match bound_open_dir(&self.objects, ContentObjectKind::Embedding.directory()) {
+                Ok(directory) => *retained = Some(Arc::new(directory)),
+                Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
+                    return Ok(Vec::new());
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        let Some(base) = retained.as_ref() else {
+            return Ok(Vec::new());
+        };
+        bound_embedding_hashes(base)
+    }
+
+    fn inspect_content_object(
+        &self,
+        kind: ContentObjectKind,
+        hash: &str,
+    ) -> Result<StoredContentObjectMetadata> {
+        if !is_hash(hash) {
+            return Err(KioError::invalid_usage("invalid content object hash"));
+        }
+        let (parent, leaf) = self.content_fanout(kind, hash, false)?;
+        let size_bytes = bound_verify_content(&parent, &leaf, kind, hash)?;
+        Ok(StoredContentObjectMetadata {
+            kind,
+            hash: hash.to_owned(),
+            size_bytes,
+        })
+    }
+
+    fn inspect_content_accounted(
+        &self,
+        kind: ContentObjectKind,
+        hash: &str,
+    ) -> std::result::Result<StoredContentObjectMetadata, AccountedReadError> {
+        let (parent, leaf) =
+            self.content_fanout(kind, hash, false)
+                .map_err(|error| AccountedReadError {
+                    error,
+                    consumed_bytes: 0,
+                })?;
+        let (result, consumed_bytes) = bound_verify_content_accounted(&parent, &leaf, kind, hash);
+        let size_bytes = result.map_err(|error| AccountedReadError {
+            error,
+            consumed_bytes,
+        })?;
+        Ok(StoredContentObjectMetadata {
+            kind,
+            hash: hash.to_owned(),
+            size_bytes,
+        })
+    }
+
+    fn write_content_object(&self, kind: ContentObjectKind, bytes: &[u8]) -> Result<String> {
+        if bytes.len() as u64 > kind.max_bytes() {
+            return Err(content_object_size_error(
+                kind,
+                kind.max_bytes(),
+                bytes.len() as u64,
+            ));
+        }
+        let hash = hash_bytes(bytes);
+        let (parent, leaf) = self.content_fanout(kind, &hash, true)?;
+        match bound_read_content(&parent, &leaf, kind.max_bytes(), true) {
+            Ok((_, existing)) => {
+                if hash_bytes(&existing) == hash && existing == bytes {
+                    return Ok(hash);
+                }
+                return Err(corrupt_object_error(
+                    Path::new(&leaf),
+                    "CAS content bytes do not match existing object",
+                    &hash,
+                    Some(&hash_bytes(&existing)),
+                ));
+            }
+            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {}
+            Err(error) => return Err(error),
+        }
+        let (temp_name, mut temp) = bound_create_temp(&parent)?;
+        let result = (|| {
+            temp.write_all(bytes).kio_io(Path::new(&temp_name))?;
+            temp.sync_all().kio_io(Path::new(&temp_name))?;
+            drop(temp);
+            bound_publish_content(&parent, &temp_name, &leaf, kind, &hash, bytes)
+        })();
+        if result.is_err() {
+            let _ = bound_remove(&parent, &temp_name);
+        }
+        result.map(|()| hash)
+    }
+
+    fn read_content_object_bytes(
+        &self,
+        kind: ContentObjectKind,
+        hash: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        if !is_hash(hash) {
+            return Err(KioError::invalid_usage("invalid content object hash"));
+        }
+        let (parent, leaf) = self.content_fanout(kind, hash, false)?;
+        bound_read_content(&parent, &leaf, max_bytes, true).map(|(_, bytes)| bytes)
+    }
+
+    fn remove_content(&self, kind: ContentObjectKind, hash: &str) -> Result<bool> {
+        if !is_hash(hash) {
+            return Err(KioError::invalid_usage("invalid content object hash"));
+        }
+        let (parent, leaf) = match self.content_fanout(kind, hash, false) {
+            Ok(slot) => slot,
+            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        bound_remove_verified(&parent, &leaf, |parent, leaf| {
+            bound_verify_content(parent, leaf, kind, hash).map(|_| ())
+        })
     }
 
     fn read_object_with_size(&self, kind: ObjectKind, hash: &str) -> Result<(StoredObject, u64)> {
@@ -2050,12 +2705,7 @@ fn sync_bound_directory(directory: &File, label: &Path) -> Result<()> {
     use cap_primitives::fs::{self as cap_fs, MetadataExt};
 
     let expected = cap_fs::Metadata::from_file(directory).kio_io(label)?;
-    if !expected.is_dir() {
-        return Err(KioError::io(
-            "bound CAS directory changed type",
-            label.display().to_string(),
-        ));
-    }
+    ensure_bound_directory(directory, label)?;
     let mut options = cap_fs::OpenOptions::new();
     options
         .read(true)
@@ -2071,33 +2721,65 @@ fn sync_bound_directory(directory: &File, label: &Path) -> Result<()> {
     syncable.sync_all().kio_io(label)
 }
 
-#[cfg(unix)]
-fn bound_open_dir(parent: &File, leaf: &str) -> Result<File> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    let leaf = CString::new(leaf)
-        .map_err(|_| KioError::invalid_usage("invalid bound CAS directory name"))?;
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            leaf.as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let io = std::io::Error::last_os_error();
-        if io.kind() == std::io::ErrorKind::NotFound {
-            return Err(KioError::not_found(leaf.to_string_lossy().to_string()));
-        }
-        return Err(KioError::io(
-            io.to_string(),
-            leaf.to_string_lossy().to_string(),
-        ));
-    }
-    Ok(unsafe { File::from_raw_fd(fd) })
+/// Windows cannot flush a directory handle. The file body has already been
+/// flushed before publication; validate the retained capability instead of
+/// claiming POSIX directory-entry durability that Windows cannot provide.
+#[cfg(windows)]
+fn sync_bound_directory(directory: &File, label: &Path) -> Result<()> {
+    ensure_bound_directory(directory, label)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+fn ensure_bound_directory(directory: &File, label: &Path) -> Result<()> {
+    use cap_primitives::fs as cap_fs;
+
+    let metadata = cap_fs::Metadata::from_file(directory).kio_io(label)?;
+    if !metadata.is_dir() {
+        return Err(KioError::io(
+            "bound CAS directory changed type",
+            label.display().to_string(),
+        ));
+    }
+    #[cfg(windows)]
+    if windows_directory_handle_identity(directory).is_none() {
+        return Err(KioError::io(
+            "bound CAS directory is a reparse point or changed type",
+            label.display().to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn same_bound_directory(current: &File, retained: &File) -> Result<bool> {
+    ensure_bound_directory(current, Path::new("bound object layout"))?;
+    ensure_bound_directory(retained, Path::new("retained object layout"))?;
+    #[cfg(unix)]
+    {
+        use cap_primitives::fs::MetadataExt;
+        let current = cap_primitives::fs::Metadata::from_file(current)
+            .kio_io(Path::new("bound object layout"))?;
+        let retained = cap_primitives::fs::Metadata::from_file(retained)
+            .kio_io(Path::new("retained object layout"))?;
+        Ok(current.dev() == retained.dev() && current.ino() == retained.ino())
+    }
+    #[cfg(windows)]
+    {
+        return Ok(windows_directory_handle_identity(current)
+            == windows_directory_handle_identity(retained));
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn bound_open_dir(parent: &File, leaf: &str) -> Result<File> {
+    let name = bound_leaf(leaf, "directory")?;
+    let directory = cap_primitives::fs::open_dir_nofollow(parent, name)
+        .map_err(|error| bound_io_or_not_found(error, leaf))?;
+    ensure_bound_directory(&directory, Path::new(leaf))?;
+    Ok(directory)
+}
+
+#[cfg(any(unix, windows))]
 fn bound_ingest_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix(".ingest-") else {
         return false;
@@ -2110,7 +2792,7 @@ fn bound_ingest_name(name: &str) -> bool {
     }) && fields.next().is_none()
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn bound_stage_corrupt(message: &str) -> KioError {
     KioError::new(
         "KIO-E-STORE-CORRUPT-001",
@@ -2120,20 +2802,17 @@ fn bound_stage_corrupt(message: &str) -> KioError {
     )
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn bound_open_or_create_dir(parent: &File, leaf: &str, create: bool) -> Result<File> {
     match bound_open_dir(parent, leaf) {
         Ok(dir) => Ok(dir),
         Err(error) if create && error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
-            use std::ffi::CString;
-            use std::os::fd::AsRawFd;
-            let name = CString::new(leaf)
-                .map_err(|_| KioError::invalid_usage("invalid bound CAS directory name"))?;
-            if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-                let io = std::io::Error::last_os_error();
-                if io.kind() != std::io::ErrorKind::AlreadyExists {
-                    return Err(KioError::io(io.to_string(), leaf));
-                }
+            let name = bound_leaf(leaf, "directory")?;
+            let options = cap_primitives::fs::DirOptions::new();
+            if let Err(error) = cap_primitives::fs::create_dir(parent, name, &options)
+                && error.kind() != std::io::ErrorKind::AlreadyExists
+            {
+                return Err(KioError::io(error.to_string(), leaf));
             }
             bound_open_dir(parent, leaf)
         }
@@ -2141,74 +2820,220 @@ fn bound_open_or_create_dir(parent: &File, leaf: &str, create: bool) -> Result<F
     }
 }
 
-#[cfg(unix)]
-fn bound_read_regular(parent: &File, leaf: &str, max: u64) -> Result<(u64, Vec<u8>)> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    use std::os::unix::fs::MetadataExt;
-    let name = CString::new(leaf).map_err(|_| KioError::invalid_usage("invalid bound CAS leaf"))?;
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        let io = std::io::Error::last_os_error();
-        if io.kind() == std::io::ErrorKind::NotFound {
-            return Err(KioError::not_found(leaf));
+#[cfg(any(unix, windows))]
+fn bound_stream_regular(
+    parent: &File,
+    leaf: &str,
+    max: u64,
+    mut consume: impl FnMut(&[u8]) -> Result<()>,
+) -> (Result<u64>, u64) {
+    let mut consumed = 0_u64;
+    let result = (|| -> Result<u64> {
+        use cap_primitives::fs as cap_fs;
+        let name = bound_leaf(leaf, "object")?;
+        let label = Path::new(leaf);
+        let before = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
+            .map_err(|error| bound_io_or_not_found(error, leaf))?;
+        if !before.is_file() || !bound_metadata_single_link(&before) {
+            return Err(non_regular_object_error(label));
         }
-        return Err(KioError::io(io.to_string(), leaf));
-    }
-    let mut file = unsafe { File::from_raw_fd(fd) };
-    let meta = file.metadata().kio_io(Path::new(leaf))?;
-    if !meta.is_file() || meta.nlink() != 1 {
-        return Err(non_regular_object_error(Path::new(leaf)));
-    }
-    if meta.len() > max {
-        return Err(KioError::new(
-            "KIO-E-STORE-OBJECT-OVERSIZED-001",
-            "CAS object exceeds its byte limit",
-            serde_json::json!({"max_bytes": max, "actual_bytes": meta.len()}),
-            crate::ExitCode::PermanentFailure,
-        ));
-    }
-    let mut bytes = Vec::with_capacity(meta.len() as usize);
-    let mut buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
-    loop {
-        let remaining = max.saturating_add(1).saturating_sub(bytes.len() as u64);
-        if remaining == 0 {
-            break;
+        let mut options = cap_fs::OpenOptions::new();
+        options
+            .read(true)
+            ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+        #[cfg(unix)]
+        {
+            use cap_fs::OpenOptionsExt;
+            // A regular-file-to-FIFO race must not block a reader before its
+            // opened-handle check can reject the substituted object.
+            options.custom_flags(libc::O_NONBLOCK);
         }
-        let read_cap = remaining.min(CAS_STREAM_BUFFER_BYTES as u64) as usize;
-        let count = file.read(&mut buffer[..read_cap]).kio_io(Path::new(leaf))?;
-        if count == 0 {
-            break;
+        let mut file = cap_fs::open(parent, name, &options)
+            .map_err(|error| bound_io_or_not_found(error, leaf))?;
+        let opened = cap_fs::Metadata::from_file(&file).kio_io(label)?;
+        let named = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
+            .map_err(|error| bound_io_or_not_found(error, leaf))?;
+        if !opened.is_file()
+            || !named.is_file()
+            || !bound_metadata_single_link(&opened)
+            || !bound_metadata_single_link(&named)
+            || !same_bound_regular_entry(parent, name, &file, &before, &named)?
+        {
+            return Err(non_regular_object_error(label));
         }
-        charge_verified_cas_read(count as u64)?;
-        bytes.extend_from_slice(&buffer[..count]);
-    }
-    if bytes.len() as u64 > max {
-        return Err(KioError::new(
-            "KIO-E-STORE-OBJECT-OVERSIZED-001",
-            "CAS object exceeds its byte limit",
-            serde_json::json!({"max_bytes": max, "actual_bytes": bytes.len()}),
-            crate::ExitCode::PermanentFailure,
-        ));
-    }
-    if bytes.len() as u64 != meta.len() {
-        return Err(corrupt_object_error(
-            Path::new(leaf),
-            "CAS object changed while reading",
-            "stable",
-            None,
-        ));
-    }
-    Ok((meta.len(), bytes))
+        if opened.len() > max {
+            return Err(KioError::new(
+                "KIO-E-STORE-OBJECT-OVERSIZED-001",
+                "CAS object exceeds its byte limit",
+                serde_json::json!({"max_bytes":max,"actual_bytes":opened.len()}),
+                crate::ExitCode::PermanentFailure,
+            ));
+        }
+        let mut buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
+        loop {
+            let cap = max
+                .saturating_sub(consumed)
+                .saturating_add(1)
+                .min(buffer.len() as u64) as usize;
+            let count = file.read(&mut buffer[..cap]).kio_io(label)?;
+            if count == 0 {
+                break;
+            }
+            consumed = consumed
+                .checked_add(count as u64)
+                .ok_or_else(|| bound_stage_corrupt("CAS read byte count overflow"))?;
+            charge_verified_cas_read(count as u64)?;
+            if consumed > max {
+                return Err(KioError::new(
+                    "KIO-E-STORE-OBJECT-OVERSIZED-001",
+                    "CAS object exceeds its byte limit",
+                    serde_json::json!({"max_bytes":max,"actual_bytes":consumed}),
+                    crate::ExitCode::PermanentFailure,
+                ));
+            }
+            consume(&buffer[..count])?;
+        }
+        let finished = cap_fs::Metadata::from_file(&file).kio_io(label)?;
+        let named = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
+            .map_err(|error| bound_io_or_not_found(error, leaf))?;
+        if consumed != opened.len()
+            || finished.len() != opened.len()
+            || finished.modified().ok() != opened.modified().ok()
+            || !finished.is_file()
+            || !named.is_file()
+            || !bound_metadata_single_link(&finished)
+            || !bound_metadata_single_link(&named)
+            || !same_bound_regular_entry(parent, name, &file, &opened, &named)?
+        {
+            return Err(corrupt_object_error(
+                label,
+                "CAS object changed while reading",
+                "stable",
+                None,
+            ));
+        }
+        Ok(consumed)
+    })();
+    (result, consumed)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+fn bound_read_regular(parent: &File, leaf: &str, max: u64) -> Result<(u64, Vec<u8>)> {
+    let mut bytes = Vec::new();
+    let (result, _) = bound_stream_regular(parent, leaf, max, |part| {
+        bytes
+            .try_reserve(part.len())
+            .map_err(|_| bound_stage_corrupt("cannot allocate bounded CAS body"))?;
+        bytes.extend_from_slice(part);
+        Ok(())
+    });
+    result.map(|size| (size, bytes))
+}
+
+#[cfg(any(unix, windows))]
+fn bound_read_chunk_accounted(
+    parent: &File,
+    leaf: &str,
+    hash: &str,
+) -> std::result::Result<(ChunkObject, u64), AccountedReadError> {
+    let mut bytes = Vec::new();
+    let (result, consumed_bytes) =
+        bound_stream_regular(parent, leaf, MAX_CHUNK_OBJECT_BYTES, |part| {
+            bytes
+                .try_reserve(part.len())
+                .map_err(|_| chunk_size_error(u64::MAX))?;
+            bytes.extend_from_slice(part);
+            Ok(())
+        });
+    result
+        .and_then(|size| decode_chunk(&bytes, hash, Path::new(leaf)).map(|chunk| (chunk, size)))
+        .map_err(|error| AccountedReadError {
+            error,
+            consumed_bytes,
+        })
+}
+
+#[cfg(any(unix, windows))]
+fn bound_read_embedding(parent: &File, leaf: &str, hash: &str) -> Result<EmbeddingObject> {
+    let (_, bytes) = bound_read_regular(parent, leaf, MAX_EMBEDDING_OBJECT_BYTES)?;
+    decode_embedding(&bytes, hash, Path::new(leaf))
+}
+
+/// Semantic keys intentionally differ from a hash of serialized bytes. The
+/// caller validates that relationship; immutable publication compares the
+/// entire bounded object, including text/vector data outside the key.
+#[cfg(any(unix, windows))]
+fn bound_write_semantic(parent: &File, leaf: &str, bytes: &[u8], max: u64) -> Result<()> {
+    let verify = || -> Result<()> {
+        let (_, existing) = bound_read_regular(parent, leaf, max)?;
+        if existing != bytes {
+            return Err(bound_stage_corrupt(
+                "semantic CAS key already contains different bytes",
+            ));
+        }
+        Ok(())
+    };
+    match verify() {
+        Ok(()) => return Ok(()),
+        Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {}
+        Err(error) => return Err(error),
+    }
+    let (temp, mut file) = bound_create_temp(parent)?;
+    let result = (|| {
+        file.write_all(bytes).kio_io(Path::new(&temp))?;
+        file.sync_all().kio_io(Path::new(&temp))?;
+        drop(file);
+        match cap_primitives::fs::hard_link(parent, Path::new(&temp), parent, Path::new(leaf)) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(KioError::io(error.to_string(), leaf)),
+        }
+        bound_remove(parent, &temp)?;
+        sync_bound_directory(parent, Path::new(leaf))?;
+        verify()
+    })();
+    if result.is_err() {
+        let _ = bound_remove(parent, &temp);
+    }
+    result
+}
+
+#[cfg(any(unix, windows))]
+fn bound_read_verified_accounted(
+    parent: &File,
+    leaf: &str,
+    kind: ObjectKind,
+    hash: &str,
+    materialize: bool,
+) -> (Result<(u64, Vec<u8>)>, u64) {
+    let mut bytes = Vec::new();
+    let mut hasher = Sha256::new();
+    let (result, consumed) = bound_stream_regular(parent, leaf, kind.max_bytes(), |part| {
+        hasher.update(part);
+        if materialize {
+            bytes
+                .try_reserve(part.len())
+                .map_err(|_| bound_stage_corrupt("cannot allocate bounded CAS body"))?;
+            bytes.extend_from_slice(part);
+        }
+        Ok(())
+    });
+    let result = result.and_then(|size| {
+        let actual = format!("sha256:{}", lower_hex(&hasher.finalize()));
+        if actual != hash {
+            return Err(corrupt_object_error(
+                Path::new(leaf),
+                "CAS object hash does not match filename",
+                hash,
+                Some(&actual),
+            ));
+        }
+        Ok((size, bytes))
+    });
+    (result, consumed)
+}
+
+#[cfg(any(unix, windows))]
 fn bound_read_verified(
     parent: &File,
     leaf: &str,
@@ -2216,103 +3041,400 @@ fn bound_read_verified(
     hash: &str,
     materialize: bool,
 ) -> Result<(u64, Vec<u8>)> {
-    let (size, bytes) = bound_read_regular(parent, leaf, kind.max_bytes())?;
-    let actual = hash_bytes(&bytes);
-    if actual != hash {
-        return Err(corrupt_object_error(
-            Path::new(leaf),
-            "CAS object hash does not match filename",
-            hash,
-            Some(&actual),
-        ));
-    }
+    bound_read_verified_accounted(parent, leaf, kind, hash, materialize).0
+}
+
+/// Content namespaces use the same retained-parent, no-follow and identity
+/// checks as raw/tree/commit objects. The content byte hash is deliberately
+/// checked by `bound_verify_content`; bounded semantic reads only require a
+/// regular stable leaf, matching the public-path API contract.
+#[cfg(any(unix, windows))]
+fn bound_read_content(
+    parent: &File,
+    leaf: &str,
+    max: u64,
+    materialize: bool,
+) -> Result<(u64, Vec<u8>)> {
+    let (size, bytes) = bound_read_regular(parent, leaf, max)?;
     Ok((size, if materialize { bytes } else { Vec::new() }))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+fn bound_verify_content(
+    parent: &File,
+    leaf: &str,
+    kind: ContentObjectKind,
+    hash: &str,
+) -> Result<u64> {
+    bound_verify_content_accounted(parent, leaf, kind, hash).0
+}
+
+#[cfg(any(unix, windows))]
+fn bound_verify_content_accounted(
+    parent: &File,
+    leaf: &str,
+    kind: ContentObjectKind,
+    hash: &str,
+) -> (Result<u64>, u64) {
+    let mut hasher = Sha256::new();
+    let (result, consumed) = bound_stream_regular(parent, leaf, kind.max_bytes(), |part| {
+        hasher.update(part);
+        Ok(())
+    });
+    let result = result.and_then(|size| {
+        let actual = format!("sha256:{}", lower_hex(&hasher.finalize()));
+        if actual != hash {
+            return Err(corrupt_object_error(
+                Path::new(leaf),
+                "content object hash does not match filename",
+                hash,
+                Some(&actual),
+            ));
+        }
+        Ok(size)
+    });
+    (result, consumed)
+}
+
+#[cfg(any(unix, windows))]
 fn bound_create_temp(parent: &File) -> Result<(String, File)> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    for attempt in 0..128_u32 {
-        let name = format!(
-            ".kio-cas-{}-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos()),
-            attempt
-        );
-        let c = CString::new(name.as_str())
-            .map_err(|_| KioError::invalid_usage("invalid bound CAS temp name"))?;
-        let fd = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                c.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd >= 0 {
-            return Ok((name, unsafe { File::from_raw_fd(fd) }));
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(KioError::io(
-                std::io::Error::last_os_error().to_string(),
-                "bound CAS temp",
-            ));
-        }
-    }
-    Err(KioError::io(
-        "unable to allocate private bound CAS temp",
-        "bound CAS temp",
-    ))
+    bound_create_private_temp(parent, ".kio-cas", false, "bound CAS temp")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn bound_create_ingest_temp(parent: &File) -> Result<(String, File)> {
-    use std::ffi::CString;
-    use std::os::fd::{AsRawFd, FromRawFd};
-    for attempt in 0..128_u32 {
-        let name = format!(
-            ".ingest-{}-{}-{attempt}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_nanos())
-        );
-        let c = CString::new(name.as_str())
-            .map_err(|_| KioError::invalid_usage("invalid bound raw stage name"))?;
-        let fd = unsafe {
-            libc::openat(
-                parent.as_raw_fd(),
-                c.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd >= 0 {
-            return Ok((name, unsafe { File::from_raw_fd(fd) }));
-        }
-        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::AlreadyExists {
-            return Err(KioError::io(
-                std::io::Error::last_os_error().to_string(),
-                "bound raw stage",
-            ));
-        }
-    }
-    Err(KioError::io(
-        "could not allocate a private bound raw stage",
-        "bound raw stage",
-    ))
+    bound_create_private_temp(parent, ".ingest", true, "bound raw stage")
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn bound_remove(parent: &File, leaf: &str) -> Result<()> {
     cap_primitives::fs::remove_file(parent, Path::new(leaf))
         .map_err(|error| KioError::io(error.to_string(), leaf))
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
+fn bound_open_regular_handle(parent: &File, leaf: &str) -> Result<File> {
+    use cap_primitives::fs as cap_fs;
+    let name = bound_leaf(leaf, "object")?;
+    let before = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
+        .map_err(|error| bound_io_or_not_found(error, leaf))?;
+    if !before.is_file() || !bound_metadata_single_link(&before) {
+        return Err(non_regular_object_error(Path::new(leaf)));
+    }
+    let mut options = cap_fs::OpenOptions::new();
+    options
+        .read(true)
+        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file =
+        cap_fs::open(parent, name, &options).map_err(|error| bound_io_or_not_found(error, leaf))?;
+    let opened = cap_fs::Metadata::from_file(&file).kio_io(Path::new(leaf))?;
+    let after = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
+        .map_err(|error| bound_io_or_not_found(error, leaf))?;
+    if !opened.is_file()
+        || !after.is_file()
+        || !bound_metadata_single_link(&opened)
+        || !bound_metadata_single_link(&after)
+        || !same_bound_regular_entry(parent, name, &file, &before, &after)?
+    {
+        return Err(non_regular_object_error(Path::new(leaf)));
+    }
+    Ok(file)
+}
+
+#[cfg(any(unix, windows))]
+fn bound_hash_open_regular(file: &mut File, max: u64) -> Result<String> {
+    file.seek(std::io::SeekFrom::Start(0))
+        .map_err(|error| KioError::io(error.to_string(), "bound CAS repair source"))?;
+    let mut total = 0_u64;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
+    loop {
+        let cap = max
+            .saturating_sub(total)
+            .saturating_add(1)
+            .min(buffer.len() as u64) as usize;
+        let count = file
+            .read(&mut buffer[..cap])
+            .map_err(|error| KioError::io(error.to_string(), "bound CAS repair source"))?;
+        if count == 0 {
+            break;
+        }
+        total = total
+            .checked_add(count as u64)
+            .ok_or_else(|| bound_stage_corrupt("raw repair byte count overflow"))?;
+        if total > max {
+            return Err(object_size_error(ObjectKind::Raw, max, total));
+        }
+        charge_verified_cas_read(count as u64)?;
+        hasher.update(&buffer[..count]);
+    }
+    Ok(format!("sha256:{}", lower_hex(&hasher.finalize())))
+}
+
+#[cfg(any(unix, windows))]
+fn bound_quarantine_matches(parent: &File, quarantine: &str, source: &File) -> Result<bool> {
+    use cap_primitives::fs as cap_fs;
+    let mut options = cap_fs::OpenOptions::new();
+    options
+        .read(true)
+        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+    #[cfg(unix)]
+    {
+        use cap_fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let quarantined = cap_fs::open(parent, bound_leaf(quarantine, "quarantine")?, &options)
+        .map_err(|error| bound_io_or_not_found(error, quarantine))?;
+    #[cfg(unix)]
+    {
+        use cap_primitives::fs::MetadataExt;
+        let source = cap_fs::Metadata::from_file(source).kio_io(Path::new(quarantine))?;
+        let quarantined =
+            cap_fs::Metadata::from_file(&quarantined).kio_io(Path::new(quarantine))?;
+        Ok(source.is_file()
+            && quarantined.is_file()
+            && source.nlink() == 2
+            && quarantined.nlink() == 2
+            && source.dev() == quarantined.dev()
+            && source.ino() == quarantined.ino())
+    }
+    #[cfg(windows)]
+    {
+        Ok(same_windows_repair_quarantine_file_components(
+            windows_file_information(source),
+            windows_file_information(&quarantined),
+        ))
+    }
+}
+
+/// The explicit removal request supplies kind/hash authority for this one
+/// deterministic sibling. A retry must inspect it even when canonical is absent.
+/// No directory scan or legacy random-quarantine cleanup is authorized here.
+#[cfg(any(unix, windows))]
+fn bound_remove_verified<F>(parent: &File, leaf: &str, verify: F) -> Result<bool>
+where
+    F: Fn(&File, &str) -> Result<()>,
+{
+    use crate::durability::{DurabilityPoint, checkpoint};
+    use crate::store_dir::{Publication, StoreDirectory};
+
+    let directory = StoreDirectory::from_retained(
+        parent.try_clone().kio_io(Path::new(leaf))?,
+        PathBuf::from("CAS removal parent"),
+    )?;
+    let quarantine = format!(".kio-cas-remove-{leaf}");
+    let canonical_exists = directory.contains_entry(Path::new(leaf))?;
+    let quarantine_exists = directory.contains_entry(Path::new(&quarantine))?;
+    if canonical_exists && quarantine_exists {
+        return Err(bound_stage_corrupt(
+            "CAS removal canonical and quarantine both exist",
+        ));
+    }
+    if !canonical_exists && !quarantine_exists {
+        // Also close an interrupted post-unlink sync window on an absent retry.
+        directory.sync()?;
+        return Ok(false);
+    }
+    if canonical_exists {
+        verify(parent, leaf)?;
+        checkpoint(DurabilityPoint::CasRemoveReady)?;
+        // Single-link, no-replace atomic rename: never a second plaintext link.
+        directory.rename_regular_between_raw(
+            Path::new(leaf),
+            &directory,
+            Path::new(&quarantine),
+            Publication::CreateOnly,
+        )?;
+    }
+    directory.sync()?;
+    checkpoint(DurabilityPoint::CasRemoveQuarantined)?;
+    // Retained-parent verifiers reject links, unstable identities, and bytes
+    // not attributable to the explicitly authorized semantic CAS key.
+    verify(parent, &quarantine)?;
+    if directory.contains_entry(Path::new(leaf))? {
+        return Err(bound_stage_corrupt("CAS removal canonical reappeared"));
+    }
+    bound_remove(parent, &quarantine)?;
+    directory.sync()?;
+    checkpoint(DurabilityPoint::CasRemoveDeleted)?;
+    Ok(true)
+}
+
+#[cfg(any(unix, windows))]
+fn bound_visit_chunks(
+    base: &File,
+    visit: &mut impl FnMut(&str, &ChunkObject) -> Result<()>,
+) -> Result<()> {
+    bound_visit_chunks_with_limits(base, 100_000, 512 * 1024 * 1024, visit)
+}
+
+#[cfg(any(unix, windows))]
+fn bound_visit_chunks_with_limits(
+    base: &File,
+    max_entries: usize,
+    max_bytes: u64,
+    visit: &mut impl FnMut(&str, &ChunkObject) -> Result<()>,
+) -> Result<()> {
+    let mut entries = 0_usize;
+    let mut total_bytes = 0_u64;
+    let first_level = cap_primitives::fs::read_base_dir(base)
+        .map_err(|error| KioError::io(error.to_string(), "bound chunks directory"))?;
+    for first in first_level {
+        entries += 1;
+        if entries > max_entries {
+            return Err(bound_stage_corrupt("chunk inventory exceeds entry limit"));
+        }
+        let first =
+            first.map_err(|error| KioError::io(error.to_string(), "bound chunks directory"))?;
+        let first_name = first.file_name();
+        let first_name = first_name
+            .to_str()
+            .ok_or_else(|| bound_stage_corrupt("chunk fanout name is not UTF-8"))?;
+        if !canonical_digest_fragment(first_name, 2) {
+            return Err(bound_stage_corrupt("chunk fanout directory is malformed"));
+        }
+        let first_dir = bound_open_dir(base, first_name)?;
+        let second_level = cap_primitives::fs::read_base_dir(&first_dir)
+            .map_err(|error| KioError::io(error.to_string(), first_name))?;
+        for second in second_level {
+            entries += 1;
+            if entries > max_entries {
+                return Err(bound_stage_corrupt("chunk inventory exceeds entry limit"));
+            }
+            let second = second.map_err(|error| KioError::io(error.to_string(), first_name))?;
+            let second_name = second
+                .file_name()
+                .to_str()
+                .ok_or_else(|| bound_stage_corrupt("chunk fanout name is not UTF-8"))?
+                .to_owned();
+            if !canonical_digest_fragment(&second_name, 2) {
+                return Err(bound_stage_corrupt("chunk fanout directory is malformed"));
+            }
+            let second_dir = bound_open_dir(&first_dir, &second_name)?;
+            let leaves = cap_primitives::fs::read_base_dir(&second_dir)
+                .map_err(|error| KioError::io(error.to_string(), &second_name))?;
+            for leaf in leaves {
+                entries += 1;
+                if entries > max_entries {
+                    return Err(bound_stage_corrupt("chunk inventory exceeds entry limit"));
+                }
+                let leaf = leaf.map_err(|error| KioError::io(error.to_string(), &second_name))?;
+                let leaf_name = leaf
+                    .file_name()
+                    .to_str()
+                    .ok_or_else(|| bound_stage_corrupt("chunk leaf is not UTF-8"))?
+                    .to_owned();
+                let digest = format!("sha256:{leaf_name}");
+                if !is_hash(&digest)
+                    || !leaf_name.starts_with(first_name)
+                    || !leaf_name[2..].starts_with(&second_name)
+                {
+                    return Err(bound_stage_corrupt(
+                        "chunk leaf does not match canonical fanout",
+                    ));
+                }
+                let remaining = max_bytes.saturating_sub(total_bytes);
+                let (_, bytes) = bound_read_regular(
+                    &second_dir,
+                    &leaf_name,
+                    MAX_CHUNK_OBJECT_BYTES.min(remaining),
+                )?;
+                total_bytes += bytes.len() as u64;
+                let object = decode_chunk(&bytes, &digest, Path::new(&leaf_name))?;
+                visit(&digest, &object)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn bound_embedding_hashes(base: &File) -> Result<Vec<String>> {
+    const MAX_ENTRIES: usize = 100_000;
+    const MAX_BYTES: u64 = 512 * 1024 * 1024;
+    let mut hashes = Vec::new();
+    let mut total_bytes = 0_u64;
+    let first_level = cap_primitives::fs::read_base_dir(base)
+        .map_err(|error| KioError::io(error.to_string(), "bound embeddings directory"))?;
+    for first in first_level {
+        let first =
+            first.map_err(|error| KioError::io(error.to_string(), "bound embeddings directory"))?;
+        let first_name = first.file_name();
+        let first_name = first_name
+            .to_str()
+            .ok_or_else(|| bound_stage_corrupt("embedding fanout name is not UTF-8"))?;
+        if !canonical_digest_fragment(first_name, 2) {
+            return Err(bound_stage_corrupt(
+                "embedding fanout directory is malformed",
+            ));
+        }
+        let first_dir = bound_open_dir(base, first_name)?;
+        let second_level = cap_primitives::fs::read_base_dir(&first_dir)
+            .map_err(|error| KioError::io(error.to_string(), first_name))?;
+        for second in second_level {
+            let second = second.map_err(|error| KioError::io(error.to_string(), first_name))?;
+            let second_name = second
+                .file_name()
+                .to_str()
+                .ok_or_else(|| bound_stage_corrupt("embedding fanout name is not UTF-8"))?
+                .to_owned();
+            if !canonical_digest_fragment(&second_name, 2) {
+                return Err(bound_stage_corrupt(
+                    "embedding fanout directory is malformed",
+                ));
+            }
+            let second_dir = bound_open_dir(&first_dir, &second_name)?;
+            let leaves = cap_primitives::fs::read_base_dir(&second_dir)
+                .map_err(|error| KioError::io(error.to_string(), &second_name))?;
+            for leaf in leaves {
+                let leaf = leaf.map_err(|error| KioError::io(error.to_string(), &second_name))?;
+                let leaf_name = leaf
+                    .file_name()
+                    .to_str()
+                    .ok_or_else(|| bound_stage_corrupt("embedding leaf is not UTF-8"))?
+                    .to_owned();
+                let digest = format!("sha256:{leaf_name}");
+                if !is_hash(&digest)
+                    || !leaf_name.starts_with(first_name)
+                    || !leaf_name[2..].starts_with(&second_name)
+                {
+                    return Err(bound_stage_corrupt(
+                        "embedding leaf does not match canonical fanout",
+                    ));
+                }
+                let (_, bytes) =
+                    bound_read_regular(&second_dir, &leaf_name, MAX_EMBEDDING_OBJECT_BYTES)?;
+                total_bytes = total_bytes.checked_add(bytes.len() as u64).ok_or_else(|| {
+                    bound_stage_corrupt("embedding inventory byte count overflow")
+                })?;
+                if total_bytes > MAX_BYTES || hashes.len() >= MAX_ENTRIES {
+                    return Err(bound_stage_corrupt(
+                        "embedding inventory exceeds bounded entry or byte limit",
+                    ));
+                }
+                decode_embedding(&bytes, &digest, Path::new(&leaf_name))?;
+                hashes.push(digest);
+            }
+        }
+    }
+    hashes.sort();
+    Ok(hashes)
+}
+
+#[cfg(any(unix, windows))]
+fn canonical_digest_fragment(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value.bytes().all(|byte| {
+            byte.is_ascii_digit() || (byte.is_ascii_lowercase() && byte.is_ascii_hexdigit())
+        })
+}
+
+#[cfg(any(unix, windows))]
 fn bound_publish(
     parent: &File,
     temp: &str,
@@ -2325,8 +3447,8 @@ fn bound_publish(
     bound_publish_between(parent, temp, parent, leaf, kind, hash, size, expected)
 }
 
-#[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
+#[cfg(any(unix, windows))]
 fn bound_publish_between(
     from: &File,
     temp: &str,
@@ -2366,6 +3488,166 @@ fn bound_publish_between(
         ));
     }
     Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn bound_publish_content(
+    parent: &File,
+    temp: &str,
+    leaf: &str,
+    kind: ContentObjectKind,
+    hash: &str,
+    expected: &[u8],
+) -> Result<()> {
+    match cap_primitives::fs::hard_link(parent, Path::new(temp), parent, Path::new(leaf)) {
+        Ok(()) => {
+            bound_remove(parent, temp)?;
+            sync_bound_directory(parent, Path::new(leaf))?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let (_, existing) = bound_read_content(parent, leaf, kind.max_bytes(), true)?;
+            if hash_bytes(&existing) != hash || existing != expected {
+                return Err(corrupt_object_error(
+                    Path::new(leaf),
+                    "CAS content bytes do not match existing object",
+                    hash,
+                    Some(&hash_bytes(&existing)),
+                ));
+            }
+            bound_remove(parent, temp)?;
+        }
+        Err(error) => return Err(KioError::io(error.to_string(), leaf)),
+    }
+    let (actual_size, actual) = bound_read_content(parent, leaf, kind.max_bytes(), true)?;
+    if actual_size != expected.len() as u64 || hash_bytes(&actual) != hash || actual != expected {
+        return Err(corrupt_object_error(
+            Path::new(leaf),
+            "published CAS content changed",
+            hash,
+            Some(&hash_bytes(&actual)),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(unix, windows))]
+fn bound_leaf<'a>(leaf: &'a str, kind: &str) -> Result<&'a Path> {
+    let path = Path::new(leaf);
+    if !matches!(
+        path.components().next(),
+        Some(std::path::Component::Normal(_))
+    ) || path.components().count() != 1
+    {
+        return Err(KioError::invalid_usage(format!(
+            "invalid bound CAS {kind} name"
+        )));
+    }
+    Ok(path)
+}
+
+#[cfg(any(unix, windows))]
+fn bound_io_or_not_found(error: std::io::Error, leaf: &str) -> KioError {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        KioError::not_found(leaf)
+    } else {
+        KioError::io(error.to_string(), leaf)
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn bound_metadata_single_link(metadata: &cap_primitives::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        use cap_primitives::fs::MetadataExt;
+        metadata.nlink() == 1
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        // The Windows check is done against the opened handles below, where
+        // link count and reparse attributes are available by handle.
+        true
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn same_bound_regular_entry(
+    _parent: &File,
+    leaf: &Path,
+    opened: &File,
+    before: &cap_primitives::fs::Metadata,
+    after: &cap_primitives::fs::Metadata,
+) -> Result<bool> {
+    #[cfg(unix)]
+    {
+        use cap_primitives::fs::MetadataExt;
+        let opened = cap_primitives::fs::Metadata::from_file(opened)
+            .map_err(|error| KioError::io(error.to_string(), leaf.display().to_string()))?;
+        Ok(opened.dev() == before.dev()
+            && opened.ino() == before.ino()
+            && opened.dev() == after.dev()
+            && opened.ino() == after.ino())
+    }
+    #[cfg(windows)]
+    {
+        let _ = (before, after);
+        let mut options = cap_primitives::fs::OpenOptions::new();
+        options
+            .read(true)
+            ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
+        let verification = cap_primitives::fs::open(_parent, leaf, &options)
+            .map_err(|error| bound_io_or_not_found(error, &leaf.display().to_string()))?;
+        return Ok(same_windows_cas_file(opened, &verification));
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn bound_create_private_temp(
+    parent: &File,
+    prefix: &str,
+    read_write: bool,
+    label: &str,
+) -> Result<(String, File)> {
+    for attempt in 0..128_u32 {
+        let name = format!(
+            "{prefix}-{}-{}-{attempt}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |duration| duration.as_nanos()),
+        );
+        let path = bound_leaf(&name, "temporary leaf")?;
+        let mut options = cap_primitives::fs::OpenOptions::new();
+        options
+            .write(true)
+            .read(read_write)
+            .create_new(true)
+            ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
+        match cap_primitives::fs::open(parent, path, &options) {
+            Ok(file) => {
+                #[cfg(windows)]
+                let safe = windows_regular_file_handle_identity(&file).is_some();
+                #[cfg(unix)]
+                let safe = {
+                    let metadata = cap_primitives::fs::Metadata::from_file(&file)
+                        .map_err(|error| KioError::io(error.to_string(), label))?;
+                    metadata.is_file() && bound_metadata_single_link(&metadata)
+                };
+                if !safe {
+                    drop(file);
+                    let _ = bound_remove(parent, &name);
+                    return Err(non_regular_object_error(Path::new(label)));
+                }
+                return Ok((name, file));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(KioError::io(error.to_string(), label)),
+        }
+    }
+    Err(KioError::io(
+        "unable to allocate private bound CAS temporary file",
+        label,
+    ))
 }
 
 fn read_verified_object(
@@ -2741,55 +4023,84 @@ fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
-/// Remove one already-authorized CAS leaf without ever overwriting a quarantine
-/// name. Linking before unlink keeps a recoverable handle in the same directory;
-/// the post-unlink verification detects a source swap before final deletion.
-fn remove_verified_cas_path<F>(path: &Path, verify: F) -> Result<()>
-where
-    F: Fn(&Path) -> Result<()>,
-{
-    verify(path)?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| KioError::io("CAS path has no parent", path.display().to_string()))?;
-    let mut quarantine = None;
-    for attempt in 0..32_u8 {
-        let candidate = parent.join(format!(
-            ".purge-remove-{}-{}-{attempt}",
-            std::process::id(),
-            unix_nanos()
-        ));
-        match fs::hard_link(path, &candidate) {
-            Ok(()) => {
-                quarantine = Some(candidate);
-                break;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
+enum CasRemovalKind {
+    Raw,
+    Chunk,
+    Embedding,
+    Content(ContentObjectKind),
+}
+
+/// Ambient callers retain the validated parent and use exactly the same
+/// namespace-safe removal and semantic recovery as bound callers.
+fn remove_verified_cas_path(
+    kio: &Path,
+    path: &Path,
+    kind: CasRemovalKind,
+    hash: &str,
+) -> Result<bool> {
+    #[cfg(any(unix, windows))]
+    {
+        let parent_path = path
+            .parent()
+            .ok_or_else(|| KioError::io("CAS path has no parent", path.display().to_string()))?;
+        let leaf = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                KioError::io("CAS path has no UTF-8 leaf", path.display().to_string())
+            })?;
+        // The ambient prefix outside .kio keeps its existing OS path semantics
+        // (including relative paths and macOS /var aliases). Retain .kio with
+        // no-follow, then open every controlled ancestor through that handle.
+        let mut options = OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK);
         }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            };
+            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
+        }
+        let mut parent = options.open(kio).kio_io(kio)?;
+        ensure_bound_directory(&parent, kio)?;
+        let relative_parent = parent_path
+            .strip_prefix(kio)
+            .map_err(|_| KioError::invalid_usage("CAS removal parent escapes .kio"))?;
+        for component in relative_parent.components() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(KioError::invalid_usage("invalid CAS removal ancestor"));
+            };
+            let name = name
+                .to_str()
+                .ok_or_else(|| KioError::invalid_usage("invalid CAS removal ancestor"))?;
+            parent = bound_open_dir(&parent, name)?;
+        }
+        bound_remove_verified(&parent, leaf, |parent, candidate| match kind {
+            CasRemovalKind::Raw => {
+                bound_read_verified(parent, candidate, ObjectKind::Raw, hash, false).map(|_| ())
+            }
+            CasRemovalKind::Chunk => bound_read_chunk_accounted(parent, candidate, hash)
+                .map(|_| ())
+                .map_err(|error| error.error),
+            CasRemovalKind::Embedding => bound_read_embedding(parent, candidate, hash).map(|_| ()),
+            CasRemovalKind::Content(kind) => {
+                bound_verify_content(parent, candidate, kind, hash).map(|_| ())
+            }
+        })
     }
-    let quarantine = quarantine.ok_or_else(|| {
-        KioError::io(
-            "could not allocate CAS removal quarantine",
-            path.display().to_string(),
-        )
-    })?;
-    if let Err(error) = fs::remove_file(path) {
-        let _ = fs::remove_file(&quarantine);
-        return Err(KioError::io(error.to_string(), path.display().to_string()));
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (kio, path, kind, hash);
+        Err(KioError::invalid_usage(
+            "safe CAS removal is unsupported on this platform",
+        ))
     }
-    // Leave quarantined bytes in place on failure for retry/forensics. The
-    // logical leaf is already absent and the purge barrier keeps reads closed.
-    verify(&quarantine)?;
-    fs::remove_file(&quarantine).kio_io(&quarantine)?;
-    // R23-07: propagate. The leaf's *absence* is the result this function
-    // reports, and it is durable only once the parent entry is. Swallowing the
-    // failure let every `remove_*` caller answer `true` for a removal a crash
-    // could resurrect — the "markerless absence" window §3.5 exists to close,
-    // here in the object store rather than the purge journal. Retry is
-    // idempotent: an already-absent slot returns `false` before any mutation.
-    sync_directory(parent).kio_io(parent)?;
-    Ok(())
 }
 
 fn verify_existing_matches_file(
@@ -2830,28 +4141,22 @@ fn verify_existing_matches_file(
 }
 
 /// Read and fully verify the embedding object at one exact path. Path-scoped
-/// (rather than hash-scoped) so removal can re-verify the hard-linked
-/// quarantine copy `remove_verified_cas_path` makes, which lives beside the
-/// canonical leaf rather than at it.
+/// (rather than hash-scoped) so callers can verify an exact candidate without
+/// deriving a canonical pathname from its hash.
 fn read_embedding_path(path: &Path, expected_hash: &str) -> Result<EmbeddingObject> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|_| KioError::not_found(expected_hash))
-        .and_then(|metadata| {
-            if metadata.file_type().is_file() {
-                Ok(metadata)
-            } else {
-                Err(non_regular_object_error(path))
-            }
-        })?;
-    if metadata.len() > MAX_EMBEDDING_OBJECT_BYTES {
+    let bytes = read_bounded_regular_file(path, MAX_EMBEDDING_OBJECT_BYTES)?;
+    decode_embedding(&bytes, expected_hash, path)
+}
+
+fn decode_embedding(bytes: &[u8], expected_hash: &str, path: &Path) -> Result<EmbeddingObject> {
+    let object = EmbeddingObject::from_bytes(bytes)
+        .map_err(|error| embedding_corrupt_error(error.message(), Some(path)))?;
+    if object.to_bytes()? != bytes {
         return Err(embedding_corrupt_error(
-            "embedding object exceeds its byte limit",
+            "embedding object bytes are not canonical",
             Some(path),
         ));
     }
-    let bytes = fs::read(path).kio_io(path)?;
-    let object = EmbeddingObject::from_bytes(&bytes)
-        .map_err(|error| embedding_corrupt_error(error.message(), Some(path)))?;
     if object.identity_hash()? != expected_hash {
         return Err(embedding_corrupt_error(
             "embedding object identity does not match its storage key",
@@ -2898,29 +4203,34 @@ fn read_chunk_path_accounted(
         if consumed > MAX_CHUNK_OBJECT_BYTES {
             return Err(chunk_size_error(consumed));
         }
-        let object: ChunkObject = serde_json::from_slice(&bytes)
-            .map_err(|_| chunk_corrupt_error("chunk object schema is invalid", Some(path)))?;
-        object
-            .validate()
-            .map_err(|_| chunk_corrupt_error("chunk object semantics are invalid", Some(path)))?;
-        if object.identity_hash()? != expected_hash {
-            return Err(chunk_corrupt_error(
-                "chunk semantic identity does not match its fan-out key",
-                Some(path),
-            ));
-        }
-        let canonical = canonical_json_bytes(
-            &serde_json::to_value(&object).map_err(|error| KioError::schema(error.to_string()))?,
-        )?;
-        if canonical != bytes {
-            return Err(chunk_corrupt_error(
-                "chunk object is not canonical JSON",
-                Some(path),
-            ));
-        }
+        let object = decode_chunk(&bytes, expected_hash, path)?;
         Ok((object, bytes))
     })();
     (result, consumed)
+}
+
+fn decode_chunk(bytes: &[u8], expected_hash: &str, path: &Path) -> Result<ChunkObject> {
+    let object: ChunkObject = serde_json::from_slice(bytes)
+        .map_err(|_| chunk_corrupt_error("chunk object schema is invalid", Some(path)))?;
+    object
+        .validate()
+        .map_err(|_| chunk_corrupt_error("chunk object semantics are invalid", Some(path)))?;
+    if object.identity_hash()? != expected_hash {
+        return Err(chunk_corrupt_error(
+            "chunk semantic identity does not match its fan-out key",
+            Some(path),
+        ));
+    }
+    let canonical = canonical_json_bytes(
+        &serde_json::to_value(&object).map_err(|error| KioError::schema(error.to_string()))?,
+    )?;
+    if canonical != bytes {
+        return Err(chunk_corrupt_error(
+            "chunk object is not canonical JSON",
+            Some(path),
+        ));
+    }
+    Ok(object)
 }
 
 fn create_private_temp(parent: &Path) -> Result<(PathBuf, File)> {
@@ -3304,13 +4614,22 @@ pub struct WindowsDirectoryIdentity {
 
 /// Stable identity of a real, non-reparse, single-link Windows regular file.
 ///
-/// The representation is intentionally opaque so it is only used for
-/// within-operation path binding, never as a persisted identifier.
+/// The public representation is opaque. Core may encode its numeric components
+/// only in an explicitly versioned local recovery intent.
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowsRegularFileIdentity {
     volume_serial_number: u32,
     file_index: u64,
+}
+
+#[cfg(windows)]
+impl WindowsRegularFileIdentity {
+    /// Components for the core's versioned, local atomic recovery intent.
+    /// External callers still treat this identity as an opaque observation.
+    pub(crate) const fn atomic_recovery_components(self) -> (u32, u64) {
+        (self.volume_serial_number, self.file_index)
+    }
 }
 
 #[cfg(test)]
@@ -3813,56 +5132,6 @@ fn occupied_slot(path: PathBuf) -> Result<Option<PathBuf>> {
     }
 }
 
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| KioError::io("path has no parent", path.display().to_string()))?;
-    fs::create_dir_all(parent).kio_io(parent)?;
-
-    if path.exists() {
-        return Ok(());
-    }
-
-    let temp = parent.join(format!(".tmp-{}-{}", std::process::id(), unix_nanos()));
-    // R9-8: drop the temp on any write/sync/rename failure so an ENOSPC/EIO error
-    // never leaves an orphan `.tmp-*` in the CAS fanout dir (there is no GC before
-    // Step 4, and such residue also feeds R9-5's junk-in-gen-dir failure). Same
-    // cleanup idiom as `atomic_overwrite` below and the `markdownize.rs`/`main.rs`
-    // writers.
-    let result = (|| -> Result<()> {
-        let mut file = File::create(&temp).kio_io(&temp)?;
-        file.write_all(bytes).kio_io(&temp)?;
-        file.sync_all().kio_io(&temp)?;
-        drop(file);
-        fs::rename(&temp, path).kio_io(path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
-}
-
-pub(crate) fn atomic_overwrite(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| KioError::io("path has no parent", path.display().to_string()))?;
-    fs::create_dir_all(parent).kio_io(parent)?;
-    let temp = parent.join(format!(".tmp-{}-{}", std::process::id(), unix_nanos()));
-    // R9-8: see `atomic_write` — remove the temp on any failure so a torn write
-    // does not leave an orphan `.tmp-*` behind.
-    let result = (|| -> Result<()> {
-        let mut file = File::create(&temp).kio_io(&temp)?;
-        file.write_all(bytes).kio_io(&temp)?;
-        file.sync_all().kio_io(&temp)?;
-        drop(file);
-        fs::rename(&temp, path).kio_io(path)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
-}
-
 pub(crate) fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
     let parent = path
         .parent()
@@ -4292,34 +5561,6 @@ mod tests {
     }
 
     #[test]
-    fn atomic_overwrite_removes_temp_on_rename_failure() {
-        // R9-8: `atomic_overwrite` (and its twin `atomic_write`, which shares this
-        // cleanup idiom) must remove its temp on any failure so an ENOSPC/EIO error
-        // never leaves an orphan `.tmp-*` in the CAS fanout dir. Force the rename to
-        // fail deterministically by making the destination an existing directory
-        // (`rename(file, dir)` → EISDIR) after the temp is created + fsynced.
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("target");
-        fs::create_dir(&dest).unwrap();
-        let result = atomic_overwrite(&dest, b"payload");
-        assert!(result.is_err(), "overwrite onto a directory must fail");
-        assert!(
-            stray_temp_files(dir.path()).is_empty(),
-            "R9-8: temp must be cleaned up on failure, found {:?}",
-            stray_temp_files(dir.path())
-        );
-    }
-
-    #[test]
-    fn atomic_overwrite_succeeds_and_leaves_no_temp() {
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("obj");
-        atomic_overwrite(&dest, b"hello").unwrap();
-        assert_eq!(fs::read(&dest).unwrap(), b"hello");
-        assert!(stray_temp_files(dir.path()).is_empty());
-    }
-
-    #[test]
     fn cand_043_existing_cas_slot_must_match_exact_bytes() {
         let (_dir, store) = object_store();
         let expected = b"expected payload";
@@ -4406,7 +5647,7 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-OBJECT-OVERSIZED-001");
-        let raw_base = store.kio_dir.join("objects/raw");
+        let raw_base = store.ambient_kio_dir().unwrap().join("objects/raw");
         assert!(stray_temp_files(&raw_base).is_empty());
     }
 
@@ -4490,6 +5731,105 @@ mod tests {
             text_hash: hash_bytes(text.as_bytes()),
             text: text.to_owned(),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn purge_chunk_inventory_enforces_entry_and_aggregate_read_budgets() {
+        let (dir, store) = object_store();
+        let first = chunk_object("first inventory text");
+        let first_id = store.write_chunk(&first).unwrap();
+        let mut second = chunk_object("second inventory text");
+        second.unit_key = "page:13".to_owned();
+        let second_id = store.write_chunk(&second).unwrap();
+        let first_path = store.chunk_path(&first_id).unwrap();
+        let second_path = store.chunk_path(&second_id).unwrap();
+        let total =
+            fs::metadata(&first_path).unwrap().len() + fs::metadata(&second_path).unwrap().len();
+        let base = File::open(dir.path().join(".kio/objects/chunks")).unwrap();
+        let mut seen = 0;
+        bound_visit_chunks_with_limits(&base, 100, total, &mut |_, _| {
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 2);
+        let mut seen = 0;
+        let error = bound_visit_chunks_with_limits(&base, 2, total, &mut |_, _| {
+            seen += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
+        assert_eq!(seen, 0, "fanout directories count before the first leaf");
+        let mut seen = 0;
+        let error = bound_visit_chunks_with_limits(&base, 100, total - 1, &mut |_, _| {
+            seen += 1;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-OBJECT-OVERSIZED-001");
+        assert_eq!(
+            seen, 1,
+            "the remaining budget prevents reading the second body"
+        );
+        let unknown = first_path
+            .parent()
+            .unwrap()
+            .join(".kio-cas-remove-unattributed");
+        fs::write(&unknown, b"unknown plaintext").unwrap();
+        assert!(bound_visit_chunks_with_limits(&base, 100, total, &mut |_, _| Ok(())).is_err());
+        assert_eq!(fs::read(&unknown).unwrap(), b"unknown plaintext");
+        assert!(first_path.exists() && second_path.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn bound_semantic_objects_preserve_identity_and_retained_namespace_after_replacement() {
+        let fixture = tempfile::tempdir().unwrap();
+        let kio = fixture.path().join(".kio");
+        for kind in ["raw", "trees", "commits"] {
+            fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+        }
+        let handle =
+            cap_primitives::fs::open_ambient_dir(&kio, cap_primitives::ambient_authority())
+                .unwrap();
+        let bound = ObjectStore::from_bound_kio(&handle).unwrap();
+        let chunk = chunk_object("retained semantic text");
+        let chunk_hash = bound.write_chunk(&chunk).unwrap();
+        let embedding = embedding_object(vec![1.0, 0.0]);
+        let embedding_hash = bound.write_embedding(&embedding).unwrap();
+        assert_ne!(
+            chunk_hash,
+            hash_bytes(&canonical_json_bytes(&serde_json::to_value(&chunk).unwrap()).unwrap())
+        );
+        assert_ne!(embedding_hash, hash_bytes(&embedding.to_bytes().unwrap()));
+        assert!(bound.object_path(ObjectKind::Raw, &chunk_hash).is_err());
+        assert!(bound.chunk_path(&chunk_hash).is_err());
+        assert!(bound.embedding_path(&embedding_hash).is_err());
+
+        let parked = fixture.path().join("retained");
+        fs::rename(&kio, &parked).unwrap();
+        fs::create_dir(&kio).unwrap();
+        assert_eq!(bound.read_chunk(&chunk_hash).unwrap(), chunk);
+        assert_eq!(bound.read_embedding(&embedding_hash).unwrap(), embedding);
+        assert_eq!(bound.write_chunk(&chunk).unwrap(), chunk_hash);
+        assert_eq!(bound.write_embedding(&embedding).unwrap(), embedding_hash);
+        let mut inconsistent = embedding.clone();
+        inconsistent.vector = vec![0.0, 1.0];
+        assert!(bound.write_embedding(&inconsistent).is_err());
+        assert_eq!(bound.read_embedding(&embedding_hash).unwrap(), embedding);
+
+        let plain = ObjectStore::new(&parked);
+        let bytes = fs::read(plain.chunk_path(&chunk_hash).unwrap()).unwrap();
+        fs::write(
+            plain.chunk_path(&chunk_hash).unwrap(),
+            vec![b'x'; bytes.len()],
+        )
+        .unwrap();
+        let error = bound.read_chunk_accounted(&chunk_hash).unwrap_err();
+        assert_eq!(error.consumed_bytes, bytes.len() as u64);
+        assert_eq!(fs::read_dir(&kio).unwrap().count(), 0);
     }
 
     #[test]
@@ -4842,5 +6182,116 @@ mod tests {
             store.read_object(ObjectKind::Raw, &hash).unwrap().bytes,
             bytes
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_store_does_not_create_missing_content_namespaces_until_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let kio = dir.path().join(".kio");
+        let objects = kio.join("objects");
+        for kind in ["raw", "trees", "commits"] {
+            fs::create_dir_all(objects.join(kind)).unwrap();
+        }
+        let kio_handle = File::open(&kio).unwrap();
+        let store = ObjectStore::from_bound_kio(&kio_handle).unwrap();
+        let mut names: Vec<_> = fs::read_dir(&objects)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["commits", "raw", "trees"]);
+
+        let hash = store
+            .write_content_object(ContentObjectKind::Toollock, b"bound lazy tool lock")
+            .unwrap();
+        assert!(
+            objects
+                .join(ContentObjectKind::Toollock.directory())
+                .is_dir()
+        );
+        assert_eq!(
+            store
+                .read_content_object_bytes(ContentObjectKind::Toollock, &hash, 1024)
+                .unwrap(),
+            b"bound lazy tool lock"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bound_store_keeps_every_content_namespace_inside_retained_parents_after_path_swap() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let kio = dir.path().join(".kio");
+        let objects = kio.join("objects");
+        for kind in ["raw", "trees", "commits"] {
+            fs::create_dir_all(objects.join(kind)).unwrap();
+        }
+        let plain = ObjectStore::new(&kio);
+        let kinds = [
+            ContentObjectKind::Prepared,
+            ContentObjectKind::Image,
+            ContentObjectKind::Embedding,
+            ContentObjectKind::Manifest,
+            ContentObjectKind::Toollock,
+            ContentObjectKind::NormalizedUnit,
+        ];
+        let old: Vec<_> = kinds
+            .iter()
+            .map(|kind| {
+                let bytes = format!("retained {} content", kind.object_type()).into_bytes();
+                let hash = plain.write_content_object(*kind, &bytes).unwrap();
+                (*kind, hash, bytes)
+            })
+            .collect();
+        let kio_handle = File::open(&kio).unwrap();
+        let store = ObjectStore::from_bound_kio(&kio_handle).unwrap();
+
+        let victim = tempfile::tempdir().unwrap();
+        for kind in kinds {
+            let public = objects.join(kind.directory());
+            fs::rename(
+                &public,
+                objects.join(format!("{}-retained", kind.directory())),
+            )
+            .unwrap();
+            symlink(victim.path(), public).unwrap();
+        }
+
+        for (kind, old_hash, old_bytes) in old {
+            assert_eq!(
+                store
+                    .read_content_object_bytes(kind, &old_hash, old_bytes.len() as u64)
+                    .unwrap(),
+                old_bytes
+            );
+            assert_eq!(
+                store
+                    .inspect_content_object(kind, &old_hash)
+                    .unwrap()
+                    .size_bytes,
+                old_bytes.len() as u64
+            );
+
+            let new_bytes = format!("new retained {} content", kind.object_type()).into_bytes();
+            let new_hash = store.write_content_object(kind, &new_bytes).unwrap();
+            assert_eq!(
+                store
+                    .read_content_object_bytes(kind, &new_hash, new_bytes.len() as u64)
+                    .unwrap(),
+                new_bytes
+            );
+            let digest = hash_path_component(&new_hash).unwrap();
+            let retained_leaf = objects
+                .join(format!("{}-retained", kind.directory()))
+                .join(&digest[..2])
+                .join(&digest[2..4])
+                .join(digest);
+            assert_eq!(fs::read(retained_leaf).unwrap(), new_bytes);
+            assert!(store.content_path(kind, &new_hash).is_err());
+        }
+        assert!(fs::read_dir(victim.path()).unwrap().next().is_none());
     }
 }

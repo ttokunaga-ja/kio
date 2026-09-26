@@ -1,9 +1,11 @@
 //! Adapter request and response contracts.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::{AdapterError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -238,6 +240,10 @@ pub struct MarkdownUnit {
     pub unit_key: String,
     pub unit_type: UnitKind,
     pub markdown: String,
+    /// Image CAS objects this adapter actually decoded and persisted for this
+    /// unit. Provider markdown and metadata are untrusted descriptions and
+    /// must never be used to infer this set.
+    pub owned_image_hashes: BTreeSet<String>,
     pub metadata: BTreeMap<String, Value>,
 }
 
@@ -336,12 +342,87 @@ pub enum EmbeddingInputType {
     Query,
 }
 
+/// Maximum source bytes accepted for one embedding item.
+///
+/// This matches Gemini Batch's conservative inline body ceiling.  Local image
+/// payloads are checked against it before the adapter allocates their base64
+/// representation.
+pub const MAX_EMBEDDING_ITEM_BYTES: usize = 16 * 1024 * 1024;
+
+/// Maximum source bytes accepted across one embedding request.
+pub const MAX_EMBEDDING_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EmbeddingContent {
+    Text { text: String },
+    Image { bytes: Vec<u8>, mime: String },
+}
+
+impl std::fmt::Debug for EmbeddingContent {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text { text } => formatter.debug_struct("Text").field("text", text).finish(),
+            Self::Image { bytes, mime } => formatter
+                .debug_struct("Image")
+                .field("bytes_len", &bytes.len())
+                .field("mime", mime)
+                .finish(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingItem {
     pub id: String,
-    pub text: Option<String>,
-    pub path: Option<String>,
-    pub mime: Option<String>,
+    pub content: EmbeddingContent,
+}
+
+impl EmbeddingItem {
+    #[must_use]
+    pub fn text(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            content: EmbeddingContent::Text { text: text.into() },
+        }
+    }
+
+    #[must_use]
+    pub fn payload_len(&self) -> usize {
+        match &self.content {
+            EmbeddingContent::Text { text } => text.len(),
+            EmbeddingContent::Image { bytes, .. } => bytes.len(),
+        }
+    }
+}
+
+/// Reject payloads before an adapter constructs a wire representation.
+///
+/// In particular, local image embedding performs this check before base64
+/// allocation.  The payload count deliberately excludes opaque IDs and MIME
+/// labels: it bounds source content rather than caller metadata.
+pub fn validate_embedding_request_bytes(request: &EmbeddingRequest) -> Result<()> {
+    let mut total = 0_usize;
+    for item in &request.items {
+        let bytes = item.payload_len();
+        if bytes > MAX_EMBEDDING_ITEM_BYTES {
+            return Err(AdapterError::ContractViolation(format!(
+                "embedding item `{}` is {bytes} bytes, over the {MAX_EMBEDDING_ITEM_BYTES} byte limit",
+                item.id
+            )));
+        }
+        total = total.checked_add(bytes).ok_or_else(|| {
+            AdapterError::ContractViolation(
+                "embedding request payload length overflowed".to_owned(),
+            )
+        })?;
+        if total > MAX_EMBEDDING_REQUEST_BYTES {
+            return Err(AdapterError::ContractViolation(format!(
+                "embedding request is {total} bytes, over the {MAX_EMBEDDING_REQUEST_BYTES} byte limit"
+            )));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -496,6 +577,61 @@ mod tests {
         let value = serde_json::to_value(request).expect("serialize markdownize request");
         assert_eq!(value["mode"], "incremental");
         assert_eq!(value["bbox_annotation_enabled"], true);
+    }
+
+    #[test]
+    fn embedding_content_is_strictly_tagged_and_rejects_legacy_path_payloads() {
+        let item = EmbeddingItem::text("chunk", "hello");
+        let value = serde_json::to_value(item).unwrap();
+        assert_eq!(value["content"]["kind"], "text");
+        assert!(
+            serde_json::from_value::<EmbeddingItem>(serde_json::json!({
+                "id": "image",
+                "text": null,
+                "path": "/ambient/cas/object",
+                "mime": "image/png"
+            }))
+            .is_err()
+        );
+        assert!(
+            serde_json::from_value::<EmbeddingItem>(serde_json::json!({
+                "id": "image",
+                "content": { "kind": "image", "text": "ambiguous" }
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn embedding_payload_caps_reject_item_and_aggregate_overflow() {
+        let oversized = EmbeddingRequest {
+            input_type: EmbeddingInputType::ImageObject,
+            items: vec![EmbeddingItem {
+                id: "large".to_owned(),
+                content: EmbeddingContent::Image {
+                    bytes: vec![0; MAX_EMBEDDING_ITEM_BYTES + 1],
+                    mime: "image/png".to_owned(),
+                },
+            }],
+            idempotency_token: None,
+        };
+        assert!(validate_embedding_request_bytes(&oversized).is_err());
+
+        let half = MAX_EMBEDDING_REQUEST_BYTES / 2 + 1;
+        let aggregate = EmbeddingRequest {
+            input_type: EmbeddingInputType::ImageObject,
+            items: (0..2)
+                .map(|index| EmbeddingItem {
+                    id: index.to_string(),
+                    content: EmbeddingContent::Image {
+                        bytes: vec![0; half],
+                        mime: "image/png".to_owned(),
+                    },
+                })
+                .collect(),
+            idempotency_token: None,
+        };
+        assert!(validate_embedding_request_bytes(&aggregate).is_err());
     }
 
     #[test]

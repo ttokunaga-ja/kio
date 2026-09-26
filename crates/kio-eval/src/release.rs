@@ -22,6 +22,8 @@ use tar::{Archive, Builder, Header};
 use tempfile::TempDir;
 use thiserror::Error;
 
+use crate::acceptance_environment::IsolatedChildEnvironment;
+
 /// Package metadata is the sole version authority; this tool never carries a
 /// second release-version literal.
 pub const RC_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -822,17 +824,14 @@ pub fn smoke_candidate(options: &SmokeCandidateOptions) -> Result<SmokeSummary, 
         .join(binary_name_for_target(&verified.binding.target));
     let isolated = options.work_dir.join("isolated");
     fs::create_dir_all(&isolated)?;
-    for name in ["xdg-config", "xdg-cache", "tmp", "appdata", "localappdata"] {
+    for name in ["xdg-config", "xdg-data", "xdg-cache", "tmp"] {
         fs::create_dir_all(isolated.join(name))?;
     }
     let scope = isolated.join("manual-scope");
     fs::create_dir_all(&scope)?;
     fs::write(scope.join("release-smoke.txt"), b"release smoke marker\n")?;
     let mut base = Command::new(&binary);
-    base.env("HOME", &isolated)
-        .env("XDG_CONFIG_HOME", isolated.join("xdg-config"))
-        .env("XDG_CACHE_HOME", isolated.join("xdg-cache"))
-        .env("TMPDIR", isolated.join("tmp"));
+    smoke_env(&mut base, &isolated)?;
     let version = base.arg("--version").output()?;
     if !version.status.success()
         || !String::from_utf8_lossy(&version.stdout).contains(&verified.binding.version)
@@ -1527,6 +1526,247 @@ fn workspace_version(repo: &Path) -> Result<String, ReleaseError> {
         .map(str::to_owned)
         .ok_or_else(|| ReleaseError::Invalid("workspace.package.version missing".into()))
 }
+/// A reviewed Apple SDK release identity, not a digest of every SDK file.
+/// Ambient SDKROOT/DEVELOPER_DIR never choose candidate build inputs.
+struct MacosSdk {
+    root: PathBuf,
+}
+
+impl MacosSdk {
+    #[cfg(target_os = "macos")]
+    fn resolve() -> Result<Self, ReleaseError> {
+        let query = |flag| {
+            sdk_tool_output(
+                &mut sdk_tool_command(
+                    "/usr/bin/xcrun",
+                    &["--no-cache", "--sdk", "macosx26.5", flag],
+                ),
+                None,
+            )
+        };
+        let root_text = query("--show-sdk-path")?;
+        let root = PathBuf::from(root_text.trim());
+        if !root.is_absolute() || root_text.trim().contains(['\n', '\r', '\0']) {
+            return Err(ReleaseError::Invalid(
+                "SDK discovery returned an invalid path".into(),
+            ));
+        }
+        let root = root.canonicalize()?;
+        if !recognized_macos_sdk_root(&root) {
+            return Err(ReleaseError::Invalid(
+                "SDK is not in a recognized Apple installation".into(),
+            ));
+        }
+        validate_sdk_path(&root, true)?;
+        let version = query("--show-sdk-version")?;
+        let build = query("--show-sdk-build-version")?;
+        let settings_path = root.join("SDKSettings.json");
+        let system_path = root.join("System/Library/CoreServices/SystemVersion.plist");
+        validate_sdk_path(&settings_path, false)?;
+        validate_sdk_path(&system_path, false)?;
+        let settings = bounded_bytes(&settings_path, 64 * 1024)?;
+        let system = bounded_bytes(&system_path, 64 * 1024)?;
+        let system_json = sdk_tool_output(
+            &mut sdk_tool_command("/usr/bin/plutil", &["-convert", "json", "-o", "-", "-"]),
+            Some(system),
+        )?;
+        validate_macos_sdk_metadata(
+            version.trim(),
+            build.trim(),
+            &settings,
+            system_json.as_bytes(),
+        )?;
+        // Recheck the protected installation after discovery/metadata parsing.
+        validate_sdk_path(&settings_path, false)?;
+        validate_sdk_path(&system_path, false)?;
+        Ok(Self { root })
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn resolve() -> Result<Self, ReleaseError> {
+        Err(ReleaseError::Invalid(
+            "macOS candidate builds require the pinned installed Apple SDK".into(),
+        ))
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn sdk_tool_command(program: &str, args: &[&str]) -> Command {
+    let mut command = Command::new(program);
+    clean_sdk_tool_environment(&mut command);
+    command.current_dir("/").args(args);
+    command
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn clean_sdk_tool_environment(command: &mut Command) {
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin");
+}
+
+#[cfg(target_os = "macos")]
+fn sdk_tool_output(command: &mut Command, input: Option<Vec<u8>>) -> Result<String, ReleaseError> {
+    let output = kio_process::run_bounded_command(
+        command,
+        kio_process::BoundedProcessOptions {
+            timeout: std::time::Duration::from_secs(15),
+            max_stdout_bytes: 64 * 1024,
+            max_stderr_bytes: 4096,
+        },
+        input.map(|bytes| kio_process::BoundedStdin::new(bytes, 64 * 1024)),
+    )
+    .map_err(|error| ReleaseError::Invalid(format!("SDK discovery failed: {error}")))?;
+    if !output.status.success() {
+        return Err(ReleaseError::Invalid(format!(
+            "SDK discovery failed: {}",
+            output.stderr.trim()
+        )));
+    }
+    Ok(output.stdout)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn recognized_macos_sdk_root(root: &Path) -> bool {
+    let Some(text) = root.to_str() else {
+        return false;
+    };
+    if text == "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk" {
+        return true;
+    }
+    let parts: Vec<_> = text.split('/').collect();
+    parts.len() == 10
+        && parts[0].is_empty()
+        && parts[1] == "Applications"
+        && parts[2].starts_with("Xcode")
+        && parts[2].ends_with(".app")
+        && parts[2]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        && parts[3..9]
+            == [
+                "Contents",
+                "Developer",
+                "Platforms",
+                "MacOSX.platform",
+                "Developer",
+                "SDKs",
+            ]
+        && matches!(parts[9], "MacOSX.sdk" | "MacOSX26.5.sdk")
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn validate_macos_sdk_metadata(
+    version: &str,
+    build: &str,
+    settings: &[u8],
+    system: &[u8],
+) -> Result<(), ReleaseError> {
+    let settings: Value = serde_json::from_slice(settings)?;
+    let system: Value = serde_json::from_slice(system)?;
+    if version != "26.5"
+        || build != "25F70"
+        || settings.get("CanonicalName").and_then(Value::as_str) != Some("macosx26.5")
+        || settings.get("Version").and_then(Value::as_str) != Some("26.5")
+        || system.get("ProductName").and_then(Value::as_str) != Some("macOS")
+        || system.get("ProductVersion").and_then(Value::as_str) != Some("26.5")
+        || system.get("ProductBuildVersion").and_then(Value::as_str) != Some("25F70")
+    {
+        return Err(ReleaseError::Invalid(
+            "installed SDK does not match macOS 26.5 build 25F70".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn sdk_mode_is_trusted(path: &Path, uid: u32, gid: u32, mode: u32) -> bool {
+    // /Applications is the conventional administrator-controlled install
+    // namespace. No other group-writable path receives this exception.
+    uid == 0
+        && mode & 0o002 == 0
+        && (mode & 0o020 == 0
+            || (path == Path::new("/Applications") && gid == 80 && mode & 0o7777 == 0o775))
+}
+
+#[cfg(target_os = "macos")]
+fn validate_sdk_path(path: &Path, directory: bool) -> Result<(), ReleaseError> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let mut ancestors = path.ancestors().collect::<Vec<_>>();
+    ancestors.reverse();
+    for node in ancestors {
+        let metadata = fs::symlink_metadata(node)?;
+        let is_directory = node != path || directory;
+        if metadata.file_type().is_symlink()
+            || !sdk_mode_is_trusted(node, metadata.uid(), metadata.gid(), metadata.mode())
+            || (is_directory && !metadata.is_dir())
+            || (!is_directory && !metadata.is_file())
+        {
+            return Err(ReleaseError::Invalid(format!(
+                "unsafe SDK installation component: {}",
+                node.display()
+            )));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | if is_directory { libc::O_DIRECTORY } else { 0 })
+            .open(node)?;
+        let retained = file.metadata()?;
+        if (
+            metadata.dev(),
+            metadata.ino(),
+            metadata.uid(),
+            metadata.gid(),
+            metadata.mode(),
+        ) != (
+            retained.dev(),
+            retained.ino(),
+            retained.uid(),
+            retained.gid(),
+            retained.mode(),
+        ) {
+            return Err(ReleaseError::Invalid(
+                "SDK installation changed during validation".into(),
+            ));
+        }
+        reject_sdk_acl(&file)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn reject_sdk_acl(file: &File) -> Result<(), ReleaseError> {
+    use std::{ffi::c_void, os::fd::AsRawFd};
+    unsafe extern "C" {
+        fn acl_get_fd_np(fd: i32, kind: i32) -> *mut c_void;
+        fn acl_get_entry(acl: *mut c_void, selector: i32, entry: *mut *mut c_void) -> i32;
+        fn acl_free(object: *mut c_void) -> i32;
+    }
+    // SAFETY: the file descriptor is live; the ACL allocation is freed once.
+    let acl = unsafe { acl_get_fd_np(file.as_raw_fd(), 0x100) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ENOENT) {
+            Ok(())
+        } else {
+            Err(error.into())
+        };
+    }
+    let mut entry = std::ptr::null_mut();
+    // SAFETY: acl is valid and entry is writable output storage.
+    let result = unsafe { acl_get_entry(acl, 0, &mut entry) };
+    let error = io::Error::last_os_error();
+    unsafe {
+        acl_free(acl);
+    }
+    if result == -1 && error.raw_os_error() == Some(libc::EINVAL) {
+        return Ok(());
+    }
+    Err(ReleaseError::Invalid(
+        "SDK installation has an ACL or unreadable ACL authority".into(),
+    ))
+}
+
 fn cargo_command(
     repo: &Path,
     b: &Binding,
@@ -1637,7 +1877,10 @@ fn cargo_command(
     if b.target == "aarch64-apple-darwin" {
         // Match Rust's supported macOS floor for every C/assembly dependency;
         // otherwise the host SDK can silently stamp objects with the host OS.
+        let sdk = MacosSdk::resolve()?;
         cmd.env_remove("SDKROOT")
+            .env_remove("DEVELOPER_DIR")
+            .env("SDKROOT", &sdk.root)
             .env_remove("MACOSX_DEPLOYMENT_TARGET")
             .env("MACOSX_DEPLOYMENT_TARGET", "11.0");
     }
@@ -1826,7 +2069,7 @@ fn validate_binding(b: &Binding) -> Result<(), ReleaseError> {
 fn repro_recipe_for_target(target: &str) -> Result<&'static str, ReleaseError> {
     match target {
         "x86_64-unknown-linux-gnu" => Ok("linux-rustc-default-v1"),
-        "aarch64-apple-darwin" => Ok("macos-rust-lld-no-uuid-macos11-v1"),
+        "aarch64-apple-darwin" => Ok("macos-rust-lld-no-uuid-macos11-sdk26.5-25F70-v2"),
         "x86_64-pc-windows-msvc" => Ok("windows-msvc-brepro-v1"),
         _ => Err(ReleaseError::Invalid(format!(
             "unsupported RC target {target}"
@@ -2842,20 +3085,21 @@ fn set_executable(path: &Path) -> Result<(), ReleaseError> {
     }
     Ok(())
 }
-fn smoke_env(cmd: &mut Command, home: &Path) {
-    cmd.env("HOME", home)
-        .env("XDG_CONFIG_HOME", home.join("xdg-config"))
-        .env("XDG_CACHE_HOME", home.join("xdg-cache"))
-        .env("TMPDIR", home.join("tmp"))
-        .env("TEMP", home.join("tmp"))
-        .env("TMP", home.join("tmp"))
-        .env("APPDATA", home.join("appdata"))
-        .env("LOCALAPPDATA", home.join("localappdata"));
+fn smoke_env(cmd: &mut Command, home: &Path) -> Result<(), ReleaseError> {
+    IsolatedChildEnvironment::new(
+        home,
+        home.join("xdg-config"),
+        home.join("xdg-data"),
+        home.join("xdg-cache"),
+        home.join("tmp"),
+    )
+    .apply(cmd)
+    .map_err(|error| ReleaseError::Verify(format!("smoke environment: {error}")))
 }
 fn run_smoke(binary: &Path, home: &Path, args: &[&str]) -> Result<Vec<u8>, ReleaseError> {
     let mut cmd = Command::new(binary);
     cmd.args(args);
-    smoke_env(&mut cmd, home);
+    smoke_env(&mut cmd, home)?;
     let out = cmd.output()?;
     if !out.status.success() {
         return Err(ReleaseError::Verify(format!(
@@ -2874,7 +3118,7 @@ fn run_smoke_in(
 ) -> Result<Vec<u8>, ReleaseError> {
     let mut cmd = Command::new(binary);
     cmd.current_dir(cwd).args(args);
-    smoke_env(&mut cmd, home);
+    smoke_env(&mut cmd, home)?;
     let out = cmd.output()?;
     if !out.status.success() {
         return Err(ReleaseError::Verify(format!(
@@ -3038,6 +3282,102 @@ mod tests {
         };
         assert_eq!(executable_name("cargo-sbom"), expected);
     }
+    #[test]
+    fn sdk_identity_requires_every_reviewed_metadata_field() {
+        let settings = json!({"CanonicalName":"macosx26.5", "Version":"26.5"});
+        let system =
+            json!({"ProductName":"macOS", "ProductVersion":"26.5", "ProductBuildVersion":"25F70"});
+        let validate = |version: &str, build: &str, settings: &Value, system: &Value| {
+            validate_macos_sdk_metadata(
+                version,
+                build,
+                &serde_json::to_vec(settings).unwrap(),
+                &serde_json::to_vec(system).unwrap(),
+            )
+        };
+        assert!(validate("26.5", "25F70", &settings, &system).is_ok());
+        assert!(validate("27.0", "25F70", &settings, &system).is_err());
+        assert!(validate("26.5", "25F71", &settings, &system).is_err());
+        for field in ["CanonicalName", "Version"] {
+            let mut changed = settings.clone();
+            changed[field] = json!("wrong");
+            assert!(validate("26.5", "25F70", &changed, &system).is_err());
+        }
+        for field in ["ProductName", "ProductVersion", "ProductBuildVersion"] {
+            let mut changed = system.clone();
+            changed[field] = Value::Null;
+            assert!(validate("26.5", "25F70", &settings, &changed).is_err());
+        }
+        assert!(validate_macos_sdk_metadata("26.5", "25F70", b"not JSON", b"{}").is_err());
+    }
+
+    #[test]
+    fn sdk_installation_namespace_and_permissions_are_closed() {
+        for path in [
+            "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk",
+            "/Applications/Xcode_26.5.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+            "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.5.sdk",
+        ] {
+            assert!(recognized_macos_sdk_root(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/tmp/MacOSX26.5.sdk",
+            "/Library/Developer/CommandLineTools/SDKs/MacOSX27.0.sdk",
+            "/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk/extra",
+            "/Applications/Other.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk",
+        ] {
+            assert!(!recognized_macos_sdk_root(Path::new(path)), "{path}");
+        }
+        let applications = Path::new("/Applications");
+        let sdk = Path::new("/Library/Developer/CommandLineTools/SDKs/MacOSX26.5.sdk");
+        assert!(sdk_mode_is_trusted(applications, 0, 80, 0o775));
+        assert!(sdk_mode_is_trusted(sdk, 0, 0, 0o755));
+        assert!(!sdk_mode_is_trusted(sdk, 501, 0, 0o755));
+        assert!(!sdk_mode_is_trusted(sdk, 0, 80, 0o775));
+        assert!(!sdk_mode_is_trusted(applications, 0, 20, 0o775));
+        assert!(!sdk_mode_is_trusted(applications, 0, 80, 0o777));
+    }
+
+    #[test]
+    fn sdk_discovery_command_is_explicit_and_ignores_overrides() {
+        let command = sdk_tool_command(
+            "/usr/bin/xcrun",
+            &["--no-cache", "--sdk", "macosx26.5", "--show-sdk-path"],
+        );
+        assert_eq!(command.get_program(), "/usr/bin/xcrun");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            ["--no-cache", "--sdk", "macosx26.5", "--show-sdk-path"]
+        );
+        let mut hostile = Command::new("unused");
+        hostile
+            .env("SDKROOT", "/hostile-sdk")
+            .env("DEVELOPER_DIR", "/hostile-developer")
+            .env("DYLD_INSERT_LIBRARIES", "/hostile.dylib");
+        clean_sdk_tool_environment(&mut hostile);
+        assert_eq!(
+            hostile.get_envs().collect::<Vec<_>>(),
+            [(
+                OsStr::new("PATH"),
+                Some(OsStr::new("/usr/bin:/bin:/usr/sbin:/sbin"))
+            )]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sdk_discovery_clean_environment_drops_command_local_overrides() {
+        let mut command = Command::new("/usr/bin/env");
+        command
+            .env("SDKROOT", "/hostile-sdk")
+            .env("DEVELOPER_DIR", "/hostile-developer");
+        clean_sdk_tool_environment(&mut command);
+        assert_eq!(
+            sdk_tool_output(&mut command, None).unwrap(),
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin\n"
+        );
+    }
+
     #[test]
     fn candidate_build_uses_closed_target_specific_reproducibility_flags() {
         assert_eq!(
@@ -3348,7 +3688,7 @@ mod tests {
         #[cfg(target_os = "macos")]
         {
             macos.target = "aarch64-apple-darwin".into();
-            macos.repro_recipe = "macos-rust-lld-no-uuid-macos11-v1".into();
+            macos.repro_recipe = "macos-rust-lld-no-uuid-macos11-sdk26.5-25F70-v2".into();
             let macos_command = cargo_command(repo, &macos, &target_dir, &cargo_home).unwrap();
             let macos_env = macos_command
                 .get_envs()
@@ -3360,7 +3700,14 @@ mod tests {
                 })
                 .collect::<BTreeMap<_, _>>();
             assert_native_tool_environment_removed(&macos_env, &macos.target);
-            assert!(macos_env.get("SDKROOT").and_then(|value| *value).is_none());
+            let sdk = MacosSdk::resolve().unwrap();
+            assert_eq!(macos_env.get("SDKROOT"), Some(&sdk.root.to_str()));
+            assert!(
+                macos_env
+                    .get("DEVELOPER_DIR")
+                    .and_then(|value| *value)
+                    .is_none()
+            );
             assert_eq!(
                 macos_env.get("MACOSX_DEPLOYMENT_TARGET"),
                 Some(&Some("11.0"))
@@ -3539,7 +3886,7 @@ mod tests {
         );
         assert_eq!(
             repro_recipe_for_target("aarch64-apple-darwin").unwrap(),
-            "macos-rust-lld-no-uuid-macos11-v1"
+            "macos-rust-lld-no-uuid-macos11-sdk26.5-25F70-v2"
         );
         assert_eq!(
             repro_recipe_for_target("x86_64-pc-windows-msvc").unwrap(),
@@ -3557,6 +3904,14 @@ mod tests {
         ] {
             assert!(support_for_target(unsupported).is_err());
         }
+        let mut legacy_macos = binding();
+        legacy_macos.target = "aarch64-apple-darwin".into();
+        legacy_macos.repro_recipe = "macos-rust-lld-no-uuid-macos11-v1".into();
+        assert!(validate_binding(&legacy_macos).is_err());
+        legacy_macos.repro_recipe = repro_recipe_for_target(&legacy_macos.target)
+            .unwrap()
+            .into();
+        assert!(validate_binding(&legacy_macos).is_ok());
         let mut mismatched = binding();
         mismatched.repro_recipe = "windows-msvc-brepro-v1".into();
         assert!(validate_binding(&mismatched).is_err());

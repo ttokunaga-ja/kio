@@ -74,8 +74,7 @@ impl Fixture {
     }
 
     fn set_tip(&self, hash: &str) {
-        fs::write(self.kio().join("HEAD"), hash).unwrap();
-        fs::write(self.kio().join("refs/heads/main"), hash).unwrap();
+        fs::write(self.kio().join("HEAD"), format!("{hash}\n")).unwrap();
     }
 
     fn tool_lock(&self, discriminator: u64) -> String {
@@ -95,15 +94,18 @@ impl Fixture {
     fn normalized_closure(&self, raw: &str, discriminator: u64) -> (String, String, String) {
         let profile = hash_bytes(format!("profile-{discriminator}").as_bytes());
         let prepared = hash_bytes(format!("prepared-{discriminator}").as_bytes());
+        let preparation_profile = hash_bytes(format!("prepare-profile-{discriminator}").as_bytes());
         let unit_value = json!({
             "unit_key": "page:1",
             "unit_type": "page",
             "raw_hash": raw,
             "prepared_hash": prepared,
+            "preparation_profile_hash": preparation_profile,
             "tool_profile_hash": profile,
             "gen": 0,
             "mode": "full",
             "markdown": format!("fixture body {discriminator}"),
+            "owned_image_hashes": [],
             "metadata": {},
             "reused_from": null,
             "generated_at": AT_0
@@ -134,6 +136,7 @@ impl Fixture {
                 "unit_type": "page",
                 "status": "done",
                 "prepared_hash": prepared,
+                "preparation_profile_hash": preparation_profile,
                 "unit_object_hash": unit,
                 "error_kind": null
             }],
@@ -161,10 +164,10 @@ impl Fixture {
             .0
     }
 
-    fn commit(&self, tree: &str, parents: Vec<String>, tool_lock: &str, at: &str) -> String {
+    fn commit(&self, tree: &str, parent: Option<String>, tool_lock: &str, at: &str) -> String {
         let commit = CommitObject::new(
             tree.to_owned(),
-            parents,
+            parent,
             at.to_owned(),
             "fixture".to_owned(),
             tool_lock.to_owned(),
@@ -197,7 +200,7 @@ impl Fixture {
         );
         let commit = self.commit(
             &tree,
-            parent.into_iter().collect(),
+            parent,
             &tool_lock,
             if discriminator == 0 { AT_0 } else { AT_1 },
         );
@@ -422,7 +425,7 @@ fn shallow_receipt_classifies_commit_and_explains_only_its_missing_tree() {
         .0;
     let tip = fixture.commit(
         &empty_tree_hash,
-        vec![old.commit.clone()],
+        Some(old.commit.clone()),
         &old.tool_lock,
         AT_1,
     );
@@ -492,7 +495,7 @@ fn shallow_receipt_makes_orphaned_semantic_closure_inventory_only() {
         .0;
     let tip = fixture.commit(
         &empty_tree_hash,
-        vec![boundary.commit.clone()],
+        Some(boundary.commit.clone()),
         &boundary.tool_lock,
         AT_1,
     );
@@ -585,7 +588,7 @@ fn tree_normalize_identity_must_match_its_manifest() {
         &second_manifest,
         "mismatched.md",
     );
-    let commit = fixture.commit(&mismatched_tree, Vec::new(), &first.tool_lock, AT_1);
+    let commit = fixture.commit(&mismatched_tree, None, &first.tool_lock, AT_1);
     fixture.set_tip(&commit);
     assert_eq!(fixture.error().error_code(), "KIO-E-STORE-CORRUPT-001");
 }
@@ -604,7 +607,7 @@ fn completed_purge_and_only_pre_resurrection_manifest_gaps_are_accepted() {
         .0;
     let purge_commit = CommitObject::new_purged(
         empty_tree_hash,
-        vec![original.commit.clone()],
+        Some(original.commit.clone()),
         AT_1.to_owned(),
         "fixture purge".to_owned(),
         original.tool_lock.clone(),
@@ -626,7 +629,7 @@ fn completed_purge_and_only_pre_resurrection_manifest_gaps_are_accepted() {
         .0;
     fixture.set_tip(&purge_commit_hash);
 
-    let purge = PurgeState::new(fixture.kio());
+    let purge = PurgeState::open(fixture.kio()).unwrap();
     purge.ensure_purge_epoch(1).unwrap();
     let purge_id = new_ulid(fixture.root());
     purge
@@ -684,7 +687,7 @@ fn completed_purge_and_only_pre_resurrection_manifest_gaps_are_accepted() {
     let resurrection_tree = fixture.tree(&original.raw, &profile, &new_manifest, "resurrected.md");
     let resurrection_commit = fixture.commit(
         &resurrection_tree,
-        vec![purge_commit_hash],
+        Some(purge_commit_hash),
         &original.tool_lock,
         AT_2,
     );
@@ -732,7 +735,7 @@ fn completed_purge_does_not_explain_post_purge_tree_gaps() {
         .0;
     let purge_commit = CommitObject::new_purged(
         empty_tree_hash,
-        vec![original.commit.clone()],
+        Some(original.commit.clone()),
         AT_1.to_owned(),
         "fixture purge".to_owned(),
         original.tool_lock.clone(),
@@ -752,7 +755,7 @@ fn completed_purge_does_not_explain_post_purge_tree_gaps() {
         )
         .unwrap()
         .0;
-    let purge = PurgeState::new(fixture.kio());
+    let purge = PurgeState::open(fixture.kio()).unwrap();
     purge.ensure_purge_epoch(1).unwrap();
     purge
         .append_tombstone_event(
@@ -783,7 +786,7 @@ fn completed_purge_does_not_explain_post_purge_tree_gaps() {
     );
     let post_purge_commit = fixture.commit(
         &post_purge_tree,
-        vec![purge_commit_hash],
+        Some(purge_commit_hash),
         &original.tool_lock,
         AT_2,
     );

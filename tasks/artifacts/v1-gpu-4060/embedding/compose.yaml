@@ -1,0 +1,62 @@
+# Fixed x86_64-only preparation. The runner is the first action allowed to pull,
+# download the model, or start this GPU service.
+services:
+  qwen3-vl-embedding:
+    # Official vllm/vllm-openai:v0.26.0 linux/amd64 manifest, resolved 2026-09-08.
+    image: vllm/vllm-openai@sha256:770fe65b2c73ee74a5c42165cf3433de4048cc2cd9c57a937ca4e35aba5aa87b
+    ports:
+      - 127.0.0.1:18081:8000
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["0"]
+              capabilities: [gpu]
+    shm_size: 1g
+    restart: "no"
+    logging:
+      driver: local
+      options:
+        max-size: 10m
+        max-file: "3"
+    environment:
+      HF_HOME: /models
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      VLLM_DO_NOT_TRACK: "1"
+    volumes:
+      - ./models:/models
+      # Only the leaf server certificate/key and public CA are visible to the
+      # model container. The CA signing key stays in tls-authority/ unmounted.
+      - ./tls-server:/tls:ro
+    command:
+      - --model
+      - Qwen/Qwen3-VL-Embedding-2B
+      - --revision
+      - 9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda
+      - --runner
+      - pooling
+      - --trust-remote-code
+      - --dtype
+      - half
+      - --gpu-memory-utilization
+      - "0.80"
+      - --max-model-len
+      - "2048"
+      - --max-num-batched-tokens
+      - "2048"
+      - --max-num-seqs
+      - "1"
+      - --enforce-eager
+      - --download-dir
+      - /models
+      - --ssl-keyfile
+      - /tls/server-key.pem
+      - --ssl-certfile
+      - /tls/server-cert.pem
+    healthcheck:
+      test: ["CMD-SHELL", "curl --fail --silent --show-error --cacert /tls/ca-cert.pem https://127.0.0.1:8000/health >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 300s

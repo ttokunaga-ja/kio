@@ -45,10 +45,11 @@
 use serde_json::{Value, json};
 
 use crate::http_policy::{
-    HttpPolicy, HttpResponse, RERANK_RESPONSE_MAX_BYTES, authenticated_agent, read_json_bounded,
-    require_success,
+    HttpPolicy, HttpResponse, RERANK_RESPONSE_MAX_BYTES, authenticated_local_agent,
+    read_json_bounded, require_success,
 };
 use crate::identity::tool_profile_hash;
+use crate::local_peer::{AuthenticatedLocalEndpoint, is_local_peer_tls_error};
 use crate::traits::RerankAdapter;
 use crate::types::{
     AdapterKind, AdapterProfile, ExecutionMode, RerankRequest, RerankResponse, RerankedCandidate,
@@ -113,7 +114,7 @@ pub trait LocalRerankClient: Clone {
 /// move to TEI should not need this type renamed.
 #[derive(Debug, Clone)]
 pub struct EnvLocalRerankClient {
-    base_url: String,
+    endpoint: AuthenticatedLocalEndpoint,
     model: String,
     http_policy: HttpPolicy,
 }
@@ -125,12 +126,12 @@ impl EnvLocalRerankClient {
     /// stating that the two are the same field.
     #[must_use]
     pub fn new(
-        base_url: impl Into<String>,
+        endpoint: AuthenticatedLocalEndpoint,
         model: impl Into<String>,
         timeout_seconds: Option<u64>,
     ) -> Self {
         Self {
-            base_url: base_url.into(),
+            endpoint,
             model: model.into(),
             http_policy: timeout_seconds
                 .map_or_else(HttpPolicy::default, HttpPolicy::with_timeout_seconds),
@@ -145,9 +146,8 @@ impl LocalRerankClient for EnvLocalRerankClient {
         documents: &[String],
         top_n: usize,
     ) -> Result<Vec<(usize, f64)>> {
-        let url = format!("{}/v1/rerank", self.base_url.trim_end_matches('/'));
-        // Same posture as the embedding client: no redirects off loopback.
-        let response = authenticated_agent(self.http_policy)
+        let url = format!("{}/v1/rerank", self.endpoint.base_url());
+        let response = authenticated_local_agent(&self.endpoint, self.http_policy)?
             .post(&url)
             .send_json(json!({
                 "model": self.model,
@@ -166,6 +166,11 @@ impl LocalRerankClient for EnvLocalRerankClient {
 /// A local server has no credential and no invoice, so `Auth` and
 /// `QuotaExceeded` cannot arise. A full queue is a retry; nothing else is.
 fn rerank_http_error(error: ureq::Error) -> AdapterError {
+    if is_local_peer_tls_error(&error) {
+        return AdapterError::LocalPeerAuth(format!(
+            "rerank server TLS authentication failed: {error}"
+        ));
+    }
     AdapterError::Network(format!("rerank server unreachable: {error}"))
 }
 

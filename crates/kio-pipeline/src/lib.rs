@@ -3,6 +3,7 @@
 pub mod budget;
 pub mod ledger;
 pub mod markdownize;
+pub mod policy;
 pub mod prepare;
 pub mod scan;
 mod store_path;

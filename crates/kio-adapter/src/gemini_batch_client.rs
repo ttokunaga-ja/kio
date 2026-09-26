@@ -43,6 +43,7 @@ use std::io::Write as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::batch_recovery::{BatchRecoveryContext, PinnedBatchIdentity, configured_qualifier};
 use crate::http_policy::{
     HttpPolicy, HttpResponse, authenticated_agent, read_json_bounded, require_success,
 };
@@ -53,13 +54,8 @@ use crate::{AdapterError, Result};
 #[cfg(debug_assertions)]
 pub const TEST_GEMINI_BATCH_ENV: &str = "KIO_TEST_GEMINI_BATCH";
 
-/// Provider-scope override, mirroring `KIO_MISTRAL_WORKSPACE_ID`.
+/// Optional project qualifier, captured once as one input to recovery HMAC.
 pub const GEMINI_PROJECT_ID_ENV: &str = "KIO_GEMINI_PROJECT_ID";
-
-/// The provider scope recorded when no project is configured. A Gemini API key
-/// is itself project-scoped, so one constant scope per client configuration is
-/// a faithful v1 identity (same posture as [`crate::batch_client`]).
-pub const DEFAULT_PROVIDER_SCOPE_ID: &str = "gemini:default";
 
 const GEMINI_API_ORIGIN: &str = "https://generativelanguage.googleapis.com";
 
@@ -88,9 +84,8 @@ const BATCH_POLL_MAX_BYTES: usize = 48 * 1024 * 1024;
 /// Listing pagination page size (`pageSize` query parameter).
 const BATCH_LIST_PAGE_SIZE: usize = 100;
 
-/// Hard bound on the pagination walk — same posture as the Mistral lane: the
-/// walk STOPS at the bound (bounded, report-only inventory scan), it does not
-/// error.
+/// Hard bound on the pagination walk. A successful inventory must be complete:
+/// recovery and cleanup cannot safely infer absence from a truncated listing.
 const BATCH_LIST_MAX_PAGES: usize = 50;
 
 /// Provider cap on an inline batch is 20 MB. Bound the serialized request array
@@ -506,65 +501,88 @@ pub(crate) fn parse_inlined_results(value: &Value) -> Result<Vec<GeminiBatchEmbe
 /// Real Gemini Batch REST client. Auth and base-url posture mirror the
 /// embedding adapter exactly: `tools.toml [embedding] auth` is the credential
 /// authority and the production origin is fixed by the built-in target.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EnvGeminiBatchClient {
-    base_url: Option<String>,
+    identity: PinnedBatchIdentity,
     http_policy: HttpPolicy,
 }
 
 impl EnvGeminiBatchClient {
-    #[must_use]
-    pub fn new() -> Self {
-        Self {
-            base_url: None,
+    pub fn new(context: &BatchRecoveryContext) -> Result<Self> {
+        let credential = crate::tool_lock::resolve_role_api_key("embedding")?.ok_or_else(|| {
+            AdapterError::Auth("declared gemini batch credential is unavailable".into())
+        })?;
+        Self::from_captured(context, GEMINI_API_ORIGIN, credential)
+    }
+
+    fn from_captured(
+        context: &BatchRecoveryContext,
+        origin: &str,
+        credential: String,
+    ) -> Result<Self> {
+        let qualifier = configured_qualifier(GEMINI_PROJECT_ID_ENV)?;
+        Ok(Self {
+            identity: context.capture("gemini", origin, qualifier.as_deref(), credential)?,
             http_policy: HttpPolicy::default(),
-        }
-    }
-
-    #[allow(dead_code)]
-    #[must_use]
-    pub fn with_base_url(base_url: impl Into<String>) -> Self {
-        Self {
-            base_url: Some(base_url.into()),
-            http_policy: HttpPolicy::default(),
-        }
-    }
-
-    fn base_url(&self) -> String {
-        self.base_url
-            .clone()
-            .unwrap_or_else(|| GEMINI_API_ORIGIN.to_owned())
-            .trim_end_matches('/')
-            .to_owned()
-    }
-
-    fn api_key() -> Result<String> {
-        crate::tool_lock::resolve_role_api_key("embedding")?.ok_or_else(|| {
-            AdapterError::Auth(
-                "no Gemini embedding API key: declare tools.toml `[embedding] auth`".to_owned(),
-            )
         })
     }
 
+    #[cfg(test)]
+    fn with_base_url(base_url: impl Into<String>) -> Self {
+        crate::tool_lock::with_test_role_auth("embedding", || {
+            let credential = crate::tool_lock::resolve_role_api_key("embedding")
+                .unwrap()
+                .unwrap();
+            Self::from_captured(
+                &BatchRecoveryContext::from_key([7; 32]),
+                &base_url.into(),
+                credential,
+            )
+            .unwrap()
+        })
+    }
+
+    fn base_url(&self) -> &str {
+        self.identity.origin()
+    }
+
     fn get_json(&self, url: &str, max_bytes: usize, context: &str) -> Result<Value> {
-        let api_key = Self::api_key()?;
+        let api_key = self.identity.credential();
         let response = authenticated_agent(self.http_policy)
             .get(url)
-            .header("x-goog-api-key", &api_key)
+            .header("x-goog-api-key", api_key)
             .header("Accept-Encoding", "identity")
             .call()
             .map_err(http_error)
             .and_then(|response| require_success(response, http_status_error))?;
         read_json_bounded(response, max_bytes, context)
     }
+
+    /// `batches.list` uses the request builder's query API so opaque provider
+    /// page tokens cannot alter the query string or be sent unescaped.
+    fn get_batch_listing(&self, page_token: Option<&str>) -> Result<Value> {
+        let api_key = self.identity.credential();
+        let url = format!("{}/v1beta/batches", self.base_url());
+        let request = authenticated_agent(self.http_policy)
+            .get(&url)
+            .query("pageSize", BATCH_LIST_PAGE_SIZE.to_string());
+        let request = match page_token {
+            Some(token) => request.query("pageToken", token),
+            None => request,
+        };
+        let response = request
+            .header("x-goog-api-key", api_key)
+            .header("Accept-Encoding", "identity")
+            .call()
+            .map_err(http_error)
+            .and_then(|response| require_success(response, http_status_error))?;
+        read_json_bounded(response, BATCH_METADATA_MAX_BYTES, "Gemini batch listing")
+    }
 }
 
 impl GeminiBatchClient for EnvGeminiBatchClient {
     fn provider_scope_id(&self) -> Result<String> {
-        match std::env::var(GEMINI_PROJECT_ID_ENV) {
-            Ok(raw) if !raw.trim().is_empty() => Ok(raw.trim().to_owned()),
-            _ => Ok(DEFAULT_PROVIDER_SCOPE_ID.to_owned()),
-        }
+        Ok(self.identity.scope().to_owned())
     }
 
     fn create_embedding_job(
@@ -575,7 +593,7 @@ impl GeminiBatchClient for EnvGeminiBatchClient {
         inputs: &[GeminiBatchEmbedInput],
     ) -> Result<GeminiBatchJobRecord> {
         let body = inline_embed_batch_body(model, display_name, dimensions, inputs)?;
-        let api_key = Self::api_key()?;
+        let api_key = self.identity.credential();
         let url = format!(
             "{}/v1beta/{}:asyncBatchEmbedContent",
             self.base_url(),
@@ -583,7 +601,7 @@ impl GeminiBatchClient for EnvGeminiBatchClient {
         );
         let response = authenticated_agent(self.http_policy)
             .post(&url)
-            .header("x-goog-api-key", &api_key)
+            .header("x-goog-api-key", api_key)
             .header("Accept-Encoding", "identity")
             .send_json(body)
             .map_err(http_error)
@@ -615,32 +633,38 @@ impl GeminiBatchClient for EnvGeminiBatchClient {
     }
 
     fn list_jobs(&self) -> Result<Vec<GeminiBatchJobRecord>> {
-        let base = self.base_url();
+        let mut seen_page_tokens = std::collections::HashSet::new();
         let mut records = Vec::new();
         let mut page_token: Option<String> = None;
         for _ in 0..BATCH_LIST_MAX_PAGES {
-            let url = match page_token.as_deref() {
-                Some(token) => format!(
-                    "{base}/v1beta/batches?pageSize={BATCH_LIST_PAGE_SIZE}&pageToken={token}"
-                ),
-                None => format!("{base}/v1beta/batches?pageSize={BATCH_LIST_PAGE_SIZE}"),
-            };
-            let value = self.get_json(&url, BATCH_METADATA_MAX_BYTES, "Gemini batch listing")?;
+            let value = self.get_batch_listing(page_token.as_deref())?;
             let entries = parse_job_listing(&value)?;
-            if entries.is_empty() {
-                break;
+            if entries.len() > BATCH_LIST_PAGE_SIZE {
+                return Err(AdapterError::ContractViolation(format!(
+                    "Gemini batch listing returned {} entries, over requested page size {BATCH_LIST_PAGE_SIZE}",
+                    entries.len()
+                )));
             }
             records.extend(entries);
-            page_token = value
-                .get("nextPageToken")
-                .and_then(Value::as_str)
-                .filter(|token| !token.is_empty())
-                .map(str::to_owned);
-            if page_token.is_none() {
-                break;
+            let next_page_token = match value.get("nextPageToken") {
+                None => return Ok(records),
+                Some(Value::String(token)) if !token.is_empty() => token.to_owned(),
+                Some(_) => {
+                    return Err(AdapterError::ContractViolation(
+                        "Gemini batch listing nextPageToken must be a non-empty string".to_owned(),
+                    ));
+                }
+            };
+            if !seen_page_tokens.insert(next_page_token.clone()) {
+                return Err(AdapterError::ContractViolation(
+                    "Gemini batch listing nextPageToken cycle".to_owned(),
+                ));
             }
+            page_token = Some(next_page_token);
         }
-        Ok(records)
+        Err(AdapterError::ContractViolation(format!(
+            "Gemini batch listing exceeded {BATCH_LIST_MAX_PAGES} pages before completion"
+        )))
     }
 }
 
@@ -711,6 +735,14 @@ pub struct MockGeminiBatchScript {
     /// tests can assert call order and payloads.
     #[serde(default)]
     pub capture_path: Option<String>,
+    /// Explicit poll attribution override, including mismatches. If omitted,
+    /// poll uses only attribution retained from a successful mock submission.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Shared provider state for separate CLI invocations. When omitted, a
+    /// companion of state_path or capture_path is used when either is set.
+    #[serde(default)]
+    pub attribution_path: Option<String>,
 }
 
 #[cfg(debug_assertions)]
@@ -729,6 +761,7 @@ fn default_sequence() -> Vec<String> {
 #[cfg(debug_assertions)]
 pub struct MockGeminiBatchClient {
     script: MockGeminiBatchScript,
+    submitted_attribution: std::cell::RefCell<std::collections::BTreeMap<String, String>>,
 }
 
 #[cfg(debug_assertions)]
@@ -737,7 +770,56 @@ impl MockGeminiBatchClient {
         let script: MockGeminiBatchScript = serde_json::from_str(raw).map_err(|error| {
             AdapterError::ConfigSchema(format!("{TEST_GEMINI_BATCH_ENV} script: {error}"))
         })?;
-        Ok(Self { script })
+        Ok(Self {
+            script,
+            submitted_attribution: Default::default(),
+        })
+    }
+
+    fn attribution_path(&self) -> Option<String> {
+        self.script.attribution_path.clone().or_else(|| {
+            self.script
+                .state_path
+                .as_ref()
+                .or(self.script.capture_path.as_ref())
+                .map(|path| format!("{path}.gemini-jobs.json"))
+        })
+    }
+
+    fn attribution_key(&self) -> String {
+        serde_json::to_string(&(&self.script.provider_scope_id, &self.script.job_name)).unwrap()
+    }
+
+    fn load_attribution(&self) -> Result<std::collections::BTreeMap<String, String>> {
+        let Some(path) = self.attribution_path() else {
+            return Ok(self.submitted_attribution.borrow().clone());
+        };
+        match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+                AdapterError::ConfigSchema(format!("mock attribution state {path}: {error}"))
+            }),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+            Err(error) => Err(AdapterError::Io {
+                path,
+                message: error.to_string(),
+            }),
+        }
+    }
+
+    fn remember_attribution(&self, attribution: String) -> Result<()> {
+        let mut records = self.load_attribution()?;
+        records.insert(self.attribution_key(), attribution);
+        if let Some(path) = self.attribution_path() {
+            let bytes = serde_json::to_vec(&records).map_err(|error| {
+                AdapterError::ConfigSchema(format!("mock attribution serialization: {error}"))
+            })?;
+            std::fs::write(&path, bytes).map_err(|error| AdapterError::Io {
+                path,
+                message: error.to_string(),
+            })?;
+        }
+        *self.submitted_attribution.borrow_mut() = records;
+        Ok(())
     }
 
     fn capture(&self, event: Value) {
@@ -791,7 +873,13 @@ impl MockGeminiBatchClient {
         Ok(GeminiBatchJobRecord {
             name: self.script.job_name.clone(),
             state: GeminiBatchState::parse(state),
-            display_name: String::new(),
+            display_name: match &self.script.display_name {
+                Some(display_name) => display_name.clone(),
+                None => self
+                    .load_attribution()?
+                    .remove(&self.attribution_key())
+                    .unwrap_or_default(),
+            },
             responses_file: None,
         })
     }
@@ -821,6 +909,7 @@ impl GeminiBatchClient for MockGeminiBatchClient {
             "keys": inputs.iter().map(|input| input.key.clone()).collect::<Vec<_>>(),
         }));
         self.fail_if_scripted("create_job")?;
+        self.remember_attribution(display_name.to_owned())?;
         let mut record = self.record(
             self.script
                 .state_sequence
@@ -879,7 +968,9 @@ impl GeminiBatchClient for MockGeminiBatchClient {
 /// [`TEST_GEMINI_BATCH_ENV`] is set, otherwise the real client when an API key
 /// is resolvable from declared `tools.toml [embedding] auth`.
 /// `None` means the lane is unavailable and the caller must not send.
-pub fn resolve_gemini_batch_client() -> Result<Option<Box<dyn GeminiBatchClient>>> {
+pub fn resolve_gemini_batch_client(
+    recovery_context: impl FnOnce() -> Result<BatchRecoveryContext>,
+) -> Result<Option<Box<dyn GeminiBatchClient>>> {
     #[cfg(debug_assertions)]
     {
         use kio_core::test_control::Selector;
@@ -887,8 +978,13 @@ pub fn resolve_gemini_batch_client() -> Result<Option<Box<dyn GeminiBatchClient>
             return Ok(Some(Box::new(MockGeminiBatchClient::from_env_value(&raw)?)));
         }
     }
-    if crate::tool_lock::resolve_role_api_key("embedding")?.is_some() {
-        return Ok(Some(Box::new(EnvGeminiBatchClient::new())));
+    if let Some(credential) = crate::tool_lock::resolve_role_api_key("embedding")? {
+        let context = recovery_context()?;
+        return Ok(Some(Box::new(EnvGeminiBatchClient::from_captured(
+            &context,
+            GEMINI_API_ORIGIN,
+            credential,
+        )?)));
     }
     Ok(None)
 }
@@ -896,6 +992,160 @@ pub fn resolve_gemini_batch_client() -> Result<Option<Box<dyn GeminiBatchClient>
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_rotation_changes_scope_but_existing_instance_remains_pinned() {
+        let _guard = crate::batch_client::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let _qualifier =
+            kio_core::test_control::TestEnvGuard::set(GEMINI_PROJECT_ID_ENV, "same-qualifier");
+        let _credential = kio_core::test_control::TestEnvGuard::set(
+            "KIO_TEST_CAPTURED_BATCH_KEY",
+            "credential-before",
+        );
+        let context = BatchRecoveryContext::from_key([9; 32]);
+        let old = crate::batch_recovery::with_test_env_credential(
+            "embedding",
+            "KIO_TEST_CAPTURED_BATCH_KEY",
+            || {
+                let old = EnvGeminiBatchClient::new(&context).unwrap();
+                let _rotated = kio_core::test_control::TestEnvGuard::set(
+                    "KIO_TEST_CAPTURED_BATCH_KEY",
+                    "credential-after",
+                );
+                let new = EnvGeminiBatchClient::new(&context).unwrap();
+                assert_ne!(
+                    old.provider_scope_id().unwrap(),
+                    new.provider_scope_id().unwrap()
+                );
+                assert_eq!(old.identity.credential(), "credential-before");
+                assert_eq!(new.identity.credential(), "credential-after");
+                old
+            },
+        );
+        // The source tools.toml is gone and no declaration is active now.
+        assert_eq!(old.identity.credential(), "credential-before");
+        let debug = format!("{old:?}");
+        assert!(!debug.contains("credential-before"));
+        assert!(!debug.contains(&old.provider_scope_id().unwrap()));
+    }
+
+    #[test]
+    fn mock_poll_roundtrips_only_recorded_submission_display_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = json!({ "attribution_path": dir.path().join("jobs.json") });
+        let client = MockGeminiBatchClient::from_env_value(&script.to_string()).unwrap();
+        assert!(
+            client
+                .poll_job(&default_job())
+                .unwrap()
+                .record
+                .display_name
+                .is_empty()
+        );
+        let inputs = [GeminiBatchEmbedInput {
+            key: "input".into(),
+            text: "text".into(),
+        }];
+        client
+            .create_embedding_job("model", 768, "kio-submitted-intent", &inputs)
+            .unwrap();
+        assert_eq!(
+            client.poll_job(&default_job()).unwrap().record.display_name,
+            "kio-submitted-intent"
+        );
+        let reopened = MockGeminiBatchClient::from_env_value(&script.to_string()).unwrap();
+        assert_eq!(
+            reopened
+                .poll_job(&default_job())
+                .unwrap()
+                .record
+                .display_name,
+            "kio-submitted-intent"
+        );
+        for field in ["provider_scope_id", "job_name"] {
+            let mut other = script.clone();
+            other[field] = json!("different");
+            let client = MockGeminiBatchClient::from_env_value(&other.to_string()).unwrap();
+            assert!(
+                client
+                    .poll_job("different")
+                    .unwrap()
+                    .record
+                    .display_name
+                    .is_empty()
+            );
+        }
+        let mut mismatch = script;
+        mismatch["display_name"] = json!("kio-wrong");
+        let client = MockGeminiBatchClient::from_env_value(&mismatch.to_string()).unwrap();
+        assert_eq!(
+            client.poll_job(&default_job()).unwrap().record.display_name,
+            "kio-wrong"
+        );
+        let memory_only = MockGeminiBatchClient::from_env_value("{}").unwrap();
+        memory_only
+            .create_embedding_job("model", 768, "kio-memory", &inputs)
+            .unwrap();
+        assert_eq!(
+            memory_only
+                .poll_job(&default_job())
+                .unwrap()
+                .record
+                .display_name,
+            "kio-memory"
+        );
+    }
+
+    fn with_test_gemini_auth<T>(operation: impl FnOnce() -> T) -> T {
+        crate::tool_lock::with_test_role_auth("embedding", operation)
+    }
+
+    fn http_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn spawn_listing_server(
+        responses: Vec<String>,
+    ) -> (
+        String,
+        std::thread::JoinHandle<Vec<String>>,
+        crate::http_policy::test_tls::TrustGuard,
+    ) {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let tls = crate::http_policy::test_tls::Fixture::new();
+        let trust = tls.trust();
+        let handle = std::thread::spawn(move || {
+            let mut requests = Vec::new();
+            for response in responses {
+                let mut stream = tls.accept(&listener);
+                let mut request = Vec::new();
+                let mut chunk = [0_u8; 1024];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let count = stream.read(&mut chunk).unwrap();
+                    assert!(count > 0, "Gemini listing request ended before headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    assert!(
+                        request.len() <= 64 * 1024,
+                        "Gemini listing request headers too large"
+                    );
+                }
+                stream.write_all(response.as_bytes()).unwrap();
+                requests.push(String::from_utf8_lossy(&request).into_owned());
+            }
+            requests
+        });
+        (format!("https://{address}"), handle, trust)
+    }
 
     #[test]
     fn state_parses_batch_and_job_prefixes_and_marks_terminals() {
@@ -1250,6 +1500,100 @@ mod tests {
             display_name_intent_token(&records[0].display_name),
             Some("019f96a5-b5a5-7cb2-ba6e-8ddfccafc483")
         );
+    }
+
+    #[test]
+    fn real_listing_continues_after_an_empty_page_and_encodes_the_next_token() {
+        let _guard = crate::batch_client::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (base, server, _trust) = spawn_listing_server(vec![
+            http_response(r#"{"operations":[],"nextPageToken":"cursor /?&+%"}"#),
+            http_response(
+                r#"{"operations":[{"name":"batches/after-empty","state":"BATCH_STATE_RUNNING"}]}"#,
+            ),
+        ]);
+        let client = EnvGeminiBatchClient::with_base_url(base);
+
+        let jobs = with_test_gemini_auth(|| client.list_jobs()).unwrap();
+
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].name, "batches/after-empty");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /v1beta/batches?pageSize=100 "));
+        assert!(
+            requests[1].starts_with(
+                "GET /v1beta/batches?pageSize=100&pageToken=cursor%20%2F%3F%26%2B%25 "
+            )
+        );
+    }
+
+    #[test]
+    fn real_listing_rejects_a_next_page_token_cycle() {
+        let _guard = crate::batch_client::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let (base, server, _trust) = spawn_listing_server(vec![
+            http_response(r#"{"operations":[],"nextPageToken":"again"}"#),
+            http_response(r#"{"operations":[],"nextPageToken":"again"}"#),
+        ]);
+        let client = EnvGeminiBatchClient::with_base_url(base);
+
+        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        assert!(matches!(error, AdapterError::ContractViolation(_)));
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn real_listing_rejects_malformed_tokens_and_oversized_pages() {
+        let _guard = crate::batch_client::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        let (base, server, _trust) = spawn_listing_server(vec![http_response(
+            r#"{"operations":[],"nextPageToken":17}"#,
+        )]);
+        let client = EnvGeminiBatchClient::with_base_url(base);
+        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        assert!(matches!(error, AdapterError::ContractViolation(_)));
+        assert_eq!(server.join().unwrap().len(), 1);
+
+        let operations = (0..BATCH_LIST_PAGE_SIZE + 1)
+            .map(|index| {
+                json!({
+                    "name": format!("batches/oversized-{index}"),
+                    "state": "BATCH_STATE_RUNNING",
+                })
+            })
+            .collect::<Vec<_>>();
+        let (base, server, _trust) = spawn_listing_server(vec![http_response(
+            &json!({ "operations": operations }).to_string(),
+        )]);
+        let client = EnvGeminiBatchClient::with_base_url(base);
+        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        assert!(matches!(error, AdapterError::ContractViolation(_)));
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn real_listing_rejects_an_incomplete_walk_at_the_page_cap() {
+        let _guard = crate::batch_client::test_env_lock()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let responses = (0..BATCH_LIST_MAX_PAGES)
+            .map(|page| {
+                http_response(&format!(
+                    r#"{{"operations":[],"nextPageToken":"cursor-{page}"}}"#
+                ))
+            })
+            .collect();
+        let (base, server, _trust) = spawn_listing_server(responses);
+        let client = EnvGeminiBatchClient::with_base_url(base);
+
+        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        assert!(matches!(error, AdapterError::ContractViolation(_)));
+        assert_eq!(server.join().unwrap().len(), BATCH_LIST_MAX_PAGES);
     }
 
     #[test]

@@ -11,6 +11,8 @@ path = "src/lib.rs"
 
 [dependencies]
 kio-core = { path = "../kio-core" }
+kio-process.workspace = true
+tempfile.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true
@@ -20,19 +22,25 @@ toml.workspace = true
 unicode-normalization.workspace = true
 base64.workspace = true
 miniz_oxide.workspace = true
+zip.workspace = true
 # Batch upload multipart boundaries (07 §5.5): OS-entropy boundary strings so
 # a boundary can never be predicted from (or collide with) the payload.
 getrandom.workspace = true
 # Authenticated adapter responses use identity encoding so wire and decoded
 # byte ceilings cannot be bypassed through transparent decompression.
 ureq.workspace = true
+ring = "=0.17.14"
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 # XLSX sheet extraction (07 §5.1): OOXML is namespaced XML with entity escaping
 # and attribute-order-independent structure — the class of parsing where a
 # hand-rolled reader fails SILENTLY, producing plausible wrong text rather than
-# an error. Pure Rust, no default features, no transitive deps. The ZIP
-# container around it is read in-crate instead: its failure mode is a loud
-# refusal, and the decompression bounds are ours to set (`xlsx_extract`).
+# an error. Pure Rust, no default features, no transitive deps. OOXML package
+# validation uses the maintained bounded ZIP reader in `ooxml_package`.
 quick-xml = { version = "0.41", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

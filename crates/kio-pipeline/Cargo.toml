@@ -14,7 +14,7 @@ cap-primitives.workspace = true
 getrandom.workspace = true
 kio-adapter = { path = "../kio-adapter" }
 kio-core.workspace = true
-rusqlite.workspace = true
+rusqlite = { workspace = true, features = ["serialize"] }
 serde.workspace = true
 serde_json.workspace = true
 serde_jcs.workspace = true

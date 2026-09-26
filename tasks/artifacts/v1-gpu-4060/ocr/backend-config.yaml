@@ -1,0 +1,13 @@
+# RTX 4060 8 GB first-trial resource sizing only. These keys become vLLM CLI
+# arguments (underscores -> dashes); no model, revision, template, or sampling
+# setting is changed.
+trust_remote_code: true
+gpu_memory_utilization: 0.65
+# PaddleX requests its fixed 4096 completion budget in addition to prompt
+# tokens; 4160 is the smallest measured headroom above the observed 14-token
+# prompt while retaining the 4096 batch cap.
+max_model_len: 4160
+max_num_batched_tokens: 4096
+api_server_count: 1
+enforce_eager: true
+max_num_seqs: 2

@@ -1,0 +1,318 @@
+name: V1 acceptance final verifier
+
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_sha:
+        description: Exact 40-character candidate SHA shared by every source run
+        required: true
+        type: string
+      native_run_id:
+        description: Successful v1-acceptance.yml workflow_dispatch run ID
+        required: true
+        type: string
+      provider_run_id:
+        description: Successful v1-provider-acceptance.yml workflow_dispatch run ID
+        required: true
+        type: string
+      local_run_id:
+        description: Successful v1-local-acceptance.yml workflow_dispatch run ID
+        required: true
+        type: string
+
+# This workflow only reads prior immutable Actions evidence and writes a new
+# verifier artifact. It makes no provider request, scheduler registration, or
+# release change.
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  verify:
+    name: Assemble and verify the full fixed v1 receipt matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Validate explicit immutable inputs
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          NATIVE_RUN_ID: ${{ inputs.native_run_id }}
+          PROVIDER_RUN_ID: ${{ inputs.provider_run_id }}
+          LOCAL_RUN_ID: ${{ inputs.local_run_id }}
+        run: |
+          set -euo pipefail
+          [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          test "$GITHUB_EVENT_NAME" = workflow_dispatch
+          test "$GITHUB_SHA" = "$CANDIDATE_SHA"
+          test "$GITHUB_REF" = refs/heads/main
+          [[ "$NATIVE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$PROVIDER_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          [[ "$LOCAL_RUN_ID" =~ ^[1-9][0-9]*$ ]]
+          test "$NATIVE_RUN_ID" != "$PROVIDER_RUN_ID"
+          test "$NATIVE_RUN_ID" != "$LOCAL_RUN_ID"
+          test "$PROVIDER_RUN_ID" != "$LOCAL_RUN_ID"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Confirm the verifier builds from the requested candidate
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$CANDIDATE_SHA"
+          test -z "$(git status --porcelain --untracked-files=no)"
+
+      - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+
+      - name: Build the candidate-owned final verifier
+        run: cargo +1.98.0 build -p kio-eval --bin kio-eval --locked
+
+      - name: Verify every source run before any artifact download
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          NATIVE_RUN_ID: ${{ inputs.native_run_id }}
+          PROVIDER_RUN_ID: ${{ inputs.provider_run_id }}
+          LOCAL_RUN_ID: ${{ inputs.local_run_id }}
+        run: |
+          set -euo pipefail
+          reports="$RUNNER_TEMP/kio-v1-verify-reports"
+          mkdir "$reports"
+          jq -n --arg repository "$GITHUB_REPOSITORY" \
+            --arg head_sha "$GITHUB_SHA" --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --argjson run_id "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
+            --arg workflow_sha256 "$(shasum -a 256 .github/workflows/v1-acceptance-verify.yml | awk '{print $1}')" \
+            '{repository: $repository, head_sha: $head_sha, workflow_ref: $workflow_ref,
+              run_id: $run_id, attempt: $attempt, workflow_sha256: $workflow_sha256}' \
+            > "$reports/verifier-run.json"
+          verify_run() {
+            local label="$1"
+            local run_id="$2"
+            local workflow_path="$3"
+            local metadata
+            local workflow_sha256
+            test -f "$workflow_path"
+            workflow_sha256="$(shasum -a 256 "$workflow_path" | awk '{print $1}')"
+            metadata="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
+            jq -e \
+              --arg repository "$GITHUB_REPOSITORY" \
+              --arg candidate "$CANDIDATE_SHA" \
+              --arg workflow_path "$workflow_path" \
+              '.repository.full_name == $repository
+                and .event == "workflow_dispatch"
+                and .status == "completed"
+                and .conclusion == "success"
+                and .head_sha == $candidate
+                and .path == $workflow_path
+                and (.run_attempt | type == "number" and . >= 1)' <<< "$metadata" >/dev/null
+            printf '%s\n' "$metadata" | jq -c --arg workflow_sha256 "$workflow_sha256" \
+              '{id, repository: .repository.full_name, event, status, conclusion, head_sha, path, run_attempt, workflow_sha256: $workflow_sha256}' \
+              > "$reports/${label}-run.json"
+          }
+          verify_run native "$NATIVE_RUN_ID" .github/workflows/v1-acceptance.yml
+          verify_run provider "$PROVIDER_RUN_ID" .github/workflows/v1-provider-acceptance.yml
+          # This is an intentional hard dependency. Until this workflow exists
+          # and succeeds, the final fixed matrix cannot be accepted.
+          verify_run local "$LOCAL_RUN_ID" .github/workflows/v1-local-acceptance.yml
+          printf 'KIO_V1_VERIFY_REPORTS=%s\n' "$reports" >> "$GITHUB_ENV"
+
+      - name: Download only bounded expected and receipt files from verified runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          NATIVE_RUN_ID: ${{ inputs.native_run_id }}
+          PROVIDER_RUN_ID: ${{ inputs.provider_run_id }}
+          LOCAL_RUN_ID: ${{ inputs.local_run_id }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/kio-v1-verify-inputs"
+          expected_root="$root/expected"
+          receipt_root="$root/receipts"
+          mkdir "$root" "$expected_root" "$receipt_root"
+          native_seen=''
+          max_artifact_bytes=16777216
+          max_evidence_bytes=65536
+
+          select_artifacts() {
+            local label="$1"
+            local run_id="$2"
+            local matched=0
+            local rows
+            local source_report="$KIO_V1_VERIFY_REPORTS/${label}-run.json"
+            test -f "$source_report"
+            local source_attempt source_path source_workflow_sha256
+            source_attempt="$(jq -er '.run_attempt' "$source_report")"
+            source_path="$(jq -er '.path' "$source_report")"
+            source_workflow_sha256="$(jq -er '.workflow_sha256' "$source_report")"
+            test "$(jq -er '.id' "$source_report")" = "$run_id"
+            [[ "$source_attempt" =~ ^[1-9][0-9]*$ ]]
+            [[ "$source_workflow_sha256" =~ ^[0-9a-f]{64}$ ]]
+            rows="$(gh api --paginate \
+              "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}/artifacts?per_page=100" \
+              --jq '.artifacts[] | [.id, .name, (.expired | tostring), .size_in_bytes] | @tsv')"
+            while IFS=$'\t' read -r artifact_id artifact_name expired artifact_bytes; do
+              test -n "$artifact_id" || continue
+              [[ "$artifact_id" =~ ^[1-9][0-9]*$ ]]
+              case "$label" in
+                native)
+                  if [[ "$artifact_name" =~ ^kio-v1-native-(linux|macos|windows)-${CANDIDATE_SHA}$ ]]; then
+                    os="${BASH_REMATCH[1]}"
+                    case " $native_seen " in *" $os "*)
+                      echo "duplicate native evidence artifact for $os" >&2; exit 1 ;;
+                    esac
+                    native_seen="$native_seen $os"
+                  else
+                    continue
+                  fi
+                  ;;
+                provider)
+                  [[ "$artifact_name" == v1-provider-a08-* ]] || continue
+                  ;;
+                local)
+                  # Receipt artifacts from the private local source workflow.
+                  [[ "$artifact_name" == "kio-v1-local-${CANDIDATE_SHA}-"* ]] || continue
+                  ;;
+                *) exit 1 ;;
+              esac
+              [[ "$artifact_bytes" =~ ^[0-9]+$ ]]
+              test "$artifact_bytes" -le "$max_artifact_bytes" || {
+                echo "verified $label artifact exceeds the evidence size bound: $artifact_name" >&2
+                exit 1
+              }
+              test "$expired" = false || {
+                echo "verified $label artifact is expired: $artifact_name" >&2
+                exit 1
+              }
+              matched=$((matched + 1))
+              test "$matched" -le 16 || {
+                echo "too many $label acceptance evidence artifacts" >&2
+                exit 1
+              }
+              artifact_dir="$root/${label}-${artifact_id}"
+              mkdir "$artifact_dir"
+              archive="$artifact_dir/source.zip"
+              gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$archive"
+              mapfile -t entries < <(unzip -Z1 "$archive")
+              test "${#entries[@]}" -gt 0
+              test "${#entries[@]}" -le 128
+              duplicate_count="$(printf '%s\n' "${entries[@]}" | sort | uniq -d | wc -l | tr -d ' ')"
+              test "$duplicate_count" = 0
+              wanted=()
+              for entry in "${entries[@]}"; do
+                test -n "$entry"
+                case "$entry" in
+                  */*|*'\'*|*$'\n'*|*$'\r'*)
+                    echo "unsafe artifact path: $entry" >&2; exit 1 ;;
+                esac
+                [[ "$entry" =~ ^kio-v1-[A-Za-z0-9][A-Za-z0-9._-]{0,180}-(expected|receipt)\.json$ ]] \
+                  && wanted+=("$entry") || true
+              done
+              test "${#wanted[@]}" -gt 0 || {
+                echo "$label artifact has no expected/receipt evidence: $artifact_name" >&2
+                exit 1
+              }
+              evidence_dir="$artifact_dir/evidence"
+              mkdir "$evidence_dir"
+              for entry in "${wanted[@]}"; do
+                file="$evidence_dir/$entry"
+                test ! -e "$file"
+                set +o pipefail
+                unzip -p "$archive" "$entry" | head -c "$((max_evidence_bytes + 1))" > "$file"
+                pipeline_status=("${PIPESTATUS[@]}")
+                set -o pipefail
+                unzip_status="${pipeline_status[0]}"
+                head_status="${pipeline_status[1]}"
+                test "$head_status" = 0
+                case "$unzip_status" in 0|141) ;; *)
+                  echo "could not read bounded artifact evidence: $entry" >&2; exit 1 ;;
+                esac
+                test "$(wc -c < "$file" | tr -d ' ')" -le "$max_evidence_bytes" || {
+                  echo "artifact evidence exceeds the uncompressed byte bound: $entry" >&2
+                  exit 1
+                }
+                jq -e \
+                  --arg candidate "$CANDIDATE_SHA" \
+                  --arg workflow_path "$source_path" \
+                  --arg workflow_sha256 "$source_workflow_sha256" \
+                  --argjson source_run_id "$run_id" \
+                  --argjson source_attempt "$source_attempt" \
+                  '.candidate.candidate_sha == $candidate
+                    and .workflow.run_id == $source_run_id
+                    and .workflow.attempt == $source_attempt
+                    and .workflow.workflow_commit == $candidate
+                    and .workflow.workflow_path == $workflow_path
+                    and .workflow.workflow_sha256 == $workflow_sha256' "$file" >/dev/null
+                base="$entry"
+                case "$base" in
+                  kio-v1-*-expected.json)
+                    cp "$file" "$expected_root/${label}-${artifact_id}-${base}" ;;
+                  kio-v1-*-receipt.json)
+                    cp "$file" "$receipt_root/${label}-${artifact_id}-${base}" ;;
+                  *)
+                    echo "unexpected extracted evidence path: $file" >&2; exit 1 ;;
+                esac
+              done
+              rm "$archive"
+            done <<< "$rows"
+            test "$matched" -gt 0 || {
+              echo "verified $label run has no matching acceptance artifacts" >&2
+              exit 1
+            }
+            if test "$label" = native; then
+              test "$matched" = 3
+              test "$(printf '%s\n' $native_seen | sort | tr '\n' ' ')" = 'linux macos windows ' || {
+                echo 'native evidence does not cover Linux, macOS, and Windows exactly once' >&2
+                exit 1
+              }
+            fi
+          }
+
+          select_artifacts native "$NATIVE_RUN_ID"
+          select_artifacts provider "$PROVIDER_RUN_ID"
+          select_artifacts local "$LOCAL_RUN_ID"
+          mapfile -t expected_files < <(find "$expected_root" -maxdepth 1 -type f -name '*.json' -print | sort)
+          mapfile -t receipt_files < <(find "$receipt_root" -maxdepth 1 -type f -name '*.json' -print | sort)
+          test "${#expected_files[@]}" -gt 0
+          test "${#receipt_files[@]}" -gt 0
+          printf '%s\0' "${expected_files[@]}" > "$root/expected-files.nul"
+          printf '%s\0' "${receipt_files[@]}" > "$root/receipt-files.nul"
+          printf 'KIO_V1_VERIFY_INPUTS=%s\n' "$root" >> "$GITHUB_ENV"
+
+      - name: Assemble the complete immutable expected matrix and verify every receipt
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          eval_bin=target/debug/kio-eval
+          root="$KIO_V1_VERIFY_INPUTS"
+          mapfile -d '' -t expected_files < "$root/expected-files.nul"
+          mapfile -d '' -t receipt_files < "$root/receipt-files.nul"
+          expected_args=()
+          for file in "${expected_files[@]}"; do expected_args+=(--expected-case "$file"); done
+          receipt_args=()
+          for file in "${receipt_files[@]}"; do receipt_args+=(--receipt "$file"); done
+          manifest="$RUNNER_TEMP/kio-v1-full-expected.json"
+          "$eval_bin" acceptance assemble-expected \
+            --candidate-sha "$CANDIDATE_SHA" "${expected_args[@]}" --out "$manifest"
+          "$eval_bin" acceptance verify \
+            --expected "$manifest" "${receipt_args[@]}" \
+            | tee "$RUNNER_TEMP/kio-v1-full-verify.txt"
+
+      - name: Upload final verifier evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: kio-v1-final-verify-${{ inputs.candidate_sha }}-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/kio-v1-verify-reports/*.json
+            ${{ runner.temp }}/kio-v1-full-expected.json
+            ${{ runner.temp }}/kio-v1-full-verify.txt
+          if-no-files-found: warn
+          compression-level: 0

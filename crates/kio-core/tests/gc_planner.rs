@@ -46,10 +46,10 @@ impl Fixture {
             .0
     }
 
-    fn commit(&self, tree: &str, parents: Vec<String>, at: &str, kind: CommitType) -> String {
+    fn commit(&self, tree: &str, parent: Option<String>, at: &str, kind: CommitType) -> String {
         let commit = CommitObject::new(
             tree.into(),
-            parents,
+            parent,
             at.into(),
             "fixture".into(),
             TOOL.into(),
@@ -68,10 +68,10 @@ impl Fixture {
             .0
     }
 
-    fn purged_commit(&self, tree: &str, parents: Vec<String>, at: &str) -> String {
+    fn purged_commit(&self, tree: &str, parent: Option<String>, at: &str) -> String {
         let commit = CommitObject::new_purged(
             tree.into(),
-            parents,
+            parent,
             at.into(),
             "fixture purge".into(),
             TOOL.into(),
@@ -90,10 +90,16 @@ impl Fixture {
     }
 
     fn head(&self, hash: &str) {
-        fs::write(self.kio().join("HEAD"), hash).unwrap();
+        fs::write(self.kio().join("HEAD"), format!("{hash}\n")).unwrap();
     }
-    fn branch(&self, name: &str, hash: &str) {
-        fs::write(self.kio().join("refs/heads").join(name), hash).unwrap();
+    fn tag(&self, _name: &str, hash: &str) {
+        fs::write(
+            self.kio()
+                .join("refs/tags-v1")
+                .join(format!("tag-{}", &hash[7..])),
+            hash,
+        )
+        .unwrap();
     }
     fn policy(&self, text: &str) {
         fs::write(self.kio().join("config.toml"), text).unwrap();
@@ -199,19 +205,19 @@ fn recovery_rejects_preexisting_receipt_timestamp_or_inode_replacement() {
         let shallow_tree = f.tree("old");
         let shallow = f.commit(
             &shallow_tree,
-            vec![],
+            None,
             "2025-01-01T00:00:00Z",
             CommitType::Auto,
         );
         let head_tree = f.tree("head");
         let head = f.commit(
             &head_tree,
-            vec![shallow.clone()],
+            Some(shallow.clone()),
             "2026-01-01T00:00:00Z",
             CommitType::Manual,
         );
         f.head(&head);
-        f.branch("main", &head);
+        f.tag("main", &head);
         let receipt_dir = f.kio().join("gc/shallowed");
         fs::create_dir_all(&receipt_dir).unwrap();
         let leaf = &shallow[7..];
@@ -288,26 +294,26 @@ fn recovery_recomputes_retention_and_rejects_forged_marker_candidates() {
         let expired_tree = f.tree("expired");
         let expired = f.commit(
             &expired_tree,
-            vec![],
+            None,
             "2025-01-01T00:00:00Z",
             CommitType::Auto,
         );
         let recent_tree = f.tree("recent");
         let recent = f.commit(
             &recent_tree,
-            vec![expired.clone()],
+            Some(expired.clone()),
             "2026-01-01T00:00:00Z",
             CommitType::Auto,
         );
         let head_tree = f.tree("head");
         let head = f.commit(
             &head_tree,
-            vec![recent.clone()],
+            Some(recent.clone()),
             "2026-01-02T00:00:00Z",
             CommitType::Manual,
         );
         f.head(&head);
-        f.branch("main", &head);
+        f.tag("main", &head);
         let plan = f.plan();
         assert_eq!(hashes(&plan), vec![expired.clone()]);
         let marker = GcInProgressMarker::from_plan(
@@ -473,25 +479,25 @@ fn recovery_authorization_stays_bound_to_marker_start_across_retention_boundary(
     let expired_tree = f.tree("expired-at-start");
     let expired = f.commit(
         &expired_tree,
-        vec![],
+        None,
         "2025-01-01T00:00:00Z",
         CommitType::Auto,
     );
     let recent_tree = f.tree("recent-at-start");
     let recent = f.commit(
         &recent_tree,
-        vec![expired.clone()],
+        Some(expired.clone()),
         "2026-01-01T00:00:00Z",
         CommitType::Auto,
     );
     let head = f.commit(
         &f.tree("head"),
-        vec![recent.clone()],
+        Some(recent.clone()),
         "2026-01-02T00:00:00Z",
         CommitType::Manual,
     );
     f.head(&head);
-    f.branch("main", &head);
+    f.tag("main", &head);
 
     let start_plan = f.plan();
     assert_eq!(hashes(&start_plan), vec![expired]);
@@ -532,18 +538,17 @@ fn recovery_authorization_stays_bound_to_marker_start_across_retention_boundary(
 fn same_byte_ref_replacement_changes_plan_truth_binding() {
     let f = Fixture::new();
     let tree = f.tree("old");
-    let old = f.commit(&tree, vec![], "2025-01-01T00:00:00Z", CommitType::Auto);
+    let old = f.commit(&tree, None, "2025-01-01T00:00:00Z", CommitType::Auto);
     let head_tree = f.tree("head");
     let head = f.commit(
         &head_tree,
-        vec![old],
+        Some(old),
         "2026-01-01T00:00:00Z",
         CommitType::Manual,
     );
     f.head(&head);
-    f.branch("main", &head);
     let first = f.plan();
-    let path = f.kio().join("refs/heads/main");
+    let path = f.kio().join("HEAD");
     let bytes = fs::read(&path).unwrap();
     let replacement = path.with_extension("same-bytes");
     fs::write(&replacement, bytes).unwrap();
@@ -558,16 +563,16 @@ fn same_byte_ref_replacement_changes_plan_truth_binding() {
 fn marker_owned_receipt_must_use_marker_timestamp() {
     let f = Fixture::new();
     let tree = f.tree("expired");
-    let expired = f.commit(&tree, vec![], "2025-01-01T00:00:00Z", CommitType::Auto);
+    let expired = f.commit(&tree, None, "2025-01-01T00:00:00Z", CommitType::Auto);
     let head_tree = f.tree("head");
     let head = f.commit(
         &head_tree,
-        vec![expired],
+        Some(expired),
         "2026-01-01T00:00:00Z",
         CommitType::Manual,
     );
     f.head(&head);
-    f.branch("main", &head);
+    f.tag("main", &head);
     let plan = f.plan();
     let mut marker = GcInProgressMarker::from_plan(
         &plan,
@@ -617,16 +622,16 @@ fn marker_owned_receipt_must_use_marker_timestamp() {
 fn sweeping_receipt_binding_rejects_same_bytes_inode_replacement() {
     let f = Fixture::new();
     let tree = f.tree("expired");
-    let expired = f.commit(&tree, vec![], "2025-01-01T00:00:00Z", CommitType::Auto);
+    let expired = f.commit(&tree, None, "2025-01-01T00:00:00Z", CommitType::Auto);
     let head_tree = f.tree("head");
     let head = f.commit(
         &head_tree,
-        vec![expired],
+        Some(expired),
         "2026-01-01T00:00:00Z",
         CommitType::Manual,
     );
     f.head(&head);
-    f.branch("main", &head);
+    f.tag("main", &head);
     let plan = f.plan();
     let mut marker = GcInProgressMarker::from_plan(
         &plan,
@@ -665,37 +670,37 @@ fn retention_tier_boundaries_keep_each_tier_and_plan_only_expired_auto() {
     f.policy("[gc]\nmode=\"manual_only\"\n[gc.auto_retention]\nkeep_last_hours=1\nkeep_hourly_days=1\nkeep_daily_weeks=1\nkeep_weekly_months=1\n");
     let old = f.commit(
         &f.tree("old"),
-        vec![],
+        None,
         "2025-12-02T00:00:00Z",
         CommitType::Auto,
     );
     let weekly = f.commit(
         &f.tree("weekly"),
-        vec![old.clone()],
+        Some(old.clone()),
         "2025-12-25T00:00:00Z",
         CommitType::Auto,
     );
     let daily = f.commit(
         &f.tree("daily"),
-        vec![weekly],
+        Some(weekly),
         "2025-12-31T00:00:00Z",
         CommitType::Auto,
     );
     let hourly = f.commit(
         &f.tree("hourly"),
-        vec![daily],
+        Some(daily),
         "2025-12-31T23:00:00Z",
         CommitType::Auto,
     );
     let recent = f.commit(
         &f.tree("recent"),
-        vec![hourly],
+        Some(hourly),
         "2025-12-31T23:00:01Z",
         CommitType::Auto,
     );
     let head = f.commit(
         &f.tree("head"),
-        vec![recent],
+        Some(recent),
         "2026-01-01T00:00:00Z",
         CommitType::Manual,
     );
@@ -743,25 +748,25 @@ fn fractional_timestamps_preserve_true_future_and_latest_bucket_member() {
     f.policy("[gc]\nmode=\"manual_only\"\n[gc.auto_retention]\nkeep_last_hours=0\nkeep_hourly_days=7\nkeep_daily_weeks=1\nkeep_weekly_months=1\n");
     let older = f.commit(
         &f.tree("fraction-older"),
-        vec![],
+        None,
         "2025-12-31T12:00:00.100Z",
         CommitType::Auto,
     );
     let newer = f.commit(
         &f.tree("fraction-newer"),
-        vec![older.clone()],
+        Some(older.clone()),
         "2025-12-31T12:00:00.900Z",
         CommitType::Auto,
     );
     let future = f.commit(
         &f.tree("fraction-future"),
-        vec![newer],
+        Some(newer),
         "2026-01-01T00:00:00.100Z",
         CommitType::Auto,
     );
     let head = f.commit(
         &f.tree("head"),
-        vec![future],
+        Some(future),
         "2026-01-01T00:00:01Z",
         CommitType::Manual,
     );
@@ -774,58 +779,58 @@ fn fractional_timestamps_preserve_true_future_and_latest_bucket_member() {
 }
 
 #[test]
-fn head_branch_tag_tips_and_protected_types_are_excluded() {
+fn head_and_tag_tips_and_protected_types_are_excluded() {
     let f = Fixture::new();
     f.policy("[gc]\nmode=\"manual_only\"\n[gc.auto_retention]\nkeep_last_hours=0\nkeep_hourly_days=0\nkeep_daily_weeks=0\nkeep_weekly_months=0\n");
     let auto = f.commit(
         &f.tree("auto"),
-        vec![],
+        None,
         "2025-01-01T00:00:00Z",
         CommitType::Auto,
     );
     let manual = f.commit(
         &f.tree("manual"),
-        vec![auto.clone()],
+        Some(auto.clone()),
         "2025-01-02T00:00:00Z",
         CommitType::Manual,
     );
     let intermediate = f.commit(
         &f.tree("intermediate"),
-        vec![manual],
+        Some(manual),
         "2025-01-03T00:00:00Z",
         CommitType::Manual,
     );
     let protected_manual = f.commit(
         &f.tree("protected-manual"),
-        vec![intermediate],
+        Some(intermediate),
         "2025-01-04T00:00:00Z",
         CommitType::Manual,
     );
     let purged = f.purged_commit(
         &f.tree("purged"),
-        vec![protected_manual],
+        Some(protected_manual),
         "2025-01-05T00:00:00Z",
     );
     let head = f.commit(
         &f.tree("head"),
-        vec![purged],
+        Some(purged),
         "2025-01-06T00:00:00Z",
         CommitType::Auto,
     );
-    let branch = f.commit(
-        &f.tree("branch"),
-        vec![],
+    let tagged_history = f.commit(
+        &f.tree("tagged-history"),
+        None,
         "2025-01-07T00:00:00Z",
         CommitType::Auto,
     );
     let tag = f.commit(
         &f.tree("tag"),
-        vec![],
+        None,
         "2025-01-08T00:00:00Z",
         CommitType::Auto,
     );
     f.head(&head);
-    f.branch("topic", &branch);
+    f.tag("topic", &tagged_history);
     fs::write(
         f.kio()
             .join("refs/tags-v1")
@@ -863,13 +868,13 @@ fn raw_chunk_and_commit_objects_are_never_planned() {
     let chunk_hash = store.write_chunk(&chunk).unwrap();
     let auto = f.commit(
         &f.tree("auto"),
-        vec![],
+        None,
         "2025-01-01T00:00:00Z",
         CommitType::Auto,
     );
     let head = f.commit(
         &f.tree("head"),
-        vec![auto.clone()],
+        Some(auto.clone()),
         "2025-01-02T00:00:00Z",
         CommitType::Manual,
     );
@@ -888,37 +893,54 @@ fn raw_chunk_and_commit_objects_are_never_planned() {
 }
 
 #[test]
-fn repaired_retention_is_per_branch_and_shared_trees_are_not_candidates() {
+fn repaired_retention_follows_head_and_shared_trees_are_not_candidates() {
     let f = Fixture::new();
-    f.policy("[gc]\nmode=\"manual_only\"\n[gc.auto_retention]\nkeep_last_hours=0\nkeep_hourly_days=0\nkeep_daily_weeks=0\nkeep_weekly_months=0\n[gc.derived_retention]\nkeep_repaired_per_branch=1\n");
+    f.policy("[gc]\nmode=\"manual_only\"\n[gc.auto_retention]\nkeep_last_hours=0\nkeep_hourly_days=0\nkeep_daily_weeks=0\nkeep_weekly_months=0\n[gc.derived_retention]\nkeep_repaired=1\n");
     let repaired_old = f.commit(
         &f.tree("old"),
-        vec![],
+        None,
         "2025-01-01T00:00:00Z",
         CommitType::Repaired,
     );
     let repaired_new = f.commit(
         &f.tree("new"),
-        vec![repaired_old.clone()],
+        Some(repaired_old.clone()),
         "2025-01-02T00:00:00Z",
         CommitType::Repaired,
     );
     let shared_tree = f.tree("shared");
     let auto = f.commit(
         &shared_tree,
-        vec![repaired_new],
+        Some(repaired_new),
         "2025-01-03T00:00:00Z",
         CommitType::Auto,
     );
     let manual = f.commit(
         &shared_tree,
-        vec![auto],
+        Some(auto),
         "2025-01-04T00:00:00Z",
         CommitType::Manual,
     );
     f.head(&manual);
-    f.branch("main", &manual);
+    f.tag("main", &manual);
+    let outside_head = f.commit(
+        &f.tree("outside-head"),
+        None,
+        "2025-01-05T00:00:00Z",
+        CommitType::Repaired,
+    );
+    let tag_tip = f.commit(
+        &f.tree("tag-tip"),
+        Some(outside_head),
+        "2025-01-06T00:00:00Z",
+        CommitType::Manual,
+    );
+    f.tag("detached", &tag_tip);
     let p = f.plan();
+    let output = serde_json::to_value(&p).unwrap();
+    assert_eq!(output["policy"]["keep_repaired"], 1);
+    assert!(output["policy"].get("keep_repaired_per_branch").is_none());
+    assert_eq!(excluded(&p, "repaired_outside_head"), 1);
     assert_eq!(hashes(&p), vec![repaired_old]);
     assert_eq!(excluded(&p, "retained_repaired"), 1);
     assert_eq!(excluded(&p, "shared_tree_non_shallow"), 1);
@@ -927,13 +949,31 @@ fn repaired_retention_is_per_branch_and_shared_trees_are_not_candidates() {
 }
 
 #[test]
+fn repaired_retention_rejects_legacy_key_instead_of_defaulting() {
+    let f = Fixture::new();
+    for fields in [
+        "keep_repaired_per_branch=1",
+        "keep_repaired=1\nkeep_repaired_per_branch=1",
+    ] {
+        f.policy(&format!(
+            "[gc]\nmode=\"manual_only\"\n[gc.derived_retention]\n{fields}\n"
+        ));
+        let error = GcPlanner::bind(f.canonical_root())
+            .unwrap()
+            .plan_at(NOW)
+            .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-CONFIG-SCHEMA-001");
+    }
+}
+
+#[test]
 fn an_existing_shallow_receipt_is_idempotent_and_skips_missing_tree() {
     let f = Fixture::new();
     let tree = f.tree("gone");
-    let shallow = f.commit(&tree, vec![], "2025-01-01T00:00:00Z", CommitType::Auto);
+    let shallow = f.commit(&tree, None, "2025-01-01T00:00:00Z", CommitType::Auto);
     let head = f.commit(
         &f.tree("head"),
-        vec![shallow.clone()],
+        Some(shallow.clone()),
         "2025-01-02T00:00:00Z",
         CommitType::Manual,
     );
@@ -970,21 +1010,16 @@ fn an_existing_shallow_receipt_is_idempotent_and_skips_missing_tree() {
 fn final_shallow_validation_requires_every_shared_tree_receipt() {
     let f = Fixture::new();
     let shared_tree = f.tree("shared-gone");
-    let first = f.commit(
-        &shared_tree,
-        vec![],
-        "2025-01-01T00:00:00Z",
-        CommitType::Auto,
-    );
+    let first = f.commit(&shared_tree, None, "2025-01-01T00:00:00Z", CommitType::Auto);
     let second = f.commit(
         &shared_tree,
-        vec![first.clone()],
+        Some(first.clone()),
         "2025-01-01T00:00:01Z",
         CommitType::Auto,
     );
     let head = f.commit(
         &f.tree("shared-head"),
-        vec![second],
+        Some(second),
         "2025-01-02T00:00:00Z",
         CommitType::Manual,
     );
@@ -1038,15 +1073,15 @@ fn final_shallow_inventory_rejects_a_symlinked_kio_boundary() {
 fn marker_estimated_bytes_must_exactly_bind_candidate_tree_sizes() {
     let f = Fixture::new();
     let tree = f.tree("expired-size-bound");
-    let expired = f.commit(&tree, vec![], "2025-01-01T00:00:00Z", CommitType::Auto);
+    let expired = f.commit(&tree, None, "2025-01-01T00:00:00Z", CommitType::Auto);
     let head = f.commit(
         &f.tree("size-bound-head"),
-        vec![expired],
+        Some(expired),
         "2026-01-01T00:00:00Z",
         CommitType::Manual,
     );
     f.head(&head);
-    f.branch("main", &head);
+    f.tag("main", &head);
     let plan = f.plan();
     let mut marker = GcInProgressMarker::from_plan(
         &plan,
@@ -1067,10 +1102,10 @@ fn marker_estimated_bytes_must_exactly_bind_candidate_tree_sizes() {
 fn malformed_receipt_and_missing_unreceipted_tree_fail_safely() {
     let f = Fixture::new();
     let tree = f.tree("missing");
-    let auto = f.commit(&tree, vec![], "2025-01-01T00:00:00Z", CommitType::Auto);
+    let auto = f.commit(&tree, None, "2025-01-01T00:00:00Z", CommitType::Auto);
     let head = f.commit(
         &f.tree("head"),
-        vec![auto],
+        Some(auto),
         "2025-01-02T00:00:00Z",
         CommitType::Manual,
     );
@@ -1106,7 +1141,7 @@ fn malformed_receipt_and_missing_unreceipted_tree_fail_safely() {
 
     let f = Fixture::new();
     let tree = f.tree("invalid-receipt-time");
-    let commit = f.commit(&tree, vec![], "2025-01-01T00:00:00Z", CommitType::Auto);
+    let commit = f.commit(&tree, None, "2025-01-01T00:00:00Z", CommitType::Auto);
     let receipts = f.kio().join("gc/shallowed");
     fs::create_dir_all(&receipts).unwrap();
     fs::write(
@@ -1163,7 +1198,7 @@ fn rejects_symlink_hardlink_and_traversal_limits() {
     let f = Fixture::new();
     let auto = f.commit(
         &f.tree("depth"),
-        vec![],
+        None,
         "2025-01-01T00:00:00Z",
         CommitType::Auto,
     );
@@ -1179,6 +1214,8 @@ fn rejects_symlink_hardlink_and_traversal_limits() {
     assert_eq!(err.error_code(), "KIO-E-GC-PLAN-LIMIT-001");
 
     let f = Fixture::new();
+    let tag_target = format!("sha256:{}", "a".repeat(64));
+    f.tag("retained", &tag_target);
     let err = GcPlanner::bind(f.canonical_root())
         .unwrap()
         .with_limits(GcPlanLimits {
@@ -1203,7 +1240,7 @@ fn rejects_symlink_hardlink_and_traversal_limits() {
     let f = Fixture::new();
     let auto = f.commit(
         &f.tree("graph"),
-        vec![],
+        None,
         "2025-01-01T00:00:00Z",
         CommitType::Auto,
     );
@@ -1235,13 +1272,13 @@ fn plan_serialization_is_deterministic() {
     let f = Fixture::new();
     let auto = f.commit(
         &f.tree("auto"),
-        vec![],
+        None,
         "2025-01-01T00:00:00Z",
         CommitType::Auto,
     );
     let head = f.commit(
         &f.tree("head"),
-        vec![auto],
+        Some(auto),
         "2025-01-02T00:00:00Z",
         CommitType::Manual,
     );

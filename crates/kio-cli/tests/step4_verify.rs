@@ -41,7 +41,7 @@ fn fixture() -> (TempDir, Value, String) {
     )
     .unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline", "--yes"]);
     let search = success(&dir, &["search", "3600", "--mode", "text"]);
     let pointer = search["results"][0]["evidence_pointer"].clone();
     let uri = search["results"][0]["evidence_uri"]
@@ -57,7 +57,7 @@ fn write_purged_commit(dir: &TempDir, timestamp: &str, purged_raws: &[String]) -
     let parent = repo.read_commit(&parent_hash).unwrap();
     let purged = CommitObject::new_purged(
         parent.tree,
-        vec![parent_hash],
+        Some(parent_hash),
         timestamp.to_owned(),
         "legal".to_owned(),
         parent.tool_lock_hash,
@@ -339,7 +339,7 @@ fn ct4_verify_genuine_shallow_commit_uses_durable_chunk_cas() {
         "# Advance\n\nadvance the fixture head\n",
     )
     .unwrap();
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline", "--yes"]);
     let receipt_path = dir
         .path()
         .join(".kio/gc/shallowed")
@@ -425,7 +425,7 @@ fn ct4_verify_and_fsck_accept_valid_tombstone_terminal() {
     let purged_at = "2026-07-13T00:00:00Z";
     let purged = CommitObject::new_purged(
         parent.tree,
-        vec![parent_hash],
+        Some(parent_hash),
         purged_at.to_owned(),
         "legal".to_owned(),
         parent.tool_lock_hash,
@@ -441,8 +441,7 @@ fn ct4_verify_and_fsck_accept_valid_tombstone_terminal() {
     let (purged_hash, _) = store
         .write_json(ObjectKind::Commit, &serde_json::to_value(&purged).unwrap())
         .unwrap();
-    fs::write(dir.path().join(".kio/HEAD"), &purged_hash).unwrap();
-    fs::write(dir.path().join(".kio/refs/heads/main"), &purged_hash).unwrap();
+    fs::write(dir.path().join(".kio/HEAD"), format!("{purged_hash}\n")).unwrap();
     fs::write(
         &tombstone,
         serde_json::to_vec(&serde_json::json!({
@@ -515,10 +514,14 @@ fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
         )
         .unwrap();
     let mut unit: Value = serde_json::from_slice(&unit_bytes).unwrap();
+    let missing_image_hash = format!("sha256:{}", "f".repeat(64));
     unit["metadata"]["images"] = serde_json::json!([{
-        "hash": format!("sha256:{}", "f".repeat(64)),
+        "hash": missing_image_hash.clone(),
         "media_type": "image/png"
     }]);
+    // Metadata alone is descriptive. Make this a typed local ownership edge
+    // so fsck must verify the missing image CAS object.
+    unit["owned_image_hashes"] = serde_json::json!([missing_image_hash]);
     let unit_bytes = canonical_json_bytes(&unit).unwrap();
     let replacement_unit_hash = store
         .write_content_object(ContentObjectKind::NormalizedUnit, &unit_bytes)
@@ -535,7 +538,7 @@ fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
         .unwrap();
     let commit = CommitObject::new(
         tree_hash,
-        vec![parent_hash],
+        Some(parent_hash),
         "2026-08-12T00:00:00Z".to_owned(),
         "fixture: immutable failed and image references".to_owned(),
         parent.tool_lock_hash,
@@ -550,8 +553,7 @@ fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
     let (commit_hash, _) = store
         .write_json(ObjectKind::Commit, &serde_json::to_value(&commit).unwrap())
         .unwrap();
-    fs::write(repo.kio_dir().join("refs/heads/main"), &commit_hash).unwrap();
-    fs::write(repo.kio_dir().join("HEAD"), &commit_hash).unwrap();
+    fs::write(repo.kio_dir().join("HEAD"), format!("{commit_hash}\n")).unwrap();
 
     let stdout = kio(&dir, &["repair", "verify-objects"])
         .arg("--json")
@@ -572,12 +574,13 @@ fn ct4_fsck_checks_failed_prepared_and_metadata_only_image_references() {
 }
 
 #[test]
-fn ct4_fsck_accepts_erase_receipt_reachable_only_from_canonical_tag() {
+fn ct4_fsck_accepts_erase_receipt_in_current_head_ancestry() {
     let (dir, pointer, _) = fixture();
     let raw_hash = pointer["raw_hash"].as_str().unwrap();
     let timestamp = "2026-07-13T00:00:00Z";
     let purged_hash = write_purged_commit(&dir, timestamp, &[raw_hash.to_owned()]);
     tag_commit(&dir, "purged-only", &purged_hash);
+    fs::write(dir.path().join(".kio/HEAD"), format!("{purged_hash}\n")).unwrap();
     write_receipt(&dir, raw_hash, &purged_hash, timestamp);
     let store = ObjectStore::new(dir.path().join(".kio"));
     fs::remove_file(store.object_path(ObjectKind::Raw, raw_hash).unwrap()).unwrap();
@@ -600,6 +603,7 @@ fn ct4_fsck_live_raw_with_stale_receipt_and_no_republication_commit_is_incomplet
     let timestamp = "2026-07-13T00:00:00Z";
     let purged_hash = write_purged_commit(&dir, timestamp, &[raw_hash.to_owned()]);
     tag_commit(&dir, "stale-receipt", &purged_hash);
+    fs::write(dir.path().join(".kio/HEAD"), format!("{purged_hash}\n")).unwrap();
     let receipt = write_receipt(&dir, raw_hash, &purged_hash, timestamp);
     let receipt_before = fs::read(&receipt).unwrap();
     let head_before = fs::read(dir.path().join(".kio/HEAD")).unwrap();
@@ -636,13 +640,13 @@ fn ct4_fsck_live_raw_with_republication_commit_backfills_retired_receipt() {
     let purged_hash = write_purged_commit(&dir, timestamp, std::slice::from_ref(&raw_hash));
     write_receipt(&dir, &raw_hash, &purged_hash, timestamp);
 
-    // A republication commit: a normal child of the purge commit, tagged so
-    // both it and its ancestor (the purge commit) are ref-reachable.
+    // A republication commit is the new HEAD and a normal child of the purge
+    // commit. The tag names that same linear ancestry; it grants no authority.
     let repo = kio_core::scope::Repository::open(dir.path()).unwrap();
     let purged_commit_object = repo.read_commit(&purged_hash).unwrap();
     let republication = CommitObject::new(
         purged_commit_object.tree.clone(),
-        vec![purged_hash.clone()],
+        Some(purged_hash.clone()),
         "2026-07-14T00:00:00Z".to_owned(),
         "republished".to_owned(),
         purged_commit_object.tool_lock_hash.clone(),
@@ -662,6 +666,11 @@ fn ct4_fsck_live_raw_with_republication_commit_backfills_retired_receipt() {
         )
         .unwrap();
     tag_commit(&dir, "republication", &republication_hash);
+    fs::write(
+        dir.path().join(".kio/HEAD"),
+        format!("{republication_hash}\n"),
+    )
+    .unwrap();
 
     let output = success(&dir, &["repair", "verify-objects"]);
     assert_eq!(output["status"], "ok", "{output}");
@@ -673,7 +682,7 @@ fn ct4_fsck_live_raw_with_republication_commit_backfills_retired_receipt() {
             .any(|finding| finding["kind"] == "purge_incomplete")
     );
 
-    let state = PurgeState::new(dir.path().join(".kio"));
+    let state = PurgeState::open(dir.path().join(".kio")).unwrap();
     let receipt = state.read_erase_receipt(&raw_hash).unwrap().unwrap();
     assert!(!receipt.is_active());
     assert_eq!(
@@ -704,7 +713,7 @@ fn ct4_fsck_unindexed_scope_recovers_lifecycle_epoch_before_retired_backfill() {
     let purged_commit_object = repo.read_commit(&purged_hash).unwrap();
     let republication = CommitObject::new(
         purged_commit_object.tree.clone(),
-        vec![purged_hash.clone()],
+        Some(purged_hash.clone()),
         "2026-07-14T00:00:00Z".to_owned(),
         "republished".to_owned(),
         purged_commit_object.tool_lock_hash.clone(),
@@ -723,11 +732,17 @@ fn ct4_fsck_unindexed_scope_recovers_lifecycle_epoch_before_retired_backfill() {
         )
         .unwrap();
     tag_commit(&dir, "republication", &republication_hash);
+    fs::write(
+        dir.path().join(".kio/HEAD"),
+        format!("{republication_hash}\n"),
+    )
+    .unwrap();
 
     let output = success(&dir, &["repair", "verify-objects"]);
     assert_eq!(output["status"], "ok", "{output}");
     assert!(!dir.path().join(".kio/index/sqlite.db").exists());
-    let receipt = PurgeState::new(dir.path().join(".kio"))
+    let receipt = PurgeState::open(dir.path().join(".kio"))
+        .unwrap()
         .read_erase_receipt(&raw_hash)
         .unwrap()
         .unwrap();
@@ -742,7 +757,7 @@ fn ct4_fsck_unindexed_scope_recovers_lifecycle_epoch_before_retired_backfill() {
 fn ct4_fsck_active_journal_suppresses_raw_recovery_and_ref_mutation() {
     let (dir, pointer, _) = fixture();
     let raw_hash = pointer["raw_hash"].as_str().unwrap().to_owned();
-    let purge = PurgeState::new(dir.path().join(".kio"));
+    let purge = PurgeState::open(dir.path().join(".kio")).unwrap();
     purge
         .begin(
             vec![raw_hash.clone()],
@@ -804,7 +819,14 @@ fn ct4_fsck_rejects_linked_object_namespace_without_traversing_it() {
             .as_array()
             .unwrap()
             .iter()
-            .any(|finding| finding["kind"] == "non_regular_object")
+            .any(|finding| finding["kind"] == "object_namespace_unavailable")
+    );
+    assert_eq!(output["status"], "verification_blocked");
+    assert_eq!(output["repaired_raw_count"], 0);
+    assert_eq!(fs::read_link(&chunks).unwrap(), outside.path());
+    assert_eq!(
+        fs::read(outside.path().join("secret")).unwrap(),
+        b"must not be inventoried"
     );
 }
 
@@ -821,6 +843,7 @@ fn ct4_fsck_live_raw_tombstone_and_dual_terminal_markers_are_incomplete_purge_no
     let timestamp = "2026-07-13T00:00:00Z";
     let purged_hash = write_purged_commit(&dir, timestamp, &[raw_hash.to_owned()]);
     tag_commit(&dir, "marker-conflict", &purged_hash);
+    fs::write(dir.path().join(".kio/HEAD"), format!("{purged_hash}\n")).unwrap();
     let tombstone = write_tombstone(&dir, raw_hash, &purged_hash, timestamp);
     let stdout = kio(&dir, &["repair", "verify-objects"])
         .arg("--json")

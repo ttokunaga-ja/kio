@@ -44,7 +44,7 @@ use kio_pipeline::ledger::ops::{
     plan_bounded_sweep, recovery_deadline_passed, recovery_finish_cleanup, recovery_mark_found,
     recovery_settle_unknown, resolve_abandon_selector, resolve_billing_from_usd_field,
     stalled_rows, sync_record_provider_request_id, terminal_transaction,
-    visibility_grace_period_elapsed, with_immediate_transaction,
+    visibility_grace_period_elapsed,
 };
 use kio_pipeline::ledger::schema::{
     CREATE_BATCH_REQUESTS_SQL, CREATE_COST_LEDGER_SQL, CREATE_IDX_BATCH_REQUESTS_INFLIGHT_SQL,
@@ -63,7 +63,15 @@ use tempfile::TempDir;
 
 fn open_temp_ledger() -> (TempDir, LedgerDb) {
     let dir = tempfile::tempdir().unwrap();
-    let db = LedgerDb::open(dir.path().join("cost-ledger.sqlite")).unwrap();
+    let device_dir = std::fs::canonicalize(dir.path()).unwrap().join("device");
+    std::fs::create_dir(&device_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&device_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = device_dir.join("cost-ledger.sqlite");
+    let db = LedgerDb::initialize(&path).unwrap();
     (dir, db)
 }
 
@@ -470,27 +478,48 @@ fn cl07_required_indexes_canonical_and_partial_index_used_by_planner() {
     );
 }
 
-/// CL08: covered as `ledger::schema::tests::missing_index_is_self_healed_on_open`
-/// / `malformed_index_is_dropped_and_recreated_on_open` in kio-pipeline (needs
-/// only a bare `Connection` + `LedgerDb::open`, no CLI). Re-asserted here at the
-/// public-API level actually used by the ledger store.
+/// CL08: lifecycle opening is strict. A required-index mutation is not silently
+/// repaired: the existing authority/checkpoint and SQLite file remain intact,
+/// and an explicit recovery workflow must decide the next action.
 #[test]
-fn cl08_ledger_db_open_self_heals_a_missing_required_index() {
+fn cl08_ledger_db_open_existing_rejects_missing_required_index_without_repair() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("cost-ledger.sqlite");
+    let device_dir = std::fs::canonicalize(dir.path()).unwrap().join("device");
+    std::fs::create_dir(&device_dir).unwrap();
+    #[cfg(unix)]
     {
-        let conn = Connection::open(&path).unwrap();
-        conn.execute_batch(CREATE_COST_LEDGER_SQL).unwrap();
-        conn.execute_batch(CREATE_IDX_COST_LEDGER_MONTH_SQL)
-            .unwrap();
-        conn.execute_batch(CREATE_BATCH_REQUESTS_SQL).unwrap();
-        conn.execute_batch(CREATE_SCHEMA_MIGRATIONS_SQL).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&device_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
-    let db = LedgerDb::open(&path).unwrap();
+    let path = device_dir.join("cost-ledger.sqlite");
+    let db = LedgerDb::initialize(&path).unwrap();
+    let authority =
+        std::fs::read(path.with_file_name("cost-ledger.sqlite.authority.json")).unwrap();
+    let checkpoint =
+        std::fs::read(path.with_file_name("cost-ledger.sqlite.checkpoint.json")).unwrap();
+    drop(db);
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP INDEX idx_batch_requests_inflight;")
+        .unwrap();
+    assert!(LedgerDb::open_existing(&path).is_err());
     assert!(
-        object_sql(db.connection(), "index", "idx_batch_requests_inflight")
-            .unwrap()
-            .is_some()
+        object_sql(
+            &Connection::open(&path).unwrap(),
+            "index",
+            "idx_batch_requests_inflight"
+        )
+        .unwrap()
+        .is_none(),
+        "strict open must not repair the mutation"
+    );
+    assert_eq!(
+        std::fs::read(path.with_file_name("cost-ledger.sqlite.authority.json")).unwrap(),
+        authority
+    );
+    assert_eq!(
+        std::fs::read(path.with_file_name("cost-ledger.sqlite.checkpoint.json")).unwrap(),
+        checkpoint
     );
 }
 
@@ -503,14 +532,14 @@ fn cl08_ledger_db_open_self_heals_a_missing_required_index() {
 fn cl13_phase1_new_key_sets_state0_and_all_null_fields() {
     let (_dir, db) = open_temp_ledger();
     let outcome = phase1_intent(
-        db.connection(),
+        &db,
         &key("s", "markdownize", "h"),
         RequestKind::Batch,
         2.5,
         None,
     )
     .unwrap();
-    let row = get_batch_request(db.connection(), &key("s", "markdownize", "h"))
+    let row = get_batch_request(&db, &key("s", "markdownize", "h"))
         .unwrap()
         .unwrap();
     assert_eq!(row.state, BatchState::Intent);
@@ -539,10 +568,11 @@ fn cl13_phase1_new_key_sets_state0_and_all_null_fields() {
 fn cl14_phase1_reissue_nulls_residue_but_preserves_attempts() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let first = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    let first = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
     // Manually bump `attempts` (as a terminal Tx would) and drive the row to a
     // fully-cleaned-up terminal state so phase 1 is allowed to reissue.
-    db.connection()
+    Connection::open(db.path())
+        .unwrap()
         .execute(
             "UPDATE batch_requests SET attempts = 3, upload_id='up1', batch_job_id='job1', \
              provider_scope_id='prov1', completed_at=999, error='network_error' \
@@ -551,7 +581,7 @@ fn cl14_phase1_reissue_nulls_residue_but_preserves_attempts() {
         )
         .unwrap();
     terminal_transaction(
-        db.connection(),
+        &db,
         &plain_terminal_write(
             &task_key,
             Outcome::Expired,
@@ -566,11 +596,9 @@ fn cl14_phase1_reissue_nulls_residue_but_preserves_attempts() {
     )
     .unwrap();
 
-    let second = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 4.0, None).unwrap();
+    let second = phase1_intent(&db, &task_key, RequestKind::Batch, 4.0, None).unwrap();
     assert_ne!(second.intent_token, first.intent_token);
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(row.state, BatchState::Intent);
     assert!(row.upload_id.is_none());
     assert!(row.batch_job_id.is_none());
@@ -588,7 +616,8 @@ fn cl15_submission_seq_max_plus_one_and_omission_regression() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
     // Seed cost_ledger with a prior confirmed row at seq=3.
-    db.connection()
+    Connection::open(db.path())
+        .unwrap()
         .execute(
             "INSERT INTO cost_ledger (scope_id, adapter_kind, input_hash, tool_profile_hash, \
              submission_seq, batch_job_id, usd, estimated, outcome, month, recorded_at) \
@@ -602,10 +631,10 @@ fn cl15_submission_seq_max_plus_one_and_omission_regression() {
         )
         .unwrap();
     // (a) correct implementation: phase1_intent computes MAX+1 = 4.
-    let outcome = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    let outcome = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
     assert_eq!(outcome.submission_seq, 4);
     terminal_transaction(
-        db.connection(),
+        &db,
         &plain_terminal_write(
             &task_key,
             Outcome::Succeeded,
@@ -619,7 +648,7 @@ fn cl15_submission_seq_max_plus_one_and_omission_regression() {
         ),
     )
     .unwrap();
-    let rows = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+    let rows = cost_ledger_rows_for_key(&db, &task_key).unwrap();
     assert!(
         rows.iter()
             .any(|row| row.submission_seq == 4 && row.usd == 5.0)
@@ -629,7 +658,8 @@ fn cl15_submission_seq_max_plus_one_and_omission_regression() {
     // old row's stale value (2) collides with an already-recorded ledger row at
     // the same seq and is silently absorbed by ON CONFLICT DO NOTHING.
     let other_key = key("s2", "markdownize", "h2");
-    db.connection()
+    Connection::open(db.path())
+        .unwrap()
         .execute(
             "INSERT INTO cost_ledger (scope_id, adapter_kind, input_hash, tool_profile_hash, \
              submission_seq, batch_job_id, usd, estimated, outcome, month, recorded_at) \
@@ -643,7 +673,7 @@ fn cl15_submission_seq_max_plus_one_and_omission_regression() {
         )
         .unwrap();
     let lost = terminal_transaction(
-        db.connection(),
+        &db,
         &TerminalWrite {
             key: &other_key,
             outcome: Outcome::Succeeded,
@@ -668,8 +698,8 @@ fn cl15_submission_seq_max_plus_one_and_omission_regression() {
     // demonstrate the raw INSERT collision an implementation that skipped the
     // MAX+1 rule at phase 1 would hit.
     assert!(lost.is_ok());
-    let collision = db
-        .connection()
+    let collision = Connection::open(db.path())
+        .unwrap()
         .execute(
             "INSERT INTO cost_ledger (scope_id, adapter_kind, input_hash, tool_profile_hash, \
          submission_seq, batch_job_id, usd, estimated, outcome, month, recorded_at) \
@@ -688,8 +718,8 @@ fn cl15_submission_seq_max_plus_one_and_omission_regression() {
         collision, 0,
         "reusing the stale seq must be silently absorbed (the regression)"
     );
-    let sum: f64 = db
-        .connection()
+    let sum: f64 = Connection::open(db.path())
+        .unwrap()
         .query_row(
             "SELECT SUM(usd) FROM cost_ledger WHERE input_hash = ?1",
             params![other_key.input_hash],
@@ -708,20 +738,13 @@ fn cl15_submission_seq_max_plus_one_and_omission_regression() {
 fn cl16_phase2a_upload_ordering_and_residue_survives_job_create_failure() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
 
     assert!(
-        phase2a_record_provider_scope(
-            db.connection(),
-            &task_key,
-            &intent.intent_token,
-            "prov-scope-a"
-        )
-        .unwrap()
+        phase2a_record_provider_scope(&db, &task_key, &intent.intent_token, "prov-scope-a")
+            .unwrap()
     );
-    let before_upload = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let before_upload = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(
         before_upload.provider_scope_id.as_deref(),
         Some("prov-scope-a")
@@ -731,19 +754,9 @@ fn cl16_phase2a_upload_ordering_and_residue_survives_job_create_failure() {
         "upload_id not set until upload succeeds"
     );
 
-    assert!(
-        phase2a_record_upload_id(
-            db.connection(),
-            &task_key,
-            &intent.intent_token,
-            "upload-123"
-        )
-        .unwrap()
-    );
+    assert!(phase2a_record_upload_id(&db, &task_key, &intent.intent_token, "upload-123").unwrap());
     // Simulate phase 2b (job creation) failing — no further writes.
-    let after = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let after = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(after.upload_id.as_deref(), Some("upload-123"));
     assert_eq!(
         after.state,
@@ -760,35 +773,16 @@ fn cl16_phase2a_upload_ordering_and_residue_survives_job_create_failure() {
 fn cl17_phase2b_job_create_started_then_created_and_scope_mismatch_restart() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
-    phase2a_record_provider_scope(
-        db.connection(),
-        &task_key,
-        &intent.intent_token,
-        "prov-scope-a",
-    )
-    .unwrap();
-    phase2a_record_upload_id(
-        db.connection(),
-        &task_key,
-        &intent.intent_token,
-        "upload-123",
-    )
-    .unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    phase2a_record_provider_scope(&db, &task_key, &intent.intent_token, "prov-scope-a").unwrap();
+    phase2a_record_upload_id(&db, &task_key, &intent.intent_token, "upload-123").unwrap();
 
     // (a) matching scope: job_create_started_at recorded before the "call",
     // then batch_job_id + state=1 after success.
-    let row_before = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row_before = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert!(phase2b_scope_matches(&row_before, "prov-scope-a"));
-    assert!(
-        phase2b_record_job_create_started(db.connection(), &task_key, &intent.intent_token)
-            .unwrap()
-    );
-    let mid = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    assert!(phase2b_record_job_create_started(&db, &task_key, &intent.intent_token).unwrap());
+    let mid = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert!(mid.job_create_started_at.is_some());
     assert_eq!(
         mid.state,
@@ -796,17 +790,9 @@ fn cl17_phase2b_job_create_started_then_created_and_scope_mismatch_restart() {
         "not yet state=1 — job call has not succeeded"
     );
     assert!(
-        phase2b_record_job_created(
-            db.connection(),
-            &task_key,
-            &intent.intent_token,
-            "provider-job-1"
-        )
-        .unwrap()
+        phase2b_record_job_created(&db, &task_key, &intent.intent_token, "provider-job-1").unwrap()
     );
-    let done = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let done = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(done.state, BatchState::JobCreated);
     assert_eq!(done.batch_job_id.as_deref(), Some("provider-job-1"));
 
@@ -817,44 +803,75 @@ fn cl17_phase2b_job_create_started_then_created_and_scope_mismatch_restart() {
     // has for that upload).
     let (_dir2, db2) = open_temp_ledger();
     let key2 = key("s2", "markdownize", "h2");
-    let intent2 = phase1_intent(db2.connection(), &key2, RequestKind::Batch, 1.0, None).unwrap();
-    phase2a_record_provider_scope(
-        db2.connection(),
-        &key2,
-        &intent2.intent_token,
-        "prov-scope-old",
-    )
-    .unwrap();
-    phase2a_record_upload_id(db2.connection(), &key2, &intent2.intent_token, "upload-old").unwrap();
-    let row2 = get_batch_request(db2.connection(), &key2).unwrap().unwrap();
+    let intent2 = phase1_intent(&db2, &key2, RequestKind::Batch, 1.0, None).unwrap();
+    phase2a_record_provider_scope(&db2, &key2, &intent2.intent_token, "prov-scope-old").unwrap();
+    phase2a_record_upload_id(&db2, &key2, &intent2.intent_token, "upload-old").unwrap();
+    let row2 = get_batch_request(&db2, &key2).unwrap().unwrap();
     assert!(!phase2b_scope_matches(&row2, "prov-scope-new"));
 
     // R23-19: unconfirmed deletion — a no-op, locators must survive.
     assert!(
-        !phase2a_restart_after_scope_mismatch(
-            db2.connection(),
-            &key2,
-            &intent2.intent_token,
-            false
-        )
-        .unwrap()
+        !phase2a_restart_after_scope_mismatch(&db2, &key2, &intent2.intent_token, false).unwrap()
     );
-    let unconfirmed = get_batch_request(db2.connection(), &key2).unwrap().unwrap();
+    let unconfirmed = get_batch_request(&db2, &key2).unwrap().unwrap();
     assert_eq!(unconfirmed.upload_id.as_deref(), Some("upload-old"));
     assert_eq!(
         unconfirmed.provider_scope_id.as_deref(),
         Some("prov-scope-old")
     );
 
+    // A stale caller token cannot clear the current reservation's only upload
+    // locator, even when it claims deletion was confirmed.
+    assert!(!phase2a_restart_after_scope_mismatch(&db2, &key2, "stale-token", true).unwrap());
+    let stale_token = get_batch_request(&db2, &key2).unwrap().unwrap();
+    assert_eq!(stale_token.upload_id.as_deref(), Some("upload-old"));
+    assert_eq!(
+        stale_token.provider_scope_id.as_deref(),
+        Some("prov-scope-old")
+    );
+
     // Confirmed deletion — now the restart proceeds.
     assert!(
-        phase2a_restart_after_scope_mismatch(db2.connection(), &key2, &intent2.intent_token, true)
-            .unwrap()
+        phase2a_restart_after_scope_mismatch(&db2, &key2, &intent2.intent_token, true).unwrap()
     );
-    let restarted = get_batch_request(db2.connection(), &key2).unwrap().unwrap();
+    let restarted = get_batch_request(&db2, &key2).unwrap().unwrap();
     assert!(restarted.upload_id.is_none());
     assert!(restarted.provider_scope_id.is_none());
     assert_eq!(restarted.state, BatchState::Intent);
+
+    // Once job creation has begun, deleting the upload locator would discard
+    // the recovery key for a provider call whose outcome may be unknown.
+    let (_dir3, db3) = open_temp_ledger();
+    let key3 = key("s3", "markdownize", "h3");
+    let intent3 = phase1_intent(&db3, &key3, RequestKind::Batch, 1.0, None).unwrap();
+    phase2a_record_provider_scope(&db3, &key3, &intent3.intent_token, "prov-scope-old").unwrap();
+    phase2a_record_upload_id(&db3, &key3, &intent3.intent_token, "upload-started").unwrap();
+    phase2b_record_job_create_started(&db3, &key3, &intent3.intent_token).unwrap();
+    assert!(
+        !phase2a_restart_after_scope_mismatch(&db3, &key3, &intent3.intent_token, true).unwrap()
+    );
+    let started = get_batch_request(&db3, &key3).unwrap().unwrap();
+    assert_eq!(started.upload_id.as_deref(), Some("upload-started"));
+    assert_eq!(started.provider_scope_id.as_deref(), Some("prov-scope-old"));
+    assert!(started.job_create_started_at.is_some());
+    assert!(started.batch_job_id.is_none());
+
+    // A completed job-create transition is equally ineligible for phase-2a
+    // restart: its upload and provider job identifiers remain recoverable.
+    let (_dir4, db4) = open_temp_ledger();
+    let key4 = key("s4", "markdownize", "h4");
+    let intent4 = phase1_intent(&db4, &key4, RequestKind::Batch, 1.0, None).unwrap();
+    phase2a_record_provider_scope(&db4, &key4, &intent4.intent_token, "prov-scope-old").unwrap();
+    phase2a_record_upload_id(&db4, &key4, &intent4.intent_token, "upload-created").unwrap();
+    phase2b_record_job_created(&db4, &key4, &intent4.intent_token, "provider-job-4").unwrap();
+    assert!(
+        !phase2a_restart_after_scope_mismatch(&db4, &key4, &intent4.intent_token, true).unwrap()
+    );
+    let created = get_batch_request(&db4, &key4).unwrap().unwrap();
+    assert_eq!(created.upload_id.as_deref(), Some("upload-created"));
+    assert_eq!(created.provider_scope_id.as_deref(), Some("prov-scope-old"));
+    assert_eq!(created.batch_job_id.as_deref(), Some("provider-job-4"));
+    assert_eq!(created.state, BatchState::JobCreated);
 }
 
 /// CL18: successful collect — confirmed record + `state=2` + `completed_at`,
@@ -863,16 +880,14 @@ fn cl17_phase2b_job_create_started_then_created_and_scope_mismatch_restart() {
 fn cl18_phase3_success_records_and_completes_same_tx() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
-    phase2a_record_provider_scope(db.connection(), &task_key, &intent.intent_token, "prov")
-        .unwrap();
-    phase2a_record_upload_id(db.connection(), &task_key, &intent.intent_token, "up").unwrap();
-    phase2b_record_job_create_started(db.connection(), &task_key, &intent.intent_token).unwrap();
-    phase2b_record_job_created(db.connection(), &task_key, &intent.intent_token, "job-real")
-        .unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    phase2a_record_provider_scope(&db, &task_key, &intent.intent_token, "prov").unwrap();
+    phase2a_record_upload_id(&db, &task_key, &intent.intent_token, "up").unwrap();
+    phase2b_record_job_create_started(&db, &task_key, &intent.intent_token).unwrap();
+    phase2b_record_job_created(&db, &task_key, &intent.intent_token, "job-real").unwrap();
 
     let receipt = terminal_transaction(
-        db.connection(),
+        &db,
         &plain_terminal_write(
             &task_key,
             Outcome::Succeeded,
@@ -887,12 +902,10 @@ fn cl18_phase3_success_records_and_completes_same_tx() {
     )
     .unwrap();
     assert!(receipt.recorded);
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(row.state, BatchState::Completed);
     assert!(row.completed_at.is_some());
-    let ledger_rows = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+    let ledger_rows = cost_ledger_rows_for_key(&db, &task_key).unwrap();
     assert_eq!(ledger_rows.len(), 1);
     assert_eq!(ledger_rows[0].outcome, Outcome::Succeeded);
     assert_eq!(ledger_rows[0].usd, 3.25);
@@ -907,11 +920,11 @@ fn cl18_phase3_success_records_and_completes_same_tx() {
 fn cl19_phase3_purged_closes_like_a_reject_terminal() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 2.0, None).unwrap();
-    phase2b_record_job_created(db.connection(), &task_key, &intent.intent_token, "job-x").unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 2.0, None).unwrap();
+    phase2b_record_job_created(&db, &task_key, &intent.intent_token, "job-x").unwrap();
 
     terminal_transaction(
-        db.connection(),
+        &db,
         &plain_terminal_write(
             &task_key,
             Outcome::Purged,
@@ -922,12 +935,10 @@ fn cl19_phase3_purged_closes_like_a_reject_terminal() {
         ),
     )
     .unwrap();
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(row.state, BatchState::Terminal);
     assert_eq!(row.error.as_deref(), Some("purged"));
-    let ledger_rows = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+    let ledger_rows = cost_ledger_rows_for_key(&db, &task_key).unwrap();
     assert_eq!(ledger_rows[0].outcome, Outcome::Purged);
 }
 
@@ -939,11 +950,11 @@ fn cl19_phase3_purged_closes_like_a_reject_terminal() {
 fn cl20_phase3_contract_violation_increments_count_and_attempts_same_tx() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
-    phase2b_record_job_created(db.connection(), &task_key, &intent.intent_token, "job-y").unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    phase2b_record_job_created(&db, &task_key, &intent.intent_token, "job-y").unwrap();
 
     terminal_transaction(
-        db.connection(),
+        &db,
         &TerminalWrite {
             key: &task_key,
             outcome: Outcome::ContractViolation,
@@ -962,9 +973,7 @@ fn cl20_phase3_contract_violation_increments_count_and_attempts_same_tx() {
         },
     )
     .unwrap();
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(row.state, BatchState::Terminal);
     assert_eq!(row.error.as_deref(), Some("contract_violation"));
     assert_eq!(row.contract_violation_count, 1);
@@ -982,10 +991,10 @@ fn cl20_phase3_contract_violation_increments_count_and_attempts_same_tx() {
 fn cl21_phase1_blocks_reissue_until_cleanup_completes() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
-    phase2b_record_job_created(db.connection(), &task_key, &intent.intent_token, "job-z").unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    phase2b_record_job_created(&db, &task_key, &intent.intent_token, "job-z").unwrap();
     terminal_transaction(
-        db.connection(),
+        &db,
         &TerminalWrite {
             key: &task_key,
             outcome: Outcome::ContractViolation,
@@ -1005,22 +1014,20 @@ fn cl21_phase1_blocks_reissue_until_cleanup_completes() {
     )
     .unwrap();
 
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert!(
         contract_violation_retry_allowed(&row),
         "count==1 still allows retry"
     );
-    let blocked = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None);
+    let blocked = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None);
     assert!(
         blocked.is_err(),
         "phase 1 must refuse while cleanup is pending"
     );
 
     // Cleanup completes (upload deletion confirmed) -> phase 1 is allowed again.
-    assert!(recovery_finish_cleanup(db.connection(), &task_key, &intent.intent_token).unwrap());
-    let allowed = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None);
+    assert!(recovery_finish_cleanup(&db, &task_key, &intent.intent_token).unwrap());
+    let allowed = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None);
     assert!(allowed.is_ok());
 }
 
@@ -1035,7 +1042,7 @@ fn cl21_phase1_blocks_reissue_until_cleanup_completes() {
 fn cl22_on_conflict_do_nothing_prevents_double_counting_on_replay() {
     let (_dir, db) = open_temp_ledger();
     let insert = || {
-        db.connection().execute(
+        Connection::open(db.path()).unwrap().execute(
             "INSERT INTO cost_ledger (scope_id, adapter_kind, input_hash, tool_profile_hash, \
              submission_seq, batch_job_id, usd, estimated, outcome, month, recorded_at) \
              VALUES ('s','markdownize','h','t', 1, 'job-1', 5.0, 0, 'succeeded', '2026-07', 0) \
@@ -1052,8 +1059,8 @@ fn cl22_on_conflict_do_nothing_prevents_double_counting_on_replay() {
         0,
         "the replay must be absorbed, not duplicated"
     );
-    let (count, sum): (i64, f64) = db
-        .connection()
+    let (count, sum): (i64, f64) = Connection::open(db.path())
+        .unwrap()
         .query_row(
             "SELECT COUNT(*), SUM(usd) FROM cost_ledger WHERE input_hash = 'h'",
             [],
@@ -1071,24 +1078,17 @@ fn cl22_on_conflict_do_nothing_prevents_double_counting_on_replay() {
 fn cl23_unknown_settlement_bumps_seq_and_next_phase1_continues_from_it() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 2.0, None).unwrap();
-    phase2b_record_job_created(
-        db.connection(),
-        &task_key,
-        &intent.intent_token,
-        "job-unknown",
-    )
-    .unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 2.0, None).unwrap();
+    phase2b_record_job_created(&db, &task_key, &intent.intent_token, "job-unknown").unwrap();
     assert_eq!(intent.submission_seq, 1);
 
     let receipt =
-        recovery_settle_unknown(db.connection(), &task_key, &intent.intent_token, 2.0, false)
-            .unwrap();
+        recovery_settle_unknown(&db, &task_key, &intent.intent_token, 2.0, false).unwrap();
     assert_eq!(
         receipt.submission_seq, 2,
         "seq 1 -> 2 before recording the estimate"
     );
-    let ledger_rows = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+    let ledger_rows = cost_ledger_rows_for_key(&db, &task_key).unwrap();
     assert_eq!(ledger_rows.len(), 1);
     assert_eq!(ledger_rows[0].submission_seq, 2);
     assert_eq!(ledger_rows[0].batch_job_id, intent.intent_token);
@@ -1097,8 +1097,8 @@ fn cl23_unknown_settlement_bumps_seq_and_next_phase1_continues_from_it() {
 
     // Cleanup completes; the next phase 1 must use seq 3 (MAX(2)+1), never
     // colliding with the settlement row at seq 2.
-    recovery_finish_cleanup(db.connection(), &task_key, &intent.intent_token).unwrap();
-    let next = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    recovery_finish_cleanup(&db, &task_key, &intent.intent_token).unwrap();
+    let next = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
     assert_eq!(next.submission_seq, 3);
 }
 
@@ -1107,11 +1107,11 @@ fn cl23_unknown_settlement_bumps_seq_and_next_phase1_continues_from_it() {
 fn cl24_abandon_settlement_also_bumps_seq_by_one() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 0.8, None).unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 0.8, None).unwrap();
     assert_eq!(intent.submission_seq, 1);
-    let execution = execute_abandon(db.connection(), &task_key).unwrap();
+    let execution = execute_abandon(&db, &task_key).unwrap();
     assert_eq!(execution, AbandonExecution::Abandoned);
-    let ledger_rows = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+    let ledger_rows = cost_ledger_rows_for_key(&db, &task_key).unwrap();
     assert_eq!(ledger_rows.len(), 1);
     assert_eq!(ledger_rows[0].submission_seq, 2);
     assert_eq!(ledger_rows[0].usd, 0.8);
@@ -1135,18 +1135,17 @@ fn cl24_abandon_settlement_also_bumps_seq_by_one() {
 fn r23_18_abandon_on_completed_row_with_residual_token_does_not_recharge() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 3.0, None).unwrap();
-    phase2a_record_provider_scope(db.connection(), &task_key, &intent.intent_token, "prov")
-        .unwrap();
-    phase2a_record_upload_id(db.connection(), &task_key, &intent.intent_token, "up").unwrap();
-    phase2b_record_job_create_started(db.connection(), &task_key, &intent.intent_token).unwrap();
-    phase2b_record_job_created(db.connection(), &task_key, &intent.intent_token, "job-1").unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 3.0, None).unwrap();
+    phase2a_record_provider_scope(&db, &task_key, &intent.intent_token, "prov").unwrap();
+    phase2a_record_upload_id(&db, &task_key, &intent.intent_token, "up").unwrap();
+    phase2b_record_job_create_started(&db, &task_key, &intent.intent_token).unwrap();
+    phase2b_record_job_created(&db, &task_key, &intent.intent_token, "job-1").unwrap();
 
     // Success lands (state=2), but a crash before upload cleanup completes
     // leaves intent_token set (clear_intent_token=false simulates this —
     // same override `cl37`'s stalled-row test uses).
     terminal_transaction(
-        db.connection(),
+        &db,
         &TerminalWrite {
             clear_intent_token: false,
             ..plain_terminal_write(
@@ -1163,28 +1162,24 @@ fn r23_18_abandon_on_completed_row_with_residual_token_does_not_recharge() {
         },
     )
     .unwrap();
-    let before = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let before = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(before.state, BatchState::Completed);
     assert!(
         before.intent_token.is_some(),
         "residual token — cleanup still pending"
     );
 
-    let execution = execute_abandon(db.connection(), &task_key).unwrap();
+    let execution = execute_abandon(&db, &task_key).unwrap();
     assert_eq!(execution, AbandonExecution::Abandoned);
 
     // No re-charge: still exactly the ONE succeeded row, same seq.
-    let ledger_rows = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+    let ledger_rows = cost_ledger_rows_for_key(&db, &task_key).unwrap();
     assert_eq!(ledger_rows.len(), 1, "abandon must not add a second charge");
     assert_eq!(ledger_rows[0].outcome, Outcome::Succeeded);
     assert_eq!(ledger_rows[0].usd, 3.0);
     assert_eq!(ledger_rows[0].submission_seq, intent.submission_seq);
 
-    let after = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let after = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(
         after.state,
         BatchState::Completed,
@@ -1204,16 +1199,9 @@ fn r23_18_abandon_on_completed_row_with_residual_token_does_not_recharge() {
 fn r23_18_abandon_on_completed_sync_row_clears_token_without_recharge() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "embedding", "h2");
-    let intent = phase1_intent(
-        db.connection(),
-        &task_key,
-        RequestKind::Sync,
-        1.5,
-        Some(300),
-    )
-    .unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Sync, 1.5, Some(300)).unwrap();
     terminal_transaction(
-        db.connection(),
+        &db,
         &TerminalWrite {
             clear_intent_token: false,
             ..plain_terminal_write(
@@ -1230,28 +1218,24 @@ fn r23_18_abandon_on_completed_sync_row_clears_token_without_recharge() {
         },
     )
     .unwrap();
-    let before = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let before = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert!(
         before.provider_scope_id.is_none(),
         "sync rows never set provider_scope_id"
     );
     assert!(before.intent_token.is_some());
 
-    let execution = execute_abandon(db.connection(), &task_key).unwrap();
+    let execution = execute_abandon(&db, &task_key).unwrap();
     assert_eq!(execution, AbandonExecution::Abandoned);
 
-    let after = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let after = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(after.state, BatchState::Completed);
     assert!(
         after.intent_token.is_none(),
         "no upload could exist — cleanup completes immediately"
     );
 
-    let ledger_rows = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+    let ledger_rows = cost_ledger_rows_for_key(&db, &task_key).unwrap();
     assert_eq!(
         ledger_rows.len(),
         1,
@@ -1269,17 +1253,15 @@ fn r23_18_abandon_on_completed_sync_row_clears_token_without_recharge() {
 fn cl25_estimated_row_is_never_revised_by_a_later_discovery() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 2.0, None).unwrap();
-    let receipt =
-        recovery_settle_unknown(db.connection(), &task_key, &intent.intent_token, 2.0, true)
-            .unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 2.0, None).unwrap();
+    let receipt = recovery_settle_unknown(&db, &task_key, &intent.intent_token, 2.0, true).unwrap();
     assert_eq!(receipt.submission_seq, 2);
 
     // The job is later discovered with a real amount — attempting to "correct"
     // the same (key, seq=2) row through the only insert primitive available is
     // absorbed, not applied.
-    let attempted_correction = db
-        .connection()
+    let attempted_correction = Connection::open(db.path())
+        .unwrap()
         .execute(
             "INSERT INTO cost_ledger (scope_id, adapter_kind, input_hash, tool_profile_hash, \
          submission_seq, batch_job_id, usd, estimated, outcome, month, recorded_at) \
@@ -1295,7 +1277,7 @@ fn cl25_estimated_row_is_never_revised_by_a_later_discovery() {
         )
         .unwrap();
     assert_eq!(attempted_correction, 0);
-    let rows = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+    let rows = cost_ledger_rows_for_key(&db, &task_key).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(
         rows[0].usd, 2.0,
@@ -1328,10 +1310,9 @@ fn cl26_all_eight_outcome_scenarios_record_the_correct_value() {
     for (index, (outcome, expected_str)) in scenarios.into_iter().enumerate() {
         let (_dir, db) = open_temp_ledger();
         let task_key = key("s", "markdownize", &format!("h{index}"));
-        let intent =
-            phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
+        let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
         terminal_transaction(
-            db.connection(),
+            &db,
             &plain_terminal_write(
                 &task_key,
                 outcome,
@@ -1345,7 +1326,7 @@ fn cl26_all_eight_outcome_scenarios_record_the_correct_value() {
             ),
         )
         .unwrap();
-        let rows = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+        let rows = cost_ledger_rows_for_key(&db, &task_key).unwrap();
         assert_eq!(rows[0].outcome.as_str(), expected_str);
         assert_eq!(outcome.as_str(), expected_str);
     }
@@ -1358,11 +1339,11 @@ fn cl26_all_eight_outcome_scenarios_record_the_correct_value() {
 fn cl31_billing_field_failure_alone_never_changes_outcome_or_violation_count() {
     let (_dir, db) = open_temp_ledger();
     let key_a = key("s", "markdownize", "a");
-    let intent_a = phase1_intent(db.connection(), &key_a, RequestKind::Batch, 3.0, None).unwrap();
+    let intent_a = phase1_intent(&db, &key_a, RequestKind::Batch, 3.0, None).unwrap();
     let billed_a = resolve_billing_from_usd_field(-1.0, 3.0); // invalid usd -> estimated
     assert!(billed_a.estimated);
     terminal_transaction(
-        db.connection(),
+        &db,
         &plain_terminal_write(
             &key_a,
             Outcome::Succeeded,
@@ -1373,9 +1354,9 @@ fn cl31_billing_field_failure_alone_never_changes_outcome_or_violation_count() {
         ),
     )
     .unwrap();
-    let row_a = get_batch_request(db.connection(), &key_a).unwrap().unwrap();
+    let row_a = get_batch_request(&db, &key_a).unwrap().unwrap();
     assert_eq!(row_a.contract_violation_count, 0);
-    let ledger_a = cost_ledger_rows_for_key(db.connection(), &key_a).unwrap();
+    let ledger_a = cost_ledger_rows_for_key(&db, &key_a).unwrap();
     assert_eq!(
         ledger_a[0].outcome,
         Outcome::Succeeded,
@@ -1384,10 +1365,10 @@ fn cl31_billing_field_failure_alone_never_changes_outcome_or_violation_count() {
     assert!(ledger_a[0].estimated);
 
     let key_b = key("s", "markdownize", "b");
-    let intent_b = phase1_intent(db.connection(), &key_b, RequestKind::Batch, 3.0, None).unwrap();
+    let intent_b = phase1_intent(&db, &key_b, RequestKind::Batch, 3.0, None).unwrap();
     let billed_b = nonbillable_charge(); // stand-in for an invalid billable_units report degrading
     terminal_transaction(
-        db.connection(),
+        &db,
         &plain_terminal_write(
             &key_b,
             Outcome::FallbackToFull,
@@ -1398,9 +1379,9 @@ fn cl31_billing_field_failure_alone_never_changes_outcome_or_violation_count() {
         ),
     )
     .unwrap();
-    let row_b = get_batch_request(db.connection(), &key_b).unwrap().unwrap();
+    let row_b = get_batch_request(&db, &key_b).unwrap().unwrap();
     assert_eq!(row_b.contract_violation_count, 0);
-    let ledger_b = cost_ledger_rows_for_key(db.connection(), &key_b).unwrap();
+    let ledger_b = cost_ledger_rows_for_key(&db, &key_b).unwrap();
     assert_eq!(ledger_b[0].outcome, Outcome::FallbackToFull);
 }
 
@@ -1414,19 +1395,17 @@ fn cl31_billing_field_failure_alone_never_changes_outcome_or_violation_count() {
 #[test]
 fn cl32_recovery_candidates_selects_the_right_rows() {
     let (_dir, db) = open_temp_ledger();
-    let conn = db.connection();
-
     let state0 = key("s", "markdownize", "a");
-    phase1_intent(conn, &state0, RequestKind::Batch, 1.0, None).unwrap();
+    phase1_intent(&db, &state0, RequestKind::Batch, 1.0, None).unwrap();
 
     let state1 = key("s", "markdownize", "b");
-    let intent1 = phase1_intent(conn, &state1, RequestKind::Batch, 1.0, None).unwrap();
-    phase2b_record_job_created(conn, &state1, &intent1.intent_token, "job-b").unwrap();
+    let intent1 = phase1_intent(&db, &state1, RequestKind::Batch, 1.0, None).unwrap();
+    phase2b_record_job_created(&db, &state1, &intent1.intent_token, "job-b").unwrap();
 
     let uncleaned_terminal = key("s", "markdownize", "c");
-    let intent_c = phase1_intent(conn, &uncleaned_terminal, RequestKind::Batch, 1.0, None).unwrap();
+    let intent_c = phase1_intent(&db, &uncleaned_terminal, RequestKind::Batch, 1.0, None).unwrap();
     terminal_transaction(
-        conn,
+        &db,
         &TerminalWrite {
             clear_intent_token: false,
             ..plain_terminal_write(
@@ -1445,9 +1424,9 @@ fn cl32_recovery_candidates_selects_the_right_rows() {
     .unwrap();
 
     let cleaned_terminal = key("s", "markdownize", "d");
-    let intent_d = phase1_intent(conn, &cleaned_terminal, RequestKind::Batch, 1.0, None).unwrap();
+    let intent_d = phase1_intent(&db, &cleaned_terminal, RequestKind::Batch, 1.0, None).unwrap();
     terminal_transaction(
-        conn,
+        &db,
         &plain_terminal_write(
             &cleaned_terminal,
             Outcome::Succeeded,
@@ -1463,9 +1442,9 @@ fn cl32_recovery_candidates_selects_the_right_rows() {
     .unwrap();
 
     let sync_inflight = key("s", "embedding", "e");
-    phase1_intent(conn, &sync_inflight, RequestKind::Sync, 0.1, Some(300)).unwrap();
+    phase1_intent(&db, &sync_inflight, RequestKind::Sync, 0.1, Some(300)).unwrap();
 
-    let candidates = kio_pipeline::ledger::ops::recovery_candidates(conn).unwrap();
+    let candidates = kio_pipeline::ledger::ops::recovery_candidates(&db).unwrap();
     let candidate_hashes: BTreeSet<String> = candidates
         .into_iter()
         .map(|row| row.key.input_hash)
@@ -1489,28 +1468,20 @@ fn cl32_recovery_candidates_selects_the_right_rows() {
 fn cl34_found_self_describes_batch_job_id_only_when_unset() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
     // (a) batch_job_id already recorded: self-describe is a no-op.
-    phase2b_record_job_created(
-        db.connection(),
-        &task_key,
-        &intent.intent_token,
-        "already-known",
-    )
-    .unwrap();
-    recovery_mark_found(db.connection(), &task_key, "discovered-different").unwrap();
-    let row_a = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    phase2b_record_job_created(&db, &task_key, &intent.intent_token, "already-known").unwrap();
+    recovery_mark_found(&db, &task_key, "discovered-different").unwrap();
+    let row_a = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(row_a.batch_job_id.as_deref(), Some("already-known"));
 
     // (b) batch_job_id NULL (crashed after phase 2b's call succeeded but
     // before its own record landed): self-describe fills it in.
     let key_b = key("s", "markdownize", "h2");
-    let intent_b = phase1_intent(db.connection(), &key_b, RequestKind::Batch, 1.0, None).unwrap();
-    phase2b_record_job_create_started(db.connection(), &key_b, &intent_b.intent_token).unwrap();
-    recovery_mark_found(db.connection(), &key_b, "discovered-job").unwrap();
-    let row_b = get_batch_request(db.connection(), &key_b).unwrap().unwrap();
+    let intent_b = phase1_intent(&db, &key_b, RequestKind::Batch, 1.0, None).unwrap();
+    phase2b_record_job_create_started(&db, &key_b, &intent_b.intent_token).unwrap();
+    recovery_mark_found(&db, &key_b, "discovered-job").unwrap();
+    let row_b = get_batch_request(&db, &key_b).unwrap().unwrap();
     assert_eq!(row_b.batch_job_id.as_deref(), Some("discovered-job"));
 }
 
@@ -1521,10 +1492,8 @@ fn cl34_found_self_describes_batch_job_id_only_when_unset() {
 fn cl36_recovery_deadline_uses_the_later_of_token_time_and_job_create_started() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     let now = now_millis();
 
     // Freshly issued: not past the default 48h deadline.
@@ -1544,15 +1513,14 @@ fn cl36_recovery_deadline_uses_the_later_of_token_time_and_job_create_started() 
     // job_create_started_at later than the token's own embedded timestamp
     // becomes the effective basis.
     let later_started_at = now + 10_000;
-    db.connection()
+    Connection::open(db.path())
+        .unwrap()
         .execute(
             "UPDATE batch_requests SET job_create_started_at = ?1 WHERE input_hash = 'h'",
             params![later_started_at],
         )
         .unwrap();
-    let row2 = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row2 = get_batch_request(&db, &task_key).unwrap().unwrap();
     let almost_from_token = now + DEFAULT_RECOVERY_DEADLINE_MS + 1_000;
     // Not yet passed relative to the later job_create_started_at basis.
     assert!(!recovery_deadline_passed(
@@ -1612,9 +1580,9 @@ fn cl35_r23_05_visibility_grace_period_measured_from_job_create_started_at() {
 fn cl37_stalled_rows_expose_intent_token_and_abandon_is_the_exit() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
     terminal_transaction(
-        db.connection(),
+        &db,
         &TerminalWrite {
             clear_intent_token: false, // cleanup permanently stuck
             ..plain_terminal_write(
@@ -1632,7 +1600,7 @@ fn cl37_stalled_rows_expose_intent_token_and_abandon_is_the_exit() {
     )
     .unwrap();
 
-    let stalled = stalled_rows(db.connection()).unwrap();
+    let stalled = stalled_rows(&db).unwrap();
     assert_eq!(stalled.len(), 1);
     assert_eq!(
         stalled[0].intent_token.as_deref(),
@@ -1640,14 +1608,14 @@ fn cl37_stalled_rows_expose_intent_token_and_abandon_is_the_exit() {
     );
 
     let resolution = resolve_abandon_selector(
-        db.connection(),
+        &db,
         &AbandonSelector::IntentToken(intent.intent_token.clone()),
     )
     .unwrap();
     assert_eq!(resolution, AbandonResolution::Found(task_key.clone()));
-    let execution = execute_abandon(db.connection(), &task_key).unwrap();
+    let execution = execute_abandon(&db, &task_key).unwrap();
     assert_eq!(execution, AbandonExecution::Abandoned);
-    assert!(stalled_rows(db.connection()).unwrap().is_empty());
+    assert!(stalled_rows(&db).unwrap().is_empty());
 }
 
 /// CL38: residual cleanup — a normal reject and an already-abandoned task both
@@ -1659,23 +1627,18 @@ fn cl37_stalled_rows_expose_intent_token_and_abandon_is_the_exit() {
 fn cl38_residual_cleanup_applies_uniformly_including_to_abandoned_rows() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
-    phase2a_record_provider_scope(db.connection(), &task_key, &intent.intent_token, "prov")
-        .unwrap();
-    phase2a_record_upload_id(db.connection(), &task_key, &intent.intent_token, "up").unwrap();
-    let execution = execute_abandon(db.connection(), &task_key).unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    phase2a_record_provider_scope(&db, &task_key, &intent.intent_token, "prov").unwrap();
+    phase2a_record_upload_id(&db, &task_key, &intent.intent_token, "up").unwrap();
+    let execution = execute_abandon(&db, &task_key).unwrap();
     assert_eq!(execution, AbandonExecution::Abandoned);
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert!(
         row.intent_token.is_some(),
         "provider_scope_id was set (upload may exist) — cleanup is not assumed complete"
     );
-    assert!(recovery_finish_cleanup(db.connection(), &task_key, &intent.intent_token).unwrap());
-    let cleaned = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    assert!(recovery_finish_cleanup(&db, &task_key, &intent.intent_token).unwrap());
+    let cleaned = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert!(cleaned.intent_token.is_none());
 }
 
@@ -1688,9 +1651,9 @@ fn cl38_residual_cleanup_applies_uniformly_including_to_abandoned_rows() {
 fn cl39_reissue_is_structurally_impossible_before_cleanup_completes() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
     terminal_transaction(
-        db.connection(),
+        &db,
         &TerminalWrite {
             clear_intent_token: false,
             ..plain_terminal_write(
@@ -1709,7 +1672,7 @@ fn cl39_reissue_is_structurally_impossible_before_cleanup_completes() {
     .unwrap();
     for _ in 0..3 {
         assert!(
-            phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).is_err(),
+            phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).is_err(),
             "every reissue attempt before cleanup must fail, not just the first"
         );
     }
@@ -1725,17 +1688,8 @@ fn cl39_reissue_is_structurally_impossible_before_cleanup_completes() {
 fn cl42_sync_phase1_row_shape() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "embedding", "h");
-    let outcome = phase1_intent(
-        db.connection(),
-        &task_key,
-        RequestKind::Sync,
-        0.02,
-        Some(300),
-    )
-    .unwrap();
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let outcome = phase1_intent(&db, &task_key, RequestKind::Sync, 0.02, Some(300)).unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(row.request_kind, RequestKind::Sync);
     assert_eq!(
         row.intent_token.as_deref(),
@@ -1755,26 +1709,11 @@ fn cl42_sync_phase1_row_shape() {
 fn cl43_sync_provider_request_id_recorded_before_terminal() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "embedding", "h");
-    let intent = phase1_intent(
-        db.connection(),
-        &task_key,
-        RequestKind::Sync,
-        0.02,
-        Some(300),
-    )
-    .unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Sync, 0.02, Some(300)).unwrap();
     assert!(
-        sync_record_provider_request_id(
-            db.connection(),
-            &task_key,
-            &intent.intent_token,
-            "req-abc"
-        )
-        .unwrap()
+        sync_record_provider_request_id(&db, &task_key, &intent.intent_token, "req-abc").unwrap()
     );
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(row.batch_job_id.as_deref(), Some("req-abc"));
     assert_eq!(row.state, BatchState::Intent, "still pre-terminal");
 }
@@ -1788,24 +1727,17 @@ fn cl44_multiple_sync_calls_serialize_with_monotonic_seq() {
     let task_key = key("s", "embedding", "h");
     let mut seqs = Vec::new();
     for call in 0..3 {
-        let intent = phase1_intent(
-            db.connection(),
-            &task_key,
-            RequestKind::Sync,
-            0.01,
-            Some(300),
-        )
-        .unwrap();
+        let intent = phase1_intent(&db, &task_key, RequestKind::Sync, 0.01, Some(300)).unwrap();
         seqs.push(intent.submission_seq);
         sync_record_provider_request_id(
-            db.connection(),
+            &db,
             &task_key,
             &intent.intent_token,
             &format!("req-{call}"),
         )
         .unwrap();
         terminal_transaction(
-            db.connection(),
+            &db,
             &plain_terminal_write(
                 &task_key,
                 Outcome::Succeeded,
@@ -1837,18 +1769,10 @@ fn cl45_cl46_sync_crash_recovery_confirms_or_settles_unknown() {
     // success directly).
     let (_dir_a, db_a) = open_temp_ledger();
     let key_a = key("s", "embedding", "a");
-    let intent_a = phase1_intent(
-        db_a.connection(),
-        &key_a,
-        RequestKind::Sync,
-        0.01,
-        Some(300),
-    )
-    .unwrap();
-    sync_record_provider_request_id(db_a.connection(), &key_a, &intent_a.intent_token, "req-a")
-        .unwrap();
+    let intent_a = phase1_intent(&db_a, &key_a, RequestKind::Sync, 0.01, Some(300)).unwrap();
+    sync_record_provider_request_id(&db_a, &key_a, &intent_a.intent_token, "req-a").unwrap();
     terminal_transaction(
-        db_a.connection(),
+        &db_a,
         &plain_terminal_write(
             &key_a,
             Outcome::Succeeded,
@@ -1863,30 +1787,16 @@ fn cl45_cl46_sync_crash_recovery_confirms_or_settles_unknown() {
     )
     .unwrap();
     assert_eq!(
-        cost_ledger_rows_for_key(db_a.connection(), &key_a).unwrap()[0].outcome,
+        cost_ledger_rows_for_key(&db_a, &key_a).unwrap()[0].outcome,
         Outcome::Succeeded
     );
 
     // (b) batch_job_id NULL: unknown settlement.
     let (_dir_b, db_b) = open_temp_ledger();
     let key_b = key("s", "embedding", "b");
-    let intent_b = phase1_intent(
-        db_b.connection(),
-        &key_b,
-        RequestKind::Sync,
-        0.02,
-        Some(300),
-    )
-    .unwrap();
-    recovery_settle_unknown(
-        db_b.connection(),
-        &key_b,
-        &intent_b.intent_token,
-        0.02,
-        true,
-    )
-    .unwrap();
-    let row_b = cost_ledger_rows_for_key(db_b.connection(), &key_b).unwrap();
+    let intent_b = phase1_intent(&db_b, &key_b, RequestKind::Sync, 0.02, Some(300)).unwrap();
+    recovery_settle_unknown(&db_b, &key_b, &intent_b.intent_token, 0.02, true).unwrap();
+    let row_b = cost_ledger_rows_for_key(&db_b, &key_b).unwrap();
     assert_eq!(row_b[0].outcome, Outcome::UnknownSettled);
     assert!(row_b[0].estimated);
 
@@ -1894,49 +1804,22 @@ fn cl45_cl46_sync_crash_recovery_confirms_or_settles_unknown() {
     // not resolve it, falls back to unknown settlement — same primitive as (b)).
     let (_dir_c, db_c) = open_temp_ledger();
     let key_c = key("s", "embedding", "c");
-    let intent_c = phase1_intent(
-        db_c.connection(),
-        &key_c,
-        RequestKind::Sync,
-        0.03,
-        Some(300),
-    )
-    .unwrap();
-    sync_record_provider_request_id(
-        db_c.connection(),
-        &key_c,
-        &intent_c.intent_token,
-        "req-c-unresolvable",
-    )
-    .unwrap();
-    recovery_settle_unknown(
-        db_c.connection(),
-        &key_c,
-        &intent_c.intent_token,
-        0.03,
-        true,
-    )
-    .unwrap();
+    let intent_c = phase1_intent(&db_c, &key_c, RequestKind::Sync, 0.03, Some(300)).unwrap();
+    sync_record_provider_request_id(&db_c, &key_c, &intent_c.intent_token, "req-c-unresolvable")
+        .unwrap();
+    recovery_settle_unknown(&db_c, &key_c, &intent_c.intent_token, 0.03, true).unwrap();
     assert_eq!(
-        cost_ledger_rows_for_key(db_c.connection(), &key_c).unwrap()[0].outcome,
+        cost_ledger_rows_for_key(&db_c, &key_c).unwrap()[0].outcome,
         Outcome::UnknownSettled
     );
 
     // (d, CL46) recovery confirms a fallback_to_full control response.
     let (_dir_d, db_d) = open_temp_ledger();
     let key_d = key("s", "embedding", "d");
-    let intent_d = phase1_intent(
-        db_d.connection(),
-        &key_d,
-        RequestKind::Sync,
-        0.01,
-        Some(300),
-    )
-    .unwrap();
-    sync_record_provider_request_id(db_d.connection(), &key_d, &intent_d.intent_token, "req-d")
-        .unwrap();
+    let intent_d = phase1_intent(&db_d, &key_d, RequestKind::Sync, 0.01, Some(300)).unwrap();
+    sync_record_provider_request_id(&db_d, &key_d, &intent_d.intent_token, "req-d").unwrap();
     terminal_transaction(
-        db_d.connection(),
+        &db_d,
         &plain_terminal_write(
             &key_d,
             Outcome::FallbackToFull,
@@ -1947,9 +1830,7 @@ fn cl45_cl46_sync_crash_recovery_confirms_or_settles_unknown() {
         ),
     )
     .unwrap();
-    let row_d = get_batch_request(db_d.connection(), &key_d)
-        .unwrap()
-        .unwrap();
+    let row_d = get_batch_request(&db_d, &key_d).unwrap().unwrap();
     assert!(
         row_d.intent_token.is_none(),
         "CL47: sync clears intent_token on every terminal Tx"
@@ -1970,16 +1851,9 @@ fn cl47_sync_rows_clear_intent_token_on_every_terminal_variant() {
     for (index, (outcome, state)) in scenarios.into_iter().enumerate() {
         let (_dir, db) = open_temp_ledger();
         let task_key = key("s", "embedding", &format!("h{index}"));
-        let intent = phase1_intent(
-            db.connection(),
-            &task_key,
-            RequestKind::Sync,
-            0.01,
-            Some(300),
-        )
-        .unwrap();
+        let intent = phase1_intent(&db, &task_key, RequestKind::Sync, 0.01, Some(300)).unwrap();
         terminal_transaction(
-            db.connection(),
+            &db,
             &plain_terminal_write(
                 &task_key,
                 outcome,
@@ -1993,9 +1867,7 @@ fn cl47_sync_rows_clear_intent_token_on_every_terminal_variant() {
             ),
         )
         .unwrap();
-        let row = get_batch_request(db.connection(), &task_key)
-            .unwrap()
-            .unwrap();
+        let row = get_batch_request(&db, &task_key).unwrap().unwrap();
         assert!(
             row.intent_token.is_none(),
             "{outcome:?} must clear intent_token immediately for a sync row"
@@ -2021,30 +1893,17 @@ fn cl48_device_row_identity_and_cap_scoping() {
         "embed-profile",
     );
     assert!(task_key.is_device());
-    let outcome = phase1_intent(
-        db.connection(),
-        &task_key,
-        RequestKind::Sync,
-        0.0,
-        Some(300),
-    )
-    .unwrap();
+    let outcome = phase1_intent(&db, &task_key, RequestKind::Sync, 0.0, Some(300)).unwrap();
     assert!(outcome.submission_seq >= 1);
 
     let month = utc_month_of(now_millis());
-    let folder_total = ledger_month_total(
-        db.connection(),
-        Some("some-real-folder-scope"),
-        None,
-        &month,
-    )
-    .unwrap();
+    let folder_total =
+        ledger_month_total(&db, Some("some-real-folder-scope"), None, &month).unwrap();
     assert_eq!(
         folder_total, 0.0,
         "device rows never appear in a folder-scoped total"
     );
-    let device_total =
-        ledger_month_total(db.connection(), None, Some("embedding"), &month).unwrap();
+    let device_total = ledger_month_total(&db, None, Some("embedding"), &month).unwrap();
     assert!(
         device_total >= 0.0,
         "device rows do count toward the device/per_adapter total"
@@ -2062,24 +1921,15 @@ fn cl51_extend_after_claim_lost_reports_claim_lost() {
         "q-hash",
         "embed-profile",
     );
-    let claim = device_claim(
-        db.connection(),
-        &task_key,
-        0.0,
-        300,
-        R23_02_NEVER_DENY_DEVICE_CAP,
-        None,
-    )
-    .unwrap();
+    let claim = device_claim(&db, &task_key, 0.0, 300, R23_02_NEVER_DENY_DEVICE_CAP, None).unwrap();
     let ClaimOutcome::Claimed(outcome) = claim else {
         panic!("expected a fresh claim");
     };
     // Another process recovers the row (unknown settlement clears the token).
-    recovery_settle_unknown(db.connection(), &task_key, &outcome.intent_token, 0.0, true).unwrap();
+    recovery_settle_unknown(&db, &task_key, &outcome.intent_token, 0.0, true).unwrap();
 
     let extension =
-        device_extend_stale_after(db.connection(), &task_key, &outcome.intent_token, 30.0, 300)
-            .unwrap();
+        device_extend_stale_after(&db, &task_key, &outcome.intent_token, 30.0, 300).unwrap();
     assert_eq!(extension, ExtendOutcome::ClaimLost);
 }
 
@@ -2097,26 +1947,20 @@ fn cl53_inline_sweep_always_settles_unknown_never_queries() {
         "stale-q",
         "embed-profile",
     );
-    let outcome = phase1_intent(
-        db.connection(),
-        &stale_key,
-        RequestKind::Sync,
-        0.0,
-        Some(300),
-    )
-    .unwrap();
+    let outcome = phase1_intent(&db, &stale_key, RequestKind::Sync, 0.0, Some(300)).unwrap();
     // Force it stale.
-    db.connection()
+    Connection::open(db.path())
+        .unwrap()
         .execute(
             "UPDATE batch_requests SET stale_after_at = ?1 WHERE input_hash = 'stale-q'",
             params![now_millis() - 1],
         )
         .unwrap();
-    let plan = plan_bounded_sweep(db.connection(), None, now_millis()).unwrap();
+    let plan = plan_bounded_sweep(&db, None, now_millis()).unwrap();
     assert!(plan.general_stale.contains(&stale_key));
-    let report = execute_bounded_sweep(db.connection(), &plan, now_millis()).unwrap();
+    let report = execute_bounded_sweep(&db, &plan, now_millis()).unwrap();
     assert!(report.settled.contains(&stale_key));
-    let rows = cost_ledger_rows_for_key(db.connection(), &stale_key).unwrap();
+    let rows = cost_ledger_rows_for_key(&db, &stale_key).unwrap();
     assert_eq!(
         rows[0].outcome,
         Outcome::UnknownSettled,
@@ -2136,31 +1980,14 @@ fn cl54_same_key_live_inflight_falls_back_without_a_second_phase1() {
         "shared-q",
         "embed-profile",
     );
-    let first = device_claim(
-        db.connection(),
-        &task_key,
-        0.0,
-        300,
-        R23_02_NEVER_DENY_DEVICE_CAP,
-        None,
-    )
-    .unwrap();
+    let first = device_claim(&db, &task_key, 0.0, 300, R23_02_NEVER_DENY_DEVICE_CAP, None).unwrap();
     let ClaimOutcome::Claimed(first_outcome) = first else {
         panic!("expected the first claim to succeed");
     };
-    let second = device_claim(
-        db.connection(),
-        &task_key,
-        0.0,
-        300,
-        R23_02_NEVER_DENY_DEVICE_CAP,
-        None,
-    )
-    .unwrap();
+    let second =
+        device_claim(&db, &task_key, 0.0, 300, R23_02_NEVER_DENY_DEVICE_CAP, None).unwrap();
     assert_eq!(second, ClaimOutcome::InFlight);
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(
         row.intent_token.as_deref(),
         Some(first_outcome.intent_token.as_str())
@@ -2213,7 +2040,7 @@ fn cl55_terminal_device_row_pruning_conditions_and_abandon_after_pruning() {
         month_start + 1_000,
     );
 
-    let plan = plan_bounded_sweep(db.connection(), None, now).unwrap();
+    let plan = plan_bounded_sweep(&db, None, now).unwrap();
     assert!(
         plan.prune.contains(&prunable),
         "state=2 success must be prunable"
@@ -2221,17 +2048,12 @@ fn cl55_terminal_device_row_pruning_conditions_and_abandon_after_pruning() {
     assert!(!plan.prune.contains(&has_violation));
     assert!(!plan.prune.contains(&this_month));
 
-    let report = execute_bounded_sweep(db.connection(), &plan, now).unwrap();
+    let report = execute_bounded_sweep(&db, &plan, now).unwrap();
     assert!(report.pruned.contains(&prunable));
-    assert!(
-        get_batch_request(db.connection(), &prunable)
-            .unwrap()
-            .is_none()
-    );
+    assert!(get_batch_request(&db, &prunable).unwrap().is_none());
 
     // Abandon on the now-pruned key is a no-op idempotent success.
-    let resolution =
-        resolve_abandon_selector(db.connection(), &AbandonSelector::TaskKey(prunable)).unwrap();
+    let resolution = resolve_abandon_selector(&db, &AbandonSelector::TaskKey(prunable)).unwrap();
     assert_eq!(resolution, AbandonResolution::NotFound);
 }
 
@@ -2242,7 +2064,8 @@ fn seed_terminal_device_row(
     violations: i64,
     completed_at: i64,
 ) {
-    db.connection()
+    Connection::open(db.path())
+        .unwrap()
         .execute(
             "INSERT INTO batch_requests (scope_id, adapter_kind, input_hash, tool_profile_hash, \
              state, request_kind, intent_token, submission_seq, estimated_usd, \
@@ -2276,15 +2099,10 @@ fn r23_02_device_claim_denies_on_device_cap_exceeded() {
         "over-device-cap",
         "embed-profile",
     );
-    let claim = with_immediate_transaction(db.connection(), || {
-        device_claim(db.connection(), &task_key, 5.0, 300, 50.0, None)
-    })
-    .unwrap();
+    let claim = device_claim(&db, &task_key, 5.0, 300, 50.0, None).unwrap();
     assert_eq!(claim, ClaimOutcome::Denied(CapLayer::Device));
     assert!(
-        get_batch_request(db.connection(), &task_key)
-            .unwrap()
-            .is_none(),
+        get_batch_request(&db, &task_key).unwrap().is_none(),
         "a denied claim must not create a phase-1 row"
     );
 }
@@ -2302,16 +2120,9 @@ fn r23_02_device_claim_denies_on_per_adapter_cap_exceeded() {
         "over-per-adapter-cap",
         "embed-profile",
     );
-    let claim = with_immediate_transaction(db.connection(), || {
-        device_claim(db.connection(), &task_key, 5.0, 300, 1000.0, Some(15.0))
-    })
-    .unwrap();
+    let claim = device_claim(&db, &task_key, 5.0, 300, 1000.0, Some(15.0)).unwrap();
     assert_eq!(claim, ClaimOutcome::Denied(CapLayer::PerAdapter));
-    assert!(
-        get_batch_request(db.connection(), &task_key)
-            .unwrap()
-            .is_none()
-    );
+    assert!(get_batch_request(&db, &task_key).unwrap().is_none());
 }
 
 /// R23-02: `estimated_usd == 0.0` (a zero-priced local embedding adapter)
@@ -2327,10 +2138,7 @@ fn r23_02_device_claim_zero_cost_bypasses_cap_even_when_over() {
         "free-claim",
         "embed-profile",
     );
-    let claim = with_immediate_transaction(db.connection(), || {
-        device_claim(db.connection(), &task_key, 0.0, 300, 0.0, Some(0.0))
-    })
-    .unwrap();
+    let claim = device_claim(&db, &task_key, 0.0, 300, 0.0, Some(0.0)).unwrap();
     assert!(matches!(claim, ClaimOutcome::Claimed(_)));
 }
 
@@ -2352,16 +2160,14 @@ fn r23_03_settle_after_reclaim_does_not_double_charge() {
         "raced-query",
         "embed-profile",
     );
-    let claim = with_immediate_transaction(db.connection(), || {
-        device_claim(
-            db.connection(),
-            &task_key,
-            0.02,
-            300,
-            R23_02_NEVER_DENY_DEVICE_CAP,
-            None,
-        )
-    })
+    let claim = device_claim(
+        &db,
+        &task_key,
+        0.02,
+        300,
+        R23_02_NEVER_DENY_DEVICE_CAP,
+        None,
+    )
     .unwrap();
     let ClaimOutcome::Claimed(original) = claim else {
         panic!("expected the first claim to succeed");
@@ -2372,18 +2178,16 @@ fn r23_03_settle_after_reclaim_does_not_double_charge() {
     // `execute_bounded_sweep` does to a row whose `stale_after_at` elapsed
     // while the original holder's adapter call was still in flight).
     recovery_settle_unknown(
-        db.connection(),
+        &db,
         &task_key,
         &original.intent_token,
         0.02, // the claim's own estimated_usd (Phase1Outcome does not carry it back)
         true,
     )
     .unwrap();
-    let after_reclaim = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let after_reclaim = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert!(after_reclaim.intent_token.is_none());
-    let rows_after_reclaim = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+    let rows_after_reclaim = cost_ledger_rows_for_key(&db, &task_key).unwrap();
     assert_eq!(rows_after_reclaim.len(), 1);
     assert_eq!(rows_after_reclaim[0].outcome, Outcome::UnknownSettled);
 
@@ -2392,7 +2196,7 @@ fn r23_03_settle_after_reclaim_does_not_double_charge() {
     // (mirrors `settle_task_charge_success`'s `intent_token_guard:
     // Some(intent_token)` after R23-03).
     let receipt = terminal_transaction(
-        db.connection(),
+        &db,
         &TerminalWrite {
             key: &task_key,
             outcome: Outcome::Succeeded,
@@ -2419,7 +2223,7 @@ fn r23_03_settle_after_reclaim_does_not_double_charge() {
 
     // No second cost_ledger row: still exactly the reclaimer's one
     // unknown_settled row.
-    let rows_final = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+    let rows_final = cost_ledger_rows_for_key(&db, &task_key).unwrap();
     assert_eq!(
         rows_final.len(),
         1,
@@ -2449,17 +2253,18 @@ fn r23_04_own_key_sweep_requires_full_four_tuple_match() {
         "profile-b",
     );
     for k in [&claiming_key, &other_profile_key] {
-        phase1_intent(db.connection(), k, RequestKind::Sync, 0.0, Some(300)).unwrap();
+        phase1_intent(&db, k, RequestKind::Sync, 0.0, Some(300)).unwrap();
     }
     // Force both stale.
-    db.connection()
+    Connection::open(db.path())
+        .unwrap()
         .execute(
             "UPDATE batch_requests SET stale_after_at = ?1 WHERE input_hash = 'shared-input-hash'",
             params![now_millis() - 1],
         )
         .unwrap();
 
-    let plan = plan_bounded_sweep(db.connection(), Some(&claiming_key), now_millis()).unwrap();
+    let plan = plan_bounded_sweep(&db, Some(&claiming_key), now_millis()).unwrap();
     assert!(
         plan.own_key_stale.contains(&claiming_key),
         "the exact claiming key belongs in the unbounded own-key pool"
@@ -2487,27 +2292,13 @@ fn r23_30_retry_after_fractional_seconds_rounds_up_not_down() {
         "fractional-retry-after",
         "embed-profile",
     );
-    let claim = device_claim(
-        db.connection(),
-        &task_key,
-        0.0,
-        300,
-        R23_02_NEVER_DENY_DEVICE_CAP,
-        None,
-    )
-    .unwrap();
+    let claim = device_claim(&db, &task_key, 0.0, 300, R23_02_NEVER_DENY_DEVICE_CAP, None).unwrap();
     let ClaimOutcome::Claimed(outcome) = claim else {
         panic!("expected a fresh claim");
     };
     let before = now_millis();
-    let extension = device_extend_stale_after(
-        db.connection(),
-        &task_key,
-        &outcome.intent_token,
-        600.5,
-        300,
-    )
-    .unwrap();
+    let extension =
+        device_extend_stale_after(&db, &task_key, &outcome.intent_token, 600.5, 300).unwrap();
     let ExtendOutcome::Extended(new_value) = extension else {
         panic!("expected the extension to succeed");
     };
@@ -2537,16 +2328,14 @@ fn cl56_two_layer_cap_folder_optional() {
         folder_cap: None,
         device_per_adapter_cap: None,
     };
-    let result = with_immediate_transaction(db.connection(), || {
-        check_then_reserve(
-            db.connection(),
-            &folder_a,
-            10.0,
-            &no_folder_cap,
-            RequestKind::Batch,
-            None,
-        )
-    })
+    let result = check_then_reserve(
+        &db,
+        &folder_a,
+        10.0,
+        &no_folder_cap,
+        RequestKind::Batch,
+        None,
+    )
     .unwrap();
     assert!(matches!(result, CapCheckResult::Allowed(_)));
 
@@ -2556,16 +2345,14 @@ fn cl56_two_layer_cap_folder_optional() {
         folder_cap: Some(5.0),
         device_per_adapter_cap: None,
     };
-    let denied = with_immediate_transaction(db.connection(), || {
-        check_then_reserve(
-            db.connection(),
-            &folder_b,
-            10.0,
-            &with_tight_folder_cap,
-            RequestKind::Batch,
-            None,
-        )
-    })
+    let denied = check_then_reserve(
+        &db,
+        &folder_b,
+        10.0,
+        &with_tight_folder_cap,
+        RequestKind::Batch,
+        None,
+    )
     .unwrap();
     assert_eq!(denied, CapCheckResult::Denied(CapLayer::Folder));
 }
@@ -2584,27 +2371,15 @@ fn cl57_three_condition_and_and_same_tx_atomicity() {
         folder_cap: Some(10.0),
         device_per_adapter_cap: Some(30.0),
     };
-    let device_total =
-        ledger_month_total(db.connection(), None, None, &utc_month_of(now_millis())).unwrap();
+    let device_total = ledger_month_total(&db, None, None, &utc_month_of(now_millis())).unwrap();
     assert_eq!(device_total, 45.0);
 
     // 45+3=48<50 OK, 8+3=11 !< 10 -> folder denies.
-    let denied_folder = with_immediate_transaction(db.connection(), || {
-        check_then_reserve(
-            db.connection(),
-            &task_key,
-            3.0,
-            &caps,
-            RequestKind::Batch,
-            None,
-        )
-    })
-    .unwrap();
+    let denied_folder =
+        check_then_reserve(&db, &task_key, 3.0, &caps, RequestKind::Batch, None).unwrap();
     assert_eq!(denied_folder, CapCheckResult::Denied(CapLayer::Folder));
     assert!(
-        get_batch_request(db.connection(), &task_key)
-            .unwrap()
-            .is_none(),
+        get_batch_request(&db, &task_key).unwrap().is_none(),
         "no phase-1 row on denial"
     );
 
@@ -2619,23 +2394,10 @@ fn cl57_three_condition_and_and_same_tx_atomicity() {
         folder_cap: Some(100.0),
         device_per_adapter_cap: Some(30.0),
     };
-    let denied_adapter = with_immediate_transaction(db2.connection(), || {
-        check_then_reserve(
-            db2.connection(),
-            &key2,
-            3.0,
-            &caps2,
-            RequestKind::Batch,
-            None,
-        )
-    })
-    .unwrap();
+    let denied_adapter =
+        check_then_reserve(&db2, &key2, 3.0, &caps2, RequestKind::Batch, None).unwrap();
     assert_eq!(denied_adapter, CapCheckResult::Denied(CapLayer::PerAdapter));
-    assert!(
-        get_batch_request(db2.connection(), &key2)
-            .unwrap()
-            .is_none()
-    );
+    assert!(get_batch_request(&db2, &key2).unwrap().is_none());
 
     // All three pass -> allowed, and the reservation lands in the same call.
     let (_dir3, db3) = open_temp_ledger();
@@ -2645,23 +2407,9 @@ fn cl57_three_condition_and_and_same_tx_atomicity() {
         folder_cap: Some(10.0),
         device_per_adapter_cap: Some(30.0),
     };
-    let allowed = with_immediate_transaction(db3.connection(), || {
-        check_then_reserve(
-            db3.connection(),
-            &key3,
-            3.0,
-            &caps3,
-            RequestKind::Batch,
-            None,
-        )
-    })
-    .unwrap();
+    let allowed = check_then_reserve(&db3, &key3, 3.0, &caps3, RequestKind::Batch, None).unwrap();
     assert!(matches!(allowed, CapCheckResult::Allowed(_)));
-    assert!(
-        get_batch_request(db3.connection(), &key3)
-            .unwrap()
-            .is_some()
-    );
+    assert!(get_batch_request(&db3, &key3).unwrap().is_some());
 }
 
 /// CL58: `candidate=0` bypasses the cap check entirely, even when every layer
@@ -2676,23 +2424,9 @@ fn cl58_zero_candidate_bypasses_cap_even_when_over() {
         folder_cap: Some(10.0),
         device_per_adapter_cap: Some(1.0),
     };
-    let result = with_immediate_transaction(db.connection(), || {
-        check_then_reserve(
-            db.connection(),
-            &task_key,
-            0.0,
-            &caps,
-            RequestKind::Batch,
-            None,
-        )
-    })
-    .unwrap();
+    let result = check_then_reserve(&db, &task_key, 0.0, &caps, RequestKind::Batch, None).unwrap();
     assert!(matches!(result, CapCheckResult::ExemptZeroCost(_)));
-    assert!(
-        get_batch_request(db.connection(), &task_key)
-            .unwrap()
-            .is_some()
-    );
+    assert!(get_batch_request(&db, &task_key).unwrap().is_some());
 }
 
 /// CL59: `ledger(...)` = confirmed-month sum (estimate rows count too) +
@@ -2703,7 +2437,8 @@ fn cl58_zero_candidate_bypasses_cap_even_when_over() {
 fn cl59_ledger_total_combines_confirmed_and_inflight_reservation() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "markdownize", "h");
-    db.connection()
+    Connection::open(db.path())
+        .unwrap()
         .execute(
             "INSERT INTO cost_ledger (scope_id, adapter_kind, input_hash, tool_profile_hash, \
              submission_seq, batch_job_id, usd, estimated, outcome, month, recorded_at) \
@@ -2713,18 +2448,11 @@ fn cl59_ledger_total_combines_confirmed_and_inflight_reservation() {
         )
         .unwrap();
     let inflight = key("s", "markdownize", "inflight");
-    phase1_intent(db.connection(), &inflight, RequestKind::Batch, 5.0, None).unwrap();
+    phase1_intent(&db, &inflight, RequestKind::Batch, 5.0, None).unwrap();
     let terminal_row = key("s", "markdownize", "terminal");
-    let terminal_intent = phase1_intent(
-        db.connection(),
-        &terminal_row,
-        RequestKind::Batch,
-        1.0,
-        None,
-    )
-    .unwrap();
+    let terminal_intent = phase1_intent(&db, &terminal_row, RequestKind::Batch, 1.0, None).unwrap();
     terminal_transaction(
-        db.connection(),
+        &db,
         &plain_terminal_write(
             &terminal_row,
             Outcome::Succeeded,
@@ -2740,13 +2468,7 @@ fn cl59_ledger_total_combines_confirmed_and_inflight_reservation() {
     .unwrap();
     let _ = task_key;
 
-    let total = ledger_month_total(
-        db.connection(),
-        Some("s"),
-        None,
-        &utc_month_of(now_millis()),
-    )
-    .unwrap();
+    let total = ledger_month_total(&db, Some("s"), None, &utc_month_of(now_millis())).unwrap();
     assert_eq!(total, 10.0 + 2.0 + 5.0 + 1.0);
 }
 
@@ -2761,30 +2483,19 @@ fn cl60_sync_phase1_never_touches_cost_ledger() {
         folder_cap: None,
         device_per_adapter_cap: None,
     };
-    with_immediate_transaction(db.connection(), || {
-        check_then_reserve(
-            db.connection(),
-            &task_key,
-            0.05,
-            &caps,
-            RequestKind::Sync,
-            Some(300),
-        )
-    })
-    .unwrap();
-    let ledger_count: i64 = db
-        .connection()
+    check_then_reserve(&db, &task_key, 0.05, &caps, RequestKind::Sync, Some(300)).unwrap();
+    let ledger_count: i64 = Connection::open(db.path())
+        .unwrap()
         .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row.get(0))
         .unwrap();
     assert_eq!(ledger_count, 0);
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(row.estimated_usd, 0.05);
 }
 
 fn seed_confirmed_charge(db: &LedgerDb, scope_id: &str, adapter_kind: &str, usd: f64) {
-    db.connection()
+    Connection::open(db.path())
+        .unwrap()
         .execute(
             "INSERT INTO cost_ledger (scope_id, adapter_kind, input_hash, tool_profile_hash, \
              submission_seq, batch_job_id, usd, estimated, outcome, month, recorded_at) \
@@ -2801,23 +2512,15 @@ fn seed_confirmed_charge(db: &LedgerDb, scope_id: &str, adapter_kind: &str, usd:
 }
 
 /// CL63: a terminal sync row has already had `intent_token` NULL'd (CL47), so
-/// it cannot be reached via an intent_token selector — only the 4-tuple key
-/// resolves it (and, being fully terminal-and-clean, resolves to an
-/// idempotent no-op abandon per CL66).
+/// it cannot be reached via an intent-token selector. Its four-tuple resolves
+/// to the terminal row and abandon remains an idempotent no-op.
 #[test]
 fn cl63_terminal_sync_row_needs_the_four_tuple_selector() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "embedding", "h");
-    let intent = phase1_intent(
-        db.connection(),
-        &task_key,
-        RequestKind::Sync,
-        0.01,
-        Some(300),
-    )
-    .unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Sync, 0.01, Some(300)).unwrap();
     terminal_transaction(
-        db.connection(),
+        &db,
         &plain_terminal_write(
             &task_key,
             Outcome::Succeeded,
@@ -2831,29 +2534,21 @@ fn cl63_terminal_sync_row_needs_the_four_tuple_selector() {
         ),
     )
     .unwrap();
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
     assert!(
-        row.intent_token.is_none(),
-        "sync terminal Tx already cleared it (CL47)"
+        get_batch_request(&db, &task_key)
+            .unwrap()
+            .unwrap()
+            .intent_token
+            .is_none()
     );
-
-    let via_token = resolve_abandon_selector(
-        db.connection(),
-        &AbandonSelector::IntentToken(intent.intent_token),
-    )
-    .unwrap();
     assert_eq!(
-        via_token,
+        resolve_abandon_selector(&db, &AbandonSelector::IntentToken(intent.intent_token)).unwrap(),
         AbandonResolution::NotFound,
-        "the token no longer resolves anything"
     );
-
-    let via_four_tuple =
-        resolve_abandon_selector(db.connection(), &AbandonSelector::TaskKey(task_key.clone()))
-            .unwrap();
-    assert_eq!(via_four_tuple, AbandonResolution::Found(task_key));
+    assert_eq!(
+        resolve_abandon_selector(&db, &AbandonSelector::TaskKey(task_key.clone())).unwrap(),
+        AbandonResolution::Found(task_key),
+    );
 }
 
 /// CL67: abandon applies to `request_kind='sync'` rows exactly like batch rows
@@ -2863,25 +2558,16 @@ fn cl63_terminal_sync_row_needs_the_four_tuple_selector() {
 fn cl67_abandon_applies_to_sync_rows_with_immediate_token_clear() {
     let (_dir, db) = open_temp_ledger();
     let task_key = key("s", "embedding", "h");
-    phase1_intent(
-        db.connection(),
-        &task_key,
-        RequestKind::Sync,
-        0.02,
-        Some(300),
-    )
-    .unwrap();
-    let execution = execute_abandon(db.connection(), &task_key).unwrap();
+    phase1_intent(&db, &task_key, RequestKind::Sync, 0.02, Some(300)).unwrap();
+    let execution = execute_abandon(&db, &task_key).unwrap();
     assert_eq!(execution, AbandonExecution::Abandoned);
-    let row = get_batch_request(db.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let row = get_batch_request(&db, &task_key).unwrap().unwrap();
     assert_eq!(row.state, BatchState::Terminal);
     assert!(
         row.intent_token.is_none(),
         "sync abandon must not wait for cleanup"
     );
-    let ledger_rows = cost_ledger_rows_for_key(db.connection(), &task_key).unwrap();
+    let ledger_rows = cost_ledger_rows_for_key(&db, &task_key).unwrap();
     assert_eq!(ledger_rows[0].outcome, Outcome::Abandoned);
 }
 
@@ -2894,12 +2580,11 @@ fn cl64_abandon_cli_confirmation_records_estimated_charge_and_terminal_state() {
     let dir = tempfile::tempdir().unwrap();
     init_scope(&dir);
     let task_key = key("device-test-scope", "markdownize", "cl64-task");
-    let db = LedgerDb::open(ledger_path_for(&dir)).unwrap();
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.25, None).unwrap();
+    let db = LedgerDb::open_existing(ledger_path_for(&dir)).unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.25, None).unwrap();
     drop(db);
 
-    let stdout = kio(&dir, &["batch", "abandon", &intent.intent_token])
-        .write_stdin("y\n")
+    let stdout = kio(&dir, &["batch", "abandon", &intent.intent_token, "--yes"])
         .arg("--json")
         .assert()
         .success()
@@ -2909,13 +2594,11 @@ fn cl64_abandon_cli_confirmation_records_estimated_charge_and_terminal_state() {
     let result: Value = serde_json::from_slice(&stdout).unwrap();
     assert_eq!(result["status"], "abandoned");
 
-    let db_after = LedgerDb::open(ledger_path_for(&dir)).unwrap();
-    let row = get_batch_request(db_after.connection(), &task_key)
-        .unwrap()
-        .unwrap();
+    let db_after = LedgerDb::open_existing(ledger_path_for(&dir)).unwrap();
+    let row = get_batch_request(&db_after, &task_key).unwrap().unwrap();
     assert_eq!(row.state, BatchState::Terminal);
     assert!(row.completed_at.is_some());
-    let ledger_rows = cost_ledger_rows_for_key(db_after.connection(), &task_key).unwrap();
+    let ledger_rows = cost_ledger_rows_for_key(&db_after, &task_key).unwrap();
     assert_eq!(ledger_rows.len(), 1);
     assert_eq!(ledger_rows[0].outcome, Outcome::Abandoned);
     assert_eq!(ledger_rows[0].usd, 1.25);
@@ -2935,7 +2618,7 @@ fn cl69_check_violation_reaches_the_caller_as_store_constraint_error() {
     let (_dir, db) = open_temp_ledger();
     // Bypass validation entirely: attempt to record a negative usd directly
     // through the same INSERT shape terminal_transaction uses.
-    let raw_result = db.connection().execute(
+    let raw_result = Connection::open(db.path()).unwrap().execute(
         "INSERT INTO cost_ledger (scope_id, adapter_kind, input_hash, tool_profile_hash, \
          submission_seq, batch_job_id, usd, estimated, outcome, month, recorded_at) \
          VALUES ('s','markdownize','h','t', 1, 'job', -5.0, 0, 'succeeded', '2026-07', 0)",
@@ -2953,42 +2636,65 @@ fn cl69_check_violation_reaches_the_caller_as_store_constraint_error() {
 }
 
 /// CL70: device-global single-file path resolution (via `$XDG_DATA_HOME`),
-/// WAL plus busy_timeout on connect, and no `rebuild`-style recreation path
-/// exists in this module (only `LedgerDb::open`, which preserves existing
-/// rows — already proven by
-/// `ledger::schema::tests::reopen_is_idempotent_and_preserves_rows`).
+/// WAL plus a meaningful busy timeout on lifecycle writes.
 #[test]
 fn cl70_device_global_path_and_wal_busy_timeout() {
     let dir = tempfile::tempdir().unwrap();
+    let data_home = std::fs::canonicalize(dir.path()).unwrap();
     // SAFETY (test-only): scoped to this process's short-lived assertion;
     // no other thread in this binary reads XDG_DATA_HOME concurrently with it.
     unsafe {
-        std::env::set_var("XDG_DATA_HOME", dir.path());
+        std::env::set_var("XDG_DATA_HOME", &data_home);
     }
     let resolved = kio_pipeline::ledger::default_ledger_path().unwrap();
     unsafe {
         std::env::remove_var("XDG_DATA_HOME");
     }
-    assert_eq!(resolved, dir.path().join("kio/cost-ledger.sqlite"));
+    assert_eq!(resolved, data_home.join("kio/cost-ledger.sqlite"));
 
-    let db = LedgerDb::open(&resolved).unwrap();
-    let journal: String = db
-        .connection()
+    let initialized = LedgerDb::initialize(&resolved).unwrap();
+    drop(initialized);
+    let db = LedgerDb::open_existing(&resolved).unwrap();
+    let journal: String = Connection::open(db.path())
+        .unwrap()
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .unwrap();
     assert_eq!(journal.to_lowercase(), "wal");
-    let timeout: i64 = db
-        .connection()
-        .query_row("PRAGMA busy_timeout", [], |row| row.get(0))
+    let blocker = Connection::open(db.path()).unwrap();
+    blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
+    let worker = db.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        tx.send(phase1_intent(
+            &worker,
+            &key("cl70", "markdownize", "busy-timeout"),
+            RequestKind::Batch,
+            0.0,
+            None,
+        ))
         .unwrap();
-    assert!(timeout > 0);
+    });
+    assert!(
+        rx.recv_timeout(std::time::Duration::from_millis(100))
+            .is_err(),
+        "the lifecycle write must wait for SQLite contention instead of failing immediately"
+    );
+    blocker.execute_batch("ROLLBACK;").unwrap();
+    rx.recv_timeout(std::time::Duration::from_secs(6))
+        .expect("writer must complete after the lock releases")
+        .unwrap();
 }
 
 #[test]
 fn retired_jsonl_files_fail_closed_without_modification() {
     let dir = tempfile::tempdir().unwrap();
-    let data_dir = dir.path().join("kio");
-    std::fs::create_dir_all(&data_dir).unwrap();
+    let data_dir = std::fs::canonicalize(dir.path()).unwrap().join("device");
+    std::fs::create_dir(&data_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
 
     for name in [
         "cost-ledger.jsonl",
@@ -3009,7 +2715,7 @@ fn retired_jsonl_files_fail_closed_without_modification() {
         .concat();
         std::fs::write(&path, &original).unwrap();
 
-        let err = match LedgerDb::open(data_dir.join("cost-ledger.sqlite")) {
+        let err = match LedgerDb::open_existing(data_dir.join("cost-ledger.sqlite")) {
             Ok(_) => panic!("{name} must make ledger startup fail closed"),
             Err(err) => err,
         };
@@ -3053,7 +2759,7 @@ fn retired_jsonl_files_fail_closed_without_modification() {
             (path, bytes)
         })
         .collect::<Vec<_>>();
-    let err = match LedgerDb::open(data_dir.join("cost-ledger.sqlite")) {
+    let err = match LedgerDb::open_existing(data_dir.join("cost-ledger.sqlite")) {
         Ok(_) => panic!("multiple legacy files must make ledger startup fail closed"),
         Err(err) => err,
     };
@@ -3077,7 +2783,7 @@ fn retired_jsonl_files_fail_closed_without_modification() {
         std::fs::write(&target, b"non-rebuildable symlink target\0\xff").unwrap();
         let symlinked = data_dir.join("cost-ledger.jsonl");
         symlink(&target, &symlinked).unwrap();
-        let err = match LedgerDb::open(data_dir.join("cost-ledger.sqlite")) {
+        let err = match LedgerDb::open_existing(data_dir.join("cost-ledger.sqlite")) {
             Ok(_) => panic!("a retired-ledger symlink must fail closed"),
             Err(err) => err,
         };
@@ -3090,7 +2796,7 @@ fn retired_jsonl_files_fail_closed_without_modification() {
 
         let dangling = data_dir.join("cost-ledger.jsonl.migrated");
         symlink(data_dir.join("missing-legacy-target"), &dangling).unwrap();
-        let err = match LedgerDb::open(data_dir.join("cost-ledger.sqlite")) {
+        let err = match LedgerDb::open_existing(data_dir.join("cost-ledger.sqlite")) {
             Ok(_) => panic!("a dangling retired-ledger symlink must fail closed"),
             Err(err) => err,
         };
@@ -3103,16 +2809,22 @@ fn retired_jsonl_files_fail_closed_without_modification() {
 fn ledger_opens_normally_when_no_retired_jsonl_files_exist() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("kio/cost-ledger.sqlite");
-    let db = LedgerDb::open(&path).unwrap();
-    let tables: i64 = db
-        .connection()
+    LedgerDb::initialize(&path).unwrap();
+    let db = LedgerDb::open_existing(&path).unwrap();
+    let tables: i64 = Connection::open(db.path())
+        .unwrap()
         .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'cost_ledger'",
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'table' AND name IN
+             ('cost_ledger', 'batch_requests', 'schema_migrations', 'ledger_metadata')",
             [],
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(tables, 1);
+    assert_eq!(
+        tables, 4,
+        "fresh ledger must include its authority metadata"
+    );
 }
 
 #[test]
@@ -3121,9 +2833,9 @@ fn legacy_rejection_does_not_change_existing_sqlite_bytes_or_rows() {
     let data_dir = dir.path().join("kio");
     let path = data_dir.join("cost-ledger.sqlite");
     {
-        let db = LedgerDb::open(&path).unwrap();
+        let db = LedgerDb::initialize(&path).unwrap();
         let task_key = key("scope-a", "markdownize", "hash-a");
-        phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
+        phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
     }
     let before = std::fs::read(&path).unwrap();
     let retired_names = [
@@ -3145,7 +2857,7 @@ fn legacy_rejection_does_not_change_existing_sqlite_bytes_or_rows() {
         ]
         .concat();
         std::fs::write(&legacy_path, &legacy_bytes).unwrap();
-        let err = match LedgerDb::open(&path) {
+        let err = match LedgerDb::open_existing(&path) {
             Ok(_) => panic!("{name} must make ledger startup fail closed"),
             Err(err) => err,
         };
@@ -3173,7 +2885,7 @@ fn legacy_rejection_does_not_change_existing_sqlite_bytes_or_rows() {
             (path, bytes)
         })
         .collect::<Vec<_>>();
-    let err = match LedgerDb::open(&path) {
+    let err = match LedgerDb::open_existing(&path) {
         Ok(_) => panic!("mixed retired files must make ledger startup fail closed"),
         Err(err) => err,
     };
@@ -3188,9 +2900,9 @@ fn legacy_rejection_does_not_change_existing_sqlite_bytes_or_rows() {
         std::fs::remove_file(legacy_path).unwrap();
     }
 
-    let db = LedgerDb::open(&path).unwrap();
-    let rows: i64 = db
-        .connection()
+    let db = LedgerDb::open_existing(&path).unwrap();
+    let rows: i64 = Connection::open(db.path())
+        .unwrap()
         .query_row("SELECT COUNT(*) FROM batch_requests", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 1, "legacy rejection must not change existing rows");
@@ -3234,10 +2946,10 @@ fn ledger_path_for(dir: &TempDir) -> PathBuf {
 }
 
 fn seed_ledger_row_for_cli(dir: &TempDir, task_key: &TaskKey) -> String {
-    let db = LedgerDb::open(ledger_path_for(dir)).unwrap();
-    let intent = phase1_intent(db.connection(), task_key, RequestKind::Batch, 1.0, None).unwrap();
+    let db = LedgerDb::open_existing(ledger_path_for(dir)).unwrap();
+    let intent = phase1_intent(&db, task_key, RequestKind::Batch, 1.0, None).unwrap();
     terminal_transaction(
-        db.connection(),
+        &db,
         &TerminalWrite {
             clear_intent_token: false, // stalled: settled but cleanup stuck
             ..plain_terminal_write(
@@ -3260,6 +2972,7 @@ fn seed_ledger_row_for_cli(dir: &TempDir, task_key: &TaskKey) -> String {
 fn init_scope(dir: &TempDir) {
     std::fs::write(dir.path().join("doc.md"), "hello").unwrap();
     json_success(dir, &["init"]);
+    LedgerDb::initialize(ledger_path_for(dir)).unwrap();
 }
 
 /// CL65/CL68: `kio status` surfaces the stalled row's `intent_token`, and
@@ -3277,9 +2990,8 @@ fn cl65_cl68_status_to_abandon_round_trip() {
     assert_eq!(stalled.len(), 1);
     assert_eq!(stalled[0]["intent_token"], intent_token);
 
-    // Confirm "yes" -> abandoned.
-    let stdout = kio(&dir, &["batch", "abandon", &intent_token])
-        .write_stdin("y\n")
+    // Explicit --yes -> abandoned.
+    let stdout = kio(&dir, &["batch", "abandon", &intent_token, "--yes"])
         .arg("--json")
         .assert()
         .success()
@@ -3293,8 +3005,9 @@ fn cl65_cl68_status_to_abandon_round_trip() {
     assert!(status_after["stalled_batch"].as_array().unwrap().is_empty());
 }
 
-/// CL65: rejecting the confirmation (or providing none) exits 9 with no
-/// changes; CL66: a selector matching no row is an idempotent exit-0 success.
+/// CL65: JSON/non-interactive mode rejects a piped response or no response
+/// without `--yes`, leaving state unchanged; CL66: a selector matching no row
+/// is an idempotent exit-0 success.
 #[test]
 fn cl65_cl66_confirmation_rejection_and_no_target_idempotence() {
     let dir = tempfile::tempdir().unwrap();
@@ -3303,7 +3016,7 @@ fn cl65_cl66_confirmation_rejection_and_no_target_idempotence() {
     let intent_token = seed_ledger_row_for_cli(&dir, &task_key);
 
     kio(&dir, &["batch", "abandon", &intent_token])
-        .write_stdin("no\n")
+        .write_stdin("y\n")
         .arg("--json")
         .assert()
         .code(9);
@@ -3333,7 +3046,7 @@ fn cl65_cl66_confirmation_rejection_and_no_target_idempotence() {
 fn cl62_ambiguous_three_tuple_selector_is_rejected() {
     let dir = tempfile::tempdir().unwrap();
     init_scope(&dir);
-    let db = LedgerDb::open(ledger_path_for(&dir)).unwrap();
+    let db = LedgerDb::open_existing(ledger_path_for(&dir)).unwrap();
     for profile in ["profile-a", "profile-b"] {
         let task_key = TaskKey::new(
             "device-test-scope",
@@ -3341,7 +3054,7 @@ fn cl62_ambiguous_three_tuple_selector_is_rejected() {
             "ambiguous-hash",
             profile,
         );
-        phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
+        phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
     }
     kio(
         &dir,
@@ -3363,11 +3076,11 @@ fn cl62_ambiguous_three_tuple_selector_is_rejected() {
 fn reset_violations_resets_terminal_row_and_is_a_noop_at_zero() {
     let dir = tempfile::tempdir().unwrap();
     init_scope(&dir);
-    let db = LedgerDb::open(ledger_path_for(&dir)).unwrap();
+    let db = LedgerDb::open_existing(ledger_path_for(&dir)).unwrap();
     let task_key = key("device-test-scope", "markdownize", "violating-task");
-    let intent = phase1_intent(db.connection(), &task_key, RequestKind::Batch, 1.0, None).unwrap();
+    let intent = phase1_intent(&db, &task_key, RequestKind::Batch, 1.0, None).unwrap();
     terminal_transaction(
-        db.connection(),
+        &db,
         &TerminalWrite {
             increment_contract_violation: true,
             ..plain_terminal_write(
@@ -3386,7 +3099,9 @@ fn reset_violations_resets_terminal_row_and_is_a_noop_at_zero() {
     .unwrap();
     drop(db);
 
-    let stdout = kio(
+    // The authorization command requires an explicit --yes argument; piping
+    // input cannot repair missing command syntax or authorize a reset.
+    kio(
         &dir,
         &[
             "batch",
@@ -3396,6 +3111,20 @@ fn reset_violations_resets_terminal_row_and_is_a_noop_at_zero() {
         ],
     )
     .write_stdin("y\n")
+    .arg("--json")
+    .assert()
+    .code(2);
+
+    let stdout = kio(
+        &dir,
+        &[
+            "batch",
+            "retry",
+            "--reset-violations",
+            "device-test-scope/markdownize/violating-task/tool-profile-1",
+            "--yes",
+        ],
+    )
     .arg("--json")
     .assert()
     .success()
@@ -3412,9 +3141,9 @@ fn reset_violations_resets_terminal_row_and_is_a_noop_at_zero() {
             "retry",
             "--reset-violations",
             "device-test-scope/markdownize/violating-task/tool-profile-1",
+            "--yes",
         ],
     )
-    .write_stdin("y\n")
     .arg("--json")
     .assert()
     .success()

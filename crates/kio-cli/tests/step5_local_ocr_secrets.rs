@@ -14,6 +14,8 @@
 //! to a cloud API that never received it.
 
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -29,6 +31,8 @@ const CHILD_ENV_DENYLIST: &[&str] = &[
     "KIO_TEST_MISTRAL_OCR",
     "KIO_TEST_MARKDOWNIZE_ADAPTER",
 ];
+
+const LOCAL_PEER_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBWTCB/6ADAgECAhR5P0J0YMFaZPlrOFyN8/jwpGzhqjAKBggqhkjOPQQDAjAh\nMR8wHQYDVQQDDBZyY2dlbiBzZWxmIHNpZ25lZCBjZXJ0MCAXDTc1MDEwMTAwMDAw\nMFoYDzQwOTYwMTAxMDAwMDAwWjAhMR8wHQYDVQQDDBZyY2dlbiBzZWxmIHNpZ25l\nZCBjZXJ0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGhIwEPQnvWSlH+iUQ5Ui\nq0khmBj4hlxmW+mTL5xjjyxwwopOnkxLs2AofasS2lYPdILzMaIeRE78g2S7Hz1n\nX6MTMBEwDwYDVR0RBAgwBocEfwAAATAKBggqhkjOPQQDAgNJADBGAiEA0GBG4uEL\nSJJea18R17+yhRTyn3rsD6PzDhdg7F/v2sQCIQCccgcgjDh+ABNajeb1deKZoqbx\nnP4qBrGe09azOI4jbg==\n-----END CERTIFICATE-----\n";
 
 fn kio(dir: &TempDir, args: &[&str], env: &[(&str, &str)]) -> Command {
     let mut command = Command::cargo_bin("kio").unwrap();
@@ -57,37 +61,72 @@ fn run(dir: &TempDir, args: &[&str], env: &[(&str, &str)]) -> (bool, String) {
     )
 }
 
-/// Every `send_secrets` consent row this run wrote, as tool ids.
+/// Every current device-private `send_secrets` grant this run wrote, as tool
+/// ids. The old append-only `consents.jsonl` ledger is no longer the authority.
 fn secrets_consent_tool_ids(dir: &TempDir) -> Vec<String> {
     let path = dir
         .path()
         .join(".test-data")
         .join("kio")
-        .join("consents.jsonl");
+        .join("grants")
+        .join("grants.json");
     if !path.exists() {
         return Vec::new();
     }
-    fs::read_to_string(&path)
-        .unwrap()
-        .lines()
-        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-        .filter(|row| {
-            row.get("operation")
-                .and_then(Value::as_str)
-                .is_some_and(|operation| operation.contains("secret"))
-        })
+    serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap()["grants"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|row| row["binding"]["operation"].as_str() == Some("send_secrets"))
         .filter_map(|row| {
-            row.get("tool_id")
+            row["binding"]
+                .get("tool_id")
                 .and_then(Value::as_str)
                 .map(str::to_owned)
         })
         .collect()
 }
 
+fn configure_local_ocr(dir: &TempDir, env: &[(&str, &str)]) {
+    #[cfg(unix)]
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let config = dir.path().join(".test-config/kio/tools.toml");
+    fs::create_dir_all(config.parent().unwrap()).unwrap();
+    fs::write(
+        config,
+        "[markdown.paddleocr_vl_local]\nkind = \"offline_api\"\nurl = \"https://127.0.0.1:8443\"\nmodel = \"PaddleOCR-VL-0.9B\"\n",
+    )
+    .unwrap();
+    let ca_path = dir.path().join("local-peer-ca.pem");
+    fs::write(&ca_path, LOCAL_PEER_CA_PEM).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(&ca_path, fs::Permissions::from_mode(0o600)).unwrap();
+    let ca_path = ca_path.to_str().unwrap();
+    let (ok, out) = run(
+        dir,
+        &["adapter", "trust", "register", "--ca-pem", ca_path, "--yes"],
+        env,
+    );
+    assert!(ok, "{out}");
+}
+
 fn fixture() -> TempDir {
     let dir = tempfile::tempdir().unwrap();
-    fs::write(dir.path().join("scan.pdf"), "%PDF-1.4\nscanned page\n").unwrap();
+    fs::write(
+        dir.path().join("credentials_scan.pdf"),
+        "%PDF-1.4\nscanned page\n",
+    )
+    .unwrap();
     dir
+}
+
+fn markdown_task(dir: &TempDir) -> Value {
+    fs::read_to_string(dir.path().join(".kio/tasks.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .find(|task| task["type"].as_str() == Some("markdownize"))
+        .expect("secret OCR fixture must create a markdownize task")
 }
 
 /// With a local OCR pipeline declared, `--send-secrets` must record consent
@@ -95,15 +134,33 @@ fn fixture() -> TempDir {
 #[test]
 fn the_secrets_consent_names_the_adapter_that_will_see_the_file() {
     let dir = fixture();
-    let local = [("KIO_TEST_LOCAL_OCR", "mock")];
+    // The configured embedding adapter has no send-secrets grant. Its missing
+    // permission must not hold an OCR send that is authorized for the actual
+    // local OCR peer.
+    let local = [
+        ("KIO_TEST_LOCAL_OCR", "mock"),
+        ("KIO_TEST_GEMINI_EMBED", "mock"),
+    ];
+    configure_local_ocr(&dir, &local);
     let (ok, out) = run(&dir, &["init"], &local);
     assert!(ok, "{out}");
     let (ok, out) = run(
         &dir,
-        &["index", "--approve", "--offline", "--send-secrets"],
+        &[
+            "adapter",
+            "approve",
+            "paddleocr_vl_local",
+            "--yes",
+            "--send-secrets",
+        ],
         &local,
     );
     assert!(ok, "{out}");
+    let (ok, out) = run(&dir, &["index"], &local);
+    assert!(ok, "{out}");
+    let task = markdown_task(&dir);
+    assert_eq!(task["status"], "done", "{task}");
+    assert_eq!(task["fallback_reason"], "local_adapter_done", "{task}");
 
     let recorded = secrets_consent_tool_ids(&dir);
     assert!(
@@ -121,6 +178,37 @@ fn the_secrets_consent_names_the_adapter_that_will_see_the_file() {
     );
 }
 
+#[test]
+fn mistral_secret_consent_does_not_authorize_the_local_ocr_peer() {
+    let dir = fixture();
+    let local = [("KIO_TEST_LOCAL_OCR", "mock")];
+    // Establish an otherwise valid Mistral grant before switching the active
+    // OCR target. The old all-configured predicate treated it as sufficient.
+    let (ok, out) = run(&dir, &["init"], &[]);
+    assert!(ok, "{out}");
+    let (ok, out) = run(
+        &dir,
+        &[
+            "adapter",
+            "approve",
+            "mistral_ocr_markdownize",
+            "--yes",
+            "--send-secrets",
+        ],
+        &[],
+    );
+    assert!(ok, "{out}");
+    configure_local_ocr(&dir, &local);
+    let (ok, out) = run(&dir, &["init"], &local);
+    assert!(ok, "{out}");
+
+    let (ok, out) = run(&dir, &["index"], &local);
+    assert!(ok, "{out}");
+    let task = markdown_task(&dir);
+    assert_eq!(task["status"], "paused", "{task}");
+    assert_eq!(task["fallback_reason"], "secrets_tier_b_hold", "{task}");
+}
+
 /// Without a local pipeline, nothing changes: the consent still names the
 /// online OCR adapter, exactly as it did before the split.
 #[test]
@@ -130,9 +218,17 @@ fn the_online_route_records_its_consent_unchanged() {
     assert!(ok, "{out}");
     let (ok, out) = run(
         &dir,
-        &["index", "--approve", "--offline", "--send-secrets"],
+        &[
+            "adapter",
+            "approve",
+            "mistral_ocr_markdownize",
+            "--yes",
+            "--send-secrets",
+        ],
         &[],
     );
+    assert!(ok, "{out}");
+    let (ok, out) = run(&dir, &["index", "--offline"], &[]);
     assert!(ok, "{out}");
 
     let recorded = secrets_consent_tool_ids(&dir);

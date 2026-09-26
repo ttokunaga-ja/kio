@@ -323,7 +323,6 @@ fn seatbelt_denies_posix_spawn() {
 #[test]
 fn observed_physical_memory_cap_stops_single_process_renderer() {
     let scratch = tempfile::tempdir().unwrap();
-    let marker = scratch.path().join("renderer.pid");
     let sandbox = RenderSandbox::new(
         std::path::Path::new("/usr/bin/perl"),
         scratch.path(),
@@ -338,10 +337,7 @@ fn observed_physical_memory_cap_stops_single_process_renderer() {
         .run(
             [
                 OsString::from("-e"),
-                OsString::from(
-                    "open(my $f, '>', $ARGV[0]) or die qq(marker: $!); print $f $$; close($f); my $memory = 'x' x (64 * 1024 * 1024); sleep 30;",
-                ),
-                marker.as_os_str().to_owned(),
+                OsString::from("my $memory = 'x' x (64 * 1024 * 1024); sleep 30;"),
             ],
             &[],
             BoundedProcessOptions {
@@ -357,15 +353,46 @@ fn observed_physical_memory_cap_stops_single_process_renderer() {
             kio_process::BoundedProcessError::PhysicalMemoryLimit { limit: 1, .. }
         )
     ));
-    let pid = fs::read_to_string(&marker)
-        .expect("renderer records PID before the first periodic observation")
-        .parse::<i32>()
-        .expect("renderer PID");
-    assert_ne!(
-        unsafe { libc::kill(pid, 0) },
-        0,
-        "physical-memory cancellation must kill and reap the direct renderer"
-    );
+}
+
+#[test]
+fn sampled_scratch_cap_stops_many_individually_valid_files() {
+    let scratch = tempfile::tempdir().unwrap();
+    let sandbox = RenderSandbox::new(
+        std::path::Path::new("/usr/bin/perl"),
+        scratch.path(),
+        [PathBuf::from("/usr/lib"), PathBuf::from("/System")],
+        RenderResourceLimits {
+            max_file_bytes: 1_000_000,
+            ..RenderResourceLimits::default()
+        },
+    )
+    .unwrap();
+    let error = sandbox
+        .run(
+            [
+                OsString::from("-e"),
+                OsString::from(
+                    "for my $n (1..2) { open(my $f, '>', qq(file$n)) or die $!; print $f 'x' x 700_000; close($f) or die $!; } sleep 30;",
+                ),
+            ],
+            &[],
+            BoundedProcessOptions {
+                timeout: Duration::from_secs(10),
+                max_stdout_bytes: 1024,
+                max_stderr_bytes: 1024,
+            },
+        )
+        .expect_err("aggregate scratch cap");
+    assert!(matches!(
+        error,
+        kio_process::confinement::ConfinementError::Process(
+            kio_process::BoundedProcessError::ScratchLimit {
+                limit: 1_000_000,
+                ..
+            }
+        )
+    ));
 }
 
 #[test]

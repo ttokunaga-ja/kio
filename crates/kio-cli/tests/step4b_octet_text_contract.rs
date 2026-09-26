@@ -76,7 +76,8 @@ fn octet_xml_and_html_index_offline_and_search() {
     kio(&dir, &["init"]).assert().success();
     // The whole point: index must SUCCEED (no KIO-E-INDEX-PARTIAL-001, no
     // contract_violation task) for markup-bearing sniffed text.
-    let index = json_success(&dir, &["index", "--approve"]);
+    let index = json_success(&dir, &["index", "--yes"]);
+    json_success(&dir, &["adapter", "approve", "--all", "--yes"]);
     assert_eq!(index["failed_files"], 0, "{index}");
 
     assert_search_hit(&dir, "quartzledger", "record-037.xml");

@@ -77,6 +77,25 @@ pub struct OcrResponse {
     pub model_version_pin: String,
 }
 
+/// Batch collection distinguishes a rejected provider body from a local CAS
+/// publication fault. The latter leaves a known provider result to collect
+/// again; it must not be treated as a bad provider response and re-submitted.
+#[derive(Debug)]
+pub enum BatchOcrMaterializationError {
+    Contract(AdapterError),
+    Persistence(AdapterError),
+}
+
+impl fmt::Display for BatchOcrMaterializationError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Contract(error) | Self::Persistence(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for BatchOcrMaterializationError {}
+
 pub trait MistralOcrClient: Clone {
     fn resolve_model_pin(&self, configured_model: &str) -> Result<String>;
 
@@ -679,69 +698,184 @@ impl<C: MistralOcrClient> MarkdownizeAdapter for MistralOcrMarkdownizeAdapter<C>
             Some(hints) => hints.clone(),
             None => discovered_unit_hints(&request.media_type, &request.raw.raw_hash, &ocr.pages)?,
         };
-        let pages_by_index = verified_pages_by_index(&ocr.pages, &hints)?;
-        if let Some(kio_dir) = &self.image_store_dir {
-            let images = ocr
-                .pages
-                .iter()
-                .flat_map(|page| page.images.iter())
-                .collect::<Vec<_>>();
-            persist_image_refs_bounded(
-                kio_dir,
-                &images,
-                OcrResponsePolicy::default().max_persisted_image_bytes,
-            )?;
-        }
-        // QA17 (step4b-contract-tests-p3a.md §F, 07 §4 L291-307): Mistral OCR
-        // bills per page processed, and `hints` is exactly the set of pages
-        // this request asked for AND that `pages_by_index` (above) confirmed
-        // the response actually returned — a real, provider-response-derived
-        // count, not a fabricated one. `hints` is non-empty here: an empty
-        // `prepared_unit_hint` takes the `discovered_unit_hints` path, which
-        // itself errors on zero pages before reaching this point.
-        let billable_units = vec![crate::types::BillableUnit {
-            kind: crate::types::BillableUnitKind::Pages,
-            count: hints.len() as u64,
-        }];
-        Ok(MarkdownizeResponse {
-            mode_used: request.mode,
-            updated_units: hints
+        markdownize_response_from_ocr(
+            ocr,
+            request.mode,
+            hints,
+            &self.scope_id,
+            self.image_store_dir.as_deref(),
+        )
+    }
+}
+
+/// Convert a verified Mistral batch-output body into persisted Kio markdown.
+///
+/// The caller supplies the scope and current store from its repository binding;
+/// neither may be accepted from provider output. `None` discovers units from a
+/// fresh OCR response, while `Some` preserves the exact (possibly retry-scoped)
+/// prepared-page set that was submitted to Mistral.
+pub fn materialize_mistral_batch_ocr_body(
+    body: &Value,
+    prepared_unit_hints: Option<&[PreparedUnitHint]>,
+    media_type: &str,
+    raw_hash: &str,
+    scope_id: &str,
+    image_store_dir: &Path,
+    bbox_annotation_enabled: bool,
+) -> std::result::Result<(MarkdownizeResponse, Vec<PreparedUnitHint>), BatchOcrMaterializationError>
+{
+    // Batch output has no independently resolved model-pin lookup at collect
+    // time. Require the provider's echoed model rather than fabricating
+    // provenance from a task or job record.
+    let model_pin = body.get("model").and_then(Value::as_str).ok_or_else(|| {
+        BatchOcrMaterializationError::Contract(AdapterError::ContractViolation(
+            "batch OCR body is missing its model field".to_owned(),
+        ))
+    })?;
+    let expected_page_indices = prepared_unit_hints
+        .map(|hints| {
+            hints
                 .iter()
                 .map(|hint| {
-                    let page_index = usize::try_from(hint.order).map_err(|_| {
+                    usize::try_from(hint.order).map_err(|_| {
                         AdapterError::ContractViolation(
                             "prepared page order exceeds platform range".to_owned(),
                         )
-                    })?;
-                    let page = pages_by_index.get(&page_index).copied().ok_or_else(|| {
-                        AdapterError::ContractViolation(format!(
-                            "OCR response missing page index {page_index}"
-                        ))
-                    })?;
-                    let markdown =
-                        replace_image_placeholders(&page.markdown, &self.scope_id, &page.images);
-                    let markdown =
-                        project_bbox_annotations(&markdown, &self.scope_id, &page.images)?;
-                    Ok(MarkdownUnit {
-                        unit_key: hint.unit_key.clone(),
-                        unit_type: hint.unit_kind,
-                        markdown,
-                        metadata: page_metadata(
-                            &ocr.model_version_pin,
-                            Some(page.images.as_slice()),
-                        ),
                     })
                 })
-                .collect::<Result<Vec<_>>>()?,
-            unchanged_unit_keys: Vec::new(),
-            added_units: Vec::new(),
-            removed_unit_keys: Vec::new(),
-            failed_units: Vec::new(),
-            fallback_to_full: false,
-            reason: None,
-            usage: Some(crate::types::AdapterUsage::BillableUnits { billable_units }),
+                .collect::<Result<Vec<_>>>()
         })
+        .transpose()
+        .map_err(BatchOcrMaterializationError::Contract)?;
+    let ocr = parse_ocr_response(
+        body.clone(),
+        model_pin,
+        expected_page_indices.as_deref(),
+        OcrResponsePolicy::default(),
+        bbox_annotation_enabled,
+    )
+    .map_err(BatchOcrMaterializationError::Contract)?;
+    let hints = match prepared_unit_hints {
+        Some([]) => {
+            return Err(BatchOcrMaterializationError::Contract(
+                AdapterError::ContractViolation(
+                    "unit-scoped retry without recoverable prepared units".to_owned(),
+                ),
+            ));
+        }
+        Some(hints) => hints.to_vec(),
+        None => discovered_unit_hints(media_type, raw_hash, &ocr.pages)
+            .map_err(BatchOcrMaterializationError::Contract)?,
+    };
+    // Validate the entire provider conversion before any persistence side
+    // effect. This is the same converter the synchronous adapter uses; the
+    // batch path only separates its write so a local CAS failure is replayed
+    // from this known output rather than billed and sent again.
+    let response =
+        build_markdownize_response_from_ocr(&ocr, MarkdownizeMode::Full, &hints, scope_id, true)
+            .map_err(BatchOcrMaterializationError::Contract)?;
+    persist_ocr_images(&ocr, image_store_dir).map_err(BatchOcrMaterializationError::Persistence)?;
+    Ok((response, hints))
+}
+
+fn markdownize_response_from_ocr(
+    ocr: OcrResponse,
+    mode_used: MarkdownizeMode,
+    hints: Vec<PreparedUnitHint>,
+    scope_id: &str,
+    image_store_dir: Option<&Path>,
+) -> Result<MarkdownizeResponse> {
+    let images_persisted = image_store_dir.is_some();
+    let response =
+        build_markdownize_response_from_ocr(&ocr, mode_used, &hints, scope_id, images_persisted)?;
+    if let Some(kio_dir) = image_store_dir {
+        persist_ocr_images(&ocr, kio_dir)?;
     }
+    Ok(response)
+}
+
+/// Build a validated response from decoded provider bytes. This is deliberately
+/// side-effect free, so both sync and batch lanes apply identical URI,
+/// metadata, ownership, and page-bijection rules before either writes a CAS
+/// object. `images_will_persist` is supplied by the caller because the sync
+/// adapter's no-store test seam intentionally exposes no image ownership.
+fn build_markdownize_response_from_ocr(
+    ocr: &OcrResponse,
+    mode_used: MarkdownizeMode,
+    hints: &[PreparedUnitHint],
+    scope_id: &str,
+    images_will_persist: bool,
+) -> Result<MarkdownizeResponse> {
+    let pages_by_index = verified_pages_by_index(&ocr.pages, hints)?;
+    // QA17 (step4b-contract-tests-p3a.md §F, 07 §4 L291-307): Mistral OCR
+    // bills per page processed, and `hints` is exactly the set of pages
+    // this request asked for AND that `pages_by_index` (above) confirmed
+    // the response actually returned — a real, provider-response-derived
+    // count, not a fabricated one. `hints` is non-empty here: an empty
+    // `prepared_unit_hint` takes the `discovered_unit_hints` path, which
+    // itself errors on zero pages before reaching this point.
+    let billable_units = vec![crate::types::BillableUnit {
+        kind: crate::types::BillableUnitKind::Pages,
+        count: hints.len() as u64,
+    }];
+    Ok(MarkdownizeResponse {
+        mode_used,
+        updated_units: hints
+            .iter()
+            .map(|hint| {
+                let page_index = usize::try_from(hint.order).map_err(|_| {
+                    AdapterError::ContractViolation(
+                        "prepared page order exceeds platform range".to_owned(),
+                    )
+                })?;
+                let page = pages_by_index.get(&page_index).copied().ok_or_else(|| {
+                    AdapterError::ContractViolation(format!(
+                        "OCR response missing page index {page_index}"
+                    ))
+                })?;
+                let markdown = replace_image_placeholders(&page.markdown, scope_id, &page.images);
+                let markdown = project_bbox_annotations(&markdown, scope_id, &page.images)?;
+                Ok(MarkdownUnit {
+                    unit_key: hint.unit_key.clone(),
+                    unit_type: hint.unit_kind,
+                    markdown,
+                    // Ownership derives solely from images persisted from
+                    // decoded bytes on this page, never provider markdown
+                    // or arbitrary provider metadata.
+                    owned_image_hashes: if images_will_persist {
+                        page.images
+                            .iter()
+                            .map(|image| image_hash(&image.bytes))
+                            .collect()
+                    } else {
+                        Default::default()
+                    },
+                    metadata: page_metadata(&ocr.model_version_pin, Some(page.images.as_slice())),
+                })
+            })
+            .collect::<Result<Vec<_>>>()?,
+        unchanged_unit_keys: Vec::new(),
+        added_units: Vec::new(),
+        removed_unit_keys: Vec::new(),
+        failed_units: Vec::new(),
+        fallback_to_full: false,
+        reason: None,
+        usage: Some(crate::types::AdapterUsage::BillableUnits { billable_units }),
+    })
+}
+
+fn persist_ocr_images(ocr: &OcrResponse, kio_dir: &Path) -> Result<()> {
+    let images = ocr
+        .pages
+        .iter()
+        .flat_map(|page| page.images.iter())
+        .collect::<Vec<_>>();
+    persist_image_refs_bounded(
+        kio_dir,
+        &images,
+        OcrResponsePolicy::default().max_persisted_image_bytes,
+    )?;
+    Ok(())
 }
 
 /// Build the canonical unit identities discovered by a full OCR-from-scratch

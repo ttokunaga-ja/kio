@@ -1,0 +1,79 @@
+name: kio-v1-embedding-r32
+services:
+  qwen3-vl-embedding:
+    command:
+      - --model
+      - Qwen/Qwen3-VL-Embedding-2B
+      - --revision
+      - 9f2f7e710d6d81056aa5c0a4f04764fec6bb7bda
+      - --runner
+      - pooling
+      - --trust-remote-code
+      - --dtype
+      - half
+      - --gpu-memory-utilization
+      - "0.80"
+      - --max-model-len
+      - "2048"
+      - --max-num-batched-tokens
+      - "2048"
+      - --max-num-seqs
+      - "1"
+      - --enforce-eager
+      - --download-dir
+      - /models
+      - --ssl-keyfile
+      - /tls/server-key.pem
+      - --ssl-certfile
+      - /tls/server-cert.pem
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities:
+                - gpu
+              driver: nvidia
+              device_ids:
+                - "0"
+    environment:
+      HF_HOME: /models
+      HF_HUB_DISABLE_TELEMETRY: "1"
+      VLLM_DO_NOT_TRACK: "1"
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl --fail --silent --show-error --cacert /tls/ca-cert.pem https://127.0.0.1:8000/health
+          >/dev/null
+      timeout: 5s
+      interval: 10s
+      retries: 6
+      start_period: 5m0s
+    image: vllm/vllm-openai@sha256:770fe65b2c73ee74a5c42165cf3433de4048cc2cd9c57a937ca4e35aba5aa87b
+    logging:
+      driver: local
+      options:
+        max-file: "3"
+        max-size: 10m
+    networks:
+      default: null
+    ports:
+      - mode: ingress
+        host_ip: 127.0.0.1
+        target: 8000
+        published: "18081"
+        protocol: tcp
+    restart: 'no'
+    shm_size: "1073741824"
+    volumes:
+      - type: bind
+        source: /home/kio-test/work/kio/v1-embedding-r32/models
+        target: /models
+        bind: {}
+      - type: bind
+        source: /home/kio-test/work/kio/v1-embedding-r32/tls-server
+        target: /tls
+        read_only: true
+        bind: {}
+networks:
+  default:
+    name: kio-v1-embedding-r32_default

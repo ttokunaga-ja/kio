@@ -1,0 +1,265 @@
+name: V1 provider acceptance (ledger guarded)
+run-name: v1 provider acceptance ${{ inputs.operation }} / ${{ inputs.campaign_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      operation: { required: true, type: choice, options: [initialize, run] }
+      candidate_sha: { required: false, type: string }
+      package_run_id: { required: false, type: string }
+      campaign_id: { required: true, type: string }
+
+# One shared budget authority across campaigns, retries, providers, and OSes.
+concurrency: { group: v1-provider-acceptance-ledger-global, cancel-in-progress: false }
+permissions: { actions: read, contents: read }
+
+jobs:
+  candidate-guard:
+    runs-on: ubuntu-latest
+    outputs:
+      eligible: ${{ steps.guard.outputs.eligible }}
+    steps:
+      - id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OPERATION: ${{ inputs.operation }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          PACKAGE_RUN_ID: ${{ inputs.package_run_id }}
+          CAMPAIGN_ID: ${{ inputs.campaign_id }}
+        run: |
+          set -euo pipefail
+          [[ "$CAMPAIGN_ID" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$ ]]
+          case "$OPERATION" in
+            initialize) test -z "$CANDIDATE_SHA" && test -z "$PACKAGE_RUN_ID" ;;
+            run) [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]] && [[ "$PACKAGE_RUN_ID" =~ ^[1-9][0-9]*$ ]] ;;
+            *) exit 1 ;;
+          esac
+          main_sha="$(gh api "/repos/${GITHUB_REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          test "$GITHUB_SHA" = "$main_sha"
+          if test "$OPERATION" = run; then test "$GITHUB_SHA" = "$CANDIDATE_SHA"; fi
+          echo eligible=true >> "$GITHUB_OUTPUT"
+
+  tools-build:
+    name: Build pinned acceptance helper
+    needs: candidate-guard
+    if: needs.candidate-guard.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    permissions: { contents: read }
+    outputs:
+      helper_sha256: ${{ steps.helper.outputs.sha256 }}
+      workflow_sha256: ${{ steps.helper.outputs.workflow_sha256 }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - run: test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+      - id: helper
+        name: Build the pinned helper only
+        run: |
+          set -euo pipefail
+          cargo +1.98.0 build -p kio-eval --bin kio-acceptance-tools --locked
+          test -f target/debug/kio-acceptance-tools
+          echo "sha256=$(sha256sum target/debug/kio-acceptance-tools | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+          echo "workflow_sha256=$(sha256sum .github/workflows/v1-provider-acceptance.yml | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+      - name: Publish immutable pinned helper
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: kio-acceptance-tools-${{ github.sha }}
+          path: target/debug/kio-acceptance-tools
+          if-no-files-found: error
+          overwrite: false
+
+  authority:
+    name: Protected ledger authority
+    needs: [candidate-guard, tools-build]
+    if: needs.candidate-guard.outputs.eligible == 'true'
+    runs-on: ubuntu-latest
+    environment: v1-provider-acceptance
+    permissions: { actions: read, contents: write }
+    outputs:
+      reservation_commit: ${{ steps.ledger.outputs.reservation_commit }}
+    steps:
+      # Sole contents:write holder. It executes only the separately built,
+      # hash-checked helper; no candidate checkout, Cargo/build.rs, or paid key
+      # occurs in this authority boundary.
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: kio-acceptance-tools-${{ github.sha }}
+          path: ${{ runner.temp }}/kio-acceptance-tools
+      - name: Verify pinned helper inventory and digest
+        env:
+          EXPECTED_SHA256: ${{ needs.tools-build.outputs.helper_sha256 }}
+        run: |
+          set -euo pipefail
+          helper="$RUNNER_TEMP/kio-acceptance-tools/kio-acceptance-tools"
+          [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          test -f "$helper"
+          test "$(find "$RUNNER_TEMP/kio-acceptance-tools" -type f -print | wc -l | tr -d ' ')" = 1
+          test "$(sha256sum "$helper" | awk '{print $1}')" = "$EXPECTED_SHA256"
+          chmod 700 "$helper"
+          echo "KIO_ACCEPTANCE_TOOLS=$helper" >> "$GITHUB_ENV"
+      - id: ledger
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
+          OPERATION: ${{ inputs.operation }}
+          CAMPAIGN_ID: ${{ inputs.campaign_id }}
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ATTEMPT: ${{ github.run_attempt }}
+          WORKFLOW_SHA256: ${{ needs.tools-build.outputs.workflow_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$WORKFLOW_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          main_sha="$(gh api "/repos/${REPOSITORY}/git/ref/heads/main" --jq '.object.sha')"
+          test "$main_sha" = "$GITHUB_SHA"
+          if test "$OPERATION" = run; then test "$CANDIDATE_SHA" = "$GITHUB_SHA"; fi
+          if test "$OPERATION" = initialize; then
+            "$KIO_ACCEPTANCE_TOOLS" provider-ledger initialize --repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --workflow-sha256 "$WORKFLOW_SHA256" --run-id "$RUN_ID" --attempt "$ATTEMPT"
+          else
+            result="$("$KIO_ACCEPTANCE_TOOLS" provider-ledger reserve-all --repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --workflow-sha256 "$WORKFLOW_SHA256" --candidate-sha "$CANDIDATE_SHA" --run-id "$RUN_ID" --attempt "$ATTEMPT")"
+            commit="$(jq -er .commit <<< "$result")"
+            [[ "$commit" =~ ^[0-9a-f]{40}$ ]]
+            echo "reservation_commit=$commit" >> "$GITHUB_OUTPUT"
+          fi
+
+  provider-a08:
+    name: ${{ matrix.os }} ${{ matrix.provider }} A08 live-provider guard
+    needs: [candidate-guard, authority]
+    if: needs.candidate-guard.outputs.eligible == 'true' && inputs.operation == 'run'
+    runs-on: ${{ matrix.runner }}
+    environment: v1-provider-acceptance
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: linux, runner: ubuntu-latest, provider: mistral }
+          - { os: macos, runner: macos-26, provider: mistral }
+          - { os: windows, runner: windows-latest, provider: mistral }
+          - { os: linux, runner: ubuntu-latest, provider: gemini }
+          - { os: macos, runner: macos-26, provider: gemini }
+          - { os: windows, runner: windows-latest, provider: gemini }
+    defaults: { run: { shell: bash } }
+    env:
+      CAMPAIGN_ID: ${{ inputs.campaign_id }}
+      CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+      PACKAGE_RUN_ID: ${{ inputs.package_run_id }}
+      PROVIDER: ${{ matrix.provider }}
+      OS_NAME: ${{ matrix.os }}
+      RESERVATION_COMMIT: ${{ needs.authority.outputs.reservation_commit }}
+    steps:
+      # Paid jobs have contents:read only and pin this commit; they never infer
+      # authority from branch tip or diagnostic artifact.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          path: authority
+          fetch-depth: 1
+          persist-credentials: false
+      - run: test "$(git -C authority rev-parse HEAD)" = "$GITHUB_SHA"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ inputs.candidate_sha }}
+          path: candidate
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind exact candidate and successful package source run
+        working-directory: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin main
+          test "$CANDIDATE_SHA" = "$(git rev-parse HEAD)"
+          test "$CANDIDATE_SHA" = "$(git rev-parse origin/main)"
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}" | jq -e --arg sha "$CANDIDATE_SHA" '.event == "workflow_dispatch" and .status == "completed" and .conclusion == "success" and .head_sha == $sha and .path == ".github/workflows/v1-acceptance.yml"' >/dev/null
+      - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+      - name: Build exact candidate acceptance binaries before credential
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          cargo +1.98.0 build -p kio-eval --bin kio-eval --bin kio-acceptance-tools --locked
+          tools_bin=target/debug/kio-acceptance-tools
+          if [[ "$RUNNER_OS" == Windows ]]; then tools_bin="${tools_bin}.exe"; fi
+          test -f "$tools_bin"
+          printf 'KIO_ACCEPTANCE_TOOLS=%s\n' "$GITHUB_WORKSPACE/candidate/$tools_bin" >> "$GITHUB_ENV"
+          printf 'KIO_PROVIDER_WORKFLOW_SHA256=%s\n' "$(shasum -a 256 .github/workflows/v1-provider-acceptance.yml | awk '{print $1}')" >> "$GITHUB_ENV"
+      - name: Verify exact ledger root, chain, and reservation before credential
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$RESERVATION_COMMIT" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$KIO_PROVIDER_WORKFLOW_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          "$KIO_ACCEPTANCE_TOOLS" provider-ledger verify --repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --workflow-sha256 "$KIO_PROVIDER_WORKFLOW_SHA256" --candidate-sha "$CANDIDATE_SHA" --run-id "$RUN_ID" --attempt "$ATTEMPT" --reservation-commit "$RESERVATION_COMMIT" --provider "$PROVIDER" --os "$OS_NAME"
+      - name: Verify and unpack the selected native package with bounded leaves
+        id: package
+        working-directory: candidate
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          os="$OS_NAME"; test "$os" = macos || test "$os" = linux || test "$os" = windows
+          row="$(gh api --paginate "/repos/${GITHUB_REPOSITORY}/actions/runs/${PACKAGE_RUN_ID}/artifacts?per_page=100" --jq '.artifacts[] | [.id,.name,(.expired|tostring),.size_in_bytes] | @tsv' | awk -F '\t' -v n="kio-v1-package-${os}-${CANDIDATE_SHA}" '$2 == n {print}')"
+          test "$(printf '%s\n' "$row" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          IFS=$'\t' read -r artifact_id artifact_name expired artifact_bytes <<< "$row"
+          test "$expired" = false; test "$artifact_bytes" -le 805306368
+          root="$RUNNER_TEMP/kio-v1-package-$os"; (umask 077; mkdir "$root")
+          gh api "/repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}/zip" > "$root/package.zip"
+          "$KIO_ACCEPTANCE_TOOLS" package-extract --archive "$root/package.zip" --output "$root/package"
+          root="$root/package"
+          archive="$(find "$root" -maxdepth 1 -type f -name '*.tar.gz' -print)"; checksums="$(find "$root" -maxdepth 1 -type f -name '*.checksums.json' -print)"
+          test "$(printf '%s\n' "$archive" | sed '/^$/d' | wc -l | tr -d ' ')" = 1; test "$(printf '%s\n' "$checksums" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          lock_sha256="$(<"$root/kio-v1-lock-sha256")"; eval_bin=target/debug/kio-eval; test "$RUNNER_OS" != Windows || eval_bin="${eval_bin}.exe"
+          archive_sha256="$("$eval_bin" release archive-sha256 --archive "$archive")"
+          "$eval_bin" release verify --archive "$archive" --checksums "$checksums" --expected-archive-sha256 "$archive_sha256" --source-repo "$GITHUB_WORKSPACE/candidate" --expected-commit "$CANDIDATE_SHA" --expected-lock-sha256 "$lock_sha256"
+          extract="$root/extract"; mkdir "$extract"; tar -xzf "$archive" -C "$extract"
+          release_root="$(find "$extract" -mindepth 1 -maxdepth 1 -type d -print)"; test "$(printf '%s\n' "$release_root" | sed '/^$/d' | wc -l | tr -d ' ')" = 1
+          release_bin="$release_root/bin/kio"; test "$RUNNER_OS" != Windows || release_bin="${release_bin}.exe"; test -f "$release_bin"
+          target="$RUNNER_TEMP/kio-v1-provider-target.json"; expected="$RUNNER_TEMP/kio-v1-provider-a08-expected.json"
+          workflow_sha256="$KIO_PROVIDER_WORKFLOW_SHA256"
+          "$eval_bin" acceptance target-binding --candidate-sha "$CANDIDATE_SHA" --os "$os" --target "$(jq -er .target "$root/target-binding.json")" --archive-sha256 "$archive_sha256" --binary-sha256 "$(jq -er .binary_sha256 "$root/target-binding.json")" --version "$(jq -er .version "$root/target-binding.json")" --out "$target"
+          "$eval_bin" acceptance expected-case --target-binding "$target" --case A08 --lane provider-live --subcase "$PROVIDER" --os "$os" --fixture-id provider-public-v1 --fixture-sha256 fc6ac89c29025e71da895f61b45d0d7a449989f098f3de1ac01f3f7dd1f02961 --workflow-path .github/workflows/v1-provider-acceptance.yml --workflow-sha256 "$workflow_sha256" --workflow-commit "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --architecture "$(uname -m)" --out "$expected"
+          printf 'release_bin=%s\nexpected=%s\nfixture=%s\n' "$release_bin" "$expected" "$GITHUB_WORKSPACE/candidate/crates/kio-eval/acceptance-fixtures/v1/provider-public" >> "$GITHUB_OUTPUT"
+      - name: Export verified ledger allocation in the existing executor format
+        id: state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          state="$RUNNER_TEMP/kio-v1-provider-budget-$PROVIDER"
+          [[ "$KIO_PROVIDER_WORKFLOW_SHA256" =~ ^[0-9a-f]{64}$ ]]
+          "$KIO_ACCEPTANCE_TOOLS" provider-ledger export-state --repository "$REPOSITORY" --campaign-id "$CAMPAIGN_ID" --workflow-sha256 "$KIO_PROVIDER_WORKFLOW_SHA256" --candidate-sha "$CANDIDATE_SHA" --run-id "$GITHUB_RUN_ID" --attempt "$GITHUB_RUN_ATTEMPT" --reservation-commit "$RESERVATION_COMMIT" --provider "$PROVIDER" --os "$OS_NAME" --state-dir "$state"
+          echo "state_dir=$state" >> "$GITHUB_OUTPUT"
+      - name: Execute Mistral A08 once
+        if: matrix.provider == 'mistral'
+        working-directory: candidate
+        env:
+          MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+        run: |
+          set -euo pipefail; test -n "$MISTRAL_API_KEY"
+          target/debug/kio-eval acceptance run --expected-case "${{ steps.package.outputs.expected }}" --case A08 --lane provider-live --subcase mistral --os "$OS_NAME" --bin "${{ steps.package.outputs.release_bin }}" --fixture "${{ steps.package.outputs.fixture }}" --work-dir "$RUNNER_TEMP/kio-v1-provider-work-mistral" --receipt "$RUNNER_TEMP/kio-v1-provider-a08-mistral-receipt.json" --provider mistral --reservation-state-dir "${{ steps.state.outputs.state_dir }}" --campaign-id "$CAMPAIGN_ID" --allocation-id "mistral-${OS_NAME}-${CANDIDATE_SHA:0:12}-r${GITHUB_RUN_ID}-a${GITHUB_RUN_ATTEMPT}"
+      - name: Execute Gemini A08 once
+        if: matrix.provider == 'gemini'
+        working-directory: candidate
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          set -euo pipefail; test -n "$GEMINI_API_KEY"
+          target/debug/kio-eval acceptance run --expected-case "${{ steps.package.outputs.expected }}" --case A08 --lane provider-live --subcase gemini --os "$OS_NAME" --bin "${{ steps.package.outputs.release_bin }}" --fixture "${{ steps.package.outputs.fixture }}" --work-dir "$RUNNER_TEMP/kio-v1-provider-work-gemini" --receipt "$RUNNER_TEMP/kio-v1-provider-a08-gemini-receipt.json" --provider gemini --reservation-state-dir "${{ steps.state.outputs.state_dir }}" --campaign-id "$CAMPAIGN_ID" --allocation-id "gemini-${OS_NAME}-${CANDIDATE_SHA:0:12}-r${GITHUB_RUN_ID}-a${GITHUB_RUN_ATTEMPT}"
+      - name: Publish diagnostic receipt only
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: v1-provider-a08-${{ inputs.campaign_id }}-${{ matrix.provider }}-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/kio-v1-provider-a08-expected.json
+            ${{ runner.temp }}/kio-v1-provider-a08-${{ matrix.provider }}-receipt.json
+          if-no-files-found: error
+          overwrite: false

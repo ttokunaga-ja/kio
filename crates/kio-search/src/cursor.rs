@@ -9,7 +9,7 @@ use std::collections::BTreeSet;
 use crate::query::{TimeTravelSelector, is_sha256_hash};
 use crate::{Result, SearchError};
 
-const CURSOR_VERSION: u64 = 2;
+const CURSOR_VERSION: u64 = 3;
 const MAX_CURSOR_PAYLOAD_BYTES: usize = 1024 * 1024;
 const MAX_CURSOR_TOKEN_BYTES: usize = 1_500_000;
 const MAX_SCOPE_ID_BYTES: usize = 256;
@@ -29,6 +29,10 @@ pub enum ScopeMode {
 pub struct ScopeCursor {
     pub scope_id: String,
     pub snapshot_commit: String,
+    /// The current-policy observation which admitted this scope's bindings on
+    /// page 1. A replay must reject a changed digest before it can reuse the
+    /// frozen row and consumed boundaries.
+    pub policy_digest: String,
     /// PC19/PC21 (05 §1.5): the scope's `index_metadata.index_generation` ULID at
     /// page-1 issuance. Replay re-reads the current value and rejects the cursor
     /// (`KIO-E-SEARCH-CURSOR-001`) on any mismatch — a rebuild/purge/enrichment
@@ -89,7 +93,7 @@ pub struct CursorToken {
 impl CursorToken {
     pub const VERSION: u64 = CURSOR_VERSION;
 
-    /// Strictly validate the signed v2 structure after deserialization (and
+    /// Strictly validate the signed v3 structure after deserialization (and
     /// before emission). Array order is part of the deterministic paging state.
     pub fn validate(&self) -> Result<()> {
         self.validate_contract().map_err(SearchError::Cursor)
@@ -149,6 +153,9 @@ impl CursorToken {
                 return Err(
                     "snapshot_commit must be sha256: plus 64 lowercase hex digits".to_owned(),
                 );
+            }
+            if !is_sha256_hash(&scope.policy_digest) {
+                return Err("policy_digest must be sha256: plus 64 lowercase hex digits".to_owned());
             }
             if !is_sha256_hash(&scope.chunking_config_hash) {
                 return Err(
@@ -382,6 +389,7 @@ mod tests {
             scopes: vec![ScopeCursor {
                 scope_id: "scope_01".to_owned(),
                 snapshot_commit: hash('a'),
+                policy_digest: hash('b'),
                 index_generation: "01J8ZQEXAMPLEGENERATION0".to_owned(),
                 max_rowid: 42,
                 max_association_rowid: 48,
@@ -447,21 +455,25 @@ mod tests {
     }
 
     #[test]
-    fn strict_decode_rejects_legacy_unknown_or_incomplete_v2_payloads() {
-        let key = b"strict-v2-key";
+    fn strict_decode_rejects_legacy_unknown_or_incomplete_v3_payloads() {
+        let key = b"strict-v3-key";
         let mut value = serde_json::to_value(sample_token()).unwrap();
 
-        value["v"] = json!(1);
+        value["v"] = json!(2);
+        assert!(decode_cursor_token(&signed_json(&value, key), key).is_err());
+
+        value["v"] = json!(4);
         assert!(decode_cursor_token(&signed_json(&value, key), key).is_err());
 
         value["v"] = json!(3);
-        assert!(decode_cursor_token(&signed_json(&value, key), key).is_err());
-
-        value["v"] = json!(2);
         value.as_object_mut().unwrap().remove("time_travel");
         assert!(decode_cursor_token(&signed_json(&value, key), key).is_err());
 
-        for required_scope_field in ["max_association_rowid", "chunking_config_hash"] {
+        for required_scope_field in [
+            "policy_digest",
+            "max_association_rowid",
+            "chunking_config_hash",
+        ] {
             value = serde_json::to_value(sample_token()).unwrap();
             value["scopes"][0]
                 .as_object_mut()
@@ -510,6 +522,7 @@ mod tests {
         token.scopes.push(ScopeCursor {
             scope_id: "scope_00".to_owned(),
             snapshot_commit: hash('b'),
+            policy_digest: hash('c'),
             index_generation: "01J8ZQEXAMPLEGENERATION1".to_owned(),
             max_rowid: 1,
             max_association_rowid: 1,
@@ -527,12 +540,16 @@ mod tests {
         assert!(token.validate().is_err());
     }
 
-    /// PC19/PC21: `index_generation` is a required, non-empty per-scope field —
-    /// a v2 cursor without it (e.g. a hand-forged payload, or a pre-PC19 token
+    /// `policy_digest` and `index_generation` are required per-scope fields —
+    /// a v3 cursor without either (e.g. a hand-forged payload, or a prior token
     /// shape) is rejected the same way a missing `chunking_config_hash` already
-    /// is (`strict_decode_rejects_legacy_unknown_or_incomplete_v2_payloads`).
+    /// is (`strict_decode_rejects_legacy_unknown_or_incomplete_v3_payloads`).
     #[test]
-    fn pc19_index_generation_is_required_and_nonempty() {
+    fn policy_digest_and_index_generation_are_required_and_nonempty() {
+        let mut token = sample_token();
+        token.scopes[0].policy_digest = String::new();
+        assert!(token.validate().is_err());
+
         let mut token = sample_token();
         token.scopes[0].index_generation = String::new();
         assert!(token.validate().is_err());
@@ -543,6 +560,13 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("index_generation");
+        assert!(decode_cursor_token(&signed_json(&value, key), key).is_err());
+
+        let mut value = serde_json::to_value(sample_token()).unwrap();
+        value["scopes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("policy_digest");
         assert!(decode_cursor_token(&signed_json(&value, key), key).is_err());
     }
 

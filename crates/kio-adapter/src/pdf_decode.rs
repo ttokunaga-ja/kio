@@ -1157,6 +1157,13 @@ fn contents_refs(dict: &[u8]) -> Result<Vec<u32>> {
     Ok(refs)
 }
 
+// A single TJ operand list normally has tens to thousands of items. Permit
+// 262,144 operands and 16 MiB of representation (including enum slots), but
+// charge cumulative admissions per content stream so nested/restarted or
+// unterminated arrays cannot reset the work bound.
+const MAX_CONTENT_OPERANDS: usize = 262_144;
+const MAX_CONTENT_OPERAND_BYTES: usize = 16 * 1024 * 1024;
+
 enum ShowString {
     Literal(Vec<u8>),
     Hex(Vec<u8>),
@@ -1174,6 +1181,40 @@ fn decode_content_ops(
     fonts: &HashMap<String, FontMap>,
     budget: &mut PdfDecodeBudget,
 ) -> Result<String> {
+    decode_content_ops_with_limits(
+        content,
+        fonts,
+        budget,
+        MAX_CONTENT_OPERANDS,
+        MAX_CONTENT_OPERAND_BYTES,
+    )
+}
+
+fn decode_content_ops_with_limits(
+    content: &[u8],
+    fonts: &HashMap<String, FontMap>,
+    budget: &mut PdfDecodeBudget,
+    operand_limit: usize,
+    byte_limit: usize,
+) -> Result<String> {
+    let mut operands = 0;
+    let mut operand_bytes = 0;
+    let mut admit_operand = |payload: usize| -> Result<()> {
+        PdfDecodeBudget::reserve(&mut operands, 1, operand_limit, "content operand count")?;
+        let bytes = payload
+            .checked_add(std::mem::size_of::<ArrayItem>())
+            .ok_or_else(|| {
+                AdapterError::ContractViolation(
+                    "PDF content operand accounting overflow".to_owned(),
+                )
+            })?;
+        PdfDecodeBudget::reserve(
+            &mut operand_bytes,
+            bytes,
+            byte_limit,
+            "content operand representation",
+        )
+    };
     let mut output = String::new();
     let mut index = 0_usize;
     let mut current_font: Option<&FontMap> = None;
@@ -1187,6 +1228,7 @@ fn decode_content_ops(
             b'%' => index = skip_pdf_comment(content, index),
             b'(' => {
                 let end = skip_pdf_literal_string(content, index);
+                admit_operand(end.saturating_sub(index + 2))?;
                 let literal = unescape_pdf_literal(&content[index + 1..end.saturating_sub(1)]);
                 let string = ShowString::Literal(literal);
                 match array_items.as_mut() {
@@ -1219,6 +1261,8 @@ fn decode_content_ops(
                     .position(|b| *b == b'>')
                     .map(|offset| index + 1 + offset)
                     .unwrap_or(content.len());
+                // Encoded length is a conservative bound for decoded storage.
+                admit_operand(end - index - 1)?;
                 let hex = hex_bytes(&content[index + 1..end]);
                 let string = ShowString::Hex(hex);
                 match array_items.as_mut() {
@@ -1228,12 +1272,14 @@ fn decode_content_ops(
                 index = end + 1;
             }
             b'[' => {
+                admit_operand(0)?;
                 array_items = Some(Vec::new());
                 index += 1;
             }
             b']' => index += 1,
             b'/' => {
                 let end = pdf_name_end(content, index + 1);
+                admit_operand(end - index - 1)?;
                 last_name = std::str::from_utf8(&content[index + 1..end])
                     .ok()
                     .map(str::to_owned);
@@ -1252,6 +1298,7 @@ fn decode_content_ops(
                         .unwrap_or("")
                         .parse::<f64>()
                 {
+                    admit_operand(0)?;
                     items.push(ArrayItem::Kern(value));
                 }
                 index = end;
@@ -1754,6 +1801,58 @@ mod tests {
             unescape_pdf_literal(b"a\\(b\\)c\\\\d\\n\\101"),
             b"a(b)c\\d\nA".to_vec()
         );
+    }
+
+    #[test]
+    fn compact_numeric_array_hits_production_operand_limit() {
+        // About 512 KiB of input used to queue all operands without a semantic
+        // bound. Keep this regression far below the 16 MiB stream ceiling.
+        let content = format!("[{}", "0 ".repeat(MAX_CONTENT_OPERANDS));
+        assert!(matches!(
+            decode_content_ops(content.as_bytes(), &HashMap::new(), &mut test_budget()),
+            Err(AdapterError::ContractViolation(_))
+        ));
+    }
+
+    #[test]
+    fn content_operand_limits_cover_unterminated_and_restarted_arrays() {
+        let fonts = HashMap::new();
+        for content in [
+            b"[0 0".as_slice(),
+            b"[0 [".as_slice(),
+            b"[()()".as_slice(),
+            b"[<><>".as_slice(),
+        ] {
+            assert!(
+                decode_content_ops_with_limits(content, &fonts, &mut test_budget(), 3, 1024)
+                    .is_ok()
+            );
+            assert!(matches!(
+                decode_content_ops_with_limits(content, &fonts, &mut test_budget(), 2, 1024),
+                Err(AdapterError::ContractViolation(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn content_operand_representation_exact_boundary_preserves_text() {
+        let content = b"[(hello) -200 (world)] TJ";
+        let bytes = 4 * std::mem::size_of::<ArrayItem>() + 10;
+        assert_eq!(
+            decode_content_ops_with_limits(content, &HashMap::new(), &mut test_budget(), 4, bytes)
+                .unwrap(),
+            "hello world"
+        );
+        assert!(matches!(
+            decode_content_ops_with_limits(
+                content,
+                &HashMap::new(),
+                &mut test_budget(),
+                4,
+                bytes - 1
+            ),
+            Err(AdapterError::ContractViolation(_))
+        ));
     }
 
     fn test_budget() -> PdfDecodeBudget {

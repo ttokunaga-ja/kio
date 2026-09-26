@@ -1,5 +1,19 @@
 //! Deterministic primitives owned by Kio's internal evaluation binary.
 
+pub mod acceptance;
+pub mod acceptance_authenticated_local;
+pub mod acceptance_distribution;
+pub(crate) mod acceptance_environment;
+pub mod acceptance_failure;
+pub mod acceptance_fault;
+pub mod acceptance_local_trust;
+pub mod acceptance_native;
+pub mod acceptance_office;
+pub mod acceptance_policy;
+pub mod acceptance_preflight;
+pub mod acceptance_provider;
+pub mod acceptance_service;
+pub mod acceptance_tools;
 pub mod artifact;
 pub mod attestation;
 pub mod boundary;
@@ -21,6 +35,7 @@ pub mod persona_render_artifact;
 pub mod persona_scaffold;
 pub mod persona_schedule;
 pub(crate) mod process_boundary;
+pub mod provider_budget;
 pub mod python_exceptions;
 pub mod qhard;
 pub mod release;

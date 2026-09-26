@@ -123,6 +123,7 @@ struct NormalizedUnitIdentity {
     unit_type: String,
     raw_hash: String,
     prepared_hash: String,
+    preparation_profile_hash: String,
     tool_profile_hash: String,
     generation: u64,
 }
@@ -133,6 +134,7 @@ struct ManifestPin {
     unit_type: String,
     raw_hash: String,
     prepared_hash: String,
+    preparation_profile_hash: String,
     tool_profile_hash: String,
     generation: u64,
 }
@@ -175,6 +177,7 @@ struct InventoryManifestUnit {
     unit_type: String,
     status: String,
     prepared_hash: String,
+    preparation_profile_hash: String,
     #[serde(deserialize_with = "deserialize_required_nullable_hash")]
     unit_object_hash: Option<String>,
     error_kind: Option<String>,
@@ -187,11 +190,14 @@ struct InventoryNormalizedUnit {
     unit_type: String,
     raw_hash: String,
     prepared_hash: String,
+    preparation_profile_hash: String,
     tool_profile_hash: String,
     #[serde(rename = "gen")]
     generation: u64,
     mode: String,
     markdown: String,
+    #[serde(deserialize_with = "deserialize_owned_image_hashes")]
+    owned_image_hashes: BTreeSet<String>,
     metadata: BTreeMap<String, Value>,
     #[serde(deserialize_with = "deserialize_required_nullable_reused_from")]
     reused_from: Option<InventoryReusedFrom>,
@@ -214,6 +220,34 @@ where
     D: Deserializer<'de>,
 {
     Option::<String>::deserialize(deserializer)
+}
+
+fn deserialize_owned_image_hashes<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeSet<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let values = Vec::<String>::deserialize(deserializer)?;
+    if values.len() > 256 {
+        return Err(serde::de::Error::custom(
+            "owned_image_hashes exceeds per-unit image limit",
+        ));
+    }
+    let mut hashes = BTreeSet::new();
+    for hash in values {
+        if !crate::cas::is_hash(&hash) {
+            return Err(serde::de::Error::custom(
+                "owned_image_hashes contains an invalid hash",
+            ));
+        }
+        if !hashes.insert(hash) {
+            return Err(serde::de::Error::custom(
+                "owned_image_hashes contains a duplicate hash",
+            ));
+        }
+    }
+    Ok(hashes)
 }
 
 fn deserialize_required_nullable_reused_from<'de, D>(
@@ -642,27 +676,6 @@ impl UnreachableObjectInventory {
 
         let refs = open_required_dir(&self.kio, "refs", "refs directory is missing")?;
         state.observe_directory(&refs, "refs")?;
-        let heads = open_required_dir(&refs, "heads", "branch refs directory is missing")?;
-        state.observe_directory(&heads, "refs/heads")?;
-        let mut main = None;
-        for name in names(&heads, &mut state.walker_stats, &state.walker_limits, 3)? {
-            let (bytes, observation) = read_regular_observed(&heads, &name, MAX_REF)?;
-            state.observe_file(
-                &format!("refs/heads/{name}"),
-                observation,
-                bytes.len() as u64,
-            )?;
-            let value = parse_ref(&bytes, name == "main")?;
-            if name == "main" {
-                main = value.clone();
-            }
-            if let Some(value) = value {
-                add_inventory_ref(state, &format!("heads/{name}"), &value)?;
-            }
-        }
-        if head.is_some() && main.is_some() && head != main {
-            return Err(corrupt("HEAD and refs/heads/main disagree"));
-        }
 
         let tags = open_required_dir(&refs, "tags-v1", "tag refs directory is missing")?;
         state.observe_directory(&tags, "refs/tags-v1")?;
@@ -908,9 +921,6 @@ impl UnreachableObjectInventory {
             "commit" => {
                 require_content_hash(bytes, hash, "commit")?;
                 let commit: CommitObject = strict_canonical_json(bytes, "commit")?;
-                if commit.parents.len() > MAX_COMMIT_PARENTS {
-                    return Err(limit("commit parents"));
-                }
                 commit
                     .validate()
                     .map_err(|_| corrupt("invalid commit object"))?;
@@ -1004,10 +1014,10 @@ impl UnreachableObjectInventory {
         invocation_time: &str,
     ) -> Result<Vec<ShallowBoundary>> {
         for commit in state.commits.values() {
-            for parent in &commit.parents {
-                if !state.commits.contains_key(parent) {
-                    return Err(corrupt("commit references a missing parent"));
-                }
+            if let Some(parent) = &commit.parent
+                && !state.commits.contains_key(parent)
+            {
+                return Err(corrupt("commit references a missing parent"));
             }
         }
         for tip in state.refs.values() {
@@ -1033,7 +1043,7 @@ impl UnreachableObjectInventory {
                 .commits
                 .get(&hash)
                 .ok_or_else(|| corrupt("history traversal reached a missing commit"))?;
-            pending.extend(commit.parents.iter().cloned());
+            pending.extend(commit.parent.iter().cloned());
         }
 
         let mut boundaries = Vec::new();
@@ -1090,6 +1100,7 @@ impl UnreachableObjectInventory {
                     || unit.unit_type != pin.unit_type
                     || unit.raw_hash != pin.raw_hash
                     || unit.prepared_hash != pin.prepared_hash
+                    || unit.preparation_profile_hash != pin.preparation_profile_hash
                     || unit.tool_profile_hash != pin.tool_profile_hash
                     || unit.generation != pin.generation
                 {
@@ -1391,7 +1402,7 @@ fn strict_descendant(
     let Some(start) = commits.get(descendant) else {
         return Err(corrupt("descendant commit is missing"));
     };
-    let mut pending = start.parents.clone();
+    let mut pending: Vec<_> = start.parent.iter().cloned().collect();
     let mut seen = BTreeSet::new();
     while let Some(hash) = pending.pop() {
         *steps = steps
@@ -1409,7 +1420,7 @@ fn strict_descendant(
         let commit = commits
             .get(&hash)
             .ok_or_else(|| corrupt("retired ancestry references a missing commit"))?;
-        pending.extend(commit.parents.iter().cloned());
+        pending.extend(commit.parent.iter().cloned());
     }
     Ok(false)
 }
@@ -1444,6 +1455,7 @@ fn validate_manifest(
             || entry.unit_ref != unit_ref(&entry.unit_key)
             || !valid_unit_type(&entry.unit_type)
             || !crate::cas::is_hash(&entry.prepared_hash)
+            || !crate::cas::is_hash(&entry.preparation_profile_hash)
         {
             return Err(corrupt("invalid normalized manifest unit entry"));
         }
@@ -1458,6 +1470,7 @@ fn validate_manifest(
                         unit_type: entry.unit_type.clone(),
                         raw_hash: manifest.raw_hash.clone(),
                         prepared_hash: entry.prepared_hash.clone(),
+                        preparation_profile_hash: entry.preparation_profile_hash.clone(),
                         tool_profile_hash: manifest.tool_profile_hash.clone(),
                         generation: manifest.generation,
                     });
@@ -1482,7 +1495,13 @@ fn validate_normalized_unit(unit: &InventoryNormalizedUnit) -> Result<Normalized
         || !valid_unit_type(&unit.unit_type)
         || !crate::cas::is_hash(&unit.raw_hash)
         || !crate::cas::is_hash(&unit.prepared_hash)
+        || !crate::cas::is_hash(&unit.preparation_profile_hash)
         || !crate::cas::is_hash(&unit.tool_profile_hash)
+        || unit.owned_image_hashes.len() > 256
+        || unit
+            .owned_image_hashes
+            .iter()
+            .any(|hash| !crate::cas::is_hash(hash))
         || !matches!(unit.mode.as_str(), "full" | "incremental")
         || unit.markdown.is_empty()
         || !is_canonical_utc_timestamp(&unit.generated_at)
@@ -1503,6 +1522,7 @@ fn validate_normalized_unit(unit: &InventoryNormalizedUnit) -> Result<Normalized
         unit_type: unit.unit_type.clone(),
         raw_hash: unit.raw_hash.clone(),
         prepared_hash: unit.prepared_hash.clone(),
+        preparation_profile_hash: unit.preparation_profile_hash.clone(),
         tool_profile_hash: unit.tool_profile_hash.clone(),
         generation: unit.generation,
     })
@@ -1531,12 +1551,11 @@ fn require_content_hash(bytes: &[u8], expected: &str, label: &str) -> Result<()>
 fn parse_ref(bytes: &[u8], empty_allowed: bool) -> Result<Option<String>> {
     let value = std::str::from_utf8(bytes).map_err(|_| corrupt("ref is not UTF-8"))?;
     let value = value.trim();
+    if value == "unborn" && empty_allowed {
+        return Ok(None);
+    }
     if value.is_empty() {
-        return if empty_allowed {
-            Ok(None)
-        } else {
-            Err(corrupt("ref must not be empty"))
-        };
+        return Err(corrupt("ref must not be empty"));
     }
     if !crate::cas::is_hash(value) {
         return Err(corrupt("ref is not a canonical commit hash"));
@@ -1733,5 +1752,42 @@ mod tests {
             fs::create_dir(&objects).unwrap();
         });
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
+    }
+
+    #[test]
+    fn normalized_unit_inventory_schema_requires_canonical_owned_hashes() {
+        let valid = serde_json::json!({
+            "unit_key": "page:1",
+            "unit_type": "page",
+            "raw_hash": format!("sha256:{}", "a".repeat(64)),
+            "prepared_hash": format!("sha256:{}", "b".repeat(64)),
+            "preparation_profile_hash": format!("sha256:{}", "c".repeat(64)),
+            "tool_profile_hash": format!("sha256:{}", "d".repeat(64)),
+            "gen": 0,
+            "mode": "full",
+            "markdown": "body",
+            "owned_image_hashes": [],
+            "metadata": {},
+            "reused_from": null,
+            "generated_at": "2026-09-08T00:00:00Z"
+        });
+        let parsed: InventoryNormalizedUnit = serde_json::from_value(valid.clone()).unwrap();
+        validate_normalized_unit(&parsed).unwrap();
+
+        let mut missing = valid.clone();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("owned_image_hashes");
+        assert!(serde_json::from_value::<InventoryNormalizedUnit>(missing).is_err());
+
+        let mut malformed = valid.clone();
+        malformed["owned_image_hashes"] = serde_json::json!(["sha256:not-a-digest"]);
+        assert!(serde_json::from_value::<InventoryNormalizedUnit>(malformed).is_err());
+
+        let hash = format!("sha256:{}", "e".repeat(64));
+        let mut duplicate = valid;
+        duplicate["owned_image_hashes"] = serde_json::json!([hash.clone(), hash]);
+        assert!(serde_json::from_value::<InventoryNormalizedUnit>(duplicate).is_err());
     }
 }

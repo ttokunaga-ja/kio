@@ -26,7 +26,7 @@ const MANIFEST_HASH: &str =
 const TOOL_LOCK: &str = "sha256:8a32a740871b1dd9db1bda186dce07e8e6c60d2cd316f21683ea2bd857c16ffb";
 const PARENT: &str = "sha256:30fa71e5c11a90a28c8c0895382e8f45df431047fcc699afed45ee316cfbf65a";
 const TREE_HASH: &str = "sha256:941c3ef6a2134651a85825bb1011adda88e73901387529a94e9d5df23df0462e";
-const COMMIT_HASH: &str = "sha256:5f07871c06c14cce80583219e932e43703074f88c632b3b3ce1a372db1d013e1";
+const COMMIT_HASH: &str = "sha256:7321022379bc2a499c217f6671a8dbdac9723c89bd9962a5ae62959ce9fba722";
 
 #[test]
 fn ct_hash_001_002_raw_hash_vectors() {
@@ -50,7 +50,7 @@ fn ct_hash_003_tree_jcs_vector() {
 fn ct_hash_004_commit_jcs_vector() {
     let commit = CommitObject::new(
         TREE_HASH.to_owned(),
-        vec![PARENT.to_owned()],
+        Some(PARENT.to_owned()),
         "2026-04-29T12:00:00Z".to_owned(),
         "snapshot after indexing docs".to_owned(),
         TOOL_LOCK.to_owned(),
@@ -66,7 +66,7 @@ fn ct_hash_004_commit_jcs_vector() {
     let bytes = canonical_json_bytes(&serde_json::to_value(&commit).unwrap()).unwrap();
     assert_eq!(
         String::from_utf8(bytes.clone()).unwrap(),
-        "{\"commit_type\":\"manual\",\"created_at\":\"2026-04-29T12:00:00Z\",\"message\":\"snapshot after indexing docs\",\"object_type\":\"commit\",\"parents\":[\"sha256:30fa71e5c11a90a28c8c0895382e8f45df431047fcc699afed45ee316cfbf65a\"],\"stats\":{\"files_added\":12,\"files_deleted\":1,\"files_modified\":3},\"tool_lock_hash\":\"sha256:8a32a740871b1dd9db1bda186dce07e8e6c60d2cd316f21683ea2bd857c16ffb\",\"tree\":\"sha256:941c3ef6a2134651a85825bb1011adda88e73901387529a94e9d5df23df0462e\"}"
+        "{\"commit_type\":\"manual\",\"created_at\":\"2026-04-29T12:00:00Z\",\"message\":\"snapshot after indexing docs\",\"object_type\":\"commit\",\"parent\":\"sha256:30fa71e5c11a90a28c8c0895382e8f45df431047fcc699afed45ee316cfbf65a\",\"stats\":{\"files_added\":12,\"files_deleted\":1,\"files_modified\":3},\"tool_lock_hash\":\"sha256:8a32a740871b1dd9db1bda186dce07e8e6c60d2cd316f21683ea2bd857c16ffb\",\"tree\":\"sha256:941c3ef6a2134651a85825bb1011adda88e73901387529a94e9d5df23df0462e\"}"
     );
     assert_eq!(hash_bytes(&bytes), COMMIT_HASH);
 }
@@ -78,9 +78,9 @@ fn ct_hash_005_fanout_path_uses_portable_digest_leaf() {
         path,
         std::path::Path::new("objects")
             .join("commits")
-            .join("5f")
-            .join("07")
-            .join("5f07871c06c14cce80583219e932e43703074f88c632b3b3ce1a372db1d013e1")
+            .join("73")
+            .join("21")
+            .join("7321022379bc2a499c217f6671a8dbdac9723c89bd9962a5ae62959ce9fba722")
     );
 }
 
@@ -205,7 +205,7 @@ fn ct_commit_001_002_and_gc_mappings() {
 fn ct_commit_004_root_commit_vector() {
     let commit = CommitObject::new(
         TREE_HASH.to_owned(),
-        Vec::new(),
+        None,
         "2026-04-29T12:00:00Z".to_owned(),
         "initial snapshot".to_owned(),
         TOOL_LOCK.to_owned(),
@@ -218,11 +218,39 @@ fn ct_commit_004_root_commit_vector() {
     )
     .unwrap();
 
-    assert!(commit.parents.is_empty());
+    assert_eq!(commit.parent, None);
     assert_eq!(
         commit_hash(&commit).unwrap(),
-        "sha256:f190671b29ad34b5240087362d9088a0c6880802a28ac853db7e41e9d87e3d09"
+        "sha256:27322537dce77e069edafda5f3a5a67f7032979e50420a0a4341152fea502b76"
     );
+}
+
+#[test]
+fn ct_commit_006_rejects_legacy_parents_missing_parent_and_unknown_fields() {
+    let base = json!({
+        "commit_type": "manual",
+        "created_at": "2026-04-29T12:00:00Z",
+        "message": "initial snapshot",
+        "object_type": "commit",
+        "parent": null,
+        "stats": {"files_added": 0, "files_modified": 0, "files_deleted": 0},
+        "tool_lock_hash": TOOL_LOCK,
+        "tree": TREE_HASH,
+    });
+    assert!(serde_json::from_value::<CommitObject>(base.clone()).is_ok());
+
+    let mut legacy = base.clone();
+    legacy.as_object_mut().unwrap().remove("parent");
+    legacy["parents"] = json!([PARENT]);
+    assert!(serde_json::from_value::<CommitObject>(legacy).is_err());
+
+    let mut missing_parent = base.clone();
+    missing_parent.as_object_mut().unwrap().remove("parent");
+    assert!(serde_json::from_value::<CommitObject>(missing_parent).is_err());
+
+    let mut unknown = base;
+    unknown["branch"] = json!("main");
+    assert!(serde_json::from_value::<CommitObject>(unknown).is_err());
 }
 
 #[test]
@@ -252,14 +280,13 @@ fn ct_commit_003_005_007_snapshot_parent_refs_and_noop() {
         .snapshot(Some("second"), Some("2026-04-29T12:00:01Z"))
         .unwrap();
     assert_eq!(
-        second.commit.as_ref().unwrap().parents[0],
+        second.commit.as_ref().unwrap().parent.as_deref().unwrap(),
         first.commit_hash.unwrap()
     );
 
     let head = fs::read_to_string(repo.kio_dir().join("HEAD")).unwrap();
-    let main = fs::read_to_string(repo.kio_dir().join("refs/heads/main")).unwrap();
-    assert_eq!(head, second.commit_hash.clone().unwrap());
-    assert_eq!(main, second.commit_hash.clone().unwrap());
+    assert_eq!(head, format!("{}\n", second.commit_hash.clone().unwrap()));
+    assert!(!repo.kio_dir().join("refs/heads/main").exists());
 
     let noop = repo
         .snapshot(Some("same"), Some("2026-04-29T12:00:02Z"))
@@ -267,7 +294,7 @@ fn ct_commit_003_005_007_snapshot_parent_refs_and_noop() {
     assert!(noop.noop);
     assert_eq!(
         fs::read_to_string(repo.kio_dir().join("HEAD")).unwrap(),
-        second.commit_hash.unwrap()
+        format!("{}\n", second.commit_hash.unwrap())
     );
 }
 

@@ -65,7 +65,7 @@ Kio:   commit + raw_hash + chunk_hash   → ファイル移動・リネーム・
 | フィールド | 役割 |
 | --- | --- |
 | `tree` | 当該 commit の tree_hash (高速解決用。shallow 化済み commit では tree object 自体は存在しないことがある) |
-| `path_at_commit` | commit 時点の表示用 path (UI 表示・人間可読性) |
+| `path_at_commit` | commit 時点の正確な tree entry を指定する optional selector。指定時は別名で代替せず、現在の policy も検証する |
 | `heading_path` / `section_id` | chunk の構造的位置 (UI 表示用) |
 | `byte_start` / `byte_end` | normalized unit 本文内の UTF-8 byte span (unit-local・0-based half-open、[03-data-model.md §8.1](03-data-model.md)) |
 | `scope_path` | 生成時点の正本 `.kio` の絶対パス (解決の高速ヒント + 表示用。解決の root 信頼は `scope_id`) |
@@ -74,17 +74,22 @@ Kio:   commit + raw_hash + chunk_hash   → ファイル移動・リネーム・
 present にする場合は、1〜64 個の非空文字列だけを順序どおり格納する。`"heading_path": []` と
 `"heading_path": null` は non-canonical であり、production parser と verifier は受理しない。
 
-表示用 field は、解決が成功した場合は**解決結果の canonical 値 (tree / chunk object 由来) を優先して
+表示用 field (heading / span) は、解決が成功した場合は**解決結果の canonical 値 (tree / chunk object 由来) を優先して
 表示し、pointer 入力値と相違するときは入力値を無視する** — 正しい必須 tuple に偽の表示 metadata
-(path / heading / span) を付けた pointer が、alive 判定のままそのまま人間向け引用に使われることを
-防ぐ (これらは解決には元々使わない — §3.1 手順 8 の整合検証は必須 tuple のみ)。**shallow 解決
-(§3.1 手順 2a) では tree 由来の canonical 値が得られない field (`path_at_commit`) を pointer 入力値で
-代替表示しない** — `path unavailable (commit_shallow)` 等の欠落表示とする (chunk object 由来の field は
-通常どおり canonical 値を表示する)。
+(heading / span) を付けた pointer が、alive 判定のままそのまま人間向け引用に使われることを
+防ぐ (これらは解決には元々使わない — §3.1 手順 8 の整合検証は必須 tuple のみ)。receipt により
+正当化された tree 欠落では、`kio open` / `kio view` は本文・表示 metadata を返さず
+`KIO-E-COMMIT-SHALLOW-001` で終端する (§3.1 手順 2a)。pointer 入力の `path_at_commit` で代替表示したり、
+raw / chunk だけから本文を返したりしない。
 
-`path_at_commit` は **表示用** であり、解決には使わない。実際の解決は `commit + raw_hash` で行う (path はリネーム履歴をまたいでも追えるが、root 信頼は raw_hash 側)。
+`path_at_commit` を指定した本文解決は、その commit の正確な entry と raw / profile / generation / manifest
+の帰属を検証する。指定した path が Ignore 対象なら、同じ内容の許可された別名があっても拒否する。
+省略された URI は、同じ immutable identity に帰属し、現在の policy で許可された別名から決定論的に
+選択する。commit 自体も現在の管理対象 HEAD の履歴から到達できる必要がある。CAS にコピーされた
+object や古い SQLite 行だけでは本文の読み出しを許可しない。
 
-`scope_path` も `path_at_commit` と同様 **ヒント** であり、解決の root 信頼にしない。`.kio` の移動後も、`scope_id` が一致する限り pointer は解決可能である。
+`scope_path` は **ヒント** であり、解決の root 信頼にしない。移動後も scope identity と現在の管理境界が
+検証できれば解決可能である。管理対象の子の移動・コピーは、再登録なしに以前の承認を引き継がない。
 
 ## 2.3 正規シリアライズ (canonical serialization)
 
@@ -99,8 +104,8 @@ kio://scope_01J8ZQ.../sha256:9f2c.../sha256:abc123.../sha256:tool1.../sha256:chu
 
 規則:
 
-- URI は **必須フィールドのみ** を持つ。optional フィールド (path_at_commit / heading_path / byte_start 等) は
-  表示用であり (§2.2)、URI ⇄ JSON の往復で失われてよいのは optional フィールドだけ。
+- URI は **必須フィールドのみ** を持つ。optional フィールドは URI ⇄ JSON の往復で失われる。
+  `path_at_commit` の省略は §2.2 の別名選択を意味し、元の JSON の明示 path 選択を保存する形式ではない。
 - `sv` (schema_version) 省略時は `1`。`1` 以外の `sv` は KIO-E-CONFIG-SCHEMA 系 error (exit 2)。
   **URI は opaque として扱い、authority 位置
   (scope_id) の大文字小文字を保存する** — 一般 URI 正規化 (authority の小文字化) を適用してはならない。
@@ -141,6 +146,10 @@ bulk 系 (`kio evidence verify --batch <pointers.jsonl>`) は従来どおり各�
 出力: { raw_object | normalized_unit | chunk_text } または error
 ```
 
+本節の「解決成功」は本文を返す `kio open` / `kio view` の resolver を指す。本文を返さない
+`kio evidence verify` は §4.3 の status semantics を使い、receipt-backed shallow の観測をこの本文解決の
+成功へ読み替えない。
+
 ## 3.1 解決手順
 
 ```text
@@ -173,22 +182,24 @@ bulk 系 (`kio evidence verify --batch <pointers.jsonl>`) は従来どおり各�
     presence/hash drift / busy / retry exhaustion / temp I/O / integrity を確定できない private snapshot
     read-open-query failure は `KIO-E-REGISTRY-SNAPSHOT-001` (exit 3) で fail-closed し、
     hint / CWD fallback、nested scope status、batch_changed へ変換しない。
-2.  commit を refs / objects/commits/ から取得
-2a. commit が shallow (tree 破棄済み) の場合の適用手順は次に限る: **手順 5 (tombstone /
-    raw 存在) → pointer の chunk_hash → chunk object → gen で normalized unit instance を
-    直接解決 → 手順 7 → 手順 8 (tree entry 系の照合句は対象外)**。手順 3-4・6・6a・6b は
-    tree / entry を要するため適用しない — 時点帰属・membership は検証できず、手順 8 の
-    shallow 句のとおり --strict verify は unverifiable (exit 3)。chunk object 本体が gen を
-    保持するため直接解決できる (03-data-model.md §8)。
-    レスポンスに "commit_shallow": true を付す。
+2.  commit を refs / objects/commits/ から取得し、現行管理scopeのHEADから到達可能であることを検証する。
+    以下の本文解決では、過去のpolicyではなく現在の所属・Ignore・policyを使う。
+2a. commit の tree が欠落し、有効な `.kio/gc/shallowed/<commit64>` receipt がその欠落を
+    正当化する場合、本文を返す `kio open` / `kio view` は **`KIO-E-COMMIT-SHALLOW-001` (exit 1)**
+    で fail-closed する。tree entry の membership / profile / gen / 時点帰属を検証できないため、
+    raw_hash・chunk_hash・current HEAD・SQLite cache のいずれも代替 authority にしない。回復は backup
+    から当該 tree object を復元して完全な tree 検証を再実行することだけである。本文を返さない
+    `kio evidence verify` の shallow 観測は §4.3 の別 status semantics に限る。
 3.  tree (commit.tree) を取得
-4.  tree から raw_hash で entry を検索 (同一 raw_hash の entry が複数ある場合 — 複数 path への重複配置。
-    同一 commit 内では同一 (raw, tool_profile) の normalize binding は共有される — は、**pointer の
-    tool_profile_hash と一致する binding の entry を選ぶ** (pointer は gen を持たない — gen の整合は
-    手順 8 が tree entry と chunk object の間で検証する)。同一 binding の entry が複数残る場合は
-    **path の UTF-8 byte 順最小の entry を決定的に選ぶ** ([05-runtime.md §1.7](05-runtime.md) の `path_at_commit` と同じ規則 — 表示もこの canonical path を使い、pointer 入力の optional path は使わない)。一致 entry が
-    無ければ手順 5〜7 を実行せず KIO-E-STORE-CORRUPT-001 (not_found 扱い — 手順 8 の不一致処理と同じ
-    終端) へ短絡する)
+4.  tree の raw_hash と tool_profile_hash が一致する正規化済みentryを選ぶ。
+    path_at_commit が指定されていれば、そのpathだけを検証し、別名の許可で代替しない。
+    省略時は、同じbindingのうち現行policyで許可されたentryをpathのUTF-8 byte順で選ぶ。
+    各entry自身のgen・manifest・normalized unitを検証し、他entryのmanifestを借用しない。
+    genの整合は手順8でchunk objectとも検証する。現行policyで拒否されたpathしかなければ
+    KIO-E-EVIDENCE-POLICY-001で本文解決を拒否する。一致bindingがなければ
+    KIO-E-STORE-CORRUPT-001で終端する。normalize=nullのbare snapshotは意味的なEvidence Pointerの
+    authorityにならず、別commitの正規化結果を流用しない。bare snapshotのcurrent HEADにあるrawは、
+    別契約のraw short hashで現行policyを確認した上で開ける。
 5.  raw_hash の marker と raw object の存在を判定する。**まず、存在する全 marker (tombstone /
     erase receipt) の最終 event を 1 つに正本化する** — canonical final event = 全 marker 中で
     `lifecycle_epoch` 最大の最終 event ([05-runtime.md §3.5](05-runtime.md)。`lifecycle_epoch` を欠く
@@ -264,9 +275,8 @@ bulk 系 (`kio evidence verify --batch <pointers.jsonl>`) は従来どおり各�
     retired では不十分 — 別 marker により再 purge 済み = canonical が `purged` なら
     手順 5 で tombstoned)。リンク先 commit が不在・ref 不達、または上記検証に失敗した場合は
     リンクを使わず直接解決の規則へ戻る (それも失敗なら not_found)。
-    unverifiable になるのは manifest done 検査のみ。`manifest_missing` は 6b を実行できる
-    non-shallow 解決でのみ設定される — shallow (2a) は 6b を適用しないため `commit_shallow` とは
-    **相互排他** (schema 上は独立 field だが同時に true にならない)
+    `manifest_missing` は 6b を実行できる full-tree 解決でのみ設定される。receipt-backed shallow
+    は手順 2a で本文解決を終端するため、この `manifest_missing` 降格経路へ入らない。
 7.  chunk_hash で chunk object を解決し byte_start/byte_end の text を取り出す
 8.  **整合検証**: 解決した chunk object の raw_hash / tool_profile_hash が pointer の値と一致し、
     手順 4-6 を経た場合はさらに **tree entry の normalize.tool_profile_hash が pointer の
@@ -277,9 +287,8 @@ bulk 系 (`kio evidence verify --batch <pointers.jsonl>`) は従来どおり各�
     当該 commit の証拠として通ってしまう)
     (pointer は gen を持たない — gen の照合対象は tree entry と chunk object 内部のみ)。不一致は
     store corruption として KIO-E-STORE-CORRUPT-001 (not_found 扱い) — cross-wired な pointer が
-    別文書の本文を「解決成功」として返すことを防ぐ。**shallow 経路 (2a) は tree membership を検証
-    できない** — この限界は `commit_shallow: true` が表明し、`--strict` verify は shallow 経路の解決を
-    alive でなく **unverifiable (exit 3)** として返す (時点帰属の偽装を「検証済み」と誤認させない)
+    別文書の本文を「解決成功」として返すことを防ぐ。receipt-backed shallow は手順 2a で本文解決を
+    終端するため、この tree membership 検証を省略して成功する経路はない。
 ```
 
 ## 3.2 不変条件
@@ -287,7 +296,8 @@ bulk 系 (`kio evidence verify --batch <pointers.jsonl>`) は従来どおり各�
 ```text
 解決成功条件:
   - scope (.kio) に到達できる
-  - commit object が存在 (shallow でもよい。commit object は GC で削除されない)
+  - commit object と、その commit が参照する tree object が存在
+    (commit object は GC で削除されない。receipt-backed tree 欠落は本文解決の `KIO-E-COMMIT-SHALLOW-001`)
   - raw object が存在 (purge されていない)
   - chunk object が存在 (= 同一 tool_profile_hash で生成済み)
 
@@ -309,9 +319,11 @@ bulk 系 (`kio evidence verify --batch <pointers.jsonl>`) は従来どおり各�
                                         KIO-E-EVIDENCE-RETARGET-REQUIRED-001 (exit 8)
                                         — pointer が現在の chunk へ自動的に切り替わることはない。
 
-補足: shallow commit は pointer 解決の失敗要因ではない (§3.1 手順 2a)。
-KIO-E-COMMIT-SHALLOW-001 は restore / diff / `--at <shallow-commit>` 検索 /
-cursor 再計算など tree 全体を要する操作に限る ([05-runtime.md §2.2](05-runtime.md))。
+補足: receipt-backed shallow tree は `kio open` / `kio view` の Evidence Pointer 本文解決でも
+`KIO-E-COMMIT-SHALLOW-001` となる (§3.1 手順 2a)。tree を backup から復元して再実行する。
+同じ code は export / diff / `--at <shallow-commit>` 検索 / cursor 再計算にも用いる
+([05-runtime.md §2.2](05-runtime.md))。本文を返さない `kio evidence verify` は §4.3 の
+`commit_shallow` status semantics を維持する。
 ```
 
 ---
@@ -380,7 +392,7 @@ kio evidence verify <pointer> [--strict]   # <pointer> の受理形式は §2.3
 ```
 
 `unverifiable` は `--strict` 時の「時点帰属を検証できない解決」であり、`details.reason` で区別する:
-`commit_shallow` (§3.1 手順 8 — 状況により解消し得る) /
+`commit_shallow` (receipt-backed shallow tree の verify-only 観測 — 状況により解消し得る) /
 `manifest_missing` (手順 6b — **恒久**)。exit は reason の再試行可能性に従い分岐する — `commit_shallow` のみなら 3 (unshallow で解消し得る)、`manifest_missing` を 1 件でも含めば **4** (恒久 — 再試行で進展しない。[06-cli-spec.md §7](06-cli-spec.md) / [10-operations.md §11.2](10-operations.md) の横断規約「4 = 再試行で進展しない」どおり。details.reason は引き続き全 reason を返す)。
 live clone 重複は status `registry_duplicate` (候補一覧つき、exit 3 — §3.1 手順 1)。**sqlite.db が不在・利用不能の場合は status ではなく command-level の
 retryable error `KIO-E-INDEX-REBUILDING-001` (exit 3)** — 検査は完了していないため --strict なしでも
@@ -484,9 +496,11 @@ production issuer が path/raw/profile/gen/chunk/section/span を持つ新 point
 ```
 - 既存 Evidence Pointer は Kio によって書き換えられない
 - raw_hash / chunk_hash / tool_profile_hash / commit は append-only
-- pointer の意味する場所 (= 生成時に解決可能だった raw + chunk) は purge されない限り解決可能
+- pointer の意味する場所 (= 生成時に解決可能だった raw + chunk) は purge されない限り保持される
 - 解決失敗は schema 上区別される (tombstoned / not_found / scope_unreachable / registry_duplicate。verify はさらに unverifiable — §4.3 の 6 値 union が正本)
-- auto commit の GC (shallow 化) は pointer の解決可能性に影響しない (raw / chunk object は GC で削除されない、[05-runtime.md §2.6](05-runtime.md))
+- auto commit の GC が tree を shallow 化すると、本文を返す `open` / `view` は membership を推測せず
+  `KIO-E-COMMIT-SHALLOW-001` で拒否する。tree を backup から復元すれば完全な解決可能性を回復する
+  (raw / chunk object 自体は GC で削除されない、[05-runtime.md §2.6](05-runtime.md))
 ```
 
 これは AI Agent が Kio から取得した Evidence を **長期参照** できる契約となる。

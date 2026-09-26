@@ -1,4 +1,4 @@
-//! GC shallow-sweep fsck and restore barriers.
+//! GC shallow-sweep fsck and export barriers.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -68,7 +68,7 @@ fn fixture_with_index(with_index: bool) -> (TempDir, String, String) {
     fs::write(dir.path().join("doc.md"), "# receipt sweep\n").unwrap();
     json_success(&dir, &["init"]);
     if with_index {
-        json_success(&dir, &["index", "--offline", "--approve"]);
+        json_success(&dir, &["index", "--offline", "--yes"]);
     }
     let repo = Repository::open(dir.path()).unwrap();
     if !with_index {
@@ -259,7 +259,7 @@ fn active_marker_blocks_fsck_repair_and_restore_before_destination_side_effects(
 
     let destination = dir.path().join("destination");
     let destination_text = destination.display().to_string();
-    kio(&dir, &["restore", &commit, "--to", &destination_text])
+    kio(&dir, &["export", &commit, "--to", &destination_text])
         .arg("--json")
         .assert()
         .code(3);
@@ -474,7 +474,7 @@ fn final_shallow_ancestor_with_chunks_keeps_verify_and_rebuild_available() {
     const OLD: &str = "2025-01-01T00:00:00Z";
     const NOW: &str = "2026-08-14T00:00:00Z";
     json_success_at(&dir, &["init"], NOW);
-    let old = json_success_at(&dir, &["index", "--offline", "--approve"], OLD);
+    let old = json_success_at(&dir, &["index", "--offline", "--yes"], OLD);
     let old_commit = old["commit_hash"].as_str().unwrap().to_owned();
     assert!(dir.path().join(".kio/index/chunks.jsonl").is_file());
     fs::write(
@@ -482,7 +482,7 @@ fn final_shallow_ancestor_with_chunks_keeps_verify_and_rebuild_available() {
         "# current snapshot\n\nnew content\n",
     )
     .unwrap();
-    json_success_at(&dir, &["index", "--offline", "--approve"], NOW);
+    json_success_at(&dir, &["index", "--offline", "--yes"], NOW);
     let repo = Repository::open(dir.path()).unwrap();
     let old_tree = repo.read_commit(&old_commit).unwrap().tree;
     let old_tree_path = ObjectStore::new(repo.kio_dir())
@@ -510,13 +510,11 @@ fn final_shallow_ancestor_with_chunks_keeps_verify_and_rebuild_available() {
         let sqlite_path = dir.path().join(".kio/index/sqlite.db");
         let chunks_path = dir.path().join(".kio/index/chunks.jsonl");
         let head_path = dir.path().join(".kio/HEAD");
-        let main_ref_path = dir.path().join(".kio/refs/heads/main");
         let gc_path = dir.path().join(".kio/gc");
         let old_tree_before = fs::read(&old_tree_path).unwrap();
         let sqlite_before = fs::read(&sqlite_path).unwrap();
         let chunks_before = fs::read(&chunks_path).unwrap();
         let head_before = fs::read(&head_path).unwrap();
-        let main_ref_before = fs::read(&main_ref_path).unwrap();
         assert!(!gc_path.exists());
         let output = kio(&dir, &["gc", "--yes"])
             .env("KIO_FIXED_NOW", NOW)
@@ -538,7 +536,6 @@ fn final_shallow_ancestor_with_chunks_keeps_verify_and_rebuild_available() {
         assert_eq!(fs::read(&sqlite_path).unwrap(), sqlite_before);
         assert_eq!(fs::read(&chunks_path).unwrap(), chunks_before);
         assert_eq!(fs::read(&head_path).unwrap(), head_before);
-        assert_eq!(fs::read(&main_ref_path).unwrap(), main_ref_before);
         assert!(!dir.path().join(".kio/.lock").exists());
         assert!(!gc_path.exists());
         assert_eq!(

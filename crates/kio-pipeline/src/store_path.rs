@@ -83,55 +83,6 @@ pub(crate) fn resolve_existing_store_path(
 
 /// Create a store-relative directory one component at a time, rejecting every
 /// pre-existing symlink or non-directory before descending through it.
-pub(crate) fn ensure_store_directory_path(kio_dir: &Path, relative: &Path) -> Result<PathBuf> {
-    let components = relative.components().collect::<Vec<_>>();
-    if components.is_empty()
-        || components
-            .iter()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(unsafe_store_path(
-            relative,
-            "store path is not a non-empty relative path",
-        ));
-    }
-
-    let root_metadata = fs::symlink_metadata(kio_dir).pipeline_io(kio_dir)?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.file_type().is_dir() {
-        return Err(unsafe_store_path(
-            kio_dir,
-            "Kio store root is not a real directory",
-        ));
-    }
-    let canonical_root = kio_dir.canonicalize().pipeline_io(kio_dir)?;
-
-    let mut current = kio_dir.to_path_buf();
-    for component in components {
-        current.push(component.as_os_str());
-        match fs::create_dir(&current) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error).pipeline_io(&current),
-        }
-        let metadata = fs::symlink_metadata(&current).pipeline_io(&current)?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-            return Err(unsafe_store_path(
-                &current,
-                "store directory component is not a real directory",
-            ));
-        }
-        let canonical = current.canonicalize().pipeline_io(&current)?;
-        if !canonical.starts_with(&canonical_root) {
-            return Err(unsafe_store_path(
-                &current,
-                "store directory resolves outside the canonical Kio directory",
-            ));
-        }
-    }
-
-    current.canonicalize().pipeline_io(&current)
-}
-
 fn unsafe_store_path(path: &Path, message: impl Into<String>) -> PipelineError {
     PipelineError::corrupt(path.display().to_string(), message)
 }

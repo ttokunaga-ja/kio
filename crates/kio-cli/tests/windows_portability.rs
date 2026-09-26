@@ -2,7 +2,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use kio_core::cas::{ObjectKind, ObjectStore};
+use kio_core::dag::{CommitObject, CommitStats, CommitType, build_tree};
 use kio_core::portable::{PORTABLE_TAGS_DIRECTORY, portable_leaf_error, portable_tag_leaf};
+use kio_core::scope::Repository;
 use serde_json::Value;
 
 const TEST_ENV: &[&str] = &[
@@ -93,7 +96,7 @@ fn home_and_xdg_unset_use_windows_profile_without_cwd_device_state() {
         "# Profile\n\nwindows profile fallback marker\n",
     )
     .unwrap();
-    windows_no_home_json(scope.path(), profile.path(), &["index", "--approve"]);
+    windows_no_home_json(scope.path(), profile.path(), &["index"]);
     let search = windows_no_home_json(
         scope.path(),
         profile.path(),
@@ -204,7 +207,7 @@ fn open_cache_derives_a_portable_leaf_from_hostile_logical_basename() {
         "# Cache\n\nportable cache marker text\n",
     )
     .unwrap();
-    json_success(scope.path(), device.path(), &["index", "--approve"]);
+    json_success(scope.path(), device.path(), &["index"]);
     let search = json_success(
         scope.path(),
         device.path(),
@@ -212,6 +215,43 @@ fn open_cache_derives_a_portable_leaf_from_hostile_logical_basename() {
     );
     let mut pointer = search["results"][0]["evidence_pointer"].clone();
     let hostile = "CON?.PDF:stream. ";
+    // A pointer's path is part of its authenticated commit/tree binding. Model
+    // this Unix-originated historical logical basename in a child commit rather
+    // than forging `path_at_commit` on the search result.
+    let repo = Repository::open(scope.path()).unwrap();
+    let parent_hash = repo.head_commit_hash().unwrap().unwrap();
+    let parent = repo.read_commit(&parent_hash).unwrap();
+    let mut tree = repo.read_tree(&parent.tree).unwrap();
+    let raw_hash = pointer["raw_hash"].as_str().unwrap();
+    tree.entries
+        .iter_mut()
+        .find(|entry| entry.raw_hash == raw_hash)
+        .unwrap()
+        .path = hostile.to_owned();
+    let tree = build_tree(tree.entries).unwrap();
+    let store = ObjectStore::new(repo.kio_dir());
+    let (tree_hash, _) = store
+        .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())
+        .unwrap();
+    let commit = CommitObject::new(
+        tree_hash,
+        Some(parent_hash),
+        "2026-09-09T00:00:00Z".to_owned(),
+        "fixture: hostile historical logical basename".to_owned(),
+        parent.tool_lock_hash,
+        CommitStats {
+            files_added: 0,
+            files_modified: 1,
+            files_deleted: 0,
+        },
+        CommitType::Manual,
+    )
+    .unwrap();
+    let (commit_hash, _) = store
+        .write_json(ObjectKind::Commit, &serde_json::to_value(&commit).unwrap())
+        .unwrap();
+    fs::write(repo.kio_dir().join("HEAD"), format!("{commit_hash}\n")).unwrap();
+    pointer["commit"] = Value::String(commit_hash);
     pointer["path_at_commit"] = Value::String(hostile.to_owned());
     fs::remove_file(scope.path().join("report.md")).unwrap();
 

@@ -33,8 +33,16 @@ R23 の同梱 runtime が実行できる online target は `mistral_ocr_markdown
 
 許容 (非推奨):
 2. tools.toml 直書き:  auth = "plain:<api_key>"
-   - tools.toml の permission が 0600 (owner read/write のみ) でない場合、
-     Kio は起動時に warn を出す (errors.jsonl に level=warn で記録)
+   - tools.toml と直上のディレクトリは利用者所有・所有者限定とする。
+     他の利用者へ権限を与える macOS ACL / Windows DACL も拒否する。
+     通常の Unix 設定例はファイル 0600、親ディレクトリ 0700。
+   - 条件を満たさない平文 credential は KIO-E-ADAPTER-TOOLS-PRIVATE-001
+     (exit 2) で拒否する。既存の permission を自動変更しない。
+   - 起動時と credential 使用時に、1 MiB 上限の regular・single-link・
+     no-follow 読込みを行う。使用時の宣言が読込み済み設定と変わっていたら拒否する。
+     事前の形式判定すらできない unsafe file は通常の bounded-read error になる。
+   - TOML 構文エラーには設定本文・credential を含めず、byte offset だけを示す。
+     CLI の標準エラーと errors.jsonl のどちらにも入力行を転記しない。
 
 禁止 (既定どおり):
    .kio/ 配下・tool-lock.json・tool_profile_hash の入力への認証情報の混入
@@ -53,7 +61,7 @@ Adapter は **提供主体ではなく実行形態と決定性** で分類する
 online_api               LLM 等のネットワーク越し API (frontier AI が中心)
                          明示的な network opt-in が必要
 offline_api              ローカル LLM / ローカル embedding server
-                         ネット送信なし。非決定的出力はあり得る
+                         loopback HTTP を使い得る。非決定的出力はあり得る
 deterministic_library    決定論的ライブラリ (PDF text extraction, parser)
                          同じ入力 + 同じ profile なら同じ出力
 ```
@@ -90,7 +98,7 @@ Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱す�
 > instance 内の prepared_hash drift ではなく新 identity としての基線再構築)。
 
 - online Adapter が未設定または network 未承認のとき、Markdownize タスクは同梱 deterministic Adapter で実行する (タスクを止めない)。Embedding タスクは生成しない (検索は text fallback、[05-runtime.md §1](05-runtime.md))
-- この状態を **ベースライン index** と呼ぶ。`init → index --approve → search → open <pointer>` の最低体験ライン ([01-positioning.md §3](01-positioning.md)) はベースライン index のみで成立しなければならない
+- この状態を **ベースライン index** と呼ぶ。`init → index --yes → search → open <pointer>` の最低体験ライン ([01-positioning.md §3](01-positioning.md)) はベースライン index のみで成立しなければならない
 - online Adapter を承認した後の AI 強化は、別 `tool_profile_hash` の artifact として通常の Markdownize / Embedding タスクで生成する (identity 規約 [03-data-model.md §5](03-data-model.md) のとおり。ベースライン artifact とその Evidence Pointer は不変のまま残る)
 
 ---
@@ -108,159 +116,54 @@ default: no network transmission (opt-in 未成立の scope からはオンラ�
 opt-in の単位・成立・寿命:
 
 ```text
-単位:   scope × adapter
-        (どの .kio のファイルを、どの online_api Adapter (tool_id) に送るか)
+単位: scope と Adapter の完全な paired identity。
+  scope 側の active approval reference と device-private active grant の両方が、
+  scope/membership、tool_id、execution_mode、tool_profile_hash、destination、
+  credential binding、trust binding、operation に一致しなければならない。
 
-成立:   (a) 初回スキャン承認フローで network transmission policy を承認
-            (対話承認 または --approve。--yes では成立しない: 06-cli-spec.md §2)。
-            **承認の成立 = approvals[] 行の materialize と、同一承認操作での scope config
-            `allow_network = true` の設定の両方** (送信 gate は boolean と行の AND —
-            行だけでは送信が有効にならない)
-        (b) 明示設定: .kio/config.toml の adapter.policy.allow_network = true —
-            **boolean 単独では送信 gate (boolean × 行の AND) を満たさない**。行の materialize は
-            承認操作 (対話 / --approve) のみで、config の手編集は kill switch の解除・意思表示に
-            留まる (**例外 = 下記の初回 materialize**: `approvals_initialized` marker が無く
-            approvals[] が空の**初回に限り**、最初の 1 tool を自動 materialize する — それ以外は
-            crash 中間 (true × 行なし) との区別のため自動 materialize をせず、送信可能化には
-            (a) の承認操作を要する)
+成立: `kio adapter approve <tool_id>` または `kio adapter approve --all` が、
+  確認後に paired record を publish する。config の `allow_network = true`、
+  scope reference、device record、または pending record の一つだけでは開かない。
+  `approval_pending` は resume に使う中断記録であり、自動 publish されない。
 
-寿命:   永続 (revoke まで)。ただし対象 Adapter の tool_id・execution_mode・tool_profile_hash の
-        いずれかが変わった場合は失効し、再承認を要する (profile に畳み込まれる設定 —
-        `[markdownize].bbox_annotation` 等 — の変更も含む。照合の実体は下記「記録」の送信 gate)。
+寿命と revoke: identity が変われば grant は一致しない。`adapter revoke` は対象の
+  scope approval/pending と device grant を revoke し、`--all` は configured Adapter
+  全体を対象にする。送信済み bytes は取り消せない。online_api では
+  `allow_network = false` も閉鎖条件である。
 
-revoke: adapter.policy.allow_network = false に設定する (これは **scope 全体の kill switch** —
-`--online` の一時 opt-in でも上書きされない。下記「優先関係」の例外)。
-単一 Adapter だけの revoke は approvals[] 当該行の **status=revoked + revoked_at への更新**で行う
-(opt-in 単位 = scope × adapter に対応する既存機構 — 下記)。**効果は当該 Adapter の新規送信停止に
-限り、他 Adapter の active 承認と `allow_network` boolean は変えない**。**revoke は単一 Adapter では同一
-(scope_id, tool_id) の `approval_pending` を execution_mode / tool_profile_hash 不問で同一 atomic write
-除去し、`--all` は tool を
-問わず存在する全ての `approval_pending` を除去する** — 未 publish の
-pending intent を残さない (行 publish 前に revoke した場合に、次回実行の self-heal が承認を
-復活させる経路の封鎖 — 別 tool の crash 残存 pending も `--all` で残さない。**4 組一致に限ると**、
-profile 変更後の revoke が旧 profile の pending を取り逃し、config を戻した後の self-heal が
-revoke 直後の承認を復活させる — pending は未 publish の intent であり、広めの除去は再承認要求に
-なるだけで安全側)。**加えて、revoke が
-pending の除去または行の revoked 化を実際に実行した場合、`approvals_initialized` marker が無ければ
-同一 atomic write で `approvals_initialized: true` を記録する** (初回 materialize 例外の消費 —
-pending が唯一の区別子である crash 中間 (true × 行ゼロ × marker 無し) で revoke 後の次回実行の
-(b) 初回 materialize が、直前に revoke した承認を復活させない)。対象なし (行なし・
-pending なし・既 revoked) は冪等成功 (exit 0 + 「対象なし」表示 — **marker も書かない**: 未使用
-scope の初回 materialize 経路を revoke の空振りで消費しない)。**単一 Adapter revoke の実行主体 = `kio adapter revoke <tool_id>`**
-([06-cli-spec.md §1](06-cli-spec.md) — `.kio/.lock` 下の locked mutation、[05-runtime.md §6](05-runtime.md))。
-承認側の行 publish・self-heal も同じ lock 下で行い、**publish の直前に `approval_pending` の存在を
-再検証する** (CAS — 並行する revoke が除去した pending を publish しない)。明示承認コマンド
-(対話 / --approve) はこの再検証の不一致を**明示エラー (KIO-E-ADAPTER-APPROVAL-CONFLICT-001 / exit 5 —
-並行 revoke との競合・再承認が必要) で終端する** (無音の no-op
-成功にしない。self-heal は発火条件不成立として非発火のままでよい)。
-        新規オンライン送信 task の発行停止は、kill switch では scope 全体・単一 Adapter revoke では
-        当該 Adapter 分のみ (送信済みデータの取り消しは、どちらの revoke でも保証しない。**発行停止の
-        境界 = 相 1 claim Tx 内 (`BEGIN IMMEDIATE` 保持下) の最終再読 ([05-runtime.md §1.1](05-runtime.md)) — 再読後に完了した
-        revoke の当該送信は in-flight として許容**)。
-
-記録:   承認記録に scope_id / tool_id / **execution_mode / tool_profile_hash (承認時点)** /
-        approved_at / approval_method を残す。送信前に現在の execution_mode / profile と照合し、
-        不一致 = 失効 (再承認要求) — 保存しないと「変わった場合は失効」を永続状態から判定できない。
-        **保存先 = `.kio/scope.json` の `approvals[]` 配列** (schema 検証対象
-        [10-operations.md §11.3](10-operations.md)、truth [03-data-model.md §4.1](03-data-model.md))。
-        `(scope_id, tool_id)` 単位の行で、失効・revoke は当該行の **status=revoked + revoked_at への
-        更新** (atomic rename) で行う (行は削除しない — 監査保全)。送信 gate は
-        「`allow_network` の実効設定が true であり (**未設定・設定 key の喪失は gate 不成立** —
-        active 行が現存する場合は config へ true を再設定するだけで回復し、再承認は不要)、**かつ**
-        行の scope_id が当該 scope.json の scope_id と
-        一致し、現在の execution_mode / tool_profile_hash に一致する `status=active` 行が存在する」の
-        両立とする (**scope_id 不一致の行は gate に使わない** — 再承認を迂回させない)。
-        **`--online` の一時 opt-in は
-        この gate の唯一の例外** — 「優先関係」のとおり opt-in 未成立の既定閉鎖のみを上書きし
-        (approvals[] 行は作らない)、consent 由来 `cli_online` として §7 の log に記録する。明示
-        revoke (`allow_network = false`・行の revoked) は上書きしない。
-        `approvals[]` 要素の required field = scope_id / tool_id / execution_mode /
-        tool_profile_hash / approved_at / approval_method / **status (`active` | `revoked`)** —
-        status=revoked の行は **revoked_at** も必須 ([10-operations.md §11.3](10-operations.md) の
-        schema 定義と一致)。**status を持たない行は送信を許可しない** — 既定値で active と
-        読む経路は持たない (fail-closed、[10-operations.md §11.3](10-operations.md))。
-        初回スキャン承認 (10-operations.md §1) の記録とは別物 — あちらは scope 単位の
-        取り込み承認、こちらは adapter 単位の network opt-in。
-        (b) の config boolean は scope 内の全 online_api Adapter の**送信 gate 条件** (false で全停止)
-        であると同時に、**scope で最初に実行される 1 Adapter に限り approvals[] 行を materialize する
-        意思表示**として扱う —
-        行 materialize 後は (a) と同じ照合・失効規則に従う (tool_id 個別の可否は approvals[] が
-        単位。boolean だけでは profile 変化の失効を判定できないため、行なしでの送信は不可)。
-        **materialize が発火するのは当該 scope の approvals[] に行が (tool_id を問わず) 一つも
-        存在せず、かつ scope.json に `approvals_initialized` marker が無い初回、その最初の 1 tool に
-        対してのみ**。初回承認 (materialize / --approve のいずれも) は行 publish と**同一 atomic
-        write** で `approvals_initialized: true` を記録する ([10-operations.md §11.3](10-operations.md) の
-        optional key) — 以後 approvals[] が空になっても (手動編集・不整合 backup 復元等)、行ゼロ ×
-        marker あり は真正初回と区別して **fail-closed (明示承認要求)** とする (行ゼロだけでは台帳
-        喪失と初回を区別できない)。marker は行と同時に書かれるため、承認途中の crash 中間 (true ×
-        行なし × marker なし) では self-heal が成立する — ただし**完遂できるのは下記
-        `approval_pending` (pending intent) と 4 組完全一致の tool のみ** (crash 後に config /
-        Adapter 構成が変わって「最初の 1 tool」が別 identity になっても、承認したのと別の
-        Adapter を materialize しない)。2 個目以降の tool_id や tool_id が
-        変わった Adapter は、boolean が true のままでも自動生成せず明示承認 (対話 / --approve) を
-        要する (新 identity への blanket 波及を許すと、上記寿命規則の「tool_id が変わった場合は
-        失効し、再承認」を『新規行の初回 materialize』として迂回できてしまう)。profile 変更で
-        失効した行や revoked 行が存在する場合も同様に再承認を要する (残存 boolean による失効迂回の禁止)。
-        承認操作の書込順は **(0) pending intent = 承認対象の 4 組 (scope_id / tool_id /
-        execution_mode / tool_profile_hash) + 公開行の監査値 (`approved_at` / `approval_method`) を
-        scope.json の `approval_pending` key へ atomic に
-        耐久化 → (1) config.toml (`allow_network = true`) を耐久化 → (2) approvals[] 行 + marker を
-        publish し、同一 atomic write で `approval_pending` を除去** (self-heal は pending の payload
-        をそのまま publish する — 監査値を補完・捏造しない) — 途中で crash した中間
-        (true × 行なし) は、次回実行の self-heal が **`approval_pending` と完全一致する場合に限り**
-        行 publish を完遂する (pending 記録が無い・一致しない中間は自動生成せず明示承認 (対話 /
-        --approve) を要求する)。`approval_pending` 全体の**不在**は有効であり pending intent 無しを表す。
-        ただし key が存在する場合は [10-operations.md §11.3](10-operations.md) の required field
-        (`approved_at` / `approval_method` を含む) を全て満たさなければならない。present malformed
-        pending は schema error / fail-closed とし、self-heal・自動 cleanup・監査値の補完の対象にしない。
-        **scope 全体の revoke** は逆順 (全行の revoked 化 → boolean false) — 中間
-        (revoked × true) は gate の AND で送信不能 (安全側) のまま恒久に安全であり、**boolean の
-        false 化は kill switch 操作 (config 編集) 側の責務 — 自動整合はしない** (`kio adapter revoke
-        --all` の終状態 (全行 revoked × true、[06-cli-spec.md §1](06-cli-spec.md) の「boolean は
-        変えない」) と scope 全体 revoke の crash 中間を状態だけでは区別できないため。
-        **単一 Adapter revoke は当該行の更新のみ**)。
+送信境界: admission と dispatch の双方で current paired identity を検査する。
+  active record の欠落、不一致、revocation、または必要な online_api policy の拒否は
+  fail closed である。`adapter status` は scope/device/pending と effective match を
+  read-only で表示する。詳細な CLI 構文は [06-cli-spec.md §1](06-cli-spec.md) と
+  [14-v1-runtime-contracts.md](14-v1-runtime-contracts.md) に従う。
 ```
 
-CLI フラグ `--online` は **その 1 回の実行に限る一時 opt-in** で、**永続的な承認状態
-(`approvals[]` 行) を作らない** (実行の送信記録は §7 の log に残り、consent の由来 —
-approvals / cli_online — を含める)。`--offline` は逆向きの一時上書きで、当該実行の新規送信を
-禁止する (未送信の online タスクは **pending のまま**当該実行では送信しない — 永続状態・
-hold_reason は変更しない ([04-pipeline.md §5.2/§5.4](04-pipeline.md) — enqueue のみ + index_status に
-pending 可視化)。`--override-budget` と併用した場合も budget pause の解除のみ行い、送信はしない)。
-適用対象は online 作業を駆動し得る全コマンド
-(`kio index` / `kio batch resume` / `kio batch retry` / `kio reindex` — `--force` / `--at <commit>`
-のいずれも online embedding を駆動し得る — / `kio repair rebuild-db` (rebuild 後の enrichment —
-[04-pipeline.md §5.4](04-pipeline.md)) / **`kio search` — vector|hybrid の page 1 の query embedding**
-([05-runtime.md §1.1](05-runtime.md) の consent gate: payload は query 文字列のみ。送信可否 = 参加
-scope の 1 つ以上に当該 embedding Adapter の active 承認 + 当該 scope の実効 `allow_network` = true
-(§3 の gate と同一規範 — 未設定・key 喪失は不成立)。承認ゼロ・gate 不成立は text fallback / `--mode vector` は
-error。課金は `scope_id='device'` — [04-pipeline.md §5.4](04-pipeline.md))。[06-cli-spec.md §1](06-cli-spec.md))。**既存 in-flight
-request の照会・出力取得・upload 掃除 ([04-pipeline.md §5.8](04-pipeline.md) 回復) は新規送信に
-当たらず、opt-in / `--online` なしで実行できる** (opt-in が制御するのは新規 upload・job 作成・
-sync 呼出のみ)。
-優先関係は次のとおり:
+`--online` は temporary opt-in でも grant 作成手段でもない。`index --online` は、
+current scope の configured Adapter の少なくとも一つに active external-send paired grant
+があることを preflight で要求する。Gemini-only の grant でもこの preflight を満たし得るが、
+各 Adapter の dispatch は依然としてその Adapter 自身の exact grant を要求する。検索の
+query embedding も current exact paired grant を要求する。`--online` は revoke、identity
+不一致、または policy 拒否を修復しない。
 
-```text
-CLI (--online / --offline)  >  .kio/config.toml (scope)  >  ~/.config/kio/config.toml (user)
-```
-
-この優先で `--online` が上書きできるのは **opt-in 未成立 (`allow_network` 未設定) の既定閉鎖**である。
-**明示 revoke (`allow_network = false` の明示設定) は `--online` より優先する** (kill switch の趣旨 —
-解除は config の再変更のみ。`--offline` 側は常に最優先で当該実行の新規送信を禁止する)。
+`--offline` は当該 invocation の**全 HTTP dispatch**を禁止する。online provider だけでなく、
+認証済み loopback local Adapter、provider の poll、output download、upload cleanup も対象である。
+未実行の task はこの invocation で送信せず、HTTP 回復も行わない。適用対象は index、batch
+resume/retry、reindex、repair rebuild-db、search、および HTTP Adapter を使い得る同等の経路である。
 
 **01-positioning.md との整合**: デフォルト同梱 Adapter は online_api (frontier AI) だが、
-初回スキャン承認で network transmission policy に同意するまで送信は始まらない。
+paired grant が成立するまで送信は始まらない。
 "frontier AI default" は同梱・推奨構成を指し、"default: no network transmission" は
-opt-in 未成立状態の既定値を指す。両者は矛盾せず、初回スキャン承認フローが接続する。
+opt-in 未成立状態の既定値を指す。両者は矛盾せず、明示承認フローが接続する。
 
 オンライン API Adapter を使う場合、ユーザーがどの scope / file / task を送信対象にしたかを
 記録する。オフライン API / 決定論的ライブラリの場合も `execution_mode` と `profile_hash` は
 記録する。
 
-> **`offline_api` の url 制限と consent gate 免除 (2026-07-26 確定)**:
-> ローカル LLM / ローカル embedding server (`execution_mode = "offline_api"`) の導入にあたり、
-> 本節の opt-in 機構との関係を確定させる。**両者は表裏一体である** — 免除が成立するのは
-> 「送信が構造的に起こり得ない」ことを url 制限が保証する場合に限る。
+> **local HTTP Adapter の loopback 制限と paired grant (2026-09-08)**:
+> `execution_mode = "offline_api"` でも別 process への HTTP dispatch である。loopback
+> 制限は宛先制限であって consent/approval の免除ではない。local Adapter には current
+> scope/device paired network grant と、認証を使う場合には device-local managed CA trust が
+> 必要である。`--offline` はこの HTTP dispatch も禁止する。
 >
 > **(1) url は loopback リテラルに限定する。**
 > 受理するのは `127.0.0.1` / `localhost` / `[::1]` / UNIX domain socket **のみ**。
@@ -286,21 +189,9 @@ opt-in 未成立状態の既定値を指す。両者は矛盾せず、初回ス�
 > **実行直前の宣言再検査**の両方。後者を欠くと、起動時検証を通った宣言が
 > 実行の瞬間に別経路で拒否される (あるいはその逆に素通りする)。
 >
-> この制限が無いと `kind = "offline_api"` + `url = "https://api.example.com"` が
-> **同意記録なしに全ファイル本文を外部へ送る**経路になる。本節の gate は
-> `execution_mode == online_api` を前提に組まれているため、この構成を素通ししてしまう。
->
-> **(2) `offline_api` Adapter は approvals[] / `allow_network` gate の対象外とする。**
-> 本節の opt-in 単位は冒頭のとおり「どの `online_api` Adapter (tool_id) に送るか」であり、
-> 上記のとおり offline_api については `execution_mode` と `profile_hash` の記録のみを
-> 求めている。(1) により送信が構造的に起こり得ない以上、**送信を gate する機構には
-> 適用対象が無い**。承認記録・`allow_network` boolean・失効判定のいずれも要求しない。
->
-> **`--offline` も offline_api Adapter を止めない。** `--offline` の定義は上記のとおり
-> 「当該実行の**新規送信**を禁止する」であり、送信を行わない Adapter には適用対象が無い。
-> したがって `--offline` 指定下でも local embedding による vector 検索は成立する
-> (適用形は [05-runtime.md §1.1](05-runtime.md) の consent gate)。逆に `--online` が
-> offline_api Adapter に対して何かを開くこともない (開くべき閉鎖が存在しない)。
+> `kind = "offline_api"` が外部 URL を受理することはない。加えて、loopback endpoint
+> への本文送信は paired grant がなければ拒否する。scope config の一行だけ、device grant
+> だけ、または trust snapshot だけでは送信を許可しない。
 >
 > **現行実装 (2026-08-02 更新)**: Embedding と Markdownize の**両方**で `url` が
 > 上記の条件下で**受理される** (Markdownize は 2026-08-02 に解禁。それ以前は
@@ -332,9 +223,8 @@ opt-in 未成立状態の既定値を指す。両者は矛盾せず、初回ス�
 >
 > **secrets hold は offline_api にも適用する (2026-08-02 確定)。**
 > Tier A ([10 §1.1](10-operations.md)) として明示承認で取り込まれたファイルは、
-> `--send-secrets` が無い限り**ローカル Adapter にも渡さない**。上の (2) が
-> 免除したのは approvals[] / `allow_network` — すなわち「データが機械の外へ
-> 出るか」を問う gate であって、secrets hold が問うているのは**中身が資格情報か**
+> `--send-secrets` が無い限り**ローカル Adapter にも渡さない**。paired network grant と
+> secret-send grant は別であり、secrets hold が問うているのは**中身が資格情報か**
 > であり、送り先のネットワーク上の位置ではない。ローカルモデルサーバは
 > 別プロセス (多くはコンテナ) であり、プロンプトをログに残しうる。
 > **誤る向きが非対称である**ことが決め手で、緩い側で誤れば資格情報が
@@ -347,9 +237,9 @@ opt-in 未成立状態の既定値を指す。両者は矛盾せず、初回ス�
 > **`kind` で target を解決する** — offline embedding 実装が 2 つ目になるまでは
 > 一意に定まる。
 >
-> `auth` は書かない — 認証先が無い。この宣言があること自体が有効化の signal であり、
-> 承認行も `allow_network` も要らない ((2) のとおり)。Adapter は
-> `POST {url}/v1/embeddings` に §5.3 (2) の `messages` 形式で 1 item ずつ送る。
+> `auth` を省略しても paired grant は必要である。認証する local peer は、`adapter trust`
+> lifecycle が管理する CA snapshot だけを信頼する。legacy `ca_pem_path` は拒否する。Adapter
+> は `POST {url}/v1/embeddings` に §5.3 (2) の `messages` 形式で 1 item ずつ送る。
 
 ---
 
@@ -384,9 +274,12 @@ AdapterRun:
   input_hashes
   output_hashes
   status                "pending" | "running" | "done" | "partial" | "failed"
-                        (partial = unit 単位の部分失敗, 04-pipeline.md §5.2。正常な制御応答
-                         (fallback_to_full) は request として成功 = "done" — outcome の区別は
-                         cost_ledger 側 ([04-pipeline.md §3.2](04-pipeline.md)))
+                        (partial = unit 単位の部分失敗, 04-pipeline.md §5.2。`full_required`
+                         (= fallback_to_full) は request の制御結果であり、AdapterRun は "done" でも
+                         normalized task の完了を意味しない。送信前なら Kio が Full を選べるが、有料
+                         incremental の送信後に自動 Full 再送はしない。後者は result_unknown として
+                         明示 `--resend-unknown` 承認を待つ。request outcome の区別は cost_ledger 側
+                         ([04-pipeline.md §3.2](04-pipeline.md)))
   error_code            機械判定用 (06-cli-spec.md §8)
   error_category        transient | permanent | rate_limit — 04 §5.3 の retry 分類の入力
                         (集計用の粗分類 — auth / quota / invalid_input 等の細分は error_code が
@@ -445,6 +338,8 @@ renderer 版内で prepared_hash が安定し、renderer 更新による出力�
 可視化する。実行時の変換失敗は contract_violation ([04-pipeline.md §5.3](04-pipeline.md) — 同一入力の
 再試行 1 回) に合流する。音声の変換機構は現在の契約に含めない。
 
+**Office package preflight (DOCX / PPTX)**: LibreOffice に渡す前に raw ZIP を最大 100 MiB、central-directory を最大 4,096 entry、各 member を最大 32 MiB、全 member の declared aggregate を最大 256 MiB として検証する。必要な `[Content_Types].xml`、`_rels/.rels`、main XML の読取り合計は 6 MiB に制限し、CRC を検証して読む。encrypted / split ZIP、ZIP64、重複・非 UTF-8・unsafe part name、非 Stored/Deflated member は拒否する。XML は UTF-8、nesting 256、attribute 1,024 を上限とし、DTD/entity declaration を受けない。DOCX / PPTX ごとに genuine な MIME override、内部 root relationship、main part と namespace を検証する。preflight failure は renderer を起動せず contract violation とする。
+
 **XLSX の unit 化 (実装フィードバック 2026-07-25 — 上の「対象外」を解除)**: XLSX は
 **変換 PDF を経由しない**。DOCX / PPTX が変換 PDF に載るのは page と slide が**それ自体で視覚的な
 unit** だからであり、sheet にはそれが無い。実測: 10 列 1 シートを `soffice` で PDF 化すると
@@ -457,7 +352,7 @@ unit** だからであり、sheet にはそれが無い。実測: 10 列 1 シ�
 workbook あたり 256 sheets・1,000,000 cells（疎な列位置の padding を含む）・セル文字列合計 16 MiB・
 出力 Markdown 合計 16 MiB、sheet あたり 50,000 rows・1,024 columns、ZIP central-directory 4,096 entries、
 任意の inflated ZIP member 64 MiB とする。self-closing row/cell にも同じ上限を適用し、
-共有文字列の複写・列 padding・Markdown escape より前に残量を検査する。超過・不正 ZIP/XML は部分抽出や空成功にせず
+共有文字列の複写・列 padding・Markdown escape より前に残量を検査する。raw ZIP は 100 MiB、aggregate read は 256 MiB、XML は nesting 256 / attribute 1,024 を上限とする。central/local header の name、size、CRC は一致を確認し、CRC-checked read を行う。encrypted / split ZIP、ZIP64、重複・非 UTF-8・unsafe part name、非 Stored/Deflated member、DTD/entity declaration、malformed XML は拒否する。超過・不正 ZIP/XML は部分抽出や空成功にせず
 `KIO-E-PREPARE-XLSX-EXTRACT-001` の contract violation とする。
 
 - **unit = worksheet 1 枚**。`unit_key` は 04 §2 / QB27 の `sheet:` 規則 —
@@ -492,6 +387,9 @@ input:
 output:
   mode_used                    "full" | "incremental"
   updated_units / added_units / removed_unit_keys / unchanged_unit_keys
+  # updated / added の各 unit は owned_image_hashes を必須とする。
+  # 実際に取得・検証した画像バイトの hash だけを格納し、画像なしは []。
+  # Markdown の URI や provider の自由記述 metadata から所有関係を推測しない。
   failed_units                 [{ unit_key, error_kind }] — 部分失敗の unit (error_kind は
                                [04-pipeline.md §5.3](04-pipeline.md) の閉 enum。04 §3.2 V1 の被覆に
                                含める (full は V6 の被覆)。persist されず manifest 側で failed へ遷移
@@ -943,7 +841,7 @@ list_uploads()                 scope 内の upload を pagination 走査でき�
 delete_upload(upload_id)       404 (不存在) は削除成功として報告する
 fetch_output(job_id)           出力 JSONL は入力ごとの custom_id (= unit_key) を保存して返却する
                                ([04-pipeline.md §5.8](04-pipeline.md) の unit 復元の前提)
-provider_scope_id()            下記の不変識別子を返す
+provider_scope_id()            下記の versioned credential-bound recovery scope を返す
 ```
 
 - **エラー分類の契約**: Adapter は失敗を transient (5xx / ネットワーク断)・rate_limit (429 —
@@ -955,8 +853,13 @@ provider_scope_id()            下記の不変識別子を返す
   request 単位記帳の前提 — 直列多 request task では各 request の終端 Tx が自身の実測 usage を持つ)。
   **機械契約は §4 AdapterRun の `usage` field (one-of: `usd` | `billable_units`) — billable な
   terminal 応答で必須**。報告値が cost ledger の記録源である
-- **provider_scope_id**: `adapter 名前空間 + account 不変 ID (+ workspace 不変 ID)` の連結。表示名・
-  alias 等の可変値は使わない。値は「これから呼び出す client instance」から取得する
+- **provider_scope_id**: account の恒久 ID とは別の、versioned credential-bound recovery scope。
+  `kio-batch-recovery:v1:<provider>:<HMAC-SHA256>` とし、device-private な専用 32-byte
+  `batch-recovery-key` を鍵に、domain / provider namespace / canonical HTTPS origin /
+  optional workspace・project qualifier（有無を区別）/ exact credential bytes を length-framed で結合する。
+  client 構築時に private source の検証後、credential / origin / qualifier を一度だけ capture し、
+  upload / create / poll / fetch / delete の全呼出で同じ値を使う。環境変数名や表示名の一致だけでは同一 scope としない。
+  HMAC は central ledger の回復照合専用であり、`.kio`、tool profile、send grant、通常 JSON / Debug 出力には含めない。
 
 **Batch プロバイダ採用条件** (満たさない provider は sync 呼出のみで採用するか、採用しない。**例外 = 条件 7 は sync fallback の免除対象外**: sync 呼出も provider request id を同じ記帳キー (`batch_job_id` 列) と cost_ledger 恒久突合に使うため ([04-pipeline.md §5.4](04-pipeline.md))、条件 7 を満たさない provider は sync でも採用しない):
 
@@ -967,8 +870,11 @@ provider_scope_id()            下記の不変識別子を返す
    upload() は upload_id を返し (返却型必須)、list_uploads は pagination を提供すること
 3. job / 一覧情報の保持期間が Kio の回復期限 (既定 48h) 以上であること
 4. job metadata / filename に client 任意の識別子 (intent_token) を埋め込めること
-5. account / workspace の**安定した**識別子を取得できること (取得不能なら reservation の照合が恒久
-   unknown になり、`kio batch abandon` 頼みの運用になる)
+5. 上記の versioned credential-bound recovery scope を提供し、記録済み scope と現在 client の完全一致を
+   poll / fetch / delete 前に検証できること。credential / origin / qualifier / device key の変更は別 scope であり、
+   自動 cross-key rotation・rebind はしない。旧 constant scope との互換 fallback も設けない。
+   credential を rotate する前に pending job / upload cleanup を drain する。未解決行がある場合は、
+   元の authorized credential と device key を復元するか明示 `kio batch abandon` で扱い、別鍵へ自動再送しない。
 6. 投入拒否 (permanent 4xx) にも課金するか否かを宣言すること。**課金する provider の Adapter は、
    拒否応答時に usage (`usd` = 宣言請求額 | `billable_units` — §4 の one-of と同形、第三の field は
    設けない) を機械可読で返却する** (この返却義務は Batch 限定で
@@ -1088,7 +994,7 @@ R23 の Markdownize / Embedding runtime は同梱 target だけを実行し、�
 task_id, adapter_id, tool_profile_hash, execution_mode, scope_id
 input_raw_hash, output_hash
 status, error_code, error_category, retry_after_ms
-network_consent (approvals | cli_online — 送信を伴った実行のみ)
+network_consent (current paired grant identity — HTTP dispatch を伴った実行のみ)
 started_at, finished_at
 adapter_kind, input_hash, intent_token, submission_seq
 usage_validation (missing | invalid), billing_source (estimated)
@@ -1104,7 +1010,7 @@ usage_validation (missing | invalid), billing_source (estimated)
                               行数が一致しないのは二重課金防止のための意図的挙動)
 ```
 
-`adapter_id` は tools.toml の `tool_id` と同一値である (別 namespace を作らない — approvals[] (§3) の照合キーと一致し、実行 Adapter を承認行へ一意に対応付ける)。
+`adapter_id` は tools.toml の `tool_id` と同一値である (別 namespace を作らない — scope approval reference と device grant (§3) の照合キーと一致し、実行 Adapter を paired authority へ一意に対応付ける)。
 
 残してはならないもの:
 
@@ -1126,7 +1032,7 @@ MVP における Adapter の脅威モデルを次のとおり確定する。
      単位。task 全体の総量上限ではない — 総量は budget cap 側が律する) — 超過は送信前に当該 task を
      terminal failed (invalid_input・非再試行) とし、送信しない (課金なし)
    - Kio は allowed_scope 外のファイルを Adapter に渡さない (入力制御)
-   - Kio は allow_network=false の Adapter にオンライン送信前提の task を発行しない
+   - Kio は永続 gate が不成立の Adapter にオンライン送信前提の task を発行しない
    - AdapterRun (task_id / input_hashes / output_hashes / status) を監査ログとして残す
 
 3. Kio が実行・文書化するのは同梱 built-in Adapter だけである。
@@ -1149,7 +1055,8 @@ MVP における Adapter の脅威モデルを次のとおり確定する。
    → Markdown の局所一貫性を保つ
 3. heading 構造の変更は Kio には影響しない (chunk side で対応)
 4. Adapter が「軽微とは言えない」と判断したら fallback_to_full=true で短絡
-   (受理側は unit 検査に先立つ制御応答として扱い、同一 task を mode=full で再発行する —
+   (受理側は unit 検査に先立つ制御応答として識別し、本文として保存しない。
+   同期有料要求の後でFullを再送するには、一度の明示承認と新しい予約が必要 —
    [04-pipeline.md §3.2](04-pipeline.md) の制御応答規則。full 応答での本 flag は contract violation)
    閾値の Adapter 側 hint は Kio 側 hint と衝突したら **Kio 側を優先**
 5. spec_version 不一致なら、Adapter は invalid_input として失敗 (`KIO-E-ADAPTER-SPECVER-001` — 汎用 `KIO-E-ADAPTER-CONTRACT-001` (retryable 1 回) と区別し、[04-pipeline.md §5.3](04-pipeline.md) の invalid_input 分類 = max_attempts 0 に一意に対応させる)

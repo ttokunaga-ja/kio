@@ -18,7 +18,7 @@ use kio_core::purge::{PurgeReason, PurgeState, TombstoneMode};
 use kio_core::scope::Repository;
 use kio_index::registry::{RegistryDb, RegistryEntry};
 use kio_pipeline::markdownize::NormalizedUnitObject;
-use rusqlite::params;
+use rusqlite::{Connection, params};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -161,9 +161,19 @@ fn registry_path(dir: &TempDir) -> std::path::PathBuf {
     dir.path().join(".test-data/kio/scope-registry.sqlite")
 }
 
+fn initialized_ledger_path(dir: &TempDir) -> PathBuf {
+    let path = dir.path().join(".test-data/kio/cost-ledger.sqlite");
+    if path.exists() {
+        kio_pipeline::ledger::LedgerDb::open_existing(&path).unwrap();
+    } else {
+        kio_pipeline::ledger::LedgerDb::initialize(&path).unwrap();
+    }
+    path
+}
+
 /// A complete `Present` observation of one device-local cost-ledger leaf.
-/// The companion's identity matters: `LedgerDb::open` may atomically replace
-/// the same bytes, which a bytes-only assertion would miss.
+/// Every lifecycle artifact's identity matters: a read-only snapshot must not
+/// create, replace, or repair any of them.
 #[derive(Debug, PartialEq, Eq)]
 struct PresentLedgerLeaf {
     bytes: Vec<u8>,
@@ -194,9 +204,10 @@ struct UnsafeLedgerLeafObservation {
     ino: u64,
 }
 
-/// The source ledger's SQLite main/WAL/SHM triad and the adjacent write-seq
-/// companion.  `Absent` is evidence too: a text or cursor read must not turn
-/// it into a sidecar merely by observing budget status.
+/// The source ledger's SQLite leaves plus authority, checkpoint,
+/// initialization-pending, and lifecycle-lock records. `Absent` is evidence
+/// too: a text or cursor read must not turn it into an artifact merely by
+/// observing budget status.
 #[derive(Debug, PartialEq, Eq)]
 enum LedgerLeafObservation {
     Absent,
@@ -268,29 +279,32 @@ fn observe_unsafe_ledger_leaf(path: &Path) -> UnsafeLedgerLeafObservation {
     }
 }
 
-fn ledger_leaf_paths(dir: &TempDir) -> [PathBuf; 4] {
+fn ledger_leaf_paths(dir: &TempDir) -> [PathBuf; 7] {
     let main = dir.path().join(".test-data/kio/cost-ledger.sqlite");
     [
         main.clone(),
-        PathBuf::from(format!("{}.write-seq", main.display())),
         PathBuf::from(format!("{}-wal", main.display())),
         PathBuf::from(format!("{}-shm", main.display())),
+        PathBuf::from(format!("{}.authority.json", main.display())),
+        PathBuf::from(format!("{}.checkpoint.json", main.display())),
+        PathBuf::from(format!("{}.init.pending", main.display())),
+        main.parent().unwrap().join("ledger.lifecycle.lock"),
     ]
 }
 
-fn observe_ledger_leaves(dir: &TempDir) -> [LedgerLeafObservation; 4] {
+fn observe_ledger_leaves(dir: &TempDir) -> [LedgerLeafObservation; 7] {
     ledger_leaf_paths(dir).map(|path| observe_ledger_leaf(&path))
 }
 
 fn assert_ledger_leaves_unchanged(
     dir: &TempDir,
-    before: &[LedgerLeafObservation; 4],
+    before: &[LedgerLeafObservation; 7],
     context: &str,
 ) {
     assert_eq!(
         observe_ledger_leaves(dir),
         *before,
-        "{context}: main/write-seq/WAL/SHM must remain exact Present|Absent observations"
+        "{context}: main/WAL/SHM/authority/checkpoint/init-pending/lock must remain exact Present|Absent observations"
     );
 }
 
@@ -311,10 +325,9 @@ fn assert_no_budget_paused_task(dir: &TempDir) {
 fn seed_current_scope_ledger_charge(dir: &TempDir, usd: f64) {
     let repo = Repository::open(dir.path()).unwrap();
     let scope_id = repo.scope_identity().unwrap().scope_id;
-    let ledger_path = dir.path().join(".test-data/kio/cost-ledger.sqlite");
-    let ledger = kio_pipeline::ledger::LedgerDb::open(&ledger_path).unwrap();
-    ledger
-        .connection()
+    let ledger_path = initialized_ledger_path(dir);
+    Connection::open(&ledger_path)
+        .unwrap()
         .execute(
             "INSERT INTO cost_ledger (
                 scope_id, adapter_kind, input_hash, tool_profile_hash, submission_seq,
@@ -334,10 +347,9 @@ fn seed_current_scope_ledger_reservation(dir: &TempDir, state: i64, usd: f64) {
     let repo = Repository::open(dir.path()).unwrap();
     let scope_id = repo.scope_identity().unwrap().scope_id;
     let input_hash = format!("budget-search-reservation-input-state-{state}");
-    let ledger_path = dir.path().join(".test-data/kio/cost-ledger.sqlite");
-    let ledger = kio_pipeline::ledger::LedgerDb::open(&ledger_path).unwrap();
-    ledger
-        .connection()
+    let ledger_path = initialized_ledger_path(dir);
+    Connection::open(&ledger_path)
+        .unwrap()
         .execute(
             "INSERT INTO batch_requests (
                 scope_id, adapter_kind, input_hash, tool_profile_hash, state,
@@ -435,9 +447,8 @@ fn assert_search_child_process_tree(child: &std::process::Child) {
     );
 }
 
-/// Explicit text search is not a vector/hybrid page-one operation.  It must
-/// not open the device cost ledger (whose companion write-sequence leaf is
-/// atomically rewritten even when its bytes are unchanged).
+/// Explicit text search is not a vector/hybrid page-one operation. It must
+/// not mutate device-ledger SQLite or lifecycle artifacts.
 #[test]
 fn pb_text_search_preserves_cost_ledger_and_write_sequence_identity() {
     let dir = tempfile::tempdir().unwrap();
@@ -447,7 +458,8 @@ fn pb_text_search_preserves_cost_ledger_and_write_sequence_identity() {
     )
     .unwrap();
     private_success(&dir, &["init"]);
-    private_success(&dir, &["index", "--offline", "--approve"]);
+    private_success(&dir, &["index", "--offline"]);
+    initialized_ledger_path(&dir);
 
     let before = observe_ledger_leaves(&dir);
     assert!(
@@ -508,15 +520,15 @@ fn pb_text_search_unsafe_ledger_hardlink_fails_closed_without_search_fallback() 
     )
     .unwrap();
     private_success(&dir, &["init"]);
-    private_success(&dir, &["index", "--offline", "--approve"]);
+    private_success(&dir, &["index", "--offline"]);
+    initialized_ledger_path(&dir);
 
     let leaves = ledger_leaf_paths(&dir);
     let main = &leaves[0];
-    let before_other_leaves = [
-        observe_ledger_leaf(&leaves[1]),
-        observe_ledger_leaf(&leaves[2]),
-        observe_ledger_leaf(&leaves[3]),
-    ];
+    let before_other_leaves = leaves[1..]
+        .iter()
+        .map(|leaf| observe_ledger_leaf(leaf))
+        .collect::<Vec<_>>();
     let alias = dir.path().join("unsafe-ledger-alias.sqlite");
     fs::hard_link(main, &alias).unwrap();
     let before_main = observe_unsafe_ledger_leaf(main);
@@ -542,9 +554,9 @@ fn pb_text_search_unsafe_ledger_hardlink_fails_closed_without_search_fallback() 
         before_main,
         "failed text search must not change the unsafe source main leaf"
     );
-    assert_eq!(observe_ledger_leaf(&leaves[1]), before_other_leaves[0]);
-    assert_eq!(observe_ledger_leaf(&leaves[2]), before_other_leaves[1]);
-    assert_eq!(observe_ledger_leaf(&leaves[3]), before_other_leaves[2]);
+    for (leaf, before) in leaves[1..].iter().zip(before_other_leaves) {
+        assert_eq!(observe_ledger_leaf(leaf), before);
+    }
 }
 
 /// Budget status is supplementary to a text search result. A syntactically
@@ -560,7 +572,8 @@ fn pb_text_search_budget_policy_error_remains_best_effort_and_non_mutating() {
     )
     .unwrap();
     private_success(&dir, &["init"]);
-    private_success(&dir, &["index", "--offline", "--approve"]);
+    private_success(&dir, &["index", "--offline"]);
+    initialized_ledger_path(&dir);
     // Valid TOML and global config-schema shape, but `read_budget_policy`
     // rejects a folder-layer `per_adapter` policy (that constraint is
     // device-only). There is deliberately no `[search]` key here, so normal
@@ -586,8 +599,8 @@ fn pb_text_search_budget_policy_error_remains_best_effort_and_non_mutating() {
 }
 
 /// An entirely absent source main/WAL/SHM triad is the normal zero-spend
-/// observation. Text search must not recreate the ledger, its write-sequence
-/// companion, or a SQLite sidecar merely to render `index_status`.
+/// observation. Text search must not recreate the ledger, lifecycle records,
+/// or SQLite sidecars merely to render `index_status`.
 #[test]
 fn pb_text_search_missing_ledger_is_zero_spend_and_no_create() {
     let dir = tempfile::tempdir().unwrap();
@@ -597,7 +610,7 @@ fn pb_text_search_missing_ledger_is_zero_spend_and_no_create() {
     )
     .unwrap();
     private_success(&dir, &["init"]);
-    private_success(&dir, &["index", "--offline", "--approve"]);
+    private_success(&dir, &["index", "--offline"]);
     for path in ledger_leaf_paths(&dir) {
         if path.exists() {
             fs::remove_file(path).unwrap();
@@ -608,7 +621,7 @@ fn pb_text_search_missing_ledger_is_zero_spend_and_no_create() {
         absent
             .iter()
             .all(|leaf| matches!(leaf, LedgerLeafObservation::Absent)),
-        "fixture must start with no source ledger main/write-seq/WAL/SHM"
+        "fixture must start with no source ledger or lifecycle artifacts"
     );
 
     let response = private_success(&dir, &["search", "missingledgerneedle", "--mode", "text"]);
@@ -639,7 +652,7 @@ fn pb_text_search_retries_absent_to_present_ledger_before_budget_status() {
     )
     .unwrap();
     private_success(&dir, &["init"]);
-    private_success(&dir, &["index", "--offline", "--approve"]);
+    private_success(&dir, &["index", "--offline"]);
     write_budget_caps(&dir, 1.0, None);
     assert_no_budget_paused_task(&dir);
     for path in ledger_leaf_paths(&dir) {
@@ -714,7 +727,7 @@ fn pb_text_and_auto_preserve_device_cap_exhaustion_without_ledger_mutation() {
     )
     .unwrap();
     private_success(&dir, &["init"]);
-    private_success(&dir, &["index", "--offline", "--approve"]);
+    private_success(&dir, &["index", "--offline"]);
     assert_no_budget_paused_task(&dir);
     write_budget_caps(&dir, 1.0, None);
     seed_current_scope_ledger_charge(&dir, 1.0);
@@ -732,7 +745,7 @@ fn pb_text_and_auto_preserve_folder_cap_exhaustion_without_ledger_mutation() {
     )
     .unwrap();
     private_success(&dir, &["init"]);
-    private_success(&dir, &["index", "--offline", "--approve"]);
+    private_success(&dir, &["index", "--offline"]);
     assert_no_budget_paused_task(&dir);
     write_budget_caps(&dir, 10.0, Some(1.0));
     seed_current_scope_ledger_charge(&dir, 1.0);
@@ -751,7 +764,7 @@ fn pb_text_and_auto_preserve_device_reservation_exhaustion_without_ledger_mutati
     )
     .unwrap();
     private_success(&dir, &["init"]);
-    private_success(&dir, &["index", "--offline", "--approve"]);
+    private_success(&dir, &["index", "--offline"]);
     assert_no_budget_paused_task(&dir);
     write_budget_caps(&dir, 1.0, None);
     seed_current_scope_ledger_reservation(&dir, 0, 0.4);
@@ -771,7 +784,7 @@ fn pb_text_and_auto_preserve_folder_reservation_exhaustion_without_ledger_mutati
     )
     .unwrap();
     private_success(&dir, &["init"]);
-    private_success(&dir, &["index", "--offline", "--approve"]);
+    private_success(&dir, &["index", "--offline"]);
     assert_no_budget_paused_task(&dir);
     write_budget_caps(&dir, 10.0, Some(1.0));
     seed_current_scope_ledger_reservation(&dir, 0, 0.4);
@@ -788,7 +801,7 @@ fn fixture() -> (TempDir, Value, String) {
     )
     .unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
     let search = success(&dir, &["search", "3600", "--mode", "text"]);
     let pointer = search["results"][0]["evidence_pointer"].clone();
     let uri = search["results"][0]["evidence_uri"]
@@ -811,7 +824,7 @@ fn make_pointer_commit_final_shallow(dir: &TempDir, pointer: &Value) {
         "# Advance\n\nadvance the shallow fixture head\n",
     )
     .unwrap();
-    success(dir, &["index", "--offline", "--approve"]);
+    success(dir, &["index", "--offline"]);
 
     let receipt_path = kio_dir(dir)
         .join("gc/shallowed")
@@ -904,7 +917,7 @@ fn successor_with_failed_pinned_manifest(dir: &TempDir, pointer: &Value) -> Stri
         .unwrap();
     let commit = CommitObject::new(
         tree_hash,
-        vec![parent],
+        Some(parent),
         "2026-07-20T00:00:00Z".to_owned(),
         "fixture: pin failed normalized manifest".to_owned(),
         parent_commit.tool_lock_hash,
@@ -919,8 +932,7 @@ fn successor_with_failed_pinned_manifest(dir: &TempDir, pointer: &Value) -> Stri
     let (commit_hash, _) = store
         .write_json(ObjectKind::Commit, &serde_json::to_value(&commit).unwrap())
         .unwrap();
-    fs::write(kio_dir(dir).join("refs/heads/main"), &commit_hash).unwrap();
-    fs::write(kio_dir(dir).join("HEAD"), &commit_hash).unwrap();
+    fs::write(kio_dir(dir).join("HEAD"), format!("{commit_hash}\n")).unwrap();
     commit_hash
 }
 
@@ -941,7 +953,7 @@ fn pb46_same_generation_immutable_bodies_remain_commit_pinned_after_rebuild() {
     )
     .unwrap();
     success(&dir, &["init"]);
-    let indexed = success(&dir, &["index", "--offline", "--approve"]);
+    let indexed = success(&dir, &["index", "--offline"]);
     let c1 = indexed["commit_hash"].as_str().unwrap().to_owned();
 
     let repo = Repository::open(dir.path()).unwrap();
@@ -992,7 +1004,7 @@ fn pb46_same_generation_immutable_bodies_remain_commit_pinned_after_rebuild() {
         .unwrap();
     let c2_commit = CommitObject::new(
         tree_hash,
-        vec![c1.clone()],
+        Some(c1.clone()),
         "2026-08-12T00:00:00Z".to_owned(),
         "fixture: same-generation immutable normalized body B".to_owned(),
         parent_commit.tool_lock_hash,
@@ -1010,8 +1022,7 @@ fn pb46_same_generation_immutable_bodies_remain_commit_pinned_after_rebuild() {
             &serde_json::to_value(&c2_commit).unwrap(),
         )
         .unwrap();
-    fs::write(kio_dir(&dir).join("refs/heads/main"), &c2).unwrap();
-    fs::write(kio_dir(&dir).join("HEAD"), &c2).unwrap();
+    fs::write(kio_dir(&dir).join("HEAD"), format!("{c2}\n")).unwrap();
 
     success(&dir, &["repair", "rebuild-db"]);
 
@@ -1570,7 +1581,7 @@ fn pb15_prune_orphans_blocked_by_active_purge_journal() {
         ContentObjectKind::Prepared.directory(),
         b"orphan that must survive because the journal blocks pruning",
     );
-    let purge = PurgeState::new(kio_dir(&dir));
+    let purge = PurgeState::open(kio_dir(&dir)).unwrap();
     purge
         .begin(
             vec![raw_hash],
@@ -2087,7 +2098,7 @@ fn pb56_exit_table_alive_zero_not_found_four() {
     let raw_hash = pointer["raw_hash"].as_str().unwrap().to_owned();
     let store = ObjectStore::new(kio_dir(&dir));
     fs::remove_file(store.object_path(ObjectKind::Raw, &raw_hash).unwrap()).unwrap();
-    let purge = PurgeState::new(kio_dir(&dir));
+    let purge = PurgeState::open(kio_dir(&dir)).unwrap();
     let repo = Repository::open(dir.path()).unwrap();
     let commit_hash = repo.head_commit_hash().unwrap().unwrap();
     purge
@@ -2120,7 +2131,7 @@ fn pb56_exit_table_alive_zero_not_found_four() {
 fn pb58_regression_active_journal_blocks_verify_for_unrelated_raw_hash() {
     let (dir, pointer, _) = fixture();
     let unrelated_raw_hash = hash_bytes(b"a raw_hash the journal does not target");
-    let purge = PurgeState::new(kio_dir(&dir));
+    let purge = PurgeState::open(kio_dir(&dir)).unwrap();
     purge
         .begin(
             vec![unrelated_raw_hash],
@@ -2501,7 +2512,7 @@ fn pb62_batch_complete_single_status_and_exit_parity() {
 fn build_lc10_fixture() -> (TempDir, Value) {
     let (dir, pointer, _) = fixture();
     let raw_hash = pointer["raw_hash"].as_str().unwrap().to_owned();
-    let purge = PurgeState::new(kio_dir(&dir));
+    let purge = PurgeState::open(kio_dir(&dir)).unwrap();
     let repo = Repository::open(dir.path()).unwrap();
     let commit_hash = repo.head_commit_hash().unwrap().unwrap();
     // Tombstone tail = purged (lifecycle_epoch stamped 1st -> lower).
@@ -2562,7 +2573,7 @@ fn pb65_lc12_canonical_erased_raw_absent_is_not_found() {
     let raw_hash = pointer["raw_hash"].as_str().unwrap().to_owned();
     let store = ObjectStore::new(kio_dir(&dir));
     fs::remove_file(store.object_path(ObjectKind::Raw, &raw_hash).unwrap()).unwrap();
-    let purge = PurgeState::new(kio_dir(&dir));
+    let purge = PurgeState::open(kio_dir(&dir)).unwrap();
     let repo = Repository::open(dir.path()).unwrap();
     let commit_hash = repo.head_commit_hash().unwrap().unwrap();
     purge
@@ -2663,7 +2674,7 @@ fn pb68_verify_and_open_agree_on_canonical_erased_raw_absent() {
     // this genuinely probes the CAS+purge-marker cross-check the pointer
     // resolution path is supposed to take, not the working-tree fast path.
     fs::remove_file(dir.path().join("evidence.md")).unwrap();
-    let purge = PurgeState::new(kio_dir(&dir));
+    let purge = PurgeState::open(kio_dir(&dir)).unwrap();
     let repo = Repository::open(dir.path()).unwrap();
     let commit_hash = repo.head_commit_hash().unwrap().unwrap();
     purge
@@ -2718,7 +2729,7 @@ fn pb48_pb49_manifest_missing_resolves_via_resurrection_link_after_reingest() {
     )
     .unwrap();
     success(&dir, &["init"]);
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
     let search = success(&dir, &["search", "3600", "--mode", "text"]);
     let old_pointer = search["results"][0]["evidence_pointer"].clone();
     let old_pointer_json = serde_json::to_string(&old_pointer).unwrap();
@@ -2761,7 +2772,7 @@ fn pb48_pb49_manifest_missing_resolves_via_resurrection_link_after_reingest() {
     // same bytes are still sitting in evidence.md -- the next `kio index`
     // re-ingests and resurrects (retires the tombstone) in the same locked
     // mutation, reproducing the identical chunk_hash at gen 0.
-    success(&dir, &["index", "--offline", "--approve"]);
+    success(&dir, &["index", "--offline"]);
 
     for args in [
         vec![
@@ -2863,7 +2874,7 @@ fn pb42_open_view_side_binds_to_pointer_tool_profile_hash_not_first_raw_hash_mat
         .unwrap();
     let new_commit = CommitObject::new(
         new_tree_hash,
-        vec![head],
+        Some(head),
         "2026-07-21T00:00:00Z".to_owned(),
         "pb42 fixture: duplicate raw_hash placement".to_owned(),
         commit.tool_lock_hash.clone(),
@@ -2881,8 +2892,7 @@ fn pb42_open_view_side_binds_to_pointer_tool_profile_hash_not_first_raw_hash_mat
             &serde_json::to_value(&new_commit).unwrap(),
         )
         .unwrap();
-    fs::write(kio_dir(&dir).join("refs/heads/main"), &new_commit_hash).unwrap();
-    fs::write(kio_dir(&dir).join("HEAD"), &new_commit_hash).unwrap();
+    fs::write(kio_dir(&dir).join("HEAD"), format!("{new_commit_hash}\n")).unwrap();
 
     let mut new_pointer = pointer.clone();
     new_pointer["commit"] = Value::String(new_commit_hash);

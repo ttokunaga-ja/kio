@@ -96,7 +96,7 @@ KIO-E-SEARCH-VEC-UNAVAIL-001 で error。課金は
 > (上の「`--offline` 指定時は承認の有無に関わらず query embedding を送信しない」は
 > online_api Adapter についての規範である — 送信しない Adapter に禁止する送信は無い)。
 > `--online` も同様に無関係である (開くべき閉鎖が存在しない)。
-> 課金はローカル単価 0 として記帳されるため device cap の扱いも変わらない。
+> ローカル処理は課金台帳にゼロ単価の行を作成しない。処理の provenance は各 `.kio` に保持し、device cap を消費しない。
 >
 > **本節の残りの規範は execution_mode に依らず適用する** — profile_hash 不一致
 > (INCOMPAT)・`embedding_in_flight`・`embedding_contract_violation`・
@@ -380,9 +380,9 @@ first-parent walk:     100,000 commits / 10,000,000 total tree entries /
 `--all-history` / `--since` の scope は candidate/alias を部分返却せず
 `KIO-E-COMMIT-HISTORY-LIMIT-001` (`excluded_scopes[].reason=history_limit_exceeded`) で失敗し、既存の
 multi-scope partial 規則に従う (部分 = exit 3、全 scope 失敗 = §1.8 の昇格・retryability 分割 —
-同一 code 全滅は当該 code の単独時 exit、混在は retryable 理由を含めば 3・全て permanent なら 4)。purge-by-path は all-parent cap、restore-by-path は
+同一 code 全滅は当該 code の単独時 exit、混在は retryable 理由を含めば 3・全て permanent なら 4)。purge-by-path は all-parent cap、export-by-path は
 first-parent cap を同じ error code で fail-before-mutation/publication する。raw-hash purge と explicit
-commit/evidence restore は ancestry walk を必要としない。
+commit/evidence export は ancestry walk を必要としない。
 
 過去 snapshot の embedding 再生成は別操作 (`kio reindex --at`)。
 
@@ -1084,7 +1084,7 @@ commit は CAS JSON object であり SQLite に commit 表は存在しないた�
 検証 (publication 時の loader)** である。値域 (JSON Schema enum 相当):
 
 ```text
-commit_type ∈ { 'manual', 'auto', 'repaired', 'purged' }
+commit_type ∈ { 'manual', 'auto', 'repaired', 'purged', 'restored' }
 ```
 
 | type | 用途 | protected | GC policy |
@@ -1093,6 +1093,7 @@ commit_type ∈ { 'manual', 'auto', 'repaired', 'purged' }
 | auto | 自動 snapshot (取り込み完了時 = MVP / 定期 = Phase 4、§8) | false | shallow (個数 / 時間で tree を減衰) |
 | repaired | repair 操作の中間 commit | false | shallow |
 | purged | 法務・秘匿削除後の commit | true | none |
+| restored | 過去の内容を現在 HEAD の子として復元 | true | none |
 
 current reader は上記以外を拒否し、legacy enum の読取りや変換を行わない。
 
@@ -1106,6 +1107,7 @@ gc_policy(commit_type):
   repaired  → shallow
   manual    → none
   purged    → none
+  restored  → none
 ```
 
 **full (commit object の削除) はどの commit_type にも適用しない。** commit object は append-only であり、これを消す操作は Kio に存在しない (purge も commit / tree を書き換えない、§3.5)。
@@ -1126,12 +1128,14 @@ unknown field、filename/hash/tree/time不一致、symlink/reparse、非regular�
 ```text
 - メタ情報 (commit_hash, parents, message, timestamp, commit_type) は表示
 - tree は "shallow: tree discarded" と表示
-- kio restore <shallow-commit> は KIO-E-COMMIT-SHALLOW-001 で拒否
+- kio export <shallow-commit> は KIO-E-COMMIT-SHALLOW-001 で拒否
 - kio diff <a> <b> で片方が shallow なら全ファイル差分は不能と明示
 - kio search --at <shallow-commit> と、shallow 化 commit を snapshot とする
   cursor の再計算も KIO-E-COMMIT-SHALLOW-001 で失敗する (tree 全体を要するため)
-- shallow commit を指す Evidence Pointer の解決は失敗しない
-  (raw_hash / chunk_hash による直接解決、08-evidence-pointer-spec.md §3.1)
+- receipt により正当化された tree 欠落を指す Evidence Pointer の本文解決 (`kio open` / `kio view`) は
+  `KIO-E-COMMIT-SHALLOW-001` で拒否する。raw_hash / chunk_hash による tree membership の代替や HEAD
+  fallback は行わない。tree を backup から復元してから再実行する。本文を返さない `kio evidence verify`
+  の shallow 観測は [08-evidence-pointer-spec.md §4.3](08-evidence-pointer-spec.md) の別セマンティクスに従う。
 ```
 
 ## 2.3 GC スケジューリング
@@ -1159,8 +1163,8 @@ idle_threshold_seconds = 300
 
 ## 2.4 Tiered Retention
 
-`commit_type=auto` のみ tiered retention を適用する。retention 満了は **shallow 化 (tree 破棄)** であり commit object の削除ではない (`manual` / `purged` は tree も常に残す)。`repaired` は `[gc.derived_retention]` に従う — branch ごとに最新 `keep_repaired_per_branch` 個の tree を保持し、超過分を shallow 化する (ref tip は除外・tiered retention (auto) とは別系統)。
-**ref tip 除外**: HEAD・branch・tag が指す commit の tree は、retention 満了でも **shallow 化の対象にしない** — 無変更 scope では auto snapshot が no-op を続け HEAD が古い auto commit に留まり続けるため、除外しないと現在状態の基点 (bare search / restore / cursor) を失う。物理削除の直前にも、ref tip 非該当と「非 shallow commit からの参照ゼロ」を同一 exclusive critical section で再検証する (§2.5):
+`commit_type=auto` のみ tiered retention を適用する。retention 満了は **shallow 化 (tree 破棄)** であり commit object の削除ではない (`manual` / `purged` は tree も常に残す)。`repaired` は `[gc.derived_retention]` に従う — 単一 HEAD の到達履歴で最新 `keep_repaired` 個の tree を保持し、超過分を shallow 化する (ref tip は除外・tiered retention (auto) とは別系統)。
+**ref tip 除外**: HEAD・tag が指す commit の tree は、retention 満了でも **shallow 化の対象にしない** — 無変更 scope では auto snapshot が no-op を続け HEAD が古い auto commit に留まり続けるため、除外しないと現在状態の基点 (bare search / export / cursor) を失う。物理削除の直前にも、ref tip 非該当と「非 shallow commit からの参照ゼロ」を同一 exclusive critical section で再検証する (§2.5):
 
 ```toml
 [gc.auto_retention]
@@ -1169,8 +1173,10 @@ keep_hourly_days   = 7
 keep_daily_weeks   = 4
 keep_weekly_months = 6
 [gc.derived_retention]
-keep_repaired_per_branch = 5
+keep_repaired = 5
 ```
+
+HEAD から到達しない `repaired` は `repaired_outside_head` として保持する。旧キー `keep_repaired_per_branch` は schema error とし、alias や暗黙の既定値への置換は行わない。
 
 ## 2.5 並行性 / power-loss 安全性
 
@@ -1191,7 +1197,7 @@ keep_repaired_per_branch = 5
 - tree/marker の隔離・退役名は `.kio/gc/internal/` 配下の operation-reserved namespace とする。
   retained descriptor、nofollow、no-replace exchange、identity/hash/single-link の再検証で、隔離前および
   検出可能な隔離後の差替えは fail-closed にする。POSIX の最終 pathname unlink には inode 条件を付与
-  できないため、検証直後の reserved name へ第三者が直接書き込む残余窓は §3.5 の restore 隔離と同じく
+  できないため、検証直後の reserved name へ第三者が直接書き込む残余窓は §3.5 の export 隔離と同じく
   保護契約外とする。この例外は public CAS path、scope/fanout directory、receipt/marker public name、
   hardlink、または unlink 後の retained handle に対する検証を緩めない
 - **generation 採番の順序**: sweep は**最初の tree 物理削除に先立ち** `index_generation` を新規採番・
@@ -1487,7 +1493,7 @@ phase 順序    = prepared (closure 確定・記帳)
               (各 phase は再実行安全 — planned_commit を journal から publish するため同一 hash を
               再現でき、時刻の再計算をしない)。journal が active な間の fsck は incomplete (exit 3 —
               [10-operations.md §7.5.1](10-operations.md))。**読み取り系 (status を除く §6 の全読取
-              コマンド — search / log / view / inspect / evidence verify / restore / diff / open) は、
+              コマンド — search / log / view / inspect / evidence verify / export / diff / open) は、
               冒頭と「本文・存在情報を返す直前」の 2 点で検査する: 「active journal の不在 **かつ**
               `.kio/purge/epoch` (単調カウンタ) が開始時と不変」でなければ `KIO-E-PURGE-JOURNAL-ACTIVE-001`
               ([10-operations.md §11.1](10-operations.md)) retryable (exit 3) で拒否する** (2 点目で検出した場合は取得済み結果を破棄する。
@@ -1502,13 +1508,13 @@ phase 順序    = prepared (closure 確定・記帳)
               再検査 (journal / purge epoch / **lifecycle counter** の 3 点 — 順序と比較対象は
               [10-operations.md §3](10-operations.md) の固定順) がこれを閉じる。`kio status` だけは拒否せず、active journal の存在を状態として
               表示する (クラッシュした purge の回復可視性のため。status は本文を返さない)。
-              不可逆な外部副作用を持つ 2 系は検査位置を固定する: restore は private temp へ展開し
+              不可逆な外部副作用を持つ 2 系は検査位置を固定する: export は private temp へ展開し
               返却直前検査の後に atomic rename で --to へ publish (検出時は temp を削除)。**出力名・上書き
-              対象名が `.kio-restore-bak` / `.kio-restore-quarantine` で終わる場合は mutation 前に明示
+              対象名が `.kio-export-bak` / `.kio-export-quarantine` で終わる場合は mutation 前に明示
               拒否する** (commit 展開では全出力 path を publish 前に検査。退避・隔離名前空間の予約 —
-              残存退避を正規対象として再退避・cleanup すると先行 restore の回復コピーを失う。真にその名の
-              ファイルを復元する場合は改名復元を案内)。**出力先の退避名 `<basename>.kio-restore-bak`・隔離名 `<basename>.kio-restore-quarantine`
-              に同名ファイルが既に存在する場合は、--force の有無・宛先の存否に関わらず先行 restore の
+              残存退避を正規対象として再退避・cleanup すると先行 export の回復コピーを失う。真にその名の
+              ファイルを復元する場合は改名復元を案内)。**出力先の退避名 `<basename>.kio-export-bak`・隔離名 `<basename>.kio-export-quarantine`
+              に同名ファイルが既に存在する場合は、--force の有無・宛先の存否に関わらず先行 export の
               未完残存として mutation 前に拒否し、回復手順 (内容確認の上での手動復帰または削除) を
               案内する** (bak / quarantine とも出力 path ごとの mutation 前検査 — --force 限定にすると
               先行 crash で宛先が消えた後の非 --force 再実行が stale 退避を素通しする) (crash 残存の隔離物が purge 済み
@@ -1519,18 +1525,18 @@ phase 順序    = prepared (closure 確定・記帳)
               競合検出時は無変更で失敗する** (非 --force = preflight の不存在判定後に現れた第三者ファイルを
               無断置換しない。--force = 下記の退避が destination を空けた直後に現れた第三者ファイルを
               置換しない — この競合時は退避を元 path へ復帰 (下記の隔離検証方式) して終端する。意図的置換は
-              退避 rename だけが担う。restore の競合終端は全て **KIO-E-COMMIT-RESTORE-CONFLICT-001
+              退避 rename だけが担う。export の競合終端は全て **KIO-E-COMMIT-EXPORT-CONFLICT-001
               (retryable exit 3 — context に閉 enum `conflict_kind` (publish_race /
-              quarantine_rename_race / quarantine_mismatch / backup_mismatch / restore_rename_race /
+              quarantine_rename_race / quarantine_mismatch / backup_mismatch / export_rename_race /
               stale_backup / stale_quarantine) と `retry_disposition` (**transient = publish_race のみ** —
               transient は「次回 preflight を妨げる残存物を作らない競合」に限る。他は全て manual_action。
               自動再試行が安全なのは transient のみ)、および両者の所在)**)。**--force 上書き時は publish の rename に先立ち、既存
-              ファイルを同一 directory 内の退避名 `<basename>.kio-restore-bak` へ no-replace rename で
+              ファイルを同一 directory 内の退避名 `<basename>.kio-export-bak` へ no-replace rename で
               保全し、退避名を stderr に表示して退避の dev/inode を記録する** (置換 rename は旧内容を破壊
               するため、保全なしには下記の巻き戻しが原状回復にならない。**同名の退避が既に存在する場合は
-              先行 restore の未完残存として拒否し、回復手順 (退避の手動復帰または削除) を案内する** —
+              先行 export の未完残存として拒否し、回復手順 (退避の手動復帰または削除) を案内する** —
               残存退避はユーザー領域のファイルであり Kio は自動削除しない。crash で退避だけが残っても、
-              次回の同 path への --force restore がこの拒否で検出・案内する)。**restore はさらに rename
+              次回の同 path への --force export がこの拒否で検出・案内する)。**export はさらに rename
               完了後に同 3 点を再検査し、変化を検出したら対象 raw の canonical 状態
               ([08-evidence-pointer-spec.md §3.1](08-evidence-pointer-spec.md) 手順 5) を
               再解決する — 対象が alive のまま (無関係な lifecycle 変化) なら publish を維持して成功。
@@ -1538,7 +1544,7 @@ phase 順序    = prepared (closure 確定・記帳)
               KIO-E-PURGE-JOURNAL-ACTIVE-001 (retryable exit 3) で終端する (返却直前検査の fail-closed と
               対称 — purge 意図の耐久化以後は提供しない)。対象の purge が完遂していた場合は巻き戻す:
               **publish 済みファイルは unlink せず、同一 directory 内の決定的隔離名
-              `<basename>.kio-restore-quarantine` への no-replace rename で隔離し (隔離名は stderr に
+              `<basename>.kio-export-quarantine` への no-replace rename で隔離し (隔離名は stderr に
               表示)、rename した実体を fstat の dev/inode 対照で自らの publish と検証する** (対照→削除の
               2 操作では対照後の置換窓が残るため、rename した実体の上で検証する。一致 = 隔離分を削除
               (**削除は pathname に対する操作であり、fstat〜削除間の隔離名への第三者置換は検出できない —
@@ -1556,8 +1562,8 @@ phase 順序    = prepared (closure 確定・記帳)
               巻き戻し・退避処置とも) の no-replace 失敗 = preflight 後に隔離名へ現れた第三者ファイル —
               双方不触で終端 (quarantine_rename_race)** / 隔離実体の対照不一致 =
               復帰を試みて終端 / 退避の対照不一致・復帰 rename の no-replace 失敗 = 不触で終端。いずれも
-              両者の所在 (隔離名・退避名を含む) を表示して RESTORE-CONFLICT で終端する — 窓内の第三者
-              置換を消さない。crash で隔離だけが残っても、次回の同 path への restore が同名残存の拒否で
+              両者の所在 (隔離名・退避名を含む) を表示して EXPORT-CONFLICT で終端する — 窓内の第三者
+              置換を消さない。crash で隔離だけが残っても、次回の同 path への export が同名残存の拒否で
               検出・案内する。巻き戻しにより publish の事後取消が --force 上書きを含めて成立 —
               lock 非取得のまま残余窓を閉じる。purge closure を Kio 自身が破らない)。open は
               OS アプリ起動の直前 (一時展開の cache publish 後) に再検査する (起動後は取消不能 —
@@ -1629,12 +1635,12 @@ resurrection link・同一 marker 自身の lifecycle 管理 (retired / 再 eras
 
 **制約 (明記)**: tree entry の `path` 文字列と `raw_hash` は履歴に残る。ファイル名そのものが秘匿対象であるケース (履歴書き換えが必要) は current purge の対応範囲外である。
 
-# 4. Restore / Time-travel
+# 4. Export / Time-travel
 
-## 4.1 Restore
+## 4.1 Export
 
 ```bash
-kio restore <evidence|path|commit> --to <dir>
+kio export <evidence|path|commit> --to <dir>
 ```
 
 **安全要件**:
@@ -1644,26 +1650,26 @@ kio restore <evidence|path|commit> --to <dir>
   配下 (`.kio` 含む) の場合は KIO-E-CONFIG-USAGE-001 (exit 2) で拒否** — `--to .` による禁止の迂回を
   許さない。canonical 解決は §1.8 の canonical root_path 算出規則と同一 (realpath 含む) を --to と
   scope root の双方に適用する)
-- **全出力 path について、退避 (`<basename>.kio-restore-bak`) / 隔離 (`<basename>.kio-restore-quarantine`)
-  の同名残存を --force の有無・宛先の存否に関わらず mutation 前に検査し、残存 = 先行 restore の
+- **全出力 path について、退避 (`<basename>.kio-export-bak`) / 隔離 (`<basename>.kio-export-quarantine`)
+  の同名残存を --force の有無・宛先の存否に関わらず mutation 前に検査し、残存 = 先行 export の
   未完として拒否 + 回復案内する** (正本 §3.5 — --force 文脈に限定しない)
 - 既存ファイル上書きは --force 必須 + 確認プロンプト
-- --force 上書きは旧ファイルを同 directory の退避名 `<basename>.kio-restore-bak` へ no-replace で
+- --force 上書きは旧ファイルを同 directory の退避名 `<basename>.kio-export-bak` へ no-replace で
   保全 (同名残存 = 先行未完として拒否 + 回復案内。退避名は stderr に表示・dev/inode を記録) して
   から publish し、rename 後再検査の purge / erase / journal 終端時のみ原状復帰する (対象 alive の
   無関係変化は publish 維持 — §3.5。成功時に退避を除去)
 - publish (--force 含む)・隔離・復帰の rename は全て no-replace。巻き戻しの削除も退避の復帰・
-  除去も、path 上の対照ではなく決定的隔離名 `<basename>.kio-restore-quarantine` への隔離 rename +
+  除去も、path 上の対照ではなく決定的隔離名 `<basename>.kio-export-quarantine` への隔離 rename +
   rename した実体の dev/inode 検証で行う (隔離名は stderr に表示。同名残存 = 先行未完として拒否 +
   回復案内。隔離・退避はユーザー領域 — 04 §1.1 の temp 掃除の対象外、Kio は自動削除しない)
 - 競合処置は段階別 (--force publish 競合 = 退避を復帰 / 隔離実体の不一致 = 元 path へ復帰を試行 /
   退避の不一致・復帰 rename 失敗 = 不触) — いずれも両所在を表示して
-  KIO-E-COMMIT-RESTORE-CONFLICT-001 (retryable exit 3、context に conflict_kind・retry_disposition)
+  KIO-E-COMMIT-EXPORT-CONFLICT-001 (retryable exit 3、context に conflict_kind・retry_disposition)
   で終端 (§3.5)
-- 出力名・上書き対象名が `.kio-restore-bak` / `.kio-restore-quarantine` で終わる場合は展開前に
+- 出力名・上書き対象名が `.kio-export-bak` / `.kio-export-quarantine` で終わる場合は展開前に
   明示拒否 (退避・隔離名前空間の予約 — 改名復元を案内)
-- restore は raw object をそのまま展開 (再 Markdownize しない)
-- shallow commit からの restore は KIO-E-COMMIT-SHALLOW-001
+- export は raw object をそのまま展開 (再 Markdownize しない)
+- shallow commit からの export は KIO-E-COMMIT-SHALLOW-001
 - purged 対象は KIO-E-PURGE-NOT-FOUND-001 / tombstone
 - 展開は検証済み --to ディレクトリの dirfd 配下で no-follow (symlink を辿らない) に行い、
   private temp → atomic rename で publish する。**containment 判定と展開の同一実体束縛**: --to を
@@ -1723,11 +1729,11 @@ kio batch resume / kio batch retry / kio batch abandon / kio reindex /
 kio adapter revoke
 ```
 
-承認系の scope.json 更新 — 承認操作 (対話 / `--approve` の行 publish)・approval self-heal・
-`kio adapter revoke` — は、いずれも上記 lock 下の locked mutation として直列化する
-(並行する approve × revoke の lost update を作らない — [07-adapter-spec.md §3](07-adapter-spec.md))。
-承認 publish 直前の CAS 再検証の不一致は `KIO-E-ADAPTER-APPROVAL-CONFLICT-001` (exit 5 —
-並行 revoke による pending 除去、再承認が必要。[07-adapter-spec.md §3](07-adapter-spec.md)) で終端する。
+承認系の scope.json 更新 — 承認操作（対話 / `--approve` の行 publish）、approval_pending の記録、
+`kio adapter revoke` — は、いずれも retained store lock と束縛済み metadata handle を使う
+locked mutation として直列化する。atomic rename は publication であり CAS ではない。並行する
+approve × revoke の比較不一致は `KIO-E-ADAPTER-APPROVAL-CONFLICT-001` (exit 5) で終端し、
+fresh な明示承認を要する。[07-adapter-spec.md §3](07-adapter-spec.md)
 
 batch 系と reindex は外部副作用 (upload / job 作成) と batch_requests の状態遷移を伴うため lock 必須
 ([04-pipeline.md §5.8](04-pipeline.md) — 並行 resume が同一行へ別 intent_token を書くと先行 job が
@@ -1735,7 +1741,7 @@ batch 系と reindex は外部副作用 (upload / job 作成) と batch_requests
 
 規約:
 
-- 読み取り系 (search / log / view / open / inspect / evidence verify / restore / status / diff) は `.kio/.lock` を取得しない。`kio index` と `kio search` の同時実行は許容する。検索は `.kio/index/sqlite.db` の WAL snapshot を読まず、公開済み `aggregator.sqlite` の projection だけを読む。`index_status.budget_paused` の月次 cap 観測は、1 search invocation につき device-global cost-ledger の owned read-only snapshot を command preflight で1個だけ作る。取得は既存の入力・mode 判定後、fresh vector / hybrid page 1 の writable ledger open・claim / reservation・query embedding 送信より前に完了する。同じ snapshot と取得時の UTC 集計月を response まで保持し、取得後の別 writer や同一 invocation による charge はその response の月次 cap 観測へ混ぜない。source main / `-wal` / `-shm` を NOFOLLOW・regular・single-link・identity・size・SHA で前後観測し、owner-private temp へ main と存在する WAL だけを複写して `READ_ONLY` + `query_only` で読む (SHM は複写しない)。全3 leaf absent のみ no-ledger / spent=0 とし、partial leaf・unsafe link / replacement・stable-copy integrity failure は `KIO-E-LEDGER-SNAPSHOT-UNSAFE-001` / exit 4、presence/hash drift・busy・retry exhaustion・temp/copy/open/query の不確定性は `KIO-E-LEDGER-SNAPSHOT-001` / exit 3 で stdout を返さず fail-closed する。これは開始と終了の一致を要求する stable-or-fail 観測であり、cross-file formal atomic snapshot の主張ではない。例外的に `kio search` は final consent check を通過した vector|hybrid の fresh page 1 に限り cost-ledger.sqlite の device 行 (`scope_id='device'`) への相 1 / stale 回収・剪定の書込を行う。claim 開始後の adapter failure で最終結果が text fallback になってもこの例外は維持される。一方、offline / profile incompatibility / final consent rejection による pre-attempt auto→text はこの書込を行わない。これも `.kio/.lock` の対象外である — device 行はどの scope にも属さず、直列化は cost-ledger 側の `BEGIN IMMEDIATE` Tx が担う ([04-pipeline.md §5.4](04-pipeline.md))
+- 読み取り系 (search / log / view / open / inspect / evidence verify / export / status / diff) は `.kio/.lock` を取得しない。`kio index` と `kio search` の同時実行は許容する。検索は `.kio/index/sqlite.db` の WAL snapshot を読まず、公開済み `aggregator.sqlite` の projection だけを読む。`index_status.budget_paused` の月次 cap 観測は、1 search invocation につき device-global cost-ledger の owned read-only snapshot を command preflight で1個だけ作る。取得は既存の入力・mode 判定後、fresh vector / hybrid page 1 の writable ledger open・claim / reservation・query embedding 送信より前に完了する。同じ snapshot と取得時の UTC 集計月を response まで保持し、取得後の別 writer や同一 invocation による charge はその response の月次 cap 観測へ混ぜない。source main / `-wal` / `-shm` を NOFOLLOW・regular・single-link・identity・size・SHA で前後観測し、owner-private temp へ main と存在する WAL だけを複写して `READ_ONLY` + `query_only` で読む (SHM は複写しない)。全3 leaf absent のみ no-ledger / spent=0 とし、partial leaf・unsafe link / replacement・stable-copy integrity failure は `KIO-E-LEDGER-SNAPSHOT-UNSAFE-001` / exit 4、presence/hash drift・busy・retry exhaustion・temp/copy/open/query の不確定性は `KIO-E-LEDGER-SNAPSHOT-001` / exit 3 で stdout を返さず fail-closed する。これは開始と終了の一致を要求する stable-or-fail 観測であり、cross-file formal atomic snapshot の主張ではない。例外的に `kio search` は final consent check を通過した vector|hybrid の fresh page 1 に限り cost-ledger.sqlite の device 行 (`scope_id='device'`) への相 1 / stale 回収・剪定の書込を行う。claim 開始後の adapter failure で最終結果が text fallback になってもこの例外は維持される。一方、offline / profile incompatibility / final consent rejection による pre-attempt auto→text はこの書込を行わない。これも `.kio/.lock` の対象外である — device 行はどの scope にも属さず、直列化は cost-ledger 側の `BEGIN IMMEDIATE` Tx が担う ([04-pipeline.md §5.4](04-pipeline.md))
 - `.kio/.lock` を取得できない場合、書き込み系コマンドは**待機せず即座に失敗する**: error code `KIO-E-STORE-LOCKED-001`、exit code 3 (retryable、[06-cli-spec.md §7](06-cli-spec.md))。lock ファイルには保持プロセスの pid と取得時刻を記録し、保持プロセスが存在しない stale lock は次の取得試行時に回収してよい。Unixでは acquire/reclaim/release 全体を crash-release される directory `flock` でも直列化し、release はcheck-then-unlinkでなくdead canonical sentinelとのatomic exchangeを使う。このため非保持時にもdead sentinel leafが残り得るが、次writerが同じgate下で回収し、単なる`.lock`存在だけをlive判定に使わない。
 - refs (refs/heads/main, refs/tags-v1/*) の更新は `.kio/.lock` 保持下で、temp file 書き込み + atomic rename により行う (部分書き込みを外部に見せない)
 - `kio repair verify-objects` の raw object 復旧と repaired commit publication も、同じ lock の下で private temp + hash 再検証 + atomic publish を使う

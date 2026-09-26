@@ -69,6 +69,7 @@ pub enum PersonaAttestError {
 pub struct PersonaFilesystemAttestation {
     pub schema: String,
     pub root: String,
+    #[serde(with = "kio_core::identity_serde::u64_hex")]
     pub filesystem_device: u64,
     pub fixture_id: String,
     pub profile: PersonaProfile,
@@ -628,6 +629,58 @@ fn run_before_publish_hook(_: &Path) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_device_jcs_preserves_all_bits() {
+        for value in [(1_u64 << 53) + 1, 9_851_624_185_183_609, u64::MAX] {
+            let mut report = PersonaFilesystemAttestation {
+                schema: REPORT_SCHEMA.into(),
+                root: "/fixture".into(),
+                filesystem_device: value,
+                fixture_id: "fixture".into(),
+                profile: PersonaProfile::Tiny,
+                plan_digest: "0".repeat(64),
+                materialization_sha256: "0".repeat(64),
+                materialization_bytes: 1,
+                plan_sha256: "0".repeat(64),
+                plan_bytes: 1,
+                schedule_sha256: "0".repeat(64),
+                schedule_bytes: 1,
+                render_sha256: "0".repeat(64),
+                render_bytes: 1,
+                directory_merkle_sha256: "0".repeat(64),
+                entries: 1,
+                files: 1,
+                directories: 1,
+                bytes: 1,
+                claims: AttestationClaims {
+                    actual_kio_evidence: false,
+                    history_ready: false,
+                },
+            };
+            let bytes = canonical_report_bytes(&report).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<PersonaFilesystemAttestation>(&bytes).unwrap(),
+                report
+            );
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["filesystem_device"], format!("{value:016x}"));
+            report.filesystem_device -= 1;
+            assert_ne!(canonical_report_bytes(&report).unwrap(), bytes);
+            for invalid in [
+                serde_json::json!(value),
+                serde_json::json!("FFFFFFFFFFFFFFFF"),
+                serde_json::json!("1"),
+            ] {
+                let mut invalid_report = json.clone();
+                invalid_report["filesystem_device"] = invalid;
+                assert!(
+                    serde_json::from_value::<PersonaFilesystemAttestation>(invalid_report).is_err()
+                );
+            }
+        }
+    }
+
     use crate::{
         persona_materialize::{MaterializeRequest, materialize},
         persona_plan::PersonaProfile,

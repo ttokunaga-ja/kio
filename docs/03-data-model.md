@@ -169,6 +169,7 @@ manifest schema:
       "unit_type": "page",
       "status": "done",
       "prepared_hash": "sha256:...",
+      "preparation_profile_hash": "sha256:...",
       "unit_object_hash": "sha256:...",
       "error_kind": null
     },
@@ -179,6 +180,7 @@ manifest schema:
       "unit_type": "page",
       "status": "failed",
       "prepared_hash": "sha256:...",
+      "preparation_profile_hash": "sha256:...",
       "unit_object_hash": null,
       "error_kind": "invalid_input"
     }
@@ -195,10 +197,12 @@ manifest schema:
   "unit_type": "page",
   "raw_hash": "sha256:abc...",
   "prepared_hash": "sha256:...",
+  "preparation_profile_hash": "sha256:...",
   "tool_profile_hash": "sha256:tool1...",
   "gen": 0,
   "mode": "full",
   "markdown": "## 3.2 認証仕様\n...",
+  "owned_image_hashes": [],
   "metadata": {
     "page": 12,
     "bbox_annotations": []
@@ -214,6 +218,13 @@ manifest schema:
 ([04-pipeline.md §2.2](04-pipeline.md)) による再利用の provenance:
 `{ "raw_hash": "sha256:old...", "gen": 0, "unit_key": "page:11" }`。再利用時も新 instance 用の
 full NormalizedUnitObject を JCS CAS として確定する (per-.kio 重複容認、§9)。
+`owned_image_hashes` は、この unit の処理で取得・検証した画像の content hash を保持する必須配列である。
+重複のない昇順の SHA-256 hash を格納し、画像がなければ `[]` を明示する。通常の Markdown リンクは
+画像の所有関係を作らない。OCR Adapter は受け取った画像バイトから計算した hash だけを返し、Kio は
+単体画像の検証済み原本 hash を追加する。unchanged unit では従前の集合をそのまま引き継ぐ。
+画像の読み出し・送信・検索 projection は、現在の管理境界で許可される所有元をこの immutable field から
+検証する。本文や metadata に同じ hash を書いても所有関係は成立しない。field 欠落を空集合へ読み替える
+旧形式互換や暗黙の移行は行わない。
 `metadata` は current schema の **required object** であり、page/bbox/confidence と Step 4 の bounded
 `bbox_annotations` を保持する。内容が無い場合は空 object `{}` を明示する。field 全体の欠落を `{}` に
 読み替える旧 reader / default は置かず reject する。検索用 annotation block は同じ unit の `markdown` にも
@@ -225,6 +236,9 @@ full NormalizedUnitObject を JCS CAS として確定する (per-.kio 重複容�
   hash が一致しなければならない。`status=failed` entry は `unit_object_hash: null` を明示しなければならない**。
   field 欠落、done の null、failed の non-null は current schema violation として fail-closed にする。旧 shape を
   default / migration で読む経路は置かない。
+- **各 manifest entry の `preparation_profile_hash` は必須の SHA-256 identity** である。prepared bytes の
+  content address (`prepared_hash`) には混ぜず、unit 再利用と raw 不変時の gen 判定では両方を照合する。欠落・
+  不正 hash は current-schema corruption として fail-closed にし、旧 shape を読む default / migration は置かない。
 - path-named `<unit_ref>.json` は current loader がこの CAS object から再 materialize できる mutable working
   projection であり、履歴、`--at`、Evidence Pointer は決してこれや同 gen の「最新」body を読まない。
 - manifest の `units[].error_kind` は [04-pipeline.md §5.3](04-pipeline.md) の閉 enum (フリーテキストではない) —
@@ -636,13 +650,15 @@ mode                                   full | incremental
 status                                 pending | running | done | partial | failed
                                        (manifest の unit status から導出)
 changed_unit_keys                      incremental の対象 unit ([04-pipeline.md §5.1](04-pipeline.md) task にも記録)
-output_ref                             normalized instance ディレクトリ
+output_ref                             `normalized:<raw64>.<tool64>.g<gen>` (portable taskref。下記)
 fallback_reason                        capability_missing | threshold_exceeded | ...
                                        (task 側の運用データ、喪失許容)
 created_at / finished_at
 ```
 
-`normalized_path` は持たない。instance は `(raw_hash, tool_profile_hash, gen)` から一意に決まる。
+`normalized_path` は持たない。Markdownize task の `output_ref` は `normalized:<raw64>.<tool64>.g<gen>` だけであり、`<raw64>` は `input_hash`、`<tool64>` は `tool_profile_hash` の各 digest-only lowercase hex、`<gen>` は leading zero を許さない canonical decimal `u64` である。parser は input hash と raw digest の一致、両 digest、generation、完全な 1 表記を mutation 前に検証する。absolute / relative pathname、separator、末尾 slash を含む旧 pathref は互換読取りせず拒否する。runtime の instance directory はこの taskref から retained current `.kio/objects/normalized_units/` の下へ導出する。
+
+instance は `(raw_hash, tool_profile_hash, gen)` から一意に決まる。
 世代の親子関係は manifest の `parent_gen` で表現する (`parent_run_id` チェーンは永続化しない —
 喪失許容の運用データ、[04-pipeline.md §5.7](04-pipeline.md))。**incremental で親の raw が異なる場合
 (raw 更新をまたぐ通常 incremental) は `parent_instance = {raw_hash, tool_profile_hash, gen}` を必須で
@@ -801,10 +817,17 @@ entry では `normalize` を**省略**する (省略 = 当該ファイルの nor
 `commit_type` は固定 enum (詳細は [05-runtime.md §2](05-runtime.md)):
 
 ```
-manual | auto | repaired | purged
+manual | auto | repaired | purged | restored
 ```
 
 commit object の schema 検証 (publication 時の loader — [05-runtime.md §2.1](05-runtime.md)。commit は CAS JSON object であり SQLite に commit 表は無い) でこの値域だけを受理する。未知値は schema violation として拒否し、legacy reader や値変換は持たない。
+
+`restored` は現在 HEAD を唯一の `parent` とし、`restore_provenance` に
+`source_commit` と復元対象の `paths`（重複なし・昇順）を必須で保持する。
+過去の source は親参照ではない。`parent: null`、制御領域の path、および他の
+commit type に付いた restore provenance は拒否する。履歴の path 検証は OS 非依存とし、
+実際にファイルを作成するときに宛先 OS の名前制約を追加する。`restored` の tree は
+`manual` と同様に GC の保持対象である。
 
 ## 8.2 tree のスケール前提 (flat entries)
 

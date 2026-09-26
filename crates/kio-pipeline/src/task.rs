@@ -6,7 +6,6 @@ use std::io::{BufRead, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use cap_primitives::{ambient_authority, fs as cap_fs};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::markdownize::MarkdownizeMode;
@@ -27,11 +26,15 @@ const MAX_TASK_TIMESTAMP_BYTES: usize = 128;
 
 pub const BUDGET_EXCEEDED_REASON: &str = "budget_exceeded";
 pub const SECRETS_TIER_B_HOLD_REASON: &str = "secrets_tier_b_hold";
+pub const LEDGER_INITIALIZATION_REQUIRED_REASON: &str = "ledger_initialization_required";
 pub const RETIRED_NON_LIVE_REASON: &str = "retired_non_live";
+/// A synchronous provider call may have been billed but Kio cannot recover its
+/// result. It is terminal until an operator explicitly authorizes a fresh send.
+pub const RESULT_UNKNOWN_REASON: &str = "result_unknown";
 
 /// step4b-contract-tests-p3a.md QA1: the closed `hold_reason` enum for a
-/// `Paused` task (04 §5.2 L679-683: `hold_reason = budget | auth |
-/// tier_b_approval`), distinct from `fallback_reason`'s `RetryErrorKind`
+/// `Paused` task (`budget`, `auth`, `tier_b_approval`, or
+/// `ledger_initialization_required`), distinct from `fallback_reason`'s `RetryErrorKind`
 /// classification for `Failed` tasks.
 ///
 /// QA2/QA3 (step4b-contract-tests-p3a.md §A, 04 §5.2/§5.3, implemented): the
@@ -68,6 +71,7 @@ pub enum HoldReason {
     Budget,
     Auth,
     TierBApproval,
+    LedgerInitializationRequired,
 }
 
 impl HoldReason {
@@ -77,6 +81,7 @@ impl HoldReason {
             Self::Budget => "budget",
             Self::Auth => "auth",
             Self::TierBApproval => "tier_b_approval",
+            Self::LedgerInitializationRequired => "ledger_initialization_required",
         }
     }
 }
@@ -91,6 +96,7 @@ pub fn hold_reason_for_reason(reason: &str) -> Option<HoldReason> {
         BUDGET_EXCEEDED_REASON => Some(HoldReason::Budget),
         SECRETS_TIER_B_HOLD_REASON => Some(HoldReason::TierBApproval),
         "auth_error" => Some(HoldReason::Auth),
+        LEDGER_INITIALIZATION_REQUIRED_REASON => Some(HoldReason::LedgerInitializationRequired),
         _ => None,
     }
 }
@@ -260,6 +266,18 @@ pub enum TaskOutputRef {
     },
 }
 
+/// Canonical portable reference for a normalized instance. It never embeds a
+/// filesystem path; callers derive the operational path from retained `.kio`.
+pub fn normalized_task_output_ref(raw_hash: &str, tool_profile_hash: &str, r#gen: u64) -> String {
+    let raw = raw_hash
+        .strip_prefix("sha256:")
+        .expect("validated raw hash");
+    let tool = tool_profile_hash
+        .strip_prefix("sha256:")
+        .expect("validated tool hash");
+    format!("normalized:{raw}.{tool}.g{gen}")
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CappedTaskInput {
     Bytes(Vec<u8>),
@@ -282,9 +300,13 @@ pub enum RetryErrorKind {
     NetworkError,
     RateLimit,
     AuthError,
+    LocalPeerAuth,
+    LocalPeerConfig,
     QuotaExceeded,
     InvalidInput,
     ContractViolation,
+    /// A sync provider result may have been billed but cannot be recovered.
+    ResultUnknown,
     BudgetExceeded,
 }
 
@@ -334,16 +356,55 @@ impl TaskStore {
     }
 
     pub fn all(&self) -> Result<Vec<TaskDescriptor>> {
-        let file = match fs::File::open(&self.path) {
-            Ok(file) => file,
+        // Retain the existing store before opening the journal. In particular,
+        // a replaced or symlinked tasks.jsonl must not redirect this reader.
+        let root = self.kio_dir();
+        let listed = match fs::symlink_metadata(root) {
+            Ok(metadata) => metadata,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(err) => {
-                return Err(PipelineError::Io {
-                    path: self.path.display().to_string(),
-                    message: err.to_string(),
-                });
-            }
+            Err(err) => return Err(err).pipeline_io(root),
         };
+        if !listed.file_type().is_dir() {
+            return Err(PipelineError::corrupt(
+                self.path.display().to_string(),
+                "task store root is not a real directory",
+            ));
+        }
+        #[cfg(windows)]
+        let expected = kio_core::cas::windows_real_directory_identity(root).pipeline_io(root)?;
+        let canonical = root.canonicalize().pipeline_io(root)?;
+        let retained = kio_core::store_dir::StoreDirectory::open(&canonical).map_err(|error| {
+            PipelineError::corrupt(self.path.display().to_string(), error.to_string())
+        })?;
+        #[cfg(unix)]
+        let identity_matches = {
+            use std::os::unix::fs::MetadataExt;
+            let opened = retained.root_handle().metadata().pipeline_io(root)?;
+            listed.dev() == opened.dev() && listed.ino() == opened.ino()
+        };
+        #[cfg(windows)]
+        let identity_matches = expected.is_some()
+            && kio_core::cas::windows_directory_handle_identity(&retained.root_handle())
+                == expected;
+        #[cfg(not(any(unix, windows)))]
+        let identity_matches = false;
+        if !identity_matches {
+            return Err(PipelineError::corrupt(
+                self.path.display().to_string(),
+                "task store root changed while opening",
+            ));
+        }
+        let leaf = Path::new("tasks.jsonl");
+        if !retained.contains_entry(leaf).map_err(|error| {
+            PipelineError::corrupt(self.path.display().to_string(), error.to_string())
+        })? {
+            return Ok(Vec::new());
+        }
+        let file = retained
+            .open_regular_read(leaf, MAX_TASK_STORE_BYTES)
+            .map_err(|error| {
+                PipelineError::corrupt(self.path.display().to_string(), error.to_string())
+            })?;
         self.read_descriptors(file, |descriptor| {
             validate_task_descriptor(self.kio_dir(), descriptor)
         })
@@ -541,366 +602,6 @@ impl TaskStore {
     }
 }
 
-/// Rebase normalized-instance task references after a private task-store copy.
-///
-/// `source_kio` is an already-canonical, lexical source identity; it is never
-/// opened. The destination store is read only after a bounded, no-follow store
-/// path check. If its task journal is absent, this is a no-op and does not
-/// create one.
-pub fn rebase_normalized_output_refs_for_relocated_store(
-    source_kio: &Path,
-    destination_kio: &Path,
-) -> Result<()> {
-    let destination_store = TaskStore::new(destination_kio);
-    // Retain this descriptor through the complete read/validate/replace
-    // sequence. A same-UID actor can rename the public `.kio` pathname after
-    // validation; resolving the journal through that pathname again would
-    // otherwise target a different store.
-    let destination_dir = open_checked_store_dir(destination_kio)?;
-    let task_name = Path::new("tasks.jsonl");
-    let listed = match cap_fs::stat(&destination_dir, task_name, cap_fs::FollowSymlinks::No) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error).pipeline_io(&destination_store.path),
-    };
-    if !listed.file_type().is_file() {
-        return Err(PipelineError::corrupt(
-            destination_store.path.display().to_string(),
-            "store object has an unexpected filesystem type",
-        ));
-    }
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let file =
-        cap_fs::open(&destination_dir, task_name, &options).pipeline_io(&destination_store.path)?;
-    let opened = cap_fs::Metadata::from_file(&file).pipeline_io(&destination_store.path)?;
-    if !opened.file_type().is_file() || !same_cap_file_identity(&listed, &opened) {
-        return Err(PipelineError::corrupt(
-            destination_store.path.display().to_string(),
-            "task journal changed while it was being opened",
-        ));
-    }
-    // Keep a descriptor for the post-read state check.  Reading by a clone
-    // shares the underlying immutable file identity without reopening its
-    // pathname.
-    let reader = file.try_clone().pipeline_io(&destination_store.path)?;
-    let mut tasks = destination_store.read_descriptors(reader, |descriptor| {
-        validate_task_descriptor_fields(destination_kio, descriptor)?;
-        let mut rebased = descriptor.clone();
-        rebase_task_output_ref(source_kio, destination_kio, &mut rebased)
-    })?;
-    let after_read = cap_fs::Metadata::from_file(&file).pipeline_io(&destination_store.path)?;
-    if !same_cap_file_state(&opened, &after_read) {
-        return Err(PipelineError::corrupt(
-            destination_store.path.display().to_string(),
-            "task journal changed while it was being read",
-        ));
-    }
-
-    for task in &mut tasks {
-        rebase_task_output_ref(source_kio, destination_kio, task)?;
-    }
-    replace_relocated_task_journal(&destination_dir, &destination_store, &opened, &tasks)
-}
-
-/// Bind the destination store once, without retaining its public pathname as
-/// authority for its children.
-fn open_checked_store_dir(destination_kio: &Path) -> Result<fs::File> {
-    let listed = fs::symlink_metadata(destination_kio).pipeline_io(destination_kio)?;
-    if listed.file_type().is_symlink() || !listed.file_type().is_dir() {
-        return Err(PipelineError::corrupt(
-            destination_kio.display().to_string(),
-            "Kio store root is not a real directory",
-        ));
-    }
-    // `std::os::windows::fs::MetadataExt` exposes the identity fields behind
-    // an unstable API on Rust 1.98. More importantly, metadata obtained by
-    // re-resolving this public path after opening it would not bind the
-    // directory handle we will use. Capture a real-directory identity before
-    // canonicalization and compare it with the opened handle below.
-    #[cfg(windows)]
-    let listed_identity = kio_core::cas::windows_real_directory_identity(destination_kio)
-        .pipeline_io(destination_kio)?
-        .ok_or_else(|| {
-            PipelineError::corrupt(
-                destination_kio.display().to_string(),
-                "Kio store root is not a real directory",
-            )
-        })?;
-    let canonical = destination_kio
-        .canonicalize()
-        .pipeline_io(destination_kio)?;
-    let directory =
-        cap_fs::open_ambient_dir(&canonical, ambient_authority()).pipeline_io(destination_kio)?;
-    let opened = cap_fs::Metadata::from_file(&directory).pipeline_io(destination_kio)?;
-    #[cfg(windows)]
-    let identity_matches =
-        kio_core::cas::windows_directory_handle_identity(&directory) == Some(listed_identity);
-    #[cfg(not(windows))]
-    let identity_matches = same_store_directory_identity(&listed, &opened);
-    if !opened.file_type().is_dir() || !identity_matches {
-        return Err(PipelineError::corrupt(
-            destination_kio.display().to_string(),
-            "Kio store root changed while it was being opened",
-        ));
-    }
-    Ok(directory)
-}
-
-fn replace_relocated_task_journal(
-    destination_dir: &fs::File,
-    destination_store: &TaskStore,
-    expected_journal: &cap_fs::Metadata,
-    descriptors: &[TaskDescriptor],
-) -> Result<()> {
-    if descriptors.len() > MAX_TASK_RECORDS {
-        return Err(PipelineError::corrupt(
-            destination_store.path.display().to_string(),
-            format!("tasks.jsonl exceeds {MAX_TASK_RECORDS} record limit"),
-        ));
-    }
-    for descriptor in descriptors {
-        validate_task_descriptor(destination_store.kio_dir(), descriptor)?;
-    }
-    let (mut file, temporary_name) =
-        create_relocated_task_temp(destination_dir, destination_store)?;
-    let result = (|| -> Result<()> {
-        let mut total_bytes = 0u64;
-        for descriptor in descriptors {
-            let line = destination_store.framed_record(descriptor)?;
-            total_bytes = total_bytes.saturating_add(line.len() as u64);
-            if total_bytes > MAX_TASK_STORE_BYTES {
-                return Err(PipelineError::corrupt(
-                    destination_store.path.display().to_string(),
-                    format!("tasks.jsonl exceeds {MAX_TASK_STORE_BYTES} byte limit"),
-                ));
-            }
-            file.write_all(&line).pipeline_io(&destination_store.path)?;
-        }
-        file.sync_all().pipeline_io(&destination_store.path)?;
-        drop(file);
-        let current = cap_fs::stat(
-            destination_dir,
-            Path::new("tasks.jsonl"),
-            cap_fs::FollowSymlinks::No,
-        )
-        .pipeline_io(&destination_store.path)?;
-        if !current.file_type().is_file() || !same_cap_file_state(expected_journal, &current) {
-            return Err(PipelineError::corrupt(
-                destination_store.path.display().to_string(),
-                "task journal changed while it was being rebased",
-            ));
-        }
-        cap_fs::rename(
-            destination_dir,
-            Path::new(&temporary_name),
-            destination_dir,
-            Path::new("tasks.jsonl"),
-        )
-        .pipeline_io(&destination_store.path)?;
-        sync_relocated_task_directory(destination_dir, &destination_store.path)
-    })();
-    if result.is_err() {
-        let _ = cap_fs::remove_file(destination_dir, Path::new(&temporary_name));
-    }
-    result
-}
-
-// `open_ambient_dir` intentionally retains a capability-style directory
-// descriptor.  On Linux that can be an O_PATH descriptor, which is suitable
-// for capability-relative operations but cannot itself be synced.  Reopen the
-// already-bound directory through `.` and prove it is the same object before
-// using the real read-only descriptor for the durability barrier.
-#[cfg(unix)]
-fn sync_relocated_task_directory(destination_dir: &fs::File, label: &Path) -> Result<()> {
-    let expected = cap_fs::Metadata::from_file(destination_dir).pipeline_io(label)?;
-    if !expected.file_type().is_dir() {
-        return Err(PipelineError::corrupt(
-            label.display().to_string(),
-            "bound Kio store directory changed type",
-        ));
-    }
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let syncable = cap_fs::open(destination_dir, Path::new("."), &options).pipeline_io(label)?;
-    let observed = cap_fs::Metadata::from_file(&syncable).pipeline_io(label)?;
-    if !observed.file_type().is_dir() || !same_cap_file_identity(&expected, &observed) {
-        return Err(PipelineError::corrupt(
-            label.display().to_string(),
-            "bound Kio store directory changed while reopening for fsync",
-        ));
-    }
-    syncable.sync_all().pipeline_io(label)
-}
-
-// Windows cannot flush a directory handle: `FlushFileBuffers` requires access
-// that directory handles cannot have.  Preserve the fail-closed validation
-// half of the Unix operation by requiring the retained capability to identify
-// a real, non-reparse directory; the journal file itself was synced before its
-// rename above.  This intentionally makes no POSIX-style directory-durability
-// claim on Windows.
-#[cfg(windows)]
-fn sync_relocated_task_directory(destination_dir: &fs::File, label: &Path) -> Result<()> {
-    kio_core::cas::windows_directory_handle_identity(destination_dir).ok_or_else(|| {
-        PipelineError::corrupt(
-            label.display().to_string(),
-            "bound Kio store directory is not a real directory",
-        )
-    })?;
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn sync_relocated_task_directory(_destination_dir: &fs::File, label: &Path) -> Result<()> {
-    Err(PipelineError::corrupt(
-        label.display().to_string(),
-        "directory durability is unsupported on this platform",
-    ))
-}
-
-fn create_relocated_task_temp(
-    destination_dir: &fs::File,
-    destination_store: &TaskStore,
-) -> Result<(fs::File, String)> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    for _ in 0..8 {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|elapsed| elapsed.as_nanos())
-            .unwrap_or(0);
-        let sequence = SEQ.fetch_add(1, Ordering::Relaxed);
-        let name = format!(".tasks.jsonl.{}.{nanos}.{sequence}.tmp", std::process::id());
-        let mut options = cap_fs::OpenOptions::new();
-        options
-            .write(true)
-            .create_new(true)
-            ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-        match cap_fs::open(destination_dir, Path::new(&name), &options) {
-            Ok(file) => return Ok((file, name)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(error).pipeline_io(&destination_store.path),
-        }
-    }
-    Err(PipelineError::Io {
-        path: destination_store.path.display().to_string(),
-        message: "could not create a unique temp file for tasks.jsonl".to_owned(),
-    })
-}
-
-#[cfg(unix)]
-fn same_store_directory_identity(listed: &fs::Metadata, opened: &cap_fs::Metadata) -> bool {
-    use cap_fs::MetadataExt as CapMetadataExt;
-    use std::os::unix::fs::MetadataExt as StdMetadataExt;
-    listed.dev() == opened.dev() && listed.ino() == opened.ino()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_store_directory_identity(_listed: &fs::Metadata, opened: &cap_fs::Metadata) -> bool {
-    opened.file_type().is_dir()
-}
-
-#[cfg(unix)]
-fn same_cap_file_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(unix)]
-fn same_cap_file_state(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::MetadataExt;
-    same_cap_file_identity(left, right)
-        && left.len() == right.len()
-        && left.mtime() == right.mtime()
-        && left.mtime_nsec() == right.mtime_nsec()
-        && left.ctime() == right.ctime()
-        && left.ctime_nsec() == right.ctime_nsec()
-}
-
-#[cfg(not(unix))]
-fn same_cap_file_state(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    same_cap_file_identity(left, right) && left.len() == right.len()
-}
-
-#[cfg(windows)]
-fn same_cap_file_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::_WindowsByHandle;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_cap_file_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
-}
-
-fn rebase_task_output_ref(
-    source_kio: &Path,
-    destination_kio: &Path,
-    descriptor: &mut TaskDescriptor,
-) -> Result<()> {
-    if descriptor.output_ref.starts_with("online:")
-        || descriptor.output_ref.starts_with("offline:")
-        || descriptor.output_ref.starts_with("embedding:")
-    {
-        validate_task_output_ref(destination_kio, descriptor)?;
-        return Ok(());
-    }
-
-    if descriptor.task_type != TaskType::Markdownize {
-        return Err(invalid_output_ref(destination_kio, &descriptor.output_ref));
-    }
-    let source_root = source_kio.join("objects/normalized_units");
-    let persisted = Path::new(&descriptor.output_ref);
-    let relative = persisted
-        .strip_prefix(&source_root)
-        .map_err(|_| invalid_output_ref(destination_kio, &descriptor.output_ref))?;
-    let components = relative
-        .components()
-        .map(|component| match component {
-            Component::Normal(value) => value.to_str().map(str::to_owned),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-        .ok_or_else(|| invalid_output_ref(destination_kio, &descriptor.output_ref))?;
-    if components.len() != 3 {
-        return Err(invalid_output_ref(destination_kio, &descriptor.output_ref));
-    }
-    let digest = descriptor
-        .input_hash
-        .strip_prefix("sha256:")
-        .ok_or_else(|| invalid_output_ref(destination_kio, &descriptor.output_ref))?;
-    if components[0] != digest[0..2] || components[1] != digest[2..4] {
-        return Err(invalid_output_ref(destination_kio, &descriptor.output_ref));
-    }
-    let (tool_profile_hash, r#gen) =
-        parse_normalized_output_basename(&descriptor.input_hash, &components[2])
-            .ok_or_else(|| invalid_output_ref(destination_kio, &descriptor.output_ref))?;
-    let expected_source = crate::markdownize::normalized_instance_dir(
-        source_kio,
-        &descriptor.input_hash,
-        &tool_profile_hash,
-        r#gen,
-    );
-    if expected_source.to_str() != Some(descriptor.output_ref.as_str()) {
-        return Err(invalid_output_ref(destination_kio, &descriptor.output_ref));
-    }
-    descriptor.output_ref = crate::markdownize::normalized_instance_dir(
-        destination_kio,
-        &descriptor.input_hash,
-        &tool_profile_hash,
-        r#gen,
-    )
-    .to_str()
-    .ok_or_else(|| invalid_output_ref(destination_kio, &descriptor.output_ref))?
-    .to_owned();
-    validate_task_output_ref(destination_kio, descriptor)?;
-    Ok(())
-}
-
 /// Whether `input_path` names a direct child of the scope root: a single
 /// `Component::Normal` — not absolute, no path separator, no `.`/`..` traversal
 /// (03 §3.3). Rejects `""`, `/etc/hosts`, `../x`, `a/b`, `.`, `..` (P1).
@@ -913,21 +614,6 @@ pub fn is_scope_local_file_name(input_path: &str) -> bool {
     matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
-fn parse_normalized_output_basename(input_hash: &str, name: &str) -> Option<(String, u64)> {
-    let raw_digest = input_hash.strip_prefix("sha256:")?;
-    let canonical_suffix = name.strip_prefix(&format!("{raw_digest}."));
-    if let Some(suffix) = canonical_suffix {
-        let (tool_digest, gen_text) = suffix.rsplit_once(".g")?;
-        if is_lower_sha256_digest(tool_digest) && is_canonical_generation(gen_text) {
-            let r#gen = gen_text.parse::<u64>().ok()?;
-            return Some((format!("sha256:{tool_digest}"), r#gen));
-        }
-        return None;
-    }
-
-    None
-}
-
 fn is_lower_sha256_digest(value: &str) -> bool {
     value.len() == 64
         && value
@@ -937,6 +623,22 @@ fn is_lower_sha256_digest(value: &str) -> bool {
 
 fn is_canonical_generation(value: &str) -> bool {
     !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn parse_portable_normalized_ref(input_hash: &str, value: &str) -> Option<(String, u64)> {
+    let value = value.strip_prefix("normalized:")?;
+    let (raw, remainder) = value.split_once('.')?;
+    let (tool, generation) = remainder.rsplit_once(".g")?;
+    let expected_raw = input_hash.strip_prefix("sha256:")?;
+    if raw != expected_raw
+        || !is_lower_sha256_digest(raw)
+        || !is_lower_sha256_digest(tool)
+        || !is_canonical_generation(generation)
+        || (generation.len() > 1 && generation.starts_with('0'))
+    {
+        return None;
+    }
+    Some((format!("sha256:{tool}"), generation.parse().ok()?))
 }
 
 /// Validate and classify a persisted task output reference before any consumer
@@ -976,100 +678,33 @@ pub fn validate_task_output_ref(
         return Err(invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref));
     }
 
-    let persisted = Path::new(&descriptor.output_ref);
-    let has_parent_component = persisted
-        .components()
-        .any(|component| matches!(component, Component::ParentDir));
-    let has_current_component = persisted
-        .components()
-        .any(|component| matches!(component, Component::CurDir));
-    let has_prefix = persisted
-        .components()
-        .any(|component| matches!(component, Component::Prefix(_)));
-    let has_root = persisted
-        .components()
-        .any(|component| matches!(component, Component::RootDir));
-    // Descriptor-bound child indexing deliberately addresses the retained
-    // `.kio` directory as `.`. Its canonical normalized-instance spelling is
-    // therefore `./objects/...`; accept that one relative spelling only when
-    // the task store itself is descriptor-bound to `.`. Ordinary repositories
-    // still require an absolute canonical output reference, and `..` remains
-    // forbidden in every mode.
-    let bound_relative_root = kio_dir.as_ref() == Path::new(".");
-    if has_parent_component
-        || (has_current_component && !bound_relative_root)
-        || ((has_prefix || has_root) && !persisted.is_absolute())
+    let (tool_profile_hash, r#gen) =
+        parse_portable_normalized_ref(&descriptor.input_hash, &descriptor.output_ref)
+            .ok_or_else(|| invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref))?;
+    // A durable reference has one spelling independent of the owning store
+    // location. Only the validated identity is resolved beneath the live store.
+    if normalized_task_output_ref(&descriptor.input_hash, &tool_profile_hash, r#gen)
+        != descriptor.output_ref
     {
         return Err(invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref));
-    }
-    let current_dir = std::env::current_dir().map_err(|err| PipelineError::Io {
-        path: descriptor.output_ref.clone(),
-        message: err.to_string(),
-    })?;
-    let absolute = if persisted.is_absolute() {
-        persisted.to_path_buf()
-    } else {
-        current_dir.join(persisted)
-    };
-    let normalized_root = kio_dir.as_ref().join("objects/normalized_units");
-    let absolute_root = if normalized_root.is_absolute() {
-        normalized_root.clone()
-    } else {
-        current_dir.join(&normalized_root)
-    };
-    let relative = absolute
-        .strip_prefix(&absolute_root)
-        .map_err(|_| invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref))?;
-    let components = relative
-        .components()
-        .filter_map(|component| match component {
-            Component::Normal(value) => value.to_str().map(str::to_owned),
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    if components.len() != 3 {
-        return Err(invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref));
-    }
-    let digest = descriptor
-        .input_hash
-        .strip_prefix("sha256:")
-        .ok_or_else(|| invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref))?;
-    if components[0] != digest[0..2] || components[1] != digest[2..4] {
-        return Err(invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref));
-    }
-    let (tool_profile_hash, r#gen) =
-        parse_normalized_output_basename(&descriptor.input_hash, &components[2])
-            .ok_or_else(|| invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref))?;
-    // `output_ref` is a durable identity, not merely a path that resolves to
-    // the generated instance. Reconstruct its sole canonical spelling so
-    // aliases such as trailing separators, doubled separators, or cwd-relative
-    // paths cannot make a completed task invisible to `done_output_for`.
-    // Ordinary stores retain the exact absolute spelling as their durable
-    // identity. A descriptor-bound child deliberately persists the
-    // discovery-time canonical `.kio` path instead of its operational `.`
-    // path; the structural checks above prove that it names the same retained
-    // `objects/normalized_units` subtree, while comparing it to
-    // `normalized_instance_dir(".", ..)` would falsely reject it as an alias.
-    if !bound_relative_root {
-        let canonical = crate::markdownize::normalized_instance_dir(
-            kio_dir.as_ref(),
-            &descriptor.input_hash,
-            &tool_profile_hash,
-            r#gen,
-        );
-        if canonical.to_str() != Some(descriptor.output_ref.as_str()) {
-            return Err(invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref));
-        }
     }
 
     // Validate every existing component from `.kio` downward. In particular,
     // `normalized_units` cannot become a second trust root by being a symlink.
-    let store_relative = Path::new("objects").join("normalized_units").join(relative);
-    resolve_existing_store_path(kio_dir.as_ref(), &store_relative, StorePathKind::Directory)
+    let instance = crate::markdownize::normalized_instance_dir(
+        kio_dir.as_ref(),
+        &descriptor.input_hash,
+        &tool_profile_hash,
+        r#gen,
+    );
+    let store_relative = instance
+        .strip_prefix(kio_dir.as_ref())
+        .map_err(|_| invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref))?;
+    resolve_existing_store_path(kio_dir.as_ref(), store_relative, StorePathKind::Directory)
         .map_err(|_| invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref))?;
 
     Ok(TaskOutputRef::NormalizedInstance {
-        path: absolute,
+        path: instance,
         raw_hash: descriptor.input_hash.clone(),
         tool_profile_hash,
         r#gen,
@@ -1114,8 +749,11 @@ pub fn task_retry_kind(task: &TaskDescriptor) -> RetryErrorKind {
         Some("network_error") => RetryErrorKind::NetworkError,
         Some("rate_limit") => RetryErrorKind::RateLimit,
         Some("auth_error") => RetryErrorKind::AuthError,
+        Some("local_peer_auth") => RetryErrorKind::LocalPeerAuth,
+        Some("local_peer_config") => RetryErrorKind::LocalPeerConfig,
         Some("quota_exceeded") => RetryErrorKind::QuotaExceeded,
         Some("invalid_input") | Some(RETIRED_NON_LIVE_REASON) => RetryErrorKind::InvalidInput,
+        Some(RESULT_UNKNOWN_REASON) => RetryErrorKind::ResultUnknown,
         Some(BUDGET_EXCEEDED_REASON) => RetryErrorKind::BudgetExceeded,
         _ => RetryErrorKind::ContractViolation,
     }
@@ -1415,6 +1053,18 @@ pub fn task_status_from_unit_counts(
 #[must_use]
 pub fn retry_policy(error_kind: RetryErrorKind) -> RetryPolicy {
     match error_kind {
+        RetryErrorKind::LocalPeerAuth | RetryErrorKind::LocalPeerConfig => RetryPolicy {
+            error_kind,
+            retryable: false,
+            max_attempts: Some(0),
+            backoff: "user_action".to_owned(),
+            error_code: match error_kind {
+                RetryErrorKind::LocalPeerAuth => "KIO-E-LOCAL-PEER-AUTH-001",
+                _ => "KIO-E-LOCAL-PEER-CONFIG-001",
+            }
+            .to_owned(),
+            paused: false,
+        },
         RetryErrorKind::NetworkError => RetryPolicy {
             error_kind,
             retryable: true,
@@ -1474,6 +1124,14 @@ pub fn retry_policy(error_kind: RetryErrorKind) -> RetryPolicy {
             max_attempts: Some(1),
             backoff: "immediate".to_owned(),
             error_code: "KIO-E-ADAPTER-CONTRACT-001".to_owned(),
+            paused: false,
+        },
+        RetryErrorKind::ResultUnknown => RetryPolicy {
+            error_kind,
+            retryable: false,
+            max_attempts: Some(0),
+            backoff: "explicit_resend_unknown_required".to_owned(),
+            error_code: "KIO-E-SYNC-RESULT-UNKNOWN-001".to_owned(),
             paused: false,
         },
         RetryErrorKind::BudgetExceeded => RetryPolicy {
@@ -1771,6 +1429,10 @@ mod tests {
             "tier_b_approval"
         );
         assert_eq!(
+            serde_json::to_value(HoldReason::LedgerInitializationRequired).unwrap(),
+            "ledger_initialization_required"
+        );
+        assert_eq!(
             hold_reason_for_reason(BUDGET_EXCEEDED_REASON),
             Some(HoldReason::Budget)
         );
@@ -1779,6 +1441,10 @@ mod tests {
             Some(HoldReason::TierBApproval)
         );
         assert_eq!(hold_reason_for_reason("auth_error"), Some(HoldReason::Auth));
+        assert_eq!(
+            hold_reason_for_reason(LEDGER_INITIALIZATION_REQUIRED_REASON),
+            Some(HoldReason::LedgerInitializationRequired)
+        );
         assert_eq!(hold_reason_for_reason("network_error"), None);
         assert_eq!(hold_reason_for_reason("rate_limit"), None);
 
@@ -1821,6 +1487,11 @@ mod tests {
         assert_eq!(
             retry_policy(RetryErrorKind::ContractViolation).error_code,
             "KIO-E-ADAPTER-CONTRACT-001"
+        );
+        assert!(!retry_policy(RetryErrorKind::ResultUnknown).retryable);
+        assert_eq!(
+            retry_policy(RetryErrorKind::ResultUnknown).error_code,
+            "KIO-E-SYNC-RESULT-UNKNOWN-001"
         );
     }
 
@@ -1880,6 +1551,17 @@ mod tests {
                     message: "x".to_owned(),
                 },
                 RetryErrorKind::ContractViolation,
+            ),
+            (
+                AdapterError::LocalPeerAuth("x".to_owned()),
+                RetryErrorKind::LocalPeerAuth,
+            ),
+            (
+                AdapterError::LocalPeerConfig {
+                    code: "KIO-E-LOCAL-PEER-CA-PATH-001",
+                    message: "x".to_owned(),
+                },
+                RetryErrorKind::LocalPeerConfig,
             ),
         ];
         for (error, retry_kind) in cases {
@@ -1981,280 +1663,160 @@ mod tests {
     }
 
     #[test]
-    fn cand_047_output_ref_is_typed_and_bound_to_the_task_store() {
+    fn cand_047_output_ref_is_typed_and_bound_to_the_current_task_store() {
         let dir = tempfile::tempdir().unwrap();
-        let foreign_dir = tempfile::tempdir().unwrap();
         let raw_hash = format!("sha256:{}", "a".repeat(64));
         let tool_hash = format!("sha256:{}", "b".repeat(64));
         let mut task = valid_task();
         task.input_hash = raw_hash.clone();
-        task.output_ref =
-            crate::markdownize::normalized_instance_dir(dir.path(), &raw_hash, &tool_hash, 7)
-                .display()
-                .to_string();
-        fs::create_dir_all(&task.output_ref).unwrap();
+        task.output_ref = normalized_task_output_ref(&raw_hash, &tool_hash, 7);
+        let instance =
+            crate::markdownize::normalized_instance_dir(dir.path(), &raw_hash, &tool_hash, 7);
+        fs::create_dir_all(&instance).unwrap();
+        assert_eq!(
+            validate_task_output_ref(dir.path(), &task).unwrap(),
+            TaskOutputRef::NormalizedInstance {
+                path: instance,
+                raw_hash,
+                tool_profile_hash: tool_hash,
+                r#gen: 7,
+            }
+        );
+        task.task_type = TaskType::Embedding;
+        assert!(validate_task_output_ref(dir.path(), &task).is_err());
+        task.output_ref = format!("embedding:sha256:{}", "c".repeat(64));
         assert!(matches!(
             validate_task_output_ref(dir.path(), &task).unwrap(),
-            TaskOutputRef::NormalizedInstance { r#gen: 7, .. }
-        ));
-
-        for foreign in [
-            "/tmp/foreign/manifest-parent".to_owned(),
-            "../foreign/normalized-instance".to_owned(),
-            crate::markdownize::normalized_instance_dir(
-                foreign_dir.path(),
-                &raw_hash,
-                &tool_hash,
-                7,
-            )
-            .display()
-            .to_string(),
-        ] {
-            task.output_ref = foreign;
-            assert!(validate_task_output_ref(dir.path(), &task).is_err());
-        }
-
-        let mut poisoned = valid_task();
-        poisoned.input_hash = raw_hash.clone();
-        poisoned.output_ref = crate::markdownize::normalized_instance_dir(
-            foreign_dir.path(),
-            &raw_hash,
-            &tool_hash,
-            7,
-        )
-        .display()
-        .to_string();
-        let store = TaskStore::new(dir.path());
-        let mut encoded = serde_json::to_vec(&poisoned).unwrap();
-        encoded.push(b'\n');
-        fs::write(dir.path().join("tasks.jsonl"), encoded).unwrap();
-        assert!(matches!(store.all(), Err(PipelineError::Corrupt { .. })));
-
-        let mut embedding = valid_task();
-        embedding.task_type = TaskType::Embedding;
-        embedding.output_ref = format!("embedding:sha256:{}", "c".repeat(64));
-        assert!(matches!(
-            validate_task_output_ref(dir.path(), &embedding).unwrap(),
             TaskOutputRef::Embedding { .. }
         ));
     }
 
     #[test]
-    fn canonical_output_ref_rejects_noncanonical_generation() {
+    fn normalized_output_ref_rejects_legacy_paths_aliases_and_foreign_identities_without_writes() {
         let dir = tempfile::tempdir().unwrap();
         let raw_hash = format!("sha256:{}", "a".repeat(64));
         let tool_hash = format!("sha256:{}", "b".repeat(64));
-        let canonical =
-            crate::markdownize::normalized_instance_dir(dir.path(), &raw_hash, &tool_hash, 1);
-        let malformed =
-            canonical.with_file_name(format!("{}.{}.g+1", "a".repeat(64), "b".repeat(64)));
         let mut task = valid_task();
-        task.input_hash = raw_hash;
-        task.output_ref = malformed.display().to_string();
-        assert!(validate_task_output_ref(dir.path(), &task).is_err());
+        task.input_hash = raw_hash.clone();
+        let canonical = normalized_task_output_ref(&raw_hash, &tool_hash, 7);
+        let absolute =
+            crate::markdownize::normalized_instance_dir(dir.path(), &raw_hash, &tool_hash, 7);
+        fs::create_dir_all(&absolute).unwrap();
+        let mut invalid = vec![
+            absolute.display().to_string(),
+            "./objects/normalized_units/x".into(),
+            "../foreign".into(),
+            "C:\\store\\objects\\normalized_units\\x".into(),
+            "normalized:../../foreign".into(),
+            format!("{canonical}/"),
+            format!(" {canonical}"),
+            canonical.replace("normalized:", "normalized://"),
+            canonical.to_uppercase(),
+            normalized_task_output_ref(&format!("sha256:{}", "c".repeat(64)), &tool_hash, 7),
+            format!("normalized:{}.{}.g7", "a".repeat(64), "b".repeat(63)),
+        ];
+        for generation in ["", "+7", "-7", "07", " 7", "7/", "18446744073709551616"] {
+            invalid.push(format!(
+                "normalized:{}.{}.g{generation}",
+                "a".repeat(64),
+                "b".repeat(64)
+            ));
+        }
+        let journal = dir.path().join("tasks.jsonl");
+        for output_ref in invalid {
+            task.output_ref = output_ref;
+            let mut bytes = serde_json::to_vec(&task).unwrap();
+            bytes.push(b'\n');
+            fs::write(&journal, &bytes).unwrap();
+            let store = TaskStore::new(dir.path());
+            assert!(
+                validate_task_output_ref(dir.path(), &task).is_err(),
+                "{}",
+                task.output_ref
+            );
+            assert!(store.all().is_err());
+            assert!(store.append(&task).is_err());
+            assert_eq!(fs::read(&journal).unwrap(), bytes);
+        }
     }
 
     #[test]
-    fn normalized_output_ref_requires_canonical_basename_and_exact_persisted_ref() {
+    fn normalized_output_ref_done_lookup_uses_the_exact_portable_identity() {
         let dir = tempfile::tempdir().unwrap();
-        let raw_hash = format!("sha256:{}", "a".repeat(64));
-        let tool_hash = format!("sha256:{}", "b".repeat(64));
-        let canonical =
-            crate::markdownize::normalized_instance_dir(dir.path(), &raw_hash, &tool_hash, 7);
-        let legacy = canonical.with_file_name(format!("{raw_hash}.{tool_hash}.g7"));
-        fs::create_dir_all(&canonical).unwrap();
-
         let mut task = valid_task();
-        task.input_hash = raw_hash.clone();
-        task.output_ref = canonical.display().to_string();
+        let tool = format!("sha256:{}", "b".repeat(64));
+        task.output_ref = normalized_task_output_ref(&task.input_hash, &tool, u64::MAX);
         task.status = TaskStatus::Done;
-        assert!(matches!(
-            validate_task_output_ref(dir.path(), &task).unwrap(),
-            TaskOutputRef::NormalizedInstance {
-                tool_profile_hash,
-                r#gen: 7,
-                ..
-            } if tool_profile_hash == tool_hash
-        ));
-
         let store = TaskStore::new(dir.path());
         store.append(&task).unwrap();
         assert!(
             store
-                .done_output_for(&raw_hash, &canonical.display().to_string())
+                .done_output_for(&task.input_hash, &task.output_ref)
                 .unwrap()
                 .is_some()
         );
-
-        task.output_ref = legacy.display().to_string();
-        assert!(validate_task_output_ref(dir.path(), &task).is_err());
         assert!(
             store
-                .done_output_for(&raw_hash, &legacy.display().to_string())
+                .done_output_for(&task.input_hash, &format!("{}/", task.output_ref))
                 .unwrap()
                 .is_none()
         );
     }
 
     #[test]
-    fn normalized_output_ref_rejects_path_spelling_aliases() {
-        let cwd = std::env::current_dir().unwrap();
-        let dir = tempfile::Builder::new()
-            .prefix("kio-task-output-ref-")
-            .tempdir_in(&cwd)
-            .unwrap();
-        let raw_hash = format!("sha256:{}", "a".repeat(64));
-        let tool_hash = format!("sha256:{}", "b".repeat(64));
-        let canonical =
-            crate::markdownize::normalized_instance_dir(dir.path(), &raw_hash, &tool_hash, 7);
-        fs::create_dir_all(&canonical).unwrap();
-
-        let mut task = valid_task();
-        task.input_hash = raw_hash;
-        task.output_ref = canonical.display().to_string();
-        assert!(validate_task_output_ref(dir.path(), &task).is_ok());
-
-        let parent = canonical.parent().unwrap().display();
-        let file_name = canonical.file_name().unwrap().to_str().unwrap();
-        let relative = canonical.strip_prefix(&cwd).unwrap().display().to_string();
-        for alias in [
-            format!("{}{}", canonical.display(), std::path::MAIN_SEPARATOR),
-            format!(
-                "{parent}{separator}{separator}{file_name}",
-                separator = std::path::MAIN_SEPARATOR
-            ),
-            relative,
-        ] {
-            task.output_ref = alias;
-            assert!(validate_task_output_ref(dir.path(), &task).is_err());
-        }
-    }
-
-    #[test]
-    fn relocated_store_rebases_only_exact_normalized_refs() {
-        let source = tempfile::tempdir().unwrap();
-        let destination = tempfile::tempdir().unwrap();
-        let raw_hash = format!("sha256:{}", "a".repeat(64));
-        let tool_hash = format!("sha256:{}", "b".repeat(64));
-        let source_ref =
-            crate::markdownize::normalized_instance_dir(source.path(), &raw_hash, &tool_hash, 7);
-        let destination_ref = crate::markdownize::normalized_instance_dir(
-            destination.path(),
-            &raw_hash,
-            &tool_hash,
-            7,
-        );
-        fs::create_dir_all(&destination_ref).unwrap();
-
+    fn relocated_store_preserves_task_journal_bytes_and_resolves_in_the_destination() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("source");
+        let destination = parent.path().join("destination");
+        fs::create_dir(&source).unwrap();
         let mut normalized = valid_task();
-        normalized.input_hash = raw_hash;
-        normalized.output_ref = source_ref.display().to_string();
-        let mut typed = valid_task();
-        typed.task_id = "task_02H".to_owned();
-        let typed_ref = typed.output_ref.clone();
-        let mut encoded = serde_json::to_vec(&normalized).unwrap();
-        encoded.push(b'\n');
-        encoded.extend(serde_json::to_vec(&typed).unwrap());
-        encoded.push(b'\n');
-        fs::write(destination.path().join("tasks.jsonl"), encoded).unwrap();
-
-        rebase_normalized_output_refs_for_relocated_store(source.path(), destination.path())
-            .unwrap();
-        let tasks = TaskStore::new(destination.path()).all().unwrap();
-        assert_eq!(tasks[0].output_ref, destination_ref.display().to_string());
-        assert_eq!(tasks[1].output_ref, typed_ref);
-    }
-
-    #[test]
-    fn relocated_store_rejects_malformed_or_foreign_refs_without_mutation() {
-        let source = tempfile::tempdir().unwrap();
-        let destination = tempfile::tempdir().unwrap();
-        let foreign = tempfile::tempdir().unwrap();
-        let raw_hash = format!("sha256:{}", "a".repeat(64));
-        let tool_hash = format!("sha256:{}", "b".repeat(64));
-        let mut task = valid_task();
-        task.input_hash = raw_hash.clone();
-        task.output_ref =
-            crate::markdownize::normalized_instance_dir(foreign.path(), &raw_hash, &tool_hash, 1)
-                .display()
-                .to_string();
-        let path = destination.path().join("tasks.jsonl");
-        let mut bytes = serde_json::to_vec(&task).unwrap();
-        bytes.push(b'\n');
-        fs::write(&path, &bytes).unwrap();
-        assert!(
-            rebase_normalized_output_refs_for_relocated_store(source.path(), destination.path())
-                .is_err()
+        let tool = format!("sha256:{}", "b".repeat(64));
+        normalized.output_ref = normalized_task_output_ref(&normalized.input_hash, &tool, 7);
+        let source_instance =
+            crate::markdownize::normalized_instance_dir(&source, &normalized.input_hash, &tool, 7);
+        fs::create_dir_all(&source_instance).unwrap();
+        let store = TaskStore::new(&source);
+        store.append(&normalized).unwrap();
+        let bytes = fs::read(source.join("tasks.jsonl")).unwrap();
+        fs::rename(&source, &destination).unwrap();
+        let moved = TaskStore::new(&destination).all().unwrap();
+        assert_eq!(moved, vec![normalized.clone()]);
+        assert_eq!(fs::read(destination.join("tasks.jsonl")).unwrap(), bytes);
+        let TaskOutputRef::NormalizedInstance { path, .. } =
+            validate_task_output_ref(&destination, &moved[0]).unwrap()
+        else {
+            panic!("wrong output type")
+        };
+        assert_eq!(
+            path,
+            crate::markdownize::normalized_instance_dir(
+                &destination,
+                &normalized.input_hash,
+                &tool,
+                7
+            )
         );
-        assert_eq!(fs::read(&path).unwrap(), bytes);
-
-        fs::write(&path, b"{ malformed\n").unwrap();
-        let malformed = fs::read(&path).unwrap();
-        assert!(
-            rebase_normalized_output_refs_for_relocated_store(source.path(), destination.path())
-                .is_err()
-        );
-        assert_eq!(fs::read(&path).unwrap(), malformed);
     }
 
     #[cfg(unix)]
     #[test]
     fn relocated_store_never_follows_a_journal_symlink() {
         use std::os::unix::fs::symlink;
-
-        let source = tempfile::tempdir().unwrap();
         let destination = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();
         let outside_journal = outside.path().join("tasks.jsonl");
         let sentinel = b"must not be read or replaced";
         fs::write(&outside_journal, sentinel).unwrap();
         symlink(&outside_journal, destination.path().join("tasks.jsonl")).unwrap();
-
-        assert!(
-            rebase_normalized_output_refs_for_relocated_store(source.path(), destination.path())
-                .is_err()
-        );
+        assert!(TaskStore::new(destination.path()).all().is_err());
         assert_eq!(fs::read(outside_journal).unwrap(), sentinel);
     }
 
     #[test]
     fn relocated_store_does_not_create_missing_task_journal() {
-        let source = tempfile::tempdir().unwrap();
         let destination = tempfile::tempdir().unwrap();
-        rebase_normalized_output_refs_for_relocated_store(source.path(), destination.path())
-            .unwrap();
+        assert!(TaskStore::new(destination.path()).all().unwrap().is_empty());
         assert!(!destination.path().join("tasks.jsonl").exists());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn cand_047_canonical_windows_absolute_output_ref_is_supported() {
-        let dir = tempfile::tempdir().unwrap();
-        let foreign = tempfile::tempdir().unwrap();
-        let kio_dir = dir.path().canonicalize().unwrap();
-        let raw_hash = format!("sha256:{}", "a".repeat(64));
-        let tool_hash = format!("sha256:{}", "b".repeat(64));
-        let path = crate::markdownize::normalized_instance_dir(&kio_dir, &raw_hash, &tool_hash, 2);
-        fs::create_dir_all(&path).unwrap();
-        assert!(
-            path.components()
-                .any(|component| matches!(component, Component::Prefix(_)))
-        );
-
-        let mut task = valid_task();
-        task.input_hash = raw_hash.clone();
-        task.output_ref = path.display().to_string();
-        assert!(validate_task_output_ref(&kio_dir, &task).is_ok());
-
-        task.output_ref = crate::markdownize::normalized_instance_dir(
-            foreign.path().canonicalize().unwrap(),
-            &raw_hash,
-            &tool_hash,
-            2,
-        )
-        .display()
-        .to_string();
-        assert!(validate_task_output_ref(&kio_dir, &task).is_err());
     }
 
     #[cfg(unix)]
@@ -2271,10 +1833,7 @@ mod tests {
 
         let mut task = valid_task();
         task.input_hash = raw_hash.clone();
-        task.output_ref =
-            crate::markdownize::normalized_instance_dir(dir.path(), &raw_hash, &tool_hash, 0)
-                .display()
-                .to_string();
+        task.output_ref = normalized_task_output_ref(&raw_hash, &tool_hash, 0);
         assert!(validate_task_output_ref(dir.path(), &task).is_err());
     }
 
@@ -2292,8 +1851,8 @@ mod tests {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         symlink(outside.path(), &path).unwrap();
         let mut task = valid_task();
-        task.input_hash = raw_hash;
-        task.output_ref = path.display().to_string();
+        task.input_hash = raw_hash.clone();
+        task.output_ref = normalized_task_output_ref(&raw_hash, &tool_hash, 0);
         assert!(validate_task_output_ref(dir.path(), &task).is_err());
     }
 
@@ -2427,6 +1986,14 @@ mod tests {
 
         paused.hold_reason = Some(HoldReason::Budget);
         store.append(&paused).unwrap();
-        assert_eq!(store.all().unwrap(), vec![paused]);
+
+        let mut ledger_paused = valid_task();
+        ledger_paused.task_id = "task_ledger_initialization_required".to_owned();
+        ledger_paused.status = TaskStatus::Paused;
+        ledger_paused.fallback_reason = Some(LEDGER_INITIALIZATION_REQUIRED_REASON.to_owned());
+        ledger_paused.hold_reason = Some(HoldReason::LedgerInitializationRequired);
+        store.append(&ledger_paused).unwrap();
+
+        assert_eq!(store.all().unwrap(), vec![paused, ledger_paused]);
     }
 }

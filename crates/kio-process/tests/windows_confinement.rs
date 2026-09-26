@@ -226,3 +226,244 @@ fn output_cap_terminates_renderer_promptly() {
         })
     ));
 }
+
+// The child uses filesystem handshakes so readiness and permitted completion
+// are explicit. No network delay tool or new helper binary is required.
+fn stage_launcher_and_child(scratch: &Path, child_action: &str, redirect_pipes: bool) {
+    let redirect = if redirect_pipes { " >nul 2>nul" } else { "" };
+    std::fs::write(
+        scratch.join("launcher.cmd"),
+        format!("@echo off\r\nstart \"\" /b \"%SystemRoot%\\System32\\cmd.exe\" /d /c child.cmd{redirect}\r\nexit /b 7\r\n"),
+    ).unwrap();
+    std::fs::write(
+        scratch.join("child.cmd"),
+        format!("@echo off\r\necho ready>child-ready\r\n:waiting\r\nif not exist release-child goto waiting\r\n{child_action}\r\nexit /b 0\r\n"),
+    ).unwrap();
+}
+
+fn release_ready_child<T>(scratch: &Path, result: &mpsc::Receiver<T>) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !scratch.join("child-ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "descendant did not report readiness"
+        );
+        assert!(
+            matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "renderer returned before its descendant reported readiness"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // The child cannot finish until we release it, even though its launcher
+    // exits and redirected pipes can already report EOF to the host.
+    let early = result.recv_timeout(Duration::from_millis(250));
+    std::fs::write(scratch.join("release-child"), b"release").unwrap();
+    assert!(
+        matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
+        "renderer returned while its descendant was waiting for release"
+    );
+}
+
+#[test]
+fn launcher_exit_and_pipe_eof_wait_for_descendant_output() {
+    let scratch = tempfile::tempdir().unwrap();
+    stage_launcher_and_child(scratch.path(), "echo complete>child-output", true);
+    let (sandbox, root) = sandbox(scratch.path());
+    let (sender, result) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        sender
+            .send(sandbox.run(
+                ["/d", "/c", "launcher.cmd"],
+                &environment(root),
+                options(Duration::from_secs(15), 4096),
+            ))
+            .unwrap();
+    });
+    release_ready_child(scratch.path(), &result);
+    let output = result
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap()
+        .unwrap();
+    worker.join().unwrap();
+    assert_eq!(output.status.code(), Some(7), "preserve launcher status");
+    assert_eq!(
+        std::fs::read_to_string(scratch.path().join("child-output"))
+            .unwrap()
+            .trim(),
+        "complete"
+    );
+}
+
+#[test]
+fn launcher_exit_does_not_stop_descendant_scratch_monitoring() {
+    let scratch = tempfile::tempdir().unwrap();
+    stage_launcher_and_child(
+        scratch.path(),
+        "for /L %%i in (1,1,2000) do @echo 012345678901234567890123456789 >>oversized\r\n:hold\r\nif not exist cleanup-probe goto hold\r\necho survived>child-survived",
+        true,
+    );
+    let (_, root) = sandbox(scratch.path());
+    let program = PathBuf::from(&root).join("System32").join("cmd.exe");
+    let sandbox = RenderSandbox::new(
+        &program,
+        scratch.path(),
+        [program.parent().unwrap().to_path_buf()],
+        RenderResourceLimits {
+            max_file_bytes: 2048,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (sender, result) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        sender
+            .send(sandbox.run(
+                ["/d", "/c", "launcher.cmd"],
+                &environment(root),
+                options(Duration::from_secs(15), 4096),
+            ))
+            .unwrap();
+    });
+    release_ready_child(scratch.path(), &result);
+    let error = result
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap()
+        .unwrap_err();
+    worker.join().unwrap();
+    std::fs::write(scratch.path().join("cleanup-probe"), b"probe").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !scratch.path().join("child-survived").exists(),
+        "descendant survived resource cleanup"
+    );
+    assert!(
+        matches!(error, ConfinementError::Resource(ref cause)
+        if cause.to_string().contains("exceeds configured limit")),
+        "{error}"
+    );
+}
+
+#[test]
+fn late_oversized_child_output_is_rejected_when_child_exits_immediately() {
+    let scratch = tempfile::tempdir().unwrap();
+    // Unlike the ongoing-monitoring test, this child has no post-write hold:
+    // it exits as soon as the oversized final file has been written. Either a
+    // periodic observation or the mandatory Job-empty final scan must reject it.
+    stage_launcher_and_child(
+        scratch.path(),
+        "for /L %%i in (1,1,2000) do @echo 012345678901234567890123456789 >>oversized",
+        true,
+    );
+    let (_, root) = sandbox(scratch.path());
+    let program = PathBuf::from(&root).join("System32").join("cmd.exe");
+    let sandbox = RenderSandbox::new(
+        &program,
+        scratch.path(),
+        [program.parent().unwrap().to_path_buf()],
+        RenderResourceLimits {
+            max_file_bytes: 2048,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let (sender, result) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        sender
+            .send(sandbox.run(
+                ["/d", "/c", "launcher.cmd"],
+                &environment(root),
+                options(Duration::from_secs(15), 4096),
+            ))
+            .unwrap();
+    });
+    release_ready_child(scratch.path(), &result);
+    let error = result
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap()
+        .unwrap_err();
+    worker.join().unwrap();
+    assert!(
+        matches!(error, ConfinementError::Resource(ref cause)
+        if cause.to_string().contains("exceeds configured limit")),
+        "{error}"
+    );
+}
+
+#[test]
+fn launcher_exit_does_not_stop_descendant_output_monitoring() {
+    let scratch = tempfile::tempdir().unwrap();
+    stage_launcher_and_child(
+        scratch.path(),
+        "for /L %%i in (1,1,2000) do @echo 012345678901234567890123456789\r\n:hold\r\nif not exist cleanup-probe goto hold\r\necho survived>child-survived",
+        false,
+    );
+    let (sandbox, root) = sandbox(scratch.path());
+    let (sender, result) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        sender
+            .send(sandbox.run(
+                ["/d", "/c", "launcher.cmd"],
+                &environment(root),
+                options(Duration::from_secs(15), 64),
+            ))
+            .unwrap();
+    });
+    release_ready_child(scratch.path(), &result);
+    let error = result
+        .recv_timeout(Duration::from_secs(15))
+        .unwrap()
+        .unwrap_err();
+    worker.join().unwrap();
+    std::fs::write(scratch.path().join("cleanup-probe"), b"probe").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !scratch.path().join("child-survived").exists(),
+        "descendant survived resource cleanup"
+    );
+    assert!(
+        matches!(
+            error,
+            ConfinementError::Process(BoundedProcessError::OutputLimit {
+                stream: "stdout",
+                limit: 64,
+            })
+        ),
+        "{error}"
+    );
+}
+
+#[test]
+fn launcher_exit_and_pipe_eof_do_not_bypass_descendant_timeout() {
+    let scratch = tempfile::tempdir().unwrap();
+    stage_launcher_and_child(scratch.path(), "echo complete>child-output", true);
+    let (sandbox, root) = sandbox(scratch.path());
+    let started = std::time::Instant::now();
+    let error = sandbox
+        .run(
+            ["/d", "/c", "launcher.cmd"],
+            &environment(root),
+            options(Duration::from_secs(2), 4096),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            ConfinementError::Process(BoundedProcessError::Timeout { timeout_ms: 2000 })
+        ),
+        "{error}"
+    );
+    assert!(
+        scratch.path().join("child-ready").exists(),
+        "descendant must have started"
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(10),
+        "timeout unexpectedly reset or cleanup unbounded"
+    );
+    // If a descendant survived cleanup, releasing its handshake would permit
+    // it to create this output. Give asynchronous Job termination a grace only
+    // in the assertion, never in the renderer's command deadline.
+    std::fs::write(scratch.path().join("release-child"), b"release").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(!scratch.path().join("child-output").exists());
+}

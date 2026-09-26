@@ -68,6 +68,7 @@ pub struct PersonaMaterializationRecord {
     pub profile: PersonaProfile,
     pub replay_id: String,
     pub destination_root: String,
+    #[serde(with = "kio_core::identity_serde::u64_hex")]
     pub filesystem_device: u64,
     pub plan: PlanRecord,
     pub schedule: ArtifactRecord,
@@ -644,6 +645,63 @@ fn bad<T>(message: impl Into<String>) -> Result<T, PersonaMaterializeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filesystem_device_jcs_preserves_all_bits() {
+        for value in [(1_u64 << 53) + 1, 9_851_624_185_183_609, u64::MAX] {
+            let mut record = PersonaMaterializationRecord {
+                schema: "kio.persona.materialization/v1".into(),
+                fixture_id: FIXTURE_ID.into(),
+                profile: PersonaProfile::Tiny,
+                replay_id: "replay-01".into(),
+                destination_root: "/fixture".into(),
+                filesystem_device: value,
+                plan: PlanRecord {
+                    digest: hash_bytes(b"fixture"),
+                    sha256: hash_bytes(b"fixture"),
+                    bytes: 1,
+                },
+                schedule: ArtifactRecord {
+                    sha256: hash_bytes(b"fixture"),
+                    bytes: 1,
+                },
+                render: ArtifactRecord {
+                    sha256: hash_bytes(b"fixture"),
+                    bytes: 1,
+                },
+                claims: Claims {
+                    sources_materialized: false,
+                    actual_kio_evidence: false,
+                    history_ready: false,
+                },
+            };
+            let bytes = record.canonical_bytes().unwrap();
+            assert_eq!(
+                serde_json::from_slice::<PersonaMaterializationRecord>(&bytes).unwrap(),
+                record
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                PersonaMaterializationRecord::parse_canonical(&bytes).unwrap(),
+                record
+            );
+            let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(json["filesystem_device"], format!("{value:016x}"));
+            record.filesystem_device -= 1;
+            assert_ne!(record.canonical_bytes().unwrap(), bytes);
+            for invalid in [
+                serde_json::json!(value),
+                serde_json::json!("FFFFFFFFFFFFFFFF"),
+                serde_json::json!("1"),
+            ] {
+                let mut invalid_record = json.clone();
+                invalid_record["filesystem_device"] = invalid;
+                let bytes = canonical_json_bytes(&invalid_record).unwrap();
+                assert!(serde_json::from_slice::<PersonaMaterializationRecord>(&bytes).is_err());
+            }
+        }
+    }
+
     use crate::{
         persona_plan::{PersonaProfile, frozen_plan},
         persona_render_artifact::RenderArtifact,

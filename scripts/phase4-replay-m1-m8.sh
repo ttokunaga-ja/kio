@@ -948,8 +948,8 @@ run_m1() {
     (.stability_check_stats | keys == ["commits","dir_entries","graph_steps","receipts","refs","tree_entries","trees_verified","verified_bytes"]) and
     # These are diagnostic counters from different traversals, not an authority comparison.
     ([.stats[],.stability_check_stats[]] | all(type == "number" and . >= 0 and floor == .)) and
-    (.policy | keys == ["keep_daily_weeks","keep_hourly_days","keep_last_hours","keep_repaired_per_branch","keep_weekly_months"]) and
-    .policy.keep_last_hours == 0 and .policy.keep_hourly_days == 0 and .policy.keep_daily_weeks == 0 and .policy.keep_weekly_months == 0 and .policy.keep_repaired_per_branch == 5 and
+    (.policy | keys == ["keep_daily_weeks","keep_hourly_days","keep_last_hours","keep_repaired","keep_weekly_months"]) and
+    .policy.keep_last_hours == 0 and .policy.keep_hourly_days == 0 and .policy.keep_daily_weeks == 0 and .policy.keep_weekly_months == 0 and .policy.keep_repaired == 5 and
     (.exclusions | all(keys == ["count","reason"] and (.count | type == "number" and . >= 0) and (.reason | type == "string"))) and
     (.candidates | length == 1) and (.candidates[0] | keys == ["commit_hash","commit_type","created_at","policy","size_bytes","tree_hash"] and .commit_hash == $oc and .commit_hash != $cc and .tree_hash == $ot and .commit_type == "auto" and .policy == "auto_retention" and (.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")) and (.size_bytes | type == "number" and . > 0)) and
     .estimated_bytes == .candidates[0].size_bytes and
@@ -1029,8 +1029,8 @@ run_m8() {
     (.stability_check_stats | keys == ["commits","dir_entries","graph_steps","receipts","refs","tree_entries","trees_verified","verified_bytes"]) and
     # These are diagnostic counters from different traversals, not an authority comparison.
     ([.stats[],.stability_check_stats[]] | all(type == "number" and . >= 0 and floor == .)) and
-    (.policy | keys == ["keep_daily_weeks","keep_hourly_days","keep_last_hours","keep_repaired_per_branch","keep_weekly_months"]) and
-    .policy.keep_last_hours == 0 and .policy.keep_hourly_days == 0 and .policy.keep_daily_weeks == 0 and .policy.keep_weekly_months == 0 and .policy.keep_repaired_per_branch == 5 and
+    (.policy | keys == ["keep_daily_weeks","keep_hourly_days","keep_last_hours","keep_repaired","keep_weekly_months"]) and
+    .policy.keep_last_hours == 0 and .policy.keep_hourly_days == 0 and .policy.keep_daily_weeks == 0 and .policy.keep_weekly_months == 0 and .policy.keep_repaired == 5 and
     (.exclusions | all(keys == ["count","reason"] and (.count | type == "number" and . >= 0) and (.reason | type == "string"))) and
     (.candidates | length == 1) and (.candidates[0] | keys == ["commit_hash","commit_type","created_at","policy","size_bytes","tree_hash"] and .commit_hash == $oc and .commit_hash != $cc and .tree_hash == $ot and .commit_type == "auto" and .policy == "auto_retention" and (.created_at | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$")) and (.size_bytes | type == "number" and . > 0)) and
     .estimated_bytes == .candidates[0].size_bytes and
