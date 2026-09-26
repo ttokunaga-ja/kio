@@ -2765,8 +2765,8 @@ fn same_bound_directory(current: &File, retained: &File) -> Result<bool> {
     }
     #[cfg(windows)]
     {
-        return Ok(windows_directory_handle_identity(current)
-            == windows_directory_handle_identity(retained));
+        Ok(windows_directory_handle_identity(current)
+            == windows_directory_handle_identity(retained))
     }
 }
 
@@ -3597,7 +3597,7 @@ fn same_bound_regular_entry(
             ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
         let verification = cap_primitives::fs::open(_parent, leaf, &options)
             .map_err(|error| bound_io_or_not_found(error, &leaf.display().to_string()))?;
-        return Ok(same_windows_cas_file(opened, &verification));
+        Ok(same_windows_cas_file(opened, &verification))
     }
 }
 

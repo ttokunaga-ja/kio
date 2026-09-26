@@ -689,7 +689,7 @@ fn recover_locked(
         remove_if_present(workspace, REMOVED)?;
         crate::durability::checkpoint(crate::durability::DurabilityPoint::AtomicRemoveDeleted)?;
         remove_if_present(workspace, REMOVE_READY)?;
-        return Ok(true);
+        Ok(true)
     }
     #[cfg(not(windows))]
     match (source, removed) {

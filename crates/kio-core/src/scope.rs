@@ -5761,7 +5761,7 @@ impl StoreLock {
 
         #[cfg(windows)]
         {
-            return Self::acquire_path_windows(path, pid);
+            Self::acquire_path_windows(path, pid)
         }
 
         #[cfg(not(windows))]

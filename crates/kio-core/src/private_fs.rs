@@ -1170,7 +1170,7 @@ mod windows {
             MaximumLength: (name.len() * mem::size_of::<u16>()) as u16,
             Buffer: name.as_ptr().cast_mut(),
         };
-        let mut attributes = OBJECT_ATTRIBUTES {
+        let attributes = OBJECT_ATTRIBUTES {
             Length: mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
             RootDirectory: parent.as_raw_handle() as HANDLE,
             ObjectName: &mut unicode,
@@ -1205,7 +1205,7 @@ mod windows {
             NtCreateFile(
                 &mut handle,
                 desired_access,
-                &mut attributes,
+                &attributes,
                 &mut status_block,
                 ptr::null_mut(),
                 file_attributes,
@@ -1449,7 +1449,7 @@ mod windows {
                     Some(path),
                 )
             })?;
-        verify_owner_only(&file, &owner, path)?;
+        verify_owner_only(&file, owner, path)?;
         let before = file
             .metadata()
             .map_err(|_| unsafe_file("cannot inspect private trust file", Some(path)))?;
@@ -1479,7 +1479,7 @@ mod windows {
             .metadata()
             .map_err(|_| unsafe_file("cannot recheck private trust file", Some(path)))?;
         let after_change_time = change_time(&file, path)?;
-        verify_owner_only(&file, &owner, path)?;
+        verify_owner_only(&file, owner, path)?;
         if before_identity != after_identity
             || before.len() != after.len()
             || before.modified().ok() != after.modified().ok()

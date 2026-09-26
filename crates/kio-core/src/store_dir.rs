@@ -1921,7 +1921,7 @@ mod platform {
         label: &Path,
     ) -> Result<()> {
         let name = destination.encode_wide().collect::<Vec<_>>();
-        if name.is_empty() || name.iter().any(|unit| *unit == 0) {
+        if name.is_empty() || name.contains(&0) {
             return Err(err(label, "retained rename destination is invalid"));
         }
         let name_bytes = name

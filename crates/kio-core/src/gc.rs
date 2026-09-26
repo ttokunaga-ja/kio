@@ -1186,7 +1186,7 @@ impl GcSweepSession {
         self.recheck_binding()?;
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            return Err(corrupt("GC index rotation is unsupported on this platform"));
+            Err(corrupt("GC index rotation is unsupported on this platform"))
         }
         #[cfg(any(target_os = "macos", target_os = "linux"))]
         {
