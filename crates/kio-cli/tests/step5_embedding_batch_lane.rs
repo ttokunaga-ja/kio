@@ -875,30 +875,94 @@ fn a_short_result_set_does_not_settle_the_row_as_succeeded() {
     let short = serde_json::json!({
         "state_sequence": ["BATCH_STATE_SUCCEEDED"],
         "job_name": "batches/short-1",
+        "capture_path": capture.to_string_lossy(),
         "inlined_responses": [{
             "metadata": { "key": keys[0] },
             "output": { "response": { "embedding": { "values": vec![component; 768] } } },
         }],
     })
     .to_string();
-    json_any(&dir, &short, &["batch", "resume"]);
+    use kio_pipeline::ledger::model::{BatchState, Outcome};
 
-    // state 3 = Terminal, NOT 2 = Completed.
+    // The malformed result is settled, then the durable breaker holds any
+    // replacement submission. Repeating resume must retain that hold.
+    for _ in 0..2 {
+        let assert = kio(&dir)
+            .env(
+                "KIO_TEST_GEMINI_BATCH",
+                script_with_attribution(&dir, &short),
+            )
+            .args(["--json", "batch", "resume"])
+            .assert()
+            .code(4);
+        assert!(assert.get_output().stdout.is_empty());
+        let error: Value = serde_json::from_slice(&assert.get_output().stderr).unwrap();
+        assert_eq!(error["error_code"], "KIO-E-EMBED-BATCH-CONTRACT-HOLD-001");
+        let blocked = error["context"]["blocked_attempts"].as_array().unwrap();
+        assert_eq!(blocked.len(), 1, "{error}");
+
+        let ledger =
+            rusqlite::Connection::open(dir.path().join("home/data/kio/cost-ledger.sqlite"))
+                .unwrap();
+        let (selector, sequence): (String, i64) = ledger.query_row(
+                "SELECT b.state, b.contract_violation_count, b.intent_token IS NULL,
+                        b.estimated_usd, l.outcome, l.estimated, l.usd,
+                        b.scope_id || '/' || b.adapter_kind || '/' || b.input_hash || '/' || b.tool_profile_hash,
+                        b.submission_seq
+                 FROM batch_requests b JOIN cost_ledger l
+                   USING (scope_id, adapter_kind, input_hash, tool_profile_hash, submission_seq)
+                 WHERE b.adapter_kind = 'embedding'",
+                [],
+                |row| {
+                    let state: i64 = row.get(0)?;
+                    let violations: i64 = row.get(1)?;
+                    let cleared: bool = row.get(2)?;
+                    let estimate: f64 = row.get(3)?;
+                    let outcome: String = row.get(4)?;
+                    let estimated: bool = row.get(5)?;
+                    let usd: f64 = row.get(6)?;
+                    assert_eq!(BatchState::from_i64(state), Some(BatchState::Terminal));
+                    assert_eq!(Outcome::parse(&outcome), Some(Outcome::ContractViolation));
+                    assert_eq!(violations, 1);
+                    assert!(cleared, "terminal inline job must clear its intent");
+                    assert!(estimated && estimate > 0.0);
+                    assert_eq!(usd, estimate, "malformed results settle at the reservation");
+                    Ok((row.get(7)?, row.get(8)?))
+                },
+            ).unwrap();
+        assert_eq!(blocked[0]["selector"], selector);
+        assert_eq!(blocked[0]["submission_seq"], sequence);
+        let counts: (i64, i64) = ledger
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM batch_requests WHERE adapter_kind = 'embedding'),
+                    (SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind = 'embedding')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            counts,
+            (1, 1),
+            "resume must not reserve or settle another job"
+        );
+
+        let index = rusqlite::Connection::open(root(&dir).join(".kio/index/sqlite.db")).unwrap();
+        let published: i64 = index
+            .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            published, 0,
+            "even the valid first member must not be published"
+        );
+    }
+    let creates = std::fs::read_to_string(&capture)
+        .unwrap()
+        .lines()
+        .filter(|line| line.contains("create_embedding_job"))
+        .count();
     assert_eq!(
-        ledger_query(
-            &dir,
-            "SELECT CAST(state AS TEXT) FROM batch_requests WHERE adapter_kind = 'embedding'"
-        ),
-        "3",
-        "a short result set must not complete the row"
-    );
-    assert_ne!(
-        ledger_query(
-            &dir,
-            "SELECT outcome FROM cost_ledger WHERE adapter_kind = 'embedding'"
-        ),
-        "succeeded",
-        "a short result set must not be settled as a success"
+        creates, 1,
+        "contract hold must prevent a second provider job"
     );
 }
 
