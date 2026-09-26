@@ -84,10 +84,47 @@ failure evidence, not full-suite passes.
   returns 404, and Tailscale still has its wildcard grant. No setting was saved.
   The 132 unrelated untracked paths remain byte- and mode-identical.
 
-Remaining gates are the complete current macOS/Linux regression and lint runs,
-clean candidate packaging/reproducibility and actual A05/A06/A10 drivers, the
-closed final security receipt, concrete private Actions route approval and
-installation, and all required native
+### Current regression and security evidence
+
+Linux r165 completed formatting, workspace/all-target Clippy with warnings
+denied, and the full locked/offline workspace/all-target suite on `923a85e`:
+all 84 top-level test targets passed. The original 1,624 source paths have
+identical before/after digests. This is local Linux evidence, not Actions.
+
+The macOS run on that same source passed the index, pipeline, process and search
+crates. It exposed 19 core and nine evaluator fixture failures because raw
+`/var` temporary roots correctly failed private-directory ancestry checks. One
+watcher test also sampled an old idle snapshot while enrollment reconciliation
+was still running. The original failed runs and direct diagnostics are retained.
+The test-only correction canonicalizes enclosing temporary roots while retaining
+unsafe leaf cases. The watcher assertion now requires fresh completed enrollment
+and two bounded stable idle windows instead of blind sleeps. Production path
+checks and watcher filters are unchanged. Post-fix formatting, workspace/all-target
+Clippy, all core targets, the 46 evaluator acceptance-tool tests and all four
+watcher tests pass. The external
+`restart-fixture-watch-19` evidence has identical 1,624-path source manifests.
+
+The later sealed `c89b7ec..923a85e` security scan has complete coverage of all
+75 changed paths, no deferred surfaces and no reportable finding. A separate
+bounded Daybreak-designated review of the test-only delta found no security
+regression. Requested model and unobservable actual serving model remain
+separate. The older Windows renderer candidate still needs native execution:
+later code waits for the entire private Job and performs the final scan, but
+this static review does not close the Windows/real Office acceptance gate.
+
+Read-only route preparation now binds existing trusted Windows/WSL Ed25519 host
+keys and the four proposed configuration files. The provider Environment exists
+with main-only deployment, both API-key Secret names, and USD 10 per-provider
+budget variables. Key validity was not tested. The local Environment and
+provider ledger/rulesets are absent. Proposed immutable-history protection has
+no bypass; a separate Actions App writer exception does not establish individual
+workflow identity. Installation, privileged readback and a successful authority
+token initialization are required before any paid run. No settings were applied.
+
+Remaining gates are final-candidate affected checks and the macOS application
+and early CLI targets, final-bound Linux persona/synthetic CI parity, clean
+candidate packaging/reproducibility and actual A05/A06/A10 drivers, concrete
+private Actions route approval and installation, and all required native
 Windows/Linux/macOS receipts on one candidate SHA. The ten-minute independent
 monitor is active. Logs for this recovery are under
 `~/Documents/Codex/2026-09-27/kio-resume-validation/recovery/`; r163 evidence is

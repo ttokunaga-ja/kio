@@ -27,11 +27,22 @@ Artifacts are diagnostic receipts only; they never authorize spend. Candidate
 jobs also require the exact current `main` SHA and a successful candidate-bound
 native package workflow before they use a provider credential.
 
-This design depends on branch protection that prevents deletion and force-push,
-and on only the protected control-plane workflow being able to update the
-ledger. A repository administrator able to bypass those protections can replace
-the history; the ledger cannot defend against that authority. Branch protection
-must therefore be installed and verified before this workflow is used.
+This design depends on protection that prevents deletion, non-fast-forward
+updates and nonlinear history, plus restricted ledger creation and updates.
+Keep the immutable-history rules in a separate ruleset with no bypass actors;
+a GitHub Actions App bypass for creation/update must not bypass those rules.
+Install and read back the exact active protections, and prove that the authority
+job's token can initialize the ledger before any paid run. If the platform
+cannot enforce this configuration, stop rather than add an administrator bypass.
+
+GitHub App restrictions do not identify an individual workflow or job. The
+control-plane workflow being the only writer is also a repository configuration
+invariant: current workflows default to read-only contents permissions, and only
+the authority job requests contents write. Trusted changes to main, workflow
+permissions or rulesets must preserve and recheck that invariant. A repository
+administrator can change these protections; the ledger cannot defend against
+that authority. Do not describe the App restriction as workflow-level identity
+enforcement.
 
 All GitHub REST reads are bounded (at most 34 linear commits, seven tree
 entries per commit, and 16 KiB JSON blobs). The helper neither downloads nor
