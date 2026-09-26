@@ -6,13 +6,29 @@ local verification, and the final native acceptance evidence.
 
 ## Current checkpoint — 2026-09-26
 
-**v1.0 is still incomplete.** This checkpoint prepares the local v1 implementation
-milestone from base `d98e0f6`. No push, Actions run, paid-provider call, release,
+**v1.0 is still incomplete.** The local v1 implementation milestone is committed
+as `265a472` from base `d98e0f6`; local CI parity has exposed further work below.
+No push, Actions run, paid-provider call, release,
 new route privilege, or new machine privilege occurred in this checkpoint.
 Historical results below are diagnostics, not current-candidate acceptance.
 
 ### Evidence boundary
 
+- The local Linux counterpart of `persona-w0-integration` passes all eleven
+  steps. The ordered `synthetic-history-eval` counterpart first exposed a stale
+  closed index-JSON parser: `child_scope_discovery` was missing. The evaluator
+  now requires its typed, complete, empty-discovery shape for flat fixtures;
+  unknown fields, partial discovery and preview output remain rejected. macOS
+  parser tests (4), the complete scale-preparer test module (9), formatting and
+  workspace/all-target Clippy pass. A focused Daybreak-designated cross-check
+  retains no finding. Linux r161 passes the corrected current-data generate,
+  prepare and attest steps, but stops at history preparation. This second failure
+  is a product bug: retained chunk work chooses only one filename context after
+  a rename, while the contract requires both retained contexts. The expected four
+  new vectors must not be weakened to the observed one. Contextual task identity,
+  accounting and deterministic vector projection require correction before a new
+  candidate package or push. Original failed logs and corpus state are preserved.
+  These local runs are not Actions receipts.
 - The latest macOS r149 full workspace/all-target run completed with only three
   failing `batch_recovery_key` test fixtures: temporary directories were not
   owner-private. The evaluator passed 477/477, CLI contracts 284/284 and purge

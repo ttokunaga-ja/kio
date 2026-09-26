@@ -353,9 +353,36 @@ struct IndexOutput {
     budget_warning: Option<Value>,
     skipped_units: Vec<Value>,
     child_scopes: Vec<Value>,
+    child_scope_discovery: ChildScopeDiscoveryOutput,
     #[serde(default)]
     skipped_units_guidance: Option<String>,
     gc: GcReceipt,
+}
+
+/// Every preparer invocation is a public, mutating index command, including
+/// registry no-ops. It must finish discovery even when the fixture is flat.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChildScopeDiscoveryOutput {
+    page_size: usize,
+    has_more: bool,
+    continuation_committed: bool,
+    // A stale frontier can legitimately restart and then finish an empty scan.
+    // Both boolean values are valid; completion is checked independently below.
+    #[allow(dead_code)]
+    restarted_from_root: bool,
+    rows_total: u64,
+    rows_omitted: u64,
+}
+
+impl ChildScopeDiscoveryOutput {
+    fn is_completed_empty(&self) -> bool {
+        self.page_size == kio_pipeline::scan::CHILD_SCOPE_DISCOVERY_PAGE_SIZE
+            && !self.has_more
+            && self.continuation_committed
+            && self.rows_total == 0
+            && self.rows_omitted == 0
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -884,6 +911,7 @@ fn validate_index_output(
         || output.skipped_unrecognized_binary_files != 0
         || !output.skipped_units.is_empty()
         || !output.child_scopes.is_empty()
+        || !output.child_scope_discovery.is_completed_empty()
         || output.budget_warning.is_some()
         || output.skipped_units_guidance.is_some()
         || output.gc.mode != "manual_only"
@@ -892,7 +920,7 @@ fn validate_index_output(
         || output.gc.trigger != "index"
     {
         return Err(ScalePrepareError::Input(
-            "offline index output reports a pending, skipped, network, budget, or GC failure state"
+            "offline index output reports a pending, skipped, network, budget, discovery, or GC failure state"
                 .into(),
         ));
     }
@@ -1518,6 +1546,14 @@ mod tests {
             "commit_hash":commit_hash,
             "commit":commit, "budget_warning":null, "skipped_units":[],
             "child_scopes":[],
+            "child_scope_discovery": {
+                "page_size": kio_pipeline::scan::CHILD_SCOPE_DISCOVERY_PAGE_SIZE,
+                "has_more": false,
+                "continuation_committed": true,
+                "restarted_from_root": false,
+                "rows_total": 0,
+                "rows_omitted": 0,
+            },
             "gc": {"mode":"manual_only","reason":"manual_only","status":"disabled","trigger":"index"}
         })
     }
@@ -1568,6 +1604,84 @@ mod tests {
             .is_err()
         );
         assert!(validate_index_output(&serde_json::json!({"status":"failed","network_allowed":false,"failed_files":0,"pending_files":0,"pending_online_tasks":0,"paused_tasks":0,"embedding_tasks_failed":0,"normalized_files":1,"commit_hash":"x"}), IndexExpectation::Repair { files: 1, embeddings: 0 }).is_err());
+    }
+
+    #[test]
+    fn index_parser_accepts_completed_empty_discovery_after_restart_or_noop() {
+        for restarted in [false, true] {
+            for (mut output, expected) in [
+                (
+                    indexed_output(),
+                    IndexExpectation::Repair {
+                        files: 1,
+                        embeddings: 0,
+                    },
+                ),
+                (noop_output(), IndexExpectation::RegistryNoop { files: 1 }),
+            ] {
+                output["child_scope_discovery"]["restarted_from_root"] =
+                    serde_json::json!(restarted);
+                assert!(validate_index_output(&output, expected).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn index_parser_rejects_incomplete_or_malformed_discovery() {
+        let expected = IndexExpectation::Repair {
+            files: 1,
+            embeddings: 0,
+        };
+        for (field, value) in [
+            ("page_size", serde_json::json!(0)),
+            ("page_size", serde_json::json!(129)),
+            ("page_size", serde_json::json!("128")),
+            ("has_more", serde_json::json!(true)),
+            ("has_more", serde_json::json!(0)),
+            ("continuation_committed", serde_json::json!(false)),
+            ("restarted_from_root", serde_json::json!(null)),
+            ("restarted_from_root", serde_json::json!("false")),
+            ("rows_total", serde_json::json!(1)),
+            ("rows_omitted", serde_json::json!(1)),
+            ("rows_total", serde_json::json!(-1)),
+            ("rows_omitted", serde_json::json!(0.5)),
+            ("preview", serde_json::json!(true)),
+            ("unknown", serde_json::json!(false)),
+        ] {
+            let mut output = indexed_output();
+            output["child_scope_discovery"][field] = value;
+            assert!(
+                validate_index_output(&output, expected.clone()).is_err(),
+                "{field}"
+            );
+        }
+        for missing in [
+            "page_size",
+            "has_more",
+            "continuation_committed",
+            "restarted_from_root",
+            "rows_total",
+            "rows_omitted",
+        ] {
+            let mut output = indexed_output();
+            output["child_scope_discovery"]
+                .as_object_mut()
+                .unwrap()
+                .remove(missing);
+            assert!(
+                validate_index_output(&output, expected.clone()).is_err(),
+                "missing {missing}"
+            );
+        }
+        let mut missing = indexed_output();
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("child_scope_discovery");
+        assert!(validate_index_output(&missing, expected.clone()).is_err());
+        let mut null = indexed_output();
+        null["child_scope_discovery"] = Value::Null;
+        assert!(validate_index_output(&null, expected).is_err());
     }
 
     #[test]

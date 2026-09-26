@@ -290,12 +290,24 @@ inert になっても他の child を妨げず、後に同じ planned identity �
 退役する前に、その stage の verified exact case probe だけを cleanup する。公開済みの pending `.kio` は cancel
 できず、Ignore が外れた後に通常の recovery で再開する。
 
-子 scope 経路を含む RC platform support policy の正本は [09-mvp-scope.md §1.2](09-mvp-scope.md)
-である。子 scope の自動 mutation は retained directory capability から child process を起動できる
-macOS / Linux で実装済みである。Windows は read-only preview までは行うが、現行の process
-API と SQLite 経路では retained handle を child の全 mutation sink へ連鎖できないため、各 planned
-child を `KIO-E-SCOPE-BOUND-UNSUPPORTED-001` として構造化報告し、子 `.kio` 作成前に
-fail-closed する。public pathname の再検証後に `current_dir(path)` へ戻る fallback は持たない。
+子 scope 経路を含む v1 platform support policy の正本は [09-mvp-scope.md §1.2](09-mvp-scope.md)
+である。macOS / Linux / Windows の自動管理は、retained directory capability から child を検証し、
+保持済み Repository を共通 app 層へ渡す。public pathname の再解決や `current_dir(path)` 型 handoff
+は使わない。現行 policy・所属・identity の検証に失敗した child は採用しない。各 OS の native Actions
+受入は別途必要である。
+
+公開 `index` の JSON は `child_scopes` と `child_scope_discovery` を含む。通常実行の discovery は
+`page_size` (現在 128)、`has_more`、`continuation_committed`、`restarted_from_root`、`rows_total`、
+`rows_omitted` の閉じた object である。`rows_total` は報告対象となった子候補の全行数で、作成成功数ではない。
+`rows_omitted` は表示上限により `child_scopes` から省略した行数である。`has_more` は継続すべき探索・処理が
+残ることを示す。`continuation_committed` は少なくとも一つの完了ページについて継続状態を保存したことを示し、
+最終ページで状態を消した場合も true となる。この値だけで全体の成功を判定してはならない。
+`restarted_from_root` は保存済みの探索状態を現行条件で再使用できず、root から再探索したことを示す。
+再探索後に全ページが完了すれば `has_more=false` と両立する。
+
+`index --preview` の discovery は `page_size`、`has_more`、`preview=true` の別の閉じた object であり、
+継続状態を保存しない。評価用の平坦な fixture は通常実行の完了形を検証する：子行数と省略数がともに 0、
+`has_more=false`、`continuation_committed=true`。未知 field、未完了状態、preview の取り違えを受理しない。
 
 `<pointer>` 引数の受理形式 (URI / inline JSON / stdin / hash 短縮形) は [08-evidence-pointer-spec.md §2.3](08-evidence-pointer-spec.md) を正本とする。
 
@@ -574,7 +586,7 @@ kio gc --yes --json
 - automatic authority はwriter開始前のcanonicalな`[gc]` subtree digestとretained scope / `.kio` identityへ固定し、publication後およびGC lock下のlocked re-plan前後で一致を要求する。mode/runtime/retentionまたはscope bindingが途中で変わればGC mutationを開始せず `KIO-E-GC-CONFIG-CHANGED-001` / exit 3 とする。既にdurableなpublicationは`publication_status="completed"`のままであり、index自身が更新する非GCのadapter/network設定はこのdigestの対象外である。
 - `max_runtime_seconds` はmonotonic soft deadlineである。安全なdurable checkpointで `status="deferred"`、`reason="max_runtime_seconds"`、`recovery_pending=true` を返しmarkerを残す。次回のautomatic writer入口は通常lockより前にresumeし、未完ならindex/snapshotを開始しない。shared treeは全candidate receiptが耐久化するまでtree phaseへ移らないためbatch境界でsharing closureを分割しない。
 - automatic resultはindex/snapshot payloadの`gc` objectに載せる。post-publication timeout/errorは`publication_status="completed"`を保持し、timeoutは`KIO-E-GC-RUNTIME-LIMIT-001` / exit 3、permanent integrity failureはexit 4、それ以外のpost-publication failureはpartial exit 3とする。pre-publication recovery timeoutは`publication_status="not_started"` / exit 3である。human outputにも`gc: <status> (<reason>)`を追記する。
-- internal child scopeはchild subprocess自身がそのscopeへ1回だけhookを適用し、保持済みchild capabilityと再bind identityが一致しない場合はfail-closedする。親scope hookがchildへ代理適用されることはなく、childのGC結果は親の`child_scopes[].gc`へ保持する。
+- internal child scope は保持済み Repository を使う共通 app 層の呼出しで、その scope へ1回だけ hook を適用する。保持済み child capability と再確認した identity が一致しない場合は fail-closed する。親 scope の hook が child へ代理適用されることはなく、child の GC 結果は親の `child_scopes[].gc` へ保持する。
 
 scheduled snapshotはPhase 4 milestone 4、Rust-only `on_idle` はmilestone 5で公開済みである ([05-runtime.md §2.2-§2.6](05-runtime.md))。
 
