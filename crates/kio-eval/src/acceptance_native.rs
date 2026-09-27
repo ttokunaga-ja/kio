@@ -194,6 +194,9 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
 
     let mut first = WatchChild::start(&options.binary, &watched.device, &watched.root)?;
     wait_running(options, &watched, &mut first)?;
+    // Reconciliation is proven above; stop before observing durable state so
+    // periodic indexing cannot race the search replica assertions.
+    first.stop(&options.binary, &watched.device, &watched.root)?;
     let before_scopes = collect_scope_manifests(&watched.root)?;
     let before_ignored = before_scopes
         .get("managed-then-ignored")
@@ -229,7 +232,6 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
         )?,
     });
     assert_effective_search_includes(options, &watched, &expected_pointer)?;
-    first.stop(&options.binary, &watched.device, &watched.root)?;
 
     apply_stopped_ignore_mutation(&watched.root)?;
     apply_stopped_ignore_mutation(&manual.root)?;
@@ -237,6 +239,7 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
     replace_same_length_preserving_mtime(&manual.root.join("same-length.txt"))?;
     let mut restarted = WatchChild::start(&options.binary, &watched.device, &watched.root)?;
     wait_running(options, &watched, &mut restarted)?;
+    restarted.stop(&options.binary, &watched.device, &watched.root)?;
     let after_scopes = collect_scope_manifests(&watched.root)?;
     assert_ignored_child_not_indexed(&after_scopes, &before_ignored)?;
     for query in [PRE_IGNORED_SEARCH_TOKEN, POST_IGNORED_SEARCH_TOKEN] {
@@ -280,7 +283,6 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
         ));
     }
     assert_manifest_bytes(&watched.root, &after_scopes)?;
-    restarted.stop(&options.binary, &watched.device, &watched.root)?;
 
     // The driver uses the shipped binary as its reconciler. It does not fake a
     // Kio outcome or alter release-only controls; queue injection is the bounded
@@ -406,7 +408,16 @@ fn assert_effective_search_includes(
             &output.stdout,
             expected_pointer,
             label,
-        )?;
+        )
+        .map_err(|error| {
+            search_assertion_error(
+                error,
+                "before Ignore revocation",
+                label,
+                output.status.code(),
+                &output.stderr,
+            )
+        })?;
     }
     Ok(())
 }
@@ -489,9 +500,39 @@ fn assert_effective_search_excludes(
             query,
             expected_exclusions,
             label,
-        )?;
+        )
+        .map_err(|error| {
+            search_assertion_error(
+                error,
+                "after Ignore revocation",
+                label,
+                output.status.code(),
+                &output.stderr,
+            )
+        })?;
     }
     Ok(())
+}
+
+// Exit 3 can also be a command-level error with JSON on stderr only. Keep
+// that diagnostic without relaxing the required search response contract.
+fn search_assertion_error(
+    error: AcceptanceError,
+    phase: &str,
+    label: &str,
+    exit_code: Option<i32>,
+    stderr: &[u8],
+) -> AcceptanceError {
+    const MAX_DIAGNOSTIC_BYTES: usize = 4096;
+    let detail = String::from_utf8_lossy(&stderr[..stderr.len().min(MAX_DIAGNOSTIC_BYTES)]);
+    let suffix = if stderr.len() > MAX_DIAGNOSTIC_BYTES {
+        " [truncated]"
+    } else {
+        ""
+    };
+    AcceptanceError::Command(format!(
+        "{phase}: {label} (exit {exit_code:?}): {error}; stderr={detail:?}{suffix}"
+    ))
 }
 
 // Exit 3 alone is not evidence of Ignore enforcement: it also covers unrelated
@@ -1218,8 +1259,8 @@ impl WatchChild {
         let deadline = Instant::now() + WATCH_TIMEOUT;
         loop {
             self.check_output_size()?;
-            if self.child.try_wait().map_err(io)?.is_some() {
-                return Ok(());
+            if let Some(status) = self.child.try_wait().map_err(io)? {
+                return validate_watch_stop_exit(status.code());
             }
             if Instant::now() >= deadline {
                 let _ = self.child.kill();
@@ -1242,6 +1283,15 @@ impl WatchChild {
         }
         Ok(())
     }
+}
+
+fn validate_watch_stop_exit(exit_code: Option<i32>) -> Result<(), AcceptanceError> {
+    if exit_code != Some(0) {
+        return Err(AcceptanceError::Command(format!(
+            "native watcher did not exit successfully after stop request: {exit_code:?}"
+        )));
+    }
+    Ok(())
 }
 
 impl Drop for WatchChild {
@@ -1768,6 +1818,44 @@ fn io(error: std::io::Error) -> AcceptanceError {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn watcher_stop_requires_successful_exit() {
+        assert!(validate_watch_stop_exit(Some(0)).is_ok());
+        for code in [None, Some(1), Some(3), Some(4), Some(101)] {
+            assert!(validate_watch_stop_exit(code).is_err(), "{code:?}");
+        }
+    }
+
+    #[test]
+    fn search_assertion_diagnostic_identifies_phase_and_retains_bounded_stderr() {
+        for phase in ["before Ignore revocation", "after Ignore revocation"] {
+            let error = search_assertion_error(
+                AcceptanceError::Json("EOF while parsing".into()),
+                phase,
+                "root descendant search",
+                Some(3),
+                b"{\"error_code\":\"KIO-E-SEARCH-SCOPE-ALL-FAILED-001\"}",
+            )
+            .to_string();
+            assert!(error.contains(phase));
+            assert!(error.contains("exit Some(3)"));
+            assert!(error.contains("KIO-E-SEARCH-SCOPE-ALL-FAILED-001"));
+        }
+        let mut stderr = vec![b'x'; 4096];
+        stderr.extend_from_slice(b"OMITTED-TAIL");
+        let error = search_assertion_error(
+            AcceptanceError::Json("EOF".into()),
+            "after Ignore revocation",
+            "all-scope search",
+            Some(3),
+            &stderr,
+        )
+        .to_string();
+        assert!(error.contains("[truncated]"));
+        assert!(!error.contains("OMITTED-TAIL"));
+        assert!(error.len() < 4400);
+    }
 
     fn denial_error() -> Value {
         json!({"error_code": "KIO-E-POLICY-SCOPE-DENIED-001", "message": "managed scope is denied by current ancestor policy", "context": {}})
