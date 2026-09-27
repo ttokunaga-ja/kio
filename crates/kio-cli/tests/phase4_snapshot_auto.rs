@@ -212,6 +212,17 @@ impl Drop for HeldLockChild {
     }
 }
 
+// Windows retained handles may prevent the attack before Kio observes it.
+// Only access-denied/sharing-violation count as that successful protection.
+fn attack_succeeded(result: std::io::Result<()>) -> bool {
+    match result {
+        Ok(()) => true,
+        #[cfg(windows)]
+        Err(error) if matches!(error.raw_os_error(), Some(5 | 32)) => false,
+        Err(error) => panic!("unexpected attack setup failure: {error}"),
+    }
+}
+
 fn barrier_path(dir: &TempDir, name: &str) -> PathBuf {
     let barriers = dir.path().join("barriers");
     fs::create_dir_all(&barriers).unwrap();
@@ -320,7 +331,7 @@ fn tree_paths(dir: &TempDir) -> Vec<String> {
         .collect()
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn stale_gc_candidate(mode: &str) -> (TempDir, String, String) {
     let old = "2025-01-01T00:00:00Z";
     let dir = canonical_tempdir();
@@ -364,7 +375,7 @@ fn skips_disabled_missing_and_not_indexed_without_mutating_kio() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 #[test]
 fn eligible_snapshot_fails_before_lock_or_state_on_unsupported_platform() {
     let dir = indexed_fixture(60, 1);
@@ -386,7 +397,7 @@ fn eligible_snapshot_fails_before_lock_or_state_on_unsupported_platform() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn first_run_noop_advances_canonical_state_and_json_and_human_agree() {
     let dir = indexed_fixture(60, 99);
@@ -418,7 +429,7 @@ fn first_run_noop_advances_canonical_state_and_json_and_human_agree() {
     assert!(human.contains("eligibility_reason: interval_elapsed"));
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn interval_boundaries_and_threshold_boundaries_are_deterministic() {
     let dir = indexed_fixture(60, 2);
@@ -443,7 +454,7 @@ fn interval_boundaries_and_threshold_boundaries_are_deterministic() {
     assert_eq!(after["eligibility_reason"], "interval_elapsed");
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn scheduled_counts_add_edit_delete_and_rename() {
     let dir = indexed_fixture(3600, 1);
@@ -469,7 +480,7 @@ fn scheduled_counts_add_edit_delete_and_rename() {
     assert_eq!(rename["stats"]["files_deleted"], 1);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn ignored_and_tier_a_inputs_do_not_change_snapshot() {
     let dir = canonical_tempdir();
@@ -525,7 +536,7 @@ fn symlink_is_rejected_before_snapshot_mutation() {
     assert_eq!(head(&dir), before);
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn hardlinked_working_file_is_rejected_before_snapshot_mutation() {
     let dir = indexed_fixture(60, 1);
@@ -552,7 +563,7 @@ fn hardlinked_working_file_is_rejected_before_snapshot_mutation() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn auto_preserves_existing_normalize_refs_and_never_runs_after_index_gc() {
     let dir = indexed_fixture(60, 1);
@@ -613,7 +624,7 @@ fn auto_preserves_existing_normalize_refs_and_never_runs_after_index_gc() {
     assert!(!dir.path().join(".kio/gc/internal/trees").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn clock_rollback_is_retryable_and_does_not_move_state_or_head() {
     let dir = indexed_fixture(60, 99);
@@ -637,7 +648,7 @@ fn clock_rollback_is_retryable_and_does_not_move_state_or_head() {
     assert_eq!(fs::read(state_path).unwrap(), before_state);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn tool_lock_only_change_waits_for_interval_then_creates_auto_commit() {
     let dir = indexed_fixture(60, 99);
@@ -675,7 +686,7 @@ fn tool_lock_only_change_waits_for_interval_then_creates_auto_commit() {
     assert_eq!(after.commit_type, CommitType::Auto);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn tool_lock_change_at_checkpoint_boundary_cannot_be_reported_as_noop() {
     let dir = indexed_fixture(60, 99);
@@ -697,10 +708,19 @@ fn tool_lock_change_at_checkpoint_boundary_cannot_be_reported_as_noop() {
     );
     let mut bytes = serde_json::to_vec(&lock).unwrap();
     bytes.push(b'\n');
-    fs::write(&lock_path, bytes).unwrap();
+    let attacked = attack_succeeded(fs::write(&lock_path, bytes));
     fs::write(ready.with_extension("release"), b"release").unwrap();
 
     let output = child.wait_with_output().unwrap();
+    if !attacked {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(dir.path().join(".kio/snapshot-auto.json").is_file());
+        return;
+    }
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         output_json(&output)["error_code"],
@@ -710,7 +730,7 @@ fn tool_lock_change_at_checkpoint_boundary_cannot_be_reported_as_noop() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn ref_advance_at_checkpoint_boundary_is_preserved_and_rejected() {
     let dir = indexed_fixture(60, 1);
@@ -736,10 +756,22 @@ fn ref_advance_at_checkpoint_boundary_is_preserved_and_rejected() {
     let child = child.spawn().unwrap();
     wait_for_path(&ready);
 
-    fs::write(dir.path().join(".kio/HEAD"), format!("{alternate}\n")).unwrap();
+    let attacked = attack_succeeded(fs::write(
+        dir.path().join(".kio/HEAD"),
+        format!("{alternate}\n"),
+    ));
     fs::write(ready.with_extension("release"), b"release").unwrap();
 
     let output = child.wait_with_output().unwrap();
+    if !attacked {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(dir.path().join(".kio/snapshot-auto.json").is_file());
+        return;
+    }
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         output_json(&output)["error_code"],
@@ -749,7 +781,7 @@ fn ref_advance_at_checkpoint_boundary_is_preserved_and_rejected() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn torn_head_capture_is_rejected_as_authority_change() {
     let dir = indexed_fixture(60, 1);
@@ -761,10 +793,22 @@ fn torn_head_capture_is_rejected_as_authority_change() {
     wait_for_path(&ready);
 
     let competing = format!("sha256:{}", "c".repeat(64));
-    fs::write(dir.path().join(".kio/HEAD"), format!("{competing}\n")).unwrap();
+    let attacked = attack_succeeded(fs::write(
+        dir.path().join(".kio/HEAD"),
+        format!("{competing}\n"),
+    ));
     fs::write(ready.with_extension("release"), b"release").unwrap();
 
     let output = child.wait_with_output().unwrap();
+    if !attacked {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(dir.path().join(".kio/snapshot-auto.json").is_file());
+        return;
+    }
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         output_json(&output)["error_code"],
@@ -778,7 +822,7 @@ fn torn_head_capture_is_rejected_as_authority_change() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn malformed_checkpoint_temp_fails_before_snapshot_publication() {
     let dir = indexed_fixture(60, 1);
@@ -807,7 +851,7 @@ fn malformed_checkpoint_temp_fails_before_snapshot_publication() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn concurrent_checkpoint_replacement_is_preserved_and_fails_closed() {
     let dir = indexed_fixture(60, 99);
@@ -830,10 +874,22 @@ fn concurrent_checkpoint_replacement_is_preserved_and_fails_closed() {
     let mut file = fs::File::create(&replacement).unwrap();
     file.write_all(concurrent).unwrap();
     file.sync_all().unwrap();
-    fs::rename(&replacement, dir.path().join(".kio/snapshot-auto.json")).unwrap();
+    let attacked = attack_succeeded(fs::rename(
+        &replacement,
+        dir.path().join(".kio/snapshot-auto.json"),
+    ));
     fs::write(ready.with_extension("release"), b"release").unwrap();
 
     let output = child.wait_with_output().unwrap();
+    if !attacked {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(dir.path().join(".kio/snapshot-auto.json").is_file());
+        return;
+    }
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         output_json(&output)["error_code"],
@@ -853,7 +909,7 @@ fn concurrent_checkpoint_replacement_is_preserved_and_fails_closed() {
     assert_eq!(head(&dir), before_head);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn concurrent_first_checkpoint_publication_is_no_clobber() {
     let dir = indexed_fixture(60, 99);
@@ -898,7 +954,7 @@ fn concurrent_first_checkpoint_publication_is_no_clobber() {
     }));
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn crash_after_checkpoint_temp_fsync_is_recovered_without_residue() {
     let dir = indexed_fixture(60, 99);
@@ -933,7 +989,7 @@ fn crash_after_checkpoint_temp_fsync_is_recovered_without_residue() {
     }));
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn crash_after_checkpoint_before_ref_keeps_cooldown_and_head_boundary() {
     let dir = indexed_fixture(60, 99);
@@ -965,7 +1021,10 @@ fn crash_after_checkpoint_before_ref_keeps_cooldown_and_head_boundary() {
     assert_ne!(head(&dir), before_head);
 }
 
-#[cfg(all(debug_assertions, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(
+    debug_assertions,
+    any(target_os = "macos", target_os = "linux", windows)
+))]
 #[test]
 fn live_writer_lock_rejects_scheduled_snapshot_without_state_publication() {
     let dir = indexed_fixture(60, 1);
@@ -997,7 +1056,7 @@ fn live_writer_lock_rejects_scheduled_snapshot_without_state_publication() {
     assert!(first_output.status.success());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn config_inode_replacement_at_publication_is_retryable_and_nonpublishing() {
     let dir = indexed_fixture(60, 1);
@@ -1013,10 +1072,19 @@ fn config_inode_replacement_at_publication_is_retryable_and_nonpublishing() {
     let bytes = fs::read(&config).unwrap();
     let replacement = dir.path().join(".kio/config.replacement");
     fs::write(&replacement, bytes).unwrap();
-    fs::rename(&replacement, &config).unwrap();
+    let attacked = attack_succeeded(fs::rename(&replacement, &config));
     fs::write(ready.with_extension("release"), b"release").unwrap();
 
     let output = child.wait_with_output().unwrap();
+    if !attacked {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(dir.path().join(".kio/snapshot-auto.json").is_file());
+        return;
+    }
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         output_json(&output)["error_code"],
@@ -1026,7 +1094,7 @@ fn config_inode_replacement_at_publication_is_retryable_and_nonpublishing() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn ignore_policy_change_at_writer_boundary_is_rejected_before_cas() {
     let dir = indexed_fixture(60, 1);
@@ -1058,7 +1126,7 @@ fn ignore_policy_change_at_writer_boundary_is_rejected_before_cas() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn working_file_change_after_final_observation_is_not_published() {
     let dir = indexed_fixture(60, 1);
@@ -1071,9 +1139,29 @@ fn working_file_change_after_final_observation_is_not_published() {
     wait_for_path(&ready);
 
     let replacement = b"changed after final observation\n";
-    fs::write(dir.path().join("new.md"), replacement).unwrap();
+    let attacked = attack_succeeded(fs::write(dir.path().join("new.md"), replacement));
     fs::write(ready.with_extension("release"), b"release").unwrap();
     let output = child.wait_with_output().unwrap();
+    if !attacked {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(dir.path().join(".kio/snapshot-auto.json").is_file());
+        let repo = Repository::open(dir.path()).unwrap();
+        let commit = repo.read_commit(&head(&dir).unwrap()).unwrap();
+        let tree = repo.read_tree(&commit.tree).unwrap();
+        assert_eq!(
+            tree.entries
+                .iter()
+                .find(|entry| entry.path == "new.md")
+                .unwrap()
+                .raw_hash,
+            hash_bytes(b"observed bytes\n")
+        );
+        return;
+    }
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         output_json(&output)["error_code"],
@@ -1089,7 +1177,7 @@ fn working_file_change_after_final_observation_is_not_published() {
     );
 }
 
-#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux", windows)))]
 #[test]
 fn unsafe_symlink_added_at_writer_boundary_is_rejected_before_cas() {
     use std::os::unix::fs::symlink;
@@ -1121,7 +1209,7 @@ fn unsafe_symlink_added_at_writer_boundary_is_rejected_before_cas() {
     );
 }
 
-#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn hardlink_added_at_writer_boundary_is_rejected_before_cas() {
     let dir = indexed_fixture(60, 1);
@@ -1134,13 +1222,22 @@ fn hardlink_added_at_writer_boundary_is_rejected_before_cas() {
     let child = child.spawn().unwrap();
     wait_for_path(&ready);
 
-    fs::hard_link(
+    let attacked = attack_succeeded(fs::hard_link(
         dir.path().join("note.md"),
         outside.path().join("external-note-link"),
-    )
-    .unwrap();
+    ));
     fs::write(ready.with_extension("release"), b"release").unwrap();
     let output = child.wait_with_output().unwrap();
+    if !attacked {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(dir.path().join(".kio/snapshot-auto.json").is_file());
+        assert!(!outside.path().join("external-note-link").exists());
+        return;
+    }
     assert_eq!(output.status.code(), Some(4));
     assert_eq!(
         output_json(&output)["error_code"],
@@ -1182,7 +1279,7 @@ fn non_utf8_leaf_added_at_writer_boundary_is_rejected_before_cas() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn scope_replacement_at_writer_boundary_cannot_mutate_either_store() {
     let dir = indexed_fixture(60, 1);
@@ -1198,7 +1295,19 @@ fn scope_replacement_at_writer_boundary_cannot_mutate_either_store() {
     wait_for_path(&ready);
 
     let retained = dir.path().join(".kio-retained");
-    fs::rename(dir.path().join(".kio"), &retained).unwrap();
+    let attacked = attack_succeeded(fs::rename(dir.path().join(".kio"), &retained));
+    if !attacked {
+        fs::write(ready.with_extension("release"), b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(kio_bytes(&victim.path().join(".kio")), victim_before);
+        assert!(dir.path().join(".kio/snapshot-auto.json").is_file());
+        return;
+    }
     fs::rename(victim.path().join(".kio"), dir.path().join(".kio")).unwrap();
     fs::write(ready.with_extension("release"), b"release").unwrap();
     let output = child.wait_with_output().unwrap();
@@ -1221,7 +1330,7 @@ fn scope_replacement_at_writer_boundary_cannot_mutate_either_store() {
     );
 }
 
-#[cfg(all(unix, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(unix, any(target_os = "macos", target_os = "linux", windows)))]
 #[test]
 fn object_namespace_replacement_after_binding_cannot_redirect_publication() {
     use std::os::unix::fs::symlink;
@@ -1263,7 +1372,7 @@ fn object_namespace_replacement_after_binding_cannot_redirect_publication() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(unix)]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn scope_replacement_before_lock_cannot_write_the_replacement_store() {
     let dir = indexed_fixture(60, 1);
@@ -1278,7 +1387,22 @@ fn scope_replacement_before_lock_cannot_write_the_replacement_store() {
     let child = child.spawn().unwrap();
     wait_for_path(&ready);
 
-    fs::rename(dir.path().join(".kio"), dir.path().join(".kio-retained")).unwrap();
+    let attacked = attack_succeeded(fs::rename(
+        dir.path().join(".kio"),
+        dir.path().join(".kio-retained"),
+    ));
+    if !attacked {
+        fs::write(ready.with_extension("release"), b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(kio_bytes(&victim.path().join(".kio")), victim_before);
+        assert!(dir.path().join(".kio/snapshot-auto.json").is_file());
+        return;
+    }
     fs::rename(victim.path().join(".kio"), dir.path().join(".kio")).unwrap();
     fs::write(ready.with_extension("release"), b"release").unwrap();
     let output = child.wait_with_output().unwrap();
@@ -1292,7 +1416,7 @@ fn scope_replacement_before_lock_cannot_write_the_replacement_store() {
     assert!(!dir.path().join(".kio-retained/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn scope_replacement_before_gc_preflight_cannot_resume_the_victim_marker() {
     let dir = indexed_fixture(60, 1);
@@ -1314,7 +1438,22 @@ fn scope_replacement_before_gc_preflight_cannot_resume_the_victim_marker() {
     let child = child.spawn().unwrap();
     wait_for_path(&ready);
 
-    fs::rename(dir.path().join(".kio"), dir.path().join(".kio-retained")).unwrap();
+    let attacked = attack_succeeded(fs::rename(
+        dir.path().join(".kio"),
+        dir.path().join(".kio-retained"),
+    ));
+    if !attacked {
+        fs::write(ready.with_extension("release"), b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(kio_bytes(&victim.path().join(".kio")), victim_before);
+        assert!(!dir.path().join(".kio/gc/in_progress").exists());
+        return;
+    }
     fs::rename(victim.path().join(".kio"), dir.path().join(".kio")).unwrap();
     fs::write(ready.with_extension("release"), b"release").unwrap();
 
@@ -1334,7 +1473,7 @@ fn scope_replacement_before_gc_preflight_cannot_resume_the_victim_marker() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn active_purge_barrier_blocks_raw_republication_and_state_advance() {
     let dir = indexed_fixture(60, 1);
@@ -1393,7 +1532,7 @@ fn active_purge_barrier_blocks_raw_republication_and_state_advance() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn purge_journal_created_at_writer_boundary_blocks_before_cas() {
     let dir = indexed_fixture(60, 1);
@@ -1427,7 +1566,7 @@ fn purge_journal_created_at_writer_boundary_blocks_before_cas() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn disabled_scheduler_does_not_resume_an_after_index_marker() {
     let (dir, _, tree) = stale_gc_candidate("after_index");
@@ -1456,7 +1595,7 @@ fn disabled_scheduler_does_not_resume_an_after_index_marker() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn active_manual_gc_marker_remains_an_ordinary_writer_barrier() {
     let (dir, _, _) = stale_gc_candidate("manual_only");
@@ -1484,7 +1623,7 @@ fn active_manual_gc_marker_remains_an_ordinary_writer_barrier() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn active_after_index_marker_is_recovered_before_scheduled_publication() {
     let (dir, commit, tree) = stale_gc_candidate("after_index");
@@ -1511,4 +1650,215 @@ fn active_after_index_marker_is_recovered_before_scheduled_publication() {
             .unwrap()
             .exists()
     );
+}
+
+#[cfg(windows)]
+fn interrupted_windows_state_exchange(fault: &str) -> (TempDir, String) {
+    let dir = indexed_fixture(60, 99);
+    auto(&dir, T0);
+    let original_head = head(&dir).unwrap();
+    fs::write(dir.path().join("new.md"), "pending exchange input\n").unwrap();
+    let interrupted = kio(
+        &dir,
+        &["snapshot", "auto", "--json"],
+        "2026-08-14T00:01:00Z",
+    )
+    .env("KIO_TEST_GC_FAULT", fault)
+    .output()
+    .unwrap();
+    assert_eq!(
+        interrupted.status.code(),
+        Some(7),
+        "{fault}: {}",
+        String::from_utf8_lossy(&interrupted.stderr)
+    );
+    assert_eq!(head(&dir).as_deref(), Some(original_head.as_str()));
+    (dir, original_head)
+}
+
+#[cfg(windows)]
+fn check_windows_state_exchange_recovery(fault: &str) {
+    let (dir, original_head) = interrupted_windows_state_exchange(fault);
+    let owner = dir.path().join(".kio/gc/internal/snapshot-state-exchange");
+    let pending = !fault.ends_with("intent_remove");
+    assert_eq!(owner.join("intent.json").is_file(), pending);
+    if fault.ends_with("source_capture") {
+        assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
+    }
+    let before = kio_bytes(&dir.path().join(".kio"));
+    {
+        let session = kio_core::gc::GcSweepSession::bind(dir.path()).unwrap();
+        assert_eq!(
+            session.has_pending_snapshot_auto_state_exchange().unwrap(),
+            pending
+        );
+        if pending {
+            // In particular, the missing-public-state window must not become None.
+            assert!(session.snapshot_auto_state().is_err());
+        } else {
+            assert!(session.snapshot_auto_state().is_ok());
+        }
+    }
+    assert_eq!(kio_bytes(&dir.path().join(".kio")), before);
+    if pending {
+        for args in [
+            &["gc", "--dry-run", "--json"][..],
+            &[
+                "snapshot",
+                "create",
+                "-m",
+                "blocked ordinary writer",
+                "--json",
+            ][..],
+        ] {
+            let output = kio(&dir, args, "2026-08-14T00:01:01Z").output().unwrap();
+            assert_eq!(output.status.code(), Some(4));
+            assert_eq!(
+                output_json(&output)["error_code"],
+                "KIO-E-STORE-CORRUPT-001"
+            );
+            assert_eq!(kio_bytes(&dir.path().join(".kio")), before);
+        }
+    }
+    let recovered = auto(&dir, "2026-08-14T00:01:01Z");
+    assert_eq!(recovered["status"], "skipped");
+    assert_eq!(recovered["reason"], "not_eligible");
+    assert_eq!(recovered["next_eligible_at"], "2026-08-14T00:02:00Z");
+    assert_eq!(head(&dir).as_deref(), Some(original_head.as_str()));
+    assert!(!owner.join("intent.json").exists());
+    assert!(!owner.join("backup").exists());
+    let due = auto(&dir, "2026-08-14T00:02:00Z");
+    assert_eq!(due["status"], "completed");
+    let repo = Repository::open(dir.path()).unwrap();
+    let commit = repo.read_commit(&head(&dir).unwrap()).unwrap();
+    assert_eq!(commit.parent.as_deref(), Some(original_head.as_str()));
+    assert_eq!(commit.commit_type, CommitType::Auto);
+}
+
+#[cfg(windows)]
+macro_rules! windows_state_exchange_test {
+    ($name:ident, $fault:literal) => {
+        #[test]
+        fn $name() {
+            check_windows_state_exchange_recovery($fault);
+        }
+    };
+}
+
+#[cfg(windows)]
+windows_state_exchange_test!(
+    windows_snapshot_state_recovers_after_intent,
+    "after_windows_snapshot_state_exchange_intent"
+);
+#[cfg(windows)]
+windows_state_exchange_test!(
+    windows_snapshot_state_recovers_missing_public_after_source_capture,
+    "after_windows_snapshot_state_exchange_source_capture"
+);
+#[cfg(windows)]
+windows_state_exchange_test!(
+    windows_snapshot_state_recovers_after_target_publish,
+    "after_windows_snapshot_state_exchange_target_publish"
+);
+#[cfg(windows)]
+windows_state_exchange_test!(
+    windows_snapshot_state_recovers_after_names_complete,
+    "after_windows_snapshot_state_exchange_names_complete"
+);
+#[cfg(windows)]
+windows_state_exchange_test!(
+    windows_snapshot_state_recovers_after_source_retire,
+    "after_windows_snapshot_state_exchange_source_retire"
+);
+#[cfg(windows)]
+windows_state_exchange_test!(
+    windows_snapshot_state_recovers_after_intent_remove,
+    "after_windows_snapshot_state_exchange_intent_remove"
+);
+
+#[cfg(windows)]
+#[test]
+fn windows_snapshot_state_recovery_rejects_substituted_source_or_target() {
+    for substitute_source in [true, false] {
+        let (dir, original_head) = interrupted_windows_state_exchange(
+            "after_windows_snapshot_state_exchange_source_capture",
+        );
+        let owner = dir.path().join(".kio/gc/internal/snapshot-state-exchange");
+        let intent: Value =
+            serde_json::from_slice(&fs::read(owner.join("intent.json")).unwrap()).unwrap();
+        let path = if substitute_source {
+            owner.join("backup")
+        } else {
+            dir.path()
+                .join(".kio")
+                .join(intent["prepared"].as_str().unwrap())
+        };
+        let bytes = fs::read(&path).unwrap();
+        // Keep the old identity allocated, so this is a guaranteed same-byte substitution.
+        let parked = canonical_tempdir();
+        fs::rename(&path, parked.path().join("original")).unwrap();
+        fs::write(&path, bytes).unwrap();
+        let before = kio_bytes(&dir.path().join(".kio"));
+        let output = kio(
+            &dir,
+            &["snapshot", "auto", "--json"],
+            "2026-08-14T00:01:01Z",
+        )
+        .output()
+        .unwrap();
+        assert_eq!(output.status.code(), Some(4));
+        assert_eq!(head(&dir).as_deref(), Some(original_head.as_str()));
+        assert_eq!(kio_bytes(&dir.path().join(".kio")), before);
+        assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_snapshot_state_recovery_rechecks_current_policy() {
+    let (dir, original_head) =
+        interrupted_windows_state_exchange("after_windows_snapshot_state_exchange_source_capture");
+    configure(&dir, true, 120, 99);
+    let before = kio_bytes(&dir.path().join(".kio"));
+    let output = kio(
+        &dir,
+        &["snapshot", "auto", "--json"],
+        "2026-08-14T00:01:01Z",
+    )
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(head(&dir).as_deref(), Some(original_head.as_str()));
+    assert_eq!(kio_bytes(&dir.path().join(".kio")), before);
+    assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_snapshot_state_recovery_requires_enabled_current_policy() {
+    let (dir, original_head) =
+        interrupted_windows_state_exchange("after_windows_snapshot_state_exchange_source_capture");
+    let config = dir.path().join(".kio/config.toml");
+    let authorized = fs::read(&config).unwrap();
+    configure(&dir, false, 60, 99);
+    let before = kio_bytes(&dir.path().join(".kio"));
+    let output = kio(
+        &dir,
+        &["snapshot", "auto", "--json"],
+        "2026-08-14T00:01:01Z",
+    )
+    .output()
+    .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(
+        output_json(&output)["error_code"],
+        "KIO-E-SNAPSHOT-AUTHORITY-CHANGED-001"
+    );
+    assert_eq!(kio_bytes(&dir.path().join(".kio")), before);
+    assert_eq!(head(&dir).as_deref(), Some(original_head.as_str()));
+    assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
+    fs::write(config, authorized).unwrap();
+    let recovered = auto(&dir, "2026-08-14T00:01:01Z");
+    assert_eq!(recovered["reason"], "not_eligible");
+    assert_eq!(recovered["next_eligible_at"], "2026-08-14T00:02:00Z");
 }

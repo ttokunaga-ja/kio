@@ -1199,7 +1199,7 @@ HEAD から到達しない `repaired` は `repaired_outside_head` として保�
 - shared treeは対象commit全件のreceipt耐久化後に1回だけ除去する。除去直前にも全ref tip、全commitの
   tree共有、receipt、marker、bound scope identityを再検証し、相違は自動再計画せずfail-closedにする
 - tree/marker の隔離・退役名は `.kio/gc/internal/` 配下の operation-reserved namespace とする。
-  retained descriptor、nofollow、no-replace exchange、identity/hash/single-link の再検証で、隔離前および
+  retained descriptor、nofollow、no-replace rename、identity/hash/single-link の再検証で、隔離前および
   検出可能な隔離後の差替えは fail-closed にする。POSIX の最終 pathname unlink には inode 条件を付与
   できないため、検証直後の reserved name へ第三者が直接書き込む残余窓は §3.5 の export 隔離と同じく
   保護契約外とする。この例外は public CAS path、scope/fanout directory、receipt/marker public name、
@@ -1214,19 +1214,76 @@ HEAD から到達しない `repaired` は `repaired_outside_head` として保�
 - 各回転は公開 `index/sqlite.db` をin-place更新しない。retained `.kio` capabilityからsourceの
   generation/physical identityとsource file state（size/mtime/ctime）を固定し、`.kio/gc/internal/index/` の
   private copyを更新・file fsyncしてから、source state、source/target/private-directory identityをmarkerへ
-  耐久化する。その後、descriptor-relative atomic exchange直前にもsource stateを再照合した上でexchangeを
-  行い、公開`index/`、private directoryの順にfsyncする。recoveryは公開leafがmarkerのsourceかtargetである
-  場合だけ再開し、同generationの別inode、private directory/leaf差替え、unsupported platformはreceipt publish前
+  耐久化する。その後、source stateを再照合して公開leafを切り替える。macOS / Linuxは
+  descriptor-relative atomic exchange後、公開`index/`、private directoryの順にfsyncする。
+  Windowsは下記のjournal付きno-replace moveを使う。recoveryは公開leafがmarkerのsourceかtargetである
+  場合、またはWindowsの一致するjournalが公開leaf不在を説明する場合だけ再開する。
+  同generationの別identity、private directory/leaf差替え、unsupported platformはreceipt publish前
   またはtree除去前にfail-closedとする
 - private copy の pre-sweep generation 更新と同一 SQLite transaction で、strict singleton
   `gc_rotation_attestation`（version、sweep ID、role、plan digest、source/target generation）を記録する。
   tree除去直前に公開DBのgeneration/physical identityとこのattestationをmarkerへ再照合し、単にmarkerの
   `index_pre_sweep`を現在値へ偽装した状態を回転済みとは扱わない。coreのtree除去APIはこのtrusted index検証後に
   発行されるprocess-local permitを必須とし、marker JSONだけを物理削除authorityにしない
-- power-loss 中断時は次回起動時に sweep 再開 (.kio/gc/in_progress マーカーで検出)
+- 中断時は次のGC mutation入口でsweepを再開する（in_progressまたはpending marker exchangeで検出）。
+  read-only入口では回復しない。Windowsのpower-loss耐久性は下記の制約に従う
 - markerだけでreceipt/tree進捗が無い場合に限り、locked fresh planとの不一致を確認してmarkerを退役し、
   新規previewを要求してよい。一度作成したreceiptはrollbackしない
 ```
+
+Windows の marker 更新と index rotation は、GC 専用の versioned canonical intent と
+retained HANDLE による no-replace move を用いる。Windows API に atomic な二名交換を仮定しない。
+owner は `.kio/gc/internal/marker-exchange/` と `index-exchange/` に分離し、一般の
+`.kio-atomic` schema は変更しない。intent は operation kind / binding、両 parent identity、direct leaf 名、
+source / target の single-link identity・length・content hash を、いずれの移動よりも先に記録する。
+scope・`.kio`・両 parent・private directory を保持し、同一 volume と現在の identity / bytes を再検証する。
+mutation 用 HANDLE は競合する write/delete open を許さず、次の5配置だけを受理する。
+
+| 状態 | public leaf | prepared leaf | reserved backup |
+| --- | --- | --- | --- |
+| Initial | source | target | 不在 |
+| Source captured | 不在 | target | source |
+| Target published | target | 不在 | source |
+| Exchange complete | target | source | 不在 |
+| Source retired | target | 不在 | 不在 |
+
+source → backup、target → public、backup → prepared の順で同じ HANDLE を移動し、
+中断後は残りの段階を完了する。第三のfile、重複配置、parent差替え、hardlink / reparse、未知の残骸は
+fail-closed とし削除しない。旧 source は intent を残したまま exact HANDLE で disposition し、
+同一 identity と link count 0 を確認して truncate / flush する。削除 owner HANDLE を閉じて
+prepared 名の不在を確認した後にだけ intent を消す。disposition 成功だけでは完了としない。
+Source retired からの回復は、actual target、retained parents、caller binding と現在の意味的 authority を
+再検証して journal cleanup だけを行う。失われた source を再作成したり、digest から旧 marker を推測しない。
+
+marker 回復は旧/新 canonical schema と許可された phase 遷移を検証し、現在の retention policy、
+receipt、phase、frozen truth を再検証する。index 回復は GC marker 内の exact rotation / private parent
+へ束縛し、journal が説明する一時的な public index 不在を CREATE で埋めない。SQLite は pager access 前に
+`SQLITE_FCNTL_WIN32_GET_HANDLE` で actual main-file HANDLE を照合する。HANDLE 由来の locator は
+lookup hint にすぎず、既存 sidecar、不一致 identity、unexpected open は拒否する。namespace helper の
+完了だけでは tree deletion を許可せず、generation、rotation role、plan digest と source/target identity・
+attestation の検証を引き続き要求する。
+
+Windows の tree 退役も frozen marker authority と deterministic quarantine を使い、read/write/delete
+権限・read-only sharing の同じ HANDLE で no-replace 移動する。marker/index/receipt の最終確認後に
+exact HANDLE で disposition、同一 identity / zero links 検証、truncate / flush を行う。
+旧 marker と prepared index も同じ exact-handle 退役規則に従う。POSIX sentinel / pathname unlink を
+Windows の削除 authority として代用しない。
+
+pending marker exchange（intent の未公開残骸を含む）は、public `gc/in_progress` が不在でも
+active/corrupt state とする。通常 read/write/search は `KIO-E-STORE-CORRUPT-001` / exit 4 で
+fail-closed し、read-only command は回復しない。`kio gc --dry-run` は
+`status="recovery_pending", reason="marker_exchange"` を返す。手動GC command は対話時でも明示
+`kio gc --yes` を必要とし、専用 writer lock 下で ordinary marker を読む前に回復する。
+明示automatic modeの同mode回復入口は§2.3の規約に従う。
+これは交換中ではない canonical active marker の既存契約（通常writer拒否、新規cursor抑止、
+page 1 は返却可能なら `next_cursor=null`、replay は既存generation/barrier検証）とは別である。
+
+Windows 実装の利用可能性は native acceptance 完了を意味しない。native Windows の各 move / intent /
+cleanup 中断、反復 resume、非空 CLI GC、automatic GC、差替え / hardlink / reparse / collision 拒否、
+public 名不在時の通常操作排除、retained reader の byte reclamation を検証し、3 OS の GitHub Actions
+acceptance と最終 security review を release gate とする。process interruption の回復検証と power-loss
+ordering の証明は分離する。NTFS の HANDLE rename / disposition / zero links / truncate / file flush の
+probe 成功から Unix と同等の directory fsync や volume power-loss durability を主張しない。
 
 ## 2.6 GC の削除対象 (規範)
 
@@ -1284,8 +1341,12 @@ strict ancestor commitが参照するものだけであり、anchor以後や無�
 
 走査は retained scope / `.kio` descriptor と同じwriter gateのshared lockを保持し、すべて capability-relative・
 nofollow で行う。symlink/reparse、非regular、unsafe hardlink、identity/size/hash/link countの変化を拒否する。
-このmutation-free shared descriptor gateを実装済みのplatformはmacOS / Linuxであり、その他ではscopeを
-変更せずfail-closedする。
+macOS / Linux はdirectory `flock`、Windows はstorage format `2.0.0`のimmutableな空file
+`.kio/.store-gate`を`GENERIC_READ`で開くnonblocking shared `LockFileEx`を使う。
+Windowsの実writerも同じgateのexclusive lockを`.lock`作成・stale回収前からowner closeまで保持する。
+read-only走査はgateを作成・修復・書換えしない。2.0.0でgate欠落・unsafeならfail-closedし、旧1.0.0は
+gate検査より先のversion検査でexit 8とする。その他の非対応platformではscopeを変更せずfail-closedする。
+Windowsのnative acceptanceは前節のrelease gateに従う。
 object数、総physical/verified bytes、manifest unit数、history/ref/receipt/directory/name/depthを上限化し、
 refs・receipt・purge/GC stateを含む独立した全走査を2回行って結果とfilesystem observationの完全一致を
 要求する。active/recovery/uncertain state、欠落、malformed、race、上限超過はcandidate 0へ縮退せず
@@ -1747,6 +1808,7 @@ batch 系と reindex は外部副作用 (upload / job 作成) と batch_requests
 
 - 読み取り系 (search / log / view / open / inspect / evidence verify / export / status / diff) は通常 `.kio/.lock` を取得しない。ただし fresh page 1 で HTTP query embedding を送る search は、許可を与える参加 scope の writer lease を取得し、current policy / paired grant を最終検証して処理終了まで保持する (§1.1)。`kio index` と `kio search` の同時実行は許容する。検索は `.kio/index/sqlite.db` の WAL snapshot を読まず、公開済み `aggregator.sqlite` の projection だけを読む。`index_status.budget_paused` の月次 cap 観測は、1 search invocation につき device-global cost-ledger の owned read-only snapshot を command preflight で1個だけ作る。取得は既存の入力・mode 判定後、fresh vector / hybrid page 1 の writable ledger open・claim / reservation・query embedding 送信より前に完了する。同じ snapshot と取得時の UTC 集計月を response まで保持し、取得後の別 writer や同一 invocation による charge はその response の月次 cap 観測へ混ぜない。source main / `-wal` / `-shm` を NOFOLLOW・regular・single-link・identity・size・SHA で前後観測し、owner-private temp へ main と存在する WAL だけを複写して `READ_ONLY` + `query_only` で読む (SHM は複写しない)。全3 leaf absent のみ no-ledger / spent=0 とし、partial leaf・unsafe link / replacement・stable-copy integrity failure は `KIO-E-LEDGER-SNAPSHOT-UNSAFE-001` / exit 4、presence/hash drift・busy・retry exhaustion・temp/copy/open/query の不確定性は `KIO-E-LEDGER-SNAPSHOT-001` / exit 3 で stdout を返さず fail-closed する。これは開始と終了の一致を要求する stable-or-fail 観測であり、cross-file formal atomic snapshot の主張ではない。例外的に `kio search` は final consent check を通過した online_api の vector|hybrid fresh page 1 に限り cost-ledger.sqlite の device 行 (`scope_id='device'`) への相 1 / stale 回収・剪定の書込を行う。claim 開始後の adapter failure で最終結果が text fallback になってもこの例外は維持される。一方、offline / profile incompatibility / final consent rejection による pre-attempt auto→text はこの書込を行わない。device 行自体の直列化は cost-ledger 側の `BEGIN IMMEDIATE` Tx が担う — device 行はどの scope にも属さないが、query dispatch の承認には上述の authorizing scope の writer lease を保持する ([04-pipeline.md §5.4](04-pipeline.md))
 - `.kio/.lock` を取得できない場合、書き込み系コマンドは**待機せず即座に失敗する**: error code `KIO-E-STORE-LOCKED-001`、exit code 3 (retryable、[06-cli-spec.md §7](06-cli-spec.md))。lock ファイルには保持プロセスの pid と取得時刻を記録し、保持プロセスが存在しない stale lock は次の取得試行時に回収してよい。Unixでは acquire/reclaim/release 全体を crash-release される directory `flock` でも直列化し、release はcheck-then-unlinkでなくdead canonical sentinelとのatomic exchangeを使う。このため非保持時にもdead sentinel leafが残り得るが、次writerが同じgate下で回収し、単なる`.lock`存在だけをlive判定に使わない。
+- storage format `2.0.0` は全OSの初期化時にimmutableな空regular file `.kio/.store-gate` を作る。Windowsのwriterはこの同一gateのnonblocking exclusive `LockFileEx`を`.lock`のcreate/reclaimより先に取得し、owner closeまで保持する。unreachable inventoryは`GENERIC_READ`で同じgateのshared lockを取り、writerとの相互排除をmutationなしに行う。Unixのdirectory `flock`は変更しない。2.0.0のgate欠落・unsafe状態はfail-closedし自動修復しない。旧1.0.0はgate検査に先立つversion検査で`KIO-E-STORE-VERSION-001` / exit 8とする。gateの詳細は[03-data-model.md](03-data-model.md)に従う。
 - refs (refs/heads/main, refs/tags-v1/*) の更新は `.kio/.lock` 保持下で、temp file 書き込み + atomic rename により行う (部分書き込みを外部に見せない)
 - `kio repair verify-objects` の raw object 復旧と repaired commit publication も、同じ lock の下で private temp + hash 再検証 + atomic publish を使う
 - `kio repair rebuild-db` 実行中の `kio search` は旧 `.kio/index/sqlite.db` を読まない。scope の replica header が `Rebuilding` または完全 projection を欠く間は `KIO-E-INDEX-REBUILDING-001` で fail-closed とし、writer が新しい projection を publish してから検索へ再参加させる。再構築本体は引き続き atomic rename (`sqlite.db.tmp → sqlite.db`) で切り替える
@@ -1868,10 +1930,34 @@ systemd --user: WorkingDirectory=/absolute/indexed/scope
                 ExecStart=/absolute/path/kio snapshot auto --json
 ```
 
-現行のscheduled mutationはdescriptor-relative writer lockとatomic state exchangeを実装済みの
-macOS / Linuxだけで有効である。Windowsおよびその他のplatformでは、eligibleな実行を
+scheduled mutation は macOS / Linux / Windows の実装経路を持つ。Windows は retained HANDLE
+で metadata / raw staging / purge・entry guard を検証し、checkpoint の既存 leaf 置換には
+§2.5 の5状態journalを `OperationKind::SnapshotState` として使う。owner は
+`.kio/gc/internal/snapshot-state-exchange/` に分離し、marker/index exchange のownerと共有しない。
+Windowsの単純なreplace renameをatomic exchangeとして扱わない。非対応platformではeligibleな実行を
 `.kio/.lock`・HEAD・scheduler stateへ触れる前に
 `KIO-E-SNAPSHOT-PLATFORM-UNSUPPORTED-001`でfail-closedする。
+
+pending checkpoint exchange はpublic `snapshot-auto.json`が不在でもfresh runと解釈しない。
+read-only state検査と通常writer / GCはfail-closedし、enabledな明示 `kio snapshot auto`だけが
+専用writer lock下でindex metadata、GC preflight、eligibility判定より先に回復する。
+config欠落/disabledとpendingが併存する場合は通常のdisabled skipにせず、
+`KIO-E-SNAPSHOT-AUTHORITY-CHANGED-001` / exit 3で無変更のまま拒否する。
+
+persisted authorityはscope / `.kio` identity、検証したHEAD / tool-lock / config / root ignoreのbyte digest、
+GC設定のcanonical semantic digestへ束縛する。現在のinvocationでも交換・回復の前後に
+retained fileのexact observationを再検証する。persisted値が変わっていれば回復を拒否する一方、元の正確なbyte値へ戻したfileを
+過去のinode不一致だけで拒否しない（scope / `.kio` identityは引き続き一致必須）。
+checkpointはcanonical schemaとtimestamp / working-set digestに対応する許可された単調な遷移を検証する。
+旧source退役済みならactual targetを検証し、失われたsourceを復元・推測しない。intentは旧sourceの
+exact-handle退役とowner HANDLE close後のprepared名不在確認まで保持する。
+
+Windows経路の有効化はnative acceptance完了を意味しない。intent publish、source capture、target
+publish、exchange complete、source retirement、intent removalの6中断点と反復回復を検証対象とする。
+3 OS ActionsのA09では実public CLIによるfirst-run noop、変更後の直系child commit作成、直後の
+not-eligible再実行も確認し、§2.5のnative acceptance / security gateを満たすまで未受入とする。
+process interruptionの回復とpower-loss orderingは分離し、Windowsのfile flushにUnixのdirectory fsyncと
+同じ耐久性を仮定しない。
 
 JSONは`operation,status,reason,publication_status,snapshot_status,eligibility_reason,eligible,change_count,next_eligible_at,
 commit_hash,tree_hash,stats,working_set_digest,idle_observed_since,idle_observed_seconds,
@@ -1881,6 +1967,7 @@ on_idle の human / JSON output は `baseline_recorded`、`not_idle`、`complete
 next eligible時刻を決定的に表示する。
 
 state が unsupported / malformed で clean recreation が必要な場合は、Kio writer を停止し、
-`.kio/gc/in_progress` が無く `.kio/.lock` に live operation が無いことを確認してから、正確に
+`.kio/gc/in_progress` とpending marker/index/snapshot-state exchangeが無く、`.kio/.lock` に
+live operation が無いことを確認してから、正確に
 `.kio/snapshot-auto.json` の leaf だけを除去する。広い `rm` は使わない。次の `kio snapshot auto` が
 baseline state を v2 として再作成する。

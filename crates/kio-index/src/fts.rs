@@ -501,13 +501,32 @@ fn source_file_state(file: &std::fs::File) -> Result<SourceFileState> {
 #[cfg(windows)]
 fn source_file_state(file: &std::fs::File) -> Result<SourceFileState> {
     use cap_fs::_WindowsByHandle;
-    use std::os::windows::fs::MetadataExt;
+    use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
+    };
     let metadata = file
         .metadata()
         .map_err(|error| IndexError::Schema(format!("inspect GC source index state: {error}")))?;
     let by_handle = cap_fs::Metadata::from_file(file).map_err(|error| {
         IndexError::Schema(format!("inspect GC source index handle state: {error}"))
     })?;
+    let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle(),
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+        || basic.ChangeTime < 0
+    {
+        return Err(IndexError::Schema(format!(
+            "inspect GC source index Windows change time: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
     let modified = metadata.last_write_time();
     Ok(SourceFileState {
         identity: SourceFileIdentity {
@@ -517,8 +536,8 @@ fn source_file_state(file: &std::fs::File) -> Result<SourceFileState> {
         len: metadata.file_size(),
         modified_seconds: i64::try_from(modified / 10_000_000).unwrap_or(i64::MAX),
         modified_nanos: i64::try_from((modified % 10_000_000) * 100).unwrap_or(i64::MAX),
-        changed_seconds: -1,
-        changed_nanos: -1,
+        changed_seconds: basic.ChangeTime / 10_000_000,
+        changed_nanos: (basic.ChangeTime % 10_000_000) * 100,
     })
 }
 
@@ -864,7 +883,7 @@ fn exchange_gc_index_leaves(
         )))
     }
 }
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn exchange_gc_index_leaves(_: &std::fs::File, _: &str, _: &std::fs::File, _: &str) -> Result<()> {
     Err(IndexError::Schema(
         "atomic GC index exchange is unsupported on this platform".to_owned(),
@@ -956,7 +975,7 @@ impl BoundSourceIndex {
         use std::os::fd::AsRawFd;
         PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd()))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn sqlite_path(&self) -> PathBuf {
         self.public_path.clone()
     }
@@ -1041,7 +1060,17 @@ fn open_bound_source_connection(source: &BoundSourceIndex, flags: OpenFlags) -> 
         "kio-bound-source-unix",
     )?)
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+mod windows_gc;
+
+#[cfg(windows)]
+fn open_bound_source_connection(source: &BoundSourceIndex, flags: OpenFlags) -> Result<Connection> {
+    windows::open(source, flags)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_bound_source_connection(source: &BoundSourceIndex, flags: OpenFlags) -> Result<Connection> {
     Ok(Connection::open_with_flags(source.sqlite_path(), flags)?)
 }
@@ -1432,6 +1461,7 @@ fn wait_at_bound_gc_index_copy_barrier() {}
 /// longer needed.  The identity check makes this safe for recovery cleanup:
 /// a substituted leaf is never unlinked merely because it has a GC-looking
 /// name.  The directory fsync makes successful cleanup durable.
+#[cfg(not(windows))]
 pub fn remove_prepared_bound_gc_index(
     kio_dir: &std::fs::File,
     temp_leaf: &str,
@@ -1483,6 +1513,21 @@ pub fn remove_prepared_bound_gc_index(
     Ok(PreparedGcIndexCleanup::Removed)
 }
 
+#[cfg(windows)]
+pub fn remove_prepared_bound_gc_index(
+    kio_dir: &std::fs::File,
+    temp_leaf: &str,
+    expected_private_dir_identity: &str,
+    expected_identity: &str,
+) -> Result<PreparedGcIndexCleanup> {
+    windows_gc::remove_prepared(
+        kio_dir,
+        temp_leaf,
+        expected_private_dir_identity,
+        expected_identity,
+    )
+}
+
 /// Retire stale private rotation leaves before a new attempt.  Only bounded,
 /// strict private names are considered; every candidate is re-opened
 /// descriptor-relatively no-follow and required to remain a single-link
@@ -1494,6 +1539,8 @@ pub fn cleanup_stale_bound_gc_index_rotations(
 ) -> Result<()> {
     const MAX_PRIVATE_GC_INDEX_LEAVES: usize = 32;
     const MAX_PRIVATE_GC_INDEX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+    #[cfg(windows)]
+    windows_gc::ensure_no_pending(kio_dir)?;
     let private = open_gc_internal_index_dir(kio_dir)?;
     let mut stale = Vec::new();
     let mut bytes = 0_u64;
@@ -1557,12 +1604,16 @@ pub fn cleanup_stale_bound_gc_index_rotations(
                 "stale GC index copy changed during cleanup".to_owned(),
             ));
         }
+        #[cfg(not(windows))]
         cap_fs::remove_file(&private, Path::new(&leaf))
             .map_err(|error| IndexError::Schema(format!("remove stale GC index copy: {error}")))?;
+        #[cfg(windows)]
+        windows_gc::remove_exact(&private, &leaf, &identity)?;
     }
     sync_bound_gc_directory(&private, "fsync private GC index stale cleanup")
 }
 
+#[cfg(not(windows))]
 pub fn exchange_prepared_bound_gc_index(
     kio_dir: &std::fs::File,
     temp_leaf: &str,
@@ -1604,6 +1655,49 @@ pub fn exchange_prepared_bound_gc_index(
     Ok(())
 }
 
+/// Finish a Windows index exchange whose journal is bound to the durable GC
+/// rotation marker. A missing public index is admissible only when that exact
+/// journal accounts for both files. This is namespace recovery, not SQLite
+/// attestation: callers must revalidate the published generation and operation
+/// attestation before retiring any tree.
+#[cfg(windows)]
+pub fn recover_prepared_bound_gc_index(
+    kio_dir: &std::fs::File,
+    temp_leaf: &str,
+    expected_private_dir_identity: &str,
+    expected_source_identity: &str,
+    expected_source_state_digest: &str,
+    expected_target_identity: &str,
+) -> Result<bool> {
+    windows_gc::recover(
+        kio_dir,
+        temp_leaf,
+        expected_private_dir_identity,
+        expected_source_identity,
+        expected_source_state_digest,
+        expected_target_identity,
+    )
+}
+
+#[cfg(windows)]
+pub fn exchange_prepared_bound_gc_index(
+    kio_dir: &std::fs::File,
+    temp_leaf: &str,
+    expected_private_dir_identity: &str,
+    expected_source_identity: &str,
+    expected_source_state_digest: &str,
+    expected_target_identity: &str,
+) -> Result<()> {
+    windows_gc::exchange(
+        kio_dir,
+        temp_leaf,
+        expected_private_dir_identity,
+        expected_source_identity,
+        expected_source_state_digest,
+        expected_target_identity,
+    )
+}
+
 /// Rotate the fixed `index/sqlite.db` generation below a retained `.kio`
 /// capability and return the metadata read from the *same pinned connection*
 /// after the write commits.  No ambient pathname is accepted by this API.
@@ -1614,12 +1708,12 @@ fn rotate_bound_gc_index_generation(
     expected_current: Option<(&str, &str)>,
     config: &FtsSchemaConfig,
 ) -> Result<Option<BoundGcIndexMetadata>> {
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (kio_dir, generation, expected_current, config);
         unsupported_bound_gc_index_rotation()
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         let index = cap_fs::open_dir_nofollow(kio_dir, Path::new("index")).map_err(|error| {
             IndexError::Schema(format!(
@@ -1890,17 +1984,14 @@ fn open_bound_gc_index(
     config: &FtsSchemaConfig,
     writable: bool,
 ) -> Result<Option<(BoundSourceIndex, Connection)>> {
-    // The Unix descriptor VFS below makes SQLite open the exact retained
-    // primary-file descriptor. On non-Unix targets rusqlite only accepts a
-    // pathname here; retaining a separate file handle is not enough to prove
-    // that SQLite adopted that same handle. Refuse GC rotation rather than
-    // silently re-opening `index/sqlite.db` through the ambient cwd.
-    #[cfg(not(unix))]
+    // Unix descriptor binding and Windows actual-HANDLE verification both
+    // prove SQLite adopted the retained primary file before pager access.
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (kio_dir, config, writable);
         unsupported_bound_gc_index_rotation()
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
         crate::vec::ensure_registered();
         let root = kio_dir
@@ -1919,7 +2010,7 @@ fn open_bound_gc_index(
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn unsupported_bound_gc_index_rotation<T>() -> Result<T> {
     Err(IndexError::Schema(
         "capability-bound GC SQLite rotation is unsupported on this platform".to_owned(),
@@ -3974,44 +4065,7 @@ mod tests {
         );
     }
 
-    #[cfg(windows)]
-    #[test]
-    fn bound_gc_rotation_is_unsupported_without_touching_retained_source() {
-        let directory = tempfile::tempdir().unwrap();
-        let kio = directory.path().join(".kio");
-        let index = kio.join("index");
-        std::fs::create_dir_all(&index).unwrap();
-        let path = index.join("sqlite.db");
-        let config = FtsSchemaConfig {
-            tokenizer: FtsTokenizer::Trigram,
-        };
-        drop(SqliteFtsIndex::open(&path, config.clone()).unwrap());
-        let conn = Connection::open(&path).unwrap();
-        ensure_index_metadata(&conn, "01J00000000000000000000000", 7).unwrap();
-        drop(conn);
-        let before = std::fs::read(&path).unwrap();
-        let kio_handle = cap_fs::open_ambient_dir(&kio, cap_primitives::ambient_authority())
-            .expect("open retained .kio test capability");
-
-        let error = rotate_bound_gc_index_generation(
-            &kio_handle,
-            "01J00000000000000000000001",
-            None,
-            &config,
-        )
-        .expect_err("Windows must fail closed before attempting retained GC rotation");
-        assert_eq!(
-            error.to_string(),
-            "index schema error: capability-bound GC SQLite rotation is unsupported on this platform"
-        );
-        assert_eq!(std::fs::read(&path).unwrap(), before);
-        let conn = Connection::open(&path).unwrap();
-        let metadata = read_index_metadata(&conn).unwrap().unwrap();
-        assert_eq!(metadata.index_generation, "01J00000000000000000000000");
-        assert_eq!(metadata.last_lifecycle_epoch, 7);
-    }
-
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn bound_gc_rotation_stays_on_retained_kio_capability_and_reports_missing() {
         let directory = tempfile::tempdir().unwrap();

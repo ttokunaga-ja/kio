@@ -2,11 +2,9 @@
 //!
 //! Every mutating invocation below is confined to a freshly-created fixture.
 
-// The executor deliberately refuses to publish a marker on platforms lacking
-// the descriptor-bound atomic index/tree primitives. Unsupported-platform
-// fail-closed behavior is covered by `phase4_gc_after_index`; this file tests
-// successful mutation and crash recovery only where those primitives exist.
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+// Successful mutation and process-interruption recovery use the same public
+// CLI contract on every supported desktop platform.
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 
 mod support;
 
@@ -225,7 +223,6 @@ fn objects_except_trees(dir: &TempDir) -> BTreeMap<PathBuf, Vec<u8>> {
     result
 }
 
-#[cfg(unix)]
 fn regular_file_snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
     fn walk(root: &Path, at: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
         for entry in fs::read_dir(at).unwrap() {
@@ -527,6 +524,285 @@ fn every_fault_point_leaves_a_resumable_receipt_first_state_and_resume_is_idempo
         // A completed retry cannot mutate receipts or attempt another removal.
         let rerun = json_success(&dir, &["gc", "--yes"], NOW);
         assert_eq!(rerun["candidate_count"], 0, "{point}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_exchange_interruptions_gate_readers_and_writers_and_resume_idempotently() {
+    for kind in ["marker", "index"] {
+        for step in [
+            "intent",
+            "source_capture",
+            "target_publish",
+            "names_complete",
+            "source_retire",
+            "intent_remove",
+        ] {
+            let point = format!("after_windows_{kind}_exchange_{step}");
+            let (dir, commit, tree) = candidate_fixture();
+            let baseline = json_success(
+                &dir,
+                &[
+                    "search",
+                    "common pagination needle",
+                    "--scope",
+                    ".",
+                    "--mode",
+                    "text",
+                    "--limit",
+                    "100",
+                ],
+                NOW,
+            );
+            let kio_dir = dir.path().join(".kio");
+            let owner = kio_dir.join(format!("gc/internal/{kind}-exchange"));
+            let interrupted = kio(&dir, &["gc", "--yes", "--json"])
+                .env("KIO_FIXED_NOW", NOW)
+                .env("KIO_TEST_GC_FAULT", &point)
+                .output()
+                .unwrap();
+            assert_eq!(
+                interrupted.status.code(),
+                Some(7),
+                "{point}: {}",
+                String::from_utf8_lossy(&interrupted.stderr)
+            );
+            let fault: Value = serde_json::from_slice(&interrupted.stderr).unwrap();
+            assert_eq!(
+                fault["error_code"], "KIO-E-GC-TEST-INTERRUPTED-001",
+                "{point}"
+            );
+            assert_eq!(
+                owner.join("intent.json").is_file(),
+                step != "intent_remove",
+                "{point}"
+            );
+            if step == "source_capture" {
+                assert_eq!(
+                    kio_dir.join("gc/in_progress").exists(),
+                    kind != "marker",
+                    "{point}"
+                );
+                assert_eq!(
+                    kio_dir.join("index/sqlite.db").exists(),
+                    kind != "index",
+                    "{point}"
+                );
+            }
+            let before = regular_file_snapshot(&kio_dir);
+            let head_before = fs::read(kio_dir.join("HEAD")).unwrap();
+            let pending = json_success(&dir, &["gc", "--dry-run"], NOW);
+            assert_eq!(pending["status"], "recovery_pending", "{point}");
+            assert_eq!(
+                regular_file_snapshot(&kio_dir),
+                before,
+                "{point}: dry-run mutated store"
+            );
+            let unconfirmed = json_failure(&dir, &["gc"], NOW, 2);
+            assert_eq!(
+                unconfirmed["error_code"], "KIO-E-CONFIG-USAGE-001",
+                "{point}"
+            );
+            assert_eq!(
+                regular_file_snapshot(&kio_dir),
+                before,
+                "{point}: unconfirmed GC mutated store"
+            );
+            let marker_pending = kind == "marker" && step != "intent_remove";
+            let (writer_exit, writer_error) = if marker_pending {
+                (4, "KIO-E-STORE-CORRUPT-001")
+            } else {
+                (3, "KIO-E-GC-SWEEP-ACTIVE-001")
+            };
+            for args in [
+                &["index", "--offline", "--yes"][..],
+                &["snapshot", "create"][..],
+                &["tag", "exchange-blocked"][..],
+            ] {
+                let error = json_failure(&dir, args, NOW, writer_exit);
+                assert_eq!(error["error_code"], writer_error, "{point}: {args:?}");
+                assert_eq!(
+                    regular_file_snapshot(&kio_dir),
+                    before,
+                    "{point}: {args:?} mutated store"
+                );
+            }
+            let search_args = [
+                "search",
+                "common pagination needle",
+                "--scope",
+                ".",
+                "--mode",
+                "text",
+                "--limit",
+                "100",
+            ];
+            if marker_pending {
+                // The retained marker is not yet stable. The same observer
+                // gate rejects search before it can publish any result rows.
+                let denied = kio(&dir, &search_args)
+                    .env("KIO_FIXED_NOW", NOW)
+                    .arg("--json")
+                    .output()
+                    .unwrap();
+                assert_eq!(denied.status.code(), Some(4), "{point}");
+                assert!(denied.stdout.is_empty(), "{point}: search published rows");
+                let error: Value = serde_json::from_slice(&denied.stderr).unwrap();
+                assert_eq!(error["error_code"], "KIO-E-STORE-CORRUPT-001", "{point}");
+            } else {
+                let search = json_success(&dir, &search_args, NOW);
+                assert!(
+                    search["paging"]["next_cursor"].is_null(),
+                    "{point}: {search}"
+                );
+                assert_eq!(
+                    search["gc_recovery_pending"]["next_cursor_suppressed"], true,
+                    "{point}: {search}"
+                );
+                let authorized = baseline["results"].as_array().unwrap();
+                assert!(
+                    search["results"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|row| authorized.contains(row)),
+                    "{point}: exposed a result outside the authorized current baseline: {search}"
+                );
+            }
+            assert_eq!(
+                regular_file_snapshot(&kio_dir),
+                before,
+                "{point}: search mutated store"
+            );
+            let completed = json_success(&dir, &["gc", "--yes"], NOW);
+            assert_eq!(completed["status"], "completed", "{point}");
+            assert_eq!(
+                fs::read(kio_dir.join("HEAD")).unwrap(),
+                head_before,
+                "{point}"
+            );
+            assert!(!tree_path(&dir, &tree).exists(), "{point}");
+            let receipts = kio_core::gc::read_shallow_receipts(&kio_dir).unwrap();
+            assert_eq!(receipts.len(), 1, "{point}");
+            assert_eq!(receipts[&commit].tree_hash, tree, "{point}");
+            assert!(!kio_dir.join("gc/in_progress").exists(), "{point}");
+            for owner_kind in ["marker", "index"] {
+                let owner = kio_dir.join(format!("gc/internal/{owner_kind}-exchange"));
+                if owner.exists() {
+                    assert_eq!(
+                        fs::read_dir(owner).unwrap().count(),
+                        0,
+                        "{point}: journal owner not clean"
+                    );
+                }
+            }
+            let completed_state = regular_file_snapshot(&kio_dir);
+            let repeated = json_success(&dir, &["gc", "--yes"], NOW);
+            assert_eq!(repeated["candidate_count"], 0, "{point}");
+            assert_eq!(
+                regular_file_snapshot(&kio_dir),
+                completed_state,
+                "{point}: repeat mutated store"
+            );
+        }
+    }
+}
+
+/// Windows sharing exclusions must reject the attack at the native operation,
+/// not merely make a later integrity check fail with an unrelated error.
+#[cfg(windows)]
+fn assert_windows_mutation_denied(error: std::io::Error) {
+    assert!(
+        matches!(error.raw_os_error(), Some(5 | 32)),
+        "expected access/sharing denial, got {error:?}"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_retained_index_denies_writes_in_copy_and_tree_permit_windows() {
+    for barrier in [
+        "KIO_TEST_GC_INDEX_COPY_READY",
+        "KIO_TEST_GC_PRE_QUARANTINE_READY",
+    ] {
+        let (dir, commit, tree) = candidate_fixture();
+        let ready = dir.path().join("retained-index-ready");
+        let child = kio_process(&dir, &["gc", "--yes", "--json"])
+            .env("KIO_FIXED_NOW", NOW)
+            .env(barrier, &ready)
+            .spawn()
+            .unwrap();
+        wait_for_ready(&ready);
+        let sqlite = dir.path().join(".kio/index/sqlite.db");
+        let before = fs::read(&sqlite).unwrap();
+        assert_windows_mutation_denied(
+            fs::OpenOptions::new()
+                .write(true)
+                .open(&sqlite)
+                .unwrap_err(),
+        );
+        assert_eq!(fs::read(&sqlite).unwrap(), before);
+        fs::write(ready.with_extension("release"), b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{barrier}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!tree_path(&dir, &tree).exists());
+        assert_eq!(
+            kio_core::gc::read_shallow_receipts(&dir.path().join(".kio")).unwrap()[&commit]
+                .tree_hash,
+            tree
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_retained_quarantine_denies_rename_and_hardlink_races() {
+    for attack in ["rename", "hardlink"] {
+        let (dir, commit, tree) = candidate_fixture();
+        let ready = dir.path().join("retained-tree-ready");
+        let child = kio_process(&dir, &["gc", "--yes", "--json"])
+            .env("KIO_FIXED_NOW", NOW)
+            .env("KIO_TEST_GC_TREE_QUARANTINE_READY", &ready)
+            .spawn()
+            .unwrap();
+        wait_for_ready(&ready);
+        let marker = GcInProgressMarker::parse_canonical(
+            &fs::read(dir.path().join(".kio/gc/in_progress")).unwrap(),
+        )
+        .unwrap();
+        let archive = tree_archive_path(&dir, &marker, &tree);
+        let before = fs::read(&archive).unwrap();
+        let victim = dir.path().join("foreign-victim");
+        fs::write(&victim, b"foreign victim must survive\n").unwrap();
+        let destination = dir.path().join("attacker-tree");
+        let result = if attack == "rename" {
+            fs::rename(&archive, &destination)
+        } else {
+            fs::hard_link(&archive, &destination)
+        };
+        assert_windows_mutation_denied(result.unwrap_err());
+        assert!(!destination.exists());
+        assert_eq!(fs::read(&archive).unwrap(), before);
+        fs::write(ready.with_extension("release"), b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{attack}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"foreign victim must survive\n");
+        assert!(!archive.exists());
+        assert!(!tree_path(&dir, &tree).exists());
+        assert_eq!(
+            kio_core::gc::read_shallow_receipts(&dir.path().join(".kio")).unwrap()[&commit]
+                .tree_hash,
+            tree
+        );
     }
 }
 
@@ -848,7 +1124,6 @@ fn in_place_source_index_mutation_after_private_copy_is_rejected() {
     assert!(dir.path().join(".kio/gc/in_progress").exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn in_place_source_index_mutation_after_rotation_marker_blocks_exchange() {
     let (dir, _commit, tree_hash) = candidate_fixture();
@@ -913,7 +1188,6 @@ fn in_place_index_attestation_mutation_after_permit_mint_blocks_tree_retirement(
     assert!(dir.path().join(".kio/gc/in_progress").exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn same_generation_index_replacement_blocks_tree_retirement() {
     let (dir, _commit, tree) = candidate_fixture();
@@ -938,7 +1212,6 @@ fn same_generation_index_replacement_blocks_tree_retirement() {
     assert!(dir.path().join(".kio/gc/in_progress").exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn substituted_old_temp_after_exchange_is_not_accepted_as_already_cleaned() {
     let (dir, _commit, tree) = candidate_fixture();
@@ -965,7 +1238,6 @@ fn substituted_old_temp_after_exchange_is_not_accepted_as_already_cleaned() {
     assert!(tree_path(&dir, &tree).exists());
 }
 
-#[cfg(unix)]
 #[test]
 fn replaced_private_index_directory_after_exchange_fails_closed() {
     let (dir, _commit, tree) = candidate_fixture();

@@ -493,60 +493,16 @@ fn final_shallow_ancestor_with_chunks_keeps_verify_and_rebuild_available() {
         .object_path(ObjectKind::Tree, &old_tree)
         .unwrap();
 
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        json_success_at(&dir, &["gc", "--yes"], NOW);
-        assert!(!old_tree_path.exists());
-        assert_eq!(
-            json_success_at(&dir, &["repair", "verify-objects"], NOW)["status"],
-            "ok"
-        );
-        assert_eq!(
-            json_success_at(&dir, &["repair", "rebuild-db"], NOW)["status"],
-            "rebuilt"
-        );
-    }
-
-    #[cfg(windows)]
-    {
-        // Phase E intentionally rejects descriptor-relative GC locking on
-        // unsupported platforms; a rejected sweep must not mutate storage.
-        let sqlite_path = dir.path().join(".kio/index/sqlite.db");
-        let chunks_path = dir.path().join(".kio/index/chunks.jsonl");
-        let head_path = dir.path().join(".kio/HEAD");
-        let gc_path = dir.path().join(".kio/gc");
-        let old_tree_before = fs::read(&old_tree_path).unwrap();
-        let sqlite_before = fs::read(&sqlite_path).unwrap();
-        let chunks_before = fs::read(&chunks_path).unwrap();
-        let head_before = fs::read(&head_path).unwrap();
-        assert!(!gc_path.exists());
-        let output = kio(&dir, &["gc", "--yes"])
-            .env("KIO_FIXED_NOW", NOW)
-            .arg("--json")
-            .assert()
-            .code(4)
-            .get_output()
-            .stderr
-            .clone();
-        let value: Value = serde_json::from_slice(&output).unwrap();
-        assert_eq!(value["error_code"], "KIO-E-STORE-CORRUPT-001");
-        assert!(
-            value["message"]
-                .as_str()
-                .unwrap()
-                .contains("descriptor-relative GC lock")
-        );
-        assert_eq!(fs::read(&old_tree_path).unwrap(), old_tree_before);
-        assert_eq!(fs::read(&sqlite_path).unwrap(), sqlite_before);
-        assert_eq!(fs::read(&chunks_path).unwrap(), chunks_before);
-        assert_eq!(fs::read(&head_path).unwrap(), head_before);
-        assert!(!dir.path().join(".kio/.lock").exists());
-        assert!(!gc_path.exists());
-        assert_eq!(
-            json_success_at(&dir, &["repair", "verify-objects"], NOW)["status"],
-            "ok"
-        );
-    }
+    json_success_at(&dir, &["gc", "--yes"], NOW);
+    assert!(!old_tree_path.exists());
+    assert_eq!(
+        json_success_at(&dir, &["repair", "verify-objects"], NOW)["status"],
+        "ok"
+    );
+    assert_eq!(
+        json_success_at(&dir, &["repair", "rebuild-db"], NOW)["status"],
+        "rebuilt"
+    );
 }
 
 #[test]

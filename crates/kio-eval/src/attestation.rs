@@ -1368,7 +1368,11 @@ mod tests {
         let target = fixture.root.path().join("outside.json");
         fs::write(
             &target,
-            br#"{"kio_format_version":"1.0.0","scope_id":"01ARZ3NDEKTSV4RRFFQ69G5FAV"}"#,
+            serde_json::to_vec(&serde_json::json!({
+                "kio_format_version": kio_core::scope::KIO_FORMAT_VERSION,
+                "scope_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            }))
+            .unwrap(),
         )
         .unwrap();
         fs::remove_file(&scope_json).unwrap();

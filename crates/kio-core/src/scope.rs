@@ -39,13 +39,17 @@ use crate::schema::{SchemaKind, validate_json_schema};
 use crate::store_dir::StoreDirectory;
 
 mod managed_restore;
+#[cfg(windows)]
+mod scheduled_windows;
+#[cfg(windows)]
+mod windows_gate;
 pub(crate) use managed_restore::reject_pending_managed_restore;
 pub use managed_restore::{
     ManagedRestoreChange, ManagedRestoreOutcome, ManagedRestorePlan, ManagedRestoreRequest,
 };
 
 /// Exact on-disk scope format understood by this pre-stable reader.
-pub const KIO_FORMAT_VERSION: &str = "1.0.0";
+pub const KIO_FORMAT_VERSION: &str = "2.0.0";
 pub const DEFAULT_MAX_ARCHIVE_FILE_BYTES: u64 = MAX_RAW_OBJECT_BYTES;
 pub const DEFAULT_MAX_ARCHIVE_SCOPE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub use crate::dag::MAX_TREE_ENTRIES;
@@ -92,12 +96,12 @@ impl SnapshotTestControl {
         Self {}
     }
 
-    #[cfg(all(debug_assertions, unix))]
+    #[cfg(all(debug_assertions, any(unix, windows)))]
     fn authority_capture_ready(&self) -> Option<&Path> {
         self.core.snapshot_authority_capture_ready.as_deref()
     }
 
-    #[cfg(all(not(debug_assertions), unix))]
+    #[cfg(all(not(debug_assertions), any(unix, windows)))]
     fn authority_capture_ready(&self) -> Option<&Path> {
         None
     }
@@ -1258,19 +1262,19 @@ impl Repository {
         expected_snapshot_policy: Option<&SnapshotAutoBinding>,
         chunking_config_hash: &str,
     ) -> Result<WorkingTree> {
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         let _ = expected_snapshot_policy;
         let scheduled_bound = expected_raw_by_path.is_some() && {
-            #[cfg(unix)]
+            #[cfg(any(unix, windows))]
             {
                 self.bound_kio.is_some()
             }
-            #[cfg(not(unix))]
+            #[cfg(not(any(unix, windows)))]
             {
                 false
             }
         };
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if scheduled_bound {
             // Recover only canonical private stages through the retained raw
             // descriptor before allocating new ones.  This is bounded and
@@ -1287,6 +1291,7 @@ impl Repository {
                 let allowed = limits.max_file_bytes.min(remaining);
                 let mut source = open_working_file_candidate(&candidate)?;
                 let before = source.metadata().kio_io(&candidate.path)?;
+                let identity = scheduled_source_identity(&source)?;
                 if before.len() > allowed {
                     return Err(scope_input_oversized(
                         &candidate.file_name,
@@ -1296,22 +1301,20 @@ impl Repository {
                 }
                 let stage = self.store.stage_raw_from_reader(&mut source, allowed)?;
                 let after = source.metadata().kio_io(&candidate.path)?;
-                use std::os::unix::fs::MetadataExt as _;
                 if after.len() != stage.size_bytes()
                     || before.len() != after.len()
-                    || before.dev() != after.dev()
-                    || before.ino() != after.ino()
+                    || identity != scheduled_source_identity(&source)?
                 {
                     return Err(scope_file_changed(&candidate.file_name));
                 }
                 consumed_scope_bytes = consumed_scope_bytes
                     .checked_add(stage.size_bytes())
                     .ok_or_else(|| scope_input_oversized(&candidate.file_name, limits, u64::MAX))?;
-                staged.push((candidate, source, before, stage));
+                staged.push((candidate, source, before, identity, stage));
             }
             let actual = staged
                 .iter()
-                .map(|(file, _, _, stage)| (file.file_name.clone(), stage.raw_hash().to_owned()))
+                .map(|(file, _, _, _, stage)| (file.file_name.clone(), stage.raw_hash().to_owned()))
                 .collect::<BTreeMap<_, _>>();
             if Some(&actual) != expected_raw_by_path {
                 return Err(snapshot_authority_changed(
@@ -1328,7 +1331,7 @@ impl Repository {
             // Identity and length are insufficient for an in-place same-size
             // edit. Re-hash each still-open, no-follow source descriptor after
             // the final namespace check and before the first CAS publication.
-            for (candidate, source, before, stage) in &mut staged {
+            for (candidate, source, before, identity, stage) in &mut staged {
                 source.seek(SeekFrom::Start(0)).kio_io(&candidate.path)?;
                 let (rehash, size) = hash_scope_file(
                     source,
@@ -1338,12 +1341,10 @@ impl Repository {
                     limits,
                 )?;
                 let after = source.metadata().kio_io(&candidate.path)?;
-                use std::os::unix::fs::MetadataExt as _;
                 if rehash != stage.raw_hash()
                     || size != stage.size_bytes()
                     || after.len() != before.len()
-                    || after.dev() != before.dev()
-                    || after.ino() != before.ino()
+                    || scheduled_source_identity(source)? != *identity
                 {
                     return Err(snapshot_authority_changed(
                         "scheduled snapshot source bytes changed before CAS publication",
@@ -1359,7 +1360,7 @@ impl Repository {
             self.reject_scheduled_bound_purge_state()?;
             self.reject_scheduled_marker_targets(actual.values())?;
             let mut entries = Vec::with_capacity(staged.len());
-            for (candidate, _, _, stage) in staged {
+            for (candidate, _, _, _, stage) in staged {
                 let (published_hash, published_size) = self.store.publish_bound_raw_stage(stage)?;
                 if published_size > limits.max_file_bytes {
                     return Err(scope_input_oversized(
@@ -1812,7 +1813,7 @@ impl Repository {
         )
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn bound_snapshot_auto_direct_entries(&self) -> Result<BTreeSet<String>> {
         let root = self.bound_root.as_deref().ok_or_else(|| {
             KioError::invalid_usage(
@@ -1826,7 +1827,7 @@ impl Repository {
     /// `.kio` directory.  This deliberately has stricter semantics than the
     /// ordinary open path: an empty HEAD with a populated branch ref is
     /// corruption here, not an opportunity for automatic repair.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn validate_scheduled_auto_prerequisites(
         &self,
         test_control: &SnapshotTestControl,
@@ -1855,7 +1856,7 @@ impl Repository {
     /// Capture every mutable metadata leaf that selects the scheduled
     /// snapshot's parent and tool identity.  Values alone are not enough: a
     /// same-byte inode replacement is an authority change too.
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn capture_scheduled_snapshot_authority(
         &self,
         test_control: &SnapshotTestControl,
@@ -1879,7 +1880,7 @@ impl Repository {
         })
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn recheck_scheduled_snapshot_authority(
         &self,
         expected: &ScheduledSnapshotAuthority,
@@ -1898,7 +1899,7 @@ impl Repository {
         Ok(())
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn recheck_scheduled_published_authority(
         &self,
         expected: &ScheduledSnapshotAuthority,
@@ -1923,7 +1924,7 @@ impl Repository {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn capture_scheduled_snapshot_authority(
         &self,
         _: &SnapshotTestControl,
@@ -1936,7 +1937,7 @@ impl Repository {
         ))
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn recheck_scheduled_snapshot_authority(
         &self,
         _: &ScheduledSnapshotAuthority,
@@ -1945,7 +1946,7 @@ impl Repository {
         unreachable!("scheduled snapshots are unsupported without descriptor capabilities")
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn recheck_scheduled_published_authority(
         &self,
         _: &ScheduledSnapshotAuthority,
@@ -1956,7 +1957,7 @@ impl Repository {
         unreachable!("scheduled snapshots are unsupported without descriptor capabilities")
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn validate_scheduled_auto_prerequisites(
         &self,
         _: &SnapshotTestControl,
@@ -1969,7 +1970,7 @@ impl Repository {
         ))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn reject_scheduled_bound_purge_state(&self) -> Result<()> {
         use cap_primitives::fs as cap_fs;
 
@@ -2009,7 +2010,7 @@ impl Repository {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn reject_scheduled_bound_purge_state(&self) -> Result<()> {
         // Scheduled snapshots require descriptor-relative inspection of the
         // purge journal before any publication can occur. Do not emulate that
@@ -2023,7 +2024,7 @@ impl Repository {
         ))
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     fn reject_scheduled_marker_targets<'a>(
         &self,
         raw_hashes: impl IntoIterator<Item = &'a String>,
@@ -2046,7 +2047,7 @@ impl Repository {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn reject_scheduled_marker_targets<'a>(
         &self,
         _: impl IntoIterator<Item = &'a String>,
@@ -2054,7 +2055,7 @@ impl Repository {
         Ok(())
     }
 
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     fn bound_snapshot_auto_direct_entries(&self) -> Result<BTreeSet<String>> {
         Err(KioError::new(
             "KIO-E-SNAPSHOT-PLATFORM-UNSUPPORTED-001",
@@ -3353,6 +3354,7 @@ impl Repository {
         let value: Value =
             serde_json::from_str(&text).map_err(|err| KioError::schema(err.to_string()))?;
         validate_scope_json_value(&value)?;
+        validate_stable_store_gate(&self.store_directory()?)?;
         let Some(scope_id) = value.get("scope_id").and_then(Value::as_str) else {
             return Err(KioError::schema("scope.json missing scope_id"));
         };
@@ -3665,6 +3667,7 @@ fn planned_kio_files(
     let mut files = std::collections::BTreeMap::new();
     files.insert("HEAD".into(), b"unborn\n".to_vec());
     files.insert("config.toml".into(), Vec::new());
+    files.insert(".store-gate".into(), Vec::new());
     files.insert("scope.json".into(), serde_json::to_string_pretty(&json!({"kio_format_version": KIO_FORMAT_VERSION,"scope_id": scope_id,"scope_path": canonical_root})).map_err(|e| KioError::schema(e.to_string()))?.into_bytes());
     files.insert(
         "manifest.json".into(),
@@ -3810,8 +3813,12 @@ fn validate_planned_root_entries(
 /// scheduler's ref/tool handoff needs only regular-file authority binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BoundMetadataObservation {
+    #[cfg(not(windows))]
     dev: u64,
+    #[cfg(not(windows))]
     ino: u64,
+    #[cfg(windows)]
+    identity: crate::cas::WindowsRegularFileIdentity,
     len: u64,
     nlink: u64,
     digest: String,
@@ -3824,6 +3831,20 @@ struct ScheduledSnapshotAuthority {
     head_observation: BoundMetadataObservation,
     tool_lock_observation: BoundMetadataObservation,
 }
+
+#[cfg(unix)]
+fn scheduled_source_identity(file: &File) -> Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file
+        .metadata()
+        .map_err(|error| KioError::io(error.to_string(), "scheduled source"))?;
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(windows)]
+use scheduled_windows::{
+    read_bound_regular_text_observed_at, source_identity as scheduled_source_identity,
+};
 
 /// Read a bounded regular metadata leaf without following any public path and
 /// retain enough evidence to reject same-byte replacement at a later writer
@@ -5339,7 +5360,7 @@ fn ensure_raw_publication_allowed(purge: &PurgeState, raw_hash: &str) -> Result<
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn bound_marker_exists(kio: &File, namespace: &str, raw_hash: &str) -> Result<bool> {
     use cap_primitives::fs as cap_fs;
 
@@ -5380,7 +5401,7 @@ fn bound_marker_exists(kio: &File, namespace: &str, raw_hash: &str) -> Result<bo
 
 /// Debug-only synchronization seam for descriptor-replacement integration
 /// tests. Production builds never inspect the environment or wait.
-#[cfg(all(unix, debug_assertions))]
+#[cfg(all(any(unix, windows), debug_assertions))]
 fn wait_at_bound_snapshot_auto_layout_barrier() {
     // This helper can run inside an already captured snapshot operation. It
     // must not consult ambient environment variables midway through that
@@ -5389,7 +5410,7 @@ fn wait_at_bound_snapshot_auto_layout_barrier() {
     wait_at_bound_snapshot_auto_barrier(test_control.snapshot_bound_layout_ready.as_deref());
 }
 
-#[cfg(not(all(unix, debug_assertions)))]
+#[cfg(not(all(any(unix, windows), debug_assertions)))]
 fn wait_at_bound_snapshot_auto_layout_barrier() {}
 
 #[cfg(debug_assertions)]
@@ -5631,7 +5652,7 @@ thread_local! {
     /// Reentrancy depth per `.lock` path for the current thread. A whole-command
     /// lock held by `kio index`/`repair`/`reindex` must not deadlock against the
     /// `snapshot` sub-step re-acquiring the same lock inside the same process.
-    static LOCK_DEPTH: RefCell<HashMap<PathBuf, u32>> = RefCell::new(HashMap::new());
+    static LOCK_DEPTH: RefCell<HashMap<(PathBuf, bool), u32>> = RefCell::new(HashMap::new());
     /// Distinct lock names in one directory (notably `.lock` followed by
     /// `purge-publication.lock`) share the same directory-flock open file
     /// description within a thread. This keeps the crash-released gate
@@ -5696,29 +5717,51 @@ impl Drop for BoundLockGate {
 /// the outermost guard drops.
 pub struct StoreLock {
     path: PathBuf,
+    store_gate: bool,
+    #[cfg(not(windows))]
     pid: u32,
+    #[cfg(not(windows))]
     token: String,
-    /// A nested (reentrant) acquisition owns no on-disk lock and must not remove
-    /// the file on drop.
     reentrant: bool,
-    /// Kernel-held, crash-released serialization gate for the complete
-    /// acquire/reclaim/release interval. The public `.lock` remains the
-    /// interoperable on-disk protocol; this descriptor gate closes the final
-    /// double-read-to-exchange race between cooperating Kio writers.
     #[cfg(unix)]
     _gate: Option<LockGate>,
-    /// Windows retains both handles. The parent is resolved component-by-
-    /// component without following reparses; the owner handle denies write,
-    /// delete, and rename sharing until the guard is released.
+    // Every nested guard owns this lease, including when the first guard is
+    // dropped before the nested one. Rc deliberately prevents cross-thread
+    // transfer of a guard whose reentrancy bookkeeping is thread-local.
     #[cfg(windows)]
-    _windows_parent: Option<File>,
-    #[cfg(windows)]
-    _windows_owner: Option<File>,
+    _windows_owner: Option<Rc<WindowsLockOwner>>,
+}
+
+#[cfg(windows)]
+struct WindowsLockOwner {
+    _parent: File,
+    owner: Option<File>,
+    gate: Option<windows_gate::Gate>,
+    pid: u32,
+    token: String,
+}
+
+#[cfg(windows)]
+impl Drop for WindowsLockOwner {
+    fn drop(&mut self) {
+        if let Some(owner) = self.owner.take() {
+            let _ = release_windows_owned_lock(&owner, self.pid, &self.token);
+            // Windows disposition is not namespace completion until close.
+            drop(owner);
+        }
+        drop(self.gate.take());
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    static WINDOWS_LOCK_OWNERS: RefCell<HashMap<(PathBuf, bool), Weak<WindowsLockOwner>>> = RefCell::new(HashMap::new());
 }
 
 impl StoreLock {
     pub fn acquire(kio_dir: &Path) -> Result<Self> {
-        let lock = Self::acquire_path(kio_dir.join(".lock"))?;
+        validate_store_lock_authority(&StoreDirectory::open(kio_dir)?)?;
+        let lock = Self::acquire_path_kind(kio_dir.join(".lock"), true)?;
         // The outer acquisition already performed this check while it owned
         // the real lock.  Besides avoiding redundant work, skipping the
         // ambient-path read for a nested acquisition lets a descriptor-bound
@@ -5747,12 +5790,17 @@ impl StoreLock {
     /// path) and stale-reclaim semantics as [`acquire`]; the parent directory is
     /// created if missing.
     pub fn acquire_path(path: PathBuf) -> Result<Self> {
+        // Generic device/publication locks are explicitly outside store gating.
+        Self::acquire_path_kind(path, false)
+    }
+
+    fn acquire_path_kind(path: PathBuf, _store_gate: bool) -> Result<Self> {
         let pid = std::process::id();
 
         // Reentrant fast path: this thread already holds the lock for `path`.
         let already_held = LOCK_DEPTH.with(|depth| {
             let mut depth = depth.borrow_mut();
-            if let Some(count) = depth.get_mut(&path) {
+            if let Some(count) = depth.get_mut(&(path.clone(), _store_gate)) {
                 *count += 1;
                 true
             } else {
@@ -5760,23 +5808,40 @@ impl StoreLock {
             }
         });
         if already_held {
+            #[cfg(windows)]
+            let owner = WINDOWS_LOCK_OWNERS.with(|owners| {
+                owners
+                    .borrow()
+                    .get(&(path.clone(), _store_gate))
+                    .and_then(Weak::upgrade)
+            });
+            #[cfg(windows)]
+            if owner.is_none() {
+                LOCK_DEPTH.with(|depth| {
+                    if let Some(count) = depth.borrow_mut().get_mut(&(path.clone(), _store_gate)) {
+                        *count -= 1;
+                    }
+                });
+                return Err(KioError::locked("Windows lock lease is unavailable"));
+            }
             return Ok(Self {
                 path,
+                store_gate: _store_gate,
+                #[cfg(not(windows))]
                 pid,
+                #[cfg(not(windows))]
                 token: String::new(),
                 reentrant: true,
                 #[cfg(unix)]
                 _gate: None,
                 #[cfg(windows)]
-                _windows_parent: None,
-                #[cfg(windows)]
-                _windows_owner: None,
+                _windows_owner: owner,
             });
         }
 
         #[cfg(windows)]
         {
-            Self::acquire_path_windows(path, pid)
+            Self::acquire_path_windows(path, pid, _store_gate)
         }
 
         #[cfg(not(windows))]
@@ -5802,18 +5867,15 @@ impl StoreLock {
                 }
                 Err(err) => return Err(KioError::io(err.to_string(), path.display().to_string())),
             }
-            LOCK_DEPTH.with(|depth| depth.borrow_mut().insert(path.clone(), 1));
+            LOCK_DEPTH.with(|depth| depth.borrow_mut().insert((path.clone(), _store_gate), 1));
             Ok(Self {
                 path,
+                store_gate: _store_gate,
                 pid,
                 token,
                 reentrant: false,
                 #[cfg(unix)]
                 _gate: Some(gate),
-                #[cfg(windows)]
-                _windows_parent: None,
-                #[cfg(windows)]
-                _windows_owner: None,
             })
         }
     }
@@ -5822,8 +5884,14 @@ impl StoreLock {
     /// than the path-based token-checked fallback. A live owner shares READ
     /// only, so a second writer cannot open it for DELETE or replace it.
     #[cfg(windows)]
-    fn acquire_path_windows(path: PathBuf, pid: u32) -> Result<Self> {
-        let parent = open_windows_lock_parent(&path)?;
+    fn acquire_path_windows(path: PathBuf, pid: u32, store_gate: bool) -> Result<Self> {
+        let parent = open_windows_lock_parent_kind(&path, !store_gate)?;
+        let gate = if store_gate {
+            validate_bound_store_lock_authority(&parent)?;
+            Some(windows_gate::Gate::acquire(&parent, true)?)
+        } else {
+            None
+        };
         let leaf = windows_lock_leaf(&path)?;
         let token = new_lock_token(pid);
         let canonical = canonical_lock_bytes(pid, &token)?;
@@ -5835,13 +5903,23 @@ impl StoreLock {
             }
             Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
         };
-        LOCK_DEPTH.with(|depth| depth.borrow_mut().insert(path.clone(), 1));
-        Ok(Self {
-            path,
+        let owner = Rc::new(WindowsLockOwner {
+            _parent: parent,
+            owner: Some(owner),
+            gate,
             pid,
             token,
+        });
+        WINDOWS_LOCK_OWNERS.with(|owners| {
+            let mut owners = owners.borrow_mut();
+            owners.retain(|_, owner| owner.strong_count() != 0);
+            owners.insert((path.clone(), store_gate), Rc::downgrade(&owner));
+        });
+        LOCK_DEPTH.with(|depth| depth.borrow_mut().insert((path.clone(), store_gate), 1));
+        Ok(Self {
+            path,
+            store_gate,
             reentrant: false,
-            _windows_parent: Some(parent),
             _windows_owner: Some(owner),
         })
     }
@@ -5849,12 +5927,12 @@ impl StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        let released = LOCK_DEPTH.with(|depth| {
+        let _released = LOCK_DEPTH.with(|depth| {
             let mut depth = depth.borrow_mut();
-            if let Some(count) = depth.get_mut(&self.path) {
+            if let Some(count) = depth.get_mut(&(self.path.clone(), self.store_gate)) {
                 *count -= 1;
                 if *count == 0 {
-                    depth.remove(&self.path);
+                    depth.remove(&(self.path.clone(), self.store_gate));
                     return true;
                 }
             }
@@ -5862,13 +5940,14 @@ impl Drop for StoreLock {
         });
         // macOS/Linux exchange rather than check-then-unlink. Windows validates
         // and deletes only the retained owned handle; it never unlinks a path.
-        if released && !self.reentrant {
-            #[cfg(windows)]
-            if let Some(owner) = self._windows_owner.as_ref() {
-                let _ = release_windows_owned_lock(owner, self.pid, &self.token);
-            }
-            #[cfg(not(windows))]
+        #[cfg(not(windows))]
+        if _released && !self.reentrant {
             let _ = release_ordinary_lock(&self.path, self.pid, &self.token);
+        }
+        #[cfg(windows)]
+        {
+            // The last Rc lease owns disposition, close, then gate unlock.
+            drop(self._windows_owner.take());
         }
         // `gate` drops after the on-disk release operation, and the kernel
         // automatically releases it after a process crash.
@@ -5895,8 +5974,13 @@ const MAX_WINDOWS_LOCK_BYTES: u64 = 4096;
 /// Resolve/create a lock parent from a filesystem root without re-resolving
 /// ambient parents afterwards. `open_dir_nofollow` rejects symlink/reparse
 /// components; the by-handle identity check also rejects junctions.
-#[cfg(windows)]
+#[cfg(all(windows, test))]
 fn open_windows_lock_parent(path: &Path) -> Result<File> {
+    open_windows_lock_parent_kind(path, true)
+}
+
+#[cfg(windows)]
+fn open_windows_lock_parent_kind(path: &Path, create_missing: bool) -> Result<File> {
     use cap_primitives::{ambient_authority, fs as cap_fs};
 
     if path
@@ -5943,7 +6027,7 @@ fn open_windows_lock_parent(path: &Path) -> Result<File> {
     for component in components {
         directory = match cap_fs::open_dir_nofollow(&directory, Path::new(&component)) {
             Ok(directory) => directory,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
                 let options = cap_fs::DirOptions::new();
                 match cap_fs::create_dir(&directory, Path::new(&component), &options) {
                     Ok(()) => {}
@@ -6524,7 +6608,7 @@ pub(crate) struct BoundStoreReadGuard {
     initial_lock: Option<(Vec<u8>, BoundLockObservation)>,
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) struct BoundStoreReadGuard {
     _private: (),
 }
@@ -6554,7 +6638,7 @@ impl BoundStoreReadGuard {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl BoundStoreReadGuard {
     pub(crate) fn recheck_idle(&self) -> Result<()> {
         Err(KioError::new(
@@ -6571,6 +6655,7 @@ impl BoundStoreReadGuard {
 /// directory `flock`; it deliberately has no pathname or lock-file mutation.
 #[cfg(unix)]
 pub(crate) fn acquire_bound_store_read_guard(kio: &File) -> Result<BoundStoreReadGuard> {
+    validate_bound_store_lock_authority(kio)?;
     use std::os::fd::AsRawFd;
 
     let gate = open_bound_directory_for_io(kio, Path::new(".kio"))?;
@@ -6604,7 +6689,7 @@ pub(crate) fn acquire_bound_store_read_guard(kio: &File) -> Result<BoundStoreRea
     })
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn acquire_bound_store_read_guard(_kio: &File) -> Result<BoundStoreReadGuard> {
     Err(KioError::new(
         "KIO-E-STORE-CORRUPT-001",
@@ -6614,13 +6699,48 @@ pub(crate) fn acquire_bound_store_read_guard(_kio: &File) -> Result<BoundStoreRe
     ))
 }
 
+#[cfg(windows)]
+pub(crate) struct BoundStoreReadGuard {
+    kio: File,
+    gate: windows_gate::Gate,
+    initial_lock: Option<windows_gate::IdleLock>,
+}
+
+#[cfg(windows)]
+impl BoundStoreReadGuard {
+    pub(crate) fn recheck_idle(&self) -> Result<()> {
+        self.gate.recheck(&self.kio)?;
+        if windows_gate::idle_lock(&self.kio)? != self.initial_lock {
+            return Err(KioError::locked(".kio/.lock"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+pub(crate) fn acquire_bound_store_read_guard(kio: &File) -> Result<BoundStoreReadGuard> {
+    validate_bound_store_lock_authority(kio)?;
+    let gate = windows_gate::Gate::acquire(kio, false)?;
+    let initial_lock = windows_gate::idle_lock(kio)?;
+    let guard = BoundStoreReadGuard {
+        kio: kio
+            .try_clone()
+            .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
+        gate,
+        initial_lock,
+    };
+    guard.recheck_idle()?;
+    Ok(guard)
+}
+
 /// Windows and other non-Unix platforms deliberately expose the same type so
 /// the GC state machine remains portable, but do not provide a path-based
 /// substitute for descriptor-relative no-follow locking.
 #[cfg(windows)]
 pub struct BoundStoreLock {
     _kio: File,
-    owner: File,
+    owner: Option<File>,
+    gate: Option<windows_gate::Gate>,
     pid: u32,
     token: String,
 }
@@ -6642,6 +6762,7 @@ pub struct RetainedPublicationLock {
 }
 
 fn acquire_retained_publication_lock(kio: &File) -> Result<RetainedPublicationLock> {
+    validate_bound_store_lock_authority(kio)?;
     let directory = StoreDirectory::from_retained(
         kio.try_clone()
             .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
@@ -6652,7 +6773,7 @@ fn acquire_retained_publication_lock(kio: &File) -> Result<RetainedPublicationLo
     // second flock on the writer's `.kio` directory.
     let publication = directory.create_directory_all(Path::new("internal/publication"))?;
     Ok(RetainedPublicationLock {
-        _owner: acquire_retained_store_lock(&publication)?,
+        _owner: acquire_retained_lock_kind(&publication, false)?,
     })
 }
 
@@ -6662,6 +6783,7 @@ pub type BoundReentrantStoreLock = RetainedStoreLock;
 
 #[derive(Clone, PartialEq, Eq)]
 struct BoundLeaseIdentity {
+    store_gate: bool,
     #[cfg(unix)]
     dev: u64,
     #[cfg(unix)]
@@ -6674,7 +6796,7 @@ thread_local! {
     static BOUND_STORE_LEASES: RefCell<Vec<(BoundLeaseIdentity, Weak<BoundStoreLock>)>> = const { RefCell::new(Vec::new()) };
 }
 
-fn bound_lease_identity(kio: &File) -> Result<BoundLeaseIdentity> {
+fn bound_lease_identity(kio: &File, store_gate: bool) -> Result<BoundLeaseIdentity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -6682,6 +6804,7 @@ fn bound_lease_identity(kio: &File) -> Result<BoundLeaseIdentity> {
             .metadata()
             .map_err(|error| KioError::io(error.to_string(), ".kio"))?;
         Ok(BoundLeaseIdentity {
+            store_gate,
             dev: metadata.dev(),
             ino: metadata.ino(),
         })
@@ -6690,7 +6813,10 @@ fn bound_lease_identity(kio: &File) -> Result<BoundLeaseIdentity> {
     {
         let identity = crate::cas::windows_directory_handle_identity(kio)
             .ok_or_else(|| KioError::locked(".kio"))?;
-        Ok(BoundLeaseIdentity { identity })
+        Ok(BoundLeaseIdentity {
+            identity,
+            store_gate,
+        })
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -6708,7 +6834,12 @@ fn bound_lease_identity(kio: &File) -> Result<BoundLeaseIdentity> {
 /// identity in this thread. A weak entry never keeps an old store alive after
 /// the final guard is dropped.
 pub(crate) fn acquire_retained_store_lock(kio: &File) -> Result<RetainedStoreLock> {
-    let identity = bound_lease_identity(kio)?;
+    validate_bound_store_lock_authority(kio)?;
+    acquire_retained_lock_kind(kio, true)
+}
+
+fn acquire_retained_lock_kind(kio: &File, _store_gate: bool) -> Result<RetainedStoreLock> {
+    let identity = bound_lease_identity(kio, _store_gate)?;
     if let Some(owner) = BOUND_STORE_LEASES.with(|leases| {
         let mut leases = leases.borrow_mut();
         leases.retain(|(_, owner)| owner.strong_count() != 0);
@@ -6718,6 +6849,11 @@ pub(crate) fn acquire_retained_store_lock(kio: &File) -> Result<RetainedStoreLoc
     }) {
         return Ok(RetainedStoreLock { _owner: owner });
     }
+    #[cfg(windows)]
+    let owner = Rc::new(acquire_bound_lock_windows(kio, _store_gate)?);
+    #[cfg(unix)]
+    let owner = Rc::new(acquire_bound_lock_unix(kio, _store_gate)?);
+    #[cfg(not(any(unix, windows)))]
     let owner = Rc::new(acquire_bound_store_lock(kio)?);
     BOUND_STORE_LEASES.with(|leases| leases.borrow_mut().push((identity, Rc::downgrade(&owner))));
     Ok(RetainedStoreLock { _owner: owner })
@@ -6741,6 +6877,14 @@ const MAX_BOUND_LOCK_BYTES: u64 = 4096;
 
 #[cfg(unix)]
 pub(crate) fn acquire_bound_store_lock(kio: &File) -> Result<BoundStoreLock> {
+    acquire_bound_lock_unix(kio, true)
+}
+
+#[cfg(unix)]
+fn acquire_bound_lock_unix(kio: &File, store_gate: bool) -> Result<BoundStoreLock> {
+    if store_gate {
+        validate_bound_store_lock_authority(kio)?;
+    }
     let gate = acquire_bound_lock_gate(kio)?;
     let pid = std::process::id();
     let token = new_lock_token(pid);
@@ -6787,6 +6931,19 @@ pub(crate) fn acquire_bound_store_lock(kio: &File) -> Result<BoundStoreLock> {
 
 #[cfg(windows)]
 pub(crate) fn acquire_bound_store_lock(kio: &File) -> Result<BoundStoreLock> {
+    acquire_bound_lock_windows(kio, true)
+}
+
+#[cfg(windows)]
+fn acquire_bound_lock_windows(kio: &File, store_gate: bool) -> Result<BoundStoreLock> {
+    if store_gate {
+        validate_bound_store_lock_authority(kio)?;
+    }
+    let gate = if store_gate {
+        Some(windows_gate::Gate::acquire(kio, true)?)
+    } else {
+        None
+    };
     if crate::cas::windows_directory_handle_identity(kio).is_none() {
         return Err(KioError::locked(
             "retained .kio is not an ordinary directory",
@@ -6809,7 +6966,8 @@ pub(crate) fn acquire_bound_store_lock(kio: &File) -> Result<BoundStoreLock> {
     };
     Ok(BoundStoreLock {
         _kio: retained,
-        owner,
+        owner: Some(owner),
+        gate,
         pid,
         token,
     })
@@ -6820,7 +6978,11 @@ impl Drop for BoundStoreLock {
     fn drop(&mut self) {
         // The owner handle denies replacement and retains DELETE access. The
         // release routine checks its token and deletes that exact object.
-        let _ = release_windows_owned_lock(&self.owner, self.pid, &self.token);
+        if let Some(owner) = self.owner.take() {
+            let _ = release_windows_owned_lock(&owner, self.pid, &self.token);
+            drop(owner);
+        }
+        drop(self.gate.take());
     }
 }
 
@@ -7552,6 +7714,38 @@ fn validate_scope_json_value(value: &Value) -> Result<()> {
     validate_json_schema(SchemaKind::Scope, value)
 }
 
+fn validate_stable_store_gate(directory: &StoreDirectory) -> Result<()> {
+    #[cfg(windows)]
+    {
+        windows_gate::validate(directory.root_handle().as_ref())
+    }
+    #[cfg(not(windows))]
+    {
+        match directory.read_optional(Path::new(".store-gate"), 0) {
+            Ok(Some(bytes)) if bytes.is_empty() => Ok(()),
+            _ => Err(KioError::locked(
+                ".kio/.store-gate is missing, unsafe, or not empty",
+            )),
+        }
+    }
+}
+
+fn validate_store_lock_authority(directory: &StoreDirectory) -> Result<()> {
+    // Format must reject old binaries/stores before checking a new required
+    // leaf, and before creating or reclaiming any transient lock.
+    read_bound_scope_json_value(directory)?;
+    validate_stable_store_gate(directory)
+}
+
+fn validate_bound_store_lock_authority(kio: &File) -> Result<()> {
+    let directory = StoreDirectory::from_retained(
+        kio.try_clone()
+            .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
+        PathBuf::from(".kio"),
+    )?;
+    validate_store_lock_authority(&directory)
+}
+
 /// Bind an approval mutation to a retained `.kio` directory and serialize its
 /// complete read/compare/write sequence with every other store writer.  The
 /// public path is used only to acquire the initial no-follow directory
@@ -7968,6 +8162,64 @@ mod tests {
     use serde_json::Value;
     #[cfg(windows)]
     use std::path::PathBuf;
+
+    #[test]
+    fn planned_store_gate_is_required_empty_and_read_only_validation_never_repairs_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let gate = repo.kio_dir().join(".store-gate");
+        assert_eq!(fs::read(&gate).unwrap(), b"");
+        let kio = repo
+            .store_directory()
+            .unwrap()
+            .root_handle()
+            .try_clone()
+            .unwrap();
+        fs::remove_file(&gate).unwrap();
+        for error in [
+            repo.scope_identity().unwrap_err(),
+            super::acquire_bound_store_read_guard(&kio).err().unwrap(),
+            super::acquire_bound_store_lock(&kio).err().unwrap(),
+            StoreLock::acquire(repo.kio_dir()).err().unwrap(),
+        ] {
+            assert_eq!(error.error_code(), "KIO-E-STORE-LOCKED-001");
+        }
+        assert!(!gate.exists());
+        assert!(!repo.kio_dir().join(".lock").exists());
+        fs::write(&gate, b"foreign").unwrap();
+        assert_eq!(
+            repo.scope_identity().unwrap_err().error_code(),
+            "KIO-E-STORE-LOCKED-001"
+        );
+        assert_eq!(fs::read(gate).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn old_format_rejects_before_missing_gate_and_low_level_writer_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = Repository::init(temp.path()).unwrap();
+        let kio = repo
+            .store_directory()
+            .unwrap()
+            .root_handle()
+            .try_clone()
+            .unwrap();
+        let path = repo.kio_dir().join("scope.json");
+        let mut scope: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        scope["kio_format_version"] = json!("1.0.0");
+        fs::write(&path, serde_json::to_vec(&scope).unwrap()).unwrap();
+        fs::remove_file(repo.kio_dir().join(".store-gate")).unwrap();
+        for error in [
+            repo.scope_identity().unwrap_err(),
+            super::acquire_bound_store_read_guard(&kio).err().unwrap(),
+            super::acquire_bound_store_lock(&kio).err().unwrap(),
+            StoreLock::acquire(repo.kio_dir()).err().unwrap(),
+        ] {
+            assert_eq!(error.error_code(), "KIO-E-STORE-VERSION-001");
+        }
+        assert!(!repo.kio_dir().join(".lock").exists());
+        assert!(!repo.kio_dir().join(".store-gate").exists());
+    }
 
     #[cfg(unix)]
     #[test]
@@ -8745,7 +8997,15 @@ mod tests {
 
     #[test]
     fn incompatible_scope_versions_precede_current_schema_validation() {
-        for version in ["0.0.0", "0.1.0", "0.2.0", "1.0.1", "malformed"] {
+        for version in [
+            "0.0.0",
+            "0.1.0",
+            "0.2.0",
+            "1.0.0",
+            "1.0.1",
+            "3.0.0",
+            "malformed",
+        ] {
             let dir = tempfile::tempdir().unwrap();
             let repo = Repository::init(dir.path()).unwrap();
             let scope_path = repo.kio_dir().join("scope.json");

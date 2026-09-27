@@ -179,8 +179,8 @@ purge済み、HEAD競合は適用前に止める。source不在パスの削除�
 | A06 | source SQLite/aggregator消失・破損、同時index/search | `.kio`から再構築、結果同値または明示した一時未完状態 |
 | A07 | DOCX/PPTX→PDF、PDF/image→Markdown、XLSX、壊れた入力 | 実converter version、fixture/output hash、出力構造、拒否/timeout |
 | A08 | Mistral/Gemini/local、batch/realtime、query embedding、認証/予算失敗、受付後の結果不明 | 実provider receiptとmock failure契約の両方。不明要求の重複送信0または明示未解決 |
-| A09 | 全体/選択restore、削除、dirty、purged、同時HEAD変更、過去の制御path混入 | 親は旧currentの一つだけ。現在のconfig/consent内容・policy世代・ledger維持、非選択保持 |
-| A10 | commit/restore/rebuild/queue/ledgerのdurable境界でprocess停止、中央backup復旧 | 再開後のHEAD・bytes・projection整合、provider受付前後の再送防止、未解決intent保持、欠落ledgerで課金停止 |
+| A09 | 全体/選択restore、削除、dirty、purged、同時HEAD変更、過去の制御path混入、候補を持つ実GC、未参照object調査、定期snapshot | 親は旧currentの一つだけ。現在のconfig/consent内容・policy世代・ledger維持、非選択保持。GCのreceipt・旧tree消失・HEAD保持・verify/rebuild・再実行、調査の無変更、snapshot autoの初回noop→変更による子commit→未変更skipを3 OSで確認 |
+| A10 | commit/restore/rebuild/queue/ledger/GC/checkpointのdurable境界でprocess停止、中央backup復旧 | 再開後のHEAD・bytes・projection整合、provider受付前後の再送防止、未解決intent保持、欠落ledgerで課金停止。Windows GCのmarker/indexと定期checkpointの各6境界はnative CLI試験で追加検証 |
 | A11 | watch常駐の登録・起動・停止・再起動・解除 | 3OSのuser-level lifecycle証跡、複数起動競合、秘密を含まないstatus |
 | A12 | 配布archive、hash、SBOM/依存情報、clean install、help/version | exact候補SHAと各OS artifactの対応、展開後binaryでA01〜A11を実行 |
 

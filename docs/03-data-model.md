@@ -35,6 +35,7 @@ raw / prepared / image / normalized_unit_object / chunk / embedding / manifest /
 
 ```
 .kio/
+  .store-gate         init 時に全 OS で作る必須の空 regular file (恒久的な concurrency gate)
   HEAD
   config.toml         folder-scope の設定 (ignore, chunking, search, budget)
   scope.json          scope_id (init 時採番の ULID、以後不変) とこのフォルダ自身・子 .kio リンク
@@ -143,7 +144,9 @@ names.jsonl で digest を解決する。対応行の無い canonical ref は fs
 names 行は残す [06-cli-spec.md §1](06-cli-spec.md))。同一 digest の複数行は最終行を表示名とする
 (NFC + simple case folding が同じ名前は同一 slot — 表記ゆれの上書きは append で表現)。
 
-**format_version**: 旧称 `VERSION 0.1.0` (旧 research/kio.md) は `kio_format_version` に統一。semver は [10-operations.md §11.5](10-operations.md) 参照。**保存場所 = `.kio/scope.json` の必須 `kio_format_version` フィールド** (init 時に current version を記録する)。current reader は `KIO_FORMAT_VERSION` と**完全一致**する string だけを受理する。欠落、非 string、非 parseable、older/newer、未知を含む任意の不一致は current schema ではなく **incompatible format** として、`KIO-E-STORE-VERSION-001` / exit 8 で store bytes を変更せず fail-closed にする。**この完全一致判定は scope.json の schema validation より先に評価する**。reader / search / repair / historical を含む全 command に read-only、migration、old-reader の例外はなく、multi-scope search も当該 scope を除外して partial success を返さず command 全体を停止する。具体挙動は [10-operations.md §11.5](10-operations.md) が正本。
+**format_version**: 旧称 `VERSION 0.1.0` (旧 research/kio.md) は `kio_format_version` に統一。semver は [10-operations.md §11.5](10-operations.md) 参照。**保存場所 = `.kio/scope.json` の必須 `kio_format_version` フィールド** (init 時に current version を記録する)。現在の保存形式は `KIO_FORMAT_VERSION = "2.0.0"`。これは製品の release/Cargo version や GUI を含む製品 v2 とは独立した storage format である。current reader は `KIO_FORMAT_VERSION` と**完全一致**する string だけを受理する。欠落、非 string、非 parseable、older/newer、未知を含む任意の不一致は current schema ではなく **incompatible format** として、`KIO-E-STORE-VERSION-001` / exit 8 で store bytes を変更せず fail-closed にする。**この完全一致判定は scope.json の schema validation より先に評価する**。reader / search / repair / historical を含む全 command に read-only、migration、old-reader の例外はなく、multi-scope search も当該 scope を除外して partial success を返さず command 全体を停止する。具体挙動は [10-operations.md §11.5](10-operations.md) が正本。
+
+**2.0.0 の store gate**: `.kio/.store-gate` は init が全 OS で作成する必須の空 regular file であり、内容と identity を不変に保つ。削除・置換・遅延作成・repair による補完はしない。Windows の reader/writer coordination はこの恒久 gate を共有する。旧 Windows writer が gate を迂回して書き込むことを防ぐため、保存形式を 1.0.0 から 2.0.0 に変更した。旧 store は gate の有無によらず version 判定を先に行って exit 8 で拒否し、current store の gate 欠落・非 regular・非空も fail-closed とする。移行経路や旧形式の read/write 互換経路は置かない。
 
 ## 2.1 normalized instance と全文 view
 

@@ -2317,6 +2317,7 @@ pub fn run_a09(options: &A09Options) -> Result<AcceptanceReceipt, AcceptanceErro
         "KIO-E-MANAGED-RESTORE-RECOVERY-REQUIRED-001",
         "A09 purged source restore",
     )?;
+    assert_a09_public_gc(&options.binary, &isolated)?;
     if sha256_regular_file(&options.binary, MAX_BINARY_BYTES)?
         != options.expected.candidate.binary_sha256
     {
@@ -2338,6 +2339,354 @@ pub fn run_a09(options: &A09Options) -> Result<AcceptanceReceipt, AcceptanceErro
     };
     write_receipt_create_only(&options.receipt, &receipt)?;
     Ok(receipt)
+}
+
+/// Deterministic public text inputs are bound by the evaluator digest. The
+/// ordinary CLI creates every commit, tree and index using real wall time;
+/// zero documented retention horizons make the old auto snapshot eligible.
+fn assert_a09_public_gc(binary: &Path, isolated: &Path) -> Result<(), AcceptanceError> {
+    use kio_core::cas::{ObjectKind, ObjectStore};
+    use kio_core::gc::read_shallow_receipts;
+
+    const OLD: &[u8] = b"# A09 public GC seed v1\n\nHistorical public acceptance text.\n";
+    const CURRENT: &[u8] = b"# A09 public GC seed v2\n\nCurrent public acceptance text.\n";
+    let scope = isolated.join("gc-scope");
+    fs::create_dir(&scope).map_err(io_error)?;
+    let document = scope.join("document.md");
+    fs::write(&document, OLD).map_err(io_error)?;
+    let scope_text = scope
+        .to_str()
+        .ok_or_else(|| AcceptanceError::Invalid("A09 GC scope is not UTF-8".into()))?;
+    run_a01_command(binary, isolated, None, &["--json", "init", scope_text])?;
+    let config_path = scope.join(".kio/config.toml");
+    let mut config: toml::Value =
+        toml::from_str(&fs::read_to_string(&config_path).map_err(io_error)?)
+            .map_err(|error| AcceptanceError::Invalid(format!("A09 GC config: {error}")))?;
+    let gc = config
+        .as_table_mut()
+        .ok_or_else(|| AcceptanceError::Invalid("A09 GC config is not a table".into()))?
+        .entry("gc")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or_else(|| AcceptanceError::Invalid("A09 GC settings are not a table".into()))?;
+    gc.insert("mode".into(), toml::Value::String("manual_only".into()));
+    let retention = [
+        "keep_last_hours",
+        "keep_hourly_days",
+        "keep_daily_weeks",
+        "keep_weekly_months",
+    ]
+    .into_iter()
+    .map(|key| (key.into(), toml::Value::Integer(0)))
+    .collect();
+    gc.insert("auto_retention".into(), toml::Value::Table(retention));
+    fs::write(
+        &config_path,
+        toml::to_string(&config)
+            .map_err(|error| AcceptanceError::Invalid(format!("A09 GC config: {error}")))?,
+    )
+    .map_err(io_error)?;
+
+    let mut snapshots = Vec::new();
+    for bytes in [OLD, CURRENT] {
+        fs::write(&document, bytes).map_err(io_error)?;
+        let index = command_json(
+            binary,
+            isolated,
+            &scope,
+            &["--json", "index", "--offline", "--yes"],
+        )?;
+        let hash = required_json_string(&index, "/commit_hash", "A09 GC index")?;
+        let commit = command_json(binary, isolated, &scope, &["--json", "inspect", &hash])?;
+        if commit["commit_type"] != "auto" {
+            return Err(AcceptanceError::Command(
+                "A09 GC seed did not create an auto snapshot".into(),
+            ));
+        }
+        let tree = required_json_string(&commit, "/tree", "A09 GC snapshot")?;
+        snapshots.push((hash, tree));
+    }
+    let (old_commit, old_tree) = &snapshots[0];
+    let (current_commit, current_tree) = &snapshots[1];
+    if old_commit == current_commit || old_tree == current_tree {
+        return Err(AcceptanceError::Command(
+            "A09 GC seed snapshots are not distinct".into(),
+        ));
+    }
+    let kio = scope.join(".kio");
+    let head_before = fs::read(kio.join("HEAD")).map_err(io_error)?;
+    if std::str::from_utf8(&head_before).ok().map(str::trim) != Some(current_commit.as_str()) {
+        return Err(AcceptanceError::Command(
+            "A09 GC HEAD is not the current seed snapshot".into(),
+        ));
+    }
+    let store = ObjectStore::new(&kio);
+    let old_path = store
+        .object_path(ObjectKind::Tree, old_tree)
+        .map_err(|error| AcceptanceError::Command(error.to_string()))?;
+    let current_path = store
+        .object_path(ObjectKind::Tree, current_tree)
+        .map_err(|error| AcceptanceError::Command(error.to_string()))?;
+    let current_tree_before = fs::read(&current_path).map_err(io_error)?;
+    if !old_path.is_file() {
+        return Err(AcceptanceError::Command(
+            "A09 GC old tree was absent before sweep".into(),
+        ));
+    }
+    assert_a09_readonly_inventory(binary, isolated, &scope, &[old_tree, current_tree], &[])?;
+    let preview = command_json(binary, isolated, &scope, &["--json", "gc", "--dry-run"])?;
+    if preview["candidate_count"] != 1
+        || preview["candidate_tree_count"] != 1
+        || preview["candidates"].as_array().map(Vec::len) != Some(1)
+        || preview["candidates"][0]["commit_hash"] != *old_commit
+        || preview["candidates"][0]["tree_hash"] != *old_tree
+    {
+        return Err(AcceptanceError::Command(format!(
+            "A09 GC preview did not select exactly the old auto tree: {preview}"
+        )));
+    }
+    let completed = command_json(binary, isolated, &scope, &["--json", "gc", "--yes"])?;
+    if completed["status"] != "completed"
+        || completed["candidate_count"] != 1
+        || completed["candidate_tree_count"] != 1
+        || old_path.exists()
+        || kio.join("gc/in_progress").exists()
+    {
+        return Err(AcceptanceError::Command(format!(
+            "A09 GC did not complete its nonempty sweep: {completed}"
+        )));
+    }
+    // The production parser requires canonical bytes, exact leaf/hash binding,
+    // timestamp and policy, and rejects unknown fields and duplicate receipts.
+    let receipts =
+        read_shallow_receipts(&kio).map_err(|error| AcceptanceError::Command(error.to_string()))?;
+    if receipts.len() != 1
+        || receipts.get(old_commit).map(|receipt| &receipt.tree_hash) != Some(old_tree)
+    {
+        return Err(AcceptanceError::Command(
+            "A09 GC did not publish the exact old snapshot receipt".into(),
+        ));
+    }
+    assert_a09_readonly_inventory(binary, isolated, &scope, &[current_tree], &[old_tree])?;
+    for (args, status) in [
+        (["--json", "repair", "verify-objects"], "ok"),
+        (["--json", "repair", "rebuild-db"], "rebuilt"),
+        (["--json", "repair", "verify-objects"], "ok"),
+    ] {
+        let result = command_json(binary, isolated, &scope, &args)?;
+        if result["status"] != status {
+            return Err(AcceptanceError::Command(format!(
+                "A09 GC repair failed: {result}"
+            )));
+        }
+    }
+    for flag in ["--dry-run", "--yes"] {
+        let repeated = command_json(binary, isolated, &scope, &["--json", "gc", flag])?;
+        if repeated["candidate_count"] != 0 || repeated["candidates"] != serde_json::json!([]) {
+            return Err(AcceptanceError::Command(format!(
+                "A09 GC repeat was not empty: {repeated}"
+            )));
+        }
+    }
+    if fs::read(kio.join("HEAD")).map_err(io_error)? != head_before
+        || fs::read(&document).map_err(io_error)? != CURRENT
+        || fs::read(&current_path).map_err(io_error)? != current_tree_before
+        || old_path.exists()
+        || read_shallow_receipts(&kio)
+            .map_err(|error| AcceptanceError::Command(error.to_string()))?
+            != receipts
+        || kio.join("gc/in_progress").exists()
+    {
+        return Err(AcceptanceError::Command(
+            "A09 GC changed current state or was not idempotent".into(),
+        ));
+    }
+    assert_a09_scheduled_snapshot(binary, isolated, &scope, current_commit)?;
+    Ok(())
+}
+
+/// Exercise the shipped scheduled writer using real time. The change threshold
+/// makes publication immediate while the one-year interval keeps an unchanged
+/// repeat ineligible without sleeps or an instrumented binary.
+fn assert_a09_scheduled_snapshot(
+    binary: &Path,
+    isolated: &Path,
+    scope: &Path,
+    parent: &str,
+) -> Result<(), AcceptanceError> {
+    const NEXT: &[u8] =
+        b"# A09 public scheduled seed v3\n\nChanged public scheduled acceptance text.\n";
+    let config_path = scope.join(".kio/config.toml");
+    let mut config: toml::Value =
+        toml::from_str(&fs::read_to_string(&config_path).map_err(io_error)?)
+            .map_err(|error| AcceptanceError::Invalid(format!("A09 snapshot config: {error}")))?;
+    let snapshot = config
+        .as_table_mut()
+        .ok_or_else(|| AcceptanceError::Invalid("A09 snapshot config is not a table".into()))?
+        .entry("snapshot")
+        .or_insert_with(|| toml::Value::Table(Default::default()))
+        .as_table_mut()
+        .ok_or_else(|| AcceptanceError::Invalid("A09 snapshot settings are not a table".into()))?;
+    snapshot.insert(
+        "auto".into(),
+        toml::Value::Table(
+            [
+                ("enabled".into(), toml::Value::Boolean(true)),
+                ("interval_seconds".into(), toml::Value::Integer(31_536_000)),
+                ("on_change_threshold".into(), toml::Value::Integer(1)),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+    fs::write(
+        &config_path,
+        toml::to_string(&config)
+            .map_err(|error| AcceptanceError::Invalid(format!("A09 snapshot config: {error}")))?,
+    )
+    .map_err(io_error)?;
+    let head_path = scope.join(".kio/HEAD");
+    let head_before = fs::read(&head_path).map_err(io_error)?;
+    let first = command_json(binary, isolated, scope, &["--json", "snapshot", "auto"])?;
+    if first["operation"] != "snapshot_auto"
+        || first["status"] != "noop"
+        || first["eligible"] != true
+        || first["eligibility_reason"] != "first_run"
+        || first["change_count"] != 0
+        || first["publication_status"] != "completed"
+        || first["snapshot_status"] != "noop"
+        || !first["commit_hash"].is_null()
+        || fs::read(&head_path).map_err(io_error)? != head_before
+    {
+        return Err(AcceptanceError::Command(format!(
+            "A09 initial scheduled snapshot was not an eligible no-op: {first}"
+        )));
+    }
+    let initial_state = a09_scheduled_state(scope, &first)?;
+    fs::write(scope.join("document.md"), NEXT).map_err(io_error)?;
+    let published = command_json(binary, isolated, scope, &["--json", "snapshot", "auto"])?;
+    let child = required_json_string(&published, "/commit_hash", "A09 scheduled snapshot")?;
+    let commit = command_json(binary, isolated, scope, &["--json", "inspect", &child])?;
+    if published["status"] != "completed"
+        || published["reason"] != "snapshot_created"
+        || published["publication_status"] != "completed"
+        || published["snapshot_status"] != "completed"
+        || published["eligible"] != true
+        || published["eligibility_reason"] != "change_threshold"
+        || published["change_count"] != 1
+        || child == parent
+        || commit["commit_type"] != "auto"
+        || commit["parent"] != parent
+        || commit["tree"] != published["tree_hash"]
+        || fs::read_to_string(&head_path).map_err(io_error)?.trim() != child
+        || fs::read(scope.join("document.md")).map_err(io_error)? != NEXT
+    {
+        return Err(AcceptanceError::Command(format!(
+            "A09 scheduled threshold did not publish the expected child: {published}"
+        )));
+    }
+    let state = a09_scheduled_state(scope, &published)?;
+    if initial_state.working_set_digest == state.working_set_digest {
+        return Err(AcceptanceError::Command(
+            "A09 scheduled state did not record the changed working set".into(),
+        ));
+    }
+    let before_repeat = directory_fingerprint(scope)?;
+    let repeated = command_json(binary, isolated, scope, &["--json", "snapshot", "auto"])?;
+    if repeated["status"] != "skipped"
+        || repeated["reason"] != "not_eligible"
+        || repeated["eligible"] != false
+        || repeated["change_count"] != 0
+        || repeated["publication_status"] != "not_started"
+        || !repeated["commit_hash"].is_null()
+        || directory_fingerprint(scope)? != before_repeat
+        || a09_scheduled_state(scope, &repeated)? != state
+    {
+        return Err(AcceptanceError::Command(format!(
+            "A09 unchanged scheduled repeat was not a read-only skip: {repeated}"
+        )));
+    }
+    Ok(())
+}
+
+fn a09_scheduled_state(
+    scope: &Path,
+    report: &serde_json::Value,
+) -> Result<kio_core::gc::SnapshotAutoState, AcceptanceError> {
+    // The core observer rejects non-regular files, unknown fields, invalid
+    // timestamps/digests and any state bytes other than canonical JCS+LF.
+    let state = kio_core::gc::GcSweepSession::bind(scope.to_path_buf())
+        .and_then(|session| session.snapshot_auto_state())
+        .map_err(|error| AcceptanceError::Command(format!("A09 scheduled state: {error}")))?
+        .state
+        .ok_or_else(|| AcceptanceError::Command("A09 scheduled state is missing".into()))?;
+    if report["working_set_digest"] != state.working_set_digest {
+        return Err(AcceptanceError::Command(
+            "A09 scheduled state does not bind the reported working set".into(),
+        ));
+    }
+    Ok(state)
+}
+
+/// Inventory is a read-only diagnostic, never authority to delete an object.
+/// Check the complete scope image around each real CLI invocation so creating
+/// a lock/gate, modifying SQLite or rewriting a receipt cannot pass unnoticed.
+fn assert_a09_readonly_inventory(
+    binary: &Path,
+    isolated: &Path,
+    scope: &Path,
+    present_trees: &[&str],
+    absent_trees: &[&str],
+) -> Result<(), AcceptanceError> {
+    let before = directory_fingerprint(scope)?;
+    let mut previous = None;
+    for _ in 0..2 {
+        let inventory = command_json(
+            binary,
+            isolated,
+            scope,
+            &["--json", "gc", "--dry-run", "--prune-unreachable"],
+        )?;
+        if directory_fingerprint(scope)? != before {
+            return Err(AcceptanceError::Command(
+                "A09 unreachable inventory changed scope bytes or names".into(),
+            ));
+        }
+        if inventory["operation"] != "unreachable_object_inventory"
+            || inventory["schema_version"] != 1
+            || inventory["status"] != "dry_run"
+            || inventory["read_only"] != true
+            || inventory["diagnostic_only"] != true
+            || inventory["mutation_authority"] != false
+        {
+            return Err(AcceptanceError::Command(format!(
+                "A09 unreachable inventory violated the diagnostic contract: {inventory}"
+            )));
+        }
+        let objects = inventory["objects"].as_array().ok_or_else(|| {
+            AcceptanceError::Command("A09 inventory omitted object records".into())
+        })?;
+        let contains = |tree: &&str| {
+            objects
+                .iter()
+                .any(|object| object["kind"] == "tree" && object["hash"] == *tree)
+        };
+        if !present_trees.iter().all(contains) || absent_trees.iter().any(contains) {
+            return Err(AcceptanceError::Command(
+                "A09 inventory did not reflect the public GC tree transition".into(),
+            ));
+        }
+        if previous
+            .as_ref()
+            .is_some_and(|previous| previous != &inventory)
+        {
+            return Err(AcceptanceError::Command(
+                "A09 repeated unreachable inventory was not deterministic".into(),
+            ));
+        }
+        previous = Some(inventory);
+    }
+    Ok(())
 }
 
 fn command_json(

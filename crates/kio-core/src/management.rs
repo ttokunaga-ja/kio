@@ -1,4 +1,5 @@
 //! Descriptor-bound local management authority.
+use crate::scope::KIO_FORMAT_VERSION;
 use crate::store_dir::{Publication, StoreDirectory};
 use crate::{ExitCode, KioError, Result};
 use cap_primitives::fs as cap_fs;
@@ -1105,7 +1106,7 @@ fn scope_id_from_store(store: &StoreDirectory) -> Result<String> {
         serde_json::from_slice(&bytes).map_err(|_| err("scope.json is not JSON"))?;
     if v.get("kio_format_version")
         .and_then(serde_json::Value::as_str)
-        != Some("1.0.0")
+        != Some(KIO_FORMAT_VERSION)
     {
         return Err(err("scope.json format is not current"));
     }

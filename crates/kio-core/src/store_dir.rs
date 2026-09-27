@@ -314,10 +314,23 @@ impl StoreDirectory {
         )
     }
 
+    /// Open one GC mutation leaf with read/write/delete rights and read-only sharing.
+    #[cfg(windows)]
+    pub fn open_gc_mutation(&self, leaf: &Path, max_bytes: u64) -> Result<File> {
+        platform::direct_leaf(leaf, &self.logical)?;
+        platform::open_gc_mutation(&self.handle, leaf, max_bytes, &self.logical)
+    }
+
+    /// Delete this exact single-link file and verify zero links before reclaiming bytes.
+    #[cfg(windows)]
+    pub fn retire_gc_handle(&self, file: &File) -> Result<()> {
+        platform::retire_gc_handle(file, &self.logical)
+    }
+
     /// Move a Windows regular file by its already-validated retained handle.
     /// The source name is never reopened by this primitive.
     #[cfg(windows)]
-    pub(super) fn move_verified_regular_handle_to_raw(
+    pub fn move_verified_regular_handle_to_raw(
         &self,
         source: &File,
         destination_parent: &StoreDirectory,
@@ -1678,6 +1691,84 @@ mod platform {
         }
         Ok(file)
     }
+    pub(super) fn open_gc_mutation(
+        root: &File,
+        relative: &Path,
+        max: u64,
+        label: &Path,
+    ) -> Result<File> {
+        let (parent, leaf) = parent(root, relative, label)?;
+        let mut options = cap_fs::OpenOptions::new();
+        options
+            .read(true)
+            .write(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE)
+            .share_mode(FILE_SHARE_READ)
+            ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+        let file = cap_fs::open(&parent, Path::new(leaf), &options).map_err(|e| ioerr(label, e))?;
+        if regular(&file, label)?.len() > max {
+            return Err(err(label, "GC mutation file exceeds byte limit"));
+        }
+        Ok(file)
+    }
+
+    pub(super) fn retire_gc_handle(file: &File, label: &Path) -> Result<()> {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+            FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx, SetFileInformationByHandle,
+        };
+        let expected = crate::cas::windows_regular_file_handle_identity(file)
+            .ok_or_else(|| err(label, "GC retirement requires a single-link regular handle"))?
+            .atomic_recovery_components();
+        let disposition = FILE_DISPOSITION_INFO_EX {
+            Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        };
+        if unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as _,
+                FileDispositionInfoEx,
+                &disposition as *const _ as _,
+                std::mem::size_of_val(&disposition) as u32,
+            )
+        } == 0
+        {
+            return Err(ioerr(label, std::io::Error::last_os_error()));
+        }
+        let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
+            return Err(ioerr(label, std::io::Error::last_os_error()));
+        }
+        let actual = (
+            information.dwVolumeSerialNumber,
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        );
+        if actual != expected || information.nNumberOfLinks != 0 {
+            return Err(err(
+                label,
+                "GC retirement did not preserve identity with zero links",
+            ));
+        }
+        file.set_len(0).map_err(|e| ioerr(label, e))?;
+        file.sync_all().map_err(|e| ioerr(label, e))?;
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0 {
+            return Err(ioerr(label, std::io::Error::last_os_error()));
+        }
+        let after = (
+            information.dwVolumeSerialNumber,
+            (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+        );
+        if after != expected
+            || information.nNumberOfLinks != 0
+            || information.nFileSizeHigh != 0
+            || information.nFileSizeLow != 0
+        {
+            return Err(err(
+                label,
+                "GC retirement postcondition failed after reclamation",
+            ));
+        }
+        Ok(())
+    }
     pub(super) fn read_optional(
         root: &File,
         relative: &Path,
@@ -2072,7 +2163,7 @@ mod platform {
         sync_directory(source_parent, source_label)?;
         sync_directory(destination_parent, destination_label)
     }
-    fn direct_leaf<'a>(path: &'a Path, label: &Path) -> Result<&'a std::ffi::OsStr> {
+    pub(super) fn direct_leaf<'a>(path: &'a Path, label: &Path) -> Result<&'a std::ffi::OsStr> {
         let c = relative_components(path, false, label)?;
         if c.len() != 1 {
             return Err(err(label, "directory rename requires one direct leaf"));
@@ -2281,6 +2372,47 @@ mod platform {
                 b"validated"
             );
             assert_eq!(fs::read(&source_path).unwrap(), b"replacement");
+        }
+
+        #[test]
+        fn gc_retirement_preserves_identity_and_reclaims_a_retained_reader() {
+            use std::io::Read as _;
+            let root = tempfile::tempdir().unwrap();
+            let parent = directory(&root.path().join("retire"));
+            let path = parent.path().join("leaf");
+            fs::write(&path, b"reclaim these bytes").unwrap();
+            let mut reader = OpenOptions::new()
+                .read(true)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(&path)
+                .unwrap();
+            let mutator = parent.open_gc_mutation(Path::new("leaf"), 64).unwrap();
+            let before = crate::cas::windows_regular_file_handle_identity(&mutator)
+                .unwrap()
+                .atomic_recovery_components();
+            parent.retire_gc_handle(&mutator).unwrap();
+            let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            assert_ne!(
+                unsafe {
+                    GetFileInformationByHandle(mutator.as_raw_handle() as _, &mut information)
+                },
+                0
+            );
+            assert_eq!(
+                (
+                    information.dwVolumeSerialNumber,
+                    (u64::from(information.nFileIndexHigh) << 32)
+                        | u64::from(information.nFileIndexLow)
+                ),
+                before
+            );
+            assert_eq!(information.nNumberOfLinks, 0);
+            assert_eq!(mutator.metadata().unwrap().len(), 0);
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            assert!(bytes.is_empty());
+            drop(mutator);
+            assert!(!path.exists());
         }
 
         #[test]

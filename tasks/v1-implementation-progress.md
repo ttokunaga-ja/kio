@@ -4,7 +4,251 @@ Implementation of the approved [plan](v1-implementation-plan.md) began on
 2026-09-07, from `f198c26` on `main`. Entries below distinguish implementation,
 local verification, and the final native acceptance evidence.
 
-## Current checkpoint — 2026-09-27
+## Current acceptance checkpoint — 2026-09-27
+
+**v1.0 remains incomplete.** Candidate `1ffdd0c` is published on `main` for
+native CI confirmation. The earlier recovery entries below describe historical
+checkpoints; their statements about absent App configuration or no push do not
+describe the current state.
+
+- The dedicated private provider-ledger GitHub App is installed only on `kio`.
+  Its private key is confined to the main-only authority Environment. Separate
+  rules prohibit ledger history deletion/force updates and restrict ledger
+  creation/updates to the App. Installation and configuration are complete;
+  runtime token initialization and the first campaign remain pending. No paid
+  provider requests have been made during this recovery.
+- Local Mac and Linux workspace regression passed at the `63a9102` runtime base.
+  Current-candidate targeted validation passed after A03 was changed to inspect
+  durable search state only after successful watcher reconciliation and shutdown.
+  The strict policy-denial and immutable child-store assertions remain enabled.
+- Two fresh Mac package builds at `1ffdd0c` produced identical archives
+  (`ea210c627c8dfc2f2dfc1e4e798989260e026811e1b4d807fc90648df739a651`).
+  Packaged A01, A02, A03-native, A04-core/local-trust, A05, A06, A08-mock,
+  A09 and A10 passed locally. These are local receipts, not native Actions
+  acceptance. Service and real-provider/local lanes are still pending.
+- Official macOS LibreOffice 26.2.5 lacks the compiled headless backend and
+  aborts during confined conversion despite a successful version probe. A fresh
+  official 26.8.0 download passed the actual A07 diagnostic without modifying
+  the bundle or isolation. Actions pins are updated to 26.8.0, and unsupported
+  verified macOS bundles are rejected before conversion. These local debug
+  diagnostics still require new packaged-candidate/native Actions receipts.
+  A12's obsolete `index --approve` argument is fixed to `--yes`; its distribution
+  diagnostic passed using the prior archives and modified evaluator, with the
+  mixed provenance explicitly retained.
+- [CI run 36287581490](https://github.com/ttokunaga-ja/kio/actions/runs/36287581490)
+  failed in Linux confinement setup, macOS SDK hardlink handling, and Windows
+  Clippy. Complete failing-job logs and annotations were retrieved before fixes.
+  Acceptance-tooling and Persona W0 passed in that run;
+  [CodeQL run 36287580518](https://github.com/ttokunaga-ja/kio/actions/runs/36287580518)
+  also passed. No repeated run of the unchanged failed candidate was requested.
+- Local commits `8d17331`, `2f43c33`, and `1b6165c` address SDK hardlinks,
+  Windows-specific Clippy failures, Office bundle recognition, and native CI
+  prerequisites. At the frozen `1b6165c` Rust source state, Mac formatting,
+  workspace all-target Clippy and all 3,136 tests across 96 targets passed, with
+  zero failed/ignored tests and unchanged source hashes. The subsequent macOS
+  version gate passed 31 focused tests and strict adapter Clippy on Rust 1.98.0.
+  The committed `de1e450` Linux snapshot subsequently passed the complete
+  synthetic-history and Persona W0 command sequences (32 invocations). All
+  1,632 tracked source files and 1,053 tracked evaluation inputs retained their
+  bytes and modes. Native Windows and final candidate-bound acceptance remain
+  separate gates.
+- Local commit `c95c670` retains exited Unix child identity with `waitid` /
+  `WNOWAIT` until cancellation and final reaping. Its regression covers an
+  escaped descendant retaining stdout and a late output-limit error; all 28
+  process tests, formatting and strict process Clippy passed on macOS. Native
+  WSL bounded tests (5), process all-target checking and strict Clippy also
+  passed from the exact `c95c670` snapshot.
+- Local commit `94dcea9` centralizes Linux user-manager setup and cgroup v2
+  prerequisite checks in the guarded hosted-runner helper. The exact resource
+  probe passed twice on the lab's systemd 259.5, including kernel limit values,
+  explicit termination properties, cleanup and idempotent environment exports.
+  Bash/ShellCheck/YAML/action-pin checks and independent correctness review also
+  passed. This does not establish Ubuntu 24.04/systemd 255 AppArmor enforcement,
+  which remains a native Actions gate.
+- Local commit `c69fdb5` adds a verified systemd user scope, aggregate
+  memory/task/CPU enforcement, a two-phase keeper-ready/activation protocol and
+  bounded cleanup. Final native checks, pinned Office conversion and a fresh
+  Daybreak security review remain required before accepting this M5/v1 gate.
+  A private PID namespace or the prerequisite probe alone does not satisfy it.
+- The Linux working snapshot now passes a fresh-target all-target check, strict
+  Clippy and explicit library/integration compilation. An earlier reused target
+  contained stale Cargo artifacts because the source archive used zero mtimes;
+  those apparent check/Clippy passes are not new-code evidence. Native execution
+  found a cleanup bug: removed cgroup directories retain `nlink=2`. The OOM
+  fixture independently observed kernel OOM killing at 96 MiB and complete
+  process removal, but the implementation incorrectly reported cleanup timeout.
+  Two separate retained-descriptor probes confirmed the deletion semantics and
+  support an identity-bound replacement. The initial native library run passed
+  33 tests and failed four at this same cleanup boundary; it is not a green
+  acceptance result. The mount validator separately passed 16 native tests and
+  seven live checks, including WSL's stacked mounts.
+- The corrected r4 snapshot passed all 13 public Linux confinement acceptance
+  tests, including aggregate OOM, task/CPU limits, timeout, parent death,
+  concurrent scopes, environment/descriptor isolation and cleanup. Its library
+  suite passed 36 of 37 tests. The remaining early-keeper test observed safe
+  refusal through `pidfd_open`/`ESRCH`, but required keeper context in the error;
+  `c69fdb5` adds that diagnostic without relaxing admission. Exact-commit
+  regression subsequently passed all 37 Linux library tests, formatting,
+  strict workspace Clippy and compilation of all 88 workspace test targets.
+  The first library attempt hit the Unix socket path-length limit because its
+  private `TMPDIR` was too deep; the original failure is retained, and the
+  exact socket test plus full library suite passed with a short UID-owned
+  mode-0700 temporary directory. Full workspace execution remains pending.
+  When kernel accounting disappears after OOM,
+  the product reports unavailable accounting rather than claiming an observed
+  OOM cause; the test separately requires a positive kernel OOM-kill witness.
+- The lab's normal host build environment now has the 41 pinned development
+  packages required by `build-essential` and `pkg-config`; the installed-package
+  delta is exactly 41 additions, with no upgrades or removals. Host libc C and
+  standard-library Rust compile/link/run checks passed without a mixed rootfs
+  loader environment. Native strict workspace Clippy then passed at `c69fdb5`.
+  The full native workspace test stopped at the adapter library (359 passed,
+  five failed): one symlink test rejected the earlier safe scratch-inspection
+  refusal message, and four subsequent tests inherited the poisoned test mutex.
+  Both symlink tests now accept that specific safe refusal while retaining
+  `expect_err` and private-content nondisclosure assertions. This test-only
+  correction passed all 364 adapter tests and the native full workspace /
+  all-target command in a separate snapshot: 3,135 passed across 85 executables
+  in 509 seconds. The one ignored top-level entry is the self-helper invoked
+  explicitly by native confinement tests, not an omitted acceptance case.
+  An intervening run stopped at
+  the Python exception ledger test because the extracted archive lacked Git
+  index metadata; adding the harness index made that exact test and the full
+  rerun pass. All 1,633 other source files retained their original bytes and
+  modes. The original candidate source and failed logs remain unchanged.
+- The broad macOS workspace/all-target test run completed with 3,129 passing
+  tests across 85 top-level targets (nested helper results excluded). It began
+  at `94dcea9`; Linux-only source and the process error enum changed during the
+  run, so this is not an exact-`c69fdb5` full-suite receipt. After those changes,
+  `c69fdb5` passed formatting, strict workspace/all-target Clippy and
+  28 focused process tests (12 library, 11 macOS confinement, five bounded
+  process). Two clean-checkout candidate package builds subsequently produced
+  identical archives and passed archive verification (archive SHA-256
+  `ce71fc81d9ec05351ef755b71e5186a10d7d58df6ddde4da0b9a6a8069f9b422`).
+  All twelve locally feasible receipts passed: A01--A10 (A03 native, both A04
+  subcases, A08 mock) and A12. A07 used the pinned official 26.8.0.3 Mac runtime;
+  its 18,538-entry app inventory and code signature were unchanged after the
+  run. Both package builds and all receipts bind to the clean `c69fdb5` tree.
+  These use a synthetic local run identity; real service/provider/local-route
+  lanes and native Actions acceptance remain separate requirements.
+- The lab's WSL Office prerequisite now starts the pinned official 26.8.0.3
+  runtime. Only `libnss3=2:3.120-1ubuntu2.1` and
+  `libnspr4=2:4.38.2-1ubuntu1` were added, with exact package digests checked;
+  no existing packages were upgraded or removed. The version check used a
+  private read-only Office mount, UID 1001, zero capabilities and unchanged
+  host `/opt` mount state. The subsequent r4 diagnostic passed source/fixture
+  hashes, ELF target checks and real Office preflight, then failed A07 when
+  `index --offline` reported converter exit status 77. This is a real conversion
+  failure, not a skipped test or a successful acceptance receipt. Its binding
+  remains the frozen r4 working snapshot, not the clean `c69fdb5` candidate;
+  host `/opt` mount state remained unchanged. The exact `c69fdb5` adapter test
+  binary reproduced exit 77 with `User installation could not be completed`.
+  A controlled comparison adding only the pinned package's read-only `presets`
+  leaf passed the deterministic DOCX test (1.42 seconds), isolating the missing
+  first-profile input. The host Bubblewrap bytes and `/opt` mounts remained
+  unchanged. The product correction adds that leaf under the existing
+  root-owner/mode/canonical-path checks; Mac focused tests (31), strict adapter
+  Clippy and a separate Daybreak-designated static review passed. The actual
+  patched binaries then passed both real DOCX/PPTX tests with
+  `KIO_REAL_OFFICE=1` and the full Linux A07 case using the original Bubblewrap,
+  without the diagnostic wrapper. Converter 26.8.0.3, UID 1001, zero capabilities,
+  no-new-privileges and the private read-only runtime mounts remained in force;
+  host `/opt` mount state was unchanged. The A07 binary digest is
+  `a63455be4ceb85aa3d7472e6efb92f7aa91ff453da5c5d737a5fcbe5e6fcb7b6`.
+  Its provenance is `c69fdb5` plus the single Office source overlay, with a
+  synthetic local run ID; it is a product diagnostic, not a clean-candidate or
+  Actions receipt. Two preceding verifier-setup failures are retained separately.
+- The sealed `63a9102..d39bd43` Daybreak-designated diff review has complete
+  coverage, zero reportable findings and zero deferred surfaces. The test-only
+  A03 shutdown delta also passed independent correctness review. Later changes
+  must receive their own applicable validation; historical scans are not a
+  final-candidate security receipt.
+- The sealed `1ffdd0c..8d17331` SDK hardlink review separately covers all four
+  changed SDK files with complete coverage and no discovery candidates. The
+  subsequent six-file `2f43c33` Windows lint change was independently checked
+  for equivalent control flow and error propagation; its platform-specific
+  fixture compilation passed, while full native Windows execution remains
+  blocked locally by Smart App Control and must be confirmed in Actions.
+- The `2f43c33..1b6165c` Daybreak review covered all ten changed files. Its two
+  candidates received source-based validation and policy disposition: macOS
+  execution identity was suppressed; Linux runtime-leaf authority was initially
+  deferred, then ignored at attack-path analysis. However, sealed scan
+  `7239cfec-686b-484a-9be7-3bbdc09b9fca` retains two intermediate deferred rows
+  and reports **partial** canonical coverage: the final rejected surface did not
+  retain each `candidateId` needed to reconcile earlier checkpoints. It is
+  preserved unchanged and is not accepted as a complete security receipt. The final candidate needs a
+  correctly reconciled review and canonical readback, alongside the retained
+  substantive evidence and its execution-identity/provenance limitations.
+- Fresh scan `4b9e6288-6d14-48c9-9bce-33614dbf55ae` is bound to immutable
+  `2f43c33..c69fdb5` and is now sealed with canonical readback: complete
+  coverage, zero reportable findings and zero deferred surfaces. Discovery
+  reviewed all 19 Git diff paths, including six test/script/documentation paths
+  omitted by the tool's 13-file source inventory. The sole recursive mount
+  candidate (`candidate-813c8349e7679a5a`) retains its earlier static validation
+  and deferred attack-path evidence. A supplemental Daybreak-designated
+  adjudication and independent primary cross-check rejected the alleged
+  physical-backing-root invariant: the selected contract authorizes visible
+  runtime roots, and the WSL child-mount allowance is explicit in source/tests.
+  Upstream Bubblewrap's recursive `nodev` is additional counterevidence to
+  device-I/O impact; it does not prove all mounted regular files harmless.
+  All checkpoints retain the same candidate ID. Requested Daybreak identity
+  and unobservable actual backend identity remain separate; the workbench's
+  controller model is not evidence of the substantive CLI backend. The sealed
+  report applies to this exact range, not later changes or full-v1 acceptance.
+- The private Actions route has a candidate-bound read-only deployment packet.
+  Tailscale policy/OIDC and dedicated Windows/WSL SSH changes await the separate
+  concrete approval. No route or host privilege has been enabled by preparing
+  the packet. The quiet ten-minute monitoring automation remains active.
+- A subsequent Windows reachability check found a remaining M1 implementation
+  gap: a nonempty `gc --yes` sweep acquires the implemented Windows store lock
+  but is rejected by `ensure_index_rotation_supported` before marker creation.
+  Windows still lacks bound GC SQLite opens, index exchange/recovery and parts
+  of marker/tree publication. The Windows GC test's expected lock error is
+  obsolete. A09 verifies purge/restore, not destructive GC, so its success would
+  not close this gap. Retained-handle feasibility and a recoverable publication
+  design were required. The following implementation checkpoint replaces the
+  unsupported paths; native execution remains a separate acceptance gate.
+- Windows SQLite now verifies its actual main-file HANDLE through the public
+  SQLite file-control API before pager access. Unexpected files, sidecars,
+  shared memory, attachments and disk temporary opens fail closed; sorting uses
+  memory. The earlier binding revision passed ten native tests, but execution
+  of the final revision was blocked by Smart App Control. No policy bypass or
+  renamed/retried executable was used. Current integrated core/index and GC CLI
+  tests have strict native Windows metadata-check evidence, not runtime proof.
+- Windows GC now uses an explicit five-state, journaled no-replace exchange
+  for marker/index publication and exact-handle tree retirement. The Daybreak
+  protocol challenge identified premature journal removal; the corrected
+  implementation retains intent through old-source deletion, zero-link/length
+  checks, handle close and name absence. Atomic-only publication/removal residue
+  is recovered without inventing a missing source or index. SQLite generation
+  and operation attestation still authorize every tree removal.
+- Storage format is now `2.0.0`, independently of the product's v1 release.
+  The required immutable empty `.store-gate` is created on every OS; old formats
+  are rejected before gate checks or mutation. Windows inventory uses shared
+  nonblocking locks and both ordinary/retained writers use the exclusive gate.
+  Windows nested ordinary locks retain physical ownership until the final guard
+  drops, including reverse drop order. No reader creates or repairs a gate.
+- Scheduled snapshot staging now implements retained Windows input and metadata
+  checks. Checkpoint replacement uses the same five-state protocol with its own
+  owner. Pending state blocks ordinary writers and cannot become a first run;
+  enabled `snapshot auto` recovers under its dedicated lock before eligibility.
+  Disabled or changed authority fails closed. Persistent content bindings allow
+  restoration of exact prior policy bytes, while invocation-local observations
+  detect file replacement before and after recovery.
+- A09 now runs real public CLI retention GC, immutable unreachable inventory,
+  and scheduled first-run no-op, changed-file linear publication, then unchanged
+  skipped repeat. The complete local debug A09 passed after these additions.
+  Mac scope (76), management (30), attestation (11), index (166), GC sweep (27),
+  after-index (16), snapshot-auto (33), and on-idle (13) targeted suites passed
+  at their recorded source states. Windows cross-compilation/strict Clippy passed
+  for the new core paths; final full-workspace, same-SHA packaged/native Actions
+  execution and a new immutable security diff review remain outstanding.
+
+Completion still requires fixing the observed failures, rerunning feasible
+local equivalents, and obtaining every required native 3-OS receipt on one
+candidate SHA. Release publication is separate and has not been performed.
+
+## Earlier recovery checkpoint — 2026-09-27
 
 **v1.0 remains incomplete.** Work resumed after the app restart on local `main`
 at `c89b7ec`; the changes below are undergoing local validation before final

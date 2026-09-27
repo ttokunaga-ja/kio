@@ -10,17 +10,17 @@ use support::canonical_tempdir;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use std::process::Stdio;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use std::thread;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use std::time::{Duration, Instant};
 
 use assert_cmd::Command;
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use kio_core::cas::{ObjectKind, ObjectStore};
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use kio_core::scope::Repository;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -108,7 +108,7 @@ fn indexed(threshold: u64) -> TempDir {
     dir
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn stale_candidate() -> (TempDir, String) {
     let old = "2025-01-01T00:00:00Z";
     let dir = canonical_tempdir();
@@ -144,7 +144,7 @@ fn only_enabled_and_indexed_scopes_activate_on_idle_without_store_mutation() {
     assert_eq!(disabled["reason"], "disabled");
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn baseline_then_idle_boundary_reports_not_idle_and_no_candidate_noop() {
     let dir = indexed(10);
@@ -167,7 +167,7 @@ fn baseline_then_idle_boundary_reports_not_idle_and_no_candidate_noop() {
     assert_eq!(after["status"], "noop");
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn human_on_idle_output_reports_gc_and_waiting_does_not_mutate_store() {
     let dir = indexed(10);
@@ -197,7 +197,7 @@ fn human_on_idle_output_reports_gc_and_waiting_does_not_mutate_store() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn idle_threshold_sweeps_a_real_stale_candidate() {
     let (dir, commit) = stale_candidate();
@@ -226,7 +226,7 @@ fn idle_threshold_sweeps_a_real_stale_candidate() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn idle_gc_timeout_defers_then_next_scheduler_invocations_resume_it() {
     let (dir, commit) = stale_candidate();
@@ -282,7 +282,7 @@ fn idle_gc_timeout_defers_then_next_scheduler_invocations_resume_it() {
     panic!("on-idle recovery did not converge");
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn post_publication_index_replacement_fails_closed_without_retiring_stale_tree() {
     let (dir, commit) = stale_candidate();
@@ -322,7 +322,23 @@ fn post_publication_index_replacement_fails_closed_without_retiring_stale_tree()
 
     let index = dir.path().join(".kio/index");
     let parked = control.path().join("parked-index");
-    fs::rename(&index, &parked).unwrap();
+    match fs::rename(&index, &parked) {
+        Ok(()) => {}
+        #[cfg(windows)]
+        Err(error) if matches!(error.raw_os_error(), Some(5 | 32)) => {
+            fs::write(ready.with_extension("release"), b"release").unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(output_json(&output)["gc"]["status"], "completed");
+            assert!(!tree_path.exists());
+            return;
+        }
+        Err(error) => panic!("unexpected index attack setup failure: {error}"),
+    }
     fs::create_dir(&index).unwrap();
     fs::write(ready.with_extension("release"), b"release").unwrap();
     let output = child.wait_with_output().unwrap();
@@ -337,7 +353,7 @@ fn post_publication_index_replacement_fails_closed_without_retiring_stale_tree()
     assert!(!dir.path().join(".kio/gc/in_progress").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn post_publication_snapshot_auto_disable_fails_closed_before_on_idle_sweep() {
     let (dir, commit) = stale_candidate();
@@ -395,7 +411,7 @@ fn post_publication_snapshot_auto_disable_fails_closed_before_on_idle_sweep() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn manual_snapshot_and_index_commands_never_fresh_trigger_on_idle_gc() {
     let (dir, commit) = stale_candidate();
@@ -430,7 +446,7 @@ fn manual_snapshot_and_index_commands_never_fresh_trigger_on_idle_gc() {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn parent_on_idle_does_not_consume_child_gc_state_and_child_handles_its_own_tree() {
     let dir = canonical_tempdir();
@@ -511,7 +527,7 @@ fn parent_on_idle_does_not_consume_child_gc_state_and_child_handles_its_own_tree
     assert!(!child_tree_path.exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn content_and_path_changes_reset_idle_but_ignored_inputs_do_not() {
     let dir = indexed(60);
@@ -544,7 +560,7 @@ fn content_and_path_changes_reset_idle_but_ignored_inputs_do_not() {
     assert_eq!(renamed["reason"], "working_set_changed");
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn digest_uses_content_and_paths_not_mtime_or_ignored_tier_a_inputs() {
     let dir = indexed(60);
@@ -554,7 +570,9 @@ fn digest_uses_content_and_paths_not_mtime_or_ignored_tier_a_inputs() {
     let note = dir.path().join("note.md");
     let modified = fs::metadata(&note).unwrap().modified().unwrap();
     fs::write(&note, "baseline\n").unwrap();
-    fs::File::open(&note)
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&note)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(modified))
         .unwrap();
@@ -564,7 +582,9 @@ fn digest_uses_content_and_paths_not_mtime_or_ignored_tier_a_inputs() {
 
     // A content edit remains observable even when its mtime is restored.
     fs::write(&note, "different bytes\n").unwrap();
-    fs::File::open(&note)
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&note)
         .unwrap()
         .set_times(fs::FileTimes::new().set_modified(modified))
         .unwrap();
@@ -590,7 +610,7 @@ fn digest_uses_content_and_paths_not_mtime_or_ignored_tier_a_inputs() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn rejects_noncanonical_or_incompatible_idle_state_and_clock_rollback() {
     let dir = indexed(10);
@@ -620,7 +640,7 @@ fn rejects_noncanonical_or_incompatible_idle_state_and_clock_rollback() {
     assert_eq!(rollback.status.code(), Some(3));
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 #[test]
 fn indexed_on_idle_fails_before_scheduler_or_gc_mutation_on_unsupported_platform() {
     let dir = indexed(10);
@@ -661,4 +681,46 @@ fn strict_gc_mode_contract_rejects_missing_irrelevant_invalid_and_unknown_values
             .unwrap();
         assert_eq!(output.status.code(), Some(2));
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn idle_gc_recovers_pending_windows_marker_when_public_marker_is_missing() {
+    let (dir, commit) = stale_candidate();
+    let repo = Repository::open(dir.path()).unwrap();
+    let tree = repo.read_commit(&commit).unwrap().tree;
+    let tree_path = ObjectStore::new(dir.path().join(".kio"))
+        .object_path(ObjectKind::Tree, &tree)
+        .unwrap();
+    json(&dir, &["snapshot", "auto"], T0);
+    let interrupted = kio(
+        &dir,
+        &["snapshot", "auto", "--json"],
+        "2026-08-14T00:00:10Z",
+    )
+    .env(
+        "KIO_TEST_GC_FAULT",
+        "after_windows_marker_exchange_source_capture",
+    )
+    .output()
+    .unwrap();
+    assert_eq!(interrupted.status.code(), Some(3));
+    assert_eq!(output_json(&interrupted)["gc"]["status"], "failed");
+    let owner = dir.path().join(".kio/gc/internal/marker-exchange");
+    assert!(owner.join("intent.json").is_file());
+    assert!(!dir.path().join(".kio/gc/in_progress").exists());
+    let before_head = repo.head_commit_hash().unwrap();
+    let resumed = json(&dir, &["snapshot", "auto"], "2026-08-14T00:00:11Z");
+    assert_eq!(resumed["recovered_gc"], true);
+    assert_eq!(repo.head_commit_hash().unwrap(), before_head);
+    assert!(!owner.join("intent.json").exists());
+    assert!(!owner.join("backup").exists());
+    assert!(!dir.path().join(".kio/gc/in_progress").exists());
+    assert!(!tree_path.exists());
+    assert!(
+        dir.path()
+            .join(".kio/gc/shallowed")
+            .join(commit.trim_start_matches("sha256:"))
+            .is_file()
+    );
 }

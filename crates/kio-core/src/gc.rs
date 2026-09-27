@@ -4,6 +4,11 @@
 //! below is relative to a retained directory descriptor.
 
 mod unreachable_inventory;
+#[cfg(windows)]
+mod windows;
+pub mod windows_exchange;
+#[cfg(windows)]
+mod windows_snapshot_state;
 
 pub use unreachable_inventory::{UnreachableInventoryLimits, UnreachableObjectInventory};
 
@@ -37,6 +42,7 @@ const MAX_REF: u64 = 4096;
 const MAX_MARKER_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SWEEP_CANDIDATES: usize = 100_000;
 const MAX_SWEEP_ESTIMATED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+#[cfg(not(windows))]
 const GC_RETIRE_SENTINEL: &[u8] = b"kio gc retirement sentinel\n";
 const SNAPSHOT_AUTO_STATE_LEAF: &str = "snapshot-auto.json";
 const SNAPSHOT_AUTO_STATE_VERSION: u32 = 2;
@@ -469,6 +475,53 @@ pub fn read_active_marker(kio_dir: &Path) -> Result<Option<GcInProgressMarker>> 
     read_active_marker_bound(&kio)
 }
 fn read_active_marker_bound(kio: &std::fs::File) -> Result<Option<GcInProgressMarker>> {
+    reject_pending_snapshot_state_exchange(kio)?;
+    if has_pending_marker_exchange(kio)? {
+        return Err(corrupt(
+            "pending GC marker exchange requires locked recovery",
+        ));
+    }
+    read_marker_without_pending_check(kio)
+}
+
+fn has_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<bool> {
+    let mut parent = kio
+        .try_clone()
+        .map_err(|e| ioerr(e, "snapshot state exchange"))?;
+    for leaf in ["gc", "internal", "snapshot-state-exchange"] {
+        let Some(child) = open_optional_dir(&parent, leaf)? else {
+            return Ok(false);
+        };
+        parent = child;
+    }
+    let owner = StoreDirectory::from_retained(parent, PathBuf::from("<snapshot state exchange>"))?;
+    windows_exchange::inspect_pending(&owner)
+}
+
+fn reject_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<()> {
+    if has_pending_snapshot_state_exchange(kio)? {
+        return Err(corrupt(
+            "pending snapshot auto state exchange requires locked scheduler recovery",
+        ));
+    }
+    Ok(())
+}
+
+fn has_pending_marker_exchange(kio: &std::fs::File) -> Result<bool> {
+    let mut parent = kio
+        .try_clone()
+        .map_err(|e| ioerr(e, "GC marker exchange"))?;
+    for leaf in ["gc", "internal", "marker-exchange"] {
+        let Some(child) = open_optional_dir(&parent, leaf)? else {
+            return Ok(false);
+        };
+        parent = child;
+    }
+    let owner = StoreDirectory::from_retained(parent, PathBuf::from("<GC marker exchange>"))?;
+    windows_exchange::inspect_pending(&owner)
+}
+
+fn read_marker_without_pending_check(kio: &std::fs::File) -> Result<Option<GcInProgressMarker>> {
     let Some(gc) = open_optional_dir(kio, "gc")? else {
         return Ok(None);
     };
@@ -929,10 +982,94 @@ impl GcSweepSession {
     pub fn read_marker(&self) -> Result<Option<GcInProgressMarker>> {
         read_active_marker_bound(&self.kio)
     }
+    pub fn has_pending_marker_exchange(&self) -> Result<bool> {
+        self.recheck_binding()?;
+        has_pending_marker_exchange(&self.kio)
+    }
+
+    /// Read-only query for coordinators which must enter locked recovery even
+    /// when a pending exchange temporarily removed the public marker.
+    pub fn has_active_or_pending_marker(&self) -> Result<bool> {
+        self.recheck_binding()?;
+        if has_pending_marker_exchange(&self.kio)? {
+            return Ok(true);
+        }
+        Ok(self.read_marker()?.is_some())
+    }
+
+    /// Recover a marker exchange while the caller holds this session's writer
+    /// lock. Read-only callers must use `has_active_or_pending_marker` instead.
+    pub fn recover_pending_marker_under_lock(&self) -> Result<()> {
+        self.recheck_binding()?;
+        reject_pending_snapshot_state_exchange(&self.kio)?;
+        self.ensure_no_pending_managed_restore_under_lock()?;
+        #[cfg(windows)]
+        {
+            self.recover_marker_windows()
+        }
+        #[cfg(not(windows))]
+        {
+            if has_pending_marker_exchange(&self.kio)? {
+                return Err(corrupt(
+                    "Windows GC marker exchange cannot recover on this platform",
+                ));
+            }
+            Ok(())
+        }
+    }
+
     pub fn acquire_store_lock(&self) -> Result<BoundStoreLock> {
         self.recheck_binding()?;
-        acquire_bound_store_lock(&self.kio)
+        let lock = acquire_bound_store_lock(&self.kio)?;
+        reject_pending_snapshot_state_exchange(&self.kio)?;
+        Ok(lock)
     }
+    /// Read-only pending-state query; never treats a missing public state as fresh.
+    pub fn has_pending_snapshot_auto_state_exchange(&self) -> Result<bool> {
+        self.recheck_binding()?;
+        has_pending_snapshot_state_exchange(&self.kio)
+    }
+
+    /// Acquire the scheduler recovery barrier, allowing only its own pending journal.
+    pub fn acquire_snapshot_auto_recovery_lock(&self) -> Result<BoundReentrantStoreLock> {
+        self.recheck_binding()?;
+        let lock = acquire_bound_reentrant_store_lock(&self.kio)?;
+        self.recheck_binding()?;
+        if has_pending_marker_exchange(&self.kio)? {
+            return Err(corrupt("pending GC marker blocks scheduler recovery"));
+        }
+        if let Some(marker) = read_marker_without_pending_check(&self.kio)? {
+            return Err(active_sweep_error(&marker));
+        }
+        self.ensure_no_pending_managed_restore_under_lock()?;
+        Ok(lock)
+    }
+
+    /// Explicit recovery under the scheduler recovery writer lock, before state admission.
+    pub fn recover_snapshot_auto_state_under_lock(
+        &self,
+        snapshot: &SnapshotAutoBinding,
+        gc: &GcAutomationBinding,
+    ) -> Result<()> {
+        self.recheck_binding()?;
+        if has_pending_marker_exchange(&self.kio)? {
+            return Err(corrupt("pending GC marker blocks scheduler recovery"));
+        }
+        if let Some(marker) = read_marker_without_pending_check(&self.kio)? {
+            return Err(active_sweep_error(&marker));
+        }
+        self.ensure_no_pending_managed_restore_under_lock()?;
+        snapshot.recheck(&self.scope, &self.kio)?;
+        if self.automation_binding()? != *gc {
+            return Err(snapshot_auto_authority_changed());
+        }
+        #[cfg(windows)]
+        self.recover_snapshot_state_windows(snapshot, gc)?;
+        #[cfg(not(windows))]
+        reject_pending_snapshot_state_exchange(&self.kio)?;
+        self.recheck_binding()
+    }
+
     /// Acquire the scheduler writer barrier relative to the retained `.kio`
     /// descriptor, then make nested [`Repository`] store-lock acquisitions
     /// reentrant on this thread. There is deliberately no ambient fallback:
@@ -1004,6 +1141,7 @@ impl GcSweepSession {
     /// scheduled attempt.
     pub fn snapshot_auto_state(&self) -> Result<SnapshotAutoStateBinding> {
         self.recheck_binding()?;
+        reject_pending_snapshot_state_exchange(&self.kio)?;
         let (state, observation) =
             match read_regular_observed(&self.kio, SNAPSHOT_AUTO_STATE_LEAF, MAX_METADATA) {
                 Ok((bytes, observation)) => {
@@ -1118,6 +1256,11 @@ impl GcSweepSession {
                     return Err(error);
                 }
             }
+            #[cfg(windows)]
+            Some(observation) => {
+                self.replace_snapshot_state_windows(&temporary, &bytes, observation)?
+            }
+            #[cfg(not(windows))]
             Some(observation) => replace_snapshot_state_expected(
                 &self.kio,
                 SNAPSHOT_AUTO_STATE_LEAF,
@@ -1184,11 +1327,11 @@ impl GcSweepSession {
     }
     pub fn ensure_index_rotation_supported(&self) -> Result<()> {
         self.recheck_binding()?;
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
         {
             Err(corrupt("GC index rotation is unsupported on this platform"))
         }
-        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
         {
             Ok(())
         }
@@ -1350,6 +1493,13 @@ impl GcSweepSession {
     /// but rejects a new ref or non-frozen commit sharing a victim tree.
     pub fn validate_frozen_marker_current_truth(&self, marker: &GcInProgressMarker) -> Result<()> {
         let _ = self.validate_recovery_state(marker)?;
+        self.validate_frozen_marker_truth_without_public_read(marker)
+    }
+
+    fn validate_frozen_marker_truth_without_public_read(
+        &self,
+        marker: &GcInProgressMarker,
+    ) -> Result<()> {
         let planner = self.bound_planner()?;
         let mut stats = GcPlanStats::default();
         let mut observations = BTreeMap::new();
@@ -1463,9 +1613,22 @@ impl GcSweepSession {
         // Never expose a partially written public marker. The private stage is
         // create-new, fully written and fsynced before a no-clobber atomic
         // rename publishes `in_progress` in one namespace operation.
-        create_new_bound(&markers, &staged, &bytes, MAX_MARKER_BYTES)?;
-        self.inject_gc_tree_fault(GcTreeFaultPoint::MarkerStageFsync)?;
-        rename_noreplace_between(&markers, &staged, &gc, "in_progress")?;
+        #[cfg(windows)]
+        windows::publish_staged(
+            &markers,
+            &staged,
+            &gc,
+            "in_progress",
+            &bytes,
+            MAX_MARKER_BYTES,
+            || self.inject_gc_tree_fault(GcTreeFaultPoint::MarkerStageFsync),
+        )?;
+        #[cfg(not(windows))]
+        {
+            create_new_bound(&markers, &staged, &bytes, MAX_MARKER_BYTES)?;
+            self.inject_gc_tree_fault(GcTreeFaultPoint::MarkerStageFsync)?;
+            rename_noreplace_between(&markers, &staged, &gc, "in_progress")?;
+        }
         sync_bound_directory(&gc, "in_progress")?;
         sync_bound_directory(&markers, &staged)?;
         let (published, _) = read_regular_observed(&gc, "in_progress", MAX_MARKER_BYTES)?;
@@ -1478,27 +1641,7 @@ impl GcSweepSession {
         self.recheck_binding()?;
         self.ensure_no_pending_managed_restore_under_lock()?;
         let (current, observed) = self.read_marker_observed()?;
-        if current.sweep_id != marker.sweep_id
-            || phase_rank(&marker.phase) < phase_rank(&current.phase)
-            || phase_rank(&marker.phase) > phase_rank(&current.phase) + 1
-            || current.started_at != marker.started_at
-            || current.plan_digest != marker.plan_digest
-            || current.truth_digest != marker.truth_digest
-            || current.stable_truth_digest != marker.stable_truth_digest
-            || current.baseline_receipts_digest != marker.baseline_receipts_digest
-            || (current.operation_receipts_digest != marker.operation_receipts_digest
-                && !(current.phase == GcSweepPhase::Receipting
-                    && marker.phase == GcSweepPhase::Sweeping
-                    && current.operation_receipts_digest.is_none()
-                    && marker.operation_receipts_digest.is_some()))
-            || current.candidates != marker.candidates
-            || current.trees != marker.trees
-            || current.estimated_bytes != marker.estimated_bytes
-            || current.index_initial != marker.index_initial
-            || !valid_index_marker_delta(&current, marker)
-        {
-            return Err(corrupt("invalid GC marker transition"));
-        }
+        validate_marker_transition(&current, marker)?;
         self.write_marker_expected(marker, &observed)
     }
     /// Bind every marker-owned receipt observation immediately before the
@@ -1526,6 +1669,11 @@ impl GcSweepSession {
         let gc = ensure_child_dir(&self.kio, "gc")?;
         let internal = ensure_child_dir(&gc, "internal")?;
         let markers = ensure_child_dir(&internal, "markers")?;
+        #[cfg(windows)]
+        {
+            self.exchange_marker_windows(&gc, &internal, &markers, marker, expected)
+        }
+        #[cfg(not(windows))]
         atomic_exchange_marker_expected(
             &gc,
             "in_progress",
@@ -1594,9 +1742,22 @@ impl GcSweepSession {
                 // As with the operation marker, stage and fsync the complete
                 // record before its final receipt name exists. A crash during
                 // staging leaves no malformed authorization at `shallowed/`.
-                create_new_bound(&receipts, &staged, &bytes, MAX_METADATA)?;
-                self.inject_gc_tree_fault(GcTreeFaultPoint::ReceiptStageFsync)?;
-                rename_noreplace_between(&receipts, &staged, &shallowed, leaf)?;
+                #[cfg(windows)]
+                windows::publish_staged(
+                    &receipts,
+                    &staged,
+                    &shallowed,
+                    leaf,
+                    &bytes,
+                    MAX_METADATA,
+                    || self.inject_gc_tree_fault(GcTreeFaultPoint::ReceiptStageFsync),
+                )?;
+                #[cfg(not(windows))]
+                {
+                    create_new_bound(&receipts, &staged, &bytes, MAX_METADATA)?;
+                    self.inject_gc_tree_fault(GcTreeFaultPoint::ReceiptStageFsync)?;
+                    rename_noreplace_between(&receipts, &staged, &shallowed, leaf)?;
+                }
                 sync_bound_directory(&shallowed, leaf)?;
                 sync_bound_directory(&receipts, &staged)?;
                 let (published, _) = read_regular_observed(&shallowed, leaf, MAX_METADATA)?;
@@ -1688,45 +1849,65 @@ impl GcSweepSession {
         let internal = ensure_child_dir(&gc, "internal")?;
         let archive_dir = ensure_child_dir(&internal, "trees")?;
         let quarantine = format!("{}-{}", marker.sweep_id, raw);
-        let captured_name = tree_capture_name(marker, raw);
+        #[cfg(windows)]
+        {
+            self.remove_candidate_tree_windows(
+                permit,
+                marker,
+                tree_hash,
+                raw,
+                &d,
+                &archive_dir,
+                &quarantine,
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            #[cfg(not(windows))]
+            let captured_name = tree_capture_name(marker, raw);
 
-        // Either start from the canonical CAS leaf or resume the exact
-        // operation-owned quarantine left by a crash after the durable rename.
-        // Both paths bind a no-follow writable descriptor before the archive
-        // name is removed; no ambient pathname is ever used for deletion.
-        let canonical = read_regular_observed(&d, raw, MAX_TREE_OBJECT_BYTES);
-        let (bytes, before, writable, already_captured) = match canonical {
-            Ok((bytes, before)) => {
-                self.validate_committed_tree_bytes(marker, tree_hash, &bytes)?;
-                let writable = open_gc_tree_writable(&d, raw, &before)?;
-                // A pre-existing operation archive together with the canonical
-                // leaf is not a resumable state and must never be overwritten.
-                if read_regular_observed(&archive_dir, &quarantine, MAX_TREE_OBJECT_BYTES).is_ok() {
-                    return Err(corrupt("GC tree exists at canonical and archive paths"));
+            // Either start from the canonical CAS leaf or resume the exact
+            // operation-owned quarantine left by a crash after the durable rename.
+            // Both paths bind a no-follow writable descriptor before the archive
+            // name is removed; no ambient pathname is ever used for deletion.
+            let canonical = read_regular_observed(&d, raw, MAX_TREE_OBJECT_BYTES);
+            let (bytes, before, writable, already_captured) = match canonical {
+                Ok((bytes, before)) => {
+                    self.validate_committed_tree_bytes(marker, tree_hash, &bytes)?;
+                    let writable = open_gc_tree_writable(&d, raw, &before)?;
+                    // A pre-existing operation archive together with the canonical
+                    // leaf is not a resumable state and must never be overwritten.
+                    if read_regular_observed(&archive_dir, &quarantine, MAX_TREE_OBJECT_BYTES)
+                        .is_ok()
+                    {
+                        return Err(corrupt("GC tree exists at canonical and archive paths"));
+                    }
+                    self.require_active_marker(marker)?;
+                    let (final_bytes, final_observation) =
+                        read_regular_observed(&d, raw, MAX_TREE_OBJECT_BYTES)?;
+                    if final_observation != before || final_bytes != bytes {
+                        return Err(corrupt("tree changed immediately before GC quarantine"));
+                    }
+                    self.wait_at_gc_pre_quarantine_barrier();
+                    // The index generation/identity is part of the irreversible
+                    // deletion authority, not merely an executor preflight.  Bind
+                    // it again at the final namespace transition after the longer
+                    // ref/receipt/tree verification above.
+                    self.validate_tree_removal_permit(permit, marker)?;
+                    self.require_live_pre_sweep_index_binding(marker)?;
+                    rename_noreplace_between(&d, raw, &archive_dir, &quarantine)?;
+                    // Persist disappearance from CAS and appearance in quarantine
+                    // before any crash seam or byte reclamation.
+                    sync_bound_directory(&archive_dir, &quarantine)?;
+                    sync_bound_directory(&d, raw)?;
+                    (bytes, before, writable, false)
                 }
-                self.require_active_marker(marker)?;
-                let (final_bytes, final_observation) =
-                    read_regular_observed(&d, raw, MAX_TREE_OBJECT_BYTES)?;
-                if final_observation != before || final_bytes != bytes {
-                    return Err(corrupt("tree changed immediately before GC quarantine"));
-                }
-                self.wait_at_gc_pre_quarantine_barrier();
-                // The index generation/identity is part of the irreversible
-                // deletion authority, not merely an executor preflight.  Bind
-                // it again at the final namespace transition after the longer
-                // ref/receipt/tree verification above.
-                self.validate_tree_removal_permit(permit, marker)?;
-                self.require_live_pre_sweep_index_binding(marker)?;
-                rename_noreplace_between(&d, raw, &archive_dir, &quarantine)?;
-                // Persist disappearance from CAS and appearance in quarantine
-                // before any crash seam or byte reclamation.
-                sync_bound_directory(&archive_dir, &quarantine)?;
-                sync_bound_directory(&d, raw)?;
-                (bytes, before, writable, false)
-            }
-            Err(error) if is_io_not_found(&error) => {
-                let (bytes, before, already_captured) =
-                    match read_regular_observed(&archive_dir, &quarantine, MAX_TREE_OBJECT_BYTES) {
+                Err(error) if is_io_not_found(&error) => {
+                    let (bytes, before, already_captured) = match read_regular_observed(
+                        &archive_dir,
+                        &quarantine,
+                        MAX_TREE_OBJECT_BYTES,
+                    ) {
                         Ok((sentinel, _)) if sentinel == GC_RETIRE_SENTINEL => {
                             match read_regular_observed(
                                 &archive_dir,
@@ -1751,113 +1932,120 @@ impl GcSweepSession {
                         Err(error) if is_io_not_found(&error) => return Ok(false),
                         Err(error) => return Err(error),
                     };
-                self.validate_committed_tree_bytes(marker, tree_hash, &bytes)?;
-                let writable = open_gc_tree_writable(
-                    &archive_dir,
-                    if already_captured {
-                        &captured_name
-                    } else {
-                        &quarantine
-                    },
-                    &before,
-                )?;
-                (bytes, before, writable, already_captured)
-            }
-            Err(error) => return Err(error),
-        };
+                    self.validate_committed_tree_bytes(marker, tree_hash, &bytes)?;
+                    let writable = open_gc_tree_writable(
+                        &archive_dir,
+                        if already_captured {
+                            &captured_name
+                        } else {
+                            &quarantine
+                        },
+                        &before,
+                    )?;
+                    (bytes, before, writable, already_captured)
+                }
+                Err(error) => return Err(error),
+            };
 
-        let quarantined = read_regular_observed(
-            &archive_dir,
-            if already_captured {
+            let quarantined = read_regular_observed(
+                &archive_dir,
+                if already_captured {
+                    &captured_name
+                } else {
+                    &quarantine
+                },
+                MAX_TREE_OBJECT_BYTES,
+            );
+            // Rename legitimately updates ctime, so only identity + byte length and
+            // hash are stable across the quarantine transition.
+            let valid_quarantine = quarantined.as_ref().is_ok_and(|(bytes, observation)| {
+                hash_bytes(bytes) == tree_hash
+                    && observation.identity == before.identity
+                    && observation.state.len == before.state.len
+            });
+            if !valid_quarantine {
+                // Do not restore: a replacement raw leaf could have appeared after
+                // the no-replace move. Leaving the quarantined object is safe and
+                // forces explicit recovery rather than risking an overwrite.
+                return Err(corrupt("tree changed during GC quarantine"));
+            }
+            let handle_meta =
+                cap_fs::Metadata::from_file(&writable).map_err(|error| ioerr(error, raw))?;
+            if id_meta(&handle_meta)? != before.identity || handle_meta.len() != before.state.len {
+                return Err(corrupt("tree writable handle changed during quarantine"));
+            }
+            if hash_bytes(&bytes) != tree_hash {
+                return Err(corrupt("tree bytes changed during GC quarantine"));
+            }
+            self.inject_gc_tree_fault(GcTreeFaultPoint::TreeQuarantine)?;
+            self.wait_at_gc_tree_quarantine_barrier();
+            // The test seam is deliberately before this final check. Rebind both
+            // authorities immediately before capture: a marker replacement must
+            // stop the erase, and a renamed archive victim is captured under a
+            // fresh private name then compared before any unlink occurs.
+            self.require_active_marker(marker)?;
+            let erase_leaf = if already_captured {
                 &captured_name
             } else {
                 &quarantine
-            },
-            MAX_TREE_OBJECT_BYTES,
-        );
-        // Rename legitimately updates ctime, so only identity + byte length and
-        // hash are stable across the quarantine transition.
-        let valid_quarantine = quarantined.as_ref().is_ok_and(|(bytes, observation)| {
-            hash_bytes(bytes) == tree_hash
-                && observation.identity == before.identity
-                && observation.state.len == before.state.len
-        });
-        if !valid_quarantine {
-            // Do not restore: a replacement raw leaf could have appeared after
-            // the no-replace move. Leaving the quarantined object is safe and
-            // forces explicit recovery rather than risking an overwrite.
-            return Err(corrupt("tree changed during GC quarantine"));
-        }
-        let handle_meta =
-            cap_fs::Metadata::from_file(&writable).map_err(|error| ioerr(error, raw))?;
-        if id_meta(&handle_meta)? != before.identity || handle_meta.len() != before.state.len {
-            return Err(corrupt("tree writable handle changed during quarantine"));
-        }
-        if hash_bytes(&bytes) != tree_hash {
-            return Err(corrupt("tree bytes changed during GC quarantine"));
-        }
-        self.inject_gc_tree_fault(GcTreeFaultPoint::TreeQuarantine)?;
-        self.wait_at_gc_tree_quarantine_barrier();
-        // The test seam is deliberately before this final check. Rebind both
-        // authorities immediately before capture: a marker replacement must
-        // stop the erase, and a renamed archive victim is captured under a
-        // fresh private name then compared before any unlink occurs.
-        self.require_active_marker(marker)?;
-        let erase_leaf = if already_captured {
-            &captured_name
-        } else {
-            &quarantine
-        };
-        let (final_bytes, final_observation) =
-            read_regular_observed(&archive_dir, erase_leaf, MAX_TREE_OBJECT_BYTES)?;
-        if final_observation.identity != before.identity
-            || final_observation.state.len != before.state.len
-            || final_observation.digest != hash_bytes(&bytes)
-            || final_bytes != bytes
-        {
-            return Err(corrupt("tree changed immediately before GC erase"));
-        }
-        let (captured, captured_observation) = if already_captured {
-            (captured_name, final_observation)
-        } else {
-            exchange_capture_verified_named(
+            };
+            let (final_bytes, final_observation) =
+                read_regular_observed(&archive_dir, erase_leaf, MAX_TREE_OBJECT_BYTES)?;
+            if final_observation.identity != before.identity
+                || final_observation.state.len != before.state.len
+                || final_observation.digest != hash_bytes(&bytes)
+                || final_bytes != bytes
+            {
+                return Err(corrupt("tree changed immediately before GC erase"));
+            }
+            let (captured, captured_observation) = if already_captured {
+                (captured_name, final_observation)
+            } else {
+                exchange_capture_verified_named(
+                    &archive_dir,
+                    &quarantine,
+                    &captured_name,
+                    &final_observation,
+                    MAX_TREE_OBJECT_BYTES,
+                    "GC tree archive",
+                )?
+            };
+            self.inject_gc_tree_fault(GcTreeFaultPoint::TreeRetirementCapture)?;
+            // Unlink only the private captured name, then require the retained
+            // object to have no remaining names before truncating it. A same-UID
+            // hardlink inserted at any point leaves nlink > 0 and aborts without
+            // modifying bytes owned by another pathname.
+            remove_verified_leaf(
                 &archive_dir,
-                &quarantine,
-                &captured_name,
-                &final_observation,
+                &captured,
+                &captured_observation,
                 MAX_TREE_OBJECT_BYTES,
-                "GC tree archive",
-            )?
-        };
-        self.inject_gc_tree_fault(GcTreeFaultPoint::TreeRetirementCapture)?;
-        // Unlink only the private captured name, then require the retained
-        // object to have no remaining names before truncating it. A same-UID
-        // hardlink inserted at any point leaves nlink > 0 and aborts without
-        // modifying bytes owned by another pathname.
-        remove_verified_leaf(
-            &archive_dir,
-            &captured,
-            &captured_observation,
-            MAX_TREE_OBJECT_BYTES,
-            "GC captured tree archive",
-        )?;
-        remove_sentinel_leaf(&archive_dir, &quarantine)?;
-        sync_bound_directory(&archive_dir, &quarantine)?;
-        let unlinked = cap_fs::Metadata::from_file(&writable).map_err(|error| ioerr(error, raw))?;
-        if id_meta(&unlinked)? != before.identity || link_count(&unlinked)? != 0 {
-            return Err(corrupt("tree archive gained a hardlink before byte erase"));
+                "GC captured tree archive",
+            )?;
+            remove_sentinel_leaf(&archive_dir, &quarantine)?;
+            sync_bound_directory(&archive_dir, &quarantine)?;
+            let unlinked =
+                cap_fs::Metadata::from_file(&writable).map_err(|error| ioerr(error, raw))?;
+            if id_meta(&unlinked)? != before.identity || link_count(&unlinked)? != 0 {
+                return Err(corrupt("tree archive gained a hardlink before byte erase"));
+            }
+            writable.set_len(0).map_err(|error| ioerr(error, raw))?;
+            writable.sync_all().map_err(|error| ioerr(error, raw))?;
+            let erased =
+                cap_fs::Metadata::from_file(&writable).map_err(|error| ioerr(error, raw))?;
+            if id_meta(&erased)? != before.identity
+                || erased.len() != 0
+                || link_count(&erased)? != 0
+            {
+                return Err(corrupt(
+                    "tree archive truncate did not bind expected object",
+                ));
+            }
+            sync_bound_directory(&d, raw)?;
+            Ok(true)
         }
-        writable.set_len(0).map_err(|error| ioerr(error, raw))?;
-        writable.sync_all().map_err(|error| ioerr(error, raw))?;
-        let erased = cap_fs::Metadata::from_file(&writable).map_err(|error| ioerr(error, raw))?;
-        if id_meta(&erased)? != before.identity || erased.len() != 0 || link_count(&erased)? != 0 {
-            return Err(corrupt(
-                "tree archive truncate did not bind expected object",
-            ));
-        }
-        sync_bound_directory(&d, raw)?;
-        Ok(true)
     }
+
     pub fn remove_marker(&self, expected: &GcInProgressMarker) -> Result<()> {
         self.recheck_binding()?;
         self.ensure_no_pending_managed_restore_under_lock()?;
@@ -1868,63 +2056,71 @@ impl GcSweepSession {
         let gc = open_required_dir(&self.kio, "gc", "GC directory is missing")?;
         let internal = ensure_child_dir(&gc, "internal")?;
         let markers = ensure_child_dir(&internal, "markers")?;
-        let archive = unique_internal_name("completed");
-        rename_noreplace_between(&gc, "in_progress", &markers, &archive)?;
-        sync_bound_directory(&markers, &archive)?;
-        // Commit the source disappearance before retiring the destination,
-        // otherwise a power loss could resurrect the public marker after the
-        // internal archive has been unlinked.
-        sync_bound_directory(&gc, "gc")?;
-        let (moved_bytes, moved) = read_regular_observed(&markers, &archive, MAX_MARKER_BYTES)?;
-        if moved.identity != observation.identity
-            || moved.state.len != observation.state.len
-            || moved.digest != observation.digest
-            || GcInProgressMarker::parse_canonical(&moved_bytes).is_err()
+        #[cfg(windows)]
         {
-            // Never roll back after a failed identity check: a second move
-            // could restore a hostile replacement into the public marker
-            // name. Preserve the archived entry for fail-closed diagnosis.
-            return Err(corrupt("GC marker changed during completion archive"));
+            windows::remove_completed_marker(&gc, &markers, expected, &observation)
         }
-        let moved_handle = open_verified_file_handle(
-            &markers,
-            &archive,
-            &moved,
-            MAX_MARKER_BYTES,
-            "GC completed marker",
-        )?;
-        // The archive name is only a capability-relative quarantine used to
-        // prove that the exact active marker left the public name. Remove it
-        // in the same completion step so successful sweeps do not retain an
-        // unbounded marker history. If another name was added, the retained
-        // handle exposes nlink != 0 and completion fails without changing the
-        // bytes reachable through that other name.
-        // Retire through an atomic exchange so a replacement at the archive
-        // name is captured and identity-checked before any unlink. A foreign
-        // marker is retained on mismatch rather than deleted.
-        let (captured, captured_observation) = exchange_capture_verified(
-            &markers,
-            &archive,
-            &moved,
-            MAX_MARKER_BYTES,
-            "GC completed marker",
-        )?;
-        remove_verified_leaf(
-            &markers,
-            &captured,
-            &captured_observation,
-            MAX_MARKER_BYTES,
-            "GC captured completed marker",
-        )?;
-        remove_sentinel_leaf(&markers, &archive)?;
-        sync_bound_directory(&markers, &archive)?;
-        let unlinked =
-            cap_fs::Metadata::from_file(&moved_handle).map_err(|error| ioerr(error, &archive))?;
-        if id_meta(&unlinked)? != moved.identity || link_count(&unlinked)? != 0 {
-            return Err(corrupt("GC completed marker gained another name"));
+        #[cfg(not(windows))]
+        {
+            let archive = unique_internal_name("completed");
+            rename_noreplace_between(&gc, "in_progress", &markers, &archive)?;
+            sync_bound_directory(&markers, &archive)?;
+            // Commit the source disappearance before retiring the destination,
+            // otherwise a power loss could resurrect the public marker after the
+            // internal archive has been unlinked.
+            sync_bound_directory(&gc, "gc")?;
+            let (moved_bytes, moved) = read_regular_observed(&markers, &archive, MAX_MARKER_BYTES)?;
+            if moved.identity != observation.identity
+                || moved.state.len != observation.state.len
+                || moved.digest != observation.digest
+                || GcInProgressMarker::parse_canonical(&moved_bytes).is_err()
+            {
+                // Never roll back after a failed identity check: a second move
+                // could restore a hostile replacement into the public marker
+                // name. Preserve the archived entry for fail-closed diagnosis.
+                return Err(corrupt("GC marker changed during completion archive"));
+            }
+            let moved_handle = open_verified_file_handle(
+                &markers,
+                &archive,
+                &moved,
+                MAX_MARKER_BYTES,
+                "GC completed marker",
+            )?;
+            // The archive name is only a capability-relative quarantine used to
+            // prove that the exact active marker left the public name. Remove it
+            // in the same completion step so successful sweeps do not retain an
+            // unbounded marker history. If another name was added, the retained
+            // handle exposes nlink != 0 and completion fails without changing the
+            // bytes reachable through that other name.
+            // Retire through an atomic exchange so a replacement at the archive
+            // name is captured and identity-checked before any unlink. A foreign
+            // marker is retained on mismatch rather than deleted.
+            let (captured, captured_observation) = exchange_capture_verified(
+                &markers,
+                &archive,
+                &moved,
+                MAX_MARKER_BYTES,
+                "GC completed marker",
+            )?;
+            remove_verified_leaf(
+                &markers,
+                &captured,
+                &captured_observation,
+                MAX_MARKER_BYTES,
+                "GC captured completed marker",
+            )?;
+            remove_sentinel_leaf(&markers, &archive)?;
+            sync_bound_directory(&markers, &archive)?;
+            let unlinked = cap_fs::Metadata::from_file(&moved_handle)
+                .map_err(|error| ioerr(error, &archive))?;
+            if id_meta(&unlinked)? != moved.identity || link_count(&unlinked)? != 0 {
+                return Err(corrupt("GC completed marker gained another name"));
+            }
+            sync_bound_directory(&gc, "gc")
         }
-        sync_bound_directory(&gc, "gc")
     }
+
     /// Check that the caller's public scope pathname still names exactly the
     /// retained capability handles. Invoke around any external index operation.
     pub fn assert_public_identity(&self) -> Result<()> {
@@ -1955,6 +2151,11 @@ impl GcSweepSession {
         }
     }
     fn read_marker_observed(&self) -> Result<(GcInProgressMarker, FileObservation)> {
+        if has_pending_marker_exchange(&self.kio)? {
+            return Err(corrupt(
+                "pending GC marker exchange requires locked recovery",
+            ));
+        }
         let gc = open_required_dir(&self.kio, "gc", "GC directory is missing")?;
         let (bytes, observed) = read_regular_observed(&gc, "in_progress", MAX_MARKER_BYTES)?;
         Ok((GcInProgressMarker::parse_canonical(&bytes)?, observed))
@@ -1992,6 +2193,7 @@ impl GcSweepSession {
                 },
             };
             let archive = format!("{}-{raw}", marker.sweep_id);
+            #[cfg(not(windows))]
             let captured_name = tree_capture_name(marker, raw);
             // Keep each directory capability alive through the complete read.  In
             // Rust 2021, the nested `if let` scrutinee temporaries lived until the
@@ -2009,6 +2211,7 @@ impl GcSweepSession {
                 match archives.as_ref() {
                     Some(archives) => {
                         match read_regular_observed(archives, &archive, MAX_TREE_OBJECT_BYTES) {
+                            #[cfg(not(windows))]
                             Ok((sentinel, _)) if sentinel == GC_RETIRE_SENTINEL => {
                                 match read_regular_observed(
                                     archives,
@@ -2244,6 +2447,7 @@ impl SnapshotAutoStateBinding {
     /// Confirm that the checkpoint just published still names the exact
     /// durable state leaf before a scheduled ref can advance.
     pub(crate) fn recheck(&self, kio: &std::fs::File) -> Result<()> {
+        reject_pending_snapshot_state_exchange(kio)?;
         let actual = match read_regular_observed(kio, SNAPSHOT_AUTO_STATE_LEAF, MAX_METADATA) {
             Ok((bytes, observation)) => Some((parse_snapshot_auto_state(&bytes)?, observation)),
             Err(error) if is_io_not_found(&error) => None,
@@ -2337,6 +2541,7 @@ fn validate_gc_tree_bytes(bytes: &[u8], expected_hash: &str) -> Result<()> {
         .map_err(|_| corrupt("invalid tree object before removal"))
 }
 
+#[cfg(not(windows))]
 fn open_gc_tree_writable(
     directory: &std::fs::File,
     leaf: &str,
@@ -2462,12 +2667,11 @@ fn rename_snapshot_state_noreplace(dir: &std::fs::File, from: &str, to: &str) ->
     rename_noreplace_bound(dir, from, to)
 }
 
-// `std::fs::rename` is no-clobber on Windows. `cap_fs::rename` retains the
-// already-open directory as the path-resolution authority and therefore gives
-// first publication the same destination-must-be-absent contract.
+// Move the verified source HANDLE relative to retained parents, refusing an
+// occupied destination without reopening the source during the move.
 #[cfg(windows)]
 fn rename_snapshot_state_noreplace(dir: &std::fs::File, from: &str, to: &str) -> Result<()> {
-    cap_fs::rename(dir, Path::new(from), dir, Path::new(to)).map_err(|error| ioerr(error, to))
+    rename_noreplace_between(dir, from, dir, to)
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -2571,6 +2775,7 @@ fn replace_snapshot_state_expected(
 /// a substituted entry is preserved and fails closed rather than being
 /// removed as cleanup.  This keeps repeated CAS conflicts from accumulating
 /// unbounded private state files.
+#[cfg(not(windows))]
 fn retire_snapshot_state_temporary(
     dir: &std::fs::File,
     temporary: &str,
@@ -2603,6 +2808,16 @@ fn retire_snapshot_state_temporary(
     sync_bound_directory(dir, temporary)
 }
 
+#[cfg(windows)]
+fn retire_snapshot_state_temporary(
+    dir: &std::fs::File,
+    temporary: &str,
+    expected_bytes: &[u8],
+    expected: &FileObservation,
+) -> Result<()> {
+    windows::retire_expected(dir, temporary, expected_bytes, expected, MAX_METADATA)
+}
+
 /// Retire only scheduler state temporaries which could have been produced by
 /// [`unique_internal_name`].  This runs under the scheduler writer lock,
 /// before allocating the next temporary.  Names outside this narrow private
@@ -2610,6 +2825,7 @@ fn retire_snapshot_state_temporary(
 /// conform is evidence of interference and stops publication without
 /// deleting anything.
 fn cleanup_snapshot_auto_state_temporaries(dir: &std::fs::File) -> Result<()> {
+    reject_pending_snapshot_state_exchange(dir)?;
     let mut temporaries = Vec::new();
     for entry in cap_fs::read_base_dir(dir).map_err(|error| ioerr(error, "directory"))? {
         let entry = entry.map_err(|error| ioerr(error, "directory"))?;
@@ -2661,82 +2877,6 @@ fn is_canonical_decimal(value: &str) -> bool {
         && (value == "0" || !value.starts_with('0'))
 }
 
-/// Windows has no rename-exchange primitive. The retained `.kio` directory
-/// handle and the process-wide writer lock are the authority boundary; rename
-/// the already-created temporary handle relative to that directory with
-/// replace + write-through semantics, then the caller verifies the exact
-/// public bytes and directory identity before reporting success.
-#[cfg(windows)]
-fn replace_snapshot_state_expected(
-    dir: &std::fs::File,
-    leaf: &str,
-    temporary: &str,
-    _: &[u8],
-    expected: &FileObservation,
-) -> Result<()> {
-    use cap_fs::OpenOptionsExt;
-    use std::mem::{offset_of, size_of};
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileRenameInfoEx, SYNCHRONIZE, SetFileInformationByHandle,
-    };
-    const FILE_RENAME_FLAG_REPLACE_IF_EXISTS: u32 = 1;
-    const FILE_RENAME_FLAG_POSIX_SEMANTICS: u32 = 2;
-
-    if !read_regular_observed(dir, leaf, MAX_METADATA)
-        .is_ok_and(|(_, observed)| observed == *expected)
-    {
-        return Err(snapshot_auto_state_changed());
-    }
-    let mut options = cap_fs::OpenOptions::new();
-    options.access_mode(DELETE | SYNCHRONIZE);
-    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-    options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let temporary_handle = cap_fs::open(dir, Path::new(temporary), &options)
-        .map_err(|error| ioerr(error, temporary))?;
-    let name = std::ffi::OsStr::new(leaf).encode_wide().collect::<Vec<_>>();
-    let name_bytes = name
-        .len()
-        .checked_mul(size_of::<u16>())
-        .and_then(|value| u32::try_from(value).ok())
-        .ok_or_else(|| corrupt("snapshot auto state name is too long"))?;
-    let header = offset_of!(FILE_RENAME_INFO, FileName);
-    let total = header
-        .checked_add(name_bytes as usize)
-        .ok_or_else(|| corrupt("snapshot auto state rename buffer overflow"))?;
-    let mut buffer = vec![0_u8; total];
-    // SAFETY: `buffer` is large enough for FILE_RENAME_INFO through the exact
-    // UTF-16 leaf payload, and every pointer remains live for the syscall.
-    let result = unsafe {
-        let info = buffer.as_mut_ptr().cast::<FILE_RENAME_INFO>();
-        (*info).Anonymous.Flags =
-            FILE_RENAME_FLAG_REPLACE_IF_EXISTS | FILE_RENAME_FLAG_POSIX_SEMANTICS;
-        (*info).RootDirectory = dir.as_raw_handle();
-        (*info).FileNameLength = name_bytes;
-        std::ptr::copy_nonoverlapping(
-            name.as_ptr(),
-            std::ptr::addr_of_mut!((*info).FileName).cast::<u16>(),
-            name.len(),
-        );
-        SetFileInformationByHandle(
-            temporary_handle.as_raw_handle(),
-            FileRenameInfoEx,
-            buffer.as_ptr().cast(),
-            u32::try_from(total).unwrap_or(u32::MAX),
-        )
-    };
-    if result == 0 {
-        Err(ioerr(
-            std::io::Error::last_os_error(),
-            SNAPSHOT_AUTO_STATE_LEAF,
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn replace_snapshot_state_expected(
     _: &std::fs::File,
@@ -2754,6 +2894,7 @@ fn replace_snapshot_state_expected(
 /// bind the captured entry's identity before a caller unlinks it. If a
 /// replacement won the race, that replacement remains captured and is never
 /// removed by this operation.
+#[cfg(not(windows))]
 fn exchange_capture_verified(
     dir: &std::fs::File,
     leaf: &str,
@@ -2765,6 +2906,7 @@ fn exchange_capture_verified(
     exchange_capture_verified_named(dir, leaf, &captured, expected, max, label)
 }
 
+#[cfg(not(windows))]
 fn exchange_capture_verified_named(
     dir: &std::fs::File,
     leaf: &str,
@@ -2797,10 +2939,12 @@ fn exchange_capture_verified_named(
     Ok((captured.to_owned(), observed))
 }
 
+#[cfg(not(windows))]
 fn tree_capture_name(marker: &GcInProgressMarker, raw: &str) -> String {
     format!("{}-{raw}-captured", marker.sweep_id)
 }
 
+#[cfg(not(windows))]
 fn remove_verified_leaf(
     dir: &std::fs::File,
     leaf: &str,
@@ -2861,11 +3005,12 @@ fn remove_reserved_leaf(dir: &std::fs::File, leaf: &str) -> Result<()> {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(not(any(target_os = "macos", windows)))]
 fn remove_reserved_leaf(dir: &std::fs::File, leaf: &str) -> Result<()> {
     cap_fs::remove_file(dir, Path::new(leaf)).map_err(|error| ioerr(error, leaf))
 }
 
+#[cfg(not(windows))]
 fn remove_sentinel_leaf(dir: &std::fs::File, leaf: &str) -> Result<()> {
     let (bytes, observed) = read_regular_observed(dir, leaf, MAX_METADATA)?;
     if bytes != GC_RETIRE_SENTINEL {
@@ -3003,13 +3148,13 @@ fn exchange_between(
         ))
     }
 }
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn exchange_bound(_dir: &std::fs::File, _left: &str, _right: &str) -> Result<()> {
     Err(corrupt(
         "platform lacks a verified atomic GC marker exchange primitive",
     ))
 }
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn exchange_between(
     _left_dir: &std::fs::File,
     _left: &str,
@@ -3056,21 +3201,17 @@ fn rename_noreplace_between(
 }
 #[allow(dead_code)]
 #[cfg(windows)]
-fn rename_noreplace_bound(_dir: &std::fs::File, _from: &str, _to: &str) -> Result<()> {
-    Err(corrupt(
-        "platform lacks a verified no-replace GC quarantine primitive",
-    ))
+fn rename_noreplace_bound(dir: &std::fs::File, from: &str, to: &str) -> Result<()> {
+    rename_noreplace_between(dir, from, dir, to)
 }
 #[cfg(windows)]
 fn rename_noreplace_between(
-    _from_dir: &std::fs::File,
-    _from: &str,
-    _to_dir: &std::fs::File,
-    _to: &str,
+    from_dir: &std::fs::File,
+    from: &str,
+    to_dir: &std::fs::File,
+    to: &str,
 ) -> Result<()> {
-    Err(corrupt(
-        "platform lacks a verified no-replace GC quarantine primitive",
-    ))
+    windows::move_noreplace(from_dir, from, to_dir, to)
 }
 #[allow(dead_code)]
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
@@ -3090,6 +3231,7 @@ fn rename_noreplace_between(
         "platform lacks a verified no-replace GC quarantine primitive",
     ))
 }
+#[cfg(not(windows))]
 fn atomic_exchange_marker_expected(
     dir: &std::fs::File,
     leaf: &str,
@@ -3172,6 +3314,34 @@ fn atomic_exchange_marker_expected(
         cap_fs::Metadata::from_file(&retired_handle).map_err(|error| ioerr(error, &temporary))?;
     if id_meta(&unlinked)? != archived_observation.identity || link_count(&unlinked)? != 0 {
         return Err(corrupt("GC retired marker gained another name"));
+    }
+    Ok(())
+}
+
+fn validate_marker_transition(
+    current: &GcInProgressMarker,
+    marker: &GcInProgressMarker,
+) -> Result<()> {
+    if current.sweep_id != marker.sweep_id
+        || phase_rank(&marker.phase) < phase_rank(&current.phase)
+        || phase_rank(&marker.phase) > phase_rank(&current.phase) + 1
+        || current.started_at != marker.started_at
+        || current.plan_digest != marker.plan_digest
+        || current.truth_digest != marker.truth_digest
+        || current.stable_truth_digest != marker.stable_truth_digest
+        || current.baseline_receipts_digest != marker.baseline_receipts_digest
+        || (current.operation_receipts_digest != marker.operation_receipts_digest
+            && !(current.phase == GcSweepPhase::Receipting
+                && marker.phase == GcSweepPhase::Sweeping
+                && current.operation_receipts_digest.is_none()
+                && marker.operation_receipts_digest.is_some()))
+        || current.candidates != marker.candidates
+        || current.trees != marker.trees
+        || current.estimated_bytes != marker.estimated_bytes
+        || current.index_initial != marker.index_initial
+        || !valid_index_marker_delta(current, marker)
+    {
+        return Err(corrupt("invalid GC marker transition"));
     }
     Ok(())
 }
@@ -4203,6 +4373,32 @@ fn parse_snapshot_auto_state(bytes: &[u8]) -> Result<SnapshotAutoState> {
     Ok(state)
 }
 
+#[cfg(any(windows, test))]
+fn validate_snapshot_state_transition(
+    old: &SnapshotAutoState,
+    new: &SnapshotAutoState,
+) -> Result<()> {
+    let old_attempt = parse_utc_seconds(&old.last_successful_eligible_attempt_at)
+        .ok_or_else(|| corrupt("invalid old snapshot attempt"))?;
+    let old_idle = parse_utc_seconds(&old.idle_observed_since)
+        .ok_or_else(|| corrupt("invalid old snapshot idle time"))?;
+    let new_attempt = parse_utc_seconds(&new.last_successful_eligible_attempt_at)
+        .ok_or_else(|| corrupt("invalid new snapshot attempt"))?;
+    let new_idle = parse_utc_seconds(&new.idle_observed_since)
+        .ok_or_else(|| corrupt("invalid new snapshot idle time"))?;
+    let valid = if old.working_set_digest == new.working_set_digest {
+        new_idle == old_idle
+            && (new_attempt == old_attempt || new_attempt >= old_attempt.max(old_idle))
+    } else {
+        new_idle >= old_attempt.max(old_idle)
+            && (new_attempt == old_attempt || new_attempt == new_idle)
+    };
+    if !valid {
+        return Err(corrupt("invalid snapshot auto checkpoint transition"));
+    }
+    Ok(())
+}
+
 fn snapshot_auto_state_changed() -> KioError {
     KioError::new(
         "KIO-E-SNAPSHOT-STATE-CHANGED-001",
@@ -4594,6 +4790,7 @@ fn valid_file(m: &cap_fs::Metadata, max: u64) -> Result<()> {
     }
     Ok(())
 }
+#[cfg(not(windows))]
 fn link_count(metadata: &cap_fs::Metadata) -> Result<u64> {
     #[cfg(unix)]
     {
@@ -5179,6 +5376,46 @@ mod tests {
     use crate::scope::Repository;
 
     #[test]
+    fn pending_marker_exchange_blocks_readers_when_public_marker_is_missing() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path().join("gc/internal/marker-exchange");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::write(owner.join("intent.json"), b"incomplete intent").unwrap();
+        let bound = open_bound_absolute(&std::fs::canonicalize(temp.path()).unwrap()).unwrap();
+        assert!(has_pending_marker_exchange(&bound).unwrap());
+        assert!(read_active_marker_bound(&bound).is_err());
+        assert!(ensure_no_active_sweep(&std::fs::canonicalize(temp.path()).unwrap()).is_err());
+        assert_eq!(
+            std::fs::read(owner.join("intent.json")).unwrap(),
+            b"incomplete intent"
+        );
+        assert!(!temp.path().join("gc/in_progress").exists());
+    }
+
+    #[test]
+    fn unexpected_marker_exchange_residue_fails_closed_without_cleanup() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path().join("gc/internal/marker-exchange");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::write(owner.join("foreign"), b"preserve").unwrap();
+        let bound = open_bound_absolute(&std::fs::canonicalize(temp.path()).unwrap()).unwrap();
+        assert!(has_pending_marker_exchange(&bound).is_err());
+        assert!(read_active_marker_bound(&bound).is_err());
+        assert_eq!(std::fs::read(owner.join("foreign")).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn empty_marker_exchange_owner_is_read_only_and_inactive() {
+        let temp = tempfile::tempdir().unwrap();
+        let owner = temp.path().join("gc/internal/marker-exchange");
+        std::fs::create_dir_all(&owner).unwrap();
+        let bound = open_bound_absolute(&std::fs::canonicalize(temp.path()).unwrap()).unwrap();
+        assert!(!has_pending_marker_exchange(&bound).unwrap());
+        assert_eq!(read_active_marker_bound(&bound).unwrap(), None);
+        assert_eq!(std::fs::read_dir(owner).unwrap().count(), 0);
+    }
+
+    #[test]
     fn gc_identity_jcs_preserves_all_bits() {
         for value in [(1_u64 << 53) + 1, 9_851_624_185_183_609, u64::MAX] {
             let identity = Identity(value, value);
@@ -5323,6 +5560,54 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-CONFIG-NOT-IMPLEMENTED-001");
+    }
+
+    #[test]
+    fn snapshot_state_pending_journal_is_not_a_fresh_missing_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = Repository::init(root.path()).unwrap();
+        let session = GcSweepSession::bind(repo.canonical_root().to_path_buf()).unwrap();
+        assert!(session.snapshot_auto_state().unwrap().state.is_none());
+        let owner = repo
+            .canonical_root()
+            .join(".kio/gc/internal/snapshot-state-exchange");
+        std::fs::create_dir_all(&owner).unwrap();
+        std::fs::write(
+            owner.join("intent.json"),
+            b"foreign pending Windows snapshot state",
+        )
+        .unwrap();
+        assert!(session.has_pending_snapshot_auto_state_exchange().unwrap());
+        assert!(session.snapshot_auto_state().is_err());
+        assert!(ensure_no_active_sweep_bound(&session.kio).is_err());
+        assert_eq!(
+            std::fs::read(owner.join("intent.json")).unwrap(),
+            b"foreign pending Windows snapshot state"
+        );
+    }
+
+    #[test]
+    fn snapshot_state_transition_matches_scheduled_publication_rules() {
+        let old = SnapshotAutoState {
+            version: 2,
+            last_successful_eligible_attempt_at: "2026-09-27T00:00:00Z".into(),
+            idle_observed_since: "2026-09-27T00:00:01Z".into(),
+            working_set_digest: format!("sha256:{}", "a".repeat(64)),
+        };
+        let mut new = old.clone();
+        assert!(validate_snapshot_state_transition(&old, &new).is_ok());
+        new.last_successful_eligible_attempt_at = "2026-09-27T00:00:02Z".into();
+        assert!(validate_snapshot_state_transition(&old, &new).is_ok());
+        new.idle_observed_since = "2026-09-27T00:00:02Z".into();
+        assert!(validate_snapshot_state_transition(&old, &new).is_err());
+        new.working_set_digest = format!("sha256:{}", "b".repeat(64));
+        assert!(validate_snapshot_state_transition(&old, &new).is_ok());
+        new.last_successful_eligible_attempt_at = old.last_successful_eligible_attempt_at.clone();
+        assert!(validate_snapshot_state_transition(&old, &new).is_ok());
+        new.last_successful_eligible_attempt_at = "2026-09-27T00:00:01Z".into();
+        assert!(validate_snapshot_state_transition(&old, &new).is_err());
+        new.idle_observed_since = "2026-09-26T23:59:59Z".into();
+        assert!(validate_snapshot_state_transition(&old, &new).is_err());
     }
 
     #[cfg(any(target_os = "macos", target_os = "linux"))]

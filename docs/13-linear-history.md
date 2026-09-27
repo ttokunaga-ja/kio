@@ -1,8 +1,9 @@
 # 13 Linear History and Restore — design direction
 
 本書の線形履歴・復元の設計方針は 2026-09-07 に承認済みである。
-現在の実装は format `1.0.0`、必須の単一 `parent`、唯一の可変参照 `HEAD`、条件付き公開 journal へ移行している。
-旧 `parents` 配列と旧 format を暗黙に移行しない。CLI の管理対象への `restore` と別出力先への `export` の分離、
+現在の実装は storage format `2.0.0`、必須の単一 `parent`、唯一の可変参照 `HEAD`、条件付き公開 journal へ移行している。
+2.0.0 は恒久的な `.kio/.store-gate` による concurrency protocol を必須にする保存形式の変更であり、製品 v2 (GUI) や Cargo/release version とは独立する。
+旧 `parents` 配列と旧 format の移行・read/write 互換経路は置かない。CLI の管理対象への `restore` と別出力先への `export` の分離、
 作業ファイルを含む復元 transaction は未実装であり、線形保存形式の実装と区別する。
 実装・試験の状況は [進捗記録](../tasks/v1-implementation-progress.md)、受入条件は
 [v1 実装計画](../tasks/v1-implementation-plan.md) を参照する。

@@ -859,6 +859,11 @@ fn run_snapshot_auto() -> Result<Value> {
         ));
     }
     if !first_config.config.is_some_and(|config| config.enabled) {
+        if session.has_pending_snapshot_auto_state_exchange()? {
+            return Err(snapshot_auto_authority_changed(
+                "scheduled snapshot is disabled while checkpoint recovery is pending",
+            ));
+        }
         return Ok(snapshot_auto_output(
             "skipped",
             "disabled",
@@ -874,7 +879,7 @@ fn run_snapshot_auto() -> Result<Value> {
     // automatic scheduling may publish state and run on-idle GC.  Do not
     // probe index metadata (or enter any mutation preflight) on platforms
     // without the verified descriptor-relative writer contract.
-    if !cfg!(any(target_os = "macos", target_os = "linux")) {
+    if !cfg!(any(target_os = "macos", target_os = "linux", windows)) {
         return match repo.head_commit_hash()? {
             Some(_) => Err(snapshot_auto_platform_unsupported()),
             None => Ok(snapshot_auto_output(
@@ -887,6 +892,27 @@ fn run_snapshot_auto() -> Result<Value> {
                 false,
             )),
         };
+    }
+    // A Windows checkpoint exchange can temporarily remove its public name.
+    // Recover that exact pending operation under its own writer barrier before
+    // GC preflight or eligibility reads; absence must never mean a fresh run.
+    if session.has_pending_snapshot_auto_state_exchange()? {
+        let _lock = session.acquire_snapshot_auto_recovery_lock()?;
+        if session.snapshot_auto_binding()? != first_config
+            || session.automation_binding()? != first_gc
+        {
+            return Err(snapshot_auto_authority_changed(
+                "scheduled snapshot authority changed before checkpoint recovery",
+            ));
+        }
+        session.recover_snapshot_auto_state_under_lock(&first_config, &first_gc)?;
+        if session.snapshot_auto_binding()? != first_config
+            || session.automation_binding()? != first_gc
+        {
+            return Err(snapshot_auto_authority_changed(
+                "scheduled snapshot authority changed during checkpoint recovery",
+            ));
+        }
     }
     let first_indexed = scheduled_auto_index_metadata(&session)?.is_some();
     let second_indexed = scheduled_auto_index_metadata(&session)?.is_some();

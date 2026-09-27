@@ -374,7 +374,7 @@ fn after_index_with_no_candidates_skips_without_creating_gc_state() {
 }
 
 #[test]
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn after_index_with_candidates_fails_before_marker_on_unsupported_rotation_platforms() {
     let (dir, _commit, tree) = stale_candidate();
     configure(&dir, "after_index");
@@ -405,7 +405,7 @@ fn after_index_with_candidates_fails_before_marker_on_unsupported_rotation_platf
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn after_index_sweeps_a_real_stale_tree_after_successful_index() {
     let (dir, commit, tree) = stale_candidate();
     configure(&dir, "after_index");
@@ -419,7 +419,7 @@ fn after_index_sweeps_a_real_stale_tree_after_successful_index() {
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn after_index_timeout_is_observable_and_next_invocations_converge_recovery() {
     let (dir, commit, tree) = stale_candidate();
     configure(&dir, "after_index");
@@ -458,7 +458,7 @@ fn after_index_timeout_is_observable_and_next_invocations_converge_recovery() {
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn automatic_receipt_crash_recovers_in_preflight_before_next_publication() {
     let (dir, commit, tree) = stale_candidate();
     configure(&dir, "after_index");
@@ -485,8 +485,287 @@ fn automatic_receipt_crash_recovers_in_preflight_before_next_publication() {
     assert!(!tree_path(&dir, &tree).exists());
 }
 
+#[cfg(windows)]
+fn windows_exchange_scope_image(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(root: &Path, at: &Path, image: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(at).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let kind = entry.file_type().unwrap();
+            assert!(!kind.is_symlink());
+            if kind.is_dir() {
+                walk(root, &path, image);
+            } else {
+                image.insert(
+                    path.strip_prefix(root).unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut image = std::collections::BTreeMap::new();
+    walk(root, root, &mut image);
+    image
+}
+
+#[cfg(windows)]
+fn assert_windows_automatic_exchange_completed(dir: &TempDir, commit: &str, tree: &str) {
+    let kio_dir = dir.path().join(".kio");
+    assert!(!kio_dir.join("gc/in_progress").exists());
+    assert!(!tree_path(dir, tree).exists());
+    let receipts = kio_core::gc::read_shallow_receipts(&kio_dir).unwrap();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[commit].tree_hash, tree);
+    for kind in ["marker", "index"] {
+        let owner = kio_dir.join(format!("gc/internal/{kind}-exchange"));
+        if owner.exists() {
+            assert_eq!(fs::read_dir(owner).unwrap().count(), 0);
+        }
+    }
+}
+
+#[cfg(windows)]
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn automatic_windows_exchange_interruptions_resume_before_next_publication() {
+    for point in [
+        "after_windows_marker_exchange_source_capture",
+        "after_windows_marker_exchange_source_retire",
+        "after_windows_marker_exchange_intent_remove",
+        "after_windows_index_exchange_source_capture",
+    ] {
+        let (dir, commit, tree) = stale_candidate();
+        configure(&dir, "after_index");
+        fs::write(
+            dir.path().join("document.md"),
+            "# automatic exchange first publication\n",
+        )
+        .unwrap();
+        let crashed = kio(&dir, &["index", "--offline", "--yes", "--json"])
+            .env("KIO_TEST_GC_FAULT", point)
+            .output()
+            .unwrap();
+        assert_eq!(
+            crashed.status.code(),
+            Some(3),
+            "{point}: {}",
+            String::from_utf8_lossy(&crashed.stderr)
+        );
+        let crashed = output_json(&crashed);
+        assert_eq!(crashed["publication_status"], "completed", "{point}");
+        assert_eq!(crashed["gc"]["status"], "failed", "{point}");
+        assert_eq!(
+            crashed["gc"]["error"]["error_code"], "KIO-E-GC-TEST-INTERRUPTED-001",
+            "{point}"
+        );
+        let published = crashed["commit_hash"].as_str().unwrap();
+        let kio_dir = dir.path().join(".kio");
+        assert_eq!(
+            fs::read_to_string(kio_dir.join("HEAD")).unwrap().trim(),
+            published
+        );
+        if point == "after_windows_marker_exchange_source_capture" {
+            assert!(!kio_dir.join("gc/in_progress").exists());
+            assert!(
+                kio_dir
+                    .join("gc/internal/marker-exchange/intent.json")
+                    .is_file()
+            );
+        }
+        if point == "after_windows_marker_exchange_source_retire" {
+            assert!(kio_dir.join("gc/in_progress").is_file());
+            assert!(
+                kio_dir
+                    .join("gc/internal/marker-exchange/intent.json")
+                    .is_file()
+            );
+            assert!(!kio_dir.join("gc/internal/marker-exchange/backup").exists());
+        }
+        if point == "after_windows_marker_exchange_intent_remove" {
+            assert!(kio_dir.join("gc/in_progress").is_file());
+            assert!(
+                !kio_dir
+                    .join("gc/internal/marker-exchange/intent.json")
+                    .exists()
+            );
+        }
+        if point == "after_windows_index_exchange_source_capture" {
+            assert!(!kio_dir.join("index/sqlite.db").exists());
+            assert!(kio_dir.join("gc/in_progress").is_file());
+            assert!(
+                kio_dir
+                    .join("gc/internal/index-exchange/intent.json")
+                    .is_file()
+            );
+        }
+        fs::write(
+            dir.path().join("document.md"),
+            "# automatic exchange next publication\n",
+        )
+        .unwrap();
+        let recovered = json_success(&dir, &["index", "--offline", "--yes"], NOW);
+        assert_eq!(
+            recovered["gc"]["recovered_before_publication"], true,
+            "{point}"
+        );
+        let next = recovered["commit_hash"].as_str().unwrap();
+        assert_ne!(next, published);
+        let repo = Repository::open(dir.path()).unwrap();
+        assert_eq!(
+            repo.read_commit(next).unwrap().parent.as_deref(),
+            Some(published)
+        );
+        assert_eq!(
+            fs::read_to_string(kio_dir.join("HEAD")).unwrap().trim(),
+            next
+        );
+        assert_windows_automatic_exchange_completed(&dir, &commit, &tree);
+        let receipts_before = windows_exchange_scope_image(&kio_dir.join("gc/shallowed"));
+        let repeated = json_success(&dir, &["index", "--offline", "--yes"], NOW);
+        assert_eq!(
+            repeated["gc"]["recovered_before_publication"], false,
+            "{point}"
+        );
+        assert_eq!(repeated["gc"]["status"], "skipped", "{point}");
+        assert_eq!(
+            fs::read_to_string(kio_dir.join("HEAD")).unwrap().trim(),
+            next
+        );
+        assert_eq!(
+            windows_exchange_scope_image(&kio_dir.join("gc/shallowed")),
+            receipts_before
+        );
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn automatic_windows_exchange_mismatched_backup_blocks_next_publication() {
+    for kind in ["marker", "index"] {
+        let (dir, _commit, tree) = stale_candidate();
+        configure(&dir, "after_index");
+        fs::write(
+            dir.path().join("document.md"),
+            "# automatic before mismatch\n",
+        )
+        .unwrap();
+        let point = format!("after_windows_{kind}_exchange_source_capture");
+        let crashed = kio(&dir, &["index", "--offline", "--yes", "--json"])
+            .env("KIO_TEST_GC_FAULT", &point)
+            .output()
+            .unwrap();
+        assert_eq!(crashed.status.code(), Some(3));
+        let crashed = output_json(&crashed);
+        assert_eq!(crashed["publication_status"], "completed");
+        assert_eq!(
+            crashed["gc"]["error"]["error_code"],
+            "KIO-E-GC-TEST-INTERRUPTED-001"
+        );
+        let kio_dir = dir.path().join(".kio");
+        let backup = kio_dir.join(format!("gc/internal/{kind}-exchange/backup"));
+        assert!(backup.is_file());
+        fs::write(&backup, b"foreign replacement source bytes\n").unwrap();
+        fs::write(
+            dir.path().join("document.md"),
+            "# must not publish after mismatch\n",
+        )
+        .unwrap();
+        let before = windows_exchange_scope_image(&kio_dir);
+        let failure = kio(&dir, &["index", "--offline", "--yes", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            failure.status.code(),
+            Some(4),
+            "{kind}: {}",
+            String::from_utf8_lossy(&failure.stderr)
+        );
+        assert!(
+            failure.stdout.is_empty(),
+            "{kind}: published despite mismatch"
+        );
+        let error = output_json(&failure);
+        assert_eq!(error["error_code"], "KIO-E-GC-EXCHANGE-001", "{kind}");
+        assert_eq!(
+            windows_exchange_scope_image(&kio_dir),
+            before,
+            "{kind}: failed recovery mutated store"
+        );
+        assert!(tree_path(&dir, &tree).is_file());
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn automatic_hook_resumes_marker_exchange_created_after_its_publication() {
+    let (dir, commit, tree) = stale_candidate();
+    configure(&dir, "after_index");
+    fs::write(
+        dir.path().join("document.md"),
+        "# publication before concurrent exchange\n",
+    )
+    .unwrap();
+    let ready = dir.path().join("post-publication-exchange.ready");
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"));
+    for name in [
+        "GEMINI_API_KEY",
+        "MISTRAL_API_KEY",
+        "KIO_TEST_GC_FAULT",
+        "KIO_TEST_GC_RUNTIME_CHECKPOINTS",
+    ] {
+        command.env_remove(name);
+    }
+    let child = command
+        .current_dir(dir.path())
+        .env("HOME", dir.path().join("home"))
+        .env("XDG_CONFIG_HOME", dir.path().join("config"))
+        .env("XDG_DATA_HOME", dir.path().join("data"))
+        .env("XDG_CACHE_HOME", dir.path().join("cache"))
+        .env("KIO_FIXED_NOW", NOW)
+        .env("KIO_TEST_GC_POST_PUBLICATION_READY", &ready)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .args(["index", "--offline", "--yes", "--json"])
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !ready.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(
+        ready.exists(),
+        "index did not reach post-publication barrier"
+    );
+    let head = fs::read(dir.path().join(".kio/HEAD")).unwrap();
+    let interrupted = kio(&dir, &["gc", "--yes", "--json"])
+        .env(
+            "KIO_TEST_GC_FAULT",
+            "after_windows_marker_exchange_source_capture",
+        )
+        .output()
+        .unwrap();
+    assert_eq!(interrupted.status.code(), Some(7));
+    assert!(!dir.path().join(".kio/gc/in_progress").exists());
+    assert!(
+        dir.path()
+            .join(".kio/gc/internal/marker-exchange/intent.json")
+            .is_file()
+    );
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let completed = output_json(&output);
+    assert_eq!(completed["gc"]["status"], "completed");
+    assert_eq!(completed["gc"]["recovered_before_publication"], false);
+    assert_eq!(fs::read(dir.path().join(".kio/HEAD")).unwrap(), head);
+    assert_windows_automatic_exchange_completed(&dir, &commit, &tree);
+}
+
+#[test]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn completed_automatic_sweep_rotates_sqlite_before_and_after_tree_retirement() {
     let (dir, commit, tree) = stale_candidate();
     let generation_before = index_generation(&dir);
@@ -585,7 +864,7 @@ fn preview_and_failed_index_never_start_after_index_gc() {
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn child_scope_runs_its_explicit_after_index_hook_once_and_reports_it_to_parent() {
     let dir = canonical_tempdir();
     fs::write(dir.path().join("parent.md"), "parent\n").unwrap();
@@ -730,7 +1009,7 @@ fn after_index_retains_a_tree_still_shared_by_a_protected_ref_tip() {
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn automatic_sweep_receipts_all_eligible_repaired_sharers_before_one_tree_removal() {
     let dir = canonical_tempdir();
     fs::write(dir.path().join("current.md"), "current\n").unwrap();

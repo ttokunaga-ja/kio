@@ -1,6 +1,6 @@
 //! Milestone 8's public read-only inventory entry point.
 
-#![cfg(unix)]
+#![cfg(any(unix, windows))]
 
 mod support;
 
@@ -29,6 +29,10 @@ fn image(root: &Path) -> BTreeMap<String, Vec<u8>> {
             let entry = entry.unwrap();
             let path = entry.path();
             if entry.file_type().unwrap().is_dir() {
+                out.insert(
+                    format!("{}/", path.strip_prefix(root).unwrap().display()),
+                    Vec::new(),
+                );
                 walk(root, &path, out);
             } else {
                 out.insert(
@@ -124,6 +128,7 @@ fn inventory_human_output_is_deterministic_and_failures_do_not_write_stdout() {
         .current_dir(scope.path())
         .assert()
         .success();
+    let before = image(scope.path());
     let first = kio(home.path())
         .args(["gc", "--dry-run", "--prune-unreachable"])
         .current_dir(scope.path())
@@ -136,7 +141,9 @@ fn inventory_human_output_is_deterministic_and_failures_do_not_write_stdout() {
         .unwrap();
     assert!(first.status.success());
     assert_eq!(first.stdout, second.stdout);
+    assert_eq!(before, image(scope.path()));
     fs::write(scope.path().join(".kio").join(".lock"), b"writer").unwrap();
+    let before_failure = image(scope.path());
     let failure = kio(home.path())
         .args(["gc", "--dry-run", "--prune-unreachable", "--json"])
         .current_dir(scope.path())
@@ -144,4 +151,63 @@ fn inventory_human_output_is_deterministic_and_failures_do_not_write_stdout() {
         .unwrap();
     assert!(!failure.status.success());
     assert!(failure.stdout.is_empty());
+    assert_eq!(before_failure, image(scope.path()));
+}
+
+#[cfg(windows)]
+#[test]
+fn inventory_missing_or_malformed_store_gate_fails_without_creating_or_repairing_it() {
+    for state in ["missing", "nonempty", "directory"] {
+        let scope = canonical_tempdir();
+        let home = canonical_tempdir();
+        kio(home.path())
+            .arg("init")
+            .current_dir(scope.path())
+            .assert()
+            .success();
+        let gate = scope.path().join(".kio/.store-gate");
+        assert_eq!(
+            fs::read(&gate).unwrap(),
+            b"",
+            "init must publish the empty gate"
+        );
+        match state {
+            "missing" => fs::remove_file(&gate).unwrap(),
+            "nonempty" => fs::write(&gate, b"malformed gate\n").unwrap(),
+            "directory" => {
+                fs::remove_file(&gate).unwrap();
+                fs::create_dir(&gate).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = image(scope.path());
+        for _ in 0..2 {
+            let failure = kio(home.path())
+                .args(["gc", "--dry-run", "--prune-unreachable", "--json"])
+                .current_dir(scope.path())
+                .output()
+                .unwrap();
+            assert_eq!(
+                failure.status.code(),
+                Some(3),
+                "{state}: {}",
+                String::from_utf8_lossy(&failure.stderr)
+            );
+            assert!(
+                failure.stdout.is_empty(),
+                "{state}: failed inventory emitted results"
+            );
+            let error: Value = serde_json::from_slice(&failure.stderr).unwrap();
+            assert_eq!(error["error_code"], "KIO-E-STORE-LOCKED-001", "{state}");
+            assert_eq!(
+                before,
+                image(scope.path()),
+                "{state}: read-only inventory changed scope"
+            );
+            assert!(
+                !scope.path().join(".kio/.lock").exists(),
+                "{state}: read-only inventory created a writer lock"
+            );
+        }
+    }
 }

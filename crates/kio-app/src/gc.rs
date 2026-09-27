@@ -115,7 +115,7 @@ pub(super) fn preflight_automatic_bound(
             require_snapshot_auto_binding(session, Some(expected_snapshot_auto))?;
             let max_runtime_seconds = required_max_runtime_seconds(config)?;
             let deadline = automatic_deadline(started, max_runtime_seconds)?;
-            if session.read_marker()?.is_none() {
+            if !session.has_active_or_pending_marker()? {
                 return Ok(AutomaticGcPreflight::Proceed {
                     recovered: false,
                     binding,
@@ -148,7 +148,7 @@ pub(super) fn preflight_automatic_bound(
         GcAutomationMode::AfterIndex => {
             let max_runtime_seconds = required_max_runtime_seconds(config)?;
             let deadline = automatic_deadline(started, max_runtime_seconds)?;
-            if session.read_marker()?.is_none() {
+            if !session.has_active_or_pending_marker()? {
                 return Ok(AutomaticGcPreflight::Proceed {
                     recovered: false,
                     binding,
@@ -282,7 +282,7 @@ fn run_after_success(
             let max_runtime_seconds = required_max_runtime_seconds(config)?;
             let deadline = automatic_deadline(started, max_runtime_seconds)?;
             let mut budget = ExecutionBudget::new(Some(deadline));
-            let report = if session.read_marker()?.is_some() {
+            let report = if session.has_active_or_pending_marker()? {
                 resume_session_with_budget(
                     &session,
                     now,
@@ -349,7 +349,7 @@ pub(super) fn run_on_idle_after_snapshot_bound(
     let max_runtime_seconds = required_max_runtime_seconds(binding.config)?;
     let now = fixed_now()?;
     let mut budget = ExecutionBudget::new(Some(automatic_deadline(started, max_runtime_seconds)?));
-    let report = if session.read_marker()?.is_some() {
+    let report = if session.has_active_or_pending_marker()? {
         resume_session_with_budget(
             session,
             now,
@@ -474,6 +474,23 @@ pub(super) fn run(
     // missing-marker failure.  This has no HEAD self-heal side effect.
     let preview_session = GcSweepSession::bind(root.clone())?;
 
+    if preview_session.has_pending_marker_exchange()? {
+        if dry_run {
+            return Ok(json!({
+                "status": "recovery_pending",
+                "reason": "marker_exchange",
+            }));
+        }
+        // The public marker may be between names. Do not fabricate a frozen
+        // plan or mutate the journal merely to render an interactive preview.
+        if !yes {
+            return Err(KioError::invalid_usage(
+                "GC marker publication is incomplete; resume with kio gc --yes",
+            ));
+        }
+        return resume(root, now);
+    }
+
     if let Some(marker) = preview_session.read_marker()? {
         if dry_run {
             return Ok(recovery_pending_value(&marker));
@@ -544,6 +561,9 @@ fn start_session_with_budget(
     expected_snapshot_auto: Option<&SnapshotAutoBinding>,
 ) -> Result<Value> {
     let _lock = session.acquire_store_lock()?;
+    if session.has_active_or_pending_marker()? {
+        return Err(plan_changed());
+    }
     require_automation_binding(session, expected_binding)?;
     require_automatic_index_binding(session, expected_index)?;
     require_snapshot_auto_binding(session, expected_snapshot_auto)?;
@@ -562,7 +582,7 @@ fn start_session_with_budget(
     if locked.candidates.is_empty() {
         return Ok(no_candidates_execution_value());
     }
-    if session.read_marker()?.is_some() {
+    if session.has_active_or_pending_marker()? {
         return Err(plan_changed());
     }
     // A platform without a descriptor-bound SQLite rotation must reject the
@@ -620,6 +640,7 @@ fn resume_session_with_budget(
     require_automation_binding(session, expected_binding)?;
     require_snapshot_auto_binding(session, expected_snapshot_auto)?;
     session.ensure_index_rotation_supported()?;
+    session.recover_pending_marker_under_lock()?;
     let marker = session.read_marker()?.ok_or_else(plan_changed)?;
     let marker_can_be_discarded = session.marker_can_be_discarded_after_fresh_replan(&marker)?;
     // Marker phase is not evidence of durable progress: a crash can happen
@@ -1064,6 +1085,28 @@ fn complete_marked_index_rotation(
         return Err(index_binding_changed("during durable rotation"));
     };
     let kio = session.retained_kio_handle()?;
+    // Windows may have durably captured the old file before publishing its
+    // replacement. Resolve only the journal bound to this exact marker before
+    // opening the public index; an absent name never permits CREATE.
+    #[cfg(windows)]
+    if kio_index::fts::recover_prepared_bound_gc_index(
+        &kio,
+        &rotation.temp_leaf,
+        &rotation.private_dir_identity,
+        source,
+        &rotation.source_state_digest,
+        target,
+    )
+    .map_err(|_| index_binding_changed("during durable rotation recovery"))?
+    {
+        inject_fault("after_index_exchange")?;
+        if budget
+            .as_deref_mut()
+            .is_some_and(ExecutionBudget::should_defer_after_checkpoint)
+        {
+            return Ok(true);
+        }
+    }
     match index_state_bound(session)? {
         state if state == rotation.source => {
             exchange_prepared_bound_gc_index(

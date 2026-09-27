@@ -1059,9 +1059,13 @@ validation 失敗は exit code 2 で停止し、`KIO-E-CONFIG-SCHEMA-001` を返
 
 ## 11.5 current-format boundary
 
+現在の保存形式は `KIO_FORMAT_VERSION = "2.0.0"` である。これは product/Cargo/release version や GUI を含む製品 v2 の到達状態とは独立する。必須の恒久 `.kio/.store-gate` を用いる concurrency protocol により、旧 Windows writer が reader gate を迂回することを防ぐための storage MAJOR bump である。
+
 current reader は `KIO_FORMAT_VERSION` と**完全一致**する string の `kio_format_version` だけを受理する。この判定は、すべての incompatible store に安定した `KIO-E-STORE-VERSION-001` / exit 8 を返すためだけに current schema validation より先に行う。missing、non-string、malformed、older、newer、unknown を含む任意の non-current 値は拒否し、いかなる command も拒否前に store bytes を変更してはならない。
 
 この境界は reader / search / repair / historical の全 command に適用する。migration reader、old-version reader、read-only compatibility mode、best-effort 例外はない。multi-scope search は selected scope が non-current と分かった時点で停止し、その scope を `excluded_scopes` に記録せず、version fallback を記録せず、healthy scope だけの partial result を返さない。incompatible derived SQLite も byte-for-byte で残し、`repair rebuild-db` は validated current commit/tree/manifest/CAS truth からだけ再構築し、old row を読まない。
+
+`.kio/.store-gate` は全 OS の init で作る必須の空 regular file である。内容と identity は不変で、通常操作による作成・削除・置換や repair による補完は認めない。current store で欠落・非 regular・非空なら fail-closed にする。gate が欠落している旧形式でも version 判定を先に行い、`KIO-E-STORE-VERSION-001` / exit 8 を返す。旧形式へ gate を追加する migration や旧形式を読み書きする互換経路は置かない。
 
 current-format の recovery は別契約である。fresh / missing derived SQLite は current schema で初期化してよく、torn write や current-format lifecycle / purge の失敗には定められた fail-closed recovery を維持する。`cost-ledger.sqlite` は non-rebuildable truth であり、old / missing / incompatible shape は import、rename、ALTER、推測変換をせず保存して拒否する。canonical digest-only name、Unicode NFC/case folding、Windows write/read/hash verification の portability も維持するが、legacy physical-name fallback は維持しない。
 
