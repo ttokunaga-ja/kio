@@ -80,7 +80,27 @@ pub(crate) fn retained_image_authority(
             requires_secret_approval |= classify_secret(path).is_some();
         }
 
-        for unit in pinned_done_units(repo, &instance.raw_hash, &instance.normalize)? {
+        let units = match pinned_done_units(repo, &instance.raw_hash, &instance.normalize) {
+            Ok(units) => units,
+            Err(error) => {
+                // Unit absence may be wrapped as a pipeline corruption error.
+                // The verifier independently proves actual CAS absence and
+                // checks every surviving body; error text is not authority.
+                if crate::verify_objects::purge_explains_missing_retained_instance(
+                    repo,
+                    &instance.raw_hash,
+                    &instance.normalize,
+                )? {
+                    // A completed purge can leave an immutable historical
+                    // reference after re-ingest retires its marker. Omit that
+                    // verified old closure entirely: absent bytes establish
+                    // no image ownership, even when some bodies survived.
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        for unit in units {
             for image_hash in unit.owned_image_hashes {
                 if !is_hash(&image_hash) {
                     return Err(KioError::schema(
@@ -99,6 +119,43 @@ pub(crate) fn retained_image_authority(
 #[cfg(test)]
 mod tests {
     use super::{ImageAuthorityEntry, ImageAuthorityMap};
+
+    #[test]
+    fn retained_authority_rejects_missing_or_corrupt_unexplained_manifest() {
+        use std::collections::BTreeSet;
+
+        use kio_core::cas::{ContentObjectKind, hash_bytes};
+        use kio_core::dag::NormalizeRef;
+
+        let root = tempfile::tempdir().unwrap();
+        let repo = match crate::initialize_explicit_root(root.path()).unwrap() {
+            crate::ExplicitRoot::Created(repo) => repo,
+            crate::ExplicitRoot::Existing(_) => panic!("fresh root must be created"),
+        };
+        let policy = crate::current_embedding_policy(&repo).unwrap();
+        let mut instance = crate::historical_reindex::RetainedNormalizedInstance {
+            raw_hash: hash_bytes(b"raw"),
+            normalize: NormalizeRef {
+                tool_profile_hash: hash_bytes(b"profile"),
+                r#gen: 0,
+                manifest_hash: hash_bytes(b"absent manifest"),
+            },
+            raw_path: "source.md".to_owned(),
+            policy_paths: BTreeSet::from(["source.md".to_owned()]),
+            introductions: Vec::new(),
+        };
+        let missing =
+            super::retained_image_authority(&repo, std::slice::from_ref(&instance), &policy)
+                .unwrap_err();
+        assert_eq!(missing.error_code(), "KIO-E-STORE-NOT-FOUND-001");
+
+        instance.normalize.manifest_hash = repo
+            .object_store()
+            .write_content_object(ContentObjectKind::Manifest, b"not a manifest")
+            .unwrap();
+        let corrupt = super::retained_image_authority(&repo, &[instance], &policy).unwrap_err();
+        assert_eq!(corrupt.error_code(), "KIO-E-STORE-CORRUPT-001");
+    }
 
     #[test]
     fn public_alias_does_not_remove_secret_requirement() {

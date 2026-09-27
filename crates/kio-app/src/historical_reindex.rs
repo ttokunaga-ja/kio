@@ -543,13 +543,11 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
                 {
                     continue;
                 }
-                if error.error_code() == "KIO-E-STORE-NOT-FOUND-001"
-                    && purge_explains_missing_pinned_manifest(
-                        repo,
-                        &instance.raw_hash,
-                        [selected_commit.clone()],
-                    )?
-                {
+                if crate::verify_objects::purge_explains_missing_retained_instance(
+                    repo,
+                    &instance.raw_hash,
+                    &instance.normalize,
+                )? {
                     continue;
                 }
                 // An explicit `--at` pins one immutable snapshot.  A corrupt

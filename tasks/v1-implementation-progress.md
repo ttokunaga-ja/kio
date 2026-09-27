@@ -6,6 +6,39 @@ local verification, and the final native acceptance evidence.
 
 ## Current acceptance checkpoint — 2026-09-27
 
+Unpublished storage checkpoint `68690960` has now passed macOS formatting,
+workspace all-target strict Clippy and tests (3,139 main tests across 85 Cargo
+targets, plus 11 nested helper passes; zero failed or ignored). Native WSL
+workspace checks also passed: 3,145 main tests across 85 targets, zero failed,
+and one ignored self-helper entry point that native tests invoke explicitly;
+14 nested helper passes are recorded separately. The WSL retry used private
+test ancestors and ordinary CI umask `022`;
+earlier harness-permission failures are retained, not counted as product passes.
+Persona W0 and the complete synthetic-history CI sequence also passed from the
+same isolated WSL source snapshot, with all 1,642 tracked file bytes and modes
+unchanged. Candidate packaging is still pending.
+
+The immutable Daybreak Blue diff scan `acb38ce2-7192-4d5a-ad3a-cf5ef887f1e1`
+for `b45ec138..68690960` is sealed: all 32 changed paths reviewed, zero findings
+and zero deferred candidates. The explicit CLI model request was
+`gpt-daybreak-blue-latest` at high effort; resolved backend identity was not
+attested. Windows metadata compilation is separate evidence: native execution
+on the final source was blocked by Smart App Control and was not bypassed.
+Native Actions acceptance is still required. Power-loss durability remains an
+explicit limitation, separate from process-interruption recovery evidence.
+
+The subsequent [orphan-prune repair milestone](v1-orphan-prune-recovery.md)
+implements remaining PB14–PB16 scope-wide blockers, staging recovery and retained
+deletion capabilities. Its focused macOS validation passed: 71 CLI contract tests,
+16 verifier tests, 14 core removal/binding tests, two ledger tests, 33 Markdown
+validation tests and two image-authority tests. Formatting and all-target strict
+Clippy for core/pipeline/app/CLI passed. The public purge → re-ingest → search →
+prune → search regression now passes, including partial retained history and
+unrelated shallow receipts; corrupt surviving bodies remain rejected. These
+changes are outside the sealed `68690960` scan. Full workspace regression,
+new-candidate packaging, separate Daybreak review and native Actions acceptance
+remain required.
+
 **v1.0 remains incomplete.** Candidate `1ffdd0c` is published on `main` for
 native CI confirmation. The earlier recovery entries below describe historical
 checkpoints; their statements about absent App configuration or no push do not

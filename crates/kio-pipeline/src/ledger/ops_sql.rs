@@ -81,6 +81,26 @@ pub(crate) fn requests_with_intent_for_scope(
         .map_err(Into::into)
 }
 
+/// Every inflight external request for this scope, including realtime requests
+/// and rows without an intent token. Repair must preserve all state 0/1 work;
+/// provider-residue cleanup and terminal-row queries have different semantics.
+pub(crate) fn inflight_requests_for_scope(
+    conn: &Connection,
+    scope_id: &str,
+) -> Result<Vec<BatchRequestRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT scope_id, adapter_kind, input_hash, tool_profile_hash, state, request_kind,
+                intent_token, upload_id, batch_job_id, provider_scope_id, job_create_started_at,
+                stale_after_at, submission_seq, attempts, contract_violation_count, estimated_usd,
+                error, completed_at, created_at
+         FROM batch_requests WHERE scope_id = ?1 AND state IN (0, 1)
+         ORDER BY created_at, adapter_kind, input_hash, tool_profile_hash",
+    )?;
+    stmt.query_map(params![scope_id], row_to_batch_request)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(Into::into)
+}
+
 /// Current terminal Batch contract violations remain authoritative after cleanup.
 /// Historical outcomes and diagnostic error strings are not retry authority.
 pub(crate) fn unreset_contract_violations_for_scope_adapter(
@@ -2141,6 +2161,102 @@ mod tests {
     use std::collections::BTreeSet;
 
     use super::*;
+
+    #[test]
+    fn inflight_scope_query_includes_all_kinds_and_null_intents_in_stable_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(crate::ledger::schema::CREATE_BATCH_REQUESTS_SQL)
+            .unwrap();
+        let mut expected = Vec::new();
+        for scope in ["target-scope", "other-scope"] {
+            for kind in [RequestKind::Sync, RequestKind::Batch] {
+                for (state, inflight) in [
+                    (BatchState::Intent, true),
+                    (BatchState::JobCreated, true),
+                    (BatchState::Completed, false),
+                    (BatchState::Terminal, false),
+                ] {
+                    for intent in [None, Some("intent-token")] {
+                        // Reverse profile insertion and shared timestamps/input
+                        // keys exercise the full deterministic ordering tuple.
+                        for profile in ["profile-z", "profile-a"] {
+                            let adapter = if kind == RequestKind::Sync {
+                                "markdownize"
+                            } else {
+                                "embedding"
+                            };
+                            let input = format!("input-{}-{}", state.as_i64(), intent.is_some());
+                            let created_at = (state.as_i64() + 1) % 2;
+                            conn.execute(
+                                "INSERT INTO batch_requests
+                                    (scope_id, adapter_kind, input_hash, tool_profile_hash, state,
+                                     request_kind, intent_token, estimated_usd, created_at)
+                                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0.25, ?8)",
+                                params![
+                                    scope,
+                                    adapter,
+                                    input,
+                                    profile,
+                                    state.as_i64(),
+                                    kind.as_str(),
+                                    intent,
+                                    created_at
+                                ],
+                            )
+                            .unwrap();
+                            if scope == "target-scope" && inflight {
+                                expected.push((
+                                    created_at,
+                                    adapter.to_owned(),
+                                    input,
+                                    profile.to_owned(),
+                                    state,
+                                    kind,
+                                    intent.map(str::to_owned),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        expected.sort_by(|left, right| {
+            (&left.0, &left.1, &left.2, &left.3).cmp(&(&right.0, &right.1, &right.2, &right.3))
+        });
+        let before_changes = conn.total_changes();
+        let rows = inflight_requests_for_scope(&conn, "target-scope").unwrap();
+        assert_eq!(rows.len(), 16);
+        let actual = rows
+            .iter()
+            .map(|row| {
+                assert_eq!(row.key.scope_id, "target-scope");
+                (
+                    row.created_at,
+                    row.key.adapter_kind.clone(),
+                    row.key.input_hash.clone(),
+                    row.key.tool_profile_hash.clone(),
+                    row.state,
+                    row.request_kind,
+                    row.intent_token.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            inflight_requests_for_scope(&conn, "target-scope").unwrap(),
+            rows
+        );
+        assert!(
+            inflight_requests_for_scope(&conn, "absent-scope")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            conn.total_changes(),
+            before_changes,
+            "inflight inspection must not update ledger state"
+        );
+    }
 
     #[test]
     fn unreset_batch_contract_violations_require_exact_current_attempt() {

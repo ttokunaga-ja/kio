@@ -877,8 +877,7 @@ fn load_validated_normalized_units_from_manifest_with_size(
         tool_profile_hash: manifest.tool_profile_hash.clone(),
         r#gen: manifest.r#gen,
     };
-    validate_manifest_identity(source_path, &identity, manifest)?;
-    validate_manifest_unit_object_pins(source_path, manifest)?;
+    validate_normalized_manifest(source_path, &identity, manifest)?;
 
     let mut total_bytes = 0_u64;
     let mut units = Vec::new();
@@ -938,41 +937,13 @@ pub fn validate_normalized_instance(
     units: &[NormalizedUnitObject],
 ) -> Result<()> {
     let source_path = source_path.as_ref();
-    validate_manifest_identity(source_path, identity, manifest)?;
-
-    let mut manifest_keys = BTreeSet::new();
-    let mut manifest_refs = BTreeSet::new();
+    validate_normalized_manifest(source_path, identity, manifest)?;
     let done_by_key = manifest
         .units
         .iter()
         .filter(|entry| entry.status == UnitStatus::Done)
         .map(|entry| (entry.unit_key.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
-    for entry in &manifest.units {
-        if entry.unit_key.is_empty()
-            || !manifest_keys.insert(entry.unit_key.as_str())
-            || !manifest_refs.insert(entry.unit_ref.as_str())
-            || entry.unit_ref != prepared_unit_ref(&entry.unit_key)
-        {
-            return Err(normalized_corrupt(
-                source_path,
-                "manifest contains a duplicate or non-derived unit reference",
-            ));
-        }
-        if !kio_core::cas::is_hash(&entry.prepared_hash) {
-            return Err(normalized_corrupt(
-                source_path,
-                "manifest entry prepared_hash is invalid",
-            ));
-        }
-        if !kio_core::cas::is_hash(&entry.preparation_profile_hash) {
-            return Err(normalized_corrupt(
-                source_path,
-                "manifest entry preparation_profile_hash is invalid",
-            ));
-        }
-    }
-    validate_manifest_unit_object_pins(source_path, manifest)?;
 
     if units.len() != done_by_key.len() {
         return Err(normalized_corrupt(
@@ -1009,6 +980,48 @@ pub fn validate_normalized_instance(
             ));
         }
     }
+    Ok(())
+}
+
+/// Validate the complete manifest structure without requiring its unit bodies.
+/// This permits callers with verified purge authority to distinguish absent
+/// historical bodies from malformed retained state.
+pub fn validate_normalized_manifest(
+    source_path: impl AsRef<Path>,
+    identity: &NormalizedInstanceIdentity,
+    manifest: &NormalizedInstanceManifest,
+) -> Result<()> {
+    let source_path = source_path.as_ref();
+    validate_manifest_identity(source_path, identity, manifest)?;
+
+    let mut manifest_keys = BTreeSet::new();
+    let mut manifest_refs = BTreeSet::new();
+    for entry in &manifest.units {
+        if entry.unit_key.is_empty()
+            || !manifest_keys.insert(entry.unit_key.as_str())
+            || !manifest_refs.insert(entry.unit_ref.as_str())
+            || entry.unit_ref != prepared_unit_ref(&entry.unit_key)
+        {
+            return Err(normalized_corrupt(
+                source_path,
+                "manifest contains a duplicate or non-derived unit reference",
+            ));
+        }
+        if !kio_core::cas::is_hash(&entry.prepared_hash) {
+            return Err(normalized_corrupt(
+                source_path,
+                "manifest entry prepared_hash is invalid",
+            ));
+        }
+        if !kio_core::cas::is_hash(&entry.preparation_profile_hash) {
+            return Err(normalized_corrupt(
+                source_path,
+                "manifest entry preparation_profile_hash is invalid",
+            ));
+        }
+    }
+    validate_manifest_unit_object_pins(source_path, manifest)?;
+
     Ok(())
 }
 
@@ -1807,6 +1820,22 @@ mod tests {
         }];
         manifest.units[0].unit_object_hash = Some(normalized_unit_object_hash(&units[0]).unwrap());
         (identity, manifest, units)
+    }
+
+    #[test]
+    fn manifest_structure_validation_does_not_require_bodies_but_rejects_hidden_duplicates() {
+        let (identity, manifest, _) = normalized_fixture();
+        validate_normalized_manifest("fixture", &identity, &manifest).unwrap();
+        assert!(validate_normalized_instance("fixture", &identity, &manifest, &[]).is_err());
+        let mut duplicate = manifest.clone();
+        duplicate.units.push(duplicate.units[0].clone());
+        assert!(validate_normalized_manifest("fixture", &identity, &duplicate).is_err());
+        let mut missing_pin = manifest.clone();
+        missing_pin.units[0].unit_object_hash = None;
+        assert!(validate_normalized_manifest("fixture", &identity, &missing_pin).is_err());
+        let mut wrong_reference = manifest;
+        wrong_reference.units[0].unit_ref = "0000000000000000".into();
+        assert!(validate_normalized_manifest("fixture", &identity, &wrong_reference).is_err());
     }
 
     #[test]

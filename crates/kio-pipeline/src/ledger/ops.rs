@@ -34,6 +34,13 @@ pub fn requests_with_intent_for_scope(
     db.read(|conn| super::ops_sql::requests_with_intent_for_scope(conn, scope_id))
 }
 
+/// Read every state 0/1 request for a scope through the existing ledger
+/// lifecycle. Request kind and presence of an intent token do not limit this
+/// repair blocker query; no database is initialized or recovered here.
+pub fn inflight_requests_for_scope(db: &LedgerDb, scope_id: &str) -> Result<Vec<BatchRequestRow>> {
+    db.read(|conn| super::ops_sql::inflight_requests_for_scope(conn, scope_id))
+}
+
 pub fn cost_ledger_rows_for_key(
     db: &LedgerDb,
     key: &TaskKey,
@@ -210,6 +217,32 @@ pub fn sweep_then_device_claim(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inflight_scope_query_uses_the_existing_ledger_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = LedgerDb::initialize(dir.path().join("device/cost-ledger.sqlite")).unwrap();
+        let batch = TaskKey::new("scope-a", "embedding", "batch", "profile");
+        let realtime = TaskKey::new("scope-a", "markdownize", "realtime", "profile");
+        let other = TaskKey::new("scope-b", "embedding", "other", "profile");
+        phase1_intent(&db, &batch, RequestKind::Batch, 0.5, None).unwrap();
+        phase1_intent(&db, &realtime, RequestKind::Sync, 0.5, Some(300)).unwrap();
+        phase1_intent(&db, &other, RequestKind::Batch, 0.5, None).unwrap();
+        let rows = inflight_requests_for_scope(&db, "scope-a").unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| row.key == batch));
+        assert!(rows.iter().any(|row| row.key == realtime));
+        assert!(
+            inflight_requests_for_scope(&db, "missing-scope")
+                .unwrap()
+                .is_empty()
+        );
+        // LedgerDb retains its authority/locator, not a live connection. A
+        // disappearance must fail closed rather than bootstrap a new ledger.
+        std::fs::remove_file(db.path()).unwrap();
+        assert!(inflight_requests_for_scope(&db, "scope-a").is_err());
+        assert!(!db.path().exists());
+    }
 
     #[test]
     fn reserve_or_reuse_refuses_an_inflight_task_sync_attempt() {

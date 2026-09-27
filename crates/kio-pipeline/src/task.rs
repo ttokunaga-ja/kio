@@ -430,6 +430,14 @@ impl TaskStore {
                 "task store root changed while opening",
             ));
         }
+        self.all_bound(&retained)
+    }
+
+    /// Read tasks through the caller's retained scope capability without rebinding a path.
+    pub fn all_bound(
+        &self,
+        retained: &kio_core::store_dir::StoreDirectory,
+    ) -> Result<Vec<TaskDescriptor>> {
         let leaf = Path::new("tasks.jsonl");
         if !retained.contains_entry(leaf).map_err(|error| {
             PipelineError::corrupt(self.path.display().to_string(), error.to_string())

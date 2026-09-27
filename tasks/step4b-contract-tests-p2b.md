@@ -177,12 +177,27 @@ P2 = 参考 (Phase 4+ 依存・文書のみ)。「**現行実装との既知の�
 - 前提: raw_hash `X` が canonical final event = `purged` (in_commit=`Cp`) で説明される。(a) `Cp` 以前の
   commit の tree entry の manifest が欠落。(b) `Cp` より後の (= retire 後に再作成・再公開された)
   commit の tree entry の manifest が欠落。
-- 操作: `kio repair --verify-objects` を実行する。
-- 期待: (a) は正常な dead terminal として manifest 欠落を corruption としない (`dead_by_tombstone_count`
-  等の既存カウンタに算入)。(b) は「古い退役 event が新規破損を隠さない」ため corruption と判定する
+- 操作: `kio repair verify-objects` を実行する。
+- 期待: (a) の厳密に purge が説明する古い reachable commit の normalized closure 欠落は、
+  expected unavailable history とし、`purge_explained_missing_history_count` に normalize 参照ごとに
+  算入する (object / unit 数ではない)。他に finding / incomplete が無ければ `status="ok"` だが、
+  count > 0 では `external_pointers_may_be_affected=true` を維持する。全履歴の復元可能性は保証しない。
+  (b) は「古い退役 event が新規破損を隠さない」ため corruption と判定する
   (`manifest_corrupt` 相当の finding)。この判定は §D(PB05 自身)・fsck 側の raw 欠落説明スコープ
   (LC17/LC35-38 と同一原則) を manifest object に対しても適用する
   ことを要求する — raw 側だけ範囲限定して manifest 側は無条件除外、という非対称実装は契約違反。
+
+- 追加条件: 有効な canonical purge / lifecycle evidence と、`manifest_hash` を含む exact old
+  `NormalizeRef` を要求する。cutoff は検証済み `purged` / `erased` event の `in_commit` 以前であり、
+  resurrection 時点まで広げない。同じ exact closure が HEAD / current、または purge 後の commit に
+  現れれば例外を拒否する。resurrection commit / 新 generation の欠落にも適用しない。古い historical
+  tag root であることだけでは除外しない。manifest の全構造・残存全 body を検査し、一つ目の missing
+  unit の後にある corrupt unit も finding とする。genuine missing、corrupt manifest / body、未検証・
+  不正 marker は除外しない。通常 verify / prune / replica / image authority で共有する分類を使い、
+  prune 専用 bypass は認めない。purge → re-ingest 後の検索は現在の有効な closure から回復し、
+  削除済みの古い closure は image ownership を与えない。公開経路の regression と shallow partial
+  ケースは 2026-09-27 の macOS CLI contract suite（71件）で通過した。
+  Windows/Linux の候補全体の runtime 受入と新しい差分のセキュリティ確認は別の未完了 gate とする。
 
 ### PB06 HEAD tree entry の作業コピー manifest.json canonical JCS hash 一致検査 (未 finalize と corruption の分離) [P0]
 - 正本: 10 §7.5.1 L501-504『HEAD tree の entry については作業コピー manifest.json の canonical JCS
@@ -302,46 +317,52 @@ P2 = 参考 (Phase 4+ 依存・文書のみ)。「**現行実装との既知の�
   ある限り保持)。この live 参照判定は purge closure の共有派生判定 (U30、02-philosophy §6.1) と同一
   規則を使う。
 
-### PB14 staging root の 3 分類 (descriptor 無し / path 不整合 / terminal task 対応) [P0]
-- 正本: 10 §7.5.1 L588-592『descriptor の無い staging root・path と不整合な staging root (descriptor
-  の有無を問わない)・terminal 化済み (done / failed permanent / abandoned / settled partial) task に
-  のみ対応する staging root ... を列挙し、locked repair として削除する』
-- 前提: staging root を (a) descriptor が存在しない、(b) descriptor はあるが記載 path と実体が
-  不一致、(c) descriptor があり path も整合するが対応する task が terminal (done/failed
-  permanent/abandoned/settled partial)、(d) 同様に整合するが対応 task が non-terminal
-  (pending/running/partial-with-retryable-failed-unit) の 4 パターンで用意する。
-- 操作: `kio repair --verify-objects --prune-orphans` を実行する。
-- 期待: (a)(b)(c) は削除対象。(d) は削除対象外 (進行中 task の保全 — PB15 の拒否条件と表裏)。partial
-  task は「再投入可能な failed unit が残る場合のみ」non-terminal 扱いとし、全 unit terminal の
-  settled partial (04 §5.2) は (c) 側 (削除対象) に分類する。
+### PB14 staging root と normalized private stage の分類 [P0]
+- 正本: [10-operations.md §7.5.1](../docs/10-operations.md#751-kio-repair-verify-objects-fsck-相当)。
+- 前提: (a) descriptor 無し、(b) 妥当な同一 scope の descriptor と path が不整合、(c) 対応 task が
+  done / failed permanent / abandoned / settled partial、(d) pending / running / paused / failed
+  retryable / retryable failed unit の残る partial、(e) malformed / foreign descriptor を用意する。
+- 操作: `kio repair verify-objects --prune-orphans` の対象表示を確認して承認する。
+- 期待: 全 scope blocker が無ければ (a)(b)(c) は候補。(d) は scope 全体を拒否し、(e) や hardlink /
+  symlink / reparse point 等の unsafe な残骸も計画を拒否する。「descriptor 無し / path 不整合」を
+  malformed / foreign descriptor の削除許可に読み替えない。
+- 追加契約: publication の所有下にない abandoned normalized `.staged-<ULID>` は、全 blocker が
+  無ければ候補。妥当な staged manifest の prepared / image 参照は今回の計画で live として保護する。
+  stage 削除後に孤立する CAS は、次回の新しい preview / proof / 確認でのみ回収する。
 
-### PB15 fail-closed 拒否条件の列挙 (state 0/1 request・non-terminal task・未 finalize manifest・active journal) [P0]
-- 正本: 10 §7.5.1 L594-599, L609-614『**拒否条件 (fail-closed)**: 当該 scope に state 0/1 の外部実行
-  (batch_requests — request_kind 不問)・pending / running の task・... 非 terminal ... の task に
-  対応する staging ... 未 finalize の manifest 進行状態・active な purge journal のいずれかが存在する
-  間は、prune を実行せず exit 3 (retryable) で拒否する』
-- 前提: 4 通りの単独条件をそれぞれ用意する: (a) state 0/1 の `batch_requests` 行が存在。(b)
-  pending/running task が存在。(c) 未 finalize の manifest 進行状態 (HEAD tree entry の manifest.json
-  と CAS manifest が不一致 — PB06 の (b) と同型)。(d) active な purge journal。他の削除対象 (orphan
-  prepared 等) も同時に存在する。
-- 操作: `kio repair --verify-objects --prune-orphans` を実行する。
-- 期待: (a)(b)(c)(d) いずれか 1 つでも真なら、prune を一切実行せず (他に安全に削除できる orphan が
-  あっても実行しない) exit 3 で拒否する。拒否応答には blocker の種別と対象 (intent_token または 4 組
-  キー) を含め、次操作 (`kio batch resume` / `kio batch abandon` / journal 回復) を提示する。
+### PB15 scope 全体の blocker と確認済み計画の再検査 [P0]
+- 正本: 10 §7.5.1 の拒否条件・確認から削除まで・現行の計画上限。
+- 前提: 他の削除可能な orphan と共に、各条件を単独で用意する: (a) state 0/1 `batch_requests`
+  (`request_kind` の各種および NULL `intent_token` を含む)、(b) non-terminal task (paused /
+  failed retryable / retryable partial を含む)、(c) 未 finalize projection / immutable manifest 不一致、
+  (d) active publication / pending atomic / active purge journal。
+- 操作: `kio repair verify-objects --prune-orphans` を実行する。
+- 期待: いずれも prune 全体を exit 3 で拒否し、一件も削除しない。blocker 種別・対象・次操作を示す。
+  公開・整合検証済み manifest の retryable failed unit だけでは publication blocker にしないが、
+  その prepared / image 参照は保護する。state 2/3 request と settled partial は blocker ではない。
+- 確認後の追加条件: apply 直前に blocker / live 参照 / 対象実体を変更する。全 blocker・現在の proof・
+  現在も eligible として選択する全 pin を最初の削除前に再検査し、元の表示対象で現在も eligible な同一実体だけを削除する。
+  新しい orphan や同名の置換物を対象に追加しない。検査・削除エラーを無視して成功を返さない。
+- 上限: core RemovalBudget の 1,024 held handle / pin、深さ 32、捕捉物理 file size 合計 1 GiB、
+  proof walk の 1,000,000 entries / 計上 verification byte 合計 1 GiB 超過では明示拒否し、無言で
+  候補を切り詰めない。core の複数 pass の hash 再読込、shared CAS loader の検証 I/O は累積で
+  1 GiB 以下とは限らない。proof は直接読む descriptor / projection / immutable manifest と、正常に
+  load した unit / commit / tree の canonical-size を計上する。個別 object / instance、失敗時、
+  検証 pass は別の上限を持ち、shallow receipt helper は上限付き 2 pass とする。
 
-### PB16 特定不能退出経路のエスケープハッチ (全 gen terminal + state 0/1 無し) [P1]
-- 正本: 10 §7.5.1 L600-609『**特定不能の退出経路**: (1) descriptor の (raw_hash, tool_profile_hash)
-  配下に**存在する全て**の normalized instance (全 gen) の manifest で全 unit が terminal
-  (done/failed permanent) であり、**かつ同 key の state 0/1 batch_requests 行が無い**なら、terminal
-  残骸とみなし削除対象へ移す』
-- 前提: staging root の descriptor から対応する task record が失われている (task 記録喪失は許容 —
-  04 §1)。同一 (raw_hash, tool_profile_hash) の全 gen の normalized instance manifest が全 unit
-  terminal であり、同 key の `batch_requests` 行に state 0/1 が無い。
-- 操作: `kio repair --verify-objects --prune-orphans` を実行する。
-- 期待: task 記録が特定できなくても削除対象に含まれる (PB15 の non-terminal-task 拒否には該当しない
-  — 「対応 task を特定できない descriptor つき root は blocker 側に倒す」原則の**例外**としてこの
-  条件だけは削除を許可する)。in-flight 信号は cost-ledger (`batch_requests`) 側で判定し、喪失許容の
-  task 記録には依存しない。
+### PB16 特定不能退出経路の両立と crash quarantine 回復 [P1]
+- 正本: 10 §7.5.1 の特定不能退出経路 (1)(2) と crash quarantine 回復。
+- 前提: 妥当で path と整合する descriptor の対応 task record が失われている (04 §1)。
+- 操作: `kio repair verify-objects --prune-orphans` の対象表示を確認して承認する。
+- 期待: 全 scope blocker の不在を必須とし、次の**両方**の退出経路を検査する。
+  (1) 同一 (raw_hash, tool_profile_hash) に少なくとも一世代が存在し、存在する全 gen の全 unit が
+  terminal (done / failed permanent)、同 key の state 0/1 request が無い場合は terminal 残骸として候補。
+  ゼロ世代を空集合の全称条件で terminal としない。
+  (2) (1) 以外でも、全 blocker の不在を lock 下で確認し、明示確認した locked repair なら候補。
+  task 記録の欠落だけで永久拒否せず、ledger / publication / unsafe 検査は省略しない。
+- crash 回復: `.kio-cas-remove-…` / `.kio-prune-directory-…` 残存は新しい preview と現在の proof、
+  新しい確認済み pin を必要とする。名前だけを権限にせず、canonical 名との共存や不正状態を拒否する。
+  複数対象の途中失敗には一括 rollback を仮定せず、残存物を再計画する。
 
 ### PB17 purge 済み raw の open cache 残骸回収 (raw/image 型分離、C 領域との境界注記) [P1]
 - 正本: 10 §7.5.1 L616-626『`--prune-orphans` は、当該 scope で canonical final event が `purged`
@@ -350,7 +371,7 @@ P2 = 参考 (Phase 4+ 依存・文書のみ)。「**現行実装との既知の�
 - 前提: canonical final event が `purged`/`erased` の raw_hash に対応する `~/.cache/kio/open/<digest64>/`
   が残存する (open 手順の publish 後・起動直前検査前の crash 窓を模したもの)。当該 scope のどの live
   manifest からも参照されない image の `~/.cache/kio/open/image/<digest64>/` も同様に残存する。
-- 操作: `kio repair --verify-objects --prune-orphans` を実行する。
+- 操作: `kio repair verify-objects --prune-orphans` を実行する。
 - 期待: いずれの残存 cache dir も削除対象に含まれ、同じ locked repair で冪等に削除される。**境界
   注記**: cache の型分離 (`open/image/<digest64>/` への raw/image 分離自体) は C 領域 (U22-U24) の
   管轄であり本書は再契約しない — 本契約は `--prune-orphans` という**本書 F 領域の CLI フラグ**が

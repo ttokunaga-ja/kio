@@ -2561,6 +2561,13 @@ fn run_repair(args: RepairArgs) -> Result<Value> {
     }
     // M1(a): serialize the DB rebuild against concurrent index/repair/reindex.
     let _lock = repo.lock_store()?;
+    if mode == RepairMode::VerifyObjectsPruneOrphans
+        && let Some(prune) = verify_objects::prune_orphans_preflight(&repo)?
+    {
+        return Ok(
+            json!({"prune_orphans":prune,"error_code":"KIO-E-PRUNE-ORPHANS-BLOCKED-001","__exit_code":3}),
+        );
+    }
     repo.recover_publication()?;
     validate_repo_tool_lock(&repo)?;
     if mode == RepairMode::VerifyObjects || mode == RepairMode::VerifyObjectsPruneOrphans {
@@ -2630,7 +2637,7 @@ fn run_repair(args: RepairArgs) -> Result<Value> {
                     skip_prompt,
                 )?;
             }
-            let prune = verify_objects::prune_orphans_apply(&repo, &plan)?;
+            let prune = verify_objects::prune_orphans_apply(&repo, plan)?;
             if let (Some(object), Ok(prune_value)) = (
                 output.as_object_mut(),
                 serde_json::to_value(&prune).map_err(|error| KioError::schema(error.to_string())),
@@ -4530,15 +4537,11 @@ fn projection_bindings_for_plan(
                 done_units.insert(key.clone(), done);
             }
             Err(error) => {
-                if error.error_code() == "KIO-E-STORE-NOT-FOUND-001"
-                    && purge_explains_missing_pinned_manifest(
-                        repo,
-                        &binding.raw_hash,
-                        bindings
-                            .iter()
-                            .map(|binding| binding.pointer_commit.clone()),
-                    )?
-                {
+                if verify_objects::purge_explains_missing_retained_instance(
+                    repo,
+                    &binding.raw_hash,
+                    &normalize,
+                )? {
                     continue;
                 }
                 return Err(error);
@@ -7344,7 +7347,7 @@ fn purge_blocks_historical_reindex_raw(kio_dir: &Path, raw_hash: &str) -> Result
 /// one missing closure while the erase receipt is still active, but only when
 /// the receipt's own erased event is backed by a real purge commit at or after
 /// the selected snapshot.  This is deliberately separate from
-/// `purge_explains_missing_pinned_manifest`: normal rebuilds retain that
+/// `verify_objects::purge_explains_missing_retained_instance`: normal rebuilds retain that
 /// stricter retired/resurrection-only rule.
 pub(crate) fn active_erase_purge_explains_historical_missing_manifest(
     repo: &Repository,
@@ -7376,107 +7379,6 @@ pub(crate) fn active_erase_purge_explains_historical_missing_manifest(
         return Ok(false);
     }
     is_ancestor_or_equal(repo, selected_commit, &erased.in_commit)
-}
-
-/// A purge deliberately removes the old manifest/unit closure. After a
-/// re-ingest the canonical lifecycle event is `Retired`, so that old closure
-/// is explainable only for bindings at-or-before the purge that removed it.
-/// Never use this for malformed/corrupt objects or for a binding newer than
-/// the explaining purge: those remain fail-closed store corruption.
-fn purge_explains_missing_pinned_manifest(
-    repo: &Repository,
-    raw_hash: &str,
-    relevant_commits: impl IntoIterator<Item = String>,
-) -> Result<bool> {
-    let state = PurgeState::open(repo.kio_dir())?;
-    // An in-flight purge owns visibility. Missing immutable closure bytes must
-    // never be reclassified as an explained, completed purge while its barrier
-    // is still active (including a torn/recoverable journal).
-    if state.barrier_blocks(raw_hash)? {
-        return Ok(false);
-    }
-    let tombstone = state.read_tombstone(raw_hash)?;
-    let receipt = state.read_erase_receipt(raw_hash)?;
-    let Some(canonical) = canonical_final_event(
-        tombstone.as_ref().map(|record| record.tail()),
-        receipt.as_ref().map(|receipt| receipt.tail()),
-    )?
-    else {
-        return Ok(false);
-    };
-    if canonical.event.kind != EventKind::Retired {
-        return Ok(false);
-    }
-    let events = match canonical.marker_kind {
-        TombstoneMode::Default => tombstone.as_ref().map(|record| &record.events),
-        TombstoneMode::Erase => receipt.as_ref().map(|receipt| &receipt.events),
-    };
-    let Some(explaining_purge) = events.and_then(|events| {
-        events
-            .iter()
-            .rev()
-            .find(|event| matches!(event.kind, EventKind::Purged | EventKind::Erased))
-            .map(|event| event.in_commit.as_str())
-    }) else {
-        return Ok(false);
-    };
-    let explaining_commit = match repo.read_commit(explaining_purge) {
-        Ok(commit) => commit,
-        Err(error) if is_store_not_found(&error) => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if explaining_commit.commit_type != CommitType::Purged
-        || !explaining_commit
-            .purged_raws
-            .iter()
-            .any(|purged| purged == raw_hash)
-    {
-        return Ok(false);
-    }
-    let Some(resurrection) = canonical.event.resurrection_commit.as_deref() else {
-        return Ok(false);
-    };
-    if !is_ancestor_or_equal(repo, explaining_purge, resurrection)? {
-        return Ok(false);
-    }
-    let resurrection_commit = match repo.read_commit(resurrection) {
-        Ok(commit) => commit,
-        Err(error) if is_store_not_found(&error) => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    let resurrection_tree = match repo.read_tree(&resurrection_commit.tree) {
-        Ok(tree) => tree,
-        Err(error) if is_store_not_found(&error) => return Ok(false),
-        Err(error) => return Err(error),
-    };
-    if !resurrection_tree
-        .entries
-        .iter()
-        .any(|entry| entry.raw_hash == raw_hash)
-    {
-        return Ok(false);
-    }
-    let reachable_resurrection =
-        repo.current_ref_targets()?
-            .into_iter()
-            .try_fold(false, |reachable, root| {
-                if reachable {
-                    Ok(true)
-                } else {
-                    is_ancestor_or_equal(repo, resurrection, &root)
-                }
-            })?;
-    if !reachable_resurrection {
-        return Ok(false);
-    }
-    relevant_commits
-        .into_iter()
-        .try_fold(true, |all_explained, commit| {
-            if !all_explained {
-                return Ok(false);
-            }
-            is_ancestor_or_equal(repo, &commit, explaining_purge)
-        })
 }
 
 fn scope_deadline_check(
@@ -9293,13 +9195,11 @@ pub(crate) fn retained_unit_introductions(
         let done = match pinned_done_units(repo, &instance.raw_hash, &instance.normalize) {
             Ok(done) => done,
             Err(error) => {
-                if error.error_code() == "KIO-E-STORE-NOT-FOUND-001"
-                    && purge_explains_missing_pinned_manifest(
-                        repo,
-                        &instance.raw_hash,
-                        instance.introductions.clone(),
-                    )?
-                {
+                if verify_objects::purge_explains_missing_retained_instance(
+                    repo,
+                    &instance.raw_hash,
+                    &instance.normalize,
+                )? {
                     continue;
                 }
                 return Err(error);
@@ -9679,13 +9579,11 @@ fn rebuild_step3_index(repo: &Repository) -> Result<Step3RebuildReport> {
                 })
                 .collect::<Result<Vec<_>>>(),
             Err(error) => {
-                if error.error_code() == "KIO-E-STORE-NOT-FOUND-001"
-                    && purge_explains_missing_pinned_manifest(
-                        repo,
-                        &retained.raw_hash,
-                        retained.introductions.clone(),
-                    )?
-                {
+                if verify_objects::purge_explains_missing_retained_instance(
+                    repo,
+                    &retained.raw_hash,
+                    &retained.normalize,
+                )? {
                     continue;
                 }
                 if !is_rebuild_skippable_unit_error(&error) {

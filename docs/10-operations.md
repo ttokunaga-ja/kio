@@ -691,35 +691,85 @@ terminal `retired` の `resurrection_commit` 検証も erased 側と同一に必
 (erased 開始の文法は receipt 専用)。検証失敗の marker は説明能力を持たず corruption とする —
 偽 `in_commit` を持つ構造的に正しい tombstone が genuine missing を隠さない)。
 
+**purge が説明する利用不能な履歴の報告**: 通常の `kio repair verify-objects` は、厳密な purge / lifecycle
+検証で説明できる resurrection 前の missing normalized closure を、corruption と分離した expected
+unavailable history として報告する。JSON の `purge_explained_missing_history_count` は、この分類に該当する
+**古い reachable commit の normalize 参照ごと**に計数する (一意 object 数や欠落 unit 数ではない)。
+他に実際の finding や incomplete 状態が無ければ `status="ok"` とするが、count > 0 なら
+`external_pointers_may_be_affected=true` を維持する。`ok` は全履歴が復元可能という意味ではない。
+
+この例外には、検証済み canonical purge / lifecycle evidence と、`manifest_hash` を含む exact old
+`NormalizeRef` が必要である。cutoff は resurrection 時点ではなく、実際に検証した `purged` / `erased`
+event の `in_commit` **以前 (当該 commit を含む)**。同じ exact closure が HEAD / current に現れる、または
+purge 後の commit に現れる場合は、その closure に例外を適用しない。resurrection commit や新 generation の
+欠落も保護しない。一方、古い commit が historical tag の root であることだけでは例外から除外しない。
+manifest が存在する場合は全構造と残存する全 body を検証し、最初の missing unit で検査を打ち切って
+別の corruption を隠してはならない。genuine missing、corrupt body / manifest、未検証・不正 marker は
+引き続き finding とする。通常 verify / prune / replica / image authority はこの分類を共有する。
+purge 後の re-ingest では有効な現在の closure から replica を再構築して再び検索可能にするが、
+削除済みの古い closure は image ownership を与えない。prune 専用の検証省略で例外を実現しない。
+
 **orphan 掃除 (`--prune-orphans`)**: `kio repair verify-objects --prune-orphans` は、どの manifest
-からも参照されない orphan prepared / image (公開前 crash の残骸 — [05-runtime.md §3.5](05-runtime.md))
-と **descriptor の無い staging root・path と不整合な staging root (descriptor の有無を問わない)・
-terminal 化済み (done / failed permanent / abandoned / settled partial — [04-pipeline.md §5.2](04-pipeline.md)) task にのみ対応する staging root
-([03-data-model.md §2](03-data-model.md) — 帰属不明の crash 残骸、および
-[07-adapter-spec.md §8.3](07-adapter-spec.md) cleanup 失敗の残骸)** を列挙し、locked repair として削除する (確認プロンプト必須。live 参照判定は
-purge closure と同一規則)。
-ここでは**法務 purge の完結手段だけ**を扱う (purge 完了表示の注記から誘導)。
-**拒否条件 (fail-closed)**: 当該 scope に state 0/1 の外部実行 (batch_requests — request_kind 不問)・
-pending / running の task・**descriptor を持ち path と整合し、非 terminal (pending / running /
-partial / failed retryable) の task に対応する** staging (partial は**再投入可能な failed unit が
-残る場合のみ** — 全 unit terminal の settled partial ([04-pipeline.md §5.2](04-pipeline.md)) は
-07 §8.3 の cleanup 対象であり blocker にしない) ([07-adapter-spec.md §8.3](07-adapter-spec.md)
-— 進行中 task の保全。対応 task を特定できない descriptor つき root は blocker 側に倒す (fail-closed)。
-**特定不能の退出経路** (task 記録の喪失許容 — [04-pipeline.md §1](04-pipeline.md) — で blocker が恒久化しないための経路):
-(1) descriptor の (raw_hash, tool_profile_hash) 配下に**存在する全て**の normalized instance
-(全 gen — descriptor は gen を持たず世代を特定しないため) の manifest で全 unit が terminal
-(done / failed permanent) であり、**かつ同 key の state 0/1 batch_requests 行が無い**なら、
-terminal 残骸とみなし削除対象へ移す (どの世代の root かを問わず削除が安全になる条件 —
-進行中世代があれば「manifest 未 terminal」か「state 0/1 行」のどちらかが必ず塞ぐ。in-flight
-信号は喪失許容の task 記録でなく cost-ledger 側を使う)。
-(2) それ以外は、同 key の state 0/1 batch_requests 行と pending / running task の不在を lock 下で
-検証したうえ、確認プロンプト付きの locked repair として削除できる。
-descriptor の無い・path 不整合・terminal 化済み task の残骸は上記の削除対象であり blocker にしない)・未 finalize の
-manifest 進行状態・active な purge journal のいずれかが存在する間は、prune を実行せず exit 3
-(retryable) で拒否する — **manifest 未確定の正規進行中 prepared / image を orphan と誤認して削除
-しない**ため (相 3 collect の入力を消すと再課金・欠落参照になる。終端・完了後に再実行する)。拒否応答には
-blocker の種別と対象 (intent_token または 4 組キー) を含め、次操作 (`kio batch resume` /
-`kio batch abandon` / journal 回復) を提示する — terminal (state 2/3) の行は blocker にならない。
+からも参照されない orphan prepared / image (公開前 crash の残骸 — [05-runtime.md §3.5](05-runtime.md))、
+および以下の staging 残骸を列挙し、確認プロンプト付きの locked repair として削除する。
+
+- descriptor の無い staging root、または妥当な同一 scope の descriptor と path が不整合な root。
+- terminal 化済み (done / failed permanent / abandoned / settled partial —
+  [04-pipeline.md §5.2](04-pipeline.md)) task にのみ対応する staging root。
+- 下記の特定不能退出経路を満たす root、および publication の所有下になく、全 scope blocker が
+  無い abandoned normalized private directory (`.staged-<ULID>`)。
+
+これは [07-adapter-spec.md §8.3](07-adapter-spec.md) の cleanup 失敗や crash 残骸を含む手動回収経路である。
+「descriptor 無し / path 不整合」は安全性検査の免除ではない。malformed / foreign-scope descriptor、
+hardlink、symlink / Windows reparse point、不正な namespace や読み取りエラーは fail-closed で計画を拒否する。
+
+**拒否条件 (scope 全体で fail-closed)**: 当該 scope に以下のいずれかがあれば、他に削除可能な orphan が
+あっても計画全体を拒否し、prune は一切実行しない (exit 3 / retryable)。
+
+- state 0/1 の `batch_requests` 行。`request_kind` 不問で、`intent_token` が NULL の行も含む。
+- non-terminal task: pending / running / paused / failed retryable、および再投入可能な failed unit が
+  残る partial。全 unit terminal の settled partial は blocker ではない。
+- active publication journal、pending atomic publication、active purge journal。
+- normalized projection と immutable manifest / unit object の不一致など、未 finalize の publication 状態。
+
+検証済みで公開済みの manifest に retryable failed unit があること**だけ**では、未 finalize publication と
+みなさない。ただし対応する non-terminal task や in-flight request があれば上記で拒否する。
+全 manifest の prepared / image 参照 (過去世代・公開済み retryable failed manifest を含む) を保護する。
+private staged manifest の妥当な参照も今回の計画では live として保護するため、stage を削除した結果だけを
+根拠に同じ計画へ CAS 削除を追加しない。残った orphan CAS の回収には次回の新しい計画が必要である。
+拒否応答は blocker 種別・対象 (`intent_token`、NULL 時は request key、task / journal / path 等) と
+次操作 (`kio batch resume` / `kio batch abandon` / journal 回復等) を示す。state 2/3 の request は blocker ではない。
+
+**特定不能の退出経路** (task 記録の喪失許容 — [04-pipeline.md §1](04-pipeline.md)):
+妥当で path と整合する descriptor の対応 task が見つからない root には、次の両経路を残す。
+いずれも上記の全 scope blocker の不在と安全性検証が必要である。
+
+1. descriptor の (raw_hash, tool_profile_hash) 配下に normalized instance が**少なくとも一つ存在**し、
+   **存在する全 gen** の manifest の全 unit が terminal (done / failed permanent) であり、同 key の
+   state 0/1 request が無いなら terminal 残骸とする。世代がゼロのとき、この条件を空集合で成立させない。
+2. それ以外でも、lock 下で全 scope blocker の不在を検証し、ユーザーが明示確認した locked repair として
+   削除できる。task 記録の喪失を永久 blocker にせず、cost-ledger や publication の検査を省略しない。
+
+**確認から削除まで**: preview は保持した scope lock と実体に結び付いた opaque removal pin を持つ計画であり、
+表示した pathname や hash の一覧そのものは削除権限ではない。apply は lock を保持したまま、全 blocker・現在の
+live proof・現在も eligible として選択する全 pin を**最初の削除前に**再検査する。削除できるのは元の表示対象のうち現在も eligible な
+同一実体だけで、新たな orphan を追加したり、同じ名前の置換物を採用したりしない。検査・削除エラーを握り潰さない。
+複数対象の削除は一括 rollback を保証しない。途中失敗時には残存物とエラーを確認して再計画する。
+
+**crash quarantine 回復**: `.kio-cas-remove-…` / `.kio-prune-directory-…` の名前だけを信頼して削除しない。
+新しい preview で現在の scope / live proof / 実体を検証し、新たに確認した計画だけが残存 quarantine を回収できる。
+canonical 名との共存、不正な名前、置換、その他安全性を証明できない状態は拒否する。
+
+**現行の計画上限**: core `RemovalBudget` は計画全体で保持 handle / pin を 1,024、directory 深さを 32、
+捕捉する物理 file size の合計を 1 GiB に制限する (対象件数 1,024 の意味ではなく、親・子の保持分も消費する)。
+hash 検証では複数 pass で再読込するため、この値は累積 physical I/O の上限ではない。
+live proof の walk は 1,000,000 entries、verification-byte budget は計上対象 byte の合計 1 GiB を上限とする。
+後者は直接読む descriptor / projected manifest・unit / immutable manifest の byte と、正常に load した
+unit / commit / tree の canonical-size 計上分を含む。shared CAS loader の hash / 再読込を含めた累積
+physical I/O を 1 GiB に制限する保証ではない。個別 object / instance の既存上限、失敗時の読み取り上限、
+検証 pass ごとの上限は別に適用し、shallow receipt helper も上限付きの 2 pass で検査する。
+上限超過は `prune_limit` 等の明示的拒否とし、対象を黙って切り詰めたり、一部だけを承認済みにしたりしない。
+大きな残骸集合の自動分割・無制限回収は提供しない。
 
 **purge closure** は raw とその prepared / image / manifest / normalized_unit_object / chunk / embedding の
 到達 object、および current projection / view cache を含む。purge / verify の marker による dead-terminal

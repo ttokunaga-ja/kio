@@ -1457,6 +1457,8 @@ pub struct VerifyObjectsReport {
     pub repaired_commit_hash: Option<String>,
     pub dead_by_tombstone_count: u64,
     pub dead_by_erase_receipt_count: u64,
+    /// Reachable pre-resurrection normalize references with purge-explained absence.
+    pub purge_explained_missing_history_count: u64,
     pub remaining_findings: Vec<ObjectFinding>,
     pub findings_truncated: bool,
     pub external_pointers_may_be_affected: bool,
@@ -1485,6 +1487,7 @@ impl VerifyObjectsReport {
             repaired_commit_hash: None,
             dead_by_tombstone_count: 0,
             dead_by_erase_receipt_count: 0,
+            purge_explained_missing_history_count: 0,
             remaining_findings: vec![ObjectFinding {
                 kind: "object_namespace_unavailable".to_owned(),
                 object_hash: String::new(),
@@ -1875,6 +1878,7 @@ fn verify_objects_with_limits(
     }
 
     let reachable = reachable_commits(repo, &commits, &mut state)?;
+    let current_head = repo.head_commit_hash()?;
     if state.exceeded_bounds {
         return Ok(finish_limit_report(state));
     }
@@ -1913,6 +1917,14 @@ fn verify_objects_with_limits(
         }
     }
 
+    let explained_manifests = explained_historical_manifests(
+        &purge,
+        &commits,
+        &trees,
+        &reachable,
+        current_head.as_deref(),
+        &invocation_time,
+    );
     // A final shallow receipt proves that a historical tree was deliberately
     // discarded, while manifests and normalized-unit CAS objects remain.  The
     // chunk ledger is mutable operational metadata, so its introduction fields
@@ -1922,7 +1934,13 @@ fn verify_objects_with_limits(
     // chunk still has to match raw/profile/generation/unit-key/content-hash;
     // an unrelated ledger row alone cannot make it reachable.
     if !final_shallow_commits.is_empty() {
-        index_retained_manifest_units(&store, repo.kio_dir(), &mut reachable_units, &mut state)?;
+        index_retained_manifest_units(
+            &store,
+            repo.kio_dir(),
+            &explained_manifests,
+            &mut reachable_units,
+            &mut state,
+        )?;
         if state.exceeded_bounds {
             return Ok(finish_limit_report(state));
         }
@@ -1986,22 +2004,28 @@ fn verify_objects_with_limits(
                             pinned_normalized.insert(manifest_hash.clone(), instance);
                         }
                         Err(PinnedNormalizedError::Missing)
-                            if purge_explains_old_closure_gap(
-                                &purge,
-                                &entry.raw_hash,
-                                commit_hash,
-                                &commits,
-                                &trees,
-                                &reachable,
-                                &invocation_time,
+                            if explained_manifests.get(manifest_hash).is_some_and(
+                                |(raw, exact)| raw == &entry.raw_hash && exact == reference,
                             ) =>
                         {
-                            state.finding(
-                                "normalized_closure_incomplete",
-                                manifest_hash,
-                                "historical normalized closure is absent from a purge-explained pre-resurrection commit",
-                                std::slice::from_ref(commit_hash),
-                            );
+                            match validate_purge_explained_missing_closure(
+                                &store,
+                                repo.kio_dir(),
+                                &entry.raw_hash,
+                                reference,
+                                &mut state,
+                            ) {
+                                Ok(()) => state.purge_explained_missing_history_count += 1,
+                                Err(error) => state.finding(
+                                    "normalized_closure_corrupt",
+                                    manifest_hash,
+                                    &error.to_string(),
+                                    std::slice::from_ref(commit_hash),
+                                ),
+                            }
+                            if state.exceeded_bounds {
+                                return Ok(finish_limit_report(state));
+                            }
                             continue;
                         }
                         Err(error) => {
@@ -2521,6 +2545,7 @@ const MAX_MANIFEST_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
 fn index_retained_manifest_units(
     store: &ObjectStore,
     kio_dir: &Path,
+    explained: &BTreeMap<String, (String, NormalizeRef)>,
     units_by_content_hash: &mut BTreeMap<String, Vec<ValidatedNormalizedInstanceUnit>>,
     state: &mut State,
 ) -> Result<()> {
@@ -2602,6 +2627,32 @@ fn index_retained_manifest_units(
             state,
         ) {
             Ok(instance) => instance,
+            Err(PinnedNormalizedError::Missing)
+                if explained
+                    .get(&reference.manifest_hash)
+                    .is_some_and(|(raw, exact)| {
+                        raw == &manifest.raw_hash && exact == &reference
+                    }) =>
+            {
+                match validate_purge_explained_missing_closure(
+                    store,
+                    kio_dir,
+                    &manifest.raw_hash,
+                    &reference,
+                    state,
+                ) {
+                    Ok(()) => continue,
+                    Err(error) => {
+                        state.finding(
+                            "normalized_closure_corrupt",
+                            &reference.manifest_hash,
+                            &error.to_string(),
+                            &[],
+                        );
+                        continue;
+                    }
+                }
+            }
             Err(error) => {
                 state.finding(
                     "normalized_closure_corrupt",
@@ -2636,13 +2687,16 @@ fn index_retained_manifest_units(
 /// Verify the immutable closure named by one tree `NormalizeRef`. This never
 /// opens `objects/normalized_units/`: that path-named representation is a
 /// mutable current cache and cannot authenticate a historical snapshot.
-fn load_pinned_normalized_instance(
+fn read_pinned_normalized_manifest(
     store: &ObjectStore,
     kio_dir: &Path,
     raw_hash: &str,
     normalize: &NormalizeRef,
     state: &mut State,
-) -> std::result::Result<ValidatedNormalizedInstance, PinnedNormalizedError> {
+) -> std::result::Result<
+    (NormalizedInstanceManifest, NormalizedInstanceIdentity, u64),
+    PinnedNormalizedError,
+> {
     state.count_object();
     if state.exceeded_bounds {
         return Err(PinnedNormalizedError::Corrupt(
@@ -2705,6 +2759,23 @@ fn load_pinned_normalized_instance(
             "manifest identity does not match its tree normalization reference".to_owned(),
         ));
     }
+    kio_pipeline::markdownize::validate_normalized_manifest(&manifest_path, &identity, &manifest)
+        .map_err(|error| PinnedNormalizedError::Corrupt(error.to_string()))?;
+    Ok((manifest, identity, manifest_bytes.len() as u64))
+}
+
+fn load_pinned_normalized_instance(
+    store: &ObjectStore,
+    kio_dir: &Path,
+    raw_hash: &str,
+    normalize: &NormalizeRef,
+    state: &mut State,
+) -> std::result::Result<ValidatedNormalizedInstance, PinnedNormalizedError> {
+    let (manifest, identity, manifest_bytes) =
+        read_pinned_normalized_manifest(store, kio_dir, raw_hash, normalize, state)?;
+    let manifest_path = kio_dir
+        .join("objects/manifests")
+        .join(&normalize.manifest_hash);
     // Identify an actual absence before entering the shared loader so only a
     // missing historical closure, not any other loader error, can receive the
     // narrow lifecycle explanation below.
@@ -2767,8 +2838,252 @@ fn load_pinned_normalized_instance(
     Ok(ValidatedNormalizedInstance {
         manifest,
         units,
-        verified_bytes: manifest_bytes.len() as u64 + verified_unit_bytes,
+        verified_bytes: manifest_bytes + verified_unit_bytes,
     })
+}
+
+/// Validate all surviving bodies even when an earlier body was purged.
+/// Whole-manifest validation precedes the absence exception.
+fn load_surviving_normalized_units(
+    store: &ObjectStore,
+    manifest: &NormalizedInstanceManifest,
+    state: &mut State,
+) -> std::result::Result<
+    (Vec<kio_pipeline::markdownize::NormalizedUnitObject>, bool),
+    PinnedNormalizedError,
+> {
+    let identity = NormalizedInstanceIdentity {
+        raw_hash: manifest.raw_hash.clone(),
+        tool_profile_hash: manifest.tool_profile_hash.clone(),
+        r#gen: manifest.r#gen,
+    };
+    kio_pipeline::markdownize::validate_normalized_manifest(
+        "historical manifest",
+        &identity,
+        manifest,
+    )
+    .map_err(|error| PinnedNormalizedError::Corrupt(error.to_string()))?;
+    let mut single = manifest.clone();
+    single.units.clear();
+    let mut units = Vec::new();
+    let mut missing = false;
+    for entry in manifest
+        .units
+        .iter()
+        .filter(|entry| entry.status == UnitStatus::Done)
+    {
+        state.count_object();
+        if state.exceeded_bounds {
+            return Err(PinnedNormalizedError::Corrupt(
+                "historical closure verification bound exceeded".into(),
+            ));
+        }
+        let hash = entry
+            .unit_object_hash
+            .as_deref()
+            .expect("validated manifest pin");
+        match store.inspect_content_accounted(ContentObjectKind::NormalizedUnit, hash) {
+            Ok(metadata) => state.add_bytes(metadata.size_bytes),
+            Err(error) => {
+                state.add_bytes(error.consumed_bytes);
+                if is_store_not_found(&error.error) {
+                    missing = true;
+                    continue;
+                }
+                return Err(PinnedNormalizedError::Corrupt(error.error.to_string()));
+            }
+        }
+        if state.exceeded_bounds {
+            return Err(PinnedNormalizedError::Corrupt(
+                "historical closure verification bound exceeded".into(),
+            ));
+        }
+        single.units.clear();
+        single.units.push(entry.clone());
+        let loaded = load_validated_normalized_units_from_manifest(store, &single)
+            .map_err(|error| PinnedNormalizedError::Corrupt(error.to_string()))?;
+        for unit in &loaded {
+            let bytes = canonical_json_bytes(
+                &serde_json::to_value(unit)
+                    .map_err(|error| PinnedNormalizedError::Corrupt(error.to_string()))?,
+            )
+            .map_err(|error| PinnedNormalizedError::Corrupt(error.to_string()))?;
+            state.add_bytes((bytes.len() as u64).saturating_mul(2));
+        }
+        if state.exceeded_bounds {
+            return Err(PinnedNormalizedError::Corrupt(
+                "historical closure verification bound exceeded".into(),
+            ));
+        }
+        units.extend(loaded);
+    }
+    Ok((units, missing))
+}
+
+fn validate_purge_explained_missing_closure(
+    store: &ObjectStore,
+    kio_dir: &Path,
+    raw_hash: &str,
+    normalize: &NormalizeRef,
+    state: &mut State,
+) -> std::result::Result<(), PinnedNormalizedError> {
+    let (manifest, _, _) =
+        match read_pinned_normalized_manifest(store, kio_dir, raw_hash, normalize, state) {
+            Ok(value) => value,
+            Err(PinnedNormalizedError::Missing) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+    let (_, missing) = load_surviving_normalized_units(store, &manifest, state)?;
+    if !missing {
+        return Err(PinnedNormalizedError::Corrupt(
+            "historical closure changed during verification".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Only exact closures whose every visible appearance predates the explaining
+/// purge can borrow its absence authority. Generation numbers may be reused.
+fn explained_historical_manifests(
+    purge: &PurgeState,
+    commits: &BTreeMap<String, CommitObject>,
+    trees: &BTreeMap<String, TreeObject>,
+    reachable: &BTreeSet<String>,
+    head: Option<&str>,
+    now: &str,
+) -> BTreeMap<String, (String, NormalizeRef)> {
+    let mut eligible = BTreeMap::new();
+    let mut rejected = BTreeSet::new();
+    for hash in reachable {
+        let Some(tree) = commits.get(hash).and_then(|commit| trees.get(&commit.tree)) else {
+            continue;
+        };
+        for entry in &tree.entries {
+            let Some(reference) = &entry.normalize else {
+                continue;
+            };
+            let key = &reference.manifest_hash;
+            let same_identity =
+                eligible
+                    .get(key)
+                    .is_none_or(|(raw, previous): &(String, NormalizeRef)| {
+                        raw == &entry.raw_hash && previous == reference
+                    });
+            if head == Some(hash.as_str())
+                || !same_identity
+                || !purge_explains_old_closure_gap(
+                    purge,
+                    &entry.raw_hash,
+                    hash,
+                    commits,
+                    trees,
+                    reachable,
+                    now,
+                )
+            {
+                rejected.insert(key.clone());
+                eligible.remove(key);
+            } else if !rejected.contains(key) {
+                eligible.insert(key.clone(), (entry.raw_hash.clone(), reference.clone()));
+            }
+        }
+    }
+    eligible
+}
+
+/// Read-only missing-closure classification shared by replica materialization.
+/// A successful exception grants no image/unit ownership from the omitted closure.
+pub(super) fn purge_explains_missing_retained_instance(
+    repo: &Repository,
+    raw_hash: &str,
+    normalize: &NormalizeRef,
+) -> Result<bool> {
+    let session = GcSweepSession::bind_repository(repo)?;
+    let directory = kio_core::store_dir::StoreDirectory::from_retained(
+        session.retained_kio_handle()?,
+        repo.kio_dir().to_path_buf(),
+    )?;
+    let purge = PurgeState::from_directory(directory);
+    if purge.barrier_blocks(raw_hash)? {
+        return Ok(false);
+    }
+    let shallow = session.validated_final_shallow_receipts()?;
+    let store = repo.object_store();
+    let mut state = State::default();
+    let mut commits = BTreeMap::new();
+    let mut trees = BTreeMap::new();
+    let mut reachable = BTreeSet::new();
+    let mut queue: VecDeque<_> = repo.current_ref_targets()?.into_iter().collect();
+    while let Some(hash) = queue.pop_front() {
+        if !reachable.insert(hash.clone()) {
+            continue;
+        }
+        state.count_object();
+        let commit = repo.read_commit(&hash)?;
+        state.add_bytes(
+            canonical_json_bytes(
+                &serde_json::to_value(&commit)
+                    .map_err(|error| KioError::schema(error.to_string()))?,
+            )?
+            .len() as u64,
+        );
+        queue.extend(commit.parent.iter().cloned());
+        match repo.read_tree(&commit.tree) {
+            Ok(tree) => {
+                if shallow.contains_key(&hash) {
+                    return Err(KioError::schema("shallow receipt coexists with tree"));
+                }
+                state.add_bytes(
+                    canonical_json_bytes(
+                        &serde_json::to_value(&tree)
+                            .map_err(|error| KioError::schema(error.to_string()))?,
+                    )?
+                    .len() as u64,
+                );
+                trees.insert(commit.tree.clone(), tree);
+            }
+            Err(error)
+                if is_store_not_found(&error) && shallow.get(&hash) == Some(&commit.tree) => {}
+            Err(error) => return Err(error),
+        }
+        commits.insert(hash, commit);
+        if state.exceeded_bounds {
+            return Err(KioError::schema(
+                "historical authority verification bound exceeded",
+            ));
+        }
+    }
+    let authority = explained_historical_manifests(
+        &purge,
+        &commits,
+        &trees,
+        &reachable,
+        repo.head_commit_hash()?.as_deref(),
+        &now_utc_seconds(),
+    );
+    if !authority
+        .get(&normalize.manifest_hash)
+        .is_some_and(|(raw, reference)| raw == raw_hash && reference == normalize)
+    {
+        return Ok(false);
+    }
+    let missing = match read_pinned_normalized_manifest(
+        &store,
+        repo.kio_dir(),
+        raw_hash,
+        normalize,
+        &mut state,
+    ) {
+        Err(PinnedNormalizedError::Missing) => true,
+        Err(error) => return Err(KioError::schema(error.to_string())),
+        Ok((manifest, _, _)) => {
+            load_surviving_normalized_units(&store, &manifest, &mut state)
+                .map_err(|error| KioError::schema(error.to_string()))?
+                .1
+        }
+    };
+    session.assert_public_identity()?;
+    Ok(missing)
 }
 
 /// A retired marker proves that the closure which existed before its verified
@@ -2796,7 +3111,12 @@ fn purge_explains_old_closure_gap(
     let Some(resurrection) = canonical.event.resurrection_commit.as_deref() else {
         return false;
     };
-    commit_hash == resurrection || is_ancestor(commits, commit_hash, resurrection)
+    if commit_hash == resurrection || !is_ancestor(commits, commit_hash, resurrection) {
+        return false;
+    }
+    lookup
+        .explaining_purge_commit
+        .is_some_and(|cutoff| commit_hash == cutoff || is_ancestor(commits, commit_hash, &cutoff))
 }
 
 /// PB01 (§A, 10 §7.5.1 L489 → 03 §8.1): `objects/embeddings/` CAS objects.
@@ -3043,9 +3363,11 @@ fn finish_report(
         repaired_commit_hash,
         dead_by_tombstone_count: state.dead_by_tombstone_count,
         dead_by_erase_receipt_count: state.dead_by_erase_receipt_count,
+        purge_explained_missing_history_count: state.purge_explained_missing_history_count,
         remaining_findings: state.findings,
         findings_truncated: state.findings_truncated,
-        external_pointers_may_be_affected: has_findings,
+        external_pointers_may_be_affected: has_findings
+            || state.purge_explained_missing_history_count > 0,
         verified_bytes: state.verified_bytes,
         inventoried_objects: state.inventoried_objects,
     }
@@ -3067,6 +3389,7 @@ struct State {
     visited_entries: usize,
     dead_by_tombstone_count: u64,
     dead_by_erase_receipt_count: u64,
+    purge_explained_missing_history_count: u64,
     max_objects: usize,
     max_verified_bytes: u64,
     remaining_affected_commits: usize,
@@ -3085,6 +3408,7 @@ impl Default for State {
             visited_entries: 0,
             dead_by_tombstone_count: 0,
             dead_by_erase_receipt_count: 0,
+            purge_explained_missing_history_count: 0,
             max_objects: MAX_OBJECTS,
             max_verified_bytes: MAX_VERIFIED_BYTES,
             remaining_affected_commits: MAX_AFFECTED_COMMITS,
@@ -3591,326 +3915,10 @@ fn commit_roots(repo: &Repository, state: &mut State) -> Result<BTreeSet<String>
 // §E, U43, 10-operations.md §7.5.1 L586-626).
 // ===========================================================================
 
-#[derive(Debug, Default, Serialize)]
-pub struct PruneOrphansReport {
-    /// `"pruned"` or `"blocked"` (PB15 fail-closed refusal).
-    pub status: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub blocked_by: Option<String>,
-    pub pruned_prepared_count: u64,
-    pub pruned_image_count: u64,
-    pub pruned_open_cache_count: u64,
-}
-
-/// H2-4 (R24b, 3/3 系統一致・うち 2 件 fatal): the exact set a prune will
-/// delete.
-///
-/// The confirmation prompt 06 §1 requires is only meaningful if the set the
-/// user approves is the set that gets deleted. Previously `prune_orphans` was
-/// called twice — once to count, once to delete — and re-derived the targets
-/// each time, so anything that became an orphan in between was deleted without
-/// ever having been shown. This type is the binding: [`prune_orphans_plan`]
-/// computes it, the prompt enumerates it, and [`prune_orphans_apply`] deletes
-/// nothing that is not in it.
-#[derive(Debug, Default)]
-pub struct PruneOrphansPlan {
-    pub status: String,
-    pub blocked_by: Option<String>,
-    pub prepared: Vec<String>,
-    pub images: Vec<String>,
-    pub cache_dirs: Vec<PathBuf>,
-}
-
-impl PruneOrphansPlan {
-    fn blocked(reason: &str) -> Self {
-        Self {
-            status: "blocked".to_owned(),
-            blocked_by: Some(reason.to_owned()),
-            ..Default::default()
-        }
-    }
-
-    #[must_use]
-    pub fn is_blocked(&self) -> bool {
-        self.status == "blocked"
-    }
-
-    /// The targets as `(kind, label)` pairs, for the confirmation prompt's
-    /// enumeration (06 §1: 削除対象を先に列挙して見せてから問う).
-    #[must_use]
-    pub fn target_lines(&self) -> Vec<String> {
-        let mut lines = Vec::new();
-        for hash in &self.prepared {
-            lines.push(format!("prepared  {hash}"));
-        }
-        for hash in &self.images {
-            lines.push(format!("image     {hash}"));
-        }
-        for dir in &self.cache_dirs {
-            lines.push(format!("cache     {}", dir.display()));
-        }
-        lines
-    }
-
-    fn to_blocked_report(&self) -> PruneOrphansReport {
-        PruneOrphansReport {
-            status: self.status.clone(),
-            blocked_by: self.blocked_by.clone(),
-            ..Default::default()
-        }
-    }
-}
-
-/// Delete exactly what [`prune_orphans_plan`] listed — never a re-derived set.
-///
-/// The counts report what was actually removed, which can be lower than the
-/// plan's if something disappeared in between (another process, a concurrent
-/// `gc`). Lower is safe; the invariant that matters is that nothing OUTSIDE
-/// the plan is touched.
-pub fn prune_orphans_apply(
-    repo: &Repository,
-    plan: &PruneOrphansPlan,
-) -> Result<PruneOrphansReport> {
-    if plan.is_blocked() {
-        return Ok(plan.to_blocked_report());
-    }
-    let store = ObjectStore::new(repo.kio_dir());
-    let mut pruned_prepared = 0u64;
-    for hash in &plan.prepared {
-        if store
-            .remove_content(ContentObjectKind::Prepared, hash)
-            .unwrap_or(false)
-        {
-            pruned_prepared += 1;
-        }
-    }
-    let mut pruned_images = 0u64;
-    for hash in &plan.images {
-        if store
-            .remove_content(ContentObjectKind::Image, hash)
-            .unwrap_or(false)
-        {
-            pruned_images += 1;
-        }
-    }
-    let mut pruned_cache = 0u64;
-    for dir in &plan.cache_dirs {
-        if dir.exists() && fs::remove_dir_all(dir).is_ok() {
-            pruned_cache += 1;
-        }
-    }
-    Ok(PruneOrphansReport {
-        status: "pruned".to_owned(),
-        blocked_by: None,
-        pruned_prepared_count: pruned_prepared,
-        pruned_image_count: pruned_images,
-        pruned_open_cache_count: pruned_cache,
-    })
-}
-
-/// PB12-17 (§E): `kio repair verify-objects --prune-orphans`.
-///
-/// **Implemented this session**: PB13 (orphan prepared/image — referenced by
-/// no live manifest across the FULL reachable commit history, not just HEAD),
-/// two of PB15's four fail-closed blocker conditions (active purge journal;
-/// pending/running task), and PB17 (open-cache residue for canonically
-/// `purged`/`erased` raw_hashes, image cache included and type-separated per
-/// `open/image/<digest64>/`).
-///
-/// **NOT implemented this session — documented gap, not a silent omission**:
-/// PB14/16 (staging-root descriptor 3-way classification and the terminal-
-/// task escape hatch — depends on staging-root/task-descriptor internals this
-/// session did not have scope to research safely) and the remaining two of
-/// PB15's four blockers (state 0/1 `batch_requests` rows, which need
-/// cost-ledger.sqlite schema this module does not touch; unfinalized-manifest
-/// progress, which needs the `normalize.manifest_hash` prerequisite §B defers
-/// this session). Callers must NOT treat this function's `"pruned"` status as
-/// a complete PB15 fail-closed guarantee — it is a conservative subset that
-/// only ever deletes strictly-unreferenced prepared/image/cache objects, never
-/// a false-positive orphan, but it can still run while one of the two
-/// unimplemented blocker conditions is true.
-/// This computes the deletion set; it removes nothing. [`prune_orphans_apply`]
-/// does the removing, and only of what this returned — see [`PruneOrphansPlan`]
-/// for why the two are split (H2-4).
-pub fn prune_orphans_plan(repo: &Repository) -> Result<PruneOrphansPlan> {
-    let purge = PurgeState::open(repo.kio_dir())?;
-    if purge.read_journal()?.is_some() {
-        return Ok(PruneOrphansPlan::blocked("active_purge_journal"));
-    }
-    let tasks = kio_pipeline::task::TaskStore::new(repo.kio_dir())
-        .all()
-        .map_err(pipeline_to_kio)?;
-    if tasks.iter().any(|task| {
-        matches!(
-            task.status,
-            kio_pipeline::task::TaskStatus::Pending | kio_pipeline::task::TaskStatus::Running
-        )
-    }) {
-        return Ok(PruneOrphansPlan::blocked("non_terminal_task"));
-    }
-
-    let invocation_time = now_utc_seconds();
-    let mut root_state = State::default();
-    let roots = commit_roots(repo, &mut root_state)?;
-    if root_state.exceeded_bounds || !root_state.findings.is_empty() {
-        // A ref/inventory anomaly means the live set below cannot be trusted
-        // — refuse to prune rather than risk deleting something still live.
-        return Ok(PruneOrphansPlan::blocked("ref_inventory_unsafe"));
-    }
-    let mut commits = BTreeMap::<String, CommitObject>::new();
-    let mut trees = BTreeMap::<String, TreeObject>::new();
-    let mut reachable = BTreeSet::<String>::new();
-    let mut queue: VecDeque<String> = roots.into_iter().collect();
-    while let Some(hash) = queue.pop_front() {
-        if !reachable.insert(hash.clone()) {
-            continue;
-        }
-        let commit = repo.read_commit(&hash)?;
-        queue.extend(commit.parent.iter().cloned());
-        if let Ok(tree) = repo.read_tree(&commit.tree) {
-            trees.insert(commit.tree.clone(), tree);
-        }
-        commits.insert(hash, commit);
-    }
-
-    let mut live_prepared = BTreeSet::<String>::new();
-    let mut live_images = BTreeSet::<String>::new();
-    for commit_hash in &reachable {
-        let Some(commit) = commits.get(commit_hash) else {
-            continue;
-        };
-        let Some(tree) = trees.get(&commit.tree) else {
-            continue;
-        };
-        for entry in &tree.entries {
-            let Some(normalize) = &entry.normalize else {
-                continue;
-            };
-            let Ok(instance) = load_validated_normalized_instance(
-                repo.kio_dir(),
-                &entry.raw_hash,
-                &normalize.tool_profile_hash,
-                normalize.r#gen,
-            ) else {
-                // A missing/corrupt normalized instance is fsck's concern
-                // (`kio repair verify-objects` without `--prune-orphans`);
-                // prune-orphans conservatively treats it as "cannot prove
-                // orphan-ness" rather than compounding a corruption finding
-                // with a deletion.
-                continue;
-            };
-            for unit_manifest in &instance.manifest.units {
-                live_prepared.insert(unit_manifest.prepared_hash.clone());
-            }
-            for unit in &instance.units {
-                live_images.extend(unit.owned_image_hashes.iter().cloned());
-            }
-        }
-    }
-
-    let mut prepared_targets = Vec::new();
-    for hash in inventory_content_dir(repo.kio_dir(), ContentObjectKind::Prepared)? {
-        if !live_prepared.contains(&hash) {
-            prepared_targets.push(hash);
-        }
-    }
-    let mut image_targets = Vec::new();
-    for hash in inventory_content_dir(repo.kio_dir(), ContentObjectKind::Image)? {
-        if !live_images.contains(&hash) {
-            image_targets.push(hash);
-        }
-    }
-
-    // PB17: open-cache residue for raw_hashes whose canonical final event is
-    // `purged`/`erased` (the publish-then-check crash window, 05 §4.2), plus
-    // any image cache entry no live manifest references (mirrors the
-    // prepared/image CAS orphan judgment above; the raw/image cache-type
-    // separation itself is C-territory, out of this contract's scope — PB17
-    // only fixes that `--prune-orphans` triggers the cleanup).
-    let mut cache_targets: Vec<PathBuf> = Vec::new();
-    let mut marker_state = State::default();
-    let tombstone_hashes = marker_inventory(repo.kio_dir(), "tombstones", &mut marker_state)?;
-    let receipt_hashes =
-        marker_inventory(repo.kio_dir(), "purge/erase-receipts", &mut marker_state)?;
-    for raw_hash in tombstone_hashes.union(&receipt_hashes) {
-        let lookup = canonical_lookup(
-            &purge,
-            raw_hash,
-            &commits,
-            &trees,
-            &reachable,
-            &invocation_time,
-        );
-        let retired = matches!(
-            lookup.canonical.map(|canonical| canonical.event.kind),
-            Some(EventKind::Purged) | Some(EventKind::Erased)
-        );
-        if !retired {
-            continue;
-        }
-        if let Ok(digest) = kio_core::cas::hash_path_component(raw_hash) {
-            let cache_dir = crate::cache_home().join("kio/open").join(digest);
-            if cache_dir.exists() {
-                cache_targets.push(cache_dir);
-            }
-        }
-    }
-    let image_cache_root = crate::cache_home().join("kio/open/image");
-    if let Ok(entries) = fs::read_dir(&image_cache_root) {
-        for entry in entries.flatten() {
-            let leaf = entry.file_name().to_string_lossy().into_owned();
-            let candidate_hash = format!("sha256:{leaf}");
-            if is_hash(&candidate_hash) && !live_images.contains(&candidate_hash) {
-                cache_targets.push(entry.path());
-            }
-        }
-    }
-
-    Ok(PruneOrphansPlan {
-        status: "pruned".to_owned(),
-        blocked_by: None,
-        prepared: prepared_targets,
-        images: image_targets,
-        cache_dirs: cache_targets,
-    })
-}
-
-/// Non-recursive fan-out inventory of one `ContentObjectKind` directory —
-/// lighter-weight than `inventory()` (no byte/object bounds accounting,
-/// `--prune-orphans` is an explicit maintenance operation, not the routine
-/// fsck hot path).
-fn inventory_content_dir(kio_dir: &Path, kind: ContentObjectKind) -> Result<BTreeSet<String>> {
-    let base = kio_dir.join("objects").join(kind.directory());
-    let mut hashes = BTreeSet::new();
-    if !base.exists() {
-        return Ok(hashes);
-    }
-    let mut stack = vec![base];
-    while let Some(directory) = stack.pop() {
-        for entry in fs::read_dir(&directory)
-            .map_err(|error| KioError::io(error.to_string(), directory.display().to_string()))?
-        {
-            let entry = entry.map_err(|error| {
-                KioError::io(error.to_string(), directory.display().to_string())
-            })?;
-            let path = entry.path();
-            let file_type = entry
-                .file_type()
-                .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-            if file_type.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            let leaf = entry.file_name().to_string_lossy().into_owned();
-            let digest = leaf.strip_prefix("sha256:").unwrap_or(&leaf);
-            let hash = format!("sha256:{digest}");
-            if is_hash(&hash) {
-                hashes.insert(hash);
-            }
-        }
-    }
-    Ok(hashes)
-}
+mod prune_orphans;
+#[cfg(test)]
+use prune_orphans::PruneOrphansPlan;
+pub use prune_orphans::{prune_orphans_apply, prune_orphans_plan, prune_orphans_preflight};
 
 // ===========================================================================
 // `kio repair registry-prune` (step4b-contract-tests-p2b.md §H, U46,
@@ -3992,6 +4000,7 @@ pub fn registry_prune_apply(plan: &RegistryPrunePlan) -> Result<RegistryPruneRep
 /// caller can still surface a `*_corrupt` finding for it (LC21: fsck and the
 /// resolver never disagree about which markers explain state).
 struct CanonicalLookup {
+    explaining_purge_commit: Option<String>,
     canonical: Option<CanonicalFinalEvent>,
     tombstone_error: Option<String>,
     receipt_error: Option<String>,
@@ -4006,6 +4015,7 @@ fn canonical_lookup(
     invocation_time: &str,
 ) -> CanonicalLookup {
     let mut tombstone_tail = None;
+    let mut tombstone_purge = None;
     let mut tombstone_error = None;
     match purge.read_tombstone(raw_hash) {
         Ok(Some(record)) => {
@@ -4017,7 +4027,15 @@ fn canonical_lookup(
                 reachable,
                 invocation_time,
             ) {
-                Ok(()) => tombstone_tail = Some(record.tail().clone()),
+                Ok(()) => {
+                    tombstone_tail = Some(record.tail().clone());
+                    tombstone_purge = record
+                        .events
+                        .iter()
+                        .rev()
+                        .find(|event| matches!(event.kind, EventKind::Purged | EventKind::Erased))
+                        .map(|event| event.in_commit.clone());
+                }
                 Err(reason) => tombstone_error = Some(reason),
             }
         }
@@ -4025,6 +4043,7 @@ fn canonical_lookup(
         Err(error) => tombstone_error = Some(error.to_string()),
     }
     let mut receipt_tail = None;
+    let mut receipt_purge = None;
     let mut receipt_error = None;
     match purge.read_erase_receipt(raw_hash) {
         Ok(Some(receipt)) => {
@@ -4036,7 +4055,15 @@ fn canonical_lookup(
                 reachable,
                 invocation_time,
             ) {
-                Ok(()) => receipt_tail = Some(receipt.tail().clone()),
+                Ok(()) => {
+                    receipt_tail = Some(receipt.tail().clone());
+                    receipt_purge = receipt
+                        .events
+                        .iter()
+                        .rev()
+                        .find(|event| matches!(event.kind, EventKind::Purged | EventKind::Erased))
+                        .map(|event| event.in_commit.clone());
+                }
                 Err(reason) => receipt_error = Some(reason),
             }
         }
@@ -4058,7 +4085,14 @@ fn canonical_lookup(
             None
         }
     };
+    let explaining_purge_commit = canonical
+        .as_ref()
+        .and_then(|value| match value.marker_kind {
+            TombstoneMode::Default => tombstone_purge,
+            TombstoneMode::Erase => receipt_purge,
+        });
     CanonicalLookup {
+        explaining_purge_commit,
         canonical,
         tombstone_error,
         receipt_error,
@@ -4875,6 +4909,122 @@ mod tests {
     }
 
     #[test]
+    fn historical_absence_authority_requires_exact_all_appearance_purge_cutoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let purge = PurgeState::open(dir.path()).unwrap();
+        let raw = hash('1');
+        let old = hash('2');
+        let purged = hash('3');
+        let gap = hash('4');
+        let resurrected = hash('5');
+        let old_tree = hash('6');
+        let new_tree = hash('7');
+        let empty_tree = hash('8');
+        let reference = NormalizeRef {
+            tool_profile_hash: hash('a'),
+            r#gen: 0,
+            manifest_hash: hash('b'),
+        };
+        let mut newer = reference.clone();
+        newer.manifest_hash = hash('c');
+        let tree = |reference: NormalizeRef| {
+            let mut entry = TreeEntry::raw_file("doc.md", raw.clone()).unwrap();
+            entry.normalize = Some(reference);
+            TreeObject {
+                object_type: "tree".into(),
+                chunking_config_hash: hash('d'),
+                entries: vec![entry],
+            }
+        };
+        let mut purge_commit = purged_commit("2026-07-13T00:00:01Z", vec![raw.clone()]);
+        purge_commit.parent = Some(old.clone());
+        purge_commit.tree = empty_tree.clone();
+        let commits = BTreeMap::from([
+            (
+                old.clone(),
+                commit_with_tree(CommitType::Manual, "2026-07-13T00:00:00Z", &old_tree, None),
+            ),
+            (purged.clone(), purge_commit),
+            (
+                gap.clone(),
+                commit_with_tree(
+                    CommitType::Manual,
+                    "2026-07-13T00:00:02Z",
+                    &empty_tree,
+                    Some(purged.clone()),
+                ),
+            ),
+            (
+                resurrected.clone(),
+                commit_with_tree(
+                    CommitType::Manual,
+                    "2026-07-13T00:00:03Z",
+                    &new_tree,
+                    Some(gap.clone()),
+                ),
+            ),
+        ]);
+        let reachable: BTreeSet<_> = commits.keys().cloned().collect();
+        let mut trees = BTreeMap::from([
+            (old_tree.clone(), tree(reference.clone())),
+            (new_tree.clone(), tree(newer)),
+        ]);
+        purge
+            .append_tombstone_event(&raw, purged_event(&purged, "2026-07-13T00:00:01Z"))
+            .unwrap();
+        purge
+            .retire_tombstone(&raw, &resurrected, "2026-07-13T00:00:03Z", "user")
+            .unwrap();
+        let classify =
+            |commits: &BTreeMap<_, _>, trees: &BTreeMap<_, _>, reachable: &BTreeSet<_>, head| {
+                explained_historical_manifests(
+                    &purge,
+                    commits,
+                    trees,
+                    reachable,
+                    head,
+                    "2026-07-14T00:00:00Z",
+                )
+            };
+        assert!(
+            classify(&commits, &trees, &reachable, Some(&resurrected))
+                .contains_key(&reference.manifest_hash),
+            "same generation with different manifest is not the old closure"
+        );
+        assert!(
+            !classify(&commits, &trees, &reachable, Some(&old))
+                .contains_key(&reference.manifest_hash),
+            "HEAD cannot borrow historical absence"
+        );
+        trees.insert(new_tree.clone(), tree(reference.clone()));
+        assert!(
+            !classify(&commits, &trees, &reachable, Some(&resurrected))
+                .contains_key(&reference.manifest_hash),
+            "current exact reuse disqualifies old appearances"
+        );
+        trees.remove(&new_tree);
+        let mut gap_commits = commits.clone();
+        gap_commits.get_mut(&gap).unwrap().tree = old_tree;
+        assert!(
+            !classify(&gap_commits, &trees, &reachable, Some(&resurrected))
+                .contains_key(&reference.manifest_hash),
+            "post-purge pre-resurrection appearance is not explained"
+        );
+        let mut unreachable = reachable.clone();
+        unreachable.remove(&purged);
+        assert!(
+            classify(&commits, &trees, &unreachable, Some(&resurrected)).is_empty(),
+            "unreachable lifecycle cannot authorize absence"
+        );
+        let mut malformed = commits.clone();
+        malformed.get_mut(&purged).unwrap().purged_raws.clear();
+        assert!(
+            classify(&malformed, &trees, &reachable, Some(&resurrected)).is_empty(),
+            "mismatched lifecycle binding cannot authorize absence"
+        );
+    }
+
+    #[test]
     fn byte_and_object_bounds_are_global_and_exact() {
         let mut state = State {
             max_objects: 2,
@@ -5109,6 +5259,14 @@ mod tests {
     /// removed, so `apply` now takes the plan and touches nothing else.
     #[test]
     fn apply_removes_only_what_the_plan_listed() {
+        let _environment = kio_core::test_control::test_env_lock().lock().unwrap();
+        let device = tempfile::tempdir().unwrap();
+        let _data =
+            kio_core::test_control::TestEnvGuard::set("XDG_DATA_HOME", device.path().join("data"));
+        let _cache = kio_core::test_control::TestEnvGuard::set(
+            "XDG_CACHE_HOME",
+            device.path().join("cache"),
+        );
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
         repo.snapshot(Some("fixture"), Some("2026-07-13T00:00:00Z"))
@@ -5131,7 +5289,7 @@ mod tests {
             .write_content_object(ContentObjectKind::Prepared, b"appeared after the prompt")
             .unwrap();
 
-        let report = prune_orphans_apply(&repo, &plan).unwrap();
+        let report = prune_orphans_apply(&repo, plan).unwrap();
         assert_eq!(report.status, "pruned");
         assert!(
             store
@@ -5161,8 +5319,8 @@ mod tests {
             .write_content_object(ContentObjectKind::Prepared, b"orphan")
             .unwrap();
 
-        let blocked = PruneOrphansPlan::blocked("active_purge_journal");
-        let report = prune_orphans_apply(&repo, &blocked).unwrap();
+        let blocked = PruneOrphansPlan::blocked_for_test("active_purge_journal");
+        let report = prune_orphans_apply(&repo, blocked).unwrap();
         assert_eq!(report.status, "blocked");
         assert_eq!(report.blocked_by.as_deref(), Some("active_purge_journal"));
         assert_eq!(report.pruned_prepared_count, 0);

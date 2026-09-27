@@ -1453,9 +1453,7 @@ fn pb09_canonical_ref_names_correspondence_is_asymmetric() {
 }
 
 // ===========================================================================
-// §E — `--prune-orphans` (U43). PB14/16/17 and two of PB15's four blockers
-// are NOT implemented this session (see `prune_orphans`'s doc comment in
-// src/verify_objects.rs) — not tested here.
+// §E — `--prune-orphans` (U43): confirmed cleanup and progress barriers.
 // ===========================================================================
 
 /// PB12: `repair` accepts exactly one of `--rebuild-db`/`--verify-objects`/
@@ -1580,7 +1578,7 @@ fn pb13_prune_orphans_deletes_unreferenced_prepared_and_image() {
 fn pb15_prune_orphans_blocked_by_active_purge_journal() {
     let (dir, pointer, _) = fixture();
     let raw_hash = pointer["raw_hash"].as_str().unwrap().to_owned();
-    write_content_bytes(
+    let orphan_hash = write_content_bytes(
         &kio_dir(&dir),
         ContentObjectKind::Prepared.directory(),
         b"orphan that must survive because the journal blocks pruning",
@@ -1604,17 +1602,831 @@ fn pb15_prune_orphans_blocked_by_active_purge_journal() {
         &dir,
         &["repair", "verify-objects", "--prune-orphans", "--yes"],
     );
-    // The underlying verify pass itself reports the active journal as a
-    // `purge_incomplete` finding (exit 3) before prune-orphans would even run.
+    // Prune preflight reports progress before the ordinary verification pass.
     assert_eq!(code, 3, "{output}");
-    assert!(
-        output["remaining_findings"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|finding| finding["kind"] == "purge_incomplete")
+    assert_eq!(
+        output["prune_orphans"]["blocked_by"],
+        "active_purge_journal"
     );
-    assert!(output.get("prune_orphans").is_none(), "{output}");
+    assert_prune_blocker(&output, "active_purge_journal");
+    assert!(
+        ObjectStore::new(kio_dir(&dir))
+            .inspect_content_accounted(ContentObjectKind::Prepared, &orphan_hash)
+            .is_ok()
+    );
+}
+
+fn prune_fixture() -> (TempDir, PathBuf, Vec<u8>) {
+    let (dir, ..) = fixture();
+    let bytes = b"PB15 orphan must survive every unresolved authority".to_vec();
+    let hash = write_content_bytes(
+        &kio_dir(&dir),
+        ContentObjectKind::Prepared.directory(),
+        &bytes,
+    );
+    let path = ObjectStore::new(kio_dir(&dir))
+        .content_path(ContentObjectKind::Prepared, &hash)
+        .unwrap();
+    (dir, path, bytes)
+}
+
+fn prune_normalize(dir: &TempDir) -> (String, NormalizeRef) {
+    let repo = Repository::open(dir.path()).unwrap();
+    let commit = repo
+        .read_commit(&repo.head_commit_hash().unwrap().unwrap())
+        .unwrap();
+    let entry = repo.read_tree(&commit.tree).unwrap().entries.remove(0);
+    (entry.raw_hash, entry.normalize.unwrap())
+}
+
+fn prune_staging(dir: &TempDir, raw: &str, tool: &str, descriptor: bool) -> PathBuf {
+    let scope = Repository::open(dir.path())
+        .unwrap()
+        .scope_identity()
+        .unwrap()
+        .scope_id;
+    let root = kio_dir(dir).join("staging").join(format!(
+        "{}.{}.markdownize",
+        raw.trim_start_matches("sha256:"),
+        tool.trim_start_matches("sha256:")
+    ));
+    fs::create_dir_all(&root).unwrap();
+    if descriptor {
+        let value = serde_json::json!({"scope_id":scope,"raw_hash":raw,"tool_profile_hash":tool,"adapter_kind":"markdownize"});
+        fs::write(
+            root.join("descriptor.json"),
+            serde_jcs::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+    }
+    fs::write(root.join("payload.part"), b"unpublished staging payload").unwrap();
+    root
+}
+
+fn assert_prune_blocker(output: &Value, kind: &str) {
+    let blockers = output["prune_orphans"]["blockers"]
+        .as_array()
+        .expect("blocked prune must explain targets and recovery");
+    let blocker = blockers
+        .iter()
+        .find(|entry| entry["kind"] == kind)
+        .unwrap_or_else(|| panic!("missing {kind}: {output}"));
+    assert!(
+        blocker["target"].as_str().is_some_and(|s| !s.is_empty()),
+        "{output}"
+    );
+    assert!(
+        blocker["next_action"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()),
+        "{output}"
+    );
+}
+
+#[test]
+fn pb15_all_inflight_request_kinds_and_null_intents_block_without_deletion() {
+    for (state, kind, intent) in [
+        (0, "batch", Some("pb15-batch")),
+        (1, "batch", None),
+        (0, "sync", None),
+        (1, "sync", Some("pb15-sync")),
+    ] {
+        let (dir, orphan, bytes) = prune_fixture();
+        let scope = Repository::open(dir.path())
+            .unwrap()
+            .scope_identity()
+            .unwrap()
+            .scope_id;
+        let ledger = initialized_ledger_path(&dir);
+        Connection::open(&ledger).unwrap().execute(
+            "INSERT INTO batch_requests (scope_id,adapter_kind,input_hash,tool_profile_hash,state,request_kind,intent_token,estimated_usd,created_at) VALUES (?1,'markdownize',?2,?3,?4,?5,?6,0,1)",
+            params![scope, hash_bytes(b"inflight raw"), hash_bytes(b"inflight tool"), state, kind, intent],
+        ).unwrap();
+        let (code, output) = run(
+            &dir,
+            &["repair", "verify-objects", "--prune-orphans", "--yes"],
+        );
+        assert_eq!(code, 3, "{state}/{kind}: {output}");
+        assert_eq!(fs::read(&orphan).unwrap(), bytes);
+        assert_prune_blocker(&output, "inflight_request");
+    }
+}
+
+#[test]
+fn pb15_terminal_requests_and_other_scope_requests_do_not_block() {
+    let (dir, orphan, _) = prune_fixture();
+    let scope = Repository::open(dir.path())
+        .unwrap()
+        .scope_identity()
+        .unwrap()
+        .scope_id;
+    let ledger = initialized_ledger_path(&dir);
+    let conn = Connection::open(ledger).unwrap();
+    for (index, state, row_scope) in [
+        (0, 2, scope.as_str()),
+        (1, 3, scope.as_str()),
+        (2, 0, "01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+        (3, 1, "01ARZ3NDEKTSV4RRFFQ69G5FAV"),
+    ] {
+        conn.execute("INSERT INTO batch_requests (scope_id,adapter_kind,input_hash,tool_profile_hash,state,request_kind,estimated_usd,created_at) VALUES (?1,'markdownize',?2,?3,?4,'sync',0,1)",params![row_scope,hash_bytes(format!("row {index}").as_bytes()),hash_bytes(b"tool"),state]).unwrap();
+    }
+    drop(conn);
+    let output = success(
+        &dir,
+        &["repair", "verify-objects", "--prune-orphans", "--yes"],
+    );
+    assert_eq!(output["prune_orphans"]["status"], "pruned", "{output}");
+    assert!(!orphan.exists());
+}
+
+#[test]
+fn pb15_pending_running_paused_and_retryable_failed_tasks_preserve_orphans() {
+    use kio_pipeline::task::{HoldReason, TaskStatus, TaskStore};
+    for status in [
+        TaskStatus::Pending,
+        TaskStatus::Running,
+        TaskStatus::Paused,
+        TaskStatus::Failed,
+    ] {
+        let (dir, orphan, bytes) = prune_fixture();
+        let store = TaskStore::new(kio_dir(&dir));
+        let mut task = store.all().unwrap().remove(0);
+        task.status = status;
+        task.attempts = 0;
+        task.fallback_reason = Some(
+            if status == TaskStatus::Paused {
+                "auth_error"
+            } else {
+                "network_error"
+            }
+            .to_owned(),
+        );
+        task.hold_reason = (status == TaskStatus::Paused).then_some(HoldReason::Auth);
+        store.append(&task).unwrap();
+        let (code, output) = run(
+            &dir,
+            &["repair", "verify-objects", "--prune-orphans", "--yes"],
+        );
+        assert_eq!(code, 3, "{status:?}: {output}");
+        assert_eq!(fs::read(&orphan).unwrap(), bytes);
+        assert_prune_blocker(&output, "non_terminal_task");
+    }
+}
+
+#[test]
+fn pb14_pb16_confirmed_cleanup_covers_missing_mismatched_terminal_and_unknown_staging() {
+    for case in [
+        "missing_descriptor",
+        "path_mismatch",
+        "terminal_task",
+        "terminal_failed_task",
+        "settled_partial_task",
+        "unknown_terminal_instances",
+        "unknown_no_instances",
+    ] {
+        let (dir, orphan, bytes) = prune_fixture();
+        let (raw, normalize) = prune_normalize(&dir);
+        let root = if case == "unknown_no_instances" {
+            prune_staging(
+                &dir,
+                &hash_bytes(b"no instance raw"),
+                &hash_bytes(b"no instance tool"),
+                true,
+            )
+        } else {
+            prune_staging(
+                &dir,
+                &raw,
+                &normalize.tool_profile_hash,
+                case != "missing_descriptor",
+            )
+        };
+        let root = if case == "path_mismatch" {
+            let moved = root.with_file_name("mismatched-crash-root");
+            fs::rename(&root, &moved).unwrap();
+            moved
+        } else {
+            root
+        };
+        if case.starts_with("unknown") {
+            fs::write(kio_dir(&dir).join("tasks.jsonl"), b"").unwrap();
+        }
+        if matches!(case, "terminal_failed_task" | "settled_partial_task") {
+            use kio_pipeline::task::{TaskStatus, TaskStore, TaskType};
+            let tasks = TaskStore::new(kio_dir(&dir));
+            let mut task = tasks
+                .all()
+                .unwrap()
+                .into_iter()
+                .find(|task| task.task_type == TaskType::Markdownize)
+                .unwrap();
+            task.status = if case == "terminal_failed_task" {
+                TaskStatus::Failed
+            } else {
+                TaskStatus::Partial
+            };
+            task.fallback_reason = Some("invalid_input".to_owned());
+            tasks.append(&task).unwrap();
+        }
+        let (code, output) = run(&dir, &["repair", "verify-objects", "--prune-orphans"]);
+        assert_eq!(code, 9, "{case}: {output}");
+        assert_eq!(fs::read(&orphan).unwrap(), bytes);
+        assert_eq!(
+            fs::read(root.join("payload.part")).unwrap(),
+            b"unpublished staging payload"
+        );
+        let output = success(
+            &dir,
+            &["repair", "verify-objects", "--prune-orphans", "--yes"],
+        );
+        assert_eq!(
+            output["prune_orphans"]["pruned_staging_root_count"], 1,
+            "{case}: {output}"
+        );
+        assert!(!root.exists(), "{case}");
+        assert!(!orphan.exists(), "{case}");
+    }
+}
+
+#[test]
+fn pb14_foreign_scope_and_malformed_staging_descriptors_fail_closed() {
+    for foreign in [false, true] {
+        let (dir, orphan, bytes) = prune_fixture();
+        let (raw, normalize) = prune_normalize(&dir);
+        let root = prune_staging(&dir, &raw, &normalize.tool_profile_hash, true);
+        let descriptor = root.join("descriptor.json");
+        if foreign {
+            let mut value: Value = serde_json::from_slice(&fs::read(&descriptor).unwrap()).unwrap();
+            value["scope_id"] = serde_json::json!("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+            fs::write(&descriptor, serde_jcs::to_vec(&value).unwrap()).unwrap();
+        } else {
+            fs::write(&descriptor, b"not a descriptor").unwrap();
+        }
+        let before = fs::read(&descriptor).unwrap();
+        let (code, output) = run(
+            &dir,
+            &["repair", "verify-objects", "--prune-orphans", "--yes"],
+        );
+        assert_eq!(code, 3, "{output}");
+        assert_eq!(fs::read(&orphan).unwrap(), bytes);
+        assert_eq!(fs::read(descriptor).unwrap(), before);
+        assert!(root.join("payload.part").is_file());
+    }
+}
+
+#[test]
+fn pb15_unfinalized_projection_and_retryable_partial_preserve_orphans() {
+    use kio_pipeline::task::{TaskStatus, TaskStore, TaskType};
+    for partial in [false, true] {
+        let (dir, orphan, bytes) = prune_fixture();
+        let (raw, normalize) = prune_normalize(&dir);
+        let manifest_path = kio_pipeline::markdownize::normalized_instance_dir(
+            kio_dir(&dir),
+            &raw,
+            &normalize.tool_profile_hash,
+            normalize.r#gen,
+        )
+        .join("manifest.json");
+        let mut manifest: Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["units"][0]["status"] = serde_json::json!("failed");
+        manifest["units"][0]["unit_object_hash"] = Value::Null;
+        manifest["units"][0]["error_kind"] = serde_json::json!("network_error");
+        fs::write(&manifest_path, serde_jcs::to_vec(&manifest).unwrap()).unwrap();
+        if partial {
+            let store = TaskStore::new(kio_dir(&dir));
+            let mut task = store
+                .all()
+                .unwrap()
+                .into_iter()
+                .find(|task| task.task_type == TaskType::Markdownize)
+                .unwrap();
+            task.status = TaskStatus::Partial;
+            task.fallback_reason = Some("network_error".to_owned());
+            store.append(&task).unwrap();
+            prune_staging(&dir, &raw, &normalize.tool_profile_hash, true);
+        }
+        let (code, output) = run(
+            &dir,
+            &["repair", "verify-objects", "--prune-orphans", "--yes"],
+        );
+        assert_eq!(code, 3, "{output}");
+        assert_eq!(fs::read(&orphan).unwrap(), bytes);
+        let serialized = output.to_string();
+        assert!(
+            serialized.contains("manifest") || serialized.contains("non_terminal_task"),
+            "{output}"
+        );
+    }
+}
+
+#[test]
+fn pb13_corrupt_or_missing_historical_manifest_never_authorizes_pruning() {
+    for corrupt in [false, true] {
+        let (dir, orphan, bytes) = prune_fixture();
+        let (_, normalize) = prune_normalize(&dir);
+        // Move HEAD forward: the protected manifest belongs to immutable history.
+        fs::write(
+            dir.path().join("evidence.md"),
+            "# changed\nnew generation of evidence\n",
+        )
+        .unwrap();
+        success(&dir, &["index", "--offline"]);
+        let path = ObjectStore::new(kio_dir(&dir))
+            .content_path(ContentObjectKind::Manifest, &normalize.manifest_hash)
+            .unwrap();
+        if corrupt {
+            fs::write(path, b"corrupt historical manifest").unwrap();
+        } else {
+            fs::remove_file(path).unwrap();
+        }
+        let (code, output) = run(
+            &dir,
+            &["repair", "verify-objects", "--prune-orphans", "--yes"],
+        );
+        assert_eq!(code, 3, "{output}");
+        assert_eq!(fs::read(&orphan).unwrap(), bytes);
+        assert_ne!(output["prune_orphans"]["status"], "pruned", "{output}");
+    }
+}
+
+#[test]
+fn pb14_hardlinked_staging_descriptor_never_authorizes_cleanup() {
+    let (dir, orphan, bytes) = prune_fixture();
+    let (raw, normalize) = prune_normalize(&dir);
+    let root = prune_staging(&dir, &raw, &normalize.tool_profile_hash, true);
+    let descriptor = root.join("descriptor.json");
+    let outside = canonical_tempdir();
+    let alias = outside.path().join("descriptor.json");
+    fs::hard_link(&descriptor, &alias).unwrap();
+    let descriptor_before = fs::read(&alias).unwrap();
+    let (code, output) = run(
+        &dir,
+        &["repair", "verify-objects", "--prune-orphans", "--yes"],
+    );
+    assert_eq!(code, 3, "{output}");
+    assert_eq!(fs::read(&orphan).unwrap(), bytes);
+    assert_eq!(fs::read(&descriptor).unwrap(), descriptor_before);
+    assert_eq!(fs::read(&alias).unwrap(), descriptor_before);
+    assert!(root.join("payload.part").is_file());
+}
+
+#[test]
+fn pb16_unknown_retryable_generation_uses_explicit_confirmed_recovery() {
+    let (dir, orphan, bytes) = prune_fixture();
+    let (raw, normalize) = prune_normalize(&dir);
+    let root = prune_staging(&dir, &raw, &normalize.tool_profile_hash, true);
+    fs::write(kio_dir(&dir).join("tasks.jsonl"), b"").unwrap();
+    let current = kio_pipeline::markdownize::normalized_instance_dir(
+        kio_dir(&dir),
+        &raw,
+        &normalize.tool_profile_hash,
+        normalize.r#gen,
+    );
+    let next = kio_pipeline::markdownize::normalized_instance_dir(
+        kio_dir(&dir),
+        &raw,
+        &normalize.tool_profile_hash,
+        normalize.r#gen + 1,
+    );
+    let mut manifest: Value =
+        serde_json::from_slice(&fs::read(current.join("manifest.json")).unwrap()).unwrap();
+    manifest["gen"] = serde_json::json!(normalize.r#gen + 1);
+    manifest["parent_gen"] = serde_json::json!(normalize.r#gen);
+    for unit in manifest["units"].as_array_mut().unwrap() {
+        unit["status"] = serde_json::json!("failed");
+        unit["unit_object_hash"] = Value::Null;
+        unit["error_kind"] = serde_json::json!("network_error");
+    }
+    let store = ObjectStore::new(kio_dir(&dir));
+    let prepared_before: Vec<_> = manifest["units"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|unit| {
+            let path = store
+                .content_path(
+                    ContentObjectKind::Prepared,
+                    unit["prepared_hash"].as_str().unwrap(),
+                )
+                .unwrap();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    let manifest_bytes = serde_jcs::to_vec(&manifest).unwrap();
+    let manifest_hash = store
+        .write_content_object(ContentObjectKind::Manifest, &manifest_bytes)
+        .unwrap();
+    fs::create_dir_all(&next).unwrap();
+    fs::write(next.join("manifest.json"), &manifest_bytes).unwrap();
+    // Escape 1 is unavailable: g1 is retryable. Escape 2 permits explicit
+    // locked repair because the manifest is finalized, task state is lost,
+    // and no in-flight requests or other PB15 blockers exist.
+    let (code, output) = run(&dir, &["repair", "verify-objects", "--prune-orphans"]);
+    assert_eq!(code, 9, "{output}");
+    assert_eq!(fs::read(&orphan).unwrap(), bytes);
+    assert!(root.join("payload.part").is_file());
+    let output = success(
+        &dir,
+        &["repair", "verify-objects", "--prune-orphans", "--yes"],
+    );
+    assert_eq!(
+        output["prune_orphans"]["pruned_staging_root_count"], 1,
+        "{output}"
+    );
+    assert!(!orphan.exists());
+    assert!(!root.exists());
+    assert_eq!(
+        fs::read(next.join("manifest.json")).unwrap(),
+        manifest_bytes
+    );
+    assert_eq!(
+        fs::read(
+            store
+                .content_path(ContentObjectKind::Manifest, &manifest_hash)
+                .unwrap()
+        )
+        .unwrap(),
+        manifest_bytes
+    );
+    for (path, bytes) in prepared_before {
+        assert_eq!(
+            fs::read(path).unwrap(),
+            bytes,
+            "referenced prepared bytes must survive staging cleanup"
+        );
+    }
+}
+
+#[test]
+fn pb15_finalized_partial_blocks_below_retry_limit_and_settles_at_limit() {
+    use kio_pipeline::task::{TaskStatus, TaskStore, TaskType};
+    for attempts in [4, 5] {
+        let (dir, orphan, orphan_bytes) = prune_fixture();
+        let repo = Repository::open(dir.path()).unwrap();
+        let parent = repo.head_commit_hash().unwrap().unwrap();
+        let previous = repo.read_commit(&parent).unwrap();
+        let mut tree = repo.read_tree(&previous.tree).unwrap();
+        let entry = &mut tree.entries[0];
+        let raw = entry.raw_hash.clone();
+        let normalize = entry.normalize.as_mut().unwrap();
+        let store = ObjectStore::new(kio_dir(&dir));
+        let mut manifest: Value = serde_json::from_slice(
+            &store
+                .read_content_object_bytes(
+                    ContentObjectKind::Manifest,
+                    &normalize.manifest_hash,
+                    8 * 1024 * 1024,
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        // Keep the existing Done unit and add a retryable Failed unit: this is
+        // a real mixed Partial manifest, not a task status over all-Done data.
+        let mut failed = manifest["units"][0].clone();
+        failed["order"] = serde_json::json!(manifest["units"].as_array().unwrap().len());
+        failed["unit_key"] = serde_json::json!("pb15:retryable");
+        failed["unit_ref"] = serde_json::json!(kio_pipeline::prepare::unit_ref("pb15:retryable"));
+        failed["status"] = serde_json::json!("failed");
+        failed["unit_object_hash"] = Value::Null;
+        failed["error_kind"] = serde_json::json!("network_error");
+        manifest["units"].as_array_mut().unwrap().push(failed);
+        let bytes = serde_jcs::to_vec(&manifest).unwrap();
+        normalize.manifest_hash = store
+            .write_content_object(ContentObjectKind::Manifest, &bytes)
+            .unwrap();
+        let projection = kio_pipeline::markdownize::normalized_instance_dir(
+            kio_dir(&dir),
+            &raw,
+            &normalize.tool_profile_hash,
+            normalize.r#gen,
+        )
+        .join("manifest.json");
+        fs::write(&projection, &bytes).unwrap();
+        let staging = prune_staging(&dir, &raw, &normalize.tool_profile_hash, true);
+        let tree = build_tree(tree.entries).unwrap();
+        let (tree_hash, _) = store
+            .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
+            .unwrap();
+        let commit = CommitObject::new(
+            tree_hash,
+            Some(parent),
+            "2026-07-20T00:00:00Z".to_owned(),
+            "fixture: finalized partial checkpoint".to_owned(),
+            previous.tool_lock_hash,
+            CommitStats {
+                files_added: 0,
+                files_modified: 1,
+                files_deleted: 0,
+            },
+            CommitType::Manual,
+        )
+        .unwrap();
+        let (commit_hash, _) = store
+            .write_json(ObjectKind::Commit, &serde_json::to_value(commit).unwrap())
+            .unwrap();
+        fs::write(kio_dir(&dir).join("HEAD"), format!("{commit_hash}\n")).unwrap();
+        let tasks = TaskStore::new(kio_dir(&dir));
+        let mut task = tasks
+            .all()
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_type == TaskType::Markdownize)
+            .unwrap();
+        task.status = TaskStatus::Partial;
+        task.attempts = attempts;
+        task.fallback_reason = Some("network_error".to_owned());
+        tasks.append(&task).unwrap();
+        let (code, output) = run(
+            &dir,
+            &["repair", "verify-objects", "--prune-orphans", "--yes"],
+        );
+        if attempts == 4 {
+            assert_eq!(code, 3, "{output}");
+            assert_prune_blocker(&output, "non_terminal_task");
+            assert_eq!(fs::read(&orphan).unwrap(), orphan_bytes);
+            assert!(staging.join("payload.part").is_file());
+        } else {
+            assert_eq!(code, 0, "{output}");
+            assert_eq!(
+                output["prune_orphans"]["pruned_staging_root_count"], 1,
+                "{output}"
+            );
+            assert!(!staging.exists());
+            assert!(!orphan.exists());
+        }
+        assert_eq!(fs::read(projection).unwrap(), bytes);
+    }
+}
+
+#[test]
+fn pb13_cli_purge_resurrection_then_prune_preserves_live_closure() {
+    let (dir, pointer, _) = fixture();
+    let raw = pointer["raw_hash"].as_str().unwrap();
+    let (_, before_normalize) = prune_normalize(&dir);
+    let store = ObjectStore::new(kio_dir(&dir));
+    let old_manifest = store
+        .content_path(ContentObjectKind::Manifest, &before_normalize.manifest_hash)
+        .unwrap();
+    success(
+        &dir,
+        &["purge", "--raw-hash", raw, "--reason", "legal", "--yes"],
+    );
+    assert!(!old_manifest.exists());
+    success(&dir, &["index", "--offline"]);
+    assert!(
+        !old_manifest.exists(),
+        "fixture must exercise the lifecycle-explained missing historical closure"
+    );
+    let (_, current) = prune_normalize(&dir);
+    let current_manifest = store
+        .content_path(ContentObjectKind::Manifest, &current.manifest_hash)
+        .unwrap();
+    let manifest_before = fs::read(&current_manifest).unwrap();
+    let orphan_hash = write_content_bytes(
+        &kio_dir(&dir),
+        ContentObjectKind::Prepared.directory(),
+        b"orphan after resurrection",
+    );
+    let orphan = store
+        .content_path(ContentObjectKind::Prepared, &orphan_hash)
+        .unwrap();
+    let (search_before_code, search_before) = run(&dir, &["search", "3600", "--mode", "text"]);
+    assert_eq!(
+        search_before_code, 0,
+        "search after resurrection failed before verification or pruning: {search_before}"
+    );
+    assert!(!search_before["results"].as_array().unwrap().is_empty());
+    let (code, verification) = run(&dir, &["repair", "verify-objects"]);
+    assert_eq!(
+        code, 0,
+        "plain verification must admit lifecycle-explained old closure before prune can run: {verification}"
+    );
+    assert_eq!(verification["status"], "ok", "{verification}");
+    assert!(
+        verification["purge_explained_missing_history_count"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{verification}"
+    );
+    assert_eq!(
+        verification["external_pointers_may_be_affected"], true,
+        "{verification}"
+    );
+    let output = success(
+        &dir,
+        &["repair", "verify-objects", "--prune-orphans", "--yes"],
+    );
+    assert_eq!(output["status"], "ok", "{output}");
+    assert!(
+        output["purge_explained_missing_history_count"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{output}"
+    );
+    assert_eq!(
+        output["external_pointers_may_be_affected"], true,
+        "{output}"
+    );
+    assert_eq!(output["prune_orphans"]["status"], "pruned", "{output}");
+    assert!(!orphan.exists());
+    assert_eq!(fs::read(current_manifest).unwrap(), manifest_before);
+    assert!(!old_manifest.exists());
+    let (search_after_code, search_after) = run(&dir, &["search", "3600", "--mode", "text"]);
+    assert_eq!(
+        search_after_code, 0,
+        "search after pruning failed: {search_after}"
+    );
+    assert!(!search_after["results"].as_array().unwrap().is_empty());
+}
+
+fn historical_partial_closure_fixture(unrelated_shallow: bool) {
+    let (dir, pointer, _) = fixture();
+    let raw = pointer["raw_hash"].as_str().unwrap();
+    let repo = Repository::open(dir.path()).unwrap();
+    let store = ObjectStore::new(kio_dir(&dir));
+    let parent = repo.head_commit_hash().unwrap().unwrap();
+    let previous = repo.read_commit(&parent).unwrap();
+    let mut tree = repo.read_tree(&previous.tree).unwrap();
+    let normalize = tree.entries[0].normalize.as_mut().unwrap();
+    let mut manifest: Value = serde_json::from_slice(
+        &store
+            .read_content_object_bytes(
+                ContentObjectKind::Manifest,
+                &normalize.manifest_hash,
+                8 * 1024 * 1024,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let template_entry = manifest["units"][0].clone();
+    let template: Value = serde_json::from_slice(
+        &store
+            .read_content_object_bytes(
+                ContentObjectKind::NormalizedUnit,
+                template_entry["unit_object_hash"].as_str().unwrap(),
+                8 * 1024 * 1024,
+            )
+            .unwrap(),
+    )
+    .unwrap();
+    let mut entries = Vec::new();
+    let mut unit_hashes = Vec::new();
+    let mut unit_bytes = Vec::new();
+    for order in 0..2 {
+        let key = format!("pb13:historical:{order}");
+        let mut unit = template.clone();
+        unit["unit_key"] = serde_json::json!(key);
+        unit["markdown"] = serde_json::json!(format!("historical body {order} before purge"));
+        let bytes = serde_jcs::to_vec(&unit).unwrap();
+        let hash = store
+            .write_content_object(ContentObjectKind::NormalizedUnit, &bytes)
+            .unwrap();
+        unit_bytes.push(bytes);
+        let mut entry = template_entry.clone();
+        entry["order"] = serde_json::json!(order);
+        entry["unit_key"] = serde_json::json!(key);
+        entry["unit_ref"] = serde_json::json!(kio_pipeline::prepare::unit_ref(&key));
+        entry["unit_object_hash"] = serde_json::json!(hash);
+        entries.push(entry);
+        unit_hashes.push(hash);
+    }
+    manifest["units"] = serde_json::json!(entries);
+    let historical_bytes = serde_jcs::to_vec(&manifest).unwrap();
+    normalize.manifest_hash = store
+        .write_content_object(ContentObjectKind::Manifest, &historical_bytes)
+        .unwrap();
+    let historical_hash = normalize.manifest_hash.clone();
+    let projection = kio_pipeline::markdownize::normalized_instance_dir(
+        kio_dir(&dir),
+        raw,
+        &normalize.tool_profile_hash,
+        normalize.r#gen,
+    )
+    .join("manifest.json");
+    fs::write(projection, &historical_bytes).unwrap();
+    let tree = build_tree(tree.entries).unwrap();
+    let (tree_hash, _) = store
+        .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
+        .unwrap();
+    let commit = CommitObject::new(
+        tree_hash,
+        Some(parent),
+        previous.created_at,
+        "fixture: two historical bodies".to_owned(),
+        previous.tool_lock_hash,
+        CommitStats {
+            files_added: 0,
+            files_modified: 1,
+            files_deleted: 0,
+        },
+        CommitType::Manual,
+    )
+    .unwrap();
+    let (commit_hash, _) = store
+        .write_json(ObjectKind::Commit, &serde_json::to_value(commit).unwrap())
+        .unwrap();
+    fs::write(kio_dir(&dir).join("HEAD"), format!("{commit_hash}\n")).unwrap();
+    success(
+        &dir,
+        &["purge", "--raw-hash", raw, "--reason", "legal", "--yes"],
+    );
+    success(&dir, &["index", "--offline"]);
+    let first = store
+        .content_path(ContentObjectKind::NormalizedUnit, &unit_hashes[0])
+        .unwrap();
+    let second = store
+        .content_path(ContentObjectKind::NormalizedUnit, &unit_hashes[1])
+        .unwrap();
+    assert!(!first.exists());
+    assert!(!second.exists());
+    // Restore the exact historical manifest, but only a corrupt later body.
+    // The earlier missing pin is explained by purge; the later corruption is not.
+    assert_eq!(
+        store
+            .write_content_object(ContentObjectKind::Manifest, &historical_bytes)
+            .unwrap(),
+        historical_hash
+    );
+    success(&dir, &["repair", "replica"]);
+    let search = success(&dir, &["search", "3600", "--mode", "text"]);
+    assert!(!search["results"].as_array().unwrap().is_empty());
+    if unrelated_shallow {
+        // This receipt covers a post-resurrection Auto commit, not the older
+        // partial historical closure whose surviving unit must still validate.
+        let current = repo.head_commit_hash().unwrap().unwrap();
+        make_pointer_commit_final_shallow(&dir, &serde_json::json!({"commit": current}));
+        assert_eq!(
+            store
+                .write_content_object(ContentObjectKind::NormalizedUnit, &unit_bytes[1])
+                .unwrap(),
+            unit_hashes[1]
+        );
+    } else {
+        fs::create_dir_all(second.parent().unwrap()).unwrap();
+        fs::write(&second, b"corrupt surviving historical body").unwrap();
+    }
+    let orphan_hash = write_content_bytes(
+        &kio_dir(&dir),
+        ContentObjectKind::Prepared.directory(),
+        b"orphan must survive hidden corruption",
+    );
+    let orphan = store
+        .content_path(ContentObjectKind::Prepared, &orphan_hash)
+        .unwrap();
+    let orphan_before = fs::read(&orphan).unwrap();
+    if unrelated_shallow {
+        let verification = success(&dir, &["repair", "verify-objects"]);
+        assert_eq!(verification["status"], "ok", "{verification}");
+        assert!(
+            verification["purge_explained_missing_history_count"]
+                .as_u64()
+                .unwrap()
+                > 0,
+            "{verification}"
+        );
+        let pruned = success(
+            &dir,
+            &["repair", "verify-objects", "--prune-orphans", "--yes"],
+        );
+        assert_eq!(pruned["prune_orphans"]["status"], "pruned", "{pruned}");
+        assert!(!orphan.exists());
+        assert!(!first.exists());
+        assert_eq!(fs::read(&second).unwrap(), unit_bytes[1]);
+        return;
+    }
+    let (repair_code, repair_output) = run(&dir, &["repair", "replica"]);
+    assert_eq!(
+        repair_code, 3,
+        "corrupt survivor must block replica repair: {repair_output}"
+    );
+    for args in [
+        &["repair", "verify-objects"][..],
+        &["repair", "verify-objects", "--prune-orphans", "--yes"][..],
+    ] {
+        let (code, output) = run(&dir, args);
+        assert_eq!(code, 3, "{output}");
+        assert_ne!(output["prune_orphans"]["status"], "pruned", "{output}");
+        assert_eq!(fs::read(&orphan).unwrap(), orphan_before);
+        assert_eq!(
+            fs::read(&second).unwrap(),
+            b"corrupt surviving historical body"
+        );
+        assert!(!first.exists());
+    }
+}
+
+#[test]
+fn pb13_explained_missing_first_unit_cannot_hide_corrupt_surviving_unit() {
+    historical_partial_closure_fixture(false);
+}
+
+#[test]
+fn pb13_unrelated_shallow_receipt_preserves_valid_partial_historical_closure() {
+    historical_partial_closure_fixture(true);
 }
 
 // ===========================================================================
