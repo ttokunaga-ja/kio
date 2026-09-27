@@ -7,6 +7,10 @@ on:
         description: Exact 40-character candidate SHA shared by every source run
         required: true
         type: string
+      ci_run_id:
+        description: Successful ci.yml push run ID for main at the candidate SHA
+        required: true
+        type: string
       native_run_id:
         description: Successful v1-acceptance.yml workflow_dispatch run ID
         required: true
@@ -39,6 +43,7 @@ jobs:
       - name: Validate explicit immutable inputs
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
           NATIVE_RUN_ID: ${{ inputs.native_run_id }}
           PROVIDER_RUN_ID: ${{ inputs.provider_run_id }}
           LOCAL_RUN_ID: ${{ inputs.local_run_id }}
@@ -48,6 +53,10 @@ jobs:
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
           test "$GITHUB_SHA" = "$CANDIDATE_SHA"
           test "$GITHUB_REF" = refs/heads/main
+          [[ "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
+          test "$CI_RUN_ID" != "$NATIVE_RUN_ID"
+          test "$CI_RUN_ID" != "$PROVIDER_RUN_ID"
+          test "$CI_RUN_ID" != "$LOCAL_RUN_ID"
           [[ "$NATIVE_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$PROVIDER_RUN_ID" =~ ^[1-9][0-9]*$ ]]
           [[ "$LOCAL_RUN_ID" =~ ^[1-9][0-9]*$ ]]
@@ -78,6 +87,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+          CI_RUN_ID: ${{ inputs.ci_run_id }}
           NATIVE_RUN_ID: ${{ inputs.native_run_id }}
           PROVIDER_RUN_ID: ${{ inputs.provider_run_id }}
           LOCAL_RUN_ID: ${{ inputs.local_run_id }}
@@ -96,6 +106,7 @@ jobs:
             local label="$1"
             local run_id="$2"
             local workflow_path="$3"
+            local expected_event="$4"
             local metadata
             local workflow_sha256
             test -f "$workflow_path"
@@ -103,24 +114,31 @@ jobs:
             metadata="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
             jq -e \
               --arg repository "$GITHUB_REPOSITORY" \
+              --argjson repository_id "$GITHUB_REPOSITORY_ID" \
+              --argjson run_id "$run_id" \
+              --arg expected_event "$expected_event" \
               --arg candidate "$CANDIDATE_SHA" \
               --arg workflow_path "$workflow_path" \
               '.repository.full_name == $repository
-                and .event == "workflow_dispatch"
+                and .repository.id == $repository_id
+                and .id == $run_id
+                and .event == $expected_event
+                and ($expected_event != "push" or .head_branch == "main")
                 and .status == "completed"
                 and .conclusion == "success"
                 and .head_sha == $candidate
                 and .path == $workflow_path
-                and (.run_attempt | type == "number" and . >= 1)' <<< "$metadata" >/dev/null
+                and (.run_attempt | type == "number" and . >= 1 and . == floor)' <<< "$metadata" >/dev/null
             printf '%s\n' "$metadata" | jq -c --arg workflow_sha256 "$workflow_sha256" \
-              '{id, repository: .repository.full_name, event, status, conclusion, head_sha, path, run_attempt, workflow_sha256: $workflow_sha256}' \
+              '{id, repository: .repository.full_name, event, status, conclusion, head_sha, head_branch, path, run_attempt, workflow_sha256: $workflow_sha256}' \
               > "$reports/${label}-run.json"
           }
-          verify_run native "$NATIVE_RUN_ID" .github/workflows/v1-acceptance.yml
-          verify_run provider "$PROVIDER_RUN_ID" .github/workflows/v1-provider-acceptance.yml
+          verify_run ci "$CI_RUN_ID" .github/workflows/ci.yml push
+          verify_run native "$NATIVE_RUN_ID" .github/workflows/v1-acceptance.yml workflow_dispatch
+          verify_run provider "$PROVIDER_RUN_ID" .github/workflows/v1-provider-acceptance.yml workflow_dispatch
           # This is an intentional hard dependency. Until this workflow exists
           # and succeeds, the final fixed matrix cannot be accepted.
-          verify_run local "$LOCAL_RUN_ID" .github/workflows/v1-local-acceptance.yml
+          verify_run local "$LOCAL_RUN_ID" .github/workflows/v1-local-acceptance.yml workflow_dispatch
           printf 'KIO_V1_VERIFY_REPORTS=%s\n' "$reports" >> "$GITHUB_ENV"
 
       - name: Download only bounded expected and receipt files from verified runs

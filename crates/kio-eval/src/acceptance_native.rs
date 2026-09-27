@@ -245,13 +245,22 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
     let ignored_scopes =
         BTreeMap::from([("managed-then-ignored".to_owned(), before_ignored.clone())]);
     let ignored_identity_and_head = scope_identity_and_heads(&watched.root, &ignored_scopes)?;
-    command_must_fail(
-        &options.binary,
-        &watched.device,
-        &watched.root.join("managed-then-ignored"),
-        &["--json", "index", "--offline"],
-        "targeted ignored child index unexpectedly succeeded",
+    let ignored_store = ignored_child.join(".kio");
+    let store_before = ignored_store_fingerprint(&ignored_store)?;
+    let denied_output = base(&options.binary, &watched.device, Some(&ignored_child))?
+        .args(["--json", "index", "--offline"])
+        .output()
+        .map_err(io)?;
+    validate_ignored_index_denial(
+        denied_output.status.code(),
+        &denied_output.stdout,
+        &denied_output.stderr,
     )?;
+    if ignored_store_fingerprint(&ignored_store)? != store_before {
+        return Err(AcceptanceError::Command(
+            "targeted ignored child index changed its store despite policy denial".into(),
+        ));
+    }
     let after_targeted_index = collect_scope_manifests(&watched.root)?;
     assert_ignored_child_not_indexed(&after_targeted_index, &before_ignored).map_err(|error| {
         AcceptanceError::Command(format!(
@@ -1577,6 +1586,100 @@ fn command(
     Ok(output.stdout)
 }
 
+// Do not treat arbitrary command failure as proof that ancestor Ignore was enforced.
+fn validate_ignored_index_denial(
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> Result<(), AcceptanceError> {
+    if exit_code != Some(1) || !stdout.is_empty() {
+        return Err(AcceptanceError::Command(
+            "targeted ignored child index must exit 1 with empty stdout".into(),
+        ));
+    }
+    let error: serde_json::Value = serde_json::from_slice(stderr)
+        .map_err(|error| AcceptanceError::Json(format!("targeted ignored child index: {error}")))?;
+    if error.as_object().map(|object| object.len()) != Some(3)
+        || error.get("error_code").and_then(serde_json::Value::as_str)
+            != Some("KIO-E-POLICY-SCOPE-DENIED-001")
+        || !error
+            .get("message")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|message| !message.is_empty())
+        || !error
+            .get("context")
+            .is_some_and(serde_json::Value::is_object)
+    {
+        return Err(AcceptanceError::Command(
+            "targeted ignored child index did not report the expected policy denial".into(),
+        ));
+    }
+    Ok(())
+}
+
+// The ignored child is quiescent: watcher state and error logs live in the
+// isolated device directory. No child store files, including SQLite sidecars,
+// task records, locks, or GC journals, are exempt from the comparison.
+fn ignored_store_fingerprint(root: &Path) -> Result<BTreeMap<PathBuf, String>, AcceptanceError> {
+    let mut pending = vec![root.to_path_buf()];
+    let mut fingerprint = BTreeMap::new();
+    let mut total_bytes = 0_u64;
+    while let Some(path) = pending.pop() {
+        if fingerprint.len() >= MAX_DIRECTORY_ENTRIES {
+            return Err(AcceptanceError::Invalid(
+                "ignored store exceeds entry bound".into(),
+            ));
+        }
+        let metadata = fs::symlink_metadata(&path).map_err(io)?;
+        #[cfg(windows)]
+        let is_link = {
+            use std::os::windows::fs::MetadataExt;
+            metadata.file_attributes() & 0x400 != 0 // FILE_ATTRIBUTE_REPARSE_POINT
+        };
+        #[cfg(not(windows))]
+        let is_link = metadata.file_type().is_symlink();
+        let relative = path
+            .strip_prefix(root)
+            .map_err(|_| AcceptanceError::Invalid("ignored store path escaped its root".into()))?
+            .to_path_buf();
+        if is_link
+            || (!metadata.is_dir() && !metadata.is_file())
+            || (relative.as_os_str().is_empty() && !metadata.is_dir())
+        {
+            return Err(AcceptanceError::Invalid(
+                "ignored store contains a non-regular entry".into(),
+            ));
+        }
+        if metadata.is_dir() {
+            fingerprint.insert(relative, "directory".into());
+            for entry in fs::read_dir(&path).map_err(io)? {
+                if fingerprint.len() + pending.len() >= MAX_DIRECTORY_ENTRIES {
+                    return Err(AcceptanceError::Invalid(
+                        "ignored store exceeds entry bound".into(),
+                    ));
+                }
+                pending.push(entry.map_err(io)?.path());
+            }
+        } else {
+            // A store may exceed the 1 MiB input-fixture bound. Cap the entire
+            // snapshot at the existing 512 MiB binary bound, not each file.
+            total_bytes = total_bytes.checked_add(metadata.len()).ok_or_else(|| {
+                AcceptanceError::Invalid("ignored store exceeds byte bound".into())
+            })?;
+            if total_bytes > MAX_BINARY_BYTES {
+                return Err(AcceptanceError::Invalid(
+                    "ignored store exceeds byte bound".into(),
+                ));
+            }
+            fingerprint.insert(
+                relative,
+                format!("file:{}", sha256_regular_file(&path, metadata.len())?),
+            );
+        }
+    }
+    Ok(fingerprint)
+}
+
 fn command_must_fail(
     binary: &Path,
     isolated: &Path,
@@ -1665,6 +1768,118 @@ fn io(error: std::io::Error) -> AcceptanceError {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    fn denial_error() -> Value {
+        json!({"error_code": "KIO-E-POLICY-SCOPE-DENIED-001", "message": "managed scope is denied by current ancestor policy", "context": {}})
+    }
+
+    #[test]
+    fn ignored_index_denial_requires_exact_error_and_status() {
+        let stderr = serde_json::to_vec(&denial_error()).unwrap();
+        assert!(validate_ignored_index_denial(Some(1), b"", &stderr).is_ok());
+        for code in [None, Some(0), Some(2), Some(3), Some(4), Some(5), Some(6)] {
+            assert!(validate_ignored_index_denial(code, b"", &stderr).is_err());
+        }
+        for stdout in [b" ".as_slice(), b"{}", b"partial output"] {
+            assert!(validate_ignored_index_denial(Some(1), stdout, &stderr).is_err());
+        }
+        let mut wrong = denial_error();
+        wrong["error_code"] = json!("KIO-E-IO-001");
+        assert!(
+            validate_ignored_index_denial(Some(1), b"", &serde_json::to_vec(&wrong).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn ignored_index_denial_rejects_malformed_or_incomplete_error() {
+        for stderr in [
+            b"".as_slice(),
+            b"panic",
+            b"[]",
+            b"null",
+            b"{} trailing",
+            b"{}\n{}",
+        ] {
+            assert!(validate_ignored_index_denial(Some(1), b"", stderr).is_err());
+        }
+        for key in ["error_code", "message", "context"] {
+            let mut error = denial_error();
+            error.as_object_mut().unwrap().remove(key);
+            assert!(
+                validate_ignored_index_denial(Some(1), b"", &serde_json::to_vec(&error).unwrap())
+                    .is_err()
+            );
+        }
+        for (key, value) in [
+            ("message", json!("")),
+            ("context", json!([])),
+            ("extra", json!(true)),
+        ] {
+            let mut error = denial_error();
+            error[key] = value;
+            assert!(
+                validate_ignored_index_denial(Some(1), b"", &serde_json::to_vec(&error).unwrap())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn ignored_store_fingerprint_detects_changes_beyond_head_and_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        fs::write(root.join("HEAD"), b"same-head").unwrap();
+        fs::write(root.join("manifest.json"), b"same-manifest").unwrap();
+        fs::create_dir(root.join("index")).unwrap();
+        fs::write(root.join("index/sqlite.db"), b"before").unwrap();
+        let before = ignored_store_fingerprint(root).unwrap();
+        assert_eq!(ignored_store_fingerprint(root).unwrap(), before);
+        fs::write(root.join("index/sqlite.db"), b"after!").unwrap();
+        assert_ne!(ignored_store_fingerprint(root).unwrap(), before);
+        fs::write(root.join("index/sqlite.db"), b"before").unwrap();
+        for extra in ["index/sqlite.db-wal", "task.json", "gc-journal.json"] {
+            fs::write(root.join(extra), b"new state").unwrap();
+            assert_ne!(ignored_store_fingerprint(root).unwrap(), before);
+            fs::remove_file(root.join(extra)).unwrap();
+        }
+        fs::create_dir(root.join("empty-new-directory")).unwrap();
+        assert_ne!(ignored_store_fingerprint(root).unwrap(), before);
+        fs::remove_dir(root.join("empty-new-directory")).unwrap();
+        assert_eq!(ignored_store_fingerprint(root).unwrap(), before);
+        fs::remove_file(root.join("index/sqlite.db")).unwrap();
+        assert_ne!(ignored_store_fingerprint(root).unwrap(), before);
+        assert_eq!(fs::read(root.join("HEAD")).unwrap(), b"same-head");
+        assert_eq!(
+            fs::read(root.join("manifest.json")).unwrap(),
+            b"same-manifest"
+        );
+    }
+
+    #[test]
+    fn ignored_store_fingerprint_allows_sqlite_size_and_enforces_total_bound() {
+        let temp = tempfile::tempdir().unwrap();
+        let file = File::create(temp.path().join("sqlite.db")).unwrap();
+        file.set_len(MAX_FIXTURE_BYTES + 1).unwrap();
+        assert!(ignored_store_fingerprint(temp.path()).is_ok());
+        file.set_len(MAX_BINARY_BYTES + 1).unwrap();
+        assert!(ignored_store_fingerprint(temp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ignored_store_fingerprint_rejects_symlinks_including_root() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("store");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("regular"), b"bytes").unwrap();
+        std::os::unix::fs::symlink("regular", root.join("link")).unwrap();
+        assert!(ignored_store_fingerprint(&root).is_err());
+        fs::remove_file(root.join("link")).unwrap();
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        assert!(ignored_store_fingerprint(&alias).is_err());
+    }
 
     fn expected_exclusions() -> Value {
         json!([{"scope_id": "child-id", "scope_path": "/root/child/.kio", "reason": "policy_denied"}])
