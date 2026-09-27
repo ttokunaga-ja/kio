@@ -43,9 +43,14 @@ enum Kind {
 struct Entry {
     id: Identity,
     kind: Kind,
+    shared: bool,
+    size: u64,
 }
 type Plan = BTreeMap<PathBuf, Entry>;
 fn kind(m: &Metadata) -> Result<Kind> {
+    source_kind(m, false)
+}
+fn source_kind(m: &Metadata, allow_shared: bool) -> Result<Kind> {
     require(
         m.mode() & 0o7000 == 0,
         "special permission bits on SDK entry",
@@ -53,7 +58,7 @@ fn kind(m: &Metadata) -> Result<Kind> {
     if m.is_dir() {
         Ok(Kind::Directory)
     } else if m.is_file() {
-        require(m.nlink() == 1, "hardlinked SDK file")?;
+        require(allow_shared || m.nlink() == 1, "hardlinked SDK file")?;
         Ok(Kind::File)
     } else if m.is_symlink() {
         Ok(Kind::Link(PathBuf::new()))
@@ -92,9 +97,13 @@ fn check_link(path: &Path, root: &Path) -> Result<PathBuf> {
     Ok(target)
 }
 fn plan_tree(root: &Path) -> Result<Plan> {
-    fn visit(path: &Path, root: &Path, plan: &mut Plan) -> Result<()> {
+    plan_tree_with_shared(root, false)
+}
+fn plan_tree_with_shared(root: &Path, allow_shared: bool) -> Result<Plan> {
+    fn visit(path: &Path, root: &Path, plan: &mut Plan, allow_shared: bool) -> Result<()> {
         let m = io(fs::symlink_metadata(path))?;
-        let mut k = kind(&m)?;
+        let mut k = source_kind(&m, allow_shared)
+            .map_err(|e| format!("{e}: {} (nlink={})", path.display(), m.nlink()))?;
         if matches!(k, Kind::Link(_)) {
             k = Kind::Link(check_link(path, root)?);
         }
@@ -104,6 +113,8 @@ fn plan_tree(root: &Path) -> Result<Plan> {
             Entry {
                 id: identity(&m),
                 kind: k,
+                shared: m.is_file() && m.nlink() > 1,
+                size: if m.is_file() { m.len() } else { 0 },
             },
         );
         if directory {
@@ -113,13 +124,13 @@ fn plan_tree(root: &Path) -> Result<Plan> {
                 .map_err(|e| e.to_string())?;
             children.sort();
             for child in children {
-                visit(&child, root, plan)?;
+                visit(&child, root, plan, allow_shared)?;
             }
         }
         Ok(())
     }
     let mut plan = Plan::new();
-    visit(root, root, &mut plan)?;
+    visit(root, root, &mut plan, allow_shared)?;
     Ok(plan)
 }
 fn open_node(path: &Path) -> Result<File> {
@@ -295,12 +306,14 @@ fn trusted(path: &Path, uid: u32, gid: u32, mode: u32) -> bool {
 mod darwin;
 #[cfg(target_os = "macos")]
 pub use darwin::prepare;
+mod detach;
 #[cfg(test)]
 mod tests;
 trait Operations {
     fn inspect(&self, path: &Path, expected: Option<&Identity>, mutate: bool) -> Result<()>;
     fn metadata(&self, root: &Path) -> Result<()>;
     fn link(&self, path: &Path, entry: &Entry, mutate: bool, require_root: bool) -> Result<()>;
+    fn detach(&self, path: &Path, entry: &Entry, parent: &Entry) -> Result<Identity>;
     fn select(&self) -> Result<()>;
 }
 fn normalize(root: &Path, ops: &impl Operations) -> Result<usize> {
@@ -325,7 +338,24 @@ fn normalize(root: &Path, ops: &impl Operations) -> Result<usize> {
             Ok((p, identity(&m)))
         })
         .collect::<Result<Vec<_>>>()?;
-    let plan = plan_tree(root)?;
+    let mut plan = plan_tree_with_shared(root, true)?;
+    let shared_count = plan.values().filter(|entry| entry.shared).count();
+    let shared_bytes =
+        plan.values()
+            .filter(|entry| entry.shared)
+            .try_fold(0u64, |total, entry| {
+                require(
+                    entry.size <= detach::MAX_FILE_BYTES,
+                    "shared SDK file exceeds copy byte limit",
+                )?;
+                total
+                    .checked_add(entry.size)
+                    .ok_or_else(|| "shared SDK copy size overflow".to_owned())
+            })?;
+    require(
+        shared_count <= 100_000 && shared_bytes <= 16 * 1024 * 1024 * 1024,
+        "shared SDK copy exceeds count/total-byte limit",
+    )?;
     ops.metadata(root)?;
     for (path, entry) in &plan {
         if matches!(entry.kind, Kind::Link(_)) {
@@ -334,6 +364,28 @@ fn normalize(root: &Path, ops: &impl Operations) -> Result<usize> {
     }
     for (path, id) in &ancestors {
         ops.inspect(path, Some(id), true)?;
+    }
+    // Secure every directory before publishing fresh files. Shared source inodes
+    // are read only: never chown/chmod/clear their ACL through any alias.
+    for (path, entry) in &plan {
+        if entry.kind == Kind::Directory {
+            ops.inspect(path, Some(&entry.id), true)?;
+        }
+    }
+    let shared: Vec<_> = plan
+        .iter()
+        .filter(|(_, entry)| entry.shared)
+        .map(|(path, _)| path.clone())
+        .collect();
+    for path in shared {
+        let entry = &plan[&path];
+        let parent = plan
+            .get(path.parent().ok_or("missing shared-file parent")?)
+            .ok_or("unplanned shared-file parent")?;
+        let id = ops.detach(&path, entry, parent)?;
+        let entry = plan.get_mut(&path).ok_or("missing shared file")?;
+        entry.id = id;
+        entry.shared = false;
     }
     for (path, entry) in &plan {
         if matches!(entry.kind, Kind::Link(_)) {

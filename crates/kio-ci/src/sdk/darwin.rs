@@ -185,6 +185,15 @@ impl Operations for Darwin {
         let uid = inspect()?;
         require(!require_root || uid == 0, "unsafe SDK symlink ownership")
     }
+    fn detach(&self, path: &Path, entry: &Entry, parent: &Entry) -> Result<Identity> {
+        let parent_path = path.parent().ok_or("missing parent")?;
+        self.inspect(parent_path, Some(&parent.id), false)?;
+        println!(
+            "{}",
+            serde_json::json!({"detach_shared_file":path,"source_nlink":io(fs::symlink_metadata(path))?.nlink()})
+        );
+        detach::detach(path, &entry.id, entry.size, &parent.id)
+    }
     fn select(&self) -> Result<()> {
         command(
             "/usr/bin/xcode-select",
@@ -225,5 +234,34 @@ mod tests {
         assert!(!acl_present(Some(&file), None).unwrap());
         clear_acl(&file).unwrap();
         assert!(!acl_present(Some(&file), None).unwrap());
+    }
+    #[test]
+    fn detachment_preserves_external_alias_acl() {
+        let temp = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let dir = fs::canonicalize(temp.path()).unwrap();
+        let outside = dir.join("external");
+        let source = dir.join("source");
+        fs::write(&outside, b"sdk").unwrap();
+        fs::hard_link(&outside, &source).unwrap();
+        let status = Command::new("/bin/chmod")
+            .env_clear()
+            .args(["+a", "everyone allow read"])
+            .arg(&outside)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let file = File::open(&outside).unwrap();
+        assert!(acl_present(Some(&file), None).unwrap());
+        let before = file.metadata().unwrap();
+        detach::detach(
+            &source,
+            &identity(&before),
+            before.len(),
+            &identity(&fs::metadata(&dir).unwrap()),
+        )
+        .unwrap();
+        assert!(acl_present(Some(&file), None).unwrap());
+        assert_eq!(identity(&file.metadata().unwrap()), identity(&before));
+        assert_eq!(fs::read(outside).unwrap(), b"sdk");
     }
 }

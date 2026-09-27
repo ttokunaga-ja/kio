@@ -202,6 +202,10 @@ impl Operations for Mock {
         );
         Ok(())
     }
+    fn detach(&self, path: &Path, entry: &Entry, parent: &Entry) -> Result<Identity> {
+        self.events.borrow_mut().push("detach".into());
+        detach::detach(path, &entry.id, entry.size, &parent.id)
+    }
     fn select(&self) -> Result<()> {
         self.events.borrow_mut().push("select".into());
         Ok(())
@@ -272,4 +276,81 @@ fn links_are_preflighted_and_independently_verified() {
     assert!(index("link-preflight") < index("mutate"));
     assert!(index("link-mutate") < index("link-verify"));
     assert!(index("link-verify") < index("select"));
+}
+
+#[test]
+fn normalization_detaches_internal_and_external_hardlinks_then_requires_strict_plan() {
+    let (_temp, root) = tree();
+    let outside = root.parent().unwrap().join("outside");
+    fs::hard_link(root.join("file"), root.join("second")).unwrap();
+    fs::hard_link(root.join("file"), &outside).unwrap();
+    let before = fs::metadata(&outside).unwrap();
+    let ops = Mock {
+        events: RefCell::new(vec![]),
+        bad_metadata: false,
+        fail_postverify: false,
+        root: root.clone(),
+    };
+    normalize(&root, &ops).unwrap();
+    assert!(
+        plan_tree(&root)
+            .unwrap()
+            .values()
+            .all(|entry| !entry.shared)
+    );
+    assert_ne!(
+        identity(&fs::metadata(root.join("file")).unwrap()),
+        identity(&fs::metadata(root.join("second")).unwrap())
+    );
+    let after = fs::metadata(&outside).unwrap();
+    assert_eq!(
+        (after.uid(), after.gid(), after.mode()),
+        (before.uid(), before.gid(), before.mode())
+    );
+    assert_eq!(fs::read(outside).unwrap(), b"sdk");
+    let events = ops.events.borrow();
+    assert_eq!(events.iter().filter(|event| *event == "detach").count(), 2);
+    assert!(
+        events.iter().position(|event| event == "mutate").unwrap()
+            < events.iter().position(|event| event == "detach").unwrap()
+    );
+    assert_eq!(events.last().unwrap(), "select");
+}
+#[test]
+fn single_link_normalization_does_not_copy() {
+    let (_temp, root) = tree();
+    let before = identity(&fs::metadata(root.join("file")).unwrap());
+    let ops = Mock {
+        events: RefCell::new(vec![]),
+        bad_metadata: false,
+        fail_postverify: false,
+        root: root.clone(),
+    };
+    normalize(&root, &ops).unwrap();
+    assert_eq!(before, identity(&fs::metadata(root.join("file")).unwrap()));
+    assert!(!ops.events.borrow().iter().any(|event| event == "detach"));
+}
+#[test]
+fn oversized_shared_file_is_rejected_before_any_mutation() {
+    let (_temp, root) = tree();
+    File::options()
+        .write(true)
+        .open(root.join("file"))
+        .unwrap()
+        .set_len(detach::MAX_FILE_BYTES + 1)
+        .unwrap();
+    fs::hard_link(root.join("file"), root.join("second")).unwrap();
+    let ops = Mock {
+        events: RefCell::new(vec![]),
+        bad_metadata: false,
+        fail_postverify: false,
+        root: root.clone(),
+    };
+    assert!(normalize(&root, &ops).unwrap_err().contains("byte limit"));
+    assert!(
+        !ops.events
+            .borrow()
+            .iter()
+            .any(|event| event == "mutate" || event == "detach" || event == "select")
+    );
 }
