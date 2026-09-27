@@ -23,7 +23,9 @@ use crate::boundary::{
 };
 #[cfg(target_os = "linux")]
 use crate::process_boundary::configure_descriptor_environment;
-use crate::process_boundary::{DescriptorExecutable, ProcessBoundaryError, configure_retained_cwd};
+#[cfg(unix)]
+use crate::process_boundary::configure_retained_cwd;
+use crate::process_boundary::{DescriptorExecutable, ProcessBoundaryError};
 
 const DEVICE_DIR: &str = ".kio-eval-device";
 const HISTORY_MANIFEST: &str = "history-manifest.json";
@@ -706,9 +708,9 @@ impl ReplayDevice {
         #[cfg(not(unix))]
         {
             let _ = bytes;
-            return Err(ReplayBoundaryError::Unsupported(
+            Err(ReplayBoundaryError::Unsupported(
                 "create-only durable manifest publication",
-            ));
+            ))
         }
         #[cfg(unix)]
         {

@@ -1617,7 +1617,7 @@ fn rotate_bound_gc_index_generation(
     #[cfg(not(unix))]
     {
         let _ = (kio_dir, generation, expected_current, config);
-        return unsupported_bound_gc_index_rotation();
+        unsupported_bound_gc_index_rotation()
     }
     #[cfg(unix)]
     {
@@ -1898,7 +1898,7 @@ fn open_bound_gc_index(
     #[cfg(not(unix))]
     {
         let _ = (kio_dir, config, writable);
-        return unsupported_bound_gc_index_rotation();
+        unsupported_bound_gc_index_rotation()
     }
     #[cfg(unix)]
     {

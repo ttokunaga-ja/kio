@@ -516,7 +516,7 @@ fn lease_dir(m: &cap_fs::Metadata, writable: bool) -> bool {
     }
     #[cfg(not(unix))]
     {
-        let _ = m;
+        let _ = (m, writable);
         false
     }
 }
@@ -907,13 +907,13 @@ fn regular_private(
                 "{label} must be a bounded single-link private regular file"
             ));
         }
+        Ok(())
     }
     #[cfg(not(unix))]
     {
         let _ = (m, maximum, label);
-        return Err(PersonaLeaseError::Unsupported);
+        Err(PersonaLeaseError::Unsupported)
     }
-    Ok(())
 }
 #[cfg(unix)]
 fn same_cap(a: &cap_fs::Metadata, b: &cap_fs::Metadata) -> bool {

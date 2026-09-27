@@ -450,8 +450,7 @@ fn cleanup_pinned_private_dir(directory: &fs::File, path: &Path) -> io::Result<(
     }
 
     if !private_dir_leaves(path)?.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "owner-private registry snapshot changed during cleanup",
         ));
     }
@@ -730,7 +729,7 @@ fn words_for(bytes: usize) -> Vec<usize> {
 
 fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
     let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
-    if wide.iter().any(|unit| *unit == 0) {
+    if wide.contains(&0) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "registry snapshot path contains NUL",

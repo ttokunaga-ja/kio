@@ -240,6 +240,7 @@ impl ValidatedFixture {
 }
 #[derive(Debug)]
 pub struct FixtureLock {
+    #[cfg(unix)]
     file: fs::File,
     root: fs::File,
     label: PathBuf,
@@ -795,19 +796,20 @@ fn lock(root: &fs::File, label: &Path) -> Result<FixtureLock, ScaleFixtureError>
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return bad("fixture lock is already held");
         }
+        let guard = FixtureLock {
+            file,
+            root: root.try_clone()?,
+            label: label.to_path_buf(),
+            binding,
+        };
+        guard.recheck()?;
+        Ok(guard)
     }
     #[cfg(not(unix))]
     {
-        return bad("safe fixture locks unsupported");
+        let _ = (file, binding);
+        bad("safe fixture locks unsupported")
     }
-    let guard = FixtureLock {
-        file,
-        root: root.try_clone()?,
-        label: label.to_path_buf(),
-        binding,
-    };
-    guard.recheck()?;
-    Ok(guard)
 }
 fn open_lock(
     root: &fs::File,

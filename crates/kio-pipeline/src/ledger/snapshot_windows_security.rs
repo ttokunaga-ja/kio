@@ -88,18 +88,14 @@ impl LedgerSnapshotPrivateDir {
                     "create owner-private ledger snapshot directory",
                 ));
             }
-            match Self::open_and_verify(path.clone(), &owner) {
-                Ok(handle) => {
-                    return Ok(Self {
-                        path,
-                        handle: Some(handle),
-                    });
-                }
-                // The validation handle has already closed. Never clean up by
-                // the shared temporary-root pathname: it could now name a
-                // replacement. Leave it for OS/user cleanup.
-                Err(error) => return Err(error),
-            }
+            // On validation failure the handle has already closed. Never clean
+            // up by the shared temporary-root pathname: it could now name a
+            // replacement. Leave it for OS/user cleanup.
+            let handle = Self::open_and_verify(path.clone(), &owner)?;
+            return Ok(Self {
+                path,
+                handle: Some(handle),
+            });
         }
         Err(io::Error::new(
             io::ErrorKind::AlreadyExists,
@@ -422,8 +418,7 @@ fn cleanup_pinned_private_dir(directory: &fs::File, path: &Path) -> io::Result<(
         drop(file);
     }
     if !private_dir_leaves(path)?.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
+        return Err(io::Error::other(
             "private ledger snapshot changed during cleanup",
         ));
     }
