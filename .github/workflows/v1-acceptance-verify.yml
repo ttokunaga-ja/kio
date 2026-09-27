@@ -34,7 +34,7 @@ permissions:
 jobs:
   verify:
     name: Assemble and verify the full fixed v1 receipt matrix
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
       run:

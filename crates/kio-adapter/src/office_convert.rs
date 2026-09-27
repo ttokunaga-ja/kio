@@ -113,10 +113,12 @@ enum ConverterBackend {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PrivateUnoCatalog {
     #[cfg(target_os = "macos")]
     source: PathBuf,
+    #[cfg(target_os = "macos")]
+    bundle: PathBuf,
     source_digest: String,
 }
 
@@ -310,7 +312,7 @@ fn probe_real_converter_diagnostic(program: PathBuf) -> Result<OfficeConverter> 
     let sandbox = RenderSandbox::new(
         &program,
         scratch.path(),
-        renderer_runtime_roots(&program)?,
+        renderer_runtime_roots(&program, uno_catalog.as_ref())?,
         RenderResourceLimits::default(),
     )
     .map_err(|error| {
@@ -483,21 +485,136 @@ fn create_private_renderer_state(scratch: &Path, purpose: &str) -> Result<PathBu
     Ok(profile)
 }
 
+// A bundle-shaped path is not authority. Only Apple's verifier may authorize
+// the enclosing app as a runtime read root. Custom standalone renderers keep
+// their existing executable-only access.
+#[cfg(target_os = "macos")]
+fn macos_office_bundle_candidate(program: &Path) -> Option<PathBuf> {
+    if !program.is_absolute() || program.file_name()? != "soffice" {
+        return None;
+    }
+    let macos = program.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    (macos.file_name()? == "MacOS"
+        && contents.file_name()? == "Contents"
+        && bundle.extension()? == "app")
+        .then(|| bundle.to_path_buf())
+}
+
+#[cfg(target_os = "macos")]
+fn verify_macos_office_bundle(bundle: &Path) -> Result<()> {
+    // -R= is the codesign inline requirement syntax; no shell or ambient
+    // executable search is involved. Deep verification covers nested code,
+    // and strict verification rejects unsealed/escaping symbolic links.
+    const REQUIREMENT: &str = "-R=anchor apple generic and certificate leaf[subject.OU] = \"7P5S3ZLCN7\" and identifier \"org.libreoffice.script\"";
+    let mut command = std::process::Command::new("/usr/bin/codesign");
+    command
+        .env_clear()
+        .current_dir("/")
+        .args([
+            "--verify",
+            "--deep",
+            "--strict",
+            "--all-architectures",
+            REQUIREMENT,
+        ])
+        .arg(bundle);
+    let output = kio_process::run_bounded_command(
+        &mut command,
+        BoundedProcessOptions {
+            timeout: Duration::from_secs(60),
+            max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
+            max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
+        },
+        None,
+    )
+    .map_err(|_| {
+        AdapterError::ContractViolation("Office bundle signature verification failed".to_owned())
+    })?;
+    if !output.status.success() {
+        return Err(AdapterError::ContractViolation(
+            "Office bundle is not a verified LibreOffice distribution".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[derive(PartialEq, Eq)]
+struct OfficeBundlePathIdentity {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    owner: u32,
+    len: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(target_os = "macos")]
+fn office_bundle_path_snapshot(
+    bundle: &Path,
+    program: &Path,
+    source: &Path,
+) -> Result<Vec<OfficeBundlePathIdentity>> {
+    use std::os::unix::fs::MetadataExt;
+    // Refuse aliases and escapes for every authority-bearing path. Retain
+    // filesystem identity across verification and catalog parsing, including
+    // ownership and permissions, to detect replacement during these checks.
+    [
+        bundle.to_path_buf(),
+        bundle.join("Contents"),
+        bundle.join("Contents/MacOS"),
+        bundle.join("Contents/Resources"),
+        bundle.join("Contents/Resources/services"),
+        program.to_path_buf(),
+        source.to_path_buf(),
+    ]
+    .iter()
+    .map(|path| {
+        let fail = || {
+            AdapterError::ContractViolation("Office bundle path is unstable or unsafe".to_owned())
+        };
+        if std::fs::canonicalize(path).map_err(|_| fail())? != *path {
+            return Err(fail());
+        }
+        let metadata = std::fs::symlink_metadata(path).map_err(|_| fail())?;
+        if metadata.mode() & 0o022 != 0 {
+            return Err(fail());
+        }
+        Ok(OfficeBundlePathIdentity {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            owner: metadata.uid(),
+            len: metadata.len(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        })
+    })
+    .collect()
+}
+
 #[cfg(target_os = "macos")]
 fn private_uno_catalog_for_program(program: &Path) -> Result<Option<PrivateUnoCatalog>> {
-    const BUNDLE: &str = "/Applications/LibreOffice.app";
-    let bundle = PathBuf::from(BUNDLE);
-    let recognized = std::fs::canonicalize(bundle.join("Contents/MacOS/soffice"))
-        .is_ok_and(|candidate| candidate == program);
-    if !recognized {
+    let Some(bundle) = macos_office_bundle_candidate(program) else {
         return Ok(None);
-    }
+    };
     let source = bundle.join("Contents/Resources/services/services.rdb");
+    let before = office_bundle_path_snapshot(&bundle, program, &source)?;
+    verify_macos_office_bundle(&bundle)?;
     let bytes = read_stable_catalog(&source)?;
     let _ = macos_spell_component_range(&bytes)?;
+    if before != office_bundle_path_snapshot(&bundle, program, &source)? {
+        return Err(AdapterError::ContractViolation(
+            "Office bundle changed during verification".to_owned(),
+        ));
+    }
     let digest = Sha256::digest(&bytes);
     Ok(Some(PrivateUnoCatalog {
         source,
+        bundle,
         source_digest: hex_digest(&digest),
     }))
 }
@@ -776,6 +893,12 @@ fn renderer_environment(_program: &Path, home: Option<&Path>) -> Vec<(OsString, 
             .expect("fixed Unix runtime paths contain no separators");
         environment.push((OsString::from("PATH"), path));
     }
+    // Python imported by LibreOffice must not rewrite sealed app resources.
+    #[cfg(target_os = "macos")]
+    environment.push((
+        OsString::from("PYTHONDONTWRITEBYTECODE"),
+        OsString::from("1"),
+    ));
     #[cfg(windows)]
     for name in ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
         if let Some(value) = std::env::var_os(name) {
@@ -820,7 +943,73 @@ fn renderer_environment(_program: &Path, home: Option<&Path>) -> Vec<(OsString, 
     environment
 }
 
-fn renderer_runtime_roots(_program: &Path) -> Result<Vec<PathBuf>> {
+// TDF's system DEBs install outside /usr. This exact root-owned layout is
+// the only additional Linux package authority; a caller's executable path
+// alone still grants no access to sibling files.
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn linux_tdf_bundle_candidate(program: &Path) -> Option<PathBuf> {
+    let version = program
+        .to_str()?
+        .strip_prefix("/opt/libreoffice")?
+        .strip_suffix("/program/soffice")?;
+    let (major, minor) = version.split_once('.')?;
+    if ![major, minor]
+        .iter()
+        .all(|part| (1..=4).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return None;
+    }
+    Some(PathBuf::from(format!("/opt/libreoffice{version}")))
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn trusted_linux_package_mode(owner: u32, mode: u32, directory: bool) -> bool {
+    owner == 0 && mode & 0o022 == 0 && (directory || mode & 0o6000 == 0)
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn verify_linux_package_path(path: &Path, directory: bool) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let fail = || {
+        AdapterError::ContractViolation(
+            "Linux Office package path is unsafe or unavailable".to_owned(),
+        )
+    };
+    let metadata = std::fs::symlink_metadata(path).map_err(|_| fail())?;
+    if (directory && !metadata.is_dir())
+        || (!directory && !metadata.is_file())
+        || !trusted_linux_package_mode(metadata.uid(), metadata.mode(), directory)
+        || std::fs::canonicalize(path).map_err(|_| fail())?.as_os_str() != path.as_os_str()
+    {
+        return Err(fail());
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
+fn linux_tdf_runtime_roots(program: &Path) -> Result<Vec<PathBuf>> {
+    let Some(bundle) = linux_tdf_bundle_candidate(program) else {
+        return Ok(Vec::new());
+    };
+    let program_directory = bundle.join("program");
+    let share_directory = bundle.join("share");
+    for directory in [
+        Path::new("/"),
+        Path::new("/opt"),
+        &bundle,
+        &program_directory,
+        &share_directory,
+    ] {
+        verify_linux_package_path(directory, true)?;
+    }
+    verify_linux_package_path(program, false)?;
+    Ok(vec![program_directory, share_directory])
+}
+
+fn renderer_runtime_roots(
+    _program: &Path,
+    _catalog: Option<&PrivateUnoCatalog>,
+) -> Result<Vec<PathBuf>> {
     let mut roots = Vec::new();
     #[cfg(target_os = "macos")]
     for root in [
@@ -838,11 +1027,12 @@ fn renderer_runtime_roots(_program: &Path) -> Result<Vec<PathBuf>> {
         }
     }
     #[cfg(target_os = "macos")]
-    if private_uno_catalog_for_program(_program)?.is_some() {
-        roots.push(PathBuf::from("/Applications/LibreOffice.app"));
+    if let Some(catalog) = _catalog {
+        roots.push(catalog.bundle.clone());
     }
     #[cfg(target_os = "linux")]
     {
+        roots.extend(linux_tdf_runtime_roots(_program)?);
         let package_program = Path::new("/usr/lib/libreoffice/program/soffice");
         if std::fs::canonicalize(package_program).ok().as_deref() == Some(_program) {
             let share = PathBuf::from("/usr/lib/libreoffice/share");
@@ -923,6 +1113,12 @@ fn convert_with_real_binary(
             MAX_OFFICE_INPUT_BYTES
         )));
     }
+    let validated_catalog = private_uno_catalog_for_program(program)?;
+    if validated_catalog != uno_catalog.cloned() {
+        return Err(AdapterError::ContractViolation(
+            "Office runtime changed after converter probe".to_owned(),
+        ));
+    }
     let scratch = private_temp_dir()?;
     let workdir = scratch.path();
 
@@ -966,7 +1162,7 @@ fn convert_with_real_binary(
     let sandbox = RenderSandbox::new(
         program,
         workdir,
-        renderer_runtime_roots(program)?,
+        renderer_runtime_roots(program, validated_catalog.as_ref())?,
         RenderResourceLimits::default(),
     )
     .map_err(|err| {
@@ -1627,11 +1823,197 @@ mod tests {
             .expect("fixture directory");
         let home = fixture.path().join("home");
         let program = home.join("bin").join("soffice");
-        let roots = renderer_runtime_roots(&program).expect("runtime roots");
+        let roots = renderer_runtime_roots(&program, None).expect("runtime roots");
         assert!(
             !roots.contains(&home.join("bin")) && !roots.contains(&home),
             "a caller-selected converter must not grant its directory or home"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_tdf_layout_is_exact_and_version_components_are_bounded() {
+        assert_eq!(
+            linux_tdf_bundle_candidate(Path::new("/opt/libreoffice26.2/program/soffice")),
+            Some(PathBuf::from("/opt/libreoffice26.2"))
+        );
+        for path in [
+            "/opt/libreoffice/program/soffice",
+            "/opt/libreoffice26/program/soffice",
+            "/opt/libreoffice26.2.5/program/soffice",
+            "/opt/libreoffice26./program/soffice",
+            "/opt/libreoffice.2/program/soffice",
+            "/opt/libreoffice12345.2/program/soffice",
+            "/opt/libreoffice26.beta/program/soffice",
+            "/home/user/libreoffice26.2/program/soffice",
+            "/opt/libreoffice26.2//program/soffice",
+            "/opt/libreoffice26.2/program/../program/soffice",
+            "/opt/libreoffice26.2/program/custom",
+            "/opt/libreoffice26.2/sibling/soffice",
+        ] {
+            assert!(
+                linux_tdf_bundle_candidate(Path::new(path)).is_none(),
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn linux_package_authority_requires_root_and_rejects_unsafe_modes() {
+        assert!(trusted_linux_package_mode(0, 0o100755, false));
+        assert!(trusted_linux_package_mode(0, 0o40755, true));
+        for (owner, mode) in [
+            (501, 0o100755),
+            (0, 0o100775),
+            (0, 0o100757),
+            (0, 0o104755),
+            (0, 0o102755),
+        ] {
+            assert!(!trusted_linux_package_mode(owner, mode, false));
+        }
+        assert!(!trusted_linux_package_mode(0, 0o40777, true));
+        assert!(
+            linux_tdf_runtime_roots(Path::new("/tmp/custom/soffice"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(verify_linux_package_path(Path::new("/"), true).is_ok());
+        let fixture = tempfile::tempdir().unwrap();
+        let alias = fixture.path().join("alias");
+        std::os::unix::fs::symlink("/", &alias).unwrap();
+        assert!(verify_linux_package_path(&alias, true).is_err());
+        assert!(verify_linux_package_path(&fixture.path().join("missing"), false).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_renderer_disables_python_bytecode_writes() {
+        let environment = renderer_environment(Path::new("/custom/soffice"), None);
+        assert!(environment.contains(&(
+            OsString::from("PYTHONDONTWRITEBYTECODE"),
+            OsString::from("1")
+        )));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_candidate_requires_exact_app_layout() {
+        let app = Path::new("/private/task/LibreOffice.app");
+        assert_eq!(
+            macos_office_bundle_candidate(&app.join("Contents/MacOS/soffice")),
+            Some(app.to_path_buf())
+        );
+        for path in [
+            "relative.app/Contents/MacOS/soffice",
+            "/private/LibreOffice/Contents/MacOS/soffice",
+            "/private/LibreOffice.app/MacOS/soffice",
+            "/private/LibreOffice.app/Contents/MacOS/other",
+            "/private/LibreOffice.app/Contents/bin/soffice",
+            "/private/bin/soffice",
+        ] {
+            assert_eq!(
+                macos_office_bundle_candidate(Path::new(path)),
+                None,
+                "{path}"
+            );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn fake_office_bundle() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
+        let directory = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(directory.path()).unwrap();
+        let bundle = base.join("LibreOffice.app");
+        std::fs::create_dir_all(bundle.join("Contents/MacOS")).unwrap();
+        std::fs::create_dir_all(bundle.join("Contents/Resources/services")).unwrap();
+        let program = bundle.join("Contents/MacOS/soffice");
+        let source = bundle.join("Contents/Resources/services/services.rdb");
+        std::fs::write(&program, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::write(&source, b"<components/>").unwrap();
+        (directory, bundle, program, source)
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_forged_bundle_identity_does_not_authorize_runtime() {
+        let (_directory, bundle, program, _source) = fake_office_bundle();
+        std::fs::write(
+            bundle.join("Contents/Info.plist"),
+            br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>CFBundleIdentifier</key><string>org.libreoffice.script</string>
+            <key>TeamIdentifier</key><string>7P5S3ZLCN7</string>
+            <key>CFBundleExecutable</key><string>soffice</string></dict></plist>"#,
+        )
+        .unwrap();
+        assert!(verify_macos_office_bundle(&bundle).is_err());
+        assert!(private_uno_catalog_for_program(&program).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_bundle_authority_rejects_symlink_escapes_and_writable_paths() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let (directory, bundle, program, source) = fake_office_bundle();
+        assert!(office_bundle_path_snapshot(&bundle, &program, &source).is_ok());
+        let outside = directory.path().join("outside.rdb");
+        std::fs::write(&outside, b"<components/>").unwrap();
+        std::fs::remove_file(&source).unwrap();
+        symlink(&outside, &source).unwrap();
+        assert!(office_bundle_path_snapshot(&bundle, &program, &source).is_err());
+        std::fs::remove_file(&source).unwrap();
+        std::fs::write(&source, b"<components/>").unwrap();
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(office_bundle_path_snapshot(&bundle, &program, &source).is_err());
+        std::fs::set_permissions(&bundle, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_private_catalog_remains_bound_to_exact_source_bytes() {
+        let (_directory, bundle, _program, source) = fake_office_bundle();
+        let bytes = macos_catalog(macos_spell_component());
+        std::fs::write(&source, &bytes).unwrap();
+        let catalog = PrivateUnoCatalog {
+            bundle,
+            source: source.clone(),
+            source_digest: hex_digest(&Sha256::digest(&bytes)),
+        };
+        let scratch = tempfile::tempdir().unwrap();
+        let filtered = write_private_uno_catalog(&catalog, scratch.path()).unwrap();
+        assert!(
+            !std::fs::read_to_string(filtered)
+                .unwrap()
+                .contains("MacOSXSpellChecker")
+        );
+        std::fs::write(&source, b"<malformed").unwrap();
+        let next_scratch = tempfile::tempdir().unwrap();
+        assert!(write_private_uno_catalog(&catalog, next_scratch.path()).is_err());
+        let malformed_catalog = PrivateUnoCatalog {
+            source_digest: hex_digest(&Sha256::digest(b"<malformed")),
+            ..catalog
+        };
+        assert!(write_private_uno_catalog(&malformed_catalog, next_scratch.path()).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_runtime_roots_admit_only_the_validated_bundle() {
+        let (_directory, bundle, program, source) = fake_office_bundle();
+        // This constructs the post-verification value only to test root
+        // selection; production can obtain it only through codesign above.
+        let catalog = PrivateUnoCatalog {
+            bundle: bundle.clone(),
+            source,
+            source_digest: String::new(),
+        };
+        let roots = renderer_runtime_roots(&program, Some(&catalog)).unwrap();
+        assert!(roots.contains(&bundle));
+        assert!(!roots.contains(&bundle.parent().unwrap().to_path_buf()));
+        assert!(!roots.contains(&bundle.with_file_name("Sibling.app")));
+        assert!(!roots.contains(&program.parent().unwrap().to_path_buf()));
+        let roots = renderer_runtime_roots(&program, None).unwrap();
+        assert!(!roots.contains(&bundle));
     }
 
     #[cfg(unix)]

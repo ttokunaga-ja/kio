@@ -855,7 +855,7 @@ pub fn smoke_candidate(options: &SmokeCandidateOptions) -> Result<SmokeSummary, 
         &binary,
         &isolated,
         &scope,
-        &["--json", "index", "--approve", "--offline"],
+        &["--json", "index", "--yes", "--offline"],
     )?;
     let search = run_smoke_in(
         &binary,

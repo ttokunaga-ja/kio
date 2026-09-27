@@ -22,13 +22,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             label: Linux
             native_os: linux
           - os: macos-26
             label: macOS
             native_os: macos
-          - os: windows-latest
+          - os: windows-2025
             label: Windows
             native_os: windows
     defaults:
@@ -158,13 +158,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             label: Linux
             native_os: linux
           - os: macos-26
             label: macOS
             native_os: macos
-          - os: windows-latest
+          - os: windows-2025
             label: Windows
             native_os: windows
     defaults:
@@ -230,19 +230,21 @@ jobs:
           deb_directory="$(find "$office_unpack" -type d -name DEBS -print -quit)"
           test -n "$deb_directory"
           sudo apt-get update
-          sudo apt-get install --yes --no-install-recommends bubblewrap "$deb_directory"/*.deb
+          sudo apt-get install --yes --no-install-recommends "$deb_directory"/*.deb
+          bash scripts/ci/prepare-linux-confinement.sh
           sudo loginctl enable-linger "$USER"
           uid="$(id -u)"
           sudo systemctl start "user@${uid}.service"
-          test -x /usr/bin/soffice
+          converter=/opt/libreoffice26.2/program/soffice
+          test -x "$converter"
           {
-            echo 'KIO_OFFICE_CONVERTER=/usr/bin/soffice'
+            echo "KIO_OFFICE_CONVERTER=$converter"
             echo "XDG_RUNTIME_DIR=/run/user/${uid}"
             echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus"
           } >> "$GITHUB_ENV"
           {
             sha256sum "$office_archive"
-            /usr/bin/soffice --version
+            "$converter" --version
             dpkg-query --show bubblewrap
           } > "$RUNNER_TEMP/kio-v1-provisioning.txt"
 
@@ -266,7 +268,7 @@ jobs:
           echo "KIO_OFFICE_CONVERTER=$converter" >> "$GITHUB_ENV"
           {
             shasum -a 256 "$office_dmg"
-            "$converter" --version
+            PYTHONDONTWRITEBYTECODE=1 "$converter" --version
           } > "$RUNNER_TEMP/kio-v1-provisioning.txt"
 
       - name: Provision Windows Office prerequisite
@@ -715,7 +717,7 @@ jobs:
     name: V1 native acceptance supplement summary
     needs: native-a01-a09
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Reject a missing, skipped, cancelled, or failed native lane
         env:

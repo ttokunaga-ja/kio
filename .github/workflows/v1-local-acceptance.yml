@@ -23,9 +23,9 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          - { os: linux, runner: ubuntu-latest }
+          - { os: linux, runner: ubuntu-24.04 }
           - { os: macos, runner: macos-26 }
-          - { os: windows, runner: windows-latest }
+          - { os: windows, runner: windows-2025 }
     defaults: { run: { shell: bash } }
     env:
       CANDIDATE_SHA: ${{ inputs.candidate_sha }}

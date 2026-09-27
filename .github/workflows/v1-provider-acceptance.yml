@@ -14,7 +14,7 @@ permissions: { actions: read, contents: read }
 
 jobs:
   candidate-guard:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       eligible: ${{ steps.guard.outputs.eligible }}
     steps:
@@ -42,7 +42,7 @@ jobs:
     name: Build pinned acceptance helper
     needs: candidate-guard
     if: needs.candidate-guard.outputs.eligible == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions: { contents: read }
     outputs:
       helper_sha256: ${{ steps.helper.outputs.sha256 }}
@@ -75,7 +75,7 @@ jobs:
     name: Protected ledger authority
     needs: [candidate-guard, tools-build]
     if: needs.candidate-guard.outputs.eligible == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     environment: v1-provider-ledger-authority
     permissions: { actions: read, contents: read }
     outputs:
@@ -177,12 +177,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: linux, runner: ubuntu-latest, provider: mistral }
+          - { os: linux, runner: ubuntu-24.04, provider: mistral }
           - { os: macos, runner: macos-26, provider: mistral }
-          - { os: windows, runner: windows-latest, provider: mistral }
-          - { os: linux, runner: ubuntu-latest, provider: gemini }
+          - { os: windows, runner: windows-2025, provider: mistral }
+          - { os: linux, runner: ubuntu-24.04, provider: gemini }
           - { os: macos, runner: macos-26, provider: gemini }
-          - { os: windows, runner: windows-latest, provider: gemini }
+          - { os: windows, runner: windows-2025, provider: gemini }
     defaults: { run: { shell: bash } }
     env:
       CAMPAIGN_ID: ${{ inputs.campaign_id }}

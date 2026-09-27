@@ -22,13 +22,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             label: Linux
             support: supported
           - os: macos-26
             label: macOS
             support: supported
-          - os: windows-latest
+          - os: windows-2025
             label: Windows
             support: experimental
     defaults:
