@@ -49,11 +49,6 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # Run the checked-out helper before toolchain setup or other repository code.
-      - name: Prepare the pinned macOS SDK installation
-        if: runner.os == 'macOS'
-        run: sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin /usr/bin/python3 -I scripts/prepare-macos-sdk.py
-
       - name: Confirm checkout is the requested immutable commit
         env:
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
@@ -65,6 +60,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           components: clippy, rustfmt
+
+      # Build only the isolated bootstrap before other repository crates.
+      - name: Build pinned SDK preparation helper
+        if: runner.os == 'macOS'
+        run: cargo +1.98.0 build -p kio-ci --bin kio-prepare-macos-sdk --locked
+      - name: Prepare the pinned macOS SDK on the ephemeral runner
+        if: runner.os == 'macOS'
+        run: sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$PWD/target/debug/kio-prepare-macos-sdk"
 
       - name: Build the Rust-owned release tooling
         run: cargo +1.98.0 build -p kio-eval --bin kio-eval --locked

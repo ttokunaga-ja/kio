@@ -1239,8 +1239,12 @@ host installation を前提とする境界であり、全 SDK 内容の暗号学
 検証済み root を子 Cargo の `SDKROOT` に明示設定し、Rust linker と native C dependencies に共有する。
 旧 recipe、SDK 不在、metadata 不一致は Cargo 起動前に拒否し、既定 SDK への fallback は行わない。
 recipe に SDK release identity を含めるため、他 OS 上の artifact verification は local SDK を必要としない。
-macOS workflow は `macos-26` を明示し、同 SDK のインストールを前提とする。host の `xcode-select`
-や global environment は変更しない。
+macOS workflow は `macos-26` を明示し、同 SDK のインストールを前提とする。ephemeral CI runner だけは
+固定 Rust toolchain 導入後、独立した `kio-ci` の `kio-prepare-macos-sdk` だけを非特権で locked build し、
+他の repository crate の build 前に環境を消去した sudo で実行する。固定 Xcode 26.5 内の全 SDK tree と
+metadata を事前検証し、descriptor に束縛した所有者・permission・ACL 正規化と独立した再検証に成功した場合だけ
+`xcode-select` を切り替える。引数・SDK override・fallback はない。開発者 host ではこの CI helper を実行せず、
+通常の release validator は host の `xcode-select` や global environment を変更しない。
 
 
 ## 12.1 macOS / Linux の install と uninstall

@@ -3,6 +3,7 @@ members = [
     "crates/kio-adapter",
     "crates/kio-app",
     "crates/kio-cli",
+    "crates/kio-ci",
     "crates/kio-core",
     "crates/kio-eval",
     "crates/kio-index",

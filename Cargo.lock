@@ -1028,6 +1028,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kio-ci"
+version = "0.1.0-rc.3"
+dependencies = [
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "kio-cli"
 version = "0.1.0-rc.3"
 dependencies = [
