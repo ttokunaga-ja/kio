@@ -348,6 +348,29 @@ DOCX/PPTX 変換と隔離の受入試験を行う。v1 の 3 OS Actions は公�
 
 **Office package preflight (DOCX / PPTX)**: LibreOffice に渡す前に raw ZIP を最大 100 MiB、central-directory を最大 4,096 entry、各 member を最大 32 MiB、全 member の declared aggregate を最大 256 MiB として検証する。必要な `[Content_Types].xml`、`_rels/.rels`、main XML の読取り合計は 6 MiB に制限し、CRC を検証して読む。encrypted / split ZIP、ZIP64、重複・非 UTF-8・unsafe part name、非 Stored/Deflated member は拒否する。XML は UTF-8、nesting 256、attribute 1,024 を上限とし、DTD/entity declaration を受けない。DOCX / PPTX ごとに genuine な MIME override、内部 root relationship、main part と namespace を検証する。preflight failure は renderer を起動せず contract violation とする。
 
+**Linux renderer の資源境界 (v1 必須契約)**: 変換ごとに systemd user scope と cgroup v2 を
+使用し、本文を処理する前に実際の所属と制限値を確認する。CPU / memory / pids controller、
+`cgroup.kill`、安全な descriptor 相対解決、利用者の systemd manager が必須であり、
+不足時は変換を拒否する。製品が sudo を呼び出したり、ホストの権限設定を変更したりしない。
+native Actions の受入対象は Ubuntu 24.04 / systemd 255 である。
+
+既定値は invocation 全体で memory 2 GiB、swap 0、task 64、CPU bandwidth 1 CPU とする。
+task 数には launcher、監視用の待機プロセス、renderer の全 thread を含む。
+CPU 時間は `cpu.stat` の合計を定期確認する。時間の上限判定には監視間隔と quota period による
+超過があり、瞬時の停止を保証する値ではない。memory / task 上限はカーネルで適用する。
+OOM は scope 全体を終了させ、task 上限への抵触や資源情報の読取り失敗も変換失敗とする。
+終了と同時にカーネルの accounting が削除された場合は、資源情報を取得できない失敗として
+返す。取得済みの OOM counter がない限り、プロセスの終了だけから OOM と断定しない。
+複数の独立した invocation に対するマシン全体の合計上限を表す値ではない。
+
+起動準備と変換は同じ wall-clock deadline に含め、後始末には最大 5 秒の追加猶予を設ける。
+成功時も残存する scope 内プロセスを終了し、空になったことを確認してから出力を受け入れる。
+確認できない場合は成功を返さない。親終了時の停止に加え、systemd の有限 runtime と
+明示した全プロセスへの SIGKILL を独立した終了手段とする。renderer には user bus、
+host cgroup / procfs、制御 descriptor を渡さず、既存の filesystem / network 隔離を保つ。
+この契約の実装・試験状況は [v1 実装記録](../tasks/v1-implementation-progress.md) に記録し、
+前提検査の成功だけで実変換や native Actions の合格とは扱わない。
+
 **XLSX の unit 化 (実装フィードバック 2026-07-25 — 上の「対象外」を解除)**: XLSX は
 **変換 PDF を経由しない**。DOCX / PPTX が変換 PDF に載るのは page と slide が**それ自体で視覚的な
 unit** だからであり、sheet にはそれが無い。実測: 10 列 1 シートを `soffice` で PDF 化すると

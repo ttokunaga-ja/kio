@@ -657,6 +657,12 @@ impl Drop for AppContainerProfile {
 struct Job(HANDLE);
 impl Job {
     fn new(limits: crate::confinement::RenderResourceLimits) -> Result<Self, ConfinementError> {
+        let memory_limit = usize::try_from(limits.max_aggregate_memory_bytes)
+            .ok()
+            .filter(|value| *value != 0)
+            .ok_or_else(|| {
+                ConfinementError::Resource(std::io::Error::other("invalid aggregate memory limit"))
+            })?;
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
             return Err(ConfinementError::Resource(std::io::Error::last_os_error()));
@@ -676,7 +682,7 @@ impl Job {
                 .saturating_mul(HUNDRED_NANOSECONDS_PER_SECOND),
         )
         .unwrap_or(i64::MAX);
-        info.JobMemoryLimit = usize::try_from(limits.max_address_space_bytes).unwrap_or(usize::MAX);
+        info.JobMemoryLimit = memory_limit;
         if unsafe {
             SetInformationJobObject(
                 handle,

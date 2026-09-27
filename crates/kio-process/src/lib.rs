@@ -109,6 +109,20 @@ pub enum BoundedProcessError {
     ScratchLimit { limit: u64, observed: u64 },
     #[error("could not inspect bounded renderer scratch: {0}")]
     ScratchInspection(#[source] std::io::Error),
+    #[error("renderer exceeded aggregate {resource} limit")]
+    AggregateResourceLimit { resource: &'static str },
+    #[error("cannot read aggregate {resource} resource accounting: {source}")]
+    ResourceAccounting {
+        resource: &'static str,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error(
+        "renderer exceeded sampled aggregate CPU budget of {limit_usec} microseconds (observed {observed_usec})"
+    )]
+    AggregateCpuLimit { limit_usec: u64, observed_usec: u64 },
+    #[error("could not prove renderer scope cleanup: {0}")]
+    RendererCleanup(#[source] std::io::Error),
     #[error("bounded subprocess emitted non-UTF-8 {stream}")]
     NonUtf8 { stream: &'static str },
 }
@@ -689,7 +703,7 @@ pub fn wait_supervised_child(command: &mut Command) -> Result<ExitStatus, Bounde
 /// Run a Unix renderer with a sampled aggregate scratch cap. The per-file
 /// RLIMIT_FSIZE remains the kernel-enforced immediate write limit; this
 /// monitor catches multiple individually-valid scratch files.
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 pub(crate) fn run_bounded_command_with_unix_renderer_limits(
     command: &mut Command,
     options: BoundedProcessOptions,
@@ -1111,6 +1125,24 @@ fn run_bounded_command_inner(
 
 trait BoundedProcessMonitor {
     fn observe(&mut self, child: &Child) -> Result<(), BoundedProcessError>;
+    fn needs_startup_pipe(&self) -> bool {
+        false
+    }
+    fn operation_deadline(&self, deadline: Instant) -> Instant {
+        deadline
+    }
+    fn on_spawn(&mut self, _child: &mut Child) -> Result<(), BoundedProcessError> {
+        Ok(())
+    }
+    fn on_exit(&mut self, _child: &Child) -> Result<(), BoundedProcessError> {
+        Ok(())
+    }
+    fn cleanup(&mut self) -> Result<(), BoundedProcessError> {
+        Ok(())
+    }
+    fn reap(&mut self, child: &mut Child) -> Result<ExitStatus, BoundedProcessError> {
+        child.wait().map_err(BoundedProcessError::Wait)
+    }
 }
 
 impl BoundedProcessMonitor for () {
@@ -1242,14 +1274,13 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
         });
     }
     configure_process_isolation(command);
-    command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .stdin(if stdin.is_some() {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(
+        if stdin.is_some() || monitor.needs_startup_pipe() {
             Stdio::piped()
         } else {
             Stdio::null()
-        });
+        },
+    );
     // This is deliberately before spawn: one monotonic deadline accounts for
     // all work within this boundary, including a slow spawn and cleanup.
     let started = Instant::now();
@@ -1282,6 +1313,15 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
             return Err(BoundedProcessError::Isolation(error));
         }
     };
+    if let Err(error) = monitor.on_spawn(&mut child) {
+        terminate_attached_tree(&process_tree);
+        terminate_process_tree(&mut child);
+        let cleanup = monitor.cleanup();
+        let reaped = monitor.reap(&mut child);
+        cleanup?;
+        reaped?;
+        return Err(error);
+    }
     let stdout = child.stdout.take().expect("stdout was configured as piped");
     let stderr = child.stderr.take().expect("stderr was configured as piped");
     #[cfg(unix)]
@@ -1299,7 +1339,10 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
             let error = std::io::Error::last_os_error();
             terminate_attached_tree(&process_tree);
             terminate_process_tree(&mut child);
-            let _ = child.wait();
+            let cleanup = monitor.cleanup();
+            let reaped = monitor.reap(&mut child);
+            cleanup?;
+            reaped?;
             return Err(BoundedProcessError::Write(error));
         }
     }
@@ -1336,7 +1379,7 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
         }
     });
 
-    let deadline = started + options.timeout;
+    let deadline = monitor.operation_deadline(started + options.timeout);
     let mut child_exited = false;
     let mut stdout = None;
     let mut stderr = None;
@@ -1353,7 +1396,12 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
             #[cfg(not(unix))]
             let exited = child.try_wait().map(|status| status.is_some());
             match exited {
-                Ok(exited) => child_exited = exited,
+                Ok(exited) => {
+                    child_exited = exited;
+                    if exited && let Err(error) = monitor.on_exit(&child) {
+                        break Err(error);
+                    }
+                }
                 Err(error) => break Err(BoundedProcessError::Wait(error)),
             }
         }
@@ -1544,7 +1592,14 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
         // keeping those workers blocked.
         close_attached_tree_before_join(&mut process_tree);
     }
-    let waited = child.wait().map_err(BoundedProcessError::Wait);
+    let cleanup = monitor.cleanup();
+    if cleanup.is_err() {
+        cancelled.store(true, Ordering::Release);
+        terminate_attached_tree(&process_tree);
+        terminate_process_tree(&mut child);
+        close_attached_tree_before_join(&mut process_tree);
+    }
+    let waited = monitor.reap(&mut child);
     #[cfg(not(unix))]
     let stdin_result = stdin_writer.map(|writer| {
         writer
@@ -1556,6 +1611,7 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
     });
     let _ = stdout_reader.join();
     let _ = stderr_reader.join();
+    cleanup?;
     result?;
     #[cfg(not(unix))]
     if let Some(result) = stdin_result {

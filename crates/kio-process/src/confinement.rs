@@ -22,7 +22,14 @@ use std::process::Command;
 
 use thiserror::Error;
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
+#[path = "confinement_linux_cgroup.rs"]
+mod linux_cgroup;
+#[cfg(target_os = "linux")]
+#[path = "confinement_linux_mounts.rs"]
+mod linux_mounts;
+
+#[cfg(target_os = "macos")]
 use crate::run_bounded_command_with_unix_renderer_limits;
 use crate::{BoundedProcessError, BoundedProcessOptions, BoundedProcessOutput};
 
@@ -31,6 +38,8 @@ pub struct RenderResourceLimits {
     pub wall_timeout: Duration,
     pub cpu_seconds: u64,
     pub max_address_space_bytes: u64,
+    /// Whole-invocation kernel memory limit on Linux and Windows.
+    pub max_aggregate_memory_bytes: u64,
     /// macOS only: an observed physical-footprint threshold for the one
     /// renderer process. This is sampled periodically and is therefore not a
     /// kernel-enforced instantaneous memory limit.
@@ -43,6 +52,7 @@ impl Default for RenderResourceLimits {
         Self {
             wall_timeout: Duration::from_secs(300),
             cpu_seconds: 300,
+            max_aggregate_memory_bytes: 2 * 1024 * 1024 * 1024,
             // Darwin's shared-cache reservation makes RLIMIT_AS unsuitable
             // as a resident-memory budget. Until a process-tree footprint
             // monitor exists, macOS disables this kernel limit explicitly.
@@ -191,16 +201,7 @@ impl RenderSandbox {
         }
         #[cfg(target_os = "linux")]
         {
-            let mut command = self.linux_command(args)?;
-            command.env_clear().envs(environment.iter().cloned());
-            Ok(run_bounded_command_with_unix_renderer_limits(
-                &mut command,
-                options,
-                None,
-                &self.scratch,
-                self.limits.max_file_bytes,
-                0,
-            )?)
+            linux_cgroup::run(self, args, environment, options)
         }
         #[cfg(windows)]
         {
@@ -255,12 +256,7 @@ impl RenderSandbox {
         I: IntoIterator<Item = S>,
         S: AsRef<std::ffi::OsStr>,
     {
-        let bwrap = ["/usr/bin/bwrap", "/usr/local/bin/bwrap"]
-            .iter()
-            .map(Path::new)
-            .find(|path| path.is_file())
-            .ok_or(ConfinementError::BackendUnavailable("bubblewrap (bwrap)"))?;
-        let mut command = Command::new(bwrap);
+        let mut command = Command::new("/usr/bin/bwrap");
         command
             .arg("--unshare-net")
             // A procfs mount without a private PID namespace exposes host
@@ -286,7 +282,6 @@ impl RenderSandbox {
             .arg("--")
             .arg(&self.program)
             .args(args);
-        apply_unix_limits(&mut command, self.limits)?;
         Ok(command)
     }
 
