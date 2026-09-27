@@ -232,15 +232,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends "$deb_directory"/*.deb
           bash scripts/ci/prepare-linux-confinement.sh
-          sudo loginctl enable-linger "$USER"
-          uid="$(id -u)"
-          sudo systemctl start "user@${uid}.service"
           converter=/opt/libreoffice26.8/program/soffice
           test -x "$converter"
           {
             echo "KIO_OFFICE_CONVERTER=$converter"
-            echo "XDG_RUNTIME_DIR=/run/user/${uid}"
-            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/${uid}/bus"
           } >> "$GITHUB_ENV"
           {
             sha256sum "$office_archive"
