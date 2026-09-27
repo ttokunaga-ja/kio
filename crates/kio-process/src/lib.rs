@@ -243,8 +243,8 @@ fn terminate_process_tree(child: &mut Child) {
     #[cfg(unix)]
     {
         // A direct child can call setsid before cancellation, at which point
-        // it is no longer in the process group created for it. Kill and reap
-        // that known child independently before best-effort group cleanup.
+        // it is no longer in the process group created for it. Kill that
+        // known child independently, then clean up the group before reaping.
         let _ = child.kill();
         unsafe {
             // `configure_process_isolation` makes the child the process-group leader;
@@ -1157,7 +1157,7 @@ impl BoundedProcessMonitor for Option<MacosPhysicalMemoryMonitor> {
                 })
             }
             Ok(_) => Ok(()),
-            // A concurrent exit is observed by try_wait below; it is not a
+            // A concurrent exit is observed on the next loop; it is not a
             // monitoring failure and must not mask the child's exit status.
             Err(error) if error.raw_os_error() == Some(libc::ESRCH) => Ok(()),
             Err(error) => Err(BoundedProcessError::PhysicalMemory(error)),
@@ -1204,6 +1204,28 @@ fn macos_physical_footprint(pid: u32) -> Result<u64, std::io::Error> {
         return Err(std::io::Error::last_os_error());
     }
     Ok(unsafe { usage.assume_init() }.physical_footprint)
+}
+
+#[cfg(unix)]
+fn unix_child_has_exited(child: &Child) -> Result<bool, std::io::Error> {
+    // Keep an exited child waitable until the caller has finished all possible
+    // process-group cancellation. Reaping here would let its PID be reused
+    // before a later output error or timeout sends a signal to that group.
+    // SAFETY: the initialized record is writable for waitid, and Child owns
+    // the direct PID that this wait observes without consuming its status.
+    let mut information: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            child.id() as libc::id_t,
+            &mut information,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { information.si_pid() } != 0)
 }
 
 fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
@@ -1315,24 +1337,27 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
     });
 
     let deadline = started + options.timeout;
-    let mut status = None;
+    let mut child_exited = false;
     let mut stdout = None;
     let mut stderr = None;
     let mut finished_streams = 0;
     #[allow(unused_labels)]
     let result = 'run: loop {
-        // Reap before sampling: once try_wait has produced a status, the PID
-        // must never be observed again because it could be recycled. Route a
-        // monitor failure for a still-live child through shared cancellation.
-        if status.is_none() {
-            match child.try_wait() {
-                Ok(next) => status = next,
+        // Observe exit before sampling, without reaping on Unix. This keeps
+        // the child's PID reserved through any later group cancellation while
+        // avoiding memory observations after exit. Windows retains try_wait's
+        // cached status and its independent Job Object cleanup authority.
+        if !child_exited {
+            #[cfg(unix)]
+            let exited = unix_child_has_exited(&child);
+            #[cfg(not(unix))]
+            let exited = child.try_wait().map(|status| status.is_some());
+            match exited {
+                Ok(exited) => child_exited = exited,
                 Err(error) => break Err(BoundedProcessError::Wait(error)),
             }
         }
-        if status.is_none()
-            && let Err(error) = monitor.observe(&child)
-        {
+        if !child_exited && let Err(error) = monitor.observe(&child) {
             break 'run Err(error);
         }
         #[cfg(unix)]
@@ -1414,13 +1439,13 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
         let stdin_complete = stdin_writer
             .as_ref()
             .is_none_or(|writer| writer.is_finished());
-        if status.is_some() && !stdin_complete {
+        if child_exited && !stdin_complete {
             break Err(BoundedProcessError::Write(std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
                 "bounded subprocess exited before consuming bounded stdin",
             )));
         }
-        if status.is_some() && finished_streams == 2 && stdin_complete {
+        if child_exited && finished_streams == 2 && stdin_complete {
             break Ok(());
         }
         let now = Instant::now();
