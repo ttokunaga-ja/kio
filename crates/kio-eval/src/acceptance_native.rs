@@ -220,6 +220,15 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
         "",
         "same-length.txt",
     )?;
+    let expected_pointer = serde_json::json!({
+        "scope_id": ignored_scope_id,
+        "scope_path": ignored_child.join(".kio"),
+        "path_at_commit": "visible-before-revocation.txt",
+        "raw_hash": required_raw_hash(
+            &before_scopes, "managed-then-ignored", "visible-before-revocation.txt",
+        )?,
+    });
+    assert_effective_search_includes(options, &watched, &expected_pointer)?;
     first.stop(&options.binary, &watched.device, &watched.root)?;
 
     apply_stopped_ignore_mutation(&watched.root)?;
@@ -233,6 +242,9 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
     for query in [PRE_IGNORED_SEARCH_TOKEN, POST_IGNORED_SEARCH_TOKEN] {
         assert_effective_search_excludes(options, &watched, query, &expected_exclusions)?;
     }
+    let ignored_scopes =
+        BTreeMap::from([("managed-then-ignored".to_owned(), before_ignored.clone())]);
+    let ignored_identity_and_head = scope_identity_and_heads(&watched.root, &ignored_scopes)?;
     command_must_fail(
         &options.binary,
         &watched.device,
@@ -240,6 +252,18 @@ pub fn run_a03(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
         &["--json", "index", "--offline"],
         "targeted ignored child index unexpectedly succeeded",
     )?;
+    let after_targeted_index = collect_scope_manifests(&watched.root)?;
+    assert_ignored_child_not_indexed(&after_targeted_index, &before_ignored).map_err(|error| {
+        AcceptanceError::Command(format!(
+            "targeted ignored child index mutated its manifest: {error}"
+        ))
+    })?;
+    if scope_identity_and_heads(&watched.root, &ignored_scopes)? != ignored_identity_and_head {
+        return Err(AcceptanceError::Command(
+            "targeted ignored child index changed its scope identity or HEAD despite failing"
+                .into(),
+        ));
+    }
     let after = required_raw_hash(&after_scopes, "", "same-length.txt")?;
     if before == after {
         return Err(AcceptanceError::Command(
@@ -326,13 +350,9 @@ fn assert_ignored_child_not_indexed(
     Ok(())
 }
 
-fn assert_effective_search_excludes(
-    options: &NativeOptions,
-    watched: &DeviceRoot,
-    query: &str,
-    expected_exclusions: &serde_json::Value,
-) -> Result<(), AcceptanceError> {
-    for (args, label) in [
+// Use identical scope selection before and after Ignore revocation.
+fn ignored_child_search_commands(query: &str) -> [(Vec<&str>, &str); 2] {
+    [
         (
             vec![
                 "--json",
@@ -359,7 +379,97 @@ fn assert_effective_search_excludes(
             ],
             "all-scope search",
         ),
-    ] {
+    ]
+}
+
+fn assert_effective_search_includes(
+    options: &NativeOptions,
+    watched: &DeviceRoot,
+    expected_pointer: &serde_json::Value,
+) -> Result<(), AcceptanceError> {
+    for (args, label) in ignored_child_search_commands(PRE_IGNORED_SEARCH_TOKEN) {
+        let output = base(&options.binary, &watched.device, Some(&watched.root))?
+            .args(&args)
+            .output()
+            .map_err(io)?;
+        validate_included_search_output(
+            output.status.code(),
+            &output.stdout,
+            expected_pointer,
+            label,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_included_search_output(
+    exit_code: Option<i32>,
+    stdout: &[u8],
+    expected_pointer: &serde_json::Value,
+    label: &str,
+) -> Result<(), AcceptanceError> {
+    if exit_code != Some(0) {
+        return Err(AcceptanceError::Command(format!(
+            "{label} expected searchable child exit 0 before Ignore revocation, got {exit_code:?}"
+        )));
+    }
+    let value: serde_json::Value = serde_json::from_slice(stdout)
+        .map_err(|error| AcceptanceError::Json(format!("{label}: {error}")))?;
+    let empty_array = serde_json::json!([]);
+    let expected_fields = ["scope_id", "scope_path", "path_at_commit", "raw_hash"];
+    if value.get("excluded_scopes") != Some(&empty_array)
+        || value.get("query").and_then(serde_json::Value::as_str) != Some(PRE_IGNORED_SEARCH_TOKEN)
+        || value
+            .get("requested_mode")
+            .and_then(serde_json::Value::as_str)
+            != Some("text")
+        || value
+            .get("resolved_mode")
+            .and_then(serde_json::Value::as_str)
+            != Some("text")
+        || value.get("error_code") != Some(&serde_json::Value::Null)
+        || value.get("fallback") != Some(&serde_json::Value::Bool(false))
+        || value.get("fallback_reason") != Some(&serde_json::Value::Null)
+        || value.get("warnings") != Some(&empty_array)
+        || ["error", "errors", "failed_scopes"]
+            .iter()
+            .any(|key| value.get(key).is_some())
+        || !value
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|results| {
+                !results.is_empty()
+                    && results.iter().all(|result| {
+                        result.get("scope_path") == expected_pointer.get("scope_path")
+                            && expected_fields.iter().all(|key| {
+                                expected_pointer
+                                    .get(key)
+                                    .and_then(serde_json::Value::as_str)
+                                    .is_some_and(|expected| {
+                                        result
+                                            .get("evidence_pointer")
+                                            .and_then(|pointer| pointer.get(key))
+                                            .and_then(serde_json::Value::as_str)
+                                            == Some(expected)
+                                    })
+                            })
+                    })
+            })
+    {
+        return Err(AcceptanceError::Command(format!(
+            "{label} did not return only the expected searchable child file before Ignore revocation"
+        )));
+    }
+    Ok(())
+}
+
+fn assert_effective_search_excludes(
+    options: &NativeOptions,
+    watched: &DeviceRoot,
+    query: &str,
+    expected_exclusions: &serde_json::Value,
+) -> Result<(), AcceptanceError> {
+    for (args, label) in ignored_child_search_commands(query) {
         let output = base(&options.binary, &watched.device, Some(&watched.root))?
             .args(&args)
             .output()
@@ -1579,6 +1689,118 @@ mod tests {
             &expected_exclusions(),
             "test search",
         )
+    }
+
+    fn expected_pointer() -> Value {
+        json!({
+            "scope_id": "child-id", "scope_path": "/root/child/.kio",
+            "path_at_commit": "visible-before-revocation.txt", "raw_hash": "sha256:fixture",
+        })
+    }
+
+    fn included_response() -> Value {
+        let mut value = excluded_response();
+        value["excluded_scopes"] = json!([]);
+        value["results"] = json!([{
+            "scope_path": "/root/child/.kio", "evidence_pointer": expected_pointer(),
+        }]);
+        value
+    }
+
+    fn validate_included(code: Option<i32>, value: &Value) -> Result<(), AcceptanceError> {
+        validate_included_search_output(
+            code,
+            &serde_json::to_vec(value).unwrap(),
+            &expected_pointer(),
+            "test search",
+        )
+    }
+
+    #[test]
+    fn included_search_accepts_expected_child_file() {
+        assert!(validate_included(Some(0), &included_response()).is_ok());
+    }
+
+    #[test]
+    fn included_search_rejects_missing_results_and_wrong_identity() {
+        for replacement in [json!([]), Value::Null, json!({})] {
+            let mut value = included_response();
+            value["results"] = replacement;
+            assert!(validate_included(Some(0), &value).is_err());
+        }
+        for field in ["scope_id", "scope_path", "path_at_commit", "raw_hash"] {
+            let mut value = included_response();
+            value["results"][0]["evidence_pointer"][field] = json!("wrong");
+            assert!(validate_included(Some(0), &value).is_err(), "wrong {field}");
+            value["results"][0]["evidence_pointer"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                validate_included(Some(0), &value).is_err(),
+                "missing {field}"
+            );
+        }
+        let mut value = included_response();
+        value["results"][0]["scope_path"] = json!("/wrong/.kio");
+        assert!(validate_included(Some(0), &value).is_err());
+        let mut value = included_response();
+        value["results"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"scope_path": "/wrong/.kio"}));
+        assert!(validate_included(Some(0), &value).is_err());
+    }
+
+    #[test]
+    fn included_search_rejects_exclusions_errors_and_unsuccessful_statuses() {
+        for code in [None, Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)] {
+            assert!(
+                validate_included(code, &included_response()).is_err(),
+                "{code:?}"
+            );
+        }
+        for (key, replacement) in [
+            ("excluded_scopes", expected_exclusions()),
+            ("error_code", json!("E_IO")),
+            ("error", json!({"message": "failure"})),
+            ("errors", json!(["failure"])),
+            ("failed_scopes", json!(["other-id"])),
+            ("warnings", json!(["degraded"])),
+            ("fallback", json!(true)),
+            ("fallback_reason", json!("degraded")),
+            ("query", json!(POST_IGNORED_SEARCH_TOKEN)),
+            ("resolved_mode", json!("hybrid")),
+        ] {
+            let mut value = included_response();
+            value[key] = replacement;
+            assert!(validate_included(Some(0), &value).is_err(), "{key}");
+        }
+    }
+
+    #[test]
+    fn included_search_rejects_malformed_payload() {
+        for bytes in [b"not JSON".as_slice(), b"{} trailing", b"[]", b"null"] {
+            assert!(
+                validate_included_search_output(Some(0), bytes, &expected_pointer(), "test search")
+                    .is_err()
+            );
+        }
+        for key in [
+            "results",
+            "excluded_scopes",
+            "query",
+            "requested_mode",
+            "resolved_mode",
+            "error_code",
+            "warnings",
+            "fallback",
+            "fallback_reason",
+        ] {
+            let mut value = included_response();
+            value.as_object_mut().unwrap().remove(key);
+            assert!(validate_included(Some(0), &value).is_err(), "missing {key}");
+        }
     }
 
     #[test]

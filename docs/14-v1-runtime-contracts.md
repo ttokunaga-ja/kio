@@ -203,6 +203,16 @@ A denial by any ancestor cannot be lifted by a child's negation. A denied
 directory makes its descendants ineligible, including rows and tasks created
 before that denial.
 
+`index` (including preview) and both `reindex` modes reject a denied scope
+before writer recovery or index mutation. Rejection leaves the scope's existing
+HEAD, manifest and stored history intact; scope denial is not an instruction to
+publish an empty tree. Ordinary file-level Ignore still filters eligible files.
+Index and regenerating reindex revalidate the captured policy immediately before
+publishing the journal/HEAD/manifest, including the no-op success path. A policy
+change observed there aborts publication; immutable objects prepared earlier may
+remain unreachable. This does not claim an atomic lock against an external
+editor changing ancestor policy after that validation point.
+
 The policy digest binds membership, local policy bytes, the fixed secret/control
 path rules and filesystem case behavior. Search filters before limiting
 candidates. Cursor replay rejects changed policy. OCR, document/query embedding

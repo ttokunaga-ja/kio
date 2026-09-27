@@ -146,6 +146,7 @@ fn ct4_purge_reingest_after_default_tombstone_republishes_and_retires() {
             &BTreeSet::new(),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            None,
         )
         .unwrap();
     assert!(!outcome.noop);

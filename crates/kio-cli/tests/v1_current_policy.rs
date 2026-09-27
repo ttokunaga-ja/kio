@@ -181,6 +181,103 @@ fn assert_policy_failure(output: &Output) {
     );
 }
 
+// Compare every durable byte, including HEAD, manifest, commit/tree objects,
+// task state and recovery journals, rather than checking only the exit status.
+fn store_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    fn visit(
+        root: &Path,
+        directory: &Path,
+        files: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                visit(root, &path, files);
+            } else {
+                files.insert(
+                    path.strip_prefix(root).unwrap().to_owned(),
+                    fs::read(path).unwrap(),
+                );
+            }
+        }
+    }
+    let mut files = std::collections::BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+#[test]
+fn denied_child_index_preview_and_reindex_preserve_entire_store() {
+    let fixture = Fixture::new();
+    fixture.ignore("child/\n");
+    let before = store_bytes(&fixture.child.join(".kio"));
+    assert!(before.contains_key(Path::new("HEAD")));
+    assert!(before.contains_key(Path::new("manifest.json")));
+    for args in [
+        vec!["index", "--offline"],
+        vec!["index", "--offline", "--preview"],
+        vec!["reindex", "--regenerate", "--yes", "--offline"],
+        vec!["reindex", "--at", "HEAD", "--offline"],
+    ] {
+        let output = fixture.command(&fixture.child, &args).output().unwrap();
+        assert!(!output.status.success(), "{args:?} unexpectedly succeeded");
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(
+            error["error_code"], "KIO-E-POLICY-SCOPE-DENIED-001",
+            "{error}"
+        );
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            store_bytes(&fixture.child.join(".kio")),
+            before,
+            "{args:?} mutated denied child state"
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn ancestor_revocation_during_snapshot_rejects_commit_and_noop() {
+    for (changed, args) in [
+        (false, vec!["index", "--offline"]),
+        (true, vec!["index", "--offline"]),
+        (false, vec!["reindex", "--regenerate", "--yes", "--offline"]),
+    ] {
+        let fixture = Fixture::new();
+        let head = fixture.head();
+        let manifest_path = fixture.child.join(".kio/manifest.json");
+        let manifest = fs::read(&manifest_path).unwrap();
+        if changed {
+            fs::write(fixture.child.join("allowed.md"), "changed before index\n").unwrap();
+        }
+        let ready = fixture.home.join("snapshot.ready");
+        let mut child = fixture
+            .command(&fixture.child, &args)
+            .env("KIO_TEST_HOLD_LOCK_READY", &ready)
+            .spawn()
+            .unwrap();
+        wait_ready(&ready, &mut child);
+        fixture.ignore("child/\n");
+        fs::write(ready.with_extension("release"), b"release").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(!output.status.success());
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error_code"], "KIO-E-POLICY-STALE-001", "{error}");
+        assert_eq!(fixture.head(), head);
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest);
+    }
+}
+
+#[test]
+fn file_ignore_still_allows_child_index_publication() {
+    let fixture = Fixture::new();
+    let old_head = fixture.head();
+    fixture.ignore("child/denied.md\n");
+    fixture.ok_at(&fixture.child, &["index", "--offline"]);
+    assert_ne!(fixture.head(), old_head);
+    assert_eq!(paths(&fixture.search(&[])), vec!["allowed.md"]);
+}
+
 #[test]
 fn ancestor_ignore_filters_current_and_historical_results_before_limit() {
     let fixture = Fixture::new();
@@ -398,7 +495,7 @@ fn historical_batch_embedding_requires_current_ancestor_policy() {
             );
             let error: Value = serde_json::from_slice(&output.stderr).unwrap();
             assert_eq!(
-                error["error_code"], "KIO-E-ADAPTER-APPROVAL-REQUIRED-001",
+                error["error_code"], "KIO-E-POLICY-SCOPE-DENIED-001",
                 "{error}"
             );
             assert!(

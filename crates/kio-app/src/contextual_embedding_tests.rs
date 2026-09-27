@@ -705,6 +705,7 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
             &BTreeSet::new(),
             &BTreeMap::new(),
             &BTreeSet::new(),
+            None,
         )
         .unwrap()
         .commit_hash

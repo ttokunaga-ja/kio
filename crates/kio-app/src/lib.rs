@@ -1606,6 +1606,19 @@ fn discover_child_page(
     }
 }
 
+/// Admit the scope itself separately from ordinary per-file ignore filtering.
+/// A denied child must never publish an empty tree or start writer recovery.
+fn admit_scope_writer(repo: &Repository) -> Result<CurrentPolicyEvaluator> {
+    let policy = current_embedding_policy(repo)?;
+    if !policy.allows_scope().map_err(pipeline_to_kio)? {
+        return Err(pipeline_to_kio(kio_pipeline::PipelineError::contract(
+            "KIO-E-POLICY-SCOPE-DENIED-001",
+            "managed scope is denied by current ancestor policy",
+        )));
+    }
+    Ok(policy)
+}
+
 fn run_index_for_repo_inner(
     args: IndexArgs,
     repo: &Repository,
@@ -1616,6 +1629,9 @@ fn run_index_for_repo_inner(
             "--online and --offline are mutually exclusive",
         ));
     }
+    // Shared by explicit invocations and retained internal child runs, including
+    // preview. Admission precedes GC, writer acquisition and recovery writes.
+    let admission_policy = admit_scope_writer(repo)?;
     // Scope identity conflicts matter to local publication and replication as
     // well as paid sends. Check an owned read-only registry snapshot before
     // GC recovery, grants or any index mutation can begin.
@@ -1743,6 +1759,7 @@ fn run_index_for_repo_inner(
                 "preview": true,
             });
         }
+        admission_policy.revalidate().map_err(pipeline_to_kio)?;
         return Ok(output);
     }
 
@@ -1761,7 +1778,11 @@ fn run_index_for_repo_inner(
     // current tree rather than a stale pre-lock observation. The lock is
     // reentrant, so the internal auto-snapshot re-acquisition does not deadlock.
     let lock = repo.lock_store()?;
+    admission_policy.revalidate().map_err(pipeline_to_kio)?;
     management::reconcile_child_lifecycle(repo)?;
+    // Lifecycle reconciliation may legitimately change management records.
+    // Bind scanning and publication to the resulting live policy snapshot.
+    let publication_policy = admit_scope_writer(repo)?;
     validate_repo_tool_lock(repo)?;
     let preview = build_repository_scan_preview(
         repo,
@@ -1843,6 +1864,7 @@ fn run_index_for_repo_inner(
         &excluded,
         &index_result.normalize_by_path,
         &explicitly_allowed_tier_a,
+        Some(&|| publication_policy.revalidate().map_err(pipeline_to_kio)),
     )?;
     if let Some(commit_hash) = &outcome.commit_hash {
         maybe_inject_replica_after_head_fault("index_before_marker")?;
@@ -8994,12 +9016,16 @@ fn run_reindex(args: ReindexArgs) -> Result<Value> {
         offline: args.offline,
     };
     let lane_override = LaneOverride::new(args.realtime, args.batch);
+    // Recovery-capable opening only binds and reads durable scope authority;
+    // reject scope denial before any writer/recovery or derived-state mutation.
     let repo = open_current_recovery_repository()?;
+    let publication_policy = admit_scope_writer(&repo)?;
     resolve_invocation_lane(lane_override, Some(&repo.kio_dir().join("config.toml")))?;
     // M1(a): serialize both HEAD reindex and historical enrichment against
     // concurrent index/repair/reindex. Historical enrichment is derived-state
     // only, but still appends to the chunk ledger and SQLite projection.
     let _lock = repo.lock_store()?;
+    publication_policy.revalidate().map_err(pipeline_to_kio)?;
     validate_repo_tool_lock(&repo)?;
     // CL45/item 5: reconcile any stale `request_kind='sync'` cost-ledger.sqlite
     // rows left by a crashed prior run — applies uniformly to both the
@@ -9149,6 +9175,7 @@ fn run_reindex(args: ReindexArgs) -> Result<Value> {
         &excluded,
         &normalize_by_path,
         &explicitly_allowed_tier_a,
+        Some(&|| publication_policy.revalidate().map_err(pipeline_to_kio)),
     )?;
     if let Some(commit_hash) = &outcome.commit_hash {
         maybe_inject_replica_after_head_fault("reindex_before_marker")?;

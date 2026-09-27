@@ -1755,6 +1755,7 @@ impl Repository {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -1776,9 +1777,12 @@ impl Repository {
             excluded_paths,
             &BTreeMap::new(),
             &BTreeSet::new(),
+            None,
         )
     }
 
+    /// The optional read-only guard runs after immutable preparation, immediately
+    /// before publication (or noop success). It must not mutate scope state.
     pub fn auto_snapshot_with_bound_normalize(
         &self,
         message: Option<&str>,
@@ -1786,6 +1790,7 @@ impl Repository {
         excluded_paths: &BTreeSet<String>,
         normalize_by_path: &BTreeMap<String, PendingNormalizeRef>,
         explicitly_allowed_tier_a_paths: &BTreeSet<String>,
+        publication_guard: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<SnapshotOutcome> {
         self.snapshot_with_type(
             message,
@@ -1803,6 +1808,7 @@ impl Repository {
             None,
             None,
             None,
+            publication_guard,
         )
     }
 
@@ -2125,6 +2131,7 @@ impl Repository {
             Some(&scheduled_authority),
             Some(before_ref_publication),
             Some(&test_control),
+            None,
         )
     }
 
@@ -2337,6 +2344,7 @@ impl Repository {
             None,
             None,
             None,
+            None,
         )
     }
 
@@ -2396,6 +2404,7 @@ impl Repository {
         expected_scheduled_authority: Option<&ScheduledSnapshotAuthority>,
         before_ref_publication: Option<&mut dyn FnMut() -> Result<SnapshotAutoStateBinding>>,
         operation_test_control: Option<&SnapshotTestControl>,
+        publication_guard: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<SnapshotOutcome> {
         let captured_test_control;
         let test_control = match operation_test_control {
@@ -2610,6 +2619,9 @@ impl Repository {
                     )?;
                 }
             }
+            if let Some(guard) = publication_guard {
+                guard()?;
+            }
             return Ok(SnapshotOutcome {
                 noop: true,
                 message: "snapshot noop: tree unchanged".to_owned(),
@@ -2743,6 +2755,9 @@ impl Repository {
             self.publish_with_journal(parent.as_deref(), &commit_hash, &commit, manifest.clone())?;
             Some(self.capture_scheduled_snapshot_authority(test_control)?)
         } else {
+            if let Some(guard) = publication_guard {
+                guard()?;
+            }
             self.publish_with_journal(parent.as_deref(), &commit_hash, &commit, manifest.clone())?;
             None
         };
@@ -9728,6 +9743,52 @@ mod tests {
     }
 
     #[test]
+    fn index_publication_guard_rejects_commit_and_noop_without_moving_refs() {
+        for changed in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let repo = Repository::init(dir.path()).unwrap();
+            fs::write(dir.path().join("doc.txt"), b"original").unwrap();
+            repo.snapshot(Some("initial"), Some("2026-08-14T00:00:00Z"))
+                .unwrap();
+            let head = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+            let manifest = fs::read(repo.kio_dir().join("manifest.json")).unwrap();
+            if changed {
+                fs::write(dir.path().join("doc.txt"), b"changed").unwrap();
+            }
+            let calls = std::cell::Cell::new(0);
+            let guard = || {
+                calls.set(calls.get() + 1);
+                Err(crate::KioError::invalid_usage(
+                    "policy revoked before publication",
+                ))
+            };
+            let error = repo
+                .auto_snapshot_with_bound_normalize(
+                    Some("guarded index"),
+                    None,
+                    &BTreeSet::new(),
+                    &BTreeMap::new(),
+                    &BTreeSet::new(),
+                    Some(&guard),
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains("policy revoked"));
+            assert_eq!(calls.get(), 1);
+            assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head);
+            assert_eq!(
+                fs::read(repo.kio_dir().join("manifest.json")).unwrap(),
+                manifest
+            );
+            assert!(
+                !repo
+                    .kio_dir()
+                    .join(super::PUBLICATION_JOURNAL_LEAF)
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
     fn scheduled_snapshot_rejects_raw_map_drift_before_cas_publication() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
@@ -9757,6 +9818,7 @@ mod tests {
                 &[],
                 true,
                 Some(&expected),
+                None,
                 None,
                 None,
                 None,
