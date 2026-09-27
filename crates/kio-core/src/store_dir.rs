@@ -15,7 +15,16 @@ use serde_json::json;
 use crate::{ExitCode, KioError, Result};
 
 mod atomic;
+#[cfg(any(unix, windows))]
+mod planned_removal;
 pub use atomic::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
+#[cfg(any(unix, windows))]
+pub(crate) use planned_removal::require_same_filesystem;
+#[cfg(any(unix, windows))]
+pub use planned_removal::{
+    CAS_REMOVAL_QUARANTINE_PREFIX, PRUNE_DIRECTORY_QUARANTINE_PREFIX, PlannedDirectoryRemoval,
+    PlannedFileRemoval, RemovalBudget,
+};
 
 const MAX_DIRECTORY_REMOVAL_DEPTH: usize = 128;
 const MAX_DIRECTORY_REMOVAL_ENTRIES: usize = 100_000;
@@ -77,6 +86,31 @@ impl StoreDirectory {
 
     pub fn open_directory(&self, relative: &Path) -> Result<File> {
         platform::open_directory(&self.handle, relative, &self.logical)
+    }
+
+    /// Open maintenance ancestry without crossing filesystem or Linux mount
+    /// boundaries. Every component is compared through retained handles before
+    /// traversing the next one; ordinary directory operations remain unchanged.
+    #[cfg(any(unix, windows))]
+    pub fn open_maintenance_directory(&self, relative: &Path) -> Result<File> {
+        let components = relative_components(relative, false, &self.logical)?;
+        let mut current = self
+            .handle
+            .try_clone()
+            .map_err(|e| ioerr(&self.logical, e))?;
+        for component in components {
+            let next = platform::open_directory(&current, Path::new(component), &self.logical)?;
+            require_same_filesystem(&current, &next, &self.logical.join(relative))?;
+            current = next;
+        }
+        Ok(current)
+    }
+
+    /// Validate an already-retained maintenance parent against this boundary.
+    /// This compares handles only; it does not assert ancestry or reopen paths.
+    #[cfg(any(unix, windows))]
+    pub fn require_same_filesystem(&self, other: &Self) -> Result<()> {
+        require_same_filesystem(&self.handle, &other.handle, &other.logical)
     }
 
     /// Test one direct name without opening any siblings or following links.
@@ -1068,7 +1102,7 @@ mod platform {
         sync_directory(directory, label)
     }
     #[cfg(target_os = "macos")]
-    fn rename_regular_noreplace(
+    pub(super) fn rename_regular_noreplace(
         source_parent: &File,
         source: &std::ffi::OsStr,
         destination_parent: &File,
@@ -1104,7 +1138,7 @@ mod platform {
         }
     }
     #[cfg(target_os = "linux")]
-    fn rename_regular_noreplace(
+    pub(super) fn rename_regular_noreplace(
         source_parent: &File,
         source: &std::ffi::OsStr,
         destination_parent: &File,
@@ -1132,7 +1166,7 @@ mod platform {
         }
     }
     #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    fn rename_regular_noreplace(
+    pub(super) fn rename_regular_noreplace(
         _source_parent: &File,
         _source: &std::ffi::OsStr,
         _destination_parent: &File,
@@ -1452,7 +1486,7 @@ mod platform {
         }
         Ok(basic.ChangeTime)
     }
-    fn volume_serial(file: &File, label: &Path) -> Result<u32> {
+    pub(super) fn volume_serial(file: &File, label: &Path) -> Result<u32> {
         let mut information = BY_HANDLE_FILE_INFORMATION::default();
         if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) }
             == 0
@@ -2004,7 +2038,7 @@ mod platform {
     ) -> Result<()> {
         rename_retained_handle(source, destination_parent, destination, replace, label)
     }
-    fn rename_retained_handle(
+    pub(super) fn rename_retained_handle(
         source: &File,
         destination_parent: &File,
         destination: &std::ffi::OsStr,

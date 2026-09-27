@@ -581,11 +581,15 @@ pub fn validated_final_shallow_receipts(kio_dir: &Path) -> Result<BTreeMap<Strin
             "Kio directory changed while binding shallow inventory",
         ));
     }
+    validated_final_shallow_receipts_bound(&planner)
+}
+
+fn validated_final_shallow_receipts_bound(planner: &GcPlanner) -> Result<BTreeMap<String, String>> {
     let root_id = id_file(&planner.scope)?;
     let kio_id = id_file(&planner.kio)?;
     planner.require_layout()?;
-    let first = inventory_final_shallow_receipts(&planner)?;
-    let second = inventory_final_shallow_receipts(&planner)?;
+    let first = inventory_final_shallow_receipts(planner)?;
+    let second = inventory_final_shallow_receipts(planner)?;
     if first != second {
         return Err(corrupt(
             "store truth changed while validating final shallow receipts",
@@ -922,7 +926,7 @@ impl GcSweepSession {
     /// handles and use the same public no-follow bind as [`Self::bind`].
     pub fn bind_repository(repository: &Repository) -> Result<Self> {
         let session = Self::bind(repository.canonical_root().to_path_buf())?;
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         match (
             repository.bound_root_handle(),
             repository.bound_kio_handle(),
@@ -2126,12 +2130,18 @@ impl GcSweepSession {
     pub fn assert_public_identity(&self) -> Result<()> {
         self.recheck_binding()
     }
-    /// Retained `.kio` capability for the index-generation coordinator. The
-    /// caller must not use it for object deletion; this accessor exists solely
-    /// to avoid reopening the public scope pathname around SQLite rotation.
+    /// Borrow the retained `.kio` capability without reopening the public path.
+    /// Index rotation and maintenance proof may derive bounded capabilities
+    /// from it. Object deletion must use opaque planned-removal capabilities
+    /// after current reachability proof, never direct raw-handle deletion.
     pub fn retained_kio_handle(&self) -> Result<std::fs::File> {
         self.recheck_binding()?;
         self.kio.try_clone().map_err(|error| ioerr(error, "kio"))
+    }
+    /// Validate final shallow receipts through this retained scope capability.
+    pub fn validated_final_shallow_receipts(&self) -> Result<BTreeMap<String, String>> {
+        self.recheck_binding()?;
+        validated_final_shallow_receipts_bound(&self.bound_planner()?)
     }
     fn bound_planner(&self) -> Result<GcPlanner> {
         Ok(GcPlanner {
@@ -5788,6 +5798,24 @@ mod tests {
             std::fs::write(repo.kio_dir().join(SNAPSHOT_AUTO_STATE_LEAF), invalid).unwrap();
             assert!(session.snapshot_auto_state().is_err());
         }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn bound_repository_session_rejects_replaced_public_kio() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = Repository::init(root.path()).unwrap();
+        assert!(repo.bound_kio_handle().is_some());
+        GcSweepSession::bind_repository(&repo).unwrap();
+        let replacement_root = tempfile::tempdir().unwrap();
+        let replacement = Repository::init(replacement_root.path()).unwrap();
+        std::fs::rename(repo.kio_dir(), root.path().join(".kio-retained")).unwrap();
+        std::fs::rename(replacement.kio_dir(), root.path().join(".kio")).unwrap();
+        let error = match GcSweepSession::bind_repository(&repo) {
+            Ok(_) => panic!("mixed retained repository and replacement public store"),
+            Err(error) => error,
+        };
+        assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
     }
 
     #[cfg(unix)]

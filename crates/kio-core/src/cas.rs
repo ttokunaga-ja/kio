@@ -630,7 +630,74 @@ impl Drop for BoundRawStage {
     }
 }
 
+/// Exact prepared/image victim captured for one confirmed maintenance plan.
+#[cfg(any(unix, windows))]
+#[derive(Debug)]
+pub struct PlannedContentRemoval(crate::store_dir::PlannedFileRemoval);
+#[cfg(any(unix, windows))]
+impl PlannedContentRemoval {
+    pub fn revalidate(&self) -> Result<bool> {
+        self.0.revalidate()
+    }
+    pub fn remove(self) -> Result<bool> {
+        self.0.remove()
+    }
+}
+
 impl ObjectStore {
+    /// Capture an exact physical content file through already-retained CAS
+    /// parents. Quarantine residue is only a candidate; hash verification and
+    /// the caller's fresh orphan proof are required on every new plan.
+    #[cfg(any(unix, windows))]
+    pub fn plan_content_removal(
+        &self,
+        kind: ContentObjectKind,
+        hash: &str,
+        budget: &mut crate::store_dir::RemovalBudget,
+    ) -> Result<Option<PlannedContentRemoval>> {
+        if !matches!(kind, ContentObjectKind::Prepared | ContentObjectKind::Image) || !is_hash(hash)
+        {
+            return Err(KioError::invalid_usage(
+                "planned orphan removal requires a prepared/image content hash",
+            ));
+        }
+        let bound = self.bound.as_ref().ok_or_else(|| {
+            KioError::invalid_usage("planned removal requires a retained ObjectStore")
+        })?;
+        let (parent, leaf) = match bound.content_fanout(kind, hash, false) {
+            Ok(slot) => slot,
+            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        crate::store_dir::require_same_filesystem(
+            &bound.kio,
+            &parent,
+            Path::new("planned CAS parent"),
+        )?;
+        let directory = crate::store_dir::StoreDirectory::from_retained(
+            parent,
+            PathBuf::from("planned CAS parent"),
+        )?;
+        let Some(target) = crate::store_dir::PlannedFileRemoval::capture_content(
+            &directory,
+            Path::new(&leaf),
+            kind.max_bytes(),
+            budget,
+        )?
+        else {
+            return Ok(None);
+        };
+        if target.content_hash() != hash {
+            return Err(corrupt_object_error(
+                Path::new(&leaf),
+                "planned content hash does not match filename",
+                hash,
+                Some(target.content_hash()),
+            ));
+        }
+        Ok(Some(PlannedContentRemoval(target)))
+    }
+
     #[must_use]
     pub fn new(kio_dir: impl Into<PathBuf>) -> Self {
         Self {
