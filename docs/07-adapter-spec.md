@@ -338,6 +338,14 @@ renderer 版内で prepared_hash が安定し、renderer 更新による出力�
 可視化する。実行時の変換失敗は contract_violation ([04-pipeline.md §5.3](04-pipeline.md) — 同一入力の
 再試行 1 回) に合流する。音声の変換機構は現在の契約に含めない。
 
+macOS の LibreOffice は、Document Foundation の署名を検証できる bundle と
+26.8 以降の release を必要とする。公式 26.2.5 は `--version` が成功しても、
+headless backend を含まないため、実変換時に Cocoa の初期化で隔離内から異常終了する。
+対応版未満・不正な version 応答は変換前に拒否する。この版の条件は対応方針であり、
+将来の配布物がすべて動作するという保証ではない。各固定配布物について実際の
+DOCX/PPTX 変換と隔離の受入試験を行う。v1 の 3 OS Actions は公式 26.8.0 を
+配布物ごとの SHA-256 で固定する。bundle 内の変更や隔離の緩和で旧版を動かさない。
+
 **Office package preflight (DOCX / PPTX)**: LibreOffice に渡す前に raw ZIP を最大 100 MiB、central-directory を最大 4,096 entry、各 member を最大 32 MiB、全 member の declared aggregate を最大 256 MiB として検証する。必要な `[Content_Types].xml`、`_rels/.rels`、main XML の読取り合計は 6 MiB に制限し、CRC を検証して読む。encrypted / split ZIP、ZIP64、重複・非 UTF-8・unsafe part name、非 Stored/Deflated member は拒否する。XML は UTF-8、nesting 256、attribute 1,024 を上限とし、DTD/entity declaration を受けない。DOCX / PPTX ごとに genuine な MIME override、内部 root relationship、main part と namespace を検証する。preflight failure は renderer を起動せず contract violation とする。
 
 **XLSX の unit 化 (実装フィードバック 2026-07-25 — 上の「対象外」を解除)**: XLSX は

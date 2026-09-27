@@ -354,6 +354,13 @@ fn probe_real_converter_diagnostic(program: PathBuf) -> Result<OfficeConverter> 
             output.status
         )));
     }
+    // The supported official macOS 26.8 build includes the SVP headless
+    // backend. The tested 26.2.5 build lacks it: its version probe succeeds,
+    // but document conversion enters Cocoa and aborts under confinement.
+    #[cfg(target_os = "macos")]
+    if uno_catalog.is_some() {
+        validate_macos_office_version(&output.stdout)?;
+    }
     let version = output
         .stdout
         .lines()
@@ -373,6 +380,54 @@ fn probe_real_converter_diagnostic(program: PathBuf) -> Result<OfficeConverter> 
         },
         version: version.to_owned(),
     })
+}
+
+/// Supported-release policy for verified macOS LibreOffice bundles only.
+/// This prevents known incompatible releases; actual native acceptance remains
+/// the capability proof for each pinned distribution.
+#[cfg(target_os = "macos")]
+fn validate_macos_office_version(stdout: &str) -> Result<()> {
+    let malformed = || {
+        AdapterError::ContractViolation(
+            "verified macOS LibreOffice returned a malformed or ambiguous version".to_owned(),
+        )
+    };
+    let line = stdout.trim();
+    if line.len() > 128 || line.contains(['\r', '\n']) {
+        return Err(malformed());
+    }
+    let mut tokens = line.split_ascii_whitespace();
+    if tokens.next() != Some("LibreOffice") {
+        return Err(malformed());
+    }
+    let version = tokens.next().ok_or_else(malformed)?;
+    if tokens.next().is_some_and(|build| {
+        build.len() != 40 || !build.bytes().all(|byte| byte.is_ascii_hexdigit())
+    }) {
+        return Err(malformed());
+    }
+    if tokens.next().is_some() {
+        return Err(malformed());
+    }
+    let mut components = Vec::new();
+    for component in version.split('.') {
+        if !(1..=4).contains(&component.len())
+            || !component.bytes().all(|byte| byte.is_ascii_digit())
+            || (component.len() > 1 && component.starts_with('0'))
+        {
+            return Err(malformed());
+        }
+        components.push(component.parse::<u16>().map_err(|_| malformed())?);
+    }
+    if !(3..=4).contains(&components.len()) {
+        return Err(malformed());
+    }
+    if (components[0], components[1]) < (26, 8) {
+        return Err(AdapterError::ContractViolation(
+            "sandboxed macOS Office conversion requires LibreOffice 26.8 or newer; the selected release predates the supported headless runtime".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn fingerprint_renderer_program(program: &Path) -> Result<String> {
@@ -1884,6 +1939,55 @@ mod tests {
         std::os::unix::fs::symlink("/", &alias).unwrap();
         assert!(verify_linux_package_path(&alias, true).is_err());
         assert!(verify_linux_package_path(&fixture.path().join("missing"), false).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_office_requires_supported_headless_release() {
+        let old = validate_macos_office_version(
+            "LibreOffice 26.2.5.2 cd7284b4cbbfeb507e630c1aac019f4157393acb\n\n",
+        )
+        .unwrap_err();
+        assert!(
+            old.to_string()
+                .contains("requires LibreOffice 26.8 or newer")
+        );
+        for version in [
+            "LibreOffice 26.8.0.3",
+            "LibreOffice 26.8.0\n\n",
+            "LibreOffice 26.8.0.3 cd7284b4cbbfeb507e630c1aac019f4157393acb\n",
+            "LibreOffice 27.2.0.1",
+        ] {
+            assert!(validate_macos_office_version(version).is_ok(), "{version}");
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_office_rejects_malformed_or_ambiguous_version() {
+        for version in [
+            "",
+            "26.8.0.3",
+            "LibreOffice 26.8",
+            "LibreOffice 26.8.0.3.1",
+            "LibreOffice 026.8.0.3",
+            "LibreOffice 26.08.0.3",
+            "LibreOffice 26.8..3",
+            "LibreOffice 26.8.0-beta",
+            "LibreOffice +26.8.0.3",
+            "LibreOffice 99999.8.0.3",
+            "LibreOffice 26.8.0.3 forged",
+            "LibreOffice 26.8.0.3 extra tokens",
+            "LibreOffice 26.8.0.3\nLibreOffice 26.2.5.2",
+            "LibreOffice\n26.8.0.3",
+            "LibreOffice 26.8.0.3\0",
+        ] {
+            let error = validate_macos_office_version(version).unwrap_err();
+            assert!(
+                error.to_string().contains("malformed or ambiguous"),
+                "{version}"
+            );
+        }
     }
 
     #[cfg(target_os = "macos")]

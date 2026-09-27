@@ -167,3 +167,37 @@ still not a whole-workspace or three-OS acceptance result.
   A local synthetic macOS experiment confirmed that `/dev/fd/N` execution is
   refused with `EACCES`, so it is not a portable descriptor-execution solution.
   A stronger execution binding remains open for the renderer identity design.
+
+## Fixed-release acceptance follow-up — 2026-09-27
+
+The pristine, signature-verified official macOS 26.2.5.2 distribution passes
+`--version` but aborts during actual DOCX conversion. Its crash stack enters
+`CreateSalInstance`, the `osx` VCL backend, AppKit `NSApplication`, then
+HIServices `RegisterApplication`. This is separate from the earlier
+MacSpellChecker startup failure. The official 26.2.5 build configuration lacks
+`--enable-headless`; the official 26.8.0 configuration includes it, corroborated
+by the corresponding SVP symbols in the binaries. Passing `--headless` or setting
+`SAL_USE_VCLPLUGIN=svp` cannot supply an absent compiled backend.
+
+The official 26.8.0.3 macOS distribution passed the confined A07 diagnostic:
+DOCX `page:1`, PPTX `slide:1`, and XLSX `sheet:Fixture` were persisted, and malformed
+inputs were rejected. The staged application's 18,538 inventory entries and
+deep/strict/all-architecture signature remained unchanged. This proof used
+private debug binaries at the `1b6165c` source state; it is not a packaged-candidate
+or native Actions receipt. Original failure evidence remains retained.
+
+Actions now pins official 26.8.0 for all three OSes with separately verified
+distribution hashes. Verified macOS bundles older than 26.8, and malformed or
+ambiguous version output, are rejected before document conversion. This is a
+supported-release policy, not a substitute for native capability tests. Generic
+standalone converter resolution retains its existing behavior. The sandbox
+policy and installed bundle bytes are not weakened or modified for compatibility.
+
+The Linux 26.8.0 archive was downloaded and its SHA-256 matched the official pin.
+Offline extraction confirms the root-owned `/opt/libreoffice26.8/program/soffice`
+layout. Real Linux conversion remains unverified: the available Docker execution
+environment disallows the nested user namespace, while an outer rootless
+namespace maps package ownership incorrectly for the production guard. Neither
+failure is counted as a conversion pass. Linux aggregate descendant resource
+enforcement above also remains a v1 blocker until implementation and native tests
+are complete.

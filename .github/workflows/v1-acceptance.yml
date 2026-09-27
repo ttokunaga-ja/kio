@@ -172,10 +172,10 @@ jobs:
         shell: bash
     env:
       KIO_REAL_OFFICE: "1"
-      OFFICE_VERSION: "26.2.5"
-      OFFICE_LINUX_SHA256: "2f03bfb2ac9f33ea7c77331b4b7a23300fb0ed7443566046bf8b5bc51c1bed1e"
-      OFFICE_MACOS_AARCH64_SHA256: "c99fb4fe574437fc4cb820a4ca15271bca325920861f7139858b36d7f9df78ad"
-      OFFICE_WINDOWS_X64_SHA256: "f15ba07bfcb0186986cf3171063506f5d207c11f8cc051ba0d135209e9e915f9"
+      OFFICE_VERSION: "26.8.0"
+      OFFICE_LINUX_SHA256: "d0a6031a3837e48f9854e6d2da6489b9fadbd814afa4741fa32a197741663a22"
+      OFFICE_MACOS_AARCH64_SHA256: "8858d8058da4f862f47559486814e65efc27294da67c5e4bb56b006b1ee59f89"
+      OFFICE_WINDOWS_X64_SHA256: "4aa6c6e1895f4055104effcb556bd3362d20c6ad707c149543304f395ef9db95"
 
     steps:
       - name: Validate the exact candidate input
@@ -235,7 +235,7 @@ jobs:
           sudo loginctl enable-linger "$USER"
           uid="$(id -u)"
           sudo systemctl start "user@${uid}.service"
-          converter=/opt/libreoffice26.2/program/soffice
+          converter=/opt/libreoffice26.8/program/soffice
           test -x "$converter"
           {
             echo "KIO_OFFICE_CONVERTER=$converter"
