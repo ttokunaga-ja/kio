@@ -76,12 +76,12 @@ jobs:
     needs: [candidate-guard, tools-build]
     if: needs.candidate-guard.outputs.eligible == 'true'
     runs-on: ubuntu-latest
-    environment: v1-provider-acceptance
-    permissions: { actions: read, contents: write }
+    environment: v1-provider-ledger-authority
+    permissions: { actions: read, contents: read }
     outputs:
       reservation_commit: ${{ steps.ledger.outputs.reservation_commit }}
     steps:
-      # Sole contents:write holder. It executes only the separately built,
+      # Sole App contents:write credential holder. It executes only the separately built,
       # hash-checked helper; no candidate checkout, Cargo/build.rs, or paid key
       # occurs in this authority boundary.
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
@@ -100,10 +100,51 @@ jobs:
           test "$(sha256sum "$helper" | awk '{print $1}')" = "$EXPECTED_SHA256"
           chmod 700 "$helper"
           echo "KIO_ACCEPTANCE_TOOLS=$helper" >> "$GITHUB_ENV"
+      - name: Validate approved ledger App configuration
+        env:
+          APP_CLIENT_ID: ${{ vars.KIO_LEDGER_APP_CLIENT_ID }}
+          APP_ID: ${{ vars.KIO_LEDGER_APP_ID }}
+          APP_SLUG: ${{ vars.KIO_LEDGER_APP_SLUG }}
+          INSTALLATION_ID: ${{ vars.KIO_LEDGER_INSTALLATION_ID }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REPOSITORY" = ttokunaga-ja/kio
+          test "$GITHUB_REPOSITORY_ID" = 1220844216
+          test "$GITHUB_REF" = refs/heads/main
+          [[ "$APP_CLIENT_ID" =~ ^Iv[0-9A-Za-z_.]{1,126}$ ]] || exit 1
+          [[ "$APP_ID" =~ ^[1-9][0-9]{0,19}$ ]] || exit 1
+          [[ "$APP_SLUG" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]] || exit 1
+          test "${#APP_SLUG}" -le 100
+          [[ "$INSTALLATION_ID" =~ ^[1-9][0-9]{0,19}$ ]] || exit 1
+      - name: Mint repository-scoped ledger App token
+        id: ledger-app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          client-id: ${{ vars.KIO_LEDGER_APP_CLIENT_ID }}
+          private-key: ${{ secrets.KIO_LEDGER_APP_PRIVATE_KEY }}
+          owner: ttokunaga-ja
+          repositories: kio
+          permission-contents: write
+      - name: Verify ledger App identity and token repository scope
+        env:
+          GH_TOKEN: ${{ steps.ledger-app.outputs.token }}
+          EXPECTED_APP_SLUG: ${{ vars.KIO_LEDGER_APP_SLUG }}
+          EXPECTED_INSTALLATION_ID: ${{ vars.KIO_LEDGER_INSTALLATION_ID }}
+          ACTUAL_APP_SLUG: ${{ steps.ledger-app.outputs.app-slug }}
+          ACTUAL_INSTALLATION_ID: ${{ steps.ledger-app.outputs.installation-id }}
+        run: |
+          set -euo pipefail
+          test "$ACTUAL_APP_SLUG" = "$EXPECTED_APP_SLUG"
+          test "$ACTUAL_INSTALLATION_ID" = "$EXPECTED_INSTALLATION_ID"
+          # One bounded page, with total_count checked: never accept a truncated list.
+          gh api '/installation/repositories?per_page=2' | jq -e '
+            .total_count == 1 and (.repositories | length) == 1 and
+            .repositories[0].id == 1220844216 and
+            .repositories[0].full_name == "ttokunaga-ja/kio"' >/dev/null
       - id: ledger
         env:
           GH_TOKEN: ${{ github.token }}
-          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ steps.ledger-app.outputs.token }}
           OPERATION: ${{ inputs.operation }}
           CAMPAIGN_ID: ${{ inputs.campaign_id }}
           CANDIDATE_SHA: ${{ inputs.candidate_sha }}
