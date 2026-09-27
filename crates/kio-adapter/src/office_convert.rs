@@ -1048,17 +1048,20 @@ fn linux_tdf_runtime_roots(program: &Path) -> Result<Vec<PathBuf>> {
     };
     let program_directory = bundle.join("program");
     let share_directory = bundle.join("share");
+    // TDF initializes each private user profile by copying this package leaf.
+    let presets_directory = bundle.join("presets");
     for directory in [
         Path::new("/"),
         Path::new("/opt"),
         &bundle,
         &program_directory,
         &share_directory,
+        &presets_directory,
     ] {
         verify_linux_package_path(directory, true)?;
     }
     verify_linux_package_path(program, false)?;
-    Ok(vec![program_directory, share_directory])
+    Ok(vec![program_directory, share_directory, presets_directory])
 }
 
 fn renderer_runtime_roots(
@@ -1815,7 +1818,12 @@ mod tests {
             .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
             .expect_err("a renderer-controlled output symlink must be rejected");
         let message = error.to_string();
-        assert!(message.contains("unsafe") || message.contains("absent"));
+        assert!(
+            message.contains("unsafe")
+                || message.contains("absent")
+                || message.contains("renderer scratch contains a symlink"),
+            "unexpected safe renderer rejection: {message}"
+        );
         assert!(!message.contains("private fixture bytes"));
     }
 
@@ -1855,7 +1863,8 @@ mod tests {
         assert!(
             message.contains("did not produce")
                 || message.contains("absent")
-                || message.contains("unsafe"),
+                || message.contains("unsafe")
+                || message.contains("renderer scratch contains a symlink"),
             "unexpected safe renderer rejection: {message}"
         );
         assert!(!message.contains("private fixture bytes"));

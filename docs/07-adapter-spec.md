@@ -346,6 +346,12 @@ headless backend を含まないため、実変換時に Cocoa の初期化で�
 DOCX/PPTX 変換と隔離の受入試験を行う。v1 の 3 OS Actions は公式 26.8.0 を
 配布物ごとの SHA-256 で固定する。bundle 内の変更や隔離の緩和で旧版を動かさない。
 
+Linux の TDF 公式 DEB では、厳密な `/opt/libreoffice<major>.<minor>/program/soffice`
+配置を認識し、`program`、`share` と初回の専用 profile 作成に必要な `presets` を
+読み取り専用で許可する。各 leaf とその祖先は root 所有・group/other 書込み不可の
+実ディレクトリであることを検証し、symlink 経由の配置を拒否する。必要な leaf が
+欠ける場合は拒否し、実行ファイルの指定だけで任意の sibling を読み取り可能にしない。
+
 **Office package preflight (DOCX / PPTX)**: LibreOffice に渡す前に raw ZIP を最大 100 MiB、central-directory を最大 4,096 entry、各 member を最大 32 MiB、全 member の declared aggregate を最大 256 MiB として検証する。必要な `[Content_Types].xml`、`_rels/.rels`、main XML の読取り合計は 6 MiB に制限し、CRC を検証して読む。encrypted / split ZIP、ZIP64、重複・非 UTF-8・unsafe part name、非 Stored/Deflated member は拒否する。XML は UTF-8、nesting 256、attribute 1,024 を上限とし、DTD/entity declaration を受けない。DOCX / PPTX ごとに genuine な MIME override、内部 root relationship、main part と namespace を検証する。preflight failure は renderer を起動せず contract violation とする。
 
 **Linux renderer の資源境界 (v1 必須契約)**: 変換ごとに systemd user scope と cgroup v2 を
