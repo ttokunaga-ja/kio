@@ -298,6 +298,16 @@ struct ParsedPeSection {
     raw_offset: u32,
 }
 
+fn pinned_toolchain() -> &'static str {
+    // An abbreviated Windows toolchain inherits rustup's operator default
+    // host, which may be GNU even when the supported recipe requires MSVC.
+    if cfg!(all(windows, target_arch = "x86_64")) {
+        "+1.98.0-x86_64-pc-windows-msvc"
+    } else {
+        "+1.98.0"
+    }
+}
+
 pub fn prepare_tools(options: &PrepareToolsOptions) -> Result<(), ReleaseError> {
     let cargo_home = validate_prepared_cargo_home_for_tools(&options.cargo_home)?;
     create_empty_dir(&options.output_dir)?;
@@ -310,7 +320,7 @@ pub fn prepare_tools(options: &PrepareToolsOptions) -> Result<(), ReleaseError> 
         cargo
             .current_dir(subprocess_path(&filesystem_root()?)?)
             .args([
-                "+1.98.0",
+                pinned_toolchain(),
                 "install",
                 "--locked",
                 "--version",
@@ -1775,10 +1785,10 @@ fn cargo_command(
 ) -> Result<Command, ReleaseError> {
     let mut cmd = Command::new("cargo");
     cmd.current_dir(subprocess_path(&filesystem_root()?)?)
-        .arg("+1.98.0")
+        .arg(pinned_toolchain())
         // The filesystem-root cwd and isolated Cargo home exclude file-based
         // config discovery. The trusted Rust toolchain remains the host PATH
-        // tool selected by rust-toolchain.toml; wrappers are disabled below.
+        // tool selected by the explicit pin; wrappers are disabled below.
         .args([
             "--config",
             "build.rustc=\"rustc\"",
@@ -1932,12 +1942,13 @@ fn encoded_macos_linker_flags(linker: &str) -> String {
 }
 fn pinned_rust_lld(target: &str) -> Result<PathBuf, ReleaseError> {
     let output = Command::new("rustc")
-        .args(["+1.98.0", "--print", "sysroot"])
+        .args([pinned_toolchain(), "--print", "sysroot"])
         .output()?;
     if !output.status.success() {
-        return Err(ReleaseError::Invalid(
-            "rustc +1.98.0 --print sysroot failed".into(),
-        ));
+        return Err(ReleaseError::Invalid(format!(
+            "rustc {} --print sysroot failed",
+            pinned_toolchain()
+        )));
     }
     let sysroot = String::from_utf8(output.stdout)
         .map_err(|_| ReleaseError::Invalid("rustc sysroot was not UTF-8".into()))?;
@@ -1979,22 +1990,29 @@ fn git(repo: &Path, args: &[&str]) -> Result<String, ReleaseError> {
 }
 fn rust_version() -> Result<String, ReleaseError> {
     let out = Command::new("rustc")
-        .arg("+1.98.0")
+        .arg(pinned_toolchain())
         .arg("--version")
         .output()?;
     if !out.status.success() {
-        return Err(ReleaseError::Invalid(
-            "rustc +1.98.0 --version failed".into(),
-        ));
+        return Err(ReleaseError::Invalid(format!(
+            "rustc {} --version failed",
+            pinned_toolchain()
+        )));
     }
     String::from_utf8(out.stdout)
         .map(|s| s.trim().to_owned())
         .map_err(|_| ReleaseError::Invalid("rust version was not UTF-8".into()))
 }
 fn rust_host() -> Result<String, ReleaseError> {
-    let out = Command::new("rustc").arg("+1.98.0").arg("-vV").output()?;
+    let out = Command::new("rustc")
+        .arg(pinned_toolchain())
+        .arg("-vV")
+        .output()?;
     if !out.status.success() {
-        return Err(ReleaseError::Invalid("rustc +1.98.0 -vV failed".into()));
+        return Err(ReleaseError::Invalid(format!(
+            "rustc {} -vV failed",
+            pinned_toolchain()
+        )));
     }
     let text = String::from_utf8(out.stdout)
         .map_err(|_| ReleaseError::Invalid("rustc host not UTF-8".into()))?;
@@ -3640,10 +3658,15 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_str().unwrap())
             .collect::<Vec<_>>();
+        let expected_toolchain = if cfg!(all(windows, target_arch = "x86_64")) {
+            "+1.98.0-x86_64-pc-windows-msvc"
+        } else {
+            "+1.98.0"
+        };
         assert_eq!(
             &linux_args[..7],
             [
-                "+1.98.0",
+                expected_toolchain,
                 "--config",
                 "build.rustc=\"rustc\"",
                 "--config",
@@ -3722,6 +3745,7 @@ mod tests {
             .get_args()
             .map(|arg| arg.to_str().unwrap())
             .collect::<Vec<_>>();
+        assert_eq!(windows_args[0], expected_toolchain);
         assert_eq!(
             windows_args[7..10],
             [
@@ -3752,8 +3776,19 @@ mod tests {
         for key in ["CL", "_CL_", "LINK", "_LINK_"] {
             assert!(windows_env.get(key).and_then(|value| *value).is_none());
         }
-        assert!(!windows_env.contains_key("LIB"));
-        assert!(!windows_env.contains_key("INCLUDE"));
+        for name in ["LIB", "INCLUDE"] {
+            let inherited = env::vars_os().find_map(|(key, value)| {
+                key.to_string_lossy()
+                    .eq_ignore_ascii_case(name)
+                    .then_some(value)
+            });
+            let configured = windows_command.get_envs().find_map(|(key, value)| {
+                key.to_string_lossy()
+                    .eq_ignore_ascii_case(name)
+                    .then_some(value)
+            });
+            assert_eq!(configured.flatten(), inherited.as_deref(), "{name}");
+        }
         assert_native_tool_environment_removed(&windows_env, &windows.target);
     }
     #[test]

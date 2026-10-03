@@ -866,7 +866,13 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use std::fs;
-    use std::process::Command;
+    fn successful_status() -> std::process::ExitStatus {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(0)
+    }
     fn log_output(mut commits: Vec<Value>) -> BoundedProcessOutput {
         for index in 0..commits.len() {
             let parent =
@@ -874,7 +880,7 @@ mod tests {
             commits[index]["parent"] = parent.unwrap_or(serde_json::Value::Null);
         }
         BoundedProcessOutput {
-            status: Command::new("true").status().unwrap(),
+            status: successful_status(),
             stdout: serde_json::json!({"commits": commits, "truncated": false}).to_string(),
             stderr: String::new(),
             duration: std::time::Duration::ZERO,
@@ -891,7 +897,7 @@ mod tests {
     }
     #[test]
     fn index_rejects_network_or_partial() {
-        let status = Command::new("true").status().unwrap();
+        let status = successful_status();
         let out = BoundedProcessOutput { status, stdout: r#"{"status":"indexed","failed_files":0,"network_allowed":false,"network_opt_in":false,"commit":{"commit_type":"auto","message":"kio index auto snapshot"}}"#.into(), stderr: String::new(), duration: std::time::Duration::ZERO };
         assert!(validate_result("index", &out, None).is_ok());
         let out = BoundedProcessOutput { stdout: r#"{"status":"indexed","failed_files":1,"network_allowed":false,"network_opt_in":false,"commit":{"commit_type":"auto","message":"kio index auto snapshot"}}"#.into(), ..out };
@@ -901,7 +907,7 @@ mod tests {
     #[test]
     fn successful_replay_command_rejects_stderr() {
         let out = BoundedProcessOutput {
-            status: Command::new("true").status().unwrap(),
+            status: successful_status(),
             stdout: r#"{"status":"initialized"}"#.into(),
             stderr: "degraded cache write\n".into(),
             duration: std::time::Duration::ZERO,
@@ -913,7 +919,7 @@ mod tests {
     }
     #[test]
     fn malformed_json_is_rejected() {
-        let status = Command::new("true").status().unwrap();
+        let status = successful_status();
         let out = BoundedProcessOutput {
             status,
             stdout: "not-json".into(),
