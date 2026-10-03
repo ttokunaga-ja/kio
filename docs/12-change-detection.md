@@ -55,6 +55,14 @@ Windows の通知欠落時には subtree の列挙が必要になる。USN は N
 [Change Journal Records](https://learn.microsoft.com/en-us/windows/win32/fileio/change-journal-records)、
 [Journal lifecycle](https://learn.microsoft.com/en-us/windows/win32/fileio/creating-modifying-and-deleting-a-change-journal)
 
+Windows backend はrootごとに独立した2つのhandleで、名前・サイズ・更新日時の通知と、属性・securityの
+通知を購読する。前者のModified通知だけは、観測できた通常directory自身の更新を抑止する。
+これはKioのlock作成・削除による親directoryの自己通知を収束させるためであり、control path、
+file、reparse point、観測失敗、作成・削除・rename、属性・security通知は抑止しない。
+どちらかの購読が失敗した場合はbackend低下とroot再照合を記録する。停止時は未完了I/Oの
+cancel完了を確認してworkerをjoinしてからhandleとbufferを解放する。通知の解釈はauthorityの
+検証を代替せず、通常のbinding再確認と定期照合を維持する。
+
 永続 cursor は volume identity、journal identity、root identity と組にする。Linux の inotify watch ID は
 永続 cursor として保存しない。OS 共通 API はイベントだけでなく、`rescan_required`、監視範囲、
 継続性、backend failure を表現する。ネットワーク共有や仮想ファイルシステムでは、通知能力を検出して
