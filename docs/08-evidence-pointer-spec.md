@@ -137,6 +137,27 @@ CLI の `<pointer>` 引数はすべて以下の受理規則に従う (優先順�
 
 bulk 系 (`kio evidence verify --batch <pointers.jsonl>`) は従来どおり各行 JSON object。
 
+## 2.4 識別子の安定性と引用の保持
+
+引用の識別子が不変であることと、原本・本文をいつでも解決できることは別である。
+auto / repaired commit の tree は retention GC で shallow 化され得る。raw / chunk が残っていても、
+必要な tree がなければ本文解決は §3.1 手順2aで拒否する。purge / erase、scope喪失、破損、
+現在のIgnore・policyによる拒否も、解決可能性に影響する。
+
+現行の `kio tag <name> <commit>` は同じchain内の保持されたcommitへ名前を付け、HEAD/tag tipを
+retention GCのshallow候補から除外する ([06-cli-spec.md §6.1](06-cli-spec.md))。
+重要な引用を保持する場合は、そのpointerが示す正確なcommitをshallow化される前にtag対象とする。
+最新状態のmanual snapshotや復元commitのprovenanceは、元pointerのcommitを保護する代わりにならない。
+既にshallow化されたcommitへのtag作成は拒否され、tagは明示purge/eraseを防ぐ保証でもない。
+
+tagの削除・再作成はCLI仕様上の操作だが、2026-10-03の開発版では削除の引数・実行経路が未接続である。
+tag名は内容固定の引用識別子として使わず、既発行pointerをtagや最新版へ黙って付け替えない。
+既存exportは原本ファイルの書き出しであり、別環境でpointerを検証・解決する自立bundleとは異なる。
+
+2026-10-03承認の追加方針では、既存tagを利用した引用保持と削除影響の表示を先に改善する。
+引用群の登録・自立bundle・文書lineageは詳細契約を別途固定する。
+実装順序と受入条件は [実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md) を参照する。
+
 ---
 
 # 3. Evidence Pointer の解決

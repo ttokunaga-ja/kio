@@ -174,6 +174,11 @@ kio evidence retarget <pointer> --at <commit> # exact-only read-only retarget。
 
 本表はコマンド全量の spec である。MVP での採否・実装 Step の正本は [09-mvp-scope.md §1 / §3.1](09-mvp-scope.md)。
 
+2026-10-03実装照合: `tag --delete` は上記の要求契約であり、現行の `kio-cli::TagArgs` と
+`kio-app::Command::Tag` は作成経路だけを接続している。削除を実装済み・配布済みと扱わず、
+[v1完成と後続改善の計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md) のK2で既存要件の
+残差として解消する。tag作成によるretention保護と、tag解除・引用への影響表示の完成は別である。
+
 ### Device-global ledger recovery
 
 `kio ledger recover` は scope と `.kio` 設定から独立した device-global command である。成功時の

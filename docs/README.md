@@ -17,14 +17,19 @@ Kio は **local-first** な知識アーカイブ。データの主権はあな�
 1. Evidence Pointer        path ではなく commit / tree / raw_hash / chunk_hash / span で根拠を指す
 2. Markdown 正規化         全ファイル種別を Normalized Markdown に変換、人間と AI が同じビューを使う
 3. Content-addressed CAS   全ファイルを CAS object として保存。削除済み・過去版・移動済みでも到達可能
-                           (ユーザー明示の purge / erase を除く)
+                           (必要な履歴の保持と現行policyによる許可が必要。shallow / purge / erase は別扱い)
 ```
 
 最低体験ライン:
 
+引用の意味は不変でも、本文解決には必要な履歴の保持と現在のpolicyが必要である。
+重要な版のtag保護とshallow / purge / eraseの違いは
+[08-evidence-pointer-spec.md §2.4](08-evidence-pointer-spec.md#24-識別子の安定性と引用の保持) を参照する。
+
 ```bash
 kio init
-kio index --approve      # 取り込み + ベースライン index (成功時に auto snapshot)
+kio index --preview      # ローカル取り込み対象と送信policyを確認
+kio index --offline --yes # ローカル取り込み + ベースライン index。HTTPを禁止
 kio search "あの PDF"
 kio open <検索結果の pointer>
 ```
@@ -58,7 +63,8 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 # 1. ドキュメント構成 と Reading Path
 
 `docs/` 直下に実装スペック、製品要件、明示した設計提案を置く。`README.md` (本書) を最初に読み、
-続いて `01-` から `13-` の順に読む。`11-` は製品要件、`12-` と `13-` は承認済み・未実装の設計方針である。
+続いて `01-` から `13-` の順に読む。`11-` は製品要件、`12-` と `13-` は承認済み方針、
+現行実装との対応、未実装の追加改善を区別して記録する。実装済みを3 OS受入・配布済みと同一視しない。
 
 | 順 | ファイル | 役割 |
 | --- | --- | --- |
@@ -74,8 +80,8 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 | **09** | [09-mvp-scope.md](09-mvp-scope.md) | MVP scope / RC platform support matrix / non-authorizing roadmap / Step 1-4 + 規模上限 / 北極星シナリオ / 凍結ゲート |
 | **10** | [10-operations.md](10-operations.md) | 横断規約 (semver / 観測ログ / 命名リネーム表 / 初回スキャン承認 / Adapter セキュリティ) |
 | **11** | [11-product-requirements.md](11-product-requirements.md) | **製品要件の正本**: v1 の到達要求、RCとの区別、v2/v3 の境界、検証要求 |
-| **12** | [12-change-detection.md](12-change-detection.md) | **承認済み方針・未実装**: OSイベント、差分走査、欠落復旧、子scope自動管理 |
-| **13** | [13-linear-history.md](13-linear-history.md) | **承認済み方針・未実装**: 線形履歴、全体・選択パスの復元、公開と復旧 |
+| **12** | [12-change-detection.md](12-change-detection.md) | **承認済み方針・実装対応**: OSイベント、差分走査、欠落復旧、子scope自動管理、後続の版別状態表示 |
+| **13** | [13-linear-history.md](13-linear-history.md) | **承認済み方針・実装対応**: 線形履歴、管理対象復元、公開・回復、tag保持、後続の操作表示 |
 01〜10 は実装・運用契約、11 は製品要件である。契約が RC の現状や提案を記録する場合、v1 の到達要求と実装済みを混同しない。旧統合要件ドラフトは current consumer がなく、旧 CLI/schema を残すだけだったため削除済みである。
 
 ## 1.1 設計検討メモ (撤去済み)
@@ -92,6 +98,12 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 # 2. Phase Plan と Step 計画
 
 詳細は [09-mvp-scope.md](09-mvp-scope.md)。
+
+現在のv1実行工程は [v1完成計画](../tasks/v1-completion-plan-2026-09-08.md)、候補別の実装・検証は
+[進捗記録](../tasks/v1-implementation-progress.md) を参照する。2026-10-03承認の
+[保存・復元・引用保持の実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md) は、
+既存v1受入を維持し、後続に版別状態表示、既存tagによる引用保持、復元操作表示を追加する。
+jj連携・引用bundle・文書lineageは着手条件付きの検討候補であり、追加機能はまだ実装済みではない。
 
 ```
 Phase 1: Evidence 基盤    raw / normalized / chunk / Evidence Pointer
@@ -141,7 +153,7 @@ M3-3: 「削除したはずの資料から特定の数字を再発見」
 
 ADR (Architecture Decision Records) フォルダは廃止しました。本プロジェクトでは:
 
-- **正本は `docs/*.md` の 10 本 spec** (current truth)
+- **実装・運用契約の正本は01〜10、製品要件は11**。12・13は承認済み方針、実装対応、後続改善を区別する。
 - 「なぜそう決めたか」は spec の各セクション冒頭に短く埋め込む (例: `01-positioning.md §1.1`「なぜ local-first であって offline-first ではないか」)
 - 設計検討メモ (旧 `docs/research/`) は 2026-07-18 に撤去済み — 経緯は git history で辿れる
 

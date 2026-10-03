@@ -10,26 +10,32 @@ heavy lifting (OCR, embedding) uses frontier models, on explicit opt-in.
 
 Secondary framing: *evidence-grounded local knowledge archive*.
 
-**Status: pre-release.** The MVP pipeline is implemented and passes its contract
-suite. [`v0.1.0-rc.1`](https://github.com/ttokunaga-ja/kio/releases/tag/v0.1.0-rc.1)
-is published as a GitHub pre-release; the CLI surface can still change. It is a
-CLI; there is no GUI.
+**Status: pre-release.** As of October 3, 2026, the latest published pre-release is
+[`v0.1.0-rc.3`](https://github.com/ttokunaga-ja/kio/releases/tag/v0.1.0-rc.3).
+Current development includes watch, managed restore, and recovery changes beyond
+that release. v1 acceptance is incomplete; implementation, local checks,
+three-OS acceptance, and packaged-binary verification are recorded separately in
+[the implementation record](tasks/v1-implementation-progress.md).
+The CLI surface can still change. There is no GUI.
 
 ---
 
 ## What it does differently
 
 **1. Evidence Pointer.** Results point at `commit / tree / raw_hash /
-chunk_hash / span`, not at a path. Move the file, rename it, or delete it, and
-the citation still resolves. Paths rot; content addresses do not.
+chunk_hash / span`, not at a path. Moving, renaming, or normally deleting a file
+does not change its citation identity. Resolving the citation still requires its
+retained version and current scope policy; shallow GC, purge, or erase can make
+it unavailable. See [citation retention](docs/08-evidence-pointer-spec.md#24-識別子の安定性と引用の保持).
 
 **2. Markdown normalization.** Every format is converted to normalized Markdown,
 so a human and a model read the same view of a scanned PDF, a slide deck, and a
 source file.
 
-**3. Content-addressed store.** Files are kept as CAS objects, so past versions,
-moved files, and deleted files remain reachable — except where you explicitly
-`purge` or `erase` them.
+**3. Content-addressed store.** Files are kept as CAS objects. Past versions and
+normally deleted files can be accessed while the required history is retained
+and current policy permits it. Tags protect their target versions from retention
+shallowing; explicit `purge` / `erase` and missing history have separate effects.
 
 ## Who it is for
 
@@ -47,7 +53,7 @@ kio search "あの PDF"
 kio open <pointer from the results>
 ```
 
-The [`v0.1.0-rc.1` GitHub pre-release](https://github.com/ttokunaga-ja/kio/releases/tag/v0.1.0-rc.1)
+The [`v0.1.0-rc.3` GitHub pre-release](https://github.com/ttokunaga-ja/kio/releases/tag/v0.1.0-rc.3)
 is public. Its archive verification, installation, uninstallation, platform
 support, and signing-status procedures are defined in
 [docs/10-operations.md §12](docs/10-operations.md#12-rc-draft-artifact-の検証と導入).
@@ -83,8 +89,14 @@ lifetime, and revocation rules.
 ## Documentation
 
 [docs/README.md](docs/README.md) is the entry point and defines the reading
-order. The numbered files under `docs/` are the **normative specification** —
-the implementation follows them, not the other way around.
+order. The numbered files distinguish current implementation contracts, product
+requirements, approved design directions, and planned additions. Implementation
+follows the applicable contracts; a plan alone is not evidence of delivery.
+
+The [approved knowledge UX plan](tasks/knowledge-ux-implementation-plan-2026-10-03.md)
+keeps the CAS and immutable citations, completes existing v1 acceptance first,
+then improves version-specific readiness, citation retention using existing tags,
+and restore status. These additions are planned, not delivered functionality.
 
 ## Contributing
 
@@ -137,17 +149,25 @@ Kio は、手元にある PDF・Office 文書・画像・コード・メモを�
 あなたのマシンにあり、OCR や Embedding といった重い計算には frontier AI を使います
 (明示的な opt-in 後)。
 
-**状態: プレリリース。** MVP パイプラインは実装済みで契約テストを通過しています。
-[`v0.1.0-rc.1`](https://github.com/ttokunaga-ja/kio/releases/tag/v0.1.0-rc.1) は
-GitHub pre-release として公開済みですが、CLI の仕様は変わりえます。GUI はありません。
+**状態: プレリリース。** 2026年10月3日時点の最新配布版は
+[`v0.1.0-rc.3`](https://github.com/ttokunaga-ja/kio/releases/tag/v0.1.0-rc.3) です。
+開発版には、その配布版以降の監視・管理対象復元・回復の変更があります。v1受入は未完了であり、
+実装・ローカル検証・3 OS受入・配布物確認は [進捗記録](tasks/v1-implementation-progress.md) で
+区別しています。CLI の仕様は変わりえます。GUI はありません。
 
 ## 中核 3 点
 
 1. **Evidence Pointer** — 検索結果は path ではなく `commit / tree / raw_hash /
-   chunk_hash / span` を指します。ファイルを移動・改名・削除しても根拠は解決できます。
+   chunk_hash / span` を指します。移動・改名・通常削除で引用の識別子は変わりません。
+   解決には必要な版の保持と現行policyによる許可が必要です。
 2. **Markdown 正規化** — 全形式を正規化 Markdown に変換し、人間と AI が同じビューを見ます。
-3. **Content-addressed CAS** — 過去版・移動済み・削除済みのファイルにも到達できます
-   (明示的な `purge` / `erase` を除く)。
+3. **Content-addressed CAS** — 必要な履歴を保持し現行policyが許可する範囲で、過去版や通常削除した
+   ファイルへ到達できます。tagは対象版の保持期限によるshallow化を防ぎます。明示的な
+   `purge` / `erase`、履歴欠損の影響は別に扱います。
+
+引用の保持範囲は [Evidence Pointer仕様](docs/08-evidence-pointer-spec.md#24-識別子の安定性と引用の保持)、
+承認済みの改善工程は [保存・復元・引用保持の実装計画](tasks/knowledge-ux-implementation-plan-2026-10-03.md)
+を参照してください。追加改善は未実装です。
 
 ## 対象ユーザー
 

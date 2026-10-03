@@ -1,8 +1,14 @@
-# 12 Change Detection — v1 design direction
+# 12 Change Detection — design direction and current status
 
-本書の設計方針は 2026-09-07 に承認済みであり、実装済みの契約ではない。
-詳細な実装契約を固定する工程は [v1-implementation-plan.md](../tasks/v1-implementation-plan.md) を参照する。
-製品の到達要求は [11-product-requirements.md](11-product-requirements.md) を参照する。
+本書の設計方針は 2026-09-07 に承認済みである。以下には当初の設計理由と検証項目も残しており、
+各段落を一律に実装済みの契約と読まない。現行 CLI と watch の詳細契約は
+[06-cli-spec.md](06-cli-spec.md) を正本とする。`watch run/status/stop` とログインユーザーの
+service lifecycle、起動・定期・通知欠落時の再照合は実装されている。`watch status` には
+backlog、監視能力の低下、最終成功時刻、最終失敗がある。ただし、個々のファイルの版ごとに
+原本保存・抽出・全文検索・embedding の準備状態を示す機能は今後の改善である。
+実装と 3 OS の最終受入は別の判定とし、現行候補の最終受入完了は主張しない。
+[v1 進捗記録](../tasks/v1-implementation-progress.md)、[今後の実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md)、
+[製品要求](11-product-requirements.md) を参照する。
 
 ## 1. 方針
 
@@ -112,16 +118,21 @@ Ignore の変更は既存子にも適用する。新規発見を止めるだけ�
 
 symlink/junction と未登録の mount 境界を既定で越えない。別 volume を対象とする場合は root として明示登録する。
 Unix の device ID だけでは同一 filesystem の bind mount を区別できないので、各 OS の mount 情報も必要になる。
-Windows の通知 API の実装だけでは、安全に `.kio` を作る retained-handle mutation の未対応は解消しない。
+通知 API の実装だけでは安全な `.kio` 更新の証明にならない。Windows の保存・回復経路も、
+現行候補の実装と最終 native 受入を分けて検証する。
 
-## 6. v1 の検証と残る決定
+## 6. v1 の検証と次の改善
 
 3 OS で、空フォルダ、新規・変更・削除・rename・移入、深い subtree、同サイズ上書き、mtime 保存、Ignore の
 追加・解除、既存子の失効、root 移動、監視 overflow、watch 上限、停止・再起動、処理途中 crash を検証する。
 自動処理と手動 `index` が同じ最終状態に収束し、承認なしの外部通信が発生しないことを確認する。
 OS 固有 integration test と、通知の欠落・重複を注入する共通 engine test の両方が必要である。
 
-v1 には CLI から起動・停止・状態確認できる継続プロセスが必要になる。OS の通知自体が `.kio` を作るわけではない。
-foreground の watch 実行を最小形とし、ログインユーザーの service としての起動方法を各 OS で定義する。
-管理者常駐プロセスを前提にしない。具体的な CLI 名、debounce/最大遅延、整合性確認周期、対応 filesystem は
-受入試験と運用負荷を踏まえて確定する。これらの数値・API 選定は本書では既決扱いしない。
+継続プロセスの CLI とログインユーザーの native service lifecycle は [06-cli-spec.md](06-cli-spec.md) に
+定義され、実装されている。各 OS の native lifecycle と最終候補の受入結果は進捗記録で個別に判定する。
+
+次の改善では、scope 全体の watch 状態に加えて、ファイルの版・内容 hash に紐付く原本保存、抽出、
+全文検索、embedding の準備状態を利用者が確認できるようにする。これらを単一の完了率にまとめず、
+例えば原本保存済みで OCR 承認待ち、全文検索可能で embedding 未作成、旧版は検索可能で最新版は
+処理中という違いを表す。状態表示の追加は保存・検索正本の変更や 3 OS 受入完了を意味しない。
+具体的な受入条件と順序は [実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md) に置く。
