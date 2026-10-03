@@ -103,6 +103,8 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 [進捗記録](../tasks/v1-implementation-progress.md) を参照する。2026-10-03承認の
 [保存・復元・引用保持の実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md) は、
 既存v1受入を維持し、後続に版別状態表示、既存tagによる引用保持、復元操作表示を追加する。
+直近の実行順序と最終候補の証跡は
+[既存v1の受入完了と文書整合](../tasks/v1-acceptance-closeout-plan-2026-10-03.md) を参照する。
 jj連携・引用bundle・文書lineageは着手条件付きの検討候補であり、追加機能はまだ実装済みではない。
 
 ```
