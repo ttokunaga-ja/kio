@@ -32,10 +32,14 @@ const MAX_SCOPE_COUNT: usize = 4096;
 const MAX_DIRECTORY_ENTRIES: usize = 16384;
 const PRE_IGNORED_SEARCH_TOKEN: &str = "preignoredchildsentinelword";
 const POST_IGNORED_SEARCH_TOKEN: &str = "postignoredchildsentinelword";
-// This bounds a semantic convergence check over 39 independently durable
-// scopes, including a 33-level chain. It is not the v1 performance benchmark:
-// the observed macOS pass took 28s even without concurrent build load.
+// Startup, A03 recovery, and graceful stop have a separate bounded wait from
+// A02's larger post-mutation discovery workload.
 const WATCH_TIMEOUT: Duration = Duration::from_secs(120);
+// A02 enrolls 39 independently durable scopes, including a 33-level chain.
+// Their control-file notifications can require a second full reconciliation.
+// A macOS diagnostic reached an empty queue after 229s with every receipt
+// predicate intact. This semantic check is not the v1 performance benchmark.
+const A02_POST_MUTATION_TIMEOUT: Duration = Duration::from_secs(300);
 // The native acceptance leg proves startup and OS notification convergence.
 // Keep its periodic fallback beyond either bounded wait so a healthy full scan
 // cannot continually refill the backlog while A02 checks for an idle watcher.
@@ -110,6 +114,7 @@ pub fn run_a02(options: &NativeOptions) -> Result<AcceptanceReceipt, AcceptanceE
         &mut child,
         initial_success,
         "native mutations",
+        A02_POST_MUTATION_TIMEOUT,
     )?;
 
     // This is deliberately a foreground watcher stop; Drop remains the RAII
@@ -1312,7 +1317,14 @@ fn wait_running(
     device: &DeviceRoot,
     child: &mut WatchChild,
 ) -> Result<u64, AcceptanceError> {
-    wait_until(options, device, child, None, "initial reconciliation")
+    wait_until(
+        options,
+        device,
+        child,
+        None,
+        "initial reconciliation",
+        WATCH_TIMEOUT,
+    )
 }
 
 fn wait_for_convergence(
@@ -1321,8 +1333,9 @@ fn wait_for_convergence(
     child: &mut WatchChild,
     after_success: u64,
     phase: &str,
+    timeout: Duration,
 ) -> Result<(), AcceptanceError> {
-    wait_until(options, device, child, Some(after_success), phase).map(|_| ())
+    wait_until(options, device, child, Some(after_success), phase, timeout).map(|_| ())
 }
 
 fn wait_until(
@@ -1331,8 +1344,9 @@ fn wait_until(
     child: &mut WatchChild,
     after_success: Option<u64>,
     phase: &str,
+    timeout: Duration,
 ) -> Result<u64, AcceptanceError> {
-    let deadline = Instant::now() + WATCH_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         child.check()?;
         // Re-read the externally supplied fixture on each poll. This prevents a

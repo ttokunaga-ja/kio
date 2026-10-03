@@ -164,3 +164,41 @@ Windows専用accountとSSH forward制限、WSLのstream-local forward拒否の�
 一時configでparser検証した。稼働設定の変更やservice reloadは行っていない。
 Tailscale policy/OIDC、専用key/account、Environmentへの設定適用は、具体差分の承認と
 fresh状態確認の後に実施する。readback、parser成功、接続/拒否/cleanup、GPU runtimeは別の判定である。
+
+## 9. 次候補に向けたC3再検証と待機上限の是正
+
+`9a37b0f13af73bd89735a4c38c97892f08aeb7ce` は履歴fixtureとnative watcherのperiodic間隔を
+是正した候補。mainへlocal commitし、元からあった132件の未追跡WIPはpath・内容・metadataを保持した。
+この候補もpushしておらず、以下は最終受入の代替ではない。
+
+| 検証 | 結果と扱い |
+|---|---|
+| macOS全体回帰 | app 321件はpass。evalは493件pass・ACL 3件fail。検証用のminimal environmentで標準USERを除外したことが原因。実UID由来のUSER/LOGNAMEを渡すと3件の個別再試験はpass。全体成功とはまだ数えない |
+| macOSその他CI相当 | fmt・strict Clippy・release workspace・shell/action-pin・Persona W0はpass |
+| macOS配布物再生成 | 隔離した2回のpackage hashが一致。verify・展開・smokeはpass。archive `d13b47ab20096f727f43141646e671b535a7a71211a6bd23ae5fc3fbeaae0e4c`、binary `bb55fd1c414976be1954e068f5b2019ab5d65c240f96b7b1de6110328fbceeb4` |
+| macOS native診断 | 10件pass、A02はnative full scanのbacklogが残り120秒でfail。periodic間隔600秒への修正だけでは足りなかった。失敗記録とqueueを保存 |
+| Docker Linux回帰 | 固定候補のfmt・strict Clippy・shell/action-pin・Persona W0はpass。全体試験は検証containerのmemory上限、次いで12 GiB tmpfs満杯によるlinker停止。製品assertion失敗とは判定しないが全体passでもない。容量を調整した隔離環境で再検証する |
+| security追加差分 | `3494f492..9a37b0f1` の変更source 2件と文書2件を検証し、sealed reportの確認findingは0件。要求したDaybreak Blueの実backend独立確認は未成立のまま |
+
+A02の保存記録を照合すると、41件のauto commitは39スコープの現HEADと置き換わったルートの2件に
+対応する。既存childを毎回再登録する実装経路はなく、繰り返し同一treeのcommitを作った証拠でもない。
+初回登録のcontrol-file通知による後続走査と整合するが、保存ログだけでOSイベントの全path/kindは断定できない。
+
+そこで、隔離cloneのevaluatorだけに変更後の待機上限300秒を与えたcreate-only診断を1回実行した。
+元の候補binaryを使用し、初期/停止120秒、periodic600秒、running・新しい成功時刻・backlogゼロ・
+非degraded・各pollのinput hash・境界確認・停止後の厳密manifest比較をすべて維持した。
+初期成功から約229秒後に空queueへ収束し、全体381秒で比較もpassした。
+このsource overlayの結果を候補束縛されたA02 receiptとして扱わない。
+
+次の是正はA02の変更後待機だけを300秒にする。製品watcherのdefault、初期/停止上限、A03回復、
+既存の合否predicateは変更しない。正式な新候補で全体回帰とpackage/nativeの必要な検証を取り直す。
+各候補の失敗・環境補正・診断・受入の4状態を分けて保存する。
+
+C2ではWindows C:が約11 MiBまで不足し、WSLはuser lookup errorの後Stoppedと観測された。
+停止原因は未確定で、こちらからshutdown/restart/remountは実行していない。固定volumeはC:だけであり、
+TEMP調査には安全な容量回収対象を特定できなかった。WSL/DockerのVHDXと研究WIPは保存する。
+host healthと空き容量の条件が成立するまで、SSH route本適用とGPU試験を進めない。
+
+新規Tailscale policy/OIDCとGitHub Environmentの具体案はrepo外の確認packetへ整理した。
+Mac→WindowsのSSHを保持する一方、既存wildcardの削除はWindows→Mac/RDP等に影響する。
+新しい永続credentialの保存前の承認を待ち、設定完了・runtime・最終51件受入は別々に判定する。
