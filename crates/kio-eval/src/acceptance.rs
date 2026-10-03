@@ -2347,9 +2347,14 @@ pub fn run_a09(options: &A09Options) -> Result<AcceptanceReceipt, AcceptanceErro
 fn assert_a09_public_gc(binary: &Path, isolated: &Path) -> Result<(), AcceptanceError> {
     use kio_core::cas::{ObjectKind, ObjectStore};
     use kio_core::gc::read_shallow_receipts;
+    use kio_core::portable::{PORTABLE_TAGS_DIRECTORY, portable_tag_leaf};
 
     const OLD: &[u8] = b"# A09 public GC seed v1\n\nHistorical public acceptance text.\n";
     const CURRENT: &[u8] = b"# A09 public GC seed v2\n\nCurrent public acceptance text.\n";
+    // All three sigma spellings must address the same portable tag ref.
+    const OLD_TAG: &str = "a09-gc-Σ";
+    const DELETE_ALIAS: &str = "a09-gc-ς";
+    const RECREATE_ALIAS: &str = "a09-gc-σ";
     let scope = isolated.join("gc-scope");
     fs::create_dir(&scope).map_err(io_error)?;
     let document = scope.join("document.md");
@@ -2428,11 +2433,120 @@ fn assert_a09_public_gc(binary: &Path, isolated: &Path) -> Result<(), Acceptance
         .object_path(ObjectKind::Tree, current_tree)
         .map_err(|error| AcceptanceError::Command(error.to_string()))?;
     let current_tree_before = fs::read(&current_path).map_err(io_error)?;
-    if !old_path.is_file() {
+    let old_tree_before = fs::read(&old_path).map_err(io_error)?;
+    let ledger_before = ledger_artifacts_fingerprint(&isolated.join("xdg-data/kio"))?;
+    let old_tag = command_json(
+        binary,
+        isolated,
+        &scope,
+        &["--json", "tag", OLD_TAG, old_commit],
+    )?;
+    let retained_tag = command_json(
+        binary,
+        isolated,
+        &scope,
+        &["--json", "tag", "a09-gc-retained", current_commit],
+    )?;
+    let old_ref = PathBuf::from(required_json_string(&old_tag, "/path", "A09 GC old tag")?);
+    let retained_ref = PathBuf::from(required_json_string(
+        &retained_tag,
+        "/path",
+        "A09 GC retained tag",
+    )?);
+    let tags_path = kio.join("refs").join(PORTABLE_TAGS_DIRECTORY);
+    let names_path = tags_path.join("names.jsonl");
+    let names_before = fs::read(&names_path).map_err(io_error)?;
+    let retained_ref_before = fs::read(&retained_ref).map_err(io_error)?;
+    if old_tag["tag"] != OLD_TAG
+        || old_tag["commit_hash"] != *old_commit
+        || retained_tag["tag"] != "a09-gc-retained"
+        || retained_tag["commit_hash"] != *current_commit
+        || old_ref != tags_path.join(portable_tag_leaf(OLD_TAG))
+        || retained_ref != tags_path.join(portable_tag_leaf("a09-gc-retained"))
+        || fs::read(&old_ref).map_err(io_error)? != old_commit.as_bytes()
+        || retained_ref_before != current_commit.as_bytes()
+    {
         return Err(AcceptanceError::Command(
-            "A09 GC old tree was absent before sweep".into(),
+            "A09 GC tag setup did not bind the intended commits and refs".into(),
         ));
     }
+    let protected = command_json(binary, isolated, &scope, &["--json", "gc", "--dry-run"])?;
+    if protected["candidate_count"] != 0 || protected["candidates"] != serde_json::json!([]) {
+        return Err(AcceptanceError::Command(format!(
+            "A09 GC old auto snapshot was not protected by its tag: {protected}"
+        )));
+    }
+    let deleted = command_json(
+        binary,
+        isolated,
+        &scope,
+        &["--json", "tag", "--delete", DELETE_ALIAS],
+    )?;
+    if deleted["operation"] != "tag_delete"
+        || deleted["status"] != "deleted"
+        || deleted["tag"] != DELETE_ALIAS
+        || deleted["commit_hash"] != *old_commit
+        || deleted["path"] != old_tag["path"]
+        || old_ref.exists()
+        || fs::read(&names_path).map_err(io_error)? != names_before
+        || fs::read(&retained_ref).map_err(io_error)? != retained_ref_before
+        || fs::read(kio.join("HEAD")).map_err(io_error)? != head_before
+        || fs::read(&old_path).map_err(io_error)? != old_tree_before
+        || fs::read(&current_path).map_err(io_error)? != current_tree_before
+        || ledger_artifacts_fingerprint(&isolated.join("xdg-data/kio"))? != ledger_before
+    {
+        return Err(AcceptanceError::Command(format!(
+            "A09 GC tag deletion changed retained state: {deleted}"
+        )));
+    }
+    let recreated = command_json(
+        binary,
+        isolated,
+        &scope,
+        &["--json", "tag", RECREATE_ALIAS, old_commit],
+    )?;
+    let names_recreated = fs::read(&names_path).map_err(io_error)?;
+    if recreated["tag"] != RECREATE_ALIAS
+        || recreated["path"] != old_tag["path"]
+        || recreated["commit_hash"] != *old_commit
+        || !names_recreated.starts_with(&names_before)
+        || names_recreated.len() <= names_before.len()
+        || fs::read(&old_ref).map_err(io_error)? != old_commit.as_bytes()
+    {
+        return Err(AcceptanceError::Command(
+            "A09 GC deleted tag could not be recreated with an appended name audit".into(),
+        ));
+    }
+    let deleted_again = command_json(
+        binary,
+        isolated,
+        &scope,
+        &["--json", "tag", "--delete", OLD_TAG],
+    )?;
+    if deleted_again["operation"] != "tag_delete"
+        || deleted_again["status"] != "deleted"
+        || deleted_again["tag"] != OLD_TAG
+        || deleted_again["commit_hash"] != *old_commit
+        || deleted_again["path"] != old_tag["path"]
+        || old_ref.exists()
+        || fs::read(&names_path).map_err(io_error)? != names_recreated
+        || fs::read(&retained_ref).map_err(io_error)? != retained_ref_before
+        || fs::read(kio.join("HEAD")).map_err(io_error)? != head_before
+        || fs::read(&old_path).map_err(io_error)? != old_tree_before
+        || fs::read(&current_path).map_err(io_error)? != current_tree_before
+        || ledger_artifacts_fingerprint(&isolated.join("xdg-data/kio"))? != ledger_before
+    {
+        return Err(AcceptanceError::Command(
+            "A09 GC recreated tag deletion changed its public contract or name audit".into(),
+        ));
+    }
+    let missing = command_json_failure(
+        binary,
+        isolated,
+        &scope,
+        &["--json", "tag", "--delete", DELETE_ALIAS],
+    )?;
+    require_error_code(&missing, "KIO-E-STORE-NOT-FOUND-001", "A09 GC missing tag")?;
     assert_a09_readonly_inventory(binary, isolated, &scope, &[old_tree, current_tree], &[])?;
     let preview = command_json(binary, isolated, &scope, &["--json", "gc", "--dry-run"])?;
     if preview["candidate_count"] != 1

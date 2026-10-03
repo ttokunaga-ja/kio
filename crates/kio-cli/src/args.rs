@@ -31,7 +31,7 @@ pub(crate) enum Command {
     Diff(DiffArgs),
     /// Inspect an object by hash.
     Inspect(InspectArgs),
-    /// Create or show a tag.
+    /// Create or delete a tag.
     Tag(TagArgs),
     /// Ingest and normalize files in the current scope.
     Index(IndexArgs),
@@ -176,6 +176,9 @@ pub(crate) struct InspectArgs {
 pub(crate) struct TagArgs {
     pub(crate) name: String,
     pub(crate) commit: Option<String>,
+    /// Delete an existing tag while preserving its name audit record.
+    #[arg(long, conflicts_with = "commit")]
+    pub(crate) delete: bool,
 }
 #[derive(Debug, Args)]
 pub(crate) struct ExportArgs {
@@ -632,7 +635,7 @@ plain_from!(SnapshotCreateArgs => SnapshotCreateArgs { message });
 plain_from!(LogArgs => LogArgs { at, since });
 plain_from!(DiffArgs => DiffArgs { a, b });
 plain_from!(InspectArgs => InspectArgs { hash });
-plain_from!(TagArgs => TagArgs { name, commit });
+plain_from!(TagArgs => TagArgs { name, commit, delete });
 plain_from!(ExportArgs => ExportArgs { source, to, force, yes });
 plain_from!(RestoreArgs => RestoreArgs { source, paths, delete_missing, expected_head, preview, message });
 plain_from!(GcArgs => GcArgs { dry_run, yes, prune_unreachable });

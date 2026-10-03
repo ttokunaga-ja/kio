@@ -174,10 +174,16 @@ kio evidence retarget <pointer> --at <commit> # exact-only read-only retarget。
 
 本表はコマンド全量の spec である。MVP での採否・実装 Step の正本は [09-mvp-scope.md §1 / §3.1](09-mvp-scope.md)。
 
-2026-10-03実装照合: `tag --delete` は上記の要求契約であり、現行の `kio-cli::TagArgs` と
-`kio-app::Command::Tag` は作成経路だけを接続している。削除を実装済み・配布済みと扱わず、
-[v1完成と後続改善の計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md) のK2で既存要件の
-残差として解消する。tag作成によるretention保護と、tag解除・引用への影響表示の完成は別である。
+2026-10-03の開発版で `tag --delete` をcore・app・CLIへ接続した。削除時のcommit指定は
+`KIO-E-CONFIG-USAGE-001` / exit 2で拒否する。存在しないtagは
+`KIO-E-STORE-NOT-FOUND-001` / exit 4であり、成功no-opにはしない。成功時のJSONは
+`{ "operation": "tag_delete", "status": "deleted", "tag": <name>, "commit_hash": <removed target>, "path": <canonical ref path> }`。
+削除は対象refのbytesとretained directoryを検証し、HEAD・CAS・他tagと名前の監査行を保持する。
+中断したatomic削除は再試行時に回復してから存在を確認する。既に削除が確定していれば
+残存intentを片付けて上記not-foundを返す。削除対象のcommit/treeの存在は要求しない。
+
+検証範囲と残差は [実行記録](../tasks/v1-closeout-execution-2026-10-03.md) を参照する。
+3 OSの最終候補受入・配布と、後続の引用への影響表示は別の完成条件である。
 
 ### Device-global ledger recovery
 
@@ -625,10 +631,10 @@ kio gc --dry-run --prune-unreachable [--json]
 mutation authority にはならない。
 
 走査全体で実writerと同じgateのnonblocking shared lockを保持する。macOS / Linuxはdirectory
-`flock`、Windowsはstorage format `2.0.0`のimmutableな空file `.kio/.store-gate`を
+`flock`、Windowsはstorage format `3.0.0`のimmutableな空file `.kio/.store-gate`を
 `GENERIC_READ`で開くshared `LockFileEx`を用いる。writerは同じgateのexclusive lockを
 `.lock`作成・stale回収前からowner closeまで保持する。inventoryはgateを作成・修復・変更しない。
-2.0.0のgate欠落・unsafeはfail-closedし、旧1.0.0はgate検査前に
+current 3.0.0のgate欠落・unsafeはfail-closedし、旧1.0.0/2.0.0はgate検査前に
 `KIO-E-STORE-VERSION-001` / exit 8で拒否する。非対応platformは無変更でfail-closedする。
 Windows実装についてもnative Windowsを含む3 OS Actions acceptanceは未完了のrelease gateである。
 

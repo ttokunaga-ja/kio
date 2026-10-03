@@ -18,6 +18,10 @@ three-OS acceptance, and packaged-binary verification are recorded separately in
 [the implementation record](tasks/v1-implementation-progress.md).
 The CLI surface can still change. There is no GUI.
 
+Development now uses storage format **3.0.0** for corrected Unicode tag identity.
+Older stores, including 2.0.0, are rejected without changing their bytes; no
+migration command is provided. See [the closeout execution record](tasks/v1-closeout-execution-2026-10-03.md).
+
 ---
 
 ## What it does differently
@@ -154,6 +158,10 @@ Kio は、手元にある PDF・Office 文書・画像・コード・メモを�
 開発版には、その配布版以降の監視・管理対象復元・回復の変更があります。v1受入は未完了であり、
 実装・ローカル検証・3 OS受入・配布物確認は [進捗記録](tasks/v1-implementation-progress.md) で
 区別しています。CLI の仕様は変わりえます。GUI はありません。
+
+開発版の保存形式は、Unicode tag規則を是正した **3.0.0** です。2.0.0を含む旧storeは
+bytesを変更せず拒否します。移行コマンドは提供しません。
+[受入作業の実行記録](tasks/v1-closeout-execution-2026-10-03.md) を参照してください。
 
 ## 中核 3 点
 

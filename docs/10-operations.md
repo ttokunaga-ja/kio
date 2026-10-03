@@ -1109,7 +1109,7 @@ validation 失敗は exit code 2 で停止し、`KIO-E-CONFIG-SCHEMA-001` を返
 
 ## 11.5 current-format boundary
 
-現在の保存形式は `KIO_FORMAT_VERSION = "2.0.0"` である。これは product/Cargo/release version や GUI を含む製品 v2 の到達状態とは独立する。必須の恒久 `.kio/.store-gate` を用いる concurrency protocol により、旧 Windows writer が reader gate を迂回することを防ぐための storage MAJOR bump である。
+現在の保存形式は `KIO_FORMAT_VERSION = "3.0.0"` である。これは product/Cargo/release version や製品v2/v3の到達状態とは独立する。2.0.0で導入した必須の恒久 `.kio/.store-gate` を維持し、3.0.0ではtag名のNFC + Unicode simple case foldingと未割当文字拒否を是正する。旧小文字化で作られたtagのhashを新規則で読み替えないためのstorage MAJOR bumpである。旧storeのbytesを変更する移行処理は設けない。
 
 current reader は `KIO_FORMAT_VERSION` と**完全一致**する string の `kio_format_version` だけを受理する。この判定は、すべての incompatible store に安定した `KIO-E-STORE-VERSION-001` / exit 8 を返すためだけに current schema validation より先に行う。missing、non-string、malformed、older、newer、unknown を含む任意の non-current 値は拒否し、いかなる command も拒否前に store bytes を変更してはならない。
 

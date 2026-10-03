@@ -125,6 +125,7 @@ pub struct InspectArgs {
 pub struct TagArgs {
     pub name: String,
     pub commit: Option<String>,
+    pub delete: bool,
 }
 
 #[derive(Debug, Clone)]

@@ -12,7 +12,7 @@ use kio_core::cas::{
 };
 use kio_core::dag::{CommitObject, NormalizeRef, TreeObject};
 use kio_core::gc::{GcSweepSession, read_active_marker, read_shallow_receipts};
-use kio_core::portable::portable_tag_digest64;
+use kio_core::portable::{portable_tag_digest64, portable_tag_name_has_unassigned};
 use kio_core::purge::{
     CanonicalFinalEvent, EventKind, LifecycleEvent, MAX_PURGE_RECORD_BYTES, PurgeState,
     TombstoneMode, canonical_final_event,
@@ -3298,6 +3298,15 @@ fn verify_names_jsonl(kio_dir: &Path, state: &mut State) -> Result<()> {
         }
         match serde_json::from_str::<NamesJsonlRecord>(line) {
             Ok(record) => {
+                if portable_tag_name_has_unassigned(&record.logical_name) {
+                    state.finding(
+                        "names_jsonl_corrupt",
+                        &record.digest64,
+                        "names.jsonl logical_name contains a character unassigned in Unicode 16",
+                        &[],
+                    );
+                    continue;
+                }
                 let expected_digest = portable_tag_digest64(&record.logical_name);
                 if record.digest64 != expected_digest {
                     state.finding(
@@ -5146,6 +5155,42 @@ mod tests {
         std::fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
         std::fs::write(&corrupt, b"corrupt prepared bytes").unwrap();
         assert!(verify_prepared_reference(&store, &hash, true).is_err());
+    }
+
+    #[test]
+    fn names_ledger_accepts_simple_folded_tag_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.md"), "tag target").unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let head = repo
+            .snapshot(Some("fixture"), Some("2026-10-03T00:00:00Z"))
+            .unwrap()
+            .commit_hash
+            .unwrap();
+        repo.tag("Σ", None).unwrap();
+        assert_eq!(repo.resolve_commit("ς").unwrap(), head);
+        assert!(!verify_objects(&repo).unwrap().has_remaining_findings());
+    }
+
+    #[test]
+    fn names_ledger_rejects_unicode_16_unassigned_logical_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let name = "future\u{0378}";
+        let names = names_jsonl_path(repo.kio_dir());
+        std::fs::create_dir_all(names.parent().unwrap()).unwrap();
+        let row = json!({
+            "digest64": portable_tag_digest64(name),
+            "logical_name": name,
+            "recorded_at": "2026-10-03T00:00:00Z",
+        });
+        std::fs::write(&names, format!("{row}\n")).unwrap();
+
+        let report = verify_objects(&repo).unwrap();
+        assert!(report.remaining_findings.iter().any(|finding| {
+            finding.kind == "names_jsonl_corrupt"
+                && finding.reason.contains("unassigned in Unicode 16")
+        }));
     }
 
     /// A tag ref pointing at a hash with no commit object behind it is a

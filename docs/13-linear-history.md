@@ -1,8 +1,9 @@
 # 13 Linear History and Restore — design direction and current status
 
 本書の線形履歴・復元の設計方針は 2026-09-07 に承認済みである。
-現在の実装は storage format `2.0.0`、必須の単一 `parent`、唯一の可変参照 `HEAD`、条件付き公開 journal へ移行している。
-2.0.0 は恒久的な `.kio/.store-gate` による concurrency protocol を必須にする保存形式の変更であり、製品 v2 (GUI) や Cargo/release version とは独立する。
+現在の実装は storage format `3.0.0`、必須の単一 `parent`、唯一の可変参照 `HEAD`、条件付き公開 journal を使う。
+2.0.0で導入した恒久的な `.kio/.store-gate` を維持し、3.0.0ではtag名のUnicode identityを是正する。
+保存形式は製品v2/v3やCargo/release versionとは独立する。旧storeは書き換えず拒否し、移行機能は提供しない。
 旧 `parents` 配列と旧 format の移行・read/write 互換経路は置かない。別出力先への `export` と
 管理対象への `restore` は分離され、作業ファイルを含む journal 付き復元、preview、明示 recovery は実装済みである。
 以下の当初の設計理由・将来案と現行契約は区別し、CLI の詳細は [06-cli-spec.md](06-cli-spec.md) を正本とする。
@@ -60,8 +61,8 @@ working bytes・identity を再検証する。`--expected-head` は preview 時�
 - genesis の parent はなし。それ以降の公開 commit は親が一つで、公開時に観測した current HEAD と等しい。
   現行 schema は単一 `parent` を表す。
 - 可変の current HEAD は一つの正本であり、branch は持たない。
-- tag は一本の chain 上の commit を指す論理名である。仕様は削除後の同名再作成を許すが、
-  2026-10-03の現行CLIには `tag --delete` が未接続であり、既存v1の残差として解消する。
+- tag は一本の chain 上の commit を指す論理名である。2026-10-03の開発版で
+  `tag --delete` と削除後の同名再作成を接続した。削除はrefだけを解除し、HEAD・CASと名前の監査行を保持する。
   切断した別履歴を新しい公開 root として認めない。タグ作成・取り込んだタグの読取・台帳由来の
   rebuild root は、現在の HEAD から parent を逆にたどって到達できることを検証する。
   未公開の子 commit と unborn HEAD に残ったタグも拒否し、タグから HEAD を推測して復旧しない。

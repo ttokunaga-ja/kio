@@ -31,8 +31,8 @@ use crate::dag::{
 use crate::error::{IoResultExt, KioError, Result};
 use crate::gc::{SnapshotAutoBinding, SnapshotAutoStateBinding};
 use crate::portable::{
-    PORTABLE_TAGS_DIRECTORY, portable_collision_key, portable_leaf_error, portable_tag_digest64,
-    portable_tag_leaf,
+    PORTABLE_TAGS_DIRECTORY, portable_leaf_error, portable_tag_collision_key,
+    portable_tag_digest64, portable_tag_leaf,
 };
 use crate::purge::PurgeState;
 use crate::schema::{SchemaKind, validate_json_schema};
@@ -49,7 +49,7 @@ pub use managed_restore::{
 };
 
 /// Exact on-disk scope format understood by this pre-stable reader.
-pub const KIO_FORMAT_VERSION: &str = "2.0.0";
+pub const KIO_FORMAT_VERSION: &str = "3.0.0";
 pub const DEFAULT_MAX_ARCHIVE_FILE_BYTES: u64 = MAX_RAW_OBJECT_BYTES;
 pub const DEFAULT_MAX_ARCHIVE_SCOPE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub use crate::dag::MAX_TREE_ENTRIES;
@@ -2968,25 +2968,7 @@ impl Repository {
 
     pub fn tag(&self, name: &str, commit: Option<&str>) -> Result<String> {
         self.validate()?;
-        validate_ref_operand(name)?;
-        // F4: `resolve_commit` resolves the literal `HEAD` and any `sha256:` hash
-        // form BEFORE it ever consults the canonical tag refs (see below), so a tag created
-        // under such a name is written to disk but permanently shadowed — a dead
-        // ref that `diff`/`log` can never reach. Reject it at creation rather than
-        // returning a success that silently does nothing. (This check is specific
-        // to tag *names*; `validate_ref_operand` stays shared with `resolve_commit`,
-        // which must still accept `HEAD`/hash as commit operands.)
-        let collision_key = portable_collision_key(name);
-        if collision_key == "head" || is_hash(&collision_key) {
-            return Err(KioError::invalid_usage(
-                "tag name collides with `HEAD` or a commit hash",
-            ));
-        }
-        if let Some(reason) = portable_leaf_error(name) {
-            return Err(KioError::invalid_usage(format!(
-                "tag name is not a portable filesystem leaf: {reason}"
-            )));
-        }
+        validate_tag_name(name)?;
         let _lock = self.lock_store()?;
         let commit_hash = match commit {
             Some(value) => self.resolve_commit(value)?,
@@ -3098,6 +3080,36 @@ impl Repository {
         Ok(commit_hash)
     }
 
+    /// Remove only the canonical tag ref. The append-only logical-name ledger
+    /// remains as an audit record, and no commit/tree object needs to be read:
+    /// a tag can be removed even after its target history became shallow.
+    pub fn delete_tag(&self, name: &str) -> Result<String> {
+        self.validate()?;
+        validate_tag_name(name)?;
+        let _lock = self.lock_store()?;
+        let directory = self.store_directory()?;
+        // An interrupted removal may already have unpublished the ref while
+        // leaving a durable atomic intent/quarantine. Complete that exact
+        // operation before deciding whether this invocation still has a tag.
+        directory.recover_atomic(&[&directory])?;
+        let relative = Path::new("refs")
+            .join(PORTABLE_TAGS_DIRECTORY)
+            .join(portable_tag_leaf(name));
+        let bytes = directory
+            .read_optional(&relative, MAX_TAG_REF_BYTES)?
+            .ok_or_else(|| KioError::not_found(name))?;
+        let target = std::str::from_utf8(&bytes)
+            .map_err(|_| tag_ref_corrupt(&self.kio_dir.join(&relative), "tag ref is not UTF-8"))?;
+        if !is_hash(target) {
+            return Err(tag_ref_corrupt(
+                &self.kio_dir.join(&relative),
+                "tag ref target is invalid",
+            ));
+        }
+        directory.quarantine_then_remove(&relative, &bytes, MAX_TAG_REF_BYTES)?;
+        Ok(target.to_owned())
+    }
+
     /// Verify that retained refs and publication records cannot expand the
     /// single HEAD ancestry. This is also used before rebuilding projections.
     pub fn validate_published_history_roots(&self, roots: &BTreeSet<String>) -> Result<()> {
@@ -3182,7 +3194,7 @@ impl Repository {
             }
             return Ok(value.to_owned());
         }
-        let normalized_operand = portable_collision_key(value);
+        let normalized_operand = portable_tag_collision_key(value);
         if normalized_operand == "head" || is_hash(&normalized_operand) {
             return Err(KioError::invalid_usage(
                 "commit reference collides with a reserved operand",
@@ -4578,6 +4590,30 @@ fn validate_ref_operand(value: &str) -> Result<()> {
         return Err(KioError::invalid_usage(
             "commit reference must not contain path separators or `.`/`..` traversal",
         ));
+    }
+    Ok(())
+}
+
+fn validate_tag_name(name: &str) -> Result<()> {
+    validate_ref_operand(name)?;
+    if crate::portable::portable_tag_name_has_unassigned(name) {
+        return Err(KioError::invalid_usage(
+            "tag name contains a character unassigned in Unicode 16",
+        ));
+    }
+    // `resolve_commit` resolves HEAD and hash operands before tag refs. A tag
+    // under either name would be permanently shadowed, so reject it for both
+    // creation and deletion while leaving those valid commit operands intact.
+    let collision_key = portable_tag_collision_key(name);
+    if collision_key == "head" || is_hash(&collision_key) {
+        return Err(KioError::invalid_usage(
+            "tag name collides with `HEAD` or a commit hash",
+        ));
+    }
+    if let Some(reason) = portable_leaf_error(name) {
+        return Err(KioError::invalid_usage(format!(
+            "tag name is not a portable filesystem leaf: {reason}"
+        )));
     }
     Ok(())
 }
@@ -8602,6 +8638,196 @@ mod tests {
     }
 
     #[test]
+    fn delete_tag_removes_only_its_ref_and_retains_name_audit() {
+        let scope = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scope.path()).unwrap();
+        fs::write(scope.path().join("note.md"), b"ancestor").unwrap();
+        let ancestor = repo
+            .snapshot(Some("ancestor"), None)
+            .unwrap()
+            .commit_hash
+            .unwrap();
+        fs::write(scope.path().join("note.md"), b"head").unwrap();
+        let head = repo
+            .snapshot(Some("head"), None)
+            .unwrap()
+            .commit_hash
+            .unwrap();
+        repo.tag("Keep", Some(&ancestor)).unwrap();
+        repo.tag("other", Some(&head)).unwrap();
+        let names = repo.kio_dir().join("refs/tags-v1/names.jsonl");
+        let audit_before = fs::read(&names).unwrap();
+        let head_before = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+        assert_eq!(
+            repo.current_ref_targets().unwrap(),
+            BTreeSet::from([ancestor.clone(), head.clone()])
+        );
+
+        assert_eq!(repo.delete_tag("keep").unwrap(), ancestor);
+        assert_eq!(fs::read(&names).unwrap(), audit_before);
+        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head_before);
+        assert_eq!(repo.resolve_commit("other").unwrap(), head);
+        assert_eq!(repo.current_ref_targets().unwrap(), BTreeSet::from([head]));
+        assert_eq!(
+            repo.delete_tag("Keep").unwrap_err().error_code(),
+            "KIO-E-STORE-NOT-FOUND-001"
+        );
+
+        // The old logical-name row remains, and a new spelling records a new
+        // row while occupying the same canonical slot.
+        repo.tag("KEEP", None).unwrap();
+        assert!(fs::read(&names).unwrap().starts_with(&audit_before));
+        assert!(fs::read(&names).unwrap().len() > audit_before.len());
+    }
+
+    #[test]
+    fn delete_tag_rejects_invalid_names_and_corrupt_or_unsafe_refs() {
+        let scope = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scope.path()).unwrap();
+        fs::write(scope.path().join("note.md"), b"note").unwrap();
+        let head = repo
+            .snapshot(Some("head"), None)
+            .unwrap()
+            .commit_hash
+            .unwrap();
+        repo.tag("valid", None).unwrap();
+        for name in ["HEAD", "head", "../valid", "CON", "bad."] {
+            assert_eq!(
+                repo.delete_tag(name).unwrap_err().error_code(),
+                "KIO-E-CONFIG-USAGE-001"
+            );
+        }
+        let ref_path = repo
+            .kio_dir()
+            .join("refs/tags-v1")
+            .join(super::portable_tag_leaf("valid"));
+        fs::write(&ref_path, format!("{head}\n")).unwrap();
+        assert_eq!(
+            repo.delete_tag("valid").unwrap_err().error_code(),
+            "KIO-E-STORE-CORRUPT-001"
+        );
+        assert!(ref_path.exists());
+        fs::write(&ref_path, &head).unwrap();
+
+        #[cfg(unix)]
+        {
+            let outside = scope.path().join("outside");
+            fs::write(&outside, &head).unwrap();
+            fs::remove_file(&ref_path).unwrap();
+            std::os::unix::fs::symlink(&outside, &ref_path).unwrap();
+            assert!(repo.delete_tag("valid").is_err());
+            assert_eq!(fs::read(&outside).unwrap(), head.as_bytes());
+            fs::remove_file(&ref_path).unwrap();
+            fs::hard_link(&outside, &ref_path).unwrap();
+            assert!(repo.delete_tag("valid").is_err());
+            assert_eq!(fs::read(&outside).unwrap(), head.as_bytes());
+        }
+    }
+
+    #[test]
+    fn delete_tag_honors_store_lock_and_retained_scope_identity() {
+        let scope = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scope.path()).unwrap();
+        fs::write(scope.path().join("note.md"), b"note").unwrap();
+        repo.snapshot(Some("head"), None).unwrap();
+        repo.tag("held", None).unwrap();
+        let ref_path = repo
+            .kio_dir()
+            .join("refs/tags-v1")
+            .join(super::portable_tag_leaf("held"));
+
+        let held = repo.lock_store().unwrap();
+        let blocked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| repo.delete_tag("held"))
+                .join()
+                .unwrap()
+                .unwrap_err()
+        });
+        assert_eq!(blocked.error_code(), "KIO-E-STORE-LOCKED-001");
+        assert!(ref_path.exists());
+        drop(held);
+
+        let detached = scope.path().join("detached-kio");
+        fs::rename(repo.kio_dir(), &detached).unwrap();
+        fs::create_dir(repo.kio_dir()).unwrap();
+        assert!(repo.delete_tag("held").is_err());
+        assert!(
+            detached
+                .join("refs/tags-v1")
+                .join(super::portable_tag_leaf("held"))
+                .exists()
+        );
+    }
+
+    #[test]
+    fn delete_tag_does_not_require_target_commit_object() {
+        let scope = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scope.path()).unwrap();
+        fs::write(scope.path().join("note.md"), b"ancestor").unwrap();
+        let ancestor = repo
+            .snapshot(Some("ancestor"), None)
+            .unwrap()
+            .commit_hash
+            .unwrap();
+        fs::write(scope.path().join("note.md"), b"head").unwrap();
+        repo.snapshot(Some("head"), None).unwrap();
+        repo.tag("old", Some(&ancestor)).unwrap();
+
+        // Simulate missing historical CAS material. Removing the ref is still
+        // possible because deletion authorizes against the exact ref bytes.
+        let digest = ancestor.strip_prefix("sha256:").unwrap();
+        let commit_path = repo
+            .kio_dir()
+            .join("objects/commits")
+            .join(&digest[..2])
+            .join(&digest[2..4])
+            .join(digest);
+        fs::remove_file(commit_path).unwrap();
+        assert_eq!(repo.delete_tag("old").unwrap(), ancestor);
+    }
+
+    #[test]
+    fn delete_tag_makes_expired_auto_commit_eligible_for_gc() {
+        let scope = tempfile::tempdir().unwrap();
+        let repo = Repository::init(scope.path()).unwrap();
+        fs::write(scope.path().join("note.md"), b"auto version").unwrap();
+        let auto = repo
+            .auto_snapshot_with_normalize(
+                Some("auto"),
+                Some("2026-01-01T00:00:00Z"),
+                &BTreeSet::new(),
+                &BTreeMap::new(),
+            )
+            .unwrap()
+            .commit_hash
+            .unwrap();
+        fs::write(scope.path().join("note.md"), b"manual version").unwrap();
+        repo.snapshot(Some("manual"), Some("2026-01-02T00:00:00Z"))
+            .unwrap();
+        repo.tag("preserve", Some(&auto)).unwrap();
+
+        let planner = crate::gc::GcPlanner::bind(repo.canonical_root()).unwrap();
+        let as_of = super::parse_utc_seconds("2027-01-01T00:00:00Z").unwrap();
+        let protected = planner.plan_at(as_of).unwrap();
+        assert!(
+            !protected
+                .candidates
+                .iter()
+                .any(|item| item.commit_hash == auto)
+        );
+
+        assert_eq!(repo.delete_tag("preserve").unwrap(), auto);
+        let released = planner.plan_at(as_of).unwrap();
+        assert!(
+            released
+                .candidates
+                .iter()
+                .any(|item| item.commit_hash == auto)
+        );
+    }
+
+    #[test]
     fn tag_refuses_mismatched_or_coexisting_shallow_receipts() {
         use std::collections::{BTreeMap, BTreeSet};
 
@@ -9003,7 +9229,8 @@ mod tests {
             "0.2.0",
             "1.0.0",
             "1.0.1",
-            "3.0.0",
+            "2.0.0",
+            "4.0.0",
             "malformed",
         ] {
             let dir = tempfile::tempdir().unwrap();
@@ -9027,7 +9254,7 @@ mod tests {
         let repo = Repository::init(dir.path()).unwrap();
         let scope_path = repo.kio_dir().join("scope.json");
         let mut scope: Value = serde_json::from_slice(&fs::read(&scope_path).unwrap()).unwrap();
-        scope["kio_format_version"] = json!("0.1.0");
+        scope["kio_format_version"] = json!("2.0.0");
         fs::write(&scope_path, serde_json::to_vec(&scope).unwrap()).unwrap();
         let before_scope = fs::read(&scope_path).unwrap();
         let before_head = fs::read(repo.kio_dir().join("HEAD")).unwrap();

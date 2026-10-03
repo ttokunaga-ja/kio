@@ -150,7 +150,8 @@ retention GCのshallow候補から除外する ([06-cli-spec.md §6.1](06-cli-sp
 最新状態のmanual snapshotや復元commitのprovenanceは、元pointerのcommitを保護する代わりにならない。
 既にshallow化されたcommitへのtag作成は拒否され、tagは明示purge/eraseを防ぐ保証でもない。
 
-tagの削除・再作成はCLI仕様上の操作だが、2026-10-03の開発版では削除の引数・実行経路が未接続である。
+2026-10-03の開発版でtagの削除・同名再作成をCLIへ接続した。解除後は、そのcommitを保護する
+別のrefがなければ通常のretention規則が再び適用される。名前の監査行と既存CASは削除時に保持する。
 tag名は内容固定の引用識別子として使わず、既発行pointerをtagや最新版へ黙って付け替えない。
 既存exportは原本ファイルの書き出しであり、別環境でpointerを検証・解決する自立bundleとは異なる。
 

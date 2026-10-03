@@ -4,7 +4,19 @@ Implementation of the approved [plan](v1-implementation-plan.md) began on
 2026-09-07, from `f198c26` on `main`. Entries below distinguish implementation,
 local verification, and the final native acceptance evidence.
 
-## Current acceptance checkpoint — 2026-09-27
+## Current closeout execution — 2026-10-03
+
+The approved [closeout plan](v1-acceptance-closeout-plan-2026-10-03.md) is now
+in execution. The current baseline, requirement/lane mapping, tag deletion,
+environment readiness and remaining gates are recorded in
+[the execution record](v1-closeout-execution-2026-10-03.md).
+The checkpoint below is historical evidence for its own revisions; its full
+regression, package and security results are not final-candidate results.
+The user also approved correcting Unicode tag identity with storage format
+3.0.0; older stores remain unchanged and are rejected before schema validation.
+**v1.0 remains incomplete.**
+
+## Acceptance checkpoint — 2026-09-27
 
 Unpublished storage checkpoint `68690960` has now passed macOS formatting,
 workspace all-target strict Clippy and tests (3,139 main tests across 85 Cargo

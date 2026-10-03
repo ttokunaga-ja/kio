@@ -1,6 +1,8 @@
 //! Cross-platform physical-leaf rules shared by refs and disposable caches.
 
 use sha2::{Digest, Sha256};
+use unicode_case_mapping::case_folded;
+use unicode_general_category::{GeneralCategory, get_general_category};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::cas::lower_hex;
@@ -12,14 +14,36 @@ const MAX_PORTABLE_LEAF_UTF16_UNITS: usize = 255;
 /// a future change to the naming rule from having to coexist with this one.
 pub const PORTABLE_TAGS_DIRECTORY: &str = "tags-v1";
 
-/// Return a stable, case-insensitive key for a logical tag name.
+/// Return the existing portable collision key for working-tree paths.
 ///
-/// NFC normalization plus Unicode lowercase is deliberately stricter than the
-/// host filesystem. It prevents a tag pair from becoming ambiguous after a
-/// store is copied between a case-sensitive Unix filesystem and Windows/macOS.
+/// Keep this NFC plus lowercase rule stable for export path collision checks.
 #[must_use]
 pub fn portable_collision_key(value: &str) -> String {
     value.nfc().flat_map(char::to_lowercase).collect()
+}
+
+/// Return the format-3 logical tag identity key.
+/// NFC normalization is followed by Unicode 16 simple case folding, with no
+/// locale-sensitive mapping or multi-character expansion.
+#[must_use]
+pub fn portable_tag_collision_key(value: &str) -> String {
+    value
+        .nfc()
+        .map(|ch| {
+            case_folded(ch)
+                .and_then(|mapped| char::from_u32(mapped.get()))
+                .unwrap_or(ch)
+        })
+        .collect()
+}
+
+/// Tag names cannot contain code points unassigned in the Unicode data that
+/// defines format-3 identity. Apply this to the original name, before NFC.
+#[must_use]
+pub fn portable_tag_name_has_unassigned(value: &str) -> bool {
+    value
+        .chars()
+        .any(|ch| get_general_category(ch) == GeneralCategory::Unassigned)
 }
 
 /// Explain why `value` cannot be used as a portable direct-child leaf.
@@ -80,7 +104,7 @@ pub fn portable_tag_leaf(logical_name: &str) -> String {
 /// the two can never independently drift on the hash construction.
 #[must_use]
 pub fn portable_tag_digest64(logical_name: &str) -> String {
-    let key = portable_collision_key(logical_name);
+    let key = portable_tag_collision_key(logical_name);
     lower_hex(&Sha256::digest(key.as_bytes()))
 }
 
@@ -153,6 +177,51 @@ mod tests {
             portable_tag_leaf("Caf\u{e9}")
         );
         assert_eq!(portable_leaf_error(&portable_tag_leaf("CON")), None);
+    }
+
+    #[test]
+    fn tag_identity_uses_unicode_16_simple_case_folding() {
+        assert_eq!(unicode_case_mapping::UNICODE_VERSION, (16, 0, 0));
+        assert_eq!(unicode_general_category::UNICODE_VERSION, (16, 0, 0));
+        for (left, right) in [
+            ("Σ", "σ"),
+            ("Σ", "ς"),
+            ("Ꭰ", "ꭰ"),
+            ("ß", "ẞ"),
+            ("Cafe\u{301}", "Café"),
+        ] {
+            assert_eq!(
+                portable_tag_collision_key(left),
+                portable_tag_collision_key(right)
+            );
+            assert_eq!(portable_tag_leaf(left), portable_tag_leaf(right));
+        }
+        assert_ne!(
+            portable_tag_collision_key("ß"),
+            portable_tag_collision_key("ss")
+        );
+        assert_ne!(
+            portable_tag_collision_key("İ"),
+            portable_tag_collision_key("i")
+        );
+        assert_ne!(
+            portable_tag_collision_key("I"),
+            portable_tag_collision_key("ı")
+        );
+        assert!(portable_tag_name_has_unassigned("future\u{0378}"));
+        assert!(!portable_tag_name_has_unassigned("研究メモ"));
+    }
+
+    #[test]
+    fn working_path_collision_key_keeps_lowercase_expansion() {
+        assert_eq!(
+            portable_collision_key("İ"),
+            portable_collision_key("i\u{307}")
+        );
+        assert_ne!(
+            portable_tag_collision_key("İ"),
+            portable_tag_collision_key("i\u{307}")
+        );
     }
 
     #[test]

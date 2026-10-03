@@ -700,14 +700,38 @@ fn execute_dispatch(command: Command) -> Result<Value> {
             }
         }
         Command::Tag(args) => {
+            if args.delete && args.commit.is_some() {
+                return Err(KioError::invalid_usage(
+                    "tag deletion does not accept a commit operand",
+                ));
+            }
             let repo = open_current_recovery_repository()?;
             validate_repo_tool_lock(&repo)?;
-            let commit_hash = repo.tag(&args.name, args.commit.as_deref())?;
-            Ok(json!({
-                "tag": args.name,
-                "commit_hash": commit_hash,
-                "path": repo.kio_dir().join("refs").join(PORTABLE_TAGS_DIRECTORY).join(portable_tag_leaf(&args.name)),
-            }))
+            let commit_hash = if args.delete {
+                repo.delete_tag(&args.name)?
+            } else {
+                repo.tag(&args.name, args.commit.as_deref())?
+            };
+            let path = repo
+                .kio_dir()
+                .join("refs")
+                .join(PORTABLE_TAGS_DIRECTORY)
+                .join(portable_tag_leaf(&args.name));
+            if args.delete {
+                Ok(json!({
+                    "operation": "tag_delete",
+                    "status": "deleted",
+                    "tag": args.name,
+                    "commit_hash": commit_hash,
+                    "path": path,
+                }))
+            } else {
+                Ok(json!({
+                    "tag": args.name,
+                    "commit_hash": commit_hash,
+                    "path": path,
+                }))
+            }
         }
         Command::Index(args) => run_index(args),
         Command::Watch(args) => watch_command::run(args),

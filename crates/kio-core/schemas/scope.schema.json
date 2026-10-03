@@ -5,7 +5,7 @@
   "properties": {
     "kio_format_version": {
       "type": "string",
-      "const": "2.0.0"
+      "const": "3.0.0"
     },
     "scope_id": {
       "type": "string",

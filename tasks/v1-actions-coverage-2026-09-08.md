@@ -4,6 +4,10 @@
 これは承認済み実装計画 §7 の方針を具体化する記録であり、workflow追加や受入成功の宣言ではない。
 研究用 PersonaScope/personaCorpus 性能評価は v1 の必須gateにしない。
 
+本書は2026-09-08時点の調査記録である。現行workflowの固定51件matrixと候補別の状態は
+[2026-10-03の実行記録](v1-closeout-execution-2026-10-03.md) と
+[受入完了計画](v1-acceptance-closeout-plan-2026-10-03.md) を参照する。
+
 ## 現在の実行結果
 
 GitHub API の `commits/main`、workflow一覧、直近runと各jobを確認した。

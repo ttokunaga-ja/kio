@@ -43,6 +43,8 @@ toml = "1.1"
 # internally, so pinning the same version adds no new dependency weight.
 toml_edit = "0.25"
 unicode-normalization = "0.1"
+unicode-case-mapping = "=1.0.0"
+unicode-general-category = "=1.1.0"
 base64 = "0.23"
 cap-primitives = "4.0.2"
 # Offline PDF text extraction (07 §2.1): real-world text-layer PDFs
