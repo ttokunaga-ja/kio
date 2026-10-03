@@ -345,7 +345,7 @@ fn is_lease_file(prefix: &Path, name: &str, plan: &PersonaPlan) -> bool {
 }
 
 fn verify_runtime_lease_file(dir: &fs::File, name: &str) -> Result<(), PersonaScaffoldError> {
-    let meta = cap_fs::stat(dir, Path::new(name), cap_fs::FollowSymlinks::No)?;
+    let _meta = cap_fs::stat(dir, Path::new(name), cap_fs::FollowSymlinks::No)?;
     #[cfg(unix)]
     {
         use cap_fs::MetadataExt;
@@ -355,12 +355,12 @@ fn verify_runtime_lease_file(dir: &fs::File, name: &str) -> Result<(), PersonaSc
             "lease-recovery.jsonl" => 64 * 1024,
             _ => unreachable!("closed by is_lease_file"),
         };
-        if !meta.file_type().is_file()
-            || meta.file_type().is_symlink()
-            || meta.nlink() != 1
-            || meta.mode() & 0o777 != 0o600
-            || meta.uid() != unsafe { libc::geteuid() }
-            || meta.len() as usize > max
+        if !_meta.file_type().is_file()
+            || _meta.file_type().is_symlink()
+            || _meta.nlink() != 1
+            || _meta.mode() & 0o777 != 0o600
+            || _meta.uid() != unsafe { libc::geteuid() }
+            || _meta.len() as usize > max
         {
             return bad("runtime file is not private single-link regular");
         }
@@ -530,12 +530,14 @@ pub fn scaffold(plan_path: &Path, root: &Path) -> Result<Scaffold, PersonaScaffo
 fn create_stage(parent: &Parent, root: &Path) -> Result<(String, fs::File), PersonaScaffoldError> {
     for _ in 0..32 {
         let stage_name = format!("{STAGE_PREFIX}{}", stage_token(root)?);
-        let mut options = cap_fs::DirOptions::new();
+        let options = cap_fs::DirOptions::new();
         #[cfg(unix)]
-        {
+        let options = {
             use cap_fs::DirBuilderExt;
+            let mut options = options;
             options.mode(0o700);
-        }
+            options
+        };
         match cap_fs::create_dir(&parent.handle, Path::new(&stage_name), &options) {
             Ok(()) => {
                 return Ok((
@@ -551,7 +553,7 @@ fn create_stage(parent: &Parent, root: &Path) -> Result<(String, fs::File), Pers
 }
 #[cfg(test)]
 static STAGE_TOKENS: OnceLock<Mutex<BTreeMap<PathBuf, Vec<String>>>> = OnceLock::new();
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn install_stage_tokens(root: PathBuf, tokens: Vec<String>) {
     let old = STAGE_TOKENS
         .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -659,12 +661,14 @@ fn mkdir(parent: &fs::File, name: &str) -> Result<fs::File, PersonaScaffoldError
     if !safe(name) {
         return bad("unsafe plan-derived directory name");
     }
-    let mut options = cap_fs::DirOptions::new();
+    let options = cap_fs::DirOptions::new();
     #[cfg(unix)]
-    {
+    let options = {
         use cap_fs::DirBuilderExt;
+        let mut options = options;
         options.mode(0o700);
-    }
+        options
+    };
     cap_fs::create_dir(parent, Path::new(name), &options)?;
     Ok(cap_fs::open_dir_nofollow(parent, Path::new(name))?)
 }
@@ -853,6 +857,7 @@ fn collect_tree(
     }
     Ok(())
 }
+#[cfg(unix)]
 fn expected_directory_mode(path: &Path) -> u32 {
     let components: Vec<_> = path.components().collect();
     if path == Path::new("_control")
@@ -1122,7 +1127,7 @@ fn preflight() -> Result<(), PersonaScaffoldError> {
 type BeforeRenameHook = Box<dyn FnOnce() + Send>;
 #[cfg(test)]
 static BEFORE_RENAME_HOOK: OnceLock<Mutex<BTreeMap<PathBuf, BeforeRenameHook>>> = OnceLock::new();
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 fn install_before_rename_hook(root: PathBuf, hook: BeforeRenameHook) {
     let old = BEFORE_RENAME_HOOK
         .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -1151,15 +1156,18 @@ fn bad<T>(s: impl Into<String>) -> Result<T, PersonaScaffoldError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::persona_plan::{PersonaProfile, frozen_plan};
     use tempfile::tempdir;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn plan_file(root: &Path, profile: PersonaProfile) -> PathBuf {
         let path = root.join("plan.json");
         fs::write(&path, frozen_plan(profile).canonical_bytes().unwrap()).unwrap();
         path
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn payload_leaf(root: &Path, plan: &PersonaPlan) -> PathBuf {
         let person = plan
             .personas

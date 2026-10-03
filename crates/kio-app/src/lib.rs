@@ -29597,10 +29597,11 @@ mod tests {
         estimate_embedding_tokens, lane_rate, markdownize_send_lane, parse_chunk_ledger,
         publication_is_compatible, publication_is_include_deleted_compatible, publication_ranks,
         query_embedding_send_lane, read_chunk_publication_events, read_stored_chunks,
-        realtime_lane_requested, replace_chunk_ledger_contents, resolve_invocation_lane,
-        truncate_torn_chunk_tail, unit_authorities_from_inputs,
+        realtime_lane_requested, resolve_invocation_lane, unit_authorities_from_inputs,
         write_through_projection_with_requested_at,
     };
+    #[cfg(unix)]
+    use super::{replace_chunk_ledger_contents, truncate_torn_chunk_tail};
 
     #[test]
     fn embedding_tool_lock_labels_cover_every_execution_mode() {

@@ -833,14 +833,15 @@ fn recheck_static_child(
     Ok(())
 }
 struct Guard {
-    file: fs::File,
+    // Retain the lock handle on every platform for the full guard lifetime.
+    _file: fs::File,
     _metadata: cap_fs::Metadata,
 }
 impl Drop for Guard {
     fn drop(&mut self) {
         #[cfg(unix)]
         unsafe {
-            libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self.file), libc::LOCK_UN);
+            libc::flock(std::os::fd::AsRawFd::as_raw_fd(&self._file), libc::LOCK_UN);
         }
     }
 }
@@ -884,7 +885,7 @@ fn guard(d: &fs::File) -> Result<Guard, PersonaLeaseError> {
         return bad("lock changed while locking");
     }
     Ok(Guard {
-        file: f,
+        _file: f,
         _metadata: opened,
     })
 }
@@ -1077,15 +1078,21 @@ fn fault(point: &str) -> Result<(), PersonaLeaseError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use crate::{
         persona_plan::{PersonaProfile, frozen_plan},
         persona_scaffold::scaffold,
     };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::path::PathBuf;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use std::sync::OnceLock;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     use tempfile::tempdir;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     static TINY_PLAN: OnceLock<Vec<u8>> = OnceLock::new();
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn workspace() -> (tempfile::TempDir, PathBuf, String) {
         let temp = tempdir().unwrap();
         let parent = std::fs::canonicalize(temp.path()).unwrap();
@@ -1098,6 +1105,7 @@ mod tests {
         scaffold(&plan, &root).unwrap();
         (temp, root, parsed.personas[0].scopes[0].id.clone())
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn payload_leaf(root: &Path, scope_id: &str) -> PathBuf {
         let plan = crate::persona_plan::PersonaPlan::parse_canonical(
             &std::fs::read(root.join("persona-plan.json")).unwrap(),

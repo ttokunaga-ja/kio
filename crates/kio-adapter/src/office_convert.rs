@@ -1872,10 +1872,15 @@ mod tests {
 
     #[test]
     fn file_url_percent_encodes_reserved_characters() {
+        #[cfg(not(windows))]
         let path = Path::new("/private/kio office#?%.profile");
+        #[cfg(windows)]
+        let path = Path::new(r"C:\private\kio office#?%.profile");
         let url = file_url(path).expect("Unicode fixture path");
         #[cfg(not(windows))]
         assert_eq!(url, "file:///private/kio%20office%23%3F%25.profile");
+        #[cfg(windows)]
+        assert_eq!(url, "file:///C:/private/kio%20office%23%3F%25.profile");
     }
 
     #[cfg(target_os = "macos")]

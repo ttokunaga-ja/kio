@@ -2247,13 +2247,15 @@ fn exported_file_json(file: &PreflightFile) -> Value {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
     use std::io::Write;
 
     use super::{
-        ExportItem, ScopeTarget, check_purge_state, create_private_temp,
-        destination_lstat_identity, missing_live_raw_error, no_replace_move, normalize_absolute,
-        open_destination_dir, sync_directory_handle, validate_source_names,
+        ExportItem, ScopeTarget, check_purge_state, destination_lstat_identity,
+        missing_live_raw_error, normalize_absolute, open_destination_dir, validate_source_names,
     };
+    #[cfg(unix)]
+    use super::{create_private_temp, no_replace_move, sync_directory_handle};
 
     fn entry_names(path: &std::path::Path) -> Vec<String> {
         let mut names = fs::read_dir(path)

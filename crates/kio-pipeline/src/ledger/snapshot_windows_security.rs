@@ -111,10 +111,6 @@ impl LedgerSnapshotPrivateDir {
             .as_ref()
             .expect("private ledger directory remains pinned")
     }
-    pub(crate) fn capability(&self) -> io::Result<fs::File> {
-        self.handle().try_clone()
-    }
-
     pub(crate) fn create_file(&self, basename: &str) -> io::Result<fs::File> {
         validate_basename(basename)?;
         let owner = CurrentUserSid::current()?;

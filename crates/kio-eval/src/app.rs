@@ -3501,12 +3501,13 @@ mod tests {
     };
     use serde_json::json;
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    use super::PersonaCommands;
     use super::{
-        Args, Commands, PersonaCommands, RerankCommands, bundled_eval_path,
-        output_is_within_input_root, parse_acceptance_case, parse_acceptance_lane,
-        parse_acceptance_subcase, parse_drain_rounds, parse_fixture_mode, parse_native_os,
-        parse_provider, parse_recall, parse_rerank_dataset, parse_rerank_limit, parse_scenario,
-        parse_u7_threshold, run,
+        Args, Commands, RerankCommands, bundled_eval_path, output_is_within_input_root,
+        parse_acceptance_case, parse_acceptance_lane, parse_acceptance_subcase, parse_drain_rounds,
+        parse_fixture_mode, parse_native_os, parse_provider, parse_recall, parse_rerank_dataset,
+        parse_rerank_limit, parse_scenario, parse_u7_threshold, run,
     };
     use kio_eval::acceptance_provider::Provider;
 

@@ -298,13 +298,13 @@ pub struct StagedHistoryManifest<'a> {
     binding: FileBinding,
     identity: FileIdentity,
     published: bool,
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fail_after_rename: bool,
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     post_root_sync: Option<PostRootSyncAction>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 #[derive(Debug)]
 enum PostRootSyncAction {
     Replace(Vec<u8>),
@@ -320,7 +320,7 @@ impl StagedHistoryManifest<'_> {
             HISTORY_MANIFEST,
         )?;
         self.published = true;
-        #[cfg(test)]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         if self.fail_after_rename {
             return self.rollback_after_publish(ReplayBoundaryError::unsafe_(
                 &self.boundary.public_root,
@@ -335,7 +335,7 @@ impl StagedHistoryManifest<'_> {
         {
             return self.rollback_after_publish(error);
         }
-        #[cfg(test)]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         if let Some(action) = self.post_root_sync.take() {
             self.inject_post_root_sync_action(action)?;
         }
@@ -440,22 +440,22 @@ impl StagedHistoryManifest<'_> {
         })?;
         Err(cause)
     }
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fn inject_post_rename_failure(mut self) -> Self {
         self.fail_after_rename = true;
         self
     }
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fn inject_post_root_sync_replacement(mut self, bytes: Vec<u8>) -> Self {
         self.post_root_sync = Some(PostRootSyncAction::Replace(bytes));
         self
     }
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fn inject_post_root_sync_removal(mut self) -> Self {
         self.post_root_sync = Some(PostRootSyncAction::Remove);
         self
     }
-    #[cfg(test)]
+    #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
     fn inject_post_root_sync_action(&self, action: PostRootSyncAction) -> ReplayBoundaryResult<()> {
         cap_fs::remove_file(&self.boundary.root, Path::new(HISTORY_MANIFEST)).map_err(|e| {
             ReplayBoundaryError::io(self.boundary.public_root.join(HISTORY_MANIFEST), e)
@@ -755,9 +755,9 @@ impl ReplayDevice {
                 },
                 identity,
                 published: false,
-                #[cfg(test)]
+                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
                 fail_after_rename: false,
-                #[cfg(test)]
+                #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
                 post_root_sync: None,
             })
         }
@@ -1165,7 +1165,7 @@ fn normalize_os_alias(path: &Path) -> ReplayBoundaryResult<PathBuf> {
     };
     Ok(PathBuf::from(rewritten))
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn normalize_os_alias(path: &Path) -> ReplayBoundaryResult<PathBuf> {
     Ok(path.to_path_buf())
 }
@@ -1246,12 +1246,14 @@ fn safe_relative(value: &str) -> ReplayBoundaryResult<()> {
 }
 fn create_private_dir(parent: &fs::File, name: &str, path: &Path) -> ReplayBoundaryResult<()> {
     normal_component(name, "private directory")?;
-    let mut opts = cap_fs::DirOptions::new();
+    let opts = cap_fs::DirOptions::new();
     #[cfg(unix)]
-    {
+    let opts = {
         use cap_fs::DirBuilderExt;
+        let mut opts = opts;
         opts.mode(0o700);
-    }
+        opts
+    };
     cap_fs::create_dir(parent, Path::new(name), &opts).map_err(|e| ReplayBoundaryError::io(path, e))
 }
 struct ObservedFile {

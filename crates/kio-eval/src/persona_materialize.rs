@@ -204,12 +204,14 @@ pub fn materialize(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
     }
-    let mut directory_options = cap_fs::DirOptions::new();
+    let directory_options = cap_fs::DirOptions::new();
     #[cfg(unix)]
-    {
+    let directory_options = {
         use cap_fs::DirBuilderExt;
+        let mut directory_options = directory_options;
         directory_options.mode(0o700);
-    }
+        directory_options
+    };
     cap_fs::create_dir(&parent.handle, Path::new(&stage_name), &directory_options)?;
     let stage = cap_fs::open_dir_nofollow(&parent.handle, Path::new(&stage_name))?;
     let stage_cap_metadata = cap_fs::Metadata::from_file(&stage)?;
@@ -553,7 +555,7 @@ fn valid_hash(value: &str) -> bool {
 type BeforeRenameHook = Box<dyn FnOnce() + Send>;
 #[cfg(test)]
 static BEFORE_RENAME_HOOK: OnceLock<Mutex<BTreeMap<PathBuf, BeforeRenameHook>>> = OnceLock::new();
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn install_before_rename_hook(destination: PathBuf, hook: BeforeRenameHook) {
     let destination = persona_artifact::normalize_persona_path(&destination)
         .expect("before-rename test hook destination must be valid UTF-8");

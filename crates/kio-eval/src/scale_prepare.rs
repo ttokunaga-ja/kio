@@ -1077,12 +1077,14 @@ fn create_or_open_dir(
         Ok(dir) => Ok(dir),
         Err(_) => match cap_fs::stat(parent, Path::new(name), cap_fs::FollowSymlinks::No) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                let mut options = cap_fs::DirOptions::new();
+                let options = cap_fs::DirOptions::new();
                 #[cfg(unix)]
-                {
+                let options = {
                     use cap_fs::DirBuilderExt;
+                    let mut options = options;
                     options.mode(0o700);
-                }
+                    options
+                };
                 match cap_fs::create_dir(parent, Path::new(name), &options) {
                     Ok(()) => open_dir(parent, name, label),
                     Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {

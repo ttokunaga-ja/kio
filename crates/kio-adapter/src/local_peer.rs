@@ -602,11 +602,20 @@ mod tests {
     #[cfg(any(unix, windows))]
     #[test]
     fn private_anchor_rejects_missing_relative_and_hardlinked_files() {
+        #[cfg(unix)]
         let directory = tempfile::Builder::new()
             .prefix("kio-local-peer-")
             .tempdir_in(std::env::current_dir().unwrap())
             .unwrap();
+        #[cfg(windows)]
+        let directory = tempfile::Builder::new()
+            .prefix("kio-local-peer-")
+            .tempdir()
+            .unwrap();
+        #[cfg(unix)]
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        #[cfg(windows)]
+        private_acl_fixture::protect_owner_only(directory.path(), true).unwrap();
         let path = directory.path().join("peer-ca.pem");
         assert!(AuthenticatedLocalEndpoint::new("https://localhost:8443", path.clone()).is_err());
         assert!(
@@ -614,7 +623,10 @@ mod tests {
                 .is_err()
         );
         fs::write(&path, b"not a certificate").unwrap();
+        #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        #[cfg(windows)]
+        private_acl_fixture::protect_owner_only(&path, false).unwrap();
         assert!(AuthenticatedLocalEndpoint::new("https://localhost:8443", path.clone()).is_err());
         fs::hard_link(&path, directory.path().join("peer-ca-copy.pem")).unwrap();
         assert!(kio_core::private_fs::read_private_file(&path, MAX_CA_PEM_BYTES).is_err());

@@ -261,3 +261,52 @@ GitHub v1-local-acceptance Environmentはmain branchだけのpolicy、reviewers�
 
 これらは設定適用の証拠であり、Actions OIDC接続・専用SSH account/key/configの本適用・GPU workload・
 必須51件受入の成功を意味しない。今回承認された3項目にhost側の専用account/SSH本適用は含めない。
+
+## 12. e837020の全体検証とWSL Rust整備、Windowsの追加是正
+
+`e83702085792737e2cde4400d1d52cdc9a8fc41d` のmacOS CI相当15 gateは成功した。
+workspace全target試験、strict Clippy、release build、shell/action-pin、Persona W0を含む。
+同じ候補のmacOS archiveを2回生成して一致を確認し、展開binaryの11件のlocal診断も成功した。
+A03-native/A06/A10の元の失敗はこの候補で解消したが、local run ID `900000007` は正式Actions receiptではない。
+
+利用者の追加依頼に基づき、WSLの既存`kio-test`へ公式Rustup 1.29.1と標準proxyを導入し、
+既存Rust/Cargo 1.98.0、rustfmt、Clippyを保持した。変更前のprofile/bashrcとhashを保存し、
+login/interactive Bashおよび主担当のfresh SSHで検証した。root/system/SSH/他ユーザー設定は変更していない。
+この整備後、e837020のWSL全体試験、strict Clippy、release build、Persona W0、
+synthetic-history CI sequenceとrelease helperのroute preflightが成功した。
+元のnested Cargo失敗は環境差として保持し、製品sourceの変更や検査削減で処理していない。
+WSLのAppArmor無効、Ubuntu 26.04とhosted Ubuntu 24.04、Mac SDK27とCI SDK26.5の差は残る。
+
+WindowsにもRust 1.98.0/MSVC BuildToolsがあることを実機確認し、owner-privateの専用source/cache/targetと
+process限定developer環境でCI相当を開始した。既存default GNU toolchainは変更していない。
+fmtはexit0で成功したが、strict Clippyはledger snapshotの未使用関数2件とWindowsの未使用method1件で
+実コード失敗を示した。full raw stderrを保持した。PowerShell wrapperがchild終了後にhangしたため
+Cargo process exitは未知だが、compile診断の失敗とは別に記録する。残存cargo/rustcがないことを確認し、
+今回のowned wrapperだけを終了した。full test/releaseはこの失敗で停止し、未実行である。
+
+追加是正は、Unix側からだけ呼ばれる`verify_private_leaf`/`verify_private_snapshot`へ`cfg(unix)`を付け、
+呼出元のないWindowsの`capability()` clone wrapperを除く。Windowsのretained directory handle、
+owner DACL、pre-SQLite leaf/manifest検証は維持する。macOSのpipeline全target strict Clippyと
+ledger snapshot関連25件は局所passした。
+
+その後のWindows診断では、wrapperをactual exit 0/7のsmoke付き`.cmd`へ置換し、各変更後に
+strict Clippyを1回ずつ実行した。Cargoが次のcrate/test targetへ進むごとに露出した失敗とexit101を
+別々に保存した。補助関数・importは既存callerのUnix/Linux/macOS条件へ揃え、Windowsの検査は
+削除していない。metadata取得とエラー伝播、lock handleの全platformでの保持、Unixの0700/0600設定、
+identity/link検証は維持する。Windowsのprivate CA fixtureには既存のowner-only ACL helperを適用し、
+file URLの予約文字試験にはWindows drive pathと期待値を加える。
+
+Windows限定cache fixtureのREADONLY解除だけは、RustのWindows属性動作を確認した理由付きの
+狭い`clippy::permissions_set_readonly_false` expectationを付ける。Unixは既存mode0600を維持する。
+Job Object子孫終了試験のhelperは、既存の30秒sleepを保ち、生存した場合にchildをwaitする。
+replayのfault injectionは既存Linux/macOS callerだけに合わせ、production rollbackは変更しない。
+macOSの追加test helper是正前497件のeval lib診断と、最新26 sourceのfmt・workspace全target strict Clippyは成功した。
+Windowsも26 sourceの照合済みoverlayでstrict Clippyが実exit0（22.6秒）となった。
+これらの局所診断とWindows overlayは新しい不変候補の正式全体検証を代替しない。
+
+e837020の静的security追加差分検証は確認finding0、canonical coverage completeで保存した。
+新しい是正候補には別のsource/security/runtime証拠を束縛し、以前の成功を流用しない。
+host適用の具体案と5分rollbackを用意し、Windows/WSL account/key/SSH本適用は非同期の承認回答を待つ。
+dispatcherは実装どおりsource下の`scripts/v1-local-gpu/kio-acceptance-tools`へ設置する案であり、
+先行提案のsource root直下の例は適用しない。新候補のhelper/deployment/bundleも同じ候補へ再束縛する。
+現在まで新しいpush/Actions dispatch、paid provider/GPU workload、release公開は行っていない。

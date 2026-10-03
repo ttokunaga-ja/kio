@@ -595,14 +595,14 @@ fn base64(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        collections::BTreeMap,
-        path::PathBuf,
-        sync::{Mutex, OnceLock},
-    };
+    use std::{collections::BTreeMap, path::PathBuf};
 
     #[cfg(unix)]
-    use std::{fs, os::unix::fs::PermissionsExt};
+    use std::{
+        fs,
+        os::unix::fs::PermissionsExt,
+        sync::{Mutex, OnceLock},
+    };
 
     use super::*;
 

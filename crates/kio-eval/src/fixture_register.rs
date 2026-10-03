@@ -293,7 +293,7 @@ fn copy_clean_retained(source: &fs::File, dest: &Path) -> Result<(), FixtureRegi
         }
         let output = dest.join(&name);
         if ty.is_dir() {
-            let before =
+            let _before =
                 cap_fs::stat(source, name_path, cap_fs::FollowSymlinks::No).map_err(|_| {
                     FixtureRegisterError::Input(
                         "fixture source directory changed during copy".into(),
@@ -309,33 +309,33 @@ fn copy_clean_retained(source: &fs::File, dest: &Path) -> Result<(), FixtureRegi
                         "fixture source directory changed during copy".into(),
                     )
                 })?;
-                if before.dev() != opened.dev() || before.ino() != opened.ino() {
+                if _before.dev() != opened.dev() || _before.ino() != opened.ino() {
                     return Err(FixtureRegisterError::Input(
                         "fixture source directory changed during copy".into(),
                     ));
                 }
             }
             copy_clean_retained(&child, &output)?;
-            let after =
+            let _after =
                 cap_fs::stat(source, name_path, cap_fs::FollowSymlinks::No).map_err(|_| {
                     FixtureRegisterError::Input(
                         "fixture source directory changed during copy".into(),
                     )
                 })?;
             #[cfg(unix)]
-            if before.dev() != after.dev() || before.ino() != after.ino() {
+            if _before.dev() != _after.dev() || _before.ino() != _after.ino() {
                 return Err(FixtureRegisterError::Input(
                     "fixture source directory changed during copy".into(),
                 ));
             }
         } else if ty.is_file() {
-            let before =
+            let _before =
                 cap_fs::stat(source, name_path, cap_fs::FollowSymlinks::No).map_err(|_| {
                     FixtureRegisterError::Input("fixture source file changed during copy".into())
                 })?;
             #[cfg(unix)]
             {
-                if before.nlink() != 1 {
+                if _before.nlink() != 1 {
                     return Err(FixtureRegisterError::Input(
                         "fixture source contains hard-linked file".into(),
                     ));
@@ -348,13 +348,13 @@ fn copy_clean_retained(source: &fs::File, dest: &Path) -> Result<(), FixtureRegi
             let mut file = cap_fs::open(source, name_path, &options).map_err(|_| {
                 FixtureRegisterError::Input("fixture source file changed during copy".into())
             })?;
-            let opened = cap_fs::Metadata::from_file(&file).map_err(|_| {
+            let _opened = cap_fs::Metadata::from_file(&file).map_err(|_| {
                 FixtureRegisterError::Input("fixture source file changed during copy".into())
             })?;
             #[cfg(unix)]
-            if before.dev() != opened.dev()
-                || before.ino() != opened.ino()
-                || before.nlink() != opened.nlink()
+            if _before.dev() != _opened.dev()
+                || _before.ino() != _opened.ino()
+                || _before.nlink() != _opened.nlink()
             {
                 return Err(FixtureRegisterError::Input(
                     "fixture source file changed during copy".into(),
@@ -372,16 +372,16 @@ fn copy_clean_retained(source: &fs::File, dest: &Path) -> Result<(), FixtureRegi
                     "fixture source file exceeds byte bound".into(),
                 ));
             }
-            let after =
+            let _after =
                 cap_fs::stat(source, name_path, cap_fs::FollowSymlinks::No).map_err(|_| {
                     FixtureRegisterError::Input("fixture source file changed during copy".into())
                 })?;
             #[cfg(unix)]
             {
-                if before.dev() != after.dev()
-                    || before.ino() != after.ino()
-                    || before.nlink() != after.nlink()
-                    || before.len() != opened.len()
+                if _before.dev() != _after.dev()
+                    || _before.ino() != _after.ino()
+                    || _before.nlink() != _after.nlink()
+                    || _before.len() != _opened.len()
                 {
                     return Err(FixtureRegisterError::Input(
                         "fixture source file changed during copy".into(),

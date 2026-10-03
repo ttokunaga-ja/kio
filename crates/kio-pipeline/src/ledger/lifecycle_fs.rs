@@ -1243,17 +1243,17 @@ mod tests {
         let path = db_path(temp.path());
         let first = FsSession::acquire(&path, true).unwrap();
         let lock_path = path.parent().unwrap().join(LIFECYCLE_LOCK);
-        let before = fs::metadata(&lock_path).unwrap();
+        let _before = fs::metadata(&lock_path).unwrap();
         let error = FsSession::acquire(&path, false).unwrap_err();
         assert!(matches!(error, PipelineError::Locked { .. }));
         drop(first);
         let second = FsSession::acquire(&path, false).unwrap();
         drop(second);
-        let after = fs::metadata(lock_path).unwrap();
+        let _after = fs::metadata(lock_path).unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            assert_eq!((_before.dev(), _before.ino()), (_after.dev(), _after.ino()));
         }
     }
 

@@ -2278,7 +2278,7 @@ fn resolve_tool(path: &Path) -> Option<PathBuf> {
         .map(|d| d.join(path))
         .find(|p| p.is_file())
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn executable_tool(
     path: &Path,
     label: &str,

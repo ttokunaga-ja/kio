@@ -999,6 +999,7 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
 
+    #[cfg(unix)]
     use crate::boundary::BoundCorpus;
 
     use super::{PointerAttestor, parse_pointer_wire, read_cap_regular_file};

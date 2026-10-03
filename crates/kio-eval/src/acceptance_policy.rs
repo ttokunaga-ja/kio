@@ -454,11 +454,11 @@ fn bounded_file(path: &Path) -> Result<Vec<u8>, AcceptanceError> {
     fs::read(path).map_err(io)
 }
 
-fn private_dir(path: &Path) -> Result<(), AcceptanceError> {
+fn private_dir(_path: &Path) -> Result<(), AcceptanceError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(io)?;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o700)).map_err(io)?;
     }
     Ok(())
 }

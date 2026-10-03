@@ -353,7 +353,7 @@ fn normalize_os_alias(path: &Path) -> ProcessBoundaryResult<PathBuf> {
     };
     Ok(PathBuf::from(rewritten))
 }
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(unix, not(target_os = "macos")))]
 fn normalize_os_alias(path: &Path) -> ProcessBoundaryResult<PathBuf> {
     Ok(path.to_owned())
 }
@@ -403,7 +403,7 @@ fn observe_executable(
     name: &str,
     diagnostic: &Path,
     max: u64,
-    link_policy: LinkPolicy,
+    _link_policy: LinkPolicy,
 ) -> ProcessBoundaryResult<ObservedExecutable> {
     let mut opts = cap_fs::OpenOptions::new();
     opts.read(true)
@@ -421,14 +421,14 @@ fn observe_executable(
     #[cfg(unix)]
     {
         use cap_fs::MetadataExt;
-        let valid_links = match link_policy {
+        let valid_links = match _link_policy {
             LinkPolicy::ExactlyOne => before.nlink() == 1,
             LinkPolicy::OneOrTwo => (1..=2).contains(&before.nlink()),
         };
         if !valid_links {
             return Err(ProcessBoundaryError::unsafe_(
                 diagnostic,
-                match link_policy {
+                match _link_policy {
                     LinkPolicy::ExactlyOne => "executable must have exactly one link",
                     LinkPolicy::OneOrTwo => {
                         "scale build artifact must have one link or Cargo's two-link shape"

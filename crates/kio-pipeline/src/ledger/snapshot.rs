@@ -1152,6 +1152,7 @@ fn validate_test_barrier_parent(parent: &fs::File) -> Result<(), AttemptError> {
     }
 }
 
+#[cfg(unix)]
 fn verify_private_leaf(
     dir: &fs::File,
     name: &str,
@@ -1227,6 +1228,7 @@ fn verify_private_leaf(
     Ok(())
 }
 
+#[cfg(unix)]
 fn verify_private_snapshot(path: &Path, manifest: &Manifest) -> Result<(), AttemptError> {
     let dir = cap_fs::open_ambient_dir(path, cap_primitives::ambient_authority()).map_err(|e| {
         AttemptError::Unstable(format!("open private ledger snapshot capability: {e}"))

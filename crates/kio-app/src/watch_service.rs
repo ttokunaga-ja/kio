@@ -165,7 +165,7 @@ fn load_runner_manifest(manifest_path: &Path) -> Result<ServiceManifest> {
     // byte comparison catches a replacement between the private-file audit
     // and capability-relative read.
     let store = StoreDirectory::open(parent)?;
-    let mut file = store.open_regular_read(Path::new(leaf), MAX_MANIFEST_BYTES)?;
+    let file = store.open_regular_read(Path::new(leaf), MAX_MANIFEST_BYTES)?;
     store.ensure_owner_private(Path::new(leaf))?;
     let mut retained_bytes = Vec::new();
     file.take(MAX_MANIFEST_BYTES.saturating_add(1))

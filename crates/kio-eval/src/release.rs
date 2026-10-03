@@ -3075,13 +3075,13 @@ fn is_lowercase_hex(v: &str) -> bool {
     v.bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
-fn set_executable(path: &Path) -> Result<(), ReleaseError> {
+fn set_executable(_path: &Path) -> Result<(), ReleaseError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let mut p = fs::metadata(path)?.permissions();
+        let mut p = fs::metadata(_path)?.permissions();
         p.set_mode(0o755);
-        fs::set_permissions(path, p)?;
+        fs::set_permissions(_path, p)?;
     }
     Ok(())
 }

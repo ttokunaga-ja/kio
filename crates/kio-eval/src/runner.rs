@@ -1220,8 +1220,10 @@ mod tests {
             .arg("runner::tests::windows_job_leaf_helper")
             .arg("--nocapture")
             .env("KIO_EVAL_WINDOWS_JOB_LEAF_MARKER", marker);
-        let _leaf = leaf.spawn().expect("spawn Job Object descendant");
+        let mut leaf = leaf.spawn().expect("spawn Job Object descendant");
         thread::sleep(Duration::from_secs(30));
+        leaf.wait()
+            .expect("reap Job Object descendant if helper survives");
     }
 
     #[cfg(windows)]

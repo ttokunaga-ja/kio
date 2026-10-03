@@ -573,7 +573,7 @@ type AfterPublishHook = Box<dyn FnOnce() + Send>;
 static AFTER_PUBLISH_HOOK: OnceLock<Mutex<BTreeMap<PathBuf, AfterPublishHook>>> = OnceLock::new();
 #[cfg(test)]
 static BEFORE_PUBLISH_HOOK: OnceLock<Mutex<BTreeMap<PathBuf, AfterPublishHook>>> = OnceLock::new();
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn install_after_publish_hook(output: PathBuf, hook: AfterPublishHook) {
     let mut slot = AFTER_PUBLISH_HOOK
         .get_or_init(|| Mutex::new(BTreeMap::new()))
@@ -681,23 +681,26 @@ mod tests {
         }
     }
 
+    use crate::persona_plan::PersonaProfile;
+    #[cfg(unix)]
     use crate::{
         persona_materialize::{MaterializeRequest, materialize},
-        persona_plan::PersonaProfile,
         persona_render_artifact::RenderArtifact,
         persona_schedule::build_suite_schedule,
     };
     use std::{
         fs,
         sync::{
-            Arc, OnceLock,
+            Arc,
             atomic::{AtomicUsize, Ordering},
         },
     };
     use tempfile::tempdir;
 
+    #[cfg(unix)]
     static TINY_BUNDLE: OnceLock<(Vec<u8>, Vec<u8>, Vec<u8>)> = OnceLock::new();
 
+    #[cfg(unix)]
     fn tiny_bundle() -> &'static (Vec<u8>, Vec<u8>, Vec<u8>) {
         TINY_BUNDLE.get_or_init(|| {
             let plan = crate::persona_plan::frozen_plan(PersonaProfile::Tiny);
@@ -711,6 +714,7 @@ mod tests {
         })
     }
 
+    #[cfg(unix)]
     fn bundle() -> (tempfile::TempDir, PathBuf) {
         let temp = tempdir().unwrap();
         let base = fs::canonicalize(temp.path()).unwrap();

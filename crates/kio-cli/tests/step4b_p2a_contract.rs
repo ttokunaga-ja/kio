@@ -523,6 +523,10 @@ fn pa08_cache_reuse_reverifies_bytes_every_time_and_fails_closed_on_torn_content
         fs::set_permissions(&cache_path, fs::Permissions::from_mode(0o600)).unwrap();
     }
     #[cfg(windows)]
+    #[expect(
+        clippy::permissions_set_readonly_false,
+        reason = "Windows-only fixture clears the READONLY attribute; Unix sets mode 0600 above"
+    )]
     {
         let mut permissions = fs::metadata(&cache_path).unwrap().permissions();
         permissions.set_readonly(false);
