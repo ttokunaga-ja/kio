@@ -67,13 +67,7 @@ use tempfile::TempDir;
 
 fn open_temp_ledger() -> (TempDir, LedgerDb) {
     let dir = tempfile::tempdir().unwrap();
-    let device_dir = std::fs::canonicalize(dir.path()).unwrap().join("device");
-    std::fs::create_dir(&device_dir).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&device_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    let device_dir = support::create_private_child_dir(dir.path(), "device");
     let path = device_dir.join("cost-ledger.sqlite");
     let db = LedgerDb::initialize(&path).unwrap();
     (dir, db)
@@ -488,13 +482,7 @@ fn cl07_required_indexes_canonical_and_partial_index_used_by_planner() {
 #[test]
 fn cl08_ledger_db_open_existing_rejects_missing_required_index_without_repair() {
     let dir = tempfile::tempdir().unwrap();
-    let device_dir = std::fs::canonicalize(dir.path()).unwrap().join("device");
-    std::fs::create_dir(&device_dir).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&device_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    let device_dir = support::create_private_child_dir(dir.path(), "device");
     let path = device_dir.join("cost-ledger.sqlite");
     let db = LedgerDb::initialize(&path).unwrap();
     let authority =
@@ -2659,11 +2647,13 @@ fn cl70_device_global_path_and_wal_busy_timeout() {
     let initialized = LedgerDb::initialize(&resolved).unwrap();
     drop(initialized);
     let db = LedgerDb::open_existing(&resolved).unwrap();
+    support::prepare_private_sqlite_sidecars(db.path()).unwrap();
     let journal: String = Connection::open(db.path())
         .unwrap()
         .query_row("PRAGMA journal_mode", [], |row| row.get(0))
         .unwrap();
     assert_eq!(journal.to_lowercase(), "wal");
+    support::prepare_private_sqlite_sidecars(db.path()).unwrap();
     let blocker = Connection::open(db.path()).unwrap();
     blocker.execute_batch("BEGIN IMMEDIATE;").unwrap();
     let worker = db.clone();
@@ -2692,13 +2682,7 @@ fn cl70_device_global_path_and_wal_busy_timeout() {
 #[test]
 fn retired_jsonl_files_fail_closed_without_modification() {
     let dir = tempfile::tempdir().unwrap();
-    let data_dir = std::fs::canonicalize(dir.path()).unwrap().join("device");
-    std::fs::create_dir(&data_dir).unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    }
+    let data_dir = support::create_private_child_dir(dir.path(), "device");
 
     for name in [
         "cost-ledger.jsonl",

@@ -157,6 +157,7 @@ impl Fixture {
     }
 
     fn ledger_counts(&self) -> (i64, i64) {
+        support::prepare_private_sqlite_sidecars(&self.ledger_path()).unwrap();
         let conn =
             Connection::open_with_flags(self.ledger_path(), OpenFlags::SQLITE_OPEN_READ_ONLY)
                 .unwrap();

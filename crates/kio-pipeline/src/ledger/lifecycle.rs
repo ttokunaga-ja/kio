@@ -907,3 +907,70 @@ fn durability_checkpoint(point: DurabilityPoint) -> Result<()> {
 #[cfg(test)]
 #[path = "lifecycle_tests.rs"]
 mod tests;
+
+#[cfg(all(test, windows))]
+mod windows_sidecar_tests {
+    use super::*;
+    use kio_core::store_dir::{Publication, StoreDirectory};
+    use std::fs;
+
+    #[test]
+    fn interrupted_first_sidecar_publication_requires_exact_init_resume() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .canonicalize()
+            .unwrap()
+            .join("device/cost-ledger.sqlite");
+        let parent_path = path.parent().unwrap();
+        let wal_leaf = Path::new("cost-ledger.sqlite-wal");
+        let shm_path = parent_path.join("cost-ledger.sqlite-shm");
+        let error = LedgerDb::initialize_with_hook(&path, |phase| {
+            if phase == InitPhase::Database {
+                // Simulate the crash state after the first create-only sidecar
+                // publication, before SQLite opens or SHM is published. The
+                // initialization session still owns its lifecycle lock here.
+                let parent = StoreDirectory::open(parent_path).unwrap();
+                parent
+                    .write_atomic(wal_leaf, b"", Publication::CreateOnly)
+                    .unwrap();
+                return Err(contract("TEST-INTERRUPTED", "first sidecar published"));
+            }
+            Ok(())
+        })
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PipelineError::Contract {
+                code: "TEST-INTERRUPTED",
+                ..
+            }
+        ));
+        let pending_path = parent_path.join("cost-ledger.sqlite.init.pending");
+        let pending_bytes = fs::read(&pending_path).unwrap();
+        let pending: InitPending = decode(&pending_bytes).unwrap();
+        let wal_path = parent_path.join(wal_leaf);
+        assert_eq!(fs::read(&wal_path).unwrap(), b"");
+        assert!(!shm_path.exists());
+        assert!(LedgerDb::open_existing(&path).is_err());
+        assert!(LedgerDb::initialize(&path).is_err());
+        assert_eq!(fs::read(&pending_path).unwrap(), pending_bytes);
+        assert_eq!(fs::read(&wal_path).unwrap(), b"");
+        assert!(!shm_path.exists());
+
+        let resumed = LedgerDb::resume_initialization(&path).unwrap();
+        assert_eq!(resumed.authority, pending.authority);
+        assert_eq!(resumed.integrity_check().unwrap(), "ok");
+        let rows: i64 = resumed
+            .read(|connection| {
+                Ok(connection.query_row(
+                    "SELECT (SELECT count(*) FROM batch_requests)+(SELECT count(*) FROM cost_ledger)",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert!(!pending_path.exists());
+    }
+}

@@ -271,23 +271,6 @@ fn insert_batch_request_row(
     .unwrap();
 }
 
-fn batch_request_row_exists(
-    conn: &Connection,
-    scope_id: &str,
-    adapter_kind: &str,
-    input_hash: &str,
-    tool_profile_hash: &str,
-) -> bool {
-    conn.query_row(
-        "SELECT COUNT(*) FROM batch_requests
-         WHERE scope_id = ?1 AND adapter_kind = ?2 AND input_hash = ?3 AND tool_profile_hash = ?4",
-        params![scope_id, adapter_kind, input_hash, tool_profile_hash],
-        |row| row.get::<_, i64>(0),
-    )
-    .unwrap()
-        > 0
-}
-
 fn batch_request_row(
     conn: &Connection,
     scope_id: &str,
@@ -547,14 +530,17 @@ fn qa15_orphan_attribution_walk() {
     // Nothing was mutated: no batch_requests row exists for any of these
     // task keys (they were never created).
     let ledger = LedgerDb::open_existing(ledger_path(&dir)).unwrap();
-    let conn = Connection::open(ledger.path()).unwrap();
-    assert!(!batch_request_row_exists(
-        &conn,
+    let orphan_key = kio_pipeline::ledger::TaskKey::new(
         &local_scope_id,
         "markdownize",
         "sha256:orphan-input",
         "sha256:orphan-profile",
-    ));
+    );
+    assert!(
+        kio_pipeline::ledger::ops::get_batch_request(&ledger, &orphan_key)
+            .unwrap()
+            .is_none()
+    );
     drop(ledger);
 
     // Idempotent: an identical rerun (same fixture, nothing changed) reports

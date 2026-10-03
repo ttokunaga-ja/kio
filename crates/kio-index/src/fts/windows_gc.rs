@@ -14,7 +14,7 @@ use std::fs::File;
 const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 fn core_error(error: kio_core::KioError) -> IndexError {
-    IndexError::Schema(format!("Windows GC index exchange: {error}"))
+    IndexError::GcExchange(error)
 }
 fn validation_error(error: IndexError) -> kio_core::KioError {
     kio_core::KioError::new(
@@ -339,7 +339,7 @@ mod tests {
             };
             let path = kio_path.join("index/sqlite.db");
             let index = SqliteFtsIndex::open(&path, config.clone()).unwrap();
-            let source_generation = "01J000000000000000000000000";
+            let source_generation = "01J00000000000000000000000";
             ensure_index_metadata(index.connection(), source_generation, 7).unwrap();
             drop(index);
             let kio =
@@ -348,11 +348,11 @@ mod tests {
                 .unwrap()
                 .unwrap();
             let attestation = GcIndexRotationAttestation {
-                sweep_id: "01J000000000000000000000002".into(),
+                sweep_id: "01J00000000000000000000002".into(),
                 role: "pre_sweep".into(),
                 plan_digest: format!("sha256:{}", "a".repeat(64)),
                 source_generation: source_generation.into(),
-                target_generation: "01J000000000000000000000001".into(),
+                target_generation: "01J00000000000000000000001".into(),
             };
             let prepared = prepare_bound_gc_index_rotation(
                 &kio,
@@ -405,7 +405,12 @@ mod tests {
     }
 
     fn interruption() -> kio_core::KioError {
-        validation_error(IndexError::Schema("injected process interruption".into()))
+        kio_core::KioError::new(
+            "KIO-E-GC-TEST-INTERRUPTED-001",
+            "injected process interruption",
+            serde_json::json!({"point": "index_exchange_checkpoint"}),
+            kio_core::ExitCode::Interrupted,
+        )
     }
 
     #[cfg(debug_assertions)]
@@ -465,16 +470,20 @@ mod tests {
             ExchangeStep::IntentRemoved,
         ] {
             let fixture = Fixture::new();
-            assert!(
-                exchange_authority(&fixture.kio, &fixture.authority(), |step| {
-                    if step == stop {
-                        Err(interruption())
-                    } else {
-                        Ok(())
-                    }
-                })
-                .is_err()
-            );
+            let error = exchange_authority(&fixture.kio, &fixture.authority(), |step| {
+                if step == stop {
+                    Err(interruption())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap_err();
+            let IndexError::GcExchange(error) = error else {
+                panic!("exchange interruption lost its typed outcome: {error}");
+            };
+            assert_eq!(error.error_code(), "KIO-E-GC-TEST-INTERRUPTED-001");
+            assert_eq!(error.exit_code(), kio_core::ExitCode::Interrupted);
+            assert_eq!(error.context(), interruption().context());
             if stop == ExchangeStep::SourceCaptured {
                 assert!(
                     !fixture.public().exists(),

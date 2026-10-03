@@ -753,10 +753,26 @@ impl ObjectStore {
         Ok(Self {
             kio_dir: None,
             bound: Some(BoundObjectDirs {
-                kio: Arc::new(
-                    kio.try_clone()
-                        .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
-                ),
+                kio: {
+                    let retained = kio
+                        .try_clone()
+                        .map_err(|e| KioError::io(e.to_string(), ".kio"))?;
+                    // The borrowed caller handle remains caller-owned. Our
+                    // persistent clone must open by ID on Windows so it does
+                    // not retain a named link after the caller closes theirs.
+                    #[cfg(windows)]
+                    {
+                        crate::store_dir::StoreDirectory::from_retained(
+                            retained,
+                            PathBuf::from(".kio"),
+                        )?
+                        .root_handle()
+                    }
+                    #[cfg(unix)]
+                    {
+                        Arc::new(retained)
+                    }
+                },
                 objects: Arc::new(objects),
                 raw: Arc::new(raw),
                 trees: Arc::new(trees),
@@ -2843,6 +2859,18 @@ fn bound_open_dir(parent: &File, leaf: &str) -> Result<File> {
     let directory = cap_primitives::fs::open_dir_nofollow(parent, name)
         .map_err(|error| bound_io_or_not_found(error, leaf))?;
     ensure_bound_directory(&directory, Path::new(leaf))?;
+    #[cfg(windows)]
+    let directory = {
+        // CAS namespaces can outlive this call, including lazy content bases.
+        // Consume the raw handle so retained children permit ancestor renames;
+        // normalization reopens only this same validated directory object.
+        let retained =
+            crate::store_dir::StoreDirectory::from_retained(directory, PathBuf::from(leaf))?;
+        retained
+            .root_handle()
+            .try_clone()
+            .map_err(|error| KioError::io(error.to_string(), leaf))?
+    };
     Ok(directory)
 }
 
@@ -5862,6 +5890,7 @@ mod tests {
             cap_primitives::fs::open_ambient_dir(&kio, cap_primitives::ambient_authority())
                 .unwrap();
         let bound = ObjectStore::from_bound_kio(&handle).unwrap();
+        drop(handle);
         let chunk = chunk_object("retained semantic text");
         let chunk_hash = bound.write_chunk(&chunk).unwrap();
         let embedding = embedding_object(vec![1.0, 0.0]);

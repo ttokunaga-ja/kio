@@ -751,7 +751,12 @@ mod tests {
         }
         let engine =
             WatchEngine::open(&dir.path().join("queue.sqlite"), [root], Calls::default()).unwrap();
-        let stale = WatchRoot::new("stale", PathBuf::from("/private/stale-root"), 9).unwrap();
+        let stale = WatchRoot::new(
+            "stale",
+            root_dir.path().canonicalize().unwrap().join("stale-root"),
+            9,
+        )
+        .unwrap();
         engine
             .queue
             .lock()

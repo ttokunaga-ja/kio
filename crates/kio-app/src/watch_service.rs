@@ -1843,9 +1843,10 @@ mod tests {
     #[test]
     fn renders_escaped_native_definition_without_shell_syntax() {
         let root = Path::new("/tmp/watch & root");
+        let binary = root.join("kio");
         let rendered = render_definition(
             "io.kio.watch.abc",
-            Path::new("/tmp/kio"),
+            &binary,
             root,
             300,
             &manifest().environment,
@@ -1853,6 +1854,11 @@ mod tests {
         )
         .unwrap();
         assert!(rendered.contains("watch &amp; root") || rendered.contains("watch & root"));
+        #[cfg(windows)]
+        assert!(rendered.contains(&format!(
+            "<Command>{}</Command>",
+            xml_escape(&binary.to_string_lossy()).unwrap()
+        )));
         assert!(!rendered.contains("$()"));
     }
     #[test]

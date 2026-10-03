@@ -71,15 +71,15 @@ impl<R: Reconcile> NativeWatcher<R> {
     #[cfg(windows)]
     pub fn start(engine: Arc<WatchEngine<R>>) -> Result<Self, WatchError> {
         engine.set_backend("windows/read-directory-changes", false, None);
-        let watcher = windows_backend::Backend::start(Arc::clone(&engine)).map_err(|error| {
-            engine.set_backend(
-                "windows/read-directory-changes",
-                true,
-                Some(error.to_string()),
-            );
-            enqueue_all(&engine, DirtyReason::BackendError);
-            error
-        })?;
+        let watcher =
+            windows_backend::Backend::start(Arc::clone(&engine)).inspect_err(|error| {
+                engine.set_backend(
+                    "windows/read-directory-changes",
+                    true,
+                    Some(error.to_string()),
+                );
+                enqueue_all(&engine, DirtyReason::BackendError);
+            })?;
         Ok(Self {
             _watcher: watcher,
             _engine: engine,

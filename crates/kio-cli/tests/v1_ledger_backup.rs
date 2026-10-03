@@ -1,5 +1,8 @@
 //! CLI contracts for create-only, authority-bound device ledger recovery.
 
+#[allow(dead_code)]
+mod support;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -84,10 +87,7 @@ impl Fixture {
 }
 
 fn backup_dir(fixture: &Fixture) -> PathBuf {
-    let path = fixture.home.join("ledger-backup");
-    fs::create_dir(&path).unwrap();
-    make_owner_private(&path);
-    path
+    support::create_private_child_dir(&fixture.home, "ledger-backup")
 }
 
 fn make_owner_private(path: &Path) {

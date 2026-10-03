@@ -14,8 +14,11 @@ const SCOPE_ID: &str = "01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 fn planned_stage() -> (tempfile::TempDir, PathBuf, StoreDirectory) {
     let fixture = tempfile::tempdir().unwrap();
-    let root = fixture.path().canonicalize().unwrap();
-    let directory = StoreDirectory::open(&root).unwrap();
+    let parent_root = fixture.path().canonicalize().unwrap();
+    let parent = StoreDirectory::open(&parent_root).unwrap();
+    let stage = parent.create_directory(Path::new("stage")).unwrap();
+    let root = parent_root.join("stage");
+    let directory = StoreDirectory::from_retained(stage, root.clone()).unwrap();
     (fixture, root, directory)
 }
 
@@ -93,6 +96,87 @@ fn complete_planned_layout_fills_only_missing_expected_entries() {
     }
 
     complete_planned_kio_layout(&directory, &root, SCOPE_ID, &aux).unwrap();
+}
+
+#[test]
+fn planned_layout_validates_and_completes_with_an_empty_auxiliary_gate_locked() {
+    let (_fixture, root, directory) = planned_stage();
+    let gate_name = Path::new(".root-init-gate");
+    let gate = directory.lock_private_gate(gate_name).unwrap();
+    directory.ensure_owner_private(gate_name).unwrap();
+    let aux = [(".root-init-gate", b"".as_slice())];
+
+    let assert_gate_locked = || {
+        let contender = directory.open_regular_read(gate_name, 0).unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        assert_eq!(gate.metadata().unwrap().len(), 0);
+    };
+    assert_gate_locked();
+    validate_planned_kio_layout(&directory, &root, SCOPE_ID, &aux).unwrap();
+    assert_gate_locked();
+    for _ in 0..2 {
+        complete_planned_kio_layout(&directory, &root, SCOPE_ID, &aux).unwrap();
+        validate_planned_kio_layout(&directory, &root, SCOPE_ID, &aux).unwrap();
+        assert_gate_locked();
+    }
+}
+
+#[test]
+fn planned_layout_rejects_auxiliary_content_mismatches_before_writing() {
+    for (actual, expected) in [
+        (b"nonempty".as_slice(), b"".as_slice()),
+        (b"wrong".as_slice(), b"right".as_slice()),
+        (b"".as_slice(), b"right".as_slice()),
+    ] {
+        let (_fixture, root, directory) = planned_stage();
+        directory
+            .write_atomic(Path::new("auxiliary"), actual, Publication::CreateOnly)
+            .unwrap();
+        let aux = [("auxiliary", expected)];
+
+        assert!(validate_planned_kio_layout(&directory, &root, SCOPE_ID, &aux).is_err());
+        assert!(complete_planned_kio_layout(&directory, &root, SCOPE_ID, &aux).is_err());
+        assert_eq!(read(&directory, "auxiliary"), Some(actual.to_vec()));
+        assert_eq!(read(&directory, "HEAD"), None);
+    }
+}
+
+#[test]
+fn planned_layout_rejects_an_empty_auxiliary_directory_before_writing() {
+    let (_fixture, root, directory) = planned_stage();
+    directory.create_directory(Path::new("auxiliary")).unwrap();
+    let aux = [("auxiliary", b"".as_slice())];
+
+    assert!(validate_planned_kio_layout(&directory, &root, SCOPE_ID, &aux).is_err());
+    assert!(complete_planned_kio_layout(&directory, &root, SCOPE_ID, &aux).is_err());
+    assert_eq!(read(&directory, "HEAD"), None);
+}
+
+#[cfg(unix)]
+#[test]
+fn planned_layout_rejects_empty_auxiliary_links_before_writing() {
+    use std::os::unix::fs::symlink;
+
+    for hard_link in [false, true] {
+        let (_fixture, root, directory) = planned_stage();
+        let outside = tempfile::tempdir().unwrap();
+        let target = outside.path().join("empty");
+        fs::write(&target, b"").unwrap();
+        if hard_link {
+            fs::hard_link(&target, root.join("auxiliary")).unwrap();
+        } else {
+            symlink(&target, root.join("auxiliary")).unwrap();
+        }
+        let aux = [("auxiliary", b"".as_slice())];
+
+        assert!(validate_planned_kio_layout(&directory, &root, SCOPE_ID, &aux).is_err());
+        assert!(complete_planned_kio_layout(&directory, &root, SCOPE_ID, &aux).is_err());
+        assert_eq!(read(&directory, "HEAD"), None);
+        assert!(fs::read(&target).unwrap().is_empty());
+    }
 }
 
 #[test]

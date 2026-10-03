@@ -509,6 +509,42 @@ fn windows_exchange_scope_image(root: &Path) -> std::collections::BTreeMap<PathB
 }
 
 #[cfg(windows)]
+fn assert_windows_exchange_owner_clean(path: &Path) {
+    use kio_core::store_dir::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, StoreDirectory};
+
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        result => assert!(result.unwrap().is_dir(), "{}", path.display()),
+    }
+    let owner = StoreDirectory::open(path).unwrap();
+    for leaf in ["intent.json", "backup"] {
+        assert!(
+            !owner.contains_entry(Path::new(leaf)).unwrap(),
+            "{}: {leaf} remains",
+            path.display()
+        );
+    }
+    let entries = owner.entries(Path::new("")).unwrap();
+    for entry in &entries {
+        assert_eq!(entry.name, ATOMIC_WORKSPACE_DIR, "{}", path.display());
+        assert!(entry.is_directory && !entry.is_regular_file);
+        owner.open_directory(Path::new(&entry.name)).unwrap();
+    }
+    // Atomic removal keeps its permanent gate after retiring the journal.
+    assert_eq!(
+        owner.inspect_atomic().unwrap(),
+        if entries.is_empty() {
+            AtomicWorkspaceState::Absent
+        } else {
+            AtomicWorkspaceState::Clean
+        },
+        "{}",
+        path.display()
+    );
+    assert!(!kio_core::gc::windows_exchange::inspect_pending(&owner).unwrap());
+}
+
+#[cfg(windows)]
 fn assert_windows_automatic_exchange_completed(dir: &TempDir, commit: &str, tree: &str) {
     let kio_dir = dir.path().join(".kio");
     assert!(!kio_dir.join("gc/in_progress").exists());
@@ -518,9 +554,7 @@ fn assert_windows_automatic_exchange_completed(dir: &TempDir, commit: &str, tree
     assert_eq!(receipts[commit].tree_hash, tree);
     for kind in ["marker", "index"] {
         let owner = kio_dir.join(format!("gc/internal/{kind}-exchange"));
-        if owner.exists() {
-            assert_eq!(fs::read_dir(owner).unwrap().count(), 0);
-        }
+        assert_windows_exchange_owner_clean(&owner);
     }
 }
 

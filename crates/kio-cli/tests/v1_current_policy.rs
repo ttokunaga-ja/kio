@@ -125,6 +125,7 @@ impl Fixture {
         if !path.exists() {
             return (0, 0);
         }
+        support::prepare_private_sqlite_sidecars(&path).unwrap();
         let conn =
             Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         (

@@ -384,6 +384,7 @@ fn normalized_absolute(path: &Path) -> Result<PathBuf, LedgerSnapshotError> {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::ffi::OsStrExt;
         use std::path::Prefix;
         let mut components = path.components();
         let Some(Component::Prefix(prefix)) = components.next() else {
@@ -392,8 +393,11 @@ fn normalized_absolute(path: &Path) -> Result<PathBuf, LedgerSnapshotError> {
                 path.display()
             )));
         };
-        if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(_, _))
-            || !matches!(components.next(), Some(Component::RootDir))
+        let verbatim_disk = matches!(prefix.kind(), Prefix::VerbatimDisk(_));
+        if !matches!(
+            prefix.kind(),
+            Prefix::Disk(_) | Prefix::UNC(_, _) | Prefix::VerbatimDisk(_)
+        ) || !matches!(components.next(), Some(Component::RootDir))
         {
             return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
                 "ledger path must use a normalized absolute drive or UNC path: {}",
@@ -404,7 +408,17 @@ fn normalized_absolute(path: &Path) -> Result<PathBuf, LedgerSnapshotError> {
         normalized.push("\\");
         for component in components {
             match component {
-                Component::Normal(name) => normalized.push(name),
+                Component::Normal(name) => {
+                    // Preserve canonical drive paths in their verbatim
+                    // namespace, whose only separator is a backslash.
+                    if verbatim_disk && name.encode_wide().any(|unit| unit == b'/' as u16) {
+                        return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
+                            "ledger verbatim drive path contains a slash: {}",
+                            path.display()
+                        )));
+                    }
+                    normalized.push(name);
+                }
                 _ => {
                     return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
                         "ledger path is not normalized: {}",
@@ -752,8 +766,10 @@ fn filesystem_root(_path: &Path) -> Result<PathBuf, LedgerSnapshotError> {
                 "ledger path has no volume root".into(),
             ));
         };
-        if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(_, _))
-            || !matches!(components.next(), Some(Component::RootDir))
+        if !matches!(
+            prefix.kind(),
+            Prefix::Disk(_) | Prefix::UNC(_, _) | Prefix::VerbatimDisk(_)
+        ) || !matches!(components.next(), Some(Component::RootDir))
         {
             return Err(LedgerSnapshotError::UnsafeIntegrity(
                 "ledger path has no volume root".into(),
@@ -1577,18 +1593,53 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = private_test_dir(dir.path(), "device").join("cost-ledger.sqlite");
         initialize_ledger(&path);
-        let conn = Connection::open(&path).unwrap();
+        let conn = fixture_connection(&path);
         (dir, path, conn)
+    }
+
+    fn fixture_connection(path: &Path) -> Connection {
+        #[cfg(not(windows))]
+        {
+            Connection::open(path).unwrap()
+        }
+        #[cfg(windows)]
+        {
+            // Establish private main/WAL/SHM bindings through the production
+            // lifecycle boundary before a raw test connection can use them.
+            // Keep both SQLite connections alive through the first real table
+            // read, so finishing the bound connection cannot remove sidecars
+            // that the returned fixture connection will still need.
+            let session = super::super::lifecycle_fs::FsSession::acquire(path, false).unwrap();
+            let bound = session
+                .open_existing_sqlite(OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .unwrap();
+            let conn =
+                Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+            let _: i64 = conn
+                .query_row("SELECT count(*) FROM cost_ledger", [], |row| row.get(0))
+                .unwrap();
+            bound.finish().unwrap();
+            // The lifecycle session and its lock end here, before the caller
+            // runs a snapshot or deliberately mutates the source fixture.
+            conn
+        }
     }
 
     fn private_test_dir(parent: &Path, name: &str) -> PathBuf {
         let path = parent.join(name);
-        fs::create_dir(&path).unwrap();
+        #[cfg(windows)]
+        {
+            let parent = kio_core::store_dir::StoreDirectory::open(parent).unwrap();
+            drop(parent.create_directory(Path::new(name)).unwrap());
+        }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            fs::create_dir(&path).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         }
+        #[cfg(not(any(unix, windows)))]
+        fs::create_dir(&path).unwrap();
         fs::canonicalize(path).unwrap()
     }
 
@@ -1740,7 +1791,7 @@ mod tests {
         db.execute_batch("PRAGMA wal_autocheckpoint = 0;").unwrap();
         // Keep a reader transaction and the writer alive: WAL must remain the
         // committed source of truth while the private main+WAL copy is opened.
-        let reader = rusqlite::Connection::open(&path).unwrap();
+        let reader = fixture_connection(&path);
         reader
             .execute_batch("BEGIN; SELECT count(*) FROM cost_ledger;")
             .unwrap();
@@ -1754,6 +1805,96 @@ mod tests {
         let snapshot = LedgerReadSnapshot::open(&path).unwrap();
         assert_eq!(snapshot.month_total(None, None, "2026-08").unwrap(), 4.0);
         assert_eq!(before, source_bytes(&path));
+        drop(reader);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_ledger_path_policy_accepts_absolute_disk_canonical_disk_or_unc_roots() {
+        for (accepted, expected_root) in [
+            (r"C:\kio\cost-ledger.sqlite", r"C:\"),
+            (r"\\?\C:\kio\cost-ledger.sqlite", r"\\?\C:\"),
+            (r"\\server\share\kio\cost-ledger.sqlite", r"\\server\share\"),
+        ] {
+            let normalized = normalized_absolute(Path::new(accepted))
+                .unwrap_or_else(|error| panic!("{accepted}: {error}"));
+            assert_eq!(normalized.as_os_str(), Path::new(accepted).as_os_str());
+            assert_eq!(
+                filesystem_root(&normalized).unwrap().as_os_str(),
+                Path::new(expected_root).as_os_str(),
+                "{accepted}"
+            );
+        }
+        for rejected in [
+            r"kio\cost-ledger.sqlite",
+            r"\kio\cost-ledger.sqlite",
+            r"C:kio\cost-ledger.sqlite",
+            r"C:\kio\..\cost-ledger.sqlite",
+            r"\\?\C:",
+            r"\\?\C:kio\cost-ledger.sqlite",
+            r"\\?\C:/kio/cost-ledger.sqlite",
+            r"\\?\C:\kio/cost-ledger.sqlite",
+            r"\\?\C:\kio\..\cost-ledger.sqlite",
+            r"\\?\C:\kio\.\cost-ledger.sqlite",
+            r"\\?\UNC\server\share\kio\cost-ledger.sqlite",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\kio\cost-ledger.sqlite",
+            r"\\.\PhysicalDrive0",
+            r"\\.\C:\kio\cost-ledger.sqlite",
+        ] {
+            assert!(
+                normalized_absolute(Path::new(rejected)).is_err(),
+                "{rejected}"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_canonical_drive_snapshot_reads_wal_without_changing_source_artifacts() {
+        let (_dir, path, db) = ledger();
+        db.execute_batch("PRAGMA wal_autocheckpoint = 0;").unwrap();
+        let reader = fixture_connection(&path);
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM cost_ledger;")
+            .unwrap();
+        db.execute(
+            "INSERT INTO cost_ledger (scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,estimated,outcome,month,recorded_at)
+             VALUES ('scope-w','markdownize','input-w','profile-w',1,'job-w',4.0,0,'succeeded','2026-08',0)", [],
+        ).unwrap();
+        let canonical = fs::canonicalize(&path).unwrap();
+        assert!(matches!(
+            canonical.components().next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+        assert_eq!(
+            normalized_absolute(&canonical).unwrap().as_os_str(),
+            canonical.as_os_str(),
+            "canonical source path must retain its exact namespace"
+        );
+        assert!(canonical.with_file_name("cost-ledger.sqlite-wal").exists());
+        assert!(canonical.with_file_name("cost-ledger.sqlite-shm").exists());
+        let before = source_bytes(&canonical);
+        let before_names = fs::read_dir(canonical.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+
+        let snapshot = LedgerReadSnapshot::open(&canonical).unwrap();
+        assert_eq!(snapshot.month_total(None, None, "2026-08").unwrap(), 4.0);
+        assert!(snapshot.stalled_rows().unwrap().is_empty());
+        drop(snapshot);
+
+        assert_eq!(
+            source_bytes(&canonical),
+            before,
+            "main/WAL/SHM and lifecycle authority/checkpoint/intent must remain unchanged"
+        );
+        let after_names = fs::read_dir(canonical.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(after_names, before_names, "source artifact files changed");
         drop(reader);
     }
 
@@ -1832,10 +1973,9 @@ mod tests {
         let source = path.clone();
         MISSING_PARENT_HOOK.with(|slot| {
             *slot.borrow_mut() = Some(std::sync::Arc::new(move || {
-                fs::create_dir(&missing_parent).unwrap();
+                private_test_dir(missing_parent.parent().unwrap(), "appearing-parent");
                 initialize_ledger(&source);
-                Connection::open(&source)
-                    .unwrap()
+                fixture_connection(&source)
                     .execute(
                         "INSERT INTO cost_ledger (
                             scope_id, adapter_kind, input_hash, tool_profile_hash,
@@ -1864,8 +2004,7 @@ mod tests {
         let hook: SnapshotHook = std::sync::Arc::new(move |phase, attempt, _| {
             if attempt == 0 && matches!(phase, SnapshotPhase::AfterInitialManifest) {
                 initialize_ledger(&source);
-                Connection::open(&source)
-                    .unwrap()
+                fixture_connection(&source)
                     .execute(
                         "INSERT INTO cost_ledger (
                             scope_id, adapter_kind, input_hash, tool_profile_hash,
@@ -1996,7 +2135,7 @@ mod tests {
         let canonical_parent = private_test_dir(&private_test_root(&dir), "canonical");
         let path = canonical_parent.join("cost-ledger.sqlite");
         initialize_ledger(&path);
-        let original = Connection::open(&path).unwrap();
+        let original = fixture_connection(&path);
         original
             .execute(
                 "INSERT INTO cost_ledger (scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,estimated,outcome,month,recorded_at)
@@ -2277,8 +2416,7 @@ mod tests {
         let source = path.clone();
         let hook: SnapshotHook = std::sync::Arc::new(move |phase, attempt, _| {
             if matches!(phase, SnapshotPhase::AfterProbeBeforeRecheck) {
-                Connection::open(&source)
-                    .unwrap()
+                fixture_connection(&source)
                     .execute_batch(&format!("PRAGMA user_version = {};", attempt + 10))
                     .unwrap();
             }

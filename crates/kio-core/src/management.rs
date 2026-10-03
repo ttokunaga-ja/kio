@@ -131,6 +131,18 @@ impl ManagementBinding {
         if file_identity(&named)? != kio_identity {
             return Err(err("retained .kio handle does not match root"));
         }
+        #[cfg(windows)]
+        let (root, kio) = {
+            // Keep the proved objects while consuming the original Windows
+            // handles: retaining their delete-share-denying clones would
+            // prevent later namespace moves even after `control` normalizes.
+            let root = StoreDirectory::from_retained(root, canonical_root.clone())?;
+            let kio = StoreDirectory::from_retained(kio, canonical_root.join(".kio"))?;
+            (
+                root.root_handle().try_clone().map_err(io)?,
+                kio.root_handle().try_clone().map_err(io)?,
+            )
+        };
         let control = StoreDirectory::from_retained(
             kio.try_clone().map_err(io)?,
             canonical_root.join(".kio"),

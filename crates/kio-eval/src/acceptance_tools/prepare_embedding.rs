@@ -434,6 +434,7 @@ mod tests {
         }
     }
     fn source(root: &Path, r: &str) {
+        let directory = StoreDirectory::open(root).unwrap();
         for (p, b) in [
             (
                 format!("hub/models--Qwen--Qwen3-VL-Embedding-2B/snapshots/{r}/config.json"),
@@ -444,28 +445,25 @@ mod tests {
                 b"weights".as_slice(),
             ),
         ] {
-            let p = root.join(p);
-            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
-            std::fs::write(p, b).unwrap();
+            let p = Path::new(&p);
+            let parent = directory.create_directory_all(p.parent().unwrap()).unwrap();
+            let parent =
+                StoreDirectory::from_retained(parent, root.join(p.parent().unwrap())).unwrap();
+            parent
+                .write_atomic(
+                    Path::new(p.file_name().unwrap()),
+                    b,
+                    kio_core::store_dir::Publication::CreateOnly,
+                )
+                .unwrap();
         }
-    }
-    #[cfg(unix)]
-    fn private_dir(path: &Path) {
-        use std::os::unix::fs::DirBuilderExt;
-        let mut builder = std::fs::DirBuilder::new();
-        builder.mode(0o700);
-        builder.create(path).unwrap();
-    }
-    #[cfg(not(unix))]
-    fn private_dir(path: &Path) {
-        std::fs::create_dir(path).unwrap();
     }
     #[test]
     fn materializes_and_refuses_overwrite() {
         let t = super::super::canonical_tempdir();
         let r = "0123456789abcdef0123456789abcdef01234567";
         let c = t.path().join("cache");
-        private_dir(&c);
+        let _cache = super::super::private_fixture_directory(&c);
         source(&c, r);
         let p = t.path().join("models");
         std::fs::create_dir(&p).unwrap();
@@ -482,7 +480,7 @@ mod tests {
         let t = super::super::canonical_tempdir();
         let r = "0123456789abcdef0123456789abcdef01234567";
         let c = t.path().join("cache");
-        private_dir(&c);
+        let _cache = super::super::private_fixture_directory(&c);
         source(&c, r);
         let p = t.path().join("models");
         std::fs::create_dir(&p).unwrap();

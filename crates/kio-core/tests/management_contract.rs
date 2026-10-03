@@ -225,31 +225,34 @@ fn retained_binding_rejects_a_replaced_canonical_root_entry() {
     let temp = tempfile::tempdir().unwrap();
     let root = scope(temp.path(), "root");
     let record = initialize_root(&root, scope_id(&root), false).unwrap();
+    let retained_kio = StoreDirectory::from_retained(
+        root.kio_handle().try_clone().unwrap(),
+        root.canonical_root().join(".kio"),
+    )
+    .unwrap();
+    let before = retained_kio
+        .read_optional(std::path::Path::new("management.json"), 1024 * 1024)
+        .unwrap()
+        .expect("retained management record");
     let old = temp.path().join("old-root");
-    let rename = fs::rename(root.canonical_root(), &old);
-    #[cfg(windows)]
-    {
-        // cap-primitives omits FILE_SHARE_DELETE on retained directories, so
-        // Windows prevents the replacement itself while this binding is live.
-        assert_eq!(rename.unwrap_err().raw_os_error(), Some(32));
-        assert!(!old.exists());
-        root.revalidate().unwrap();
-        let chain = validate_live_chain(&root).unwrap();
-        assert_eq!(chain.scopes.len(), 1);
-        assert_eq!(chain.scopes[0].record, record);
-        assert_eq!(
-            chain.scopes[0].binding.directory_identity(),
-            root.directory_identity()
-        );
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = record;
-        rename.unwrap();
-        fs::create_dir_all(temp.path().join("root")).unwrap();
-        Repository::init(temp.path().join("root")).unwrap();
-        assert!(validate_live_chain(&root).is_err());
-    }
+    fs::rename(root.canonical_root(), &old).unwrap();
+    fs::create_dir_all(temp.path().join("root")).unwrap();
+    Repository::init(temp.path().join("root")).unwrap();
+    assert!(root.revalidate().is_err());
+    assert!(validate_live_chain(&root).is_err());
+    assert_eq!(
+        directory_identity_from_handle(root.root_handle()).unwrap(),
+        record.directory_identity
+    );
+    assert_eq!(
+        retained_kio
+            .read_optional(std::path::Path::new("management.json"), 1024 * 1024)
+            .unwrap()
+            .expect("retained management record"),
+        before
+    );
+    assert_eq!(fs::read(old.join(".kio/management.json")).unwrap(), before);
+    assert!(!temp.path().join("root/.kio/management.json").exists());
 }
 
 #[test]

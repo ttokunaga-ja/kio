@@ -78,6 +78,10 @@ fn bound_inspection_accounted_reads_and_streaming_copy_follow_retained_namespace
     }
     let retained =
         cap_primitives::fs::open_ambient_dir(&kio, cap_primitives::ambient_authority()).unwrap();
+    #[cfg(windows)]
+    let retained = kio_core::store_dir::StoreDirectory::from_retained(retained, kio.clone())
+        .unwrap()
+        .root_handle();
     let store = ObjectStore::from_bound_kio(&retained).unwrap();
     let mut objects = Vec::new();
     let raw = vec![b'z'; 128 * 1024 + 17];
@@ -186,6 +190,10 @@ fn retained_repairs_removals_and_embedding_inventory_never_follow_public_substit
     }
     let retained =
         cap_primitives::fs::open_ambient_dir(&kio, cap_primitives::ambient_authority()).unwrap();
+    #[cfg(windows)]
+    let retained = kio_core::store_dir::StoreDirectory::from_retained(retained, kio.clone())
+        .unwrap()
+        .root_handle();
     let store = ObjectStore::from_bound_kio(&retained).unwrap();
     let raw_bytes = b"raw retained repair";
     let raw_hash = store.write_raw(raw_bytes).unwrap();
@@ -219,6 +227,81 @@ fn retained_repairs_removals_and_embedding_inventory_never_follow_public_substit
     assert!(!store.remove_raw(&raw_hash).unwrap());
     assert!(store.embedding_hashes().unwrap().is_empty());
     assert_eq!(std::fs::read_dir(&kio).unwrap().count(), 0);
+}
+
+#[cfg(windows)]
+#[test]
+fn store_owned_kio_clone_survives_moves_after_raw_caller_handle_is_closed() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().join("scope");
+    let kio = root.join(".kio");
+    for kind in ["raw", "trees", "commits"] {
+        std::fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+    }
+    // Deliberately pass a raw named handle, without fixture normalization.
+    let caller =
+        cap_primitives::fs::open_ambient_dir(&kio, cap_primitives::ambient_authority()).unwrap();
+    let store = ObjectStore::from_bound_kio(&caller).unwrap();
+    drop(caller);
+    let bytes = b"raw bytes from the original bound store";
+    let hash = store.write_raw(bytes).unwrap();
+    let image = b"image bytes from the original lazy namespace";
+    let image_hash = store
+        .write_content_object(ContentObjectKind::Image, image)
+        .unwrap();
+
+    std::fs::rename(&kio, root.join("retained-kio")).unwrap();
+    for kind in ["raw", "trees", "commits"] {
+        std::fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+    }
+    let replacement = ObjectStore::new(&kio);
+    let replacement_hash = replacement.write_raw(b"replacement bytes").unwrap();
+    assert!(replacement.read_object(ObjectKind::Raw, &hash).is_err());
+    assert!(
+        store
+            .read_object(ObjectKind::Raw, &replacement_hash)
+            .is_err()
+    );
+    assert_eq!(
+        store.read_object(ObjectKind::Raw, &hash).unwrap().bytes,
+        bytes
+    );
+    assert_eq!(
+        store
+            .read_content_object_bytes(ContentObjectKind::Image, &image_hash, 4096)
+            .unwrap(),
+        image
+    );
+
+    std::fs::rename(&root, fixture.path().join("retained-scope")).unwrap();
+    for kind in ["raw", "trees", "commits"] {
+        std::fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+    }
+    let replacement = ObjectStore::new(&kio);
+    let replacement_hash = replacement.write_raw(b"replacement root bytes").unwrap();
+    assert!(replacement.read_object(ObjectKind::Raw, &hash).is_err());
+    assert!(
+        store
+            .read_object(ObjectKind::Raw, &replacement_hash)
+            .is_err()
+    );
+    assert_eq!(
+        store.read_object(ObjectKind::Raw, &hash).unwrap().bytes,
+        bytes
+    );
+    assert_eq!(
+        store
+            .read_content_object_bytes(ContentObjectKind::Image, &image_hash, 4096)
+            .unwrap(),
+        image
+    );
+    assert_eq!(
+        replacement
+            .read_object(ObjectKind::Raw, &replacement_hash)
+            .unwrap()
+            .bytes,
+        b"replacement root bytes"
+    );
 }
 
 #[cfg(unix)]

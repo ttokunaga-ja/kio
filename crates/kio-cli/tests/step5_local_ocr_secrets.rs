@@ -95,13 +95,34 @@ fn configure_local_ocr(dir: &TempDir, env: &[(&str, &str)]) {
     #[cfg(unix)]
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     let config = dir.path().join(".test-config/kio/tools.toml");
+    #[cfg(windows)]
+    {
+        let config_root = dir.path().join(".test-config");
+        if !config_root.exists() {
+            support::create_private_child_dir(dir.path(), ".test-config");
+        }
+        if !config.parent().unwrap().exists() {
+            support::create_private_child_dir(&config_root, "kio");
+        }
+    }
+    #[cfg(not(windows))]
     fs::create_dir_all(config.parent().unwrap()).unwrap();
     fs::write(
         config,
         "[markdown.paddleocr_vl_local]\nkind = \"offline_api\"\nurl = \"https://127.0.0.1:8443\"\nmodel = \"PaddleOCR-VL-0.9B\"\n",
     )
     .unwrap();
+    #[cfg(windows)]
+    let ca_path = dir.path().join(".test-config/kio/local-peer-ca.pem");
+    #[cfg(not(windows))]
     let ca_path = dir.path().join("local-peer-ca.pem");
+    #[cfg(windows)]
+    support::write_private_fixture_file(
+        ca_path.parent().unwrap(),
+        "local-peer-ca.pem",
+        LOCAL_PEER_CA_PEM.as_bytes(),
+    );
+    #[cfg(not(windows))]
     fs::write(&ca_path, LOCAL_PEER_CA_PEM).unwrap();
     #[cfg(unix)]
     fs::set_permissions(&ca_path, fs::Permissions::from_mode(0o600)).unwrap();

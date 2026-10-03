@@ -243,9 +243,9 @@ fn active_marker_blocks_fsck_repair_and_restore_before_destination_side_effects(
     let fsck = fsck_output.stdout;
     let value: Value = serde_json::from_slice(&fsck).unwrap();
     let findings = value["remaining_findings"].as_array().unwrap();
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     assert!(findings.iter().any(|f| f["kind"] == "gc_sweep_incomplete"));
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     {
         // Phase E requires unsupported platforms to fail closed rather than
         // advertising a resumable descriptor-bound sweep.
@@ -303,9 +303,9 @@ fn every_frozen_receipt_tree_transition_is_recovery_pending() {
             .clone();
         let value: Value = serde_json::from_slice(&output).unwrap();
         let findings = value["remaining_findings"].as_array().unwrap();
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         assert!(findings.iter().any(|f| f["kind"] == "gc_sweep_incomplete"));
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         {
             // Phase E requires unsupported platforms to fail closed rather
             // than advertising a resumable descriptor-bound sweep.

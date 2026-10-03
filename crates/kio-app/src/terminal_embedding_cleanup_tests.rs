@@ -59,7 +59,7 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
         "inflight",
         "missing_job",
     ] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::PrivateTempDir::new();
         let ledger = LedgerDb::initialize(root.path().join("device/ledger.sqlite")).unwrap();
         let key = TaskKey::new("scope", super::EMBEDDING_ADAPTER_KIND, "input", "profile");
         let intent = phase1_intent(&ledger, &key, RequestKind::Batch, 1.0, None).unwrap();

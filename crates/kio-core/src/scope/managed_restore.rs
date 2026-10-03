@@ -1150,6 +1150,38 @@ mod tests {
         Publication, Repository, RestoreProgress,
     };
 
+    fn write_working_file(path: impl AsRef<Path>, bytes: &[u8]) -> std::io::Result<()> {
+        let path = path.as_ref();
+        #[cfg(windows)]
+        {
+            use std::io::Write;
+
+            let parent_path = path.parent().ok_or_else(|| {
+                std::io::Error::other("working-file fixture has no parent directory")
+            })?;
+            let leaf = path
+                .file_name()
+                .ok_or_else(|| std::io::Error::other("working-file fixture has no file name"))?;
+            let parent = crate::store_dir::StoreDirectory::open(parent_path)
+                .map_err(std::io::Error::other)?;
+            if !parent
+                .contains_entry(Path::new(leaf))
+                .map_err(std::io::Error::other)?
+            {
+                // Elevated Windows processes may otherwise create a fixture
+                // owned by Administrators. Set TokenUser ownership at CreateNew,
+                // before managed restore is asked to remove the working file.
+                let mut file = parent
+                    .create_private_file_raw(Path::new(leaf))
+                    .map_err(std::io::Error::other)?;
+                return file.write_all(bytes);
+            }
+        }
+        // Existing fixture writes preserve their owner and ACL. Unix keeps
+        // the original fs::write behavior for both new and existing files.
+        fs::write(path, bytes)
+    }
+
     fn snapshot(repo: &Repository, at: &str) -> String {
         repo.snapshot(Some("test"), Some(at))
             .unwrap()
@@ -1189,14 +1221,14 @@ mod tests {
     #[test]
     fn selected_restore_is_a_linear_child_and_preserves_unselected_dirty_file() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), b"one").unwrap();
-        fs::write(directory.path().join("b.txt"), b"base").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("b.txt"), b"base").unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         let source = snapshot(&repo, "2026-01-01T00:00:00Z");
-        fs::write(directory.path().join("a.txt"), b"two").unwrap();
-        fs::write(directory.path().join("b.txt"), b"head").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"two").unwrap();
+        write_working_file(directory.path().join("b.txt"), b"head").unwrap();
         let head = snapshot(&repo, "2026-01-02T00:00:00Z");
-        fs::write(directory.path().join("b.txt"), b"dirty").unwrap();
+        write_working_file(directory.path().join("b.txt"), b"dirty").unwrap();
 
         let plan = repo
             .plan_restore(ManagedRestoreRequest::new(
@@ -1221,10 +1253,10 @@ mod tests {
     #[test]
     fn source_absence_never_deletes_without_explicit_delete_missing() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         let source = snapshot(&repo, "2026-01-01T00:00:00Z");
-        fs::write(directory.path().join("b.txt"), b"head-only").unwrap();
+        write_working_file(directory.path().join("b.txt"), b"head-only").unwrap();
         snapshot(&repo, "2026-01-02T00:00:00Z");
 
         let no_delete = repo
@@ -1255,12 +1287,12 @@ mod tests {
     #[test]
     fn controls_and_dirty_selected_files_are_refused_before_writes() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         let source = snapshot(&repo, "2026-01-01T00:00:00Z");
-        fs::write(directory.path().join("a.txt"), b"two").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"two").unwrap();
         snapshot(&repo, "2026-01-02T00:00:00Z");
-        fs::write(directory.path().join("a.txt"), b"dirty").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"dirty").unwrap();
         let dirty = repo
             .plan_restore(ManagedRestoreRequest::new(
                 source.clone(),
@@ -1286,7 +1318,7 @@ mod tests {
     #[test]
     fn noop_restore_still_refuses_a_dirty_selected_path() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         let head = snapshot(&repo, "2026-01-01T00:00:00Z");
         let plan = repo
@@ -1299,7 +1331,7 @@ mod tests {
             ))
             .unwrap();
         assert!(plan.is_noop());
-        fs::write(directory.path().join("a.txt"), b"dirty").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"dirty").unwrap();
         assert!(repo.apply_restore(&plan, || Ok(())).is_err());
         assert_eq!(fs::read(directory.path().join("a.txt")).unwrap(), b"dirty");
     }
@@ -1307,10 +1339,10 @@ mod tests {
     #[test]
     fn explicit_recovery_rolls_back_only_the_journaled_new_bytes_before_publication() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         let source = snapshot(&repo, "2026-01-01T00:00:00Z");
-        fs::write(directory.path().join("a.txt"), b"two").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"two").unwrap();
         let head = snapshot(&repo, "2026-01-02T00:00:00Z");
         let plan = repo
             .plan_restore(ManagedRestoreRequest::new(
@@ -1352,10 +1384,10 @@ mod tests {
     #[test]
     fn explicit_recovery_refills_the_durably_recorded_old_removed_gap() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         let source = snapshot(&repo, "2026-01-01T00:00:00Z");
-        fs::write(directory.path().join("a.txt"), b"two").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"two").unwrap();
         snapshot(&repo, "2026-01-02T00:00:00Z");
         let plan = repo
             .plan_restore(ManagedRestoreRequest::new(
@@ -1400,10 +1432,10 @@ mod tests {
     #[test]
     fn publishing_new_with_an_absent_path_requires_manual_recovery() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         let source = snapshot(&repo, "2026-01-01T00:00:00Z");
-        fs::write(directory.path().join("a.txt"), b"two").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"two").unwrap();
         snapshot(&repo, "2026-01-02T00:00:00Z");
         let plan = repo
             .plan_restore(ManagedRestoreRequest::new(
@@ -1436,10 +1468,10 @@ mod tests {
     #[test]
     fn recovery_refuses_to_resurrect_after_new_bytes_were_applied_then_deleted() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         let source = snapshot(&repo, "2026-01-01T00:00:00Z");
-        fs::write(directory.path().join("a.txt"), b"two").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"two").unwrap();
         snapshot(&repo, "2026-01-02T00:00:00Z");
         let plan = repo
             .plan_restore(ManagedRestoreRequest::new(
@@ -1483,10 +1515,10 @@ mod tests {
     #[test]
     fn rollback_new_removed_phase_retries_without_overwriting_foreign_bytes() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         let source = snapshot(&repo, "2026-01-01T00:00:00Z");
-        fs::write(directory.path().join("a.txt"), b"two").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"two").unwrap();
         snapshot(&repo, "2026-01-02T00:00:00Z");
         let plan = repo
             .plan_restore(ManagedRestoreRequest::new(
@@ -1527,10 +1559,10 @@ mod tests {
     #[test]
     fn restoring_old_absence_is_ambiguous_and_never_resurrected() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         let source = snapshot(&repo, "2026-01-01T00:00:00Z");
-        fs::write(directory.path().join("a.txt"), b"two").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"two").unwrap();
         snapshot(&repo, "2026-01-02T00:00:00Z");
         let plan = repo
             .plan_restore(ManagedRestoreRequest::new(
@@ -1574,10 +1606,10 @@ mod tests {
     #[test]
     fn generic_publication_recovery_refuses_a_dual_managed_restore_journal() {
         let directory = tempfile::tempdir().unwrap();
-        fs::write(directory.path().join("a.txt"), b"one").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"one").unwrap();
         let repo = Repository::init(directory.path()).unwrap();
         let source = snapshot(&repo, "2026-01-01T00:00:00Z");
-        fs::write(directory.path().join("a.txt"), b"two").unwrap();
+        write_working_file(directory.path().join("a.txt"), b"two").unwrap();
         let head = snapshot(&repo, "2026-01-02T00:00:00Z");
         let plan = repo
             .plan_restore(ManagedRestoreRequest::new(

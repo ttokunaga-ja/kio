@@ -155,14 +155,14 @@ pub(crate) fn protect_owner_private_scratch(path: &Path) -> Result<(), Confineme
             let name_bytes =
                 u32::from_ne_bytes(record[length_offset..length_offset + 4].try_into().unwrap())
                     as usize;
-            if name_bytes == 0 || name_bytes % 2 != 0 {
+            if name_bytes == 0 || !name_bytes.is_multiple_of(2) {
                 return Err(invalid_records());
             }
             let record_end = name_offset
                 .checked_add(name_bytes)
                 .filter(|end| *end <= record.len())
                 .ok_or_else(&invalid_records)?;
-            if next != 0 && (next % 8 != 0 || next < record_end || next >= record.len()) {
+            if next != 0 && (!next.is_multiple_of(8) || next < record_end || next >= record.len()) {
                 return Err(invalid_records());
             }
             let name = &record[name_offset..record_end];

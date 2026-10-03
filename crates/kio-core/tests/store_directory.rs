@@ -2,6 +2,33 @@ use std::{fs, path::Path};
 
 use kio_core::store_dir::{Publication, StoreDirectory};
 
+#[test]
+fn entries_classify_normal_directories_and_regular_files() {
+    let fixture = tempfile::tempdir().unwrap();
+    let root = fixture.path().canonicalize().unwrap();
+    let store = StoreDirectory::open(&root).unwrap();
+    assert!(store.entries(Path::new("")).unwrap().is_empty());
+
+    fs::create_dir(root.join("directory")).unwrap();
+    fs::write(root.join("regular"), b"ordinary file").unwrap();
+    fs::write(root.join("directory/nested"), b"nested file").unwrap();
+
+    let entries = store.entries(Path::new("")).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].name, "directory");
+    assert!(entries[0].is_directory);
+    assert!(!entries[0].is_regular_file);
+    assert_eq!(entries[1].name, "regular");
+    assert!(!entries[1].is_directory);
+    assert!(entries[1].is_regular_file);
+
+    let nested = store.entries(Path::new("directory")).unwrap();
+    assert_eq!(nested.len(), 1);
+    assert_eq!(nested[0].name, "nested");
+    assert!(nested[0].is_regular_file);
+    assert!(!nested[0].is_directory);
+}
+
 #[cfg(unix)]
 #[test]
 fn direct_lookup_does_not_open_siblings_and_regular_io_rejects_fifos() {

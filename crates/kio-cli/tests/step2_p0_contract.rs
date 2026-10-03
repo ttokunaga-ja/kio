@@ -1275,27 +1275,20 @@ fn ct2_scope_001_subfolder_files_do_not_reach_parent_artifacts() {
     fs::write(dir.path().join("child/secret.txt"), "child private").unwrap();
     let child_hash = hash_bytes(b"child private");
 
-    #[cfg(not(windows))]
-    json_success(&dir, ["index", "--yes"]);
-    #[cfg(windows)]
-    let index_output = json_code_stdout_with_env(&dir, ["index", "--yes"], 3, &[]);
-
-    #[cfg(windows)]
-    {
-        assert_eq!(index_output["error_code"], "KIO-E-INDEX-PARTIAL-001");
-        let child = index_output["child_scopes"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|row| row["path"] == "child")
-            .expect("the discovered child must be reported");
-        assert_eq!(child["status"], "skipped_error");
-        assert_eq!(child["error_code"], "KIO-E-SCOPE-BOUND-UNSUPPORTED-001");
-        assert!(
-            !dir.path().join("child/.kio").exists(),
-            "an unsupported bound child must not be initialized by a pathname fallback"
-        );
-    }
+    let index_output = json_success(&dir, ["index", "--yes"]);
+    let child = index_output["child_scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["path"] == "child")
+        .expect("the discovered child must be reported");
+    assert_eq!(child["status"], "indexed", "{child}");
+    let parent_scope: Value =
+        serde_json::from_slice(&fs::read(dir.path().join(".kio/scope.json")).unwrap()).unwrap();
+    let child_scope: Value =
+        serde_json::from_slice(&fs::read(dir.path().join("child/.kio/scope.json")).unwrap())
+            .unwrap();
+    assert_ne!(parent_scope["scope_id"], child_scope["scope_id"]);
 
     let status = json_success(&dir, ["status"]);
     assert!(!status["tasks"].as_array().unwrap().iter().any(|task| {
@@ -1322,7 +1315,6 @@ fn ct2_scope_001_subfolder_files_do_not_reach_parent_artifacts() {
             .join(".test-data/kio/cost-ledger.sqlite")
             .exists()
     );
-    #[cfg(not(windows))]
     {
         let child = dir.path().join("child/.kio");
         assert!(child.join("HEAD").is_file());

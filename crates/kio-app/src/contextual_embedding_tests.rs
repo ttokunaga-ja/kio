@@ -24,12 +24,8 @@ impl Interaction for QuietInteraction {
     fn diagnostic(&self, _: &str) {}
 }
 
-fn private_tempdir() -> tempfile::TempDir {
-    let parent = std::env::temp_dir().canonicalize().unwrap();
-    let root = tempfile::tempdir_in(parent).unwrap();
-    let directory = kio_core::store_dir::StoreDirectory::open(root.path()).unwrap();
-    kio_core::store_dir::restrict_new_private_directory(&directory.root_handle()).unwrap();
-    root
+fn private_tempdir() -> crate::test_support::PrivateTempDir {
+    crate::test_support::PrivateTempDir::new()
 }
 
 pub(super) fn isolated_child_for(test_name: &str) -> bool {

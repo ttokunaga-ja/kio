@@ -12,6 +12,35 @@ fn directory(file: &File) -> Result<StoreDirectory> {
     )
 }
 
+fn open_snapshot_source(parent: &File, expected: &FileObservation) -> Result<File> {
+    match directory(parent)?.open_gc_mutation(Path::new(SNAPSHOT_AUTO_STATE_LEAF), MAX_METADATA) {
+        Ok(source) => Ok(source),
+        Err(acquisition_error) => {
+            // A replacement's live writer can deny the exclusive mutation pin
+            // before observe() compares identity. Metadata under the retained
+            // parent can prove stale CAS authority, but cannot authorize mutation.
+            // Missing, unsafe, unreadable, or unchanged leaves retain the original
+            // acquisition error; a failed re-observation is not proof of a race.
+            let changed = (|| -> Result<bool> {
+                let metadata = cap_fs::stat(
+                    parent,
+                    Path::new(SNAPSHOT_AUTO_STATE_LEAF),
+                    cap_fs::FollowSymlinks::No,
+                )
+                .map_err(|error| ioerr(error, "snapshot state"))?;
+                valid_file(&metadata, MAX_METADATA)?;
+                Ok(id_meta(&metadata)? != expected.identity
+                    || (metadata.modified().is_ok() && file_state(&metadata) != expected.state))
+            })();
+            if matches!(changed, Ok(true)) {
+                Err(snapshot_auto_state_changed())
+            } else {
+                Err(acquisition_error)
+            }
+        }
+    }
+}
+
 fn observe(file: &File) -> Result<(SnapshotAutoState, FileObservation)> {
     let before = cap_fs::Metadata::from_file(file).map_err(|e| ioerr(e, "snapshot state"))?;
     valid_file(&before, MAX_METADATA)?;
@@ -94,6 +123,7 @@ impl GcSweepSession {
         temporary: &str,
         bytes: &[u8],
         expected: &FileObservation,
+        temporary_observation: &FileObservation,
     ) -> Result<()> {
         if !is_snapshot_auto_state_temporary_name(temporary) {
             return Err(corrupt("invalid snapshot state temporary"));
@@ -107,8 +137,25 @@ impl GcSweepSession {
         let parent = directory(&self.kio)?;
         let target_state = parse_snapshot_auto_state(bytes)?;
         let authority = {
-            let source =
-                parent.open_gc_mutation(Path::new(SNAPSHOT_AUTO_STATE_LEAF), MAX_METADATA)?;
+            let source = match open_snapshot_source(&self.kio, expected) {
+                Ok(source) => source,
+                Err(error) => {
+                    // Only this pre-journal CAS conflict may retire our prepared
+                    // target. Later failures leave journal-owned recovery state.
+                    // Unknown or pending owner state never authorizes cleanup.
+                    if error.error_code() == "KIO-E-SNAPSHOT-STATE-CHANGED-001"
+                        && !windows_exchange::inspect_pending(&owner)?
+                    {
+                        retire_snapshot_state_temporary(
+                            &self.kio,
+                            temporary,
+                            bytes,
+                            temporary_observation,
+                        )?;
+                    }
+                    return Err(error);
+                }
+            };
             if observe(&source)?.1 != *expected {
                 return Err(snapshot_auto_state_changed());
             }
@@ -252,6 +299,127 @@ mod tests {
             )
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-GC-TEST-INTERRUPTED-001");
+    }
+
+    #[test]
+    fn changed_snapshot_source_with_live_writer_reports_state_changed() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let (_temp, session, first) = fixture();
+        let path = session.root.join(".kio").join(SNAPSHOT_AUTO_STATE_LEAF);
+        let original = fs::read(&path).unwrap();
+        let before_head = fs::read(session.root.join(".kio/HEAD")).unwrap();
+        let replacement = path.with_extension("competing-writer");
+        let mut writer = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&replacement)
+            .unwrap();
+        // Identical bytes still represent a different object. Keep its writer
+        // live through the acquisition and preservation assertions.
+        writer.write_all(&original).unwrap();
+        writer.sync_all().unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let error =
+            open_snapshot_source(&session.kio, first.observation.as_ref().unwrap()).unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-SNAPSHOT-STATE-CHANGED-001");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            fs::read(session.root.join(".kio/HEAD")).unwrap(),
+            before_head
+        );
+        assert!(!session.has_pending_snapshot_auto_state_exchange().unwrap());
+        drop(writer);
+    }
+
+    #[test]
+    fn unchanged_snapshot_source_with_live_writer_preserves_acquisition_io() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        };
+
+        let (_temp, session, first) = fixture();
+        let path = session.root.join(".kio").join(SNAPSHOT_AUTO_STATE_LEAF);
+        let original = fs::read(&path).unwrap();
+        let writer = fs::OpenOptions::new()
+            .write(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .open(&path)
+            .unwrap();
+        let original_error = directory(&session.kio)
+            .unwrap()
+            .open_gc_mutation(Path::new(SNAPSHOT_AUTO_STATE_LEAF), MAX_METADATA)
+            .unwrap_err();
+        let error =
+            open_snapshot_source(&session.kio, first.observation.as_ref().unwrap()).unwrap_err();
+        assert_eq!(original_error.error_code(), "KIO-E-STORE-IO-001");
+        assert_eq!(error.error_code(), original_error.error_code());
+        assert_eq!(error.message(), original_error.message());
+        assert_eq!(error.context(), original_error.context());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert!(!session.has_pending_snapshot_auto_state_exchange().unwrap());
+        drop(writer);
+    }
+
+    #[test]
+    fn source_acquisition_conflict_retires_only_owned_prepared_temporary() {
+        let (_temp, session, first) = fixture();
+        let path = session.root.join(".kio").join(SNAPSHOT_AUTO_STATE_LEAF);
+        let concurrent = fs::read(&path).unwrap();
+        let replacement = path.with_extension("competing-writer");
+        let mut writer = fs::File::create(&replacement).unwrap();
+        writer.write_all(&concurrent).unwrap();
+        writer.sync_all().unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let temporary = unique_internal_name(".snapshot-auto-state");
+        create_new_bound(&session.kio, &temporary, &concurrent, MAX_METADATA).unwrap();
+        let (_, temporary_observation) =
+            read_regular_observed(&session.kio, &temporary, MAX_METADATA).unwrap();
+        let error = session
+            .replace_snapshot_state_windows(
+                &temporary,
+                &concurrent,
+                first.observation.as_ref().unwrap(),
+                &temporary_observation,
+            )
+            .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-SNAPSHOT-STATE-CHANGED-001");
+        assert!(!session.root.join(".kio").join(&temporary).exists());
+        assert_eq!(fs::read(&path).unwrap(), concurrent);
+        assert!(!session.has_pending_snapshot_auto_state_exchange().unwrap());
+        drop(writer);
+    }
+
+    #[test]
+    fn pending_exchange_fault_retains_prepared_target_for_recovery() {
+        let (_temp, session, first) = fixture();
+        interrupt(
+            &session,
+            &first,
+            GcFault::AfterWindowsSnapshotStateExchangeIntent,
+        );
+        assert!(session.has_pending_snapshot_auto_state_exchange().unwrap());
+        let prepared = fs::read_dir(session.root.join(".kio"))
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with(".snapshot-auto-state-")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(prepared.len(), 1);
+        let target = parse_snapshot_auto_state(&fs::read(&prepared[0]).unwrap()).unwrap();
+        assert_eq!(
+            target.last_successful_eligible_attempt_at,
+            "2026-09-27T00:01:00Z"
+        );
     }
 
     #[test]

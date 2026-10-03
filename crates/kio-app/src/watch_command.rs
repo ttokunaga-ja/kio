@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kio_core::management::{ManagementAuthority, ManagementBinding, read_record};
+#[cfg(not(windows))]
 use kio_core::private_fs::read_private_file_at;
 use kio_core::scope::new_ulid;
 use kio_core::store_dir::{Publication, StoreDirectory};
@@ -363,6 +364,7 @@ fn requested_stop(directory: &StoreDirectory, instance: &str) -> Result<bool> {
     Ok(request.instance == instance)
 }
 
+#[cfg(not(windows))]
 fn open_instance_lock(directory: &StoreDirectory, create: bool) -> Result<Option<File>> {
     if directory.read_optional(Path::new(LOCK), 0)?.is_none() {
         if !create {
@@ -378,6 +380,28 @@ fn open_instance_lock(directory: &StoreDirectory, create: bool) -> Result<Option
     // different local user cannot serve as a stop request or queue authority.
     read_private_file_at(directory, LOCK, 0)?;
     directory.open_regular_read(Path::new(LOCK), 0).map(Some)
+}
+
+#[cfg(windows)]
+fn open_instance_lock(directory: &StoreDirectory, create: bool) -> Result<Option<File>> {
+    let leaf = Path::new(LOCK);
+    // Even an empty marker must not be read through a second handle while
+    // Windows holds its exclusive byte-range lock. Absence and fixed length
+    // are metadata invariants; unsafe occupied names remain errors below.
+    if !directory.contains_entry(leaf)? {
+        if !create {
+            return Ok(None);
+        }
+        if let Err(error) = directory.write_atomic(leaf, &[], Publication::CreateOnly)
+            && !directory.contains_entry(leaf)?
+        {
+            return Err(error);
+        }
+    }
+    let file = directory.open_regular_read(leaf, 0)?;
+    kio_core::private_fs::verify_private_directory_handle(directory)?;
+    kio_core::private_fs::verify_owner_private_handle(&file)?;
+    Ok(Some(file))
 }
 
 fn state_directory(root: &Path, create: bool) -> Result<Option<StoreDirectory>> {
@@ -425,6 +449,70 @@ fn watch_error(error: impl std::fmt::Display) -> KioError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    fn private_watch_directory() -> (tempfile::TempDir, StoreDirectory) {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().canonicalize().unwrap().join("watch-state");
+        let directory = crate::private_state::ensure_private_directory(&path).unwrap();
+        (temp, directory)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn held_empty_instance_marker_can_be_validated_without_releasing_exclusivity() {
+        let (_temp, directory) = private_watch_directory();
+        assert!(open_instance_lock(&directory, false).unwrap().is_none());
+        assert!(!directory.contains_entry(Path::new(LOCK)).unwrap());
+        let held = open_instance_lock(&directory, true).unwrap().unwrap();
+        held.try_lock().unwrap();
+        let contender = open_instance_lock(&directory, false).unwrap().unwrap();
+        assert_eq!(contender.metadata().unwrap().len(), 0);
+        kio_core::private_fs::verify_owner_private_handle(&contender).unwrap();
+        assert!(matches!(
+            contender.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        let repeated = open_instance_lock(&directory, true).unwrap().unwrap();
+        assert!(matches!(repeated.try_lock(), Err(TryLockError::WouldBlock)));
+        drop(held);
+        contender.try_lock().unwrap();
+        assert!(matches!(repeated.try_lock(), Err(TryLockError::WouldBlock)));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn existing_instance_marker_is_never_repaired_or_overwritten() {
+        for fixture in ["nonempty", "unsafe_acl", "hardlink"] {
+            let (_temp, directory) = private_watch_directory();
+            let path = directory.path().join(LOCK);
+            match fixture {
+                "nonempty" => directory
+                    .write_atomic(Path::new(LOCK), b"occupied", Publication::CreateOnly)
+                    .unwrap(),
+                "unsafe_acl" => {
+                    std::fs::write(&path, b"").unwrap();
+                    let file = File::open(&path).unwrap();
+                    assert!(kio_core::private_fs::verify_owner_private_handle(&file).is_err());
+                }
+                _ => {
+                    directory
+                        .write_atomic(Path::new(LOCK), b"", Publication::CreateOnly)
+                        .unwrap();
+                    std::fs::hard_link(&path, directory.path().join("marker-alias")).unwrap();
+                }
+            }
+            let before = std::fs::read(&path).unwrap();
+            for create in [false, true] {
+                assert!(open_instance_lock(&directory, create).is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+                if fixture == "unsafe_acl" {
+                    let file = File::open(&path).unwrap();
+                    assert!(kio_core::private_fs::verify_owner_private_handle(&file).is_err());
+                }
+            }
+        }
+    }
 
     #[test]
     fn incomplete_output_reason_is_bounded_and_identifies_child_discovery() {

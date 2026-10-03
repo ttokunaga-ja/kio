@@ -482,6 +482,25 @@ impl Repository {
         scope: File,
         kio: File,
     ) -> Result<Self> {
+        #[cfg(windows)]
+        let (scope, kio) = {
+            // Consume the original cap-primitives handles before retaining any
+            // repository authority. Normalizing only temporary clones leaves
+            // the originals denying delete sharing and blocks namespace moves
+            // while this repository is alive. These reopens retain the same
+            // validated directory objects, without resolving public paths.
+            let scope = StoreDirectory::from_retained(scope, canonical_root.clone())?;
+            let kio = StoreDirectory::from_retained(kio, canonical_root.join(".kio"))?;
+            (
+                scope
+                    .root_handle()
+                    .try_clone()
+                    .map_err(|error| KioError::io(error.to_string(), "."))?,
+                kio.root_handle()
+                    .try_clone()
+                    .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
+            )
+        };
         crate::management::ManagementBinding::from_retained(
             scope
                 .try_clone()
@@ -3626,14 +3645,8 @@ pub fn complete_planned_kio_layout(
         directory.create_directory_all(Path::new(relative))?;
     }
     for (name, bytes) in &files {
-        match directory.read_optional(Path::new(name), bytes.len() as u64)? {
-            Some(actual) if actual == *bytes => {}
-            Some(_) => {
-                return Err(KioError::schema(
-                    "planned stage leaf differs from expected bytes",
-                ));
-            }
-            None => directory.write_atomic(Path::new(name), bytes, Publication::CreateOnly)?,
+        if !planned_leaf_present(directory, Path::new(name), bytes)? {
+            directory.write_atomic(Path::new(name), bytes, Publication::CreateOnly)?;
         }
     }
     validate_planned_stage(directory, &files)
@@ -3728,6 +3741,47 @@ fn validate_planned_aux_name(name: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// Observe presence only after checking the exact planned contents.
+fn planned_leaf_present(
+    directory: &StoreDirectory,
+    relative: &Path,
+    expected: &[u8],
+) -> Result<bool> {
+    let matches = if expected.is_empty() {
+        // A caller may hold an exclusive lock on an empty gate. On Windows a
+        // ReadFile request through another handle then fails even at EOF. The
+        // no-follow, single-link regular open and retained metadata establish
+        // the empty-content invariant without issuing any range read.
+        let file = match directory.open_regular_read(relative, 0) {
+            Ok(file) => file,
+            Err(error)
+                if error.error_code() == "KIO-E-STORE-IO-001"
+                    && error.context().get("io_error_kind").and_then(Value::as_str)
+                        == Some("not_found") =>
+            {
+                return Ok(false);
+            }
+            Err(error) => return Err(error),
+        };
+        file.metadata()
+            .kio_io(&directory.path().join(relative))?
+            .len()
+            == 0
+    } else {
+        let Some(actual) = directory.read_optional(relative, expected.len() as u64)? else {
+            return Ok(false);
+        };
+        actual == expected
+    };
+    if !matches {
+        return Err(KioError::schema(
+            "planned stage leaf differs from expected bytes",
+        ));
+    }
+    Ok(true)
+}
+
 fn validate_planned_stage(
     directory: &StoreDirectory,
     files: &std::collections::BTreeMap<String, Vec<u8>>,
@@ -3764,13 +3818,7 @@ fn validate_planned_stage(
         )?;
     }
     for (name, expected) in files {
-        if let Some(actual) = directory.read_optional(Path::new(name), expected.len() as u64)?
-            && actual != *expected
-        {
-            return Err(KioError::schema(
-                "planned stage leaf differs from expected bytes",
-            ));
-        }
+        planned_leaf_present(directory, Path::new(name), expected)?;
     }
     Ok(())
 }
@@ -5057,7 +5105,11 @@ fn open_bound_scope_file_nofollow(
             .unwrap_or(Path::new("."))
             .to_path_buf(),
     )?;
-    directory.open_regular_read(name, MAX_RAW_OBJECT_BYTES)
+    // Source enumeration and each read/staging caller enforce archive limits
+    // from this descriptor's metadata before reading, then bound the stream.
+    // Let those checks report the scope budget error for oversized inputs while
+    // retaining StoreDirectory's no-follow and single-link validation here.
+    directory.open_regular_read(name, u64::MAX)
 }
 
 fn open_scope_file_nofollow(path: &Path) -> Result<File> {
@@ -6064,22 +6116,32 @@ fn open_windows_lock_parent_kind(path: &Path, create_missing: bool) -> Result<Fi
         directory = match cap_fs::open_dir_nofollow(&directory, Path::new(&component)) {
             Ok(directory) => directory,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
-                let options = cap_fs::DirOptions::new();
-                match cap_fs::create_dir(&directory, Path::new(&component), &options) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                    Err(error) => {
-                        return Err(KioError::io(error.to_string(), path.display().to_string()));
+                // Create only the absent component through its retained parent
+                // with a protected owner-only DACL. Existing ancestors are
+                // neither restricted nor repaired, and the original named
+                // parent handle is consumed rather than kept as an extra alias.
+                let retained = StoreDirectory::from_retained(directory, root.clone())?;
+                match retained.create_directory(Path::new(&component)) {
+                    Ok(created) => created,
+                    Err(error)
+                        if error.error_code() == "KIO-E-STORE-IO-001"
+                            && error.context().get("io_error_kind").and_then(Value::as_str)
+                                == Some("already_exists") =>
+                    {
+                        cap_fs::open_dir_nofollow(&retained.root_handle(), Path::new(&component))
+                            .map_err(|error| {
+                                KioError::io(error.to_string(), path.display().to_string())
+                            })?
                     }
+                    Err(error) => return Err(error),
                 }
-                cap_fs::open_dir_nofollow(&directory, Path::new(&component))
-                    .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
             }
             Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
         };
         if crate::cas::windows_directory_handle_identity(&directory).is_none() {
             return Err(KioError::locked(path.display().to_string()));
         }
+        root.push(&component);
     }
     Ok(directory)
 }
@@ -9408,6 +9470,110 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn windows_event_log_first_creates_private_parents_without_repairing_existing_prefix() {
+        use crate::{
+            private_fs::{verify_owner_private_handle, verify_private_directory},
+            store_dir::StoreDirectory,
+            test_control::{TestEnvGuard, test_env_lock},
+        };
+        use std::{mem, os::windows::io::AsRawHandle, ptr};
+        use windows_sys::Win32::{
+            Foundation::LocalFree,
+            Security::{
+                ACL,
+                Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+                DACL_SECURITY_INFORMATION, GetSecurityDescriptorControl, PSECURITY_DESCRIPTOR,
+            },
+            Storage::FileSystem::{FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx},
+        };
+
+        fn snapshot(file: &std::fs::File) -> (u64, [u8; 16], u16, Vec<u8>) {
+            let mut identity = FILE_ID_INFO::default();
+            assert_ne!(
+                unsafe {
+                    GetFileInformationByHandleEx(
+                        file.as_raw_handle() as _,
+                        FileIdInfo,
+                        (&mut identity as *mut FILE_ID_INFO).cast(),
+                        mem::size_of::<FILE_ID_INFO>() as u32,
+                    )
+                },
+                0
+            );
+            let mut acl = ptr::null_mut::<ACL>();
+            let mut descriptor: PSECURITY_DESCRIPTOR = ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    GetSecurityInfo(
+                        file.as_raw_handle() as _,
+                        SE_FILE_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        ptr::null_mut(),
+                        ptr::null_mut(),
+                        &mut acl,
+                        ptr::null_mut(),
+                        &mut descriptor,
+                    )
+                },
+                0
+            );
+            let mut control = 0;
+            let mut revision = 0;
+            let control_ok =
+                unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+            let bytes = if acl.is_null() {
+                Vec::new()
+            } else {
+                // GetSecurityInfo supplies a valid ACL in its returned allocation.
+                unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), (*acl).AclSize as usize) }
+                    .to_vec()
+            };
+            unsafe { LocalFree(descriptor) };
+            assert_ne!(control_ok, 0);
+            (
+                identity.VolumeSerialNumber,
+                identity.FileId.Identifier,
+                control,
+                bytes,
+            )
+        }
+
+        let _env_lock = test_env_lock().lock().unwrap();
+        let fixture = tempfile::tempdir().unwrap();
+        let existing_path = fixture.path().canonicalize().unwrap();
+        let existing = StoreDirectory::open(&existing_path).unwrap();
+        let existing_before = snapshot(&existing.root_handle());
+        assert!(verify_owner_private_handle(&existing.root_handle()).is_err());
+        let device = existing_path.join("device");
+        let _data_home = TestEnvGuard::set("XDG_DATA_HOME", &device);
+        assert!(!device.exists());
+
+        super::append_event_log("PRIVATE-PARENT-FIRST", "first log append", json!({})).unwrap();
+        let paths = [device.clone(), device.join("kio"), device.join("kio/logs")];
+        let mut created = Vec::new();
+        for path in &paths {
+            let directory = verify_private_directory(path).unwrap();
+            verify_owner_private_handle(&directory.root_handle()).unwrap();
+            created.push(snapshot(&directory.root_handle()));
+        }
+        let log = device.join("kio/logs/events.jsonl");
+        let reopened = open_windows_lock_parent(&device.join("kio/logs/scrub.lock")).unwrap();
+        assert_eq!(snapshot(&reopened), created[2]);
+        drop(reopened);
+        super::append_event_log("PRIVATE-PARENT-SECOND", "second log append", json!({})).unwrap();
+        for (path, before) in paths.iter().zip(&created) {
+            let directory = verify_private_directory(path).unwrap();
+            assert_eq!(&snapshot(&directory.root_handle()), before);
+        }
+        let events = fs::read_to_string(log).unwrap();
+        assert!(events.contains("PRIVATE-PARENT-FIRST"));
+        assert!(events.contains("PRIVATE-PARENT-SECOND"));
+        assert_eq!(snapshot(&existing.root_handle()), existing_before);
+        assert!(verify_owner_private_handle(&existing.root_handle()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn windows_lock_leaf_rejects_parent_traversal_and_preserves_foreign_token() {
         let traversal = PathBuf::from("safe").join("..").join("ordinary.lock");
         assert!(open_windows_lock_parent(&traversal).is_err());
@@ -10107,6 +10273,7 @@ mod tests {
         let path = dir.path().join("oversized.bin");
         let file = fs::File::create(&path).unwrap();
         file.set_len(DEFAULT_MAX_ARCHIVE_FILE_BYTES + 1).unwrap();
+        drop(file);
         let head_before = fs::read(repo.kio_dir().join("HEAD")).unwrap();
 
         let error = repo.snapshot(Some("oversized"), None).unwrap_err();

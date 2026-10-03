@@ -367,16 +367,9 @@ mod tests {
     use super::*;
     use std::fs;
 
-    #[cfg(unix)]
-    fn private(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
-    }
     fn fixture(root: &Path) -> (Binding, PathBuf, PathBuf) {
         let state = root.join("state");
-        fs::create_dir(&state).unwrap();
-        #[cfg(unix)]
-        private(&state);
+        let _state = super::super::private_fixture_directory(&state);
         let source = root.join("source");
         fs::write(&source, b"controller").unwrap();
         let binding = Binding {

@@ -528,6 +528,89 @@ fn every_fault_point_leaves_a_resumable_receipt_first_state_and_resume_is_idempo
 }
 
 #[cfg(windows)]
+fn assert_search_only_appended_access_event(
+    before: &BTreeMap<PathBuf, Vec<u8>>,
+    mut after: BTreeMap<PathBuf, Vec<u8>>,
+    search: &Value,
+    point: &str,
+) {
+    let path = PathBuf::from("logs/access.jsonl");
+    let previous = before.get(&path).unwrap();
+    let current = after.get(&path).unwrap();
+    assert!(
+        current.starts_with(previous),
+        "{point}: audit prefix changed"
+    );
+    let appended = &current[previous.len()..];
+    let row = appended
+        .strip_suffix(b"\n")
+        .expect("search must append one newline-terminated audit event");
+    assert!(
+        !row.contains(&b'\n'),
+        "{point}: multiple audit rows appended"
+    );
+    let event: Value = serde_json::from_slice(row).unwrap();
+    assert_eq!(
+        event,
+        serde_json::json!({
+            "ts": NOW,
+            "level": "info",
+            "code": "KIO-I-SEARCH-ACCESS-001",
+            "component": "kio-cli",
+            "message": "search access",
+            "context": {
+                "query": "[redacted]",
+                "mode": "text",
+                "result_count": search["results"].as_array().unwrap().len(),
+            },
+        }),
+        "{point}: unexpected search access event"
+    );
+    // Restore only the validated append before comparing every store path/byte.
+    after.insert(path, previous.clone());
+    assert_eq!(
+        &after, before,
+        "{point}: search mutated non-audit store state"
+    );
+}
+
+#[cfg(windows)]
+fn assert_windows_exchange_owner_clean(path: &Path) {
+    use kio_core::store_dir::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, StoreDirectory};
+
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+        result => assert!(result.unwrap().is_dir(), "{}", path.display()),
+    }
+    let owner = StoreDirectory::open(path).unwrap();
+    for leaf in ["intent.json", "backup"] {
+        assert!(
+            !owner.contains_entry(Path::new(leaf)).unwrap(),
+            "{}: {leaf} remains",
+            path.display()
+        );
+    }
+    let entries = owner.entries(Path::new("")).unwrap();
+    for entry in &entries {
+        assert_eq!(entry.name, ATOMIC_WORKSPACE_DIR, "{}", path.display());
+        assert!(entry.is_directory && !entry.is_regular_file);
+        owner.open_directory(Path::new(&entry.name)).unwrap();
+    }
+    // Atomic removal keeps its permanent gate after retiring the journal.
+    assert_eq!(
+        owner.inspect_atomic().unwrap(),
+        if entries.is_empty() {
+            AtomicWorkspaceState::Absent
+        } else {
+            AtomicWorkspaceState::Clean
+        },
+        "{}",
+        path.display()
+    );
+    assert!(!kio_core::gc::windows_exchange::inspect_pending(&owner).unwrap());
+}
+
+#[cfg(windows)]
 #[test]
 fn windows_exchange_interruptions_gate_readers_and_writers_and_resume_idempotently() {
     for kind in ["marker", "index"] {
@@ -650,6 +733,11 @@ fn windows_exchange_interruptions_gate_readers_and_writers_and_resume_idempotent
                 assert!(denied.stdout.is_empty(), "{point}: search published rows");
                 let error: Value = serde_json::from_slice(&denied.stderr).unwrap();
                 assert_eq!(error["error_code"], "KIO-E-STORE-CORRUPT-001", "{point}");
+                assert_eq!(
+                    regular_file_snapshot(&kio_dir),
+                    before,
+                    "{point}: denied search mutated store"
+                );
             } else {
                 let search = json_success(&dir, &search_args, NOW);
                 assert!(
@@ -669,12 +757,13 @@ fn windows_exchange_interruptions_gate_readers_and_writers_and_resume_idempotent
                         .all(|row| authorized.contains(row)),
                     "{point}: exposed a result outside the authorized current baseline: {search}"
                 );
+                assert_search_only_appended_access_event(
+                    &before,
+                    regular_file_snapshot(&kio_dir),
+                    &search,
+                    &point,
+                );
             }
-            assert_eq!(
-                regular_file_snapshot(&kio_dir),
-                before,
-                "{point}: search mutated store"
-            );
             let completed = json_success(&dir, &["gc", "--yes"], NOW);
             assert_eq!(completed["status"], "completed", "{point}");
             assert_eq!(
@@ -689,13 +778,7 @@ fn windows_exchange_interruptions_gate_readers_and_writers_and_resume_idempotent
             assert!(!kio_dir.join("gc/in_progress").exists(), "{point}");
             for owner_kind in ["marker", "index"] {
                 let owner = kio_dir.join(format!("gc/internal/{owner_kind}-exchange"));
-                if owner.exists() {
-                    assert_eq!(
-                        fs::read_dir(owner).unwrap().count(),
-                        0,
-                        "{point}: journal owner not clean"
-                    );
-                }
+                assert_windows_exchange_owner_clean(&owner);
             }
             let completed_state = regular_file_snapshot(&kio_dir);
             let repeated = json_success(&dir, &["gc", "--yes"], NOW);
@@ -761,9 +844,11 @@ fn windows_retained_index_denies_writes_in_copy_and_tree_permit_windows() {
 
 #[cfg(windows)]
 #[test]
-fn windows_retained_quarantine_denies_rename_and_hardlink_races() {
+fn windows_retained_quarantine_denies_rename_and_preserves_hardlink_aliases() {
     for attack in ["rename", "hardlink"] {
         let (dir, commit, tree) = candidate_fixture();
+        let before = fs::read(tree_path(&dir, &tree)).unwrap();
+        assert_eq!(kio_core::cas::hash_bytes(&before), tree);
         let ready = dir.path().join("retained-tree-ready");
         let child = kio_process(&dir, &["gc", "--yes", "--json"])
             .env("KIO_FIXED_NOW", NOW)
@@ -771,12 +856,11 @@ fn windows_retained_quarantine_denies_rename_and_hardlink_races() {
             .spawn()
             .unwrap();
         wait_for_ready(&ready);
-        let marker = GcInProgressMarker::parse_canonical(
-            &fs::read(dir.path().join(".kio/gc/in_progress")).unwrap(),
-        )
-        .unwrap();
+        let marker_path = dir.path().join(".kio/gc/in_progress");
+        let marker_bytes = fs::read(&marker_path).unwrap();
+        let marker = GcInProgressMarker::parse_canonical(&marker_bytes).unwrap();
         let archive = tree_archive_path(&dir, &marker, &tree);
-        let before = fs::read(&archive).unwrap();
+        assert_eq!(fs::read(&archive).unwrap(), before);
         let victim = dir.path().join("foreign-victim");
         fs::write(&victim, b"foreign victim must survive\n").unwrap();
         let destination = dir.path().join("attacker-tree");
@@ -785,25 +869,121 @@ fn windows_retained_quarantine_denies_rename_and_hardlink_races() {
         } else {
             fs::hard_link(&archive, &destination)
         };
-        assert_windows_mutation_denied(result.unwrap_err());
-        assert!(!destination.exists());
+        let aliased = match result {
+            Ok(()) => {
+                assert_eq!(attack, "hardlink", "retained HANDLE must deny rename");
+                assert_eq!(fs::read(&destination).unwrap(), before);
+                true
+            }
+            Err(error) => {
+                assert_windows_mutation_denied(error);
+                assert!(!destination.exists());
+                false
+            }
+        };
         assert_eq!(fs::read(&archive).unwrap(), before);
         fs::write(ready.with_extension("release"), b"release").unwrap();
         let output = child.wait_with_output().unwrap();
-        assert!(
-            output.status.success(),
-            "{attack}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
         assert_eq!(fs::read(&victim).unwrap(), b"foreign victim must survive\n");
-        assert!(!archive.exists());
         assert!(!tree_path(&dir, &tree).exists());
+        if aliased {
+            assert_eq!(output.status.code(), Some(4));
+            let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert_eq!(error["error_code"], "KIO-E-STORE-CORRUPT-001");
+            assert_eq!(fs::read(&destination).unwrap(), before);
+            assert_eq!(fs::read(&archive).unwrap(), before);
+            assert_eq!(fs::read(&marker_path).unwrap(), marker_bytes);
+            let repeated = json_failure(&dir, &["gc", "--yes"], NOW, 4);
+            assert_eq!(repeated["error_code"], "KIO-E-STORE-CORRUPT-001");
+            assert_eq!(fs::read(&destination).unwrap(), before);
+            assert_eq!(fs::read(&archive).unwrap(), before);
+            assert_eq!(fs::read(&marker_path).unwrap(), marker_bytes);
+            assert_eq!(fs::read(&victim).unwrap(), b"foreign victim must survive\n");
+        } else {
+            assert!(
+                output.status.success(),
+                "{attack}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(!archive.exists());
+            assert!(!marker_path.exists());
+        }
         assert_eq!(
             kio_core::gc::read_shallow_receipts(&dir.path().join(".kio")).unwrap()[&commit]
                 .tree_hash,
             tree
         );
     }
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_tree_gc_reclaims_bytes_held_by_a_retained_reader() {
+    use std::io::Read;
+    use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle,
+    };
+
+    fn information(file: &fs::File) -> BY_HANDLE_FILE_INFORMATION {
+        let mut information = BY_HANDLE_FILE_INFORMATION::default();
+        assert_ne!(
+            unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) },
+            0
+        );
+        information
+    }
+
+    let (dir, commit, tree) = candidate_fixture();
+    let mut reader = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(tree_path(&dir, &tree))
+        .unwrap();
+    let before = information(&reader);
+    assert_eq!(before.nNumberOfLinks, 1);
+    let ready = dir.path().join("retained-reader-tree-ready");
+    let mut child = kio_process(&dir, &["gc", "--yes", "--json"])
+        .env("KIO_FIXED_NOW", NOW)
+        .env("KIO_TEST_GC_TREE_QUARANTINE_READY", &ready)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while !ready.exists() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            let output = child.wait_with_output().unwrap();
+            panic!(
+                "GC failed before retaining the tree with its existing reader: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready.exists(), "GC did not retain the tree at its barrier");
+    assert!(reader.metadata().unwrap().len() > 0);
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let after = information(&reader);
+    assert_eq!(after.dwVolumeSerialNumber, before.dwVolumeSerialNumber);
+    assert_eq!(after.nFileIndexHigh, before.nFileIndexHigh);
+    assert_eq!(after.nFileIndexLow, before.nFileIndexLow);
+    assert_eq!(after.nNumberOfLinks, 0);
+    assert_eq!(reader.metadata().unwrap().len(), 0);
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert!(bytes.is_empty());
+    assert!(!tree_path(&dir, &tree).exists());
+    assert!(!dir.path().join(".kio/gc/in_progress").exists());
+    assert_eq!(
+        kio_core::gc::read_shallow_receipts(&dir.path().join(".kio")).unwrap()[&commit].tree_hash,
+        tree
+    );
 }
 
 #[test]

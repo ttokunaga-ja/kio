@@ -8,9 +8,8 @@ use kio_adapter::gemini_batch_client::{
 };
 use kio_pipeline::ledger::ops::{cost_ledger_rows_for_key, phase1_intent};
 
-fn canonical_tempdir() -> tempfile::TempDir {
-    // Strict store ancestry checks require the resolved macOS temporary root.
-    tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+fn canonical_tempdir() -> crate::test_support::PrivateTempDir {
+    crate::test_support::PrivateTempDir::new()
 }
 
 fn unreadable() -> kio_adapter::AdapterError {
@@ -533,11 +532,6 @@ fn credential_or_device_key_rotation_holds_existing_rows_without_provider_effect
     });
     for current in [credential_rotated, device_rotated] {
         let ledger_dir = canonical_tempdir();
-        // tempfile directories inherit default directory permissions. This
-        // fixture uses the directory itself as the ledger parent, so restrict
-        // its newly created retained handle before initializing private state.
-        let ledger_parent = StoreDirectory::open(ledger_dir.path()).unwrap();
-        restrict_new_private_directory(&ledger_parent.root_handle()).unwrap();
         let ledger = LedgerDb::initialize(ledger_dir.path().join("ledger.sqlite")).unwrap();
         let row = reserved_row(&ledger, "markdownize", "profile", Some(&before.0));
         let mut mistral = mistral_client(&row);

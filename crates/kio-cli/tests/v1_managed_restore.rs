@@ -44,14 +44,33 @@ fn index(dir: &TempDir) -> String {
         .to_owned()
 }
 
+fn write_new_working_fixture(dir: &TempDir, leaf: &str, bytes: &[u8]) {
+    #[cfg(windows)]
+    {
+        use kio_core::store_dir::{Publication, StoreDirectory};
+        let target = StoreDirectory::open(dir.path()).unwrap();
+        let owner = StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+        target
+            .write_atomic_with_owner(
+                &owner,
+                std::path::Path::new(leaf),
+                bytes,
+                Publication::CreateOnly,
+            )
+            .unwrap();
+    }
+    #[cfg(not(windows))]
+    fs::write(dir.path().join(leaf), bytes).unwrap();
+}
+
 fn fixture() -> (TempDir, String, String) {
     let dir = canonical_tempdir();
     ok(&dir, &["init"]);
-    fs::write(dir.path().join("a.md"), b"old unique orchid phrase").unwrap();
-    fs::write(dir.path().join("b.md"), b"old b").unwrap();
+    write_new_working_fixture(&dir, "a.md", b"old unique orchid phrase");
+    write_new_working_fixture(&dir, "b.md", b"old b");
     let source = index(&dir);
     fs::write(dir.path().join("a.md"), b"new unique tulip phrase").unwrap();
-    fs::write(dir.path().join("c.md"), b"keep c").unwrap();
+    write_new_working_fixture(&dir, "c.md", b"keep c");
     let head = index(&dir);
     (dir, source, head)
 }

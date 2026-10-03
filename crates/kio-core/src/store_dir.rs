@@ -1421,10 +1421,10 @@ mod platform {
             OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
         },
         Storage::FileSystem::{
-            BY_HANDLE_FILE_INFORMATION, DELETE, FILE_BASIC_INFO, FILE_READ_ATTRIBUTES,
-            FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileBasicInfo,
-            GetFileInformationByHandle, GetFileInformationByHandleEx, READ_CONTROL, SYNCHRONIZE,
-            WRITE_DAC,
+            BY_HANDLE_FILE_INFORMATION, DELETE, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+            FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE, FileBasicInfo, GetFileInformationByHandle,
+            GetFileInformationByHandleEx, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
         },
         System::IO::IO_STATUS_BLOCK,
     };
@@ -1503,6 +1503,17 @@ mod platform {
         }
     }
     fn operation_directory(directory: &File, label: &Path) -> Result<File> {
+        reopen_retained_directory(
+            directory,
+            label,
+            GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        )
+    }
+    fn reopen_retained_directory(
+        directory: &File,
+        label: &Path,
+        desired_access: u32,
+    ) -> Result<File> {
         let identity = crate::cas::windows_directory_handle_identity(directory)
             .ok_or_else(|| err(label, "retained store handle is not a real directory"))?;
         // Windows rejects a retained-relative `.` open for a directory.  An
@@ -1526,7 +1537,7 @@ mod platform {
         let status = unsafe {
             NtCreateFile(
                 &mut handle,
-                GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                desired_access,
                 &attributes,
                 &mut status_block,
                 ptr::null(),
@@ -1567,8 +1578,69 @@ mod platform {
         std::io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) as i32 })
     }
     pub(super) fn normalize_directory_handle(file: File, label: &Path) -> Result<File> {
-        validate_directory(&file, label)?;
-        Ok(file)
+        use windows_sys::Win32::Storage::FileSystem::{
+            ExtendedFileIdType, FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_DESCRIPTOR,
+            FILE_ID_DESCRIPTOR_0, FILE_ID_INFO, FileIdInfo, OpenFileById,
+        };
+        let full_identity = |directory: &File| -> Result<FILE_ID_INFO> {
+            validate_directory(directory, label)?;
+            let mut identity = FILE_ID_INFO::default();
+            if unsafe {
+                GetFileInformationByHandleEx(
+                    directory.as_raw_handle() as HANDLE,
+                    FileIdInfo,
+                    (&mut identity as *mut FILE_ID_INFO).cast(),
+                    mem::size_of::<FILE_ID_INFO>() as u32,
+                )
+            } == 0
+            {
+                return Err(ioerr(label, std::io::Error::last_os_error()));
+            }
+            Ok(identity)
+        };
+        let before = full_identity(&file)?;
+        // Delete sharing permits a source-directory rename, but named child
+        // directory handles still pin ancestor links on Windows. Persistent
+        // capabilities must open by ID; empty-name reopens remain transient
+        // operation handles. The retained original supplies the volume hint,
+        // so no diagnostic path or ambient volume name is resolved here.
+        let descriptor = FILE_ID_DESCRIPTOR {
+            dwSize: mem::size_of::<FILE_ID_DESCRIPTOR>() as u32,
+            Type: ExtendedFileIdType,
+            Anonymous: FILE_ID_DESCRIPTOR_0 {
+                ExtendedFileId: before.FileId,
+            },
+        };
+        let handle = unsafe {
+            OpenFileById(
+                file.as_raw_handle() as HANDLE,
+                &descriptor,
+                GENERIC_READ | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                ptr::null(),
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            // Unsupported filesystems or file-ID opens fail closed. Falling
+            // back to a named open would restore the ancestor-link pin.
+            return Err(ioerr(label, std::io::Error::last_os_error()));
+        }
+        if handle.is_null() {
+            return Err(err(
+                label,
+                "file-ID directory open returned an invalid handle",
+            ));
+        }
+        let normalized = unsafe { File::from_raw_handle(handle as _) };
+        let after = full_identity(&normalized)?;
+        if before.VolumeSerialNumber != after.VolumeSerialNumber
+            || before.FileId.Identifier != after.FileId.Identifier
+        {
+            return Err(err(label, "retained store directory identity changed"));
+        }
+        drop(file);
+        Ok(normalized)
     }
     fn directory(root: &File, relative: &Path, label: &Path) -> Result<File> {
         let mut d = cap_fs::open_dir_nofollow(root, Path::new(".")).map_err(|e| ioerr(label, e))?;
@@ -2138,18 +2210,13 @@ mod platform {
         source_options
             .access_mode(DELETE | SYNCHRONIZE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
         let source_directory = cap_fs::open(&parent, Path::new(source_leaf), &source_options)
             .map_err(|_| err(&source_path, "source directory is missing or unsafe"))?;
         validate_directory(&source_directory, &source_path)?;
         rename_directory_noreplace(&source_directory, &parent, destination_leaf, &source_path)?;
-        let published =
-            cap_fs::open_dir_nofollow(&parent, Path::new(destination_leaf)).map_err(|_| {
-                err(
-                    &destination_path,
-                    "published directory is missing or unsafe",
-                )
-            })?;
+        let published = open_published_directory(&parent, destination_leaf, &destination_path)?;
         if crate::cas::windows_directory_handle_identity(&source_directory)
             != crate::cas::windows_directory_handle_identity(&published)
         {
@@ -2174,18 +2241,14 @@ mod platform {
         options
             .access_mode(DELETE | SYNCHRONIZE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
             ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
         let held = cap_fs::open(source_parent, Path::new(source), &options)
             .map_err(|_| err(source_label, "source directory is missing or unsafe"))?;
         validate_directory(&held, source_label)?;
         rename_directory_noreplace(&held, destination_parent, destination, source_label)?;
-        let published = cap_fs::open_dir_nofollow(destination_parent, Path::new(destination))
-            .map_err(|_| {
-                err(
-                    destination_label,
-                    "published directory is missing or unsafe",
-                )
-            })?;
+        let published =
+            open_published_directory(destination_parent, destination, destination_label)?;
         if crate::cas::windows_directory_handle_identity(&held)
             != crate::cas::windows_directory_handle_identity(&published)
         {
@@ -2196,6 +2259,24 @@ mod platform {
         }
         sync_directory(source_parent, source_label)?;
         sync_directory(destination_parent, destination_label)
+    }
+    fn open_published_directory(
+        parent: &File,
+        leaf: &std::ffi::OsStr,
+        label: &Path,
+    ) -> Result<File> {
+        // Keep delete sharing while the source's DELETE handle remains alive
+        // for the identity check. cap-primitives directory options omit it.
+        let mut options = cap_fs::OpenOptions::new();
+        options
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+        let published = cap_fs::open(parent, Path::new(leaf), &options)
+            .map_err(|_| err(label, "published directory is missing or unsafe"))?;
+        validate_directory(&published, label)?;
+        Ok(published)
     }
     pub(super) fn direct_leaf<'a>(path: &'a Path, label: &Path) -> Result<&'a std::ffi::OsStr> {
         let c = relative_components(path, false, label)?;
@@ -2316,13 +2397,25 @@ mod platform {
         for entry in cap_fs::read_dir(&d, Path::new(".")).map_err(|e| ioerr(label, e))? {
             let entry = entry.map_err(|e| ioerr(label, e))?;
             let name = entry.file_name();
+            let child_label = full(label, relative).join(&name);
             let mut o = cap_fs::OpenOptions::new();
-            o.read(true)._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-            let child = cap_fs::open(&d, Path::new(&name), &o)
-                .map_err(|_| err(label, "store entry is reparse"))?;
-            let meta = child.metadata().map_err(|e| ioerr(label, e))?;
-            if !meta.is_dir() {
-                regular(&child, label)?;
+            // Windows requires directory-open semantics even when an entry
+            // may also be a regular file. Keep the same retained parent and
+            // no-follow policy for both kinds of entry.
+            o.read(true)
+                ._cap_fs_ext_maybe_dir(true)
+                ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+            let child = cap_fs::open(&d, Path::new(&name), &o).map_err(|_| {
+                err(
+                    &child_label,
+                    "store entry cannot be opened without following links",
+                )
+            })?;
+            let meta = child.metadata().map_err(|e| ioerr(&child_label, e))?;
+            if meta.is_dir() {
+                validate_directory(&child, &child_label)?;
+            } else {
+                regular(&child, &child_label)?;
             }
             out.push(StoreEntry {
                 name,

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use kio_core::cas::{ObjectKind, ObjectStore};
-use kio_core::dag::{CommitObject, CommitStats, CommitType, build_tree};
+use kio_core::dag::{CommitObject, CommitStats, CommitType};
 use kio_core::portable::{PORTABLE_TAGS_DIRECTORY, portable_leaf_error, portable_tag_leaf};
 use kio_core::scope::Repository;
 use serde_json::Value;
@@ -232,7 +232,11 @@ fn open_cache_derives_a_portable_leaf_from_hostile_logical_basename() {
         .find(|entry| entry.raw_hash == raw_hash)
         .unwrap()
         .path = hostile.to_owned();
-    let tree = build_tree(tree.entries).unwrap();
+    // Historical logical names are validated independently of this host's
+    // materialization rules. Preserve the authentic parent chunking identity.
+    tree.entries
+        .sort_by(|left, right| left.path.as_bytes().cmp(right.path.as_bytes()));
+    tree.validate().unwrap();
     let store = ObjectStore::new(repo.kio_dir());
     let (tree_hash, _) = store
         .write_json(ObjectKind::Tree, &serde_json::to_value(&tree).unwrap())

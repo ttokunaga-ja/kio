@@ -234,19 +234,27 @@ impl FsSession {
             .ensure_owner_private(lock_leaf)
             .map_err(core_private)?;
         let absolute_lock = parent_path.join(lock_leaf);
-        let observed =
-            kio_core::private_fs::read_private_file_at(&parent, LIFECYCLE_LOCK, MAX_LOCK_BYTES)
-                .map_err(core_private)?;
-        if observed != LOCK_BYTES {
-            return Err(contract(
-                "KIO-E-LEDGER-PRIVATE-001",
-                "ledger lifecycle lock has unexpected contents",
-            ));
+        #[cfg(unix)]
+        {
+            let observed =
+                kio_core::private_fs::read_private_file_at(&parent, LIFECYCLE_LOCK, MAX_LOCK_BYTES)
+                    .map_err(core_private)?;
+            if observed != LOCK_BYTES {
+                return Err(contract(
+                    "KIO-E-LEDGER-PRIVATE-001",
+                    "ledger lifecycle lock has unexpected contents",
+                ));
+            }
         }
         let lock = parent
             .open_regular_read(lock_leaf, MAX_LOCK_BYTES)
             .map_err(core_private)?;
         let lock_identity = regular_file_identity(&lock, &absolute_lock)?;
+        #[cfg(windows)]
+        kio_core::private_fs::verify_owner_private_handle(&lock).map_err(core_private)?;
+        // Windows denies data reads through another handle while this range
+        // is locked. Acquire before inspecting contents so contenders report
+        // Locked, then validate bytes through the handle owning the lock.
         match lock.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
@@ -499,6 +507,14 @@ impl FsSession {
         }
         self.revalidate_boundary()?;
         let before = SqliteFiles::capture_required_main(self)?;
+        #[cfg(windows)]
+        let before = {
+            let mut before = before;
+            if flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE) {
+                before.create_missing_private_sidecars(self)?;
+            }
+            before
+        };
         self.revalidate_boundary()?;
         let connection = Connection::open_with_flags(&self.db_path, flags)?;
         let mut bound = BoundSqliteConnection {
@@ -522,10 +538,9 @@ impl FsSession {
         }
 
         if self.inherited_parent {
-            // The parent was duplicated from `/dev/fd/N` before this session
-            // began. Reopening that spelling would let a later `dup2` choose
-            // a different root, so the retained capability itself is the only
-            // authority for every check below.
+            // Inherited roots and snapshot parents are already bound through
+            // retained handles. Their diagnostic paths may be renamed or
+            // retargeted, so the retained capability is the authority below.
             verify_private_parent_handle(self.parent.root_handle().as_ref(), &self.parent_path)?;
         } else {
             let named_parent = StoreDirectory::open(&self.parent_path).map_err(core_private)?;
@@ -551,14 +566,98 @@ impl FsSession {
                 ));
             }
         }
-        let observed = kio_core::private_fs::read_private_file_at(
-            &self.parent,
-            LIFECYCLE_LOCK,
-            MAX_LOCK_BYTES,
-        )
-        .map_err(core_private)?;
-        if observed != LOCK_BYTES {
+        #[cfg(unix)]
+        {
+            let observed = kio_core::private_fs::read_private_file_at(
+                &self.parent,
+                LIFECYCLE_LOCK,
+                MAX_LOCK_BYTES,
+            )
+            .map_err(core_private)?;
+            if observed != LOCK_BYTES {
+                return Err(boundary_changed("ledger lifecycle lock contents changed"));
+            }
+        }
+        #[cfg(windows)]
+        self.revalidate_locked_contents()?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn revalidate_locked_contents(&self) -> Result<()> {
+        use std::os::windows::fs::FileExt;
+
+        self.revalidate_retained_lock_binding()?;
+        let path = self.parent_path.join(LIFECYCLE_LOCK);
+        let before_identity = regular_file_identity(&self.lock, &path)?;
+        kio_core::private_fs::verify_owner_private_handle(&self.lock).map_err(core_private)?;
+        let before = self.lock.metadata().map_err(|error| PipelineError::Io {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+        let before_change_time = windows_change_time(&self.lock, &path)?;
+        if before_identity != self.lock_identity || before.len() != LOCK_BYTES.len() as u64 {
             return Err(boundary_changed("ledger lifecycle lock contents changed"));
+        }
+
+        // Never reopen or duplicate the handle and never release its lock.
+        // Explicit offsets make repeated checks independent of the file cursor;
+        // the extra byte detects growth without an unbounded allocation/read.
+        let mut body = [0_u8; LOCK_BYTES.len() + 1];
+        let mut read = 0;
+        while read < body.len() {
+            match self.lock.seek_read(&mut body[read..], read as u64) {
+                Ok(0) => break,
+                Ok(count) => read += count,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(PipelineError::Io {
+                        path: path.display().to_string(),
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+
+        let after_identity = regular_file_identity(&self.lock, &path)?;
+        let after = self.lock.metadata().map_err(|error| PipelineError::Io {
+            path: path.display().to_string(),
+            message: error.to_string(),
+        })?;
+        let after_change_time = windows_change_time(&self.lock, &path)?;
+        kio_core::private_fs::verify_owner_private_handle(&self.lock).map_err(core_private)?;
+        self.revalidate_retained_lock_binding()?;
+        if before_identity != after_identity
+            || before.len() != after.len()
+            || before.modified().ok() != after.modified().ok()
+            || before_change_time != after_change_time
+            || after.len() != read as u64
+        {
+            return Err(boundary_changed(
+                "ledger lifecycle lock changed while it was read",
+            ));
+        }
+        if &body[..read] != LOCK_BYTES {
+            return Err(boundary_changed("ledger lifecycle lock contents changed"));
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn revalidate_retained_lock_binding(&self) -> Result<()> {
+        verify_private_parent_handle(self.parent.root_handle().as_ref(), &self.parent_path)?;
+        // Open only for metadata and ACL checks, relative to the retained
+        // parent. Data reads must continue through the handle owning the lock.
+        let named_lock = self
+            .parent
+            .open_regular_read(Path::new(LIFECYCLE_LOCK), MAX_LOCK_BYTES)
+            .map_err(core_private)?;
+        let identity = regular_file_identity(&named_lock, &self.parent_path.join(LIFECYCLE_LOCK))?;
+        kio_core::private_fs::verify_owner_private_handle(&named_lock).map_err(core_private)?;
+        if identity != self.lock_identity {
+            return Err(boundary_changed(
+                "retained parent lifecycle name no longer names the retained lock",
+            ));
         }
         Ok(())
     }
@@ -648,6 +747,32 @@ impl SqliteFiles {
         let wal = capture_leaf(session, &session.names.wal)?;
         let shm = capture_leaf(session, &session.names.shm)?;
         Ok(Self { main, wal, shm })
+    }
+
+    #[cfg(windows)]
+    fn create_missing_private_sidecars(&mut self, session: &FsSession) -> Result<()> {
+        // All existing SQLite leaves were checked before reaching this point.
+        // SQLite's Windows VFS otherwise creates these files with the token's
+        // default security descriptor. OPEN_ALWAYS reuses our private files.
+        // Publication is confined to absent coordination files, never repairs
+        // an existing leaf, and leaves their bindings pinned before SQLite opens.
+        for (leaf, retained) in [
+            (&session.names.wal, &mut self.wal),
+            (&session.names.shm, &mut self.shm),
+        ] {
+            if retained.is_none() {
+                session.revalidate_boundary()?;
+                session
+                    .parent
+                    .write_atomic(leaf, b"", Publication::CreateOnly)
+                    .map_err(core_private)?;
+                *retained = Some(capture_leaf(session, leaf)?.ok_or_else(|| {
+                    boundary_changed("newly published SQLite sidecar is missing")
+                })?);
+                session.revalidate_boundary()?;
+            }
+        }
+        Ok(())
     }
 
     fn revalidate_and_capture_sidecars(&mut self, session: &FsSession) -> Result<()> {
@@ -1108,6 +1233,34 @@ fn verify_private_parent_handle(file: &File, path: &Path) -> Result<()> {
     kio_core::private_fs::verify_owner_private_handle(file).map_err(core_private)
 }
 
+#[cfg(windows)]
+fn windows_change_time(file: &File, path: &Path) -> Result<i64> {
+    use std::{mem, os::windows::io::AsRawHandle};
+    use windows_sys::Win32::{
+        Foundation::HANDLE,
+        Storage::FileSystem::{FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx},
+    };
+
+    let mut basic = FILE_BASIC_INFO::default();
+    // SAFETY: the retained file owns a live handle, and `basic` is writable
+    // storage with the exact layout and size required by FileBasicInfo.
+    if unsafe {
+        GetFileInformationByHandleEx(
+            file.as_raw_handle() as HANDLE,
+            FileBasicInfo,
+            (&mut basic as *mut FILE_BASIC_INFO).cast(),
+            mem::size_of::<FILE_BASIC_INFO>() as u32,
+        )
+    } == 0
+    {
+        return Err(PipelineError::Io {
+            path: path.display().to_string(),
+            message: std::io::Error::last_os_error().to_string(),
+        });
+    }
+    Ok(basic.ChangeTime)
+}
+
 #[cfg(not(any(unix, windows)))]
 compile_error!("ledger lifecycle filesystem capability requires Unix or Windows");
 
@@ -1243,18 +1396,302 @@ mod tests {
         let path = db_path(temp.path());
         let first = FsSession::acquire(&path, true).unwrap();
         let lock_path = path.parent().unwrap().join(LIFECYCLE_LOCK);
-        let _before = fs::metadata(&lock_path).unwrap();
+        let before = regular_file_identity(&first.lock, &lock_path).unwrap();
+        first.revalidate_boundary().unwrap();
+        first.revalidate_boundary().unwrap();
         let error = FsSession::acquire(&path, false).unwrap_err();
         assert!(matches!(error, PipelineError::Locked { .. }));
+        first.revalidate_boundary().unwrap();
         drop(first);
         let second = FsSession::acquire(&path, false).unwrap();
+        second.revalidate_boundary().unwrap();
+        assert_eq!(
+            before,
+            regular_file_identity(&second.lock, &lock_path).unwrap()
+        );
         drop(second);
-        let _after = fs::metadata(lock_path).unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            assert_eq!((_before.dev(), _before.ino()), (_after.dev(), _after.ino()));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_lifecycle_revalidation_reads_from_zero_after_cursor_moves() {
+        use std::io::{Seek, SeekFrom};
+
+        let temp = private_tempdir();
+        let path = db_path(temp.path());
+        let mut session = FsSession::acquire(&path, true).unwrap();
+        session.lock.seek(SeekFrom::End(0)).unwrap();
+        session.revalidate_boundary().unwrap();
+        session.revalidate_boundary().unwrap();
+        let contender = FsSession::acquire(&path, false).unwrap_err();
+        assert!(matches!(contender, PipelineError::Locked { .. }));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_snapshot_parent_rejects_replaced_locked_marker() {
+        for replacement in [LOCK_BYTES, b"replacement marker".as_slice()] {
+            let temp = private_tempdir();
+            let path = db_path(temp.path());
+            drop(FsSession::acquire(&path, true).unwrap());
+            let parent_path = path.parent().unwrap();
+            let parent = StoreDirectory::open(parent_path).unwrap();
+            let session = FsSession::acquire_retained_snapshot_parent(
+                parent.root_handle().as_ref(),
+                parent_path,
+                "cost-ledger.sqlite",
+            )
+            .unwrap();
+            assert!(session.inherited_parent);
+            session.revalidate_boundary().unwrap();
+            session.revalidate_boundary().unwrap();
+
+            let displaced = parent_path.join("displaced.lifecycle.lock");
+            fs::rename(parent_path.join(LIFECYCLE_LOCK), &displaced)
+                .expect("held Windows lock must allow same-volume rename");
+            parent
+                .write_atomic(
+                    Path::new(LIFECYCLE_LOCK),
+                    replacement,
+                    Publication::CreateOnly,
+                )
+                .unwrap();
+            assert_eq!(
+                regular_file_identity(&session.lock, &displaced).unwrap(),
+                session.lock_identity,
+                "the original locked handle remains valid after displacement"
+            );
+            let error = session.revalidate_boundary().unwrap_err();
+            assert!(matches!(
+                error,
+                PipelineError::Contract {
+                    code: "KIO-E-LEDGER-BOUNDARY-RACE-001",
+                    ..
+                }
+            ));
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retained_snapshot_parent_stays_bound_after_diagnostic_parent_replacement() {
+        let temp = private_tempdir();
+        let path = db_path(temp.path());
+        drop(FsSession::acquire(&path, true).unwrap());
+        let parent_path = path.parent().unwrap();
+        let parent = StoreDirectory::open(parent_path).unwrap();
+        let displaced = temp.path().join("displaced.device");
+        fs::rename(parent_path, &displaced)
+            .expect("retained Windows parent must allow same-volume rename");
+        // Rename before acquiring a regular-file lock: the directory
+        // capability stays bound, while no named descendant handle prevents
+        // Windows from moving its ancestor directory.
+        let replacement = FsSession::acquire(&path, true).unwrap();
+        let session = FsSession::acquire_retained_snapshot_parent(
+            parent.root_handle().as_ref(),
+            parent_path,
+            "cost-ledger.sqlite",
+        )
+        .unwrap();
+        // The original diagnostic spelling now names an independent valid
+        // private parent and lock. The snapshot session must keep using its
+        // displaced capability, including the name-binding checks.
+        assert_ne!(replacement.lock_identity, session.lock_identity);
+        session.revalidate_boundary().unwrap();
+        session.revalidate_boundary().unwrap();
+        let contender = FsSession::acquire_retained_snapshot_parent(
+            parent.root_handle().as_ref(),
+            parent_path,
+            "cost-ledger.sqlite",
+        )
+        .unwrap_err();
+        assert!(matches!(contender, PipelineError::Locked { .. }));
+    }
+
+    #[cfg(windows)]
+    fn publish_private_test_database(session: &FsSession) {
+        let connection = Connection::open_in_memory().unwrap();
+        connection
+            .execute_batch("CREATE TABLE sidecar_test (value INTEGER NOT NULL);")
+            .unwrap();
+        let image = connection.serialize("main").unwrap();
+        session.create_only(&session.names.db, &image).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn private_sidecars_keep_identity_through_wal_checkpoint_and_reopen() {
+        let temp = private_tempdir();
+        let path = db_path(temp.path());
+        let session = FsSession::acquire(&path, true).unwrap();
+        publish_private_test_database(&session);
+        drop(session);
+
+        for expected_rows in 1..=3 {
+            let session = FsSession::acquire(&path, false).unwrap();
+            let mut bound = session
+                .open_existing_sqlite(OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .unwrap();
+            let wal_identity = bound.files.wal.as_ref().unwrap().identity;
+            let shm_identity = bound.files.shm.as_ref().unwrap().identity;
+            let mode: String = bound
+                .connection()
+                .query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(mode, "wal");
+            bound
+                .connection()
+                .execute("INSERT INTO sidecar_test VALUES (?1)", [expected_rows])
+                .unwrap();
+            let rows: i64 = bound
+                .connection()
+                .query_row("SELECT count(*) FROM sidecar_test", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(rows, expected_rows);
+            let busy: i64 = bound
+                .connection()
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(busy, 0);
+            bound.revalidate_open().unwrap();
+            assert_eq!(bound.files.wal.as_ref().unwrap().identity, wal_identity);
+            assert_eq!(bound.files.shm.as_ref().unwrap().identity, shm_identity);
+            for sidecar in [&bound.files.wal, &bound.files.shm] {
+                kio_core::private_fs::verify_owner_private_handle(
+                    &sidecar.as_ref().unwrap()._handle,
+                )
+                .unwrap();
+            }
+            bound.finish().unwrap();
+            let image = fs::read(&path).unwrap();
+            assert_eq!(&image[18..20], &[2, 2], "WAL mode must persist in main");
+            assert!(!path.with_file_name("cost-ledger.sqlite-wal").exists());
+            assert!(!path.with_file_name("cost-ledger.sqlite-shm").exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unsafe_existing_sqlite_leaf_rejects_before_sidecar_publication() {
+        for unsafe_leaf in ["main", "wal", "shm"] {
+            let temp = private_tempdir();
+            let path = db_path(temp.path());
+            let session = FsSession::acquire(&path, true).unwrap();
+            if unsafe_leaf != "main" {
+                publish_private_test_database(&session);
+            }
+            let leaf = match unsafe_leaf {
+                "main" => &session.names.db,
+                "wal" => &session.names.wal,
+                _ => &session.names.shm,
+            };
+            let unsafe_path = session.parent_path.join(leaf);
+            fs::write(&unsafe_path, b"existing unsafe bytes").unwrap();
+            let retained = File::open(&unsafe_path).unwrap();
+            assert!(kio_core::private_fs::verify_owner_private_handle(&retained).is_err());
+            let identity = regular_file_identity(&retained, &unsafe_path).unwrap();
+            let error = session
+                .open_existing_sqlite(OpenFlags::SQLITE_OPEN_READ_WRITE)
+                .err()
+                .expect("unsafe existing leaf must reject SQLite open");
+            assert!(matches!(
+                error,
+                PipelineError::Contract {
+                    code: "KIO-E-LEDGER-PRIVATE-001",
+                    ..
+                }
+            ));
+            assert_eq!(fs::read(&unsafe_path).unwrap(), b"existing unsafe bytes");
+            let after = File::open(&unsafe_path).unwrap();
+            assert_eq!(
+                regular_file_identity(&after, &unsafe_path).unwrap(),
+                identity
+            );
+            assert!(kio_core::private_fs::verify_owner_private_handle(&after).is_err());
+            for sidecar in [&session.names.wal, &session.names.shm] {
+                if sidecar != leaf {
+                    assert!(!session.parent_path.join(sidecar).exists());
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn hardlinked_existing_sidecar_rejects_without_creating_its_counterpart() {
+        for unsafe_wal in [true, false] {
+            let temp = private_tempdir();
+            let path = db_path(temp.path());
+            let session = FsSession::acquire(&path, true).unwrap();
+            publish_private_test_database(&session);
+            session
+                .create_only(&session.names.authority, b"hardlinked private bytes")
+                .unwrap();
+            let (leaf, absent) = if unsafe_wal {
+                (&session.names.wal, &session.names.shm)
+            } else {
+                (&session.names.shm, &session.names.wal)
+            };
+            fs::hard_link(
+                session.parent_path.join(&session.names.authority),
+                session.parent_path.join(leaf),
+            )
+            .unwrap();
+            assert!(
+                session
+                    .open_existing_sqlite(OpenFlags::SQLITE_OPEN_READ_WRITE)
+                    .is_err()
+            );
+            assert!(!session.parent_path.join(absent).exists());
+            assert_eq!(
+                fs::read(session.parent_path.join(leaf)).unwrap(),
+                b"hardlinked private bytes"
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn missing_sqlite_main_never_creates_sidecars() {
+        let temp = private_tempdir();
+        let path = db_path(temp.path());
+        let session = FsSession::acquire(&path, true).unwrap();
+        let error = session
+            .open_existing_sqlite(OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .err()
+            .expect("missing main must reject SQLite open");
+        assert!(matches!(
+            error,
+            PipelineError::Contract {
+                code: "KIO-E-LEDGER-MISSING-001",
+                ..
+            }
+        ));
+        for leaf in [&session.names.db, &session.names.wal, &session.names.shm] {
+            assert!(!session.parent_path.join(leaf).exists());
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn read_only_sqlite_open_does_not_precreate_sidecars() {
+        let temp = private_tempdir();
+        let path = db_path(temp.path());
+        let session = FsSession::acquire(&path, true).unwrap();
+        publish_private_test_database(&session);
+        let before = fs::read(&path).unwrap();
+        let bound = session
+            .open_existing_sqlite(OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+        let rows: i64 = bound
+            .connection()
+            .query_row("SELECT count(*) FROM sidecar_test", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(rows, 0);
+        bound.finish().unwrap();
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!session.parent_path.join(&session.names.wal).exists());
+        assert!(!session.parent_path.join(&session.names.shm).exists());
     }
 
     #[cfg(unix)]

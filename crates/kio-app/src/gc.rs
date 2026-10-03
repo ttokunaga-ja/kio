@@ -1097,7 +1097,7 @@ fn complete_marked_index_rotation(
         &rotation.source_state_digest,
         target,
     )
-    .map_err(|_| index_binding_changed("during durable rotation recovery"))?
+    .map_err(|error| index_exchange_error(error, "during durable rotation recovery"))?
     {
         inject_fault("after_index_exchange")?;
         if budget
@@ -1117,7 +1117,7 @@ fn complete_marked_index_rotation(
                 &rotation.source_state_digest,
                 target,
             )
-            .map_err(|_| index_binding_changed("during durable rotation"))?;
+            .map_err(|error| index_exchange_error(error, "during durable rotation"))?;
             inject_fault("after_index_exchange")?;
             if budget
                 .as_deref_mut()
@@ -1137,7 +1137,7 @@ fn complete_marked_index_rotation(
         &rotation.private_dir_identity,
         source,
     )
-    .map_err(|_| index_binding_changed("during durable rotation"))?;
+    .map_err(|error| index_exchange_error(error, "during durable rotation"))?;
     inject_fault("after_temp_cleanup_before_marker_advance")?;
     if cleanup == PreparedGcIndexCleanup::Removed
         && budget
@@ -1159,6 +1159,13 @@ fn cleanup_stale_index_rotations(session: &GcSweepSession, keep: Option<&str>) -
     let kio = session.retained_kio_handle()?;
     cleanup_stale_bound_gc_index_rotations(&kio, keep)
         .map_err(|_| index_binding_changed("during private rotation cleanup"))
+}
+
+fn index_exchange_error(error: kio_index::IndexError, when: &str) -> KioError {
+    match error {
+        kio_index::IndexError::GcExchange(error) => error,
+        _ => index_binding_changed(when),
+    }
 }
 
 fn index_binding_changed(when: &str) -> KioError {
@@ -1400,5 +1407,47 @@ fn maybe_wait_at_test_prelock_barrier() {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !release_path.exists() && std::time::Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+#[cfg(test)]
+mod index_exchange_error_tests {
+    use super::*;
+
+    #[test]
+    fn gc_index_exchange_preserves_typed_interruption_outcome() {
+        let context = json!({"point": "AfterWindowsIndexExchangeSourceCapture"});
+        let error = index_exchange_error(
+            kio_index::IndexError::GcExchange(KioError::new(
+                "KIO-E-GC-TEST-INTERRUPTED-001",
+                "GC exchange test fault interrupted the sweep",
+                context.clone(),
+                ExitCode::Interrupted,
+            )),
+            "during durable rotation",
+        );
+        assert_eq!(error.error_code(), "KIO-E-GC-TEST-INTERRUPTED-001");
+        assert_eq!(error.exit_code(), ExitCode::Interrupted);
+        assert_eq!(
+            error.message(),
+            "GC exchange test fault interrupted the sweep"
+        );
+        assert_eq!(error.context(), &context);
+    }
+
+    #[test]
+    fn gc_index_exchange_validation_failures_remain_corrupt() {
+        for when in [
+            "during durable rotation",
+            "during durable rotation recovery",
+        ] {
+            let error = index_exchange_error(
+                kio_index::IndexError::Schema("source attestation changed".into()),
+                when,
+            );
+            assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
+            assert_eq!(error.exit_code(), ExitCode::PermanentFailure);
+            assert_eq!(error.message(), format!("GC source index changed {when}"));
+        }
     }
 }

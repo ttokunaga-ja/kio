@@ -1382,6 +1382,13 @@ pub fn prepare_bound_gc_index_rotation(
     source_options
         .read(true)
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+    #[cfg(windows)]
+    {
+        use cap_fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+        // Keep the copied source immutable until the final state recheck.
+        source_options.share_mode(FILE_SHARE_READ);
+    }
     let mut input = cap_fs::open(&index, Path::new("sqlite.db"), &source_options)
         .map_err(|error| IndexError::Schema(format!("open GC source index copy: {error}")))?;
     validate_bound_source_file(&input, Path::new("sqlite.db"))?;
@@ -2043,7 +2050,9 @@ fn open_bound_gc_index_leaf(
     {
         use cap_fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        // Writable SQLite connections need write sharing. Read-only GC
+        // attestation handles and their retained clones must exclude writers.
+        options.share_mode(FILE_SHARE_READ | if writable { FILE_SHARE_WRITE } else { 0 });
     }
     let file = cap_fs::open(&parent, Path::new(leaf), &options)
         .map_err(|error| IndexError::Schema(format!("open bound GC source index: {error}")))?;

@@ -1261,9 +1261,12 @@ impl GcSweepSession {
                 }
             }
             #[cfg(windows)]
-            Some(observation) => {
-                self.replace_snapshot_state_windows(&temporary, &bytes, observation)?
-            }
+            Some(observation) => self.replace_snapshot_state_windows(
+                &temporary,
+                &bytes,
+                observation,
+                &temporary_observation,
+            )?,
             #[cfg(not(windows))]
             Some(observation) => replace_snapshot_state_expected(
                 &self.kio,
@@ -1727,14 +1730,10 @@ impl GcSweepSession {
                 // forced durable.  Merely re-reading the pathname leaves a
                 // crash window in which this invocation can start removing a
                 // tree while the receipt has not reached stable storage.
-                let durable = open_verified_file_handle(
-                    &shallowed,
-                    leaf,
-                    &observed,
-                    MAX_METADATA,
-                    "existing GC shallow receipt",
-                )?;
+                let durable = open_verified_receipt_durable_handle(&shallowed, leaf, &observed)?;
                 durable.sync_all().map_err(|error| ioerr(error, leaf))?;
+                #[cfg(windows)]
+                verify_retained_receipt_observation(&durable, leaf, &observed)?;
                 sync_bound_directory(&shallowed, leaf)?;
                 Ok(GcReceiptPublication::AlreadyPresent)
             }
@@ -2570,6 +2569,7 @@ fn open_gc_tree_writable(
     Ok(file)
 }
 
+#[cfg(not(windows))]
 fn open_verified_file_handle(
     directory: &std::fs::File,
     leaf: &str,
@@ -2588,6 +2588,79 @@ fn open_verified_file_handle(
         return Err(corrupt(&format!("{label} changed while binding handle")));
     }
     Ok(file)
+}
+
+#[cfg(not(windows))]
+fn open_verified_receipt_durable_handle(
+    directory: &std::fs::File,
+    leaf: &str,
+    expected: &FileObservation,
+) -> Result<std::fs::File> {
+    open_verified_file_handle(
+        directory,
+        leaf,
+        expected,
+        MAX_METADATA,
+        "existing GC shallow receipt",
+    )
+}
+
+#[cfg(windows)]
+fn open_verified_receipt_durable_handle(
+    directory: &std::fs::File,
+    leaf: &str,
+    expected: &FileObservation,
+) -> Result<std::fs::File> {
+    use cap_fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
+
+    // FlushFileBuffers requires write access even when the receipt bytes stay
+    // unchanged. Bind only this receipt through its retained parent, excluding
+    // concurrent writes and namespace mutations while it authorizes retirement.
+    let mut options = cap_fs::OpenOptions::new();
+    options
+        .read(true)
+        .write(true)
+        .share_mode(FILE_SHARE_READ)
+        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+    let file =
+        cap_fs::open(directory, Path::new(leaf), &options).map_err(|error| ioerr(error, leaf))?;
+    verify_retained_receipt_observation(&file, leaf, expected)?;
+    Ok(file)
+}
+
+#[cfg(windows)]
+fn verify_retained_receipt_observation(
+    file: &std::fs::File,
+    leaf: &str,
+    expected: &FileObservation,
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+
+    let before = cap_fs::Metadata::from_file(file).map_err(|error| ioerr(error, leaf))?;
+    valid_file(&before, MAX_METADATA)?;
+    let mut reader = file;
+    reader
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| ioerr(error, leaf))?;
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_METADATA.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| ioerr(error, leaf))?;
+    let after = cap_fs::Metadata::from_file(file).map_err(|error| ioerr(error, leaf))?;
+    valid_file(&after, MAX_METADATA)?;
+    if !same_file_state(&before, &after)?
+        || bytes.len() as u64 != after.len()
+        || id_meta(&after)? != expected.identity
+        || file_state(&after) != expected.state
+        || hash_bytes(&bytes) != expected.digest
+    {
+        return Err(corrupt(
+            "existing GC shallow receipt changed on retained handle",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]

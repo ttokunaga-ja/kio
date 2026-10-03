@@ -52,6 +52,8 @@ pub struct RegistryDb {
     // An inherited `/dev/fd/N` registry is opened through this duplicated
     // parent descriptor's procfs path. Keep it alive until SQLite closes so a
     // caller retargeting the original descriptor cannot redirect the database.
+    // Windows writers likewise retain their verified or newly private parent
+    // through SQLite's lifetime, including its path-based open.
     _inherited_parent: Option<kio_core::store_dir::StoreDirectory>,
     // Declared after `conn`, so the database closes before its private snapshot
     // directory is removed.
@@ -264,6 +266,103 @@ fn index_error_from_snapshot(error: RegistrySnapshotError) -> crate::IndexError 
             crate::IndexError::RegistryUnstableBusy(message)
         }
     }
+}
+
+#[cfg(windows)]
+fn windows_registry_writer_parent(
+    path: &Path,
+) -> Result<(PathBuf, kio_core::store_dir::StoreDirectory)> {
+    use kio_core::{private_fs, store_dir::StoreDirectory};
+    use std::os::windows::fs::MetadataExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
+
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        // Only plain relative custom paths inherit the current directory.
+        // Drive-relative and rooted-relative paths have a different authority.
+        if path.as_os_str().is_empty()
+            || !path
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+        {
+            return Err(crate::IndexError::Schema(format!(
+                "registry writer path is not a normalized relative path: {}",
+                path.display()
+            )));
+        }
+        std::env::current_dir()
+            .map_err(|error| crate::IndexError::Schema(error.to_string()))?
+            .join(path)
+    };
+    let absolute =
+        normalized_absolute_registry_path(&absolute).map_err(index_error_from_snapshot)?;
+    if absolute.file_name().is_none() {
+        return Err(crate::IndexError::Schema(
+            "registry writer path has no file name".to_owned(),
+        ));
+    }
+    let parent_path = absolute.parent().ok_or_else(|| {
+        crate::IndexError::Schema("registry writer path has no parent".to_owned())
+    })?;
+    let mut ancestor = parent_path.to_path_buf();
+    let mut missing = Vec::new();
+    let mut parent = loop {
+        match fs::symlink_metadata(&ancestor) {
+            Ok(metadata) => {
+                if !metadata.is_dir()
+                    || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+                {
+                    return Err(crate::IndexError::Schema(format!(
+                        "registry writer ancestor is not a real directory: {}",
+                        ancestor.display()
+                    )));
+                }
+                // An occupied unsafe ancestor is a refusal, never a reason to
+                // back off farther or repair that ancestor's ACL.
+                break private_fs::verify_private_creation_parent(&ancestor)
+                    .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let component = ancestor.file_name().ok_or_else(|| {
+                    crate::IndexError::Schema("registry writer has no existing ancestor".to_owned())
+                })?;
+                missing.push(component.to_os_string());
+                if !ancestor.pop() {
+                    return Err(crate::IndexError::Schema(
+                        "registry writer has no existing ancestor".to_owned(),
+                    ));
+                }
+            }
+            Err(error) => return Err(crate::IndexError::Schema(error.to_string())),
+        }
+    };
+    let mut logical = ancestor;
+    for component in missing.into_iter().rev() {
+        let leaf = Path::new(&component);
+        let next = if parent
+            .contains_entry(leaf)
+            .map_err(|error| crate::IndexError::Schema(error.to_string()))?
+        {
+            parent
+                .open_directory(leaf)
+                .map_err(|error| crate::IndexError::Schema(error.to_string()))?
+        } else {
+            // The core primitive installs a protected owner-only DACL before
+            // exposing this create-only entry. Creation errors stay errors.
+            parent
+                .create_directory(leaf)
+                .map_err(|error| crate::IndexError::Schema(error.to_string()))?
+        };
+        logical.push(&component);
+        parent = StoreDirectory::from_retained(next, logical.clone())
+            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+        // A component that appeared after the missing suffix was observed must
+        // also be private; neither that entry nor a new one is ACL-repaired.
+        private_fs::verify_private_directory_handle(&parent)
+            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+    }
+    Ok((absolute, parent))
 }
 
 #[cfg(target_os = "linux")]
@@ -907,6 +1006,7 @@ fn normalized_absolute_registry_path(
 fn normalized_absolute_registry_path(
     path: &Path,
 ) -> std::result::Result<PathBuf, RegistrySnapshotError> {
+    use std::os::windows::ffi::OsStrExt;
     use std::path::Prefix;
 
     let mut components = path.components();
@@ -916,8 +1016,11 @@ fn normalized_absolute_registry_path(
             path.display()
         )));
     };
-    if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(_, _))
-        || !matches!(components.next(), Some(Component::RootDir))
+    let verbatim_disk = matches!(prefix.kind(), Prefix::VerbatimDisk(_));
+    if !matches!(
+        prefix.kind(),
+        Prefix::Disk(_) | Prefix::UNC(_, _) | Prefix::VerbatimDisk(_)
+    ) || !matches!(components.next(), Some(Component::RootDir))
     {
         return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
             "scope registry path must use a normalized absolute drive or UNC path: {}",
@@ -928,7 +1031,18 @@ fn normalized_absolute_registry_path(
     normalized.push("\\");
     for component in components {
         match component {
-            Component::Normal(name) => normalized.push(name),
+            Component::Normal(name) => {
+                // Canonical Windows drive paths retain their verbatim prefix.
+                // That namespace only treats backslashes as separators; do
+                // not pass a disguised slash separator to the parent walk.
+                if verbatim_disk && name.encode_wide().any(|unit| unit == b'/' as u16) {
+                    return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
+                        "scope registry verbatim drive path contains a slash: {}",
+                        path.display()
+                    )));
+                }
+                normalized.push(name);
+            }
             Component::CurDir
             | Component::ParentDir
             | Component::RootDir
@@ -954,8 +1068,10 @@ fn registry_filesystem_root(path: &Path) -> std::result::Result<PathBuf, Registr
                 path.display()
             )));
         };
-        if !matches!(prefix.kind(), Prefix::Disk(_) | Prefix::UNC(_, _))
-            || !matches!(components.next(), Some(Component::RootDir))
+        if !matches!(
+            prefix.kind(),
+            Prefix::Disk(_) | Prefix::UNC(_, _) | Prefix::VerbatimDisk(_)
+        ) || !matches!(components.next(), Some(Component::RootDir))
         {
             return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
                 "scope registry path must be absolute on Windows: {}",
@@ -1788,12 +1904,15 @@ impl RegistryDb {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         #[cfg(target_os = "linux")]
         let inherited = inherited_registry_parent(path.as_ref())?;
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        let inherited = Some(windows_registry_writer_parent(path.as_ref())?);
+        #[cfg(not(any(target_os = "linux", windows)))]
         let inherited: Option<(PathBuf, kio_core::store_dir::StoreDirectory)> = None;
 
         let (sqlite_path, inherited_parent) = if let Some((sqlite_path, parent)) = inherited {
             (sqlite_path, Some(parent))
         } else {
+            #[cfg(not(windows))]
             if let Some(parent) = path.as_ref().parent() {
                 std::fs::create_dir_all(parent)
                     .map_err(|err| crate::IndexError::Schema(err.to_string()))?;
@@ -3108,29 +3227,286 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_registry_path_policy_accepts_only_absolute_disk_or_unc_roots() {
-        for accepted in [
-            r"C:\kio\scope-registry.sqlite",
-            r"\\server\share\kio\scope-registry.sqlite",
+    fn windows_registry_path_policy_accepts_absolute_disk_canonical_disk_or_unc_roots() {
+        for (accepted, expected_root) in [
+            (r"C:\kio\scope-registry.sqlite", r"C:\"),
+            (r"\\?\C:\kio\scope-registry.sqlite", r"\\?\C:\"),
+            (
+                r"\\server\share\kio\scope-registry.sqlite",
+                r"\\server\share\",
+            ),
         ] {
-            assert!(
-                normalized_absolute_registry_path(Path::new(accepted)).is_ok(),
+            let normalized = normalized_absolute_registry_path(Path::new(accepted))
+                .unwrap_or_else(|error| panic!("{accepted}: {error}"));
+            assert_eq!(normalized.as_os_str(), Path::new(accepted).as_os_str());
+            assert_eq!(
+                registry_filesystem_root(&normalized).unwrap().as_os_str(),
+                Path::new(expected_root).as_os_str(),
                 "{accepted}"
             );
         }
         for rejected in [
             r"kio\scope-registry.sqlite",
+            r"\kio\scope-registry.sqlite",
             r"C:kio\scope-registry.sqlite",
             r"C:\kio\..\scope-registry.sqlite",
-            r"\\?\C:\kio\scope-registry.sqlite",
+            r"\\?\C:",
+            r"\\?\C:kio\scope-registry.sqlite",
+            r"\\?\C:/kio/scope-registry.sqlite",
+            r"\\?\C:\kio/scope-registry.sqlite",
+            r"\\?\C:\kio\..\scope-registry.sqlite",
+            r"\\?\C:\kio\.\scope-registry.sqlite",
             r"\\?\UNC\server\share\kio\scope-registry.sqlite",
+            r"\\?\Volume{00000000-0000-0000-0000-000000000000}\kio\scope-registry.sqlite",
             r"\\.\PhysicalDrive0",
+            r"\\.\C:\kio\scope-registry.sqlite",
         ] {
             assert!(
                 normalized_absolute_registry_path(Path::new(rejected)).is_err(),
                 "{rejected}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_read_only_snapshot_accepts_canonical_drive_path_without_touching_source() {
+        let (dir, writer) = open_temp();
+        let path = dir.path().join("scope-registry.sqlite");
+        let expected = entry("scope_canonical", dir.path().to_str().unwrap(), true, true);
+        writer.upsert(&expected).unwrap();
+        drop(writer);
+
+        let canonical = fs::canonicalize(&path).unwrap();
+        assert!(matches!(
+            canonical.components().next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+        assert_eq!(
+            normalized_absolute_registry_path(&canonical)
+                .unwrap()
+                .as_os_str(),
+            canonical.as_os_str(),
+            "canonical source path must retain its exact namespace"
+        );
+        let binding = registry_parent_and_leaf(&canonical).unwrap();
+        assert_eq!(binding.parent_path, canonical.parent().unwrap());
+        drop(binding);
+        let before = snapshot_registry(&path);
+        let before_names = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(before_names.len(), 1, "fixture must have no WAL sidecars");
+
+        let snapshot = RegistryDb::open_read_only(&canonical).unwrap();
+        assert_eq!(
+            snapshot
+                .lookup_scope_id_snapshot("scope_canonical")
+                .unwrap(),
+            vec![expected]
+        );
+        drop(snapshot);
+
+        assert_eq!(snapshot_registry(&path), before, "source registry changed");
+        let after_names = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(after_names, before_names, "source sidecar files changed");
+    }
+
+    #[cfg(windows)]
+    fn windows_security_descriptor(file: &fs::File) -> Vec<u8> {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::{
+            Foundation::{HANDLE, LocalFree},
+            Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT},
+            Security::{
+                DACL_SECURITY_INFORMATION, GetSecurityDescriptorLength, OWNER_SECURITY_INFORMATION,
+            },
+        };
+
+        let mut descriptor = std::ptr::null_mut();
+        // SAFETY: the retained file handle is live, and GetSecurityInfo owns
+        // the returned descriptor allocation until LocalFree below.
+        let status = unsafe {
+            GetSecurityInfo(
+                file.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(status, 0, "inspect fixture security descriptor");
+        assert!(!descriptor.is_null());
+        // SAFETY: GetSecurityInfo returned a valid self-relative descriptor.
+        unsafe {
+            let len = GetSecurityDescriptorLength(descriptor) as usize;
+            let bytes = std::slice::from_raw_parts(descriptor.cast::<u8>(), len).to_vec();
+            LocalFree(descriptor as _);
+            bytes
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_registry_writer_creates_private_nested_parents_and_preserves_them_on_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let kio = data.join("kio");
+        let path = kio.join("scope-registry.sqlite");
+        assert!(!data.exists());
+        let expected = entry("scope_private_parent", "/tmp/private-parent", true, true);
+        let writer = RegistryDb::open(&path).unwrap();
+        writer.upsert(&expected).unwrap();
+        let before = [&data, &kio].map(|directory| {
+            let retained = kio_core::private_fs::verify_private_directory(directory)
+                .expect("new registry parent must have a protected owner-only DACL");
+            let handle = retained.root_handle();
+            (
+                kio_core::cas::windows_directory_handle_identity(handle.as_ref()).unwrap(),
+                windows_security_descriptor(handle.as_ref()),
+            )
+        });
+        assert!(writer._inherited_parent.is_some());
+        drop(writer);
+
+        let reopened = RegistryDb::open(&path).unwrap();
+        assert_eq!(
+            reopened.lookup_scope_id("scope_private_parent").unwrap(),
+            vec![expected]
+        );
+        let after = [&data, &kio].map(|directory| {
+            let retained = kio_core::private_fs::verify_private_directory(directory).unwrap();
+            let handle = retained.root_handle();
+            (
+                kio_core::cas::windows_directory_handle_identity(handle.as_ref()).unwrap(),
+                windows_security_descriptor(handle.as_ref()),
+            )
+        });
+        assert_eq!(
+            after, before,
+            "reopen must preserve directory identity and ACL"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_registry_writer_preserves_trusted_existing_parent_acl() {
+        let dir = tempfile::tempdir().unwrap();
+        let retained = kio_core::private_fs::verify_private_creation_parent(dir.path()).unwrap();
+        let handle = retained.root_handle();
+        let before_acl = windows_security_descriptor(handle.as_ref());
+        let before_identity = kio_core::cas::windows_directory_handle_identity(handle.as_ref());
+
+        let writer = RegistryDb::open(dir.path().join("scope-registry.sqlite")).unwrap();
+        writer
+            .upsert(&entry("scope_existing_parent", "/tmp/existing", true, true))
+            .unwrap();
+        assert_eq!(
+            writer
+                .lookup_scope_id("scope_existing_parent")
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(windows_security_descriptor(handle.as_ref()), before_acl);
+        assert_eq!(
+            kio_core::cas::windows_directory_handle_identity(handle.as_ref()),
+            before_identity
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_registry_writer_rejects_unsafe_existing_ancestor_without_acl_repair() {
+        use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo},
+            Security::{DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION},
+            Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+            },
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let ancestor = dir.path().join("unsafe");
+        fs::create_dir(&ancestor).unwrap();
+        let handle = fs::OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&ancestor)
+            .unwrap();
+        // SAFETY: this isolated fixture handle is live. A protected null DACL
+        // intentionally grants everyone access and must never be repaired.
+        assert_eq!(
+            unsafe {
+                SetSecurityInfo(
+                    handle.as_raw_handle() as HANDLE,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            },
+            0
+        );
+        assert!(kio_core::private_fs::verify_private_creation_parent(&ancestor).is_err());
+        let before_acl = windows_security_descriptor(&handle);
+        let before_identity = kio_core::cas::windows_directory_handle_identity(&handle).unwrap();
+        let path = ancestor.join("data/kio/scope-registry.sqlite");
+
+        assert!(RegistryDb::open(&path).is_err());
+        assert!(!ancestor.join("data").exists());
+        assert_eq!(windows_security_descriptor(&handle), before_acl);
+        assert_eq!(
+            kio_core::cas::windows_directory_handle_identity(&handle),
+            Some(before_identity)
+        );
+        assert_eq!(fs::read_dir(&ancestor).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_registry_writer_rejects_nondirectory_ancestor_without_creating_descendants() {
+        let dir = tempfile::tempdir().unwrap();
+        let ancestor = dir.path().join("occupied");
+        fs::write(&ancestor, b"preserve this file").unwrap();
+        let before = snapshot_registry(&ancestor);
+        let before_acl = windows_security_descriptor(&fs::File::open(&ancestor).unwrap());
+
+        assert!(RegistryDb::open(ancestor.join("data/kio/scope-registry.sqlite")).is_err());
+        assert_eq!(snapshot_registry(&ancestor), before);
+        assert_eq!(
+            windows_security_descriptor(&fs::File::open(&ancestor).unwrap()),
+            before_acl
+        );
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_read_only_missing_registry_never_creates_private_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let path = data.join("kio/scope-registry.sqlite");
+
+        assert!(matches!(
+            RegistryDb::open_read_only(&path),
+            Err(RegistrySnapshotError::Missing)
+        ));
+        assert!(!data.exists());
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 
     #[test]

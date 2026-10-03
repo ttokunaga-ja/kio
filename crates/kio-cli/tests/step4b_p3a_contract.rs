@@ -120,6 +120,8 @@ fn registry_path(dir: &TempDir) -> std::path::PathBuf {
 }
 
 fn ledger_row_counts(dir: &TempDir) -> (i64, i64) {
+    support::prepare_private_sqlite_sidecars(&dir.path().join(".test-data/kio/cost-ledger.sqlite"))
+        .unwrap();
     let conn = rusqlite::Connection::open_with_flags(
         dir.path().join(".test-data/kio/cost-ledger.sqlite"),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,

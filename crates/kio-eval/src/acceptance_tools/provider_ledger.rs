@@ -1177,9 +1177,7 @@ mod tests {
         let reservation = reserve_all(&mut api, &args()).unwrap();
         let root = super::super::canonical_tempdir();
         let private = root.path().join("private");
-        fs::create_dir(&private).unwrap();
-        kio_core::store_dir::restrict_new_private_directory(&fs::File::open(&private).unwrap())
-            .unwrap();
+        let _private = super::super::private_fixture_directory(&private);
         let state = private.join("state");
         let mut request = args();
         request.reservation_commit = Some(reservation["commit"].as_str().unwrap().to_owned());
@@ -1297,9 +1295,7 @@ mod tests {
         let reserved = reserve_all(&mut api, &args()).unwrap();
         let root = super::super::canonical_tempdir();
         let private = root.path().join("private");
-        fs::create_dir(&private).unwrap();
-        kio_core::store_dir::restrict_new_private_directory(&fs::File::open(&private).unwrap())
-            .unwrap();
+        let _private = super::super::private_fixture_directory(&private);
         let mut request = args();
         request.reservation_commit = Some(reserved["commit"].as_str().unwrap().to_owned());
         request.state_dir = Some(private.join("state"));

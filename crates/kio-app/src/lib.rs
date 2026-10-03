@@ -6,6 +6,8 @@ mod cursor_key;
 mod discovery;
 mod embedding_owners;
 mod export;
+#[cfg(test)]
+mod test_support;
 use embedding_owners::RetainedEmbeddingChunk;
 mod gc;
 mod grants;
@@ -30425,7 +30427,7 @@ mod tests {
         // budget-policy reads cannot depend on the user's config. This is
         // test-harness code, not a production clock or authorization seam.
         if std::env::var_os("KIO_TEST_BUDGET_MONTH_CHILD").is_none() {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::PrivateTempDir::new();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "tests::search_index_status_uses_preflight_month"])
                 .env_clear()
@@ -30457,7 +30459,7 @@ mod tests {
         ] {
             assert_eq!(std::env::var_os(name), Some(expected.into_os_string()));
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::PrivateTempDir::new();
         let repo = Repository::init(dir.path()).unwrap();
         let scope_id = repo.scope_identity().unwrap().scope_id;
         let device_config = user_config_toml_path();
@@ -30528,7 +30530,7 @@ mod tests {
         use super::capture_search_budget_observation_with;
         use kio_pipeline::ledger::LedgerDb;
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::PrivateTempDir::new();
         let ledger_path = root.path().join("device/cost-ledger.sqlite");
         drop(LedgerDb::initialize(&ledger_path).unwrap());
         let ticks = std::cell::RefCell::new(
@@ -30674,7 +30676,7 @@ mod tests {
         use kio_pipeline::ledger::LedgerDb;
         use kio_pipeline::task::{TaskDescriptor, TaskStatus, TaskStore, TaskType};
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::PrivateTempDir::new();
         let repo = Repository::init(root.path()).unwrap();
         let store = TaskStore::new(repo.kio_dir());
         let ledger = LedgerDb::initialize(root.path().join("device/cost-ledger.sqlite")).unwrap();
@@ -30850,7 +30852,7 @@ mod tests {
         use kio_pipeline::ledger::LedgerDb;
         use kio_pipeline::task::{TaskDescriptor, TaskStatus, TaskStore, TaskType};
 
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_support::PrivateTempDir::new();
         let repo = Repository::init(root.path()).unwrap();
         let store = TaskStore::new(repo.kio_dir());
         let ledger = LedgerDb::initialize(root.path().join("device/cost-ledger.sqlite")).unwrap();
@@ -32287,7 +32289,7 @@ mod tests {
         use kio_pipeline::ledger::RequestKind;
         use std::collections::BTreeMap;
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::PrivateTempDir::new();
         let ledger = kio_pipeline::ledger::LedgerDb::initialize(
             tmp.path().join("device/cost-ledger.sqlite"),
         )
@@ -32362,7 +32364,7 @@ mod tests {
     fn release_task_charge_if_open_is_a_no_op_without_a_matching_row() {
         use super::{release_task_charge_if_open, task_ledger_key};
 
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_support::PrivateTempDir::new();
         let ledger = kio_pipeline::ledger::LedgerDb::initialize(
             tmp.path().join("device/cost-ledger.sqlite"),
         )
@@ -32901,6 +32903,19 @@ mod tests {
             AdoptedEmbeddingExecution, DeclaredEmbeddingProfile, EmbeddingExecution,
         };
 
+        let _environment_lock = kio_core::test_control::test_env_lock()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let device = crate::test_support::PrivateTempDir::new();
+        let _config = kio_core::test_control::TestEnvGuard::set(
+            "XDG_CONFIG_HOME",
+            device.path().join("config"),
+        );
+        let _data = kio_core::test_control::TestEnvGuard::set("XDG_DATA_HOME", device.path());
+        let _cache = kio_core::test_control::TestEnvGuard::set(
+            "XDG_CACHE_HOME",
+            device.path().join("cache"),
+        );
         let root = tempfile::tempdir().unwrap();
         let repo = match initialize_explicit_root(root.path()).unwrap() {
             ExplicitRoot::Created(repo) => repo,

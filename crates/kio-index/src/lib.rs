@@ -31,6 +31,9 @@ pub enum IndexError {
     Contract(String),
     #[error("index schema error: {0}")]
     Schema(String),
+    /// Typed failures from the durable GC index namespace exchange.
+    #[error("GC index exchange error: {0}")]
+    GcExchange(#[source] kio_core::KioError),
     #[error("index sqlite error: {0}")]
     Sqlite(#[from] SqliteError),
     #[error("scope registry snapshot is missing")]
