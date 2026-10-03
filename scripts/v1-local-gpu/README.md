@@ -12,6 +12,18 @@ from `crates/kio-eval/src/acceptance_tools` and `acceptance_tools_main.rs`.
 it for model validation and runtime identity. The binary must be a reviewed
 regular executable; a missing or changed binary causes refusal.
 
+## Native WSL Rust environment
+
+The `kio-test` account has a native Linux Rust environment. Rust/Cargo 1.98.0
+are available through `/home/kio-test/.cargo/bin` in normal login and interactive
+Bash sessions. A fresh SSH session and an ordinary offline Cargo build/run
+verified this setup. Existing toolchains were retained.
+
+For a shell opened before setup, load `source ~/.cargo/env`, then check
+`rustc --version` and `cargo --version`. This setup does not install the private
+Actions account, keys, dispatcher, or SSH configuration; those host changes
+remain covered by the separate host-application approval.
+
 ## Controller contract
 
 `init` creates the private runtime directories, one seven-day CA and localhost
@@ -105,9 +117,17 @@ integrity; it is not independent provenance for a candidate-built executable.
 The dispatcher must be installed as the reviewed binary and the forced command
 must end in `kio-acceptance-tools dispatch`, never a mutable repository script.
 
-There is currently no installed private CI route, no authorized new accounts,
+As of the 2026-09-26 snapshot, there was no installed private CI route or authorized new accounts,
 keys, ACLs, firewall changes, or Environment configuration, and no local
-acceptance receipt. On 2026-09-26, the account's Daybreak Blue entitlement was
+acceptance receipt. On 2026-10-03, the owner approved the narrowed Tailscale
+policy, CI OIDC credential, and main-only `v1-local-acceptance` Environment;
+these three settings were applied and read back. Windows/WSL account, key,
+dispatcher installation, and SSH configuration changes were additionally
+approved with the detailed execution plan on 2026-10-04. They remain unapplied
+until the final candidate bundle is regenerated and validated. See the dated
+[execution record](../../tasks/v1-closeout-execution-2026-10-03.md) for evidence
+and candidate-specific validation; no authenticated-local receipt is claimed.
+On 2026-09-26, the account's Daybreak Blue entitlement was
 confirmed. Collaboration invocation lacked `access_programs.cyber=daybreak_blue`;
 a process-scoped CLI probe succeeded and an independent architecture review
 started. Neither the probe nor a running review establishes completed audit

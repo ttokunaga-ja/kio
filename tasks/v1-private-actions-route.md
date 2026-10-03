@@ -1,8 +1,16 @@
 # GPU受入試験のActions専用接続経路
 
-2026-09-08。これは後続の外部設定承認に供する具体的な提案であり、アカウント、鍵、ACL、firewall、GitHub Environment、Secret、Tailscale policy はまだ変更していない。既存の Mac/admin 接続経路は保存する。既存 Mac の SSH/TCP 接続は維持し、GitHub-hosted の private acceptance 経路を追加する。下記の wildcard-policy 削除と、既存 Mac key を含む WSL Unix-socket forwarding の削除は明示的な権限縮小である。
+2026-09-08作成。以下の提案と事前調査は各記録日の状態を示す。
+2026-10-03には所有者がTailscale接続ルールの縮小、CI専用OIDC認証、main専用の
+`v1-local-acceptance` Environmentを承認し、この3件を適用して再読確認した。
+Environmentには専用SSH秘密鍵1件と接続・認証情報5件を登録した。
+2026-10-04に詳細実行計画が承認され、Windows/WSLの専用アカウント・鍵登録・
+dispatcher配置・SSH設定と条件付き復旧の本適用も承認範囲に入った。まだ未適用であり、
+最終候補に束縛したbundleの更新・検証とローカル回帰の後に進める。既存Mac/admin接続は維持されている。
+最新の状態と検証範囲は[実行記録](v1-closeout-execution-2026-10-03.md)を参照する。
+private CI routeとauthenticated local acceptanceの完了は主張しない。
 
-## 確認済みの現在状態
+## 2026-09-26までの事前確認状態
 
 Windows の live read では OpenSSH は port 22、`AllowUsers rm2c`、global
 `AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys` である。Mac の
@@ -299,10 +307,14 @@ establishes transfer integrity only.
 The deployment record is a future owner-private WSL file beside the installed
 binary dispatcher, not a repository artifact. The proposed WSL source tree is
 `/home/kio-test/work/kio/v1-actions-source`, preserving the reviewed candidate
-layout below it. The forced command ends in `kio-acceptance-tools dispatch`; it
+layout below it. Install the dispatcher and deployment record at
+`scripts/v1-local-gpu/kio-acceptance-tools` and
+`scripts/v1-local-gpu/deployment.json` below that source root. The forced command
+ends in `kio-acceptance-tools dispatch`; it
 does not name a source-tree Python dispatcher. The dispatcher's fixed repository
 root resolves to `/home/kio-test/work/kio/v1-actions-source`. The source root
-and its parents must be owned by `kio-test` and not writable by group or others;
+must be owned by `kio-test`; its trusted ancestors may be owned by `kio-test`
+or root, and must not be writable by group or others;
 the dispatcher directory is `0700`, its deployment record is `0600`, and the
 installed fixed source files are not group- or other-writable. The separate
 create-only runtime root remains `/home/kio-test/work/kio/v1-actions-gpu`; it
@@ -355,7 +367,7 @@ only its two local API destinations. Substitute the actual reviewed public key;
 do not put a private key, candidate, or capability into this file:
 
 ```
-command="/home/kio-test/work/kio/v1-actions-source/kio-acceptance-tools dispatch",no-agent-forwarding,no-pty,no-user-rc,no-X11-forwarding,permitopen="127.0.0.1:18443",permitopen="127.0.0.1:18444" ssh-ed25519 <dedicated-ci-public-key> kio-v1-local-acceptance
+command="/home/kio-test/work/kio/v1-actions-source/scripts/v1-local-gpu/kio-acceptance-tools dispatch",no-agent-forwarding,no-pty,no-user-rc,no-X11-forwarding,permitopen="127.0.0.1:18443",permitopen="127.0.0.1:18444" ssh-ed25519 <dedicated-ci-public-key> kio-v1-local-acceptance
 ```
 
 `no-port-forwarding` is intentionally absent because the two `permitopen`
@@ -413,7 +425,7 @@ non-2222 Windows forwarding, and non-18443/18444 WSL forwarding. Record the
 new key fingerprint and re-read the affected effective configurations, policy,
 and listener/firewall state before any candidate workflow dispatch.
 
-## 未完了
+## 2026-09-26時点の未完了記録
 
 この文書は提案と review checklist だけである。tailnet policy の live read と具体的 replacement proposal は用意済みだが、所有者承認、Windows/WSL account and SSH configuration、GitHub Environment values、dedicated key generation、route connectivity、3 OS receipt は未構成・未実行である。2026-09-26 に Daybreak Blue の account entitlement と専用設定を付けた CLI 応答を確認し、独立 review を開始した。route review 報告は回収済みだが requested model は Blue、actual model は metadata で未確認である。CLI の疎通や review 報告は installed route の完了証拠ではない。dispatcher/client 実装と GPT-6 Sol 独立 review・Astra crosscheck があっても、private CI route、3 OS Actions、authenticated local acceptance、または Blue review 完了を主張しない。
 
