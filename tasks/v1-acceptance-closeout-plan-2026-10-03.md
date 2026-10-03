@@ -59,8 +59,9 @@ private route・credential・課金台帳の設定は記録上の状態に留ま
 ## 4. 最初の実装単位: tag削除
 
 現行契約は [docs/03 §2](../docs/03-data-model.md) と [docs/06](../docs/06-cli-spec.md) にある。
-保存形式を増やさず、scopeの既存lock/retained directoryからcanonical tag refだけを削除し、
+tag削除自体は新しい保存形式を設けず、scopeの既存lock/retained directoryからcanonical tag refだけを削除し、
 `names.jsonl`の監査行は残す。HEAD、commit/tree/raw/chunk、他のrefを削除しない。
+追加承認されたUnicode是正は別の保存契約変更として、保存形式3.0.0と旧形式拒否を適用する。
 
 coreが名前・対象ref・lock・削除境界を検証し、appが現在のscopeと実行結果を扱い、CLIが
 `tag --delete <name>`を接続する。作成時のcommit指定と削除指定は排他とし、予約名・portable名・
@@ -143,7 +144,7 @@ App/Environmentの設定完了記録と、初期化・予約・実呼出のrunti
 
 - docs/03・06: tag削除の実装/CLI/error/監査契約。未接続注記は実装後に実証範囲を示して更新する。
 - docs/08・13: tagの通常GC保護、shallow/purge/erase、復元provenanceと引用保持の違いを維持する。
-- README・docs/README・09・10・11: 配布版/開発版、保存形式2.0.0と製品v1、3 OS対応、実送信/復旧/制約を整合する。
+- README・docs/README・09・10・11: 配布版/開発版、現行保存形式3.0.0と旧2.0.0拒否、製品v1、3 OS対応、実送信/復旧/制約を整合する。
   RC.3のhistorical platform matrixは保存し、新候補のsupported表記はnative証拠の後に確定する。
 - 実装進捗・Actions coverage: 作成当時の記録を残し、現在の対応表とreceiptを追記/参照する。
   以前の全回帰/配布物/security成功を最終候補の結果へ読み替えない。

@@ -722,12 +722,48 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
         "the validated old owner may be skipped"
     );
 
+    // Caller-supplied introduction metadata cannot replace the committed
+    // history used to classify a missing immutable closure.
     let mut wrong_introduction = retained.clone();
     wrong_introduction[0].introductions.push(resurrection);
+    assert!(
+        collect(&wrong_introduction).unwrap().is_empty(),
+        "forged caller introductions cannot override the committed history"
+    );
+
+    // Actually publish the same missing NormalizeRef after resurrection. The
+    // new retained tree makes this a post-purge appearance, which the retired
+    // receipt cannot explain even though the original owner remains old.
+    let pending = BTreeMap::from([(
+        CURRENT_PATH.to_owned(),
+        PendingNormalizeRef {
+            expected_raw_hash: instance.raw_hash.clone(),
+            normalize: instance.normalize.clone(),
+        },
+    )]);
+    let post_purge = repo
+        .auto_snapshot_with_bound_normalize(
+            Some("post-purge normalized binding"),
+            None,
+            &BTreeSet::new(),
+            &pending,
+            &BTreeSet::new(),
+            None,
+        )
+        .unwrap();
+    assert!(!post_purge.noop);
+    let latest = post_purge.commit_hash.unwrap();
+    let latest_commit = repo.read_commit(&latest).unwrap();
+    let latest_tree = repo.read_tree(&latest_commit.tree).unwrap();
     assert_eq!(
-        collect(&wrong_introduction).unwrap_err().error_code(),
+        latest_tree.entries[0].normalize,
+        Some(instance.normalize.clone())
+    );
+    let post_purge_retained = retained_history_instances(repo.kio_dir(), &latest).unwrap();
+    assert_eq!(
+        collect(&post_purge_retained).unwrap_err().error_code(),
         "KIO-E-STORE-NOT-FOUND-001",
-        "even one post-purge introduction must prevent the exception"
+        "an actual post-purge binding must prevent the exception"
     );
 
     // A valid retired receipt explains absence, never corrupt bytes at the

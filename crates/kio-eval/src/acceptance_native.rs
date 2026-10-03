@@ -36,6 +36,10 @@ const POST_IGNORED_SEARCH_TOKEN: &str = "postignoredchildsentinelword";
 // scopes, including a 33-level chain. It is not the v1 performance benchmark:
 // the observed macOS pass took 28s even without concurrent build load.
 const WATCH_TIMEOUT: Duration = Duration::from_secs(120);
+// The native acceptance leg proves startup and OS notification convergence.
+// Keep its periodic fallback beyond either bounded wait so a healthy full scan
+// cannot continually refill the backlog while A02 checks for an idle watcher.
+const NATIVE_ACCEPTANCE_RECONCILE_INTERVAL_SECONDS: &str = "600";
 
 #[derive(Debug, Clone)]
 pub struct NativeOptions {
@@ -1232,7 +1236,7 @@ impl WatchChild {
                 "watch",
                 "run",
                 "--reconcile-interval-seconds",
-                "1",
+                NATIVE_ACCEPTANCE_RECONCILE_INTERVAL_SECONDS,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::from(File::create(&stdout).map_err(io)?))
@@ -1357,8 +1361,22 @@ fn wait_until(
             return Ok(success.expect("checked above"));
         }
         if Instant::now() >= deadline {
+            let status = value
+                .pointer("/status")
+                .and_then(serde_json::Value::as_str)
+                .map(|status| status.chars().take(64).collect::<String>());
+            let backlog = value
+                .pointer("/last_observation/backlog")
+                .and_then(serde_json::Value::as_u64);
+            let degraded = value
+                .pointer("/last_observation/degraded")
+                .and_then(serde_json::Value::as_bool);
+            let last_failure = value
+                .pointer("/last_observation/last_failure")
+                .and_then(serde_json::Value::as_str)
+                .map(|failure| failure.chars().take(240).collect::<String>());
             return Err(AcceptanceError::Command(format!(
-                "native watcher did not converge for {phase}"
+                "native watcher did not converge for {phase}: status={status:?}, backlog={backlog:?}, degraded={degraded:?}, last_success_ms={success:?}, last_failure={last_failure:?}"
             )));
         }
         thread::sleep(Duration::from_millis(100));

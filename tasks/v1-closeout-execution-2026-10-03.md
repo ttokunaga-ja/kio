@@ -114,3 +114,53 @@ native Windows/hosted setup、実scheduler、live provider/localの未実行gate
 実行ログ、候補SHA、archive/binary hash、source hash不変確認はrepo外に保存し、途中の失敗ログも残す。
 外部設定変更とpush/dispatchの承認範囲を確認してからC4へ進む。C4〜C6中のmain凍結、
 修正時の候補再束縛、51件verifier、手動受入とrelease公開の別判定は元の計画に従う。
+
+## 7. 初回C3候補と是正
+
+初回候補は `3494f492bb1df4b3f60ad633183a29bbf5f5809c`。
+tag削除・Unicode是正・保存形式3.0.0と関連文書をmainへlocal commitした。pushはまだ行っていない。
+以下はこのSHAの結果であり、是正後の候補へ流用しない。
+
+| 検証 | 結果と残差 |
+|---|---|
+| macOS Rust 1.98 | fmt・strict Clippy・release workspace・shell/action-pin・Persona W0はpass。workspace testは履歴収集テスト1件がfail |
+| native WSL Rust 1.98 | 同じ履歴テスト1件がfail。fmt・strict Clippy・release・Persona W0、CI相当umaskでadapter 364件はpass |
+| macOS arm64配布物 | 隔離した2回build/packageのarchive・binary hashが一致し、release verify・展開・smokeはpass |
+| macOS配布binary受入 | 試行した11件のうち10件pass、A02 native watchは収束待ちでfail。A09のUnicode tag解除/再作成/実GCはpass |
+| Linux synthetic-history | WSLの証拠ディレクトリへの書込みがEROFSとなり開始できず。その後SSHも拒否。hostの再起動/remount/設定変更は行っていない |
+| macOS synthetic-history | descriptor-bound executionを要求するscale/replayはplatform非対応。Linux laneの成功へ代替しない |
+| Office/service/3 OS受入 | 実Officeの配布元一致、実scheduler、Windows runtime、hosted enforcementは未受入。ローカル診断receiptをActions receiptへ数えない |
+
+macOS archive SHA-256は `389c593d1d99e6669e9c62ca73ff288ac65edb24c3b84ce9f551cc6fc5dc291c`、
+binaryは `5fb1fc2e247b858b8c8fec14aad6514ba093959375139b53e4557a0843aeba2e`。
+失敗ログ・watch queue/status・配布物・実行環境はrepo外の開始証拠ディレクトリへ保存した。
+
+履歴テストは、実装がHEAD ancestryを検証するのに対し、callerのin-memory introductionだけを書き換えていた。
+実際のpost-purge commitへ欠損NormalizeRefを保存して拒否を検証するfixtureへ修正し、
+未説明の欠損・正当な旧owner例外・残存破損の拒否を維持した。対象テスト1件は局所passした。
+
+A02は1秒間隔のperiodic full scanでbacklogが補充され、正常なwatcherでもidle条件を満たせなかった。
+native通知とstartupを検証するこのlegのperiodic間隔を600秒へ変更し、timeout診断を追加した。
+backlogゼロ・新しい成功時刻・非degraded・fixture/binary hash・停止後manifest比較は維持する。
+製品watcherのdefaultや、A03の独立したperiodic回復検証は変更しない。関連unit 17件は局所passした。
+これら2件を含む新候補でworkspaceとpackage受入を取り直す。
+
+security差分検証は `68690960..3494f492` の23 production pathsを完了し、確認されたfindingは0件。
+Daybreak Blueを指定したCLI出力とworkbenchのsealed reportを保存した。実際のbackendは独立に確認できていない。
+追加是正の差分は新候補へ固定して別途検証する。
+
+## 8. C2の追加readback
+
+利用者のTailscaleログインとGitHub再認証後、consoleを読取り確認した。
+Tailscaleのactive policyは全source→全destinationの全IP許可と既存SSH checkであり、CI tag/OIDC credentialはない。
+限定policyは提案ファイル、OIDC scopeは未保存formである。新規grantやcredential生成はまだ行っていない。
+
+既存GitHub App `kio-provider-ledger` はowner `ttokunaga-ja`、App ID `5091330`、
+installation `165299841`。対象は選択された `ttokunaga-ja/kio` 1 repository、Contents read/writeと
+Metadata readのみである。新しいApp権限は不要。private keyの存在確認は値の妥当性やruntime token成功を証明しない。
+ledgerの2 rulesetは予定したimmutable-historyとApp-only writerに一致するが、campaignは未初期化である。
+
+Windows専用accountとSSH forward制限、WSLのstream-local forward拒否の具体差分をrepo外へ生成し、
+一時configでparser検証した。稼働設定の変更やservice reloadは行っていない。
+Tailscale policy/OIDC、専用key/account、Environmentへの設定適用は、具体差分の承認と
+fresh状態確認の後に実施する。readback、parser成功、接続/拒否/cleanup、GPU runtimeは別の判定である。
