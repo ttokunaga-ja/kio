@@ -871,7 +871,14 @@ fn run_queue_fault_driver(
     )?;
     thread::sleep(Duration::from_millis(1100));
     drain_engine(&engine, &state, 2, "dropped-notification periodic recovery")?;
-    assert_engine_idle(&engine, &state, "dropped-notification periodic recovery")?;
+    // A further reconcile_once would itself schedule the next one-second
+    // periodic pass when the just-completed CLI index took over a second.
+    // Observe the drained queue without dispatching another pass here.
+    assert_engine_quiescent(
+        &engine,
+        &state.calls,
+        "dropped-notification periodic recovery",
+    )?;
     drop(engine);
 
     write_file(
@@ -1034,6 +1041,31 @@ fn assert_engine_idle(
         return Err(AcceptanceError::Command(format!(
             "production watch engine did not become idle after {phase}"
         )));
+    }
+    Ok(())
+}
+
+fn assert_engine_quiescent<R: Reconcile>(
+    engine: &WatchEngine<R>,
+    calls: &AtomicUsize,
+    phase: &str,
+) -> Result<(), AcceptanceError> {
+    let completed_calls = calls.load(Ordering::Relaxed);
+    for observation in 0..3 {
+        let status = engine
+            .status()
+            .map_err(|error| AcceptanceError::Command(error.to_string()))?;
+        if status.backlog != 0
+            || status.degraded
+            || calls.load(Ordering::Relaxed) != completed_calls
+        {
+            return Err(AcceptanceError::Command(format!(
+                "production watch engine did not remain quiescent after {phase}"
+            )));
+        }
+        if observation < 2 {
+            thread::sleep(Duration::from_millis(25));
+        }
     }
     Ok(())
 }
@@ -1850,6 +1882,53 @@ fn io(error: std::io::Error) -> AcceptanceError {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    #[test]
+    fn periodic_quiescence_observation_does_not_dispatch_overdue_work() {
+        struct CountingReconciler(Arc<AtomicUsize>);
+        impl Reconcile for CountingReconciler {
+            fn reconcile(
+                &self,
+                _: &WatchRoot,
+                _: DirtyReason,
+                _: &[PathBuf],
+            ) -> Result<ReconcileCompletion, WatchError> {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Ok(ReconcileCompletion::Complete)
+            }
+        }
+
+        let private = tempfile::tempdir().unwrap();
+        private_dir(private.path()).unwrap();
+        let root = WatchRoot::new("scope", private.path().canonicalize().unwrap(), 1).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let engine = WatchEngine::open_with_interval(
+            &private.path().join("queue.sqlite"),
+            [root.clone()],
+            CountingReconciler(Arc::clone(&calls)),
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(engine.reconcile_once().unwrap()); // startup
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        thread::sleep(Duration::from_millis(1100));
+
+        // Observation must leave the now-due periodic work un-dispatched.
+        assert_engine_quiescent(&engine, &calls, "test periodic recovery").unwrap();
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(engine.reconcile_once().unwrap()); // periodic, if explicitly driven
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
+        assert_engine_quiescent(&engine, &calls, "test periodic recovery").unwrap();
+
+        engine
+            .enqueue_event(
+                &root,
+                Some(&root.canonical_root.join("pending.txt")),
+                DirtyReason::Native,
+            )
+            .unwrap();
+        assert!(assert_engine_quiescent(&engine, &calls, "pending work").is_err());
+    }
 
     #[test]
     fn watcher_stop_requires_successful_exit() {

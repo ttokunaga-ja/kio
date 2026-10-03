@@ -283,8 +283,10 @@ CREATE TABLE scopes (
   存在する WAL だけを copy して query_only reader を開く。3 leaf の presence を含む比較が崩れた
   場合は stable-or-fail（formal atomic snapshot の主張ではない）で停止する。main / `-wal` / `-shm` の
   **全 3 leaf が absent** の場合だけが no-create cache miss であり、main absent + sidecar present は
-  unsafe integrity。unsafe leaf・pre/open/post identity mismatch、または source 再観測が一致した
-  owned copy の SQLite integrity failure は `KIO-E-REGISTRY-SNAPSHOT-UNSAFE-001` / exit 4、presence/hash
+  unsafe integrity。unsafe leaf・上限超過・usable identity欠如、private owned copyのidentity/内容不一致、
+  または source 再観測が一致した owned copy の SQLite integrity failure は
+  `KIO-E-REGISTRY-SNAPSHOT-UNSAFE-001` / exit 4。regularなsource leafのpre/open/post identity・size変化は
+  sidecarの同時更新としてbounded retryで再観測し、source presence/identity/size/hash
   drift・busy・retry exhaustion・temp I/O・integrity を確定できない private snapshot read-open-query
   failure は `KIO-E-REGISTRY-SNAPSHOT-001` / exit 3。これらを hint / CWD fallback や scope status に
   落とさない。

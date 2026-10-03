@@ -115,8 +115,6 @@ pub fn checkpoint(point: DurabilityPoint) -> Result<()> {
 
 #[cfg(debug_assertions)]
 fn checkpoint_debug(point: DurabilityPoint) -> Result<()> {
-    use std::fs::OpenOptions;
-    use std::io::Write;
     use std::time::{Duration, Instant};
 
     let control = crate::test_control::current_or_default().core;
@@ -127,20 +125,10 @@ fn checkpoint_debug(point: DurabilityPoint) -> Result<()> {
         return Ok(());
     };
 
-    let mut marker = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&ready_path)
-        .map_err(|error| {
-            crate::KioError::io(error.to_string(), ready_path.display().to_string())
-        })?;
-    marker
-        .write_all(format!("point={}\npid={}\n", point.name(), std::process::id()).as_bytes())
-        .and_then(|()| marker.sync_all())
-        .map_err(|error| {
-            crate::KioError::io(error.to_string(), ready_path.display().to_string())
-        })?;
-    drop(marker);
+    let payload = format!("point={}\npid={}\n", point.name(), std::process::id());
+    publish_ready_marker_with(&ready_path, payload.as_bytes(), |_| Ok(())).map_err(|error| {
+        crate::KioError::io(error.to_string(), ready_path.display().to_string())
+    })?;
 
     let release_path = ready_path.with_extension("release");
     let deadline = Instant::now() + Duration::from_secs(30);
@@ -170,9 +158,70 @@ fn checkpoint_debug(point: DurabilityPoint) -> Result<()> {
     }
 }
 
-#[cfg(test)]
+/// Stage a complete marker next to its destination, then publish the name
+/// without replacing an existing ready marker. The callback lets the unit test
+/// observe the boundary after payload sync and before publication.
+#[cfg(debug_assertions)]
+fn publish_ready_marker_with(
+    ready_path: &std::path::Path,
+    payload: &[u8],
+    before_publish: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    use std::fs::{self, OpenOptions};
+    use std::io::{Error, ErrorKind, Write};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_PENDING: AtomicU64 = AtomicU64::new(0);
+    let basename = ready_path
+        .file_name()
+        .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "ready marker has no basename"))?;
+    let mut pending_name = basename.to_os_string();
+    pending_name.push(format!(
+        ".pending-{}-{}",
+        std::process::id(),
+        NEXT_PENDING.fetch_add(1, Ordering::Relaxed)
+    ));
+    let pending_path = ready_path.with_file_name(pending_name);
+    let mut pending = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&pending_path)?;
+
+    let publication = (|| {
+        pending.write_all(payload)?;
+        pending.sync_all()?;
+        // Windows may reject hard-link creation while the source is open.
+        drop(pending);
+        before_publish(&pending_path)?;
+        fs::hard_link(&pending_path, ready_path)
+    })();
+
+    // This process owns only the sibling it created. In particular, never
+    // remove an existing ready marker if publication failed with AlreadyExists.
+    let cleanup = fs::remove_file(&pending_path);
+    match (publication, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(()), Err(cleanup_error)) => Err(Error::new(
+            cleanup_error.kind(),
+            format!(
+                "ready marker was published but could not remove pending marker {}: {cleanup_error}",
+                pending_path.display()
+            ),
+        )),
+        (Err(error), Err(cleanup_error)) => Err(Error::new(
+            error.kind(),
+            format!(
+                "ready marker publication failed: {error}; could not remove pending marker {}: {cleanup_error}",
+                pending_path.display()
+            ),
+        )),
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
 mod tests {
-    use super::{DurabilityPoint, checkpoint};
+    use super::{DurabilityPoint, checkpoint, publish_ready_marker_with};
     use crate::test_control::{CoreTestControl, DebugTestControl, Selector, install_scoped};
     use std::time::{Duration, Instant};
 
@@ -225,5 +274,37 @@ mod tests {
         let marker = std::fs::read_to_string(ready).unwrap();
         assert!(marker.contains("point=publication_journal\n"));
         assert!(marker.contains("pid="));
+    }
+
+    #[test]
+    fn ready_marker_is_published_only_after_complete_sync_and_never_replaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("manifest.ready");
+        let payload = b"point=publication_manifest\npid=123\n";
+        let mut pending_path = None;
+
+        publish_ready_marker_with(&ready, payload, |pending| {
+            pending_path = Some(pending.to_path_buf());
+            assert!(!ready.exists(), "ready marker appeared before publication");
+            assert_eq!(std::fs::read(pending)?.as_slice(), payload);
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&ready).unwrap().as_slice(), payload);
+        assert!(!pending_path.unwrap().exists());
+
+        let stale = b"point=stale\npid=456\n";
+        std::fs::write(&ready, stale).unwrap();
+        let mut second_pending_path = None;
+        let error = publish_ready_marker_with(&ready, payload, |pending| {
+            second_pending_path = Some(pending.to_path_buf());
+            assert_eq!(std::fs::read(&ready)?.as_slice(), stale);
+            assert_eq!(std::fs::read(pending)?.as_slice(), payload);
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&ready).unwrap().as_slice(), stale);
+        assert!(!second_pending_path.unwrap().exists());
     }
 }

@@ -199,9 +199,11 @@ tag名は内容固定の引用識別子として使わず、既発行pointerをt
     main と存在する WAL だけを渡す（SHM は copy しない）。これは formal な cross-file atomic
     snapshot を主張せず stable-or-fail の線形化点である。main / `-wal` / `-shm` の **全 3 leaf が absent**
     の Missing registry のみ cache miss として hint / CWD 規則を継続する。main absent + sidecar present は
-    unsafe integrity とする。unsafe leaf / pre-open-post identity mismatch、または source 再観測が
-    一致した owned copy の SQLite integrity failure は `KIO-E-REGISTRY-SNAPSHOT-UNSAFE-001` (exit 4)、
-    presence/hash drift / busy / retry exhaustion / temp I/O / integrity を確定できない private snapshot
+    unsafe integrity とする。unsafe leaf / 上限超過 / usable identity欠如 / private owned copyの
+    identity・内容不一致、または source 再観測が一致した owned copy の SQLite integrity failure は
+    `KIO-E-REGISTRY-SNAPSHOT-UNSAFE-001` (exit 4)。regularなsource leafのpre/open/post identity・size変化は
+    bounded retryで再観測し、不安定なcopyを採用しない。source presence/identity/size/hash drift /
+    busy / retry exhaustion / temp I/O / integrity を確定できない private snapshot
     read-open-query failure は `KIO-E-REGISTRY-SNAPSHOT-001` (exit 3) で fail-closed し、
     hint / CWD fallback、nested scope status、batch_changed へ変換しない。
 2.  commit を refs / objects/commits/ から取得し、現行管理scopeのHEADから到達可能であることを検証する。
@@ -471,8 +473,10 @@ batch 固有の command-level error は、malformed JSONL / invalid UTF-8 / blan
 `KIO-E-EVIDENCE-BATCH-INPUT-001` (exit 2)、file / line / record / distinct scope limit を
 `KIO-E-EVIDENCE-BATCH-LIMIT-001` (exit 2)、aggregate 認証済み CAS byte limit を
 `KIO-E-STORE-VERIFIED-BYTES-LIMIT-001` (exit 4)、検査中の scope authority / registry /
-index generation drift を `KIO-E-EVIDENCE-BATCH-CHANGED-001` (exit 3) とする。unsafe link・
-pre/open/post identity 不一致は store integrity error (exit 4) であり、いずれも partial output を返さない。
+index generation drift を `KIO-E-EVIDENCE-BATCH-CHANGED-001` (exit 3) とする。storeまたはprivate owned copyの
+unsafe link・pre/open/post identity 不一致は integrity error (exit 4) である。registry snapshotの
+command-level preflightには上記§3の分類を適用し、regular sourceのdriftはbounded retry exhaustionで
+exit 3とする。いずれも partial output を返さない。
 
 strict batch の exit priority は permanent 4 > retryable 3 > success 0 である。permanent は
 `tombstoned` / `not_found` / `manifest_missing`、retryable は `scope_unreachable` /

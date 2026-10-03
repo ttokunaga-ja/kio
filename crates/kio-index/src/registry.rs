@@ -225,6 +225,8 @@ struct RegistrySnapshot {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SnapshotTestPhase {
+    BeforeSourceLeafOpen,
+    BeforeSourceLeafRestat,
     AfterInitialManifest,
     BeforeSnapshotSqliteOpen,
     AfterSnapshotQueryBeforeRecheck,
@@ -846,9 +848,14 @@ fn verify_windows_regular_binding(
             SnapshotAttemptError::Unstable(format!("inspect Windows registry {label}: {error}"))
         })?;
     let handle_identity = kio_core::cas::windows_regular_file_handle_identity(opened);
-    if path_identity.is_none() || path_identity != handle_identity {
+    if path_identity.is_none() || handle_identity.is_none() {
         return Err(SnapshotAttemptError::Unsafe(format!(
-            "Windows registry {label} is a reparse point or changed while opening"
+            "Windows registry {label} is a reparse point or has no usable identity"
+        )));
+    }
+    if path_identity != handle_identity {
+        return Err(SnapshotAttemptError::Unstable(format!(
+            "Windows registry {label} changed while opening"
         )));
     }
     Ok(())
@@ -1059,6 +1066,8 @@ fn observe_leaf(
     parent_path: &Path,
     name: &str,
     copy_to: Option<(&PrivateSnapshotStorage, &str)>,
+    #[cfg(test)] hook: Option<&SnapshotTestHook>,
+    #[cfg(test)] attempt: usize,
 ) -> std::result::Result<LeafObservation, SnapshotAttemptError> {
     #[cfg(not(windows))]
     let _ = parent_path;
@@ -1074,6 +1083,14 @@ fn observe_leaf(
         }
     };
     validate_regular(&before, name)?;
+    #[cfg(test)]
+    if let Some(hook) = hook {
+        hook(
+            SnapshotTestPhase::BeforeSourceLeafOpen,
+            attempt,
+            Some(&parent_path.join(name)),
+        );
+    }
     let mut options = cap_fs::OpenOptions::new();
     options
         .read(true)
@@ -1096,7 +1113,7 @@ fn observe_leaf(
         ))
     })?;
     if before_identity != opened_identity || before.len() != opened.len() {
-        return Err(SnapshotAttemptError::Unsafe(format!(
+        return Err(SnapshotAttemptError::Unstable(format!(
             "scope registry {name} changed while opening"
         )));
     }
@@ -1135,6 +1152,14 @@ fn observe_leaf(
             SnapshotAttemptError::Unstable(format!("flush registry snapshot {name}: {error}"))
         })?;
     }
+    #[cfg(test)]
+    if let Some(hook) = hook {
+        hook(
+            SnapshotTestPhase::BeforeSourceLeafRestat,
+            attempt,
+            Some(&parent_path.join(name)),
+        );
+    }
     let after =
         cap_fs::stat(parent, Path::new(name), cap_fs::FollowSymlinks::No).map_err(|error| {
             SnapshotAttemptError::Unstable(format!("restat scope registry {name}: {error}"))
@@ -1148,7 +1173,7 @@ fn observe_leaf(
         ))
     })?;
     if opened_identity != after_identity || opened.len() != after.len() || total != opened.len() {
-        return Err(SnapshotAttemptError::Unsafe(format!(
+        return Err(SnapshotAttemptError::Unstable(format!(
             "scope registry {name} changed while reading"
         )));
     }
@@ -1165,6 +1190,8 @@ fn observe_manifest(
     main: &str,
     storage: Option<&PrivateSnapshotStorage>,
     missing_is_cache_miss: bool,
+    #[cfg(test)] hook: Option<&SnapshotTestHook>,
+    #[cfg(test)] attempt: usize,
 ) -> std::result::Result<RegistryManifest, SnapshotAttemptError> {
     let wal = format!("{main}-wal");
     let shm = format!("{main}-shm");
@@ -1173,14 +1200,31 @@ fn observe_manifest(
         parent_path,
         main,
         storage.map(|storage| (storage, PRIVATE_REGISTRY_MAIN)),
+        #[cfg(test)]
+        hook,
+        #[cfg(test)]
+        attempt,
     )?;
     let wal_observation = observe_leaf(
         parent,
         parent_path,
         &wal,
         storage.map(|storage| (storage, "snapshot.sqlite-wal")),
+        #[cfg(test)]
+        hook,
+        #[cfg(test)]
+        attempt,
     )?;
-    let shm_observation = observe_leaf(parent, parent_path, &shm, None)?;
+    let shm_observation = observe_leaf(
+        parent,
+        parent_path,
+        &shm,
+        None,
+        #[cfg(test)]
+        hook,
+        #[cfg(test)]
+        attempt,
+    )?;
     let manifest = RegistryManifest {
         main: main_observation,
         wal: wal_observation,
@@ -1262,7 +1306,17 @@ fn classify_snapshot_sqlite_failure(
     // A copied main/WAL pair can be temporarily incoherent while a writer is
     // rotating/checkpointing.  Re-observe all source leaves before calling a
     // stable copy malformed; source drift is retryable rather than corruption.
-    match observe_manifest(parent, parent_path, main, None, false) {
+    match observe_manifest(
+        parent,
+        parent_path,
+        main,
+        None,
+        false,
+        #[cfg(test)]
+        None,
+        #[cfg(test)]
+        0,
+    ) {
         Ok(current) if &current != initial => SnapshotAttemptError::Unstable(
             "scope registry changed while preparing SQLite snapshot".to_owned(),
         ),
@@ -1448,7 +1502,17 @@ fn snapshot_attempt(
     let parent_path = binding.parent_path.as_path();
     let main = binding.leaf.as_str();
     let storage = PrivateSnapshotStorage::create()?;
-    let initial = match observe_manifest(parent, parent_path, main, Some(&storage), true) {
+    let initial = match observe_manifest(
+        parent,
+        parent_path,
+        main,
+        Some(&storage),
+        true,
+        #[cfg(test)]
+        hook,
+        #[cfg(test)]
+        attempt,
+    ) {
         Ok(initial) => initial,
         Err(SnapshotAttemptError::Missing) => {
             #[cfg(test)]
@@ -1456,7 +1520,17 @@ fn snapshot_attempt(
                 hook(SnapshotTestPhase::AfterInitialManifest, attempt, None);
             }
             let fresh_parent = fresh_registry_parent_binding(binding)?;
-            return match observe_manifest(fresh_parent.as_ref(), parent_path, main, None, true) {
+            return match observe_manifest(
+                fresh_parent.as_ref(),
+                parent_path,
+                main,
+                None,
+                true,
+                #[cfg(test)]
+                hook,
+                #[cfg(test)]
+                attempt,
+            ) {
                 Err(SnapshotAttemptError::Missing) => {
                     #[cfg(test)]
                     if let Some(hook) = hook {
@@ -1573,7 +1647,17 @@ fn snapshot_attempt(
         );
     }
     let fresh_parent = fresh_registry_parent_binding(binding)?;
-    let final_manifest = observe_manifest(fresh_parent.as_ref(), parent_path, main, None, false)?;
+    let final_manifest = observe_manifest(
+        fresh_parent.as_ref(),
+        parent_path,
+        main,
+        None,
+        false,
+        #[cfg(test)]
+        hook,
+        #[cfg(test)]
+        attempt,
+    )?;
     if initial != final_manifest {
         return Err(SnapshotAttemptError::Unstable(
             "scope registry main/WAL/SHM changed while snapshotting".to_owned(),
@@ -2635,6 +2719,67 @@ mod tests {
             RegistryDb::open_read_only_for_test(&path, 1, hook),
             Err(RegistrySnapshotError::UnstableBusy(_))
         ));
+    }
+
+    #[cfg(unix)]
+    fn source_shm_rotation_during_observation(
+        phase_to_rotate: SnapshotTestPhase,
+        rotate_every_attempt: bool,
+    ) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scope-registry.sqlite");
+        let expected = entry("scope_a", "/tmp/a", true, true);
+        let writer = RegistryDb::open(&path).unwrap();
+        writer.upsert(&expected).unwrap();
+        drop(writer);
+        let shm = dir.path().join("scope-registry.sqlite-shm");
+        fs::write(&shm, b"initial").unwrap();
+
+        let rotations = std::sync::Arc::new(AtomicUsize::new(0));
+        let hook_rotations = std::sync::Arc::clone(&rotations);
+        let hook: SnapshotTestHook = std::sync::Arc::new(move |phase, attempt, source| {
+            if phase != phase_to_rotate
+                || (!rotate_every_attempt && attempt != 0)
+                || source != Some(shm.as_path())
+            {
+                return;
+            }
+            let replacement = shm.with_extension(format!("replacement-{attempt}"));
+            fs::write(&replacement, format!("rotated-{attempt}")).unwrap();
+            fs::rename(&replacement, &shm).unwrap();
+            hook_rotations.fetch_add(1, Ordering::SeqCst);
+        });
+
+        let result = RegistryDb::open_read_only_for_test(&path, 2, hook);
+        assert_eq!(
+            rotations.load(Ordering::SeqCst),
+            if rotate_every_attempt { 2 } else { 1 }
+        );
+        if rotate_every_attempt {
+            assert!(matches!(
+                result,
+                Err(RegistrySnapshotError::UnstableBusy(_))
+            ));
+        } else {
+            let snapshot = result.expect("stable retry after source SHM rotation");
+            assert_eq!(snapshot.lookup_scope_id("scope_a").unwrap(), vec![expected]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_shm_rotation_between_stat_and_open_retries_or_reports_busy() {
+        source_shm_rotation_during_observation(SnapshotTestPhase::BeforeSourceLeafOpen, false);
+        source_shm_rotation_during_observation(SnapshotTestPhase::BeforeSourceLeafOpen, true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_shm_rotation_between_read_and_restat_retries_or_reports_busy() {
+        source_shm_rotation_during_observation(SnapshotTestPhase::BeforeSourceLeafRestat, false);
+        source_shm_rotation_during_observation(SnapshotTestPhase::BeforeSourceLeafRestat, true);
     }
 
     #[test]

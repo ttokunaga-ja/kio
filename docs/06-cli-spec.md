@@ -753,9 +753,12 @@ kio evidence retarget          canonical heading_path exact match が 0 件な�
 ```
 
 Evidence の registry snapshot は command-level preflight である。source registry の symlink /
-hardlink / non-regular leaf、pre/open/post の identity 不一致、または source 再観測が一致した
-owned copy の SQLite integrity failure は `KIO-E-REGISTRY-SNAPSHOT-UNSAFE-001` / exit 4 とする。
-source leaf の presence/hash drift、busy、bounded retry 内に安定しない snapshot、temp I/O、または
+hardlink / non-regular leaf・上限超過・usable identity欠如、private owned copy のidentity/内容不一致、
+または source 再観測が一致した owned copy の SQLite integrity failure は
+`KIO-E-REGISTRY-SNAPSHOT-UNSAFE-001` / exit 4 とする。
+regularなsource leafのpre/open/post identity・size変化は、SQLite sidecarの同時更新と同様に
+bounded retryで再観測する。不安定なcopyは採用せず、private copyの照合とsource再観測一致を必須とする。
+source leaf の presence/identity/size/hash drift、busy、bounded retry 内に安定しない snapshot、temp I/O、または
 copy/open/query 中に integrity を確定できない failure は `KIO-E-REGISTRY-SNAPSHOT-001` / exit 3 とし、
 いずれも stdout を空にして single verify / batch verify / retarget へ同じまま伝播する。これらは
 scope status や `batch_changed` に変換しない。registry main / `-wal` / `-shm` の **全 3 leaf が absent**

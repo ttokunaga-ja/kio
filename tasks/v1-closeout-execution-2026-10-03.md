@@ -202,3 +202,62 @@ host healthと空き容量の条件が成立するまで、SSH route本適用と
 新規Tailscale policy/OIDCとGitHub Environmentの具体案はrepo外の確認packetへ整理した。
 Mac→WindowsのSSHを保持する一方、既存wildcardの削除はWindows→Mac/RDP等に影響する。
 新しい永続credentialの保存前の承認を待ち、設定完了・runtime・最終51件受入は別々に判定する。
+
+## 10. a8bb376候補の回帰結果と再開確認
+
+`a8bb3762d895e99344b25a532de58b3bc675114c` のmacOS全体回帰は、標準USER/LOGNAMEを
+実UIDから渡した環境でpassした。fmt、strict Clippy、workspace全target test、release build、
+shell/action-pin、Persona W0もpass。eval libは496件成功で、132件の元のWIPも不変だった。
+
+同じ候補の隔離した2回packageはarchive hash
+`e6f56e00ddfdb02de373daac1fc27ec95fa8663d1e1f23244406adee027e7b0f` が一致し、
+展開binaryは `0b5ec7633cd796fd0264c076507c247745dee25d6baf218fa01d19e7792c7831`。
+verify・smoke・A12配布はpass。実binaryの10 case/subcase中7件pass・3件failであり、
+A02は正式な候補evaluatorで309秒の全工程を完了した。A09のUnicode tag削除・再作成と実GCもpass。
+これらはローカル診断IDの証拠であり、必須Actions receiptやv1全体受入とは数えない。
+
+残る失敗を保存記録とsourceで切り分けた。
+
+- A03: 1秒のperiodic回復が終わった後、idle検査がreconcile_onceを呼び、次のperiodicを自ら投入していた。
+  保存queueは空。通知欠落後の実回復・新しい呼出・最終内容照合を維持し、この区間だけ
+  新規dispatchなしのqueueゼロ・非degraded・呼出回数安定を検査する。
+- A06: concurrent CLIのregistry SHMがsource stat/open間で変化し、直ちにunsafeで停止した。
+  regular sourceのidentity/size driftを既存のbounded retryへ分類する。unsafe leafとprivate copyの
+  照合拒否は保持し、CLI/運用/Evidence Pointer文書もこの区別へ整合する。
+- A10: debug barrierが最終ready名を作成した後、payloadを書き込む前にreaderが0 byteを観測した。
+  完全payloadを同期した同directoryのpendingからcreate-onlyでready名を公開する。
+  point/PIDの厳密検査は維持し、既存readyを上書きしない。
+
+是正ごとに原因に対応する回帰を追加し、新候補の必要な検証を実行する。失敗の無変更再試行や、
+合否条件の削減では閉じない。修正前の候補の成功を新候補の証明へ読み替えない。
+
+利用者が不要データを削除し、再開可能と連絡した後、2026-10-03 13:30 JSTのread-only確認で
+Windows C:の空きは383,960,043,520 bytes（約357.7 GiB）へ回復した。Ubuntu/Docker WSLはRunning、
+既存SSH接続は成功、guest ext4はrw、kio-test home/repoは書込み可能なmetadataだった。
+kio-sshd・Docker 29.8.1・RTX 4060のmetadata確認も成功した。
+KioLabWslKeepaliveはReadyで、最後の結果は0xC000013A。終了理由は断定せず、常駐の将来継続を
+このsnapshotだけで保証しない。こちらから削除・修復・再起動・GPU workloadは行っていない。
+
+容量と既存SSHの停止条件は解消した。新規Tailscale/OIDC/Environmentの適用承認、専用SSH経路の
+本適用、実GPU/service受入と51件verifierは引き続き別の終了条件である。
+
+## 11. 追加是正の対象検証と外部設定の適用
+
+本差分の対象検証ではregistry lib 43件、durability lib 4件がpassした。
+新しいA03回帰は最初にfixture tempdirのowner-private権限不足で起動前にfailしたため、
+既存のprivate_dirを適用してproductionと同じ前提へ揃えた。修正後のnative evaluator検査は
+18件passし、fmt、core release testのno-runコンパイル、strict workspace Clippyもpassした。
+原失敗と再検証の記録を保持し、132件の元のWIPはsymlinkを含めて不変だった。
+独立したGPT-6.1 Solのregistry source reviewでも追加是正は見つからなかったが、
+これはWindows runtimeや正式受入、最終差分securityの完了を代替しない。
+
+利用者はTailscale policy/OIDC/GitHub Environmentの具体的な3項目を承認した。
+2026-10-03 14:05 JSTまでに、policyを保存してserver整形後の全文を再読し、提案とのJSON内容一致を
+確認した。既存Mac→Windows→WSLのstrict SSH接続も成功した。OIDC credentialを作成し、
+保存済みissuer/subjectと4つのexact claims、Auth Keys scope、tag:kio-ciを読み戻した。
+GitHub v1-local-acceptance Environmentはmain branchだけのpolicy、reviewersなし、指定variable5件と
+専用SSH secret1件で作成し、API/UIで検証した。Windows/WSLのpublic host keyは既存strict SSH pinと
+照合してから登録した。private keyの本文やdigestは文書・repo・ログに保存していない。
+
+これらは設定適用の証拠であり、Actions OIDC接続・専用SSH account/key/configの本適用・GPU workload・
+必須51件受入の成功を意味しない。今回承認された3項目にhost側の専用account/SSH本適用は含めない。
