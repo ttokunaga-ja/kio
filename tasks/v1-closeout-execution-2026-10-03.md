@@ -890,3 +890,57 @@ host設定は変更せず、明示的な`+1.98.0-x86_64-pc-windows-msvc`とversi
 直接関連するprivate fixtureをlocal main `cca9887`へ保存した。Windows releaseのMSVC pinと
 portable fixtureは`06ed68c`へ保存した。元132件の未追跡WIPは
 bytes/size/mode/mtime/inode/device一致を再確認し、一切stageしていない。
+
+## 20. 同一候補の全体回帰とMac監視テストの出力回収
+
+2026-10-04 08:31 JST記録。`1820d3fbcf0170a8d206045984c4b7c9b4685809` /
+tree `5ff7b3dc215a685ee3a51540d93113f40f30e3b8` を固定し、tracked 1,655件の
+bytes・Git blob・indexと、元132件の未追跡WIPのmetadata/contentを照合した。
+bundle SHA-256は `3acd73a9c98dbbd0a37ce962f5601ca39f61f693097b8be056722630d16c5691`。
+以下はこの候補で得た結果であり、後続候補の全体回帰や51件の正式受入に流用しない。
+
+WSLでは、bundleから作成したclean detached cloneと新規target/build directoryを用い、
+Rust 1.98.0のfmt、locked workspace/all-targets strict Clippy、全workspace/all-targets test、
+locked release workspace buildがすべて実exit0だった。testは102 executable summary、
+3,221 pass / 0 fail / 1 ignoredで、789.42秒。全1,655 sourceの前後fingerprint、HEAD/tree、
+indexとclean statusも一致した。証拠は `linux-wsl-1820d3fb-workspace-v1/`。
+これはWindows native、配布物、実service/provider/local受入の成功を表さない。
+
+Macのfmtとstrict Clippyは実exit0だったが、全体testは実exit101で、`v1_watch`の
+停止3件が25秒の期限を超過した。release buildは順序ゲートにより未実行である。
+`-p kio-cli --test v1_watch`の4件成功時にはCLIの依存feature統合が変わって再buildされて
+いたため、その結果で全体失敗を解消済みとはしなかった。元のfull variantのCLIとharnessを
+SHA-256で固定して保存し、再現時の3 processをsampleしたところ、いずれも監視処理終了後の
+`main.rs`のJSON出力でstdout pipeへのwrite/flushを待っていた。testがprocess終了まで
+pipeを読まないことによる停止待ちとの循環で、notifyの停止不具合を示すstackではなかった。
+再現は実exit101、1 pass / 3 fail。証拠は
+`macos-full-variant-v1-watch-diagnostic-1820d3fb-v1/`。
+
+是正は`crates/kio-cli/tests/v1_watch.rs`だけに限定し、起動直後からstdout/stderrを並行して
+回収し、正常終了・crash・Dropでchildとreaderを回収する。25秒期限、並行test、既存assertionを
+維持し、正常停止結果の完全なJSONと`status: stopped`も検証する。全workspace/all-targetsの
+locked `--no-run`は実exit0。新harnessを元のfull CLI（SHA-256
+`482f079a0907c3db173fcee3c6a143cc6f3f3f68b1a577db6d1b4a6965fc2095`）へ明示的に
+結び付けたGreenは4 pass / 0 fail、実exit0で、test時間12.28秒、command全体13.308秒だった。
+前後1,655 sourceは一致した。証拠は `macos-watch-pipe-green-1820d3fb-v1/`。
+この局所GreenをMac全体回帰へ昇格しない。
+
+Windows全体runner v1はPowerShell 5.1の261文字pathの観測失敗、v2はRust version確認用の
+findstr判定で準備段階に停止し、いずれもCargo全体回帰を実行していない。v2の実出力は
+release 1.98.0 / host x86_64-pc-windows-msvcだった。新しいv3は短いroot、semantic version/host
+確認、未起動Cargoをnullで区別するterminal receipt、転送対象の完全なclosureを検証した準備物。
+Macのtest是正で候補が変わるため、この旧候補向けv3は実行せず、新候補へ再生成する。
+失敗したprepare/preflightのraw receiptは保持する。
+
+この候補の `452adbc..1820d3fb` security diff scanは変更Rust 57件を確認し、候補0件、
+coverage completeでseal/readbackまで完了した。Daybreak Blueを指定した独立CLIも実exit0だったが、
+返却metadataから実行backendを独立確認できず、指定modelをbackend実証として扱わない。
+scan IDは `8a2364ec-9337-4bd9-897a-ebf08cdbef2c`。この静的結果はruntime受入を表さず、
+後続のtest差分も新候補のreview対象に含める。
+
+配布物runnerと専用host適用packetは実行前reviewで見つかったscript不整合を是正中で、
+hostへの本適用、push、Actions、provider/localの外部呼出しは行っていない。Mac空き容量は
+約12 GiBで、独立2回build用の18 GiB開始基準を下回るため配布物試験を保留し、利用者へ
+整理方法を確認した。復元したreceipt・source・package・compiled proofを削除していない。
+今回のtest是正と文書をcommitした後、repo外freezeで新候補SHA/treeを固定し、
+その候補の3 OS全体回帰・配布物・security・専用経路・正式受入を順に確認する。

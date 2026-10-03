@@ -6,8 +6,10 @@ use support::canonical_tempdir;
 
 use std::collections::VecDeque;
 use std::fs;
+use std::io::{self, Read};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -70,20 +72,21 @@ impl Fixture {
         self.ok(&["watch", "status"])
     }
     fn start(&self, interval: &str) -> Guard {
-        let mut child = self
-            .command(&["watch", "run", "--reconcile-interval-seconds", interval])
-            .spawn()
-            .unwrap();
+        let mut guard = Guard::new(
+            self.command(&["watch", "run", "--reconcile-interval-seconds", interval])
+                .spawn()
+                .unwrap(),
+        );
         std::thread::sleep(Duration::from_millis(500));
-        if child.try_wait().unwrap().is_some() {
-            let output = child.wait_with_output().unwrap();
+        if guard.child.as_mut().unwrap().try_wait().unwrap().is_some() {
+            let output = guard.output();
             panic!(
                 "watch exited on startup: {} {}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        Guard(Some(child))
+        guard
     }
     fn wait(&self, condition: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + Duration::from_secs(25);
@@ -158,36 +161,77 @@ impl Fixture {
         }
     }
 }
-struct Guard(Option<Child>);
+struct Guard {
+    child: Option<Child>,
+    stdout: Option<JoinHandle<io::Result<Vec<u8>>>>,
+    stderr: Option<JoinHandle<io::Result<Vec<u8>>>>,
+}
 impl Guard {
+    fn new(mut child: Child) -> Self {
+        let stdout = child.stdout.take().unwrap();
+        let stderr = child.stderr.take().unwrap();
+        let mut guard = Self {
+            child: Some(child),
+            stdout: None,
+            stderr: None,
+        };
+        // Drain both pipes while the watcher runs, so a full pipe cannot block
+        // the watcher before it exits.
+        guard.stdout = Some(std::thread::spawn(move || read_output(stdout)));
+        guard.stderr = Some(std::thread::spawn(move || read_output(stderr)));
+        guard
+    }
+    fn output(&mut self) -> Output {
+        let status = self.child.as_mut().unwrap().wait().unwrap();
+        self.child = None;
+        Output {
+            status,
+            stdout: self.stdout.take().unwrap().join().unwrap().unwrap(),
+            stderr: self.stderr.take().unwrap().join().unwrap().unwrap(),
+        }
+    }
     fn stopped(mut self) {
         let deadline = Instant::now() + Duration::from_secs(25);
-        let child = self.0.as_mut().unwrap();
+        let child = self.child.as_mut().unwrap();
         while child.try_wait().unwrap().is_none() {
             assert!(Instant::now() < deadline, "watch stop timed out");
             std::thread::sleep(Duration::from_millis(100));
         }
-        let output = self.0.take().unwrap().wait_with_output().unwrap();
+        let output = self.output();
         assert!(
             output.status.success(),
             "{} {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let result: Value = serde_json::from_slice(&output.stdout)
+            .expect("watch stop must return complete JSON output");
+        assert_eq!(result["status"], "stopped");
     }
     fn crash(mut self) {
-        let mut child = self.0.take().unwrap();
-        child.kill().unwrap();
-        child.wait().unwrap();
+        self.child.as_mut().unwrap().kill().unwrap();
+        let _ = self.output();
     }
 }
 impl Drop for Guard {
     fn drop(&mut self) {
-        if let Some(mut child) = self.0.take() {
+        if let Some(mut child) = self.child.take() {
             let _ = child.kill();
             let _ = child.wait();
         }
+        if let Some(stdout) = self.stdout.take() {
+            let _ = stdout.join();
+        }
+        if let Some(stderr) = self.stderr.take() {
+            let _ = stderr.join();
+        }
     }
+}
+
+fn read_output(mut pipe: impl Read) -> io::Result<Vec<u8>> {
+    let mut output = Vec::new();
+    pipe.read_to_end(&mut output)?;
+    Ok(output)
 }
 
 #[test]
