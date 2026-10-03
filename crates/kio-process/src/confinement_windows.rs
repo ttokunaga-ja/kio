@@ -11,7 +11,7 @@ use std::{
     fs::File,
     io::Read,
     os::windows::{ffi::OsStrExt, io::FromRawHandle},
-    path::Path,
+    path::{Component, Path, Prefix},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc,
@@ -23,16 +23,18 @@ use windows_sys::Win32::Security::Isolation::{
     CreateAppContainerProfile, DeleteAppContainerProfile,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
+    BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
     FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-    FILE_ID_BOTH_DIR_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_NONE, FILE_SHARE_READ,
-    FILE_SHARE_WRITE, FILE_TYPE_DISK, FileIdBothDirectoryInfo, GetFileInformationByHandle,
-    GetFileInformationByHandleEx, GetFileType, OPEN_EXISTING, WRITE_DAC,
+    FILE_ID_BOTH_DIR_INFO, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+    FILE_SHARE_DELETE, FILE_SHARE_NONE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK,
+    FileIdBothDirectoryInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, GetFileType,
+    GetFinalPathNameByHandleW, OPEN_EXISTING, READ_CONTROL, VOLUME_NAME_DOS, WRITE_DAC,
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, GENERIC_ALL, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
-        SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, GENERIC_ALL, HANDLE,
+        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, MAX_PATH, SetHandleInformation,
+        WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::{
         Authorization::{
@@ -40,8 +42,8 @@ use windows_sys::Win32::{
             SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
         },
         CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, FreeSid, GetTokenInformation,
-        OBJECT_INHERIT_ACE, PSID, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, TOKEN_QUERY,
-        TOKEN_USER, TokenUser,
+        OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
+        SECURITY_CAPABILITIES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     },
     System::{
         JobObjects::{
@@ -87,7 +89,7 @@ pub(crate) fn protect_owner_private_scratch(path: &Path) -> Result<(), Confineme
     let raw_directory = unsafe {
         CreateFileW(
             wide_path.as_ptr(),
-            WRITE_DAC,
+            FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
             FILE_SHARE_NONE,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -108,51 +110,118 @@ pub(crate) fn protect_owner_private_scratch(path: &Path) -> Result<(), Confineme
             "scratch must be a newly-created empty non-symlink directory",
         )));
     }
-    let mut first = vec![
-        0_usize;
-        (std::mem::size_of::<FILE_ID_BOTH_DIR_INFO>() + 1024)
-            .div_ceil(std::mem::size_of::<usize>())
-    ];
-    if unsafe {
-        GetFileInformationByHandleEx(
-            directory.0,
-            FileIdBothDirectoryInfo,
-            first.as_mut_ptr().cast(),
-            first.len() as u32,
-        )
-    } != 0
-    {
-        return Err(ConfinementError::Profile(std::io::Error::other(
-            "scratch must be empty before staging",
-        )));
+    // FILE_ID_BOTH_DIR_INFO records require eight-byte alignment. The Win32
+    // buffer length is in bytes, not the number of backing allocation elements.
+    #[repr(align(8))]
+    struct DirectoryEntries([u8; 4096]);
+    let mut entries = DirectoryEntries([0; 4096]);
+    let buffer_bytes = entries.0.len();
+    let name_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileName);
+    let invalid_records = || {
+        ConfinementError::Profile(std::io::Error::other(
+            "invalid scratch directory enumeration",
+        ))
+    };
+    let mut seen_dot = false;
+    let mut seen_dot_dot = false;
+    loop {
+        entries.0.fill(0);
+        if unsafe {
+            GetFileInformationByHandleEx(
+                directory.0,
+                FileIdBothDirectoryInfo,
+                entries.0.as_mut_ptr().cast(),
+                buffer_bytes as u32,
+            )
+        } == 0
+        {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                break;
+            }
+            return Err(ConfinementError::Profile(error));
+        }
+        let bytes = &entries.0;
+        let mut offset = 0;
+        loop {
+            let record = bytes.get(offset..).ok_or_else(&invalid_records)?;
+            if record.len() < name_offset {
+                return Err(invalid_records());
+            }
+            // Read only the fixed header fields; a short final filename need
+            // not occupy the tail padding of the Rust structure.
+            let next = u32::from_ne_bytes(record[..4].try_into().unwrap()) as usize;
+            let length_offset = std::mem::offset_of!(FILE_ID_BOTH_DIR_INFO, FileNameLength);
+            let name_bytes =
+                u32::from_ne_bytes(record[length_offset..length_offset + 4].try_into().unwrap())
+                    as usize;
+            if name_bytes == 0 || name_bytes % 2 != 0 {
+                return Err(invalid_records());
+            }
+            let record_end = name_offset
+                .checked_add(name_bytes)
+                .filter(|end| *end <= record.len())
+                .ok_or_else(&invalid_records)?;
+            if next != 0 && (next % 8 != 0 || next < record_end || next >= record.len()) {
+                return Err(invalid_records());
+            }
+            let name = &record[name_offset..record_end];
+            let dot = [b'.', 0];
+            let dot_dot = [b'.', 0, b'.', 0];
+            let seen = if name == dot {
+                &mut seen_dot
+            } else if name == dot_dot {
+                &mut seen_dot_dot
+            } else {
+                return Err(ConfinementError::Profile(std::io::Error::other(
+                    "scratch must be empty before staging",
+                )));
+            };
+            // At most two pseudoentries can be skipped across all batches.
+            // Reject repeats so even a malformed enumerator is bounded.
+            if *seen {
+                return Err(invalid_records());
+            }
+            *seen = true;
+            if next == 0 {
+                break;
+            }
+            offset = offset.checked_add(next).ok_or_else(&invalid_records)?;
+        }
     }
     let mut token = std::ptr::null_mut();
     if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
         return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
     }
+    let token = OwnedHandle(token);
     let mut size = 0;
-    unsafe {
-        GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut size);
+    let sized =
+        unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut size) };
+    let error = std::io::Error::last_os_error();
+    if sized != 0 || error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+        return Err(ConfinementError::Profile(error));
+    }
+    if (size as usize) < std::mem::size_of::<TOKEN_USER>() {
+        return Err(ConfinementError::Profile(std::io::Error::other(
+            "invalid TokenUser buffer length",
+        )));
     }
     let mut buffer = vec![0_usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
     let ok = unsafe {
         GetTokenInformation(
-            token,
+            token.0,
             TokenUser,
             buffer.as_mut_ptr().cast(),
             size,
             &mut size,
         )
     };
-    unsafe {
-        CloseHandle(token);
-    }
     if ok == 0 {
         return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
     }
     let sid = unsafe { (&*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
     let mut entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: GENERIC_ALL,
+        grfAccessPermissions: FILE_ALL_ACCESS,
         grfAccessMode: SET_ACCESS,
         grfInheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
         ..Default::default()
@@ -171,8 +240,8 @@ pub(crate) fn protect_owner_private_scratch(path: &Path) -> Result<(), Confineme
         SetSecurityInfo(
             directory.0,
             SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | 0x8000_0000,
-            sid,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             acl,
             std::ptr::null(),
@@ -217,7 +286,7 @@ where
     let application = wide(sandbox.program().as_os_str());
     let mut command_line = windows_command_line(sandbox.program().as_os_str(), args);
     let environment = environment_block(environment)?;
-    let cwd = wide(sandbox.scratch().as_os_str());
+    let cwd = renderer_current_directory(sandbox.scratch());
     let started = Instant::now();
     let deadline = started
         .checked_add(options.timeout)
@@ -421,18 +490,19 @@ const MAX_SCRATCH_SCAN_DEPTH: usize = 32;
 const MAX_SCRATCH_SCAN_ENTRIES: usize = 10_000;
 const SCRATCH_SCAN_BUDGET: Duration = Duration::from_secs(1);
 
-// Never share delete: every ancestor stays pinned until its descendants have
-// been observed. Directories additionally deny write sharing so they cannot be
-// converted into reparse points while path-based read_dir resolves descendants.
+// Metadata-only file observations remain compatible with active writers.
+// Directory pins additionally request list access so their sharing restrictions
+// participate in Windows share-access checks.
 fn open_scratch_entry(
     path: &Path,
+    access: u32,
     share: u32,
 ) -> Result<(OwnedHandle, BY_HANDLE_FILE_INFORMATION), std::io::Error> {
     let path = wide(path.as_os_str());
     let raw = unsafe {
         CreateFileW(
             path.as_ptr(),
-            FILE_READ_ATTRIBUTES,
+            access,
             share,
             std::ptr::null(),
             OPEN_EXISTING,
@@ -461,11 +531,31 @@ fn open_scratch_entry(
     Ok((handle, info))
 }
 
-fn pin_scratch_directory(path: &Path) -> Result<OwnedHandle, std::io::Error> {
-    let (handle, info) = open_scratch_entry(path, FILE_SHARE_READ)?;
+fn pin_scratch_directory(
+    path: &Path,
+    observed: Option<&BY_HANDLE_FILE_INFORMATION>,
+) -> Result<OwnedHandle, std::io::Error> {
+    // Deny write and delete sharing while this directory and its descendants
+    // are observed. Attribute access alone would not establish this pin.
+    let (handle, info) = open_scratch_entry(
+        path,
+        FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ,
+    )?;
     if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Err(std::io::Error::other(
             "renderer scratch directory changed type",
+        ));
+    }
+    if observed.is_some_and(|previous| {
+        previous.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
+            || previous.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            || previous.dwVolumeSerialNumber != info.dwVolumeSerialNumber
+            || previous.nFileIndexHigh != info.nFileIndexHigh
+            || previous.nFileIndexLow != info.nFileIndexLow
+    }) {
+        return Err(std::io::Error::other(
+            "renderer scratch directory changed identity before pinning",
         ));
     }
     Ok(handle)
@@ -500,20 +590,21 @@ fn enforce_scratch_limit_with_budget(
 
     fn visit(
         path: &Path,
+        observed: Option<&BY_HANDLE_FILE_INFORMATION>,
         depth: usize,
         max: u64,
-        total: &mut u64,
-        entries: &mut usize,
+        counts: (&mut u64, &mut usize),
         budget: Duration,
         elapsed: &mut impl FnMut() -> Duration,
     ) -> Result<(), std::io::Error> {
+        let (total, entries) = counts;
         if depth > MAX_SCRATCH_SCAN_DEPTH {
             return Err(std::io::Error::other(
                 "renderer scratch scan exceeded depth limit",
             ));
         }
         check_deadline(budget, elapsed)?;
-        let _directory = pin_scratch_directory(path)?;
+        let _directory = pin_scratch_directory(path, observed)?;
         check_deadline(budget, elapsed)?;
         // read_dir streams entries. _directory and every caller's guard remain
         // alive throughout iteration, including while each child is visited.
@@ -533,17 +624,29 @@ fn enforce_scratch_limit_with_budget(
                 ));
             }
             let child_path = entry.path();
-            let (_entry, info) =
-                match open_scratch_entry(&child_path, FILE_SHARE_READ | FILE_SHARE_WRITE) {
-                    Ok(entry) => entry,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => return Err(error),
-                };
+            let (_entry, info) = match open_scratch_entry(
+                &child_path,
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+            ) {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
             check_deadline(budget, elapsed)?;
             if info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0 {
-                // _entry already denies deletion during the second open, and
-                // visit revalidates attributes with write sharing disabled.
-                visit(&child_path, depth + 1, max, total, entries, budget, elapsed)?;
+                // The metadata handle does not pin the name. Retain it and
+                // require the stronger directory open to identify the same
+                // object before resolving any descendants through its path.
+                visit(
+                    &child_path,
+                    Some(&info),
+                    depth + 1,
+                    max,
+                    (total, entries),
+                    budget,
+                    elapsed,
+                )?;
             } else {
                 let size = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
                 if size > max {
@@ -564,7 +667,15 @@ fn enforce_scratch_limit_with_budget(
         check_deadline(budget, elapsed)
     }
     check_deadline(budget, elapsed)?;
-    visit(root, 0, max_file_bytes, &mut 0, &mut 0, budget, elapsed)
+    visit(
+        root,
+        None,
+        0,
+        max_file_bytes,
+        (&mut 0, &mut 0),
+        budget,
+        elapsed,
+    )
 }
 
 // `runtime_roots` are never ACL-mutated. The actual access decision is left to
@@ -801,7 +912,7 @@ impl Attributes {
                     0,
                     PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
                     attributes.handles.as_ptr().cast(),
-                    std::mem::size_of_val(&attributes.handles),
+                    std::mem::size_of_val(&*attributes.handles),
                     std::ptr::null_mut(),
                     std::ptr::null(),
                 )
@@ -1004,6 +1115,61 @@ fn resume(thread: HANDLE) -> Result<(), std::io::Error> {
 fn wide(value: &OsStr) -> Vec<u16> {
     value.encode_wide().chain(Some(0)).collect()
 }
+fn renderer_current_directory(scratch: &Path) -> Vec<u16> {
+    let canonical = wide(scratch.as_os_str());
+    if !scratch.is_absolute()
+        || !matches!(
+            scratch.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::VerbatimDisk(_))
+        )
+    {
+        return canonical;
+    }
+    // Only the process CWD spelling may change. Keep the canonical scratch
+    // for grants and observation, and retain all other path namespaces.
+    let ordinary = &canonical[4..];
+    if ordinary.len() > MAX_PATH as usize {
+        return canonical;
+    }
+    // Ask Win32 to interpret the ordinary spelling itself. In particular,
+    // trailing dots/spaces and DOS device names must never redirect the CWD.
+    let raw = unsafe {
+        CreateFileW(
+            ordinary.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return canonical;
+    }
+    let directory = OwnedHandle(raw);
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    if unsafe { GetFileInformationByHandle(directory.0, &mut info) } == 0
+        || info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)
+            != FILE_ATTRIBUTE_DIRECTORY
+    {
+        return canonical;
+    }
+    let mut resolved = vec![0_u16; canonical.len()];
+    let length = unsafe {
+        GetFinalPathNameByHandleW(
+            directory.0,
+            resolved.as_mut_ptr(),
+            resolved.len() as u32,
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+        )
+    } as usize;
+    if length == canonical.len() - 1 && resolved[..length] == canonical[..length] {
+        ordinary.to_vec()
+    } else {
+        canonical
+    }
+}
 fn unique_suffix() -> u128 {
     u128::from(PROFILE_SEQUENCE.fetch_add(1, Ordering::Relaxed))
 }
@@ -1070,6 +1236,48 @@ fn quote_windows_arg(value: &OsStr) -> String {
 
 #[cfg(test)]
 mod scratch_scan_tests {
+
+    #[test]
+    fn renderer_cwd_ordinary_spelling_round_trips_to_canonical_unicode_directory() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let holder = tempfile::tempdir().unwrap();
+        let scratch = holder.path().join("描画 scratch");
+        std::fs::create_dir(&scratch).unwrap();
+        let canonical = std::fs::canonicalize(&scratch).unwrap();
+        let cwd = renderer_current_directory(&canonical);
+        assert_eq!(cwd.last(), Some(&0));
+        let cwd = std::path::PathBuf::from(OsString::from_wide(&cwd[..cwd.len() - 1]));
+        assert!(matches!(
+            cwd.components().next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::Disk(_))
+        ));
+        assert_eq!(std::fs::canonicalize(&cwd).unwrap(), canonical);
+        assert_eq!(std::fs::canonicalize(&scratch).unwrap(), canonical);
+    }
+
+    #[test]
+    fn renderer_cwd_keeps_verbatim_semantics_for_reserved_and_trailing_names() {
+        let holder = tempfile::tempdir().unwrap();
+        let canonical_holder = std::fs::canonicalize(holder.path()).unwrap();
+        let ordinary = canonical_holder.join("semantic");
+        std::fs::create_dir(&ordinary).unwrap();
+        for name in ["semantic.", "semantic ", "NUL"] {
+            let scratch = canonical_holder.join(name);
+            std::fs::create_dir(&scratch).expect("create exact verbatim directory");
+            let canonical = std::fs::canonicalize(&scratch).unwrap();
+            assert_eq!(canonical.file_name(), Some(OsStr::new(name)));
+            assert_eq!(
+                renderer_current_directory(&canonical),
+                wide(canonical.as_os_str()),
+                "ordinary CWD spelling must not redirect {name:?}"
+            );
+            assert_eq!(std::fs::canonicalize(&scratch).unwrap(), canonical);
+            std::fs::remove_dir(&canonical).unwrap();
+        }
+        assert!(std::fs::read_dir(ordinary).unwrap().next().is_none());
+    }
     use super::*;
 
     fn scan(root: &Path, max: u64) -> Result<(), std::io::Error> {
@@ -1250,6 +1458,30 @@ mod scratch_scan_tests {
         .unwrap_err();
         assert!(error.to_string().contains("observation budget"));
         assert_eq!(ticks, 5);
+    }
+
+    #[test]
+    fn scratch_directory_pin_rejects_a_replaced_observed_directory() {
+        let parent = tempfile::tempdir().unwrap();
+        let child = parent.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let (_metadata, observed) = open_scratch_entry(
+            &child,
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )
+        .unwrap();
+        drop(pin_scratch_directory(&child, Some(&observed)).unwrap());
+        // Attribute-only observations permit a name swap. A later strong open
+        // must reject the replacement even though it is also a regular directory.
+        std::fs::rename(&child, parent.path().join("moved-child")).unwrap();
+        std::fs::create_dir(&child).unwrap();
+        let error = pin_scratch_directory(&child, Some(&observed))
+            .err()
+            .expect("replacement must not inherit the observed directory identity");
+        assert!(error.to_string().contains("changed identity"));
+        // The rejected strong open releases its handle on the error path.
+        std::fs::rename(&child, parent.path().join("replacement")).unwrap();
     }
 
     #[test]

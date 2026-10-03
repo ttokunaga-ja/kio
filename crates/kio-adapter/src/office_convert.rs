@@ -993,7 +993,9 @@ fn renderer_environment(_program: &Path, home: Option<&Path>) -> Vec<(OsString, 
             }
         }
         #[cfg(windows)]
-        environment.push((OsString::from("USERPROFILE"), home.as_os_str().to_owned()));
+        for name in ["USERPROFILE", "LOCALAPPDATA"] {
+            environment.push((OsString::from(name), home.as_os_str().to_owned()));
+        }
     }
     environment
 }
@@ -2002,6 +2004,47 @@ mod tests {
                 "{version}"
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_renderer_environment_uses_only_private_profile_state() {
+        let program = Path::new(r"C:\Program Files\LibreOffice\program\soffice.exe");
+        let home = Path::new(r"C:\kio scratch\private プロファイル");
+        let environment = renderer_environment(program, Some(home));
+        for name in ["HOME", "USERPROFILE", "LOCALAPPDATA"] {
+            let values: Vec<_> = environment
+                .iter()
+                .filter(|(key, _)| key == name)
+                .map(|(_, value)| value.as_os_str())
+                .collect();
+            assert_eq!(values, vec![home.as_os_str()], "{name}");
+        }
+        // An exhaustive key allowlist rejects ambient credentials, proxies,
+        // and user state without mutating the process-wide test environment.
+        for (key, _) in &environment {
+            assert!(
+                [
+                    "SystemRoot",
+                    "WINDIR",
+                    "COMSPEC",
+                    "PATHEXT",
+                    "PATH",
+                    "HOME",
+                    "USERPROFILE",
+                    "LOCALAPPDATA",
+                ]
+                .iter()
+                .any(|allowed| key == *allowed),
+                "unexpected renderer environment key: {key:?}"
+            );
+        }
+        let without_home = renderer_environment(program, None);
+        assert!(without_home.iter().all(|(key, _)| {
+            !["HOME", "USERPROFILE", "LOCALAPPDATA"]
+                .iter()
+                .any(|name| key == name)
+        }));
     }
 
     #[cfg(target_os = "macos")]
