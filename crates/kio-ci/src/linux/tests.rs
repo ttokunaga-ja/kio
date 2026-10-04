@@ -317,6 +317,18 @@ fn residual_processes_refuse_export_after_bounded_polling() {
     assert!(fake.environment.is_empty());
 }
 #[test]
+fn cgroup_paths_preserve_linux_separators_on_every_test_host() {
+    let relative = Fake::cgroup();
+    assert_eq!(
+        membership_path(&relative, 1001, UNIT)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        format!("{ROOT}{relative}")
+    );
+}
+
+#[test]
 fn closed_unit_uid_and_membership_grammar() {
     for unit in ["foreign.scope", "kio-confinement-preflight-../x.scope"] {
         assert!(probe(&mut Fake::default(), 1001, unit).is_err());

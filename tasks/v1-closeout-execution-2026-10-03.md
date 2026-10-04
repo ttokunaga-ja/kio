@@ -1235,3 +1235,27 @@ jobは両matrix groupのsuccessだけを受け付ける集約gateにする。
 2-group条件不成立と提案の成立を確認する。次候補の実Windows libtest一覧でtargetごとのmultisetの
 非重複・全件一致、無指定filterの正式全体test実exit0、同一候補のhosted確認は別に必要である。
 準備checkや過去S4の局所成功を、次候補のCI・C2専用経路・51件受入の成功には数えない。
+
+凍結したS6候補`425665a852467acf1bafb21d888a452ec2eb6429`では、MacとLinuxの正式四工程と
+各OSの独立2回の配布物検証が実exit0で成功した。一方、Windowsはfmt・strict Clippyが成功した後、
+無指定filterの全workspace testが実exit101で終了した。Linux helperの共通mock18件のうち
+6件が失敗し、Windowsのrelease build・配布物・相補的一覧の工程は開始していない。
+事前環境検査と実行後のsource guardは成功しており、失敗rawと成功済み工程を候補別に保持した。
+証拠は`root-s6-windows-formal-failure-v1.json`、`root-mac-s6-formal-completion-425665a8-v1.json`、
+`root-mac-s6-package-completion-v1.json`、`root-linux-s6-collection-verification-v1.json`。
+
+追加診断ではLinux cgroupのパス生成にhost OSの`Path::join`を使用していたことが原因と確定した。
+Windows上で`/sys/fs/cgroup`直後へbackslashが入り、後続のLinux scope検査が拒否していた。
+回帰testを先に追加し、変更前のproduction sourceをWindowsのpinned Rust 1.98 MSVCでcompileして、
+共通mock全19件を無指定filter・default threadsで一度実行した。新規回帰を含む7件が実Red101となり、
+期待するslashと実backslashの差をrawに保存した。その後、Linux mountと検査済みrelative pathを
+Linux表記のまま結合する一箇所を修正した。同じ全19件のfresh Windows実行はGreen0になった。
+UID・unit・canonical path・resource・cleanup・exportの拒否条件やtest対象を弱めていない。
+MacでもLinux helper28件と変更していないSDK helper28件、kio-ci strict Clippy・fmtが実exit0となり、
+各実行前後のsource/Git/index guardが一致した。証拠は`s7-cgroup-path-windows-red-v1/`、
+`s7-cgroup-path-windows-green-v1/`、`mac-s7-cgroup-focused-v1/`とrootの`s7-cgroup-path-fix-root-v1/`。
+
+この局所Red→Greenは正式全体回帰の代替にはしない。是正と本記録を同じlogical commitへ含め、
+S7のSHA/tree・正本1659件・元の未追跡WIP132件を固定する。同じS7候補で3 OSの正式四工程と
+各2回の配布物検証、Windows相補的一覧、合成CI経路・securityを揃え直す。専用経路への適用と
+hosted CI/native/provider/local・固定51件の受入は引き続き未完了である。

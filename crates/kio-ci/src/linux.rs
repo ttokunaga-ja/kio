@@ -95,7 +95,7 @@ fn membership_path(relative: &str, uid: u32, unit: &str) -> Result<PathBuf> {
             && !relative.split('/').any(|p| p == "." || p == ".."),
         "probe did not enter its unique current-user scope",
     )?;
-    Ok(Path::new(ROOT).join(relative.trim_start_matches('/')))
+    Ok(PathBuf::from(format!("{ROOT}{relative}")))
 }
 fn fields(text: &str) -> Result<BTreeMap<&str, &str>> {
     let mut map = BTreeMap::new();
