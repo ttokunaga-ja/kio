@@ -314,16 +314,17 @@ fn same_installation(left: &ServiceManifest, right: &ServiceManifest) -> bool {
         && left.environment == right.environment
 }
 
-/// Complete a previously persisted install intent. This is deliberately
-/// idempotent: an interruption after either the manifest write or native
-/// registration can be resumed without replacing a service owned by somebody
-/// else.
+/// Complete an Installing intent after interruption, without replacing another
+/// owner's service. A completed installation is not an interrupted operation.
 fn recover_install<S: Scheduler>(
     store: &StoreDirectory,
     leaf: &Path,
     mut manifest: ServiceManifest,
     scheduler: &S,
 ) -> Result<Value> {
+    if manifest.phase != ServicePhase::Installing {
+        return Err(service_error("watch service is already installed"));
+    }
     match scheduler.inspect(&manifest)? {
         NativeRegistration::Absent => scheduler.install(&manifest)?,
         NativeRegistration::Owned => {}
@@ -378,17 +379,35 @@ fn mutate_existing(root_argument: Option<PathBuf>, lifecycle: Lifecycle) -> Resu
                     "watch root no longer exists; refusing to start service",
                 ));
             }
-            transition_checked(&scheduler, &manifest, lifecycle, registration)?;
+            transition_checked(
+                &scheduler,
+                &manifest,
+                lifecycle,
+                registration,
+                crate::watch_command::inspect_liveness,
+            )?;
             Ok(json!({"status":"start_requested", "service_id":manifest.id, "root":manifest.root}))
         }
         Lifecycle::Stop => {
             // Disable scheduler restart before asking the foreground instance to
             // stop; otherwise a failed process may be restarted during shutdown.
-            transition_checked(&scheduler, &manifest, lifecycle, registration)?;
+            transition_checked(
+                &scheduler,
+                &manifest,
+                lifecycle,
+                registration,
+                crate::watch_command::inspect_liveness,
+            )?;
             Ok(json!({"status":"stopped", "service_id":manifest.id, "root":manifest.root}))
         }
         Lifecycle::Uninstall => {
-            transition_checked(&scheduler, &manifest, lifecycle, registration)?;
+            transition_checked(
+                &scheduler,
+                &manifest,
+                lifecycle,
+                registration,
+                crate::watch_command::inspect_liveness,
+            )?;
             let bytes = serde_json::to_vec(&manifest).map_err(service_error)?;
             store.quarantine_then_remove(&leaf, &bytes, MAX_MANIFEST_BYTES)?;
             Ok(json!({"status":"uninstalled", "service_id":manifest.id, "root":manifest.root}))
@@ -401,6 +420,7 @@ fn transition_checked<S: Scheduler>(
     manifest: &ServiceManifest,
     lifecycle: Lifecycle,
     registration: NativeRegistration,
+    inspect_liveness: impl FnOnce(&Path) -> Result<Value>,
 ) -> Result<()> {
     if registration == NativeRegistration::Foreign {
         return Err(service_error(
@@ -411,7 +431,17 @@ fn transition_checked<S: Scheduler>(
         Lifecycle::Start if registration != NativeRegistration::Owned => Err(service_error(
             "native registration is absent; reinstall the watch service",
         )),
-        Lifecycle::Start => scheduler.start(manifest),
+        Lifecycle::Start => {
+            // The caller retains the service mutation lock across this check
+            // and the native command. Instance-lock liveness also detects a
+            // watcher still starting, before it publishes its state or PID.
+            let liveness = inspect_liveness(&manifest.root)?;
+            match liveness.get("status").and_then(Value::as_str) {
+                Some("stopped") => scheduler.start(manifest),
+                Some("running") => Err(service_error("watcher is already running")),
+                _ => Err(service_error("watch instance liveness is unavailable")),
+            }
+        }
         // A prior interrupted stop or uninstall can already have removed the
         // native registration. Both operations remain safe to retry.
         Lifecycle::Stop if registration == NativeRegistration::Absent => Ok(()),
@@ -1777,6 +1807,22 @@ mod tests {
         uninstalls: Cell<u8>,
     }
 
+    impl FakeScheduler {
+        fn owned() -> Self {
+            Self {
+                registration: RefCell::new(NativeRegistration::Owned),
+                install_fails: false,
+                start_fails: false,
+                stop_fails: false,
+                uninstall_fails: false,
+                installs: Cell::new(0),
+                starts: Cell::new(0),
+                stops: Cell::new(0),
+                uninstalls: Cell::new(0),
+            }
+        }
+    }
+
     impl Scheduler for FakeScheduler {
         fn inspect(&self, _: &ServiceManifest) -> Result<NativeRegistration> {
             Ok(*self.registration.borrow())
@@ -1988,6 +2034,7 @@ mod tests {
                 &manifest,
                 lifecycle,
                 fake.inspect(&manifest).unwrap(),
+                |_| Ok(json!({"status":"stopped", "last_observation":{"pid":std::process::id()}})),
             )
             .unwrap();
         }
@@ -2001,6 +2048,144 @@ mod tests {
             (1, 2, 1, 1)
         );
         assert_eq!(fake.inspect(&manifest).unwrap(), NativeRegistration::Absent);
+    }
+
+    #[test]
+    fn completed_duplicate_install_is_rejected_without_scheduler_or_manifest_mutation() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = StoreDirectory::open(&temp.path().canonicalize().unwrap()).unwrap();
+        let leaf = Path::new("service.json");
+        let mut manifest = manifest();
+        manifest.phase = ServicePhase::Installed;
+        write_manifest(&store, leaf, &manifest, Publication::CreateOnly).unwrap();
+        let before = store
+            .read_optional(leaf, MAX_MANIFEST_BYTES)
+            .unwrap()
+            .unwrap();
+        for registration in [NativeRegistration::Owned, NativeRegistration::Absent] {
+            let fake = FakeScheduler::owned();
+            *fake.registration.borrow_mut() = registration;
+            let error = recover_install(&store, leaf, manifest.clone(), &fake).unwrap_err();
+            assert!(error.to_string().contains("already installed"));
+            assert_eq!(fake.installs.get(), 0);
+            assert_eq!(fake.starts.get(), 0);
+            assert_eq!(fake.stops.get(), 0);
+            assert_eq!(fake.uninstalls.get(), 0);
+            assert_eq!(
+                store
+                    .read_optional(leaf, MAX_MANIFEST_BYTES)
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn interrupted_install_resumes_owned_or_absent_registration_and_refuses_foreign() {
+        for registration in [
+            NativeRegistration::Owned,
+            NativeRegistration::Absent,
+            NativeRegistration::Foreign,
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = StoreDirectory::open(&temp.path().canonicalize().unwrap()).unwrap();
+            let leaf = Path::new("service.json");
+            let manifest = manifest();
+            write_manifest(&store, leaf, &manifest, Publication::CreateOnly).unwrap();
+            let before = store
+                .read_optional(leaf, MAX_MANIFEST_BYTES)
+                .unwrap()
+                .unwrap();
+            let fake = FakeScheduler::owned();
+            *fake.registration.borrow_mut() = registration;
+            let result = recover_install(&store, leaf, manifest, &fake);
+            let bytes = store
+                .read_optional(leaf, MAX_MANIFEST_BYTES)
+                .unwrap()
+                .unwrap();
+            let stored: ServiceManifest = serde_json::from_slice(&bytes).unwrap();
+            match registration {
+                NativeRegistration::Owned | NativeRegistration::Absent => {
+                    assert_eq!(result.unwrap()["status"], "installed");
+                    assert_eq!(stored.phase, ServicePhase::Installed);
+                    assert_eq!(
+                        fake.installs.get(),
+                        u8::from(registration == NativeRegistration::Absent)
+                    );
+                    assert_eq!(fake.inspect(&stored).unwrap(), NativeRegistration::Owned);
+                }
+                NativeRegistration::Foreign => {
+                    assert!(result.unwrap_err().to_string().contains("foreign"));
+                    assert_eq!(stored.phase, ServicePhase::Installing);
+                    assert_eq!(bytes, before);
+                    assert_eq!(fake.installs.get(), 0);
+                }
+            }
+            assert_eq!(fake.starts.get(), 0);
+        }
+    }
+
+    #[test]
+    fn running_duplicate_start_is_rejected_without_scheduler_restart() {
+        let manifest = manifest();
+        let fake = FakeScheduler::owned();
+        let error = transition_checked(
+            &fake,
+            &manifest,
+            Lifecycle::Start,
+            NativeRegistration::Owned,
+            |root| {
+                assert_eq!(root, manifest.root);
+                // The authoritative held lock is running even before state/PID publication.
+                Ok(json!({"status":"running", "last_observation":null}))
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("already running"));
+        assert_eq!(fake.starts.get(), 0);
+    }
+
+    #[test]
+    fn start_refuses_liveness_inspection_error_without_scheduler_mutation() {
+        let manifest = manifest();
+        let fake = FakeScheduler::owned();
+        let error = transition_checked(
+            &fake,
+            &manifest,
+            Lifecycle::Start,
+            NativeRegistration::Owned,
+            |_| Err(service_error("synthetic instance lock inspection failure")),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("instance lock inspection failure")
+        );
+        assert_eq!(fake.starts.get(), 0);
+    }
+
+    #[test]
+    fn start_refuses_unknown_instance_liveness_without_scheduler_mutation() {
+        let manifest = manifest();
+        for liveness in [
+            json!({}),
+            json!({"status":"unknown"}),
+            json!({"status":null}),
+        ] {
+            let fake = FakeScheduler::owned();
+            let error = transition_checked(
+                &fake,
+                &manifest,
+                Lifecycle::Start,
+                NativeRegistration::Owned,
+                |_| Ok(liveness),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("instance liveness"));
+            assert_eq!(fake.starts.get(), 0);
+        }
     }
 
     #[test]
@@ -2022,7 +2207,8 @@ mod tests {
                 &fake,
                 &manifest,
                 Lifecycle::Start,
-                NativeRegistration::Owned
+                NativeRegistration::Owned,
+                |_| Ok(json!({"status":"stopped"})),
             )
             .is_err()
         );
@@ -2032,7 +2218,8 @@ mod tests {
                 &fake,
                 &manifest,
                 Lifecycle::Uninstall,
-                NativeRegistration::Foreign
+                NativeRegistration::Foreign,
+                |_| panic!("foreign registrations must not inspect liveness"),
             )
             .is_err()
         );

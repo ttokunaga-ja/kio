@@ -1146,3 +1146,57 @@ v4は固定Rust 1.98で関連13件が13 pass / 0 fail、無指定filterの全lib
 正式受入へ進む。上記のsource overlayによる局所成功は、新候補の3 OS全体回帰・配布物・
 正式受入の成功には数えない。account/key/SSHの本適用、push、Actions、provider/local外部呼出し、
 正式集計・release公開はこの段階でも未実行である。
+
+## 23. S4のローカル検証とhosted差分・専用経路の部分停止
+
+2026-10-05 JST記録。候補`c763a03743d3e7941063103b3a8bcdacc81cb92d`、tree
+`3a8acc2eb3e1af6312db0203b58eaf87d6288284`を固定し、Windows・WSL・Macでfmt、strict
+Clippy、全workspace/all-targets test、release buildを確認した。Macの容量制約による中断は
+保持し、同じsourceの後続release成功と区別して四工程を照合した。利用者が最低空きを10 GiBへ
+変更した後、3 OSそれぞれ独立2回のarchive一致と配布binaryの実試験も成功した。
+各OSのsummary行の合計は重複実行を含む観測数であり、固有test件数とは扱わない。
+証拠は`root-windows-s4-formal-four-stage-verification-v1.json`、
+`root-linux-s4-collection-verification-v1.json`、`root-mac-s4-formal-completion-v1.json`と
+各OSのpackage検証記録。製品差分のsecurity検証は候補0件だったが、全repository監査や
+外部backend identityの確認へ読み替えない。
+
+公開範囲・起動workflow・送信対象・hooks・WIP・ローカルgateを確認し、通常のmain pushを行った。
+同じ候補の[通常CI](https://github.com/ttokunaga-ja/kio/actions/runs/37214894712)、
+[native受入](https://github.com/ttokunaga-ja/kio/actions/runs/37215091986)を開始した。
+[CodeQL](https://github.com/ttokunaga-ja/kio/actions/runs/37214893976)と3 OSのnative archive作成は
+成功した。一方、以下の失敗が残り、42件のnative subsetも51件の正式受入も未完了である。
+
+- Linux通常CI/native prerequisite: namespace検証は成功した後、`busctl status`の資格情報取得が
+  `No such device or address`で停止した。user managerの直前確認は成功していたが、後続の実cgroup
+  resource probeは未実行。資格情報診断をbounded read-only Peer.Pingへ置換し、既存の実CPU・
+  memory・pids制限、cleanup、成功後のみのexportを維持する。局所8件は成功しており、hostedでの
+  enforcementは未確認。準備と適用証拠は`s4-linux-ci-bus-health-fix-preparation-v1/`と
+  `s5-linux-ci-bus-health-fix-applied-v1/`。
+- macOS通常CI: SHM回転2件のhook実行数が0だった。所有する新規TMPDIRの`/var` aliasを使うと
+  元の2件が同じassertionで実exit101となり、原因を実再現した。fixtureのSHM pathだけを既存の
+  macOS正規化へ揃え、回転数・retry・UnstableBusyの条件を維持した。関連2件とkio-index全168件が
+  成功。製品のpath安全性検査は変更していない。証拠は`s5-registry-shm-test-fix-v1/`。
+- macOS native service: 拒否されるべき操作の成功をevaluatorが検出した。rawには操作名がなく、
+  特定の呼出しを断定しない。現行契約はInstalling intentの回復と複数起動競合の拒否を要求する。
+  Installed済みmanifestの重複installと、稼働中の重複startに対する製品側のguardを是正する。
+  evaluatorの拒否assertionは緩和しない。局所Redは20件中4件が意図した失敗となり、guard是正後は20件が成功した。Installing回復、foreign拒否、稼働確認error/unknownの拒否、停止後の再起動を維持した。全体回帰と後続native試験は未完了である。
+
+専用Windows/WSL経路は、元のconfig/keyと既存のsource22・空runtimeを再照合し、fresh generationの
+直前状態・native parser・PowerShell Decimal時間判定を確認してから実行した。両5分rollbackは
+実際にarmされた。しかしWindows専用user作成後、native CreateProfileがHRESULT `0x800706F7`で
+停止した。Windows account phaseの実exitは1、raw捕捉は完了している。WSL/Windowsのconfig/key
+適用、13経路probe、ACKには進んでいない。config-only rollbackは解除せず、作成途中のaccountを
+保持する。後続の独立readbackではWindows taskが予定時刻に実行されLastTaskResult 0、次回なしで、
+両OSのconfig/keyは元のhash・metadata、WSLの元inodeを維持し、既存SSH serviceも稼働していた。
+WSLのunit消失・既定ExecMainStatus 0だけではrollback実exitを証明しないため、保存されたtimer-resultの
+照合は別に残す。新規accountはUsers-onlyのSID末尾1008で、元の7 accountに欠落・変更はなく、
+Windows Security event 4720（record 245092）が当該実行中の管理者による作成を示した。
+同SIDのRegistry/CIM profileは不在だった。未結合の物理profile pathを推測して検査・削除していない。
+CreateProfileのbuffer容量は診断候補であり、MAX_PATH制約や原因解消を実証済みとは扱わない。
+証拠は`root-c2-s4-final-issuance-execution-v2/`、`c2-s4-critical-route-results-v3/`。
+post-rollback証拠は`root-c2-s4-partial-account-post-rollback-readonly-v2/`。
+以前の準備失敗・未使用activation・expired task・backup・rawは上書きせず保持した。
+
+provider/local workflow、予算台帳の初期化・予約、有料API、GPU/lease、正式集約、release公開は
+未実行。是正をまとめた後の候補SHA/treeで全体回帰・配布物・securityとhosted gateを照合し、
+成功した候補のarchiveだけで残りの9件と固定51件のverifierへ進む。
