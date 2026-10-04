@@ -10,11 +10,12 @@ use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{self, Cursor, Read, Write},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     process::Command,
 };
 
 use flate2::{Compression, GzBuilder, read::GzDecoder};
+use kio_core::{private_fs::verify_private_creation_parent, store_dir::StoreDirectory};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -805,20 +806,18 @@ pub fn verify_candidate(options: &VerifyCandidateOptions) -> Result<VerifySummar
 
 pub fn smoke_candidate(options: &SmokeCandidateOptions) -> Result<SmokeSummary, ReleaseError> {
     let verified = verify_candidate(&options.verify)?;
-    create_empty_dir(&options.work_dir)?;
+    let fixture = SmokeFixture::prepare(&options.work_dir)?;
     let archive = bounded_bytes(&options.verify.archive, MAX_ARCHIVE)?;
     let files = read_archive(&archive)?;
     for (name, bytes) in &files {
         let relative = Path::new(name);
-        let destination = options.work_dir.join(relative);
-        if !destination.starts_with(&options.work_dir) {
+        let destination = fixture.path().join(relative);
+        if !destination.starts_with(fixture.path()) {
             return Err(ReleaseError::Verify(
                 "extraction escaped destination".into(),
             ));
         }
-        if let Some(parent) = destination.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        fixture.prepare_extraction_parent(relative)?;
         create_new_bytes(&destination, bytes)?;
         if name.ends_with(&format!(
             "/bin/{}",
@@ -827,18 +826,12 @@ pub fn smoke_candidate(options: &SmokeCandidateOptions) -> Result<SmokeSummary, 
             set_executable(&destination)?;
         }
     }
-    let binary = options
-        .work_dir
+    let binary = fixture
+        .path()
         .join(&verified.root)
         .join("bin")
         .join(binary_name_for_target(&verified.binding.target));
-    let isolated = options.work_dir.join("isolated");
-    fs::create_dir_all(&isolated)?;
-    for name in ["xdg-config", "xdg-data", "xdg-cache", "tmp"] {
-        fs::create_dir_all(isolated.join(name))?;
-    }
-    let scope = isolated.join("manual-scope");
-    fs::create_dir_all(&scope)?;
+    let (isolated, scope) = fixture.prepare_environment()?;
     fs::write(scope.join("release-smoke.txt"), b"release smoke marker\n")?;
     let mut base = Command::new(&binary);
     smoke_env(&mut base, &isolated)?;
@@ -2794,6 +2787,149 @@ fn require_regular(path: &Path, max: u64) -> Result<(), ReleaseError> {
     }
     Ok(())
 }
+// Keep smoke fixture preparation separate from the child commands so its
+// filesystem policy can be checked without executing an extracted binary.
+struct SmokeFixture {
+    root: StoreDirectory,
+}
+
+impl SmokeFixture {
+    fn prepare(path: &Path) -> Result<Self, ReleaseError> {
+        let current_dir = if path.is_absolute() {
+            PathBuf::new()
+        } else {
+            env::current_dir()?
+        };
+        Self::prepare_at(path, &current_dir)
+    }
+
+    fn prepare_at(path: &Path, current_dir: &Path) -> Result<Self, ReleaseError> {
+        #[cfg(windows)]
+        if !path.is_absolute()
+            && (path.has_root() || matches!(path.components().next(), Some(Component::Prefix(_))))
+        {
+            return Err(ReleaseError::Invalid(
+                "smoke work path has an ambiguous Windows drive or root".into(),
+            ));
+        }
+        let prefix = if path.is_absolute() {
+            Path::new("")
+        } else {
+            if !current_dir.is_absolute() {
+                return Err(ReleaseError::Invalid(
+                    "smoke work path must resolve to an absolute path".into(),
+                ));
+            }
+            current_dir
+        };
+        let mut existing = PathBuf::new();
+        let mut missing = PathBuf::new();
+        // Inspect raw components before joining. Windows verbatim PathBuf
+        // joins normalize .., so joining the whole input would erase prefixes
+        // that must be checked for missing, symlinked, or unsafe directories.
+        for component in prefix.components().chain(path.components()) {
+            match component {
+                Component::Prefix(_) | Component::RootDir => existing.push(component.as_os_str()),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !missing.as_os_str().is_empty() {
+                        return Err(ReleaseError::Invalid(
+                            "smoke work path cannot traverse a missing parent".into(),
+                        ));
+                    }
+                    // Check the prefix before normalizing it away. This keeps
+                    // an unsafe directory or ancestor from being hidden by .. .
+                    verify_private_creation_parent(&existing).map_err(smoke_fixture_error)?;
+                    existing.pop();
+                }
+                Component::Normal(name) => {
+                    // A verbatim Windows component can contain literal '/',
+                    // but PathBuf::push reparses it as a separator. Refuse that
+                    // ambiguous spelling before either join or suffix push.
+                    #[cfg(windows)]
+                    if name.as_encoded_bytes().contains(&b'/') {
+                        return Err(ReleaseError::Invalid(
+                            "smoke work path contains a mixed slash Windows component".into(),
+                        ));
+                    }
+                    if !missing.as_os_str().is_empty() {
+                        missing.push(name);
+                        continue;
+                    }
+                    let next = existing.join(name);
+                    match fs::symlink_metadata(&next) {
+                        Ok(metadata) => {
+                            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                                return Err(ReleaseError::Invalid(format!(
+                                    "smoke work path is not a real directory: {}",
+                                    next.display(),
+                                )));
+                            }
+                            existing = next;
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => missing.push(name),
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+        }
+        // Verify the whole selected parent, letting core apply its ancestor
+        // policy (including root-owned sticky temporary ancestors) unchanged.
+        let parent = verify_private_creation_parent(&existing).map_err(smoke_fixture_error)?;
+        let root = if missing.as_os_str().is_empty() {
+            parent
+        } else {
+            let directory = parent
+                .create_directory_all(&missing)
+                .map_err(smoke_fixture_error)?;
+            StoreDirectory::from_retained(directory, existing.join(&missing))
+                .map_err(smoke_fixture_error)?
+        };
+        if !root
+            .entries(Path::new(""))
+            .map_err(smoke_fixture_error)?
+            .is_empty()
+        {
+            return Err(ReleaseError::Invalid(format!(
+                "smoke work directory exists and is nonempty: {}",
+                root.path().display(),
+            )));
+        }
+        Ok(Self { root })
+    }
+
+    fn path(&self) -> &Path {
+        self.root.path()
+    }
+
+    fn create_directory_all(&self, relative: &Path) -> Result<PathBuf, ReleaseError> {
+        self.root
+            .create_directory_all(relative)
+            .map_err(smoke_fixture_error)?;
+        Ok(self.path().join(relative))
+    }
+
+    fn prepare_extraction_parent(&self, relative: &Path) -> Result<(), ReleaseError> {
+        if let Some(parent) = relative.parent() {
+            self.create_directory_all(parent)?;
+        }
+        Ok(())
+    }
+
+    fn prepare_environment(&self) -> Result<(PathBuf, PathBuf), ReleaseError> {
+        let isolated = self.create_directory_all(Path::new("isolated"))?;
+        for name in ["xdg-config", "xdg-data", "xdg-cache", "tmp", "manual-scope"] {
+            self.create_directory_all(&Path::new("isolated").join(name))?;
+        }
+        let scope = isolated.join("manual-scope");
+        Ok((isolated, scope))
+    }
+}
+
+fn smoke_fixture_error(error: kio_core::KioError) -> ReleaseError {
+    ReleaseError::Verify(format!("smoke fixture: {error}"))
+}
+
 fn create_empty_dir(path: &Path) -> Result<(), ReleaseError> {
     if path.exists() {
         let metadata = fs::symlink_metadata(path)?;
@@ -3151,6 +3287,463 @@ fn run_smoke_in(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn smoke_test_tempdir() -> TempDir {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir()
+                .unwrap()
+        }
+        #[cfg(not(unix))]
+        {
+            tempfile::tempdir().unwrap()
+        }
+    }
+
+    fn assert_smoke_fixture_directories(fixture: &SmokeFixture, private_root: bool) {
+        let package = Path::new("candidate/bin/kio");
+        fixture.prepare_extraction_parent(package).unwrap();
+        let (isolated, scope) = fixture.prepare_environment().unwrap();
+        assert_eq!(isolated, fixture.path().join("isolated"));
+        assert_eq!(scope, isolated.join("manual-scope"));
+        let directories = [
+            "candidate",
+            "candidate/bin",
+            "isolated",
+            "isolated/xdg-config",
+            "isolated/xdg-data",
+            "isolated/xdg-cache",
+            "isolated/tmp",
+            "isolated/manual-scope",
+        ];
+        for relative in directories {
+            assert_smoke_private_directory(&fixture.path().join(relative));
+        }
+        if private_root {
+            assert_smoke_private_directory(fixture.path());
+        }
+        // This is the creation-parent policy used by init for its .kio child.
+        kio_core::private_fs::verify_private_creation_parent(&scope).unwrap();
+        let extracted = fixture.path().join(package);
+        create_new_bytes(&extracted, b"first extraction").unwrap();
+        assert!(create_new_bytes(&extracted, b"replacement").is_err());
+        assert_eq!(fs::read(extracted).unwrap(), b"first extraction");
+    }
+
+    fn assert_smoke_private_directory(path: &Path) {
+        kio_core::private_fs::verify_private_directory(path).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    #[test]
+    fn smoke_fixture_preserves_create_only_directory_and_file_policy() {
+        let temp = smoke_test_tempdir();
+        let base = temp.path().canonicalize().unwrap();
+        let work = base.join("work");
+        let fixture = SmokeFixture::prepare(&work).unwrap();
+        assert_smoke_fixture_directories(&fixture, true);
+        assert!(SmokeFixture::prepare(&work).is_err());
+        assert_eq!(
+            fs::read(work.join("candidate/bin/kio")).unwrap(),
+            b"first extraction"
+        );
+    }
+
+    #[test]
+    fn smoke_fixture_rejects_nonempty_directory_without_changes() {
+        let temp = smoke_test_tempdir();
+        let work = temp.path().canonicalize().unwrap().join("work");
+        fs::create_dir(&work).unwrap();
+        fs::write(work.join("existing"), b"protected").unwrap();
+        assert!(SmokeFixture::prepare(&work).is_err());
+        assert_eq!(fs::read(work.join("existing")).unwrap(), b"protected");
+        assert_eq!(fs::read_dir(work).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_fixture_is_private_for_restrictive_and_permissive_umasks() {
+        for mask in ["077", "002"] {
+            for relative in [false, true] {
+                let temp = smoke_test_tempdir();
+                let base = temp.path().canonicalize().unwrap();
+                let output = Command::new(env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "release::tests::smoke_fixture_umask_child",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .current_dir(&base)
+                    .env("KIO_RELEASE_SMOKE_TEST_UMASK", mask)
+                    .env("KIO_RELEASE_SMOKE_TEST_ROOT", &base)
+                    .env(
+                        "KIO_RELEASE_SMOKE_TEST_RELATIVE",
+                        if relative { "1" } else { "0" },
+                    )
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "smoke fixture child failed for umask {mask}, relative={relative}:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr),
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_fixture_umask_child() {
+        let Ok(mask) = env::var("KIO_RELEASE_SMOKE_TEST_UMASK") else {
+            return;
+        };
+        // Only this isolated, single-test child changes umask. The Cargo test
+        // process and its concurrently running tests retain their own umask.
+        let mask = libc::mode_t::from_str_radix(&mask, 8).unwrap();
+        // SAFETY: umask takes a value and has no memory-safety preconditions.
+        unsafe { libc::umask(mask) };
+        let base = PathBuf::from(env::var_os("KIO_RELEASE_SMOKE_TEST_ROOT").unwrap());
+        let relative = Path::new("new-parent/nested/work");
+        let work = if env::var("KIO_RELEASE_SMOKE_TEST_RELATIVE").unwrap() == "1" {
+            relative.to_path_buf()
+        } else {
+            base.join(relative)
+        };
+        let fixture = SmokeFixture::prepare(&work).unwrap();
+        assert_eq!(fixture.path(), base.join(relative));
+        assert_smoke_private_directory(&base.join("new-parent"));
+        assert_smoke_private_directory(&base.join("new-parent/nested"));
+        assert_smoke_fixture_directories(&fixture, true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_fixture_preserves_empty_trusted_shared_read_work_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = smoke_test_tempdir();
+        let work = temp.path().canonicalize().unwrap().join("work");
+        fs::create_dir(&work).unwrap();
+        fs::set_permissions(&work, fs::Permissions::from_mode(0o755)).unwrap();
+        let fixture = SmokeFixture::prepare(&work).unwrap();
+        assert_eq!(
+            fs::metadata(&work).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_smoke_fixture_directories(&fixture, false);
+        assert_eq!(
+            fs::metadata(work).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_fixture_rejects_unsafe_work_directory_and_ancestor_without_repair() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = smoke_test_tempdir();
+        let unsafe_dir = temp.path().canonicalize().unwrap().join("unsafe");
+        fs::create_dir(&unsafe_dir).unwrap();
+        fs::set_permissions(&unsafe_dir, fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(SmokeFixture::prepare(&unsafe_dir).is_err());
+        assert!(SmokeFixture::prepare(&unsafe_dir.join("new-work")).is_err());
+        assert_eq!(
+            fs::metadata(&unsafe_dir).unwrap().permissions().mode() & 0o777,
+            0o775
+        );
+        assert_eq!(fs::read_dir(unsafe_dir).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_fixture_rejects_symlink_work_directory_and_ancestor_without_changes() {
+        use std::os::unix::fs::symlink;
+        let temp = smoke_test_tempdir();
+        let base = temp.path().canonicalize().unwrap();
+        let target = base.join("target");
+        fs::create_dir(&target).unwrap();
+        let linked = base.join("linked");
+        symlink(&target, &linked).unwrap();
+        assert!(SmokeFixture::prepare(&linked).is_err());
+        assert!(SmokeFixture::prepare(&linked.join("new-work")).is_err());
+        assert_eq!(fs::read_link(linked).unwrap(), target);
+        assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    fn run_smoke_fixture_path_case(case: &str) {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt, symlink};
+        let temp = smoke_test_tempdir();
+        let base = temp.path().canonicalize().unwrap();
+        for name in ["existing-private", "private-parent", "target", "unsafe"] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(base.join(name))
+                .unwrap();
+        }
+        fs::set_permissions(base.join("unsafe"), fs::Permissions::from_mode(0o775)).unwrap();
+        symlink(base.join("target"), base.join("linked")).unwrap();
+        let current = if case == "parent-existing" {
+            base.join("existing-private")
+        } else {
+            base.clone()
+        };
+        let output = Command::new(env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "release::tests::smoke_fixture_path_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .current_dir(current)
+            .env("KIO_RELEASE_SMOKE_TEST_ROOT", &base)
+            .env("KIO_RELEASE_SMOKE_TEST_PATH_CASE", case)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "smoke fixture path child failed for {case}:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_fixture_supports_parent_relative_existing_private_parent() {
+        run_smoke_fixture_path_case("parent-existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_fixture_supports_existing_private_prefix_before_parent_component() {
+        run_smoke_fixture_path_case("existing-parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_fixture_rejects_unsafe_prefix_before_parent_component_without_repair() {
+        run_smoke_fixture_path_case("unsafe-parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_fixture_rejects_symlink_prefix_before_parent_component_without_changes() {
+        run_smoke_fixture_path_case("symlink-parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_fixture_rejects_missing_prefix_before_parent_component_without_creation() {
+        run_smoke_fixture_path_case("missing-parent");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn smoke_fixture_path_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let Ok(case) = env::var("KIO_RELEASE_SMOKE_TEST_PATH_CASE") else {
+            return;
+        };
+        let base = PathBuf::from(env::var_os("KIO_RELEASE_SMOKE_TEST_ROOT").unwrap());
+        let (input, expected) = match case.as_str() {
+            "parent-existing" => (
+                "../private-parent/leaf",
+                Some(base.join("private-parent/leaf")),
+            ),
+            "existing-parent" => ("existing-private/../newleaf", Some(base.join("newleaf"))),
+            "unsafe-parent" => ("unsafe/../newleaf", None),
+            "symlink-parent" => ("linked/../newleaf", None),
+            "missing-parent" => ("missing/../work", None),
+            _ => panic!("unknown smoke fixture path case"),
+        };
+        let prepared = SmokeFixture::prepare(Path::new(input));
+        if let Some(expected) = expected {
+            let fixture = prepared.unwrap();
+            assert_eq!(fixture.path(), expected);
+            assert_smoke_fixture_directories(&fixture, true);
+        } else {
+            assert!(prepared.is_err(), "unsafe work path accepted: {input}");
+            assert!(!base.join("newleaf").exists());
+            assert!(!base.join("work").exists());
+            assert!(!base.join("missing").exists());
+            assert_eq!(fs::read_dir(&base).unwrap().count(), 5);
+        }
+        for name in ["existing-private", "private-parent", "target"] {
+            assert_eq!(
+                fs::metadata(base.join(name)).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(
+            fs::metadata(base.join("unsafe"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775
+        );
+        assert_eq!(
+            fs::read_link(base.join("linked")).unwrap(),
+            base.join("target")
+        );
+        for name in ["existing-private", "target", "unsafe"] {
+            assert_eq!(fs::read_dir(base.join(name)).unwrap().count(), 0);
+        }
+    }
+
+    #[cfg(windows)]
+    fn smoke_fixture_windows_verbatim_base() -> (TempDir, PathBuf, StoreDirectory) {
+        let temp = smoke_test_tempdir();
+        let base = temp.path().canonicalize().unwrap();
+        assert!(matches!(
+            base.components().next(),
+            Some(Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
+        ));
+        let parent = verify_private_creation_parent(&base).unwrap();
+        (temp, base, parent)
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn smoke_fixture_windows_verbatim_cwd_rejects_missing_parent_without_creation() {
+        let (_temp, base, _parent) = smoke_fixture_windows_verbatim_base();
+        let prepared = SmokeFixture::prepare_at(Path::new("missing/../work"), &base);
+        assert!(
+            prepared.is_err(),
+            "missing prefix was normalized away before validation"
+        );
+        assert!(!base.join("missing").exists());
+        assert!(!base.join("work").exists());
+        assert_eq!(fs::read_dir(base).unwrap().count(), 0);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn smoke_fixture_windows_verbatim_cwd_supports_existing_private_parent() {
+        let (_temp, base, parent) = smoke_fixture_windows_verbatim_base();
+        parent
+            .create_directory(Path::new("existing-private"))
+            .unwrap();
+        let fixture =
+            SmokeFixture::prepare_at(Path::new("existing-private/../leaf"), &base).unwrap();
+        assert_eq!(fixture.path(), base.join("leaf"));
+        assert_smoke_fixture_directories(&fixture, true);
+        assert_smoke_private_directory(&base.join("existing-private"));
+        assert_eq!(
+            fs::read_dir(base.join("existing-private")).unwrap().count(),
+            0
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn smoke_fixture_windows_verbatim_cwd_rejects_file_prefix_without_changes() {
+        let (_temp, base, _parent) = smoke_fixture_windows_verbatim_base();
+        fs::write(base.join("existing-file"), b"protected").unwrap();
+        let prepared = SmokeFixture::prepare_at(Path::new("existing-file/../work"), &base);
+        assert!(
+            prepared.is_err(),
+            "file prefix was normalized away before validation"
+        );
+        assert!(!base.join("work").exists());
+        assert_eq!(fs::read(base.join("existing-file")).unwrap(), b"protected");
+        assert_eq!(fs::read_dir(base).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn smoke_fixture_windows_verbatim_cwd_rejects_unsafe_prefix_without_repair() {
+        use std::{
+            os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+            ptr,
+        };
+        use windows_sys::Win32::{
+            Foundation::HANDLE,
+            Security::{
+                Authorization::{SE_FILE_OBJECT, SetSecurityInfo},
+                DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+            },
+            Storage::FileSystem::{
+                FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+            },
+        };
+        let (_temp, base, parent) = smoke_fixture_windows_verbatim_base();
+        parent.create_directory(Path::new("unsafe")).unwrap();
+        let unsafe_path = base.join("unsafe");
+        let fixture = OpenOptions::new()
+            .read(true)
+            .access_mode(FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(&unsafe_path)
+            .unwrap();
+        // Only this newly owned test directory receives a null DACL, which
+        // grants access to untrusted principals. No existing user path changes.
+        // SAFETY: the handle stays live and a null DACL is a supported input.
+        let status = unsafe {
+            SetSecurityInfo(
+                fixture.as_raw_handle() as HANDLE,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, 0, "cannot create unsafe DACL fixture");
+        assert!(verify_private_creation_parent(&unsafe_path).is_err());
+        let prepared = SmokeFixture::prepare_at(Path::new("unsafe/../work"), &base);
+        assert!(
+            prepared.is_err(),
+            "unsafe prefix was normalized away before validation"
+        );
+        assert!(verify_private_creation_parent(&unsafe_path).is_err());
+        assert!(!base.join("work").exists());
+        assert_eq!(fs::read_dir(&unsafe_path).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(base).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn smoke_fixture_windows_verbatim_cwd_rejects_mixed_slash_verbatim_prefix_without_creation() {
+        let (_temp, base, parent) = smoke_fixture_windows_verbatim_base();
+        parent.create_directory(Path::new("existing")).unwrap();
+        // Append the raw spelling without Path::join, which would already
+        // normalize the missing prefix away for a verbatim path.
+        let mut raw = base.as_os_str().to_os_string();
+        raw.push(r"\missing/../existing\leaf");
+        let input = PathBuf::from(raw);
+        assert!(input.is_absolute());
+        assert!(input.components().any(|component| matches!(
+            component,
+            Component::Normal(name) if name.as_encoded_bytes().contains(&b'/')
+        )));
+        let prepared = SmokeFixture::prepare(&input);
+        assert!(
+            prepared.is_err(),
+            "mixed slash verbatim prefix was normalized away before validation"
+        );
+        assert!(!base.join("missing").exists());
+        assert!(!base.join("existing/leaf").exists());
+        assert_smoke_private_directory(&base.join("existing"));
+        assert_eq!(fs::read_dir(base.join("existing")).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(base).unwrap().count(), 1);
+    }
+
     fn binding() -> Binding {
         Binding {
             version: RC_VERSION.into(),

@@ -1022,8 +1022,127 @@ v3は子processだけに`-ExecutionPolicy Bypass`を指定し、persistent host 
 10件の準備物testは成功したが、v3のnative selftestと配布物試験は未実行である。
 旧packetの失敗とraw receiptを保持し、新候補に再生成してから実行する。
 
-Mac空き容量は現在約2.4 GiBで、配布物/native試験の18 GiB開始基準を下回る。
+この記録時点のMac空き容量は約2.4 GiBで、配布物/native試験の18 GiB開始基準を下回る。
 復元した証拠・source・bundle・compiled proofを削除していない。A03/A11のserviceは正式CI待ちで、
 localで`GITHUB_ACTIONS=true`を装っていない。account/key/SSHの本適用、push、Actions、
 provider/local外部呼出し、正式集計・release公開は未実行。A08是正と直接関連する文書をcommitした後、
 repo外で新候補SHA/treeを固定し、同一候補の3 OS全回帰・配布物・security・専用経路・正式受入を揃える。
+
+## 22. S3の回帰結果と配布物smoke fixtureの追加是正
+
+2026-10-04記録。候補S3は`03a2bcdcc62fa8991acfc7736df8be43d72d5f30`、
+treeは`a778ef30e2f01278439e463336078c4a447a5587`、trackedは1,655件。
+利用者の復元後、元132件の未追跡WIPの内容・mode・mtime・inode・deviceと候補bundleを
+再照合し、一致を確認した。Macの空き容量も開始基準18 GiBを上回った。
+
+S3のWindows・WSLではfmt、workspace/all-targets strict Clippy、無指定filterの
+全workspace/all-targets test、locked release buildがすべて実exit0だった。
+Windowsは2,923 pass / 0 fail / 1 ignored、WSLは3,222 pass / 0 fail / 1 ignored。
+外側SSHの実exit0、各commandのraw出力、tracked bytes/Git mode/blob/index/HEADの
+前後一致を回収した。WSLではUnix physical modeも照合した。証拠は`windows-candidate-workspace-runner-s3-v2/`と
+`linux-s3-workspace-v2/`。S3差分のsecurity scanもsealed・未解決0件で完了した。
+これらはS3の証拠であり、以後の修正候補の全体回帰・security成功へ読み替えない。
+
+Linux S3配布物は17工程のうち001〜011が実exit0で、最初のarchiveの候補照合も成功した。
+012の`release-smoke-1`は実exit1、展開した製品の`init`は実exit4で停止した。
+errorは`KIO-E-PRIVATE-FILE-UNSAFE-001`で、試験ツール自身が作ったsmokeの
+work/isolated/XDG/tmp/manual-scope ancestryが0775だった。
+`release.rs`の`create_dir_all`がcallerのumaskに依存し、`IsolatedChildEnvironment`は
+環境変数だけを設定していた。coreの所有・他者書込検査は正しく拒否している。
+この実行と以前の成功実行の実umaskは記録されておらず、後から読んだ値で補っていない。
+013〜017と2回目archiveは未実行で、再現性・配布物成功とは扱わない。
+外側SSHの実exit1、失敗raw、全1,655件のsource/mode/blob/index一致は
+`linux-s3-package-v1/execution-20261004T050108Z/`へ保存した。
+
+是正は候補所有のsmoke fixture準備に限定する。新規directoryは既存のretained directory
+primitiveでowner-privateに作り、既存の安全な空directoryは権限を変更せず利用する。
+unsafe/symlink/nonemptyな既存directoryやancestorを修復して通さない。
+別processのumask 077/002、create-only、既存directory不変の回帰を先に用意し、
+意図した失敗を確認してから実装する。coreの検査、archive照合、CLI smokeの内容、51件の
+必須matrixは維持する。TDDと実装修正はこの記録時点では未完了。
+
+再現試験の最初の起動はcwd指定漏れでCargo.tomlを見つけられず実exit101となり、
+compile/testは行われなかった。次の試行はテスト用TempDir自体がcallerのumaskに依存し、
+077の比較条件も成立しなかった。この2試行のrawを保持し、新規のテストrootを生成時0700に
+限定したv3で再現をやり直した。v3はcompile後13件中3 pass / 10 fail、実exit101で、
+077のabsolute/relative子processが成功した後に002の新規parentのowner-only検査が失敗した。
+試験自身のcwd・実umask 0002・唯一のsource overlay・全1,655件のguardも回収した。
+証拠は`release-smoke-private-fixture-tdd-v1/red-native-v3/`。
+
+最初の修正案はWSLの追加13件が実exit0で成功した。一方、差分確認でWindowsのverbatim cwdに
+relative pathをjoinすると、検査前に`..`が正規化され、missing/unsafe prefixを隠せる問題が
+見つかった。全library試験は自身のprocess groupだけを停止し、子の実return -15・外側SSH exit241を
+中断として保持した。Clippy/fmtは未開始である。旧案の局所Greenを最終修正の成功に読み替えず、
+Windowsの追加再現試験と入力componentを検査前に消さない修正を進める。
+この時点ではmainの製品sourceにまだ適用していない。
+
+WindowsのRed v2は固定Rust 1.98 MSVCでcompile後、5件中1 pass / 4 fail、
+Cargoと外側SSHの実exit101だった。既存の安全なparentを使う正常例が成功し、
+missing/file/unsafe prefixを`..`で隠す3例と、verbatim path内の混在separatorを使う1例が
+意図したassertionで失敗した。compiler/起動失敗とは区別し、6工程の実exit、2子processの
+前後source guard、42件の環境名配列、21件のraw captureを独立照合した。
+証拠は`windows-release-smoke-tdd-plan-v2/receipts/root-red-v2-verification.json`。
+この再現結果を根拠に2回目の修正案を作成し、同じWindowsの関連7件とWSLの回帰で検証する。
+
+2回目の修正案は、入力componentをjoin前に検査し、Windowsの曖昧なdrive/root-relative
+入力と、verbatim component内の混在separatorを拒否する。既存テストは変更せず保持した。
+Windows Greenの最初の起動はPowerShellの実行指定漏れで`common.ps1`の読込み前に実exit1で
+停止し、testは未実行だった。失敗記録を保持し、既存の`workspace.cmd`と同じprocess限定の
+`-ExecutionPolicy Bypass`を指定したfresh runnerで再実行した。永続policyは変更していない。
+再実行は5工程と2子processがすべて実exit0、関連7件が7 pass / 0 failだった。
+前後の全1,655件のsource guard、42件の環境名配列、21件のraw captureも独立照合した。
+証拠は`windows-release-smoke-tdd-plan-v2/green-input-extension-v2/receipts/root-green-v2-verification.json`。
+これはsource overlayの局所検証であり、次の候補のWindows全体回帰・配布物成功には数えない。
+WSLでは同じ修正案の関連13件が13 pass / 0 fail、実exit0だった。
+親・子の実umaskは0002、全1,655件の前後guardも一致した。
+続く無指定filterの全library検証は484 pass / 1 fail / 0 ignored、実exit101だった。
+唯一の失敗は既存の`acceptance_failure::tests::device_new_restricts_group_writable_scenario_ancestor`で、
+試験のfixture ancestry事前条件を満たしていなかった。読取り診断で検証用checkoutの
+repo/crates/kio-evalまでの3 directoryが0775、所有者1001だったことを確認した。
+上位の新規検証root・`.cache`は0700、homeは0750である。coreが他者書込可能な祖先を拒否した結果で、
+このtestやcoreの条件を変更して通さない。全libraryの子umaskは0022、親は0002のままで、
+失敗後のsource guardも一致した。外側SSHの実exitは1、Clippy/fmtは未開始である。
+失敗したcheckout/TMP/rawを保持し、既存directoryをchmodせず、同一sourceの安全な新規checkoutで
+4工程を検証し直す。mainの製品sourceへはまだ適用していない。
+
+Mac S3はfmtとstrict Clippyが実exit0だった。追加の製品変更が必要となったため、
+全体test中に自身のprocess groupだけをSIGTERMで停止した。外側実exitは143、
+testの完了receiptはなく、releaseは未実行。これは中断でありtestのpass/failへ加算しない。
+partial rawと終了記録を保持し、停止後の全1,655件のsource/mode/blob/index/HEAD一致も
+独立照合した。証拠は`mac-s3-workspace-v1/`。
+
+Windows配布物のpre-Cargo selftestでは、PowerShell 5.1が環境名の配列をnested receiptへ
+wrapper objectとして保存する別の検証ツール不備も判明した。外部runner v2はtyped arrayを
+直接記録し、collectorは文字列配列・別captureとの完全一致・必須名と禁止名を検査する。
+nativeの小さなserialization再現試験と14件のローカルtestが成功した。
+新runnerもfresh S3 cloneでpre-Cargo selftestまで実行し、6工程・5子process・各source guardが
+すべて実exit0だった。各子processの42件の環境名は文字列配列で、別captureと完全一致した。
+回収した56 fileのsize/hashと12件の外側raw hashを独立照合した。
+これはrunnerの診断成功であり、Cargo・配布物は実行していない。
+証拠は`windows-s3-distribution-runner-v2/receipts/root-native-selftest-verification.json`。
+旧失敗packet/receiptは保持し、次の候補にはbundle/freeze/runnerを再生成する。
+
+新規WSL checkoutの準備でも2件の手順不備を記録した。最初はumaskの重複読取りで
+作成前に停止し、次はGit cloneだけに0022を指定してcheckoutに指定していなかったため、
+追加したancestry検査で停止した。いずれもCargoは未開始で、後者はsource overlayも未適用だった。
+旧領域・raw・guardを保持し、新しいv4領域でclone/checkoutの両子processへ0022を指定した。
+親0002を変更せず、生成したcheckoutだけのtracked mode 30件を正本へ揃え、
+clean S3の全1,655件と安全なdirectory ancestryを確認してから同じ修正案を適用した。
+
+v4は固定Rust 1.98で関連13件が13 pass / 0 fail、無指定filterの全libraryが
+485 pass / 0 fail / 0 ignoredだった。既存A08のfixture検査も成功した。
+続く`cargo clippy -p kio-eval --all-targets --locked -- -D warnings`とworkspace fmtも
+実exit0で、4子processと外側SSHがすべて実exit0だった。
+関連13件は親・子0002、その後は子だけ0022、親は全工程0002のままである。
+全sourceの前後guardも一致した。修正版sourceのSHA-256は
+`da290fe90ace4cb77eea8ac4bee90887ecd35fe3edafeaf8c741cacfce393f5e`。
+証拠は`release-smoke-private-fixture-tdd-v1/green-native-v4-private-checkout/`。
+これで局所是正をmainの`crates/kio-eval/src/release.rs`と本記録・計画へ統合する。
+既存test、coreの安全性検査、archive照合、必須51件matrix、保存形式は変更しない。
+旧形式の互換・移行経路は追加しない。
+
+関連文書と同じlogical commit後、repo外で次の候補を固定する。
+同一候補の3 OS全体回帰・2回配布物・securityを再確認してから、候補に合わせた専用CI経路と
+正式受入へ進む。上記のsource overlayによる局所成功は、新候補の3 OS全体回帰・配布物・
+正式受入の成功には数えない。account/key/SSHの本適用、push、Actions、provider/local外部呼出し、
+正式集計・release公開はこの段階でも未実行である。

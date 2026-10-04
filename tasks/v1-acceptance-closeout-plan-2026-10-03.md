@@ -11,9 +11,15 @@ Windowsの既知の失敗とAppContainer起動問題に対応する局所回帰�
 strict Clippyは成功した。監視testの出力回収を是正した固定候補`3d4fa21d`では、3 OSのfmt・
 strict Clippy・全workspace/all-targets test・release buildとLinux配布物の検証が成功した。
 追加のLinux A08で受入fixtureの中間directory権限の不備が見つかり、製品の安全性検証を維持して
-fixtureを是正した。関連する単体試験とstrict Clippyも成功した。この修正後に候補SHA/treeを
-再固定し、同一候補の検証を揃え直す。
-Mac配布物検証には空き容量確保も必要。正式受入の完了とは分け、最新状態と証拠は実行記録§21を
+fixtureを是正した。関連する単体試験とstrict Clippyも成功した。修正後の候補`03a2bcdc`では
+Windows・WSLの全体回帰が成功したが、Linux配布物のsmoke fixtureにも権限の不備が見つかった。
+製品の拒否規則を維持し、試験ツール自身が新規作成するdirectoryを安全に作る修正を局所検証した。
+Windowsの関連7件、WSLの関連13件・全library485件・strict Clippy・fmtが成功した。
+検証環境の権限不備と準備手順の失敗は保持し、安全な新規checkoutで同一sourceを検証し直した。
+この局所是正をmainへ統合し、新候補で3 OSの必須証拠を揃える。
+Macの空き容量は回復し、旧候補のfmt・strict Clippyは成功した。新しい修正が必要となったため、
+Macの全体testは中断し、修正後の候補SHA/treeで3 OSの必須証拠を揃え直す。
+正式受入の完了とは分け、最新状態と証拠は実行記録§22を
 正本とする。
 専用Windows/WSL host変更・条件付き復旧も今回の承認に含まれるが、旧候補向けbundleを流用せず、
 最終候補に合わせて再生成・検証してから適用する。工程C4〜C6の51件と公開の別判定は維持する。
