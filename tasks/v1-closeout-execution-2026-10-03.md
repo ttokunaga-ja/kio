@@ -1188,15 +1188,50 @@ Clippy、全workspace/all-targets test、release buildを確認した。Macの�
 適用、13経路probe、ACKには進んでいない。config-only rollbackは解除せず、作成途中のaccountを
 保持する。後続の独立readbackではWindows taskが予定時刻に実行されLastTaskResult 0、次回なしで、
 両OSのconfig/keyは元のhash・metadata、WSLの元inodeを維持し、既存SSH serviceも稼働していた。
-WSLのunit消失・既定ExecMainStatus 0だけではrollback実exitを証明しないため、保存されたtimer-resultの
-照合は別に残す。新規accountはUsers-onlyのSID末尾1008で、元の7 accountに欠落・変更はなく、
+WSLのunit消失・既定ExecMainStatus 0だけではrollback実exitを証明しないため、後続のread-only照合で
+保存されたtimer-resultのactual exit 0を確認した。証拠は`root-c2-s4-wsl-timer-result-readonly-v1/`。
+新規accountはUsers-onlyのSID末尾1008で、元の7 accountに欠落・変更はなく、
 Windows Security event 4720（record 245092）が当該実行中の管理者による作成を示した。
-同SIDのRegistry/CIM profileは不在だった。未結合の物理profile pathを推測して検査・削除していない。
-CreateProfileのbuffer容量は診断候補であり、MAX_PATH制約や原因解消を実証済みとは扱わない。
-証拠は`root-c2-s4-final-issuance-execution-v2/`、`c2-s4-critical-route-results-v3/`。
+当初の同SIDのRegistry/CIM profileは不在だった。その後、所有を確認した同じ`kio-ci` account/SIDに
+rootが一度だけbuffer 260のnative CreateProfileを実行し、HRESULT 0、Registry/CIM/nativeの
+`C:\Users\kio-ci`一致、unloaded・non-reparse ancestry・owner BAとprivate ACLを確認した。
+証拠は`root-c2-s4-owned-profile-recovery-execution-v1/`。account再作成、password変更、手動profile ACL変更、
+key/config適用は行っていない。以前のbuffer 32768による失敗を、容量だけが原因だったと断定しない。
+元の418-byte Windows configと`AllowUsers rm2c`によるCI拒否は維持されている。
+今後はfresh root proofで所有account/profileを採用する。新しい適用packetは未発行で、
+専用SSH経路やhosted authenticationの成功を意味しない。
+旧失敗の証拠は`root-c2-s4-final-issuance-execution-v2/`、`c2-s4-critical-route-results-v3/`、
 post-rollback証拠は`root-c2-s4-partial-account-post-rollback-readonly-v2/`。
 以前の準備失敗・未使用activation・expired task・backup・rawは上書きせず保持した。
 
 provider/local workflow、予算台帳の初期化・予約、有料API、GPU/lease、正式集約、release公開は
 未実行。是正をまとめた後の候補SHA/treeで全体回帰・配布物・securityとhosted gateを照合し、
 成功した候補のarchiveだけで残りの9件と固定51件のverifierへ進む。
+
+S5の製品是正を含む候補`e34485a19825f0b9d16f301ee226610c974e5f6e`のMac・Windows正式全体testは
+実exit101で終了した。両OSで新規`test_prepare_linux_confinement.py`だけが閉じたPython例外台帳と
+不一致になった。台帳はPython-native依存を持つmanual経路だけを許可するため、stdlib-onlyのCI mockを
+例外として登録せず、既存validator・2件のmanual例外・assertionを維持する。両hostの失敗rawを保持し、
+後続のpackage/release工程は開始していない。
+
+S6ではLinux resource/user-manager部分とmockを、既存の独立`kio-ci` crateの固定Rust helperへ置換した。
+AppArmor/bwrapのprivileged provisioningとnamespace probeは維持する。Rust child自身のUID・一意scope・
+実cgroup制限・termination propertyを確認し、成功/失敗/timeoutで自身のscopeだけを停止する。
+子の出力がない場合もControlGroup readbackで収束を確認し、cleanup成功後だけ環境変数をexportする。
+user-manager環境一覧とPeer.Pingのstdoutは破棄し、他command出力は各64 KiBに制限する。
+Linux workflowはpinned Rust/helper buildをshell provisioningより前へ移し、Python mock呼出しを削除した。
+局所のmalformed cleanup LoadState回帰は実Red101→Green0を確認した。Mac上のRust helper27件と
+変更していないSDK helper28件、kio-ci strict Clippy、全体fmt、shell syntax・差分checkは実exit0だった。
+Rustのmock/native capture試験の成功は
+hosted Ubuntuのenforcementや新候補の3 OS全体回帰・配布物・51件受入へ読み替えない。
+証拠は`s6-linux-rust-preflight-fix-v1/`。Git管理対象のPython削除を含む次のlogical commit後に台帳を再検証し、
+同一候補で残りのgateを照合する。
+次の最終候補にはWindows通常CIの相補的2分割を含める。S4の重い2件は40分超を要し、
+Windows app targetは約44分51秒、suite全体は単一90分jobを超えるため、上限を増やさず
+同じpinned Rust・workspace/all-targets/locked・default test threadsのまま、2件の名前substringのORと
+同じ2件の`--skip`で全体を分ける。fmtとfull Clippyはremainingで維持し、旧`windows-security-r23`
+jobは両matrix groupのsuccessだけを受け付ける集約gateにする。
+これはCI実行構造の変更なので製品振る舞いのRed→Greenは適用せず、外部準備checkで旧single-job構造の
+2-group条件不成立と提案の成立を確認する。次候補の実Windows libtest一覧でtargetごとのmultisetの
+非重複・全件一致、無指定filterの正式全体test実exit0、同一候補のhosted確認は別に必要である。
+準備checkや過去S4の局所成功を、次候補のCI・C2専用経路・51件受入の成功には数えない。

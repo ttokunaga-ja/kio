@@ -211,6 +211,10 @@ jobs:
         if: runner.os == 'macOS'
         run: sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$PWD/target/debug/kio-prepare-macos-sdk"
 
+      - name: Build pinned Linux resource preflight helper
+        if: runner.os == 'Linux'
+        run: cargo +1.98.0 build -p kio-ci --bin kio-prepare-linux-confinement --locked
+
       # These URLs name immutable Document Foundation release artifacts. Check
       # their pinned SHA-256 values before installation; do not accept a
       # package-manager-selected Office build from a mutable channel.

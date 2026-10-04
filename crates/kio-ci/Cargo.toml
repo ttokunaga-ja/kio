@@ -10,6 +10,10 @@ publish.workspace = true
 name = "kio-prepare-macos-sdk"
 path = "src/main.rs"
 
+[[bin]]
+name = "kio-prepare-linux-confinement"
+path = "src/linux_main.rs"
+
 [dependencies]
 serde_json.workspace = true
 

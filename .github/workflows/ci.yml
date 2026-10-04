@@ -25,6 +25,11 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+      - name: Build and test the Rust Linux preflight without provisioning
+        run: |
+          cargo +1.98.0 build -p kio-ci --bin kio-prepare-linux-confinement --locked
+          cargo +1.98.0 test -p kio-ci --bin kio-prepare-linux-confinement --locked
       - name: Check fixed shell controllers and Linux preflight
         shell: bash
         run: |
@@ -32,7 +37,6 @@ jobs:
           bash -n scripts/v1-local-gpu/gpu-phase.sh
           bash -n scripts/v1-local-gpu/ocr_api_entrypoint.sh
           bash -n scripts/ci/prepare-linux-confinement.sh
-          python3 scripts/ci/test_prepare_linux_confinement.py
 
   rust:
     runs-on: ubuntu-24.04
@@ -42,8 +46,6 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Install Linux renderer confinement runtime
-        run: bash scripts/ci/prepare-linux-confinement.sh
       - name: Check canonical workflow action references
         shell: bash
         run: |
@@ -79,6 +81,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           components: clippy, rustfmt
+      - name: Build pinned Linux resource preflight helper
+        run: cargo +1.98.0 build -p kio-ci --bin kio-prepare-linux-confinement --locked
+      - name: Install Linux renderer confinement runtime
+        run: bash scripts/ci/prepare-linux-confinement.sh
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
       # This directly exercises the Rust-owned persona plan, renderer, manifest,
@@ -267,18 +273,45 @@ jobs:
         run: sudo /usr/bin/env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin "$PWD/target/debug/kio-prepare-macos-sdk"
       - run: cargo test --workspace --all-targets --locked
 
-  windows-security-r23:
+  windows-workspace-tests:
     runs-on: windows-2025
-    # Run 32740699426 reached step4b_selfheal_contract at 44:39; matching
-    # Linux/macOS logs show another 17:37-25:00 of ordered suite work remained.
-    # Keep a finite cap with enough margin to finish the measured Windows lane.
+    # Keep the workspace build graph unchanged. The two libtest selections are
+    # complements, so every original test remains covered once across the matrix.
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [reconciliation, remaining]
+    env:
+      RECONCILIATION_FILTER: tests::index_reconciles_more_than_legacy_child_cap_and_deep_pages_in_one_run
+      VERIFY_OBJECTS_FILTER: verify_objects::tests::apply_removes_only_what_the_plan_listed
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           components: clippy, rustfmt
-      - run: cargo fmt --all -- --check
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - run: cargo test --workspace --all-targets --locked
+      - if: matrix.group == 'remaining'
+        run: cargo fmt --all -- --check
+      - if: matrix.group == 'remaining'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Run complementary workspace tests
+        shell: pwsh
+        run: |
+          if ('${{ matrix.group }}' -eq 'reconciliation') {
+            cargo test --workspace --all-targets --locked -- "$env:RECONCILIATION_FILTER" "$env:VERIFY_OBJECTS_FILTER"
+          } else {
+            cargo test --workspace --all-targets --locked -- --skip "$env:RECONCILIATION_FILTER" --skip "$env:VERIFY_OBJECTS_FILTER"
+          }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  windows-security-r23:
+    needs: windows-workspace-tests
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require both Windows test groups to succeed
+        env:
+          WINDOWS_RESULT: ${{ needs.windows-workspace-tests.result }}
+        run: test "$WINDOWS_RESULT" = success
