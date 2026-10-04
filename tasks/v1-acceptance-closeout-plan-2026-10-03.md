@@ -8,10 +8,13 @@
 正式受入の詳細実行計画が承認され、実行を再開した。再開時の製品基準はlocal main `452adbc` と
 未commitの49 sourceである。`0d560839`のAGENTS.md追加を保持し、後続の是正をmainへ統合した。
 Windowsの既知の失敗とAppContainer起動問題に対応する局所回帰、GC全26件、全workspace
-strict Clippyは成功した。固定候補`1820d3fb`のWSL全回帰・release buildは成功したが、Mac全回帰で
-監視testの出力回収による停止待ちを確認した。testの是正は元の実行fileとの局所Greenで確認し、
-修正・関連文書をcommitして新候補SHA/treeを固定し直す。Mac配布物検証には空き容量確保も必要。
-全回帰・配布物・正式受入の完了とは分け、詳細と証拠は実行記録§20を正本とする。
+strict Clippyは成功した。監視testの出力回収を是正した固定候補`3d4fa21d`では、3 OSのfmt・
+strict Clippy・全workspace/all-targets test・release buildとLinux配布物の検証が成功した。
+追加のLinux A08で受入fixtureの中間directory権限の不備が見つかり、製品の安全性検証を維持して
+fixtureを是正した。関連する単体試験とstrict Clippyも成功した。この修正後に候補SHA/treeを
+再固定し、同一候補の検証を揃え直す。
+Mac配布物検証には空き容量確保も必要。正式受入の完了とは分け、最新状態と証拠は実行記録§21を
+正本とする。
 専用Windows/WSL host変更・条件付き復旧も今回の承認に含まれるが、旧候補向けbundleを流用せず、
 最終候補に合わせて再生成・検証してから適用する。工程C4〜C6の51件と公開の別判定は維持する。
 

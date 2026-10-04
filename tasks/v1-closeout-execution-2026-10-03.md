@@ -944,3 +944,86 @@ hostへの本適用、push、Actions、provider/localの外部呼出しは行っ
 整理方法を確認した。復元したreceipt・source・package・compiled proofを削除していない。
 今回のtest是正と文書をcommitした後、repo外freezeで新候補SHA/treeを固定し、
 その候補の3 OS全体回帰・配布物・security・専用経路・正式受入を順に確認する。
+
+## 21. 復元照合、S2全体回帰とA08 fixtureの是正
+
+2026-10-04記録。固定候補S2は
+`3d4fa21dea4fedca1aece82c36e4f0f6c46b1e14`、treeは
+`ed14e68b94e6b0d352804eec74188a2d22a816c4`、trackedは1,655件。
+利用者の復元後、10:55 JSTにtracked bytes・size・mode、HEAD/tree/index、
+元132件の未追跡WIPの内容・mode・mtime・inode・deviceとbundleを照合し、すべて一致した。
+bundle SHA-256は `1b22f6161d643b9447f56d3d4e25891e5361d88f582d4d48d3eb1ce26ffd308b`。
+証拠は `restore-confirmation-20261004T0155Z/confirmation.json`。是正作業はこの照合後に再開した。
+
+S2では、各OSの実環境でfmt、locked workspace/all-targets strict Clippy、
+全workspace/all-targets test、locked release workspace buildがすべて実exit0だった。
+各実行の前後で固定sourceとclean cloneを照合している。
+
+| OS | test executable summary | pass | fail | ignored |
+|---|---:|---:|---:|---:|
+| macOS | 98 | 3,211 | 0 | 0 |
+| Linux / WSL | 102 | 3,221 | 0 | 1 |
+| Windows MSVC | 96 | 2,923 | 0 | 1 |
+
+統合証拠は `three-os-s2-formal-completion-v1/completion.json`。Macは短いprivate TMPを使った
+v2が全体成功であり、長いTMPでUnix socket path上限に達したv1の失敗も保持している。
+S2の差分security検証はscan `0352fd16-5056-4787-8f48-370cf4e5c7ea`で候補0件、
+coverage complete、seal/readback完了。いずれも後続候補や正式51件の受入成功へ流用しない。
+
+Linux配布物は独立2回のbuild・package・verify・smoke・archive比較を完了し、
+17段階すべて実exit0だった。両archiveは11,307,212 bytesでSHA-256が
+`5f23f5b4f88d286251e7e7b7ce8b7feed0a37b75dde0956a8f95eb44bf1b54fb`と一致した。
+証拠は `linux-s2-package-v1/`。Linuxのsafe CI parityもtooling・W0・syntheticの実exit0で、
+証拠は `linux-s2-ci-parity-v1/`。これらをnative/provider/localの正式受入と合算しない。
+
+Linux local native試験はA01〜A06の7 receiptが成功し、A07で停止した。
+追加診断はconverterのexit127を再現し、抽出配置の`soffice` wrapperがsandbox内で
+`oosplash`を実行できないことを確認した。物理fileはhostに存在するが、現行のroot所有
+`/opt/libreoffice<major>.<minor>`配置の信頼規則に抽出先のhome配下が合致しない。
+製品のmount・信頼規則やhostのOffice配置を変更して通さず、正式CIの所定配置で必須A07を検証する。
+証拠は `linux-s2-office-probe-stderr-diagnostic-v3/`。診断overlayをS2の受入候補にしていない。
+
+残り4件のlocal追試はA08のrelease `init`が
+`KIO-E-PRIVATE-FILE-UNSAFE-001`で実exit1となり、A09/A10/A12を実行せず停止した。
+`Device::new`は各scenarioのprivate/XDG等を0700にするが、その上のscenario directoryを
+ambient umaskの0775のまま残していた。保存したmanifestもこのmodeを示し、製品の全祖先に対する
+所有・書込権限検査が正しく拒否している。証拠は `linux-s2-remaining-native-v1/`。
+外側SSHの終了値はこの回で独立回収できておらず、A08子processの実exitとsource guardを証拠にする。
+
+是正対象は`crates/kio-eval/src/acceptance_failure.rs`のfixture準備に限定する。
+全6 scenarioの中間directoryを明示的に0775で作り、既存のprivate creation-parent検査と
+0700を要求する回帰testを先に用意した。新規private WSL cloneとtargetで、意図した
+`missing-credential/private`の祖先拒否によるRed101を確認した。子processと外側SSHの
+実exit101、timeoutなし、承認した1 source以外の一致を回収した。
+証拠は `a08-private-scenario-tdd-red-run-v1/`。
+Greenではscenarioを最初に作成・0700化し、その後に従来のprivate/scope/XDG/tmpを作る。
+製品の検査、全6 scenarioのassertion、期限、依存関係、固定受入matrixを維持する。
+同じclone・targetのGreen focused testは1 pass / 0 fail、実exit0、4.08秒だった。
+続く`kio-eval --lib`全単体試験は472 pass / 0 fail、実exit0、218.15秒だった。
+`clippy -p kio-eval --all-targets --locked -- -D warnings`も実exit0、35.18秒で、
+各実行後のsource guardが一致した。子processと外側SSHの実exitを回収し、
+27 JSONのstrict parseと回収45 entryのsize/hash一致を確認した。
+証拠は `a08-private-scenario-tdd-green-run-v1/`。
+この局所Greenを正式A08のnative成功へ昇格しない。
+
+専用CI経路のS2設定案は、Windows PowerShell 5.1のrollback構文検査、Windows sshdの
+`-t`と`-T -C`によるrm2c/kio-ciの設定値確認、WSL sshdの`-t`と`-T -C`による
+kio-testの設定値確認をすべて実exit0で完了した。共有TEMPのACLは変更せず、既存の安全な
+ProgramData祖先の下にprivate検証用directoryを新規作成し、検証後は自身の一致するfileと
+空directoryだけを削除した。両OSの既存SSH configのmetadata/hashは前後一致した。
+証拠は `c2-s2-native-preflight-execution-v4/root-verification.json`。
+これは構文と設定案の検証であり、account/key/configの本適用・専用経路の接続受入ではない。
+WSL daemon-global `permitopen any`は、未適用のCI keyの宛先制限の証明でもない。
+source bundle・helper build receipt・適用packetは新候補へ結び直してから本適用する。
+
+Windows配布物runner v1はtoolchain引数の結合、v2は検証用子PowerShellのExecutionPolicyで
+Cargo前に停止した。v2のpinned rustcは正確な2引数で1.98.0/MSVC hostの実exit0だった。
+v3は子processだけに`-ExecutionPolicy Bypass`を指定し、persistent host policyは変更しない。
+10件の準備物testは成功したが、v3のnative selftestと配布物試験は未実行である。
+旧packetの失敗とraw receiptを保持し、新候補に再生成してから実行する。
+
+Mac空き容量は現在約2.4 GiBで、配布物/native試験の18 GiB開始基準を下回る。
+復元した証拠・source・bundle・compiled proofを削除していない。A03/A11のserviceは正式CI待ちで、
+localで`GITHUB_ACTIONS=true`を装っていない。account/key/SSHの本適用、push、Actions、
+provider/local外部呼出し、正式集計・release公開は未実行。A08是正と直接関連する文書をcommitした後、
+repo外で新候補SHA/treeを固定し、同一候補の3 OS全回帰・配布物・security・専用経路・正式受入を揃える。

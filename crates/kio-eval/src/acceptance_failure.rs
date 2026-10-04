@@ -525,8 +525,11 @@ struct Device {
 }
 impl Device {
     fn new(root: &Path, name: &str) -> Result<Self, AcceptanceError> {
-        let private = root.join(name).join("private");
-        let scope = root.join(name).join("scope");
+        let scenario = root.join(name);
+        fs::create_dir_all(&scenario).map_err(io)?;
+        private_dir(&scenario)?;
+        let private = scenario.join("private");
+        let scope = scenario.join("scope");
         for path in [
             &private,
             &scope,
@@ -937,4 +940,74 @@ fn io(error: std::io::Error) -> AcceptanceError {
 }
 fn invalid(message: impl Into<String>) -> AcceptanceError {
     AcceptanceError::Invalid(message.into())
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn device_new_restricts_group_writable_scenario_ancestor() {
+        // Keep the fixture under the checkout, matching the private_fs contract
+        // tests, and explicitly seed 0775 instead of racing on process umask.
+        let temporary = tempfile::Builder::new()
+            .prefix("kio-a08-private-scenario-")
+            .tempdir_in(std::env::current_dir().expect("current directory"))
+            .expect("scenario fixture");
+        private_dir(temporary.path()).expect("private fixture root");
+        let root = temporary.path().canonicalize().expect("canonical root");
+        kio_core::private_fs::verify_private_creation_parent(&root)
+            .expect("fixture ancestry must already satisfy the product policy");
+
+        for name in [
+            "missing-credential",
+            "auth",
+            "rate-limit",
+            "budget",
+            "unknown-accepted",
+            "unknown-sync-resend",
+        ] {
+            let scenario = root.join(name);
+            fs::create_dir(&scenario).expect("seed scenario directory");
+            fs::set_permissions(&scenario, fs::Permissions::from_mode(0o775))
+                .expect("seed group-writable intermediate directory");
+            assert!(
+                kio_core::private_fs::verify_private_creation_parent(&scenario).is_err(),
+                "the product must reject the unsafe scenario fixture"
+            );
+
+            let device = Device::new(&root, name).expect("prepare A08 device");
+            for path in [
+                device.private.clone(),
+                device.scope.clone(),
+                device.private.join("xdg-config"),
+                device.private.join("xdg-data"),
+                device.private.join("xdg-cache"),
+                device.private.join("tmp"),
+            ] {
+                kio_core::private_fs::verify_private_creation_parent(&path)
+                    .unwrap_or_else(|error| panic!("unsafe A08 path {}: {error}", path.display()));
+                assert_eq!(
+                    fs::metadata(&path)
+                        .expect("prepared directory metadata")
+                        .permissions()
+                        .mode()
+                        & 0o777,
+                    0o700,
+                    "A08 device directory {} must be owner-private",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                fs::metadata(&scenario)
+                    .expect("scenario metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700,
+                "A08 scenario ancestor must be owner-private"
+            );
+        }
+    }
 }
