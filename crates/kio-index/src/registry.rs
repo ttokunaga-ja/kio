@@ -2853,7 +2853,8 @@ mod tests {
         let writer = RegistryDb::open(&path).unwrap();
         writer.upsert(&expected).unwrap();
         drop(writer);
-        let shm = dir.path().join("scope-registry.sqlite-shm");
+        let shm = normalized_absolute_registry_path(&dir.path().join("scope-registry.sqlite-shm"))
+            .unwrap();
         fs::write(&shm, b"initial").unwrap();
 
         let rotations = std::sync::Arc::new(AtomicUsize::new(0));
