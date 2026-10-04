@@ -173,7 +173,8 @@ require(subprocess.check_output(["stat", "-f", "-c", "%T", "/sys/fs/cgroup"],
         "unified cgroup v2 is required")
 subprocess.run(["systemctl", "--user", "show-environment"], check=True,
                stdout=subprocess.DEVNULL, timeout=10)
-subprocess.run(["busctl", "--user", "--timeout=10", "status", "org.freedesktop.systemd1"],
+subprocess.run(["busctl", "--user", "--timeout=10", "call", "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1", "org.freedesktop.DBus.Peer", "Ping"],
                check=True, stdout=subprocess.DEVNULL, timeout=15)
 
 # Check the controls of the process actually launched in the transient scope,

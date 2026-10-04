@@ -17,21 +17,22 @@ permissions:
 
 jobs:
   acceptance-tooling:
-    # The Rust workspace owns acceptance tests; retain only syntax checks for
-    # the fixed shell controllers used by the private route.
+    # The Rust workspace owns Rust acceptance tests. Check the fixed shell
+    # controllers and mocked Linux preflight without provisioning a host.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - name: Parse fixed shell controllers
+      - name: Check fixed shell controllers and Linux preflight
         shell: bash
         run: |
           set -euo pipefail
           bash -n scripts/v1-local-gpu/gpu-phase.sh
           bash -n scripts/v1-local-gpu/ocr_api_entrypoint.sh
           bash -n scripts/ci/prepare-linux-confinement.sh
+          python3 scripts/ci/test_prepare_linux_confinement.py
 
   rust:
     runs-on: ubuntu-24.04

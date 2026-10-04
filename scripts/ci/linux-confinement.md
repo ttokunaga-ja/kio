@@ -27,6 +27,16 @@ canonical `/run/user/UID` directory owned by that UID with mode 0700, a usable
 user-manager bus, and a unified cgroup v2 mount with delegated CPU, memory, and
 PID controllers. It does not change cgroup permissions globally.
 
+Before launching the resource probe, `systemctl --user show-environment` checks
+the user manager, then a bounded, read-only D-Bus `org.freedesktop.DBus.Peer.Ping`
+call to `org.freedesktop.systemd1` at `/org/freedesktop/systemd1` checks bus
+reachability. `busctl status` inspects process credentials and is not a bus
+health check; credential introspection is not needed by this preflight. Ping
+has a ten-second bus timeout and a fifteen-second subprocess timeout. Either
+health check failing stops the preflight before scope creation or environment
+export. Passing these checks establishes reachability; resource enforcement
+still requires the following unprivileged scope probe and its cleanup.
+
 An unprivileged, uniquely named transient user scope tests `MemoryMax=64M`
 (64 MiB), `MemorySwapMax=0`, `TasksMax=32`, `CPUQuota=100%`, `OOMPolicy=kill`,
 `RuntimeMaxSec=15s`, `KillMode=control-group`, `KillSignal=SIGKILL`, and
@@ -55,3 +65,8 @@ Local shell/static and mocked-probe checks do not provision a host or establish
 Ubuntu 24.04 resource enforcement. Native hosted CI must pass both preflights.
 The resource probe checks installed limits and cleanup, not stress-induced OOM,
 PID exhaustion, CPU scheduling, or the complete renderer containment path.
+
+Run the local regression harness with
+`python3 scripts/ci/test_prepare_linux_confinement.py`. It executes the Python
+preflight and its child probe with mocked subprocess and filesystem metadata;
+it does not run the shell provisioning steps or establish hosted enforcement.
