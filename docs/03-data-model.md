@@ -703,7 +703,7 @@ image_hash    = "sha256:" + base16(sha256(抽出画像のバイト列))
 - object は RFC 8785 JCS canonical form の JSON バイト列として保存する。
 - `tree_hash` / `commit_hash` = 保存バイト列の sha256。検証は再ハッシュのみで足りる。
 - 種別誤認防止のため object 本体に `"object_type": "tree" | "commit"` を必須で含める (Git の object header 相当)。
-- tree の `entries` は `path` の UTF-8 バイト列昇順で一意にソートする。同一 `path` の重複 entry は禁止。
+- tree の `entries` は `path` の UTF-8 バイト列昇順で一意にソートする。同一 `path` の重複 entry は禁止し、`KIO-E-STORE-DUP-001` で拒否する (`/` を含む path の `KIO-E-STORE-PATH-001` とは区別する)。
 - commit の `parents` は commit_hash の配列。第一要素は直前 HEAD (first parent)。
 - timestamp は UTC ISO8601 + `Z` ([06-cli-spec.md §11](06-cli-spec.md))。
 - `HEAD` / `refs/heads/*` / `refs/tags-v1/tag-*` の値は commit_hash (`refs/tags-v1/names.jsonl` は ref ではなく論理名 ledger — この規則の対象外)。

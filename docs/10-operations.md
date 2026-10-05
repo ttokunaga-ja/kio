@@ -662,7 +662,7 @@ ref 到達可能な再 publication commit が存在するなら、crash した r
 append して整合させる ([05-runtime.md §3.5](05-runtime.md) の補完規範と同一の因果条件)。**存在しなければ
 incomplete purge として exit 3 で報告する** (retired を append しない —
 purge 済み内容を fsck が復活させない。回復は同一対象への `kio purge --raw-hash` の再実行で冪等に
-完遂できる — [09-mvp-scope.md §5.2](09-mvp-scope.md) の再 purge 規範。報告にはこの誘導を含める) (**receipt は除去しない** — 除去すると旧 commit が参照する
+完遂できる — [05-runtime.md §3.5](05-runtime.md) の再 purge 規範。報告にはこの誘導を含める) (**receipt は除去しない** — 除去すると旧 commit が参照する
 manifest 欠落を説明するものが消える。**commit がまだ無い場合 — snapshot finalize 前の crash — は
 「未 finalize の進行状態」として incomplete (exit 3) とし、append しない** —
 [05-runtime.md §3.5](05-runtime.md) の因果条件と同型)。
@@ -1000,7 +1000,7 @@ max_consecutive = 5
 
 # 10. 現行仕様の索引
 
-以下の仕様は既に正本 spec に統合済みである。着手前に該当節が凍結ゲート ([09-mvp-scope.md §6.2](09-mvp-scope.md)) を通過していることを確認する。
+以下の仕様は既に正本 spec に統合済みである。
 
 ```text
 object store / snapshot DAG      → 03-data-model.md
@@ -1024,54 +1024,11 @@ done criteria                    → 09-mvp-scope.md
 
 すべての error は `KIO-E-<DOMAIN>-<SUBDOMAIN>-<NNN>` 形式の **error_code** を持つ。`error_kind` などのフリーテキストはユーザー向け表示専用で、機械判定には `error_code` を使う (明示例外 = manifest `units[]` / Adapter 出力 `failed_units` の `error_kind` — [04-pipeline.md §5.3](04-pipeline.md) の閉 enum であり、unit 単位の retry 可否判定に使う)。
 
-```text
-DOMAIN:
-  BATCH    バッチ処理 (markdownize / embedding / etc.)
-  INDEX    インデックス更新
-  REPAIR   device / scope 修復の集約
-  SEARCH   検索 (FTS / vector / hybrid)
-  COMMIT   commit / snapshot / restore
-  GC       garbage collection
-  PURGE    purge 操作
-  EVIDENCE Evidence Pointer 解決 / verify
-  REGISTRY scope registry (live clone 重複・退役 — [§3])
-  ADAPTER  Adapter ロード・実行
-  EMBED    embedding profile / modality 検証 (KIO-E-EMBED-MODALITY-001 — [03-data-model.md §7](03-data-model.md))
-  CONFIG   config / schema / 設定
-  STORE    object store / fs IO
-  AUTH     認証・認可
-```
-
-例: `KIO-E-BATCH-NET-001`, `KIO-E-SEARCH-VEC-INCOMPAT-001`, `KIO-E-SEARCH-VEC-UNAVAIL-001`, `KIO-E-SEARCH-VEC-UNAUTHORIZED-001`, `KIO-E-COMMIT-SHALLOW-001`, `KIO-E-PURGE-NOT-FOUND-001`, `KIO-E-PURGE-JOURNAL-ACTIVE-001` (未完了 purge journal / epoch 不変違反による**読み取り系** preflight の拒否 (書き込み系は journal 回復を再開)。**export の rename 後再検査が対象を closure に含む active journal を検出した場合の publish 後巻き戻し終端にも用いる** — retryable、exit 3、[05-runtime.md §3.5](05-runtime.md)), `KIO-E-COMMIT-EXPORT-CONFLICT-001` (export の publish / 巻き戻しにおける no-replace 競合・dev/inode 不一致・退避 / 隔離の同名残存 — context に閉 enum `conflict_kind`・`retry_disposition` (transient / manual_action) と両者の所在を含む。retryable、exit 3、[05-runtime.md §3.5](05-runtime.md)), `KIO-E-ADAPTER-APPROVAL-CONFLICT-001` (承認の serialized compare/write 不一致 — 並行 revoke による pending 除去・fresh な明示承認が必要。exit 5、[07-adapter-spec.md §3](07-adapter-spec.md)), `KIO-E-ADAPTER-SPECVER-001` (spec_version 不一致 — invalid_input / 非再試行、[07-adapter-spec.md §8.1](07-adapter-spec.md)), `KIO-E-STORE-PATH-001`, `KIO-E-STORE-CORRUPT-001`, `KIO-E-STORE-VERSION-001` (§11.5 — current `KIO_FORMAT_VERSION` と完全一致しない store を全 command で拒否、exit 8), `KIO-E-SEARCH-SCOPE-ALL-FAILED-001`, `KIO-E-SEARCH-CURSOR-001`, `KIO-E-INDEX-REBUILDING-001`, `KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001`, `KIO-E-ADAPTER-CONTRACT-001`、`KIO-E-PURGE-REPLICA-001` (purge 後の device replica 再射影に失敗 — 本文が cache root に読める状態で成功と報告しないための fail-closed 終端。exit 1、[05-runtime.md §3.5](05-runtime.md))、`KIO-E-CONFIG-OFFLINE-URL-001` (`execution_mode = "offline_api"` の Adapter に loopback リテラル (`127.0.0.1` / `localhost` / `[::1]` / UNIX domain socket) 以外の `url` が宣言されている — tool-lock materialize / adapter 登録時に検証。exit 2、[07-adapter-spec.md §3](07-adapter-spec.md))。各 code の定義箇所は該当 spec (06-cli-spec.md §8 に一覧と参照先) を参照。
-
-device-global repair の scope 集約 code は `KIO-E-REPAIR-PARTIAL-001` と
-`KIO-E-REPAIR-ALL-FAILED-001` とする ([06-cli-spec.md §7](06-cli-spec.md))。
-registry 行が on-disk の scope identity / path と一致しない場合は
-`KIO-E-REGISTRY-STALE-001` とする。
-
-各 spec が定義した個別エラー (04-pipeline.md / 05-runtime.md / 06-cli-spec.md 等) はこの namespace に従う。新規 code 追加は本書および該当 spec の更新を伴う (破壊的変更扱い)。
+DOMAIN の扱い、code の一覧の正本、spec へ記載する code の範囲は [06-cli-spec.md §8](06-cli-spec.md) に従う。
 
 ## 11.2 CLI exit code
 
-Kio のすべての CLI コマンドは以下の exit code を返す。
-
-```text
-0   成功 / 全 up_to_date
-1   汎用 failure (詳細不明)
-2   invalid usage / config 不正 / schema validation 失敗
-3   retryable な失敗が残っている (部分成功・全体 retryable を含む — [06-cli-spec.md §7](06-cli-spec.md))
-4   permanent な失敗のみが残っている (全失敗 permanent、および settled partial
-    (部分成功 + 残り全 permanent — 04-pipeline.md §5.2) を含む — 再試行で進展しない)
-5   auth_error (user action 必要)
-6   budget_exceeded により paused
-7   user 中断 (SIGINT/SIGTERM)
-8   incompatible profile / format version
-9   confirm 拒否 (purge 等の確認プロンプトで no)
-```
-
-スクリプト連携はこれらを参照する。コマンド固有の補足は各 sub-command が docstring に明記する。
-
-dead pointer (tombstoned / not_found) は `4`、**scope_unreachable のみは retryable の `3`** (再接続・registry 再登録で回復可能 — [08-evidence-pointer-spec.md §4.3](08-evidence-pointer-spec.md))、tool_profile 不一致による chunk 解決不能は `8` に割り当てる (詳細: [06-cli-spec.md §7](06-cli-spec.md))。
+exit code の一覧と割当規則の正本は [06-cli-spec.md §7](06-cli-spec.md) である。
 
 ## 11.3 設定ファイル schema validation
 

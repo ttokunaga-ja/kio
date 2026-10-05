@@ -87,8 +87,8 @@ pub enum AdapterError {
     /// alongside, letting `adapter_to_kio` surface it structurally instead of
     /// re-reading it out of the message text.
     ///
-    /// Codes are declared in [06-cli-spec.md §8] / [10-operations.md §11.1] and
-    /// all resolve to exit 2.
+    /// Codes follow the namespace in [06-cli-spec.md §8] and all resolve to
+    /// exit 2.
     #[error("{code}: {message}")]
     ConfigSchemaCoded { code: &'static str, message: String },
     #[error("io error at {path}: {message}")]
