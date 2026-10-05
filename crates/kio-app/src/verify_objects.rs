@@ -2211,7 +2211,7 @@ fn verify_objects_with_limits(
                         None => state.finding(
                             "purge_incomplete",
                             &raw_hash,
-                            "verified raw exists but no causal republication commit was found (09 §5.2: re-run kio purge --raw-hash to complete idempotently)",
+                            "verified raw exists but no causal republication commit was found (05 §3.5: re-run kio purge --raw-hash to complete idempotently)",
                             &[],
                         ),
                     }
@@ -2276,7 +2276,7 @@ fn verify_objects_with_limits(
                                 None => state.finding(
                                     "purge_incomplete",
                                     raw_hash,
-                                    "verified raw exists but no causal republication commit was found (09 §5.2: re-run kio purge --raw-hash to complete idempotently)",
+                                    "verified raw exists but no causal republication commit was found (05 §3.5: re-run kio purge --raw-hash to complete idempotently)",
                                     &affected,
                                 ),
                             }

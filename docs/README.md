@@ -63,8 +63,9 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 # 1. ドキュメント構成 と Reading Path
 
 `docs/` 直下に実装スペック、製品要件、明示した設計提案を置く。`README.md` (本書) を最初に読み、
-続いて `01-` から `13-` の順に読む。`11-` は製品要件、`12-` と `13-` は承認済み方針、
-現行実装との対応、未実装の追加改善を区別して記録する。実装済みを3 OS受入・配布済みと同一視しない。
+続いて `01-` から `14-` の順に読む。`11-` は製品要件、`12-` と `13-` は承認済み方針、
+現行実装との対応、未実装の追加改善を区別して記録する。`14-` は v1 の実装契約である。
+実装済みを3 OS受入・配布済みと同一視しない。
 
 | 順 | ファイル | 役割 |
 | --- | --- | --- |
@@ -77,12 +78,14 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 | **06** | [06-cli-spec.md](06-cli-spec.md) | CLI 全コマンド / exit code / error code namespace / JSON output / observability |
 | **07** | [07-adapter-spec.md](07-adapter-spec.md) | Adapter trait (Prepare / Markdownize / Embedding / etc.) / 実行形態 / **incremental Markdownize プロンプト規約** |
 | **08** | [08-evidence-pointer-spec.md](08-evidence-pointer-spec.md) | Evidence Pointer schema / 解決手順 / **Dead Pointer (purge) のセマンティクス** / exact-only retarget / 外部 Agent 相互運用 |
-| **09** | [09-mvp-scope.md](09-mvp-scope.md) | MVP scope / RC platform support matrix / non-authorizing roadmap / Step 1-4 + 規模上限 / 北極星シナリオ / 凍結ゲート |
+| **09** | [09-mvp-scope.md](09-mvp-scope.md) | MVP scope / RC platform support matrix / non-authorizing roadmap / Step 1-4 / **コード規模と構造の上限 (OS 共通ロジックと OS 固有層の分離)** / 北極星シナリオ / 決定済みの設計論点 |
 | **10** | [10-operations.md](10-operations.md) | 横断規約 (semver / 観測ログ / 命名リネーム表 / 初回スキャン承認 / Adapter セキュリティ) |
 | **11** | [11-product-requirements.md](11-product-requirements.md) | **製品要件の正本**: v1 の到達要求、RCとの区別、v2/v3 の境界、検証要求 |
 | **12** | [12-change-detection.md](12-change-detection.md) | **承認済み方針・実装対応**: OSイベント、差分走査、欠落復旧、子scope自動管理、後続の版別状態表示 |
 | **13** | [13-linear-history.md](13-linear-history.md) | **承認済み方針・実装対応**: 線形履歴、管理対象復元、公開・回復、tag保持、後続の操作表示 |
-01〜10 は実装・運用契約、11 は製品要件である。契約が RC の現状や提案を記録する場合、v1 の到達要求と実装済みを混同しない。旧統合要件ドラフトは current consumer がなく、旧 CLI/schema を残すだけだったため削除済みである。
+| **14** | [14-v1-runtime-contracts.md](14-v1-runtime-contracts.md) | **v1 実装契約**: 正本と運用状態の所在、課金台帳、送信承認、local Adapter の trust、watch・restore の実装判断 (英語。文書削減工程で各契約書へ統合する) |
+
+01〜10 と 14 は実装・運用契約、11 は製品要件である。契約が RC の現状や提案を記録する場合、v1 の到達要求と実装済みを混同しない。旧統合要件ドラフトは current consumer がなく、旧 CLI/schema を残すだけだったため削除済みである。
 
 ## 1.1 設計検討メモ (撤去済み)
 
@@ -115,18 +118,8 @@ Phase 2: 検索             FTS5 / sqlite-vec / hybrid (paging / MMR)
 Phase 3: 履歴             tree / commit / restore / --at / time-travel
 ```
 
-Step 計画 (Phase 1-3 を実装):
-
-```
-Step 1 (1-2ヶ月): kio-core + kio-cli (init / status / snapshot create / log / diff / inspect / tag)
-Step 2 (2-3ヶ月): kio-pipeline + kio-adapter (frontier AI default)
-Step 3 (2-3ヶ月): kio-index + kio-search (hybrid + Evidence Pointer)
-Step 4 (1.5-2ヶ月): restore + --at + time-travel + purge 最小形 (tombstone) + evidence verify
-```
-
-(Step の期間・内容の正本は [09-mvp-scope.md §3](09-mvp-scope.md) — 差分が生じた場合は 09 が正)
-
-**コア規模上限** (ripgrep 以下): テスト除いて 11-16k LOC、テスト含めて 20-30k LOC。
+Step 計画と、OS 共通ロジック・OS 固有層ごとのコード規模と構造の上限は
+[09-mvp-scope.md §3](09-mvp-scope.md) を正本とする。
 
 ---
 
@@ -144,12 +137,9 @@ M3-3: 「削除したはずの資料から特定の数字を再発見」
 
 ---
 
-# 4. 設計上の宿題 (4 論点)
+# 4. 決定済みの設計論点
 
-**status・期限の正本は [09-mvp-scope.md §5.4](09-mvp-scope.md)** — 本書には転記しない (転記は陳腐化して
-「draft なら着手しない」規則を誤発動させた実績があるため、一覧・現在の status は必ず正本を見る)。
-
-未確定 (draft) のままステップに到達したら **そのステップを着手しない** (該当判定も 09 §5.4 の status で行う)。
+Phase 1 着手前に確定した論点の結論と正本は [09-mvp-scope.md §5](09-mvp-scope.md) にまとめる。
 
 ---
 
@@ -157,18 +147,18 @@ M3-3: 「削除したはずの資料から特定の数字を再発見」
 
 ADR (Architecture Decision Records) フォルダは廃止しました。本プロジェクトでは:
 
-- **実装・運用契約の正本は01〜10、製品要件は11**。12・13は承認済み方針、実装対応、後続改善を区別する。
+- **実装・運用契約の正本は01〜10と14、製品要件は11**。12・13は承認済み方針、実装対応、後続改善を区別する。
 - 「なぜそう決めたか」は spec の各セクション冒頭に短く埋め込む (例: `01-positioning.md §1.1`「なぜ local-first であって offline-first ではないか」)
 - 設計検討メモ (旧 `docs/research/`) は 2026-07-18 に撤去済み — 経緯は git history で辿れる
 
-将来、本当に「逆方向の判断もありえた」「外部から問われたら答える義務がある」決定が出てきた時点で、改めて `adr/` を作る方針です。Phase 1 着手前の今、ADR を運用するコストはメリットを上回らないと判断しています ([09-mvp-scope.md §6](09-mvp-scope.md))。
+将来、本当に「逆方向の判断もありえた」「外部から問われたら答える義務がある」決定が出てきた時点で、改めて `adr/` を作る方針です。
 
 ---
 
 # 6. 編集規約
 
 - **形式**: GitHub-flavored Markdown。
-- **言語**: 日本語。固有名詞・コード片は原語のまま。
+- **言語**: 日本語。固有名詞・コード片は原語のまま。英語で書かれた 14 は文書削減工程で各契約書へ統合する。
 - **コードブロック**: 言語タグ必須 (`bash`, `toml`, `json`, `rust`, `sql`, `text`)。既存の列挙・図示 block の無タグ fence は `text` 扱い (新規追加時にタグ必須)。
 - **相対リンク**: docs/ ルート相対。
 - **スキーマ変更**: 03-data-model.md / 07-adapter-spec.md の変更は破壊的変更扱い。安定版前は旧 format を明示的に reject し、migration / alias / compatibility reader を要件にしない。利用者ファイルと knowledge を明示操作なしに破壊しない。
@@ -182,4 +172,10 @@ ADR (Architecture Decision Records) フォルダは廃止しました。本プ�
   - ✓ データはローカル、計算は最強の AI を使う。(core 日)
   - ✓ local-first / Evidence-grounded local knowledge archive
   - ✓ Evidence Pointer / time-travel knowledge navigation
-- **凍結中の修正**: ドキュメント統合ゲート ([09-mvp-scope.md §6](09-mvp-scope.md)) 完了後の本文書き換えは、Step 1-4 で実装が物理的に不可能と判明した場合 / 外部 Agent 互換性を破壊する変更 / データ破壊リスク、の 3 ケースに限る (これに加え、[09-mvp-scope.md §4.2](09-mvp-scope.md) の一回限りの Q_hard 増補とその #5 追記の完遂手続きのみ凍結対象外)。それ以外の「綺麗にする」修正は Step 4 完了後。
+- **仕様の更新**: 仕様書は現在の合意済み仕様の正本であり、凍結期間を設けない。仕様を変える実装では、
+  先に該当する節を更新する。古い説明・参照・例は同じ変更で更新または削除し、経緯は git 履歴に任せる。
+- **仕様書に書くもの**: 利用者と外部 Agent が観測・依存する契約に限る。CLI の構文・出力・JSON・exit・
+  分岐に使う error code、保存形式、Evidence Pointer、送信承認と課金の境界、回復の保証と失敗時の扱い。
+- **仕様書に書かないもの**: 実装の機構 (system call、lock・retry の内部手順、OS ごとの API や回避策)、
+  コードと同じ内容の転記、実装・検証の経緯や日付付きの裁定記録。OS 固有の機構は OS 固有層のコードとコメントを
+  正本とする ([09-mvp-scope.md §3](09-mvp-scope.md))。同じ規則を複数の文書へ転記せず、正本の節を参照する。

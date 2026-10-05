@@ -1,8 +1,7 @@
 # Kio 検索評価ハーネス (synthetic)
 
 `docs/09-mvp-scope.md` §4.3 の **Recall 評価規約 (ゴールデンクエリ)** を実行するための
-合成コーパス + 履歴シナリオ + ゴールデンクエリ + 評価ランナー。設計宿題 #5
-(`docs/09-mvp-scope.md` §5.5、**Step 3 着手前ゲート**) の成果物。
+合成コーパス + 履歴シナリオ + ゴールデンクエリ + 評価ランナー。
 
 - Push/PR 評価経路は **Rust-only**。残る Python は
   `eval/python-exceptions.toml` と exact-match する manual な
@@ -264,13 +263,19 @@ Done 条件 = **synthetic で各シナリオ Recall@10 >= 0.8** + **dogfood で 
 
 ## クエリ凍結規律 (重要)
 
-`docs/09-mvp-scope.md` §4.3 / §4.2 に従う:
+`docs/09-mvp-scope.md` §4.2 に従う。既存クエリの差し替え・削除は禁止し、悪化を隠すための削除もしない。
+クエリを増やす場合は、結果を測定する前に別ファイルとして追加し、下表へ件数と digest を記録して再凍結する。
+凍結 corpus fixture (`corpus-fixture.json`) と履歴シナリオも凍結対象であり、Recall 数値の連続性を壊す変更をしない。
 
-- ゴールデンクエリの追加は **Step 3 着手前まで**。
-- **Step 3 着手後は `golden-queries.jsonl` の追加・差し替え・削除を禁止** (シナリオ凍結規律に準ずる)。
-  悪化を隠すためのクエリ削除は禁止。物理的に実装不可能と判明した場合のみ docs 側で撤回 + 代替採用。
-- 凍結 corpus fixture (`corpus-fixture.json`) と履歴シナリオも同様に凍結対象。変更は Recall 数値の連続性を壊すため、
-  Step 3 着手後は原則行わない。
+| ファイル | 件数 | digest (raw UTF-8 bytes の sha256) |
+| --- | ---: | --- |
+| `golden-queries.jsonl` | 50 (M3-1: 18 / M3-2: 16 / M3-3: 16) | `sha256:b7183fa3586383883ec522256696268eab8e607c1a032020e09223158a5bf08d` |
+| `golden-queries-qhard.jsonl` | 8 | `sha256:d5c30eccc664e6bd4d96e1068970e225d209d04bde34c50eab300d6245d4e163` |
+| `golden-queries-crossscope.jsonl` | 16 (M3-1: 8 / M3-2: 4 / M3-3: 4) | `sha256:1fe0ebf2b51f35323d91bb1a235a282b5fa68a59de7a9c0bac2bc0f4ebade868` |
+| `golden-queries-fixture-b.jsonl` | 24 | `sha256:bdad3e02c4b70f721e882d7f24c8b5b442621be7c0c03593afde41b8ebca7d45` |
+
+横断増補は、Recall@10 では横断融合の順位欠陥をほぼ検出できないため、診断値 `worst_expected_rank`
+(2 つの expected の遅い方の順位) を併記する。
 
 ## 決定論の検証
 

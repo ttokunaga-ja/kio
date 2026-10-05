@@ -2584,7 +2584,7 @@ fn pb28_rebuild_db_initializes_last_lifecycle_epoch_to_current_value() {
     // Bump the lifecycle-epoch counter past 0 via a real, COMPLETE purge, so
     // `last_lifecycle_epoch` would be wrong if left at DEFAULT 0. The
     // working-tree source file must be gone first — otherwise purge reports
-    // `purge_incomplete` (its working-tree-alias guard, 09 §5.2) rather than
+    // `purge_incomplete` (its working-tree-alias guard, 05 §3.5) rather than
     // completing, and never advances the tombstone all the way.
     fs::remove_file(dir.path().join("evidence.md")).unwrap();
     success(

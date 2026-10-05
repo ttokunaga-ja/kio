@@ -1040,7 +1040,7 @@ CREATE TABLE ledger_metadata (
 
 ## 5.5 冪等性
 
-`(input_hash, tool_profile_hash) → output_ref` 一致なら done として短絡 (キャッシュヒット)。これは **first-instance-wins** ([03-data-model.md §6](03-data-model.md), [09-mvp-scope.md §設計宿題](09-mvp-scope.md))。LLM APIの二重課金防止はrequestごとの予約・終端と送信回復で行う。providerのidempotency keyを利用できる場合も、ローカルのintent token自体をproviderの重複排除保証とは扱わない。同期taskの不確定結果は§5.4の明示再試行承認を必要とし、Batch投入と結果回収は§5.8のprotocolに従う。
+`(input_hash, tool_profile_hash) → output_ref` 一致なら done として短絡 (キャッシュヒット)。これは **first-instance-wins** ([03-data-model.md §6](03-data-model.md))。LLM APIの二重課金防止はrequestごとの予約・終端と送信回復で行う。providerのidempotency keyを利用できる場合も、ローカルのintent token自体をproviderの重複排除保証とは扱わない。同期taskの不確定結果は§5.4の明示再試行承認を必要とし、Batch投入と結果回収は§5.8のprotocolに従う。
 
 **embedding の content ベース再利用**: embedding タスクは上記の短絡に加え、対象 chunk の
 `(text_hash, embedding profile_hash, dimensions, distance, modality)` に一致する既存 embedding が
