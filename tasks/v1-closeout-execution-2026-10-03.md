@@ -1259,3 +1259,25 @@ MacでもLinux helper28件と変更していないSDK helper28件、kio-ci stric
 S7のSHA/tree・正本1659件・元の未追跡WIP132件を固定する。同じS7候補で3 OSの正式四工程と
 各2回の配布物検証、Windows相補的一覧、合成CI経路・securityを揃え直す。専用経路への適用と
 hosted CI/native/provider/local・固定51件の受入は引き続き未完了である。
+
+## 24. 構造是正の承認、小修正と文書削減の着手
+
+2026-10-06 JST記録。利用者はレビュー所見のうち、規模上限の再設定（OS共通ロジックとOS固有層を分ける前提）、
+仕様書の削減、kio-appの層分割をv1へ含めることを承認した。工程と見直しは
+[受入完了計画 §10・§11](v1-acceptance-closeout-plan-2026-10-03.md) を正とする。
+
+S7候補 `ad5f28e7` の後に次の小修正と文書変更をlocal mainへcommitした（未push）。
+
+- kio-cliの通常依存を、本番コードが使うkio-app・kio-core・kio-index・clap・serde_jsonに限った。
+  integration testだけが使うcrateはdev-dependenciesへ移し、未使用の依存を削除した（Cargo.lockも追随）。
+- 07のlocal Adapter URL規則を実装とdocs/14（HTTPS loopback・明示port・`KIO-E-LOCAL-PEER-URL-001`）に合わせ、
+  実装に存在しない`KIO-E-CONFIG-OFFLINE-URL-001`・`KIO-E-ADAPTER-SPECVER-001`の記載を是正した。
+- error code・exit codeの重複記載（06 §8と10 §11.1・§11.2）を06へ一本化し、05 §6からOS別のlock機構を除いた。
+- 09 §3の旧規模上限・Step 1着手ゲート・設計宿題表・文書凍結ゲートを削除し、OS共通／OS固有／tooling別の
+  上限と分離規則を定めた。docs/READMEに14を加え、凍結規則を仕様書の記載基準に置き換えた。
+
+検証はMacでの`cargo +1.98.0 fmt --all -- --check`と、`clippy -p kio-cli -p kio-app -p kio-adapter
+--all-targets --locked -D warnings`の実exit 0、文書の相対リンク照合に限る。Windows向けのbuild
+（kio-cliの`windows-sys`をtarget別dev-dependencyへ移した影響を含む）、全workspace test、3 OS回帰は未実行であり、
+R0の基準取得で確認する。未追跡WIPは変更していない。`.gitignore`へ`.DS_Store`を加えたため、
+`git status`に表示される未追跡件数はその分減るが、ファイル自体は残っている。

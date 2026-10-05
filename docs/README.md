@@ -109,7 +109,8 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 直近の実行順序と最終候補の証跡は
 [既存v1の受入完了と文書整合](../tasks/v1-acceptance-closeout-plan-2026-10-03.md) を参照する。
 作業開始後の基準・tag/Unicode是正・環境確認・残るgateは
-[実行記録](../tasks/v1-closeout-execution-2026-10-03.md) を参照する。
+[実行記録](../tasks/v1-closeout-execution-2026-10-03.md) を参照する。2026-10-06に承認した構造是正
+(OS 固有層の分離、kio-app の分解と型付き API) と文書削減は、同計画の §10 に含める。
 jj連携・引用bundle・文書lineageは着手条件付きの検討候補であり、追加機能はまだ実装済みではない。
 
 ```

@@ -30,11 +30,18 @@ Macの最低空き容量は利用者の追加指示により10 GiBとし、各�
 今回へ含めると追加承認した。C1の「保存形式を増やさない」はtag削除単体の方針であり、この追加是正は
 保存形式3.0.0への更新と旧形式拒否の検証を含む。旧storeの移行機能は追加しない。
 
+2026-10-06に、利用者は構造是正と文書削減をv1へ含めることを承認した。製品コードを広く変更するため、
+最終候補の固定（C3）より前に構造是正（R工程）を行い、文書削減（D工程）を並行する。工程と見直しの結果は
+§10・§11。S7候補 `ad5f28e7` はR工程の後の最終候補にならないため、配布物検証・hosted CI・native受入へ進めない。
+利用者が準備中の検証用データによる実データ確認（V工程）は並行し、v1の受入条件にはしない。
+
 ## 1. 今回の完成地点
 
 既存v1の必須機能欠落を解消し、最終候補のローカル回帰・security検証・配布物と
 macOS/Linux/Windowsの必須Actions receiptを揃える。固定matrixの最終verifier成功までを
 「実装・自動受入完了」とし、実端末の手動確認とrelease公開は別の状態として報告する。
+最終候補は、[09 §3](../docs/09-mvp-scope.md) の規模・構造の上限とOS分離規則を計測ツールで満たし、
+kio-appが型付きのrequest/responseを公開し、D工程を終えた状態で固定する（§10）。
 
 後続の版別状態表示、引用保持UX、復元操作ID、引用bundle、文書lineage、jj連携をこの候補へ混ぜない。
 GUIはv2、cloud・共同編集・user/group ACLはv3、personaCorpusの研究性能評価はv1のnonblockingを維持する。
@@ -68,12 +75,15 @@ private route・credential・課金台帳の設定は記録上の状態に留ま
 | C0 基準と対応表を固定 | HEAD、既存WIPの一覧/fingerprint、要件→実装→試験→laneの残差表。既存CI失敗のログ/annotationsと修正commitを照合 | 他作業を保護でき、必須ケース・環境・未接続経路を明示 |
 | C1 既存機能と試験を閉じる | tag削除を完成。保存/回復/prune/confinement等の最終差分を統合し、残差表で見つかった既存要件だけを是正 | 関係する回帰がpass、既知の必須機能欠落がなく、CLI/spec/testの対応がある |
 | C2 環境と権限を準備 | 3 OS runtime/Office/service preflight、private local route、provider ledger/credential/予算の準備と確認 | 各laneの実行可能性と承認根拠が明示。未準備をskip/pass扱いしない |
+| R0〜R5 構造是正 | OS固有層の分離、kio-appの分解と型付きAPI、大きなファイルの分割、計測ツールとCI gate（§10） | 09 §3の上限・分離規則を満たし、CLI契約試験を変更せず3 OSの全体回帰が成功 |
+| D 文書削減 | docs/README §6の基準で契約書から実装の機構・転記・経緯を除き、docs/14を各契約書へ統合（§10） | 参照切れなし。現行CLI・コードと一致。C3の文書確定までに完了 |
 | C3 ローカル統合と文書を確定 | Rust/lock/flagsを揃えた全回帰、release build、合成CI経路、2回packageと実binary受入。最終差分security検証、操作/制約文書を閉じる | ローカルで再現できる失敗なし。実行できないnative経路と理由を明記 |
 | C4 候補SHAを固定して通常CI・native受入 | 承認範囲を確認したpush後、通常CI成功。既存native workflowでarchiveとOffice/serviceを含む3 OS受入 | 同じSHAのCIとnative workflowが成功、42件のnative subset receiptが揃う |
 | C5 実provider/local受入 | 成功native runのarchiveを使い、Mistral/Geminiの6laneとauthenticated localの3laneを実行 | 正確な候補・予算・service identityで9件の追加receiptがpass、結果不明要求を重複送信しない |
 | C6 最終集約と完成報告 | CI/native/provider/localのrun IDを最終verifierへ渡し、固定matrixとartifactを検証 | 51件の必須receiptと全source runが合格。未解決security・必須機能欠落なし。手動確認票と公開状態を別記 |
 
-主経路はC0→C1→C3→C4→C5→C6。C2はC0から開始し、C1/C3と並行する。
+主経路はC0→C1→R0〜R5→C3→C4→C5→C6（2026-10-06変更）。D工程はR工程と並行してC3前に終える。
+C2はC0から開始し、C1/R/C3と並行する。
 後になってprivate route未準備が全体を止めないよう、C2のread-only preflightと具体的な設定差分の準備を先行する。
 実装と環境準備は所有領域を分ける。3 OS試験は独立して実行できるが、1台のGPUを使うlocal laneは既存leaseに従い直列化する。
 
@@ -188,3 +198,66 @@ Lunaはbounded探索と確定済み検証コマンド、Sol reviewerは機能/�
 一つのlogical milestoneごとにstaged diffを確認してmainへlocal commitする。
 全ローカル可能gateが通るまではpushをdebugループに使わず、外部実行は確認済みの承認範囲で行う。
 所要日数はC0/C2の結果で見積もる。環境待ち・課金結果不明・機能不具合の3種類を区別して進捗を報告する。
+
+## 10. 構造是正（R工程）と文書削減（D工程）— 2026-10-06追加
+
+目的は、v2のGUIが同じRust engineを型付きのrequest/responseで呼べる構造にし、OS固有の処理を共通ロジックから
+分離し、[09 §3](../docs/09-mvp-scope.md) の上限を計測できる状態にすることである。CLIの構文・JSON出力・
+exit code・保存形式・送信承認の振る舞いは変えない。新機能、CLI/JSON/保存形式の変更、K3〜K6の製品実装、
+OS用crateの新設は含めない。
+
+着手時点の実測（2026-10-05、近似）: OS共通の製品ロジック約101,000行、OS固有約22,000行（Windows約11,000、
+Unix共通約7,600、Linux約2,300、macOS約1,300）、検証tooling約63,000行。OS条件の属性は製品・tooling合計で
+約2,200箇所あり、`kio-core/src/scope.rs`（160）、`gc.rs`・`cas.rs`（各80台）、`kio-index`の`fts.rs`・
+`registry.rs`（各80台）、`kio-pipeline/src/ledger/snapshot.rs`（80）、`kio-adapter/src/office_convert.rs`（70）、
+`kio-app/src/lib.rs`（54）に集中する。対象外OS向けの代替実装（`not(any(unix, windows))`等）は約85箇所ある。
+`kio-app::execute` は `serde_json::Value` を返し、終了コードを `__exit_code` field で上書きし、
+実行contextをthread-localで暗黙に渡している。
+
+| 工程 | 作業・成果物 | 終了条件 |
+|---|---|---|
+| R0 基準 | 開始SHA（2026-10-06の小修正を含むmain）で3 OSの正式四工程（fmt・strict Clippy・全workspace test・release build）とlibtest一覧を取得 | 3 OSで実exit 0。test一覧を候補別に保存 |
+| R1 計測ツール | `kio-ci`に09 §3の計測（区分別のコード行、製品ファイルの上限、共通ロジック内のOS条件）を実装。例外の許可リストは理由を必須にする。まず報告だけをCIへ接続 | 手計測の推定値と照合できる。分類・除外・許可リストの単体試験がpass |
+| R2 OS固有層の分離 | crateごとに`src/platform/`（interfaceは`mod.rs`、実装は`windows`/`unix`/`linux`/`macos`）へ移す。順序はkio-core→kio-index・kio-pipeline・kio-adapter・kio-process→kio-app。複数crateが使うprimitiveはkio-coreのplatformへ置く。対象外OS向けの代替実装を削除し、未対応targetはbuild時に拒否する | 共通ロジック内のOS条件が許可リスト以外0。crateごとにWindows/WSLのbuildとtestが成功 |
+| R3 kio-appの分解と型付きAPI | `execute`を型付きresponseに変え、JSON化と終了コードの決定をCLIへ移す（`__exit_code`を廃止）。thread-localの暗黙contextを明示引数にする。`lib.rs`をコマンド群ごとのmodule（index、search、embedding・batch、snapshot・履歴、adapter・ledger、repair、open・view等）へ分ける | CLI契約試験を変更せずpass。`lib.rs`はdispatchだけになる。各ファイル3,000行以下 |
+| R4 kio-coreほかの分割 | `scope.rs`（repositoryのopen・lock、refs・HEAD・tag、承認記録、log）、`gc.rs`、`cas.rs`、`kio-app/src/verify_objects.rs`を責務別のmoduleへ分ける | 製品ファイルの上限超過0 |
+| R5 gate | R1のツールをCIの必須gateにし、上限・分離規則・ファイル上限を検査する。計測値を09 §3へ記録する | 全区分が上限内。3 OSの正式四工程が成功。C3へ進む |
+
+- 移動と振る舞いの変更を同じcommitに混ぜない。移動だけのcommitでは振る舞いを変えない。
+- 局所検証はMacの全workspace testと、Windows/WSLの関係crate。3 OSの全体回帰はR2・R3・R5の終了時に行う。
+- testの期待値を変えて通さない。CLI契約試験（`crates/kio-cli/tests`）の変更は、移動に伴うpath・importの修正に限る。
+- K3（状態モデルの仕様）は並行してよい。K4以降の実装はR3の型付きAPIの上に作る。
+
+D工程は [docs/README §6](../docs/README.md) の「仕様書に書くもの / 書かないもの」を基準にする。
+
+1. docs/14を03・05・07・12・13へ日本語で統合し、14を削除する。
+2. OS固有の機構と実装手順を除く。例: store-gateのOS別lock手順（03・05・06・10に重複）、SQLiteのleaf複写手順、
+   Windows HANDLEやmacOS SDKの扱い。
+3. 同じ規則の転記を正本への参照に置き換える。例: 10 §11.3・§11.4と06 §10・§11。
+4. 日付付きの裁定・経緯・計測記録をgit履歴に任せて削除し、09 §4.1の評価harnessの詳細はeval/READMEへ寄せる。
+5. R工程で移動したコードを指す記述を更新する。
+
+目安はdocs/01〜14の合計を約59万字から約40万字以下にすることで、必要な契約を削って達成しない。
+文書だけの変更のためRed→Greenは適用せず、リンク・参照・現行CLIとコードとの照合で検証する。
+
+V工程（実データ確認）は、利用者の検証用データが揃った時点の最新候補でM3-1〜M3-3を確認し、所要時間と
+失敗例を記録する。v1の受入条件にはしない（[docs/11 §3](../docs/11-product-requirements.md)）。結果はK3〜K6の
+優先度と検索体験の改善に使う。
+
+## 11. 計画の見直し（2026-10-06）
+
+1. **工程順序。** 主経路をC0→C1→R0〜R5→C3→C4→C5→C6に変えた。製品を広く変更するR工程の後に候補を固定しないと、
+   C3以降の配布物・51件のreceiptを取り直すことになる。
+2. **S7候補の扱い。** S7の配布物検証、hosted CI、native受入はR後の最終候補に流用できないため実行しない。
+   R0の基準は小修正後のmainで取る。C2の専用経路は既存方針どおり最終候補に合わせて適用する。
+3. **受入証拠の候補同一性（提案。利用者の確認待ち）。** 現在は製品と無関係なtest・CIだけの修正でもSHAが変わり、
+   51件を取り直す。配布archiveは独立2回のbuildで一致を確認しているため、native・provider・localのreceiptを
+   「製品archive・binaryのdigestと、evaluator・workflow・fixtureのdigest」に結び付け、これらが変わらない修正では
+   該当receiptを再利用できるようにする。通常CIの同一SHA成功は従来どおり必須とする。確認が得られるまでは
+   従来の同一SHA規則で進める。
+4. **検証の粒度。** R工程中の3 OS全体回帰はmilestone単位に限る。S6で導入したWindows通常CIの2分割は維持する。
+5. **完了条件。** §1に構造是正とD工程を加えた。必須receipt 51件とA01〜A12は変えない。
+6. **リスク。** (a) R3は出力の微差を生みやすい。CLI契約試験を変更しないことで検出する。(b) OS分離で
+   Windowsだけの経路が初めてbuildエラーになり得る。crate単位でWindows/WSLのbuildを完了条件にする。
+   (c) OS共通ロジックの上限（100,000行）は現状（約101,000行）を下回る。対象外OS向け代替実装と分割時の重複を
+   削除して収める見込みだが、収まらない場合は削減候補を示して利用者の判断を求める。
