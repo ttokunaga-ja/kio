@@ -1,8 +1,8 @@
 //! Search primitives: RRF fusion, MMR diversification, cursor tokens,
 //! query-hash canonicalization, and Evidence Pointer issue/serialization.
 //!
-//! The CLI (`kio-cli`) supplies the execution engine (FTS5/vector backends,
-//! multi-scope merge, paging); this crate holds the deterministic, contract-
+//! The application layer (`kio-app`) supplies the execution engine (FTS5/vector
+//! backends, multi-scope merge, paging); this crate holds the deterministic, contract-
 //! frozen pieces those flows are built from (05-runtime.md §1.3-§1.5/§1.8,
 //! 08-evidence-pointer-spec.md §2).
 

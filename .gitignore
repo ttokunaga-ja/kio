@@ -1,5 +1,6 @@
 /target/
 **/*.rs.bk
+.DS_Store
 
 # Local Python acceptance-tooling bytecode.
 __pycache__/
