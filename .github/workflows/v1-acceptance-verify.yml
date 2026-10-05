@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       candidate_sha:
-        description: Exact 40-character candidate SHA shared by every source run
+        description: Exact 40-character evidence commit shared by the native, provider, and local runs
         required: true
         type: string
       ci_run_id:
-        description: Successful ci.yml push run ID for main at the candidate SHA
+        description: Successful ci.yml push run ID for the dispatched main commit
         required: true
         type: string
       native_run_id:
@@ -26,7 +26,9 @@ on:
 
 # This workflow only reads prior immutable Actions evidence and writes a new
 # verifier artifact. It makes no provider request, scheduler registration, or
-# release change.
+# release change. It runs at the dispatched main commit; receipts bound to an
+# earlier evidence commit are accepted only when `acceptance verify-reuse`
+# proves the net diff touches evidence-neutral paths alone.
 permissions:
   actions: read
   contents: read
@@ -50,8 +52,8 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$CANDIDATE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$GITHUB_SHA" =~ ^[0-9a-f]{40}$ ]]
           test "$GITHUB_EVENT_NAME" = workflow_dispatch
-          test "$GITHUB_SHA" = "$CANDIDATE_SHA"
           test "$GITHUB_REF" = refs/heads/main
           [[ "$CI_RUN_ID" =~ ^[1-9][0-9]*$ ]] || exit 1
           test "$CI_RUN_ID" != "$NATIVE_RUN_ID"
@@ -83,6 +85,18 @@ jobs:
       - name: Build the candidate-owned final verifier
         run: cargo +1.98.0 build -p kio-eval --bin kio-eval --locked
 
+      - name: Prove the evidence commit remains valid at the dispatched main commit
+        env:
+          CANDIDATE_SHA: ${{ inputs.candidate_sha }}
+        run: |
+          set -euo pipefail
+          reports="$RUNNER_TEMP/kio-v1-verify-reports"
+          mkdir "$reports"
+          target/debug/kio-eval acceptance verify-reuse --repo . \
+            --evidence-sha "$CANDIDATE_SHA" --verify-sha "$GITHUB_SHA" \
+            --out "$reports/evidence-reuse.json"
+          printf 'KIO_V1_VERIFY_REPORTS=%s\n' "$reports" >> "$GITHUB_ENV"
+
       - name: Verify every source run before any artifact download
         env:
           GH_TOKEN: ${{ github.token }}
@@ -93,31 +107,35 @@ jobs:
           LOCAL_RUN_ID: ${{ inputs.local_run_id }}
         run: |
           set -euo pipefail
-          reports="$RUNNER_TEMP/kio-v1-verify-reports"
-          mkdir "$reports"
+          reports="$KIO_V1_VERIFY_REPORTS"
+          test -f "$reports/evidence-reuse.json"
+          git cat-file -e "$GITHUB_SHA:.github/workflows/v1-acceptance-verify.yml"
           jq -n --arg repository "$GITHUB_REPOSITORY" \
-            --arg head_sha "$GITHUB_SHA" --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
+            --arg head_sha "$GITHUB_SHA" --arg evidence_sha "$CANDIDATE_SHA" \
+            --arg workflow_ref "$GITHUB_WORKFLOW_REF" \
             --argjson run_id "$GITHUB_RUN_ID" --argjson attempt "$GITHUB_RUN_ATTEMPT" \
-            --arg workflow_sha256 "$(shasum -a 256 .github/workflows/v1-acceptance-verify.yml | awk '{print $1}')" \
-            '{repository: $repository, head_sha: $head_sha, workflow_ref: $workflow_ref,
-              run_id: $run_id, attempt: $attempt, workflow_sha256: $workflow_sha256}' \
+            --arg workflow_sha256 "$(git show "$GITHUB_SHA:.github/workflows/v1-acceptance-verify.yml" | shasum -a 256 | awk '{print $1}')" \
+            '{repository: $repository, head_sha: $head_sha, evidence_sha: $evidence_sha,
+              workflow_ref: $workflow_ref, run_id: $run_id, attempt: $attempt,
+              workflow_sha256: $workflow_sha256}' \
             > "$reports/verifier-run.json"
           verify_run() {
             local label="$1"
             local run_id="$2"
             local workflow_path="$3"
             local expected_event="$4"
+            local expected_head="$5"
             local metadata
             local workflow_sha256
-            test -f "$workflow_path"
-            workflow_sha256="$(shasum -a 256 "$workflow_path" | awk '{print $1}')"
+            git cat-file -e "${expected_head}:${workflow_path}"
+            workflow_sha256="$(git show "${expected_head}:${workflow_path}" | shasum -a 256 | awk '{print $1}')"
             metadata="$(gh api "/repos/${GITHUB_REPOSITORY}/actions/runs/${run_id}")"
             jq -e \
               --arg repository "$GITHUB_REPOSITORY" \
               --argjson repository_id "$GITHUB_REPOSITORY_ID" \
               --argjson run_id "$run_id" \
               --arg expected_event "$expected_event" \
-              --arg candidate "$CANDIDATE_SHA" \
+              --arg expected_head "$expected_head" \
               --arg workflow_path "$workflow_path" \
               '.repository.full_name == $repository
                 and .repository.id == $repository_id
@@ -126,20 +144,21 @@ jobs:
                 and ($expected_event != "push" or .head_branch == "main")
                 and .status == "completed"
                 and .conclusion == "success"
-                and .head_sha == $candidate
+                and .head_sha == $expected_head
                 and .path == $workflow_path
                 and (.run_attempt | type == "number" and . >= 1 and . == floor)' <<< "$metadata" >/dev/null
             printf '%s\n' "$metadata" | jq -c --arg workflow_sha256 "$workflow_sha256" \
               '{id, repository: .repository.full_name, event, status, conclusion, head_sha, head_branch, path, run_attempt, workflow_sha256: $workflow_sha256}' \
               > "$reports/${label}-run.json"
           }
-          verify_run ci "$CI_RUN_ID" .github/workflows/ci.yml push
-          verify_run native "$NATIVE_RUN_ID" .github/workflows/v1-acceptance.yml workflow_dispatch
-          verify_run provider "$PROVIDER_RUN_ID" .github/workflows/v1-provider-acceptance.yml workflow_dispatch
+          # Normal CI must pass at the dispatched main commit; receipt-producing
+          # runs must have run at the evidence commit.
+          verify_run ci "$CI_RUN_ID" .github/workflows/ci.yml push "$GITHUB_SHA"
+          verify_run native "$NATIVE_RUN_ID" .github/workflows/v1-acceptance.yml workflow_dispatch "$CANDIDATE_SHA"
+          verify_run provider "$PROVIDER_RUN_ID" .github/workflows/v1-provider-acceptance.yml workflow_dispatch "$CANDIDATE_SHA"
           # This is an intentional hard dependency. Until this workflow exists
           # and succeeds, the final fixed matrix cannot be accepted.
-          verify_run local "$LOCAL_RUN_ID" .github/workflows/v1-local-acceptance.yml workflow_dispatch
-          printf 'KIO_V1_VERIFY_REPORTS=%s\n' "$reports" >> "$GITHUB_ENV"
+          verify_run local "$LOCAL_RUN_ID" .github/workflows/v1-local-acceptance.yml workflow_dispatch "$CANDIDATE_SHA"
 
       - name: Download only bounded expected and receipt files from verified runs
         env:

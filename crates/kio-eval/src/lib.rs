@@ -12,6 +12,7 @@ pub mod acceptance_office;
 pub mod acceptance_policy;
 pub mod acceptance_preflight;
 pub mod acceptance_provider;
+pub mod acceptance_reuse;
 pub mod acceptance_service;
 pub mod acceptance_tools;
 pub mod artifact;

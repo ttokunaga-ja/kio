@@ -38,6 +38,7 @@ use kio_eval::{
     acceptance_office::{A07OfficeOptions, run_a07},
     acceptance_policy::{PolicyOptions, run_a04 as run_policy_a04},
     acceptance_provider::{A08ProviderOptions, Provider, run_a08_provider},
+    acceptance_reuse::{verify_evidence_reuse, write_evidence_reuse_report_create_only},
     acceptance_service::{ServiceOptions, run_a03 as run_service_a03, run_a11},
     artifact::CreateOnlyArtifact,
     attestation::{MAX_POINTER_ATTESTATIONS_PER_QUERY, PointerAttestor},
@@ -359,6 +360,19 @@ enum AcceptanceCommands {
     Plan {
         #[arg(long)]
         expected: PathBuf,
+    },
+    /// Prove that receipts bound to the evidence commit remain valid at a
+    /// descendant main commit whose net diff touches only evidence-neutral paths.
+    VerifyReuse {
+        #[arg(long, default_value = ".")]
+        repo: PathBuf,
+        #[arg(long)]
+        evidence_sha: String,
+        #[arg(long)]
+        verify_sha: String,
+        /// New canonical reuse-report path; existing output is rejected.
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Reject incomplete, duplicate, or differently-bound acceptance receipts.
     Verify {
@@ -2738,6 +2752,22 @@ pub fn run(args: Args) -> Result<ExitCode, AppError> {
                     println!("{}", String::from_utf8_lossy(&bytes));
                     Ok(ExitCode::Success)
                 }
+                AcceptanceCommands::VerifyReuse {
+                    repo,
+                    evidence_sha,
+                    verify_sha,
+                    out,
+                } => {
+                    let report = verify_evidence_reuse(repo, evidence_sha, verify_sha)
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    write_evidence_reuse_report_create_only(out, &report)
+                        .map_err(|error| AppError::Input(error.to_string()))?;
+                    println!(
+                        "[ok] receipts from {evidence_sha} remain valid at {verify_sha} ({} neutral paths changed)",
+                        report.changed_paths.len()
+                    );
+                    Ok(ExitCode::Success)
+                }
                 AcceptanceCommands::Verify { expected, receipt } => {
                     let manifest = read_expected_manifest(expected)
                         .map_err(|error| AppError::Input(error.to_string()))?;
@@ -3713,6 +3743,79 @@ mod tests {
         ])
         .unwrap();
         assert!(run(args).is_err());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn acceptance_verify_reuse_writes_a_create_only_report_for_neutral_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = directory.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&repo)
+                .args([
+                    "-c",
+                    "user.name=kio-test",
+                    "-c",
+                    "user.email=kio@example.invalid",
+                ])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "git {args:?} failed");
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        fs::create_dir_all(repo.join("crates/kio-core/src")).unwrap();
+        fs::write(repo.join("crates/kio-core/src/lib.rs"), "pub fn a() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "evidence"]);
+        let evidence = git(&["rev-parse", "HEAD"]);
+        fs::create_dir(repo.join("docs")).unwrap();
+        fs::write(repo.join("docs/a.md"), "note\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "docs"]);
+        let verify = git(&["rev-parse", "HEAD"]);
+        let output = directory.path().join("reuse.json");
+        let arguments = |verify: &str| {
+            Args::try_parse_from([
+                "kio-eval",
+                "acceptance",
+                "verify-reuse",
+                "--repo",
+                repo.to_str().unwrap(),
+                "--evidence-sha",
+                &evidence,
+                "--verify-sha",
+                verify,
+                "--out",
+                output.to_str().unwrap(),
+            ])
+            .unwrap()
+        };
+        assert_eq!(run(arguments(&verify)).unwrap(), ExitCode::Success);
+        let report: serde_json::Value =
+            serde_json::from_slice(&fs::read(&output).unwrap()).unwrap();
+        assert_eq!(
+            report,
+            json!({
+                "changed_paths": ["docs/a.md"],
+                "evidence_sha": evidence,
+                "verify_sha": verify,
+            })
+        );
+        assert!(
+            run(arguments(&verify)).is_err(),
+            "output must be create-only"
+        );
+
+        fs::remove_file(&output).unwrap();
+        fs::write(repo.join("crates/kio-core/src/lib.rs"), "pub fn b() {}\n").unwrap();
+        git(&["commit", "-q", "-am", "product"]);
+        let product = git(&["rev-parse", "HEAD"]);
+        assert!(run(arguments(&product)).is_err());
         assert!(!output.exists());
     }
 

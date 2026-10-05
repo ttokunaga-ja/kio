@@ -126,8 +126,8 @@ macOSのCI専用SDK準備やLinux provisioning scriptを利用者端末へその
 成立しないnative経路はActionsで確認する。環境preflightを実Office/serviceの受入成功と扱わない。
 
 仕様/操作文書と受入fixtureをC3までに整合し、最後にcandidate SHAを固定する。
-C4〜C6中はmainに別の変更を積まない。修正が必要なら新SHAを作り、関係するローカル検証を経て
-同一候補の必須receiptを取り直す。課金laneは通常CI・native/packageが成功してから実行する。
+C4〜C6中にmainへ積んでよいのは、受入証拠に影響しない経路だけを変える修正である（§6の再利用条件）。
+それ以外の修正は新SHAを作り、関係するローカル検証を経て必須receiptを取り直す。課金laneは通常CI・native/packageが成功してから実行する。
 完成報告はまずrepo外の証跡に保存し、報告文書を後でcommitする場合も受入対象SHAを明記する。
 
 ## 6. 既存workflowと最終51件matrix
@@ -138,7 +138,7 @@ matrixの正本は `crates/kio-eval/src/acceptance.rs::fixed_v1_requirements()`�
 
 | 実行 | 必須証拠 | 件数 |
 |---|---|---|
-| `ci.yml` | 同じ候補mainのpush run、全必須job成功 | receipt matrixと別に必須 |
+| `ci.yml` | 最終verifierを実行するmainのcommit（検証SHA）のpush run、全必須job成功 | receipt matrixと別に必須 |
 | `v1-acceptance.yml` | native core A01〜A06/A09/A10、A04-local-trust、A03/A11-service、A07-real、A08-mock、A12-distribution | 14×3 OS = 42 |
 | `v1-provider-acceptance.yml` | A08-Mistral/Gemini、成功native archiveと候補の一致、実provider/予算台帳 | 2×3 OS = 6 |
 | `v1-local-acceptance.yml` | A08-authenticated-local、実OCR/embedding、service/model/checkpoint identity | 1×3 OS = 3 |
@@ -153,6 +153,25 @@ missing/skip/cancel/failure、別候補・別workflow、自己申告だけのpas
 最終workflowは候補と4 run IDを入力として、候補自身の `kio-eval acceptance assemble-expected` と
 `kio-eval acceptance verify` を実行する。native workflow単体の緑、CodeQLの緑、ローカルreceiptだけで
 v1完了を宣言しない。
+
+**受入証拠の再利用（2026-10-06利用者承認）。** native・provider・localのreceiptは、それらを実行した製品の
+commit（証拠SHA。receiptの`candidate_sha`）に結び付く。配布binaryはcommit SHAとgit treeを埋め込むため、
+binary digestの一致では再利用を判定できない。最終verifierはmainのcommit（検証SHA）で起動し、証拠SHAの
+`kio-eval`を使って `acceptance verify-reuse` を実行する。次をすべて満たす場合に限り、証拠SHAのreceiptを受け付ける。
+
+- 証拠SHAが検証SHAの祖先である。
+- 証拠SHAから検証SHAへの差分（rename検出なし）が、次の経路だけを変更している:
+  `docs/`、`tasks/`、`strategy/`、`crates/kio-ci/`、`scripts/ci/`、製品crate（kio-core、kio-pipeline、
+  kio-adapter、kio-index、kio-search、kio-app、kio-cli、kio-process）の`tests/`、`.github/workflows/ci.yml`、
+  `README.md`、`CONTRIBUTING.md`、`SECURITY.md`、`.gitignore`。
+- 通常CI（`ci.yml`のpush run）が検証SHAで成功している。
+
+製品crateの`src/`（`#[cfg(test)]`だけの変更を含む）と`build.rs`、`Cargo.toml`・`Cargo.lock`、
+`rust-toolchain.toml`、`kio-eval`（acceptance fixtureを含む）、受入とreleaseのworkflowを変更した場合は、
+新しい証拠SHAでreceiptを取り直す。`kio-ci`と`scripts/ci`は受入とreleaseの準備にも使うが、receiptと
+配布物は証拠SHAの版で作られているため、後の変更は既存の証拠を変えない。受入対象の製品は証拠SHAであり、
+配布物、release tag、release verifierの`--expected-commit`には証拠SHAを使う。判定した変更経路の一覧は
+最終verifierのartifactに残す。証拠SHAと検証SHAが同じ場合は従来の判定と同じになる。
 
 ## 7. 外部前提の扱い
 
@@ -248,13 +267,12 @@ V工程（実データ確認）は、利用者の検証用データが揃った�
 
 1. **工程順序。** 主経路をC0→C1→R0〜R5→C3→C4→C5→C6に変えた。製品を広く変更するR工程の後に候補を固定しないと、
    C3以降の配布物・51件のreceiptを取り直すことになる。
-2. **S7候補の扱い。** S7の配布物検証、hosted CI、native受入はR後の最終候補に流用できないため実行しない。
-   R0の基準は小修正後のmainで取る。C2の専用経路は既存方針どおり最終候補に合わせて適用する。
-3. **受入証拠の候補同一性（提案。利用者の確認待ち）。** 現在は製品と無関係なtest・CIだけの修正でもSHAが変わり、
-   51件を取り直す。配布archiveは独立2回のbuildで一致を確認しているため、native・provider・localのreceiptを
-   「製品archive・binaryのdigestと、evaluator・workflow・fixtureのdigest」に結び付け、これらが変わらない修正では
-   該当receiptを再利用できるようにする。通常CIの同一SHA成功は従来どおり必須とする。確認が得られるまでは
-   従来の同一SHA規則で進める。
+2. **S7候補の扱い（2026-10-06利用者承認）。** S7の配布物検証、hosted CI、native受入はR後の最終候補に流用できないため
+   実行しない。R0の基準は小修正後のmainで取る。C2の専用経路は既存方針どおり最終候補に合わせて適用する。
+3. **受入証拠の再利用（2026-10-06利用者承認）。** 製品と無関係なtest・CIだけの修正でもSHAが変わり、51件を
+   取り直していた。当初はbinary digestの一致で判定する案だったが、配布binaryがcommit SHAとgit treeを埋め込むため
+   成り立たない。証拠SHAから検証SHAへの差分経路で判定する方式を§6に定めた。S4〜S7の是正の多くは製品`src/`内の
+   試験やkio-evalの変更を含んでおり、この方式でも取り直しは残る。効果は終盤の文書・CI・統合試験だけの修正に限られる。
 4. **検証の粒度。** R工程中の3 OS全体回帰はmilestone単位に限る。S6で導入したWindows通常CIの2分割は維持する。
 5. **完了条件。** §1に構造是正とD工程を加えた。必須receipt 51件とA01〜A12は変えない。
 6. **リスク。** (a) R3は出力の微差を生みやすい。CLI契約試験を変更しないことで検出する。(b) OS分離で

@@ -1281,3 +1281,25 @@ S7候補 `ad5f28e7` の後に次の小修正と文書変更をlocal mainへcommi
 （kio-cliの`windows-sys`をtarget別dev-dependencyへ移した影響を含む）、全workspace test、3 OS回帰は未実行であり、
 R0の基準取得で確認する。未追跡WIPは変更していない。`.gitignore`へ`.DS_Store`を加えたため、
 `git status`に表示される未追跡件数はその分減るが、ファイル自体は残っている。
+
+## 25. S7の扱いと受入証拠の再利用
+
+2026-10-06 JST記録。利用者はS7候補の配布物検証・hosted CI・native受入を行わない計画と、受入証拠の再利用を承認した。
+当初案のbinary digest一致による判定は、配布binaryがcommit SHAとgit treeを埋め込む（`crates/kio-cli/build.rs`）ため
+成立しないと報告し、利用者は差分経路による判定を選んだ。規則は
+[受入完了計画 §6](v1-acceptance-closeout-plan-2026-10-03.md) を正とする。
+
+- `kio-eval acceptance verify-reuse` を追加した。証拠SHAが検証SHAの祖先であり、rename検出なしの差分が
+  受入証拠に影響しない経路だけを変える場合に限りcreate-onlyのreportを書く。gitは継承環境とglobal/system設定を
+  使わず、置き換えobjectを無効にして実行する。
+- `v1-acceptance-verify.yml` は検証SHA（dispatchしたmainのcommit）で起動し、証拠SHAから作った`kio-eval`で
+  上記を判定する。通常CIは検証SHA、native・provider・localは証拠SHAのrunであることを照合し、判定reportを
+  artifactへ残す。証拠SHAと検証SHAが同じ場合は従来どおりである。
+
+検証: 新規の単体試験10件とCLI試験1件はRed（未実装、置き換えrefによる隠蔽）を確認した後にGreenとなった。
+実リポジトリの履歴でも、文書だけの差分（`32e9ca4d`→`7bede01f`）は再利用可、S7からの差分は`Cargo.lock`と
+製品`src/`を含むため不可、祖先でない組は不可と判定した。Macで`fmt --check`と
+`clippy -p kio-eval --all-targets --locked -D warnings`は実exit 0。`kio-eval`の全試験はsandbox内で10件が
+ローカルportのbind拒否と`/tmp`書き込み拒否により失敗し、sandbox外の再実行で全件成功（実exit 0）した。
+`actionlint`は変更したworkflowに既存のinfo 2件だけを報告した。Windows/Linuxでの試験とhostedでの
+workflow実行は未実施であり、R0の基準取得と最終候補のC4で確認する。
