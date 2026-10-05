@@ -12,30 +12,22 @@ path = "src/main.rs"
 
 [dependencies]
 kio-app.workspace = true
-cap-primitives.workspace = true
 clap.workspace = true
-getrandom.workspace = true
-kio-adapter = { path = "../kio-adapter" }
 kio-core.workspace = true
 kio-index = { path = "../kio-index" }
-kio-pipeline = { path = "../kio-pipeline" }
-kio-search = { path = "../kio-search" }
-rusqlite = { workspace = true, features = ["hooks"] }
-serde.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-toml.workspace = true
-toml_edit.workspace = true
-unicode-normalization.workspace = true
 
-[target.'cfg(windows)'.dependencies]
+[target.'cfg(windows)'.dev-dependencies]
 windows-sys.workspace = true
 
 [dev-dependencies]
 assert_cmd = "2"
-# ct3_multi_011 asserts on the device replica through its own public API,
-# rather than pinning the rule to a hand-tuned BM25 ranking.
-kio-index = { path = "../kio-index" }
+kio-adapter = { path = "../kio-adapter" }
+kio-pipeline = { path = "../kio-pipeline" }
+rusqlite = { workspace = true, features = ["hooks"] }
+sha2.workspace = true
+toml.workspace = true
+toml_edit.workspace = true
 base64.workspace = true
 # step4b_flate_contract.rs compresses its PDF fixtures at test time so the
 # FlateDecode extraction path is exercised against real zlib streams.
