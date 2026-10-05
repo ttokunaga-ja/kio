@@ -162,32 +162,20 @@ opt-in 未成立状態の既定値を指す。両者は矛盾せず、明示承�
 > **local HTTP Adapter の loopback 制限と paired grant (2026-09-08)**:
 > `execution_mode = "offline_api"` でも別 process への HTTP dispatch である。loopback
 > 制限は宛先制限であって consent/approval の免除ではない。local Adapter には current
-> scope/device paired network grant と、認証を使う場合には device-local managed CA trust が
-> 必要である。`--offline` はこの HTTP dispatch も禁止する。
+> scope/device paired network grant と device-local managed CA trust が必要である
+> ([14-v1-runtime-contracts.md](14-v1-runtime-contracts.md))。`--offline` はこの HTTP
+> dispatch も禁止する。
 >
-> **(1) url は loopback リテラルに限定する。**
-> 受理するのは `127.0.0.1` / `localhost` / `[::1]` / UNIX domain socket **のみ**。
-> **判定はリテラル文字列に対して行い、ホスト名解決の結果を見ない** (解決結果を信用すると
-> DNS rebinding で loopback を名乗る外部ホストへ送信できてしまう)。違反は
-> `KIO-E-CONFIG-OFFLINE-URL-001` (exit 2、[06-cli-spec.md §8](06-cli-spec.md) /
-> [10-operations.md §11.1](10-operations.md))。検証点は tool-lock materialize /
-> adapter 登録時 — §2 が `offline_api` を「ネット送信なし」と**定義**している以上、
-> 定義に反する構成は実行前に拒否する。
+> **(1) url は明示ポート付きの HTTPS loopback リテラルに限定する。**
 >
-> 判定の細部 (2026-07-26 実装時に確定):
+> - スキームは `https://` のみ。`http://`、`unix:`、スキームなしの形は受理しない
+> - ホストは `127.0.0.1` / `localhost` / `[::1]` との**完全一致**。判定はリテラル文字列に
+>   対して行い、ホスト名解決の結果を見ない (DNS rebinding で loopback を名乗る外部ホストへ
+>   送信させないため)。`localhost.evil.example` のような接尾辞付きは拒否する
+> - 0 以外の明示ポートが必須。userinfo (`@`) と query は拒否する。パスは任意
 >
-> - **スキームは必須** (`http://` / `https://` / `unix:`)。`127.0.0.1:8000` のような
->   スキームなしの形は authority の切り出しが一意に定まらないため受理しない
-> - **userinfo (`@`) を含む url は拒否する。** `http://127.0.0.1@evil.example/` の
->   実ホストは `evil.example` であり、`@` の前は認証情報である。解析して捨てるのではなく
->   存在自体を拒否する — 解析の取り違えが起こり得ない形にするため
-> - ホストは上記 3 リテラルとの**完全一致**。`localhost.evil.example` /
->   `127.0.0.1.evil.example` のような接尾辞付きは拒否する
-> - ポートとパスは自由 (`http://localhost:8000/v1`)
->
-> **検証は 2 箇所で行う。** config 読込時 (`tools.toml` の検証) と
-> **実行直前の宣言再検査**の両方。後者を欠くと、起動時検証を通った宣言が
-> 実行の瞬間に別経路で拒否される (あるいはその逆に素通りする)。
+> 違反は `KIO-E-LOCAL-PEER-URL-001` で拒否する。検証は `tools.toml` の検証時と
+> 実行直前の宣言再検査の両方で行う。
 >
 > `kind = "offline_api"` が外部 URL を受理することはない。加えて、loopback endpoint
 > への本文送信は paired grant がなければ拒否する。scope config の一行だけ、device grant
@@ -205,12 +193,12 @@ opt-in 未成立状態の既定値を指す。両者は矛盾せず、明示承�
 > ```toml
 > [embedding.qwen3_vl_embedding_local]
 > kind  = "offline_api"
-> url   = "http://127.0.0.1:8000"      # loopback リテラルのみ。末尾の /v1 は不要
+> url   = "https://127.0.0.1:8000"     # HTTPS loopback リテラルと明示ポート。末尾の /v1 は不要
 > model = "Qwen/Qwen3-VL-Embedding-2B" # 省略時はこの値
 >
 > [markdown.paddleocr_vl_local]
 > kind  = "offline_api"
-> url   = "http://127.0.0.1:8080"      # 末尾の /layout-parsing は不要
+> url   = "https://127.0.0.1:8080"     # 末尾の /layout-parsing は不要
 > model = "PaddleOCR-VL-0.9B"          # 接頭辞 `PaddleOCR-VL` で照合
 > ```
 >
@@ -506,7 +494,7 @@ incremental の詳細プロンプト規約は §8 (生成 LLM 系のみ。§8 �
     policy/profile は task identity に含め、既存 annotation 無し Done task を default-on の完了扱いにしない
 - 生成 LLM (Gemini / Claude / GPT 等) は Markdownize の主処理ではなく、OCR 後の品質検証・図表解釈に使う。
 
-> **実地検証済み (2026-07-03、設計宿題 #6 解消 [09-mvp-scope.md §5.4](09-mvp-scope.md))**: 合成 fixture (複雑表・日本語・数式・埋め込み画像、4 ページ) を sync / Batch 両モードで検証: 表セル一致率 1.0 (17/17)、日本語 CER 0.0、画像抽出 1/1 (placeholder 形式も §5.2 想定どおり)、数式は LaTeX でテキスト化。単価は公称一致 (API $4 / Batch $2 per 1,000 pages)、Batch のジョブ往復は 4 ページで約 24 秒。ハーネスと実測ログは `experiments/ocr-verification`。
+> **実地検証済み (2026-07-03、Adapter 選定 — [09-mvp-scope.md §5](09-mvp-scope.md))**: 合成 fixture (複雑表・日本語・数式・埋め込み画像、4 ページ) を sync / Batch 両モードで検証: 表セル一致率 1.0 (17/17)、日本語 CER 0.0、画像抽出 1/1 (placeholder 形式も §5.2 想定どおり)、数式は LaTeX でテキスト化。単価は公称一致 (API $4 / Batch $2 per 1,000 pages)、Batch のジョブ往復は 4 ページで約 24 秒。ハーネスと実測ログは `experiments/ocr-verification`。
 
 ## 5.2.1 Normalized Markdown 形式 (最小凍結 — 2026-07-18)
 
@@ -1118,13 +1106,13 @@ MVP における Adapter の脅威モデルを次のとおり確定する。
    同期有料要求の後でFullを再送するには、一度の明示承認と新しい予約が必要 —
    [04-pipeline.md §3.2](04-pipeline.md) の制御応答規則。full 応答での本 flag は contract violation)
    閾値の Adapter 側 hint は Kio 側 hint と衝突したら **Kio 側を優先**
-5. spec_version 不一致なら、Adapter は invalid_input として失敗 (`KIO-E-ADAPTER-SPECVER-001` — 汎用 `KIO-E-ADAPTER-CONTRACT-001` (retryable 1 回) と区別し、[04-pipeline.md §5.3](04-pipeline.md) の invalid_input 分類 = max_attempts 0 に一意に対応させる)
+5. spec_version 不一致なら、Adapter は invalid_input として失敗する (`KIO-E-BATCH-INPUT-001`。汎用 `KIO-E-ADAPTER-CONTRACT-001` (retryable 1 回) と区別し、[04-pipeline.md §5.3](04-pipeline.md) の invalid_input 分類 = max_attempts 0 に対応させる)
 6. 出力は Kio 側の受け入れ検査 (04-pipeline.md §3.2) を通過しなければ persist されない。
    違反は KIO-E-ADAPTER-CONTRACT-001 として reject され、**incremental capability 非互換の場合に
    限り** full に fallback する (spec_version 非互換は下記のとおり fallback しない)
 ```
 
-`spec_version` の bump 規約は [10-operations.md §11.5](10-operations.md) を正とする。**full fallback (§8.4) が有効なのは incremental capability だけが非互換な場合に限る** — full request も同じ `spec_version` を含むため、spec_version 自体の非互換は full で呼び直しても同じ invalid_input を再生するだけである。この場合は `KIO-E-ADAPTER-SPECVER-001` (§8.1 手順 5 — invalid_input / 非再試行) として当該 online Adapter のタスクを failed permanent (Adapter 更新が必要) にし、同梱 deterministic Adapter のベースライン (§2.1) は影響を受けず継続する。
+`spec_version` の bump 規約は [10-operations.md §11.5](10-operations.md) を正とする。**full fallback (§8.4) が有効なのは incremental capability だけが非互換な場合に限る** — full request も同じ `spec_version` を含むため、spec_version 自体の非互換は full で呼び直しても同じ invalid_input を再生するだけである。この場合は invalid_input (`KIO-E-BATCH-INPUT-001`、§8.1 手順 5 — 非再試行) として当該 online Adapter のタスクを failed permanent (Adapter 更新が必要) にし、同梱 deterministic Adapter のベースライン (§2.1) は影響を受けず継続する。
 
 ## 8.2 推奨プロンプト構造 (frontier AI 系)
 
