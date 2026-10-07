@@ -1303,3 +1303,46 @@ R0の基準取得で確認する。未追跡WIPは変更していない。`.giti
 ローカルportのbind拒否と`/tmp`書き込み拒否により失敗し、sandbox外の再実行で全件成功（実exit 0）した。
 `actionlint`は変更したworkflowに既存のinfo 2件だけを報告した。Windows/Linuxでの試験とhostedでの
 workflow実行は未実施であり、R0の基準取得と最終候補のC4で確認する。
+
+## 26. R0: 構造是正前の3 OS基準
+
+2026-10-07 JST記録。候補 `bc1a28ab733da29e56f36466c1209e7364a4b54c`（tree `5672ad88cd357cc439e4f46b3a0b53fdda2cab95`、
+tracked 1,660件）をgit bundle（SHA-256 `f5461d2ff088bcd45f0494cc80a5f699bf253725f9e2d896c96f85d8f5c6d01d`）で
+3 OSの新規privateディレクトリへ配置し、各OSでHEAD・tree・`git ls-files -s -z`のSHA-256
+（`39abbcba…1783`）とclean状態をMacと照合した。Rust 1.98.0で
+`fmt --all -- --check`、`clippy --workspace --all-targets --locked -- -D warnings`、
+`test --workspace --all-targets --locked`（filterなし・既定のtest threads）、
+`build --release --workspace --locked`、`test ... -- --list --format terse` を順に実行し、
+各工程の後にもソースを照合した。3 OSとも全5工程のcargo実exitが0、工程後の照合も全件一致した。
+
+| OS | 実行環境 | test結果（libtest summary合計） | test所要 | libtest一覧 |
+|---|---|---|---|---|
+| macOS | sandbox外、`~/.codex/validation/kio-r0-bc1a28ab` | 100 summary、3,270 pass / 0 fail / 0 ignored | 29.7分 | 89 target / 3,259件 |
+| Linux (WSL Ubuntu 26.04) | umask 0022、0700のroot | 103 summary、3,279 pass / 0 fail / 1 ignored | 12.4分 | 89 target / 3,266件 |
+| Windows 11 | MSVC 1.98.0、VsDevCmd、`CARGO_BUILD_JOBS=2` | 97 summary、2,965 pass / 0 fail / 1 ignored | 44.6分 | 89 target / 2,958件 |
+
+summaryの合計は入れ子のtest harnessを含み、一覧の件数と一致しない。89 targetは3 OSに共通し、
+42 targetでOS別の試験差がある（`summary.json`の`per_target`）。R2のOS分離ではこの一覧を基準に、
+移動の前後で各OSの試験集合が変わらないことを確認する。
+
+経緯と処置:
+
+- WSLの最初のrootでは、runnerがリポジトリ外で`git bundle verify`を実行して停止した（cargo未実行）。
+  clone後にリポジトリ内で検証するよう直し、新しいroot `r0-bc1a28ab-v2` で実行した。失敗rootと記録は保持した。
+- WindowsのC:空きは、同じPC上のWSL仮想ディスク（371 GiB、sparseでない）の伸長で約88.6 GiBから62 GiBに減り、
+  新規targetでのbuildが下限50 GiBを割る見込みとなった。利用者の承認を得て、旧候補のbuild出力
+  `candidate-e837020\target`、`w03a2v2\target`、`w3d4fv1\target`（計約66 GiB）だけを削除した。
+  削除前に通常directoryであること、Cargo出力以外の項目と再解析pointがないことを確認した。最初の削除は
+  `CACHEDIR.TAG`がないため検査で拒否され、Cargoのdirectory構成を確認して判定を改めてから実行した。
+  receipt・証跡・`windows-candidate-452adbc\private-temp`は変更していない。空きは122 GiBになった。
+- Windowsのtest中の17:12:50 JSTに、RM2Cのセッションのスタートメニューから再起動が操作された
+  （System event 1074、正常shutdown。crashや更新待ちではない）。SSHは255で切断し、testは未完了だった。
+  中断した記録を`interrupted-test-1`へ退避し、再起動後のソース照合が一致することを確かめ、
+  利用者の確認を得て同じroot・同じSHAでtest・release・listを再実行した。fmtとClippyは再起動前の成功を用いた。
+- Windowsの準備で記録した最長path 356は、日本語pathをgitが8進表記した文字数で、実pathの長さではない。
+
+証跡は repo外の `~/Documents/Codex/2026-10-07/kio-r0-bc1a28ab/`（`summary.json` SHA-256
+`4d0b35b5f769a888b60993d72bb64841e4fadf2ba557d6b9fcbee07429889a9c`、目録 `artifact-manifest.json`）。
+Macの未追跡WIP 128件は凍結時の指紋と一致した。検証用のcheckoutとtargetは各hostに残した
+（Windows `r0bc1`、WSL `r0-bc1a28ab-v2`・失敗した`r0-bc1a28ab`、Mac `~/.codex/validation/kio-r0-bc1a28ab`）。
+R0はローカル基準であり、配布物の検証、hosted CI、ci.ymlのその他の検査、受入receiptを含まない。
