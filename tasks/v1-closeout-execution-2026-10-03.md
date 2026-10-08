@@ -1346,3 +1346,51 @@ summaryの合計は入れ子のtest harnessを含み、一覧の件数と一致�
 Macの未追跡WIP 128件は凍結時の指紋と一致した。検証用のcheckoutとtargetは各hostに残した
 （Windows `r0bc1`、WSL `r0-bc1a28ab-v2`・失敗した`r0-bc1a28ab`、Mac `~/.codex/validation/kio-r0-bc1a28ab`）。
 R0はローカル基準であり、配布物の検証、hosted CI、ci.ymlのその他の検査、受入receiptを含まない。
+
+## 27. R1: 規模上限とOS分離の計測ツール
+
+2026-10-08 JST記録。`kio-ci` に `kio-code-limits` を追加した（`469fc96bfd21936564f0b8b477ee9acd48698b5d`、
+tree `29227f84d7221c8b2ae7a955880ea3b472f82b84`）。実装前に [09 §3](../docs/09-mvp-scope.md) を、計測で判定できる
+形に明確化した。`platform/mod.rs` はOS共通に数え、OS条件は `mod`/`use` の選択にだけ付ける。分離規則は製品crateに限り、
+toolingには適用しない。OS条件の識別子は6種とする。テストコードは `test` を必須とするcfgのitemとする。テスト用のfile名は
+`tests.rs`・`*_tests.rs`・`test_support.rs` とし、静的に決められない構文は計測失敗とする。終了値は、違反なしが0、違反ありが1、
+計測失敗が2である。CIの `acceptance-tooling` jobは0と1を通し、R5で0だけを通す。許可リストは空で始める。
+
+実測（Mac・WSL・Windows MSVCの出力JSONがバイト一致、SHA-256 `134b03ee…a2c7`）:
+
+| 区分 | コード行 | 上限 |
+|---|---:|---:|
+| OS共通の製品ロジック | 118,746 | 100,000 |
+| OS固有層（Windows・Unix・Linux・macOS） | 各0（`src/platform/` 未作成） | 14,000・9,000・4,000・3,000 |
+| 検証tooling | 63,418（うち本ツール1,181） | 65,000 |
+
+- 1ファイルの超過は推定と同じ5本だった。`kio-app/src/lib.rs` 21,547、`kio-core/src/scope.rs` 6,768、`gc.rs` 4,842、
+  `cas.rs` 4,669、`kio-app/src/verify_objects.rs` 3,781行で、推定との差は±50行以内である。
+- 共通ロジック内のOS条件は1,155件ある（cfg属性1,145、`cfg!` 10）。crate別では、kio-core 529、kio-app 174、
+  kio-index 166、kio-pipeline 138、kio-process 106、kio-adapter 42件である。
+- 製品合計は、推定値の合計（約123,000行）より3.5%少ない。旧推定はOS条件とOS名による近似である。
+  今回はテストのitemを構文上の範囲で除いた。
+- 計画§10のOS条件約2,200箇所は、製品とtoolingの合計でテストを含む。集計範囲が異なるため、直接は比較しない。
+
+進め方と検証:
+
+- 読み取り調査、実装、修正、3 OS照合はCodex CLI（ChatGPT認証）に任せた。実装とは別のsessionで、反証的なレビューを3回行った。
+  指摘は8件、5件、1件と減り、すべてRed→Greenの試験を付けて直した。
+- 監督側では2件を直した。crate直下の `tests/`・`benches/` は字句検査だけに戻した。macro内の `mod` は
+  inline module以外を計測失敗にした。レビューの再現fixture 104件の結果は期待と一致した。
+- Macでは `test -p kio-ci`（116件）、`fmt --all -- --check`、workspaceのstrict Clippyが成功し、`Cargo.lock` は変わらなかった。
+  WSLでは `test -p kio-ci` が113件、Windows MSVCでは78件、いずれも失敗0で成功した。件数の差はOS限定の試験による。
+  各工程の前後で、HEAD・tree・`ls-files -s -z`・cleanを照合した。
+- Windowsでは、cargoの終了後に待機用のwrapperが戻らなかった。cargoの終了値0の記録と、build processがないことを確かめた。
+  そのうえで、今回のwrapperのPIDだけを終了した。試験は再実行していない。
+- workspace全体のtestとrelease buildは行っていない。kio-ciに依存するcrateがなく、`Cargo.lock` も不変のためである。
+  hosted CIも未実行である。
+
+残る扱い:
+
+- `condition` の表示文字列は空白を正規化しているため、literal内の連続空白も詰まる。判定には影響しない。
+- `cfg_attr` の中で到達しないpath候補も、ファイル名規則で拒否する（安全側）。
+- 証跡はrepo外の `~/Documents/Codex/2026-10-08/kio-r1/` にある。`runs/` にはA1、B1〜B3、D1〜D3、C1の指示・
+  イベント・最終報告・証跡を置き、`wip/` にはWIPの指紋を置いた。Macの未追跡WIP 128件はR0の指紋と内容まで一致し、
+  各実行の前後でも変わらなかった。
+- 照合用のcheckoutは残した。WSLは `r1-469fc96b`（約362 MiB）、Windowsは `r1-469fc96b`（約317 MiB）である。
