@@ -28,11 +28,11 @@ use kio_process::{
     confinement::{RenderResourceLimits, RenderSandbox},
 };
 use sha2::{Digest, Sha256};
-use tempfile::{Builder, TempDir};
 
-#[cfg(target_os = "macos")]
-use quick_xml::{Reader, events::Event};
-
+use crate::platform::{
+    OfficeRuntime, canonical_renderer_program, file_url, private_temp_dir,
+    restrict_renderer_state_directory,
+};
 use crate::{AdapterError, Result};
 
 /// Test seam env var: its value is a path to a fixture PDF returned
@@ -50,7 +50,7 @@ const OFFICE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const OFFICE_CONVERT_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_OFFICE_INPUT_BYTES: usize = 100 * 1024 * 1024;
 const MAX_OFFICE_PDF_BYTES: usize = 250 * 1024 * 1024;
-const MAX_OFFICE_LOG_BYTES: usize = 64 * 1024;
+pub(crate) const MAX_OFFICE_LOG_BYTES: usize = 64 * 1024;
 const OFFICE_NORMALIZATION_PROFILE: &str = "pdf-volatile-fields-v1";
 const MACOS_UNO_FILTER_VERSION: &str = "macos-spell-component-v1";
 
@@ -109,17 +109,8 @@ enum ConverterBackend {
     Real {
         program: PathBuf,
         program_digest: String,
-        uno_catalog: Option<PrivateUnoCatalog>,
+        runtime: OfficeRuntime,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PrivateUnoCatalog {
-    #[cfg(target_os = "macos")]
-    source: PathBuf,
-    #[cfg(target_os = "macos")]
-    bundle: PathBuf,
-    source_digest: String,
 }
 
 /// A resolved Office → PDF converter (07 §5.1). Obtain one via
@@ -159,18 +150,13 @@ impl OfficeConverter {
             ConverterBackend::Real {
                 program,
                 program_digest,
-                uno_catalog,
+                runtime,
             } => {
                 digest.update(program.as_os_str().as_encoded_bytes());
                 digest.update(b"\0");
                 digest.update(program_digest.as_bytes());
                 digest.update(b"\0");
-                digest.update(
-                    uno_catalog
-                        .as_ref()
-                        .map_or("none", |catalog| &catalog.source_digest)
-                        .as_bytes(),
-                );
+                digest.update(runtime.catalog_digest().unwrap_or("none").as_bytes());
             }
         }
         hex_digest(&digest.finalize())
@@ -201,12 +187,11 @@ impl OfficeConverter {
             ConverterBackend::Real {
                 program,
                 program_digest,
-                uno_catalog,
+                runtime,
             } => {
                 crate::ooxml_package::validate_real_office_package(input, media_type)?;
                 verify_renderer_fingerprint(program, program_digest, "before conversion")?;
-                let pdf =
-                    convert_with_real_binary(program, uno_catalog.as_ref(), input, media_type)?;
+                let pdf = convert_with_real_binary(program, runtime, input, media_type)?;
                 verify_renderer_fingerprint(program, program_digest, "after conversion")?;
                 Ok(normalize_converted_pdf(&pdf))
             }
@@ -261,37 +246,6 @@ fn resolve_program(program: PathBuf) -> Option<PathBuf> {
         .find_map(canonical_renderer_program)
 }
 
-fn canonical_renderer_program(candidate: PathBuf) -> Option<PathBuf> {
-    let canonical = std::fs::canonicalize(&candidate).ok()?;
-    if !canonical.is_file() {
-        return None;
-    }
-    // Recognize only the known passthrough wrapper by both location and bytes.
-    // A command installed at the Homebrew name may select another application
-    // or add arguments; its name alone cannot authorize substituting this app.
-    #[cfg(target_os = "macos")]
-    {
-        let known_location = ["/opt/homebrew/bin/soffice", "/usr/local/bin/soffice"]
-            .into_iter()
-            .filter_map(|path| std::fs::canonicalize(path).ok())
-            .any(|path| path == canonical);
-        let known_passthrough = known_location
-            && kio_core::cas::read_bounded_regular_file(&canonical, 4096)
-                .is_ok_and(|bytes| is_macos_office_passthrough_wrapper(&bytes));
-        if known_passthrough {
-            return std::fs::canonicalize("/Applications/LibreOffice.app/Contents/MacOS/soffice")
-                .ok()
-                .filter(|program| program.is_file());
-        }
-    }
-    Some(canonical)
-}
-
-#[cfg(target_os = "macos")]
-fn is_macos_office_passthrough_wrapper(bytes: &[u8]) -> bool {
-    bytes == b"#!/bin/bash\nexec \"/Applications/LibreOffice.app/Contents/MacOS/soffice\"  \"$@\"\n"
-}
-
 /// Probe a candidate converter binary via `--version`. ANY failure (spawn
 /// error / missing binary, non-zero exit, empty stdout) resolves to `None`
 /// — never an `Err`, per [`resolve_office_converter`]'s contract.
@@ -305,14 +259,14 @@ fn probe_real_converter(program: PathBuf) -> Option<OfficeConverter> {
 /// an absent binary.
 fn probe_real_converter_diagnostic(program: PathBuf) -> Result<OfficeConverter> {
     let program_digest = fingerprint_renderer_program(&program)?;
-    let uno_catalog = private_uno_catalog_for_program(&program)?;
+    let runtime = OfficeRuntime::new(&program)?;
     let scratch = private_temp_dir()?;
     let profile_dir = create_private_renderer_state(scratch.path(), "probe")?;
     let profile_url = file_url(&profile_dir)?;
     let sandbox = RenderSandbox::new(
         &program,
         scratch.path(),
-        renderer_runtime_roots(&program, uno_catalog.as_ref())?,
+        runtime.runtime_roots(&program)?,
         RenderResourceLimits::default(),
     )
     .map_err(|error| {
@@ -320,14 +274,8 @@ fn probe_real_converter_diagnostic(program: PathBuf) -> Result<OfficeConverter> 
             "office converter confinement setup failed: {error}"
         ))
     })?;
-    let mut environment = renderer_environment(&program, Some(&profile_dir));
-    if let Some(catalog) = uno_catalog.as_ref() {
-        let private_catalog = write_private_uno_catalog(catalog, scratch.path())?;
-        environment.push((
-            OsString::from("URE_MORE_SERVICES"),
-            file_url(&private_catalog)?.into(),
-        ));
-    }
+    let mut environment = runtime.environment(&program, Some(&profile_dir));
+    runtime.configure_services(scratch.path(), &mut environment)?;
     let output = sandbox
         .run(
             [
@@ -357,10 +305,7 @@ fn probe_real_converter_diagnostic(program: PathBuf) -> Result<OfficeConverter> 
     // The supported official macOS 26.8 build includes the SVP headless
     // backend. The tested 26.2.5 build lacks it: its version probe succeeds,
     // but document conversion enters Cocoa and aborts under confinement.
-    #[cfg(target_os = "macos")]
-    if uno_catalog.is_some() {
-        validate_macos_office_version(&output.stdout)?;
-    }
+    runtime.validate_probe(&output.stdout)?;
     let version = output
         .stdout
         .lines()
@@ -376,58 +321,10 @@ fn probe_real_converter_diagnostic(program: PathBuf) -> Result<OfficeConverter> 
         backend: ConverterBackend::Real {
             program,
             program_digest,
-            uno_catalog,
+            runtime,
         },
         version: version.to_owned(),
     })
-}
-
-/// Supported-release policy for verified macOS LibreOffice bundles only.
-/// This prevents known incompatible releases; actual native acceptance remains
-/// the capability proof for each pinned distribution.
-#[cfg(target_os = "macos")]
-fn validate_macos_office_version(stdout: &str) -> Result<()> {
-    let malformed = || {
-        AdapterError::ContractViolation(
-            "verified macOS LibreOffice returned a malformed or ambiguous version".to_owned(),
-        )
-    };
-    let line = stdout.trim();
-    if line.len() > 128 || line.contains(['\r', '\n']) {
-        return Err(malformed());
-    }
-    let mut tokens = line.split_ascii_whitespace();
-    if tokens.next() != Some("LibreOffice") {
-        return Err(malformed());
-    }
-    let version = tokens.next().ok_or_else(malformed)?;
-    if tokens.next().is_some_and(|build| {
-        build.len() != 40 || !build.bytes().all(|byte| byte.is_ascii_hexdigit())
-    }) {
-        return Err(malformed());
-    }
-    if tokens.next().is_some() {
-        return Err(malformed());
-    }
-    let mut components = Vec::new();
-    for component in version.split('.') {
-        if !(1..=4).contains(&component.len())
-            || !component.bytes().all(|byte| byte.is_ascii_digit())
-            || (component.len() > 1 && component.starts_with('0'))
-        {
-            return Err(malformed());
-        }
-        components.push(component.parse::<u16>().map_err(|_| malformed())?);
-    }
-    if !(3..=4).contains(&components.len()) {
-        return Err(malformed());
-    }
-    if (components[0], components[1]) < (26, 8) {
-        return Err(AdapterError::ContractViolation(
-            "sandboxed macOS Office conversion requires LibreOffice 26.8 or newer; the selected release predates the supported headless runtime".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 fn fingerprint_renderer_program(program: &Path) -> Result<String> {
@@ -459,54 +356,6 @@ fn office_extension(media_type: &str) -> Option<&'static str> {
     }
 }
 
-/// Create an exclusively allocated, owner-private scratch directory.  The
-/// `tempfile` implementation uses a random name and atomic create; on Unix we
-/// also set the mode explicitly instead of inheriting the caller's umask.
-fn private_temp_dir() -> Result<TempDir> {
-    let directory = {
-        let mut builder = Builder::new();
-        builder.prefix("kio-");
-        #[cfg(target_os = "macos")]
-        {
-            // LibreOffice's Unix-domain socket names must fit sun_path. A
-            // canonical short parent leaves room for its generated suffixes;
-            // the directory remains exclusively created and owner-private.
-            let socket_root = std::fs::canonicalize("/private/tmp").map_err(|error| {
-                AdapterError::ContractViolation(format!(
-                    "failed to resolve private Office socket root: {error}"
-                ))
-            })?;
-            builder.tempdir_in(socket_root)
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            builder.tempdir()
-        }
-    }
-    .map_err(|error| {
-        AdapterError::ContractViolation(format!(
-            "failed to create private office scratch directory: {error}"
-        ))
-    })?;
-    #[cfg(windows)]
-    crate::platform::protect_owner_private_scratch(directory.path()).map_err(|error| {
-        AdapterError::ContractViolation(format!(
-            "failed to establish owner-private office scratch directory: {error}"
-        ))
-    })?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
-            .map_err(|error| {
-                AdapterError::ContractViolation(format!(
-                    "failed to restrict office scratch directory permissions: {error}"
-                ))
-            })?;
-    }
-    Ok(directory)
-}
-
 /// Construct all renderer-owned mutable state before process creation. These
 /// names are derived only from an exclusively-created private scratch parent;
 /// on Windows they inherit its protected owner DACL before AppContainer
@@ -525,627 +374,13 @@ fn create_private_renderer_state(scratch: &Path, purpose: &str) -> Result<PathBu
                 "failed to create private {purpose} {label}: {error}"
             ))
         })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
-                |error| {
-                    AdapterError::ContractViolation(format!(
-                        "failed to restrict private {purpose} {label}: {error}"
-                    ))
-                },
-            )?;
-        }
+        restrict_renderer_state_directory(path, purpose, label)?;
     }
     Ok(profile)
 }
 
-// A bundle-shaped path is not authority. Only Apple's verifier may authorize
-// the enclosing app as a runtime read root. Custom standalone renderers keep
-// their existing executable-only access.
-#[cfg(target_os = "macos")]
-fn macos_office_bundle_candidate(program: &Path) -> Option<PathBuf> {
-    if !program.is_absolute() || program.file_name()? != "soffice" {
-        return None;
-    }
-    let macos = program.parent()?;
-    let contents = macos.parent()?;
-    let bundle = contents.parent()?;
-    (macos.file_name()? == "MacOS"
-        && contents.file_name()? == "Contents"
-        && bundle.extension()? == "app")
-        .then(|| bundle.to_path_buf())
-}
-
-#[cfg(target_os = "macos")]
-fn verify_macos_office_bundle(bundle: &Path) -> Result<()> {
-    // -R= is the codesign inline requirement syntax; no shell or ambient
-    // executable search is involved. Deep verification covers nested code,
-    // and strict verification rejects unsealed/escaping symbolic links.
-    const REQUIREMENT: &str = "-R=anchor apple generic and certificate leaf[subject.OU] = \"7P5S3ZLCN7\" and identifier \"org.libreoffice.script\"";
-    let mut command = std::process::Command::new("/usr/bin/codesign");
-    command
-        .env_clear()
-        .current_dir("/")
-        .args([
-            "--verify",
-            "--deep",
-            "--strict",
-            "--all-architectures",
-            REQUIREMENT,
-        ])
-        .arg(bundle);
-    let output = kio_process::run_bounded_command(
-        &mut command,
-        BoundedProcessOptions {
-            timeout: Duration::from_secs(60),
-            max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
-            max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
-        },
-        None,
-    )
-    .map_err(|_| {
-        AdapterError::ContractViolation("Office bundle signature verification failed".to_owned())
-    })?;
-    if !output.status.success() {
-        return Err(AdapterError::ContractViolation(
-            "Office bundle is not a verified LibreOffice distribution".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "macos")]
-#[derive(PartialEq, Eq)]
-struct OfficeBundlePathIdentity {
-    device: u64,
-    inode: u64,
-    mode: u32,
-    owner: u32,
-    len: u64,
-    modified: (i64, i64),
-    changed: (i64, i64),
-}
-
-#[cfg(target_os = "macos")]
-fn office_bundle_path_snapshot(
-    bundle: &Path,
-    program: &Path,
-    source: &Path,
-) -> Result<Vec<OfficeBundlePathIdentity>> {
-    use std::os::unix::fs::MetadataExt;
-    // Refuse aliases and escapes for every authority-bearing path. Retain
-    // filesystem identity across verification and catalog parsing, including
-    // ownership and permissions, to detect replacement during these checks.
-    [
-        bundle.to_path_buf(),
-        bundle.join("Contents"),
-        bundle.join("Contents/MacOS"),
-        bundle.join("Contents/Resources"),
-        bundle.join("Contents/Resources/services"),
-        program.to_path_buf(),
-        source.to_path_buf(),
-    ]
-    .iter()
-    .map(|path| {
-        let fail = || {
-            AdapterError::ContractViolation("Office bundle path is unstable or unsafe".to_owned())
-        };
-        if std::fs::canonicalize(path).map_err(|_| fail())? != *path {
-            return Err(fail());
-        }
-        let metadata = std::fs::symlink_metadata(path).map_err(|_| fail())?;
-        if metadata.mode() & 0o022 != 0 {
-            return Err(fail());
-        }
-        Ok(OfficeBundlePathIdentity {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-            mode: metadata.mode(),
-            owner: metadata.uid(),
-            len: metadata.len(),
-            modified: (metadata.mtime(), metadata.mtime_nsec()),
-            changed: (metadata.ctime(), metadata.ctime_nsec()),
-        })
-    })
-    .collect()
-}
-
-#[cfg(target_os = "macos")]
-fn private_uno_catalog_for_program(program: &Path) -> Result<Option<PrivateUnoCatalog>> {
-    let Some(bundle) = macos_office_bundle_candidate(program) else {
-        return Ok(None);
-    };
-    let source = bundle.join("Contents/Resources/services/services.rdb");
-    let before = office_bundle_path_snapshot(&bundle, program, &source)?;
-    verify_macos_office_bundle(&bundle)?;
-    let bytes = read_stable_catalog(&source)?;
-    let _ = macos_spell_component_range(&bytes)?;
-    if before != office_bundle_path_snapshot(&bundle, program, &source)? {
-        return Err(AdapterError::ContractViolation(
-            "Office bundle changed during verification".to_owned(),
-        ));
-    }
-    let digest = Sha256::digest(&bytes);
-    Ok(Some(PrivateUnoCatalog {
-        source,
-        bundle,
-        source_digest: hex_digest(&digest),
-    }))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn private_uno_catalog_for_program(_program: &Path) -> Result<Option<PrivateUnoCatalog>> {
-    Ok(None)
-}
-
-#[cfg(target_os = "macos")]
-fn read_stable_catalog(path: &Path) -> Result<Vec<u8>> {
-    const MAX_CATALOG_BYTES: usize = 1024 * 1024;
-    kio_core::cas::read_bounded_regular_file(path, MAX_CATALOG_BYTES as u64).map_err(|error| {
-        AdapterError::ContractViolation(format!(
-            "cannot safely read Office service catalog: {error}"
-        ))
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn macos_spell_component_range(bytes: &[u8]) -> Result<(usize, usize)> {
-    const IMPLEMENTATION: &[u8] = b"org.openoffice.lingu.MacOSXSpellChecker";
-    const CONSTRUCTOR: &[u8] = b"lingucomponent_MacSpellChecker_get_implementation";
-    let mut reader = Reader::from_reader(bytes);
-    reader.config_mut().check_end_names = true;
-    let mut buffer = Vec::new();
-    let mut previous = 0_usize;
-    let mut component: Option<(usize, usize, usize, bool)> = None;
-    let mut match_range = None;
-    let mut root_started = false;
-    let mut root_closed = false;
-    let mut root_depth = 0_usize;
-    loop {
-        let start = previous;
-        let event = reader.read_event_into(&mut buffer).map_err(|error| {
-            AdapterError::ContractViolation(format!(
-                "Office service catalog XML is invalid: {error}"
-            ))
-        })?;
-        previous = reader.buffer_position() as usize;
-        match event {
-            Event::DocType(_) => {
-                return Err(AdapterError::ContractViolation(
-                    "Office service catalog must not contain a DOCTYPE".to_owned(),
-                ));
-            }
-            Event::Start(ref tag) | Event::Empty(ref tag) => {
-                let empty = matches!(&event, Event::Empty(_));
-                let tag_name = tag.name();
-                let name = tag_name.as_ref();
-                // `quick-xml` reports attribute syntax failures lazily. Walk
-                // every element's attributes before interpreting its shape so
-                // a malformed unrelated component cannot survive the filtered
-                // copy unchanged.
-                let mut declared_namespace = None;
-                let mut implementation = None;
-                let mut constructor = None;
-                for attribute in tag.attributes().with_checks(true) {
-                    let attribute = attribute.map_err(|error| {
-                        AdapterError::ContractViolation(format!(
-                            "Office service catalog attribute is invalid: {error}"
-                        ))
-                    })?;
-                    match attribute.key.as_ref() {
-                        b"xmlns" => {
-                            declared_namespace = Some(
-                                attribute.value.as_ref()
-                                    == b"http://openoffice.org/2010/uno-components",
-                            )
-                        }
-                        b"name" if name == b"implementation" => {
-                            implementation = Some(attribute.value.as_ref() == IMPLEMENTATION)
-                        }
-                        b"constructor" if name == b"implementation" => {
-                            constructor = Some(attribute.value.as_ref() == CONSTRUCTOR)
-                        }
-                        _ => {}
-                    }
-                }
-                if !root_started {
-                    if empty || name != b"components" || declared_namespace != Some(true) {
-                        return Err(AdapterError::ContractViolation("Office service catalog must have one components root in the UNO namespace".to_owned()));
-                    }
-                    root_started = true;
-                    root_depth = 1;
-                    buffer.clear();
-                    continue;
-                }
-                if root_closed {
-                    return Err(AdapterError::ContractViolation(
-                        "Office service catalog has content after its root element".to_owned(),
-                    ));
-                }
-                root_depth += 1;
-                if name == b"component" && root_depth != 2 {
-                    return Err(AdapterError::ContractViolation(
-                        "Office service catalog components must be direct children of the root"
-                            .to_owned(),
-                    ));
-                }
-                if (name == b"component" || name == b"implementation")
-                    && declared_namespace == Some(false)
-                {
-                    return Err(AdapterError::ContractViolation(
-                        "Office service catalog direct component namespace is invalid".to_owned(),
-                    ));
-                }
-                if name == b"component" && component.is_none() {
-                    component = Some((start, 1, 0, false));
-                } else if let Some((_, depth, _, _)) = component.as_mut() {
-                    *depth += 1;
-                }
-                if name == b"implementation" {
-                    if component.as_ref().map(|(_, depth, _, _)| *depth) != Some(2) {
-                        return Err(AdapterError::ContractViolation(
-                            "Office service catalog implementations must be direct component children"
-                                .to_owned(),
-                        ));
-                    }
-                    if implementation == Some(true) {
-                        if constructor != Some(true) || match_range.is_some() {
-                            return Err(AdapterError::ContractViolation("Office service catalog spell checker is not the expected single implementation".to_owned()));
-                        }
-                        let Some((_, _, implementations, target)) = component.as_mut() else {
-                            return Err(AdapterError::ContractViolation(
-                                "Office spell checker is outside a component".to_owned(),
-                            ));
-                        };
-                        *implementations += 1;
-                        *target = true;
-                    } else if let Some((_, _, implementations, _)) = component.as_mut() {
-                        *implementations += 1;
-                    }
-                }
-                if empty {
-                    if let Some((component_start, depth, implementations, target)) =
-                        component.as_mut()
-                    {
-                        *depth = depth.saturating_sub(1);
-                        if *depth == 0 {
-                            if *target {
-                                if *implementations != 1 {
-                                    return Err(AdapterError::ContractViolation("Office spell checker component contains additional implementations".to_owned()));
-                                }
-                                match_range = Some((*component_start, previous));
-                            }
-                            component = None;
-                        }
-                    }
-                    root_depth = root_depth.saturating_sub(1);
-                }
-            }
-            Event::End(tag) => {
-                if !root_started || root_closed || root_depth == 0 {
-                    return Err(AdapterError::ContractViolation(
-                        "Office service catalog has an invalid closing element".to_owned(),
-                    ));
-                }
-                if tag.name().as_ref() == b"component" {
-                    if let Some((component_start, depth, implementations, target)) =
-                        component.as_mut()
-                    {
-                        *depth = depth.saturating_sub(1);
-                        if *depth == 0 {
-                            if *target {
-                                if *implementations != 1 {
-                                    return Err(AdapterError::ContractViolation("Office spell checker component contains additional implementations".to_owned()));
-                                }
-                                match_range = Some((*component_start, previous));
-                            }
-                            component = None;
-                        }
-                    }
-                } else if let Some((_, depth, _, _)) = component.as_mut() {
-                    *depth = depth.saturating_sub(1);
-                }
-                root_depth -= 1;
-                if root_depth == 0 {
-                    if tag.name().as_ref() != b"components" || component.is_some() {
-                        return Err(AdapterError::ContractViolation(
-                            "Office service catalog has an invalid components root".to_owned(),
-                        ));
-                    }
-                    root_closed = true;
-                }
-            }
-            Event::Text(text) => {
-                let raw: &[u8] = text.as_ref();
-                if (!root_started || root_closed) && !raw.iter().all(u8::is_ascii_whitespace) {
-                    return Err(AdapterError::ContractViolation(
-                        "Office service catalog has non-whitespace text outside its root"
-                            .to_owned(),
-                    ));
-                }
-            }
-            Event::Eof => break,
-            _ => {}
-        }
-        buffer.clear();
-    }
-    if !root_closed || component.is_some() {
-        return Err(AdapterError::ContractViolation(
-            "Office service catalog is truncated or has no closed root".to_owned(),
-        ));
-    }
-    match_range.ok_or_else(|| {
-        AdapterError::ContractViolation(
-            "Office service catalog has no expected macOS spell checker component".to_owned(),
-        )
-    })
-}
-
-fn write_private_uno_catalog(catalog: &PrivateUnoCatalog, scratch: &Path) -> Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let bytes = read_stable_catalog(&catalog.source)?;
-        if hex_digest(&Sha256::digest(&bytes)) != catalog.source_digest {
-            return Err(AdapterError::ContractViolation(
-                "Office service catalog changed after converter probe".to_owned(),
-            ));
-        }
-        let (start, end) = macos_spell_component_range(&bytes)?;
-        let destination = scratch.join("services-without-macos-spell.rdb");
-        let mut output = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&destination)
-            .map_err(|error| {
-                AdapterError::ContractViolation(format!(
-                    "cannot create private Office service catalog: {error}"
-                ))
-            })?;
-        use std::io::Write as _;
-        output
-            .write_all(&bytes[..start])
-            .and_then(|()| output.write_all(&bytes[end..]))
-            .and_then(|()| output.sync_all())
-            .map_err(|error| {
-                AdapterError::ContractViolation(format!(
-                    "cannot write private Office service catalog: {error}"
-                ))
-            })?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))
-                .map_err(|error| {
-                    AdapterError::ContractViolation(format!(
-                        "cannot restrict private Office service catalog: {error}"
-                    ))
-                })?;
-        }
-        Ok(destination)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (catalog, scratch);
-        Err(AdapterError::ContractViolation(
-            "private UNO catalogs are unsupported on this platform".to_owned(),
-        ))
-    }
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
+pub(crate) fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
-/// A renderer receives no ambient credentials, proxy, loader, or application
-/// configuration.  This is intentionally a narrow OS-runtime allowlist; the
-/// private profile replaces `HOME` so LibreOffice cannot read user state.
-fn renderer_environment(_program: &Path, home: Option<&Path>) -> Vec<(OsString, OsString)> {
-    let mut environment = Vec::new();
-    #[cfg(unix)]
-    {
-        let path = std::env::join_paths([Path::new("/usr/bin"), Path::new("/bin")])
-            .expect("fixed Unix runtime paths contain no separators");
-        environment.push((OsString::from("PATH"), path));
-    }
-    // Python imported by LibreOffice must not rewrite sealed app resources.
-    #[cfg(target_os = "macos")]
-    environment.push((
-        OsString::from("PYTHONDONTWRITEBYTECODE"),
-        OsString::from("1"),
-    ));
-    #[cfg(windows)]
-    for name in ["SystemRoot", "WINDIR", "COMSPEC", "PATHEXT"] {
-        if let Some(value) = std::env::var_os(name) {
-            environment.push((OsString::from(name), value));
-        }
-    }
-    #[cfg(windows)]
-    {
-        let mut paths = Vec::new();
-        if let Some(system_root) = std::env::var_os("SystemRoot") {
-            let root = PathBuf::from(system_root);
-            paths.push(root.join("System32"));
-            paths.push(root);
-        }
-        if let Ok(path) = std::env::join_paths(paths) {
-            environment.push((OsString::from("PATH"), path));
-        }
-    }
-    if let Some(home) = home {
-        environment.push((OsString::from("HOME"), home.as_os_str().to_owned()));
-        #[cfg(unix)]
-        {
-            environment.push((OsString::from("TMPDIR"), home.as_os_str().to_owned()));
-            if let Some(scratch) = home.parent() {
-                environment.push((
-                    OsString::from("OSL_SOCKET_PATH"),
-                    scratch.as_os_str().to_owned(),
-                ));
-                environment.push((
-                    OsString::from("XDG_CACHE_HOME"),
-                    scratch.join("cache").into_os_string(),
-                ));
-                environment.push((
-                    OsString::from("XDG_CONFIG_HOME"),
-                    scratch.join("config").into_os_string(),
-                ));
-            }
-        }
-        #[cfg(windows)]
-        for name in ["USERPROFILE", "LOCALAPPDATA"] {
-            environment.push((OsString::from(name), home.as_os_str().to_owned()));
-        }
-    }
-    environment
-}
-
-// TDF's system DEBs install outside /usr. This exact root-owned layout is
-// the only additional Linux package authority; a caller's executable path
-// alone still grants no access to sibling files.
-#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
-fn linux_tdf_bundle_candidate(program: &Path) -> Option<PathBuf> {
-    let version = program
-        .to_str()?
-        .strip_prefix("/opt/libreoffice")?
-        .strip_suffix("/program/soffice")?;
-    let (major, minor) = version.split_once('.')?;
-    if ![major, minor]
-        .iter()
-        .all(|part| (1..=4).contains(&part.len()) && part.bytes().all(|byte| byte.is_ascii_digit()))
-    {
-        return None;
-    }
-    Some(PathBuf::from(format!("/opt/libreoffice{version}")))
-}
-
-#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
-fn trusted_linux_package_mode(owner: u32, mode: u32, directory: bool) -> bool {
-    owner == 0 && mode & 0o022 == 0 && (directory || mode & 0o6000 == 0)
-}
-
-#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
-fn verify_linux_package_path(path: &Path, directory: bool) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let fail = || {
-        AdapterError::ContractViolation(
-            "Linux Office package path is unsafe or unavailable".to_owned(),
-        )
-    };
-    let metadata = std::fs::symlink_metadata(path).map_err(|_| fail())?;
-    if (directory && !metadata.is_dir())
-        || (!directory && !metadata.is_file())
-        || !trusted_linux_package_mode(metadata.uid(), metadata.mode(), directory)
-        || std::fs::canonicalize(path).map_err(|_| fail())?.as_os_str() != path.as_os_str()
-    {
-        return Err(fail());
-    }
-    Ok(())
-}
-
-#[cfg(any(target_os = "linux", all(test, target_os = "macos")))]
-fn linux_tdf_runtime_roots(program: &Path) -> Result<Vec<PathBuf>> {
-    let Some(bundle) = linux_tdf_bundle_candidate(program) else {
-        return Ok(Vec::new());
-    };
-    let program_directory = bundle.join("program");
-    let share_directory = bundle.join("share");
-    // TDF initializes each private user profile by copying this package leaf.
-    let presets_directory = bundle.join("presets");
-    for directory in [
-        Path::new("/"),
-        Path::new("/opt"),
-        &bundle,
-        &program_directory,
-        &share_directory,
-        &presets_directory,
-    ] {
-        verify_linux_package_path(directory, true)?;
-    }
-    verify_linux_package_path(program, false)?;
-    Ok(vec![program_directory, share_directory, presets_directory])
-}
-
-fn renderer_runtime_roots(
-    _program: &Path,
-    _catalog: Option<&PrivateUnoCatalog>,
-) -> Result<Vec<PathBuf>> {
-    let mut roots = Vec::new();
-    #[cfg(target_os = "macos")]
-    for root in [
-        "/System",
-        "/bin",
-        "/usr/bin",
-        "/usr/lib",
-        "/usr/share",
-        "/Library/Fonts",
-        "/System/Library/Fonts",
-        "/private/var/db/timezone",
-    ] {
-        if Path::new(root).exists() {
-            roots.push(PathBuf::from(root));
-        }
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(catalog) = _catalog {
-        roots.push(catalog.bundle.clone());
-    }
-    #[cfg(target_os = "linux")]
-    {
-        roots.extend(linux_tdf_runtime_roots(_program)?);
-        let package_program = Path::new("/usr/lib/libreoffice/program/soffice");
-        if std::fs::canonicalize(package_program).ok().as_deref() == Some(_program) {
-            let share = PathBuf::from("/usr/lib/libreoffice/share");
-            if !share.is_dir() {
-                return Err(AdapterError::ContractViolation(
-                    "recognized Linux LibreOffice package is missing its share runtime".to_owned(),
-                ));
-            }
-            roots.push(share);
-        }
-    }
-    #[cfg(target_os = "linux")]
-    for root in [
-        "/bin",
-        "/usr/bin",
-        "/usr/lib",
-        "/usr/share",
-        "/lib",
-        "/lib64",
-        "/etc/fonts",
-    ] {
-        if Path::new(root).exists() {
-            roots.push(PathBuf::from(root));
-        }
-    }
-    #[cfg(windows)]
-    if let Some(root) = std::env::var_os("SystemRoot") {
-        roots.push(PathBuf::from(root));
-    }
-    Ok(roots)
-}
-
-fn file_url(path: &Path) -> Result<String> {
-    let text = path.to_str().ok_or_else(|| {
-        AdapterError::ContractViolation("office scratch path is not valid Unicode".to_owned())
-    })?;
-    #[cfg(windows)]
-    let path = text.replace('\\', "/");
-    #[cfg(not(windows))]
-    let path = text.to_owned();
-    let mut encoded = String::new();
-    for byte in path.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
-            encoded.push(byte as char);
-        } else {
-            use std::fmt::Write as _;
-            let _ = write!(encoded, "%{byte:02X}");
-        }
-    }
-    #[cfg(windows)]
-    return Ok(format!("file:///{encoded}"));
-    #[cfg(not(windows))]
-    Ok(format!("file://{encoded}"))
 }
 
 /// Run the real renderer: stage `input` under the correct extension, convert
@@ -1158,7 +393,7 @@ fn file_url(path: &Path) -> Result<String> {
 /// non-PDF output) is `AdapterError::ContractViolation`.
 fn convert_with_real_binary(
     program: &Path,
-    uno_catalog: Option<&PrivateUnoCatalog>,
+    runtime: &OfficeRuntime,
     input: &[u8],
     media_type: &str,
 ) -> Result<Vec<u8>> {
@@ -1173,8 +408,8 @@ fn convert_with_real_binary(
             MAX_OFFICE_INPUT_BYTES
         )));
     }
-    let validated_catalog = private_uno_catalog_for_program(program)?;
-    if validated_catalog != uno_catalog.cloned() {
+    let validated_runtime = OfficeRuntime::new(program)?;
+    if validated_runtime != *runtime {
         return Err(AdapterError::ContractViolation(
             "Office runtime changed after converter probe".to_owned(),
         ));
@@ -1222,7 +457,7 @@ fn convert_with_real_binary(
     let sandbox = RenderSandbox::new(
         program,
         workdir,
-        renderer_runtime_roots(program, validated_catalog.as_ref())?,
+        validated_runtime.runtime_roots(program)?,
         RenderResourceLimits::default(),
     )
     .map_err(|err| {
@@ -1239,7 +474,7 @@ fn convert_with_real_binary(
         outdir.as_os_str().to_owned(),
         input_path.as_os_str().to_owned(),
     ];
-    let mut environment = renderer_environment(program, Some(&profile_dir));
+    let mut environment = runtime.environment(program, Some(&profile_dir));
     #[cfg(test)]
     if native_acceptance_diagnostics_enabled() {
         // This is a fixed diagnostic switch for checked-in synthetic OOXML
@@ -1249,13 +484,7 @@ fn convert_with_real_binary(
             OsString::from("+WARN+INFO.sal.osl.pipe"),
         ));
     }
-    if let Some(catalog) = uno_catalog {
-        let catalog = write_private_uno_catalog(catalog, workdir)?;
-        environment.push((
-            OsString::from("URE_MORE_SERVICES"),
-            file_url(&catalog)?.into(),
-        ));
-    }
+    runtime.configure_services(workdir, &mut environment)?;
     let output = sandbox
         .run(
             arguments,
@@ -1571,6 +800,7 @@ fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+    use crate::platform::*;
     use base64::Engine;
 
     #[cfg(unix)]
@@ -2479,4 +1709,17 @@ mod tests {
              independent conversions of the same input"
         );
     }
+}
+
+pub(crate) fn encode_file_url_path(path: &str) -> String {
+    let mut encoded = String::new();
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            encoded.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(encoded, "%{byte:02X}");
+        }
+    }
+    encoded
 }
