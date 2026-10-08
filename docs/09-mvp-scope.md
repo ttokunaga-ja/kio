@@ -105,7 +105,9 @@ handle-bound 保存、送信承認、課金台帳、回復、監視を含み、�
 - OS 固有の処理は各製品 crate の `src/platform/` に置く。`platform/mod.rs` は OS 非依存の型と関数
   signature だけを公開する。OS ごとの実装 (`platform/` 直下の `windows`、`unix`、`linux`、`macos` の
   `.rs` または directory) の選択はここだけで、`mod` と `use` の宣言に OS 条件を付けて行う。
-  `platform/` にはこれ以外の file を置かない。
+  `platform/` にはこれ以外の file を置かない。共通ロジックが使う item は全 OS で同じ名前と signature を持つ。
+  特定 OS だけの機構 (Windows の journaled exchange 等) を他 crate の同じ OS の層から使う item は、その OS
+  でだけ `use` で公開してよい。どちらも signature に OS 固有の型を出さない。
 - 共通ロジックのファイルは OS 条件を持たない。OS 条件とは、`#[cfg(...)]`、`#[cfg_attr(...)]`、`cfg!(...)` の
   条件式に `unix`、`windows`、`target_os`、`target_family`、`target_vendor`、`target_env` を含むものをいう。
   OS によって変わる値、エラー、制約は platform の interface から受け取る。
