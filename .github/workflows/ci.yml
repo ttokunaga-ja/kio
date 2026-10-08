@@ -30,6 +30,16 @@ jobs:
         run: |
           cargo +1.98.0 build -p kio-ci --bin kio-prepare-linux-confinement --locked
           cargo +1.98.0 test -p kio-ci --bin kio-prepare-linux-confinement --locked
+      - name: Test and report code limits (R1)
+        shell: bash
+        run: |
+          cargo +1.98.0 test -p kio-ci --bin kio-code-limits --locked
+          status=0
+          cargo +1.98.0 run -q -p kio-ci --bin kio-code-limits --locked -- --root . || status=$?
+          case "$status" in
+            0|1) ;;
+            *) exit "$status" ;;
+          esac
       - name: Check fixed shell controllers and Linux preflight
         shell: bash
         run: |

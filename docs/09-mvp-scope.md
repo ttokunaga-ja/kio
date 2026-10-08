@@ -102,24 +102,35 @@ handle-bound 保存、送信承認、課金台帳、回復、監視を含み、�
 
 **前提: OS 共通ロジックと OS 固有層の分離**
 
-- OS 固有の処理は各 crate の `src/platform/` に置く。`platform/mod.rs` は OS 非依存の型と関数
-  signature だけを公開し、OS ごとの実装 (`windows`、`unix`、`linux`、`macos`) の選択はここだけで行う。
-- 共通ロジックのファイルは `#[cfg(windows)]`、`#[cfg(unix)]`、`#[cfg(target_os = ...)]` 等の OS 条件と、
-  `cfg!(...)` による OS 判定を持たない。OS によって変わる値、エラー、制約は platform の interface から受け取る。
+- OS 固有の処理は各製品 crate の `src/platform/` に置く。`platform/mod.rs` は OS 非依存の型と関数
+  signature だけを公開する。OS ごとの実装 (`platform/` 直下の `windows`、`unix`、`linux`、`macos` の
+  `.rs` または directory) の選択はここだけで、`mod` と `use` の宣言に OS 条件を付けて行う。
+  `platform/` にはこれ以外の file を置かない。
+- 共通ロジックのファイルは OS 条件を持たない。OS 条件とは、`#[cfg(...)]`、`#[cfg_attr(...)]`、`cfg!(...)` の
+  条件式に `unix`、`windows`、`target_os`、`target_family`、`target_vendor`、`target_env` を含むものをいう。
+  OS によって変わる値、エラー、制約は platform の interface から受け取る。
 - 複数 crate が使う OS primitive (保持 handle、private file、atomic publication、file identity 等) は
   `kio-core` の platform に置き、OS 用の crate を新設しない。process の隔離は `kio-process` に閉じる。
 - 対応 OS は macOS / Linux / Windows に限る。それ以外の target 向けの代替実装を置かず、build 時に拒否する。
-- テストコードは本規則の対象外とする。規則の例外は計測ツールの許可リストに理由とともに登録し、件数を報告する。
+- テストコードと検証 tooling は本規則の対象外とする。テストコードは、計測方法で数えない file と、`test` を
+  必須とする cfg 条件 (`cfg(test)`、`cfg(all(test, ...))`) の付いた item である。`cfg(any(test, ...))` と
+  `cfg(not(test))` の item は製品コードとして扱う。
+- 規則の例外は計測ツールの許可リストに file と規則ごとに理由とともに登録し、件数を報告する。上限には例外を設けない。
 
 **計測方法**
 
-コード行は、Rust source から空行とコメントだけの行 (doc comment を含む) を除いた行である。
-`tests/`、`benches/`、`#[cfg(test)]` module、`*_tests.rs`、`test_support.rs` は数えない。
+コード行は、各 crate directory 配下の Rust source (`src/`、`build.rs`、`examples/` を含む) から空行と
+コメントだけの行 (doc comment を含む) を除いた行である。コードとコメントが同じ行にあれば数える。
+`tests/`、`benches/`、`tests.rs`、`*_tests.rs`、`test_support.rs` とテストコードの item は数えない。
+テストコードの module を別 file に置くときはこの file 名にし、この file 名を製品コードの module に使わない。
+symbolic link、UTF-8 でない file、`platform/` の規定外の file、この file 名の規則に反する module 宣言、
+テストコードの範囲や module の file を静的に決められない構文 (macro 内の out-of-line module 宣言等) は、
+飛ばさず計測失敗とする。
 
 | 区分 | 範囲 |
 | --- | --- |
-| OS 共通の製品ロジック | 製品 crate (`kio-core`、`kio-pipeline`、`kio-adapter`、`kio-index`、`kio-search`、`kio-app`、`kio-cli`、`kio-process`) のうち OS 固有層以外 |
-| OS 固有層 | 製品 crate の `src/platform/` 配下。OS 別に数え、`unix` は Linux と macOS の共通部分とする |
+| OS 共通の製品ロジック | 製品 crate (`kio-core`、`kio-pipeline`、`kio-adapter`、`kio-index`、`kio-search`、`kio-app`、`kio-cli`、`kio-process`) のうち OS 固有層以外。`platform/mod.rs` を含む |
+| OS 固有層 | 製品 crate の `src/platform/` 配下の OS 別実装。OS 別に数え、`unix` は Linux と macOS の共通部分とする |
 | 検証 tooling | `kio-eval`、`kio-ci` (OS 固有部分を含む) |
 
 **上限**
@@ -142,8 +153,9 @@ OS 固有層を分離する前の値である。OS 共通ロジックの上限�
 
 **運用**
 
-- 上限と分離規則は v1 の構造是正 (R 工程) で計測ツールに実装し、CI で検査する。
-  それまでは候補を固定するときに手動で計測して記録する。
+- 上限と分離規則は `kio-ci` の `kio-code-limits` で計測し、CI で検査する。終了値は違反なしで 0、
+  違反ありで 1、計測失敗で 2 とする。R 工程の途中の扱いは
+  [受入完了計画 §10](../tasks/v1-acceptance-closeout-plan-2026-10-03.md) に従う。
 - 上限を超える変更は、同じ変更の中で削減する。上限自体の変更は利用者の承認を得て、理由と日付を本節に記録する。
 - 上限は設計肥大化の検知に使う。行数を減らすために必要な検証、エラー処理、回復処理を削らない。
 
