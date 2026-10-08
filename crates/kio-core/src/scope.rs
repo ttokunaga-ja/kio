@@ -29,6 +29,13 @@ use crate::dag::{
 };
 use crate::error::{IoResultExt, KioError, Result};
 use crate::gc::{SnapshotAutoBinding, SnapshotAutoStateBinding};
+#[cfg(unix)]
+use crate::platform::scope_effective_uid as effective_uid;
+use crate::platform::{
+    scope_configure_no_follow as configure_scope_no_follow,
+    scope_open_bound_nofollow as open_bound_scope_file_nofollow,
+    scope_read_bound_regular_text_observed_at as read_bound_regular_text_observed_at,
+};
 use crate::portable::{
     PORTABLE_TAGS_DIRECTORY, portable_leaf_error, portable_tag_collision_key,
     portable_tag_digest64, portable_tag_leaf,
@@ -3764,16 +3771,16 @@ fn validate_planned_root_entries(
 /// read. This is deliberately separate from the GC observation types: the
 /// scheduler's ref/tool handoff needs only regular-file authority binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct BoundMetadataObservation {
+pub(crate) struct BoundMetadataObservation {
     #[cfg(not(windows))]
-    dev: u64,
+    pub(crate) dev: u64,
     #[cfg(not(windows))]
-    ino: u64,
+    pub(crate) ino: u64,
     #[cfg(windows)]
-    identity: crate::cas::WindowsRegularFileIdentity,
-    len: u64,
-    nlink: u64,
-    digest: String,
+    pub(crate) identity: crate::cas::WindowsRegularFileIdentity,
+    pub(crate) len: u64,
+    pub(crate) nlink: u64,
+    pub(crate) digest: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3794,95 +3801,7 @@ fn scheduled_source_identity(file: &File) -> Result<(u64, u64)> {
 }
 
 #[cfg(windows)]
-use scheduled_windows::{
-    read_bound_regular_text_observed_at, source_identity as scheduled_source_identity,
-};
-
-/// Read a bounded regular metadata leaf without following any public path and
-/// retain enough evidence to reject same-byte replacement at a later writer
-/// boundary.
-#[cfg(unix)]
-fn read_bound_regular_text_observed_at(
-    kio: &File,
-    relative: &str,
-    max_bytes: u64,
-) -> Result<(String, BoundMetadataObservation)> {
-    use cap_primitives::fs::{self as cap_fs, MetadataExt};
-
-    let path = Path::new(relative);
-    if path
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(KioError::invalid_usage(
-            "bound metadata path must contain only normal components",
-        ));
-    }
-    let parent = path.parent().unwrap_or_else(|| Path::new(""));
-    let leaf = path
-        .file_name()
-        .ok_or_else(|| KioError::invalid_usage("bound metadata path must name a regular file"))?;
-    let mut directory = kio
-        .try_clone()
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    for component in parent.components() {
-        let Component::Normal(component) = component else {
-            continue;
-        };
-        directory = cap_fs::open_dir_nofollow(&directory, Path::new(component))
-            .map_err(|error| KioError::io(error.to_string(), relative))?;
-    }
-    let before = cap_fs::stat(&directory, Path::new(leaf), cap_fs::FollowSymlinks::No)
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    if !before.is_file() || before.nlink() != 1 || before.len() > max_bytes {
-        return Err(KioError::schema(
-            "bound metadata must be a bounded single-link regular file",
-        ));
-    }
-    let mut options = cap_fs::OpenOptions::new();
-    options.read(true);
-    options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut file = cap_fs::open(&directory, Path::new(leaf), &options)
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    let opened = cap_fs::Metadata::from_file(&file)
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    if !opened.is_file()
-        || opened.nlink() != 1
-        || opened.len() > max_bytes
-        || opened.dev() != before.dev()
-        || opened.ino() != before.ino()
-        || opened.len() != before.len()
-    {
-        return Err(KioError::schema("bound metadata changed while opening"));
-    }
-    let mut bytes = Vec::with_capacity(usize::try_from(opened.len()).unwrap_or(0));
-    (&mut file)
-        .take(max_bytes.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    let after = cap_fs::stat(&directory, Path::new(leaf), cap_fs::FollowSymlinks::No)
-        .map_err(|error| KioError::io(error.to_string(), relative))?;
-    if bytes.len() as u64 != opened.len()
-        || after.dev() != opened.dev()
-        || after.ino() != opened.ino()
-        || after.nlink() != opened.nlink()
-        || after.len() != opened.len()
-    {
-        return Err(KioError::schema("bound metadata changed while reading"));
-    }
-    let text =
-        String::from_utf8(bytes.clone()).map_err(|error| KioError::schema(error.to_string()))?;
-    Ok((
-        text,
-        BoundMetadataObservation {
-            dev: opened.dev(),
-            ino: opened.ino(),
-            len: opened.len(),
-            nlink: opened.nlink(),
-            digest: lower_hex(&Sha256::digest(&bytes)),
-        },
-    ))
-}
+pub(crate) use scheduled_windows::source_identity as scheduled_source_identity;
 
 pub(crate) fn canonical_tool_lock_value(value: &Value) -> Result<Value> {
     let object = value
@@ -4907,15 +4826,6 @@ fn validate_retained_store_directory(kio: &File, label: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
-fn effective_uid() -> u32 {
-    unsafe extern "C" {
-        fn geteuid() -> u32;
-    }
-    // SAFETY: geteuid has no preconditions and only returns process metadata.
-    unsafe { geteuid() }
-}
-
 fn unsafe_store_error(path: &Path, message: &str) -> KioError {
     KioError::new(
         "KIO-E-STORE-UNSAFE-001",
@@ -4930,76 +4840,6 @@ fn open_working_file_candidate(candidate: &WorkingFileCandidate) -> Result<File>
         return open_bound_scope_file_nofollow(root, &candidate.file_name, &candidate.path);
     }
     open_scope_file_nofollow(&candidate.path)
-}
-
-/// Open one direct source child using the scope descriptor retained by an
-/// internal child index. The public path is diagnostic-only and never used for
-/// lookup, so a post-bind rename cannot redirect a source read.
-#[cfg(unix)]
-fn open_bound_scope_file_nofollow(
-    root: &File,
-    file_name: &str,
-    display_path: &Path,
-) -> Result<File> {
-    use cap_fs::MetadataExt;
-    use cap_primitives::fs as cap_fs;
-
-    let name = Path::new(file_name);
-    if name.components().count() != 1
-        || !matches!(name.components().next(), Some(Component::Normal(_)))
-    {
-        return Err(scope_file_changed_path(display_path));
-    }
-    let before = cap_fs::stat(root, name, cap_fs::FollowSymlinks::No)
-        .map_err(|error| KioError::io(error.to_string(), display_path.display().to_string()))?;
-    if !before.is_file() {
-        return Err(scope_file_changed_path(display_path));
-    }
-    let mut options = cap_fs::OpenOptions::new();
-    options.read(true);
-    options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let file = cap_fs::open(root, name, &options)
-        .map_err(|error| KioError::io(error.to_string(), display_path.display().to_string()))?;
-    let opened = cap_fs::Metadata::from_file(&file)
-        .map_err(|error| KioError::io(error.to_string(), display_path.display().to_string()))?;
-    let after = cap_fs::stat(root, name, cap_fs::FollowSymlinks::No)
-        .map_err(|error| KioError::io(error.to_string(), display_path.display().to_string()))?;
-    if !opened.is_file()
-        || !after.is_file()
-        || opened.dev() != before.dev()
-        || opened.ino() != before.ino()
-        || opened.dev() != after.dev()
-        || opened.ino() != after.ino()
-    {
-        return Err(scope_file_changed_path(display_path));
-    }
-    Ok(file)
-}
-
-#[cfg(windows)]
-fn open_bound_scope_file_nofollow(
-    root: &File,
-    file_name: &str,
-    display_path: &Path,
-) -> Result<File> {
-    let name = Path::new(file_name);
-    if name.components().count() != 1
-        || !matches!(name.components().next(), Some(Component::Normal(_)))
-    {
-        return Err(scope_file_changed_path(display_path));
-    }
-    let directory = StoreDirectory::from_retained(
-        root.try_clone().kio_io(display_path)?,
-        display_path
-            .parent()
-            .unwrap_or(Path::new("."))
-            .to_path_buf(),
-    )?;
-    // Source enumeration and each read/staging caller enforce archive limits
-    // from this descriptor's metadata before reading, then bound the stream.
-    // Let those checks report the scope budget error for oversized inputs while
-    // retaining StoreDirectory's no-follow and single-link validation here.
-    directory.open_regular_read(name, u64::MAX)
 }
 
 fn open_scope_file_nofollow(path: &Path) -> Result<File> {
@@ -5033,23 +4873,6 @@ fn open_scope_file_nofollow(path: &Path) -> Result<File> {
         return Err(scope_file_changed_path(path));
     }
     Ok(file)
-}
-
-#[cfg(unix)]
-fn configure_scope_no_follow(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    #[cfg(target_os = "linux")]
-    options.custom_flags(0x20_800);
-    #[cfg(target_os = "macos")]
-    options.custom_flags(0x104);
-    let _ = options;
-}
-
-#[cfg(windows)]
-fn configure_scope_no_follow(options: &mut OpenOptions) {
-    use std::os::windows::fs::OpenOptionsExt;
-    options.custom_flags(0x0020_0000);
 }
 
 #[cfg(unix)]
@@ -5454,7 +5277,7 @@ fn scope_file_changed(file_name: &str) -> KioError {
     )
 }
 
-fn scope_file_changed_path(path: &Path) -> KioError {
+pub(crate) fn scope_file_changed_path(path: &Path) -> KioError {
     KioError::new(
         "KIO-E-SCOPE-FILE-CHANGED-001",
         "scope path no longer identifies the checked regular file",

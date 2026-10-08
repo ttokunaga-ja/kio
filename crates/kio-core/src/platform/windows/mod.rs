@@ -1,3 +1,13 @@
+pub(crate) mod cas_identity;
+pub(crate) mod cas_io;
+pub(crate) mod durability;
+pub(crate) mod gc_io;
+pub(crate) mod gc_observation;
+pub(crate) mod gc_snapshot_io;
+pub(crate) mod management;
+pub(crate) mod planned_removal;
 pub(crate) mod private_fs;
 pub(crate) mod profile;
+pub(crate) mod scheduled;
+pub(crate) mod scope_io;
 pub(crate) mod store;

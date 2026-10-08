@@ -14,11 +14,11 @@
 //! flow: re-publication is allowed and retires the marker in the same locked
 //! mutation as the republication's snapshot finalize (05-runtime.md §3.5).
 
+pub(crate) use crate::platform::sync_directory;
+
 use std::collections::BTreeSet;
-#[cfg(any(test, windows))]
+#[cfg(test)]
 use std::fs;
-#[cfg(not(windows))]
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
@@ -1758,44 +1758,6 @@ fn is_valid_utc(value: &str) -> bool {
         _ => 31,
     };
     (1..=max_day).contains(&day) && hour <= 23 && minute <= 59 && second <= 59
-}
-
-/// Fsync a directory so a prior rename/unlink within it is durable (R23-07,
-/// 05-runtime.md §3.5 L834-836 "temp 書込 → file fsync → atomic rename →
-/// 親 directory fsync" and L843-845 "journal を除去 + directory fsync").
-/// Must propagate failure to its caller: silently swallowing a failed
-/// open/fsync here would let a legacy path-based object-store publication
-/// report success before its directory entry was durable. Retained
-/// `StoreDirectory` purge operations enforce the corresponding ordering by
-/// descriptor-relative primitives.
-///
-/// `pub(crate)` because the object store needs the identical guarantee for its
-/// own post-`remove_file` entries: [`crate::cas`] carried two hand-rolled
-/// copies of the pre-R23-07 `if let Ok(dir) = File::open(parent)` shape, which
-/// reproduced both defects one layer down — the discarded POSIX fsync, and the
-/// permanent Windows no-op. They now call this, so the two arms have exactly
-/// one definition to keep correct.
-#[cfg(not(windows))]
-pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
-    File::open(path)?.sync_all()
-}
-
-/// Windows counterpart. **Windows has no directory fsync**, so this arm cannot
-/// make the same durability promise as the POSIX one above.
-///
-/// What survives is the *fail-closed* half of R23-07: a parent that is missing
-/// or is not a directory still surfaces to the caller rather than
-/// type-checking as success. That is the failure this arm can actually see.
-#[cfg(windows)]
-pub(crate) fn sync_directory(path: &Path) -> std::io::Result<()> {
-    if fs::metadata(path)?.is_dir() {
-        Ok(())
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::NotADirectory,
-            "sync_directory expects a directory",
-        ))
-    }
 }
 
 fn corrupt_state(message: impl Into<String>) -> KioError {

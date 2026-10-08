@@ -3,6 +3,11 @@
 //! they never persist authority to delete without current caller proofs.
 use super::{StoreDirectory, err, ioerr, platform, relative_components};
 use crate::Result;
+#[cfg(target_os = "linux")]
+use crate::platform::mount_id;
+use crate::platform::planned_removal::rename;
+#[cfg(windows)]
+use crate::platform::planned_removal::retire_directory;
 use cap_primitives::fs as cap_fs;
 use sha2::{Digest, Sha256};
 use std::{
@@ -60,15 +65,15 @@ impl RemovalBudget {
 
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Identity(u64, u64);
+pub(crate) struct Identity(u64, u64);
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Identity {
+pub(crate) enum Identity {
     File(crate::cas::WindowsRegularFileIdentity),
     Directory(crate::cas::WindowsDirectoryIdentity),
 }
 
-fn identity(file: &File, directory: bool, label: &Path) -> Result<Identity> {
+pub(crate) fn identity(file: &File, directory: bool, label: &Path) -> Result<Identity> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -116,31 +121,6 @@ pub(crate) fn require_same_filesystem(parent: &File, child: &File, label: &Path)
         return Err(err(label, "planned removal crosses a mount boundary"));
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn mount_id(file: &File, label: &Path) -> Result<u64> {
-    use std::os::fd::AsRawFd;
-    let mut info: libc::statx = unsafe { std::mem::zeroed() };
-    if unsafe {
-        libc::statx(
-            file.as_raw_fd(),
-            c"".as_ptr(),
-            libc::AT_EMPTY_PATH,
-            libc::STATX_MNT_ID,
-            &mut info,
-        )
-    } != 0
-    {
-        return Err(ioerr(label, std::io::Error::last_os_error()));
-    }
-    if info.stx_mask & libc::STATX_MNT_ID == 0 {
-        return Err(err(
-            label,
-            "planned removal requires retained-handle mount IDs",
-        ));
-    }
-    Ok(info.stx_mnt_id)
 }
 
 #[derive(Debug)]
@@ -531,26 +511,6 @@ impl Target {
     }
 }
 
-#[cfg(unix)]
-fn rename(
-    parent: &File,
-    source: &OsStr,
-    destination: &OsStr,
-    _held: &File,
-    label: &Path,
-) -> Result<()> {
-    platform::rename_regular_noreplace(parent, source, parent, destination, label)
-}
-#[cfg(windows)]
-fn rename(
-    parent: &File,
-    _source: &OsStr,
-    destination: &OsStr,
-    held: &File,
-    label: &Path,
-) -> Result<()> {
-    platform::rename_retained_handle(held, parent, destination, false, label)
-}
 fn remove_node(
     parent: &File,
     leaf: &OsStr,
@@ -611,33 +571,6 @@ fn remove_node(
     }
     drop(mutator);
     platform::sync_directory(parent, label)
-}
-#[cfg(windows)]
-fn retire_directory(file: &File, label: &Path) -> Result<()> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-        FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx, SetFileInformationByHandle,
-    };
-    let expected = identity(file, true, label)?;
-    let info = FILE_DISPOSITION_INFO_EX {
-        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-    };
-    if unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileDispositionInfoEx,
-            &info as *const _ as _,
-            std::mem::size_of_val(&info) as u32,
-        )
-    } == 0
-    {
-        return Err(ioerr(label, std::io::Error::last_os_error()));
-    }
-    if identity(file, true, label)? != expected {
-        return Err(err(label, "retired directory handle identity changed"));
-    }
-    Ok(())
 }
 
 #[derive(Debug)]

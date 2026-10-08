@@ -1,4 +1,8 @@
 //! Descriptor-bound local management authority.
+use crate::platform::{
+    management_file_identity as file_identity,
+    management_same_case_probe_file as same_case_probe_file,
+};
 use crate::scope::KIO_FORMAT_VERSION;
 use crate::store_dir::{Publication, StoreDirectory};
 use crate::{ExitCode, KioError, Result};
@@ -395,18 +399,6 @@ fn case_probe_uppercase_resolution(directory: &StoreDirectory) -> Result<bool> {
     }
 }
 
-#[cfg(unix)]
-fn same_case_probe_file(left: &File, right: &File) -> Result<bool> {
-    use std::os::unix::fs::MetadataExt;
-    let left = left.metadata().map_err(io)?;
-    let right = right.metadata().map_err(io)?;
-    Ok(left.dev() == right.dev() && left.ino() == right.ino() && left.nlink() == 1)
-}
-
-#[cfg(windows)]
-fn same_case_probe_file(left: &File, right: &File) -> Result<bool> {
-    Ok(crate::cas::same_windows_regular_file(left, right))
-}
 pub fn read_record(binding: &ManagementBinding) -> Result<ManagementRecord> {
     binding.recheck()?;
     if child_initialization_pending(binding)? {
@@ -1223,49 +1215,15 @@ fn same_volume(left: &DirectoryIdentity, right: &DirectoryIdentity) -> bool {
         _ => false,
     }
 }
-#[cfg(unix)]
-fn file_identity(f: &File) -> Result<DirectoryIdentity> {
-    use cap_primitives::fs::MetadataExt;
-    let m = cap_fs::Metadata::from_file(f).map_err(io)?;
-    if !m.is_dir() {
-        return Err(err("retained handle is not a directory"));
-    }
-    Ok(DirectoryIdentity::Unix {
-        device: m.dev(),
-        inode: m.ino(),
-    })
-}
+
 /// Read the strict platform identity of an already-retained real directory.
 /// This rejects regular files and Windows reparse points; it does not adopt a
 /// path or attempt to repair permissions on an arbitrary file.
 pub fn directory_identity_from_handle(directory: &File) -> Result<DirectoryIdentity> {
     file_identity(directory)
 }
-#[cfg(windows)]
-fn file_identity(f: &File) -> Result<DirectoryIdentity> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe { GetFileInformationByHandle(f.as_raw_handle() as _, &mut information) } == 0 {
-        return Err(err("cannot read Windows directory identity"));
-    }
-    if information.dwFileAttributes
-        & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY
-        == 0
-        || information.dwFileAttributes
-            & windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT
-            != 0
-    {
-        return Err(err("retained handle is not normal directory"));
-    }
-    Ok(DirectoryIdentity::Windows {
-        volume_serial_number: information.dwVolumeSerialNumber,
-        file_index: ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
-    })
-}
-fn err(m: impl Into<String>) -> KioError {
+
+pub(crate) fn err(m: impl Into<String>) -> KioError {
     KioError::new(
         "KIO-E-MANAGEMENT-AUTHORITY-001",
         m,
@@ -1273,7 +1231,7 @@ fn err(m: impl Into<String>) -> KioError {
         ExitCode::PermanentFailure,
     )
 }
-fn io(e: std::io::Error) -> KioError {
+pub(crate) fn io(e: std::io::Error) -> KioError {
     KioError::new(
         "KIO-E-MANAGEMENT-AUTHORITY-001",
         "management authority I/O failed",

@@ -3,6 +3,28 @@
 //! Public paths are used only to bind and diagnose a scope.  Every store read
 //! below is relative to a retained directory descriptor.
 
+use crate::platform::{
+    gc_canonical_index_identity as canonical_gc_index_identity_from_metadata,
+    gc_file_state as file_state, gc_receipt_handle as open_verified_receipt_durable_handle,
+    gc_rename_snapshot_state_noreplace as rename_snapshot_state_noreplace,
+    gc_retire_snapshot_state_temporary as retire_snapshot_state_temporary,
+    gc_same_file_state as same_file_state, gc_sync_bound_directory as sync_bound_directory,
+};
+#[cfg(not(windows))]
+use crate::platform::{
+    gc_exchange_between as exchange_between, gc_exchange_bound as exchange_bound,
+    gc_exchange_capture_verified as exchange_capture_verified,
+    gc_exchange_capture_verified_named as exchange_capture_verified_named,
+    gc_open_tree_writable as open_gc_tree_writable,
+    gc_open_verified_handle as open_verified_file_handle,
+    gc_remove_sentinel_leaf as remove_sentinel_leaf,
+    gc_remove_verified_leaf as remove_verified_leaf,
+    gc_rename_noreplace_between as rename_noreplace_between,
+};
+
+#[cfg(windows)]
+use crate::platform::gc_verify_retained_receipt_observation as verify_retained_receipt_observation;
+
 mod unreachable_inventory;
 #[cfg(windows)]
 mod windows;
@@ -37,14 +59,14 @@ use crate::scope::{
 };
 use crate::store_dir::StoreDirectory;
 
-const MAX_METADATA: u64 = 1024 * 1024;
+pub(crate) const MAX_METADATA: u64 = 1024 * 1024;
 const MAX_REF: u64 = 4096;
-const MAX_MARKER_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const MAX_MARKER_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SWEEP_CANDIDATES: usize = 100_000;
 const MAX_SWEEP_ESTIMATED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 #[cfg(not(windows))]
-const GC_RETIRE_SENTINEL: &[u8] = b"kio gc retirement sentinel\n";
-const SNAPSHOT_AUTO_STATE_LEAF: &str = "snapshot-auto.json";
+pub(crate) const GC_RETIRE_SENTINEL: &[u8] = b"kio gc retirement sentinel\n";
+pub(crate) const SNAPSHOT_AUTO_STATE_LEAF: &str = "snapshot-auto.json";
 const SNAPSHOT_AUTO_STATE_VERSION: u32 = 2;
 const SNAPSHOT_AUTO_STATE_TEMP_PREFIX: &str = ".snapshot-auto-state-";
 /// Scheduler state publishing may leave a private create-new file behind if
@@ -2542,119 +2564,6 @@ fn validate_gc_tree_bytes(bytes: &[u8], expected_hash: &str) -> Result<()> {
         .map_err(|_| corrupt("invalid tree object before removal"))
 }
 
-#[cfg(not(windows))]
-fn open_gc_tree_writable(
-    directory: &std::fs::File,
-    leaf: &str,
-    expected: &FileObservation,
-) -> Result<std::fs::File> {
-    let mut options = cap_fs::OpenOptions::new();
-    options.read(true).write(true);
-    options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let file =
-        cap_fs::open(directory, Path::new(leaf), &options).map_err(|error| ioerr(error, leaf))?;
-    let metadata = cap_fs::Metadata::from_file(&file).map_err(|error| ioerr(error, leaf))?;
-    valid_file(&metadata, MAX_TREE_OBJECT_BYTES)?;
-    if id_meta(&metadata)? != expected.identity || metadata.len() != expected.state.len {
-        return Err(corrupt("tree changed before writable handle bind"));
-    }
-    Ok(file)
-}
-
-#[cfg(not(windows))]
-fn open_verified_file_handle(
-    directory: &std::fs::File,
-    leaf: &str,
-    expected: &FileObservation,
-    max: u64,
-    label: &str,
-) -> Result<std::fs::File> {
-    let mut options = cap_fs::OpenOptions::new();
-    options.read(true);
-    options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let file =
-        cap_fs::open(directory, Path::new(leaf), &options).map_err(|error| ioerr(error, leaf))?;
-    let metadata = cap_fs::Metadata::from_file(&file).map_err(|error| ioerr(error, leaf))?;
-    valid_file(&metadata, max)?;
-    if id_meta(&metadata)? != expected.identity || metadata.len() != expected.state.len {
-        return Err(corrupt(&format!("{label} changed while binding handle")));
-    }
-    Ok(file)
-}
-
-#[cfg(not(windows))]
-fn open_verified_receipt_durable_handle(
-    directory: &std::fs::File,
-    leaf: &str,
-    expected: &FileObservation,
-) -> Result<std::fs::File> {
-    open_verified_file_handle(
-        directory,
-        leaf,
-        expected,
-        MAX_METADATA,
-        "existing GC shallow receipt",
-    )
-}
-
-#[cfg(windows)]
-fn open_verified_receipt_durable_handle(
-    directory: &std::fs::File,
-    leaf: &str,
-    expected: &FileObservation,
-) -> Result<std::fs::File> {
-    use cap_fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
-
-    // FlushFileBuffers requires write access even when the receipt bytes stay
-    // unchanged. Bind only this receipt through its retained parent, excluding
-    // concurrent writes and namespace mutations while it authorizes retirement.
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .share_mode(FILE_SHARE_READ)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let file =
-        cap_fs::open(directory, Path::new(leaf), &options).map_err(|error| ioerr(error, leaf))?;
-    verify_retained_receipt_observation(&file, leaf, expected)?;
-    Ok(file)
-}
-
-#[cfg(windows)]
-fn verify_retained_receipt_observation(
-    file: &std::fs::File,
-    leaf: &str,
-    expected: &FileObservation,
-) -> Result<()> {
-    use std::io::{Seek, SeekFrom};
-
-    let before = cap_fs::Metadata::from_file(file).map_err(|error| ioerr(error, leaf))?;
-    valid_file(&before, MAX_METADATA)?;
-    let mut reader = file;
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| ioerr(error, leaf))?;
-    let mut bytes = Vec::new();
-    reader
-        .take(MAX_METADATA.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| ioerr(error, leaf))?;
-    let after = cap_fs::Metadata::from_file(file).map_err(|error| ioerr(error, leaf))?;
-    valid_file(&after, MAX_METADATA)?;
-    if !same_file_state(&before, &after)?
-        || bytes.len() as u64 != after.len()
-        || id_meta(&after)? != expected.identity
-        || file_state(&after) != expected.state
-        || hash_bytes(&bytes) != expected.digest
-    {
-        return Err(corrupt(
-            "existing GC shallow receipt changed on retained handle",
-        ));
-    }
-    Ok(())
-}
-
 #[derive(Clone, Copy)]
 enum GcTreeFaultPoint {
     MarkerStageFsync,
@@ -2722,7 +2631,12 @@ fn ensure_child_dir(parent: &std::fs::File, name: &str) -> Result<std::fs::File>
         }
     }
 }
-fn create_new_bound(dir: &std::fs::File, leaf: &str, bytes: &[u8], max: u64) -> Result<()> {
+pub(crate) fn create_new_bound(
+    dir: &std::fs::File,
+    leaf: &str,
+    bytes: &[u8],
+    max: u64,
+) -> Result<()> {
     let mut options = cap_fs::OpenOptions::new();
     options.write(true).create_new(true);
     options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
@@ -2735,18 +2649,6 @@ fn create_new_bound(dir: &std::fs::File, leaf: &str, bytes: &[u8], max: u64) -> 
         return Err(corrupt("receipt changed after create"));
     }
     sync_bound_directory(dir, leaf)
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn rename_snapshot_state_noreplace(dir: &std::fs::File, from: &str, to: &str) -> Result<()> {
-    rename_noreplace_bound(dir, from, to)
-}
-
-// Move the verified source HANDLE relative to retained parents, refusing an
-// occupied destination without reopening the source during the move.
-#[cfg(windows)]
-fn rename_snapshot_state_noreplace(dir: &std::fs::File, from: &str, to: &str) -> Result<()> {
-    rename_noreplace_between(dir, from, dir, to)
 }
 
 /// Replace an exact observed scheduler checkpoint without an absent public
@@ -2838,54 +2740,6 @@ fn replace_snapshot_state_expected(
     Ok(())
 }
 
-/// Retire only the scheduler temporary created by this invocation.  The
-/// exchange first captures the current name and compares its identity/bytes;
-/// a substituted entry is preserved and fails closed rather than being
-/// removed as cleanup.  This keeps repeated CAS conflicts from accumulating
-/// unbounded private state files.
-#[cfg(not(windows))]
-fn retire_snapshot_state_temporary(
-    dir: &std::fs::File,
-    temporary: &str,
-    expected_bytes: &[u8],
-    expected: &FileObservation,
-) -> Result<()> {
-    let (bytes, current) = read_regular_observed(dir, temporary, MAX_METADATA)?;
-    if bytes != expected_bytes
-        || current.identity != expected.identity
-        || current.state.len != expected.state.len
-        || current.digest != expected.digest
-    {
-        return Err(corrupt("snapshot auto temporary changed before retirement"));
-    }
-    let (captured, captured_observation) = exchange_capture_verified(
-        dir,
-        temporary,
-        &current,
-        MAX_METADATA,
-        "snapshot auto temporary",
-    )?;
-    remove_verified_leaf(
-        dir,
-        &captured,
-        &captured_observation,
-        MAX_METADATA,
-        "snapshot auto captured temporary",
-    )?;
-    remove_sentinel_leaf(dir, temporary)?;
-    sync_bound_directory(dir, temporary)
-}
-
-#[cfg(windows)]
-fn retire_snapshot_state_temporary(
-    dir: &std::fs::File,
-    temporary: &str,
-    expected_bytes: &[u8],
-    expected: &FileObservation,
-) -> Result<()> {
-    windows::retire_expected(dir, temporary, expected_bytes, expected, MAX_METADATA)
-}
-
 /// Retire only scheduler state temporaries which could have been produced by
 /// [`unique_internal_name`].  This runs under the scheduler writer lock,
 /// before allocating the next temporary.  Names outside this narrow private
@@ -2945,312 +2799,11 @@ fn is_canonical_decimal(value: &str) -> bool {
         && (value == "0" || !value.starts_with('0'))
 }
 
-/// Atomically exchange a public leaf with an operation-private sentinel, then
-/// bind the captured entry's identity before a caller unlinks it. If a
-/// replacement won the race, that replacement remains captured and is never
-/// removed by this operation.
-#[cfg(not(windows))]
-fn exchange_capture_verified(
-    dir: &std::fs::File,
-    leaf: &str,
-    expected: &FileObservation,
-    max: u64,
-    label: &str,
-) -> Result<(String, FileObservation)> {
-    let captured = unique_internal_name(".gc-captured");
-    exchange_capture_verified_named(dir, leaf, &captured, expected, max, label)
-}
-
-#[cfg(not(windows))]
-fn exchange_capture_verified_named(
-    dir: &std::fs::File,
-    leaf: &str,
-    captured: &str,
-    expected: &FileObservation,
-    max: u64,
-    label: &str,
-) -> Result<(String, FileObservation)> {
-    create_new_bound(dir, captured, GC_RETIRE_SENTINEL, MAX_METADATA)?;
-    exchange_bound(dir, leaf, captured)?;
-    // The deterministic captured state is a recovery state, so it must reach
-    // stable storage before any caller can expose a crash seam after capture.
-    sync_bound_directory(dir, leaf)?;
-    let (_bytes, observed) = read_regular_observed(dir, captured, max)?;
-    if observed.identity != expected.identity
-        || observed.state.len != expected.state.len
-        || observed.digest != expected.digest
-    {
-        return Err(corrupt(&format!(
-            "{label} changed during retirement capture"
-        )));
-    }
-    // Make both sides of the exchange durable before the caller may inject a
-    // crash or remove the captured object.  Without this directory fsync, a
-    // power loss could resurrect the pre-exchange archive name while recovery
-    // observes marker progress that assumes the deterministic capture exists.
-    sync_bound_directory(dir, captured)?;
-    // The exchange changes ctime, but this exact observation is used by the
-    // immediate descriptor-relative unlink below.
-    Ok((captured.to_owned(), observed))
-}
-
 #[cfg(not(windows))]
 fn tree_capture_name(marker: &GcInProgressMarker, raw: &str) -> String {
     format!("{}-{raw}-captured", marker.sweep_id)
 }
 
-#[cfg(not(windows))]
-fn remove_verified_leaf(
-    dir: &std::fs::File,
-    leaf: &str,
-    expected: &FileObservation,
-    max: u64,
-    label: &str,
-) -> Result<()> {
-    let (bytes, observed) = read_regular_observed(dir, leaf, max)?;
-    if observed != *expected {
-        return Err(corrupt(&format!("{label} changed before unlink")));
-    }
-    let handle = open_verified_file_handle(dir, leaf, &observed, max, label)?;
-    let handle_observed =
-        cap_fs::Metadata::from_file(&handle).map_err(|error| ioerr(error, leaf))?;
-    if id_meta(&handle_observed)? != observed.identity
-        || handle_observed.len() != bytes.len() as u64
-    {
-        return Err(corrupt(&format!(
-            "{label} changed while binding unlink handle"
-        )));
-    }
-    // This name lives only in the operation-reserved `.kio/gc/internal/`
-    // namespace.  On Darwin, make the final descriptor-relative unlink also
-    // reject a symlinked path, an escape, or a vnode which gained another
-    // hardlink in the last syscall-width window.  POSIX still has no
-    // unlink-if-inode-equals primitive; the remaining replacement window is
-    // the explicitly documented reserved-namespace residual shared with the
-    // restore quarantine protocol.
-    remove_reserved_leaf(dir, leaf)
-}
-
-#[cfg(target_os = "macos")]
-fn remove_reserved_leaf(dir: &std::fs::File, leaf: &str) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-
-    // Darwin private/full-level flags from <sys/fcntl.h>.  They are accepted
-    // by the public unlinkat(2) entry point. AT_UNIQUE performs the link-count
-    // check in the same kernel operation as removal.
-    const AT_SYMLINK_NOFOLLOW_ANY: libc::c_int = 0x0800;
-    const AT_RESOLVE_BENEATH: libc::c_int = 0x2000;
-    const AT_UNIQUE: libc::c_int = 0x8000;
-
-    let leaf = CString::new(leaf).map_err(|_| corrupt("invalid GC retirement leaf"))?;
-    // SAFETY: `leaf` is NUL-terminated, `dir` remains open for the call, and
-    // unlinkat does not retain either pointer or descriptor.
-    let result = unsafe {
-        libc::unlinkat(
-            dir.as_raw_fd(),
-            leaf.as_ptr(),
-            AT_SYMLINK_NOFOLLOW_ANY | AT_RESOLVE_BENEATH | AT_UNIQUE,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(ioerr(std::io::Error::last_os_error(), "GC retirement leaf"))
-    }
-}
-
-#[cfg(not(any(target_os = "macos", windows)))]
-fn remove_reserved_leaf(dir: &std::fs::File, leaf: &str) -> Result<()> {
-    cap_fs::remove_file(dir, Path::new(leaf)).map_err(|error| ioerr(error, leaf))
-}
-
-#[cfg(not(windows))]
-fn remove_sentinel_leaf(dir: &std::fs::File, leaf: &str) -> Result<()> {
-    let (bytes, observed) = read_regular_observed(dir, leaf, MAX_METADATA)?;
-    if bytes != GC_RETIRE_SENTINEL {
-        return Err(corrupt(
-            "GC retirement sentinel was replaced before cleanup",
-        ));
-    }
-    remove_verified_leaf(dir, leaf, &observed, MAX_METADATA, "GC retirement sentinel")
-}
-
-/// Descriptor-relative atomic move which refuses to clobber the destination.
-/// This is the critical quarantine primitive: an attacker cannot pre-create a
-/// victim name and have it replaced by a tree object.
-#[allow(dead_code)]
-#[cfg(target_os = "macos")]
-fn rename_noreplace_bound(dir: &std::fs::File, from: &str, to: &str) -> Result<()> {
-    rename_noreplace_between(dir, from, dir, to)
-}
-#[cfg(target_os = "macos")]
-fn rename_noreplace_between(
-    from_dir: &std::fs::File,
-    from: &str,
-    to_dir: &std::fs::File,
-    to: &str,
-) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    let from = CString::new(from).map_err(|_| corrupt("invalid quarantine name"))?;
-    let to = CString::new(to).map_err(|_| corrupt("invalid quarantine name"))?;
-    unsafe extern "C" {
-        fn renameatx_np(
-            fromfd: libc::c_int,
-            from: *const libc::c_char,
-            tofd: libc::c_int,
-            to: *const libc::c_char,
-            flags: libc::c_uint,
-        ) -> libc::c_int;
-    }
-    // Darwin's RENAME_EXCL is documented as 0x00000004.
-    let result = unsafe {
-        renameatx_np(
-            from_dir.as_raw_fd(),
-            from.as_ptr(),
-            to_dir.as_raw_fd(),
-            to.as_ptr(),
-            0x0000_0004,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(ioerr(
-            std::io::Error::last_os_error(),
-            from.to_string_lossy().as_ref(),
-        ))
-    }
-}
-#[allow(dead_code)]
-#[cfg(target_os = "macos")]
-fn exchange_bound(dir: &std::fs::File, left: &str, right: &str) -> Result<()> {
-    exchange_between(dir, left, dir, right)
-}
-#[cfg(target_os = "macos")]
-fn exchange_between(
-    left_dir: &std::fs::File,
-    left: &str,
-    right_dir: &std::fs::File,
-    right: &str,
-) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    let left = CString::new(left).map_err(|_| corrupt("invalid marker archive name"))?;
-    let right = CString::new(right).map_err(|_| corrupt("invalid marker archive name"))?;
-    unsafe extern "C" {
-        fn renameatx_np(
-            fromfd: libc::c_int,
-            from: *const libc::c_char,
-            tofd: libc::c_int,
-            to: *const libc::c_char,
-            flags: libc::c_uint,
-        ) -> libc::c_int;
-    }
-    // Darwin RENAME_SWAP is 0x00000002.
-    if unsafe {
-        renameatx_np(
-            left_dir.as_raw_fd(),
-            left.as_ptr(),
-            right_dir.as_raw_fd(),
-            right.as_ptr(),
-            0x0000_0002,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(ioerr(
-            std::io::Error::last_os_error(),
-            left.to_string_lossy().as_ref(),
-        ))
-    }
-}
-#[allow(dead_code)]
-#[cfg(target_os = "linux")]
-fn exchange_bound(dir: &std::fs::File, left: &str, right: &str) -> Result<()> {
-    exchange_between(dir, left, dir, right)
-}
-#[cfg(target_os = "linux")]
-fn exchange_between(
-    left_dir: &std::fs::File,
-    left: &str,
-    right_dir: &std::fs::File,
-    right: &str,
-) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    let left = CString::new(left).map_err(|_| corrupt("invalid marker archive name"))?;
-    let right = CString::new(right).map_err(|_| corrupt("invalid marker archive name"))?;
-    // Linux renameat2 RENAME_EXCHANGE is 0x2.
-    if unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            left_dir.as_raw_fd(),
-            left.as_ptr(),
-            right_dir.as_raw_fd(),
-            right.as_ptr(),
-            2_u32,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(ioerr(
-            std::io::Error::last_os_error(),
-            left.to_string_lossy().as_ref(),
-        ))
-    }
-}
-#[cfg(target_os = "linux")]
-fn rename_noreplace_bound(dir: &std::fs::File, from: &str, to: &str) -> Result<()> {
-    rename_noreplace_between(dir, from, dir, to)
-}
-#[cfg(target_os = "linux")]
-fn rename_noreplace_between(
-    from_dir: &std::fs::File,
-    from: &str,
-    to_dir: &std::fs::File,
-    to: &str,
-) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    let from = CString::new(from).map_err(|_| corrupt("invalid quarantine name"))?;
-    let to = CString::new(to).map_err(|_| corrupt("invalid quarantine name"))?;
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            from_dir.as_raw_fd(),
-            from.as_ptr(),
-            to_dir.as_raw_fd(),
-            to.as_ptr(),
-            1_u32,
-        )
-    };
-    if result == 0 {
-        Ok(())
-    } else {
-        Err(ioerr(
-            std::io::Error::last_os_error(),
-            from.to_string_lossy().as_ref(),
-        ))
-    }
-}
-#[allow(dead_code)]
-#[cfg(windows)]
-fn rename_noreplace_bound(dir: &std::fs::File, from: &str, to: &str) -> Result<()> {
-    rename_noreplace_between(dir, from, dir, to)
-}
-#[cfg(windows)]
-fn rename_noreplace_between(
-    from_dir: &std::fs::File,
-    from: &str,
-    to_dir: &std::fs::File,
-    to: &str,
-) -> Result<()> {
-    windows::move_noreplace(from_dir, from, to_dir, to)
-}
 #[cfg(not(windows))]
 fn atomic_exchange_marker_expected(
     dir: &std::fs::File,
@@ -3366,7 +2919,7 @@ fn validate_marker_transition(
     Ok(())
 }
 
-fn unique_internal_name(prefix: &str) -> String {
+pub(crate) fn unique_internal_name(prefix: &str) -> String {
     format!(
         "{prefix}-{}-{}",
         std::process::id(),
@@ -3416,10 +2969,10 @@ pub struct GcPlanStats {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct FileObservation {
-    identity: Identity,
-    state: FileState,
-    digest: String,
+pub(crate) struct FileObservation {
+    pub(crate) identity: Identity,
+    pub(crate) state: FileState,
+    pub(crate) digest: String,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GcCandidate {
@@ -4365,7 +3918,7 @@ fn canonical_snapshot_auto_state_bytes(state: &SnapshotAutoState) -> Result<Vec<
     Ok(bytes)
 }
 
-fn parse_snapshot_auto_state(bytes: &[u8]) -> Result<SnapshotAutoState> {
+pub(crate) fn parse_snapshot_auto_state(bytes: &[u8]) -> Result<SnapshotAutoState> {
     let value: serde_json::Value = serde_json::from_slice(bytes)
         .map_err(|error| corrupt(&format!("invalid snapshot auto state: {error}")))?;
     if value.get("version").and_then(serde_json::Value::as_u64)
@@ -4419,7 +3972,7 @@ fn validate_snapshot_state_transition(
     Ok(())
 }
 
-fn snapshot_auto_state_changed() -> KioError {
+pub(crate) fn snapshot_auto_state_changed() -> KioError {
     KioError::new(
         "KIO-E-SNAPSHOT-STATE-CHANGED-001",
         "scheduled snapshot state changed during the locked eligibility handoff",
@@ -4582,7 +4135,10 @@ fn open_dir_os(base: &std::fs::File, n: &std::ffi::OsStr) -> Result<std::fs::Fil
     Ok(d)
 }
 
-fn validate_directory_handle(directory: &std::fs::File, display: impl AsRef<Path>) -> Result<()> {
+pub(crate) fn validate_directory_handle(
+    directory: &std::fs::File,
+    display: impl AsRef<Path>,
+) -> Result<()> {
     let metadata =
         cap_fs::Metadata::from_file(directory).map_err(|error| ioerr(error, display.as_ref()))?;
     if !metadata.is_dir() {
@@ -4598,40 +4154,6 @@ fn validate_directory_handle(directory: &std::fs::File, display: impl AsRef<Path
         }
     }
     Ok(())
-}
-
-/// Capability directory handles are intentionally opened as `O_PATH` on
-/// Linux, which is valid for descriptor-relative traversal but cannot be
-/// passed to `fsync`. Reopen exactly `.` below the retained capability with
-/// no-follow read access, verify that it is the same directory, then flush
-/// that syncable descriptor. No ambient pathname is reconstructed.
-#[cfg(unix)]
-fn sync_bound_directory(directory: &std::fs::File, label: impl AsRef<Path>) -> Result<()> {
-    let label = label.as_ref();
-    let expected = cap_fs::Metadata::from_file(directory).map_err(|error| ioerr(error, label))?;
-    validate_directory_handle(directory, label)?;
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let syncable =
-        cap_fs::open(directory, Path::new("."), &options).map_err(|error| ioerr(error, label))?;
-    let observed = cap_fs::Metadata::from_file(&syncable).map_err(|error| ioerr(error, label))?;
-    if !observed.is_dir() || id_meta(&observed)? != id_meta(&expected)? {
-        return Err(corrupt(
-            "retained directory changed while reopening for fsync",
-        ));
-    }
-    syncable.sync_all().map_err(|error| ioerr(error, label))
-}
-
-/// Windows cannot flush a directory handle (`FlushFileBuffers` rejects it),
-/// so retain the fail-closed capability validation and rely on the preceding
-/// file-level sync and NTFS metadata journaling. This deliberately does not
-/// claim POSIX directory durability on Windows.
-#[cfg(windows)]
-fn sync_bound_directory(directory: &std::fs::File, label: impl AsRef<Path>) -> Result<()> {
-    validate_directory_handle(directory, label.as_ref())
 }
 
 fn names(
@@ -4659,7 +4181,7 @@ fn names(
     v.sort();
     Ok(v)
 }
-fn read_regular_observed(
+pub(crate) fn read_regular_observed(
     d: &std::fs::File,
     n: &str,
     max: u64,
@@ -4772,7 +4294,7 @@ fn read_required_accounted_observed(
         result => result,
     }
 }
-fn valid_file(m: &cap_fs::Metadata, max: u64) -> Result<()> {
+pub(crate) fn valid_file(m: &cap_fs::Metadata, max: u64) -> Result<()> {
     if !m.is_file() || m.len() > max {
         return Err(if m.len() > max {
             limit("file bytes")
@@ -4816,20 +4338,20 @@ fn link_count(metadata: &cap_fs::Metadata) -> Result<u64> {
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct Identity(
+pub(crate) struct Identity(
     #[serde(serialize_with = "crate::identity_serde::u64_hex::serialize")] u64,
     #[serde(serialize_with = "crate::identity_serde::u64_hex::serialize")] u64,
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct FileState {
-    len: u64,
-    modified_seconds: i64,
-    modified_nanos: i64,
-    changed_seconds: i64,
-    changed_nanos: i64,
+pub(crate) struct FileState {
+    pub(crate) len: u64,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanos: i64,
+    pub(crate) changed_seconds: i64,
+    pub(crate) changed_nanos: i64,
 }
-fn id_meta(m: &cap_fs::Metadata) -> Result<Identity> {
+pub(crate) fn id_meta(m: &cap_fs::Metadata) -> Result<Identity> {
     #[cfg(unix)]
     {
         use cap_primitives::fs::MetadataExt;
@@ -4848,71 +4370,6 @@ fn id_meta(m: &cap_fs::Metadata) -> Result<Identity> {
     }
 }
 
-#[cfg(unix)]
-fn canonical_gc_index_identity_from_metadata(metadata: &cap_fs::Metadata) -> Result<String> {
-    use cap_primitives::fs::MetadataExt;
-    Ok(format!(
-        "unix:{:016x}:{:016x}",
-        metadata.dev(),
-        metadata.ino()
-    ))
-}
-
-#[cfg(windows)]
-fn canonical_gc_index_identity_from_metadata(metadata: &cap_fs::Metadata) -> Result<String> {
-    use cap_fs::_WindowsByHandle;
-    let volume = metadata
-        .volume_serial_number()
-        .ok_or_else(|| corrupt("GC source index has no Windows volume identity"))?;
-    let index = metadata
-        .file_index()
-        .ok_or_else(|| corrupt("GC source index has no Windows file identity"))?;
-    Ok(format!("windows:{volume:08x}:{index:016x}"))
-}
-
-#[cfg(unix)]
-fn same_file_state(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> Result<bool> {
-    Ok(id_meta(left)? == id_meta(right)? && file_state(left) == file_state(right))
-}
-
-#[cfg(not(unix))]
-fn same_file_state(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> Result<bool> {
-    Ok(id_meta(left)? == id_meta(right)?
-        && left.len() == right.len()
-        && left.modified().ok() == right.modified().ok())
-}
-
-#[cfg(unix)]
-fn file_state(metadata: &cap_fs::Metadata) -> FileState {
-    use cap_primitives::fs::MetadataExt;
-    FileState {
-        len: metadata.len(),
-        modified_seconds: metadata.mtime(),
-        modified_nanos: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanos: metadata.ctime_nsec(),
-    }
-}
-
-#[cfg(not(unix))]
-fn file_state(metadata: &cap_fs::Metadata) -> FileState {
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|time| time.into_std().duration_since(std::time::UNIX_EPOCH).ok());
-    FileState {
-        len: metadata.len(),
-        modified_seconds: modified
-            .as_ref()
-            .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-            .unwrap_or(-1),
-        modified_nanos: modified
-            .as_ref()
-            .map_or(-1, |duration| i64::from(duration.subsec_nanos())),
-        changed_seconds: -1,
-        changed_nanos: -1,
-    }
-}
 fn id_file(f: &std::fs::File) -> Result<Identity> {
     id_meta(&cap_fs::Metadata::from_file(f).map_err(|e| ioerr(e, "scope"))?)
 }
@@ -5324,7 +4781,7 @@ fn retention_candidate_pairs(
 fn inc(x: &mut BTreeMap<String, u64>, n: &str) {
     *x.entry(n.into()).or_default() += 1
 }
-fn corrupt(m: &str) -> KioError {
+pub(crate) fn corrupt(m: &str) -> KioError {
     KioError::new(
         "KIO-E-STORE-CORRUPT-001",
         m,
@@ -5332,7 +4789,7 @@ fn corrupt(m: &str) -> KioError {
         ExitCode::PermanentFailure,
     )
 }
-fn limit(w: &str) -> KioError {
+pub(crate) fn limit(w: &str) -> KioError {
     KioError::new(
         "KIO-E-GC-PLAN-LIMIT-001",
         format!("GC planning limit exceeded: {w}"),
@@ -5340,7 +4797,7 @@ fn limit(w: &str) -> KioError {
         ExitCode::PermanentFailure,
     )
 }
-fn ioerr(e: std::io::Error, p: impl AsRef<Path>) -> KioError {
+pub(crate) fn ioerr(e: std::io::Error, p: impl AsRef<Path>) -> KioError {
     let kind = match e.kind() {
         std::io::ErrorKind::NotFound => "not_found",
         std::io::ErrorKind::PermissionDenied => "permission_denied",

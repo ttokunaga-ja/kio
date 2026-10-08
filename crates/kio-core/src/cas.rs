@@ -15,6 +15,27 @@ use sha2::{Digest, Sha256};
 use crate::error::{IoResultExt, KioError, Result};
 use crate::purge::sync_directory;
 
+#[cfg(windows)]
+pub(crate) use crate::platform::cas_identity::same_windows_regular_file;
+#[cfg(windows)]
+use crate::platform::cas_identity::windows_file_information;
+#[cfg(windows)]
+pub use crate::platform::cas_identity::{
+    WindowsDirectoryIdentity, WindowsRegularFileIdentity, windows_directory_handle_identity,
+    windows_directory_is_real, windows_real_directory_identity, windows_real_regular_file_identity,
+    windows_regular_file_handle_identity, windows_regular_file_is_safe,
+};
+#[cfg(unix)]
+use crate::platform::cas_io::{
+    configure_no_follow, is_single_link_regular_metadata, replace_file, same_file_identity,
+    same_open_file, sync_bound_directory,
+};
+#[cfg(windows)]
+use crate::platform::cas_io::{
+    configure_no_follow, open_windows_regular_nofollow_observation, replace_file, same_open_file,
+    same_windows_cas_file, same_windows_cas_file_triplet, sync_bound_directory,
+};
+
 pub const CAS_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 pub const MAX_RAW_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_TREE_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
@@ -2730,36 +2751,7 @@ impl BoundObjectDirs {
     }
 }
 
-#[cfg(unix)]
-fn sync_bound_directory(directory: &File, label: &Path) -> Result<()> {
-    use cap_primitives::fs::{self as cap_fs, MetadataExt};
-
-    let expected = cap_fs::Metadata::from_file(directory).kio_io(label)?;
-    ensure_bound_directory(directory, label)?;
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let syncable = cap_fs::open(directory, Path::new("."), &options).kio_io(label)?;
-    let observed = cap_fs::Metadata::from_file(&syncable).kio_io(label)?;
-    if !observed.is_dir() || observed.dev() != expected.dev() || observed.ino() != expected.ino() {
-        return Err(KioError::io(
-            "bound CAS directory changed while reopening for fsync",
-            label.display().to_string(),
-        ));
-    }
-    syncable.sync_all().kio_io(label)
-}
-
-/// Windows cannot flush a directory handle. The file body has already been
-/// flushed before publication; validate the retained capability instead of
-/// claiming POSIX directory-entry durability that Windows cannot provide.
-#[cfg(windows)]
-fn sync_bound_directory(directory: &File, label: &Path) -> Result<()> {
-    ensure_bound_directory(directory, label)
-}
-
-fn ensure_bound_directory(directory: &File, label: &Path) -> Result<()> {
+pub(crate) fn ensure_bound_directory(directory: &File, label: &Path) -> Result<()> {
     use cap_primitives::fs as cap_fs;
 
     let metadata = cap_fs::Metadata::from_file(directory).kio_io(label)?;
@@ -3957,67 +3949,6 @@ fn create_repair_quarantine(path: &Path, opened: &File) -> Result<PathBuf> {
     ))
 }
 
-#[cfg(unix)]
-fn same_open_file(left: &File, right: &File) -> Result<bool> {
-    Ok(same_file_identity(
-        &left
-            .metadata()
-            .map_err(|error| KioError::io(error.to_string(), "raw repair source"))?,
-        &right
-            .metadata()
-            .map_err(|error| KioError::io(error.to_string(), "raw repair quarantine"))?,
-    ))
-}
-
-#[cfg(windows)]
-fn same_open_file(left: &File, right: &File) -> Result<bool> {
-    Ok(same_windows_repair_quarantine_file_components(
-        windows_file_information(left),
-        windows_file_information(right),
-    ))
-}
-
-#[cfg(not(windows))]
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    fs::rename(source, destination)
-        .map_err(|error| KioError::io(error.to_string(), destination.display().to_string()))
-}
-
-#[cfg(windows)]
-fn replace_file(source: &Path, destination: &Path) -> Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-    };
-
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect::<Vec<_>>();
-    // SAFETY: both UTF-16 buffers are NUL-terminated and live for the call.
-    let moved = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        Err(KioError::io(
-            std::io::Error::last_os_error().to_string(),
-            "raw repair destination",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
 enum CasRemovalKind {
     Raw,
     Chunk,
@@ -4441,26 +4372,6 @@ fn validate_open_regular_nofollow_with_before(
     validate_open_regular_nofollow(path, file)
 }
 
-#[cfg(unix)]
-fn is_single_link_regular_metadata(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.is_file() && metadata.nlink() == 1
-}
-
-#[cfg(windows)]
-fn open_windows_regular_nofollow_observation(path: &Path) -> Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    configure_no_follow(&mut options);
-    let file = options.open(path).kio_io(path)?;
-    if !windows_file_information(&file)
-        .is_some_and(|information| information.is_regular_file() && information.is_single_link())
-    {
-        return Err(non_regular_object_error(path));
-    }
-    Ok(file)
-}
-
 #[cfg(windows)]
 fn validate_open_regular_nofollow_with_windows_before(
     path: &Path,
@@ -4477,37 +4388,6 @@ fn validate_open_regular_nofollow_with_windows_before(
     validate_open_regular_nofollow(path, file)
 }
 
-#[cfg(unix)]
-fn configure_no_follow(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    #[cfg(target_os = "linux")]
-    options.custom_flags(0x20_800);
-    #[cfg(target_os = "macos")]
-    options.custom_flags(0x104);
-    let _ = options;
-}
-
-#[cfg(windows)]
-fn configure_no_follow(options: &mut OpenOptions) {
-    use std::os::windows::fs::OpenOptionsExt;
-    options.custom_flags(0x0020_0000);
-}
-
-#[cfg(unix)]
-fn same_file_identity(opened: &fs::Metadata, path: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    opened.dev() == path.dev() && opened.ino() == path.ino()
-}
-
-#[cfg(windows)]
-pub(crate) fn same_windows_regular_file(opened: &File, path: &File) -> bool {
-    same_windows_regular_file_components(
-        windows_file_information(opened),
-        windows_file_information(path),
-    )
-}
-
 #[cfg(any(test, windows))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WindowsFileInformation {
@@ -4522,7 +4402,7 @@ impl WindowsFileInformation {
     const DIRECTORY_ATTRIBUTE: u32 = 0x10;
     const REPARSE_POINT_ATTRIBUTE: u32 = 0x400;
 
-    const fn new(
+    pub(crate) const fn new(
         volume_serial_number: u32,
         file_index: u64,
         number_of_links: u32,
@@ -4541,11 +4421,11 @@ impl WindowsFileInformation {
             && self.file_index == other.file_index
     }
 
-    fn is_single_link(self) -> bool {
+    pub(crate) fn is_single_link(self) -> bool {
         self.number_of_links == 1
     }
 
-    fn is_regular_file(self) -> bool {
+    pub(crate) fn is_regular_file(self) -> bool {
         self.file_attributes & (Self::DIRECTORY_ATTRIBUTE | Self::REPARSE_POINT_ATTRIBUTE) == 0
     }
 
@@ -4555,7 +4435,7 @@ impl WindowsFileInformation {
     }
 
     #[cfg(windows)]
-    fn directory_identity(self) -> Option<WindowsDirectoryIdentity> {
+    pub(crate) fn directory_identity(self) -> Option<WindowsDirectoryIdentity> {
         self.is_real_directory()
             .then_some(WindowsDirectoryIdentity {
                 volume_serial_number: self.volume_serial_number,
@@ -4564,43 +4444,11 @@ impl WindowsFileInformation {
     }
 
     #[cfg(windows)]
-    fn regular_file_identity(self) -> Option<WindowsRegularFileIdentity> {
+    pub(crate) fn regular_file_identity(self) -> Option<WindowsRegularFileIdentity> {
         (self.is_regular_file() && self.is_single_link()).then_some(WindowsRegularFileIdentity {
             volume_serial_number: self.volume_serial_number,
             file_index: self.file_index,
         })
-    }
-}
-
-/// Stable identity of a real, non-reparse Windows directory.
-///
-/// Unlike directory metadata timestamps, this remains unchanged when children
-/// are created or removed.  Its fields stay private so callers can compare
-/// identities without treating their representation as a persistence format.
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowsDirectoryIdentity {
-    volume_serial_number: u32,
-    file_index: u64,
-}
-
-/// Stable identity of a real, non-reparse, single-link Windows regular file.
-///
-/// The public representation is opaque. Core may encode its numeric components
-/// only in an explicitly versioned local recovery intent.
-#[cfg(windows)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowsRegularFileIdentity {
-    volume_serial_number: u32,
-    file_index: u64,
-}
-
-#[cfg(windows)]
-impl WindowsRegularFileIdentity {
-    /// Components for the core's versioned, local atomic recovery intent.
-    /// External callers still treat this identity as an opaque observation.
-    pub(crate) const fn atomic_recovery_components(self) -> (u32, u64) {
-        (self.volume_serial_number, self.file_index)
     }
 }
 
@@ -4613,7 +4461,7 @@ pub(crate) fn same_windows_file_identity_components(
 }
 
 #[cfg(any(test, windows))]
-fn same_windows_regular_file_components(
+pub(crate) fn same_windows_regular_file_components(
     left: Option<WindowsFileInformation>,
     right: Option<WindowsFileInformation>,
 ) -> bool {
@@ -4624,21 +4472,8 @@ fn same_windows_regular_file_components(
     )
 }
 
-#[cfg(windows)]
-fn same_windows_cas_file(opened: &File, path: &File) -> bool {
-    same_windows_cas_file_components(
-        windows_file_information(opened),
-        windows_file_information(path),
-    )
-}
-
-#[cfg(windows)]
-fn same_windows_cas_file_triplet(before: &File, opened: &File, after: &File) -> bool {
-    same_windows_cas_file(before, opened) && same_windows_cas_file(opened, after)
-}
-
 #[cfg(any(test, windows))]
-fn same_windows_cas_file_components(
+pub(crate) fn same_windows_cas_file_components(
     left: Option<WindowsFileInformation>,
     right: Option<WindowsFileInformation>,
 ) -> bool {
@@ -4664,7 +4499,7 @@ fn same_windows_cas_file_triplet_components(
 }
 
 #[cfg(any(test, windows))]
-fn same_windows_repair_quarantine_file_components(
+pub(crate) fn same_windows_repair_quarantine_file_components(
     left: Option<WindowsFileInformation>,
     right: Option<WindowsFileInformation>,
 ) -> bool {
@@ -4677,107 +4512,6 @@ fn same_windows_repair_quarantine_file_components(
                 && left.number_of_links == 2
                 && right.number_of_links == 2
     )
-}
-
-#[cfg(windows)]
-fn windows_file_information(file: &File) -> Option<WindowsFileInformation> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-
-    let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `file` owns a valid handle for the duration of the call, and
-    // `information` points to writable storage of the required Win32 layout.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
-        return None;
-    }
-    let file_index =
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-    Some(WindowsFileInformation::new(
-        information.dwVolumeSerialNumber,
-        file_index,
-        information.nNumberOfLinks,
-        information.dwFileAttributes,
-    ))
-}
-
-/// Open a Windows directory without traversing its final reparse point and
-/// verify its handle attributes. `symlink_metadata().is_symlink()` alone does
-/// not cover every directory reparse-point kind (notably junctions).
-#[cfg(windows)]
-pub fn windows_real_directory_identity(
-    path: &Path,
-) -> std::io::Result<Option<WindowsDirectoryIdentity>> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
-    let directory = options.open(path)?;
-    Ok(windows_file_information(&directory).and_then(WindowsFileInformation::directory_identity))
-}
-
-/// Open a Windows path without following its final reparse point and return a
-/// stable identity only for a real, single-link regular file.
-#[cfg(windows)]
-pub fn windows_real_regular_file_identity(
-    path: &Path,
-) -> std::io::Result<Option<WindowsRegularFileIdentity>> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE,
-    };
-
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    let file = options.open(path)?;
-    Ok(windows_file_information(&file).and_then(WindowsFileInformation::regular_file_identity))
-}
-
-/// Return the stable identity of an already-opened Windows directory.
-///
-/// This is the by-handle counterpart of [`windows_real_directory_identity`]:
-/// callers that already hold the handle they intend to use must compare against
-/// the handle itself, never re-open the path, or a component swapped between
-/// the two opens would simply be re-observed and accepted.
-#[cfg(windows)]
-#[must_use]
-pub fn windows_directory_handle_identity(file: &File) -> Option<WindowsDirectoryIdentity> {
-    windows_file_information(file).and_then(WindowsFileInformation::directory_identity)
-}
-
-/// Return the stable identity of an already-opened Windows regular file.
-#[cfg(windows)]
-#[must_use]
-pub fn windows_regular_file_handle_identity(file: &File) -> Option<WindowsRegularFileIdentity> {
-    windows_file_information(file).and_then(WindowsFileInformation::regular_file_identity)
-}
-
-/// Return whether a Windows path is a real directory rather than any reparse
-/// point, including junction kinds not reported by `is_symlink()`.
-#[cfg(windows)]
-pub fn windows_directory_is_real(path: &Path) -> std::io::Result<bool> {
-    windows_real_directory_identity(path).map(|identity| identity.is_some())
-}
-
-/// Open a Windows leaf without following a reparse point and require a real,
-/// single-link regular file. Restore uses this before replacing a destination.
-#[cfg(windows)]
-pub fn windows_regular_file_is_safe(path: &Path) -> std::io::Result<bool> {
-    windows_real_regular_file_identity(path).map(|identity| identity.is_some())
 }
 
 fn corrupt_object_error(
@@ -4924,7 +4658,7 @@ fn chunk_size_error(actual: u64) -> KioError {
     )
 }
 
-fn non_regular_object_error(path: &Path) -> KioError {
+pub(crate) fn non_regular_object_error(path: &Path) -> KioError {
     KioError::new(
         "KIO-E-STORE-CORRUPT-001",
         "CAS path is not a real regular file or directory",
@@ -5448,88 +5182,6 @@ mod tests {
         assert!(directory.is_real_directory());
         assert!(!reparse_point.is_real_directory());
         assert!(!single_link.is_real_directory());
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_handle_identity_distinguishes_distinct_equal_sized_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = dir.path().join("first.bin");
-        let second = dir.path().join("second.bin");
-        fs::write(&first, b"same-size").unwrap();
-        fs::write(&second, b"same-size").unwrap();
-        let first_handle = File::open(&first).unwrap();
-        let same_handle = File::open(&first).unwrap();
-        let second_handle = File::open(&second).unwrap();
-
-        let information = windows_file_information(&first_handle).unwrap();
-        assert!(information.is_regular_file());
-        assert!(information.is_single_link());
-        assert_eq!(
-            windows_real_regular_file_identity(&first).unwrap(),
-            windows_regular_file_handle_identity(&first_handle)
-        );
-        assert_ne!(
-            windows_real_regular_file_identity(&first).unwrap(),
-            windows_real_regular_file_identity(&second).unwrap()
-        );
-        assert!(same_windows_regular_file(&first_handle, &same_handle));
-        assert!(!same_windows_regular_file(&first_handle, &second_handle));
-        assert!(open_regular_nofollow(&first).is_ok());
-    }
-
-    /// The property restore's PA18 destination binding rests on: an identity
-    /// captured from a path must still match a handle later opened on that same
-    /// directory, and must NOT match once a different real directory has taken
-    /// over the name.
-    #[cfg(windows)]
-    #[test]
-    fn windows_directory_handle_identity_matches_its_path_and_detects_a_swap() {
-        use std::os::windows::fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        };
-
-        fn open_directory(path: &Path) -> File {
-            let mut options = OpenOptions::new();
-            options
-                .read(true)
-                .access_mode(FILE_READ_ATTRIBUTES)
-                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-                .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
-            options.open(path).unwrap()
-        }
-
-        let root = tempfile::tempdir().unwrap();
-        let destination = root.path().join("destination");
-        let decoy = root.path().join("decoy");
-        fs::create_dir(&destination).unwrap();
-        fs::create_dir(&decoy).unwrap();
-
-        let captured = windows_real_directory_identity(&destination)
-            .unwrap()
-            .unwrap();
-        {
-            let opened = open_directory(&destination);
-            assert_eq!(windows_directory_handle_identity(&opened), Some(captured));
-        }
-
-        // The swap PA18 exists to catch: the validated name now resolves to a
-        // different real directory.
-        fs::rename(&destination, root.path().join("moved")).unwrap();
-        fs::rename(&decoy, &destination).unwrap();
-        let swapped = open_directory(&destination);
-        assert_ne!(windows_directory_handle_identity(&swapped), Some(captured));
-
-        // A non-directory carries no directory identity, so callers comparing
-        // against `Some(expected)` fail closed rather than matching.
-        let regular = root.path().join("regular.bin");
-        fs::write(&regular, b"payload").unwrap();
-        assert_eq!(
-            windows_directory_handle_identity(&File::open(&regular).unwrap()),
-            None
-        );
     }
 
     #[test]

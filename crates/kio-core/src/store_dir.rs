@@ -15,7 +15,7 @@ use serde_json::json;
 use crate::{ExitCode, KioError, Result, platform::store as platform};
 
 mod atomic;
-mod planned_removal;
+pub(crate) mod planned_removal;
 pub use atomic::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
 pub(crate) use planned_removal::require_same_filesystem;
 pub use planned_removal::{
