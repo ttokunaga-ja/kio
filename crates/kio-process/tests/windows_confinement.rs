@@ -1,10 +1,9 @@
 #![cfg(windows)]
 
+use kio_process::platform::protect_owner_private_scratch;
 use kio_process::{
     BoundedProcessError, BoundedProcessOptions,
-    confinement::{
-        ConfinementError, RenderResourceLimits, RenderSandbox, protect_owner_private_scratch,
-    },
+    confinement::{ConfinementError, RenderResourceLimits, RenderSandbox},
 };
 use std::{
     ffi::OsString,

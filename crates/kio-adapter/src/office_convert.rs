@@ -489,7 +489,7 @@ fn private_temp_dir() -> Result<TempDir> {
         ))
     })?;
     #[cfg(windows)]
-    kio_process::confinement::protect_owner_private_scratch(directory.path()).map_err(|error| {
+    crate::platform::protect_owner_private_scratch(directory.path()).map_err(|error| {
         AdapterError::ContractViolation(format!(
             "failed to establish owner-private office scratch directory: {error}"
         ))

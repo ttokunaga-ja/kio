@@ -11,11 +11,11 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+#[cfg(windows)]
+use crate::platform::wait_supervised_child;
 use kio_core::management::{ManagementAuthority, read_record};
 use kio_core::store_dir::{Publication, StoreDirectory};
 use kio_core::{ExitCode, KioError, Result};
-#[cfg(windows)]
-use kio_process::wait_supervised_child;
 use kio_process::{BoundedProcessOptions, BoundedProcessOutput, run_bounded_command};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};

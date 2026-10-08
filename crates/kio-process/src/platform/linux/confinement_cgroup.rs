@@ -1,9 +1,11 @@
 //! Mandatory Linux renderer resource scope. The fixed gate executes no renderer
 //! until the parent has verified its inherited cgroup membership and limits.
-use super::{ConfinementError, RenderSandbox, apply_unix_limits};
+use super::confinement::NativeRenderSandbox;
+use crate::confinement::ConfinementError;
+use crate::platform::{UnixRendererMonitor, apply_unix_limits};
 use crate::{
     BoundedProcessError as Error, BoundedProcessMonitor, BoundedProcessOptions,
-    BoundedProcessOutput, UnixRendererMonitor,
+    BoundedProcessOutput,
 };
 use std::{
     collections::BTreeMap,
@@ -53,7 +55,7 @@ fn isolation(message: &'static str) -> Error {
 }
 
 pub(super) fn run<I, S>(
-    sandbox: &RenderSandbox,
+    sandbox: &NativeRenderSandbox,
     args: I,
     environment: &[(OsString, OsString)],
     options: BoundedProcessOptions,
@@ -196,7 +198,7 @@ where
     command
         .args(bubblewrap.get_args())
         .current_dir(&sandbox.scratch);
-    apply_unix_limits(&mut command, sandbox.limits)?;
+    apply_unix_limits(&mut command, sandbox.limits, false)?;
     configure_helper(&mut command, Some((keep_fd, ready_fd)));
     monitor.launched = true;
     let result = crate::run_bounded_command_inner_impl(&mut command, options, None, &mut monitor);
@@ -259,7 +261,7 @@ fn pidfd_alive(file: &File) -> io::Result<bool> {
 fn overlap(path: &Path, control: &Path) -> bool {
     path.starts_with(control) || control.starts_with(path)
 }
-fn validate_mounts(sandbox: &RenderSandbox) -> Result<(), ConfinementError> {
+fn validate_mounts(sandbox: &NativeRenderSandbox) -> Result<(), ConfinementError> {
     let sources: Vec<_> = std::iter::once(sandbox.program.clone())
         .chain(std::iter::once(sandbox.scratch.clone()))
         .chain(
@@ -285,7 +287,7 @@ fn validate_mounts(sandbox: &RenderSandbox) -> Result<(), ConfinementError> {
             return Err(ConfinementError::Runtime(path.clone()));
         }
     }
-    super::linux_mounts::validate_sources(&sources).map_err(ConfinementError::Resource)?;
+    super::confinement_mounts::validate_sources(&sources).map_err(ConfinementError::Resource)?;
     Ok(())
 }
 fn trusted_helper(path: &str) -> Result<PathBuf, ConfinementError> {
@@ -503,7 +505,7 @@ impl BoundedProcessMonitor for ManagerMonitor {
 }
 fn reap_before(child: &mut Child, deadline: Instant) -> Result<ExitStatus, Error> {
     loop {
-        if crate::unix_child_has_exited(child).map_err(Error::Wait)? {
+        if crate::platform::child_has_exited(child).map_err(Error::Wait)? {
             return child.wait().map_err(Error::Wait);
         }
         if Instant::now() >= deadline {
@@ -936,7 +938,7 @@ impl BoundedProcessMonitor for Scope {
             if Instant::now() >= self.deadline {
                 return Err(isolation("renderer scope startup deadline expired"));
             }
-            if crate::unix_child_has_exited(child).map_err(Error::Wait)? {
+            if crate::platform::child_has_exited(child).map_err(Error::Wait)? {
                 return Err(isolation("renderer launcher exited before scope admission"));
             }
             if self.anchor(child).map_err(Error::Isolation)? {
@@ -983,7 +985,7 @@ impl BoundedProcessMonitor for Scope {
         if TEST_OBSERVE_RUNTIME_FUSE.with(std::cell::Cell::get) {
             let deadline = self.deadline + CLEANUP_GRACE;
             loop {
-                if crate::unix_child_has_exited(child).map_err(Error::Wait)? {
+                if crate::platform::child_has_exited(child).map_err(Error::Wait)? {
                     let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
                     let result = unsafe {
                         libc::waitid(
@@ -1068,6 +1070,7 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::confinement::RenderSandbox;
     #[test]
     fn rejects_missing_ambiguous_and_overflowing_controls() {
         assert!(key_values("usage_usec 1\nusage_usec 2\n", ' ').is_err());
@@ -1118,10 +1121,10 @@ mod tests {
                 Path::new("/bin/sh"),
                 scratch.path(),
                 [PathBuf::from(root)],
-                super::super::RenderResourceLimits::default(),
+                crate::confinement::RenderResourceLimits::default(),
             )
             .unwrap();
-            assert!(validate_mounts(&sandbox).is_err(), "{root}");
+            assert!(validate_mounts(&sandbox.native).is_err(), "{root}");
         }
         let alias = scratch.path().join("control-alias");
         std::os::unix::fs::symlink("/run", &alias).unwrap();
@@ -1129,10 +1132,10 @@ mod tests {
             Path::new("/bin/sh"),
             scratch.path(),
             [alias],
-            super::super::RenderResourceLimits::default(),
+            crate::confinement::RenderResourceLimits::default(),
         )
         .unwrap();
-        assert!(validate_mounts(&sandbox).is_err());
+        assert!(validate_mounts(&sandbox.native).is_err());
     }
     fn fixture(root: &Path) -> RenderSandbox {
         RenderSandbox::new(
@@ -1142,7 +1145,7 @@ mod tests {
                 .into_iter()
                 .map(PathBuf::from)
                 .filter(|path| path.exists()),
-            super::super::RenderResourceLimits::default(),
+            crate::confinement::RenderResourceLimits::default(),
         )
         .unwrap()
     }
@@ -1299,7 +1302,7 @@ mod tests {
             let mut controller = Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
-                    "confinement::linux_cgroup::tests::parent_death_protocol_helper",
+                    "platform::linux::confinement_cgroup::tests::parent_death_protocol_helper",
                     "--nocapture",
                 ])
                 .env_clear()
@@ -1310,7 +1313,7 @@ mod tests {
                 .unwrap();
             let deadline = Instant::now() + Duration::from_secs(8);
             while !scratch.path().join("phase").exists() {
-                if crate::unix_child_has_exited(&controller).unwrap() {
+                if crate::platform::child_has_exited(&mut controller).unwrap() {
                     let status = controller.wait().unwrap();
                     panic!("{stage} controller exited before the injection point: {status}");
                 }

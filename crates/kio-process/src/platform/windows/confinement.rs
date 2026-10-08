@@ -11,7 +11,7 @@ use std::{
     fs::File,
     io::Read,
     os::windows::{ffi::OsStrExt, io::FromRawHandle},
-    path::{Component, Path, Prefix},
+    path::{Component, Path, PathBuf, Prefix},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc,
@@ -66,8 +66,79 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::confinement::{ConfinementError, RenderSandbox};
+use crate::confinement::{ConfinementError, RenderResourceLimits, canonical_paths};
 use crate::{BoundedProcessError, BoundedProcessOptions, BoundedProcessOutput};
+use std::collections::BTreeSet;
+
+#[derive(Debug, Clone)]
+pub(crate) struct NativeRenderSandbox {
+    program: PathBuf,
+    scratch: PathBuf,
+    runtime_roots: Vec<PathBuf>,
+    limits: RenderResourceLimits,
+}
+
+impl NativeRenderSandbox {
+    pub(crate) fn new(
+        program: &Path,
+        scratch: &Path,
+        runtime_roots: impl IntoIterator<Item = PathBuf>,
+        limits: RenderResourceLimits,
+    ) -> Result<Self, ConfinementError> {
+        let paths = canonical_paths(program, scratch, runtime_roots)?;
+        let mut roots = BTreeSet::new();
+        for (_, source) in paths.roots {
+            roots.insert(source);
+        }
+        // Selecting an executable authorizes that file, not its siblings.
+        // A standalone renderer may live next to private source documents or
+        // credentials; package directories must be supplied explicitly.
+        roots.insert(paths.program.clone());
+        Ok(Self {
+            program: paths.program,
+            scratch: paths.scratch,
+            runtime_roots: roots.into_iter().collect(),
+            limits,
+        })
+    }
+    pub(crate) fn run<I, S>(
+        &self,
+        args: I,
+        environment: &[(OsString, OsString)],
+        options: BoundedProcessOptions,
+    ) -> Result<BoundedProcessOutput, ConfinementError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        run_windows_renderer(self, args, environment, options)
+    }
+
+    pub(crate) fn limits(&self) -> RenderResourceLimits {
+        self.limits
+    }
+
+    pub(crate) fn program(&self) -> &Path {
+        &self.program
+    }
+    pub(crate) fn scratch(&self) -> &Path {
+        &self.scratch
+    }
+    pub(crate) fn runtime_roots(&self) -> &[PathBuf] {
+        &self.runtime_roots
+    }
+}
+
+pub(crate) fn default_render_resource_limits() -> RenderResourceLimits {
+    RenderResourceLimits {
+        wall_timeout: Duration::from_secs(300),
+        cpu_seconds: 300,
+        max_aggregate_memory_bytes: 2 * 1024 * 1024 * 1024,
+        max_address_space_bytes: 2 * 1024 * 1024 * 1024,
+        max_physical_memory_bytes: 0,
+        max_file_bytes: 250 * 1024 * 1024,
+    }
+}
 
 const HUNDRED_NANOSECONDS_PER_SECOND: u64 = 10_000_000;
 static PROFILE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -84,7 +155,7 @@ impl Drop for OwnedHandle {
 /// Make a newly-created, empty scratch directory owner-private before any
 /// renderer-controlled bytes are staged in it. The caller must invoke this
 /// immediately after exclusive creation; non-empty or symlink paths fail.
-pub(crate) fn protect_owner_private_scratch(path: &Path) -> Result<(), ConfinementError> {
+pub fn protect_owner_private_scratch(path: &Path) -> Result<(), ConfinementError> {
     let wide_path = wide(path.as_os_str());
     let raw_directory = unsafe {
         CreateFileW(
@@ -262,7 +333,7 @@ pub(crate) fn protect_owner_private_scratch(path: &Path) -> Result<(), Confineme
 /// profile's zero capability count is deliberate: adding internetClient or
 /// privateNetworkClientServer would turn network access back on.
 pub(crate) fn run_windows_renderer<I, S>(
-    sandbox: &RenderSandbox,
+    sandbox: &NativeRenderSandbox,
     args: I,
     environment: &[(OsString, OsString)],
     options: BoundedProcessOptions,
@@ -431,7 +502,7 @@ fn remaining_wait_millis(deadline: Instant) -> u32 {
 }
 
 fn observe_scratch_until(
-    sandbox: &RenderSandbox,
+    sandbox: &NativeRenderSandbox,
     deadline: Instant,
     options: BoundedProcessOptions,
 ) -> Result<(), ConfinementError> {
@@ -453,7 +524,7 @@ fn observe_scratch_until(
 // Complete pipes do not skip the final scan, and a final scan never gets a new
 // command timeout. Once empty, no renderer process can race this observation.
 fn finish_renderer_output(
-    sandbox: &RenderSandbox,
+    sandbox: &NativeRenderSandbox,
     options: BoundedProcessOptions,
     started: Instant,
     status: std::process::ExitStatus,
@@ -1284,8 +1355,8 @@ mod scratch_scan_tests {
         enforce_scratch_limit_with_clock(root, max, &mut || Duration::ZERO)
     }
 
-    fn final_scan_sandbox(root: &Path, max: u64) -> RenderSandbox {
-        RenderSandbox::new(
+    fn final_scan_sandbox(root: &Path, max: u64) -> NativeRenderSandbox {
+        crate::confinement::RenderSandbox::new(
             &std::env::current_exe().unwrap(),
             root,
             [],
@@ -1295,6 +1366,7 @@ mod scratch_scan_tests {
             },
         )
         .unwrap()
+        .native
     }
 
     #[test]

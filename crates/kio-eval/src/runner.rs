@@ -1104,7 +1104,8 @@ mod tests {
     #[cfg(windows)]
     impl WindowsPreAttachDelay {
         fn set(delay: Duration) -> Self {
-            let previous = kio_process::replace_windows_pre_attach_delay_for_test(Some(delay));
+            let previous =
+                kio_process::platform::replace_windows_pre_attach_delay_for_test(Some(delay));
             Self(previous)
         }
     }
@@ -1112,7 +1113,7 @@ mod tests {
     #[cfg(windows)]
     impl Drop for WindowsPreAttachDelay {
         fn drop(&mut self) {
-            let _ = kio_process::replace_windows_pre_attach_delay_for_test(self.0);
+            let _ = kio_process::platform::replace_windows_pre_attach_delay_for_test(self.0);
         }
     }
 

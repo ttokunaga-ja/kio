@@ -19,6 +19,7 @@ mod management;
 mod multi_scope;
 mod ocr_discovery;
 mod online_task;
+mod platform;
 mod private_state;
 mod promotion;
 mod purge;
