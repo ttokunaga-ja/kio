@@ -3,6 +3,8 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
+use crate::platform::windows_profile_dir;
+
 /// Read an `XDG_*` base-directory environment variable per the XDG Base Directory
 /// Specification's validity rules: an **unset, empty, or relative** value must be
 /// treated as *unset* — the spec requires these paths to be absolute and states
@@ -64,65 +66,13 @@ fn home_dir_from_sources(
 
 /// Pure core of [`home_dir`], unit-testable without mutating the environment.
 #[must_use]
-fn home_dir_from(value: Option<OsString>) -> Option<PathBuf> {
+pub(crate) fn home_dir_from(value: Option<OsString>) -> Option<PathBuf> {
     let value = value?;
     if value.is_empty() {
         return None;
     }
     let path = PathBuf::from(value);
     path.is_absolute().then_some(path)
-}
-
-/// On Windows, `$HOME` is optional and frequently absent. Resolve the current
-/// user's profile through the OS Known Folder API instead of degrading to CWD or
-/// trusting a relative environment variable. Non-Windows builds deliberately
-/// return `None`, preserving the existing fail-closed HOME/XDG contract.
-#[cfg(windows)]
-fn windows_profile_dir() -> Option<PathBuf> {
-    use std::os::windows::ffi::OsStringExt;
-    use std::ptr::{NonNull, null_mut};
-
-    use windows_sys::Win32::System::Com::CoTaskMemFree;
-    use windows_sys::Win32::UI::Shell::{FOLDERID_Profile, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
-
-    #[cfg(debug_assertions)]
-    if let Some(profile) = crate::test_control::current_or_default()
-        .core
-        .windows_profile
-        .and_then(|profile| home_dir_from(Some(profile.into_os_string())))
-    {
-        return Some(profile);
-    }
-
-    let mut raw = null_mut();
-    let status = unsafe {
-        SHGetKnownFolderPath(
-            &FOLDERID_Profile,
-            KF_FLAG_DEFAULT as u32,
-            null_mut(),
-            &mut raw,
-        )
-    };
-    let raw = NonNull::new(raw)?;
-    if status < 0 {
-        unsafe { CoTaskMemFree(raw.as_ptr().cast()) };
-        return None;
-    }
-    let mut length = 0usize;
-    unsafe {
-        while *raw.as_ptr().add(length) != 0 {
-            length = length.checked_add(1)?;
-        }
-    }
-    let value = unsafe { OsString::from_wide(std::slice::from_raw_parts(raw.as_ptr(), length)) };
-    unsafe { CoTaskMemFree(raw.as_ptr().cast()) };
-    let path = PathBuf::from(value);
-    path.is_absolute().then_some(path)
-}
-
-#[cfg(not(windows))]
-fn windows_profile_dir() -> Option<PathBuf> {
-    None
 }
 
 #[cfg(test)]
@@ -184,12 +134,5 @@ mod tests {
             home_dir_from_sources(None, Some(PathBuf::from("relative-profile"))),
             None
         );
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn windows_known_profile_is_an_absolute_fallback() {
-        let profile = windows_profile_dir().expect("Windows profile known folder");
-        assert!(profile.is_absolute());
     }
 }
