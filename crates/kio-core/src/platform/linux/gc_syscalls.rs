@@ -41,7 +41,6 @@ pub(crate) fn rename_noreplace_between(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn exchange_bound(dir: &std::fs::File, left: &str, right: &str) -> Result<()> {
     exchange_between(dir, left, dir, right)
 }

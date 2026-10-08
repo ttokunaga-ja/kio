@@ -32,7 +32,6 @@ pub(crate) fn remove_reserved_leaf(dir: &std::fs::File, leaf: &str) -> Result<()
 /// Descriptor-relative atomic move which refuses to clobber the destination.
 /// This is the critical quarantine primitive: an attacker cannot pre-create a
 /// victim name and have it replaced by a tree object.
-#[allow(dead_code)]
 pub(crate) fn rename_noreplace_bound(dir: &std::fs::File, from: &str, to: &str) -> Result<()> {
     rename_noreplace_between(dir, from, dir, to)
 }
@@ -76,7 +75,6 @@ pub(crate) fn rename_noreplace_between(
     }
 }
 
-#[allow(dead_code)]
 pub(crate) fn exchange_bound(dir: &std::fs::File, left: &str, right: &str) -> Result<()> {
     exchange_between(dir, left, dir, right)
 }

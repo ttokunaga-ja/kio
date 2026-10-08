@@ -102,11 +102,6 @@ pub(crate) fn retire_snapshot_state_temporary(
     windows::retire_expected(dir, temporary, expected_bytes, expected, MAX_METADATA)
 }
 
-#[allow(dead_code)]
-pub(crate) fn rename_noreplace_bound(dir: &std::fs::File, from: &str, to: &str) -> Result<()> {
-    rename_noreplace_between(dir, from, dir, to)
-}
-
 pub(crate) fn rename_noreplace_between(
     from_dir: &std::fs::File,
     from: &str,
