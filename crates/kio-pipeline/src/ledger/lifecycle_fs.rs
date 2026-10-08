@@ -251,7 +251,7 @@ impl FsSession {
             .map_err(core_private)?;
         let lock_identity = regular_file_identity(&lock, &absolute_lock)?;
         #[cfg(windows)]
-        kio_core::private_fs::verify_owner_private_handle(&lock).map_err(core_private)?;
+        kio_core::platform::verify_owner_private_handle(&lock).map_err(core_private)?;
         // Windows denies data reads through another handle while this range
         // is locked. Acquire before inspecting contents so contenders report
         // Locked, then validate bytes through the handle owning the lock.
@@ -590,7 +590,7 @@ impl FsSession {
         self.revalidate_retained_lock_binding()?;
         let path = self.parent_path.join(LIFECYCLE_LOCK);
         let before_identity = regular_file_identity(&self.lock, &path)?;
-        kio_core::private_fs::verify_owner_private_handle(&self.lock).map_err(core_private)?;
+        kio_core::platform::verify_owner_private_handle(&self.lock).map_err(core_private)?;
         let before = self.lock.metadata().map_err(|error| PipelineError::Io {
             path: path.display().to_string(),
             message: error.to_string(),
@@ -625,7 +625,7 @@ impl FsSession {
             message: error.to_string(),
         })?;
         let after_change_time = windows_change_time(&self.lock, &path)?;
-        kio_core::private_fs::verify_owner_private_handle(&self.lock).map_err(core_private)?;
+        kio_core::platform::verify_owner_private_handle(&self.lock).map_err(core_private)?;
         self.revalidate_retained_lock_binding()?;
         if before_identity != after_identity
             || before.len() != after.len()
@@ -653,7 +653,7 @@ impl FsSession {
             .open_regular_read(Path::new(LIFECYCLE_LOCK), MAX_LOCK_BYTES)
             .map_err(core_private)?;
         let identity = regular_file_identity(&named_lock, &self.parent_path.join(LIFECYCLE_LOCK))?;
-        kio_core::private_fs::verify_owner_private_handle(&named_lock).map_err(core_private)?;
+        kio_core::platform::verify_owner_private_handle(&named_lock).map_err(core_private)?;
         if identity != self.lock_identity {
             return Err(boundary_changed(
                 "retained parent lifecycle name no longer names the retained lock",
@@ -1230,7 +1230,7 @@ fn regular_file_identity(file: &File, path: &Path) -> Result<RegularFileIdentity
 #[cfg(windows)]
 fn verify_private_parent_handle(file: &File, path: &Path) -> Result<()> {
     directory_identity(file, path)?;
-    kio_core::private_fs::verify_owner_private_handle(file).map_err(core_private)
+    kio_core::platform::verify_owner_private_handle(file).map_err(core_private)
 }
 
 #[cfg(windows)]
@@ -1557,10 +1557,8 @@ mod tests {
             assert_eq!(bound.files.wal.as_ref().unwrap().identity, wal_identity);
             assert_eq!(bound.files.shm.as_ref().unwrap().identity, shm_identity);
             for sidecar in [&bound.files.wal, &bound.files.shm] {
-                kio_core::private_fs::verify_owner_private_handle(
-                    &sidecar.as_ref().unwrap()._handle,
-                )
-                .unwrap();
+                kio_core::platform::verify_owner_private_handle(&sidecar.as_ref().unwrap()._handle)
+                    .unwrap();
             }
             bound.finish().unwrap();
             let image = fs::read(&path).unwrap();
@@ -1588,7 +1586,7 @@ mod tests {
             let unsafe_path = session.parent_path.join(leaf);
             fs::write(&unsafe_path, b"existing unsafe bytes").unwrap();
             let retained = File::open(&unsafe_path).unwrap();
-            assert!(kio_core::private_fs::verify_owner_private_handle(&retained).is_err());
+            assert!(kio_core::platform::verify_owner_private_handle(&retained).is_err());
             let identity = regular_file_identity(&retained, &unsafe_path).unwrap();
             let error = session
                 .open_existing_sqlite(OpenFlags::SQLITE_OPEN_READ_WRITE)
@@ -1607,7 +1605,7 @@ mod tests {
                 regular_file_identity(&after, &unsafe_path).unwrap(),
                 identity
             );
-            assert!(kio_core::private_fs::verify_owner_private_handle(&after).is_err());
+            assert!(kio_core::platform::verify_owner_private_handle(&after).is_err());
             for sidecar in [&session.names.wal, &session.names.shm] {
                 if sidecar != leaf {
                     assert!(!session.parent_path.join(sidecar).exists());

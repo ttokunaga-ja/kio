@@ -14,7 +14,7 @@ use serde_json::json;
 
 use crate::{ExitCode, KioError, Result, platform::store as platform};
 
-mod atomic;
+pub(crate) mod atomic;
 pub(crate) mod planned_removal;
 pub use atomic::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
 pub(crate) use planned_removal::require_same_filesystem;
@@ -382,16 +382,7 @@ pub(crate) fn relative_components<'a>(
     for component in relative.components() {
         match component {
             Component::Normal(c) => {
-                #[cfg(windows)]
-                {
-                    use std::os::windows::ffi::OsStrExt as _;
-                    if c.encode_wide().any(|unit| unit == b':' as u16) {
-                        return Err(err(
-                            label,
-                            "Windows store paths cannot contain ADS separators",
-                        ));
-                    }
-                }
+                crate::platform::storage_semantics::validate_store_component(c, label)?;
                 out.push(c);
             }
             _ => {

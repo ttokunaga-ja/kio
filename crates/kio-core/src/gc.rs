@@ -3,16 +3,6 @@
 //! Public paths are used only to bind and diagnose a scope.  Every store read
 //! below is relative to a retained directory descriptor.
 
-#[cfg(not(windows))]
-use crate::platform::{
-    gc_atomic_exchange_marker_expected as atomic_exchange_marker_expected,
-    gc_atomic_replace_snapshot_state_expected as replace_snapshot_state_expected,
-    gc_exchange_capture_verified_named as exchange_capture_verified_named,
-    gc_link_count as link_count, gc_open_tree_writable as open_gc_tree_writable,
-    gc_remove_sentinel_leaf as remove_sentinel_leaf,
-    gc_remove_verified_leaf as remove_verified_leaf,
-    gc_rename_noreplace_between as rename_noreplace_between,
-};
 use crate::platform::{
     gc_canonical_index_identity as canonical_gc_index_identity_from_metadata,
     gc_file_state as file_state, gc_publish_staged as publish_staged,
@@ -23,14 +13,12 @@ use crate::platform::{
     gc_same_file_state as same_file_state, gc_sync_bound_directory as sync_bound_directory,
 };
 
-#[cfg(windows)]
 use crate::platform::gc_verify_retained_receipt_observation as verify_retained_receipt_observation;
 
 pub mod exchange;
 mod unreachable_inventory;
-#[cfg(windows)]
-mod windows;
-#[cfg(windows)]
+#[cfg(all(test, windows))]
+#[path = "gc/windows_snapshot_state_tests.rs"]
 mod windows_snapshot_state;
 
 pub use unreachable_inventory::{UnreachableInventoryLimits, UnreachableObjectInventory};
@@ -65,15 +53,13 @@ const MAX_REF: u64 = 4096;
 pub(crate) const MAX_MARKER_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_SWEEP_CANDIDATES: usize = 100_000;
 const MAX_SWEEP_ESTIMATED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-#[cfg(not(windows))]
-pub(crate) const GC_RETIRE_SENTINEL: &[u8] = b"kio gc retirement sentinel\n";
 pub(crate) const SNAPSHOT_AUTO_STATE_LEAF: &str = "snapshot-auto.json";
 const SNAPSHOT_AUTO_STATE_VERSION: u32 = 2;
 const SNAPSHOT_AUTO_STATE_TEMP_PREFIX: &str = ".snapshot-auto-state-";
 /// Scheduler state publishing may leave a private create-new file behind if
 /// the process dies after fsync and before the final rename/exchange.  Keep
 /// recovery bounded even when a scheduler repeatedly dies at that seam.
-const MAX_SNAPSHOT_AUTO_STATE_TEMPORARIES: usize = 64;
+pub(crate) const MAX_SNAPSHOT_AUTO_STATE_TEMPORARIES: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -507,7 +493,7 @@ fn read_active_marker_bound(kio: &std::fs::File) -> Result<Option<GcInProgressMa
     read_marker_without_pending_check(kio)
 }
 
-fn has_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<bool> {
+pub(crate) fn has_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<bool> {
     let mut parent = kio
         .try_clone()
         .map_err(|e| ioerr(e, "snapshot state exchange"))?;
@@ -521,7 +507,7 @@ fn has_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<bool> {
     exchange::inspect_pending(&owner)
 }
 
-fn reject_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<()> {
+pub(crate) fn reject_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<()> {
     if has_pending_snapshot_state_exchange(kio)? {
         return Err(corrupt(
             "pending snapshot auto state exchange requires locked scheduler recovery",
@@ -530,7 +516,7 @@ fn reject_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<()> {
     Ok(())
 }
 
-fn has_pending_marker_exchange(kio: &std::fs::File) -> Result<bool> {
+pub(crate) fn has_pending_marker_exchange(kio: &std::fs::File) -> Result<bool> {
     let mut parent = kio
         .try_clone()
         .map_err(|e| ioerr(e, "GC marker exchange"))?;
@@ -625,16 +611,6 @@ fn validated_final_shallow_receipts_bound(planner: &GcPlanner) -> Result<BTreeMa
 /// `/var` is the platform-owned macOS spelling of `/private/var`.  Normalize
 /// only that lexical alias before descriptor binding; do not call
 /// `canonicalize` on arbitrary user-controlled components.
-fn normalize_macos_var_alias(path: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(rest) = path.strip_prefix("/var") {
-            return Path::new("/private/var").join(rest);
-        }
-    }
-    path.to_path_buf()
-}
-
 /// Make a supplied relative spelling absolute without resolving any
 /// user-controlled component.  Joining to the already-open process cwd keeps
 /// the no-follow component walk authoritative while preserving callers that
@@ -647,7 +623,7 @@ fn absolute_lexical_path(path: &Path) -> Result<PathBuf> {
             .map_err(|error| ioerr(error, path))?
             .join(path)
     };
-    Ok(normalize_macos_var_alias(&absolute))
+    Ok(crate::platform::normalize_gc_scope_path(&absolute))
 }
 
 /// Complete descriptor-bound observation used by the final shallow inventory.
@@ -896,7 +872,84 @@ pub enum GcReceiptPublication {
     AlreadyPresent,
 }
 
+/// Immutable common-domain proof; native exchange only receives its binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SnapshotExchangeAuthority {
+    pub(crate) binding: String,
+    pub(crate) head_observation: FileObservation,
+    pub(crate) tool_observation: FileObservation,
+}
+
 impl GcSweepSession {
+    fn snapshot_exchange_authority(
+        &self,
+        snapshot: &SnapshotAutoBinding,
+        gc: &GcAutomationBinding,
+    ) -> Result<SnapshotExchangeAuthority> {
+        self.recheck_binding()?;
+        snapshot.recheck(&self.scope, &self.kio)?;
+        if !snapshot.config.is_some_and(|config| config.enabled)
+            || self.automation_binding()? != *gc
+        {
+            return Err(snapshot_auto_authority_changed());
+        }
+        let (head, head_observation) = read_regular_observed(&self.kio, "HEAD", MAX_METADATA)?;
+        let head_text = std::str::from_utf8(&head)
+            .map_err(|_| corrupt("snapshot exchange HEAD is not UTF-8"))?;
+        if head_text != "unborn\n" && !head_text.strip_suffix('\n').is_some_and(is_hash) {
+            return Err(corrupt("snapshot exchange HEAD is invalid"));
+        }
+        let (tools, tool_observation) =
+            read_regular_observed(&self.kio, "tool-lock.json", MAX_METADATA)?;
+        let tool_value: serde_json::Value =
+            serde_json::from_slice(&tools).map_err(|e| KioError::schema(e.to_string()))?;
+        crate::scope::canonical_tool_lock_value(&tool_value)?;
+        let binding = hash_bytes(&canonical_json_bytes(&json!({
+            "protocol":"windows-snapshot-state-exchange-v1",
+            "scope": id_file(&self.scope)?, "kio": id_file(&self.kio)?,
+            "head": head_observation.digest, "tool_lock": tool_observation.digest,
+            "config": snapshot.config_observation.digest, "ignore": snapshot.root_ignore_observation.as_ref().map(|observation| &observation.digest),
+            "gc_policy": gc.gc_config_digest,
+        }))?);
+        if read_regular_observed(&self.kio, "HEAD", MAX_METADATA)?.1 != head_observation
+            || read_regular_observed(&self.kio, "tool-lock.json", MAX_METADATA)?.1
+                != tool_observation
+        {
+            return Err(snapshot_auto_authority_changed());
+        }
+        snapshot.recheck(&self.scope, &self.kio)?;
+        self.recheck_binding()?;
+        Ok(SnapshotExchangeAuthority {
+            binding: binding[7..].to_owned(),
+            head_observation,
+            tool_observation,
+        })
+    }
+    fn validate_pending_marker_data(
+        &self,
+        source: Option<GcInProgressMarker>,
+        target: GcInProgressMarker,
+    ) -> Result<()> {
+        if let Some(source) = source {
+            validate_marker_transition(&source, &target)?;
+        }
+        // In the terminal placement no predecessor remains. Only validate the
+        // retained target and current truth; do not reconstruct old authority.
+        let receipts = read_shallow_receipts_bound(&self.kio)?;
+        let frozen = target
+            .candidates
+            .iter()
+            .map(|candidate| (&candidate.commit_hash, &candidate.tree_hash))
+            .collect();
+        self.validate_marker_phase_state(&target, &receipts, &frozen)?;
+        if let Some(expected) = &target.operation_receipts_digest
+            && operation_receipt_observation_digest_bound(&self.kio, &target)? != *expected
+        {
+            return Err(corrupt("pending marker receipt identity/content changed"));
+        }
+        self.validate_frozen_marker_truth_without_public_read(&target)
+    }
+
     /// Recheck the managed-restore exclusion using the retained `.kio`
     /// capability.  Public mutation entry points call this after their caller
     /// holds the bound writer lock, closing the bind-to-first-write race.
@@ -1029,19 +1082,9 @@ impl GcSweepSession {
         self.recheck_binding()?;
         reject_pending_snapshot_state_exchange(&self.kio)?;
         self.ensure_no_pending_managed_restore_under_lock()?;
-        #[cfg(windows)]
-        {
-            self.recover_marker_windows()
-        }
-        #[cfg(not(windows))]
-        {
-            if has_pending_marker_exchange(&self.kio)? {
-                return Err(corrupt(
-                    "Windows GC marker exchange cannot recover on this platform",
-                ));
-            }
-            Ok(())
-        }
+        crate::platform::recover_marker(&self.kio, |source, target| {
+            self.validate_pending_marker_data(source, target)
+        })
     }
 
     pub fn acquire_store_lock(&self) -> Result<BoundStoreLock> {
@@ -1089,10 +1132,11 @@ impl GcSweepSession {
         if self.automation_binding()? != *gc {
             return Err(snapshot_auto_authority_changed());
         }
-        #[cfg(windows)]
-        self.recover_snapshot_state_windows(snapshot, gc)?;
-        #[cfg(not(windows))]
-        reject_pending_snapshot_state_exchange(&self.kio)?;
+        crate::platform::recover_snapshot_state(
+            &self.kio,
+            || self.snapshot_exchange_authority(snapshot, gc),
+            || self.snapshot_auto_state().map(|_| ()),
+        )?;
         self.recheck_binding()
     }
 
@@ -1282,20 +1326,11 @@ impl GcSweepSession {
                     return Err(error);
                 }
             }
-            #[cfg(windows)]
-            Some(observation) => self.replace_snapshot_state_windows(
+            Some(observation) => self.replace_snapshot_state(
                 &temporary,
                 &bytes,
                 observation,
                 &temporary_observation,
-            )?,
-            #[cfg(not(windows))]
-            Some(observation) => replace_snapshot_state_expected(
-                &self.kio,
-                SNAPSHOT_AUTO_STATE_LEAF,
-                &temporary,
-                &bytes,
-                observation,
             )?,
         }
         sync_bound_directory(&self.kio, SNAPSHOT_AUTO_STATE_LEAF)?;
@@ -1304,6 +1339,30 @@ impl GcSweepSession {
             return Err(corrupt("snapshot auto state changed during publication"));
         }
         Ok(published)
+    }
+
+    fn replace_snapshot_state(
+        &self,
+        temporary: &str,
+        bytes: &[u8],
+        expected: &FileObservation,
+        temporary_observation: &FileObservation,
+    ) -> Result<()> {
+        crate::platform::replace_snapshot_state(
+            &self.kio,
+            temporary,
+            bytes,
+            expected,
+            temporary_observation,
+            || {
+                let snapshot = self.snapshot_auto_binding()?;
+                let gc_binding = self.automation_binding()?;
+                let binding = self.snapshot_exchange_authority(&snapshot, &gc_binding)?;
+                Ok((binding, move || {
+                    self.snapshot_exchange_authority(&snapshot, &gc_binding)
+                }))
+            },
+        )
     }
 
     /// Establish the scheduler-state publication precondition while the
@@ -1685,19 +1744,16 @@ impl GcSweepSession {
         let gc = ensure_child_dir(&self.kio, "gc")?;
         let internal = ensure_child_dir(&gc, "internal")?;
         let markers = ensure_child_dir(&internal, "markers")?;
-        #[cfg(windows)]
-        {
-            self.exchange_marker_windows(&gc, &internal, &markers, marker, expected)
-        }
-        #[cfg(not(windows))]
-        atomic_exchange_marker_expected(
+        crate::platform::exchange_marker(
             &gc,
-            "in_progress",
+            &internal,
             &markers,
-            &marker.canonical_bytes()?,
+            marker,
             expected,
+            |source, target| self.validate_pending_marker_data(source, target),
         )
     }
+
     pub fn create_receipt(
         &self,
         candidate: &GcCandidate,
@@ -1741,7 +1797,6 @@ impl GcSweepSession {
                 // tree while the receipt has not reached stable storage.
                 let durable = open_verified_receipt_durable_handle(&shallowed, leaf, &observed)?;
                 durable.sync_all().map_err(|error| ioerr(error, leaf))?;
-                #[cfg(windows)]
                 verify_retained_receipt_observation(&durable, leaf, &observed)?;
                 sync_bound_directory(&shallowed, leaf)?;
                 Ok(GcReceiptPublication::AlreadyPresent)
@@ -1855,201 +1910,34 @@ impl GcSweepSession {
         let internal = ensure_child_dir(&gc, "internal")?;
         let archive_dir = ensure_child_dir(&internal, "trees")?;
         let quarantine = format!("{}-{}", marker.sweep_id, raw);
-        #[cfg(windows)]
-        {
-            self.remove_candidate_tree_windows(
-                permit,
-                marker,
-                tree_hash,
-                raw,
-                &d,
-                &archive_dir,
-                &quarantine,
-            )
-        }
-        #[cfg(not(windows))]
-        {
-            #[cfg(not(windows))]
-            let captured_name = tree_capture_name(marker, raw);
-
-            // Either start from the canonical CAS leaf or resume the exact
-            // operation-owned quarantine left by a crash after the durable rename.
-            // Both paths bind a no-follow writable descriptor before the archive
-            // name is removed; no ambient pathname is ever used for deletion.
-            let canonical = read_regular_observed(&d, raw, MAX_TREE_OBJECT_BYTES);
-            let (bytes, before, writable, already_captured) = match canonical {
-                Ok((bytes, before)) => {
-                    self.validate_committed_tree_bytes(marker, tree_hash, &bytes)?;
-                    let writable = open_gc_tree_writable(&d, raw, &before)?;
-                    // A pre-existing operation archive together with the canonical
-                    // leaf is not a resumable state and must never be overwritten.
-                    if read_regular_observed(&archive_dir, &quarantine, MAX_TREE_OBJECT_BYTES)
-                        .is_ok()
-                    {
-                        return Err(corrupt("GC tree exists at canonical and archive paths"));
-                    }
-                    self.require_active_marker(marker)?;
-                    let (final_bytes, final_observation) =
-                        read_regular_observed(&d, raw, MAX_TREE_OBJECT_BYTES)?;
-                    if final_observation != before || final_bytes != bytes {
-                        return Err(corrupt("tree changed immediately before GC quarantine"));
-                    }
-                    self.wait_at_gc_pre_quarantine_barrier();
-                    // The index generation/identity is part of the irreversible
-                    // deletion authority, not merely an executor preflight.  Bind
-                    // it again at the final namespace transition after the longer
-                    // ref/receipt/tree verification above.
-                    self.validate_tree_removal_permit(permit, marker)?;
-                    self.require_live_pre_sweep_index_binding(marker)?;
-                    rename_noreplace_between(&d, raw, &archive_dir, &quarantine)?;
-                    // Persist disappearance from CAS and appearance in quarantine
-                    // before any crash seam or byte reclamation.
-                    sync_bound_directory(&archive_dir, &quarantine)?;
-                    sync_bound_directory(&d, raw)?;
-                    (bytes, before, writable, false)
-                }
-                Err(error) if is_io_not_found(&error) => {
-                    let (bytes, before, already_captured) = match read_regular_observed(
-                        &archive_dir,
-                        &quarantine,
-                        MAX_TREE_OBJECT_BYTES,
-                    ) {
-                        Ok((sentinel, _)) if sentinel == GC_RETIRE_SENTINEL => {
-                            match read_regular_observed(
-                                &archive_dir,
-                                &captured_name,
-                                MAX_TREE_OBJECT_BYTES,
-                            ) {
-                                Ok((captured, observed)) => (captured, observed, true),
-                                Err(error) if is_io_not_found(&error) => {
-                                    // The captured tree was already unlinked
-                                    // before a crash. Its sentinel is a durable,
-                                    // deterministic completion record; remove it
-                                    // only after the fresh marker binding above.
-                                    self.require_active_marker(marker)?;
-                                    remove_sentinel_leaf(&archive_dir, &quarantine)?;
-                                    sync_bound_directory(&archive_dir, &quarantine)?;
-                                    return Ok(true);
-                                }
-                                Err(error) => return Err(error),
-                            }
-                        }
-                        Ok(value) => (value.0, value.1, false),
-                        Err(error) if is_io_not_found(&error) => return Ok(false),
-                        Err(error) => return Err(error),
-                    };
-                    self.validate_committed_tree_bytes(marker, tree_hash, &bytes)?;
-                    let writable = open_gc_tree_writable(
-                        &archive_dir,
-                        if already_captured {
-                            &captured_name
-                        } else {
-                            &quarantine
-                        },
-                        &before,
-                    )?;
-                    (bytes, before, writable, already_captured)
-                }
-                Err(error) => return Err(error),
-            };
-
-            let quarantined = read_regular_observed(
-                &archive_dir,
-                if already_captured {
-                    &captured_name
-                } else {
-                    &quarantine
-                },
-                MAX_TREE_OBJECT_BYTES,
-            );
-            // Rename legitimately updates ctime, so only identity + byte length and
-            // hash are stable across the quarantine transition.
-            let valid_quarantine = quarantined.as_ref().is_ok_and(|(bytes, observation)| {
-                hash_bytes(bytes) == tree_hash
-                    && observation.identity == before.identity
-                    && observation.state.len == before.state.len
-            });
-            if !valid_quarantine {
-                // Do not restore: a replacement raw leaf could have appeared after
-                // the no-replace move. Leaving the quarantined object is safe and
-                // forces explicit recovery rather than risking an overwrite.
-                return Err(corrupt("tree changed during GC quarantine"));
-            }
-            let handle_meta =
-                cap_fs::Metadata::from_file(&writable).map_err(|error| ioerr(error, raw))?;
-            if id_meta(&handle_meta)? != before.identity || handle_meta.len() != before.state.len {
-                return Err(corrupt("tree writable handle changed during quarantine"));
-            }
-            if hash_bytes(&bytes) != tree_hash {
-                return Err(corrupt("tree bytes changed during GC quarantine"));
-            }
-            self.inject_gc_tree_fault(GcTreeFaultPoint::TreeQuarantine)?;
-            self.wait_at_gc_tree_quarantine_barrier();
-            // The test seam is deliberately before this final check. Rebind both
-            // authorities immediately before capture: a marker replacement must
-            // stop the erase, and a renamed archive victim is captured under a
-            // fresh private name then compared before any unlink occurs.
-            self.require_active_marker(marker)?;
-            let erase_leaf = if already_captured {
-                &captured_name
-            } else {
-                &quarantine
-            };
-            let (final_bytes, final_observation) =
-                read_regular_observed(&archive_dir, erase_leaf, MAX_TREE_OBJECT_BYTES)?;
-            if final_observation.identity != before.identity
-                || final_observation.state.len != before.state.len
-                || final_observation.digest != hash_bytes(&bytes)
-                || final_bytes != bytes
-            {
-                return Err(corrupt("tree changed immediately before GC erase"));
-            }
-            let (captured, captured_observation) = if already_captured {
-                (captured_name, final_observation)
-            } else {
-                exchange_capture_verified_named(
-                    &archive_dir,
-                    &quarantine,
-                    &captured_name,
-                    &final_observation,
-                    MAX_TREE_OBJECT_BYTES,
-                    "GC tree archive",
-                )?
-            };
-            self.inject_gc_tree_fault(GcTreeFaultPoint::TreeRetirementCapture)?;
-            // Unlink only the private captured name, then require the retained
-            // object to have no remaining names before truncating it. A same-UID
-            // hardlink inserted at any point leaves nlink > 0 and aborts without
-            // modifying bytes owned by another pathname.
-            remove_verified_leaf(
-                &archive_dir,
-                &captured,
-                &captured_observation,
-                MAX_TREE_OBJECT_BYTES,
-                "GC captured tree archive",
-            )?;
-            remove_sentinel_leaf(&archive_dir, &quarantine)?;
-            sync_bound_directory(&archive_dir, &quarantine)?;
-            let unlinked =
-                cap_fs::Metadata::from_file(&writable).map_err(|error| ioerr(error, raw))?;
-            if id_meta(&unlinked)? != before.identity || link_count(&unlinked)? != 0 {
-                return Err(corrupt("tree archive gained a hardlink before byte erase"));
-            }
-            writable.set_len(0).map_err(|error| ioerr(error, raw))?;
-            writable.sync_all().map_err(|error| ioerr(error, raw))?;
-            let erased =
-                cap_fs::Metadata::from_file(&writable).map_err(|error| ioerr(error, raw))?;
-            if id_meta(&erased)? != before.identity
-                || erased.len() != 0
-                || link_count(&erased)? != 0
-            {
-                return Err(corrupt(
-                    "tree archive truncate did not bind expected object",
-                ));
-            }
-            sync_bound_directory(&d, raw)?;
-            Ok(true)
-        }
+        let captured_name = format!("{}-{raw}-captured", marker.sweep_id);
+        crate::platform::retire_candidate_tree(
+            tree_hash,
+            raw,
+            &d,
+            &archive_dir,
+            &quarantine,
+            &captured_name,
+            |bytes| self.validate_committed_tree_bytes(marker, tree_hash, bytes),
+            || self.require_active_marker(marker).map(|_| ()),
+            || {
+                self.wait_at_gc_pre_quarantine_barrier();
+                self.validate_tree_removal_permit(permit, marker)?;
+                self.require_live_pre_sweep_index_binding(marker)
+            },
+            || {
+                self.inject_gc_tree_fault(GcTreeFaultPoint::TreeQuarantine)?;
+                self.wait_at_gc_tree_quarantine_barrier();
+                Ok(())
+            },
+            || {
+                self.require_active_marker(marker)?;
+                self.validate_tree_removal_permit(permit, marker)?;
+                self.require_live_pre_sweep_index_binding(marker)?;
+                self.recheck_tree_receipts(marker, tree_hash)
+            },
+            || self.inject_gc_tree_fault(GcTreeFaultPoint::TreeRetirementCapture),
+        )
     }
 
     pub fn remove_marker(&self, expected: &GcInProgressMarker) -> Result<()> {
@@ -2143,8 +2031,6 @@ impl GcSweepSession {
                 },
             };
             let archive = format!("{}-{raw}", marker.sweep_id);
-            #[cfg(not(windows))]
-            let captured_name = tree_capture_name(marker, raw);
             // Keep each directory capability alive through the complete read.  In
             // Rust 2021, the nested `if let` scrutinee temporaries lived until the
             // end of this initializer; make that lifetime explicit for Rust 2024.
@@ -2159,33 +2045,12 @@ impl GcSweepSession {
                     None => None,
                 };
                 match archives.as_ref() {
-                    Some(archives) => {
-                        match read_regular_observed(archives, &archive, MAX_TREE_OBJECT_BYTES) {
-                            #[cfg(not(windows))]
-                            Ok((sentinel, _)) if sentinel == GC_RETIRE_SENTINEL => {
-                                match read_regular_observed(
-                                    archives,
-                                    &captured_name,
-                                    MAX_TREE_OBJECT_BYTES,
-                                ) {
-                                    Ok((bytes, _)) => {
-                                        self.validate_committed_tree_bytes(
-                                            marker, tree_hash, &bytes,
-                                        )?;
-                                        (false, true)
-                                    }
-                                    Err(error) if is_io_not_found(&error) => (false, false),
-                                    Err(error) => return Err(error),
-                                }
-                            }
-                            Ok((bytes, _)) => {
-                                self.validate_committed_tree_bytes(marker, tree_hash, &bytes)?;
-                                (true, false)
-                            }
-                            Err(error) if is_io_not_found(&error) => (false, false),
-                            Err(error) => return Err(error),
-                        }
-                    }
+                    Some(archives) => crate::platform::marker_archive_presence(
+                        archives,
+                        &archive,
+                        &format!("{}-{raw}-captured", marker.sweep_id),
+                        |bytes| self.validate_committed_tree_bytes(marker, tree_hash, bytes),
+                    )?,
                     None => (false, false),
                 }
             };
@@ -2546,7 +2411,7 @@ fn wait_at_gc_test_barrier(ready_path: Option<&Path>) {
     }
 }
 
-fn ensure_child_dir(parent: &std::fs::File, name: &str) -> Result<std::fs::File> {
+pub(crate) fn ensure_child_dir(parent: &std::fs::File, name: &str) -> Result<std::fs::File> {
     match open_optional_dir(parent, name)? {
         Some(dir) => Ok(dir),
         None => {
@@ -2618,7 +2483,7 @@ fn cleanup_snapshot_auto_state_temporaries(dir: &std::fs::File) -> Result<()> {
     sync_bound_directory(dir, "snapshot auto temporary cleanup")
 }
 
-fn is_snapshot_auto_state_temporary_name(name: &str) -> bool {
+pub(crate) fn is_snapshot_auto_state_temporary_name(name: &str) -> bool {
     let Some(suffix) = name.strip_prefix(SNAPSHOT_AUTO_STATE_TEMP_PREFIX) else {
         return false;
     };
@@ -2635,11 +2500,6 @@ fn is_canonical_decimal(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| byte.is_ascii_digit())
         && (value == "0" || !value.starts_with('0'))
-}
-
-#[cfg(not(windows))]
-fn tree_capture_name(marker: &GcInProgressMarker, raw: &str) -> String {
-    format!("{}-{raw}-captured", marker.sweep_id)
 }
 
 fn validate_marker_transition(
@@ -3706,7 +3566,7 @@ pub(crate) fn snapshot_auto_state_changed() -> KioError {
     )
 }
 
-fn snapshot_auto_authority_changed() -> KioError {
+pub(crate) fn snapshot_auto_authority_changed() -> KioError {
     KioError::new(
         "KIO-E-SNAPSHOT-AUTHORITY-CHANGED-001",
         "scheduled snapshot authority changed during publication",
@@ -3724,7 +3584,7 @@ pub fn snapshot_auto_clock_error(message: &str) -> KioError {
     )
 }
 
-fn snapshot_auto_unsafe_entry(message: &str) -> KioError {
+pub(crate) fn snapshot_auto_unsafe_entry(message: &str) -> KioError {
     KioError::new(
         "KIO-E-SNAPSHOT-UNSAFE-ENTRY-001",
         message,
@@ -3755,16 +3615,7 @@ pub(crate) fn validated_snapshot_auto_direct_entries(
         let before = cap_fs::stat(scope, path, cap_fs::FollowSymlinks::No)
             .map_err(|error| ioerr(error, &name))?;
         if before.is_dir() {
-            #[cfg(windows)]
-            {
-                use cap_fs::_WindowsByHandle;
-                use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-                if before.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-                    return Err(snapshot_auto_unsafe_entry(
-                        "direct directory is a reparse point",
-                    ));
-                }
-            }
+            crate::platform::validate_gc_direct_directory_metadata(&before)?;
             continue;
         }
         valid_file(&before, MAX_RAW_OBJECT_BYTES).map_err(|_| {
@@ -3835,7 +3686,7 @@ fn open_dir(base: &std::fs::File, n: &str) -> Result<std::fs::File> {
 /// Open one optional direct-child directory without following its final
 /// component. Only an exact `NotFound` is absence; every other failure remains
 /// observable so an unsafe entry cannot masquerade as an empty namespace.
-fn open_optional_dir(base: &std::fs::File, n: &str) -> Result<Option<std::fs::File>> {
+pub(crate) fn open_optional_dir(base: &std::fs::File, n: &str) -> Result<Option<std::fs::File>> {
     let path = Path::new(n);
     let directory = match cap_fs::open_dir_nofollow(base, path) {
         Ok(directory) => directory,
@@ -3869,16 +3720,7 @@ pub(crate) fn validate_directory_handle(
     if !metadata.is_dir() {
         return Err(corrupt("expected real directory"));
     }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(corrupt("directory is a Windows reparse point"));
-        }
-    }
-    Ok(())
+    crate::platform::validate_gc_directory_metadata(&metadata)
 }
 
 fn names(
@@ -4027,30 +3869,13 @@ pub(crate) fn valid_file(m: &cap_fs::Metadata, max: u64) -> Result<()> {
             corrupt("non-regular store entry")
         });
     }
-    #[cfg(unix)]
-    {
-        use cap_primitives::fs::MetadataExt;
-        if m.nlink() != 1 {
-            return Err(corrupt("linked store entry"));
-        }
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-        if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || m.number_of_links() != Some(1)
-        {
-            return Err(corrupt("linked store entry"));
-        }
-    }
-    Ok(())
+    crate::platform::validate_gc_file_links(m)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Identity(
-    #[serde(serialize_with = "crate::identity_serde::u64_hex::serialize")] u64,
-    #[serde(serialize_with = "crate::identity_serde::u64_hex::serialize")] u64,
+    #[serde(serialize_with = "crate::identity_serde::u64_hex::serialize")] pub(crate) u64,
+    #[serde(serialize_with = "crate::identity_serde::u64_hex::serialize")] pub(crate) u64,
 );
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4063,22 +3888,7 @@ pub(crate) struct FileState {
 }
 
 pub(crate) fn id_meta(m: &cap_fs::Metadata) -> Result<Identity> {
-    #[cfg(unix)]
-    {
-        use cap_primitives::fs::MetadataExt;
-        Ok(Identity(m.dev(), m.ino()))
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        let volume = m
-            .volume_serial_number()
-            .ok_or_else(|| corrupt("store identity is unavailable"))?;
-        let index = m
-            .file_index()
-            .ok_or_else(|| corrupt("store identity is unavailable"))?;
-        Ok(Identity(u64::from(volume), index))
-    }
+    crate::platform::gc_metadata_identity(m)
 }
 
 fn id_file(f: &std::fs::File) -> Result<Identity> {
@@ -4092,7 +3902,7 @@ fn id_child(d: &std::fs::File, n: &str) -> Result<Identity> {
     let x = open_dir(d, n)?;
     id_file(&x)
 }
-fn is_io_not_found(error: &KioError) -> bool {
+pub(crate) fn is_io_not_found(error: &KioError) -> bool {
     error.error_code() == "KIO-E-STORE-IO-001"
         && error
             .context()
@@ -4109,41 +3919,7 @@ fn is_canonical_ulid(value: &str) -> bool {
     value.len() == 26 && value.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'A'..=b'H' | b'J'..=b'K' | b'M'..=b'N' | b'P'..=b'T' | b'V'..=b'Z'))
 }
 fn is_canonical_gc_index_identity(value: &str) -> bool {
-    #[cfg(unix)]
-    {
-        let Some((platform, dev, ino)) = value.split_once(':').and_then(|(platform, rest)| {
-            rest.split_once(':').map(|(dev, ino)| (platform, dev, ino))
-        }) else {
-            return false;
-        };
-        platform == "unix"
-            && dev.len() == 16
-            && ino.len() == 16
-            && dev
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            && ino
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    }
-    #[cfg(windows)]
-    {
-        let Some((platform, volume, index)) = value.split_once(':').and_then(|(platform, rest)| {
-            rest.split_once(':')
-                .map(|(volume, index)| (platform, volume, index))
-        }) else {
-            return false;
-        };
-        platform == "windows"
-            && volume.len() == 8
-            && index.len() == 16
-            && volume
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-            && index
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    }
+    crate::platform::is_canonical_gc_index_identity(value)
 }
 
 fn is_valid_gc_index_temp_leaf(value: &str) -> bool {

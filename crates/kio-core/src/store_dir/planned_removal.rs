@@ -3,11 +3,7 @@
 //! they never persist authority to delete without current caller proofs.
 use super::{StoreDirectory, err, ioerr, platform, relative_components};
 use crate::Result;
-#[cfg(target_os = "linux")]
-use crate::platform::mount_id;
 use crate::platform::planned_removal::rename;
-#[cfg(windows)]
-use crate::platform::planned_removal::retire_directory;
 use cap_primitives::fs as cap_fs;
 use sha2::{Digest, Sha256};
 use std::{
@@ -63,65 +59,8 @@ impl RemovalBudget {
     }
 }
 
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Identity(u64, u64);
-#[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Identity {
-    File(crate::platform::RegularFileHandleIdentity),
-    Directory(crate::platform::DirectoryHandleIdentity),
-}
-
-pub(crate) fn identity(file: &File, directory: bool, label: &Path) -> Result<Identity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let m = file.metadata().map_err(|e| ioerr(label, e))?;
-        if (directory && !m.is_dir()) || (!directory && (!m.is_file() || m.nlink() != 1)) {
-            return Err(err(
-                label,
-                "planned removal target is not a safe single-link file or directory",
-            ));
-        }
-        Ok(Identity(m.dev(), m.ino()))
-    }
-    #[cfg(windows)]
-    {
-        if directory {
-            crate::platform::directory_handle_identity(file).map(Identity::Directory)
-        } else {
-            crate::platform::regular_file_handle_identity(file).map(Identity::File)
-        }
-        .ok_or_else(|| {
-            err(
-                label,
-                "planned removal target is reparse, hardlinked, or the wrong kind",
-            )
-        })
-    }
-}
-
-// Compare retained handles before reading descendants, including the target root.
-// Linux mount IDs additionally distinguish same-device bind mounts.
-pub(crate) fn require_same_filesystem(parent: &File, child: &File, label: &Path) -> Result<()> {
-    #[cfg(unix)]
-    let same = {
-        use std::os::unix::fs::MetadataExt;
-        parent.metadata().map_err(|e| ioerr(label, e))?.dev()
-            == child.metadata().map_err(|e| ioerr(label, e))?.dev()
-    };
-    #[cfg(windows)]
-    let same = platform::volume_serial(parent, label)? == platform::volume_serial(child, label)?;
-    if !same {
-        return Err(err(label, "planned removal crosses a filesystem boundary"));
-    }
-    #[cfg(target_os = "linux")]
-    if mount_id(parent, label)? != mount_id(child, label)? {
-        return Err(err(label, "planned removal crosses a mount boundary"));
-    }
-    Ok(())
-}
+use crate::platform::removal_semantics::open;
+pub(crate) use crate::platform::removal_semantics::{Identity, identity, require_same_filesystem};
 
 #[derive(Debug)]
 struct Node {
@@ -168,67 +107,6 @@ fn exists(parent: &File, leaf: &OsStr, label: &Path) -> Result<bool> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(e) => Err(ioerr(label, e)),
     }
-}
-fn open(
-    parent: &File,
-    leaf: &OsStr,
-    directory: bool,
-    mutation: bool,
-    label: &Path,
-) -> Result<File> {
-    #[cfg(unix)]
-    if directory && !mutation {
-        let file =
-            cap_fs::open_dir_nofollow(parent, Path::new(leaf)).map_err(|e| ioerr(label, e))?;
-        identity(&file, true, label)?;
-        require_same_filesystem(parent, &file, label)?;
-        return Ok(file);
-    }
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    #[cfg(unix)]
-    {
-        use cap_fs::OpenOptionsExt;
-        let mut flags = libc::O_NONBLOCK;
-        if directory {
-            flags |= libc::O_DIRECTORY;
-        }
-        options.custom_flags(flags);
-        let _ = mutation;
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::OpenOptionsExt;
-        use windows_sys::Win32::{
-            Foundation::{GENERIC_READ, GENERIC_WRITE},
-            Storage::FileSystem::{
-                DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            },
-        };
-        // Capture pins permit the later exact DELETE mutator; that mutator
-        // denies further writers/deleters and is compared to the pinned identity.
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-        if mutation {
-            options
-                .access_mode(GENERIC_READ | DELETE | if directory { 0 } else { GENERIC_WRITE })
-                .share_mode(FILE_SHARE_READ | if directory { FILE_SHARE_WRITE } else { 0 });
-        }
-        options.custom_flags(
-            FILE_FLAG_OPEN_REPARSE_POINT
-                | if directory {
-                    FILE_FLAG_BACKUP_SEMANTICS
-                } else {
-                    0
-                },
-        );
-    }
-    let file = cap_fs::open(parent, Path::new(leaf), &options).map_err(|e| ioerr(label, e))?;
-    identity(&file, directory, label)?;
-    require_same_filesystem(parent, &file, label)?;
-    Ok(file)
 }
 fn digest(file: &File, max: u64, label: &Path) -> Result<(u64, String)> {
     let before = identity(file, false, label)?;
@@ -544,31 +422,15 @@ fn remove_node(
             ));
         }
     }
-    // A retained root quarantine is the Unix reserved namespace boundary; no
-    // final unlink claims a portable atomic compare-and-delete syscall.
-    #[cfg(unix)]
-    {
-        let named = open(parent, leaf, node.is_dir(), false, label)?;
-        if identity(&named, node.is_dir(), label)? != node.identity
-            || identity(&node.held, node.is_dir(), label)? != node.identity
-        {
-            return Err(err(label, "planned child changed before unlink"));
-        }
-        if node.is_dir() {
-            cap_fs::remove_dir(parent, Path::new(leaf))
-        } else {
-            cap_fs::remove_file(parent, Path::new(leaf))
-        }
-        .map_err(|e| ioerr(label, e))?;
-    }
-    #[cfg(windows)]
-    {
-        if node.is_dir() {
-            retire_directory(&mutator, label)?;
-        } else {
-            platform::retire_gc_handle_retained(&mutator, label)?;
-        }
-    }
+    crate::platform::removal_semantics::retire_leaf(
+        parent,
+        leaf,
+        &node.held,
+        &mutator,
+        node.is_dir(),
+        &node.identity,
+        label,
+    )?;
     drop(mutator);
     platform::sync_directory(parent, label)
 }
@@ -635,6 +497,8 @@ impl PlannedFileRemoval {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use crate::platform::mount_id;
     fn fixture() -> (tempfile::TempDir, StoreDirectory) {
         let temp = tempfile::tempdir().unwrap();
         let parent = StoreDirectory::open(&temp.path().canonicalize().unwrap()).unwrap();

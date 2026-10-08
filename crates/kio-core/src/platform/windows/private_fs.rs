@@ -51,7 +51,7 @@ use windows_sys::Win32::{
 };
 
 use crate::Result;
-use crate::private_fs::{NewPrivateObjectKind, oversized_file, raced_file, unsafe_file};
+use crate::private_fs::{oversized_file, raced_file, unsafe_file};
 use crate::store_dir::StoreDirectory;
 
 const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
@@ -70,6 +70,15 @@ const FILE_APPEND_DATA: u32 = 0x0000_0004;
 const FILE_WRITE_EA: u32 = 0x0000_0010;
 const FILE_DELETE_CHILD: u32 = 0x0000_0040;
 const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
+
+/// Create one direct child beneath a retained Windows directory with its
+/// current-user owner and protected owner-only DACL installed by the kernel at
+/// creation time. This never adopts or repairs an existing name.
+#[derive(Clone, Copy)]
+pub(crate) enum NewPrivateObjectKind {
+    Directory,
+    RegularFile,
+}
 
 pub(crate) fn create_new_private_at(
     parent: &File,
@@ -212,12 +221,16 @@ fn private_acl(owner: &CurrentUserSid) -> std::io::Result<(Vec<u32>, *mut ACL)> 
     Ok((acl, acl_ptr))
 }
 
-pub(crate) fn verify_owner_private_handle(file: &File) -> Result<()> {
+/// Verify a retained Windows handle's owner-private ACL before another crate
+/// creates operational artifacts beneath it. This never repairs permissions.
+pub fn verify_owner_private_handle(file: &File) -> Result<()> {
     let owner = CurrentUserSid::current()
         .map_err(|_| unsafe_file("cannot determine current Windows user", None))?;
     verify_owner_only(file, &owner, Path::new("<retained>"))
 }
 
+/// Require that a retained Windows file or directory belongs to the current
+/// user without changing its security descriptor.
 pub(crate) fn verify_current_owner_handle(file: &File) -> Result<()> {
     let owner = CurrentUserSid::current()
         .map_err(|_| unsafe_file("cannot determine current Windows user", None))?;
@@ -236,6 +249,8 @@ pub(crate) fn verify_private_directory_handle(directory: &StoreDirectory) -> Res
     verify_owner_only(&handle, &owner, directory.path())
 }
 
+/// Restrict a retained, already-existing object only after proving that the
+/// current user owns it. New objects must use `create_new_private_at` instead.
 pub(crate) fn restrict_existing_private_handle(file: &File) -> Result<()> {
     let owner = CurrentUserSid::current()
         .map_err(|_| unsafe_file("cannot determine current Windows user", None))?;

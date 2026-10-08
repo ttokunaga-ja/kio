@@ -488,9 +488,10 @@ mod unix {
 
 #[cfg(windows)]
 mod windows {
+    use kio_core::platform::verify_owner_private_handle;
     use kio_core::private_fs::{
-        read_private_file, read_private_file_at, verify_owner_private_handle,
-        verify_private_creation_parent, verify_private_directory, verify_private_directory_handle,
+        read_private_file, read_private_file_at, verify_private_creation_parent,
+        verify_private_directory, verify_private_directory_handle,
     };
     use kio_core::store_dir::StoreDirectory;
     use std::{

@@ -99,3 +99,11 @@ pub(crate) fn publish_staged(
     staged_checkpoint()?;
     crate::platform::gc_rename_noreplace_between(from_dir, staged, to_dir, leaf)
 }
+
+pub(crate) fn verify_retained_receipt_observation(
+    _file: &std::fs::File,
+    _leaf: &str,
+    _expected: &FileObservation,
+) -> Result<()> {
+    Ok(())
+}

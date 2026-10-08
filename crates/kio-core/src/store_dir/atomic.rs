@@ -22,8 +22,8 @@ pub const ATOMIC_WORKSPACE_DIR: &str = ".kio-atomic";
 const GATE: &str = ".gate";
 const WRITE: &str = "write";
 const REMOVE_PENDING: &str = "remove.pending";
-const REMOVE_READY: &str = "remove.json";
-const REMOVED: &str = "removed";
+pub(crate) const REMOVE_READY: &str = "remove.json";
+pub(crate) const REMOVED: &str = "removed";
 const MAX_INTENT_BYTES: u64 = 64 * 1024;
 const MAX_RELATIVE_DEPTH: usize = 128;
 const MAX_RELATIVE_BYTES: usize = 4096;
@@ -51,7 +51,7 @@ struct RemoveIntent {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "platform", rename_all = "snake_case", deny_unknown_fields)]
-enum FileSystemIdentity {
+pub(crate) enum FileSystemIdentity {
     Unix {
         #[serde(with = "crate::identity_serde::u64_hex")]
         device: u64,
@@ -66,7 +66,14 @@ enum FileSystemIdentity {
     },
 }
 
-fn failure(message: impl Into<String>) -> KioError {
+pub(crate) struct AtomicRemovalExpectation {
+    pub(crate) source_id: FileSystemIdentity,
+    pub(crate) sha256: String,
+    pub(crate) length: u64,
+    pub(crate) max_bytes: u64,
+}
+
+pub(crate) fn failure(message: impl Into<String>) -> KioError {
     KioError::new(
         "KIO-E-ATOMIC-WORKSPACE-UNSAFE-001",
         message,
@@ -75,7 +82,7 @@ fn failure(message: impl Into<String>) -> KioError {
     )
 }
 
-fn io_failure(message: impl Into<String>, error: std::io::Error) -> KioError {
+pub(crate) fn io_failure(message: impl Into<String>, error: std::io::Error) -> KioError {
     KioError::new(
         "KIO-E-ATOMIC-WORKSPACE-IO-001",
         format!("{}: {error}", message.into()),
@@ -166,24 +173,7 @@ fn inventory(workspace: &StoreDirectory) -> Result<Vec<String>> {
 }
 
 fn ensure_private_workspace(workspace: &StoreDirectory) -> Result<()> {
-    let metadata = workspace
-        .root_handle()
-        .metadata()
-        .map_err(|e| io_failure("cannot inspect atomic workspace", e))?;
-    if !metadata.is_dir() {
-        return Err(failure("atomic workspace is not a directory"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        let uid = unsafe { libc::geteuid() };
-        if metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-            return Err(failure("atomic workspace is not owner-private"));
-        }
-    }
-    #[cfg(windows)]
-    crate::private_fs::verify_owner_private_handle(&workspace.root_handle())?;
-    Ok(())
+    crate::platform::atomic_semantics::ensure_private_workspace(workspace)
 }
 
 fn valid_relative(relative: &Path) -> Result<String> {
@@ -234,39 +224,11 @@ fn directory_id(directory: &StoreDirectory) -> Result<DirectoryIdentity> {
     crate::management::directory_identity_from_handle(&directory.root_handle())
 }
 
-fn file_id(file: &File) -> Result<FileSystemIdentity> {
-    let metadata = file
-        .metadata()
-        .map_err(|e| io_failure("cannot inspect retained file", e))?;
-    if !metadata.is_file() {
-        return Err(failure("atomic source is not a regular file"));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if metadata.nlink() != 1 {
-            return Err(failure("atomic source is not a single-link regular file"));
-        }
-        Ok(FileSystemIdentity::Unix {
-            device: metadata.dev(),
-            inode: metadata.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        crate::platform::regular_file_handle_identity(file)
-            .map(|id| {
-                let (volume_serial_number, file_index) = id.atomic_recovery_components();
-                FileSystemIdentity::Windows {
-                    volume_serial_number,
-                    file_index,
-                }
-            })
-            .ok_or_else(|| failure("atomic source has no single-link identity"))
-    }
+pub(crate) fn file_id(file: &File) -> Result<FileSystemIdentity> {
+    crate::platform::atomic_semantics::atomic_file_identity(file)
 }
 
-fn hash_file(file: &mut File, max_bytes: u64) -> Result<(String, u64)> {
+pub(crate) fn hash_file(file: &mut File, max_bytes: u64) -> Result<(String, u64)> {
     let before_id = file_id(file)?;
     let before = file
         .metadata()
@@ -299,13 +261,7 @@ fn hash_file(file: &mut File, max_bytes: u64) -> Result<(String, u64)> {
     if before_id != file_id(file)? || before.len() != after.len() || after.len() != total {
         return Err(failure("atomic source changed while it was hashed"));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        if before.ctime() != after.ctime() || before.ctime_nsec() != after.ctime_nsec() {
-            return Err(failure("atomic source changed while it was hashed"));
-        }
-    }
+    crate::platform::atomic_semantics::validate_hash_metadata(&before, &after)?;
     Ok((crate::cas::lower_hex(&digest.finalize()), total))
 }
 
@@ -420,7 +376,7 @@ fn lock_workspace(workspace: &StoreDirectory) -> Result<File> {
     Ok(gate)
 }
 
-fn remove_if_present(workspace: &StoreDirectory, name: &str) -> Result<bool> {
+pub(crate) fn remove_if_present(workspace: &StoreDirectory, name: &str) -> Result<bool> {
     if workspace.contains_entry(Path::new(name))? {
         workspace.remove_file(Path::new(name))?;
         return Ok(true);
@@ -537,8 +493,7 @@ pub(super) fn remove(
     let (parent, leaf, chain) = parent_chain(target, relative)?;
     same_volume(&workspace, &parent)?;
     let mut source = parent.open_regular_for_removal(Path::new(&leaf), max_bytes)?;
-    #[cfg(windows)]
-    crate::private_fs::verify_current_owner_handle(&source)?;
+    crate::platform::atomic_semantics::verify_removal_owner(&source)?;
     let source_id = file_id(&source)?;
     let (sha256, length) = hash_file(&mut source, max_bytes)?;
     let expected_hash = crate::cas::lower_hex(&Sha256::digest(expected));
@@ -631,104 +586,19 @@ fn recover_locked(
         None
     };
     let removed = has_removed;
-    #[cfg(windows)]
-    let (mut quarantined, contents_already_verified) = match (source, removed) {
-        (Some(mut source), false) => {
-            crate::private_fs::verify_current_owner_handle(&source)?;
-            if file_id(&source)? != intent.source_id
-                || hash_file(&mut source, intent.max_bytes)?
-                    != (intent.sha256.clone(), intent.length)
-            {
-                return Err(failure("removal source does not match its ready intent"));
-            }
-            crate::platform::move_verified_regular_handle_to_raw(
-                &parent,
-                &source,
-                workspace,
-                Path::new(REMOVED),
-            )?;
-            if file_id(&source)? != intent.source_id {
-                return Err(failure(
-                    "moved removal source no longer matches its ready intent",
-                ));
-            }
-            crate::durability::checkpoint(
-                crate::durability::DurabilityPoint::AtomicRemoveQuarantined,
-            )?;
-            (source, true)
-        }
-        (None, true) => (
-            workspace.open_regular_for_removal(Path::new(REMOVED), intent.max_bytes)?,
-            false,
-        ),
-        (None, false) => {
-            remove_if_present(workspace, REMOVE_READY)?;
-            return Ok(true);
-        }
-        (Some(_), true) => return Err(failure("both removal source and quarantine are present")),
-    };
-    #[cfg(windows)]
-    {
-        crate::private_fs::verify_current_owner_handle(&quarantined)?;
-        if file_id(&quarantined)? != intent.source_id
-            || (!contents_already_verified
-                && hash_file(&mut quarantined, intent.max_bytes)? != (intent.sha256, intent.length))
-        {
-            return Err(failure(
-                "removal quarantine does not match its ready intent",
-            ));
-        }
-        crate::private_fs::restrict_existing_private_handle(&quarantined)?;
-        drop(quarantined);
-        remove_if_present(workspace, REMOVED)?;
-        crate::durability::checkpoint(crate::durability::DurabilityPoint::AtomicRemoveDeleted)?;
-        remove_if_present(workspace, REMOVE_READY)?;
-        Ok(true)
-    }
-    #[cfg(not(windows))]
-    match (source, removed) {
-        (Some(mut source), false) => {
-            if file_id(&source)? != intent.source_id
-                || hash_file(&mut source, intent.max_bytes)?
-                    != (intent.sha256.clone(), intent.length)
-            {
-                return Err(failure("removal source does not match its ready intent"));
-            }
-            drop(source);
-            parent.rename_regular_between_raw(
-                Path::new(&leaf),
-                workspace,
-                Path::new(REMOVED),
-                Publication::CreateOnly,
-            )?;
-            crate::durability::checkpoint(
-                crate::durability::DurabilityPoint::AtomicRemoveQuarantined,
-            )?;
-        }
-        (None, true) => {}
-        (None, false) => {
-            remove_if_present(workspace, REMOVE_READY)?;
-            return Ok(true);
-        }
-        (Some(_), true) => return Err(failure("both removal source and quarantine are present")),
-    }
-    #[cfg(not(windows))]
-    {
-        let mut quarantined =
-            workspace.open_regular_for_removal(Path::new(REMOVED), intent.max_bytes)?;
-        if file_id(&quarantined)? != intent.source_id
-            || hash_file(&mut quarantined, intent.max_bytes)? != (intent.sha256, intent.length)
-        {
-            return Err(failure(
-                "removal quarantine does not match its ready intent",
-            ));
-        }
-        drop(quarantined);
-        remove_if_present(workspace, REMOVED)?;
-        crate::durability::checkpoint(crate::durability::DurabilityPoint::AtomicRemoveDeleted)?;
-        remove_if_present(workspace, REMOVE_READY)?;
-        Ok(true)
-    }
+    crate::platform::atomic_semantics::finish_remove_retirement(
+        &parent,
+        &leaf,
+        workspace,
+        source,
+        removed,
+        AtomicRemovalExpectation {
+            source_id: intent.source_id,
+            sha256: intent.sha256,
+            length: intent.length,
+            max_bytes: intent.max_bytes,
+        },
+    )
 }
 
 #[cfg(test)]

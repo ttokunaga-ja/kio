@@ -486,25 +486,11 @@ impl Repository {
         scope: File,
         kio: File,
     ) -> Result<Self> {
-        #[cfg(windows)]
-        let (scope, kio) = {
-            // Consume the original cap-primitives handles before retaining any
-            // repository authority. Normalizing only temporary clones leaves
-            // the originals denying delete sharing and blocks namespace moves
-            // while this repository is alive. These reopens retain the same
-            // validated directory objects, without resolving public paths.
-            let scope = StoreDirectory::from_retained(scope, canonical_root.clone())?;
-            let kio = StoreDirectory::from_retained(kio, canonical_root.join(".kio"))?;
-            (
-                scope
-                    .root_handle()
-                    .try_clone()
-                    .map_err(|error| KioError::io(error.to_string(), "."))?,
-                kio.root_handle()
-                    .try_clone()
-                    .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
-            )
-        };
+        let (scope, kio) = crate::platform::scope_semantics::normalize_repository_handles(
+            scope,
+            kio,
+            &canonical_root,
+        )?;
         crate::management::ManagementBinding::from_retained(
             scope
                 .try_clone()
@@ -4481,15 +4467,7 @@ fn validate_tag_refs_directory(path: &Path, allow_missing: bool) -> Result<bool>
             "tag refs path must be a real directory inside the store",
         ));
     }
-    #[cfg(windows)]
-    if !crate::platform::directory_is_real(path)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-    {
-        return Err(unsafe_store_error(
-            path,
-            "tag refs path must not be a Windows reparse point",
-        ));
-    }
+    crate::platform::scope_semantics::validate_tag_directory_native(path)?;
     let resolved = path.canonicalize().kio_io(path)?;
     let expected = if path.is_absolute() {
         path.to_path_buf()
@@ -4552,16 +4530,7 @@ fn read_commit_ref(path: &Path, allow_unborn: bool) -> Result<Option<String>> {
             "commit ref is not a bounded regular file",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if listed.nlink() != 1 {
-            return Err(tag_ref_corrupt(
-                path,
-                "commit ref has an unexpected hard-link count",
-            ));
-        }
-    }
+    crate::platform::scope_semantics::validate_commit_ref_links(&listed, path)?;
     let file = open_scope_file_nofollow(path)?;
     let opened = file.metadata().kio_io(path)?;
     if !opened.is_file() || opened.len() != listed.len() || opened.len() > MAX_TAG_REF_BYTES {
@@ -4616,7 +4585,7 @@ fn read_tag_ref(path: &Path) -> Result<String> {
     read_commit_ref(path, false)?.ok_or_else(|| tag_ref_corrupt(path, "tag ref is empty"))
 }
 
-fn tag_ref_corrupt(path: &Path, message: &str) -> KioError {
+pub(crate) fn tag_ref_corrupt(path: &Path, message: &str) -> KioError {
     KioError::new(
         "KIO-E-STORE-CORRUPT-001",
         message,
@@ -4932,23 +4901,7 @@ pub fn cleanup_orphan_raw_ingest_temps(kio_dir: &Path) -> Result<u64> {
                 "raw-ingest orphan is not a bounded regular file",
             ));
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if listed.nlink() != 1 {
-                return Err(orphan_raw_ingest_error(
-                    &path,
-                    "raw-ingest orphan has an unexpected hard-link count",
-                ));
-            }
-        }
-        #[cfg(windows)]
-        if !crate::platform::regular_file_is_safe(&path).kio_io(&path)? {
-            return Err(orphan_raw_ingest_error(
-                &path,
-                "raw-ingest orphan is a reparse point or hard link",
-            ));
-        }
+        crate::platform::scope_semantics::validate_orphan_file_native(&path, &listed)?;
 
         let opened = open_scope_file_nofollow(&path)?;
         let opened_metadata = opened.metadata().kio_io(&path)?;
@@ -4989,17 +4942,11 @@ fn validate_ingest_directory(path: &Path) -> Result<()> {
             "raw-ingest namespace ancestor is not a real directory",
         ));
     }
-    #[cfg(windows)]
-    if !crate::platform::directory_is_real(path).kio_io(path)? {
-        return Err(orphan_raw_ingest_error(
-            path,
-            "raw-ingest namespace ancestor is a reparse point",
-        ));
-    }
+    crate::platform::scope_semantics::validate_ingest_directory_native(path)?;
     Ok(())
 }
 
-fn orphan_raw_ingest_error(path: &Path, message: &str) -> KioError {
+pub(crate) fn orphan_raw_ingest_error(path: &Path, message: &str) -> KioError {
     KioError::new(
         "KIO-E-STORE-CORRUPT-001",
         message,
@@ -5313,17 +5260,15 @@ thread_local! {
     /// `purge-publication.lock`) share the same directory-flock open file
     /// description within a thread. This keeps the crash-released gate
     /// reentrant without weakening cross-process serialization.
-    #[cfg(unix)]
-    static LOCK_GATE_POOL: RefCell<HashMap<PathBuf, (u32, crate::platform::PathGate)>> = RefCell::new(HashMap::new());
+    static LOCK_GATE_POOL: RefCell<HashMap<PathBuf, (u32, File)>> = RefCell::new(HashMap::new());
 }
 
-#[cfg(unix)]
 pub(crate) struct LockGate {
     key: PathBuf,
-    _file: crate::platform::PathGate,
+    _file: File,
+    unlock: fn(&File),
 }
 
-#[cfg(unix)]
 impl Drop for LockGate {
     fn drop(&mut self) {
         let final_owner = LOCK_GATE_POOL.with(|pool| {
@@ -5340,7 +5285,7 @@ impl Drop for LockGate {
             }
         });
         if final_owner {
-            self._file.unlock();
+            (self.unlock)(&self._file);
         }
     }
 }
@@ -5358,9 +5303,8 @@ pub struct StoreLock {
     native: Option<crate::platform::PathLockLease>,
 }
 
-#[cfg(windows)]
 thread_local! {
-    static WINDOWS_LOCK_OWNERS: RefCell<HashMap<(PathBuf, bool), Weak<crate::platform::PathLock>>> = RefCell::new(HashMap::new());
+    static PATH_LOCK_OWNERS: RefCell<HashMap<(PathBuf, bool), Weak<crate::platform::PathLock>>> = RefCell::new(HashMap::new());
 }
 
 impl StoreLock {
@@ -5413,36 +5357,30 @@ impl StoreLock {
             }
         });
         if already_held {
-            #[cfg(windows)]
-            let owner = WINDOWS_LOCK_OWNERS.with(|owners| {
+            let owner = PATH_LOCK_OWNERS.with(|owners| {
                 owners
                     .borrow()
                     .get(&(path.clone(), _store_gate))
                     .and_then(Weak::upgrade)
             });
-            #[cfg(windows)]
-            if owner.is_none() {
-                LOCK_DEPTH.with(|depth| {
-                    if let Some(count) = depth.borrow_mut().get_mut(&(path.clone(), _store_gate)) {
-                        *count -= 1;
-                    }
-                });
-                return Err(KioError::locked("Windows lock lease is unavailable"));
-            }
+            let native = match crate::platform::scope_semantics::reentrant_path_lock_lease(owner) {
+                Ok(native) => native,
+                Err(error) => {
+                    LOCK_DEPTH.with(|depth| {
+                        if let Some(count) =
+                            depth.borrow_mut().get_mut(&(path.clone(), _store_gate))
+                        {
+                            *count -= 1;
+                        }
+                    });
+                    return Err(error);
+                }
+            };
             return Ok(Self {
                 path,
                 store_gate: _store_gate,
                 reentrant: true,
-                native: {
-                    #[cfg(unix)]
-                    {
-                        None
-                    }
-                    #[cfg(windows)]
-                    {
-                        owner
-                    }
-                },
+                native,
             });
         }
 
@@ -5451,17 +5389,16 @@ impl StoreLock {
             pid,
             _store_gate,
             validate_bound_store_lock_authority,
+            acquire_lock_gate,
         )?;
-        #[cfg(windows)]
-        let native = {
-            let owner = Rc::new(native);
-            WINDOWS_LOCK_OWNERS.with(|owners| {
+        let (native, owner) = crate::platform::scope_semantics::prepare_path_lock_lease(native);
+        if let Some(owner) = owner {
+            PATH_LOCK_OWNERS.with(|owners| {
                 let mut owners = owners.borrow_mut();
                 owners.retain(|_, owner| owner.strong_count() != 0);
                 owners.insert((path.clone(), _store_gate), Rc::downgrade(&owner));
             });
-            owner
-        };
+        }
         LOCK_DEPTH.with(|depth| depth.borrow_mut().insert((path.clone(), _store_gate), 1));
         Ok(Self {
             path,
@@ -5513,8 +5450,14 @@ pub(crate) fn new_lock_token(pid: u32) -> String {
     hex_prefix(&digest, 32)
 }
 
-#[cfg(unix)]
-pub(crate) fn acquire_lock_gate(lock_path: &Path) -> Result<LockGate> {
+pub(crate) type AcquireLockGate =
+    fn(&Path, fn(&Path, &Path) -> Result<File>, fn(&File)) -> Result<LockGate>;
+
+pub(crate) fn acquire_lock_gate(
+    lock_path: &Path,
+    acquire: fn(&Path, &Path) -> Result<File>,
+    unlock: fn(&File),
+) -> Result<LockGate> {
     let parent = lock_path
         .parent()
         .ok_or_else(|| KioError::io("lock path has no parent", lock_path.display().to_string()))?;
@@ -5526,14 +5469,22 @@ pub(crate) fn acquire_lock_gate(lock_path: &Path) -> Result<LockGate> {
         *count += 1;
         Some(cloned)
     }) {
-        return Ok(LockGate { key, _file: cloned });
+        return Ok(LockGate {
+            key,
+            _file: cloned,
+            unlock,
+        });
     }
-    let gate = crate::platform::PathGate::acquire(parent, lock_path)?;
+    let gate = acquire(parent, lock_path)?;
     let pooled = gate.try_clone().kio_io(parent)?;
     LOCK_GATE_POOL.with(|pool| {
         pool.borrow_mut().insert(key.clone(), (1, pooled));
     });
-    Ok(LockGate { key, _file: gate })
+    Ok(LockGate {
+        key,
+        _file: gate,
+        unlock,
+    })
 }
 
 /// A descriptor-relative owner of the ordinary `.kio/.lock` protocol.
@@ -7528,7 +7479,8 @@ mod tests {
     #[test]
     fn windows_event_log_first_creates_private_parents_without_repairing_existing_prefix() {
         use crate::{
-            private_fs::{verify_owner_private_handle, verify_private_directory},
+            platform::verify_owner_private_handle,
+            private_fs::verify_private_directory,
             store_dir::StoreDirectory,
             test_control::{TestEnvGuard, test_env_lock},
         };

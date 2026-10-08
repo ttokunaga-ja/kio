@@ -1,7 +1,8 @@
+pub(crate) const GC_RETIRE_SENTINEL: &[u8] = b"kio gc retirement sentinel\n";
 use super::gc_io::{open_verified_file_handle, sync_bound_directory};
 use crate::error::Result;
 use crate::gc::{
-    FileObservation, GC_RETIRE_SENTINEL, MAX_METADATA, corrupt, create_new_bound, id_meta, ioerr,
+    FileObservation, MAX_METADATA, corrupt, create_new_bound, id_meta, ioerr,
     read_regular_observed, unique_internal_name,
 };
 use crate::platform::{

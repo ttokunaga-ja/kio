@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use crate::error::{IoResultExt, KioError, Result};
 use crate::purge::sync_directory;
 
-#[cfg(windows)]
+#[cfg(all(test, windows))]
 use crate::platform::cas_identity::windows_file_information;
 #[cfg(all(test, unix))]
 use crate::platform::cas_io::validate_open_regular_nofollow_with_before;
@@ -23,11 +23,7 @@ use crate::platform::cas_io::{
     bound_metadata_single_link, configure_no_follow, observe_regular_file_stability, replace_file,
     same_bound_regular_entry, same_open_file, sync_bound_directory,
 };
-#[cfg(windows)]
-use crate::platform::{
-    directory_handle_identity, regular_file_handle_identity,
-    same_windows_repair_quarantine_file_components,
-};
+use crate::platform::cas_semantics;
 
 pub const CAS_STREAM_BUFFER_BYTES: usize = 64 * 1024;
 pub const MAX_RAW_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
@@ -762,18 +758,7 @@ impl ObjectStore {
                     // The borrowed caller handle remains caller-owned. Our
                     // persistent clone must open by ID on Windows so it does
                     // not retain a named link after the caller closes theirs.
-                    #[cfg(windows)]
-                    {
-                        crate::store_dir::StoreDirectory::from_retained(
-                            retained,
-                            PathBuf::from(".kio"),
-                        )?
-                        .root_handle()
-                    }
-                    #[cfg(unix)]
-                    {
-                        Arc::new(retained)
-                    }
+                    cas_semantics::retain_bound_kio(retained)?
                 },
                 objects: Arc::new(objects),
                 raw: Arc::new(raw),
@@ -903,18 +888,19 @@ impl ObjectStore {
             .parent()
             .ok_or_else(|| KioError::io("CAS path has no parent", path.display().to_string()))?;
         let (temp_path, mut temp) = create_private_temp(parent)?;
+        let mut corrupt = Some(corrupt);
+        let source = cas_semantics::retain_repair_source(&mut corrupt);
         let result = (|| -> Result<()> {
             temp.write_all(bytes).kio_io(&temp_path)?;
             temp.sync_all().kio_io(&temp_path)?;
             drop(temp);
 
-            let quarantine = create_repair_quarantine(path, &corrupt)?;
+            let quarantine = create_repair_quarantine(path, source.file())?;
             // MoveFileEx requires both path operands to be closed on Windows.
             // The verified quarantine hard link now pins the exact corrupt
             // object for rollback, so the original read handle can be released
             // without reopening or trusting its pathname.
-            #[cfg(windows)]
-            drop(corrupt);
+            source.prepare_replace();
             if let Err(error) = replace_file(&temp_path, path) {
                 let _ = fs::remove_file(&quarantine);
                 return Err(error);
@@ -2132,8 +2118,7 @@ impl BoundObjectDirs {
         // handle remains open. The exact file was checked above; publication
         // re-opens it through the retained raw directory and verifies hash,
         // type and single-link identity before accepting it.
-        #[cfg(windows)]
-        drop(stage.file.take());
+        cas_semantics::prepare_bound_raw_stage(&mut stage.file);
         let (parent, leaf) = self.fanout(ObjectKind::Raw, &hash, true)?;
         match bound_read_verified(&parent, &leaf, ObjectKind::Raw, &hash, true) {
             Ok((existing_size, existing)) => {
@@ -2754,32 +2739,14 @@ pub(crate) fn ensure_bound_directory(directory: &File, label: &Path) -> Result<(
             label.display().to_string(),
         ));
     }
-    #[cfg(windows)]
-    if directory_handle_identity(directory).is_none() {
-        return Err(KioError::io(
-            "bound CAS directory is a reparse point or changed type",
-            label.display().to_string(),
-        ));
-    }
+    cas_semantics::validate_bound_directory_native(directory, label)?;
     Ok(())
 }
 
 fn same_bound_directory(current: &File, retained: &File) -> Result<bool> {
     ensure_bound_directory(current, Path::new("bound object layout"))?;
     ensure_bound_directory(retained, Path::new("retained object layout"))?;
-    #[cfg(unix)]
-    {
-        use cap_primitives::fs::MetadataExt;
-        let current = cap_primitives::fs::Metadata::from_file(current)
-            .kio_io(Path::new("bound object layout"))?;
-        let retained = cap_primitives::fs::Metadata::from_file(retained)
-            .kio_io(Path::new("retained object layout"))?;
-        Ok(current.dev() == retained.dev() && current.ino() == retained.ino())
-    }
-    #[cfg(windows)]
-    {
-        Ok(directory_handle_identity(current) == directory_handle_identity(retained))
-    }
+    cas_semantics::same_bound_directory_native(current, retained)
 }
 
 fn bound_open_dir(parent: &File, leaf: &str) -> Result<File> {
@@ -2787,18 +2754,7 @@ fn bound_open_dir(parent: &File, leaf: &str) -> Result<File> {
     let directory = cap_primitives::fs::open_dir_nofollow(parent, name)
         .map_err(|error| bound_io_or_not_found(error, leaf))?;
     ensure_bound_directory(&directory, Path::new(leaf))?;
-    #[cfg(windows)]
-    let directory = {
-        // CAS namespaces can outlive this call, including lazy content bases.
-        // Consume the raw handle so retained children permit ancestor renames;
-        // normalization reopens only this same validated directory object.
-        let retained =
-            crate::store_dir::StoreDirectory::from_retained(directory, PathBuf::from(leaf))?;
-        retained
-            .root_handle()
-            .try_clone()
-            .map_err(|error| KioError::io(error.to_string(), leaf))?
-    };
+    let directory = cas_semantics::normalize_bound_child(directory, leaf)?;
     Ok(directory)
 }
 
@@ -2860,13 +2816,7 @@ fn bound_stream_regular(
         options
             .read(true)
             ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-        #[cfg(unix)]
-        {
-            use cap_fs::OpenOptionsExt;
-            // A regular-file-to-FIFO race must not block a reader before its
-            // opened-handle check can reject the substituted object.
-            options.custom_flags(libc::O_NONBLOCK);
-        }
+        cas_semantics::configure_bound_read(&mut options);
         let mut file = cap_fs::open(parent, name, &options)
             .map_err(|error| bound_io_or_not_found(error, leaf))?;
         let opened = cap_fs::Metadata::from_file(&file).kio_io(label)?;
@@ -3131,11 +3081,7 @@ fn bound_open_regular_handle(parent: &File, leaf: &str) -> Result<File> {
     options
         .read(true)
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    #[cfg(unix)]
-    {
-        use cap_fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
+    cas_semantics::configure_bound_read(&mut options);
     let file =
         cap_fs::open(parent, name, &options).map_err(|error| bound_io_or_not_found(error, leaf))?;
     let opened = cap_fs::Metadata::from_file(&file).kio_io(Path::new(leaf))?;
@@ -3187,33 +3133,10 @@ fn bound_quarantine_matches(parent: &File, quarantine: &str, source: &File) -> R
     options
         .read(true)
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    #[cfg(unix)]
-    {
-        use cap_fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NONBLOCK);
-    }
+    cas_semantics::configure_bound_read(&mut options);
     let quarantined = cap_fs::open(parent, bound_leaf(quarantine, "quarantine")?, &options)
         .map_err(|error| bound_io_or_not_found(error, quarantine))?;
-    #[cfg(unix)]
-    {
-        use cap_primitives::fs::MetadataExt;
-        let source = cap_fs::Metadata::from_file(source).kio_io(Path::new(quarantine))?;
-        let quarantined =
-            cap_fs::Metadata::from_file(&quarantined).kio_io(Path::new(quarantine))?;
-        Ok(source.is_file()
-            && quarantined.is_file()
-            && source.nlink() == 2
-            && quarantined.nlink() == 2
-            && source.dev() == quarantined.dev()
-            && source.ino() == quarantined.ino())
-    }
-    #[cfg(windows)]
-    {
-        Ok(same_windows_repair_quarantine_file_components(
-            windows_file_information(source),
-            windows_file_information(&quarantined),
-        ))
-    }
+    cas_semantics::same_repair_quarantine(source, &quarantined, Path::new(quarantine))
 }
 
 /// The explicit removal request supplies kind/hash authority for this one
@@ -3571,14 +3494,7 @@ fn bound_create_private_temp(
             ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
         match cap_primitives::fs::open(parent, path, &options) {
             Ok(file) => {
-                #[cfg(windows)]
-                let safe = regular_file_handle_identity(&file).is_some();
-                #[cfg(unix)]
-                let safe = {
-                    let metadata = cap_primitives::fs::Metadata::from_file(&file)
-                        .map_err(|error| KioError::io(error.to_string(), label))?;
-                    metadata.is_file() && bound_metadata_single_link(&metadata)
-                };
+                let safe = cas_semantics::private_bound_temp_is_safe(&file, label)?;
                 if !safe {
                     drop(file);
                     let _ = bound_remove(parent, &name);
@@ -3926,19 +3842,7 @@ fn remove_verified_cas_path(
         // no-follow, then open every controlled ancestor through that handle.
         let mut options = OpenOptions::new();
         options.read(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
-            };
-            options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
-        }
+        cas_semantics::configure_removal_root(&mut options);
         let mut parent = options.open(kio).kio_io(kio)?;
         ensure_bound_directory(&parent, kio)?;
         let relative_parent = parent_path
@@ -4107,11 +4011,7 @@ fn create_private_temp(parent: &Path) -> Result<(PathBuf, File)> {
         ));
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        cas_semantics::configure_private_temp(&mut options);
         match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,

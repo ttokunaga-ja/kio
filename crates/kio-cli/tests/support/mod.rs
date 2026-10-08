@@ -38,7 +38,7 @@ pub fn write_private_fixture_file(parent: &std::path::Path, leaf: &str, bytes: &
 pub fn prepare_private_sqlite_sidecars(path: &std::path::Path) -> kio_core::Result<()> {
     #[cfg(windows)]
     {
-        use kio_core::private_fs::verify_owner_private_handle;
+        use kio_core::platform::verify_owner_private_handle;
         use kio_core::store_dir::{Publication, StoreDirectory};
         use std::path::{Path, PathBuf};
 

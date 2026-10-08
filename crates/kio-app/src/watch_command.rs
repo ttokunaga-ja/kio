@@ -400,7 +400,7 @@ fn open_instance_lock(directory: &StoreDirectory, create: bool) -> Result<Option
     }
     let file = directory.open_regular_read(leaf, 0)?;
     kio_core::private_fs::verify_private_directory_handle(directory)?;
-    kio_core::private_fs::verify_owner_private_handle(&file)?;
+    kio_core::platform::verify_owner_private_handle(&file)?;
     Ok(Some(file))
 }
 
@@ -468,7 +468,7 @@ mod tests {
         held.try_lock().unwrap();
         let contender = open_instance_lock(&directory, false).unwrap().unwrap();
         assert_eq!(contender.metadata().unwrap().len(), 0);
-        kio_core::private_fs::verify_owner_private_handle(&contender).unwrap();
+        kio_core::platform::verify_owner_private_handle(&contender).unwrap();
         assert!(matches!(
             contender.try_lock(),
             Err(TryLockError::WouldBlock)
@@ -493,7 +493,7 @@ mod tests {
                 "unsafe_acl" => {
                     std::fs::write(&path, b"").unwrap();
                     let file = File::open(&path).unwrap();
-                    assert!(kio_core::private_fs::verify_owner_private_handle(&file).is_err());
+                    assert!(kio_core::platform::verify_owner_private_handle(&file).is_err());
                 }
                 _ => {
                     directory
@@ -508,7 +508,7 @@ mod tests {
                 assert_eq!(std::fs::read(&path).unwrap(), before);
                 if fixture == "unsafe_acl" {
                     let file = File::open(&path).unwrap();
-                    assert!(kio_core::private_fs::verify_owner_private_handle(&file).is_err());
+                    assert!(kio_core::platform::verify_owner_private_handle(&file).is_err());
                 }
             }
         }

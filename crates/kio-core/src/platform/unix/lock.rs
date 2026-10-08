@@ -695,12 +695,17 @@ pub(crate) fn acquire_path_lock(
     pid: u32,
     _store_gate: bool,
     _validate_authority: fn(&File) -> Result<()>,
+    acquire_gate: crate::scope::AcquireLockGate,
 ) -> Result<PathLock> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).kio_io(parent)?;
     }
 
-    let gate = crate::scope::acquire_lock_gate(&path)?;
+    let gate = acquire_gate(
+        &path,
+        super::scope_semantics::acquire_path_gate,
+        super::scope_semantics::unlock_path_gate,
+    )?;
 
     let token = new_lock_token(pid);
     let canonical = canonical_lock_bytes(pid, &token)?;
@@ -726,33 +731,6 @@ pub(crate) fn acquire_path_lock(
 impl PathLock {
     pub(crate) fn release_outer(&self) {
         let _ = release_ordinary_lock(&self.path, self.pid, &self.token);
-    }
-}
-pub(crate) struct PathGate(File);
-impl PathGate {
-    pub(crate) fn acquire(parent: &Path, lock_path: &Path) -> Result<Self> {
-        use std::os::fd::AsRawFd;
-        let gate = File::open(parent).kio_io(parent)?;
-        // SAFETY: `gate` stays owned by the returned File until the lock guard is
-        // dropped. LOCK_NB prevents a path operation from waiting while another
-        // writer owns the same store protocol.
-        if unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            let error = std::io::Error::last_os_error();
-            if matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK)) {
-                return Err(KioError::locked(lock_path.display().to_string()));
-            }
-            return Err(KioError::io(
-                error.to_string(),
-                lock_path.display().to_string(),
-            ));
-        }
-        Ok(Self(gate))
-    }
-    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
-        self.0.try_clone().map(Self)
-    }
-    pub(crate) fn unlock(&self) {
-        unlock_flock(&self.0);
     }
 }
 pub(crate) fn validate_store_gate(directory: &StoreDirectory) -> Result<()> {

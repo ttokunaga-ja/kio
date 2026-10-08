@@ -146,8 +146,7 @@ fn is_platform_safe_direct_child(path: &str) -> bool {
         return false;
     }
 
-    #[cfg(windows)]
-    if crate::portable::portable_leaf_error(path).is_some() {
+    if !crate::platform::storage_semantics::materializable_component(path) {
         return false;
     }
 

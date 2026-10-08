@@ -77,11 +77,7 @@ pub(crate) use macos::gc_syscalls::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::{
-    gc_io::open_gc_tree_writable as gc_open_tree_writable,
     gc_retirement::{
-        exchange_capture_verified_named as gc_exchange_capture_verified_named,
-        remove_sentinel_leaf as gc_remove_sentinel_leaf,
-        remove_verified_leaf as gc_remove_verified_leaf,
         rename_snapshot_state_noreplace as gc_rename_snapshot_state_noreplace,
         retire_snapshot_state_temporary as gc_retire_snapshot_state_temporary,
     },
@@ -98,7 +94,6 @@ pub(crate) use windows::{
         retire_snapshot_state_temporary as gc_retire_snapshot_state_temporary,
         verify_retained_receipt_observation as gc_verify_retained_receipt_observation,
     },
-    gc_snapshot_io,
     scheduled::read_bound_regular_text_observed_at as scope_read_bound_regular_text_observed_at,
     scope_io::open_bound_scope_file_nofollow as scope_open_bound_nofollow,
 };
@@ -166,9 +161,6 @@ pub(crate) use windows::lock::{
     validate_store_gate,
 };
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use unix::lock::PathGate;
-
 #[cfg(target_os = "linux")]
 pub(crate) use linux::lock_exchange::exchange_bound_lock;
 
@@ -188,19 +180,8 @@ pub use windows::gc_exchange::{
     validate_pending_authority as validate_pending_gc_exchange_authority,
 };
 
-#[cfg(windows)]
-pub(crate) use windows::identity_logic::same_windows_repair_quarantine_file_components;
 #[cfg(any(windows, test))]
 pub(crate) use windows::snapshot_logic as gc_snapshot_logic;
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use unix::gc_exchange::{
-    atomic_exchange_marker_expected as gc_atomic_exchange_marker_expected,
-    replace_snapshot_state_expected as gc_atomic_replace_snapshot_state_expected,
-};
-
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use unix::gc_exchange::link_count as gc_link_count;
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::{
@@ -211,3 +192,50 @@ pub(crate) use unix::{
 pub(crate) use windows::gc_io::{
     publish_staged as gc_publish_staged, remove_completed_marker as gc_remove_completed_marker,
 };
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::{
+    atomic_semantics, cas_semantics, removal_semantics, scope_semantics, storage_semantics,
+};
+
+#[cfg(target_os = "windows")]
+pub(crate) use windows::{
+    atomic_semantics, cas_semantics, removal_semantics, scope_semantics, storage_semantics,
+};
+
+#[cfg(target_os = "windows")]
+pub use windows::private_fs::verify_owner_private_handle;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::{
+    gc_metadata::{
+        gc_metadata_identity, is_canonical_gc_index_identity,
+        validate_gc_direct_directory_metadata, validate_gc_directory_metadata,
+        validate_gc_file_links,
+    },
+    gc_semantics::{
+        exchange_marker, marker_archive_presence, normalize_gc_scope_path, recover_marker,
+    },
+    gc_semantics::{recover_snapshot_state, replace_snapshot_state},
+    gc_tree::retire_candidate_tree,
+};
+
+#[cfg(target_os = "windows")]
+pub(crate) use windows::{
+    gc_metadata::{
+        gc_metadata_identity, is_canonical_gc_index_identity,
+        validate_gc_direct_directory_metadata, validate_gc_directory_metadata,
+        validate_gc_file_links,
+    },
+    gc_semantics::{
+        exchange_marker, marker_archive_presence, normalize_gc_scope_path, recover_marker,
+    },
+    gc_snapshot_semantics::{recover_snapshot_state, replace_snapshot_state},
+    gc_tree::retire_candidate_tree,
+};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::gc_io::verify_retained_receipt_observation as gc_verify_retained_receipt_observation;
+
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use windows::gc_snapshot_io;

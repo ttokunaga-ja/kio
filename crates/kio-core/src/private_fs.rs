@@ -121,46 +121,6 @@ pub fn verify_trusted_executable(path: &Path) -> Result<std::path::PathBuf> {
     Ok(canonical)
 }
 
-/// Create one direct child beneath a retained Windows directory with its
-/// current-user owner and protected owner-only DACL installed by the kernel at
-/// creation time. This never adopts or repairs an existing name.
-#[cfg(windows)]
-#[derive(Clone, Copy)]
-pub(crate) enum NewPrivateObjectKind {
-    Directory,
-    RegularFile,
-}
-
-#[cfg(windows)]
-pub(crate) fn create_new_private_at(
-    parent: &std::fs::File,
-    leaf: &std::ffi::OsStr,
-    kind: NewPrivateObjectKind,
-) -> std::io::Result<std::fs::File> {
-    native::create_new_private_at(parent, leaf, kind)
-}
-
-/// Restrict a retained, already-existing object only after proving that the
-/// current user owns it. New objects must use `create_new_private_at` instead.
-#[cfg(windows)]
-pub(crate) fn restrict_existing_private_handle(file: &std::fs::File) -> Result<()> {
-    native::restrict_existing_private_handle(file)
-}
-
-#[cfg(windows)]
-/// Verify a retained Windows handle's owner-private ACL before another crate
-/// creates operational artifacts beneath it. This never repairs permissions.
-pub fn verify_owner_private_handle(file: &std::fs::File) -> Result<()> {
-    native::verify_owner_private_handle(file)
-}
-
-/// Require that a retained Windows file or directory belongs to the current
-/// user without changing its security descriptor.
-#[cfg(windows)]
-pub(crate) fn verify_current_owner_handle(file: &std::fs::File) -> Result<()> {
-    native::verify_current_owner_handle(file)
-}
-
 pub(crate) fn unsafe_file(message: &str, path: Option<&Path>) -> KioError {
     KioError::new(
         PRIVATE_FILE_ERROR,

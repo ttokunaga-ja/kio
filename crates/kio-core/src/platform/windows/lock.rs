@@ -422,6 +422,7 @@ pub(crate) fn acquire_path_lock(
     pid: u32,
     store_gate: bool,
     validate_authority: fn(&File) -> Result<()>,
+    _acquire_gate: crate::scope::AcquireLockGate,
 ) -> Result<PathLock> {
     let parent = open_windows_lock_parent_kind(&path, !store_gate)?;
     let gate = if store_gate {

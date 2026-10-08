@@ -116,6 +116,6 @@ pub(crate) fn validate_scope_store_private(kio: &File, label: &Path) -> Result<(
             "retained .kio handle is not a directory",
         ));
     }
-    crate::private_fs::verify_owner_private_handle(kio)?;
+    super::private_fs::verify_owner_private_handle(kio)?;
     Ok(())
 }

@@ -332,14 +332,14 @@ pub(crate) fn create_directory_all(root: &File, relative: &Path, label: &Path) -
         match cap_fs::open_dir_nofollow(&d, Path::new(c)) {
             Ok(next) => d = next,
             Err(_) => {
-                d = crate::private_fs::create_new_private_at(
+                d = super::private_fs::create_new_private_at(
                     &d,
                     c,
-                    crate::private_fs::NewPrivateObjectKind::Directory,
+                    super::private_fs::NewPrivateObjectKind::Directory,
                 )
                 .map_err(|e| ioerr(label, e))?;
                 validate_directory(&d, label)?;
-                crate::private_fs::verify_owner_private_handle(&d)?;
+                super::private_fs::verify_owner_private_handle(&d)?;
                 sync_directory(&d, label)?;
             }
         }
@@ -349,14 +349,14 @@ pub(crate) fn create_directory_all(root: &File, relative: &Path, label: &Path) -
 pub(crate) fn create_directory(root: &File, relative: &Path, label: &Path) -> Result<File> {
     let (parent, leaf) = parent(root, relative, label)?;
     let path = full(label, relative);
-    let created = crate::private_fs::create_new_private_at(
+    let created = super::private_fs::create_new_private_at(
         &parent,
         leaf,
-        crate::private_fs::NewPrivateObjectKind::Directory,
+        super::private_fs::NewPrivateObjectKind::Directory,
     )
     .map_err(|e| ioerr(&path, e))?;
     validate_directory(&created, &path)?;
-    crate::private_fs::verify_owner_private_handle(&created)?;
+    super::private_fs::verify_owner_private_handle(&created)?;
     sync_directory(&parent, label)?;
     Ok(created)
 }
@@ -540,14 +540,14 @@ pub(crate) fn read_optional(
 pub(crate) fn create_private_file_raw(root: &File, leaf: &Path, label: &Path) -> Result<File> {
     let leaf = direct_leaf(leaf, label)?;
     let path = label.join(leaf);
-    let file = crate::private_fs::create_new_private_at(
+    let file = super::private_fs::create_new_private_at(
         root,
         leaf,
-        crate::private_fs::NewPrivateObjectKind::RegularFile,
+        super::private_fs::NewPrivateObjectKind::RegularFile,
     )
     .map_err(|e| ioerr(&path, e))?;
     regular(&file, &path)?;
-    crate::private_fs::verify_owner_private_handle(&file)?;
+    super::private_fs::verify_owner_private_handle(&file)?;
     Ok(file)
 }
 pub(crate) fn open_private_gate_raw(root: &File, leaf: &Path, label: &Path) -> Result<File> {
@@ -571,7 +571,7 @@ pub(crate) fn open_private_gate_raw(root: &File, leaf: &Path, label: &Path) -> R
             if regular(&file, &path)?.len() != 0 {
                 return Err(err(&path, "private gate file is not empty"));
             }
-            crate::private_fs::verify_owner_private_handle(&file)?;
+            super::private_fs::verify_owner_private_handle(&file)?;
             Ok(file)
         }
         Err(error) => Err(error),
@@ -1000,7 +1000,7 @@ fn rename_directory_noreplace(
 pub(crate) fn ensure_owner_private(root: &File, relative: &Path, label: &Path) -> Result<()> {
     let f = open_regular_read(root, relative, u64::MAX, label)?;
     regular(&f, &full(label, relative))?;
-    crate::private_fs::verify_owner_private_handle(&f)
+    super::private_fs::verify_owner_private_handle(&f)
 }
 pub(crate) fn entries(root: &File, relative: &Path, label: &Path) -> Result<Vec<StoreEntry>> {
     let d = directory(root, relative, label)?;
@@ -1059,7 +1059,7 @@ pub(crate) fn sync_directory(directory: &File, label: &Path) -> Result<()> {
 }
 pub(crate) fn restrict_new_private_directory(directory: &File) -> Result<()> {
     validate_directory(directory, Path::new("<retained>"))?;
-    crate::private_fs::verify_owner_private_handle(directory)
+    super::private_fs::verify_owner_private_handle(directory)
 }
 
 #[cfg(test)]
