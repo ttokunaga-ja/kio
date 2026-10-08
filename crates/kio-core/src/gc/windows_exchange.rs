@@ -20,7 +20,6 @@ fn failure(message: impl Into<String>) -> KioError {
 
 /// Inspect an existing exchange owner without recovering or creating anything.
 /// Foreign-platform pending journals are deliberately reported as pending.
-#[cfg(any(unix, windows))]
 pub fn inspect_pending(owner: &StoreDirectory) -> Result<bool> {
     let mut pending = false;
     let handle = owner.root_handle();
@@ -44,12 +43,6 @@ pub fn inspect_pending(owner: &StoreDirectory) -> Result<bool> {
         }
     }
     Ok(pending || owner.inspect_atomic()? == AtomicWorkspaceState::Pending)
-}
-#[cfg(not(any(unix, windows)))]
-pub fn inspect_pending(_owner: &StoreDirectory) -> Result<bool> {
-    Err(failure(
-        "GC exchange inspection is unsupported on this platform",
-    ))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

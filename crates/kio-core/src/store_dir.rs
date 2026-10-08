@@ -15,12 +15,9 @@ use serde_json::json;
 use crate::{ExitCode, KioError, Result};
 
 mod atomic;
-#[cfg(any(unix, windows))]
 mod planned_removal;
 pub use atomic::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
-#[cfg(any(unix, windows))]
 pub(crate) use planned_removal::require_same_filesystem;
-#[cfg(any(unix, windows))]
 pub use planned_removal::{
     CAS_REMOVAL_QUARANTINE_PREFIX, PRUNE_DIRECTORY_QUARANTINE_PREFIX, PlannedDirectoryRemoval,
     PlannedFileRemoval, RemovalBudget,
@@ -91,7 +88,6 @@ impl StoreDirectory {
     /// Open maintenance ancestry without crossing filesystem or Linux mount
     /// boundaries. Every component is compared through retained handles before
     /// traversing the next one; ordinary directory operations remain unchanged.
-    #[cfg(any(unix, windows))]
     pub fn open_maintenance_directory(&self, relative: &Path) -> Result<File> {
         let components = relative_components(relative, false, &self.logical)?;
         let mut current = self
@@ -108,7 +104,6 @@ impl StoreDirectory {
 
     /// Validate an already-retained maintenance parent against this boundary.
     /// This compares handles only; it does not assert ancestry or reopen paths.
-    #[cfg(any(unix, windows))]
     pub fn require_same_filesystem(&self, other: &Self) -> Result<()> {
         require_same_filesystem(&self.handle, &other.handle, &other.logical)
     }
@@ -1165,19 +1160,6 @@ mod platform {
             Err(ioerr(label, std::io::Error::last_os_error()))
         }
     }
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    pub(super) fn rename_regular_noreplace(
-        _source_parent: &File,
-        _source: &std::ffi::OsStr,
-        _destination_parent: &File,
-        _destination: &std::ffi::OsStr,
-        label: &Path,
-    ) -> Result<()> {
-        Err(err(
-            label,
-            "atomic no-replace regular-file rename is unsupported",
-        ))
-    }
     #[cfg(target_os = "macos")]
     fn rename_directory_noreplace(
         source_parent: &File,
@@ -1241,19 +1223,6 @@ mod platform {
         } else {
             Err(ioerr(label, std::io::Error::last_os_error()))
         }
-    }
-    #[cfg(all(unix, not(any(target_os = "macos", target_os = "linux"))))]
-    fn rename_directory_noreplace(
-        _source_parent: &File,
-        _source: &std::ffi::OsStr,
-        _destination_parent: &File,
-        _destination: &std::ffi::OsStr,
-        label: &Path,
-    ) -> Result<()> {
-        Err(err(
-            label,
-            "atomic no-replace directory rename is unsupported",
-        ))
     }
     pub(super) fn ensure_owner_private(root: &File, relative: &Path, label: &Path) -> Result<()> {
         let (parent, leaf) = parent(root, relative, label)?;
@@ -2558,37 +2527,4 @@ mod platform {
             drop(held);
         }
     }
-}
-
-#[cfg(not(any(unix, windows)))]
-mod platform {
-    use super::{Publication, Result, StoreEntry, err};
-    use std::{
-        fs::File,
-        path::{Path, PathBuf},
-    };
-    macro_rules! unsupported {($n:ident($($a:ident:$t:ty),*)->$r:ty)=>{pub(super) fn $n($($a:$t),*)->Result<$r>{Err(err(Path::new("<retained>"),"StoreDirectory is unsupported on this platform"))}};}
-    unsupported!(open(path:&Path)->File);
-    unsupported!(validate_directory(file:&File,label:&Path)->());
-    unsupported!(normalize_directory_handle(file:File,label:&Path)->File);
-    unsupported!(open_directory(root:&File,path:&Path,label:&Path)->File);
-    unsupported!(create_directory_all(root:&File,path:&Path,label:&Path)->File);
-    unsupported!(create_directory(root:&File,path:&Path,label:&Path)->File);
-    unsupported!(open_regular_read(root:&File,path:&Path,max:u64,label:&Path)->File);
-    unsupported!(open_regular_for_removal(root:&File,path:&Path,max:u64,label:&Path)->File);
-    unsupported!(read_optional(root:&File,path:&Path,max:u64,label:&Path)->Option<Vec<u8>>);
-    unsupported!(create_private_file_raw(root:&File,path:&Path,label:&Path)->File);
-    unsupported!(open_private_gate_raw(root:&File,path:&Path,label:&Path)->File);
-    unsupported!(rename_regular_between_raw(source_parent:&File,source_leaf:&Path,destination_parent:&File,destination_leaf:&Path,p:Publication,source_label:&Path,destination_label:&Path)->());
-    unsupported!(append(root:&File,path:&Path,data:&[u8],label:&Path)->());
-    unsupported!(remove_file(root:&File,path:&Path,label:&Path)->());
-    unsupported!(rename_directory_create_only(root:&File,source:&Path,destination:&Path,label:&Path)->());
-    unsupported!(rename_directory_between_create_only(source_parent:&File,source_leaf:&Path,destination_parent:&File,destination_leaf:&Path,source_label:&Path,destination_label:&Path)->());
-    unsupported!(quarantine_directory(root:&File,path:&Path,label:&Path)->PathBuf);
-    unsupported!(remove_directory_all(root:&File,path:&Path,label:&Path)->());
-    unsupported!(ensure_owner_private(root:&File,path:&Path,label:&Path)->());
-    unsupported!(entries(root:&File,path:&Path,label:&Path)->Vec<StoreEntry>);
-    unsupported!(entries_optional(root:&File,path:&Path,label:&Path)->Option<Vec<StoreEntry>>);
-    unsupported!(sync_directory(root:&File,label:&Path)->());
-    unsupported!(restrict_new_private_directory(root:&File)->());
 }

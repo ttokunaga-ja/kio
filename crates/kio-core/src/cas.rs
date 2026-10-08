@@ -2,11 +2,9 @@
 
 use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
-#[cfg(any(unix, windows))]
 use std::io::Seek;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-#[cfg(any(unix, windows))]
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -580,11 +578,9 @@ pub struct ObjectStore {
     /// Scheduled writers retain these handles before taking their writer
     /// boundary.  The ambient `.kio/objects` pathname is deliberately never
     /// consulted by the bound read/write subset below.
-    #[cfg(any(unix, windows))]
     bound: Option<BoundObjectDirs>,
 }
 
-#[cfg(any(unix, windows))]
 #[derive(Debug, Clone)]
 struct BoundObjectDirs {
     kio: Arc<File>,
@@ -601,7 +597,6 @@ struct BoundObjectDirs {
     normalized_units: Arc<Mutex<Option<Arc<File>>>>,
 }
 
-#[cfg(any(unix, windows))]
 #[derive(Debug)]
 pub struct BoundRawStage {
     parent: Arc<File>,
@@ -610,7 +605,6 @@ pub struct BoundRawStage {
     raw_hash: String,
     size_bytes: u64,
 }
-#[cfg(any(unix, windows))]
 impl BoundRawStage {
     #[must_use]
     pub fn raw_hash(&self) -> &str {
@@ -621,7 +615,6 @@ impl BoundRawStage {
         self.size_bytes
     }
 }
-#[cfg(any(unix, windows))]
 impl Drop for BoundRawStage {
     fn drop(&mut self) {
         if !self.name.is_empty() {
@@ -631,10 +624,8 @@ impl Drop for BoundRawStage {
 }
 
 /// Exact prepared/image victim captured for one confirmed maintenance plan.
-#[cfg(any(unix, windows))]
 #[derive(Debug)]
 pub struct PlannedContentRemoval(crate::store_dir::PlannedFileRemoval);
-#[cfg(any(unix, windows))]
 impl PlannedContentRemoval {
     pub fn revalidate(&self) -> Result<bool> {
         self.0.revalidate()
@@ -648,7 +639,6 @@ impl ObjectStore {
     /// Capture an exact physical content file through already-retained CAS
     /// parents. Quarantine residue is only a candidate; hash verification and
     /// the caller's fresh orphan proof are required on every new plan.
-    #[cfg(any(unix, windows))]
     pub fn plan_content_removal(
         &self,
         kind: ContentObjectKind,
@@ -702,7 +692,6 @@ impl ObjectStore {
     pub fn new(kio_dir: impl Into<PathBuf>) -> Self {
         Self {
             kio_dir: Some(kio_dir.into()),
-            #[cfg(any(unix, windows))]
             bound: None,
         }
     }
@@ -720,7 +709,6 @@ impl ObjectStore {
     /// namespaces used by the scheduled snapshot writer, and refuses a
     /// missing/replaced/symlinked object namespace rather than recovering via
     /// the public pathname.
-    #[cfg(any(unix, windows))]
     pub fn from_bound_kio(kio: &File) -> Result<Self> {
         let objects = bound_open_dir(kio, "objects")?;
         let raw = bound_open_dir(&objects, ObjectKind::Raw.directory())?;
@@ -794,7 +782,6 @@ impl ObjectStore {
         Ok(hash)
     }
 
-    #[cfg(any(unix, windows))]
     pub fn stage_raw_from_reader<R: Read>(
         &self,
         reader: &mut R,
@@ -808,7 +795,6 @@ impl ObjectStore {
             .stage_raw_from_reader(reader, max_bytes)
     }
 
-    #[cfg(any(unix, windows))]
     pub fn cleanup_bound_raw_stages(&self) -> Result<()> {
         self.bound
             .as_ref()
@@ -818,7 +804,6 @@ impl ObjectStore {
             .cleanup_raw_ingest_orphans()
     }
 
-    #[cfg(any(unix, windows))]
     pub fn validate_bound_layout(&self) -> Result<()> {
         self.bound
             .as_ref()
@@ -828,17 +813,6 @@ impl ObjectStore {
             .validate_layout()
     }
 
-    #[cfg(not(any(unix, windows)))]
-    pub fn validate_bound_layout(&self) -> Result<()> {
-        Err(KioError::new(
-            "KIO-E-SNAPSHOT-PLATFORM-UNSUPPORTED-001",
-            "scheduled snapshot publication requires retained filesystem capabilities",
-            serde_json::json!({}),
-            crate::ExitCode::PermanentFailure,
-        ))
-    }
-
-    #[cfg(any(unix, windows))]
     pub fn publish_bound_raw_stage(&self, stage: BoundRawStage) -> Result<(String, u64)> {
         self.bound
             .as_ref()
@@ -855,7 +829,6 @@ impl ObjectStore {
     /// noncanonical or conflicting representation remains fail-closed. The caller must
     /// hold the scope store lock for the entire operation.
     pub fn repair_raw(&self, expected_hash: &str, bytes: &[u8]) -> Result<bool> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.repair_raw(expected_hash, bytes);
         }
@@ -968,7 +941,6 @@ impl ObjectStore {
         if bytes.len() as u64 > MAX_CHUNK_OBJECT_BYTES {
             return Err(chunk_size_error(bytes.len() as u64));
         }
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             let (parent, leaf) = bound.chunk_fanout(&hash, true)?;
             bound_write_semantic(&parent, &leaf, &bytes, MAX_CHUNK_OBJECT_BYTES)?;
@@ -1019,7 +991,6 @@ impl ObjectStore {
 
     /// Read a semantic chunk and return the exact logical object byte count.
     pub fn read_chunk_with_size(&self, hash: &str) -> Result<(ChunkObject, u64)> {
-        #[cfg(any(unix, windows))]
         if self.bound.is_some() {
             return self.read_chunk_accounted(hash).map_err(|e| e.error);
         }
@@ -1040,7 +1011,6 @@ impl ObjectStore {
         &self,
         hash: &str,
     ) -> std::result::Result<(ChunkObject, u64), AccountedReadError> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             let (parent, leaf) =
                 bound
@@ -1080,7 +1050,6 @@ impl ObjectStore {
         kind: ContentObjectKind,
         hash: &str,
     ) -> Result<StoredContentObjectMetadata> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.inspect_content_object(kind, hash);
         }
@@ -1106,7 +1075,6 @@ impl ObjectStore {
         kind: ContentObjectKind,
         hash: &str,
     ) -> std::result::Result<StoredContentObjectMetadata, AccountedReadError> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.inspect_content_accounted(kind, hash);
         }
@@ -1161,7 +1129,6 @@ impl ObjectStore {
                 crate::ExitCode::PermanentFailure,
             ));
         }
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             let (parent, leaf) = bound.content_fanout(ContentObjectKind::Embedding, &hash, true)?;
             bound_write_semantic(&parent, &leaf, &bytes, MAX_EMBEDDING_OBJECT_BYTES)?;
@@ -1204,7 +1171,6 @@ impl ObjectStore {
     /// Read and fully verify one embedding object, including that its identity
     /// hashes back to the name it is stored under.
     pub fn read_embedding(&self, hash: &str) -> Result<EmbeddingObject> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             let (parent, leaf) = bound.content_fanout(ContentObjectKind::Embedding, hash, false)?;
             return bound_read_embedding(&parent, &leaf, hash);
@@ -1223,7 +1189,6 @@ impl ObjectStore {
     /// as [`Self::remove_chunk`] is for the identity-keyed chunk namespace.
     /// Missing is an idempotent `false`.
     pub fn remove_embedding(&self, hash: &str) -> Result<bool> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.remove_embedding(hash);
         }
@@ -1249,7 +1214,6 @@ impl ObjectStore {
         &self,
         mut visit: impl FnMut(&str, &ChunkObject) -> Result<()>,
     ) -> Result<()> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             let mut retained = bound
                 .chunks
@@ -1283,7 +1247,6 @@ impl ObjectStore {
     /// empty list when the namespace does not exist, which is the ordinary
     /// state of a scope nothing has embedded yet.
     pub fn embedding_hashes(&self) -> Result<Vec<String>> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.embedding_hashes();
         }
@@ -1347,7 +1310,6 @@ impl ObjectStore {
     /// bounded semantic read, not just the byte-hash check
     /// [`Self::inspect_content_accounted`] already provides generically.
     pub fn content_path(&self, kind: ContentObjectKind, hash: &str) -> Result<PathBuf> {
-        #[cfg(any(unix, windows))]
         if self.bound.is_some() {
             let _ = (kind, hash);
             return Err(KioError::invalid_usage(
@@ -1435,7 +1397,6 @@ impl ObjectStore {
     }
 
     pub fn write_object_bytes(&self, kind: ObjectKind, hash: &str, bytes: &[u8]) -> Result<()> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.write_object_bytes(kind, hash, bytes);
         }
@@ -1486,7 +1447,6 @@ impl ObjectStore {
         reader: &mut R,
         max_bytes: u64,
     ) -> Result<(String, u64)> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.write_raw_reader(reader, max_bytes);
         }
@@ -1545,7 +1505,6 @@ impl ObjectStore {
     }
 
     pub fn read_by_hash(&self, hash: &str) -> Result<StoredObject> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.read_by_hash(hash);
         }
@@ -1564,7 +1523,6 @@ impl ObjectStore {
     /// held. Missing is an idempotent `false`; malformed links or bytes fail
     /// closed before unlink.
     pub fn remove_raw(&self, hash: &str) -> Result<bool> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.remove_raw(hash);
         }
@@ -1584,7 +1542,6 @@ impl ObjectStore {
 
     /// Remove one semantic chunk object after identity/text verification.
     pub fn remove_chunk(&self, hash: &str) -> Result<bool> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.remove_chunk(hash);
         }
@@ -1608,7 +1565,6 @@ impl ObjectStore {
     /// `false`; malformed links, bytes, or duplicate representations fail closed
     /// before the first unlink.
     pub fn remove_content(&self, kind: ContentObjectKind, hash: &str) -> Result<bool> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.remove_content(kind, hash);
         }
@@ -1658,7 +1614,6 @@ impl ObjectStore {
     /// contract) — used by tests to construct fsck fixtures directly, and is
     /// the storage primitive a future write-path integration would call.
     pub fn write_content_object(&self, kind: ContentObjectKind, bytes: &[u8]) -> Result<String> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.write_content_object(kind, bytes);
         }
@@ -1710,7 +1665,6 @@ impl ObjectStore {
         hash: &str,
         max_bytes: u64,
     ) -> Result<Vec<u8>> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.read_content_object_bytes(kind, hash, max_bytes);
         }
@@ -1740,7 +1694,6 @@ impl ObjectStore {
         kind: ObjectKind,
         hash: &str,
     ) -> Result<(StoredObject, u64)> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             return bound.read_object_with_size(kind, hash);
         }
@@ -1767,7 +1720,6 @@ impl ObjectStore {
     /// Verify and count an object through a fixed-size buffer. This is the
     /// metadata-only path used by raw `inspect`; it does not retain the body.
     pub fn inspect_by_hash(&self, hash: &str) -> Result<StoredObjectMetadata> {
-        #[cfg(any(unix, windows))]
         if self.bound.is_some() {
             for kind in [ObjectKind::Tree, ObjectKind::Commit, ObjectKind::Raw] {
                 match self.inspect_object(kind, hash) {
@@ -1790,7 +1742,6 @@ impl ObjectStore {
     /// Stream-verify metadata from one required CAS namespace without accepting
     /// a same-digest object from another namespace as a substitute.
     pub fn inspect_object(&self, kind: ObjectKind, hash: &str) -> Result<StoredObjectMetadata> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             let (parent, leaf) = bound.fanout(kind, hash, false)?;
             let (size_bytes, _) = bound_read_verified(&parent, &leaf, kind, hash, false)?;
@@ -1825,7 +1776,6 @@ impl ObjectStore {
         kind: ObjectKind,
         hash: &str,
     ) -> std::result::Result<StoredObjectMetadata, AccountedReadError> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             let (size_bytes, _) = bound.read_object_accounted(kind, hash, false)?;
             return Ok(StoredObjectMetadata {
@@ -1866,7 +1816,6 @@ impl ObjectStore {
         kind: ObjectKind,
         hash: &str,
     ) -> std::result::Result<(StoredObject, u64), AccountedReadError> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             let (size_bytes, bytes) = bound.read_object_accounted(kind, hash, true)?;
             return Ok((
@@ -1918,7 +1867,6 @@ impl ObjectStore {
         hash: &str,
         writer: &mut W,
     ) -> Result<StoredObjectMetadata> {
-        #[cfg(any(unix, windows))]
         if let Some(bound) = &self.bound {
             let (parent, leaf) = bound.fanout(kind, hash, false)?;
             let mut hasher = Sha256::new();
@@ -2041,7 +1989,6 @@ impl ObjectStore {
     }
 }
 
-#[cfg(any(unix, windows))]
 impl BoundObjectDirs {
     fn validate_layout(&self) -> Result<()> {
         let changed = || {
@@ -2812,7 +2759,6 @@ fn sync_bound_directory(directory: &File, label: &Path) -> Result<()> {
     ensure_bound_directory(directory, label)
 }
 
-#[cfg(any(unix, windows))]
 fn ensure_bound_directory(directory: &File, label: &Path) -> Result<()> {
     use cap_primitives::fs as cap_fs;
 
@@ -2833,7 +2779,6 @@ fn ensure_bound_directory(directory: &File, label: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
 fn same_bound_directory(current: &File, retained: &File) -> Result<bool> {
     ensure_bound_directory(current, Path::new("bound object layout"))?;
     ensure_bound_directory(retained, Path::new("retained object layout"))?;
@@ -2853,7 +2798,6 @@ fn same_bound_directory(current: &File, retained: &File) -> Result<bool> {
     }
 }
 
-#[cfg(any(unix, windows))]
 fn bound_open_dir(parent: &File, leaf: &str) -> Result<File> {
     let name = bound_leaf(leaf, "directory")?;
     let directory = cap_primitives::fs::open_dir_nofollow(parent, name)
@@ -2874,7 +2818,6 @@ fn bound_open_dir(parent: &File, leaf: &str) -> Result<File> {
     Ok(directory)
 }
 
-#[cfg(any(unix, windows))]
 fn bound_ingest_name(name: &str) -> bool {
     let Some(rest) = name.strip_prefix(".ingest-") else {
         return false;
@@ -2887,7 +2830,6 @@ fn bound_ingest_name(name: &str) -> bool {
     }) && fields.next().is_none()
 }
 
-#[cfg(any(unix, windows))]
 fn bound_stage_corrupt(message: &str) -> KioError {
     KioError::new(
         "KIO-E-STORE-CORRUPT-001",
@@ -2897,7 +2839,6 @@ fn bound_stage_corrupt(message: &str) -> KioError {
     )
 }
 
-#[cfg(any(unix, windows))]
 fn bound_open_or_create_dir(parent: &File, leaf: &str, create: bool) -> Result<File> {
     match bound_open_dir(parent, leaf) {
         Ok(dir) => Ok(dir),
@@ -2915,7 +2856,6 @@ fn bound_open_or_create_dir(parent: &File, leaf: &str, create: bool) -> Result<F
     }
 }
 
-#[cfg(any(unix, windows))]
 fn bound_stream_regular(
     parent: &File,
     leaf: &str,
@@ -3012,7 +2952,6 @@ fn bound_stream_regular(
     (result, consumed)
 }
 
-#[cfg(any(unix, windows))]
 fn bound_read_regular(parent: &File, leaf: &str, max: u64) -> Result<(u64, Vec<u8>)> {
     let mut bytes = Vec::new();
     let (result, _) = bound_stream_regular(parent, leaf, max, |part| {
@@ -3025,7 +2964,6 @@ fn bound_read_regular(parent: &File, leaf: &str, max: u64) -> Result<(u64, Vec<u
     result.map(|size| (size, bytes))
 }
 
-#[cfg(any(unix, windows))]
 fn bound_read_chunk_accounted(
     parent: &File,
     leaf: &str,
@@ -3048,7 +2986,6 @@ fn bound_read_chunk_accounted(
         })
 }
 
-#[cfg(any(unix, windows))]
 fn bound_read_embedding(parent: &File, leaf: &str, hash: &str) -> Result<EmbeddingObject> {
     let (_, bytes) = bound_read_regular(parent, leaf, MAX_EMBEDDING_OBJECT_BYTES)?;
     decode_embedding(&bytes, hash, Path::new(leaf))
@@ -3057,7 +2994,6 @@ fn bound_read_embedding(parent: &File, leaf: &str, hash: &str) -> Result<Embeddi
 /// Semantic keys intentionally differ from a hash of serialized bytes. The
 /// caller validates that relationship; immutable publication compares the
 /// entire bounded object, including text/vector data outside the key.
-#[cfg(any(unix, windows))]
 fn bound_write_semantic(parent: &File, leaf: &str, bytes: &[u8], max: u64) -> Result<()> {
     let verify = || -> Result<()> {
         let (_, existing) = bound_read_regular(parent, leaf, max)?;
@@ -3093,7 +3029,6 @@ fn bound_write_semantic(parent: &File, leaf: &str, bytes: &[u8], max: u64) -> Re
     result
 }
 
-#[cfg(any(unix, windows))]
 fn bound_read_verified_accounted(
     parent: &File,
     leaf: &str,
@@ -3128,7 +3063,6 @@ fn bound_read_verified_accounted(
     (result, consumed)
 }
 
-#[cfg(any(unix, windows))]
 fn bound_read_verified(
     parent: &File,
     leaf: &str,
@@ -3143,7 +3077,6 @@ fn bound_read_verified(
 /// checks as raw/tree/commit objects. The content byte hash is deliberately
 /// checked by `bound_verify_content`; bounded semantic reads only require a
 /// regular stable leaf, matching the public-path API contract.
-#[cfg(any(unix, windows))]
 fn bound_read_content(
     parent: &File,
     leaf: &str,
@@ -3154,7 +3087,6 @@ fn bound_read_content(
     Ok((size, if materialize { bytes } else { Vec::new() }))
 }
 
-#[cfg(any(unix, windows))]
 fn bound_verify_content(
     parent: &File,
     leaf: &str,
@@ -3164,7 +3096,6 @@ fn bound_verify_content(
     bound_verify_content_accounted(parent, leaf, kind, hash).0
 }
 
-#[cfg(any(unix, windows))]
 fn bound_verify_content_accounted(
     parent: &File,
     leaf: &str,
@@ -3191,23 +3122,19 @@ fn bound_verify_content_accounted(
     (result, consumed)
 }
 
-#[cfg(any(unix, windows))]
 fn bound_create_temp(parent: &File) -> Result<(String, File)> {
     bound_create_private_temp(parent, ".kio-cas", false, "bound CAS temp")
 }
 
-#[cfg(any(unix, windows))]
 fn bound_create_ingest_temp(parent: &File) -> Result<(String, File)> {
     bound_create_private_temp(parent, ".ingest", true, "bound raw stage")
 }
 
-#[cfg(any(unix, windows))]
 fn bound_remove(parent: &File, leaf: &str) -> Result<()> {
     cap_primitives::fs::remove_file(parent, Path::new(leaf))
         .map_err(|error| KioError::io(error.to_string(), leaf))
 }
 
-#[cfg(any(unix, windows))]
 fn bound_open_regular_handle(parent: &File, leaf: &str) -> Result<File> {
     use cap_primitives::fs as cap_fs;
     let name = bound_leaf(leaf, "object")?;
@@ -3241,7 +3168,6 @@ fn bound_open_regular_handle(parent: &File, leaf: &str) -> Result<File> {
     Ok(file)
 }
 
-#[cfg(any(unix, windows))]
 fn bound_hash_open_regular(file: &mut File, max: u64) -> Result<String> {
     file.seek(std::io::SeekFrom::Start(0))
         .map_err(|error| KioError::io(error.to_string(), "bound CAS repair source"))?;
@@ -3271,7 +3197,6 @@ fn bound_hash_open_regular(file: &mut File, max: u64) -> Result<String> {
     Ok(format!("sha256:{}", lower_hex(&hasher.finalize())))
 }
 
-#[cfg(any(unix, windows))]
 fn bound_quarantine_matches(parent: &File, quarantine: &str, source: &File) -> Result<bool> {
     use cap_primitives::fs as cap_fs;
     let mut options = cap_fs::OpenOptions::new();
@@ -3310,7 +3235,6 @@ fn bound_quarantine_matches(parent: &File, quarantine: &str, source: &File) -> R
 /// The explicit removal request supplies kind/hash authority for this one
 /// deterministic sibling. A retry must inspect it even when canonical is absent.
 /// No directory scan or legacy random-quarantine cleanup is authorized here.
-#[cfg(any(unix, windows))]
 fn bound_remove_verified<F>(parent: &File, leaf: &str, verify: F) -> Result<bool>
 where
     F: Fn(&File, &str) -> Result<()>,
@@ -3360,7 +3284,6 @@ where
     Ok(true)
 }
 
-#[cfg(any(unix, windows))]
 fn bound_visit_chunks(
     base: &File,
     visit: &mut impl FnMut(&str, &ChunkObject) -> Result<()>,
@@ -3368,7 +3291,6 @@ fn bound_visit_chunks(
     bound_visit_chunks_with_limits(base, 100_000, 512 * 1024 * 1024, visit)
 }
 
-#[cfg(any(unix, windows))]
 fn bound_visit_chunks_with_limits(
     base: &File,
     max_entries: usize,
@@ -3448,7 +3370,6 @@ fn bound_visit_chunks_with_limits(
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
 fn bound_embedding_hashes(base: &File) -> Result<Vec<String>> {
     const MAX_ENTRIES: usize = 100_000;
     const MAX_BYTES: u64 = 512 * 1024 * 1024;
@@ -3521,7 +3442,6 @@ fn bound_embedding_hashes(base: &File) -> Result<Vec<String>> {
     Ok(hashes)
 }
 
-#[cfg(any(unix, windows))]
 fn canonical_digest_fragment(value: &str, length: usize) -> bool {
     value.len() == length
         && value.bytes().all(|byte| {
@@ -3529,7 +3449,6 @@ fn canonical_digest_fragment(value: &str, length: usize) -> bool {
         })
 }
 
-#[cfg(any(unix, windows))]
 fn bound_publish(
     parent: &File,
     temp: &str,
@@ -3543,7 +3462,6 @@ fn bound_publish(
 }
 
 #[allow(clippy::too_many_arguments)]
-#[cfg(any(unix, windows))]
 fn bound_publish_between(
     from: &File,
     temp: &str,
@@ -3585,7 +3503,6 @@ fn bound_publish_between(
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
 fn bound_publish_content(
     parent: &File,
     temp: &str,
@@ -3625,7 +3542,6 @@ fn bound_publish_content(
     Ok(())
 }
 
-#[cfg(any(unix, windows))]
 fn bound_leaf<'a>(leaf: &'a str, kind: &str) -> Result<&'a Path> {
     let path = Path::new(leaf);
     if !matches!(
@@ -3640,7 +3556,6 @@ fn bound_leaf<'a>(leaf: &'a str, kind: &str) -> Result<&'a Path> {
     Ok(path)
 }
 
-#[cfg(any(unix, windows))]
 fn bound_io_or_not_found(error: std::io::Error, leaf: &str) -> KioError {
     if error.kind() == std::io::ErrorKind::NotFound {
         KioError::not_found(leaf)
@@ -3649,7 +3564,6 @@ fn bound_io_or_not_found(error: std::io::Error, leaf: &str) -> KioError {
     }
 }
 
-#[cfg(any(unix, windows))]
 fn bound_metadata_single_link(metadata: &cap_primitives::fs::Metadata) -> bool {
     #[cfg(unix)]
     {
@@ -3665,7 +3579,6 @@ fn bound_metadata_single_link(metadata: &cap_primitives::fs::Metadata) -> bool {
     }
 }
 
-#[cfg(any(unix, windows))]
 fn same_bound_regular_entry(
     _parent: &File,
     leaf: &Path,
@@ -3696,7 +3609,6 @@ fn same_bound_regular_entry(
     }
 }
 
-#[cfg(any(unix, windows))]
 fn bound_create_private_temp(
     parent: &File,
     prefix: &str,
@@ -4065,18 +3977,6 @@ fn same_open_file(left: &File, right: &File) -> Result<bool> {
     ))
 }
 
-#[cfg(not(any(unix, windows)))]
-fn same_open_file(left: &File, right: &File) -> Result<bool> {
-    Ok(left
-        .metadata()
-        .map_err(|error| KioError::io(error.to_string(), "raw repair source"))?
-        .len()
-        == right
-            .metadata()
-            .map_err(|error| KioError::io(error.to_string(), "raw repair quarantine"))?
-            .len())
-}
-
 #[cfg(not(windows))]
 fn replace_file(source: &Path, destination: &Path) -> Result<()> {
     fs::rename(source, destination)
@@ -4133,7 +4033,6 @@ fn remove_verified_cas_path(
     kind: CasRemovalKind,
     hash: &str,
 ) -> Result<bool> {
-    #[cfg(any(unix, windows))]
     {
         let parent_path = path
             .parent()
@@ -4188,13 +4087,6 @@ fn remove_verified_cas_path(
                 bound_verify_content(parent, candidate, kind, hash).map(|_| ())
             }
         })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (kio, path, kind, hash);
-        Err(KioError::invalid_usage(
-            "safe CAS removal is unsupported on this platform",
-        ))
     }
 }
 
@@ -4589,16 +4481,9 @@ fn validate_open_regular_nofollow_with_windows_before(
 fn configure_no_follow(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "linux")]
     options.custom_flags(0x20_800);
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
+    #[cfg(target_os = "macos")]
     options.custom_flags(0x104);
     let _ = options;
 }
@@ -4608,9 +4493,6 @@ fn configure_no_follow(options: &mut OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt;
     options.custom_flags(0x0020_0000);
 }
-
-#[cfg(not(any(unix, windows)))]
-fn configure_no_follow(_options: &mut OpenOptions) {}
 
 #[cfg(unix)]
 fn same_file_identity(opened: &fs::Metadata, path: &fs::Metadata) -> bool {
@@ -4624,11 +4506,6 @@ pub(crate) fn same_windows_regular_file(opened: &File, path: &File) -> bool {
         windows_file_information(opened),
         windows_file_information(path),
     )
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(opened: &fs::Metadata, path: &fs::Metadata) -> bool {
-    opened.len() == path.len() && opened.modified().ok() == path.modified().ok()
 }
 
 #[cfg(any(test, windows))]

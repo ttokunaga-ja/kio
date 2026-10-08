@@ -926,7 +926,6 @@ impl GcSweepSession {
     /// handles and use the same public no-follow bind as [`Self::bind`].
     pub fn bind_repository(repository: &Repository) -> Result<Self> {
         let session = Self::bind(repository.canonical_root().to_path_buf())?;
-        #[cfg(any(unix, windows))]
         match (
             repository.bound_root_handle(),
             repository.bound_kio_handle(),
@@ -1334,14 +1333,7 @@ impl GcSweepSession {
     }
     pub fn ensure_index_rotation_supported(&self) -> Result<()> {
         self.recheck_binding()?;
-        #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-        {
-            Err(corrupt("GC index rotation is unsupported on this platform"))
-        }
-        #[cfg(any(target_os = "macos", target_os = "linux", windows))]
-        {
-            Ok(())
-        }
+        Ok(())
     }
     /// Mint the process-local capability required by
     /// [`Self::remove_candidate_tree`].
@@ -2757,13 +2749,6 @@ fn rename_snapshot_state_noreplace(dir: &std::fs::File, from: &str, to: &str) ->
     rename_noreplace_between(dir, from, dir, to)
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn rename_snapshot_state_noreplace(_: &std::fs::File, _: &str, _: &str) -> Result<()> {
-    Err(corrupt(
-        "platform lacks a verified no-replace snapshot state primitive",
-    ))
-}
-
 /// Replace an exact observed scheduler checkpoint without an absent public
 /// state window. Darwin/Linux retain the predecessor through atomic exchange,
 /// validate that it is the expected inode/bytes, and only then retire it.
@@ -2958,19 +2943,6 @@ fn is_canonical_decimal(value: &str) -> bool {
     !value.is_empty()
         && value.bytes().all(|byte| byte.is_ascii_digit())
         && (value == "0" || !value.starts_with('0'))
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn replace_snapshot_state_expected(
-    _: &std::fs::File,
-    _: &str,
-    _: &str,
-    _: &[u8],
-    _: &FileObservation,
-) -> Result<()> {
-    Err(corrupt(
-        "platform lacks a verified snapshot state replacement primitive",
-    ))
 }
 
 /// Atomically exchange a public leaf with an operation-private sentinel, then
@@ -3231,23 +3203,6 @@ fn exchange_between(
         ))
     }
 }
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn exchange_bound(_dir: &std::fs::File, _left: &str, _right: &str) -> Result<()> {
-    Err(corrupt(
-        "platform lacks a verified atomic GC marker exchange primitive",
-    ))
-}
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn exchange_between(
-    _left_dir: &std::fs::File,
-    _left: &str,
-    _right_dir: &std::fs::File,
-    _right: &str,
-) -> Result<()> {
-    Err(corrupt(
-        "platform lacks a verified atomic GC marker exchange primitive",
-    ))
-}
 #[cfg(target_os = "linux")]
 fn rename_noreplace_bound(dir: &std::fs::File, from: &str, to: &str) -> Result<()> {
     rename_noreplace_between(dir, from, dir, to)
@@ -3295,24 +3250,6 @@ fn rename_noreplace_between(
     to: &str,
 ) -> Result<()> {
     windows::move_noreplace(from_dir, from, to_dir, to)
-}
-#[allow(dead_code)]
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn rename_noreplace_bound(_dir: &std::fs::File, _from: &str, _to: &str) -> Result<()> {
-    Err(corrupt(
-        "platform lacks a verified no-replace GC quarantine primitive",
-    ))
-}
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn rename_noreplace_between(
-    _from_dir: &std::fs::File,
-    _from: &str,
-    _to_dir: &std::fs::File,
-    _to: &str,
-) -> Result<()> {
-    Err(corrupt(
-        "platform lacks a verified no-replace GC quarantine primitive",
-    ))
 }
 #[cfg(not(windows))]
 fn atomic_exchange_marker_expected(
@@ -4697,17 +4634,6 @@ fn sync_bound_directory(directory: &std::fs::File, label: impl AsRef<Path>) -> R
     validate_directory_handle(directory, label.as_ref())
 }
 
-#[cfg(not(any(unix, windows)))]
-fn sync_bound_directory(directory: &std::fs::File, label: impl AsRef<Path>) -> Result<()> {
-    let _ = directory;
-    Err(ioerr(
-        std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "directory durability is unsupported on this platform",
-        ),
-        label.as_ref(),
-    ))
-}
 fn names(
     d: &std::fs::File,
     s: &mut GcPlanStats,
@@ -4888,11 +4814,6 @@ fn link_count(metadata: &cap_fs::Metadata) -> Result<u64> {
             .map(u64::from)
             .ok_or_else(|| corrupt("store link count is unavailable"))
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = metadata;
-        Err(corrupt("store link count is unavailable"))
-    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct Identity(
@@ -4925,12 +4846,6 @@ fn id_meta(m: &cap_fs::Metadata) -> Result<Identity> {
             .ok_or_else(|| corrupt("store identity is unavailable"))?;
         Ok(Identity(u64::from(volume), index))
     }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = m;
-        Err(corrupt("store identity is unsupported on this platform"))
-    }
 }
 
 #[cfg(unix)]
@@ -4953,12 +4868,6 @@ fn canonical_gc_index_identity_from_metadata(metadata: &cap_fs::Metadata) -> Res
         .file_index()
         .ok_or_else(|| corrupt("GC source index has no Windows file identity"))?;
     Ok(format!("windows:{volume:08x}:{index:016x}"))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn canonical_gc_index_identity_from_metadata(metadata: &cap_fs::Metadata) -> Result<String> {
-    let _ = metadata;
-    Err(corrupt("GC source index identity is unsupported"))
 }
 
 #[cfg(unix)]
@@ -5066,11 +4975,6 @@ fn is_canonical_gc_index_identity(value: &str) -> bool {
             && index
                 .bytes()
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = value;
-        false
     }
 }
 fn is_valid_gc_index_temp_leaf(value: &str) -> bool {

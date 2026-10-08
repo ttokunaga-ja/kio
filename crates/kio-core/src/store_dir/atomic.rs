@@ -268,13 +268,6 @@ fn file_id(file: &File) -> Result<FileSystemIdentity> {
             })
             .ok_or_else(|| failure("atomic source has no single-link identity"))
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = metadata;
-        Err(failure(
-            "atomic file identity is unsupported on this platform",
-        ))
-    }
 }
 
 fn hash_file(file: &mut File, max_bytes: u64) -> Result<(String, u64)> {

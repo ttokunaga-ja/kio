@@ -38,14 +38,6 @@ pub fn read_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     {
         windows::read_private_file(path, max_bytes)
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (path, max_bytes);
-        Err(unsafe_file(
-            "private trust files are unsupported on this platform",
-            None,
-        ))
-    }
 }
 
 /// Read a direct owner-private regular-file child of an already retained
@@ -66,14 +58,6 @@ pub fn read_private_file_at(
     #[cfg(windows)]
     {
         windows::read_private_file_at(parent, name, max_bytes)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (parent, name, max_bytes);
-        Err(unsafe_file(
-            "private trust files are unsupported on this platform",
-            None,
-        ))
     }
 }
 
@@ -119,14 +103,6 @@ pub fn verify_private_directory(path: &Path) -> Result<StoreDirectory> {
     {
         windows::verify_private_directory(path)
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = path;
-        Err(unsafe_file(
-            "private directories are unsupported on this platform",
-            None,
-        ))
-    }
 }
 
 /// Recheck that an already retained directory capability remains owner-private.
@@ -142,14 +118,6 @@ pub fn verify_private_directory_handle(directory: &StoreDirectory) -> Result<()>
     #[cfg(windows)]
     {
         windows::verify_private_directory_handle(directory)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = directory;
-        Err(unsafe_file(
-            "private directories are unsupported on this platform",
-            None,
-        ))
     }
 }
 
@@ -170,14 +138,6 @@ pub fn verify_private_creation_parent(path: &Path) -> Result<StoreDirectory> {
     #[cfg(windows)]
     {
         windows::verify_private_creation_parent(path)
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = path;
-        Err(unsafe_file(
-            "private directory creation is unsupported on this platform",
-            None,
-        ))
     }
 }
 
@@ -201,14 +161,6 @@ pub fn verify_trusted_owned_regular_file_handle(file: &std::fs::File) -> Result<
         }
         windows::verify_owner_private_handle(file)
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = file;
-        Err(unsafe_file(
-            "trusted regular files are unsupported on this platform",
-            None,
-        ))
-    }
 }
 
 /// Resolve and verify an executable that a persistent native scheduler may
@@ -228,14 +180,6 @@ pub fn verify_trusted_executable(path: &Path) -> Result<std::path::PathBuf> {
     unix::verify_trusted_executable(&canonical)?;
     #[cfg(windows)]
     windows::verify_trusted_executable(&canonical)?;
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = &canonical;
-        return Err(unsafe_file(
-            "scheduler executable verification is unsupported on this platform",
-            Some(path),
-        ));
-    }
     Ok(canonical)
 }
 
