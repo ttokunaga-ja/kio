@@ -84,3 +84,18 @@ pub(crate) fn sync_bound_directory(
     }
     syncable.sync_all().map_err(|error| ioerr(error, label))
 }
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn publish_staged(
+    from_dir: &std::fs::File,
+    staged: &str,
+    to_dir: &std::fs::File,
+    leaf: &str,
+    bytes: &[u8],
+    max: u64,
+    staged_checkpoint: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    crate::gc::create_new_bound(from_dir, staged, bytes, max)?;
+    staged_checkpoint()?;
+    crate::platform::gc_rename_noreplace_between(from_dir, staged, to_dir, leaf)
+}

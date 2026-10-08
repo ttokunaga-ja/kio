@@ -3,32 +3,33 @@
 //! Public paths are used only to bind and diagnose a scope.  Every store read
 //! below is relative to a retained directory descriptor.
 
-use crate::platform::{
-    gc_canonical_index_identity as canonical_gc_index_identity_from_metadata,
-    gc_file_state as file_state, gc_receipt_handle as open_verified_receipt_durable_handle,
-    gc_rename_snapshot_state_noreplace as rename_snapshot_state_noreplace,
-    gc_retire_snapshot_state_temporary as retire_snapshot_state_temporary,
-    gc_same_file_state as same_file_state, gc_sync_bound_directory as sync_bound_directory,
-};
 #[cfg(not(windows))]
 use crate::platform::{
-    gc_exchange_between as exchange_between, gc_exchange_bound as exchange_bound,
-    gc_exchange_capture_verified as exchange_capture_verified,
+    gc_atomic_exchange_marker_expected as atomic_exchange_marker_expected,
+    gc_atomic_replace_snapshot_state_expected as replace_snapshot_state_expected,
     gc_exchange_capture_verified_named as exchange_capture_verified_named,
-    gc_open_tree_writable as open_gc_tree_writable,
-    gc_open_verified_handle as open_verified_file_handle,
+    gc_link_count as link_count, gc_open_tree_writable as open_gc_tree_writable,
     gc_remove_sentinel_leaf as remove_sentinel_leaf,
     gc_remove_verified_leaf as remove_verified_leaf,
     gc_rename_noreplace_between as rename_noreplace_between,
+};
+use crate::platform::{
+    gc_canonical_index_identity as canonical_gc_index_identity_from_metadata,
+    gc_file_state as file_state, gc_publish_staged as publish_staged,
+    gc_receipt_handle as open_verified_receipt_durable_handle,
+    gc_remove_completed_marker as remove_completed_marker,
+    gc_rename_snapshot_state_noreplace as rename_snapshot_state_noreplace,
+    gc_retire_snapshot_state_temporary as retire_snapshot_state_temporary,
+    gc_same_file_state as same_file_state, gc_sync_bound_directory as sync_bound_directory,
 };
 
 #[cfg(windows)]
 use crate::platform::gc_verify_retained_receipt_observation as verify_retained_receipt_observation;
 
+pub mod exchange;
 mod unreachable_inventory;
 #[cfg(windows)]
 mod windows;
-pub mod windows_exchange;
 #[cfg(windows)]
 mod windows_snapshot_state;
 
@@ -517,7 +518,7 @@ fn has_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<bool> {
         parent = child;
     }
     let owner = StoreDirectory::from_retained(parent, PathBuf::from("<snapshot state exchange>"))?;
-    windows_exchange::inspect_pending(&owner)
+    exchange::inspect_pending(&owner)
 }
 
 fn reject_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<()> {
@@ -540,7 +541,7 @@ fn has_pending_marker_exchange(kio: &std::fs::File) -> Result<bool> {
         parent = child;
     }
     let owner = StoreDirectory::from_retained(parent, PathBuf::from("<GC marker exchange>"))?;
-    windows_exchange::inspect_pending(&owner)
+    exchange::inspect_pending(&owner)
 }
 
 fn read_marker_without_pending_check(kio: &std::fs::File) -> Result<Option<GcInProgressMarker>> {
@@ -1634,8 +1635,7 @@ impl GcSweepSession {
         // Never expose a partially written public marker. The private stage is
         // create-new, fully written and fsynced before a no-clobber atomic
         // rename publishes `in_progress` in one namespace operation.
-        #[cfg(windows)]
-        windows::publish_staged(
+        publish_staged(
             &markers,
             &staged,
             &gc,
@@ -1644,12 +1644,7 @@ impl GcSweepSession {
             MAX_MARKER_BYTES,
             || self.inject_gc_tree_fault(GcTreeFaultPoint::MarkerStageFsync),
         )?;
-        #[cfg(not(windows))]
-        {
-            create_new_bound(&markers, &staged, &bytes, MAX_MARKER_BYTES)?;
-            self.inject_gc_tree_fault(GcTreeFaultPoint::MarkerStageFsync)?;
-            rename_noreplace_between(&markers, &staged, &gc, "in_progress")?;
-        }
+
         sync_bound_directory(&gc, "in_progress")?;
         sync_bound_directory(&markers, &staged)?;
         let (published, _) = read_regular_observed(&gc, "in_progress", MAX_MARKER_BYTES)?;
@@ -1759,8 +1754,7 @@ impl GcSweepSession {
                 // As with the operation marker, stage and fsync the complete
                 // record before its final receipt name exists. A crash during
                 // staging leaves no malformed authorization at `shallowed/`.
-                #[cfg(windows)]
-                windows::publish_staged(
+                publish_staged(
                     &receipts,
                     &staged,
                     &shallowed,
@@ -1769,12 +1763,7 @@ impl GcSweepSession {
                     MAX_METADATA,
                     || self.inject_gc_tree_fault(GcTreeFaultPoint::ReceiptStageFsync),
                 )?;
-                #[cfg(not(windows))]
-                {
-                    create_new_bound(&receipts, &staged, &bytes, MAX_METADATA)?;
-                    self.inject_gc_tree_fault(GcTreeFaultPoint::ReceiptStageFsync)?;
-                    rename_noreplace_between(&receipts, &staged, &shallowed, leaf)?;
-                }
+
                 sync_bound_directory(&shallowed, leaf)?;
                 sync_bound_directory(&receipts, &staged)?;
                 let (published, _) = read_regular_observed(&shallowed, leaf, MAX_METADATA)?;
@@ -2073,69 +2062,7 @@ impl GcSweepSession {
         let gc = open_required_dir(&self.kio, "gc", "GC directory is missing")?;
         let internal = ensure_child_dir(&gc, "internal")?;
         let markers = ensure_child_dir(&internal, "markers")?;
-        #[cfg(windows)]
-        {
-            windows::remove_completed_marker(&gc, &markers, expected, &observation)
-        }
-        #[cfg(not(windows))]
-        {
-            let archive = unique_internal_name("completed");
-            rename_noreplace_between(&gc, "in_progress", &markers, &archive)?;
-            sync_bound_directory(&markers, &archive)?;
-            // Commit the source disappearance before retiring the destination,
-            // otherwise a power loss could resurrect the public marker after the
-            // internal archive has been unlinked.
-            sync_bound_directory(&gc, "gc")?;
-            let (moved_bytes, moved) = read_regular_observed(&markers, &archive, MAX_MARKER_BYTES)?;
-            if moved.identity != observation.identity
-                || moved.state.len != observation.state.len
-                || moved.digest != observation.digest
-                || GcInProgressMarker::parse_canonical(&moved_bytes).is_err()
-            {
-                // Never roll back after a failed identity check: a second move
-                // could restore a hostile replacement into the public marker
-                // name. Preserve the archived entry for fail-closed diagnosis.
-                return Err(corrupt("GC marker changed during completion archive"));
-            }
-            let moved_handle = open_verified_file_handle(
-                &markers,
-                &archive,
-                &moved,
-                MAX_MARKER_BYTES,
-                "GC completed marker",
-            )?;
-            // The archive name is only a capability-relative quarantine used to
-            // prove that the exact active marker left the public name. Remove it
-            // in the same completion step so successful sweeps do not retain an
-            // unbounded marker history. If another name was added, the retained
-            // handle exposes nlink != 0 and completion fails without changing the
-            // bytes reachable through that other name.
-            // Retire through an atomic exchange so a replacement at the archive
-            // name is captured and identity-checked before any unlink. A foreign
-            // marker is retained on mismatch rather than deleted.
-            let (captured, captured_observation) = exchange_capture_verified(
-                &markers,
-                &archive,
-                &moved,
-                MAX_MARKER_BYTES,
-                "GC completed marker",
-            )?;
-            remove_verified_leaf(
-                &markers,
-                &captured,
-                &captured_observation,
-                MAX_MARKER_BYTES,
-                "GC captured completed marker",
-            )?;
-            remove_sentinel_leaf(&markers, &archive)?;
-            sync_bound_directory(&markers, &archive)?;
-            let unlinked = cap_fs::Metadata::from_file(&moved_handle)
-                .map_err(|error| ioerr(error, &archive))?;
-            if id_meta(&unlinked)? != moved.identity || link_count(&unlinked)? != 0 {
-                return Err(corrupt("GC completed marker gained another name"));
-            }
-            sync_bound_directory(&gc, "gc")
-        }
+        remove_completed_marker(&gc, &markers, expected, &observation)
     }
 
     /// Check that the caller's public scope pathname still names exactly the
@@ -2651,95 +2578,6 @@ pub(crate) fn create_new_bound(
     sync_bound_directory(dir, leaf)
 }
 
-/// Replace an exact observed scheduler checkpoint without an absent public
-/// state window. Darwin/Linux retain the predecessor through atomic exchange,
-/// validate that it is the expected inode/bytes, and only then retire it.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn replace_snapshot_state_expected(
-    dir: &std::fs::File,
-    leaf: &str,
-    temporary: &str,
-    replacement: &[u8],
-    expected: &FileObservation,
-) -> Result<()> {
-    exchange_bound(dir, leaf, temporary)?;
-    sync_bound_directory(dir, leaf)?;
-    let (old_bytes, old) = read_regular_observed(dir, temporary, MAX_METADATA)?;
-    let old_ok = old.identity == expected.identity
-        && old.state.len == expected.state.len
-        && old.digest == expected.digest
-        && parse_snapshot_auto_state(&old_bytes).is_ok();
-    let public = read_regular_observed(dir, leaf, MAX_METADATA);
-    let new_ok = public
-        .as_ref()
-        .is_ok_and(|(bytes, _)| bytes == replacement && parse_snapshot_auto_state(bytes).is_ok());
-    if !old_ok || !new_ok {
-        // The exchange captured a writer which won after our last observation.
-        // Restore that captured checkpoint to the public name before failing.
-        // A non-cooperating third writer can still alter either reserved state
-        // name in this syscall-width window; the post-exchange observations
-        // detect that case, and no pathname is unlinked in either outcome.
-        let captured_before = old.clone();
-        let replacement_before = public.map(|(_, observation)| observation)?;
-        exchange_bound(dir, leaf, temporary)?;
-        sync_bound_directory(dir, leaf)?;
-        let restored = read_regular_observed(dir, leaf, MAX_METADATA);
-        let retired_replacement = read_regular_observed(dir, temporary, MAX_METADATA);
-        let restored_ok = restored.as_ref().is_ok_and(|(_, observation)| {
-            observation.identity == captured_before.identity
-                && observation.state.len == captured_before.state.len
-                && observation.digest == captured_before.digest
-        });
-        let replacement_retired_ok =
-            retired_replacement
-                .as_ref()
-                .is_ok_and(|(bytes, observation)| {
-                    bytes == replacement
-                        && observation.identity == replacement_before.identity
-                        && observation.state.len == replacement_before.state.len
-                        && observation.digest == replacement_before.digest
-                });
-        if !restored_ok || !replacement_retired_ok {
-            return Err(corrupt(
-                "snapshot auto state changed during failed replacement rollback",
-            ));
-        }
-        retire_snapshot_state_temporary(dir, temporary, replacement, &replacement_before)?;
-        return Err(snapshot_auto_state_changed());
-    }
-    let old_handle = open_verified_file_handle(
-        dir,
-        temporary,
-        &old,
-        MAX_METADATA,
-        "snapshot auto predecessor state",
-    )?;
-    let (captured, captured_observation) = exchange_capture_verified(
-        dir,
-        temporary,
-        &old,
-        MAX_METADATA,
-        "snapshot auto predecessor state",
-    )?;
-    remove_verified_leaf(
-        dir,
-        &captured,
-        &captured_observation,
-        MAX_METADATA,
-        "snapshot auto captured predecessor state",
-    )?;
-    remove_sentinel_leaf(dir, temporary)?;
-    sync_bound_directory(dir, temporary)?;
-    let unlinked =
-        cap_fs::Metadata::from_file(&old_handle).map_err(|error| ioerr(error, temporary))?;
-    if id_meta(&unlinked)? != old.identity || link_count(&unlinked)? != 0 {
-        return Err(corrupt(
-            "snapshot auto predecessor state gained another name",
-        ));
-    }
-    Ok(())
-}
-
 /// Retire only scheduler state temporaries which could have been produced by
 /// [`unique_internal_name`].  This runs under the scheduler writer lock,
 /// before allocating the next temporary.  Names outside this narrow private
@@ -2802,93 +2640,6 @@ fn is_canonical_decimal(value: &str) -> bool {
 #[cfg(not(windows))]
 fn tree_capture_name(marker: &GcInProgressMarker, raw: &str) -> String {
     format!("{}-{raw}-captured", marker.sweep_id)
-}
-
-#[cfg(not(windows))]
-fn atomic_exchange_marker_expected(
-    dir: &std::fs::File,
-    leaf: &str,
-    archives: &std::fs::File,
-    bytes: &[u8],
-    expected: &FileObservation,
-) -> Result<()> {
-    let temporary = unique_internal_name(".gc-retired-marker");
-    create_new_bound(archives, &temporary, bytes, MAX_MARKER_BYTES)?;
-    // The expected marker is re-read through the same retained descriptor
-    // immediately before exchange. The exchange preserves it at `temporary`;
-    // no unverified leaf is ever overwritten or unlinked.
-    let matches = read_regular_observed(dir, leaf, MAX_MARKER_BYTES)
-        .is_ok_and(|(_, observed)| observed == *expected);
-    if !matches {
-        // The temporary was created by this call, but never remove its name
-        // blindly after a failed public-marker comparison. A replacement is
-        // retained for diagnosis instead of becoming an unlink victim.
-        if let Ok((actual, observation)) =
-            read_regular_observed(archives, &temporary, MAX_MARKER_BYTES)
-            && actual == bytes
-        {
-            let _ = remove_verified_leaf(
-                archives,
-                &temporary,
-                &observation,
-                MAX_MARKER_BYTES,
-                "GC unpublished replacement marker",
-            );
-        }
-        return Err(corrupt("GC marker changed before replacement"));
-    }
-    exchange_between(dir, leaf, archives, &temporary)?;
-    // Exchange legitimately updates ctime, so bind the archived marker by its
-    // stable identity, length and digest rather than full metadata state.
-    let archived = read_regular_observed(archives, &temporary, MAX_MARKER_BYTES);
-    let old_ok = archived.as_ref().is_ok_and(|(actual, observed)| {
-        observed.identity == expected.identity
-            && observed.state.len == expected.state.len
-            && observed.digest == expected.digest
-            && GcInProgressMarker::parse_canonical(actual).is_ok()
-    });
-    let new_ok = read_regular_observed(dir, leaf, MAX_MARKER_BYTES).is_ok_and(|(actual, _)| {
-        actual == bytes && GcInProgressMarker::parse_canonical(&actual).is_ok()
-    });
-    if !old_ok || !new_ok {
-        // Do not attempt a rollback after validation fails. A second exchange
-        // would itself need a fresh atomic identity precondition for both
-        // names and could swap a hostile replacement into the public marker
-        // path. Preserve both entries for fail-closed recovery/diagnosis.
-        return Err(corrupt("GC marker exchange validation failed"));
-    }
-    sync_bound_directory(dir, leaf)?;
-    sync_bound_directory(archives, &temporary)?;
-    let (_, archived_observation) = archived?;
-    let retired_handle = open_verified_file_handle(
-        archives,
-        &temporary,
-        &archived_observation,
-        MAX_MARKER_BYTES,
-        "GC retired marker",
-    )?;
-    let (captured, captured_observation) = exchange_capture_verified(
-        archives,
-        &temporary,
-        &archived_observation,
-        MAX_MARKER_BYTES,
-        "GC retired marker",
-    )?;
-    remove_verified_leaf(
-        archives,
-        &captured,
-        &captured_observation,
-        MAX_MARKER_BYTES,
-        "GC captured retired marker",
-    )?;
-    remove_sentinel_leaf(archives, &temporary)?;
-    sync_bound_directory(archives, &temporary)?;
-    let unlinked =
-        cap_fs::Metadata::from_file(&retired_handle).map_err(|error| ioerr(error, &temporary))?;
-    if id_meta(&unlinked)? != archived_observation.identity || link_count(&unlinked)? != 0 {
-        return Err(corrupt("GC retired marker gained another name"));
-    }
-    Ok(())
 }
 
 fn validate_marker_transition(
@@ -3946,32 +3697,6 @@ pub(crate) fn parse_snapshot_auto_state(bytes: &[u8]) -> Result<SnapshotAutoStat
     Ok(state)
 }
 
-#[cfg(any(windows, test))]
-fn validate_snapshot_state_transition(
-    old: &SnapshotAutoState,
-    new: &SnapshotAutoState,
-) -> Result<()> {
-    let old_attempt = parse_utc_seconds(&old.last_successful_eligible_attempt_at)
-        .ok_or_else(|| corrupt("invalid old snapshot attempt"))?;
-    let old_idle = parse_utc_seconds(&old.idle_observed_since)
-        .ok_or_else(|| corrupt("invalid old snapshot idle time"))?;
-    let new_attempt = parse_utc_seconds(&new.last_successful_eligible_attempt_at)
-        .ok_or_else(|| corrupt("invalid new snapshot attempt"))?;
-    let new_idle = parse_utc_seconds(&new.idle_observed_since)
-        .ok_or_else(|| corrupt("invalid new snapshot idle time"))?;
-    let valid = if old.working_set_digest == new.working_set_digest {
-        new_idle == old_idle
-            && (new_attempt == old_attempt || new_attempt >= old_attempt.max(old_idle))
-    } else {
-        new_idle >= old_attempt.max(old_idle)
-            && (new_attempt == old_attempt || new_attempt == new_idle)
-    };
-    if !valid {
-        return Err(corrupt("invalid snapshot auto checkpoint transition"));
-    }
-    Ok(())
-}
-
 pub(crate) fn snapshot_auto_state_changed() -> KioError {
     KioError::new(
         "KIO-E-SNAPSHOT-STATE-CHANGED-001",
@@ -4321,22 +4046,7 @@ pub(crate) fn valid_file(m: &cap_fs::Metadata, max: u64) -> Result<()> {
     }
     Ok(())
 }
-#[cfg(not(windows))]
-fn link_count(metadata: &cap_fs::Metadata) -> Result<u64> {
-    #[cfg(unix)]
-    {
-        use cap_primitives::fs::MetadataExt;
-        Ok(metadata.nlink())
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        metadata
-            .number_of_links()
-            .map(u64::from)
-            .ok_or_else(|| corrupt("store link count is unavailable"))
-    }
-}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct Identity(
     #[serde(serialize_with = "crate::identity_serde::u64_hex::serialize")] u64,
@@ -4351,6 +4061,7 @@ pub(crate) struct FileState {
     pub(crate) changed_seconds: i64,
     pub(crate) changed_nanos: i64,
 }
+
 pub(crate) fn id_meta(m: &cap_fs::Metadata) -> Result<Identity> {
     #[cfg(unix)]
     {
@@ -4434,6 +4145,7 @@ fn is_canonical_gc_index_identity(value: &str) -> bool {
                 .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
     }
 }
+
 fn is_valid_gc_index_temp_leaf(value: &str) -> bool {
     value.starts_with(".gc-index-")
         && value.len() <= 128
@@ -4817,6 +4529,7 @@ pub(crate) fn ioerr(e: std::io::Error, p: impl AsRef<Path>) -> KioError {
 mod tests {
     use super::*;
     use crate::dag::CommitStats;
+    use crate::platform::gc_snapshot_logic::validate_snapshot_state_transition;
     use crate::scope::Repository;
 
     #[test]

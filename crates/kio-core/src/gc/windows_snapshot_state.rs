@@ -1,15 +1,27 @@
 //! Windows scheduler checkpoint replacement with retained exchange authority.
 use super::*;
+use crate::gc::exchange::OperationKind;
+use crate::platform::ExchangeExpected;
 use crate::platform::gc_snapshot_io::{directory, observe, open_snapshot_source};
 use std::fs::File;
-use windows_exchange::{ExchangeExpected, OperationKind};
 
 fn validate_handles(source: Option<&File>, target: &File) -> Result<()> {
     let (new, _) = observe(target)?;
     if let Some(source) = source {
-        validate_snapshot_state_transition(&observe(source)?.0, &new)?;
+        crate::platform::gc_snapshot_logic::validate_snapshot_state_transition(
+            &observe(source)?.0,
+            &new,
+        )?;
     }
     Ok(())
+}
+
+/// Immutable common-domain proof; native exchange only receives its binding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotExchangeAuthority {
+    binding: String,
+    head_observation: FileObservation,
+    tool_observation: FileObservation,
 }
 
 impl GcSweepSession {
@@ -17,7 +29,7 @@ impl GcSweepSession {
         &self,
         snapshot: &SnapshotAutoBinding,
         gc: &GcAutomationBinding,
-    ) -> Result<(String, FileObservation, FileObservation)> {
+    ) -> Result<SnapshotExchangeAuthority> {
         self.recheck_binding()?;
         snapshot.recheck(&self.scope, &self.kio)?;
         if !snapshot.config.is_some_and(|config| config.enabled)
@@ -51,7 +63,11 @@ impl GcSweepSession {
         }
         snapshot.recheck(&self.scope, &self.kio)?;
         self.recheck_binding()?;
-        Ok((binding[7..].to_owned(), head_observation, tool_observation))
+        Ok(SnapshotExchangeAuthority {
+            binding: binding[7..].to_owned(),
+            head_observation,
+            tool_observation,
+        })
     }
 
     pub(super) fn replace_snapshot_state_windows(
@@ -80,7 +96,7 @@ impl GcSweepSession {
                     // target. Later failures leave journal-owned recovery state.
                     // Unknown or pending owner state never authorizes cleanup.
                     if error.error_code() == "KIO-E-SNAPSHOT-STATE-CHANGED-001"
-                        && !windows_exchange::inspect_pending(&owner)?
+                        && !exchange::inspect_pending(&owner)?
                     {
                         retire_snapshot_state_temporary(
                             &self.kio,
@@ -101,11 +117,11 @@ impl GcSweepSession {
                 return Err(snapshot_auto_state_changed());
             }
             ExchangeExpected {
-                source: windows_exchange::observe(&source, MAX_METADATA)?,
-                target: windows_exchange::observe(&target, MAX_METADATA)?,
+                source: crate::platform::observe_gc_exchange(&source, MAX_METADATA)?,
+                target: crate::platform::observe_gc_exchange(&target, MAX_METADATA)?,
             }
         };
-        let pending = windows_exchange::begin(
+        let pending = crate::platform::begin_gc_exchange(
             &owner,
             &parent,
             SNAPSHOT_AUTO_STATE_LEAF,
@@ -114,7 +130,7 @@ impl GcSweepSession {
             OperationKind::SnapshotState,
             &authority,
             MAX_METADATA,
-            &binding.0,
+            &binding.binding,
             |source, target| {
                 if observe(source)?.1 != *expected || observe(target)?.0 != target_state {
                     return Err(snapshot_auto_state_changed());
@@ -149,7 +165,7 @@ impl GcSweepSession {
             .ok_or_else(|| corrupt("missing snapshot exchange owner"))?;
         let owner = directory(&owner_file)?;
         let parent = directory(&self.kio)?;
-        windows_exchange::validate_pending_authority(&owner, &binding.0)?;
+        crate::platform::validate_pending_gc_exchange_authority(&owner, &binding.binding)?;
         // Atomic-only residue never explains an absent checkpoint: it represents
         // either unpublished intent boot or cleanup after exact source retirement.
         let stable_public = if !owner.contains_entry(Path::new("intent.json"))? {
@@ -160,13 +176,13 @@ impl GcSweepSession {
         } else {
             None
         };
-        if let Some(pending) = windows_exchange::open_pending_under_lock(
+        if let Some(pending) = crate::platform::open_pending_gc_exchange_under_lock(
             &owner,
             &parent,
             &parent,
             OperationKind::SnapshotState,
             MAX_METADATA,
-            &binding.0,
+            &binding.binding,
         )? {
             validate_handles(pending.source(), pending.target())?;
             if self.snapshot_exchange_authority(snapshot, gc_binding)? != binding {

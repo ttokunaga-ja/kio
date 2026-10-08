@@ -2,10 +2,10 @@ use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 
 use super::cas_identity::windows_file_information;
-use crate::cas::{
-    bound_io_or_not_found, ensure_bound_directory, non_regular_object_error,
+use super::identity_logic::{
     same_windows_cas_file_components, same_windows_repair_quarantine_file_components,
 };
+use crate::cas::{bound_io_or_not_found, ensure_bound_directory, non_regular_object_error};
 use crate::error::{IoResultExt, KioError, Result};
 
 /// Windows cannot flush a directory handle. The file body has already been

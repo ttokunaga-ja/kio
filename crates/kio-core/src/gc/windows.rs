@@ -1,7 +1,7 @@
 //! Windows GC mutations keep DELETE authority on the verified victim handle.
 use super::*;
+use crate::platform::gc_io::retire_expected;
 use crate::platform::gc_io::{directory, matches_stable, observe};
-pub(super) use crate::platform::gc_io::{publish_staged, remove_completed_marker, retire_expected};
 use std::fs::File;
 
 impl GcSweepSession {
@@ -153,10 +153,11 @@ impl GcSweepSession {
         marker: &GcInProgressMarker,
         expected: &FileObservation,
     ) -> Result<()> {
-        use windows_exchange::{ExchangeExpected, OperationKind};
+        use crate::gc::exchange::OperationKind;
+        use crate::platform::ExchangeExpected;
         let owner_file = ensure_child_dir(internal, "marker-exchange")?;
         let owner = directory(&owner_file)?;
-        if windows_exchange::inspect_pending(&owner)? {
+        if exchange::inspect_pending(&owner)? {
             return Err(corrupt("GC marker exchange already pending"));
         }
         cleanup_marker_temporaries(markers)?;
@@ -188,11 +189,11 @@ impl GcSweepSession {
                 return Err(corrupt("GC prepared marker changed before exchange"));
             }
             ExchangeExpected {
-                source: windows_exchange::observe(&source, MAX_MARKER_BYTES)?,
-                target: windows_exchange::observe(&target, MAX_MARKER_BYTES)?,
+                source: crate::platform::observe_gc_exchange(&source, MAX_MARKER_BYTES)?,
+                target: crate::platform::observe_gc_exchange(&target, MAX_MARKER_BYTES)?,
             }
         };
-        let pending = windows_exchange::begin(
+        let pending = crate::platform::begin_gc_exchange(
             &owner,
             &public,
             "in_progress",
@@ -209,7 +210,8 @@ impl GcSweepSession {
     }
 
     pub(super) fn recover_marker_windows(&self) -> Result<()> {
-        use windows_exchange::{ExchangeExpected, OperationKind};
+        use crate::gc::exchange::OperationKind;
+        use crate::platform::ExchangeExpected;
         let Some(gc) = open_optional_dir(&self.kio, "gc")? else {
             return Ok(());
         };
@@ -226,7 +228,7 @@ impl GcSweepSession {
             let owner = directory(&owner_file)?;
             let public = directory(&gc)?;
             let prepared = directory(&markers)?;
-            if let Some(pending) = windows_exchange::open_pending_under_lock(
+            if let Some(pending) = crate::platform::open_pending_gc_exchange_under_lock(
                 &owner,
                 &public,
                 &prepared,

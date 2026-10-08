@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 
-use crate::cas::{WindowsFileInformation, same_windows_regular_file_components};
+use super::identity_logic::{WindowsFileInformation, same_windows_regular_file_components};
 
 pub(crate) fn same_windows_regular_file(opened: &File, path: &File) -> bool {
     same_windows_regular_file_components(

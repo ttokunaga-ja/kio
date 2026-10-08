@@ -2,6 +2,7 @@ pub(crate) mod atomic;
 pub(crate) mod cas_identity;
 pub(crate) mod cas_io;
 pub(crate) mod durability;
+pub(crate) mod gc_exchange;
 pub(crate) mod gc_io;
 pub(crate) mod gc_observation;
 pub(crate) mod gc_retirement;

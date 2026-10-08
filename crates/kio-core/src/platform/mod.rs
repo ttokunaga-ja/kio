@@ -10,7 +10,7 @@ mod linux;
 mod macos;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod unix;
-#[cfg(target_os = "windows")]
+#[cfg(any(windows, test))]
 mod windows;
 
 #[cfg(target_os = "macos")]
@@ -77,12 +77,8 @@ pub(crate) use macos::gc_syscalls::{
 };
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::{
-    gc_io::{
-        open_gc_tree_writable as gc_open_tree_writable,
-        open_verified_file_handle as gc_open_verified_handle,
-    },
+    gc_io::open_gc_tree_writable as gc_open_tree_writable,
     gc_retirement::{
-        exchange_capture_verified as gc_exchange_capture_verified,
         exchange_capture_verified_named as gc_exchange_capture_verified_named,
         remove_sentinel_leaf as gc_remove_sentinel_leaf,
         remove_verified_leaf as gc_remove_verified_leaf,
@@ -183,3 +179,35 @@ pub(crate) use macos::lock_exchange::exchange_bound_lock;
 pub(crate) use unix::lock;
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) use windows::lock;
+
+#[cfg(windows)]
+pub use windows::gc_exchange::{
+    ExchangeExpected, ExchangeStep, FileRecord as ExchangeFileRecord, PendingExchange,
+    begin as begin_gc_exchange, observe as observe_gc_exchange,
+    open_pending_under_lock as open_pending_gc_exchange_under_lock,
+    validate_pending_authority as validate_pending_gc_exchange_authority,
+};
+
+#[cfg(windows)]
+pub(crate) use windows::identity_logic::same_windows_repair_quarantine_file_components;
+#[cfg(any(windows, test))]
+pub(crate) use windows::snapshot_logic as gc_snapshot_logic;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::gc_exchange::{
+    atomic_exchange_marker_expected as gc_atomic_exchange_marker_expected,
+    replace_snapshot_state_expected as gc_atomic_replace_snapshot_state_expected,
+};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::gc_exchange::link_count as gc_link_count;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::{
+    gc_exchange::remove_completed_marker as gc_remove_completed_marker,
+    gc_io::publish_staged as gc_publish_staged,
+};
+#[cfg(windows)]
+pub(crate) use windows::gc_io::{
+    publish_staged as gc_publish_staged, remove_completed_marker as gc_remove_completed_marker,
+};

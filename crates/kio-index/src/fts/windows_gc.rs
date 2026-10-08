@@ -5,9 +5,8 @@
 //! binds that journal to the caller's index authority; completing the namespace
 //! protocol does not replace the caller's SQLite generation/attestation checks.
 use super::*;
-use kio_core::gc::windows_exchange::{
-    self as exchange, ExchangeExpected, ExchangeStep, OperationKind,
-};
+use kio_core::gc::exchange::{self as exchange, OperationKind};
+use kio_core::platform::{ExchangeExpected, ExchangeStep, PendingExchange};
 use kio_core::store_dir::StoreDirectory;
 use std::fs::File;
 
@@ -126,7 +125,7 @@ fn parents(kio: &File, authority: &Authority<'_>) -> Result<(StoreDirectory, Sto
 }
 
 fn finish(
-    pending: exchange::PendingExchange<'_>,
+    pending: PendingExchange<'_>,
     authority: &Authority<'_>,
     checkpoint: impl FnMut(ExchangeStep) -> kio_core::Result<()>,
 ) -> Result<()> {
@@ -171,7 +170,7 @@ fn recover_authority(kio: &File, authority: &Authority<'_>) -> Result<bool> {
         return Ok(false);
     }
     let (public, private) = parents(kio, authority)?;
-    let Some(pending) = exchange::open_pending_under_lock(
+    let Some(pending) = kio_core::platform::open_pending_gc_exchange_under_lock(
         &owner,
         &public,
         &private,
@@ -237,13 +236,15 @@ fn exchange_authority(
     .map_err(core_error)?;
     authority.validate_files(&source, &target, true)?;
     let expected = ExchangeExpected {
-        source: exchange::observe(&source, MAX_INDEX_BYTES).map_err(core_error)?,
-        target: exchange::observe(&target, MAX_INDEX_BYTES).map_err(core_error)?,
+        source: kio_core::platform::observe_gc_exchange(&source, MAX_INDEX_BYTES)
+            .map_err(core_error)?,
+        target: kio_core::platform::observe_gc_exchange(&target, MAX_INDEX_BYTES)
+            .map_err(core_error)?,
     };
     drop(target);
     drop(source);
     let owner = owner(kio, true)?.expect("create owner returns directory");
-    let pending = exchange::begin(
+    let pending = kio_core::platform::begin_gc_exchange(
         &owner,
         &public,
         "sqlite.db",

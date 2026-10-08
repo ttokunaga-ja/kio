@@ -541,7 +541,7 @@ fn assert_windows_exchange_owner_clean(path: &Path) {
         "{}",
         path.display()
     );
-    assert!(!kio_core::gc::windows_exchange::inspect_pending(&owner).unwrap());
+    assert!(!kio_core::gc::exchange::inspect_pending(&owner).unwrap());
 }
 
 #[cfg(windows)]
