@@ -16,8 +16,6 @@ use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::ExitCode;
-#[cfg(unix)]
-use crate::cas::lower_hex;
 use crate::cas::{
     CAS_STREAM_BUFFER_BYTES, ContentObjectKind, MAX_RAW_OBJECT_BYTES, ObjectKind, ObjectStore,
     append_jsonl, canonical_json_bytes, is_hash, read_bounded_regular_file,
@@ -50,8 +48,6 @@ use crate::store_dir::StoreDirectory;
 use crate::platform::scope_same_file_identity as same_scope_file_identity;
 
 mod managed_restore;
-#[cfg(windows)]
-mod windows_gate;
 pub(crate) use managed_restore::reject_pending_managed_restore;
 pub use managed_restore::{
     ManagedRestoreChange, ManagedRestoreOutcome, ManagedRestorePlan, ManagedRestoreRequest,
@@ -898,7 +894,7 @@ impl Repository {
         PurgeState::open(&self.kio_dir)
     }
 
-    fn store_directory(&self) -> Result<StoreDirectory> {
+    pub(crate) fn store_directory(&self) -> Result<StoreDirectory> {
         if let Some(kio) = self.bound_kio.as_deref() {
             return StoreDirectory::from_retained(
                 kio.try_clone()
@@ -5317,24 +5313,14 @@ thread_local! {
     /// `purge-publication.lock`) share the same directory-flock open file
     /// description within a thread. This keeps the crash-released gate
     /// reentrant without weakening cross-process serialization.
-    static LOCK_GATE_POOL: RefCell<HashMap<PathBuf, (u32, File)>> = RefCell::new(HashMap::new());
+    #[cfg(unix)]
+    static LOCK_GATE_POOL: RefCell<HashMap<PathBuf, (u32, crate::platform::PathGate)>> = RefCell::new(HashMap::new());
 }
 
 #[cfg(unix)]
-struct LockGate {
+pub(crate) struct LockGate {
     key: PathBuf,
-    _file: File,
-}
-
-#[cfg(unix)]
-fn unlock_flock(file: &File) {
-    use std::os::fd::AsRawFd;
-
-    // Closing the local descriptor is normally sufficient, but a concurrent
-    // fork may retain the same open-file description until its exec boundary.
-    // Explicit unlock releases that shared kernel lock at the logical guard
-    // boundary instead of extending it into the child process transiently.
-    let _ = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    _file: crate::platform::PathGate,
 }
 
 #[cfg(unix)]
@@ -5354,20 +5340,8 @@ impl Drop for LockGate {
             }
         });
         if final_owner {
-            unlock_flock(&self._file);
+            self._file.unlock();
         }
-    }
-}
-
-#[cfg(unix)]
-struct BoundLockGate {
-    file: File,
-}
-
-#[cfg(unix)]
-impl Drop for BoundLockGate {
-    fn drop(&mut self) {
-        unlock_flock(&self.file);
     }
 }
 
@@ -5378,44 +5352,15 @@ impl Drop for BoundLockGate {
 pub struct StoreLock {
     path: PathBuf,
     store_gate: bool,
-    #[cfg(not(windows))]
-    pid: u32,
-    #[cfg(not(windows))]
-    token: String,
     reentrant: bool,
-    #[cfg(unix)]
-    _gate: Option<LockGate>,
-    // Every nested guard owns this lease, including when the first guard is
-    // dropped before the nested one. Rc deliberately prevents cross-thread
-    // transfer of a guard whose reentrancy bookkeeping is thread-local.
-    #[cfg(windows)]
-    _windows_owner: Option<Rc<WindowsLockOwner>>,
-}
-
-#[cfg(windows)]
-struct WindowsLockOwner {
-    _parent: File,
-    owner: Option<File>,
-    gate: Option<windows_gate::Gate>,
-    pid: u32,
-    token: String,
-}
-
-#[cfg(windows)]
-impl Drop for WindowsLockOwner {
-    fn drop(&mut self) {
-        if let Some(owner) = self.owner.take() {
-            let _ = release_windows_owned_lock(&owner, self.pid, &self.token);
-            // Windows disposition is not namespace completion until close.
-            drop(owner);
-        }
-        drop(self.gate.take());
-    }
+    // Windows nested guards share an Rc lease, including when the first guard
+    // drops first. Unix keeps the original outer-owner release condition.
+    native: Option<crate::platform::PathLockLease>,
 }
 
 #[cfg(windows)]
 thread_local! {
-    static WINDOWS_LOCK_OWNERS: RefCell<HashMap<(PathBuf, bool), Weak<WindowsLockOwner>>> = RefCell::new(HashMap::new());
+    static WINDOWS_LOCK_OWNERS: RefCell<HashMap<(PathBuf, bool), Weak<crate::platform::PathLock>>> = RefCell::new(HashMap::new());
 }
 
 impl StoreLock {
@@ -5487,100 +5432,42 @@ impl StoreLock {
             return Ok(Self {
                 path,
                 store_gate: _store_gate,
-                #[cfg(not(windows))]
-                pid,
-                #[cfg(not(windows))]
-                token: String::new(),
                 reentrant: true,
-                #[cfg(unix)]
-                _gate: None,
-                #[cfg(windows)]
-                _windows_owner: owner,
+                native: {
+                    #[cfg(unix)]
+                    {
+                        None
+                    }
+                    #[cfg(windows)]
+                    {
+                        owner
+                    }
+                },
             });
         }
 
-        #[cfg(windows)]
-        {
-            Self::acquire_path_windows(path, pid, _store_gate)
-        }
-
-        #[cfg(not(windows))]
-        {
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).kio_io(parent)?;
-            }
-
-            #[cfg(unix)]
-            let gate = acquire_lock_gate(&path)?;
-
-            let token = new_lock_token(pid);
-            let canonical = canonical_lock_bytes(pid, &token)?;
-            match OpenOptions::new().write(true).create_new(true).open(&path) {
-                Ok(mut file) => {
-                    file.write_all(&canonical).kio_io(&path)?;
-                    file.sync_all().kio_io(&path)?;
-                }
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                    if !reclaim_stale_lock(&path, &canonical)? {
-                        return Err(KioError::locked(path.display().to_string()));
-                    }
-                }
-                Err(err) => return Err(KioError::io(err.to_string(), path.display().to_string())),
-            }
-            LOCK_DEPTH.with(|depth| depth.borrow_mut().insert((path.clone(), _store_gate), 1));
-            Ok(Self {
-                path,
-                store_gate: _store_gate,
-                pid,
-                token,
-                reentrant: false,
-                #[cfg(unix)]
-                _gate: Some(gate),
-            })
-        }
-    }
-
-    /// Windows ordinary writers use retained capability-relative handles. A live
-    /// owner shares READ only, so a second writer cannot open it for DELETE or
-    /// replace it.
-    #[cfg(windows)]
-    fn acquire_path_windows(path: PathBuf, pid: u32, store_gate: bool) -> Result<Self> {
-        let parent = open_windows_lock_parent_kind(&path, !store_gate)?;
-        let gate = if store_gate {
-            validate_bound_store_lock_authority(&parent)?;
-            Some(windows_gate::Gate::acquire(&parent, true)?)
-        } else {
-            None
-        };
-        let leaf = windows_lock_leaf(&path)?;
-        let token = new_lock_token(pid);
-        let canonical = canonical_lock_bytes(pid, &token)?;
-        let owner = match create_windows_lock(&parent, leaf, &canonical) {
-            Ok(owner) => owner,
-            Err(error) if is_windows_lock_contention(&error) => {
-                reclaim_windows_stale_lock(&parent, leaf, &canonical)?
-                    .ok_or_else(|| KioError::locked(path.display().to_string()))?
-            }
-            Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
-        };
-        let owner = Rc::new(WindowsLockOwner {
-            _parent: parent,
-            owner: Some(owner),
-            gate,
+        let native = crate::platform::acquire_path_lock(
+            path.clone(),
             pid,
-            token,
-        });
-        WINDOWS_LOCK_OWNERS.with(|owners| {
-            let mut owners = owners.borrow_mut();
-            owners.retain(|_, owner| owner.strong_count() != 0);
-            owners.insert((path.clone(), store_gate), Rc::downgrade(&owner));
-        });
-        LOCK_DEPTH.with(|depth| depth.borrow_mut().insert((path.clone(), store_gate), 1));
+            _store_gate,
+            validate_bound_store_lock_authority,
+        )?;
+        #[cfg(windows)]
+        let native = {
+            let owner = Rc::new(native);
+            WINDOWS_LOCK_OWNERS.with(|owners| {
+                let mut owners = owners.borrow_mut();
+                owners.retain(|_, owner| owner.strong_count() != 0);
+                owners.insert((path.clone(), _store_gate), Rc::downgrade(&owner));
+            });
+            owner
+        };
+        LOCK_DEPTH.with(|depth| depth.borrow_mut().insert((path.clone(), _store_gate), 1));
         Ok(Self {
             path,
-            store_gate,
+            store_gate: _store_gate,
             reentrant: false,
-            _windows_owner: Some(owner),
+            native: Some(native),
         })
     }
 }
@@ -5598,496 +5485,25 @@ impl Drop for StoreLock {
             }
             false
         });
-        // macOS/Linux exchange rather than check-then-unlink. Windows validates
-        // and deletes only the retained owned handle; it never unlinks a path.
-        #[cfg(not(windows))]
-        if _released && !self.reentrant {
-            let _ = release_ordinary_lock(&self.path, self.pid, &self.token);
-        }
-        #[cfg(windows)]
-        {
-            // The last Rc lease owns disposition, close, then gate unlock.
-            drop(self._windows_owner.take());
-        }
+        crate::platform::finish_path_lock(&mut self.native, _released && !self.reentrant);
         // `gate` drops after the on-disk release operation, and the kernel
         // automatically releases it after a process crash.
     }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
-struct LockFile {
-    pid: u32,
-    token: String,
-    created_at: String,
+pub(crate) struct LockFile {
+    pub(crate) pid: u32,
+    pub(crate) token: String,
+    pub(crate) created_at: String,
 }
 
 /// Reserved owner written by the lock-release exchange protocol. No supported
 /// platform can assign this value to a Kio process; treating it as dead is part
 /// of the on-disk protocol and must not depend on spawning a liveness probe.
-const RELEASED_LOCK_PID: u32 = u32::MAX;
+pub(crate) const RELEASED_LOCK_PID: u32 = u32::MAX;
 
-/// The lock record is deliberately tiny; reject an oversized leaf before
-/// deserializing so a hostile lock path cannot become an unbounded allocation.
-#[cfg(windows)]
-const MAX_WINDOWS_LOCK_BYTES: u64 = 4096;
-
-/// Resolve/create a lock parent from a filesystem root without re-resolving
-/// ambient parents afterwards. `open_dir_nofollow` rejects symlink/reparse
-/// components; the by-handle identity check also rejects junctions.
-#[cfg(all(windows, test))]
-fn open_windows_lock_parent(path: &Path) -> Result<File> {
-    open_windows_lock_parent_kind(path, true)
-}
-
-#[cfg(windows)]
-fn open_windows_lock_parent_kind(path: &Path, create_missing: bool) -> Result<File> {
-    use cap_primitives::{ambient_authority, fs as cap_fs};
-
-    if path
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(KioError::invalid_usage(
-            "lock path must not contain parent traversal",
-        ));
-    }
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-            .join(path)
-    };
-    let parent = absolute
-        .parent()
-        .ok_or_else(|| KioError::invalid_usage("lock path has no parent"))?;
-    let mut root = PathBuf::new();
-    let mut components = Vec::new();
-    for component in parent.components() {
-        match component {
-            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
-            Component::RootDir => root.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::Normal(component) => components.push(component.to_os_string()),
-            Component::ParentDir => {
-                return Err(KioError::invalid_usage(
-                    "lock path must not contain parent traversal",
-                ));
-            }
-        }
-    }
-    if root.as_os_str().is_empty() {
-        return Err(KioError::invalid_usage("lock path must be rooted"));
-    }
-    let mut directory = cap_fs::open_ambient_dir(&root, ambient_authority())
-        .map_err(|error| KioError::io(error.to_string(), root.display().to_string()))?;
-    if crate::platform::directory_handle_identity(&directory).is_none() {
-        return Err(KioError::locked(path.display().to_string()));
-    }
-    for component in components {
-        directory = match cap_fs::open_dir_nofollow(&directory, Path::new(&component)) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
-                // Create only the absent component through its retained parent
-                // with a protected owner-only DACL. Existing ancestors are
-                // neither restricted nor repaired, and the original named
-                // parent handle is consumed rather than kept as an extra alias.
-                let retained = StoreDirectory::from_retained(directory, root.clone())?;
-                match retained.create_directory(Path::new(&component)) {
-                    Ok(created) => created,
-                    Err(error)
-                        if error.error_code() == "KIO-E-STORE-IO-001"
-                            && error.context().get("io_error_kind").and_then(Value::as_str)
-                                == Some("already_exists") =>
-                    {
-                        cap_fs::open_dir_nofollow(&retained.root_handle(), Path::new(&component))
-                            .map_err(|error| {
-                                KioError::io(error.to_string(), path.display().to_string())
-                            })?
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
-        };
-        if crate::platform::directory_handle_identity(&directory).is_none() {
-            return Err(KioError::locked(path.display().to_string()));
-        }
-        root.push(&component);
-    }
-    Ok(directory)
-}
-
-#[cfg(windows)]
-fn windows_lock_leaf(path: &Path) -> Result<&Path> {
-    let leaf = path
-        .file_name()
-        .filter(|leaf| !leaf.is_empty())
-        .map(Path::new)
-        .ok_or_else(|| KioError::invalid_usage("lock path must name a leaf"))?;
-    Ok(leaf)
-}
-
-/// Classify only create/open errors that prove another Windows lock owner may
-/// still control the leaf. Delete failures intentionally remain I/O errors:
-/// they do not establish that a competing lock exists.
-#[cfg(windows)]
-fn is_windows_lock_contention(error: &std::io::Error) -> bool {
-    use windows_sys::Win32::Foundation::{ERROR_LOCK_VIOLATION, ERROR_SHARING_VIOLATION};
-
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::PermissionDenied
-    ) || matches!(
-        error.raw_os_error(),
-        Some(code) if code == ERROR_SHARING_VIOLATION as i32 || code == ERROR_LOCK_VIOLATION as i32
-    )
-}
-
-#[cfg(windows)]
-fn windows_lock_open_options(
-    create_new: bool,
-    access_mode: u32,
-) -> cap_primitives::fs::OpenOptions {
-    use cap_primitives::fs::{FollowSymlinks, OpenOptionsExt};
-    use windows_sys::Win32::Storage::FileSystem::{FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ};
-
-    let mut options = cap_primitives::fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(create_new)
-        .create_new(create_new)
-        .access_mode(access_mode)
-        .share_mode(FILE_SHARE_READ)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        ._cap_fs_ext_follow(FollowSymlinks::No);
-    options
-}
-
-#[cfg(windows)]
-fn create_windows_lock(parent: &File, leaf: &Path, bytes: &[u8]) -> std::io::Result<File> {
-    use cap_primitives::fs as cap_fs;
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, SYNCHRONIZE};
-
-    let options =
-        windows_lock_open_options(true, GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE);
-    let mut file = cap_fs::open(parent, leaf, &options)?;
-    let published = (|| -> std::io::Result<()> {
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        let (record, _) = read_windows_lock(&file).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
-        })?;
-        if canonical_lock_bytes_for(&record).map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string())
-        })? != bytes
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "new Windows lock record differs from its canonical bytes",
-            ));
-        }
-        Ok(())
-    })();
-    if let Err(error) = published {
-        // The create_new handle is the exact object we just created. Do not
-        // unlink a path here: a partial record must not wedge future writers,
-        // and a competing replacement must never be removed.
-        let _ = delete_windows_lock_handle(&file);
-        return Err(error);
-    }
-    Ok(file)
-}
-
-#[cfg(windows)]
-fn read_windows_lock(
-    file: &File,
-) -> Result<(LockFile, crate::platform::RegularFileHandleIdentity)> {
-    let identity = crate::platform::regular_file_handle_identity(file)
-        .ok_or_else(|| KioError::locked("Windows lock leaf is not a single-link regular file"))?;
-    let length = file
-        .metadata()
-        .map_err(|error| KioError::io(error.to_string(), ".lock"))?
-        .len();
-    if length > MAX_WINDOWS_LOCK_BYTES {
-        return Err(KioError::locked(
-            "Windows lock leaf exceeds the bounded record size",
-        ));
-    }
-    let mut reader = file
-        .try_clone()
-        .map_err(|error| KioError::io(error.to_string(), ".lock"))?;
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|error| KioError::io(error.to_string(), ".lock"))?;
-    let mut bytes = Vec::with_capacity(length as usize);
-    reader
-        .read_to_end(&mut bytes)
-        .map_err(|error| KioError::io(error.to_string(), ".lock"))?;
-    if bytes.len() as u64 != length || bytes.len() as u64 > MAX_WINDOWS_LOCK_BYTES {
-        return Err(KioError::locked(
-            "Windows lock leaf changed while being read",
-        ));
-    }
-    let lock: LockFile = serde_json::from_slice(&bytes)
-        .map_err(|_| KioError::locked("Windows lock is malformed"))?;
-    if canonical_lock_bytes_for(&lock)? != bytes
-        || crate::platform::regular_file_handle_identity(file) != Some(identity)
-    {
-        return Err(KioError::locked(
-            "Windows lock is not canonical or changed identity",
-        ));
-    }
-    Ok((lock, identity))
-}
-
-#[cfg(windows)]
-fn delete_windows_lock_handle(file: &File) -> std::io::Result<()> {
-    use std::mem::size_of;
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-        FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx, SetFileInformationByHandle,
-    };
-
-    let info = FILE_DISPOSITION_INFO_EX {
-        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-    };
-    // SAFETY: `info` has the exact Win32 layout and `file` retains DELETE access.
-    if unsafe {
-        SetFileInformationByHandle(
-            file.as_raw_handle(),
-            FileDispositionInfoEx,
-            std::ptr::addr_of!(info).cast(),
-            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
-        )
-    } == 0
-    {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-/// Return a newly owned lock only after deleting the exact retained stale
-/// handle. If a competing writer creates the leaf in the absent interval, it
-/// wins and this caller reports contention without deleting the new object.
-#[cfg(windows)]
-fn reclaim_windows_stale_lock(
-    parent: &File,
-    leaf: &Path,
-    replacement: &[u8],
-) -> Result<Option<File>> {
-    use cap_primitives::fs as cap_fs;
-    use windows_sys::Win32::Foundation::GENERIC_READ;
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, SYNCHRONIZE};
-
-    let options = windows_lock_open_options(false, GENERIC_READ | DELETE | SYNCHRONIZE);
-    let stale = match cap_fs::open(parent, leaf, &options) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) if is_windows_lock_contention(&error) => return Ok(None),
-        Err(error) => return Err(KioError::io(error.to_string(), ".lock")),
-    };
-    let (old, identity) = read_windows_lock(&stale)?;
-    if process_is_alive(old.pid) {
-        return Ok(None);
-    }
-    if crate::platform::regular_file_handle_identity(&stale) != Some(identity) {
-        return Err(KioError::locked("Windows stale lock changed identity"));
-    }
-    delete_windows_lock_handle(&stale).map_err(|error| KioError::io(error.to_string(), ".lock"))?;
-    drop(stale);
-    match create_windows_lock(parent, leaf, replacement) {
-        Ok(file) => Ok(Some(file)),
-        Err(error) if is_windows_lock_contention(&error) => Ok(None),
-        Err(error) => Err(KioError::io(error.to_string(), ".lock")),
-    }
-}
-
-#[cfg(windows)]
-fn release_windows_owned_lock(file: &File, pid: u32, token: &str) -> Result<()> {
-    let (owned, _) = read_windows_lock(file)?;
-    if owned.pid != pid || owned.token != token {
-        return Ok(());
-    }
-    delete_windows_lock_handle(file).map_err(|error| KioError::io(error.to_string(), ".lock"))
-}
-
-#[cfg(unix)]
-fn reclaim_stale_lock(path: &Path, replacement: &[u8]) -> Result<bool> {
-    {
-        let Some(old) = read_lock_snapshot(path)? else {
-            return Ok(false);
-        };
-        if process_is_alive(old.lock.pid) {
-            return Ok(false);
-        }
-        let Some(again) = read_lock_snapshot(path)? else {
-            return Ok(false);
-        };
-        if old != again || process_is_alive(again.lock.pid) {
-            return Ok(false);
-        }
-        let parent = path
-            .parent()
-            .ok_or_else(|| KioError::io("lock path has no parent", path.display().to_string()))?;
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| KioError::locked(path.display().to_string()))?;
-        let temp_name = format!(".{name}.reclaimed-{}-{}", std::process::id(), unix_nanos());
-        let temp = parent.join(&temp_name);
-        let mut temp_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .kio_io(&temp)?;
-        temp_file.write_all(replacement).kio_io(&temp)?;
-        temp_file.sync_all().kio_io(&temp)?;
-        drop(temp_file);
-        let Some(current) = read_lock_snapshot(path)? else {
-            return Ok(false);
-        };
-        if current != old {
-            return Ok(false);
-        }
-        let directory = File::open(parent).kio_io(parent)?;
-        exchange_bound_lock(&directory, name, &directory, &temp_name)?;
-        let expected_replacement = parse_canonical_lock(replacement)?;
-        let active_ok = read_lock_snapshot(path).is_ok_and(|snapshot| {
-            snapshot.is_some_and(|snapshot| {
-                snapshot.bytes == replacement && snapshot.lock == expected_replacement
-            })
-        });
-        let stale_ok =
-            read_lock_snapshot(&temp).is_ok_and(|snapshot| snapshot == Some(old.clone()));
-        if !active_ok || !stale_ok {
-            // Both postconditions must hold before a compensating exchange could
-            // be safe. Retain the names instead: no concurrent replacement is
-            // removed or overwritten by a cleanup attempt.
-            return Err(bound_lock_corrupt(
-                "ordinary stale lock exchange validation failed",
-            ));
-        }
-        fs::remove_file(&temp).kio_io(&temp)?;
-        directory.sync_all().kio_io(parent)?;
-        Ok(true)
-    }
-}
-
-#[cfg(unix)]
-fn release_ordinary_lock(path: &Path, pid: u32, token: &str) -> Result<()> {
-    {
-        let Some(owned) = read_lock_snapshot(path)? else {
-            return Ok(());
-        };
-        if owned.lock.pid != pid || owned.lock.token != token {
-            return Ok(());
-        }
-        let parent = path
-            .parent()
-            .ok_or_else(|| KioError::io("lock path has no parent", path.display().to_string()))?;
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| KioError::locked(path.display().to_string()))?;
-        let temp_name = format!(".{name}.released-{}-{}", std::process::id(), unix_nanos());
-        let temp = parent.join(&temp_name);
-        let sentinel = canonical_lock_bytes(RELEASED_LOCK_PID, &new_lock_token(RELEASED_LOCK_PID))?;
-        let mut temp_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .kio_io(&temp)?;
-        temp_file.write_all(&sentinel).kio_io(&temp)?;
-        temp_file.sync_all().kio_io(&temp)?;
-        drop(temp_file);
-        if read_lock_snapshot(path)? != Some(owned.clone()) {
-            return Ok(());
-        }
-        let directory = File::open(parent).kio_io(parent)?;
-        exchange_bound_lock(&directory, name, &directory, &temp_name)?;
-        let sentinel_lock = parse_canonical_lock(&sentinel)?;
-        let active_ok = read_lock_snapshot(path).is_ok_and(|snapshot| {
-            snapshot.is_some_and(|snapshot| {
-                snapshot.bytes == sentinel && snapshot.lock == sentinel_lock
-            })
-        });
-        let archived_ok = read_lock_snapshot(&temp).is_ok_and(|snapshot| snapshot == Some(owned));
-        if !active_ok || !archived_ok {
-            return Err(bound_lock_corrupt(
-                "ordinary lock release exchange validation failed",
-            ));
-        }
-        fs::remove_file(&temp).kio_io(&temp)?;
-        directory.sync_all().kio_io(parent)
-    }
-}
-
-#[cfg(windows)]
-fn process_is_alive(pid: u32) -> bool {
-    if pid == RELEASED_LOCK_PID {
-        return false;
-    }
-    if pid == std::process::id() {
-        return true;
-    }
-
-    use windows_sys::Win32::Foundation::{
-        CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, STILL_ACTIVE,
-    };
-    use windows_sys::Win32::System::Threading::{
-        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-    };
-
-    // SAFETY: `OpenProcess` is called with a PID read from the lock file and no
-    // inheritable handle. A null handle is never passed to the query/close calls.
-    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-    if process.is_null() {
-        // Windows documents ERROR_INVALID_PARAMETER for a PID that does not name
-        // a process (including PID 0). Access denial and every other query error
-        // are ambiguous, so keep the lock rather than reclaiming a live owner's.
-        return unsafe { GetLastError() } != ERROR_INVALID_PARAMETER;
-    }
-
-    let mut exit_code = 0_u32;
-    // SAFETY: `process` is a valid handle returned by `OpenProcess`, and
-    // `exit_code` points to writable storage for the duration of the call.
-    let queried = unsafe { GetExitCodeProcess(process, &mut exit_code) } != 0;
-    // SAFETY: this function owns the process handle and closes it exactly once.
-    let _ = unsafe { CloseHandle(process) };
-
-    // A query failure is ambiguous. Conservatively retain the lock; otherwise,
-    // STILL_ACTIVE is the documented marker for a process that has not exited.
-    !queried || exit_code == STILL_ACTIVE as u32
-}
-
-#[cfg(unix)]
-fn process_is_alive(pid: u32) -> bool {
-    if pid == RELEASED_LOCK_PID {
-        return false;
-    }
-    if pid == std::process::id() {
-        return true;
-    }
-
-    // PID zero names a process group rather than a process, and values above
-    // pid_t's positive range cannot name a Unix process.
-    if pid == 0 || pid > libc::pid_t::MAX as u32 {
-        return false;
-    }
-    // SAFETY: signal zero performs no delivery. ESRCH is the sole definite
-    // absence result; EPERM and every other error are conservatively live.
-    if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
-        true
-    } else {
-        std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-    }
-}
-
-fn new_lock_token(pid: u32) -> String {
+pub(crate) fn new_lock_token(pid: u32) -> String {
     let seed = format!(
         "{pid}:{}:{}",
         unix_nanos(),
@@ -6098,9 +5514,7 @@ fn new_lock_token(pid: u32) -> String {
 }
 
 #[cfg(unix)]
-fn acquire_lock_gate(lock_path: &Path) -> Result<LockGate> {
-    use std::os::fd::AsRawFd;
-
+pub(crate) fn acquire_lock_gate(lock_path: &Path) -> Result<LockGate> {
     let parent = lock_path
         .parent()
         .ok_or_else(|| KioError::io("lock path has no parent", lock_path.display().to_string()))?;
@@ -6114,20 +5528,7 @@ fn acquire_lock_gate(lock_path: &Path) -> Result<LockGate> {
     }) {
         return Ok(LockGate { key, _file: cloned });
     }
-    let gate = File::open(parent).kio_io(parent)?;
-    // SAFETY: `gate` stays owned by the returned File until the lock guard is
-    // dropped. LOCK_NB prevents a path operation from waiting while another
-    // writer owns the same store protocol.
-    if unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK)) {
-            return Err(KioError::locked(lock_path.display().to_string()));
-        }
-        return Err(KioError::io(
-            error.to_string(),
-            lock_path.display().to_string(),
-        ));
-    }
+    let gate = crate::platform::PathGate::acquire(parent, lock_path)?;
     let pooled = gate.try_clone().kio_io(parent)?;
     LOCK_GATE_POOL.with(|pool| {
         pool.borrow_mut().insert(key.clone(), (1, pooled));
@@ -6135,167 +5536,31 @@ fn acquire_lock_gate(lock_path: &Path) -> Result<LockGate> {
     Ok(LockGate { key, _file: gate })
 }
 
-#[cfg(unix)]
-fn bound_lock_corrupt(message: impl Into<String>) -> KioError {
-    KioError::new(
-        "KIO-E-STORE-CORRUPT-001",
-        message,
-        json!({}),
-        ExitCode::PermanentFailure,
-    )
-}
-
-#[cfg(unix)]
-fn bound_lock_io(error: std::io::Error, path: impl Into<String>) -> KioError {
-    let kind = match error.kind() {
-        std::io::ErrorKind::AlreadyExists => "already_exists",
-        std::io::ErrorKind::NotFound => "not_found",
-        _ => "other",
-    };
-    KioError::new(
-        "KIO-E-STORE-IO-001",
-        error.to_string(),
-        json!({"path": path.into(), "io_error_kind": kind}),
-        ExitCode::Failure,
-    )
-}
-
 /// A descriptor-relative owner of the ordinary `.kio/.lock` protocol.
-///
-/// This is intentionally separate from [`StoreLock`]'s path/reentrancy
-/// convenience wrapper: GC has already retained the `.kio` directory and must
-/// never re-resolve that public path while it obtains or releases its writer
-/// barrier.  The bytes are nevertheless exactly the same `LockFile` JSON, so
-/// ordinary writers and a recovered GC process contend on one lock leaf.
-#[cfg(unix)]
+/// Common writer authority and same-thread leases wrap its selected native inner.
 pub struct BoundStoreLock {
-    kio: File,
-    _gate: BoundLockGate,
-    locks: File,
-    pid: u32,
-    token: String,
-    owned: BoundLockObservation,
-    bytes: Vec<u8>,
+    _native: crate::platform::BoundLock,
 }
-
-/// A mutation-free reader barrier over the same retained `.kio` directory
-/// gate used by every cooperating writer. Unlike [`BoundStoreLock`], this
-/// guard never creates, reclaims, exchanges, or removes `.kio/.lock`.
-#[cfg(unix)]
+/// A mutation-free shared reader barrier over the retained `.kio` capability.
 pub(crate) struct BoundStoreReadGuard {
-    kio: File,
-    _gate: BoundLockGate,
-    initial_lock: Option<(Vec<u8>, BoundLockObservation)>,
+    native: crate::platform::ReadGate,
 }
-
-#[cfg(unix)]
 impl BoundStoreReadGuard {
-    /// Recheck the public lock leaf while the shared kernel gate remains held.
-    /// A byte-identical dead release sentinel is harmless; a live owner or any
-    /// replacement is an uncertain writer boundary and therefore retryable.
     pub(crate) fn recheck_idle(&self) -> Result<()> {
-        let current = match read_bound_lock(&self.kio, ".lock") {
-            Ok((bytes, observation)) => {
-                let lock =
-                    parse_canonical_lock(&bytes).map_err(|_| KioError::locked(".kio/.lock"))?;
-                if lock.pid != RELEASED_LOCK_PID {
-                    return Err(KioError::locked(".kio/.lock"));
-                }
-                Some((bytes, observation))
-            }
-            Err(error) if bound_is_not_found(&error) => None,
-            Err(error) => return Err(error),
-        };
-        if current != self.initial_lock {
-            return Err(KioError::locked(".kio/.lock"));
-        }
-        Ok(())
+        self.native.recheck_idle()
     }
 }
-
-/// Acquire a shared, non-blocking reader gate on the retained `.kio`
-/// capability. This is the read-only counterpart of the writers' exclusive
-/// directory `flock`; it deliberately has no pathname or lock-file mutation.
-#[cfg(unix)]
-pub(crate) fn acquire_bound_store_read_guard(kio: &File) -> Result<BoundStoreReadGuard> {
+pub(crate) fn acquire_bound_store_lock(kio: &File) -> Result<BoundStoreLock> {
     validate_bound_store_lock_authority(kio)?;
-    use std::os::fd::AsRawFd;
-
-    let gate = open_bound_directory_for_io(kio, Path::new(".kio"))?;
-    // SAFETY: `gate` is owned by the returned guard, names the retained `.kio`
-    // directory, and outlives every inventory read protected by this lock.
-    if unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK)) {
-            return Err(KioError::locked(".kio/.lock"));
-        }
-        return Err(KioError::io(error.to_string(), ".kio"));
-    }
-    let gate = BoundLockGate { file: gate };
-    let initial_lock = match read_bound_lock(kio, ".lock") {
-        Ok((bytes, observation)) => {
-            let lock = parse_canonical_lock(&bytes).map_err(|_| KioError::locked(".kio/.lock"))?;
-            if lock.pid != RELEASED_LOCK_PID {
-                return Err(KioError::locked(".kio/.lock"));
-            }
-            Some((bytes, observation))
-        }
-        Err(error) if bound_is_not_found(&error) => None,
-        Err(error) => return Err(error),
-    };
-    Ok(BoundStoreReadGuard {
-        kio: kio
-            .try_clone()
-            .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
-        _gate: gate,
-        initial_lock,
+    Ok(BoundStoreLock {
+        _native: crate::platform::acquire_bound_lock(kio, true)?,
     })
 }
-
-#[cfg(windows)]
-pub(crate) struct BoundStoreReadGuard {
-    kio: File,
-    gate: windows_gate::Gate,
-    initial_lock: Option<windows_gate::IdleLock>,
-}
-
-#[cfg(windows)]
-impl BoundStoreReadGuard {
-    pub(crate) fn recheck_idle(&self) -> Result<()> {
-        self.gate.recheck(&self.kio)?;
-        if windows_gate::idle_lock(&self.kio)? != self.initial_lock {
-            return Err(KioError::locked(".kio/.lock"));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(windows)]
 pub(crate) fn acquire_bound_store_read_guard(kio: &File) -> Result<BoundStoreReadGuard> {
     validate_bound_store_lock_authority(kio)?;
-    let gate = windows_gate::Gate::acquire(kio, false)?;
-    let initial_lock = windows_gate::idle_lock(kio)?;
-    let guard = BoundStoreReadGuard {
-        kio: kio
-            .try_clone()
-            .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
-        gate,
-        initial_lock,
-    };
-    guard.recheck_idle()?;
-    Ok(guard)
-}
-
-/// Windows and other non-Unix platforms deliberately expose the same type so
-/// the GC state machine remains portable, but do not provide a path-based
-/// substitute for descriptor-relative no-follow locking.
-#[cfg(windows)]
-pub struct BoundStoreLock {
-    _kio: File,
-    owner: Option<File>,
-    gate: Option<windows_gate::Gate>,
-    pid: u32,
-    token: String,
+    Ok(BoundStoreReadGuard {
+        native: crate::platform::acquire_bound_read_gate(kio)?,
+    })
 }
 
 /// A same-thread lease of the descriptor-relative `.kio/.lock` owner.  The
@@ -6332,40 +5597,11 @@ pub type BoundReentrantStoreLock = RetainedStoreLock;
 #[derive(Clone, PartialEq, Eq)]
 struct BoundLeaseIdentity {
     store_gate: bool,
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-    #[cfg(windows)]
     identity: crate::platform::DirectoryHandleIdentity,
 }
 
 thread_local! {
     static BOUND_STORE_LEASES: RefCell<Vec<(BoundLeaseIdentity, Weak<BoundStoreLock>)>> = const { RefCell::new(Vec::new()) };
-}
-
-fn bound_lease_identity(kio: &File, store_gate: bool) -> Result<BoundLeaseIdentity> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let metadata = kio
-            .metadata()
-            .map_err(|error| KioError::io(error.to_string(), ".kio"))?;
-        Ok(BoundLeaseIdentity {
-            store_gate,
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        let identity = crate::platform::directory_handle_identity(kio)
-            .ok_or_else(|| KioError::locked(".kio"))?;
-        Ok(BoundLeaseIdentity {
-            identity,
-            store_gate,
-        })
-    }
 }
 
 /// Acquire or share the physical lock only for the same retained directory
@@ -6376,8 +5612,14 @@ pub(crate) fn acquire_retained_store_lock(kio: &File) -> Result<RetainedStoreLoc
     acquire_retained_lock_kind(kio, true)
 }
 
-fn acquire_retained_lock_kind(kio: &File, _store_gate: bool) -> Result<RetainedStoreLock> {
-    let identity = bound_lease_identity(kio, _store_gate)?;
+pub(crate) fn acquire_retained_lock_kind(
+    kio: &File,
+    _store_gate: bool,
+) -> Result<RetainedStoreLock> {
+    let identity = BoundLeaseIdentity {
+        store_gate: _store_gate,
+        identity: crate::platform::directory_lease_identity(kio)?,
+    };
     if let Some(owner) = BOUND_STORE_LEASES.with(|leases| {
         let mut leases = leases.borrow_mut();
         leases.retain(|(_, owner)| owner.strong_count() != 0);
@@ -6387,10 +5629,12 @@ fn acquire_retained_lock_kind(kio: &File, _store_gate: bool) -> Result<RetainedS
     }) {
         return Ok(RetainedStoreLock { _owner: owner });
     }
-    #[cfg(windows)]
-    let owner = Rc::new(acquire_bound_lock_windows(kio, _store_gate)?);
-    #[cfg(unix)]
-    let owner = Rc::new(acquire_bound_lock_unix(kio, _store_gate)?);
+    if _store_gate {
+        validate_bound_store_lock_authority(kio)?;
+    }
+    let owner = Rc::new(BoundStoreLock {
+        _native: crate::platform::acquire_bound_lock(kio, _store_gate)?,
+    });
     BOUND_STORE_LEASES.with(|leases| leases.borrow_mut().push((identity, Rc::downgrade(&owner))));
     Ok(RetainedStoreLock { _owner: owner })
 }
@@ -6399,224 +5643,7 @@ pub(crate) fn acquire_bound_reentrant_store_lock(kio: &File) -> Result<BoundReen
     acquire_retained_store_lock(kio)
 }
 
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct BoundLockObservation {
-    dev: u64,
-    ino: u64,
-    len: u64,
-    digest: String,
-}
-
-#[cfg(unix)]
-const MAX_BOUND_LOCK_BYTES: u64 = 4096;
-
-#[cfg(unix)]
-pub(crate) fn acquire_bound_store_lock(kio: &File) -> Result<BoundStoreLock> {
-    acquire_bound_lock_unix(kio, true)
-}
-
-#[cfg(unix)]
-fn acquire_bound_lock_unix(kio: &File, store_gate: bool) -> Result<BoundStoreLock> {
-    if store_gate {
-        validate_bound_store_lock_authority(kio)?;
-    }
-    let gate = acquire_bound_lock_gate(kio)?;
-    let pid = std::process::id();
-    let token = new_lock_token(pid);
-    let bytes = canonical_lock_bytes(pid, &token)?;
-    // Every fallible resource needed by `BoundStoreLock::drop` is prepared
-    // before the authoritative lock is published.  In particular, a broken
-    // Generic `.kio/internal/locks` setup must not turn a failed acquisition into a live lock
-    // that no guard owns to release.  Inspect the current entry first so a
-    // live ordinary writer sees no GC-internal directory creation.
-    preflight_bound_lock_entry(kio)?;
-    let retained_kio = kio
-        .try_clone()
-        .map_err(|e| KioError::io(e.to_string(), ".kio"))?;
-    let locks = bound_lock_archive_dir(kio)?;
-
-    match create_bound_lock(kio, ".lock", &bytes) {
-        Ok(owned) => Ok(BoundStoreLock {
-            kio: retained_kio,
-            _gate: gate,
-            locks,
-            pid,
-            token,
-            owned,
-            bytes,
-        }),
-        Err(error) if bound_is_exists(&error) => {
-            if let Some(owned) = reclaim_stale_bound_lock(kio, &locks, &bytes)? {
-                Ok(BoundStoreLock {
-                    kio: retained_kio,
-                    _gate: gate,
-                    locks,
-                    pid,
-                    token,
-                    owned,
-                    bytes,
-                })
-            } else {
-                Err(KioError::locked(".kio/.lock"))
-            }
-        }
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(windows)]
-pub(crate) fn acquire_bound_store_lock(kio: &File) -> Result<BoundStoreLock> {
-    acquire_bound_lock_windows(kio, true)
-}
-
-#[cfg(windows)]
-fn acquire_bound_lock_windows(kio: &File, store_gate: bool) -> Result<BoundStoreLock> {
-    if store_gate {
-        validate_bound_store_lock_authority(kio)?;
-    }
-    let gate = if store_gate {
-        Some(windows_gate::Gate::acquire(kio, true)?)
-    } else {
-        None
-    };
-    if crate::platform::directory_handle_identity(kio).is_none() {
-        return Err(KioError::locked(
-            "retained .kio is not an ordinary directory",
-        ));
-    }
-    let retained = kio
-        .try_clone()
-        .map_err(|error| KioError::io(error.to_string(), ".kio"))?;
-    let pid = std::process::id();
-    let token = new_lock_token(pid);
-    let bytes = canonical_lock_bytes(pid, &token)?;
-    let leaf = Path::new(".lock");
-    let owner = match create_windows_lock(&retained, leaf, &bytes) {
-        Ok(owner) => owner,
-        Err(error) if is_windows_lock_contention(&error) => {
-            reclaim_windows_stale_lock(&retained, leaf, &bytes)?
-                .ok_or_else(|| KioError::locked(".kio/.lock"))?
-        }
-        Err(error) => return Err(KioError::io(error.to_string(), ".kio/.lock")),
-    };
-    Ok(BoundStoreLock {
-        _kio: retained,
-        owner: Some(owner),
-        gate,
-        pid,
-        token,
-    })
-}
-
-#[cfg(windows)]
-impl Drop for BoundStoreLock {
-    fn drop(&mut self) {
-        // The owner handle denies replacement and retains DELETE access. The
-        // release routine checks its token and deletes that exact object.
-        if let Some(owner) = self.owner.take() {
-            let _ = release_windows_owned_lock(&owner, self.pid, &self.token);
-            drop(owner);
-        }
-        drop(self.gate.take());
-    }
-}
-
-#[cfg(unix)]
-fn preflight_bound_lock_entry(kio: &File) -> Result<()> {
-    match read_bound_lock(kio, ".lock") {
-        Ok((bytes, _)) => {
-            let lock = parse_canonical_lock(&bytes).map_err(|_| KioError::locked(".kio/.lock"))?;
-            if process_is_alive(lock.pid) {
-                return Err(KioError::locked(".kio/.lock"));
-            }
-            // A dead, exact entry is re-read by the reclaim routine below
-            // before it is exchanged.  Its presence authorizes preparing the
-            // private archive capability; it does not authorize deletion.
-            Ok(())
-        }
-        Err(error) if bound_is_not_found(&error) => Ok(()),
-        Err(error) => Err(error),
-    }
-}
-
-#[cfg(unix)]
-fn acquire_bound_lock_gate(kio: &File) -> Result<BoundLockGate> {
-    use std::os::fd::AsRawFd;
-
-    // `try_clone` shares an open-file description with the caller on Unix;
-    // that would keep flock held by the retained session FD after this guard
-    // drops. Re-open `.` capability-relatively to obtain an independent
-    // description while staying inside the already-bound `.kio` directory.
-    let gate = open_bound_directory_for_io(kio, Path::new(".kio"))?;
-    // SAFETY: this retained descriptor names the same `.kio` directory used
-    // for every later capability-relative operation and outlives the lock.
-    if unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-        let error = std::io::Error::last_os_error();
-        if matches!(error.raw_os_error(), Some(libc::EWOULDBLOCK)) {
-            return Err(KioError::locked(".kio/.lock"));
-        }
-        return Err(KioError::io(error.to_string(), ".kio"));
-    }
-    Ok(BoundLockGate { file: gate })
-}
-
-#[cfg(unix)]
-impl Drop for BoundStoreLock {
-    fn drop(&mut self) {
-        let Ok((bytes, observed)) = read_bound_lock(&self.kio, ".lock") else {
-            return;
-        };
-        if bytes != self.bytes
-            || observed != self.owned
-            || !parse_canonical_lock(&bytes)
-                .map(|lock| lock.pid == self.pid && lock.token == self.token)
-                .unwrap_or(false)
-        {
-            return;
-        }
-        // Never create an absent-lock window and never move an entry that may
-        // have replaced ours after the check above. Exchange our lock with a
-        // canonical, deliberately dead release sentinel, then verify both
-        // sides. The next writer reclaims that sentinel through the ordinary
-        // stale-lock protocol. This is conservative (the lock may outlive this
-        // guard briefly) but cannot remove a concurrent owner's replacement.
-        let archive = bound_lock_name("released");
-        let released_pid = RELEASED_LOCK_PID;
-        let released_token = new_lock_token(released_pid);
-        let Ok(released_bytes) = canonical_lock_bytes(released_pid, &released_token) else {
-            return;
-        };
-        let Ok(released) = create_bound_lock(&self.locks, &archive, &released_bytes) else {
-            return;
-        };
-        if !read_bound_lock(&self.kio, ".lock")
-            .is_ok_and(|(actual, state)| actual == self.bytes && state == self.owned)
-        {
-            return;
-        }
-        if exchange_bound_lock(&self.kio, ".lock", &self.locks, &archive).is_err() {
-            return;
-        }
-        let old_ok = read_bound_lock(&self.locks, &archive)
-            .is_ok_and(|(actual, state)| actual == self.bytes && state == self.owned);
-        let released_ok = read_bound_lock(&self.kio, ".lock")
-            .is_ok_and(|(actual, state)| actual == released_bytes && state == released);
-        if !old_ok || !released_ok {
-            // Do not attempt a compensating exchange unless both entries are
-            // still exact; in the mismatch branch that is intentionally never
-            // true. Leaving a lock entry is fail-closed.
-            return;
-        }
-        if cap_primitives::fs::remove_file(&self.locks, Path::new(&archive)).is_err() {
-            return;
-        }
-        let _ = sync_bound_directory(&self.kio, ".lock");
-        let _ = sync_bound_directory(&self.locks, &archive);
-    }
-}
-
-fn canonical_lock_bytes(pid: u32, token: &str) -> Result<Vec<u8>> {
+pub(crate) fn canonical_lock_bytes(pid: u32, token: &str) -> Result<Vec<u8>> {
     let lock = LockFile {
         pid,
         token: token.to_owned(),
@@ -6625,360 +5652,8 @@ fn canonical_lock_bytes(pid: u32, token: &str) -> Result<Vec<u8>> {
     serde_json::to_vec(&lock).map_err(|error| KioError::io(error.to_string(), ".kio/.lock"))
 }
 
-#[cfg(unix)]
-fn parse_canonical_lock(bytes: &[u8]) -> Result<LockFile> {
-    let lock: LockFile =
-        serde_json::from_slice(bytes).map_err(|_| KioError::locked(".kio/.lock"))?;
-    if canonical_lock_bytes_for(&lock)? != bytes {
-        return Err(KioError::locked(".kio/.lock"));
-    }
-    Ok(lock)
-}
-
-fn canonical_lock_bytes_for(lock: &LockFile) -> Result<Vec<u8>> {
+pub(crate) fn canonical_lock_bytes_for(lock: &LockFile) -> Result<Vec<u8>> {
     serde_json::to_vec(lock).map_err(|error| KioError::io(error.to_string(), ".kio/.lock"))
-}
-
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct LockSnapshot {
-    lock: LockFile,
-    bytes: Vec<u8>,
-    dev: u64,
-    ino: u64,
-    len: u64,
-    digest: String,
-}
-
-/// Strict ordinary-lock read used solely by stale recovery. The path based
-/// API needs this one retained file descriptor check before its atomic
-/// exchange; it never unlinks a name after a best-effort string comparison.
-#[cfg(unix)]
-fn read_lock_snapshot(path: &Path) -> Result<Option<LockSnapshot>> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-    let before = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
-    };
-    if !before.file_type().is_file() || before.nlink() != 1 || before.len() > MAX_BOUND_LOCK_BYTES {
-        return Err(KioError::locked(path.display().to_string()));
-    }
-    let mut file = match OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
-    };
-    let opened = file.metadata().kio_io(path)?;
-    if opened.dev() != before.dev() || opened.ino() != before.ino() || opened.len() != before.len()
-    {
-        return Err(bound_lock_corrupt("ordinary lock changed while opening"));
-    }
-    let mut bytes = Vec::with_capacity(opened.len() as usize);
-    (&mut file)
-        .take(MAX_BOUND_LOCK_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .kio_io(path)?;
-    let after = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
-    };
-    if bytes.len() as u64 != opened.len()
-        || after.dev() != opened.dev()
-        || after.ino() != opened.ino()
-        || after.len() != opened.len()
-    {
-        return Err(bound_lock_corrupt("ordinary lock changed while reading"));
-    }
-    let lock = parse_canonical_lock(&bytes)?;
-    Ok(Some(LockSnapshot {
-        lock,
-        digest: lower_hex(&Sha256::digest(&bytes)),
-        bytes,
-        dev: opened.dev(),
-        ino: opened.ino(),
-        len: opened.len(),
-    }))
-}
-
-#[cfg(unix)]
-fn open_bound_directory_for_io(directory: &File, label: impl AsRef<Path>) -> Result<File> {
-    use cap_primitives::fs::{self as cap_fs, MetadataExt};
-
-    let label = label.as_ref();
-    let expected = cap_fs::Metadata::from_file(directory)
-        .map_err(|error| KioError::io(error.to_string(), label.display().to_string()))?;
-    if !expected.is_dir() {
-        return Err(unsafe_store_error(label, "retained directory changed type"));
-    }
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let syncable = cap_fs::open(directory, Path::new("."), &options)
-        .map_err(|error| KioError::io(error.to_string(), label.display().to_string()))?;
-    let observed = cap_fs::Metadata::from_file(&syncable)
-        .map_err(|error| KioError::io(error.to_string(), label.display().to_string()))?;
-    if !observed.is_dir() || observed.dev() != expected.dev() || observed.ino() != expected.ino() {
-        return Err(unsafe_store_error(
-            label,
-            "retained directory changed while reopening",
-        ));
-    }
-    Ok(syncable)
-}
-
-#[cfg(unix)]
-fn sync_bound_directory(directory: &File, label: impl AsRef<Path>) -> Result<()> {
-    let label = label.as_ref();
-    open_bound_directory_for_io(directory, label)?
-        .sync_all()
-        .map_err(|error| KioError::io(error.to_string(), label.display().to_string()))
-}
-
-#[cfg(unix)]
-fn bound_lock_archive_dir(kio: &File) -> Result<File> {
-    use cap_primitives::fs as cap_fs;
-    fn ensure(parent: &File, leaf: &str) -> Result<File> {
-        use cap_primitives::fs as cap_fs;
-        match cap_fs::open_dir_nofollow(parent, Path::new(leaf)) {
-            Ok(dir) => Ok(dir),
-            Err(_) => {
-                cap_fs::create_dir(parent, Path::new(leaf), &cap_fs::DirOptions::new())
-                    .map_err(|e| KioError::io(e.to_string(), leaf))?;
-                let dir = cap_fs::open_dir_nofollow(parent, Path::new(leaf))
-                    .map_err(|e| KioError::io(e.to_string(), leaf))?;
-                sync_bound_directory(parent, leaf)?;
-                Ok(dir)
-            }
-        }
-    }
-    // Stale writer-lock archival is generic store plumbing, never GC state:
-    // normal writer acquisition must not create a `gc/` namespace.
-    let internal = ensure(kio, "internal")?;
-    let locks = ensure(&internal, "locks")?;
-    // Re-open validation is descriptor-relative; `ensure` never follows a
-    // public path and refuses a non-directory/reparse child.
-    let _ = cap_fs::read_base_dir(&locks).map_err(|e| KioError::io(e.to_string(), "locks"))?;
-    Ok(locks)
-}
-
-#[cfg(unix)]
-fn create_bound_lock(kio: &File, leaf: &str, bytes: &[u8]) -> Result<BoundLockObservation> {
-    use cap_primitives::fs as cap_fs;
-    let mut options = cap_fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut file =
-        cap_fs::open(kio, Path::new(leaf), &options).map_err(|e| bound_lock_io(e, leaf))?;
-    file.write_all(bytes)
-        .map_err(|e| KioError::io(e.to_string(), leaf))?;
-    file.sync_all()
-        .map_err(|e| KioError::io(e.to_string(), leaf))?;
-    drop(file);
-    let (actual, observed) = read_bound_lock(kio, leaf)?;
-    if actual != bytes || parse_canonical_lock(&actual).is_err() {
-        return Err(bound_lock_corrupt("GC lock changed after creation"));
-    }
-    sync_bound_directory(kio, leaf)?;
-    Ok(observed)
-}
-
-#[cfg(unix)]
-fn read_bound_lock(kio: &File, leaf: &str) -> Result<(Vec<u8>, BoundLockObservation)> {
-    use cap_primitives::fs::{self as cap_fs, MetadataExt};
-    let path = Path::new(leaf);
-    let before =
-        cap_fs::stat(kio, path, cap_fs::FollowSymlinks::No).map_err(|e| bound_lock_io(e, leaf))?;
-    validate_bound_lock_meta(&before)?;
-    let mut options = cap_fs::OpenOptions::new();
-    options.read(true);
-    options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut file = cap_fs::open(kio, path, &options).map_err(|e| bound_lock_io(e, leaf))?;
-    let opened =
-        cap_fs::Metadata::from_file(&file).map_err(|e| KioError::io(e.to_string(), leaf))?;
-    validate_bound_lock_meta(&opened)?;
-    if before.dev() != opened.dev() || before.ino() != opened.ino() || before.len() != opened.len()
-    {
-        return Err(bound_lock_corrupt("GC lock changed while opening"));
-    }
-    let mut bytes = Vec::with_capacity(opened.len() as usize);
-    (&mut file)
-        .take(MAX_BOUND_LOCK_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|e| KioError::io(e.to_string(), leaf))?;
-    let after =
-        cap_fs::stat(kio, path, cap_fs::FollowSymlinks::No).map_err(|e| bound_lock_io(e, leaf))?;
-    validate_bound_lock_meta(&after)?;
-    if bytes.len() as u64 != opened.len()
-        || after.dev() != opened.dev()
-        || after.ino() != opened.ino()
-        || after.len() != opened.len()
-    {
-        return Err(bound_lock_corrupt("GC lock changed while reading"));
-    }
-    Ok((
-        bytes.clone(),
-        BoundLockObservation {
-            dev: opened.dev(),
-            ino: opened.ino(),
-            len: opened.len(),
-            digest: lower_hex(&Sha256::digest(&bytes)),
-        },
-    ))
-}
-
-#[cfg(unix)]
-fn validate_bound_lock_meta(metadata: &cap_primitives::fs::Metadata) -> Result<()> {
-    use cap_primitives::fs::MetadataExt;
-    if !metadata.is_file() || metadata.len() > MAX_BOUND_LOCK_BYTES || metadata.nlink() != 1 {
-        return Err(bound_lock_corrupt("invalid GC lock entry"));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn reclaim_stale_bound_lock(
-    kio: &File,
-    locks: &File,
-    own_bytes: &[u8],
-) -> Result<Option<BoundLockObservation>> {
-    let (old_bytes, old) = match read_bound_lock(kio, ".lock") {
-        Ok(value) => value,
-        Err(error) if error.error_code() == "KIO-E-STORE-IO-001" => return Ok(None),
-        Err(error) => return Err(error),
-    };
-    let old_lock = match parse_canonical_lock(&old_bytes) {
-        Ok(lock) => lock,
-        Err(_) => return Ok(None),
-    };
-    if process_is_alive(old_lock.pid) {
-        return Ok(None);
-    }
-    // Read it twice before publishing a replacement. A same-content rename is
-    // observable through identity and never reclaimed as our stale lock.
-    let (again_bytes, again) = read_bound_lock(kio, ".lock")?;
-    if again_bytes != old_bytes || again != old || process_is_alive(old_lock.pid) {
-        return Ok(None);
-    }
-    let archive = bound_lock_name("stale");
-    let new = create_bound_lock(locks, &archive, own_bytes)?;
-    let source_unchanged = read_bound_lock(kio, ".lock")
-        .is_ok_and(|(bytes, observed)| bytes == old_bytes && observed == old);
-    if !source_unchanged {
-        // The unpublished temporary is retained rather than check-then-unlinking
-        // a name which a hostile writer could replace in the final gap.
-        return Ok(None);
-    }
-    exchange_bound_lock(kio, ".lock", locks, &archive)?;
-    let old_ok = read_bound_lock(locks, &archive)
-        .is_ok_and(|(bytes, observed)| bytes == old_bytes && observed == old);
-    let new_ok = read_bound_lock(kio, ".lock")
-        .is_ok_and(|(bytes, observed)| bytes == own_bytes && observed == new);
-    if !old_ok || !new_ok {
-        // Never exchange back after a failed postcondition: at least one name
-        // no longer designates the expected object, so rollback could move a
-        // concurrent owner's entry. The canonical lock remains fail-closed.
-        return Err(bound_lock_corrupt(
-            "GC stale lock exchange validation failed",
-        ));
-    }
-    cap_primitives::fs::remove_file(locks, Path::new(&archive))
-        .map_err(|e| KioError::io(e.to_string(), &archive))?;
-    sync_bound_directory(kio, ".lock")?;
-    sync_bound_directory(locks, &archive)?;
-    Ok(Some(new))
-}
-
-#[cfg(unix)]
-fn bound_lock_name(prefix: &str) -> String {
-    format!("{prefix}-{}-{}", std::process::id(), unix_nanos())
-}
-
-#[cfg(unix)]
-fn bound_is_exists(error: &KioError) -> bool {
-    error.error_code() == "KIO-E-STORE-IO-001"
-        && error
-            .context()
-            .get("io_error_kind")
-            .and_then(serde_json::Value::as_str)
-            == Some("already_exists")
-}
-
-#[cfg(unix)]
-fn bound_is_not_found(error: &KioError) -> bool {
-    error.error_code() == "KIO-E-STORE-IO-001"
-        && error
-            .context()
-            .get("io_error_kind")
-            .and_then(serde_json::Value::as_str)
-            == Some("not_found")
-}
-
-#[cfg(target_os = "macos")]
-fn exchange_bound_lock(left_dir: &File, left: &str, right_dir: &File, right: &str) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    let left = CString::new(left).map_err(|_| bound_lock_corrupt("invalid GC lock name"))?;
-    let right = CString::new(right).map_err(|_| bound_lock_corrupt("invalid GC lock name"))?;
-    unsafe extern "C" {
-        fn renameatx_np(
-            a: libc::c_int,
-            b: *const libc::c_char,
-            c: libc::c_int,
-            d: *const libc::c_char,
-            flags: libc::c_uint,
-        ) -> libc::c_int;
-    }
-    if unsafe {
-        renameatx_np(
-            left_dir.as_raw_fd(),
-            left.as_ptr(),
-            right_dir.as_raw_fd(),
-            right.as_ptr(),
-            0x0000_0002,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(KioError::io(
-            std::io::Error::last_os_error().to_string(),
-            ".lock",
-        ))
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn exchange_bound_lock(left_dir: &File, left: &str, right_dir: &File, right: &str) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    let left = CString::new(left).map_err(|_| bound_lock_corrupt("invalid GC lock name"))?;
-    let right = CString::new(right).map_err(|_| bound_lock_corrupt("invalid GC lock name"))?;
-    if unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            left_dir.as_raw_fd(),
-            left.as_ptr(),
-            right_dir.as_raw_fd(),
-            right.as_ptr(),
-            2_u32,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(KioError::io(
-            std::io::Error::last_os_error().to_string(),
-            ".lock",
-        ))
-    }
 }
 
 #[cfg(debug_assertions)]
@@ -7002,7 +5677,7 @@ fn maybe_hold_lock_for_tests(ready: Option<&Path>) {
 #[cfg(not(debug_assertions))]
 fn maybe_hold_lock_for_tests(_: Option<&Path>) {}
 
-fn unix_nanos() -> u128 {
+pub(crate) fn unix_nanos() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
@@ -7231,19 +5906,7 @@ fn validate_scope_json_value(value: &Value) -> Result<()> {
 }
 
 fn validate_stable_store_gate(directory: &StoreDirectory) -> Result<()> {
-    #[cfg(windows)]
-    {
-        windows_gate::validate(directory.root_handle().as_ref())
-    }
-    #[cfg(not(windows))]
-    {
-        match directory.read_optional(Path::new(".store-gate"), 0) {
-            Ok(Some(bytes)) if bytes.is_empty() => Ok(()),
-            _ => Err(KioError::locked(
-                ".kio/.store-gate is missing, unsafe, or not empty",
-            )),
-        }
-    }
+    crate::platform::validate_store_gate(directory)
 }
 
 fn validate_store_lock_authority(directory: &StoreDirectory) -> Result<()> {
@@ -7253,7 +5916,7 @@ fn validate_store_lock_authority(directory: &StoreDirectory) -> Result<()> {
     validate_stable_store_gate(directory)
 }
 
-fn validate_bound_store_lock_authority(kio: &File) -> Result<()> {
+pub(crate) fn validate_bound_store_lock_authority(kio: &File) -> Result<()> {
     let directory = StoreDirectory::from_retained(
         kio.try_clone()
             .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
@@ -7659,22 +6322,25 @@ fn revoke_network_approval_in_directory(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use super::canonical_lock_bytes;
     use super::{
         ArchiveLimits, DEFAULT_MAX_ARCHIVE_FILE_BYTES, MAX_TREE_ENTRIES, PendingNormalizeRef,
         RELEASED_LOCK_PID, Repository, StoreLock, append_jsonl_rotating, civil_from_days,
         format_unix_seconds, format_utc_seconds, open_scope_file_nofollow, parse_utc_seconds,
-        process_is_alive, prune_rotated_logs, publish_network_approval, read_adapter_lane,
-        read_logs_retention_days, read_network_approval_pending, read_network_approvals,
-        redact_context, redact_message_paths, revoke_network_approval, rotate_stale_log,
+        prune_rotated_logs, publish_network_approval, read_adapter_lane, read_logs_retention_days,
+        read_network_approval_pending, read_network_approvals, redact_context,
+        redact_message_paths, revoke_network_approval, rotate_stale_log,
         write_network_approval_pending,
-    };
-    #[cfg(windows)]
-    use super::{
-        canonical_lock_bytes, create_windows_lock, is_windows_lock_contention,
-        open_windows_lock_parent, read_windows_lock, release_windows_owned_lock, windows_lock_leaf,
     };
     use super::{enforce_config_semantics, enforce_scope_config_semantics};
     use crate::cas::canonical_json_bytes;
+    use crate::platform::lock::process_is_alive;
+    #[cfg(windows)]
+    use crate::platform::lock::{
+        create_windows_lock, is_windows_lock_contention, open_windows_lock_parent,
+        read_windows_lock, release_windows_owned_lock, windows_lock_leaf,
+    };
     use serde_json::Value;
     #[cfg(windows)]
     use std::path::PathBuf;
@@ -7862,7 +6528,7 @@ mod tests {
         let scope = tempfile::tempdir().unwrap();
         let repo = Repository::init(scope.path()).unwrap();
         let retained = cap_fs::open_ambient_dir(repo.kio_dir(), ambient_authority()).unwrap();
-        super::sync_bound_directory(&retained, repo.kio_dir()).unwrap();
+        crate::platform::lock::sync_bound_directory(&retained, repo.kio_dir()).unwrap();
     }
 
     #[cfg(unix)]
@@ -7890,7 +6556,7 @@ mod tests {
             token: "dead-owner".into(),
             created_at: "2026-01-01T00:00:00Z".into(),
         };
-        assert!(!super::process_is_alive(stale.pid));
+        assert!(!crate::platform::lock::process_is_alive(stale.pid));
         let stale_bytes = serde_json::to_vec(&stale).unwrap();
         std::fs::write(repo.kio_dir().join(".lock"), &stale_bytes).unwrap();
         let recovered = super::acquire_bound_store_lock(&retained).unwrap();
@@ -7918,7 +6584,7 @@ mod tests {
         let outer = super::acquire_bound_reentrant_store_lock(&retained).unwrap();
         // Model a fork-inherited duplicate of the directory open-file
         // description. The final logical lease must explicitly unlock it.
-        let inherited_gate = outer._owner._gate.file.try_clone().unwrap();
+        let inherited_gate = outer._owner._native._gate.file.try_clone().unwrap();
         let nested = repo.lock_store().unwrap();
         drop(outer);
         // Each logical guard owns the same Rc lease; dropping the outer
@@ -9209,7 +7875,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("inherited.lock");
         let held = StoreLock::acquire_path(path.clone()).unwrap();
-        let inherited_gate = held._gate.as_ref().unwrap()._file.try_clone().unwrap();
+        let inherited_gate = held
+            .native
+            .as_ref()
+            .unwrap()
+            ._gate
+            ._file
+            .try_clone()
+            .unwrap();
 
         drop(held);
         assert!(StoreLock::acquire_path(path).is_ok());

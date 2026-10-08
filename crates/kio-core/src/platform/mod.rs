@@ -155,3 +155,31 @@ pub(crate) use windows::scope_io::{
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 pub(crate) use unix::scope_io::effective_uid as scope_effective_uid;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::lock::{
+    BoundLock, PathLock, PathLockLease, ReadGate, acquire_bound_lock, acquire_bound_read_gate,
+    acquire_path_lock, directory_lease_identity, finish_path_lock, process_is_alive,
+    validate_store_gate,
+};
+
+#[cfg(target_os = "windows")]
+pub(crate) use windows::lock::{
+    BoundLock, PathLock, PathLockLease, ReadGate, acquire_bound_lock, acquire_bound_read_gate,
+    acquire_path_lock, directory_lease_identity, finish_path_lock, process_is_alive,
+    validate_store_gate,
+};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::lock::PathGate;
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux::lock_exchange::exchange_bound_lock;
+
+#[cfg(target_os = "macos")]
+pub(crate) use macos::lock_exchange::exchange_bound_lock;
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) use unix::lock;
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use windows::lock;

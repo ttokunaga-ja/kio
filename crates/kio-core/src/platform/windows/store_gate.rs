@@ -1,13 +1,17 @@
 //! Immutable store-wide Windows byte-range gate. Acquiring it never writes.
-use super::*;
+use super::lock::{read_windows_lock, windows_lock_open_options};
+use crate::error::{KioError, Result};
+use crate::scope::{LockFile, RELEASED_LOCK_PID};
 use cap_primitives::fs as cap_fs;
+use std::fs::File;
 use std::os::windows::io::AsRawHandle;
+use std::path::Path;
 use windows_sys::Win32::Storage::FileSystem::{
     LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx, UnlockFileEx,
 };
 use windows_sys::Win32::System::IO::OVERLAPPED;
 
-pub(super) struct Gate {
+pub(crate) struct Gate {
     file: File,
     identity: crate::platform::RegularFileHandleIdentity,
 }
@@ -21,7 +25,7 @@ fn open(kio: &File) -> Result<File> {
     Ok(file)
 }
 
-pub(super) fn validate(kio: &File) -> Result<()> {
+pub(crate) fn validate(kio: &File) -> Result<()> {
     open(kio).map(drop)
 }
 
@@ -40,7 +44,7 @@ fn checked_identity(file: &File) -> Result<crate::platform::RegularFileHandleIde
 }
 
 impl Gate {
-    pub(super) fn acquire(kio: &File, exclusive: bool) -> Result<Self> {
+    pub(crate) fn acquire(kio: &File, exclusive: bool) -> Result<Self> {
         let file = open(kio)?;
         let identity = checked_identity(&file)?;
         let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
@@ -61,7 +65,7 @@ impl Gate {
         Ok(gate)
     }
 
-    pub(super) fn recheck(&self, kio: &File) -> Result<()> {
+    pub(crate) fn recheck(&self, kio: &File) -> Result<()> {
         if checked_identity(&self.file)? != self.identity
             || checked_identity(&open(kio)?)? != self.identity
         {
@@ -80,12 +84,12 @@ impl Drop for Gate {
 }
 
 #[derive(PartialEq, Eq)]
-pub(super) struct IdleLock {
+pub(crate) struct IdleLock {
     identity: crate::platform::RegularFileHandleIdentity,
     record: LockFile,
 }
 
-pub(super) fn idle_lock(kio: &File) -> Result<Option<IdleLock>> {
+pub(crate) fn idle_lock(kio: &File) -> Result<Option<IdleLock>> {
     use windows_sys::Win32::Foundation::GENERIC_READ;
     let options = windows_lock_open_options(false, GENERIC_READ);
     let file = match cap_fs::open(kio, Path::new(".lock"), &options) {
@@ -104,6 +108,12 @@ pub(super) fn idle_lock(kio: &File) -> Result<Option<IdleLock>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExitCode;
+    use crate::scope::{
+        Repository, StoreLock, acquire_bound_store_lock, acquire_bound_store_read_guard,
+        acquire_retained_lock_kind, canonical_lock_bytes,
+    };
+    use std::fs;
 
     fn retained(repo: &Repository) -> File {
         repo.store_directory()
@@ -329,7 +339,7 @@ mod tests {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "scope::windows_gate::tests::crash_release_child",
+                "platform::windows::store_gate::tests::crash_release_child",
                 "--nocapture",
             ])
             .env("KIO_TEST_WINDOWS_GATE_CRASH_ROOT", temp.path())

@@ -8,6 +8,12 @@ pub struct DirectoryHandleIdentity {
     inode: u64,
 }
 
+impl DirectoryHandleIdentity {
+    pub(super) const fn from_components(device: u64, inode: u64) -> Self {
+        Self { device, inode }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RegularFileHandleIdentity {
     device: u64,
