@@ -807,7 +807,7 @@ pub fn discover_managed_child_scopes_page(
             }
         };
         #[cfg(windows)]
-        if kio_core::cas::windows_directory_handle_identity(&child).is_none() {
+        if kio_core::platform::directory_handle_identity(&child).is_none() {
             let mut row = child_status(relative, "skipped_symlink");
             row.reason = Some("windows_reparse_point".to_owned());
             result.push(row);
@@ -1306,7 +1306,7 @@ fn discover_child_scopes_inner(
         // than a real directory here: a junction/reparse point is never a
         // child-scope candidate, and must not be followed by discovery.
         #[cfg(windows)]
-        if kio_core::cas::windows_directory_handle_identity(&child).is_none() {
+        if kio_core::platform::directory_handle_identity(&child).is_none() {
             let mut row = child_status(relative, "skipped_symlink");
             row.reason = Some("windows_reparse_point".to_owned());
             result.push(row);

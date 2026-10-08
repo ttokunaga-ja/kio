@@ -796,10 +796,10 @@ fn verify_windows_directory_binding(
     opened: &fs::File,
     label: &str,
 ) -> Result<(), LedgerSnapshotError> {
-    let path_identity = kio_core::cas::windows_real_directory_identity(path).map_err(|e| {
+    let path_identity = kio_core::platform::real_directory_identity(path).map_err(|e| {
         LedgerSnapshotError::UnstableBusy(format!("inspect Windows ledger parent {label}: {e}"))
     })?;
-    let handle_identity = kio_core::cas::windows_directory_handle_identity(opened);
+    let handle_identity = kio_core::platform::directory_handle_identity(opened);
     if path_identity.is_none() || path_identity != handle_identity {
         return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
             "Windows ledger parent is a reparse point or changed: {label}"
@@ -814,9 +814,9 @@ fn verify_windows_regular_binding(
     opened: &fs::File,
     label: &str,
 ) -> Result<(), AttemptError> {
-    let path_identity = kio_core::cas::windows_real_regular_file_identity(path)
+    let path_identity = kio_core::platform::real_regular_file_identity(path)
         .map_err(|e| AttemptError::Unstable(format!("inspect Windows ledger {label}: {e}")))?;
-    let handle_identity = kio_core::cas::windows_regular_file_handle_identity(opened);
+    let handle_identity = kio_core::platform::regular_file_handle_identity(opened);
     if path_identity.is_none() || path_identity != handle_identity {
         return Err(AttemptError::Unsafe(format!(
             "Windows ledger {label} is a reparse point or changed while opening"
@@ -2373,7 +2373,7 @@ mod tests {
             )
             .unwrap();
         let original_source = source_bytes(&path);
-        let original_identity = kio_core::cas::windows_real_regular_file_identity(&path)
+        let original_identity = kio_core::platform::real_regular_file_identity(&path)
             .unwrap()
             .expect("the source must be a real regular file");
         let moved = dir.path().join("moved.sqlite");
@@ -2399,7 +2399,7 @@ mod tests {
         );
         assert_eq!(source_bytes(&path), original_source);
         assert_eq!(
-            kio_core::cas::windows_real_regular_file_identity(&path).unwrap(),
+            kio_core::platform::real_regular_file_identity(&path).unwrap(),
             Some(original_identity)
         );
         assert!(path.exists(), "the original source must remain live");

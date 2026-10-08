@@ -922,12 +922,12 @@ fn verify_windows_directory_binding(
     opened: &fs::File,
     label: &str,
 ) -> std::result::Result<(), RegistrySnapshotError> {
-    let path_identity = kio_core::cas::windows_real_directory_identity(path).map_err(|error| {
+    let path_identity = kio_core::platform::real_directory_identity(path).map_err(|error| {
         RegistrySnapshotError::UnstableBusy(format!(
             "inspect Windows registry parent component {label}: {error}"
         ))
     })?;
-    let handle_identity = kio_core::cas::windows_directory_handle_identity(opened);
+    let handle_identity = kio_core::platform::directory_handle_identity(opened);
     if path_identity.is_none() || path_identity != handle_identity {
         return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
             "Windows registry parent component is a reparse point or changed while opening: {label}"
@@ -942,11 +942,10 @@ fn verify_windows_regular_binding(
     opened: &fs::File,
     label: &str,
 ) -> std::result::Result<(), SnapshotAttemptError> {
-    let path_identity =
-        kio_core::cas::windows_real_regular_file_identity(path).map_err(|error| {
-            SnapshotAttemptError::Unstable(format!("inspect Windows registry {label}: {error}"))
-        })?;
-    let handle_identity = kio_core::cas::windows_regular_file_handle_identity(opened);
+    let path_identity = kio_core::platform::real_regular_file_identity(path).map_err(|error| {
+        SnapshotAttemptError::Unstable(format!("inspect Windows registry {label}: {error}"))
+    })?;
+    let handle_identity = kio_core::platform::regular_file_handle_identity(opened);
     if path_identity.is_none() || handle_identity.is_none() {
         return Err(SnapshotAttemptError::Unsafe(format!(
             "Windows registry {label} is a reparse point or has no usable identity"
@@ -3371,7 +3370,7 @@ mod tests {
                 .expect("new registry parent must have a protected owner-only DACL");
             let handle = retained.root_handle();
             (
-                kio_core::cas::windows_directory_handle_identity(handle.as_ref()).unwrap(),
+                kio_core::platform::directory_handle_identity(handle.as_ref()).unwrap(),
                 windows_security_descriptor(handle.as_ref()),
             )
         });
@@ -3387,7 +3386,7 @@ mod tests {
             let retained = kio_core::private_fs::verify_private_directory(directory).unwrap();
             let handle = retained.root_handle();
             (
-                kio_core::cas::windows_directory_handle_identity(handle.as_ref()).unwrap(),
+                kio_core::platform::directory_handle_identity(handle.as_ref()).unwrap(),
                 windows_security_descriptor(handle.as_ref()),
             )
         });
@@ -3404,7 +3403,7 @@ mod tests {
         let retained = kio_core::private_fs::verify_private_creation_parent(dir.path()).unwrap();
         let handle = retained.root_handle();
         let before_acl = windows_security_descriptor(handle.as_ref());
-        let before_identity = kio_core::cas::windows_directory_handle_identity(handle.as_ref());
+        let before_identity = kio_core::platform::directory_handle_identity(handle.as_ref());
 
         let writer = RegistryDb::open(dir.path().join("scope-registry.sqlite")).unwrap();
         writer
@@ -3419,7 +3418,7 @@ mod tests {
         );
         assert_eq!(windows_security_descriptor(handle.as_ref()), before_acl);
         assert_eq!(
-            kio_core::cas::windows_directory_handle_identity(handle.as_ref()),
+            kio_core::platform::directory_handle_identity(handle.as_ref()),
             before_identity
         );
     }
@@ -3464,14 +3463,14 @@ mod tests {
         );
         assert!(kio_core::private_fs::verify_private_creation_parent(&ancestor).is_err());
         let before_acl = windows_security_descriptor(&handle);
-        let before_identity = kio_core::cas::windows_directory_handle_identity(&handle).unwrap();
+        let before_identity = kio_core::platform::directory_handle_identity(&handle).unwrap();
         let path = ancestor.join("data/kio/scope-registry.sqlite");
 
         assert!(RegistryDb::open(&path).is_err());
         assert!(!ancestor.join("data").exists());
         assert_eq!(windows_security_descriptor(&handle), before_acl);
         assert_eq!(
-            kio_core::cas::windows_directory_handle_identity(&handle),
+            kio_core::platform::directory_handle_identity(&handle),
             Some(before_identity)
         );
         assert_eq!(fs::read_dir(&ancestor).unwrap().count(), 0);

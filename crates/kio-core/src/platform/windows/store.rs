@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::store_dir::{
-    MAX_DIRECTORY_REMOVAL_DEPTH, MAX_DIRECTORY_REMOVAL_ENTRIES, Publication, StoreEntry, err,
-    ioerr, relative_components,
+    MAX_DIRECTORY_REMOVAL_DEPTH, MAX_DIRECTORY_REMOVAL_ENTRIES, Publication, StoreDirectory,
+    StoreEntry, err, ioerr, relative_components,
 };
 use cap_primitives::fs::OpenOptionsExt;
 use cap_primitives::{ambient_authority, fs as cap_fs};
@@ -104,7 +104,7 @@ pub(crate) fn volume_serial(file: &File, label: &Path) -> Result<u32> {
     Ok(information.dwVolumeSerialNumber)
 }
 pub(crate) fn validate_directory(file: &File, label: &Path) -> Result<()> {
-    if crate::cas::windows_directory_handle_identity(file).is_none() {
+    if crate::platform::directory_handle_identity(file).is_none() {
         Err(err(label, "retained store handle is not a real directory"))
     } else {
         Ok(())
@@ -118,7 +118,7 @@ fn operation_directory(directory: &File, label: &Path) -> Result<File> {
     )
 }
 fn reopen_retained_directory(directory: &File, label: &Path, desired_access: u32) -> Result<File> {
-    let identity = crate::cas::windows_directory_handle_identity(directory)
+    let identity = crate::platform::directory_handle_identity(directory)
         .ok_or_else(|| err(label, "retained store handle is not a real directory"))?;
     // Windows rejects a retained-relative `.` open for a directory.  An
     // empty native name denotes the retained directory itself without
@@ -173,7 +173,7 @@ fn reopen_retained_directory(directory: &File, label: &Path, desired_access: u32
         ));
     }
     let operation = unsafe { File::from_raw_handle(handle as _) };
-    if crate::cas::windows_directory_handle_identity(&operation) != Some(identity) {
+    if crate::platform::directory_handle_identity(&operation) != Some(identity) {
         return Err(err(label, "retained store directory identity changed"));
     }
     Ok(operation)
@@ -315,7 +315,7 @@ fn leaf_optional(parent: &File, name: &std::ffi::OsStr, label: &Path) -> Result<
     }
 }
 fn regular(file: &File, label: &Path) -> Result<std::fs::Metadata> {
-    if crate::cas::windows_regular_file_handle_identity(file).is_none() {
+    if crate::platform::regular_file_handle_identity(file).is_none() {
         return Err(err(
             label,
             "store leaf is reparse, nonregular, or hardlinked",
@@ -396,12 +396,36 @@ pub(crate) fn open_regular_for_removal(
     }
     Ok(file)
 }
-pub(crate) fn open_gc_mutation(
-    root: &File,
-    relative: &Path,
-    max: u64,
-    label: &Path,
-) -> Result<File> {
+/// Open one GC mutation leaf with read/write/delete rights and read-only sharing.
+pub fn open_gc_mutation(directory: &StoreDirectory, leaf: &Path, max_bytes: u64) -> Result<File> {
+    direct_leaf(leaf, directory.path())?;
+    open_gc_mutation_retained(&directory.root_handle(), leaf, max_bytes, directory.path())
+}
+
+/// Delete this exact single-link file and verify zero links before reclaiming bytes.
+pub fn retire_gc_handle(directory: &StoreDirectory, file: &File) -> Result<()> {
+    retire_gc_handle_retained(file, directory.path())
+}
+
+/// Move a Windows regular file by its already-validated retained handle.
+/// The source name is never reopened by this primitive.
+pub fn move_verified_regular_handle_to_raw(
+    directory: &StoreDirectory,
+    source: &File,
+    destination_parent: &StoreDirectory,
+    destination_leaf: &Path,
+) -> Result<()> {
+    move_verified_regular_handle_to_raw_retained(
+        &directory.root_handle(),
+        source,
+        &destination_parent.root_handle(),
+        destination_leaf,
+        directory.path(),
+        destination_parent.path(),
+    )
+}
+
+fn open_gc_mutation_retained(root: &File, relative: &Path, max: u64, label: &Path) -> Result<File> {
     let (parent, leaf) = parent(root, relative, label)?;
     let mut options = cap_fs::OpenOptions::new();
     options
@@ -417,12 +441,12 @@ pub(crate) fn open_gc_mutation(
     Ok(file)
 }
 
-pub(crate) fn retire_gc_handle(file: &File, label: &Path) -> Result<()> {
+pub(crate) fn retire_gc_handle_retained(file: &File, label: &Path) -> Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
         FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx, SetFileInformationByHandle,
     };
-    let expected = crate::cas::windows_regular_file_handle_identity(file)
+    let expected = crate::platform::regular_file_handle_identity(file)
         .ok_or_else(|| err(label, "GC retirement requires a single-link regular handle"))?
         .atomic_recovery_components();
     let disposition = FILE_DISPOSITION_INFO_EX {
@@ -488,7 +512,7 @@ pub(crate) fn read_optional(
         return Ok(None);
     };
     let before = regular(&f, &path)?;
-    let before_identity = crate::cas::windows_regular_file_handle_identity(&f)
+    let before_identity = crate::platform::regular_file_handle_identity(&f)
         .ok_or_else(|| err(&path, "store leaf changed type while being read"))?;
     let before_change = change_time(&f, &path)?;
     if before.len() > max {
@@ -500,7 +524,7 @@ pub(crate) fn read_optional(
         .read_to_end(&mut bytes)
         .map_err(|e| ioerr(&path, e))?;
     let after = regular(&f, &path)?;
-    let after_identity = crate::cas::windows_regular_file_handle_identity(&f)
+    let after_identity = crate::platform::regular_file_handle_identity(&f)
         .ok_or_else(|| err(&path, "store leaf changed type while being read"))?;
     let after_change = change_time(&f, &path)?;
     if bytes.len() as u64 > max
@@ -586,7 +610,7 @@ pub(crate) fn rename_regular_between_raw(
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let source_file = cap_fs::open(source_parent, Path::new(source), &source_options)
         .map_err(|e| ioerr(&source_path, e))?;
-    let source_identity = crate::cas::windows_regular_file_handle_identity(&source_file)
+    let source_identity = crate::platform::regular_file_handle_identity(&source_file)
         .ok_or_else(|| err(&source_path, "source is not a single-link regular file"))?;
     match publication {
         Publication::CreateOnly => rename_regular_handle(
@@ -653,7 +677,7 @@ pub(crate) fn rename_regular_between_raw(
         false,
         &destination_path,
     )?;
-    if crate::cas::windows_regular_file_handle_identity(&published) != Some(source_identity) {
+    if crate::platform::regular_file_handle_identity(&published) != Some(source_identity) {
         return Err(err(
             &destination_path,
             "published regular-file identity changed",
@@ -662,7 +686,7 @@ pub(crate) fn rename_regular_between_raw(
     sync_directory(source_parent, source_label)?;
     sync_directory(destination_parent, destination_label)
 }
-pub(crate) fn move_verified_regular_handle_to_raw(
+fn move_verified_regular_handle_to_raw_retained(
     source_parent: &File,
     source: &File,
     destination_parent: &File,
@@ -682,7 +706,7 @@ pub(crate) fn move_verified_regular_handle_to_raw(
             "regular rename crosses filesystem volumes",
         ));
     }
-    let source_identity = crate::cas::windows_regular_file_handle_identity(source)
+    let source_identity = crate::platform::regular_file_handle_identity(source)
         .ok_or_else(|| err(source_label, "source is not a single-link regular file"))?;
     rename_regular_handle(
         source,
@@ -691,7 +715,7 @@ pub(crate) fn move_verified_regular_handle_to_raw(
         false,
         &destination_path,
     )?;
-    if crate::cas::windows_regular_file_handle_identity(source) != Some(source_identity) {
+    if crate::platform::regular_file_handle_identity(source) != Some(source_identity) {
         return Err(err(
             &destination_path,
             "moved regular-file handle identity changed",
@@ -815,8 +839,8 @@ pub(crate) fn rename_directory_create_only(
     validate_directory(&source_directory, &source_path)?;
     rename_directory_noreplace(&source_directory, &parent, destination_leaf, &source_path)?;
     let published = open_published_directory(&parent, destination_leaf, &destination_path)?;
-    if crate::cas::windows_directory_handle_identity(&source_directory)
-        != crate::cas::windows_directory_handle_identity(&published)
+    if crate::platform::directory_handle_identity(&source_directory)
+        != crate::platform::directory_handle_identity(&published)
     {
         return Err(err(
             &destination_path,
@@ -846,8 +870,8 @@ pub(crate) fn rename_directory_between_create_only(
     validate_directory(&held, source_label)?;
     rename_directory_noreplace(&held, destination_parent, destination, source_label)?;
     let published = open_published_directory(destination_parent, destination, destination_label)?;
-    if crate::cas::windows_directory_handle_identity(&held)
-        != crate::cas::windows_directory_handle_identity(&published)
+    if crate::platform::directory_handle_identity(&held)
+        != crate::platform::directory_handle_identity(&published)
     {
         return Err(err(
             destination_label,
@@ -1071,7 +1095,7 @@ mod tests {
         fs::write(&source_path, b"replacement").expect("replacement body");
         let source_handle = source_parent.root_handle();
         let destination_handle = destination_parent.root_handle();
-        move_verified_regular_handle_to_raw(
+        move_verified_regular_handle_to_raw_retained(
             &source_handle,
             &source,
             &destination_handle,
@@ -1100,11 +1124,11 @@ mod tests {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .open(&path)
             .unwrap();
-        let mutator = parent.open_gc_mutation(Path::new("leaf"), 64).unwrap();
-        let before = crate::cas::windows_regular_file_handle_identity(&mutator)
+        let mutator = open_gc_mutation(&parent, Path::new("leaf"), 64).unwrap();
+        let before = crate::platform::regular_file_handle_identity(&mutator)
             .unwrap()
             .atomic_recovery_components();
-        parent.retire_gc_handle(&mutator).unwrap();
+        retire_gc_handle(&parent, &mutator).unwrap();
         let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         assert_ne!(
             unsafe { GetFileInformationByHandle(mutator.as_raw_handle() as _, &mut information) },

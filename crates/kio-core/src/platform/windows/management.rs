@@ -3,7 +3,9 @@ use crate::management::{DirectoryIdentity, err};
 use std::fs::File;
 
 pub(crate) fn same_case_probe_file(left: &File, right: &File) -> Result<bool> {
-    Ok(crate::cas::same_windows_regular_file(left, right))
+    Ok(crate::platform::cas_identity::same_windows_regular_file(
+        left, right,
+    ))
 }
 
 pub(crate) fn file_identity(f: &File) -> Result<DirectoryIdentity> {
@@ -29,3 +31,6 @@ pub(crate) fn file_identity(f: &File) -> Result<DirectoryIdentity> {
         file_index: ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
     })
 }
+
+pub(crate) const NATIVE_IDENTITY_FAMILY: crate::platform::NativeIdentityFamily =
+    crate::platform::NativeIdentityFamily::Windows;

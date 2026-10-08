@@ -16,9 +16,18 @@ pub(crate) fn same_windows_regular_file(opened: &File, path: &File) -> bool {
 /// are created or removed.  Its fields stay private so callers can compare
 /// identities without treating their representation as a persistence format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowsDirectoryIdentity {
-    pub(crate) volume_serial_number: u32,
-    pub(crate) file_index: u64,
+pub struct DirectoryHandleIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+}
+
+impl DirectoryHandleIdentity {
+    pub(crate) const fn new(volume_serial_number: u32, file_index: u64) -> Self {
+        Self {
+            volume_serial_number,
+            file_index,
+        }
+    }
 }
 
 /// Stable identity of a real, non-reparse, single-link Windows regular file.
@@ -26,12 +35,21 @@ pub struct WindowsDirectoryIdentity {
 /// The public representation is opaque. Core may encode its numeric components
 /// only in an explicitly versioned local recovery intent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowsRegularFileIdentity {
-    pub(crate) volume_serial_number: u32,
-    pub(crate) file_index: u64,
+pub struct RegularFileHandleIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
 }
 
-impl WindowsRegularFileIdentity {
+impl RegularFileHandleIdentity {
+    pub(crate) const fn new(volume_serial_number: u32, file_index: u64) -> Self {
+        Self {
+            volume_serial_number,
+            file_index,
+        }
+    }
+}
+
+impl RegularFileHandleIdentity {
     /// Components for the core's versioned, local atomic recovery intent.
     /// External callers still treat this identity as an opaque observation.
     pub(crate) const fn atomic_recovery_components(self) -> (u32, u64) {
@@ -64,9 +82,7 @@ pub(crate) fn windows_file_information(file: &File) -> Option<WindowsFileInforma
 /// Open a Windows directory without traversing its final reparse point and
 /// verify its handle attributes. `symlink_metadata().is_symlink()` alone does
 /// not cover every directory reparse-point kind (notably junctions).
-pub fn windows_real_directory_identity(
-    path: &Path,
-) -> std::io::Result<Option<WindowsDirectoryIdentity>> {
+pub fn real_directory_identity(path: &Path) -> std::io::Result<Option<DirectoryHandleIdentity>> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
@@ -85,9 +101,9 @@ pub fn windows_real_directory_identity(
 
 /// Open a Windows path without following its final reparse point and return a
 /// stable identity only for a real, single-link regular file.
-pub fn windows_real_regular_file_identity(
+pub fn real_regular_file_identity(
     path: &Path,
-) -> std::io::Result<Option<WindowsRegularFileIdentity>> {
+) -> std::io::Result<Option<RegularFileHandleIdentity>> {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
@@ -106,31 +122,31 @@ pub fn windows_real_regular_file_identity(
 
 /// Return the stable identity of an already-opened Windows directory.
 ///
-/// This is the by-handle counterpart of [`windows_real_directory_identity`]:
+/// This is the by-handle counterpart of [`real_directory_identity`]:
 /// callers that already hold the handle they intend to use must compare against
 /// the handle itself, never re-open the path, or a component swapped between
 /// the two opens would simply be re-observed and accepted.
 #[must_use]
-pub fn windows_directory_handle_identity(file: &File) -> Option<WindowsDirectoryIdentity> {
+pub fn directory_handle_identity(file: &File) -> Option<DirectoryHandleIdentity> {
     windows_file_information(file).and_then(WindowsFileInformation::directory_identity)
 }
 
 /// Return the stable identity of an already-opened Windows regular file.
 #[must_use]
-pub fn windows_regular_file_handle_identity(file: &File) -> Option<WindowsRegularFileIdentity> {
+pub fn regular_file_handle_identity(file: &File) -> Option<RegularFileHandleIdentity> {
     windows_file_information(file).and_then(WindowsFileInformation::regular_file_identity)
 }
 
 /// Return whether a Windows path is a real directory rather than any reparse
 /// point, including junction kinds not reported by `is_symlink()`.
-pub fn windows_directory_is_real(path: &Path) -> std::io::Result<bool> {
-    windows_real_directory_identity(path).map(|identity| identity.is_some())
+pub fn directory_is_real(path: &Path) -> std::io::Result<bool> {
+    real_directory_identity(path).map(|identity| identity.is_some())
 }
 
 /// Open a Windows leaf without following a reparse point and require a real,
 /// single-link regular file. Restore uses this before replacing a destination.
-pub fn windows_regular_file_is_safe(path: &Path) -> std::io::Result<bool> {
-    windows_real_regular_file_identity(path).map(|identity| identity.is_some())
+pub fn regular_file_is_safe(path: &Path) -> std::io::Result<bool> {
+    real_regular_file_identity(path).map(|identity| identity.is_some())
 }
 
 #[cfg(test)]
@@ -155,12 +171,12 @@ mod tests {
         assert!(information.is_regular_file());
         assert!(information.is_single_link());
         assert_eq!(
-            windows_real_regular_file_identity(&first).unwrap(),
-            windows_regular_file_handle_identity(&first_handle)
+            real_regular_file_identity(&first).unwrap(),
+            regular_file_handle_identity(&first_handle)
         );
         assert_ne!(
-            windows_real_regular_file_identity(&first).unwrap(),
-            windows_real_regular_file_identity(&second).unwrap()
+            real_regular_file_identity(&first).unwrap(),
+            real_regular_file_identity(&second).unwrap()
         );
         assert!(same_windows_regular_file(&first_handle, &same_handle));
         assert!(!same_windows_regular_file(&first_handle, &second_handle));
@@ -196,12 +212,10 @@ mod tests {
         fs::create_dir(&destination).unwrap();
         fs::create_dir(&decoy).unwrap();
 
-        let captured = windows_real_directory_identity(&destination)
-            .unwrap()
-            .unwrap();
+        let captured = real_directory_identity(&destination).unwrap().unwrap();
         {
             let opened = open_directory(&destination);
-            assert_eq!(windows_directory_handle_identity(&opened), Some(captured));
+            assert_eq!(directory_handle_identity(&opened), Some(captured));
         }
 
         // The swap PA18 exists to catch: the validated name now resolves to a
@@ -209,14 +223,14 @@ mod tests {
         fs::rename(&destination, root.path().join("moved")).unwrap();
         fs::rename(&decoy, &destination).unwrap();
         let swapped = open_directory(&destination);
-        assert_ne!(windows_directory_handle_identity(&swapped), Some(captured));
+        assert_ne!(directory_handle_identity(&swapped), Some(captured));
 
         // A non-directory carries no directory identity, so callers comparing
         // against `Some(expected)` fail closed rather than matching.
         let regular = root.path().join("regular.bin");
         fs::write(&regular, b"payload").unwrap();
         assert_eq!(
-            windows_directory_handle_identity(&File::open(&regular).unwrap()),
+            directory_handle_identity(&File::open(&regular).unwrap()),
             None
         );
     }

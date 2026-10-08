@@ -95,7 +95,8 @@ impl GcSweepSession {
             if observe(&source)?.1 != *expected {
                 return Err(snapshot_auto_state_changed());
             }
-            let target = parent.open_gc_mutation(Path::new(temporary), MAX_METADATA)?;
+            let target =
+                crate::platform::open_gc_mutation(&parent, Path::new(temporary), MAX_METADATA)?;
             if observe(&target)?.0 != target_state {
                 return Err(snapshot_auto_state_changed());
             }
@@ -287,10 +288,12 @@ mod tests {
             .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
             .open(&path)
             .unwrap();
-        let original_error = directory(&session.kio)
-            .unwrap()
-            .open_gc_mutation(Path::new(SNAPSHOT_AUTO_STATE_LEAF), MAX_METADATA)
-            .unwrap_err();
+        let original_error = crate::platform::open_gc_mutation(
+            &directory(&session.kio).unwrap(),
+            Path::new(SNAPSHOT_AUTO_STATE_LEAF),
+            MAX_METADATA,
+        )
+        .unwrap_err();
         let error =
             open_snapshot_source(&session.kio, first.observation.as_ref().unwrap()).unwrap_err();
         assert_eq!(original_error.error_code(), "KIO-E-STORE-IO-001");

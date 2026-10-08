@@ -365,13 +365,13 @@ impl OwnerOnlyDescriptor {
 }
 
 fn verify_directory_handle(file: &fs::File, path: &Path, owner: &CurrentUserSid) -> io::Result<()> {
-    let handle = kio_core::cas::windows_directory_handle_identity(file).ok_or_else(|| {
+    let handle = kio_core::platform::directory_handle_identity(file).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "private ledger directory is reparse or non-directory",
         )
     })?;
-    if kio_core::cas::windows_real_directory_identity(path)? != Some(handle) {
+    if kio_core::platform::real_directory_identity(path)? != Some(handle) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "private ledger directory changed while opening",
@@ -380,13 +380,13 @@ fn verify_directory_handle(file: &fs::File, path: &Path, owner: &CurrentUserSid)
     verify_owner_only_security(file, owner, AclShape::ExactCreated { directory: true })
 }
 fn verify_file_handle(file: &fs::File, path: &Path, owner: &CurrentUserSid) -> io::Result<()> {
-    let handle = kio_core::cas::windows_regular_file_handle_identity(file).ok_or_else(|| {
+    let handle = kio_core::platform::regular_file_handle_identity(file).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "private ledger leaf is reparse, nonregular, or linked",
         )
     })?;
-    if kio_core::cas::windows_real_regular_file_identity(path)? != Some(handle) {
+    if kio_core::platform::real_regular_file_identity(path)? != Some(handle) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "private ledger leaf changed while opening",
@@ -465,13 +465,13 @@ fn open_private_leaf_for_delete(
     }
     // SAFETY: CreateFileW returned an owned valid handle.
     let file = unsafe { fs::File::from_raw_handle(raw as _) };
-    let handle = kio_core::cas::windows_regular_file_handle_identity(&file).ok_or_else(|| {
+    let handle = kio_core::platform::regular_file_handle_identity(&file).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
             "private ledger cleanup leaf unsafe",
         )
     })?;
-    if kio_core::cas::windows_real_regular_file_identity(&path)? != Some(handle) {
+    if kio_core::platform::real_regular_file_identity(&path)? != Some(handle) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "private ledger cleanup leaf changed",

@@ -226,10 +226,10 @@ fn verify_named_identity(directory: &StoreDirectory, path: &Path) -> Result<()> 
 
 #[cfg(windows)]
 fn verify_named_identity(directory: &StoreDirectory, path: &Path) -> Result<()> {
-    let named = kio_core::cas::windows_real_directory_identity(path)
+    let named = kio_core::platform::real_directory_identity(path)
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
         .ok_or_else(|| KioError::invalid_usage("private state path is not a real directory"))?;
-    let retained = kio_core::cas::windows_directory_handle_identity(&directory.root_handle())
+    let retained = kio_core::platform::directory_handle_identity(&directory.root_handle())
         .ok_or_else(|| KioError::invalid_usage("retained private state is not a real directory"))?;
     if named != retained {
         return Err(KioError::new(

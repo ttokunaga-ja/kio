@@ -162,14 +162,14 @@ pub(crate) fn retire_expected(
     max: u64,
 ) -> Result<()> {
     let parent = directory(parent)?;
-    let mut file = parent.open_gc_mutation(Path::new(leaf), max)?;
+    let mut file = crate::platform::open_gc_mutation(&parent, Path::new(leaf), max)?;
     let (actual, observed) = observe(&mut file, max)?;
     if actual != bytes || !matches_stable(&observed, expected) {
         return Err(corrupt(
             "GC temporary changed before exact-handle retirement",
         ));
     }
-    parent.retire_gc_handle(&file)
+    crate::platform::retire_gc_handle(&parent, &file)
 }
 
 pub(crate) fn remove_completed_marker(
@@ -180,26 +180,32 @@ pub(crate) fn remove_completed_marker(
 ) -> Result<()> {
     let source = directory(gc)?;
     let target = directory(markers)?;
-    let mut file = source.open_gc_mutation(Path::new("in_progress"), MAX_MARKER_BYTES)?;
+    let mut file =
+        crate::platform::open_gc_mutation(&source, Path::new("in_progress"), MAX_MARKER_BYTES)?;
     let (bytes, actual) = observe(&mut file, MAX_MARKER_BYTES)?;
     if actual != *observation || GcInProgressMarker::parse_canonical(&bytes)? != *expected {
         return Err(corrupt("GC marker changed before completion archive"));
     }
     let archive = unique_internal_name("completed");
-    source.move_verified_regular_handle_to_raw(&file, &target, Path::new(&archive))?;
+    crate::platform::move_verified_regular_handle_to_raw(
+        &source,
+        &file,
+        &target,
+        Path::new(&archive),
+    )?;
     let (moved, actual) = observe(&mut file, MAX_MARKER_BYTES)?;
     if moved != bytes || !matches_stable(&actual, observation) {
         return Err(corrupt("GC marker changed during completion archive"));
     }
-    target.retire_gc_handle(&file)
+    crate::platform::retire_gc_handle(&target, &file)
 }
 
 pub(crate) fn move_noreplace(from_dir: &File, from: &str, to_dir: &File, to: &str) -> Result<()> {
     let source = directory(from_dir)?;
     let target = directory(to_dir)?;
-    let mut file = source.open_gc_mutation(Path::new(from), MAX_MARKER_BYTES)?;
+    let mut file = crate::platform::open_gc_mutation(&source, Path::new(from), MAX_MARKER_BYTES)?;
     let (bytes, before) = observe(&mut file, MAX_MARKER_BYTES)?;
-    source.move_verified_regular_handle_to_raw(&file, &target, Path::new(to))?;
+    crate::platform::move_verified_regular_handle_to_raw(&source, &file, &target, Path::new(to))?;
     let (after_bytes, after) = observe(&mut file, MAX_MARKER_BYTES)?;
     if bytes != after_bytes || !matches_stable(&after, &before) {
         return Err(corrupt("GC publication changed during exact-handle move"));
@@ -243,7 +249,7 @@ pub(crate) fn publish_staged(
     staged_checkpoint()?;
     let source = directory(from_dir)?;
     let target = directory(to_dir)?;
-    source.move_verified_regular_handle_to_raw(&file, &target, Path::new(leaf))?;
+    crate::platform::move_verified_regular_handle_to_raw(&source, &file, &target, Path::new(leaf))?;
     let (published, after) = observe(&mut file, max)?;
     if published != bytes || !matches_stable(&after, &before) {
         return Err(corrupt("GC publication changed during exact-handle move"));

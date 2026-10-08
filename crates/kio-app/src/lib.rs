@@ -88,14 +88,14 @@ use kio_core::cas::{
     ChunkObject, ContentObjectKind, MAX_RAW_OBJECT_BYTES, canonical_json_bytes, fanout_path,
     is_hash, read_bounded_regular_file,
 };
-#[cfg(windows)]
-use kio_core::cas::{windows_directory_handle_identity, windows_real_directory_identity};
 use kio_core::dag::{CommitObject, CommitType, NormalizeRef, TreeObject};
 use kio_core::gc::{
     GcAutomationBinding, GcAutomationMode, GcSweepSession, SnapshotAutoBinding,
     SnapshotAutoStateBinding, snapshot_auto_clock_error,
 };
 use kio_core::history::HistoryReader;
+#[cfg(windows)]
+use kio_core::platform::{directory_handle_identity, real_directory_identity};
 use kio_core::portable::{PORTABLE_TAGS_DIRECTORY, portable_cache_leaf, portable_tag_leaf};
 use kio_core::purge::{EventKind, PurgeState, TombstoneMode, canonical_final_event};
 use kio_core::schema::{SchemaKind, validate_json_schema};
@@ -10109,7 +10109,7 @@ fn open_kio_root_dir(kio_dir: &Path) -> Result<std::fs::File> {
         ));
     }
     #[cfg(windows)]
-    let before = windows_real_directory_identity(kio_dir)
+    let before = real_directory_identity(kio_dir)
         .map_err(|error| KioError::io(error.to_string(), kio_dir.display().to_string()))?
         .ok_or_else(|| {
             KioError::io(
@@ -10148,7 +10148,7 @@ fn open_kio_root_dir(kio_dir: &Path) -> Result<std::fs::File> {
         same_directory_identity(&before, &after)
     };
     #[cfg(windows)]
-    let unchanged = windows_directory_handle_identity(&root) == Some(before);
+    let unchanged = directory_handle_identity(&root) == Some(before);
     if !unchanged {
         return Err(KioError::io(
             "repository .kio root changed while opening",
@@ -10323,7 +10323,7 @@ fn sync_bound_directory(directory: &std::fs::File, path: &Path) -> Result<()> {
     // this call.  This deliberately does not claim POSIX directory durability.
     #[cfg(windows)]
     {
-        windows_directory_handle_identity(directory).ok_or_else(|| {
+        directory_handle_identity(directory).ok_or_else(|| {
             KioError::io(
                 "bound directory must be a real directory, not a reparse point",
                 path.display().to_string(),

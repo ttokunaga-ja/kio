@@ -20,7 +20,11 @@ pub(crate) fn directory(file: &File) -> Result<StoreDirectory> {
 }
 
 pub(crate) fn open_snapshot_source(parent: &File, expected: &FileObservation) -> Result<File> {
-    match directory(parent)?.open_gc_mutation(Path::new(SNAPSHOT_AUTO_STATE_LEAF), MAX_METADATA) {
+    match crate::platform::open_gc_mutation(
+        &directory(parent)?,
+        Path::new(SNAPSHOT_AUTO_STATE_LEAF),
+        MAX_METADATA,
+    ) {
         Ok(source) => Ok(source),
         Err(acquisition_error) => {
             // A replacement's live writer can deny the exclusive mutation pin

@@ -260,7 +260,7 @@ fn bind_source_index(
                 )));
             }
             #[cfg(windows)]
-            let before_root_identity = kio_core::cas::windows_real_directory_identity(root)
+            let before_root_identity = kio_core::platform::real_directory_identity(root)
                 .map_err(|e| {
                     IndexError::Schema(format!(
                         "inspect source index root reparse state {}: {e}",
@@ -294,7 +294,7 @@ fn bind_source_index(
             #[cfg(not(windows))]
             let root_matches = same_std_and_cap_directory(&before_root, &opened_root);
             #[cfg(windows)]
-            let root_matches = kio_core::cas::windows_directory_handle_identity(&root_handle)
+            let root_matches = kio_core::platform::directory_handle_identity(&root_handle)
                 == Some(before_root_identity);
             if !root_matches {
                 return Err(IndexError::Schema(format!(
@@ -323,7 +323,7 @@ fn bind_source_index(
             ))
         })?;
         #[cfg(windows)]
-        let before_identity = kio_core::cas::windows_real_directory_identity(parent)
+        let before_identity = kio_core::platform::real_directory_identity(parent)
             .map_err(|e| {
                 IndexError::Schema(format!(
                     "inspect source index parent reparse state {}: {e}",
@@ -354,7 +354,7 @@ fn bind_source_index(
         let parent_matches = same_std_and_cap_directory(&before, &after);
         #[cfg(windows)]
         let parent_matches =
-            kio_core::cas::windows_directory_handle_identity(&handle) == Some(before_identity);
+            kio_core::platform::directory_handle_identity(&handle) == Some(before_identity);
         if !parent_matches {
             return Err(IndexError::Schema(format!(
                 "source index parent changed while opening: {}",
@@ -730,7 +730,7 @@ fn sync_bound_gc_directory(directory: &std::fs::File, context: &str) -> Result<(
 /// persistence; do not claim a POSIX directory-`fsync` guarantee here.
 #[cfg(windows)]
 fn sync_bound_gc_directory(directory: &std::fs::File, context: &str) -> Result<()> {
-    if kio_core::cas::windows_directory_handle_identity(directory).is_none() {
+    if kio_core::platform::directory_handle_identity(directory).is_none() {
         return Err(IndexError::Schema(format!(
             "{context}: retained directory is not a real Windows directory"
         )));

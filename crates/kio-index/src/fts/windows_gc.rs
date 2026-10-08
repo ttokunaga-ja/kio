@@ -226,12 +226,15 @@ fn exchange_authority(
     // First validate the exact current source state before any new intent or
     // exchange owner is published. begin reopens and repeats the validation
     // under restrictive pins immediately before durable intent publication.
-    let source = public
-        .open_gc_mutation(Path::new("sqlite.db"), MAX_INDEX_BYTES)
-        .map_err(core_error)?;
-    let target = private
-        .open_gc_mutation(Path::new(authority.temp_leaf), MAX_INDEX_BYTES)
-        .map_err(core_error)?;
+    let source =
+        kio_core::platform::open_gc_mutation(&public, Path::new("sqlite.db"), MAX_INDEX_BYTES)
+            .map_err(core_error)?;
+    let target = kio_core::platform::open_gc_mutation(
+        &private,
+        Path::new(authority.temp_leaf),
+        MAX_INDEX_BYTES,
+    )
+    .map_err(core_error)?;
     authority.validate_files(&source, &target, true)?;
     let expected = ExchangeExpected {
         source: exchange::observe(&source, MAX_INDEX_BYTES).map_err(core_error)?,
@@ -291,15 +294,14 @@ pub(super) fn remove_exact(
     if !parent.contains_entry(Path::new(leaf)).map_err(core_error)? {
         return Ok(PreparedGcIndexCleanup::AlreadyAbsent);
     }
-    let file = parent
-        .open_gc_mutation(Path::new(leaf), MAX_INDEX_BYTES)
+    let file = kio_core::platform::open_gc_mutation(&parent, Path::new(leaf), MAX_INDEX_BYTES)
         .map_err(core_error)?;
     if canonical_gc_index_identity(&file)? != expected_identity {
         return Err(IndexError::Schema(
             "GC private index cleanup input changed".into(),
         ));
     }
-    parent.retire_gc_handle(&file).map_err(core_error)?;
+    kio_core::platform::retire_gc_handle(&parent, &file).map_err(core_error)?;
     Ok(PreparedGcIndexCleanup::Removed)
 }
 

@@ -69,8 +69,8 @@ pub(crate) struct Identity(u64, u64);
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Identity {
-    File(crate::cas::WindowsRegularFileIdentity),
-    Directory(crate::cas::WindowsDirectoryIdentity),
+    File(crate::platform::RegularFileHandleIdentity),
+    Directory(crate::platform::DirectoryHandleIdentity),
 }
 
 pub(crate) fn identity(file: &File, directory: bool, label: &Path) -> Result<Identity> {
@@ -89,9 +89,9 @@ pub(crate) fn identity(file: &File, directory: bool, label: &Path) -> Result<Ide
     #[cfg(windows)]
     {
         if directory {
-            crate::cas::windows_directory_handle_identity(file).map(Identity::Directory)
+            crate::platform::directory_handle_identity(file).map(Identity::Directory)
         } else {
-            crate::cas::windows_regular_file_handle_identity(file).map(Identity::File)
+            crate::platform::regular_file_handle_identity(file).map(Identity::File)
         }
         .ok_or_else(|| {
             err(
@@ -566,7 +566,7 @@ fn remove_node(
         if node.is_dir() {
             retire_directory(&mutator, label)?;
         } else {
-            platform::retire_gc_handle(&mutator, label)?;
+            platform::retire_gc_handle_retained(&mutator, label)?;
         }
     }
     drop(mutator);

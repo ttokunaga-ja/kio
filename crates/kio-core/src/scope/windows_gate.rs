@@ -9,7 +9,7 @@ use windows_sys::Win32::System::IO::OVERLAPPED;
 
 pub(super) struct Gate {
     file: File,
-    identity: crate::cas::WindowsRegularFileIdentity,
+    identity: crate::platform::RegularFileHandleIdentity,
 }
 
 fn open(kio: &File) -> Result<File> {
@@ -25,8 +25,8 @@ pub(super) fn validate(kio: &File) -> Result<()> {
     open(kio).map(drop)
 }
 
-fn checked_identity(file: &File) -> Result<crate::cas::WindowsRegularFileIdentity> {
-    let identity = crate::cas::windows_regular_file_handle_identity(file)
+fn checked_identity(file: &File) -> Result<crate::platform::RegularFileHandleIdentity> {
+    let identity = crate::platform::regular_file_handle_identity(file)
         .ok_or_else(|| KioError::locked(".kio/.store-gate is not a single-link regular file"))?;
     if file
         .metadata()
@@ -81,7 +81,7 @@ impl Drop for Gate {
 
 #[derive(PartialEq, Eq)]
 pub(super) struct IdleLock {
-    identity: crate::cas::WindowsRegularFileIdentity,
+    identity: crate::platform::RegularFileHandleIdentity,
     record: LockFile,
 }
 

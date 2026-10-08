@@ -16,24 +16,17 @@ use crate::error::{IoResultExt, KioError, Result};
 use crate::purge::sync_directory;
 
 #[cfg(windows)]
-pub(crate) use crate::platform::cas_identity::same_windows_regular_file;
-#[cfg(windows)]
 use crate::platform::cas_identity::windows_file_information;
-#[cfg(windows)]
-pub use crate::platform::cas_identity::{
-    WindowsDirectoryIdentity, WindowsRegularFileIdentity, windows_directory_handle_identity,
-    windows_directory_is_real, windows_real_directory_identity, windows_real_regular_file_identity,
-    windows_regular_file_handle_identity, windows_regular_file_is_safe,
-};
-#[cfg(unix)]
+#[cfg(all(test, unix))]
+use crate::platform::cas_io::validate_open_regular_nofollow_with_before;
 use crate::platform::cas_io::{
-    configure_no_follow, is_single_link_regular_metadata, replace_file, same_file_identity,
-    same_open_file, sync_bound_directory,
+    bound_metadata_single_link, configure_no_follow, observe_regular_file_stability, replace_file,
+    same_bound_regular_entry, same_open_file, sync_bound_directory,
 };
 #[cfg(windows)]
-use crate::platform::cas_io::{
-    configure_no_follow, open_windows_regular_nofollow_observation, replace_file, same_open_file,
-    same_windows_cas_file, same_windows_cas_file_triplet, sync_bound_directory,
+use crate::platform::{
+    DirectoryHandleIdentity, RegularFileHandleIdentity, directory_handle_identity,
+    regular_file_handle_identity,
 };
 
 pub const CAS_STREAM_BUFFER_BYTES: usize = 64 * 1024;
@@ -2762,7 +2755,7 @@ pub(crate) fn ensure_bound_directory(directory: &File, label: &Path) -> Result<(
         ));
     }
     #[cfg(windows)]
-    if windows_directory_handle_identity(directory).is_none() {
+    if directory_handle_identity(directory).is_none() {
         return Err(KioError::io(
             "bound CAS directory is a reparse point or changed type",
             label.display().to_string(),
@@ -2785,8 +2778,7 @@ fn same_bound_directory(current: &File, retained: &File) -> Result<bool> {
     }
     #[cfg(windows)]
     {
-        Ok(windows_directory_handle_identity(current)
-            == windows_directory_handle_identity(retained))
+        Ok(directory_handle_identity(current) == directory_handle_identity(retained))
     }
 }
 
@@ -3548,56 +3540,11 @@ fn bound_leaf<'a>(leaf: &'a str, kind: &str) -> Result<&'a Path> {
     Ok(path)
 }
 
-fn bound_io_or_not_found(error: std::io::Error, leaf: &str) -> KioError {
+pub(crate) fn bound_io_or_not_found(error: std::io::Error, leaf: &str) -> KioError {
     if error.kind() == std::io::ErrorKind::NotFound {
         KioError::not_found(leaf)
     } else {
         KioError::io(error.to_string(), leaf)
-    }
-}
-
-fn bound_metadata_single_link(metadata: &cap_primitives::fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use cap_primitives::fs::MetadataExt;
-        metadata.nlink() == 1
-    }
-    #[cfg(windows)]
-    {
-        let _ = metadata;
-        // The Windows check is done against the opened handles below, where
-        // link count and reparse attributes are available by handle.
-        true
-    }
-}
-
-fn same_bound_regular_entry(
-    _parent: &File,
-    leaf: &Path,
-    opened: &File,
-    before: &cap_primitives::fs::Metadata,
-    after: &cap_primitives::fs::Metadata,
-) -> Result<bool> {
-    #[cfg(unix)]
-    {
-        use cap_primitives::fs::MetadataExt;
-        let opened = cap_primitives::fs::Metadata::from_file(opened)
-            .map_err(|error| KioError::io(error.to_string(), leaf.display().to_string()))?;
-        Ok(opened.dev() == before.dev()
-            && opened.ino() == before.ino()
-            && opened.dev() == after.dev()
-            && opened.ino() == after.ino())
-    }
-    #[cfg(windows)]
-    {
-        let _ = (before, after);
-        let mut options = cap_primitives::fs::OpenOptions::new();
-        options
-            .read(true)
-            ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
-        let verification = cap_primitives::fs::open(_parent, leaf, &options)
-            .map_err(|error| bound_io_or_not_found(error, &leaf.display().to_string()))?;
-        Ok(same_windows_cas_file(opened, &verification))
     }
 }
 
@@ -3625,7 +3572,7 @@ fn bound_create_private_temp(
         match cap_primitives::fs::open(parent, path, &options) {
             Ok(file) => {
                 #[cfg(windows)]
-                let safe = windows_regular_file_handle_identity(&file).is_some();
+                let safe = regular_file_handle_identity(&file).is_some();
                 #[cfg(unix)]
                 let safe = {
                     let metadata = cap_primitives::fs::Metadata::from_file(&file)
@@ -4208,184 +4155,23 @@ pub fn ensure_real_directory(path: &Path, create: bool) -> Result<()> {
 /// Open a real, single-link regular file without following its final symlink
 /// or reparse point, and bind the returned handle to the verified path entry.
 pub fn open_regular_nofollow(path: &Path) -> Result<File> {
-    let before = fs::symlink_metadata(path).kio_io(path)?;
-    if !before.file_type().is_file() || before.file_type().is_symlink() {
-        return Err(non_regular_object_error(path));
-    }
-    #[cfg(unix)]
-    if !is_single_link_regular_metadata(&before) {
-        return Err(non_regular_object_error(path));
-    }
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    configure_no_follow(&mut options);
-    #[cfg(windows)]
-    let before_handle = options.open(path).kio_io(path)?;
-    let file = options.open(path).kio_io(path)?;
-    let opened = file.metadata().kio_io(path)?;
-    let after = fs::symlink_metadata(path).kio_io(path)?;
-    #[cfg(windows)]
-    let same_identity = {
-        let mut verification_options = OpenOptions::new();
-        verification_options.read(true);
-        configure_no_follow(&mut verification_options);
-        let verification = verification_options.open(path).kio_io(path)?;
-        verification.metadata().kio_io(path)?.is_file()
-            && same_windows_cas_file_triplet(&before_handle, &file, &verification)
-    };
-    #[cfg(not(windows))]
-    let same_identity = same_file_identity(&before, &opened) && same_file_identity(&opened, &after);
-    if !opened.is_file()
-        || !after.file_type().is_file()
-        || after.file_type().is_symlink()
-        || !same_identity
-    {
-        return Err(non_regular_object_error(path));
-    }
-    #[cfg(unix)]
-    {
-        if !is_single_link_regular_metadata(&opened) || !is_single_link_regular_metadata(&after) {
-            return Err(non_regular_object_error(path));
-        }
-    }
-    Ok(file)
+    crate::platform::cas_io::open_regular_nofollow(path)
 }
 
 /// Open an existing metadata file for reading and mutation through the same
 /// no-follow, single-link, identity-checked boundary as [`open_regular_nofollow`].
 pub fn open_regular_nofollow_read_write(path: &Path) -> Result<File> {
-    let before = fs::symlink_metadata(path).kio_io(path)?;
-    if !before.file_type().is_file() || before.file_type().is_symlink() {
-        return Err(non_regular_object_error(path));
-    }
-    #[cfg(unix)]
-    if !is_single_link_regular_metadata(&before) {
-        return Err(non_regular_object_error(path));
-    }
-
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    configure_no_follow(&mut options);
-    #[cfg(windows)]
-    let before_handle = open_windows_regular_nofollow_observation(path)?;
-    let file = options.open(path).kio_io(path)?;
-    #[cfg(windows)]
-    validate_open_regular_nofollow_with_windows_before(path, &file, &before_handle)?;
-    #[cfg(not(windows))]
-    validate_open_regular_nofollow_with_before(path, &file, &before)?;
-    Ok(file)
+    crate::platform::cas_io::open_regular_nofollow_read_write(path)
 }
 
 /// Open an existing ledger for append, or atomically create a new real regular
-/// single-link ledger.  In particular, a dangling symlink is an existing path,
-/// not a missing ledger to be created through.
+/// single-link ledger without following its final symlink or reparse point.
 pub fn open_or_create_regular_nofollow_append(path: &Path) -> Result<File> {
-    for _ in 0..4 {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) => {
-                if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-                    return Err(non_regular_object_error(path));
-                }
-                #[cfg(unix)]
-                if !is_single_link_regular_metadata(&metadata) {
-                    return Err(non_regular_object_error(path));
-                }
-                let mut options = OpenOptions::new();
-                options.append(true);
-                configure_no_follow(&mut options);
-                #[cfg(windows)]
-                let before_handle = open_windows_regular_nofollow_observation(path)?;
-                let file = options.open(path).kio_io(path)?;
-                #[cfg(windows)]
-                validate_open_regular_nofollow_with_windows_before(path, &file, &before_handle)?;
-                #[cfg(not(windows))]
-                validate_open_regular_nofollow_with_before(path, &file, &metadata)?;
-                return Ok(file);
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let mut options = OpenOptions::new();
-                options.write(true).append(true).create_new(true);
-                configure_no_follow(&mut options);
-                match options.open(path) {
-                    Ok(file) => {
-                        validate_open_regular_nofollow(path, &file)?;
-                        return Ok(file);
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => return Err(error).kio_io(path),
-                }
-            }
-            Err(error) => return Err(error).kio_io(path),
-        }
-    }
-    Err(KioError::io(
-        "could not safely create ledger file after concurrent path changes",
-        path.display().to_string(),
-    ))
+    crate::platform::cas_io::open_or_create_regular_nofollow_append(path)
 }
 
 fn validate_open_regular_nofollow(path: &Path, file: &File) -> Result<()> {
-    let opened = file.metadata().kio_io(path)?;
-    let after = fs::symlink_metadata(path).kio_io(path)?;
-    #[cfg(windows)]
-    let same_identity = {
-        let mut verification_options = OpenOptions::new();
-        verification_options.read(true);
-        configure_no_follow(&mut verification_options);
-        let verification = verification_options.open(path).kio_io(path)?;
-        verification.metadata().kio_io(path)?.is_file()
-            && same_windows_cas_file(file, &verification)
-    };
-    #[cfg(not(windows))]
-    let same_identity = same_file_identity(&opened, &after);
-    if !opened.is_file()
-        || !after.file_type().is_file()
-        || after.file_type().is_symlink()
-        || !same_identity
-    {
-        return Err(non_regular_object_error(path));
-    }
-    #[cfg(unix)]
-    {
-        if !is_single_link_regular_metadata(&opened) || !is_single_link_regular_metadata(&after) {
-            return Err(non_regular_object_error(path));
-        }
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn validate_open_regular_nofollow_with_before(
-    path: &Path,
-    file: &File,
-    before: &fs::Metadata,
-) -> Result<()> {
-    let opened = file.metadata().kio_io(path)?;
-    if !same_file_identity(before, &opened) {
-        return Err(non_regular_object_error(path));
-    }
-    #[cfg(unix)]
-    if !is_single_link_regular_metadata(before) || !is_single_link_regular_metadata(&opened) {
-        return Err(non_regular_object_error(path));
-    }
-    validate_open_regular_nofollow(path, file)
-}
-
-#[cfg(windows)]
-fn validate_open_regular_nofollow_with_windows_before(
-    path: &Path,
-    file: &File,
-    before: &File,
-) -> Result<()> {
-    let mut options = OpenOptions::new();
-    options.read(true);
-    configure_no_follow(&mut options);
-    let after = options.open(path).kio_io(path)?;
-    if !same_windows_cas_file_triplet(before, file, &after) {
-        return Err(non_regular_object_error(path));
-    }
-    validate_open_regular_nofollow(path, file)
+    crate::platform::cas_io::validate_open_regular_nofollow(path, file)
 }
 
 #[cfg(any(test, windows))]
@@ -4435,20 +4221,20 @@ impl WindowsFileInformation {
     }
 
     #[cfg(windows)]
-    pub(crate) fn directory_identity(self) -> Option<WindowsDirectoryIdentity> {
+    pub(crate) fn directory_identity(self) -> Option<DirectoryHandleIdentity> {
         self.is_real_directory()
-            .then_some(WindowsDirectoryIdentity {
-                volume_serial_number: self.volume_serial_number,
-                file_index: self.file_index,
-            })
+            .then_some(DirectoryHandleIdentity::new(
+                self.volume_serial_number,
+                self.file_index,
+            ))
     }
 
     #[cfg(windows)]
-    pub(crate) fn regular_file_identity(self) -> Option<WindowsRegularFileIdentity> {
-        (self.is_regular_file() && self.is_single_link()).then_some(WindowsRegularFileIdentity {
-            volume_serial_number: self.volume_serial_number,
-            file_index: self.file_index,
-        })
+    pub(crate) fn regular_file_identity(self) -> Option<RegularFileHandleIdentity> {
+        (self.is_regular_file() && self.is_single_link()).then_some(RegularFileHandleIdentity::new(
+            self.volume_serial_number,
+            self.file_index,
+        ))
     }
 }
 
@@ -4802,29 +4588,6 @@ fn read_bounded_regular_file_inner(
         ));
     }
     Ok(bytes)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RegularFileStability {
-    len: u64,
-    modified: SystemTime,
-    #[cfg(unix)]
-    changed: (i64, i64),
-}
-
-fn observe_regular_file_stability(
-    metadata: &fs::Metadata,
-    path: &Path,
-) -> Result<RegularFileStability> {
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
-
-    Ok(RegularFileStability {
-        len: metadata.len(),
-        modified: metadata.modified().kio_io(path)?,
-        #[cfg(unix)]
-        changed: (metadata.ctime(), metadata.ctime_nsec()),
-    })
 }
 
 /// `Some(path)` when the CAS slot is occupied by anything at all — a symlink or

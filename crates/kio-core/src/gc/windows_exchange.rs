@@ -160,7 +160,7 @@ mod implementation {
 
     /// Hash a bounded single-link regular file using its exact retained handle.
     pub fn observe(file: &File, max: u64) -> Result<FileRecord> {
-        let id = crate::cas::windows_regular_file_handle_identity(file)
+        let id = crate::platform::regular_file_handle_identity(file)
             .ok_or_else(|| failure("unsafe exchange file handle"))?;
         let (volume, index) = id.atomic_recovery_components();
         let length = file.metadata().map_err(|e| failure(e.to_string()))?.len();
@@ -190,7 +190,7 @@ mod implementation {
             hash.update(&buffer[..n]);
         }
         if read != length
-            || crate::cas::windows_regular_file_handle_identity(file) != Some(id)
+            || crate::platform::regular_file_handle_identity(file) != Some(id)
             || file.metadata().map_err(|e| failure(e.to_string()))?.len() != length
         {
             return Err(failure("exchange file changed while hashing"));
@@ -313,7 +313,8 @@ mod implementation {
             if self.state == Placement::Initial {
                 self.checkpoint(ExchangeStep::IntentPublished)?;
                 checkpoint(ExchangeStep::IntentPublished)?;
-                self.public.move_verified_regular_handle_to_raw(
+                crate::platform::move_verified_regular_handle_to_raw(
+                    self.public,
                     self.source
                         .as_ref()
                         .ok_or_else(|| failure("missing exchange source"))?,
@@ -326,7 +327,8 @@ mod implementation {
                 checkpoint(ExchangeStep::SourceCaptured)?;
             }
             if self.state == Placement::Captured {
-                self.prepared.move_verified_regular_handle_to_raw(
+                crate::platform::move_verified_regular_handle_to_raw(
+                    self.prepared,
                     &self.target,
                     self.public,
                     Path::new(&self.intent.public),
@@ -337,7 +339,8 @@ mod implementation {
                 checkpoint(ExchangeStep::TargetPublished)?;
             }
             if self.state == Placement::Published {
-                self.owner.move_verified_regular_handle_to_raw(
+                crate::platform::move_verified_regular_handle_to_raw(
+                    self.owner,
                     self.source
                         .as_ref()
                         .ok_or_else(|| failure("missing exchange source"))?,
@@ -354,7 +357,7 @@ mod implementation {
                     .source
                     .take()
                     .ok_or_else(|| failure("missing retirement source"))?;
-                self.prepared.retire_gc_handle(&source)?;
+                crate::platform::retire_gc_handle(self.prepared, &source)?;
                 drop(source);
                 self.state = Placement::Retired;
                 self.check()?;
@@ -540,7 +543,7 @@ mod implementation {
                 roles.push(None);
                 continue;
             }
-            let file = parent.open_gc_mutation(Path::new(leaf), max)?;
+            let file = crate::platform::open_gc_mutation(parent, Path::new(leaf), max)?;
             let observed = observe(&file, max)?;
             if observed == intent.source && source.is_none() {
                 source = Some(file);
@@ -589,8 +592,8 @@ mod implementation {
         if inspect_pending(owner)? {
             return Err(failure("exchange already pending"));
         }
-        let source = public.open_gc_mutation(Path::new(public_leaf), max)?;
-        let target = prepared.open_gc_mutation(Path::new(prepared_leaf), max)?;
+        let source = crate::platform::open_gc_mutation(public, Path::new(public_leaf), max)?;
+        let target = crate::platform::open_gc_mutation(prepared, Path::new(prepared_leaf), max)?;
         if observe(&source, max)? != expected.source || observe(&target, max)? != expected.target {
             return Err(failure("exchange initial authority mismatch"));
         }
@@ -724,12 +727,14 @@ mod windows_tests {
             let (owner, public, prepared) = (&dirs[0], &dirs[1], &dirs[2]);
             fs::write(public.path().join("in_progress"), b"old").unwrap();
             fs::write(prepared.path().join(".gc-retired-marker-1-2"), b"new").unwrap();
-            let source = public
-                .open_gc_mutation(Path::new("in_progress"), 64)
-                .unwrap();
-            let target = prepared
-                .open_gc_mutation(Path::new(".gc-retired-marker-1-2"), 64)
-                .unwrap();
+            let source =
+                crate::platform::open_gc_mutation(public, Path::new("in_progress"), 64).unwrap();
+            let target = crate::platform::open_gc_mutation(
+                prepared,
+                Path::new(".gc-retired-marker-1-2"),
+                64,
+            )
+            .unwrap();
             let expected = ExchangeExpected {
                 source: observe(&source, 64).unwrap(),
                 target: observe(&target, 64).unwrap(),
@@ -829,12 +834,14 @@ mod windows_tests {
             let (owner, public, prepared) = (&dirs[0], &dirs[1], &dirs[2]);
             fs::write(public.path().join("in_progress"), b"old").unwrap();
             fs::write(prepared.path().join(".gc-retired-marker-1-2"), b"new").unwrap();
-            let source = public
-                .open_gc_mutation(Path::new("in_progress"), 64)
-                .unwrap();
-            let target = prepared
-                .open_gc_mutation(Path::new(".gc-retired-marker-1-2"), 64)
-                .unwrap();
+            let source =
+                crate::platform::open_gc_mutation(public, Path::new("in_progress"), 64).unwrap();
+            let target = crate::platform::open_gc_mutation(
+                prepared,
+                Path::new(".gc-retired-marker-1-2"),
+                64,
+            )
+            .unwrap();
             let expected = ExchangeExpected {
                 source: observe(&source, 64).unwrap(),
                 target: observe(&target, 64).unwrap(),

@@ -2370,7 +2370,7 @@ fn validate_real_directory(path: &Path) -> Result<()> {
     // trees, so descending through one could unlink files outside Kio.  Verify
     // the opened directory handle before every traversal step.
     #[cfg(windows)]
-    if !kio_core::cas::windows_directory_is_real(path)
+    if !kio_core::platform::directory_is_real(path)
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
     {
         return Err(store_corrupt(path, "expected a real non-reparse directory"));
@@ -2423,8 +2423,10 @@ fn validate_existing_regular(path: &Path, max_bytes: Option<u64>) -> Result<fs::
 }
 
 #[cfg(windows)]
-fn windows_regular_file_identity(path: &Path) -> Result<kio_core::cas::WindowsRegularFileIdentity> {
-    kio_core::cas::windows_real_regular_file_identity(path)
+fn windows_regular_file_identity(
+    path: &Path,
+) -> Result<kio_core::platform::RegularFileHandleIdentity> {
+    kio_core::platform::real_regular_file_identity(path)
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
         .ok_or_else(|| store_corrupt(path, "expected a real single-link regular file"))
 }
@@ -2443,7 +2445,7 @@ fn read_bounded_regular(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> 
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
     #[cfg(windows)]
     let identity_matches = same_file_identity(&listed, &opened)
-        && kio_core::cas::windows_regular_file_handle_identity(&file) == Some(listed_identity);
+        && kio_core::platform::regular_file_handle_identity(&file) == Some(listed_identity);
     #[cfg(not(windows))]
     let identity_matches = same_file_identity(&listed, &opened);
     if !identity_matches {
@@ -2483,9 +2485,9 @@ struct TreeRemoval {
     expected: fs::Metadata,
     is_directory: bool,
     #[cfg(windows)]
-    directory_identity: Option<kio_core::cas::WindowsDirectoryIdentity>,
+    directory_identity: Option<kio_core::platform::DirectoryHandleIdentity>,
     #[cfg(windows)]
-    regular_file_identity: Option<kio_core::cas::WindowsRegularFileIdentity>,
+    regular_file_identity: Option<kio_core::platform::RegularFileHandleIdentity>,
 }
 
 fn remove_tree_nofollow(path: &Path) -> Result<bool> {
@@ -2501,7 +2503,7 @@ fn remove_tree_nofollow(path: &Path) -> Result<bool> {
             .map_err(|error| KioError::io(error.to_string(), entry.display().to_string()))?;
         #[cfg(windows)]
         let identity_matches = if removal.is_directory {
-            kio_core::cas::windows_real_directory_identity(&entry)
+            kio_core::platform::real_directory_identity(&entry)
                 .map_err(|error| KioError::io(error.to_string(), entry.display().to_string()))?
                 == removal.directory_identity
         } else {
@@ -2541,7 +2543,7 @@ fn collect_tree_removals(path: &Path, output: &mut Vec<TreeRemoval>, depth: usiz
     }
     if metadata.is_dir() {
         #[cfg(windows)]
-        let directory_identity = kio_core::cas::windows_real_directory_identity(path)
+        let directory_identity = kio_core::platform::real_directory_identity(path)
             .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
             .ok_or_else(|| store_corrupt(path, "artifact tree contains a reparse directory"))?;
         for child in read_real_directory(path)? {
@@ -2725,7 +2727,7 @@ fn atomic_private_replace(path: &Path, bytes: &[u8]) -> Result<()> {
         ));
     }
     #[cfg(windows)]
-    let parent_identity = kio_core::cas::windows_real_directory_identity(parent)
+    let parent_identity = kio_core::platform::real_directory_identity(parent)
         .map_err(|error| KioError::io(error.to_string(), parent.display().to_string()))?
         .ok_or_else(|| store_corrupt(parent, "purge state parent is a reparse directory"))?;
     let original_leaf = if path_exists(path)? {
@@ -2765,7 +2767,7 @@ fn atomic_private_replace(path: &Path, bytes: &[u8]) -> Result<()> {
         drop(file);
         #[cfg(windows)]
         {
-            let current_parent = kio_core::cas::windows_real_directory_identity(parent)
+            let current_parent = kio_core::platform::real_directory_identity(parent)
                 .map_err(|error| KioError::io(error.to_string(), parent.display().to_string()))?;
             if current_parent != Some(parent_identity) {
                 return Err(store_corrupt(

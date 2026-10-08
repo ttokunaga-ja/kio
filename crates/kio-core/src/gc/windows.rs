@@ -19,10 +19,15 @@ impl GcSweepSession {
         let source = directory(canonical_parent)?;
         let archive = directory(archive_parent)?;
         let (mut victim, needs_move) =
-            match source.open_gc_mutation(Path::new(raw), MAX_TREE_OBJECT_BYTES) {
+            match crate::platform::open_gc_mutation(&source, Path::new(raw), MAX_TREE_OBJECT_BYTES)
+            {
                 Ok(file) => (file, true),
                 Err(error) if is_io_not_found(&error) => {
-                    match archive.open_gc_mutation(Path::new(quarantine), MAX_TREE_OBJECT_BYTES) {
+                    match crate::platform::open_gc_mutation(
+                        &archive,
+                        Path::new(quarantine),
+                        MAX_TREE_OBJECT_BYTES,
+                    ) {
                         Ok(file) => (file, false),
                         // Disposition already removed every name before interruption.
                         Err(error) if is_io_not_found(&error) => return Ok(false),
@@ -45,7 +50,12 @@ impl GcSweepSession {
             self.wait_at_gc_pre_quarantine_barrier();
             self.validate_tree_removal_permit(permit, marker)?;
             self.require_live_pre_sweep_index_binding(marker)?;
-            source.move_verified_regular_handle_to_raw(&victim, &archive, Path::new(quarantine))?;
+            crate::platform::move_verified_regular_handle_to_raw(
+                &source,
+                &victim,
+                &archive,
+                Path::new(quarantine),
+            )?;
         }
         let (moved, observed) = observe(&mut victim, MAX_TREE_OBJECT_BYTES)?;
         if moved != bytes || !matches_stable(&observed, &before) || hash_bytes(&moved) != tree_hash
@@ -63,7 +73,7 @@ impl GcSweepSession {
             return Err(corrupt("tree changed immediately before GC erase"));
         }
         self.inject_gc_tree_fault(GcTreeFaultPoint::TreeRetirementCapture)?;
-        archive.retire_gc_handle(&victim)?;
+        crate::platform::retire_gc_handle(&archive, &victim)?;
         Ok(true)
     }
 }
@@ -160,12 +170,20 @@ impl GcSweepSession {
             MAX_MARKER_BYTES,
         )?;
         let authority = {
-            let mut source = public.open_gc_mutation(Path::new("in_progress"), MAX_MARKER_BYTES)?;
+            let mut source = crate::platform::open_gc_mutation(
+                &public,
+                Path::new("in_progress"),
+                MAX_MARKER_BYTES,
+            )?;
             let (_, observed) = observe(&mut source, MAX_MARKER_BYTES)?;
             if observed != *expected {
                 return Err(corrupt("GC marker changed before replacement"));
             }
-            let target = prepared.open_gc_mutation(Path::new(&temporary), MAX_MARKER_BYTES)?;
+            let target = crate::platform::open_gc_mutation(
+                &prepared,
+                Path::new(&temporary),
+                MAX_MARKER_BYTES,
+            )?;
             if marker_from_handle(&target)? != *marker {
                 return Err(corrupt("GC prepared marker changed before exchange"));
             }

@@ -10,7 +10,7 @@ pub mod history;
 #[doc(hidden)]
 pub mod identity_serde;
 pub mod management;
-pub(crate) mod platform;
+pub mod platform;
 pub mod portable;
 pub mod private_fs;
 pub mod purge;

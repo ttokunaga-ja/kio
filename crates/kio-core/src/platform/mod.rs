@@ -1,3 +1,9 @@
+#[derive(Clone, Copy)]
+pub(crate) enum NativeIdentityFamily {
+    Unix,
+    Windows,
+}
+
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -10,9 +16,9 @@ mod windows;
 #[cfg(target_os = "macos")]
 pub(crate) use macos::private_acl;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
-pub(crate) use unix::{private_fs, profile::windows_profile_dir, store};
+pub(crate) use unix::{private_fs, profile::profile_dir, store};
 #[cfg(target_os = "windows")]
-pub(crate) use windows::{private_fs, profile::windows_profile_dir, store};
+pub(crate) use windows::{private_fs, profile::profile_dir, store};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use unix::{
@@ -84,8 +90,6 @@ pub(crate) use unix::{
         retire_snapshot_state_temporary as gc_retire_snapshot_state_temporary,
     },
     scope_io::{
-        configure_scope_no_follow as scope_configure_no_follow,
-        effective_uid as scope_effective_uid,
         open_bound_scope_file_nofollow as scope_open_bound_nofollow,
         read_bound_regular_text_observed_at as scope_read_bound_regular_text_observed_at,
     },
@@ -100,8 +104,54 @@ pub(crate) use windows::{
     },
     gc_snapshot_io,
     scheduled::read_bound_regular_text_observed_at as scope_read_bound_regular_text_observed_at,
-    scope_io::{
-        configure_scope_no_follow as scope_configure_no_follow,
-        open_bound_scope_file_nofollow as scope_open_bound_nofollow,
-    },
+    scope_io::open_bound_scope_file_nofollow as scope_open_bound_nofollow,
 };
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::{
+    atomic::atomic_relative_spelling_is_normalized, management::NATIVE_IDENTITY_FAMILY,
+};
+#[cfg(target_os = "windows")]
+pub(crate) use windows::{
+    atomic::atomic_relative_spelling_is_normalized, management::NATIVE_IDENTITY_FAMILY,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RegularFileStability {
+    pub(crate) len: u64,
+    pub(crate) modified: std::time::SystemTime,
+    pub(crate) changed: Option<(i64, i64)>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use unix::cas_identity::{
+    DirectoryHandleIdentity, RegularFileHandleIdentity, directory_handle_identity,
+    directory_is_real, real_directory_identity, real_regular_file_identity,
+    regular_file_handle_identity, regular_file_is_safe,
+};
+#[cfg(target_os = "windows")]
+pub use windows::cas_identity::{
+    DirectoryHandleIdentity, RegularFileHandleIdentity, directory_handle_identity,
+    directory_is_real, real_directory_identity, real_regular_file_identity,
+    regular_file_handle_identity, regular_file_is_safe,
+};
+#[cfg(target_os = "windows")]
+pub use windows::store::{move_verified_regular_handle_to_raw, open_gc_mutation, retire_gc_handle};
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use unix::scope_io::{
+    BoundMetadataObservation, ScheduledSourceIdentity, configure_private_stage,
+    open_scope_file_nofollow as scope_open_nofollow, scheduled_source_identity,
+    set_scope_directory_permissions, validate_scope_path_private, validate_scope_store_private,
+};
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) use windows::scope_io::same_scope_file_identity as scope_same_file_identity;
+#[cfg(target_os = "windows")]
+pub(crate) use windows::scope_io::{
+    BoundMetadataObservation, ScheduledSourceIdentity, configure_private_stage,
+    open_scope_file_nofollow as scope_open_nofollow, scheduled_source_identity,
+    set_scope_directory_permissions, validate_scope_path_private, validate_scope_store_private,
+};
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+pub(crate) use unix::scope_io::effective_uid as scope_effective_uid;

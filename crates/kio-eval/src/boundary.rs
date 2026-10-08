@@ -32,7 +32,7 @@ pub(crate) enum DirectoryIdentity {
     #[cfg(unix)]
     Unix { dev: u64, ino: u64 },
     #[cfg(windows)]
-    Windows(kio_core::cas::WindowsDirectoryIdentity),
+    Windows(kio_core::platform::DirectoryHandleIdentity),
 }
 
 #[derive(Debug, Error)]
@@ -474,7 +474,7 @@ pub(crate) fn directory_identity_from_path(
     #[cfg(windows)]
     {
         let _ = listed;
-        return kio_core::cas::windows_real_directory_identity(path)
+        return kio_core::platform::real_directory_identity(path)
             .map(|identity| identity.map(DirectoryIdentity::Windows));
     }
     #[allow(unreachable_code)]
@@ -500,7 +500,7 @@ pub(crate) fn directory_identity_from_file(
     #[cfg(windows)]
     {
         return Ok(
-            kio_core::cas::windows_directory_handle_identity(file).map(DirectoryIdentity::Windows)
+            kio_core::platform::directory_handle_identity(file).map(DirectoryIdentity::Windows)
         );
     }
     #[allow(unreachable_code)]

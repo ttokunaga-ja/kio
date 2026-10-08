@@ -54,10 +54,16 @@ impl DirectoryIdentity {
     /// local filesystem probe.
     #[must_use]
     pub const fn is_native_platform(&self) -> bool {
-        match self {
-            Self::Unix { .. } => cfg!(unix),
-            Self::Windows { .. } => cfg!(windows),
-        }
+        use crate::platform::{NATIVE_IDENTITY_FAMILY, NativeIdentityFamily};
+        let family = match self {
+            Self::Unix { .. } => NativeIdentityFamily::Unix,
+            Self::Windows { .. } => NativeIdentityFamily::Windows,
+        };
+        matches!(
+            (family, NATIVE_IDENTITY_FAMILY),
+            (NativeIdentityFamily::Unix, NativeIdentityFamily::Unix)
+                | (NativeIdentityFamily::Windows, NativeIdentityFamily::Windows)
+        )
     }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

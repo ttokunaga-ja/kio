@@ -955,7 +955,7 @@ fn validate_real_directory(path: &Path) -> Result<()> {
         ));
     }
     #[cfg(windows)]
-    if !kio_core::cas::windows_directory_is_real(path)
+    if !kio_core::platform::directory_is_real(path)
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
     {
         return Err(unsafe_export_error(
@@ -1056,7 +1056,7 @@ fn validate_replaceable_file(path: &Path) -> Result<()> {
         }
     }
     #[cfg(windows)]
-    if !kio_core::cas::windows_regular_file_is_safe(path)
+    if !kio_core::platform::regular_file_is_safe(path)
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
     {
         return Err(unsafe_export_error(
@@ -1126,7 +1126,7 @@ struct DestinationIdentity {
     #[cfg(unix)]
     ino: u64,
     #[cfg(windows)]
-    identity: kio_core::cas::WindowsDirectoryIdentity,
+    identity: kio_core::platform::DirectoryHandleIdentity,
     #[cfg(not(any(unix, windows)))]
     len: u64,
 }
@@ -1147,7 +1147,7 @@ impl DestinationIdentity {
 
     #[cfg(windows)]
     fn matches_opened(&self, opened: &File) -> bool {
-        kio_core::cas::windows_directory_handle_identity(opened) == Some(self.identity)
+        kio_core::platform::directory_handle_identity(opened) == Some(self.identity)
     }
 
     #[cfg(not(any(unix, windows)))]
@@ -1166,7 +1166,7 @@ fn destination_lstat_identity(path: &Path) -> Result<DestinationIdentity> {
         // the leaf is not a real directory — a reparse point or a non-directory
         // that `verify_existing_directory_chain` rejected moments ago, so its
         // appearance here is itself a mid-check swap. Fail closed.
-        let Some(identity) = kio_core::cas::windows_real_directory_identity(path)
+        let Some(identity) = kio_core::platform::real_directory_identity(path)
             .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
         else {
             return Err(unsafe_export_error(

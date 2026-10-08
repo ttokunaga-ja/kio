@@ -388,14 +388,13 @@ impl OwnerOnlyDescriptor {
 }
 
 fn verify_directory_handle(file: &fs::File, path: &Path, owner: &CurrentUserSid) -> io::Result<()> {
-    let handle_identity =
-        kio_core::cas::windows_directory_handle_identity(file).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "private registry snapshot directory is reparse or not a directory",
-            )
-        })?;
-    let path_identity = kio_core::cas::windows_real_directory_identity(path)?;
+    let handle_identity = kio_core::platform::directory_handle_identity(file).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "private registry snapshot directory is reparse or not a directory",
+        )
+    })?;
+    let path_identity = kio_core::platform::real_directory_identity(path)?;
     if path_identity != Some(handle_identity) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -407,13 +406,13 @@ fn verify_directory_handle(file: &fs::File, path: &Path, owner: &CurrentUserSid)
 
 fn verify_file_handle(file: &fs::File, path: &Path, owner: &CurrentUserSid) -> io::Result<()> {
     let handle_identity =
-        kio_core::cas::windows_regular_file_handle_identity(file).ok_or_else(|| {
+        kio_core::platform::regular_file_handle_identity(file).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "private registry snapshot leaf is reparse, non-regular, or linked",
             )
         })?;
-    let path_identity = kio_core::cas::windows_real_regular_file_identity(path)?;
+    let path_identity = kio_core::platform::real_regular_file_identity(path)?;
     if path_identity != Some(handle_identity) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -506,13 +505,13 @@ fn open_private_leaf_for_delete(
     // SAFETY: `CreateFileW` returned an owned valid handle.
     let file = unsafe { fs::File::from_raw_handle(raw as _) };
     let handle_identity =
-        kio_core::cas::windows_regular_file_handle_identity(&file).ok_or_else(|| {
+        kio_core::platform::regular_file_handle_identity(&file).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "owner-private registry snapshot cleanup leaf is unsafe",
             )
         })?;
-    let path_identity = kio_core::cas::windows_real_regular_file_identity(&path)?;
+    let path_identity = kio_core::platform::real_regular_file_identity(&path)?;
     if path_identity != Some(handle_identity) {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

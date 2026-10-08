@@ -1197,13 +1197,13 @@ fn verify_private_parent_handle(file: &File, path: &Path) -> Result<()> {
 }
 
 #[cfg(windows)]
-type DirectoryIdentity = kio_core::cas::WindowsDirectoryIdentity;
+type DirectoryIdentity = kio_core::platform::DirectoryHandleIdentity;
 #[cfg(windows)]
-type RegularFileIdentity = kio_core::cas::WindowsRegularFileIdentity;
+type RegularFileIdentity = kio_core::platform::RegularFileHandleIdentity;
 
 #[cfg(windows)]
 fn directory_identity(file: &File, path: &Path) -> Result<DirectoryIdentity> {
-    kio_core::cas::windows_directory_handle_identity(file).ok_or_else(|| {
+    kio_core::platform::directory_handle_identity(file).ok_or_else(|| {
         contract(
             "KIO-E-LEDGER-PRIVATE-001",
             format!(
@@ -1216,7 +1216,7 @@ fn directory_identity(file: &File, path: &Path) -> Result<DirectoryIdentity> {
 
 #[cfg(windows)]
 fn regular_file_identity(file: &File, path: &Path) -> Result<RegularFileIdentity> {
-    kio_core::cas::windows_regular_file_handle_identity(file).ok_or_else(|| {
+    kio_core::platform::regular_file_handle_identity(file).ok_or_else(|| {
         contract(
             "KIO-E-LEDGER-PRIVATE-001",
             format!(

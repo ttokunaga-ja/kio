@@ -76,7 +76,7 @@ pub(crate) fn create_new_private_at(
     leaf: &OsStr,
     kind: NewPrivateObjectKind,
 ) -> std::io::Result<File> {
-    if crate::cas::windows_directory_handle_identity(parent).is_none() {
+    if crate::platform::directory_handle_identity(parent).is_none() {
         return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
     }
     let name: Vec<u16> = leaf.encode_wide().collect();
@@ -181,10 +181,10 @@ pub(crate) fn create_new_private_at(
     let file = unsafe { File::from_raw_handle(handle as _) };
     let valid = match kind {
         NewPrivateObjectKind::Directory => {
-            crate::cas::windows_directory_handle_identity(&file).is_some()
+            crate::platform::directory_handle_identity(&file).is_some()
         }
         NewPrivateObjectKind::RegularFile => {
-            crate::cas::windows_regular_file_handle_identity(&file).is_some()
+            crate::platform::regular_file_handle_identity(&file).is_some()
         }
     };
     if !valid {
@@ -239,8 +239,8 @@ pub(crate) fn verify_private_directory_handle(directory: &StoreDirectory) -> Res
 pub(crate) fn restrict_existing_private_handle(file: &File) -> Result<()> {
     let owner = CurrentUserSid::current()
         .map_err(|_| unsafe_file("cannot determine current Windows user", None))?;
-    let directory = crate::cas::windows_directory_handle_identity(file);
-    let regular = crate::cas::windows_regular_file_handle_identity(file);
+    let directory = crate::platform::directory_handle_identity(file);
+    let regular = crate::platform::regular_file_handle_identity(file);
     match (directory, regular) {
         (Some(_), None) | (None, Some(_)) => {}
         _ => {
@@ -382,7 +382,7 @@ fn read_private_leaf(
     let mut file = cap_fs::open(parent, Path::new(leaf), &options)
         .map_err(|_| unsafe_file("cannot open private trust file", Some(path)))?;
     let before_identity =
-        crate::cas::windows_regular_file_handle_identity(&file).ok_or_else(|| {
+        crate::platform::regular_file_handle_identity(&file).ok_or_else(|| {
             unsafe_file(
                 "private trust file is reparse, nonregular, or hardlinked",
                 Some(path),
@@ -406,13 +406,12 @@ fn read_private_leaf(
     if body.len() as u64 > max_bytes {
         return Err(oversized_file(max_bytes, body.len() as u64, path));
     }
-    let after_identity =
-        crate::cas::windows_regular_file_handle_identity(&file).ok_or_else(|| {
-            unsafe_file(
-                "private trust file changed type while it was read",
-                Some(path),
-            )
-        })?;
+    let after_identity = crate::platform::regular_file_handle_identity(&file).ok_or_else(|| {
+        unsafe_file(
+            "private trust file changed type while it was read",
+            Some(path),
+        )
+    })?;
     let after = file
         .metadata()
         .map_err(|_| unsafe_file("cannot recheck private trust file", Some(path)))?;
@@ -473,7 +472,7 @@ pub(crate) fn verify_trusted_executable(path: &Path) -> Result<()> {
         &options,
     )
     .map_err(|_| unsafe_file("cannot open scheduler executable", Some(path)))?;
-    if crate::cas::windows_regular_file_handle_identity(&file).is_none() {
+    if crate::platform::regular_file_handle_identity(&file).is_none() {
         return Err(unsafe_file(
             "scheduler executable is reparse, nonregular, or hardlinked",
             Some(path),
@@ -559,7 +558,7 @@ fn change_time(file: &File, path: &Path) -> Result<i64> {
 }
 
 fn verify_real_directory(directory: &File, path: &Path) -> Result<()> {
-    if crate::cas::windows_directory_handle_identity(directory).is_none() {
+    if crate::platform::directory_handle_identity(directory).is_none() {
         return Err(unsafe_file(
             "private trust file path contains a reparse or non-directory component",
             Some(path),
@@ -962,7 +961,7 @@ pub(crate) fn resolve_inherited_private_root(
 }
 
 pub(crate) fn verify_trusted_owned_regular_file_handle(file: &std::fs::File) -> Result<()> {
-    if crate::cas::windows_regular_file_handle_identity(file).is_none() {
+    if crate::platform::regular_file_handle_identity(file).is_none() {
         return Err(unsafe_file(
             "trusted leaf is not a single-link regular file",
             None,

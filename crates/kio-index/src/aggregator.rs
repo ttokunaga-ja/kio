@@ -527,7 +527,7 @@ fn open_or_create_cache_parent(
         )));
     }
     #[cfg(windows)]
-    let before_identity = kio_core::cas::windows_real_directory_identity(existing)
+    let before_identity = kio_core::platform::real_directory_identity(existing)
         .map_err(|error| {
             crate::IndexError::Schema(format!(
                 "inspect aggregator cache ancestor reparse state {}: {error}",
@@ -570,7 +570,7 @@ fn open_or_create_cache_parent(
     }
     #[cfg(windows)]
     {
-        if kio_core::cas::windows_directory_handle_identity(&handle) != Some(before_identity) {
+        if kio_core::platform::directory_handle_identity(&handle) != Some(before_identity) {
             return Err(crate::IndexError::Schema(format!(
                 "aggregator cache ancestor changed while opening: {}",
                 existing.display()

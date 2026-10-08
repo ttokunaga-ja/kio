@@ -21,3 +21,6 @@ pub(crate) fn file_identity(f: &File) -> Result<DirectoryIdentity> {
         inode: m.ino(),
     })
 }
+
+pub(crate) const NATIVE_IDENTITY_FAMILY: crate::platform::NativeIdentityFamily =
+    crate::platform::NativeIdentityFamily::Unix;

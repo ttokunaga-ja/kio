@@ -195,11 +195,7 @@ fn valid_relative(relative: &Path) -> Result<String> {
             "atomic target path exceeds its byte or encoding bound",
         ));
     }
-    if raw
-        .split(|ch| ch == '/' || (cfg!(windows) && ch == '\\'))
-        .any(|part| part.is_empty() || part == "." || part == "..")
-        || (!cfg!(windows) && raw.contains('\\'))
-    {
+    if !crate::platform::atomic_relative_spelling_is_normalized(raw) {
         return Err(failure("atomic target path must be normalized"));
     }
     let mut parts = Vec::new();
@@ -258,7 +254,7 @@ fn file_id(file: &File) -> Result<FileSystemIdentity> {
     }
     #[cfg(windows)]
     {
-        crate::cas::windows_regular_file_handle_identity(file)
+        crate::platform::regular_file_handle_identity(file)
             .map(|id| {
                 let (volume_serial_number, file_index) = id.atomic_recovery_components();
                 FileSystemIdentity::Windows {
@@ -645,7 +641,12 @@ fn recover_locked(
             {
                 return Err(failure("removal source does not match its ready intent"));
             }
-            parent.move_verified_regular_handle_to_raw(&source, workspace, Path::new(REMOVED))?;
+            crate::platform::move_verified_regular_handle_to_raw(
+                &parent,
+                &source,
+                workspace,
+                Path::new(REMOVED),
+            )?;
             if file_id(&source)? != intent.source_id {
                 return Err(failure(
                     "moved removal source no longer matches its ready intent",

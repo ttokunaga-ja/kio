@@ -342,38 +342,6 @@ impl StoreDirectory {
             &destination_parent.logical,
         )
     }
-
-    /// Open one GC mutation leaf with read/write/delete rights and read-only sharing.
-    #[cfg(windows)]
-    pub fn open_gc_mutation(&self, leaf: &Path, max_bytes: u64) -> Result<File> {
-        platform::direct_leaf(leaf, &self.logical)?;
-        platform::open_gc_mutation(&self.handle, leaf, max_bytes, &self.logical)
-    }
-
-    /// Delete this exact single-link file and verify zero links before reclaiming bytes.
-    #[cfg(windows)]
-    pub fn retire_gc_handle(&self, file: &File) -> Result<()> {
-        platform::retire_gc_handle(file, &self.logical)
-    }
-
-    /// Move a Windows regular file by its already-validated retained handle.
-    /// The source name is never reopened by this primitive.
-    #[cfg(windows)]
-    pub fn move_verified_regular_handle_to_raw(
-        &self,
-        source: &File,
-        destination_parent: &StoreDirectory,
-        destination_leaf: &Path,
-    ) -> Result<()> {
-        platform::move_verified_regular_handle_to_raw(
-            &self.handle,
-            source,
-            &destination_parent.handle,
-            destination_leaf,
-            &self.logical,
-            &destination_parent.logical,
-        )
-    }
 }
 
 /// Restrict a just-created directory before it is used for persisted state.

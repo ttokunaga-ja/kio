@@ -29,12 +29,14 @@ use crate::dag::{
 };
 use crate::error::{IoResultExt, KioError, Result};
 use crate::gc::{SnapshotAutoBinding, SnapshotAutoStateBinding};
-#[cfg(unix)]
+#[cfg(all(test, unix))]
 use crate::platform::scope_effective_uid as effective_uid;
 use crate::platform::{
-    scope_configure_no_follow as configure_scope_no_follow,
+    BoundMetadataObservation, configure_private_stage, scheduled_source_identity,
     scope_open_bound_nofollow as open_bound_scope_file_nofollow,
+    scope_open_nofollow as open_scope_file_nofollow,
     scope_read_bound_regular_text_observed_at as read_bound_regular_text_observed_at,
+    set_scope_directory_permissions, validate_scope_path_private, validate_scope_store_private,
 };
 use crate::portable::{
     PORTABLE_TAGS_DIRECTORY, portable_leaf_error, portable_tag_collision_key,
@@ -44,9 +46,10 @@ use crate::purge::PurgeState;
 use crate::schema::{SchemaKind, validate_json_schema};
 use crate::store_dir::StoreDirectory;
 
+#[cfg(all(test, windows))]
+use crate::platform::scope_same_file_identity as same_scope_file_identity;
+
 mod managed_restore;
-#[cfg(windows)]
-mod scheduled_windows;
 #[cfg(windows)]
 mod windows_gate;
 pub(crate) use managed_restore::reject_pending_managed_restore;
@@ -3767,22 +3770,6 @@ fn validate_planned_root_entries(
     Ok(())
 }
 
-/// Exact identity and content observation for a descriptor-relative metadata
-/// read. This is deliberately separate from the GC observation types: the
-/// scheduler's ref/tool handoff needs only regular-file authority binding.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct BoundMetadataObservation {
-    #[cfg(not(windows))]
-    pub(crate) dev: u64,
-    #[cfg(not(windows))]
-    pub(crate) ino: u64,
-    #[cfg(windows)]
-    pub(crate) identity: crate::cas::WindowsRegularFileIdentity,
-    pub(crate) len: u64,
-    pub(crate) nlink: u64,
-    pub(crate) digest: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ScheduledSnapshotAuthority {
     head: String,
@@ -3790,18 +3777,6 @@ struct ScheduledSnapshotAuthority {
     head_observation: BoundMetadataObservation,
     tool_lock_observation: BoundMetadataObservation,
 }
-
-#[cfg(unix)]
-fn scheduled_source_identity(file: &File) -> Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = file
-        .metadata()
-        .map_err(|error| KioError::io(error.to_string(), "scheduled source"))?;
-    Ok((metadata.dev(), metadata.ino()))
-}
-
-#[cfg(windows)]
-pub(crate) use scheduled_windows::source_identity as scheduled_source_identity;
 
 pub(crate) fn canonical_tool_lock_value(value: &Value) -> Result<Value> {
     let object = value
@@ -4511,7 +4486,7 @@ fn validate_tag_refs_directory(path: &Path, allow_missing: bool) -> Result<bool>
         ));
     }
     #[cfg(windows)]
-    if !crate::cas::windows_directory_is_real(path)
+    if !crate::platform::directory_is_real(path)
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
     {
         return Err(unsafe_store_error(
@@ -4771,23 +4746,7 @@ fn validate_store_directory(kio_dir: &Path) -> Result<()> {
         ));
     }
 
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(unsafe_store_error(
-                kio_dir,
-                ".kio must not be accessible to group or other principals",
-            ));
-        }
-        if metadata.uid() != effective_uid() {
-            return Err(unsafe_store_error(
-                kio_dir,
-                ".kio must be owned by the current effective user",
-            ));
-        }
-    }
+    validate_scope_path_private(&metadata, kio_dir)?;
     Ok(())
 }
 
@@ -4796,37 +4755,10 @@ fn validate_store_directory(kio_dir: &Path) -> Result<()> {
 /// a permissive or foreign-owned `.kio` is not accepted merely because its
 /// descriptor remains valid.
 fn validate_retained_store_directory(kio: &File, label: &Path) -> Result<()> {
-    let metadata = kio
-        .metadata()
-        .map_err(|error| KioError::io(error.to_string(), label.display().to_string()))?;
-    if !metadata.is_dir() {
-        return Err(unsafe_store_error(
-            label,
-            "retained .kio handle is not a directory",
-        ));
-    }
-    #[cfg(windows)]
-    crate::private_fs::verify_owner_private_handle(kio)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if metadata.permissions().mode() & 0o077 != 0 {
-            return Err(unsafe_store_error(
-                label,
-                ".kio must not be accessible to group or other principals",
-            ));
-        }
-        if metadata.uid() != effective_uid() {
-            return Err(unsafe_store_error(
-                label,
-                ".kio must be owned by the current effective user",
-            ));
-        }
-    }
-    Ok(())
+    validate_scope_store_private(kio, label)
 }
 
-fn unsafe_store_error(path: &Path, message: &str) -> KioError {
+pub(crate) fn unsafe_store_error(path: &Path, message: &str) -> KioError {
     KioError::new(
         "KIO-E-STORE-UNSAFE-001",
         message,
@@ -4840,50 +4772,6 @@ fn open_working_file_candidate(candidate: &WorkingFileCandidate) -> Result<File>
         return open_bound_scope_file_nofollow(root, &candidate.file_name, &candidate.path);
     }
     open_scope_file_nofollow(&candidate.path)
-}
-
-fn open_scope_file_nofollow(path: &Path) -> Result<File> {
-    let before = fs::symlink_metadata(path).kio_io(path)?;
-    if before.file_type().is_symlink() || !before.file_type().is_file() {
-        return Err(scope_file_changed_path(path));
-    }
-
-    let mut options = OpenOptions::new();
-    options.read(true);
-    configure_scope_no_follow(&mut options);
-    let file = options.open(path).kio_io(path)?;
-    let opened = file.metadata().kio_io(path)?;
-    let after = fs::symlink_metadata(path).kio_io(path)?;
-    #[cfg(windows)]
-    let same_identity = {
-        let mut verification_options = OpenOptions::new();
-        verification_options.read(true);
-        configure_scope_no_follow(&mut verification_options);
-        let verification = verification_options.open(path).kio_io(path)?;
-        verification.metadata().kio_io(path)?.is_file()
-            && same_scope_file_identity(&file, &verification)
-    };
-    #[cfg(not(windows))]
-    let same_identity = same_scope_file_identity(&opened, &after);
-    if !opened.is_file()
-        || after.file_type().is_symlink()
-        || !after.file_type().is_file()
-        || !same_identity
-    {
-        return Err(scope_file_changed_path(path));
-    }
-    Ok(file)
-}
-
-#[cfg(unix)]
-fn same_scope_file_identity(opened: &fs::Metadata, path: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    opened.dev() == path.dev() && opened.ino() == path.ino()
-}
-
-#[cfg(windows)]
-fn same_scope_file_identity(opened: &File, path: &File) -> bool {
-    crate::cas::same_windows_regular_file(opened, path)
 }
 
 fn hash_scope_file(
@@ -4988,11 +4876,7 @@ fn create_raw_staging_file(parent: &Path) -> Result<(PathBuf, File)> {
         ));
         let mut options = OpenOptions::new();
         options.write(true).read(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        configure_private_stage(&mut options);
         match options.open(&path) {
             Ok(file) => return Ok((path, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -5063,7 +4947,7 @@ pub fn cleanup_orphan_raw_ingest_temps(kio_dir: &Path) -> Result<u64> {
             }
         }
         #[cfg(windows)]
-        if !crate::cas::windows_regular_file_is_safe(&path).kio_io(&path)? {
+        if !crate::platform::regular_file_is_safe(&path).kio_io(&path)? {
             return Err(orphan_raw_ingest_error(
                 &path,
                 "raw-ingest orphan is a reparse point or hard link",
@@ -5110,7 +4994,7 @@ fn validate_ingest_directory(path: &Path) -> Result<()> {
         ));
     }
     #[cfg(windows)]
-    if !crate::cas::windows_directory_is_real(path).kio_io(path)? {
+    if !crate::platform::directory_is_real(path).kio_io(path)? {
         return Err(orphan_raw_ingest_error(
             path,
             "raw-ingest namespace ancestor is a reparse point",
@@ -5301,16 +5185,7 @@ fn snapshot_authority_changed(message: &str) -> KioError {
 /// cannot read another user's archive. A 0700 parent blocks traversal into the
 /// whole subtree regardless of child modes. No-op on non-unix.
 pub fn restrict_dir_to_owner(dir: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).kio_io(dir)?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-    }
-    Ok(())
+    set_scope_directory_permissions(dir)
 }
 
 fn tree_map(tree: &TreeObject) -> BTreeMap<String, String> {
@@ -5806,7 +5681,7 @@ fn open_windows_lock_parent_kind(path: &Path, create_missing: bool) -> Result<Fi
     }
     let mut directory = cap_fs::open_ambient_dir(&root, ambient_authority())
         .map_err(|error| KioError::io(error.to_string(), root.display().to_string()))?;
-    if crate::cas::windows_directory_handle_identity(&directory).is_none() {
+    if crate::platform::directory_handle_identity(&directory).is_none() {
         return Err(KioError::locked(path.display().to_string()));
     }
     for component in components {
@@ -5835,7 +5710,7 @@ fn open_windows_lock_parent_kind(path: &Path, create_missing: bool) -> Result<Fi
             }
             Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
         };
-        if crate::cas::windows_directory_handle_identity(&directory).is_none() {
+        if crate::platform::directory_handle_identity(&directory).is_none() {
             return Err(KioError::locked(path.display().to_string()));
         }
         root.push(&component);
@@ -5926,8 +5801,10 @@ fn create_windows_lock(parent: &File, leaf: &Path, bytes: &[u8]) -> std::io::Res
 }
 
 #[cfg(windows)]
-fn read_windows_lock(file: &File) -> Result<(LockFile, crate::cas::WindowsRegularFileIdentity)> {
-    let identity = crate::cas::windows_regular_file_handle_identity(file)
+fn read_windows_lock(
+    file: &File,
+) -> Result<(LockFile, crate::platform::RegularFileHandleIdentity)> {
+    let identity = crate::platform::regular_file_handle_identity(file)
         .ok_or_else(|| KioError::locked("Windows lock leaf is not a single-link regular file"))?;
     let length = file
         .metadata()
@@ -5956,7 +5833,7 @@ fn read_windows_lock(file: &File) -> Result<(LockFile, crate::cas::WindowsRegula
     let lock: LockFile = serde_json::from_slice(&bytes)
         .map_err(|_| KioError::locked("Windows lock is malformed"))?;
     if canonical_lock_bytes_for(&lock)? != bytes
-        || crate::cas::windows_regular_file_handle_identity(file) != Some(identity)
+        || crate::platform::regular_file_handle_identity(file) != Some(identity)
     {
         return Err(KioError::locked(
             "Windows lock is not canonical or changed identity",
@@ -6017,7 +5894,7 @@ fn reclaim_windows_stale_lock(
     if process_is_alive(old.pid) {
         return Ok(None);
     }
-    if crate::cas::windows_regular_file_handle_identity(&stale) != Some(identity) {
+    if crate::platform::regular_file_handle_identity(&stale) != Some(identity) {
         return Err(KioError::locked("Windows stale lock changed identity"));
     }
     delete_windows_lock_handle(&stale).map_err(|error| KioError::io(error.to_string(), ".lock"))?;
@@ -6460,7 +6337,7 @@ struct BoundLeaseIdentity {
     #[cfg(unix)]
     ino: u64,
     #[cfg(windows)]
-    identity: crate::cas::WindowsDirectoryIdentity,
+    identity: crate::platform::DirectoryHandleIdentity,
 }
 
 thread_local! {
@@ -6482,7 +6359,7 @@ fn bound_lease_identity(kio: &File, store_gate: bool) -> Result<BoundLeaseIdenti
     }
     #[cfg(windows)]
     {
-        let identity = crate::cas::windows_directory_handle_identity(kio)
+        let identity = crate::platform::directory_handle_identity(kio)
             .ok_or_else(|| KioError::locked(".kio"))?;
         Ok(BoundLeaseIdentity {
             identity,
@@ -6603,7 +6480,7 @@ fn acquire_bound_lock_windows(kio: &File, store_gate: bool) -> Result<BoundStore
     } else {
         None
     };
-    if crate::cas::windows_directory_handle_identity(kio).is_none() {
+    if crate::platform::directory_handle_identity(kio).is_none() {
         return Err(KioError::locked(
             "retained .kio is not an ordinary directory",
         ));

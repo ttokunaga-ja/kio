@@ -571,7 +571,7 @@ fn sync_parent(parent: &BoundParent) -> Result<(), PersonaArtifactError> {
     // journaling supplies the weaker directory-entry durability guarantee.
     #[cfg(windows)]
     {
-        kio_core::cas::windows_directory_handle_identity(&parent.handle).ok_or_else(|| {
+        kio_core::platform::directory_handle_identity(&parent.handle).ok_or_else(|| {
             PersonaArtifactError::Unsafe(
                 "artifact parent must be a real directory, not a reparse point".into(),
             )
@@ -837,9 +837,9 @@ mod tests {
         ));
         assert!(bind_parent(&target).is_ok());
         let directory = cap_fs::open_ambient_dir(root.path(), ambient_authority()).unwrap();
-        let public = kio_core::cas::windows_real_directory_identity(root.path()).unwrap();
+        let public = kio_core::platform::real_directory_identity(root.path()).unwrap();
         assert_eq!(
-            kio_core::cas::windows_directory_handle_identity(&directory),
+            kio_core::platform::directory_handle_identity(&directory),
             public
         );
     }

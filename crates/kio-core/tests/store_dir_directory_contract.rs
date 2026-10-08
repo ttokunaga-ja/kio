@@ -16,7 +16,7 @@ fn full_directory_identity(file: &std::fs::File) -> (u64, [u8; 16]) {
         FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
     };
 
-    kio_core::cas::windows_directory_handle_identity(file)
+    kio_core::platform::directory_handle_identity(file)
         .expect("retained handle is a real non-reparse directory");
     let mut identity = FILE_ID_INFO::default();
     assert_ne!(

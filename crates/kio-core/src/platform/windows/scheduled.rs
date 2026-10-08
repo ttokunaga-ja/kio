@@ -8,8 +8,8 @@ use std::path::{Component, Path};
 
 use sha2::{Digest, Sha256};
 
+use super::scope_io::{BoundMetadataObservation, scheduled_source_identity as source_identity};
 use crate::error::{IoResultExt, KioError, Result};
-use crate::scope::{BoundMetadataObservation, scheduled_source_identity as source_identity};
 #[cfg(test)]
 use crate::store_dir::StoreDirectory;
 use cap_primitives::fs as cap_fs;
@@ -82,7 +82,7 @@ pub(crate) fn read_bound_regular_text_observed_at(
 }
 
 fn validate_directory(file: &File) -> Result<()> {
-    if crate::cas::windows_directory_handle_identity(file).is_none() {
+    if crate::platform::directory_handle_identity(file).is_none() {
         return Err(KioError::schema(
             "bound metadata parent is not a real directory",
         ));

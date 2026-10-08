@@ -1,3 +1,5 @@
+pub(crate) mod atomic;
+pub(crate) mod cas_identity;
 pub(crate) mod cas_io;
 pub(crate) mod durability;
 pub(crate) mod gc_io;
