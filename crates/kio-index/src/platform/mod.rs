@@ -79,3 +79,67 @@ use unix_cache::{
 pub(crate) use windows_cache::{
     BoundCache, bind_cache, open_bound_cache_connection, recreate_cache, validate_bound_cache_file,
 };
+
+#[cfg(unix)]
+#[path = "unix/source.rs"]
+mod unix_source;
+#[cfg(windows)]
+#[path = "windows/source.rs"]
+mod windows_source;
+#[cfg(unix)]
+use unix_source as source;
+#[cfg(windows)]
+use windows_source as source;
+
+#[cfg(target_os = "linux")]
+#[path = "linux/source_vfs.rs"]
+mod linux_source_vfs;
+#[cfg(target_os = "macos")]
+#[path = "macos/source_vfs.rs"]
+mod macos_source_vfs;
+#[cfg(unix)]
+#[path = "unix/source_vfs.rs"]
+mod unix_source_vfs;
+#[cfg(windows)]
+#[path = "windows/source_vfs.rs"]
+mod windows_source_vfs;
+#[cfg(target_os = "linux")]
+use linux_source_vfs as source_vfs;
+#[cfg(target_os = "macos")]
+use macos_source_vfs as source_vfs;
+#[cfg(windows)]
+pub(crate) use source_vfs::open as open_bound_source_connection;
+#[cfg(unix)]
+pub(crate) use source_vfs::open_bound_source_connection;
+#[cfg(windows)]
+use windows_source_vfs as source_vfs;
+
+#[cfg(unix)]
+#[path = "unix/source_gc.rs"]
+mod unix_source_gc;
+#[cfg(windows)]
+#[path = "windows/source_gc.rs"]
+mod windows_source_gc;
+#[cfg(unix)]
+pub(crate) use unix_source_gc::{exchange_prepared_bound_gc_index, remove_prepared_bound_gc_index};
+#[cfg(windows)]
+pub use windows_source_gc::recover_prepared_bound_gc_index;
+#[cfg(windows)]
+pub(crate) use windows_source_gc::{
+    exchange_prepared_bound_gc_index, remove_prepared_bound_gc_index,
+};
+
+#[cfg(unix)]
+pub(crate) use unix_source::{
+    BoundSourceIndex, SourceFileIdentity, bind_gc_source_leaf, bind_source_index,
+    canonical_gc_index_identity, cap_source_leaf_identity, gc_cleanup_directory,
+    open_gc_source_copy, remove_stale_gc_index_file, source_file_identity, source_file_state,
+    sync_bound_gc_directory, validate_bound_source_file,
+};
+#[cfg(windows)]
+pub(crate) use windows_source::{
+    BoundSourceIndex, SourceFileIdentity, bind_gc_source_leaf, bind_source_index,
+    canonical_gc_index_identity, cap_source_leaf_identity, gc_cleanup_directory,
+    open_gc_source_copy, remove_stale_gc_index_file, source_file_identity, source_file_state,
+    sync_bound_gc_directory, validate_bound_source_file,
+};

@@ -1089,7 +1089,7 @@ fn complete_marked_index_rotation(
     // replacement. Resolve only the journal bound to this exact marker before
     // opening the public index; an absent name never permits CREATE.
     #[cfg(windows)]
-    if kio_index::fts::recover_prepared_bound_gc_index(
+    if crate::platform::recover_prepared_bound_gc_index(
         &kio,
         &rotation.temp_leaf,
         &rotation.private_dir_identity,

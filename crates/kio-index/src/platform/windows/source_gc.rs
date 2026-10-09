@@ -4,11 +4,25 @@
 //! the intent through exact old-source retirement. This module
 //! binds that journal to the caller's index authority; completing the namespace
 //! protocol does not replace the caller's SQLite generation/attestation checks.
-use super::*;
+#[cfg(test)]
+use crate::fts::{
+    FtsSchemaConfig, FtsTokenizer, GcIndexRotationAttestation, PreparedBoundGcIndexRotation,
+    SqliteFtsIndex, ensure_index_metadata, prepare_bound_gc_index_rotation,
+    read_bound_gc_index_metadata, read_bound_gc_index_rotation_attestation,
+};
+use crate::fts::{
+    PreparedGcIndexCleanup, is_sha256_digest, open_existing_gc_internal_index_dir,
+    require_gc_private_dir_identity, source_file_state_digest, validate_gc_temp_leaf,
+};
+use crate::platform::source::{canonical_gc_index_identity, source_file_state};
+use crate::{IndexError, Result};
+use cap_primitives::fs as cap_fs;
 use kio_core::gc::exchange::{self as exchange, OperationKind};
 use kio_core::platform::{ExchangeExpected, ExchangeStep, PendingExchange};
 use kio_core::store_dir::StoreDirectory;
+use sha2::{Digest, Sha256};
 use std::fs::File;
+use std::path::{Path, PathBuf};
 
 const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
@@ -60,7 +74,7 @@ fn owner(kio: &File, create: bool) -> Result<Option<StoreDirectory>> {
     directory(&parent).map(Some)
 }
 
-pub(super) fn ensure_no_pending(kio: &File) -> Result<()> {
+pub(crate) fn ensure_no_pending(kio: &File) -> Result<()> {
     if let Some(owner) = owner(kio, false)?
         && exchange::inspect_pending(&owner).map_err(core_error)?
     {
@@ -192,7 +206,7 @@ fn recover_authority(kio: &File, authority: &Authority<'_>) -> Result<bool> {
     Ok(true)
 }
 
-pub(super) fn recover(
+pub(crate) fn recover(
     kio: &File,
     temp_leaf: &str,
     private_identity: &str,
@@ -265,7 +279,7 @@ fn exchange_authority(
     finish(pending, authority, checkpoint)
 }
 
-pub(super) fn exchange(
+pub(crate) fn exchange(
     kio: &File,
     temp_leaf: &str,
     private_identity: &str,
@@ -286,7 +300,7 @@ pub(super) fn exchange(
     )
 }
 
-pub(super) fn remove_exact(
+pub(crate) fn remove_exact(
     parent: &File,
     leaf: &str,
     expected_identity: &str,
@@ -306,7 +320,7 @@ pub(super) fn remove_exact(
     Ok(PreparedGcIndexCleanup::Removed)
 }
 
-pub(super) fn remove_prepared(
+pub(crate) fn remove_prepared(
     kio: &File,
     temp_leaf: &str,
     private_identity: &str,
@@ -317,6 +331,58 @@ pub(super) fn remove_prepared(
     let private = open_existing_gc_internal_index_dir(kio)?;
     require_gc_private_dir_identity(&private, private_identity)?;
     remove_exact(&private, temp_leaf, expected_identity)
+}
+
+pub(crate) fn remove_prepared_bound_gc_index(
+    kio_dir: &std::fs::File,
+    temp_leaf: &str,
+    expected_private_dir_identity: &str,
+    expected_identity: &str,
+) -> Result<PreparedGcIndexCleanup> {
+    remove_prepared(
+        kio_dir,
+        temp_leaf,
+        expected_private_dir_identity,
+        expected_identity,
+    )
+}
+
+pub(crate) fn exchange_prepared_bound_gc_index(
+    kio_dir: &std::fs::File,
+    temp_leaf: &str,
+    expected_private_dir_identity: &str,
+    expected_source_identity: &str,
+    expected_source_state_digest: &str,
+    expected_target_identity: &str,
+) -> Result<()> {
+    exchange(
+        kio_dir,
+        temp_leaf,
+        expected_private_dir_identity,
+        expected_source_identity,
+        expected_source_state_digest,
+        expected_target_identity,
+    )
+}
+
+/// Finish only the Windows exchange journal bound to this exact durable GC marker.
+/// The caller must still revalidate the SQLite generation and operation attestation.
+pub fn recover_prepared_bound_gc_index(
+    kio_dir: &std::fs::File,
+    temp_leaf: &str,
+    expected_private_dir_identity: &str,
+    expected_source_identity: &str,
+    expected_source_state_digest: &str,
+    expected_target_identity: &str,
+) -> Result<bool> {
+    recover(
+        kio_dir,
+        temp_leaf,
+        expected_private_dir_identity,
+        expected_source_identity,
+        expected_source_state_digest,
+        expected_target_identity,
+    )
 }
 
 #[cfg(test)]

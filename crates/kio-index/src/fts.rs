@@ -1,17 +1,14 @@
 //! FTS5 external-content index contracts.
 
-#[cfg(target_os = "linux")]
-use std::cell::Cell;
-#[cfg(target_os = "linux")]
-use std::collections::BTreeMap;
+use crate::platform::open_bound_source_connection;
+use crate::platform::{
+    BoundSourceIndex, SourceFileIdentity, bind_gc_source_leaf, bind_source_index,
+    canonical_gc_index_identity, cap_source_leaf_identity, gc_cleanup_directory,
+    open_gc_source_copy, remove_stale_gc_index_file, source_file_identity, source_file_state,
+    sync_bound_gc_directory, validate_bound_source_file,
+};
 use std::collections::BTreeSet;
-#[cfg(unix)]
-use std::ffi::CStr;
-use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
-use std::sync::Mutex;
-#[cfg(unix)]
-use std::sync::{Once, OnceLock};
+use std::path::Path;
 
 use cap_primitives::fs as cap_fs;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
@@ -165,306 +162,20 @@ pub enum ExistingSourceIndexOpenMode {
     ReadWrite,
 }
 
-/// Resolve an index parent before passing the untrusted leaf to SQLite.
-///
-/// `SQLITE_OPEN_NOFOLLOW` applies to every component SQLite receives.  The
-/// parent therefore needs to be resolved separately: Kio must accept an
-/// OS-owned ancestor symlink, but it must never follow a link installed at the
-/// final `sqlite.db` component.
-fn source_index_path_in_resolved_parent(path: &std::path::Path) -> Result<std::path::PathBuf> {
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| std::path::Path::new("."));
-    // The immediate `.kio/index` parent is repository-controlled. Do not
-    // canonicalize through a replacement symlink here: unlike an OS-owned
-    // ancestor such as `/var`, that would redirect a fresh sqlite.db bootstrap
-    // into an attacker-selected directory.
-    let parent_metadata = std::fs::symlink_metadata(parent).map_err(|error| {
-        IndexError::Schema(format!(
-            "inspect source index parent {}: {error}",
-            parent.display()
-        ))
-    })?;
-    if parent_metadata.file_type().is_symlink() || !parent_metadata.is_dir() {
-        return Err(IndexError::Schema(format!(
-            "source index parent must be a real directory, not a symlink: {}",
-            parent.display()
-        )));
-    }
-    let file_name = path.file_name().ok_or_else(|| {
-        IndexError::Schema(format!(
-            "source index path has no file name: {}",
-            path.display()
-        ))
-    })?;
-    Ok(parent.join(file_name))
-}
-
-struct BoundSourceIndex {
-    // Keep the repository-owned root (normally `.kio`) as well as `index`.
-    // Opening `index` relative to this descriptor is what keeps a concurrent
-    // replacement of `.kio` from changing the authority used for SQLite.
-    _root: std::fs::File,
-    _parent: std::fs::File,
-    file: std::fs::File,
-    public_path: PathBuf,
-}
-
-fn bind_source_index(
-    path: &Path,
-    writable: bool,
-    create_missing: bool,
-) -> Result<BoundSourceIndex> {
-    let path = source_index_path_in_resolved_parent(path)?;
-    let parent = path.parent().expect("source index has a parent");
-    let root = parent.parent().filter(|root| !root.as_os_str().is_empty());
-    let (root_handle, parent_handle) = if let Some(root) = root {
-        // A descriptor-bound child index has already changed cwd to the
-        // retained `.kio` directory, which is represented as `.`. Treat that
-        // current directory as the root capability directly instead of trying
-        // to split `.` into a public parent/leaf path.
-        if root == Path::new(".") {
-            let root_handle =
-                cap_fs::open_ambient_dir(Path::new("."), cap_primitives::ambient_authority())
-                    .map_err(|e| {
-                        IndexError::Schema(format!("open descriptor-bound source index root: {e}"))
-                    })?;
-            let parent_leaf = parent.file_name().expect("source index parent has a leaf");
-            let parent_handle = cap_fs::open_dir_nofollow(&root_handle, Path::new(parent_leaf))
-                .map_err(|e| {
-                    IndexError::Schema(format!(
-                        "open source index parent {}: {e}",
-                        parent.display()
-                    ))
-                })?;
-            (root_handle, parent_handle)
-        } else {
-            let root_leaf = root.file_name().ok_or_else(|| {
-                IndexError::Schema(format!(
-                    "source index parent has no repository root component: {}",
-                    parent.display()
-                ))
-            })?;
-            let outer = root
-                .parent()
-                .filter(|outer| !outer.as_os_str().is_empty())
-                .unwrap_or_else(|| Path::new("."));
-            let before_root = std::fs::symlink_metadata(root).map_err(|e| {
-                IndexError::Schema(format!("inspect source index root {}: {e}", root.display()))
-            })?;
-            if before_root.file_type().is_symlink() || !before_root.is_dir() {
-                return Err(IndexError::Schema(format!(
-                    "source index root must be a real directory, not a symlink: {}",
-                    root.display()
-                )));
-            }
-            #[cfg(windows)]
-            let before_root_identity = kio_core::platform::real_directory_identity(root)
-                .map_err(|e| {
-                    IndexError::Schema(format!(
-                        "inspect source index root reparse state {}: {e}",
-                        root.display()
-                    ))
-                })?
-                .ok_or_else(|| {
-                    IndexError::Schema(format!(
-                        "source index root must be a real directory, not a reparse point: {}",
-                        root.display()
-                    ))
-                })?;
-            let outer_handle = cap_fs::open_ambient_dir(outer, cap_primitives::ambient_authority())
-                .map_err(|e| {
-                    IndexError::Schema(format!(
-                        "open source index root ancestor {}: {e}",
-                        outer.display()
-                    ))
-                })?;
-            let root_handle = cap_fs::open_dir_nofollow(&outer_handle, Path::new(root_leaf))
-                .map_err(|e| {
-                    IndexError::Schema(format!("open source index root {}: {e}", root.display()))
-                })?;
-            #[cfg(not(windows))]
-            let opened_root = root_handle.metadata().map_err(|e| {
-                IndexError::Schema(format!(
-                    "inspect opened source index root {}: {e}",
-                    root.display()
-                ))
-            })?;
-            #[cfg(not(windows))]
-            let root_matches = same_std_and_cap_directory(&before_root, &opened_root);
-            #[cfg(windows)]
-            let root_matches = kio_core::platform::directory_handle_identity(&root_handle)
-                == Some(before_root_identity);
-            if !root_matches {
-                return Err(IndexError::Schema(format!(
-                    "source index root changed while opening: {}",
-                    root.display()
-                )));
-            }
-            let parent_leaf = parent.file_name().expect("source index parent has a leaf");
-            let parent_handle = cap_fs::open_dir_nofollow(&root_handle, Path::new(parent_leaf))
-                .map_err(|e| {
-                    IndexError::Schema(format!(
-                        "open source index parent {}: {e}",
-                        parent.display()
-                    ))
-                })?;
-            (root_handle, parent_handle)
-        }
-    } else {
-        // A bare relative path has no repository-root component to bind. Keep
-        // the old lstat/open/identity check for that API convenience case.
-        #[cfg(not(windows))]
-        let before = std::fs::symlink_metadata(parent).map_err(|e| {
-            IndexError::Schema(format!(
-                "inspect source index parent {}: {e}",
-                parent.display()
-            ))
-        })?;
-        #[cfg(windows)]
-        let before_identity = kio_core::platform::real_directory_identity(parent)
-            .map_err(|e| {
-                IndexError::Schema(format!(
-                    "inspect source index parent reparse state {}: {e}",
-                    parent.display()
-                ))
-            })?
-            .ok_or_else(|| {
-                IndexError::Schema(format!(
-                    "source index parent must be a real directory, not a reparse point: {}",
-                    parent.display()
-                ))
-            })?;
-        let handle = cap_fs::open_ambient_dir(parent, cap_primitives::ambient_authority())
-            .map_err(|e| {
-                IndexError::Schema(format!(
-                    "open source index parent {}: {e}",
-                    parent.display()
-                ))
-            })?;
-        #[cfg(not(windows))]
-        let after = handle.metadata().map_err(|e| {
-            IndexError::Schema(format!(
-                "inspect opened source index parent {}: {e}",
-                parent.display()
-            ))
-        })?;
-        #[cfg(not(windows))]
-        let parent_matches = same_std_and_cap_directory(&before, &after);
-        #[cfg(windows)]
-        let parent_matches =
-            kio_core::platform::directory_handle_identity(&handle) == Some(before_identity);
-        if !parent_matches {
-            return Err(IndexError::Schema(format!(
-                "source index parent changed while opening: {}",
-                parent.display()
-            )));
-        }
-        (
-            handle.try_clone().map_err(|e| {
-                IndexError::Schema(format!(
-                    "retain source index parent {}: {e}",
-                    parent.display()
-                ))
-            })?,
-            handle,
-        )
-    };
-    let before = parent_handle.metadata().map_err(|e| {
-        IndexError::Schema(format!(
-            "inspect opened source index parent {}: {e}",
-            parent.display()
-        ))
-    })?;
-    if !before.is_dir() {
-        return Err(IndexError::Schema(format!(
-            "source index parent is not a directory: {}",
-            parent.display()
-        )));
-    }
-    let leaf = path.file_name().expect("source index has a leaf");
-    let before_leaf = cap_source_leaf_identity(&parent_handle, Path::new(leaf))?;
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(writable)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    #[cfg(windows)]
-    {
-        // SQLite's public-path open below cannot be passed this capability
-        // handle. Keep this leaf handle open without FILE_SHARE_DELETE so a
-        // concurrent rename/delete (and therefore path replacement) is denied
-        // until SQLite has completed its own open and the connection closes.
-        // cap-primitives gives directory handles this policy by default, but
-        // ordinary file OpenOptions intentionally default to allowing delete.
-        use cap_fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-    }
-    if create_missing && before_leaf.is_none() {
-        options.create_new(true);
-    }
-    let file = cap_fs::open(&parent_handle, Path::new(leaf), &options)
-        .map_err(|e| IndexError::Schema(format!("inspect source index {}: {e}", path.display())))?;
-    validate_bound_source_file(&file, &path)?;
-    if let Some(before_leaf) = before_leaf
-        && source_file_identity(&file)? != before_leaf
-    {
-        return Err(IndexError::Schema(format!(
-            "source index leaf changed while opening: {}",
-            path.display()
-        )));
-    }
-    Ok(BoundSourceIndex {
-        _root: root_handle,
-        _parent: parent_handle,
-        file,
-        public_path: path,
-    })
-}
-
 #[derive(Clone, Copy, PartialEq, Eq)]
-struct SourceFileIdentity {
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-    #[cfg(windows)]
-    volume_serial_number: Option<u32>,
-    #[cfg(windows)]
-    file_index: Option<u64>,
+pub(crate) struct SourceFileState {
+    pub(crate) identity: SourceFileIdentity,
+    pub(crate) len: u64,
+    pub(crate) modified_seconds: i64,
+    pub(crate) modified_nanos: i64,
+    pub(crate) changed_seconds: i64,
+    pub(crate) changed_nanos: i64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct SourceFileState {
-    identity: SourceFileIdentity,
-    len: u64,
-    modified_seconds: i64,
-    modified_nanos: i64,
-    changed_seconds: i64,
-    changed_nanos: i64,
-}
-
-fn source_file_state_digest(state: SourceFileState) -> String {
+pub(crate) fn source_file_state_digest(state: SourceFileState) -> String {
     let mut digest = Sha256::new();
     digest.update(b"kio-gc-index-source-state-v1\0");
-    #[cfg(unix)]
-    {
-        digest.update(state.identity.dev.to_be_bytes());
-        digest.update(state.identity.ino.to_be_bytes());
-    }
-    #[cfg(windows)]
-    {
-        digest.update(
-            state
-                .identity
-                .volume_serial_number
-                .unwrap_or_default()
-                .to_be_bytes(),
-        );
-        digest.update(state.identity.file_index.unwrap_or_default().to_be_bytes());
-    }
+    state.identity.update_digest(&mut digest);
     digest.update(state.len.to_be_bytes());
     digest.update(state.modified_seconds.to_be_bytes());
     digest.update(state.modified_nanos.to_be_bytes());
@@ -479,85 +190,7 @@ fn source_file_state_digest(state: SourceFileState) -> String {
     encoded
 }
 
-#[cfg(unix)]
-fn source_file_state(file: &std::fs::File) -> Result<SourceFileState> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = file
-        .metadata()
-        .map_err(|error| IndexError::Schema(format!("inspect GC source index state: {error}")))?;
-    Ok(SourceFileState {
-        identity: SourceFileIdentity {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        },
-        len: metadata.len(),
-        modified_seconds: metadata.mtime(),
-        modified_nanos: metadata.mtime_nsec(),
-        changed_seconds: metadata.ctime(),
-        changed_nanos: metadata.ctime_nsec(),
-    })
-}
-
-#[cfg(windows)]
-fn source_file_state(file: &std::fs::File) -> Result<SourceFileState> {
-    use cap_fs::_WindowsByHandle;
-    use std::os::windows::fs::MetadataExt;
-    let metadata = file
-        .metadata()
-        .map_err(|error| IndexError::Schema(format!("inspect GC source index state: {error}")))?;
-    let by_handle = cap_fs::Metadata::from_file(file).map_err(|error| {
-        IndexError::Schema(format!("inspect GC source index handle state: {error}"))
-    })?;
-    let changed = kio_core::platform::file_change_time(file).map_err(|error| {
-        IndexError::Schema(format!(
-            "inspect GC source index Windows change time: {error}"
-        ))
-    })?;
-    if changed < 0 {
-        return Err(IndexError::Schema(format!(
-            "inspect GC source index Windows change time: {}",
-            std::io::Error::last_os_error()
-        )));
-    }
-    let modified = metadata.last_write_time();
-    Ok(SourceFileState {
-        identity: SourceFileIdentity {
-            volume_serial_number: by_handle.volume_serial_number(),
-            file_index: by_handle.file_index(),
-        },
-        len: metadata.file_size(),
-        modified_seconds: i64::try_from(modified / 10_000_000).unwrap_or(i64::MAX),
-        modified_nanos: i64::try_from((modified % 10_000_000) * 100).unwrap_or(i64::MAX),
-        changed_seconds: changed / 10_000_000,
-        changed_nanos: (changed % 10_000_000) * 100,
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-fn source_file_state(file: &std::fs::File) -> Result<SourceFileState> {
-    let metadata = file
-        .metadata()
-        .map_err(|error| IndexError::Schema(format!("inspect GC source index state: {error}")))?;
-    let modified = metadata
-        .modified()
-        .ok()
-        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok());
-    Ok(SourceFileState {
-        identity: SourceFileIdentity {},
-        len: metadata.len(),
-        modified_seconds: modified
-            .as_ref()
-            .and_then(|value| i64::try_from(value.as_secs()).ok())
-            .unwrap_or(-1),
-        modified_nanos: modified
-            .as_ref()
-            .map_or(-1, |value| i64::from(value.subsec_nanos())),
-        changed_seconds: -1,
-        changed_nanos: -1,
-    })
-}
-
-fn gc_leaf_state(parent: &std::fs::File, leaf: &str) -> Result<SourceFileState> {
+pub(crate) fn gc_leaf_state(parent: &std::fs::File, leaf: &str) -> Result<SourceFileState> {
     let mut options = cap_fs::OpenOptions::new();
     options
         .read(true)
@@ -567,116 +200,8 @@ fn gc_leaf_state(parent: &std::fs::File, leaf: &str) -> Result<SourceFileState> 
     validate_bound_source_file(&file, Path::new(leaf))?;
     source_file_state(&file)
 }
-#[cfg(unix)]
-fn cap_source_leaf_identity(
-    parent: &std::fs::File,
-    leaf: &Path,
-) -> Result<Option<SourceFileIdentity>> {
-    use cap_fs::MetadataExt;
-    match cap_fs::stat(parent, leaf, cap_fs::FollowSymlinks::No) {
-        Ok(metadata) if metadata.is_file() && metadata.nlink() == 1 => {
-            Ok(Some(SourceFileIdentity {
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-            }))
-        }
-        Ok(metadata) if metadata.is_file() => Err(IndexError::Schema(format!(
-            "source index target must have exactly one hard link (found {}): {}",
-            metadata.nlink(),
-            leaf.display()
-        ))),
-        Ok(_) => Err(IndexError::Schema(format!(
-            "source index target is not a regular file: {}",
-            leaf.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(IndexError::Schema(format!(
-            "inspect source index {}: {error}",
-            leaf.display()
-        ))),
-    }
-}
-#[cfg(windows)]
-fn cap_source_leaf_identity(
-    parent: &std::fs::File,
-    leaf: &Path,
-) -> Result<Option<SourceFileIdentity>> {
-    use cap_fs::_WindowsByHandle;
-    match cap_fs::stat(parent, leaf, cap_fs::FollowSymlinks::No) {
-        Ok(metadata) if metadata.is_file() && metadata.number_of_links() == Some(1) => {
-            Ok(Some(SourceFileIdentity {
-                volume_serial_number: metadata.volume_serial_number(),
-                file_index: metadata.file_index(),
-            }))
-        }
-        Ok(metadata) if metadata.is_file() => Err(IndexError::Schema(format!(
-            "source index target must have exactly one hard link (found {}): {}",
-            metadata
-                .number_of_links()
-                .map_or_else(|| "unknown".to_owned(), |links| links.to_string()),
-            leaf.display()
-        ))),
-        Ok(_) => Err(IndexError::Schema(format!(
-            "source index target is not a regular file: {}",
-            leaf.display()
-        ))),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(IndexError::Schema(format!(
-            "inspect source index {}: {error}",
-            leaf.display()
-        ))),
-    }
-}
-#[cfg(not(any(unix, windows)))]
-fn cap_source_leaf_identity(
-    _parent: &std::fs::File,
-    _leaf: &Path,
-) -> Result<Option<SourceFileIdentity>> {
-    Err(IndexError::Schema(
-        "source SQLite capability binding is unsupported on this platform".to_owned(),
-    ))
-}
-#[cfg(unix)]
-fn source_file_identity(file: &std::fs::File) -> Result<SourceFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    let m = file
-        .metadata()
-        .map_err(|e| IndexError::Schema(format!("inspect opened source index: {e}")))?;
-    Ok(SourceFileIdentity {
-        dev: m.dev(),
-        ino: m.ino(),
-    })
-}
-/// Return a stable, marker-safe representation of the primary SQLite file's
-/// platform identity.  This intentionally has no pathname component: it is
-/// the identity of the retained descriptor, and is compared with a fresh
-/// descriptor-relative observation before every destructive GC step.
-#[cfg(unix)]
-fn canonical_gc_index_identity(file: &std::fs::File) -> Result<String> {
-    let identity = source_file_identity(file)?;
-    Ok(format!("unix:{:016x}:{:016x}", identity.dev, identity.ino))
-}
 
-#[cfg(windows)]
-fn canonical_gc_index_identity(file: &std::fs::File) -> Result<String> {
-    let identity = source_file_identity(file)?;
-    let volume = identity.volume_serial_number.ok_or_else(|| {
-        IndexError::Schema("GC source index has no Windows volume identity".to_owned())
-    })?;
-    let index = identity.file_index.ok_or_else(|| {
-        IndexError::Schema("GC source index has no Windows file identity".to_owned())
-    })?;
-    Ok(format!("windows:{volume:08x}:{index:016x}"))
-}
-
-#[cfg(not(any(unix, windows)))]
-fn canonical_gc_index_identity(_: &std::fs::File) -> Result<String> {
-    Err(IndexError::Schema(
-        "GC source SQLite identity is unsupported on this platform".to_owned(),
-    ))
-}
-
-fn gc_leaf_identity(parent: &std::fs::File, leaf: &str) -> Result<String> {
+pub(crate) fn gc_leaf_identity(parent: &std::fs::File, leaf: &str) -> Result<String> {
     let mut options = cap_fs::OpenOptions::new();
     options
         .read(true)
@@ -687,57 +212,7 @@ fn gc_leaf_identity(parent: &std::fs::File, leaf: &str) -> Result<String> {
     canonical_gc_index_identity(&file)
 }
 
-/// `cap_fs::open_dir_nofollow` intentionally retains Linux directories as
-/// `O_PATH` capabilities.  That is the right authority for every name lookup
-/// below it, but Linux rejects `fsync` on the retained descriptor.  Reopen
-/// exactly `.` below that capability with read access before syncing; this
-/// neither reconstructs nor trusts an ambient pathname.  Comparing the two
-/// pinned identities makes an unexpected capability-wrapper regression fail
-/// closed before any durability claim is made.
-#[cfg(unix)]
-fn sync_bound_gc_directory(directory: &std::fs::File, context: &str) -> Result<()> {
-    let expected = source_file_identity(directory)?;
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let syncable = cap_fs::open(directory, Path::new("."), &options)
-        .map_err(|error| IndexError::Schema(format!("{context}: {error}")))?;
-    let metadata = syncable
-        .metadata()
-        .map_err(|error| IndexError::Schema(format!("{context}: {error}")))?;
-    if !metadata.is_dir() || source_file_identity(&syncable)? != expected {
-        return Err(IndexError::Schema(format!(
-            "{context}: retained directory changed while reopening for fsync"
-        )));
-    }
-    syncable
-        .sync_all()
-        .map_err(|error| IndexError::Schema(format!("{context}: {error}")))
-}
-
-/// Windows does not support flushing directory handles.  Validate the exact
-/// retained capability is a real directory (never a reparse point), then rely
-/// on the already-synced file contents and NTFS journaling for namespace
-/// persistence; do not claim a POSIX directory-`fsync` guarantee here.
-#[cfg(windows)]
-fn sync_bound_gc_directory(directory: &std::fs::File, context: &str) -> Result<()> {
-    if kio_core::platform::directory_handle_identity(directory).is_none() {
-        return Err(IndexError::Schema(format!(
-            "{context}: retained directory is not a real Windows directory"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn sync_bound_gc_directory(_: &std::fs::File, context: &str) -> Result<()> {
-    Err(IndexError::Schema(format!(
-        "{context}: directory durability is unsupported on this platform"
-    )))
-}
-
-fn validate_gc_temp_leaf(leaf: &str) -> Result<()> {
+pub(crate) fn validate_gc_temp_leaf(leaf: &str) -> Result<()> {
     if !leaf.starts_with(".gc-index-")
         || leaf.len() > 128
         || !leaf
@@ -755,7 +230,7 @@ fn validate_gc_temp_leaf(leaf: &str) -> Result<()> {
 /// deliberately lives below `gc/internal`, never beside the public index: a
 /// crashed preparation must not leave an executable-looking database in the
 /// public index directory.
-fn open_gc_internal_index_dir(kio_dir: &std::fs::File) -> Result<std::fs::File> {
+pub(crate) fn open_gc_internal_index_dir(kio_dir: &std::fs::File) -> Result<std::fs::File> {
     fn open_or_create(parent: &std::fs::File, leaf: &str) -> Result<std::fs::File> {
         match cap_fs::open_dir_nofollow(parent, Path::new(leaf)) {
             Ok(dir) => Ok(dir),
@@ -779,7 +254,9 @@ fn open_gc_internal_index_dir(kio_dir: &std::fs::File) -> Result<std::fs::File> 
     open_or_create(&internal, "index")
 }
 
-fn open_existing_gc_internal_index_dir(kio_dir: &std::fs::File) -> Result<std::fs::File> {
+pub(crate) fn open_existing_gc_internal_index_dir(
+    kio_dir: &std::fs::File,
+) -> Result<std::fs::File> {
     let gc = cap_fs::open_dir_nofollow(kio_dir, Path::new("gc")).map_err(|error| {
         IndexError::Schema(format!("open private GC index gc directory: {error}"))
     })?;
@@ -794,382 +271,13 @@ fn gc_private_dir_identity(dir: &std::fs::File) -> Result<String> {
     canonical_gc_index_identity(dir)
 }
 
-fn require_gc_private_dir_identity(dir: &std::fs::File, expected: &str) -> Result<()> {
+pub(crate) fn require_gc_private_dir_identity(dir: &std::fs::File, expected: &str) -> Result<()> {
     if gc_private_dir_identity(dir)? != expected {
         return Err(IndexError::Schema(
             "GC private index directory changed".to_owned(),
         ));
     }
     Ok(())
-}
-
-#[cfg(any(target_os = "macos", target_os = "linux"))]
-fn exchange_gc_index_leaves(
-    left_dir: &std::fs::File,
-    left: &str,
-    right_dir: &std::fs::File,
-    right: &str,
-) -> Result<()> {
-    use std::ffi::CString;
-    let left =
-        CString::new(left).map_err(|_| IndexError::Schema("invalid GC index name".into()))?;
-    let right =
-        CString::new(right).map_err(|_| IndexError::Schema("invalid GC index name".into()))?;
-    kio_core::platform::atomic_exchange(left_dir, &left, right_dir, &right)
-        .map_err(|error| IndexError::Schema(format!("atomic GC index exchange: {error}")))
-}
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn exchange_gc_index_leaves(_: &std::fs::File, _: &str, _: &std::fs::File, _: &str) -> Result<()> {
-    Err(IndexError::Schema(
-        "atomic GC index exchange is unsupported on this platform".to_owned(),
-    ))
-}
-#[cfg(not(any(unix, windows)))]
-fn source_file_identity(_: &std::fs::File) -> Result<SourceFileIdentity> {
-    Ok(SourceFileIdentity {})
-}
-#[cfg(windows)]
-fn source_file_identity(file: &std::fs::File) -> Result<SourceFileIdentity> {
-    use cap_fs::_WindowsByHandle;
-    let metadata = cap_fs::Metadata::from_file(file)
-        .map_err(|e| IndexError::Schema(format!("inspect opened source index: {e}")))?;
-    Ok(SourceFileIdentity {
-        volume_serial_number: metadata.volume_serial_number(),
-        file_index: metadata.file_index(),
-    })
-}
-
-#[cfg(unix)]
-fn same_std_and_cap_directory(before: &std::fs::Metadata, after: &std::fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    before.dev() == after.dev() && before.ino() == after.ino()
-}
-#[cfg(not(any(unix, windows)))]
-fn same_std_and_cap_directory(_: &std::fs::Metadata, _: &std::fs::Metadata) -> bool {
-    false
-}
-
-fn validate_bound_source_file(file: &std::fs::File, path: &Path) -> Result<()> {
-    let metadata = file.metadata().map_err(|e| {
-        IndexError::Schema(format!(
-            "inspect opened source index {}: {e}",
-            path.display()
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(IndexError::Schema(format!(
-            "source index target is not a regular file: {}",
-            path.display()
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(IndexError::Schema(format!(
-                "source index target must have exactly one hard link (found {}): {}",
-                metadata.nlink(),
-                path.display()
-            )));
-        }
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        let by_handle = cap_fs::Metadata::from_file(file).map_err(|error| {
-            IndexError::Schema(format!(
-                "inspect opened source index handle {}: {error}",
-                path.display()
-            ))
-        })?;
-        if by_handle.number_of_links() != Some(1) {
-            return Err(IndexError::Schema(format!(
-                "source index target must have exactly one hard link (found {}): {}",
-                by_handle
-                    .number_of_links()
-                    .map_or_else(|| "unknown".to_owned(), |links| links.to_string()),
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-impl BoundSourceIndex {
-    #[cfg(target_os = "linux")]
-    fn sqlite_path(&self) -> PathBuf {
-        use std::os::fd::AsRawFd;
-
-        let leaf = self
-            .public_path
-            .file_name()
-            .expect("bound source index has a file name");
-        PathBuf::from(format!("/proc/self/fd/{}", self._parent.as_raw_fd())).join(leaf)
-    }
-    #[cfg(all(unix, not(target_os = "linux")))]
-    fn sqlite_path(&self) -> PathBuf {
-        use std::os::fd::AsRawFd;
-        PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd()))
-    }
-    #[cfg(not(any(unix, windows)))]
-    fn sqlite_path(&self) -> PathBuf {
-        self.public_path.clone()
-    }
-}
-
-#[cfg(unix)]
-const BOUND_SOURCE_VFS_NAME: &CStr = c"kio-bound-source-unix";
-#[cfg(unix)]
-static BOUND_SOURCE_VFS_INIT: Once = Once::new();
-#[cfg(unix)]
-static BOUND_SOURCE_VFS_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-#[cfg(unix)]
-static BOUND_SOURCE_DEFAULT_VFS: OnceLock<usize> = OnceLock::new();
-#[cfg(target_os = "linux")]
-static BOUND_SOURCE_LINUX_OPEN: Mutex<()> = Mutex::new(());
-#[cfg(target_os = "linux")]
-std::thread_local! {
-    static BOUND_SOURCE_LINUX_EXPECTED: Cell<Option<SourceFileIdentity>> = const { Cell::new(None) };
-}
-
-#[cfg(unix)]
-fn open_bound_source_connection(source: &BoundSourceIndex, flags: OpenFlags) -> Result<Connection> {
-    #[cfg(not(target_os = "linux"))]
-    use std::os::unix::ffi::OsStrExt;
-
-    let path = source.sqlite_path();
-    #[cfg(not(target_os = "linux"))]
-    if !is_bound_source_fd_name(path.as_os_str().as_bytes()) {
-        return Err(IndexError::Schema(
-            "bound source SQLite path is not an internal descriptor path".to_owned(),
-        ));
-    }
-    BOUND_SOURCE_VFS_INIT.call_once(|| {
-        let result = unsafe {
-            let original = rusqlite::ffi::sqlite3_vfs_find(std::ptr::null());
-            if original.is_null() {
-                Err("SQLite has no default VFS".to_owned())
-            } else {
-                let _ = BOUND_SOURCE_DEFAULT_VFS.set(original as usize);
-                let mut wrapped = Box::new(*original);
-                wrapped.zName = BOUND_SOURCE_VFS_NAME.as_ptr();
-                wrapped.xOpen = Some(bound_source_x_open);
-                wrapped.xFullPathname = Some(bound_source_x_full_pathname);
-                let code = rusqlite::ffi::sqlite3_vfs_register(Box::into_raw(wrapped), 0);
-                if code == rusqlite::ffi::SQLITE_OK {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "register bound source SQLite VFS: SQLite error {code}"
-                    ))
-                }
-            }
-        };
-        let _ = BOUND_SOURCE_VFS_RESULT.set(result);
-    });
-    BOUND_SOURCE_VFS_RESULT
-        .get()
-        .expect("VFS initializer sets result")
-        .as_ref()
-        .map_err(|e| IndexError::Schema(e.clone()))?;
-    #[cfg(target_os = "linux")]
-    {
-        if !is_bound_source_linux_parent_fd_name(path.as_os_str().as_encoded_bytes()) {
-            return Err(IndexError::Schema(
-                "bound source SQLite path is not an internal descriptor-root path".to_owned(),
-            ));
-        }
-        let _open_guard = BOUND_SOURCE_LINUX_OPEN.lock().map_err(|_| {
-            IndexError::Schema("bound source SQLite open mutex is poisoned".to_owned())
-        })?;
-        let expected = source_file_identity(&source.file)?;
-        BOUND_SOURCE_LINUX_EXPECTED.with(|slot| slot.set(Some(expected)));
-        let outcome = Connection::open_with_flags_and_vfs(&path, flags, "kio-bound-source-unix");
-        BOUND_SOURCE_LINUX_EXPECTED.with(|slot| slot.set(None));
-        let conn = outcome?;
-        Ok(conn)
-    }
-    #[cfg(not(target_os = "linux"))]
-    Ok(Connection::open_with_flags_and_vfs(
-        &path,
-        flags,
-        "kio-bound-source-unix",
-    )?)
-}
-#[cfg(windows)]
-mod windows;
-#[cfg(windows)]
-mod windows_gc;
-
-#[cfg(windows)]
-fn open_bound_source_connection(source: &BoundSourceIndex, flags: OpenFlags) -> Result<Connection> {
-    windows::open(source, flags)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn open_bound_source_connection(source: &BoundSourceIndex, flags: OpenFlags) -> Result<Connection> {
-    Ok(Connection::open_with_flags(source.sqlite_path(), flags)?)
-}
-
-#[cfg(unix)]
-unsafe extern "C" fn bound_source_x_full_pathname(
-    _: *mut rusqlite::ffi::sqlite3_vfs,
-    name: *const std::ffi::c_char,
-    output_len: std::ffi::c_int,
-    output: *mut std::ffi::c_char,
-) -> std::ffi::c_int {
-    if name.is_null() || output.is_null() || output_len <= 0 {
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    }
-    let bytes = unsafe { CStr::from_ptr(name).to_bytes() };
-    if is_bound_source_fd_name(bytes)
-        || (cfg!(target_os = "linux") && is_bound_source_linux_parent_fd_name(bytes))
-    {
-        if bytes.len() + 1 > output_len as usize {
-            return rusqlite::ffi::SQLITE_CANTOPEN;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr().cast::<std::ffi::c_char>(),
-                output,
-                bytes.len(),
-            );
-            *output.add(bytes.len()) = 0;
-        }
-        return rusqlite::ffi::SQLITE_OK;
-    }
-    let Some(default_vfs) = BOUND_SOURCE_DEFAULT_VFS.get() else {
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    };
-    let default_vfs = *default_vfs as *mut rusqlite::ffi::sqlite3_vfs;
-    let Some(callback) = (unsafe { (*default_vfs).xFullPathname }) else {
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    };
-    unsafe { callback(default_vfs, name, output_len, output) }
-}
-
-#[cfg(unix)]
-unsafe extern "C" fn bound_source_x_open(
-    _: *mut rusqlite::ffi::sqlite3_vfs,
-    name: rusqlite::ffi::sqlite3_filename,
-    file: *mut rusqlite::ffi::sqlite3_file,
-    flags: std::ffi::c_int,
-    out_flags: *mut std::ffi::c_int,
-) -> std::ffi::c_int {
-    let Some(default_vfs) = BOUND_SOURCE_DEFAULT_VFS.get() else {
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    };
-    let default_vfs = *default_vfs as *mut rusqlite::ffi::sqlite3_vfs;
-    let Some(callback) = (unsafe { (*default_vfs).xOpen }) else {
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    };
-
-    #[cfg(target_os = "linux")]
-    if !name.is_null()
-        && is_bound_source_linux_parent_fd_name(unsafe { CStr::from_ptr(name).to_bytes() })
-        && flags & rusqlite::ffi::SQLITE_OPEN_MAIN_DB != 0
-    {
-        let expected = BOUND_SOURCE_LINUX_EXPECTED.with(Cell::get);
-        let Some(expected) = expected else {
-            return rusqlite::ffi::SQLITE_CANTOPEN;
-        };
-        let Ok(before) = linux_regular_fd_inventory() else {
-            return rusqlite::ffi::SQLITE_CANTOPEN;
-        };
-        let code = unsafe { callback(default_vfs, name, file, flags, out_flags) };
-        if code != rusqlite::ffi::SQLITE_OK {
-            return code;
-        }
-        let verified = linux_regular_fd_inventory().is_ok_and(|after| {
-            let opened: Vec<_> = after
-                .iter()
-                .filter(|(fd, identity)| before.get(fd) != Some(*identity))
-                .collect();
-            // The main database must add exactly one descriptor for the
-            // retained source. Concurrent same-process work may open other
-            // regular files, which cannot grant authority over this source;
-            // it is trusted in-process code. A second descriptor for this
-            // identity is fail-closed, so another operation cannot obscure
-            // which descriptor SQLite selected.
-            opened
-                .iter()
-                .filter(|(_, identity)| **identity == expected)
-                .count()
-                == 1
-        });
-        if verified {
-            return rusqlite::ffi::SQLITE_OK;
-        }
-        if !file.is_null() {
-            let methods = unsafe { (*file).pMethods };
-            if !methods.is_null()
-                && let Some(close) = unsafe { (*methods).xClose }
-            {
-                let _ = unsafe { close(file) };
-            }
-        }
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    }
-
-    unsafe { callback(default_vfs, name, file, flags, out_flags) }
-}
-
-#[cfg(unix)]
-fn is_bound_source_fd_name(value: &[u8]) -> bool {
-    value
-        .strip_prefix(b"/dev/fd/")
-        .is_some_and(|fd| !fd.is_empty() && fd.iter().all(u8::is_ascii_digit))
-}
-
-/// A Linux-only descriptor-root spelling.  This names a retained parent
-/// directory and a single final leaf, so SQLite's unix VFS can apply
-/// O_NOFOLLOW to the real repository-controlled leaf while retaining its
-/// normal lock registry and close semantics.
-#[cfg(unix)]
-fn is_bound_source_linux_parent_fd_name(value: &[u8]) -> bool {
-    let Some(value) = value.strip_prefix(b"/proc/self/fd/") else {
-        return false;
-    };
-    let Some(separator) = value.iter().position(|byte| *byte == b'/') else {
-        return false;
-    };
-    let (fd, leaf_with_separator) = value.split_at(separator);
-    let leaf = &leaf_with_separator[1..];
-    !fd.is_empty()
-        && fd.iter().all(u8::is_ascii_digit)
-        && !leaf.is_empty()
-        && !leaf.contains(&b'/')
-        && leaf != b"."
-        && leaf != b".."
-}
-
-#[cfg(target_os = "linux")]
-fn linux_regular_fd_inventory() -> Result<BTreeMap<i32, SourceFileIdentity>> {
-    use std::os::unix::fs::MetadataExt;
-
-    let entries = std::fs::read_dir("/proc/self/fd")
-        .map_err(|e| IndexError::Schema(format!("inspect process descriptor inventory: {e}")))?;
-    let mut result = BTreeMap::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            IndexError::Schema(format!("read process descriptor inventory entry: {e}"))
-        })?;
-        let Ok(fd) = entry.file_name().to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        let Ok(metadata) = std::fs::metadata(entry.path()) else {
-            continue;
-        };
-        if metadata.is_file() {
-            result.insert(
-                fd,
-                SourceFileIdentity {
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                },
-            );
-        }
-    }
-    Ok(result)
 }
 
 /// Open an existing, current source index without following its final path
@@ -1313,19 +421,7 @@ pub fn prepare_bound_gc_index_rotation(
     })?;
     let private = open_gc_internal_index_dir(kio_dir)?;
     let private_dir_identity = gc_private_dir_identity(&private)?;
-    let mut source_options = cap_fs::OpenOptions::new();
-    source_options
-        .read(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    #[cfg(windows)]
-    {
-        use cap_fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
-        // Keep the copied source immutable until the final state recheck.
-        source_options.share_mode(FILE_SHARE_READ);
-    }
-    let mut input = cap_fs::open(&index, Path::new("sqlite.db"), &source_options)
-        .map_err(|error| IndexError::Schema(format!("open GC source index copy: {error}")))?;
+    let mut input = open_gc_source_copy(&index)?;
     validate_bound_source_file(&input, Path::new("sqlite.db"))?;
     if canonical_gc_index_identity(&input)? != source.file_identity {
         return Err(IndexError::Schema(
@@ -1399,77 +495,6 @@ fn wait_at_bound_gc_index_copy_barrier() {
 #[cfg(not(debug_assertions))]
 fn wait_at_bound_gc_index_copy_barrier() {}
 
-/// Remove an operation-owned private index leaf after its source copy is no
-/// longer needed.  The identity check makes this safe for recovery cleanup:
-/// a substituted leaf is never unlinked merely because it has a GC-looking
-/// name.  The directory fsync makes successful cleanup durable.
-#[cfg(not(windows))]
-pub fn remove_prepared_bound_gc_index(
-    kio_dir: &std::fs::File,
-    temp_leaf: &str,
-    expected_private_dir_identity: &str,
-    expected_identity: &str,
-) -> Result<PreparedGcIndexCleanup> {
-    validate_gc_temp_leaf(temp_leaf)?;
-    let private = open_existing_gc_internal_index_dir(kio_dir)?;
-    require_gc_private_dir_identity(&private, expected_private_dir_identity)?;
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let file = match cap_fs::open(&private, Path::new(temp_leaf), &options) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PreparedGcIndexCleanup::AlreadyAbsent);
-        }
-        Err(error) => {
-            return Err(IndexError::Schema(format!(
-                "open GC private index copy for cleanup: {error}"
-            )));
-        }
-    };
-    validate_bound_source_file(&file, Path::new(temp_leaf))?;
-    let identity = canonical_gc_index_identity(&file)?;
-    if gc_leaf_identity(&private, temp_leaf)? != identity {
-        return Err(IndexError::Schema(
-            "GC private index cleanup input changed".to_owned(),
-        ));
-    }
-    if identity != expected_identity {
-        return Err(IndexError::Schema(
-            "GC private index cleanup input changed".to_owned(),
-        ));
-    }
-    match cap_fs::remove_file(&private, Path::new(temp_leaf)) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PreparedGcIndexCleanup::AlreadyAbsent);
-        }
-        Err(error) => {
-            return Err(IndexError::Schema(format!(
-                "remove GC private index copy: {error}"
-            )));
-        }
-    }
-    sync_bound_gc_directory(&private, "fsync private GC index cleanup")?;
-    Ok(PreparedGcIndexCleanup::Removed)
-}
-
-#[cfg(windows)]
-pub fn remove_prepared_bound_gc_index(
-    kio_dir: &std::fs::File,
-    temp_leaf: &str,
-    expected_private_dir_identity: &str,
-    expected_identity: &str,
-) -> Result<PreparedGcIndexCleanup> {
-    windows_gc::remove_prepared(
-        kio_dir,
-        temp_leaf,
-        expected_private_dir_identity,
-        expected_identity,
-    )
-}
-
 /// Retire stale private rotation leaves before a new attempt.  Only bounded,
 /// strict private names are considered; every candidate is re-opened
 /// descriptor-relatively no-follow and required to remain a single-link
@@ -1481,9 +506,7 @@ pub fn cleanup_stale_bound_gc_index_rotations(
 ) -> Result<()> {
     const MAX_PRIVATE_GC_INDEX_LEAVES: usize = 32;
     const MAX_PRIVATE_GC_INDEX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-    #[cfg(windows)]
-    windows_gc::ensure_no_pending(kio_dir)?;
-    let private = open_gc_internal_index_dir(kio_dir)?;
+    let private = gc_cleanup_directory(kio_dir)?;
     let mut stale = Vec::new();
     let mut bytes = 0_u64;
     let entries = cap_fs::read_dir(&private, Path::new("."))
@@ -1546,98 +569,9 @@ pub fn cleanup_stale_bound_gc_index_rotations(
                 "stale GC index copy changed during cleanup".to_owned(),
             ));
         }
-        #[cfg(not(windows))]
-        cap_fs::remove_file(&private, Path::new(&leaf))
-            .map_err(|error| IndexError::Schema(format!("remove stale GC index copy: {error}")))?;
-        #[cfg(windows)]
-        windows_gc::remove_exact(&private, &leaf, &identity)?;
+        remove_stale_gc_index_file(&private, &leaf, &identity)?;
     }
     sync_bound_gc_directory(&private, "fsync private GC index stale cleanup")
-}
-
-#[cfg(not(windows))]
-pub fn exchange_prepared_bound_gc_index(
-    kio_dir: &std::fs::File,
-    temp_leaf: &str,
-    expected_private_dir_identity: &str,
-    expected_source_identity: &str,
-    expected_source_state_digest: &str,
-    expected_target_identity: &str,
-) -> Result<()> {
-    validate_gc_temp_leaf(temp_leaf)?;
-    let index = cap_fs::open_dir_nofollow(kio_dir, Path::new("index")).map_err(|error| {
-        IndexError::Schema(format!("open GC index directory for exchange: {error}"))
-    })?;
-    let private = open_existing_gc_internal_index_dir(kio_dir)?;
-    require_gc_private_dir_identity(&private, expected_private_dir_identity)?;
-    let source = gc_leaf_identity(&index, "sqlite.db")?;
-    let source_state = gc_leaf_state(&index, "sqlite.db")?;
-    let temp = gc_leaf_identity(&private, temp_leaf)?;
-    if source != expected_source_identity
-        || source_file_state_digest(source_state) != expected_source_state_digest
-        || temp != expected_target_identity
-    {
-        return Err(IndexError::Schema(
-            "GC durable index exchange inputs changed".to_owned(),
-        ));
-    }
-    exchange_gc_index_leaves(&index, "sqlite.db", &private, temp_leaf)?;
-    // Exchange spans two directories.  Persist the destination namespace
-    // first: after a power loss recovery may see both names, but never rely on
-    // a source-directory fsync having made the target name durable first.
-    sync_bound_gc_directory(&index, "fsync GC index exchange")?;
-    sync_bound_gc_directory(&private, "fsync private GC index exchange")?;
-    if gc_leaf_identity(&index, "sqlite.db")? != expected_target_identity
-        || gc_leaf_identity(&private, temp_leaf)? != expected_source_identity
-    {
-        return Err(IndexError::Schema(
-            "GC durable index exchange changed unexpectedly".to_owned(),
-        ));
-    }
-    Ok(())
-}
-
-/// Finish a Windows index exchange whose journal is bound to the durable GC
-/// rotation marker. A missing public index is admissible only when that exact
-/// journal accounts for both files. This is namespace recovery, not SQLite
-/// attestation: callers must revalidate the published generation and operation
-/// attestation before retiring any tree.
-#[cfg(windows)]
-pub fn recover_prepared_bound_gc_index(
-    kio_dir: &std::fs::File,
-    temp_leaf: &str,
-    expected_private_dir_identity: &str,
-    expected_source_identity: &str,
-    expected_source_state_digest: &str,
-    expected_target_identity: &str,
-) -> Result<bool> {
-    windows_gc::recover(
-        kio_dir,
-        temp_leaf,
-        expected_private_dir_identity,
-        expected_source_identity,
-        expected_source_state_digest,
-        expected_target_identity,
-    )
-}
-
-#[cfg(windows)]
-pub fn exchange_prepared_bound_gc_index(
-    kio_dir: &std::fs::File,
-    temp_leaf: &str,
-    expected_private_dir_identity: &str,
-    expected_source_identity: &str,
-    expected_source_state_digest: &str,
-    expected_target_identity: &str,
-) -> Result<()> {
-    windows_gc::exchange(
-        kio_dir,
-        temp_leaf,
-        expected_private_dir_identity,
-        expected_source_identity,
-        expected_source_state_digest,
-        expected_target_identity,
-    )
 }
 
 /// Rotate the fixed `index/sqlite.db` generation below a retained `.kio`
@@ -1650,27 +584,19 @@ fn rotate_bound_gc_index_generation(
     expected_current: Option<(&str, &str)>,
     config: &FtsSchemaConfig,
 ) -> Result<Option<BoundGcIndexMetadata>> {
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (kio_dir, generation, expected_current, config);
-        unsupported_bound_gc_index_rotation()
-    }
-    #[cfg(any(unix, windows))]
-    {
-        let index = cap_fs::open_dir_nofollow(kio_dir, Path::new("index")).map_err(|error| {
-            IndexError::Schema(format!(
-                "open GC index directory below retained capability: {error}"
-            ))
-        })?;
-        rotate_bound_gc_index_leaf(
-            &index,
-            "sqlite.db",
-            generation,
-            expected_current,
-            None,
-            config,
-        )
-    }
+    let index = cap_fs::open_dir_nofollow(kio_dir, Path::new("index")).map_err(|error| {
+        IndexError::Schema(format!(
+            "open GC index directory below retained capability: {error}"
+        ))
+    })?;
+    rotate_bound_gc_index_leaf(
+        &index,
+        "sqlite.db",
+        generation,
+        expected_current,
+        None,
+        config,
+    )
 }
 
 fn rotate_bound_gc_index_leaf(
@@ -1885,7 +811,7 @@ fn valid_gc_ulid(value: &str) -> bool {
         })
 }
 
-fn is_sha256_digest(value: &str) -> bool {
+pub(crate) fn is_sha256_digest(value: &str) -> bool {
     value.len() == 71
         && value.starts_with("sha256:")
         && value.as_bytes()[7..]
@@ -1928,35 +854,21 @@ fn open_bound_gc_index(
 ) -> Result<Option<(BoundSourceIndex, Connection)>> {
     // Unix descriptor binding and Windows actual-HANDLE verification both
     // prove SQLite adopted the retained primary file before pager access.
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (kio_dir, config, writable);
-        unsupported_bound_gc_index_rotation()
-    }
-    #[cfg(any(unix, windows))]
-    {
-        crate::vec::ensure_registered();
-        let root = kio_dir
-            .try_clone()
-            .map_err(|e| IndexError::Schema(format!("retain GC .kio capability: {e}")))?;
-        let parent = match cap_fs::open_dir_nofollow(&root, Path::new("index")) {
-            Ok(parent) => parent,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(IndexError::Schema(format!(
-                    "open GC index directory below retained capability: {error}"
-                )));
-            }
-        };
-        open_bound_gc_index_leaf(&parent, "sqlite.db", config, writable)
-    }
-}
 
-#[cfg(not(any(unix, windows)))]
-fn unsupported_bound_gc_index_rotation<T>() -> Result<T> {
-    Err(IndexError::Schema(
-        "capability-bound GC SQLite rotation is unsupported on this platform".to_owned(),
-    ))
+    crate::vec::ensure_registered();
+    let root = kio_dir
+        .try_clone()
+        .map_err(|e| IndexError::Schema(format!("retain GC .kio capability: {e}")))?;
+    let parent = match cap_fs::open_dir_nofollow(&root, Path::new("index")) {
+        Ok(parent) => parent,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(IndexError::Schema(format!(
+                "open GC index directory below retained capability: {error}"
+            )));
+        }
+    };
+    open_bound_gc_index_leaf(&parent, "sqlite.db", config, writable)
 }
 
 fn open_bound_gc_index_leaf(
@@ -1965,43 +877,8 @@ fn open_bound_gc_index_leaf(
     config: &FtsSchemaConfig,
     writable: bool,
 ) -> Result<Option<(BoundSourceIndex, Connection)>> {
-    let root = parent
-        .try_clone()
-        .map_err(|e| IndexError::Schema(format!("retain GC index capability: {e}")))?;
-    let parent = parent
-        .try_clone()
-        .map_err(|e| IndexError::Schema(format!("retain GC index parent: {e}")))?;
-    let public_path = PathBuf::from(leaf);
-    let before = cap_source_leaf_identity(&parent, Path::new(leaf))?;
-    let Some(before) = before else {
+    let Some(source) = bind_gc_source_leaf(parent, leaf, writable)? else {
         return Ok(None);
-    };
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(writable)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    #[cfg(windows)]
-    {
-        use cap_fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-        // Writable SQLite connections need write sharing. Read-only GC
-        // attestation handles and their retained clones must exclude writers.
-        options.share_mode(FILE_SHARE_READ | if writable { FILE_SHARE_WRITE } else { 0 });
-    }
-    let file = cap_fs::open(&parent, Path::new(leaf), &options)
-        .map_err(|error| IndexError::Schema(format!("open bound GC source index: {error}")))?;
-    validate_bound_source_file(&file, &public_path)?;
-    if source_file_identity(&file)? != before {
-        return Err(IndexError::Schema(
-            "GC source index changed while opening retained capability".to_owned(),
-        ));
-    }
-    let source = BoundSourceIndex {
-        _root: root,
-        _parent: parent,
-        file,
-        public_path,
     };
     let flags = if writable {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW
@@ -2048,6 +925,39 @@ fn validate_bound_source_name_identity(source: &BoundSourceIndex) -> Result<()> 
         )));
     }
     Ok(())
+}
+
+/// Remove an operation-owned private leaf after validating its marker-bound identity.
+pub fn remove_prepared_bound_gc_index(
+    kio_dir: &std::fs::File,
+    temp_leaf: &str,
+    expected_private_dir_identity: &str,
+    expected_identity: &str,
+) -> Result<PreparedGcIndexCleanup> {
+    crate::platform::remove_prepared_bound_gc_index(
+        kio_dir,
+        temp_leaf,
+        expected_private_dir_identity,
+        expected_identity,
+    )
+}
+
+pub fn exchange_prepared_bound_gc_index(
+    kio_dir: &std::fs::File,
+    temp_leaf: &str,
+    expected_private_dir_identity: &str,
+    expected_source_identity: &str,
+    expected_source_state_digest: &str,
+    expected_target_identity: &str,
+) -> Result<()> {
+    crate::platform::exchange_prepared_bound_gc_index(
+        kio_dir,
+        temp_leaf,
+        expected_private_dir_identity,
+        expected_source_identity,
+        expected_source_state_digest,
+        expected_target_identity,
+    )
 }
 
 impl SqliteFtsIndex {

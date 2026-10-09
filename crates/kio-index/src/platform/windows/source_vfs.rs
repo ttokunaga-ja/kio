@@ -4,8 +4,11 @@
 //! sidecars and unnamed disk temporary files remain outside the retained
 //! source capability and are refused, including if a caller changes the
 //! temporary-storage pragma. SQLite reports memory exhaustion normally.
-use super::{BoundSourceIndex, Connection, IndexError, OpenFlags, Result};
+use crate::platform::source::{BoundSourceIndex, source_file_identity};
+use crate::{IndexError, Result};
+use cap_primitives::fs as cap_fs;
 use rusqlite::ffi;
+use rusqlite::{Connection, OpenFlags};
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::windows::io::AsRawHandle;
@@ -45,7 +48,7 @@ const SIDECARS: [&str; 3] = ["-journal", "-wal", "-shm"];
 fn sidecar_absent(access: &Access, suffix: &str) -> bool {
     let mut leaf = access.leaf.clone();
     leaf.push(suffix);
-    matches!(super::cap_fs::stat(&access.parent, std::path::Path::new(&leaf), super::cap_fs::FollowSymlinks::No), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
+    matches!(cap_fs::stat(&access.parent, std::path::Path::new(&leaf), cap_fs::FollowSymlinks::No), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
 }
 
 thread_local! {
@@ -122,7 +125,7 @@ fn default_vfs() -> Result<*mut ffi::sqlite3_vfs> {
         .map_err(|error| IndexError::Schema(error.clone()))
 }
 
-pub(super) fn open(source: &BoundSourceIndex, flags: OpenFlags) -> Result<Connection> {
+pub(crate) fn open(source: &BoundSourceIndex, flags: OpenFlags) -> Result<Connection> {
     default_vfs()?;
     let handle = source.file.as_raw_handle();
     let expected = identity(handle).ok_or_else(|| {
@@ -398,7 +401,7 @@ unsafe extern "C" fn x_access(
         else {
             continue;
         };
-        let Ok(parent) = super::source_file_identity(&access.parent) else {
+        let Ok(parent) = source_file_identity(&access.parent) else {
             return ffi::SQLITE_IOERR_ACCESS;
         };
         if parent.volume_serial_number.is_none() || parent.file_index.is_none() {
