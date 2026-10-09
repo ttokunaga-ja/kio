@@ -23,6 +23,13 @@ use sha2::Digest;
 
 use super::{ReadBarrierCheckpoint, ScopeTarget};
 use crate::commands::ExportArgs;
+use crate::platform::{
+    DestinationIdentity, configure_cap_no_follow, configure_export_temp,
+    configure_private_cap_directory, destination_identity_matches_opened,
+    destination_lstat_identity, is_platform_root_alias, sync_export_directory,
+    validate_export_directory_metadata_native, validate_export_directory_native,
+    validate_export_regular_metadata_native, validate_export_regular_native,
+};
 
 const MAX_POINTER_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_EXPORT_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -784,19 +791,6 @@ fn verify_existing_directory_chain(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
-fn is_platform_root_alias(path: &Path) -> bool {
-    matches!(path.to_str(), Some("/var" | "/tmp" | "/etc"))
-        && path
-            .canonicalize()
-            .is_ok_and(|canonical| canonical.starts_with("/private"))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn is_platform_root_alias(_path: &Path) -> bool {
-    false
-}
-
 fn effective_destination(path: &Path) -> Result<PathBuf> {
     let mut existing = path.to_path_buf();
     let mut suffix = Vec::<OsString>::new();
@@ -880,15 +874,8 @@ fn open_destination_dir(
         match cap_fs::open_dir_nofollow(&current, Path::new(&component)) {
             Ok(next) => current = next,
             Err(error) if create_missing && error.kind() == std::io::ErrorKind::NotFound => {
-                #[cfg(unix)]
-                let options = {
-                    use cap_fs::DirBuilderExt;
-                    let mut options = cap_fs::DirOptions::new();
-                    options.mode(0o700);
-                    options
-                };
-                #[cfg(not(unix))]
-                let options = cap_fs::DirOptions::new();
+                let mut options = cap_fs::DirOptions::new();
+                configure_private_cap_directory(&mut options);
                 match cap_fs::create_dir(&current, Path::new(&component), &options) {
                     Ok(()) => {}
                     Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -931,7 +918,7 @@ fn open_destination_dir(
         ));
     }
     if let Some(expected) = expected_identity
-        && !expected.matches_opened(&current)
+        && !destination_identity_matches_opened(expected, &current)
     {
         return Err(KioError::new(
             "KIO-E-CONFIG-USAGE-001",
@@ -955,15 +942,7 @@ fn validate_real_directory(path: &Path) -> Result<()> {
             "destination ancestor is not a real non-reparse directory",
         ));
     }
-    #[cfg(windows)]
-    if !kio_core::platform::directory_is_real(path)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-    {
-        return Err(unsafe_export_error(
-            path,
-            "destination ancestor is a reparse point",
-        ));
-    }
+    validate_export_directory_native(path)?;
     Ok(())
 }
 
@@ -1046,25 +1025,7 @@ fn validate_replaceable_file(path: &Path) -> Result<()> {
             "export may replace only a real regular file",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(unsafe_export_error(
-                path,
-                "export refuses a hard-linked destination file",
-            ));
-        }
-    }
-    #[cfg(windows)]
-    if !kio_core::platform::regular_file_is_safe(path)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-    {
-        return Err(unsafe_export_error(
-            path,
-            "export refuses a reparse or hard-linked destination file",
-        ));
-    }
+    validate_export_regular_native(path, &metadata)?;
     Ok(())
 }
 
@@ -1075,127 +1036,17 @@ fn validate_replaceable_metadata(path: &Path, metadata: &cap_fs::Metadata) -> Re
             "export may replace only a real regular file",
         ));
     }
-    #[cfg(unix)]
-    {
-        use cap_fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(unsafe_export_error(
-                path,
-                "export refuses a hard-linked destination file",
-            ));
-        }
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            || metadata.number_of_links() != Some(1)
-        {
-            return Err(unsafe_export_error(
-                path,
-                "export refuses a reparse or hard-linked destination file",
-            ));
-        }
-    }
+    validate_export_regular_metadata_native(path, metadata)?;
     Ok(())
 }
 
-fn unsafe_export_error(path: &Path, message: &str) -> KioError {
+pub(crate) fn unsafe_export_error(path: &Path, message: &str) -> KioError {
     KioError::new(
         "KIO-E-COMMIT-EXPORT-UNSAFE-001",
         message,
         json!({ "path": path }),
         ExitCode::Failure,
     )
-}
-
-/// PA18 (§D, U25): the identity captured by `lstat` at
-/// `validate_destination`'s containment-check moment. Compared, never
-/// re-derived, against the directory `open_destination_dir` actually opens.
-///
-/// On Windows the same (volume serial, file index) pair `lstat` would expose is
-/// taken through `GetFileInformationByHandle` instead: `std::os::windows::fs::
-/// MetadataExt::{volume_serial_number, file_index}` are still unstable behind
-/// `windows_by_handle` (rust-lang/rust#63010), so they cannot be used on stable
-/// Rust. `kio_core::cas` already wraps that call for the purge/CAS paths.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct DestinationIdentity {
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-    #[cfg(windows)]
-    identity: kio_core::platform::DirectoryHandleIdentity,
-    #[cfg(not(any(unix, windows)))]
-    len: u64,
-}
-
-impl DestinationIdentity {
-    /// Compare against the directory handle `open_destination_dir` actually
-    /// opened — the handle, never its path, so this stays the `fstat` half of
-    /// PA18's binding. A handle that cannot be interrogated fails closed
-    /// (reported as a mismatch), since an unverifiable destination is exactly
-    /// the case the guard exists to refuse.
-    #[cfg(unix)]
-    fn matches_opened(&self, opened: &File) -> bool {
-        use std::os::unix::fs::MetadataExt;
-        opened
-            .metadata()
-            .is_ok_and(|opened| self.dev == opened.dev() && self.ino == opened.ino())
-    }
-
-    #[cfg(windows)]
-    fn matches_opened(&self, opened: &File) -> bool {
-        kio_core::platform::directory_handle_identity(opened) == Some(self.identity)
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    fn matches_opened(&self, opened: &File) -> bool {
-        opened
-            .metadata()
-            .is_ok_and(|opened| self.len == opened.len())
-    }
-}
-
-fn destination_lstat_identity(path: &Path) -> Result<DestinationIdentity> {
-    #[cfg(windows)]
-    {
-        // Opens the leaf without following a final reparse point (the `lstat`
-        // half of PA18) and reads the identity off that handle. `None` means
-        // the leaf is not a real directory — a reparse point or a non-directory
-        // that `verify_existing_directory_chain` rejected moments ago, so its
-        // appearance here is itself a mid-check swap. Fail closed.
-        let Some(identity) = kio_core::platform::real_directory_identity(path)
-            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-        else {
-            return Err(unsafe_export_error(
-                path,
-                "destination identity is unavailable for this filesystem",
-            ));
-        };
-        Ok(DestinationIdentity { identity })
-    }
-    #[cfg(not(windows))]
-    {
-        let metadata = fs::symlink_metadata(path)
-            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Ok(DestinationIdentity {
-                dev: metadata.dev(),
-                ino: metadata.ino(),
-            })
-        }
-        #[cfg(not(unix))]
-        {
-            Ok(DestinationIdentity {
-                len: metadata.len(),
-            })
-        }
-    }
 }
 
 fn confirm_force() -> Result<()> {
@@ -1587,18 +1438,7 @@ fn create_private_temp(destination: &DestinationDir) -> Result<(OsString, File)>
         ));
         let mut options = cap_fs::OpenOptions::new();
         options.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use cap_fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        #[cfg(windows)]
-        {
-            use cap_fs::OpenOptionsExt;
-            use windows_sys::Win32::Foundation::GENERIC_READ;
-            use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_GENERIC_WRITE};
-            options.access_mode(GENERIC_READ | FILE_GENERIC_WRITE | DELETE);
-        }
+        configure_export_temp(&mut options);
         match cap_fs::open(&destination.handle, Path::new(&name), &options) {
             Ok(file) => return Ok((name, file)),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -2006,18 +1846,7 @@ fn validate_destination_handle(destination: &DestinationDir) -> Result<()> {
             "destination ancestor is not a real non-reparse directory",
         ));
     }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(unsafe_export_error(
-                &destination.path,
-                "destination ancestor is a reparse point",
-            ));
-        }
-    }
+    validate_export_directory_metadata_native(&destination.path, &metadata)?;
     Ok(())
 }
 
@@ -2113,53 +1942,8 @@ fn verify_open_file(
     Ok(())
 }
 
-#[cfg(unix)]
-fn configure_cap_no_follow(options: &mut cap_fs::OpenOptions) {
-    use cap_fs::OpenOptionsExt;
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    options.custom_flags(0x20_800);
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    options.custom_flags(0x104);
-    let _ = options;
-}
-
-#[cfg(windows)]
-fn configure_cap_no_follow(options: &mut cap_fs::OpenOptions) {
-    use cap_fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-    options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_cap_no_follow(_options: &mut cap_fs::OpenOptions) {}
-
-#[cfg(unix)]
 fn sync_directory_handle(destination: &DestinationDir) -> Result<()> {
-    // `cap_primitives` deliberately opens capability directories with
-    // `O_PATH` on Linux. That descriptor is suitable for the relative
-    // operations above, but `fsync(O_PATH)` fails with `EBADF`. Re-open `.`
-    // relative to the held capability so durability is requested for the
-    // same directory without falling back to its ambient pathname.
-    let mut options = cap_fs::OpenOptions::new();
-    options.read(true);
-    let syncable = cap_fs::open(&destination.handle, Path::new("."), &options)
-        .map_err(|error| KioError::io(error.to_string(), destination.path.display().to_string()))?;
-    syncable
-        .sync_all()
-        .map_err(|error| KioError::io(error.to_string(), destination.path.display().to_string()))
-}
-
-#[cfg(not(unix))]
-fn sync_directory_handle(_destination: &DestinationDir) -> Result<()> {
-    Ok(())
+    sync_export_directory(&destination.handle, &destination.path)
 }
 
 fn cleanup_staged(destination: &DestinationDir, staged: &[StagedFile]) {

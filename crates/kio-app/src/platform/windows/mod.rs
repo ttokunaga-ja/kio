@@ -1,10 +1,11 @@
-mod gc;
-pub(crate) use gc::recover_prepared_bound_gc_index;
+mod storage;
+pub(crate) use storage::*;
+mod export;
+mod purge;
+mod verification;
+pub(crate) use export::*;
+pub(crate) use kio_index::platform::recover_prepared_bound_gc_index as try_recover_marked_index_rotation;
+pub(crate) use purge::*;
+pub(crate) use verification::*;
 
-use std::process::{Command, ExitStatus};
-
-pub(crate) fn wait_supervised_child(
-    command: &mut Command,
-) -> Result<ExitStatus, kio_process::BoundedProcessError> {
-    kio_process::platform::wait_supervised_child(command)
-}
+pub(crate) use kio_process::platform::wait_supervised_child;

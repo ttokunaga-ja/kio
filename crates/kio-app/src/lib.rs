@@ -95,8 +95,6 @@ use kio_core::gc::{
     SnapshotAutoStateBinding, snapshot_auto_clock_error,
 };
 use kio_core::history::HistoryReader;
-#[cfg(windows)]
-use kio_core::platform::{directory_handle_identity, real_directory_identity};
 use kio_core::portable::{PORTABLE_TAGS_DIRECTORY, portable_cache_leaf, portable_tag_leaf};
 use kio_core::purge::{EventKind, PurgeState, TombstoneMode, canonical_final_event};
 use kio_core::schema::{SchemaKind, validate_json_schema};
@@ -10088,79 +10086,8 @@ struct ChunkLedgerDir {
     handle: std::fs::File,
 }
 
-#[cfg(unix)]
-fn same_directory_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    before.dev() == after.dev() && before.ino() == after.ino()
-}
-
-/// Open the repository's `.kio` root through its parent and keep that handle.
-/// A path-string open of `.kio/index` can otherwise follow a `.kio` symlink
-/// installed between validation and open.
-fn open_kio_root_dir(kio_dir: &Path) -> Result<std::fs::File> {
-    #[cfg(unix)]
-    let before = fs::symlink_metadata(kio_dir)
-        .map_err(|error| KioError::io(error.to_string(), kio_dir.display().to_string()))?;
-    #[cfg(unix)]
-    if before.file_type().is_symlink() || !before.is_dir() {
-        return Err(KioError::io(
-            "repository .kio root must be a real directory, not a symlink",
-            kio_dir.display().to_string(),
-        ));
-    }
-    #[cfg(windows)]
-    let before = real_directory_identity(kio_dir)
-        .map_err(|error| KioError::io(error.to_string(), kio_dir.display().to_string()))?
-        .ok_or_else(|| {
-            KioError::io(
-                "repository .kio root must be a real directory, not a reparse point",
-                kio_dir.display().to_string(),
-            )
-        })?;
-    // A descriptor-bound child has already `fchdir`ed into the retained `.kio`
-    // directory, so `.` is both its only operational store spelling and an
-    // inode-stable authority. Do not recover a parent/leaf path in this case:
-    // doing so would either reject `.` syntactically or re-enter a replaceable
-    // public `.kio` pathname.
-    if kio_dir == Path::new(".") {
-        return cap_fs::open_ambient_dir(Path::new("."), cap_primitives::ambient_authority())
-            .map_err(|error| KioError::io(error.to_string(), "."));
-    }
-    let outer = kio_dir
-        .parent()
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
-    let leaf = kio_dir.file_name().ok_or_else(|| {
-        KioError::io(
-            "repository .kio root has no final path component",
-            kio_dir.display().to_string(),
-        )
-    })?;
-    let outer_handle = cap_fs::open_ambient_dir(outer, cap_primitives::ambient_authority())
-        .map_err(|error| KioError::io(error.to_string(), outer.display().to_string()))?;
-    let root = cap_fs::open_dir_nofollow(&outer_handle, Path::new(leaf))
-        .map_err(|error| KioError::io(error.to_string(), kio_dir.display().to_string()))?;
-    #[cfg(unix)]
-    let unchanged = {
-        let after = root
-            .metadata()
-            .map_err(|error| KioError::io(error.to_string(), kio_dir.display().to_string()))?;
-        same_directory_identity(&before, &after)
-    };
-    #[cfg(windows)]
-    let unchanged = directory_handle_identity(&root) == Some(before);
-    if !unchanged {
-        return Err(KioError::io(
-            "repository .kio root changed while opening",
-            kio_dir.display().to_string(),
-        ));
-    }
-    Ok(root)
-}
-
 fn open_chunk_ledger_dir(kio_dir: &Path, create_missing: bool) -> Result<ChunkLedgerDir> {
-    let kio = open_kio_root_dir(kio_dir)?;
+    let kio = platform::open_chunk_ledger_root(kio_dir)?;
     let path = index_dir(kio_dir);
     let handle = match cap_fs::open_dir_nofollow(&kio, Path::new("index")) {
         Ok(handle) => handle,
@@ -10176,15 +10103,8 @@ fn open_chunk_ledger_dir(kio_dir: &Path, create_missing: bool) -> Result<ChunkLe
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound
                 ) =>
         {
-            #[cfg(unix)]
-            let options = {
-                use cap_fs::DirBuilderExt;
-                let mut options = cap_fs::DirOptions::new();
-                options.mode(0o700);
-                options
-            };
-            #[cfg(not(unix))]
-            let options = cap_fs::DirOptions::new();
+            let mut options = cap_fs::DirOptions::new();
+            platform::configure_private_cap_directory(&mut options);
             let created = match cap_fs::create_dir(&kio, Path::new("index"), &options) {
                 Ok(()) => true,
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
@@ -10195,7 +10115,7 @@ fn open_chunk_ledger_dir(kio_dir: &Path, create_missing: bool) -> Result<ChunkLe
             if created {
                 // Persist the new `index` entry in `.kio` before its child
                 // ledger can be reported durable.
-                sync_bound_directory(&kio, kio_dir)?;
+                platform::sync_chunk_ledger_directory(&kio, kio_dir)?;
             }
             cap_fs::open_dir_nofollow(&kio, Path::new("index"))
                 .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
@@ -10222,33 +10142,7 @@ fn try_open_chunk_ledger_file(
         .write(write)
         .append(append)
         .create(create);
-    #[cfg(unix)]
-    {
-        use cap_fs::OpenOptionsExt;
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        options.custom_flags(0x20_800);
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly"
-        ))]
-        options.custom_flags(0x104);
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        };
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        // Keep a no-delete-share handle for the entire ledger operation. A
-        // public-path replacement cannot win between this nofollow open and
-        // parsing/appending the durable record.
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-    }
+    platform::configure_chunk_ledger_open(&mut options);
     let file = cap_fs::open(&directory.handle, Path::new("chunks.jsonl"), &options)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -10257,16 +10151,7 @@ fn try_open_chunk_ledger_file(
             "chunks.jsonl must be a regular file",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "chunks.jsonl must have exactly one hard link",
-            ));
-        }
-    }
+    platform::validate_chunk_ledger_links(&metadata)?;
     Ok(file)
 }
 
@@ -10286,61 +10171,7 @@ fn open_chunk_ledger_file(
 }
 
 fn sync_chunk_ledger_dir(directory: &ChunkLedgerDir) -> Result<()> {
-    sync_bound_directory(&directory.handle, &directory.path)
-}
-
-fn sync_bound_directory(directory: &std::fs::File, path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        let mut options = cap_fs::OpenOptions::new();
-        options
-            .read(true)
-            // `.` is deliberately resolved through the retained directory
-            // capability.  Requesting no-follow keeps this reopen on the same
-            // no-symlink boundary as the original handle (and avoids a Linux
-            // O_PATH-only resolution through the capability wrapper).
-            ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-        let syncable = cap_fs::open(directory, Path::new("."), &options)
-            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-        let metadata = syncable
-            .metadata()
-            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-        if !metadata.is_dir() {
-            return Err(KioError::io(
-                "bound directory changed type",
-                path.display().to_string(),
-            ));
-        }
-        syncable
-            .sync_all()
-            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))
-    }
-
-    // Windows cannot flush a directory handle: `FlushFileBuffers` requires
-    // access that a directory handle cannot have, and an ordinary reopen fails
-    // with ERROR_ACCESS_DENIED.  Retain the fail-closed security half of the
-    // POSIX operation by proving that the capability is still a real,
-    // non-reparse directory, then rely on the file-level sync performed before
-    // this call.  This deliberately does not claim POSIX directory durability.
-    #[cfg(windows)]
-    {
-        directory_handle_identity(directory).ok_or_else(|| {
-            KioError::io(
-                "bound directory must be a real directory, not a reparse point",
-                path.display().to_string(),
-            )
-        })?;
-        Ok(())
-    }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = directory;
-        Err(KioError::io(
-            "directory durability is unsupported on this platform",
-            path.display().to_string(),
-        ))
-    }
+    platform::sync_chunk_ledger_directory(&directory.handle, &directory.path)
 }
 
 /// Atomically replace the complete chunk ledger using the already-validated
@@ -10358,16 +10189,10 @@ pub(crate) fn replace_chunk_ledger_contents(kio_dir: &Path, bytes: &[u8]) -> Res
                     directory.path.join(target).display().to_string(),
                 ));
             }
-            #[cfg(unix)]
-            {
-                use cap_fs::MetadataExt;
-                if metadata.nlink() != 1 {
-                    return Err(KioError::io(
-                        "chunks.jsonl must have exactly one hard link",
-                        directory.path.join(target).display().to_string(),
-                    ));
-                }
-            }
+            platform::validate_chunk_ledger_existing_links(
+                &metadata,
+                &directory.path.join(target),
+            )?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -10392,28 +10217,7 @@ pub(crate) fn replace_chunk_ledger_contents(kio_dir: &Path, bytes: &[u8]) -> Res
         let candidate = format!("{temp_name_prefix}-{attempt}");
         let mut options = cap_fs::OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use cap_fs::OpenOptionsExt;
-            options.mode(0o600);
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            options.custom_flags(0x20_800);
-            #[cfg(any(
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "freebsd",
-                target_os = "openbsd",
-                target_os = "netbsd",
-                target_os = "dragonfly"
-            ))]
-            options.custom_flags(0x104);
-        }
-        #[cfg(windows)]
-        {
-            use cap_fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT;
-            options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-        }
+        platform::configure_chunk_ledger_temp(&mut options);
         match cap_fs::open(&directory.handle, Path::new(&candidate), &options) {
             Ok(file) => {
                 temp_name = Some(candidate);
@@ -10450,23 +10254,7 @@ pub(crate) fn replace_chunk_ledger_contents(kio_dir: &Path, bytes: &[u8]) -> Res
                 directory.path.join(temp).display().to_string(),
             ));
         }
-        #[cfg(unix)]
-        {
-            #[cfg(target_os = "macos")]
-            use std::os::darwin::fs::MetadataExt;
-            #[cfg(not(target_os = "macos"))]
-            use std::os::unix::fs::MetadataExt;
-            #[cfg(target_os = "macos")]
-            let nlink = metadata.st_nlink();
-            #[cfg(not(target_os = "macos"))]
-            let nlink = metadata.nlink();
-            if nlink != 1 {
-                return Err(KioError::io(
-                    "temporary chunk ledger must have exactly one hard link",
-                    directory.path.join(temp).display().to_string(),
-                ));
-            }
-        }
+        platform::validate_chunk_ledger_temp_links(&metadata, &directory.path.join(temp))?;
         file.write_all(bytes).map_err(|error| {
             KioError::io(
                 error.to_string(),
@@ -14381,11 +14169,7 @@ fn open_cas_byte_object(
         if let Some(parent) = cache.parent() {
             harden_open_cache_subtree(parent);
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&cache, fs::Permissions::from_mode(0o400));
-        }
+        platform::harden_open_cache_hit(&cache);
         return Ok(Some((cache, true)));
     }
     // Q2: prepared / image CAS objects were historically written non-atomically
@@ -14435,16 +14219,7 @@ fn read_or_verify_bounded_cas_object(
             format!("CAS object is not a regular file within the {max_bytes} byte limit"),
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if listed.nlink() != 1 {
-            return Err(store_corrupt_error(
-                path,
-                "CAS object has an unexpected hard-link count",
-            ));
-        }
-    }
+    platform::validate_cached_cas_links(&listed, path)?;
     let mut file = fs::File::open(path)
         .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
     let opened = file
@@ -14543,11 +14318,7 @@ fn write_open_cache_atomic(cache: &Path, bytes: &[u8]) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut open_options = OpenOptions::new();
         open_options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            open_options.mode(0o600);
-        }
+        platform::configure_private_cache_file(&mut open_options);
         let mut file = open_options
             .open(&temp)
             .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
@@ -14581,29 +14352,7 @@ fn write_open_cache_atomic(cache: &Path, bytes: &[u8]) -> Result<()> {
 /// guard keeps the walk from ever chmod-ing anything above the cache root
 /// (e.g. `$XDG_CACHE_HOME` itself). No-op on non-unix.
 fn harden_open_cache_subtree(leaf: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let root = cache_home().join("kio");
-        if !leaf.starts_with(&root) {
-            return;
-        }
-        let mut current = leaf.to_path_buf();
-        loop {
-            let _ = fs::set_permissions(&current, fs::Permissions::from_mode(0o700));
-            if current == root {
-                break;
-            }
-            match current.parent() {
-                Some(parent) => current = parent.to_path_buf(),
-                None => break,
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = leaf;
-    }
+    platform::harden_open_cache_subtree(leaf, &cache_home().join("kio"));
 }
 
 const MAX_WORKING_TREE_SCAN_ENTRIES: usize = 100_000;
@@ -25444,11 +25193,7 @@ fn atomic_write_cas_object(kio_dir: &Path, path: &Path, bytes: &[u8]) -> Result<
     let result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        platform::configure_exact_cas_temp(&mut options);
         let mut file = options
             .open(&temp)
             .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
@@ -25491,16 +25236,7 @@ fn verify_exact_cas_object(path: &Path, expected: &[u8]) -> Result<()> {
             "content-addressed object is not the expected regular file",
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(store_corrupt_error(
-                path,
-                "content-addressed object has an unexpected hard-link count",
-            ));
-        }
-    }
+    platform::validate_exact_cas_links(&metadata, path)?;
     let mut file = fs::File::open(path)
         .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
     let opened = file

@@ -14,6 +14,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::commands::PurgeArgs;
+use crate::platform::{
+    PurgeRemovalObservation, configure_purge_private_temp, observe_purge_parent,
+    observe_purge_regular, observe_purge_removal, purge_parent_matches,
+    purge_regular_matches_named, purge_regular_matches_opened, purge_removal_matches,
+    validate_purge_directory_native, validate_purge_regular_native,
+};
 use kio_core::cas::{
     ChunkObject, ContentObjectKind, ObjectKind, ObjectStore, canonical_json_bytes, hash_bytes,
     is_hash,
@@ -1310,7 +1316,6 @@ fn delete_derived_surfaces(
 /// Prepared already authenticated the raw targets and immutable deletion
 /// closure. Recovery must not reread a manifest/unit CAS body that this same
 /// purge may have removed, nor require a cache manifest after partial cleanup.
-#[cfg(any(unix, windows))]
 fn remove_target_normalized_instances(repo: &Repository, targets: &BTreeSet<&str>) -> Result<u64> {
     use kio_core::store_dir::StoreDirectory;
     fn child(parent: &StoreDirectory, name: &str) -> Result<Option<StoreDirectory>> {
@@ -1417,16 +1422,6 @@ fn remove_target_normalized_instances(repo: &Repository, targets: &BTreeSet<&str
         }
     }
     Ok(removed)
-}
-
-#[cfg(not(any(unix, windows)))]
-fn remove_target_normalized_instances(
-    _repo: &Repository,
-    _targets: &BTreeSet<&str>,
-) -> Result<u64> {
-    Err(KioError::invalid_usage(
-        "safe purge cache cleanup is unsupported on this platform",
-    ))
 }
 
 fn scan_derived_inventory(
@@ -2365,16 +2360,7 @@ fn validate_real_directory(path: &Path) -> Result<()> {
     if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
         return Err(store_corrupt(path, "expected a real directory"));
     }
-    // On Windows, `is_symlink` does not cover every directory reparse-point
-    // kind (notably junctions).  Purge recursively deletes normalized/cache
-    // trees, so descending through one could unlink files outside Kio.  Verify
-    // the opened directory handle before every traversal step.
-    #[cfg(windows)]
-    if !kio_core::platform::directory_is_real(path)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-    {
-        return Err(store_corrupt(path, "expected a real non-reparse directory"));
-    }
+    validate_purge_directory_native(path)?;
     Ok(())
 }
 
@@ -2404,31 +2390,11 @@ fn validate_existing_regular(path: &Path, max_bytes: Option<u64>) -> Result<fs::
     if listed.file_type().is_symlink() || !listed.file_type().is_file() {
         return Err(store_corrupt(path, "expected a real regular file"));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if listed.nlink() != 1 {
-            return Err(store_corrupt(
-                path,
-                "regular file has an unexpected hard-link count",
-            ));
-        }
-    }
-    #[cfg(windows)]
-    let _ = windows_regular_file_identity(path)?;
+    validate_purge_regular_native(path, &listed)?;
     if max_bytes.is_some_and(|limit| listed.len() > limit) {
         return Err(store_corrupt(path, "regular file exceeds its byte bound"));
     }
     Ok(listed)
-}
-
-#[cfg(windows)]
-fn windows_regular_file_identity(
-    path: &Path,
-) -> Result<kio_core::platform::RegularFileHandleIdentity> {
-    kio_core::platform::real_regular_file_identity(path)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-        .ok_or_else(|| store_corrupt(path, "expected a real single-link regular file"))
 }
 
 fn read_bounded_regular(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> {
@@ -2436,18 +2402,13 @@ fn read_bounded_regular(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> 
         return Ok(None);
     }
     let listed = validate_existing_regular(path, Some(max_bytes))?;
-    #[cfg(windows)]
-    let listed_identity = windows_regular_file_identity(path)?;
+    let observed = observe_purge_regular(path, &listed)?;
     let mut file = kio_core::cas::open_regular_nofollow(path)
         .map_err(|_| store_corrupt(path, "regular file changed while it was opened"))?;
     let opened = file
         .metadata()
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-    #[cfg(windows)]
-    let identity_matches = same_file_identity(&listed, &opened)
-        && kio_core::platform::regular_file_handle_identity(&file) == Some(listed_identity);
-    #[cfg(not(windows))]
-    let identity_matches = same_file_identity(&listed, &opened);
+    let identity_matches = purge_regular_matches_opened(&observed, &opened, &file);
     if !identity_matches {
         return Err(store_corrupt(
             path,
@@ -2466,28 +2427,10 @@ fn read_bounded_regular(path: &Path, max_bytes: u64) -> Result<Option<Vec<u8>>> 
     Ok(Some(bytes))
 }
 
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        left.dev() == right.dev() && left.ino() == right.ino()
-    }
-    #[cfg(not(unix))]
-    {
-        left.len() == right.len()
-            && left.modified().ok() == right.modified().ok()
-            && left.file_type() == right.file_type()
-    }
-}
-
 struct TreeRemoval {
     path: PathBuf,
-    expected: fs::Metadata,
+    observation: PurgeRemovalObservation,
     is_directory: bool,
-    #[cfg(windows)]
-    directory_identity: Option<kio_core::platform::DirectoryHandleIdentity>,
-    #[cfg(windows)]
-    regular_file_identity: Option<kio_core::platform::RegularFileHandleIdentity>,
 }
 
 fn remove_tree_nofollow(path: &Path) -> Result<bool> {
@@ -2501,17 +2444,8 @@ fn remove_tree_nofollow(path: &Path) -> Result<bool> {
         let entry = removal.path;
         let current = fs::symlink_metadata(&entry)
             .map_err(|error| KioError::io(error.to_string(), entry.display().to_string()))?;
-        #[cfg(windows)]
-        let identity_matches = if removal.is_directory {
-            kio_core::platform::real_directory_identity(&entry)
-                .map_err(|error| KioError::io(error.to_string(), entry.display().to_string()))?
-                == removal.directory_identity
-        } else {
-            same_file_identity(&removal.expected, &current)
-                && Some(windows_regular_file_identity(&entry)?) == removal.regular_file_identity
-        };
-        #[cfg(not(windows))]
-        let identity_matches = same_file_identity(&removal.expected, &current);
+        let identity_matches =
+            purge_removal_matches(&removal.observation, &entry, &current, removal.is_directory)?;
         if !identity_matches {
             return Err(store_corrupt(&entry, "artifact changed before deletion"));
         }
@@ -2542,43 +2476,21 @@ fn collect_tree_removals(path: &Path, output: &mut Vec<TreeRemoval>, depth: usiz
         ));
     }
     if metadata.is_dir() {
-        #[cfg(windows)]
-        let directory_identity = kio_core::platform::real_directory_identity(path)
-            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-            .ok_or_else(|| store_corrupt(path, "artifact tree contains a reparse directory"))?;
+        let observation = observe_purge_removal(path, &metadata, true)?;
         for child in read_real_directory(path)? {
             collect_tree_removals(&child, output, depth + 1)?;
         }
         output.push(TreeRemoval {
             path: path.to_path_buf(),
-            expected: metadata,
+            observation,
             is_directory: true,
-            #[cfg(windows)]
-            directory_identity: Some(directory_identity),
-            #[cfg(windows)]
-            regular_file_identity: None,
         });
     } else if metadata.is_file() {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            if metadata.nlink() != 1 {
-                return Err(store_corrupt(
-                    path,
-                    "artifact has an unexpected hard-link count",
-                ));
-            }
-        }
-        #[cfg(windows)]
-        let regular_file_identity = windows_regular_file_identity(path)?;
+        let observation = observe_purge_removal(path, &metadata, false)?;
         output.push(TreeRemoval {
             path: path.to_path_buf(),
-            expected: metadata,
+            observation,
             is_directory: false,
-            #[cfg(windows)]
-            directory_identity: None,
-            #[cfg(windows)]
-            regular_file_identity: Some(regular_file_identity),
         });
     } else {
         return Err(store_corrupt(
@@ -2589,7 +2501,7 @@ fn collect_tree_removals(path: &Path, output: &mut Vec<TreeRemoval>, depth: usiz
     Ok(())
 }
 
-fn store_corrupt(path: &Path, message: &str) -> KioError {
+pub(crate) fn store_corrupt(path: &Path, message: &str) -> KioError {
     KioError::new(
         "KIO-E-STORE-CORRUPT-001",
         "purge encountered corrupt store state",
@@ -2726,19 +2638,15 @@ fn atomic_private_replace(path: &Path, bytes: &[u8]) -> Result<()> {
             parent.display().to_string(),
         ));
     }
-    #[cfg(windows)]
-    let parent_identity = kio_core::platform::real_directory_identity(parent)
-        .map_err(|error| KioError::io(error.to_string(), parent.display().to_string()))?
-        .ok_or_else(|| store_corrupt(parent, "purge state parent is a reparse directory"))?;
+    let parent_observation = observe_purge_parent(parent, &metadata)?;
     let original_leaf = if path_exists(path)? {
         Some(validate_existing_regular(path, None)?)
     } else {
         None
     };
-    #[cfg(windows)]
-    let original_leaf_identity = original_leaf
+    let original_leaf_observation = original_leaf
         .as_ref()
-        .map(|_| windows_regular_file_identity(path))
+        .map(|listed| observe_purge_regular(path, listed))
         .transpose()?;
     let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let nanos = SystemTime::now()
@@ -2752,11 +2660,7 @@ fn atomic_private_replace(path: &Path, bytes: &[u8]) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+        configure_purge_private_temp(&mut options);
         let mut file = options
             .open(&temp)
             .map_err(|error| KioError::io(error.to_string(), temp.display().to_string()))?;
@@ -2765,36 +2669,16 @@ fn atomic_private_replace(path: &Path, bytes: &[u8]) -> Result<()> {
         file.sync_all()
             .map_err(|error| KioError::io(error.to_string(), temp.display().to_string()))?;
         drop(file);
-        #[cfg(windows)]
-        {
-            let current_parent = kio_core::platform::real_directory_identity(parent)
-                .map_err(|error| KioError::io(error.to_string(), parent.display().to_string()))?;
-            if current_parent != Some(parent_identity) {
-                return Err(store_corrupt(
-                    parent,
-                    "purge state parent changed during rewrite",
-                ));
-            }
+        if !purge_parent_matches(&parent_observation, parent)? {
+            return Err(store_corrupt(
+                parent,
+                "purge state parent changed during rewrite",
+            ));
         }
-        #[cfg(not(windows))]
-        {
-            let current_parent = fs::symlink_metadata(parent)
-                .map_err(|error| KioError::io(error.to_string(), parent.display().to_string()))?;
-            if !same_file_identity(&metadata, &current_parent) {
-                return Err(store_corrupt(
-                    parent,
-                    "purge state parent changed during rewrite",
-                ));
-            }
-        }
-        match &original_leaf {
+        match &original_leaf_observation {
             Some(expected) => {
                 let current = validate_existing_regular(path, None)?;
-                #[cfg(windows)]
-                let identity_matches = same_file_identity(expected, &current)
-                    && Some(windows_regular_file_identity(path)?) == original_leaf_identity;
-                #[cfg(not(windows))]
-                let identity_matches = same_file_identity(expected, &current);
+                let identity_matches = purge_regular_matches_named(expected, path, &current)?;
                 if !identity_matches {
                     return Err(store_corrupt(
                         path,

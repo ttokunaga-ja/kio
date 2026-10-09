@@ -192,61 +192,8 @@ fn create_private_directory(
             "private state directory creation did not reach requested path",
         ));
     }
-    verify_named_identity(&directory, requested)?;
+    crate::platform::verify_private_state_named_identity(&directory, requested)?;
     Ok(directory)
-}
-
-/// The final name must still identify the retained created directory before it
-/// can become a mutable store. This detects a rename-and-replace race without
-/// falling back to path-relative I/O after the check.
-#[cfg(unix)]
-fn verify_named_identity(directory: &StoreDirectory, path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    let named = std::fs::symlink_metadata(path)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-    let retained = directory
-        .root_handle()
-        .metadata()
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-    if named.file_type().is_symlink()
-        || !named.is_dir()
-        || named.dev() != retained.dev()
-        || named.ino() != retained.ino()
-    {
-        return Err(KioError::new(
-            "KIO-E-PRIVATE-STATE-RACED-001",
-            "private state directory changed while being created",
-            serde_json::json!({}),
-            ExitCode::PermanentFailure,
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn verify_named_identity(directory: &StoreDirectory, path: &Path) -> Result<()> {
-    let named = kio_core::platform::real_directory_identity(path)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-        .ok_or_else(|| KioError::invalid_usage("private state path is not a real directory"))?;
-    let retained = kio_core::platform::directory_handle_identity(&directory.root_handle())
-        .ok_or_else(|| KioError::invalid_usage("retained private state is not a real directory"))?;
-    if named != retained {
-        return Err(KioError::new(
-            "KIO-E-PRIVATE-STATE-RACED-001",
-            "private state directory changed while being created",
-            serde_json::json!({}),
-            ExitCode::PermanentFailure,
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(any(unix, windows)))]
-fn verify_named_identity(_directory: &StoreDirectory, _path: &Path) -> Result<()> {
-    Err(KioError::invalid_usage(
-        "private state directory identity is unsupported on this platform",
-    ))
 }
 
 fn acquire_existing_lock(directory: &StoreDirectory, lock_bytes: &[u8]) -> Result<File> {
