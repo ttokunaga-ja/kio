@@ -11,8 +11,6 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-#[cfg(windows)]
-use crate::platform::wait_supervised_child;
 use kio_core::management::{ManagementAuthority, read_record};
 use kio_core::store_dir::{Publication, StoreDirectory};
 use kio_core::{ExitCode, KioError, Result};
@@ -23,24 +21,29 @@ use sha2::{Digest, Sha256};
 
 use crate::commands::WatchServiceCommand;
 use crate::management::{binding_for_repo, open_existing_managed_root};
+use crate::platform::{
+    native_after_remove, native_definition_path, native_enable, native_loaded_definition_matches,
+    native_start, native_state, native_stop, native_uninstall, render_definition,
+    run_watch_service_runner,
+};
 
 const MANIFEST_DIRECTORY: &str = "watch-services";
 const MUTATION_LOCK_DIRECTORY: &str = "watch-services/locks";
-const MAX_MANIFEST_BYTES: u64 = 32 * 1024;
+pub(crate) const MAX_MANIFEST_BYTES: u64 = 32 * 1024;
 const VERSION: u8 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ServiceManifest {
+pub(crate) struct ServiceManifest {
     version: u8,
-    id: String,
-    scope_id: String,
-    root: PathBuf,
-    binary: PathBuf,
-    reconcile_interval_seconds: u64,
-    native_path: PathBuf,
-    definition: String,
-    environment: ServiceEnvironment,
+    pub(crate) id: String,
+    pub(crate) scope_id: String,
+    pub(crate) root: PathBuf,
+    pub(crate) binary: PathBuf,
+    pub(crate) reconcile_interval_seconds: u64,
+    pub(crate) native_path: PathBuf,
+    pub(crate) definition: String,
+    pub(crate) environment: ServiceEnvironment,
     phase: ServicePhase,
 }
 
@@ -49,12 +52,12 @@ struct ServiceManifest {
 /// same device-private Kio directories as an interactive invocation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct ServiceEnvironment {
-    home: PathBuf,
-    userprofile: PathBuf,
-    xdg_config_home: PathBuf,
-    xdg_data_home: PathBuf,
-    xdg_cache_home: PathBuf,
+pub(crate) struct ServiceEnvironment {
+    pub(crate) home: PathBuf,
+    pub(crate) userprofile: PathBuf,
+    pub(crate) xdg_config_home: PathBuf,
+    pub(crate) xdg_data_home: PathBuf,
+    pub(crate) xdg_cache_home: PathBuf,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,7 +68,7 @@ enum ServicePhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NativeRegistration {
+pub(crate) enum NativeRegistration {
     Absent,
     Owned,
     Foreign,
@@ -80,145 +83,8 @@ pub(crate) fn run(root_argument: Option<PathBuf>, command: WatchServiceCommand) 
         WatchServiceCommand::Stop => mutate_existing(root_argument, Lifecycle::Stop),
         WatchServiceCommand::Status => status(root_argument),
         WatchServiceCommand::Uninstall => mutate_existing(root_argument, Lifecycle::Uninstall),
-        WatchServiceCommand::Runner { manifest } => run_runner(manifest),
+        WatchServiceCommand::Runner { manifest } => run_watch_service_runner(manifest),
     }
-}
-
-/// Start the Windows Task Scheduler child only after re-binding its private
-/// manifest to this executable, the native task, and the managed root.
-///
-/// The scheduler does not provide a trustworthy inherited environment.  This
-/// runner therefore sets the captured device paths on the child `Command`
-/// rather than mutating this process environment.
-#[cfg(windows)]
-fn run_runner(manifest_path: PathBuf) -> Result<Value> {
-    let manifest = load_runner_manifest(&manifest_path)?;
-    let current_binary = env::current_exe()
-        .map_err(service_error)?
-        .canonicalize()
-        .map_err(service_error)?;
-    let current_binary = kio_core::private_fs::verify_trusted_executable(&current_binary)?;
-    let manifest_binary = kio_core::private_fs::verify_trusted_executable(&manifest.binary)?;
-    if current_binary != manifest_binary {
-        return Err(service_error(
-            "watch service runner executable does not match its manifest",
-        ));
-    }
-    let root = manifest.root.canonicalize().map_err(service_error)?;
-    if root != manifest.root {
-        return Err(service_error(
-            "watch service root no longer matches its canonical manifest path",
-        ));
-    }
-    let repo = open_existing_managed_root(&root)?;
-    let binding = binding_for_repo(&repo)?;
-    let record = read_record(&binding)?;
-    if record.authority != ManagementAuthority::Root || record.scope_id != manifest.scope_id {
-        return Err(service_error(
-            "watch service manifest no longer matches the managed root authority",
-        ));
-    }
-    let scheduler = NativeScheduler;
-    if scheduler.inspect(&manifest)? != NativeRegistration::Owned
-        || !native_runner_registration_matches(&manifest)?
-    {
-        return Err(service_error(
-            "watch service runner refuses an absent or foreign native registration",
-        ));
-    }
-    let mut child = watcher_child_command(&manifest)?;
-    let status = wait_supervised_child(&mut child).map_err(service_error)?;
-    if !status.success() {
-        return Err(service_error(format!(
-            "watch service child exited unsuccessfully: {status}"
-        )));
-    }
-    Ok(json!({"status":"watcher_exited", "service_id":manifest.id}))
-}
-
-#[cfg(not(windows))]
-fn run_runner(_manifest_path: PathBuf) -> Result<Value> {
-    Err(invalid(
-        "watch service runner is reserved for the Windows Task Scheduler",
-    ))
-}
-
-#[cfg(windows)]
-fn load_runner_manifest(manifest_path: &Path) -> Result<ServiceManifest> {
-    if !manifest_path.is_absolute() {
-        return Err(invalid("watch service manifest path must be absolute"));
-    }
-    // This first read proves every ancestor and the leaf are owner-private
-    // without trusting scheduler-provided environment variables.
-    let private_bytes = kio_core::private_fs::read_private_file(manifest_path, MAX_MANIFEST_BYTES)?;
-    let manifest: ServiceManifest =
-        serde_json::from_slice(&private_bytes).map_err(service_error)?;
-    validate_manifest(&manifest)?;
-    validate_runner_manifest_locator(manifest_path, &manifest)?;
-    let parent = manifest_path
-        .parent()
-        .ok_or_else(|| service_error("watch service manifest has no parent"))?;
-    let leaf = manifest_path
-        .file_name()
-        .ok_or_else(|| service_error("watch service manifest has no file name"))?;
-    // Retain the verified parent before opening the leaf a second time.  The
-    // byte comparison catches a replacement between the private-file audit
-    // and capability-relative read.
-    let store = StoreDirectory::open(parent)?;
-    let file = store.open_regular_read(Path::new(leaf), MAX_MANIFEST_BYTES)?;
-    store.ensure_owner_private(Path::new(leaf))?;
-    let mut retained_bytes = Vec::new();
-    file.take(MAX_MANIFEST_BYTES.saturating_add(1))
-        .read_to_end(&mut retained_bytes)
-        .map_err(service_error)?;
-    if retained_bytes.len() > MAX_MANIFEST_BYTES as usize {
-        return Err(service_error(
-            "watch service manifest exceeds its byte limit",
-        ));
-    }
-    if retained_bytes != private_bytes {
-        return Err(service_error(
-            "watch service manifest changed while the runner was binding it",
-        ));
-    }
-    Ok(manifest)
-}
-
-#[cfg(windows)]
-fn watcher_child_command(manifest: &ServiceManifest) -> Result<Command> {
-    let mut command = Command::new(&manifest.binary);
-    command.args(watch_argv(manifest)?.into_iter().skip(1));
-    for (name, value) in service_environment_pairs(&manifest.environment)? {
-        command.env(name, value);
-    }
-    Ok(command)
-}
-
-#[cfg(any(windows, test))]
-fn validate_runner_manifest_locator(
-    manifest_path: &Path,
-    manifest: &ServiceManifest,
-) -> Result<()> {
-    if manifest_path != manifest_locator(&manifest.id, &manifest.environment)? {
-        return Err(service_error(
-            "watch service runner manifest locator does not bind its environment and identifier",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(any(windows, test))]
-fn runner_argv(manifest_path: &Path) -> Result<Vec<String>> {
-    let manifest_path = manifest_path
-        .to_str()
-        .ok_or_else(|| invalid("watch service manifest path is not valid UTF-8"))?;
-    Ok(vec![
-        "watch".into(),
-        "service".into(),
-        "runner".into(),
-        "--manifest".into(),
-        manifest_path.to_owned(),
-    ])
 }
 
 fn install(root_argument: Option<PathBuf>, interval: u64) -> Result<Value> {
@@ -593,7 +459,7 @@ fn manifest_leaf(id: &str) -> Result<PathBuf> {
 /// The scheduler receives this absolute locator as an argument.  It is
 /// derived from the manifest's captured data directory, never from the
 /// scheduler process environment.
-fn manifest_locator(id: &str, environment: &ServiceEnvironment) -> Result<PathBuf> {
+pub(crate) fn manifest_locator(id: &str, environment: &ServiceEnvironment) -> Result<PathBuf> {
     let leaf = manifest_leaf(id)?;
     let path = environment.xdg_data_home.join("kio").join(leaf);
     validate_argument_path(&path)?;
@@ -611,7 +477,7 @@ fn stable_id(scope_id: &str, root: &Path) -> String {
     )
 }
 
-fn validate_manifest(manifest: &ServiceManifest) -> Result<()> {
+pub(crate) fn validate_manifest(manifest: &ServiceManifest) -> Result<()> {
     if manifest.version != VERSION
         || manifest.reconcile_interval_seconds == 0
         || manifest.reconcile_interval_seconds > 86_400
@@ -691,7 +557,7 @@ fn validate_environment(environment: &ServiceEnvironment) -> Result<()> {
     Ok(())
 }
 
-fn service_environment_pairs(
+pub(crate) fn service_environment_pairs(
     environment: &ServiceEnvironment,
 ) -> Result<Vec<(&'static str, String)>> {
     Ok(vec![
@@ -767,7 +633,7 @@ fn acquire_mutation_lock(store: &StoreDirectory, id: &str) -> Result<File> {
     Ok(lock)
 }
 
-fn validate_argument_path(path: &Path) -> Result<()> {
+pub(crate) fn validate_argument_path(path: &Path) -> Result<()> {
     if !path.is_absolute()
         || path.to_str().is_none()
         || path
@@ -783,7 +649,7 @@ fn validate_argument_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-trait Scheduler {
+pub(crate) trait Scheduler {
     fn inspect(&self, manifest: &ServiceManifest) -> Result<NativeRegistration>;
     fn install(&self, manifest: &ServiceManifest) -> Result<()>;
     fn start(&self, manifest: &ServiceManifest) -> Result<()>;
@@ -926,7 +792,7 @@ impl NativeDefinitionLocation {
     }
 }
 
-struct NativeScheduler;
+pub(crate) struct NativeScheduler;
 impl Scheduler for NativeScheduler {
     fn inspect(&self, manifest: &ServiceManifest) -> Result<NativeRegistration> {
         let location = NativeDefinitionLocation::admit(&manifest.native_path)?;
@@ -989,506 +855,7 @@ impl Scheduler for NativeScheduler {
     }
 }
 
-#[cfg(target_os = "macos")]
-fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
-    let output = run_native_output(
-        "/bin/launchctl",
-        [
-            "print".into(),
-            format!("gui/{}/{}", unsafe { libc::geteuid() }, manifest.id),
-        ],
-    )?;
-    // A stopped service is deliberately booted out, leaving only our verified
-    // plist. A successful query, however, must bind the loaded service to the
-    // exact executable and root before it can be controlled or deleted.
-    if !output.status.success() {
-        // `launchctl print` uses exit 113 for a genuinely unloaded service.
-        // Other failures are an ambiguous manager error and must fail closed.
-        if output.status.code() == Some(113)
-            && (output.stderr.contains("Could not find service")
-                || output.stderr.contains("Bad request"))
-        {
-            return Ok(true);
-        }
-        return Err(service_error(
-            "launchctl could not inspect native watch registration",
-        ));
-    }
-    let expected = watch_argv(manifest)?;
-    let path = manifest
-        .native_path
-        .to_str()
-        .ok_or_else(|| service_error("non-UTF-8 native definition path"))?;
-    let binary = manifest
-        .binary
-        .to_str()
-        .ok_or_else(|| service_error("non-UTF-8 watch binary path"))?;
-    let lines = output.stdout.lines().map(str::trim).collect::<Vec<_>>();
-    let exact_path = lines.iter().any(|line| *line == format!("path = {path}"));
-    let exact_program = lines
-        .iter()
-        .any(|line| *line == format!("program = {binary}"));
-    let Some(start) = lines.iter().position(|line| *line == "arguments = {") else {
-        return Ok(false);
-    };
-    let Some(end) = lines[start + 1..].iter().position(|line| *line == "}") else {
-        return Ok(false);
-    };
-    let observed = lines[start + 1..start + 1 + end]
-        .iter()
-        .map(|line| {
-            // launchctl's verified output prints one bare argv value per line.
-            // Any assignment, escaping, or blank line is ambiguous and rejected.
-            (!line.is_empty() && !line.contains(" = ")).then(|| (*line).to_owned())
-        })
-        .collect::<Option<Vec<_>>>();
-    let environment = service_environment_pairs(&manifest.environment)?;
-    let environment_matches = environment.iter().all(|(name, value)| {
-        lines
-            .iter()
-            .any(|line| *line == format!("{name} => {value}"))
-    });
-    Ok(exact_path
-        && exact_program
-        && environment_matches
-        && observed.as_deref() == Some(expected.as_slice()))
-}
-
-#[cfg(any(windows, target_os = "macos"))]
-fn watch_argv(manifest: &ServiceManifest) -> Result<Vec<String>> {
-    Ok(vec![
-        manifest
-            .binary
-            .to_str()
-            .ok_or_else(|| service_error("non-UTF-8 watch binary path"))?
-            .to_owned(),
-        "watch".into(),
-        "--root".into(),
-        manifest
-            .root
-            .to_str()
-            .ok_or_else(|| service_error("non-UTF-8 watch root path"))?
-            .to_owned(),
-        "run".into(),
-        "--reconcile-interval-seconds".into(),
-        manifest.reconcile_interval_seconds.to_string(),
-    ])
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
-    let output = run_native_output(
-        systemctl_path()?,
-        [
-            "--user".into(),
-            "show".into(),
-            "--property=FragmentPath,ExecStart,Environment".into(),
-            manifest.id.clone(),
-        ],
-    )?;
-    if !output.status.success() {
-        return Err(service_error(
-            "systemd could not inspect native watch registration",
-        ));
-    }
-    let environment = service_environment_pairs(&manifest.environment)?;
-    Ok(output
-        .stdout
-        .contains(manifest.native_path.to_string_lossy().as_ref())
-        && output
-            .stdout
-            .contains(manifest.binary.to_string_lossy().as_ref())
-        && output
-            .stdout
-            .contains(manifest.root.to_string_lossy().as_ref())
-        && environment
-            .iter()
-            .all(|(name, value)| output.stdout.contains(&format!("{name}={value}"))))
-}
-
-#[cfg(windows)]
-fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
-    native_windows_task_definition_matches(manifest, true)
-}
-
-/// Runner startup has a stricter condition than lifecycle recovery: a missing
-/// task can be safely uninstalled, but it cannot authorize a manually invoked
-/// hidden runner to start a watcher.
-#[cfg(windows)]
-fn native_runner_registration_matches(manifest: &ServiceManifest) -> Result<bool> {
-    native_windows_task_definition_matches(manifest, false)
-}
-
-#[cfg(windows)]
-fn native_windows_task_definition_matches(
-    manifest: &ServiceManifest,
-    allow_absent_for_recovery: bool,
-) -> Result<bool> {
-    let output = run_native_output(
-        schtasks_path()?,
-        [
-            "/query".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/xml".into(),
-        ],
-    )?;
-    if !output.status.success() {
-        // A crash after Task Scheduler deleted the task but before the owned
-        // XML cache was removed is recoverable: the exact private cache still
-        // binds this name and uninstall may finish removing it.
-        if output.stderr.contains("cannot find") || output.stderr.contains("not exist") {
-            return Ok(allow_absent_for_recovery);
-        }
-        return Err(service_error(
-            "Task Scheduler could not inspect native watch registration",
-        ));
-    }
-    let manifest_path = manifest_locator(&manifest.id, &manifest.environment)?;
-    let manifest_path = manifest_path
-        .to_str()
-        .ok_or_else(|| service_error("non-UTF-8 watch service manifest path"))?;
-    let runner_args = runner_argv(Path::new(manifest_path))?;
-    let expected_arguments =
-        windows_arguments(&runner_args.iter().map(String::as_str).collect::<Vec<_>>())?;
-    Ok(output
-        .stdout
-        .contains(&format!("<URI>\\{}</URI>", manifest.id))
-        && output
-            .stdout
-            .contains("<LogonType>InteractiveToken</LogonType>")
-        && output
-            .stdout
-            .contains("<RunLevel>LeastPrivilege</RunLevel>")
-        && output
-            .stdout
-            .contains(&xml_escape(&manifest.binary.to_string_lossy())?)
-        && output.stdout.contains(&xml_escape(&expected_arguments)?))
-}
-
-#[cfg(target_os = "macos")]
-fn native_definition_path(id: &str, environment: &ServiceEnvironment) -> Result<PathBuf> {
-    Ok(environment
-        .home
-        .join("Library/LaunchAgents")
-        .join(format!("{id}.plist")))
-}
-#[cfg(all(unix, not(target_os = "macos")))]
-fn native_definition_path(id: &str, environment: &ServiceEnvironment) -> Result<PathBuf> {
-    Ok(environment
-        .xdg_config_home
-        .join("systemd/user")
-        .join(format!("{id}.service")))
-}
-#[cfg(windows)]
-fn native_definition_path(id: &str, environment: &ServiceEnvironment) -> Result<PathBuf> {
-    let path = environment
-        .xdg_data_home
-        .join("kio/watch-services-native")
-        .join(format!("{id}.xml"));
-    validate_argument_path(&path)?;
-    Ok(path)
-}
-
-#[cfg(target_os = "macos")]
-fn render_definition(
-    id: &str,
-    binary: &Path,
-    root: &Path,
-    interval: u64,
-    environment: &ServiceEnvironment,
-    _manifest_path: &Path,
-) -> Result<String> {
-    let args = [
-        binary.as_os_str().to_string_lossy().into_owned(),
-        "watch".into(),
-        "--root".into(),
-        root.as_os_str().to_string_lossy().into_owned(),
-        "run".into(),
-        "--reconcile-interval-seconds".into(),
-        interval.to_string(),
-    ];
-    Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>{}</string><key>ProgramArguments</key><array>{}</array><key>EnvironmentVariables</key><dict>{}</dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n",
-        xml_escape(id)?,
-        args.iter()
-            .map(|arg| Ok(format!("<string>{}</string>", xml_escape(arg)?)))
-            .collect::<Result<Vec<_>>>()?
-            .join(""),
-        service_environment_pairs(environment)?
-            .iter()
-            .map(|(name, value)| Ok(format!(
-                "<key>{}</key><string>{}</string>",
-                xml_escape(name)?,
-                xml_escape(value)?
-            )))
-            .collect::<Result<Vec<_>>>()?
-            .join("")
-    ))
-}
-#[cfg(all(unix, not(target_os = "macos")))]
-fn render_definition(
-    id: &str,
-    binary: &Path,
-    root: &Path,
-    interval: u64,
-    environment: &ServiceEnvironment,
-    _manifest_path: &Path,
-) -> Result<String> {
-    let args = [
-        binary.as_os_str().to_string_lossy().into_owned(),
-        "watch".into(),
-        "--root".into(),
-        root.as_os_str().to_string_lossy().into_owned(),
-        "run".into(),
-        "--reconcile-interval-seconds".into(),
-        interval.to_string(),
-    ];
-    Ok(format!(
-        "[Unit]\nDescription=Kio offline watch {}\n\n[Service]\nType=simple\nEnvironment={}\nExecStart={}\nRestart=on-failure\nRestartSec=5\n\n[Install]\nWantedBy=default.target\n",
-        systemd_escape(id)?,
-        service_environment_pairs(environment)?
-            .iter()
-            .map(|(name, value)| systemd_escape(&format!("{name}={value}")))
-            .collect::<Result<Vec<_>>>()?
-            .join(" "),
-        args.iter()
-            .map(|arg| systemd_escape(arg))
-            .collect::<Result<Vec<_>>>()?
-            .join(" ")
-    ))
-}
-#[cfg(windows)]
-fn render_definition(
-    id: &str,
-    binary: &Path,
-    _root: &Path,
-    _interval: u64,
-    _environment: &ServiceEnvironment,
-    manifest_path: &Path,
-) -> Result<String> {
-    let runner_args = runner_argv(manifest_path)?;
-    let arguments = windows_arguments(&runner_args.iter().map(String::as_str).collect::<Vec<_>>())?;
-    Ok(format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-16\"?><Task version=\"1.4\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\"><RegistrationInfo><URI>\\{}</URI><Description>Kio offline watcher {}</Description></RegistrationInfo><Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers><Principals><Principal id=\"Author\"><LogonType>InteractiveToken</LogonType><RunLevel>LeastPrivilege</RunLevel></Principal></Principals><Settings><Enabled>true</Enabled><StartWhenAvailable>false</StartWhenAvailable><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy></Settings><Actions Context=\"Author\"><Exec><Command>{}</Command><Arguments>{}</Arguments></Exec></Actions></Task>",
-        xml_escape(id)?,
-        xml_escape(id)?,
-        xml_escape(&binary.to_string_lossy())?,
-        xml_escape(&arguments)?
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn native_enable(manifest: &ServiceManifest) -> Result<()> {
-    // The per-user LaunchAgent directory is loaded at login. Installing only
-    // writes the verified plist, so it cannot start this session's watcher.
-    let _ = manifest;
-    Ok(())
-}
-#[cfg(target_os = "macos")]
-fn native_start(manifest: &ServiceManifest) -> Result<()> {
-    let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, manifest.id);
-    let printed = run_native_output("/bin/launchctl", ["print".into(), target.clone()])?;
-    if !printed.status.success() {
-        run_native(
-            "/bin/launchctl",
-            [
-                "bootstrap".into(),
-                format!("gui/{}", unsafe { libc::geteuid() }),
-                manifest.native_path.display().to_string(),
-            ],
-        )?;
-    }
-    run_native("/bin/launchctl", ["kickstart".into(), "-k".into(), target]).map(|_| ())
-}
-#[cfg(target_os = "macos")]
-fn native_stop(manifest: &ServiceManifest) -> Result<()> {
-    run_native(
-        "/bin/launchctl",
-        [
-            "bootout".into(),
-            format!("gui/{}", unsafe { libc::geteuid() }),
-            manifest.native_path.display().to_string(),
-        ],
-    )
-    .map(|_| ())
-}
-#[cfg(target_os = "macos")]
-fn native_uninstall(manifest: &ServiceManifest) -> Result<()> {
-    let target = format!("gui/{}/{}", unsafe { libc::geteuid() }, manifest.id);
-    let printed = run_native_output("/bin/launchctl", ["print".into(), target])?;
-    if printed.status.success() {
-        native_stop(manifest)
-    } else if printed.status.code() == Some(113)
-        && (printed.stderr.contains("Could not find service")
-            || printed.stderr.contains("Bad request"))
-    {
-        Ok(())
-    } else {
-        Err(service_error(
-            "launchctl could not inspect service before uninstall",
-        ))
-    }
-}
-#[cfg(target_os = "macos")]
-fn native_after_remove() -> Result<()> {
-    Ok(())
-}
-#[cfg(target_os = "macos")]
-fn native_state(manifest: &ServiceManifest) -> Result<Value> {
-    let active = run_native_output(
-        "/bin/launchctl",
-        [
-            "print".into(),
-            format!("gui/{}/{}", unsafe { libc::geteuid() }, manifest.id),
-        ],
-    )?
-    .status
-    .success();
-    Ok(json!({"registered":true,"active":active}))
-}
-
-#[cfg(all(unix, not(target_os = "macos")))]
-fn native_enable(manifest: &ServiceManifest) -> Result<()> {
-    run_systemctl(["daemon-reload".into()])?;
-    run_systemctl(["enable".into(), manifest.id.clone()]).map(|_| ())
-}
-#[cfg(all(unix, not(target_os = "macos")))]
-fn native_start(manifest: &ServiceManifest) -> Result<()> {
-    native_enable(manifest)?;
-    run_systemctl(["start".into(), manifest.id.clone()]).map(|_| ())
-}
-#[cfg(all(unix, not(target_os = "macos")))]
-fn native_stop(manifest: &ServiceManifest) -> Result<()> {
-    run_systemctl(["disable".into(), manifest.id.clone()])?;
-    run_systemctl(["stop".into(), manifest.id.clone()]).map(|_| ())
-}
-#[cfg(all(unix, not(target_os = "macos")))]
-fn native_uninstall(manifest: &ServiceManifest) -> Result<()> {
-    native_stop(manifest)
-}
-#[cfg(all(unix, not(target_os = "macos")))]
-fn native_after_remove() -> Result<()> {
-    run_systemctl(["daemon-reload".into()]).map(|_| ())
-}
-#[cfg(all(unix, not(target_os = "macos")))]
-fn native_state(manifest: &ServiceManifest) -> Result<Value> {
-    let enabled = run_native_output(
-        systemctl_path()?,
-        ["--user".into(), "is-enabled".into(), manifest.id.clone()],
-    )?
-    .status
-    .success();
-    let active = run_native_output(
-        systemctl_path()?,
-        ["--user".into(), "is-active".into(), manifest.id.clone()],
-    )?
-    .status
-    .success();
-    Ok(json!({"registered":enabled,"active":active}))
-}
-
-#[cfg(windows)]
-fn native_enable(manifest: &ServiceManifest) -> Result<()> {
-    run_native(
-        schtasks_path()?,
-        [
-            "/create".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/xml".into(),
-            manifest.native_path.display().to_string(),
-        ],
-    )
-    .map(|_| ())
-}
-#[cfg(windows)]
-fn native_start(manifest: &ServiceManifest) -> Result<()> {
-    run_native(
-        schtasks_path()?,
-        [
-            "/change".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/enable".into(),
-        ],
-    )?;
-    run_native(
-        schtasks_path()?,
-        ["/run".into(), "/tn".into(), manifest.id.clone()],
-    )
-    .map(|_| ())
-}
-#[cfg(windows)]
-fn native_stop(manifest: &ServiceManifest) -> Result<()> {
-    run_native(
-        schtasks_path()?,
-        [
-            "/change".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/disable".into(),
-        ],
-    )?;
-    run_native(
-        schtasks_path()?,
-        ["/end".into(), "/tn".into(), manifest.id.clone()],
-    )
-    .map(|_| ())
-}
-#[cfg(windows)]
-fn native_uninstall(manifest: &ServiceManifest) -> Result<()> {
-    let query = run_native_output(
-        schtasks_path()?,
-        ["/query".into(), "/tn".into(), manifest.id.clone()],
-    )?;
-    if !query.status.success()
-        && (query.stderr.contains("cannot find") || query.stderr.contains("not exist"))
-    {
-        return Ok(());
-    }
-    if !native_loaded_definition_matches(manifest)? {
-        return Err(service_error(
-            "Task Scheduler registration changed before uninstall",
-        ));
-    }
-    let _ = native_stop(manifest);
-    run_native(
-        schtasks_path()?,
-        [
-            "/delete".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/f".into(),
-        ],
-    )
-    .map(|_| ())
-}
-#[cfg(windows)]
-fn native_after_remove() -> Result<()> {
-    Ok(())
-}
-#[cfg(windows)]
-fn native_state(manifest: &ServiceManifest) -> Result<Value> {
-    let output = run_native_output(
-        schtasks_path()?,
-        [
-            "/query".into(),
-            "/tn".into(),
-            manifest.id.clone(),
-            "/fo".into(),
-            "list".into(),
-        ],
-    )?;
-    if !output.status.success() {
-        return Err(service_error(
-            "Task Scheduler could not report native watch registration",
-        ));
-    }
-    Ok(json!({"registered":true,"active":output.stdout.contains("Running")}))
-}
-
-fn run_native<I, P>(program: P, args: I) -> Result<BoundedProcessOutput>
+pub(crate) fn run_native<I, P>(program: P, args: I) -> Result<BoundedProcessOutput>
 where
     I: IntoIterator<Item = String>,
     P: AsRef<std::ffi::OsStr>,
@@ -1503,7 +870,7 @@ where
         )))
     }
 }
-fn run_native_output<I, P>(program: P, args: I) -> Result<BoundedProcessOutput>
+pub(crate) fn run_native_output<I, P>(program: P, args: I) -> Result<BoundedProcessOutput>
 where
     I: IntoIterator<Item = String>,
     P: AsRef<std::ffi::OsStr>,
@@ -1532,107 +899,11 @@ where
     )
     .map_err(service_error)
 }
-#[cfg(all(unix, not(target_os = "macos")))]
-fn systemctl_path() -> Result<&'static str> {
-    if Path::new("/usr/bin/systemctl").is_file() {
-        Ok("/usr/bin/systemctl")
-    } else if Path::new("/bin/systemctl").is_file() {
-        Ok("/bin/systemctl")
-    } else {
-        Err(service_error("systemctl is unavailable"))
-    }
-}
-#[cfg(windows)]
-fn schtasks_path() -> Result<PathBuf> {
-    let root = env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .ok_or_else(|| service_error("SystemRoot is unavailable"))?;
-    let path = root.join("System32/schtasks.exe");
-    if path.is_file() {
-        Ok(path)
-    } else {
-        Err(service_error("schtasks.exe is unavailable"))
-    }
-}
-#[cfg(all(unix, not(target_os = "macos")))]
-fn run_systemctl(args: impl IntoIterator<Item = String>) -> Result<BoundedProcessOutput> {
-    run_native(
-        systemctl_path()?,
-        std::iter::once("--user".to_owned()).chain(args),
-    )
-}
 fn bounded_output(output: &BoundedProcessOutput) -> String {
     output.stderr.chars().take(512).collect()
 }
 
-#[cfg(any(windows, target_os = "macos", test))]
-fn xml_escape(value: &str) -> Result<String> {
-    if value
-        .chars()
-        .any(|c| c == '\0' || c == '\r' || c == '\n' || (c.is_control() && c != '\t'))
-    {
-        return Err(invalid(
-            "native scheduler value contains a control character",
-        ));
-    }
-    Ok(value
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('\"', "&quot;")
-        .replace('\'', "&apos;"))
-}
-#[cfg(all(unix, not(target_os = "macos")))]
-fn systemd_escape(value: &str) -> Result<String> {
-    if value.chars().any(|c| c.is_control()) {
-        return Err(invalid(
-            "native scheduler value contains a control character",
-        ));
-    }
-    Ok(format!(
-        "\"{}\"",
-        value.replace('\\', "\\\\").replace('\"', "\\\"")
-    ))
-}
-#[cfg(windows)]
-fn windows_arguments(values: &[&str]) -> Result<String> {
-    values
-        .iter()
-        .map(|value| windows_quote(value))
-        .collect::<Result<Vec<_>>>()
-        .map(|parts| parts.join(" "))
-}
-
-/// Quote one argv element using the CommandLineToArgvW backslash rule: runs of
-/// backslashes are doubled only when they precede a quote or the closing quote.
-#[cfg(windows)]
-fn windows_quote(value: &str) -> Result<String> {
-    if value.chars().any(char::is_control) {
-        return Err(invalid(
-            "native scheduler value contains a control character",
-        ));
-    }
-    let mut quoted = String::from("\"");
-    let mut slashes = 0usize;
-    for ch in value.chars() {
-        if ch == '\\' {
-            slashes += 1;
-            continue;
-        }
-        if ch == '\"' {
-            quoted.push_str(&"\\".repeat(slashes.saturating_mul(2).saturating_add(1)));
-            quoted.push('\"');
-        } else {
-            quoted.push_str(&"\\".repeat(slashes));
-            quoted.push(ch);
-        }
-        slashes = 0;
-    }
-    quoted.push_str(&"\\".repeat(slashes.saturating_mul(2)));
-    quoted.push('\"');
-    Ok(quoted)
-}
-fn invalid(message: impl Into<String>) -> KioError {
+pub(crate) fn invalid(message: impl Into<String>) -> KioError {
     KioError::new(
         "KIO-E-WATCH-SERVICE-INVALID-001",
         message.into(),
@@ -1640,7 +911,7 @@ fn invalid(message: impl Into<String>) -> KioError {
         ExitCode::InvalidUsage,
     )
 }
-fn service_error(error: impl std::fmt::Display) -> KioError {
+pub(crate) fn service_error(error: impl std::fmt::Display) -> KioError {
     KioError::new(
         "KIO-E-WATCH-SERVICE-001",
         error.to_string(),
@@ -1654,6 +925,7 @@ mod tests {
     use std::cell::{Cell, RefCell};
 
     use super::*;
+    use crate::platform::{runner_argv, validate_runner_manifest_locator, xml_escape};
 
     #[cfg(unix)]
     fn native_test_root() -> (tempfile::TempDir, PathBuf) {
