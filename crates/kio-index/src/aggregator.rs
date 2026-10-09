@@ -44,24 +44,18 @@
 //! It is a CACHE, never truth (03 §4). Deleting it costs a re-projection and
 //! nothing else, which is why it lives under the cache root.
 
-#[cfg(target_os = "linux")]
-use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
-#[cfg(unix)]
-use std::ffi::CStr;
-use std::path::{Path, PathBuf};
-#[cfg(target_os = "linux")]
-use std::sync::Mutex;
-#[cfg(unix)]
-use std::sync::{Once, OnceLock};
+use std::path::Path;
 
-use cap_primitives::fs as cap_fs;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::Result;
 use crate::embedding_store::{EmbeddingProfileSummary, f32_from_le_bytes, f32_to_le_bytes};
+use crate::platform::{
+    BoundCache, bind_cache, open_bound_cache_connection, recreate_cache, validate_bound_cache_file,
+};
 
 /// One committed chunk as the collection sees it.
 ///
@@ -440,620 +434,6 @@ fn sqlite_sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(name)
 }
 
-/// A cache leaf and its parent directory retained as capabilities.  The parent
-/// must stay alive: a public cache pathname can be redirected after opening it.
-struct BoundCache {
-    _parent: std::fs::File,
-    file: std::fs::File,
-    public_path: PathBuf,
-}
-
-struct BoundCacheParent {
-    parent: std::fs::File,
-    public_path: PathBuf,
-}
-
-/// Bind the immediate cache parent without following it. Ancestors may be
-/// OS-owned symlinks (such as `/var`), so only the direct parent is selected
-/// relative to a canonicalized *outer* directory capability.
-fn bind_cache_parent(path: &Path, create_parent: bool) -> Result<BoundCacheParent> {
-    #[cfg(target_os = "linux")]
-    validate_linux_cache_path_lexical(path)?;
-    let lexical_parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let file_name = path.file_name().ok_or_else(|| {
-        crate::IndexError::Schema(format!(
-            "aggregator cache path has no file name: {}",
-            path.display()
-        ))
-    })?;
-    let (parent, resolved_parent) = open_or_create_cache_parent(lexical_parent, create_parent)?;
-    Ok(BoundCacheParent {
-        parent,
-        public_path: resolved_parent.join(file_name),
-    })
-}
-
-/// Reject spelling aliases before either the retained-descriptor route or the
-/// ordinary ambient resolver has a chance to normalize them. In particular a
-/// `..` before a later `/dev/fd/N` component must not be canonicalized into a
-/// descriptor-root-looking path and then escape through ambient resolution.
-#[cfg(target_os = "linux")]
-fn validate_linux_cache_path_lexical(path: &Path) -> Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-
-    let raw = path.as_os_str().as_bytes();
-    if raw.windows(2).any(|window| window == b"//")
-        || (raw.len() > 1 && raw.ends_with(b"/"))
-        || raw
-            .split(|byte| *byte == b'/')
-            .any(|component| component == b"." || component == b"..")
-    {
-        return Err(crate::IndexError::Schema(format!(
-            "aggregator cache path is not canonical (lexical): {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-fn open_or_create_cache_parent(
-    path: &Path,
-    create_missing: bool,
-) -> Result<(std::fs::File, std::path::PathBuf)> {
-    #[cfg(target_os = "linux")]
-    if let Some(bound) = open_or_create_inherited_cache_parent(path, create_missing)? {
-        return Ok(bound);
-    }
-    let mut existing = path;
-    while matches!(std::fs::symlink_metadata(existing), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
-    {
-        existing = existing.parent().ok_or_else(|| {
-            crate::IndexError::Schema(format!(
-                "no existing aggregator cache ancestor for {}",
-                path.display()
-            ))
-        })?;
-    }
-    let before = std::fs::symlink_metadata(existing).map_err(|e| {
-        crate::IndexError::Schema(format!(
-            "inspect aggregator cache ancestor {}: {e}",
-            existing.display()
-        ))
-    })?;
-    if !before.is_dir() || before.file_type().is_symlink() {
-        return Err(crate::IndexError::Schema(format!(
-            "aggregator cache ancestor must be a real directory: {}",
-            existing.display()
-        )));
-    }
-    #[cfg(windows)]
-    let before_identity = kio_core::platform::real_directory_identity(existing)
-        .map_err(|error| {
-            crate::IndexError::Schema(format!(
-                "inspect aggregator cache ancestor reparse state {}: {error}",
-                existing.display()
-            ))
-        })?
-        .ok_or_else(|| {
-            crate::IndexError::Schema(format!(
-                "aggregator cache ancestor must not be a Windows reparse point: {}",
-                existing.display()
-            ))
-        })?;
-    let resolved_existing = std::fs::canonicalize(existing).map_err(|e| {
-        crate::IndexError::Schema(format!(
-            "resolve aggregator cache ancestor {}: {e}",
-            existing.display()
-        ))
-    })?;
-    let mut handle =
-        cap_fs::open_ambient_dir(&resolved_existing, cap_primitives::ambient_authority()).map_err(
-            |e| {
-                crate::IndexError::Schema(format!(
-                    "open aggregator cache ancestor {}: {e}",
-                    resolved_existing.display()
-                ))
-            },
-        )?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        let opened = handle.metadata().map_err(|e| {
-            crate::IndexError::Schema(format!("inspect opened aggregator cache ancestor: {e}"))
-        })?;
-        if before.dev() != opened.dev() || before.ino() != opened.ino() {
-            return Err(crate::IndexError::Schema(format!(
-                "aggregator cache ancestor changed while opening: {}",
-                existing.display()
-            )));
-        }
-    }
-    #[cfg(windows)]
-    {
-        if kio_core::platform::directory_handle_identity(&handle) != Some(before_identity) {
-            return Err(crate::IndexError::Schema(format!(
-                "aggregator cache ancestor changed while opening: {}",
-                existing.display()
-            )));
-        }
-    }
-    let mut resolved = resolved_existing;
-    let remainder = path.strip_prefix(existing).map_err(|_| {
-        crate::IndexError::Schema(format!(
-            "derive cache path below ancestor: {}",
-            path.display()
-        ))
-    })?;
-    for component in remainder.components() {
-        let std::path::Component::Normal(component) = component else {
-            continue;
-        };
-        handle = match cap_fs::open_dir_nofollow(&handle, Path::new(component)) {
-            Ok(child) => child,
-            Err(_)
-                if create_missing
-                    && matches!(cap_fs::stat(&handle, Path::new(component), cap_fs::FollowSymlinks::No), Err(e) if e.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                let parent = kio_core::store_dir::StoreDirectory::from_retained(
-                    handle.try_clone().map_err(|error| {
-                        crate::IndexError::Schema(format!("retain cache parent: {error}"))
-                    })?,
-                    resolved.clone(),
-                )
-                .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
-                parent
-                    .create_directory(Path::new(component))
-                    .map_err(|error| {
-                        crate::IndexError::Schema(format!(
-                            "create private aggregator cache directory {}: {error}",
-                            path.display()
-                        ))
-                    })?
-            }
-            Err(e) => {
-                return Err(crate::IndexError::Schema(format!(
-                    "open aggregator cache directory {} without following links: {e}",
-                    path.display()
-                )));
-            }
-        };
-        resolved.push(component);
-    }
-    Ok((handle, resolved))
-}
-
-/// Bind a cache parent below the shared inherited-directory capability.
-///
-/// `/dev/fd/N` never reaches the ambient resolver: core validates the raw
-/// spelling, duplicates the descriptor, and returns only normal suffix names.
-/// Every suffix operation below is therefore relative to that retained root.
-#[cfg(target_os = "linux")]
-fn open_or_create_inherited_cache_parent(
-    path: &Path,
-    create_missing: bool,
-) -> Result<Option<(std::fs::File, std::path::PathBuf)>> {
-    let Some((mut current, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
-        .map_err(|error| {
-            crate::IndexError::Schema(format!(
-                "resolve inherited aggregator cache capability: {error}"
-            ))
-        })?
-    else {
-        return Ok(None);
-    };
-    let mut logical = current.path().to_path_buf();
-    for component in suffix {
-        let leaf = Path::new(&component);
-        logical.push(&component);
-        let next = if current.contains_entry(leaf).map_err(|error| {
-            crate::IndexError::Schema(format!(
-                "inspect inherited aggregator cache directory {}: {error}",
-                logical.display()
-            ))
-        })? {
-            current.open_directory(leaf).map_err(|error| {
-                crate::IndexError::Schema(format!(
-                    "open inherited aggregator cache directory {} without following links: {error}",
-                    logical.display()
-                ))
-            })?
-        } else if create_missing {
-            current.create_directory(leaf).map_err(|error| {
-                crate::IndexError::Schema(format!(
-                    "create inherited private aggregator cache directory {}: {error}",
-                    logical.display()
-                ))
-            })?
-        } else {
-            return Err(crate::IndexError::Schema(format!(
-                "inherited aggregator cache directory is missing: {}",
-                logical.display()
-            )));
-        };
-        current = kio_core::store_dir::StoreDirectory::from_retained(next, logical.clone())
-            .map_err(|error| {
-                crate::IndexError::Schema(format!(
-                    "retain inherited aggregator cache directory {}: {error}",
-                    logical.display()
-                ))
-            })?;
-        verify_private_cache_directory(current.root_handle().as_ref(), &logical)?;
-    }
-    let retained = current.root_handle().try_clone().map_err(|error| {
-        crate::IndexError::Schema(format!(
-            "retain inherited aggregator cache parent {}: {error}",
-            path.display()
-        ))
-    })?;
-    Ok(Some((retained, path.to_path_buf())))
-}
-
-/// Core validates the inherited root. Existing suffix directories and newly
-/// created cache directories must have the same owner-private boundary before
-/// they can become the SQLite parent.
-#[cfg(target_os = "linux")]
-fn verify_private_cache_directory(file: &std::fs::File, path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = file.metadata().map_err(|error| {
-        crate::IndexError::Schema(format!(
-            "inspect inherited aggregator cache directory {}: {error}",
-            path.display()
-        ))
-    })?;
-    // SAFETY: geteuid has no arguments and no memory-safety preconditions.
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-        return Err(crate::IndexError::Schema(format!(
-            "inherited aggregator cache directory is not owner-private: {}",
-            path.display()
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn cache_file_identity(file: &std::fs::File) -> Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-
-    let metadata = file
-        .metadata()
-        .map_err(|e| crate::IndexError::Schema(format!("inspect opened aggregator cache: {e}")))?;
-    Ok((metadata.dev(), metadata.ino()))
-}
-
-fn validate_bound_cache_file(file: &std::fs::File, path: &Path) -> Result<()> {
-    let metadata = file.metadata().map_err(|e| {
-        crate::IndexError::Schema(format!(
-            "inspect opened aggregator cache {}: {e}",
-            path.display()
-        ))
-    })?;
-    if !metadata.is_file() {
-        return Err(crate::IndexError::Schema(format!(
-            "aggregator cache target is not a regular file: {}",
-            path.display()
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(crate::IndexError::Schema(format!(
-                "aggregator cache target must have exactly one hard link (found {}): {}",
-                metadata.nlink(),
-                path.display()
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn bind_cache(path: &Path, create_missing: bool) -> Result<BoundCache> {
-    let BoundCacheParent {
-        parent: parent_handle,
-        public_path: path,
-    } = bind_cache_parent(path, true)?;
-    let leaf = path.file_name().expect("resolved cache has leaf");
-    let before_leaf = cap_fs::stat(&parent_handle, Path::new(leaf), cap_fs::FollowSymlinks::No);
-    if matches!(&before_leaf, Ok(metadata) if !metadata.is_file()) {
-        return Err(crate::IndexError::Schema(format!(
-            "aggregator cache target is not a regular file (possibly a symlink): {}",
-            path.display()
-        )));
-    }
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    #[cfg(windows)]
-    {
-        use cap_fs::OpenOptionsExt;
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-    }
-    if create_missing && matches!(&before_leaf, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
-    {
-        options.create_new(true);
-    }
-    let file = cap_fs::open(&parent_handle, Path::new(leaf), &options).map_err(|e| {
-        crate::IndexError::Schema(format!("open aggregator cache {}: {e}", path.display()))
-    })?;
-    validate_bound_cache_file(&file, &path)?;
-    #[cfg(unix)]
-    if let Ok(before) = before_leaf {
-        use cap_fs::MetadataExt;
-        if (before.dev(), before.ino()) != cache_file_identity(&file)? {
-            return Err(crate::IndexError::Schema(format!(
-                "aggregator cache leaf changed while opening: {}",
-                path.display()
-            )));
-        }
-    }
-    Ok(BoundCache {
-        _parent: parent_handle,
-        file,
-        public_path: path,
-    })
-}
-
-#[cfg(unix)]
-const BOUND_CACHE_VFS_NAME: &CStr = c"kio-bound-cache-unix";
-#[cfg(unix)]
-static BOUND_CACHE_VFS_INIT: Once = Once::new();
-#[cfg(unix)]
-static BOUND_CACHE_VFS_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
-#[cfg(unix)]
-static BOUND_CACHE_DEFAULT_VFS: OnceLock<usize> = OnceLock::new();
-#[cfg(target_os = "linux")]
-static BOUND_CACHE_LINUX_OPEN: Mutex<()> = Mutex::new(());
-#[cfg(target_os = "linux")]
-std::thread_local! {
-    static BOUND_CACHE_LINUX_EXPECTED: Cell<Option<(u64, u64)>> = const { Cell::new(None) };
-}
-
-impl BoundCache {
-    #[cfg(target_os = "linux")]
-    fn sqlite_path(&self) -> PathBuf {
-        use std::os::fd::AsRawFd;
-
-        let leaf = self
-            .public_path
-            .file_name()
-            .expect("bound cache has a file name");
-        PathBuf::from(format!("/proc/self/fd/{}", self._parent.as_raw_fd())).join(leaf)
-    }
-
-    #[cfg(all(unix, not(target_os = "linux")))]
-    fn sqlite_path(&self) -> PathBuf {
-        use std::os::fd::AsRawFd;
-        PathBuf::from(format!("/dev/fd/{}", self.file.as_raw_fd()))
-    }
-}
-
-#[cfg(unix)]
-fn open_bound_cache_connection(cache: &BoundCache, flags: OpenFlags) -> Result<Connection> {
-    BOUND_CACHE_VFS_INIT.call_once(|| {
-        let result = unsafe {
-            let original = rusqlite::ffi::sqlite3_vfs_find(std::ptr::null());
-            if original.is_null() {
-                Err("SQLite has no default VFS".to_owned())
-            } else {
-                let _ = BOUND_CACHE_DEFAULT_VFS.set(original as usize);
-                let mut wrapped = Box::new(*original);
-                wrapped.zName = BOUND_CACHE_VFS_NAME.as_ptr();
-                wrapped.xOpen = Some(bound_cache_x_open);
-                wrapped.xFullPathname = Some(bound_cache_x_full_pathname);
-                let code = rusqlite::ffi::sqlite3_vfs_register(Box::into_raw(wrapped), 0);
-                if code == rusqlite::ffi::SQLITE_OK {
-                    Ok(())
-                } else {
-                    Err(format!(
-                        "register bound cache SQLite VFS: SQLite error {code}"
-                    ))
-                }
-            }
-        };
-        let _ = BOUND_CACHE_VFS_RESULT.set(result);
-    });
-    BOUND_CACHE_VFS_RESULT
-        .get()
-        .expect("VFS initializer sets result")
-        .as_ref()
-        .map_err(|e| crate::IndexError::Schema(e.clone()))?;
-    let path = cache.sqlite_path();
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::ffi::OsStrExt;
-
-        if !is_bound_cache_linux_parent_fd_name(path.as_os_str().as_bytes()) {
-            return Err(crate::IndexError::Schema(
-                "bound cache SQLite path is not an internal descriptor-root path".to_owned(),
-            ));
-        }
-        let _open_guard = BOUND_CACHE_LINUX_OPEN.lock().map_err(|_| {
-            crate::IndexError::Schema("bound cache SQLite open mutex is poisoned".to_owned())
-        })?;
-        let expected = cache_file_identity(&cache.file)?;
-        BOUND_CACHE_LINUX_EXPECTED.with(|slot| slot.set(Some(expected)));
-        let outcome = Connection::open_with_flags_and_vfs(&path, flags, "kio-bound-cache-unix");
-        BOUND_CACHE_LINUX_EXPECTED.with(|slot| slot.set(None));
-        Ok(outcome?)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        use std::os::unix::ffi::OsStrExt;
-
-        if !is_bound_cache_fd_name(path.as_os_str().as_bytes()) {
-            return Err(crate::IndexError::Schema(
-                "bound cache SQLite path is not an internal descriptor path".to_owned(),
-            ));
-        }
-        Ok(Connection::open_with_flags_and_vfs(
-            &path,
-            flags,
-            "kio-bound-cache-unix",
-        )?)
-    }
-}
-#[cfg(not(unix))]
-fn open_bound_cache_connection(cache: &BoundCache, flags: OpenFlags) -> Result<Connection> {
-    Ok(Connection::open_with_flags(&cache.public_path, flags)?)
-}
-#[cfg(unix)]
-unsafe extern "C" fn bound_cache_x_full_pathname(
-    _: *mut rusqlite::ffi::sqlite3_vfs,
-    name: *const std::ffi::c_char,
-    output_len: std::ffi::c_int,
-    output: *mut std::ffi::c_char,
-) -> std::ffi::c_int {
-    if name.is_null() || output.is_null() || output_len <= 0 {
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    }
-    let bytes = unsafe { CStr::from_ptr(name).to_bytes() };
-    if is_bound_cache_fd_name(bytes)
-        || (cfg!(target_os = "linux") && is_bound_cache_linux_parent_fd_name(bytes))
-    {
-        if bytes.len() + 1 > output_len as usize {
-            return rusqlite::ffi::SQLITE_CANTOPEN;
-        }
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr().cast::<std::ffi::c_char>(),
-                output,
-                bytes.len(),
-            );
-            *output.add(bytes.len()) = 0;
-        }
-        return rusqlite::ffi::SQLITE_OK;
-    }
-    let Some(default_vfs) = BOUND_CACHE_DEFAULT_VFS.get() else {
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    };
-    let default_vfs = *default_vfs as *mut rusqlite::ffi::sqlite3_vfs;
-    let Some(callback) = (unsafe { (*default_vfs).xFullPathname }) else {
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    };
-    unsafe { callback(default_vfs, name, output_len, output) }
-}
-
-#[cfg(unix)]
-unsafe extern "C" fn bound_cache_x_open(
-    _: *mut rusqlite::ffi::sqlite3_vfs,
-    name: rusqlite::ffi::sqlite3_filename,
-    file: *mut rusqlite::ffi::sqlite3_file,
-    flags: std::ffi::c_int,
-    out_flags: *mut std::ffi::c_int,
-) -> std::ffi::c_int {
-    let Some(default_vfs) = BOUND_CACHE_DEFAULT_VFS.get() else {
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    };
-    let default_vfs = *default_vfs as *mut rusqlite::ffi::sqlite3_vfs;
-    let Some(callback) = (unsafe { (*default_vfs).xOpen }) else {
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    };
-
-    #[cfg(target_os = "linux")]
-    if !name.is_null()
-        && is_bound_cache_linux_parent_fd_name(unsafe { CStr::from_ptr(name).to_bytes() })
-        && flags & rusqlite::ffi::SQLITE_OPEN_MAIN_DB != 0
-    {
-        let expected = BOUND_CACHE_LINUX_EXPECTED.with(Cell::get);
-        let Some(expected) = expected else {
-            return rusqlite::ffi::SQLITE_CANTOPEN;
-        };
-        let Ok(before) = linux_regular_fd_inventory() else {
-            return rusqlite::ffi::SQLITE_CANTOPEN;
-        };
-        let code = unsafe { callback(default_vfs, name, file, flags, out_flags) };
-        if code != rusqlite::ffi::SQLITE_OK {
-            return code;
-        }
-        let verified = linux_regular_fd_inventory().is_ok_and(|after| {
-            let opened: Vec<_> = after
-                .iter()
-                .filter(|(fd, identity)| before.get(fd) != Some(*identity))
-                .collect();
-            // SQLite must add exactly one descriptor for the retained cache
-            // inode. Other trusted in-process opens cannot grant authority
-            // over this cache; a second matching descriptor is fail-closed.
-            opened
-                .iter()
-                .filter(|(_, identity)| **identity == expected)
-                .count()
-                == 1
-        });
-        if verified {
-            return rusqlite::ffi::SQLITE_OK;
-        }
-        if !file.is_null() {
-            let methods = unsafe { (*file).pMethods };
-            if !methods.is_null()
-                && let Some(close) = unsafe { (*methods).xClose }
-            {
-                let _ = unsafe { close(file) };
-            }
-        }
-        return rusqlite::ffi::SQLITE_CANTOPEN;
-    }
-
-    unsafe { callback(default_vfs, name, file, flags, out_flags) }
-}
-
-#[cfg(unix)]
-fn is_bound_cache_fd_name(value: &[u8]) -> bool {
-    value
-        .strip_prefix(b"/dev/fd/")
-        .is_some_and(|fd| !fd.is_empty() && fd.iter().all(u8::is_ascii_digit))
-}
-
-/// Linux uses a retained parent directory plus one final leaf, allowing the
-/// stock Unix VFS to apply `O_NOFOLLOW` to the real cache file rather than to
-/// `/dev/fd/N` (which the Linux VFS rejects with `O_NOFOLLOW`).
-#[cfg(unix)]
-fn is_bound_cache_linux_parent_fd_name(value: &[u8]) -> bool {
-    let Some(value) = value.strip_prefix(b"/proc/self/fd/") else {
-        return false;
-    };
-    let Some(separator) = value.iter().position(|byte| *byte == b'/') else {
-        return false;
-    };
-    let (fd, leaf_with_separator) = value.split_at(separator);
-    let leaf = &leaf_with_separator[1..];
-    !fd.is_empty()
-        && fd.iter().all(u8::is_ascii_digit)
-        && !leaf.is_empty()
-        && !leaf.contains(&b'/')
-        && leaf != b"."
-        && leaf != b".."
-}
-
-#[cfg(target_os = "linux")]
-fn linux_regular_fd_inventory() -> Result<BTreeMap<i32, (u64, u64)>> {
-    use std::os::unix::fs::MetadataExt;
-
-    let entries = std::fs::read_dir("/proc/self/fd").map_err(|e| {
-        crate::IndexError::Schema(format!("inspect process descriptor inventory: {e}"))
-    })?;
-    let mut result = BTreeMap::new();
-    for entry in entries {
-        let entry = entry.map_err(|e| {
-            crate::IndexError::Schema(format!("read process descriptor inventory entry: {e}"))
-        })?;
-        let Ok(fd) = entry.file_name().to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        let Ok(metadata) = std::fs::metadata(entry.path()) else {
-            continue;
-        };
-        if metadata.is_file() {
-            result.insert(fd, (metadata.dev(), metadata.ino()));
-        }
-    }
-    Ok(result)
-}
-
 pub struct Aggregator {
     conn: Connection,
     // Retain the directory and leaf capabilities for the lifetime of SQLite.
@@ -1233,74 +613,7 @@ impl Aggregator {
     /// never turn discovery of an incompatible cache into a write.  Callers
     /// invoke it only under the user-authorized device repair operation.
     pub fn recreate(path: &Path) -> Result<Self> {
-        let BoundCacheParent {
-            parent: parent_handle,
-            public_path: path,
-        } = bind_cache_parent(path, true)?;
-        let leaf = path.file_name().expect("resolved cache has leaf");
-        // Cap-relative deletion prevents a swapped public parent from becoming
-        // the authority for any part of explicit recreation.
-        for candidate in [
-            leaf.to_os_string(),
-            format!("{}-wal", leaf.to_string_lossy()).into(),
-            format!("{}-shm", leaf.to_string_lossy()).into(),
-        ] {
-            let candidate = Path::new(&candidate);
-            match cap_fs::stat(&parent_handle, candidate, cap_fs::FollowSymlinks::No) {
-                Ok(metadata) if metadata.is_file() => {
-                    #[cfg(unix)]
-                    {
-                        use cap_fs::MetadataExt;
-                        if metadata.nlink() != 1 {
-                            return Err(crate::IndexError::Schema(format!(
-                                "aggregator cache target must have exactly one hard link: {}",
-                                candidate.display()
-                            )));
-                        }
-                    }
-                }
-                Ok(_) => {
-                    return Err(crate::IndexError::Schema(format!(
-                        "refusing to recreate aggregator cache through symlink or non-file: {}",
-                        candidate.display()
-                    )));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => {
-                    return Err(crate::IndexError::Schema(format!(
-                        "inspect aggregator cache {}: {e}",
-                        candidate.display()
-                    )));
-                }
-            }
-            cap_fs::remove_file(&parent_handle, candidate).map_err(|e| {
-                crate::IndexError::Schema(format!(
-                    "remove aggregator cache {}: {e}",
-                    candidate.display()
-                ))
-            })?;
-        }
-        let mut options = cap_fs::OpenOptions::new();
-        options
-            .read(true)
-            .write(true)
-            .create_new(true)
-            ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-        #[cfg(windows)]
-        {
-            use cap_fs::OpenOptionsExt;
-            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
-            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
-        }
-        let file = cap_fs::open(&parent_handle, Path::new(leaf), &options).map_err(|e| {
-            crate::IndexError::Schema(format!("create aggregator cache {}: {e}", path.display()))
-        })?;
-        let cache = BoundCache {
-            _parent: parent_handle,
-            file,
-            public_path: path,
-        };
-        Self::open_bound(cache)
+        Self::open_bound(recreate_cache(path)?)
     }
 
     /// Validate an existing replica before opening it for writing.
@@ -1314,7 +627,7 @@ impl Aggregator {
     fn reject_obsolete_binding_schema(cache: &BoundCache) -> Result<()> {
         type SchemaColumn = (&'static str, &'static str, bool, i64);
         type TableSchema = (&'static str, &'static [SchemaColumn]);
-        validate_bound_cache_file(&cache.file, &cache.public_path)?;
+        validate_bound_cache_file(cache.file(), cache.public_path())?;
         let conn = open_bound_cache_connection(
             cache,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -3501,7 +2814,7 @@ mod tests {
 
         let directory = private_fd_root();
         let retained_root = std::fs::File::open(directory.path()).unwrap();
-        let path = PathBuf::from(format!(
+        let path = std::path::PathBuf::from(format!(
             "/dev/fd/{}/kio/aggregator.sqlite",
             retained_root.as_raw_fd()
         ));
@@ -3518,7 +2831,7 @@ mod tests {
 
         let directory = private_fd_root();
         let retained_root = std::fs::File::open(directory.path()).unwrap();
-        let path = PathBuf::from(format!(
+        let path = std::path::PathBuf::from(format!(
             "/dev/fd/{}/aggregator.sqlite",
             retained_root.as_raw_fd()
         ));
@@ -3543,7 +2856,7 @@ mod tests {
         std::fs::write(&regular, b"not a directory").unwrap();
         let retained_file = std::fs::File::open(&regular).unwrap();
         use std::os::fd::AsRawFd;
-        let path = PathBuf::from(format!(
+        let path = std::path::PathBuf::from(format!(
             "/dev/fd/{}/kio/aggregator.sqlite",
             retained_file.as_raw_fd()
         ));
@@ -3562,7 +2875,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
         let retained_root = std::fs::File::open(directory.path()).unwrap();
-        let path = PathBuf::from(format!(
+        let path = std::path::PathBuf::from(format!(
             "/dev/fd/{}/aggregator.sqlite",
             retained_root.as_raw_fd()
         ));
@@ -3635,7 +2948,7 @@ mod tests {
         std::fs::create_dir(&original).unwrap();
         std::fs::rename(&original, directory.path().join("kio-original")).unwrap();
         symlink(victim.path(), &original).unwrap();
-        let path = PathBuf::from(format!(
+        let path = std::path::PathBuf::from(format!(
             "/dev/fd/{}/kio/aggregator.sqlite",
             retained_root.as_raw_fd()
         ));
