@@ -3,14 +3,13 @@
 pub mod budget;
 pub mod ledger;
 pub mod markdownize;
+mod platform;
 pub mod policy;
 pub mod prepare;
 pub mod scan;
 mod store_path;
 pub mod task;
 pub mod unsupported;
-#[cfg(any(test, windows))]
-mod windows_file;
 
 use thiserror::Error;
 

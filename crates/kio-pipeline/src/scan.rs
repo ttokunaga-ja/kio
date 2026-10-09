@@ -2,17 +2,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
-#[cfg(not(windows))]
-use std::fs::Metadata;
 use std::io::Read;
-#[cfg(windows)]
-use std::os::windows::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
 use cap_primitives::{ambient_authority, fs as cap_fs};
 use kio_core::management::{DirectoryIdentity, ManagementBinding, read_record};
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
+
+use crate::platform::scan::{
+    directory_identity, ensure_file_unchanged, open_verified_regular_file, reject_child_directory,
+    same_bound_file_identity, same_bound_file_state, same_cap_directory_identity,
+    same_cap_directory_volume, validate_discovery_path_limit,
+};
 
 use crate::policy::CurrentPolicyEvaluator;
 use crate::prepare::{hash_bytes, hash_reader};
@@ -30,14 +32,6 @@ pub const CHILD_SCOPE_DISCOVERY_PAGE_SIZE: usize = 128;
 const CHILD_SCOPE_DISCOVERY_SELECTION_SIZE: usize = CHILD_SCOPE_DISCOVERY_PAGE_SIZE + 1;
 const CHILD_SCOPE_DISCOVERY_TOKEN_VERSION: u8 = 1;
 const MAX_CHILD_SCOPE_DISCOVERY_TOKEN_BYTES: usize = 1024 * 1024;
-/// A Unix pathname is bounded by the operating system at open time. This cap
-/// bounds continuation serialization without imposing Unix's short path
-/// limit on Windows, whose normal long-path ceiling is 32,767 UTF-16 units.
-#[cfg(not(windows))]
-const MAX_CHILD_SCOPE_DISCOVERY_RELATIVE_BYTES: usize = 128 * 1024;
-#[cfg(windows)]
-const MAX_CHILD_SCOPE_DISCOVERY_RELATIVE_UTF16: usize = 32_767;
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildScopeDiscovery {
     /// Relative to the parent scope, using `/` separators.
@@ -806,8 +800,7 @@ pub fn discover_managed_child_scopes_page(
                 continue;
             }
         };
-        #[cfg(windows)]
-        if kio_core::platform::directory_handle_identity(&child).is_none() {
+        if reject_child_directory(&child) {
             let mut row = child_status(relative, "skipped_symlink");
             row.reason = Some("windows_reparse_point".to_owned());
             result.push(row);
@@ -1017,20 +1010,7 @@ fn validate_discovery_relative(path: &Path) -> Result<()> {
             "child discovery continuation contains a non-relative path",
         ));
     }
-    #[cfg(windows)]
-    if path.as_os_str().encode_wide().count() > MAX_CHILD_SCOPE_DISCOVERY_RELATIVE_UTF16 {
-        return Err(crate::PipelineError::contract(
-            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
-            "child discovery path exceeds the Windows supported limit",
-        ));
-    }
-    #[cfg(not(windows))]
-    if path.as_os_str().as_encoded_bytes().len() > MAX_CHILD_SCOPE_DISCOVERY_RELATIVE_BYTES {
-        return Err(crate::PipelineError::contract(
-            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
-            "child discovery path exceeds the supported token limit",
-        ));
-    }
+    validate_discovery_path_limit(path)?;
     Ok(())
 }
 
@@ -1078,53 +1058,6 @@ fn select_discovery_entry_page(dir: &File, after: Option<&str>) -> Result<Vec<St
         }
     }
     Ok(names.into_iter().collect())
-}
-
-#[cfg(unix)]
-fn directory_identity(file: &File) -> Result<DirectoryIdentity> {
-    use cap_fs::MetadataExt;
-    let metadata = cap_fs::Metadata::from_file(file).pipeline_io(Path::new("."))?;
-    if !metadata.file_type().is_dir() {
-        return Err(crate::PipelineError::contract(
-            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
-            "discovery frontier is not a directory",
-        ));
-    }
-    Ok(DirectoryIdentity::Unix {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-#[cfg(windows)]
-fn directory_identity(file: &File) -> Result<DirectoryIdentity> {
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-    };
-    let information = kio_core::platform::file_information(file).map_err(|_| {
-        crate::PipelineError::contract(
-            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
-            "discovery frontier is not a real directory",
-        )
-    })?;
-    if information.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0
-        || information.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-    {
-        return Err(crate::PipelineError::contract(
-            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
-            "discovery frontier is not a real directory",
-        ));
-    }
-    Ok(DirectoryIdentity::Windows {
-        volume_serial_number: information.volume_serial_number,
-        file_index: information.file_index,
-    })
-}
-#[cfg(not(any(unix, windows)))]
-fn directory_identity(_file: &File) -> Result<DirectoryIdentity> {
-    Err(crate::PipelineError::contract(
-        "KIO-E-SCAN-DIRECTORY-IDENTITY-001",
-        "directory identities are unsupported on this platform",
-    ))
 }
 
 fn load_bound_index_vcs_repos(kio: &File) -> Result<bool> {
@@ -1307,8 +1240,7 @@ fn discover_child_scopes_inner(
         // and recursion use. On Windows, reject a handle for anything other
         // than a real directory here: a junction/reparse point is never a
         // child-scope candidate, and must not be followed by discovery.
-        #[cfg(windows)]
-        if kio_core::platform::directory_handle_identity(&child).is_none() {
+        if reject_child_directory(&child) {
             let mut row = child_status(relative, "skipped_symlink");
             row.reason = Some("windows_reparse_point".to_owned());
             result.push(row);
@@ -1363,50 +1295,11 @@ fn relative_scope_path(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn same_cap_directory_volume(left: &File, right: &File) -> Result<bool> {
-    let left = cap_fs::Metadata::from_file(left).pipeline_io(Path::new("."))?;
-    let right = cap_fs::Metadata::from_file(right).pipeline_io(Path::new("."))?;
-    #[cfg(unix)]
-    {
-        use cap_fs::MetadataExt;
-        Ok(left.dev() == right.dev())
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        Ok(left.volume_serial_number() == right.volume_serial_number())
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = (left, right);
-        Err(crate::PipelineError::contract(
-            "KIO-E-SCAN-VOLUME-001",
-            "platform has no retained filesystem identity",
-        ))
-    }
-}
-
 fn is_vcs_root(path: &File) -> bool {
     cap_fs::stat(path, Path::new(".git"), cap_fs::FollowSymlinks::No).is_ok()
         || [".hg", ".svn", ".bzr"]
             .iter()
             .any(|marker| cap_fs::stat(path, Path::new(marker), cap_fs::FollowSymlinks::No).is_ok())
-}
-
-#[cfg(unix)]
-fn same_cap_directory_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-#[cfg(windows)]
-fn same_cap_directory_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::_WindowsByHandle;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-#[cfg(not(any(unix, windows)))]
-fn same_cap_directory_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 pub fn load_index_vcs_repos(scope_path: &Path) -> Result<bool> {
@@ -1946,184 +1839,6 @@ fn ensure_bound_file_unchanged(
         ));
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn same_bound_file_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_bound_file_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::_WindowsByHandle;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_bound_file_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
-}
-
-#[cfg(unix)]
-fn same_bound_file_state(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::MetadataExt;
-    same_bound_file_identity(left, right)
-        && left.len() == right.len()
-        && left.mtime() == right.mtime()
-        && left.mtime_nsec() == right.mtime_nsec()
-        && left.ctime() == right.ctime()
-        && left.ctime_nsec() == right.ctime_nsec()
-}
-
-#[cfg(not(unix))]
-fn same_bound_file_state(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    same_bound_file_identity(left, right)
-}
-
-#[derive(Debug)]
-struct OpenedFileState {
-    #[cfg(not(windows))]
-    metadata: Metadata,
-    #[cfg(windows)]
-    information: crate::windows_file::WindowsFileInformation,
-}
-
-impl OpenedFileState {
-    fn len(&self) -> u64 {
-        #[cfg(windows)]
-        {
-            self.information.file_size()
-        }
-        #[cfg(not(windows))]
-        {
-            self.metadata.len()
-        }
-    }
-}
-
-fn open_verified_regular_file(path: &Path) -> Result<(File, OpenedFileState)> {
-    #[cfg(windows)]
-    {
-        let listed = crate::windows_file::open_path_no_follow(path).pipeline_io(path)?;
-        let listed_information = crate::windows_file::information(&listed).pipeline_io(path)?;
-        if !listed_information.is_regular_file() {
-            return Err(crate::PipelineError::contract(
-                "KIO-E-SCAN-FILE-IDENTITY-001",
-                format!("scan candidate is not a regular file: {}", path.display()),
-            ));
-        }
-        let file = File::open(path).pipeline_io(path)?;
-        verify_opened_regular_file(path, listed_information, file)
-    }
-
-    #[cfg(not(windows))]
-    {
-        // `symlink_metadata` does not follow the final component. Comparing its identity
-        // with the opened handle closes the swap-to-symlink interval without requiring a
-        // later pathname read.
-        let listed = std::fs::symlink_metadata(path).pipeline_io(path)?;
-        if !listed.file_type().is_file() {
-            return Err(crate::PipelineError::contract(
-                "KIO-E-SCAN-FILE-IDENTITY-001",
-                format!("scan candidate is not a regular file: {}", path.display()),
-            ));
-        }
-        let file = File::open(path).pipeline_io(path)?;
-        verify_opened_regular_file(path, listed, file)
-    }
-}
-
-#[cfg(not(windows))]
-fn verify_opened_regular_file(
-    path: &Path,
-    listed: Metadata,
-    file: File,
-) -> Result<(File, OpenedFileState)> {
-    let opened = file.metadata().pipeline_io(path)?;
-    if !opened.is_file() || !same_file_identity(&listed, &opened) {
-        return Err(crate::PipelineError::contract(
-            "KIO-E-SCAN-FILE-IDENTITY-001",
-            format!(
-                "scan candidate changed while it was being opened: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok((file, OpenedFileState { metadata: opened }))
-}
-
-#[cfg(windows)]
-fn verify_opened_regular_file(
-    path: &Path,
-    listed: crate::windows_file::WindowsFileInformation,
-    file: File,
-) -> Result<(File, OpenedFileState)> {
-    let opened = file.metadata().pipeline_io(path)?;
-    let information = crate::windows_file::information(&file).pipeline_io(path)?;
-    if !opened.is_file() || !information.is_regular_file() || !listed.same_identity(information) {
-        return Err(crate::PipelineError::contract(
-            "KIO-E-SCAN-FILE-IDENTITY-001",
-            format!(
-                "scan candidate changed while it was being opened: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok((file, OpenedFileState { information }))
-}
-
-fn ensure_file_unchanged(file: &File, before: &OpenedFileState, path: &Path) -> Result<()> {
-    #[cfg(windows)]
-    let unchanged = {
-        let after = crate::windows_file::information(file).pipeline_io(path)?;
-        after.is_regular_file() && before.information.same_file_state(after)
-    };
-    #[cfg(not(windows))]
-    let unchanged = {
-        let after = file.metadata().pipeline_io(path)?;
-        same_file_state(&before.metadata, &after)
-    };
-    if !unchanged {
-        return Err(crate::PipelineError::contract(
-            "KIO-E-SCAN-INPUT-CHANGED-001",
-            format!(
-                "scan candidate changed while it was being read: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(left: &Metadata, right: &Metadata) -> bool {
-    left.file_type() == right.file_type()
-        && left.len() == right.len()
-        && left.modified().ok() == right.modified().ok()
-}
-
-#[cfg(unix)]
-fn same_file_state(left: &Metadata, right: &Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    same_file_identity(left, right)
-        && left.len() == right.len()
-        && left.mtime() == right.mtime()
-        && left.mtime_nsec() == right.mtime_nsec()
-        && left.ctime() == right.ctime()
-        && left.ctime_nsec() == right.ctime_nsec()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_state(left: &Metadata, right: &Metadata) -> bool {
-    same_file_identity(left, right)
 }
 
 fn is_xdg_state_inside_scope(scope_path: &Path, path: &Path) -> bool {
@@ -2751,6 +2466,8 @@ fn bound_scope_id_from_scope_json(kio: &File) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::platform::scan::verify_opened_regular_file;
 
     #[cfg(unix)]
     #[test]

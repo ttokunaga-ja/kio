@@ -406,29 +406,7 @@ impl TaskStore {
                 "task store root is not a real directory",
             ));
         }
-        #[cfg(windows)]
-        let expected = kio_core::platform::real_directory_identity(root).pipeline_io(root)?;
-        let canonical = root.canonicalize().pipeline_io(root)?;
-        let retained = kio_core::store_dir::StoreDirectory::open(&canonical).map_err(|error| {
-            PipelineError::corrupt(self.path.display().to_string(), error.to_string())
-        })?;
-        #[cfg(unix)]
-        let identity_matches = {
-            use std::os::unix::fs::MetadataExt;
-            let opened = retained.root_handle().metadata().pipeline_io(root)?;
-            listed.dev() == opened.dev() && listed.ino() == opened.ino()
-        };
-        #[cfg(windows)]
-        let identity_matches = expected.is_some()
-            && kio_core::platform::directory_handle_identity(&retained.root_handle()) == expected;
-        #[cfg(not(any(unix, windows)))]
-        let identity_matches = false;
-        if !identity_matches {
-            return Err(PipelineError::corrupt(
-                self.path.display().to_string(),
-                "task store root changed while opening",
-            ));
-        }
+        let retained = crate::platform::task::retain_task_root(root, &listed, &self.path)?;
         self.all_bound(&retained)
     }
 

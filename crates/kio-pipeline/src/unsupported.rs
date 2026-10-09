@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use kio_core::cas::is_hash;
 use serde::{Deserialize, Serialize};
 
+use crate::platform::configure_no_follow;
 use crate::store_path::{StorePathKind, resolve_existing_store_path};
 use crate::task::is_scope_local_file_name;
 use crate::{IoResultExt, PipelineError, Result};
@@ -44,19 +45,8 @@ pub struct UnsupportedInputDisposition {
 /// audit history.
 #[derive(Debug, Clone)]
 pub struct UnsupportedInputStore {
-    kio_dir: PathBuf,
+    pub(crate) kio_dir: PathBuf,
     path: PathBuf,
-}
-
-#[derive(Debug)]
-struct StoreRootSnapshot {
-    canonical: PathBuf,
-    #[cfg(not(windows))]
-    metadata: fs::Metadata,
-    #[cfg(windows)]
-    information: crate::windows_file::WindowsFileInformation,
-    #[cfg(windows)]
-    _handle: fs::File,
 }
 
 impl UnsupportedInputStore {
@@ -206,149 +196,9 @@ impl UnsupportedInputStore {
         Ok(Some(file))
     }
 
-    fn store_root_snapshot(&self) -> Result<StoreRootSnapshot> {
-        #[cfg(windows)]
-        {
-            let handle = crate::windows_file::open_path_no_follow(&self.kio_dir)
-                .pipeline_io(&self.kio_dir)?;
-            let information =
-                crate::windows_file::information(&handle).pipeline_io(&self.kio_dir)?;
-            if !information.is_real_directory() {
-                return Err(self.corrupt("Kio store root is not a real directory"));
-            }
-            let canonical = self.kio_dir.canonicalize().pipeline_io(&self.kio_dir)?;
-            Ok(StoreRootSnapshot {
-                canonical,
-                information,
-                _handle: handle,
-            })
-        }
-
-        #[cfg(not(windows))]
-        {
-            let metadata = fs::symlink_metadata(&self.kio_dir).pipeline_io(&self.kio_dir)?;
-            if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-                return Err(self.corrupt("Kio store root is not a real directory"));
-            }
-            let canonical = self.kio_dir.canonicalize().pipeline_io(&self.kio_dir)?;
-            Ok(StoreRootSnapshot {
-                canonical,
-                metadata,
-            })
-        }
-    }
-
-    fn validate_opened_file(
-        &self,
-        file: &fs::File,
-        opened_path: &Path,
-        root: &StoreRootSnapshot,
-    ) -> Result<()> {
-        let opened = file.metadata().pipeline_io(opened_path)?;
-        #[cfg(windows)]
-        let (valid_identity_and_type, single_link) = {
-            let opened_information =
-                crate::windows_file::information(file).pipeline_io(opened_path)?;
-            let listed_handle =
-                crate::windows_file::open_path_no_follow(opened_path).pipeline_io(opened_path)?;
-            let listed_information =
-                crate::windows_file::information(&listed_handle).pipeline_io(opened_path)?;
-            (
-                opened.is_file()
-                    && opened_information.is_regular_file()
-                    && listed_information.is_regular_file()
-                    && opened_information.same_identity(listed_information),
-                opened_information.has_single_link() && listed_information.has_single_link(),
-            )
-        };
-        #[cfg(not(windows))]
-        let (valid_identity_and_type, single_link) = {
-            let listed = fs::symlink_metadata(opened_path).pipeline_io(opened_path)?;
-            (
-                opened.is_file()
-                    && !listed.file_type().is_symlink()
-                    && listed.file_type().is_file()
-                    && same_file_identity(&opened, &listed),
-                has_single_link(&opened) && has_single_link(&listed),
-            )
-        };
-        if !valid_identity_and_type {
-            return Err(self.corrupt(
-                "unsupported-input store changed while it was opened or is not a regular file",
-            ));
-        }
-        if !single_link {
-            return Err(self.corrupt("unsupported-input store has an unexpected hard-link count"));
-        }
-
-        let current_root = self.store_root_snapshot()?;
-        #[cfg(windows)]
-        let same_root_identity = current_root.information.same_identity(root.information);
-        #[cfg(not(windows))]
-        let same_root_identity = same_file_identity(&current_root.metadata, &root.metadata);
-        if current_root.canonical != root.canonical || !same_root_identity {
-            return Err(self.corrupt("Kio store root changed while the store was opened"));
-        }
-        let canonical_file = opened_path.canonicalize().pipeline_io(opened_path)?;
-        if canonical_file.parent() != Some(root.canonical.as_path()) {
-            return Err(self
-                .corrupt("unsupported-input store resolves outside the canonical Kio directory"));
-        }
-        Ok(())
-    }
-
-    fn corrupt(&self, message: impl Into<String>) -> PipelineError {
+    pub(crate) fn corrupt(&self, message: impl Into<String>) -> PipelineError {
         PipelineError::corrupt(self.path.display().to_string(), message)
     }
-}
-
-#[cfg(unix)]
-fn configure_no_follow(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    options.custom_flags(0x20_800);
-    #[cfg(any(
-        target_os = "macos",
-        target_os = "ios",
-        target_os = "freebsd",
-        target_os = "openbsd",
-        target_os = "netbsd",
-        target_os = "dragonfly"
-    ))]
-    options.custom_flags(0x104);
-    let _ = options;
-}
-
-#[cfg(windows)]
-fn configure_no_follow(options: &mut OpenOptions) {
-    use std::os::windows::fs::OpenOptionsExt;
-    options.custom_flags(0x0020_0000);
-}
-
-#[cfg(not(any(unix, windows)))]
-fn configure_no_follow(_options: &mut OpenOptions) {}
-
-#[cfg(unix)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
-}
-
-#[cfg(unix)]
-fn has_single_link(metadata: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    metadata.nlink() == 1
-}
-
-#[cfg(not(any(unix, windows)))]
-fn has_single_link(_metadata: &fs::Metadata) -> bool {
-    true
 }
 
 fn validate_disposition(
