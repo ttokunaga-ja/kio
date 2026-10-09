@@ -7,13 +7,13 @@ use std::path::{Component, Path, PathBuf};
 
 use cap_primitives::{ambient_authority, fs as cap_fs};
 use kio_core::management::{DirectoryIdentity, ManagementBinding, read_record};
+use kio_core::platform::same_cap_file_identity;
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::platform::scan::{
     directory_identity, ensure_file_unchanged, open_verified_regular_file, reject_child_directory,
-    same_bound_file_identity, same_bound_file_state, same_cap_directory_identity,
-    same_cap_directory_volume, validate_discovery_path_limit,
+    same_bound_file_state, same_cap_directory_volume, validate_discovery_path_limit,
 };
 
 use crate::policy::CurrentPolicyEvaluator;
@@ -1133,7 +1133,7 @@ fn bound_child_handle(plan: &ChildScopePlan, relative: &str) -> Result<File> {
         path: relative.to_owned(),
         message: err.to_string(),
     })?;
-    if !same_cap_directory_identity(&expected, &actual) {
+    if !same_cap_file_identity(&expected, &actual) {
         return Err(crate::PipelineError::Schema(format!(
             "planned child scope changed during discovery: {relative}"
         )));
@@ -1812,8 +1812,8 @@ fn open_bound_verified_regular_file(
     let opened = cap_fs::Metadata::from_file(&file).pipeline_io(path)?;
     let after = cap_fs::stat(root, path, cap_fs::FollowSymlinks::No).pipeline_io(path)?;
     if !opened.file_type().is_file()
-        || !same_bound_file_identity(&listed, &opened)
-        || !same_bound_file_identity(&opened, &after)
+        || !same_cap_file_identity(&listed, &opened)
+        || !same_cap_file_identity(&opened, &after)
     {
         return Err(crate::PipelineError::contract(
             "KIO-E-SCAN-FILE-IDENTITY-001",
@@ -2100,8 +2100,8 @@ fn read_bound_optional_regular_text(dir: &File, name: &str) -> Result<Option<Str
     let after = cap_fs::stat(dir, path, cap_fs::FollowSymlinks::No).pipeline_io(path)?;
     if !opened.file_type().is_file()
         || opened.len() > MAX_BOUND_SCAN_METADATA_BYTES
-        || !same_bound_file_identity(&listed, &opened)
-        || !same_bound_file_identity(&opened, &after)
+        || !same_cap_file_identity(&listed, &opened)
+        || !same_cap_file_identity(&opened, &after)
     {
         return Err(crate::PipelineError::contract(
             "KIO-E-SCAN-FILE-IDENTITY-001",

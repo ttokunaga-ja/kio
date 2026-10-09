@@ -13,6 +13,7 @@ use kio_core::cas::{MAX_RAW_OBJECT_BYTES, ObjectKind, ObjectStore, hash_bytes, i
 use kio_core::dag::{CommitType, TreeEntry};
 use kio_core::gc::ensure_no_active_sweep;
 use kio_core::history::HistoryReader;
+use kio_core::platform::same_cap_file_identity;
 use kio_core::portable::portable_collision_key;
 use kio_core::purge::{EventKind, PurgeState, canonical_final_event};
 use kio_core::scope::Repository;
@@ -2110,24 +2111,6 @@ fn verify_open_file(
         ));
     }
     Ok(())
-}
-
-#[cfg(unix)]
-fn same_cap_file_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(windows)]
-fn same_cap_file_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::_WindowsByHandle;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-#[cfg(not(any(unix, windows)))]
-fn same_cap_file_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 #[cfg(unix)]

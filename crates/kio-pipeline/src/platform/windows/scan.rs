@@ -1,6 +1,7 @@
 use crate::{IoResultExt, Result};
 use cap_primitives::fs as cap_fs;
 use kio_core::management::DirectoryIdentity;
+use kio_core::platform::same_cap_file_identity;
 use std::fs::File;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
@@ -39,23 +40,8 @@ pub(crate) fn same_cap_directory_volume(left: &File, right: &File) -> Result<boo
     }
 }
 
-pub(crate) fn same_cap_directory_identity(
-    left: &cap_fs::Metadata,
-    right: &cap_fs::Metadata,
-) -> bool {
-    use cap_fs::_WindowsByHandle;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
-pub(crate) fn same_bound_file_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::_WindowsByHandle;
-    left.volume_serial_number() == right.volume_serial_number()
-        && left.file_index() == right.file_index()
-}
-
 pub(crate) fn same_bound_file_state(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    same_bound_file_identity(left, right)
+    same_cap_file_identity(left, right)
 }
 
 #[derive(Debug)]

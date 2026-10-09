@@ -1,6 +1,7 @@
 use crate::{IoResultExt, Result};
 use cap_primitives::fs as cap_fs;
 use kio_core::management::DirectoryIdentity;
+use kio_core::platform::same_cap_file_identity;
 use std::fs::File;
 use std::fs::Metadata;
 use std::path::Path;
@@ -30,22 +31,9 @@ pub(crate) fn same_cap_directory_volume(left: &File, right: &File) -> Result<boo
     }
 }
 
-pub(crate) fn same_cap_directory_identity(
-    left: &cap_fs::Metadata,
-    right: &cap_fs::Metadata,
-) -> bool {
-    use cap_fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-pub(crate) fn same_bound_file_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    use cap_fs::MetadataExt;
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
 pub(crate) fn same_bound_file_state(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
     use cap_fs::MetadataExt;
-    same_bound_file_identity(left, right)
+    same_cap_file_identity(left, right)
         && left.len() == right.len()
         && left.mtime() == right.mtime()
         && left.mtime_nsec() == right.mtime_nsec()

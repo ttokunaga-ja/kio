@@ -13,6 +13,16 @@ mod unix;
 #[cfg(any(windows, test))]
 mod windows;
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "unix/cap_identity.rs"]
+mod cap_identity;
+#[cfg(target_os = "windows")]
+#[path = "windows/cap_identity.rs"]
+mod cap_identity;
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+pub use cap_identity::same_cap_file_identity;
+
 #[cfg(target_os = "macos")]
 pub(crate) use macos::private_acl;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
