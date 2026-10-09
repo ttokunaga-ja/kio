@@ -3,17 +3,12 @@
 //! root-wide reconciliation request.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use notify::event::{AccessKind, AccessMode};
-#[cfg(not(windows))]
-use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use notify::{Event, EventKind};
 
-#[cfg(any(windows, test))]
-#[path = "native_windows.rs"]
-mod windows_backend;
+use crate::platform::{NativeWatchBackend, watch_backend_name};
 
 use super::{DirtyReason, Reconcile, WatchEngine, WatchError};
 
@@ -24,62 +19,13 @@ pub enum NativeWatcherStatus {
 }
 
 pub struct NativeWatcher<R: Reconcile> {
-    #[cfg(not(windows))]
-    _watcher: RecommendedWatcher,
-    #[cfg(windows)]
-    _watcher: windows_backend::Backend,
+    _watcher: NativeWatchBackend,
     _engine: Arc<WatchEngine<R>>,
 }
 
 impl<R: Reconcile> NativeWatcher<R> {
-    #[cfg(not(windows))]
     pub fn start(engine: Arc<WatchEngine<R>>) -> Result<Self, WatchError> {
-        let callback_engine = Arc::clone(&engine);
-        let mut watcher = RecommendedWatcher::new(
-            move |event| handle_event(&callback_engine, event),
-            Config::default(),
-        )
-        .map_err(|error| {
-            engine.set_backend(
-                "polling-required",
-                true,
-                Some(format!("native watcher initialization failed: {error}")),
-            );
-            WatchError::invariant(format!("cannot start native watcher: {error}"))
-        })?;
-        for root in engine.roots() {
-            watcher
-                .watch(&root.canonical_root, RecursiveMode::Recursive)
-                .map_err(|error| {
-                    engine.set_backend(
-                        "polling-required",
-                        true,
-                        Some(format!("native watch registration failed: {error}")),
-                    );
-                    WatchError::invariant(format!(
-                        "cannot watch {}: {error}",
-                        root.canonical_root.display()
-                    ))
-                })?;
-        }
-        engine.set_backend("notify/recommended", false, None);
-        Ok(Self {
-            _watcher: watcher,
-            _engine: engine,
-        })
-    }
-    #[cfg(windows)]
-    pub fn start(engine: Arc<WatchEngine<R>>) -> Result<Self, WatchError> {
-        engine.set_backend("windows/read-directory-changes", false, None);
-        let watcher =
-            windows_backend::Backend::start(Arc::clone(&engine)).inspect_err(|error| {
-                engine.set_backend(
-                    "windows/read-directory-changes",
-                    true,
-                    Some(error.to_string()),
-                );
-                enqueue_all(&engine, DirtyReason::BackendError);
-            })?;
+        let watcher = NativeWatchBackend::start(Arc::clone(&engine))?;
         Ok(Self {
             _watcher: watcher,
             _engine: engine,
@@ -87,15 +33,7 @@ impl<R: Reconcile> NativeWatcher<R> {
     }
 }
 
-fn backend_name() -> &'static str {
-    if cfg!(windows) {
-        "windows/read-directory-changes"
-    } else {
-        "notify/recommended"
-    }
-}
-
-fn handle_event<R: Reconcile>(engine: &WatchEngine<R>, event: notify::Result<Event>) {
+pub(crate) fn handle_event<R: Reconcile>(engine: &WatchEngine<R>, event: notify::Result<Event>) {
     match event {
         Ok(event) => {
             if event.need_rescan() {
@@ -129,33 +67,28 @@ fn handle_event<R: Reconcile>(engine: &WatchEngine<R>, event: notify::Result<Eve
                 // enqueue_events performs root-relative validation before one
                 // durable update for this backend notification.
                 if let Err(error) = engine.enqueue_events(&root, &paths, DirtyReason::Native) {
-                    engine.set_backend(backend_name(), true, Some(error.to_string()));
+                    engine.set_backend(watch_backend_name(), true, Some(error.to_string()));
                     let _ = engine.enqueue_event(&root, None, DirtyReason::Overflow);
                 }
             }
         }
         Err(error) => {
-            engine.set_backend(backend_name(), true, Some(error.to_string()));
+            engine.set_backend(watch_backend_name(), true, Some(error.to_string()));
             enqueue_all(engine, DirtyReason::BackendError);
         }
     }
 }
 
-fn enqueue_all<R: Reconcile>(engine: &WatchEngine<R>, reason: DirtyReason) {
+pub(crate) fn enqueue_all<R: Reconcile>(engine: &WatchEngine<R>, reason: DirtyReason) {
     for root in engine.roots() {
         let _ = engine.enqueue_event(&root, None, reason);
     }
 }
 
-#[allow(dead_code)]
-fn _event_paths_are_hints(paths: &[PathBuf]) -> bool {
-    !paths.is_empty()
-}
-
 #[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 mod tests {
     use std::fs;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::thread;
     use std::time::{Duration, Instant};

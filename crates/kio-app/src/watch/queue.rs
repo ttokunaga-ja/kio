@@ -4,14 +4,12 @@
 //! evidence that the path in an OS event is still present or authorized.
 
 use std::collections::BTreeSet;
-use std::fs::{self, File, OpenOptions};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kio_core::durability::{DurabilityPoint, checkpoint};
-#[cfg(target_os = "linux")]
-use kio_core::store_dir::{Publication, StoreDirectory};
-use rusqlite::{Connection, OptionalExtension, params};
+use kio_core::store_dir::StoreDirectory;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 
 use super::{DirtyReason, WatchError, WatchRoot};
@@ -42,11 +40,7 @@ pub enum EnqueueOutcome {
 
 #[derive(Debug)]
 pub struct DirtyQueue {
-    connection: Connection,
-    _exclusive_lock: File,
-    // Linux SQLite paths below `/proc/self/fd/<fd>` remain meaningful only
-    // while this duplicated owner-private parent capability stays open.
-    _retained_parent: Option<File>,
+    storage: crate::platform::WatchQueueStorage,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,71 +51,21 @@ impl DirtyQueue {
     /// still owns selecting this device-private location; a root path or an
     /// event path must never be used as this database path.
     pub fn open_private(path: &Path) -> Result<Self, WatchError> {
-        validate_private_queue_path(path)?;
-        Self::open_private_inner(path, None, || Ok(()))
+        Self::initialize(crate::platform::WatchQueueStorage::open_private(path)?)
     }
 
-    /// Open SQLite below an already-verified, retained private parent without
-    /// reopening its ambient pathname. Linux is the only supported bridge for
-    /// SQLite's pathname-only API; callers on other platforms retain the
-    /// ordinary path admission contract.
-    #[cfg(target_os = "linux")]
-    pub fn open_private_at(directory: &StoreDirectory, leaf: &Path) -> Result<Self, WatchError> {
-        if leaf.components().count() != 1
-            || !matches!(leaf.components().next(), Some(Component::Normal(_)))
-        {
-            return Err(WatchError::invariant(
-                "watch queue leaf must be one normal relative component",
-            ));
-        }
-        kio_core::private_fs::verify_private_directory_handle(directory).map_err(|error| {
-            WatchError::invariant(format!("watch queue private parent is unsafe: {error}"))
-        })?;
-        use std::os::fd::AsRawFd;
-        let parent = directory
-            .root_handle()
-            .as_ref()
-            .try_clone()
-            .map_err(WatchError::io)?;
-        let bridge = PathBuf::from(format!(
-            "/proc/self/fd/{}/{}",
-            parent.as_raw_fd(),
-            leaf.to_string_lossy()
-        ));
-        let leaves = prepare_retained_queue_leaves(directory, leaf)?;
-        Self::open_private_inner(&bridge, Some(parent), || {
-            verify_retained_queue_leaves(directory, &leaves)
-        })
+    /// Open through the selected platform's owner-private directory admission.
+    pub(crate) fn open_private_at(
+        directory: &StoreDirectory,
+        leaf: &Path,
+    ) -> Result<Self, WatchError> {
+        Self::initialize(crate::platform::WatchQueueStorage::open_private_at(
+            directory, leaf,
+        )?)
     }
 
-    fn open_private_inner<F>(
-        path: &Path,
-        retained_parent: Option<File>,
-        revalidate: F,
-    ) -> Result<Self, WatchError>
-    where
-        F: Fn() -> Result<(), WatchError>,
-    {
-        let lock_path = path.with_extension(format!(
-            "{}.lock",
-            path.extension()
-                .and_then(|value| value.to_str())
-                .unwrap_or("queue")
-        ));
-        let exclusive_lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)
-            .map_err(WatchError::io)?;
-        revalidate()?;
-        exclusive_lock.try_lock().map_err(|error| {
-            WatchError::invariant(format!(
-                "watch queue is already owned by another process: {error}"
-            ))
-        })?;
-        let connection = Connection::open(path).map_err(WatchError::sqlite)?;
+    fn initialize(storage: crate::platform::WatchQueueStorage) -> Result<Self, WatchError> {
+        let connection = storage.connection();
         connection
             .pragma_update(None, "journal_mode", "WAL")
             .map_err(WatchError::sqlite)?;
@@ -159,12 +103,8 @@ impl DirtyQueue {
                 [],
             )
             .map_err(WatchError::sqlite)?;
-        revalidate()?;
-        Ok(Self {
-            connection,
-            _exclusive_lock: exclusive_lock,
-            _retained_parent: retained_parent,
-        })
+        storage.revalidate()?;
+        Ok(Self { storage })
     }
 
     pub fn enqueue(
@@ -175,7 +115,11 @@ impl DirtyQueue {
     ) -> Result<EnqueueOutcome, WatchError> {
         let mut now = now_ms()?;
         let root_key = root_key(root);
-        let transaction = self.connection.transaction().map_err(WatchError::sqlite)?;
+        let transaction = self
+            .storage
+            .connection_mut()
+            .transaction()
+            .map_err(WatchError::sqlite)?;
         let existing = transaction
             .query_row(
                 "SELECT paths_json, full_scan, first_dirty_ms, sequence, event_generation, updated_ms FROM watch_dirty_queue WHERE root = ?1",
@@ -256,7 +200,8 @@ impl DirtyQueue {
 
     pub fn pending_count(&self) -> Result<usize, WatchError> {
         let count: i64 = self
-            .connection
+            .storage
+            .connection()
             .query_row("SELECT COUNT(*) FROM watch_dirty_queue", [], |row| {
                 row.get(0)
             })
@@ -272,7 +217,11 @@ impl DirtyQueue {
         lease: Duration,
     ) -> Result<Option<Claim>, WatchError> {
         let now = millis(now)?;
-        let transaction = self.connection.transaction().map_err(WatchError::sqlite)?;
+        let transaction = self
+            .storage
+            .connection_mut()
+            .transaction()
+            .map_err(WatchError::sqlite)?;
         let row = transaction.query_row(
             "SELECT root, scope_id, root_generation, event_generation, sequence, reason, paths_json, full_scan, updated_ms, first_dirty_ms
              FROM watch_dirty_queue WHERE (claimed_until_ms IS NULL OR claimed_until_ms <= ?1)
@@ -341,7 +290,11 @@ impl DirtyQueue {
     /// newer event while reconciling therefore leaves the new work durable.
     pub fn complete(&mut self, claim: &Claim, complete: bool) -> Result<(), WatchError> {
         let root = root_key(&claim.work.root);
-        let transaction = self.connection.transaction().map_err(WatchError::sqlite)?;
+        let transaction = self
+            .storage
+            .connection_mut()
+            .transaction()
+            .map_err(WatchError::sqlite)?;
         if complete {
             transaction.execute("DELETE FROM watch_dirty_queue WHERE root = ?1 AND sequence = ?2 AND event_generation = ?3 AND claim_generation = ?3", params![root, claim.sequence, claim.work.generation as i64]).map_err(WatchError::sqlite)?;
         } else {
@@ -357,7 +310,7 @@ impl DirtyQueue {
     }
 
     pub fn discard(&mut self, claim: &Claim) -> Result<(), WatchError> {
-        self.connection.execute("DELETE FROM watch_dirty_queue WHERE root = ?1 AND sequence = ?2 AND event_generation = ?3", params![root_key(&claim.work.root), claim.sequence, claim.work.generation as i64]).map_err(WatchError::sqlite)?;
+        self.storage.connection().execute("DELETE FROM watch_dirty_queue WHERE root = ?1 AND sequence = ?2 AND event_generation = ?3", params![root_key(&claim.work.root), claim.sequence, claim.work.generation as i64]).map_err(WatchError::sqlite)?;
         Ok(())
     }
 }
@@ -424,163 +377,13 @@ fn duration_ms(duration: Duration) -> Result<i64, WatchError> {
         .map_err(|_| WatchError::invariant("duration milliseconds overflow"))
 }
 
-#[cfg(target_os = "linux")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct RetainedLeafIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(target_os = "linux")]
-#[derive(Debug)]
-struct RetainedQueueLeaves(Vec<(PathBuf, RetainedLeafIdentity)>);
-
-/// Create every SQLite pathname that this queue can use with owner-only mode
-/// before SQLite is allowed to open it. All operations below use the retained
-/// directory capability, so an ambient replacement of its diagnostic path
-/// cannot select a different namespace.
-#[cfg(target_os = "linux")]
-fn prepare_retained_queue_leaves(
-    directory: &StoreDirectory,
-    queue_leaf: &Path,
-) -> Result<RetainedQueueLeaves, WatchError> {
-    let leaves = sqlite_leaf_names(queue_leaf)?;
-    let mut identities = Vec::with_capacity(leaves.len());
-    for leaf in leaves {
-        if !directory
-            .contains_entry(&leaf)
-            .map_err(retained_queue_error)?
-        {
-            // A concurrent safe initializer may win the create-only race.
-            // In either case, re-open below with no-follow semantics and
-            // reject anything that is not an owner-private regular file.
-            let _ = directory.write_atomic(&leaf, &[], Publication::CreateOnly);
-        }
-        directory
-            .ensure_owner_private(&leaf)
-            .map_err(retained_queue_error)?;
-        identities.push((leaf.clone(), retained_leaf_identity(directory, &leaf)?));
-    }
-    Ok(RetainedQueueLeaves(identities))
-}
-
-#[cfg(target_os = "linux")]
-fn verify_retained_queue_leaves(
-    directory: &StoreDirectory,
-    leaves: &RetainedQueueLeaves,
-) -> Result<(), WatchError> {
-    for (leaf, expected) in &leaves.0 {
-        directory
-            .ensure_owner_private(leaf)
-            .map_err(retained_queue_error)?;
-        if retained_leaf_identity(directory, leaf)? != *expected {
-            return Err(WatchError::invariant(
-                "watch queue leaf changed while SQLite was opened",
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn retained_leaf_identity(
-    directory: &StoreDirectory,
-    leaf: &Path,
-) -> Result<RetainedLeafIdentity, WatchError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let file = directory
-        .open_regular_read(leaf, u64::MAX)
-        .map_err(retained_queue_error)?;
-    let metadata = file.metadata().map_err(WatchError::io)?;
-    Ok(RetainedLeafIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn sqlite_leaf_names(queue_leaf: &Path) -> Result<[PathBuf; 4], WatchError> {
-    if queue_leaf.components().count() != 1
-        || !matches!(queue_leaf.components().next(), Some(Component::Normal(_)))
-    {
-        return Err(WatchError::invariant(
-            "watch queue leaf must be one normal relative component",
-        ));
-    }
-    let queue = queue_leaf.to_path_buf();
-    let lock = queue.with_extension(format!(
-        "{}.lock",
-        queue
-            .extension()
-            .and_then(|value| value.to_str())
-            .unwrap_or("queue")
-    ));
-    let name = queue_leaf
-        .file_name()
-        .expect("one normal queue component has a file name")
-        .to_string_lossy();
-    Ok([
-        queue,
-        lock,
-        PathBuf::from(format!("{name}-wal")),
-        PathBuf::from(format!("{name}-shm")),
-    ])
-}
-
-#[cfg(target_os = "linux")]
-fn retained_queue_error(error: kio_core::KioError) -> WatchError {
-    WatchError::invariant(format!("watch queue private leaf is unsafe: {error}"))
-}
-
-fn validate_private_queue_path(path: &Path) -> Result<(), WatchError> {
-    if !path.is_absolute() || path.file_name().is_none() {
-        return Err(WatchError::invariant(
-            "watch queue path must be absolute and have a leaf",
-        ));
-    }
-    let parent = path
-        .parent()
-        .ok_or_else(|| WatchError::invariant("watch queue path lacks a parent"))?;
-    let meta = fs::symlink_metadata(parent).map_err(WatchError::io)?;
-    if !meta.is_dir() || meta.file_type().is_symlink() {
-        return Err(WatchError::invariant(
-            "watch queue parent must be a real private directory",
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
-            return Err(WatchError::invariant(
-                "watch queue parent is not owner-private",
-            ));
-        }
-    }
-    if path.exists() {
-        let meta = fs::symlink_metadata(path).map_err(WatchError::io)?;
-        if !meta.is_file() || meta.file_type().is_symlink() {
-            return Err(WatchError::invariant("watch queue is not a regular file"));
-        }
-    } else {
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)
-            .map_err(WatchError::io)?;
-        drop(file);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(WatchError::io)?;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::fs::File;
     use tempfile::tempdir;
 
     #[cfg(target_os = "linux")]

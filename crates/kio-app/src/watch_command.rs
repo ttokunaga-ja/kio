@@ -2,14 +2,12 @@
 //! management or send authority. Each pass reopens the registered root and
 //! runs the same local index operation as the interactive command.
 
-use std::fs::{File, TryLockError};
+use std::fs::TryLockError;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use kio_core::management::{ManagementAuthority, ManagementBinding, read_record};
-#[cfg(not(windows))]
-use kio_core::private_fs::read_private_file_at;
 use kio_core::scope::new_ulid;
 use kio_core::store_dir::{Publication, StoreDirectory};
 use kio_core::{ExitCode, KioError, Result};
@@ -20,11 +18,11 @@ use sha2::{Digest, Sha256};
 use crate::commands::{CommandRequest, IndexArgs, WatchArgs, WatchCommand};
 use crate::context::{AppContext, Interaction};
 use crate::management::{binding_for_repo, open_existing_managed_root};
+use crate::platform::open_watch_instance_lock;
 use crate::watch::{
     DirtyReason, NativeWatcher, Reconcile, ReconcileCompletion, WatchEngine, WatchError, WatchRoot,
 };
 
-const LOCK: &str = "instance.lock";
 const STATE: &str = "state.json";
 const STOP: &str = "stop.json";
 const MAX_STATE_BYTES: u64 = 64 * 1024;
@@ -91,7 +89,7 @@ fn inspect(root: &Path, stop: bool) -> Result<Value> {
     let Some(directory) = state_directory(root, false)? else {
         return Ok(json!({"status":"stopped", "root":root, "last_observation":null}));
     };
-    let lock = open_instance_lock(&directory, false)?;
+    let lock = open_watch_instance_lock(&directory, false)?;
     let running = match lock {
         None => false,
         Some(file) => match file.try_lock() {
@@ -136,16 +134,8 @@ fn run_foreground(root: &Path, interval: u64) -> Result<Value> {
     }
     let directory = state_directory(root, true)?
         .ok_or_else(|| watch_error("watch state directory is unavailable"))?;
-    #[cfg(not(target_os = "linux"))]
-    if kio_core::private_fs::resolve_inherited_private_root(directory.path())
-        .map_err(watch_error)?
-        .is_some()
-    {
-        return Err(watch_error(
-            "descriptor-backed watch state queues are unsupported on this platform",
-        ));
-    }
-    let lock = open_instance_lock(&directory, true)?
+    crate::platform::validate_watch_queue_directory(&directory).map_err(watch_error)?;
+    let lock = open_watch_instance_lock(&directory, true)?
         .ok_or_else(|| watch_error("watch instance lock is unavailable"))?;
     lock.try_lock().map_err(|error| {
         watch_error(format!(
@@ -159,18 +149,9 @@ fn run_foreground(root: &Path, interval: u64) -> Result<Value> {
         binding,
         scope_id: record.scope_id.clone(),
     };
-    #[cfg(target_os = "linux")]
     let engine = WatchEngine::open_with_interval_private_directory(
         &directory,
         Path::new("queue.sqlite"),
-        [watch_root],
-        reconciler,
-        Duration::from_secs(interval),
-    )
-    .map_err(watch_error)?;
-    #[cfg(not(target_os = "linux"))]
-    let engine = WatchEngine::open_with_interval(
-        &directory.path().join("queue.sqlite"),
         [watch_root],
         reconciler,
         Duration::from_secs(interval),
@@ -364,46 +345,6 @@ fn requested_stop(directory: &StoreDirectory, instance: &str) -> Result<bool> {
     Ok(request.instance == instance)
 }
 
-#[cfg(not(windows))]
-fn open_instance_lock(directory: &StoreDirectory, create: bool) -> Result<Option<File>> {
-    if directory.read_optional(Path::new(LOCK), 0)?.is_none() {
-        if !create {
-            return Ok(None);
-        }
-        if let Err(error) = directory.write_atomic(Path::new(LOCK), &[], Publication::CreateOnly)
-            && directory.read_optional(Path::new(LOCK), 0)?.is_none()
-        {
-            return Err(error);
-        }
-    }
-    // Revalidates the retained private parent/DACL. State from a
-    // different local user cannot serve as a stop request or queue authority.
-    read_private_file_at(directory, LOCK, 0)?;
-    directory.open_regular_read(Path::new(LOCK), 0).map(Some)
-}
-
-#[cfg(windows)]
-fn open_instance_lock(directory: &StoreDirectory, create: bool) -> Result<Option<File>> {
-    let leaf = Path::new(LOCK);
-    // Even an empty marker must not be read through a second handle while
-    // Windows holds its exclusive byte-range lock. Absence and fixed length
-    // are metadata invariants; unsafe occupied names remain errors below.
-    if !directory.contains_entry(leaf)? {
-        if !create {
-            return Ok(None);
-        }
-        if let Err(error) = directory.write_atomic(leaf, &[], Publication::CreateOnly)
-            && !directory.contains_entry(leaf)?
-        {
-            return Err(error);
-        }
-    }
-    let file = directory.open_regular_read(leaf, 0)?;
-    kio_core::private_fs::verify_private_directory_handle(directory)?;
-    kio_core::platform::verify_owner_private_handle(&file)?;
-    Ok(Some(file))
-}
-
 fn state_directory(root: &Path, create: bool) -> Result<Option<StoreDirectory>> {
     let registry = kio_index::registry::default_registry_path().map_err(crate::index_to_kio)?;
     let data = registry
@@ -448,6 +389,10 @@ fn watch_error(error: impl std::fmt::Display) -> KioError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    use std::fs::File;
+    #[cfg(windows)]
+    const LOCK: &str = "instance.lock";
     use super::*;
 
     #[cfg(windows)]
@@ -462,18 +407,24 @@ mod tests {
     #[test]
     fn held_empty_instance_marker_can_be_validated_without_releasing_exclusivity() {
         let (_temp, directory) = private_watch_directory();
-        assert!(open_instance_lock(&directory, false).unwrap().is_none());
+        assert!(
+            open_watch_instance_lock(&directory, false)
+                .unwrap()
+                .is_none()
+        );
         assert!(!directory.contains_entry(Path::new(LOCK)).unwrap());
-        let held = open_instance_lock(&directory, true).unwrap().unwrap();
+        let held = open_watch_instance_lock(&directory, true).unwrap().unwrap();
         held.try_lock().unwrap();
-        let contender = open_instance_lock(&directory, false).unwrap().unwrap();
+        let contender = open_watch_instance_lock(&directory, false)
+            .unwrap()
+            .unwrap();
         assert_eq!(contender.metadata().unwrap().len(), 0);
         kio_core::platform::verify_owner_private_handle(&contender).unwrap();
         assert!(matches!(
             contender.try_lock(),
             Err(TryLockError::WouldBlock)
         ));
-        let repeated = open_instance_lock(&directory, true).unwrap().unwrap();
+        let repeated = open_watch_instance_lock(&directory, true).unwrap().unwrap();
         assert!(matches!(repeated.try_lock(), Err(TryLockError::WouldBlock)));
         drop(held);
         contender.try_lock().unwrap();
@@ -504,7 +455,7 @@ mod tests {
             }
             let before = std::fs::read(&path).unwrap();
             for create in [false, true] {
-                assert!(open_instance_lock(&directory, create).is_err());
+                assert!(open_watch_instance_lock(&directory, create).is_err());
                 assert_eq!(std::fs::read(&path).unwrap(), before);
                 if fixture == "unsafe_acl" {
                     let file = File::open(&path).unwrap();

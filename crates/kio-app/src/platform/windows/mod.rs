@@ -9,3 +9,6 @@ pub(crate) use purge::*;
 pub(crate) use verification::*;
 
 pub(crate) use kio_process::platform::wait_supervised_child;
+
+mod watch_queue;
+pub(crate) use watch_queue::{WatchQueueStorage, validate_watch_queue_directory};

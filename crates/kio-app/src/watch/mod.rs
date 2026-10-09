@@ -4,7 +4,7 @@
 //! scope roots, and the reconciliation callback must reopen and re-authorize
 //! every candidate before it changes any source-of-truth data.
 
-mod native;
+pub(crate) mod native;
 mod queue;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -172,10 +172,8 @@ impl<R: Reconcile> WatchEngine<R> {
         )
     }
 
-    /// Open a Linux queue through a retained owner-private directory instead
-    /// of re-resolving the directory's diagnostic pathname.
-    #[cfg(target_os = "linux")]
-    pub fn open_with_interval_private_directory(
+    /// Open through the selected platform's private directory admission.
+    pub(crate) fn open_with_interval_private_directory(
         directory: &kio_core::store_dir::StoreDirectory,
         queue_leaf: &Path,
         roots: impl IntoIterator<Item = WatchRoot>,
