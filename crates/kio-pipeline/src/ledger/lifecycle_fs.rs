@@ -19,11 +19,18 @@ use kio_core::store_dir::{Publication, StoreDirectory};
 use rusqlite::{Connection, OpenFlags};
 
 use super::schema::RETIRED_LEDGER_BASENAMES;
+use crate::platform::ledger_lifecycle::{
+    DirectoryIdentity, RegularFileIdentity, directory_identity, normalized_absolute_db_path,
+    path_component_is_unsafe, prepare_sqlite_sidecars, regular_file_identity,
+    revalidate_lock_contents, sqlite_path_from_retained_parent, try_inherited_parent,
+    validate_lock_contents_before_acquire, validate_open_lock_before_acquire,
+    verify_existing_ancestor_path, verify_private_parent_handle,
+};
 use crate::{PipelineError, Result};
 
 pub(crate) const LIFECYCLE_LOCK: &str = "ledger.lifecycle.lock";
-const LOCK_BYTES: &[u8] = b"kio-ledger-lifecycle-lock-v1\n";
-const MAX_LOCK_BYTES: u64 = 128;
+pub(crate) const LOCK_BYTES: &[u8] = b"kio-ledger-lifecycle-lock-v1\n";
+pub(crate) const MAX_LOCK_BYTES: u64 = 128;
 
 /// Direct children of the retained device-private ledger parent.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,10 +54,7 @@ impl ArtifactNames {
                 "ledger path must be absolute",
             ));
         }
-        if path.components().any(|component| {
-            matches!(component, Component::CurDir | Component::ParentDir)
-                || (matches!(component, Component::Prefix(_)) && !cfg!(windows))
-        }) {
+        if path.components().any(path_component_is_unsafe) {
             return Err(contract(
                 "KIO-E-LEDGER-PATH-001",
                 "ledger path contains an unsafe component",
@@ -234,24 +238,12 @@ impl FsSession {
             .ensure_owner_private(lock_leaf)
             .map_err(core_private)?;
         let absolute_lock = parent_path.join(lock_leaf);
-        #[cfg(unix)]
-        {
-            let observed =
-                kio_core::private_fs::read_private_file_at(&parent, LIFECYCLE_LOCK, MAX_LOCK_BYTES)
-                    .map_err(core_private)?;
-            if observed != LOCK_BYTES {
-                return Err(contract(
-                    "KIO-E-LEDGER-PRIVATE-001",
-                    "ledger lifecycle lock has unexpected contents",
-                ));
-            }
-        }
+        validate_lock_contents_before_acquire(&parent)?;
         let lock = parent
             .open_regular_read(lock_leaf, MAX_LOCK_BYTES)
             .map_err(core_private)?;
         let lock_identity = regular_file_identity(&lock, &absolute_lock)?;
-        #[cfg(windows)]
-        kio_core::platform::verify_owner_private_handle(&lock).map_err(core_private)?;
+        validate_open_lock_before_acquire(&lock)?;
         // Windows denies data reads through another handle while this range
         // is locked. Acquire before inspecting contents so contenders report
         // Locked, then validate bytes through the handle owning the lock.
@@ -280,6 +272,11 @@ impl FsSession {
         };
         session.revalidate_boundary()?;
         Ok(session)
+    }
+
+    #[must_use]
+    pub(crate) fn parent(&self) -> &StoreDirectory {
+        &self.parent
     }
 
     #[must_use]
@@ -506,15 +503,8 @@ impl FsSession {
             ));
         }
         self.revalidate_boundary()?;
-        let before = SqliteFiles::capture_required_main(self)?;
-        #[cfg(windows)]
-        let before = {
-            let mut before = before;
-            if flags.contains(OpenFlags::SQLITE_OPEN_READ_WRITE) {
-                before.create_missing_private_sidecars(self)?;
-            }
-            before
-        };
+        let mut before = SqliteFiles::capture_required_main(self)?;
+        prepare_sqlite_sidecars(self, &mut before, flags)?;
         self.revalidate_boundary()?;
         let connection = Connection::open_with_flags(&self.db_path, flags)?;
         let mut bound = BoundSqliteConnection {
@@ -527,7 +517,7 @@ impl FsSession {
         Ok(bound)
     }
 
-    fn revalidate_boundary(&self) -> Result<()> {
+    pub(crate) fn revalidate_boundary(&self) -> Result<()> {
         // Keep the lock alive and locked for the complete session. Accessing
         // metadata also detects a closed/invalid handle rather than relying on
         // its presence in this struct alone.
@@ -566,99 +556,12 @@ impl FsSession {
                 ));
             }
         }
-        #[cfg(unix)]
-        {
-            let observed = kio_core::private_fs::read_private_file_at(
-                &self.parent,
-                LIFECYCLE_LOCK,
-                MAX_LOCK_BYTES,
-            )
-            .map_err(core_private)?;
-            if observed != LOCK_BYTES {
-                return Err(boundary_changed("ledger lifecycle lock contents changed"));
-            }
-        }
-        #[cfg(windows)]
-        self.revalidate_locked_contents()?;
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    fn revalidate_locked_contents(&self) -> Result<()> {
-        use std::os::windows::fs::FileExt;
-
-        self.revalidate_retained_lock_binding()?;
-        let path = self.parent_path.join(LIFECYCLE_LOCK);
-        let before_identity = regular_file_identity(&self.lock, &path)?;
-        kio_core::platform::verify_owner_private_handle(&self.lock).map_err(core_private)?;
-        let before = self.lock.metadata().map_err(|error| PipelineError::Io {
-            path: path.display().to_string(),
-            message: error.to_string(),
-        })?;
-        let before_change_time = windows_change_time(&self.lock, &path)?;
-        if before_identity != self.lock_identity || before.len() != LOCK_BYTES.len() as u64 {
-            return Err(boundary_changed("ledger lifecycle lock contents changed"));
-        }
-
-        // Never reopen or duplicate the handle and never release its lock.
-        // Explicit offsets make repeated checks independent of the file cursor;
-        // the extra byte detects growth without an unbounded allocation/read.
-        let mut body = [0_u8; LOCK_BYTES.len() + 1];
-        let mut read = 0;
-        while read < body.len() {
-            match self.lock.seek_read(&mut body[read..], read as u64) {
-                Ok(0) => break,
-                Ok(count) => read += count,
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(error) => {
-                    return Err(PipelineError::Io {
-                        path: path.display().to_string(),
-                        message: error.to_string(),
-                    });
-                }
-            }
-        }
-
-        let after_identity = regular_file_identity(&self.lock, &path)?;
-        let after = self.lock.metadata().map_err(|error| PipelineError::Io {
-            path: path.display().to_string(),
-            message: error.to_string(),
-        })?;
-        let after_change_time = windows_change_time(&self.lock, &path)?;
-        kio_core::platform::verify_owner_private_handle(&self.lock).map_err(core_private)?;
-        self.revalidate_retained_lock_binding()?;
-        if before_identity != after_identity
-            || before.len() != after.len()
-            || before.modified().ok() != after.modified().ok()
-            || before_change_time != after_change_time
-            || after.len() != read as u64
-        {
-            return Err(boundary_changed(
-                "ledger lifecycle lock changed while it was read",
-            ));
-        }
-        if &body[..read] != LOCK_BYTES {
-            return Err(boundary_changed("ledger lifecycle lock contents changed"));
-        }
-        Ok(())
-    }
-
-    #[cfg(windows)]
-    fn revalidate_retained_lock_binding(&self) -> Result<()> {
-        verify_private_parent_handle(self.parent.root_handle().as_ref(), &self.parent_path)?;
-        // Open only for metadata and ACL checks, relative to the retained
-        // parent. Data reads must continue through the handle owning the lock.
-        let named_lock = self
-            .parent
-            .open_regular_read(Path::new(LIFECYCLE_LOCK), MAX_LOCK_BYTES)
-            .map_err(core_private)?;
-        let identity = regular_file_identity(&named_lock, &self.parent_path.join(LIFECYCLE_LOCK))?;
-        kio_core::platform::verify_owner_private_handle(&named_lock).map_err(core_private)?;
-        if identity != self.lock_identity {
-            return Err(boundary_changed(
-                "retained parent lifecycle name no longer names the retained lock",
-            ));
-        }
+        revalidate_lock_contents(
+            &self.parent,
+            &self.lock,
+            &self.lock_identity,
+            &self.parent_path,
+        )?;
         Ok(())
     }
 }
@@ -724,16 +627,16 @@ impl Drop for BoundSqliteConnection<'_> {
     }
 }
 
-struct RetainedSqliteFile {
+pub(crate) struct RetainedSqliteFile {
     leaf: PathBuf,
     _handle: File,
     identity: RegularFileIdentity,
 }
 
-struct SqliteFiles {
+pub(crate) struct SqliteFiles {
     main: RetainedSqliteFile,
-    wal: Option<RetainedSqliteFile>,
-    shm: Option<RetainedSqliteFile>,
+    pub(crate) wal: Option<RetainedSqliteFile>,
+    pub(crate) shm: Option<RetainedSqliteFile>,
 }
 
 impl SqliteFiles {
@@ -747,32 +650,6 @@ impl SqliteFiles {
         let wal = capture_leaf(session, &session.names.wal)?;
         let shm = capture_leaf(session, &session.names.shm)?;
         Ok(Self { main, wal, shm })
-    }
-
-    #[cfg(windows)]
-    fn create_missing_private_sidecars(&mut self, session: &FsSession) -> Result<()> {
-        // All existing SQLite leaves were checked before reaching this point.
-        // SQLite's Windows VFS otherwise creates these files with the token's
-        // default security descriptor. OPEN_ALWAYS reuses our private files.
-        // Publication is confined to absent coordination files, never repairs
-        // an existing leaf, and leaves their bindings pinned before SQLite opens.
-        for (leaf, retained) in [
-            (&session.names.wal, &mut self.wal),
-            (&session.names.shm, &mut self.shm),
-        ] {
-            if retained.is_none() {
-                session.revalidate_boundary()?;
-                session
-                    .parent
-                    .write_atomic(leaf, b"", Publication::CreateOnly)
-                    .map_err(core_private)?;
-                *retained = Some(capture_leaf(session, leaf)?.ok_or_else(|| {
-                    boundary_changed("newly published SQLite sidecar is missing")
-                })?);
-                session.revalidate_boundary()?;
-            }
-        }
-        Ok(())
     }
 
     fn revalidate_and_capture_sidecars(&mut self, session: &FsSession) -> Result<()> {
@@ -794,8 +671,12 @@ fn revalidate_or_capture(
     Ok(())
 }
 
-fn capture_leaf(session: &FsSession, leaf: &Path) -> Result<Option<RetainedSqliteFile>> {
-    if !session.parent.contains_entry(leaf).map_err(core_private)? {
+pub(crate) fn capture_leaf(session: &FsSession, leaf: &Path) -> Result<Option<RetainedSqliteFile>> {
+    if !session
+        .parent()
+        .contains_entry(leaf)
+        .map_err(core_private)?
+    {
         session.revalidate_boundary()?;
         return Ok(None);
     }
@@ -836,12 +717,8 @@ fn revalidate_retained_leaf(session: &FsSession, retained: &RetainedSqliteFile) 
 }
 
 fn open_or_create_parent(path: &Path, allow_create: bool) -> Result<(StoreDirectory, bool)> {
-    #[cfg(target_os = "linux")]
-    if let Some((root, suffix)) =
-        kio_core::private_fs::resolve_inherited_private_root(path).map_err(core_private)?
-    {
-        return open_or_create_inherited_parent(root, &suffix, path, allow_create)
-            .map(|parent| (parent, true));
+    if let Some(parent) = try_inherited_parent(path, allow_create)? {
+        return Ok((parent, true));
     }
     match StoreDirectory::open(path) {
         Ok(parent) => {
@@ -883,72 +760,6 @@ fn open_or_create_parent(path: &Path, allow_create: bool) -> Result<(StoreDirect
         return Ok((base, false));
     }
     create_missing_private_path(base, &ancestor, &suffix).map(|parent| (parent, false))
-}
-
-/// Traverse only the validated suffix of an inherited private root. The root
-/// descriptor was duplicated before this function received it; no operation
-/// below reimports the original `/dev/fd/N` spelling.
-#[cfg(target_os = "linux")]
-fn open_or_create_inherited_parent(
-    mut current: StoreDirectory,
-    suffix: &[std::ffi::OsString],
-    path: &Path,
-    allow_create: bool,
-) -> Result<StoreDirectory> {
-    verify_private_parent_handle(current.root_handle().as_ref(), current.path())?;
-    let mut logical = current.path().to_path_buf();
-    for name in suffix {
-        let leaf = Path::new(name);
-        logical.push(name);
-        if current.contains_entry(leaf).map_err(core_private)? {
-            let retained = current.open_directory(leaf).map_err(core_private)?;
-            let next =
-                StoreDirectory::from_retained(retained, logical.clone()).map_err(core_private)?;
-            verify_private_parent_handle(next.root_handle().as_ref(), &logical)?;
-            current = next;
-            continue;
-        }
-        if !allow_create {
-            return Err(contract(
-                "KIO-E-LEDGER-UNINITIALIZED-001",
-                format!("ledger parent is missing: {}", logical.display()),
-            ));
-        }
-        let retained = current.create_directory(leaf).map_err(core_private)?;
-        let next =
-            StoreDirectory::from_retained(retained, logical.clone()).map_err(core_private)?;
-        verify_private_parent_handle(next.root_handle().as_ref(), &logical)?;
-        current = next;
-    }
-    // `path` is retained only for precise diagnostics: the actual authority is
-    // `current`'s duplicated descriptor-relative handle.
-    verify_private_parent_handle(current.root_handle().as_ref(), path)?;
-    Ok(current)
-}
-
-/// SQLite accepts only a path. On Linux inherited roots are retained directory
-/// capabilities, so address the main leaf through this process's *duplicated*
-/// descriptor. The descriptor remains owned by `FsSession` for the complete
-/// SQLite lifetime; a caller replacing its original `/dev/fd/N` cannot retarget
-/// this path.
-#[cfg(target_os = "linux")]
-fn sqlite_path_from_retained_parent(parent: &StoreDirectory, leaf: &Path) -> Result<PathBuf> {
-    use std::os::fd::AsRawFd;
-
-    require_leaf(leaf)?;
-    Ok(PathBuf::from(format!(
-        "/proc/self/fd/{}",
-        parent.root_handle().as_raw_fd()
-    ))
-    .join(leaf))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn sqlite_path_from_retained_parent(_parent: &StoreDirectory, _leaf: &Path) -> Result<PathBuf> {
-    Err(contract(
-        "KIO-E-LEDGER-PRIVATE-001",
-        "inherited ledger roots are unsupported on this platform",
-    ))
 }
 
 fn create_missing_private_path(
@@ -995,96 +806,6 @@ fn create_missing_private_path(
     Ok(current)
 }
 
-fn normalized_absolute_db_path(path: &Path) -> Result<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        if !path.is_absolute() {
-            return Err(contract(
-                "KIO-E-LEDGER-PATH-001",
-                "ledger path must be absolute",
-            ));
-        }
-        let mut normalized = PathBuf::from("/");
-        for component in path.components() {
-            match component {
-                Component::RootDir => {}
-                Component::Normal(name) => {
-                    if normalized == Path::new("/") && name == "var" {
-                        normalized.push("private");
-                        normalized.push("var");
-                    } else {
-                        normalized.push(name);
-                    }
-                }
-                _ => {
-                    return Err(contract(
-                        "KIO-E-LEDGER-PATH-001",
-                        "ledger path is not normalized",
-                    ));
-                }
-            }
-        }
-        Ok(normalized)
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        Ok(path.to_path_buf())
-    }
-}
-
-#[cfg(unix)]
-fn verify_existing_ancestor_path(path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-
-    // Validate every already-existing component before creating anything
-    // below it. Root-owned sticky directories (for example /private/tmp) are
-    // the sole writable-by-others exception, matching private_fs.
-    // SAFETY: geteuid has no arguments and no memory-safety preconditions.
-    let uid = unsafe { libc::geteuid() };
-    let mut prefix = PathBuf::from("/");
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(value) => prefix.push(value),
-            _ => {
-                return Err(contract(
-                    "KIO-E-LEDGER-PATH-001",
-                    "ledger parent contains an unsafe component",
-                ));
-            }
-        }
-        let directory = StoreDirectory::open(&prefix).map_err(core_private)?;
-        let metadata = directory
-            .root_handle()
-            .metadata()
-            .map_err(|error| PipelineError::Io {
-                path: prefix.display().to_string(),
-                message: error.to_string(),
-            })?;
-        let owner_trusted = metadata.uid() == uid || metadata.uid() == 0;
-        let writable_by_others = metadata.mode() & 0o022 != 0;
-        let root_owned_sticky = metadata.uid() == 0 && metadata.mode() & 0o1000 != 0;
-        if !metadata.is_dir() || !owner_trusted || (writable_by_others && !root_owned_sticky) {
-            return Err(contract(
-                "KIO-E-LEDGER-PRIVATE-001",
-                format!(
-                    "ledger creation ancestor is not privately controlled: {}",
-                    prefix.display()
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn verify_existing_ancestor_path(path: &Path) -> Result<()> {
-    // StoreDirectory already opened every component without traversing a
-    // reparse point. The newly created final parent receives the protected ACL
-    // and is checked through its retained handle before lock publication.
-    StoreDirectory::open(path).map(|_| ()).map_err(core_private)
-}
-
 fn reject_retired_names(parent: &StoreDirectory) -> Result<()> {
     for name in RETIRED_LEDGER_BASENAMES {
         if parent
@@ -1100,7 +821,7 @@ fn reject_retired_names(parent: &StoreDirectory) -> Result<()> {
     Ok(())
 }
 
-fn require_leaf(path: &Path) -> Result<()> {
+pub(crate) fn require_leaf(path: &Path) -> Result<()> {
     let mut components = path.components();
     if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
         return Err(contract(
@@ -1111,138 +832,17 @@ fn require_leaf(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn contract(code: &'static str, message: impl Into<String>) -> PipelineError {
+pub(crate) fn contract(code: &'static str, message: impl Into<String>) -> PipelineError {
     PipelineError::contract(code, message)
 }
 
-fn core_private(error: kio_core::KioError) -> PipelineError {
+pub(crate) fn core_private(error: kio_core::KioError) -> PipelineError {
     contract("KIO-E-LEDGER-PRIVATE-001", error.to_string())
 }
 
-fn boundary_changed(message: impl Into<String>) -> PipelineError {
+pub(crate) fn boundary_changed(message: impl Into<String>) -> PipelineError {
     contract("KIO-E-LEDGER-BOUNDARY-RACE-001", message)
 }
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct DirectoryIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(unix)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct RegularFileIdentity {
-    device: u64,
-    inode: u64,
-}
-
-#[cfg(unix)]
-fn directory_identity(file: &File, path: &Path) -> Result<DirectoryIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = file.metadata().map_err(|error| PipelineError::Io {
-        path: path.display().to_string(),
-        message: error.to_string(),
-    })?;
-    if !metadata.is_dir() {
-        return Err(contract(
-            "KIO-E-LEDGER-PRIVATE-001",
-            "ledger parent handle is not a directory",
-        ));
-    }
-    Ok(DirectoryIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(unix)]
-fn regular_file_identity(file: &File, path: &Path) -> Result<RegularFileIdentity> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = file.metadata().map_err(|error| PipelineError::Io {
-        path: path.display().to_string(),
-        message: error.to_string(),
-    })?;
-    if !metadata.is_file() || metadata.nlink() != 1 {
-        return Err(contract(
-            "KIO-E-LEDGER-PRIVATE-001",
-            format!(
-                "ledger leaf is not a single-link regular file: {}",
-                path.display()
-            ),
-        ));
-    }
-    Ok(RegularFileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-#[cfg(unix)]
-fn verify_private_parent_handle(file: &File, path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let metadata = file.metadata().map_err(|error| PipelineError::Io {
-        path: path.display().to_string(),
-        message: error.to_string(),
-    })?;
-    // SAFETY: geteuid has no arguments and no memory-safety preconditions.
-    let uid = unsafe { libc::geteuid() };
-    if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-        return Err(contract(
-            "KIO-E-LEDGER-PRIVATE-001",
-            format!("ledger parent is not owner-private: {}", path.display()),
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-type DirectoryIdentity = kio_core::platform::DirectoryHandleIdentity;
-#[cfg(windows)]
-type RegularFileIdentity = kio_core::platform::RegularFileHandleIdentity;
-
-#[cfg(windows)]
-fn directory_identity(file: &File, path: &Path) -> Result<DirectoryIdentity> {
-    kio_core::platform::directory_handle_identity(file).ok_or_else(|| {
-        contract(
-            "KIO-E-LEDGER-PRIVATE-001",
-            format!(
-                "ledger parent is reparse or non-directory: {}",
-                path.display()
-            ),
-        )
-    })
-}
-
-#[cfg(windows)]
-fn regular_file_identity(file: &File, path: &Path) -> Result<RegularFileIdentity> {
-    kio_core::platform::regular_file_handle_identity(file).ok_or_else(|| {
-        contract(
-            "KIO-E-LEDGER-PRIVATE-001",
-            format!(
-                "ledger leaf is reparse, nonregular, or hardlinked: {}",
-                path.display()
-            ),
-        )
-    })
-}
-
-#[cfg(windows)]
-fn verify_private_parent_handle(file: &File, path: &Path) -> Result<()> {
-    directory_identity(file, path)?;
-    kio_core::platform::verify_owner_private_handle(file).map_err(core_private)
-}
-
-#[cfg(windows)]
-fn windows_change_time(file: &File, path: &Path) -> Result<i64> {
-    kio_core::platform::file_change_time(file).map_err(|error| PipelineError::Io {
-        path: path.display().to_string(),
-        message: error.to_string(),
-    })
-}
-
-#[cfg(not(any(unix, windows)))]
-compile_error!("ledger lifecycle filesystem capability requires Unix or Windows");
 
 #[cfg(test)]
 mod tests {

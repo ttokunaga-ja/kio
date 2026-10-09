@@ -172,7 +172,7 @@ enum PrivateStorage {
     #[cfg(unix)]
     Unix(tempfile::TempDir),
     #[cfg(windows)]
-    Windows(crate::ledger::snapshot_windows_security::LedgerSnapshotPrivateDir),
+    Windows(crate::platform::snapshot_windows_security::LedgerSnapshotPrivateDir),
 }
 
 impl PrivateStorage {
@@ -191,7 +191,7 @@ impl PrivateStorage {
         }
         #[cfg(windows)]
         {
-            return crate::ledger::snapshot_windows_security::LedgerSnapshotPrivateDir::create()
+            return crate::platform::snapshot_windows_security::LedgerSnapshotPrivateDir::create()
                 .map(Self::Windows)
                 .map_err(|e| {
                     AttemptError::Unstable(format!("create private ledger snapshot dir: {e}"))

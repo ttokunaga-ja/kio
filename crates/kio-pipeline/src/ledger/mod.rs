@@ -17,8 +17,6 @@ pub mod ops;
 pub(crate) mod ops_sql;
 pub mod schema;
 pub mod snapshot;
-#[cfg(windows)]
-pub(crate) mod snapshot_windows_security;
 pub mod time;
 
 pub use backup::{LedgerBackup, RestoreReadiness};
