@@ -39,9 +39,9 @@ use windows_sys::Win32::{
         WinBuiltinAdministratorsSid, WinLocalSystemSid,
     },
     Storage::FileSystem::{
-        FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_BASIC_INFO, FILE_LIST_DIRECTORY,
-        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
-        FileBasicInfo, GetFileInformationByHandleEx, READ_CONTROL, SYNCHRONIZE,
+        FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE, READ_CONTROL,
+        SYNCHRONIZE,
     },
     System::{
         IO::IO_STATUS_BLOCK,
@@ -552,24 +552,12 @@ fn validate_windows_component(value: &OsStr, path: &Path) -> Result<()> {
 }
 
 fn change_time(file: &File, path: &Path) -> Result<i64> {
-    let mut basic = FILE_BASIC_INFO::default();
-    // SAFETY: `file` retains a valid Windows handle; `basic` is writable
-    // storage exactly matching FileBasicInfo's required buffer layout.
-    if unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle() as HANDLE,
-            FileBasicInfo,
-            (&mut basic as *mut FILE_BASIC_INFO).cast(),
-            mem::size_of::<FILE_BASIC_INFO>() as u32,
-        )
-    } == 0
-    {
-        return Err(unsafe_file(
+    super::primitives::file_change_time(file).map_err(|_| {
+        unsafe_file(
             "cannot inspect private trust file Windows change time",
             Some(path),
-        ));
-    }
-    Ok(basic.ChangeTime)
+        )
+    })
 }
 
 fn verify_real_directory(directory: &File, path: &Path) -> Result<()> {

@@ -1235,30 +1235,10 @@ fn verify_private_parent_handle(file: &File, path: &Path) -> Result<()> {
 
 #[cfg(windows)]
 fn windows_change_time(file: &File, path: &Path) -> Result<i64> {
-    use std::{mem, os::windows::io::AsRawHandle};
-    use windows_sys::Win32::{
-        Foundation::HANDLE,
-        Storage::FileSystem::{FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx},
-    };
-
-    let mut basic = FILE_BASIC_INFO::default();
-    // SAFETY: the retained file owns a live handle, and `basic` is writable
-    // storage with the exact layout and size required by FileBasicInfo.
-    if unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle() as HANDLE,
-            FileBasicInfo,
-            (&mut basic as *mut FILE_BASIC_INFO).cast(),
-            mem::size_of::<FILE_BASIC_INFO>() as u32,
-        )
-    } == 0
-    {
-        return Err(PipelineError::Io {
-            path: path.display().to_string(),
-            message: std::io::Error::last_os_error().to_string(),
-        });
-    }
-    Ok(basic.ChangeTime)
+    kio_core::platform::file_change_time(file).map_err(|error| PipelineError::Io {
+        path: path.display().to_string(),
+        message: error.to_string(),
+    })
 }
 
 #[cfg(not(any(unix, windows)))]

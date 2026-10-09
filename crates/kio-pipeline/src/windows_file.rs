@@ -70,47 +70,27 @@ fn join_u32(high: u32, low: u32) -> u64 {
 
 #[cfg(windows)]
 pub(crate) fn information(file: &std::fs::File) -> std::io::Result<WindowsFileInformation> {
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        GetFileInformationByHandle,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     };
-
-    let mut raw = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `file` owns a valid handle for the duration of the call and `raw`
-    // points to writable storage with the Win32-required layout.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut raw) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
+    let raw = kio_core::platform::file_information(file)?;
     Ok(WindowsFileInformation::from_components(
-        raw.dwVolumeSerialNumber,
-        (raw.nFileIndexHigh, raw.nFileIndexLow),
-        (raw.nFileSizeHigh, raw.nFileSizeLow),
-        raw.nNumberOfLinks,
+        raw.volume_serial_number,
+        ((raw.file_index >> 32) as u32, raw.file_index as u32),
+        ((raw.file_size >> 32) as u32, raw.file_size as u32),
+        raw.number_of_links,
         (
-            raw.ftLastWriteTime.dwHighDateTime,
-            raw.ftLastWriteTime.dwLowDateTime,
+            (raw.last_write_time >> 32) as u32,
+            raw.last_write_time as u32,
         ),
-        raw.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
-        raw.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
+        raw.file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+        raw.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
     ))
 }
 
 #[cfg(windows)]
 pub(crate) fn open_path_no_follow(path: &std::path::Path) -> std::io::Result<std::fs::File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
-    let mut options = std::fs::OpenOptions::new();
-    options
-        .read(true)
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
-    options.open(path)
+    kio_core::platform::open_metadata_nofollow(path)
 }
 
 #[cfg(test)]

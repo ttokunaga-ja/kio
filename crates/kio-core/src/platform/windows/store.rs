@@ -30,10 +30,10 @@ use windows_sys::Win32::{
         OBJ_CASE_INSENSITIVE, RtlNtStatusToDosError, UNICODE_STRING,
     },
     Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_BASIC_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileBasicInfo, GetFileInformationByHandle, GetFileInformationByHandleEx, READ_CONTROL,
-        SYNCHRONIZE, WRITE_DAC,
+        BY_HANDLE_FILE_INFORMATION, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
+        FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, READ_CONTROL, SYNCHRONIZE,
+        WRITE_DAC,
     },
     System::IO::IO_STATUS_BLOCK,
 };
@@ -81,27 +81,12 @@ fn absolute_components(path: &Path) -> Result<(PathBuf, Vec<&std::ffi::OsStr>)> 
     Ok((root, components))
 }
 fn change_time(file: &File, label: &Path) -> Result<i64> {
-    let mut basic = FILE_BASIC_INFO::default();
-    if unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle() as HANDLE,
-            FileBasicInfo,
-            (&mut basic as *mut FILE_BASIC_INFO).cast(),
-            mem::size_of::<FILE_BASIC_INFO>() as u32,
-        )
-    } == 0
-    {
-        return Err(ioerr(label, std::io::Error::last_os_error()));
-    }
-    Ok(basic.ChangeTime)
+    super::primitives::file_change_time(file).map_err(|error| ioerr(label, error))
 }
 pub(crate) fn volume_serial(file: &File, label: &Path) -> Result<u32> {
-    let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as HANDLE, &mut information) } == 0
-    {
-        return Err(ioerr(label, std::io::Error::last_os_error()));
-    }
-    Ok(information.dwVolumeSerialNumber)
+    super::primitives::file_information(file)
+        .map(|information| information.volume_serial_number)
+        .map_err(|error| ioerr(label, error))
 }
 pub(crate) fn validate_directory(file: &File, label: &Path) -> Result<()> {
     if crate::platform::directory_handle_identity(file).is_none() {

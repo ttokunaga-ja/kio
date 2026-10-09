@@ -52,26 +52,8 @@ pub(crate) fn exchange_between(
     right: &str,
 ) -> Result<()> {
     use std::ffi::CString;
-    use std::os::fd::AsRawFd;
     let left = CString::new(left).map_err(|_| corrupt("invalid marker archive name"))?;
     let right = CString::new(right).map_err(|_| corrupt("invalid marker archive name"))?;
-    // Linux renameat2 RENAME_EXCHANGE is 0x2.
-    if unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            left_dir.as_raw_fd(),
-            left.as_ptr(),
-            right_dir.as_raw_fd(),
-            right.as_ptr(),
-            2_u32,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(ioerr(
-            std::io::Error::last_os_error(),
-            left.to_string_lossy().as_ref(),
-        ))
-    }
+    crate::platform::atomic_exchange(left_dir, &left, right_dir, &right)
+        .map_err(|error| ioerr(error, left.to_string_lossy().as_ref()))
 }

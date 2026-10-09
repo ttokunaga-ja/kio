@@ -34,6 +34,8 @@ pub(crate) mod management;
 #[cfg(windows)]
 pub(crate) mod planned_removal;
 #[cfg(windows)]
+pub(crate) mod primitives;
+#[cfg(windows)]
 pub(crate) mod private_fs;
 #[cfg(windows)]
 pub(crate) mod profile;

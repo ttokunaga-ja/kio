@@ -58,44 +58,21 @@ impl RegularFileHandleIdentity {
 }
 
 pub(crate) fn windows_file_information(file: &File) -> Option<WindowsFileInformation> {
-    use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
-    };
-
-    let mut information = BY_HANDLE_FILE_INFORMATION::default();
-    // SAFETY: `file` owns a valid handle for the duration of the call, and
-    // `information` points to writable storage of the required Win32 layout.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
-        return None;
-    }
-    let file_index =
-        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
-    Some(WindowsFileInformation::new(
-        information.dwVolumeSerialNumber,
-        file_index,
-        information.nNumberOfLinks,
-        information.dwFileAttributes,
-    ))
+    super::primitives::file_information(file).ok().map(|raw| {
+        WindowsFileInformation::new(
+            raw.volume_serial_number,
+            raw.file_index,
+            raw.number_of_links,
+            raw.file_attributes,
+        )
+    })
 }
 
 /// Open a Windows directory without traversing its final reparse point and
 /// verify its handle attributes. `symlink_metadata().is_symlink()` alone does
 /// not cover every directory reparse-point kind (notably junctions).
 pub fn real_directory_identity(path: &Path) -> std::io::Result<Option<DirectoryHandleIdentity>> {
-    use std::os::windows::fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-    };
-
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .access_mode(FILE_READ_ATTRIBUTES)
-        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
-    let directory = options.open(path)?;
+    let directory = super::primitives::open_metadata_nofollow(path)?;
     Ok(windows_file_information(&directory).and_then(WindowsFileInformation::directory_identity))
 }
 

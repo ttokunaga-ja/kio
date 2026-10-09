@@ -239,3 +239,12 @@ pub(crate) use unix::gc_io::verify_retained_receipt_observation as gc_verify_ret
 
 #[cfg(all(test, target_os = "windows"))]
 pub(crate) use windows::gc_snapshot_io;
+
+#[cfg(target_os = "linux")]
+pub use linux::primitives::atomic_exchange;
+#[cfg(target_os = "macos")]
+pub use macos::primitives::atomic_exchange;
+#[cfg(target_os = "windows")]
+pub use windows::primitives::{
+    FileInformation, file_change_time, file_information, open_metadata_nofollow,
+};

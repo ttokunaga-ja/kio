@@ -1097,15 +1097,17 @@ fn directory_identity(file: &File) -> Result<DirectoryIdentity> {
 }
 #[cfg(windows)]
 fn directory_identity(file: &File) -> Result<DirectoryIdentity> {
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        GetFileInformationByHandle,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     };
-    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut information) } == 0
-        || information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0
-        || information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    let information = kio_core::platform::file_information(file).map_err(|_| {
+        crate::PipelineError::contract(
+            "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
+            "discovery frontier is not a real directory",
+        )
+    })?;
+    if information.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || information.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
     {
         return Err(crate::PipelineError::contract(
             "KIO-E-CHILD-DISCOVERY-CONTINUATION-STALE-001",
@@ -1113,8 +1115,8 @@ fn directory_identity(file: &File) -> Result<DirectoryIdentity> {
         ));
     }
     Ok(DirectoryIdentity::Windows {
-        volume_serial_number: information.dwVolumeSerialNumber,
-        file_index: ((information.nFileIndexHigh as u64) << 32) | information.nFileIndexLow as u64,
+        volume_serial_number: information.volume_serial_number,
+        file_index: information.file_index,
     })
 }
 #[cfg(not(any(unix, windows)))]

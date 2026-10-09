@@ -501,27 +501,19 @@ fn source_file_state(file: &std::fs::File) -> Result<SourceFileState> {
 #[cfg(windows)]
 fn source_file_state(file: &std::fs::File) -> Result<SourceFileState> {
     use cap_fs::_WindowsByHandle;
-    use std::os::windows::{fs::MetadataExt, io::AsRawHandle};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_BASIC_INFO, FileBasicInfo, GetFileInformationByHandleEx,
-    };
+    use std::os::windows::fs::MetadataExt;
     let metadata = file
         .metadata()
         .map_err(|error| IndexError::Schema(format!("inspect GC source index state: {error}")))?;
     let by_handle = cap_fs::Metadata::from_file(file).map_err(|error| {
         IndexError::Schema(format!("inspect GC source index handle state: {error}"))
     })?;
-    let mut basic: FILE_BASIC_INFO = unsafe { std::mem::zeroed() };
-    if unsafe {
-        GetFileInformationByHandleEx(
-            file.as_raw_handle(),
-            FileBasicInfo,
-            (&mut basic as *mut FILE_BASIC_INFO).cast(),
-            std::mem::size_of::<FILE_BASIC_INFO>() as u32,
-        )
-    } == 0
-        || basic.ChangeTime < 0
-    {
+    let changed = kio_core::platform::file_change_time(file).map_err(|error| {
+        IndexError::Schema(format!(
+            "inspect GC source index Windows change time: {error}"
+        ))
+    })?;
+    if changed < 0 {
         return Err(IndexError::Schema(format!(
             "inspect GC source index Windows change time: {}",
             std::io::Error::last_os_error()
@@ -536,8 +528,8 @@ fn source_file_state(file: &std::fs::File) -> Result<SourceFileState> {
         len: metadata.file_size(),
         modified_seconds: i64::try_from(modified / 10_000_000).unwrap_or(i64::MAX),
         modified_nanos: i64::try_from((modified % 10_000_000) * 100).unwrap_or(i64::MAX),
-        changed_seconds: basic.ChangeTime / 10_000_000,
-        changed_nanos: (basic.ChangeTime % 10_000_000) * 100,
+        changed_seconds: changed / 10_000_000,
+        changed_nanos: (changed % 10_000_000) * 100,
     })
 }
 
@@ -811,7 +803,7 @@ fn require_gc_private_dir_identity(dir: &std::fs::File, expected: &str) -> Resul
     Ok(())
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn exchange_gc_index_leaves(
     left_dir: &std::fs::File,
     left: &str,
@@ -819,69 +811,12 @@ fn exchange_gc_index_leaves(
     right: &str,
 ) -> Result<()> {
     use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    unsafe extern "C" {
-        fn renameatx_np(
-            fromfd: libc::c_int,
-            from: *const libc::c_char,
-            tofd: libc::c_int,
-            to: *const libc::c_char,
-            flags: libc::c_uint,
-        ) -> libc::c_int;
-    }
     let left =
         CString::new(left).map_err(|_| IndexError::Schema("invalid GC index name".into()))?;
     let right =
         CString::new(right).map_err(|_| IndexError::Schema("invalid GC index name".into()))?;
-    if unsafe {
-        renameatx_np(
-            left_dir.as_raw_fd(),
-            left.as_ptr(),
-            right_dir.as_raw_fd(),
-            right.as_ptr(),
-            2,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(IndexError::Schema(format!(
-            "atomic GC index exchange: {}",
-            std::io::Error::last_os_error()
-        )))
-    }
-}
-#[cfg(target_os = "linux")]
-fn exchange_gc_index_leaves(
-    left_dir: &std::fs::File,
-    left: &str,
-    right_dir: &std::fs::File,
-    right: &str,
-) -> Result<()> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    let left =
-        CString::new(left).map_err(|_| IndexError::Schema("invalid GC index name".into()))?;
-    let right =
-        CString::new(right).map_err(|_| IndexError::Schema("invalid GC index name".into()))?;
-    if unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            left_dir.as_raw_fd(),
-            left.as_ptr(),
-            right_dir.as_raw_fd(),
-            right.as_ptr(),
-            2_u32,
-        )
-    } == 0
-    {
-        Ok(())
-    } else {
-        Err(IndexError::Schema(format!(
-            "atomic GC index exchange: {}",
-            std::io::Error::last_os_error()
-        )))
-    }
+    kio_core::platform::atomic_exchange(left_dir, &left, right_dir, &right)
+        .map_err(|error| IndexError::Schema(format!("atomic GC index exchange: {error}")))
 }
 #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn exchange_gc_index_leaves(_: &std::fs::File, _: &str, _: &std::fs::File, _: &str) -> Result<()> {
