@@ -5,8 +5,6 @@
 //! directory and each fixed SQLite leaf are created with an owner-only,
 //! protected DACL and then bound to a no-delete-share handle.
 
-#![cfg(windows)]
-
 use std::{
     ffi::c_void,
     fs, io, mem,

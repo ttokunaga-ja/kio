@@ -12,6 +12,12 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::platform::ledger_snapshot::{
+    Identity, PrivateStorage, bound_parent, filesystem_root, identity,
+    normalize_snapshot_entry_path, normalized_absolute, same_identity, stable_parent_binding,
+    validate_file_links, validate_test_barrier_parent, verify_directory_binding,
+    verify_private_storage, verify_regular_binding,
+};
 use cap_primitives::fs as cap_fs;
 use rusqlite::{Connection, OpenFlags};
 use sha2::{Digest, Sha256};
@@ -25,11 +31,11 @@ use super::{
 // hostile or accidentally enormous device cache from turning a read-only
 // search-status check into unbounded disk I/O; total admits one main plus WAL
 // and SHM-sized observation without allocating any leaf wholesale.
-const MAX_LEAF_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_LEAF_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ATTEMPTS: usize = 8;
 const RETRY_WINDOW: Duration = Duration::from_secs(5);
-const SNAPSHOT_MAIN: &str = "ledger.sqlite";
+pub(crate) const SNAPSHOT_MAIN: &str = "ledger.sqlite";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LedgerSnapshotError {
@@ -49,7 +55,7 @@ impl std::fmt::Display for LedgerSnapshotError {
 impl std::error::Error for LedgerSnapshotError {}
 
 #[derive(Debug)]
-enum AttemptError {
+pub(crate) enum AttemptError {
     Missing,
     Unsafe(String),
     Unstable(String),
@@ -92,7 +98,7 @@ thread_local! {
     };
 }
 #[cfg(test)]
-fn run_missing_parent_hook() {
+pub(crate) fn run_missing_parent_hook() {
     MISSING_PARENT_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow().as_ref() {
             hook();
@@ -109,7 +115,7 @@ thread_local! {
     };
 }
 #[cfg(test)]
-fn run_private_storage_create_hook() -> Result<(), AttemptError> {
+pub(crate) fn run_private_storage_create_hook() -> Result<(), AttemptError> {
     PRIVATE_STORAGE_CREATE_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow().as_ref() {
             hook()
@@ -119,7 +125,7 @@ fn run_private_storage_create_hook() -> Result<(), AttemptError> {
     })
 }
 #[cfg(test)]
-fn run_parent_component_hook(index: usize) {
+pub(crate) fn run_parent_component_hook(index: usize) {
     PARENT_COMPONENT_HOOK.with(|slot| {
         if let Some(hook) = slot.borrow().as_ref() {
             hook(index);
@@ -128,103 +134,28 @@ fn run_parent_component_hook(index: usize) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Leaf {
+pub(crate) enum Leaf {
     Absent,
     Present(Observed),
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Observed {
+pub(crate) struct Observed {
     identity: Identity,
-    bytes: u64,
-    sha256: [u8; 32],
+    pub(crate) bytes: u64,
+    pub(crate) sha256: [u8; 32],
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Manifest {
-    main: Leaf,
-    wal: Leaf,
-    shm: Leaf,
+pub(crate) struct Manifest {
+    pub(crate) main: Leaf,
+    pub(crate) wal: Leaf,
+    pub(crate) shm: Leaf,
 }
-
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Identity {
-    dev: u64,
-    ino: u64,
-}
-#[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Identity {
-    volume_serial_number: Option<u32>,
-    file_index: Option<u64>,
-}
-#[cfg(not(any(unix, windows)))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Identity;
 
 /// A private SQLite connection whose backing temporary directory outlives it.
 pub struct LedgerReadSnapshot {
     conn: Connection,
     // Field order intentionally closes SQLite before deleting its private dir.
     _storage: PrivateStorage,
-}
-
-enum PrivateStorage {
-    #[cfg(unix)]
-    Unix(tempfile::TempDir),
-    #[cfg(windows)]
-    Windows(crate::platform::snapshot_windows_security::LedgerSnapshotPrivateDir),
-}
-
-impl PrivateStorage {
-    fn create() -> Result<Self, AttemptError> {
-        #[cfg(test)]
-        run_private_storage_create_hook()?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut builder = tempfile::Builder::new();
-            builder.prefix("kio-ledger-snapshot-");
-            builder.permissions(fs::Permissions::from_mode(0o700));
-            return builder.tempdir().map(Self::Unix).map_err(|e| {
-                AttemptError::Unstable(format!("create private ledger snapshot dir: {e}"))
-            });
-        }
-        #[cfg(windows)]
-        {
-            return crate::platform::snapshot_windows_security::LedgerSnapshotPrivateDir::create()
-                .map(Self::Windows)
-                .map_err(|e| {
-                    AttemptError::Unstable(format!("create private ledger snapshot dir: {e}"))
-                });
-        }
-        #[allow(unreachable_code)]
-        Err(AttemptError::Unsafe("unsupported snapshot platform".into()))
-    }
-    fn path(&self) -> &Path {
-        match self {
-            #[cfg(unix)]
-            Self::Unix(dir) => dir.path(),
-            #[cfg(windows)]
-            Self::Windows(dir) => dir.path(),
-        }
-    }
-    fn create_file(&self, name: &str) -> Result<fs::File, AttemptError> {
-        match self {
-            #[cfg(unix)]
-            Self::Unix(dir) => {
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut options = fs::OpenOptions::new();
-                options.write(true).create_new(true).mode(0o600);
-                options.open(dir.path().join(name)).map_err(|e| {
-                    AttemptError::Unstable(format!("create private ledger snapshot {name}: {e}"))
-                })
-            }
-            #[cfg(windows)]
-            Self::Windows(dir) => dir.create_file(name).map_err(|e| {
-                AttemptError::Unstable(format!("create private ledger snapshot {name}: {e}"))
-            }),
-        }
-    }
 }
 
 impl LedgerReadSnapshot {
@@ -243,15 +174,7 @@ impl LedgerReadSnapshot {
         // Preserve the raw descriptor spelling until the shared resolver binds
         // it. `Path::components` would normalize an alias such as a doubled
         // separator before the resolver could reject it.
-        #[cfg(target_os = "linux")]
-        let inherited_path = inherited_ledger_root(path)?.is_some();
-        #[cfg(not(target_os = "linux"))]
-        let inherited_path = false;
-        let path = if inherited_path {
-            path.to_path_buf()
-        } else {
-            normalized_absolute(path)?
-        };
+        let path = normalize_snapshot_entry_path(path)?;
         let started = Instant::now();
         let mut last = None;
         for attempt in 0..attempts {
@@ -348,187 +271,9 @@ fn snapshot_query_error(error: crate::PipelineError) -> LedgerSnapshotError {
     }
 }
 
-fn normalized_absolute(path: &Path) -> Result<PathBuf, LedgerSnapshotError> {
-    if !path.is_absolute() {
-        return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-            "ledger path must be absolute: {}",
-            path.display()
-        )));
-    }
-    #[cfg(not(windows))]
-    {
-        let mut out = PathBuf::from("/");
-        for c in path.components() {
-            match c {
-                Component::RootDir => {}
-                Component::Normal(n) => {
-                    #[cfg(target_os = "macos")]
-                    if out == Path::new("/") && n == "var" {
-                        out.push("private");
-                        out.push("var");
-                    } else {
-                        out.push(n);
-                    }
-                    #[cfg(not(target_os = "macos"))]
-                    out.push(n);
-                }
-                _ => {
-                    return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-                        "ledger path is not normalized: {}",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        Ok(out)
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-        use std::path::Prefix;
-        let mut components = path.components();
-        let Some(Component::Prefix(prefix)) = components.next() else {
-            return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-                "ledger path must use an absolute drive or UNC path: {}",
-                path.display()
-            )));
-        };
-        let verbatim_disk = matches!(prefix.kind(), Prefix::VerbatimDisk(_));
-        if !matches!(
-            prefix.kind(),
-            Prefix::Disk(_) | Prefix::UNC(_, _) | Prefix::VerbatimDisk(_)
-        ) || !matches!(components.next(), Some(Component::RootDir))
-        {
-            return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-                "ledger path must use a normalized absolute drive or UNC path: {}",
-                path.display()
-            )));
-        }
-        let mut normalized = PathBuf::from(prefix.as_os_str());
-        normalized.push("\\");
-        for component in components {
-            match component {
-                Component::Normal(name) => {
-                    // Preserve canonical drive paths in their verbatim
-                    // namespace, whose only separator is a backslash.
-                    if verbatim_disk && name.encode_wide().any(|unit| unit == b'/' as u16) {
-                        return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-                            "ledger verbatim drive path contains a slash: {}",
-                            path.display()
-                        )));
-                    }
-                    normalized.push(name);
-                }
-                _ => {
-                    return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-                        "ledger path is not normalized: {}",
-                        path.display()
-                    )));
-                }
-            }
-        }
-        Ok(normalized)
-    }
-}
-
-/// Resolve the sole inherited-descriptor spelling through the shared core
-/// capability boundary.  The resolver validates the raw lexical form before
-/// duplicating the descriptor, so this module never treats `/dev/fd` as an
-/// ambient filesystem path.
-#[cfg(target_os = "linux")]
-fn inherited_ledger_root(
+pub(crate) fn bound_ambient_parent(
     path: &Path,
-) -> Result<
-    Option<(kio_core::store_dir::StoreDirectory, Vec<std::ffi::OsString>)>,
-    LedgerSnapshotError,
-> {
-    kio_core::private_fs::resolve_inherited_private_root(path).map_err(|error| {
-        LedgerSnapshotError::UnsafeIntegrity(format!(
-            "resolve inherited ledger directory capability: {error}"
-        ))
-    })
-}
-
-/// Bind an inherited directory capability and traverse only the resolver's
-/// validated suffix with no-follow operations.
-#[cfg(target_os = "linux")]
-fn bound_inherited_parent(
-    path: &Path,
-) -> Result<Option<(fs::File, String, PathBuf)>, LedgerSnapshotError> {
-    let Some((root, suffix)) = inherited_ledger_root(path)? else {
-        return Ok(None);
-    };
-    bound_inherited_parent_from_root(path, root, &suffix).map(Some)
-}
-
-/// Traverse a validated ledger suffix from an already-retained inherited root.
-#[cfg(target_os = "linux")]
-fn bound_inherited_parent_from_root(
-    path: &Path,
-    root: kio_core::store_dir::StoreDirectory,
-    suffix: &[std::ffi::OsString],
 ) -> Result<(fs::File, String, PathBuf), LedgerSnapshotError> {
-    let (leaf, parent_suffix) = suffix.split_last().ok_or_else(|| {
-        LedgerSnapshotError::UnsafeIntegrity("inherited ledger path has no file name".into())
-    })?;
-    let leaf = leaf
-        .to_str()
-        .ok_or_else(|| LedgerSnapshotError::UnsafeIntegrity("ledger file name is invalid".into()))?
-        .to_owned();
-    let parent_path = path
-        .parent()
-        .ok_or_else(|| LedgerSnapshotError::UnsafeIntegrity("ledger has no parent".into()))?
-        .to_owned();
-    let mut dir = root.root_handle().try_clone().map_err(|error| {
-        LedgerSnapshotError::UnstableBusy(format!("clone inherited ledger root: {error}"))
-    })?;
-
-    for name in parent_suffix {
-        let label = name.to_string_lossy();
-        let before =
-            cap_fs::stat(&dir, Path::new(name), cap_fs::FollowSymlinks::No).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    #[cfg(test)]
-                    run_missing_parent_hook();
-                    LedgerSnapshotError::Missing
-                } else {
-                    LedgerSnapshotError::UnstableBusy(format!(
-                        "stat inherited ledger parent: {error}"
-                    ))
-                }
-            })?;
-        validate_dir(&before, &label)?;
-        let child = cap_fs::open_dir_nofollow(&dir, Path::new(name)).map_err(|error| {
-            LedgerSnapshotError::UnsafeIntegrity(format!(
-                "open inherited ledger parent nofollow: {error}"
-            ))
-        })?;
-        let opened = cap_fs::Metadata::from_file(&child).map_err(|error| {
-            LedgerSnapshotError::UnstableBusy(format!("inspect inherited ledger parent: {error}"))
-        })?;
-        let after =
-            cap_fs::stat(&dir, Path::new(name), cap_fs::FollowSymlinks::No).map_err(|error| {
-                LedgerSnapshotError::UnsafeIntegrity(format!(
-                    "re-stat inherited ledger parent: {error}"
-                ))
-            })?;
-        validate_dir(&opened, &label)?;
-        validate_dir(&after, &label)?;
-        if !same_identity(&before, &opened) || !same_identity(&before, &after) {
-            return Err(LedgerSnapshotError::UnsafeIntegrity(
-                "inherited ledger parent changed while opening".into(),
-            ));
-        }
-        dir = child;
-    }
-    Ok((dir, leaf, parent_path))
-}
-
-fn bound_parent(path: &Path) -> Result<(fs::File, String, PathBuf), LedgerSnapshotError> {
-    #[cfg(target_os = "linux")]
-    if let Some(binding) = bound_inherited_parent(path)? {
-        return Ok(binding);
-    }
     let leaf = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -582,8 +327,7 @@ fn bound_parent(path: &Path) -> Result<(fs::File, String, PathBuf), LedgerSnapsh
             ));
         }
         bound.push(name);
-        #[cfg(windows)]
-        verify_windows_directory_binding(&bound, &child, &name.to_string_lossy())?;
+        verify_directory_binding(&bound, &child, &name.to_string_lossy())?;
         dir = child;
     }
     Ok((dir, leaf, parent_path))
@@ -594,14 +338,9 @@ fn bound_parent(path: &Path) -> Result<(fs::File, String, PathBuf), LedgerSnapsh
 /// the second complete capability walk reaches the same absence.  This closes
 /// the equivalent all-absent race for the parent itself: a creator that wins
 /// between observations makes the operation retry and bind the new parent.
-fn stable_parent_binding(path: &Path) -> Result<Option<(fs::File, String, PathBuf)>, AttemptError> {
-    #[cfg(target_os = "linux")]
-    if inherited_ledger_root(path)
-        .map_err(parent_binding_error)?
-        .is_some()
-    {
-        return stable_inherited_parent_binding(path);
-    }
+pub(crate) fn stable_ambient_parent_binding(
+    path: &Path,
+) -> Result<Option<(fs::File, String, PathBuf)>, AttemptError> {
     match bound_parent(path) {
         Ok(binding) => Ok(Some(binding)),
         Err(LedgerSnapshotError::Missing) => match bound_parent(path) {
@@ -613,96 +352,6 @@ fn stable_parent_binding(path: &Path) -> Result<Option<(fs::File, String, PathBu
         },
         Err(error) => Err(parent_binding_error(error)),
     }
-}
-
-/// Confirm an inherited-path absence against one retained descriptor root,
-/// then prove that the raw descriptor still names that root just before
-/// accepting `Missing`. Re-resolving `/dev/fd/N` for both absence walks would
-/// otherwise join observations from two unrelated authority roots.
-#[cfg(target_os = "linux")]
-fn stable_inherited_parent_binding(
-    path: &Path,
-) -> Result<Option<(fs::File, String, PathBuf)>, AttemptError> {
-    let (root, suffix) = inherited_ledger_root(path)
-        .map_err(parent_binding_error)?
-        .ok_or_else(|| AttemptError::Unsafe("inherited ledger root disappeared".into()))?;
-    match bound_inherited_parent_from_root(path, root.clone(), &suffix) {
-        Ok(binding) => Ok(Some(binding)),
-        Err(LedgerSnapshotError::Missing) => {
-            match bound_inherited_parent_from_root(path, root.clone(), &suffix) {
-                Ok(_) => Err(AttemptError::Unstable(
-                    "ledger parent appeared while confirming its absence".into(),
-                )),
-                Err(LedgerSnapshotError::Missing) => {
-                    let (fresh_root, fresh_suffix) = inherited_ledger_root(path)
-                        .map_err(parent_binding_error)?
-                        .ok_or_else(|| {
-                            AttemptError::Unstable(
-                                "inherited ledger root disappeared while confirming absence".into(),
-                            )
-                        })?;
-                    if fresh_suffix != suffix {
-                        return Err(AttemptError::Unsafe(
-                            "inherited ledger suffix changed while confirming absence".into(),
-                        ));
-                    }
-                    require_same_inherited_root(&root, &fresh_root, "while confirming absence")?;
-                    match bound_inherited_parent_from_root(path, fresh_root, &suffix) {
-                        Err(LedgerSnapshotError::Missing) => {
-                            let (post_walk_root, post_walk_suffix) = inherited_ledger_root(path)
-                                .map_err(parent_binding_error)?
-                                .ok_or_else(|| {
-                                    AttemptError::Unstable(
-                                        "inherited ledger root disappeared after final absence walk"
-                                            .into(),
-                                    )
-                                })?;
-                            if post_walk_suffix != suffix {
-                                return Err(AttemptError::Unsafe(
-                                    "inherited ledger suffix changed after final absence walk"
-                                        .into(),
-                                ));
-                            }
-                            require_same_inherited_root(
-                                &root,
-                                &post_walk_root,
-                                "after final absence walk",
-                            )?;
-                            Ok(None)
-                        }
-                        Ok(_) => Err(AttemptError::Unstable(
-                            "ledger parent appeared while accepting inherited absence".into(),
-                        )),
-                        Err(error) => Err(parent_binding_error(error)),
-                    }
-                }
-                Err(error) => Err(parent_binding_error(error)),
-            }
-        }
-        Err(error) => Err(parent_binding_error(error)),
-    }
-}
-
-#[cfg(target_os = "linux")]
-fn require_same_inherited_root(
-    held: &kio_core::store_dir::StoreDirectory,
-    fresh: &kio_core::store_dir::StoreDirectory,
-    phase: &str,
-) -> Result<(), AttemptError> {
-    let held_metadata =
-        cap_fs::Metadata::from_file(held.root_handle().as_ref()).map_err(|error| {
-            AttemptError::Unstable(format!("inspect retained inherited ledger root: {error}"))
-        })?;
-    let fresh_metadata =
-        cap_fs::Metadata::from_file(fresh.root_handle().as_ref()).map_err(|error| {
-            AttemptError::Unstable(format!("inspect fresh inherited ledger root: {error}"))
-        })?;
-    if !same_identity(&held_metadata, &fresh_metadata) {
-        return Err(AttemptError::Unsafe(format!(
-            "inherited ledger root identity changed {phase}"
-        )));
-    }
-    Ok(())
 }
 
 /// Rebind the canonical parent immediately before accepting a snapshot result.
@@ -744,7 +393,7 @@ fn fresh_parent_binding(
     Ok(fresh_parent)
 }
 
-fn parent_binding_error(error: LedgerSnapshotError) -> AttemptError {
+pub(crate) fn parent_binding_error(error: LedgerSnapshotError) -> AttemptError {
     match error {
         LedgerSnapshotError::Missing => AttemptError::Missing,
         LedgerSnapshotError::UnsafeIntegrity(message) => AttemptError::Unsafe(message),
@@ -752,36 +401,7 @@ fn parent_binding_error(error: LedgerSnapshotError) -> AttemptError {
     }
 }
 
-fn filesystem_root(_path: &Path) -> Result<PathBuf, LedgerSnapshotError> {
-    #[cfg(not(windows))]
-    {
-        Ok(PathBuf::from("/"))
-    }
-    #[cfg(windows)]
-    {
-        use std::path::Prefix;
-        let mut components = _path.components();
-        let Some(Component::Prefix(prefix)) = components.next() else {
-            return Err(LedgerSnapshotError::UnsafeIntegrity(
-                "ledger path has no volume root".into(),
-            ));
-        };
-        if !matches!(
-            prefix.kind(),
-            Prefix::Disk(_) | Prefix::UNC(_, _) | Prefix::VerbatimDisk(_)
-        ) || !matches!(components.next(), Some(Component::RootDir))
-        {
-            return Err(LedgerSnapshotError::UnsafeIntegrity(
-                "ledger path has no volume root".into(),
-            ));
-        }
-        let mut root = PathBuf::from(prefix.as_os_str());
-        root.push("\\");
-        Ok(root)
-    }
-}
-
-fn validate_dir(m: &cap_fs::Metadata, label: &str) -> Result<(), LedgerSnapshotError> {
+pub(crate) fn validate_dir(m: &cap_fs::Metadata, label: &str) -> Result<(), LedgerSnapshotError> {
     if !m.is_dir() || m.file_type().is_symlink() {
         return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
             "ledger parent is not a real directory: {label}"
@@ -790,79 +410,7 @@ fn validate_dir(m: &cap_fs::Metadata, label: &str) -> Result<(), LedgerSnapshotE
     Ok(())
 }
 
-#[cfg(windows)]
-fn verify_windows_directory_binding(
-    path: &Path,
-    opened: &fs::File,
-    label: &str,
-) -> Result<(), LedgerSnapshotError> {
-    let path_identity = kio_core::platform::real_directory_identity(path).map_err(|e| {
-        LedgerSnapshotError::UnstableBusy(format!("inspect Windows ledger parent {label}: {e}"))
-    })?;
-    let handle_identity = kio_core::platform::directory_handle_identity(opened);
-    if path_identity.is_none() || path_identity != handle_identity {
-        return Err(LedgerSnapshotError::UnsafeIntegrity(format!(
-            "Windows ledger parent is a reparse point or changed: {label}"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn verify_windows_regular_binding(
-    path: &Path,
-    opened: &fs::File,
-    label: &str,
-) -> Result<(), AttemptError> {
-    let path_identity = kio_core::platform::real_regular_file_identity(path)
-        .map_err(|e| AttemptError::Unstable(format!("inspect Windows ledger {label}: {e}")))?;
-    let handle_identity = kio_core::platform::regular_file_handle_identity(opened);
-    if path_identity.is_none() || path_identity != handle_identity {
-        return Err(AttemptError::Unsafe(format!(
-            "Windows ledger {label} is a reparse point or changed while opening"
-        )));
-    }
-    Ok(())
-}
-fn identity(m: &cap_fs::Metadata) -> Identity {
-    #[cfg(unix)]
-    {
-        use cap_fs::MetadataExt;
-        Identity {
-            dev: m.dev(),
-            ino: m.ino(),
-        }
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        Identity {
-            volume_serial_number: m.volume_serial_number(),
-            file_index: m.file_index(),
-        }
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Identity
-    }
-}
-
-/// Compare platform file identities without treating an unavailable Windows
-/// identity field as a stable value. A missing volume serial or file index
-/// cannot establish that two handles name the same object, so it fails closed.
-fn same_identity(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
-    #[cfg(windows)]
-    {
-        let left = identity(left);
-        let right = identity(right);
-        left.volume_serial_number.is_some() && left.file_index.is_some() && left == right
-    }
-    #[cfg(not(windows))]
-    {
-        identity(left) == identity(right)
-    }
-}
-fn validate_file(m: &cap_fs::Metadata, label: &str) -> Result<(), AttemptError> {
+pub(crate) fn validate_file(m: &cap_fs::Metadata, label: &str) -> Result<(), AttemptError> {
     if !m.is_file() || m.file_type().is_symlink() {
         return Err(AttemptError::Unsafe(format!(
             "ledger {label} is not a regular nofollow file"
@@ -873,24 +421,7 @@ fn validate_file(m: &cap_fs::Metadata, label: &str) -> Result<(), AttemptError> 
             "ledger {label} exceeds bound"
         )));
     }
-    #[cfg(unix)]
-    {
-        use cap_fs::MetadataExt;
-        if m.nlink() != 1 {
-            return Err(AttemptError::Unsafe(format!(
-                "ledger {label} has hard links"
-            )));
-        }
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        if m.number_of_links() != Some(1) {
-            return Err(AttemptError::Unsafe(format!(
-                "ledger {label} has hard links"
-            )));
-        }
-    }
+    validate_file_links(m, label)?;
     Ok(())
 }
 
@@ -900,8 +431,6 @@ fn observe(
     name: &str,
     copy: Option<(&PrivateStorage, &str)>,
 ) -> Result<Leaf, AttemptError> {
-    #[cfg(not(windows))]
-    let _ = parent_path;
     let before = match cap_fs::stat(parent, Path::new(name), cap_fs::FollowSymlinks::No) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Leaf::Absent),
@@ -917,8 +446,7 @@ fn observe(
     let opened = cap_fs::Metadata::from_file(&input)
         .map_err(|e| AttemptError::Unstable(format!("inspect ledger {name}: {e}")))?;
     validate_file(&opened, name)?;
-    #[cfg(windows)]
-    verify_windows_regular_binding(&parent_path.join(name), &input, name)?;
+    verify_regular_binding(&parent_path.join(name), &input, name)?;
     if !same_identity(&before, &opened) || before.len() != opened.len() {
         return Err(AttemptError::Unsafe(format!(
             "ledger {name} changed while opening"
@@ -957,8 +485,7 @@ fn observe(
     let after = cap_fs::stat(parent, Path::new(name), cap_fs::FollowSymlinks::No)
         .map_err(|e| AttemptError::Unstable(format!("restat ledger {name}: {e}")))?;
     validate_file(&after, name)?;
-    #[cfg(windows)]
-    verify_windows_regular_binding(&parent_path.join(name), &input, name)?;
+    verify_regular_binding(&parent_path.join(name), &input, name)?;
     if !same_identity(&opened, &after) || opened.len() != after.len() || total != opened.len() {
         return Err(AttemptError::Unsafe(format!(
             "ledger {name} changed while reading"
@@ -1134,188 +661,6 @@ fn ensure_barrier_leaf_absent(parent: &fs::File, name: &str) -> Result<(), Attem
         Err(e) => Err(AttemptError::Unstable(format!(
             "stat test ledger barrier leaf {name}: {e}"
         ))),
-    }
-}
-
-fn validate_test_barrier_parent(parent: &fs::File) -> Result<(), AttemptError> {
-    let metadata = cap_fs::Metadata::from_file(parent)
-        .map_err(|e| AttemptError::Unstable(format!("inspect test ledger barrier parent: {e}")))?;
-    if !metadata.is_dir() {
-        return Err(AttemptError::Unsafe(
-            "test ledger barrier parent is not a directory".into(),
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use cap_fs::MetadataExt;
-        // SAFETY: geteuid has no preconditions and reads only process metadata.
-        let euid = unsafe { libc::geteuid() };
-        if metadata.uid() != euid || metadata.mode() & 0o077 != 0 {
-            return Err(AttemptError::Unsafe(
-                "test ledger barrier parent is not owner-private".into(),
-            ));
-        }
-    }
-    #[cfg(windows)]
-    {
-        Err(AttemptError::Unsafe(
-            "test ledger barrier is unsupported on Windows without owner-DACL binding".into(),
-        ))
-    }
-    #[cfg(not(windows))]
-    {
-        Ok(())
-    }
-}
-
-#[cfg(unix)]
-fn verify_private_leaf(
-    dir: &fs::File,
-    name: &str,
-    expected: &Observed,
-) -> Result<(), AttemptError> {
-    let before = cap_fs::stat(dir, Path::new(name), cap_fs::FollowSymlinks::No).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            AttemptError::Unsafe(format!("private ledger snapshot {name} is missing"))
-        } else {
-            AttemptError::Unstable(format!("stat private ledger snapshot {name}: {e}"))
-        }
-    })?;
-    validate_file(&before, name)?;
-    if before.len() != expected.bytes {
-        return Err(AttemptError::Unsafe(format!(
-            "private ledger snapshot {name} size differs"
-        )));
-    }
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut input = cap_fs::open(dir, Path::new(name), &options).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            AttemptError::Unsafe(format!("private ledger snapshot {name} disappeared"))
-        } else {
-            AttemptError::Unstable(format!("open private ledger snapshot {name}: {e}"))
-        }
-    })?;
-    let opened = cap_fs::Metadata::from_file(&input).map_err(|e| {
-        AttemptError::Unstable(format!("inspect private ledger snapshot {name}: {e}"))
-    })?;
-    validate_file(&opened, name)?;
-    if !same_identity(&before, &opened) || before.len() != opened.len() {
-        return Err(AttemptError::Unsafe(format!(
-            "private ledger snapshot {name} changed while opening"
-        )));
-    }
-    let mut bytes = 0u64;
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 65536];
-    loop {
-        let count = input.read(&mut buffer).map_err(|e| {
-            AttemptError::Unstable(format!("read private ledger snapshot {name}: {e}"))
-        })?;
-        if count == 0 {
-            break;
-        }
-        bytes += count as u64;
-        if bytes > MAX_LEAF_BYTES {
-            return Err(AttemptError::Unsafe(format!(
-                "private ledger snapshot {name} exceeds bound"
-            )));
-        }
-        hash.update(&buffer[..count]);
-    }
-    let after = cap_fs::stat(dir, Path::new(name), cap_fs::FollowSymlinks::No).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            AttemptError::Unsafe(format!("private ledger snapshot {name} disappeared"))
-        } else {
-            AttemptError::Unstable(format!("re-stat private ledger snapshot {name}: {e}"))
-        }
-    })?;
-    validate_file(&after, name)?;
-    if !same_identity(&opened, &after)
-        || bytes != expected.bytes
-        || hash.finalize().as_slice() != expected.sha256
-    {
-        return Err(AttemptError::Unsafe(format!(
-            "private ledger snapshot {name} differs from source copy"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn verify_private_snapshot(path: &Path, manifest: &Manifest) -> Result<(), AttemptError> {
-    let dir = cap_fs::open_ambient_dir(path, cap_primitives::ambient_authority()).map_err(|e| {
-        AttemptError::Unstable(format!("open private ledger snapshot capability: {e}"))
-    })?;
-    let Leaf::Present(main) = &manifest.main else {
-        return Err(AttemptError::Unsafe(
-            "private ledger snapshot without source main".into(),
-        ));
-    };
-    verify_private_leaf(&dir, SNAPSHOT_MAIN, main)?;
-    let wal_name = format!("{SNAPSHOT_MAIN}-wal");
-    let mut allowed = std::collections::BTreeSet::from([SNAPSHOT_MAIN.to_owned()]);
-    if let Leaf::Present(wal) = &manifest.wal {
-        allowed.insert(wal_name.clone());
-        verify_private_leaf(&dir, &wal_name, wal)?;
-    }
-    let shm = format!("{SNAPSHOT_MAIN}-shm");
-    match cap_fs::stat(&dir, Path::new(&shm), cap_fs::FollowSymlinks::No) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Ok(_) => {
-            return Err(AttemptError::Unsafe(
-                "private ledger snapshot has pre-open SHM".into(),
-            ));
-        }
-        Err(error) => {
-            return Err(AttemptError::Unstable(format!(
-                "stat private ledger SHM: {error}"
-            )));
-        }
-    }
-    for entry in cap_fs::read_base_dir(&dir)
-        .map_err(|e| AttemptError::Unstable(format!("enumerate private ledger snapshot: {e}")))?
-    {
-        let entry = entry.map_err(|e| {
-            AttemptError::Unstable(format!("enumerate private ledger snapshot leaf: {e}"))
-        })?;
-        let file_name = entry.file_name();
-        let Some(name) = file_name.to_str() else {
-            return Err(AttemptError::Unsafe(
-                "private ledger snapshot non-utf8 leaf".into(),
-            ));
-        };
-        if !allowed.contains(name) {
-            return Err(AttemptError::Unsafe(format!(
-                "private ledger snapshot unexpected leaf {name}"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn verify_private_storage(
-    storage: &PrivateStorage,
-    manifest: &Manifest,
-) -> Result<(), AttemptError> {
-    #[cfg(unix)]
-    {
-        verify_private_snapshot(storage.path(), manifest)
-    }
-    #[cfg(windows)]
-    {
-        let PrivateStorage::Windows(private) = storage;
-        private
-            .verify_before_sqlite(matches!(manifest.wal, Leaf::Present(_)))
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::InvalidData {
-                    AttemptError::Unsafe(format!("verify owner-private ledger snapshot: {error}"))
-                } else {
-                    AttemptError::Unstable(format!("verify owner-private ledger snapshot: {error}"))
-                }
-            })
     }
 }
 
