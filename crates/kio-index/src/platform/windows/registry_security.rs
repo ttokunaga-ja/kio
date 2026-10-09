@@ -5,8 +5,6 @@
 //! an attacker-controlled interval.  The directory and every fixed-name leaf
 //! are created with an owner-only protected DACL, then inspected by handle.
 
-#![cfg(windows)]
-
 use std::{
     ffi::c_void,
     fs, io, mem,

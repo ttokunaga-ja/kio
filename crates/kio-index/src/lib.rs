@@ -7,9 +7,8 @@ pub mod aggregator;
 pub mod chunking;
 pub mod embedding_store;
 pub mod fts;
+pub mod platform;
 pub mod registry;
-#[cfg(windows)]
-pub(crate) mod registry_windows_security;
 pub mod rows;
 mod search_projection;
 pub mod vec;

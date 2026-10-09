@@ -9,8 +9,8 @@
 use std::{
     collections::BTreeSet,
     fs,
-    io::{Read, Write},
-    path::{Component, Path, PathBuf},
+    io::Read,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -19,6 +19,13 @@ use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, pa
 use sha2::{Digest, Sha256};
 
 use crate::Result;
+use crate::platform::{
+    FileIdentity, PrivateSnapshotStorage, RegistryParentBinding, fresh_registry_parent_binding,
+    leaf_identity, observe_leaf, prepare_registry_writer, stable_registry_parent_binding,
+    validate_regular,
+};
+#[cfg(test)]
+use std::path::Component;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RegistryEntry {
@@ -63,7 +70,9 @@ pub struct RegistryDb {
 /// The size limits are deliberately registry-specific.  Snapshot reads and
 /// copies are streaming, so these bounds limit I/O rather than allocating a
 /// whole SQLite leaf in memory.
-const MAX_REGISTRY_LEAF_BYTES: u64 = 64 * 1024 * 1024;
+const PRIVATE_REGISTRY_MAIN: &str = "snapshot.sqlite";
+
+pub(crate) const MAX_REGISTRY_LEAF_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_REGISTRY_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 const REGISTRY_SNAPSHOT_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_REGISTRY_SNAPSHOT_ATTEMPTS: usize = 8;
@@ -91,16 +100,16 @@ impl std::fmt::Display for RegistrySnapshotError {
 impl std::error::Error for RegistrySnapshotError {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum LeafObservation {
+pub(crate) enum LeafObservation {
     Absent,
     Present(FileObservation),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FileObservation {
-    identity: FileIdentity,
-    bytes: u64,
-    sha256: [u8; 32],
+pub(crate) struct FileObservation {
+    pub(crate) identity: FileIdentity,
+    pub(crate) bytes: u64,
+    pub(crate) sha256: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,106 +125,6 @@ struct PrivateSnapshotManifest {
     wal: Option<FileObservation>,
 }
 
-#[cfg(unix)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileIdentity {
-    dev: u64,
-    ino: u64,
-}
-
-#[cfg(windows)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileIdentity {
-    volume_serial_number: u32,
-    file_index: u64,
-}
-
-#[cfg(not(any(unix, windows)))]
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct FileIdentity;
-
-const PRIVATE_REGISTRY_MAIN: &str = "snapshot.sqlite";
-
-enum PrivateSnapshotStorage {
-    #[cfg(unix)]
-    Temp(tempfile::TempDir),
-    #[cfg(windows)]
-    Windows(crate::registry_windows_security::RegistrySnapshotPrivateDir),
-}
-
-impl PrivateSnapshotStorage {
-    fn create() -> std::result::Result<Self, SnapshotAttemptError> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut builder = tempfile::Builder::new();
-            builder.prefix("kio-registry-snapshot-");
-            builder.permissions(fs::Permissions::from_mode(0o700));
-            builder.tempdir().map(Self::Temp).map_err(|error| {
-                SnapshotAttemptError::Unstable(format!(
-                    "create registry snapshot directory: {error}"
-                ))
-            })
-        }
-        #[cfg(windows)]
-        {
-            crate::registry_windows_security::RegistrySnapshotPrivateDir::create()
-                .map(Self::Windows)
-                .map_err(|error| {
-                    SnapshotAttemptError::Unstable(format!(
-                        "create owner-private registry snapshot directory: {error}"
-                    ))
-                })
-        }
-        #[cfg(not(any(unix, windows)))]
-        compile_error!("RegistrySnapshot requires a platform-private directory implementation");
-    }
-
-    fn path(&self) -> &Path {
-        match self {
-            #[cfg(unix)]
-            Self::Temp(temp) => temp.path(),
-            #[cfg(windows)]
-            Self::Windows(temp) => temp.path(),
-        }
-    }
-
-    fn create_file(&self, basename: &str) -> std::result::Result<fs::File, SnapshotAttemptError> {
-        match self {
-            #[cfg(unix)]
-            Self::Temp(temp) => {
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut options = fs::OpenOptions::new();
-                options.write(true).create_new(true).mode(0o600);
-                options.open(temp.path().join(basename)).map_err(|error| {
-                    SnapshotAttemptError::Unstable(format!(
-                        "create registry snapshot {}: {error}",
-                        temp.path().join(basename).display()
-                    ))
-                })
-            }
-            #[cfg(windows)]
-            Self::Windows(temp) => temp.create_file(basename).map_err(|error| {
-                SnapshotAttemptError::Unstable(format!(
-                    "create owner-private registry snapshot {basename}: {error}"
-                ))
-            }),
-        }
-    }
-
-    #[cfg(windows)]
-    fn as_windows(
-        &self,
-    ) -> std::result::Result<
-        &crate::registry_windows_security::RegistrySnapshotPrivateDir,
-        SnapshotAttemptError,
-    > {
-        match self {
-            Self::Windows(storage) => Ok(storage),
-        }
-    }
-}
-
 struct RegistrySnapshot {
     // This is the descriptor-relative capability used to validate the copied
     // leaves immediately before SQLite is allowed to open the private path.
@@ -226,7 +135,7 @@ struct RegistrySnapshot {
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SnapshotTestPhase {
+pub(crate) enum SnapshotTestPhase {
     BeforeSourceLeafOpen,
     BeforeSourceLeafRestat,
     AfterInitialManifest,
@@ -236,7 +145,7 @@ enum SnapshotTestPhase {
 }
 
 #[cfg(test)]
-type SnapshotTestHook =
+pub(crate) type SnapshotTestHook =
     std::sync::Arc<dyn Fn(SnapshotTestPhase, usize, Option<&Path>) + Send + Sync>;
 
 /// `$XDG_DATA_HOME/kio/scope-registry.sqlite`, falling back to
@@ -256,7 +165,7 @@ pub fn default_registry_path() -> Result<PathBuf> {
     Ok(data_home.join("kio/scope-registry.sqlite"))
 }
 
-fn index_error_from_snapshot(error: RegistrySnapshotError) -> crate::IndexError {
+pub(crate) fn index_error_from_snapshot(error: RegistrySnapshotError) -> crate::IndexError {
     match error {
         RegistrySnapshotError::Missing => crate::IndexError::RegistryMissing,
         RegistrySnapshotError::UnsafeIntegrity(message) => {
@@ -266,230 +175,6 @@ fn index_error_from_snapshot(error: RegistrySnapshotError) -> crate::IndexError 
             crate::IndexError::RegistryUnstableBusy(message)
         }
     }
-}
-
-#[cfg(windows)]
-fn windows_registry_writer_parent(
-    path: &Path,
-) -> Result<(PathBuf, kio_core::store_dir::StoreDirectory)> {
-    use kio_core::{private_fs, store_dir::StoreDirectory};
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        // Only plain relative custom paths inherit the current directory.
-        // Drive-relative and rooted-relative paths have a different authority.
-        if path.as_os_str().is_empty()
-            || !path
-                .components()
-                .all(|component| matches!(component, Component::Normal(_)))
-        {
-            return Err(crate::IndexError::Schema(format!(
-                "registry writer path is not a normalized relative path: {}",
-                path.display()
-            )));
-        }
-        std::env::current_dir()
-            .map_err(|error| crate::IndexError::Schema(error.to_string()))?
-            .join(path)
-    };
-    let absolute =
-        normalized_absolute_registry_path(&absolute).map_err(index_error_from_snapshot)?;
-    if absolute.file_name().is_none() {
-        return Err(crate::IndexError::Schema(
-            "registry writer path has no file name".to_owned(),
-        ));
-    }
-    let parent_path = absolute.parent().ok_or_else(|| {
-        crate::IndexError::Schema("registry writer path has no parent".to_owned())
-    })?;
-    let mut ancestor = parent_path.to_path_buf();
-    let mut missing = Vec::new();
-    let mut parent = loop {
-        match fs::symlink_metadata(&ancestor) {
-            Ok(metadata) => {
-                if !metadata.is_dir()
-                    || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-                {
-                    return Err(crate::IndexError::Schema(format!(
-                        "registry writer ancestor is not a real directory: {}",
-                        ancestor.display()
-                    )));
-                }
-                // An occupied unsafe ancestor is a refusal, never a reason to
-                // back off farther or repair that ancestor's ACL.
-                break private_fs::verify_private_creation_parent(&ancestor)
-                    .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let component = ancestor.file_name().ok_or_else(|| {
-                    crate::IndexError::Schema("registry writer has no existing ancestor".to_owned())
-                })?;
-                missing.push(component.to_os_string());
-                if !ancestor.pop() {
-                    return Err(crate::IndexError::Schema(
-                        "registry writer has no existing ancestor".to_owned(),
-                    ));
-                }
-            }
-            Err(error) => return Err(crate::IndexError::Schema(error.to_string())),
-        }
-    };
-    let mut logical = ancestor;
-    for component in missing.into_iter().rev() {
-        let leaf = Path::new(&component);
-        let next = if parent
-            .contains_entry(leaf)
-            .map_err(|error| crate::IndexError::Schema(error.to_string()))?
-        {
-            parent
-                .open_directory(leaf)
-                .map_err(|error| crate::IndexError::Schema(error.to_string()))?
-        } else {
-            // The core primitive installs a protected owner-only DACL before
-            // exposing this create-only entry. Creation errors stay errors.
-            parent
-                .create_directory(leaf)
-                .map_err(|error| crate::IndexError::Schema(error.to_string()))?
-        };
-        logical.push(&component);
-        parent = StoreDirectory::from_retained(next, logical.clone())
-            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
-        // A component that appeared after the missing suffix was observed must
-        // also be private; neither that entry nor a new one is ACL-repaired.
-        private_fs::verify_private_directory_handle(&parent)
-            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
-    }
-    Ok((absolute, parent))
-}
-
-#[cfg(target_os = "linux")]
-fn inherited_registry_parent(
-    path: &Path,
-) -> Result<Option<(PathBuf, kio_core::store_dir::StoreDirectory)>> {
-    use std::ffi::CString;
-    use std::os::fd::AsRawFd;
-    use std::os::fd::FromRawFd;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
-
-    let Some((mut parent, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
-        .map_err(|error| {
-            crate::IndexError::Schema(format!(
-                "resolve inherited registry directory capability: {error}"
-            ))
-        })?
-    else {
-        return Ok(None);
-    };
-    let (leaf, parent_suffix) = suffix.split_last().ok_or_else(|| {
-        crate::IndexError::Schema("inherited scope registry path has no file name".to_owned())
-    })?;
-    let verify_owner_private_directory =
-        |directory: &kio_core::store_dir::StoreDirectory| -> Result<()> {
-            let metadata = directory.root_handle().metadata().map_err(|error| {
-                crate::IndexError::Schema(format!("inspect inherited registry parent: {error}"))
-            })?;
-            // SAFETY: geteuid has no arguments and no memory-safety preconditions.
-            let uid = unsafe { libc::geteuid() };
-            if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-                return Err(crate::IndexError::Schema(format!(
-                    "inherited registry parent is not owner-private: {}",
-                    directory.path().display()
-                )));
-            }
-            Ok(())
-        };
-
-    verify_owner_private_directory(&parent)?;
-    let mut logical = parent.path().to_path_buf();
-    for name in parent_suffix {
-        let component = Path::new(name);
-        logical.push(name);
-        let next = if parent
-            .contains_entry(component)
-            .map_err(|error| crate::IndexError::Schema(error.to_string()))?
-        {
-            parent
-                .open_directory(component)
-                .map_err(|error| crate::IndexError::Schema(error.to_string()))?
-        } else {
-            parent
-                .create_directory(component)
-                .map_err(|error| crate::IndexError::Schema(error.to_string()))?
-        };
-        parent = kio_core::store_dir::StoreDirectory::from_retained(next, logical.clone())
-            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
-        // Existing directories are only verified, never chmod-repaired. New
-        // directories were restricted by StoreDirectory before this adoption.
-        verify_owner_private_directory(&parent)?;
-    }
-
-    let leaf = Path::new(leaf);
-    let name = CString::new(leaf.as_os_str().as_bytes()).map_err(|_| {
-        crate::IndexError::Schema("inherited scope registry leaf contains NUL".to_owned())
-    })?;
-    // Create a missing SQLite main leaf descriptor-relatively and owner-only
-    // before SQLite sees it. Existing state is opened with O_NOFOLLOW and
-    // validated, never chmod-repaired.
-    if !parent
-        .contains_entry(leaf)
-        .map_err(|error| crate::IndexError::Schema(error.to_string()))?
-    {
-        // SAFETY: `parent` is a retained directory capability and `name` is a
-        // single NUL-free component supplied by core's inherited-root parser.
-        let fd = unsafe {
-            libc::openat(
-                parent.root_handle().as_raw_fd(),
-                name.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd >= 0 {
-            // SAFETY: openat returned an owned descriptor above.
-            let created = unsafe { fs::File::from_raw_fd(fd) };
-            let metadata = created.metadata().map_err(|error| {
-                crate::IndexError::Schema(format!(
-                    "inspect created inherited registry leaf: {error}"
-                ))
-            })?;
-            // SAFETY: geteuid has no arguments and no memory-safety preconditions.
-            let uid = unsafe { libc::geteuid() };
-            if !metadata.is_file()
-                || metadata.uid() != uid
-                || metadata.mode() & 0o077 != 0
-                || metadata.nlink() != 1
-            {
-                return Err(crate::IndexError::Schema(
-                    "created inherited registry leaf is not owner-private".to_owned(),
-                ));
-            }
-        } else {
-            let error = std::io::Error::last_os_error();
-            if error.raw_os_error() == Some(libc::EEXIST) {
-                parent
-                    .ensure_owner_private(leaf)
-                    .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
-            } else {
-                return Err(crate::IndexError::Schema(format!(
-                    "create inherited scope registry leaf: {error}"
-                )));
-            }
-        }
-    } else {
-        parent
-            .ensure_owner_private(leaf)
-            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
-    }
-    let sqlite_path = PathBuf::from(format!(
-        "/proc/self/fd/{}",
-        parent.root_handle().as_raw_fd()
-    ))
-    .join(leaf);
-    Ok(Some((sqlite_path, parent)))
 }
 
 fn snapshot_query_error(error: crate::IndexError) -> RegistrySnapshotError {
@@ -533,237 +218,13 @@ fn snapshot_query_error(error: crate::IndexError) -> RegistrySnapshotError {
 }
 
 #[derive(Debug)]
-enum SnapshotAttemptError {
+pub(crate) enum SnapshotAttemptError {
     Missing,
     Unsafe(String),
     Unstable(String),
 }
 
-struct RegistryParentBinding {
-    parent: std::sync::Arc<fs::File>,
-    leaf: String,
-    parent_path: PathBuf,
-    // Keep the core-duplicated inherited root for the complete snapshot
-    // attempt. A later `/dev/fd/N` re-resolution is compared to this retained
-    // capability before a stable read or missing result is accepted.
-    #[cfg(target_os = "linux")]
-    inherited_root: Option<kio_core::store_dir::StoreDirectory>,
-}
-
-fn registry_parent_and_leaf(
-    path: &Path,
-) -> std::result::Result<RegistryParentBinding, RegistrySnapshotError> {
-    #[cfg(target_os = "linux")]
-    if let Some((root, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
-        .map_err(|error| {
-            RegistrySnapshotError::UnsafeIntegrity(format!(
-                "resolve inherited registry directory capability: {error}"
-            ))
-        })?
-    {
-        return inherited_registry_parent_and_leaf(path, root, &suffix);
-    }
-    let path = normalized_absolute_registry_path(path)?;
-    let filesystem_root = registry_filesystem_root(&path)?;
-    let leaf = path
-        .file_name()
-        .and_then(|leaf| leaf.to_str())
-        .ok_or_else(|| {
-            RegistrySnapshotError::UnsafeIntegrity(format!(
-                "scope registry path has no valid UTF-8 file name: {}",
-                path.display()
-            ))
-        })?;
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("/"));
-    let mut handle =
-        cap_fs::open_ambient_dir(&filesystem_root, cap_primitives::ambient_authority()).map_err(
-            |error| RegistrySnapshotError::UnstableBusy(format!("open filesystem root: {error}")),
-        )?;
-    let mut bound_component_path = filesystem_root.clone();
-    #[cfg(test)]
-    let mut index = 0usize;
-    for component in parent.components() {
-        let Component::Normal(name) = component else {
-            continue;
-        };
-        let before = match cap_fs::stat(&handle, Path::new(name), cap_fs::FollowSymlinks::No) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Err(RegistrySnapshotError::Missing);
-            }
-            Err(error) => {
-                return Err(RegistrySnapshotError::UnstableBusy(format!(
-                    "inspect registry parent component {}: {error}",
-                    name.to_string_lossy()
-                )));
-            }
-        };
-        validate_directory(&before, &name.to_string_lossy())?;
-        #[cfg(test)]
-        run_parent_component_hook(index);
-        let child = cap_fs::open_dir_nofollow(&handle, Path::new(name)).map_err(|error| {
-            RegistrySnapshotError::UnsafeIntegrity(format!(
-                "open registry parent component {}: {error}",
-                name.to_string_lossy()
-            ))
-        })?;
-        bound_component_path.push(name);
-        let opened = cap_fs::Metadata::from_file(&child).map_err(|error| {
-            RegistrySnapshotError::UnstableBusy(format!(
-                "inspect opened registry parent component {}: {error}",
-                name.to_string_lossy()
-            ))
-        })?;
-        validate_directory(&opened, &name.to_string_lossy())?;
-        let current = cap_fs::stat(&handle, Path::new(name), cap_fs::FollowSymlinks::No).map_err(
-            |error| {
-                RegistrySnapshotError::UnsafeIntegrity(format!(
-                    "reinspect registry parent component {} after opening: {error}",
-                    name.to_string_lossy()
-                ))
-            },
-        )?;
-        validate_directory(&current, &name.to_string_lossy())?;
-        let before_identity = leaf_identity(&before).ok_or_else(|| {
-            RegistrySnapshotError::UnsafeIntegrity(format!(
-                "registry parent component has no usable identity: {}",
-                name.to_string_lossy()
-            ))
-        })?;
-        let opened_identity = leaf_identity(&opened).ok_or_else(|| {
-            RegistrySnapshotError::UnsafeIntegrity(format!(
-                "opened registry parent component has no usable identity: {}",
-                name.to_string_lossy()
-            ))
-        })?;
-        let current_identity = leaf_identity(&current).ok_or_else(|| {
-            RegistrySnapshotError::UnsafeIntegrity(format!(
-                "reinspected registry parent component has no usable identity: {}",
-                name.to_string_lossy()
-            ))
-        })?;
-        if before_identity != opened_identity
-            || before_identity != current_identity
-            || opened_identity != current_identity
-        {
-            return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-                "registry parent component changed while opening: {}",
-                name.to_string_lossy()
-            )));
-        }
-        #[cfg(windows)]
-        verify_windows_directory_binding(&bound_component_path, &child, &name.to_string_lossy())?;
-        handle = child;
-        #[cfg(test)]
-        {
-            index += 1;
-        }
-    }
-    Ok(RegistryParentBinding {
-        parent: std::sync::Arc::new(handle),
-        leaf: leaf.to_owned(),
-        parent_path: parent.to_owned(),
-        #[cfg(target_os = "linux")]
-        inherited_root: None,
-    })
-}
-
-#[cfg(target_os = "linux")]
-fn inherited_registry_parent_and_leaf(
-    path: &Path,
-    root: kio_core::store_dir::StoreDirectory,
-    suffix: &[std::ffi::OsString],
-) -> std::result::Result<RegistryParentBinding, RegistrySnapshotError> {
-    use std::os::unix::fs::MetadataExt;
-
-    let (leaf, parent_suffix) = suffix.split_last().ok_or_else(|| {
-        RegistrySnapshotError::UnsafeIntegrity(
-            "inherited scope registry path has no file name".to_owned(),
-        )
-    })?;
-    let leaf = leaf.to_str().ok_or_else(|| {
-        RegistrySnapshotError::UnsafeIntegrity(
-            "inherited scope registry path has no valid UTF-8 file name".to_owned(),
-        )
-    })?;
-    let parent_path = path.parent().ok_or_else(|| {
-        RegistrySnapshotError::UnsafeIntegrity(
-            "inherited scope registry path has no parent".to_owned(),
-        )
-    })?;
-    let mut parent = root.root_handle();
-    // SAFETY: geteuid has no arguments and no memory-safety preconditions.
-    let uid = unsafe { libc::geteuid() };
-    for name in parent_suffix {
-        let label = name.to_string_lossy();
-        let before =
-            match cap_fs::stat(parent.as_ref(), Path::new(name), cap_fs::FollowSymlinks::No) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    return Err(RegistrySnapshotError::Missing);
-                }
-                Err(error) => {
-                    return Err(RegistrySnapshotError::UnstableBusy(format!(
-                        "inspect inherited registry parent component {label}: {error}"
-                    )));
-                }
-            };
-        validate_directory(&before, &label)?;
-        let child =
-            cap_fs::open_dir_nofollow(parent.as_ref(), Path::new(name)).map_err(|error| {
-                RegistrySnapshotError::UnsafeIntegrity(format!(
-                    "open inherited registry parent component {label}: {error}"
-                ))
-            })?;
-        let opened = cap_fs::Metadata::from_file(&child).map_err(|error| {
-            RegistrySnapshotError::UnstableBusy(format!(
-                "inspect inherited registry parent component {label}: {error}"
-            ))
-        })?;
-        let after = cap_fs::stat(parent.as_ref(), Path::new(name), cap_fs::FollowSymlinks::No)
-            .map_err(|error| {
-                RegistrySnapshotError::UnsafeIntegrity(format!(
-                    "reinspect inherited registry parent component {label}: {error}"
-                ))
-            })?;
-        validate_directory(&opened, &label)?;
-        validate_directory(&after, &label)?;
-        let before_identity = leaf_identity(&before).ok_or_else(|| {
-            RegistrySnapshotError::UnsafeIntegrity(format!(
-                "inherited registry parent component has no usable identity: {label}"
-            ))
-        })?;
-        if leaf_identity(&opened).as_ref() != Some(&before_identity)
-            || leaf_identity(&after).as_ref() != Some(&before_identity)
-        {
-            return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-                "inherited registry parent component changed while opening: {label}"
-            )));
-        }
-        let metadata = child.metadata().map_err(|error| {
-            RegistrySnapshotError::UnstableBusy(format!(
-                "inspect inherited registry parent permissions {label}: {error}"
-            ))
-        })?;
-        if !metadata.is_dir() || metadata.uid() != uid || metadata.mode() & 0o077 != 0 {
-            return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-                "inherited registry parent is not owner-private: {label}"
-            )));
-        }
-        parent = std::sync::Arc::new(child);
-    }
-    Ok(RegistryParentBinding {
-        parent,
-        leaf: leaf.to_owned(),
-        parent_path: parent_path.to_owned(),
-        inherited_root: Some(root),
-    })
-}
-
-fn registry_parent_binding_error(error: RegistrySnapshotError) -> SnapshotAttemptError {
+pub(crate) fn registry_parent_binding_error(error: RegistrySnapshotError) -> SnapshotAttemptError {
     match error {
         RegistrySnapshotError::Missing => SnapshotAttemptError::Missing,
         RegistrySnapshotError::UnsafeIntegrity(message) => SnapshotAttemptError::Unsafe(message),
@@ -774,321 +235,7 @@ fn registry_parent_binding_error(error: RegistrySnapshotError) -> SnapshotAttemp
 /// A missing canonical parent is a cache miss only after two complete nofollow
 /// walks agree. Each snapshot retry obtains a new binding rather than retaining
 /// a directory that may have been detached from the canonical path.
-fn stable_registry_parent_binding(
-    path: &Path,
-) -> std::result::Result<Option<RegistryParentBinding>, SnapshotAttemptError> {
-    #[cfg(target_os = "linux")]
-    if let Some((root, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
-        .map_err(|error| {
-            SnapshotAttemptError::Unsafe(format!(
-                "resolve inherited registry directory capability: {error}"
-            ))
-        })?
-    {
-        match inherited_registry_parent_and_leaf(path, root.clone(), &suffix) {
-            Ok(binding) => return Ok(Some(binding)),
-            Err(RegistrySnapshotError::Missing) => {
-                match inherited_registry_parent_and_leaf(path, root.clone(), &suffix) {
-                    Ok(_) => {
-                        return Err(SnapshotAttemptError::Unstable(
-                            "inherited registry parent appeared while confirming its absence"
-                                .to_owned(),
-                        ));
-                    }
-                    Err(RegistrySnapshotError::Missing) => {
-                        let (fresh_root, fresh_suffix) =
-                            kio_core::private_fs::resolve_inherited_private_root(path)
-                                .map_err(|error| {
-                                    SnapshotAttemptError::Unsafe(format!(
-                                        "re-resolve inherited registry directory capability: {error}"
-                                    ))
-                                })?
-                                .ok_or_else(|| {
-                                    SnapshotAttemptError::Unstable(
-                                        "inherited registry root disappeared while confirming absence"
-                                            .to_owned(),
-                                    )
-                                })?;
-                        if fresh_suffix != suffix || !same_inherited_root(&root, &fresh_root)? {
-                            return Err(SnapshotAttemptError::Unsafe(
-                                "inherited registry root changed while confirming absence"
-                                    .to_owned(),
-                            ));
-                        }
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(registry_parent_binding_error(error)),
-                }
-            }
-            Err(error) => return Err(registry_parent_binding_error(error)),
-        }
-    }
-    match registry_parent_and_leaf(path) {
-        Ok(binding) => Ok(Some(binding)),
-        Err(RegistrySnapshotError::Missing) => match registry_parent_and_leaf(path) {
-            Err(RegistrySnapshotError::Missing) => Ok(None),
-            Ok(_) => Err(SnapshotAttemptError::Unstable(
-                "scope registry parent appeared while confirming its absence".to_owned(),
-            )),
-            Err(error) => Err(registry_parent_binding_error(error)),
-        },
-        Err(error) => Err(registry_parent_binding_error(error)),
-    }
-}
-
-/// Freshly bind the canonical parent at the acceptance boundary and require it
-/// to be the same directory as the descriptor used to capture the snapshot.
-fn fresh_registry_parent_binding(
-    held: &RegistryParentBinding,
-) -> std::result::Result<std::sync::Arc<fs::File>, SnapshotAttemptError> {
-    let canonical_path = held.parent_path.join(&held.leaf);
-    let fresh = match registry_parent_and_leaf(&canonical_path) {
-        Ok(binding) => binding,
-        Err(RegistrySnapshotError::Missing) => {
-            return Err(SnapshotAttemptError::Unstable(
-                "scope registry canonical parent disappeared while snapshotting".to_owned(),
-            ));
-        }
-        Err(error) => return Err(registry_parent_binding_error(error)),
-    };
-    if fresh.leaf != held.leaf || fresh.parent_path != held.parent_path {
-        return Err(SnapshotAttemptError::Unsafe(
-            "scope registry canonical parent rebound to an unexpected path".to_owned(),
-        ));
-    }
-    #[cfg(target_os = "linux")]
-    match (&held.inherited_root, &fresh.inherited_root) {
-        (Some(held_root), Some(fresh_root)) => {
-            if !same_inherited_root(held_root, fresh_root)? {
-                return Err(SnapshotAttemptError::Unsafe(
-                    "inherited registry root changed while snapshotting".to_owned(),
-                ));
-            }
-        }
-        (None, None) => {}
-        _ => {
-            return Err(SnapshotAttemptError::Unsafe(
-                "registry binding changed inherited-root mode while snapshotting".to_owned(),
-            ));
-        }
-    }
-    let held_metadata = cap_fs::Metadata::from_file(held.parent.as_ref()).map_err(|error| {
-        SnapshotAttemptError::Unstable(format!("inspect retained registry parent: {error}"))
-    })?;
-    let fresh_metadata = cap_fs::Metadata::from_file(fresh.parent.as_ref()).map_err(|error| {
-        SnapshotAttemptError::Unstable(format!("inspect freshly bound registry parent: {error}"))
-    })?;
-    let held_identity = leaf_identity(&held_metadata).ok_or_else(|| {
-        SnapshotAttemptError::Unsafe(
-            "retained registry parent has no usable identity while snapshotting".to_owned(),
-        )
-    })?;
-    let fresh_identity = leaf_identity(&fresh_metadata).ok_or_else(|| {
-        SnapshotAttemptError::Unsafe(
-            "freshly bound registry parent has no usable identity while snapshotting".to_owned(),
-        )
-    })?;
-    if held_identity != fresh_identity {
-        return Err(SnapshotAttemptError::Unsafe(
-            "scope registry canonical parent identity changed while snapshotting".to_owned(),
-        ));
-    }
-    Ok(fresh.parent)
-}
-
-#[cfg(target_os = "linux")]
-fn same_inherited_root(
-    held: &kio_core::store_dir::StoreDirectory,
-    fresh: &kio_core::store_dir::StoreDirectory,
-) -> std::result::Result<bool, SnapshotAttemptError> {
-    let held_metadata =
-        cap_fs::Metadata::from_file(held.root_handle().as_ref()).map_err(|error| {
-            SnapshotAttemptError::Unstable(format!(
-                "inspect retained inherited registry root: {error}"
-            ))
-        })?;
-    let fresh_metadata =
-        cap_fs::Metadata::from_file(fresh.root_handle().as_ref()).map_err(|error| {
-            SnapshotAttemptError::Unstable(format!(
-                "inspect fresh inherited registry root: {error}"
-            ))
-        })?;
-    Ok(leaf_identity(&held_metadata) == leaf_identity(&fresh_metadata))
-}
-
-#[cfg(windows)]
-fn verify_windows_directory_binding(
-    path: &Path,
-    opened: &fs::File,
-    label: &str,
-) -> std::result::Result<(), RegistrySnapshotError> {
-    let path_identity = kio_core::platform::real_directory_identity(path).map_err(|error| {
-        RegistrySnapshotError::UnstableBusy(format!(
-            "inspect Windows registry parent component {label}: {error}"
-        ))
-    })?;
-    let handle_identity = kio_core::platform::directory_handle_identity(opened);
-    if path_identity.is_none() || path_identity != handle_identity {
-        return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-            "Windows registry parent component is a reparse point or changed while opening: {label}"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(windows)]
-fn verify_windows_regular_binding(
-    path: &Path,
-    opened: &fs::File,
-    label: &str,
-) -> std::result::Result<(), SnapshotAttemptError> {
-    let path_identity = kio_core::platform::real_regular_file_identity(path).map_err(|error| {
-        SnapshotAttemptError::Unstable(format!("inspect Windows registry {label}: {error}"))
-    })?;
-    let handle_identity = kio_core::platform::regular_file_handle_identity(opened);
-    if path_identity.is_none() || handle_identity.is_none() {
-        return Err(SnapshotAttemptError::Unsafe(format!(
-            "Windows registry {label} is a reparse point or has no usable identity"
-        )));
-    }
-    if path_identity != handle_identity {
-        return Err(SnapshotAttemptError::Unstable(format!(
-            "Windows registry {label} changed while opening"
-        )));
-    }
-    Ok(())
-}
-
-#[cfg(not(windows))]
-fn normalized_absolute_registry_path(
-    path: &Path,
-) -> std::result::Result<PathBuf, RegistrySnapshotError> {
-    if !path.is_absolute() {
-        return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-            "scope registry path must be absolute: {}",
-            path.display()
-        )));
-    }
-    let mut normalized = PathBuf::from("/");
-    for component in path.components() {
-        match component {
-            Component::RootDir => {}
-            Component::Normal(name) => {
-                #[cfg(target_os = "macos")]
-                if normalized == Path::new("/") && name == "var" {
-                    normalized.push("private");
-                    normalized.push("var");
-                } else {
-                    normalized.push(name);
-                }
-                #[cfg(not(target_os = "macos"))]
-                normalized.push(name);
-            }
-            Component::CurDir | Component::ParentDir => {
-                return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-                    "scope registry path is not normalized: {}",
-                    path.display()
-                )));
-            }
-            Component::Prefix(_) => {
-                return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-                    "scope registry path prefix is unsupported: {}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    Ok(normalized)
-}
-
-#[cfg(windows)]
-fn normalized_absolute_registry_path(
-    path: &Path,
-) -> std::result::Result<PathBuf, RegistrySnapshotError> {
-    use std::os::windows::ffi::OsStrExt;
-    use std::path::Prefix;
-
-    let mut components = path.components();
-    let Some(Component::Prefix(prefix)) = components.next() else {
-        return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-            "scope registry path must use an absolute drive or UNC path: {}",
-            path.display()
-        )));
-    };
-    let verbatim_disk = matches!(prefix.kind(), Prefix::VerbatimDisk(_));
-    if !matches!(
-        prefix.kind(),
-        Prefix::Disk(_) | Prefix::UNC(_, _) | Prefix::VerbatimDisk(_)
-    ) || !matches!(components.next(), Some(Component::RootDir))
-    {
-        return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-            "scope registry path must use a normalized absolute drive or UNC path: {}",
-            path.display()
-        )));
-    }
-    let mut normalized = PathBuf::from(prefix.as_os_str());
-    normalized.push("\\");
-    for component in components {
-        match component {
-            Component::Normal(name) => {
-                // Canonical Windows drive paths retain their verbatim prefix.
-                // That namespace only treats backslashes as separators; do
-                // not pass a disguised slash separator to the parent walk.
-                if verbatim_disk && name.encode_wide().any(|unit| unit == b'/' as u16) {
-                    return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-                        "scope registry verbatim drive path contains a slash: {}",
-                        path.display()
-                    )));
-                }
-                normalized.push(name);
-            }
-            Component::CurDir
-            | Component::ParentDir
-            | Component::RootDir
-            | Component::Prefix(_) => {
-                return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-                    "scope registry path is not normalized: {}",
-                    path.display()
-                )));
-            }
-        }
-    }
-    Ok(normalized)
-}
-
-fn registry_filesystem_root(path: &Path) -> std::result::Result<PathBuf, RegistrySnapshotError> {
-    #[cfg(windows)]
-    {
-        let mut components = path.components();
-        use std::path::Prefix;
-        let Some(Component::Prefix(prefix)) = components.next() else {
-            return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-                "scope registry path must have an absolute Windows volume/share root: {}",
-                path.display()
-            )));
-        };
-        if !matches!(
-            prefix.kind(),
-            Prefix::Disk(_) | Prefix::UNC(_, _) | Prefix::VerbatimDisk(_)
-        ) || !matches!(components.next(), Some(Component::RootDir))
-        {
-            return Err(RegistrySnapshotError::UnsafeIntegrity(format!(
-                "scope registry path must be absolute on Windows: {}",
-                path.display()
-            )));
-        }
-        let mut root = PathBuf::from(prefix.as_os_str());
-        root.push("\\");
-        Ok(root)
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = path;
-        Ok(PathBuf::from("/"))
-    }
-}
-
-fn validate_directory(
+pub(crate) fn validate_directory(
     metadata: &cap_fs::Metadata,
     label: &str,
 ) -> std::result::Result<(), RegistrySnapshotError> {
@@ -1109,194 +256,12 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn run_parent_component_hook(index: usize) {
+pub(crate) fn run_parent_component_hook(index: usize) {
     PARENT_COMPONENT_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow().as_ref() {
             hook(index);
         }
     });
-}
-
-fn leaf_identity(metadata: &cap_fs::Metadata) -> Option<FileIdentity> {
-    #[cfg(unix)]
-    {
-        use cap_fs::MetadataExt;
-        Some(FileIdentity {
-            dev: metadata.dev(),
-            ino: metadata.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        Some(FileIdentity {
-            volume_serial_number: metadata.volume_serial_number()?,
-            file_index: metadata.file_index()?,
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Some(FileIdentity)
-    }
-}
-
-fn validate_regular(
-    metadata: &cap_fs::Metadata,
-    label: &str,
-) -> std::result::Result<(), SnapshotAttemptError> {
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(SnapshotAttemptError::Unsafe(format!(
-            "scope registry {label} must be a regular non-symlink file"
-        )));
-    }
-    if metadata.len() > MAX_REGISTRY_LEAF_BYTES {
-        return Err(SnapshotAttemptError::Unsafe(format!(
-            "scope registry {label} exceeds {} byte limit",
-            MAX_REGISTRY_LEAF_BYTES
-        )));
-    }
-    #[cfg(unix)]
-    {
-        use cap_fs::MetadataExt;
-        if metadata.nlink() != 1 {
-            return Err(SnapshotAttemptError::Unsafe(format!(
-                "scope registry {label} must have exactly one hard link"
-            )));
-        }
-    }
-    #[cfg(windows)]
-    {
-        use cap_fs::_WindowsByHandle;
-        if metadata.number_of_links() != Some(1) {
-            return Err(SnapshotAttemptError::Unsafe(format!(
-                "scope registry {label} must have exactly one hard link"
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn observe_leaf(
-    parent: &fs::File,
-    parent_path: &Path,
-    name: &str,
-    copy_to: Option<(&PrivateSnapshotStorage, &str)>,
-    #[cfg(test)] hook: Option<&SnapshotTestHook>,
-    #[cfg(test)] attempt: usize,
-) -> std::result::Result<LeafObservation, SnapshotAttemptError> {
-    #[cfg(not(windows))]
-    let _ = parent_path;
-    let before = match cap_fs::stat(parent, Path::new(name), cap_fs::FollowSymlinks::No) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(LeafObservation::Absent);
-        }
-        Err(error) => {
-            return Err(SnapshotAttemptError::Unstable(format!(
-                "stat scope registry {name}: {error}"
-            )));
-        }
-    };
-    validate_regular(&before, name)?;
-    #[cfg(test)]
-    if let Some(hook) = hook {
-        hook(
-            SnapshotTestPhase::BeforeSourceLeafOpen,
-            attempt,
-            Some(&parent_path.join(name)),
-        );
-    }
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut input = cap_fs::open(parent, Path::new(name), &options).map_err(|error| {
-        SnapshotAttemptError::Unstable(format!("open scope registry {name}: {error}"))
-    })?;
-    let opened = cap_fs::Metadata::from_file(&input).map_err(|error| {
-        SnapshotAttemptError::Unstable(format!("inspect opened registry {name}: {error}"))
-    })?;
-    validate_regular(&opened, name)?;
-    #[cfg(windows)]
-    verify_windows_regular_binding(&parent_path.join(name), &input, name)?;
-    let before_identity = leaf_identity(&before).ok_or_else(|| {
-        SnapshotAttemptError::Unsafe(format!("scope registry {name} has no usable identity"))
-    })?;
-    let opened_identity = leaf_identity(&opened).ok_or_else(|| {
-        SnapshotAttemptError::Unsafe(format!(
-            "opened scope registry {name} has no usable identity"
-        ))
-    })?;
-    if before_identity != opened_identity || before.len() != opened.len() {
-        return Err(SnapshotAttemptError::Unstable(format!(
-            "scope registry {name} changed while opening"
-        )));
-    }
-
-    let mut output = match copy_to {
-        Some((storage, basename)) => Some(storage.create_file(basename)?),
-        None => None,
-    };
-    let mut hash = Sha256::new();
-    let mut total = 0u64;
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let read = input.read(&mut buf).map_err(|error| {
-            SnapshotAttemptError::Unstable(format!("read scope registry {name}: {error}"))
-        })?;
-        if read == 0 {
-            break;
-        }
-        total = total.checked_add(read as u64).ok_or_else(|| {
-            SnapshotAttemptError::Unsafe(format!("scope registry {name} size overflow"))
-        })?;
-        if total > MAX_REGISTRY_LEAF_BYTES {
-            return Err(SnapshotAttemptError::Unsafe(format!(
-                "scope registry {name} exceeded byte limit while reading"
-            )));
-        }
-        hash.update(&buf[..read]);
-        if let Some(output) = output.as_mut() {
-            output.write_all(&buf[..read]).map_err(|error| {
-                SnapshotAttemptError::Unstable(format!("write registry snapshot {name}: {error}"))
-            })?;
-        }
-    }
-    if let Some(output) = output.as_mut() {
-        output.flush().map_err(|error| {
-            SnapshotAttemptError::Unstable(format!("flush registry snapshot {name}: {error}"))
-        })?;
-    }
-    #[cfg(test)]
-    if let Some(hook) = hook {
-        hook(
-            SnapshotTestPhase::BeforeSourceLeafRestat,
-            attempt,
-            Some(&parent_path.join(name)),
-        );
-    }
-    let after =
-        cap_fs::stat(parent, Path::new(name), cap_fs::FollowSymlinks::No).map_err(|error| {
-            SnapshotAttemptError::Unstable(format!("restat scope registry {name}: {error}"))
-        })?;
-    validate_regular(&after, name)?;
-    #[cfg(windows)]
-    verify_windows_regular_binding(&parent_path.join(name), &input, name)?;
-    let after_identity = leaf_identity(&after).ok_or_else(|| {
-        SnapshotAttemptError::Unsafe(format!(
-            "reinspected scope registry {name} has no usable identity"
-        ))
-    })?;
-    if opened_identity != after_identity || opened.len() != after.len() || total != opened.len() {
-        return Err(SnapshotAttemptError::Unstable(format!(
-            "scope registry {name} changed while reading"
-        )));
-    }
-    Ok(LeafObservation::Present(FileObservation {
-        identity: opened_identity,
-        bytes: total,
-        sha256: hash.finalize().into(),
-    }))
 }
 
 fn observe_manifest(
@@ -1666,24 +631,7 @@ fn snapshot_attempt(
         }
         Err(error) => return Err(error),
     };
-    let private_dir = {
-        #[cfg(windows)]
-        {
-            storage.as_windows()?.capability().map_err(|error| {
-                SnapshotAttemptError::Unstable(format!(
-                    "clone owner-private registry snapshot capability: {error}"
-                ))
-            })?
-        }
-        #[cfg(not(windows))]
-        cap_fs::open_ambient_dir(storage.path(), cap_primitives::ambient_authority()).map_err(
-            |error| {
-                SnapshotAttemptError::Unstable(format!(
-                    "open private registry snapshot directory capability: {error}"
-                ))
-            },
-        )?
-    };
+    let private_dir = storage.capability()?;
     let private_initial = verify_private_snapshot_before_sqlite(&private_dir, &initial)?;
     #[cfg(test)]
     if let Some(hook) = hook {
@@ -1901,34 +849,7 @@ impl RegistryDb {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        #[cfg(target_os = "linux")]
-        let inherited = inherited_registry_parent(path.as_ref())?;
-        #[cfg(windows)]
-        let inherited = Some(windows_registry_writer_parent(path.as_ref())?);
-        #[cfg(not(any(target_os = "linux", windows)))]
-        let inherited: Option<(PathBuf, kio_core::store_dir::StoreDirectory)> = None;
-
-        let (sqlite_path, inherited_parent) = if let Some((sqlite_path, parent)) = inherited {
-            (sqlite_path, Some(parent))
-        } else {
-            #[cfg(not(windows))]
-            if let Some(parent) = path.as_ref().parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|err| crate::IndexError::Schema(err.to_string()))?;
-                // P2: the device data dir (`~/.local/share/kio`) that holds this
-                // registry, the cost ledger, logs and the open-cache carries usage
-                // patterns and the scope map — restrict it to the owner (0700) so a
-                // multi-user host cannot read another user's data. Best-effort (the
-                // registry is a recoverable cache); no-op on non-unix.
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    let _ =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-                }
-            }
-            (path.as_ref().to_path_buf(), None)
-        };
+        let (sqlite_path, inherited_parent) = prepare_registry_writer(path.as_ref())?;
         let conn = Connection::open(sqlite_path)?;
         // P6 (05 §1.8 / docs/05:565): serialize concurrent writers with WAL +
         // busy_timeout so a parallel `kio init`/`index` upsert waits (up to 5s)
@@ -2573,12 +1494,17 @@ mod tests {
     #[test]
     fn macos_registry_path_normalization_only_rewrites_var_alias() {
         assert_eq!(
-            normalized_absolute_registry_path(Path::new("/var/folders/kio/scope-registry.sqlite"))
-                .unwrap(),
+            crate::platform::normalized_absolute_registry_path(Path::new(
+                "/var/folders/kio/scope-registry.sqlite"
+            ))
+            .unwrap(),
             PathBuf::from("/private/var/folders/kio/scope-registry.sqlite")
         );
         assert_eq!(
-            normalized_absolute_registry_path(Path::new("/tmp/kio/scope-registry.sqlite")).unwrap(),
+            crate::platform::normalized_absolute_registry_path(Path::new(
+                "/tmp/kio/scope-registry.sqlite"
+            ))
+            .unwrap(),
             PathBuf::from("/tmp/kio/scope-registry.sqlite")
         );
     }
@@ -2626,7 +1552,7 @@ mod tests {
         fs::create_dir(&nested).unwrap();
         let path = nested.join("scope-registry.sqlite");
         let moved = dir.path().join("moved");
-        let final_index = normalized_absolute_registry_path(&path)
+        let final_index = crate::platform::normalized_absolute_registry_path(&path)
             .unwrap()
             .parent()
             .unwrap()
@@ -2852,8 +1778,10 @@ mod tests {
         let writer = RegistryDb::open(&path).unwrap();
         writer.upsert(&expected).unwrap();
         drop(writer);
-        let shm = normalized_absolute_registry_path(&dir.path().join("scope-registry.sqlite-shm"))
-            .unwrap();
+        let shm = crate::platform::normalized_absolute_registry_path(
+            &dir.path().join("scope-registry.sqlite-shm"),
+        )
+        .unwrap();
         fs::write(&shm, b"initial").unwrap();
 
         let rotations = std::sync::Arc::new(AtomicUsize::new(0));
@@ -3236,11 +2164,14 @@ mod tests {
                 r"\\server\share\",
             ),
         ] {
-            let normalized = normalized_absolute_registry_path(Path::new(accepted))
-                .unwrap_or_else(|error| panic!("{accepted}: {error}"));
+            let normalized =
+                crate::platform::normalized_absolute_registry_path(Path::new(accepted))
+                    .unwrap_or_else(|error| panic!("{accepted}: {error}"));
             assert_eq!(normalized.as_os_str(), Path::new(accepted).as_os_str());
             assert_eq!(
-                registry_filesystem_root(&normalized).unwrap().as_os_str(),
+                crate::platform::registry_filesystem_root(&normalized)
+                    .unwrap()
+                    .as_os_str(),
                 Path::new(expected_root).as_os_str(),
                 "{accepted}"
             );
@@ -3262,7 +2193,7 @@ mod tests {
             r"\\.\C:\kio\scope-registry.sqlite",
         ] {
             assert!(
-                normalized_absolute_registry_path(Path::new(rejected)).is_err(),
+                crate::platform::normalized_absolute_registry_path(Path::new(rejected)).is_err(),
                 "{rejected}"
             );
         }
@@ -3284,13 +2215,13 @@ mod tests {
                 if matches!(prefix.kind(), std::path::Prefix::VerbatimDisk(_))
         ));
         assert_eq!(
-            normalized_absolute_registry_path(&canonical)
+            crate::platform::normalized_absolute_registry_path(&canonical)
                 .unwrap()
                 .as_os_str(),
             canonical.as_os_str(),
             "canonical source path must retain its exact namespace"
         );
-        let binding = registry_parent_and_leaf(&canonical).unwrap();
+        let binding = crate::platform::registry_parent_and_leaf(&canonical).unwrap();
         assert_eq!(binding.parent_path, canonical.parent().unwrap());
         drop(binding);
         let before = snapshot_registry(&path);
