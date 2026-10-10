@@ -9,6 +9,8 @@ pub trait Interaction: Send + Sync {
     fn read_input(&self, max_bytes: usize) -> Result<Vec<u8>>;
     fn is_interactive(&self) -> bool;
     fn diagnostic(&self, message: &str);
+    fn write_diagnostic(&self, text: &str) -> Result<()>;
+    fn flush_diagnostics(&self) -> Result<()>;
 }
 
 #[derive(Clone)]

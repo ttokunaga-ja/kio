@@ -105,14 +105,26 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
         };
         // There is deliberately no scope SQLite DB or vector projection here:
         // releasing a completed operational cleanup must not depend on either.
-        super::recover_terminal_embedding_batch_cleanup(&ledger, &client, "scope").unwrap();
+        super::recover_terminal_embedding_batch_cleanup(
+            &crate::context::test_support::context(std::path::Path::new(".")),
+            &ledger,
+            &client,
+            "scope",
+        )
+        .unwrap();
         let after = get_batch_request(&ledger, &key).unwrap().unwrap();
         if case == "terminal" {
             assert!(after.intent_token.is_none());
             let mut expected = before.clone();
             expected.intent_token = None;
             assert_eq!(after, expected);
-            super::recover_terminal_embedding_batch_cleanup(&ledger, &client, "scope").unwrap();
+            super::recover_terminal_embedding_batch_cleanup(
+                &crate::context::test_support::context(std::path::Path::new(".")),
+                &ledger,
+                &client,
+                "scope",
+            )
+            .unwrap();
             assert_eq!(client.polls.get(), 1, "cleaned rows must not poll again");
         } else {
             assert_eq!(after, before, "{case} must remain pending");

@@ -3,6 +3,7 @@
 //! runs the same local index operation as the interactive command.
 
 use std::fs::TryLockError;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -253,10 +254,10 @@ impl Reconcile for LocalReconciler {
             // Keep the durable queue retry semantics, while making a partial
             // index result diagnosable without copying its potentially large
             // child-scope rows into watcher output or device state.
-            eprintln!(
+            Unattended.diagnostic(&format!(
                 "watch reconciliation incomplete: {}",
                 incomplete_output_reason(&output)
-            );
+            ));
             return Ok(ReconcileCompletion::Incomplete);
         }
         Ok(ReconcileCompletion::Complete)
@@ -304,6 +305,18 @@ impl Interaction for Unattended {
     }
     fn diagnostic(&self, message: &str) {
         eprintln!("{message}");
+    }
+    fn write_diagnostic(&self, text: &str) -> Result<()> {
+        std::io::stderr()
+            .lock()
+            .write_all(text.as_bytes())
+            .map_err(|error| KioError::io(error.to_string(), "stderr"))
+    }
+    fn flush_diagnostics(&self) -> Result<()> {
+        std::io::stderr()
+            .lock()
+            .flush()
+            .map_err(|error| KioError::io(error.to_string(), "stderr"))
     }
 }
 

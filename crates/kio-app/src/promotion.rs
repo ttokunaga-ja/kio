@@ -5,6 +5,8 @@
 //! reference and verifies that the manifest and every unit form one complete,
 //! immutable identity before the CLI is allowed to bind that identity into HEAD.
 
+use crate::context::AppContext;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -522,7 +524,10 @@ pub(super) fn apply_online_promotion_to_index(
 /// Publish one deterministic promotion commit for all accepted outputs completed
 /// by a batch pass. The repository primitive changes only matching HEAD bindings;
 /// unrelated deferred working-tree edits are never captured.
-pub(super) fn promote_completed_online_markdownize(repo: &Repository) -> kio_core::Result<bool> {
+pub(super) fn promote_completed_online_markdownize(
+    ctx: &AppContext,
+    repo: &Repository,
+) -> kio_core::Result<bool> {
     let Some(plan) = plan_online_markdownize_promotion(repo)? else {
         return Ok(false);
     };
@@ -553,7 +558,7 @@ pub(super) fn promote_completed_online_markdownize(repo: &Repository) -> kio_cor
     // previous HEAD as if it were current.  `finish_pending_online_promotion`
     // publishes Ready again only after the source-index rebuild and complete
     // writer projection succeed.
-    mark_replica_rebuilding_or_log(repo.kio_dir(), commit_hash);
+    mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), commit_hash);
     state.target_head = Some(commit_hash.clone());
     persist_promotion_state(repo.kio_dir(), &state)?;
     publish_staged_tool_lock(repo.kio_dir(), &state)?;
@@ -623,8 +628,11 @@ pub(super) fn recover_pending_online_promotion(repo: &Repository) -> kio_core::R
     Ok(true)
 }
 
-pub(super) fn finish_pending_online_promotion(repo: &Repository) -> kio_core::Result<()> {
-    rebuild_step3_index(repo)?;
+pub(super) fn finish_pending_online_promotion(
+    ctx: &AppContext,
+    repo: &Repository,
+) -> kio_core::Result<()> {
+    rebuild_step3_index(ctx, repo)?;
     maybe_inject_promotion_fault("after_index_swap")?;
     clear_promotion_state(repo.kio_dir())
 }

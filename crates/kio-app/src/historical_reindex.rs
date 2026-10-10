@@ -349,7 +349,13 @@ pub(super) fn retained_history_instances_for_roots(
     retained_history_instances_from_graph(kio_dir, &graph)
 }
 
-pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool) -> Result<Value> {
+pub(super) fn run(
+    ctx: &AppContext,
+    repo: &Repository,
+    operand: &str,
+    online: bool,
+    offline: bool,
+) -> Result<Value> {
     ensure_no_visible_purge_journal(repo.kio_dir())?;
     let head_before = repo
         .head_commit_hash()?
@@ -645,6 +651,7 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
         })
         .collect::<Vec<_>>();
     project_selected_snapshot(
+        ctx,
         repo,
         &selected_commit,
         &tree_entries,
@@ -659,6 +666,7 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
     // `--yes`/`--approve`-equivalent confirming flag.
     let embedding_online = embedding_online_allowed(repo, offline, online, false)?;
     let enrichment = run_historical_embedding_enrichment(
+        ctx,
         repo,
         embedding_online,
         &selected_instances,
@@ -782,6 +790,7 @@ fn reindex_history_limit_error(exceeded: &str, attempted: u64, limit: u64) -> Ki
 /// exact tree projection. Rebuilding the whole ledger would be observable work on
 /// non-selected history; this narrow transaction is the enrichment-only boundary.
 fn project_selected_snapshot(
+    ctx: &AppContext,
     repo: &Repository,
     selected_commit: &str,
     tree_entries: &[TreeEntryRow],
@@ -936,7 +945,11 @@ fn project_selected_snapshot(
             // readily as it adds new ones.
             drop(fts);
             crate::rotate_index_generation_unconditionally(repo.kio_dir())?;
-            crate::write_through_projection_or_log_for_at_snapshot(repo.kio_dir(), selected_commit);
+            crate::write_through_projection_or_log_for_at_snapshot(
+                ctx,
+                repo.kio_dir(),
+                selected_commit,
+            );
             Ok(())
         }
         Err(error) => {

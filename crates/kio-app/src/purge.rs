@@ -159,7 +159,7 @@ pub(crate) fn run(ctx: &AppContext, args: PurgeArgs) -> Result<Value> {
     }
     let preview = preflight(&repo, &args)?;
     confirm(ctx, &preview, args.yes)?;
-    execute_phase_machine(&repo, &args, &preview)
+    execute_phase_machine(ctx, &repo, &args, &preview)
 }
 
 /// The actor recorded on new journal/lifecycle records (05-runtime.md §3.5's
@@ -581,6 +581,7 @@ fn chunk_ledger_authentication_error(error: KioError) -> KioError {
 /// deterministic — the store lock has been held throughout) and publishes it
 /// for real, making it ref-reachable for the first time.
 fn execute_phase_machine(
+    ctx: &AppContext,
     repo: &Repository,
     args: &PurgeArgs,
     preview: &PurgePreview,
@@ -806,7 +807,7 @@ fn execute_phase_machine(
             // text the user asked to stop existing, so reporting success while
             // it is still readable under the cache root is not a degraded
             // result — it is a false one.
-            crate::write_through_projection(repo.kio_dir()).map_err(|reason| {
+            crate::write_through_projection(ctx, repo.kio_dir()).map_err(|reason| {
                 KioError::new(
                     "KIO-E-PURGE-REPLICA-001",
                     "purge removed the content but could not remove it from the \
@@ -2940,34 +2941,24 @@ fn confirm(ctx: &AppContext, preview: &PurgePreview, yes: bool) -> Result<()> {
         TombstoneMode::Default => "default tombstone",
         TombstoneMode::Erase => "fsck-only erase receipt",
     };
-    let mut stderr = std::io::stderr().lock();
-    writeln!(
-        stderr,
-        "Purge preview: {} raw object(s); reason={}; terminal={mode}.",
+    ctx.interaction.write_diagnostic(&format!(
+        "Purge preview: {} raw object(s); reason={}; terminal={mode}.\n",
         preview.plan.target_raw_hashes.len(),
         preview.plan.reason
-    )
-    .map_err(|error| KioError::io(error.to_string(), "stderr"))?;
+    ))?;
     if preview.completed.is_some() {
-        writeln!(stderr, "This exact purge is already complete.")
-            .map_err(|error| KioError::io(error.to_string(), "stderr"))?;
+        ctx.interaction
+            .write_diagnostic("This exact purge is already complete.\n")?;
     }
     if preview.working_tree_alias_count > 0 {
-        writeln!(
-            stderr,
-            "{}",
+        ctx.interaction.write_diagnostic(&format!(
+            "{}\n",
             working_tree_warning_text(preview.working_tree_alias_count)
-        )
-        .map_err(|error| KioError::io(error.to_string(), "stderr"))?;
+        ))?;
     }
-    write!(
-        stderr,
-        "Remove this content from KIO-managed history? [y/N] "
-    )
-    .map_err(|error| KioError::io(error.to_string(), "stderr"))?;
-    stderr
-        .flush()
-        .map_err(|error| KioError::io(error.to_string(), "stderr"))?;
+    ctx.interaction
+        .write_diagnostic("Remove this content from KIO-managed history? [y/N] ")?;
+    ctx.interaction.flush_diagnostics()?;
 
     // Bound confirmation input so a hostile pipe cannot force an unbounded
     // allocation. Inputs longer than 32 bytes simply fail the exact y/yes check.
@@ -3158,3 +3149,7 @@ mod windows_tests {
         std::fs::remove_dir(&junction).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "purge/diagnostic_tests.rs"]
+mod diagnostic_tests;

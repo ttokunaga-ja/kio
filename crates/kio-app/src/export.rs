@@ -130,7 +130,7 @@ pub(super) fn run(ctx: &AppContext, args: ExportArgs) -> Result<Value> {
     // Re-run the complete leaf check before staging any content.
     let preflight_files = preflight_in_dir(&source, &destination_dir, args.force)?;
     let staged = stage_all(&source, preflight_files, &destination_dir)?;
-    publish_all(&source, &destination_dir, staged, &checkpoint)
+    publish_all(ctx, &source, &destination_dir, staged, &checkpoint)
 }
 
 fn resolve_source(ctx: &AppContext, operand: &str) -> Result<ExportSource> {
@@ -146,8 +146,12 @@ fn resolve_source(ctx: &AppContext, operand: &str) -> Result<ExportSource> {
 fn resolve_evidence_source(ctx: &AppContext, operand: &str) -> Result<ExportSource> {
     let text = read_pointer_operand(ctx, operand)?;
     let pointer = super::parse_pointer_text(&text)?;
-    let target =
-        super::resolve_scope_target(ctx.cwd(), &pointer.scope_id, pointer.scope_path.as_deref())?;
+    let target = super::resolve_scope_target(
+        ctx.cwd(),
+        ctx.interaction.as_ref(),
+        &pointer.scope_id,
+        pointer.scope_path.as_deref(),
+    )?;
     let repo = Repository::open(&target.repo_root)?;
     super::validate_repo_tool_lock(&repo)?;
 
@@ -1467,6 +1471,7 @@ fn create_private_temp(destination: &DestinationDir) -> Result<(OsString, File)>
 }
 
 fn publish_all(
+    ctx: &AppContext,
     source: &ExportSource,
     destination: &DestinationDir,
     staged: Vec<StagedFile>,
@@ -1500,7 +1505,7 @@ fn publish_all(
                 error,
             ));
         }
-        match publish_one(destination, &file) {
+        match publish_one(ctx, destination, &file) {
             Ok(backup) => {
                 // PA24 (§E, U26): rename completed — re-resolve the target
                 // raw's canonical state one more time (a second, independent
@@ -1522,6 +1527,7 @@ fn publish_all(
                     .and_then(|()| checkpoint.recheck())
                 {
                     let error = rollback_published_file(
+                        ctx,
                         destination,
                         &file.preflight,
                         backup.as_deref(),
@@ -1595,6 +1601,7 @@ fn publish_all(
 type PublishSuccess = Option<String>;
 
 fn publish_one(
+    ctx: &AppContext,
     destination: &DestinationDir,
     file: &StagedFile,
 ) -> std::result::Result<PublishSuccess, (KioError, bool)> {
@@ -1643,10 +1650,10 @@ fn publish_one(
             }
             Err(MoveOutcome::Io(error)) => return Err((error, false)),
         }
-        eprintln!(
+        ctx.interaction.diagnostic(&format!(
             "export: evacuated existing '{}' to '{bak_name}'",
             file.preflight.source.path_at_commit
-        );
+        ));
         backup_name_opt = Some(bak_name);
     }
     // PA23: no-replace publish (uniform for both branches now — overwrite
@@ -1716,6 +1723,7 @@ fn publish_one(
 /// (best-effort) and reported as a fresh conflict instead of the original
 /// recheck failure.
 fn rollback_published_file(
+    ctx: &AppContext,
     destination: &DestinationDir,
     preflight: &PreflightFile,
     backup: Option<&str>,
@@ -1766,11 +1774,11 @@ fn rollback_published_file(
             &preflight.destination,
         );
     }
-    eprintln!(
+    ctx.interaction.diagnostic(&format!(
         "export: rolled back publish of '{}' via quarantine '{quarantine}' ({})",
         preflight.source.path_at_commit,
         recheck_error.error_code()
-    );
+    ));
     let _ = cap_fs::remove_file(&destination.handle, Path::new(&quarantine));
     if let Some(bak_name) = backup
         && let Err(error) =
@@ -2074,6 +2082,12 @@ mod tests {
                 false
             }
             fn diagnostic(&self, _: &str) {}
+            fn write_diagnostic(&self, _: &str) -> kio_core::Result<()> {
+                Ok(())
+            }
+            fn flush_diagnostics(&self) -> kio_core::Result<()> {
+                Ok(())
+            }
         }
         let directory = tempfile::tempdir().unwrap();
         let context = crate::context::AppContext {

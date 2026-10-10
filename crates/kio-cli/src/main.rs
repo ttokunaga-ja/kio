@@ -1,7 +1,7 @@
 mod args;
 mod release_binding;
 
-use std::io::{BufRead, IsTerminal, Read};
+use std::io::{BufRead, IsTerminal, Read, Write};
 use std::process;
 use std::sync::Arc;
 
@@ -76,6 +76,18 @@ impl Interaction for TerminalInteraction {
     }
     fn diagnostic(&self, message: &str) {
         eprintln!("{message}");
+    }
+    fn write_diagnostic(&self, text: &str) -> Result<()> {
+        std::io::stderr()
+            .lock()
+            .write_all(text.as_bytes())
+            .map_err(|error| KioError::io(error.to_string(), "stderr"))
+    }
+    fn flush_diagnostics(&self) -> Result<()> {
+        std::io::stderr()
+            .lock()
+            .flush()
+            .map_err(|error| KioError::io(error.to_string(), "stderr"))
     }
 }
 

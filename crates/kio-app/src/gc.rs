@@ -5,7 +5,6 @@
 
 use crate::context::AppContext;
 
-use std::io::Write;
 use std::time::{Duration, Instant};
 
 use kio_core::gc::{
@@ -1322,19 +1321,13 @@ fn confirm<T: Serialize>(
             "kio gc requires --yes in JSON or non-interactive mode",
         ));
     }
-    let mut stderr = std::io::stderr().lock();
     let rendered = serde_json::to_string_pretty(preview)
         .map_err(|error| KioError::schema(error.to_string()))?;
-    writeln!(stderr, "GC shallow-sweep preview:\n{rendered}")
-        .map_err(|error| KioError::io(error.to_string(), "stderr"))?;
-    write!(
-        stderr,
-        "Create shallow receipts and remove planned tree objects? [y/N] "
-    )
-    .map_err(|error| KioError::io(error.to_string(), "stderr"))?;
-    stderr
-        .flush()
-        .map_err(|error| KioError::io(error.to_string(), "stderr"))?;
+    ctx.interaction
+        .write_diagnostic(&format!("GC shallow-sweep preview:\n{rendered}\n"))?;
+    ctx.interaction
+        .write_diagnostic("Create shallow receipts and remove planned tree objects? [y/N] ")?;
+    ctx.interaction.flush_diagnostics()?;
     if ctx
         .interaction
         .confirm("Create shallow receipts and remove planned tree objects? [y/N]")?
@@ -1458,3 +1451,7 @@ mod index_exchange_error_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "gc/diagnostic_tests.rs"]
+mod diagnostic_tests;

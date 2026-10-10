@@ -16,6 +16,12 @@ impl Interaction for Unattended {
         false
     }
     fn diagnostic(&self, _: &str) {}
+    fn write_diagnostic(&self, _: &str) -> kio_core::Result<()> {
+        Ok(())
+    }
+    fn flush_diagnostics(&self) -> kio_core::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn context(cwd: &Path) -> AppContext {

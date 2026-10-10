@@ -114,6 +114,7 @@ fn gemini_collection_requires_scope_profile_and_returned_job_attribution() {
             polls: Cell::new(0),
         };
         let poll = poll_attributed_embedding_batch_job(
+            &crate::context::test_support::context(std::path::Path::new(".")),
             &client,
             &row,
             Some(if case == "wrong_profile" {
@@ -566,7 +567,15 @@ fn credential_or_device_key_rotation_holds_existing_rows_without_provider_effect
             },
             polls: Cell::new(0),
         };
-        assert!(poll_attributed_embedding_batch_job(&gemini, &row, Some("profile")).is_none());
+        assert!(
+            poll_attributed_embedding_batch_job(
+                &crate::context::test_support::context(std::path::Path::new(".")),
+                &gemini,
+                &row,
+                Some("profile")
+            )
+            .is_none()
+        );
         assert_eq!(gemini.polls.get(), 0);
         assert_eq!(get_batch_request(&ledger, &row.key).unwrap().unwrap(), row);
     }

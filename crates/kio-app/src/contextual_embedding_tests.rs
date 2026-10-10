@@ -22,6 +22,12 @@ impl Interaction for QuietInteraction {
         false
     }
     fn diagnostic(&self, _: &str) {}
+    fn write_diagnostic(&self, _: &str) -> kio_core::Result<()> {
+        Ok(())
+    }
+    fn flush_diagnostics(&self) -> kio_core::Result<()> {
+        Ok(())
+    }
 }
 
 fn private_tempdir() -> crate::test_support::PrivateTempDir {

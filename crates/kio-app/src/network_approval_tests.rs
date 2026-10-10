@@ -90,6 +90,12 @@ impl Interaction for TestInteraction {
     }
 
     fn diagnostic(&self, _: &str) {}
+    fn write_diagnostic(&self, _: &str) -> kio_core::Result<()> {
+        Ok(())
+    }
+    fn flush_diagnostics(&self) -> kio_core::Result<()> {
+        Ok(())
+    }
 }
 
 impl Fixture {
