@@ -24,6 +24,7 @@ fn validate_handles(source: Option<&File>, target: &File) -> Result<()> {
 }
 pub(crate) fn replace_snapshot_state<D, R>(
     kio: &File,
+    control: &crate::control::ControlHandle,
     temporary: &str,
     bytes: &[u8],
     expected: &FileObservation,
@@ -40,11 +41,14 @@ where
     let (binding, recheck) = derive()?;
     let gc = ensure_child_dir(kio, "gc")?;
     let internal = ensure_child_dir(&gc, "internal")?;
-    let owner = directory(&ensure_child_dir(&internal, "snapshot-state-exchange")?)?;
-    let parent = directory(kio)?;
+    let owner = directory(
+        &ensure_child_dir(&internal, "snapshot-state-exchange")?,
+        control,
+    )?;
+    let parent = directory(kio, control)?;
     let target_state = parse_snapshot_auto_state(bytes)?;
     let authority = {
-        let source = match open_snapshot_source(kio, expected) {
+        let source = match open_snapshot_source(kio, expected, control) {
             Ok(source) => source,
             Err(error) => {
                 // Only this pre-journal CAS conflict may retire our prepared
@@ -53,7 +57,13 @@ where
                 if error.error_code() == "KIO-E-SNAPSHOT-STATE-CHANGED-001"
                     && !exchange::inspect_pending(&owner)?
                 {
-                    retire_snapshot_state_temporary(kio, temporary, bytes, temporary_observation)?;
+                    retire_snapshot_state_temporary(
+                        kio,
+                        temporary,
+                        bytes,
+                        temporary_observation,
+                        control,
+                    )?;
                 }
                 return Err(error);
             }
@@ -99,10 +109,11 @@ where
 }
 pub(crate) fn recover_snapshot_state(
     kio: &File,
+    control: &crate::control::ControlHandle,
     derive: impl Fn() -> Result<SnapshotExchangeAuthority>,
     admit: impl Fn() -> Result<()>,
 ) -> Result<()> {
-    if !has_pending_snapshot_state_exchange(kio)? {
+    if !has_pending_snapshot_state_exchange(kio, control)? {
         return Ok(());
     }
     let binding = derive()?;
@@ -112,8 +123,8 @@ pub(crate) fn recover_snapshot_state(
         .ok_or_else(|| corrupt("missing snapshot exchange internal parent"))?;
     let owner_file = open_optional_dir(&internal, "snapshot-state-exchange")?
         .ok_or_else(|| corrupt("missing snapshot exchange owner"))?;
-    let owner = directory(&owner_file)?;
-    let parent = directory(kio)?;
+    let owner = directory(&owner_file, control)?;
+    let parent = directory(kio, control)?;
     crate::platform::validate_pending_gc_exchange_authority(&owner, &binding.binding)?;
     // Atomic-only residue never explains an absent checkpoint: it represents
     // either unpublished intent boot or cleanup after exact source retirement.

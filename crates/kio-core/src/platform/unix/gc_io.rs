@@ -94,6 +94,7 @@ pub(crate) fn publish_staged(
     bytes: &[u8],
     max: u64,
     staged_checkpoint: impl FnOnce() -> Result<()>,
+    _control: &crate::control::ControlHandle,
 ) -> Result<()> {
     crate::gc::create_new_bound(from_dir, staged, bytes, max)?;
     staged_checkpoint()?;

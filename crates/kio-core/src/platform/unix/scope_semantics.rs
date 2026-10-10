@@ -8,6 +8,7 @@ pub(crate) fn normalize_repository_handles(
     scope: File,
     kio: File,
     _canonical_root: &Path,
+    _control: crate::control::ControlHandle,
 ) -> Result<(File, File)> {
     Ok((scope, kio))
 }

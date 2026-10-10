@@ -1,4 +1,4 @@
-use crate::context::{AppContext, EvidenceRegistry};
+use crate::context::EvidenceRegistry;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -14,7 +14,7 @@ use super::{
 };
 
 pub(super) fn run_evidence_batch(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     path: &Path,
     strict: bool,

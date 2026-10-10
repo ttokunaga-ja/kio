@@ -19,6 +19,7 @@
 //! recovered — `kio ledger reconcile` reported it `unlistable` and its
 //! reservation held the device budget cap forever.
 
+use kio_core::control::ControlHandle;
 use serde::Deserialize;
 
 use crate::Result;
@@ -126,12 +127,21 @@ pub const TEST_BATCH_INVENTORY_ENV: &str = "KIO_TEST_BATCH_INVENTORY";
 /// mapping is tested hermetically.
 pub fn configured_inventories(
     settings: &crate::tool_lock::AdapterRuntimeSettings,
+    recovery_context: impl FnMut() -> Result<crate::batch_recovery::BatchRecoveryContext>,
+) -> Result<Vec<ProviderInventory>> {
+    configured_inventories_with_control(settings, recovery_context, &ControlHandle::default())
+}
+
+/// Inventory providers using the invocation's immutable debug snapshot.
+pub fn configured_inventories_with_control(
+    settings: &crate::tool_lock::AdapterRuntimeSettings,
     mut recovery_context: impl FnMut() -> Result<crate::batch_recovery::BatchRecoveryContext>,
+    control: &ControlHandle,
 ) -> Result<Vec<ProviderInventory>> {
     #[cfg(debug_assertions)]
-    if let Some(fixture_path) = crate::debug_test_control().adapters.batch_inventory {
+    if let Some(fixture_path) = &control.debug().adapters.batch_inventory {
         let text =
-            std::fs::read_to_string(&fixture_path).map_err(|err| crate::AdapterError::Io {
+            std::fs::read_to_string(fixture_path).map_err(|err| crate::AdapterError::Io {
                 path: fixture_path.display().to_string(),
                 message: err.to_string(),
             })?;
@@ -140,16 +150,20 @@ pub fn configured_inventories(
         });
     }
     let mut inventories = Vec::new();
-    if let Some(client) =
-        crate::batch_client::configured_mistral_batch_client(settings, &mut recovery_context)?
-    {
+    if let Some(client) = crate::batch_client::configured_mistral_batch_client_with_control(
+        settings,
+        &mut recovery_context,
+        control,
+    )? {
         inventories.push(inventory_from_client(client.as_ref())?);
     }
     // G1: the embedding lane's provider. Unconfigured = contributes nothing,
     // exactly as the Mistral arm does.
-    if let Some(client) =
-        crate::gemini_batch_client::resolve_gemini_batch_client(settings, &mut recovery_context)?
-    {
+    if let Some(client) = crate::gemini_batch_client::resolve_gemini_batch_client_with_control(
+        settings,
+        &mut recovery_context,
+        control,
+    )? {
         inventories.push(gemini_inventory_from_client(client.as_ref())?);
     }
     Ok(inventories)
@@ -250,6 +264,14 @@ mod tests {
     /// Batch client, jobs attributed through the 5-key metadata schema and
     /// uploads through the filename-embedded intent token. The configured
     /// client here is the hermetic `KIO_TEST_MISTRAL_BATCH` mock listing.
+    fn configured_test_inventories(
+        settings: &crate::tool_lock::AdapterRuntimeSettings,
+        recovery_context: impl FnMut() -> Result<crate::batch_recovery::BatchRecoveryContext>,
+    ) -> Result<Vec<ProviderInventory>> {
+        let control = ControlHandle::new(kio_core::test_control::DebugTestControl::from_env());
+        configured_inventories_with_control(settings, recovery_context, &control)
+    }
+
     #[test]
     fn configured_client_listing_maps_metadata_and_filename_attribution() {
         let _guard = kio_core::test_control::test_env_lock()
@@ -287,11 +309,11 @@ mod tests {
             crate::batch_client::TEST_MISTRAL_BATCH_ENV,
             script.to_string(),
         );
-        let inventories =
-            configured_inventories(&crate::tool_lock::AdapterRuntimeSettings::default(), || {
-                panic!("mock or unconfigured inventory must not load a private key")
-            })
-            .unwrap();
+        let inventories = configured_test_inventories(
+            &crate::tool_lock::AdapterRuntimeSettings::default(),
+            || panic!("mock or unconfigured inventory must not load a private key"),
+        )
+        .unwrap();
 
         assert_eq!(inventories.len(), 1);
         let inventory = &inventories[0];
@@ -363,11 +385,11 @@ mod tests {
             TEST_BATCH_INVENTORY_ENV,
             fixture_path.as_os_str(),
         );
-        let inventories =
-            configured_inventories(&crate::tool_lock::AdapterRuntimeSettings::default(), || {
-                panic!("mock or unconfigured inventory must not load a private key")
-            })
-            .unwrap();
+        let inventories = configured_test_inventories(
+            &crate::tool_lock::AdapterRuntimeSettings::default(),
+            || panic!("mock or unconfigured inventory must not load a private key"),
+        )
+        .unwrap();
 
         assert_eq!(inventories.len(), 1);
         let inventory = &inventories[0];
@@ -407,10 +429,10 @@ mod tests {
             TEST_BATCH_INVENTORY_ENV,
             "/nonexistent/path/inventory.json",
         );
-        let result =
-            configured_inventories(&crate::tool_lock::AdapterRuntimeSettings::default(), || {
-                panic!("mock or unconfigured inventory must not load a private key")
-            });
+        let result = configured_test_inventories(
+            &crate::tool_lock::AdapterRuntimeSettings::default(),
+            || panic!("mock or unconfigured inventory must not load a private key"),
+        );
         assert!(result.is_err());
     }
 
@@ -428,10 +450,10 @@ mod tests {
             TEST_BATCH_INVENTORY_ENV,
             fixture_path.as_os_str(),
         );
-        let result =
-            configured_inventories(&crate::tool_lock::AdapterRuntimeSettings::default(), || {
-                panic!("mock or unconfigured inventory must not load a private key")
-            });
+        let result = configured_test_inventories(
+            &crate::tool_lock::AdapterRuntimeSettings::default(),
+            || panic!("mock or unconfigured inventory must not load a private key"),
+        );
         match result {
             Err(crate::AdapterError::ConfigSchema(_)) => {}
             other => panic!("expected ConfigSchema error, got {other:?}"),

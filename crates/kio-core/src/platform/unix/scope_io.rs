@@ -110,6 +110,7 @@ pub(crate) fn open_bound_scope_file_nofollow(
     root: &File,
     file_name: &str,
     display_path: &Path,
+    _control: &crate::control::ControlHandle,
 ) -> Result<File> {
     use cap_fs::MetadataExt;
     use cap_primitives::fs as cap_fs;

@@ -128,7 +128,12 @@ mod tests {
         use kio_core::dag::NormalizeRef;
 
         let root = tempfile::tempdir().unwrap();
-        let repo = match crate::initialize_explicit_root(root.path()).unwrap() {
+        let repo = match crate::initialize_explicit_root(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             crate::ExplicitRoot::Created(repo) => repo,
             crate::ExplicitRoot::Existing(_) => panic!("fresh root must be created"),
         };

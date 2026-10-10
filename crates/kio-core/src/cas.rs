@@ -1,5 +1,8 @@
 //! Content-addressed storage primitives.
 
+mod removal;
+use removal::{CasRemovalKind, bound_remove_verified, remove_verified_cas_path};
+
 use std::fs::{self, File, OpenOptions};
 use std::io::Seek;
 use std::io::{Read, Write};
@@ -488,6 +491,7 @@ pub struct AccountedReadError {
 
 #[derive(Debug, Clone)]
 pub struct ObjectStore {
+    control: crate::control::ControlHandle,
     kio_dir: Option<PathBuf>,
     /// Scheduled writers retain these handles before taking their writer
     /// boundary.  The ambient `.kio/objects` pathname is deliberately never
@@ -550,6 +554,18 @@ impl PlannedContentRemoval {
 }
 
 impl ObjectStore {
+    #[must_use]
+    pub fn control(&self) -> &crate::control::ControlHandle {
+        &self.control
+    }
+
+    #[must_use]
+    pub fn rebind_with_control(&self, control: crate::control::ControlHandle) -> Self {
+        let mut store = self.clone();
+        store.control = control;
+        store
+    }
+
     /// Capture an exact physical content file through already-retained CAS
     /// parents. Quarantine residue is only a candidate; hash verification and
     /// the caller's fresh orphan proof are required on every new plan.
@@ -578,9 +594,10 @@ impl ObjectStore {
             &parent,
             Path::new("planned CAS parent"),
         )?;
-        let directory = crate::store_dir::StoreDirectory::from_retained(
+        let directory = crate::store_dir::StoreDirectory::from_retained_with_control(
             parent,
             PathBuf::from("planned CAS parent"),
+            self.control.clone(),
         )?;
         let Some(target) = crate::store_dir::PlannedFileRemoval::capture_content(
             &directory,
@@ -604,7 +621,16 @@ impl ObjectStore {
 
     #[must_use]
     pub fn new(kio_dir: impl Into<PathBuf>) -> Self {
+        Self::new_with_control(kio_dir, crate::control::ControlHandle::default())
+    }
+
+    #[must_use]
+    pub fn new_with_control(
+        kio_dir: impl Into<PathBuf>,
+        control: crate::control::ControlHandle,
+    ) -> Self {
         Self {
+            control,
             kio_dir: Some(kio_dir.into()),
             bound: None,
         }
@@ -624,6 +650,13 @@ impl ObjectStore {
     /// missing/replaced/symlinked object namespace rather than recovering via
     /// the public pathname.
     pub fn from_bound_kio(kio: &File) -> Result<Self> {
+        Self::from_bound_kio_with_control(kio, crate::control::ControlHandle::default())
+    }
+
+    pub fn from_bound_kio_with_control(
+        kio: &File,
+        control: crate::control::ControlHandle,
+    ) -> Result<Self> {
         let objects = bound_open_dir(kio, "objects")?;
         let raw = bound_open_dir(&objects, ObjectKind::Raw.directory())?;
         let trees = bound_open_dir(&objects, ObjectKind::Tree.directory())?;
@@ -653,6 +686,7 @@ impl ObjectStore {
         let toollocks = optional_dir(ContentObjectKind::Toollock.directory())?;
         let normalized_units = optional_dir(ContentObjectKind::NormalizedUnit.directory())?;
         Ok(Self {
+            control,
             kio_dir: None,
             bound: Some(BoundObjectDirs {
                 kio: {
@@ -1094,7 +1128,7 @@ impl ObjectStore {
     /// Missing is an idempotent `false`.
     pub fn remove_embedding(&self, hash: &str) -> Result<bool> {
         if let Some(bound) = &self.bound {
-            return bound.remove_embedding(hash);
+            return bound.remove_embedding(hash, &self.control);
         }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid embedding hash"));
@@ -1103,6 +1137,7 @@ impl ObjectStore {
             return Ok(false);
         }
         remove_verified_cas_path(
+            &self.control,
             self.ambient_kio_dir()?,
             &self.embedding_path(hash)?,
             CasRemovalKind::Embedding,
@@ -1428,7 +1463,7 @@ impl ObjectStore {
     /// closed before unlink.
     pub fn remove_raw(&self, hash: &str) -> Result<bool> {
         if let Some(bound) = &self.bound {
-            return bound.remove_raw(hash);
+            return bound.remove_raw(hash, &self.control);
         }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid raw hash"));
@@ -1437,6 +1472,7 @@ impl ObjectStore {
             return Ok(false);
         }
         remove_verified_cas_path(
+            &self.control,
             self.ambient_kio_dir()?,
             &self.object_path(ObjectKind::Raw, hash)?,
             CasRemovalKind::Raw,
@@ -1447,7 +1483,7 @@ impl ObjectStore {
     /// Remove one semantic chunk object after identity/text verification.
     pub fn remove_chunk(&self, hash: &str) -> Result<bool> {
         if let Some(bound) = &self.bound {
-            return bound.remove_chunk(hash);
+            return bound.remove_chunk(hash, &self.control);
         }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid chunk hash"));
@@ -1456,6 +1492,7 @@ impl ObjectStore {
             return Ok(false);
         }
         remove_verified_cas_path(
+            &self.control,
             self.ambient_kio_dir()?,
             &self.chunk_path(hash)?,
             CasRemovalKind::Chunk,
@@ -1470,7 +1507,7 @@ impl ObjectStore {
     /// before the first unlink.
     pub fn remove_content(&self, kind: ContentObjectKind, hash: &str) -> Result<bool> {
         if let Some(bound) = &self.bound {
-            return bound.remove_content(kind, hash);
+            return bound.remove_content(kind, hash, &self.control);
         }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid content object hash"));
@@ -1479,6 +1516,7 @@ impl ObjectStore {
             return Ok(false);
         }
         remove_verified_cas_path(
+            &self.control,
             self.ambient_kio_dir()?,
             &self.content_path(kind, hash)?,
             CasRemovalKind::Content(kind),
@@ -2309,16 +2347,16 @@ impl BoundObjectDirs {
         Ok(true)
     }
 
-    fn remove_raw(&self, hash: &str) -> Result<bool> {
+    fn remove_raw(&self, hash: &str, control: &crate::control::ControlHandle) -> Result<bool> {
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid raw hash"));
         }
-        self.remove_verified(ObjectKind::Raw, hash, |parent, leaf| {
+        self.remove_verified(control, ObjectKind::Raw, hash, |parent, leaf| {
             bound_read_verified(parent, leaf, ObjectKind::Raw, hash, false).map(|_| ())
         })
     }
 
-    fn remove_chunk(&self, hash: &str) -> Result<bool> {
+    fn remove_chunk(&self, hash: &str, control: &crate::control::ControlHandle) -> Result<bool> {
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid chunk hash"));
         }
@@ -2327,14 +2365,18 @@ impl BoundObjectDirs {
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
             Err(error) => return Err(error),
         };
-        bound_remove_verified(&parent, &leaf, |parent, leaf| {
+        bound_remove_verified(control, &parent, &leaf, |parent, leaf| {
             bound_read_chunk_accounted(parent, leaf, hash)
                 .map(|_| ())
                 .map_err(|error| error.error)
         })
     }
 
-    fn remove_embedding(&self, hash: &str) -> Result<bool> {
+    fn remove_embedding(
+        &self,
+        hash: &str,
+        control: &crate::control::ControlHandle,
+    ) -> Result<bool> {
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid embedding hash"));
         }
@@ -2343,12 +2385,18 @@ impl BoundObjectDirs {
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
             Err(error) => return Err(error),
         };
-        bound_remove_verified(&parent, &leaf, |parent, leaf| {
+        bound_remove_verified(control, &parent, &leaf, |parent, leaf| {
             bound_read_embedding(parent, leaf, hash).map(|_| ())
         })
     }
 
-    fn remove_verified<F>(&self, kind: ObjectKind, hash: &str, verify: F) -> Result<bool>
+    fn remove_verified<F>(
+        &self,
+        control: &crate::control::ControlHandle,
+        kind: ObjectKind,
+        hash: &str,
+        verify: F,
+    ) -> Result<bool>
     where
         F: Fn(&File, &str) -> Result<()>,
     {
@@ -2357,7 +2405,7 @@ impl BoundObjectDirs {
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
             Err(error) => return Err(error),
         };
-        bound_remove_verified(&parent, &leaf, verify)
+        bound_remove_verified(control, &parent, &leaf, verify)
     }
 
     fn embedding_hashes(&self) -> Result<Vec<String>> {
@@ -2468,7 +2516,12 @@ impl BoundObjectDirs {
         bound_read_content(&parent, &leaf, max_bytes, true).map(|(_, bytes)| bytes)
     }
 
-    fn remove_content(&self, kind: ContentObjectKind, hash: &str) -> Result<bool> {
+    fn remove_content(
+        &self,
+        kind: ContentObjectKind,
+        hash: &str,
+        control: &crate::control::ControlHandle,
+    ) -> Result<bool> {
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid content object hash"));
         }
@@ -2477,7 +2530,7 @@ impl BoundObjectDirs {
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
             Err(error) => return Err(error),
         };
-        bound_remove_verified(&parent, &leaf, |parent, leaf| {
+        bound_remove_verified(control, &parent, &leaf, |parent, leaf| {
             bound_verify_content(parent, leaf, kind, hash).map(|_| ())
         })
     }
@@ -3041,58 +3094,6 @@ fn bound_quarantine_matches(parent: &File, quarantine: &str, source: &File) -> R
     let quarantined = cap_fs::open(parent, bound_leaf(quarantine, "quarantine")?, &options)
         .map_err(|error| bound_io_or_not_found(error, quarantine))?;
     cas_semantics::same_repair_quarantine(source, &quarantined, Path::new(quarantine))
-}
-
-/// The explicit removal request supplies kind/hash authority for this one
-/// deterministic sibling. A retry must inspect it even when canonical is absent.
-/// No directory scan or legacy random-quarantine cleanup is authorized here.
-fn bound_remove_verified<F>(parent: &File, leaf: &str, verify: F) -> Result<bool>
-where
-    F: Fn(&File, &str) -> Result<()>,
-{
-    use crate::durability::{DurabilityPoint, checkpoint};
-    use crate::store_dir::{Publication, StoreDirectory};
-
-    let directory = StoreDirectory::from_retained(
-        parent.try_clone().kio_io(Path::new(leaf))?,
-        PathBuf::from("CAS removal parent"),
-    )?;
-    let quarantine = format!(".kio-cas-remove-{leaf}");
-    let canonical_exists = directory.contains_entry(Path::new(leaf))?;
-    let quarantine_exists = directory.contains_entry(Path::new(&quarantine))?;
-    if canonical_exists && quarantine_exists {
-        return Err(bound_stage_corrupt(
-            "CAS removal canonical and quarantine both exist",
-        ));
-    }
-    if !canonical_exists && !quarantine_exists {
-        // Also close an interrupted post-unlink sync window on an absent retry.
-        directory.sync()?;
-        return Ok(false);
-    }
-    if canonical_exists {
-        verify(parent, leaf)?;
-        checkpoint(DurabilityPoint::CasRemoveReady)?;
-        // Single-link, no-replace atomic rename: never a second plaintext link.
-        directory.rename_regular_between_raw(
-            Path::new(leaf),
-            &directory,
-            Path::new(&quarantine),
-            Publication::CreateOnly,
-        )?;
-    }
-    directory.sync()?;
-    checkpoint(DurabilityPoint::CasRemoveQuarantined)?;
-    // Retained-parent verifiers reject links, unstable identities, and bytes
-    // not attributable to the explicitly authorized semantic CAS key.
-    verify(parent, &quarantine)?;
-    if directory.contains_entry(Path::new(leaf))? {
-        return Err(bound_stage_corrupt("CAS removal canonical reappeared"));
-    }
-    bound_remove(parent, &quarantine)?;
-    directory.sync()?;
-    checkpoint(DurabilityPoint::CasRemoveDeleted)?;
-    Ok(true)
 }
 
 fn bound_visit_chunks(
@@ -3714,66 +3715,6 @@ fn create_repair_quarantine(path: &Path, opened: &File) -> Result<PathBuf> {
         "could not allocate raw repair quarantine",
         path.display().to_string(),
     ))
-}
-
-enum CasRemovalKind {
-    Raw,
-    Chunk,
-    Embedding,
-    Content(ContentObjectKind),
-}
-
-/// Ambient callers retain the validated parent and use exactly the same
-/// namespace-safe removal and semantic recovery as bound callers.
-fn remove_verified_cas_path(
-    kio: &Path,
-    path: &Path,
-    kind: CasRemovalKind,
-    hash: &str,
-) -> Result<bool> {
-    {
-        let parent_path = path
-            .parent()
-            .ok_or_else(|| KioError::io("CAS path has no parent", path.display().to_string()))?;
-        let leaf = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                KioError::io("CAS path has no UTF-8 leaf", path.display().to_string())
-            })?;
-        // The ambient prefix outside .kio keeps its existing OS path semantics
-        // (including relative paths and macOS /var aliases). Retain .kio with
-        // no-follow, then open every controlled ancestor through that handle.
-        let mut options = OpenOptions::new();
-        options.read(true);
-        cas_semantics::configure_removal_root(&mut options);
-        let mut parent = options.open(kio).kio_io(kio)?;
-        ensure_bound_directory(&parent, kio)?;
-        let relative_parent = parent_path
-            .strip_prefix(kio)
-            .map_err(|_| KioError::invalid_usage("CAS removal parent escapes .kio"))?;
-        for component in relative_parent.components() {
-            let std::path::Component::Normal(name) = component else {
-                return Err(KioError::invalid_usage("invalid CAS removal ancestor"));
-            };
-            let name = name
-                .to_str()
-                .ok_or_else(|| KioError::invalid_usage("invalid CAS removal ancestor"))?;
-            parent = bound_open_dir(&parent, name)?;
-        }
-        bound_remove_verified(&parent, leaf, |parent, candidate| match kind {
-            CasRemovalKind::Raw => {
-                bound_read_verified(parent, candidate, ObjectKind::Raw, hash, false).map(|_| ())
-            }
-            CasRemovalKind::Chunk => bound_read_chunk_accounted(parent, candidate, hash)
-                .map(|_| ())
-                .map_err(|error| error.error),
-            CasRemovalKind::Embedding => bound_read_embedding(parent, candidate, hash).map(|_| ()),
-            CasRemovalKind::Content(kind) => {
-                bound_verify_content(parent, candidate, kind, hash).map(|_| ())
-            }
-        })
-    }
 }
 
 fn verify_existing_matches_file(

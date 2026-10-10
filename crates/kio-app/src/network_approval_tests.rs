@@ -1,5 +1,6 @@
 //! Device-grant contracts for external adapter permissions.
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
+use kio_core::control::ControlHandle;
 
 use std::ffi::OsString;
 use std::fs;
@@ -112,7 +113,8 @@ impl Fixture {
         let base = temp.path().canonicalize().unwrap();
         let root = base.join("scope");
         fs::create_dir(&root).unwrap();
-        let repo = match crate::management::initialize_explicit_root(&root).unwrap() {
+        let control = ControlHandle::new(kio_core::test_control::DebugTestControl::default());
+        let repo = match crate::management::initialize_explicit_root(&root, &control).unwrap() {
             crate::management::ExplicitRoot::Created(repo) => repo,
             crate::management::ExplicitRoot::Existing(_) => panic!("fresh scope already exists"),
         };
@@ -127,7 +129,7 @@ impl Fixture {
     }
 
     fn grant_path(&self) -> PathBuf {
-        super::approvals::store_path()
+        super::approvals::store_path(self.repo.control())
     }
 
     fn metadata_snapshot(&self) -> Vec<(PathBuf, Vec<u8>)> {
@@ -157,9 +159,8 @@ impl Fixture {
         send_secrets: bool,
         stop_after: Option<&'static str>,
     ) -> kio_core::Result<Value> {
-        self.in_context(|ctx| {
+        self.in_context(adapter_settings, |ctx| {
             super::approvals::approve(
-                adapter_settings,
                 ctx,
                 ApproveArgs {
                     target,
@@ -174,19 +175,21 @@ impl Fixture {
     }
 
     fn status(&self, adapter_settings: &Arc<AdapterRuntimeSettings>) -> Value {
-        self.in_context(|ctx| {
-            super::approvals::status(adapter_settings, ctx, AdapterStatusArgs { tool_id: None })
+        self.in_context(adapter_settings, |ctx| {
+            super::approvals::status(ctx, AdapterStatusArgs { tool_id: None })
         })
         .unwrap()
     }
 
     fn revoke(&self) -> Value {
-        self.in_context(|ctx| {
+        let adapter_settings = &Arc::new(AdapterRuntimeSettings::default());
+        self.in_context(adapter_settings, |ctx| {
             super::approvals::revoke(
                 ctx,
                 RevokeArgs {
                     target: AdapterTarget::Tool(TOOL_ID.to_owned()),
                 },
+                ctx.control,
             )
         })
         .unwrap()
@@ -221,21 +224,27 @@ impl Fixture {
 
     fn in_context<T>(
         &self,
-        operation: impl FnOnce(&AppContext) -> kio_core::Result<T>,
+        settings: &Arc<AdapterRuntimeSettings>,
+        operation: impl FnOnce(&super::Invocation<'_>) -> kio_core::Result<T>,
     ) -> kio_core::Result<T> {
-        self.in_context_at(&self.root, operation)
+        self.in_context_at(settings, &self.root, operation)
     }
 
     fn in_context_at<T>(
         &self,
+        settings: &Arc<AdapterRuntimeSettings>,
         root: &Path,
-        operation: impl FnOnce(&AppContext) -> kio_core::Result<T>,
+        operation: impl FnOnce(&super::Invocation<'_>) -> kio_core::Result<T>,
     ) -> kio_core::Result<T> {
         let context = AppContext {
             working_directory: root.to_path_buf(),
             interaction: Arc::new(TestInteraction),
         };
-        operation(&context)
+        operation(&super::Invocation {
+            context: &context,
+            settings,
+            control: self.repo.control(),
+        })
     }
 }
 
@@ -331,6 +340,7 @@ fn revoke_rejects_an_invalid_target_before_repository_access() {
         RevokeArgs {
             target: AdapterTarget::Tool("\n".to_owned()),
         },
+        &ControlHandle::default(),
     )
     .expect_err("control characters are not adapter identifiers");
     assert_eq!(error.error_code(), "KIO-E-CONFIG-USAGE-001");
@@ -346,9 +356,8 @@ fn preview_and_status_are_readonly_and_do_not_create_or_repair_grants() {
     assert!(!fixture.grant_path().exists());
 
     let preview = fixture
-        .in_context(|ctx| {
+        .in_context(adapter_settings, |ctx| {
             super::approvals::approve(
-                adapter_settings,
                 ctx,
                 ApproveArgs {
                     target: AdapterTarget::All,
@@ -528,10 +537,13 @@ fn copied_scope_approval_reference_cannot_reuse_the_source_device_grant() {
 
     let copied_root = fixture.root.parent().unwrap().join("copied-scope");
     fs::create_dir(&copied_root).unwrap();
-    let copied = match crate::management::initialize_explicit_root(&copied_root).unwrap() {
-        crate::management::ExplicitRoot::Created(repo) => repo,
-        crate::management::ExplicitRoot::Existing(_) => panic!("copied fixture already exists"),
-    };
+    let copied =
+        match crate::management::initialize_explicit_root(&copied_root, &ControlHandle::default())
+            .unwrap()
+        {
+            crate::management::ExplicitRoot::Created(repo) => repo,
+            crate::management::ExplicitRoot::Existing(_) => panic!("copied fixture already exists"),
+        };
     // Model a portable copied scope approval without copying the device-private
     // grant. Its source scope identity remains in the portable reference.
     let source_row = fixture
@@ -583,10 +595,10 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
     use super::approvals::{AdapterRole, allowed};
     use super::grants::GrantOperation;
     use kio_adapter::tool_lock::{AdapterRuntimeSettings, DeclaredAdapter};
-    use kio_core::test_control::{DebugTestControl, GeminiEmbedMode, Selector, install_scoped};
+    use kio_core::test_control::{DebugTestControl, GeminiEmbedMode, Selector};
 
     let fixture = Fixture::new();
-    let _control = install_scoped(DebugTestControl::default());
+    let control = fixture.repo.control();
     let settings = AdapterRuntimeSettings {
         declarations: [(
             "embedding".to_owned(),
@@ -603,13 +615,12 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
     {
         let adapter_settings = &std::sync::Arc::new(settings);
         let profile = super::declared_embedding_profile(
-            super::embedding_execution(adapter_settings).unwrap(),
+            super::embedding_execution(adapter_settings, control).unwrap(),
         );
         let target = AdapterTarget::Tool(profile.tool_id.clone());
         let preview = fixture
-            .in_context(|ctx| {
+            .in_context(adapter_settings, |ctx| {
                 super::approvals::approve(
-                    adapter_settings,
                     ctx,
                     ApproveArgs {
                         target: target.clone(),
@@ -686,7 +697,7 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
         // when rebuild has no active embedding adapter.
         {
             let adapter_settings = &std::sync::Arc::new(AdapterRuntimeSettings::default());
-            assert!(super::embedding_execution(adapter_settings).is_none());
+            assert!(super::embedding_execution(adapter_settings, control).is_none());
             for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
                 assert!(
                     !query(
@@ -710,16 +721,19 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
             // The existing CLI rebuild regression uses this mismatched profile.
             let mut control = DebugTestControl::default();
             control.adapters.gemini_embed = Selector::Known(GeminiEmbedMode::IncompatibleProfile);
-            let _drift = install_scoped(control);
+            let drift = ControlHandle::new(control);
+            let drift_repo = fixture.repo.rebind_with_control(drift.clone());
             let current = super::declared_embedding_profile(
-                super::embedding_execution(adapter_settings).unwrap(),
+                super::embedding_execution(adapter_settings, &drift).unwrap(),
             );
             assert_ne!(current.profile_hash, profile.profile_hash);
             for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
                 assert!(
-                    !query(
+                    !allowed(
                         adapter_settings,
+                        &drift_repo,
                         AdapterRole::Embedding,
+                        &profile.tool_id,
                         &profile.profile_hash,
                         operation
                     )
@@ -753,10 +767,7 @@ fn approval_query_preserves_current_runtime_and_config_errors() {
     use super::approvals::{AdapterRole, allowed};
     use super::grants::GrantOperation;
     use kio_adapter::tool_lock::{AdapterRuntimeSettings, DeclaredAdapter};
-    use kio_core::test_control::{DebugTestControl, install_scoped};
-
     let fixture = Fixture::new();
-    let _control = install_scoped(DebugTestControl::default());
     fixture.approve(adapter_settings, true);
     let profile = fixture.active_profile();
     let malformed = AdapterRuntimeSettings {
@@ -910,9 +921,8 @@ fn ancestor_reregistration_invalidates_a_childs_network_and_secret_grants() {
         panic!("child must be managed");
     };
     fixture
-        .in_context_at(&child_path, |ctx| {
+        .in_context_at(adapter_settings, &child_path, |ctx| {
             super::approvals::approve(
-                adapter_settings,
                 ctx,
                 ApproveArgs {
                     target: AdapterTarget::Tool(TOOL_ID.to_owned()),
@@ -1030,4 +1040,175 @@ fn reregistration_makes_an_old_pending_approval_unresumable() {
         )
         .unwrap_err();
     assert_eq!(error.error_code(), "KIO-E-ADAPTER-APPROVAL-REQUIRED-001");
+}
+
+#[derive(Clone, Copy)]
+enum NestedApprovalOutcome {
+    Success,
+    Error,
+    Panic,
+}
+
+type ConfirmationCallback = dyn Fn(&str) -> kio_core::Result<bool> + Send + Sync;
+
+struct CallbackInteraction {
+    confirm: Box<ConfirmationCallback>,
+}
+
+impl Interaction for CallbackInteraction {
+    fn confirm(&self, summary: &str) -> kio_core::Result<bool> {
+        (self.confirm)(summary)
+    }
+
+    fn read_input(&self, limit: usize) -> kio_core::Result<Vec<u8>> {
+        TestInteraction.read_input(limit)
+    }
+
+    fn is_interactive(&self) -> bool {
+        true
+    }
+
+    fn diagnostic(&self, message: &str) {
+        TestInteraction.diagnostic(message);
+    }
+
+    fn write_diagnostic(&self, text: &str) -> kio_core::Result<()> {
+        TestInteraction.write_diagnostic(text)
+    }
+
+    fn flush_diagnostics(&self) -> kio_core::Result<()> {
+        TestInteraction.flush_diagnostics()
+    }
+}
+
+fn nested_approval_command(target: AdapterTarget) -> crate::commands::CommandRequest {
+    crate::commands::CommandRequest::Adapter(crate::commands::AdapterArgs {
+        command: Some(crate::commands::AdapterCommand::Approve(ApproveArgs {
+            target,
+            preview: false,
+            yes: false,
+            resume: None,
+            send_secrets: false,
+        })),
+    })
+}
+
+fn assert_nested_approval_keeps_outer_control(outcome: NestedApprovalOutcome) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    const OUTER_NOW: &str = "2026-08-25T00:00:00Z";
+    const INNER_NOW: &str = "2026-08-26T00:00:00Z";
+    let fixture = Fixture::new();
+    let _fixed_now = kio_core::test_control::TestEnvGuard::set("KIO_FIXED_NOW", OUTER_NOW);
+    let _mistral = kio_core::test_control::TestEnvGuard::set("KIO_TEST_MISTRAL_OCR", "mock");
+    let _gemini = kio_core::test_control::TestEnvGuard::remove("KIO_TEST_GEMINI_EMBED");
+    let inner_root = fixture.root.with_file_name("inner-scope");
+    fs::create_dir(&inner_root).unwrap();
+    let inner_repo =
+        match crate::management::initialize_explicit_root(&inner_root, &ControlHandle::default())
+            .unwrap()
+        {
+            crate::management::ExplicitRoot::Created(repo) => repo,
+            crate::management::ExplicitRoot::Existing(_) => {
+                panic!("fresh inner scope already exists")
+            }
+        };
+    let inner_observed_fresh_selector = Arc::new(AtomicBool::new(false));
+    let observed = inner_observed_fresh_selector.clone();
+    let embedding_tool = kio_adapter::catalog::adopted_embedding_profile().adapter_id;
+    let outer_context = AppContext {
+        working_directory: fixture.root.clone(),
+        interaction: Arc::new(CallbackInteraction {
+            confirm: Box::new(move |outer_preview| {
+                assert!(!outer_preview.contains(&embedding_tool));
+                // The fixture's test_env_lock covers both executes. Leave B
+                // installed until the outer publication, so recapture cannot
+                // accidentally satisfy the outer A assertion.
+                unsafe {
+                    std::env::set_var("KIO_FIXED_NOW", INNER_NOW);
+                    std::env::set_var("KIO_TEST_GEMINI_EMBED", "mock");
+                }
+                let observed = observed.clone();
+                let embedding_tool = embedding_tool.clone();
+                let inner_context = AppContext {
+                    working_directory: inner_root.clone(),
+                    interaction: Arc::new(CallbackInteraction {
+                        confirm: Box::new(move |inner_preview| {
+                            assert!(
+                                inner_preview.contains(&embedding_tool),
+                                "inner execute must capture its fresh Gemini debug selector"
+                            );
+                            observed.store(true, Ordering::SeqCst);
+                            match outcome {
+                                NestedApprovalOutcome::Success => Ok(true),
+                                NestedApprovalOutcome::Error => Err(
+                                    kio_core::KioError::invalid_usage("nested confirmation error"),
+                                ),
+                                NestedApprovalOutcome::Panic => panic!("nested confirmation panic"),
+                            }
+                        }),
+                    }),
+                };
+                let inner_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    crate::execute(&inner_context, nested_approval_command(AdapterTarget::All))
+                }));
+                match outcome {
+                    NestedApprovalOutcome::Success => {
+                        inner_result.unwrap().unwrap();
+                    }
+                    NestedApprovalOutcome::Error => {
+                        assert!(
+                            inner_result
+                                .unwrap()
+                                .unwrap_err()
+                                .to_string()
+                                .contains("nested confirmation error")
+                        );
+                    }
+                    NestedApprovalOutcome::Panic => assert!(inner_result.is_err()),
+                }
+                Ok(true)
+            }),
+        }),
+    };
+    crate::execute(
+        &outer_context,
+        nested_approval_command(AdapterTarget::Tool(TOOL_ID.to_owned())),
+    )
+    .unwrap();
+    assert!(inner_observed_fresh_selector.load(Ordering::SeqCst));
+    assert_eq!(std::env::var("KIO_FIXED_NOW").unwrap(), INNER_NOW);
+    let inner_approvals = inner_repo.read_network_approvals().unwrap();
+    match outcome {
+        NestedApprovalOutcome::Success => {
+            assert_eq!(inner_approvals.len(), 2);
+            for approval in inner_approvals {
+                assert_eq!(approval["approved_at"], INNER_NOW);
+            }
+        }
+        NestedApprovalOutcome::Error | NestedApprovalOutcome::Panic => {
+            assert!(inner_approvals.is_empty());
+        }
+    }
+    let outer_approvals = fixture.repo.read_network_approvals().unwrap();
+    assert_eq!(outer_approvals.len(), 1);
+    assert_eq!(
+        outer_approvals[0]["approved_at"], OUTER_NOW,
+        "outer execute must retain its original clock after the inner execute"
+    );
+}
+
+#[test]
+fn nested_execute_preserves_outer_control_after_inner_success() {
+    assert_nested_approval_keeps_outer_control(NestedApprovalOutcome::Success);
+}
+
+#[test]
+fn nested_execute_preserves_outer_control_after_inner_error() {
+    assert_nested_approval_keeps_outer_control(NestedApprovalOutcome::Error);
+}
+
+#[test]
+fn nested_execute_preserves_outer_control_after_inner_panic() {
+    assert_nested_approval_keeps_outer_control(NestedApprovalOutcome::Panic);
 }

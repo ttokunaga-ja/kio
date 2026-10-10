@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{PipelineError, Result};
 use getrandom::fill;
-use kio_core::durability::{DurabilityPoint, checkpoint};
+use kio_core::{control::ControlHandle, durability::DurabilityPoint};
 use rusqlite::{Connection, OpenFlags, params};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -99,6 +99,7 @@ struct BackupProof {
 pub struct LedgerDb {
     path: PathBuf,
     authority: Authority,
+    control: ControlHandle,
 }
 
 /// Only the SQL operation module can access a live write transaction.
@@ -106,8 +107,12 @@ pub struct LedgerDb {
 /// while the transaction is prepared for commit.
 pub(crate) struct LedgerWriteTxn<'a> {
     conn: &'a Connection,
+    control: &'a ControlHandle,
 }
 impl LedgerWriteTxn<'_> {
+    pub(super) fn control(&self) -> &ControlHandle {
+        self.control
+    }
     pub(super) fn connection(&self) -> &Connection {
         self.conn
     }
@@ -126,10 +131,21 @@ impl LedgerDb {
     /// Create a fresh ledger. Existing or partially initialized state is never
     /// replaced; resuming an interrupted init requires the explicit resume API.
     pub fn initialize(path: impl AsRef<Path>) -> Result<Self> {
-        Self::initialize_with_hook(path.as_ref(), |_| Ok(()))
+        Self::initialize_with_control(path, ControlHandle::default())
     }
+    pub fn initialize_with_control(path: impl AsRef<Path>, control: ControlHandle) -> Result<Self> {
+        Self::initialize_controlled_with_hook(path.as_ref(), control, |_| Ok(()))
+    }
+    #[cfg(test)]
     fn initialize_with_hook(path: &Path, hook: impl Fn(InitPhase) -> Result<()>) -> Result<Self> {
-        let fs = FsSession::acquire(path, true)?;
+        Self::initialize_controlled_with_hook(path, ControlHandle::default(), hook)
+    }
+    fn initialize_controlled_with_hook(
+        path: &Path,
+        control: ControlHandle,
+        hook: impl Fn(InitPhase) -> Result<()>,
+    ) -> Result<Self> {
+        let fs = FsSession::acquire_with_control(path, true, control.clone())?;
         fs.recover_atomic_storage()?;
         if fs.artifact_state()? != ArtifactSetState::Missing {
             return Err(contract(
@@ -153,14 +169,21 @@ impl LedgerDb {
         Ok(Self {
             path: path.to_path_buf(),
             authority: pending.authority,
+            control,
         })
     }
 
     /// Resume only the exact recorded initialization. This cannot reset billing
     /// history, generate a replacement era, or adopt an arbitrary database.
     pub fn resume_initialization(path: impl AsRef<Path>) -> Result<Self> {
+        Self::resume_initialization_with_control(path, ControlHandle::default())
+    }
+    pub fn resume_initialization_with_control(
+        path: impl AsRef<Path>,
+        control: ControlHandle,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let fs = FsSession::acquire(path, false)?;
+        let fs = FsSession::acquire_with_control(path, false, control.clone())?;
         let bytes = fs.read_private(&fs.names().init_pending, MAX_RECORD)?;
         let pending: InitPending = decode(&bytes)?;
         if pending.version != 1 || !valid_id(&pending.init_id) {
@@ -174,6 +197,7 @@ impl LedgerDb {
         Ok(Self {
             path: path.to_path_buf(),
             authority: pending.authority,
+            control,
         })
     }
 
@@ -181,8 +205,14 @@ impl LedgerDb {
     /// schema or history. SQLite may use its normal private WAL coordination
     /// files; read-only status uses LedgerReadSnapshot instead.
     pub fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_existing_with_control(path, ControlHandle::default())
+    }
+    pub fn open_existing_with_control(
+        path: impl AsRef<Path>,
+        control: ControlHandle,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let fs = FsSession::acquire(path, false)?;
+        let fs = FsSession::acquire_with_control(path, false, control.clone())?;
         let (authority, checkpoint) = read_authority(&fs)?;
         let mut bound = fs.open_existing_sqlite(READ_WRITE)?;
         let result = (|| {
@@ -194,6 +224,7 @@ impl LedgerDb {
         Ok(Self {
             path: path.to_path_buf(),
             authority,
+            control,
         })
     }
     pub fn open_default_existing() -> Result<Self> {
@@ -202,8 +233,14 @@ impl LedgerDb {
     /// Resolve only a complete, exact private pending-write journal. Ordinary
     /// open and read APIs deliberately never invoke this mutating operation.
     pub fn recover_pending_write(path: impl AsRef<Path>) -> Result<PendingWriteRecovery> {
+        Self::recover_pending_write_with_control(path, ControlHandle::default())
+    }
+    pub fn recover_pending_write_with_control(
+        path: impl AsRef<Path>,
+        control: ControlHandle,
+    ) -> Result<PendingWriteRecovery> {
         let path = path.as_ref();
-        let fs = FsSession::acquire(path, false)?;
+        let fs = FsSession::acquire_with_control(path, false, control.clone())?;
         fs.recover_atomic_storage()?;
         let Some(bytes) = fs.read_optional_private(&fs.names().write_pending, MAX_RECORD)? else {
             // Preserve the normal strict validation even for an empty recovery
@@ -271,6 +308,12 @@ impl LedgerDb {
         result.and_then(|outcome| close.map(|()| outcome))
     }
     #[must_use]
+    pub fn now_millis(&self) -> i64 {
+        self.control.now_millis()
+    }
+    pub fn control(&self) -> &ControlHandle {
+        &self.control
+    }
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -284,7 +327,7 @@ impl LedgerDb {
     /// lock. The caller must publish these bytes create-only as one manifest
     /// set; this API never overwrites a backup destination.
     pub fn backup(&self) -> Result<LedgerBackup> {
-        let fs = FsSession::acquire(&self.path, false)?;
+        let fs = FsSession::acquire_with_control(&self.path, false, self.control.clone())?;
         let (authority, checkpoint) = self.expected_authority(&fs)?;
         let mut bound = fs.open_existing_sqlite(READ_WRITE)?;
         let result = (|| {
@@ -321,7 +364,7 @@ impl LedgerDb {
                 fs.create_only(&fs.names().backup_proof, &bytes)?;
             }
             fs.sync_parent()?;
-            durability_checkpoint(DurabilityPoint::LedgerBackupProof)?;
+            durability_checkpoint(fs.control(), DurabilityPoint::LedgerBackupProof)?;
             Ok(backup)
         })();
         let close = bound.finish();
@@ -331,7 +374,7 @@ impl LedgerDb {
     /// Inspect a proposed explicit restore. A backup behind the current
     /// checkpoint is never treated as proof that no later paid request ran.
     pub fn restore_readiness(&self, backup: &LedgerBackup) -> Result<RestoreReadiness> {
-        let fs = FsSession::acquire(&self.path, false)?;
+        let fs = FsSession::acquire_with_control(&self.path, false, self.control.clone())?;
         let (authority, checkpoint) = self.expected_authority(&fs)?;
         let backup_authority: Authority = decode(&backup.authority)?;
         let backup_checkpoint: Checkpoint = decode(&backup.checkpoint)?;
@@ -367,8 +410,15 @@ impl LedgerDb {
     /// Explicitly restore only a missing database when the surviving live
     /// authority/checkpoint prove this exact backup generation.
     pub fn restore_missing_database(path: impl AsRef<Path>, backup: &LedgerBackup) -> Result<Self> {
+        Self::restore_missing_database_with_control(path, backup, ControlHandle::default())
+    }
+    pub fn restore_missing_database_with_control(
+        path: impl AsRef<Path>,
+        backup: &LedgerBackup,
+        control: ControlHandle,
+    ) -> Result<Self> {
         let path = path.as_ref();
-        let fs = FsSession::acquire(path, false)?;
+        let fs = FsSession::acquire_with_control(path, false, control.clone())?;
         if fs.contains_leaf(&fs.names().write_pending)? {
             return Err(recovery_invalid());
         }
@@ -417,7 +467,7 @@ impl LedgerDb {
         }
         create_record_or_match(&fs, &fs.names().restore_pending, &pending)?;
         fs.sync_parent()?;
-        durability_checkpoint(DurabilityPoint::LedgerRestoreJournal)?;
+        durability_checkpoint(fs.control(), DurabilityPoint::LedgerRestoreJournal)?;
         if !db_exists {
             fs.create_only(&fs.names().db, &backup.sqlite)?;
         }
@@ -429,16 +479,17 @@ impl LedgerDb {
         })();
         let close = bound.finish();
         result.and(close)?;
-        durability_checkpoint(DurabilityPoint::LedgerRestoreDatabase)?;
+        durability_checkpoint(fs.control(), DurabilityPoint::LedgerRestoreDatabase)?;
         fs.remove_exact(&fs.names().restore_pending, &pending_bytes, MAX_RECORD)?;
         fs.sync_parent()?;
         Ok(Self {
             path: path.to_path_buf(),
             authority,
+            control,
         })
     }
     pub(crate) fn read<T>(&self, operation: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
-        let fs = FsSession::acquire(&self.path, false)?;
+        let fs = FsSession::acquire_with_control(&self.path, false, self.control.clone())?;
         let (authority, checkpoint) = self.expected_authority(&fs)?;
         let mut bound = fs.open_existing_sqlite(READ_WRITE)?;
         let result = (|| {
@@ -461,7 +512,7 @@ impl LedgerDb {
         operation: impl FnOnce(&mut LedgerWriteTxn<'_>) -> Result<T>,
         prepared: impl FnOnce() -> Result<()>,
     ) -> Result<T> {
-        let fs = FsSession::acquire(&self.path, false)?;
+        let fs = FsSession::acquire_with_control(&self.path, false, self.control.clone())?;
         let (authority, checkpoint) = self.expected_authority(&fs)?;
         let next = checkpoint
             .seq
@@ -497,7 +548,10 @@ impl LedgerDb {
             conn.execute_batch("PRAGMA synchronous=FULL; BEGIN IMMEDIATE;")?;
             validate_bound_connection(conn, &authority, &checkpoint)?;
             let value = {
-                let mut tx = LedgerWriteTxn { conn };
+                let mut tx = LedgerWriteTxn {
+                    conn,
+                    control: &self.control,
+                };
                 operation(&mut tx)?
             };
             let changed = conn.execute(
@@ -526,12 +580,12 @@ impl LedgerDb {
             };
             fs.replace_existing(&fs.names().checkpoint, &encode(&checkpoint)?)?;
             fs.sync_parent()?;
-            durability_checkpoint(DurabilityPoint::LedgerCheckpoint)?;
+            durability_checkpoint(fs.control(), DurabilityPoint::LedgerCheckpoint)?;
             prepared()?;
             bound.connection().execute_batch("COMMIT;")?;
             validate_bound_connection(bound.connection(), &authority, &checkpoint)?;
             bound.revalidate_open()?;
-            durability_checkpoint(DurabilityPoint::LedgerWriteCommitted)?;
+            durability_checkpoint(fs.control(), DurabilityPoint::LedgerWriteCommitted)?;
             fs.remove_exact(&fs.names().write_pending, &journal_bytes, MAX_RECORD)?;
             fs.sync_parent()?;
             Ok(value)
@@ -805,8 +859,10 @@ pub(crate) fn validate_read_snapshot_from_retained_parent(
     parent_path: &Path,
     main: &str,
     conn: &Connection,
+    control: &ControlHandle,
 ) -> Result<()> {
-    let fs = FsSession::acquire_retained_snapshot_parent(parent, parent_path, main)?;
+    let fs =
+        FsSession::acquire_retained_snapshot_parent(parent, parent_path, main, control.clone())?;
     let (authority, checkpoint) = read_authority(&fs)?;
     validate_bound_connection(conn, &authority, &checkpoint)
 }
@@ -818,8 +874,9 @@ pub(crate) fn snapshot_artifact_state_from_retained_parent(
     parent: &std::fs::File,
     parent_path: &Path,
     main: &str,
+    control: &ControlHandle,
 ) -> Result<ArtifactSetState> {
-    match FsSession::acquire_retained_snapshot_parent(parent, parent_path, main) {
+    match FsSession::acquire_retained_snapshot_parent(parent, parent_path, main, control.clone()) {
         Ok(fs) => fs.artifact_state(),
         Err(PipelineError::Contract {
             code: "KIO-E-LEDGER-UNINITIALIZED-001",
@@ -895,8 +952,8 @@ fn contract(code: &'static str, message: impl Into<String>) -> PipelineError {
     PipelineError::contract(code, message)
 }
 
-fn durability_checkpoint(point: DurabilityPoint) -> Result<()> {
-    checkpoint(point).map_err(|error| {
+fn durability_checkpoint(control: &ControlHandle, point: DurabilityPoint) -> Result<()> {
+    control.checkpoint(point).map_err(|error| {
         contract(
             "KIO-E-LEDGER-DURABILITY-001",
             format!("durability checkpoint failed: {error}"),

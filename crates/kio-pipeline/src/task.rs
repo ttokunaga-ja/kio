@@ -359,14 +359,28 @@ pub struct RetryPolicy {
 #[derive(Debug, Clone)]
 pub struct TaskStore {
     path: PathBuf,
+    control: kio_core::control::ControlHandle,
 }
 
 impl TaskStore {
     #[must_use]
     pub fn new(kio_dir: impl AsRef<Path>) -> Self {
+        Self::new_with_control(kio_dir, kio_core::control::ControlHandle::default())
+    }
+
+    #[must_use]
+    pub fn new_with_control(
+        kio_dir: impl AsRef<Path>,
+        control: kio_core::control::ControlHandle,
+    ) -> Self {
         Self {
             path: kio_dir.as_ref().join("tasks.jsonl"),
+            control,
         }
+    }
+
+    pub fn control(&self) -> &kio_core::control::ControlHandle {
+        &self.control
     }
 
     pub fn append(&self, descriptor: &TaskDescriptor) -> Result<()> {
@@ -406,7 +420,8 @@ impl TaskStore {
                 "task store root is not a real directory",
             ));
         }
-        let retained = crate::platform::task::retain_task_root(root, &listed, &self.path)?;
+        let retained =
+            crate::platform::task::retain_task_root(root, &listed, &self.path, &self.control)?;
         self.all_bound(&retained)
     }
 

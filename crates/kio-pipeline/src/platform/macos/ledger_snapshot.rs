@@ -35,7 +35,10 @@ pub(crate) fn normalized_absolute(path: &Path) -> Result<PathBuf, LedgerSnapshot
     }
     Ok(out)
 }
-pub(crate) fn normalize_snapshot_entry_path(path: &Path) -> Result<PathBuf, LedgerSnapshotError> {
+pub(crate) fn normalize_snapshot_entry_path(
+    path: &Path,
+    _control: &kio_core::control::ControlHandle,
+) -> Result<PathBuf, LedgerSnapshotError> {
     normalized_absolute(path)
 }
 pub(crate) use crate::ledger::snapshot::{

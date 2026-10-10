@@ -20,7 +20,10 @@ fn marker_from_handle(file: &File) -> Result<GcInProgressMarker> {
     GcInProgressMarker::parse_canonical(&bytes)
 }
 
-fn cleanup_marker_temporaries(markers: &File) -> Result<()> {
+fn cleanup_marker_temporaries(
+    markers: &File,
+    control: &crate::control::ControlHandle,
+) -> Result<()> {
     let mut names = Vec::new();
     for entry in cap_fs::read_base_dir(markers).map_err(|e| ioerr(e, "GC markers"))? {
         let entry = entry.map_err(|e| ioerr(e, "GC markers"))?;
@@ -49,13 +52,14 @@ fn cleanup_marker_temporaries(markers: &File) -> Result<()> {
     for leaf in names {
         let (bytes, observed) = read_regular_observed(markers, &leaf, MAX_MARKER_BYTES)?;
         GcInProgressMarker::parse_canonical(&bytes)?;
-        retire_expected(markers, &leaf, &bytes, &observed, MAX_MARKER_BYTES)?;
+        retire_expected(markers, &leaf, &bytes, &observed, MAX_MARKER_BYTES, control)?;
     }
     Ok(())
 }
 
 pub(crate) fn exchange_marker(
     gc: &File,
+    control: &crate::control::ControlHandle,
     internal: &File,
     markers: &File,
     marker: &GcInProgressMarker,
@@ -65,13 +69,13 @@ pub(crate) fn exchange_marker(
     use crate::gc::exchange::OperationKind;
     use crate::platform::ExchangeExpected;
     let owner_file = ensure_child_dir(internal, "marker-exchange")?;
-    let owner = directory(&owner_file)?;
+    let owner = directory(&owner_file, control)?;
     if exchange::inspect_pending(&owner)? {
         return Err(corrupt("GC marker exchange already pending"));
     }
-    cleanup_marker_temporaries(markers)?;
-    let public = directory(gc)?;
-    let prepared = directory(markers)?;
+    cleanup_marker_temporaries(markers, control)?;
+    let public = directory(gc, control)?;
+    let prepared = directory(markers, control)?;
     let temporary = unique_internal_name(".gc-retired-marker");
     create_new_bound(
         markers,
@@ -113,6 +117,7 @@ pub(crate) fn exchange_marker(
 }
 pub(crate) fn recover_marker(
     kio: &File,
+    control: &crate::control::ControlHandle,
     validate_marker: impl Fn(Option<GcInProgressMarker>, GcInProgressMarker) -> Result<()>,
 ) -> Result<()> {
     use crate::gc::exchange::OperationKind;
@@ -124,15 +129,15 @@ pub(crate) fn recover_marker(
         return Ok(());
     };
     let Some(markers) = open_optional_dir(&internal, "markers")? else {
-        if has_pending_marker_exchange(kio)? {
+        if has_pending_marker_exchange(kio, control)? {
             return Err(corrupt("pending marker exchange has no marker directory"));
         }
         return Ok(());
     };
     if let Some(owner_file) = open_optional_dir(&internal, "marker-exchange")? {
-        let owner = directory(&owner_file)?;
-        let public = directory(&gc)?;
-        let prepared = directory(&markers)?;
+        let owner = directory(&owner_file, control)?;
+        let public = directory(&gc, control)?;
+        let prepared = directory(&markers, control)?;
         if let Some(pending) = crate::platform::open_pending_gc_exchange_under_lock(
             &owner,
             &public,
@@ -149,7 +154,7 @@ pub(crate) fn recover_marker(
             pending.complete(&authority, |_| Ok(()))?;
         }
     }
-    cleanup_marker_temporaries(&markers)
+    cleanup_marker_temporaries(&markers, control)
 }
 pub(crate) fn marker_archive_presence(
     archives: &File,

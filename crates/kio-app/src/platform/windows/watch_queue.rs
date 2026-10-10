@@ -91,9 +91,12 @@ fn open_queue_connection(path: &Path) -> Result<(Connection, File), WatchError> 
 }
 
 pub(crate) fn validate_watch_queue_directory(directory: &StoreDirectory) -> Result<(), WatchError> {
-    if kio_core::private_fs::resolve_inherited_private_root(directory.path())
-        .map_err(|error| WatchError::invariant(error.to_string()))?
-        .is_some()
+    if kio_core::private_fs::resolve_inherited_private_root_with_control(
+        directory.path(),
+        directory.control(),
+    )
+    .map_err(|error| WatchError::invariant(error.to_string()))?
+    .is_some()
     {
         return Err(WatchError::invariant(
             "descriptor-backed watch state queues are unsupported on this platform",

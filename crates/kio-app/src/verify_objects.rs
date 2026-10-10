@@ -1,6 +1,7 @@
 //! Bounded object-store verification for `repair verify-objects`.
 
-use crate::context::{AppContext, EvidenceRegistry};
+use crate::context::EvidenceRegistry;
+use kio_core::control::ControlHandle;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -13,13 +14,13 @@ use kio_core::cas::{
     ObjectKind, ObjectStore, canonical_json_bytes, hash_bytes, is_hash, read_bounded_regular_file,
 };
 use kio_core::dag::{CommitObject, NormalizeRef, TreeObject};
-use kio_core::gc::{GcSweepSession, read_active_marker, read_shallow_receipts};
+use kio_core::gc::{GcSweepSession, read_active_marker_with_control, read_shallow_receipts};
 use kio_core::portable::{portable_tag_digest64, portable_tag_name_has_unassigned};
 use kio_core::purge::{
     CanonicalFinalEvent, EventKind, LifecycleEvent, MAX_PURGE_RECORD_BYTES, PurgeState,
     TombstoneMode, canonical_final_event,
 };
-use kio_core::scope::{Repository, names_jsonl_path, now_utc_seconds};
+use kio_core::scope::{Repository, names_jsonl_path};
 use kio_core::{KioError, Result};
 use kio_index::fts::SourceIndexConnection;
 use kio_pipeline::markdownize::{
@@ -144,7 +145,7 @@ const MAX_BATCH_RECORDS: usize = 4096;
 const MAX_BATCH_SCOPES: usize = 256;
 const MAX_BATCH_VERIFIED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-pub(super) fn run_evidence(ctx: &AppContext, args: EvidenceArgs) -> Result<Value> {
+pub(super) fn run_evidence(ctx: &crate::Invocation<'_>, args: EvidenceArgs) -> Result<Value> {
     let registry_input = &EvidenceRegistry::default();
     match args.command {
         EvidenceCommand::Verify(args) => run_evidence_verify(ctx, registry_input, args),
@@ -153,7 +154,7 @@ pub(super) fn run_evidence(ctx: &AppContext, args: EvidenceArgs) -> Result<Value
 }
 
 fn run_evidence_verify(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     args: EvidenceVerifyArgs,
 ) -> Result<Value> {
@@ -178,7 +179,7 @@ fn run_evidence_verify(
 }
 
 fn verify_batch_row(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     strict: bool,
@@ -220,7 +221,7 @@ fn evidence_pointer_cache_key(pointer: &EvidencePointer) -> Result<Vec<u8>> {
 }
 
 fn bind_batch_scopes(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     pointers: &[EvidencePointer],
     strict: bool,
@@ -354,7 +355,7 @@ fn batch_limit_error(line: usize, limit: &str, maximum: usize) -> KioError {
 /// judgment `resolve_pointer_for_cli` (open/view/restore) uses — PB66's
 /// structural requirement.
 fn verify_pointer_for_cli(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     strict: bool,
@@ -390,7 +391,11 @@ struct EvidenceScopeBinding {
 }
 
 impl EvidenceScopeBinding {
-    fn recheck(&self, ctx: &AppContext, registry_input: &EvidenceRegistry) -> Result<()> {
+    fn recheck(
+        &self,
+        ctx: &crate::Invocation<'_>,
+        registry_input: &EvidenceRegistry,
+    ) -> Result<()> {
         match &self.state {
             EvidenceScopeState::Ready {
                 target,
@@ -404,6 +409,7 @@ impl EvidenceScopeBinding {
                     registry_input,
                     &self.scope_id,
                     self.scope_path.as_deref(),
+                    ctx.control,
                 )
                 .map_err(|error| {
                     // A second resolver invocation is the existing
@@ -431,7 +437,7 @@ impl EvidenceScopeBinding {
                 if retained_generation != *index_generation {
                     return Err(batch_changed_error());
                 }
-                check_index_generation_current(&target.kio_dir)?;
+                check_index_generation_current(&target.kio_dir, ctx.control)?;
                 if index_generation_for_evidence(&target.kio_dir)? != *index_generation {
                     return Err(batch_changed_error());
                 }
@@ -454,13 +460,19 @@ impl EvidenceScopeBinding {
 }
 
 fn unavailable_evidence_result(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     scope_id: &str,
     scope_path: Option<&str>,
     strict_exit: ExitCode,
 ) -> Result<EvidenceVerification> {
-    match resolve_evidence_scope_target(ctx.cwd(), registry_input, scope_id, scope_path) {
+    match resolve_evidence_scope_target(
+        ctx.cwd(),
+        registry_input,
+        scope_id,
+        scope_path,
+        ctx.control,
+    ) {
         Err(error) if error.error_code() == "KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001" => {
             Ok(EvidenceVerification::new(
                 EvidenceStatus::ScopeUnreachable,
@@ -494,7 +506,7 @@ fn is_registry_snapshot_error(error: &KioError) -> bool {
 }
 
 fn bind_evidence_scope(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     strict: bool,
@@ -504,6 +516,7 @@ fn bind_evidence_scope(
         registry_input,
         &pointer.scope_id,
         pointer.scope_path.as_deref(),
+        ctx.control,
     ) {
         Ok(target) => target,
         // PB53: a structured `status`, not a raw command failure — exit 0
@@ -550,12 +563,13 @@ fn bind_evidence_scope(
     // used to open second, so a format-incompatible scope with an active
     // purge journal surfaced the lower-priority
     // `KIO-E-PURGE-JOURNAL-ACTIVE-001` instead of `KIO-E-STORE-VERSION-001`.
-    let repo = Repository::open_for_search_read_only(&target.repo_root)?;
+    let repo =
+        Repository::open_for_search_read_only_with_control(&target.repo_root, ctx.control.clone())?;
     // QB5/QB6/裁定1: shared (1)+(3) preflight pair. Evidence verify's whole
     // response IS existence information (08 §4.3 — it never returns body),
     // so checkpoint 2 below (LC54/LC55) gates every return point, not only a
     // single "success" path.
-    let checkpoint = preflight_barrier_and_index(&target.kio_dir)?;
+    let checkpoint = preflight_barrier_and_index(&target.kio_dir, ctx.control)?;
     let source_index = open_existing_source_index_connection(
         sqlite_path(&target.kio_dir),
         ExistingSourceIndexOpenMode::ReadOnly,
@@ -595,7 +609,7 @@ fn verify_pointer_in_scope(
         }
         Err(error) => return Err(error),
     };
-    let store = ObjectStore::new(&target.kio_dir);
+    let store = ObjectStore::new_with_control(&target.kio_dir, repo.control().clone());
     let (commit_shallow, entry_gen, entry_normalize) = match repo.read_tree(&commit.tree) {
         Ok(tree) => {
             // PB42/43/44 (§O, verify side): select the entry whose
@@ -622,10 +636,11 @@ fn verify_pointer_in_scope(
             (false, entry_gen, entry.normalize.clone())
         }
         Err(error) if is_store_not_found(&error) => {
-            kio_core::gc::validate_final_shallow_tree(
+            kio_core::gc::validate_final_shallow_tree_with_control(
                 &target.kio_dir,
                 &pointer.commit,
                 &commit.tree,
+                repo.control(),
             )?;
             (true, None, None)
         }
@@ -700,7 +715,9 @@ fn verify_pointer_in_scope(
     // Defense-in-depth: re-run the identical canonical dispatch after the
     // chunk read, in case a purge raced the resolution above (mirrors the
     // pre-existing double-check this function has always performed).
-    if let Err(marker_error) = enforce_canonical_marker_barrier(target, &pointer.raw_hash, true) {
+    if let Err(marker_error) =
+        enforce_canonical_marker_barrier(target, &pointer.raw_hash, true, repo.control())
+    {
         return dispatch_marker_barrier_error(
             checkpoint,
             target,
@@ -773,7 +790,12 @@ fn canonical_pointer_marker_verification(
         Err(error) if is_store_not_found(&error) => false,
         Err(error) => return Err(error),
     };
-    match enforce_canonical_marker_barrier(target, &pointer.raw_hash, raw_present) {
+    match enforce_canonical_marker_barrier(
+        target,
+        &pointer.raw_hash,
+        raw_present,
+        &checkpoint.control,
+    ) {
         Ok(()) => Ok(None),
         Err(marker_error) => dispatch_marker_barrier_error(
             checkpoint,
@@ -997,8 +1019,8 @@ fn verify_objects_with_limits(
     limits: VerifyLimits,
 ) -> Result<VerifyObjectsReport> {
     let store = repo.object_store();
-    let purge = PurgeState::open(repo.kio_dir())?;
-    let invocation_time = now_utc_seconds();
+    let purge = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
+    let invocation_time = repo.control().now_utc_seconds();
     let mut state = State {
         max_objects: limits.max_objects,
         max_verified_bytes: limits.max_verified_bytes,
@@ -1028,7 +1050,7 @@ fn verify_objects_with_limits(
             return Ok(finish_report(state, 0, None));
         }
     };
-    let active_gc_marker = match read_active_marker(repo.kio_dir()) {
+    let active_gc_marker = match read_active_marker_with_control(repo.kio_dir(), repo.control()) {
         Ok(marker) => marker,
         Err(error) => {
             state.finding("gc_sweep_marker_corrupt", "", &error.to_string(), &[]);
@@ -1042,7 +1064,10 @@ fn verify_objects_with_limits(
     // sole tree that named it was shallow-discarded.
     let mut final_shallow_commits = BTreeSet::new();
     if active_gc_marker.is_none() {
-        match kio_core::gc::validated_final_shallow_receipts(repo.kio_dir()) {
+        match kio_core::gc::validated_final_shallow_receipts_with_control(
+            repo.kio_dir(),
+            repo.control(),
+        ) {
             Ok(receipts) => {
                 final_shallow_commits.extend(receipts.into_keys());
             }
@@ -1058,7 +1083,10 @@ fn verify_objects_with_limits(
         // tree state.  This is the same state machine used by `kio gc --yes`,
         // so impossible combinations are corruption rather than a misleading
         // retryable finding.
-        let session = match GcSweepSession::bind(repo.root().to_path_buf()) {
+        let session = match GcSweepSession::bind_with_control(
+            repo.root().to_path_buf(),
+            repo.control().clone(),
+        ) {
             Ok(session) => session,
             Err(error) => {
                 state.finding("gc_sweep_marker_corrupt", "", &error.to_string(), &[]);
@@ -1923,7 +1951,7 @@ fn verify_objects_with_limits(
         let max_event_lifecycle_epoch = purge.max_recorded_lifecycle_epoch()?;
         purge.recover_lifecycle_epoch(0, max_event_lifecycle_epoch)?;
         if index_exists {
-            recover_index_generation(repo.kio_dir())?;
+            recover_index_generation(repo.kio_dir(), repo.control())?;
         }
     }
     let repair_actor = std::env::var("USER").unwrap_or_else(|_| "local-user".to_owned());
@@ -1973,7 +2001,7 @@ fn verify_objects_with_limits(
     // of its own -- its other callers run only after `rebuild_step3_index`
     // already guarantees the file is there).
     if any_retired && index_exists {
-        recover_index_generation(repo.kio_dir())?;
+        recover_index_generation(repo.kio_dir(), repo.control())?;
     }
     let repaired = staged_raws.len() as u64;
     let repaired_commit_hash = if repaired > 0 && repairs_allowed && !state.exceeded_bounds {
@@ -2470,9 +2498,10 @@ pub(super) fn purge_explains_missing_retained_instance(
     normalize: &NormalizeRef,
 ) -> Result<bool> {
     let session = GcSweepSession::bind_repository(repo)?;
-    let directory = kio_core::store_dir::StoreDirectory::from_retained(
+    let directory = kio_core::store_dir::StoreDirectory::from_retained_with_control(
         session.retained_kio_handle()?,
         repo.kio_dir().to_path_buf(),
+        repo.control().clone(),
     )?;
     let purge = PurgeState::from_directory(directory);
     if purge.barrier_blocks(raw_hash)? {
@@ -2530,7 +2559,7 @@ pub(super) fn purge_explains_missing_retained_instance(
         &trees,
         &reachable,
         repo.head_commit_hash()?.as_deref(),
-        &now_utc_seconds(),
+        &repo.control().now_utc_seconds(),
     );
     if !authority
         .get(&normalize.manifest_hash)
@@ -3432,13 +3461,16 @@ impl RegistryPrunePlan {
 }
 
 /// Compute which registry rows are unreachable. Removes nothing.
-pub fn registry_prune_plan() -> Result<RegistryPrunePlan> {
-    let registry = RegistryDb::open_default().map_err(index_to_kio)?;
+pub(crate) fn registry_prune_plan_with_control(
+    control: &ControlHandle,
+) -> Result<RegistryPrunePlan> {
+    let registry = RegistryDb::open_default_with_control(control).map_err(index_to_kio)?;
     let mut rows = Vec::new();
     for entry in registry.all_entries().map_err(index_to_kio)? {
         if crate::open_scope_from_hint_with_mode(
             &entry.root_path,
             crate::ScopeResolutionMode::Normal,
+            control,
         )
         .is_none()
         {
@@ -3448,13 +3480,16 @@ pub fn registry_prune_plan() -> Result<RegistryPrunePlan> {
     Ok(RegistryPrunePlan { rows })
 }
 
-/// Retire exactly the rows [`registry_prune_plan`] listed.
+/// Retire exactly the rows [`registry_prune_plan_with_control`] listed.
 ///
 /// H2-6 (R24b terra-002, fatal): re-scanning here instead would let a row that
 /// became unreachable AFTER the user saw the preview be deleted without ever
 /// having been shown.
-pub fn registry_prune_apply(plan: &RegistryPrunePlan) -> Result<RegistryPruneReport> {
-    let registry = RegistryDb::open_default().map_err(index_to_kio)?;
+pub(crate) fn registry_prune_apply_with_control(
+    plan: &RegistryPrunePlan,
+    control: &ControlHandle,
+) -> Result<RegistryPruneReport> {
+    let registry = RegistryDb::open_default_with_control(control).map_err(index_to_kio)?;
     let mut pruned = 0u64;
     for (scope_id, kio_path, _) in &plan.rows {
         registry.remove(scope_id, kio_path).map_err(index_to_kio)?;
@@ -3861,7 +3896,13 @@ mod tests {
             scope_path: Some(dir.path().join("missing-scope").display().to_string()),
         };
         let context = crate::context::test_support::context(dir.path());
-        let ctx = &context;
+        let settings = Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+        let control = ControlHandle::default();
+        let ctx = &crate::Invocation {
+            context: &context,
+            settings: &settings,
+            control: &control,
+        };
         let registry = EvidenceRegistry::fixture(registry_path.clone());
         let registry_input = &registry;
         let mut bindings =

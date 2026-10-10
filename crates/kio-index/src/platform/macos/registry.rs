@@ -21,6 +21,7 @@ pub(crate) struct RegistryParentBinding {
 
 pub(crate) fn registry_parent_and_leaf(
     path: &Path,
+    _control: &kio_core::control::ControlHandle,
 ) -> std::result::Result<RegistryParentBinding, RegistrySnapshotError> {
     let path = normalized_absolute_registry_path(path)?;
     let filesystem_root = registry_filesystem_root(&path)?;
@@ -129,10 +130,11 @@ pub(crate) fn registry_parent_and_leaf(
 
 pub(crate) fn stable_registry_parent_binding(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> std::result::Result<Option<RegistryParentBinding>, SnapshotAttemptError> {
-    match registry_parent_and_leaf(path) {
+    match registry_parent_and_leaf(path, control) {
         Ok(binding) => Ok(Some(binding)),
-        Err(RegistrySnapshotError::Missing) => match registry_parent_and_leaf(path) {
+        Err(RegistrySnapshotError::Missing) => match registry_parent_and_leaf(path, control) {
             Err(RegistrySnapshotError::Missing) => Ok(None),
             Ok(_) => Err(SnapshotAttemptError::Unstable(
                 "scope registry parent appeared while confirming its absence".to_owned(),
@@ -147,9 +149,10 @@ pub(crate) fn stable_registry_parent_binding(
 /// to be the same directory as the descriptor used to capture the snapshot.
 pub(crate) fn fresh_registry_parent_binding(
     held: &RegistryParentBinding,
+    control: &kio_core::control::ControlHandle,
 ) -> std::result::Result<std::sync::Arc<fs::File>, SnapshotAttemptError> {
     let canonical_path = held.parent_path.join(&held.leaf);
-    let fresh = match registry_parent_and_leaf(&canonical_path) {
+    let fresh = match registry_parent_and_leaf(&canonical_path, control) {
         Ok(binding) => binding,
         Err(RegistrySnapshotError::Missing) => {
             return Err(SnapshotAttemptError::Unstable(
@@ -229,6 +232,7 @@ pub(crate) fn normalized_absolute_registry_path(
 use crate::platform::registry_unix::registry_filesystem_root;
 pub(crate) fn prepare_registry_writer(
     path: &Path,
+    _control: &kio_core::control::ControlHandle,
 ) -> Result<(PathBuf, Option<kio_core::store_dir::StoreDirectory>)> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)

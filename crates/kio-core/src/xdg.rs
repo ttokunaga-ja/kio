@@ -3,7 +3,7 @@
 use std::ffi::OsString;
 use std::path::PathBuf;
 
-use crate::platform::profile_dir;
+use crate::{control::ControlHandle, platform::profile_dir};
 
 /// Read an `XDG_*` base-directory environment variable per the XDG Base Directory
 /// Specification's validity rules: an **unset, empty, or relative** value must be
@@ -48,8 +48,17 @@ fn xdg_dir_from(value: Option<OsString>) -> Option<PathBuf> {
 /// their conventional suffix (`.local/share`, `.config`, `.cache`).
 #[must_use]
 pub fn home_dir() -> Option<PathBuf> {
+    home_dir_with_control(&ControlHandle::default())
+}
+
+#[must_use]
+pub fn home_dir_with_control(control: &ControlHandle) -> Option<PathBuf> {
     let home = home_dir_from(std::env::var_os("HOME"));
-    if home.is_some() { home } else { profile_dir() }
+    if home.is_some() {
+        home
+    } else {
+        profile_dir(control)
+    }
 }
 
 #[cfg(test)]

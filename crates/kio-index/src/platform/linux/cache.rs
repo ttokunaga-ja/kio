@@ -29,29 +29,37 @@ fn validate_linux_cache_path_lexical(path: &Path) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn bind_cache_parent(path: &Path, create_parent: bool) -> Result<BoundCacheParent> {
+pub(super) fn bind_cache_parent(
+    path: &Path,
+    create_parent: bool,
+    control: &kio_core::control::ControlHandle,
+) -> Result<BoundCacheParent> {
     validate_linux_cache_path_lexical(path)?;
-    bind_cache_parent_unchecked(path, create_parent)
+    bind_cache_parent_unchecked(path, create_parent, control)
 }
 pub(super) fn open_or_create_cache_parent(
     path: &Path,
     create_missing: bool,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<(std::fs::File, PathBuf)> {
-    if let Some(bound) = open_or_create_inherited_cache_parent(path, create_missing)? {
+    if let Some(bound) = open_or_create_inherited_cache_parent(path, create_missing, control)? {
         return Ok(bound);
     }
-    open_or_create_ambient_cache_parent(path, create_missing)
+    open_or_create_ambient_cache_parent(path, create_missing, control)
 }
 fn open_or_create_inherited_cache_parent(
     path: &Path,
     create_missing: bool,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<Option<(std::fs::File, std::path::PathBuf)>> {
-    let Some((mut current, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
-        .map_err(|error| {
-            crate::IndexError::Schema(format!(
-                "resolve inherited aggregator cache capability: {error}"
-            ))
-        })?
+    let Some((mut current, suffix)) =
+        kio_core::private_fs::resolve_inherited_private_root_with_control(path, control).map_err(
+            |error| {
+                crate::IndexError::Schema(format!(
+                    "resolve inherited aggregator cache capability: {error}"
+                ))
+            },
+        )?
     else {
         return Ok(None);
     };
@@ -84,13 +92,17 @@ fn open_or_create_inherited_cache_parent(
                 logical.display()
             )));
         };
-        current = kio_core::store_dir::StoreDirectory::from_retained(next, logical.clone())
-            .map_err(|error| {
-                crate::IndexError::Schema(format!(
-                    "retain inherited aggregator cache directory {}: {error}",
-                    logical.display()
-                ))
-            })?;
+        current = kio_core::store_dir::StoreDirectory::from_retained_with_control(
+            next,
+            logical.clone(),
+            control.clone(),
+        )
+        .map_err(|error| {
+            crate::IndexError::Schema(format!(
+                "retain inherited aggregator cache directory {}: {error}",
+                logical.display()
+            ))
+        })?;
         verify_private_cache_directory(current.root_handle().as_ref(), &logical)?;
     }
     let retained = current.root_handle().try_clone().map_err(|error| {

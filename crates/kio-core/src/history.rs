@@ -5,7 +5,7 @@
 //! as history truth.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
@@ -300,6 +300,27 @@ impl HistoryReader {
 
     #[must_use]
     pub fn with_limits(kio_dir: impl Into<PathBuf>, limits: HistoryLimits) -> Self {
+        Self::with_limits_with_control(kio_dir, limits, crate::control::ControlHandle::default())
+    }
+
+    #[must_use]
+    pub fn new_with_control(
+        kio_dir: impl AsRef<Path>,
+        control: crate::control::ControlHandle,
+    ) -> Self {
+        Self::with_limits_with_control(
+            kio_dir.as_ref().to_path_buf(),
+            HistoryLimits::default(),
+            control,
+        )
+    }
+
+    #[must_use]
+    pub fn with_limits_with_control(
+        kio_dir: impl Into<PathBuf>,
+        limits: HistoryLimits,
+        control: crate::control::ControlHandle,
+    ) -> Self {
         let supplied = kio_dir.into();
         // HistoryReader has historically accepted ordinary ambient paths
         // (including macOS tempfile paths spelled through `/var` while the
@@ -310,7 +331,7 @@ impl HistoryReader {
         // established typed error at use time.
         let kio_dir = supplied.canonicalize().unwrap_or(supplied);
         Self {
-            store: ObjectStore::new(&kio_dir),
+            store: ObjectStore::new_with_control(&kio_dir, control),
             kio_dir,
             limits,
         }
@@ -555,10 +576,11 @@ impl HistoryReader {
             Ok(object) => Ok(object),
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
                 if kind == ObjectKind::Tree {
-                    crate::gc::validate_final_shallow_tree(
+                    crate::gc::validate_final_shallow_tree_with_control(
                         &self.kio_dir,
                         commit_hash,
                         object_hash,
+                        self.store.control(),
                     )?;
                 }
                 Err(history_shallow_error(commit_hash, kind, object_hash))
@@ -673,7 +695,10 @@ impl HistoryReader {
     /// tolerated until recovery completes. `read_shallow_receipts` is itself a
     /// strict no-follow, canonical receipt inventory.
     fn markerless_shallow_receipts(&self) -> Result<BTreeMap<String, String>> {
-        crate::gc::validated_final_shallow_receipts(&self.kio_dir)
+        crate::gc::validated_final_shallow_receipts_with_control(
+            &self.kio_dir,
+            self.store.control(),
+        )
     }
 }
 

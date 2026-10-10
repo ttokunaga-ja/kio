@@ -288,7 +288,10 @@ pub(crate) fn restrict_existing_private_handle(file: &File) -> Result<()> {
     verify_owner_only(file, &owner, Path::new("<retained>"))
 }
 
-pub(crate) fn verify_private_directory(path: &Path) -> Result<StoreDirectory> {
+pub(crate) fn verify_private_directory(
+    path: &Path,
+    control: crate::control::ControlHandle,
+) -> Result<StoreDirectory> {
     let (root_path, components) = windows_absolute_components(path)?;
     let owner = CurrentUserSid::current()
         .map_err(|_| unsafe_file("cannot determine current Windows user", Some(path)))?;
@@ -311,10 +314,13 @@ pub(crate) fn verify_private_directory(path: &Path) -> Result<StoreDirectory> {
         directory = next;
     }
     verify_owner_only(&directory, &owner, path)?;
-    StoreDirectory::from_retained(directory, path.to_path_buf())
+    StoreDirectory::from_retained_with_control(directory, path.to_path_buf(), control)
 }
 
-pub(crate) fn verify_private_creation_parent(path: &Path) -> Result<StoreDirectory> {
+pub(crate) fn verify_private_creation_parent(
+    path: &Path,
+    control: crate::control::ControlHandle,
+) -> Result<StoreDirectory> {
     let (root_path, components) = windows_absolute_components(path)?;
     let owner = CurrentUserSid::current()
         .map_err(|_| unsafe_file("cannot determine current Windows user", Some(path)))?;
@@ -334,10 +340,14 @@ pub(crate) fn verify_private_creation_parent(path: &Path) -> Result<StoreDirecto
         verify_trusted_acl(&next, &owner, path, true)?;
         directory = next;
     }
-    StoreDirectory::from_retained(directory, path.to_path_buf())
+    StoreDirectory::from_retained_with_control(directory, path.to_path_buf(), control)
 }
 
-pub(crate) fn read_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
+pub(crate) fn read_private_file(
+    path: &Path,
+    max_bytes: u64,
+    _control: crate::control::ControlHandle,
+) -> Result<Vec<u8>> {
     let (root_path, components) = windows_absolute_components(path)?;
     let owner = CurrentUserSid::current()
         .map_err(|_| unsafe_file("cannot determine current Windows user", Some(path)))?;
@@ -958,6 +968,7 @@ impl CurrentUserSid {
 
 pub(crate) fn resolve_inherited_private_root(
     path: &Path,
+    _control: crate::control::ControlHandle,
 ) -> Result<Option<(StoreDirectory, Vec<std::ffi::OsString>)>> {
     let _ = path;
     Ok(None)

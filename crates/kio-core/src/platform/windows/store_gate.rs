@@ -109,12 +109,16 @@ pub(crate) fn idle_lock(kio: &File) -> Result<Option<IdleLock>> {
 mod tests {
     use super::*;
     use crate::ExitCode;
-    use crate::scope::locks::acquire_retained_lock_kind;
+    use crate::scope::locks::acquire_retained_lock_kind_with_control;
     use crate::scope::{
         Repository, StoreLock, acquire_bound_store_lock, acquire_bound_store_read_guard,
-        canonical_lock_bytes,
+        canonical_lock_bytes_with_control,
     };
     use std::fs;
+
+    fn canonical_lock_bytes(pid: u32, token: &str) -> Result<Vec<u8>> {
+        canonical_lock_bytes_with_control(&crate::control::ControlHandle::default(), pid, token)
+    }
 
     fn retained(repo: &Repository) -> File {
         repo.store_directory()
@@ -231,7 +235,12 @@ mod tests {
         let generic = StoreLock::acquire_path(repo.kio_dir().join(".lock")).unwrap();
         locked(StoreLock::acquire(repo.kio_dir()));
         drop(generic);
-        let nongated = acquire_retained_lock_kind(&kio, false).unwrap();
+        let nongated = acquire_retained_lock_kind_with_control(
+            &kio,
+            false,
+            &crate::control::ControlHandle::default(),
+        )
+        .unwrap();
         locked(repo.lock_store());
         drop(nongated);
         repo.lock_store().unwrap();

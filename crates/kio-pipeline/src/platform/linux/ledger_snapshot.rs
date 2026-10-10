@@ -34,8 +34,11 @@ pub(crate) fn normalized_absolute(path: &Path) -> Result<PathBuf, LedgerSnapshot
     }
     Ok(out)
 }
-pub(crate) fn normalize_snapshot_entry_path(path: &Path) -> Result<PathBuf, LedgerSnapshotError> {
-    let inherited_path = inherited_ledger_root(path)?.is_some();
+pub(crate) fn normalize_snapshot_entry_path(
+    path: &Path,
+    control: &kio_core::control::ControlHandle,
+) -> Result<PathBuf, LedgerSnapshotError> {
+    let inherited_path = inherited_ledger_root(path, control)?.is_some();
     if inherited_path {
         Ok(path.to_path_buf())
     } else {
@@ -48,22 +51,26 @@ pub(crate) fn normalize_snapshot_entry_path(path: &Path) -> Result<PathBuf, Ledg
 /// ambient filesystem path.
 fn inherited_ledger_root(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<
     Option<(kio_core::store_dir::StoreDirectory, Vec<std::ffi::OsString>)>,
     LedgerSnapshotError,
 > {
-    kio_core::private_fs::resolve_inherited_private_root(path).map_err(|error| {
-        LedgerSnapshotError::UnsafeIntegrity(format!(
-            "resolve inherited ledger directory capability: {error}"
-        ))
-    })
+    kio_core::private_fs::resolve_inherited_private_root_with_control(path, control).map_err(
+        |error| {
+            LedgerSnapshotError::UnsafeIntegrity(format!(
+                "resolve inherited ledger directory capability: {error}"
+            ))
+        },
+    )
 }
 /// Bind an inherited directory capability and traverse only the resolver's
 /// validated suffix with no-follow operations.
 fn bound_inherited_parent(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<Option<(fs::File, String, PathBuf)>, LedgerSnapshotError> {
-    let Some((root, suffix)) = inherited_ledger_root(path)? else {
+    let Some((root, suffix)) = inherited_ledger_root(path, control)? else {
         return Ok(None);
     };
     bound_inherited_parent_from_root(path, root, &suffix).map(Some)
@@ -135,8 +142,9 @@ fn bound_inherited_parent_from_root(
 /// otherwise join observations from two unrelated authority roots.
 fn stable_inherited_parent_binding(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<Option<(fs::File, String, PathBuf)>, AttemptError> {
-    let (root, suffix) = inherited_ledger_root(path)
+    let (root, suffix) = inherited_ledger_root(path, control)
         .map_err(parent_binding_error)?
         .ok_or_else(|| AttemptError::Unsafe("inherited ledger root disappeared".into()))?;
     match bound_inherited_parent_from_root(path, root.clone(), &suffix) {
@@ -147,7 +155,7 @@ fn stable_inherited_parent_binding(
                     "ledger parent appeared while confirming its absence".into(),
                 )),
                 Err(LedgerSnapshotError::Missing) => {
-                    let (fresh_root, fresh_suffix) = inherited_ledger_root(path)
+                    let (fresh_root, fresh_suffix) = inherited_ledger_root(path, control)
                         .map_err(parent_binding_error)?
                         .ok_or_else(|| {
                             AttemptError::Unstable(
@@ -162,14 +170,15 @@ fn stable_inherited_parent_binding(
                     require_same_inherited_root(&root, &fresh_root, "while confirming absence")?;
                     match bound_inherited_parent_from_root(path, fresh_root, &suffix) {
                         Err(LedgerSnapshotError::Missing) => {
-                            let (post_walk_root, post_walk_suffix) = inherited_ledger_root(path)
-                                .map_err(parent_binding_error)?
-                                .ok_or_else(|| {
-                                    AttemptError::Unstable(
+                            let (post_walk_root, post_walk_suffix) =
+                                inherited_ledger_root(path, control)
+                                    .map_err(parent_binding_error)?
+                                    .ok_or_else(|| {
+                                        AttemptError::Unstable(
                                         "inherited ledger root disappeared after final absence walk"
                                             .into(),
                                     )
-                                })?;
+                                    })?;
                             if post_walk_suffix != suffix {
                                 return Err(AttemptError::Unsafe(
                                     "inherited ledger suffix changed after final absence walk"
@@ -217,22 +226,24 @@ fn require_same_inherited_root(
 }
 pub(crate) fn bound_parent(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<(fs::File, String, PathBuf), LedgerSnapshotError> {
-    if let Some(binding) = bound_inherited_parent(path)? {
+    if let Some(binding) = bound_inherited_parent(path, control)? {
         return Ok(binding);
     }
-    crate::ledger::snapshot::bound_ambient_parent(path)
+    crate::ledger::snapshot::bound_ambient_parent(path, control)
 }
 pub(crate) fn stable_parent_binding(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<Option<(fs::File, String, PathBuf)>, AttemptError> {
-    if inherited_ledger_root(path)
+    if inherited_ledger_root(path, control)
         .map_err(parent_binding_error)?
         .is_some()
     {
-        return stable_inherited_parent_binding(path);
+        return stable_inherited_parent_binding(path, control);
     }
-    crate::ledger::snapshot::stable_ambient_parent_binding(path)
+    crate::ledger::snapshot::stable_ambient_parent_binding(path, control)
 }
 #[cfg(test)]
 use crate::ledger::snapshot::run_missing_parent_hook;

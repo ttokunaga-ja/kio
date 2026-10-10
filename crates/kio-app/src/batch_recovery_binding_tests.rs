@@ -114,7 +114,13 @@ fn gemini_collection_requires_scope_profile_and_returned_job_attribution() {
             polls: Cell::new(0),
         };
         let poll = poll_attributed_embedding_batch_job(
-            &crate::context::test_support::context(std::path::Path::new(".")),
+            &crate::Invocation {
+                context: &crate::context::test_support::context(std::path::Path::new(".")),
+                settings: &std::sync::Arc::new(
+                    kio_adapter::tool_lock::AdapterRuntimeSettings::default(),
+                ),
+                control: ledger.control(),
+            },
             &client,
             &row,
             Some(if case == "wrong_profile" {
@@ -578,7 +584,13 @@ fn credential_or_device_key_rotation_holds_existing_rows_without_provider_effect
         };
         assert!(
             poll_attributed_embedding_batch_job(
-                &crate::context::test_support::context(std::path::Path::new(".")),
+                &crate::Invocation {
+                    context: &crate::context::test_support::context(std::path::Path::new(".")),
+                    settings: &std::sync::Arc::new(
+                        kio_adapter::tool_lock::AdapterRuntimeSettings::default()
+                    ),
+                    control: ledger.control(),
+                },
                 &gemini,
                 &row,
                 Some("profile")

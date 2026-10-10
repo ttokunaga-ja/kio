@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 #[cfg(test)]
 use kio_core::cas::hash_bytes;
+use kio_core::control::ControlHandle;
 use kio_core::store_dir::{Publication, StoreDirectory};
 use kio_core::{ExitCode, KioError, Result};
 use serde::{Deserialize, Serialize};
@@ -82,21 +83,28 @@ impl RuntimeTrust {
     }
 }
 
-pub(crate) fn directory_path() -> PathBuf {
-    super::data_home().join("kio/local-trust")
+pub(crate) fn directory_path(control: &ControlHandle) -> PathBuf {
+    super::data_home(control).join("kio/local-trust")
 }
 
 /// Read status without creating a directory, lock, repair, or snapshot.
 #[cfg(test)]
-pub(crate) fn status(trust_directory: &Path) -> Result<Option<TrustRecord>> {
-    read_record(trust_directory)
+pub(crate) fn status(
+    trust_directory: &Path,
+    control: &kio_core::control::ControlHandle,
+) -> Result<Option<TrustRecord>> {
+    read_record(trust_directory, control)
 }
 
 /// Acquire the active managed CA and retain the trust-store lock until the
 /// returned guard is dropped. This prevents a revoke or rotation from racing a
 /// command after its egress authority has been admitted.
-pub(crate) fn acquire_runtime_trust(trust_directory: &Path) -> Result<Option<RuntimeTrust>> {
-    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES)? else {
+pub(crate) fn acquire_runtime_trust(
+    trust_directory: &Path,
+    control: &ControlHandle,
+) -> Result<Option<RuntimeTrust>> {
+    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES, control)?
+    else {
         return Ok(None);
     };
     let record = read_record_from(state.directory())?.ok_or_else(missing_record)?;
@@ -107,7 +115,7 @@ pub(crate) fn acquire_runtime_trust(trust_directory: &Path) -> Result<Option<Run
         return Ok(None);
     }
     let path = trust_directory.join(&record.snapshot);
-    let digest = kio_adapter::local_peer::capture_private_local_trust(&path)
+    let digest = kio_adapter::local_peer::capture_private_local_trust_with_control(&path, control)
         .map_err(super::adapter_to_kio)?;
     if digest != record.digest {
         return Err(err(
@@ -134,20 +142,23 @@ pub(crate) fn register(
     ca_pem: &Path,
     preview: bool,
     resume: Option<&str>,
+    control: &ControlHandle,
 ) -> Result<TrustRecord> {
-    let source = validated_source(ca_pem)?;
+    let source = validated_source(ca_pem, control)?;
     if preview {
-        return preview_registration(trust_directory, &source, resume);
+        return preview_registration(trust_directory, &source, resume, control);
     }
-    if crate::private_state::open_readonly(trust_directory)?.is_none() {
+    if crate::private_state::open_readonly(trust_directory, control)?.is_none() {
         if resume.is_some() {
             return Err(absent());
         }
         let record = register_record_for_digest(trust_directory, None, &source.digest, true)?;
-        let state =
-            crate::private_state::create_initialized(trust_directory, LOCK_BYTES, |directory| {
-                write_pending(directory, &record, None)
-            })?;
+        let state = crate::private_state::create_initialized(
+            trust_directory,
+            LOCK_BYTES,
+            |directory| write_pending(directory, &record, None),
+            control,
+        )?;
         publish(
             state.directory(),
             &record,
@@ -157,8 +168,8 @@ pub(crate) fn register(
         clear_pending(state.directory())?;
         return Ok(record);
     }
-    let state =
-        crate::private_state::open_existing(trust_directory, LOCK_BYTES)?.ok_or_else(absent)?;
+    let state = crate::private_state::open_existing(trust_directory, LOCK_BYTES, control)?
+        .ok_or_else(absent)?;
     let current = read_record_from(state.directory())?;
     let pending = read_pending_from(state.directory())?;
     if let Some(resume) = resume {
@@ -188,8 +199,9 @@ fn preview_registration(
     trust_directory: &Path,
     source: &ValidatedSource,
     resume: Option<&str>,
+    control: &ControlHandle,
 ) -> Result<TrustRecord> {
-    let Some(directory) = crate::private_state::open_readonly(trust_directory)? else {
+    let Some(directory) = crate::private_state::open_readonly(trust_directory, control)? else {
         if resume.is_some() {
             return Err(absent());
         }
@@ -261,14 +273,20 @@ fn resume_record(
 
 /// Rotate an active managed CA. A rotation assigns a new monotonic generation,
 /// so grants bound to the prior digest no longer match.
-pub(crate) fn rotate(trust_directory: &Path, ca_pem: &Path, preview: bool) -> Result<TrustRecord> {
-    let source = validated_source(ca_pem)?;
+pub(crate) fn rotate(
+    trust_directory: &Path,
+    ca_pem: &Path,
+    preview: bool,
+    control: &ControlHandle,
+) -> Result<TrustRecord> {
+    let source = validated_source(ca_pem, control)?;
     if preview {
-        let current = active_record(read_record(trust_directory)?)?;
+        let current = active_record(read_record(trust_directory, control)?)?;
         return rotated_record_for_digest(trust_directory, &current, &source.digest);
     }
 
-    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES)? else {
+    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES, control)?
+    else {
         return Err(absent());
     };
     if let Some(pending) = read_pending_from(state.directory())? {
@@ -287,12 +305,16 @@ pub(crate) fn rotate(trust_directory: &Path, ca_pem: &Path, preview: bool) -> Re
 
 /// Persist a revocation tombstone. Repeating a completed revoke is idempotent;
 /// status and a missing record remain read-only.
-pub(crate) fn revoke(trust_directory: &Path, preview: bool) -> Result<Option<TrustRecord>> {
+pub(crate) fn revoke(
+    trust_directory: &Path,
+    preview: bool,
+    control: &ControlHandle,
+) -> Result<Option<TrustRecord>> {
     if preview {
-        let Some(initial) = read_record(trust_directory)? else {
+        let Some(initial) = read_record(trust_directory, control)? else {
             return Ok(None);
         };
-        let Some(directory) = crate::private_state::open_readonly(trust_directory)? else {
+        let Some(directory) = crate::private_state::open_readonly(trust_directory, control)? else {
             return Ok(None);
         };
         if let Some(pending) = read_pending_from(&directory)? {
@@ -307,7 +329,8 @@ pub(crate) fn revoke(trust_directory: &Path, preview: bool) -> Result<Option<Tru
             }
         }));
     }
-    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES)? else {
+    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES, control)?
+    else {
         return Ok(None);
     };
     if let Some(pending) = read_pending_from(state.directory())? {
@@ -519,8 +542,8 @@ fn clear_pending(directory: &StoreDirectory) -> Result<()> {
     Ok(())
 }
 
-fn read_record(trust_directory: &Path) -> Result<Option<TrustRecord>> {
-    let Some(directory) = crate::private_state::open_readonly(trust_directory)? else {
+fn read_record(trust_directory: &Path, control: &ControlHandle) -> Result<Option<TrustRecord>> {
+    let Some(directory) = crate::private_state::open_readonly(trust_directory, control)? else {
         return Ok(None);
     };
     read_record_from(&directory)?
@@ -615,11 +638,11 @@ fn write_active(
     directory.sync()
 }
 
-fn validated_source(path: &Path) -> Result<ValidatedSource> {
+fn validated_source(path: &Path, control: &ControlHandle) -> Result<ValidatedSource> {
     if !path.is_absolute() {
         return Err(KioError::invalid_usage("--ca-pem must be an absolute path"));
     }
-    let bytes = kio_core::private_fs::read_private_file(path, MAX_CA_BYTES)?;
+    let bytes = kio_core::private_fs::read_private_file_with_control(path, MAX_CA_BYTES, control)?;
     let digest = kio_adapter::local_peer::local_trust_digest_from_pem_bytes(&bytes)
         .map_err(super::adapter_to_kio)?;
     // Do not reopen `path` here: a second pathname read creates a TOCTOU
@@ -672,6 +695,7 @@ fn err(code: &str, message: &str) -> KioError {
 pub(crate) fn run(
     trust_directory: &Path,
     command: crate::commands::TrustCommand,
+    control: &ControlHandle,
 ) -> Result<serde_json::Value> {
     use crate::commands::TrustCommand;
 
@@ -683,6 +707,7 @@ pub(crate) fn run(
                 &args.ca_pem,
                 args.preview,
                 args.resume.as_deref(),
+                control,
             )?;
             Ok(record_value(
                 if args.preview {
@@ -695,14 +720,17 @@ pub(crate) fn run(
         }
         TrustCommand::Rotate(args) => {
             validate_confirmation(args.preview, args.yes)?;
-            let record = rotate(trust_directory, &args.ca_pem, args.preview)?;
+            let record = rotate(trust_directory, &args.ca_pem, args.preview, control)?;
             Ok(record_value(
                 if args.preview { "preview" } else { "rotated" },
                 Some(record),
             ))
         }
-        TrustCommand::Revoke => Ok(record_value("revoked", revoke(trust_directory, false)?)),
-        TrustCommand::Status => status_value(trust_directory),
+        TrustCommand::Revoke => Ok(record_value(
+            "revoked",
+            revoke(trust_directory, false, control)?,
+        )),
+        TrustCommand::Status => status_value(trust_directory, control),
     }
 }
 
@@ -715,8 +743,8 @@ fn validate_confirmation(preview: bool, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn status_value(trust_directory: &Path) -> Result<serde_json::Value> {
-    let Some(directory) = crate::private_state::open_readonly(trust_directory)? else {
+fn status_value(trust_directory: &Path, control: &ControlHandle) -> Result<serde_json::Value> {
+    let Some(directory) = crate::private_state::open_readonly(trust_directory, control)? else {
         return Ok(record_value("status", None));
     };
     let record = read_record_from(&directory)?;
@@ -846,7 +874,14 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let trust_directory = root.join("kio/local-trust");
-        assert_eq!(status(&trust_directory).unwrap(), None);
+        assert_eq!(
+            status(
+                &trust_directory,
+                &kio_core::control::ControlHandle::default()
+            )
+            .unwrap(),
+            None
+        );
         assert!(!root.join("kio").exists());
     }
 
@@ -870,14 +905,35 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
-        let first = register(&trust_directory, &first_source, false, None).unwrap();
-        revoke(&trust_directory, false).unwrap();
-        let returned = register(&trust_directory, &equivalent_source, false, None).unwrap();
+        let first = register(
+            &trust_directory,
+            &first_source,
+            false,
+            None,
+            &ControlHandle::default(),
+        )
+        .unwrap();
+        revoke(&trust_directory, false, &ControlHandle::default()).unwrap();
+        let returned = register(
+            &trust_directory,
+            &equivalent_source,
+            false,
+            None,
+            &ControlHandle::default(),
+        )
+        .unwrap();
 
         assert_eq!(returned.digest, first.digest);
         assert_eq!(returned.snapshot, first.snapshot);
         assert_eq!(returned.generation, first.generation + 1);
         assert_ne!(returned.registration_id, first.registration_id);
-        assert_eq!(status(&trust_directory).unwrap(), Some(returned));
+        assert_eq!(
+            status(
+                &trust_directory,
+                &kio_core::control::ControlHandle::default()
+            )
+            .unwrap(),
+            Some(returned)
+        );
     }
 }

@@ -1,13 +1,18 @@
 use crate::error::{KioError, Result};
 use crate::scope::{
-    LockFile, RELEASED_LOCK_PID, canonical_lock_bytes, canonical_lock_bytes_for, new_lock_token,
+    LockFile, RELEASED_LOCK_PID, canonical_lock_bytes_for, canonical_lock_bytes_with_control,
+    new_lock_token,
 };
 use crate::store_dir::StoreDirectory;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
-fn open_windows_lock_parent_kind(path: &Path, create_missing: bool) -> Result<File> {
+fn open_windows_lock_parent_kind(
+    path: &Path,
+    create_missing: bool,
+    control: &crate::control::ControlHandle,
+) -> Result<File> {
     use cap_primitives::{ambient_authority, fs as cap_fs};
 
     if path
@@ -59,7 +64,11 @@ fn open_windows_lock_parent_kind(path: &Path, create_missing: bool) -> Result<Fi
                 // with a protected owner-only DACL. Existing ancestors are
                 // neither restricted nor repaired, and the original named
                 // parent handle is consumed rather than kept as an extra alias.
-                let retained = StoreDirectory::from_retained(directory, root.clone())?;
+                let retained = StoreDirectory::from_retained_with_control(
+                    directory,
+                    root.clone(),
+                    control.clone(),
+                )?;
                 match retained.create_directory(Path::new(&component)) {
                     Ok(created) => created,
                     Err(error)
@@ -311,7 +320,7 @@ pub(crate) fn process_is_alive(pid: u32) -> bool {
 
 #[cfg(test)]
 pub(crate) fn open_windows_lock_parent(path: &Path) -> Result<File> {
-    open_windows_lock_parent_kind(path, true)
+    open_windows_lock_parent_kind(path, true, &crate::control::ControlHandle::default())
 }
 
 pub(crate) struct BoundLock {
@@ -350,7 +359,11 @@ impl ReadGate {
     }
 }
 
-pub(crate) fn acquire_bound_lock(kio: &File, store_gate: bool) -> Result<BoundLock> {
+pub(crate) fn acquire_bound_lock(
+    kio: &File,
+    store_gate: bool,
+    control: &crate::control::ControlHandle,
+) -> Result<BoundLock> {
     let gate = if store_gate {
         Some(super::store_gate::Gate::acquire(kio, true)?)
     } else {
@@ -366,7 +379,7 @@ pub(crate) fn acquire_bound_lock(kio: &File, store_gate: bool) -> Result<BoundLo
         .map_err(|error| KioError::io(error.to_string(), ".kio"))?;
     let pid = std::process::id();
     let token = new_lock_token(pid);
-    let bytes = canonical_lock_bytes(pid, &token)?;
+    let bytes = canonical_lock_bytes_with_control(control, pid, &token)?;
     let leaf = Path::new(".lock");
     let owner = match create_windows_lock(&retained, leaf, &bytes) {
         Ok(owner) => owner,
@@ -419,21 +432,22 @@ impl Drop for PathLock {
 }
 pub(crate) fn acquire_path_lock(
     path: PathBuf,
+    control: &crate::control::ControlHandle,
     pid: u32,
     store_gate: bool,
-    validate_authority: fn(&File) -> Result<()>,
+    validate_authority: fn(&File, &crate::control::ControlHandle) -> Result<()>,
     _acquire_gate: crate::scope::locks::AcquireLockGate,
 ) -> Result<PathLock> {
-    let parent = open_windows_lock_parent_kind(&path, !store_gate)?;
+    let parent = open_windows_lock_parent_kind(&path, !store_gate, control)?;
     let gate = if store_gate {
-        validate_authority(&parent)?;
+        validate_authority(&parent, control)?;
         Some(super::store_gate::Gate::acquire(&parent, true)?)
     } else {
         None
     };
     let leaf = windows_lock_leaf(&path)?;
     let token = new_lock_token(pid);
-    let canonical = canonical_lock_bytes(pid, &token)?;
+    let canonical = canonical_lock_bytes_with_control(control, pid, &token)?;
     let owner = match create_windows_lock(&parent, leaf, &canonical) {
         Ok(owner) => owner,
         Err(error) if is_windows_lock_contention(&error) => {

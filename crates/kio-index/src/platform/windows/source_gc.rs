@@ -19,7 +19,7 @@ use crate::{IndexError, Result};
 use cap_primitives::fs as cap_fs;
 use kio_core::gc::exchange::{self as exchange, OperationKind};
 use kio_core::platform::{ExchangeExpected, ExchangeStep, PendingExchange};
-use kio_core::store_dir::StoreDirectory;
+use kio_core::{control::ControlHandle, store_dir::StoreDirectory};
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -37,16 +37,17 @@ fn validation_error(error: IndexError) -> kio_core::KioError {
         kio_core::ExitCode::PermanentFailure,
     )
 }
-fn directory(file: &File) -> Result<StoreDirectory> {
-    StoreDirectory::from_retained(
+fn directory(file: &File, control: &ControlHandle) -> Result<StoreDirectory> {
+    StoreDirectory::from_retained_with_control(
         file.try_clone()
             .map_err(|error| IndexError::Schema(format!("retain GC index directory: {error}")))?,
         PathBuf::from("<retained GC index directory>"),
+        control.clone(),
     )
     .map_err(core_error)
 }
 
-fn owner(kio: &File, create: bool) -> Result<Option<StoreDirectory>> {
+fn owner(kio: &File, create: bool, control: &ControlHandle) -> Result<Option<StoreDirectory>> {
     let mut parent = kio
         .try_clone()
         .map_err(|error| IndexError::Schema(format!("retain GC exchange root: {error}")))?;
@@ -71,11 +72,11 @@ fn owner(kio: &File, create: bool) -> Result<Option<StoreDirectory>> {
             }
         };
     }
-    directory(&parent).map(Some)
+    directory(&parent, control).map(Some)
 }
 
-pub(crate) fn ensure_no_pending(kio: &File) -> Result<()> {
-    if let Some(owner) = owner(kio, false)?
+pub(crate) fn ensure_no_pending(kio: &File, control: &ControlHandle) -> Result<()> {
+    if let Some(owner) = owner(kio, false, control)?
         && exchange::inspect_pending(&owner).map_err(core_error)?
     {
         return Err(IndexError::Schema(
@@ -130,12 +131,16 @@ impl Authority<'_> {
     }
 }
 
-fn parents(kio: &File, authority: &Authority<'_>) -> Result<(StoreDirectory, StoreDirectory)> {
+fn parents(
+    kio: &File,
+    authority: &Authority<'_>,
+    control: &ControlHandle,
+) -> Result<(StoreDirectory, StoreDirectory)> {
     let public = cap_fs::open_dir_nofollow(kio, Path::new("index"))
         .map_err(|error| IndexError::Schema(format!("open bound GC index parent: {error}")))?;
     let private = open_existing_gc_internal_index_dir(kio)?;
     require_gc_private_dir_identity(&private, authority.private_identity)?;
-    Ok((directory(&public)?, directory(&private)?))
+    Ok((directory(&public, control)?, directory(&private, control)?))
 }
 
 fn finish(
@@ -173,9 +178,13 @@ fn finish(
     pending.complete(&expected, checkpoint).map_err(core_error)
 }
 
-fn recover_authority(kio: &File, authority: &Authority<'_>) -> Result<bool> {
+fn recover_authority(
+    kio: &File,
+    authority: &Authority<'_>,
+    control: &ControlHandle,
+) -> Result<bool> {
     let binding = authority.binding()?;
-    let Some(owner) = owner(kio, false)? else {
+    let Some(owner) = owner(kio, false, control)? else {
         return Ok(false);
     };
     // inspect_pending includes an unpublished atomic intent. Never call an
@@ -183,7 +192,7 @@ fn recover_authority(kio: &File, authority: &Authority<'_>) -> Result<bool> {
     if !exchange::inspect_pending(&owner).map_err(core_error)? {
         return Ok(false);
     }
-    let (public, private) = parents(kio, authority)?;
+    let (public, private) = parents(kio, authority, control)?;
     let Some(pending) = kio_core::platform::open_pending_gc_exchange_under_lock(
         &owner,
         &public,
@@ -206,36 +215,17 @@ fn recover_authority(kio: &File, authority: &Authority<'_>) -> Result<bool> {
     Ok(true)
 }
 
-pub(crate) fn recover(
-    kio: &File,
-    temp_leaf: &str,
-    private_identity: &str,
-    source_identity: &str,
-    source_state_digest: &str,
-    target_identity: &str,
-) -> Result<bool> {
-    recover_authority(
-        kio,
-        &Authority {
-            temp_leaf,
-            private_identity,
-            source_identity,
-            source_state_digest,
-            target_identity,
-        },
-    )
-}
-
 fn exchange_authority(
     kio: &File,
     authority: &Authority<'_>,
+    control: &ControlHandle,
     mut checkpoint: impl FnMut(ExchangeStep) -> kio_core::Result<()>,
 ) -> Result<()> {
     let binding = authority.binding()?;
-    if recover_authority(kio, authority)? {
+    if recover_authority(kio, authority, control)? {
         return Ok(());
     }
-    let (public, private) = parents(kio, authority)?;
+    let (public, private) = parents(kio, authority, control)?;
     // First validate the exact current source state before any new intent or
     // exchange owner is published. begin reopens and repeats the validation
     // under restrictive pins immediately before durable intent publication.
@@ -257,7 +247,7 @@ fn exchange_authority(
     };
     drop(target);
     drop(source);
-    let owner = owner(kio, true)?.expect("create owner returns directory");
+    let owner = owner(kio, true, control)?.expect("create owner returns directory");
     let pending = kio_core::platform::begin_gc_exchange(
         &owner,
         &public,
@@ -279,33 +269,13 @@ fn exchange_authority(
     finish(pending, authority, checkpoint)
 }
 
-pub(crate) fn exchange(
-    kio: &File,
-    temp_leaf: &str,
-    private_identity: &str,
-    source_identity: &str,
-    source_state_digest: &str,
-    target_identity: &str,
-) -> Result<()> {
-    exchange_authority(
-        kio,
-        &Authority {
-            temp_leaf,
-            private_identity,
-            source_identity,
-            source_state_digest,
-            target_identity,
-        },
-        |_| Ok(()),
-    )
-}
-
 pub(crate) fn remove_exact(
     parent: &File,
     leaf: &str,
     expected_identity: &str,
+    control: &ControlHandle,
 ) -> Result<PreparedGcIndexCleanup> {
-    let parent = directory(parent)?;
+    let parent = directory(parent, control)?;
     if !parent.contains_entry(Path::new(leaf)).map_err(core_error)? {
         return Ok(PreparedGcIndexCleanup::AlreadyAbsent);
     }
@@ -320,31 +290,18 @@ pub(crate) fn remove_exact(
     Ok(PreparedGcIndexCleanup::Removed)
 }
 
-pub(crate) fn remove_prepared(
-    kio: &File,
-    temp_leaf: &str,
-    private_identity: &str,
-    expected_identity: &str,
-) -> Result<PreparedGcIndexCleanup> {
-    validate_gc_temp_leaf(temp_leaf)?;
-    ensure_no_pending(kio)?;
-    let private = open_existing_gc_internal_index_dir(kio)?;
-    require_gc_private_dir_identity(&private, private_identity)?;
-    remove_exact(&private, temp_leaf, expected_identity)
-}
-
 pub(crate) fn remove_prepared_bound_gc_index(
     kio_dir: &std::fs::File,
     temp_leaf: &str,
     expected_private_dir_identity: &str,
     expected_identity: &str,
+    control: &ControlHandle,
 ) -> Result<PreparedGcIndexCleanup> {
-    remove_prepared(
-        kio_dir,
-        temp_leaf,
-        expected_private_dir_identity,
-        expected_identity,
-    )
+    validate_gc_temp_leaf(temp_leaf)?;
+    ensure_no_pending(kio_dir, control)?;
+    let private = open_existing_gc_internal_index_dir(kio_dir)?;
+    require_gc_private_dir_identity(&private, expected_private_dir_identity)?;
+    remove_exact(&private, temp_leaf, expected_identity, control)
 }
 
 pub(crate) fn exchange_prepared_bound_gc_index(
@@ -354,14 +311,19 @@ pub(crate) fn exchange_prepared_bound_gc_index(
     expected_source_identity: &str,
     expected_source_state_digest: &str,
     expected_target_identity: &str,
+    control: &ControlHandle,
 ) -> Result<()> {
-    exchange(
+    exchange_authority(
         kio_dir,
-        temp_leaf,
-        expected_private_dir_identity,
-        expected_source_identity,
-        expected_source_state_digest,
-        expected_target_identity,
+        &Authority {
+            temp_leaf,
+            private_identity: expected_private_dir_identity,
+            source_identity: expected_source_identity,
+            source_state_digest: expected_source_state_digest,
+            target_identity: expected_target_identity,
+        },
+        control,
+        |_| Ok(()),
     )
 }
 
@@ -374,14 +336,18 @@ pub fn recover_prepared_bound_gc_index(
     expected_source_identity: &str,
     expected_source_state_digest: &str,
     expected_target_identity: &str,
+    control: &ControlHandle,
 ) -> Result<bool> {
-    recover(
+    recover_authority(
         kio_dir,
-        temp_leaf,
-        expected_private_dir_identity,
-        expected_source_identity,
-        expected_source_state_digest,
-        expected_target_identity,
+        &Authority {
+            temp_leaf,
+            private_identity: expected_private_dir_identity,
+            source_identity: expected_source_identity,
+            source_state_digest: expected_source_state_digest,
+            target_identity: expected_target_identity,
+        },
+        control,
     )
 }
 
@@ -430,6 +396,7 @@ mod tests {
                 (&source.metadata.index_generation, &source.file_identity),
                 &attestation,
                 &config,
+                &ControlHandle::default(),
             )
             .unwrap();
             Self {
@@ -486,7 +453,7 @@ mod tests {
     #[test]
     fn atomic_intent_residues_recover_at_index_caller_without_extra_retry() {
         use kio_core::durability::DurabilityPoint;
-        use kio_core::test_control::{DebugTestControl, Selector, install_scoped};
+        use kio_core::test_control::{DebugTestControl, Selector};
         for point in [
             DurabilityPoint::AtomicWriteStaged,
             DurabilityPoint::AtomicRemoveQuarantined,
@@ -499,15 +466,23 @@ mod tests {
             control.core.durability_point = Selector::Known(point);
             control.core.durability_ready = Some(occupied);
             {
-                let _guard = install_scoped(control);
+                let control = ControlHandle::new(control);
                 assert!(
-                    exchange_authority(&fixture.kio, &fixture.authority(), |_| Ok(())).is_err()
+                    exchange_authority(&fixture.kio, &fixture.authority(), &control, |_| Ok(()))
+                        .is_err()
                 );
             }
-            let journal_owner = owner(&fixture.kio, false).unwrap().unwrap();
+            let journal_owner = owner(&fixture.kio, false, &ControlHandle::default())
+                .unwrap()
+                .unwrap();
             assert!(exchange::inspect_pending(&journal_owner).unwrap());
             assert!(
-                !recover_authority(&fixture.kio, &fixture.authority()).unwrap(),
+                !recover_authority(
+                    &fixture.kio,
+                    &fixture.authority(),
+                    &ControlHandle::default()
+                )
+                .unwrap(),
                 "atomic-only residue must not cause an extra failing gc resume: {point:?}"
             );
             assert!(!exchange::inspect_pending(&journal_owner).unwrap());
@@ -519,12 +494,25 @@ mod tests {
                 assert!(fixture.private().exists());
                 // The ordinary caller can begin the still-unperformed rotation
                 // in this same recovery invocation, without another gc run.
-                exchange_authority(&fixture.kio, &fixture.authority(), |_| Ok(())).unwrap();
+                exchange_authority(
+                    &fixture.kio,
+                    &fixture.authority(),
+                    &ControlHandle::default(),
+                    |_| Ok(()),
+                )
+                .unwrap();
             } else {
                 assert!(!fixture.private().exists());
             }
             fixture.assert_target_attested();
-            assert!(!recover_authority(&fixture.kio, &fixture.authority()).unwrap());
+            assert!(
+                !recover_authority(
+                    &fixture.kio,
+                    &fixture.authority(),
+                    &ControlHandle::default()
+                )
+                .unwrap()
+            );
         }
     }
 
@@ -539,13 +527,18 @@ mod tests {
             ExchangeStep::IntentRemoved,
         ] {
             let fixture = Fixture::new();
-            let error = exchange_authority(&fixture.kio, &fixture.authority(), |step| {
-                if step == stop {
-                    Err(interruption())
-                } else {
-                    Ok(())
-                }
-            })
+            let error = exchange_authority(
+                &fixture.kio,
+                &fixture.authority(),
+                &ControlHandle::default(),
+                |step| {
+                    if step == stop {
+                        Err(interruption())
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
             .unwrap_err();
             let IndexError::GcExchange(error) = error else {
                 panic!("exchange interruption lost its typed outcome: {error}");
@@ -559,16 +552,29 @@ mod tests {
                     "the journal must account for the public-name gap"
                 );
             }
-            let recovered = recover_authority(&fixture.kio, &fixture.authority()).unwrap();
+            let recovered = recover_authority(
+                &fixture.kio,
+                &fixture.authority(),
+                &ControlHandle::default(),
+            )
+            .unwrap();
             assert_eq!(recovered, stop != ExchangeStep::IntentRemoved);
             fixture.assert_target_attested();
-            assert!(!recover_authority(&fixture.kio, &fixture.authority()).unwrap());
+            assert!(
+                !recover_authority(
+                    &fixture.kio,
+                    &fixture.authority(),
+                    &ControlHandle::default()
+                )
+                .unwrap()
+            );
             assert_eq!(
-                remove_prepared(
+                remove_prepared_bound_gc_index(
                     &fixture.kio,
                     &fixture.prepared.temp_leaf,
                     &fixture.prepared.private_dir_identity,
-                    &fixture.prepared.source.file_identity
+                    &fixture.prepared.source.file_identity,
+                    &ControlHandle::default()
                 )
                 .unwrap(),
                 PreparedGcIndexCleanup::AlreadyAbsent
@@ -582,22 +588,34 @@ mod tests {
     fn mismatched_marker_authority_cannot_fill_public_gap() {
         let fixture = Fixture::new();
         assert!(
-            exchange_authority(&fixture.kio, &fixture.authority(), |step| {
-                if step == ExchangeStep::SourceCaptured {
-                    Err(interruption())
-                } else {
-                    Ok(())
+            exchange_authority(
+                &fixture.kio,
+                &fixture.authority(),
+                &ControlHandle::default(),
+                |step| {
+                    if step == ExchangeStep::SourceCaptured {
+                        Err(interruption())
+                    } else {
+                        Ok(())
+                    }
                 }
-            })
+            )
             .is_err()
         );
         let changed_digest = format!("sha256:{}", "b".repeat(64));
         let mut changed = fixture.authority();
         changed.source_state_digest = &changed_digest;
-        assert!(recover_authority(&fixture.kio, &changed).is_err());
+        assert!(recover_authority(&fixture.kio, &changed, &ControlHandle::default()).is_err());
         assert!(!fixture.public().exists());
         assert!(fixture.private().exists());
-        assert!(recover_authority(&fixture.kio, &fixture.authority()).unwrap());
+        assert!(
+            recover_authority(
+                &fixture.kio,
+                &fixture.authority(),
+                &ControlHandle::default()
+            )
+            .unwrap()
+        );
         fixture.assert_target_attested();
     }
 
@@ -612,10 +630,22 @@ mod tests {
         writer.sync_all().unwrap();
         drop(writer);
         let before = std::fs::read(fixture.public()).unwrap();
-        assert!(exchange_authority(&fixture.kio, &fixture.authority(), |_| Ok(())).is_err());
+        assert!(
+            exchange_authority(
+                &fixture.kio,
+                &fixture.authority(),
+                &ControlHandle::default(),
+                |_| Ok(())
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(fixture.public()).unwrap(), before);
         assert!(fixture.private().exists());
-        assert!(owner(&fixture.kio, false).unwrap().is_none());
+        assert!(
+            owner(&fixture.kio, false, &ControlHandle::default())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -638,8 +668,20 @@ mod tests {
         let after = std::fs::metadata(fixture.public()).unwrap();
         assert_eq!(after.len(), before.len());
         assert_eq!(after.modified().unwrap(), before.modified().unwrap());
-        assert!(exchange_authority(&fixture.kio, &fixture.authority(), |_| Ok(())).is_err());
-        assert!(owner(&fixture.kio, false).unwrap().is_none());
+        assert!(
+            exchange_authority(
+                &fixture.kio,
+                &fixture.authority(),
+                &ControlHandle::default(),
+                |_| Ok(())
+            )
+            .is_err()
+        );
+        assert!(
+            owner(&fixture.kio, false, &ControlHandle::default())
+                .unwrap()
+                .is_none()
+        );
         assert!(fixture.public().exists());
         assert!(fixture.private().exists());
     }
@@ -649,13 +691,18 @@ mod tests {
         for replace_parent in [false, true] {
             let fixture = Fixture::new();
             assert!(
-                exchange_authority(&fixture.kio, &fixture.authority(), |step| {
-                    if step == ExchangeStep::SourceCaptured {
-                        Err(interruption())
-                    } else {
-                        Ok(())
+                exchange_authority(
+                    &fixture.kio,
+                    &fixture.authority(),
+                    &ControlHandle::default(),
+                    |step| {
+                        if step == ExchangeStep::SourceCaptured {
+                            Err(interruption())
+                        } else {
+                            Ok(())
+                        }
                     }
-                })
+                )
                 .is_err()
             );
             if replace_parent {
@@ -668,7 +715,14 @@ mod tests {
                     .unwrap();
                 std::fs::write(fixture.private(), &bytes).unwrap();
             }
-            assert!(recover_authority(&fixture.kio, &fixture.authority()).is_err());
+            assert!(
+                recover_authority(
+                    &fixture.kio,
+                    &fixture.authority(),
+                    &ControlHandle::default()
+                )
+                .is_err()
+            );
             assert!(!fixture.public().exists());
         }
     }
@@ -678,32 +732,46 @@ mod tests {
         let fixture = Fixture::new();
         let mut old_reader = File::open(fixture.public()).unwrap();
         assert!(
-            exchange_authority(&fixture.kio, &fixture.authority(), |step| {
-                if step == ExchangeStep::SourceCaptured {
-                    Err(interruption())
-                } else {
-                    Ok(())
-                }
-            })
-            .is_err()
-        );
-        assert!(
-            remove_prepared(
+            exchange_authority(
                 &fixture.kio,
-                &fixture.prepared.temp_leaf,
-                &fixture.prepared.private_dir_identity,
-                &fixture.prepared.target.file_identity
+                &fixture.authority(),
+                &ControlHandle::default(),
+                |step| {
+                    if step == ExchangeStep::SourceCaptured {
+                        Err(interruption())
+                    } else {
+                        Ok(())
+                    }
+                }
             )
             .is_err()
         );
-        assert!(recover_authority(&fixture.kio, &fixture.authority()).unwrap());
-        fixture.assert_target_attested();
-        assert_eq!(
-            remove_prepared(
+        assert!(
+            remove_prepared_bound_gc_index(
                 &fixture.kio,
                 &fixture.prepared.temp_leaf,
                 &fixture.prepared.private_dir_identity,
-                &fixture.prepared.source.file_identity
+                &fixture.prepared.target.file_identity,
+                &ControlHandle::default()
+            )
+            .is_err()
+        );
+        assert!(
+            recover_authority(
+                &fixture.kio,
+                &fixture.authority(),
+                &ControlHandle::default()
+            )
+            .unwrap()
+        );
+        fixture.assert_target_attested();
+        assert_eq!(
+            remove_prepared_bound_gc_index(
+                &fixture.kio,
+                &fixture.prepared.temp_leaf,
+                &fixture.prepared.private_dir_identity,
+                &fixture.prepared.source.file_identity,
+                &ControlHandle::default()
             )
             .unwrap(),
             PreparedGcIndexCleanup::AlreadyAbsent
@@ -721,11 +789,12 @@ mod tests {
         old_reader.read_to_end(&mut remaining).unwrap();
         assert!(remaining.is_empty());
         assert_eq!(
-            remove_prepared(
+            remove_prepared_bound_gc_index(
                 &fixture.kio,
                 &fixture.prepared.temp_leaf,
                 &fixture.prepared.private_dir_identity,
-                &fixture.prepared.source.file_identity
+                &fixture.prepared.source.file_identity,
+                &ControlHandle::default()
             )
             .unwrap(),
             PreparedGcIndexCleanup::AlreadyAbsent
@@ -736,22 +805,24 @@ mod tests {
     fn cleanup_identity_substitution_and_hardlink_are_preserved() {
         let fixture = Fixture::new();
         assert!(
-            remove_prepared(
+            remove_prepared_bound_gc_index(
                 &fixture.kio,
                 &fixture.prepared.temp_leaf,
                 &fixture.prepared.private_dir_identity,
-                &fixture.prepared.source.file_identity
+                &fixture.prepared.source.file_identity,
+                &ControlHandle::default()
             )
             .is_err()
         );
         let bytes = std::fs::read(fixture.private()).unwrap();
         std::fs::hard_link(fixture.private(), fixture.private().with_extension("alias")).unwrap();
         assert!(
-            remove_prepared(
+            remove_prepared_bound_gc_index(
                 &fixture.kio,
                 &fixture.prepared.temp_leaf,
                 &fixture.prepared.private_dir_identity,
-                &fixture.prepared.target.file_identity
+                &fixture.prepared.target.file_identity,
+                &ControlHandle::default()
             )
             .is_err()
         );

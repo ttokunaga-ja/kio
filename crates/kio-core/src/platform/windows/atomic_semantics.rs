@@ -78,9 +78,9 @@ pub(crate) fn finish_remove_retirement(
                     "moved removal source no longer matches its ready intent",
                 ));
             }
-            crate::durability::checkpoint(
-                crate::durability::DurabilityPoint::AtomicRemoveQuarantined,
-            )?;
+            workspace
+                .control()
+                .checkpoint(crate::durability::DurabilityPoint::AtomicRemoveQuarantined)?;
             (source, true)
         }
         (None, true) => (
@@ -106,7 +106,9 @@ pub(crate) fn finish_remove_retirement(
         super::private_fs::restrict_existing_private_handle(&quarantined)?;
         drop(quarantined);
         remove_if_present(workspace, REMOVED)?;
-        crate::durability::checkpoint(crate::durability::DurabilityPoint::AtomicRemoveDeleted)?;
+        workspace
+            .control()
+            .checkpoint(crate::durability::DurabilityPoint::AtomicRemoveDeleted)?;
         remove_if_present(workspace, REMOVE_READY)?;
         Ok(true)
     }

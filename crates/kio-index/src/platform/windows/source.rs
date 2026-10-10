@@ -433,8 +433,11 @@ pub(crate) fn open_gc_source_copy(index: &std::fs::File) -> Result<std::fs::File
     Ok(input)
 }
 
-pub(crate) fn gc_cleanup_directory(kio_dir: &std::fs::File) -> Result<std::fs::File> {
-    crate::platform::windows_source_gc::ensure_no_pending(kio_dir)?;
+pub(crate) fn gc_cleanup_directory(
+    kio_dir: &std::fs::File,
+    control: &kio_core::control::ControlHandle,
+) -> Result<std::fs::File> {
+    crate::platform::windows_source_gc::ensure_no_pending(kio_dir, control)?;
     crate::fts::open_gc_internal_index_dir(kio_dir)
 }
 
@@ -442,6 +445,7 @@ pub(crate) fn remove_stale_gc_index_file(
     private: &std::fs::File,
     leaf: &str,
     identity: &str,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<()> {
-    crate::platform::windows_source_gc::remove_exact(private, leaf, identity).map(|_| ())
+    crate::platform::windows_source_gc::remove_exact(private, leaf, identity, control).map(|_| ())
 }

@@ -3,8 +3,8 @@ use crate::cas::lower_hex;
 use crate::error::{IoResultExt, KioError, Result};
 use crate::platform::exchange_bound_lock;
 use crate::scope::{
-    LockFile, RELEASED_LOCK_PID, canonical_lock_bytes, canonical_lock_bytes_for, new_lock_token,
-    unix_nanos, unsafe_store_error,
+    LockFile, RELEASED_LOCK_PID, canonical_lock_bytes_for, canonical_lock_bytes_with_control,
+    new_lock_token, unix_nanos, unsafe_store_error,
 };
 use crate::store_dir::StoreDirectory;
 use serde_json::json;
@@ -93,7 +93,12 @@ fn reclaim_stale_lock(path: &Path, replacement: &[u8]) -> Result<bool> {
     }
 }
 
-fn release_ordinary_lock(path: &Path, pid: u32, token: &str) -> Result<()> {
+fn release_ordinary_lock(
+    path: &Path,
+    pid: u32,
+    token: &str,
+    control: &crate::control::ControlHandle,
+) -> Result<()> {
     {
         let Some(owned) = read_lock_snapshot(path)? else {
             return Ok(());
@@ -110,7 +115,11 @@ fn release_ordinary_lock(path: &Path, pid: u32, token: &str) -> Result<()> {
             .ok_or_else(|| KioError::locked(path.display().to_string()))?;
         let temp_name = format!(".{name}.released-{}-{}", std::process::id(), unix_nanos());
         let temp = parent.join(&temp_name);
-        let sentinel = canonical_lock_bytes(RELEASED_LOCK_PID, &new_lock_token(RELEASED_LOCK_PID))?;
+        let sentinel = canonical_lock_bytes_with_control(
+            control,
+            RELEASED_LOCK_PID,
+            &new_lock_token(RELEASED_LOCK_PID),
+        )?;
         let mut temp_file = OpenOptions::new()
             .write(true)
             .create_new(true)
@@ -511,6 +520,7 @@ struct LockSnapshot {
 }
 
 pub(crate) struct BoundLock {
+    control: crate::control::ControlHandle,
     kio: File,
     pub(crate) _gate: BoundLockGate,
     locks: File,
@@ -542,7 +552,9 @@ impl Drop for BoundLock {
         let archive = bound_lock_name("released");
         let released_pid = RELEASED_LOCK_PID;
         let released_token = new_lock_token(released_pid);
-        let Ok(released_bytes) = canonical_lock_bytes(released_pid, &released_token) else {
+        let Ok(released_bytes) =
+            canonical_lock_bytes_with_control(&self.control, released_pid, &released_token)
+        else {
             return;
         };
         let Ok(released) = create_bound_lock(&self.locks, &archive, &released_bytes) else {
@@ -604,11 +616,15 @@ impl ReadGate {
     }
 }
 
-pub(crate) fn acquire_bound_lock(kio: &File, _store_gate: bool) -> Result<BoundLock> {
+pub(crate) fn acquire_bound_lock(
+    kio: &File,
+    _store_gate: bool,
+    control: &crate::control::ControlHandle,
+) -> Result<BoundLock> {
     let gate = acquire_bound_lock_gate(kio)?;
     let pid = std::process::id();
     let token = new_lock_token(pid);
-    let bytes = canonical_lock_bytes(pid, &token)?;
+    let bytes = canonical_lock_bytes_with_control(control, pid, &token)?;
     // Every fallible resource needed by `BoundLock::drop` is prepared
     // before the authoritative lock is published.  In particular, a broken
     // Generic `.kio/internal/locks` setup must not turn a failed acquisition into a live lock
@@ -622,6 +638,7 @@ pub(crate) fn acquire_bound_lock(kio: &File, _store_gate: bool) -> Result<BoundL
 
     match create_bound_lock(kio, ".lock", &bytes) {
         Ok(owned) => Ok(BoundLock {
+            control: control.clone(),
             kio: retained_kio,
             _gate: gate,
             locks,
@@ -633,6 +650,7 @@ pub(crate) fn acquire_bound_lock(kio: &File, _store_gate: bool) -> Result<BoundL
         Err(error) if bound_is_exists(&error) => {
             if let Some(owned) = reclaim_stale_bound_lock(kio, &locks, &bytes)? {
                 Ok(BoundLock {
+                    control: control.clone(),
                     kio: retained_kio,
                     _gate: gate,
                     locks,
@@ -685,6 +703,7 @@ pub(crate) fn acquire_bound_read_gate(kio: &File) -> Result<ReadGate> {
 
 const MAX_BOUND_LOCK_BYTES: u64 = 4096;
 pub(crate) struct PathLock {
+    control: crate::control::ControlHandle,
     path: PathBuf,
     pid: u32,
     token: String,
@@ -692,9 +711,10 @@ pub(crate) struct PathLock {
 }
 pub(crate) fn acquire_path_lock(
     path: PathBuf,
+    control: &crate::control::ControlHandle,
     pid: u32,
     _store_gate: bool,
-    _validate_authority: fn(&File) -> Result<()>,
+    _validate_authority: fn(&File, &crate::control::ControlHandle) -> Result<()>,
     acquire_gate: crate::scope::locks::AcquireLockGate,
 ) -> Result<PathLock> {
     if let Some(parent) = path.parent() {
@@ -708,7 +728,7 @@ pub(crate) fn acquire_path_lock(
     )?;
 
     let token = new_lock_token(pid);
-    let canonical = canonical_lock_bytes(pid, &token)?;
+    let canonical = canonical_lock_bytes_with_control(control, pid, &token)?;
     match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut file) => {
             file.write_all(&canonical).kio_io(&path)?;
@@ -722,6 +742,7 @@ pub(crate) fn acquire_path_lock(
         Err(err) => return Err(KioError::io(err.to_string(), path.display().to_string())),
     }
     Ok(PathLock {
+        control: control.clone(),
         path,
         pid,
         token,
@@ -730,7 +751,7 @@ pub(crate) fn acquire_path_lock(
 }
 impl PathLock {
     pub(crate) fn release_outer(&self) {
-        let _ = release_ordinary_lock(&self.path, self.pid, &self.token);
+        let _ = release_ordinary_lock(&self.path, self.pid, &self.token, &self.control);
     }
 }
 pub(crate) fn validate_store_gate(directory: &StoreDirectory) -> Result<()> {

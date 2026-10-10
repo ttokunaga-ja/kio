@@ -10,8 +10,8 @@ use super::{
 use crate::management::binding_for_repo;
 use kio_core::management::{
     DirectoryIdentity, ManagementBinding, directory_identity_from_handle, observe_direct_child,
-    planned_child_management_record, read_registration_recovery_record, validate_controlled_root,
-    validate_live_chain,
+    planned_child_management_record, read_registration_recovery_record,
+    validate_controlled_root_with_control, validate_live_chain,
 };
 use kio_core::scope::{Repository, validate_planned_kio_layout};
 use kio_core::store_dir::{AtomicWorkspaceState, Publication, StoreDirectory};
@@ -49,7 +49,7 @@ struct CheckedInitialization {
 pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -> Result<Value> {
     if preview {
         let binding = binding_for_repo(parent)?;
-        let store = control(&binding)?;
+        let store = control(&binding, parent.control())?;
         let pending = pending_initializations(&store)?;
         let cancellation = load_marker(&store)?.map(|(marker, _)| {
             json!({
@@ -77,7 +77,7 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
     operation_leaf(operation)?;
     let _lock = parent.lock_store()?;
     let binding = binding_for_repo(parent)?;
-    let store = control(&binding)?;
+    let store = control(&binding, parent.control())?;
     recover_lifecycle_atomic(&store)?;
     validate_live_chain(&binding)?;
     if let Some((marker, bytes)) = load_marker(&store)? {
@@ -128,7 +128,7 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
 pub(super) fn recover(parent: &Repository) -> Result<()> {
     let _lock = parent.lock_store()?;
     let binding = binding_for_repo(parent)?;
-    let store = control(&binding)?;
+    let store = control(&binding, parent.control())?;
     recover_lifecycle_atomic(&store)?;
     let Some((marker, bytes)) = load_marker(&store)? else {
         return Ok(());
@@ -250,7 +250,11 @@ fn check_initialization(
             "planned child identity changed during cancellation",
         ));
     }
-    validate_controlled_root(&observed.handle, &observed.canonical_root)?;
+    validate_controlled_root_with_control(
+        &observed.handle,
+        &observed.canonical_root,
+        parent.control().clone(),
+    )?;
     let expected = planned_child_management_record(
         parent,
         &observed,
@@ -270,7 +274,7 @@ fn check_initialization(
             "child initialization already has a parent enrollment",
         ));
     }
-    let child = StoreDirectory::from_retained(
+    let child = StoreDirectory::from_retained_with_control(
         observed.handle.try_clone().map_err(|error| {
             KioError::io(
                 error.to_string(),
@@ -278,6 +282,7 @@ fn check_initialization(
             )
         })?,
         observed.canonical_root,
+        control.control().clone(),
     )?;
     if child.contains_entry(Path::new(".kio"))? {
         return Err(KioError::invalid_usage(
@@ -311,12 +316,13 @@ fn stage_from_source(
             stage_identity: None,
         });
     }
-    let stage = StoreDirectory::from_retained(
+    let stage = StoreDirectory::from_retained_with_control(
         control.open_directory(Path::new(&journal.stage_leaf))?,
         parent
             .canonical_root()
             .join(".kio")
             .join(&journal.stage_leaf),
+        control.control().clone(),
     )?;
     kio_core::private_fs::verify_private_directory_handle(&stage)?;
     let identity = directory_identity_from_handle(stage.root_handle().as_ref())?;
@@ -361,12 +367,13 @@ fn open_quarantine(
     if !control.contains_entry(Path::new(&marker.quarantine_leaf))? {
         return Ok(None);
     }
-    let stage = StoreDirectory::from_retained(
+    let stage = StoreDirectory::from_retained_with_control(
         control.open_directory(Path::new(&marker.quarantine_leaf))?,
         parent
             .canonical_root()
             .join(".kio")
             .join(&marker.quarantine_leaf),
+        control.control().clone(),
     )?;
     kio_core::private_fs::verify_private_directory_handle(&stage)?;
     let identity = directory_identity_from_handle(stage.root_handle().as_ref())?;
@@ -446,8 +453,12 @@ fn finish(
                     "planned child identity changed before cancellation probe cleanup",
                 ));
             }
-            validate_controlled_root(&observed.handle, &observed.canonical_root)?;
-            let child = StoreDirectory::from_retained(
+            validate_controlled_root_with_control(
+                &observed.handle,
+                &observed.canonical_root,
+                parent.control().clone(),
+            )?;
+            let child = StoreDirectory::from_retained_with_control(
                 observed.handle.try_clone().map_err(|error| {
                     KioError::io(
                         error.to_string(),
@@ -455,6 +466,7 @@ fn finish(
                     )
                 })?,
                 observed.canonical_root,
+                control.control().clone(),
             )?;
             let _ = kio_core::management::cleanup_case_probe_in_directory(&child, &stage)?;
             control.rename_directory_create_only(
@@ -538,7 +550,9 @@ mod tests {
     use std::fs;
 
     fn parent(temp: &tempfile::TempDir) -> Repository {
-        match initialize_explicit_root(temp.path()).unwrap() {
+        match initialize_explicit_root(temp.path(), &kio_core::control::ControlHandle::default())
+            .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("test parent unexpectedly existed"),
         }
@@ -569,7 +583,7 @@ mod tests {
             stage_identity: None,
             management,
         };
-        let store = control(&binding).unwrap();
+        let store = control(&binding, parent.control()).unwrap();
         let stage = StoreDirectory::from_retained(
             store
                 .create_directory(Path::new(&journal.stage_leaf))
@@ -667,7 +681,7 @@ mod tests {
         let parent = parent(&temp);
         let operation = interrupted(&parent, "child", true, true);
         let binding = binding_for_repo(&parent).unwrap();
-        let store = control(&binding).unwrap();
+        let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let (journal, _) = pending_initializations(&store)
             .unwrap()
             .into_iter()
@@ -709,7 +723,7 @@ mod tests {
         let parent = parent(&temp);
         let operation = interrupted(&parent, "child", true, true);
         let binding = binding_for_repo(&parent).unwrap();
-        let store = control(&binding).unwrap();
+        let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let (journal, bytes) = pending_initializations(&store)
             .unwrap()
             .into_iter()
@@ -745,7 +759,7 @@ mod tests {
         let parent = parent(&temp);
         let operation = interrupted(&parent, "crash", true, true);
         let binding = binding_for_repo(&parent).unwrap();
-        let store = control(&binding).unwrap();
+        let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let (journal, bytes) = pending_initializations(&store)
             .unwrap()
             .into_iter()
@@ -801,7 +815,7 @@ mod tests {
         let parent = parent(&temp);
         let operation = interrupted(&parent, "partial-delete", false, false);
         let binding = binding_for_repo(&parent).unwrap();
-        let store = control(&binding).unwrap();
+        let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let (journal, bytes) = pending_initializations(&store)
             .unwrap()
             .into_iter()
@@ -867,7 +881,7 @@ mod tests {
         let parent = parent(&temp);
         let operation = interrupted(&parent, "terminal", true, false);
         let binding = binding_for_repo(&parent).unwrap();
-        let store = control(&binding).unwrap();
+        let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let (journal, bytes) = pending_initializations(&store)
             .unwrap()
             .into_iter()

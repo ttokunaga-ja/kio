@@ -282,7 +282,8 @@ pub(super) fn collect_retained_embedding_chunks(
         return Ok(Vec::new());
     };
     let roots = durable_history_roots(repo)?;
-    let (graph, _) = HistoryReader::new(repo.kio_dir()).walk_for_roots_allow_shallowed(&roots)?;
+    let (graph, _) = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+        .walk_for_roots_allow_shallowed(&roots)?;
     let mut bindings = OwnerBindings::default();
     for node in graph.nodes_in_visit_order() {
         for entry in &node.tree.entries {
@@ -295,7 +296,8 @@ pub(super) fn collect_retained_embedding_chunks(
         let raw_blocked = match blocked.get(&instance.raw_hash) {
             Some(value) => *value,
             None => {
-                let value = purge_blocks_rebuild_raw(repo.kio_dir(), &instance.raw_hash)?;
+                let value =
+                    purge_blocks_rebuild_raw(repo.kio_dir(), &instance.raw_hash, repo.control())?;
                 blocked.insert(instance.raw_hash.clone(), value);
                 value
             }

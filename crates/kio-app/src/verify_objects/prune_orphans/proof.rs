@@ -1,5 +1,6 @@
 //! Read-only blocker, staging-residue, and complete immutable live-set proof.
 use super::*;
+use kio_core::control::ControlHandle;
 use kio_core::store_dir::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
 use kio_pipeline::markdownize::{NormalizedUnitObject, UnitStatus};
 use kio_pipeline::task::{
@@ -84,18 +85,20 @@ impl Budget {
     }
 }
 fn clone_directory(directory: &StoreDirectory) -> Result<StoreDirectory> {
-    StoreDirectory::from_retained(
+    StoreDirectory::from_retained_with_control(
         directory
             .root_handle()
             .try_clone()
             .map_err(|e| KioError::io(e.to_string(), directory.path().display().to_string()))?,
         directory.path().to_path_buf(),
+        directory.control().clone(),
     )
 }
 fn child(directory: &StoreDirectory, leaf: &Path) -> Result<StoreDirectory> {
-    StoreDirectory::from_retained(
+    StoreDirectory::from_retained_with_control(
         directory.open_maintenance_directory(leaf)?,
         directory.path().join(leaf),
+        directory.control().clone(),
     )
 }
 fn optional_child(directory: &StoreDirectory, relative: &Path) -> Result<Option<StoreDirectory>> {
@@ -205,7 +208,7 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
             "Run kio repair verify-objects to recover the interrupted publication before pruning",
         ));
     }
-    let ledger = checked(crate::open_optional_ledger_db())?;
+    let ledger = checked(crate::open_optional_ledger_db(repo.control()))?;
     if let Some(ledger) = ledger {
         let rows = kio_pipeline::ledger::ops::inflight_requests_for_scope(&ledger, &scope.scope_id)
             .map_err(Blocker::unsafe_state)?;
@@ -224,7 +227,8 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
             ));
         }
     }
-    let task_store = TaskStore::new(scope.directory.path());
+    let task_store =
+        TaskStore::new_with_control(scope.directory.path(), scope.directory.control().clone());
     let tasks = task_store
         .all_bound(&scope.directory)
         .map_err(Blocker::unsafe_state)?;
@@ -241,7 +245,10 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
             ));
         }
     }
-    let store = checked(ObjectStore::from_bound_kio(&scope.directory.root_handle()))?;
+    let store = checked(ObjectStore::from_bound_kio_with_control(
+        &scope.directory.root_handle(),
+        repo.control().clone(),
+    ))?;
     let mut result = Preflight {
         tasks,
         ..Preflight::default()
@@ -506,9 +513,12 @@ pub(super) struct Proof {
 impl Proof {
     pub fn capture(repo: &Repository, scope: &BoundScope) -> Checked<Self> {
         let mut progress = preflight(repo, scope)?;
-        let store = checked(ObjectStore::from_bound_kio(&scope.directory.root_handle()))?;
+        let store = checked(ObjectStore::from_bound_kio_with_control(
+            &scope.directory.root_handle(),
+            repo.control().clone(),
+        ))?;
         let purge = PurgeState::from_directory(checked(clone_directory(&scope.directory))?);
-        let now = now_utc_seconds();
+        let now = repo.control().now_utc_seconds();
         let mut budget = std::mem::take(&mut progress.budget);
         let roots = checked(repo.current_ref_targets())?;
         let head = checked(repo.head_commit_hash())?;
@@ -687,6 +697,7 @@ impl Proof {
             &progress.protected_images,
             &mut candidates,
             &mut budget,
+            repo.control(),
         )?;
         checked(scope.recheck(repo))?;
         Ok(Self { candidates })
@@ -836,8 +847,9 @@ fn cache_candidates(
     live_images: &BTreeSet<String>,
     candidates: &mut BTreeSet<TargetKey>,
     budget: &mut Budget,
+    control: &ControlHandle,
 ) -> Checked<()> {
-    let cache = crate::cache_home().join("kio/open");
+    let cache = crate::cache_home(control).join("kio/open");
     match fs::symlink_metadata(&cache) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(Blocker::unsafe_state(error)),
@@ -846,7 +858,7 @@ fn cache_candidates(
         }
         Ok(_) => {}
     }
-    let base = checked(StoreDirectory::open(&cache))?;
+    let base = checked(StoreDirectory::open_with_control(&cache, control.clone()))?;
     for name in children(&base, budget)? {
         let actual = text_leaf(&name)?;
         if actual == "image" {

@@ -1,8 +1,8 @@
+use kio_core::control::ControlHandle;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kio_core::Result;
-use kio_core::scope::Repository;
 
 pub trait Interaction: Send + Sync {
     fn confirm(&self, summary: &str) -> Result<bool>;
@@ -23,15 +23,6 @@ impl AppContext {
     pub(crate) fn cwd(&self) -> &Path {
         &self.working_directory
     }
-    pub(crate) fn open_read_only_repository(&self) -> Result<Repository> {
-        Repository::open_read_only(self.cwd())
-    }
-    pub(crate) fn open_recovery_repository(&self) -> Result<Repository> {
-        Repository::open_for_recovery(self.cwd())
-    }
-    pub(crate) fn open_search_repository(&self) -> Result<Repository> {
-        Repository::open_for_search_read_only(self.cwd())
-    }
 }
 
 #[derive(Default)]
@@ -48,12 +39,12 @@ impl EvidenceRegistry {
         }
     }
 
-    pub(crate) fn path(&self) -> Result<PathBuf> {
+    pub(crate) fn path(&self, control: &ControlHandle) -> Result<PathBuf> {
         #[cfg(test)]
         if let Some(path) = &self.fixture_path {
             return Ok(path.clone());
         }
-        kio_index::registry::default_registry_path().map_err(|error| {
+        kio_index::registry::default_registry_path_with_control(control).map_err(|error| {
             crate::registry_snapshot_transient_error(
                 Path::new("<unresolved>"),
                 "path_resolution",

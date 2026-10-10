@@ -70,8 +70,18 @@ thread_local! {
 
 impl StoreLock {
     pub fn acquire(kio_dir: &Path) -> Result<Self> {
-        validate_store_lock_authority(&StoreDirectory::open(kio_dir)?)?;
-        let lock = Self::acquire_path_kind(kio_dir.join(".lock"), true)?;
+        Self::acquire_with_control(kio_dir, &crate::control::ControlHandle::default())
+    }
+
+    pub fn acquire_with_control(
+        kio_dir: &Path,
+        control: &crate::control::ControlHandle,
+    ) -> Result<Self> {
+        validate_store_lock_authority(&StoreDirectory::open_with_control(
+            kio_dir,
+            control.clone(),
+        )?)?;
+        let lock = Self::acquire_path_kind(kio_dir.join(".lock"), true, control)?;
         // The outer acquisition already performed this check while it owned
         // the real lock.  Besides avoiding redundant work, skipping the
         // ambient-path read for a nested acquisition lets a descriptor-bound
@@ -82,7 +92,7 @@ impl StoreLock {
         // Acquire first, then inspect through the strict GC parser. This closes
         // the marker-publication race for every ordinary writer sharing this
         // central lock entrypoint; GC uses its retained-descriptor counterpart.
-        if let Err(error) = crate::gc::ensure_no_active_sweep(kio_dir) {
+        if let Err(error) = crate::gc::ensure_no_active_sweep_with_control(kio_dir, control) {
             drop(lock);
             return Err(error);
         }
@@ -100,11 +110,22 @@ impl StoreLock {
     /// path) and stale-reclaim semantics as [`acquire`]; the parent directory is
     /// created if missing.
     pub fn acquire_path(path: PathBuf) -> Result<Self> {
-        // Generic device/publication locks are explicitly outside store gating.
-        Self::acquire_path_kind(path, false)
+        Self::acquire_path_with_control(path, &crate::control::ControlHandle::default())
     }
 
-    fn acquire_path_kind(path: PathBuf, _store_gate: bool) -> Result<Self> {
+    pub fn acquire_path_with_control(
+        path: PathBuf,
+        control: &crate::control::ControlHandle,
+    ) -> Result<Self> {
+        // Generic device/publication locks are explicitly outside store gating.
+        Self::acquire_path_kind(path, false, control)
+    }
+
+    fn acquire_path_kind(
+        path: PathBuf,
+        _store_gate: bool,
+        control: &crate::control::ControlHandle,
+    ) -> Result<Self> {
         let pid = std::process::id();
 
         // Reentrant fast path: this thread already holds the lock for `path`.
@@ -147,6 +168,7 @@ impl StoreLock {
 
         let native = crate::platform::acquire_path_lock(
             path.clone(),
+            control,
             pid,
             _store_gate,
             validate_bound_store_lock_authority,
@@ -240,13 +262,21 @@ thread_local! {
 /// identity in this thread. A weak entry never keeps an old store alive after
 /// the final guard is dropped.
 pub(crate) fn acquire_retained_store_lock(kio: &File) -> Result<RetainedStoreLock> {
-    validate_bound_store_lock_authority(kio)?;
-    acquire_retained_lock_kind(kio, true)
+    acquire_retained_store_lock_with_control(kio, &crate::control::ControlHandle::default())
 }
 
-pub(crate) fn acquire_retained_lock_kind(
+pub(crate) fn acquire_retained_store_lock_with_control(
+    kio: &File,
+    control: &crate::control::ControlHandle,
+) -> Result<RetainedStoreLock> {
+    validate_bound_store_lock_authority(kio, control)?;
+    acquire_retained_lock_kind_with_control(kio, true, control)
+}
+
+pub(crate) fn acquire_retained_lock_kind_with_control(
     kio: &File,
     _store_gate: bool,
+    control: &crate::control::ControlHandle,
 ) -> Result<RetainedStoreLock> {
     let identity = BoundLeaseIdentity {
         store_gate: _store_gate,
@@ -262,10 +292,10 @@ pub(crate) fn acquire_retained_lock_kind(
         return Ok(RetainedStoreLock { _owner: owner });
     }
     if _store_gate {
-        validate_bound_store_lock_authority(kio)?;
+        validate_bound_store_lock_authority(kio, control)?;
     }
     let owner = Rc::new(BoundStoreLock {
-        _native: crate::platform::acquire_bound_lock(kio, _store_gate)?,
+        _native: crate::platform::acquire_bound_lock(kio, _store_gate, control)?,
     });
     BOUND_STORE_LEASES.with(|leases| leases.borrow_mut().push((identity, Rc::downgrade(&owner))));
     Ok(RetainedStoreLock { _owner: owner })

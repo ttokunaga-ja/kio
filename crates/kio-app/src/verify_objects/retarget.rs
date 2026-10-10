@@ -100,7 +100,7 @@ fn retarget_old_verification_error(
 /// bounded possible chunks; every authority used below comes from the target
 /// tree, manifest/unit CAS, and chunk CAS.
 pub(super) fn run_evidence_retarget(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     args: EvidenceRetargetArgs,
 ) -> Result<Value> {
@@ -133,7 +133,7 @@ pub(super) fn run_evidence_retarget(
 }
 
 fn run_evidence_retarget_bound(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     at: &str,
@@ -191,7 +191,7 @@ fn run_evidence_retarget_bound(
         }
         Err(error) => return Err(error),
     };
-    let store = ObjectStore::new(&target.kio_dir);
+    let store = ObjectStore::new_with_control(&target.kio_dir, ctx.control.clone());
     if let Some(marker_verification) =
         canonical_pointer_marker_verification(pointer, true, target, &store, checkpoint)?
     {
@@ -205,7 +205,13 @@ fn run_evidence_retarget_bound(
         && let Some(entry) = canonical_pointer_tree_entry(tree, pointer)
         && let Some(normalize) = &entry.normalize
     {
-        retarget_manifest_unit_preflight(&target.kio_dir, &pointer.raw_hash, normalize, false)?;
+        retarget_manifest_unit_preflight(
+            &target.kio_dir,
+            &pointer.raw_hash,
+            normalize,
+            false,
+            ctx.control,
+        )?;
     }
     // Run the same canonical verifier used by `evidence verify` before doing
     // any retarget-specific reconstruction.  Optional presentation fields on
@@ -256,11 +262,16 @@ fn run_evidence_retarget_bound(
 
     // `--at` was grammar-checked above; this is deliberately a direct object
     // read, never a ref/tag/HEAD resolver.
-    let target_commit = read_exact_retarget_commit(&target.kio_dir, at)?;
+    let target_commit = read_exact_retarget_commit(&target.kio_dir, at, ctx.control)?;
     let target_tree = match repo.read_tree(&target_commit.tree) {
         Ok(tree) => tree,
         Err(error) if is_store_not_found(&error) => {
-            kio_core::gc::validate_final_shallow_tree(&target.kio_dir, at, &target_commit.tree)?;
+            kio_core::gc::validate_final_shallow_tree_with_control(
+                &target.kio_dir,
+                at,
+                &target_commit.tree,
+                repo.control(),
+            )?;
             return Err(retarget_shallow_error(
                 "target Evidence commit is shallow; retarget requires its tree",
                 at,
@@ -283,7 +294,13 @@ fn run_evidence_retarget_bound(
         .normalize
         .as_ref()
         .ok_or_else(retarget_not_found_error)?;
-    retarget_manifest_unit_preflight(&target.kio_dir, &pointer.raw_hash, target_normalize, true)?;
+    retarget_manifest_unit_preflight(
+        &target.kio_dir,
+        &pointer.raw_hash,
+        target_normalize,
+        true,
+        ctx.control,
+    )?;
     let target_units =
         pinned_done_units(repo, &pointer.raw_hash, target_normalize).map_err(|error| {
             if is_store_not_found(&error) {
@@ -401,8 +418,12 @@ fn run_evidence_retarget_bound(
 /// Read `--at` as exactly one commit object. A missing hash or an object from
 /// another namespace is an invalid operand; malformed bytes inside the commit
 /// namespace are authenticated store corruption, not a spelling error.
-fn read_exact_retarget_commit(kio_dir: &Path, at: &str) -> Result<CommitObject> {
-    let object = ObjectStore::new(kio_dir)
+fn read_exact_retarget_commit(
+    kio_dir: &Path,
+    at: &str,
+    control: &ControlHandle,
+) -> Result<CommitObject> {
+    let object = ObjectStore::new_with_control(kio_dir, control.clone())
         .read_by_hash(at)
         .map_err(|error| {
             if is_store_not_found(&error) {
@@ -439,8 +460,9 @@ fn retarget_manifest_unit_preflight(
     raw_hash: &str,
     normalize: &NormalizeRef,
     missing_is_corrupt: bool,
+    control: &ControlHandle,
 ) -> Result<()> {
-    let store = ObjectStore::new(kio_dir);
+    let store = ObjectStore::new_with_control(kio_dir, control.clone());
     let bytes = match store.read_content_object_bytes(
         ContentObjectKind::Manifest,
         &normalize.manifest_hash,

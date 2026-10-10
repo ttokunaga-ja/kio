@@ -1,7 +1,6 @@
 //! Explicit, journaled registration of an already-existing moved scope.
 
-use crate::context::AppContext;
-
+use kio_core::control::ControlHandle;
 use kio_core::management::{
     ChildEnrollment, ManagementAuthority, ManagementBinding, ManagementRecord, begin_registration,
     detect_case_insensitive, finish_registration, peek_registration_marker,
@@ -13,7 +12,7 @@ use kio_core::store_dir::{Publication, StoreDirectory};
 use kio_core::{KioError, Result};
 use kio_index::registry::{
     RegistryDb, RegistryEntry, RegistrySnapshotError, ScopeRegistrationRebind,
-    default_registry_path,
+    default_registry_path_with_control,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -71,7 +70,7 @@ struct Node {
     retired_children: BTreeMap<String, ChildEnrollment>,
 }
 
-pub(crate) fn run(ctx: &AppContext, args: RootRegisterArgs) -> Result<Value> {
+pub(crate) fn run(ctx: &crate::Invocation<'_>, args: RootRegisterArgs) -> Result<Value> {
     if args.preview == args.yes || (args.resume.is_some() && !args.yes) {
         return Err(KioError::invalid_usage(
             "root register requires exactly one of --preview or --yes; --resume requires --yes",
@@ -91,8 +90,8 @@ pub(crate) fn run(ctx: &AppContext, args: RootRegisterArgs) -> Result<Value> {
             "root register path must be a directory",
         ));
     }
-    let binding = ManagementBinding::bind(&canonical)?;
-    let control = control_for(&binding)?;
+    let binding = ManagementBinding::bind_with_control(&canonical, ctx.control.clone())?;
+    let control = control_for(&binding, ctx.control)?;
     let pending = control.read_optional(Path::new(JOURNAL_LEAF), MAX_JOURNAL_BYTES)?;
     if args.preview {
         if let Some(bytes) = pending {
@@ -107,7 +106,10 @@ pub(crate) fn run(ctx: &AppContext, args: RootRegisterArgs) -> Result<Value> {
                 kio_core::ExitCode::Failure,
             ));
         }
-        return Ok(preview(&plan_new(&canonical, binding.clone())?, None));
+        return Ok(preview(
+            &plan_new(&canonical, binding.clone(), ctx.control)?,
+            None,
+        ));
     }
     if !args.yes {
         return Err(KioError::invalid_usage(
@@ -130,7 +132,7 @@ pub(crate) fn run(ctx: &AppContext, args: RootRegisterArgs) -> Result<Value> {
                     "no root registration journal matches --resume",
                 ));
             }
-            let nodes = plan_new(&canonical, binding.clone())?;
+            let nodes = plan_new(&canonical, binding.clone(), ctx.control)?;
             let j = Journal {
                 version: 1,
                 operation_id: new_ulid(&canonical),
@@ -142,7 +144,7 @@ pub(crate) fn run(ctx: &AppContext, args: RootRegisterArgs) -> Result<Value> {
             (j, bytes, false)
         }
     };
-    execute(&binding, &mut journal, bytes, persisted).map_err(|error| {
+    execute(&binding, &mut journal, bytes, persisted, ctx.control).map_err(|error| {
         let mut context = error.context().clone();
         if let Some(context) = context.as_object_mut() {
             context.insert("operation_id".into(), json!(journal.operation_id));
@@ -157,9 +159,9 @@ pub(crate) fn run(ctx: &AppContext, args: RootRegisterArgs) -> Result<Value> {
     })
 }
 
-fn plan_new(root: &Path, binding: ManagementBinding) -> Result<Vec<Node>> {
+fn plan_new(root: &Path, binding: ManagementBinding, control: &ControlHandle) -> Result<Vec<Node>> {
     let mut nodes = Vec::new();
-    collect(root, PathBuf::new(), binding, &mut nodes)?;
+    collect(root, PathBuf::new(), binding, &mut nodes, control)?;
     let mut scope_ids = std::collections::BTreeSet::new();
     let mut identities = std::collections::BTreeSet::new();
     for node in &nodes {
@@ -215,8 +217,10 @@ fn plan_new(root: &Path, binding: ManagementBinding) -> Result<Vec<Node>> {
     }
     // The registry is a derived cache. Planning must neither create it nor
     // require it to exist when importing a moved tree on a new device.
-    let db = match RegistryDb::open_read_only(default_registry_path().map_err(crate::index_to_kio)?)
-    {
+    let db = match RegistryDb::open_read_only_with_control(
+        default_registry_path_with_control(control).map_err(crate::index_to_kio)?,
+        control,
+    ) {
         Ok(db) => Some(db),
         Err(RegistrySnapshotError::Missing) => None,
         Err(error) => return Err(KioError::invalid_usage(error.to_string())),
@@ -236,7 +240,7 @@ fn plan_new(root: &Path, binding: ManagementBinding) -> Result<Vec<Node>> {
             .to_string();
         for e in &entries {
             if e.kio_path != destination {
-                probe_live(e, &n.before.scope_id)?;
+                probe_live(e, &n.before.scope_id, control)?;
             }
         }
         n.old_kio_paths = entries.into_iter().map(|e| e.kio_path).collect();
@@ -249,6 +253,7 @@ fn collect(
     relative: PathBuf,
     binding: ManagementBinding,
     out: &mut Vec<Node>,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<()> {
     if out.len() >= MAX_NODES || relative.components().count() > 64 {
         return Err(KioError::invalid_usage(
@@ -256,7 +261,7 @@ fn collect(
         ));
     }
     let before = read_registration_recovery_record(&binding)?;
-    ensure_no_child_lifecycle(&binding)?;
+    ensure_no_child_lifecycle(&binding, control)?;
     let children = before.children.clone();
     let parent_scope = before.scope_id.clone();
     let original_root_scope = match &before.authority {
@@ -277,12 +282,13 @@ fn collect(
             return Err(KioError::invalid_usage("managed child name is invalid"));
         }
         let child_relative = relative.join(&name);
-        if !root_directory(&out[parent_index].binding)?.contains_entry(Path::new(&name))? {
+        if !root_directory(&out[parent_index].binding, control)?.contains_entry(Path::new(&name))? {
             out[parent_index].after.children.remove(&name);
             out[parent_index].retired_children.insert(name, grant);
             continue;
         }
-        let child = ManagementBinding::bind(root.join(&child_relative))?;
+        let child =
+            ManagementBinding::bind_with_control(root.join(&child_relative), control.clone())?;
         let record = read_registration_recovery_record(&child)?;
         validate_prospective_child(
             &out[parent_index].binding,
@@ -307,11 +313,11 @@ fn collect(
                 ));
             }
         }
-        collect(root, child_relative, child, out)?;
+        collect(root, child_relative, child, out, control)?;
     }
     Ok(())
 }
-fn probe_live(entry: &RegistryEntry, id: &str) -> Result<()> {
+fn probe_live(entry: &RegistryEntry, id: &str, control: &ControlHandle) -> Result<()> {
     let p = PathBuf::from(&entry.root_path);
     if !p.is_absolute() || Path::new(&entry.kio_path) != p.join(".kio") {
         return Err(KioError::invalid_usage(
@@ -338,7 +344,13 @@ fn probe_live(entry: &RegistryEntry, id: &str) -> Result<()> {
             ));
         }
     }
-    if read_registration_recovery_record(&ManagementBinding::bind(&p)?)?.scope_id == id {
+    if read_registration_recovery_record(&ManagementBinding::bind_with_control(
+        &p,
+        control.clone(),
+    )?)?
+    .scope_id
+        == id
+    {
         return Err(KioError::invalid_usage(
             "another live registered path has this scope ID",
         ));
@@ -350,19 +362,23 @@ fn execute(
     journal: &mut Journal,
     mut bytes: Vec<u8>,
     persisted: bool,
+    runtime_control: &ControlHandle,
 ) -> Result<Value> {
     retained_root.revalidate()?;
     let root = retained_root.canonical_root();
-    let control = control_for(retained_root)?;
+    let control = control_for(retained_root, runtime_control)?;
     let mut nodes = journal
         .nodes
         .iter()
-        .map(|j| node_from_journal(root, j))
+        .map(|j| node_from_journal(root, j, runtime_control))
         .collect::<Result<Vec<_>>>()?;
     // Keep the root used for the initial journal read, locks, and every journal
     // mutation identical even if an attacker replaces the named directory.
     nodes[0].binding = retained_root.clone();
-    let repos = nodes.iter().map(repo).collect::<Result<Vec<_>>>()?;
+    let repos = nodes
+        .iter()
+        .map(|node| repo(node, runtime_control))
+        .collect::<Result<Vec<_>>>()?;
     let _locks = repos
         .iter()
         .map(Repository::lock_store)
@@ -378,7 +394,7 @@ fn execute(
     }
     for n in &nodes {
         n.binding.revalidate()?;
-        ensure_no_child_lifecycle(&n.binding)?;
+        ensure_no_child_lifecycle(&n.binding, runtime_control)?;
         let current = read_registration_recovery_record(&n.binding)?;
         if current != n.before && current != n.after {
             return Err(KioError::invalid_usage(
@@ -403,7 +419,7 @@ fn execute(
         }
     }
     validate_journal_plan(&nodes)?;
-    recheck_retired_children(&nodes)?;
+    recheck_retired_children(&nodes, runtime_control)?;
     recheck_old_paths(&nodes)?;
     if !persisted {
         nodes[0].binding.revalidate()?;
@@ -419,21 +435,22 @@ fn execute(
         bytes = advance(&control, &nodes[0].binding, journal, Phase::Marked)?;
     }
     if journal.phase == Phase::Marked {
-        revoke_grants(&nodes)?;
+        revoke_grants(&nodes, runtime_control)?;
         bytes = advance(&control, &nodes[0].binding, journal, Phase::Revoked)?;
     } else if journal.phase != Phase::Prepared {
-        revoke_grants(&nodes)?;
+        revoke_grants(&nodes, runtime_control)?;
     }
     if journal.phase == Phase::Revoked {
         for n in &nodes {
-            recheck_retired_children(std::slice::from_ref(n))?;
+            recheck_retired_children(std::slice::from_ref(n), runtime_control)?;
             publish_registration_record(&n.binding, &journal.operation_id, &n.before, &n.after)?;
         }
         bytes = advance(&control, &nodes[0].binding, journal, Phase::Published)?;
     }
     if journal.phase == Phase::Published {
         recheck_old_paths(&nodes)?;
-        let mut db = RegistryDb::open_default().map_err(crate::index_to_kio)?;
+        let mut db =
+            RegistryDb::open_default_with_control(runtime_control).map_err(crate::index_to_kio)?;
         let rs = nodes
             .iter()
             .map(|n| ScopeRegistrationRebind {
@@ -450,7 +467,7 @@ fn execute(
                     root_path: n.binding.canonical_root().display().to_string(),
                     participates_in_global_search: false,
                     indexed: false,
-                    last_seen_at: crate::now_utc_seconds(),
+                    last_seen_at: runtime_control.now_utc_seconds(),
                 },
             })
             .collect::<Vec<_>>();
@@ -550,28 +567,38 @@ fn validate_journal_plan(nodes: &[Node]) -> Result<()> {
     }
     Ok(())
 }
-fn revoke_grants(nodes: &[Node]) -> Result<()> {
-    if crate::grants::PrivateGrantStore::open_readonly(&crate::approvals::store_path())?.is_some() {
-        let mut grants =
-            crate::grants::PrivateGrantStore::open_or_create(&crate::approvals::store_path())?;
+fn revoke_grants(nodes: &[Node], control: &ControlHandle) -> Result<()> {
+    if crate::grants::PrivateGrantStore::open_readonly(
+        &crate::approvals::store_path(control),
+        control,
+    )?
+    .is_some()
+    {
+        let mut grants = crate::grants::PrivateGrantStore::open_or_create(
+            &crate::approvals::store_path(control),
+            control,
+        )?;
         for node in nodes {
-            grants.revoke(&node.before.scope_id, None, crate::now_utc_seconds())?;
+            grants.revoke(&node.before.scope_id, None, control.now_utc_seconds())?;
             for (name, enrollment) in &node.retired_children {
                 grants.revoke_scope_instance(
                     &enrollment.scope_id,
                     &recorded_child_root(&node.before, name)?,
                     &enrollment.directory_identity,
-                    crate::now_utc_seconds(),
+                    control.now_utc_seconds(),
                 )?;
             }
         }
     }
     Ok(())
 }
-fn recheck_retired_children(nodes: &[Node]) -> Result<()> {
+fn recheck_retired_children(
+    nodes: &[Node],
+    control: &kio_core::control::ControlHandle,
+) -> Result<()> {
     for node in nodes {
         node.binding.revalidate()?;
-        let parent = root_directory(&node.binding)?;
+        let parent = root_directory(&node.binding, control)?;
         for name in node.retired_children.keys() {
             if parent.contains_entry(Path::new(name))? {
                 return Err(KioError::invalid_usage(
@@ -620,6 +647,7 @@ fn recheck_old_paths(nodes: &[Node]) -> Result<()> {
                     last_seen_at: String::new(),
                 },
                 &node.before.scope_id,
+                node.binding.control(),
             )?;
         }
         let destination = node
@@ -649,6 +677,7 @@ fn recheck_old_paths(nodes: &[Node]) -> Result<()> {
                     last_seen_at: String::new(),
                 },
                 &node.before.scope_id,
+                node.binding.control(),
             )?;
         }
     }
@@ -672,7 +701,7 @@ fn node_to_journal(n: &Node) -> JournalNode {
         retired_children: n.retired_children.clone(),
     }
 }
-fn node_from_journal(root: &Path, j: &JournalNode) -> Result<Node> {
+fn node_from_journal(root: &Path, j: &JournalNode, control: &ControlHandle) -> Result<Node> {
     let relative = if j.relative_path.is_empty() {
         PathBuf::new()
     } else {
@@ -690,15 +719,15 @@ fn node_from_journal(root: &Path, j: &JournalNode) -> Result<Node> {
     }
     Ok(Node {
         relative: relative.clone(),
-        binding: ManagementBinding::bind(root.join(relative))?,
+        binding: ManagementBinding::bind_with_control(root.join(relative), control.clone())?,
         before: j.before.clone(),
         after: j.after.clone(),
         old_kio_paths: j.old_kio_paths.clone(),
         retired_children: j.retired_children.clone(),
     })
 }
-fn repo(n: &Node) -> Result<Repository> {
-    Repository::open_bound_for_recovery(
+fn repo(n: &Node, control: &ControlHandle) -> Result<Repository> {
+    Repository::open_bound_for_recovery_with_control(
         n.binding.canonical_root().to_path_buf(),
         n.binding.root_handle().try_clone().map_err(|e| {
             KioError::io(
@@ -712,18 +741,20 @@ fn repo(n: &Node) -> Result<Repository> {
                 n.binding.canonical_root().display().to_string(),
             )
         })?,
+        control.clone(),
     )
 }
-fn control_for(b: &ManagementBinding) -> Result<StoreDirectory> {
-    StoreDirectory::from_retained(
+fn control_for(b: &ManagementBinding, control: &ControlHandle) -> Result<StoreDirectory> {
+    StoreDirectory::from_retained_with_control(
         b.kio_handle()
             .try_clone()
             .map_err(|e| KioError::io(e.to_string(), b.canonical_root().display().to_string()))?,
         b.canonical_root().join(".kio"),
+        control.clone(),
     )
 }
-fn root_directory(binding: &ManagementBinding) -> Result<StoreDirectory> {
-    StoreDirectory::from_retained(
+fn root_directory(binding: &ManagementBinding, control: &ControlHandle) -> Result<StoreDirectory> {
+    StoreDirectory::from_retained_with_control(
         binding.root_handle().try_clone().map_err(|error| {
             KioError::io(
                 error.to_string(),
@@ -731,10 +762,11 @@ fn root_directory(binding: &ManagementBinding) -> Result<StoreDirectory> {
             )
         })?,
         binding.canonical_root().to_path_buf(),
+        control.clone(),
     )
 }
-fn ensure_no_child_lifecycle(binding: &ManagementBinding) -> Result<()> {
-    let control = control_for(binding)?;
+fn ensure_no_child_lifecycle(binding: &ManagementBinding, control: &ControlHandle) -> Result<()> {
+    let control = control_for(binding, control)?;
     if control.inspect_atomic()? == kio_core::store_dir::AtomicWorkspaceState::Pending {
         return Err(KioError::invalid_usage(
             "atomic storage recovery must finish before moving or registering this scope",
@@ -754,9 +786,10 @@ fn ensure_no_child_lifecycle(binding: &ManagementBinding) -> Result<()> {
         }
     }
     if let Some(entries) = control.entries_optional(Path::new("child-initializations"))? {
-        let operations = StoreDirectory::from_retained(
+        let operations = StoreDirectory::from_retained_with_control(
             control.open_directory(Path::new("child-initializations"))?,
             control.path().join("child-initializations"),
+            control.control().clone(),
         )?;
         if operations.inspect_atomic()? == kio_core::store_dir::AtomicWorkspaceState::Pending
             || entries
@@ -990,7 +1023,8 @@ mod tests {
     }
 
     fn initialized_root(path: &Path) -> Repository {
-        match initialize_explicit_root(path).unwrap() {
+        match initialize_explicit_root(path, &kio_core::control::ControlHandle::default()).unwrap()
+        {
             ExplicitRoot::Created(repo) | ExplicitRoot::Existing(repo) => repo,
         }
     }
@@ -1012,6 +1046,7 @@ mod tests {
             PathBuf::new(),
             binding_for_repo(&root).unwrap(),
             &mut nodes,
+            &kio_core::control::ControlHandle::default(),
         )
         .unwrap();
         assert_eq!(nodes.len(), 2);
@@ -1064,13 +1099,20 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let root = initialized_root(directory.path());
         let binding = binding_for_repo(&root).unwrap();
-        let control = control_for(&binding).unwrap();
+        let control = control_for(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let marker = kio_core::management::CHILD_INITIALIZATION_PENDING_LEAF;
         control
             .write_atomic(Path::new(marker), b"pending", Publication::CreateOnly)
             .unwrap();
         let before = read_registration_recovery_record(&binding).unwrap();
-        assert!(plan_new(root.canonical_root(), binding.clone()).is_err());
+        assert!(
+            plan_new(
+                root.canonical_root(),
+                binding.clone(),
+                &kio_core::control::ControlHandle::default()
+            )
+            .is_err()
+        );
         assert_eq!(read_registration_recovery_record(&binding).unwrap(), before);
         assert_eq!(
             control.read_optional(Path::new(marker), 64).unwrap(),

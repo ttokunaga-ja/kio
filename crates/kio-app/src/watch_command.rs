@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use kio_core::control::ControlHandle;
 use kio_core::management::{ManagementAuthority, ManagementBinding, read_record};
 use kio_core::scope::new_ulid;
 use kio_core::store_dir::{Publication, StoreDirectory};
@@ -51,14 +52,14 @@ struct StopRequest {
     instance: String,
 }
 
-pub(crate) fn run(ctx: &AppContext, args: WatchArgs) -> Result<Value> {
+pub(crate) fn run(ctx: &AppContext, args: WatchArgs, control: &ControlHandle) -> Result<Value> {
     let WatchArgs {
         root: configured_root,
         command,
     } = args;
     let command = match command {
         WatchCommand::Service(command) => {
-            return crate::watch_service::run(ctx, configured_root, command);
+            return crate::watch_service::run(ctx, configured_root, command, control);
         }
         command => command,
     };
@@ -75,19 +76,19 @@ pub(crate) fn run(ctx: &AppContext, args: WatchArgs) -> Result<Value> {
     match command {
         WatchCommand::Run {
             reconcile_interval_seconds,
-        } => run_foreground(ctx, &root, reconcile_interval_seconds),
-        WatchCommand::Status => inspect(&root, false),
-        WatchCommand::Stop => inspect(&root, true),
+        } => run_foreground(ctx, &root, reconcile_interval_seconds, control),
+        WatchCommand::Status => inspect(&root, false, control),
+        WatchCommand::Stop => inspect(&root, true, control),
         WatchCommand::Service(_) => unreachable!("service commands return before root resolution"),
     }
 }
 
-pub(crate) fn inspect_liveness(root: &Path) -> Result<Value> {
-    inspect(root, false)
+pub(crate) fn inspect_liveness(root: &Path, control: &ControlHandle) -> Result<Value> {
+    inspect(root, false, control)
 }
 
-fn inspect(root: &Path, stop: bool) -> Result<Value> {
-    let Some(directory) = state_directory(root, false)? else {
+fn inspect(root: &Path, stop: bool, control: &ControlHandle) -> Result<Value> {
+    let Some(directory) = state_directory(root, false, control)? else {
         return Ok(json!({"status":"stopped", "root":root, "last_observation":null}));
     };
     let lock = open_watch_instance_lock(&directory, false)?;
@@ -119,13 +120,18 @@ fn inspect(root: &Path, stop: bool) -> Result<Value> {
     }))
 }
 
-fn run_foreground(ctx: &AppContext, root: &Path, interval: u64) -> Result<Value> {
+fn run_foreground(
+    ctx: &AppContext,
+    root: &Path,
+    interval: u64,
+    control: &ControlHandle,
+) -> Result<Value> {
     if !(1..=86400).contains(&interval) {
         return Err(KioError::invalid_usage(
             "reconciliation interval must be 1 through 86400 seconds",
         ));
     }
-    let repo = open_existing_managed_root(root)?;
+    let repo = open_existing_managed_root(root, control)?;
     let binding = binding_for_repo(&repo)?;
     let record = read_record(&binding)?;
     if record.authority != ManagementAuthority::Root {
@@ -133,7 +139,7 @@ fn run_foreground(ctx: &AppContext, root: &Path, interval: u64) -> Result<Value>
             "watch requires an explicitly registered root; use its management root",
         ));
     }
-    let directory = state_directory(root, true)?
+    let directory = state_directory(root, true, control)?
         .ok_or_else(|| watch_error("watch state directory is unavailable"))?;
     crate::platform::validate_watch_queue_directory(&directory).map_err(watch_error)?;
     let lock = open_watch_instance_lock(&directory, true)?
@@ -147,6 +153,7 @@ fn run_foreground(ctx: &AppContext, root: &Path, interval: u64) -> Result<Value>
     let watch_root =
         WatchRoot::new(&record.scope_id, root.to_path_buf(), 1).map_err(watch_error)?;
     let reconciler = LocalReconciler {
+        control: control.clone(),
         binding,
         scope_id: record.scope_id.clone(),
     };
@@ -205,6 +212,7 @@ fn run_foreground(ctx: &AppContext, root: &Path, interval: u64) -> Result<Value>
 }
 
 struct LocalReconciler {
+    control: ControlHandle,
     binding: ManagementBinding,
     scope_id: String,
 }
@@ -222,7 +230,7 @@ impl Reconcile for LocalReconciler {
             if record.scope_id != self.scope_id || record.authority != ManagementAuthority::Root {
                 return Err(watch_error("registered watch root authority changed"));
             }
-            let repo = open_existing_managed_root(&root.canonical_root)?;
+            let repo = open_existing_managed_root(&root.canonical_root, &self.control)?;
             let current = binding_for_repo(&repo)?;
             if current.directory_identity() != self.binding.directory_identity()
                 || repo.scope_identity()?.scope_id != self.scope_id
@@ -358,8 +366,13 @@ fn requested_stop(directory: &StoreDirectory, instance: &str) -> Result<bool> {
     Ok(request.instance == instance)
 }
 
-fn state_directory(root: &Path, create: bool) -> Result<Option<StoreDirectory>> {
-    let registry = kio_index::registry::default_registry_path().map_err(crate::index_to_kio)?;
+fn state_directory(
+    root: &Path,
+    create: bool,
+    control: &ControlHandle,
+) -> Result<Option<StoreDirectory>> {
+    let registry = kio_index::registry::default_registry_path_with_control(control)
+        .map_err(crate::index_to_kio)?;
     let data = registry
         .parent()
         .ok_or_else(|| watch_error("device data directory is unavailable"))?;
@@ -375,11 +388,11 @@ fn state_directory(root: &Path, create: bool) -> Result<Option<StoreDirectory>> 
     // resolver; canonicalizing and reopening a diagnostic pathname here would
     // make a later rename select attacker-controlled state instead.
     if create {
-        crate::private_state::ensure_private_directory(&target)
+        crate::private_state::ensure_private_directory(&target, control)
             .map(Some)
             .map_err(watch_error)
     } else {
-        crate::private_state::open_readonly(&target).map_err(watch_error)
+        crate::private_state::open_readonly(&target, control).map_err(watch_error)
     }
 }
 
@@ -412,7 +425,9 @@ mod tests {
     fn private_watch_directory() -> (tempfile::TempDir, StoreDirectory) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().canonicalize().unwrap().join("watch-state");
-        let directory = crate::private_state::ensure_private_directory(&path).unwrap();
+        let directory =
+            crate::private_state::ensure_private_directory(&path, &ControlHandle::default())
+                .unwrap();
         (temp, directory)
     }
 

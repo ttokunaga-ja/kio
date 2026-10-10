@@ -49,9 +49,9 @@ pub fn cost_ledger_rows_for_key(
 }
 
 macro_rules! typed_write {
-    ($name:ident($($arg:ident : $ty:ty),* $(,)?) -> $ret:ty) => {
+    ($name:ident($($arg:ident : $ty:ty),* $(,)?) -> $ret:ty $(, $control:ident)?) => {
         pub fn $name(db: &LedgerDb, $($arg: $ty),*) -> Result<$ret> {
-            db.write(|tx: &mut LedgerWriteTxn| super::ops_sql::$name(tx.connection(), $($arg),*))
+            db.write(|tx: &mut LedgerWriteTxn| super::ops_sql::$name(tx.connection(), $(tx.$control(),)? $($arg),*))
         }
     };
 }
@@ -64,17 +64,17 @@ macro_rules! typed_read {
 }
 
 typed_write!(phase1_intent(key: &TaskKey, request_kind: RequestKind, estimated_usd: f64,
-    sync_effective_timeout_seconds: Option<i64>) -> Phase1Outcome);
+    sync_effective_timeout_seconds: Option<i64>) -> Phase1Outcome, control);
 typed_write!(phase2a_record_provider_scope(key: &TaskKey, intent_token: &str,
     provider_scope_id: &str) -> bool);
 typed_write!(phase2a_record_upload_id(key: &TaskKey, intent_token: &str, upload_id: &str) -> bool);
 typed_write!(phase2a_restart_after_scope_mismatch(key: &TaskKey, intent_token: &str,
     old_upload_deletion_confirmed: bool) -> bool);
-typed_write!(phase2b_record_job_create_started(key: &TaskKey, intent_token: &str) -> bool);
+typed_write!(phase2b_record_job_create_started(key: &TaskKey, intent_token: &str) -> bool, control);
 typed_write!(phase2b_record_job_created(key: &TaskKey, intent_token: &str, batch_job_id: &str) -> bool);
 typed_write!(sync_record_provider_request_id(key: &TaskKey, intent_token: &str,
     provider_request_id: &str) -> bool);
-typed_write!(terminal_transaction(write: &TerminalWrite<'_>) -> TerminalReceipt);
+typed_write!(terminal_transaction(write: &TerminalWrite<'_>) -> TerminalReceipt, control);
 typed_read!(recovery_candidates() -> Vec<BatchRequestRow>);
 // Unreset Batch contract failures for the exact current attempt, including cleaned rows.
 typed_read!(unreset_contract_violations_for_scope_adapter(scope_id: &str, adapter_kind: &str) -> Vec<BatchRequestRow>);
@@ -83,16 +83,16 @@ typed_read!(sync_recovery_candidates(scope_id: &str, now_ms: i64) -> Vec<BatchRe
 typed_read!(distinct_scope_ids_with_sync_rows() -> Vec<String>);
 typed_write!(recovery_mark_found(key: &TaskKey, batch_job_id: &str) -> bool);
 typed_write!(recovery_settle_unknown(key: &TaskKey, intent_token: &str, estimated_usd: f64,
-    cleanup_complete: bool) -> TerminalReceipt);
+    cleanup_complete: bool) -> TerminalReceipt, control);
 typed_write!(authorize_unknown_sync_resend(key: &TaskKey) -> bool);
 typed_write!(recovery_finish_cleanup(key: &TaskKey, intent_token: &str) -> bool);
 typed_read!(stalled_rows() -> Vec<BatchRequestRow>);
 typed_write!(device_claim(key: &TaskKey, candidate_usd: f64, effective_timeout_seconds: i64,
-    device_cap: f64, per_adapter_cap: Option<f64>) -> ClaimOutcome);
+    device_cap: f64, per_adapter_cap: Option<f64>) -> ClaimOutcome, control);
 typed_write!(device_extend_stale_after(key: &TaskKey, intent_token: &str, retry_after_seconds: f64,
-    effective_timeout_seconds: i64) -> ExtendOutcome);
+    effective_timeout_seconds: i64) -> ExtendOutcome, control);
 typed_read!(plan_bounded_sweep(own_key: Option<&TaskKey>, now_ms: i64) -> SweepPlan);
-typed_write!(execute_bounded_sweep(plan: &SweepPlan, now_ms: i64) -> SweepReport);
+typed_write!(execute_bounded_sweep(plan: &SweepPlan, now_ms: i64) -> SweepReport, control);
 pub fn ledger_month_total(
     db: &LedgerDb,
     scope_id: Option<&str>,
@@ -102,9 +102,9 @@ pub fn ledger_month_total(
     db.read(|conn| super::ops_sql::ledger_month_total(conn, scope_id, adapter_kind, month))
 }
 typed_write!(check_then_reserve(key: &TaskKey, candidate_usd: f64, caps: &BudgetCapConfig,
-    request_kind: RequestKind, sync_effective_timeout_seconds: Option<i64>) -> CapCheckResult);
+    request_kind: RequestKind, sync_effective_timeout_seconds: Option<i64>) -> CapCheckResult, control);
 typed_read!(resolve_abandon_selector(selector: &AbandonSelector) -> AbandonResolution);
-typed_write!(execute_abandon(key: &TaskKey) -> AbandonExecution);
+typed_write!(execute_abandon(key: &TaskKey) -> AbandonExecution, control);
 typed_write!(reset_contract_violations(key: &TaskKey) -> bool);
 
 /// Atomic result for the application-level ``reuse open reservation or make a
@@ -158,7 +158,7 @@ pub fn reserve_or_reuse(
             });
         }
         match super::ops_sql::check_then_reserve(
-            conn,
+            conn, tx.control(),
             key,
             candidate_usd,
             caps,
@@ -173,7 +173,7 @@ pub fn reserve_or_reuse(
             }
             CapCheckResult::Denied(_) if bypass_cap_denial => {
                 let outcome = super::ops_sql::phase1_intent(
-                    conn,
+                    conn, tx.control(),
                     key,
                     request_kind,
                     candidate_usd,
@@ -202,9 +202,10 @@ pub fn sweep_then_device_claim(
     db.write(|tx: &mut LedgerWriteTxn| {
         let conn = tx.connection();
         let plan = super::ops_sql::plan_bounded_sweep(conn, Some(key), now_ms)?;
-        super::ops_sql::execute_bounded_sweep(conn, &plan, now_ms)?;
+        super::ops_sql::execute_bounded_sweep(conn, tx.control(), &plan, now_ms)?;
         super::ops_sql::device_claim(
             conn,
+            tx.control(),
             key,
             candidate_usd,
             effective_timeout_seconds,

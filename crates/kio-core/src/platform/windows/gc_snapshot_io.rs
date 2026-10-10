@@ -11,17 +11,25 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-pub(crate) fn directory(file: &File) -> Result<StoreDirectory> {
-    StoreDirectory::from_retained(
+pub(crate) fn directory(
+    file: &File,
+    control: &crate::control::ControlHandle,
+) -> Result<StoreDirectory> {
+    StoreDirectory::from_retained_with_control(
         file.try_clone()
             .map_err(|e| ioerr(e, "snapshot state directory"))?,
         PathBuf::from("<retained snapshot state directory>"),
+        control.clone(),
     )
 }
 
-pub(crate) fn open_snapshot_source(parent: &File, expected: &FileObservation) -> Result<File> {
+pub(crate) fn open_snapshot_source(
+    parent: &File,
+    expected: &FileObservation,
+    control: &crate::control::ControlHandle,
+) -> Result<File> {
     match crate::platform::open_gc_mutation(
-        &directory(parent)?,
+        &directory(parent, control)?,
         Path::new(SNAPSHOT_AUTO_STATE_LEAF),
         MAX_METADATA,
     ) {

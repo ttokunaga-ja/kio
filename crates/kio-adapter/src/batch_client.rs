@@ -22,6 +22,7 @@
 //! and a later collect run see a coherent QUEUED → … → SUCCESS sequence.
 
 use crate::tool_lock::AdapterRuntimeSettings;
+use kio_core::control::ControlHandle;
 #[cfg(debug_assertions)]
 use std::io::Write;
 use std::sync::Arc;
@@ -947,13 +948,26 @@ pub fn configured_mistral_batch_client(
     settings: &AdapterRuntimeSettings,
     recovery_context: impl FnOnce() -> Result<BatchRecoveryContext>,
 ) -> Result<Option<Box<dyn MistralBatchClient>>> {
+    configured_mistral_batch_client_with_control(
+        settings,
+        recovery_context,
+        &ControlHandle::default(),
+    )
+}
+
+/// Resolve a client using the invocation's immutable debug snapshot.
+pub fn configured_mistral_batch_client_with_control(
+    settings: &AdapterRuntimeSettings,
+    recovery_context: impl FnOnce() -> Result<BatchRecoveryContext>,
+    _control: &ControlHandle,
+) -> Result<Option<Box<dyn MistralBatchClient>>> {
     #[cfg(debug_assertions)]
     {
         use kio_core::test_control::Selector;
-        if let Selector::Known(raw) = crate::debug_test_control().adapters.mistral_batch
+        if let Selector::Known(raw) = &_control.debug().adapters.mistral_batch
             && !raw.trim().is_empty()
         {
-            return Ok(Some(Box::new(MockBatchClient::from_env_value(&raw)?)));
+            return Ok(Some(Box::new(MockBatchClient::from_env_value(raw)?)));
         }
     }
     if let Some(credential) = settings.resolve_role_api_key("markdown")? {
@@ -981,6 +995,42 @@ pub(crate) fn test_env_lock() -> &'static std::sync::Mutex<()> {
 #[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_factories_keep_independent_control_snapshots() {
+        use kio_core::test_control::{DebugTestControl, Selector};
+        let settings = AdapterRuntimeSettings::default();
+        let control = |scope: &str| {
+            let mut snapshot = DebugTestControl::default();
+            snapshot.adapters.mistral_batch =
+                Selector::Known(serde_json::json!({ "provider_scope_id": scope }).to_string());
+            ControlHandle::new(snapshot)
+        };
+        let first = configured_mistral_batch_client_with_control(
+            &settings,
+            || panic!("mock must not load a recovery key"),
+            &control("first"),
+        )
+        .unwrap()
+        .unwrap();
+        let second = configured_mistral_batch_client_with_control(
+            &settings,
+            || panic!("mock must not load a recovery key"),
+            &control("second"),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(first.provider_scope_id().unwrap(), "first");
+        assert_eq!(second.provider_scope_id().unwrap(), "second");
+        assert!(
+            configured_mistral_batch_client(&settings, || panic!(
+                "unconfigured root must not load a recovery key"
+            ),)
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(first.provider_scope_id().unwrap(), "first");
+    }
 
     #[test]
     fn credential_rotation_changes_scope_but_existing_instance_remains_pinned() {
@@ -1642,9 +1692,11 @@ mod tests {
 
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var(TEST_MISTRAL_BATCH_ENV, r#"{"provider_scope_id":"mock-ws"}"#) };
-        let mock = configured_mistral_batch_client(&AdapterRuntimeSettings::default(), || {
-            panic!("mock resolution must not load a private key")
-        })
+        let mock = configured_mistral_batch_client_with_control(
+            &AdapterRuntimeSettings::default(),
+            || panic!("mock resolution must not load a private key"),
+            &ControlHandle::new(kio_core::test_control::DebugTestControl::from_env()),
+        )
         .unwrap()
         .expect("the inline mock script stays first-priority");
         assert_eq!(mock.provider_scope_id().unwrap(), "mock-ws");

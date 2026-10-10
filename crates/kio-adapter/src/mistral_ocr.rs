@@ -494,7 +494,7 @@ pub struct MistralOcrMarkdownizeAdapter<C = EnvMistralOcrClient> {
     bbox_annotation_enabled: bool,
     /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): defaults to
     /// `NotProvided` (the real, shipped Mistral OCR `/v1/ocr` endpoint offers
-    /// no provider idempotency key) — see [`Self::with_provider_idempotency`].
+    /// no provider idempotency key) — see `with_provider_idempotency`.
     provider_idempotency: crate::types::ProviderIdempotency,
 }
 
@@ -538,6 +538,7 @@ impl<C> MistralOcrMarkdownizeAdapter<C> {
     /// [`crate::types::ProviderIdempotency`]. The real, shipped Mistral OCR
     /// adapter never calls this (it stays at the `::new()` default,
     /// `NotProvided`) — only a test-seam profile does.
+    #[cfg(any(debug_assertions, test))]
     #[must_use]
     pub fn with_provider_idempotency(
         mut self,

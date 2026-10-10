@@ -17,9 +17,10 @@ pub(crate) fn retire_candidate_tree(
     quarantine_checkpoint: impl Fn() -> Result<()>,
     before_erase: impl Fn() -> Result<()>,
     retirement_checkpoint: impl Fn() -> Result<()>,
+    control: &crate::control::ControlHandle,
 ) -> Result<bool> {
-    let source = directory(canonical_parent)?;
-    let archive = directory(archive_parent)?;
+    let source = directory(canonical_parent, control)?;
+    let archive = directory(archive_parent, control)?;
     let (mut victim, needs_move) =
         match crate::platform::open_gc_mutation(&source, Path::new(raw), MAX_TREE_OBJECT_BYTES) {
             Ok(file) => (file, true),

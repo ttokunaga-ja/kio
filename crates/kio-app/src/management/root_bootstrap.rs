@@ -5,11 +5,12 @@
 //! without it, a non-empty store is left untouched.
 
 use super::{ExplicitRoot, clone_root, retained_kio};
+use kio_core::control::ControlHandle;
 use kio_core::management::{
     DirectoryIdentity, MANAGEMENT_RECORD_VERSION, ManagementAuthority, ManagementBinding,
     ManagementRecord, detect_case_insensitive_in_directory, directory_identity_from_handle,
     observe_direct_child, planned_management_record_bytes, read_record,
-    read_registration_recovery_record, validate_controlled_root, validate_live_chain,
+    read_registration_recovery_record, validate_controlled_root_with_control, validate_live_chain,
 };
 use kio_core::scope::{Repository, RetainedStoreLock, new_ulid};
 use kio_core::store_dir::{AtomicWorkspaceState, Publication, StoreDirectory};
@@ -53,14 +54,18 @@ struct ParentAdmission {
 /// The caller has already decided that this is an explicit root request. This
 /// function makes no discovery decision and never adopts a non-empty `.kio`
 /// without its strict bootstrap journal.
-pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
+pub(super) fn initialize(root: &Path, control: &ControlHandle) -> Result<ExplicitRoot> {
     let canonical_root = root
         .canonicalize()
         .map_err(|error| KioError::io(error.to_string(), root.display().to_string()))?;
-    let retained_root = StoreDirectory::open(&canonical_root)?;
+    let retained_root = StoreDirectory::open_with_control(&canonical_root, control.clone())?;
     // Root control is an authority boundary, not a permission-repair step.
     // Refuse an unsafe root before creating `.kio`, a gate, or a journal.
-    validate_controlled_root(retained_root.root_handle().as_ref(), &canonical_root)?;
+    validate_controlled_root_with_control(
+        retained_root.root_handle().as_ref(),
+        &canonical_root,
+        control.clone(),
+    )?;
 
     // Existing complete stores only validate and reopen. In particular, an
     // already-enrolled Child remains a Child; it must not be forced through
@@ -68,11 +73,12 @@ pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
     let existing_kio = retained_kio(&retained_root)?;
     let existing_complete = match &existing_kio {
         Some(handle) => {
-            let directory = StoreDirectory::from_retained(
+            let directory = StoreDirectory::from_retained_with_control(
                 handle
                     .try_clone()
                     .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
                 canonical_root.join(".kio"),
+                control.clone(),
             )?;
             directory.contains_entry(Path::new("management.json"))?
                 && !directory.contains_entry(Path::new(JOURNAL))?
@@ -84,17 +90,29 @@ pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
     } else {
         admit_direct_parent(&canonical_root, &retained_root)?
     };
-    validate_controlled_root(retained_root.root_handle().as_ref(), &canonical_root)?;
+    validate_controlled_root_with_control(
+        retained_root.root_handle().as_ref(),
+        &canonical_root,
+        control.clone(),
+    )?;
 
     let kio = match existing_kio {
-        Some(kio) => StoreDirectory::from_retained(kio, canonical_root.join(".kio"))?,
+        Some(kio) => StoreDirectory::from_retained_with_control(
+            kio,
+            canonical_root.join(".kio"),
+            control.clone(),
+        )?,
         None => {
             let handle = retained_root
                 .create_directory(Path::new(".kio"))
                 .map_err(|_| {
                     KioError::invalid_usage("refusing to create over an existing .kio store")
                 })?;
-            StoreDirectory::from_retained(handle, canonical_root.join(".kio"))?
+            StoreDirectory::from_retained_with_control(
+                handle,
+                canonical_root.join(".kio"),
+                control.clone(),
+            )?
         }
     };
 
@@ -102,7 +120,7 @@ pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
     // user. Do not repair the permissions of a pre-existing empty directory.
     kio_core::private_fs::verify_private_directory_handle(&kio)?;
 
-    let binding = ManagementBinding::from_retained(
+    let binding = ManagementBinding::from_retained_with_control(
         clone_root(&retained_root)?,
         kio.root_handle().as_ref().try_clone().map_err(|e| {
             KioError::io(
@@ -111,6 +129,7 @@ pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
             )
         })?,
         canonical_root.clone(),
+        control.clone(),
     )?;
 
     // Read and validate an extant journal before creating any bootstrap gate.
@@ -123,7 +142,11 @@ pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
         verify_journal(journal, &canonical_root, &root_identity, &kio_identity)?;
     }
     binding.revalidate()?;
-    validate_controlled_root(retained_root.root_handle().as_ref(), &canonical_root)?;
+    validate_controlled_root_with_control(
+        retained_root.root_handle().as_ref(),
+        &canonical_root,
+        control.clone(),
+    )?;
     if kio.contains_entry(Path::new("management.json"))? && observed_journal.is_none() {
         validate_live_chain(&binding)?;
         if kio.inspect_atomic()? == AtomicWorkspaceState::Pending {
@@ -133,13 +156,14 @@ pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
             let _ = kio.recover_atomic(&[&kio, &retained_root])?;
             validate_live_chain(&binding)?;
         }
-        let repo = Repository::open_bound_existing(
+        let repo = Repository::open_bound_existing_with_control(
             canonical_root,
             clone_root(&retained_root)?,
             kio.root_handle()
                 .as_ref()
                 .try_clone()
                 .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
+            control.clone(),
         )?;
         verify_parent_admission(_parent_admission.as_ref(), &retained_root)?;
         return Ok(ExplicitRoot::Existing(repo));
@@ -158,13 +182,14 @@ pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
     let after_gate_journal = read_journal(&kio)?;
     if kio.contains_entry(Path::new("management.json"))? && after_gate_journal.is_none() {
         validate_live_chain(&binding)?;
-        let repo = Repository::open_bound_existing(
+        let repo = Repository::open_bound_existing_with_control(
             canonical_root,
             clone_root(&retained_root)?,
             kio.root_handle()
                 .as_ref()
                 .try_clone()
                 .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
+            control.clone(),
         )?;
         verify_parent_admission(_parent_admission.as_ref(), &retained_root)?;
         return Ok(ExplicitRoot::Existing(repo));
@@ -187,7 +212,11 @@ pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
                 case_insensitive: None,
             };
             binding.revalidate()?;
-            validate_controlled_root(retained_root.root_handle().as_ref(), &canonical_root)?;
+            validate_controlled_root_with_control(
+                retained_root.root_handle().as_ref(),
+                &canonical_root,
+                control.clone(),
+            )?;
             write_journal(&kio, &journal, Publication::CreateOnly)?;
             journal
         }
@@ -211,7 +240,11 @@ pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
                 &journal.planned_scope_id,
                 &[(GATE, b""), (JOURNAL, journal_bytes.as_slice())],
             )?;
-            validate_controlled_root(retained_root.root_handle().as_ref(), &canonical_root)?;
+            validate_controlled_root_with_control(
+                retained_root.root_handle().as_ref(),
+                &canonical_root,
+                control.clone(),
+            )?;
             // Case behavior belongs to the user-visible root directory, not
             // its private store. The core helper keeps transient artifacts in
             // `.kio` and resumes any verified interrupted probe itself.
@@ -224,7 +257,11 @@ pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
     let record = planned_root_record(&journal, case_insensitive)?;
     let record_bytes = planned_management_record_bytes(&record)?;
     let journal_bytes = journal_bytes(&journal)?;
-    validate_controlled_root(retained_root.root_handle().as_ref(), &canonical_root)?;
+    validate_controlled_root_with_control(
+        retained_root.root_handle().as_ref(),
+        &canonical_root,
+        control.clone(),
+    )?;
     kio_core::scope::complete_planned_kio_layout(
         &kio,
         &canonical_root,
@@ -250,13 +287,14 @@ pub(super) fn initialize(root: &Path) -> Result<ExplicitRoot> {
     // been proven, remove only this journal and then use the normal chain.
     binding.revalidate()?;
     kio.quarantine_then_remove(Path::new(JOURNAL), &journal_bytes, MAX_JOURNAL_BYTES)?;
-    let repo = Repository::open_bound_existing(
+    let repo = Repository::open_bound_existing_with_control(
         canonical_root,
         clone_root(&retained_root)?,
         kio.root_handle()
             .as_ref()
             .try_clone()
             .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
+        control.clone(),
     )?;
     validate_live_chain(&binding)?;
     verify_parent_admission(_parent_admission.as_ref(), &retained_root)?;
@@ -270,7 +308,7 @@ fn admit_direct_parent(
     let Some(parent_path) = canonical_root.parent() else {
         return Ok(None);
     };
-    let parent = StoreDirectory::open(parent_path)?;
+    let parent = StoreDirectory::open_with_control(parent_path, retained_root.control().clone())?;
     if !parent.contains_entry(Path::new(".kio"))? {
         return Ok(None);
     }
@@ -287,10 +325,11 @@ fn admit_direct_parent(
             "immediate parent has an unreadable or unsafe .kio; refusing ambiguous root creation",
         )
     })?;
-    let parent_repo = Repository::open_bound_existing(
+    let parent_repo = Repository::open_bound_existing_with_control(
         parent_path.to_path_buf(),
         clone_root(&parent)?,
         parent_kio,
+        retained_root.control().clone(),
     )
     .map_err(|_| {
         KioError::invalid_usage(
@@ -486,9 +525,10 @@ fn exact_abandoned_atomic_workspace(kio: &StoreDirectory) -> Result<bool> {
     ) {
         return Ok(false);
     }
-    let atomic = StoreDirectory::from_retained(
+    let atomic = StoreDirectory::from_retained_with_control(
         kio.open_directory(Path::new(".kio-atomic"))?,
         kio.path().join(".kio-atomic"),
+        kio.control().clone(),
     )?;
     let names = atomic.entries(Path::new(""))?;
     Ok(names.iter().all(|entry| {
@@ -558,10 +598,11 @@ mod tests {
     #[test]
     fn empty_store_is_bootstrapped_and_reopens_as_existing() {
         let root = canonical_tempdir();
-        let created = initialize(root.path()).unwrap();
+        let created =
+            initialize(root.path(), &kio_core::control::ControlHandle::default()).unwrap();
         assert!(matches!(created, ExplicitRoot::Created(_)));
         assert!(matches!(
-            initialize(root.path()).unwrap(),
+            initialize(root.path(), &kio_core::control::ControlHandle::default()).unwrap(),
             ExplicitRoot::Existing(_)
         ));
         assert!(!root.path().join(".kio").join(JOURNAL).exists());
@@ -574,7 +615,7 @@ mod tests {
         let root = canonical_tempdir();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(matches!(
-            initialize(root.path()).unwrap(),
+            initialize(root.path(), &kio_core::control::ControlHandle::default()).unwrap(),
             ExplicitRoot::Created(_)
         ));
     }
@@ -586,7 +627,7 @@ mod tests {
         let root = canonical_tempdir();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
         let before = tree_fingerprint(root.path());
-        assert!(initialize(root.path()).is_err());
+        assert!(initialize(root.path(), &kio_core::control::ControlHandle::default()).is_err());
         assert_eq!(tree_fingerprint(root.path()), before);
         assert!(!root.path().join(".kio").exists());
     }
@@ -600,7 +641,7 @@ mod tests {
         fs::create_dir(&path).unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o777)).unwrap();
         let before = tree_fingerprint(root.path());
-        assert!(initialize(root.path()).is_err());
+        assert!(initialize(root.path(), &kio_core::control::ControlHandle::default()).is_err());
         assert_eq!(tree_fingerprint(root.path()), before);
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
@@ -621,7 +662,7 @@ mod tests {
             .unwrap();
         assert!(status.success());
         let before = tree_fingerprint(root.path());
-        assert!(initialize(root.path()).is_err());
+        assert!(initialize(root.path(), &kio_core::control::ControlHandle::default()).is_err());
         assert_eq!(tree_fingerprint(root.path()), before);
         let directory = StoreDirectory::open(&path).unwrap();
         assert!(kio_core::private_fs::verify_private_directory_handle(&directory).is_err());
@@ -633,7 +674,7 @@ mod tests {
         fs::create_dir(root.path().join(".kio")).unwrap();
         fs::write(root.path().join(".kio").join("legacy"), b"do not touch").unwrap();
         let before = tree_fingerprint(root.path());
-        assert!(initialize(root.path()).is_err());
+        assert!(initialize(root.path(), &kio_core::control::ControlHandle::default()).is_err());
         assert_eq!(tree_fingerprint(root.path()), before);
     }
 
@@ -644,7 +685,7 @@ mod tests {
         let marker = root.path().join(".kio").join(JOURNAL);
         fs::write(&marker, b"{}").unwrap();
         let before = tree_fingerprint(root.path());
-        assert!(initialize(root.path()).is_err());
+        assert!(initialize(root.path(), &kio_core::control::ControlHandle::default()).is_err());
         assert_eq!(tree_fingerprint(root.path()), before);
     }
 
@@ -692,11 +733,11 @@ mod tests {
             preflight_unmarked_retry(&kio).unwrap();
             assert_eq!(tree_fingerprint(root.path()), before);
             assert!(matches!(
-                initialize(root.path()).unwrap(),
+                initialize(root.path(), &kio_core::control::ControlHandle::default()).unwrap(),
                 ExplicitRoot::Created(_)
             ));
             assert!(matches!(
-                initialize(root.path()).unwrap(),
+                initialize(root.path(), &kio_core::control::ControlHandle::default()).unwrap(),
                 ExplicitRoot::Existing(_)
             ));
             assert!(!kio.path().join(".kio-atomic/write").exists());
@@ -710,7 +751,7 @@ mod tests {
             let kio = unmarked_atomic_residue(root.path(), true);
             fs::write(kio.path().join(leaf), b"preserve").unwrap();
             let before = tree_fingerprint(root.path());
-            assert!(initialize(root.path()).is_err());
+            assert!(initialize(root.path(), &kio_core::control::ControlHandle::default()).is_err());
             assert_eq!(tree_fingerprint(root.path()), before);
         }
     }
@@ -722,7 +763,7 @@ mod tests {
             let kio = unmarked_atomic_residue(root.path(), true);
             fs::write(kio.path().join(leaf), b"not empty").unwrap();
             let before = tree_fingerprint(root.path());
-            assert!(initialize(root.path()).is_err());
+            assert!(initialize(root.path(), &kio_core::control::ControlHandle::default()).is_err());
             assert_eq!(tree_fingerprint(root.path()), before);
         }
     }
@@ -742,7 +783,7 @@ mod tests {
             }
             let before = tree_fingerprint(root.path());
             let mode = fs::metadata(&gate).unwrap().permissions().mode();
-            assert!(initialize(root.path()).is_err());
+            assert!(initialize(root.path(), &kio_core::control::ControlHandle::default()).is_err());
             assert_eq!(tree_fingerprint(root.path()), before);
             assert_eq!(fs::metadata(&gate).unwrap().permissions().mode(), mode);
         }
@@ -779,7 +820,7 @@ mod tests {
         .unwrap();
         assert_eq!(kio.inspect_atomic().unwrap(), AtomicWorkspaceState::Pending);
         let before = tree_fingerprint(root.path());
-        assert!(initialize(root.path()).is_err());
+        assert!(initialize(root.path(), &kio_core::control::ControlHandle::default()).is_err());
         assert_eq!(tree_fingerprint(root.path()), before);
     }
 
@@ -815,7 +856,7 @@ mod tests {
         drop(_gate);
 
         assert!(matches!(
-            initialize(&canonical).unwrap(),
+            initialize(&canonical, &kio_core::control::ControlHandle::default()).unwrap(),
             ExplicitRoot::Created(_)
         ));
         let scope: serde_json::Value =
@@ -851,7 +892,7 @@ mod tests {
         let marker = canonical.join(".kio").join(JOURNAL);
         let before = fs::read(&marker).unwrap();
         fs::set_permissions(&canonical, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(initialize(&canonical).is_err());
+        assert!(initialize(&canonical, &kio_core::control::ControlHandle::default()).is_err());
         assert_eq!(fs::read(marker).unwrap(), before);
     }
 
@@ -899,7 +940,12 @@ mod tests {
     #[test]
     fn enrolled_same_identity_child_without_kio_cannot_become_a_root() {
         let parent_path = canonical_tempdir();
-        let parent = match initialize(parent_path.path()).unwrap() {
+        let parent = match initialize(
+            parent_path.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("fresh parent unexpectedly existed"),
         };
@@ -911,7 +957,7 @@ mod tests {
             .children["child"]
             .clone();
         fs::remove_dir_all(child.join(".kio")).unwrap();
-        assert!(initialize(&child).is_err());
+        assert!(initialize(&child, &kio_core::control::ControlHandle::default()).is_err());
         assert!(!child.join(".kio").exists());
         assert_eq!(
             read_record(&binding_for_repo(&parent).unwrap())
@@ -924,7 +970,12 @@ mod tests {
     #[test]
     fn healthy_parent_allows_unenrolled_sibling_and_preserves_existing_child() {
         let parent_path = canonical_tempdir();
-        let parent = match initialize(parent_path.path()).unwrap() {
+        let parent = match initialize(
+            parent_path.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("fresh parent unexpectedly existed"),
         };
@@ -932,14 +983,14 @@ mod tests {
         fs::create_dir(&child).unwrap();
         reconcile_planned_child(&parent, bound(&child)).unwrap();
         assert!(matches!(
-            initialize(&child).unwrap(),
+            initialize(&child, &kio_core::control::ControlHandle::default()).unwrap(),
             ExplicitRoot::Existing(_)
         ));
 
         let sibling = parent_path.path().join("sibling");
         fs::create_dir(&sibling).unwrap();
         assert!(matches!(
-            initialize(&sibling).unwrap(),
+            initialize(&sibling, &kio_core::control::ControlHandle::default()).unwrap(),
             ExplicitRoot::Created(_)
         ));
         assert!(
@@ -957,7 +1008,7 @@ mod tests {
         fs::create_dir(&child).unwrap();
         fs::write(parent.path().join(".kio"), b"not a directory").unwrap();
         let before = tree_fingerprint(&child);
-        assert!(initialize(&child).is_err());
+        assert!(initialize(&child, &kio_core::control::ControlHandle::default()).is_err());
         assert_eq!(tree_fingerprint(&child), before);
         assert!(!child.join(".kio").exists());
     }

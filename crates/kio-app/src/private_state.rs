@@ -3,6 +3,7 @@
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+use kio_core::control::ControlHandle;
 use kio_core::store_dir::{Publication, StoreDirectory};
 use kio_core::{ExitCode, KioError, Result};
 
@@ -24,18 +25,23 @@ impl PrivateState {
     }
 }
 
-pub(crate) fn open_readonly(path: &Path) -> Result<Option<StoreDirectory>> {
-    if let Some((root, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)? {
+pub(crate) fn open_readonly(
+    path: &Path,
+    control: &ControlHandle,
+) -> Result<Option<StoreDirectory>> {
+    if let Some((root, suffix)) =
+        kio_core::private_fs::resolve_inherited_private_root_with_control(path, control)?
+    {
         return retained_private_directory(root, &suffix, false)
             .map(|result| result.map(|(directory, _)| directory));
     }
-    match kio_core::private_fs::verify_private_directory(path) {
+    match kio_core::private_fs::verify_private_directory_with_control(path, control) {
         Ok(directory) => Ok(Some(directory)),
         Err(error) => {
             // Only an actually absent component beneath a verified creation
             // parent is absence.  A broken or unsafe path must remain an
             // error; `Path::exists` would collapse both cases into `false`.
-            let (_, ancestor, _) = nearest_existing_ancestor(path)?;
+            let (_, ancestor, _) = nearest_existing_ancestor(path, control)?;
             if ancestor == path {
                 Err(error)
             } else {
@@ -47,35 +53,45 @@ pub(crate) fn open_readonly(path: &Path) -> Result<Option<StoreDirectory>> {
 
 /// Open and lock an existing private state directory without creating or
 /// repairing any filesystem entry.
-pub(crate) fn open_existing(path: &Path, lock_bytes: &[u8]) -> Result<Option<PrivateState>> {
-    let Some(directory) = open_readonly(path)? else {
+pub(crate) fn open_existing(
+    path: &Path,
+    lock_bytes: &[u8],
+    control: &ControlHandle,
+) -> Result<Option<PrivateState>> {
+    let Some(directory) = open_readonly(path, control)? else {
         return Ok(None);
     };
     let lock = acquire_existing_lock(&directory, lock_bytes)?;
     Ok(Some(PrivateState { directory, lock }))
 }
 
-pub(crate) fn open_or_create(path: &Path, lock_bytes: &[u8]) -> Result<PrivateState> {
-    let (directory, created) =
-        if let Some((root, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)? {
-            retained_private_directory(root, &suffix, true)?.ok_or_else(|| {
-                KioError::invalid_usage("private state creation returned no directory")
-            })?
-        } else {
-            match kio_core::private_fs::verify_private_directory(path) {
-                Ok(directory) => (directory, false),
-                Err(error) => {
-                    let (ancestor_directory, ancestor, missing) = nearest_existing_ancestor(path)?;
-                    if ancestor == path {
-                        return Err(error);
-                    }
-                    (
-                        create_private_directory(ancestor_directory, ancestor, missing, path)?,
-                        true,
-                    )
+pub(crate) fn open_or_create(
+    path: &Path,
+    lock_bytes: &[u8],
+    control: &ControlHandle,
+) -> Result<PrivateState> {
+    let (directory, created) = if let Some((root, suffix)) =
+        kio_core::private_fs::resolve_inherited_private_root_with_control(path, control)?
+    {
+        retained_private_directory(root, &suffix, true)?.ok_or_else(|| {
+            KioError::invalid_usage("private state creation returned no directory")
+        })?
+    } else {
+        match kio_core::private_fs::verify_private_directory_with_control(path, control) {
+            Ok(directory) => (directory, false),
+            Err(error) => {
+                let (ancestor_directory, ancestor, missing) =
+                    nearest_existing_ancestor(path, control)?;
+                if ancestor == path {
+                    return Err(error);
                 }
+                (
+                    create_private_directory(ancestor_directory, ancestor, missing, path)?,
+                    true,
+                )
             }
-        };
+        }
+    };
     // The lock leaf is initialized only with a newly created store. An
     // existing store with a missing/unsafe lock is corrupt rather than a
     // permission-repair opportunity.
@@ -115,7 +131,11 @@ fn retained_private_directory(
                     .map_err(|_| create_error)?,
             }
         };
-        let child = StoreDirectory::from_retained(handle, directory.path().join(leaf))?;
+        let child = StoreDirectory::from_retained_with_control(
+            handle,
+            directory.path().join(leaf),
+            directory.control().clone(),
+        )?;
         kio_core::private_fs::verify_private_directory_handle(&child)?;
         directory = child;
     }
@@ -127,6 +147,7 @@ fn retained_private_directory(
 /// authorizing creation from an unchecked path lookup.
 fn nearest_existing_ancestor(
     path: &Path,
+    control: &ControlHandle,
 ) -> Result<(StoreDirectory, PathBuf, Vec<std::ffi::OsString>)> {
     if !path.is_absolute() {
         return Err(KioError::invalid_usage(
@@ -138,7 +159,9 @@ fn nearest_existing_ancestor(
     loop {
         match std::fs::symlink_metadata(&current) {
             Ok(_) => {
-                let directory = kio_core::private_fs::verify_private_creation_parent(&current)?;
+                let directory = kio_core::private_fs::verify_private_creation_parent_with_control(
+                    &current, control,
+                )?;
                 missing.reverse();
                 return Ok((directory, current, missing));
             }
@@ -178,9 +201,16 @@ fn create_private_directory(
         // created.  If another writer won the name, strictly re-verify that
         // exact directory instead of repairing its permissions.
         directory = match directory.create_directory(Path::new(&leaf)) {
-            Ok(created) => StoreDirectory::from_retained(created, current_path.clone())?,
+            Ok(created) => StoreDirectory::from_retained_with_control(
+                created,
+                current_path.clone(),
+                directory.control().clone(),
+            )?,
             Err(create_error) => {
-                match kio_core::private_fs::verify_private_directory(&current_path) {
+                match kio_core::private_fs::verify_private_directory_with_control(
+                    &current_path,
+                    directory.control(),
+                ) {
                     Ok(existing) => existing,
                     Err(_) => return Err(create_error),
                 }
@@ -247,11 +277,12 @@ pub(crate) fn create_initialized(
     path: &Path,
     lock_bytes: &[u8],
     initialize: impl FnOnce(&StoreDirectory) -> Result<()>,
+    control: &ControlHandle,
 ) -> Result<PrivateState> {
     let parent_path = path
         .parent()
         .ok_or_else(|| KioError::invalid_usage("private state path has no parent"))?;
-    let parent = ensure_private_directory(parent_path)?;
+    let parent = ensure_private_directory(parent_path, control)?;
     let leaf = path
         .file_name()
         .ok_or_else(|| KioError::invalid_usage("private state path has no leaf"))?;
@@ -268,7 +299,11 @@ pub(crate) fn create_initialized(
     ));
     let stage_handle = parent.create_directory(Path::new(&stage_leaf))?;
     let stage_path = parent_path.join(&stage_leaf);
-    let stage = StoreDirectory::from_retained(stage_handle, stage_path)?;
+    let stage = StoreDirectory::from_retained_with_control(
+        stage_handle,
+        stage_path,
+        parent.control().clone(),
+    )?;
     initialize_lock(&stage, lock_bytes)?;
     initialize(&stage)?;
     stage.sync()?;
@@ -280,7 +315,11 @@ pub(crate) fn create_initialized(
         .root_handle()
         .try_clone()
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-    let directory = StoreDirectory::from_retained(published, path.to_path_buf())?;
+    let directory = StoreDirectory::from_retained_with_control(
+        published,
+        path.to_path_buf(),
+        parent.control().clone(),
+    )?;
     kio_core::private_fs::verify_private_directory_handle(&directory)?;
     let lock = acquire_existing_lock(&directory, lock_bytes)?;
     Ok(PrivateState { directory, lock })
@@ -288,18 +327,23 @@ pub(crate) fn create_initialized(
 
 static STAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-pub(crate) fn ensure_private_directory(path: &Path) -> Result<StoreDirectory> {
-    if let Some((root, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)? {
+pub(crate) fn ensure_private_directory(
+    path: &Path,
+    control: &ControlHandle,
+) -> Result<StoreDirectory> {
+    if let Some((root, suffix)) =
+        kio_core::private_fs::resolve_inherited_private_root_with_control(path, control)?
+    {
         return retained_private_directory(root, &suffix, true)?
             .map(|(directory, _)| directory)
             .ok_or_else(|| {
                 KioError::invalid_usage("private directory creation returned no directory")
             });
     }
-    match kio_core::private_fs::verify_private_directory(path) {
+    match kio_core::private_fs::verify_private_directory_with_control(path, control) {
         Ok(directory) => Ok(directory),
         Err(error) => {
-            let (ancestor_directory, ancestor, missing) = nearest_existing_ancestor(path)?;
+            let (ancestor_directory, ancestor, missing) = nearest_existing_ancestor(path, control)?;
             if ancestor == path {
                 return Err(error);
             }
@@ -316,6 +360,7 @@ fn initialize_lock(directory: &StoreDirectory, lock_bytes: &[u8]) -> Result<()> 
 
 #[cfg(all(test, unix))]
 mod tests {
+    use kio_core::control::ControlHandle;
     use std::fs::{self, File};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -403,7 +448,11 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        assert!(open_readonly(&inherited).unwrap().is_none());
+        assert!(
+            open_readonly(&inherited, &ControlHandle::default())
+                .unwrap()
+                .is_none()
+        );
         assert!(!root.path().join("missing").exists());
     }
 
@@ -412,9 +461,14 @@ mod tests {
         let root = private_tempdir();
         let handle = File::open(root.path()).unwrap();
         let inherited = inherited_path(&handle, "trust");
-        let state = create_initialized(&inherited, b"private-state-test-lock", |directory| {
-            directory.write_atomic(Path::new("record.json"), b"{}", Publication::CreateOnly)
-        })
+        let state = create_initialized(
+            &inherited,
+            b"private-state-test-lock",
+            |directory| {
+                directory.write_atomic(Path::new("record.json"), b"{}", Publication::CreateOnly)
+            },
+            &ControlHandle::default(),
+        )
         .unwrap();
         assert_eq!(
             state
@@ -434,9 +488,13 @@ mod tests {
             b"{}"
         );
         assert!(
-            open_existing(&inherited, b"private-state-test-lock")
-                .unwrap()
-                .is_some()
+            open_existing(
+                &inherited,
+                b"private-state-test-lock",
+                &ControlHandle::default()
+            )
+            .unwrap()
+            .is_some()
         );
     }
 
@@ -448,7 +506,7 @@ mod tests {
         let inherited = inherited_path(&handle, "state");
 
         assert!(kio_core::private_fs::resolve_inherited_private_root(&inherited).is_err());
-        assert!(super::open_or_create(&inherited, b"lock").is_err());
+        assert!(super::open_or_create(&inherited, b"lock", &ControlHandle::default()).is_err());
         assert!(!root.path().join("state").exists());
     }
 }

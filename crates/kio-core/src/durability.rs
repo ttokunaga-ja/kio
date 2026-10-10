@@ -101,32 +101,39 @@ impl DurabilityPoint {
 /// adjacent `.release` marker for at most 30 seconds.  A production build is
 /// intentionally inert.
 pub fn checkpoint(point: DurabilityPoint) -> Result<()> {
+    checkpoint_with_control(&crate::control::ControlHandle::default(), point)
+}
+
+pub(crate) fn checkpoint_with_control(
+    control: &crate::control::ControlHandle,
+    point: DurabilityPoint,
+) -> Result<()> {
     #[cfg(debug_assertions)]
     {
-        checkpoint_debug(point)
+        checkpoint_debug(control, point)
     }
 
     #[cfg(not(debug_assertions))]
     {
-        let _ = point;
+        let _ = (control, point);
         Ok(())
     }
 }
 
 #[cfg(debug_assertions)]
-fn checkpoint_debug(point: DurabilityPoint) -> Result<()> {
+fn checkpoint_debug(owner: &crate::control::ControlHandle, point: DurabilityPoint) -> Result<()> {
     use std::time::{Duration, Instant};
 
-    let control = crate::test_control::current_or_default().core;
+    let control = &owner.debug().core;
     if control.durability_point.known() != Some(&point) {
         return Ok(());
     }
-    let Some(ready_path) = control.durability_ready else {
+    let Some(ready_path) = &control.durability_ready else {
         return Ok(());
     };
 
     let payload = format!("point={}\npid={}\n", point.name(), std::process::id());
-    publish_ready_marker_with(&ready_path, payload.as_bytes(), |_| Ok(())).map_err(|error| {
+    publish_ready_marker_with(ready_path, payload.as_bytes(), |_| Ok(())).map_err(|error| {
         crate::KioError::io(error.to_string(), ready_path.display().to_string())
     })?;
 
@@ -221,26 +228,30 @@ fn publish_ready_marker_with(
 
 #[cfg(all(test, debug_assertions))]
 mod tests {
-    use super::{DurabilityPoint, checkpoint, publish_ready_marker_with};
-    use crate::test_control::{CoreTestControl, DebugTestControl, Selector, install_scoped};
+    use super::{DurabilityPoint, publish_ready_marker_with};
+    use crate::test_control::{CoreTestControl, DebugTestControl, Selector};
     use std::time::{Duration, Instant};
 
     #[test]
     fn absent_control_is_inert() {
-        let _control = install_scoped(DebugTestControl::default());
-        checkpoint(DurabilityPoint::PublicationJournal).unwrap();
+        let control = crate::control::ControlHandle::new(DebugTestControl::default());
+        control
+            .checkpoint(DurabilityPoint::PublicationJournal)
+            .unwrap();
     }
 
     #[test]
     fn selector_must_match_the_exact_point() {
-        let _control = install_scoped(DebugTestControl {
+        let control = crate::control::ControlHandle::new(DebugTestControl {
             core: CoreTestControl {
                 durability_point: Selector::Known(DurabilityPoint::PublicationHead),
                 ..CoreTestControl::default()
             },
             ..DebugTestControl::default()
         });
-        checkpoint(DurabilityPoint::PublicationJournal).unwrap();
+        control
+            .checkpoint(DurabilityPoint::PublicationJournal)
+            .unwrap();
     }
 
     #[test]
@@ -248,7 +259,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("ready");
         let release = ready.with_extension("release");
-        let _control = install_scoped(DebugTestControl {
+        let control = crate::control::ControlHandle::new(DebugTestControl {
             core: CoreTestControl {
                 durability_point: Selector::Known(DurabilityPoint::PublicationJournal),
                 durability_ready: Some(ready.clone()),
@@ -269,7 +280,9 @@ mod tests {
             std::fs::write(release, b"release").unwrap();
         });
 
-        checkpoint(DurabilityPoint::PublicationJournal).unwrap();
+        control
+            .checkpoint(DurabilityPoint::PublicationJournal)
+            .unwrap();
         releaser.join().unwrap();
         let marker = std::fs::read_to_string(ready).unwrap();
         assert!(marker.contains("point=publication_journal\n"));

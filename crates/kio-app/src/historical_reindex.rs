@@ -4,8 +4,6 @@
 //! This path therefore never consults a later normalize cache, creates a normalized
 //! generation, or advances a ref. It only appends missing current-config chunk
 //! associations and their derived search/embedding projections.
-use kio_adapter::tool_lock::AdapterRuntimeSettings;
-use std::sync::Arc;
 
 use super::*;
 use kio_core::history::TreeBinding;
@@ -212,9 +210,10 @@ pub(super) struct RetainedNormalizedInstance {
 pub(super) fn retained_history_instances(
     kio_dir: &Path,
     head: &str,
+    control: &ControlHandle,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
-    let graph = HistoryReader::new(kio_dir).walk(head)?;
-    retained_history_instances_from_graph(kio_dir, &graph)
+    let graph = HistoryReader::new_with_control(kio_dir, control.clone()).walk(head)?;
+    retained_history_instances_from_graph(kio_dir, &graph, control)
 }
 
 /// Derive retained instances from a complete strict graph.  Keeping the graph
@@ -223,6 +222,7 @@ pub(super) fn retained_history_instances(
 fn retained_history_instances_from_graph(
     kio_dir: &Path,
     graph: &kio_core::history::LinearHistory,
+    control: &ControlHandle,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
     let mut all_paths_by_raw = BTreeMap::<String, BTreeSet<String>>::new();
     for appearance in graph.bindings() {
@@ -246,7 +246,7 @@ fn retained_history_instances_from_graph(
     let mut by_instance =
         BTreeMap::<(String, String, u64, String), Vec<(TreeBinding, String)>>::new();
     for binding in exact_bindings {
-        if purge_blocks_rebuild_raw(kio_dir, &binding.raw_hash)? {
+        if purge_blocks_rebuild_raw(kio_dir, &binding.raw_hash, control)? {
             continue;
         }
         let normalize = binding
@@ -343,23 +343,26 @@ fn retained_history_instances_from_graph(
 pub(super) fn retained_history_instances_for_roots(
     kio_dir: &Path,
     roots: &BTreeSet<String>,
+    control: &ControlHandle,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
     if roots.is_empty() {
         return Ok(Vec::new());
     }
-    let (graph, _) = HistoryReader::new(kio_dir).walk_for_roots_allow_shallowed(roots)?;
-    retained_history_instances_from_graph(kio_dir, &graph)
+    let (graph, _) = HistoryReader::new_with_control(kio_dir, control.clone())
+        .walk_for_roots_allow_shallowed(roots)?;
+    retained_history_instances_from_graph(kio_dir, &graph, control)
 }
 
 pub(super) fn run(
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     repo: &Repository,
     operand: &str,
     online: bool,
     offline: bool,
 ) -> Result<Value> {
-    ensure_no_visible_purge_journal(repo.kio_dir())?;
+    let adapter_settings = ctx.settings;
+
+    ensure_no_visible_purge_journal(repo.kio_dir(), repo.control())?;
     let head_before = repo
         .head_commit_hash()?
         .ok_or_else(|| KioError::not_found("HEAD"))?;
@@ -367,7 +370,8 @@ pub(super) fn run(
     // Unlike a history walk, an explicit historical reindex needs only the exact
     // selected commit and tree. HistoryReader gives this read the same strict CAS,
     // shallow, per-object, no-cache semantics as `search --at`.
-    let snapshot = HistoryReader::new(repo.kio_dir()).snapshot(&selected_commit)?;
+    let snapshot = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+        .snapshot(&selected_commit)?;
     let config = read_chunking_config(repo)?;
     if config.chunking_config_hash != snapshot.tree.chunking_config_hash {
         return Err(KioError::invalid_usage(
@@ -402,7 +406,11 @@ pub(super) fn run(
         let blocked = match historical_purge_decisions.get(&entry.raw_hash) {
             Some(blocked) => *blocked,
             None => {
-                let blocked = purge_blocks_historical_reindex_raw(repo.kio_dir(), &entry.raw_hash)?;
+                let blocked = purge_blocks_historical_reindex_raw(
+                    repo.kio_dir(),
+                    &entry.raw_hash,
+                    repo.control(),
+                )?;
                 historical_purge_decisions.insert(entry.raw_hash.clone(), blocked);
                 blocked
             }
@@ -469,7 +477,8 @@ pub(super) fn run(
     // strict, while a receipt-backed shallow ancestor is an intentional
     // boundary rather than a reason to consult mutable state.
     let (selected_graph, _) =
-        HistoryReader::new(repo.kio_dir()).walk_allow_shallowed(&selected_commit)?;
+        HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+            .walk_allow_shallowed(&selected_commit)?;
     let introductions_by_identity =
         selected_history_introductions(&selected_graph, &selected, &config.chunking_config_hash)?;
     for (identity, instance) in &mut selected {
@@ -584,7 +593,7 @@ pub(super) fn run(
             raw_path: instance.raw_path.clone(),
             units: units?,
             config: config.clone(),
-            created_at: now_utc_seconds(),
+            created_at: ctx.control.now_utc_seconds(),
         };
         let unit_authorities = unit_authorities_from_inputs(&input.units);
         for mut row in chunk_normalized_instance(input).map_err(index_to_kio)? {
@@ -670,7 +679,6 @@ pub(super) fn run(
     let embedding_online =
         embedding_online_allowed(adapter_settings, repo, offline, online, false)?;
     let enrichment = run_historical_embedding_enrichment(
-        adapter_settings,
         ctx,
         repo,
         embedding_online,
@@ -795,7 +803,7 @@ fn reindex_history_limit_error(exceeded: &str, attempted: u64, limit: u64) -> Ki
 /// exact tree projection. Rebuilding the whole ledger would be observable work on
 /// non-selected history; this narrow transaction is the enrichment-only boundary.
 fn project_selected_snapshot(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     repo: &Repository,
     selected_commit: &str,
     tree_entries: &[TreeEntryRow],
@@ -847,7 +855,7 @@ fn project_selected_snapshot(
     }
     let mut selected_chunks = Vec::new();
     for chunk in read_stored_chunks(repo.kio_dir())? {
-        if purge_blocks_rebuild_raw(repo.kio_dir(), &chunk.row.raw_hash)? {
+        if purge_blocks_rebuild_raw(repo.kio_dir(), &chunk.row.raw_hash, repo.control())? {
             continue;
         }
         if chunk.row.chunking_config_hash == chunking_config_hash
@@ -949,7 +957,7 @@ fn project_selected_snapshot(
             // increment: `index_chunk_with_rowids` re-affirms existing rows as
             // readily as it adds new ones.
             drop(fts);
-            crate::rotate_index_generation_unconditionally(repo.kio_dir())?;
+            crate::rotate_index_generation_unconditionally(repo.kio_dir(), repo.control())?;
             crate::write_through_projection_or_log_for_at_snapshot(
                 ctx,
                 repo.kio_dir(),
@@ -1035,7 +1043,9 @@ mod tests {
         let public_root = commit("public", "z-public.md", Some(secret_root.clone()));
         let roots = BTreeSet::from([public_root.clone(), secret_root.clone()]);
         let graph = HistoryReader::new(&kio_dir).walk_for_roots(&roots).unwrap();
-        let instances = retained_history_instances_from_graph(&kio_dir, &graph).unwrap();
+        let instances =
+            retained_history_instances_from_graph(&kio_dir, &graph, &ControlHandle::default())
+                .unwrap();
 
         assert_eq!(instances.len(), 1);
         let instance = &instances[0];

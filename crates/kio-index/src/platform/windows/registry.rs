@@ -23,6 +23,7 @@ pub(crate) struct RegistryParentBinding {
 
 pub(crate) fn registry_parent_and_leaf(
     path: &Path,
+    _control: &kio_core::control::ControlHandle,
 ) -> std::result::Result<RegistryParentBinding, RegistrySnapshotError> {
     let path = normalized_absolute_registry_path(path)?;
     let filesystem_root = registry_filesystem_root(&path)?;
@@ -132,10 +133,11 @@ pub(crate) fn registry_parent_and_leaf(
 
 pub(crate) fn stable_registry_parent_binding(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> std::result::Result<Option<RegistryParentBinding>, SnapshotAttemptError> {
-    match registry_parent_and_leaf(path) {
+    match registry_parent_and_leaf(path, control) {
         Ok(binding) => Ok(Some(binding)),
-        Err(RegistrySnapshotError::Missing) => match registry_parent_and_leaf(path) {
+        Err(RegistrySnapshotError::Missing) => match registry_parent_and_leaf(path, control) {
             Err(RegistrySnapshotError::Missing) => Ok(None),
             Ok(_) => Err(SnapshotAttemptError::Unstable(
                 "scope registry parent appeared while confirming its absence".to_owned(),
@@ -150,9 +152,10 @@ pub(crate) fn stable_registry_parent_binding(
 /// to be the same directory as the descriptor used to capture the snapshot.
 pub(crate) fn fresh_registry_parent_binding(
     held: &RegistryParentBinding,
+    control: &kio_core::control::ControlHandle,
 ) -> std::result::Result<std::sync::Arc<fs::File>, SnapshotAttemptError> {
     let canonical_path = held.parent_path.join(&held.leaf);
-    let fresh = match registry_parent_and_leaf(&canonical_path) {
+    let fresh = match registry_parent_and_leaf(&canonical_path, control) {
         Ok(binding) => binding,
         Err(RegistrySnapshotError::Missing) => {
             return Err(SnapshotAttemptError::Unstable(
@@ -288,6 +291,7 @@ pub(crate) fn normalized_absolute_registry_path(
 
 pub(crate) fn windows_registry_writer_parent(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<(PathBuf, kio_core::store_dir::StoreDirectory)> {
     use kio_core::{private_fs, store_dir::StoreDirectory};
     use std::os::windows::fs::MetadataExt;
@@ -337,7 +341,7 @@ pub(crate) fn windows_registry_writer_parent(
                 }
                 // An occupied unsafe ancestor is a refusal, never a reason to
                 // back off farther or repair that ancestor's ACL.
-                break private_fs::verify_private_creation_parent(&ancestor)
+                break private_fs::verify_private_creation_parent_with_control(&ancestor, control)
                     .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -372,7 +376,7 @@ pub(crate) fn windows_registry_writer_parent(
                 .map_err(|error| crate::IndexError::Schema(error.to_string()))?
         };
         logical.push(&component);
-        parent = StoreDirectory::from_retained(next, logical.clone())
+        parent = StoreDirectory::from_retained_with_control(next, logical.clone(), control.clone())
             .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
         // A component that appeared after the missing suffix was observed must
         // also be private; neither that entry nor a new one is ACL-repaired.
@@ -612,7 +616,8 @@ impl PrivateSnapshotStorage {
 }
 pub(crate) fn prepare_registry_writer(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<(PathBuf, Option<kio_core::store_dir::StoreDirectory>)> {
-    let (sqlite_path, parent) = windows_registry_writer_parent(path)?;
+    let (sqlite_path, parent) = windows_registry_writer_parent(path, control)?;
     Ok((sqlite_path, Some(parent)))
 }

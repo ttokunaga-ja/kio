@@ -1,5 +1,6 @@
 //! Explicit device grants paired with the current scope's approval references.
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
+use kio_core::control::ControlHandle;
 use std::sync::Arc;
 
 use crate::context::AppContext;
@@ -32,8 +33,8 @@ impl AdapterRole {
     }
 }
 
-pub(crate) fn store_path() -> PathBuf {
-    super::data_home().join("kio/grants/grants.json")
+pub(crate) fn store_path(control: &ControlHandle) -> PathBuf {
+    super::data_home(control).join("kio/grants/grants.json")
 }
 
 fn selected_tool(target: &AdapterTarget) -> Result<Option<&str>> {
@@ -119,14 +120,18 @@ fn configured_profile(
     }
     let (tool_id, profile) = match role {
         AdapterRole::Markdown => {
-            let profile = match super::active_local_ocr_execution(adapter_settings) {
+            let profile = match super::active_local_ocr_execution_with_control(
+                adapter_settings,
+                repo.control(),
+            ) {
                 Some(execution) => kio_adapter::local_ocr_markdownize::profile_for(execution),
                 None => super::online_markdownize_profile_for(repo)?,
             };
             (profile.adapter_id, profile.tool_profile_hash)
         }
         AdapterRole::Embedding => {
-            let Some(execution) = super::embedding_execution(adapter_settings) else {
+            let Some(execution) = super::embedding_execution(adapter_settings, repo.control())
+            else {
                 return Ok(None);
             };
             // A library has no external recipient to approve.
@@ -223,7 +228,9 @@ pub(crate) fn allowed(
     profile: &str,
     operation: GrantOperation,
 ) -> Result<bool> {
-    let Some(snapshot) = PrivateGrantStore::open_readonly(&store_path())? else {
+    let Some(snapshot) =
+        PrivateGrantStore::open_readonly(&store_path(repo.control()), repo.control())?
+    else {
         return Ok(false);
     };
     let rows = repo.read_network_approvals()?;
@@ -271,11 +278,12 @@ pub(crate) fn allowed_at(
     tool_id: &str,
     profile: &str,
     operation: GrantOperation,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<bool> {
     let root = kio_dir
         .parent()
         .ok_or_else(|| KioError::invalid_usage("scope store has no parent"))?;
-    let repo = super::management::open_existing_managed_root(root)?;
+    let repo = super::management::open_existing_managed_root(root, control)?;
     allowed(adapter_settings, &repo, role, tool_id, profile, operation)
 }
 
@@ -308,11 +316,12 @@ fn open_network_policy(repo: &Repository) -> Result<()> {
 }
 
 pub(crate) fn approve(
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     args: ApproveArgs,
     control: &ApprovalControl,
 ) -> Result<Value> {
+    let adapter_settings = ctx.settings;
+
     let tool = selected_tool(&args.target)?;
     if args.preview && args.yes || args.resume.is_some() && tool.is_none() {
         return Err(KioError::invalid_usage(
@@ -353,7 +362,7 @@ pub(crate) fn approve(
     if refreshed != selected {
         return Err(denied("adapter identity changed after confirmation"));
     }
-    let mut store = PrivateGrantStore::open_or_create(&store_path())?;
+    let mut store = PrivateGrantStore::open_or_create(&store_path(ctx.control), ctx.control)?;
     let mut outcomes = Vec::new();
     for (role, expected) in selected {
         let rows = repo.read_network_approvals()?;
@@ -375,7 +384,7 @@ pub(crate) fn approve(
             outcomes.push(json!({"tool_id":expected.tool_id,"status":"already_approved"}));
             continue;
         }
-        let now = super::now_utc_seconds();
+        let now = ctx.control.now_utc_seconds();
         let current_intent = repo.read_network_approval_pending()?;
         if let Some(intent) = &current_intent
             && intent.get("grant_id").and_then(Value::as_str) != args.resume.as_deref()
@@ -481,17 +490,22 @@ pub(crate) fn approve(
     Ok(json!({"status":"approved","approvals":outcomes}))
 }
 
-pub(crate) fn revoke(ctx: &AppContext, args: RevokeArgs) -> Result<Value> {
+pub(crate) fn revoke(ctx: &AppContext, args: RevokeArgs, control: &ControlHandle) -> Result<Value> {
     let tool = selected_tool(&args.target)?;
-    let repo = ctx.open_recovery_repository()?;
+    let repo = Repository::open_for_recovery_with_control(ctx.cwd(), control.clone())?;
     let _lock = repo.lock_store()?;
     let scope_id = repo.scope_identity()?.scope_id;
-    let now = super::now_utc_seconds();
-    let revoked_grants = if PrivateGrantStore::open_readonly(&store_path())?.is_some() {
-        PrivateGrantStore::open_or_create(&store_path())?.revoke(&scope_id, tool, now.clone())?
-    } else {
-        Vec::new()
-    };
+    let now = control.now_utc_seconds();
+    let revoked_grants =
+        if PrivateGrantStore::open_readonly(&store_path(control), control)?.is_some() {
+            PrivateGrantStore::open_or_create(&store_path(control), control)?.revoke(
+                &scope_id,
+                tool,
+                now.clone(),
+            )?
+        } else {
+            Vec::new()
+        };
     let outcome = repo.revoke_network_approval(tool, &now)?;
     Ok(
         json!({"status":if outcome.changed() || !revoked_grants.is_empty() {"revoked"} else {"no_target"},
@@ -500,14 +514,12 @@ pub(crate) fn revoke(ctx: &AppContext, args: RevokeArgs) -> Result<Value> {
     )
 }
 
-pub(crate) fn status(
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
-    ctx: &AppContext,
-    args: AdapterStatusArgs,
-) -> Result<Value> {
+pub(crate) fn status(ctx: &crate::Invocation<'_>, args: AdapterStatusArgs) -> Result<Value> {
+    let adapter_settings = ctx.settings;
+
     let repo = ctx.open_recovery_repository()?;
     let scope_id = repo.scope_identity()?.scope_id;
-    let snapshot = PrivateGrantStore::open_readonly(&store_path())?;
+    let snapshot = PrivateGrantStore::open_readonly(&store_path(ctx.control), ctx.control)?;
     let records = snapshot
         .as_ref()
         .map(|snapshot| snapshot.records())

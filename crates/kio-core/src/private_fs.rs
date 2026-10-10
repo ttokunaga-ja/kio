@@ -11,8 +11,8 @@ use std::{ffi::OsString, path::Path};
 use serde_json::json;
 
 use crate::platform::private_fs as native;
-use crate::store_dir::StoreDirectory;
 use crate::{ExitCode, KioError, Result};
+use crate::{control::ControlHandle, store_dir::StoreDirectory};
 
 const PRIVATE_FILE_ERROR: &str = "KIO-E-PRIVATE-FILE-UNSAFE-001";
 const PRIVATE_FILE_OVERSIZE: &str = "KIO-E-PRIVATE-FILE-OVERSIZE-001";
@@ -28,7 +28,15 @@ const PRIVATE_FILE_RACE: &str = "KIO-E-PRIVATE-FILE-RACE-001";
 /// not writable by another user, except for root-owned sticky directories such
 /// as the OS temporary directory. No permissions are repaired by this API.
 pub fn read_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    native::read_private_file(path, max_bytes)
+    read_private_file_with_control(path, max_bytes, &ControlHandle::default())
+}
+
+pub fn read_private_file_with_control(
+    path: &Path,
+    max_bytes: u64,
+    control: &ControlHandle,
+) -> Result<Vec<u8>> {
+    native::read_private_file(path, max_bytes, control.clone())
 }
 
 /// Read a direct owner-private regular-file child of an already retained
@@ -56,7 +64,14 @@ pub fn read_private_file_at(
 pub fn resolve_inherited_private_root(
     path: &Path,
 ) -> Result<Option<(StoreDirectory, Vec<OsString>)>> {
-    native::resolve_inherited_private_root(path)
+    resolve_inherited_private_root_with_control(path, &ControlHandle::default())
+}
+
+pub fn resolve_inherited_private_root_with_control(
+    path: &Path,
+    control: &ControlHandle,
+) -> Result<Option<(StoreDirectory, Vec<OsString>)>> {
+    native::resolve_inherited_private_root(path, control.clone())
 }
 
 /// Retain an existing owner-private directory after validating it without
@@ -70,7 +85,14 @@ pub fn resolve_inherited_private_root(
 /// Windows DACL checks). This function never creates, repairs, or locks an
 /// entry.
 pub fn verify_private_directory(path: &Path) -> Result<StoreDirectory> {
-    native::verify_private_directory(path)
+    verify_private_directory_with_control(path, &ControlHandle::default())
+}
+
+pub fn verify_private_directory_with_control(
+    path: &Path,
+    control: &ControlHandle,
+) -> Result<StoreDirectory> {
+    native::verify_private_directory(path, control.clone())
 }
 
 /// Recheck that an already retained directory capability remains owner-private.
@@ -92,7 +114,14 @@ pub fn verify_private_directory_handle(directory: &StoreDirectory) -> Result<()>
 /// This function only verifies an existing parent. It never creates, repairs,
 /// locks, or otherwise mutates filesystem state.
 pub fn verify_private_creation_parent(path: &Path) -> Result<StoreDirectory> {
-    native::verify_private_creation_parent(path)
+    verify_private_creation_parent_with_control(path, &ControlHandle::default())
+}
+
+pub fn verify_private_creation_parent_with_control(
+    path: &Path,
+    control: &ControlHandle,
+) -> Result<StoreDirectory> {
+    native::verify_private_creation_parent(path, control.clone())
 }
 
 /// Verify an already opened native-definition leaf without changing it.

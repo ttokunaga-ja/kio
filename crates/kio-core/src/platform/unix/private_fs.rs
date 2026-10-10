@@ -102,6 +102,7 @@ fn duplicate_inherited_private_root(fd: i32, path: &Path) -> Result<File> {
 
 pub(crate) fn resolve_inherited_private_root(
     path: &Path,
+    control: crate::control::ControlHandle,
 ) -> Result<Option<(StoreDirectory, Vec<OsString>)>> {
     let Some((fd, suffix)) = inherited_root_parts(path)? else {
         return Ok(None);
@@ -112,7 +113,7 @@ pub(crate) fn resolve_inherited_private_root(
     verify_private_parent(&root, uid, path)?;
     let logical = PathBuf::from(format!("/dev/fd/{fd}"));
     Ok(Some((
-        StoreDirectory::from_retained(root, logical)?,
+        StoreDirectory::from_retained_with_control(root, logical, control)?,
         suffix,
     )))
 }
@@ -124,8 +125,11 @@ pub(crate) fn verify_private_directory_handle(directory: &StoreDirectory) -> Res
     verify_private_parent(&handle, uid, directory.path())
 }
 
-pub(crate) fn verify_private_directory(path: &Path) -> Result<StoreDirectory> {
-    if let Some((root, suffix)) = resolve_inherited_private_root(path)? {
+pub(crate) fn verify_private_directory(
+    path: &Path,
+    control: crate::control::ControlHandle,
+) -> Result<StoreDirectory> {
+    if let Some((root, suffix)) = resolve_inherited_private_root(path, control.clone())? {
         return inherited_private_directory(root, &suffix, path, false);
     }
     let components = path_components(path)?;
@@ -152,11 +156,14 @@ pub(crate) fn verify_private_directory(path: &Path) -> Result<StoreDirectory> {
         directory = next;
     }
     verify_private_parent(&directory, uid, path)?;
-    StoreDirectory::from_retained(directory, path.to_path_buf())
+    StoreDirectory::from_retained_with_control(directory, path.to_path_buf(), control)
 }
 
-pub(crate) fn verify_private_creation_parent(path: &Path) -> Result<StoreDirectory> {
-    if let Some((root, suffix)) = resolve_inherited_private_root(path)? {
+pub(crate) fn verify_private_creation_parent(
+    path: &Path,
+    control: crate::control::ControlHandle,
+) -> Result<StoreDirectory> {
+    if let Some((root, suffix)) = resolve_inherited_private_root(path, control.clone())? {
         return inherited_private_directory(root, &suffix, path, true);
     }
     let components = path_components(path)?;
@@ -184,11 +191,15 @@ pub(crate) fn verify_private_creation_parent(path: &Path) -> Result<StoreDirecto
         directory = next;
     }
     verify_creation_parent(&directory, uid, path)?;
-    StoreDirectory::from_retained(directory, path.to_path_buf())
+    StoreDirectory::from_retained_with_control(directory, path.to_path_buf(), control)
 }
 
-pub(crate) fn read_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    if let Some((root, suffix)) = resolve_inherited_private_root(path)? {
+pub(crate) fn read_private_file(
+    path: &Path,
+    max_bytes: u64,
+    control: crate::control::ControlHandle,
+) -> Result<Vec<u8>> {
+    if let Some((root, suffix)) = resolve_inherited_private_root(path, control.clone())? {
         return read_inherited_private_file(&root, &suffix, path, max_bytes);
     }
     let components = path_components(path)?;
@@ -263,7 +274,7 @@ fn inherited_private_directory(
     }
     let logical = path.to_path_buf();
     let directory = duplicate_inherited_private_root(directory.as_raw_fd(), path)?;
-    StoreDirectory::from_retained(directory, logical)
+    StoreDirectory::from_retained_with_control(directory, logical, root.control().clone())
 }
 
 fn read_inherited_private_file(

@@ -7,7 +7,8 @@ use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use kio_core::durability::{DurabilityPoint, checkpoint};
+use kio_core::control::ControlHandle;
+use kio_core::durability::DurabilityPoint;
 use kio_core::store_dir::StoreDirectory;
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -41,6 +42,7 @@ pub enum EnqueueOutcome {
 #[derive(Debug)]
 pub struct DirtyQueue {
     storage: crate::platform::WatchQueueStorage,
+    control: ControlHandle,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,7 +53,10 @@ impl DirtyQueue {
     /// still owns selecting this device-private location; a root path or an
     /// event path must never be used as this database path.
     pub fn open_private(path: &Path) -> Result<Self, WatchError> {
-        Self::initialize(crate::platform::WatchQueueStorage::open_private(path)?)
+        Self::initialize(
+            crate::platform::WatchQueueStorage::open_private(path)?,
+            ControlHandle::default(),
+        )
     }
 
     /// Open through the selected platform's owner-private directory admission.
@@ -59,12 +64,16 @@ impl DirtyQueue {
         directory: &StoreDirectory,
         leaf: &Path,
     ) -> Result<Self, WatchError> {
-        Self::initialize(crate::platform::WatchQueueStorage::open_private_at(
-            directory, leaf,
-        )?)
+        Self::initialize(
+            crate::platform::WatchQueueStorage::open_private_at(directory, leaf)?,
+            directory.control().clone(),
+        )
     }
 
-    fn initialize(storage: crate::platform::WatchQueueStorage) -> Result<Self, WatchError> {
+    fn initialize(
+        storage: crate::platform::WatchQueueStorage,
+        control: ControlHandle,
+    ) -> Result<Self, WatchError> {
         let connection = storage.connection();
         connection
             .pragma_update(None, "journal_mode", "WAL")
@@ -104,7 +113,7 @@ impl DirtyQueue {
             )
             .map_err(WatchError::sqlite)?;
         storage.revalidate()?;
-        Ok(Self { storage })
+        Ok(Self { storage, control })
     }
 
     pub fn enqueue(
@@ -262,7 +271,8 @@ impl DirtyQueue {
             ));
         }
         transaction.commit().map_err(WatchError::sqlite)?;
-        checkpoint(DurabilityPoint::QueueClaimed)
+        self.control
+            .checkpoint(DurabilityPoint::QueueClaimed)
             .map_err(|error| WatchError::invariant(error.to_string()))?;
         Ok(Some(Claim {
             sequence,
@@ -303,7 +313,8 @@ impl DirtyQueue {
         }
         transaction.commit().map_err(WatchError::sqlite)?;
         if complete {
-            checkpoint(DurabilityPoint::QueueCompleted)
+            self.control
+                .checkpoint(DurabilityPoint::QueueCompleted)
                 .map_err(|error| WatchError::invariant(error.to_string()))?;
         }
         Ok(())
@@ -379,6 +390,50 @@ fn duration_ms(duration: Duration) -> Result<i64, WatchError> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(debug_assertions)]
+    #[test]
+    fn queue_checkpoints_use_owned_entry_snapshot() {
+        use kio_core::control::ControlHandle;
+        use kio_core::test_control::{DebugTestControl, TestEnvGuard, test_env_lock};
+
+        let _lock = test_env_lock();
+        let mut markers = Vec::new();
+        for point in ["queue_claimed", "queue_completed"] {
+            let fixture = private_dir();
+            let ready = fixture.path().join("owned.ready");
+            let later = fixture.path().join("later.ready");
+            std::fs::write(ready.with_extension("release"), b"release").unwrap();
+            std::fs::write(later.with_extension("release"), b"release").unwrap();
+            let _point = TestEnvGuard::set("KIO_TEST_DURABILITY_POINT", point);
+            let _ready = TestEnvGuard::set("KIO_TEST_DURABILITY_READY", ready.as_os_str());
+            let control = ControlHandle::new(DebugTestControl::from_env());
+            let directory =
+                StoreDirectory::open_with_control(&fixture.path().canonicalize().unwrap(), control)
+                    .unwrap();
+            let mut queue =
+                DirtyQueue::open_private_at(&directory, Path::new("queue.sqlite")).unwrap();
+            let _later = TestEnvGuard::set("KIO_TEST_DURABILITY_READY", later.as_os_str());
+            queue.enqueue_full(&root(), DirtyReason::Startup).unwrap();
+            let claim = queue
+                .claim_ready(
+                    SystemTime::now() + Duration::from_secs(3),
+                    Duration::ZERO,
+                    Duration::ZERO,
+                    Duration::from_secs(1),
+                )
+                .unwrap()
+                .unwrap();
+            queue.complete(&claim, true).unwrap();
+            let marker = std::fs::read_to_string(&ready).ok();
+            markers.push((
+                marker.is_some_and(|marker| marker.contains(&format!("point={}\n", point))),
+                later.exists(),
+                queue.pending_count().unwrap(),
+            ));
+        }
+        assert_eq!(markers, vec![(true, false, 0), (true, false, 0)]);
+    }
+
     use super::*;
     #[cfg(unix)]
     use std::fs;

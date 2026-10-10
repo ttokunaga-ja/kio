@@ -5,8 +5,7 @@
 //! shallow.  Mutable manifests and index/cache projections are never accepted as
 //! purge truth.
 
-use crate::context::AppContext;
-
+use kio_core::control::ControlHandle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -33,9 +32,7 @@ use kio_core::purge::{
     BeginOutcome, ClosureItem, EventKind, LifecycleEvent, PurgeClosure, PurgeJournal, PurgePhase,
     PurgeReason, PurgeState, TombstoneMode, canonical_final_event, closure_content_hash,
 };
-use kio_core::scope::{
-    Repository, StoreLock, append_event_log, cleanup_orphan_raw_ingest_temps, now_utc_seconds,
-};
+use kio_core::scope::{Repository, StoreLock, cleanup_orphan_raw_ingest_temps};
 #[cfg(debug_assertions)]
 use kio_core::test_control::PurgeFault;
 use kio_core::{ExitCode, KioError, Result};
@@ -141,7 +138,7 @@ struct PurgeReport {
     log_fields_masked: u64,
 }
 
-pub(crate) fn run(ctx: &AppContext, args: PurgeArgs) -> Result<Value> {
+pub(crate) fn run(ctx: &crate::Invocation<'_>, args: PurgeArgs) -> Result<Value> {
     let repo = ctx.open_recovery_repository()?;
     // Orphan cleanup is transaction recovery, not target mutation. Run it under
     // the store lock before preview/working-copy refusal so a tombstoned raw temp
@@ -149,7 +146,7 @@ pub(crate) fn run(ctx: &AppContext, args: PurgeArgs) -> Result<Value> {
     {
         let _store_lock = repo.lock_store()?;
         repo.ensure_no_pending_managed_restore()?;
-        let state = PurgeState::open(repo.kio_dir())?;
+        let state = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
         if state.read_journal()?.is_some() {
             // A legacy closure cannot prove a complete embedding target set.
             // Reject it before even orphan cleanup can remove target bytes.
@@ -458,6 +455,7 @@ fn authenticate_purge_chunk_inventory(
     let retained = crate::retained_history_instances_for_roots(
         repo.kio_dir(),
         &crate::durable_history_roots(repo)?,
+        repo.control(),
     )?;
     let authorities = crate::retained_unit_introductions(repo, &retained)?;
     let store = repo.object_store();
@@ -485,7 +483,9 @@ fn authenticate_purge_chunk_inventory(
         }
         crate::authenticate_chunk_row(row, &authorities)
             .map_err(chunk_ledger_authentication_error)?;
-        if !target && crate::purge_blocks_rebuild_raw(repo.kio_dir(), &row.raw_hash)? {
+        if !target
+            && crate::purge_blocks_rebuild_raw(repo.kio_dir(), &row.raw_hash, repo.control())?
+        {
             return Err(purge_authority_incomplete(
                 "relevant survivor has a blocking purge lifecycle",
             ));
@@ -581,7 +581,7 @@ fn chunk_ledger_authentication_error(error: KioError) -> KioError {
 /// deterministic — the store lock has been held throughout) and publishes it
 /// for real, making it ref-reachable for the first time.
 fn execute_phase_machine(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     repo: &Repository,
     args: &PurgeArgs,
     preview: &PurgePreview,
@@ -604,7 +604,7 @@ fn execute_phase_machine(
     // crashed between preview cleanup and this confirmed phase-machine entry.
     cleanup_orphan_raw_ingest_temps(repo.kio_dir())?;
 
-    let state = PurgeState::open(repo.kio_dir())?;
+    let state = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
     let active = state.read_journal()?;
     // PA37-39 (§K, U34; §R ruling #1): a working-tree residual of the exact
     // same bytes is a WARNING, never a purge-blocking hard failure — "Kio
@@ -660,7 +660,7 @@ fn execute_phase_machine(
             journal.purge_id.clone(),
         )
     } else {
-        let started_at = now_utc_seconds();
+        let started_at = ctx.control.now_utc_seconds();
         let recovery_target = state
             .max_recorded_purge_epoch()?
             .map_or(1, |max| max.saturating_add(1));
@@ -726,7 +726,7 @@ fn execute_phase_machine(
         }
     };
 
-    if let Err(error) = maybe_inject_fault("prepared") {
+    if let Err(error) = maybe_inject_fault("prepared", ctx.control) {
         if newly_started {
             state.abort_before_barrier(&journal)?;
         }
@@ -773,7 +773,7 @@ fn execute_phase_machine(
             // chunk/config/vector rows change the search-visible set,
             // independent of whether this purge also happened to move the
             // lifecycle-epoch counter) — rotate unconditionally first.
-            crate::rotate_index_generation_unconditionally(repo.kio_dir())?;
+            crate::rotate_index_generation_unconditionally(repo.kio_dir(), repo.control())?;
             // LC42-LC44 (item 2): purge's own `tombstoned`-phase marker
             // append (and any resurrection retire folded into the same
             // mutation) advances `.kio/tombstones/lifecycle-epoch` directly
@@ -785,7 +785,7 @@ fn execute_phase_machine(
             // this purge completes and LC45's read-side check would reject
             // every read command until an unrelated index-touching write
             // happened to run.
-            crate::recover_index_generation(repo.kio_dir())?;
+            crate::recover_index_generation(repo.kio_dir(), repo.control())?;
             // 05 §1.8 write-through. Ranking is not the reason here: the
             // rotation makes an incomplete replica fail closed; it does not
             // ask a reader to re-project this scope. The
@@ -837,7 +837,7 @@ fn execute_visible_phases(
     journal: &mut PurgeJournal,
     report: &mut PurgeReport,
 ) -> Result<()> {
-    maybe_inject_fault("prepared_visible")?;
+    maybe_inject_fault("prepared_visible", repo.control())?;
 
     if journal.phase == PurgePhase::Prepared {
         // PA40/41 (§L, U37): settle in-flight/orphaned-cleanup ledger
@@ -856,7 +856,7 @@ fn execute_visible_phases(
         *journal = state.advance_phase(journal, PurgePhase::Tombstoned)?;
         store_phase_report(repo.kio_dir(), report)?;
     }
-    maybe_inject_fault("tombstoned")?;
+    maybe_inject_fault("tombstoned", repo.control())?;
 
     if journal.phase == PurgePhase::Tombstoned {
         delete_content_surfaces(repo, plan, closure, report)?;
@@ -865,7 +865,7 @@ fn execute_visible_phases(
         *journal = state.advance_phase(journal, PurgePhase::Deleted)?;
         store_phase_report(repo.kio_dir(), report)?;
     }
-    maybe_inject_fault("deleted")?;
+    maybe_inject_fault("deleted", repo.control())?;
 
     if journal.phase == PurgePhase::Deleted {
         let commit_hash = publish_planned_commit(repo, plan, journal)?;
@@ -874,7 +874,7 @@ fn execute_visible_phases(
         *journal = state.advance_phase(journal, PurgePhase::Committed)?;
         store_phase_report(repo.kio_dir(), report)?;
     }
-    maybe_inject_fault("committed")?;
+    maybe_inject_fault("committed", repo.control())?;
 
     // Final scrub closes the append race before the visibility barrier is
     // removed. The audit row is identifier-free and is appended while both scrub
@@ -1309,8 +1309,8 @@ fn delete_derived_surfaces(
         .cloned()
         .collect::<BTreeSet<_>>();
     flat_cache_hashes.extend(removable_prepared);
-    report.deleted.cache_directories = evict_open_cache(&flat_cache_hashes, false)?
-        .saturating_add(evict_open_cache(&removable_images, true)?);
+    report.deleted.cache_directories = evict_open_cache(&flat_cache_hashes, false, repo.control())?
+        .saturating_add(evict_open_cache(&removable_images, true, repo.control())?);
     Ok(())
 }
 
@@ -1323,7 +1323,12 @@ fn remove_target_normalized_instances(repo: &Repository, targets: &BTreeSet<&str
     use kio_core::store_dir::StoreDirectory;
     fn child(parent: &StoreDirectory, name: &str) -> Result<Option<StoreDirectory>> {
         match cap_primitives::fs::open_dir_nofollow(&parent.root_handle(), Path::new(name)) {
-            Ok(handle) => StoreDirectory::from_retained(handle, parent.path().join(name)).map(Some),
+            Ok(handle) => StoreDirectory::from_retained_with_control(
+                handle,
+                parent.path().join(name),
+                parent.control().clone(),
+            )
+            .map(Some),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(error) => Err(KioError::io(
                 error.to_string(),
@@ -1334,11 +1339,12 @@ fn remove_target_normalized_instances(repo: &Repository, targets: &BTreeSet<&str
     let handle = repo.bound_kio_handle().ok_or_else(|| {
         KioError::invalid_usage("purge cache cleanup requires retained .kio authority")
     })?;
-    let mut base = StoreDirectory::from_retained(
+    let mut base = StoreDirectory::from_retained_with_control(
         handle
             .try_clone()
             .map_err(|error| KioError::io(error.to_string(), "purge .kio handle"))?,
         repo.kio_dir().to_path_buf(),
+        repo.control().clone(),
     )?;
     for name in ["objects", "normalized_units"] {
         let Some(next) = child(&base, name)? else {
@@ -1419,9 +1425,9 @@ fn remove_target_normalized_instances(repo: &Repository, targets: &BTreeSet<&str
         for name in names {
             parent.remove_directory_all(Path::new(&name))?;
             removed = removed.saturating_add(1);
-            kio_core::durability::checkpoint(
-                kio_core::durability::DurabilityPoint::PurgeCacheDeleted,
-            )?;
+            parent
+                .control()
+                .checkpoint(kio_core::durability::DurabilityPoint::PurgeCacheDeleted)?;
         }
     }
     Ok(removed)
@@ -1559,7 +1565,8 @@ fn extend_inventory_from_reachable_refs(
     if roots.is_empty() {
         return Ok(());
     }
-    let graph = HistoryReader::new(repo.kio_dir()).walk_for_roots(&roots)?;
+    let graph = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+        .walk_for_roots(&roots)?;
     for binding in graph.bindings() {
         let Some(normalize) = binding.binding.normalize.as_ref() else {
             continue;
@@ -1668,7 +1675,7 @@ fn historical_manifest_was_purged_before_resurrection(
     raw_hash: &str,
     binding_commit: &str,
 ) -> Result<bool> {
-    let state = PurgeState::open(repo.kio_dir())?;
+    let state = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
     let tombstone = state.read_tombstone(raw_hash)?;
     let receipt = state.read_erase_receipt(raw_hash)?;
     let final_event = canonical_final_event(
@@ -1687,10 +1694,12 @@ fn historical_manifest_was_purged_before_resurrection(
     if resurrection_commit == binding_commit {
         return Ok(false);
     }
-    Ok(HistoryReader::new(repo.kio_dir())
-        .walk(resurrection_commit)?
-        .node(binding_commit)
-        .is_some())
+    Ok(
+        HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+            .walk(resurrection_commit)?
+            .node(binding_commit)
+            .is_some(),
+    )
 }
 
 const MAX_NORMALIZED_MANIFEST_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
@@ -1863,10 +1872,10 @@ fn settle_inflight_reservations_for_purge(
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     let scope_id = crate::scope_id(repo.kio_dir())?;
-    let Some(ledger) = crate::open_optional_ledger_db()? else {
+    let Some(ledger) = crate::open_optional_ledger_db(repo.control())? else {
         // A fresh offline device has no billing state. A local reservation
         // without its operational ledger must be recovered before deleting it.
-        if TaskStore::new(repo.kio_dir())
+        if TaskStore::new_with_control(repo.kio_dir(), repo.control().clone())
             .all()
             .map_err(crate::pipeline_to_kio)?
             .iter()
@@ -1889,7 +1898,7 @@ fn settle_inflight_reservations_for_purge(
     if path_exists(&tasks_path)? {
         validate_existing_regular(&tasks_path, Some(MAX_TASK_STORE_BYTES))?;
     }
-    for task in TaskStore::new(repo.kio_dir())
+    for task in TaskStore::new_with_control(repo.kio_dir(), repo.control().clone())
         .all()
         .map_err(crate::pipeline_to_kio)?
     {
@@ -1976,7 +1985,7 @@ fn delete_target_tasks(
     if path_exists(&path)? {
         validate_existing_regular(&path, Some(MAX_TASK_STORE_BYTES))?;
     }
-    let store = TaskStore::new(repo.kio_dir());
+    let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     let tasks = store.all().map_err(crate::pipeline_to_kio)?;
     let mut removed = Vec::new();
     let mut kept = Vec::new();
@@ -2139,8 +2148,12 @@ fn rewrite_jsonl_filter(
 /// one cache directory; eviction must target the same namespace or it either
 /// misses an image's cache dir entirely or (worse) deletes a same-digest
 /// raw/prepared cache dir that a live, non-target image object still needs.
-fn evict_open_cache(hashes: &BTreeSet<String>, is_image: bool) -> Result<u64> {
-    let mut root = crate::cache_home().join("kio/open");
+fn evict_open_cache(
+    hashes: &BTreeSet<String>,
+    is_image: bool,
+    control: &ControlHandle,
+) -> Result<u64> {
+    let mut root = crate::cache_home(control).join("kio/open");
     if is_image {
         root = root.join("image");
     }
@@ -2164,10 +2177,12 @@ fn scrub_logs(
     journal: &PurgeJournal,
     report: &mut PurgeReport,
 ) -> Result<()> {
-    let device_root = crate::data_home().join("kio/logs");
+    let device_root = crate::data_home(repo.control()).join("kio/logs");
     let scope_root = repo.kio_dir().join("logs");
-    let _device_lock = StoreLock::acquire_path(device_root.join("scrub.lock"))?;
-    let _scope_lock = StoreLock::acquire_path(scope_root.join("access.scrub.lock"))?;
+    let _device_lock =
+        StoreLock::acquire_path_with_control(device_root.join("scrub.lock"), repo.control())?;
+    let _scope_lock =
+        StoreLock::acquire_path_with_control(scope_root.join("access.scrub.lock"), repo.control())?;
 
     let identifiers = plan
         .target_raw_hashes
@@ -2204,7 +2219,7 @@ fn scrub_logs(
     report.log_fields_masked = report.log_fields_masked.saturating_add(pass_fields);
 
     if journal.phase == PurgePhase::Tombstoned {
-        append_event_log(
+        repo.control().append_event_log(
             "KIO-PURGE-COMPLETED",
             "purge removed content from KIO-managed history",
             json!({
@@ -2229,10 +2244,12 @@ fn finalize_purge(
     // Hold both append/scrub locks across the final pass and journal removal.
     // `scrub_logs` re-acquires these paths reentrantly, so its inner guards drop
     // without releasing the outer exclusion window.
-    let device_root = crate::data_home().join("kio/logs");
+    let device_root = crate::data_home(repo.control()).join("kio/logs");
     let scope_root = repo.kio_dir().join("logs");
-    let _device_lock = StoreLock::acquire_path(device_root.join("scrub.lock"))?;
-    let _scope_lock = StoreLock::acquire_path(scope_root.join("access.scrub.lock"))?;
+    let _device_lock =
+        StoreLock::acquire_path_with_control(device_root.join("scrub.lock"), repo.control())?;
+    let _scope_lock =
+        StoreLock::acquire_path_with_control(scope_root.join("access.scrub.lock"), repo.control())?;
     scrub_logs(repo, plan, journal, report)?;
     remove_purge_sidecars(repo.kio_dir())?;
     state.finish(journal)
@@ -2593,8 +2610,8 @@ fn incomplete_report(
     value
 }
 
-fn maybe_inject_fault(phase: &str) -> Result<()> {
-    if purge_fault_enabled(phase) {
+fn maybe_inject_fault(phase: &str, control: &ControlHandle) -> Result<()> {
+    if purge_fault_enabled(phase, control) {
         return Err(KioError::io(
             format!("injected purge failure after {phase}"),
             "purge fault seam",
@@ -2604,7 +2621,7 @@ fn maybe_inject_fault(phase: &str) -> Result<()> {
 }
 
 #[cfg(debug_assertions)]
-fn purge_fault_enabled(phase: &str) -> bool {
+fn purge_fault_enabled(phase: &str, control: &ControlHandle) -> bool {
     let expected = match phase {
         "prepared" => PurgeFault::Prepared,
         "prepared_visible" => PurgeFault::PreparedVisible,
@@ -2613,16 +2630,11 @@ fn purge_fault_enabled(phase: &str) -> bool {
         "committed" => PurgeFault::Committed,
         _ => return false,
     };
-    crate::debug_test_control()
-        .expect("command dispatch installs debug test control")
-        .cli
-        .purge_fail_after_phase
-        .known()
-        == Some(&expected)
+    control.debug().cli.purge_fail_after_phase.known() == Some(&expected)
 }
 
 #[cfg(not(debug_assertions))]
-fn purge_fault_enabled(_: &str) -> bool {
+fn purge_fault_enabled(_: &str, _control: &ControlHandle) -> bool {
     false
 }
 
@@ -2712,7 +2724,7 @@ fn atomic_private_replace(path: &Path, bytes: &[u8]) -> Result<()> {
 
 fn preflight(repo: &Repository, args: &PurgeArgs) -> Result<PurgePreview> {
     let plan = resolve_plan(repo, args)?;
-    let state = PurgeState::open(repo.kio_dir())?;
+    let state = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
     let journal = state.read_journal()?;
     if let Some(active) = &journal
         && (active.target_raw_hashes != plan.target_raw_hashes
@@ -2771,7 +2783,7 @@ fn resolve_plan(repo: &Repository, args: &PurgeArgs) -> Result<PurgePlan> {
             let bindings = if roots.is_empty() {
                 Vec::new()
             } else {
-                HistoryReader::new(repo.kio_dir())
+                HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
                     .walk_for_roots(&roots)?
                     .bindings()
             };
@@ -2799,7 +2811,7 @@ fn resolve_plan(repo: &Repository, args: &PurgeArgs) -> Result<PurgePlan> {
             // Raw identity remains authoritative even when history is shallow or
             // beyond traversal bounds. A successful best-effort walk only
             // enriches the conservative log/quarantine alias scrub.
-            let paths = HistoryReader::new(repo.kio_dir())
+            let paths = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
                 .walk(&head_commit)
                 .ok()
                 .into_iter()
@@ -2892,7 +2904,7 @@ fn verify_targets_exist(
     if has_matching_journal || is_complete {
         return Ok(());
     }
-    let store = ObjectStore::new(repo.kio_dir());
+    let store = ObjectStore::new_with_control(repo.kio_dir(), repo.control().clone());
     for raw_hash in &plan.target_raw_hashes {
         match store.inspect_object(ObjectKind::Raw, raw_hash) {
             Ok(_) => {}
@@ -2932,7 +2944,7 @@ fn purge_not_found() -> KioError {
     )
 }
 
-fn confirm(ctx: &AppContext, preview: &PurgePreview, yes: bool) -> Result<()> {
+fn confirm(ctx: &crate::context::AppContext, preview: &PurgePreview, yes: bool) -> Result<()> {
     if yes {
         return Ok(());
     }

@@ -22,6 +22,7 @@ pub(crate) fn retire_candidate_tree(
     quarantine_checkpoint: impl Fn() -> Result<()>,
     _before_erase: impl Fn() -> Result<()>,
     retirement_checkpoint: impl Fn() -> Result<()>,
+    _control: &crate::control::ControlHandle,
 ) -> Result<bool> {
     // Either start from the canonical CAS leaf or resume the exact
     // operation-owned quarantine left by a crash after the durable rename.

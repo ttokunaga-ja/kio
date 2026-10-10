@@ -77,7 +77,10 @@ pub(crate) fn verify_private_parent_handle(file: &File, path: &Path) -> Result<(
     Ok(())
 }
 
-pub(crate) fn verify_existing_ancestor_path(path: &Path) -> Result<()> {
+pub(crate) fn verify_existing_ancestor_path(
+    path: &Path,
+    control: &kio_core::control::ControlHandle,
+) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     // Validate every already-existing component before creating anything
@@ -97,7 +100,8 @@ pub(crate) fn verify_existing_ancestor_path(path: &Path) -> Result<()> {
                 ));
             }
         }
-        let directory = StoreDirectory::open(&prefix).map_err(core_private)?;
+        let directory =
+            StoreDirectory::open_with_control(&prefix, control.clone()).map_err(core_private)?;
         let metadata = directory
             .root_handle()
             .metadata()

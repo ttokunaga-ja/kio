@@ -10,9 +10,10 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 pub(crate) fn recover_marker(
     kio: &File,
+    control: &crate::control::ControlHandle,
     _validate_marker: impl Fn(Option<GcInProgressMarker>, GcInProgressMarker) -> Result<()>,
 ) -> Result<()> {
-    if has_pending_marker_exchange(kio)? {
+    if has_pending_marker_exchange(kio, control)? {
         return Err(corrupt(
             "Windows GC marker exchange cannot recover on this platform",
         ));
@@ -21,6 +22,7 @@ pub(crate) fn recover_marker(
 }
 pub(crate) fn exchange_marker(
     gc: &File,
+    _control: &crate::control::ControlHandle,
     _internal: &File,
     markers: &File,
     marker: &GcInProgressMarker,
@@ -37,6 +39,7 @@ pub(crate) fn exchange_marker(
 }
 pub(crate) fn replace_snapshot_state<D, R>(
     kio: &File,
+    _control: &crate::control::ControlHandle,
     temporary: &str,
     bytes: &[u8],
     expected: &FileObservation,
@@ -53,14 +56,16 @@ where
         temporary,
         bytes,
         expected,
+        _control,
     )
 }
 pub(crate) fn recover_snapshot_state(
     kio: &File,
+    control: &crate::control::ControlHandle,
     _derive: impl Fn() -> Result<SnapshotExchangeAuthority>,
     _admit: impl Fn() -> Result<()>,
 ) -> Result<()> {
-    reject_pending_snapshot_state_exchange(kio)
+    reject_pending_snapshot_state_exchange(kio, control)
 }
 pub(crate) fn marker_archive_presence(
     archives: &File,

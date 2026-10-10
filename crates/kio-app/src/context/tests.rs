@@ -69,12 +69,20 @@ fn nested_execute_keeps_outer_repository_and_interaction() {
     std::fs::create_dir(&outer_root).unwrap();
     std::fs::create_dir(&inner_root).unwrap();
     let crate::management::ExplicitRoot::Created(outer_repo) =
-        crate::management::initialize_explicit_root(&outer_root).unwrap()
+        crate::management::initialize_explicit_root(
+            &outer_root,
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
     else {
         panic!("fresh outer scope already exists");
     };
     let crate::management::ExplicitRoot::Created(inner_repo) =
-        crate::management::initialize_explicit_root(&inner_root).unwrap()
+        crate::management::initialize_explicit_root(
+            &inner_root,
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
     else {
         panic!("fresh inner scope already exists");
     };
@@ -85,8 +93,16 @@ fn nested_execute_keeps_outer_repository_and_interaction() {
         hash.strip_prefix("sha256:").unwrap()
     );
     let control = test_support::context(&outer_root);
+    let settings = Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+    let invocation_control =
+        kio_core::control::ControlHandle::new(kio_core::test_control::DebugTestControl::from_env());
+    let invocation = crate::Invocation {
+        context: &control,
+        settings: &settings,
+        control: &invocation_control,
+    };
     let expected = outcome(crate::run_view(
-        &control,
+        &invocation,
         PointerArgs {
             pointer: Some(pointer.clone()),
         },

@@ -37,6 +37,7 @@
 //! seam ([`TEST_GEMINI_BATCH_ENV`]).
 
 use crate::tool_lock::AdapterRuntimeSettings;
+use kio_core::control::ControlHandle;
 #[cfg(debug_assertions)]
 use std::io::Write as _;
 use std::sync::Arc;
@@ -965,19 +966,28 @@ impl GeminiBatchClient for MockGeminiBatchClient {
     }
 }
 
-/// The active embedding Batch client: the mock seam when
-/// [`TEST_GEMINI_BATCH_ENV`] is set, otherwise the real client when an API key
-/// is resolvable from declared `tools.toml [embedding] auth`.
+/// The active embedding Batch client when an API key is resolvable from
+/// declared `tools.toml [embedding] auth`. The controlled entry point can
+/// select a mock using its captured debug snapshot.
 /// `None` means the lane is unavailable and the caller must not send.
 pub fn resolve_gemini_batch_client(
     settings: &AdapterRuntimeSettings,
     recovery_context: impl FnOnce() -> Result<BatchRecoveryContext>,
 ) -> Result<Option<Box<dyn GeminiBatchClient>>> {
+    resolve_gemini_batch_client_with_control(settings, recovery_context, &ControlHandle::default())
+}
+
+/// Resolve a client using the invocation's immutable debug snapshot.
+pub fn resolve_gemini_batch_client_with_control(
+    settings: &AdapterRuntimeSettings,
+    recovery_context: impl FnOnce() -> Result<BatchRecoveryContext>,
+    _control: &ControlHandle,
+) -> Result<Option<Box<dyn GeminiBatchClient>>> {
     #[cfg(debug_assertions)]
     {
         use kio_core::test_control::Selector;
-        if let Selector::Known(raw) = crate::debug_test_control().adapters.gemini_batch {
-            return Ok(Some(Box::new(MockGeminiBatchClient::from_env_value(&raw)?)));
+        if let Selector::Known(raw) = &_control.debug().adapters.gemini_batch {
+            return Ok(Some(Box::new(MockGeminiBatchClient::from_env_value(raw)?)));
         }
     }
     if let Some(credential) = settings.resolve_role_api_key("embedding")? {

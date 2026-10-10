@@ -3,8 +3,6 @@
 //! CAS mutation remains in `kio_core::gc::GcSweepSession`; this module only
 //! owns the explicit confirmation, store-lock and SQLite generation boundary.
 
-use crate::context::AppContext;
-
 use std::time::{Duration, Instant};
 
 use kio_core::gc::{
@@ -12,15 +10,13 @@ use kio_core::gc::{
     GcIndexRotationRole, GcIndexState, GcPlan, GcReceiptPublication, GcSweepPhase, GcSweepSession,
     SnapshotAutoBinding,
 };
-use kio_core::scope::{
-    Repository, format_utc_seconds, new_ulid, now_utc_seconds, parse_utc_seconds,
-};
+use kio_core::scope::{Repository, format_utc_seconds, new_ulid, parse_utc_seconds};
 #[cfg(debug_assertions)]
 use kio_core::test_control::GcFault;
 use kio_core::{ExitCode, KioError, Result};
 use kio_index::fts::{
     BoundGcIndexMetadata, FtsSchemaConfig, FtsTokenizer, GcIndexRotationAttestation,
-    PreparedGcIndexCleanup, cleanup_stale_bound_gc_index_rotations,
+    PreparedGcIndexCleanup, cleanup_stale_bound_gc_index_rotations_with_control,
     exchange_prepared_bound_gc_index, prepare_bound_gc_index_rotation,
     read_bound_gc_index_metadata, read_bound_gc_index_rotation_attestation,
     remove_prepared_bound_gc_index,
@@ -33,28 +29,36 @@ use serde_json::{Value, json};
 /// progress and never abandons an in-flight receipt/tree/index operation.
 struct ExecutionBudget {
     deadline: Option<Instant>,
+    #[cfg(debug_assertions)]
     test_checkpoint_limit: Option<u64>,
+    #[cfg(debug_assertions)]
     completed_checkpoints: u64,
 }
 
 impl ExecutionBudget {
-    fn new(deadline: Option<Instant>) -> Self {
+    fn new(deadline: Option<Instant>, _control: &kio_core::control::ControlHandle) -> Self {
         Self {
             deadline,
-            test_checkpoint_limit: test_runtime_checkpoint_limit(),
+            #[cfg(debug_assertions)]
+            test_checkpoint_limit: test_runtime_checkpoint_limit(_control),
+            #[cfg(debug_assertions)]
             completed_checkpoints: 0,
         }
     }
 
     fn should_defer_after_checkpoint(&mut self) -> bool {
-        self.completed_checkpoints = self.completed_checkpoints.saturating_add(1);
-        let synthetic_limit = self
-            .test_checkpoint_limit
-            .is_some_and(|limit| self.completed_checkpoints >= limit.max(1));
-        let elapsed = self
-            .deadline
-            .is_some_and(|deadline| Instant::now() >= deadline);
-        synthetic_limit || elapsed
+        #[cfg(debug_assertions)]
+        {
+            self.completed_checkpoints = self.completed_checkpoints.saturating_add(1);
+            if self
+                .test_checkpoint_limit
+                .is_some_and(|limit| self.completed_checkpoints >= limit.max(1))
+            {
+                return true;
+            }
+        }
+        self.deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
     }
 }
 
@@ -122,10 +126,10 @@ pub(super) fn preflight_automatic_bound(
                     binding,
                 });
             }
-            let mut budget = ExecutionBudget::new(Some(deadline));
+            let mut budget = ExecutionBudget::new(Some(deadline), session.control());
             let report = resume_session_with_budget(
                 session,
-                fixed_now()?,
+                fixed_now(session.control())?,
                 &mut budget,
                 Some(expected_binding),
                 Some(expected_snapshot_auto),
@@ -155,10 +159,10 @@ pub(super) fn preflight_automatic_bound(
                     binding,
                 });
             }
-            let mut budget = ExecutionBudget::new(Some(deadline));
+            let mut budget = ExecutionBudget::new(Some(deadline), session.control());
             let report = resume_session_with_budget(
                 session,
-                fixed_now()?,
+                fixed_now(session.control())?,
                 &mut budget,
                 Some(expected_binding),
                 None,
@@ -258,7 +262,7 @@ fn run_after_success(
     expected_binding: &GcAutomationBinding,
 ) -> Result<Value> {
     let started = Instant::now();
-    wait_at_post_publication_test_barrier();
+    wait_at_post_publication_test_barrier(repository.control());
     let session = GcSweepSession::bind_repository(repository)?;
     let binding = session.automation_binding()?;
     if &binding != expected_binding {
@@ -279,10 +283,10 @@ fn run_after_success(
             "mode": "on_idle",
         })),
         GcAutomationMode::AfterIndex => {
-            let now = fixed_now()?;
+            let now = fixed_now(repository.control())?;
             let max_runtime_seconds = required_max_runtime_seconds(config)?;
             let deadline = automatic_deadline(started, max_runtime_seconds)?;
-            let mut budget = ExecutionBudget::new(Some(deadline));
+            let mut budget = ExecutionBudget::new(Some(deadline), session.control());
             let report = if session.has_active_or_pending_marker()? {
                 resume_session_with_budget(
                     &session,
@@ -339,7 +343,7 @@ pub(super) fn run_on_idle_after_snapshot_bound(
     recovered_before_publication: bool,
 ) -> Result<Value> {
     let started = Instant::now();
-    wait_at_post_publication_test_barrier();
+    wait_at_post_publication_test_barrier(session.control());
     session.assert_public_identity()?;
     let binding = session.automation_binding()?;
     if &binding != expected_binding || binding.config.mode != GcAutomationMode::OnIdle {
@@ -348,8 +352,11 @@ pub(super) fn run_on_idle_after_snapshot_bound(
     require_snapshot_auto_binding(session, Some(expected_snapshot_auto))?;
     require_automatic_index_binding(session, Some(expected_index))?;
     let max_runtime_seconds = required_max_runtime_seconds(binding.config)?;
-    let now = fixed_now()?;
-    let mut budget = ExecutionBudget::new(Some(automatic_deadline(started, max_runtime_seconds)?));
+    let now = fixed_now(session.control())?;
+    let mut budget = ExecutionBudget::new(
+        Some(automatic_deadline(started, max_runtime_seconds)?),
+        session.control(),
+    );
     let report = if session.has_active_or_pending_marker()? {
         resume_session_with_budget(
             session,
@@ -396,11 +403,8 @@ fn config_changed_after_publication() -> KioError {
 }
 
 #[cfg(debug_assertions)]
-fn wait_at_post_publication_test_barrier() {
-    let ready_path = crate::debug_test_control()
-        .expect("command dispatch installs debug test control")
-        .cli
-        .gc_post_publication_ready;
+fn wait_at_post_publication_test_barrier(control: &kio_core::control::ControlHandle) {
+    let ready_path = control.debug().cli.gc_post_publication_ready.clone();
     let Some(ready_path) = ready_path else {
         return;
     };
@@ -415,7 +419,7 @@ fn wait_at_post_publication_test_barrier() {
 }
 
 #[cfg(not(debug_assertions))]
-fn wait_at_post_publication_test_barrier() {}
+fn wait_at_post_publication_test_barrier(_control: &kio_core::control::ControlHandle) {}
 
 fn required_max_runtime_seconds(config: kio_core::gc::GcAutomationConfig) -> Result<u64> {
     config
@@ -454,7 +458,7 @@ fn is_runtime_deferred(report: &Value) -> bool {
 }
 
 pub(super) fn run(
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     dry_run: bool,
     yes: bool,
     prune_unreachable: bool,
@@ -463,9 +467,13 @@ pub(super) fn run(
     if prune_unreachable {
         // This is intentionally a separate read-only operation.  Do not bind
         // the retention planner/session or inspect its recovery executor.
-        return kio_core::gc::UnreachableObjectInventory::bind_current()?.inventory();
+        return kio_core::gc::UnreachableObjectInventory::bind_with_control(
+            ctx.cwd().to_path_buf(),
+            ctx.control.clone(),
+        )?
+        .inventory();
     }
-    let now = fixed_now()?;
+    let now = fixed_now(ctx.control)?;
     // Do not canonicalize the public cwd before binding: canonicalization
     // follows a symlink and would erase the evidence that the supplied scope
     // was unsafe.  `GcSweepSession::bind` opens this original absolute name
@@ -474,7 +482,7 @@ pub(super) fn run(
     // Bind the scope read-only before probing the optional marker so an
     // ordinary non-scope is an invalid-usage error, never an I/O-shaped
     // missing-marker failure.  This has no HEAD self-heal side effect.
-    let preview_session = GcSweepSession::bind(root.clone())?;
+    let preview_session = GcSweepSession::bind_with_control(root.clone(), ctx.control.clone())?;
 
     if preview_session.has_pending_marker_exchange()? {
         if dry_run {
@@ -490,7 +498,7 @@ pub(super) fn run(
                 "GC marker publication is incomplete; resume with kio gc --yes",
             ));
         }
-        return resume(root, now);
+        return resume(root, now, ctx.control);
     }
 
     if let Some(marker) = preview_session.read_marker()? {
@@ -501,7 +509,7 @@ pub(super) fn run(
         // synthesized count summary: it is the exact durable state that will
         // be validated and resumed.
         confirm(ctx, &marker, marker.candidates.len(), true, yes, json_mode)?;
-        return resume(root, now);
+        return resume(root, now, ctx.control);
     }
 
     let preview_plan = preview_session.plan_at(now)?;
@@ -532,26 +540,20 @@ pub(super) fn run(
     // A narrow integration-test seam for the exact preview-to-lock window.
     // It is inert unless explicitly named and has no role in production
     // mutation authority: the locked replan below remains mandatory.
-    maybe_wait_at_test_prelock_barrier();
-    start(root, now, preview_plan)
+    maybe_wait_at_test_prelock_barrier(ctx.control);
+    start(root, now, preview_plan, ctx.control)
 }
 
-fn start(root: std::path::PathBuf, now: i64, preview: GcPlan) -> Result<Value> {
-    let mut budget = ExecutionBudget::new(None);
-    start_with_budget(root, now, preview, &mut budget)
-}
-
-fn start_with_budget(
+fn start(
     root: std::path::PathBuf,
     now: i64,
     preview: GcPlan,
-    budget: &mut ExecutionBudget,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<Value> {
-    // Bind before acquiring the lock.  The session's forthcoming bound lock
-    // API uses this retained `.kio` descriptor, so a replacement of the
-    // public cwd cannot create or remove a victim `.kio/.lock`.
-    let session = GcSweepSession::bind(root)?;
-    start_session_with_budget(&session, now, preview, budget, None, None, None)
+    // Bind before locking: retained capabilities protect against cwd replacement.
+    let session = GcSweepSession::bind_with_control(root, control.clone())?;
+    let mut budget = ExecutionBudget::new(None, session.control());
+    start_session_with_budget(&session, now, preview, &mut budget, None, None, None)
 }
 
 fn start_session_with_budget(
@@ -601,7 +603,7 @@ fn start_session_with_budget(
     require_automatic_index_binding(session, expected_index)?;
     require_snapshot_auto_binding(session, expected_snapshot_auto)?;
     session.publish_marker(&marker)?;
-    inject_fault("after_marker_fsync")?;
+    inject_fault("after_marker_fsync", session.control())?;
     if budget.should_defer_after_checkpoint() {
         return Ok(runtime_limit_value(&marker));
     }
@@ -618,18 +620,14 @@ fn no_candidates_execution_value() -> Value {
     })
 }
 
-fn resume(root: std::path::PathBuf, now: i64) -> Result<Value> {
-    let mut budget = ExecutionBudget::new(None);
-    resume_with_budget(root, now, &mut budget)
-}
-
-fn resume_with_budget(
+fn resume(
     root: std::path::PathBuf,
     now: i64,
-    budget: &mut ExecutionBudget,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<Value> {
-    let session = GcSweepSession::bind(root)?;
-    resume_session_with_budget(&session, now, budget, None, None)
+    let session = GcSweepSession::bind_with_control(root, control.clone())?;
+    let mut budget = ExecutionBudget::new(None, session.control());
+    resume_session_with_budget(&session, now, &mut budget, None, None)
 }
 
 fn resume_session_with_budget(
@@ -752,7 +750,7 @@ fn execute_locked(
             };
             let publication = session.create_receipt(&candidate, marker.started_at.clone())?;
             if index == 0 {
-                inject_fault("after_first_receipt")?;
+                inject_fault("after_first_receipt", session.control())?;
             }
             if publication == GcReceiptPublication::NewlyPublished
                 && budget.should_defer_after_checkpoint()
@@ -760,7 +758,7 @@ fn execute_locked(
                 return Ok(runtime_limit_value(&marker));
             }
         }
-        inject_fault("after_all_receipts_before_tree_delete")?;
+        inject_fault("after_all_receipts_before_tree_delete", session.control())?;
         // Freeze the exact inode/state/content observations for every
         // operation-owned receipt before the marker can authorize Sweeping.
         // Recovery and each physical tree mutation re-check this digest, so a
@@ -777,7 +775,7 @@ fn execute_locked(
         if ensure_pre_sweep_index_rotation(session, &mut marker, budget)? {
             return Ok(runtime_limit_value(&marker));
         }
-        inject_fault("after_pre_sweep_rotation")?;
+        inject_fault("after_pre_sweep_rotation", session.control())?;
         for (index, tree) in marker.trees.iter().enumerate() {
             // A logical generation is not enough to bind the SQLite source:
             // reject a same-generation primary-file replacement before every
@@ -794,13 +792,13 @@ fn execute_locked(
             };
             let removed = session.remove_candidate_tree(&permit, &marker, tree)?;
             if index == 0 {
-                inject_fault("after_first_tree_delete")?;
+                inject_fault("after_first_tree_delete", session.control())?;
             }
             if removed && budget.should_defer_after_checkpoint() {
                 return Ok(runtime_limit_value(&marker));
             }
         }
-        inject_fault("after_all_trees_before_final_rotation")?;
+        inject_fault("after_all_trees_before_final_rotation", session.control())?;
         marker.phase = GcSweepPhase::Finalizing;
         session.advance_marker(&marker)?;
         if budget.should_defer_after_checkpoint() {
@@ -815,7 +813,10 @@ fn execute_locked(
         // an attacker could restore a stale index then leave a forged or old
         // `index_final` value that merely happens to match it.
         ensure_final_index_rotation(session, &mut marker)?;
-        inject_fault("after_final_rotation_before_marker_removal")?;
+        inject_fault(
+            "after_final_rotation_before_marker_removal",
+            session.control(),
+        )?;
         let completed_index_state = index_state_bound(session)?;
         if marker.index_final.as_ref() != Some(&completed_index_state) {
             return Err(index_binding_changed(
@@ -968,9 +969,10 @@ fn ensure_pre_sweep_index_rotation(
                 target_generation: generation.clone(),
             },
             &bound_fts_config(),
+            session.control(),
         )
         .map_err(|_| index_binding_changed("before the pre-sweep rotation"))?;
-        inject_fault("after_private_prepare")?;
+        inject_fault("after_private_prepare", session.control())?;
         let target = GcIndexState::Present {
             generation: prepared.target.metadata.index_generation,
             identity: prepared.target.file_identity,
@@ -984,7 +986,7 @@ fn ensure_pre_sweep_index_rotation(
             target: target.clone(),
         });
         session.advance_marker(marker)?;
-        inject_fault("after_rotation_marker_persist")?;
+        inject_fault("after_rotation_marker_persist", session.control())?;
         if budget.should_defer_after_checkpoint() {
             return Ok(true);
         }
@@ -1039,9 +1041,10 @@ fn ensure_final_index_rotation(
                     target_generation: generation.clone(),
                 },
                 &bound_fts_config(),
+                session.control(),
             )
             .map_err(|_| index_binding_changed("during the final rotation"))?;
-            inject_fault("after_private_prepare")?;
+            inject_fault("after_private_prepare", session.control())?;
             let target = GcIndexState::Present {
                 generation: prepared.target.metadata.index_generation,
                 identity: prepared.target.file_identity,
@@ -1055,7 +1058,7 @@ fn ensure_final_index_rotation(
                 target,
             });
             session.advance_marker(marker)?;
-            inject_fault("after_rotation_marker_persist")?;
+            inject_fault("after_rotation_marker_persist", session.control())?;
             let _ =
                 complete_marked_index_rotation(session, marker, GcIndexRotationRole::Final, None)?;
             Ok(())
@@ -1098,10 +1101,11 @@ fn complete_marked_index_rotation(
         source,
         &rotation.source_state_digest,
         target,
+        session.control(),
     )
     .map_err(|error| index_exchange_error(error, "during durable rotation recovery"))?
     {
-        inject_fault("after_index_exchange")?;
+        inject_fault("after_index_exchange", session.control())?;
         if budget
             .as_deref_mut()
             .is_some_and(ExecutionBudget::should_defer_after_checkpoint)
@@ -1118,9 +1122,10 @@ fn complete_marked_index_rotation(
                 source,
                 &rotation.source_state_digest,
                 target,
+                session.control(),
             )
             .map_err(|error| index_exchange_error(error, "during durable rotation"))?;
-            inject_fault("after_index_exchange")?;
+            inject_fault("after_index_exchange", session.control())?;
             if budget
                 .as_deref_mut()
                 .is_some_and(ExecutionBudget::should_defer_after_checkpoint)
@@ -1138,9 +1143,13 @@ fn complete_marked_index_rotation(
         &rotation.temp_leaf,
         &rotation.private_dir_identity,
         source,
+        session.control(),
     )
     .map_err(|error| index_exchange_error(error, "during durable rotation"))?;
-    inject_fault("after_temp_cleanup_before_marker_advance")?;
+    inject_fault(
+        "after_temp_cleanup_before_marker_advance",
+        session.control(),
+    )?;
     if cleanup == PreparedGcIndexCleanup::Removed
         && budget
             .as_deref_mut()
@@ -1159,7 +1168,7 @@ fn complete_marked_index_rotation(
 
 fn cleanup_stale_index_rotations(session: &GcSweepSession, keep: Option<&str>) -> Result<()> {
     let kio = session.retained_kio_handle()?;
-    cleanup_stale_bound_gc_index_rotations(&kio, keep)
+    cleanup_stale_bound_gc_index_rotations_with_control(&kio, keep, session.control())
         .map_err(|_| index_binding_changed("during private rotation cleanup"))
 }
 
@@ -1248,8 +1257,8 @@ fn validate_pre_sweep_index_attestation(
     Ok(Some(attested_file))
 }
 
-fn fixed_now() -> Result<i64> {
-    let now = now_utc_seconds();
+fn fixed_now(control: &kio_core::control::ControlHandle) -> Result<i64> {
+    let now = control.now_utc_seconds();
     parse_utc_seconds(&now)
         .ok_or_else(|| KioError::schema("current time is not canonical UTC seconds"))
 }
@@ -1271,18 +1280,8 @@ fn runtime_limit_value(marker: &GcInProgressMarker) -> Value {
 }
 
 #[cfg(debug_assertions)]
-fn test_runtime_checkpoint_limit() -> Option<u64> {
-    crate::debug_test_control()
-        .expect("command dispatch installs debug test control")
-        .cli
-        .gc_runtime_checkpoints
-        .known()
-        .copied()
-}
-
-#[cfg(not(debug_assertions))]
-fn test_runtime_checkpoint_limit() -> Option<u64> {
-    None
+fn test_runtime_checkpoint_limit(control: &kio_core::control::ControlHandle) -> Option<u64> {
+    control.debug().cli.gc_runtime_checkpoints.known().copied()
 }
 
 fn plan_changed() -> KioError {
@@ -1306,7 +1305,7 @@ fn recovery_pending_value(marker: &GcInProgressMarker) -> Value {
 }
 
 fn confirm<T: Serialize>(
-    ctx: &AppContext,
+    ctx: &crate::context::AppContext,
     preview: &T,
     candidate_count: usize,
     recovery_pending: bool,
@@ -1342,8 +1341,8 @@ fn confirm<T: Serialize>(
     ))
 }
 
-fn inject_fault(point: &str) -> Result<()> {
-    if gc_fault_enabled(point) {
+fn inject_fault(point: &str, control: &kio_core::control::ControlHandle) -> Result<()> {
+    if gc_fault_enabled(point, control) {
         return Err(KioError::new(
             "KIO-E-GC-TEST-INTERRUPTED-001",
             "GC test fault injection interrupted the sweep",
@@ -1355,7 +1354,7 @@ fn inject_fault(point: &str) -> Result<()> {
 }
 
 #[cfg(debug_assertions)]
-fn gc_fault_enabled(point: &str) -> bool {
+fn gc_fault_enabled(point: &str, control: &kio_core::control::ControlHandle) -> bool {
     let expected = match point {
         "after_marker_fsync" => GcFault::AfterMarkerFsync,
         "after_first_receipt" => GcFault::AfterFirstReceipt,
@@ -1376,27 +1375,17 @@ fn gc_fault_enabled(point: &str) -> bool {
         "after_tree_retirement_capture" => GcFault::AfterTreeRetirementCapture,
         _ => return false,
     };
-    crate::debug_test_control()
-        .expect("command dispatch installs debug test control")
-        .core
-        .gc_fault
-        .known()
-        == Some(&expected)
+    control.debug().core.gc_fault.known() == Some(&expected)
 }
 
 #[cfg(not(debug_assertions))]
-fn gc_fault_enabled(_: &str) -> bool {
+fn gc_fault_enabled(_: &str, _control: &kio_core::control::ControlHandle) -> bool {
     false
 }
 
-fn maybe_wait_at_test_prelock_barrier() {
-    #[cfg(debug_assertions)]
-    let ready_path = crate::debug_test_control()
-        .expect("command dispatch installs debug test control")
-        .cli
-        .gc_prelock_ready;
-    #[cfg(not(debug_assertions))]
-    let ready_path: Option<std::path::PathBuf> = None;
+#[cfg(debug_assertions)]
+fn maybe_wait_at_test_prelock_barrier(control: &kio_core::control::ControlHandle) {
+    let ready_path = control.debug().cli.gc_prelock_ready.clone();
     let Some(ready_path) = ready_path else {
         return;
     };
@@ -1409,6 +1398,9 @@ fn maybe_wait_at_test_prelock_barrier() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
+
+#[cfg(not(debug_assertions))]
+fn maybe_wait_at_test_prelock_barrier(_control: &kio_core::control::ControlHandle) {}
 
 #[cfg(test)]
 mod index_exchange_error_tests {

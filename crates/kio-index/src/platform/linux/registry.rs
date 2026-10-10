@@ -22,14 +22,16 @@ pub(crate) struct RegistryParentBinding {
 
 pub(crate) fn registry_parent_and_leaf(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> std::result::Result<RegistryParentBinding, RegistrySnapshotError> {
-    if let Some((root, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
-        .map_err(|error| {
-            RegistrySnapshotError::UnsafeIntegrity(format!(
-                "resolve inherited registry directory capability: {error}"
-            ))
-        })?
-    {
+    if let Some((root, suffix)) = kio_core::private_fs::resolve_inherited_private_root_with_control(
+        path, control,
+    )
+    .map_err(|error| {
+        RegistrySnapshotError::UnsafeIntegrity(format!(
+            "resolve inherited registry directory capability: {error}"
+        ))
+    })? {
         return inherited_registry_parent_and_leaf(path, root, &suffix);
     }
     let path = normalized_absolute_registry_path(path)?;
@@ -232,14 +234,16 @@ pub(crate) fn inherited_registry_parent_and_leaf(
 
 pub(crate) fn stable_registry_parent_binding(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> std::result::Result<Option<RegistryParentBinding>, SnapshotAttemptError> {
-    if let Some((root, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
-        .map_err(|error| {
-            SnapshotAttemptError::Unsafe(format!(
-                "resolve inherited registry directory capability: {error}"
-            ))
-        })?
-    {
+    if let Some((root, suffix)) = kio_core::private_fs::resolve_inherited_private_root_with_control(
+        path, control,
+    )
+    .map_err(|error| {
+        SnapshotAttemptError::Unsafe(format!(
+            "resolve inherited registry directory capability: {error}"
+        ))
+    })? {
         match inherited_registry_parent_and_leaf(path, root.clone(), &suffix) {
             Ok(binding) => return Ok(Some(binding)),
             Err(RegistrySnapshotError::Missing) => {
@@ -252,18 +256,20 @@ pub(crate) fn stable_registry_parent_binding(
                     }
                     Err(RegistrySnapshotError::Missing) => {
                         let (fresh_root, fresh_suffix) =
-                            kio_core::private_fs::resolve_inherited_private_root(path)
-                                .map_err(|error| {
-                                    SnapshotAttemptError::Unsafe(format!(
-                                        "re-resolve inherited registry directory capability: {error}"
-                                    ))
-                                })?
-                                .ok_or_else(|| {
-                                    SnapshotAttemptError::Unstable(
-                                        "inherited registry root disappeared while confirming absence"
-                                            .to_owned(),
-                                    )
-                                })?;
+                            kio_core::private_fs::resolve_inherited_private_root_with_control(
+                                path, control,
+                            )
+                            .map_err(|error| {
+                                SnapshotAttemptError::Unsafe(format!(
+                                    "re-resolve inherited registry directory capability: {error}"
+                                ))
+                            })?
+                            .ok_or_else(|| {
+                                SnapshotAttemptError::Unstable(
+                                    "inherited registry root disappeared while confirming absence"
+                                        .to_owned(),
+                                )
+                            })?;
                         if fresh_suffix != suffix || !same_inherited_root(&root, &fresh_root)? {
                             return Err(SnapshotAttemptError::Unsafe(
                                 "inherited registry root changed while confirming absence"
@@ -278,9 +284,9 @@ pub(crate) fn stable_registry_parent_binding(
             Err(error) => return Err(registry_parent_binding_error(error)),
         }
     }
-    match registry_parent_and_leaf(path) {
+    match registry_parent_and_leaf(path, control) {
         Ok(binding) => Ok(Some(binding)),
-        Err(RegistrySnapshotError::Missing) => match registry_parent_and_leaf(path) {
+        Err(RegistrySnapshotError::Missing) => match registry_parent_and_leaf(path, control) {
             Err(RegistrySnapshotError::Missing) => Ok(None),
             Ok(_) => Err(SnapshotAttemptError::Unstable(
                 "scope registry parent appeared while confirming its absence".to_owned(),
@@ -295,9 +301,10 @@ pub(crate) fn stable_registry_parent_binding(
 /// to be the same directory as the descriptor used to capture the snapshot.
 pub(crate) fn fresh_registry_parent_binding(
     held: &RegistryParentBinding,
+    control: &kio_core::control::ControlHandle,
 ) -> std::result::Result<std::sync::Arc<fs::File>, SnapshotAttemptError> {
     let canonical_path = held.parent_path.join(&held.leaf);
-    let fresh = match registry_parent_and_leaf(&canonical_path) {
+    let fresh = match registry_parent_and_leaf(&canonical_path, control) {
         Ok(binding) => binding,
         Err(RegistrySnapshotError::Missing) => {
             return Err(SnapshotAttemptError::Unstable(
@@ -405,6 +412,7 @@ pub(crate) fn normalized_absolute_registry_path(
 
 pub(crate) fn registry_writer_parent(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<Option<(PathBuf, kio_core::store_dir::StoreDirectory)>> {
     use std::ffi::CString;
     use std::os::fd::AsRawFd;
@@ -412,12 +420,14 @@ pub(crate) fn registry_writer_parent(
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::MetadataExt;
 
-    let Some((mut parent, suffix)) = kio_core::private_fs::resolve_inherited_private_root(path)
-        .map_err(|error| {
-            crate::IndexError::Schema(format!(
-                "resolve inherited registry directory capability: {error}"
-            ))
-        })?
+    let Some((mut parent, suffix)) =
+        kio_core::private_fs::resolve_inherited_private_root_with_control(path, control).map_err(
+            |error| {
+                crate::IndexError::Schema(format!(
+                    "resolve inherited registry directory capability: {error}"
+                ))
+            },
+        )?
     else {
         return Ok(None);
     };
@@ -457,8 +467,12 @@ pub(crate) fn registry_writer_parent(
                 .create_directory(component)
                 .map_err(|error| crate::IndexError::Schema(error.to_string()))?
         };
-        parent = kio_core::store_dir::StoreDirectory::from_retained(next, logical.clone())
-            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+        parent = kio_core::store_dir::StoreDirectory::from_retained_with_control(
+            next,
+            logical.clone(),
+            control.clone(),
+        )
+        .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
         // Existing directories are only verified, never chmod-repaired. New
         // directories were restricted by StoreDirectory before this adoption.
         verify_owner_private_directory(&parent)?;
@@ -532,8 +546,9 @@ pub(crate) fn registry_writer_parent(
 use crate::platform::registry_unix::registry_filesystem_root;
 pub(crate) fn prepare_registry_writer(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<(PathBuf, Option<kio_core::store_dir::StoreDirectory>)> {
-    let inherited = registry_writer_parent(path)?;
+    let inherited = registry_writer_parent(path, control)?;
     let (sqlite_path, inherited_parent) = if let Some((sqlite_path, parent)) = inherited {
         (sqlite_path, Some(parent))
     } else {

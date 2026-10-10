@@ -151,11 +151,17 @@ pub(crate) type SnapshotTestHook =
 /// `$XDG_DATA_HOME/kio/scope-registry.sqlite`, falling back to
 /// `$HOME/.local/share/kio/scope-registry.sqlite` (03-data-model.md §4).
 pub fn default_registry_path() -> Result<PathBuf> {
+    default_registry_path_with_control(&kio_core::control::ControlHandle::default())
+}
+
+pub fn default_registry_path_with_control(
+    control: &kio_core::control::ControlHandle,
+) -> Result<PathBuf> {
     // R12-6 / R13-6: honor the XDG validity rules AND require an absolute `HOME`
     // for the fallback (empty/relative treated as unset), so neither a bad
     // `XDG_DATA_HOME` nor a bad `HOME` lands the registry in a CWD-relative `kio/`.
     let data_home = kio_core::xdg::xdg_dir("XDG_DATA_HOME")
-        .or_else(|| kio_core::xdg::home_dir().map(|home| home.join(".local/share")))
+        .or_else(|| control.home_dir().map(|home| home.join(".local/share")))
         .ok_or_else(|| {
             crate::IndexError::Schema(
                 "cannot resolve an absolute user data directory; refusing a CWD-relative registry"
@@ -573,6 +579,7 @@ fn verify_private_snapshot_before_sqlite(
 
 fn snapshot_attempt(
     binding: &RegistryParentBinding,
+    control: &kio_core::control::ControlHandle,
     #[cfg(test)] hook: Option<&SnapshotTestHook>,
     #[cfg(not(test))] _hook: Option<&()>,
     #[cfg(test)] attempt: usize,
@@ -599,7 +606,7 @@ fn snapshot_attempt(
             if let Some(hook) = hook {
                 hook(SnapshotTestPhase::AfterInitialManifest, attempt, None);
             }
-            let fresh_parent = fresh_registry_parent_binding(binding)?;
+            let fresh_parent = fresh_registry_parent_binding(binding, control)?;
             return match observe_manifest(
                 fresh_parent.as_ref(),
                 parent_path,
@@ -620,7 +627,7 @@ fn snapshot_attempt(
                             None,
                         );
                     }
-                    fresh_registry_parent_binding(binding)?;
+                    fresh_registry_parent_binding(binding, control)?;
                     Err(SnapshotAttemptError::Missing)
                 }
                 Ok(_) => Err(SnapshotAttemptError::Unstable(
@@ -709,7 +716,7 @@ fn snapshot_attempt(
             None,
         );
     }
-    let fresh_parent = fresh_registry_parent_binding(binding)?;
+    let fresh_parent = fresh_registry_parent_binding(binding, control)?;
     let final_manifest = observe_manifest(
         fresh_parent.as_ref(),
         parent_path,
@@ -734,7 +741,7 @@ fn snapshot_attempt(
             None,
         );
     }
-    fresh_registry_parent_binding(binding)?;
+    fresh_registry_parent_binding(binding, control)?;
     Ok((
         conn,
         RegistrySnapshot {
@@ -751,7 +758,14 @@ impl RegistryDb {
     pub fn open_read_only(
         path: impl AsRef<Path>,
     ) -> std::result::Result<Self, RegistrySnapshotError> {
-        Self::open_read_only_with_budget(path.as_ref(), REGISTRY_SNAPSHOT_RETRY_WINDOW)
+        Self::open_read_only_with_control(path, &kio_core::control::ControlHandle::default())
+    }
+
+    pub fn open_read_only_with_control(
+        path: impl AsRef<Path>,
+        control: &kio_core::control::ControlHandle,
+    ) -> std::result::Result<Self, RegistrySnapshotError> {
+        Self::open_read_only_with_budget(path.as_ref(), REGISTRY_SNAPSHOT_RETRY_WINDOW, control)
     }
 
     /// Return a private, owned snapshot rather than opening the mutable source
@@ -761,12 +775,13 @@ impl RegistryDb {
     fn open_read_only_with_budget(
         path: &Path,
         retry_window: Duration,
+        control: &kio_core::control::ControlHandle,
     ) -> std::result::Result<Self, RegistrySnapshotError> {
         let started = Instant::now();
         let mut saw_instability = None;
         for attempt in 0..MAX_REGISTRY_SNAPSHOT_ATTEMPTS {
-            let result = match stable_registry_parent_binding(path) {
-                Ok(Some(binding)) => snapshot_attempt(&binding, None, attempt),
+            let result = match stable_registry_parent_binding(path, control) {
+                Ok(Some(binding)) => snapshot_attempt(&binding, control, None, attempt),
                 Ok(None) => Err(SnapshotAttemptError::Missing),
                 Err(error) => Err(error),
             };
@@ -813,10 +828,11 @@ impl RegistryDb {
         attempts: usize,
         hook: SnapshotTestHook,
     ) -> std::result::Result<Self, RegistrySnapshotError> {
+        let control = kio_core::control::ControlHandle::default();
         let mut saw_instability = None;
         for attempt in 0..attempts {
-            let result = match stable_registry_parent_binding(path) {
-                Ok(Some(binding)) => snapshot_attempt(&binding, Some(&hook), attempt),
+            let result = match stable_registry_parent_binding(path, &control) {
+                Ok(Some(binding)) => snapshot_attempt(&binding, &control, Some(&hook), attempt),
                 Ok(None) => Err(SnapshotAttemptError::Missing),
                 Err(error) => Err(error),
             };
@@ -849,7 +865,14 @@ impl RegistryDb {
     }
 
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let (sqlite_path, inherited_parent) = prepare_registry_writer(path.as_ref())?;
+        Self::open_with_control(path, &kio_core::control::ControlHandle::default())
+    }
+
+    pub fn open_with_control(
+        path: impl AsRef<Path>,
+        control: &kio_core::control::ControlHandle,
+    ) -> Result<Self> {
+        let (sqlite_path, inherited_parent) = prepare_registry_writer(path.as_ref(), control)?;
         let conn = Connection::open(sqlite_path)?;
         // P6 (05 §1.8 / docs/05:565): serialize concurrent writers with WAL +
         // busy_timeout so a parallel `kio init`/`index` upsert waits (up to 5s)
@@ -879,11 +902,22 @@ impl RegistryDb {
     }
 
     pub fn open_default() -> Result<Self> {
-        Self::open(default_registry_path()?)
+        Self::open_default_with_control(&kio_core::control::ControlHandle::default())
+    }
+
+    pub fn open_default_with_control(control: &kio_core::control::ControlHandle) -> Result<Self> {
+        Self::open_with_control(default_registry_path_with_control(control)?, control)
     }
 
     pub fn open_default_read_only() -> Result<Self> {
-        Self::open_read_only(default_registry_path()?).map_err(index_error_from_snapshot)
+        Self::open_default_read_only_with_control(&kio_core::control::ControlHandle::default())
+    }
+
+    pub fn open_default_read_only_with_control(
+        control: &kio_core::control::ControlHandle,
+    ) -> Result<Self> {
+        Self::open_read_only_with_control(default_registry_path_with_control(control)?, control)
+            .map_err(index_error_from_snapshot)
     }
 
     /// R15-3: retire every registration for `kio_path` whose `scope_id` differs
@@ -1121,6 +1155,28 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegistryEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn owner_control_registry_reads_xdg_at_resolution_time() {
+        use kio_core::control::ControlHandle;
+        use kio_core::test_control::{TestEnvGuard, test_env_lock};
+        let _lock = test_env_lock().lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("outer");
+        let inner = dir.path().join("inner");
+        let control = ControlHandle::default();
+        let _first = TestEnvGuard::set("XDG_DATA_HOME", &outer);
+        assert_eq!(
+            default_registry_path_with_control(&control).unwrap(),
+            outer.join("kio/scope-registry.sqlite")
+        );
+        let _second = TestEnvGuard::set("XDG_DATA_HOME", &inner);
+        assert_eq!(
+            default_registry_path_with_control(&control).unwrap(),
+            inner.join("kio/scope-registry.sqlite")
+        );
+    }
 
     #[derive(Debug, PartialEq, Eq)]
     struct RegistrySnapshot {
@@ -2221,7 +2277,11 @@ mod tests {
             canonical.as_os_str(),
             "canonical source path must retain its exact namespace"
         );
-        let binding = crate::platform::registry_parent_and_leaf(&canonical).unwrap();
+        let binding = crate::platform::registry_parent_and_leaf(
+            &canonical,
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         assert_eq!(binding.parent_path, canonical.parent().unwrap());
         drop(binding);
         let before = snapshot_registry(&path);

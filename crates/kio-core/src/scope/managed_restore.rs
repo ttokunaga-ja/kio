@@ -423,7 +423,8 @@ impl Repository {
             Publication::CreateOnly,
         )?;
         self.store_directory()?.sync()?;
-        crate::durability::checkpoint(crate::durability::DurabilityPoint::RestoreJournal)?;
+        self.control()
+            .checkpoint(crate::durability::DurabilityPoint::RestoreJournal)?;
 
         for index in 0..plan.changes.len() {
             validate_current_authority()?;
@@ -434,7 +435,8 @@ impl Repository {
                 &mut journal_bytes,
             )?;
         }
-        crate::durability::checkpoint(crate::durability::DurabilityPoint::RestoreWorkingBytes)?;
+        self.control()
+            .checkpoint(crate::durability::DurabilityPoint::RestoreWorkingBytes)?;
         self.revalidate_final_restore_working_hashes(plan)?;
         validate_current_authority()?;
         let head = self.read_commit(&plan.expected_head)?;
@@ -445,7 +447,8 @@ impl Repository {
             &plan.new_commit,
             manifest,
         )?;
-        crate::durability::checkpoint(crate::durability::DurabilityPoint::RestoreHead)?;
+        self.control()
+            .checkpoint(crate::durability::DurabilityPoint::RestoreHead)?;
         self.remove_managed_restore_journal(&journal_bytes)?;
         Ok(ManagedRestoreOutcome {
             noop: false,
@@ -568,10 +571,11 @@ impl Repository {
         let root = self.bound_root.as_deref().ok_or_else(|| {
             KioError::invalid_usage("managed restore requires retained scope authority")
         })?;
-        StoreDirectory::from_retained(
+        StoreDirectory::from_retained_with_control(
             root.try_clone()
                 .map_err(|error| KioError::io(error.to_string(), "."))?,
             self.canonical_root.clone(),
+            self.control().clone(),
         )
     }
 

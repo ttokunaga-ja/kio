@@ -4,7 +4,10 @@ impl GcPlanner {
     pub fn bind_current() -> Result<Self> {
         Self::bind(std::env::current_dir().map_err(|e| ioerr(e, "."))?)
     }
-    pub fn bind(root: impl Into<PathBuf>) -> Result<Self> {
+    pub fn bind_with_control(
+        root: impl Into<PathBuf>,
+        control: crate::control::ControlHandle,
+    ) -> Result<Self> {
         let requested = root.into();
         if !requested.is_absolute() {
             return Err(KioError::invalid_usage(
@@ -22,6 +25,7 @@ impl GcPlanner {
         let kio = open_optional_dir(&scope, ".kio")?
             .ok_or_else(|| KioError::invalid_usage("current directory is not a Kio scope"))?;
         Ok(Self {
+            control,
             root: public,
             scope,
             kio,
@@ -34,13 +38,25 @@ impl GcPlanner {
     }
 }
 
-pub fn read_active_marker(kio_dir: &Path) -> Result<Option<GcInProgressMarker>> {
-    let kio = open_bound_absolute(&absolute_lexical_path(kio_dir)?)?;
-    read_active_marker_bound(&kio)
+impl GcPlanner {
+    pub fn bind(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::bind_with_control(root, crate::control::ControlHandle::default())
+    }
 }
 
-pub fn ensure_no_active_sweep(kio_dir: &Path) -> Result<()> {
-    if let Some(marker) = read_active_marker(kio_dir)? {
+pub fn read_active_marker_with_control(
+    kio_dir: &Path,
+    control: &crate::control::ControlHandle,
+) -> Result<Option<GcInProgressMarker>> {
+    let kio = open_bound_absolute(&absolute_lexical_path(kio_dir)?)?;
+    read_active_marker_bound(&kio, control)
+}
+
+pub fn ensure_no_active_sweep_with_control(
+    kio_dir: &Path,
+    control: &crate::control::ControlHandle,
+) -> Result<()> {
+    if let Some(marker) = read_active_marker_with_control(kio_dir, control)? {
         return Err(active_sweep_error(&marker));
     }
     Ok(())

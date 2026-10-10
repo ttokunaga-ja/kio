@@ -4,6 +4,7 @@
 //! decides when an application command is allowed to create those records: an
 //! explicit root or a just-created, directly planned child only.
 
+use kio_core::control::ControlHandle;
 mod child_lifecycle;
 mod root_bootstrap;
 
@@ -32,16 +33,22 @@ pub(crate) enum ChildScope {
 
 /// Initialize an explicit root or resume only its identity-bound bootstrap.
 /// Existing managed roots remain observable without starting a new bootstrap.
-pub(crate) fn initialize_explicit_root(root: &Path) -> Result<ExplicitRoot> {
-    root_bootstrap::initialize(root)
+pub(crate) fn initialize_explicit_root(
+    root: &Path,
+    control: &kio_core::control::ControlHandle,
+) -> Result<ExplicitRoot> {
+    root_bootstrap::initialize(root, control)
 }
 
 /// Open an existing root only after validating its management chain.
-pub(crate) fn open_existing_managed_root(root: &Path) -> Result<Repository> {
+pub(crate) fn open_existing_managed_root(
+    root: &Path,
+    control: &ControlHandle,
+) -> Result<Repository> {
     let canonical_root = root
         .canonicalize()
         .map_err(|error| KioError::io(error.to_string(), root.display().to_string()))?;
-    let retained_root = StoreDirectory::open(&canonical_root)?;
+    let retained_root = StoreDirectory::open_with_control(&canonical_root, control.clone())?;
     let repo = open_existing_bound(&canonical_root, &retained_root)?;
     validate_live_chain(&binding_for_repo(&repo)?)?;
     Ok(repo)
@@ -105,11 +112,12 @@ pub(crate) fn reconcile_planned_child(
         });
     }
 
-    let child_directory = StoreDirectory::from_retained(
+    let child_directory = StoreDirectory::from_retained_with_control(
         root.try_clone().map_err(|error| {
             KioError::io(error.to_string(), canonical_root.display().to_string())
         })?,
         canonical_root.clone(),
+        parent.control().clone(),
     )?;
     if retained_kio(&child_directory)?.is_some() {
         let repo = open_existing_bound(&canonical_root, &child_directory)?;
@@ -153,7 +161,12 @@ fn open_existing_bound(canonical_root: &Path, root: &StoreDirectory) -> Result<R
     let kio = retained_kio(root)?.ok_or_else(|| {
         KioError::invalid_usage("existing managed scope is missing its .kio directory")
     })?;
-    Repository::open_bound_existing(canonical_root.to_path_buf(), clone_root(root)?, kio)
+    Repository::open_bound_existing_with_control(
+        canonical_root.to_path_buf(),
+        clone_root(root)?,
+        kio,
+        root.control().clone(),
+    )
 }
 
 pub(crate) fn binding_for_repo(repo: &Repository) -> Result<ManagementBinding> {
@@ -176,7 +189,12 @@ pub(crate) fn binding_for_repo(repo: &Repository) -> Result<ManagementBinding> {
         })?
         .try_clone()
         .map_err(|error| KioError::io(error.to_string(), repo.kio_dir().display().to_string()))?;
-    ManagementBinding::from_retained(root, kio, repo.canonical_root().to_path_buf())
+    ManagementBinding::from_retained_with_control(
+        root,
+        kio,
+        repo.canonical_root().to_path_buf(),
+        repo.control().clone(),
+    )
 }
 
 fn clone_root(root: &StoreDirectory) -> Result<File> {
@@ -233,25 +251,42 @@ mod tests {
     #[test]
     fn explicit_init_creates_once_and_existing_missing_management_fails_closed() {
         let root = tempfile::tempdir().unwrap();
-        let repo = match initialize_explicit_root(root.path()).unwrap() {
+        let repo = match initialize_explicit_root(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("new root was classified as existing"),
         };
         assert_eq!(repo.canonical_root(), root.path().canonicalize().unwrap());
         assert!(matches!(
-            initialize_explicit_root(root.path()).unwrap(),
+            initialize_explicit_root(root.path(), &kio_core::control::ControlHandle::default())
+                .unwrap(),
             ExplicitRoot::Existing(_)
         ));
 
         let unmanaged = tempfile::tempdir().unwrap();
         Repository::init(unmanaged.path()).unwrap();
-        assert!(initialize_explicit_root(unmanaged.path()).is_err());
+        assert!(
+            initialize_explicit_root(
+                unmanaged.path(),
+                &kio_core::control::ControlHandle::default()
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn child_reconciliation_enrolls_direct_child_and_excludes_independent_root() {
         let root = tempfile::tempdir().unwrap();
-        let parent = match initialize_explicit_root(root.path()).unwrap() {
+        let parent = match initialize_explicit_root(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("new parent was classified as existing"),
         };
@@ -267,7 +302,11 @@ mod tests {
         let independent_path = root.path().join("independent");
         fs::create_dir(&independent_path).unwrap();
         assert!(matches!(
-            initialize_explicit_root(&independent_path).unwrap(),
+            initialize_explicit_root(
+                &independent_path,
+                &kio_core::control::ControlHandle::default()
+            )
+            .unwrap(),
             ExplicitRoot::Created(_)
         ));
         assert!(matches!(
@@ -279,7 +318,12 @@ mod tests {
     #[test]
     fn direct_parent_enrolls_grandchild_only_after_parent_is_managed() {
         let root = tempfile::tempdir().unwrap();
-        let parent = match initialize_explicit_root(root.path()).unwrap() {
+        let parent = match initialize_explicit_root(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("new parent was classified as existing"),
         };
@@ -310,7 +354,12 @@ mod tests {
     #[test]
     fn unmanaged_or_revoked_child_fails_closed_without_reinitialization() {
         let root = tempfile::tempdir().unwrap();
-        let parent = match initialize_explicit_root(root.path()).unwrap() {
+        let parent = match initialize_explicit_root(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("new parent was classified as existing"),
         };
@@ -336,14 +385,23 @@ mod tests {
     #[test]
     fn independent_root_exclusion_does_not_enroll_its_descendant() {
         let root = tempfile::tempdir().unwrap();
-        let parent = match initialize_explicit_root(root.path()).unwrap() {
+        let parent = match initialize_explicit_root(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("new parent was classified as existing"),
         };
         let independent_path = root.path().join("independent");
         fs::create_dir(&independent_path).unwrap();
         assert!(matches!(
-            initialize_explicit_root(&independent_path).unwrap(),
+            initialize_explicit_root(
+                &independent_path,
+                &kio_core::control::ControlHandle::default()
+            )
+            .unwrap(),
             ExplicitRoot::Created(_)
         ));
         let descendant = independent_path.join("grandchild");
@@ -358,7 +416,12 @@ mod tests {
     #[test]
     fn retained_child_binding_rejects_a_replaced_directory_identity() {
         let root = tempfile::tempdir().unwrap();
-        let parent = match initialize_explicit_root(root.path()).unwrap() {
+        let parent = match initialize_explicit_root(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("new parent was classified as existing"),
         };
@@ -378,7 +441,12 @@ mod tests {
     #[test]
     fn removed_child_management_record_fails_without_reinitialization() {
         let root = tempfile::tempdir().unwrap();
-        let parent = match initialize_explicit_root(root.path()).unwrap() {
+        let parent = match initialize_explicit_root(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("new parent was classified as existing"),
         };
@@ -397,7 +465,12 @@ mod tests {
     #[test]
     fn parent_ignore_change_denies_child_input_without_a_watcher_event() {
         let root = tempfile::tempdir().unwrap();
-        let parent = match initialize_explicit_root(root.path()).unwrap() {
+        let parent = match initialize_explicit_root(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("new parent was classified as existing"),
         };

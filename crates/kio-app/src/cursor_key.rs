@@ -13,8 +13,11 @@ use kio_core::{ExitCode, KioError, Result};
 const CURSOR_KEY_LEAF: &str = "cursor-key";
 const CURSOR_KEY_BYTES: u64 = 32;
 
-pub(crate) fn load_or_create(parent_path: &Path) -> Result<Vec<u8>> {
-    let parent = crate::private_state::ensure_private_directory(parent_path)?;
+pub(crate) fn load_or_create(
+    parent_path: &Path,
+    control: &kio_core::control::ControlHandle,
+) -> Result<Vec<u8>> {
+    let parent = crate::private_state::ensure_private_directory(parent_path, control)?;
     load_or_create_at(&parent)
 }
 
@@ -94,7 +97,11 @@ mod tests {
     #[test]
     fn reuses_a_private_exact_length_key() {
         let root = private_tempdir();
-        let parent = crate::private_state::ensure_private_directory(root.path()).unwrap();
+        let parent = crate::private_state::ensure_private_directory(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         let first = load_or_create_at(&parent).unwrap();
         let second = load_or_create_at(&parent).unwrap();
 
@@ -114,8 +121,11 @@ mod tests {
     #[test]
     fn malformed_or_symlink_key_is_rejected_without_replacement() {
         let malformed_root = private_tempdir();
-        let malformed_parent =
-            crate::private_state::ensure_private_directory(malformed_root.path()).unwrap();
+        let malformed_parent = crate::private_state::ensure_private_directory(
+            malformed_root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         malformed_parent
             .write_atomic(
                 Path::new(CURSOR_KEY_LEAF),
@@ -137,8 +147,11 @@ mod tests {
             let victim_key = victim.path().join("key");
             fs::write(&victim_key, b"victim-key-is-not-replaced").unwrap();
             symlink(&victim_key, symlink_root.path().join(CURSOR_KEY_LEAF)).unwrap();
-            let symlink_parent =
-                crate::private_state::ensure_private_directory(symlink_root.path()).unwrap();
+            let symlink_parent = crate::private_state::ensure_private_directory(
+                symlink_root.path(),
+                &kio_core::control::ControlHandle::default(),
+            )
+            .unwrap();
 
             assert!(load_or_create_at(&symlink_parent).is_err());
             assert_eq!(fs::read(victim_key).unwrap(), b"victim-key-is-not-replaced");

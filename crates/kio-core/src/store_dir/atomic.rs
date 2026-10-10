@@ -97,7 +97,11 @@ fn workspace_existing(owner: &StoreDirectory) -> Result<Option<StoreDirectory>> 
         return Ok(None);
     }
     let handle = owner.open_directory(relative)?;
-    let workspace = StoreDirectory::from_retained(handle, owner.path().join(ATOMIC_WORKSPACE_DIR))?;
+    let workspace = StoreDirectory::from_retained_with_control(
+        handle,
+        owner.path().join(ATOMIC_WORKSPACE_DIR),
+        owner.control().clone(),
+    )?;
     ensure_private_workspace(&workspace)?;
     Ok(Some(workspace))
 }
@@ -108,8 +112,11 @@ fn workspace_create(owner: &StoreDirectory) -> Result<StoreDirectory> {
     }
     match owner.create_directory(Path::new(ATOMIC_WORKSPACE_DIR)) {
         Ok(handle) => {
-            let workspace =
-                StoreDirectory::from_retained(handle, owner.path().join(ATOMIC_WORKSPACE_DIR))?;
+            let workspace = StoreDirectory::from_retained_with_control(
+                handle,
+                owner.path().join(ATOMIC_WORKSPACE_DIR),
+                owner.control().clone(),
+            )?;
             ensure_private_workspace(&workspace)?;
             Ok(workspace)
         }
@@ -278,7 +285,11 @@ fn parent_chain(
             return Err(failure("atomic target path is not normalized"));
         };
         let handle = current.open_directory(Path::new(part))?;
-        current = StoreDirectory::from_retained(handle, current.path().join(part))?;
+        current = StoreDirectory::from_retained_with_control(
+            handle,
+            current.path().join(part),
+            current.control().clone(),
+        )?;
         ids.push(directory_id(&current)?);
     }
     if directory_id(&parent)? != *ids.last().expect("target root is present") {
@@ -461,7 +472,9 @@ pub(super) fn write(
         .map_err(|e| io_failure("cannot sync atomic publication artifact", e))?;
     drop(staged);
     workspace.sync()?;
-    crate::durability::checkpoint(crate::durability::DurabilityPoint::AtomicWriteStaged)?;
+    owner
+        .control()
+        .checkpoint(crate::durability::DurabilityPoint::AtomicWriteStaged)?;
     workspace.rename_regular_between_raw(
         Path::new(WRITE),
         &parent,
@@ -470,7 +483,9 @@ pub(super) fn write(
     )?;
     workspace.sync()?;
     parent.sync()?;
-    crate::durability::checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)
+    owner
+        .control()
+        .checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)
 }
 
 pub(super) fn remove(
@@ -529,7 +544,9 @@ pub(super) fn remove(
         Publication::CreateOnly,
     )?;
     workspace.sync()?;
-    crate::durability::checkpoint(crate::durability::DurabilityPoint::AtomicRemoveReady)?;
+    owner
+        .control()
+        .checkpoint(crate::durability::DurabilityPoint::AtomicRemoveReady)?;
     let _ = recover_locked(owner, &workspace, &[target])?;
     Ok(())
 }

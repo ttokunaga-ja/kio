@@ -452,7 +452,14 @@ impl Aggregator {
     /// tokenizer mismatch would make the projection and its candidate query
     /// disagree about what the user asked for.
     pub fn open(path: &Path) -> Result<Self> {
-        let cache = bind_cache(path, true)?;
+        Self::open_with_control(path, &kio_core::control::ControlHandle::default())
+    }
+
+    pub fn open_with_control(
+        path: &Path,
+        control: &kio_core::control::ControlHandle,
+    ) -> Result<Self> {
+        let cache = bind_cache(path, true, control)?;
         Self::open_bound(cache)
     }
 
@@ -613,7 +620,14 @@ impl Aggregator {
     /// never turn discovery of an incompatible cache into a write.  Callers
     /// invoke it only under the user-authorized device repair operation.
     pub fn recreate(path: &Path) -> Result<Self> {
-        Self::open_bound(recreate_cache(path)?)
+        Self::recreate_with_control(path, &kio_core::control::ControlHandle::default())
+    }
+
+    pub fn recreate_with_control(
+        path: &Path,
+        control: &kio_core::control::ControlHandle,
+    ) -> Result<Self> {
+        Self::open_bound(recreate_cache(path, control)?)
     }
 
     /// Validate an existing replica before opening it for writing.

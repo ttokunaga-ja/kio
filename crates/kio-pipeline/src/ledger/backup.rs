@@ -1,5 +1,6 @@
 //! Create-only authority-bound ledger backups.
 use crate::{PipelineError, Result};
+use kio_core::control::ControlHandle;
 use kio_core::store_dir::{
     ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, Publication, StoreDirectory,
 };
@@ -75,7 +76,15 @@ impl LedgerBackup {
         digest(&self.sqlite).sha256
     }
     pub fn publish_create_only(&self, destination: &Path) -> Result<()> {
-        let s = kio_core::private_fs::verify_private_directory(destination).map_err(store_err)?;
+        self.publish_create_only_with_control(destination, &ControlHandle::default())
+    }
+    pub fn publish_create_only_with_control(
+        &self,
+        destination: &Path,
+        control: &ControlHandle,
+    ) -> Result<()> {
+        let s = kio_core::private_fs::verify_private_directory_with_control(destination, control)
+            .map_err(store_err)?;
         if !s.entries(Path::new("")).map_err(store_err)?.is_empty() {
             return Err(err(
                 "KIO-E-LEDGER-BACKUP-EXISTS-001",
@@ -100,7 +109,11 @@ impl LedgerBackup {
         s.sync().map_err(store_err)
     }
     pub fn load(destination: &Path) -> Result<Self> {
-        let s = kio_core::private_fs::verify_private_directory(destination).map_err(store_err)?;
+        Self::load_with_control(destination, ControlHandle::default())
+    }
+    pub fn load_with_control(destination: &Path, control: ControlHandle) -> Result<Self> {
+        let s = kio_core::private_fs::verify_private_directory_with_control(destination, &control)
+            .map_err(store_err)?;
         let atomic = s.inspect_atomic().map_err(|_| {
             err(
                 "KIO-E-LEDGER-BACKUP-MANIFEST-001",
@@ -233,6 +246,53 @@ mod tests {
             path: temporary.path().join("private"),
             _temporary: temporary,
         }
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn owner_control_backup_publication_isolation() {
+        use kio_core::control::ControlHandle;
+        use kio_core::durability::DurabilityPoint;
+        use kio_core::test_control::{CoreTestControl, DebugTestControl, Selector};
+        let selected = private_tempdir();
+        let sibling = private_tempdir();
+        let occupied = selected
+            .path()
+            .parent()
+            .unwrap()
+            .join("occupied-backup-barrier");
+        fs::write(&occupied, b"occupied").unwrap();
+        let control = ControlHandle::new(DebugTestControl {
+            core: CoreTestControl {
+                durability_point: Selector::Known(DurabilityPoint::AtomicWriteStaged),
+                durability_ready: Some(occupied.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+        let backup = backup();
+        let error = backup
+            .publish_create_only_with_control(selected.path(), &control)
+            .expect_err("selected backup publication must reach its captured durability barrier");
+        assert!(
+            error
+                .to_string()
+                .contains("KIO-E-LEDGER-BACKUP-PRIVATE-001"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&occupied).unwrap(), b"occupied");
+        assert!(!selected.path().join("ledger.sqlite").exists());
+        backup
+            .publish_create_only_with_control(sibling.path(), &ControlHandle::default())
+            .unwrap();
+        let loaded =
+            LedgerBackup::load_with_control(sibling.path(), ControlHandle::default()).unwrap();
+        assert_eq!(loaded.identity(), backup.identity());
+        assert_eq!(loaded.sqlite, backup.sqlite);
+        assert_eq!(
+            LedgerBackup::load(sibling.path()).unwrap().identity(),
+            backup.identity()
+        );
     }
 
     #[test]

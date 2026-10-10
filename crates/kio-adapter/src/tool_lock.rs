@@ -160,14 +160,20 @@ pub fn tools_toml_uses_plain_auth(bytes: &[u8]) -> Result<bool> {
 /// owner-private, regular-file, no-follow trust boundary. The returned bytes
 /// are the only bytes from which a literal key may be derived.
 pub fn read_private_tools_toml(path: &Path) -> Result<Vec<u8>> {
+    read_private_tools_toml_with_control(path, &kio_core::control::ControlHandle::default())
+}
+
+pub fn read_private_tools_toml_with_control(
+    path: &Path,
+    control: &kio_core::control::ControlHandle,
+) -> Result<Vec<u8>> {
     let bytes =
-        kio_core::private_fs::read_private_file(path, MAX_TOOLS_TOML_BYTES).map_err(|_| {
-            AdapterError::ConfigSchemaCoded {
-                code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
-                message:
-                    "tools.toml containing a plain credential must be an owner-private regular file"
-                        .to_owned(),
-            }
+        kio_core::private_fs::read_private_file_with_control(path, MAX_TOOLS_TOML_BYTES, control)
+            .map_err(|_| AdapterError::ConfigSchemaCoded {
+            code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
+            message:
+                "tools.toml containing a plain credential must be an owner-private regular file"
+                    .to_owned(),
         })?;
     validate_tools_toml(&bytes)?;
     Ok(bytes)
@@ -1070,8 +1076,9 @@ fn optional_string_array(table: &toml::value::Table, field: &str) -> Vec<String>
 /// All configuration that affects adapter execution.  The app loads this from
 /// the current device configuration and owns it for one command only;
 /// profile identities intentionally remain outside this execution context.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct AdapterRuntimeSettings {
+    pub control: kio_core::control::ControlHandle,
     pub declarations: std::collections::HashMap<String, DeclaredAdapter>,
     pub pricing: std::collections::HashMap<String, BTreeMap<String, f64>>,
     pub execution_timeouts: std::collections::HashMap<String, u64>,
@@ -1087,7 +1094,26 @@ pub struct AdapterRuntimeSettings {
     pub tools_toml_path: Option<PathBuf>,
 }
 
+impl Default for AdapterRuntimeSettings {
+    fn default() -> Self {
+        Self::with_control(kio_core::control::ControlHandle::default())
+    }
+}
+
 impl AdapterRuntimeSettings {
+    #[must_use]
+    pub fn with_control(control: kio_core::control::ControlHandle) -> Self {
+        Self {
+            control,
+            declarations: Default::default(),
+            pricing: Default::default(),
+            execution_timeouts: Default::default(),
+            local_peer_ca_path: None,
+            local_peer_trust_digest: None,
+            local_peer_trust_binding: None,
+            tools_toml_path: None,
+        }
+    }
     /// Read this invocation's declaration without ambient authority.
     #[must_use]
     pub fn declared_adapter(&self, role: &str) -> Option<DeclaredAdapter> {
@@ -1136,14 +1162,19 @@ impl AdapterRuntimeSettings {
     ) -> Result<crate::local_peer::AuthenticatedLocalEndpoint> {
         let ca_path = self.local_peer_ca_path()?;
         let trust_digest = self.local_peer_trust_digest()?;
-        crate::local_peer::AuthenticatedLocalEndpoint::new_bound(url, ca_path, trust_digest)
-            .map_err(|error| match error {
-                AdapterError::LocalPeerConfig { code, message } => AdapterError::LocalPeerConfig {
-                    code,
-                    message: format!("local peer for `{role}` is unavailable: {message}"),
-                },
-                other => other,
-            })
+        crate::local_peer::AuthenticatedLocalEndpoint::new_bound(
+            url,
+            ca_path,
+            trust_digest,
+            self.control.clone(),
+        )
+        .map_err(|error| match error {
+            AdapterError::LocalPeerConfig { code, message } => AdapterError::LocalPeerConfig {
+                code,
+                message: format!("local peer for `{role}` is unavailable: {message}"),
+            },
+            other => other,
+        })
     }
 
     pub fn resolve_role_api_key(&self, role: &str) -> Result<Option<String>> {
@@ -1167,7 +1198,7 @@ impl AdapterRuntimeSettings {
                     code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
                     message: "plain credential has no owner-private tools.toml source".to_owned(),
                 })?;
-        let bytes = read_private_tools_toml(path)?;
+        let bytes = read_private_tools_toml_with_control(path, &self.control)?;
         let value = parse_tools_toml(&bytes)?;
         let verified = declared_adapter_for_role(&value, role).ok_or_else(|| {
             AdapterError::ConfigSchemaCoded {
@@ -1526,6 +1557,7 @@ mod tests {
             BTreeMap::from([("tokens_in".to_owned(), price)]),
         );
         AdapterRuntimeSettings {
+            control: kio_core::control::ControlHandle::default(),
             declarations,
             pricing,
             execution_timeouts: std::collections::HashMap::from([(

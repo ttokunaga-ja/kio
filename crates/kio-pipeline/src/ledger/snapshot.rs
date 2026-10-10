@@ -162,7 +162,14 @@ impl LedgerReadSnapshot {
     /// Capture a stable snapshot.  `Missing` is a normal no-create cache miss;
     /// unsafe source shape and source churn are deliberately distinct.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerSnapshotError> {
-        Self::open_with_attempts(path.as_ref(), MAX_ATTEMPTS, None)
+        Self::open_with_control(path, kio_core::control::ControlHandle::default())
+    }
+
+    pub fn open_with_control(
+        path: impl AsRef<Path>,
+        control: kio_core::control::ControlHandle,
+    ) -> Result<Self, LedgerSnapshotError> {
+        Self::open_with_attempts(path.as_ref(), MAX_ATTEMPTS, None, &control)
     }
 
     fn open_with_attempts(
@@ -170,15 +177,16 @@ impl LedgerReadSnapshot {
         attempts: usize,
         #[cfg(test)] hook: Option<SnapshotHook>,
         #[cfg(not(test))] _hook: Option<()>,
+        control: &kio_core::control::ControlHandle,
     ) -> Result<Self, LedgerSnapshotError> {
         // Preserve the raw descriptor spelling until the shared resolver binds
         // it. `Path::components` would normalize an alias such as a doubled
         // separator before the resolver could reject it.
-        let path = normalize_snapshot_entry_path(path)?;
+        let path = normalize_snapshot_entry_path(path, control)?;
         let started = Instant::now();
         let mut last = None;
         for attempt in 0..attempts {
-            let result = match stable_parent_binding(&path) {
+            let result = match stable_parent_binding(&path, control) {
                 Ok(Some((parent, leaf, parent_path))) => attempt_snapshot(
                     &parent,
                     &parent_path,
@@ -188,6 +196,7 @@ impl LedgerReadSnapshot {
                     #[cfg(not(test))]
                     None,
                     attempt,
+                    control,
                 ),
                 // Missing is returned only after two complete nofollow parent
                 // walks observe the same absence.  If a parent appears between
@@ -227,7 +236,12 @@ impl LedgerReadSnapshot {
         attempts: usize,
         hook: SnapshotHook,
     ) -> Result<Self, LedgerSnapshotError> {
-        Self::open_with_attempts(path, attempts, Some(hook))
+        Self::open_with_attempts(
+            path,
+            attempts,
+            Some(hook),
+            &kio_core::control::ControlHandle::default(),
+        )
     }
 
     /// CL59 totals from the private snapshot: settled costs plus active batch
@@ -273,6 +287,7 @@ fn snapshot_query_error(error: crate::PipelineError) -> LedgerSnapshotError {
 
 pub(crate) fn bound_ambient_parent(
     path: &Path,
+    _control: &kio_core::control::ControlHandle,
 ) -> Result<(fs::File, String, PathBuf), LedgerSnapshotError> {
     let leaf = path
         .file_name()
@@ -340,10 +355,11 @@ pub(crate) fn bound_ambient_parent(
 /// between observations makes the operation retry and bind the new parent.
 pub(crate) fn stable_ambient_parent_binding(
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<Option<(fs::File, String, PathBuf)>, AttemptError> {
-    match bound_parent(path) {
+    match bound_parent(path, control) {
         Ok(binding) => Ok(Some(binding)),
-        Err(LedgerSnapshotError::Missing) => match bound_parent(path) {
+        Err(LedgerSnapshotError::Missing) => match bound_parent(path, control) {
             Err(LedgerSnapshotError::Missing) => Ok(None),
             Ok(_) => Err(AttemptError::Unstable(
                 "ledger parent appeared while confirming its absence".into(),
@@ -363,9 +379,11 @@ fn fresh_parent_binding(
     held_parent: &fs::File,
     parent_path: &Path,
     main: &str,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<fs::File, AttemptError> {
     let canonical_path = parent_path.join(main);
-    let (fresh_parent, fresh_main, fresh_parent_path) = match bound_parent(&canonical_path) {
+    let (fresh_parent, fresh_main, fresh_parent_path) = match bound_parent(&canonical_path, control)
+    {
         Ok(binding) => binding,
         Err(LedgerSnapshotError::Missing) => {
             return Err(AttemptError::Unstable(
@@ -573,7 +591,9 @@ fn manifest_is_all_absent(manifest: &Manifest) -> bool {
 /// The ready/release protocol is deliberately capability-bound to an
 /// owner-private test directory: it neither overwrites nor follows an
 /// environment-supplied pathname. Release builds compile this seam out.
-fn maybe_wait_at_test_ledger_absent_recheck() -> Result<(), AttemptError> {
+fn maybe_wait_at_test_ledger_absent_recheck(
+    control: &kio_core::control::ControlHandle,
+) -> Result<(), AttemptError> {
     #[cfg(debug_assertions)]
     let ready_path =
         std::env::var_os("KIO_TEST_LEDGER_SNAPSHOT_ABSENT_BARRIER_READY").map(PathBuf::from);
@@ -583,7 +603,7 @@ fn maybe_wait_at_test_ledger_absent_recheck() -> Result<(), AttemptError> {
         return Ok(());
     };
     let ready_path = normalized_absolute(&ready_path).map_err(parent_binding_error)?;
-    let (parent, ready_name, _) = match bound_parent(&ready_path) {
+    let (parent, ready_name, _) = match bound_parent(&ready_path, control) {
         Ok(binding) => binding,
         // A malformed or missing test-control path must never become the
         // normal Missing/no-ledger outcome.
@@ -745,6 +765,7 @@ fn attempt_snapshot(
     #[cfg(not(test))] _hook: Option<&()>,
     #[cfg(test)] attempt: usize,
     #[cfg(not(test))] _attempt: usize,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<LedgerReadSnapshot, AttemptError> {
     // Do not allocate private storage before the two-pass no-ledger decision:
     // a genuine no-create miss must be independent of TMPDIR availability.
@@ -756,8 +777,8 @@ fn attempt_snapshot(
         hook(SnapshotPhase::AfterInitialManifest, attempt, parent_path);
     }
     if manifest_is_all_absent(&observed) {
-        maybe_wait_at_test_ledger_absent_recheck()?;
-        let fresh_parent = fresh_parent_binding(parent, parent_path, main)?;
+        maybe_wait_at_test_ledger_absent_recheck(control)?;
+        let fresh_parent = fresh_parent_binding(parent, parent_path, main, control)?;
         let confirmed = manifest_recheck(&fresh_parent, parent_path, main)?;
         if manifest_is_all_absent(&confirmed) {
             #[cfg(test)]
@@ -768,7 +789,7 @@ fn attempt_snapshot(
                     parent_path,
                 );
             }
-            let final_parent = fresh_parent_binding(parent, parent_path, main)?;
+            let final_parent = fresh_parent_binding(parent, parent_path, main, control)?;
             #[cfg(test)]
             if let Some(hook) = hook {
                 hook(
@@ -781,6 +802,7 @@ fn attempt_snapshot(
                 &final_parent,
                 parent_path,
                 main,
+                control,
             );
             #[cfg(test)]
             if let Some(hook) = hook {
@@ -835,7 +857,7 @@ fn attempt_snapshot(
     // Preserve the canonical parent binding before consulting lifecycle
     // sidecars by pathname. This keeps a detached/replaced parent from being
     // mistaken for a stable authority validation failure.
-    let lifecycle_parent = fresh_parent_binding(parent, parent_path, main)?;
+    let lifecycle_parent = fresh_parent_binding(parent, parent_path, main, control)?;
     // Bind the copied database to the authority/checkpoint sidecars without
     // reopening the live SQLite source. A missing, partial, or corrupt
     // authority is unsafe/unstable, never the all-absent `Missing` result.
@@ -852,6 +874,7 @@ fn attempt_snapshot(
         parent_path,
         main,
         &conn,
+        control,
     );
     #[cfg(test)]
     if let Some(hook) = hook {
@@ -888,7 +911,7 @@ fn attempt_snapshot(
             storage.path(),
         );
     }
-    let fresh_parent = fresh_parent_binding(parent, parent_path, main)?;
+    let fresh_parent = fresh_parent_binding(parent, parent_path, main, control)?;
     let final_manifest = manifest_recheck(&fresh_parent, parent_path, main)?;
     if initial != final_manifest {
         return Err(if manifest_identity_replaced(&initial, &final_manifest) {
@@ -905,7 +928,7 @@ fn attempt_snapshot(
             parent_path,
         );
     }
-    fresh_parent_binding(parent, parent_path, main)?;
+    fresh_parent_binding(parent, parent_path, main, control)?;
     Ok(LedgerReadSnapshot {
         conn,
         _storage: storage,
@@ -954,7 +977,12 @@ mod tests {
             // Keep both SQLite connections alive through the first real table
             // read, so finishing the bound connection cannot remove sidecars
             // that the returned fixture connection will still need.
-            let session = super::super::lifecycle_fs::FsSession::acquire(path, false).unwrap();
+            let session = super::super::lifecycle_fs::FsSession::acquire_with_control(
+                path,
+                false,
+                kio_core::control::ControlHandle::default(),
+            )
+            .unwrap();
             let bound = session
                 .open_existing_sqlite(OpenFlags::SQLITE_OPEN_READ_WRITE)
                 .unwrap();
@@ -1111,7 +1139,15 @@ mod tests {
              VALUES ('scope-a','markdownize','input-a','profile-a',1,'job-a',2.5,0,'succeeded','2026-08',0)", [],
         ).unwrap();
         let key = TaskKey::new("scope-a", "markdownize", "input-b", "profile-a");
-        phase1_intent(&db, &key, RequestKind::Batch, 1.25, None).unwrap();
+        phase1_intent(
+            &db,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Batch,
+            1.25,
+            None,
+        )
+        .unwrap();
         let before = source_bytes(&path);
         let snapshot = LedgerReadSnapshot::open(&path).unwrap();
         assert_eq!(snapshot.month_total(None, None, "2026-08").unwrap(), 3.75);

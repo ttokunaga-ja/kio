@@ -18,7 +18,11 @@ struct BoundCacheParent {
 /// Bind the immediate cache parent without following it. Ancestors may be
 /// OS-owned symlinks (such as `/var`), so only the direct parent is selected
 /// relative to a canonicalized *outer* directory capability.
-fn bind_cache_parent(path: &Path, create_parent: bool) -> Result<BoundCacheParent> {
+fn bind_cache_parent(
+    path: &Path,
+    create_parent: bool,
+    control: &kio_core::control::ControlHandle,
+) -> Result<BoundCacheParent> {
     let lexical_parent = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path.file_name().ok_or_else(|| {
         crate::IndexError::Schema(format!(
@@ -26,7 +30,8 @@ fn bind_cache_parent(path: &Path, create_parent: bool) -> Result<BoundCacheParen
             path.display()
         ))
     })?;
-    let (parent, resolved_parent) = open_or_create_cache_parent(lexical_parent, create_parent)?;
+    let (parent, resolved_parent) =
+        open_or_create_cache_parent(lexical_parent, create_parent, control)?;
     Ok(BoundCacheParent {
         parent,
         public_path: resolved_parent.join(file_name),
@@ -36,6 +41,7 @@ fn bind_cache_parent(path: &Path, create_parent: bool) -> Result<BoundCacheParen
 fn open_or_create_cache_parent(
     path: &Path,
     create_missing: bool,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<(std::fs::File, std::path::PathBuf)> {
     let mut existing = path;
     while matches!(std::fs::symlink_metadata(existing), Err(ref e) if e.kind() == std::io::ErrorKind::NotFound)
@@ -114,11 +120,12 @@ fn open_or_create_cache_parent(
                 if create_missing
                     && matches!(cap_fs::stat(&handle, Path::new(component), cap_fs::FollowSymlinks::No), Err(e) if e.kind() == std::io::ErrorKind::NotFound) =>
             {
-                let parent = kio_core::store_dir::StoreDirectory::from_retained(
+                let parent = kio_core::store_dir::StoreDirectory::from_retained_with_control(
                     handle.try_clone().map_err(|error| {
                         crate::IndexError::Schema(format!("retain cache parent: {error}"))
                     })?,
                     resolved.clone(),
+                    control.clone(),
                 )
                 .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
                 parent
@@ -159,11 +166,15 @@ pub(crate) fn validate_bound_cache_file(file: &std::fs::File, path: &Path) -> Re
     Ok(())
 }
 
-pub(crate) fn bind_cache(path: &Path, create_missing: bool) -> Result<BoundCache> {
+pub(crate) fn bind_cache(
+    path: &Path,
+    create_missing: bool,
+    control: &kio_core::control::ControlHandle,
+) -> Result<BoundCache> {
     let BoundCacheParent {
         parent: parent_handle,
         public_path: path,
-    } = bind_cache_parent(path, true)?;
+    } = bind_cache_parent(path, true, control)?;
     let leaf = path.file_name().expect("resolved cache has leaf");
     let before_leaf = cap_fs::stat(&parent_handle, Path::new(leaf), cap_fs::FollowSymlinks::No);
     if matches!(&before_leaf, Ok(metadata) if !metadata.is_file()) {
@@ -206,11 +217,14 @@ pub(crate) fn open_bound_cache_connection(
     Ok(Connection::open_with_flags(&cache.public_path, flags)?)
 }
 
-pub(crate) fn recreate_cache(path: &Path) -> Result<BoundCache> {
+pub(crate) fn recreate_cache(
+    path: &Path,
+    control: &kio_core::control::ControlHandle,
+) -> Result<BoundCache> {
     let BoundCacheParent {
         parent: parent_handle,
         public_path: path,
-    } = bind_cache_parent(path, true)?;
+    } = bind_cache_parent(path, true, control)?;
     let leaf = path.file_name().expect("resolved cache has leaf");
     // Cap-relative deletion prevents a swapped public parent from becoming
     // the authority for any part of explicit recreation.

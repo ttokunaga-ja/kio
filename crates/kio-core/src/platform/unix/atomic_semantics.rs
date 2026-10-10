@@ -82,9 +82,9 @@ pub(crate) fn finish_remove_retirement(
                 Path::new(REMOVED),
                 Publication::CreateOnly,
             )?;
-            crate::durability::checkpoint(
-                crate::durability::DurabilityPoint::AtomicRemoveQuarantined,
-            )?;
+            workspace
+                .control()
+                .checkpoint(crate::durability::DurabilityPoint::AtomicRemoveQuarantined)?;
         }
         (None, true) => {}
         (None, false) => {
@@ -105,7 +105,9 @@ pub(crate) fn finish_remove_retirement(
         }
         drop(quarantined);
         remove_if_present(workspace, REMOVED)?;
-        crate::durability::checkpoint(crate::durability::DurabilityPoint::AtomicRemoveDeleted)?;
+        workspace
+            .control()
+            .checkpoint(crate::durability::DurabilityPoint::AtomicRemoveDeleted)?;
         remove_if_present(workspace, REMOVE_READY)?;
         Ok(true)
     }

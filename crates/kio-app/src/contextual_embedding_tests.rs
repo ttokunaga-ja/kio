@@ -3,6 +3,7 @@
 use super::*;
 use crate::commands::{CommandRequest, InitArgs, RepairArgs, RepairOperation, RepairRebuildDbArgs};
 use crate::context::{AppContext, Interaction};
+use kio_core::control::ControlHandle;
 use std::sync::Arc;
 
 const CHILD: &str = "KIO_CONTEXTUAL_EMBEDDING_TEST_CHILD";
@@ -177,7 +178,7 @@ fn assert_scalar_context(repo: &Repository, path: &str) {
 fn assert_selection_order_independent(repo: &Repository, expected_path: &str) {
     let conn = connection(repo);
     let head = repo.head_commit_hash().unwrap().unwrap();
-    let retained = retained_history_instances(repo.kio_dir(), &head).unwrap();
+    let retained = retained_history_instances(repo.kio_dir(), &head, repo.control()).unwrap();
     let config = snapshot_chunking_config_hash(repo, &head).unwrap();
     let policy = current_embedding_policy(repo).unwrap();
     let mut candidates =
@@ -200,7 +201,7 @@ fn assert_selection_order_independent(repo: &Repository, expected_path: &str) {
 fn assert_sqlite_text_is_not_embedding_authority(repo: &Repository) {
     let conn = connection(repo);
     let head = repo.head_commit_hash().unwrap().unwrap();
-    let retained = retained_history_instances(repo.kio_dir(), &head).unwrap();
+    let retained = retained_history_instances(repo.kio_dir(), &head, repo.control()).unwrap();
     let config = snapshot_chunking_config_hash(repo, &head).unwrap();
     let policy = current_embedding_policy(repo).unwrap();
     let collect =
@@ -273,11 +274,11 @@ fn rename_retains_contexts_and_rebuild_selects_allowed_head_then_history() {
     ) {
         return;
     }
-    // execute() installs command-scoped adapter runtime settings itself; the
-    // deterministic adapter is selected directly by its release-capable env
-    // resolver and requires no CLI-only bootstrap.
+    let control = ControlHandle::new(DebugTestControl::from_env());
+    // Direct queries use the child-root selector snapshot; actual execute()
+    // calls capture their own command-root snapshot.
     assert!(matches!(
-        active_embedding_execution(adapter_settings),
+        embedding_execution(adapter_settings, &control),
         Some(EmbeddingExecution::DeterministicEvaluator)
     ));
     let root = private_tempdir();
@@ -292,7 +293,7 @@ fn rename_retains_contexts_and_rebuild_selects_allowed_head_then_history() {
     .unwrap();
     execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
     index(&context);
-    let repo = open_existing_managed_root(root.path()).unwrap();
+    let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let before = projection(&repo);
     assert!(!before.sources.is_empty());
     assert_scalar_context(&repo, OLD_PATH);
@@ -383,6 +384,7 @@ fn batch_resume_repairs_interrupted_replica_publication_without_embedding_work()
     ) {
         return;
     }
+    let control = ControlHandle::new(DebugTestControl::from_env());
     let root = private_tempdir();
     let context = AppContext {
         working_directory: root.path().to_path_buf(),
@@ -395,7 +397,7 @@ fn batch_resume_repairs_interrupted_replica_publication_without_embedding_work()
     .unwrap();
     execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
     index(&context);
-    let repo = open_existing_managed_root(root.path()).unwrap();
+    let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let scope = repo.scope_identity().unwrap().scope_id;
     let expected = projection(&repo);
     assert!(!expected.scalar.is_empty());
@@ -407,7 +409,7 @@ fn batch_resume_repairs_interrupted_replica_publication_without_embedding_work()
             .all(|task| task.status == TaskStatus::Done)
     );
     let replica_vectors = || {
-        Connection::open(aggregator_path())
+        Connection::open(aggregator_path(&control))
             .unwrap()
             .prepare(
                 "SELECT c.chunk_id, e.vector FROM agg_embeddings e
@@ -440,13 +442,13 @@ fn batch_resume_repairs_interrupted_replica_publication_without_embedding_work()
             let _lock = repo.lock_store().unwrap();
             invalidate_embedding_projection(&repo).unwrap();
             assert_eq!(projection(&repo), expected);
-            let replica = Aggregator::open(&aggregator_path()).unwrap();
+            let replica = Aggregator::open(&aggregator_path(&control)).unwrap();
             assert_eq!(
                 replica.scope_header(&scope).unwrap().unwrap().index_status,
                 AggIndexStatus::Rebuilding
             );
         } else {
-            let mut replica = Aggregator::open(&aggregator_path()).unwrap();
+            let mut replica = Aggregator::open(&aggregator_path(&control)).unwrap();
             if state == "missing" {
                 replica.retain_scopes(&BTreeSet::new()).unwrap();
                 assert!(replica.scope_header(&scope).unwrap().is_none());
@@ -502,7 +504,7 @@ fn batch_resume_repairs_interrupted_replica_publication_without_embedding_work()
             "no task retry or recharge: {state}"
         );
         if state == "healthy" {
-            let refreshed_at: i64 = Connection::open(aggregator_path())
+            let refreshed_at: i64 = Connection::open(aggregator_path(&control))
                 .unwrap()
                 .query_row(
                     "SELECT refreshed_at FROM agg_scopes WHERE scope_id = ?1",
@@ -525,6 +527,7 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
     ) {
         return;
     }
+    let control = ControlHandle::new(DebugTestControl::from_env());
     let root = private_tempdir();
     let context = AppContext {
         working_directory: root.path().to_path_buf(),
@@ -555,7 +558,7 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
         .unwrap()
     };
     assert_eq!(index_result()["embedding_tasks_executed"], 6);
-    let repo = open_existing_managed_root(root.path()).unwrap();
+    let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let profile = declared_embedding_profile(EmbeddingExecution::DeterministicEvaluator);
 
     for (revision, rename, executed) in [("Vega", false, 1), ("Rigel", true, 4)] {
@@ -584,7 +587,7 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
         );
 
         let head = repo.head_commit_hash().unwrap().unwrap();
-        let retained = retained_history_instances(repo.kio_dir(), &head).unwrap();
+        let retained = retained_history_instances(repo.kio_dir(), &head, repo.control()).unwrap();
         let config = snapshot_chunking_config_hash(&repo, &head).unwrap();
         let policy = current_embedding_policy(&repo).unwrap();
         let current =
@@ -643,6 +646,7 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
     ) {
         return;
     }
+    let control = ControlHandle::new(DebugTestControl::from_env());
     let root = private_tempdir();
     let context = AppContext {
         working_directory: root.path().to_path_buf(),
@@ -652,9 +656,9 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
     fs::write(root.path().join(CURRENT_PATH), document).unwrap();
     execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
     index(&context);
-    let repo = open_existing_managed_root(root.path()).unwrap();
+    let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let old_head = repo.head_commit_hash().unwrap().unwrap();
-    let retained = retained_history_instances(repo.kio_dir(), &old_head).unwrap();
+    let retained = retained_history_instances(repo.kio_dir(), &old_head, repo.control()).unwrap();
     assert_eq!(retained.len(), 1);
     let instance = &retained[0];
     // Test-only corruption targets the authenticated fixture repo's physical
@@ -721,7 +725,7 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
         .unwrap()
         .unwrap();
     assert_eq!(receipt.tail().kind, EventKind::Retired);
-    assert!(!purge_blocks_rebuild_raw(repo.kio_dir(), &instance.raw_hash).unwrap());
+    assert!(!purge_blocks_rebuild_raw(repo.kio_dir(), &instance.raw_hash, repo.control()).unwrap());
     assert!(
         collect(&retained).unwrap().is_empty(),
         "the validated old owner may be skipped"
@@ -764,7 +768,8 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
         latest_tree.entries[0].normalize,
         Some(instance.normalize.clone())
     );
-    let post_purge_retained = retained_history_instances(repo.kio_dir(), &latest).unwrap();
+    let post_purge_retained =
+        retained_history_instances(repo.kio_dir(), &latest, repo.control()).unwrap();
     assert_eq!(
         collect(&post_purge_retained).unwrap_err().error_code(),
         "KIO-E-STORE-NOT-FOUND-001",
@@ -849,8 +854,9 @@ fn contextual_task_mixed_outcomes_crash_recovery_and_retry_are_independent() {
     ) {
         return;
     }
+    let control = ControlHandle::new(DebugTestControl::from_env());
     let root = private_tempdir();
-    let repo = match initialize_explicit_root(root.path()).unwrap() {
+    let repo = match initialize_explicit_root(root.path(), &control).unwrap() {
         ExplicitRoot::Created(repo) => repo,
         ExplicitRoot::Existing(_) => panic!("expected new fixture"),
     };
@@ -966,7 +972,8 @@ fn contextual_task_mixed_outcomes_crash_recovery_and_retry_are_independent() {
             }
         })
         .unwrap();
-    let retry = filter_embeddable_by_task_state(&store, work[1..].to_vec(), false).unwrap();
+    let retry =
+        filter_embeddable_by_task_state(&store, work[1..].to_vec(), false, &control).unwrap();
     assert_eq!(retry.len(), 1);
     assert_eq!(retry[0].work_key, work[1].work_key);
 
@@ -982,7 +989,7 @@ fn contextual_task_mixed_outcomes_crash_recovery_and_retry_are_independent() {
         .unwrap();
     let before = fs::read(repo.kio_dir().join("tasks.jsonl")).unwrap();
     assert!(validate_embedding_task_bindings(&store, &work).is_err());
-    assert!(filter_embeddable_by_task_state(&store, work.clone(), false).is_err());
+    assert!(filter_embeddable_by_task_state(&store, work.clone(), false, &control).is_err());
     assert!(enqueue_embedding_tasks(&store, &repo, &work, true, now).is_err());
     assert_eq!(
         fs::read(repo.kio_dir().join("tasks.jsonl")).unwrap(),
@@ -1002,12 +1009,13 @@ fn persisted_embedding_consent_requires_the_exact_builtin_identity() {
     ) {
         return;
     }
+    let control = ControlHandle::new(DebugTestControl::from_env());
     assert!(matches!(
-        active_embedding_execution(adapter_settings),
+        embedding_execution(adapter_settings, &control),
         Some(EmbeddingExecution::DeterministicEvaluator)
     ));
     let root = private_tempdir();
-    let repo = match initialize_explicit_root(root.path()).unwrap() {
+    let repo = match initialize_explicit_root(root.path(), &control).unwrap() {
         ExplicitRoot::Created(repo) => repo,
         ExplicitRoot::Existing(_) => panic!("expected new fixture"),
     };

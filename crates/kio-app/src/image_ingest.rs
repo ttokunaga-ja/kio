@@ -12,7 +12,7 @@ use serde_json::json;
 use kio_adapter::types::MAX_EMBEDDING_ITEM_BYTES;
 use kio_core::cas::{ContentObjectKind, is_hash};
 use kio_core::dag::NormalizeRef;
-use kio_core::scope::{Repository, new_ulid, now_utc_seconds};
+use kio_core::scope::{Repository, new_ulid};
 use kio_core::store_dir::StoreDirectory;
 use kio_core::{KioError, Result};
 use kio_pipeline::markdownize::{
@@ -294,7 +294,7 @@ pub(crate) fn ingest_standalone_image(
 
     let scope_id = repo.scope_identity()?.scope_id;
     let unit_key = "image:0".to_owned();
-    let generated_at = now_utc_seconds();
+    let generated_at = repo.control().now_utc_seconds();
     let alt = safe_alt_label(input_path);
     let image_uri = format!("kio://{scope_id}/object/image/{image_hash}");
     let unit = NormalizedUnitObject {
@@ -349,7 +349,11 @@ pub(crate) fn ingest_standalone_image(
         })?
         .try_clone()
         .map_err(|error| KioError::io(error.to_string(), ".kio"))?;
-    let directory = StoreDirectory::from_retained(retained_kio, repo.kio_dir().to_path_buf())?;
+    let directory = StoreDirectory::from_retained_with_control(
+        retained_kio,
+        repo.kio_dir().to_path_buf(),
+        repo.control().clone(),
+    )?;
     let stamped = persist_normalized_instance_bound(&directory, &manifest, &[unit])
         .map_err(|error| KioError::schema(error.to_string()))?;
     let manifest_hash = super::hash_and_write_manifest_object(repo, &stamped)?;

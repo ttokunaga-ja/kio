@@ -5,9 +5,8 @@
 //! reference and verifies that the manifest and every unit form one complete,
 //! immutable identity before the CLI is allowed to bind that identity into HEAD.
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
+use kio_core::control::ControlHandle;
 use std::sync::Arc;
-
-use crate::context::AppContext;
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,7 +17,7 @@ use kio_core::scope::Repository;
 #[cfg(debug_assertions)]
 use kio_core::test_control::PromotionFault;
 use kio_core::{ExitCode, KioError};
-use kio_pipeline::markdownize::{UnitStatus, load_validated_normalized_instance};
+use kio_pipeline::markdownize::{UnitStatus, load_validated_normalized_instance_with_control};
 use kio_pipeline::task::{TaskDescriptor, TaskOutputRef, TaskStatus, validate_task_output_ref};
 use kio_pipeline::{PipelineError, Result as PipelineResult};
 use serde::{Deserialize, Serialize};
@@ -136,8 +135,11 @@ pub(crate) fn clear_promotion_state(kio_dir: &Path) -> kio_core::Result<()> {
     }
 }
 
-pub(crate) fn maybe_inject_promotion_fault(phase: &str) -> kio_core::Result<()> {
-    if promotion_fault_enabled(phase) {
+pub(crate) fn maybe_inject_promotion_fault(
+    phase: &str,
+    control: &ControlHandle,
+) -> kio_core::Result<()> {
+    if promotion_fault_enabled(phase, control) {
         return Err(KioError::new(
             "KIO-E-PROMOTION-FAULT-001",
             "injected promotion publication fault",
@@ -149,23 +151,18 @@ pub(crate) fn maybe_inject_promotion_fault(phase: &str) -> kio_core::Result<()> 
 }
 
 #[cfg(debug_assertions)]
-fn promotion_fault_enabled(phase: &str) -> bool {
+fn promotion_fault_enabled(phase: &str, control: &ControlHandle) -> bool {
     let expected = match phase {
         "before_head" => PromotionFault::BeforeHead,
         "after_head" => PromotionFault::AfterHead,
         "after_index_swap" => PromotionFault::AfterIndexSwap,
         _ => return false,
     };
-    crate::debug_test_control()
-        .expect("command dispatch installs debug test control")
-        .cli
-        .promotion_fault
-        .known()
-        == Some(&expected)
+    control.debug().cli.promotion_fault.known() == Some(&expected)
 }
 
 #[cfg(not(debug_assertions))]
-fn promotion_fault_enabled(_: &str) -> bool {
+fn promotion_fault_enabled(_: &str, _control: &ControlHandle) -> bool {
     false
 }
 
@@ -229,6 +226,7 @@ pub(crate) struct ValidatedOnlinePromotion {
 pub(crate) fn validated_online_promotions(
     kio_dir: &Path,
     tasks: &[TaskDescriptor],
+    control: &ControlHandle,
 ) -> PipelineResult<Vec<ValidatedOnlinePromotion>> {
     let mut promotions = Vec::new();
     for task in tasks {
@@ -252,8 +250,13 @@ pub(crate) fn validated_online_promotions(
                 "completed online Markdownize task has no normalized-instance output",
             ));
         };
-        let instance =
-            load_validated_normalized_instance(kio_dir, &raw_hash, &tool_profile_hash, r#gen)?;
+        let instance = load_validated_normalized_instance_with_control(
+            kio_dir,
+            &raw_hash,
+            &tool_profile_hash,
+            r#gen,
+            control,
+        )?;
         let complete = !instance.manifest.units.is_empty()
             && instance
                 .manifest
@@ -308,7 +311,7 @@ fn plan_online_markdownize_promotion(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
 ) -> kio_core::Result<Option<OnlinePromotionPlan>> {
-    let task_store = TaskStore::new(repo.kio_dir());
+    let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     let tasks = task_store.all().map_err(pipeline_to_kio)?;
     let Some(head_hash) = repo.head_commit_hash()? else {
         return Ok(None);
@@ -360,8 +363,8 @@ fn plan_online_markdownize_promotion(
         ensure_raw_ingest_allowed(repo, &task.input_hash)?;
         current_tasks.push(task);
     }
-    let current =
-        validated_online_promotions(repo.kio_dir(), &current_tasks).map_err(pipeline_to_kio)?;
+    let current = validated_online_promotions(repo.kio_dir(), &current_tasks, repo.control())
+        .map_err(pipeline_to_kio)?;
     if current.is_empty() {
         return Ok(None);
     }
@@ -387,10 +390,11 @@ fn plan_online_markdownize_promotion(
     let resolved_profiles = policies_to_resolve
         .into_iter()
         .filter_map(|bbox_enabled| {
-            resolve_standard_online_markdownize_profile_with_bbox(
+            resolve_standard_online_markdownize_profile_with_bbox_with_control(
                 std::sync::Arc::clone(adapter_settings),
                 &adapter_scope_id,
                 bbox_enabled,
+                repo.control(),
             )
             .ok()
             .map(|profile| (bbox_enabled, profile))
@@ -533,10 +537,11 @@ pub(super) fn apply_online_promotion_to_index(
 /// by a batch pass. The repository primitive changes only matching HEAD bindings;
 /// unrelated deferred working-tree edits are never captured.
 pub(super) fn promote_completed_online_markdownize(
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     repo: &Repository,
 ) -> kio_core::Result<bool> {
+    let adapter_settings = ctx.settings;
+
     let Some(plan) = plan_online_markdownize_promotion(adapter_settings, repo)? else {
         return Ok(false);
     };
@@ -545,7 +550,7 @@ pub(super) fn promote_completed_online_markdownize(
         .ok_or_else(|| KioError::invalid_usage("cannot promote in an unborn scope"))?;
     let staged_tool_lock = promoted_markdown_tool_lock(repo, &plan.active_profile_hash)?;
     let mut state = stage_promotion(repo, &previous_head, staged_tool_lock)?;
-    maybe_inject_promotion_fault("before_head")?;
+    maybe_inject_promotion_fault("before_head", ctx.control)?;
     let outcome = repo.promote_normalize_refs_with_staged_tool_lock(
         Some("online Markdownize promotion"),
         &plan.normalize_by_path,
@@ -571,9 +576,9 @@ pub(super) fn promote_completed_online_markdownize(
     state.target_head = Some(commit_hash.clone());
     persist_promotion_state(repo.kio_dir(), &state)?;
     publish_staged_tool_lock(repo.kio_dir(), &state)?;
-    maybe_inject_promotion_fault("after_head")?;
+    maybe_inject_promotion_fault("after_head", ctx.control)?;
     if let Some(commit_hash) = &outcome.commit_hash {
-        append_event_log(
+        ctx.control.append_event_log(
             "KIO-I-COMMIT-CREATED-001",
             "online Markdownize promotion commit created",
             json!({
@@ -638,17 +643,17 @@ pub(super) fn recover_pending_online_promotion(repo: &Repository) -> kio_core::R
 }
 
 pub(super) fn finish_pending_online_promotion(
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
-    ctx: &AppContext,
+    ctx: &crate::Invocation<'_>,
     repo: &Repository,
 ) -> kio_core::Result<()> {
-    rebuild_step3_index(adapter_settings, ctx, repo)?;
-    maybe_inject_promotion_fault("after_index_swap")?;
+    rebuild_step3_index(ctx, repo)?;
+    maybe_inject_promotion_fault("after_index_swap", ctx.control)?;
     clear_promotion_state(repo.kio_dir())
 }
 
 #[cfg(test)]
 mod tests {
+    use kio_core::control::ControlHandle;
     use std::collections::{BTreeMap, BTreeSet};
 
     use kio_core::scope::Repository;
@@ -739,7 +744,12 @@ mod tests {
         persist_normalized_instance(&kio_dir, &manifest, &[unit]).unwrap();
         let output_ref = normalized_task_output_ref(&raw_hash, &profile_hash, 0);
         let task = done_task(output_ref, raw_hash);
-        let planned = validated_online_promotions(&kio_dir, std::slice::from_ref(&task)).unwrap();
+        let planned = validated_online_promotions(
+            &kio_dir,
+            std::slice::from_ref(&task),
+            &ControlHandle::default(),
+        )
+        .unwrap();
         assert_eq!(planned.len(), 1);
         assert_eq!(planned[0].tool_profile_hash, profile_hash);
         assert!(planned[0].bbox_annotation_enabled);
@@ -747,7 +757,7 @@ mod tests {
         let mut partial = task;
         partial.status = TaskStatus::Partial;
         assert!(
-            validated_online_promotions(&kio_dir, &[partial])
+            validated_online_promotions(&kio_dir, &[partial], &ControlHandle::default())
                 .unwrap()
                 .is_empty()
         );
@@ -799,6 +809,6 @@ mod tests {
         let output_ref = normalized_task_output_ref(&raw_hash, &profile_hash, 0);
         let mut task = done_task(output_ref, raw_hash);
         task.bbox_annotation_enabled = None;
-        assert!(validated_online_promotions(&kio_dir, &[task]).is_err());
+        assert!(validated_online_promotions(&kio_dir, &[task], &ControlHandle::default()).is_err());
     }
 }

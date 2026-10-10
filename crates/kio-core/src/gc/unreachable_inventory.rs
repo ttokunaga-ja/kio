@@ -21,7 +21,7 @@ use crate::purge::{
     CanonicalFinalEvent, EraseReceipt, EventKind, TombstoneRecord, canonical_final_event,
     parse_erase_receipt_bytes, parse_tombstone_bytes, timestamp_is_after, verify_marker_binding,
 };
-use crate::scope::{acquire_bound_store_read_guard, canonical_tool_lock_value, now_utc_seconds};
+use crate::scope::{acquire_bound_store_read_guard_with_control, canonical_tool_lock_value};
 
 const CAS_KINDS: [(&str, &str, u64, bool); 10] = [
     ("commit", "commits", MAX_COMMIT_OBJECT_BYTES, true),
@@ -76,6 +76,7 @@ impl Default for UnreachableInventoryLimits {
 
 #[derive(Debug)]
 pub struct UnreachableObjectInventory {
+    control: crate::control::ControlHandle,
     root: PathBuf,
     scope: std::fs::File,
     kio: std::fs::File,
@@ -397,6 +398,13 @@ impl UnreachableObjectInventory {
     }
 
     pub fn bind(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::bind_with_control(root, crate::control::ControlHandle::default())
+    }
+
+    pub fn bind_with_control(
+        root: impl Into<PathBuf>,
+        control: crate::control::ControlHandle,
+    ) -> Result<Self> {
         let requested = root.into();
         if !requested.is_absolute() {
             return Err(KioError::invalid_usage(
@@ -416,6 +424,7 @@ impl UnreachableObjectInventory {
             return Err(corrupt(".kio changed while binding inventory"));
         }
         Ok(Self {
+            control,
             root,
             scope,
             kio,
@@ -431,9 +440,9 @@ impl UnreachableObjectInventory {
 
     pub fn inventory(&self) -> Result<Value> {
         self.assert_stable()?;
-        let guard = acquire_bound_store_read_guard(&self.kio)?;
+        let guard = acquire_bound_store_read_guard_with_control(&self.kio, &self.control)?;
         guard.recheck_idle()?;
-        let invocation_time = now_utc_seconds();
+        let invocation_time = self.control.now_utc_seconds();
         let first = self.pass(&invocation_time)?;
         guard.recheck_idle()?;
         wait_at_first_pass_test_barrier();
@@ -538,7 +547,7 @@ impl UnreachableObjectInventory {
     }
 
     fn observe_gc_and_purge_barriers(&self, state: &mut ScanState<'_>, phase: &str) -> Result<()> {
-        if let Some(marker) = read_active_marker_bound(&self.kio)? {
+        if let Some(marker) = read_active_marker_bound(&self.kio, &self.control)? {
             return Err(active_sweep_error(&marker));
         }
         let current_gc_barrier = if let Some(gc) = open_optional_dir(&self.kio, "gc")? {

@@ -6,6 +6,7 @@ use std::path::{Component, Path, PathBuf};
 pub(crate) fn try_inherited_parent(
     _path: &Path,
     _allow_create: bool,
+    _control: kio_core::control::ControlHandle,
 ) -> Result<Option<StoreDirectory>> {
     Ok(None)
 }

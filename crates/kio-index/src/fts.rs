@@ -403,6 +403,7 @@ pub fn prepare_bound_gc_index_rotation(
     expected: (&str, &str),
     attestation: &GcIndexRotationAttestation,
     config: &FtsSchemaConfig,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<PreparedBoundGcIndexRotation> {
     validate_gc_temp_leaf(temp_leaf)?;
     let source = read_bound_gc_index_metadata(kio_dir, config)?.ok_or_else(|| {
@@ -439,7 +440,7 @@ pub fn prepare_bound_gc_index_rotation(
         .map_err(|error| IndexError::Schema(format!("create GC private index copy: {error}")))?;
     std::io::copy(&mut input, &mut output)
         .map_err(|error| IndexError::Schema(format!("copy GC private index: {error}")))?;
-    wait_at_bound_gc_index_copy_barrier();
+    wait_at_bound_gc_index_copy_barrier(control);
     output
         .sync_all()
         .map_err(|error| IndexError::Schema(format!("fsync GC private index copy: {error}")))?;
@@ -475,10 +476,8 @@ pub fn prepare_bound_gc_index_rotation(
 }
 
 #[cfg(debug_assertions)]
-fn wait_at_bound_gc_index_copy_barrier() {
-    // This is a mid-operation barrier, not an operation root. Only an
-    // already-installed CLI snapshot may enable it.
-    let control = kio_core::test_control::current_or_default();
+fn wait_at_bound_gc_index_copy_barrier(control: &kio_core::control::ControlHandle) {
+    let control = control.debug();
     let Some(ready_path) = control.core.gc_index_copy_ready.as_deref() else {
         return;
     };
@@ -493,7 +492,7 @@ fn wait_at_bound_gc_index_copy_barrier() {
 }
 
 #[cfg(not(debug_assertions))]
-fn wait_at_bound_gc_index_copy_barrier() {}
+fn wait_at_bound_gc_index_copy_barrier(_control: &kio_core::control::ControlHandle) {}
 
 /// Retire stale private rotation leaves before a new attempt.  Only bounded,
 /// strict private names are considered; every candidate is re-opened
@@ -504,9 +503,21 @@ pub fn cleanup_stale_bound_gc_index_rotations(
     kio_dir: &std::fs::File,
     keep_leaf: Option<&str>,
 ) -> Result<()> {
+    cleanup_stale_bound_gc_index_rotations_with_control(
+        kio_dir,
+        keep_leaf,
+        &kio_core::control::ControlHandle::default(),
+    )
+}
+
+pub fn cleanup_stale_bound_gc_index_rotations_with_control(
+    kio_dir: &std::fs::File,
+    keep_leaf: Option<&str>,
+    control: &kio_core::control::ControlHandle,
+) -> Result<()> {
     const MAX_PRIVATE_GC_INDEX_LEAVES: usize = 32;
     const MAX_PRIVATE_GC_INDEX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-    let private = gc_cleanup_directory(kio_dir)?;
+    let private = gc_cleanup_directory(kio_dir, control)?;
     let mut stale = Vec::new();
     let mut bytes = 0_u64;
     let entries = cap_fs::read_dir(&private, Path::new("."))
@@ -569,7 +580,7 @@ pub fn cleanup_stale_bound_gc_index_rotations(
                 "stale GC index copy changed during cleanup".to_owned(),
             ));
         }
-        remove_stale_gc_index_file(&private, &leaf, &identity)?;
+        remove_stale_gc_index_file(&private, &leaf, &identity, control)?;
     }
     sync_bound_gc_directory(&private, "fsync private GC index stale cleanup")
 }
@@ -933,12 +944,14 @@ pub fn remove_prepared_bound_gc_index(
     temp_leaf: &str,
     expected_private_dir_identity: &str,
     expected_identity: &str,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<PreparedGcIndexCleanup> {
     crate::platform::remove_prepared_bound_gc_index(
         kio_dir,
         temp_leaf,
         expected_private_dir_identity,
         expected_identity,
+        control,
     )
 }
 
@@ -949,6 +962,7 @@ pub fn exchange_prepared_bound_gc_index(
     expected_source_identity: &str,
     expected_source_state_digest: &str,
     expected_target_identity: &str,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<()> {
     crate::platform::exchange_prepared_bound_gc_index(
         kio_dir,
@@ -957,6 +971,7 @@ pub fn exchange_prepared_bound_gc_index(
         expected_source_identity,
         expected_source_state_digest,
         expected_target_identity,
+        control,
     )
 }
 
@@ -2383,6 +2398,32 @@ pub const CHUNK_VEC_DIMENSIONS: usize = 768;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn owner_control_gc_copy_barrier_isolation() {
+        use kio_core::control::ControlHandle;
+        use kio_core::test_control::DebugTestControl;
+        let dir = tempfile::tempdir().unwrap();
+        let outer_ready = dir.path().join("outer-ready");
+        let inner_ready = dir.path().join("inner-ready");
+        std::fs::write(outer_ready.with_extension("release"), b"release").unwrap();
+        std::fs::write(inner_ready.with_extension("release"), b"release").unwrap();
+        let barrier = |path| {
+            let mut debug = DebugTestControl::default();
+            debug.core.gc_index_copy_ready = Some(path);
+            ControlHandle::new(debug)
+        };
+        let outer = barrier(outer_ready.clone());
+        let inner = barrier(inner_ready.clone());
+        wait_at_bound_gc_index_copy_barrier(&ControlHandle::default());
+        assert!(!outer_ready.exists() && !inner_ready.exists());
+        wait_at_bound_gc_index_copy_barrier(&inner);
+        assert!(!outer_ready.exists());
+        assert_eq!(std::fs::read(&inner_ready).unwrap(), b"ready");
+        wait_at_bound_gc_index_copy_barrier(&outer);
+        assert_eq!(std::fs::read(&outer_ready).unwrap(), b"ready");
+    }
 
     fn row(chunk_id: &str, text: &str) -> ChunkRow {
         ChunkRow {

@@ -102,12 +102,15 @@ impl PrivateGrantStore {
 
     /// Open without creating or repairing anything.  `None` means the grant
     /// store directory or its record does not exist.
-    pub fn open_readonly(path: &Path) -> Result<Option<GrantSnapshot>> {
+    pub fn open_readonly(
+        path: &Path,
+        control: &kio_core::control::ControlHandle,
+    ) -> Result<Option<GrantSnapshot>> {
         validate_store_path(path)?;
         let Some(parent) = path.parent() else {
             return Err(invalid("grant store path has no parent"));
         };
-        let Some(directory) = crate::private_state::open_readonly(parent)? else {
+        let Some(directory) = crate::private_state::open_readonly(parent, control)? else {
             return Ok(None);
         };
         if validate_directory_entries(&directory)? == AtomicWorkspaceState::Pending {
@@ -132,7 +135,7 @@ impl PrivateGrantStore {
 
     /// Create/open a private store and hold its retained lock for the caller's
     /// mutation session.  Existing permissions are checked, never repaired.
-    pub fn open_or_create(path: &Path) -> Result<Self> {
+    pub fn open_or_create(path: &Path, control: &kio_core::control::ControlHandle) -> Result<Self> {
         validate_store_path(path)?;
         let parent = path
             .parent()
@@ -141,10 +144,10 @@ impl PrivateGrantStore {
         // permanent lock inside a directory that already contains an unknown
         // sidecar; a known pending atomic workspace is recoverable after the
         // writer lease is held below.
-        if let Some(directory) = crate::private_state::open_readonly(parent)? {
+        if let Some(directory) = crate::private_state::open_readonly(parent, control)? {
             validate_directory_entries(&directory)?;
         }
-        let state = crate::private_state::open_or_create(parent, LOCK_BYTES)?;
+        let state = crate::private_state::open_or_create(parent, LOCK_BYTES, control)?;
         let directory = state.directory();
         if validate_directory_entries(directory)? != AtomicWorkspaceState::Absent {
             directory.recover_atomic(&[directory])?;
@@ -701,8 +704,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let path = root_path.join("nested/grants/grants.json");
-        assert!(PrivateGrantStore::open_readonly(&path).unwrap().is_none());
-        let mut store = PrivateGrantStore::open_or_create(&path).unwrap();
+        assert!(
+            PrivateGrantStore::open_readonly(&path, &kio_core::control::ControlHandle::default())
+                .unwrap()
+                .is_none()
+        );
+        let mut store =
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .unwrap();
         let (pending, _) = store
             .begin_pending_approval(binding(&root_path), false, "2026-09-08T00:00:00Z".into())
             .unwrap();
@@ -710,7 +719,10 @@ mod tests {
             .activate_approval(&pending, None, "2026-09-08T00:01:00Z".into())
             .unwrap();
         drop(store);
-        let active = PrivateGrantStore::open_readonly(&path).unwrap().unwrap();
+        let active =
+            PrivateGrantStore::open_readonly(&path, &kio_core::control::ControlHandle::default())
+                .unwrap()
+                .unwrap();
         assert_eq!(active.records().len(), 1);
         assert_eq!(
             active.records()[0].binding.scope_id,
@@ -724,7 +736,9 @@ mod tests {
             "atomic write workspace remains a validated known sidecar across reopen"
         );
         drop(active);
-        let reopened = PrivateGrantStore::open_or_create(&path).unwrap();
+        let reopened =
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .unwrap();
         assert_eq!(reopened.records().len(), 1);
     }
 
@@ -736,7 +750,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let path = root_path.join("grants/grants.json");
-        let mut store = PrivateGrantStore::open_or_create(&path).unwrap();
+        let mut store =
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .unwrap();
         store
             .begin_pending_approval(binding(&root_path), false, "2026-09-08T00:00:00Z".into())
             .unwrap();
@@ -759,11 +775,16 @@ mod tests {
 
         let grants_before = std::fs::read(&path).unwrap();
         let orphan_before = std::fs::read(&orphan).unwrap();
-        assert!(PrivateGrantStore::open_readonly(&path).is_err());
+        assert!(
+            PrivateGrantStore::open_readonly(&path, &kio_core::control::ControlHandle::default())
+                .is_err()
+        );
         assert_eq!(std::fs::read(&path).unwrap(), grants_before);
         assert_eq!(std::fs::read(&orphan).unwrap(), orphan_before);
 
-        let recovered = PrivateGrantStore::open_or_create(&path).unwrap();
+        let recovered =
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .unwrap();
         assert_eq!(recovered.records().len(), 1);
         drop(recovered);
         assert_eq!(std::fs::read(&path).unwrap(), grants_before);
@@ -772,7 +793,11 @@ mod tests {
             directory.inspect_atomic().unwrap(),
             AtomicWorkspaceState::Clean
         );
-        assert!(PrivateGrantStore::open_readonly(&path).unwrap().is_some());
+        assert!(
+            PrivateGrantStore::open_readonly(&path, &kio_core::control::ControlHandle::default())
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -780,7 +805,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let path = root_path.join("grants/grants.json");
-        let mut store = PrivateGrantStore::open_or_create(&path).unwrap();
+        let mut store =
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .unwrap();
         let (pending, _) = store
             .begin_pending_approval(binding(&root_path), false, "2026-09-08T00:00:00Z".into())
             .unwrap();
@@ -822,7 +849,9 @@ mod tests {
         std::fs::create_dir(&replacement_path).unwrap();
         let replacement_path = replacement_path.canonicalize().unwrap();
         let path = root_path.join("grants/grants.json");
-        let mut store = PrivateGrantStore::open_or_create(&path).unwrap();
+        let mut store =
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .unwrap();
 
         let original_binding = binding(&root_path);
         let original_identity = original_binding.directory_identity.clone();
@@ -903,7 +932,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let path = root_path.join("grants/grants.json");
-        let mut store = PrivateGrantStore::open_or_create(&path).unwrap();
+        let mut store =
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .unwrap();
         let (network, secret) = store
             .begin_pending_approval(binding(&root_path), true, "2026-09-08T00:00:00Z".into())
             .unwrap();
@@ -926,7 +957,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let path = root_path.join("grants/grants.json");
-        let mut store = PrivateGrantStore::open_or_create(&path).unwrap();
+        let mut store =
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .unwrap();
         let payload = "x".repeat(9_000);
         let mut created = 0;
         for index in 0..256 {
@@ -972,7 +1005,13 @@ mod tests {
         std::fs::write(root_path.join("outside.json"), b"{}").unwrap();
         std::os::unix::fs::symlink(root_path.join("outside.json"), directory.join(STORE_LEAF))
             .unwrap();
-        assert!(PrivateGrantStore::open_readonly(&directory.join(STORE_LEAF)).is_err());
+        assert!(
+            PrivateGrantStore::open_readonly(
+                &directory.join(STORE_LEAF),
+                &kio_core::control::ControlHandle::default()
+            )
+            .is_err()
+        );
         assert!(!directory.join(LOCK_LEAF).exists());
     }
 
@@ -986,7 +1025,10 @@ mod tests {
         std::fs::create_dir(&directory).unwrap();
         std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o770)).unwrap();
         let path = directory.join(STORE_LEAF);
-        assert!(PrivateGrantStore::open_or_create(&path).is_err());
+        assert!(
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .is_err()
+        );
         assert!(!path.exists());
     }
 
@@ -995,9 +1037,17 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let root_path = root.path().canonicalize().unwrap();
         let path = root_path.join("grants/grants.json");
-        let first = PrivateGrantStore::open_or_create(&path).unwrap();
-        assert!(PrivateGrantStore::open_or_create(&path).is_err());
+        let first =
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .unwrap();
+        assert!(
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .is_err()
+        );
         drop(first);
-        assert!(PrivateGrantStore::open_or_create(&path).is_ok());
+        assert!(
+            PrivateGrantStore::open_or_create(&path, &kio_core::control::ControlHandle::default())
+                .is_ok()
+        );
     }
 }

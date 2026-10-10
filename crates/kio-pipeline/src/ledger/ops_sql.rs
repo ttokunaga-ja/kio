@@ -26,7 +26,9 @@ use crate::ledger::model::{
     BatchRequestRow, BatchState, CostLedgerRow, Outcome, RequestKind, TaskKey,
 };
 use crate::ledger::schema::with_savepoint;
-use crate::ledger::time::{now_millis, utc_month_of};
+#[cfg(test)]
+use crate::ledger::time::now_millis;
+use crate::ledger::time::utc_month_of;
 use crate::{PipelineError, Result};
 
 // ---------------------------------------------------------------------------
@@ -405,6 +407,7 @@ pub struct Phase1Outcome {
 /// recovery-deadline mechanism covers them instead).
 pub(crate) fn phase1_intent(
     conn: &Connection,
+    control: &kio_core::control::ControlHandle,
     key: &TaskKey,
     request_kind: RequestKind,
     estimated_usd: f64,
@@ -436,7 +439,7 @@ pub(crate) fn phase1_intent(
              online submissions (10-operations.md §7.5.2)",
         ));
     }
-    let now = now_millis();
+    let now = control.now_millis();
     let existing_seq = get_batch_request(conn, key)?.map_or(0, |row| row.submission_seq);
     let submission_seq = next_submission_seq(conn, key, existing_seq)?;
     let intent_token = new_intent_token();
@@ -708,10 +711,11 @@ pub fn phase2b_scope_matches(row: &BatchRequestRow, current_provider_scope_id: &
 /// exists to close).
 pub(crate) fn phase2b_record_job_create_started(
     conn: &Connection,
+    control: &kio_core::control::ControlHandle,
     key: &TaskKey,
     intent_token: &str,
 ) -> Result<bool> {
-    let now = now_millis();
+    let now = control.now_millis();
     cas_update_one(
         conn,
         "UPDATE batch_requests SET job_create_started_at = ?1
@@ -1027,6 +1031,7 @@ pub struct TerminalReceipt {
 /// `completed_at`, all in one savepoint (04 §5.8 相 3 / §5.4 sync 終端).
 pub(crate) fn terminal_transaction(
     conn: &Connection,
+    control: &kio_core::control::ControlHandle,
     write: &TerminalWrite<'_>,
 ) -> Result<TerminalReceipt> {
     let receipt = with_savepoint(conn, "kio_ledger_terminal", || {
@@ -1084,7 +1089,7 @@ pub(crate) fn terminal_transaction(
             )?;
         }
 
-        let now = now_millis();
+        let now = control.now_millis();
         let month = utc_month_of(now);
         let inserted = conn
             .execute(
@@ -1413,6 +1418,7 @@ pub fn visibility_grace_period_elapsed(
 /// generation under the OLD token).
 pub(crate) fn recovery_settle_unknown(
     conn: &Connection,
+    control: &kio_core::control::ControlHandle,
     key: &TaskKey,
     intent_token: &str,
     estimated_usd: f64,
@@ -1420,6 +1426,7 @@ pub(crate) fn recovery_settle_unknown(
 ) -> Result<TerminalReceipt> {
     terminal_transaction(
         conn,
+        control,
         &TerminalWrite {
             key,
             outcome: Outcome::UnknownSettled,
@@ -1524,13 +1531,14 @@ pub enum ClaimOutcome {
 /// cleanup guard.
 pub(crate) fn device_claim(
     conn: &Connection,
+    control: &kio_core::control::ControlHandle,
     key: &TaskKey,
     estimated_usd: f64,
     effective_timeout_seconds: i64,
     device_cap: f64,
     device_per_adapter_cap: Option<f64>,
 ) -> Result<ClaimOutcome> {
-    let now = now_millis();
+    let now = control.now_millis();
     if let Some(existing) = get_batch_request(conn, key)?
         && existing.state.is_inflight()
     {
@@ -1541,7 +1549,7 @@ pub(crate) fn device_claim(
             return Ok(ClaimOutcome::InFlight);
         }
         if let Some(token) = existing.intent_token.clone() {
-            recovery_settle_unknown(conn, key, &token, existing.estimated_usd, true)?;
+            recovery_settle_unknown(conn, control, key, &token, existing.estimated_usd, true)?;
         }
     }
     // R23-02: `estimated_usd == 0.0` (a zero-priced local adapter) is exempt
@@ -1564,6 +1572,7 @@ pub(crate) fn device_claim(
     }
     let outcome = phase1_intent(
         conn,
+        control,
         key,
         RequestKind::Sync,
         estimated_usd,
@@ -1593,12 +1602,13 @@ pub enum ExtendOutcome {
 /// legitimately waiting out its Retry-After).
 pub(crate) fn device_extend_stale_after(
     conn: &Connection,
+    control: &kio_core::control::ControlHandle,
     key: &TaskKey,
     intent_token: &str,
     retry_after_seconds: f64,
     effective_timeout_seconds: i64,
 ) -> Result<ExtendOutcome> {
-    let now = now_millis();
+    let now = control.now_millis();
     let safe_retry_after = if retry_after_seconds.is_finite() && retry_after_seconds >= 0.0 {
         retry_after_seconds.ceil() as i64
     } else {
@@ -1815,6 +1825,7 @@ pub struct SweepReport {
 /// concurrent writer). All in one savepoint.
 pub(crate) fn execute_bounded_sweep(
     conn: &Connection,
+    control: &kio_core::control::ControlHandle,
     plan: &SweepPlan,
     now_ms: i64,
 ) -> Result<SweepReport> {
@@ -1824,7 +1835,7 @@ pub(crate) fn execute_bounded_sweep(
             if let Some(row) = get_batch_request(conn, key)?
                 && let Some(token) = row.intent_token.clone()
             {
-                recovery_settle_unknown(conn, key, &token, row.estimated_usd, true)?;
+                recovery_settle_unknown(conn, control, key, &token, row.estimated_usd, true)?;
                 settled.push(key.clone());
             }
         }
@@ -1915,6 +1926,7 @@ pub enum CapCheckResult {
 /// SAME outer transaction so the check and reservation cannot race.
 pub(crate) fn check_then_reserve(
     conn: &Connection,
+    control: &kio_core::control::ControlHandle,
     key: &TaskKey,
     candidate_usd: f64,
     caps: &BudgetCapConfig,
@@ -1922,10 +1934,17 @@ pub(crate) fn check_then_reserve(
     sync_effective_timeout_seconds: Option<i64>,
 ) -> Result<CapCheckResult> {
     if candidate_usd == 0.0 {
-        let outcome = phase1_intent(conn, key, request_kind, 0.0, sync_effective_timeout_seconds)?;
+        let outcome = phase1_intent(
+            conn,
+            control,
+            key,
+            request_kind,
+            0.0,
+            sync_effective_timeout_seconds,
+        )?;
         return Ok(CapCheckResult::ExemptZeroCost(outcome));
     }
-    let month = utc_month_of(now_millis());
+    let month = utc_month_of(control.now_millis());
     let device_total = ledger_month_total(conn, None, None, &month)?;
     if device_total + candidate_usd >= caps.device_cap {
         return Ok(CapCheckResult::Denied(CapLayer::Device));
@@ -1944,6 +1963,7 @@ pub(crate) fn check_then_reserve(
     }
     let outcome = phase1_intent(
         conn,
+        control,
         key,
         request_kind,
         candidate_usd,
@@ -2075,7 +2095,11 @@ pub enum AbandonExecution {
 /// still be outstanding for a successful row; when it is, only that cleanup
 /// proceeds — the same immediate-vs-deferred split note-5 (above) describes
 /// for the non-Completed path — never a re-charge.
-pub(crate) fn execute_abandon(conn: &Connection, key: &TaskKey) -> Result<AbandonExecution> {
+pub(crate) fn execute_abandon(
+    conn: &Connection,
+    control: &kio_core::control::ControlHandle,
+    key: &TaskKey,
+) -> Result<AbandonExecution> {
     let outcome = with_savepoint(conn, "kio_ledger_abandon", || {
         let Some(row) = get_batch_request(conn, key)? else {
             return Ok(AbandonExecution::NoTarget);
@@ -2104,6 +2128,7 @@ pub(crate) fn execute_abandon(conn: &Connection, key: &TaskKey) -> Result<Abando
         let cleanup_already_complete = row.provider_scope_id.is_none();
         terminal_transaction(
             conn,
+            control,
             &TerminalWrite {
                 key,
                 outcome: Outcome::Abandoned,
@@ -2866,7 +2891,15 @@ mod tests {
                 "hash-a",
                 "profile-a",
             );
-            phase1_intent(conn, &key, RequestKind::Batch, 1.0, None).unwrap();
+            phase1_intent(
+                conn,
+                &kio_core::control::ControlHandle::default(),
+                &key,
+                RequestKind::Batch,
+                1.0,
+                None,
+            )
+            .unwrap();
             conn.execute_batch(&format!(
                 "UPDATE batch_requests SET {column} = {value} WHERE scope_id = 'scope-{suffix}'"
             ))
@@ -2882,7 +2915,15 @@ mod tests {
         let (_dir, raw_conn) = open_temp_ledger_for_gate_tests();
         let conn = &raw_conn;
         let key = TaskKey::new("cleanup-scope", "embedding", "input", "profile");
-        let phase1 = phase1_intent(conn, &key, RequestKind::Batch, 1.25, None).unwrap();
+        let phase1 = phase1_intent(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Batch,
+            1.25,
+            None,
+        )
+        .unwrap();
         let token = phase1.intent_token;
 
         // State=0 (intent recorded) must retain its only recovery selector.
@@ -2910,7 +2951,15 @@ mod tests {
 
         // A terminal row with residue may clear once, without reseating or
         // adding a cost row; repeat cleanup is idempotent.
-        recovery_settle_unknown(conn, &key, &token, 1.25, false).unwrap();
+        recovery_settle_unknown(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            &token,
+            1.25,
+            false,
+        )
+        .unwrap();
         let charges_before: i64 = conn
             .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row.get(0))
             .unwrap();
@@ -2969,7 +3018,14 @@ mod tests {
         )
         .unwrap();
         let key = TaskKey::new("scope-a", "markdownize", "hash-a", "profile-a");
-        let err = match phase1_intent(conn, &key, RequestKind::Batch, 1.0, None) {
+        let err = match phase1_intent(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Batch,
+            1.0,
+            None,
+        ) {
             Ok(outcome) => panic!("expected the restore gate to refuse, got {outcome:?}"),
             Err(err) => err,
         };
@@ -2997,7 +3053,15 @@ mod tests {
         )
         .unwrap();
         let key = TaskKey::new(TaskKey::DEVICE_SCOPE_ID, "embedding", "hash-a", "profile-a");
-        let err = match device_claim(conn, &key, 1.0, 300, 1_000_000.0, None) {
+        let err = match device_claim(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            1.0,
+            300,
+            1_000_000.0,
+            None,
+        ) {
             Ok(outcome) => panic!("expected the restore gate to refuse, got {outcome:?}"),
             Err(err) => err,
         };
@@ -3026,7 +3090,15 @@ mod tests {
         let (_dir, raw_conn) = open_temp_ledger_for_gate_tests();
         let conn = &raw_conn;
         let key = TaskKey::new("scope-a", "markdownize", "hash-a", "profile-a");
-        let outcome = phase1_intent(conn, &key, RequestKind::Batch, 1.0, None).unwrap();
+        let outcome = phase1_intent(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Batch,
+            1.0,
+            None,
+        )
+        .unwrap();
 
         crate::ledger::schema::record_marker(
             conn,
@@ -3041,7 +3113,14 @@ mod tests {
         );
         assert!(existing.state.is_inflight());
 
-        let err = match phase1_intent(conn, &key, RequestKind::Batch, 1.0, None) {
+        let err = match phase1_intent(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Batch,
+            1.0,
+            None,
+        ) {
             Ok(_) => panic!("a fresh phase1_intent call for this key must still be refused"),
             Err(err) => err,
         };
@@ -3056,8 +3135,24 @@ mod tests {
         let (_dir, raw_conn) = open_temp_ledger_for_gate_tests();
         let conn = &raw_conn;
         let key = TaskKey::new("scope-a", "markdownize", "hash-a", "profile-a");
-        let first = phase1_intent(conn, &key, RequestKind::Sync, 1.25, Some(300)).unwrap();
-        recovery_settle_unknown(conn, &key, &first.intent_token, 1.25, true).unwrap();
+        let first = phase1_intent(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Sync,
+            1.25,
+            Some(300),
+        )
+        .unwrap();
+        recovery_settle_unknown(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            &first.intent_token,
+            1.25,
+            true,
+        )
+        .unwrap();
 
         let settled = get_batch_request(conn, &key).unwrap().unwrap();
         assert_eq!(settled.state, BatchState::Terminal);
@@ -3069,14 +3164,28 @@ mod tests {
         assert_eq!(charges_before[0].usd, 1.25);
         assert!(charges_before[0].estimated);
 
-        let denied = phase1_intent(conn, &key, RequestKind::Sync, 1.25, Some(300))
-            .expect_err("unknown settlement must fail closed before authorization");
+        let denied = phase1_intent(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Sync,
+            1.25,
+            Some(300),
+        )
+        .expect_err("unknown settlement must fail closed before authorization");
         assert!(
             denied.to_string().contains("KIO-E-SYNC-RESULT-UNKNOWN-001"),
             "got {denied}"
         );
-        let cross_lane_denied = phase1_intent(conn, &key, RequestKind::Batch, 1.25, None)
-            .expect_err("switching to batch must not evade unknown-result authorization");
+        let cross_lane_denied = phase1_intent(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Batch,
+            1.25,
+            None,
+        )
+        .expect_err("switching to batch must not evade unknown-result authorization");
         assert!(
             cross_lane_denied
                 .to_string()
@@ -3106,7 +3215,15 @@ mod tests {
             charges_before
         );
 
-        let retry = phase1_intent(conn, &key, RequestKind::Batch, 1.25, None).unwrap();
+        let retry = phase1_intent(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Batch,
+            1.25,
+            None,
+        )
+        .unwrap();
         let fresh = get_batch_request(conn, &key).unwrap().unwrap();
         assert!(fresh.state.is_inflight());
         assert_eq!(fresh.request_kind, RequestKind::Batch);
@@ -3141,7 +3258,15 @@ mod tests {
         );
 
         let key = TaskKey::new("scope-a", "markdownize", "hash-a", "profile-a");
-        let phase1 = phase1_intent(conn, &key, RequestKind::Sync, 1.25, Some(300)).unwrap();
+        let phase1 = phase1_intent(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Sync,
+            1.25,
+            Some(300),
+        )
+        .unwrap();
         let inflight_err = authorize_unknown_sync_resend(conn, &key)
             .expect_err("an in-flight attempt must be recovered, not authorized for resend");
         assert!(
@@ -3167,8 +3292,24 @@ mod tests {
         let (_dir, raw_conn) = open_temp_ledger_for_gate_tests();
         let conn = &raw_conn;
         let key = TaskKey::new("scope-a", "markdownize", "hash-a", "profile-a");
-        let phase1 = phase1_intent(conn, &key, RequestKind::Sync, 1.25, Some(300)).unwrap();
-        recovery_settle_unknown(conn, &key, &phase1.intent_token, 1.25, true).unwrap();
+        let phase1 = phase1_intent(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Sync,
+            1.25,
+            Some(300),
+        )
+        .unwrap();
+        recovery_settle_unknown(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            &phase1.intent_token,
+            1.25,
+            true,
+        )
+        .unwrap();
         conn.execute(
             "UPDATE batch_requests SET completed_at = 0
              WHERE scope_id = ?1 AND adapter_kind = ?2 AND input_hash = ?3 AND tool_profile_hash = ?4",
@@ -3183,6 +3324,7 @@ mod tests {
 
         let report = execute_bounded_sweep(
             conn,
+            &kio_core::control::ControlHandle::default(),
             &SweepPlan {
                 own_key_stale: Vec::new(),
                 general_stale: Vec::new(),
@@ -3195,8 +3337,15 @@ mod tests {
         let row = get_batch_request(conn, &key).unwrap().unwrap();
         assert_eq!(row.error.as_deref(), Some("unknown_settled"));
         assert!(row.intent_token.is_none());
-        let err = phase1_intent(conn, &key, RequestKind::Batch, 1.25, None)
-            .expect_err("the preserved authority marker must still block lane switching");
+        let err = phase1_intent(
+            conn,
+            &kio_core::control::ControlHandle::default(),
+            &key,
+            RequestKind::Batch,
+            1.25,
+            None,
+        )
+        .expect_err("the preserved authority marker must still block lane switching");
         assert!(
             err.to_string().contains("KIO-E-SYNC-RESULT-UNKNOWN-001"),
             "got {err}"

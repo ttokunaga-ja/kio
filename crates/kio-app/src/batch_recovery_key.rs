@@ -11,8 +11,9 @@ const KEY_BYTES: u64 = 32;
 pub(crate) fn load_or_create(
     parent_path: &Path,
     pending_bound_authority: bool,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<BatchRecoveryContext> {
-    let parent = crate::private_state::ensure_private_directory(parent_path)?;
+    let parent = crate::private_state::ensure_private_directory(parent_path, control)?;
     load_or_create_at(&parent, pending_bound_authority)
 }
 
@@ -73,7 +74,11 @@ mod tests {
     #[test]
     fn private_key_is_reused_and_malformed_key_is_never_replaced() {
         let root = private_tempdir();
-        let parent = crate::private_state::ensure_private_directory(root.path()).unwrap();
+        let parent = crate::private_state::ensure_private_directory(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         load_or_create_at(&parent, false).unwrap();
         let original = fs::read(root.path().join(KEY_LEAF)).unwrap();
         assert_eq!(original.len(), 32);
@@ -101,7 +106,11 @@ mod tests {
     #[test]
     fn missing_key_with_pending_authority_is_not_recreated() {
         let root = private_tempdir();
-        let parent = crate::private_state::ensure_private_directory(root.path()).unwrap();
+        let parent = crate::private_state::ensure_private_directory(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         assert!(load_or_create_at(&parent, true).is_err());
         assert!(!parent.contains_entry(Path::new(KEY_LEAF)).unwrap());
     }
@@ -113,7 +122,11 @@ mod tests {
         let target = root.path().join("victim");
         fs::write(&target, [8u8; 32]).unwrap();
         std::os::unix::fs::symlink(&target, root.path().join(KEY_LEAF)).unwrap();
-        let parent = crate::private_state::ensure_private_directory(root.path()).unwrap();
+        let parent = crate::private_state::ensure_private_directory(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         assert!(load_or_create_at(&parent, false).is_err());
         assert_eq!(fs::read(target).unwrap(), [8u8; 32]);
     }

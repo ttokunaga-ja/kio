@@ -395,7 +395,10 @@ pub(crate) fn open_gc_source_copy(index: &std::fs::File) -> Result<std::fs::File
     Ok(input)
 }
 
-pub(crate) fn gc_cleanup_directory(kio_dir: &std::fs::File) -> Result<std::fs::File> {
+pub(crate) fn gc_cleanup_directory(
+    kio_dir: &std::fs::File,
+    _control: &kio_core::control::ControlHandle,
+) -> Result<std::fs::File> {
     crate::fts::open_gc_internal_index_dir(kio_dir)
 }
 
@@ -403,6 +406,7 @@ pub(crate) fn remove_stale_gc_index_file(
     private: &std::fs::File,
     leaf: &str,
     _identity: &str,
+    _control: &kio_core::control::ControlHandle,
 ) -> Result<()> {
     cap_fs::remove_file(private, Path::new(leaf))
         .map_err(|error| IndexError::Schema(format!("remove stale GC index copy: {error}")))

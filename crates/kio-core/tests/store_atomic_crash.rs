@@ -10,7 +10,7 @@ use std::{
 
 use kio_core::{
     store_dir::{AtomicWorkspaceState, Publication, StoreDirectory},
-    test_control::{DebugTestControl, install_scoped},
+    test_control::DebugTestControl,
 };
 use tempfile::TempDir;
 
@@ -148,7 +148,9 @@ fn atomic_crash_child() {
         fs::set_permissions(root.join("target/leaf"), fs::Permissions::from_mode(0o644))
             .expect("ordinary working mode");
     }
-    let _test_control = install_scoped(DebugTestControl::from_env());
+    let owner = owner.rebind_with_control(kio_core::control::ControlHandle::new(
+        DebugTestControl::from_env(),
+    ));
     match mode.as_str() {
         "write" => {
             target

@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
+use kio_core::control::ControlHandle;
 use kio_core::management::{ManagementAuthority, read_record};
 use kio_core::store_dir::{Publication, StoreDirectory};
 use kio_core::{ExitCode, KioError, Result};
@@ -80,27 +81,37 @@ pub(crate) fn run(
     ctx: &AppContext,
     root_argument: Option<PathBuf>,
     command: WatchServiceCommand,
+    control: &ControlHandle,
 ) -> Result<Value> {
     match command {
         WatchServiceCommand::Install {
             reconcile_interval_seconds,
-        } => install(ctx, root_argument, reconcile_interval_seconds),
-        WatchServiceCommand::Start => mutate_existing(ctx, root_argument, Lifecycle::Start),
-        WatchServiceCommand::Stop => mutate_existing(ctx, root_argument, Lifecycle::Stop),
-        WatchServiceCommand::Status => status(ctx, root_argument),
-        WatchServiceCommand::Uninstall => mutate_existing(ctx, root_argument, Lifecycle::Uninstall),
-        WatchServiceCommand::Runner { manifest } => run_watch_service_runner(manifest),
+        } => install(ctx, root_argument, reconcile_interval_seconds, control),
+        WatchServiceCommand::Start => {
+            mutate_existing(ctx, root_argument, Lifecycle::Start, control)
+        }
+        WatchServiceCommand::Stop => mutate_existing(ctx, root_argument, Lifecycle::Stop, control),
+        WatchServiceCommand::Status => status(ctx, root_argument, control),
+        WatchServiceCommand::Uninstall => {
+            mutate_existing(ctx, root_argument, Lifecycle::Uninstall, control)
+        }
+        WatchServiceCommand::Runner { manifest } => run_watch_service_runner(manifest, control),
     }
 }
 
-fn install(ctx: &AppContext, root_argument: Option<PathBuf>, interval: u64) -> Result<Value> {
+fn install(
+    ctx: &AppContext,
+    root_argument: Option<PathBuf>,
+    interval: u64,
+    control: &ControlHandle,
+) -> Result<Value> {
     if !(1..=86_400).contains(&interval) {
         return Err(invalid(
             "reconciliation interval must be 1 through 86400 seconds",
         ));
     }
     let root = resolve_root(ctx, root_argument, true)?;
-    let repo = open_existing_managed_root(&root)?;
+    let repo = open_existing_managed_root(&root, control)?;
     let binding = binding_for_repo(&repo)?;
     let record = read_record(&binding)?;
     if record.authority != ManagementAuthority::Root {
@@ -133,9 +144,9 @@ fn install(ctx: &AppContext, root_argument: Option<PathBuf>, interval: u64) -> R
         environment,
         phase: ServicePhase::Installing,
     };
-    let _native_location = NativeDefinitionLocation::admit(&manifest.native_path)?;
-    let store =
-        manifest_store(true)?.ok_or_else(|| service_error("device manifest store unavailable"))?;
+    let _native_location = NativeDefinitionLocation::admit(&manifest.native_path, control)?;
+    let store = manifest_store(true, control)?
+        .ok_or_else(|| service_error("device manifest store unavailable"))?;
     let leaf = manifest_leaf(&manifest.id)?;
     let _mutation_lock = acquire_mutation_lock(&store, &manifest.id)?;
     if let Some(bytes) = store.read_optional(&leaf, MAX_MANIFEST_BYTES)? {
@@ -151,9 +162,9 @@ fn install(ctx: &AppContext, root_argument: Option<PathBuf>, interval: u64) -> R
                 "watch service is already recorded with a different executable or environment; inspect or uninstall it first",
             ));
         }
-        return recover_install(&store, &leaf, existing, &NativeScheduler);
+        return recover_install(&store, &leaf, existing, &NativeScheduler(control.clone()));
     }
-    let scheduler = NativeScheduler;
+    let scheduler = NativeScheduler(control.clone());
     match scheduler.inspect(&manifest)? {
         NativeRegistration::Absent => {}
         NativeRegistration::Owned => {
@@ -228,9 +239,10 @@ fn mutate_existing(
     ctx: &AppContext,
     root_argument: Option<PathBuf>,
     lifecycle: Lifecycle,
+    control: &ControlHandle,
 ) -> Result<Value> {
-    let (store, leaf, manifest) = find_manifest(ctx, root_argument)?;
-    let _native_location = NativeDefinitionLocation::admit(&manifest.native_path)?;
+    let (store, leaf, manifest) = find_manifest(ctx, root_argument, control)?;
+    let _native_location = NativeDefinitionLocation::admit(&manifest.native_path, control)?;
     let _mutation_lock = acquire_mutation_lock(&store, &manifest.id)?;
     // Re-read only after the retained OS lock is held.  A lifecycle operation
     // must never act on a manifest that a concurrent uninstall has replaced.
@@ -241,7 +253,7 @@ fn mutate_existing(
         })?;
     let manifest: ServiceManifest = serde_json::from_slice(&bytes).map_err(service_error)?;
     validate_manifest(&manifest)?;
-    let scheduler = NativeScheduler;
+    let scheduler = NativeScheduler(control.clone());
     let registration = scheduler.inspect(&manifest)?;
     if registration == NativeRegistration::Foreign {
         return Err(service_error(
@@ -255,35 +267,23 @@ fn mutate_existing(
                     "watch root no longer exists; refusing to start service",
                 ));
             }
-            transition_checked(
-                &scheduler,
-                &manifest,
-                lifecycle,
-                registration,
-                crate::watch_command::inspect_liveness,
-            )?;
+            transition_checked(&scheduler, &manifest, lifecycle, registration, |root| {
+                crate::watch_command::inspect_liveness(root, control)
+            })?;
             Ok(json!({"status":"start_requested", "service_id":manifest.id, "root":manifest.root}))
         }
         Lifecycle::Stop => {
             // Disable scheduler restart before asking the foreground instance to
             // stop; otherwise a failed process may be restarted during shutdown.
-            transition_checked(
-                &scheduler,
-                &manifest,
-                lifecycle,
-                registration,
-                crate::watch_command::inspect_liveness,
-            )?;
+            transition_checked(&scheduler, &manifest, lifecycle, registration, |root| {
+                crate::watch_command::inspect_liveness(root, control)
+            })?;
             Ok(json!({"status":"stopped", "service_id":manifest.id, "root":manifest.root}))
         }
         Lifecycle::Uninstall => {
-            transition_checked(
-                &scheduler,
-                &manifest,
-                lifecycle,
-                registration,
-                crate::watch_command::inspect_liveness,
-            )?;
+            transition_checked(&scheduler, &manifest, lifecycle, registration, |root| {
+                crate::watch_command::inspect_liveness(root, control)
+            })?;
             let bytes = serde_json::to_vec(&manifest).map_err(service_error)?;
             store.quarantine_then_remove(&leaf, &bytes, MAX_MANIFEST_BYTES)?;
             Ok(json!({"status":"uninstalled", "service_id":manifest.id, "root":manifest.root}))
@@ -327,9 +327,13 @@ fn transition_checked<S: Scheduler>(
     }
 }
 
-fn status(ctx: &AppContext, root_argument: Option<PathBuf>) -> Result<Value> {
-    let (_, _, manifest) = find_manifest(ctx, root_argument)?;
-    let scheduler = NativeScheduler;
+fn status(
+    ctx: &AppContext,
+    root_argument: Option<PathBuf>,
+    control: &ControlHandle,
+) -> Result<Value> {
+    let (_, _, manifest) = find_manifest(ctx, root_argument, control)?;
+    let scheduler = NativeScheduler(control.clone());
     let registration = scheduler.inspect(&manifest)?;
     if registration == NativeRegistration::Foreign {
         return Err(service_error(
@@ -339,7 +343,7 @@ fn status(ctx: &AppContext, root_argument: Option<PathBuf>) -> Result<Value> {
     let native_state = scheduler.state(&manifest, registration)?;
     // The device-private watcher lock is still authoritative even if a user
     // removed the root after installing the service.
-    let liveness = crate::watch_command::inspect_liveness(&manifest.root)?;
+    let liveness = crate::watch_command::inspect_liveness(&manifest.root, control)?;
     Ok(json!({
         "status":"service",
         "service_id":manifest.id,
@@ -353,9 +357,10 @@ fn status(ctx: &AppContext, root_argument: Option<PathBuf>) -> Result<Value> {
 fn find_manifest(
     ctx: &AppContext,
     root_argument: Option<PathBuf>,
+    control: &ControlHandle,
 ) -> Result<(StoreDirectory, PathBuf, ServiceManifest)> {
     let requested = resolve_root(ctx, root_argument, false)?;
-    let store = manifest_store(false)?
+    let store = manifest_store(false, control)?
         .ok_or_else(|| service_error("no watch service is installed for this root"))?;
     let Some(entries) = store.entries_optional(Path::new(MANIFEST_DIRECTORY))? else {
         return Err(service_error("no watch service is installed for this root"));
@@ -441,8 +446,9 @@ fn lexical_absolute(path: &Path) -> Result<PathBuf> {
     Ok(clean)
 }
 
-fn manifest_store(create: bool) -> Result<Option<StoreDirectory>> {
-    let registry = kio_index::registry::default_registry_path().map_err(crate::index_to_kio)?;
+fn manifest_store(create: bool, control: &ControlHandle) -> Result<Option<StoreDirectory>> {
+    let registry = kio_index::registry::default_registry_path_with_control(control)
+        .map_err(crate::index_to_kio)?;
     let Some(data) = registry.parent() else {
         return Err(service_error("device data directory is unavailable"));
     };
@@ -452,7 +458,7 @@ fn manifest_store(create: bool) -> Result<Option<StoreDirectory>> {
         }
         fs::create_dir_all(data).map_err(service_error)?;
     }
-    let store = StoreDirectory::open(data)?;
+    let store = StoreDirectory::open_with_control(data, control.clone())?;
     if create {
         store.create_directory_all(Path::new(MANIFEST_DIRECTORY))?;
     }
@@ -696,7 +702,7 @@ struct NativeDefinitionLocation {
 }
 
 impl NativeDefinitionLocation {
-    fn admit(path: &Path) -> Result<Self> {
+    fn admit(path: &Path, control: &ControlHandle) -> Result<Self> {
         if !path.is_absolute()
             || path
                 .components()
@@ -727,7 +733,8 @@ impl NativeDefinitionLocation {
                 Err(error) => return Err(service_error(error)),
             }
         }
-        let directory = kio_core::private_fs::verify_private_creation_parent(parent)?;
+        let directory =
+            kio_core::private_fs::verify_private_creation_parent_with_control(parent, control)?;
         missing.reverse();
         Ok(Self {
             directory,
@@ -737,7 +744,10 @@ impl NativeDefinitionLocation {
     }
 
     fn revalidate(&self) -> Result<()> {
-        let current = kio_core::private_fs::verify_private_creation_parent(self.directory.path())?;
+        let current = kio_core::private_fs::verify_private_creation_parent_with_control(
+            self.directory.path(),
+            self.directory.control(),
+        )?;
         if kio_core::management::directory_identity_from_handle(&current.root_handle())?
             != kio_core::management::directory_identity_from_handle(&self.directory.root_handle())?
         {
@@ -752,8 +762,11 @@ impl NativeDefinitionLocation {
             // Create-only: never repair or adopt a concurrently supplied path.
             let handle = self.directory.create_directory(&component)?;
             kio_core::store_dir::restrict_new_private_directory(&handle)?;
-            self.directory =
-                StoreDirectory::from_retained(handle, self.directory.path().join(component))?;
+            self.directory = StoreDirectory::from_retained_with_control(
+                handle,
+                self.directory.path().join(component),
+                self.directory.control().clone(),
+            )?;
             self.revalidate()?;
         }
         Ok(())
@@ -807,10 +820,10 @@ impl NativeDefinitionLocation {
     }
 }
 
-pub(crate) struct NativeScheduler;
+pub(crate) struct NativeScheduler(pub(crate) ControlHandle);
 impl Scheduler for NativeScheduler {
     fn inspect(&self, manifest: &ServiceManifest) -> Result<NativeRegistration> {
-        let location = NativeDefinitionLocation::admit(&manifest.native_path)?;
+        let location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
         let registration = location.inspect(manifest.definition.as_bytes())?;
         if registration != NativeRegistration::Owned {
             return Ok(registration);
@@ -824,26 +837,26 @@ impl Scheduler for NativeScheduler {
         })
     }
     fn install(&self, manifest: &ServiceManifest) -> Result<()> {
-        let mut location = NativeDefinitionLocation::admit(&manifest.native_path)?;
+        let mut location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
         location.publish(manifest.definition.as_bytes())?;
         location.require_owned(manifest)?;
         native_enable(manifest)?;
         location.require_owned(manifest)
     }
     fn start(&self, manifest: &ServiceManifest) -> Result<()> {
-        let location = NativeDefinitionLocation::admit(&manifest.native_path)?;
+        let location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
         location.require_owned(manifest)?;
         native_start(manifest)?;
         location.require_owned(manifest)
     }
     fn stop(&self, manifest: &ServiceManifest) -> Result<()> {
-        let location = NativeDefinitionLocation::admit(&manifest.native_path)?;
+        let location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
         location.require_owned(manifest)?;
         native_stop(manifest)?;
         location.require_owned(manifest)
     }
     fn uninstall(&self, manifest: &ServiceManifest) -> Result<()> {
-        let location = NativeDefinitionLocation::admit(&manifest.native_path)?;
+        let location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
         location.require_owned(manifest)?;
         native_uninstall(manifest)?;
         // Recheck the retained XML/plist/unit cache without querying a Windows
@@ -854,7 +867,7 @@ impl Scheduler for NativeScheduler {
         location.revalidate()
     }
     fn state(&self, manifest: &ServiceManifest, registration: NativeRegistration) -> Result<Value> {
-        let location = NativeDefinitionLocation::admit(&manifest.native_path)?;
+        let location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
         if location.inspect(manifest.definition.as_bytes())? != registration {
             return Err(service_error("native registration changed during status"));
         }
@@ -958,7 +971,8 @@ mod tests {
         let (_temp, root) = native_test_root();
         fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
         let path = root.join("systemd/user/kio.service");
-        let mut location = NativeDefinitionLocation::admit(&path).unwrap();
+        let mut location =
+            NativeDefinitionLocation::admit(&path, &ControlHandle::default()).unwrap();
         assert_eq!(
             location.inspect(b"unit").unwrap(),
             NativeRegistration::Absent
@@ -1008,12 +1022,22 @@ mod tests {
         for mode in [0o777, 0o775] {
             fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(mode)).unwrap();
             assert!(
-                NativeDefinitionLocation::admit(&unsafe_parent.join("missing/user/unit")).is_err()
+                NativeDefinitionLocation::admit(
+                    &unsafe_parent.join("missing/user/unit"),
+                    &ControlHandle::default()
+                )
+                .is_err()
             );
             assert_eq!(fs::read_dir(&unsafe_parent).unwrap().count(), 0);
         }
         symlink(&root, root.join("alias")).unwrap();
-        assert!(NativeDefinitionLocation::admit(&root.join("alias/missing/unit")).is_err());
+        assert!(
+            NativeDefinitionLocation::admit(
+                &root.join("alias/missing/unit"),
+                &ControlHandle::default()
+            )
+            .is_err()
+        );
         assert!(!root.join("missing").exists());
         assert!(!root.join(".kio-atomic").exists());
     }
@@ -1025,7 +1049,8 @@ mod tests {
         let (_temp, root) = native_test_root();
         let path = root.join("unit");
         fs::write(&path, b"foreign").unwrap();
-        let mut location = NativeDefinitionLocation::admit(&path).unwrap();
+        let mut location =
+            NativeDefinitionLocation::admit(&path, &ControlHandle::default()).unwrap();
         assert_eq!(
             location.inspect(b"expected").unwrap(),
             NativeRegistration::Foreign
@@ -1070,7 +1095,9 @@ mod tests {
         let (_temp, root) = native_test_root();
         let parent = root.join("native");
         fs::create_dir(&parent).unwrap();
-        let mut location = NativeDefinitionLocation::admit(&parent.join("unit")).unwrap();
+        let mut location =
+            NativeDefinitionLocation::admit(&parent.join("unit"), &ControlHandle::default())
+                .unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
         assert!(location.publish(b"unit").is_err());
         assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);

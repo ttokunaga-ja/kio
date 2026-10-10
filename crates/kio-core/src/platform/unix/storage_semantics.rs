@@ -14,6 +14,7 @@ pub(crate) fn normalize_management_handles(
     root: File,
     kio: File,
     _canonical_root: &Path,
+    _control: &crate::control::ControlHandle,
 ) -> Result<(File, File)> {
     Ok((root, kio))
 }

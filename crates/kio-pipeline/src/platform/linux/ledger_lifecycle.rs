@@ -6,9 +6,11 @@ use std::path::{Path, PathBuf};
 pub(crate) fn try_inherited_parent(
     path: &Path,
     allow_create: bool,
+    control: kio_core::control::ControlHandle,
 ) -> Result<Option<StoreDirectory>> {
     if let Some((root, suffix)) =
-        kio_core::private_fs::resolve_inherited_private_root(path).map_err(core_private)?
+        kio_core::private_fs::resolve_inherited_private_root_with_control(path, &control)
+            .map_err(core_private)?
     {
         return open_or_create_inherited_parent(root, &suffix, path, allow_create).map(Some);
     }
@@ -28,23 +30,23 @@ fn open_or_create_inherited_parent(
     for name in suffix {
         let leaf = Path::new(name);
         logical.push(name);
-        if current.contains_entry(leaf).map_err(core_private)? {
-            let retained = current.open_directory(leaf).map_err(core_private)?;
-            let next =
-                StoreDirectory::from_retained(retained, logical.clone()).map_err(core_private)?;
-            verify_private_parent_handle(next.root_handle().as_ref(), &logical)?;
-            current = next;
-            continue;
-        }
-        if !allow_create {
-            return Err(contract(
-                "KIO-E-LEDGER-UNINITIALIZED-001",
-                format!("ledger parent is missing: {}", logical.display()),
-            ));
-        }
-        let retained = current.create_directory(leaf).map_err(core_private)?;
-        let next =
-            StoreDirectory::from_retained(retained, logical.clone()).map_err(core_private)?;
+        let retained = if current.contains_entry(leaf).map_err(core_private)? {
+            current.open_directory(leaf).map_err(core_private)?
+        } else {
+            if !allow_create {
+                return Err(contract(
+                    "KIO-E-LEDGER-UNINITIALIZED-001",
+                    format!("ledger parent is missing: {}", logical.display()),
+                ));
+            }
+            current.create_directory(leaf).map_err(core_private)?
+        };
+        let next = StoreDirectory::from_retained_with_control(
+            retained,
+            logical.clone(),
+            current.control().clone(),
+        )
+        .map_err(core_private)?;
         verify_private_parent_handle(next.root_handle().as_ref(), &logical)?;
         current = next;
     }

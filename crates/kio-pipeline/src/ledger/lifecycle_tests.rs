@@ -43,7 +43,9 @@ fn pending_write(authority: &Authority, before: &Checkpoint) -> PendingWrite {
     }
 }
 fn write_pending(path: &Path, pending: &PendingWrite) {
-    let session = FsSession::acquire(path, false).unwrap();
+    let session =
+        FsSession::acquire_with_control(path, false, kio_core::control::ControlHandle::default())
+            .unwrap();
     session
         .create_only(&session.names().write_pending, &encode(pending).unwrap())
         .unwrap();
@@ -147,7 +149,9 @@ fn restore_resumes_only_the_matching_interrupted_restore_journal() {
         backup_digest: backup.sqlite_digest(),
     };
     fs::remove_file(&path).unwrap();
-    let session = FsSession::acquire(&path, false).unwrap();
+    let session =
+        FsSession::acquire_with_control(&path, false, kio_core::control::ControlHandle::default())
+            .unwrap();
     session
         .create_only(&session.names().restore_pending, &encode(&pending).unwrap())
         .unwrap();
@@ -469,4 +473,52 @@ fn sequence_exhaustion_is_an_error_and_preserves_checkpoint() {
         "KIO-E-LEDGER-SEQUENCE-OVERFLOW-001"
     );
     assert_eq!(read_checkpoint(&path).seq, i64::MAX as u64);
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn owner_control_clock_isolation_reaches_sql_transactions() {
+    use crate::ledger::{
+        model::{RequestKind, TaskKey},
+        ops,
+    };
+    use kio_core::control::ControlHandle;
+    use kio_core::test_control::{DebugTestControl, Selector};
+    let clock = |value: &str| {
+        let debug = DebugTestControl {
+            fixed_now: Selector::Known(value.to_owned()),
+            ..Default::default()
+        };
+        ControlHandle::new(debug)
+    };
+    let (_outer_dir, outer_path) = fixture();
+    let (_inner_dir, inner_path) = fixture();
+    let outer =
+        LedgerDb::initialize_with_control(&outer_path, clock("2000-01-01T00:00:00Z")).unwrap();
+    let inner =
+        LedgerDb::initialize_with_control(&inner_path, clock("2001-01-01T00:00:00Z")).unwrap();
+    let key = TaskKey::new("scope", "markdownize", "raw", "profile");
+    ops::phase1_intent(&inner, &key, RequestKind::Sync, 1.0, Some(60)).unwrap();
+    ops::phase1_intent(&outer, &key, RequestKind::Sync, 1.0, Some(60)).unwrap();
+    let inner_row = ops::get_batch_request(&inner, &key).unwrap().unwrap();
+    let outer_row = ops::get_batch_request(&outer, &key).unwrap().unwrap();
+    assert_eq!(inner_row.created_at, 978_307_200_000);
+    assert_eq!(outer_row.created_at, 946_684_800_000);
+    assert_eq!(outer_row.job_create_started_at, Some(946_684_800_000));
+    assert_eq!(outer_row.stale_after_at, Some(946_685_400_000));
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn owner_control_default_ledger_and_public_clock_ignore_fixed_environment() {
+    use kio_core::test_control::{TestEnvGuard, test_env_lock};
+    let _lock = test_env_lock().lock().unwrap();
+    let _fixed = TestEnvGuard::set("KIO_FIXED_NOW", "2000-01-01T00:00:00Z");
+    let (_dir, path) = fixture();
+    let before = crate::ledger::time::now_millis();
+    let db = LedgerDb::initialize(&path).unwrap();
+    let now = db.now_millis();
+    let after = crate::ledger::time::now_millis();
+    assert!(before <= now && now <= after);
+    assert!(now > 946_684_800_000);
 }

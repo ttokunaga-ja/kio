@@ -4,6 +4,7 @@
 //! naming or constructing concrete built-in adapters directly.
 
 use crate::tool_lock::AdapterRuntimeSettings;
+use kio_core::control::ControlHandle;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -19,17 +20,18 @@ use crate::gemini_embedding::{ADOPTED_DIMENSIONS, ADOPTED_MODEL_PIN, GeminiEmbed
 use crate::local_embedding::{
     LOCAL_EMBEDDING_DEFAULT_MODEL, LocalEmbeddingAdapter, LocalEmbeddingExecution,
 };
-use crate::mistral_ocr::{
-    EnvMistralOcrClient, MistralOcrClient, MistralOcrMarkdownizeAdapter, OcrImage, OcrPage,
-    OcrResponse,
-};
-use crate::office_convert::{is_office_media, resolve_office_converter};
+use crate::mistral_ocr::{EnvMistralOcrClient, MistralOcrClient, MistralOcrMarkdownizeAdapter};
+#[cfg(debug_assertions)]
+use crate::mistral_ocr::{OcrImage, OcrPage, OcrResponse};
+use crate::office_convert::{is_office_media, resolve_office_converter_with_control};
 use crate::traits::{EmbeddingAdapter, MarkdownizeAdapter, PrepareAdapter};
+#[cfg(debug_assertions)]
+use crate::types::FailedUnit;
 use crate::types::{
     AdapterProfile, AdapterUsage, EmbeddingInputType, EmbeddingItem, EmbeddingRequest,
-    EmbeddingVector, ExecutionMode, FailedUnit, IncrementalHints, MarkdownizeMode,
-    MarkdownizeRequest, MarkdownizeResponse, PreparedUnitHint, PreviousMarkdownizeContext,
-    ProviderIdempotency, RawInput,
+    EmbeddingVector, ExecutionMode, IncrementalHints, MarkdownizeMode, MarkdownizeRequest,
+    MarkdownizeResponse, PreparedUnitHint, PreviousMarkdownizeContext, ProviderIdempotency,
+    RawInput,
 };
 use crate::{AdapterError, Result};
 
@@ -49,38 +51,8 @@ mod test_control {
             Selector::Unset | Selector::Unknown(_) => None,
         }
     }
-    pub fn mistral_ocr() -> Option<&'static str> {
-        known(
-            crate::debug_test_control().adapters.mistral_ocr,
-            |v| match v {
-                MistralOcrMode::AuthError => "auth_error",
-                MistralOcrMode::RateLimit => "rate_limit",
-                MistralOcrMode::RateLimitAfter => "rate_limit_after",
-                MistralOcrMode::NetworkError => "network_error",
-                MistralOcrMode::Mock => "mock",
-                MistralOcrMode::Partial => "partial",
-                MistralOcrMode::PartialNetwork => "partial_network",
-                MistralOcrMode::AllFailedNetwork => "all_failed_network",
-                MistralOcrMode::AllFailedInvalidInput => "all_failed_invalid_input",
-                MistralOcrMode::MockLinkImage => "mock_link_image",
-                MistralOcrMode::IncrementalIncomplete => "incr_incomplete",
-                MistralOcrMode::PinChanged => "pin_changed",
-                MistralOcrMode::NoChangeNoSend => "no_change_no_send",
-                MistralOcrMode::RequireIdempotencyToken => "require_idempotency_token",
-            },
-        )
-    }
-    pub fn local_ocr() -> Option<&'static str> {
-        known(
-            crate::debug_test_control().adapters.local_ocr,
-            |v| match v {
-                LocalOcrMode::Mock => "mock",
-            },
-        )
-    }
-    pub fn mistral_ocr_with_capture() -> (Option<&'static str>, Option<PathBuf>) {
-        let adapters = crate::debug_test_control().adapters;
-        let mode = known(adapters.mistral_ocr, |v| match v {
+    pub fn mistral_ocr(control: &super::ControlHandle) -> Option<&'static str> {
+        known(control.debug().adapters.mistral_ocr.clone(), |v| match v {
             MistralOcrMode::AuthError => "auth_error",
             MistralOcrMode::RateLimit => "rate_limit",
             MistralOcrMode::RateLimitAfter => "rate_limit_after",
@@ -95,24 +67,22 @@ mod test_control {
             MistralOcrMode::PinChanged => "pin_changed",
             MistralOcrMode::NoChangeNoSend => "no_change_no_send",
             MistralOcrMode::RequireIdempotencyToken => "require_idempotency_token",
-        });
-        (mode, adapters.capture_sent_media)
+        })
+    }
+    pub fn local_ocr(control: &super::ControlHandle) -> Option<&'static str> {
+        known(control.debug().adapters.local_ocr.clone(), |v| match v {
+            LocalOcrMode::Mock => "mock",
+        })
+    }
+    pub fn mistral_ocr_with_capture(
+        control: &super::ControlHandle,
+    ) -> (Option<&'static str>, Option<PathBuf>) {
+        (
+            mistral_ocr(control),
+            control.debug().adapters.capture_sent_media.clone(),
+        )
     }
 }
-#[cfg(not(debug_assertions))]
-mod test_control {
-    use std::path::PathBuf;
-    pub fn mistral_ocr() -> Option<&'static str> {
-        None
-    }
-    pub fn local_ocr() -> Option<&'static str> {
-        None
-    }
-    pub fn mistral_ocr_with_capture() -> (Option<&'static str>, Option<PathBuf>) {
-        (None, None)
-    }
-}
-
 #[cfg(debug_assertions)]
 pub const TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV: &str = "KIO_TEST_MISTRAL_OCR";
 #[cfg(debug_assertions)]
@@ -185,14 +155,21 @@ pub fn builtin_offline_markdownize_adapter() -> Box<dyn MarkdownizeAdapter> {
 /// Markdown into a real archive.
 #[must_use]
 pub fn active_local_ocr_execution(settings: &AdapterRuntimeSettings) -> Option<LocalOcrExecution> {
-    match test_control::local_ocr() {
-        #[cfg(debug_assertions)]
-        Some("mock") => Some(LocalOcrExecution::Mock),
-        #[cfg(not(debug_assertions))]
-        Some("mock") => None,
-        Some(_) => None,
-        None => declared_offline_markdownize(settings).then_some(LocalOcrExecution::Real),
+    active_local_ocr_execution_with_control(settings, &ControlHandle::default())
+}
+
+pub fn active_local_ocr_execution_with_control(
+    settings: &AdapterRuntimeSettings,
+    control: &ControlHandle,
+) -> Option<LocalOcrExecution> {
+    #[cfg(debug_assertions)]
+    match test_control::local_ocr(control) {
+        Some("mock") => return Some(LocalOcrExecution::Mock),
+        Some(_) => return None,
+        None => {}
     }
+    let _ = control;
+    declared_offline_markdownize(settings).then_some(LocalOcrExecution::Real)
 }
 
 /// Whether `tools.toml` declares the markdown role as `offline_api`.
@@ -215,10 +192,28 @@ pub fn local_ocr_markdownize_adapter(
     kio_dir: &Path,
     verified_raw_bytes: &[u8],
 ) -> Result<Box<dyn MarkdownizeAdapter>> {
+    local_ocr_markdownize_adapter_with_control(
+        settings,
+        execution,
+        scope_id,
+        kio_dir,
+        verified_raw_bytes,
+        &ControlHandle::default(),
+    )
+}
+
+pub fn local_ocr_markdownize_adapter_with_control(
+    settings: &AdapterRuntimeSettings,
+    execution: LocalOcrExecution,
+    scope_id: &str,
+    kio_dir: &Path,
+    verified_raw_bytes: &[u8],
+    _control: &ControlHandle,
+) -> Result<Box<dyn MarkdownizeAdapter>> {
     let adapter = match execution {
         #[cfg(debug_assertions)]
         LocalOcrExecution::Mock => LocalOcrMarkdownizeAdapter::new(
-            MockLocalOcrClient::from_test_control(),
+            MockLocalOcrClient::from_control(_control),
             LocalOcrExecution::Mock,
             scope_id,
         )
@@ -316,11 +311,24 @@ pub fn run_standard_online_markdownize(
     settings: Arc<AdapterRuntimeSettings>,
     request: StandardOnlineMarkdownizeRequest<'_>,
 ) -> Result<StandardOnlineMarkdownizeOutcome> {
+    run_standard_online_markdownize_with_control(settings, request, &ControlHandle::default())
+}
+
+pub fn run_standard_online_markdownize_with_control(
+    settings: Arc<AdapterRuntimeSettings>,
+    request: StandardOnlineMarkdownizeRequest<'_>,
+    control: &ControlHandle,
+) -> Result<StandardOnlineMarkdownizeOutcome> {
     let bytes = std::fs::read(request.path).map_err(|err| AdapterError::Io {
         path: request.path.display().to_string(),
         message: err.to_string(),
     })?;
-    run_standard_online_markdownize_with_bytes(settings.clone(), request, &bytes)
+    run_standard_online_markdownize_with_bytes_with_control(
+        settings.clone(),
+        request,
+        &bytes,
+        control,
+    )
 }
 
 /// Execute online markdownization from bytes already owned by the caller. The
@@ -331,9 +339,23 @@ pub fn run_standard_online_markdownize_with_bytes(
     request: StandardOnlineMarkdownizeRequest<'_>,
     verified_raw_bytes: &[u8],
 ) -> Result<StandardOnlineMarkdownizeOutcome> {
-    // Test controls are process-global. Snapshot them before any request work so
-    // an individual request cannot observe a mid-flight environment mutation.
-    let (test_mode, capture_sent_media) = test_control::mistral_ocr_with_capture();
+    run_standard_online_markdownize_with_bytes_with_control(
+        settings,
+        request,
+        verified_raw_bytes,
+        &ControlHandle::default(),
+    )
+}
+
+pub fn run_standard_online_markdownize_with_bytes_with_control(
+    settings: Arc<AdapterRuntimeSettings>,
+    request: StandardOnlineMarkdownizeRequest<'_>,
+    verified_raw_bytes: &[u8],
+    control: &ControlHandle,
+) -> Result<StandardOnlineMarkdownizeOutcome> {
+    // Borrow the caller snapshot, then retain only the mock client subcontrols.
+    #[cfg(debug_assertions)]
+    let (test_mode, capture_sent_media) = test_control::mistral_ocr_with_capture(control);
     let actual_hash = crate::identity::hash_bytes(verified_raw_bytes);
     if actual_hash != request.raw_hash {
         return Err(AdapterError::ContractViolation(format!(
@@ -353,7 +375,9 @@ pub fn run_standard_online_markdownize_with_bytes(
     // `task.input_hash`/`raw_hash` directly and never read this function's
     // internal `adapter_request.raw.raw_hash` back out.
     let converted_pdf = is_office_media(request.media_type)
-        .then(|| convert_office_to_pdf(verified_raw_bytes, request.media_type))
+        .then(|| {
+            convert_office_to_pdf_with_control(verified_raw_bytes, request.media_type, control)
+        })
         .transpose()?;
     let effective_media_type: &str = if converted_pdf.is_some() {
         "application/pdf"
@@ -414,6 +438,7 @@ pub fn run_standard_online_markdownize_with_bytes(
         // profile declares one.
         idempotency_token: request.idempotency_token,
     };
+    #[cfg(debug_assertions)]
     match test_mode {
         Some("auth_error") => return Err(AdapterError::Auth("mock auth failure".to_owned())),
         Some("rate_limit") => return Err(AdapterError::rate_limit("mock 429")),
@@ -573,13 +598,21 @@ pub fn run_standard_online_markdownize_with_bytes(
 /// 変換失敗は contract_violation ([04-pipeline.md §5.3] -- 同一入力の再試行 1 回) に
 /// 合流する". Callers that must never enqueue/spend when no converter is
 /// installed at all (the `kio index` enqueue gate) check
-/// `resolve_office_converter().is_none()` THEMSELVES first and never call this
+/// `resolve_office_converter_with_control(control).is_none()` THEMSELVES first and never call this
 /// helper in that case; reaching here with no converter means the precondition
 /// that led to this call (an earlier successful resolve, e.g. at enqueue time)
 /// no longer holds -- a rare race this helper still turns into the same
 /// well-defined retryable failure rather than a panic or a stuck task.
 pub fn convert_office_to_pdf(bytes: &[u8], media_type: &str) -> Result<Vec<u8>> {
-    let converter = resolve_office_converter().ok_or_else(|| {
+    convert_office_to_pdf_with_control(bytes, media_type, &ControlHandle::default())
+}
+
+pub fn convert_office_to_pdf_with_control(
+    bytes: &[u8],
+    media_type: &str,
+    control: &ControlHandle,
+) -> Result<Vec<u8>> {
+    let converter = resolve_office_converter_with_control(control).ok_or_else(|| {
         AdapterError::ContractViolation(format!(
             "office converter unavailable for {media_type} at execution time"
         ))
@@ -672,7 +705,24 @@ pub fn resolve_standard_online_markdownize_profile(
     settings: Arc<AdapterRuntimeSettings>,
     scope_id: &str,
 ) -> Result<AdapterProfile> {
-    resolve_standard_online_markdownize_profile_with_bbox(settings.clone(), scope_id, true)
+    resolve_standard_online_markdownize_profile_with_control(
+        settings,
+        scope_id,
+        &ControlHandle::default(),
+    )
+}
+
+pub fn resolve_standard_online_markdownize_profile_with_control(
+    settings: Arc<AdapterRuntimeSettings>,
+    scope_id: &str,
+    control: &ControlHandle,
+) -> Result<AdapterProfile> {
+    resolve_standard_online_markdownize_profile_with_bbox_with_control(
+        settings.clone(),
+        scope_id,
+        true,
+        control,
+    )
 }
 
 pub fn resolve_standard_online_markdownize_profile_with_bbox(
@@ -680,7 +730,24 @@ pub fn resolve_standard_online_markdownize_profile_with_bbox(
     scope_id: &str,
     bbox_annotation_enabled: bool,
 ) -> Result<AdapterProfile> {
-    let test_mode = test_control::mistral_ocr();
+    resolve_standard_online_markdownize_profile_with_bbox_with_control(
+        settings,
+        scope_id,
+        bbox_annotation_enabled,
+        &ControlHandle::default(),
+    )
+}
+
+pub fn resolve_standard_online_markdownize_profile_with_bbox_with_control(
+    settings: Arc<AdapterRuntimeSettings>,
+    scope_id: &str,
+    bbox_annotation_enabled: bool,
+    control: &ControlHandle,
+) -> Result<AdapterProfile> {
+    let _ = control;
+    #[cfg(debug_assertions)]
+    let test_mode = test_control::mistral_ocr(control);
+    #[cfg(debug_assertions)]
     match test_mode {
         Some("auth_error") => return Err(AdapterError::Auth("mock auth failure".to_owned())),
         Some("rate_limit") => return Err(AdapterError::rate_limit("mock 429")),
@@ -742,6 +809,7 @@ pub fn resolve_standard_online_markdownize_profile_with_bbox(
     )
 }
 
+#[cfg(debug_assertions)]
 #[derive(Debug, Clone)]
 struct MockStandardOnlineMarkdownizeClient {
     test_mode: Option<&'static str>,
@@ -750,6 +818,7 @@ struct MockStandardOnlineMarkdownizeClient {
 
 // A decodable, deterministic 1x1 RGB PNG. Distinct unit keys retain distinct
 // image content so mock OCR exercises content-addressed image deduplication.
+#[cfg(debug_assertions)]
 fn mock_ocr_png(unit_key: &str) -> Vec<u8> {
     use sha2::{Digest, Sha256};
 
@@ -776,6 +845,7 @@ fn mock_ocr_png(unit_key: &str) -> Vec<u8> {
     png
 }
 
+#[cfg(debug_assertions)]
 impl MistralOcrClient for MockStandardOnlineMarkdownizeClient {
     fn resolve_model_pin(&self, _configured_model: &str) -> Result<String> {
         // R14-6: the `pin_changed` seam simulates a model-pin change between runs so the
@@ -997,6 +1067,14 @@ impl EmbeddingExecution {
 /// resolve to `Option`, let `None` mean "this lane is unavailable, degrade".
 #[must_use]
 pub fn active_embedding_execution(settings: &AdapterRuntimeSettings) -> Option<EmbeddingExecution> {
+    active_embedding_execution_with_control(settings, &ControlHandle::default())
+}
+
+pub fn active_embedding_execution_with_control(
+    settings: &AdapterRuntimeSettings,
+    control: &ControlHandle,
+) -> Option<EmbeddingExecution> {
+    let _ = control;
     match std::env::var_os(DETERMINISTIC_EVAL_EMBEDDING_ENV) {
         Some(value) if value == DETERMINISTIC_EVAL_EMBEDDING_PROFILE => {
             return Some(EmbeddingExecution::DeterministicEvaluator);
@@ -1007,17 +1085,11 @@ pub fn active_embedding_execution(settings: &AdapterRuntimeSettings) -> Option<E
         Some(_) => return None,
         None => {}
     }
-    #[cfg(debug_assertions)]
-    let adapters = crate::debug_test_control().adapters;
     if let Some(local) = active_local_embedding_execution(settings) {
         return Some(EmbeddingExecution::Offline(local));
     }
-    active_adopted_embedding_execution_from(
-        settings,
-        #[cfg(debug_assertions)]
-        Some(&adapters),
-    )
-    .map(EmbeddingExecution::Online)
+    active_adopted_embedding_execution_with_control(settings, control)
+        .map(EmbeddingExecution::Online)
 }
 
 fn active_local_embedding_execution(
@@ -1047,6 +1119,15 @@ pub fn embedding_adapter_for(
     settings: Arc<AdapterRuntimeSettings>,
     execution: EmbeddingExecution,
 ) -> Result<Box<dyn EmbeddingAdapter>> {
+    embedding_adapter_for_with_control(settings, execution, &ControlHandle::default())
+}
+
+pub fn embedding_adapter_for_with_control(
+    settings: Arc<AdapterRuntimeSettings>,
+    execution: EmbeddingExecution,
+    control: &ControlHandle,
+) -> Result<Box<dyn EmbeddingAdapter>> {
+    let _ = control;
     match execution {
         EmbeddingExecution::DeterministicEvaluator => Ok(Box::new(DeterministicEmbeddingAdapter)),
         // Same shape as the online `Real` arm below: the declaration is
@@ -1127,70 +1208,51 @@ pub fn embedding_adapter_for(
 pub fn active_adopted_embedding_execution(
     settings: &AdapterRuntimeSettings,
 ) -> Option<AdoptedEmbeddingExecution> {
-    #[cfg(debug_assertions)]
-    let adapters = crate::debug_test_control().adapters;
-    active_adopted_embedding_execution_from(
-        settings,
-        #[cfg(debug_assertions)]
-        Some(&adapters),
-    )
+    active_adopted_embedding_execution_with_control(settings, &ControlHandle::default())
 }
 
-fn active_adopted_embedding_execution_from(
+pub fn active_adopted_embedding_execution_with_control(
     settings: &AdapterRuntimeSettings,
-    #[cfg(debug_assertions)] adapters: Option<&kio_core::test_control::AdapterTestControl>,
+    control: &ControlHandle,
 ) -> Option<AdoptedEmbeddingExecution> {
+    let _ = control;
     #[cfg(debug_assertions)]
-    match adapters.and_then(|adapters| match &adapters.gemini_embed {
-        kio_core::test_control::Selector::Known(mode) => Some(*mode),
-        kio_core::test_control::Selector::Unset | kio_core::test_control::Selector::Unknown(_) => {
-            None
-        }
-    }) {
-        Some(kio_core::test_control::GeminiEmbedMode::Mock) => {
-            Some(AdoptedEmbeddingExecution::Mock)
-        }
-        Some(kio_core::test_control::GeminiEmbedMode::IncompatibleProfile) => {
-            Some(AdoptedEmbeddingExecution::IncompatibleProfile)
-        }
-        Some(kio_core::test_control::GeminiEmbedMode::NonMultimodal) => {
-            Some(AdoptedEmbeddingExecution::NonMultimodal)
-        }
-        Some(kio_core::test_control::GeminiEmbedMode::AuthError) => {
-            Some(AdoptedEmbeddingExecution::AuthError)
-        }
-        Some(kio_core::test_control::GeminiEmbedMode::RateLimit) => {
-            Some(AdoptedEmbeddingExecution::RateLimit)
-        }
-        Some(kio_core::test_control::GeminiEmbedMode::RateLimitAfter) => {
-            Some(AdoptedEmbeddingExecution::RateLimitAfter)
-        }
-        Some(kio_core::test_control::GeminiEmbedMode::NetworkError) => {
-            Some(AdoptedEmbeddingExecution::NetworkError)
-        }
-        Some(kio_core::test_control::GeminiEmbedMode::RequireIdempotencyToken) => {
-            Some(AdoptedEmbeddingExecution::RequireIdempotencyToken)
-        }
-        Some(kio_core::test_control::GeminiEmbedMode::NoUsageReport) => {
-            Some(AdoptedEmbeddingExecution::NoUsageReport)
-        }
-        // The declared tools.toml credential is the sole activation authority.
-        None => real_embedding_activation(
-            settings
-                .declared_adapter("embedding")
-                .and_then(|declared| declared.auth)
-                .is_some(),
-        ),
+    if let Some(mode) = control.debug().adapters.gemini_embed.known() {
+        return Some(match mode {
+            kio_core::test_control::GeminiEmbedMode::Mock => AdoptedEmbeddingExecution::Mock,
+            kio_core::test_control::GeminiEmbedMode::IncompatibleProfile => {
+                AdoptedEmbeddingExecution::IncompatibleProfile
+            }
+            kio_core::test_control::GeminiEmbedMode::NonMultimodal => {
+                AdoptedEmbeddingExecution::NonMultimodal
+            }
+            kio_core::test_control::GeminiEmbedMode::AuthError => {
+                AdoptedEmbeddingExecution::AuthError
+            }
+            kio_core::test_control::GeminiEmbedMode::RateLimit => {
+                AdoptedEmbeddingExecution::RateLimit
+            }
+            kio_core::test_control::GeminiEmbedMode::RateLimitAfter => {
+                AdoptedEmbeddingExecution::RateLimitAfter
+            }
+            kio_core::test_control::GeminiEmbedMode::NetworkError => {
+                AdoptedEmbeddingExecution::NetworkError
+            }
+            kio_core::test_control::GeminiEmbedMode::RequireIdempotencyToken => {
+                AdoptedEmbeddingExecution::RequireIdempotencyToken
+            }
+            kio_core::test_control::GeminiEmbedMode::NoUsageReport => {
+                AdoptedEmbeddingExecution::NoUsageReport
+            }
+        });
     }
-    #[cfg(not(debug_assertions))]
-    {
-        real_embedding_activation(
-            settings
-                .declared_adapter("embedding")
-                .and_then(|declared| declared.auth)
-                .is_some(),
-        )
-    }
+    // The declared tools.toml credential is the sole activation authority.
+    real_embedding_activation(
+        settings
+            .declared_adapter("embedding")
+            .and_then(|declared| declared.auth)
+            .is_some(),
+    )
 }
 
 /// R13-2: pure activation rule for the adopted embedding adapter (unit-testable).
@@ -1304,7 +1366,25 @@ pub fn run_embedding(
     input_type: EmbeddingInputType,
     idempotency_token: Option<String>,
 ) -> Result<AdoptedEmbeddingOutcome> {
-    let adapter = embedding_adapter_for(settings.clone(), execution)?;
+    run_embedding_with_control(
+        settings,
+        execution,
+        items,
+        input_type,
+        idempotency_token,
+        &ControlHandle::default(),
+    )
+}
+
+pub fn run_embedding_with_control(
+    settings: Arc<AdapterRuntimeSettings>,
+    execution: EmbeddingExecution,
+    items: Vec<EmbeddingItem>,
+    input_type: EmbeddingInputType,
+    idempotency_token: Option<String>,
+    control: &ControlHandle,
+) -> Result<AdoptedEmbeddingOutcome> {
+    let adapter = embedding_adapter_for_with_control(settings.clone(), execution, control)?;
     let response = adapter.embed(EmbeddingRequest {
         input_type,
         items,
@@ -1323,7 +1403,18 @@ pub fn embedding_preferred_request_kind(
     settings: &AdapterRuntimeSettings,
     execution: EmbeddingExecution,
 ) -> Result<crate::traits::PreferredRequestKind> {
-    Ok(embedding_adapter_for(Arc::new(settings.clone()), execution)?.preferred_request_kind())
+    embedding_preferred_request_kind_with_control(settings, execution, &ControlHandle::default())
+}
+
+pub fn embedding_preferred_request_kind_with_control(
+    settings: &AdapterRuntimeSettings,
+    execution: EmbeddingExecution,
+    control: &ControlHandle,
+) -> Result<crate::traits::PreferredRequestKind> {
+    Ok(
+        embedding_adapter_for_with_control(Arc::new(settings.clone()), execution, control)?
+            .preferred_request_kind(),
+    )
 }
 
 /// The active implementation's `AdapterProfile` — the source for
@@ -1333,10 +1424,20 @@ pub fn embedding_adapter_profile(
     settings: &AdapterRuntimeSettings,
     execution: EmbeddingExecution,
 ) -> Result<AdapterProfile> {
-    Ok(embedding_adapter_for(Arc::new(settings.clone()), execution)?.profile())
+    embedding_adapter_profile_with_control(settings, execution, &ControlHandle::default())
 }
 
-#[cfg(debug_assertions)]
+pub fn embedding_adapter_profile_with_control(
+    settings: &AdapterRuntimeSettings,
+    execution: EmbeddingExecution,
+    control: &ControlHandle,
+) -> Result<AdapterProfile> {
+    Ok(
+        embedding_adapter_for_with_control(Arc::new(settings.clone()), execution, control)?
+            .profile(),
+    )
+}
+
 pub fn run_adopted_embedding(
     settings: Arc<AdapterRuntimeSettings>,
     execution: AdoptedEmbeddingExecution,
@@ -1348,68 +1449,31 @@ pub fn run_adopted_embedding(
     // ledger charge.
     idempotency_token: Option<String>,
 ) -> Result<AdoptedEmbeddingOutcome> {
-    let request = EmbeddingRequest {
-        input_type,
+    run_adopted_embedding_with_control(
+        settings,
+        execution,
         items,
+        input_type,
         idempotency_token,
-    };
-    let response = match execution {
-        AdoptedEmbeddingExecution::Real => {
-            let declared = settings.declared_adapter("embedding");
-            if let Some(declared) = declared.as_ref() {
-                crate::tool_lock::validate_declared_runtime_target("embedding", declared)?;
-            }
-            let configured_model = declared
-                .and_then(|declared| declared.model)
-                .unwrap_or_else(|| ADOPTED_MODEL_PIN.to_owned());
-            GeminiEmbeddingAdapter::new(
-                crate::gemini_embedding::EnvGeminiEmbeddingClient::new(settings.clone()),
-                configured_model,
-                ADOPTED_DIMENSIONS,
-            )
-            .embed(request)
-        }
-        // QA13: behaves like the generic mock arm below, but the adapter
-        // declares a provider idempotency header so a missing
-        // `idempotency_token` surfaces as `ContractViolation` — proving the
-        // CLI threads it end-to-end.
-        AdoptedEmbeddingExecution::RequireIdempotencyToken => GeminiEmbeddingAdapter::new(
-            MockAdoptedEmbeddingClient { execution },
-            ADOPTED_MODEL_PIN,
-            ADOPTED_DIMENSIONS,
-        )
-        .with_provider_idempotency(ProviderIdempotency::HttpHeader(
-            "Idempotency-Key".to_owned(),
-        ))
-        .embed(request),
-        other => GeminiEmbeddingAdapter::new(
-            MockAdoptedEmbeddingClient { execution: other },
-            ADOPTED_MODEL_PIN,
-            ADOPTED_DIMENSIONS,
-        )
-        .embed(request),
-    }?;
-    Ok(AdoptedEmbeddingOutcome {
-        vectors: response.vectors,
-        usage: response.usage,
-    })
+        &ControlHandle::default(),
+    )
 }
 
-#[cfg(not(debug_assertions))]
-pub fn run_adopted_embedding(
+pub fn run_adopted_embedding_with_control(
     settings: Arc<AdapterRuntimeSettings>,
     execution: AdoptedEmbeddingExecution,
     items: Vec<EmbeddingItem>,
     input_type: EmbeddingInputType,
     idempotency_token: Option<String>,
+    control: &ControlHandle,
 ) -> Result<AdoptedEmbeddingOutcome> {
-    debug_assert_eq!(execution, AdoptedEmbeddingExecution::Real);
-    run_embedding(
-        settings.clone(),
-        EmbeddingExecution::Online(AdoptedEmbeddingExecution::Real),
+    run_embedding_with_control(
+        settings,
+        EmbeddingExecution::Online(execution),
         items,
         input_type,
         idempotency_token,
+        control,
     )
 }
 
@@ -1529,6 +1593,53 @@ impl GeminiEmbeddingClient for MockAdoptedEmbeddingClient {
 mod tests {
     use super::*;
     use crate::types::AdapterKind;
+
+    #[test]
+    fn explicit_catalog_controls_remain_isolated_after_error_and_panic() {
+        use kio_core::test_control::{DebugTestControl, MistralOcrMode, Selector};
+        let mut snapshot = DebugTestControl::default();
+        snapshot.adapters.mistral_ocr = Selector::Known(MistralOcrMode::Mock);
+        let outer = ControlHandle::new(snapshot);
+        let mut snapshot = DebugTestControl::default();
+        snapshot.adapters.mistral_ocr = Selector::Known(MistralOcrMode::AuthError);
+        let inner = ControlHandle::new(snapshot);
+        let settings = Arc::new(AdapterRuntimeSettings::default());
+        let profile = resolve_standard_online_markdownize_profile_with_control(
+            settings.clone(),
+            "fixture",
+            &outer,
+        )
+        .unwrap();
+        assert!(matches!(
+            resolve_standard_online_markdownize_profile_with_control(
+                settings.clone(),
+                "fixture",
+                &inner,
+            ),
+            Err(AdapterError::Auth(_))
+        ));
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_eq!(test_control::mistral_ocr(&inner), Some("auth_error"));
+                panic!("fixture unwind");
+            })
+            .is_err()
+        );
+        assert_eq!(
+            resolve_standard_online_markdownize_profile_with_control(
+                settings.clone(),
+                "fixture",
+                &outer,
+            )
+            .unwrap()
+            .tool_profile_hash,
+            profile.tool_profile_hash
+        );
+        assert!(matches!(
+            resolve_standard_online_markdownize_profile(settings, "fixture"),
+            Err(AdapterError::Auth(_))
+        ));
+    }
 
     #[test]
     fn adopted_profiles_are_catalog_owned() {
@@ -1664,7 +1775,7 @@ mod tests {
                 TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV,
                 "mock",
             );
-            run_standard_online_markdownize(
+            run_standard_online_markdownize_with_control(
                 Arc::new(AdapterRuntimeSettings::default()),
                 StandardOnlineMarkdownizeRequest {
                     scope_id: "01H00000000000000000000000",
@@ -1687,6 +1798,7 @@ mod tests {
                     bbox_annotation_enabled: false,
                     idempotency_token: None,
                 },
+                &ControlHandle::new(kio_core::test_control::DebugTestControl::from_env()),
             )
             .unwrap()
         };
@@ -1700,7 +1812,7 @@ mod tests {
                 TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV,
                 "partial",
             );
-            run_standard_online_markdownize(
+            run_standard_online_markdownize_with_control(
                 Arc::new(AdapterRuntimeSettings::default()),
                 StandardOnlineMarkdownizeRequest {
                     scope_id: "01H00000000000000000000000",
@@ -1716,6 +1828,7 @@ mod tests {
                     bbox_annotation_enabled: false,
                     idempotency_token: None,
                 },
+                &ControlHandle::new(kio_core::test_control::DebugTestControl::from_env()),
             )
             .unwrap()
         };
@@ -1741,7 +1854,7 @@ mod tests {
                 TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV,
                 "mock",
             );
-            run_standard_online_markdownize(
+            run_standard_online_markdownize_with_control(
                 Arc::new(AdapterRuntimeSettings::default()),
                 StandardOnlineMarkdownizeRequest {
                     scope_id: "01H00000000000000000000000",
@@ -1764,6 +1877,7 @@ mod tests {
                     bbox_annotation_enabled: true,
                     idempotency_token: None,
                 },
+                &ControlHandle::new(kio_core::test_control::DebugTestControl::from_env()),
             )
             .unwrap()
         };
