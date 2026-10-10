@@ -247,8 +247,9 @@ Unix共通約7,600、Linux約2,300、macOS約1,300）、検証tooling約63,000�
 - testの期待値を変えて通さない。CLI契約試験（`crates/kio-cli/tests`）の変更は、移動に伴うpath・importの修正に限る。ただし、対象外targetのbuild拒否で対応3 OSのどれでもcompileされなくなったtest・assertion・guard・commentの削除はR2の対象外OS向け代替実装の削除に含め、この制限の例外とする。対応3 OSのtest集合と期待値は変えない。
 - K3（状態モデルの仕様）は並行してよい。K4以降の実装はR3の型付きAPIの上に作る。
 - R3の型付きresponseとthread-localの除去でOS共通の製品ロジックが100,000行を超える場合は、実測で必要な分だけ
-  [09 §3](../docs/09-mvp-scope.md)の上限と`kio-ci`の定数を引き上げる（2026-10-10利用者判断）。引き上げは超える候補の前に
-  独立したcommitで行い、responseをJSON値の包みにして行数を節約することはしない。
+  [09 §3](../docs/09-mvp-scope.md)の上限と`kio-ci`の定数を引き上げる（2026-10-10利用者判断）。R3の途中の候補は超過を
+  記録して進め、引き上げはR3終了検証の前に最終の実測値で一度だけ、独立したcommitで行う。responseをJSON値の包みにして
+  行数を節約することはしない。
 
 D工程は [docs/README §6](../docs/README.md) の「仕様書に書くもの / 書かないもの」を基準にする。
 
