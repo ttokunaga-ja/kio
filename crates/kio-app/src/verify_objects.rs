@@ -29,6 +29,10 @@ use serde_json::{Value, json};
 
 use crate::*;
 
+mod evidence_batch;
+
+use evidence_batch::run_evidence_batch;
+
 const MAX_OBJECTS: usize = 1_000_000;
 const MAX_VERIFIED_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
 const MAX_FINDINGS: usize = 1_024;
@@ -650,86 +654,6 @@ fn recheck_retarget_target(
         return Err(batch_changed_error());
     }
     Ok(())
-}
-
-fn run_evidence_batch(path: &Path, strict: bool) -> Result<Value> {
-    let bytes = read_bounded_regular_file(path, MAX_BATCH_INPUT_BYTES).map_err(|error| {
-        if matches!(
-            error.error_code(),
-            "KIO-E-STORE-OBJECT-TOO-LARGE-001" | "KIO-E-STORE-OBJECT-OVERSIZED-001"
-        ) {
-            batch_limit_error(0, "file_bytes", MAX_BATCH_INPUT_BYTES as usize)
-        } else {
-            error
-        }
-    })?;
-    let pointers = parse_batch_pointers(&bytes)?;
-    let input_sha256 = hash_bytes(&bytes);
-
-    let (verifications, _) =
-        kio_core::cas::with_verified_cas_read_budget(MAX_BATCH_VERIFIED_BYTES, || {
-            let bindings = bind_batch_scopes(&pointers, strict)?;
-            let mut cache = BTreeMap::<Vec<u8>, EvidenceVerification>::new();
-            let verifications = pointers
-                .iter()
-                .map(|pointer| verify_batch_row(pointer, strict, &bindings, &mut cache))
-                .collect::<Result<Vec<_>>>()?;
-            for binding in &bindings {
-                binding.recheck()?;
-            }
-            Ok(verifications)
-        })?;
-    let mut counts = BTreeMap::<&str, usize>::new();
-    for key in [
-        "alive",
-        "tombstoned",
-        "not_found",
-        "scope_unreachable",
-        "unverifiable",
-        "registry_duplicate",
-    ] {
-        counts.insert(key, 0);
-    }
-    let mut permanent = false;
-    let mut retryable = false;
-    let results = verifications
-        .iter()
-        .enumerate()
-        .map(|(index, verification)| {
-            let status = verification.result.status.as_str();
-            *counts.get_mut(status).expect("closed status set") += 1;
-            if strict {
-                match verification.exit {
-                    ExitCode::PermanentFailure => permanent = true,
-                    ExitCode::PartialFailure => retryable = true,
-                    _ => {}
-                }
-            } else if verification.exit == ExitCode::PartialFailure {
-                retryable = true;
-            }
-            json!({"line": index + 1, "result": verification.result})
-        })
-        .collect::<Vec<_>>();
-    let mut output = json!({
-        "schema": "kio.evidence.batch-verify",
-        "schema_version": 1,
-        "input_sha256": input_sha256,
-        "strict": strict,
-        "results": results,
-        "summary": {"total": pointers.len(), "status_counts": counts},
-        "verified_count": pointers.len(),
-    });
-    let exit = if strict && permanent {
-        ExitCode::PermanentFailure
-    } else if retryable {
-        ExitCode::PartialFailure
-    } else {
-        ExitCode::Success
-    };
-    if exit != ExitCode::Success {
-        set_exit_override(&mut output, exit);
-    }
-    Ok(output)
 }
 
 fn verify_batch_row(
