@@ -85,7 +85,7 @@ pub(crate) fn enqueue_all<R: Reconcile>(engine: &WatchEngine<R>, reason: DirtyRe
     }
 }
 
-#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(test)]
 mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};

@@ -100,7 +100,7 @@ pub(crate) fn sync_chunk_ledger_directory(directory: &File, path: &Path) -> Resu
     Ok(())
 }
 
-pub(crate) fn configure_private_cache_file(_options: &mut fs::OpenOptions) {}
+pub(crate) fn configure_owner_only_file(_options: &mut fs::OpenOptions) {}
 pub(crate) fn harden_open_cache_hit(_path: &Path) {}
 pub(crate) fn harden_open_cache_subtree(_leaf: &Path, _root: &Path) {}
 pub(crate) fn validate_cached_cas_links(_metadata: &fs::Metadata, _path: &Path) -> Result<()> {

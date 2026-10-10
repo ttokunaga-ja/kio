@@ -310,7 +310,6 @@ fn cross_parent_rename_rejects_symlink_endpoints_without_touching_outside() {
     );
 }
 
-#[cfg(any(unix, windows))]
 #[test]
 fn cross_parent_rename_uses_retained_parents_after_named_parent_replacement() {
     let root = store_root();

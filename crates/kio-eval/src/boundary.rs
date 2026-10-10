@@ -462,23 +462,21 @@ pub(crate) fn directory_identity_from_path(
     {
         use std::os::unix::fs::MetadataExt;
         let _ = path;
-        return Ok(
+        Ok(
             (listed.is_dir() && !listed.file_type().is_symlink()).then_some(
                 DirectoryIdentity::Unix {
                     dev: listed.dev(),
                     ino: listed.ino(),
                 },
             ),
-        );
+        )
     }
     #[cfg(windows)]
     {
         let _ = listed;
-        return kio_core::platform::real_directory_identity(path)
-            .map(|identity| identity.map(DirectoryIdentity::Windows));
+        kio_core::platform::real_directory_identity(path)
+            .map(|identity| identity.map(DirectoryIdentity::Windows))
     }
-    #[allow(unreachable_code)]
-    Ok(None)
 }
 
 pub(crate) fn directory_identity_from_file(
@@ -488,23 +486,19 @@ pub(crate) fn directory_identity_from_file(
     {
         use std::os::unix::fs::MetadataExt;
         let metadata = file.metadata()?;
-        return Ok(
+        Ok(
             (metadata.is_dir() && !metadata.file_type().is_symlink()).then_some(
                 DirectoryIdentity::Unix {
                     dev: metadata.dev(),
                     ino: metadata.ino(),
                 },
             ),
-        );
+        )
     }
     #[cfg(windows)]
     {
-        return Ok(
-            kio_core::platform::directory_handle_identity(file).map(DirectoryIdentity::Windows)
-        );
+        Ok(kio_core::platform::directory_handle_identity(file).map(DirectoryIdentity::Windows))
     }
-    #[allow(unreachable_code)]
-    Ok(None)
 }
 
 /// Durably flush a retained directory without relying on its capability handle

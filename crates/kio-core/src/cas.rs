@@ -4671,7 +4671,6 @@ mod tests {
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn cand_043_existing_hardlink_is_not_an_immutable_cas_slot() {
         let (dir, store) = object_store();
@@ -4847,7 +4846,6 @@ mod tests {
         assert!(first_path.exists() && second_path.exists());
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn bound_semantic_objects_preserve_identity_and_retained_namespace_after_replacement() {
         let fixture = tempfile::tempdir().unwrap();
@@ -5086,7 +5084,6 @@ mod tests {
         assert_eq!(failure.consumed_bytes, poisoned.len() as u64);
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn ct4_fsck_repair_raw_rejects_hardlink_without_external_unlink() {
         let (dir, store) = object_store();

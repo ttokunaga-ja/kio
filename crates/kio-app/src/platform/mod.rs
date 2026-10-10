@@ -16,8 +16,6 @@ pub(crate) use unix::*;
 #[cfg(target_os = "windows")]
 pub(crate) use windows::*;
 
-pub(crate) use configure_private_cache_file as configure_exact_cas_temp;
-
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[path = "unix/watch_native.rs"]
 mod watch_native;

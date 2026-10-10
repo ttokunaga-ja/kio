@@ -4,7 +4,6 @@
 
 // Successful mutation and process-interruption recovery use the same public
 // CLI contract on every supported desktop platform.
-#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 
 mod support;
 

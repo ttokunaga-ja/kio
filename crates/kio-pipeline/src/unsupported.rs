@@ -307,7 +307,6 @@ mod tests {
         assert_eq!(fs::read(&external).unwrap(), original);
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn r23_cand_014_hardlinked_store_never_alters_external_target() {
         let directory = tempfile::tempdir().unwrap();

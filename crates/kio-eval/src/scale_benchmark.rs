@@ -541,8 +541,6 @@ fn verify_deleted_restore(
     let links_are_safe = metadata.nlink() == 1;
     #[cfg(windows)]
     let links_are_safe = metadata.number_of_links() == Some(1);
-    #[cfg(not(any(unix, windows)))]
-    let links_are_safe = false;
     if !metadata.is_file()
         || metadata.file_type().is_symlink()
         || !links_are_safe
@@ -577,8 +575,6 @@ fn verify_deleted_restore(
     #[cfg(windows)]
     let opened_links_are_safe =
         opened.number_of_links() == Some(1) && after.number_of_links() == Some(1);
-    #[cfg(not(any(unix, windows)))]
-    let opened_links_are_safe = false;
     if !same_file(&metadata, &opened)
         || !same_file(&opened, &after)
         || !opened_links_are_safe
@@ -623,10 +619,6 @@ fn same_file(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
             if left_volume == right_volume && left_index == right_index
     )
 }
-#[cfg(not(any(unix, windows)))]
-fn same_file(_: &cap_fs::Metadata, _: &cap_fs::Metadata) -> bool {
-    false
-}
 fn open_metrics(parent: &fs::File) -> Result<(fs::File, cap_fs::Metadata), ScaleBenchmarkError> {
     let before = cap_fs::stat(
         parent,
@@ -638,8 +630,6 @@ fn open_metrics(parent: &fs::File) -> Result<(fs::File, cap_fs::Metadata), Scale
     let safe_links = before.nlink() == 1;
     #[cfg(windows)]
     let safe_links = before.number_of_links() == Some(1);
-    #[cfg(not(any(unix, windows)))]
-    let safe_links = false;
     if !before.is_file()
         || before.file_type().is_symlink()
         || !safe_links
@@ -672,8 +662,6 @@ fn open_metrics(parent: &fs::File) -> Result<(fs::File, cap_fs::Metadata), Scale
     #[cfg(windows)]
     let opened_links_safe =
         opened.number_of_links() == Some(1) && after.number_of_links() == Some(1);
-    #[cfg(not(any(unix, windows)))]
-    let opened_links_safe = false;
     if !opened.is_file()
         || !opened_links_safe
         || !same_file(&before, &opened)

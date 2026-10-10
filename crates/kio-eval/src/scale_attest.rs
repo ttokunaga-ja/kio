@@ -573,25 +573,17 @@ fn leaf_identity(metadata: &cap_fs::Metadata) -> LeafIdentity {
             index: metadata.file_index(),
         }
     }
-    #[cfg(not(any(unix, windows)))]
-    {
-        let _ = metadata;
-        LeafIdentity {}
-    }
 }
 
 fn same(a: &cap_fs::Metadata, b: &cap_fs::Metadata) -> bool {
     #[cfg(unix)]
     {
-        return a.dev() == b.dev() && a.ino() == b.ino();
+        a.dev() == b.dev() && a.ino() == b.ino()
     }
     #[cfg(windows)]
     {
-        return a.volume_serial_number() == b.volume_serial_number()
-            && a.file_index() == b.file_index();
+        a.volume_serial_number() == b.volume_serial_number() && a.file_index() == b.file_index()
     }
-    #[allow(unreachable_code)]
-    false
 }
 
 fn dir(parent: &fs::File, name: &str, label: &str) -> Result<fs::File, AttestError> {

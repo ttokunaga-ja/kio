@@ -1136,30 +1136,25 @@ fn links(m: &cap_fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
         use cap_fs::MetadataExt;
-        return m.nlink();
+        m.nlink()
     }
     #[cfg(windows)]
     {
         use cap_fs::_WindowsByHandle;
-        return u64::from(m.number_of_links().unwrap_or(0));
+        u64::from(m.number_of_links().unwrap_or(0))
     }
-    #[allow(unreachable_code)]
-    0
 }
 fn same(a: &cap_fs::Metadata, b: &cap_fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use cap_fs::MetadataExt;
-        return a.dev() == b.dev() && a.ino() == b.ino();
+        a.dev() == b.dev() && a.ino() == b.ino()
     }
     #[cfg(windows)]
     {
         use cap_fs::_WindowsByHandle;
-        return a.volume_serial_number() == b.volume_serial_number()
-            && a.file_index() == b.file_index();
+        a.volume_serial_number() == b.volume_serial_number() && a.file_index() == b.file_index()
     }
-    #[allow(unreachable_code)]
-    false
 }
 #[cfg(unix)]
 fn file_identity(metadata: &cap_fs::Metadata) -> FileIdentity {

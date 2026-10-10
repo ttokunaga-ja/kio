@@ -374,7 +374,6 @@ fn after_index_with_no_candidates_skips_without_creating_gc_state() {
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn after_index_sweeps_a_real_stale_tree_after_successful_index() {
     let (dir, commit, tree) = stale_candidate();
     configure(&dir, "after_index");
@@ -388,7 +387,6 @@ fn after_index_sweeps_a_real_stale_tree_after_successful_index() {
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn after_index_timeout_is_observable_and_next_invocations_converge_recovery() {
     let (dir, commit, tree) = stale_candidate();
     configure(&dir, "after_index");
@@ -427,7 +425,6 @@ fn after_index_timeout_is_observable_and_next_invocations_converge_recovery() {
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn automatic_receipt_crash_recovers_in_preflight_before_next_publication() {
     let (dir, commit, tree) = stale_candidate();
     configure(&dir, "after_index");
@@ -768,7 +765,6 @@ fn automatic_hook_resumes_marker_exchange_created_after_its_publication() {
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn completed_automatic_sweep_rotates_sqlite_before_and_after_tree_retirement() {
     let (dir, commit, tree) = stale_candidate();
     let generation_before = index_generation(&dir);
@@ -867,7 +863,6 @@ fn preview_and_failed_index_never_start_after_index_gc() {
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn child_scope_runs_its_explicit_after_index_hook_once_and_reports_it_to_parent() {
     let dir = canonical_tempdir();
     fs::write(dir.path().join("parent.md"), "parent\n").unwrap();
@@ -1012,7 +1007,6 @@ fn after_index_retains_a_tree_still_shared_by_a_protected_ref_tip() {
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn automatic_sweep_receipts_all_eligible_repaired_sharers_before_one_tree_removal() {
     let dir = canonical_tempdir();
     fs::write(dir.path().join("current.md"), "current\n").unwrap();

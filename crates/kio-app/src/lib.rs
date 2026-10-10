@@ -14290,7 +14290,7 @@ fn write_open_cache_atomic(cache: &Path, bytes: &[u8]) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut open_options = OpenOptions::new();
         open_options.write(true).create(true).truncate(true);
-        platform::configure_private_cache_file(&mut open_options);
+        platform::configure_owner_only_file(&mut open_options);
         let mut file = open_options
             .open(&temp)
             .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
@@ -25165,7 +25165,7 @@ fn atomic_write_cas_object(kio_dir: &Path, path: &Path, bytes: &[u8]) -> Result<
     let result = (|| -> Result<()> {
         let mut options = OpenOptions::new();
         options.write(true).create_new(true);
-        platform::configure_exact_cas_temp(&mut options);
+        platform::configure_owner_only_file(&mut options);
         let mut file = options
             .open(&temp)
             .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;

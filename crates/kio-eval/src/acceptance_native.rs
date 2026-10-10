@@ -1201,13 +1201,6 @@ fn create_boundary_link(link: &Path, target: &Path) -> Result<(), AcceptanceErro
     }
 }
 
-#[cfg(not(any(unix, windows)))]
-fn create_boundary_link(_link: &Path, _target: &Path) -> Result<(), AcceptanceError> {
-    Err(AcceptanceError::Invalid(
-        "native link-boundary acceptance is unsupported on this platform".into(),
-    ))
-}
-
 /// Capture every regular byte beneath a small sentinel tree without following
 /// links. The acceptance fixture is bounded so this remains a precise guard,
 /// rather than an unbounded filesystem walk.

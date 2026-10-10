@@ -824,16 +824,14 @@ fn same_file(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {
     #[cfg(unix)]
     {
         use cap_primitives::fs::MetadataExt;
-        return left.dev() == right.dev() && left.ino() == right.ino();
+        left.dev() == right.dev() && left.ino() == right.ino()
     }
     #[cfg(windows)]
     {
         use cap_primitives::fs::_WindowsByHandle;
-        return left.volume_serial_number() == right.volume_serial_number()
-            && left.file_index() == right.file_index();
+        left.volume_serial_number() == right.volume_serial_number()
+            && left.file_index() == right.file_index()
     }
-    #[allow(unreachable_code)]
-    false
 }
 
 fn discover_scopes(tree: RetainedDirectory) -> Result<Vec<RetainedDirectory>, QhardError> {

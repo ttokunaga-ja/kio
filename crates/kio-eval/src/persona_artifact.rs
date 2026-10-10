@@ -578,13 +578,6 @@ fn sync_parent(parent: &BoundParent) -> Result<(), PersonaArtifactError> {
         })?;
         recheck_parent(parent)
     }
-
-    #[cfg(not(any(unix, windows)))]
-    {
-        Err(PersonaArtifactError::Unsafe(
-            "artifact parent durability is unsupported on this platform".into(),
-        ))
-    }
 }
 
 fn regular(metadata: &cap_fs::Metadata, maximum: usize) -> bool {
@@ -683,15 +676,13 @@ fn links(metadata: &cap_fs::Metadata) -> u64 {
     #[cfg(unix)]
     {
         use cap_fs::MetadataExt;
-        return metadata.nlink();
+        metadata.nlink()
     }
     #[cfg(windows)]
     {
         use cap_fs::_WindowsByHandle;
-        return u64::from(metadata.number_of_links().unwrap_or(0));
+        u64::from(metadata.number_of_links().unwrap_or(0))
     }
-    #[allow(unreachable_code)]
-    0
 }
 
 fn identity(metadata: &cap_fs::Metadata) -> FileIdentity {
@@ -711,8 +702,6 @@ fn identity(metadata: &cap_fs::Metadata) -> FileIdentity {
             index: metadata.file_index().unwrap_or(0),
         }
     }
-    #[cfg(not(any(unix, windows)))]
-    unreachable!()
 }
 
 fn same(left: &cap_fs::Metadata, right: &cap_fs::Metadata) -> bool {

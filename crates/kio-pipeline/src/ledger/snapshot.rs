@@ -983,8 +983,6 @@ mod tests {
             fs::create_dir(&path).unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         }
-        #[cfg(not(any(unix, windows)))]
-        fs::create_dir(&path).unwrap();
         fs::canonicalize(path).unwrap()
     }
 

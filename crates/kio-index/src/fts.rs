@@ -2919,7 +2919,6 @@ mod tests {
         );
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn bound_gc_rotation_stays_on_retained_kio_capability_and_reports_missing() {
         let directory = tempfile::tempdir().unwrap();
@@ -3070,7 +3069,6 @@ mod tests {
         );
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn source_index_hardlinks_are_rejected_without_touching_the_other_path() {
         #[cfg(unix)]

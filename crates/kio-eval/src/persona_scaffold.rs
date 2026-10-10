@@ -1044,10 +1044,6 @@ fn same_directory_cap(a: &cap_fs::Metadata, b: &cap_fs::Metadata) -> bool {
             if a_volume == b_volume && a_index == b_index
     )
 }
-#[cfg(not(any(unix, windows)))]
-fn same_directory_cap(_: &cap_fs::Metadata, _: &cap_fs::Metadata) -> bool {
-    false
-}
 #[cfg(unix)]
 fn validate_parent_permissions(metadata: &fs::Metadata) -> Result<(), PersonaScaffoldError> {
     use std::os::unix::fs::MetadataExt;

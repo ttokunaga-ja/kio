@@ -4723,7 +4723,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn bound_repository_session_rejects_replaced_public_kio() {
         let root = tempfile::tempdir().unwrap();

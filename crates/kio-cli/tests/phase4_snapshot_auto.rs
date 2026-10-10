@@ -331,7 +331,6 @@ fn tree_paths(dir: &TempDir) -> Vec<String> {
         .collect()
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn stale_gc_candidate(mode: &str) -> (TempDir, String, String) {
     let old = "2025-01-01T00:00:00Z";
     let dir = canonical_tempdir();
@@ -375,7 +374,6 @@ fn skips_disabled_missing_and_not_indexed_without_mutating_kio() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn first_run_noop_advances_canonical_state_and_json_and_human_agree() {
     let dir = indexed_fixture(60, 99);
@@ -407,7 +405,6 @@ fn first_run_noop_advances_canonical_state_and_json_and_human_agree() {
     assert!(human.contains("eligibility_reason: interval_elapsed"));
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn interval_boundaries_and_threshold_boundaries_are_deterministic() {
     let dir = indexed_fixture(60, 2);
@@ -432,7 +429,6 @@ fn interval_boundaries_and_threshold_boundaries_are_deterministic() {
     assert_eq!(after["eligibility_reason"], "interval_elapsed");
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn scheduled_counts_add_edit_delete_and_rename() {
     let dir = indexed_fixture(3600, 1);
@@ -458,7 +454,6 @@ fn scheduled_counts_add_edit_delete_and_rename() {
     assert_eq!(rename["stats"]["files_deleted"], 1);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn ignored_and_tier_a_inputs_do_not_change_snapshot() {
     let dir = canonical_tempdir();
@@ -514,7 +509,6 @@ fn symlink_is_rejected_before_snapshot_mutation() {
     assert_eq!(head(&dir), before);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn hardlinked_working_file_is_rejected_before_snapshot_mutation() {
     let dir = indexed_fixture(60, 1);
@@ -541,7 +535,6 @@ fn hardlinked_working_file_is_rejected_before_snapshot_mutation() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn auto_preserves_existing_normalize_refs_and_never_runs_after_index_gc() {
     let dir = indexed_fixture(60, 1);
@@ -602,7 +595,6 @@ fn auto_preserves_existing_normalize_refs_and_never_runs_after_index_gc() {
     assert!(!dir.path().join(".kio/gc/internal/trees").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn clock_rollback_is_retryable_and_does_not_move_state_or_head() {
     let dir = indexed_fixture(60, 99);
@@ -626,7 +618,6 @@ fn clock_rollback_is_retryable_and_does_not_move_state_or_head() {
     assert_eq!(fs::read(state_path).unwrap(), before_state);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn tool_lock_only_change_waits_for_interval_then_creates_auto_commit() {
     let dir = indexed_fixture(60, 99);
@@ -664,7 +655,6 @@ fn tool_lock_only_change_waits_for_interval_then_creates_auto_commit() {
     assert_eq!(after.commit_type, CommitType::Auto);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn tool_lock_change_at_checkpoint_boundary_cannot_be_reported_as_noop() {
     let dir = indexed_fixture(60, 99);
@@ -708,7 +698,6 @@ fn tool_lock_change_at_checkpoint_boundary_cannot_be_reported_as_noop() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn ref_advance_at_checkpoint_boundary_is_preserved_and_rejected() {
     let dir = indexed_fixture(60, 1);
@@ -759,7 +748,6 @@ fn ref_advance_at_checkpoint_boundary_is_preserved_and_rejected() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn torn_head_capture_is_rejected_as_authority_change() {
     let dir = indexed_fixture(60, 1);
@@ -800,7 +788,6 @@ fn torn_head_capture_is_rejected_as_authority_change() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn malformed_checkpoint_temp_fails_before_snapshot_publication() {
     let dir = indexed_fixture(60, 1);
@@ -829,7 +816,6 @@ fn malformed_checkpoint_temp_fails_before_snapshot_publication() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn concurrent_checkpoint_replacement_is_preserved_and_fails_closed() {
     let dir = indexed_fixture(60, 99);
@@ -887,7 +873,6 @@ fn concurrent_checkpoint_replacement_is_preserved_and_fails_closed() {
     assert_eq!(head(&dir), before_head);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn concurrent_first_checkpoint_publication_is_no_clobber() {
     let dir = indexed_fixture(60, 99);
@@ -932,7 +917,6 @@ fn concurrent_first_checkpoint_publication_is_no_clobber() {
     }));
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn crash_after_checkpoint_temp_fsync_is_recovered_without_residue() {
     let dir = indexed_fixture(60, 99);
@@ -967,7 +951,6 @@ fn crash_after_checkpoint_temp_fsync_is_recovered_without_residue() {
     }));
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn crash_after_checkpoint_before_ref_keeps_cooldown_and_head_boundary() {
     let dir = indexed_fixture(60, 99);
@@ -999,10 +982,7 @@ fn crash_after_checkpoint_before_ref_keeps_cooldown_and_head_boundary() {
     assert_ne!(head(&dir), before_head);
 }
 
-#[cfg(all(
-    debug_assertions,
-    any(target_os = "macos", target_os = "linux", windows)
-))]
+#[cfg(debug_assertions)]
 #[test]
 fn live_writer_lock_rejects_scheduled_snapshot_without_state_publication() {
     let dir = indexed_fixture(60, 1);
@@ -1034,7 +1014,6 @@ fn live_writer_lock_rejects_scheduled_snapshot_without_state_publication() {
     assert!(first_output.status.success());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn config_inode_replacement_at_publication_is_retryable_and_nonpublishing() {
     let dir = indexed_fixture(60, 1);
@@ -1072,7 +1051,6 @@ fn config_inode_replacement_at_publication_is_retryable_and_nonpublishing() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn ignore_policy_change_at_writer_boundary_is_rejected_before_cas() {
     let dir = indexed_fixture(60, 1);
@@ -1104,7 +1082,6 @@ fn ignore_policy_change_at_writer_boundary_is_rejected_before_cas() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn working_file_change_after_final_observation_is_not_published() {
     let dir = indexed_fixture(60, 1);
@@ -1155,7 +1132,7 @@ fn working_file_change_after_final_observation_is_not_published() {
     );
 }
 
-#[cfg(all(unix, any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(unix)]
 #[test]
 fn unsafe_symlink_added_at_writer_boundary_is_rejected_before_cas() {
     use std::os::unix::fs::symlink;
@@ -1187,7 +1164,6 @@ fn unsafe_symlink_added_at_writer_boundary_is_rejected_before_cas() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn hardlink_added_at_writer_boundary_is_rejected_before_cas() {
     let dir = indexed_fixture(60, 1);
@@ -1257,7 +1233,6 @@ fn non_utf8_leaf_added_at_writer_boundary_is_rejected_before_cas() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn scope_replacement_at_writer_boundary_cannot_mutate_either_store() {
     let dir = indexed_fixture(60, 1);
@@ -1308,7 +1283,7 @@ fn scope_replacement_at_writer_boundary_cannot_mutate_either_store() {
     );
 }
 
-#[cfg(all(unix, any(target_os = "macos", target_os = "linux", windows)))]
+#[cfg(unix)]
 #[test]
 fn object_namespace_replacement_after_binding_cannot_redirect_publication() {
     use std::os::unix::fs::symlink;
@@ -1350,7 +1325,6 @@ fn object_namespace_replacement_after_binding_cannot_redirect_publication() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn scope_replacement_before_lock_cannot_write_the_replacement_store() {
     let dir = indexed_fixture(60, 1);
@@ -1394,7 +1368,6 @@ fn scope_replacement_before_lock_cannot_write_the_replacement_store() {
     assert!(!dir.path().join(".kio-retained/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn scope_replacement_before_gc_preflight_cannot_resume_the_victim_marker() {
     let dir = indexed_fixture(60, 1);
@@ -1451,7 +1424,6 @@ fn scope_replacement_before_gc_preflight_cannot_resume_the_victim_marker() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn active_purge_barrier_blocks_raw_republication_and_state_advance() {
     let dir = indexed_fixture(60, 1);
@@ -1510,7 +1482,6 @@ fn active_purge_barrier_blocks_raw_republication_and_state_advance() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn purge_journal_created_at_writer_boundary_blocks_before_cas() {
     let dir = indexed_fixture(60, 1);
@@ -1544,7 +1515,6 @@ fn purge_journal_created_at_writer_boundary_blocks_before_cas() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn disabled_scheduler_does_not_resume_an_after_index_marker() {
     let (dir, _, tree) = stale_gc_candidate("after_index");
@@ -1573,7 +1543,6 @@ fn disabled_scheduler_does_not_resume_an_after_index_marker() {
     );
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn active_manual_gc_marker_remains_an_ordinary_writer_barrier() {
     let (dir, _, _) = stale_gc_candidate("manual_only");
@@ -1601,7 +1570,6 @@ fn active_manual_gc_marker_remains_an_ordinary_writer_barrier() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn active_after_index_marker_is_recovered_before_scheduled_publication() {
     let (dir, commit, tree) = stale_gc_candidate("after_index");

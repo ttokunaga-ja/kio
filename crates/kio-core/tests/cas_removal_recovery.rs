@@ -1,5 +1,4 @@
 //! Explicit hash-authorized retry of interrupted CAS removals.
-#![cfg(any(unix, windows))]
 
 use std::{
     fs,

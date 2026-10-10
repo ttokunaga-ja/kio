@@ -1,5 +1,3 @@
-#![cfg(any(unix, windows))]
-
 use std::io::Cursor;
 
 use kio_core::cas::{

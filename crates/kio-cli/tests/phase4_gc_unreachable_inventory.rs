@@ -1,7 +1,5 @@
 //! Milestone 8's public read-only inventory entry point.
 
-#![cfg(any(unix, windows))]
-
 mod support;
 
 use support::canonical_tempdir;

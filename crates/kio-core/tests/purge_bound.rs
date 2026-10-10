@@ -1,5 +1,3 @@
-#![cfg(any(unix, windows))]
-
 use kio_core::{
     cas::hash_bytes,
     purge::{LifecycleEvent, PurgeReason, PurgeState},

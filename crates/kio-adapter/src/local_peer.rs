@@ -287,16 +287,12 @@ pub(crate) fn is_local_peer_tls_error(error: &ureq::Error) -> bool {
 mod tests {
     use super::*;
     use std::fs;
-    #[cfg(any(unix, windows))]
     use std::io::{Read as _, Write as _};
-    #[cfg(any(unix, windows))]
     use std::net::{TcpListener, TcpStream};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
-    #[cfg(any(unix, windows))]
     use std::sync::Arc;
 
-    #[cfg(any(unix, windows))]
     fn private_ca_file(pem: &str) -> (tempfile::TempDir, PathBuf) {
         // The platform temp root can itself be a symlink (notably `/var` on
         // macOS), which the production trust reader must reject.  Place this
@@ -448,7 +444,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(unix, windows))]
     fn read_http_request(
         stream: &mut rustls::StreamOwned<rustls::ServerConnection, TcpStream>,
     ) -> Vec<u8> {
@@ -478,14 +473,12 @@ mod tests {
         }
     }
 
-    #[cfg(any(unix, windows))]
     fn localhost_server(
         response: &'static str,
     ) -> (String, String, std::thread::JoinHandle<Vec<u8>>) {
         tls_server_for_names(vec!["127.0.0.1".to_owned()], response)
     }
 
-    #[cfg(any(unix, windows))]
     fn tls_server_for_names(
         names: Vec<String>,
         response: &'static str,
@@ -515,7 +508,6 @@ mod tests {
         (format!("https://{address}"), cert.pem(), task)
     }
 
-    #[cfg(any(unix, windows))]
     fn expired_server(
         response: &'static str,
     ) -> (String, String, std::thread::JoinHandle<Vec<u8>>) {
@@ -547,10 +539,8 @@ mod tests {
         (format!("https://{address}"), cert.pem(), task)
     }
 
-    #[cfg(any(unix, windows))]
     type LocalClientCase = (&'static str, fn(AuthenticatedLocalEndpoint) -> Result<()>);
 
-    #[cfg(any(unix, windows))]
     fn local_client_cases() -> Vec<LocalClientCase> {
         use crate::local_embedding::{EnvLocalEmbeddingClient, LocalEmbeddingClient};
         use crate::local_ocr_markdownize::{EnvLocalOcrClient, LayoutFileType, LocalOcrClient};
@@ -599,7 +589,6 @@ mod tests {
         );
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn private_anchor_rejects_missing_relative_and_hardlinked_files() {
         #[cfg(unix)]
@@ -632,7 +621,6 @@ mod tests {
         assert!(kio_core::private_fs::read_private_file(&path, MAX_CA_PEM_BYTES).is_err());
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn trusted_peer_completes_tls_and_anchor_rotation_is_reloaded() {
         let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
@@ -660,7 +648,6 @@ mod tests {
         assert!(!digest.is_empty());
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn bound_endpoint_refuses_a_valid_ca_rotation_before_any_tls_request() {
         let rcgen::CertifiedKey { cert, .. } =
@@ -692,7 +679,6 @@ mod tests {
         );
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn wrong_ca_fails_before_an_http_body_is_sent() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -727,7 +713,6 @@ mod tests {
         );
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn wrong_san_is_rejected_before_http_is_available() {
         let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -745,7 +730,6 @@ mod tests {
         assert!(server.join().unwrap().is_empty());
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn expired_certificate_is_rejected_before_http_is_available() {
         let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -763,7 +747,6 @@ mod tests {
         assert!(server.join().unwrap().is_empty());
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn every_local_client_posts_only_after_the_shared_peer_is_authenticated() {
         let cases = local_client_cases();
@@ -785,7 +768,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn every_local_client_classifies_bad_tls_peers_as_permanent_before_request_body() {
         let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
@@ -820,7 +802,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(unix, windows))]
     #[test]
     fn local_connection_refusal_remains_retryable_network_error() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

@@ -243,19 +243,7 @@ fn active_marker_blocks_fsck_repair_and_restore_before_destination_side_effects(
     let fsck = fsck_output.stdout;
     let value: Value = serde_json::from_slice(&fsck).unwrap();
     let findings = value["remaining_findings"].as_array().unwrap();
-    #[cfg(any(unix, windows))]
     assert!(findings.iter().any(|f| f["kind"] == "gc_sweep_incomplete"));
-    #[cfg(not(any(unix, windows)))]
-    {
-        // Phase E requires unsupported platforms to fail closed rather than
-        // advertising a resumable descriptor-bound sweep.
-        assert!(
-            findings
-                .iter()
-                .any(|f| f["kind"] == "gc_sweep_marker_corrupt")
-        );
-        assert!(!findings.iter().any(|f| f["kind"] == "gc_sweep_incomplete"));
-    }
     assert_eq!(
         marker_before,
         fs::read(dir.path().join(".kio/gc/in_progress")).unwrap()
@@ -303,19 +291,7 @@ fn every_frozen_receipt_tree_transition_is_recovery_pending() {
             .clone();
         let value: Value = serde_json::from_slice(&output).unwrap();
         let findings = value["remaining_findings"].as_array().unwrap();
-        #[cfg(any(unix, windows))]
         assert!(findings.iter().any(|f| f["kind"] == "gc_sweep_incomplete"));
-        #[cfg(not(any(unix, windows)))]
-        {
-            // Phase E requires unsupported platforms to fail closed rather
-            // than advertising a resumable descriptor-bound sweep.
-            assert!(
-                findings
-                    .iter()
-                    .any(|f| f["kind"] == "gc_sweep_marker_corrupt")
-            );
-            assert!(!findings.iter().any(|f| f["kind"] == "gc_sweep_incomplete"));
-        }
         assert_eq!(
             marker_before,
             fs::read(dir.path().join(".kio/gc/in_progress")).unwrap()
@@ -364,8 +340,7 @@ fn absent_pre_sweep_marker_cannot_authorize_retirement_against_live_index() {
     marker = session.bind_operation_receipts(&marker).unwrap();
     marker.phase = GcSweepPhase::Sweeping;
     // This models a forged on-disk marker.  Do not invoke the production
-    // publication primitive: Phase E keeps that descriptor-bound mutation
-    // fail-closed on unsupported platforms.
+    // publication primitive.
     let marker_path = dir.path().join(".kio/gc/in_progress");
     fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
     fs::write(&marker_path, marker.canonical_bytes().unwrap()).unwrap();
@@ -467,7 +442,6 @@ fn phase_impossible_marker_is_corruption_not_recovery_pending() {
 }
 
 #[test]
-#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn final_shallow_ancestor_with_chunks_keeps_verify_and_rebuild_available() {
     let dir = canonical_tempdir();
     fs::write(

@@ -132,7 +132,7 @@ pub(crate) fn sync_chunk_ledger_directory(directory: &File, path: &Path) -> Resu
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))
 }
 
-pub(crate) fn configure_private_cache_file(options: &mut fs::OpenOptions) {
+pub(crate) fn configure_owner_only_file(options: &mut fs::OpenOptions) {
     options.mode(0o600);
 }
 
