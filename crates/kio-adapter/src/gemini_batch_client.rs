@@ -36,8 +36,10 @@
 //! the hermetic suite (`docs/07-adapter-spec.md` §5.3); the contract is covered through the mock
 //! seam ([`TEST_GEMINI_BATCH_ENV`]).
 
+use crate::tool_lock::AdapterRuntimeSettings;
 #[cfg(debug_assertions)]
 use std::io::Write as _;
+use std::sync::Arc;
 
 #[cfg(debug_assertions)]
 use serde::Deserialize;
@@ -508,8 +510,11 @@ pub struct EnvGeminiBatchClient {
 }
 
 impl EnvGeminiBatchClient {
-    pub fn new(context: &BatchRecoveryContext) -> Result<Self> {
-        let credential = crate::tool_lock::resolve_role_api_key("embedding")?.ok_or_else(|| {
+    pub fn new(
+        settings: Arc<AdapterRuntimeSettings>,
+        context: &BatchRecoveryContext,
+    ) -> Result<Self> {
+        let credential = settings.resolve_role_api_key("embedding")?.ok_or_else(|| {
             AdapterError::Auth("declared gemini batch credential is unavailable".into())
         })?;
         Self::from_captured(context, GEMINI_API_ORIGIN, credential)
@@ -528,18 +533,14 @@ impl EnvGeminiBatchClient {
     }
 
     #[cfg(test)]
-    fn with_base_url(base_url: impl Into<String>) -> Self {
-        crate::tool_lock::with_test_role_auth("embedding", || {
-            let credential = crate::tool_lock::resolve_role_api_key("embedding")
-                .unwrap()
-                .unwrap();
-            Self::from_captured(
-                &BatchRecoveryContext::from_key([7; 32]),
-                &base_url.into(),
-                credential,
-            )
-            .unwrap()
-        })
+    fn with_base_url(settings: Arc<AdapterRuntimeSettings>, base_url: impl Into<String>) -> Self {
+        let credential = settings.resolve_role_api_key("embedding").unwrap().unwrap();
+        Self::from_captured(
+            &BatchRecoveryContext::from_key([7; 32]),
+            &base_url.into(),
+            credential,
+        )
+        .unwrap()
     }
 
     fn base_url(&self) -> &str {
@@ -969,6 +970,7 @@ impl GeminiBatchClient for MockGeminiBatchClient {
 /// is resolvable from declared `tools.toml [embedding] auth`.
 /// `None` means the lane is unavailable and the caller must not send.
 pub fn resolve_gemini_batch_client(
+    settings: &AdapterRuntimeSettings,
     recovery_context: impl FnOnce() -> Result<BatchRecoveryContext>,
 ) -> Result<Option<Box<dyn GeminiBatchClient>>> {
     #[cfg(debug_assertions)]
@@ -978,7 +980,7 @@ pub fn resolve_gemini_batch_client(
             return Ok(Some(Box::new(MockGeminiBatchClient::from_env_value(&raw)?)));
         }
     }
-    if let Some(credential) = crate::tool_lock::resolve_role_api_key("embedding")? {
+    if let Some(credential) = settings.resolve_role_api_key("embedding")? {
         let context = recovery_context()?;
         return Ok(Some(Box::new(EnvGeminiBatchClient::from_captured(
             &context,
@@ -1008,13 +1010,13 @@ mod tests {
         let old = crate::batch_recovery::with_test_env_credential(
             "embedding",
             "KIO_TEST_CAPTURED_BATCH_KEY",
-            || {
-                let old = EnvGeminiBatchClient::new(&context).unwrap();
+            |settings| {
+                let old = EnvGeminiBatchClient::new(Arc::new(settings.clone()), &context).unwrap();
                 let _rotated = kio_core::test_control::TestEnvGuard::set(
                     "KIO_TEST_CAPTURED_BATCH_KEY",
                     "credential-after",
                 );
-                let new = EnvGeminiBatchClient::new(&context).unwrap();
+                let new = EnvGeminiBatchClient::new(Arc::new(settings.clone()), &context).unwrap();
                 assert_ne!(
                     old.provider_scope_id().unwrap(),
                     new.provider_scope_id().unwrap()
@@ -1098,7 +1100,7 @@ mod tests {
         );
     }
 
-    fn with_test_gemini_auth<T>(operation: impl FnOnce() -> T) -> T {
+    fn with_test_gemini_auth<T>(operation: impl FnOnce(&AdapterRuntimeSettings) -> T) -> T {
         crate::tool_lock::with_test_role_auth("embedding", operation)
     }
 
@@ -1513,9 +1515,11 @@ mod tests {
                 r#"{"operations":[{"name":"batches/after-empty","state":"BATCH_STATE_RUNNING"}]}"#,
             ),
         ]);
-        let client = EnvGeminiBatchClient::with_base_url(base);
+        let client = with_test_gemini_auth(|settings| {
+            EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base)
+        });
 
-        let jobs = with_test_gemini_auth(|| client.list_jobs()).unwrap();
+        let jobs = client.list_jobs().unwrap();
 
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].name, "batches/after-empty");
@@ -1538,9 +1542,11 @@ mod tests {
             http_response(r#"{"operations":[],"nextPageToken":"again"}"#),
             http_response(r#"{"operations":[],"nextPageToken":"again"}"#),
         ]);
-        let client = EnvGeminiBatchClient::with_base_url(base);
+        let client = with_test_gemini_auth(|settings| {
+            EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base)
+        });
 
-        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        let error = client.list_jobs().unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(_)));
         assert_eq!(server.join().unwrap().len(), 2);
     }
@@ -1554,8 +1560,10 @@ mod tests {
         let (base, server, _trust) = spawn_listing_server(vec![http_response(
             r#"{"operations":[],"nextPageToken":17}"#,
         )]);
-        let client = EnvGeminiBatchClient::with_base_url(base);
-        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        let client = with_test_gemini_auth(|settings| {
+            EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base)
+        });
+        let error = client.list_jobs().unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(_)));
         assert_eq!(server.join().unwrap().len(), 1);
 
@@ -1570,8 +1578,10 @@ mod tests {
         let (base, server, _trust) = spawn_listing_server(vec![http_response(
             &json!({ "operations": operations }).to_string(),
         )]);
-        let client = EnvGeminiBatchClient::with_base_url(base);
-        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        let client = with_test_gemini_auth(|settings| {
+            EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base)
+        });
+        let error = client.list_jobs().unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(_)));
         assert_eq!(server.join().unwrap().len(), 1);
     }
@@ -1589,9 +1599,11 @@ mod tests {
             })
             .collect();
         let (base, server, _trust) = spawn_listing_server(responses);
-        let client = EnvGeminiBatchClient::with_base_url(base);
+        let client = with_test_gemini_auth(|settings| {
+            EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base)
+        });
 
-        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        let error = client.list_jobs().unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(_)));
         assert_eq!(server.join().unwrap().len(), BATCH_LIST_MAX_PAGES);
     }

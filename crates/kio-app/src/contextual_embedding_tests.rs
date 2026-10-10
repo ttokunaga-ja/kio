@@ -265,6 +265,9 @@ fn assert_sqlite_text_is_not_embedding_authority(repo: &Repository) {
 
 #[test]
 fn rename_retains_contexts_and_rebuild_selects_allowed_head_then_history() {
+    let adapter_settings =
+        &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+
     if !isolated_child_for(
         "contextual_embedding_tests::rename_retains_contexts_and_rebuild_selects_allowed_head_then_history",
     ) {
@@ -274,7 +277,7 @@ fn rename_retains_contexts_and_rebuild_selects_allowed_head_then_history() {
     // deterministic adapter is selected directly by its release-capable env
     // resolver and requires no CLI-only bootstrap.
     assert!(matches!(
-        active_embedding_execution(),
+        active_embedding_execution(adapter_settings),
         Some(EmbeddingExecution::DeterministicEvaluator)
     ));
     let root = private_tempdir();
@@ -989,6 +992,9 @@ fn contextual_task_mixed_outcomes_crash_recovery_and_retry_are_independent() {
 
 #[test]
 fn persisted_embedding_consent_requires_the_exact_builtin_identity() {
+    let adapter_settings =
+        &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+
     use kio_adapter::catalog::AdoptedEmbeddingExecution;
     use kio_adapter::tool_lock::{EmbeddingToolLockEntry, ToolLock};
     if !isolated_child_for(
@@ -997,7 +1003,7 @@ fn persisted_embedding_consent_requires_the_exact_builtin_identity() {
         return;
     }
     assert!(matches!(
-        active_embedding_execution(),
+        active_embedding_execution(adapter_settings),
         Some(EmbeddingExecution::DeterministicEvaluator)
     ));
     let root = private_tempdir();
@@ -1056,6 +1062,7 @@ fn persisted_embedding_consent_requires_the_exact_builtin_identity() {
         if !exempt {
             assert!(
                 !approvals::allowed(
+                    adapter_settings,
                     &repo,
                     approvals::AdapterRole::Embedding,
                     &persisted.tool_id,

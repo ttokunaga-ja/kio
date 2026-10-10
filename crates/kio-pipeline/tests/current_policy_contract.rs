@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
@@ -155,6 +156,8 @@ fn managed_preview_applies_parent_deny_before_opening_raw_bytes() {
     fs::hard_link(&source, target.canonical_root().join("private.md")).unwrap();
 
     let preview = build_managed_scan_preview(
+        &BTreeMap::new(),
+        &BTreeMap::new(),
         &target,
         ScanPreviewRequest {
             scope_path: "ignored-display-path".to_owned(),
@@ -180,6 +183,8 @@ fn managed_preview_is_read_only_and_presend_policy_is_live() {
     let config = fs::read(target.canonical_root().join(".kio/config.toml")).unwrap();
     let ignore = fs::read(target.canonical_root().join(".kioignore")).unwrap_or_default();
     let _ = build_managed_scan_preview(
+        &BTreeMap::new(),
+        &BTreeMap::new(),
         &target,
         ScanPreviewRequest {
             scope_path: String::new(),
@@ -223,6 +228,8 @@ fn planned_child_preview_uses_retained_rules_before_hashing() {
     let plan = discover_managed_child_scopes(&root).unwrap();
     let bound = bind_planned_child(&plan, "child").unwrap().unwrap();
     let preview = build_planned_child_scan_preview(
+        &BTreeMap::new(),
+        &BTreeMap::new(),
         &bound,
         ScanPreviewRequest {
             scope_path: "display-only".to_owned(),

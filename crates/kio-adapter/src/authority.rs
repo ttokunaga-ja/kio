@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::tool_lock::{self, DeclaredAdapter};
+use crate::tool_lock::{self, AdapterRuntimeSettings, DeclaredAdapter};
 use crate::{AdapterError, Result};
 
 const MISTRAL_OCR_AND_BATCH_DESTINATIONS: &str = "https://api.mistral.ai/v1/batch/jobs|https://api.mistral.ai/v1/files|https://api.mistral.ai/v1/ocr";
@@ -46,24 +46,25 @@ pub struct RuntimeExecutionIdentity {
     pub trust_binding: String,
 }
 
-/// Build an identity for the runtime declaration installed by the composition
+/// Build an identity for the runtime declaration owned by the composition
 /// root. Built-in online targets retain their fixed destination identity when a
 /// declaration is absent, but expose their missing credential as
 /// `unconfigured`; unsupported and declared-invalid targets fail closed.
 pub fn runtime_execution_identity(
+    settings: &AdapterRuntimeSettings,
     request: RuntimeExecutionIdentityRequest<'_>,
 ) -> Result<RuntimeExecutionIdentity> {
     if request.tool_profile_hash.is_empty() {
         return Err(schema("tool_profile_hash must not be empty"));
     }
-    let declared = tool_lock::registered_declared_adapter(request.role);
+    let declared = settings.declared_adapter(request.role);
     if let Some(declared) = declared.as_ref() {
         tool_lock::validate_declared_runtime_target(request.role, declared)?;
     }
 
     match request.role {
-        "markdown" => markdown_identity(request, declared.as_ref()),
-        "embedding" => embedding_identity(request, declared.as_ref()),
+        "markdown" => markdown_identity(settings, request, declared.as_ref()),
+        "embedding" => embedding_identity(settings, request, declared.as_ref()),
         // `tool_lock` currently reserves this role, so it cannot supply a
         // registered, validated local reranker.  There is also no online
         // rerank implementation to describe.  Do not mint an approval for
@@ -74,6 +75,7 @@ pub fn runtime_execution_identity(
 }
 
 fn markdown_identity(
+    settings: &AdapterRuntimeSettings,
     request: RuntimeExecutionIdentityRequest<'_>,
     declared: Option<&DeclaredAdapter>,
 ) -> Result<RuntimeExecutionIdentity> {
@@ -86,12 +88,13 @@ fn markdown_identity(
             declared,
             MISTRAL_OCR_AND_BATCH_DESTINATIONS,
         ),
-        "paddleocr_vl_local" => local_identity(request, tool_id, declared),
+        "paddleocr_vl_local" => local_identity(settings, request, tool_id, declared),
         _ => Err(schema("declared markdown target is unsupported")),
     }
 }
 
 fn embedding_identity(
+    settings: &AdapterRuntimeSettings,
     request: RuntimeExecutionIdentityRequest<'_>,
     declared: Option<&DeclaredAdapter>,
 ) -> Result<RuntimeExecutionIdentity> {
@@ -107,7 +110,7 @@ fn embedding_identity(
             );
             online_identity(request, tool_id, declared, &destination)
         }
-        "qwen3_vl_embedding_local" => local_identity(request, tool_id, declared),
+        "qwen3_vl_embedding_local" => local_identity(settings, request, tool_id, declared),
         _ => Err(schema("declared embedding target is unsupported")),
     }
 }
@@ -150,6 +153,7 @@ fn online_identity(
 }
 
 fn local_identity(
+    settings: &AdapterRuntimeSettings,
     request: RuntimeExecutionIdentityRequest<'_>,
     tool_id: &str,
     declared: Option<&DeclaredAdapter>,
@@ -159,7 +163,7 @@ fn local_identity(
         .url
         .as_deref()
         .ok_or_else(|| schema("offline_api adapter has no declared url"))?;
-    let endpoint = tool_lock::authenticated_local_endpoint(request.role, url)?;
+    let endpoint = settings.authenticated_local_endpoint(request.role, url)?;
     Ok(RuntimeExecutionIdentity {
         role: request.role.to_owned(),
         tool_id: tool_id.to_owned(),
@@ -171,7 +175,7 @@ fn local_identity(
         // the captured digest. The grant additionally binds the managed
         // lifecycle generation, preventing an A→B→A CA sequence from
         // reviving a grant minted for the original A generation.
-        trust_binding: tool_lock::registered_local_peer_trust_binding()?,
+        trust_binding: settings.local_peer_trust_binding()?,
     })
 }
 
@@ -218,7 +222,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
-    use crate::tool_lock::{AdapterRuntimeSettings, with_runtime_settings};
+    use crate::tool_lock::AdapterRuntimeSettings;
 
     fn declared(tool_id: &str, kind: &str, auth: &str) -> DeclaredAdapter {
         DeclaredAdapter {
@@ -240,26 +244,27 @@ mod tests {
     fn with_declaration<T>(
         role: &str,
         declaration: DeclaredAdapter,
-        operation: impl FnOnce() -> T,
+        operation: impl FnOnce(&AdapterRuntimeSettings) -> T,
     ) -> T {
         let mut declarations = HashMap::new();
         declarations.insert(role.to_owned(), declaration);
-        with_runtime_settings(
-            AdapterRuntimeSettings {
-                declarations,
-                ..AdapterRuntimeSettings::default()
-            },
-            operation,
-        )
+        operation(&AdapterRuntimeSettings {
+            declarations,
+            ..AdapterRuntimeSettings::default()
+        })
     }
 
     #[test]
     fn undeclared_builtin_uses_the_catalog_default_without_reading_its_secret() {
-        let identity = runtime_execution_identity(RuntimeExecutionIdentityRequest {
-            role: "embedding",
-            tool_id: "gemini_embedding_2",
-            tool_profile_hash: "sha256:builtin-profile",
-        })
+        let settings = &AdapterRuntimeSettings::default();
+        let identity = runtime_execution_identity(
+            settings,
+            RuntimeExecutionIdentityRequest {
+                role: "embedding",
+                tool_id: "gemini_embedding_2",
+                tool_profile_hash: "sha256:builtin-profile",
+            },
+        )
         .unwrap();
         assert_eq!(identity.credential_binding, "unconfigured");
         assert_eq!(identity.tool_profile_hash, "sha256:builtin-profile");
@@ -279,12 +284,15 @@ mod tests {
                 "online_api",
                 "env:MISTRAL_API_KEY",
             ),
-            || {
-                let identity = runtime_execution_identity(RuntimeExecutionIdentityRequest {
-                    role: "markdown",
-                    tool_id: "mistral_ocr_markdownize",
-                    tool_profile_hash: "sha256:profile",
-                })
+            |settings| {
+                let identity = runtime_execution_identity(
+                    settings,
+                    RuntimeExecutionIdentityRequest {
+                        role: "markdown",
+                        tool_id: "mistral_ocr_markdownize",
+                        tool_profile_hash: "sha256:profile",
+                    },
+                )
                 .unwrap();
                 assert_eq!(identity.execution_mode, "online_api");
                 assert_eq!(identity.credential_binding, "env:MISTRAL_API_KEY");
@@ -305,12 +313,15 @@ mod tests {
                 "online_api",
                 "plain:NEVER_PERSIST_THIS",
             ),
-            || {
-                let identity = runtime_execution_identity(RuntimeExecutionIdentityRequest {
-                    role: "embedding",
-                    tool_id: "gemini_embedding_2",
-                    tool_profile_hash: "sha256:profile",
-                })
+            |settings| {
+                let identity = runtime_execution_identity(
+                    settings,
+                    RuntimeExecutionIdentityRequest {
+                        role: "embedding",
+                        tool_id: "gemini_embedding_2",
+                        tool_profile_hash: "sha256:profile",
+                    },
+                )
                 .unwrap();
                 assert_eq!(identity.credential_binding, "plain:tools.toml:embedding");
                 assert!(!format!("{identity:?}").contains("NEVER_PERSIST_THIS"));
@@ -337,13 +348,16 @@ mod tests {
                 "online_api",
                 "env:MISTRAL_API_KEY",
             ),
-            || {
+            |settings| {
                 assert!(
-                    runtime_execution_identity(RuntimeExecutionIdentityRequest {
-                        role: "markdown",
-                        tool_id: "paddleocr_vl_local",
-                        tool_profile_hash: "sha256:profile",
-                    })
+                    runtime_execution_identity(
+                        settings,
+                        RuntimeExecutionIdentityRequest {
+                            role: "markdown",
+                            tool_id: "paddleocr_vl_local",
+                            tool_profile_hash: "sha256:profile",
+                        }
+                    )
                     .is_err()
                 );
             },
@@ -354,12 +368,15 @@ mod tests {
     fn declared_online_target_without_auth_exposes_an_unconfigured_binding() {
         let mut declaration = declared("gemini_embedding_2", "online_api", "env:unused");
         declaration.auth = None;
-        with_declaration("embedding", declaration, || {
-            let identity = runtime_execution_identity(RuntimeExecutionIdentityRequest {
-                role: "embedding",
-                tool_id: "gemini_embedding_2",
-                tool_profile_hash: "sha256:profile",
-            })
+        with_declaration("embedding", declaration, |settings| {
+            let identity = runtime_execution_identity(
+                settings,
+                RuntimeExecutionIdentityRequest {
+                    role: "embedding",
+                    tool_id: "gemini_embedding_2",
+                    tool_profile_hash: "sha256:profile",
+                },
+            )
             .unwrap();
             assert_eq!(identity.credential_binding, "unconfigured");
         });
@@ -367,11 +384,15 @@ mod tests {
 
     #[test]
     fn declared_credential_reference_changes_the_identity_from_unconfigured() {
-        let unconfigured = runtime_execution_identity(RuntimeExecutionIdentityRequest {
-            role: "markdown",
-            tool_id: "mistral_ocr_markdownize",
-            tool_profile_hash: "sha256:profile",
-        })
+        let settings = &AdapterRuntimeSettings::default();
+        let unconfigured = runtime_execution_identity(
+            settings,
+            RuntimeExecutionIdentityRequest {
+                role: "markdown",
+                tool_id: "mistral_ocr_markdownize",
+                tool_profile_hash: "sha256:profile",
+            },
+        )
         .unwrap();
         with_declaration(
             "markdown",
@@ -380,12 +401,15 @@ mod tests {
                 "online_api",
                 "env:MISTRAL_API_KEY",
             ),
-            || {
-                let configured = runtime_execution_identity(RuntimeExecutionIdentityRequest {
-                    role: "markdown",
-                    tool_id: "mistral_ocr_markdownize",
-                    tool_profile_hash: "sha256:profile",
-                })
+            |settings| {
+                let configured = runtime_execution_identity(
+                    settings,
+                    RuntimeExecutionIdentityRequest {
+                        role: "markdown",
+                        tool_id: "mistral_ocr_markdownize",
+                        tool_profile_hash: "sha256:profile",
+                    },
+                )
                 .unwrap();
                 assert_ne!(configured, unconfigured);
                 assert_eq!(configured.credential_binding, "env:MISTRAL_API_KEY");
@@ -395,29 +419,40 @@ mod tests {
 
     #[test]
     fn empty_profile_identity_is_rejected_before_authority_is_created() {
+        let settings = &AdapterRuntimeSettings::default();
         assert!(
-            runtime_execution_identity(RuntimeExecutionIdentityRequest {
-                role: "markdown",
-                tool_id: "mistral_ocr_markdownize",
-                tool_profile_hash: "",
-            })
+            runtime_execution_identity(
+                settings,
+                RuntimeExecutionIdentityRequest {
+                    role: "markdown",
+                    tool_id: "mistral_ocr_markdownize",
+                    tool_profile_hash: "",
+                }
+            )
             .is_err()
         );
     }
 
     #[test]
     fn profile_change_produces_a_distinct_send_authority_identity() {
-        let first = runtime_execution_identity(RuntimeExecutionIdentityRequest {
-            role: "markdown",
-            tool_id: "mistral_ocr_markdownize",
-            tool_profile_hash: "sha256:first",
-        })
+        let settings = &AdapterRuntimeSettings::default();
+        let first = runtime_execution_identity(
+            settings,
+            RuntimeExecutionIdentityRequest {
+                role: "markdown",
+                tool_id: "mistral_ocr_markdownize",
+                tool_profile_hash: "sha256:first",
+            },
+        )
         .unwrap();
-        let second = runtime_execution_identity(RuntimeExecutionIdentityRequest {
-            role: "markdown",
-            tool_id: "mistral_ocr_markdownize",
-            tool_profile_hash: "sha256:second",
-        })
+        let second = runtime_execution_identity(
+            settings,
+            RuntimeExecutionIdentityRequest {
+                role: "markdown",
+                tool_id: "mistral_ocr_markdownize",
+                tool_profile_hash: "sha256:second",
+            },
+        )
         .unwrap();
         assert_ne!(first, second);
     }
@@ -446,25 +481,26 @@ mod tests {
         };
         let mut declarations = HashMap::new();
         declarations.insert("embedding".to_owned(), declaration);
-        with_runtime_settings(
-            AdapterRuntimeSettings {
+        {
+            let settings = &AdapterRuntimeSettings {
                 declarations,
                 local_peer_ca_path: Some(ca_path),
                 local_peer_trust_digest: Some(trust_digest),
                 local_peer_trust_binding: Some("local-ca:v1:g1:sha256:test".to_owned()),
                 ..AdapterRuntimeSettings::default()
-            },
-            || {
-                let identity = runtime_execution_identity(RuntimeExecutionIdentityRequest {
+            };
+            let identity = runtime_execution_identity(
+                settings,
+                RuntimeExecutionIdentityRequest {
                     role: "embedding",
                     tool_id: "qwen3_vl_embedding_local",
                     tool_profile_hash: "sha256:local-profile",
-                })
-                .unwrap();
-                assert_eq!(identity.canonical_destination, "https://127.0.0.1:8443");
-                assert_eq!(identity.trust_binding, "local-ca:v1:g1:sha256:test");
-                assert_eq!(identity.credential_binding, "none");
-            },
-        );
+                },
+            )
+            .unwrap();
+            assert_eq!(identity.canonical_destination, "https://127.0.0.1:8443");
+            assert_eq!(identity.trust_binding, "local-ca:v1:g1:sha256:test");
+            assert_eq!(identity.credential_binding, "none");
+        };
     }
 }

@@ -1,6 +1,8 @@
 //! Application boundary for journaled restores of an ancestor into the current
 //! managed working tree.  Export remains destination-only; this module is the
 //! only path that can materialize historical bytes under the managed root.
+use kio_adapter::tool_lock::AdapterRuntimeSettings;
+use std::sync::Arc;
 
 use std::path::PathBuf;
 
@@ -18,7 +20,11 @@ use crate::{
     write_through_projection_full,
 };
 
-pub(super) fn run(ctx: &AppContext, args: RestoreArgs) -> Result<Value> {
+pub(super) fn run(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+    args: RestoreArgs,
+) -> Result<Value> {
     // This is intentionally the strict, bound managed-root open.  In
     // particular, restore never invokes the recovery opener, so --preview has
     // no publication, index, ledger, or working-tree side effect.
@@ -83,7 +89,7 @@ pub(super) fn run(ctx: &AppContext, args: RestoreArgs) -> Result<Value> {
         result["projection_status"] = json!("unchanged");
         return Ok(result);
     }
-    match rebuild_projection(ctx, &repo, Some((&policy, &plan))) {
+    match rebuild_projection(adapter_settings, ctx, &repo, Some((&policy, &plan))) {
         Ok(projection) => {
             result["projection_status"] = json!("ready");
             result["projection"] = projection;
@@ -108,7 +114,10 @@ pub(super) fn run(ctx: &AppContext, args: RestoreArgs) -> Result<Value> {
 /// `repair recover-restore` is intentionally distinct from ordinary
 /// publication recovery.  A pending restore journal governs working bytes and
 /// must be resolved by core before any generic publication-recovery pathway.
-pub(super) fn recover(ctx: &AppContext) -> Result<Value> {
+pub(super) fn recover(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+) -> Result<Value> {
     let repo = Repository::open_for_recovery(ctx.cwd())?;
     validate_repo_tool_lock(&repo)?;
     // Recovery has to be possible when the policy that permitted the original
@@ -127,7 +136,7 @@ pub(super) fn recover(ctx: &AppContext) -> Result<Value> {
         if let Some(head) = repo.head_commit_hash()? {
             mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), &head);
         }
-        match rebuild_projection(ctx, &repo, None) {
+        match rebuild_projection(adapter_settings, ctx, &repo, None) {
             Ok(projection) => {
                 result["projection_status"] = json!("ready");
                 result["projection"] = projection;
@@ -151,6 +160,7 @@ pub(super) fn recover(ctx: &AppContext) -> Result<Value> {
 /// immutable CAS plus the restored HEAD; it neither polls nor submits work and
 /// does not call the online-capable repair entrypoint.
 fn rebuild_projection(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     policy: Option<(
@@ -163,7 +173,7 @@ fn rebuild_projection(
         ensure_scope_allowed(policy)?;
         ensure_planned_paths_allowed(policy, plan)?;
     }
-    let report = rebuild_step3_index(ctx, repo)?;
+    let report = rebuild_step3_index(adapter_settings, ctx, repo)?;
     recover_index_generation(repo.kio_dir())?;
     write_through_projection_full(repo.kio_dir()).map_err(|reason| {
         KioError::new(

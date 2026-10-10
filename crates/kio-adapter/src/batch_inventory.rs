@@ -125,6 +125,7 @@ pub const TEST_BATCH_INVENTORY_ENV: &str = "KIO_TEST_BATCH_INVENTORY";
 /// the configured client when set), which is how the metadata→attribution
 /// mapping is tested hermetically.
 pub fn configured_inventories(
+    settings: &crate::tool_lock::AdapterRuntimeSettings,
     mut recovery_context: impl FnMut() -> Result<crate::batch_recovery::BatchRecoveryContext>,
 ) -> Result<Vec<ProviderInventory>> {
     #[cfg(debug_assertions)]
@@ -140,14 +141,14 @@ pub fn configured_inventories(
     }
     let mut inventories = Vec::new();
     if let Some(client) =
-        crate::batch_client::configured_mistral_batch_client(&mut recovery_context)?
+        crate::batch_client::configured_mistral_batch_client(settings, &mut recovery_context)?
     {
         inventories.push(inventory_from_client(client.as_ref())?);
     }
     // G1: the embedding lane's provider. Unconfigured = contributes nothing,
     // exactly as the Mistral arm does.
     if let Some(client) =
-        crate::gemini_batch_client::resolve_gemini_batch_client(&mut recovery_context)?
+        crate::gemini_batch_client::resolve_gemini_batch_client(settings, &mut recovery_context)?
     {
         inventories.push(gemini_inventory_from_client(client.as_ref())?);
     }
@@ -286,10 +287,11 @@ mod tests {
             crate::batch_client::TEST_MISTRAL_BATCH_ENV,
             script.to_string(),
         );
-        let inventories = configured_inventories(|| {
-            panic!("mock or unconfigured inventory must not load a private key")
-        })
-        .unwrap();
+        let inventories =
+            configured_inventories(&crate::tool_lock::AdapterRuntimeSettings::default(), || {
+                panic!("mock or unconfigured inventory must not load a private key")
+            })
+            .unwrap();
 
         assert_eq!(inventories.len(), 1);
         let inventory = &inventories[0];
@@ -361,10 +363,11 @@ mod tests {
             TEST_BATCH_INVENTORY_ENV,
             fixture_path.as_os_str(),
         );
-        let inventories = configured_inventories(|| {
-            panic!("mock or unconfigured inventory must not load a private key")
-        })
-        .unwrap();
+        let inventories =
+            configured_inventories(&crate::tool_lock::AdapterRuntimeSettings::default(), || {
+                panic!("mock or unconfigured inventory must not load a private key")
+            })
+            .unwrap();
 
         assert_eq!(inventories.len(), 1);
         let inventory = &inventories[0];
@@ -404,9 +407,10 @@ mod tests {
             TEST_BATCH_INVENTORY_ENV,
             "/nonexistent/path/inventory.json",
         );
-        let result = configured_inventories(|| {
-            panic!("mock or unconfigured inventory must not load a private key")
-        });
+        let result =
+            configured_inventories(&crate::tool_lock::AdapterRuntimeSettings::default(), || {
+                panic!("mock or unconfigured inventory must not load a private key")
+            });
         assert!(result.is_err());
     }
 
@@ -424,9 +428,10 @@ mod tests {
             TEST_BATCH_INVENTORY_ENV,
             fixture_path.as_os_str(),
         );
-        let result = configured_inventories(|| {
-            panic!("mock or unconfigured inventory must not load a private key")
-        });
+        let result =
+            configured_inventories(&crate::tool_lock::AdapterRuntimeSettings::default(), || {
+                panic!("mock or unconfigured inventory must not load a private key")
+            });
         match result {
             Err(crate::AdapterError::ConfigSchema(_)) => {}
             other => panic!("expected ConfigSchema error, got {other:?}"),

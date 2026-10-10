@@ -152,11 +152,9 @@ fn canonical_origin(input: &str) -> Result<String> {
 pub(crate) fn with_test_env_credential<T>(
     role: &str,
     variable: &str,
-    operation: impl FnOnce() -> T,
+    operation: impl FnOnce(&crate::tool_lock::AdapterRuntimeSettings) -> T,
 ) -> T {
-    use crate::tool_lock::{
-        AdapterRuntimeSettings, declared_adapter_for_role, with_runtime_settings,
-    };
+    use crate::tool_lock::{AdapterRuntimeSettings, declared_adapter_for_role};
     use kio_core::store_dir::{Publication, StoreDirectory, restrict_new_private_directory};
     use std::path::Path;
     let temporary = tempfile::tempdir().unwrap();
@@ -179,14 +177,11 @@ pub(crate) fn with_test_env_credential<T>(
         role.to_owned(),
         declared_adapter_for_role(&value, role).unwrap(),
     )]);
-    with_runtime_settings(
-        AdapterRuntimeSettings {
-            declarations,
-            tools_toml_path: Some(root.join("tools.toml")),
-            ..Default::default()
-        },
-        operation,
-    )
+    operation(&AdapterRuntimeSettings {
+        declarations,
+        tools_toml_path: Some(root.join("tools.toml")),
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]

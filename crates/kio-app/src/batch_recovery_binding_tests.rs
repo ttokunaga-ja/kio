@@ -232,6 +232,9 @@ fn markdown_task(row: &BatchRequestRow) -> TaskDescriptor {
 
 #[test]
 fn mistral_collection_holds_unbound_scope_profile_and_job_without_effects() {
+    let adapter_settings =
+        &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+
     for status in [BatchJobStatus::Success, BatchJobStatus::Failed] {
         for case in [
             "missing_scope",
@@ -290,6 +293,7 @@ fn mistral_collection_holds_unbound_scope_profile_and_job_without_effects() {
             let task_bytes = fs::read(repo.kio_dir().join("tasks.jsonl")).unwrap();
             let charges = cost_ledger_rows_for_key(&ledger, &row.key).unwrap();
             let result = poll_one_batch_markdownize_row(
+                adapter_settings,
                 &repo,
                 &store,
                 &ledger,
@@ -335,6 +339,9 @@ fn mistral_collection_holds_unbound_scope_profile_and_job_without_effects() {
 
 #[test]
 fn mistral_matching_job_fetches_output_and_matching_failure_settles_and_cleans() {
+    let adapter_settings =
+        &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+
     for failed in [false, true] {
         let root = canonical_tempdir();
         let repo = Repository::init(root.path()).unwrap();
@@ -358,6 +365,7 @@ fn mistral_matching_job_fetches_output_and_matching_failure_settles_and_cleans()
         let store = TaskStore::new(repo.kio_dir());
         store.append(&task).unwrap();
         let result = poll_one_batch_markdownize_row(
+            adapter_settings,
             &repo,
             &store,
             &ledger,
@@ -471,9 +479,7 @@ fn credential_or_device_key_rotation_holds_existing_rows_without_provider_effect
     use kio_adapter::batch_client::EnvMistralBatchClient;
     use kio_adapter::batch_recovery::BatchRecoveryContext;
     use kio_adapter::gemini_batch_client::EnvGeminiBatchClient;
-    use kio_adapter::tool_lock::{
-        AdapterRuntimeSettings, declared_adapter_for_role, with_runtime_settings,
-    };
+    use kio_adapter::tool_lock::{AdapterRuntimeSettings, declared_adapter_for_role};
     use kio_core::store_dir::{Publication, StoreDirectory, restrict_new_private_directory};
     let _guard = kio_core::test_control::test_env_lock()
         .lock()
@@ -511,26 +517,29 @@ fn credential_or_device_key_rotation_holds_existing_rows_without_provider_effect
     let _workspace =
         kio_core::test_control::TestEnvGuard::set("KIO_MISTRAL_WORKSPACE_ID", "unchanged");
     let _project = kio_core::test_control::TestEnvGuard::set("KIO_GEMINI_PROJECT_ID", "unchanged");
-    let capture = |context: &BatchRecoveryContext| {
-        (
-            EnvMistralBatchClient::new(context)
-                .unwrap()
-                .provider_scope_id()
-                .unwrap(),
-            EnvGeminiBatchClient::new(context)
-                .unwrap()
-                .provider_scope_id()
-                .unwrap(),
-        )
-    };
-    let (before, credential_rotated, device_rotated) = with_runtime_settings(settings, || {
+    let capture =
+        |adapter_settings: &std::sync::Arc<kio_adapter::tool_lock::AdapterRuntimeSettings>,
+         context: &BatchRecoveryContext| {
+            (
+                EnvMistralBatchClient::new(std::sync::Arc::clone(adapter_settings), context)
+                    .unwrap()
+                    .provider_scope_id()
+                    .unwrap(),
+                EnvGeminiBatchClient::new(std::sync::Arc::clone(adapter_settings), context)
+                    .unwrap()
+                    .provider_scope_id()
+                    .unwrap(),
+            )
+        };
+    let (before, credential_rotated, device_rotated) = {
+        let adapter_settings = &std::sync::Arc::new(settings);
         let original = BatchRecoveryContext::from_key([7; 32]);
-        let before = capture(&original);
-        let device_rotated = capture(&BatchRecoveryContext::from_key([8; 32]));
+        let before = capture(adapter_settings, &original);
+        let device_rotated = capture(adapter_settings, &BatchRecoveryContext::from_key([8; 32]));
         let _rotated =
             kio_core::test_control::TestEnvGuard::set("KIO_TEST_RECOVERY_ROTATING_KEY", "after");
-        (before, capture(&original), device_rotated)
-    });
+        (before, capture(adapter_settings, &original), device_rotated)
+    };
     for current in [credential_rotated, device_rotated] {
         let ledger_dir = canonical_tempdir();
         let ledger = LedgerDb::initialize(ledger_dir.path().join("ledger.sqlite")).unwrap();

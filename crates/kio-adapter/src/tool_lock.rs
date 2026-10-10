@@ -1,6 +1,5 @@
 //! `tool-lock.json` identity and validation contracts.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -1069,7 +1068,7 @@ fn optional_string_array(table: &toml::value::Table, field: &str) -> Vec<String>
 }
 
 /// All configuration that affects adapter execution.  The app loads this from
-/// the current device configuration and installs it for one command only;
+/// the current device configuration and owns it for one command only;
 /// profile identities intentionally remain outside this execution context.
 #[derive(Debug, Clone, Default)]
 pub struct AdapterRuntimeSettings {
@@ -1088,191 +1087,123 @@ pub struct AdapterRuntimeSettings {
     pub tools_toml_path: Option<PathBuf>,
 }
 
-thread_local! {
-    static ADAPTER_RUNTIME_SETTINGS: RefCell<Vec<AdapterRuntimeSettings>> = const { RefCell::new(Vec::new()) };
-}
+impl AdapterRuntimeSettings {
+    /// Read this invocation's declaration without ambient authority.
+    #[must_use]
+    pub fn declared_adapter(&self, role: &str) -> Option<DeclaredAdapter> {
+        self.declarations.get(role).cloned()
+    }
+    #[must_use]
+    pub fn declared_pricing(&self, role: &str) -> BTreeMap<String, f64> {
+        self.pricing.get(role).cloned().unwrap_or_default()
+    }
+    #[must_use]
+    pub fn execution_timeout(&self, mode: &str) -> Option<u64> {
+        self.execution_timeouts.get(mode).copied()
+    }
+    pub fn local_peer_ca_path(&self) -> Result<PathBuf> {
+        self.local_peer_ca_path
+            .clone()
+            .ok_or_else(|| AdapterError::LocalPeerConfig {
+                code: "KIO-E-LOCAL-PEER-CA-PATH-001",
+                message:
+                    "adapter.policy.offline_api.ca_pem_path is required for an offline_api adapter"
+                        .to_owned(),
+            })
+    }
+    pub fn local_peer_trust_digest(&self) -> Result<String> {
+        self.local_peer_trust_digest
+            .clone()
+            .ok_or_else(|| AdapterError::LocalPeerConfig {
+                code: "KIO-E-LOCAL-PEER-TRUST-CAPTURE-001",
+                message: "offline_api adapter trust digest was not captured for this runtime"
+                    .to_owned(),
+            })
+    }
+    pub fn local_peer_trust_binding(&self) -> Result<String> {
+        self.local_peer_trust_binding
+            .clone()
+            .ok_or_else(|| AdapterError::LocalPeerConfig {
+                code: "KIO-E-LOCAL-PEER-TRUST-BINDING-001",
+                message: "offline_api managed trust lifecycle was not bound for this runtime"
+                    .to_owned(),
+            })
+    }
+    pub fn authenticated_local_endpoint(
+        &self,
+        role: &str,
+        url: &str,
+    ) -> Result<crate::local_peer::AuthenticatedLocalEndpoint> {
+        let ca_path = self.local_peer_ca_path()?;
+        let trust_digest = self.local_peer_trust_digest()?;
+        crate::local_peer::AuthenticatedLocalEndpoint::new_bound(url, ca_path, trust_digest)
+            .map_err(|error| match error {
+                AdapterError::LocalPeerConfig { code, message } => AdapterError::LocalPeerConfig {
+                    code,
+                    message: format!("local peer for `{role}` is unavailable: {message}"),
+                },
+                other => other,
+            })
+    }
 
-/// Run one command under its complete adapter configuration.  There is no
-/// process-global fallback: an absent context has no adapter authority, and a
-/// nested context restores its caller even when the operation unwinds.
-pub fn with_runtime_settings<T>(
-    settings: AdapterRuntimeSettings,
-    operation: impl FnOnce() -> T,
-) -> T {
-    struct TrustGuard;
-    impl Drop for TrustGuard {
-        fn drop(&mut self) {
-            ADAPTER_RUNTIME_SETTINGS.with(|contexts| {
-                let popped = contexts.borrow_mut().pop();
-                debug_assert!(popped.is_some(), "adapter runtime context stack underflow");
+    pub fn resolve_role_api_key(&self, role: &str) -> Result<Option<String>> {
+        let Some(declared) = self.declarations.get(role).cloned() else {
+            return Ok(None);
+        };
+        validate_declared_runtime_target(role, &declared)?;
+        let Some(auth) = declared.auth.as_deref() else {
+            return Ok(None);
+        };
+        if auth.starts_with("env:") {
+            return resolve_auth(auth);
+        }
+        if !auth.starts_with("plain:") {
+            return resolve_auth(auth);
+        }
+        let path =
+            self.tools_toml_path
+                .as_deref()
+                .ok_or_else(|| AdapterError::ConfigSchemaCoded {
+                    code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
+                    message: "plain credential has no owner-private tools.toml source".to_owned(),
+                })?;
+        let bytes = read_private_tools_toml(path)?;
+        let value = parse_tools_toml(&bytes)?;
+        let verified = declared_adapter_for_role(&value, role).ok_or_else(|| {
+            AdapterError::ConfigSchemaCoded {
+                code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
+                message: "owner-private tools.toml no longer declares this adapter credential"
+                    .to_owned(),
+            }
+        })?;
+        if verified != declared {
+            return Err(AdapterError::ConfigSchemaCoded {
+                code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
+                message:
+                    "tools.toml changed after adapter configuration was loaded; retry the command"
+                        .to_owned(),
             });
         }
-    }
-    ADAPTER_RUNTIME_SETTINGS.with(|contexts| contexts.borrow_mut().push(settings));
-    let _guard = TrustGuard;
-    operation()
-}
-
-/// R13-2: the current command's declared adapter for `role`, if any.
-#[must_use]
-pub fn registered_declared_adapter(role: &str) -> Option<DeclaredAdapter> {
-    ADAPTER_RUNTIME_SETTINGS.with(|contexts| {
-        contexts
-            .borrow()
-            .last()
-            .and_then(|settings| settings.declarations.get(role))
-            .cloned()
-    })
-}
-
-/// QA19: the current command's pricing table for `role`.  An absent context or
-/// declaration has no price and therefore retains the documented `estimated`
-/// billing outcome.
-#[must_use]
-pub fn registered_declared_pricing(role: &str) -> BTreeMap<String, f64> {
-    ADAPTER_RUNTIME_SETTINGS.with(|contexts| {
-        contexts
-            .borrow()
-            .last()
-            .and_then(|settings| settings.pricing.get(role))
-            .cloned()
-            .unwrap_or_default()
-    })
-}
-
-/// D7: the current command's configured execution timeout, if present.
-#[must_use]
-pub fn registered_execution_timeout(execution_mode: &str) -> Option<u64> {
-    ADAPTER_RUNTIME_SETTINGS.with(|contexts| {
-        contexts
-            .borrow()
-            .last()
-            .and_then(|settings| settings.execution_timeouts.get(execution_mode))
-            .copied()
-    })
-}
-
-pub fn registered_local_peer_ca_path() -> Result<PathBuf> {
-    ADAPTER_RUNTIME_SETTINGS
-        .with(|contexts| {
-            contexts
-                .borrow()
-                .last()
-                .and_then(|settings| settings.local_peer_ca_path.clone())
-        })
-        .ok_or_else(|| AdapterError::LocalPeerConfig {
-            code: "KIO-E-LOCAL-PEER-CA-PATH-001",
-            message:
-                "adapter.policy.offline_api.ca_pem_path is required for an offline_api adapter"
-                    .to_owned(),
-        })
-}
-
-pub fn registered_local_peer_trust_digest() -> Result<String> {
-    ADAPTER_RUNTIME_SETTINGS
-        .with(|contexts| {
-            contexts
-                .borrow()
-                .last()
-                .and_then(|settings| settings.local_peer_trust_digest.clone())
-        })
-        .ok_or_else(|| AdapterError::LocalPeerConfig {
-            code: "KIO-E-LOCAL-PEER-TRUST-CAPTURE-001",
-            message: "offline_api adapter trust digest was not captured for this runtime"
-                .to_owned(),
-        })
-}
-
-pub fn registered_local_peer_trust_binding() -> Result<String> {
-    ADAPTER_RUNTIME_SETTINGS
-        .with(|contexts| {
-            contexts
-                .borrow()
-                .last()
-                .and_then(|settings| settings.local_peer_trust_binding.clone())
-        })
-        .ok_or_else(|| AdapterError::LocalPeerConfig {
-            code: "KIO-E-LOCAL-PEER-TRUST-BINDING-001",
-            message: "offline_api managed trust lifecycle was not bound for this runtime"
-                .to_owned(),
-        })
-}
-
-pub fn authenticated_local_endpoint(
-    role: &str,
-    url: &str,
-) -> Result<crate::local_peer::AuthenticatedLocalEndpoint> {
-    let ca_path = registered_local_peer_ca_path()?;
-    let trust_digest = registered_local_peer_trust_digest()?;
-    crate::local_peer::AuthenticatedLocalEndpoint::new_bound(url, ca_path, trust_digest).map_err(
-        |error| match error {
-            AdapterError::LocalPeerConfig { code, message } => AdapterError::LocalPeerConfig {
-                code,
-                message: format!("local peer for `{role}` is unavailable: {message}"),
-            },
-            other => other,
-        },
-    )
-}
-
-/// R13-2: resolve the API key for an online adapter `role` — the declared
-/// `tools.toml` `auth` (env/plain via [`resolve_auth`]). `None` means the role
-/// is undeclared, has no auth, or its declared environment variable is unset.
-pub fn resolve_role_api_key(role: &str) -> Result<Option<String>> {
-    let Some(settings) = registered_runtime_settings() else {
-        return Ok(None);
-    };
-    let Some(declared) = settings.declarations.get(role).cloned() else {
-        return Ok(None);
-    };
-    validate_declared_runtime_target(role, &declared)?;
-    let Some(auth) = declared.auth.as_deref() else {
-        return Ok(None);
-    };
-    if auth.starts_with("env:") {
-        return resolve_auth(auth);
-    }
-    if !auth.starts_with("plain:") {
-        return resolve_auth(auth);
-    }
-    let path =
-        settings
-            .tools_toml_path
+        let key = verified
+            .auth
             .as_deref()
+            .and_then(|value| value.strip_prefix("plain:"))
             .ok_or_else(|| AdapterError::ConfigSchemaCoded {
                 code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
-                message: "plain credential has no owner-private tools.toml source".to_owned(),
+                message: "owner-private tools.toml no longer declares a plain credential"
+                    .to_owned(),
             })?;
-    let bytes = read_private_tools_toml(path)?;
-    let value = parse_tools_toml(&bytes)?;
-    let verified =
-        declared_adapter_for_role(&value, role).ok_or_else(|| AdapterError::ConfigSchemaCoded {
-            code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
-            message: "owner-private tools.toml no longer declares this adapter credential"
-                .to_owned(),
-        })?;
-    if verified != declared {
-        return Err(AdapterError::ConfigSchemaCoded {
-            code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
-            message: "tools.toml changed after adapter configuration was loaded; retry the command"
-                .to_owned(),
-        });
+        Ok(Some(key.to_owned()))
     }
-    let key = verified
-        .auth
-        .as_deref()
-        .and_then(|value| value.strip_prefix("plain:"))
-        .ok_or_else(|| AdapterError::ConfigSchemaCoded {
-            code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
-            message: "owner-private tools.toml no longer declares a plain credential".to_owned(),
-        })?;
-    Ok(Some(key.to_owned()))
 }
 
 /// Real transport fixtures use a private synthetic credential source, just as
 /// production does. Nothing in this helper reads the host's provider keys.
 #[cfg(test)]
-pub(crate) fn with_test_role_auth<T>(role: &str, operation: impl FnOnce() -> T) -> T {
+pub(crate) fn with_test_role_auth<T>(
+    role: &str,
+    operation: impl FnOnce(&AdapterRuntimeSettings) -> T,
+) -> T {
     use kio_core::store_dir::{Publication, StoreDirectory, restrict_new_private_directory};
 
     assert!(matches!(role, "markdown" | "embedding"));
@@ -1296,18 +1227,11 @@ pub(crate) fn with_test_role_auth<T>(role: &str, operation: impl FnOnce() -> T) 
         role.to_owned(),
         declared_adapter_for_role(&value, role).unwrap(),
     )]);
-    with_runtime_settings(
-        AdapterRuntimeSettings {
-            declarations,
-            tools_toml_path: Some(root.join("tools.toml")),
-            ..AdapterRuntimeSettings::default()
-        },
-        operation,
-    )
-}
-
-fn registered_runtime_settings() -> Option<AdapterRuntimeSettings> {
-    ADAPTER_RUNTIME_SETTINGS.with(|contexts| contexts.borrow().last().cloned())
+    operation(&AdapterRuntimeSettings {
+        declarations,
+        tools_toml_path: Some(root.join("tools.toml")),
+        ..AdapterRuntimeSettings::default()
+    })
 }
 
 pub fn validate_declared_runtime_target(role: &str, declared: &DeclaredAdapter) -> Result<()> {
@@ -1400,7 +1324,7 @@ pub fn validate_declared_runtime_target(role: &str, declared: &DeclaredAdapter) 
 
 /// R13-2: resolve a `tools.toml` `auth` reference to a concrete API key
 /// (docs/07 §1). `env:<NAME>` reads `$NAME`. Literal `plain:` credentials are
-/// intentionally refused here because only [`resolve_role_api_key`] can bind
+/// intentionally refused here because only [`AdapterRuntimeSettings::resolve_role_api_key`] can bind
 /// them to freshly verified owner-private `tools.toml` bytes. Returns `None`
 /// only when `env:<NAME>` names an unset variable.
 pub fn resolve_auth(auth: &str) -> Result<Option<String>> {
@@ -1425,6 +1349,34 @@ pub fn resolve_auth(auth: &str) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn explicit_settings_survive_interleaving_error_and_panic() {
+        let first = runtime_settings("https://127.0.0.1:8443", 1.0, 10, None);
+        let second = runtime_settings("https://127.0.0.1:9443", 2.0, 20, None);
+        let inspect = |settings: &AdapterRuntimeSettings| {
+            (
+                settings.declared_adapter("embedding").unwrap().url,
+                settings.declared_pricing("embedding"),
+                settings.execution_timeout("offline_api"),
+            )
+        };
+        let before = inspect(&first);
+        assert_ne!(inspect(&first), inspect(&second));
+        let failed_operation = |settings: &AdapterRuntimeSettings| -> Result<()> {
+            assert_eq!(settings.execution_timeout("offline_api"), Some(20));
+            Err(AdapterError::ConfigSchema("fixture error".to_owned()))
+        };
+        assert!(failed_operation(&second).is_err());
+        assert_eq!(inspect(&first), before);
+        let panic = std::panic::catch_unwind(|| {
+            assert_eq!(second.execution_timeout("offline_api"), Some(20));
+            panic!("fixture unwind");
+        });
+        assert!(panic.is_err());
+        assert_eq!(inspect(&first), before);
+        assert_eq!(second.execution_timeout("offline_api"), Some(20));
+    }
 
     #[test]
     fn malformed_tools_toml_never_discloses_credential_source() {
@@ -1459,97 +1411,85 @@ mod tests {
     fn local_peer_trust_is_per_invocation_and_none_revokes_it() {
         let first = PathBuf::from("/private/kio-ca-one.pem");
         let second = PathBuf::from("/private/kio-ca-two.pem");
-        with_runtime_settings(
-            AdapterRuntimeSettings {
+        {
+            let settings = &AdapterRuntimeSettings {
                 local_peer_ca_path: Some(first.clone()),
                 local_peer_trust_digest: Some("sha256:first".to_owned()),
                 local_peer_trust_binding: Some("local-ca:v1:g1:sha256:first".to_owned()),
                 ..AdapterRuntimeSettings::default()
-            },
-            || {
-                assert_eq!(registered_local_peer_ca_path().unwrap(), first);
+            };
+            assert_eq!(settings.local_peer_ca_path().unwrap(), first);
+            assert_eq!(settings.local_peer_trust_digest().unwrap(), "sha256:first");
+            assert_eq!(
+                settings.local_peer_trust_binding().unwrap(),
+                "local-ca:v1:g1:sha256:first"
+            );
+            {
+                let settings = &AdapterRuntimeSettings {
+                    local_peer_ca_path: Some(second.clone()),
+                    local_peer_trust_digest: Some("sha256:second".to_owned()),
+                    local_peer_trust_binding: Some("local-ca:v1:g2:sha256:second".to_owned()),
+                    ..AdapterRuntimeSettings::default()
+                };
+                assert_eq!(settings.local_peer_ca_path().unwrap(), second);
+                assert_eq!(settings.local_peer_trust_digest().unwrap(), "sha256:second");
                 assert_eq!(
-                    registered_local_peer_trust_digest().unwrap(),
-                    "sha256:first"
+                    settings.local_peer_trust_binding().unwrap(),
+                    "local-ca:v1:g2:sha256:second"
                 );
-                assert_eq!(
-                    registered_local_peer_trust_binding().unwrap(),
-                    "local-ca:v1:g1:sha256:first"
-                );
-                with_runtime_settings(
-                    AdapterRuntimeSettings {
-                        local_peer_ca_path: Some(second.clone()),
-                        local_peer_trust_digest: Some("sha256:second".to_owned()),
-                        local_peer_trust_binding: Some("local-ca:v1:g2:sha256:second".to_owned()),
-                        ..AdapterRuntimeSettings::default()
-                    },
-                    || {
-                        assert_eq!(registered_local_peer_ca_path().unwrap(), second);
-                        assert_eq!(
-                            registered_local_peer_trust_digest().unwrap(),
-                            "sha256:second"
-                        );
-                        assert_eq!(
-                            registered_local_peer_trust_binding().unwrap(),
-                            "local-ca:v1:g2:sha256:second"
-                        );
-                    },
-                );
-                assert_eq!(registered_local_peer_ca_path().unwrap(), first);
-                assert_eq!(
-                    registered_local_peer_trust_digest().unwrap(),
-                    "sha256:first"
-                );
-                assert_eq!(
-                    registered_local_peer_trust_binding().unwrap(),
-                    "local-ca:v1:g1:sha256:first"
-                );
-            },
-        );
-        with_runtime_settings(AdapterRuntimeSettings::default(), || {
-            assert!(registered_local_peer_ca_path().is_err())
-        });
-        with_runtime_settings(
-            AdapterRuntimeSettings {
+            };
+            assert_eq!(settings.local_peer_ca_path().unwrap(), first);
+            assert_eq!(settings.local_peer_trust_digest().unwrap(), "sha256:first");
+            assert_eq!(
+                settings.local_peer_trust_binding().unwrap(),
+                "local-ca:v1:g1:sha256:first"
+            );
+        };
+        {
+            let settings = &AdapterRuntimeSettings::default();
+            assert!(settings.local_peer_ca_path().is_err())
+        };
+        {
+            let settings = &AdapterRuntimeSettings {
                 local_peer_ca_path: Some(PathBuf::from("/private/missing-capture.pem")),
                 ..AdapterRuntimeSettings::default()
-            },
-            || {
-                let error = authenticated_local_endpoint("embedding", "https://127.0.0.1:8443")
-                    .expect_err("runtime local peer must require a captured CA digest");
-                assert!(
-                    error
-                        .to_string()
-                        .contains("KIO-E-LOCAL-PEER-TRUST-CAPTURE-001")
-                );
-            },
-        );
-        assert!(registered_local_peer_ca_path().is_err());
-        assert!(registered_local_peer_trust_digest().is_err());
-        assert!(registered_local_peer_trust_binding().is_err());
+            };
+            let error = settings
+                .authenticated_local_endpoint("embedding", "https://127.0.0.1:8443")
+                .expect_err("runtime local peer must require a captured CA digest");
+            assert!(
+                error
+                    .to_string()
+                    .contains("KIO-E-LOCAL-PEER-TRUST-CAPTURE-001")
+            );
+        };
+        let settings = AdapterRuntimeSettings::default();
+        assert!(settings.local_peer_ca_path().is_err());
+        assert!(settings.local_peer_trust_digest().is_err());
+        assert!(settings.local_peer_trust_binding().is_err());
     }
 
     #[test]
     fn local_peer_trust_isolated_between_threads() {
         let left = std::thread::spawn(|| {
             let path = PathBuf::from("/private/kio-ca-left.pem");
-            with_runtime_settings(
-                AdapterRuntimeSettings {
+            {
+                let settings = &AdapterRuntimeSettings {
                     local_peer_ca_path: Some(path.clone()),
                     ..AdapterRuntimeSettings::default()
-                },
-                || registered_local_peer_ca_path().unwrap(),
-            )
+                };
+                settings.local_peer_ca_path().unwrap()
+            }
         });
         let right = std::thread::spawn(|| {
             let path = PathBuf::from("/private/kio-ca-right.pem");
-            with_runtime_settings(
-                AdapterRuntimeSettings {
+            {
+                let settings = &AdapterRuntimeSettings {
                     local_peer_ca_path: Some(path.clone()),
                     ..AdapterRuntimeSettings::default()
-                },
-                || registered_local_peer_ca_path().unwrap(),
-            )
+                };
+                settings.local_peer_ca_path().unwrap()
+            }
         });
         assert_eq!(
             left.join().unwrap(),
@@ -1605,78 +1545,76 @@ mod tests {
     fn runtime_settings_are_scoped_and_restore_all_getters_after_nesting() {
         let outer = runtime_settings("https://127.0.0.1:8443", 1.0, 10, None);
         let inner = runtime_settings("https://127.0.0.1:9443", 2.0, 20, None);
-        with_runtime_settings(outer, || {
+        {
+            let settings = &outer;
             assert_eq!(
-                registered_declared_adapter("embedding")
+                settings
+                    .declared_adapter("embedding")
                     .unwrap()
                     .url
                     .as_deref(),
                 Some("https://127.0.0.1:8443")
             );
             assert_eq!(
-                registered_declared_pricing("embedding").get("tokens_in"),
+                settings.declared_pricing("embedding").get("tokens_in"),
                 Some(&1.0)
             );
-            assert_eq!(registered_execution_timeout("offline_api"), Some(10));
-            with_runtime_settings(inner, || {
+            assert_eq!(settings.execution_timeout("offline_api"), Some(10));
+            {
+                let settings = &inner;
                 assert_eq!(
-                    registered_declared_adapter("embedding")
+                    settings
+                        .declared_adapter("embedding")
                         .unwrap()
                         .url
                         .as_deref(),
                     Some("https://127.0.0.1:9443")
                 );
                 assert_eq!(
-                    registered_declared_pricing("embedding").get("tokens_in"),
+                    settings.declared_pricing("embedding").get("tokens_in"),
                     Some(&2.0)
                 );
-                assert_eq!(registered_execution_timeout("offline_api"), Some(20));
-                assert!(registered_local_peer_ca_path().is_err());
-                assert!(registered_local_peer_trust_digest().is_err());
-            });
+                assert_eq!(settings.execution_timeout("offline_api"), Some(20));
+                assert!(settings.local_peer_ca_path().is_err());
+                assert!(settings.local_peer_trust_digest().is_err());
+            };
             assert_eq!(
-                registered_declared_adapter("embedding")
+                settings
+                    .declared_adapter("embedding")
                     .unwrap()
                     .url
                     .as_deref(),
                 Some("https://127.0.0.1:8443")
             );
             assert_eq!(
-                registered_declared_pricing("embedding").get("tokens_in"),
+                settings.declared_pricing("embedding").get("tokens_in"),
                 Some(&1.0)
             );
-            assert_eq!(registered_execution_timeout("offline_api"), Some(10));
-            assert!(registered_local_peer_ca_path().is_err());
-            assert!(registered_local_peer_trust_digest().is_err());
-        });
-        assert!(registered_declared_adapter("embedding").is_none());
-        assert!(registered_declared_pricing("embedding").is_empty());
-        assert_eq!(registered_execution_timeout("offline_api"), None);
-        assert!(registered_local_peer_ca_path().is_err());
+            assert_eq!(settings.execution_timeout("offline_api"), Some(10));
+            assert!(settings.local_peer_ca_path().is_err());
+            assert!(settings.local_peer_trust_digest().is_err());
+        };
+        let settings = AdapterRuntimeSettings::default();
+        assert!(settings.declared_adapter("embedding").is_none());
+        assert!(settings.declared_pricing("embedding").is_empty());
+        assert_eq!(settings.execution_timeout("offline_api"), None);
+        assert!(settings.local_peer_ca_path().is_err());
     }
 
     #[test]
     fn runtime_settings_are_isolated_between_threads() {
         let left = std::thread::spawn(|| {
-            with_runtime_settings(
-                runtime_settings("https://127.0.0.1:8443", 1.0, 10, None),
-                || {
-                    (
-                        registered_declared_adapter("embedding").unwrap().url,
-                        registered_execution_timeout("offline_api"),
-                    )
-                },
+            let settings = &runtime_settings("https://127.0.0.1:8443", 1.0, 10, None);
+            (
+                settings.declared_adapter("embedding").unwrap().url,
+                settings.execution_timeout("offline_api"),
             )
         });
         let right = std::thread::spawn(|| {
-            with_runtime_settings(
-                runtime_settings("https://127.0.0.1:9443", 2.0, 20, None),
-                || {
-                    (
-                        registered_declared_adapter("embedding").unwrap().url,
-                        registered_execution_timeout("offline_api"),
-                    )
-                },
+            let settings = &runtime_settings("https://127.0.0.1:9443", 2.0, 20, None);
+            (
+                settings.declared_adapter("embedding").unwrap().url,
+                settings.execution_timeout("offline_api"),
             )
         });
         assert_eq!(
@@ -2168,40 +2106,38 @@ auth = "env:MISTRAL_API_KEY"
         let value: toml::Value = toml::from_str(std::str::from_utf8(source).unwrap()).unwrap();
         let declared = declared_adapter_for_role(&value, "embedding").unwrap();
         let declarations = std::collections::HashMap::from([("embedding".to_owned(), declared)]);
-        with_runtime_settings(
-            AdapterRuntimeSettings {
+        {
+            let settings = &AdapterRuntimeSettings {
                 declarations,
                 tools_toml_path: Some(path.clone()),
                 ..AdapterRuntimeSettings::default()
-            },
-            || {
-                assert_eq!(
-                    resolve_role_api_key("embedding").unwrap(),
-                    Some("verified-key".to_owned())
-                );
-                std::fs::write(
-                    &path,
-                    b"[embedding.gemini_embedding_2]\nauth = \"plain:replacement-key\"\n",
-                )
-                .unwrap();
-                assert!(matches!(
-                    resolve_role_api_key("embedding"),
-                    Err(AdapterError::ConfigSchemaCoded {
-                        code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
-                        ..
-                    })
-                ));
-                std::fs::write(&path, source).unwrap();
-                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-                assert!(matches!(
-                    resolve_role_api_key("embedding"),
-                    Err(AdapterError::ConfigSchemaCoded {
-                        code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
-                        ..
-                    })
-                ));
-            },
-        );
+            };
+            assert_eq!(
+                settings.resolve_role_api_key("embedding").unwrap(),
+                Some("verified-key".to_owned())
+            );
+            std::fs::write(
+                &path,
+                b"[embedding.gemini_embedding_2]\nauth = \"plain:replacement-key\"\n",
+            )
+            .unwrap();
+            assert!(matches!(
+                settings.resolve_role_api_key("embedding"),
+                Err(AdapterError::ConfigSchemaCoded {
+                    code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
+                    ..
+                })
+            ));
+            std::fs::write(&path, source).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(matches!(
+                settings.resolve_role_api_key("embedding"),
+                Err(AdapterError::ConfigSchemaCoded {
+                    code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
+                    ..
+                })
+            ));
+        };
     }
 
     #[test]

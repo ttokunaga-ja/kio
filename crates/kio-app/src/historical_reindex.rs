@@ -4,6 +4,8 @@
 //! This path therefore never consults a later normalize cache, creates a normalized
 //! generation, or advances a ref. It only appends missing current-config chunk
 //! associations and their derived search/embedding projections.
+use kio_adapter::tool_lock::AdapterRuntimeSettings;
+use std::sync::Arc;
 
 use super::*;
 use kio_core::history::TreeBinding;
@@ -350,6 +352,7 @@ pub(super) fn retained_history_instances_for_roots(
 }
 
 pub(super) fn run(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     operand: &str,
@@ -664,8 +667,10 @@ pub(super) fn run(
     // `(false, false, false)` this used to pass unconditionally.
     // `online_confirmed = false`: `kio reindex` carries no same-invocation
     // `--yes`/`--approve`-equivalent confirming flag.
-    let embedding_online = embedding_online_allowed(repo, offline, online, false)?;
+    let embedding_online =
+        embedding_online_allowed(adapter_settings, repo, offline, online, false)?;
     let enrichment = run_historical_embedding_enrichment(
+        adapter_settings,
         ctx,
         repo,
         embedding_online,

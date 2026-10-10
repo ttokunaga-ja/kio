@@ -50,6 +50,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
+use std::sync::Arc;
 use std::time::Instant;
 
 use cap_primitives::fs as cap_fs;
@@ -72,8 +73,8 @@ use kio_adapter::identity::tool_profile_hash;
 use kio_adapter::local_ocr_markdownize::LocalOcrExecution;
 use kio_adapter::office_convert::{is_office_media, resolve_office_converter};
 use kio_adapter::tool_lock::{
-    MAX_TOOLS_TOML_BYTES, load_tool_lock, parse_tools_toml, read_private_tools_toml,
-    tools_toml_uses_plain_auth, validate_tools_toml,
+    AdapterRuntimeSettings, MAX_TOOLS_TOML_BYTES, load_tool_lock, parse_tools_toml,
+    read_private_tools_toml, tools_toml_uses_plain_auth, validate_tools_toml,
 };
 use kio_adapter::traits::{MarkdownizeAdapter, PreferredRequestKind};
 #[cfg(debug_assertions)]
@@ -320,6 +321,26 @@ fn exit_override_error_code(code: ExitCode) -> &'static str {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Invocation<'a> {
+    context: &'a AppContext,
+    settings: &'a Arc<AdapterRuntimeSettings>,
+}
+
+struct InvocationRuntime {
+    settings: Arc<AdapterRuntimeSettings>,
+    _managed_trust: Option<trust::RuntimeTrust>,
+}
+
+fn execute_lifecycle(ctx: &AppContext, command: Command) -> Result<Value> {
+    match command {
+        Command::Watch(args) => watch_command::run(ctx, args),
+        Command::Adapter(args) => run_adapter_lifecycle(ctx, args.command),
+        Command::Ledger(args) => run_ledger_lifecycle(args),
+        _ => unreachable!("only lifecycle commands bypass adapter composition"),
+    }
+}
+
 pub fn execute(ctx: &AppContext, command: Command) -> Result<Value> {
     #[cfg(debug_assertions)]
     install_debug_test_control();
@@ -334,7 +355,7 @@ pub fn execute(ctx: &AppContext, command: Command) -> Result<Value> {
             ..
         })
     ) {
-        return execute_dispatch(ctx, command);
+        return execute_lifecycle(ctx, command);
     }
     // R13-6: refuse to run if device-global state cannot resolve to an absolute
     // base dir (no absolute $HOME and no absolute $XDG_*), before any command
@@ -361,7 +382,7 @@ pub fn execute(ctx: &AppContext, command: Command) -> Result<Value> {
             ),
         })
     ) {
-        return execute_dispatch(ctx, command);
+        return execute_lifecycle(ctx, command);
     }
     validate_user_tools_config()?;
     validate_user_config()?;
@@ -372,13 +393,18 @@ pub fn execute(ctx: &AppContext, command: Command) -> Result<Value> {
         settings.local_peer_trust_digest = Some(trust.digest().to_owned());
         settings.local_peer_trust_binding = Some(trust.binding().to_owned());
     }
-    kio_adapter::tool_lock::with_runtime_settings(settings, || {
-        let _managed_trust = managed_trust;
-        execute_dispatch(ctx, command)
-    })
+    let runtime = InvocationRuntime {
+        settings: Arc::new(settings),
+        _managed_trust: managed_trust,
+    };
+    execute_dispatch(&runtime.settings, ctx, command)
 }
 
-fn execute_dispatch(ctx: &AppContext, command: Command) -> Result<Value> {
+fn execute_dispatch(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+    command: Command,
+) -> Result<Value> {
     match command {
         Command::RootRegister(args) => root_registration::run(ctx, args),
         Command::Init(args) => {
@@ -491,7 +517,7 @@ fn execute_dispatch(ctx: &AppContext, command: Command) -> Result<Value> {
         }
         Command::Snapshot(SnapshotArgs {
             action: SnapshotAction::Auto,
-        }) => run_snapshot_auto(ctx),
+        }) => run_snapshot_auto(adapter_settings, ctx),
         Command::Snapshot(SnapshotArgs {
             action: SnapshotAction::Create(args),
         }) => {
@@ -521,11 +547,15 @@ fn execute_dispatch(ctx: &AppContext, command: Command) -> Result<Value> {
             // does, or `.env`/`*.pem` plaintext lands irreversibly in objects/raw and
             // the latest tree. Compute the exclusion set from the scan preview (the
             // shared classifier) and pass it through the filtered snapshot path.
-            let preview = build_scan_preview(ScanPreviewRequest {
-                scope_path: repo.root().display().to_string(),
-                include_raw_hashes: false,
-                require_network_approval: false,
-            })
+            let preview = build_scan_preview(
+                &adapter_settings.declared_pricing("markdown"),
+                &adapter_settings.declared_pricing("embedding"),
+                ScanPreviewRequest {
+                    scope_path: repo.root().display().to_string(),
+                    include_raw_hashes: false,
+                    require_network_approval: false,
+                },
+            )
             .map_err(pipeline_to_kio)?;
             let excluded = preview
                 .candidates
@@ -731,20 +761,20 @@ fn execute_dispatch(ctx: &AppContext, command: Command) -> Result<Value> {
                 }))
             }
         }
-        Command::Index(args) => run_index(ctx, args),
+        Command::Index(args) => run_index(adapter_settings, ctx, args),
         Command::Watch(args) => watch_command::run(ctx, args),
-        Command::Batch(args) => run_batch(ctx, args),
-        Command::Adapter(args) => run_adapter(ctx, args),
-        Command::Ledger(args) => run_ledger(args),
-        Command::Repair(args) => run_repair(ctx, args),
+        Command::Batch(args) => run_batch(adapter_settings, ctx, args),
+        Command::Adapter(args) => run_adapter(adapter_settings, ctx, args),
+        Command::Ledger(args) => run_ledger(adapter_settings, args),
+        Command::Repair(args) => run_repair(adapter_settings, ctx, args),
         Command::Gc(args) => gc::run(ctx, args.dry_run, args.yes, args.prune_unreachable, false),
-        Command::Search(args) => run_search(ctx, args),
+        Command::Search(args) => run_search(adapter_settings, ctx, args),
         Command::Open(args) => run_open(ctx, args),
         Command::View(args) => run_view(ctx, args),
-        Command::Reindex(args) => run_reindex(ctx, args),
+        Command::Reindex(args) => run_reindex(adapter_settings, ctx, args),
         Command::Evidence(args) => verify_objects::run_evidence(ctx, args),
         Command::Export(args) => export::run(ctx, args),
-        Command::Restore(args) => managed_restore::run(ctx, args),
+        Command::Restore(args) => managed_restore::run(adapter_settings, ctx, args),
         Command::Purge(args) => purge::run(ctx, args),
     }
 }
@@ -850,7 +880,10 @@ macro_rules! snapshot_auto_test_barrier {
     }};
 }
 
-fn run_snapshot_auto(ctx: &AppContext) -> Result<Value> {
+fn run_snapshot_auto(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+) -> Result<Value> {
     #[cfg(debug_assertions)]
     let test_control = debug_test_control();
     let repo = ctx.open_read_only_repository()?;
@@ -961,13 +994,13 @@ fn run_snapshot_auto(ctx: &AppContext) -> Result<Value> {
         ));
     }
     let now = now_utc_seconds();
-    let initial = observe_scheduled_auto(&repo, &session, &now)?;
+    let initial = observe_scheduled_auto(adapter_settings, &repo, &session, &now)?;
     if initial.gc != gc_binding {
         return Err(snapshot_auto_authority_changed(
             "GC automation changed after scheduled preflight",
         ));
     }
-    let confirmed = observe_scheduled_auto(&repo, &session, &now)?;
+    let confirmed = observe_scheduled_auto(adapter_settings, &repo, &session, &now)?;
     if confirmed != initial {
         return Err(snapshot_auto_authority_changed(
             "scheduled snapshot authority changed during observation",
@@ -1001,7 +1034,7 @@ fn run_snapshot_auto(ctx: &AppContext) -> Result<Value> {
         session.retained_scope_handle()?,
         session.retained_kio_handle()?,
     )?;
-    let locked = observe_scheduled_auto(&bound_repo, &session, &now)?;
+    let locked = observe_scheduled_auto(adapter_settings, &bound_repo, &session, &now)?;
     if locked != initial || locked.gc != gc_binding {
         return Err(snapshot_auto_authority_changed(
             "scheduled snapshot authority changed during locked eligibility handoff",
@@ -1011,7 +1044,7 @@ fn run_snapshot_auto(ctx: &AppContext) -> Result<Value> {
         test_control,
         snapshot_locked_ready
     ));
-    let final_observation = observe_scheduled_auto(&bound_repo, &session, &now)?;
+    let final_observation = observe_scheduled_auto(adapter_settings, &bound_repo, &session, &now)?;
     if final_observation != locked || final_observation.gc != gc_binding {
         return Err(snapshot_auto_authority_changed(
             "scheduled snapshot authority changed immediately before publication",
@@ -1021,7 +1054,8 @@ fn run_snapshot_auto(ctx: &AppContext) -> Result<Value> {
         test_control,
         snapshot_before_publication_ready
     ));
-    let publication_observation = observe_scheduled_auto(&bound_repo, &session, &now)?;
+    let publication_observation =
+        observe_scheduled_auto(adapter_settings, &bound_repo, &session, &now)?;
     if publication_observation != final_observation || publication_observation.gc != gc_binding {
         return Err(snapshot_auto_authority_changed(
             "scheduled snapshot authority changed at publication boundary",
@@ -1301,6 +1335,7 @@ fn wait_at_snapshot_auto_test_barrier(ready_path: Option<&Path>) {
 }
 
 fn observe_scheduled_auto(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     session: &GcSweepSession,
     now: &str,
@@ -1343,6 +1378,8 @@ fn observe_scheduled_auto(
     let root = session.retained_scope_handle()?;
     let kio = session.retained_kio_handle()?;
     let preview = build_bound_scan_preview(
+        &adapter_settings.declared_pricing("markdown"),
+        &adapter_settings.declared_pricing("embedding"),
         &root,
         &kio,
         ScanPreviewRequest {
@@ -1552,23 +1589,28 @@ fn scheduled_preview_change_count(
     Ok(changes)
 }
 
-fn run_index(ctx: &AppContext, args: IndexArgs) -> Result<Value> {
+fn run_index(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+    args: IndexArgs,
+) -> Result<Value> {
     // `index --preview` is read-only all the way through opening the repository:
     // the ordinary open path may repair a missing HEAD, which would violate the
     // preview no-state-creation contract before scanning.
     let repo = open_existing_managed_root(ctx.cwd())?;
-    run_index_for_repo(ctx, args, &repo, true)
+    run_index_for_repo(adapter_settings, ctx, args, &repo, true)
 }
 
 /// Index one scope. Only the user-invoked parent discovers children; child
 /// scopes stay direct-file-only and cannot recursively fan out a single run.
 fn run_index_for_repo(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     args: IndexArgs,
     repo: &Repository,
     discover_children: bool,
 ) -> Result<Value> {
-    run_index_for_repo_inner(ctx, args, repo, discover_children)
+    run_index_for_repo_inner(adapter_settings, ctx, args, repo, discover_children)
 }
 
 struct ChildDiscoveryPage {
@@ -1625,6 +1667,7 @@ fn admit_scope_writer(repo: &Repository) -> Result<CurrentPolicyEvaluator> {
 }
 
 fn run_index_for_repo_inner(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     args: IndexArgs,
     repo: &Repository,
@@ -1681,6 +1724,7 @@ fn run_index_for_repo_inner(
         // scopes through `build_repository_scan_preview`.
         validate_repo_tool_lock(repo)?;
         let preview = build_repository_scan_preview(
+            adapter_settings,
             repo,
             ScanPreviewRequest {
                 scope_path: repo.root().display().to_string(),
@@ -1724,6 +1768,8 @@ fn run_index_for_repo_inner(
                         continue;
                     };
                     let child_preview = build_planned_child_scan_preview(
+                        &adapter_settings.declared_pricing("markdown"),
+                        &adapter_settings.declared_pricing("embedding"),
                         &bound,
                         ScanPreviewRequest {
                             scope_path: child.path.clone(),
@@ -1773,7 +1819,7 @@ fn run_index_for_repo_inner(
 
     // An explicit network request must not silently turn into an offline
     // success. Check before writer recovery, grants, ledgers or task mutation.
-    if args.online && !approvals::any_network_allowed(repo)? {
+    if args.online && !approvals::any_network_allowed(adapter_settings, repo)? {
         return Err(KioError::invalid_usage(
             "online indexing requires an active external-send approval for this scope",
         ));
@@ -1793,6 +1839,7 @@ fn run_index_for_repo_inner(
     let publication_policy = admit_scope_writer(repo)?;
     validate_repo_tool_lock(repo)?;
     let preview = build_repository_scan_preview(
+        adapter_settings,
         repo,
         ScanPreviewRequest {
             scope_path: repo.root().display().to_string(),
@@ -1808,8 +1855,9 @@ fn run_index_for_repo_inner(
     if args.yes {
         write_approval_record(repo, &preview, "yes")?;
     }
-    let markdown_profile = active_markdownize_profile_for(repo)?;
+    let markdown_profile = active_markdownize_profile_for(adapter_settings, repo)?;
     let secrets_approved = secrets_send_approved(
+        adapter_settings,
         repo,
         approvals::AdapterRole::Markdown,
         &markdown_profile.adapter_id,
@@ -1821,10 +1869,10 @@ fn run_index_for_repo_inner(
             &markdown_output_ref_for_profile(&markdown_profile),
         )?;
     }
-    record_quarantine_candidates(repo, &preview)?;
+    record_quarantine_candidates(adapter_settings, repo, &preview)?;
 
     if recover_pending_online_promotion(repo)? {
-        finish_pending_online_promotion(ctx, repo)?;
+        finish_pending_online_promotion(adapter_settings, ctx, repo)?;
     }
     // CL45/item 5: reconcile any stale `request_kind='sync'` cost-ledger.sqlite
     // rows left by a crashed prior run, same write-command-entry point as the
@@ -1846,19 +1894,24 @@ fn run_index_for_repo_inner(
     if !args.offline
         && let Some(ledger) = open_optional_ledger_db()?
     {
-        poll_batch_markdownize_jobs(repo, &TaskStore::new(repo.kio_dir()), &ledger)?;
+        poll_batch_markdownize_jobs(
+            adapter_settings,
+            repo,
+            &TaskStore::new(repo.kio_dir()),
+            &ledger,
+        )?;
         // Offline also forbids polling, downloading or deleting existing jobs.
-        poll_batch_embedding_jobs(ctx, repo, &ledger)?;
+        poll_batch_embedding_jobs(adapter_settings, ctx, repo, &ledger)?;
     }
     // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment).
     ensure_purge_epoch_initialized(repo.kio_dir())?;
-    materialize_tool_lock(repo)?;
-    let mut index_result = run_index_pipeline(repo, &preview, &args)?;
+    materialize_tool_lock(adapter_settings, repo)?;
+    let mut index_result = run_index_pipeline(adapter_settings, repo, &preview, &args)?;
     // A prior batch may already have produced a complete accepted online
     // instance. Overlay it before the one normal index snapshot so an ordinary
     // index neither demotes the file to the deterministic baseline nor creates a
     // second promotion commit.
-    apply_online_promotion_to_index(repo, &mut index_result)?;
+    apply_online_promotion_to_index(adapter_settings, repo, &mut index_result)?;
     let excluded = preview
         .candidates
         .iter()
@@ -1892,7 +1945,7 @@ fn run_index_for_repo_inner(
             }),
         )?;
     }
-    let rebuild_report = rebuild_step3_index(ctx, repo)?;
+    let rebuild_report = rebuild_step3_index(adapter_settings, ctx, repo)?;
     // LC42-LC44: after the rebuild's temp-build-then-rename lands the final
     // `sqlite.db`, reconcile `index_metadata` (item 2).
     recover_index_generation(repo.kio_dir())?;
@@ -1900,7 +1953,7 @@ fn run_index_for_repo_inner(
     // guardrails (K4). No-op unless an embedding adapter is configured. R11-2: keep
     // the ExecOutcome (was discarded) so the embedding enrichment result is disclosed
     // and can raise the exit code (auth/budget) instead of a silent exit 0.
-    let enrichment = generate_scope_embeddings(ctx, repo, &args)?;
+    let enrichment = generate_scope_embeddings(adapter_settings, ctx, repo, &args)?;
     // The scope now has a search index; register it as indexed so it participates
     // in default multi-scope search (05 §1.8, K3). Cache write, never fatal.
     register_scope(ctx, repo, true);
@@ -1908,7 +1961,7 @@ fn run_index_for_repo_inner(
         "status": if outcome.noop { "noop" } else { "indexed" },
         "approval_method": if args.yes { "yes" } else { "existing" },
         "network_allowed": index_result.network_allowed,
-        "network_opt_in": persistent_network_allowed(repo)?,
+        "network_opt_in": persistent_network_allowed(adapter_settings, repo)?,
         "pending_online_tasks": index_result.pending_online_tasks,
         // R11-2: fold enrichment's budget pauses in with the enqueue-paused markdownize
         // tasks so `paused_tasks` reflects everything the run left paused.
@@ -2037,7 +2090,14 @@ fn run_index_for_repo_inner(
                             .expect("managed child ancestor was inserted")
                     }
                 };
-                match run_bound_child_index(ctx, direct_parent, plan, &child.path, &args) {
+                match run_bound_child_index(
+                    adapter_settings,
+                    ctx,
+                    direct_parent,
+                    plan,
+                    &child.path,
+                    &args,
+                ) {
                     Ok(BoundChildIndex::SkippedVcs) => {
                         child.status = "skipped_vcs".to_owned();
                         child.reason = Some("vcs_marker_added_after_discovery".to_owned());
@@ -2196,13 +2256,19 @@ fn run_index_for_repo_inner(
 /// Build a preview through retained management and live ancestor policy.
 /// Public paths in the request are presentation-only and never select I/O.
 fn build_repository_scan_preview(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     request: ScanPreviewRequest,
 ) -> kio_pipeline::Result<ScanPreview> {
     let binding = binding_for_repo(repo).map_err(|error| {
         kio_pipeline::PipelineError::contract("KIO-E-POLICY-MANAGEMENT-001", error.to_string())
     })?;
-    build_managed_scan_preview(&binding, request)
+    build_managed_scan_preview(
+        &adapter_settings.declared_pricing("markdown"),
+        &adapter_settings.declared_pricing("embedding"),
+        &binding,
+        request,
+    )
 }
 
 fn read_repository_scan_input(
@@ -2354,6 +2420,7 @@ fn cache_managed_child_parent(
 }
 
 fn run_bound_child_index(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     parent: &Repository,
     plan: &kio_pipeline::scan::ChildScopePlan,
@@ -2372,7 +2439,7 @@ fn run_bound_child_index(
             // grants. Existing child grants may still authorize the requested
             // execution lane through that child's ordinary send gates.
             child_args.yes = false;
-            let output = run_index_for_repo(ctx, child_args, &repo, false)?;
+            let output = run_index_for_repo(adapter_settings, ctx, child_args, &repo, false)?;
             Ok(BoundChildIndex::Output(output, repo))
         }
     }
@@ -2459,7 +2526,11 @@ fn reject_inert_repair_yes(args: &RepairArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_repair(ctx: &AppContext, args: RepairArgs) -> Result<Value> {
+fn run_repair(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+    args: RepairArgs,
+) -> Result<Value> {
     reject_inert_repair_yes(&args)?;
     if let RepairOperation::CancelChildInitialization(cancel) = args.operation {
         if cancel.preview == cancel.yes || (cancel.yes && cancel.operation.is_none()) {
@@ -2480,13 +2551,17 @@ fn run_repair(ctx: &AppContext, args: RepairArgs) -> Result<Value> {
         );
     }
     if matches!(args.operation, RepairOperation::RecoverRestore) {
-        return managed_restore::recover(ctx);
+        return managed_restore::recover(adapter_settings, ctx);
     }
     if matches!(
         args.operation,
         RepairOperation::All | RepairOperation::Replica
     ) {
-        return run_device_repair(ctx, matches!(args.operation, RepairOperation::All));
+        return run_device_repair(
+            adapter_settings,
+            ctx,
+            matches!(args.operation, RepairOperation::All),
+        );
     }
     let parsed = parsed_repair(&args);
     let mode = parsed.mode;
@@ -2643,13 +2718,21 @@ fn run_repair(ctx: &AppContext, args: RepairArgs) -> Result<Value> {
         }
         return Ok(output);
     }
-    run_rebuild_db_locked(ctx, &repo, parsed.online, parsed.offline, true)
+    run_rebuild_db_locked(
+        adapter_settings,
+        ctx,
+        &repo,
+        parsed.online,
+        parsed.offline,
+        true,
+    )
 }
 
 /// The locked, source-SQLite half of `repair rebuild-db`.  Keeping it separate
 /// lets device-global repair use the identical recovery path while forcing it
 /// offline, without widening the scoped command's CLI surface.
 fn run_rebuild_db_locked(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     online_requested: bool,
@@ -2672,8 +2755,13 @@ fn run_rebuild_db_locked(
         // entire block: its offline contract forbids provider polling and
         // remote-residue cleanup as well as new paid sends.
         if let Some(ledger) = open_optional_ledger_db()? {
-            poll_batch_markdownize_jobs(repo, &TaskStore::new(repo.kio_dir()), &ledger)?;
-            poll_batch_embedding_jobs(ctx, repo, &ledger)?;
+            poll_batch_markdownize_jobs(
+                adapter_settings,
+                repo,
+                &TaskStore::new(repo.kio_dir()),
+                &ledger,
+            )?;
+            poll_batch_embedding_jobs(adapter_settings, ctx, repo, &ledger)?;
         }
     }
     // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment).
@@ -2683,7 +2771,7 @@ fn run_rebuild_db_locked(
     // `rebuild_sqlite_index` drops and rebuilds chunks/FTS/tree_entries in place
     // while preserving the `embeddings` rows and re-deriving `chunk_vec` from them
     // (04 §4.3). It is not pre-deleted here so vector search survives the rebuild.
-    let report = rebuild_step3_index(ctx, repo)?;
+    let report = rebuild_step3_index(adapter_settings, ctx, repo)?;
     // LC42-LC44 (item 2), same ordering rationale as `run_index`'s call.
     recover_index_generation(repo.kio_dir())?;
     if promotion_rebuild_pending {
@@ -2707,7 +2795,7 @@ fn run_rebuild_db_locked(
     // materialize a new lock/profile.
     let locked_embedding_profile = rebuild_embedding_profile_from_tool_lock(repo.kio_dir())?;
     let enrichment_authorized = locked_embedding_profile.as_ref().is_some_and(|locked| {
-        embedding_execution()
+        embedding_execution(adapter_settings)
             .map(declared_embedding_profile)
             .is_some_and(|active| {
                 active.dimensions == locked.dimensions
@@ -2717,14 +2805,14 @@ fn run_rebuild_db_locked(
             })
     });
     let embedding_online = if enrichment_authorized {
-        embedding_online_allowed(repo, offline, online_requested, false)?
+        embedding_online_allowed(adapter_settings, repo, offline, online_requested, false)?
     } else {
         false
     };
     // R11-2: keep the enrichment ExecOutcome (was discarded) — disclose it and let an
     // auth/budget-pause raise the exit while the rebuild JSON still prints to stdout.
     let enrichment = if enrichment_authorized {
-        run_embedding_enrichment(ctx, repo, embedding_online, false, false)?
+        run_embedding_enrichment(adapter_settings, ctx, repo, embedding_online, false, false)?
     } else {
         ExecOutcome::default()
     };
@@ -2748,7 +2836,11 @@ fn run_rebuild_db_locked(
 /// Device-global repair deliberately enumerates the registry before opening any
 /// scope.  The registry connection is dropped before locks are taken: a repair
 /// must never hold the device database while it waits on a scope writer.
-fn run_device_repair(ctx: &AppContext, rebuild_source: bool) -> Result<Value> {
+fn run_device_repair(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+    rebuild_source: bool,
+) -> Result<Value> {
     let entries = {
         let registry = RegistryDb::open_default().map_err(index_to_kio)?;
         registry.all_entries().map_err(index_to_kio)?
@@ -2812,6 +2904,7 @@ fn run_device_repair(ctx: &AppContext, rebuild_source: bool) -> Result<Value> {
             continue;
         }
         match run_one_device_repair(
+            adapter_settings,
             ctx,
             &repo,
             &entry,
@@ -2992,6 +3085,7 @@ fn device_repair_reason(stage: &str, error: &KioError) -> &'static str {
 }
 
 fn run_one_device_repair(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     entry: &RegistryEntry,
@@ -3043,7 +3137,7 @@ fn run_one_device_repair(
                 ExitCode::PartialFailure,
             ));
         }
-        let mut result = run_rebuild_db_locked(ctx, repo, false, true, false)?;
+        let mut result = run_rebuild_db_locked(adapter_settings, ctx, repo, false, true, false)?;
         let exit = take_exit_override(&mut result);
         if let Some(exit) = exit {
             let code = result
@@ -3248,9 +3342,11 @@ enum ScopeEmbedState {
 /// When nothing is active there is no space to be compatible WITH, so the
 /// online profile stays the answer; `resolve_vector_availability` has already
 /// declined on `endpoint_configured` before this can matter.
-fn active_embedding_profile_summary() -> embedding_store::EmbeddingProfileSummary {
-    let profile_hash = embedding_execution()
-        .and_then(|execution| embedding_adapter_profile(execution).ok())
+fn active_embedding_profile_summary(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+) -> embedding_store::EmbeddingProfileSummary {
+    let profile_hash = embedding_execution(adapter_settings)
+        .and_then(|execution| embedding_adapter_profile(adapter_settings, execution).ok())
         .map_or_else(
             || adopted_embedding_profile().tool_profile_hash,
             |profile| profile.tool_profile_hash,
@@ -3268,6 +3364,7 @@ fn active_embedding_profile_summary() -> embedding_store::EmbeddingProfileSummar
 /// searchable rows, so this is the same compatibility fact a direct search
 /// needs for vector-mode resolution.
 fn replica_embedding_state(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     header: Option<&kio_index::aggregator::AggScopeHeader>,
 ) -> ScopeEmbedState {
     let Some(header) = header else {
@@ -3278,7 +3375,7 @@ fn replica_embedding_state(
     {
         return ScopeEmbedState::Absent;
     }
-    let expected = active_embedding_profile_summary();
+    let expected = active_embedding_profile_summary(adapter_settings);
     if header
         .embedding_profiles
         .iter()
@@ -5455,21 +5552,30 @@ fn log_aggregator_degraded(ctx: &AppContext, detail: &str) {
     ));
 }
 
-fn run_search(ctx: &AppContext, args: SearchArgs) -> Result<Value> {
+fn run_search(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+    args: SearchArgs,
+) -> Result<Value> {
     // R12-4: a FAILED search (cursor mismatch, all-scope-failed, …) returns before
     // `append_search_logs`, so it never wrote a per-search metrics line and dropped
     // out of the p50/p95/p99 latency population (docs/05:578). Emit that line here on
     // the error path (result_count 0 + error_code). The errors.jsonl line for a hard
     // Err is still written by main()'s Err arm.
     let started = Instant::now();
-    let result = run_search_inner(ctx, args, started);
+    let result = run_search_inner(adapter_settings, ctx, args, started);
     if let Err(error) = &result {
         append_failed_search_metrics(started, error);
     }
     result
 }
 
-fn run_search_inner(ctx: &AppContext, args: SearchArgs, started: Instant) -> Result<Value> {
+fn run_search_inner(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+    args: SearchArgs,
+    started: Instant,
+) -> Result<Value> {
     let parsed = parsed_search(args)?;
     // PC10 (05 §1.3 L115): a query that tokenizes to zero tokens (empty, or
     // whitespace-only under PC9's Unicode-whitespace split) is a usage error
@@ -5805,6 +5911,7 @@ fn run_search_inner(ctx: &AppContext, args: SearchArgs, started: Instant) -> Res
         .iter()
         .map(|exec| {
             replica_embedding_state(
+                adapter_settings,
                 replica_headers
                     .get(&exec.target.scope_id)
                     .and_then(Option::as_ref),
@@ -5819,12 +5926,12 @@ fn run_search_inner(ctx: &AppContext, args: SearchArgs, started: Instant) -> Res
     // length + per-scope compat) — never by eagerly calling the adapter.
     // QA21/23: the AND-gate's profile match needs the adapter's CURRENT
     // `tool_profile_hash` alongside its `tool_id`.
-    let adapter_identity = active_embedding_adapter_identity()?;
+    let adapter_identity = active_embedding_adapter_identity(adapter_settings)?;
     let adapter_id = adapter_identity.as_ref().map(|(id, _)| id.clone());
     // An embedding adapter can be an authenticated local HTTPS peer. Only the
     // deterministic evaluator is in-process; every other execution needs an
     // exact device+scope grant.
-    let active_embedding = embedding_execution();
+    let active_embedding = embedding_execution(adapter_settings);
     let embedding_is_deterministic = active_embedding.is_some_and(embedding_is_deterministic);
     if parsed.online && (active_embedding.is_none() || embedding_is_deterministic) {
         return Err(KioError::invalid_usage(
@@ -5835,9 +5942,13 @@ fn run_search_inner(ctx: &AppContext, args: SearchArgs, started: Instant) -> Res
         true
     } else {
         match &adapter_identity {
-            Some((id, tool_profile_hash)) => {
-                embedding_opt_in_for_scopes(&exec_scopes, id, tool_profile_hash, parsed.offline)?
-            }
+            Some((id, tool_profile_hash)) => embedding_opt_in_for_scopes(
+                adapter_settings,
+                &exec_scopes,
+                id,
+                tool_profile_hash,
+                parsed.offline,
+            )?,
             None => false,
         }
     };
@@ -5899,6 +6010,7 @@ fn run_search_inner(ctx: &AppContext, args: SearchArgs, started: Instant) -> Res
             // that same live authority immediately before the embedding helper
             // can claim budget or send the query body.
             match compute_query_embedding_page1(
+                adapter_settings,
                 &query_nfc,
                 &exec_scopes,
                 &search_repositories,
@@ -6100,7 +6212,7 @@ fn run_search_inner(ctx: &AppContext, args: SearchArgs, started: Instant) -> Res
                 })?
                 .ok_or_else(|| ScopeSearchError::Excluded(INDEX_REBUILDING_REASON.to_owned()))?;
             if mode.resolved == SearchMode::Vector {
-                match replica_embedding_state(Some(&resolution.header)) {
+                match replica_embedding_state(adapter_settings, Some(&resolution.header)) {
                     ScopeEmbedState::Compatible => {}
                     ScopeEmbedState::Incompatible => {
                         return Err(ScopeSearchError::Excluded(
@@ -8940,7 +9052,11 @@ fn run_view(ctx: &AppContext, args: PointerArgs) -> Result<Value> {
     }))
 }
 
-fn run_reindex(ctx: &AppContext, args: ReindexArgs) -> Result<Value> {
+fn run_reindex(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+    args: ReindexArgs,
+) -> Result<Value> {
     // B: `--regenerate`/`--at` exclusivity and the flag vocabulary are enforced
     // by the clap declaration on `ReindexArgs`; this only shapes the struct the
     // command body already consumed.
@@ -8980,14 +9096,26 @@ fn run_reindex(ctx: &AppContext, args: ReindexArgs) -> Result<Value> {
     if !parsed.offline
         && let Some(ledger) = open_optional_ledger_db()?
     {
-        poll_batch_markdownize_jobs(&repo, &TaskStore::new(repo.kio_dir()), &ledger)?;
+        poll_batch_markdownize_jobs(
+            adapter_settings,
+            &repo,
+            &TaskStore::new(repo.kio_dir()),
+            &ledger,
+        )?;
         // 04 §5.8 相 3 for the embedding Batch lane at the same entry point.
-        poll_batch_embedding_jobs(ctx, &repo, &ledger)?;
+        poll_batch_embedding_jobs(adapter_settings, ctx, &repo, &ledger)?;
     }
     // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment).
     ensure_purge_epoch_initialized(repo.kio_dir())?;
     if let Some(at) = parsed.at.as_deref() {
-        return historical_reindex::run(ctx, &repo, at, parsed.online, parsed.offline);
+        return historical_reindex::run(
+            adapter_settings,
+            ctx,
+            &repo,
+            at,
+            parsed.online,
+            parsed.offline,
+        );
     }
     if !parsed.force {
         return Err(KioError::invalid_usage(
@@ -9092,11 +9220,15 @@ fn run_reindex(ctx: &AppContext, args: ReindexArgs) -> Result<Value> {
             Err(error) => return Err(error),
         }
     }
-    let closing_preview = build_scan_preview(ScanPreviewRequest {
-        scope_path: repo.root().display().to_string(),
-        include_raw_hashes: false,
-        require_network_approval: false,
-    })
+    let closing_preview = build_scan_preview(
+        &adapter_settings.declared_pricing("markdown"),
+        &adapter_settings.declared_pricing("embedding"),
+        ScanPreviewRequest {
+            scope_path: repo.root().display().to_string(),
+            include_raw_hashes: false,
+            require_network_approval: false,
+        },
+    )
     .map_err(pipeline_to_kio)?;
     let excluded = closing_preview
         .candidates
@@ -9121,7 +9253,7 @@ fn run_reindex(ctx: &AppContext, args: ReindexArgs) -> Result<Value> {
         mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), commit_hash);
         maybe_inject_replica_after_head_fault("reindex")?;
     }
-    let mut report = rebuild_step3_index(ctx, &repo)?;
+    let mut report = rebuild_step3_index(adapter_settings, ctx, &repo)?;
     // LC42-LC44 (item 2), same ordering rationale as `run_index`'s call.
     recover_index_generation(repo.kio_dir())?;
     // R17-2: fold the re-normalization loop's skips into the rebuild report so the one
@@ -9139,10 +9271,17 @@ fn run_reindex(ctx: &AppContext, args: ReindexArgs) -> Result<Value> {
     // QA31 (step4b-contract-tests-p3a.md §I): `--force`'s `--online`/
     // `--offline` now reach this pass instead of the hard-coded
     // `(false, false, false)` this used to pass unconditionally.
-    let embedding_online = embedding_online_allowed(&repo, parsed.offline, parsed.online, false)?;
+    let embedding_online = embedding_online_allowed(
+        adapter_settings,
+        &repo,
+        parsed.offline,
+        parsed.online,
+        false,
+    )?;
     // R11-2: keep the enrichment ExecOutcome (was discarded) so a new-generation
     // embedding auth/budget-pause is disclosed and raises the exit (result on stdout).
-    let enrichment = run_embedding_enrichment(ctx, &repo, embedding_online, false, false)?;
+    let enrichment =
+        run_embedding_enrichment(adapter_settings, ctx, &repo, embedding_online, false, false)?;
     let mut output = json!({
         "status": "reindexed",
         "reindexed_files": reindexed,
@@ -9387,7 +9526,11 @@ fn final_shallow_commit_set(repo: &Repository) -> Result<BTreeSet<String>> {
     )
 }
 
-fn rebuild_step3_index(ctx: &AppContext, repo: &Repository) -> Result<Step3RebuildReport> {
+fn rebuild_step3_index(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+    repo: &Repository,
+) -> Result<Step3RebuildReport> {
     ensure_no_visible_purge_journal(repo.kio_dir())?;
     // HEAD is the only publication authority. Tags and chunk publication
     // records may retain ancestors, but cannot supply a substitute HEAD.
@@ -9749,6 +9892,7 @@ fn rebuild_step3_index(ctx: &AppContext, repo: &Repository) -> Result<Step3Rebui
     // search uses only replica corpus rows and bindings. The former JSON projection
     // went stale after a manual snapshot and is no longer written (L3).
     rebuild_sqlite_index(
+        adapter_settings,
         ctx,
         repo,
         &tree_entries,
@@ -10844,6 +10988,7 @@ pub(crate) fn append_chunk_publication_events(
 }
 
 fn rebuild_sqlite_index(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     tree_entries: &[TreeEntryRow],
@@ -10891,7 +11036,10 @@ fn rebuild_sqlite_index(
         }
     }
     match build_sqlite_index_at(
-        ctx,
+        Invocation {
+            settings: adapter_settings,
+            context: ctx,
+        },
         &temp_path,
         repo,
         tree_entries,
@@ -11288,7 +11436,7 @@ pub(crate) fn authenticate_publication_event_cached(
 /// sqlite.db (P5); the connection is dropped here so the rename sees no open
 /// handle / leftover journal.
 fn build_sqlite_index_at(
-    ctx: &AppContext,
+    invocation: Invocation<'_>,
     temp_path: &Path,
     repository: &Repository,
     tree_entries: &[TreeEntryRow],
@@ -11296,6 +11444,9 @@ fn build_sqlite_index_at(
     retained_unit_introductions: &AuthenticatedNormalizedUnits,
     _chunking_config_hash: &str,
 ) -> Result<()> {
+    let ctx = invocation.context;
+    let adapter_settings = invocation.settings;
+
     let kio_dir = repository.kio_dir();
     ensure_no_visible_purge_journal(kio_dir)?;
     let mut fts = SqliteFtsIndex::open(
@@ -11427,6 +11578,7 @@ fn build_sqlite_index_at(
     let secrets_allowed = match locked_embedding.as_ref() {
         Some(entry) if persisted_embedding_is_deterministic(entry) => true,
         Some(entry) => approvals::allowed(
+            adapter_settings,
             repository,
             approvals::AdapterRole::Embedding,
             &entry.tool_id,
@@ -15352,7 +15504,11 @@ fn search_to_kio(error: kio_search::SearchError) -> KioError {
     }
 }
 
-fn run_batch(ctx: &AppContext, args: BatchArgs) -> Result<Value> {
+fn run_batch(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+    args: BatchArgs,
+) -> Result<Value> {
     validate_batch_args(&args)?;
     // Same lane contract as `run_index`: resume/retry drive real online sends,
     // so the invocation lane has to be resolved before any of them is planned.
@@ -15387,6 +15543,7 @@ fn run_batch(ctx: &AppContext, args: BatchArgs) -> Result<Value> {
         }
         Some(BatchCommand::Retry(retry)) if retry.resend_unknown.is_some() => {
             return run_batch_resend_unknown(
+                adapter_settings,
                 ctx,
                 &repo,
                 retry.resend_unknown.as_deref().expect("validated above"),
@@ -15416,14 +15573,20 @@ fn run_batch(ctx: &AppContext, args: BatchArgs) -> Result<Value> {
     // ExecOutcome so "in-flight のみ残" maps to the batch exit-3 semantics.
     let mut batch_poll_outcome = ExecOutcome::default();
     if !batch_offline && let Some(ledger) = open_optional_ledger_db()? {
-        batch_poll_outcome = poll_batch_markdownize_jobs(&repo, &store, &ledger)?;
-        batch_poll_outcome.add(poll_batch_embedding_jobs(ctx, &repo, &ledger)?);
+        batch_poll_outcome = poll_batch_markdownize_jobs(adapter_settings, &repo, &store, &ledger)?;
+        batch_poll_outcome.add(poll_batch_embedding_jobs(
+            adapter_settings,
+            ctx,
+            &repo,
+            &ledger,
+        )?);
     }
     // N1: a Tier B online hold is only lifted by an explicit `--send-secrets`
     // approval, never by a plain `batch resume`. Without this, resume's
     // Paused -> Pending flip would silently un-hold the candidate-secret task.
     let online_profile = online_markdownize_profile_for(&repo)?;
     let secrets_approved = secrets_send_approved(
+        adapter_settings,
         &repo,
         approvals::AdapterRole::Markdown,
         &online_profile.adapter_id,
@@ -15477,7 +15640,10 @@ fn run_batch(ctx: &AppContext, args: BatchArgs) -> Result<Value> {
                 })
                 .map_err(pipeline_to_kio)?;
             let mut outcome = execute_pending_tasks(
-                ctx,
+                Invocation {
+                    settings: adapter_settings,
+                    context: ctx,
+                },
                 &repo,
                 &store,
                 resume.override_budget,
@@ -15559,7 +15725,10 @@ fn run_batch(ctx: &AppContext, args: BatchArgs) -> Result<Value> {
             // revives an auth_error task (CT2-TASK-005: `max_attempts=0` is this command's
             // contract; `batch resume` is where repaired credentials take effect).
             let mut outcome = execute_pending_tasks(
-                ctx,
+                Invocation {
+                    settings: adapter_settings,
+                    context: ctx,
+                },
                 &repo,
                 &store,
                 false,
@@ -15625,21 +15794,42 @@ fn validate_batch_args(args: &BatchArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_adapter(ctx: &AppContext, args: AdapterArgs) -> Result<Value> {
+fn run_adapter(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ctx: &AppContext,
+    args: AdapterArgs,
+) -> Result<Value> {
     match args.command {
-        Some(AdapterCommand::Approve(args)) => {
-            approvals::approve(ctx, args, &approvals::ApprovalControl::default())
-        }
+        Some(AdapterCommand::Approve(args)) => approvals::approve(
+            adapter_settings,
+            ctx,
+            args,
+            &approvals::ApprovalControl::default(),
+        ),
+        Some(AdapterCommand::Status(args)) => approvals::status(adapter_settings, ctx, args),
+        command => run_adapter_lifecycle(ctx, command),
+    }
+}
+
+fn run_adapter_lifecycle(ctx: &AppContext, command: Option<AdapterCommand>) -> Result<Value> {
+    match command {
         Some(AdapterCommand::Revoke(args)) => approvals::revoke(ctx, args),
-        Some(AdapterCommand::Status(args)) => approvals::status(ctx, args),
         Some(AdapterCommand::Trust(command)) => trust::run(&trust::directory_path(), command),
         None => Err(KioError::invalid_usage(
             "adapter requires approve, revoke, status, or trust",
         )),
+        _ => unreachable!("content adapter commands require runtime settings"),
     }
 }
 
-fn run_ledger(args: LedgerArgs) -> Result<Value> {
+fn run_ledger(adapter_settings: &Arc<AdapterRuntimeSettings>, args: LedgerArgs) -> Result<Value> {
+    match args.command {
+        Some(LedgerCommand::Reconcile(_)) => run_ledger_reconcile(adapter_settings),
+        command => run_ledger_lifecycle(LedgerArgs { command }),
+    }
+}
+
+fn run_ledger_lifecycle(args: LedgerArgs) -> Result<Value> {
     match args.command {
         Some(LedgerCommand::Init { resume }) => {
             let path = ledger_db_path();
@@ -15691,10 +15881,10 @@ fn run_ledger(args: LedgerArgs) -> Result<Value> {
             let recovery = LedgerDb::recover_pending_write(&path).map_err(pipeline_to_kio)?;
             Ok(json!({ "status": "ready", "recovery": recovery, "path": path }))
         }
-        Some(LedgerCommand::Reconcile(_)) => run_ledger_reconcile(),
         None => Err(KioError::invalid_usage(
             "ledger requires init, status, backup, restore, recover, or reconcile",
         )),
+        Some(LedgerCommand::Reconcile(_)) => unreachable!("reconcile requires runtime settings"),
     }
 }
 
@@ -15709,7 +15899,7 @@ fn run_ledger(args: LedgerArgs) -> Result<Value> {
 /// ledger writer uses, so no additional locking is needed here). Runnable
 /// whether or not a restore was ever detected — see `LedgerCommand::Reconcile`'s
 /// doc comment: idempotent, and useful standalone.
-fn run_ledger_reconcile() -> Result<Value> {
+fn run_ledger_reconcile(adapter_settings: &Arc<AdapterRuntimeSettings>) -> Result<Value> {
     let ledger = open_ledger_db()?;
     let conn = &ledger;
 
@@ -15753,8 +15943,10 @@ fn run_ledger_reconcile() -> Result<Value> {
     // lane) and maps job metadata's 5-key contract onto these attribution
     // records — no CLI-side merge needed.
     let inventories =
-        kio_adapter::batch_inventory::configured_inventories(|| batch_recovery_context(&ledger))
-            .map_err(adapter_to_kio)?;
+        kio_adapter::batch_inventory::configured_inventories(adapter_settings, || {
+            batch_recovery_context(&ledger)
+        })
+        .map_err(adapter_to_kio)?;
 
     let batch_walk = run_batch_recovery_walk(conn, &inventories)?;
     let orphan_walk = run_orphan_attribution_walk(conn, &inventories)?;
@@ -16462,6 +16654,7 @@ fn run_batch_reset_violations(ctx: &AppContext, selector_input: &str, yes: bool)
 /// This command never contacts an adapter: it only changes the ledger's
 /// one-shot fence and requeues the exact current task for a later online pass.
 fn run_batch_resend_unknown(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     selector_input: &str,
@@ -16489,7 +16682,7 @@ fn run_batch_resend_unknown(
         ));
     }
     let markdown_profile = online_markdownize_profile_for(repo)?;
-    let embedding_profile = embedding_execution().map(declared_embedding_profile);
+    let embedding_profile = embedding_execution(adapter_settings).map(declared_embedding_profile);
     let store = TaskStore::new(repo.kio_dir());
     let tasks = store.all().map_err(pipeline_to_kio)?;
     let matching_task_ids = match key.adapter_kind.as_str() {
@@ -17066,7 +17259,7 @@ fn set_exit_override(output: &mut Value, code: ExitCode) {
 }
 
 fn execute_pending_tasks(
-    ctx: &AppContext,
+    invocation: Invocation<'_>,
     repo: &Repository,
     store: &TaskStore,
     override_budget: bool,
@@ -17082,17 +17275,21 @@ fn execute_pending_tasks(
     online: bool,
     offline: bool,
 ) -> Result<ExecOutcome> {
+    let ctx = invocation.context;
+    let adapter_settings = invocation.settings;
+
     let mut outcome = ExecOutcome::default();
     // Q3: under the folder store lock, any Running task is an orphan from a crashed
     // run — reclaim it to Pending so this pass re-executes it.
     reclaim_orphaned_running_tasks(store)?;
     if recover_pending_online_promotion(repo)? {
-        finish_pending_online_promotion(ctx, repo)?;
+        finish_pending_online_promotion(adapter_settings, ctx, repo)?;
     }
     // Markdownize and embedding opt-ins are per-adapter (07 §3, L4): gate each
     // adapter on its own approval rather than one blanket check.
-    if !offline && persistent_network_allowed(repo)? {
+    if !offline && persistent_network_allowed(adapter_settings, repo)? {
         outcome.add(execute_pending_markdownize_tasks(
+            adapter_settings,
             ctx,
             repo,
             store,
@@ -17103,8 +17300,8 @@ fn execute_pending_tasks(
     // Online Markdownize changes durable search truth only after the complete
     // output is rebound into one auto commit and SQLite is rebuilt. Do this before
     // embedding enrichment so the same batch pass can see/promote the new chunks.
-    if promote_completed_online_markdownize(ctx, repo)? {
-        finish_pending_online_promotion(ctx, repo)?;
+    if promote_completed_online_markdownize(adapter_settings, ctx, repo)? {
+        finish_pending_online_promotion(adapter_settings, ctx, repo)?;
     }
     // Embedding tasks are executed by the same enrichment pass `kio index` uses;
     // without this, rate-limited Pending embedding tasks could never be completed
@@ -17116,8 +17313,10 @@ fn execute_pending_tasks(
     // `online_confirmed` stays `false` (matching `kio index`'s own
     // `--online`-without-`--approve` behavior: `--online` alone still needs
     // an existing approval row).
-    let embedding_online = embedding_online_allowed(repo, offline, online, false)?;
+    let embedding_online =
+        embedding_online_allowed(adapter_settings, repo, offline, online, false)?;
     outcome.add(run_embedding_enrichment(
+        adapter_settings,
         ctx,
         repo,
         embedding_online,
@@ -17131,6 +17330,7 @@ fn execute_pending_tasks(
 /// R9-7: returns success + failure counts so `batch` JSON can report driven
 /// attempts, not only successes.
 fn execute_pending_markdownize_tasks(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     store: &TaskStore,
@@ -17148,6 +17348,7 @@ fn execute_pending_markdownize_tasks(
     // `--send-secrets`-approved — in case the hold was cleared by some other path.
     let online_profile = online_markdownize_profile_for(repo)?;
     let secrets_approved = secrets_send_approved(
+        adapter_settings,
         repo,
         approvals::AdapterRole::Markdown,
         &online_profile.adapter_id,
@@ -17243,7 +17444,7 @@ fn execute_pending_markdownize_tasks(
     // Batch send lane (04 §5.8 / 07 §5.5): resolved once per pass — `Some`
     // exactly when this pass can drive upload → job-create against a
     // configured (mock or real) Batch client.
-    let batch_client = batch_markdownize_lane_client(&ledger)?;
+    let batch_client = batch_markdownize_lane_client(adapter_settings, &ledger)?;
     for task in tasks {
         let task_id = task.task_id.clone();
         let key = task_ledger_key(
@@ -17388,7 +17589,9 @@ fn execute_pending_markdownize_tasks(
         // a charge here would be a phantom. Do not apply this admission to an
         // existing sync row: that row may cover an earlier request whose result
         // remains uncertain, and must retain the normal unknown settlement.
-        if lane == MarkdownizeSendLane::Sync && !sync_markdownize_credential_available()? {
+        if lane == MarkdownizeSendLane::Sync
+            && !sync_markdownize_credential_available(adapter_settings)?
+        {
             let reason = retry_reason(RetryErrorKind::AuthError).to_owned();
             store
                 .update_matching(|candidate| {
@@ -17455,6 +17658,7 @@ fn execute_pending_markdownize_tasks(
                 .as_deref()
                 .expect("Batch lane selection guarantees a configured client");
             match submit_batch_markdownize_job(
+                adapter_settings,
                 client,
                 &ledger,
                 &key,
@@ -17537,6 +17741,7 @@ fn execute_pending_markdownize_tasks(
         // boundary, so a provider that declares a sync idempotency key can be
         // required to carry it.
         match execute_online_markdownize_task(
+            adapter_settings,
             repo,
             &task,
             prepared_input,
@@ -17555,7 +17760,7 @@ fn execute_pending_markdownize_tasks(
                 // standard rate. Reading the declaration raw made that true by
                 // accident and made the batch arm below wrong.
                 let markdownize_pricing =
-                    lane_adjusted_pricing("markdown", PreferredRequestKind::Sync);
+                    lane_adjusted_pricing(adapter_settings, "markdown", PreferredRequestKind::Sync);
                 let (billed, uncovered_pricing_kinds) = resolve_billing_from_reported_usage(
                     outcome.usage.as_ref(),
                     &declared_billable_kind_strings(&markdownize_profile),
@@ -17878,12 +18083,16 @@ fn record_online_send_failure(
     Ok(())
 }
 
-fn persistent_network_allowed(repo: &Repository) -> Result<bool> {
-    let profile = match active_local_ocr_execution() {
+fn persistent_network_allowed(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    repo: &Repository,
+) -> Result<bool> {
+    let profile = match active_local_ocr_execution(adapter_settings) {
         Some(execution) => kio_adapter::local_ocr_markdownize::profile_for(execution),
         None => online_markdownize_profile_for(repo)?,
     };
     persistent_network_allowed_for(
+        adapter_settings,
         repo,
         approvals::AdapterRole::Markdown,
         &profile.adapter_id,
@@ -17892,12 +18101,14 @@ fn persistent_network_allowed(repo: &Repository) -> Result<bool> {
 }
 
 fn persistent_network_allowed_for(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     role: approvals::AdapterRole,
     tool_id: &str,
     profile: &str,
 ) -> Result<bool> {
     approvals::allowed(
+        adapter_settings,
         repo,
         role,
         tool_id,
@@ -17907,6 +18118,7 @@ fn persistent_network_allowed_for(
 }
 
 fn local_markdownize_transport_allowed(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     profile: &AdapterProfile,
     needs_secret: bool,
@@ -17915,6 +18127,7 @@ fn local_markdownize_transport_allowed(
         .revalidate()
         .map_err(pipeline_to_kio)?;
     if !persistent_network_allowed_for(
+        adapter_settings,
         repo,
         approvals::AdapterRole::Markdown,
         &profile.adapter_id,
@@ -17924,6 +18137,7 @@ fn local_markdownize_transport_allowed(
     }
     Ok(!needs_secret
         || secrets_send_approved(
+            adapter_settings,
             repo,
             approvals::AdapterRole::Markdown,
             &profile.adapter_id,
@@ -17935,6 +18149,7 @@ fn local_markdownize_transport_allowed(
 /// transport. The caller chooses whether it is before a paid reservation
 /// (online) or directly at an unmetered local HTTP call.
 fn admit_embedding_transport(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     execution: EmbeddingExecution,
     profile: &DeclaredEmbeddingProfile,
@@ -17946,6 +18161,7 @@ fn admit_embedding_transport(
     }
     current_policy.revalidate().map_err(pipeline_to_kio)?;
     if !persistent_network_allowed_for(
+        adapter_settings,
         repo,
         approvals::AdapterRole::Embedding,
         &profile.tool_id,
@@ -17958,7 +18174,7 @@ fn admit_embedding_transport(
             ExitCode::AuthError,
         ));
     }
-    if needs_secret && !embedding_secrets_allowed(repo, profile)? {
+    if needs_secret && !embedding_secrets_allowed(adapter_settings, repo, profile)? {
         return Err(KioError::new(
             "KIO-E-ADAPTER-APPROVAL-REQUIRED-001",
             "embedding secret-send approval is no longer current",
@@ -17970,10 +18186,12 @@ fn admit_embedding_transport(
 }
 
 fn embedding_secrets_allowed(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     profile: &DeclaredEmbeddingProfile,
 ) -> Result<bool> {
     approvals::allowed(
+        adapter_settings,
         repo,
         approvals::AdapterRole::Embedding,
         &profile.tool_id,
@@ -17983,12 +18201,14 @@ fn embedding_secrets_allowed(
 }
 
 fn persistent_network_allowed_for_kio_dir(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     kio_dir: &Path,
     role: approvals::AdapterRole,
     tool_id: &str,
     profile: &str,
 ) -> Result<bool> {
     approvals::allowed_at(
+        adapter_settings,
         kio_dir,
         role,
         tool_id,
@@ -18000,6 +18220,7 @@ fn persistent_network_allowed_for_kio_dir(
 /// Query text is supplied by this invocation. One currently authorized eligible
 /// scope may admit its single embedding request; --online does not create a grant.
 fn embedding_opt_in_for_scopes(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     exec_scopes: &[ExecScope],
     tool_id: &str,
     tool_profile_hash: &str,
@@ -18010,6 +18231,7 @@ fn embedding_opt_in_for_scopes(
     }
     for exec in exec_scopes {
         if persistent_network_allowed_for_kio_dir(
+            adapter_settings,
             &exec.target.kio_dir,
             approvals::AdapterRole::Embedding,
             tool_id,
@@ -18022,12 +18244,13 @@ fn embedding_opt_in_for_scopes(
 }
 
 fn embedding_online_allowed(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     offline: bool,
     _online: bool,
     _online_confirmed: bool,
 ) -> Result<bool> {
-    let Some(execution) = embedding_execution() else {
+    let Some(execution) = embedding_execution(adapter_settings) else {
         return Ok(false);
     };
     if embedding_is_deterministic(execution) {
@@ -18038,6 +18261,7 @@ fn embedding_online_allowed(
     }
     let profile = declared_embedding_profile(execution);
     persistent_network_allowed_for(
+        adapter_settings,
         repo,
         approvals::AdapterRole::Embedding,
         &profile.tool_id,
@@ -18049,8 +18273,10 @@ fn embedding_online_allowed(
 /// `tool_profile_hash` (needed for the `approvals[]` profile match). `None`
 /// when no embedding execution is active, mirroring
 /// `active_embedding_adapter_id`.
-fn active_embedding_adapter_identity() -> Result<Option<(String, String)>> {
-    let Some(execution) = embedding_execution() else {
+fn active_embedding_adapter_identity(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+) -> Result<Option<(String, String)>> {
+    let Some(execution) = embedding_execution(adapter_settings) else {
         return Ok(None);
     };
     let profile = declared_embedding_profile(execution);
@@ -18325,6 +18551,7 @@ fn classify_online_markdownize_precondition(
 /// checked for: there is no reservation to release either, so the failure path
 /// cannot strand one the way the online lane's can.
 fn execute_pending_offline_markdownize_tasks(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     store: &TaskStore,
     normalize_by_path: &mut BTreeMap<String, PendingNormalizeRef>,
@@ -18336,7 +18563,7 @@ fn execute_pending_offline_markdownize_tasks(
     if !network_allowed {
         return Ok(0);
     }
-    let Some(execution) = active_local_ocr_execution() else {
+    let Some(execution) = active_local_ocr_execution(adapter_settings) else {
         return Ok(0);
     };
     let profile = kio_adapter::local_ocr_markdownize::profile_for(execution);
@@ -18365,6 +18592,7 @@ fn execute_pending_offline_markdownize_tasks(
         // before constructing its HTTP client. Other OCR or embedding grants
         // cannot authorize a local OCR secret send.
         if !local_markdownize_transport_allowed(
+            adapter_settings,
             repo,
             &profile,
             classify_secret(&task.input_path).is_some(),
@@ -18372,7 +18600,13 @@ fn execute_pending_offline_markdownize_tasks(
             continue;
         }
         let task_id = task.task_id.clone();
-        match execute_offline_markdownize_task(repo, &task, prepared_input, execution) {
+        match execute_offline_markdownize_task(
+            adapter_settings,
+            repo,
+            &task,
+            prepared_input,
+            execution,
+        ) {
             Ok(outcome) => {
                 // `persist_normalized_instance` has just committed the immutable
                 // normalized-unit CAS objects.  Bind this pass's tree entry to the
@@ -18471,6 +18705,7 @@ fn retire_offline_markdownize_task(store: &TaskStore, task_id: &str, reason: &st
 /// only remaining effect would be extra ways to be wrong about page
 /// correspondence.
 fn execute_offline_markdownize_task(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     task: &TaskDescriptor,
     prepared_input: PreparedOnlineMarkdownizeInput,
@@ -18490,8 +18725,14 @@ fn execute_offline_markdownize_task(
             retry_kind: RetryErrorKind::InvalidInput,
             retry_after_ms: None,
         })?;
-    let adapter = local_ocr_markdownize_adapter(execution, &scope_id, repo.kio_dir(), &bytes)
-        .map_err(task_failure_from_adapter)?;
+    let adapter = local_ocr_markdownize_adapter(
+        adapter_settings,
+        execution,
+        &scope_id,
+        repo.kio_dir(),
+        &bytes,
+    )
+    .map_err(task_failure_from_adapter)?;
     let hints = prepared_unit_hints(&prepared_units);
     let response = adapter
         .markdownize(MarkdownizeRequest {
@@ -18534,6 +18775,7 @@ fn execute_offline_markdownize_task(
 }
 
 fn execute_online_markdownize_task(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     task: &TaskDescriptor,
     prepared_input: PreparedOnlineMarkdownizeInput,
@@ -18626,6 +18868,7 @@ fn execute_online_markdownize_task(
         && !prepared_units.is_empty()
         && !is_office_media(&media_type)
         && let Some(outcome) = try_online_incremental_markdownize(
+            adapter_settings,
             repo,
             task,
             &prepared_units,
@@ -18647,6 +18890,7 @@ fn execute_online_markdownize_task(
         None => prepared_units.clone(),
     };
     let outcome = run_standard_online_markdownize_with_bytes(
+        std::sync::Arc::clone(adapter_settings),
         StandardOnlineMarkdownizeRequest {
             scope_id: &scope_id,
             kio_dir: repo.kio_dir(),
@@ -18852,6 +19096,7 @@ fn materialize_online_markdownize_response(
 /// is the cost fix (a light revision no longer re-sends/re-bills every page).
 #[allow(clippy::too_many_arguments)]
 fn try_online_incremental_markdownize(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     task: &TaskDescriptor,
     prepared_units: &[PreparedUnit],
@@ -18889,6 +19134,7 @@ fn try_online_incremental_markdownize(
     // uploaded), wasting a send + bill and then re-sending Full. `capability_flags` are
     // pin-independent, so the mode decision is unchanged.
     let resolved_profile = resolve_standard_online_markdownize_profile_with_bbox(
+        std::sync::Arc::clone(adapter_settings),
         scope_id,
         task.bbox_annotation_enabled.unwrap_or(false),
     )
@@ -18966,6 +19212,7 @@ fn try_online_incremental_markdownize(
             tool_profile_hash: previous.manifest.tool_profile_hash.clone(),
         };
         let outcome = run_standard_online_markdownize_with_bytes(
+            std::sync::Arc::clone(adapter_settings),
             StandardOnlineMarkdownizeRequest {
                 scope_id,
                 kio_dir: repo.kio_dir(),
@@ -19190,8 +19437,10 @@ const EMBEDDING_ADAPTER_KIND: &str = "embedding";
 /// that row. This only bounds how much work one plan/reserve cycle takes on.
 const EMBEDDING_BATCH_SIZE: usize = 32;
 
-fn embedding_execution() -> Option<EmbeddingExecution> {
-    active_embedding_execution()
+fn embedding_execution(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+) -> Option<EmbeddingExecution> {
+    active_embedding_execution(adapter_settings)
 }
 
 fn declared_embedding_profile(execution: EmbeddingExecution) -> DeclaredEmbeddingProfile {
@@ -19230,6 +19479,7 @@ fn embedding_transport_allowed(execution: EmbeddingExecution, offline: bool) -> 
 /// Run the active embedding adapter over a batch of items, returning one vector
 /// per item.
 fn run_embedding_adapter(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     execution: EmbeddingExecution,
     items: Vec<EmbeddingItem>,
     input_type: EmbeddingInputType,
@@ -19238,8 +19488,14 @@ fn run_embedding_adapter(
     // `kio_adapter::types::EmbeddingRequest::idempotency_token`'s doc.
     idempotency_token: Option<String>,
 ) -> std::result::Result<kio_adapter::catalog::AdoptedEmbeddingOutcome, TaskExecutionFailure> {
-    run_embedding(execution, items, input_type, idempotency_token)
-        .map_err(task_failure_from_adapter)
+    run_embedding(
+        std::sync::Arc::clone(adapter_settings),
+        execution,
+        items,
+        input_type,
+        idempotency_token,
+    )
+    .map_err(task_failure_from_adapter)
 }
 
 /// The `fallback_reason`s [`compute_query_embedding_page1`] can report through
@@ -19294,6 +19550,7 @@ enum QueryEmbeddingOutcome {
 /// handles. This function selects one authorized scope, holds its writer lease,
 /// and performs the final exact device+scope grant check before the adapter call.
 fn compute_query_embedding_page1(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     query: &str,
     exec_scopes: &[ExecScope],
     search_repositories: &BTreeMap<String, Repository>,
@@ -19304,12 +19561,12 @@ fn compute_query_embedding_page1(
     if query.chars().count() < 2 {
         return Ok(None);
     }
-    let Some(execution) = embedding_execution() else {
+    let Some(execution) = embedding_execution(adapter_settings) else {
         return Ok(None);
     };
     if embedding_is_deterministic(execution) {
         revalidate_current_policy_map(current_policies, false)?;
-        return local_query_embedding(execution, query);
+        return local_query_embedding(adapter_settings, execution, query);
     }
     if !embedding_transport_allowed(execution, offline) {
         return Ok(None);
@@ -19338,6 +19595,7 @@ fn compute_query_embedding_page1(
     let mut authorizing_repo = None;
     for (_, repo) in candidates {
         if persistent_network_allowed_for(
+            adapter_settings,
             repo,
             approvals::AdapterRole::Embedding,
             tool_id,
@@ -19354,6 +19612,7 @@ fn compute_query_embedding_page1(
     let _authorizing_scope_lock = authorizing_repo.lock_store()?;
     revalidate_current_policy_map(current_policies, false)?;
     if !persistent_network_allowed_for(
+        adapter_settings,
         authorizing_repo,
         approvals::AdapterRole::Embedding,
         tool_id,
@@ -19363,7 +19622,7 @@ fn compute_query_embedding_page1(
     }
 
     if !embedding_is_online(execution) {
-        return local_query_embedding(execution, query);
+        return local_query_embedding(adapter_settings, execution, query);
     }
 
     let ledger = open_ledger_db()?;
@@ -19410,7 +19669,7 @@ fn compute_query_embedding_page1(
         conn,
         &key,
         now,
-        estimate_embedding_cost(query, query_embedding_send_lane()),
+        estimate_embedding_cost(adapter_settings, query, query_embedding_send_lane()),
         TASK_SYNC_EFFECTIVE_TIMEOUT_SECONDS,
         device_cap_config.device_cap,
         device_cap_config.device_per_adapter_cap,
@@ -19441,6 +19700,7 @@ fn compute_query_embedding_page1(
     // are now 1 token to 1 HTTP call — `send_embed_group` reaches it by
     // sending one group per call rather than by being inherently single.
     match run_embedding_adapter(
+        adapter_settings,
         execution,
         items,
         EmbeddingInputType::Query,
@@ -19455,9 +19715,10 @@ fn compute_query_embedding_page1(
             // settles on the measured number. The reservation estimate remains
             // the fallback for a response that carried no usable report.
             let billed = embedding_billed_from_usage(
+                adapter_settings,
                 outcome.usage.as_ref(),
                 query_embedding_send_lane(),
-                estimate_embedding_cost(query, query_embedding_send_lane()),
+                estimate_embedding_cost(adapter_settings, query, query_embedding_send_lane()),
             );
             settle_task_charge_success(&ledger, &key, &intent_token, billed)?;
             Ok(outcome
@@ -19467,7 +19728,8 @@ fn compute_query_embedding_page1(
                 .map(|vector| QueryEmbeddingOutcome::Vector(vector.vector)))
         }
         Err(failure) => {
-            let billed_usd = estimate_embedding_cost(query, query_embedding_send_lane());
+            let billed_usd =
+                estimate_embedding_cost(adapter_settings, query, query_embedding_send_lane());
             settle_task_charge_unknown(&ledger, &key, &intent_token, billed_usd)?;
             // PC7: classify a contract-violation adapter failure distinctly
             // from a generic technical unavailability.
@@ -19490,6 +19752,7 @@ fn compute_query_embedding_page1(
 /// local server, and 05 §1.1 keeps `embedding_contract_violation` subject to
 /// `fail_behavior` regardless of where the vector came from.
 fn local_query_embedding(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     execution: EmbeddingExecution,
     query: &str,
 ) -> Result<Option<QueryEmbeddingOutcome>> {
@@ -19499,7 +19762,13 @@ fn local_query_embedding(
     let items = vec![EmbeddingItem::text("query", query)];
     // No `idempotency_token`: that identifies a ledger reservation, and this
     // path makes none.
-    match run_embedding_adapter(execution, items, EmbeddingInputType::Query, None) {
+    match run_embedding_adapter(
+        adapter_settings,
+        execution,
+        items,
+        EmbeddingInputType::Query,
+        None,
+    ) {
         Ok(outcome) => Ok(outcome
             .vectors
             .into_iter()
@@ -19537,8 +19806,10 @@ fn record_query_embed_trace(query: &str) {
 
 /// The tool-lock `embedding` entry (07 §6) for the active seam, or `None` when no
 /// embedding adapter is configured.
-fn embedding_tool_lock_entry() -> Result<Option<Value>> {
-    let Some(execution) = embedding_execution() else {
+fn embedding_tool_lock_entry(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+) -> Result<Option<Value>> {
+    let Some(execution) = embedding_execution(adapter_settings) else {
         return Ok(None);
     };
     let profile = declared_embedding_profile(execution);
@@ -19546,7 +19817,7 @@ fn embedding_tool_lock_entry() -> Result<Option<Value>> {
     // having run online. They are properties of the adapter, so they come from
     // its profile — the lock is provenance, and provenance that always says
     // "online" is not provenance (07 §6).
-    let execution_mode = embedding_adapter_profile(execution)
+    let execution_mode = embedding_adapter_profile(adapter_settings, execution)
         .map_err(adapter_to_kio)?
         .execution_mode;
     let (kind, mode) = embedding_execution_labels(execution_mode);
@@ -19673,6 +19944,7 @@ fn selected_embedding_contexts(
 /// Pending (surfaced by `index_status`). No-op when no embedding adapter is
 /// configured (keeps the default index path unchanged).
 fn generate_scope_embeddings(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     args: &IndexArgs,
@@ -19680,10 +19952,11 @@ fn generate_scope_embeddings(
     // Embedding online opt-in is the embedding adapter's own (L4), not a
     // ride-along on the markdownize approval. `--offline` forces enqueue-only;
     // N7: `--online` now reaches the embedding adapter too (was ignored).
-    let online = embedding_online_allowed(repo, args.offline, args.online, args.yes)?;
+    let online =
+        embedding_online_allowed(adapter_settings, repo, args.offline, args.online, args.yes)?;
     // R11-2: return the enrichment outcome (was discarded) so `run_index` can disclose
     // it and raise the exit code on auth/budget-pause.
-    run_embedding_enrichment(ctx, repo, online, false, false)
+    run_embedding_enrichment(adapter_settings, ctx, repo, online, false, false)
 }
 
 /// Core enrichment pass shared by `kio index` (inline) and `kio batch
@@ -19691,6 +19964,7 @@ fn generate_scope_embeddings(
 /// rate limit could never complete (`batch resume` only executed Markdownize
 /// tasks). Returns the chunks embedded (executed) and failed this pass (R9-7).
 fn run_embedding_enrichment(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     online: bool,
@@ -19698,7 +19972,10 @@ fn run_embedding_enrichment(
     allow_auth_revive: bool,
 ) -> Result<ExecOutcome> {
     run_embedding_enrichment_for_instances(
-        ctx,
+        Invocation {
+            settings: adapter_settings,
+            context: ctx,
+        },
         repo,
         online,
         override_budget,
@@ -19712,6 +19989,7 @@ fn run_embedding_enrichment(
 /// particular it must not reconcile/retire task rows belonging to non-selected
 /// history merely because they are absent from this deliberately narrow set.
 fn run_historical_embedding_enrichment(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     online: bool,
@@ -19719,7 +19997,10 @@ fn run_historical_embedding_enrichment(
     selected_tree_config_hash: &str,
 ) -> Result<ExecOutcome> {
     run_embedding_enrichment_for_instances(
-        ctx,
+        Invocation {
+            settings: adapter_settings,
+            context: ctx,
+        },
         repo,
         online,
         false,
@@ -19730,7 +20011,7 @@ fn run_historical_embedding_enrichment(
 }
 
 fn run_embedding_enrichment_for_instances(
-    ctx: &AppContext,
+    invocation: Invocation<'_>,
     repo: &Repository,
     online: bool,
     override_budget: bool,
@@ -19738,8 +20019,11 @@ fn run_embedding_enrichment_for_instances(
     selected_instances: Option<&[RetainedNormalizedInstance]>,
     selected_tree_config_hash: Option<&str>,
 ) -> Result<ExecOutcome> {
+    let ctx = invocation.context;
+    let adapter_settings = invocation.settings;
+
     let reconcile_scope_tasks = selected_instances.is_none();
-    let Some(execution) = embedding_execution() else {
+    let Some(execution) = embedding_execution(adapter_settings) else {
         return Ok(ExecOutcome::default());
     };
     let profile = declared_embedding_profile(execution);
@@ -19832,7 +20116,7 @@ fn run_embedding_enrichment_for_instances(
         .collect::<BTreeMap<_, _>>();
     let task_store = TaskStore::new(repo.kio_dir());
     validate_embedding_task_bindings(&task_store, &retained_chunks)?;
-    let secrets_approved = embedding_secrets_allowed(repo, &profile)?;
+    let secrets_approved = embedding_secrets_allowed(adapter_settings, repo, &profile)?;
     let mut pending = retained_chunks_without_embedding(&conn, retained_chunks.clone(), &profile)?;
     let existing_tasks = task_store.all().map_err(pipeline_to_kio)?;
     // Fresh bookkeeping must never revive, complete, or restamp an existing
@@ -19943,7 +20227,10 @@ fn run_embedding_enrichment_for_instances(
         &projection_held,
     )?;
     run_image_embedding_enrichment(
-        ctx,
+        Invocation {
+            settings: adapter_settings,
+            context: ctx,
+        },
         &embedding_context,
         &conn,
         retained_instances,
@@ -20045,6 +20332,7 @@ fn run_embedding_enrichment_for_instances(
     {
         let mut batch_transitions: BTreeMap<String, EmbeddingTransition> = BTreeMap::new();
         if let Some(submitted) = submit_embedding_batch_jobs(
+            adapter_settings,
             ctx,
             repo,
             execution,
@@ -20192,6 +20480,7 @@ fn run_embedding_enrichment_for_instances(
             // undercounts by the context prefix — and `usage: None` means the
             // shortfall is never corrected at settle time (QA17).
             let candidate_usd = estimate_embedding_cost(
+                adapter_settings,
                 &embedding_store::contextualized_embedding_input(
                     embedding_store::chunk_embedding_context(&group.representative.raw_path)
                         .as_deref(),
@@ -20269,6 +20558,7 @@ fn run_embedding_enrichment_for_instances(
                     KioError::schema("embedding owner policy changed before reservation")
                 })?;
                 admit_embedding_transport(
+                    adapter_settings,
                     repo,
                     execution,
                     &profile,
@@ -20315,6 +20605,7 @@ fn run_embedding_enrichment_for_instances(
             // one group, so each send carries its OWN reservation's token
             // rather than a representative standing in for the batch.
             match send_embed_group(
+                adapter_settings,
                 &conn,
                 &embedding_context,
                 group,
@@ -20332,6 +20623,7 @@ fn run_embedding_enrichment_for_instances(
                             &charge.key,
                             intent_token,
                             embedding_billed_from_usage(
+                                adapter_settings,
                                 usage.as_ref(),
                                 active_embedding_send_lane(),
                                 reserved_usd,
@@ -20907,6 +21199,7 @@ fn link_reused_chunks(
 /// default (2026-07-25 ruling), so the round trips it costs are never on a
 /// default path.
 fn send_embed_group(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     conn: &Connection,
     embedding: &EmbeddingExecutionContext<'_>,
     group: &EmbeddingSendGroup<'_>,
@@ -20938,6 +21231,7 @@ fn send_embed_group(
     // local HTTP has no reservation, so admission must be at this call edge.
     if !embedding_is_online(embedding.execution) {
         admit_embedding_transport(
+            adapter_settings,
             embedding.repo,
             embedding.execution,
             embedding.profile,
@@ -20953,6 +21247,7 @@ fn send_embed_group(
         })?;
     }
     let outcome = run_embedding_adapter(
+        adapter_settings,
         embedding.execution,
         items,
         EmbeddingInputType::MarkdownChunk,
@@ -21277,6 +21572,7 @@ fn normalize_embedding_vector(
 /// uses. Member tasks stay Pending, so `index_status` keeps reporting them.
 #[allow(clippy::too_many_arguments)]
 fn submit_embedding_batch_jobs(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     execution: EmbeddingExecution,
@@ -21328,10 +21624,11 @@ fn submit_embedding_batch_jobs(
     }
     // The lazy context is loaded only for a configured real client. Invalid
     // recovery authority is a hard hold, never permission to switch lanes.
-    let Some(client) = kio_adapter::gemini_batch_client::resolve_gemini_batch_client(|| {
-        batch_recovery_context(ledger)
-    })
-    .map_err(adapter_to_kio)?
+    let Some(client) =
+        kio_adapter::gemini_batch_client::resolve_gemini_batch_client(adapter_settings, || {
+            batch_recovery_context(ledger)
+        })
+        .map_err(adapter_to_kio)?
     else {
         // The lane is unavailable (no batch client resolvable). Report that to
         // the caller so it can fall back to the synchronous lane, exactly as
@@ -21455,12 +21752,15 @@ fn submit_embedding_batch_jobs(
         // the job's total, which is also what the provider will bill.
         let candidate_usd: f64 = inputs
             .iter()
-            .map(|input| estimate_embedding_cost(&input.text, PreferredRequestKind::Batch))
+            .map(|input| {
+                estimate_embedding_cost(adapter_settings, &input.text, PreferredRequestKind::Batch)
+            })
             .sum();
         // Final check before this new job's reservation/admission. Existing
         // submitted jobs are polled elsewhere and deliberately do not pass
         // through this new-submission boundary.
         admit_embedding_transport(
+            adapter_settings,
             repo,
             execution,
             profile,
@@ -21560,19 +21860,20 @@ fn submit_embedding_batch_jobs(
 /// recovery walk (`kio ledger reconcile`), not here — `batch_poll_candidates`
 /// only returns rows with a durable `batch_job_id`.
 fn poll_batch_embedding_jobs(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
     ledger: &LedgerDb,
 ) -> Result<ExecOutcome> {
     let mut outcome = ExecOutcome::default();
-    let Some(execution) = embedding_execution() else {
+    let Some(execution) = embedding_execution(adapter_settings) else {
         return Ok(outcome);
     };
     // 07 §5.5: the lane is a property of the adapter. An `offline_api` adapter
     // prefers Sync because a local server has no provider job queue to submit
     // to, and the half-price rationale that puts Gemini on Batch does not
     // exist for it. There can be no in-flight rows to poll.
-    if embedding_preferred_request_kind(execution).map_err(adapter_to_kio)?
+    if embedding_preferred_request_kind(adapter_settings, execution).map_err(adapter_to_kio)?
         != PreferredRequestKind::Batch
     {
         return Ok(outcome);
@@ -21580,10 +21881,11 @@ fn poll_batch_embedding_jobs(
     let profile = declared_embedding_profile(execution);
     // The lazy context is loaded only for a configured real client. Invalid
     // recovery authority is a hard hold, never permission to switch lanes.
-    let Some(client) = kio_adapter::gemini_batch_client::resolve_gemini_batch_client(|| {
-        batch_recovery_context(ledger)
-    })
-    .map_err(adapter_to_kio)?
+    let Some(client) =
+        kio_adapter::gemini_batch_client::resolve_gemini_batch_client(adapter_settings, || {
+            batch_recovery_context(ledger)
+        })
+        .map_err(adapter_to_kio)?
     else {
         return Ok(outcome);
     };
@@ -21624,7 +21926,7 @@ fn poll_batch_embedding_jobs(
     let mut held = BTreeSet::new();
     if secret_embedding_hold_required(
         execution.execution_mode(),
-        embedding_secrets_allowed(repo, &profile)?,
+        embedding_secrets_allowed(adapter_settings, repo, &profile)?,
         true,
     ) {
         held.extend(held_secret_embedding_chunk_ids(repo.kio_dir())?);
@@ -21820,6 +22122,7 @@ fn poll_batch_embedding_jobs(
             BatchState::Completed,
             None,
             embedding_billed_from_usage(
+                adapter_settings,
                 reported.as_ref(),
                 PreferredRequestKind::Batch,
                 row.estimated_usd,
@@ -22137,7 +22440,7 @@ const BATCH_RATE_MULTIPLIER: f64 = 0.5;
 ///
 /// This is the single point where a declared price becomes a charge, and it
 /// exists because there was no such point: both settlement sites read
-/// `registered_declared_pricing` RAW. That was accidentally right for
+/// the declared pricing RAW. That was accidentally right for
 /// markdownize — its declaration happened to hold the batch rate — which made
 /// a `--realtime` OCR run settle at half what the provider bills. An
 /// under-record is the direction a budget cap cannot protect against, since
@@ -22147,10 +22450,12 @@ const BATCH_RATE_MULTIPLIER: f64 = 0.5;
 /// rule (07 §5.3) instead of opposite conventions that have to be remembered
 /// per role.
 fn lane_adjusted_pricing(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     role: &str,
     lane: PreferredRequestKind,
 ) -> std::collections::BTreeMap<String, f64> {
-    kio_adapter::tool_lock::registered_declared_pricing(role)
+    adapter_settings
+        .declared_pricing(role)
         .into_iter()
         .map(|(kind, standard)| (kind, lane_rate(standard, lane)))
         .collect()
@@ -22266,8 +22571,12 @@ fn query_embedding_send_lane() -> PreferredRequestKind {
 /// provider actually bills. Settlement now prices measured tokens (I4/I12) —
 /// through this same function — so a wrong lane here corrupts BOTH sides at
 /// once rather than only the reservation.
-fn embedding_usd_per_token(lane: PreferredRequestKind) -> f64 {
-    let standard = kio_adapter::tool_lock::registered_declared_pricing("embedding")
+fn embedding_usd_per_token(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    lane: PreferredRequestKind,
+) -> f64 {
+    let standard = adapter_settings
+        .declared_pricing("embedding")
         .get("tokens_in")
         .copied()
         .unwrap_or(EMBEDDING_SYNC_USD_PER_TOKEN);
@@ -22329,8 +22638,12 @@ fn is_cjk_scalar(ch: char) -> bool {
 /// estimator against 33 real jobs and found -32%..+52% error with 24% of jobs
 /// UNDER-estimated, and the budget cap gates on the reservation, not on the
 /// settlement.
-fn estimate_embedding_cost(text: &str, lane: PreferredRequestKind) -> f64 {
-    estimate_embedding_tokens(text) * embedding_usd_per_token(lane)
+fn estimate_embedding_cost(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    text: &str,
+    lane: PreferredRequestKind,
+) -> f64 {
+    estimate_embedding_tokens(text) * embedding_usd_per_token(adapter_settings, lane)
 }
 
 /// Price one embedding send from the usage the adapter reported, degrading to
@@ -22344,6 +22657,7 @@ fn estimate_embedding_cost(text: &str, lane: PreferredRequestKind) -> f64 {
 /// system objected. A new send site now has to pick a lane and a fallback, not
 /// invent a pricing rule.
 fn embedding_billed_from_usage(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     reported: Option<&kio_adapter::types::AdapterUsage>,
     lane: PreferredRequestKind,
     fallback_estimated_usd: f64,
@@ -22360,7 +22674,7 @@ fn embedding_billed_from_usage(
         // its settlement drift apart.
         &std::collections::BTreeMap::from([(
             "tokens_in".to_owned(),
-            embedding_usd_per_token(lane),
+            embedding_usd_per_token(adapter_settings, lane),
         )]),
         fallback_estimated_usd,
     );
@@ -22412,7 +22726,7 @@ fn retained_chunks_without_embedding(
 /// still an authenticated HTTP peer. Its caller passes execution admission:
 /// exact device+scope approval for HTTP adapters, or the in-process evaluator.
 fn run_image_embedding_enrichment(
-    ctx: &AppContext,
+    invocation: Invocation<'_>,
     embedding: &EmbeddingExecutionContext<'_>,
     conn: &Connection,
     retained_instances: &[RetainedNormalizedInstance],
@@ -22420,6 +22734,9 @@ fn run_image_embedding_enrichment(
     secrets_approved: bool,
     execution_allowed: bool,
 ) -> Result<usize> {
+    let ctx = invocation.context;
+    let adapter_settings = invocation.settings;
+
     if !execution_allowed {
         return Ok(0);
     }
@@ -22429,7 +22746,8 @@ fn run_image_embedding_enrichment(
     if embedding_is_online(embedding.execution) {
         return Ok(0);
     }
-    let adapter_profile = embedding_adapter_profile(embedding.execution).map_err(adapter_to_kio)?;
+    let adapter_profile =
+        embedding_adapter_profile(adapter_settings, embedding.execution).map_err(adapter_to_kio)?;
     if !adapter_profile
         .capability_flags
         .iter()
@@ -22500,6 +22818,7 @@ fn run_image_embedding_enrichment(
             // conservative: it requires this embedding tool's paired grant
             // even if a public alias names the same immutable image object.
             admit_embedding_transport(
+                adapter_settings,
                 embedding.repo,
                 embedding.execution,
                 embedding.profile,
@@ -22507,6 +22826,7 @@ fn run_image_embedding_enrichment(
                 image_authority.requires_secret_approval(image_hash),
             )?;
             let Ok(outcome) = run_embedding_adapter(
+                adapter_settings,
                 embedding.execution,
                 vec![EmbeddingItem {
                     id: image_hash.clone(),
@@ -23719,6 +24039,7 @@ struct IndexPipelineResult {
 /// Reuse only a HEAD-pinned local OCR instance whose profile is exactly the
 /// local OCR profile selected by current configuration for this media type.
 fn reusable_current_ocr_normalize(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     head: &BTreeMap<String, (String, NormalizeRef)>,
     path: &str,
@@ -23731,8 +24052,8 @@ fn reusable_current_ocr_normalize(
     if head_raw != raw_hash {
         return Ok(None);
     }
-    let Some(execution) =
-        active_local_ocr_execution().filter(|_| local_ocr_handles_media_type(media_type))
+    let Some(execution) = active_local_ocr_execution(adapter_settings)
+        .filter(|_| local_ocr_handles_media_type(media_type))
     else {
         return Ok(None);
     };
@@ -24039,6 +24360,7 @@ fn test_markdown_unit(hint: &PreparedUnitHint, prefix: &str) -> MarkdownUnit {
 }
 
 fn run_index_pipeline(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     preview: &ScanPreview,
     args: &IndexArgs,
@@ -24056,7 +24378,7 @@ fn run_index_pipeline(
     let markdown_adapter = active_markdown_adapter(repo);
     let markdown_profile = markdown_adapter.profile();
     let markdown_profile_hash = markdown_profile.tool_profile_hash.clone();
-    let network_allowed = network_allowed(repo, args)?;
+    let network_allowed = network_allowed(adapter_settings, repo, args)?;
     let ledger = if args.offline {
         None
     } else {
@@ -24298,6 +24620,7 @@ fn run_index_pipeline(
         )?;
 
         if let Some(normalize) = reusable_current_ocr_normalize(
+            adapter_settings,
             repo,
             &head_ocr_normalizes,
             &candidate.input_path,
@@ -24367,6 +24690,7 @@ fn run_index_pipeline(
             // OCR remains an optional later enrichment and has its own online
             // task/output identity, so it cannot replace this image object.
             enqueue_online_placeholder_task(
+                adapter_settings,
                 repo,
                 &task_store,
                 candidate,
@@ -24416,6 +24740,7 @@ fn run_index_pipeline(
                     )?;
                 }
                 enqueue_online_placeholder_task(
+                    adapter_settings,
                     repo,
                     &task_store,
                     candidate,
@@ -24564,6 +24889,7 @@ fn run_index_pipeline(
             // and, when offline, left a permanent phantom pending that deflated enriched_ratio.
             if candidate.media_type == "application/pdf" || is_office_media(&candidate.media_type) {
                 enqueue_online_placeholder_task(
+                    adapter_settings,
                     repo,
                     &task_store,
                     candidate,
@@ -24848,6 +25174,7 @@ fn run_index_pipeline(
         // phantom pending.
         if candidate.media_type == "application/pdf" || is_office_media(&candidate.media_type) {
             enqueue_online_placeholder_task(
+                adapter_settings,
                 repo,
                 &task_store,
                 candidate,
@@ -24871,6 +25198,7 @@ fn run_index_pipeline(
     // created first and drained second, so a crash mid-OCR leaves a Pending task
     // that the next authorized index invocation can pick up.
     let executed = execute_pending_offline_markdownize_tasks(
+        adapter_settings,
         repo,
         &task_store,
         &mut result.normalize_by_path,
@@ -26352,15 +26680,21 @@ const BATCH_SUBMITTED_REASON: &str = "batch_submitted";
 /// exactly when the hermetic mock seam (`KIO_TEST_MISTRAL_BATCH`) is present
 /// — the test path — or (once the adapter-side env client lands) when the
 /// Batch-declaring Mistral profile is configured for production.
-fn batch_markdownize_lane_client(ledger: &LedgerDb) -> Result<Option<Box<dyn MistralBatchClient>>> {
-    configured_mistral_batch_client(|| batch_recovery_context(ledger)).map_err(adapter_to_kio)
+fn batch_markdownize_lane_client(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    ledger: &LedgerDb,
+) -> Result<Option<Box<dyn MistralBatchClient>>> {
+    configured_mistral_batch_client(adapter_settings, || batch_recovery_context(ledger))
+        .map_err(adapter_to_kio)
 }
 
 /// Check only the locally declared sync credential. This never constructs an
 /// HTTP client or contacts the provider. Test adapters keep their established
 /// failure semantics because their mock execution can model a post-admission
 /// auth failure rather than an absent production credential.
-fn sync_markdownize_credential_available() -> Result<bool> {
+fn sync_markdownize_credential_available(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+) -> Result<bool> {
     #[cfg(debug_assertions)]
     if markdownize_test_credential_available(
         debug_test_control()
@@ -26369,7 +26703,8 @@ fn sync_markdownize_credential_available() -> Result<bool> {
     ) {
         return Ok(true);
     }
-    Ok(kio_adapter::tool_lock::resolve_role_api_key("markdown")
+    Ok(adapter_settings
+        .resolve_role_api_key("markdown")
         .map_err(adapter_to_kio)?
         .is_some_and(|credential| !credential.trim().is_empty()))
 }
@@ -26430,8 +26765,9 @@ fn markdownize_send_lane(
 
 /// The model string a batch job is created with (`create_job`'s second
 /// argument — the model rides the JOB, not the input line, 07 §5.5).
-fn batch_job_model() -> String {
-    let declared = kio_adapter::tool_lock::registered_declared_adapter("markdown")
+fn batch_job_model(adapter_settings: &Arc<AdapterRuntimeSettings>) -> String {
+    let declared = adapter_settings
+        .declared_adapter("markdown")
         .and_then(|declared| declared.model)
         .unwrap_or_else(|| "mistral-ocr-latest".to_owned());
     if !declared.ends_with("-latest") {
@@ -26489,6 +26825,7 @@ fn batch_poll_retry_at() -> String {
 /// adapter-boundary failure to feed the shared send-failure mapping.
 #[allow(clippy::too_many_arguments)]
 fn submit_batch_markdownize_job(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     client: &dyn MistralBatchClient,
     ledger: &LedgerDb,
     key: &LedgerTaskKey,
@@ -26606,7 +26943,7 @@ fn submit_batch_markdownize_job(
     if !phase2b_record_job_create_started(conn, key, intent_token).map_err(pipeline_to_kio)? {
         return Ok(Ok(()));
     }
-    let job = match client.create_job(&upload_id, &batch_job_model(), &metadata) {
+    let job = match client.create_job(&upload_id, &batch_job_model(adapter_settings), &metadata) {
         Ok(value) => value,
         Err(error) => return Ok(Err(task_failure_from_adapter(error))),
     };
@@ -26714,12 +27051,13 @@ enum BatchPollDisposition {
 /// stay owned by the §5.8 recovery walk (`kio ledger reconcile`) — no overlap
 /// by construction.
 fn poll_batch_markdownize_jobs(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     store: &TaskStore,
     ledger: &LedgerDb,
 ) -> Result<ExecOutcome> {
     let mut counts = ExecOutcome::default();
-    let Some(client) = batch_markdownize_lane_client(ledger)? else {
+    let Some(client) = batch_markdownize_lane_client(adapter_settings, ledger)? else {
         return Ok(counts);
     };
     let scope_id = repo.scope_identity()?.scope_id;
@@ -26730,6 +27068,7 @@ fn poll_batch_markdownize_jobs(
         let tasks = store.all().map_err(pipeline_to_kio)?;
         for row in rows {
             let disposition = poll_one_batch_markdownize_row(
+                adapter_settings,
                 repo,
                 store,
                 ledger,
@@ -26805,6 +27144,7 @@ fn poll_attributed_markdownize_batch_job(
 
 #[allow(clippy::too_many_arguments)]
 fn poll_one_batch_markdownize_row(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     store: &TaskStore,
     ledger: &LedgerDb,
@@ -26885,6 +27225,7 @@ fn poll_one_batch_markdownize_row(
         .into_iter()
         .find(|line| line.custom_id == row.key.input_hash);
     collect_batch_markdownize_output(
+        adapter_settings,
         repo,
         store,
         ledger,
@@ -27026,6 +27367,7 @@ fn extend_batch_poll_schedule(store: &TaskStore, task_id: &str) -> Result<()> {
 /// deletion, then the task transition.
 #[allow(clippy::too_many_arguments)]
 fn collect_batch_markdownize_output(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     store: &TaskStore,
     ledger: &LedgerDb,
@@ -27175,6 +27517,7 @@ fn collect_batch_markdownize_output(
     // mock env). If resolution fails (e.g. no credentials in a passive
     // write-command entry poll), defer — never guess an identity.
     let resolved_profile = match resolve_standard_online_markdownize_profile_with_bbox(
+        std::sync::Arc::clone(adapter_settings),
         &row.key.scope_id,
         task.bbox_annotation_enabled.unwrap_or(false),
     ) {
@@ -27305,7 +27648,8 @@ fn collect_batch_markdownize_output(
     // degrading to the reservation estimate — but at the BATCH rate. This
     // collector only ever runs for a batch job, and it used to read the
     // declaration raw, i.e. at the sync rate.
-    let markdownize_pricing = lane_adjusted_pricing("markdown", PreferredRequestKind::Batch);
+    let markdownize_pricing =
+        lane_adjusted_pricing(adapter_settings, "markdown", PreferredRequestKind::Batch);
     let (billed, uncovered_pricing_kinds) = resolve_billing_from_reported_usage(
         usage.as_ref(),
         &declared_billable_kind_strings(online_profile),
@@ -27471,6 +27815,7 @@ enum EnqueueBudget {
 
 #[allow(clippy::too_many_arguments)]
 fn enqueue_online_placeholder_task(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     task_store: &TaskStore,
     candidate: &ScanCandidate,
@@ -27537,12 +27882,13 @@ fn enqueue_online_placeholder_task(
     // Stage 3: a declared `offline_api` pipeline owns this enrichment instead
     // of the cloud OCR. Resolved once, here, so the task's `output_ref` and the
     // status decision below cannot disagree about which route it is on.
-    let local_ocr = active_local_ocr_execution()
+    let local_ocr = active_local_ocr_execution(adapter_settings)
         .filter(|_| local_ocr_handles_media_type(&candidate.media_type));
     let (output_ref, secrets_approved) = match local_ocr {
         Some(execution) => {
             let profile = kio_adapter::local_ocr_markdownize::profile_for(execution);
             let approved = secrets_send_approved(
+                adapter_settings,
                 repo,
                 approvals::AdapterRole::Markdown,
                 &profile.adapter_id,
@@ -27553,6 +27899,7 @@ fn enqueue_online_placeholder_task(
         None => (
             online_output_ref(&online_profile.adapter_id),
             secrets_send_approved(
+                adapter_settings,
                 repo,
                 approvals::AdapterRole::Markdown,
                 &online_profile.adapter_id,
@@ -27698,7 +28045,8 @@ fn enqueue_online_placeholder_task(
     // Report the honest state (`network_opt_in_required`) rather than a false
     // `ready_for_online_adapter`. (Inline `--yes` sending, to match embedding, is
     // deferred with the F6 promotion wiring.)
-    let markdownize_drivable = network_allowed && persistent_network_allowed(repo)?;
+    let markdownize_drivable =
+        network_allowed && persistent_network_allowed(adapter_settings, repo)?;
     // N1a: a Tier B (candidate-secret) file without `--send-secrets` is held here
     // — a Paused task with `secrets_tier_b_hold`, visible in `kio status`, that
     // `batch resume` will not un-hold and `execute_pending_markdownize_tasks` will
@@ -27805,7 +28153,10 @@ fn budget_remaining_from_totals(
     (device_remaining, folder_remaining)
 }
 
-fn materialize_tool_lock(repo: &Repository) -> Result<()> {
+fn materialize_tool_lock(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    repo: &Repository,
+) -> Result<()> {
     let prepare_profile = builtin_prepare_profile();
     let markdown_profile = active_markdown_adapter(repo).profile();
     let mut value = json!({
@@ -27826,7 +28177,7 @@ fn materialize_tool_lock(repo: &Repository) -> Result<()> {
     // A non-multimodal profile is rejected here (03 §7): `load_tool_lock` fails
     // with KIO-E-EMBED-MODALITY-001, which we surface as exit 2 (scenario (e))
     // *before* any indexing happens.
-    if let Some(entry) = embedding_tool_lock_entry()?
+    if let Some(entry) = embedding_tool_lock_entry(adapter_settings)?
         && let Some(object) = value.as_object_mut()
     {
         object.insert("embedding".to_owned(), entry);
@@ -27848,25 +28199,33 @@ fn execution_mode_name(mode: ExecutionMode) -> &'static str {
     }
 }
 
-fn network_allowed(repo: &Repository, args: &IndexArgs) -> Result<bool> {
+fn network_allowed(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    repo: &Repository,
+    args: &IndexArgs,
+) -> Result<bool> {
     if args.offline {
         return Ok(false);
     }
-    persistent_network_allowed(repo)
+    persistent_network_allowed(adapter_settings, repo)
 }
 
 /// Current paired device and scope permission for this exact secret recipient.
 fn secrets_send_approved(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     role: approvals::AdapterRole,
     tool_id: &str,
     profile: &str,
 ) -> bool {
-    approvals::secrets_allowed(repo, role, tool_id, profile).unwrap_or(false)
+    approvals::secrets_allowed(adapter_settings, repo, role, tool_id, profile).unwrap_or(false)
 }
 
-fn active_markdownize_profile_for(repo: &Repository) -> Result<AdapterProfile> {
-    match active_local_ocr_execution() {
+fn active_markdownize_profile_for(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    repo: &Repository,
+) -> Result<AdapterProfile> {
+    match active_local_ocr_execution(adapter_settings) {
         Some(execution) => Ok(kio_adapter::local_ocr_markdownize::profile_for(execution)),
         None => online_markdownize_profile_for(repo),
     }
@@ -27938,7 +28297,11 @@ fn prune_terminal_embedding_secret_holds(repo: &Repository) -> Result<usize> {
 /// (candidate-secret) file awaiting `--send-secrets` (N1a).
 const SECRETS_TIER_B_HOLD: &str = "secrets_tier_b_hold";
 
-fn record_quarantine_candidates(repo: &Repository, preview: &ScanPreview) -> Result<()> {
+fn record_quarantine_candidates(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    repo: &Repository,
+    preview: &ScanPreview,
+) -> Result<()> {
     let path = repo.kio_dir().join("quarantine.jsonl");
     // R19-7: dedup on (path, approval_method), not path alone — otherwise a
     // `hold` record permanently blocks the later `send_approved` transition
@@ -27963,13 +28326,14 @@ fn record_quarantine_candidates(repo: &Repository, preview: &ScanPreview) -> Res
         .open(&path)
         .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
     for candidate in &preview.candidates {
-        let profile = match active_local_ocr_execution()
+        let profile = match active_local_ocr_execution(adapter_settings)
             .filter(|_| local_ocr_handles_media_type(&candidate.media_type))
         {
             Some(execution) => kio_adapter::local_ocr_markdownize::profile_for(execution),
             None => online_markdownize_profile_for(repo)?,
         };
         let secrets_approved = secrets_send_approved(
+            adapter_settings,
             repo,
             approvals::AdapterRole::Markdown,
             &profile.adapter_id,
@@ -31506,10 +31870,13 @@ mod tests {
 
     #[test]
     fn embedding_rate_is_lane_aware_and_batch_is_half_of_sync() {
+        let adapter_settings =
+            &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+
         // Published `gemini-embedding-2` text rates (07 §5.3 の 2026-07-24 訂正):
         // $0.20 / 1M sync, $0.10 / 1M batch.
-        let sync = embedding_usd_per_token(PreferredRequestKind::Sync);
-        let batch = embedding_usd_per_token(PreferredRequestKind::Batch);
+        let sync = embedding_usd_per_token(adapter_settings, PreferredRequestKind::Sync);
+        let batch = embedding_usd_per_token(adapter_settings, PreferredRequestKind::Batch);
         assert!((sync - 0.000_000_2).abs() < 1e-15, "sync rate: {sync}");
         assert!((batch - 0.000_000_1).abs() < 1e-15, "batch rate: {batch}");
         assert!((sync - batch * 2.0).abs() < 1e-15);
@@ -31563,12 +31930,16 @@ mod tests {
 
     #[test]
     fn embedding_cost_multiplies_the_token_estimate_by_the_lane_rate() {
+        let adapter_settings =
+            &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+
         // 1M Latin chars ≈ 250k tokens → $0.05 at the sync rate.
         let text = "a".repeat(1_000_000);
-        let usd = estimate_embedding_cost(&text, PreferredRequestKind::Sync);
+        let usd = estimate_embedding_cost(adapter_settings, &text, PreferredRequestKind::Sync);
         assert!((usd - 0.05).abs() < 1e-9, "usd: {usd}");
         // The same text on the Batch lane costs exactly half.
-        let batch_usd = estimate_embedding_cost(&text, PreferredRequestKind::Batch);
+        let batch_usd =
+            estimate_embedding_cost(adapter_settings, &text, PreferredRequestKind::Batch);
         assert!((usd - batch_usd * 2.0).abs() < 1e-12);
     }
 
@@ -32670,6 +33041,9 @@ mod tests {
 
     #[test]
     fn embedding_admission_rechecks_policy_and_exact_network_grant() {
+        let adapter_settings =
+            &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+
         use super::{
             ExplicitRoot, admit_embedding_transport, current_embedding_policy,
             initialize_explicit_root,
@@ -32705,6 +33079,7 @@ mod tests {
         };
         let policy = current_embedding_policy(&repo).unwrap();
         let missing_grant = admit_embedding_transport(
+            adapter_settings,
             &repo,
             EmbeddingExecution::Online(AdoptedEmbeddingExecution::Mock),
             &profile,
@@ -32721,6 +33096,7 @@ mod tests {
         // revalidation precedes the grant check at the actual transport edge.
         std::fs::write(root.path().join(".kioignore"), "later-denied.md\n").unwrap();
         let stale = admit_embedding_transport(
+            adapter_settings,
             &repo,
             EmbeddingExecution::Online(AdoptedEmbeddingExecution::Mock),
             &profile,

@@ -4,6 +4,8 @@
 //! strictly after a task reached `Done`: it re-opens the typed normalized-instance
 //! reference and verifies that the manifest and every unit form one complete,
 //! immutable identity before the CLI is allowed to bind that identity into HEAD.
+use kio_adapter::tool_lock::AdapterRuntimeSettings;
+use std::sync::Arc;
 
 use crate::context::AppContext;
 
@@ -303,6 +305,7 @@ struct OnlinePromotionPlan {
 /// rechecks current scope policy, working bytes, HEAD membership, and the adapter's
 /// currently resolved immutable profile.
 fn plan_online_markdownize_promotion(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
 ) -> kio_core::Result<Option<OnlinePromotionPlan>> {
     let task_store = TaskStore::new(repo.kio_dir());
@@ -384,9 +387,13 @@ fn plan_online_markdownize_promotion(
     let resolved_profiles = policies_to_resolve
         .into_iter()
         .filter_map(|bbox_enabled| {
-            resolve_standard_online_markdownize_profile_with_bbox(&adapter_scope_id, bbox_enabled)
-                .ok()
-                .map(|profile| (bbox_enabled, profile))
+            resolve_standard_online_markdownize_profile_with_bbox(
+                std::sync::Arc::clone(adapter_settings),
+                &adapter_scope_id,
+                bbox_enabled,
+            )
+            .ok()
+            .map(|profile| (bbox_enabled, profile))
         })
         .collect::<BTreeMap<_, _>>();
 
@@ -510,10 +517,11 @@ fn materialize_promoted_markdown_tool_lock(
 /// snapshot. This prevents the deterministic baseline pass from demoting a
 /// previously promoted file and avoids an extra promotion commit.
 pub(super) fn apply_online_promotion_to_index(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     result: &mut IndexPipelineResult,
 ) -> kio_core::Result<()> {
-    let Some(plan) = plan_online_markdownize_promotion(repo)? else {
+    let Some(plan) = plan_online_markdownize_promotion(adapter_settings, repo)? else {
         return Ok(());
     };
     materialize_promoted_markdown_tool_lock(repo, &plan.active_profile_hash)?;
@@ -525,10 +533,11 @@ pub(super) fn apply_online_promotion_to_index(
 /// by a batch pass. The repository primitive changes only matching HEAD bindings;
 /// unrelated deferred working-tree edits are never captured.
 pub(super) fn promote_completed_online_markdownize(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
 ) -> kio_core::Result<bool> {
-    let Some(plan) = plan_online_markdownize_promotion(repo)? else {
+    let Some(plan) = plan_online_markdownize_promotion(adapter_settings, repo)? else {
         return Ok(false);
     };
     let previous_head = repo
@@ -629,10 +638,11 @@ pub(super) fn recover_pending_online_promotion(repo: &Repository) -> kio_core::R
 }
 
 pub(super) fn finish_pending_online_promotion(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
     ctx: &AppContext,
     repo: &Repository,
 ) -> kio_core::Result<()> {
-    rebuild_step3_index(ctx, repo)?;
+    rebuild_step3_index(adapter_settings, ctx, repo)?;
     maybe_inject_promotion_fault("after_index_swap")?;
     clear_promotion_state(repo.kio_dir())
 }

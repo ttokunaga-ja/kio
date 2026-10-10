@@ -21,8 +21,10 @@
 //! progression persists in an explicit `state_path` file, so a submit run
 //! and a later collect run see a coherent QUEUED → … → SUCCESS sequence.
 
+use crate::tool_lock::AdapterRuntimeSettings;
 #[cfg(debug_assertions)]
 use std::io::Write;
+use std::sync::Arc;
 
 #[cfg(debug_assertions)]
 use serde::Deserialize;
@@ -214,8 +216,11 @@ pub struct EnvMistralBatchClient {
 }
 
 impl EnvMistralBatchClient {
-    pub fn new(context: &BatchRecoveryContext) -> Result<Self> {
-        let credential = crate::tool_lock::resolve_role_api_key("markdown")?.ok_or_else(|| {
+    pub fn new(
+        settings: Arc<AdapterRuntimeSettings>,
+        context: &BatchRecoveryContext,
+    ) -> Result<Self> {
+        let credential = settings.resolve_role_api_key("markdown")?.ok_or_else(|| {
             AdapterError::Auth("declared mistral batch credential is unavailable".into())
         })?;
         Self::from_captured(context, "https://api.mistral.ai", credential)
@@ -234,18 +239,14 @@ impl EnvMistralBatchClient {
     }
 
     #[cfg(test)]
-    fn with_base_url(base_url: impl Into<String>) -> Self {
-        crate::tool_lock::with_test_role_auth("markdown", || {
-            let credential = crate::tool_lock::resolve_role_api_key("markdown")
-                .unwrap()
-                .unwrap();
-            Self::from_captured(
-                &BatchRecoveryContext::from_key([7; 32]),
-                &base_url.into(),
-                credential,
-            )
-            .unwrap()
-        })
+    fn with_base_url(settings: Arc<AdapterRuntimeSettings>, base_url: impl Into<String>) -> Self {
+        let credential = settings.resolve_role_api_key("markdown").unwrap().unwrap();
+        Self::from_captured(
+            &BatchRecoveryContext::from_key([7; 32]),
+            &base_url.into(),
+            credential,
+        )
+        .unwrap()
     }
 
     fn base_url(&self) -> &str {
@@ -943,6 +944,7 @@ impl MistralBatchClient for MockBatchClient {
 /// A declared credential with an invalid runtime target stays a loud error here,
 /// exactly as it is on the sync path.
 pub fn configured_mistral_batch_client(
+    settings: &AdapterRuntimeSettings,
     recovery_context: impl FnOnce() -> Result<BatchRecoveryContext>,
 ) -> Result<Option<Box<dyn MistralBatchClient>>> {
     #[cfg(debug_assertions)]
@@ -954,7 +956,7 @@ pub fn configured_mistral_batch_client(
             return Ok(Some(Box::new(MockBatchClient::from_env_value(&raw)?)));
         }
     }
-    if let Some(credential) = crate::tool_lock::resolve_role_api_key("markdown")? {
+    if let Some(credential) = settings.resolve_role_api_key("markdown")? {
         let context = recovery_context()?;
         return Ok(Some(Box::new(EnvMistralBatchClient::from_captured(
             &context,
@@ -995,13 +997,13 @@ mod tests {
         let old = crate::batch_recovery::with_test_env_credential(
             "markdown",
             "KIO_TEST_CAPTURED_BATCH_KEY",
-            || {
-                let old = EnvMistralBatchClient::new(&context).unwrap();
+            |settings| {
+                let old = EnvMistralBatchClient::new(Arc::new(settings.clone()), &context).unwrap();
                 let _rotated = kio_core::test_control::TestEnvGuard::set(
                     "KIO_TEST_CAPTURED_BATCH_KEY",
                     "credential-after",
                 );
-                let new = EnvMistralBatchClient::new(&context).unwrap();
+                let new = EnvMistralBatchClient::new(Arc::new(settings.clone()), &context).unwrap();
                 assert_ne!(
                     old.provider_scope_id().unwrap(),
                     new.provider_scope_id().unwrap()
@@ -1153,7 +1155,7 @@ mod tests {
     /// Execute one real-HTTP fixture under an explicit, synthetic markdown
     /// credential. Runtime settings are per-invocation; tests must never
     /// consult ambient credentials from the developer's environment.
-    fn with_test_mistral_auth<T>(operation: impl FnOnce() -> T) -> T {
+    fn with_test_mistral_auth<T>(operation: impl FnOnce(&AdapterRuntimeSettings) -> T) -> T {
         crate::tool_lock::with_test_role_auth("markdown", operation)
     }
 
@@ -1240,15 +1242,17 @@ mod tests {
             &[],
             r#"{"id":"file-verified-1","object":"file","purpose":"batch"}"#,
         )]);
-        let client = EnvMistralBatchClient::with_base_url(&base);
+        let client = with_test_mistral_auth(|settings| {
+            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+        });
         let jsonl = batch_input_line(
             "task-1",
             &serde_json::json!({"document": {"type": "document_url"}}),
         );
         let filename = batch_upload_filename("01HTESTTOKEN");
-        let uploaded =
-            with_test_mistral_auth(|| client.upload_batch_input(jsonl.as_bytes(), &filename))
-                .unwrap();
+        let uploaded = client
+            .upload_batch_input(jsonl.as_bytes(), &filename)
+            .unwrap();
         assert_eq!(uploaded, "file-verified-1");
 
         let requests = server.join().unwrap();
@@ -1297,7 +1301,9 @@ mod tests {
     fn env_upload_rejects_a_header_breaking_filename_before_any_send() {
         // No server, no env: validation fails before credential resolution
         // or any request is attempted.
-        let client = EnvMistralBatchClient::with_base_url("https://127.0.0.1:9");
+        let client = with_test_mistral_auth(|settings| {
+            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), "https://127.0.0.1:9")
+        });
         let error = client
             .upload_batch_input(b"{}", "kio-\"evil\r\n.jsonl")
             .unwrap_err();
@@ -1316,7 +1322,9 @@ mod tests {
             &[],
             r#"{"id":"batch-verified-1","object":"batch","status":"QUEUED","output_file":null,"metadata":{"intent_token":"echoed-by-provider"}}"#,
         )]);
-        let client = EnvMistralBatchClient::with_base_url(&base);
+        let client = with_test_mistral_auth(|settings| {
+            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+        });
         let sent_metadata = serde_json::json!({
             "intent_token": "01HINTENT",
             "scope_id": "01HSCOPE",
@@ -1324,10 +1332,9 @@ mod tests {
             "input_hash": "sha256:aaaa",
             "tool_profile_hash": "sha256:bbbb",
         });
-        let record = with_test_mistral_auth(|| {
-            client.create_job("file-verified-1", "mistral-ocr-2505", &sent_metadata)
-        })
-        .unwrap();
+        let record = client
+            .create_job("file-verified-1", "mistral-ocr-2505", &sent_metadata)
+            .unwrap();
 
         assert_eq!(record.job_id, "batch-verified-1");
         assert_eq!(record.status, BatchJobStatus::Queued);
@@ -1376,9 +1383,11 @@ mod tests {
             &[],
             r#"{"detail":"file already deleted"}"#,
         )]);
-        let client = EnvMistralBatchClient::with_base_url(&base);
+        let client = with_test_mistral_auth(|settings| {
+            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+        });
         // 07 §5.5: already-gone reports as success.
-        with_test_mistral_auth(|| client.delete_upload("file-gone")).unwrap();
+        client.delete_upload("file-gone").unwrap();
         let requests = server.join().unwrap();
         assert!(
             requests[0]
@@ -1414,8 +1423,10 @@ mod tests {
             http_response("200 OK", &[], &page0.to_string()),
             http_response("200 OK", &[], &page1.to_string()),
         ]);
-        let client = EnvMistralBatchClient::with_base_url(&base);
-        let jobs = with_test_mistral_auth(|| client.list_jobs()).unwrap();
+        let client = with_test_mistral_auth(|settings| {
+            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+        });
+        let jobs = client.list_jobs().unwrap();
 
         assert_eq!(jobs.len(), 3);
         assert_eq!(jobs[0].job_id, "batch-1");
@@ -1454,8 +1465,10 @@ mod tests {
         });
         let (base, server, _trust) =
             spawn_scripted_server(vec![http_response("200 OK", &[], &page0.to_string())]);
-        let client = EnvMistralBatchClient::with_base_url(&base);
-        let uploads = with_test_mistral_auth(|| client.list_uploads()).unwrap();
+        let client = with_test_mistral_auth(|settings| {
+            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+        });
+        let uploads = client.list_uploads().unwrap();
 
         assert_eq!(uploads.len(), 2);
         assert_eq!(uploads[0].upload_id, "file-a");
@@ -1498,8 +1511,10 @@ mod tests {
             })
             .collect();
         let (base, server, _trust) = spawn_scripted_server(responses);
-        let client = EnvMistralBatchClient::with_base_url(&base);
-        let error = with_test_mistral_auth(|| client.list_jobs()).unwrap_err();
+        let client = with_test_mistral_auth(|settings| {
+            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+        });
+        let error = client.list_jobs().unwrap_err();
 
         assert!(matches!(error, AdapterError::ContractViolation(_)));
         let requests = server.join().unwrap();
@@ -1528,8 +1543,10 @@ mod tests {
         );
         let (base, server, _trust) =
             spawn_scripted_server(vec![http_response("200 OK", &[], payload)]);
-        let client = EnvMistralBatchClient::with_base_url(&base);
-        let lines = with_test_mistral_auth(|| client.fetch_output("file-out-1")).unwrap();
+        let client = with_test_mistral_auth(|settings| {
+            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+        });
+        let lines = client.fetch_output("file-out-1").unwrap();
 
         assert_eq!(lines.len(), 2, "blank lines are skipped, not errors");
         assert_eq!(lines[0].custom_id, "task-a");
@@ -1559,8 +1576,10 @@ mod tests {
             &[("Retry-After", "7")],
             r#"{"detail":"slow down"}"#,
         )]);
-        let client = EnvMistralBatchClient::with_base_url(&base);
-        let error = with_test_mistral_auth(|| client.get_job("batch-1")).unwrap_err();
+        let client = with_test_mistral_auth(|settings| {
+            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+        });
+        let error = client.get_job("batch-1").unwrap_err();
         server.join().unwrap();
 
         match error {
@@ -1579,7 +1598,10 @@ mod tests {
         let _qualifier =
             kio_core::test_control::TestEnvGuard::set(MISTRAL_WORKSPACE_ID_ENV, "workspace");
         let context = BatchRecoveryContext::from_key([7; 32]);
-        let client = with_test_mistral_auth(|| EnvMistralBatchClient::new(&context)).unwrap();
+        let client = with_test_mistral_auth(|settings| {
+            EnvMistralBatchClient::new(Arc::new(settings.clone()), &context)
+        })
+        .unwrap();
         let original = client.provider_scope_id().unwrap();
         // The private tools fixture has now been removed; this instance must
         // retain its verified credential instead of reopening a changed source.
@@ -1607,8 +1629,10 @@ mod tests {
         unsafe { std::env::remove_var(TEST_MISTRAL_BATCH_ENV) };
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(MISTRAL_WORKSPACE_ID_ENV) };
-        let real = with_test_mistral_auth(|| {
-            configured_mistral_batch_client(|| Ok(BatchRecoveryContext::from_key([7; 32])))
+        let real = with_test_mistral_auth(|settings| {
+            configured_mistral_batch_client(settings, || {
+                Ok(BatchRecoveryContext::from_key([7; 32]))
+            })
         })
         .unwrap()
         .expect("the declared credential also configures the batch lane");
@@ -1618,7 +1642,7 @@ mod tests {
 
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::set_var(TEST_MISTRAL_BATCH_ENV, r#"{"provider_scope_id":"mock-ws"}"#) };
-        let mock = configured_mistral_batch_client(|| {
+        let mock = configured_mistral_batch_client(&AdapterRuntimeSettings::default(), || {
             panic!("mock resolution must not load a private key")
         })
         .unwrap()
