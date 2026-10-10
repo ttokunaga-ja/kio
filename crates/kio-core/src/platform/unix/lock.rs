@@ -688,14 +688,14 @@ pub(crate) struct PathLock {
     path: PathBuf,
     pid: u32,
     token: String,
-    pub(crate) _gate: crate::scope::LockGate,
+    pub(crate) _gate: crate::scope::locks::LockGate,
 }
 pub(crate) fn acquire_path_lock(
     path: PathBuf,
     pid: u32,
     _store_gate: bool,
     _validate_authority: fn(&File) -> Result<()>,
-    acquire_gate: crate::scope::AcquireLockGate,
+    acquire_gate: crate::scope::locks::AcquireLockGate,
 ) -> Result<PathLock> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).kio_io(parent)?;

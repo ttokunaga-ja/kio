@@ -109,9 +109,10 @@ pub(crate) fn idle_lock(kio: &File) -> Result<Option<IdleLock>> {
 mod tests {
     use super::*;
     use crate::ExitCode;
+    use crate::scope::locks::acquire_retained_lock_kind;
     use crate::scope::{
         Repository, StoreLock, acquire_bound_store_lock, acquire_bound_store_read_guard,
-        acquire_retained_lock_kind, canonical_lock_bytes,
+        canonical_lock_bytes,
     };
     use std::fs;
 

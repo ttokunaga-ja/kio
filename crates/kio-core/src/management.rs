@@ -266,7 +266,7 @@ pub fn initialize_root(
 /// No read/search path calls this probe. The unique lower-case leaf is created
 /// with CreateOnly and is removed only through byte-verified quarantine.
 pub fn detect_case_insensitive(binding: &ManagementBinding) -> Result<bool> {
-    let _lock = crate::scope::acquire_retained_store_lock(&binding.kio)?;
+    let _lock = crate::scope::locks::acquire_retained_store_lock(&binding.kio)?;
     let root = StoreDirectory::from_retained(
         binding.root.try_clone().map_err(io)?,
         binding.canonical_root.clone(),
@@ -499,7 +499,7 @@ fn initialization_pending(
 
 pub fn begin_registration(binding: &ManagementBinding, operation_id: &str) -> Result<()> {
     validate_operation_id(operation_id)?;
-    let _lock = crate::scope::acquire_retained_store_lock(&binding.kio)?;
+    let _lock = crate::scope::locks::acquire_retained_store_lock(&binding.kio)?;
     binding.recheck()?;
     let marker = registration_marker_bytes(operation_id)?;
     match binding
@@ -525,7 +525,7 @@ pub fn publish_registration_record(
     after: &ManagementRecord,
 ) -> Result<()> {
     validate_operation_id(operation_id)?;
-    let _lock = crate::scope::acquire_retained_store_lock(&binding.kio)?;
+    let _lock = crate::scope::locks::acquire_retained_store_lock(&binding.kio)?;
     if peek_registration_marker(binding)?.as_deref() != Some(operation_id) {
         return Err(registration_pending_err());
     }
@@ -547,7 +547,7 @@ pub fn finish_registration(
     expected_after: &ManagementRecord,
 ) -> Result<()> {
     validate_operation_id(operation_id)?;
-    let _lock = crate::scope::acquire_retained_store_lock(&binding.kio)?;
+    let _lock = crate::scope::locks::acquire_retained_store_lock(&binding.kio)?;
     if peek_registration_marker(binding)?.as_deref() != Some(operation_id) {
         return Err(registration_pending_err());
     }
@@ -643,7 +643,7 @@ pub fn enroll_child(
     token: impl Into<String>,
     expected_directory_identity: &DirectoryIdentity,
 ) -> Result<()> {
-    let _lock = crate::scope::acquire_retained_store_lock(&parent.kio)?;
+    let _lock = crate::scope::locks::acquire_retained_store_lock(&parent.kio)?;
     validate_live_chain(parent)?;
     validate_basename(basename)?;
     let (scope_id, token) = (scope_id.into(), token.into());
@@ -683,7 +683,7 @@ pub fn compare_and_remove_child_enrollment(
     basename: &str,
     expected: &ChildEnrollment,
 ) -> Result<bool> {
-    let _lock = crate::scope::acquire_retained_store_lock(&parent.kio)?;
+    let _lock = crate::scope::locks::acquire_retained_store_lock(&parent.kio)?;
     validate_live_chain(parent)?;
     validate_basename(basename)?;
     validate_id(&expected.scope_id, "child scope_id")?;
@@ -702,7 +702,7 @@ pub fn compare_and_remove_child_enrollment(
     }
 }
 pub fn revoke_child(parent: &ManagementBinding, basename: &str) -> Result<bool> {
-    let _lock = crate::scope::acquire_retained_store_lock(&parent.kio)?;
+    let _lock = crate::scope::locks::acquire_retained_store_lock(&parent.kio)?;
     validate_live_chain(parent)?;
     validate_basename(basename)?;
     let mut r = read_record(parent)?;
@@ -718,7 +718,7 @@ pub fn initialize_child(
     scope_id: impl Into<String>,
     token: impl Into<String>,
 ) -> Result<ManagementRecord> {
-    let _lock = crate::scope::acquire_retained_store_lock(&parent.kio)?;
+    let _lock = crate::scope::locks::acquire_retained_store_lock(&parent.kio)?;
     validate_live_chain(parent)?;
     child.recheck()?;
     let name = child_name(parent, child)?;
