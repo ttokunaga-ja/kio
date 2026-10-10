@@ -29,11 +29,6 @@ struct ValidatedSource {
     digest: String,
 }
 
-#[cfg(test)]
-thread_local! {
-    static TEST_DIRECTORY: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TrustStatus {
@@ -87,25 +82,21 @@ impl RuntimeTrust {
     }
 }
 
-fn directory_path() -> PathBuf {
-    #[cfg(test)]
-    if let Some(path) = TEST_DIRECTORY.with(|slot| slot.borrow().clone()) {
-        return path;
-    }
+pub(crate) fn directory_path() -> PathBuf {
     super::data_home().join("kio/local-trust")
 }
 
 /// Read status without creating a directory, lock, repair, or snapshot.
 #[cfg(test)]
-pub(crate) fn status() -> Result<Option<TrustRecord>> {
-    read_record()
+pub(crate) fn status(trust_directory: &Path) -> Result<Option<TrustRecord>> {
+    read_record(trust_directory)
 }
 
 /// Acquire the active managed CA and retain the trust-store lock until the
 /// returned guard is dropped. This prevents a revoke or rotation from racing a
 /// command after its egress authority has been admitted.
-pub(crate) fn acquire_runtime_trust() -> Result<Option<RuntimeTrust>> {
-    let Some(state) = crate::private_state::open_existing(&directory_path(), LOCK_BYTES)? else {
+pub(crate) fn acquire_runtime_trust(trust_directory: &Path) -> Result<Option<RuntimeTrust>> {
+    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES)? else {
         return Ok(None);
     };
     let record = read_record_from(state.directory())?.ok_or_else(missing_record)?;
@@ -115,7 +106,7 @@ pub(crate) fn acquire_runtime_trust() -> Result<Option<RuntimeTrust>> {
     if record.status != TrustStatus::Active {
         return Ok(None);
     }
-    let path = directory_path().join(&record.snapshot);
+    let path = trust_directory.join(&record.snapshot);
     let digest = kio_adapter::local_peer::capture_private_local_trust(&path)
         .map_err(super::adapter_to_kio)?;
     if digest != record.digest {
@@ -138,18 +129,23 @@ pub(crate) fn acquire_runtime_trust() -> Result<Option<RuntimeTrust>> {
 /// Register a managed local CA. The first record starts at generation one;
 /// a durable revocation may be explicitly registered again only as a new,
 /// monotonic generation. An active record is never replaced by register.
-pub(crate) fn register(ca_pem: &Path, preview: bool, resume: Option<&str>) -> Result<TrustRecord> {
+pub(crate) fn register(
+    trust_directory: &Path,
+    ca_pem: &Path,
+    preview: bool,
+    resume: Option<&str>,
+) -> Result<TrustRecord> {
     let source = validated_source(ca_pem)?;
     if preview {
-        return preview_registration(&source, resume);
+        return preview_registration(trust_directory, &source, resume);
     }
-    if crate::private_state::open_readonly(&directory_path())?.is_none() {
+    if crate::private_state::open_readonly(trust_directory)?.is_none() {
         if resume.is_some() {
             return Err(absent());
         }
-        let record = register_record_for_digest(None, &source.digest, true)?;
+        let record = register_record_for_digest(trust_directory, None, &source.digest, true)?;
         let state =
-            crate::private_state::create_initialized(&directory_path(), LOCK_BYTES, |directory| {
+            crate::private_state::create_initialized(trust_directory, LOCK_BYTES, |directory| {
                 write_pending(directory, &record, None)
             })?;
         publish(
@@ -162,7 +158,7 @@ pub(crate) fn register(ca_pem: &Path, preview: bool, resume: Option<&str>) -> Re
         return Ok(record);
     }
     let state =
-        crate::private_state::open_existing(&directory_path(), LOCK_BYTES)?.ok_or_else(absent)?;
+        crate::private_state::open_existing(trust_directory, LOCK_BYTES)?.ok_or_else(absent)?;
     let current = read_record_from(state.directory())?;
     let pending = read_pending_from(state.directory())?;
     if let Some(resume) = resume {
@@ -171,7 +167,12 @@ pub(crate) fn register(ca_pem: &Path, preview: bool, resume: Option<&str>) -> Re
     if let Some(pending) = pending.as_ref() {
         return Err(pending_requires_resume(pending));
     }
-    let record = register_record_for_digest(current.as_ref().cloned(), &source.digest, false)?;
+    let record = register_record_for_digest(
+        trust_directory,
+        current.as_ref().cloned(),
+        &source.digest,
+        false,
+    )?;
     write_pending(state.directory(), &record, current.clone())?;
     let publication = if current.is_some() {
         Publication::Replace
@@ -183,12 +184,16 @@ pub(crate) fn register(ca_pem: &Path, preview: bool, resume: Option<&str>) -> Re
     Ok(record)
 }
 
-fn preview_registration(source: &ValidatedSource, resume: Option<&str>) -> Result<TrustRecord> {
-    let Some(directory) = crate::private_state::open_readonly(&directory_path())? else {
+fn preview_registration(
+    trust_directory: &Path,
+    source: &ValidatedSource,
+    resume: Option<&str>,
+) -> Result<TrustRecord> {
+    let Some(directory) = crate::private_state::open_readonly(trust_directory)? else {
         if resume.is_some() {
             return Err(absent());
         }
-        return register_record_for_digest(None, &source.digest, true);
+        return register_record_for_digest(trust_directory, None, &source.digest, true);
     };
     let current = read_record_from(&directory)?;
     let pending = read_pending_from(&directory)?;
@@ -198,7 +203,7 @@ fn preview_registration(source: &ValidatedSource, resume: Option<&str>) -> Resul
     if let Some(pending) = pending {
         return Err(pending_requires_resume(&pending));
     }
-    register_record_for_digest(current, &source.digest, false)
+    register_record_for_digest(trust_directory, current, &source.digest, false)
 }
 
 fn resume_registration(
@@ -256,21 +261,21 @@ fn resume_record(
 
 /// Rotate an active managed CA. A rotation assigns a new monotonic generation,
 /// so grants bound to the prior digest no longer match.
-pub(crate) fn rotate(ca_pem: &Path, preview: bool) -> Result<TrustRecord> {
+pub(crate) fn rotate(trust_directory: &Path, ca_pem: &Path, preview: bool) -> Result<TrustRecord> {
     let source = validated_source(ca_pem)?;
     if preview {
-        let current = active_record(read_record()?)?;
-        return rotated_record_for_digest(&current, &source.digest);
+        let current = active_record(read_record(trust_directory)?)?;
+        return rotated_record_for_digest(trust_directory, &current, &source.digest);
     }
 
-    let Some(state) = crate::private_state::open_existing(&directory_path(), LOCK_BYTES)? else {
+    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES)? else {
         return Err(absent());
     };
     if let Some(pending) = read_pending_from(state.directory())? {
         return Err(pending_requires_resume(&pending));
     }
     let current = active_record(read_record_from(state.directory())?)?;
-    let record = rotated_record_for_digest(&current, &source.digest)?;
+    let record = rotated_record_for_digest(trust_directory, &current, &source.digest)?;
     publish(
         state.directory(),
         &record,
@@ -282,12 +287,12 @@ pub(crate) fn rotate(ca_pem: &Path, preview: bool) -> Result<TrustRecord> {
 
 /// Persist a revocation tombstone. Repeating a completed revoke is idempotent;
 /// status and a missing record remain read-only.
-pub(crate) fn revoke(preview: bool) -> Result<Option<TrustRecord>> {
+pub(crate) fn revoke(trust_directory: &Path, preview: bool) -> Result<Option<TrustRecord>> {
     if preview {
-        let Some(initial) = read_record()? else {
+        let Some(initial) = read_record(trust_directory)? else {
             return Ok(None);
         };
-        let Some(directory) = crate::private_state::open_readonly(&directory_path())? else {
+        let Some(directory) = crate::private_state::open_readonly(trust_directory)? else {
             return Ok(None);
         };
         if let Some(pending) = read_pending_from(&directory)? {
@@ -302,7 +307,7 @@ pub(crate) fn revoke(preview: bool) -> Result<Option<TrustRecord>> {
             }
         }));
     }
-    let Some(state) = crate::private_state::open_existing(&directory_path(), LOCK_BYTES)? else {
+    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES)? else {
         return Ok(None);
     };
     if let Some(pending) = read_pending_from(state.directory())? {
@@ -326,19 +331,29 @@ fn register_record(
     bytes: &[u8],
     fresh_store: bool,
 ) -> Result<TrustRecord> {
-    register_record_for_digest(current, &hash_bytes(bytes), fresh_store)
+    register_record_for_digest(
+        Path::new("trust-record-fixture"),
+        current,
+        &hash_bytes(bytes),
+        fresh_store,
+    )
 }
 
 /// Construct a record from the adapter's canonical certificate identity.
 /// Runtime registration must use this form so its persisted binding matches
 /// `AuthenticatedLocalEndpoint` rather than the PEM serialization bytes.
 fn register_record_for_digest(
+    trust_directory: &Path,
     current: Option<TrustRecord>,
     digest: &str,
     fresh_store: bool,
 ) -> Result<TrustRecord> {
     match current {
-        None if fresh_store => Ok(record_for_digest(1, digest, new_registration_id())),
+        None if fresh_store => Ok(record_for_digest(
+            1,
+            digest,
+            new_registration_id(trust_directory),
+        )),
         None => Err(err(
             "KIO-E-LOCAL-TRUST-RECORD-MISSING-001",
             "managed local trust store has no active record; refusing to reinitialize it",
@@ -351,7 +366,11 @@ fn register_record_for_digest(
                     "local CA generation overflow",
                 )
             })?;
-            Ok(record_for_digest(generation, digest, new_registration_id()))
+            Ok(record_for_digest(
+                generation,
+                digest,
+                new_registration_id(trust_directory),
+            ))
         }
     }
 }
@@ -369,10 +388,18 @@ fn active_record(record: Option<TrustRecord>) -> Result<TrustRecord> {
 
 #[cfg(test)]
 fn rotated_record(current: &TrustRecord, bytes: &[u8]) -> Result<TrustRecord> {
-    rotated_record_for_digest(current, &hash_bytes(bytes))
+    rotated_record_for_digest(
+        Path::new("trust-record-fixture"),
+        current,
+        &hash_bytes(bytes),
+    )
 }
 
-fn rotated_record_for_digest(current: &TrustRecord, digest: &str) -> Result<TrustRecord> {
+fn rotated_record_for_digest(
+    trust_directory: &Path,
+    current: &TrustRecord,
+    digest: &str,
+) -> Result<TrustRecord> {
     if digest == current.digest {
         return Err(err(
             "KIO-E-LOCAL-TRUST-UNCHANGED-001",
@@ -385,7 +412,11 @@ fn rotated_record_for_digest(current: &TrustRecord, digest: &str) -> Result<Trus
             "local CA generation overflow",
         )
     })?;
-    Ok(record_for_digest(generation, digest, new_registration_id()))
+    Ok(record_for_digest(
+        generation,
+        digest,
+        new_registration_id(trust_directory),
+    ))
 }
 
 #[cfg(test)]
@@ -404,8 +435,8 @@ fn record_for_digest(generation: u64, digest: &str, registration_id: String) -> 
     }
 }
 
-fn new_registration_id() -> String {
-    kio_core::scope::new_ulid(&directory_path())
+fn new_registration_id(trust_directory: &Path) -> String {
+    kio_core::scope::new_ulid(trust_directory)
 }
 
 fn valid_registration_id(value: &str) -> bool {
@@ -488,8 +519,8 @@ fn clear_pending(directory: &StoreDirectory) -> Result<()> {
     Ok(())
 }
 
-fn read_record() -> Result<Option<TrustRecord>> {
-    let Some(directory) = crate::private_state::open_readonly(&directory_path())? else {
+fn read_record(trust_directory: &Path) -> Result<Option<TrustRecord>> {
+    let Some(directory) = crate::private_state::open_readonly(trust_directory)? else {
         return Ok(None);
     };
     read_record_from(&directory)?
@@ -638,13 +669,21 @@ fn err(code: &str, message: &str) -> KioError {
 /// Execute the scope-independent CLI lifecycle. Values intentionally expose
 /// only state, generation, and digest; certificate bytes and source paths are
 /// never rendered.
-pub(crate) fn run(command: crate::commands::TrustCommand) -> Result<serde_json::Value> {
+pub(crate) fn run(
+    trust_directory: &Path,
+    command: crate::commands::TrustCommand,
+) -> Result<serde_json::Value> {
     use crate::commands::TrustCommand;
 
     match command {
         TrustCommand::Register(args) => {
             validate_confirmation(args.preview, args.yes)?;
-            let record = register(&args.ca_pem, args.preview, args.resume.as_deref())?;
+            let record = register(
+                trust_directory,
+                &args.ca_pem,
+                args.preview,
+                args.resume.as_deref(),
+            )?;
             Ok(record_value(
                 if args.preview {
                     "preview"
@@ -656,14 +695,14 @@ pub(crate) fn run(command: crate::commands::TrustCommand) -> Result<serde_json::
         }
         TrustCommand::Rotate(args) => {
             validate_confirmation(args.preview, args.yes)?;
-            let record = rotate(&args.ca_pem, args.preview)?;
+            let record = rotate(trust_directory, &args.ca_pem, args.preview)?;
             Ok(record_value(
                 if args.preview { "preview" } else { "rotated" },
                 Some(record),
             ))
         }
-        TrustCommand::Revoke => Ok(record_value("revoked", revoke(false)?)),
-        TrustCommand::Status => status_value(),
+        TrustCommand::Revoke => Ok(record_value("revoked", revoke(trust_directory, false)?)),
+        TrustCommand::Status => status_value(trust_directory),
     }
 }
 
@@ -676,8 +715,8 @@ fn validate_confirmation(preview: bool, yes: bool) -> Result<()> {
     Ok(())
 }
 
-fn status_value() -> Result<serde_json::Value> {
-    let Some(directory) = crate::private_state::open_readonly(&directory_path())? else {
+fn status_value(trust_directory: &Path) -> Result<serde_json::Value> {
+    let Some(directory) = crate::private_state::open_readonly(trust_directory)? else {
         return Ok(record_value("status", None));
     };
     let record = read_record_from(&directory)?;
@@ -703,21 +742,6 @@ fn record_value(operation: &str, record: Option<TrustRecord>) -> serde_json::Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    struct TestDirectory(Option<PathBuf>);
-    impl TestDirectory {
-        fn install(path: PathBuf) -> Self {
-            let prior = TEST_DIRECTORY.with(|slot| slot.replace(Some(path)));
-            Self(prior)
-        }
-    }
-    impl Drop for TestDirectory {
-        fn drop(&mut self) {
-            TEST_DIRECTORY.with(|slot| {
-                slot.replace(self.0.take());
-            });
-        }
-    }
-
     #[test]
     fn record_accepts_only_its_own_immutable_snapshot_name() {
         let bytes = b"public-ca-material";
@@ -821,8 +845,8 @@ mod tests {
     fn status_of_absent_store_creates_no_state() {
         let temp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
-        let _directory = TestDirectory::install(root.join("kio/local-trust"));
-        assert_eq!(status().unwrap(), None);
+        let trust_directory = root.join("kio/local-trust");
+        assert_eq!(status(&trust_directory).unwrap(), None);
         assert!(!root.join("kio").exists());
     }
 
@@ -837,7 +861,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
-        let _directory = TestDirectory::install(root.join("kio/local-trust"));
+        let trust_directory = root.join("kio/local-trust");
         let first_source = root.join("first.pem");
         let equivalent_source = root.join("equivalent.pem");
         std::fs::write(&first_source, PEM).unwrap();
@@ -846,14 +870,14 @@ mod tests {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
 
-        let first = register(&first_source, false, None).unwrap();
-        revoke(false).unwrap();
-        let returned = register(&equivalent_source, false, None).unwrap();
+        let first = register(&trust_directory, &first_source, false, None).unwrap();
+        revoke(&trust_directory, false).unwrap();
+        let returned = register(&trust_directory, &equivalent_source, false, None).unwrap();
 
         assert_eq!(returned.digest, first.digest);
         assert_eq!(returned.snapshot, first.snapshot);
         assert_eq!(returned.generation, first.generation + 1);
         assert_ne!(returned.registration_id, first.registration_id);
-        assert_eq!(status().unwrap(), Some(returned));
+        assert_eq!(status(&trust_directory).unwrap(), Some(returned));
     }
 }

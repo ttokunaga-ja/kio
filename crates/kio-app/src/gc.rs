@@ -3,6 +3,8 @@
 //! CAS mutation remains in `kio_core::gc::GcSweepSession`; this module only
 //! owns the explicit confirmation, store-lock and SQLite generation boundary.
 
+use crate::context::AppContext;
+
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -453,6 +455,7 @@ fn is_runtime_deferred(report: &Value) -> bool {
 }
 
 pub(super) fn run(
+    ctx: &AppContext,
     dry_run: bool,
     yes: bool,
     prune_unreachable: bool,
@@ -468,7 +471,7 @@ pub(super) fn run(
     // follows a symlink and would erase the evidence that the supplied scope
     // was unsafe.  `GcSweepSession::bind` opens this original absolute name
     // no-follow, retains descriptor capabilities, and then verifies identity.
-    let root = crate::context_working_directory()?;
+    let root = ctx.cwd().to_path_buf();
     // Bind the scope read-only before probing the optional marker so an
     // ordinary non-scope is an invalid-usage error, never an I/O-shaped
     // missing-marker failure.  This has no HEAD self-heal side effect.
@@ -498,7 +501,7 @@ pub(super) fn run(
         // Recovery confirmation must show the complete frozen marker, not a
         // synthesized count summary: it is the exact durable state that will
         // be validated and resumed.
-        confirm(&marker, marker.candidates.len(), true, yes, json_mode)?;
+        confirm(ctx, &marker, marker.candidates.len(), true, yes, json_mode)?;
         return resume(root, now);
     }
 
@@ -515,6 +518,7 @@ pub(super) fn run(
     // bindings) before asking.  The subsequent locked re-plan remains the
     // only mutation authority.
     confirm(
+        ctx,
         &preview_plan,
         preview_candidate_count,
         false,
@@ -1303,6 +1307,7 @@ fn recovery_pending_value(marker: &GcInProgressMarker) -> Value {
 }
 
 fn confirm<T: Serialize>(
+    ctx: &AppContext,
     preview: &T,
     candidate_count: usize,
     recovery_pending: bool,
@@ -1312,7 +1317,7 @@ fn confirm<T: Serialize>(
     if yes {
         return Ok(());
     }
-    if json_mode || !crate::context::is_interactive()? {
+    if json_mode || !ctx.interaction.is_interactive() {
         return Err(KioError::invalid_usage(
             "kio gc requires --yes in JSON or non-interactive mode",
         ));
@@ -1330,7 +1335,10 @@ fn confirm<T: Serialize>(
     stderr
         .flush()
         .map_err(|error| KioError::io(error.to_string(), "stderr"))?;
-    if crate::context::confirm("Create shallow receipts and remove planned tree objects? [y/N]")? {
+    if ctx
+        .interaction
+        .confirm("Create shallow receipts and remove planned tree objects? [y/N]")?
+    {
         return Ok(());
     }
     Err(KioError::new(

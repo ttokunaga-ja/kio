@@ -1,5 +1,7 @@
 //! Explicit device grants paired with the current scope's approval references.
 
+use crate::context::AppContext;
+
 use std::path::{Path, PathBuf};
 
 use kio_adapter::authority::{RuntimeExecutionIdentityRequest, runtime_execution_identity};
@@ -274,14 +276,18 @@ fn open_network_policy(repo: &Repository) -> Result<()> {
     repo.compare_replace_config_document(&old, &document.to_string())
 }
 
-pub(crate) fn approve(args: ApproveArgs) -> Result<Value> {
+pub(crate) fn approve(
+    ctx: &AppContext,
+    args: ApproveArgs,
+    control: &ApprovalControl,
+) -> Result<Value> {
     let tool = selected_tool(&args.target)?;
     if args.preview && args.yes || args.resume.is_some() && tool.is_none() {
         return Err(KioError::invalid_usage(
             "preview conflicts with --yes; --resume requires one adapter",
         ));
     }
-    let repo = super::open_current_recovery_repository()?;
+    let repo = ctx.open_recovery_repository()?;
     let selected = configured_bindings(&repo)?
         .into_iter()
         .filter(|(_, b)| tool.is_none_or(|tool| b.tool_id == tool))
@@ -297,7 +303,7 @@ pub(crate) fn approve(args: ApproveArgs) -> Result<Value> {
         return Ok(preview);
     }
     if !args.yes
-        && !crate::context::confirm(&format!(
+        && !ctx.interaction.confirm(&format!(
             "Approve these adapter permissions? [y/N]\n{preview}"
         ))?
     {
@@ -401,7 +407,7 @@ pub(crate) fn approve(args: ApproveArgs) -> Result<Value> {
             store.revoke(&expected.scope_id, Some(&expected.tool_id), now.clone())?;
             store.begin_pending_approval(expected.clone(), args.send_secrets, now.clone())?
         };
-        approval_checkpoint("device_pending")?;
+        approval_checkpoint(control, "device_pending")?;
         let mut intent = json!({"scope_id":expected.scope_id,"tool_id":expected.tool_id,
             "execution_mode":expected.execution_mode,"tool_profile_hash":expected.tool_profile_hash,
             "grant_id":pending.grant_id,"approved_at":pending.created_at,"approval_method":"approve"});
@@ -417,22 +423,22 @@ pub(crate) fn approve(args: ApproveArgs) -> Result<Value> {
             ));
         }
         repo.write_network_approval_pending(intent.clone())?;
-        approval_checkpoint("scope_pending")?;
+        approval_checkpoint(control, "scope_pending")?;
         if expected.execution_mode == "online_api" {
             open_network_policy(&repo)?;
         }
-        approval_checkpoint("scope_config")?;
+        approval_checkpoint(control, "scope_config")?;
         let mut published = intent.clone();
         published["status"] = json!("active");
         repo.publish_network_approval(published, Some(&intent))?;
-        approval_checkpoint("scope_published")?;
+        approval_checkpoint(control, "scope_published")?;
         if configured_binding(&repo, role, GrantOperation::Network)?.as_ref() != Some(&expected) {
             return Err(denied(
                 "adapter authority changed during approval publication",
             ));
         }
         store.activate_approval(&pending, secret.as_ref(), now)?;
-        approval_checkpoint("device_active")?;
+        approval_checkpoint(control, "device_active")?;
         outcomes.push(
             json!({"tool_id":expected.tool_id,"status":"approved","grant_id":pending.grant_id,
             "secrets_grant_id":secret.map(|record|record.grant_id)}),
@@ -441,9 +447,9 @@ pub(crate) fn approve(args: ApproveArgs) -> Result<Value> {
     Ok(json!({"status":"approved","approvals":outcomes}))
 }
 
-pub(crate) fn revoke(args: RevokeArgs) -> Result<Value> {
+pub(crate) fn revoke(ctx: &AppContext, args: RevokeArgs) -> Result<Value> {
     let tool = selected_tool(&args.target)?;
-    let repo = super::open_current_recovery_repository()?;
+    let repo = ctx.open_recovery_repository()?;
     let _lock = repo.lock_store()?;
     let scope_id = repo.scope_identity()?.scope_id;
     let now = super::now_utc_seconds();
@@ -460,8 +466,8 @@ pub(crate) fn revoke(args: RevokeArgs) -> Result<Value> {
     )
 }
 
-pub(crate) fn status(args: AdapterStatusArgs) -> Result<Value> {
-    let repo = super::open_current_recovery_repository()?;
+pub(crate) fn status(ctx: &AppContext, args: AdapterStatusArgs) -> Result<Value> {
+    let repo = ctx.open_recovery_repository()?;
     let scope_id = repo.scope_identity()?.scope_id;
     let snapshot = PrivateGrantStore::open_readonly(&store_path())?;
     let records = snapshot
@@ -545,14 +551,15 @@ fn denied(message: &str) -> KioError {
     )
 }
 
-#[cfg(test)]
-thread_local! {
-    pub(crate) static STOP_AFTER: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+#[derive(Default)]
+pub(crate) struct ApprovalControl {
+    #[cfg(test)]
+    pub(crate) stop_after: Option<&'static str>,
 }
 
-fn approval_checkpoint(phase: &'static str) -> Result<()> {
+fn approval_checkpoint(control: &ApprovalControl, phase: &'static str) -> Result<()> {
     #[cfg(test)]
-    if STOP_AFTER.get() == Some(phase) {
+    if control.stop_after == Some(phase) {
         return Err(KioError::new(
             "KIO-E-APPROVAL-TEST-INTERRUPTED-001",
             "approval interrupted at a durable boundary",
@@ -560,6 +567,6 @@ fn approval_checkpoint(phase: &'static str) -> Result<()> {
             ExitCode::PartialFailure,
         ));
     }
-    let _ = phase;
+    let _ = (control, phase);
     Ok(())
 }

@@ -1,3 +1,4 @@
+use crate::context::{AppContext, EvidenceRegistry};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -12,7 +13,12 @@ use super::{
     bind_batch_scopes, parse_batch_pointers, verify_batch_row,
 };
 
-pub(super) fn run_evidence_batch(path: &Path, strict: bool) -> Result<Value> {
+pub(super) fn run_evidence_batch(
+    ctx: &AppContext,
+    registry_input: &EvidenceRegistry,
+    path: &Path,
+    strict: bool,
+) -> Result<Value> {
     let bytes = read_bounded_regular_file(path, MAX_BATCH_INPUT_BYTES).map_err(|error| {
         if matches!(
             error.error_code(),
@@ -28,14 +34,16 @@ pub(super) fn run_evidence_batch(path: &Path, strict: bool) -> Result<Value> {
 
     let (verifications, _) =
         kio_core::cas::with_verified_cas_read_budget(MAX_BATCH_VERIFIED_BYTES, || {
-            let bindings = bind_batch_scopes(&pointers, strict)?;
+            let bindings = bind_batch_scopes(ctx, registry_input, &pointers, strict)?;
             let mut cache = BTreeMap::<Vec<u8>, EvidenceVerification>::new();
             let verifications = pointers
                 .iter()
-                .map(|pointer| verify_batch_row(pointer, strict, &bindings, &mut cache))
+                .map(|pointer| {
+                    verify_batch_row(ctx, registry_input, pointer, strict, &bindings, &mut cache)
+                })
                 .collect::<Result<Vec<_>>>()?;
             for binding in &bindings {
-                binding.recheck()?;
+                binding.recheck(ctx, registry_input)?;
             }
             Ok(verifications)
         })?;

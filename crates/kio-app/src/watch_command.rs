@@ -50,18 +50,18 @@ struct StopRequest {
     instance: String,
 }
 
-pub(crate) fn run(args: WatchArgs) -> Result<Value> {
+pub(crate) fn run(ctx: &AppContext, args: WatchArgs) -> Result<Value> {
     let WatchArgs {
         root: configured_root,
         command,
     } = args;
     let command = match command {
         WatchCommand::Service(command) => {
-            return crate::watch_service::run(configured_root, command);
+            return crate::watch_service::run(ctx, configured_root, command);
         }
         command => command,
     };
-    let cwd = crate::context_working_directory()?;
+    let cwd = ctx.cwd().to_path_buf();
     let requested = configured_root.clone().unwrap_or(cwd.clone());
     let requested = if requested.is_absolute() {
         requested
@@ -74,7 +74,7 @@ pub(crate) fn run(args: WatchArgs) -> Result<Value> {
     match command {
         WatchCommand::Run {
             reconcile_interval_seconds,
-        } => run_foreground(&root, reconcile_interval_seconds),
+        } => run_foreground(ctx, &root, reconcile_interval_seconds),
         WatchCommand::Status => inspect(&root, false),
         WatchCommand::Stop => inspect(&root, true),
         WatchCommand::Service(_) => unreachable!("service commands return before root resolution"),
@@ -118,7 +118,7 @@ fn inspect(root: &Path, stop: bool) -> Result<Value> {
     }))
 }
 
-fn run_foreground(root: &Path, interval: u64) -> Result<Value> {
+fn run_foreground(ctx: &AppContext, root: &Path, interval: u64) -> Result<Value> {
     if !(1..=86400).contains(&interval) {
         return Err(KioError::invalid_usage(
             "reconciliation interval must be 1 through 86400 seconds",
@@ -176,7 +176,7 @@ fn run_foreground(root: &Path, interval: u64) -> Result<Value> {
         reconcile_interval_seconds: interval,
     };
     publish_state(&directory, &engine, &mut state)?;
-    crate::context::diagnostic(
+    ctx.interaction.diagnostic(
         "watch started; reconciliation is local and grants no external-send permission",
     );
     let mut next_observation = Instant::now();

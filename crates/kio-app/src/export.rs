@@ -1,5 +1,7 @@
 //! Step 4 destination-only export.
 
+use crate::context::AppContext;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -74,7 +76,7 @@ struct DestinationDir {
     handle: File,
 }
 
-pub(super) fn run(args: ExportArgs) -> Result<Value> {
+pub(super) fn run(ctx: &AppContext, args: ExportArgs) -> Result<Value> {
     if args.yes && !args.force {
         return Err(KioError::invalid_usage(
             "export --yes is valid only together with --force",
@@ -87,7 +89,7 @@ pub(super) fn run(args: ExportArgs) -> Result<Value> {
     // runs ahead of the shared (1)+(3) pair below — QB5 (step4b-contract-
     // tests-p3b.md §A): this ordering was already correct, unlike
     // open/view/evidence-verify (QB6).
-    let source = resolve_source(&args.source)?;
+    let source = resolve_source(ctx, &args.source)?;
     // A shallow sweep publishes its durable receipt before removing the tree.
     // Export must not stage bytes, prompt, or publish while that state machine
     // is active.  The helper also rejects a malformed marker rather than
@@ -100,11 +102,11 @@ pub(super) fn run(args: ExportArgs) -> Result<Value> {
     // irreversible publish, matching the spec's fixed "expand -> recheck ->
     // publish" order.
     let checkpoint = super::preflight_barrier_and_index(&source.target.kio_dir)?;
-    let validated_destination = validate_destination(&args.to, &source.target)?;
+    let validated_destination = validate_destination(ctx, &args.to, &source.target)?;
     let _initial_preflight = preflight(&source, &validated_destination.path, args.force)?;
 
     if args.force && !args.yes {
-        confirm_force()?;
+        confirm_force(ctx)?;
     }
 
     let destination_dir = open_destination_dir(
@@ -131,20 +133,21 @@ pub(super) fn run(args: ExportArgs) -> Result<Value> {
     publish_all(&source, &destination_dir, staged, &checkpoint)
 }
 
-fn resolve_source(operand: &str) -> Result<ExportSource> {
+fn resolve_source(ctx: &AppContext, operand: &str) -> Result<ExportSource> {
     if operand == "-" || operand.starts_with("kio://") {
-        return resolve_evidence_source(operand);
+        return resolve_evidence_source(ctx, operand);
     }
     if operand.trim_start().starts_with('{') {
-        return resolve_evidence_source(operand.trim());
+        return resolve_evidence_source(ctx, operand.trim());
     }
-    resolve_local_source(operand)
+    resolve_local_source(ctx, operand)
 }
 
-fn resolve_evidence_source(operand: &str) -> Result<ExportSource> {
-    let text = read_pointer_operand(operand)?;
+fn resolve_evidence_source(ctx: &AppContext, operand: &str) -> Result<ExportSource> {
+    let text = read_pointer_operand(ctx, operand)?;
     let pointer = super::parse_pointer_text(&text)?;
-    let target = super::resolve_scope_target(&pointer.scope_id, pointer.scope_path.as_deref())?;
+    let target =
+        super::resolve_scope_target(ctx.cwd(), &pointer.scope_id, pointer.scope_path.as_deref())?;
     let repo = Repository::open(&target.repo_root)?;
     super::validate_repo_tool_lock(&repo)?;
 
@@ -240,7 +243,7 @@ fn resolve_evidence_source(operand: &str) -> Result<ExportSource> {
     })
 }
 
-fn read_pointer_operand(operand: &str) -> Result<String> {
+fn read_pointer_operand(ctx: &AppContext, operand: &str) -> Result<String> {
     if operand != "-" {
         if operand.len() as u64 > MAX_POINTER_INPUT_BYTES {
             return Err(KioError::invalid_usage(
@@ -250,14 +253,16 @@ fn read_pointer_operand(operand: &str) -> Result<String> {
         return Ok(operand.to_owned());
     }
 
-    let input = crate::context::read_input(MAX_POINTER_INPUT_BYTES as usize)?;
+    let input = ctx
+        .interaction
+        .read_input(MAX_POINTER_INPUT_BYTES as usize)?;
     String::from_utf8(input)
         .map(|input| input.trim().to_owned())
         .map_err(|_| KioError::invalid_usage("evidence pointer input must be UTF-8"))
 }
 
-fn resolve_local_source(operand: &str) -> Result<ExportSource> {
-    let repo = crate::open_current_recovery_repository()?;
+fn resolve_local_source(ctx: &AppContext, operand: &str) -> Result<ExportSource> {
+    let repo = ctx.open_recovery_repository()?;
     super::validate_repo_tool_lock(&repo)?;
     let target = super::scope_target(repo.root())?;
 
@@ -640,8 +645,12 @@ struct ValidatedDestination {
     identity: Option<DestinationIdentity>,
 }
 
-fn validate_destination(input: &Path, target: &ScopeTarget) -> Result<ValidatedDestination> {
-    let destination = normalize_absolute(input)?;
+fn validate_destination(
+    ctx: &AppContext,
+    input: &Path,
+    target: &ScopeTarget,
+) -> Result<ValidatedDestination> {
+    let destination = normalize_absolute(ctx, input)?;
     verify_destination_input_chain(&destination, target)?;
     let destination = effective_destination(&destination)?;
     verify_existing_directory_chain(&destination)?;
@@ -734,13 +743,11 @@ fn verify_destination_input_chain(path: &Path, target: &ScopeTarget) -> Result<(
     Ok(())
 }
 
-fn normalize_absolute(path: &Path) -> Result<PathBuf> {
+fn normalize_absolute(ctx: &AppContext, path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        crate::context_working_directory()
-            .map_err(|error| KioError::io(error.to_string(), "."))?
-            .join(path)
+        ctx.cwd().join(path)
     };
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
@@ -1049,13 +1056,16 @@ pub(crate) fn unsafe_export_error(path: &Path, message: &str) -> KioError {
     )
 }
 
-fn confirm_force() -> Result<()> {
-    if !crate::context::is_interactive()? {
+fn confirm_force(ctx: &AppContext) -> Result<()> {
+    if !ctx.interaction.is_interactive() {
         return Err(confirmation_rejected(
             "export --force requires --yes in non-interactive mode",
         ));
     }
-    if crate::context::confirm("Export may replace existing files. Continue? [y/N]")? {
+    if ctx
+        .interaction
+        .confirm("Export may replace existing files. Continue? [y/N]")?
+    {
         Ok(())
     } else {
         Err(confirmation_rejected("export confirmation was rejected"))
@@ -2070,10 +2080,7 @@ mod tests {
             working_directory: directory.path().to_path_buf(),
             interaction: std::sync::Arc::new(NonInteractive),
         };
-        let normalized = crate::context::with_context(&context, || {
-            normalize_absolute(std::path::Path::new("a/../b"))
-        })
-        .unwrap();
+        let normalized = normalize_absolute(&context, std::path::Path::new("a/../b")).unwrap();
         assert_eq!(normalized, directory.path().join("b"));
     }
 

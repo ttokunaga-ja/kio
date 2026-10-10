@@ -1,5 +1,7 @@
 //! Explicit, journaled registration of an already-existing moved scope.
 
+use crate::context::AppContext;
+
 use kio_core::management::{
     ChildEnrollment, ManagementAuthority, ManagementBinding, ManagementRecord, begin_registration,
     detect_case_insensitive, finish_registration, peek_registration_marker,
@@ -69,13 +71,13 @@ struct Node {
     retired_children: BTreeMap<String, ChildEnrollment>,
 }
 
-pub(crate) fn run(args: RootRegisterArgs) -> Result<Value> {
+pub(crate) fn run(ctx: &AppContext, args: RootRegisterArgs) -> Result<Value> {
     if args.preview == args.yes || (args.resume.is_some() && !args.yes) {
         return Err(KioError::invalid_usage(
             "root register requires exactly one of --preview or --yes; --resume requires --yes",
         ));
     }
-    let context = crate::context::working_directory()?;
+    let context = ctx.cwd().to_path_buf();
     let path = match args.path {
         Some(path) if path.is_absolute() => path,
         Some(path) => context.join(path),

@@ -117,9 +117,7 @@ use kio_index::fts::{
     FtsTokenizer, SqliteFtsIndex, open_existing_source_index_connection,
     read_bound_gc_index_metadata,
 };
-use kio_index::registry::{
-    RegistryDb, RegistryEntry, RegistrySnapshotError, default_registry_path,
-};
+use kio_index::registry::{RegistryDb, RegistryEntry, RegistrySnapshotError};
 use kio_index::{
     ChunkRow, EmbeddingDistance, EmbeddingModality, EmbeddingTargetType, TreeEntryRow,
 };
@@ -227,11 +225,7 @@ const OFFICE_CONVERSION_UNAVAILABLE_REASON: &str = "office_conversion_unavailabl
 
 pub mod commands;
 pub mod context;
-
-/// Executes one validated command request inside its explicit invocation context.
-pub fn execute(context: &context::AppContext, request: Command) -> Result<Value> {
-    context::with_context(context, || execute_in_context(request))
-}
+use context::{AppContext, EvidenceRegistry};
 
 #[cfg(debug_assertions)]
 thread_local! {
@@ -326,7 +320,7 @@ fn exit_override_error_code(code: ExitCode) -> &'static str {
     }
 }
 
-fn execute_in_context(command: Command) -> Result<Value> {
+pub fn execute(ctx: &AppContext, command: Command) -> Result<Value> {
     #[cfg(debug_assertions)]
     install_debug_test_control();
     // The Windows scheduler runner carries an already absolute, owner-private
@@ -340,7 +334,7 @@ fn execute_in_context(command: Command) -> Result<Value> {
             ..
         })
     ) {
-        return execute_dispatch(command);
+        return execute_dispatch(ctx, command);
     }
     // R13-6: refuse to run if device-global state cannot resolve to an absolute
     // base dir (no absolute $HOME and no absolute $XDG_*), before any command
@@ -367,12 +361,12 @@ fn execute_in_context(command: Command) -> Result<Value> {
             ),
         })
     ) {
-        return execute_dispatch(command);
+        return execute_dispatch(ctx, command);
     }
     validate_user_tools_config()?;
     validate_user_config()?;
     let mut settings = adapter_runtime_settings_from_user_config()?;
-    let managed_trust = trust::acquire_runtime_trust()?;
+    let managed_trust = trust::acquire_runtime_trust(&trust::directory_path())?;
     if let Some(trust) = managed_trust.as_ref() {
         settings.local_peer_ca_path = Some(trust.path().to_path_buf());
         settings.local_peer_trust_digest = Some(trust.digest().to_owned());
@@ -380,15 +374,15 @@ fn execute_in_context(command: Command) -> Result<Value> {
     }
     kio_adapter::tool_lock::with_runtime_settings(settings, || {
         let _managed_trust = managed_trust;
-        execute_dispatch(command)
+        execute_dispatch(ctx, command)
     })
 }
 
-fn execute_dispatch(command: Command) -> Result<Value> {
+fn execute_dispatch(ctx: &AppContext, command: Command) -> Result<Value> {
     match command {
-        Command::RootRegister(args) => root_registration::run(args),
+        Command::RootRegister(args) => root_registration::run(ctx, args),
         Command::Init(args) => {
-            let working_directory = context_working_directory()?;
+            let working_directory = ctx.cwd().to_path_buf();
             let requested = args.path.unwrap_or(working_directory.clone());
             let path = if requested.is_absolute() {
                 requested
@@ -442,7 +436,7 @@ fn execute_dispatch(command: Command) -> Result<Value> {
             }))
         }
         Command::Status => {
-            let repo = open_current_recovery_repository()?;
+            let repo = ctx.open_recovery_repository()?;
             validate_repo_tool_lock(&repo)?;
             let task_store = TaskStore::new(repo.kio_dir());
             // R15-4: `status` is a pure read — a shallow HEAD (tree object gone)
@@ -497,7 +491,7 @@ fn execute_dispatch(command: Command) -> Result<Value> {
         }
         Command::Snapshot(SnapshotArgs {
             action: SnapshotAction::Auto,
-        }) => run_snapshot_auto(),
+        }) => run_snapshot_auto(ctx),
         Command::Snapshot(SnapshotArgs {
             action: SnapshotAction::Create(args),
         }) => {
@@ -506,7 +500,7 @@ fn execute_dispatch(command: Command) -> Result<Value> {
             // and only then perform that write. This keeps even the open path
             // behind the active-sweep barrier without following a replaced
             // public `.kio` pathname.
-            let repo = Repository::open_for_recovery(context_working_directory()?)?;
+            let repo = Repository::open_for_recovery(ctx.cwd())?;
             let (recovered_before_publication, gc_binding) =
                 match gc::preflight_automatic(&repo, "snapshot")? {
                     gc::AutomaticGcPreflight::Proceed { recovered, binding } => {
@@ -601,7 +595,7 @@ fn execute_dispatch(command: Command) -> Result<Value> {
             ))
         }
         Command::Log(args) => {
-            let repo = open_current_recovery_repository()?; // (0) kio_format_version
+            let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
             validate_repo_tool_lock(&repo)?;
             // QB5/QB6/裁定1: shared (1)+(3) preflight pair.
             let checkpoint = preflight_barrier_and_index(repo.kio_dir())?;
@@ -654,7 +648,7 @@ fn execute_dispatch(command: Command) -> Result<Value> {
             checkpoint.finish(json!({ "commits": entries, "truncated": report.truncated }))
         }
         Command::Diff(args) => {
-            let repo = open_current_recovery_repository()?; // (0) kio_format_version
+            let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
             validate_repo_tool_lock(&repo)?;
             // QB5/QB6/裁定1: shared (1)+(3) preflight pair.
             let checkpoint = preflight_barrier_and_index(repo.kio_dir())?;
@@ -663,7 +657,7 @@ fn execute_dispatch(command: Command) -> Result<Value> {
             checkpoint.finish(json!({ "changes": changes }))
         }
         Command::Inspect(args) => {
-            let repo = open_current_recovery_repository()?; // (0) kio_format_version
+            let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
             validate_repo_tool_lock(&repo)?;
             let target = scope_target(repo.root())?;
             // QB5/QB6/裁定1: shared (1)+(3) preflight pair. Distinct from the
@@ -706,7 +700,7 @@ fn execute_dispatch(command: Command) -> Result<Value> {
                     "tag deletion does not accept a commit operand",
                 ));
             }
-            let repo = open_current_recovery_repository()?;
+            let repo = ctx.open_recovery_repository()?;
             validate_repo_tool_lock(&repo)?;
             let commit_hash = if args.delete {
                 repo.delete_tag(&args.name)?
@@ -734,38 +728,22 @@ fn execute_dispatch(command: Command) -> Result<Value> {
                 }))
             }
         }
-        Command::Index(args) => run_index(args),
-        Command::Watch(args) => watch_command::run(args),
-        Command::Batch(args) => run_batch(args),
-        Command::Adapter(args) => run_adapter(args),
+        Command::Index(args) => run_index(ctx, args),
+        Command::Watch(args) => watch_command::run(ctx, args),
+        Command::Batch(args) => run_batch(ctx, args),
+        Command::Adapter(args) => run_adapter(ctx, args),
         Command::Ledger(args) => run_ledger(args),
-        Command::Repair(args) => run_repair(args),
-        Command::Gc(args) => gc::run(args.dry_run, args.yes, args.prune_unreachable, false),
-        Command::Search(args) => run_search(args),
-        Command::Open(args) => run_open(args),
-        Command::View(args) => run_view(args),
-        Command::Reindex(args) => run_reindex(args),
-        Command::Evidence(args) => verify_objects::run_evidence(args),
-        Command::Export(args) => export::run(args),
-        Command::Restore(args) => managed_restore::run(args),
-        Command::Purge(args) => purge::run(args),
+        Command::Repair(args) => run_repair(ctx, args),
+        Command::Gc(args) => gc::run(ctx, args.dry_run, args.yes, args.prune_unreachable, false),
+        Command::Search(args) => run_search(ctx, args),
+        Command::Open(args) => run_open(ctx, args),
+        Command::View(args) => run_view(ctx, args),
+        Command::Reindex(args) => run_reindex(ctx, args),
+        Command::Evidence(args) => verify_objects::run_evidence(ctx, args),
+        Command::Export(args) => export::run(ctx, args),
+        Command::Restore(args) => managed_restore::run(ctx, args),
+        Command::Purge(args) => purge::run(ctx, args),
     }
-}
-
-pub(crate) fn context_working_directory() -> Result<PathBuf> {
-    context::working_directory()
-}
-
-pub(crate) fn open_current_read_only_repository() -> Result<Repository> {
-    Repository::open_read_only(context_working_directory()?)
-}
-
-pub(crate) fn open_current_recovery_repository() -> Result<Repository> {
-    Repository::open_for_recovery(context_working_directory()?)
-}
-
-pub(crate) fn open_current_search_repository() -> Result<Repository> {
-    Repository::open_for_search_read_only(context_working_directory()?)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -869,10 +847,10 @@ macro_rules! snapshot_auto_test_barrier {
     }};
 }
 
-fn run_snapshot_auto() -> Result<Value> {
+fn run_snapshot_auto(ctx: &AppContext) -> Result<Value> {
     #[cfg(debug_assertions)]
     let test_control = debug_test_control();
-    let repo = open_current_read_only_repository()?;
+    let repo = ctx.open_read_only_repository()?;
     let session = GcSweepSession::bind_repository(&repo)?;
     let first_gc = session.automation_binding()?;
     let first_config = session.snapshot_auto_binding()?;
@@ -1571,22 +1549,23 @@ fn scheduled_preview_change_count(
     Ok(changes)
 }
 
-fn run_index(args: IndexArgs) -> Result<Value> {
+fn run_index(ctx: &AppContext, args: IndexArgs) -> Result<Value> {
     // `index --preview` is read-only all the way through opening the repository:
     // the ordinary open path may repair a missing HEAD, which would violate the
     // preview no-state-creation contract before scanning.
-    let repo = open_existing_managed_root(&context_working_directory()?)?;
-    run_index_for_repo(args, &repo, true)
+    let repo = open_existing_managed_root(ctx.cwd())?;
+    run_index_for_repo(ctx, args, &repo, true)
 }
 
 /// Index one scope. Only the user-invoked parent discovers children; child
 /// scopes stay direct-file-only and cannot recursively fan out a single run.
 fn run_index_for_repo(
+    ctx: &AppContext,
     args: IndexArgs,
     repo: &Repository,
     discover_children: bool,
 ) -> Result<Value> {
-    run_index_for_repo_inner(args, repo, discover_children)
+    run_index_for_repo_inner(ctx, args, repo, discover_children)
 }
 
 struct ChildDiscoveryPage {
@@ -1643,6 +1622,7 @@ fn admit_scope_writer(repo: &Repository) -> Result<CurrentPolicyEvaluator> {
 }
 
 fn run_index_for_repo_inner(
+    ctx: &AppContext,
     args: IndexArgs,
     repo: &Repository,
     discover_children: bool,
@@ -1661,6 +1641,8 @@ fn run_index_for_repo_inner(
     if !args.preview {
         let scope_id = repo.scope_identity()?.scope_id;
         resolve_evidence_scope_target(
+            ctx.cwd(),
+            &EvidenceRegistry::default(),
             &scope_id,
             Some(&repo.canonical_root().display().to_string()),
         )?;
@@ -2052,7 +2034,7 @@ fn run_index_for_repo_inner(
                             .expect("managed child ancestor was inserted")
                     }
                 };
-                match run_bound_child_index(direct_parent, plan, &child.path, &args) {
+                match run_bound_child_index(ctx, direct_parent, plan, &child.path, &args) {
                     Ok(BoundChildIndex::SkippedVcs) => {
                         child.status = "skipped_vcs".to_owned();
                         child.reason = Some("vcs_marker_added_after_discovery".to_owned());
@@ -2369,6 +2351,7 @@ fn cache_managed_child_parent(
 }
 
 fn run_bound_child_index(
+    ctx: &AppContext,
     parent: &Repository,
     plan: &kio_pipeline::scan::ChildScopePlan,
     relative: &str,
@@ -2386,7 +2369,7 @@ fn run_bound_child_index(
             // grants. Existing child grants may still authorize the requested
             // execution lane through that child's ordinary send gates.
             child_args.yes = false;
-            let output = run_index_for_repo(child_args, &repo, false)?;
+            let output = run_index_for_repo(ctx, child_args, &repo, false)?;
             Ok(BoundChildIndex::Output(output, repo))
         }
     }
@@ -2473,7 +2456,7 @@ fn reject_inert_repair_yes(args: &RepairArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_repair(args: RepairArgs) -> Result<Value> {
+fn run_repair(ctx: &AppContext, args: RepairArgs) -> Result<Value> {
     reject_inert_repair_yes(&args)?;
     if let RepairOperation::CancelChildInitialization(cancel) = args.operation {
         if cancel.preview == cancel.yes || (cancel.yes && cancel.operation.is_none()) {
@@ -2481,7 +2464,7 @@ fn run_repair(args: RepairArgs) -> Result<Value> {
                 "repair cancel-child-initialization requires exactly one of --preview or --yes; --yes requires --operation",
             ));
         }
-        let working_directory = context_working_directory()?;
+        let working_directory = ctx.cwd().to_path_buf();
         let root = cancel
             .path
             .map(|path| working_directory.join(path))
@@ -2494,7 +2477,7 @@ fn run_repair(args: RepairArgs) -> Result<Value> {
         );
     }
     if matches!(args.operation, RepairOperation::RecoverRestore) {
-        return managed_restore::recover();
+        return managed_restore::recover(ctx);
     }
     if matches!(
         args.operation,
@@ -2509,11 +2492,11 @@ fn run_repair(args: RepairArgs) -> Result<Value> {
     // scope at all (unlike every other repair mode).
     if let RepairOperation::RegistryPrune(prune) = &args.operation {
         let plan = verify_objects::registry_prune_plan()?;
-        confirm_repair_prune("registry-prune", &plan.target_lines(), prune.yes)?;
+        confirm_repair_prune(ctx, "registry-prune", &plan.target_lines(), prune.yes)?;
         let report = verify_objects::registry_prune_apply(&plan)?;
         return serde_json::to_value(report).map_err(|error| KioError::schema(error.to_string()));
     }
-    let repo = match Repository::open_for_recovery(context_working_directory()?) {
+    let repo = match Repository::open_for_recovery(ctx.cwd()) {
         Ok(repo) => repo,
         Err(error)
             if matches!(args.operation, RepairOperation::VerifyObjects(_))
@@ -2629,6 +2612,7 @@ fn run_repair(args: RepairArgs) -> Result<Value> {
             let plan = verify_objects::prune_orphans_plan(&repo)?;
             if !plan.is_blocked() {
                 confirm_repair_prune(
+                    ctx,
                     "verify-objects --prune-orphans",
                     &plan.target_lines(),
                     skip_prompt,
@@ -5448,21 +5432,21 @@ fn log_aggregator_degraded(detail: &str) {
     eprintln!("kio: aggregator write-through degraded ({detail})");
 }
 
-fn run_search(args: SearchArgs) -> Result<Value> {
+fn run_search(ctx: &AppContext, args: SearchArgs) -> Result<Value> {
     // R12-4: a FAILED search (cursor mismatch, all-scope-failed, …) returns before
     // `append_search_logs`, so it never wrote a per-search metrics line and dropped
     // out of the p50/p95/p99 latency population (docs/05:578). Emit that line here on
     // the error path (result_count 0 + error_code). The errors.jsonl line for a hard
     // Err is still written by main()'s Err arm.
     let started = Instant::now();
-    let result = run_search_inner(args, started);
+    let result = run_search_inner(ctx, args, started);
     if let Err(error) = &result {
         append_failed_search_metrics(started, error);
     }
     result
 }
 
-fn run_search_inner(args: SearchArgs, started: Instant) -> Result<Value> {
+fn run_search_inner(ctx: &AppContext, args: SearchArgs, started: Instant) -> Result<Value> {
     let parsed = parsed_search(args)?;
     // PC10 (05 §1.3 L115): a query that tokenizes to zero tokens (empty, or
     // whitespace-only under PC9's Unicode-whitespace split) is a usage error
@@ -5473,7 +5457,7 @@ fn run_search_inner(args: SearchArgs, started: Instant) -> Result<Value> {
             "search query has no indexable token",
         ));
     }
-    let repo = open_current_search_repository()?;
+    let repo = ctx.open_search_repository()?;
     validate_repo_tool_lock(&repo)?;
 
     let multi_scope_settings = multi_scope::effective_settings(
@@ -8879,16 +8863,16 @@ fn resolve_cursor_exec_scopes(cursor: &CursorToken) -> Result<(Vec<ExecScope>, V
     Ok((exec, excluded))
 }
 
-fn run_open(args: PointerArgs) -> Result<Value> {
-    let raw = read_pointer_input(args.pointer.into_iter().collect())?;
+fn run_open(ctx: &AppContext, args: PointerArgs) -> Result<Value> {
+    let raw = read_pointer_input(ctx, args.pointer.into_iter().collect())?;
     if let Some(object) = parse_object_uri(&raw)? {
-        return resolve_object_uri(&object, false);
+        return resolve_object_uri(ctx, &object, false);
     }
     if raw.starts_with("sha256:") {
-        return resolve_short_hash_command(&raw, false);
+        return resolve_short_hash_command(ctx, &raw, false);
     }
     let pointer = parse_pointer_text(&raw)?;
-    let resolved = resolve_pointer_for_cli(&pointer)?;
+    let resolved = resolve_pointer_for_cli(ctx, &pointer)?;
     Ok(json!({
         "status": "opened",
         "path": resolved.path,
@@ -8900,16 +8884,16 @@ fn run_open(args: PointerArgs) -> Result<Value> {
     }))
 }
 
-fn run_view(args: PointerArgs) -> Result<Value> {
-    let raw = read_pointer_input(args.pointer.into_iter().collect())?;
+fn run_view(ctx: &AppContext, args: PointerArgs) -> Result<Value> {
+    let raw = read_pointer_input(ctx, args.pointer.into_iter().collect())?;
     if let Some(object) = parse_object_uri(&raw)? {
-        return resolve_object_uri(&object, true);
+        return resolve_object_uri(ctx, &object, true);
     }
     if raw.starts_with("sha256:") {
-        return resolve_short_hash_command(&raw, true);
+        return resolve_short_hash_command(ctx, &raw, true);
     }
     let pointer = parse_pointer_text(&raw)?;
-    let resolved = resolve_pointer_for_cli(&pointer)?;
+    let resolved = resolve_pointer_for_cli(ctx, &pointer)?;
     Ok(json!({
         "status": "viewed",
         "raw_hash": pointer.raw_hash,
@@ -8929,7 +8913,7 @@ fn run_view(args: PointerArgs) -> Result<Value> {
     }))
 }
 
-fn run_reindex(args: ReindexArgs) -> Result<Value> {
+fn run_reindex(ctx: &AppContext, args: ReindexArgs) -> Result<Value> {
     // B: `--regenerate`/`--at` exclusivity and the flag vocabulary are enforced
     // by the clap declaration on `ReindexArgs`; this only shapes the struct the
     // command body already consumed.
@@ -8943,7 +8927,7 @@ fn run_reindex(args: ReindexArgs) -> Result<Value> {
     let lane_override = LaneOverride::new(args.realtime, args.batch);
     // Recovery-capable opening only binds and reads durable scope authority;
     // reject scope denial before any writer/recovery or derived-state mutation.
-    let repo = open_current_recovery_repository()?;
+    let repo = ctx.open_recovery_repository()?;
     let publication_policy = admit_scope_writer(&repo)?;
     resolve_invocation_lane(lane_override, Some(&repo.kio_dir().join("config.toml")))?;
     // M1(a): serialize both HEAD reindex and historical enrichment against
@@ -12590,7 +12574,7 @@ struct PointerResolution {
 
 /// Reads the raw `<pointer>` operand (08 §2.3), resolving `-` from stdin.
 /// Branching into evidence-pointer vs `object` URI happens in the caller.
-fn read_pointer_input(args: Vec<String>) -> Result<String> {
+fn read_pointer_input(ctx: &AppContext, args: Vec<String>) -> Result<String> {
     const MAX_POINTER_INPUT_BYTES: u64 = 64 * 1024;
     let mut args = args.into_iter();
     let Some(pointer) = args.next() else {
@@ -12602,7 +12586,9 @@ fn read_pointer_input(args: Vec<String>) -> Result<String> {
         )));
     }
     if pointer == "-" {
-        let bytes = context::read_input(MAX_POINTER_INPUT_BYTES as usize)
+        let bytes = ctx
+            .interaction
+            .read_input(MAX_POINTER_INPUT_BYTES as usize)
             .map_err(|err| KioError::invalid_usage(format!("pointer stdin: {}", err.message())))?;
         let input = String::from_utf8(bytes)
             .map_err(|_| KioError::invalid_usage("pointer stdin must be UTF-8"))?;
@@ -12674,9 +12660,9 @@ fn validate_short_hash_operand(hash: &str) -> Result<()> {
     Ok(())
 }
 
-fn classify_short_hash(hash: &str) -> Result<ShortHash> {
+fn classify_short_hash(ctx: &AppContext, hash: &str) -> Result<ShortHash> {
     validate_short_hash_operand(hash)?;
-    let initial_repo = open_current_recovery_repository()?;
+    let initial_repo = ctx.open_recovery_repository()?;
     let target = scope_target(initial_repo.root())?;
     let (repo, policy) = current_search_policy(&target)?;
     let observed_head = repo
@@ -12798,10 +12784,10 @@ fn raw_object_present(target: &ScopeTarget, raw_hash: &str) -> Result<bool> {
 
 /// Resolve a `sha256:` short-form operand for `kio open` / `kio view`
 /// (08 §2.3 rule 4). Handles both the chunk_hash and raw_hash kinds.
-fn resolve_short_hash_command(hash: &str, as_view: bool) -> Result<Value> {
-    match classify_short_hash(hash)? {
+fn resolve_short_hash_command(ctx: &AppContext, hash: &str, as_view: bool) -> Result<Value> {
+    match classify_short_hash(ctx, hash)? {
         ShortHash::Chunk(pointer) => {
-            let resolved = resolve_pointer_for_cli(&pointer)?;
+            let resolved = resolve_pointer_for_cli(ctx, &pointer)?;
             if as_view {
                 Ok(json!({
                     "status": "viewed",
@@ -13265,9 +13251,12 @@ fn resolve_chunk_view(kio_dir: &Path, chunk: &ChunkObject) -> Option<(PathBuf, u
     Some((view_path, view_start, view_end))
 }
 
-fn resolve_pointer_for_cli(pointer: &EvidencePointer) -> Result<PointerResolution> {
+fn resolve_pointer_for_cli(
+    ctx: &AppContext,
+    pointer: &EvidencePointer,
+) -> Result<PointerResolution> {
     // 08 §3.1 step 1: two-stage scope resolution (scope_path hint -> registry).
-    let target = resolve_scope_target(&pointer.scope_id, pointer.scope_path.as_deref())?;
+    let target = resolve_scope_target(ctx.cwd(), &pointer.scope_id, pointer.scope_path.as_deref())?;
     // QB6 (step4b-contract-tests-p3b.md §A, 10 §3 L300-305): (0)
     // kio_format_version compatibility must be checked BEFORE (1) the purge
     // read barrier — this used to open the checkpoint first, so a scope that
@@ -13709,36 +13698,29 @@ fn resolve_scope_id_in_registry_with_hint(
     Ok(live.into_iter().next())
 }
 
-fn resolve_scope_target(scope_id: &str, scope_path_hint: Option<&str>) -> Result<ScopeTarget> {
-    resolve_scope_target_with_mode(scope_id, scope_path_hint, ScopeResolutionMode::Normal)
+fn resolve_scope_target(
+    cwd: &Path,
+    scope_id: &str,
+    scope_path_hint: Option<&str>,
+) -> Result<ScopeTarget> {
+    resolve_scope_target_with_mode(cwd, scope_id, scope_path_hint, ScopeResolutionMode::Normal)
 }
 
 /// Evidence must use the exact same candidate, duplicate, and incompatible-format
 /// resolution rules as ordinary Evidence consumers, but it must not repair HEAD.
 /// The mode-specific opener is the sole difference; registry entries and hints are
 /// still non-authoritative candidates.
-pub(crate) fn resolve_evidence_scope_target(
-    scope_id: &str,
-    scope_path_hint: Option<&str>,
-) -> Result<ScopeTarget> {
-    resolve_evidence_scope_target_with_snapshot(scope_id, scope_path_hint)
-}
-
 /// Evidence resolution takes exactly one owned registry snapshot per resolution.
 /// The snapshot supplies both the live-candidate union and the final
 /// incompatible-format peek; unsafe or unstable registry state is a command
 /// failure, never a reason to bypass the registry using a hint or CWD.
-fn resolve_evidence_scope_target_with_snapshot(
+pub(crate) fn resolve_evidence_scope_target(
+    cwd: &Path,
+    registry_input: &EvidenceRegistry,
     scope_id: &str,
     scope_path_hint: Option<&str>,
 ) -> Result<ScopeTarget> {
-    let registry_path = evidence_registry_path().map_err(|error| {
-        registry_snapshot_transient_error(
-            Path::new("<unresolved>"),
-            "path_resolution",
-            error.to_string(),
-        )
-    })?;
+    let registry_path = registry_input.path()?;
     let registry = match RegistryDb::open_read_only(&registry_path) {
         Ok(registry) => Some(registry),
         Err(RegistrySnapshotError::Missing) => None,
@@ -13776,7 +13758,7 @@ fn resolve_evidence_scope_target_with_snapshot(
     // A cache miss alone retains the documented hint/CWD recovery path.  The
     // branches above deliberately returned before this point for every unsafe,
     // unstable, busy, copy/open/query, or TOCTOU snapshot outcome.
-    if let Some(target) = current_scope_target_with_mode(ScopeResolutionMode::EvidenceReadOnly)
+    if let Some(target) = current_scope_target_with_mode(cwd, ScopeResolutionMode::EvidenceReadOnly)
         .ok()
         .filter(|target| target.scope_id == scope_id)
     {
@@ -13790,47 +13772,13 @@ fn resolve_evidence_scope_target_with_snapshot(
         candidate_roots.push(PathBuf::from(hint));
     }
     candidate_roots.extend(entries.iter().map(|entry| PathBuf::from(&entry.root_path)));
-    if let Ok(cwd) = context_working_directory() {
-        candidate_roots.push(cwd);
-    }
+    candidate_roots.push(cwd.to_path_buf());
     for root in candidate_roots {
         if let Some(version) = peek_incompatible_format_version(&root, scope_id) {
             return Err(KioError::incompatible_format(version));
         }
     }
     Err(scope_unreachable_error(scope_id))
-}
-
-#[cfg(test)]
-thread_local! {
-    static EVIDENCE_REGISTRY_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const {
-        std::cell::RefCell::new(None)
-    };
-}
-
-fn evidence_registry_path() -> kio_index::Result<PathBuf> {
-    #[cfg(test)]
-    if let Some(path) = EVIDENCE_REGISTRY_PATH_OVERRIDE.with(|slot| slot.borrow().clone()) {
-        return Ok(path);
-    }
-    default_registry_path()
-}
-
-#[cfg(test)]
-fn with_evidence_registry_path_for_test<T>(path: PathBuf, run: impl FnOnce() -> T) -> T {
-    struct RegistryPathGuard(Option<PathBuf>);
-
-    impl Drop for RegistryPathGuard {
-        fn drop(&mut self) {
-            EVIDENCE_REGISTRY_PATH_OVERRIDE.with(|slot| {
-                slot.replace(self.0.take());
-            });
-        }
-    }
-
-    let previous = EVIDENCE_REGISTRY_PATH_OVERRIDE.with(|slot| slot.replace(Some(path)));
-    let _guard = RegistryPathGuard(previous);
-    run()
 }
 
 fn resolve_scope_id_from_registry_entries(
@@ -13935,6 +13883,7 @@ enum ScopeResolutionMode {
 }
 
 fn resolve_scope_target_with_mode(
+    cwd: &Path,
     scope_id: &str,
     scope_path_hint: Option<&str>,
     mode: ScopeResolutionMode,
@@ -13952,7 +13901,7 @@ fn resolve_scope_target_with_mode(
     // Pragmatic fallback: the current working directory when it *is* the scope.
     // Object URIs carry no scope_path hint, and a freshly-created scope may not
     // yet be listed in the registry. Still gated on scope_id equality.
-    if let Some(target) = current_scope_target_with_mode(mode)
+    if let Some(target) = current_scope_target_with_mode(cwd, mode)
         .ok()
         .filter(|target| target.scope_id == scope_id)
     {
@@ -13984,9 +13933,7 @@ fn resolve_scope_target_with_mode(
                 .map(|entry| PathBuf::from(entry.root_path)),
         );
     }
-    if let Ok(cwd) = context_working_directory() {
-        candidate_roots.push(cwd);
-    }
+    candidate_roots.push(cwd.to_path_buf());
     for root in candidate_roots {
         if let Some(version) = peek_incompatible_format_version(&root, scope_id) {
             return Err(KioError::incompatible_format(version));
@@ -14009,14 +13956,14 @@ fn scope_target_with_mode(root: &Path, mode: ScopeResolutionMode) -> Result<Scop
     }
 }
 
-fn current_scope_target_with_mode(mode: ScopeResolutionMode) -> Result<ScopeTarget> {
+fn current_scope_target_with_mode(cwd: &Path, mode: ScopeResolutionMode) -> Result<ScopeTarget> {
     match mode {
         ScopeResolutionMode::Normal => {
-            let repo = open_current_recovery_repository()?;
+            let repo = Repository::open_for_recovery(cwd)?;
             scope_target(repo.root())
         }
         ScopeResolutionMode::EvidenceReadOnly => {
-            let cwd = context_working_directory()?;
+            let cwd = cwd.to_path_buf();
             scope_target_with_mode(&cwd, mode)
         }
     }
@@ -15112,9 +15059,9 @@ fn parse_object_uri(input: &str) -> Result<Option<ObjectUri>> {
 
 /// Resolves an `object` reference URI (08 §2.3) for `kio open` / `kio view`.
 /// This is a distinct path from Evidence Pointer resolution.
-fn resolve_object_uri(object: &ObjectUri, as_view: bool) -> Result<Value> {
+fn resolve_object_uri(ctx: &AppContext, object: &ObjectUri, as_view: bool) -> Result<Value> {
     let status = if as_view { "viewed" } else { "opened" };
-    let target = resolve_scope_target(&object.scope_id, None)?;
+    let target = resolve_scope_target(ctx.cwd(), &object.scope_id, None)?;
     // QB6 (step4b-contract-tests-p3b.md §A, 10 §3 L300-305): (0)
     // kio_format_version compatibility, checked before (1)/(3) below. This
     // object-URI path previously never opened a `Repository` at all — every
@@ -15344,7 +15291,7 @@ fn search_to_kio(error: kio_search::SearchError) -> KioError {
     }
 }
 
-fn run_batch(args: BatchArgs) -> Result<Value> {
+fn run_batch(ctx: &AppContext, args: BatchArgs) -> Result<Value> {
     validate_batch_args(&args)?;
     // Same lane contract as `run_index`: resume/retry drive real online sends,
     // so the invocation lane has to be resolved before any of them is planned.
@@ -15353,7 +15300,7 @@ fn run_batch(args: BatchArgs) -> Result<Value> {
         Some(BatchCommand::Retry(retry)) => LaneOverride::new(retry.realtime, retry.batch),
         Some(BatchCommand::Abandon(_)) | None => LaneOverride::default(),
     };
-    let repo = open_current_recovery_repository()?;
+    let repo = ctx.open_recovery_repository()?;
     resolve_invocation_lane(lane_override, Some(&repo.kio_dir().join("config.toml")))?;
     // O3: `batch resume` / `batch retry` read-modify-write `tasks.jsonl` and drive
     // online sends, so hold the folder store lock end-to-end — the same guard M1
@@ -15372,19 +15319,21 @@ fn run_batch(args: BatchArgs) -> Result<Value> {
     match &args.command {
         Some(BatchCommand::Retry(retry)) if retry.reset_violations.is_some() => {
             return run_batch_reset_violations(
+                ctx,
                 retry.reset_violations.as_deref().expect("validated above"),
                 retry.yes,
             );
         }
         Some(BatchCommand::Retry(retry)) if retry.resend_unknown.is_some() => {
             return run_batch_resend_unknown(
+                ctx,
                 &repo,
                 retry.resend_unknown.as_deref().expect("validated above"),
                 retry.yes,
             );
         }
         Some(BatchCommand::Abandon(abandon)) => {
-            return run_batch_abandon(&abandon.selector, abandon.yes);
+            return run_batch_abandon(ctx, &abandon.selector, abandon.yes);
         }
         _ => {}
     }
@@ -15613,12 +15562,14 @@ fn validate_batch_args(args: &BatchArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_adapter(args: AdapterArgs) -> Result<Value> {
+fn run_adapter(ctx: &AppContext, args: AdapterArgs) -> Result<Value> {
     match args.command {
-        Some(AdapterCommand::Approve(args)) => approvals::approve(args),
-        Some(AdapterCommand::Revoke(args)) => approvals::revoke(args),
-        Some(AdapterCommand::Status(args)) => approvals::status(args),
-        Some(AdapterCommand::Trust(command)) => trust::run(command),
+        Some(AdapterCommand::Approve(args)) => {
+            approvals::approve(ctx, args, &approvals::ApprovalControl::default())
+        }
+        Some(AdapterCommand::Revoke(args)) => approvals::revoke(ctx, args),
+        Some(AdapterCommand::Status(args)) => approvals::status(ctx, args),
+        Some(AdapterCommand::Trust(command)) => trust::run(&trust::directory_path(), command),
         None => Err(KioError::invalid_usage(
             "adapter requires approve, revoke, status, or trust",
         )),
@@ -16287,16 +16238,16 @@ fn parse_batch_selector(input: &str) -> Result<AbandonSelector> {
 
 /// Batch mutations need explicit `--yes` in non-interactive mode. A piped
 /// response is never an approval: it is not reviewable at the terminal.
-fn confirm_batch_mutation(prompt: &str, yes: bool) -> Result<()> {
+fn confirm_batch_mutation(ctx: &AppContext, prompt: &str, yes: bool) -> Result<()> {
     if yes {
         return Ok(());
     }
-    if !context::is_interactive()? {
+    if !ctx.interaction.is_interactive() {
         return Err(batch_confirmation_rejected(
             "batch mutation requires --yes in non-interactive mode",
         ));
     }
-    if confirm_batch_action(&format!("{prompt} [y/N]"))? {
+    if confirm_batch_action(ctx, &format!("{prompt} [y/N]"))? {
         Ok(())
     } else {
         Err(batch_confirmation_rejected(
@@ -16307,8 +16258,8 @@ fn confirm_batch_mutation(prompt: &str, yes: bool) -> Result<()> {
 
 /// Shared terminal prompt for commands whose individual handlers decide
 /// whether non-interactive confirmation is permitted.
-fn confirm_batch_action(prompt: &str) -> Result<bool> {
-    context::confirm(prompt)
+fn confirm_batch_action(ctx: &AppContext, prompt: &str) -> Result<bool> {
+    ctx.interaction.confirm(prompt)
 }
 
 /// 06 §1 requires a confirmation prompt before `repair verify-objects
@@ -16327,12 +16278,12 @@ const REPAIR_PRUNE_PROMPT_MAX_LINES: usize = 20;
 /// H2-3 (R24b, 3/3 系統一致): the spec says 削除対象を先に列挙して見せてから問う
 /// — show WHAT will be deleted, then ask. This used to take only a count, so
 /// the user approved a number and never saw the objects behind it.
-fn confirm_repair_prune(what: &str, targets: &[String], yes: bool) -> Result<()> {
+fn confirm_repair_prune(ctx: &AppContext, what: &str, targets: &[String], yes: bool) -> Result<()> {
     let count = targets.len() as u64;
     if count == 0 || yes {
         return Ok(());
     }
-    if !context::is_interactive()? {
+    if !ctx.interaction.is_interactive() {
         return Err(KioError::new(
             "KIO-E-CONFIRM-REJECTED-001",
             format!("repair {what} requires confirmation; pass --yes in non-interactive mode"),
@@ -16352,7 +16303,7 @@ fn confirm_repair_prune(what: &str, targets: &[String], yes: bool) -> Result<()>
         preview.push_str(&format!("  … and {rest} more\n"));
     }
     preview.push_str("Proceed?");
-    if confirm_batch_action(&preview)? {
+    if confirm_batch_action(ctx, &preview)? {
         return Ok(());
     }
     Err(KioError::new(
@@ -16374,7 +16325,7 @@ fn batch_confirmation_rejected(message: &str) -> KioError {
 
 /// `kio batch abandon <selector>` (06 §1 / 04 §5.8 恒久 unknown 脱出路,
 /// CL62-CL68). Runs inside `run_batch`'s already-acquired `.kio/.lock`.
-fn run_batch_abandon(selector_input: &str, yes: bool) -> Result<Value> {
+fn run_batch_abandon(ctx: &AppContext, selector_input: &str, yes: bool) -> Result<Value> {
     let selector = parse_batch_selector(selector_input)?;
     let ledger = open_ledger_db()?;
     let resolution = resolve_abandon_selector(&ledger, &selector).map_err(pipeline_to_kio)?;
@@ -16389,6 +16340,7 @@ fn run_batch_abandon(selector_input: &str, yes: bool) -> Result<Value> {
         )),
         AbandonResolution::Found(key) => {
             confirm_batch_mutation(
+                ctx,
                 &format!(
                     "Abandon in-flight batch request for {}/{}/{}?",
                     key.scope_id, key.adapter_kind, key.input_hash
@@ -16410,7 +16362,7 @@ fn run_batch_abandon(selector_input: &str, yes: bool) -> Result<Value> {
 }
 
 /// `kio batch retry --reset-violations <selector>` (06 §1 L26-30, §M note-6).
-fn run_batch_reset_violations(selector_input: &str, yes: bool) -> Result<Value> {
+fn run_batch_reset_violations(ctx: &AppContext, selector_input: &str, yes: bool) -> Result<Value> {
     let selector = parse_batch_selector(selector_input)?;
     let ledger = open_ledger_db()?;
     let resolution = resolve_abandon_selector(&ledger, &selector).map_err(pipeline_to_kio)?;
@@ -16422,6 +16374,7 @@ fn run_batch_reset_violations(selector_input: &str, yes: bool) -> Result<Value> 
         )),
         AbandonResolution::Found(key) => {
             confirm_batch_mutation(
+                ctx,
                 &format!(
                     "Reset contract_violation_count for {}/{}/{}?",
                     key.scope_id, key.adapter_kind, key.input_hash
@@ -16445,7 +16398,12 @@ fn run_batch_reset_violations(selector_input: &str, yes: bool) -> Result<Value> 
 /// Explicitly authorize one fresh synchronous request after an unknown result.
 /// This command never contacts an adapter: it only changes the ledger's
 /// one-shot fence and requeues the exact current task for a later online pass.
-fn run_batch_resend_unknown(repo: &Repository, selector_input: &str, yes: bool) -> Result<Value> {
+fn run_batch_resend_unknown(
+    ctx: &AppContext,
+    repo: &Repository,
+    selector_input: &str,
+    yes: bool,
+) -> Result<Value> {
     let selector = parse_batch_selector(selector_input)?;
     let ledger = open_ledger_db()?;
     let resolution = resolve_abandon_selector(&ledger, &selector).map_err(pipeline_to_kio)?;
@@ -16522,6 +16480,7 @@ fn run_batch_resend_unknown(repo: &Repository, selector_input: &str, yes: bool) 
         ));
     }
     confirm_batch_mutation(
+        ctx,
         &format!(
             "Authorize a fresh charged sync request after an unknown prior result for {}/{}/{}?",
             key.scope_id, key.adapter_kind, key.input_hash

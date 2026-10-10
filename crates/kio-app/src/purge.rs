@@ -5,6 +5,8 @@
 //! shallow.  Mutable manifests and index/cache projections are never accepted as
 //! purge truth.
 
+use crate::context::AppContext;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
@@ -139,8 +141,8 @@ struct PurgeReport {
     log_fields_masked: u64,
 }
 
-pub(crate) fn run(args: PurgeArgs) -> Result<Value> {
-    let repo = crate::open_current_recovery_repository()?;
+pub(crate) fn run(ctx: &AppContext, args: PurgeArgs) -> Result<Value> {
+    let repo = ctx.open_recovery_repository()?;
     // Orphan cleanup is transaction recovery, not target mutation. Run it under
     // the store lock before preview/working-copy refusal so a tombstoned raw temp
     // is removed even when the requested purge cannot proceed.
@@ -156,7 +158,7 @@ pub(crate) fn run(args: PurgeArgs) -> Result<Value> {
         cleanup_orphan_raw_ingest_temps(repo.kio_dir())?;
     }
     let preview = preflight(&repo, &args)?;
-    confirm(&preview, args.yes)?;
+    confirm(ctx, &preview, args.yes)?;
     execute_phase_machine(&repo, &args, &preview)
 }
 
@@ -2929,7 +2931,7 @@ fn purge_not_found() -> KioError {
     )
 }
 
-fn confirm(preview: &PurgePreview, yes: bool) -> Result<()> {
+fn confirm(ctx: &AppContext, preview: &PurgePreview, yes: bool) -> Result<()> {
     if yes {
         return Ok(());
     }
@@ -2969,7 +2971,10 @@ fn confirm(preview: &PurgePreview, yes: bool) -> Result<()> {
 
     // Bound confirmation input so a hostile pipe cannot force an unbounded
     // allocation. Inputs longer than 32 bytes simply fail the exact y/yes check.
-    if crate::context::confirm("Remove this content from KIO-managed history? [y/N]")? {
+    if ctx
+        .interaction
+        .confirm("Remove this content from KIO-managed history? [y/N]")?
+    {
         return Ok(());
     }
 

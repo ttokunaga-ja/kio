@@ -9,19 +9,20 @@ use kio_core::{ExitCode, KioError, Result};
 use serde_json::{Value, json};
 
 use crate::commands::RestoreArgs;
+use crate::context::AppContext;
 use crate::management::open_existing_managed_root;
 use crate::{
-    binding_for_repo, context_working_directory, current_embedding_policy,
-    mark_replica_rebuilding_or_log, mark_replica_unavailable_or_log, pipeline_to_kio,
-    rebuild_step3_index, recover_index_generation, set_exit_override, validate_repo_tool_lock,
+    binding_for_repo, current_embedding_policy, mark_replica_rebuilding_or_log,
+    mark_replica_unavailable_or_log, pipeline_to_kio, rebuild_step3_index,
+    recover_index_generation, set_exit_override, validate_repo_tool_lock,
     write_through_projection_full,
 };
 
-pub(super) fn run(args: RestoreArgs) -> Result<Value> {
+pub(super) fn run(ctx: &AppContext, args: RestoreArgs) -> Result<Value> {
     // This is intentionally the strict, bound managed-root open.  In
     // particular, restore never invokes the recovery opener, so --preview has
     // no publication, index, ledger, or working-tree side effect.
-    let repo = open_existing_managed_root(&context_working_directory()?)?;
+    let repo = open_existing_managed_root(ctx.cwd())?;
     validate_repo_tool_lock(&repo)?;
     let source_commit = repo.resolve_commit(&args.source)?;
     let policy = current_embedding_policy(&repo)?;
@@ -107,8 +108,8 @@ pub(super) fn run(args: RestoreArgs) -> Result<Value> {
 /// `repair recover-restore` is intentionally distinct from ordinary
 /// publication recovery.  A pending restore journal governs working bytes and
 /// must be resolved by core before any generic publication-recovery pathway.
-pub(super) fn recover() -> Result<Value> {
-    let repo = Repository::open_for_recovery(context_working_directory()?)?;
+pub(super) fn recover(ctx: &AppContext) -> Result<Value> {
+    let repo = Repository::open_for_recovery(ctx.cwd())?;
     validate_repo_tool_lock(&repo)?;
     // Recovery has to be possible when the policy that permitted the original
     // restore has since denied a path.  Validate the retained management

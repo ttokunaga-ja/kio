@@ -4,6 +4,8 @@
 //! lock remains the liveness authority; scheduler state can only describe what
 //! the OS has registered or been asked to start.
 
+use crate::context::AppContext;
+
 use std::env;
 use std::fs::{self, File};
 use std::io::Read;
@@ -74,26 +76,30 @@ pub(crate) enum NativeRegistration {
     Foreign,
 }
 
-pub(crate) fn run(root_argument: Option<PathBuf>, command: WatchServiceCommand) -> Result<Value> {
+pub(crate) fn run(
+    ctx: &AppContext,
+    root_argument: Option<PathBuf>,
+    command: WatchServiceCommand,
+) -> Result<Value> {
     match command {
         WatchServiceCommand::Install {
             reconcile_interval_seconds,
-        } => install(root_argument, reconcile_interval_seconds),
-        WatchServiceCommand::Start => mutate_existing(root_argument, Lifecycle::Start),
-        WatchServiceCommand::Stop => mutate_existing(root_argument, Lifecycle::Stop),
-        WatchServiceCommand::Status => status(root_argument),
-        WatchServiceCommand::Uninstall => mutate_existing(root_argument, Lifecycle::Uninstall),
+        } => install(ctx, root_argument, reconcile_interval_seconds),
+        WatchServiceCommand::Start => mutate_existing(ctx, root_argument, Lifecycle::Start),
+        WatchServiceCommand::Stop => mutate_existing(ctx, root_argument, Lifecycle::Stop),
+        WatchServiceCommand::Status => status(ctx, root_argument),
+        WatchServiceCommand::Uninstall => mutate_existing(ctx, root_argument, Lifecycle::Uninstall),
         WatchServiceCommand::Runner { manifest } => run_watch_service_runner(manifest),
     }
 }
 
-fn install(root_argument: Option<PathBuf>, interval: u64) -> Result<Value> {
+fn install(ctx: &AppContext, root_argument: Option<PathBuf>, interval: u64) -> Result<Value> {
     if !(1..=86_400).contains(&interval) {
         return Err(invalid(
             "reconciliation interval must be 1 through 86400 seconds",
         ));
     }
-    let root = resolve_root(root_argument, true)?;
+    let root = resolve_root(ctx, root_argument, true)?;
     let repo = open_existing_managed_root(&root)?;
     let binding = binding_for_repo(&repo)?;
     let record = read_record(&binding)?;
@@ -218,8 +224,12 @@ enum Lifecycle {
     Uninstall,
 }
 
-fn mutate_existing(root_argument: Option<PathBuf>, lifecycle: Lifecycle) -> Result<Value> {
-    let (store, leaf, manifest) = find_manifest(root_argument)?;
+fn mutate_existing(
+    ctx: &AppContext,
+    root_argument: Option<PathBuf>,
+    lifecycle: Lifecycle,
+) -> Result<Value> {
+    let (store, leaf, manifest) = find_manifest(ctx, root_argument)?;
     let _native_location = NativeDefinitionLocation::admit(&manifest.native_path)?;
     let _mutation_lock = acquire_mutation_lock(&store, &manifest.id)?;
     // Re-read only after the retained OS lock is held.  A lifecycle operation
@@ -317,8 +327,8 @@ fn transition_checked<S: Scheduler>(
     }
 }
 
-fn status(root_argument: Option<PathBuf>) -> Result<Value> {
-    let (_, _, manifest) = find_manifest(root_argument)?;
+fn status(ctx: &AppContext, root_argument: Option<PathBuf>) -> Result<Value> {
+    let (_, _, manifest) = find_manifest(ctx, root_argument)?;
     let scheduler = NativeScheduler;
     let registration = scheduler.inspect(&manifest)?;
     if registration == NativeRegistration::Foreign {
@@ -341,9 +351,10 @@ fn status(root_argument: Option<PathBuf>) -> Result<Value> {
 }
 
 fn find_manifest(
+    ctx: &AppContext,
     root_argument: Option<PathBuf>,
 ) -> Result<(StoreDirectory, PathBuf, ServiceManifest)> {
-    let requested = resolve_root(root_argument, false)?;
+    let requested = resolve_root(ctx, root_argument, false)?;
     let store = manifest_store(false)?
         .ok_or_else(|| service_error("no watch service is installed for this root"))?;
     let Some(entries) = store.entries_optional(Path::new(MANIFEST_DIRECTORY))? else {
@@ -383,8 +394,12 @@ fn find_manifest(
     }
 }
 
-fn resolve_root(root_argument: Option<PathBuf>, require_existing: bool) -> Result<PathBuf> {
-    let cwd = crate::context_working_directory()?;
+fn resolve_root(
+    ctx: &AppContext,
+    root_argument: Option<PathBuf>,
+    require_existing: bool,
+) -> Result<PathBuf> {
+    let cwd = ctx.cwd().to_path_buf();
     let path = root_argument.unwrap_or(cwd.clone());
     let absolute = if path.is_absolute() {
         path

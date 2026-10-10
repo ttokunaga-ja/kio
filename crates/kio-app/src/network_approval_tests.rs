@@ -15,21 +15,6 @@ use crate::context::{AppContext, Interaction};
 
 const TOOL_ID: &str = "mistral_ocr_markdownize";
 
-struct StopAfterReset;
-
-impl StopAfterReset {
-    fn set(phase: &'static str) -> Self {
-        super::approvals::STOP_AFTER.with(|stop_after| stop_after.set(Some(phase)));
-        Self
-    }
-}
-
-impl Drop for StopAfterReset {
-    fn drop(&mut self) {
-        super::approvals::STOP_AFTER.with(|stop_after| stop_after.set(None));
-    }
-}
-
 struct EnvironmentGuard {
     variables: Vec<(&'static str, Option<OsString>)>,
 }
@@ -153,27 +138,44 @@ impl Fixture {
         resume: Option<String>,
         send_secrets: bool,
     ) -> kio_core::Result<Value> {
-        self.in_context(|| {
-            super::approvals::approve(ApproveArgs {
-                target,
-                preview: false,
-                yes: true,
-                resume,
-                send_secrets,
-            })
+        self.approve_with_control(target, resume, send_secrets, None)
+    }
+
+    fn approve_with_control(
+        &self,
+        target: AdapterTarget,
+        resume: Option<String>,
+        send_secrets: bool,
+        stop_after: Option<&'static str>,
+    ) -> kio_core::Result<Value> {
+        self.in_context(|ctx| {
+            super::approvals::approve(
+                ctx,
+                ApproveArgs {
+                    target,
+                    preview: false,
+                    yes: true,
+                    resume,
+                    send_secrets,
+                },
+                &super::approvals::ApprovalControl { stop_after },
+            )
         })
     }
 
     fn status(&self) -> Value {
-        self.in_context(|| super::approvals::status(AdapterStatusArgs { tool_id: None }))
+        self.in_context(|ctx| super::approvals::status(ctx, AdapterStatusArgs { tool_id: None }))
             .unwrap()
     }
 
     fn revoke(&self) -> Value {
-        self.in_context(|| {
-            super::approvals::revoke(RevokeArgs {
-                target: AdapterTarget::Tool(TOOL_ID.to_owned()),
-            })
+        self.in_context(|ctx| {
+            super::approvals::revoke(
+                ctx,
+                RevokeArgs {
+                    target: AdapterTarget::Tool(TOOL_ID.to_owned()),
+                },
+            )
         })
         .unwrap()
     }
@@ -202,7 +204,7 @@ impl Fixture {
 
     fn in_context<T>(
         &self,
-        operation: impl FnOnce() -> kio_core::Result<T>,
+        operation: impl FnOnce(&AppContext) -> kio_core::Result<T>,
     ) -> kio_core::Result<T> {
         self.in_context_at(&self.root, operation)
     }
@@ -210,13 +212,13 @@ impl Fixture {
     fn in_context_at<T>(
         &self,
         root: &Path,
-        operation: impl FnOnce() -> kio_core::Result<T>,
+        operation: impl FnOnce(&AppContext) -> kio_core::Result<T>,
     ) -> kio_core::Result<T> {
         let context = AppContext {
             working_directory: root.to_path_buf(),
             interaction: Arc::new(TestInteraction),
         };
-        crate::context::with_context(&context, operation)
+        operation(&context)
     }
 }
 
@@ -307,9 +309,12 @@ fn snapshot_tree(root: &Path) -> Vec<(PathBuf, Vec<u8>)> {
 
 #[test]
 fn revoke_rejects_an_invalid_target_before_repository_access() {
-    let error = super::approvals::revoke(RevokeArgs {
-        target: AdapterTarget::Tool("\n".to_owned()),
-    })
+    let error = super::approvals::revoke(
+        &crate::context::test_support::context(Path::new("unused-argument-validation")),
+        RevokeArgs {
+            target: AdapterTarget::Tool("\n".to_owned()),
+        },
+    )
     .expect_err("control characters are not adapter identifiers");
     assert_eq!(error.error_code(), "KIO-E-CONFIG-USAGE-001");
 }
@@ -321,14 +326,18 @@ fn preview_and_status_are_readonly_and_do_not_create_or_repair_grants() {
     assert!(!fixture.grant_path().exists());
 
     let preview = fixture
-        .in_context(|| {
-            super::approvals::approve(ApproveArgs {
-                target: AdapterTarget::All,
-                preview: true,
-                yes: false,
-                resume: None,
-                send_secrets: true,
-            })
+        .in_context(|ctx| {
+            super::approvals::approve(
+                ctx,
+                ApproveArgs {
+                    target: AdapterTarget::All,
+                    preview: true,
+                    yes: false,
+                    resume: None,
+                    send_secrets: true,
+                },
+                &super::approvals::ApprovalControl::default(),
+            )
         })
         .unwrap();
     assert_eq!(preview["status"], "preview");
@@ -353,13 +362,16 @@ fn interrupted_approval_recovers_only_with_the_exact_pending_pair_and_resume_sel
         "device_active",
     ] {
         let fixture = Fixture::new();
-        let reset = StopAfterReset::set(phase);
         let error = fixture
-            .approve_with(AdapterTarget::Tool(TOOL_ID.to_owned()), None, true)
+            .approve_with_control(
+                AdapterTarget::Tool(TOOL_ID.to_owned()),
+                None,
+                true,
+                Some(phase),
+            )
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-APPROVAL-TEST-INTERRUPTED-001");
         assert_eq!(error.context()["phase"], phase);
-        drop(reset);
 
         let status = fixture.status();
         let network_id = network_grant_id(&status);
@@ -435,12 +447,15 @@ fn interrupted_approval_recovers_only_with_the_exact_pending_pair_and_resume_sel
 #[test]
 fn revoke_after_an_interrupted_pair_prevents_resume_and_any_send() {
     let fixture = Fixture::new();
-    let reset = StopAfterReset::set("scope_pending");
     let error = fixture
-        .approve_with(AdapterTarget::Tool(TOOL_ID.to_owned()), None, true)
+        .approve_with_control(
+            AdapterTarget::Tool(TOOL_ID.to_owned()),
+            None,
+            true,
+            Some("scope_pending"),
+        )
         .unwrap_err();
     assert_eq!(error.error_code(), "KIO-E-APPROVAL-TEST-INTERRUPTED-001");
-    drop(reset);
 
     let status = fixture.status();
     let network_id = network_grant_id(&status);
@@ -548,14 +563,18 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
         let profile = super::declared_embedding_profile(super::embedding_execution().unwrap());
         let target = AdapterTarget::Tool(profile.tool_id.clone());
         let preview = fixture
-            .in_context(|| {
-                super::approvals::approve(ApproveArgs {
-                    target: target.clone(),
-                    preview: true,
-                    yes: false,
-                    resume: None,
-                    send_secrets: true,
-                })
+            .in_context(|ctx| {
+                super::approvals::approve(
+                    ctx,
+                    ApproveArgs {
+                        target: target.clone(),
+                        preview: true,
+                        yes: false,
+                        resume: None,
+                        send_secrets: true,
+                    },
+                    &super::approvals::ApprovalControl::default(),
+                )
             })
             .unwrap();
         assert_eq!(preview["adapters"][0]["tool_id"], profile.tool_id);
@@ -777,14 +796,18 @@ fn ancestor_reregistration_invalidates_a_childs_network_and_secret_grants() {
         panic!("child must be managed");
     };
     fixture
-        .in_context_at(&child_path, || {
-            super::approvals::approve(ApproveArgs {
-                target: AdapterTarget::Tool(TOOL_ID.to_owned()),
-                preview: false,
-                yes: true,
-                resume: None,
-                send_secrets: true,
-            })
+        .in_context_at(&child_path, |ctx| {
+            super::approvals::approve(
+                ctx,
+                ApproveArgs {
+                    target: AdapterTarget::Tool(TOOL_ID.to_owned()),
+                    preview: false,
+                    yes: true,
+                    resume: None,
+                    send_secrets: true,
+                },
+                &super::approvals::ApprovalControl::default(),
+            )
         })
         .unwrap();
     let profile = child
@@ -855,12 +878,15 @@ fn ancestor_reregistration_invalidates_a_childs_network_and_secret_grants() {
 #[test]
 fn reregistration_makes_an_old_pending_approval_unresumable() {
     let fixture = Fixture::new();
-    let reset = StopAfterReset::set("scope_pending");
     let error = fixture
-        .approve_with(AdapterTarget::Tool(TOOL_ID.to_owned()), None, true)
+        .approve_with_control(
+            AdapterTarget::Tool(TOOL_ID.to_owned()),
+            None,
+            true,
+            Some("scope_pending"),
+        )
         .unwrap_err();
     assert_eq!(error.error_code(), "KIO-E-APPROVAL-TEST-INTERRUPTED-001");
-    drop(reset);
     let pending = network_grant_id(&fixture.status());
     let grant_bytes = fs::read(fixture.grant_path()).unwrap();
     let pending_scope = fixture.repo.read_network_approval_pending().unwrap();

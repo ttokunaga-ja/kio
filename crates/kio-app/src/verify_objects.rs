@@ -1,5 +1,7 @@
 //! Bounded object-store verification for `repair verify-objects`.
 
+use crate::context::{AppContext, EvidenceRegistry};
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -140,27 +142,32 @@ const MAX_BATCH_RECORDS: usize = 4096;
 const MAX_BATCH_SCOPES: usize = 256;
 const MAX_BATCH_VERIFIED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-pub(super) fn run_evidence(args: EvidenceArgs) -> Result<Value> {
+pub(super) fn run_evidence(ctx: &AppContext, args: EvidenceArgs) -> Result<Value> {
+    let registry_input = &EvidenceRegistry::default();
     match args.command {
-        EvidenceCommand::Verify(args) => run_evidence_verify(args),
-        EvidenceCommand::Retarget(args) => run_evidence_retarget(args),
+        EvidenceCommand::Verify(args) => run_evidence_verify(ctx, registry_input, args),
+        EvidenceCommand::Retarget(args) => run_evidence_retarget(ctx, registry_input, args),
     }
 }
 
-fn run_evidence_verify(args: EvidenceVerifyArgs) -> Result<Value> {
+fn run_evidence_verify(
+    ctx: &AppContext,
+    registry_input: &EvidenceRegistry,
+    args: EvidenceVerifyArgs,
+) -> Result<Value> {
     if let Some(batch) = args.batch {
-        return run_evidence_batch(&batch, args.strict);
+        return run_evidence_batch(ctx, registry_input, &batch, args.strict);
     }
     let pointer_operand = args.pointer.expect("clap requires pointer or --batch");
     let strict = args.strict;
-    let raw = read_pointer_input(vec![pointer_operand])?;
+    let raw = read_pointer_input(ctx, vec![pointer_operand])?;
     if raw.starts_with("sha256:") || parse_object_uri(&raw)?.is_some() {
         return Err(KioError::invalid_usage(
             "evidence verify accepts only a pointer URI, inline JSON, or '-' stdin",
         ));
     }
     let pointer = parse_pointer_text(&raw)?;
-    let verification = verify_pointer_for_cli(&pointer, strict)?;
+    let verification = verify_pointer_for_cli(ctx, registry_input, &pointer, strict)?;
     let mut output = verification.value()?;
     if verification.exit != ExitCode::Success {
         set_exit_override(&mut output, verification.exit);
@@ -265,13 +272,17 @@ fn retarget_old_verification_error(
 /// Exact, history-pinned Evidence reissue.  SQLite is used only to enumerate
 /// bounded possible chunks; every authority used below comes from the target
 /// tree, manifest/unit CAS, and chunk CAS.
-fn run_evidence_retarget(args: EvidenceRetargetArgs) -> Result<Value> {
+fn run_evidence_retarget(
+    ctx: &AppContext,
+    registry_input: &EvidenceRegistry,
+    args: EvidenceRetargetArgs,
+) -> Result<Value> {
     if !is_hash(&args.at) {
         return Err(KioError::invalid_usage(
             "--at must be a full lowercase `sha256:` object hash",
         ));
     }
-    let raw = read_pointer_input(vec![args.pointer])?;
+    let raw = read_pointer_input(ctx, vec![args.pointer])?;
     if raw.starts_with("sha256:") || parse_object_uri(&raw)?.is_some() {
         return Err(KioError::invalid_usage(
             "evidence retarget accepts only a pointer URI, inline JSON, or '-' stdin",
@@ -279,7 +290,7 @@ fn run_evidence_retarget(args: EvidenceRetargetArgs) -> Result<Value> {
     }
     let pointer = parse_pointer_text(&raw)?;
     kio_core::cas::with_verified_cas_read_budget(MAX_RETARGET_VERIFIED_BYTES, || {
-        run_evidence_retarget_bound(&pointer, &args.at)
+        run_evidence_retarget_bound(ctx, registry_input, &pointer, &args.at)
     })
     .map(|(value, _)| value)
     .map_err(|error| {
@@ -294,8 +305,13 @@ fn run_evidence_retarget(args: EvidenceRetargetArgs) -> Result<Value> {
     })
 }
 
-fn run_evidence_retarget_bound(pointer: &EvidencePointer, at: &str) -> Result<Value> {
-    let binding = bind_evidence_scope(pointer, true)?;
+fn run_evidence_retarget_bound(
+    ctx: &AppContext,
+    registry_input: &EvidenceRegistry,
+    pointer: &EvidencePointer,
+    at: &str,
+) -> Result<Value> {
+    let binding = bind_evidence_scope(ctx, registry_input, pointer, true)?;
     let EvidenceScopeState::Ready {
         target,
         repo,
@@ -352,7 +368,7 @@ fn run_evidence_retarget_bound(pointer: &EvidencePointer, at: &str) -> Result<Va
     if let Some(marker_verification) =
         canonical_pointer_marker_verification(pointer, true, target, &store, checkpoint)?
     {
-        binding.recheck()?;
+        binding.recheck(ctx, registry_input)?;
         return Err(retarget_old_verification_error(
             marker_verification,
             pointer,
@@ -372,7 +388,7 @@ fn run_evidence_retarget_bound(pointer: &EvidencePointer, at: &str) -> Result<Va
     if canonical.result.status != EvidenceStatus::Alive {
         // A final retained binding check takes precedence over a stale
         // classification produced before a concurrent purge/index change.
-        binding.recheck()?;
+        binding.recheck(ctx, registry_input)?;
         return Err(retarget_old_verification_error(canonical, pointer));
     }
     let old_tree = old_tree.ok_or_else(|| {
@@ -521,7 +537,7 @@ fn run_evidence_retarget_bound(pointer: &EvidencePointer, at: &str) -> Result<Va
         return Err(retarget_ambiguous_error());
     }
     let (chunk_hash, chunk) = first_match.ok_or_else(retarget_not_found_error)?;
-    binding.recheck()?;
+    binding.recheck(ctx, registry_input)?;
     // Re-read the exact target object/tree after all candidate CAS reads.
     recheck_retarget_target(repo, at, &target_commit, &target_tree)?;
     let issued = issue_evidence_pointer(EvidencePointerIssueRequest {
@@ -539,11 +555,11 @@ fn run_evidence_retarget_bound(pointer: &EvidencePointer, at: &str) -> Result<Va
         byte_end: Some(chunk.byte_end),
     })
     .map_err(search_to_kio)?;
-    let verification = verify_pointer_for_cli(&issued, true)?;
+    let verification = verify_pointer_for_cli(ctx, registry_input, &issued, true)?;
     // Drift checks take precedence over a stale final-verifier result.  Only
     // classify a stable non-alive result after every retained authority still
     // denotes the command-start snapshot.
-    binding.recheck()?;
+    binding.recheck(ctx, registry_input)?;
     recheck_retarget_target(repo, at, &target_commit, &target_tree)?;
     if verification.result.status != EvidenceStatus::Alive {
         return Err(retarget_not_found_error());
@@ -657,6 +673,8 @@ fn recheck_retarget_target(
 }
 
 fn verify_batch_row(
+    ctx: &AppContext,
+    registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     strict: bool,
     bindings: &[EvidenceScopeBinding],
@@ -685,7 +703,7 @@ fn verify_batch_row(
     };
     // Cache entries only avoid repeated object traversal. Every row, including
     // a duplicate cache hit, crosses the live scope/registry/index/read barrier.
-    binding.recheck()?;
+    binding.recheck(ctx, registry_input)?;
     cache.entry(key).or_insert_with(|| verification.clone());
     Ok(verification)
 }
@@ -697,6 +715,8 @@ fn evidence_pointer_cache_key(pointer: &EvidencePointer) -> Result<Vec<u8>> {
 }
 
 fn bind_batch_scopes(
+    ctx: &AppContext,
+    registry_input: &EvidenceRegistry,
     pointers: &[EvidencePointer],
     strict: bool,
 ) -> Result<Vec<EvidenceScopeBinding>> {
@@ -707,7 +727,7 @@ fn bind_batch_scopes(
         if !seen.insert(key) {
             continue;
         }
-        bindings.push(bind_evidence_scope(pointer, strict)?);
+        bindings.push(bind_evidence_scope(ctx, registry_input, pointer, strict)?);
     }
     Ok(bindings)
 }
@@ -828,8 +848,13 @@ fn batch_limit_error(line: usize, limit: &str, maximum: usize) -> KioError {
 /// downgrade (with resurrection-link fallback) all flow through the same
 /// judgment `resolve_pointer_for_cli` (open/view/restore) uses — PB66's
 /// structural requirement.
-fn verify_pointer_for_cli(pointer: &EvidencePointer, strict: bool) -> Result<EvidenceVerification> {
-    let binding = bind_evidence_scope(pointer, strict)?;
+fn verify_pointer_for_cli(
+    ctx: &AppContext,
+    registry_input: &EvidenceRegistry,
+    pointer: &EvidencePointer,
+    strict: bool,
+) -> Result<EvidenceVerification> {
+    let binding = bind_evidence_scope(ctx, registry_input, pointer, strict)?;
     match &binding.state {
         EvidenceScopeState::Unavailable(result) => Ok(result.clone()),
         EvidenceScopeState::Ready {
@@ -860,7 +885,7 @@ struct EvidenceScopeBinding {
 }
 
 impl EvidenceScopeBinding {
-    fn recheck(&self) -> Result<()> {
+    fn recheck(&self, ctx: &AppContext, registry_input: &EvidenceRegistry) -> Result<()> {
         match &self.state {
             EvidenceScopeState::Ready {
                 target,
@@ -869,21 +894,25 @@ impl EvidenceScopeBinding {
                 source_index,
                 ..
             } => {
-                let current =
-                    resolve_evidence_scope_target(&self.scope_id, self.scope_path.as_deref())
-                        .map_err(|error| {
-                            // A second resolver invocation is the existing
-                            // post-bind authority re-observation.  Only a known
-                            // target/index drift becomes BATCH-CHANGED; an unsafe
-                            // or unstable registry snapshot remains the original
-                            // command-level error and never turns into a nested
-                            // verification result.
-                            if is_registry_snapshot_error(&error) {
-                                error
-                            } else {
-                                batch_changed_error()
-                            }
-                        })?;
+                let current = resolve_evidence_scope_target(
+                    ctx.cwd(),
+                    registry_input,
+                    &self.scope_id,
+                    self.scope_path.as_deref(),
+                )
+                .map_err(|error| {
+                    // A second resolver invocation is the existing
+                    // post-bind authority re-observation.  Only a known
+                    // target/index drift becomes BATCH-CHANGED; an unsafe
+                    // or unstable registry snapshot remains the original
+                    // command-level error and never turns into a nested
+                    // verification result.
+                    if is_registry_snapshot_error(&error) {
+                        error
+                    } else {
+                        batch_changed_error()
+                    }
+                })?;
                 if current.repo_root != target.repo_root || current.kio_dir != target.kio_dir {
                     return Err(batch_changed_error());
                 }
@@ -904,6 +933,8 @@ impl EvidenceScopeBinding {
             }
             EvidenceScopeState::Unavailable(expected) => {
                 let current = unavailable_evidence_result(
+                    ctx,
+                    registry_input,
                     &self.scope_id,
                     self.scope_path.as_deref(),
                     expected.exit,
@@ -918,11 +949,13 @@ impl EvidenceScopeBinding {
 }
 
 fn unavailable_evidence_result(
+    ctx: &AppContext,
+    registry_input: &EvidenceRegistry,
     scope_id: &str,
     scope_path: Option<&str>,
     strict_exit: ExitCode,
 ) -> Result<EvidenceVerification> {
-    match resolve_evidence_scope_target(scope_id, scope_path) {
+    match resolve_evidence_scope_target(ctx.cwd(), registry_input, scope_id, scope_path) {
         Err(error) if error.error_code() == "KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001" => {
             Ok(EvidenceVerification::new(
                 EvidenceStatus::ScopeUnreachable,
@@ -955,43 +988,52 @@ fn is_registry_snapshot_error(error: &KioError) -> bool {
     )
 }
 
-fn bind_evidence_scope(pointer: &EvidencePointer, strict: bool) -> Result<EvidenceScopeBinding> {
-    let target =
-        match resolve_evidence_scope_target(&pointer.scope_id, pointer.scope_path.as_deref()) {
-            Ok(target) => target,
-            // PB53: a structured `status`, not a raw command failure — exit 0
-            // unless `--strict` (PB56 promotes it to 3).
-            Err(error) if error.error_code() == "KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001" => {
-                return Ok(EvidenceScopeBinding {
-                    scope_id: pointer.scope_id.clone(),
-                    scope_path: pointer.scope_path.clone(),
-                    state: EvidenceScopeState::Unavailable(EvidenceVerification::new(
-                        EvidenceStatus::ScopeUnreachable,
-                        Some(error.error_code()),
-                        error.context().clone(),
-                        if strict {
-                            ExitCode::PartialFailure
-                        } else {
-                            ExitCode::Success
-                        },
-                    )),
-                });
-            }
-            // PB54: live registry duplicate — exit 3 regardless of --strict.
-            Err(error) if error.error_code() == "KIO-E-REGISTRY-DUP-001" => {
-                return Ok(EvidenceScopeBinding {
-                    scope_id: pointer.scope_id.clone(),
-                    scope_path: pointer.scope_path.clone(),
-                    state: EvidenceScopeState::Unavailable(EvidenceVerification::new(
-                        EvidenceStatus::RegistryDuplicate,
-                        Some(error.error_code()),
-                        error.context().clone(),
-                        ExitCode::PartialFailure,
-                    )),
-                });
-            }
-            Err(error) => return Err(error),
-        };
+fn bind_evidence_scope(
+    ctx: &AppContext,
+    registry_input: &EvidenceRegistry,
+    pointer: &EvidencePointer,
+    strict: bool,
+) -> Result<EvidenceScopeBinding> {
+    let target = match resolve_evidence_scope_target(
+        ctx.cwd(),
+        registry_input,
+        &pointer.scope_id,
+        pointer.scope_path.as_deref(),
+    ) {
+        Ok(target) => target,
+        // PB53: a structured `status`, not a raw command failure — exit 0
+        // unless `--strict` (PB56 promotes it to 3).
+        Err(error) if error.error_code() == "KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001" => {
+            return Ok(EvidenceScopeBinding {
+                scope_id: pointer.scope_id.clone(),
+                scope_path: pointer.scope_path.clone(),
+                state: EvidenceScopeState::Unavailable(EvidenceVerification::new(
+                    EvidenceStatus::ScopeUnreachable,
+                    Some(error.error_code()),
+                    error.context().clone(),
+                    if strict {
+                        ExitCode::PartialFailure
+                    } else {
+                        ExitCode::Success
+                    },
+                )),
+            });
+        }
+        // PB54: live registry duplicate — exit 3 regardless of --strict.
+        Err(error) if error.error_code() == "KIO-E-REGISTRY-DUP-001" => {
+            return Ok(EvidenceScopeBinding {
+                scope_id: pointer.scope_id.clone(),
+                scope_path: pointer.scope_path.clone(),
+                state: EvidenceScopeState::Unavailable(EvidenceVerification::new(
+                    EvidenceStatus::RegistryDuplicate,
+                    Some(error.error_code()),
+                    error.context().clone(),
+                    ExitCode::PartialFailure,
+                )),
+            });
+        }
+        Err(error) => return Err(error),
+    };
     // PB57: sqlite.db missing/unavailable is a command-level retryable error
     // (never a `status` field), independent of `--strict` — the verification
     // itself has not run, so there is nothing to report as a result.
@@ -4313,28 +4355,32 @@ mod tests {
             scope_id: "batch-cache-final-recheck-unreachable".to_owned(),
             scope_path: Some(dir.path().join("missing-scope").display().to_string()),
         };
-        with_evidence_registry_path_for_test(registry_path.clone(), || {
-            let mut bindings = bind_batch_scopes(std::slice::from_ref(&pointer), false).unwrap();
-            let original = match &bindings[0].state {
-                EvidenceScopeState::Unavailable(result) => result.clone(),
-                EvidenceScopeState::Ready { .. } => panic!("fixture scope must be unreachable"),
-            };
-            let key = evidence_pointer_cache_key(&pointer).unwrap();
-            let mut cache = BTreeMap::from([(key, original)]);
+        let context = crate::context::test_support::context(dir.path());
+        let ctx = &context;
+        let registry = EvidenceRegistry::fixture(registry_path.clone());
+        let registry_input = &registry;
+        let mut bindings =
+            bind_batch_scopes(ctx, registry_input, std::slice::from_ref(&pointer), false).unwrap();
+        let original = match &bindings[0].state {
+            EvidenceScopeState::Unavailable(result) => result.clone(),
+            EvidenceScopeState::Ready { .. } => panic!("fixture scope must be unreachable"),
+        };
+        let key = evidence_pointer_cache_key(&pointer).unwrap();
+        let mut cache = BTreeMap::from([(key, original)]);
 
-            let EvidenceScopeState::Unavailable(expected) = &mut bindings[0].state else {
-                unreachable!("fixture scope must remain unreachable");
-            };
-            expected
-                .result
-                .details
-                .as_object_mut()
-                .unwrap()
-                .insert("changed_after_cache_fill".to_owned(), json!(true));
+        let EvidenceScopeState::Unavailable(expected) = &mut bindings[0].state else {
+            unreachable!("fixture scope must remain unreachable");
+        };
+        expected
+            .result
+            .details
+            .as_object_mut()
+            .unwrap()
+            .insert("changed_after_cache_fill".to_owned(), json!(true));
 
-            let error = verify_batch_row(&pointer, false, &bindings, &mut cache).unwrap_err();
-            assert_eq!(error.error_code(), "KIO-E-EVIDENCE-BATCH-CHANGED-001");
-        });
+        let error = verify_batch_row(ctx, registry_input, &pointer, false, &bindings, &mut cache)
+            .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-EVIDENCE-BATCH-CHANGED-001");
         assert!(!registry_path.exists());
         assert!(!registry_path.parent().unwrap().exists());
     }
