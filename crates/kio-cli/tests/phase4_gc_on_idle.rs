@@ -640,28 +640,6 @@ fn rejects_noncanonical_or_incompatible_idle_state_and_clock_rollback() {
     assert_eq!(rollback.status.code(), Some(3));
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-#[test]
-fn indexed_on_idle_fails_before_scheduler_or_gc_mutation_on_unsupported_platform() {
-    let dir = indexed(10);
-    let before = bytes(&dir.path().join(".kio"));
-    let before_head = fs::read(dir.path().join(".kio/HEAD")).unwrap();
-
-    let output = kio(&dir, &["snapshot", "auto", "--json"], T0)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(4));
-    assert_eq!(
-        output_json(&output)["error_code"],
-        "KIO-E-SNAPSHOT-PLATFORM-UNSUPPORTED-001"
-    );
-    assert_eq!(fs::read(dir.path().join(".kio/HEAD")).unwrap(), before_head);
-    assert_eq!(bytes(&dir.path().join(".kio")), before);
-    assert!(!dir.path().join(".kio/.lock").exists());
-    assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
-    assert!(!dir.path().join(".kio/gc").exists());
-}
-
 #[test]
 fn strict_gc_mode_contract_rejects_missing_irrelevant_invalid_and_unknown_values() {
     let dir = indexed(10);

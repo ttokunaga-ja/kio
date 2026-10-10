@@ -374,37 +374,6 @@ fn after_index_with_no_candidates_skips_without_creating_gc_state() {
 }
 
 #[test]
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-fn after_index_with_candidates_fails_before_marker_on_unsupported_rotation_platforms() {
-    let (dir, _commit, tree) = stale_candidate();
-    configure(&dir, "after_index");
-    let tree_before = fs::read(tree_path(&dir, &tree)).unwrap();
-
-    let output = kio(
-        &dir,
-        &[
-            "snapshot",
-            "create",
-            "-m",
-            "unsupported automatic gc",
-            "--json",
-        ],
-    )
-    .output()
-    .unwrap();
-    assert_eq!(output.status.code(), Some(4));
-    let value = output_json(&output);
-    assert_eq!(value["publication_status"], "completed");
-    assert_eq!(value["gc"]["status"], "failed");
-    assert_eq!(
-        value["gc"]["error"]["error_code"],
-        "KIO-E-STORE-CORRUPT-001"
-    );
-    assert_eq!(fs::read(tree_path(&dir, &tree)).unwrap(), tree_before);
-    assert!(!dir.path().join(".kio/gc").exists());
-}
-
-#[test]
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn after_index_sweeps_a_real_stale_tree_after_successful_index() {
     let (dir, commit, tree) = stale_candidate();

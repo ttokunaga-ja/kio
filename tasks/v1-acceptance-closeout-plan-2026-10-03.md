@@ -244,7 +244,7 @@ Unix共通約7,600、Linux約2,300、macOS約1,300）、検証tooling約63,000�
 
 - 移動と振る舞いの変更を同じcommitに混ぜない。移動だけのcommitでは振る舞いを変えない。
 - 局所検証はMacの全workspace testと、Windows/WSLの関係crate。3 OSの全体回帰はR2・R3・R5の終了時に行う。
-- testの期待値を変えて通さない。CLI契約試験（`crates/kio-cli/tests`）の変更は、移動に伴うpath・importの修正に限る。
+- testの期待値を変えて通さない。CLI契約試験（`crates/kio-cli/tests`）の変更は、移動に伴うpath・importの修正に限る。ただし、対象外targetのbuild拒否で対応3 OSのどれでもcompileされなくなったtest・assertion・guard・commentの削除はR2の対象外OS向け代替実装の削除に含め、この制限の例外とする。対応3 OSのtest集合と期待値は変えない。
 - K3（状態モデルの仕様）は並行してよい。K4以降の実装はR3の型付きAPIの上に作る。
 
 D工程は [docs/README §6](../docs/README.md) の「仕様書に書くもの / 書かないもの」を基準にする。

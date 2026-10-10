@@ -375,28 +375,6 @@ fn skips_disabled_missing_and_not_indexed_without_mutating_kio() {
     assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
-#[test]
-fn eligible_snapshot_fails_before_lock_or_state_on_unsupported_platform() {
-    let dir = indexed_fixture(60, 1);
-    fs::write(dir.path().join("new.md"), "eligible but unsupported\n").unwrap();
-    let before = kio_bytes(&dir.path().join(".kio"));
-    let before_head = fs::read(dir.path().join(".kio/HEAD")).unwrap();
-
-    let output = kio(&dir, &["snapshot", "auto", "--json"], T0)
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(4));
-    assert_eq!(
-        output_json(&output)["error_code"],
-        "KIO-E-SNAPSHOT-PLATFORM-UNSUPPORTED-001"
-    );
-    assert_eq!(fs::read(dir.path().join(".kio/HEAD")).unwrap(), before_head);
-    assert_eq!(kio_bytes(&dir.path().join(".kio")), before);
-    assert!(!dir.path().join(".kio/.lock").exists());
-    assert!(!dir.path().join(".kio/snapshot-auto.json").exists());
-}
-
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[test]
 fn first_run_noop_advances_canonical_state_and_json_and_human_agree() {

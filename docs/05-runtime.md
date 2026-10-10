@@ -1218,7 +1218,7 @@ HEAD から到達しない `repaired` は `repaired_outside_head` として保�
   descriptor-relative atomic exchange後、公開`index/`、private directoryの順にfsyncする。
   Windowsは下記のjournal付きno-replace moveを使う。recoveryは公開leafがmarkerのsourceかtargetである
   場合、またはWindowsの一致するjournalが公開leaf不在を説明する場合だけ再開する。
-  同generationの別identity、private directory/leaf差替え、unsupported platformはreceipt publish前
+  同generationの別identity、private directory/leaf差替えはreceipt publish前
   またはtree除去前にfail-closedとする
 - private copy の pre-sweep generation 更新と同一 SQLite transaction で、strict singleton
   `gc_rotation_attestation`（version、sweep ID、role、plan digest、source/target generation）を記録する。
@@ -1345,7 +1345,7 @@ macOS / Linux はdirectory `flock`、Windows はstorage format `3.0.0`のimmutab
 `.kio/.store-gate`を`GENERIC_READ`で開くnonblocking shared `LockFileEx`を使う。
 Windowsの実writerも同じgateのexclusive lockを`.lock`作成・stale回収前からowner closeまで保持する。
 read-only走査はgateを作成・修復・書換えしない。current 3.0.0でgate欠落・unsafeならfail-closedし、旧1.0.0/2.0.0は
-gate検査より先のversion検査でexit 8とする。その他の非対応platformではscopeを変更せずfail-closedする。
+gate検査より先のversion検査でexit 8とする。
 Windowsのnative acceptanceは前節のrelease gateに従う。
 object数、総physical/verified bytes、manifest unit数、history/ref/receipt/directory/name/depthを上限化し、
 refs・receipt・purge/GC stateを含む独立した全走査を2回行って結果とfilesystem observationの完全一致を
@@ -1901,8 +1901,7 @@ normalize referenceやmutable cacheを流用しない。
 first observation は baseline を記録するだけで GC を実行せず、digest が変われば
 `idle_observed_since` を now へ reset して GC を実行しない。同一 digest が threshold 以上継続した時だけ
 eligible となる。scheduled snapshot 成功後に `after_index` を新規発火しない。`on_idle` GC は writer
-publication の後、lock release の後だけに実行し、timeout は exit 3、integrity failure は exit 4、
-scheduled mutation 非対応 platform は state / lock / HEAD より前に unsupported で fail-closed する。snapshot config、GC config、
+publication の後、lock release の後だけに実行し、timeout は exit 3、integrity failure は exit 4 とする。snapshot config、GC config、
 index metadata、state、scope/`.kio` identity、scanはwriter lock前後とpublication直前に再検証し、
 差替えをskipへ縮退しない。完全なignore authority（validated config、generated parent policy、
 root `.kioignore`）はretained handleで固定し、最初のraw CAS publish直前、checkpoint/ref境界、
@@ -1935,9 +1934,7 @@ scheduled mutation は macOS / Linux / Windows の実装経路を持つ。Window
 で metadata / raw staging / purge・entry guard を検証し、checkpoint の既存 leaf 置換には
 §2.5 の5状態journalを `OperationKind::SnapshotState` として使う。owner は
 `.kio/gc/internal/snapshot-state-exchange/` に分離し、marker/index exchange のownerと共有しない。
-Windowsの単純なreplace renameをatomic exchangeとして扱わない。非対応platformではeligibleな実行を
-`.kio/.lock`・HEAD・scheduler stateへ触れる前に
-`KIO-E-SNAPSHOT-PLATFORM-UNSUPPORTED-001`でfail-closedする。
+Windowsの単純なreplace renameをatomic exchangeとして扱わない。
 
 pending checkpoint exchange はpublic `snapshot-auto.json`が不在でもfresh runと解釈しない。
 read-only state検査と通常writer / GCはfail-closedし、enabledな明示 `kio snapshot auto`だけが
