@@ -1394,3 +1394,69 @@ toolingには適用しない。OS条件の識別子は6種とする。テスト�
   イベント・最終報告・証跡を置き、`wip/` にはWIPの指紋を置いた。Macの未追跡WIP 128件はR0の指紋と内容まで一致し、
   各実行の前後でも変わらなかった。
 - 照合用のcheckoutは残した。WSLは `r1-469fc96b`（約362 MiB）、Windowsは `r1-469fc96b`（約317 MiB）である。
+
+## 28. R2: OS固有層の分離
+
+2026-10-10 JST記録。`487e34c9` から25 commitで行った（最終 `4be40d37e70a61306f1ae5916407c556054a16f7`、
+tree `4001db676945e2a21ca5e9b1ac8ef80ac9a93d68`、241 file、+23,698 / −20,970行）。実装前に [09 §3](../docs/09-mvp-scope.md) を
+明確化し、OS専用のitemを同じOS層の他crateからも使えるようにした（`73a83a9c`）。kio-coreとkio-processの`build.rs`は
+macOS・Linux・Windows以外のtargetをbuild時に拒否する。これで到達しなくなった対象外OS向けの代替実装・試験・
+コメントを削除し、[05](../docs/05-runtime.md)・[06](../docs/06-cli-spec.md) から非対応platformのfail-closed規定
+（`KIO-E-SNAPSHOT-PLATFORM-UNSUPPORTED-001`）を除いた。CLI契約試験の制限には、§10に限定例外を加えた。
+
+順序はkio-core（store・private file・profile、CAS・scope・GC、identityと観測、lock・gate、GC exchange）→kio-process→
+kio-adapter→共有primitive→kio-index（registry・aggregator・FTSとGC）→kio-pipeline（scan・task、ledgerの
+lifecycleとsnapshot）→kio-app（file処理、watchのbackend・queue・lock、watch service・runner、到達不能pathと残骸）である。
+複数crateが使うprimitiveはkio-coreのplatformに置いた（例: `same_cap_file_identity`）。移動のcommitでは振る舞いを変えず、
+候補ごとに移動前後の関数本体と試験本文を字句で照合した。
+
+計測（`kio-code-limits`、Mac・WSL・Windows MSVCの出力がバイト一致、SHA-256 `d6b14199…cde3`）:
+
+| 区分 | R1 | R2終了時 | 上限 |
+|---|---:|---:|---:|
+| OS共通の製品ロジック | 118,746 | 98,084 | 100,000 |
+| Windows | 0 | 11,720 | 14,000 |
+| Unix | 0 | 6,549 | 9,000 |
+| Linux | 0 | 3,241 | 4,000 |
+| macOS | 0 | 1,789 | 3,000 |
+| 検証tooling | 63,418 | 63,365 | 65,000 |
+| 共通ロジック内のOS条件 | 1,155 | 0 | 許可リスト0 |
+
+- 製品の合計は121,383行で、R1より2,637行多い。OSごとに同名・同signatureの実装を並べたためである。
+- 1ファイルの上限超過は5本のままで、R4で扱う。`kio-app/src/lib.rs` 21,289、`kio-core/src/scope.rs` 5,052、`cas.rs` 3,926、
+  `gc.rs` 3,826、`kio-app/src/verify_objects.rs` 3,775行である。計測の終了値1は、この5本だけによる。
+
+終了検証（最終tree、Rust 1.98.0）。3 OSとも`fmt --all -- --check`、`clippy --workspace --all-targets --locked -- -D warnings`、
+`test --workspace --all-targets --locked`、`build --release --workspace --locked` のcargo実exitが0で、`Cargo.lock` は変わらなかった。
+
+| OS | test結果（libtest summary合計） | test所要 | libtest一覧 |
+|---|---|---|---|
+| macOS | 101 summary、3,330 pass / 0 fail / 0 ignored | 31.5分 | 90 target / 3,319件 |
+| Linux (WSL) | 104 summary、3,339 pass / 0 fail / 1 ignored | 13.5分 | 90 target / 3,326件 |
+| Windows 11 (MSVC) | 98 summary、3,024 pass / 0 fail / 1 ignored | 45.8分 | 90 target / 3,017件 |
+
+一覧はR0（89 target / 3,259・3,266・2,958件）と比べ、R1で追加したkio-ciの60・60・59件だけが増えた。試験の移動で
+pathが変わった141件は対応表で照合し、名前・種類・期待値に差はない。ignoredは各OSのhelper起動用の試験で、R0と同じである。
+
+進め方と経緯:
+
+- 読み取り調査、実装、3 OS検証はCodex CLI（ChatGPT認証）に任せた。監督側で設計判断を決め、候補ごとにtreeと検証結果を
+  照合してcommitした。候補ごとの検証はMacの全workspace testと、WSL・Windowsの関係crateで行った。kio-pipelineまで
+  終えた時点と最終treeでは、3 OSの全体回帰を行った。
+- Mac上の他リポジトリのcargoとCodexで検証が止まった。以後、無関係なMacのprocessは記録だけにした。
+- WSLへのSSHがbanner交換のtimeout（exit 255）で切れた。以後、1 hostへの接続を1本にし、60秒以上の間隔でpollする。
+  30・60・120秒の間隔で再試行し、3回連続で失敗したときだけ止める。
+- WindowsのLastBootUpTimeが、再起動なしに1.5秒動いた（時刻同期による）。開始値との差が60秒以内で、run開始より前なら
+  同じ起動とみなした。WSLのboot IDとMacの起動時刻は完全一致を求めた。
+- Windowsで一時的な他のbuild（帰属不明）を検出して止まった。以後、各工程の前に最大60分待ち、消えてから始めた。
+- Macの空き容量が利用者の他の作業で約11 GiBまで減り、利用者が空けてから再開した。cacheは削除していない。
+- S5bの検証中に、Codexのサービス側の切断でsessionが終わった。同じsessionを再開し、Windowsで続いていたtestの
+  結果（exit 0）を回収した。中断・停止した記録はすべて残した。
+
+残る扱い:
+
+- R3（`kio-app`の型付きAPIとmodule分割）とR4（巨大fileの分割）が続く。hosted CIとpushは未実施である
+  （リポジトリの公開範囲とActionsの有無を確認していない）。
+- 証跡はrepo外の `~/Documents/Codex/2026-10-08/kio-r2/` にある（`runs/` に各段階の指示・イベント・最終報告・証跡、
+  `wip/` にWIPの指紋）。Macの未追跡WIP 128件はR2開始前の指紋と一致し、各段階の前後でも変わらなかった。
+- 照合用のcheckoutはWSLとWindowsの `r2-platform` に残した。
