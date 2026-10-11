@@ -120,6 +120,7 @@ fn gemini_collection_requires_scope_profile_and_returned_job_attribution() {
                     kio_adapter::tool_lock::AdapterRuntimeSettings::default(),
                 ),
                 control: ledger.control(),
+                locks: &kio_core::scope::LockSession::default(),
             },
             &client,
             &row,
@@ -590,6 +591,7 @@ fn credential_or_device_key_rotation_holds_existing_rows_without_provider_effect
                         kio_adapter::tool_lock::AdapterRuntimeSettings::default()
                     ),
                     control: ledger.control(),
+                    locks: &kio_core::scope::LockSession::default(),
                 },
                 &gemini,
                 &row,

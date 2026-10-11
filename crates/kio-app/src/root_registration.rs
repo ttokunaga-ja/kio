@@ -2,9 +2,10 @@
 
 use kio_core::control::ControlHandle;
 use kio_core::management::{
-    ChildEnrollment, ManagementAuthority, ManagementBinding, ManagementRecord, begin_registration,
-    detect_case_insensitive, finish_registration, peek_registration_marker,
-    publish_registration_record, read_registration_recovery_record, recorded_child_root,
+    ChildEnrollment, ManagementAuthority, ManagementBinding, ManagementRecord,
+    begin_registration_in_session, detect_case_insensitive_in_session,
+    finish_registration_in_session, peek_registration_marker,
+    publish_registration_record_in_session, read_registration_recovery_record, recorded_child_root,
     validate_prospective_child,
 };
 use kio_core::scope::{Repository, new_ulid};
@@ -144,7 +145,15 @@ pub(crate) fn run(ctx: &crate::Invocation<'_>, args: RootRegisterArgs) -> Result
             (j, bytes, false)
         }
     };
-    execute(&binding, &mut journal, bytes, persisted, ctx.control).map_err(|error| {
+    execute(
+        &binding,
+        &mut journal,
+        bytes,
+        persisted,
+        ctx.control,
+        ctx.locks,
+    )
+    .map_err(|error| {
         let mut context = error.context().clone();
         if let Some(context) = context.as_object_mut() {
             context.insert("operation_id".into(), json!(journal.operation_id));
@@ -363,6 +372,7 @@ fn execute(
     mut bytes: Vec<u8>,
     persisted: bool,
     runtime_control: &ControlHandle,
+    session: &kio_core::scope::LockSession,
 ) -> Result<Value> {
     retained_root.revalidate()?;
     let root = retained_root.canonical_root();
@@ -377,11 +387,11 @@ fn execute(
     nodes[0].binding = retained_root.clone();
     let repos = nodes
         .iter()
-        .map(|node| repo(node, runtime_control))
+        .map(|node| repo(node, runtime_control).map(|repo| repo.in_lock_session(session)))
         .collect::<Result<Vec<_>>>()?;
     let _locks = repos
         .iter()
-        .map(Repository::lock_store)
+        .map(|repo| repo.lock_store_in_session(session))
         .collect::<Result<Vec<_>>>()?;
     retained_root.revalidate()?;
     let actual_journal = control.read_optional(Path::new(JOURNAL_LEAF), MAX_JOURNAL_BYTES)?;
@@ -404,14 +414,16 @@ fn execute(
     }
     if !persisted {
         for (index, node) in nodes.iter_mut().enumerate() {
-            let observed = detect_case_insensitive(&node.binding)?;
+            let observed = detect_case_insensitive_in_session(session, &node.binding)?;
             node.after.case_insensitive = observed;
             journal.nodes[index].after.case_insensitive = observed;
         }
         bytes = encode(journal)?;
     } else {
         for node in &nodes {
-            if detect_case_insensitive(&node.binding)? != node.after.case_insensitive {
+            if detect_case_insensitive_in_session(session, &node.binding)?
+                != node.after.case_insensitive
+            {
                 return Err(KioError::invalid_usage(
                     "root registration filesystem case behavior changed since the journal was created",
                 ));
@@ -430,7 +442,7 @@ fn execute(
     }
     if journal.phase == Phase::Prepared {
         for n in &nodes {
-            begin_registration(&n.binding, &journal.operation_id)?;
+            begin_registration_in_session(session, &n.binding, &journal.operation_id)?;
         }
         bytes = advance(&control, &nodes[0].binding, journal, Phase::Marked)?;
     }
@@ -443,7 +455,13 @@ fn execute(
     if journal.phase == Phase::Revoked {
         for n in &nodes {
             recheck_retired_children(std::slice::from_ref(n), runtime_control)?;
-            publish_registration_record(&n.binding, &journal.operation_id, &n.before, &n.after)?;
+            publish_registration_record_in_session(
+                session,
+                &n.binding,
+                &journal.operation_id,
+                &n.before,
+                &n.after,
+            )?;
         }
         bytes = advance(&control, &nodes[0].binding, journal, Phase::Published)?;
     }
@@ -495,9 +513,9 @@ fn execute(
     }
     if journal.phase == Phase::Finishing {
         for n in nodes.iter().skip(1).rev() {
-            finish(n, &journal.operation_id)?;
+            finish(session, n, &journal.operation_id)?;
         }
-        finish(&nodes[0], &journal.operation_id)?;
+        finish(session, &nodes[0], &journal.operation_id)?;
         nodes[0].binding.revalidate()?;
         control.quarantine_then_remove(Path::new(JOURNAL_LEAF), &bytes, MAX_JOURNAL_BYTES)?;
     }
@@ -683,9 +701,9 @@ fn recheck_old_paths(nodes: &[Node]) -> Result<()> {
     }
     Ok(())
 }
-fn finish(n: &Node, op: &str) -> Result<()> {
+fn finish(session: &kio_core::scope::LockSession, n: &Node, op: &str) -> Result<()> {
     match peek_registration_marker(&n.binding)?.as_deref() {
-        Some(id) if id == op => finish_registration(&n.binding, op, &n.after),
+        Some(id) if id == op => finish_registration_in_session(session, &n.binding, op, &n.after),
         None if read_registration_recovery_record(&n.binding)? == n.after => Ok(()),
         _ => Err(KioError::invalid_usage(
             "root registration marker does not match journal",

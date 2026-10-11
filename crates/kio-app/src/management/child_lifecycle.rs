@@ -11,7 +11,7 @@ use crate::grants::PrivateGrantStore;
 use crate::index_to_kio;
 use kio_core::management::{
     ChildEnrollment, DirectoryIdentity, ManagementBinding, ManagementRecord,
-    compare_and_remove_child_enrollment, enroll_child, observe_direct_child,
+    compare_and_remove_child_enrollment_in_session, enroll_child_in_session, observe_direct_child,
     planned_child_management_record, read_record, read_registration_recovery_record,
     validate_controlled_root_with_control,
 };
@@ -271,12 +271,13 @@ pub(crate) fn reconcile_stale_child_enrollment(
     target: Option<&str>,
 ) -> Result<()> {
     cancel::recover(parent)?;
-    let _lock = parent.lock_store()?;
+    let _lock = parent.lock_store_in_session(parent.lock_session())?;
     let binding = binding_for_repo(parent)?;
     let store = control(&binding, parent.control())?;
     recover_lifecycle_atomic(&store)?;
     if let Some(bytes) = store.read_optional(Path::new(RETIREMENT), MAX_JOURNAL)? {
         finish_retirement(
+            parent.lock_session(),
             &binding,
             &store,
             decode(&bytes, "child retirement journal")?,
@@ -306,7 +307,7 @@ pub(crate) fn reconcile_stale_child_enrollment(
         };
         let bytes = encode(&journal, "child retirement journal")?;
         store.write_atomic(Path::new(RETIREMENT), &bytes, Publication::CreateOnly)?;
-        finish_retirement(&binding, &store, journal, bytes)?;
+        finish_retirement(parent.lock_session(), &binding, &store, journal, bytes)?;
     }
     Ok(())
 }
@@ -320,6 +321,7 @@ pub(super) fn cancel_child_initialization(
 }
 
 fn finish_retirement(
+    session: &kio_core::scope::LockSession,
     parent: &ManagementBinding,
     store: &StoreDirectory,
     journal: Retirement,
@@ -357,7 +359,12 @@ fn finish_retirement(
         Some(_) | None => {}
     }
     // Missing means replay; a different enrollment is a conflicting new child.
-    compare_and_remove_child_enrollment(parent, &journal.basename, &journal.enrollment)?;
+    compare_and_remove_child_enrollment_in_session(
+        session,
+        parent,
+        &journal.basename,
+        &journal.enrollment,
+    )?;
     if PrivateGrantStore::open_readonly(
         &crate::approvals::store_path(store.control()),
         store.control(),
@@ -399,7 +406,7 @@ pub(crate) fn reconcile_or_initialize_child(
     parent: &Repository,
     basename: &str,
 ) -> Result<Repository> {
-    let _lock = parent.lock_store()?;
+    let _lock = parent.lock_store_in_session(parent.lock_session())?;
     cancel::recover(parent)?;
     let parent_binding = binding_for_repo(parent)?;
     let store = control(&parent_binding, parent.control())?;
@@ -451,7 +458,7 @@ pub(crate) fn reconcile_or_initialize_child(
 /// classifying an existing `.kio`, so publication after a crash is never
 /// mistaken for an independently initialized root.
 pub(crate) fn recover_pending_initializations(parent: &Repository) -> Result<Vec<Repository>> {
-    let _lock = parent.lock_store()?;
+    let _lock = parent.lock_store_in_session(parent.lock_session())?;
     cancel::recover(parent)?;
     let parent_binding = binding_for_repo(parent)?;
     let store = control(&parent_binding, parent.control())?;
@@ -528,7 +535,8 @@ fn validate_pending_before_policy(
         parent.control().clone(),
     )?;
     if child.contains_entry(Path::new(".kio"))? {
-        let repo = super::open_existing_bound(&observed.canonical_root, &child)?;
+        let repo = super::open_existing_bound(&observed.canonical_root, &child)?
+            .in_lock_session(parent.lock_session());
         let child_binding = binding_for_repo(&repo)?;
         if Some(kio_core::management::directory_identity_from_handle(
             child_binding.kio_handle(),
@@ -640,7 +648,7 @@ pub(crate) fn recover_pending_initialization_for_child(
     parent: &Repository,
     basename: &str,
 ) -> Result<Option<Repository>> {
-    let _lock = parent.lock_store()?;
+    let _lock = parent.lock_store_in_session(parent.lock_session())?;
     cancel::recover(parent)?;
     let binding = binding_for_repo(parent)?;
     let store = control(&binding, parent.control())?;
@@ -719,7 +727,8 @@ fn resume_initialization(
         parent.control().clone(),
     )?;
     if child_root.contains_entry(Path::new(".kio"))? {
-        let repo = super::open_existing_bound(&observed.canonical_root, &child_root)?;
+        let repo = super::open_existing_bound(&observed.canonical_root, &child_root)?
+            .in_lock_session(parent.lock_session());
         let child_binding = binding_for_repo(&repo)?;
         if child_binding.directory_identity() != &journal.retained_child_identity
             || Some(kio_core::management::directory_identity_from_handle(
@@ -740,7 +749,8 @@ fn resume_initialization(
                 ));
             }
             revalidate_policy(parent_binding, &journal.basename)?;
-            enroll_child(
+            enroll_child_in_session(
+                parent.lock_session(),
                 parent_binding,
                 &journal.basename,
                 &journal.planned_scope_id,

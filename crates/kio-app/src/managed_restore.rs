@@ -21,7 +21,7 @@ pub(super) fn run(ctx: &crate::Invocation<'_>, args: RestoreArgs) -> Result<Valu
     // This is intentionally the strict, bound managed-root open.  In
     // particular, restore never invokes the recovery opener, so --preview has
     // no publication, index, ledger, or working-tree side effect.
-    let repo = open_existing_managed_root(ctx.cwd(), ctx.control)?;
+    let repo = open_existing_managed_root(ctx.cwd(), ctx.control)?.in_lock_session(ctx.locks);
     validate_repo_tool_lock(&repo)?;
     let source_commit = repo.resolve_commit(&args.source)?;
     let policy = current_embedding_policy(&repo)?;
@@ -108,7 +108,7 @@ pub(super) fn run(ctx: &crate::Invocation<'_>, args: RestoreArgs) -> Result<Valu
 /// publication recovery.  A pending restore journal governs working bytes and
 /// must be resolved by core before any generic publication-recovery pathway.
 pub(super) fn recover(ctx: &crate::Invocation<'_>) -> Result<Value> {
-    let repo = Repository::open_for_recovery_with_control(ctx.cwd(), ctx.control.clone())?;
+    let repo = Repository::open_recovery_in_session(ctx.cwd(), ctx.control.clone(), ctx.locks)?;
     validate_repo_tool_lock(&repo)?;
     // Recovery has to be possible when the policy that permitted the original
     // restore has since denied a path.  Validate the retained management
@@ -157,7 +157,7 @@ fn rebuild_projection(
         &ManagedRestorePlan,
     )>,
 ) -> Result<Value> {
-    let _lock = repo.lock_store()?;
+    let _lock = repo.lock_store_in_session(repo.lock_session())?;
     if let Some((policy, plan)) = policy {
         ensure_scope_allowed(policy)?;
         ensure_planned_paths_allowed(policy, plan)?;

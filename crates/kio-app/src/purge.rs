@@ -144,7 +144,7 @@ pub(crate) fn run(ctx: &crate::Invocation<'_>, args: PurgeArgs) -> Result<Value>
     // the store lock before preview/working-copy refusal so a tombstoned raw temp
     // is removed even when the requested purge cannot proceed.
     {
-        let _store_lock = repo.lock_store()?;
+        let _store_lock = repo.lock_store_in_session(repo.lock_session())?;
         repo.ensure_no_pending_managed_restore()?;
         let state = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
         if state.read_journal()?.is_some() {
@@ -586,7 +586,7 @@ fn execute_phase_machine(
     args: &PurgeArgs,
     preview: &PurgePreview,
 ) -> Result<Value> {
-    let _store_lock = repo.lock_store()?;
+    let _store_lock = repo.lock_store_in_session(repo.lock_session())?;
     let locked_plan = resolve_plan(repo, args)?;
     if locked_plan != preview.plan {
         return Err(KioError::new(
@@ -599,7 +599,7 @@ fn execute_phase_machine(
     // Serialize the visibility barrier and destructive phases against restore's
     // final source recheck/staging/publication window. Lock order is always scope
     // store -> purge publication; restore takes only the latter.
-    let _publication_lock = repo.lock_purge_publication()?;
+    let _publication_lock = repo.lock_purge_publication_in_session(repo.lock_session())?;
     // Re-run after reacquiring the store lock: a prior Kio writer could have
     // crashed between preview cleanup and this confirmed phase-machine entry.
     cleanup_orphan_raw_ingest_temps(repo.kio_dir())?;
@@ -2179,10 +2179,16 @@ fn scrub_logs(
 ) -> Result<()> {
     let device_root = crate::data_home(repo.control()).join("kio/logs");
     let scope_root = repo.kio_dir().join("logs");
-    let _device_lock =
-        StoreLock::acquire_path_with_control(device_root.join("scrub.lock"), repo.control())?;
-    let _scope_lock =
-        StoreLock::acquire_path_with_control(scope_root.join("access.scrub.lock"), repo.control())?;
+    let _device_lock = StoreLock::acquire_path_in_session(
+        repo.lock_session(),
+        device_root.join("scrub.lock"),
+        repo.control(),
+    )?;
+    let _scope_lock = StoreLock::acquire_path_in_session(
+        repo.lock_session(),
+        scope_root.join("access.scrub.lock"),
+        repo.control(),
+    )?;
 
     let identifiers = plan
         .target_raw_hashes
@@ -2219,7 +2225,8 @@ fn scrub_logs(
     report.log_fields_masked = report.log_fields_masked.saturating_add(pass_fields);
 
     if journal.phase == PurgePhase::Tombstoned {
-        repo.control().append_event_log(
+        repo.control().append_event_log_in_session(
+            repo.lock_session(),
             "KIO-PURGE-COMPLETED",
             "purge removed content from KIO-managed history",
             json!({
@@ -2246,10 +2253,16 @@ fn finalize_purge(
     // without releasing the outer exclusion window.
     let device_root = crate::data_home(repo.control()).join("kio/logs");
     let scope_root = repo.kio_dir().join("logs");
-    let _device_lock =
-        StoreLock::acquire_path_with_control(device_root.join("scrub.lock"), repo.control())?;
-    let _scope_lock =
-        StoreLock::acquire_path_with_control(scope_root.join("access.scrub.lock"), repo.control())?;
+    let _device_lock = StoreLock::acquire_path_in_session(
+        repo.lock_session(),
+        device_root.join("scrub.lock"),
+        repo.control(),
+    )?;
+    let _scope_lock = StoreLock::acquire_path_in_session(
+        repo.lock_session(),
+        scope_root.join("access.scrub.lock"),
+        repo.control(),
+    )?;
     scrub_logs(repo, plan, journal, report)?;
     remove_purge_sidecars(repo.kio_dir())?;
     state.finish(journal)

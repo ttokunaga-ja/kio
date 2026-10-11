@@ -66,20 +66,70 @@ impl ControlHandle {
         message: &str,
         context: serde_json::Value,
     ) -> Result<()> {
-        append_observation(self, "events.jsonl", "info", code, message, context)
+        self.append_event_log_in_session(
+            &crate::scope::LockSession::default(),
+            code,
+            message,
+            context,
+        )
     }
-
+    pub fn append_event_log_in_session(
+        &self,
+        session: &crate::scope::LockSession,
+        code: &str,
+        message: &str,
+        context: serde_json::Value,
+    ) -> Result<()> {
+        append_observation(
+            session,
+            self,
+            "events.jsonl",
+            "info",
+            code,
+            message,
+            context,
+        )
+    }
     pub fn append_warn_log(
         &self,
         code: &str,
         message: &str,
         context: serde_json::Value,
     ) -> Result<()> {
-        append_observation(self, "errors.jsonl", "warn", code, message, context)
+        self.append_warn_log_in_session(
+            &crate::scope::LockSession::default(),
+            code,
+            message,
+            context,
+        )
     }
-
-    pub fn append_error_log(&self, error: &crate::KioError) -> Result<()> {
+    pub fn append_warn_log_in_session(
+        &self,
+        session: &crate::scope::LockSession,
+        code: &str,
+        message: &str,
+        context: serde_json::Value,
+    ) -> Result<()> {
         append_observation(
+            session,
+            self,
+            "errors.jsonl",
+            "warn",
+            code,
+            message,
+            context,
+        )
+    }
+    pub fn append_error_log(&self, error: &crate::KioError) -> Result<()> {
+        self.append_error_log_in_session(&crate::scope::LockSession::default(), error)
+    }
+    pub fn append_error_log_in_session(
+        &self,
+        session: &crate::scope::LockSession,
+        error: &crate::KioError,
+    ) -> Result<()> {
+        append_observation(
+            session,
             self,
             "errors.jsonl",
             "error",
@@ -88,13 +138,26 @@ impl ControlHandle {
             error.context().clone(),
         )
     }
-
     pub fn append_jsonl_rotating(
         &self,
         path: &std::path::Path,
         value: &serde_json::Value,
         retention_days: u32,
     ) -> Result<()> {
-        crate::scope::append_jsonl_rotating_with_control(self, path, value, retention_days)
+        self.append_jsonl_rotating_in_session(
+            &crate::scope::LockSession::default(),
+            path,
+            value,
+            retention_days,
+        )
+    }
+    pub fn append_jsonl_rotating_in_session(
+        &self,
+        session: &crate::scope::LockSession,
+        path: &std::path::Path,
+        value: &serde_json::Value,
+        retention_days: u32,
+    ) -> Result<()> {
+        crate::scope::append_jsonl_rotating_with_control(session, self, path, value, retention_days)
     }
 }

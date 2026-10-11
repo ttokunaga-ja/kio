@@ -41,7 +41,7 @@ struct BoundScope {
 }
 impl BoundScope {
     fn bind(repo: &Repository) -> Result<Self> {
-        let lease = repo.lock_store()?;
+        let lease = repo.lock_store_in_session(repo.lock_session())?;
         let session = GcSweepSession::bind_repository(repo)?;
         let directory = StoreDirectory::from_retained_with_control(
             session.retained_kio_handle()?,

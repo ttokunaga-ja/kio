@@ -54,7 +54,16 @@ struct ParentAdmission {
 /// The caller has already decided that this is an explicit root request. This
 /// function makes no discovery decision and never adopts a non-empty `.kio`
 /// without its strict bootstrap journal.
-pub(super) fn initialize(root: &Path, control: &ControlHandle) -> Result<ExplicitRoot> {
+#[cfg(test)]
+fn initialize(root: &Path, control: &ControlHandle) -> Result<ExplicitRoot> {
+    initialize_in_session(root, control, &kio_core::scope::LockSession::default())
+}
+
+pub(super) fn initialize_in_session(
+    root: &Path,
+    control: &ControlHandle,
+    locks: &kio_core::scope::LockSession,
+) -> Result<ExplicitRoot> {
     let canonical_root = root
         .canonicalize()
         .map_err(|error| KioError::io(error.to_string(), root.display().to_string()))?;
@@ -88,7 +97,7 @@ pub(super) fn initialize(root: &Path, control: &ControlHandle) -> Result<Explici
     let _parent_admission = if existing_complete {
         None
     } else {
-        admit_direct_parent(&canonical_root, &retained_root)?
+        admit_direct_parent(&canonical_root, &retained_root, locks)?
     };
     validate_controlled_root_with_control(
         retained_root.root_handle().as_ref(),
@@ -164,7 +173,8 @@ pub(super) fn initialize(root: &Path, control: &ControlHandle) -> Result<Explici
                 .try_clone()
                 .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
             control.clone(),
-        )?;
+        )?
+        .in_lock_session(locks);
         verify_parent_admission(_parent_admission.as_ref(), &retained_root)?;
         return Ok(ExplicitRoot::Existing(repo));
     }
@@ -190,7 +200,8 @@ pub(super) fn initialize(root: &Path, control: &ControlHandle) -> Result<Explici
                 .try_clone()
                 .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
             control.clone(),
-        )?;
+        )?
+        .in_lock_session(locks);
         verify_parent_admission(_parent_admission.as_ref(), &retained_root)?;
         return Ok(ExplicitRoot::Existing(repo));
     }
@@ -295,7 +306,8 @@ pub(super) fn initialize(root: &Path, control: &ControlHandle) -> Result<Explici
             .try_clone()
             .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
         control.clone(),
-    )?;
+    )?
+    .in_lock_session(locks);
     validate_live_chain(&binding)?;
     verify_parent_admission(_parent_admission.as_ref(), &retained_root)?;
     Ok(ExplicitRoot::Created(repo))
@@ -304,6 +316,7 @@ pub(super) fn initialize(root: &Path, control: &ControlHandle) -> Result<Explici
 fn admit_direct_parent(
     canonical_root: &Path,
     retained_root: &StoreDirectory,
+    locks: &kio_core::scope::LockSession,
 ) -> Result<Option<ParentAdmission>> {
     let Some(parent_path) = canonical_root.parent() else {
         return Ok(None);
@@ -335,13 +348,14 @@ fn admit_direct_parent(
         KioError::invalid_usage(
             "immediate parent is not a complete managed scope; refusing ambiguous root creation",
         )
-    })?;
+    })?
+    .in_lock_session(locks);
     let parent_binding = super::binding_for_repo(&parent_repo)?;
     // This is observational: it authenticates the parent before `lock_store`
     // can create any parent-private lease material.
     validate_live_chain(&parent_binding)?;
     let child_identity = directory_identity_from_handle(retained_root.root_handle().as_ref())?;
-    let lock = parent_repo.lock_store()?;
+    let lock = parent_repo.lock_store_in_session(parent_repo.lock_session())?;
     let admission = ParentAdmission {
         _parent: parent_repo,
         _lock: lock,

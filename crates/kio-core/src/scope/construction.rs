@@ -44,19 +44,7 @@ impl Repository {
         path: impl AsRef<Path>,
         control: crate::control::ControlHandle,
     ) -> Result<Self> {
-        let repo = Self::open_for_recovery_with_control(path, control)?;
-        repo.ensure_no_pending_managed_restore()?;
-        // A normal open is observational when no interrupted publication is
-        // present. This preserves read access to a legitimate read-only scope;
-        // the store lock is needed only to replay a durable journal.
-        if repo.publication_journal()?.is_some() {
-            repo.recover_publication()?;
-        }
-        repo.validate()?;
-        // A journal which appeared after the initial observation must never be
-        // hidden behind a freshly validated mutable projection.
-        repo.ensure_no_pending_publication()?;
-        Ok(repo)
+        Self::open_in_session(path, control, &LockSession::default())
     }
 
     /// Open only after proving no incomplete mutable publication exists.
@@ -279,6 +267,7 @@ impl Repository {
             control.clone(),
         )?;
         let repo = Self {
+            lock_session: LockSession::default(),
             root: canonical_root.clone(),
             kio_dir: canonical_root.join(".kio"),
             canonical_root,
@@ -350,5 +339,68 @@ impl Repository {
     pub fn open_current_for_search() -> Result<Self> {
         let cwd = std::env::current_dir().map_err(|err| KioError::io(err.to_string(), "."))?;
         Self::open_for_search(cwd)
+    }
+
+    /// Explicitly bind this retained repository to an operation's lock authority.
+    #[must_use]
+    pub fn in_lock_session(mut self, session: &LockSession) -> Self {
+        self.lock_session = session.clone();
+        self
+    }
+
+    #[must_use]
+    pub fn lock_session(&self) -> &LockSession {
+        &self.lock_session
+    }
+
+    pub fn open_in_session(
+        path: impl AsRef<Path>,
+        control: crate::control::ControlHandle,
+        session: &LockSession,
+    ) -> Result<Self> {
+        let repo = Self::open_for_recovery_with_control(path, control)?.in_lock_session(session);
+        repo.ensure_no_pending_managed_restore()?;
+        // Recovery needs this operation's owner before it acquires any lock.
+        // Without a journal, opening remains observational for read-only scopes.
+        if repo.publication_journal()?.is_some() {
+            repo.recover_publication()?;
+        }
+        repo.validate()?;
+        // A journal published during validation must still be reported.
+        repo.ensure_no_pending_publication()?;
+        Ok(repo)
+    }
+    pub fn open_read_only_in_session(
+        path: impl AsRef<Path>,
+        control: crate::control::ControlHandle,
+        session: &LockSession,
+    ) -> Result<Self> {
+        Ok(Self::open_read_only_with_control(path, control)?.in_lock_session(session))
+    }
+    pub fn open_recovery_in_session(
+        path: impl AsRef<Path>,
+        control: crate::control::ControlHandle,
+        session: &LockSession,
+    ) -> Result<Self> {
+        Ok(Self::open_for_recovery_with_control(path, control)?.in_lock_session(session))
+    }
+    pub fn open_search_in_session(
+        path: impl AsRef<Path>,
+        control: crate::control::ControlHandle,
+        session: &LockSession,
+    ) -> Result<Self> {
+        Ok(Self::open_for_search_with_control(path, control)?.in_lock_session(session))
+    }
+    pub fn open_bound_in_session(
+        canonical_root: PathBuf,
+        scope: File,
+        kio: File,
+        control: crate::control::ControlHandle,
+        session: &LockSession,
+    ) -> Result<Self> {
+        Ok(
+            Self::open_bound_existing_with_control(canonical_root, scope, kio, control)?
+                .in_lock_session(session),
+        )
     }
 }

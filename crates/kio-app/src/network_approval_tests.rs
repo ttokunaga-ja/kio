@@ -244,6 +244,7 @@ impl Fixture {
             context: &context,
             settings,
             control: self.repo.control(),
+            locks: &kio_core::scope::LockSession::default(),
         })
     }
 }

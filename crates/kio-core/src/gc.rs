@@ -787,6 +787,7 @@ pub fn validate_final_shallow_tree_with_control(
 /// ambient victim path, making accidental commit/raw/index deletion impossible.
 #[derive(Debug)]
 pub struct GcSweepSession {
+    lock_session: crate::scope::LockSession,
     root: PathBuf,
     scope: std::fs::File,
     kio: std::fs::File,
@@ -1077,6 +1078,7 @@ impl GcSweepSession {
     pub fn acquire_snapshot_auto_recovery_lock(&self) -> Result<BoundReentrantStoreLock> {
         self.recheck_binding()?;
         let lock = crate::scope::acquire_bound_reentrant_store_lock_with_control(
+            &self.lock_session,
             &self.kio,
             &self.control,
         )?;
@@ -1120,12 +1122,13 @@ impl GcSweepSession {
 
     /// Acquire the scheduler writer barrier relative to the retained `.kio`
     /// descriptor, then make nested [`Repository`] store-lock acquisitions
-    /// reentrant on this thread. There is deliberately no ambient fallback:
+    /// reentrant through the explicitly shared operation session. No ambient fallback:
     /// platforms that cannot prove the descriptor-relative lock boundary fail
     /// closed through the underlying bound-lock primitive.
     pub fn acquire_snapshot_auto_store_lock(&self) -> Result<BoundReentrantStoreLock> {
         self.recheck_binding()?;
         let lock = crate::scope::acquire_bound_reentrant_store_lock_with_control(
+            &self.lock_session,
             &self.kio,
             &self.control,
         )?;

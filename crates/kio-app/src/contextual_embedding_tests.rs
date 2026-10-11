@@ -439,7 +439,7 @@ fn batch_resume_repairs_interrupted_replica_publication_without_embedding_work()
             // Faithfully reproduce the post-scalar-commit/pre-publication cut:
             // the final vectors and Done tasks already exist, while the old
             // replica is invalidated and source generation has advanced.
-            let _lock = repo.lock_store().unwrap();
+            let _lock = repo.lock_store_in_session(repo.lock_session()).unwrap();
             invalidate_embedding_projection(&repo).unwrap();
             assert_eq!(projection(&repo), expected);
             let replica = Aggregator::open(&aggregator_path(&control)).unwrap();

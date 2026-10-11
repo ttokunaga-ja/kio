@@ -75,7 +75,7 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
         KioError::invalid_usage("child initialization cancellation requires an operation ID")
     })?;
     operation_leaf(operation)?;
-    let _lock = parent.lock_store()?;
+    let _lock = parent.lock_store_in_session(parent.lock_session())?;
     let binding = binding_for_repo(parent)?;
     let store = control(&binding, parent.control())?;
     recover_lifecycle_atomic(&store)?;
@@ -126,7 +126,7 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
 /// Resume only an explicit cancellation marker. It never starts cancellation
 /// for an ordinary initialization journal.
 pub(super) fn recover(parent: &Repository) -> Result<()> {
-    let _lock = parent.lock_store()?;
+    let _lock = parent.lock_store_in_session(parent.lock_session())?;
     let binding = binding_for_repo(parent)?;
     let store = control(&binding, parent.control())?;
     recover_lifecycle_atomic(&store)?;

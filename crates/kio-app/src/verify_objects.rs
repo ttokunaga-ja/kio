@@ -564,7 +564,7 @@ fn bind_evidence_scope(
     // purge journal surfaced the lower-priority
     // `KIO-E-PURGE-JOURNAL-ACTIVE-001` instead of `KIO-E-STORE-VERSION-001`.
     let repo =
-        Repository::open_for_search_read_only_with_control(&target.repo_root, ctx.control.clone())?;
+        Repository::open_search_in_session(&target.repo_root, ctx.control.clone(), ctx.locks)?;
     // QB5/QB6/裁定1: shared (1)+(3) preflight pair. Evidence verify's whole
     // response IS existence information (08 §4.3 — it never returns body),
     // so checkpoint 2 below (LC54/LC55) gates every return point, not only a
@@ -1083,9 +1083,10 @@ fn verify_objects_with_limits(
         // tree state.  This is the same state machine used by `kio gc --yes`,
         // so impossible combinations are corruption rather than a misleading
         // retryable finding.
-        let session = match GcSweepSession::bind_with_control(
+        let session = match GcSweepSession::bind_in_session(
             repo.root().to_path_buf(),
             repo.control().clone(),
+            repo.lock_session(),
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -3902,6 +3903,7 @@ mod tests {
             context: &context,
             settings: &settings,
             control: &control,
+            locks: &kio_core::scope::LockSession::default(),
         };
         let registry = EvidenceRegistry::fixture(registry_path.clone());
         let registry_input = &registry;

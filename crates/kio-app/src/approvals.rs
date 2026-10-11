@@ -354,7 +354,7 @@ pub(crate) fn approve(
     }
     // Lock order is scope then device. Sends already hold scope writer leases;
     // device grant publication never acquires an additional scope lease.
-    let _lock = repo.lock_store()?;
+    let _lock = repo.lock_store_in_session(repo.lock_session())?;
     let refreshed = configured_bindings(adapter_settings, &repo)?
         .into_iter()
         .filter(|(_, b)| tool.is_none_or(|tool| b.tool_id == tool))
@@ -493,7 +493,7 @@ pub(crate) fn approve(
 pub(crate) fn revoke(ctx: &AppContext, args: RevokeArgs, control: &ControlHandle) -> Result<Value> {
     let tool = selected_tool(&args.target)?;
     let repo = Repository::open_for_recovery_with_control(ctx.cwd(), control.clone())?;
-    let _lock = repo.lock_store()?;
+    let _lock = repo.lock_store_in_session(repo.lock_session())?;
     let scope_id = repo.scope_identity()?.scope_id;
     let now = control.now_utc_seconds();
     let revoked_grants =

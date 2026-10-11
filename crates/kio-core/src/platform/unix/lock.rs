@@ -710,6 +710,7 @@ pub(crate) struct PathLock {
     pub(crate) _gate: crate::scope::locks::LockGate,
 }
 pub(crate) fn acquire_path_lock(
+    _session: &crate::scope::LockSession,
     path: PathBuf,
     control: &crate::control::ControlHandle,
     pid: u32,
@@ -722,6 +723,7 @@ pub(crate) fn acquire_path_lock(
     }
 
     let gate = acquire_gate(
+        _session,
         &path,
         super::scope_semantics::acquire_path_gate,
         super::scope_semantics::unlock_path_gate,

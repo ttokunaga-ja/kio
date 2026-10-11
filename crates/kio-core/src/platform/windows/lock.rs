@@ -431,6 +431,7 @@ impl Drop for PathLock {
     }
 }
 pub(crate) fn acquire_path_lock(
+    _session: &crate::scope::LockSession,
     path: PathBuf,
     control: &crate::control::ControlHandle,
     pid: u32,

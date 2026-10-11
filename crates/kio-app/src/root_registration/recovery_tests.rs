@@ -8,6 +8,9 @@ use crate::management::{
 };
 use kio_core::control::ControlHandle;
 use kio_core::management::{begin_registration, read_record};
+use kio_core::management::{
+    detect_case_insensitive, finish_registration, publish_registration_record,
+};
 use kio_pipeline::scan::BoundPlannedChild;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -274,6 +277,7 @@ fn resume(root: &Path) {
         bytes,
         true,
         &kio_core::control::ControlHandle::default(),
+        &kio_core::scope::LockSession::default(),
     )
     .unwrap();
     assert_eq!(preserved_bytes(root), before);
@@ -351,7 +355,8 @@ fn refuses_child_initialization_started_after_registration_planning() {
             &mut journal,
             bytes,
             false,
-            &kio_core::control::ControlHandle::default()
+            &kio_core::control::ControlHandle::default(),
+            &kio_core::scope::LockSession::default(),
         )
         .is_err()
     );
@@ -390,7 +395,8 @@ fn refuses_retirement_if_absent_child_reappears_before_resume() {
             &mut journal,
             bytes.clone(),
             true,
-            &kio_core::control::ControlHandle::default()
+            &kio_core::control::ControlHandle::default(),
+            &kio_core::scope::LockSession::default(),
         )
         .is_err()
     );
@@ -432,7 +438,8 @@ fn rejects_truncated_canonical_subtree_journal() {
             &mut malformed,
             bytes,
             false,
-            &kio_core::control::ControlHandle::default()
+            &kio_core::control::ControlHandle::default(),
+            &kio_core::scope::LockSession::default(),
         )
         .is_err()
     );

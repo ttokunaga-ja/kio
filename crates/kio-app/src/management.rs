@@ -33,11 +33,20 @@ pub(crate) enum ChildScope {
 
 /// Initialize an explicit root or resume only its identity-bound bootstrap.
 /// Existing managed roots remain observable without starting a new bootstrap.
+#[cfg(test)]
 pub(crate) fn initialize_explicit_root(
     root: &Path,
     control: &kio_core::control::ControlHandle,
 ) -> Result<ExplicitRoot> {
-    root_bootstrap::initialize(root, control)
+    initialize_explicit_root_in_session(root, control, &kio_core::scope::LockSession::default())
+}
+
+pub(crate) fn initialize_explicit_root_in_session(
+    root: &Path,
+    control: &ControlHandle,
+    locks: &kio_core::scope::LockSession,
+) -> Result<ExplicitRoot> {
+    root_bootstrap::initialize_in_session(root, control, locks)
 }
 
 /// Open an existing root only after validating its management chain.
@@ -78,7 +87,7 @@ pub(crate) fn reconcile_planned_child(
     parent: &Repository,
     child: BoundPlannedChild,
 ) -> Result<ChildScope> {
-    let _parent_lock = parent.lock_store()?;
+    let _parent_lock = parent.lock_store_in_session(parent.lock_session())?;
     let BoundPlannedChild {
         canonical_root,
         root,
@@ -120,7 +129,8 @@ pub(crate) fn reconcile_planned_child(
         parent.control().clone(),
     )?;
     if retained_kio(&child_directory)?.is_some() {
-        let repo = open_existing_bound(&canonical_root, &child_directory)?;
+        let repo = open_existing_bound(&canonical_root, &child_directory)?
+            .in_lock_session(parent.lock_session());
         let child_binding = binding_for_repo(&repo)?;
         let child_record = read_record(&child_binding)?;
         validate_live_chain(&child_binding)?;

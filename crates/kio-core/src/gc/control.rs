@@ -9,6 +9,14 @@ impl GcSweepSession {
         root: impl Into<PathBuf>,
         control: crate::control::ControlHandle,
     ) -> Result<Self> {
+        Self::bind_in_session(root, control, &crate::scope::LockSession::default())
+    }
+
+    pub fn bind_in_session(
+        root: impl Into<PathBuf>,
+        control: crate::control::ControlHandle,
+        locks: &crate::scope::LockSession,
+    ) -> Result<Self> {
         let root = root.into();
         if !root.is_absolute() {
             return Err(KioError::invalid_usage(
@@ -33,6 +41,7 @@ impl GcSweepSession {
         )?;
         reject_pending_managed_restore(&kio_directory)?;
         Ok(Self {
+            lock_session: locks.clone(),
             root: canonical,
             scope,
             kio,
@@ -43,9 +52,10 @@ impl GcSweepSession {
     /// used by an internal child index. Ordinary repositories have no retained
     /// handles and use the same public no-follow bind as [`Self::bind`].
     pub fn bind_repository(repository: &Repository) -> Result<Self> {
-        let session = Self::bind_with_control(
+        let session = Self::bind_in_session(
             repository.canonical_root().to_path_buf(),
             repository.control().clone(),
+            repository.lock_session(),
         )?;
         match (
             repository.bound_root_handle(),

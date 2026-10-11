@@ -578,7 +578,8 @@ pub(super) fn promote_completed_online_markdownize(
     publish_staged_tool_lock(repo.kio_dir(), &state)?;
     maybe_inject_promotion_fault("after_head", ctx.control)?;
     if let Some(commit_hash) = &outcome.commit_hash {
-        ctx.control.append_event_log(
+        ctx.control.append_event_log_in_session(
+            ctx.locks,
             "KIO-I-COMMIT-CREATED-001",
             "online Markdownize promotion commit created",
             json!({

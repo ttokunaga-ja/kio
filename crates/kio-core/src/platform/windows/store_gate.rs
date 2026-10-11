@@ -177,9 +177,13 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path()).unwrap();
         let kio = retained(&repo);
-        let ordinary = StoreLock::acquire(repo.kio_dir()).unwrap();
+        let ordinary =
+            StoreLock::acquire_in_session(repo.lock_session(), repo.kio_dir(), repo.control())
+                .unwrap();
         locked(acquire_bound_store_read_guard(&kio));
-        let nested = StoreLock::acquire(repo.kio_dir()).unwrap();
+        let nested =
+            StoreLock::acquire_in_session(repo.lock_session(), repo.kio_dir(), repo.control())
+                .unwrap();
         drop(nested);
         locked(acquire_bound_store_read_guard(&kio));
         drop(ordinary);
@@ -187,9 +191,11 @@ mod tests {
             .unwrap()
             .recheck_idle()
             .unwrap();
-        let bound = repo.lock_store().unwrap();
-        let nested = repo.lock_store().unwrap();
-        let publication = repo.lock_purge_publication().unwrap();
+        let bound = repo.lock_store_in_session(repo.lock_session()).unwrap();
+        let nested = repo.lock_store_in_session(repo.lock_session()).unwrap();
+        let publication = repo
+            .lock_purge_publication_in_session(repo.lock_session())
+            .unwrap();
         assert!(
             !repo
                 .kio_dir()
@@ -213,8 +219,12 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let repo = Repository::init(temp.path()).unwrap();
         let kio = retained(&repo);
-        let outer = StoreLock::acquire(repo.kio_dir()).unwrap();
-        let nested = StoreLock::acquire(repo.kio_dir()).unwrap();
+        let outer =
+            StoreLock::acquire_in_session(repo.lock_session(), repo.kio_dir(), repo.control())
+                .unwrap();
+        let nested =
+            StoreLock::acquire_in_session(repo.lock_session(), repo.kio_dir(), repo.control())
+                .unwrap();
         drop(outer);
         assert!(repo.kio_dir().join(".lock").exists());
         locked(acquire_bound_store_read_guard(&kio));
@@ -236,14 +246,15 @@ mod tests {
         locked(StoreLock::acquire(repo.kio_dir()));
         drop(generic);
         let nongated = acquire_retained_lock_kind_with_control(
+            repo.lock_session(),
             &kio,
             false,
             &crate::control::ControlHandle::default(),
         )
         .unwrap();
-        locked(repo.lock_store());
+        locked(repo.lock_store_in_session(repo.lock_session()));
         drop(nongated);
-        repo.lock_store().unwrap();
+        repo.lock_store_in_session(repo.lock_session()).unwrap();
     }
 
     #[test]

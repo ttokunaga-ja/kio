@@ -39,8 +39,10 @@ use crate::historical_reindex::{
     RetainedNormalizedInstance, pinned_done_units, pinned_manifest_is_complete,
     retained_history_instances, retained_history_instances_for_roots,
 };
+#[cfg(test)]
+use crate::management::initialize_explicit_root;
 use crate::management::{
-    ChildScope, ExplicitRoot, binding_for_repo, initialize_explicit_root,
+    ChildScope, ExplicitRoot, binding_for_repo, initialize_explicit_root_in_session,
     open_existing_managed_root, reconcile_planned_child,
 };
 use crate::ocr_discovery::{prepared_units_from_ocr_discovery, supports_ocr_from_scratch};
@@ -298,9 +300,11 @@ struct Invocation<'a> {
     context: &'a AppContext,
     settings: &'a Arc<AdapterRuntimeSettings>,
     control: &'a ControlHandle,
+    locks: &'a kio_core::scope::LockSession,
 }
 
 struct InvocationRuntime {
+    locks: kio_core::scope::LockSession,
     control: kio_core::control::ControlHandle,
     settings: Arc<AdapterRuntimeSettings>,
     _managed_trust: Option<trust::RuntimeTrust>,
@@ -314,13 +318,13 @@ impl std::ops::Deref for Invocation<'_> {
 }
 impl Invocation<'_> {
     fn open_read_only_repository(&self) -> Result<Repository> {
-        Repository::open_read_only_with_control(self.cwd(), self.control.clone())
+        Repository::open_read_only_in_session(self.cwd(), self.control.clone(), self.locks)
     }
     fn open_recovery_repository(&self) -> Result<Repository> {
-        Repository::open_for_recovery_with_control(self.cwd(), self.control.clone())
+        Repository::open_recovery_in_session(self.cwd(), self.control.clone(), self.locks)
     }
     fn open_search_repository(&self) -> Result<Repository> {
-        Repository::open_for_search_read_only_with_control(self.cwd(), self.control.clone())
+        Repository::open_search_in_session(self.cwd(), self.control.clone(), self.locks)
     }
     fn scope_delay_test_control(&self) -> multi_scope::ScopeDelayTestControl {
         #[cfg(debug_assertions)]
@@ -400,6 +404,7 @@ pub fn execute(ctx: &AppContext, command: Command) -> Result<Value> {
         settings.local_peer_trust_binding = Some(trust.binding().to_owned());
     }
     let runtime = InvocationRuntime {
+        locks: kio_core::scope::LockSession::default(),
         control,
         settings: Arc::new(settings),
         _managed_trust: managed_trust,
@@ -409,6 +414,7 @@ pub fn execute(ctx: &AppContext, command: Command) -> Result<Value> {
             context: ctx,
             settings: &runtime.settings,
             control: &runtime.control,
+            locks: &runtime.locks,
         },
         command,
     )
@@ -429,16 +435,18 @@ fn execute_dispatch(ctx: &Invocation<'_>, command: Command) -> Result<Value> {
             };
             // Management records are created only by the exclusive creation path.
             // Any pre-existing store must already have a valid live chain.
-            let (repo, created) = match initialize_explicit_root(&path, ctx.control)? {
-                ExplicitRoot::Created(repo) => (repo, true),
-                ExplicitRoot::Existing(repo) => (repo, false),
-            };
+            let (repo, created) =
+                match initialize_explicit_root_in_session(&path, ctx.control, ctx.locks)? {
+                    ExplicitRoot::Created(repo) => (repo, true),
+                    ExplicitRoot::Existing(repo) => (repo, false),
+                };
+            let repo = repo.in_lock_session(ctx.locks);
             // Existing stores may finish only a verified publication intent.
             // Missing/corrupt HEAD has no second ref from which to guess a tip.
             let (repaired, _existing_store_lock) = if created {
                 (Vec::new(), None)
             } else {
-                let lock = repo.lock_store()?;
+                let lock = repo.lock_store_in_session(repo.lock_session())?;
                 let repaired = if repo.recover_publication()? {
                     vec!["publication".to_owned()]
                 } else {
@@ -539,7 +547,8 @@ fn execute_dispatch(ctx: &Invocation<'_>, command: Command) -> Result<Value> {
             // and only then perform that write. This keeps even the open path
             // behind the active-sweep barrier without following a replaced
             // public `.kio` pathname.
-            let repo = Repository::open_for_recovery_with_control(ctx.cwd(), ctx.control.clone())?;
+            let repo =
+                Repository::open_recovery_in_session(ctx.cwd(), ctx.control.clone(), ctx.locks)?;
             let (recovered_before_publication, gc_binding) =
                 match gc::preflight_automatic(&repo, "snapshot")? {
                     gc::AutomaticGcPreflight::Proceed { recovered, binding } => {
@@ -549,7 +558,7 @@ fn execute_dispatch(ctx: &Invocation<'_>, command: Command) -> Result<Value> {
                         return Ok(gc::deferred_before_publication("snapshot", report));
                     }
                 };
-            let lock = repo.lock_store()?;
+            let lock = repo.lock_store_in_session(repo.lock_session())?;
             repo.recover_publication()?;
             validate_repo_tool_lock(&repo)?;
             // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment): a
@@ -588,7 +597,8 @@ fn execute_dispatch(ctx: &Invocation<'_>, command: Command) -> Result<Value> {
                 &explicitly_allowed_tier_a,
             )?;
             if let Some(commit_hash) = &outcome.commit_hash {
-                ctx.control.append_event_log(
+                ctx.control.append_event_log_in_session(
+                    ctx.locks,
                     "KIO-I-COMMIT-CREATED-001",
                     "commit created",
                     json!({
@@ -1042,11 +1052,12 @@ fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
         snapshot_prelock_ready
     ));
     let lock = session.acquire_snapshot_auto_store_lock()?;
-    let bound_repo = Repository::open_bound_existing_with_control(
+    let bound_repo = Repository::open_bound_in_session(
         repo.canonical_root().to_path_buf(),
         session.retained_scope_handle()?,
         session.retained_kio_handle()?,
         ctx.control.clone(),
+        ctx.locks,
     )?;
     let locked = observe_scheduled_auto(adapter_settings, &bound_repo, &session, &now)?;
     if locked != initial || locked.gc != gc_binding {
@@ -1110,7 +1121,8 @@ fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
         state_published = true;
         if let Some(commit_hash) = outcome.commit_hash.as_deref() {
             mark_replica_rebuilding_or_log(ctx, bound_repo.kio_dir(), commit_hash);
-            ctx.control.append_event_log(
+            ctx.control.append_event_log_in_session(
+                ctx.locks,
                 "KIO-I-COMMIT-CREATED-001",
                 "commit created",
                 json!({
@@ -1607,7 +1619,7 @@ fn run_index(ctx: &Invocation<'_>, args: IndexArgs) -> Result<Value> {
     // `index --preview` is read-only all the way through opening the repository:
     // the ordinary open path may repair a missing HEAD, which would violate the
     // preview no-state-creation contract before scanning.
-    let repo = open_existing_managed_root(ctx.cwd(), ctx.control)?;
+    let repo = open_existing_managed_root(ctx.cwd(), ctx.control)?.in_lock_session(ctx.locks);
     run_index_for_repo(ctx, args, &repo, true)
 }
 
@@ -1846,7 +1858,7 @@ fn run_index_for_repo_inner(
     // only then constructs a fresh preview, binding approvals and writes to the
     // current tree rather than a stale pre-lock observation. The lock is
     // reentrant, so the internal auto-snapshot re-acquisition does not deadlock.
-    let lock = repo.lock_store()?;
+    let lock = repo.lock_store_in_session(repo.lock_session())?;
     admission_policy.revalidate().map_err(pipeline_to_kio)?;
     management::reconcile_child_lifecycle(repo)?;
     // Lifecycle reconciliation may legitimately change management records.
@@ -1953,7 +1965,8 @@ fn run_index_for_repo_inner(
         // search cannot serve the prior Ready snapshot in that interval.
         mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), commit_hash);
         maybe_inject_replica_after_head_fault("index", ctx.control)?;
-        ctx.control.append_event_log(
+        ctx.control.append_event_log_in_session(
+            ctx.locks,
             "KIO-I-COMMIT-CREATED-001",
             "auto commit created",
             json!({
@@ -2388,7 +2401,8 @@ fn reopen_managed_child_ancestor(
         }
         policy.revalidate().map_err(pipeline_to_kio)?;
         path.push(name);
-        let next = open_existing_managed_root(&repo.canonical_root().join(&path), repo.control())?;
+        let next = open_existing_managed_root(&repo.canonical_root().join(&path), repo.control())?
+            .in_lock_session(repo.lock_session());
         let record = kio_core::management::read_record(&binding_for_repo(&next)?)?;
         match &record.authority {
             kio_core::management::ManagementAuthority::Root => {
@@ -2549,7 +2563,8 @@ fn run_repair(ctx: &Invocation<'_>, args: RepairArgs) -> Result<Value> {
             .path
             .map(|path| working_directory.join(path))
             .unwrap_or(working_directory);
-        let parent = management::open_existing_managed_root(&root, ctx.control)?;
+        let parent =
+            management::open_existing_managed_root(&root, ctx.control)?.in_lock_session(ctx.locks);
         return management::cancel_child_initialization(
             &parent,
             cancel.preview,
@@ -2576,7 +2591,8 @@ fn run_repair(ctx: &Invocation<'_>, args: RepairArgs) -> Result<Value> {
         let report = verify_objects::registry_prune_apply_with_control(&plan, ctx.control)?;
         return serde_json::to_value(report).map_err(|error| KioError::schema(error.to_string()));
     }
-    let repo = match Repository::open_for_recovery_with_control(ctx.cwd(), ctx.control.clone()) {
+    let repo = match Repository::open_recovery_in_session(ctx.cwd(), ctx.control.clone(), ctx.locks)
+    {
         Ok(repo) => repo,
         Err(error)
             if matches!(args.operation, RepairOperation::VerifyObjects(_))
@@ -2621,7 +2637,7 @@ fn run_repair(ctx: &Invocation<'_>, args: RepairArgs) -> Result<Value> {
         return Ok(output);
     }
     // M1(a): serialize the DB rebuild against concurrent index/repair/reindex.
-    let _lock = repo.lock_store()?;
+    let _lock = repo.lock_store_in_session(repo.lock_session())?;
     if mode == RepairMode::VerifyObjectsPruneOrphans
         && let Some(prune) = verify_objects::prune_orphans_preflight(&repo)?
     {
@@ -2851,8 +2867,12 @@ fn run_device_repair(ctx: &Invocation<'_>, rebuild_source: bool) -> Result<Value
     let mut failures = Vec::new();
     let mut live = Vec::new();
     for entry in entries {
-        match Repository::open_read_only_with_control(&entry.root_path, ctx.control.clone())
-            .and_then(|repo| validate_device_registry_entry(&entry, &repo).map(|()| repo))
+        match Repository::open_read_only_in_session(
+            &entry.root_path,
+            ctx.control.clone(),
+            ctx.locks,
+        )
+        .and_then(|repo| validate_device_registry_entry(&entry, &repo).map(|()| repo))
         {
             Ok(repo) => live.push((entry, repo)),
             // Exact-current validation is command-wide, including aggregate
@@ -3089,7 +3109,7 @@ fn run_one_device_repair(
     entry: &RegistryEntry,
     operation: DeviceRepairOperation,
 ) -> Result<Value> {
-    let _lock = repo.lock_store()?;
+    let _lock = repo.lock_store_in_session(repo.lock_session())?;
     // Revalidate after taking the lock so a path replaced between registry
     // enumeration and execution cannot be repaired under the stale identity.
     validate_device_registry_entry(entry, repo)?;
@@ -5593,7 +5613,7 @@ fn run_search(ctx: &Invocation<'_>, args: SearchArgs) -> Result<Value> {
     let started = Instant::now();
     let result = run_search_inner(ctx, args, started);
     if let Err(error) = &result {
-        append_failed_search_metrics(started, error, ctx.control);
+        append_failed_search_metrics(started, error, ctx.control, ctx.locks);
     }
     result
 }
@@ -7239,6 +7259,7 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
         &ledger_path,
         &budget_month,
         ctx.control,
+        ctx.locks,
     )?;
     // PC45/PC46: a scope that skipped shallow ancestors mid-walk is not fully
     // complete even though it was not excluded — same partial-failure
@@ -8203,6 +8224,7 @@ fn compute_index_status(
     ledger_path: &Path,
     budget_month: &str,
     control: &ControlHandle,
+    locks: &kio_core::scope::LockSession,
 ) -> Result<Value> {
     let mut total = 0u64;
     let mut done = 0u64;
@@ -8295,7 +8317,7 @@ fn compute_index_status(
         // R23-20: `scope.scope_path` is the `.kio` directory; `Repository::open`
         // wants the scope ROOT (it appends `.kio` itself), so this uses the
         // separately-carried `repo_root` field.
-        match Repository::open_with_control(&scope.repo_root, control.clone()) {
+        match Repository::open_in_session(&scope.repo_root, control.clone(), locks) {
             Ok(repo) => {
                 // 07 §5.1: a single shared read (`current_dispositions`) feeds
                 // BOTH `unsupported_inputs` and the new `office_conversion_unavailable`
@@ -9127,7 +9149,7 @@ fn run_reindex(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Value> {
     // M1(a): serialize both HEAD reindex and historical enrichment against
     // concurrent index/repair/reindex. Historical enrichment is derived-state
     // only, but still appends to the chunk ledger and SQLite projection.
-    let _lock = repo.lock_store()?;
+    let _lock = repo.lock_store_in_session(repo.lock_session())?;
     publication_policy.revalidate().map_err(pipeline_to_kio)?;
     validate_repo_tool_lock(&repo)?;
     // CL45/item 5: reconcile any stale `request_kind='sync'` cost-ledger.sqlite
@@ -11096,6 +11118,7 @@ fn rebuild_sqlite_index(
             settings: adapter_settings,
             context: ctx.context,
             control: ctx.control,
+            locks: ctx.locks,
         },
         &temp_path,
         repo,
@@ -12272,8 +12295,9 @@ fn scope_id(kio_dir: &Path) -> Result<String> {
 fn load_searchable_chunks(
     target: &ScopeTarget,
     control: &ControlHandle,
+    locks: &kio_core::scope::LockSession,
 ) -> Result<Vec<SearchableChunk>> {
-    let repo = Repository::open_with_control(&target.repo_root, control.clone())?;
+    let repo = Repository::open_in_session(&target.repo_root, control.clone(), locks)?;
     let head = repo.head_commit_hash()?.unwrap_or_default();
     if head.is_empty() {
         return Ok(Vec::new());
@@ -12473,6 +12497,7 @@ fn append_search_logs(ctx: &Invocation<'_>, repo: &Repository, response: &Value,
     // Per-search latency record (05 §7, K8a): code KIO-M-SEARCH-001 / component
     // "search" / metric search.latency_ms. redact_logs default omits query & path.
     if let Err(error) = append_jsonl_cli(
+        ctx.locks,
         &data_home(ctx.control).join("kio/logs/metrics.jsonl"),
         &json!({
             "ts": ctx.control.now_utc_seconds(),
@@ -12509,6 +12534,7 @@ fn append_search_logs(ctx: &Invocation<'_>, repo: &Repository, response: &Value,
             .unwrap_or_else(|| json!("[redacted]"))
     };
     if let Err(error) = append_jsonl_cli(
+        ctx.locks,
         &repo.kio_dir().join("logs/access.jsonl"),
         &json!({
             "ts": ctx.control.now_utc_seconds(),
@@ -12535,9 +12561,15 @@ fn append_search_logs(ctx: &Invocation<'_>, repo: &Repository, response: &Value,
 /// R12-4: the per-search metrics.jsonl line for a FAILED search (result_count 0 +
 /// the failure's error_code). Best-effort — a metrics write failure must never turn
 /// a search error into a different one (R12-5), so the result is discarded.
-fn append_failed_search_metrics(started: Instant, error: &KioError, control: &ControlHandle) {
+fn append_failed_search_metrics(
+    started: Instant,
+    error: &KioError,
+    control: &ControlHandle,
+    session: &kio_core::scope::LockSession,
+) {
     let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
     let _ = append_jsonl_cli(
+        session,
         &data_home(control).join("kio/logs/metrics.jsonl"),
         &json!({
             "ts": control.now_utc_seconds(),
@@ -12774,12 +12806,13 @@ fn read_incremental_tuning(path: &Path) -> Result<(Option<bool>, Option<f64>, Op
 /// retention prune (docs/06 §12 / docs/10 §11.6), same as events/errors. Rotation
 /// is best-effort; only the final append can fail (R12-5).
 fn append_jsonl_cli(
+    session: &kio_core::scope::LockSession,
     path: &Path,
     value: &Value,
     retention_days: u32,
     control: &ControlHandle,
 ) -> Result<()> {
-    control.append_jsonl_rotating(path, value, retention_days)
+    control.append_jsonl_rotating_in_session(session, path, value, retention_days)
 }
 
 /// `[observability] retention_days` for the device-global logs (metrics), read from
@@ -12953,7 +12986,7 @@ fn classify_short_hash(ctx: &Invocation<'_>, hash: &str) -> Result<ShortHash> {
     // through current path authority before it can participate in ambiguity or
     // pointer metadata, so an ignored chunk cannot disclose its identity.
     let mut chunks = Vec::new();
-    for chunk in load_searchable_chunks(&target, ctx.control)? {
+    for chunk in load_searchable_chunks(&target, ctx.control, ctx.locks)? {
         if policy
             .allows_path(&chunk.path_at_commit)
             .map_err(pipeline_to_kio)?
@@ -13123,7 +13156,8 @@ fn resolve_short_hash_command(ctx: &Invocation<'_>, hash: &str, as_view: bool) -
                     )
                     .and_then(|()| policy.revalidate().map_err(pipeline_to_kio))
                     .and_then(|()| {
-                        let repo = open_existing_managed_root(&target.repo_root, ctx.control)?;
+                        let repo = open_existing_managed_root(&target.repo_root, ctx.control)?
+                            .in_lock_session(ctx.locks);
                         if repo.scope_identity()?.scope_id == scope_id
                             && repo.head_commit_hash()?.as_deref() == Some(head.as_str())
                         {
@@ -13566,7 +13600,7 @@ fn resolve_pointer_for_cli(
     // was both format-incompatible and mid-purge-journal surfaced the lower-
     // priority `KIO-E-PURGE-JOURNAL-ACTIVE-001` instead of
     // `KIO-E-STORE-VERSION-001`.
-    let repo = Repository::open_with_control(&target.repo_root, ctx.control.clone())?;
+    let repo = Repository::open_in_session(&target.repo_root, ctx.control.clone(), ctx.locks)?;
     // QB5/QB6/裁定1: shared (1)+(3) preflight pair, opened as soon as the
     // target scope is known — brackets every canonical-marker dispatch below
     // (LC8-14/item 3), so those calls no longer need their own
@@ -15458,7 +15492,7 @@ fn resolve_object_uri(ctx: &Invocation<'_>, object: &ObjectUri, as_view: bool) -
     // scope's object URIs resolved with zero version enforcement; validate
     // (and discard, this path has no further use for the `Repository`
     // handle) exactly as the pointer/short-hash resolution paths do.
-    let repo = Repository::open_with_control(&target.repo_root, ctx.control.clone())?;
+    let repo = Repository::open_in_session(&target.repo_root, ctx.control.clone(), ctx.locks)?;
     // QB5/QB6/裁定1: shared (1)+(3) preflight pair.
     let checkpoint = preflight_barrier_and_index(&target.kio_dir, ctx.control)?;
     if object.object_type == "chunk" {
@@ -15715,7 +15749,7 @@ fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Value> {
     // wired onto index/repair/reindex. Without it two concurrent `batch resume`
     // runs interleave the ledger and double-send held tasks. Reentrant with any
     // inner auto-snapshot; losers fail fast with KIO-E-STORE-LOCKED-001 (exit 3).
-    let _lock = repo.lock_store()?;
+    let _lock = repo.lock_store_in_session(repo.lock_session())?;
     // Persisted recovery work is executable authority. Revalidate the repository's
     // current tool lock after acquiring the store lock and before reading or
     // mutating tasks, so resume/retry cannot bypass the same adapter policy used by
@@ -15832,6 +15866,7 @@ fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Value> {
                     settings: adapter_settings,
                     context: ctx.context,
                     control: ctx.control,
+                    locks: ctx.locks,
                 },
                 &repo,
                 &store,
@@ -15918,6 +15953,7 @@ fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Value> {
                     settings: adapter_settings,
                     context: ctx.context,
                     control: ctx.control,
+                    locks: ctx.locks,
                 },
                 &repo,
                 &store,
@@ -16971,7 +17007,8 @@ fn run_batch_resend_unknown(
     // Audit precedes the ledger CAS transition. If the process dies before it,
     // no fresh send is authorized; if it dies after it, the idempotent ledger
     // marker lets this exact task-store update safely replay.
-    ctx.control.append_event_log(
+    ctx.control.append_event_log_in_session(
+        ctx.locks,
         "KIO-I-SYNC-RESULT-UNKNOWN-RESEND-001",
         "operator authorized one fresh sync request after unknown result",
         json!({
@@ -18007,6 +18044,7 @@ fn execute_pending_markdownize_tasks(
                     "markdownize",
                     &uncovered_pricing_kinds,
                     ctx.control,
+                    ctx.locks,
                 );
                 settle_task_charge_success(&ledger, &key, &intent_token, billed)?;
                 store
@@ -19889,7 +19927,8 @@ fn compute_query_embedding_page1(
         return Ok(Some(QueryEmbeddingOutcome::NotAuthorized));
     };
     maybe_wait_at_test_search_final_consent_barrier(invocation.control);
-    let _authorizing_scope_lock = authorizing_repo.lock_store()?;
+    let _authorizing_scope_lock =
+        authorizing_repo.lock_store_in_session(authorizing_repo.lock_session())?;
     revalidate_current_policy_map(current_policies, false)?;
     if !persistent_network_allowed_for(
         adapter_settings,
@@ -20001,6 +20040,7 @@ fn compute_query_embedding_page1(
                 query_embedding_send_lane(),
                 estimate_embedding_cost(adapter_settings, query, query_embedding_send_lane()),
                 invocation.control,
+                invocation.locks,
             );
             settle_task_charge_success(&ledger, &key, &intent_token, billed)?;
             Ok(outcome
@@ -20260,6 +20300,7 @@ fn run_embedding_enrichment(
             settings: adapter_settings,
             context: ctx.context,
             control: ctx.control,
+            locks: ctx.locks,
         },
         repo,
         online,
@@ -20287,6 +20328,7 @@ fn run_historical_embedding_enrichment(
             settings: adapter_settings,
             context: ctx.context,
             control: ctx.control,
+            locks: ctx.locks,
         },
         repo,
         online,
@@ -20523,6 +20565,7 @@ fn run_embedding_enrichment_for_instances(
             settings: adapter_settings,
             context: ctx.context,
             control: ctx.control,
+            locks: ctx.locks,
         },
         &embedding_context,
         &conn,
@@ -20928,6 +20971,7 @@ fn run_embedding_enrichment_for_instances(
                                 active_embedding_send_lane(),
                                 reserved_usd,
                                 invocation.control,
+                                invocation.locks,
                             ),
                         )?;
                         // R18-1's stamp, still needed so `reconcile_committed_embedding_tasks`
@@ -22444,6 +22488,7 @@ fn poll_batch_embedding_jobs(
                 PreferredRequestKind::Batch,
                 row.estimated_usd,
                 ctx.control,
+                ctx.locks,
             ),
             false,
             true,
@@ -22989,6 +23034,7 @@ fn embedding_billed_from_usage(
     lane: PreferredRequestKind,
     fallback_estimated_usd: f64,
     control: &ControlHandle,
+    session: &kio_core::scope::LockSession,
 ) -> BilledAmount {
     let (billed, uncovered) = resolve_billing_from_reported_usage(
         reported,
@@ -23006,7 +23052,7 @@ fn embedding_billed_from_usage(
         )]),
         fallback_estimated_usd,
     );
-    warn_uncovered_pricing_kinds_once(EMBEDDING_ADAPTER_KIND, &uncovered, control);
+    warn_uncovered_pricing_kinds_once(EMBEDDING_ADAPTER_KIND, &uncovered, control, session);
     billed
 }
 
@@ -24881,7 +24927,8 @@ fn run_index_pipeline(
     {
         if candidate.size_bytes > max_input_bytes {
             result.skipped_oversized_files += 1;
-            repo.control().append_event_log(
+            repo.control().append_event_log_in_session(
+                repo.lock_session(),
                 "KIO-I-INDEX-INPUT-OVERSIZED-001",
                 "input file exceeds adapter.policy.max_input_bytes; skipped adapter processing",
                 json!({
@@ -24895,7 +24942,8 @@ fn run_index_pipeline(
         if !repository_scan_policy_allows_file(repo, &candidate.input_path)
             .map_err(pipeline_to_kio)?
         {
-            repo.control().append_event_log(
+            repo.control().append_event_log_in_session(
+                repo.lock_session(),
                 "KIO-I-INDEX-INPUT-POLICY-CHANGED-001",
                 "input is no longer authorized by current scope policy; skipped",
                 json!({ "input_path": candidate.input_path }),
@@ -24907,7 +24955,8 @@ fn run_index_pipeline(
             match read_repository_scan_input(repo, &candidate.input_path, max_input_bytes) {
                 Ok(verified) => verified,
                 Err(error) => {
-                    repo.control().append_event_log(
+                    repo.control().append_event_log_in_session(
+                        repo.lock_session(),
                         "KIO-I-INDEX-INPUT-CHANGED-001",
                         "input could not be rebound to a regular bounded scope child; skipped",
                         json!({ "input_path": candidate.input_path }),
@@ -24931,7 +24980,8 @@ fn run_index_pipeline(
         if let Some(scan_hash) = &candidate.raw_hash
             && scan_hash != &current_hash
         {
-            repo.control().append_event_log(
+            repo.control().append_event_log_in_session(
+                repo.lock_session(),
                 "KIO-I-INDEX-INPUT-CHANGED-001",
                 "input file changed between scan and normalize; skipped to preserve \
                      content-addressing (re-run index)",
@@ -25124,7 +25174,7 @@ fn run_index_pipeline(
                     },
                 )?;
                 unsupported_paths.insert(candidate.input_path.clone());
-                repo.control().append_event_log(
+                repo.control().append_event_log_in_session(repo.lock_session(),
                     "KIO-I-INDEX-INPUT-UNRECOGNIZED-BINARY-001",
                     "binary input has no locally-extractable text and no OCR-able media type; archived but not enriched",
                     json!({
@@ -25264,7 +25314,8 @@ fn run_index_pipeline(
         let previous =
             previous_instance_for_path(&task_store, &candidate.input_path, &markdown_profile_hash)
                 .unwrap_or_else(|_err| {
-                    let _ = repo.control().append_event_log(
+                    let _ = repo.control().append_event_log_in_session(
+                        repo.lock_session(),
                         "KIO-I-INDEX-PREVIOUS-UNREADABLE-001",
                         "prior normalized instance unreadable; indexing this file as Full",
                         json!({ "input_path": candidate.input_path }),
@@ -25389,7 +25440,7 @@ fn run_index_pipeline(
                 // passthrough — took a live probe to recover). Keep the
                 // task-record shape, but preserve the actual reason in the
                 // event log.
-                repo.control().append_event_log(
+                repo.control().append_event_log_in_session(repo.lock_session(),
                     "KIO-E-ADAPTER-CONTRACT-001",
                     "offline markdownize response failed acceptance; task recorded as contract_violation",
                     json!({
@@ -26900,6 +26951,7 @@ fn warn_uncovered_pricing_kinds_once(
     adapter_kind: &str,
     kinds: &[String],
     control: &ControlHandle,
+    session: &kio_core::scope::LockSession,
 ) {
     if kinds.is_empty() {
         return;
@@ -26915,7 +26967,8 @@ fn warn_uncovered_pricing_kinds_once(
         return;
     }
     drop(guard);
-    let _ = control.append_warn_log(
+    let _ = control.append_warn_log_in_session(
+        session,
         "KIO-W-ADAPTER-PRICING-UNCOVERED-001",
         "billable_units reported a kind with no tools.toml [pricing] entry; \
          billing degraded to estimated",
@@ -27975,7 +28028,8 @@ fn collect_batch_markdownize_output(
             // reason string lands in the event log — a silent reject cost a
             // live probe to diagnose on the 2026-07-23 OCR run (same lesson
             // as the offline `let _ = error` fix).
-            repo.control().append_event_log(
+            repo.control().append_event_log_in_session(
+                repo.lock_session(),
                 "KIO-E-ADAPTER-CONTRACT-001",
                 "batch OCR output failed acceptance; settled as contract_violation",
                 json!({ "input_path": task.input_path, "detail": error.to_string() }),
@@ -27996,7 +28050,8 @@ fn collect_batch_markdownize_output(
             // validation. Keep the ledger reservation and collect it again;
             // treating local image CAS trouble as a contract reject would
             // discard a known billed result and schedule a new send.
-            repo.control().append_event_log(
+            repo.control().append_event_log_in_session(
+                repo.lock_session(),
                 "KIO-E-BATCH-RESULT-STORE-001",
                 "batch OCR image persistence deferred; retaining known provider result",
                 json!({ "input_path": task.input_path, "detail": error.to_string() }),
@@ -28020,7 +28075,7 @@ fn collect_batch_markdownize_output(
     let outcome = match materialized {
         Ok(outcome) => outcome,
         Err(failure) if failure.retry_kind == RetryErrorKind::ContractViolation => {
-            repo.control().append_event_log(
+            repo.control().append_event_log_in_session(repo.lock_session(),
                 "KIO-E-ADAPTER-CONTRACT-001",
                 "batch OCR materialize failed acceptance; settled as contract_violation",
                 json!({ "input_path": task.input_path, "detail": format!("materialize reject: {:?}", failure.retry_kind) }),
@@ -28057,7 +28112,12 @@ fn collect_batch_markdownize_output(
         &markdownize_pricing,
         row.estimated_usd,
     );
-    warn_uncovered_pricing_kinds_once("markdownize", &uncovered_pricing_kinds, repo.control());
+    warn_uncovered_pricing_kinds_once(
+        "markdownize",
+        &uncovered_pricing_kinds,
+        repo.control(),
+        repo.lock_session(),
+    );
     settle_batch_charge_terminal(
         ledger,
         &row.key,
@@ -31110,6 +31170,7 @@ mod tests {
                     &ledger_path,
                     month,
                     &kio_core::control::ControlHandle::default(),
+                    &kio_core::scope::LockSession::default(),
                 )
                 .unwrap();
                 assert_eq!(
@@ -31235,6 +31296,7 @@ mod tests {
             std::path::Path::new("/private/test/cost-ledger.sqlite"),
             "2026-09",
             &kio_core::control::ControlHandle::default(),
+            &kio_core::scope::LockSession::default(),
         )
         .unwrap();
         assert_eq!(status["tasks_complete"], false);
@@ -32942,6 +33004,7 @@ mod tests {
                     kio_adapter::tool_lock::AdapterRuntimeSettings::default(),
                 ),
                 control: ledger.control(),
+                locks: &kio_core::scope::LockSession::default(),
             },
             &ledger,
             &first_key,
@@ -32964,6 +33027,7 @@ mod tests {
                     kio_adapter::tool_lock::AdapterRuntimeSettings::default(),
                 ),
                 control: ledger.control(),
+                locks: &kio_core::scope::LockSession::default(),
             },
             &ledger,
             &second_key,
@@ -32984,6 +33048,7 @@ mod tests {
                     kio_adapter::tool_lock::AdapterRuntimeSettings::default(),
                 ),
                 control: ledger.control(),
+                locks: &kio_core::scope::LockSession::default(),
             },
             &ledger,
             &second_key,

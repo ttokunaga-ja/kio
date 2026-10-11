@@ -100,6 +100,7 @@ fn nested_execute_keeps_outer_repository_and_interaction() {
         context: &control,
         settings: &settings,
         control: &invocation_control,
+        locks: &kio_core::scope::LockSession::default(),
     };
     let expected = outcome(crate::run_view(
         &invocation,

@@ -125,9 +125,13 @@ pub(super) fn run(ctx: &crate::Invocation<'_>, args: ExportArgs) -> Result<Value
     // takes store -> publication, while export takes publication only, so no
     // reverse lock order exists. Keep it across the authoritative recheck,
     // private staging, and every final publication.
-    let publication_repo =
-        Repository::open_for_recovery_with_control(&source.target.repo_root, ctx.control.clone())?;
-    let _purge_publication_lock = publication_repo.lock_purge_publication()?;
+    let publication_repo = Repository::open_recovery_in_session(
+        &source.target.repo_root,
+        ctx.control.clone(),
+        ctx.locks,
+    )?;
+    let _purge_publication_lock =
+        publication_repo.lock_purge_publication_in_session(publication_repo.lock_session())?;
     // Recheck after the only lock export takes and before any private
     // destination staging.  GC deliberately does not share this lock.
     ensure_no_active_sweep_with_control(&source.target.kio_dir, ctx.control)?;
@@ -158,7 +162,7 @@ fn resolve_evidence_source(ctx: &crate::Invocation<'_>, operand: &str) -> Result
         pointer.scope_path.as_deref(),
         ctx.control,
     )?;
-    let repo = Repository::open_with_control(&target.repo_root, ctx.control.clone())?;
+    let repo = Repository::open_in_session(&target.repo_root, ctx.control.clone(), ctx.locks)?;
     super::validate_repo_tool_lock(&repo)?;
 
     let commit = match repo.read_commit(&pointer.commit) {
@@ -309,7 +313,7 @@ fn resolve_local_source(ctx: &crate::Invocation<'_>, operand: &str) -> Result<Ex
     match repo.resolve_commit(operand) {
         Ok(commit_hash) => resolve_commit_source(target, commit_hash, ctx.control),
         Err(error) if super::is_store_not_found(&error) => {
-            resolve_path_source(target, operand, ctx.control)
+            resolve_path_source(target, operand, ctx.control, ctx.locks)
         }
         Err(error) => Err(error),
     }
@@ -344,9 +348,10 @@ fn resolve_path_source(
     target: ScopeTarget,
     path: &str,
     control: &ControlHandle,
+    locks: &kio_core::scope::LockSession,
 ) -> Result<ExportSource> {
     validate_export_name(path, &hash_bytes(b"export-path-validation"))?;
-    let repo = Repository::open_with_control(&target.repo_root, control.clone())?;
+    let repo = Repository::open_in_session(&target.repo_root, control.clone(), locks)?;
     let head = repo
         .head_commit_hash()?
         .ok_or_else(|| export_source_not_found(path))?;

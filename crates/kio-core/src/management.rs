@@ -307,7 +307,15 @@ pub fn initialize_root(
 /// No read/search path calls this probe. The unique lower-case leaf is created
 /// with CreateOnly and is removed only through byte-verified quarantine.
 pub fn detect_case_insensitive(binding: &ManagementBinding) -> Result<bool> {
+    detect_case_insensitive_in_session(&crate::scope::LockSession::default(), binding)
+}
+
+pub fn detect_case_insensitive_in_session(
+    session: &crate::scope::LockSession,
+    binding: &ManagementBinding,
+) -> Result<bool> {
     let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
         &binding.kio,
         binding.control(),
     )?;
@@ -543,8 +551,17 @@ fn initialization_pending(
 }
 
 pub fn begin_registration(binding: &ManagementBinding, operation_id: &str) -> Result<()> {
+    begin_registration_in_session(&crate::scope::LockSession::default(), binding, operation_id)
+}
+
+pub fn begin_registration_in_session(
+    session: &crate::scope::LockSession,
+    binding: &ManagementBinding,
+    operation_id: &str,
+) -> Result<()> {
     validate_operation_id(operation_id)?;
     let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
         &binding.kio,
         binding.control(),
     )?;
@@ -572,8 +589,26 @@ pub fn publish_registration_record(
     before: &ManagementRecord,
     after: &ManagementRecord,
 ) -> Result<()> {
+    publish_registration_record_in_session(
+        &crate::scope::LockSession::default(),
+        binding,
+        operation_id,
+        before,
+        after,
+    )
+}
+
+pub fn publish_registration_record_in_session(
+    session: &crate::scope::LockSession,
+
+    binding: &ManagementBinding,
+    operation_id: &str,
+    before: &ManagementRecord,
+    after: &ManagementRecord,
+) -> Result<()> {
     validate_operation_id(operation_id)?;
     let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
         &binding.kio,
         binding.control(),
     )?;
@@ -597,8 +632,24 @@ pub fn finish_registration(
     operation_id: &str,
     expected_after: &ManagementRecord,
 ) -> Result<()> {
+    finish_registration_in_session(
+        &crate::scope::LockSession::default(),
+        binding,
+        operation_id,
+        expected_after,
+    )
+}
+
+pub fn finish_registration_in_session(
+    session: &crate::scope::LockSession,
+
+    binding: &ManagementBinding,
+    operation_id: &str,
+    expected_after: &ManagementRecord,
+) -> Result<()> {
     validate_operation_id(operation_id)?;
     let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
         &binding.kio,
         binding.control(),
     )?;
@@ -697,7 +748,27 @@ pub fn enroll_child(
     token: impl Into<String>,
     expected_directory_identity: &DirectoryIdentity,
 ) -> Result<()> {
+    enroll_child_in_session(
+        &crate::scope::LockSession::default(),
+        parent,
+        basename,
+        scope_id,
+        token,
+        expected_directory_identity,
+    )
+}
+
+pub fn enroll_child_in_session(
+    session: &crate::scope::LockSession,
+
+    parent: &ManagementBinding,
+    basename: &str,
+    scope_id: impl Into<String>,
+    token: impl Into<String>,
+    expected_directory_identity: &DirectoryIdentity,
+) -> Result<()> {
     let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
         &parent.kio,
         parent.control(),
     )?;
@@ -740,7 +811,23 @@ pub fn compare_and_remove_child_enrollment(
     basename: &str,
     expected: &ChildEnrollment,
 ) -> Result<bool> {
+    compare_and_remove_child_enrollment_in_session(
+        &crate::scope::LockSession::default(),
+        parent,
+        basename,
+        expected,
+    )
+}
+
+pub fn compare_and_remove_child_enrollment_in_session(
+    session: &crate::scope::LockSession,
+
+    parent: &ManagementBinding,
+    basename: &str,
+    expected: &ChildEnrollment,
+) -> Result<bool> {
     let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
         &parent.kio,
         parent.control(),
     )?;
@@ -762,7 +849,16 @@ pub fn compare_and_remove_child_enrollment(
     }
 }
 pub fn revoke_child(parent: &ManagementBinding, basename: &str) -> Result<bool> {
+    revoke_child_in_session(&crate::scope::LockSession::default(), parent, basename)
+}
+
+pub fn revoke_child_in_session(
+    session: &crate::scope::LockSession,
+    parent: &ManagementBinding,
+    basename: &str,
+) -> Result<bool> {
     let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
         &parent.kio,
         parent.control(),
     )?;
@@ -781,7 +877,25 @@ pub fn initialize_child(
     scope_id: impl Into<String>,
     token: impl Into<String>,
 ) -> Result<ManagementRecord> {
+    initialize_child_in_session(
+        &crate::scope::LockSession::default(),
+        parent,
+        child,
+        scope_id,
+        token,
+    )
+}
+
+pub fn initialize_child_in_session(
+    session: &crate::scope::LockSession,
+
+    parent: &ManagementBinding,
+    child: &ManagementBinding,
+    scope_id: impl Into<String>,
+    token: impl Into<String>,
+) -> Result<ManagementRecord> {
     let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
         &parent.kio,
         parent.control(),
     )?;

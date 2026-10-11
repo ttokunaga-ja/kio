@@ -482,7 +482,8 @@ pub(super) fn run(
     // Bind the scope read-only before probing the optional marker so an
     // ordinary non-scope is an invalid-usage error, never an I/O-shaped
     // missing-marker failure.  This has no HEAD self-heal side effect.
-    let preview_session = GcSweepSession::bind_with_control(root.clone(), ctx.control.clone())?;
+    let preview_session =
+        GcSweepSession::bind_in_session(root.clone(), ctx.control.clone(), ctx.locks)?;
 
     if preview_session.has_pending_marker_exchange()? {
         if dry_run {
@@ -498,7 +499,7 @@ pub(super) fn run(
                 "GC marker publication is incomplete; resume with kio gc --yes",
             ));
         }
-        return resume(root, now, ctx.control);
+        return resume(root, now, ctx.control, ctx.locks);
     }
 
     if let Some(marker) = preview_session.read_marker()? {
@@ -509,7 +510,7 @@ pub(super) fn run(
         // synthesized count summary: it is the exact durable state that will
         // be validated and resumed.
         confirm(ctx, &marker, marker.candidates.len(), true, yes, json_mode)?;
-        return resume(root, now, ctx.control);
+        return resume(root, now, ctx.control, ctx.locks);
     }
 
     let preview_plan = preview_session.plan_at(now)?;
@@ -541,7 +542,7 @@ pub(super) fn run(
     // It is inert unless explicitly named and has no role in production
     // mutation authority: the locked replan below remains mandatory.
     maybe_wait_at_test_prelock_barrier(ctx.control);
-    start(root, now, preview_plan, ctx.control)
+    start(root, now, preview_plan, ctx.control, ctx.locks)
 }
 
 fn start(
@@ -549,9 +550,10 @@ fn start(
     now: i64,
     preview: GcPlan,
     control: &kio_core::control::ControlHandle,
+    locks: &kio_core::scope::LockSession,
 ) -> Result<Value> {
     // Bind before locking: retained capabilities protect against cwd replacement.
-    let session = GcSweepSession::bind_with_control(root, control.clone())?;
+    let session = GcSweepSession::bind_in_session(root, control.clone(), locks)?;
     let mut budget = ExecutionBudget::new(None, session.control());
     start_session_with_budget(&session, now, preview, &mut budget, None, None, None)
 }
@@ -624,8 +626,9 @@ fn resume(
     root: std::path::PathBuf,
     now: i64,
     control: &kio_core::control::ControlHandle,
+    locks: &kio_core::scope::LockSession,
 ) -> Result<Value> {
-    let session = GcSweepSession::bind_with_control(root, control.clone())?;
+    let session = GcSweepSession::bind_in_session(root, control.clone(), locks)?;
     let mut budget = ExecutionBudget::new(None, session.control());
     resume_session_with_budget(&session, now, &mut budget, None, None)
 }

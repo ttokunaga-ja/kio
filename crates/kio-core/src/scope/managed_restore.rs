@@ -379,7 +379,7 @@ impl Repository {
     where
         F: FnMut() -> Result<()>,
     {
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(self.lock_session())?;
         self.ensure_no_pending_publication()?;
         self.ensure_no_pending_managed_restore()?;
         validate_current_authority()?;
@@ -465,7 +465,7 @@ impl Repository {
     /// Explicitly resolve a pending managed restore.  It never advances HEAD
     /// from the publication journal while rolling working bytes back.
     pub fn recover_managed_restore(&self) -> Result<bool> {
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(self.lock_session())?;
         let atomic_recovered = self.recover_atomic_storage()?;
         let Some((mut journal, mut journal_bytes)) = self.managed_restore_journal()? else {
             return Ok(atomic_recovered);
@@ -561,7 +561,7 @@ impl Repository {
     /// Recover private one-file operations before replaying their owning
     /// restore/publication journal. Both permitted retained roots are explicit.
     pub fn recover_atomic_storage(&self) -> Result<bool> {
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(self.lock_session())?;
         let owner = self.store_directory()?;
         let root = self.root_directory()?;
         owner.recover_atomic(&[&owner, &root])
