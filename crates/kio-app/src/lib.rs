@@ -2551,6 +2551,21 @@ fn reject_inert_repair_yes(args: &RepairArgs) -> Result<()> {
 }
 
 fn run_repair(ctx: &Invocation<'_>, args: RepairArgs) -> Result<Value> {
+    if matches!(&args.operation, RepairOperation::VerifyObjects(_)) {
+        return kio_core::cas::VerifiedCasReadBudget::new()
+            .run(u64::MAX, |reads| {
+                run_repair_with_reads(ctx, args, Some(reads))
+            })
+            .map(|(value, _)| value);
+    }
+    run_repair_with_reads(ctx, args, None)
+}
+
+fn run_repair_with_reads(
+    ctx: &Invocation<'_>,
+    args: RepairArgs,
+    reads: Option<&kio_core::cas::VerifiedCasReadCapability>,
+) -> Result<Value> {
     reject_inert_repair_yes(&args)?;
     if let RepairOperation::CancelChildInitialization(cancel) = args.operation {
         if cancel.preview == cancel.yes || (cancel.yes && cancel.operation.is_none()) {
@@ -2606,6 +2621,10 @@ fn run_repair(ctx: &Invocation<'_>, args: RepairArgs) -> Result<Value> {
             return Ok(output);
         }
         Err(error) => return Err(error),
+    };
+    let repo = match reads {
+        Some(reads) => repo.with_verified_reads(reads)?,
+        None => repo,
     };
     if let RepairOperation::RebuildDb(rebuild) = &args.operation {
         // `rebuild-db`'s post-rebuild enrichment can send, so it takes the same
@@ -2671,7 +2690,7 @@ fn run_repair(ctx: &Invocation<'_>, args: RepairArgs) -> Result<Value> {
             // Verification can recover a raw object and record a repaired
             // commit, which advances HEAD without taking the rebuild path
             // below. The replica write remains a non-fatal cache operation.
-            write_through_projection_or_log(ctx, repo.kio_dir());
+            write_through_projection_or_log_for_repo(ctx, &repo);
         }
         let has_findings = report.has_remaining_findings();
         let purge_incomplete = report
@@ -3998,7 +4017,7 @@ fn current_search_image_authority(
     let Some(head) = repo.head_commit_hash()? else {
         return Ok(image_authority::ImageAuthorityMap::default());
     };
-    match retained_history_instances(repo.kio_dir(), &head, repo.control()) {
+    match retained_history_instances(repo, &head) {
         Ok(retained) => image_authority::retained_image_authority(repo, &retained, policy),
         // A fresh current search is permitted to serve a Ready replica's
         // authenticated cached text when its source ancestry has become shallow.
@@ -4307,7 +4326,7 @@ fn collect_scope_projection(
         });
     };
     let image_policy = current_embedding_policy(repo)?;
-    let retained_images = retained_history_instances(repo.kio_dir(), &head, repo.control())?;
+    let retained_images = retained_history_instances(repo, &head)?;
     let image_authority =
         image_authority::retained_image_authority(repo, &retained_images, &image_policy)?;
 
@@ -4393,21 +4412,20 @@ fn collect_scope_projection(
     // reopen this source index on demand. The scope planner, including its
     // target-ancestor gate and target config resolution, remains the authority
     // for each row.
-    let mut at_snapshots =
-        match HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
-            .walk_allow_shallowed(&head)
-        {
-            Ok((history, _)) => history
-                .nodes_in_visit_order()
-                .map(|node| node.commit_hash.clone())
-                .collect::<BTreeSet<_>>(),
-            // Do not turn a current search with a cached shallow snapshot into a
-            // replica-refresh failure just to precompute optional `--at` rows.
-            // Requested `--at` snapshots remain below and are still resolved
-            // exactly by their own planner invocation.
-            Err(error) if error.error_code() == "KIO-E-COMMIT-SHALLOW-001" => BTreeSet::new(),
-            Err(error) => return Err(error),
-        };
+    let mut at_snapshots = match HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
+        .walk_allow_shallowed(&head)
+    {
+        Ok((history, _)) => history
+            .nodes_in_visit_order()
+            .map(|node| node.commit_hash.clone())
+            .collect::<BTreeSet<_>>(),
+        // Do not turn a current search with a cached shallow snapshot into a
+        // replica-refresh failure just to precompute optional `--at` rows.
+        // Requested `--at` snapshots remain below and are still resolved
+        // exactly by their own planner invocation.
+        Err(error) if error.error_code() == "KIO-E-COMMIT-SHALLOW-001" => BTreeSet::new(),
+        Err(error) => return Err(error),
+    };
     at_snapshots.extend(source_tree_entry_snapshot_commits(&conn)?);
     // The device replica already carries completed `--at` answers that are
     // outside this source's ordinary discovery set (notably valid empty,
@@ -4682,7 +4700,7 @@ fn projection_bindings_for_plan(
     // incomparable publication would back-publish content.
     let all_history_graph = if selector_kind == "all_history" {
         Some(
-            HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+            HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
                 .walk_allow_shallowed(&plan.snapshot_commit)?
                 .0,
         )
@@ -4692,9 +4710,8 @@ fn projection_bindings_for_plan(
     let mut all_history_ancestry = BTreeMap::<(String, String), bool>::new();
     let mut include_deleted_ranks = BTreeMap::<String, u64>::new();
     if selector_kind == "include_deleted" {
-        let (graph, skipped) =
-            HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
-                .walk_allow_shallowed(&plan.snapshot_commit)?;
+        let (graph, skipped) = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
+            .walk_allow_shallowed(&plan.snapshot_commit)?;
         let mut parents = graph
             .nodes_in_visit_order()
             .map(|node| (node.commit_hash.clone(), node.commit.parent.clone()))
@@ -7615,7 +7632,7 @@ fn prepare_scope_from_replica_header(
         && !exec.from_cursor
         && let Some(snapshot_commit) = header.current_snapshot_commit.as_deref()
     {
-        match HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+        match HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
             .snapshot(snapshot_commit)
         {
             Ok(_) => {}
@@ -7771,7 +7788,7 @@ fn is_vector_capacity_message(message: &str) -> bool {
 /// inferred, live-config, or old-format fallback.
 fn snapshot_chunking_config_hash(repo: &Repository, commit: &str) -> Result<String> {
     Ok(
-        HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+        HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
             .snapshot(commit)?
             .tree
             .chunking_config_hash,
@@ -9591,14 +9608,10 @@ fn final_shallow_commit_set(repo: &Repository) -> Result<BTreeSet<String>> {
     if kio_core::gc::read_active_marker_with_control(repo.kio_dir(), repo.control())?.is_some() {
         return Ok(BTreeSet::new());
     }
-    Ok(
-        kio_core::gc::validated_final_shallow_receipts_with_control(
-            repo.kio_dir(),
-            repo.control(),
-        )?
+    Ok(kio_core::gc::GcSweepSession::bind_repository(repo)?
+        .validated_final_shallow_receipts()?
         .into_keys()
-        .collect(),
-    )
+        .collect())
 }
 
 fn rebuild_step3_index(ctx: &Invocation<'_>, repo: &Repository) -> Result<Step3RebuildReport> {
@@ -9632,7 +9645,7 @@ fn rebuild_step3_index(ctx: &Invocation<'_>, repo: &Repository) -> Result<Step3R
     // roots and immutable CAS, not from whichever rows happened to survive in
     // the old database. Every root was proven to belong to HEAD ancestry.
     let mut tree_rows = BTreeMap::<(String, String), TreeEntryRow>::new();
-    let (graph, _) = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+    let (graph, _) = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
         .walk_for_roots_allow_shallowed(&rebuild_roots)
         .map_err(|error| annotate_index_stage(error, "walk retained history"))?;
     for node in graph.nodes_in_visit_order() {
@@ -9669,9 +9682,8 @@ fn rebuild_step3_index(ctx: &Invocation<'_>, repo: &Repository) -> Result<Step3R
     // several `step3_p0_contract.rs` history/deleted-content tests). Instead this
     // rebuild-only set below narrows WHICH retained instances may receive a brand
     // NEW `chunk_config_generations` association this pass — see the loop below.
-    let retained_instances =
-        retained_history_instances_for_roots(repo.kio_dir(), &rebuild_roots, repo.control())
-            .map_err(|error| annotate_index_stage(error, "load retained instances"))?;
+    let retained_instances = retained_history_instances_for_roots(repo, &rebuild_roots)
+        .map_err(|error| annotate_index_stage(error, "load retained instances"))?;
     let retained_unit_introductions = retained_unit_introductions(repo, &retained_instances)
         .map_err(|error| annotate_index_stage(error, "authenticate retained units"))?;
     let retained_instance_keys = retained_instances
@@ -10119,12 +10131,8 @@ fn read_head_tree_for_rebuild(repo: &Repository, head: &str) -> Result<TreeObjec
     match repo.read_tree(&commit.tree) {
         Ok(tree) => Ok(tree),
         Err(error) if is_store_not_found(&error) => {
-            kio_core::gc::validate_final_shallow_tree_with_control(
-                repo.kio_dir(),
-                head,
-                &commit.tree,
-                repo.control(),
-            )?;
+            kio_core::gc::GcSweepSession::bind_repository(repo)?
+                .validate_final_shallow_tree(head, &commit.tree)?;
             Err(commit_shallow_for_rebuild(head))
         }
         Err(error) => Err(error),
@@ -13826,7 +13834,7 @@ fn resolve_pointer_for_cli(
     // managed HEAD; a receipt-backed shallow ancestor is a boundary rather
     // than a reason to borrow authority from a detached CAS object.
     let (live_history, _) =
-        HistoryReader::new_with_control(policy_repo.kio_dir(), policy_repo.control().clone())
+        HistoryReader::new_with_store(policy_repo.kio_dir(), policy_repo.object_store())
             .walk_allow_shallowed(&policy_head)?;
     if live_history.node(&pointer.commit).is_none() {
         return Err(KioError::new(
@@ -15414,7 +15422,7 @@ fn authorize_image_object_read(
     let head = repo
         .head_commit_hash()?
         .ok_or_else(image_object_policy_denied)?;
-    let instances = retained_history_instances(repo.kio_dir(), &head, repo.control())?;
+    let instances = retained_history_instances(repo, &head)?;
     let authority = image_authority::retained_image_authority(repo, &instances, &policy)?;
     if authority.permits(&object.hash) {
         return Ok(ImageObjectReadAuthorization {
@@ -17085,7 +17093,7 @@ fn current_embedding_unknown_group_task_ids(
     )
     .map_err(index_to_kio)?;
     let chunking_config_hash = snapshot_chunking_config_hash(repo, &head)?;
-    let retained_instances = retained_history_instances(repo.kio_dir(), &head, repo.control())?;
+    let retained_instances = retained_history_instances(repo, &head)?;
     let policy = current_embedding_policy(repo)?;
     let retained = retained_history_chunks(
         &conn,
@@ -20398,8 +20406,7 @@ fn run_embedding_enrichment_for_instances(
         // `tree_entries`. Enrichment is writer work, so materialize that source
         // cache relation here before its live-chunk JOIN.
         ensure_snapshot_tree_entries(repo, &conn, &head)?;
-        retained_instances_owned =
-            retained_history_instances(repo.kio_dir(), &head, repo.control())?;
+        retained_instances_owned = retained_history_instances(repo, &head)?;
         &retained_instances_owned
     };
     let current_policy = current_embedding_policy(repo)?;
@@ -20412,8 +20419,7 @@ fn run_embedding_enrichment_for_instances(
     )?;
     let projection_instances_owned;
     let projection_instances = if selected_instances.is_some() {
-        projection_instances_owned =
-            retained_history_instances(repo.kio_dir(), &head, repo.control())?;
+        projection_instances_owned = retained_history_instances(repo, &head)?;
         &projection_instances_owned
     } else {
         retained_instances
@@ -22271,7 +22277,7 @@ fn poll_batch_embedding_jobs(
     };
     // Batch collection is likewise scoped by the required HEAD TreeObject
     // field, never by a mutable working-tree config.toml.
-    let instances = retained_history_instances(repo.kio_dir(), &head, repo.control())?;
+    let instances = retained_history_instances(repo, &head)?;
     let chunks =
         embedding_owners::collect_retained_embedding_chunks(repo, &conn, &instances, None, None)?;
     let current_policy = current_embedding_policy(repo)?;

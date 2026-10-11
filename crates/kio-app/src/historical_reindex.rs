@@ -208,12 +208,11 @@ pub(super) struct RetainedNormalizedInstance {
 /// here; left unimplemented given the regression risk and the P2-C task's own
 /// completion gate (`cargo test --workspace` green).
 pub(super) fn retained_history_instances(
-    kio_dir: &Path,
+    repo: &Repository,
     head: &str,
-    control: &ControlHandle,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
-    let graph = HistoryReader::new_with_control(kio_dir, control.clone()).walk(head)?;
-    retained_history_instances_from_graph(kio_dir, &graph, control)
+    let graph = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store()).walk(head)?;
+    retained_history_instances_from_graph(repo.kio_dir(), &graph, repo.control())
 }
 
 /// Derive retained instances from a complete strict graph.  Keeping the graph
@@ -341,16 +340,16 @@ fn retained_history_instances_from_graph(
 /// introductions in that union is necessary to remove descendant
 /// re-introductions across roots deterministically.
 pub(super) fn retained_history_instances_for_roots(
-    kio_dir: &Path,
+    repo: &Repository,
     roots: &BTreeSet<String>,
-    control: &ControlHandle,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
+    repo.object_store().verified_reads()?;
     if roots.is_empty() {
         return Ok(Vec::new());
     }
-    let (graph, _) = HistoryReader::new_with_control(kio_dir, control.clone())
+    let (graph, _) = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
         .walk_for_roots_allow_shallowed(roots)?;
-    retained_history_instances_from_graph(kio_dir, &graph, control)
+    retained_history_instances_from_graph(repo.kio_dir(), &graph, repo.control())
 }
 
 pub(super) fn run(
@@ -370,7 +369,7 @@ pub(super) fn run(
     // Unlike a history walk, an explicit historical reindex needs only the exact
     // selected commit and tree. HistoryReader gives this read the same strict CAS,
     // shallow, per-object, no-cache semantics as `search --at`.
-    let snapshot = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+    let snapshot = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
         .snapshot(&selected_commit)?;
     let config = read_chunking_config(repo)?;
     if config.chunking_config_hash != snapshot.tree.chunking_config_hash {
@@ -476,9 +475,8 @@ pub(super) fn run(
     // graph as other derived-history paths: the selected root itself remains
     // strict, while a receipt-backed shallow ancestor is an intentional
     // boundary rather than a reason to consult mutable state.
-    let (selected_graph, _) =
-        HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
-            .walk_allow_shallowed(&selected_commit)?;
+    let (selected_graph, _) = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
+        .walk_allow_shallowed(&selected_commit)?;
     let introductions_by_identity =
         selected_history_introductions(&selected_graph, &selected, &config.chunking_config_hash)?;
     for (identity, instance) in &mut selected {

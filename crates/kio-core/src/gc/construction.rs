@@ -25,6 +25,7 @@ impl GcPlanner {
         let kio = open_optional_dir(&scope, ".kio")?
             .ok_or_else(|| KioError::invalid_usage("current directory is not a Kio scope"))?;
         Ok(Self {
+            reads: CasReadAccess::Unmetered,
             control,
             root: public,
             scope,

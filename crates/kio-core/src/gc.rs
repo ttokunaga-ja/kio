@@ -24,8 +24,10 @@ pub use control::{
 };
 pub mod exchange;
 mod observed_read;
-pub(crate) use observed_read::read_regular_observed;
-use observed_read::{read_accounted_observed, read_required_accounted_observed};
+use observed_read::{
+    read_accounted_observed, read_cas_accounted_observed, read_required_accounted_observed,
+};
+pub(crate) use observed_read::{read_cas_regular_observed, read_regular_observed};
 mod unreachable_inventory;
 #[cfg(all(test, windows))]
 #[path = "gc/windows_snapshot_state_tests.rs"]
@@ -44,8 +46,8 @@ use serde_json::json;
 
 use crate::ExitCode;
 use crate::cas::{
-    MAX_COMMIT_OBJECT_BYTES, MAX_RAW_OBJECT_BYTES, MAX_TREE_OBJECT_BYTES, canonical_json_bytes,
-    hash_bytes, is_hash,
+    CasReadAccess, MAX_COMMIT_OBJECT_BYTES, MAX_RAW_OBJECT_BYTES, MAX_TREE_OBJECT_BYTES,
+    canonical_json_bytes, hash_bytes, is_hash,
 };
 use crate::dag::{CommitObject, CommitType, MAX_TREE_ENTRIES, TreeObject};
 use crate::error::{KioError, Result};
@@ -618,6 +620,7 @@ pub fn validated_final_shallow_receipts_with_control(
 }
 
 fn validated_final_shallow_receipts_bound(planner: &GcPlanner) -> Result<BTreeMap<String, String>> {
+    planner.reads.charge(0)?;
     let root_id = id_file(&planner.scope)?;
     let kio_id = id_file(&planner.kio)?;
     planner.require_layout()?;
@@ -726,7 +729,12 @@ fn inventory_final_shallow_receipts(planner: &GcPlanner) -> Result<FinalShallowI
                             format!("dir:objects/trees/{}/{}", &raw[..2], &raw[2..4]),
                             &mut observations,
                         )?;
-                        match read_regular_observed(&second, raw, MAX_TREE_OBJECT_BYTES) {
+                        match read_cas_regular_observed(
+                            &planner.reads,
+                            &second,
+                            raw,
+                            MAX_TREE_OBJECT_BYTES,
+                        ) {
                             Ok((_, observation)) => {
                                 insert_observation(
                                     &mut observations,
@@ -763,7 +771,18 @@ pub fn validate_final_shallow_tree_with_control(
     tree_hash: &str,
     control: &crate::control::ControlHandle,
 ) -> Result<()> {
-    let receipts = validated_final_shallow_receipts_with_control(kio_dir, control)?;
+    validate_final_shallow_receipt(
+        &validated_final_shallow_receipts_with_control(kio_dir, control)?,
+        commit_hash,
+        tree_hash,
+    )
+}
+
+fn validate_final_shallow_receipt(
+    receipts: &BTreeMap<String, String>,
+    commit_hash: &str,
+    tree_hash: &str,
+) -> Result<()> {
     match receipts.get(commit_hash) {
         Some(receipt_tree) if receipt_tree == tree_hash => Ok(()),
         Some(receipt_tree) => Err(KioError::new(
@@ -790,6 +809,7 @@ pub fn validate_final_shallow_tree_with_control(
 /// ambient victim path, making accidental commit/raw/index deletion impossible.
 #[derive(Debug)]
 pub struct GcSweepSession {
+    reads: CasReadAccess,
     lock_session: crate::scope::LockSession,
     root: PathBuf,
     scope: std::fs::File,
@@ -1977,11 +1997,20 @@ impl GcSweepSession {
     }
     /// Validate final shallow receipts through this retained scope capability.
     pub fn validated_final_shallow_receipts(&self) -> Result<BTreeMap<String, String>> {
+        self.reads.charge(0)?;
         self.recheck_binding()?;
         validated_final_shallow_receipts_bound(&self.bound_planner()?)
     }
+    pub fn validate_final_shallow_tree(&self, commit_hash: &str, tree_hash: &str) -> Result<()> {
+        validate_final_shallow_receipt(
+            &self.validated_final_shallow_receipts()?,
+            commit_hash,
+            tree_hash,
+        )
+    }
     fn bound_planner(&self) -> Result<GcPlanner> {
         Ok(GcPlanner {
+            reads: self.reads.clone(),
             control: self.control.clone(),
             root: self.root.clone(),
             scope: self.scope.try_clone().map_err(|e| ioerr(e, "scope"))?,
@@ -2018,6 +2047,7 @@ impl GcSweepSession {
         Ok(observed)
     }
     fn marker_tree_presence(&self, marker: &GcInProgressMarker) -> Result<(bool, bool)> {
+        self.reads.charge(0)?;
         let trees = open_path(&self.kio, "objects/trees")?;
         let mut any_missing = false;
         let mut all_missing = true;
@@ -2030,7 +2060,12 @@ impl GcSweepSession {
                 None => false,
                 Some(a) => match open_optional_dir(&a, &raw[2..4])? {
                     None => false,
-                    Some(dir) => match read_regular_observed(&dir, raw, MAX_TREE_OBJECT_BYTES) {
+                    Some(dir) => match read_cas_regular_observed(
+                        &self.reads,
+                        &dir,
+                        raw,
+                        MAX_TREE_OBJECT_BYTES,
+                    ) {
                         Ok((bytes, _)) => {
                             self.validate_committed_tree_bytes(marker, tree_hash, &bytes)?;
                             true
@@ -2056,6 +2091,7 @@ impl GcSweepSession {
                 };
                 match archives.as_ref() {
                     Some(archives) => crate::platform::marker_archive_presence(
+                        &self.reads,
                         archives,
                         &archive,
                         &format!("{}-{raw}-captured", marker.sweep_id),
@@ -2678,6 +2714,7 @@ impl GcPlan {
 
 #[derive(Debug)]
 pub struct GcPlanner {
+    reads: CasReadAccess,
     control: crate::control::ControlHandle,
     root: PathBuf,
     scope: std::fs::File,
@@ -2701,6 +2738,7 @@ impl GcPlanner {
     }
 
     fn plan_at_inner(&self, now: i64, before_stability_check: impl FnOnce()) -> Result<GcPlan> {
+        self.reads.charge(0)?;
         let root_id = id_file(&self.scope)?;
         let kio_id = id_file(&self.kio)?;
         self.require_layout()?;
@@ -2960,6 +2998,7 @@ impl GcPlanner {
         s: &mut GcPlanStats,
         observations: &mut BTreeMap<String, FileObservation>,
     ) -> Result<HashMap<String, CommitObject>> {
+        self.reads.charge(0)?;
         let b = open_path(&self.kio, "objects/commits")?;
         let mut o = HashMap::new();
         for a in names(&b, s, &self.limits, 2)? {
@@ -2976,10 +3015,9 @@ impl GcPlanner {
                     if n.len() != 64 || !hex(&n) || n[..2] != a || n[2..4] != bb {
                         return Err(corrupt("invalid commit leaf"));
                     }
-                    let x = read_accounted_observed(
-                        &bd,
-                        &n,
-                        MAX_COMMIT_OBJECT_BYTES,
+                    let x = read_cas_accounted_observed(
+                        &self.reads,
+                        (&bd, &n, MAX_COMMIT_OBJECT_BYTES),
                         s,
                         &self.limits,
                         observations,
@@ -3010,6 +3048,7 @@ impl GcPlanner {
         s: &mut GcPlanStats,
         observations: &mut BTreeMap<String, FileObservation>,
     ) -> Result<u64> {
+        self.reads.charge(0)?;
         let raw = h
             .strip_prefix("sha256:")
             .ok_or_else(|| corrupt("invalid tree hash"))?;
@@ -3020,9 +3059,8 @@ impl GcPlanner {
         let a = open_required_dir(&b, &raw[..2], "tree object fanout is missing")?;
         let d = open_required_dir(&a, &raw[2..4], "tree object fanout is missing")?;
         let x = read_required_accounted_observed(
-            &d,
-            raw,
-            MAX_TREE_OBJECT_BYTES,
+            &self.reads,
+            (&d, raw, MAX_TREE_OBJECT_BYTES),
             "tree object is missing",
             s,
             &self.limits,
@@ -3055,6 +3093,7 @@ impl GcPlanner {
         receipts: &HashMap<String, String>,
         commits: &HashMap<String, CommitObject>,
     ) -> Result<()> {
+        self.reads.charge(0)?;
         if read_active_marker_bound(&self.kio, &self.control)?.is_some() {
             return Ok(());
         }
@@ -3077,7 +3116,12 @@ impl GcPlanner {
                     None => None,
                 };
                 match second.as_ref() {
-                    Some(dir) => match read_regular_observed(dir, raw, MAX_TREE_OBJECT_BYTES) {
+                    Some(dir) => match read_cas_regular_observed(
+                        &self.reads,
+                        dir,
+                        raw,
+                        MAX_TREE_OBJECT_BYTES,
+                    ) {
                         Ok(_) => true,
                         Err(error) if is_io_not_found(&error) => false,
                         Err(error) => return Err(error),
@@ -4217,6 +4261,39 @@ mod tests {
     use crate::dag::CommitStats;
     use crate::platform::gc_snapshot_logic::validate_snapshot_state_transition;
     use crate::scope::Repository;
+
+    #[test]
+    fn shallow_receipt_verification_charges_both_physical_commit_inventory_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = Repository::init(root.path()).unwrap();
+        std::fs::write(root.path().join("file.txt"), b"gc budget fixture").unwrap();
+        repo.snapshot(Some("gc budget fixture"), Some("2026-08-14T00:00:00Z"))
+            .unwrap();
+        let head = repo.head_commit_hash().unwrap().unwrap();
+        let commit_bytes = repo
+            .object_store()
+            .read_object(crate::cas::ObjectKind::Commit, &head)
+            .unwrap()
+            .bytes
+            .len() as u64;
+        let expected = 2 * commit_bytes;
+        let owner = crate::cas::VerifiedCasReadBudget::new();
+        let (receipts, consumed) = owner
+            .run(expected, |reads| {
+                let metered = repo.with_verified_reads(reads)?;
+                GcSweepSession::bind_repository(&metered)?.validated_final_shallow_receipts()
+            })
+            .unwrap();
+        assert!(receipts.is_empty());
+        assert_eq!(consumed, expected);
+        let error = owner
+            .run(expected - 1, |reads| {
+                let metered = repo.with_verified_reads(reads)?;
+                GcSweepSession::bind_repository(&metered)?.validated_final_shallow_receipts()
+            })
+            .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001");
+    }
 
     #[test]
     fn pending_marker_exchange_blocks_readers_when_public_marker_is_missing() {

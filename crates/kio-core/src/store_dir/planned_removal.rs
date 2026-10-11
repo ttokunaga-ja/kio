@@ -3,6 +3,7 @@
 //! they never persist authority to delete without current caller proofs.
 use super::{StoreDirectory, err, ioerr, platform, relative_components};
 use crate::Result;
+use crate::cas::CasReadAccess;
 use crate::platform::planned_removal::rename;
 use cap_primitives::fs as cap_fs;
 use sha2::{Digest, Sha256};
@@ -108,7 +109,8 @@ fn exists(parent: &File, leaf: &OsStr, label: &Path) -> Result<bool> {
         Err(e) => Err(ioerr(label, e)),
     }
 }
-fn digest(file: &File, max: u64, label: &Path) -> Result<(u64, String)> {
+fn digest(file: &File, max: u64, label: &Path, reads: &CasReadAccess) -> Result<(u64, String)> {
+    reads.charge(0)?;
     let before = identity(file, false, label)?;
     let metadata = file.metadata().map_err(|e| ioerr(label, e))?;
     if metadata.len() > max {
@@ -123,9 +125,11 @@ fn digest(file: &File, max: u64, label: &Path) -> Result<(u64, String)> {
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let cap = (max.saturating_sub(count).saturating_add(1)).min(buffer.len() as u64) as usize;
+        reads.charge(0)?;
         let size = reader
             .read(&mut buffer[..cap])
             .map_err(|e| ioerr(label, e))?;
+        reads.charge(size as u64)?;
         if size == 0 {
             break;
         }
@@ -152,11 +156,12 @@ fn capture_node(
     parent: &File,
     leaf: &OsStr,
     directory: bool,
-    budget: &mut RemovalBudget,
+    accounting: (&mut RemovalBudget, &CasReadAccess),
     depth: usize,
     max_file: u64,
     label: &Path,
 ) -> Result<Node> {
+    let (budget, reads) = accounting;
     if depth > MAX_DEPTH {
         return Err(err(label, "planned removal exceeds depth 32"));
     }
@@ -174,7 +179,7 @@ fn capture_node(
                 &held,
                 &name,
                 metadata.is_dir(),
-                budget,
+                (budget, reads),
                 depth + 1,
                 MAX_BYTES,
                 &label.join(&name),
@@ -190,7 +195,7 @@ fn capture_node(
             return Err(err(label, "planned removal file exceeds its byte bound"));
         }
         budget.reserve_bytes(length)?;
-        let (length, digest) = digest(&held, length, label)?;
+        let (length, digest) = digest(&held, length, label, reads)?;
         NodeKind::File { length, digest }
     };
     let node = Node {
@@ -223,7 +228,9 @@ fn validate_node(node: &Node, label: &Path) -> Result<()> {
             length,
             digest: expected,
         } => {
-            if digest(&node.held, *length, label)? != (*length, expected.clone()) {
+            if digest(&node.held, *length, label, &CasReadAccess::Unmetered)?
+                != (*length, expected.clone())
+            {
                 return Err(err(label, "planned removal file content changed"));
             }
         }
@@ -265,7 +272,9 @@ impl Target {
         directory: bool,
         max_file: u64,
         budget: &mut RemovalBudget,
+        reads: &CasReadAccess,
     ) -> Result<Option<Self>> {
+        reads.charge(0)?;
         let canonical = direct_leaf(leaf)?.to_os_string();
         let quarantine = quarantine_leaf(prefix, &canonical)?;
         let root = parent.root_handle();
@@ -282,7 +291,7 @@ impl Target {
             &root,
             if retired { &quarantine } else { &canonical },
             directory,
-            budget,
+            (budget, reads),
             0,
             max_file,
             leaf,
@@ -450,6 +459,7 @@ impl PlannedDirectoryRemoval {
             true,
             MAX_BYTES,
             budget,
+            &CasReadAccess::Unmetered,
         )
         .map(|target| target.map(Self))
     }
@@ -469,6 +479,7 @@ impl PlannedFileRemoval {
         leaf: &Path,
         max: u64,
         budget: &mut RemovalBudget,
+        reads: &CasReadAccess,
     ) -> Result<Option<Self>> {
         Target::capture(
             parent,
@@ -477,6 +488,7 @@ impl PlannedFileRemoval {
             false,
             max,
             budget,
+            reads,
         )
         .map(|target| target.map(Self))
     }
@@ -510,6 +522,7 @@ mod tests {
             Path::new(name),
             1024,
             &mut RemovalBudget::new(),
+            &CasReadAccess::Unmetered,
         )
         .unwrap()
         .unwrap()
@@ -611,7 +624,8 @@ mod tests {
                 &parent,
                 Path::new("victim"),
                 1024,
-                &mut RemovalBudget::new()
+                &mut RemovalBudget::new(),
+                &CasReadAccess::Unmetered
             )
             .is_err()
         );
@@ -634,7 +648,8 @@ mod tests {
                 &parent,
                 Path::new("victim"),
                 1024,
-                &mut RemovalBudget::new()
+                &mut RemovalBudget::new(),
+                &CasReadAccess::Unmetered
             )
             .is_err()
         );
@@ -642,16 +657,28 @@ mod tests {
         let mut budget = RemovalBudget::new();
         budget.reserve_pins(MAX_PINS).unwrap();
         assert!(
-            PlannedFileRemoval::capture_content(&parent, Path::new("victim"), 1024, &mut budget)
-                .is_err()
+            PlannedFileRemoval::capture_content(
+                &parent,
+                Path::new("victim"),
+                1024,
+                &mut budget,
+                &CasReadAccess::Unmetered
+            )
+            .is_err()
         );
         let mut budget = RemovalBudget {
             pins: 0,
             bytes: MAX_BYTES,
         };
         assert!(
-            PlannedFileRemoval::capture_content(&parent, Path::new("victim"), 1024, &mut budget)
-                .is_err()
+            PlannedFileRemoval::capture_content(
+                &parent,
+                Path::new("victim"),
+                1024,
+                &mut budget,
+                &CasReadAccess::Unmetered
+            )
+            .is_err()
         );
         assert_eq!(std::fs::read(temp.path().join("victim")).unwrap(), b"bytes");
     }
@@ -714,7 +741,7 @@ mod tests {
             &root,
             leaf,
             true,
-            &mut budget,
+            (&mut budget, &CasReadAccess::Unmetered),
             0,
             MAX_BYTES,
             Path::new(leaf),

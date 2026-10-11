@@ -170,7 +170,9 @@ fn run_evidence_verify(
         ));
     }
     let pointer = parse_pointer_text(&raw)?;
-    let verification = verify_pointer_for_cli(ctx, registry_input, &pointer, strict)?;
+    let (verification, _) = kio_core::cas::VerifiedCasReadBudget::new().run(u64::MAX, |reads| {
+        verify_pointer_for_cli(ctx, registry_input, &pointer, strict, reads)
+    })?;
     let mut output = verification.value()?;
     if verification.exit != ExitCode::Success {
         set_exit_override(&mut output, verification.exit);
@@ -193,6 +195,7 @@ fn verify_batch_row(
             binding.scope_id == pointer.scope_id && binding.scope_path == pointer.scope_path
         })
         .ok_or_else(batch_changed_error)?;
+    binding.reads.ensure_active()?;
     let cached = cache.get(&key).cloned();
     let verification = match cached {
         Some(verification) => verification,
@@ -225,6 +228,7 @@ fn bind_batch_scopes(
     registry_input: &EvidenceRegistry,
     pointers: &[EvidencePointer],
     strict: bool,
+    reads: &kio_core::cas::VerifiedCasReadCapability,
 ) -> Result<Vec<EvidenceScopeBinding>> {
     let mut bindings = Vec::new();
     let mut seen = BTreeSet::new();
@@ -233,7 +237,13 @@ fn bind_batch_scopes(
         if !seen.insert(key) {
             continue;
         }
-        bindings.push(bind_evidence_scope(ctx, registry_input, pointer, strict)?);
+        bindings.push(bind_evidence_scope(
+            ctx,
+            registry_input,
+            pointer,
+            strict,
+            reads,
+        )?);
     }
     Ok(bindings)
 }
@@ -359,8 +369,9 @@ fn verify_pointer_for_cli(
     registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     strict: bool,
+    reads: &kio_core::cas::VerifiedCasReadCapability,
 ) -> Result<EvidenceVerification> {
-    let binding = bind_evidence_scope(ctx, registry_input, pointer, strict)?;
+    let binding = bind_evidence_scope(ctx, registry_input, pointer, strict, reads)?;
     match &binding.state {
         EvidenceScopeState::Unavailable(result) => Ok(result.clone()),
         EvidenceScopeState::Ready {
@@ -385,6 +396,7 @@ enum EvidenceScopeState {
 }
 
 struct EvidenceScopeBinding {
+    reads: kio_core::cas::VerifiedCasReadCapability,
     scope_id: String,
     scope_path: Option<String>,
     state: EvidenceScopeState,
@@ -396,6 +408,7 @@ impl EvidenceScopeBinding {
         ctx: &crate::Invocation<'_>,
         registry_input: &EvidenceRegistry,
     ) -> Result<()> {
+        self.reads.ensure_active()?;
         match &self.state {
             EvidenceScopeState::Ready {
                 target,
@@ -510,7 +523,9 @@ fn bind_evidence_scope(
     registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     strict: bool,
+    reads: &kio_core::cas::VerifiedCasReadCapability,
 ) -> Result<EvidenceScopeBinding> {
+    reads.ensure_active()?;
     let target = match resolve_evidence_scope_target(
         ctx.cwd(),
         registry_input,
@@ -523,6 +538,7 @@ fn bind_evidence_scope(
         // unless `--strict` (PB56 promotes it to 3).
         Err(error) if error.error_code() == "KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001" => {
             return Ok(EvidenceScopeBinding {
+                reads: reads.clone(),
                 scope_id: pointer.scope_id.clone(),
                 scope_path: pointer.scope_path.clone(),
                 state: EvidenceScopeState::Unavailable(EvidenceVerification::new(
@@ -540,6 +556,7 @@ fn bind_evidence_scope(
         // PB54: live registry duplicate — exit 3 regardless of --strict.
         Err(error) if error.error_code() == "KIO-E-REGISTRY-DUP-001" => {
             return Ok(EvidenceScopeBinding {
+                reads: reads.clone(),
                 scope_id: pointer.scope_id.clone(),
                 scope_path: pointer.scope_path.clone(),
                 state: EvidenceScopeState::Unavailable(EvidenceVerification::new(
@@ -564,7 +581,8 @@ fn bind_evidence_scope(
     // purge journal surfaced the lower-priority
     // `KIO-E-PURGE-JOURNAL-ACTIVE-001` instead of `KIO-E-STORE-VERSION-001`.
     let repo =
-        Repository::open_search_in_session(&target.repo_root, ctx.control.clone(), ctx.locks)?;
+        Repository::open_search_in_session(&target.repo_root, ctx.control.clone(), ctx.locks)?
+            .with_verified_reads(reads)?;
     // QB5/QB6/裁定1: shared (1)+(3) preflight pair. Evidence verify's whole
     // response IS existence information (08 §4.3 — it never returns body),
     // so checkpoint 2 below (LC54/LC55) gates every return point, not only a
@@ -582,6 +600,7 @@ fn bind_evidence_scope(
         .map_err(index_to_kio)?
         .map(|metadata| metadata.index_generation);
     Ok(EvidenceScopeBinding {
+        reads: reads.clone(),
         scope_id: pointer.scope_id.clone(),
         scope_path: pointer.scope_path.clone(),
         state: EvidenceScopeState::Ready {
@@ -609,7 +628,7 @@ fn verify_pointer_in_scope(
         }
         Err(error) => return Err(error),
     };
-    let store = ObjectStore::new_with_control(&target.kio_dir, repo.control().clone());
+    let store = repo.object_store();
     let (commit_shallow, entry_gen, entry_normalize) = match repo.read_tree(&commit.tree) {
         Ok(tree) => {
             // PB42/43/44 (§O, verify side): select the entry whose
@@ -636,12 +655,8 @@ fn verify_pointer_in_scope(
             (false, entry_gen, entry.normalize.clone())
         }
         Err(error) if is_store_not_found(&error) => {
-            kio_core::gc::validate_final_shallow_tree_with_control(
-                &target.kio_dir,
-                &pointer.commit,
-                &commit.tree,
-                repo.control(),
-            )?;
+            GcSweepSession::bind_repository(repo)?
+                .validate_final_shallow_tree(&pointer.commit, &commit.tree)?;
             (true, None, None)
         }
         Err(error) => return Err(error),
@@ -1018,6 +1033,13 @@ fn verify_objects_with_limits(
     repo: &Repository,
     limits: VerifyLimits,
 ) -> Result<VerifyObjectsReport> {
+    if repo.object_store().verified_reads()?.is_none() {
+        return kio_core::cas::VerifiedCasReadBudget::new()
+            .run(u64::MAX, |reads| {
+                verify_objects_with_limits(&repo.with_verified_reads(reads)?, limits)
+            })
+            .map(|(report, _)| report);
+    }
     let store = repo.object_store();
     let purge = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
     let invocation_time = repo.control().now_utc_seconds();
@@ -1064,10 +1086,9 @@ fn verify_objects_with_limits(
     // sole tree that named it was shallow-discarded.
     let mut final_shallow_commits = BTreeSet::new();
     if active_gc_marker.is_none() {
-        match kio_core::gc::validated_final_shallow_receipts_with_control(
-            repo.kio_dir(),
-            repo.control(),
-        ) {
+        match GcSweepSession::bind_repository(repo)
+            .and_then(|session| session.validated_final_shallow_receipts())
+        {
             Ok(receipts) => {
                 final_shallow_commits.extend(receipts.into_keys());
             }
@@ -1083,11 +1104,7 @@ fn verify_objects_with_limits(
         // tree state.  This is the same state machine used by `kio gc --yes`,
         // so impossible combinations are corruption rather than a misleading
         // retryable finding.
-        let session = match GcSweepSession::bind_in_session(
-            repo.root().to_path_buf(),
-            repo.control().clone(),
-            repo.lock_session(),
-        ) {
+        let session = match GcSweepSession::bind_repository(repo) {
             Ok(session) => session,
             Err(error) => {
                 state.finding("gc_sweep_marker_corrupt", "", &error.to_string(), &[]);
@@ -3907,30 +3924,138 @@ mod tests {
         };
         let registry = EvidenceRegistry::fixture(registry_path.clone());
         let registry_input = &registry;
-        let mut bindings =
-            bind_batch_scopes(ctx, registry_input, std::slice::from_ref(&pointer), false).unwrap();
-        let original = match &bindings[0].state {
-            EvidenceScopeState::Unavailable(result) => result.clone(),
-            EvidenceScopeState::Ready { .. } => panic!("fixture scope must be unreachable"),
-        };
-        let key = evidence_pointer_cache_key(&pointer).unwrap();
-        let mut cache = BTreeMap::from([(key, original)]);
+        kio_core::cas::VerifiedCasReadBudget::new()
+            .run(0, |reads| {
+                let mut bindings = bind_batch_scopes(
+                    ctx,
+                    registry_input,
+                    std::slice::from_ref(&pointer),
+                    false,
+                    reads,
+                )
+                .unwrap();
+                let original = match &bindings[0].state {
+                    EvidenceScopeState::Unavailable(result) => result.clone(),
+                    EvidenceScopeState::Ready { .. } => panic!("fixture scope must be unreachable"),
+                };
+                let key = evidence_pointer_cache_key(&pointer).unwrap();
+                let mut cache = BTreeMap::from([(key, original)]);
 
-        let EvidenceScopeState::Unavailable(expected) = &mut bindings[0].state else {
-            unreachable!("fixture scope must remain unreachable");
-        };
-        expected
-            .result
-            .details
-            .as_object_mut()
-            .unwrap()
-            .insert("changed_after_cache_fill".to_owned(), json!(true));
+                let EvidenceScopeState::Unavailable(expected) = &mut bindings[0].state else {
+                    unreachable!("fixture scope must remain unreachable");
+                };
+                expected
+                    .result
+                    .details
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("changed_after_cache_fill".to_owned(), json!(true));
 
-        let error = verify_batch_row(ctx, registry_input, &pointer, false, &bindings, &mut cache)
-            .unwrap_err();
-        assert_eq!(error.error_code(), "KIO-E-EVIDENCE-BATCH-CHANGED-001");
+                let error =
+                    verify_batch_row(ctx, registry_input, &pointer, false, &bindings, &mut cache)
+                        .unwrap_err();
+                assert_eq!(error.error_code(), "KIO-E-EVIDENCE-BATCH-CHANGED-001");
+                assert!(!registry_path.exists());
+                assert!(!registry_path.parent().unwrap().exists());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn batch_cache_hit_requires_an_active_budget_even_without_cas_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("isolated-data/kio/scope-registry.sqlite");
+        let pointer = EvidencePointer {
+            schema_version: 1,
+            commit: hash('a'),
+            tree: None,
+            raw_hash: hash('b'),
+            tool_profile_hash: hash('c'),
+            chunk_hash: hash('d'),
+            path_at_commit: None,
+            heading_path: None,
+            section_id: None,
+            byte_start: None,
+            byte_end: None,
+            scope_id: "batch-cache-expired-budget-unreachable".to_owned(),
+            scope_path: Some(dir.path().join("missing-scope").display().to_string()),
+        };
+        let context = crate::context::test_support::context(dir.path());
+        let settings = Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+        let control = ControlHandle::default();
+        let locks = kio_core::scope::LockSession::default();
+        let ctx = &crate::Invocation {
+            context: &context,
+            settings: &settings,
+            control: &control,
+            locks: &locks,
+        };
+        let registry = EvidenceRegistry::fixture(registry_path.clone());
+        let owner = kio_core::cas::VerifiedCasReadBudget::new();
+        let ((bindings, mut cache), consumed) = owner
+            .run(0, |reads| {
+                let bindings = bind_batch_scopes(
+                    ctx,
+                    &registry,
+                    std::slice::from_ref(&pointer),
+                    false,
+                    reads,
+                )?;
+                let original = match &bindings[0].state {
+                    EvidenceScopeState::Unavailable(result) => result.clone(),
+                    EvidenceScopeState::Ready { .. } => panic!("fixture scope must be unreachable"),
+                };
+                let mut cache = BTreeMap::from([(evidence_pointer_cache_key(&pointer)?, original)]);
+                let result =
+                    verify_batch_row(ctx, &registry, &pointer, false, &bindings, &mut cache)?;
+                assert_eq!(result.result.status, EvidenceStatus::ScopeUnreachable);
+                Ok((bindings, cache))
+            })
+            .unwrap();
+        assert_eq!(consumed, 0);
+        let error =
+            verify_batch_row(ctx, &registry, &pointer, false, &bindings, &mut cache).unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001");
+        let ((), consumed) = owner
+            .run(0, |_| {
+                assert!(
+                    verify_batch_row(ctx, &registry, &pointer, false, &bindings, &mut cache)
+                        .is_err()
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(consumed, 0);
         assert!(!registry_path.exists());
         assert!(!registry_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn verified_pipeline_units_charge_both_inspection_and_body_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, manifest, unit) = pinned_fixture(dir.path());
+        let bytes = canonical_json_bytes(&serde_json::to_value(&unit).unwrap()).unwrap();
+        let expected = 2 * bytes.len() as u64;
+        let store = ObjectStore::new(dir.path());
+        let owner = kio_core::cas::VerifiedCasReadBudget::new();
+        let (units, consumed) = owner
+            .run(expected, |reads| {
+                let store = store.with_verified_reads(reads)?;
+                load_validated_normalized_units_from_manifest(&store, &manifest)
+                    .map_err(pipeline_to_kio)
+            })
+            .unwrap();
+        assert_eq!(units, vec![unit]);
+        assert_eq!(consumed, expected);
+        let error = owner
+            .run(expected - 1, |reads| {
+                let store = store.with_verified_reads(reads)?;
+                load_validated_normalized_units_from_manifest(&store, &manifest)
+                    .map_err(pipeline_to_kio)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("aggregate byte limit"));
     }
 
     fn commit(kind: CommitType, created_at: &str) -> CommitObject {

@@ -105,15 +105,26 @@ pub(super) fn remove_verified_cas_path(
             parent = bound_open_dir(&parent, name)?;
         }
         bound_remove_verified(control, &parent, leaf, |parent, candidate| match kind {
-            CasRemovalKind::Raw => {
-                bound_read_verified(parent, candidate, ObjectKind::Raw, hash, false).map(|_| ())
+            CasRemovalKind::Raw => bound_read_verified(
+                &CasReadAccess::Unmetered,
+                parent,
+                candidate,
+                ObjectKind::Raw,
+                hash,
+                false,
+            )
+            .map(|_| ()),
+            CasRemovalKind::Chunk => {
+                bound_read_chunk_accounted(&CasReadAccess::Unmetered, parent, candidate, hash)
+                    .map(|_| ())
+                    .map_err(|error| error.error)
             }
-            CasRemovalKind::Chunk => bound_read_chunk_accounted(parent, candidate, hash)
-                .map(|_| ())
-                .map_err(|error| error.error),
-            CasRemovalKind::Embedding => bound_read_embedding(parent, candidate, hash).map(|_| ()),
+            CasRemovalKind::Embedding => {
+                bound_read_embedding(&CasReadAccess::Unmetered, parent, candidate, hash).map(|_| ())
+            }
             CasRemovalKind::Content(kind) => {
-                bound_verify_content(parent, candidate, kind, hash).map(|_| ())
+                bound_verify_content(&CasReadAccess::Unmetered, parent, candidate, kind, hash)
+                    .map(|_| ())
             }
         })
     }

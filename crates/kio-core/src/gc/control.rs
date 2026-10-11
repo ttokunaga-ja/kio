@@ -41,6 +41,7 @@ impl GcSweepSession {
         )?;
         reject_pending_managed_restore(&kio_directory)?;
         Ok(Self {
+            reads: CasReadAccess::Unmetered,
             lock_session: locks.clone(),
             root: canonical,
             scope,
@@ -52,11 +53,13 @@ impl GcSweepSession {
     /// used by an internal child index. Ordinary repositories have no retained
     /// handles and use the same public no-follow bind as [`Self::bind`].
     pub fn bind_repository(repository: &Repository) -> Result<Self> {
-        let session = Self::bind_in_session(
+        let mut session = Self::bind_in_session(
             repository.canonical_root().to_path_buf(),
             repository.control().clone(),
             repository.lock_session(),
         )?;
+        session.reads = repository.object_store().read_access().clone();
+        session.reads.charge(0)?;
         match (
             repository.bound_root_handle(),
             repository.bound_kio_handle(),
@@ -74,6 +77,14 @@ impl GcSweepSession {
             _ => return Err(corrupt("incomplete bound child repository capability")),
         }
         Ok(session)
+    }
+
+    pub fn with_verified_reads(
+        mut self,
+        reads: &crate::cas::VerifiedCasReadCapability,
+    ) -> Result<Self> {
+        self.reads = self.reads.bind(reads)?;
+        Ok(self)
     }
 
     #[must_use]

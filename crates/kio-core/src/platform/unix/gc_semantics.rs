@@ -1,10 +1,9 @@
 use super::gc_retirement::GC_RETIRE_SENTINEL;
-use crate::cas::MAX_TREE_OBJECT_BYTES;
+use crate::cas::{CasReadAccess, MAX_TREE_OBJECT_BYTES};
 use crate::error::Result;
 use crate::gc::{
     FileObservation, GcInProgressMarker, SnapshotExchangeAuthority, corrupt,
-    has_pending_marker_exchange, is_io_not_found, read_regular_observed,
-    reject_pending_snapshot_state_exchange,
+    has_pending_marker_exchange, is_io_not_found, reject_pending_snapshot_state_exchange,
 };
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -68,15 +67,22 @@ pub(crate) fn recover_snapshot_state(
     reject_pending_snapshot_state_exchange(kio, control)
 }
 pub(crate) fn marker_archive_presence(
+    reads: &CasReadAccess,
     archives: &File,
     archive: &str,
     captured_name: &str,
     validate_bytes: impl Fn(&[u8]) -> Result<()>,
 ) -> Result<(bool, bool)> {
     Ok(
-        match read_regular_observed(archives, archive, MAX_TREE_OBJECT_BYTES) {
+        match crate::gc::read_cas_regular_observed(reads, archives, archive, MAX_TREE_OBJECT_BYTES)
+        {
             Ok((sentinel, _)) if sentinel == GC_RETIRE_SENTINEL => {
-                match read_regular_observed(archives, captured_name, MAX_TREE_OBJECT_BYTES) {
+                match crate::gc::read_cas_regular_observed(
+                    reads,
+                    archives,
+                    captured_name,
+                    MAX_TREE_OBJECT_BYTES,
+                ) {
                     Ok((bytes, _)) => {
                         validate_bytes(&bytes)?;
                         (false, true)

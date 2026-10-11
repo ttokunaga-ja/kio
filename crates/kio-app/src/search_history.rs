@@ -186,7 +186,7 @@ pub fn plan_search_history(
     since_cutoff: Option<&str>,
 ) -> Result<SearchHistoryPlan> {
     validate_cursor_cutoff(selector, since_cutoff)?;
-    let reader = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone());
+    let reader = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store());
     let mut shallow_skipped = Vec::new();
     let bindings = match selector {
         TimeSelector::Current | TimeSelector::At(_) => {
@@ -267,7 +267,7 @@ pub fn at_target_ancestors(
     commit: &str,
 ) -> Result<(BTreeSet<String>, Vec<String>)> {
     let (graph, shallow_skipped) =
-        HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+        HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
             .walk_allow_shallowed(commit)?;
     let ancestors = graph
         .nodes_in_visit_order()

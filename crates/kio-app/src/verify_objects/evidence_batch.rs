@@ -33,8 +33,8 @@ pub(super) fn run_evidence_batch(
     let input_sha256 = hash_bytes(&bytes);
 
     let (verifications, _) =
-        kio_core::cas::with_verified_cas_read_budget(MAX_BATCH_VERIFIED_BYTES, || {
-            let bindings = bind_batch_scopes(ctx, registry_input, &pointers, strict)?;
+        kio_core::cas::VerifiedCasReadBudget::new().run(MAX_BATCH_VERIFIED_BYTES, |reads| {
+            let bindings = bind_batch_scopes(ctx, registry_input, &pointers, strict, reads)?;
             let mut cache = BTreeMap::<Vec<u8>, EvidenceVerification>::new();
             let verifications = pointers
                 .iter()

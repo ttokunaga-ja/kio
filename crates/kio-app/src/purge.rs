@@ -452,11 +452,8 @@ fn authenticate_purge_chunk_inventory(
     stored_chunks: &[crate::StoredChunk],
     embeddings: &[PurgeEmbedding],
 ) -> Result<BTreeSet<String>> {
-    let retained = crate::retained_history_instances_for_roots(
-        repo.kio_dir(),
-        &crate::durable_history_roots(repo)?,
-        repo.control(),
-    )?;
+    let retained =
+        crate::retained_history_instances_for_roots(repo, &crate::durable_history_roots(repo)?)?;
     let authorities = crate::retained_unit_introductions(repo, &retained)?;
     let store = repo.object_store();
     let target_text = stored_chunks

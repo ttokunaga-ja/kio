@@ -915,6 +915,9 @@ fn load_validated_normalized_units_from_manifest_with_size(
     source_path: &Path,
     manifest: &NormalizedInstanceManifest,
 ) -> Result<(Vec<NormalizedUnitObject>, u64)> {
+    store
+        .verified_reads()
+        .map_err(|error| normalized_corrupt(source_path, error.to_string()))?;
     let identity = NormalizedInstanceIdentity {
         raw_hash: manifest.raw_hash.clone(),
         tool_profile_hash: manifest.tool_profile_hash.clone(),

@@ -167,6 +167,13 @@ pub fn prune_orphans_preflight(repo: &Repository) -> Result<Option<PruneOrphansR
 }
 
 pub fn prune_orphans_plan(repo: &Repository) -> Result<PruneOrphansPlan> {
+    let Some(reads) = repo.object_store().verified_reads()? else {
+        return kio_core::cas::VerifiedCasReadBudget::new()
+            .run(u64::MAX, |reads| {
+                prune_orphans_plan(&repo.with_verified_reads(reads)?)
+            })
+            .map(|(plan, _)| plan);
+    };
     let scope = BoundScope::bind(repo)?;
     let proof = match Proof::capture(repo, &scope) {
         Ok(proof) => proof,
@@ -177,7 +184,8 @@ pub fn prune_orphans_plan(repo: &Repository) -> Result<PruneOrphansPlan> {
     let store = ObjectStore::from_bound_kio_with_control(
         &scope.directory.root_handle(),
         repo.control().clone(),
-    )?;
+    )?
+    .with_verified_reads(&reads)?;
     let mut targets = Vec::new();
     #[cfg(test)]
     let mut prepared = Vec::new();

@@ -166,6 +166,15 @@ pub struct Repository {
 }
 
 impl Repository {
+    pub fn with_verified_reads(
+        &self,
+        reads: &crate::cas::VerifiedCasReadCapability,
+    ) -> Result<Self> {
+        let mut repo = self.clone();
+        repo.store = self.store.with_verified_reads(reads)?;
+        Ok(repo)
+    }
+
     /// Clone the repository's retained CAS authority for bounded object reads.
     #[must_use]
     pub fn object_store(&self) -> ObjectStore {
@@ -1821,12 +1830,8 @@ impl Repository {
         let prior_tree = match self.read_tree(&head_commit.tree) {
             Ok(tree) => tree,
             Err(error) if is_store_not_found(&error) => {
-                crate::gc::validate_final_shallow_tree_with_control(
-                    &self.kio_dir,
-                    &head_hash,
-                    &head_commit.tree,
-                    self.control(),
-                )?;
+                crate::gc::GcSweepSession::bind_repository(self)?
+                    .validate_final_shallow_tree(&head_hash, &head_commit.tree)?;
                 return Err(KioError::commit_shallow(
                     "HEAD tree object is missing; online output was not promoted",
                     head_hash.clone(),
@@ -2074,11 +2079,9 @@ impl Repository {
             Some(hash) => match self.read_tree(hash) {
                 Ok(tree) => Some(tree),
                 Err(error) if is_store_not_found(&error) => {
-                    crate::gc::validate_final_shallow_tree_with_control(
-                        &self.kio_dir,
+                    crate::gc::GcSweepSession::bind_repository(self)?.validate_final_shallow_tree(
                         head_hash.as_deref().unwrap_or_default(),
                         hash,
-                        self.control(),
                     )?;
                     return Err(KioError::commit_shallow(
                         "HEAD commit is shallow (tree object discarded); \
@@ -2566,12 +2569,8 @@ impl Repository {
         match self.read_tree(&commit.tree) {
             Ok(tree) => Ok(tree),
             Err(error) if is_store_not_found(&error) => {
-                crate::gc::validate_final_shallow_tree_with_control(
-                    &self.kio_dir,
-                    commit_hash,
-                    &commit.tree,
-                    self.control(),
-                )?;
+                crate::gc::GcSweepSession::bind_repository(self)?
+                    .validate_final_shallow_tree(commit_hash, &commit.tree)?;
                 Err(diff_side_shallow_error(side, commit_hash))
             }
             Err(error) => Err(error),
@@ -2630,12 +2629,8 @@ impl Repository {
         // best-effort hint).
         match self.read_tree(&tagged_commit.tree) {
             Err(error) if is_store_not_found(&error) => {
-                crate::gc::validate_final_shallow_tree_with_control(
-                    &self.kio_dir,
-                    &commit_hash,
-                    &tagged_commit.tree,
-                    self.control(),
-                )?;
+                crate::gc::GcSweepSession::bind_repository(self)?
+                    .validate_final_shallow_tree(&commit_hash, &tagged_commit.tree)?;
                 return Err(KioError::commit_shallow(
                     "cannot create a tag on a final shallow commit; restore a non-shallow commit first",
                     commit_hash.clone(),
@@ -2925,12 +2920,8 @@ impl Repository {
         match self.read_tree(&tree_hash) {
             Ok(tree) => Ok(HeadTreeState::Present(tree)),
             Err(error) if is_store_not_found(&error) => {
-                crate::gc::validate_final_shallow_tree_with_control(
-                    &self.kio_dir,
-                    &commit_hash,
-                    &tree_hash,
-                    self.control(),
-                )?;
+                crate::gc::GcSweepSession::bind_repository(self)?
+                    .validate_final_shallow_tree(&commit_hash, &tree_hash)?;
                 Ok(HeadTreeState::Shallow)
             }
             Err(error) => Err(error),

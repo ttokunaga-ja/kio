@@ -282,7 +282,7 @@ pub(super) fn collect_retained_embedding_chunks(
         return Ok(Vec::new());
     };
     let roots = durable_history_roots(repo)?;
-    let (graph, _) = HistoryReader::new_with_control(repo.kio_dir(), repo.control().clone())
+    let (graph, _) = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
         .walk_for_roots_allow_shallowed(&roots)?;
     let mut bindings = OwnerBindings::default();
     for node in graph.nodes_in_visit_order() {

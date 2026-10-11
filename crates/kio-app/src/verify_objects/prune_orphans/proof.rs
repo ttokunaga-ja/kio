@@ -187,6 +187,15 @@ pub(super) struct Preflight {
 }
 
 pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Preflight> {
+    if checked(repo.object_store().verified_reads())?.is_none() {
+        return checked(
+            kio_core::cas::VerifiedCasReadBudget::new().run(u64::MAX, |reads| {
+                let repo = repo.with_verified_reads(reads)?;
+                Ok(preflight(&repo, scope))
+            }),
+        )?
+        .0;
+    }
     checked(scope.recheck(repo))?;
     let purge = PurgeState::from_directory(checked(clone_directory(&scope.directory))?);
     if let Some(journal) = checked(purge.read_journal())? {
@@ -245,10 +254,7 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
             ));
         }
     }
-    let store = checked(ObjectStore::from_bound_kio_with_control(
-        &scope.directory.root_handle(),
-        repo.control().clone(),
-    ))?;
+    let store = proof_store(repo, scope)?;
     let mut result = Preflight {
         tasks,
         ..Preflight::default()
@@ -507,22 +513,43 @@ fn inspect_instance(
     Ok((manifest, units))
 }
 
+fn proof_store(repo: &Repository, scope: &BoundScope) -> Checked<ObjectStore> {
+    let reads = checked(repo.object_store().verified_reads())?
+        .ok_or_else(|| Blocker::unsafe_state("verification read capability required"))?;
+    checked(
+        ObjectStore::from_bound_kio_with_control(
+            &scope.directory.root_handle(),
+            repo.control().clone(),
+        )
+        .and_then(|store| store.with_verified_reads(&reads)),
+    )
+}
+
 pub(super) struct Proof {
     pub candidates: BTreeSet<TargetKey>,
 }
 impl Proof {
     pub fn capture(repo: &Repository, scope: &BoundScope) -> Checked<Self> {
+        if checked(repo.object_store().verified_reads())?.is_none() {
+            return checked(
+                kio_core::cas::VerifiedCasReadBudget::new().run(u64::MAX, |reads| {
+                    let repo = repo.with_verified_reads(reads)?;
+                    Ok(Self::capture(&repo, scope))
+                }),
+            )?
+            .0;
+        }
         let mut progress = preflight(repo, scope)?;
-        let store = checked(ObjectStore::from_bound_kio_with_control(
-            &scope.directory.root_handle(),
-            repo.control().clone(),
-        ))?;
+        let store = proof_store(repo, scope)?;
         let purge = PurgeState::from_directory(checked(clone_directory(&scope.directory))?);
         let now = repo.control().now_utc_seconds();
         let mut budget = std::mem::take(&mut progress.budget);
         let roots = checked(repo.current_ref_targets())?;
         let head = checked(repo.head_commit_hash())?;
-        let shallow = checked(scope.session.validated_final_shallow_receipts())?;
+        let shallow = checked(
+            GcSweepSession::bind_repository(repo)
+                .and_then(|session| session.validated_final_shallow_receipts()),
+        )?;
         let mut commits = BTreeMap::<String, CommitObject>::new();
         let mut trees = BTreeMap::<String, TreeObject>::new();
         let mut reachable = BTreeSet::new();

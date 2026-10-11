@@ -1,5 +1,5 @@
 use super::gc_io::{directory, observe, retire_expected};
-use crate::cas::{MAX_TREE_OBJECT_BYTES, hash_bytes};
+use crate::cas::{CasReadAccess, MAX_TREE_OBJECT_BYTES, hash_bytes};
 use crate::error::Result;
 use crate::gc::exchange;
 use crate::gc::{
@@ -157,13 +157,15 @@ pub(crate) fn recover_marker(
     cleanup_marker_temporaries(&markers, control)
 }
 pub(crate) fn marker_archive_presence(
+    reads: &CasReadAccess,
     archives: &File,
     archive: &str,
     _captured_name: &str,
     validate_bytes: impl Fn(&[u8]) -> Result<()>,
 ) -> Result<(bool, bool)> {
     Ok(
-        match read_regular_observed(archives, archive, MAX_TREE_OBJECT_BYTES) {
+        match crate::gc::read_cas_regular_observed(reads, archives, archive, MAX_TREE_OBJECT_BYTES)
+        {
             Ok((bytes, _)) => {
                 validate_bytes(&bytes)?;
                 (true, false)

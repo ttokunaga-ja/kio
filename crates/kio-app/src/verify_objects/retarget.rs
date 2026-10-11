@@ -116,20 +116,21 @@ pub(super) fn run_evidence_retarget(
         ));
     }
     let pointer = parse_pointer_text(&raw)?;
-    kio_core::cas::with_verified_cas_read_budget(MAX_RETARGET_VERIFIED_BYTES, || {
-        run_evidence_retarget_bound(ctx, registry_input, &pointer, &args.at)
-    })
-    .map(|(value, _)| value)
-    .map_err(|error| {
-        if matches!(
-            error.error_code(),
-            "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001" | "KIO-E-COMMIT-HISTORY-LIMIT-001"
-        ) {
-            retarget_limit_error()
-        } else {
-            error
-        }
-    })
+    kio_core::cas::VerifiedCasReadBudget::new()
+        .run(MAX_RETARGET_VERIFIED_BYTES, |reads| {
+            run_evidence_retarget_bound(ctx, registry_input, &pointer, &args.at, reads)
+        })
+        .map(|(value, _)| value)
+        .map_err(|error| {
+            if matches!(
+                error.error_code(),
+                "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001" | "KIO-E-COMMIT-HISTORY-LIMIT-001"
+            ) {
+                retarget_limit_error()
+            } else {
+                error
+            }
+        })
 }
 
 fn run_evidence_retarget_bound(
@@ -137,8 +138,9 @@ fn run_evidence_retarget_bound(
     registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     at: &str,
+    reads: &kio_core::cas::VerifiedCasReadCapability,
 ) -> Result<Value> {
-    let binding = bind_evidence_scope(ctx, registry_input, pointer, true)?;
+    let binding = bind_evidence_scope(ctx, registry_input, pointer, true, reads)?;
     let EvidenceScopeState::Ready {
         target,
         repo,
@@ -191,7 +193,7 @@ fn run_evidence_retarget_bound(
         }
         Err(error) => return Err(error),
     };
-    let store = ObjectStore::new_with_control(&target.kio_dir, ctx.control.clone());
+    let store = repo.object_store();
     if let Some(marker_verification) =
         canonical_pointer_marker_verification(pointer, true, target, &store, checkpoint)?
     {
@@ -205,13 +207,7 @@ fn run_evidence_retarget_bound(
         && let Some(entry) = canonical_pointer_tree_entry(tree, pointer)
         && let Some(normalize) = &entry.normalize
     {
-        retarget_manifest_unit_preflight(
-            &target.kio_dir,
-            &pointer.raw_hash,
-            normalize,
-            false,
-            ctx.control,
-        )?;
+        retarget_manifest_unit_preflight(&store, &pointer.raw_hash, normalize, false)?;
     }
     // Run the same canonical verifier used by `evidence verify` before doing
     // any retarget-specific reconstruction.  Optional presentation fields on
@@ -262,29 +258,8 @@ fn run_evidence_retarget_bound(
 
     // `--at` was grammar-checked above; this is deliberately a direct object
     // read, never a ref/tag/HEAD resolver.
-    let target_commit = read_exact_retarget_commit(&target.kio_dir, at, ctx.control)?;
-    let target_tree = match repo.read_tree(&target_commit.tree) {
-        Ok(tree) => tree,
-        Err(error) if is_store_not_found(&error) => {
-            kio_core::gc::validate_final_shallow_tree_with_control(
-                &target.kio_dir,
-                at,
-                &target_commit.tree,
-                repo.control(),
-            )?;
-            return Err(retarget_shallow_error(
-                "target Evidence commit is shallow; retarget requires its tree",
-                at,
-            ));
-        }
-        Err(error) if error.exit_code() == ExitCode::InvalidUsage => {
-            return Err(retarget_error(
-                "KIO-E-STORE-CORRUPT-001",
-                "target Evidence tree contradicts its commit CAS object",
-            ));
-        }
-        Err(error) => return Err(error),
-    };
+    let target_commit = read_exact_retarget_commit(&store, at)?;
+    let target_tree = read_retarget_target_tree(repo, at, &target_commit)?;
     let target_entry = target_tree
         .entries
         .iter()
@@ -294,13 +269,7 @@ fn run_evidence_retarget_bound(
         .normalize
         .as_ref()
         .ok_or_else(retarget_not_found_error)?;
-    retarget_manifest_unit_preflight(
-        &target.kio_dir,
-        &pointer.raw_hash,
-        target_normalize,
-        true,
-        ctx.control,
-    )?;
+    retarget_manifest_unit_preflight(&store, &pointer.raw_hash, target_normalize, true)?;
     let target_units =
         pinned_done_units(repo, &pointer.raw_hash, target_normalize).map_err(|error| {
             if is_store_not_found(&error) {
@@ -399,7 +368,7 @@ fn run_evidence_retarget_bound(
         byte_end: Some(chunk.byte_end),
     })
     .map_err(search_to_kio)?;
-    let verification = verify_pointer_for_cli(ctx, registry_input, &issued, true)?;
+    let verification = verify_pointer_for_cli(ctx, registry_input, &issued, true, reads)?;
     // Drift checks take precedence over a stale final-verifier result.  Only
     // classify a stable non-alive result after every retained authority still
     // denotes the command-start snapshot.
@@ -418,20 +387,36 @@ fn run_evidence_retarget_bound(
 /// Read `--at` as exactly one commit object. A missing hash or an object from
 /// another namespace is an invalid operand; malformed bytes inside the commit
 /// namespace are authenticated store corruption, not a spelling error.
-fn read_exact_retarget_commit(
-    kio_dir: &Path,
+fn read_retarget_target_tree(
+    repo: &Repository,
     at: &str,
-    control: &ControlHandle,
-) -> Result<CommitObject> {
-    let object = ObjectStore::new_with_control(kio_dir, control.clone())
-        .read_by_hash(at)
-        .map_err(|error| {
-            if is_store_not_found(&error) {
-                KioError::invalid_usage("--at does not name a commit object in this scope")
-            } else {
-                error
-            }
-        })?;
+    commit: &CommitObject,
+) -> Result<TreeObject> {
+    match repo.read_tree(&commit.tree) {
+        Ok(tree) => Ok(tree),
+        Err(error) if is_store_not_found(&error) => {
+            GcSweepSession::bind_repository(repo)?.validate_final_shallow_tree(at, &commit.tree)?;
+            Err(retarget_shallow_error(
+                "target Evidence commit is shallow; retarget requires its tree",
+                at,
+            ))
+        }
+        Err(error) if error.exit_code() == ExitCode::InvalidUsage => Err(retarget_error(
+            "KIO-E-STORE-CORRUPT-001",
+            "target Evidence tree contradicts its commit CAS object",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn read_exact_retarget_commit(store: &ObjectStore, at: &str) -> Result<CommitObject> {
+    let object = store.read_by_hash(at).map_err(|error| {
+        if is_store_not_found(&error) {
+            KioError::invalid_usage("--at does not name a commit object in this scope")
+        } else {
+            error
+        }
+    })?;
     if object.kind != ObjectKind::Commit {
         return Err(KioError::invalid_usage(
             "--at does not name a commit object in this scope",
@@ -456,13 +441,11 @@ fn read_exact_retarget_commit(
 /// any unit CAS loader is reached. This is intentionally retarget-local: the
 /// existing verifier retains its own historical degraded-result contract.
 fn retarget_manifest_unit_preflight(
-    kio_dir: &Path,
+    store: &ObjectStore,
     raw_hash: &str,
     normalize: &NormalizeRef,
     missing_is_corrupt: bool,
-    control: &ControlHandle,
 ) -> Result<()> {
-    let store = ObjectStore::new_with_control(kio_dir, control.clone());
     let bytes = match store.read_content_object_bytes(
         ContentObjectKind::Manifest,
         &normalize.manifest_hash,
@@ -519,4 +502,35 @@ fn recheck_retarget_target(
         return Err(batch_changed_error());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retarget_missing_tree_receipt_reads_share_the_active_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = Repository::init(root.path()).unwrap();
+        std::fs::write(root.path().join("file.txt"), b"retarget budget fixture").unwrap();
+        repo.snapshot(
+            Some("retarget budget fixture"),
+            Some("2026-08-14T00:00:00Z"),
+        )
+        .unwrap();
+        let at = repo.head_commit_hash().unwrap().unwrap();
+        let commit = repo.read_commit(&at).unwrap();
+        let path = ObjectStore::new(repo.kio_dir())
+            .object_path(ObjectKind::Tree, &commit.tree)
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+        let error = kio_core::cas::VerifiedCasReadBudget::new()
+            .run(0, |reads| {
+                let repo = repo.with_verified_reads(reads)?;
+                read_retarget_target_tree(&repo, &at, &commit)
+            })
+            .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001");
+        assert_eq!(error.context()["consumed_bytes"], 0);
+    }
 }

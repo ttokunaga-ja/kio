@@ -178,7 +178,7 @@ fn assert_scalar_context(repo: &Repository, path: &str) {
 fn assert_selection_order_independent(repo: &Repository, expected_path: &str) {
     let conn = connection(repo);
     let head = repo.head_commit_hash().unwrap().unwrap();
-    let retained = retained_history_instances(repo.kio_dir(), &head, repo.control()).unwrap();
+    let retained = retained_history_instances(repo, &head).unwrap();
     let config = snapshot_chunking_config_hash(repo, &head).unwrap();
     let policy = current_embedding_policy(repo).unwrap();
     let mut candidates =
@@ -201,7 +201,7 @@ fn assert_selection_order_independent(repo: &Repository, expected_path: &str) {
 fn assert_sqlite_text_is_not_embedding_authority(repo: &Repository) {
     let conn = connection(repo);
     let head = repo.head_commit_hash().unwrap().unwrap();
-    let retained = retained_history_instances(repo.kio_dir(), &head, repo.control()).unwrap();
+    let retained = retained_history_instances(repo, &head).unwrap();
     let config = snapshot_chunking_config_hash(repo, &head).unwrap();
     let policy = current_embedding_policy(repo).unwrap();
     let collect =
@@ -587,7 +587,7 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
         );
 
         let head = repo.head_commit_hash().unwrap().unwrap();
-        let retained = retained_history_instances(repo.kio_dir(), &head, repo.control()).unwrap();
+        let retained = retained_history_instances(&repo, &head).unwrap();
         let config = snapshot_chunking_config_hash(&repo, &head).unwrap();
         let policy = current_embedding_policy(&repo).unwrap();
         let current =
@@ -658,7 +658,7 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
     index(&context);
     let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let old_head = repo.head_commit_hash().unwrap().unwrap();
-    let retained = retained_history_instances(repo.kio_dir(), &old_head, repo.control()).unwrap();
+    let retained = retained_history_instances(&repo, &old_head).unwrap();
     assert_eq!(retained.len(), 1);
     let instance = &retained[0];
     // Test-only corruption targets the authenticated fixture repo's physical
@@ -768,8 +768,7 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
         latest_tree.entries[0].normalize,
         Some(instance.normalize.clone())
     );
-    let post_purge_retained =
-        retained_history_instances(repo.kio_dir(), &latest, repo.control()).unwrap();
+    let post_purge_retained = retained_history_instances(&repo, &latest).unwrap();
     assert_eq!(
         collect(&post_purge_retained).unwrap_err().error_code(),
         "KIO-E-STORE-NOT-FOUND-001",
