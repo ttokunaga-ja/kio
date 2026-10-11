@@ -48,7 +48,7 @@ use serde_json::{Value, json};
 
 use crate::batch_recovery::{BatchRecoveryContext, PinnedBatchIdentity, configured_qualifier};
 use crate::http_policy::{
-    HttpPolicy, HttpResponse, authenticated_agent, read_json_bounded, require_success,
+    AuthenticatedHttpClient, HttpPolicy, HttpResponse, read_json_bounded, require_success,
 };
 use crate::{AdapterError, Result};
 
@@ -507,7 +507,7 @@ pub(crate) fn parse_inlined_results(value: &Value) -> Result<Vec<GeminiBatchEmbe
 #[derive(Debug, Clone)]
 pub struct EnvGeminiBatchClient {
     identity: PinnedBatchIdentity,
-    http_policy: HttpPolicy,
+    http: AuthenticatedHttpClient,
 }
 
 impl EnvGeminiBatchClient {
@@ -529,7 +529,7 @@ impl EnvGeminiBatchClient {
         let qualifier = configured_qualifier(GEMINI_PROJECT_ID_ENV)?;
         Ok(Self {
             identity: context.capture("gemini", origin, qualifier.as_deref(), credential)?,
-            http_policy: HttpPolicy::default(),
+            http: AuthenticatedHttpClient::new(HttpPolicy::default()),
         })
     }
 
@@ -550,7 +550,9 @@ impl EnvGeminiBatchClient {
 
     fn get_json(&self, url: &str, max_bytes: usize, context: &str) -> Result<Value> {
         let api_key = self.identity.credential();
-        let response = authenticated_agent(self.http_policy)
+        let response = self
+            .http
+            .agent()
             .get(url)
             .header("x-goog-api-key", api_key)
             .header("Accept-Encoding", "identity")
@@ -565,7 +567,9 @@ impl EnvGeminiBatchClient {
     fn get_batch_listing(&self, page_token: Option<&str>) -> Result<Value> {
         let api_key = self.identity.credential();
         let url = format!("{}/v1beta/batches", self.base_url());
-        let request = authenticated_agent(self.http_policy)
+        let request = self
+            .http
+            .agent()
             .get(&url)
             .query("pageSize", BATCH_LIST_PAGE_SIZE.to_string());
         let request = match page_token {
@@ -601,7 +605,9 @@ impl GeminiBatchClient for EnvGeminiBatchClient {
             self.base_url(),
             qualified_model(model)
         );
-        let response = authenticated_agent(self.http_policy)
+        let response = self
+            .http
+            .agent()
             .post(&url)
             .header("x-goog-api-key", api_key)
             .header("Accept-Encoding", "identity")
@@ -1126,7 +1132,7 @@ mod tests {
     ) -> (
         String,
         std::thread::JoinHandle<Vec<String>>,
-        crate::http_policy::test_tls::TrustGuard,
+        crate::http_policy::AuthenticatedHttpClient,
     ) {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
@@ -1135,7 +1141,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let tls = crate::http_policy::test_tls::Fixture::new();
-        let trust = tls.trust();
+        let http = tls.client(HttpPolicy::default());
         let handle = std::thread::spawn(move || {
             let mut requests = Vec::new();
             for response in responses {
@@ -1156,7 +1162,7 @@ mod tests {
             }
             requests
         });
-        (format!("https://{address}"), handle, trust)
+        (format!("https://{address}"), handle, http)
     }
 
     #[test]
@@ -1519,14 +1525,16 @@ mod tests {
         let _guard = crate::batch_client::test_env_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let (base, server, _trust) = spawn_listing_server(vec![
+        let (base, server, http) = spawn_listing_server(vec![
             http_response(r#"{"operations":[],"nextPageToken":"cursor /?&+%"}"#),
             http_response(
                 r#"{"operations":[{"name":"batches/after-empty","state":"BATCH_STATE_RUNNING"}]}"#,
             ),
         ]);
         let client = with_test_gemini_auth(|settings| {
-            EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base)
+            let mut client = EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base);
+            client.http = http;
+            client
         });
 
         let jobs = client.list_jobs().unwrap();
@@ -1548,12 +1556,14 @@ mod tests {
         let _guard = crate::batch_client::test_env_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let (base, server, _trust) = spawn_listing_server(vec![
+        let (base, server, http) = spawn_listing_server(vec![
             http_response(r#"{"operations":[],"nextPageToken":"again"}"#),
             http_response(r#"{"operations":[],"nextPageToken":"again"}"#),
         ]);
         let client = with_test_gemini_auth(|settings| {
-            EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base)
+            let mut client = EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base);
+            client.http = http;
+            client
         });
 
         let error = client.list_jobs().unwrap_err();
@@ -1567,11 +1577,13 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
 
-        let (base, server, _trust) = spawn_listing_server(vec![http_response(
+        let (base, server, http) = spawn_listing_server(vec![http_response(
             r#"{"operations":[],"nextPageToken":17}"#,
         )]);
         let client = with_test_gemini_auth(|settings| {
-            EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base)
+            let mut client = EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base);
+            client.http = http;
+            client
         });
         let error = client.list_jobs().unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(_)));
@@ -1585,11 +1597,13 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let (base, server, _trust) = spawn_listing_server(vec![http_response(
+        let (base, server, http) = spawn_listing_server(vec![http_response(
             &json!({ "operations": operations }).to_string(),
         )]);
         let client = with_test_gemini_auth(|settings| {
-            EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base)
+            let mut client = EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base);
+            client.http = http;
+            client
         });
         let error = client.list_jobs().unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(_)));
@@ -1608,9 +1622,11 @@ mod tests {
                 ))
             })
             .collect();
-        let (base, server, _trust) = spawn_listing_server(responses);
+        let (base, server, http) = spawn_listing_server(responses);
         let client = with_test_gemini_auth(|settings| {
-            EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base)
+            let mut client = EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base);
+            client.http = http;
+            client
         });
 
         let error = client.list_jobs().unwrap_err();

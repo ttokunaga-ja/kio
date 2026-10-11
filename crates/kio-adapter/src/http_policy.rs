@@ -70,28 +70,53 @@ impl HttpPolicy {
     }
 }
 
-/// Authenticated provider requests use HTTPS without proxies or redirects,
-/// matching the online runtime trust identity.
-pub(crate) fn authenticated_agent(policy: HttpPolicy) -> ureq::Agent {
-    // ureq 3's global timeout covers DNS through response-body completion.
-    // Keep the strictest cap as the global deadline and explicitly return
-    // status responses: callers retain their authenticated 401/403, 402, and
-    // 429 classifications (including Retry-After) without losing the body or
-    // headers to the transport error type.
-    let effective_overall_timeout = effective_overall_timeout(policy);
-    let config = ureq::Agent::config_builder()
-        .https_only(true)
-        .proxy(None)
-        .max_redirects(0)
-        .http_status_as_error(false)
-        .timeout_connect(Some(policy.connect_timeout))
-        .timeout_global(Some(effective_overall_timeout));
+/// Owns the resource policy for authenticated provider exchanges. Tests can
+/// attach only their verified fixture roots to this particular client.
+#[derive(Debug, Clone)]
+pub(crate) struct AuthenticatedHttpClient {
+    policy: HttpPolicy,
     #[cfg(test)]
-    let config = match test_tls::current_config() {
-        Some(tls) => config.tls_config(tls),
-        None => config,
-    };
-    config.build().into()
+    tls: Option<ureq::tls::TlsConfig>,
+}
+
+impl AuthenticatedHttpClient {
+    pub(crate) fn new(policy: HttpPolicy) -> Self {
+        Self {
+            policy,
+            #[cfg(test)]
+            tls: None,
+        }
+    }
+
+    /// Authenticated provider requests use HTTPS without proxies or redirects,
+    /// matching the online runtime trust identity.
+    pub(crate) fn agent(&self) -> ureq::Agent {
+        // ureq 3's global timeout covers DNS through response-body completion.
+        // Keep the strictest cap as the global deadline and explicitly return
+        // status responses: callers retain their authenticated 401/403, 402, and
+        // 429 classifications (including Retry-After) without losing the body or
+        // headers to the transport error type.
+        let policy = self.policy;
+        let effective_overall_timeout = effective_overall_timeout(policy);
+        let config = ureq::Agent::config_builder()
+            .https_only(true)
+            .proxy(None)
+            .max_redirects(0)
+            .http_status_as_error(false)
+            .timeout_connect(Some(policy.connect_timeout))
+            .timeout_global(Some(effective_overall_timeout));
+        #[cfg(test)]
+        let config = match &self.tls {
+            Some(tls) => config.tls_config(tls.clone()),
+            None => config,
+        };
+        config.build().into()
+    }
+}
+
+/// Ordinary authenticated exchanges use the production WebPKI roots.
+pub(crate) fn authenticated_agent(policy: HttpPolicy) -> ureq::Agent {
+    AuthenticatedHttpClient::new(policy).agent()
 }
 
 /// The only transport constructor for an `offline_api` request.  Unlike the
@@ -251,34 +276,14 @@ pub(crate) fn parse_json_bytes_bounded(
 }
 
 /// TLS fixtures keep the production HTTPS/proxy/redirect policy, replacing only
-/// the trust roots within an explicit test-thread scope. No production override
+/// the trust roots on one explicitly owned client. No production override
 /// or certificate-verification bypass is exposed.
 #[cfg(test)]
 pub(crate) mod test_tls {
-    use std::cell::RefCell;
     use std::net::{TcpListener, TcpStream};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
     use ureq::tls::{Certificate, RootCerts, TlsConfig};
-
-    thread_local! {
-        static CONFIG: RefCell<Option<TlsConfig>> = const { RefCell::new(None) };
-    }
-
-    pub(super) fn current_config() -> Option<TlsConfig> {
-        CONFIG.with(|config| config.borrow().clone())
-    }
-
-    pub(crate) struct TrustGuard {
-        previous: Option<TlsConfig>,
-        _thread: std::marker::PhantomData<std::rc::Rc<()>>,
-    }
-
-    impl Drop for TrustGuard {
-        fn drop(&mut self) {
-            CONFIG.with(|config| *config.borrow_mut() = self.previous.take());
-        }
-    }
 
     pub(crate) struct Fixture {
         server: Arc<rustls::ServerConfig>,
@@ -307,11 +312,10 @@ pub(crate) mod test_tls {
             }
         }
 
-        pub(crate) fn trust(&self) -> TrustGuard {
-            let previous = CONFIG.with(|config| config.replace(Some(self.client.clone())));
-            TrustGuard {
-                previous,
-                _thread: std::marker::PhantomData,
+        pub(crate) fn client(&self, policy: super::HttpPolicy) -> super::AuthenticatedHttpClient {
+            super::AuthenticatedHttpClient {
+                policy,
+                tls: Some(self.client.clone()),
             }
         }
 
@@ -486,7 +490,6 @@ mod tests {
         redirect_target.set_nonblocking(true).unwrap();
         let redirect_address = redirect_target.local_addr().unwrap();
         let tls = std::sync::Arc::new(test_tls::Fixture::new());
-        let _trust = tls.trust();
         let server_tls = tls.clone();
         let server = std::thread::spawn(move || {
             let mut stream = server_tls.accept(&listener);
@@ -498,7 +501,9 @@ mod tests {
             stream.write_all(response.as_bytes()).unwrap();
         });
 
-        let result = authenticated_agent(HttpPolicy::default())
+        let result = tls
+            .client(HttpPolicy::default())
+            .agent()
             .get(&format!("https://{address}/start"))
             .header("x-provider-secret", "synthetic")
             .call();
@@ -546,7 +551,6 @@ mod tests {
         let (request_seen_tx, request_seen_rx) = mpsc::channel();
         let (release_server_tx, release_server_rx) = mpsc::channel();
         let tls = std::sync::Arc::new(test_tls::Fixture::new());
-        let _trust = tls.trust();
         let server_tls = tls.clone();
         let server = std::thread::spawn(move || {
             let mut stream = server_tls.accept(&listener);
@@ -576,9 +580,10 @@ mod tests {
 
         let (client_result_tx, client_result_rx) = mpsc::channel();
         let client = std::thread::spawn(move || {
-            let _trust = tls.trust();
             let started = Instant::now();
-            let result = authenticated_agent(policy)
+            let result = tls
+                .client(policy)
+                .agent()
                 .get(&format!("https://{address}/slow"))
                 .call();
             client_result_tx.send((started.elapsed(), result)).unwrap();
@@ -665,7 +670,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         let tls = std::sync::Arc::new(test_tls::Fixture::new());
-        let _trust = tls.trust();
         let server_tls = tls.clone();
         let server = std::thread::spawn(move || {
             let mut stream = server_tls.accept(&listener);
@@ -677,7 +681,9 @@ mod tests {
                 )
                 .unwrap();
         });
-        let response = authenticated_agent(HttpPolicy::default())
+        let response = tls
+            .client(HttpPolicy::default())
+            .agent()
             .get(&format!("https://{address}/compressed"))
             .call()
             .unwrap();

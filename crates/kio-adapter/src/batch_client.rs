@@ -33,8 +33,8 @@ use serde_json::Value;
 
 use crate::batch_recovery::{BatchRecoveryContext, PinnedBatchIdentity, configured_qualifier};
 use crate::http_policy::{
-    HttpPolicy, OCR_RESPONSE_MAX_BYTES, authenticated_agent, read_bytes_bounded, read_json_bounded,
-    require_success,
+    AuthenticatedHttpClient, HttpPolicy, OCR_RESPONSE_MAX_BYTES, read_bytes_bounded,
+    read_json_bounded, require_success,
 };
 use crate::mistral_ocr::{http_error, http_status_error};
 use crate::{AdapterError, Result};
@@ -213,7 +213,7 @@ const BATCH_LIST_MAX_PAGES: usize = 50;
 #[derive(Debug, Clone)]
 pub struct EnvMistralBatchClient {
     identity: PinnedBatchIdentity,
-    http_policy: HttpPolicy,
+    http: AuthenticatedHttpClient,
 }
 
 impl EnvMistralBatchClient {
@@ -235,7 +235,7 @@ impl EnvMistralBatchClient {
         let qualifier = configured_qualifier(MISTRAL_WORKSPACE_ID_ENV)?;
         Ok(Self {
             identity: context.capture("mistral", origin, qualifier.as_deref(), credential)?,
-            http_policy: HttpPolicy::default(),
+            http: AuthenticatedHttpClient::new(HttpPolicy::default()),
         })
     }
 
@@ -257,7 +257,9 @@ impl EnvMistralBatchClient {
     /// Authenticated GET returning a bounded metadata-class JSON body.
     fn get_json(&self, url: &str, context: &str) -> Result<Value> {
         let api_key = self.identity.credential();
-        let response = authenticated_agent(self.http_policy)
+        let response = self
+            .http
+            .agent()
             .get(url)
             .header("Authorization", &format!("Bearer {api_key}"))
             .header("Accept-Encoding", "identity")
@@ -355,7 +357,9 @@ impl MistralBatchClient for EnvMistralBatchClient {
         let api_key = self.identity.credential();
         let boundary = multipart_boundary(jsonl)?;
         let body = multipart_form_body(&boundary, filename, jsonl);
-        let response = authenticated_agent(self.http_policy)
+        let response = self
+            .http
+            .agent()
             .post(&format!("{}/v1/files", self.base_url()))
             .header("Authorization", &format!("Bearer {api_key}"))
             .header("Accept-Encoding", "identity")
@@ -394,7 +398,9 @@ impl MistralBatchClient for EnvMistralBatchClient {
         metadata: &serde_json::Value,
     ) -> Result<BatchJobRecord> {
         let api_key = self.identity.credential();
-        let response = authenticated_agent(self.http_policy)
+        let response = self
+            .http
+            .agent()
             .post(&format!("{}/v1/batch/jobs", self.base_url()))
             .header("Authorization", &format!("Bearer {api_key}"))
             .header("Accept-Encoding", "identity")
@@ -448,7 +454,9 @@ impl MistralBatchClient for EnvMistralBatchClient {
     /// success (07 §5.5): the sweep's delete is idempotent by contract.
     fn delete_upload(&self, upload_id: &str) -> Result<()> {
         let api_key = self.identity.credential();
-        let response = authenticated_agent(self.http_policy)
+        let response = self
+            .http
+            .agent()
             .delete(&format!("{}/v1/files/{upload_id}", self.base_url()))
             .header("Authorization", &format!("Bearer {api_key}"))
             .header("Accept-Encoding", "identity")
@@ -467,7 +475,9 @@ impl MistralBatchClient for EnvMistralBatchClient {
     /// document-scale `OCR_RESPONSE_MAX_BYTES` ceiling.
     fn fetch_output(&self, output_file_id: &str) -> Result<Vec<BatchOutputLine>> {
         let api_key = self.identity.credential();
-        let response = authenticated_agent(self.http_policy)
+        let response = self
+            .http
+            .agent()
             .get(&format!(
                 "{}/v1/files/{output_file_id}/content",
                 self.base_url()
@@ -1218,7 +1228,7 @@ mod tests {
     ) -> (
         String,
         std::thread::JoinHandle<Vec<ReceivedRequest>>,
-        crate::http_policy::test_tls::TrustGuard,
+        crate::http_policy::AuthenticatedHttpClient,
     ) {
         use std::io::Read as _;
         use std::net::TcpListener;
@@ -1227,7 +1237,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let tls = crate::http_policy::test_tls::Fixture::new();
-        let trust = tls.trust();
+        let http = tls.client(HttpPolicy::default());
         let handle = std::thread::spawn(move || {
             const MAX_HEADER_BYTES: usize = 64 * 1024;
             const MAX_BODY_BYTES: usize = 2 * 1024 * 1024;
@@ -1277,7 +1287,7 @@ mod tests {
             }
             received
         });
-        (format!("https://{address}"), handle, trust)
+        (format!("https://{address}"), handle, http)
     }
 
     #[test]
@@ -1287,13 +1297,16 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(TEST_MISTRAL_BATCH_ENV) };
-        let (base, server, _trust) = spawn_scripted_server(vec![http_response(
+        let (base, server, http) = spawn_scripted_server(vec![http_response(
             "200 OK",
             &[],
             r#"{"id":"file-verified-1","object":"file","purpose":"batch"}"#,
         )]);
         let client = with_test_mistral_auth(|settings| {
-            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+            let mut client =
+                EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base);
+            client.http = http;
+            client
         });
         let jsonl = batch_input_line(
             "task-1",
@@ -1367,13 +1380,16 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(TEST_MISTRAL_BATCH_ENV) };
-        let (base, server, _trust) = spawn_scripted_server(vec![http_response(
+        let (base, server, http) = spawn_scripted_server(vec![http_response(
             "200 OK",
             &[],
             r#"{"id":"batch-verified-1","object":"batch","status":"QUEUED","output_file":null,"metadata":{"intent_token":"echoed-by-provider"}}"#,
         )]);
         let client = with_test_mistral_auth(|settings| {
-            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+            let mut client =
+                EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base);
+            client.http = http;
+            client
         });
         let sent_metadata = serde_json::json!({
             "intent_token": "01HINTENT",
@@ -1428,13 +1444,16 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(TEST_MISTRAL_BATCH_ENV) };
-        let (base, server, _trust) = spawn_scripted_server(vec![http_response(
+        let (base, server, http) = spawn_scripted_server(vec![http_response(
             "404 Not Found",
             &[],
             r#"{"detail":"file already deleted"}"#,
         )]);
         let client = with_test_mistral_auth(|settings| {
-            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+            let mut client =
+                EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base);
+            client.http = http;
+            client
         });
         // 07 §5.5: already-gone reports as success.
         client.delete_upload("file-gone").unwrap();
@@ -1469,12 +1488,15 @@ mod tests {
             "total": 3,
             "data": [{"id": "batch-3", "status": "FAILED"}],
         });
-        let (base, server, _trust) = spawn_scripted_server(vec![
+        let (base, server, http) = spawn_scripted_server(vec![
             http_response("200 OK", &[], &page0.to_string()),
             http_response("200 OK", &[], &page1.to_string()),
         ]);
         let client = with_test_mistral_auth(|settings| {
-            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+            let mut client =
+                EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base);
+            client.http = http;
+            client
         });
         let jobs = client.list_jobs().unwrap();
 
@@ -1513,10 +1535,13 @@ mod tests {
                 {"id": "file-b", "filename": null},
             ],
         });
-        let (base, server, _trust) =
+        let (base, server, http) =
             spawn_scripted_server(vec![http_response("200 OK", &[], &page0.to_string())]);
         let client = with_test_mistral_auth(|settings| {
-            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+            let mut client =
+                EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base);
+            client.http = http;
+            client
         });
         let uploads = client.list_uploads().unwrap();
 
@@ -1560,9 +1585,12 @@ mod tests {
                 )
             })
             .collect();
-        let (base, server, _trust) = spawn_scripted_server(responses);
+        let (base, server, http) = spawn_scripted_server(responses);
         let client = with_test_mistral_auth(|settings| {
-            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+            let mut client =
+                EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base);
+            client.http = http;
+            client
         });
         let error = client.list_jobs().unwrap_err();
 
@@ -1591,10 +1619,13 @@ mod tests {
             r#"{"id":"batch-1-1","custom_id":"task-b","response":{"status_code":429,"body":{"error":"rate limited"}}}"#,
             "\n",
         );
-        let (base, server, _trust) =
+        let (base, server, http) =
             spawn_scripted_server(vec![http_response("200 OK", &[], payload)]);
         let client = with_test_mistral_auth(|settings| {
-            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+            let mut client =
+                EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base);
+            client.http = http;
+            client
         });
         let lines = client.fetch_output("file-out-1").unwrap();
 
@@ -1621,13 +1652,16 @@ mod tests {
             .unwrap_or_else(|err| err.into_inner());
         // FIXME: Audit that the environment access only happens in single-threaded code.
         unsafe { std::env::remove_var(TEST_MISTRAL_BATCH_ENV) };
-        let (base, server, _trust) = spawn_scripted_server(vec![http_response(
+        let (base, server, http) = spawn_scripted_server(vec![http_response(
             "429 Too Many Requests",
             &[("Retry-After", "7")],
             r#"{"detail":"slow down"}"#,
         )]);
         let client = with_test_mistral_auth(|settings| {
-            EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base)
+            let mut client =
+                EnvMistralBatchClient::with_base_url(Arc::new(settings.clone()), &base);
+            client.http = http;
+            client
         });
         let error = client.get_job("batch-1").unwrap_err();
         server.join().unwrap();

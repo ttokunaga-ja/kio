@@ -134,60 +134,75 @@ fn resume_suspended_process(child: &Child) -> Result<(), std::io::Error> {
     }
 }
 
-thread_local! {
-    static WINDOWS_PRE_ATTACH_DELAY: std::cell::Cell<Option<Duration>> = const {
-        std::cell::Cell::new(None)
-    };
-    static WINDOWS_SUPERVISED_ATTACH_FAILURE: std::cell::Cell<bool> = const {
-        std::cell::Cell::new(false)
-    };
-}
-
-// This is public only because `kio-eval` retains the pre-existing Windows
-// regression that proves attachment happens before execution. It is hidden
-// from normal API documentation and has no production caller.
+/// Immutable controls for explicit Windows process regression fixtures.
 #[doc(hidden)]
-pub fn replace_windows_pre_attach_delay_for_test(delay: Option<Duration>) -> Option<Duration> {
-    WINDOWS_PRE_ATTACH_DELAY.with(|slot| slot.replace(delay))
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ProcessControl {
+    pre_attach_delay: Option<Duration>,
+    supervised_attach_failure: bool,
 }
-
-/// Test seam for the foreground-supervisor attach-failure cleanup path.
-#[doc(hidden)]
-pub fn replace_windows_supervised_attach_failure_for_test(enabled: bool) -> bool {
-    WINDOWS_SUPERVISED_ATTACH_FAILURE.with(|slot| slot.replace(enabled))
-}
-
-fn attach_supervised_child(job: &WindowsJob, child: &Child) -> Result<(), std::io::Error> {
-    let forced_failure = WINDOWS_SUPERVISED_ATTACH_FAILURE.with(std::cell::Cell::get);
-    if forced_failure {
-        return Err(std::io::Error::other(
-            "synthetic Windows supervised-child Job attachment failure",
-        ));
-    }
-    job.attach(child)
-}
-
-fn delay_before_windows_job_attach_for_test() {
-    WINDOWS_PRE_ATTACH_DELAY.with(|delay| {
-        if let Some(delay) = delay.get() {
-            thread::sleep(delay);
+impl ProcessControl {
+    pub fn pre_attach_delay(delay: Duration) -> Self {
+        Self {
+            pre_attach_delay: Some(delay),
+            ..Self::default()
         }
-    });
+    }
+    pub fn supervised_attach_failure() -> Self {
+        Self {
+            supervised_attach_failure: true,
+            ..Self::default()
+        }
+    }
 }
-
+struct ControlledProcessMonitor(ProcessControl);
+impl BoundedProcessMonitor for ControlledProcessMonitor {
+    fn process_tree(&mut self) -> std::io::Result<ProcessTree> {
+        ProcessTree::new_with_control(self.0)
+    }
+    fn observe(&mut self, _child: &Child) -> Result<(), BoundedProcessError> {
+        Ok(())
+    }
+}
+#[doc(hidden)]
+pub fn run_bounded_command_with_control_for_test(
+    command: &mut Command,
+    options: BoundedProcessOptions,
+    stdin: Option<BoundedStdin>,
+    control: ProcessControl,
+) -> Result<BoundedProcessOutput, BoundedProcessError> {
+    run_bounded_command_inner_impl(
+        command,
+        options,
+        stdin,
+        &mut ControlledProcessMonitor(control),
+    )
+}
+#[doc(hidden)]
+pub fn wait_supervised_child_with_control_for_test(
+    command: &mut Command,
+    control: ProcessControl,
+) -> Result<ExitStatus, BoundedProcessError> {
+    wait_supervised_child_inner(command, control)
+}
 pub fn wait_supervised_child(command: &mut Command) -> Result<ExitStatus, BoundedProcessError> {
+    wait_supervised_child_inner(command, ProcessControl::default())
+}
+fn wait_supervised_child_inner(
+    command: &mut Command,
+    control: ProcessControl,
+) -> Result<ExitStatus, BoundedProcessError> {
     configure_process_isolation(command);
-    let job = WindowsJob::create().map_err(BoundedProcessError::Isolation)?;
+    let mut process_tree =
+        ProcessTree::new_with_control(control).map_err(BoundedProcessError::Isolation)?;
     let mut child = command.spawn().map_err(BoundedProcessError::Spawn)?;
-    if let Err(error) =
-        attach_supervised_child(&job, &child).and_then(|()| resume_suspended_process(&child))
-    {
+    if let Err(error) = process_tree.attach_supervised_and_resume(&child) {
         // `attach` can fail before the suspended child has joined the Job.
         // Terminating only the Job would then leave that child suspended
         // forever, so terminate the direct child independently before reaping.
-        job.terminate();
+        process_tree.terminate_attached();
         terminate_process_tree(&mut child);
-        drop(job);
+        process_tree.close_before_join();
         let _ = child.wait();
         return Err(BoundedProcessError::Isolation(error));
     }
@@ -205,33 +220,49 @@ pub(crate) fn terminate_process_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
-pub(crate) struct ProcessTree(Option<WindowsJob>);
+pub(crate) struct ProcessTree {
+    job: Option<WindowsJob>,
+    control: ProcessControl,
+}
 impl ProcessTree {
     pub(crate) fn new() -> std::io::Result<Self> {
-        WindowsJob::create().map(|job| Self(Some(job)))
+        Self::new_with_control(ProcessControl::default())
+    }
+    fn new_with_control(control: ProcessControl) -> std::io::Result<Self> {
+        WindowsJob::create().map(|job| Self {
+            job: Some(job),
+            control,
+        })
     }
     pub(crate) fn attach_and_resume(&mut self, child: &Child) -> std::io::Result<()> {
-        delay_before_windows_job_attach_for_test();
-        self.0
+        if let Some(delay) = self.control.pre_attach_delay {
+            thread::sleep(delay);
+        }
+        self.job
             .as_ref()
             .expect("Windows Job Object was created before spawning evaluator")
             .attach(child)
             .and_then(|()| resume_suspended_process(child))
     }
     pub(crate) fn attach_supervised_and_resume(&mut self, child: &Child) -> std::io::Result<()> {
-        attach_supervised_child(
-            self.0.as_ref().expect("Windows Job created before spawn"),
-            child,
-        )
-        .and_then(|()| resume_suspended_process(child))
+        if self.control.supervised_attach_failure {
+            return Err(std::io::Error::other(
+                "synthetic Windows supervised-child Job attachment failure",
+            ));
+        }
+        self.job
+            .as_ref()
+            .expect("Windows Job created before spawn")
+            .attach(child)
+            .and_then(|()| resume_suspended_process(child))
     }
     pub(crate) fn terminate_attached(&self) {
-        if let Some(job) = &self.0 {
+        if let Some(job) = &self.job {
             job.terminate();
         }
     }
     pub(crate) fn close_before_join(&mut self) {
-        drop(self.0.take());
+        drop(self.job.take());
     }
     pub(crate) fn supervised_exit(
         &self,
@@ -262,24 +293,7 @@ mod windows_supervision_tests {
         time::{Duration, Instant, SystemTime, UNIX_EPOCH},
     };
 
-    use super::{
-        BoundedProcessError, replace_windows_supervised_attach_failure_for_test,
-        wait_supervised_child,
-    };
-
-    struct AttachFailureGuard(bool);
-
-    impl AttachFailureGuard {
-        fn install() -> Self {
-            Self(replace_windows_supervised_attach_failure_for_test(true))
-        }
-    }
-
-    impl Drop for AttachFailureGuard {
-        fn drop(&mut self) {
-            let _ = replace_windows_supervised_attach_failure_for_test(self.0);
-        }
-    }
+    use super::{BoundedProcessError, ProcessControl, wait_supervised_child_with_control_for_test};
 
     #[test]
     fn supervised_attach_failure_kills_suspended_child_before_it_can_execute() {
@@ -299,9 +313,11 @@ mod windows_supervision_tests {
         let script = format!("type nul > \"{}\"", sentinel.display());
         let mut command = Command::new(command_processor);
         command.args(["/C", &script]);
-        let _guard = AttachFailureGuard::install();
         let started = Instant::now();
-        let result = wait_supervised_child(&mut command);
+        let result = wait_supervised_child_with_control_for_test(
+            &mut command,
+            ProcessControl::supervised_attach_failure(),
+        );
         assert!(matches!(result, Err(BoundedProcessError::Isolation(_))));
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(!sentinel.exists());

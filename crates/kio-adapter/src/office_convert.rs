@@ -55,38 +55,6 @@ pub(crate) const MAX_OFFICE_LOG_BYTES: usize = 64 * 1024;
 const OFFICE_NORMALIZATION_PROFILE: &str = "pdf-volatile-fields-v1";
 const MACOS_UNO_FILTER_VERSION: &str = "macos-spell-component-v1";
 
-// This thread-local switch is intentionally test-only. It permits bounded
-// renderer stderr to appear in the assertion from the explicit synthetic
-// native acceptance lane, while production errors never forward renderer
-// output into application logs or user-visible diagnostics.
-#[cfg(test)]
-thread_local! {
-    static NATIVE_ACCEPTANCE_DIAGNOSTICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-struct NativeAcceptanceDiagnosticGuard;
-
-#[cfg(test)]
-impl NativeAcceptanceDiagnosticGuard {
-    fn enable() -> Self {
-        NATIVE_ACCEPTANCE_DIAGNOSTICS.with(|enabled| enabled.set(true));
-        Self
-    }
-}
-
-#[cfg(test)]
-impl Drop for NativeAcceptanceDiagnosticGuard {
-    fn drop(&mut self) {
-        NATIVE_ACCEPTANCE_DIAGNOSTICS.with(|enabled| enabled.set(false));
-    }
-}
-
-#[cfg(test)]
-fn native_acceptance_diagnostics_enabled() -> bool {
-    NATIVE_ACCEPTANCE_DIAGNOSTICS.with(std::cell::Cell::get)
-}
-
 const DOCX_MEDIA_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const PPTX_MEDIA_TYPE: &str =
@@ -119,11 +87,19 @@ enum ConverterBackend {
 #[derive(Debug, Clone)]
 pub struct OfficeConverter {
     control: ControlHandle,
+    #[cfg(test)]
+    native_acceptance_diagnostics: bool,
     backend: ConverterBackend,
     version: String,
 }
 
 impl OfficeConverter {
+    #[cfg(test)]
+    fn with_native_acceptance_diagnostics(mut self) -> Self {
+        self.native_acceptance_diagnostics = true;
+        self
+    }
+
     /// The renderer's self-reported version (provenance-only — never a hash
     /// input, 07 §5.1). `"test-converter"` for the test seam.
     #[must_use]
@@ -193,8 +169,7 @@ impl OfficeConverter {
             } => {
                 crate::ooxml_package::validate_real_office_package(input, media_type)?;
                 verify_renderer_fingerprint(program, program_digest, "before conversion")?;
-                let pdf =
-                    convert_with_real_binary(program, runtime, input, media_type, &self.control)?;
+                let pdf = convert_with_real_binary(program, runtime, input, media_type, self)?;
                 verify_renderer_fingerprint(program, program_digest, "after conversion")?;
                 Ok(normalize_converted_pdf(&pdf))
             }
@@ -227,6 +202,8 @@ pub fn resolve_office_converter_with_control(control: &ControlHandle) -> Option<
         }
         return Some(OfficeConverter {
             control: control.clone(),
+            #[cfg(test)]
+            native_acceptance_diagnostics: false,
             #[cfg(debug_assertions)]
             backend: ConverterBackend::Seam {
                 fixture_path: fixture_path.clone(),
@@ -337,6 +314,8 @@ fn probe_real_converter_diagnostic(
         })?;
     Ok(OfficeConverter {
         control: control.clone(),
+        #[cfg(test)]
+        native_acceptance_diagnostics: false,
         backend: ConverterBackend::Real {
             program,
             program_digest,
@@ -415,7 +394,7 @@ fn convert_with_real_binary(
     runtime: &OfficeRuntime,
     input: &[u8],
     media_type: &str,
-    control: &ControlHandle,
+    converter: &OfficeConverter,
 ) -> Result<Vec<u8>> {
     let extension = office_extension(media_type).ok_or_else(|| {
         AdapterError::ContractViolation(format!(
@@ -464,7 +443,7 @@ fn convert_with_real_binary(
             ))
         })?,
         outdir.clone(),
-        control.clone(),
+        converter.control.clone(),
     )
     .map_err(|err| {
         AdapterError::ContractViolation(format!(
@@ -497,7 +476,7 @@ fn convert_with_real_binary(
     ];
     let mut environment = runtime.environment(program, Some(&profile_dir));
     #[cfg(test)]
-    if native_acceptance_diagnostics_enabled() {
+    if converter.native_acceptance_diagnostics {
         // This is a fixed diagnostic switch for checked-in synthetic OOXML
         // fixtures only. It never accepts ambient log configuration.
         environment.push((
@@ -524,7 +503,7 @@ fn convert_with_real_binary(
         })?;
     if !output.status.success() {
         #[cfg(test)]
-        if native_acceptance_diagnostics_enabled() {
+        if converter.native_acceptance_diagnostics {
             return Err(AdapterError::ContractViolation(format!(
                 "office converter {} exited with {} after {:?}; bounded stdout for the synthetic native acceptance fixture: {}; bounded stderr: {}",
                 program.display(),
@@ -1689,8 +1668,9 @@ mod tests {
         let _lock = kio_core::test_control::test_env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _diagnostic = NativeAcceptanceDiagnosticGuard::enable();
-        let Some(converter) = required_real_office_converter() else {
+        let Some(converter) = required_real_office_converter()
+            .map(OfficeConverter::with_native_acceptance_diagnostics)
+        else {
             return;
         };
 
@@ -1734,8 +1714,9 @@ mod tests {
         let _lock = kio_core::test_control::test_env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _diagnostic = NativeAcceptanceDiagnosticGuard::enable();
-        let Some(converter) = required_real_office_converter() else {
+        let Some(converter) = required_real_office_converter()
+            .map(OfficeConverter::with_native_acceptance_diagnostics)
+        else {
             return;
         };
 

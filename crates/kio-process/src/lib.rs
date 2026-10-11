@@ -279,6 +279,9 @@ pub fn run_bounded_command(
 }
 
 trait BoundedProcessMonitor {
+    fn process_tree(&mut self) -> std::io::Result<ProcessTree> {
+        ProcessTree::new()
+    }
     fn observe(&mut self, child: &Child) -> Result<(), BoundedProcessError>;
     fn needs_startup_pipe(&self) -> bool {
         false
@@ -330,7 +333,9 @@ fn run_bounded_command_inner_impl<M: BoundedProcessMonitor>(
     // This is deliberately before spawn: one monotonic deadline accounts for
     // all work within this boundary, including a slow spawn and cleanup.
     let started = Instant::now();
-    let mut process_tree = ProcessTree::new().map_err(BoundedProcessError::Isolation)?;
+    let mut process_tree = monitor
+        .process_tree()
+        .map_err(BoundedProcessError::Isolation)?;
     let mut child = command.spawn().map_err(BoundedProcessError::Spawn)?;
     if let Err(error) = process_tree.attach_and_resume(&child) {
         process_tree.terminate_attached();

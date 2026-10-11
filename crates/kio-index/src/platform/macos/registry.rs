@@ -22,6 +22,7 @@ pub(crate) struct RegistryParentBinding {
 pub(crate) fn registry_parent_and_leaf(
     path: &Path,
     _control: &kio_core::control::ControlHandle,
+    #[cfg(test)] hooks: Option<&crate::registry::RegistryTestHooks>,
 ) -> std::result::Result<RegistryParentBinding, RegistrySnapshotError> {
     let path = normalized_absolute_registry_path(path)?;
     let filesystem_root = registry_filesystem_root(&path)?;
@@ -63,7 +64,7 @@ pub(crate) fn registry_parent_and_leaf(
         };
         validate_directory(&before, &name.to_string_lossy())?;
         #[cfg(test)]
-        run_parent_component_hook(index);
+        run_parent_component_hook(hooks, index);
         let child = cap_fs::open_dir_nofollow(&handle, Path::new(name)).map_err(|error| {
             RegistrySnapshotError::UnsafeIntegrity(format!(
                 "open registry parent component {}: {error}",
@@ -131,10 +132,21 @@ pub(crate) fn registry_parent_and_leaf(
 pub(crate) fn stable_registry_parent_binding(
     path: &Path,
     control: &kio_core::control::ControlHandle,
+    #[cfg(test)] hooks: Option<&crate::registry::RegistryTestHooks>,
 ) -> std::result::Result<Option<RegistryParentBinding>, SnapshotAttemptError> {
-    match registry_parent_and_leaf(path, control) {
+    match registry_parent_and_leaf(
+        path,
+        control,
+        #[cfg(test)]
+        hooks,
+    ) {
         Ok(binding) => Ok(Some(binding)),
-        Err(RegistrySnapshotError::Missing) => match registry_parent_and_leaf(path, control) {
+        Err(RegistrySnapshotError::Missing) => match registry_parent_and_leaf(
+            path,
+            control,
+            #[cfg(test)]
+            hooks,
+        ) {
             Err(RegistrySnapshotError::Missing) => Ok(None),
             Ok(_) => Err(SnapshotAttemptError::Unstable(
                 "scope registry parent appeared while confirming its absence".to_owned(),
@@ -150,9 +162,15 @@ pub(crate) fn stable_registry_parent_binding(
 pub(crate) fn fresh_registry_parent_binding(
     held: &RegistryParentBinding,
     control: &kio_core::control::ControlHandle,
+    #[cfg(test)] hooks: Option<&crate::registry::RegistryTestHooks>,
 ) -> std::result::Result<std::sync::Arc<fs::File>, SnapshotAttemptError> {
     let canonical_path = held.parent_path.join(&held.leaf);
-    let fresh = match registry_parent_and_leaf(&canonical_path, control) {
+    let fresh = match registry_parent_and_leaf(
+        &canonical_path,
+        control,
+        #[cfg(test)]
+        hooks,
+    ) {
         Ok(binding) => binding,
         Err(RegistrySnapshotError::Missing) => {
             return Err(SnapshotAttemptError::Unstable(

@@ -15,6 +15,8 @@ pub(crate) struct NativeRenderSandbox {
     pub(super) scratch: PathBuf,
     pub(super) runtime_mounts: Vec<(PathBuf, PathBuf)>,
     pub(super) limits: RenderResourceLimits,
+    #[cfg(test)]
+    pub(super) test_fixture: super::confinement_cgroup::ConfinementFixture,
 }
 
 impl NativeRenderSandbox {
@@ -43,6 +45,8 @@ impl NativeRenderSandbox {
                 .map(|(destination, source)| (source, destination))
                 .collect(),
             limits,
+            #[cfg(test)]
+            test_fixture: Default::default(),
         })
     }
     pub(crate) fn run<I, S>(

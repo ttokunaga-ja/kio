@@ -81,6 +81,8 @@ pub struct UnreachableObjectInventory {
     scope: std::fs::File,
     kio: std::fs::File,
     limits: UnreachableInventoryLimits,
+    #[cfg(test)]
+    first_pass_barrier: Option<FirstPassTestBarrier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -429,6 +431,8 @@ impl UnreachableObjectInventory {
             scope,
             kio,
             limits: UnreachableInventoryLimits::default(),
+            #[cfg(test)]
+            first_pass_barrier: None,
         })
     }
 
@@ -438,6 +442,26 @@ impl UnreachableObjectInventory {
         self
     }
 
+    #[cfg(all(test, unix))]
+    fn with_first_pass_test_barrier(mut self, barrier: FirstPassTestBarrier) -> Self {
+        self.first_pass_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(test)]
+    fn wait_at_first_pass_test_barrier(&self) {
+        if let Some(barrier) = self.first_pass_barrier.as_ref() {
+            barrier
+                .ready
+                .send(())
+                .expect("inventory race test receiver exists");
+            barrier
+                .release
+                .recv()
+                .expect("inventory race test release sender exists");
+        }
+    }
+
     pub fn inventory(&self) -> Result<Value> {
         self.assert_stable()?;
         let guard = acquire_bound_store_read_guard_with_control(&self.kio, &self.control)?;
@@ -445,7 +469,8 @@ impl UnreachableObjectInventory {
         let invocation_time = self.control.now_utc_seconds();
         let first = self.pass(&invocation_time)?;
         guard.recheck_idle()?;
-        wait_at_first_pass_test_barrier();
+        #[cfg(test)]
+        self.wait_at_first_pass_test_barrier();
         let second = self.pass(&invocation_time)?;
         guard.recheck_idle()?;
         self.assert_stable()?;
@@ -1679,37 +1704,11 @@ fn active_purge_error() -> KioError {
 }
 
 #[cfg(test)]
-thread_local! {
-    static TEST_FIRST_PASS_BARRIER: std::cell::RefCell<Option<(
-        std::sync::mpsc::SyncSender<()>,
-        std::sync::mpsc::Receiver<()>,
-    )>> = const { std::cell::RefCell::new(None) };
+#[derive(Debug)]
+struct FirstPassTestBarrier {
+    ready: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
-
-#[cfg(all(test, unix))]
-fn set_first_pass_test_barrier(
-    barrier: Option<(
-        std::sync::mpsc::SyncSender<()>,
-        std::sync::mpsc::Receiver<()>,
-    )>,
-) {
-    TEST_FIRST_PASS_BARRIER.with(|slot| *slot.borrow_mut() = barrier);
-}
-
-#[cfg(test)]
-fn wait_at_first_pass_test_barrier() {
-    TEST_FIRST_PASS_BARRIER.with(|slot| {
-        if let Some((ready, release)) = slot.borrow().as_ref() {
-            ready.send(()).expect("inventory race test receiver exists");
-            release
-                .recv()
-                .expect("inventory race test release sender exists");
-        }
-    });
-}
-
-#[cfg(not(test))]
-fn wait_at_first_pass_test_barrier() {}
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -1723,12 +1722,11 @@ mod tests {
         let inventory = UnreachableObjectInventory::bind(root.canonicalize().unwrap()).unwrap();
         let (ready_tx, ready_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
-        let child = std::thread::spawn(move || {
-            set_first_pass_test_barrier(Some((ready_tx, release_rx)));
-            let result = inventory.inventory();
-            set_first_pass_test_barrier(None);
-            result
+        let inventory = inventory.with_first_pass_test_barrier(FirstPassTestBarrier {
+            ready: ready_tx,
+            release: release_rx,
         });
+        let child = std::thread::spawn(move || inventory.inventory());
         ready_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("inventory reached its first-pass test barrier");

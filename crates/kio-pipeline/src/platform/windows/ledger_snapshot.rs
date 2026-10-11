@@ -11,9 +11,11 @@ pub(crate) struct Identity {
 }
 pub(crate) struct PrivateStorage(super::snapshot_windows_security::LedgerSnapshotPrivateDir);
 impl PrivateStorage {
-    pub(crate) fn create() -> Result<Self, AttemptError> {
+    pub(crate) fn create(
+        #[cfg(test)] hooks: Option<&crate::ledger::snapshot::SnapshotTestHooks>,
+    ) -> Result<Self, AttemptError> {
         #[cfg(test)]
-        crate::ledger::snapshot::run_private_storage_create_hook()?;
+        crate::ledger::snapshot::run_private_storage_create_hook(hooks)?;
         super::snapshot_windows_security::LedgerSnapshotPrivateDir::create()
             .map(Self)
             .map_err(|e| AttemptError::Unstable(format!("create private ledger snapshot dir: {e}")))

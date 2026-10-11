@@ -257,17 +257,17 @@ pub(crate) fn validate_directory(
 type ParentComponentHook = std::sync::Arc<dyn Fn(usize)>;
 
 #[cfg(test)]
-thread_local! {
-    static PARENT_COMPONENT_HOOK: std::cell::RefCell<Option<ParentComponentHook>> = const { std::cell::RefCell::new(None) };
+#[derive(Default)]
+pub(crate) struct RegistryTestHooks {
+    snapshot: Option<SnapshotTestHook>,
+    parent_component: Option<ParentComponentHook>,
 }
 
 #[cfg(test)]
-pub(crate) fn run_parent_component_hook(index: usize) {
-    PARENT_COMPONENT_HOOK.with(|hook| {
-        if let Some(hook) = hook.borrow().as_ref() {
-            hook(index);
-        }
-    });
+pub(crate) fn run_parent_component_hook(hooks: Option<&RegistryTestHooks>, index: usize) {
+    if let Some(hook) = hooks.and_then(|hooks| hooks.parent_component.as_ref()) {
+        hook(index);
+    }
 }
 
 fn observe_manifest(
@@ -580,11 +580,13 @@ fn verify_private_snapshot_before_sqlite(
 fn snapshot_attempt(
     binding: &RegistryParentBinding,
     control: &kio_core::control::ControlHandle,
-    #[cfg(test)] hook: Option<&SnapshotTestHook>,
-    #[cfg(not(test))] _hook: Option<&()>,
+    #[cfg(test)] hooks: Option<&RegistryTestHooks>,
+    #[cfg(not(test))] _hooks: Option<&()>,
     #[cfg(test)] attempt: usize,
     #[cfg(not(test))] _attempt: usize,
 ) -> std::result::Result<(Connection, RegistrySnapshot), SnapshotAttemptError> {
+    #[cfg(test)]
+    let hook = hooks.and_then(|hooks| hooks.snapshot.as_ref());
     let parent = binding.parent.as_ref();
     let parent_path = binding.parent_path.as_path();
     let main = binding.leaf.as_str();
@@ -606,7 +608,12 @@ fn snapshot_attempt(
             if let Some(hook) = hook {
                 hook(SnapshotTestPhase::AfterInitialManifest, attempt, None);
             }
-            let fresh_parent = fresh_registry_parent_binding(binding, control)?;
+            let fresh_parent = fresh_registry_parent_binding(
+                binding,
+                control,
+                #[cfg(test)]
+                hooks,
+            )?;
             return match observe_manifest(
                 fresh_parent.as_ref(),
                 parent_path,
@@ -627,7 +634,12 @@ fn snapshot_attempt(
                             None,
                         );
                     }
-                    fresh_registry_parent_binding(binding, control)?;
+                    fresh_registry_parent_binding(
+                        binding,
+                        control,
+                        #[cfg(test)]
+                        hooks,
+                    )?;
                     Err(SnapshotAttemptError::Missing)
                 }
                 Ok(_) => Err(SnapshotAttemptError::Unstable(
@@ -716,7 +728,12 @@ fn snapshot_attempt(
             None,
         );
     }
-    let fresh_parent = fresh_registry_parent_binding(binding, control)?;
+    let fresh_parent = fresh_registry_parent_binding(
+        binding,
+        control,
+        #[cfg(test)]
+        hooks,
+    )?;
     let final_manifest = observe_manifest(
         fresh_parent.as_ref(),
         parent_path,
@@ -741,7 +758,12 @@ fn snapshot_attempt(
             None,
         );
     }
-    fresh_registry_parent_binding(binding, control)?;
+    fresh_registry_parent_binding(
+        binding,
+        control,
+        #[cfg(test)]
+        hooks,
+    )?;
     Ok((
         conn,
         RegistrySnapshot {
@@ -780,7 +802,12 @@ impl RegistryDb {
         let started = Instant::now();
         let mut saw_instability = None;
         for attempt in 0..MAX_REGISTRY_SNAPSHOT_ATTEMPTS {
-            let result = match stable_registry_parent_binding(path, control) {
+            let result = match stable_registry_parent_binding(
+                path,
+                control,
+                #[cfg(test)]
+                None,
+            ) {
                 Ok(Some(binding)) => snapshot_attempt(&binding, control, None, attempt),
                 Ok(None) => Err(SnapshotAttemptError::Missing),
                 Err(error) => Err(error),
@@ -828,11 +855,27 @@ impl RegistryDb {
         attempts: usize,
         hook: SnapshotTestHook,
     ) -> std::result::Result<Self, RegistrySnapshotError> {
+        Self::open_read_only_for_test_with_hooks(
+            path,
+            attempts,
+            RegistryTestHooks {
+                snapshot: Some(hook),
+                ..RegistryTestHooks::default()
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn open_read_only_for_test_with_hooks(
+        path: &Path,
+        attempts: usize,
+        hooks: RegistryTestHooks,
+    ) -> std::result::Result<Self, RegistrySnapshotError> {
         let control = kio_core::control::ControlHandle::default();
         let mut saw_instability = None;
         for attempt in 0..attempts {
-            let result = match stable_registry_parent_binding(path, &control) {
-                Ok(Some(binding)) => snapshot_attempt(&binding, &control, Some(&hook), attempt),
+            let result = match stable_registry_parent_binding(path, &control, Some(&hooks)) {
+                Ok(Some(binding)) => snapshot_attempt(&binding, &control, Some(&hooks), attempt),
                 Ok(None) => Err(SnapshotAttemptError::Missing),
                 Err(error) => Err(error),
             };
@@ -1616,16 +1659,16 @@ mod tests {
             .filter(|component| matches!(component, Component::Normal(_)))
             .count()
             - 1;
-        PARENT_COMPONENT_HOOK.with(|slot| {
-            *slot.borrow_mut() = Some(std::sync::Arc::new(move |index| {
+        let hooks = RegistryTestHooks {
+            parent_component: Some(std::sync::Arc::new(move |index| {
                 if index == final_index {
                     fs::rename(&nested, &moved).unwrap();
                     fs::create_dir(&nested).unwrap();
                 }
-            }));
-        });
-        let result = RegistryDb::open_read_only(&path);
-        PARENT_COMPONENT_HOOK.with(|slot| *slot.borrow_mut() = None);
+            })),
+            ..RegistryTestHooks::default()
+        };
+        let result = RegistryDb::open_read_only_for_test_with_hooks(&path, 1, hooks);
         match result {
             Err(RegistrySnapshotError::UnsafeIntegrity(_)) => {}
             Err(error) => panic!("expected unsafe replacement failure, got {error}"),
@@ -2280,6 +2323,7 @@ mod tests {
         let binding = crate::platform::registry_parent_and_leaf(
             &canonical,
             &kio_core::control::ControlHandle::default(),
+            None,
         )
         .unwrap();
         assert_eq!(binding.parent_path, canonical.parent().unwrap());
