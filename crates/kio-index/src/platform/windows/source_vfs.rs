@@ -5,31 +5,28 @@
 //! source capability and are refused, including if a caller changes the
 //! temporary-storage pragma. SQLite reports memory exhaustion normally.
 use crate::platform::BoundSqliteConnection;
+use crate::platform::bound_sqlite::{Hooks, RegisteredVfs, header};
 use crate::platform::source::{BoundSourceIndex, source_file_identity};
 use crate::{IndexError, Result};
 use cap_primitives::fs as cap_fs;
 use rusqlite::OpenFlags;
 use rusqlite::ffi;
-use std::cell::RefCell;
+use std::cell::Cell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::windows::io::AsRawHandle;
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::Arc;
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
     BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
     FILE_TYPE_DISK, GetFileInformationByHandle, GetFileType, GetFinalPathNameByHandleW,
 };
 
-const NAME: &CStr = c"kio-bound-source-windows";
-static VFS: OnceLock<std::result::Result<usize, String>> = OnceLock::new();
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Identity(u32, u64);
 struct Opening {
-    locator: CString,
-    expected: Identity,
     access: Arc<Access>,
-    opened: bool,
+    opened: Cell<bool>,
 }
 struct Access {
     expected: Identity,
@@ -37,30 +34,12 @@ struct Access {
     parent: std::fs::File,
     leaf: std::ffi::OsString,
 }
-static ACCESS: Mutex<Vec<(CString, Weak<Access>)>> = Mutex::new(Vec::new());
-impl Drop for Access {
-    fn drop(&mut self) {
-        if let Ok(mut entries) = ACCESS.lock() {
-            entries.retain(|(_, entry)| !std::ptr::eq(entry.as_ptr(), self));
-        }
-    }
-}
 const SIDECARS: [&str; 3] = ["-journal", "-wal", "-shm"];
 
 fn sidecar_absent(access: &Access, suffix: &str) -> bool {
     let mut leaf = access.leaf.clone();
     leaf.push(suffix);
     matches!(cap_fs::stat(&access.parent, std::path::Path::new(&leaf), cap_fs::FollowSymlinks::No), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-}
-
-thread_local! {
-    static OPENING: RefCell<Option<Opening>> = const { RefCell::new(None) };
-}
-struct OpeningGuard;
-impl Drop for OpeningGuard {
-    fn drop(&mut self) {
-        OPENING.with(|slot| *slot.borrow_mut() = None);
-    }
 }
 
 fn identity(handle: HANDLE) -> Option<Identity> {
@@ -100,35 +79,33 @@ fn locator(handle: HANDLE) -> Result<CString> {
     CString::new(path).map_err(|_| IndexError::Schema("SQLite handle path contains NUL".into()))
 }
 
-fn default_vfs() -> Result<*mut ffi::sqlite3_vfs> {
-    let result = VFS.get_or_init(|| unsafe {
-        let original = ffi::sqlite3_vfs_find(std::ptr::null());
-        if original.is_null() || (*original).xOpen.is_none() {
-            return Err("SQLite has no usable default VFS".into());
-        }
-        let mut wrapped = Box::new(*original);
-        wrapped.zName = NAME.as_ptr();
-        wrapped.xOpen = Some(x_open);
-        wrapped.xFullPathname = Some(x_full_pathname);
-        wrapped.xDelete = Some(x_delete);
-        wrapped.xAccess = Some(x_access);
-        let wrapped = Box::into_raw(wrapped);
-        let code = ffi::sqlite3_vfs_register(wrapped, 0);
-        if code != ffi::SQLITE_OK {
-            drop(Box::from_raw(wrapped));
-            return Err(format!("register bound Windows SQLite VFS: {code}"));
-        }
-        Ok(original as usize)
-    });
-    result
-        .as_ref()
-        .copied()
-        .map(|ptr| ptr as *mut ffi::sqlite3_vfs)
-        .map_err(|error| IndexError::Schema(error.clone()))
+fn registration(access: Arc<Access>) -> Result<RegisteredVfs<Opening>> {
+    let original = unsafe { ffi::sqlite3_vfs_find(std::ptr::null()) };
+    if original.is_null() || unsafe { (*original).xOpen }.is_none() {
+        return Err(IndexError::Schema(
+            "SQLite has no usable default VFS".into(),
+        ));
+    }
+    // SAFETY: bundled native default callbacks/userdata outlive every owner
+    // and support sequential Connection use, including moves between threads.
+    unsafe {
+        RegisteredVfs::new(
+            Opening {
+                access,
+                opened: Cell::new(false),
+            },
+            Hooks {
+                open: x_open,
+                full_path: x_full_pathname,
+                access: Some(x_access),
+                delete: Some(x_delete),
+            },
+            original,
+        )
+    }
 }
 
 pub(crate) fn open(source: &BoundSourceIndex, flags: OpenFlags) -> Result<BoundSqliteConnection> {
-    default_vfs()?;
     let handle = source.file.as_raw_handle();
     let expected = identity(handle).ok_or_else(|| {
         IndexError::Schema("retained SQLite handle is not a single-link regular file".into())
@@ -136,7 +113,7 @@ pub(crate) fn open(source: &BoundSourceIndex, flags: OpenFlags) -> Result<BoundS
     let locator = locator(handle)?;
     let access = Arc::new(Access {
         expected,
-        locator: locator.clone(),
+        locator,
         parent: source
             ._parent
             .try_clone()
@@ -147,15 +124,10 @@ pub(crate) fn open(source: &BoundSourceIndex, flags: OpenFlags) -> Result<BoundS
             .expect("bound source leaf")
             .to_owned(),
     });
-    open_with_access(locator, expected, flags, access)
+    open_with_access(access, flags)
 }
 
-fn open_with_access(
-    locator: CString,
-    expected: Identity,
-    flags: OpenFlags,
-    access: Arc<Access>,
-) -> Result<BoundSqliteConnection> {
+fn open_with_access(access: Arc<Access>, flags: OpenFlags) -> Result<BoundSqliteConnection> {
     if !SIDECARS
         .iter()
         .all(|suffix| sidecar_absent(&access, suffix))
@@ -164,37 +136,13 @@ fn open_with_access(
             "source SQLite sidecar exists or cannot be inspected".into(),
         ));
     }
-    {
-        let mut entries = ACCESS
-            .lock()
-            .map_err(|_| IndexError::Schema("SQLite access registry poisoned".into()))?;
-        entries.retain(|(_, entry)| entry.strong_count() != 0);
-        entries.push((access.locator.clone(), Arc::downgrade(&access)));
-    }
-    let path = locator
+    let path = access
+        .locator
         .to_str()
         .map_err(|_| IndexError::Schema("invalid SQLite locator".into()))?
         .to_owned();
-    OPENING.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_some() {
-            return Err(IndexError::Schema("nested bound SQLite open".into()));
-        }
-        *slot = Some(Opening {
-            locator,
-            expected,
-            access,
-            opened: false,
-        });
-        Ok(())
-    })?;
-    let _guard = OpeningGuard;
-    let conn = BoundSqliteConnection::open::<()>(
-        Path::new(&path),
-        flags,
-        Some(NAME.to_str().expect("ASCII VFS name")),
-        None,
-    )?;
+    let conn =
+        BoundSqliteConnection::open_registered(registration(access)?, Path::new(&path), flags)?;
     // xOpen has verified the actual native main-file handle. Keep sorting,
     // materialization and temporary tables usable without granting SQLite
     // authority to create files in an ambient temporary directory.
@@ -202,7 +150,8 @@ fn open_with_access(
     Ok(conn)
 }
 
-unsafe extern "C" fn x_full_pathname(
+unsafe fn x_full_pathname(
+    state: *mut c_void,
     _: *mut ffi::sqlite3_vfs,
     name: *const c_char,
     len: c_int,
@@ -212,11 +161,9 @@ unsafe extern "C" fn x_full_pathname(
         return ffi::SQLITE_CANTOPEN;
     }
     let name = unsafe { CStr::from_ptr(name) };
-    let allowed = OPENING.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .is_some_and(|context| !context.opened && context.locator.as_c_str() == name)
-    });
+    // Shared trampoline validates the private owner prefix before dispatch.
+    let context = unsafe { &*state.cast::<Opening>() };
+    let allowed = !context.opened.get() && context.access.locator.as_c_str() == name;
     if !allowed || name.to_bytes_with_nul().len() > len as usize {
         return ffi::SQLITE_CANTOPEN;
     }
@@ -259,8 +206,9 @@ unsafe fn reject_opened(file: *mut ffi::sqlite3_file) -> c_int {
     ffi::SQLITE_CANTOPEN
 }
 
-unsafe extern "C" fn x_open(
-    _: *mut ffi::sqlite3_vfs,
+unsafe fn x_open(
+    state: *mut c_void,
+    vfs: *mut ffi::sqlite3_vfs,
     name: ffi::sqlite3_filename,
     file: *mut ffi::sqlite3_file,
     flags: c_int,
@@ -276,32 +224,36 @@ unsafe extern "C" fn x_open(
     if name.is_null() || flags & ffi::SQLITE_OPEN_MAIN_DB == 0 {
         return ffi::SQLITE_CANTOPEN;
     }
-    let expected = OPENING.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let context = slot.as_mut()?;
-        if context.opened || context.locator.as_c_str() != unsafe { CStr::from_ptr(name) } {
-            return None;
-        }
-        context.opened = true;
-        Some((context.expected, Arc::clone(&context.access)))
-    });
-    let Some((expected, access)) = expected else {
+    let context = unsafe { &*state.cast::<Opening>() };
+    if context.opened.get() || context.access.locator.as_c_str() != unsafe { CStr::from_ptr(name) }
+    {
+        return ffi::SQLITE_CANTOPEN;
+    }
+    context.opened.set(true);
+    let access = Arc::clone(&context.access);
+    let Some(owner) = (unsafe { header(vfs) }) else {
         return ffi::SQLITE_CANTOPEN;
     };
-    let Ok(vfs) = default_vfs() else {
-        return ffi::SQLITE_CANTOPEN;
-    };
-    let Some(callback) = (unsafe { (*vfs).xOpen }) else {
+    let original_vfs = owner.original;
+    let Some(callback) = (unsafe { (*original_vfs).xOpen }) else {
         return ffi::SQLITE_CANTOPEN;
     };
     // Pass SQLite-owned filename storage unchanged; win32 VFS retains it.
     // The retained capability already created the file, so a raced-away name
     // must never grant authority to create a replacement.
-    let code = unsafe { callback(vfs, name, file, flags & !ffi::SQLITE_OPEN_CREATE, out) };
+    let code = unsafe {
+        callback(
+            original_vfs,
+            name,
+            file,
+            flags & !ffi::SQLITE_OPEN_CREATE,
+            out,
+        )
+    };
     if code != ffi::SQLITE_OK {
         return code;
     }
-    if unsafe { native_identity(file) } != Some(expected) {
+    if unsafe { native_identity(file) } != Some(access.expected) {
         return unsafe { reject_opened(file) };
     }
     let original = unsafe { (*file).pMethods };
@@ -353,10 +305,11 @@ unsafe extern "C" fn x_shm_map(
 unsafe extern "C" fn x_shm_unmap(_: *mut ffi::sqlite3_file, _: c_int) -> c_int {
     ffi::SQLITE_OK
 }
-unsafe extern "C" fn x_delete(_: *mut ffi::sqlite3_vfs, _: *const c_char, _: c_int) -> c_int {
+unsafe fn x_delete(_: *mut c_void, _: *mut ffi::sqlite3_vfs, _: *const c_char, _: c_int) -> c_int {
     ffi::SQLITE_IOERR_DELETE
 }
-unsafe extern "C" fn x_access(
+unsafe fn x_access(
+    state: *mut c_void,
     _: *mut ffi::sqlite3_vfs,
     name: *const c_char,
     _: c_int,
@@ -369,65 +322,27 @@ unsafe extern "C" fn x_access(
         *output = 0;
     }
     let name = unsafe { CStr::from_ptr(name) }.to_bytes();
-    // Snapshot matching weak references under the registry lock. Upgrade and
-    // perform capability I/O after unlocking; unrelated connection closes
-    // cannot invalidate this callback.
-    let contexts = {
-        let Ok(entries) = ACCESS.lock() else {
-            return ffi::SQLITE_IOERR_ACCESS;
-        };
-        entries
-            .iter()
-            .filter(|(locator, _)| {
-                name.strip_prefix(locator.to_bytes()).is_some_and(|suffix| {
-                    SIDECARS
-                        .iter()
-                        .any(|candidate| candidate.as_bytes() == suffix)
-                })
-            })
-            .map(|(_, entry)| entry.clone())
-            .collect::<Vec<_>>()
+    let context = unsafe { &*state.cast::<Opening>() };
+    let access = &context.access;
+    let Some(suffix) = name.strip_prefix(access.locator.to_bytes()) else {
+        return ffi::SQLITE_IOERR_ACCESS;
     };
-    let Some(contexts) = contexts
+    let Some(suffix) = SIDECARS
         .iter()
-        .map(Weak::upgrade)
-        .collect::<Option<Vec<_>>>()
+        .find(|candidate| candidate.as_bytes() == suffix)
     else {
         return ffi::SQLITE_IOERR_ACCESS;
     };
-    let mut matched = false;
-    let mut binding = None;
-    for access in contexts {
-        let Some(suffix) = name.strip_prefix(access.locator.to_bytes()) else {
-            continue;
-        };
-        let Some(suffix) = SIDECARS
-            .iter()
-            .find(|candidate| candidate.as_bytes() == suffix)
-        else {
-            continue;
-        };
-        let Ok(parent) = source_file_identity(&access.parent) else {
-            return ffi::SQLITE_IOERR_ACCESS;
-        };
-        if parent.volume_serial_number.is_none() || parent.file_index.is_none() {
-            return ffi::SQLITE_IOERR_ACCESS;
-        }
-        let current = (parent, access.expected);
-        if binding.is_some_and(|previous| previous != current) {
-            return ffi::SQLITE_IOERR_ACCESS;
-        }
-        binding = Some(current);
-        matched = true;
-        if !sidecar_absent(&access, suffix) {
-            return ffi::SQLITE_IOERR_ACCESS;
-        }
+    let Ok(parent) = source_file_identity(&access.parent) else {
+        return ffi::SQLITE_IOERR_ACCESS;
+    };
+    if parent.volume_serial_number.is_none()
+        || parent.file_index.is_none()
+        || !sidecar_absent(access, suffix)
+    {
+        return ffi::SQLITE_IOERR_ACCESS;
     }
-    if matched {
-        ffi::SQLITE_OK
-    } else {
-        ffi::SQLITE_IOERR_ACCESS
-    }
+    ffi::SQLITE_OK
 }
 
 #[cfg(test)]
@@ -435,6 +350,102 @@ mod tests {
     use super::*;
     use std::fs::{File, OpenOptions};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::platform::bound_sqlite::tests::{name as owner_name, vfs as owner_vfs};
+    use std::ptr;
+
+    unsafe fn owner_access(
+        vfs: *mut ffi::sqlite3_vfs,
+        name: *const c_char,
+        flags: c_int,
+        output: *mut c_int,
+    ) -> c_int {
+        unsafe { (*vfs).xAccess.unwrap()(vfs, name, flags, output) }
+    }
+    unsafe fn owner_full_path(
+        vfs: *mut ffi::sqlite3_vfs,
+        name: *const c_char,
+        len: c_int,
+        output: *mut c_char,
+    ) -> c_int {
+        unsafe { (*vfs).xFullPathname.unwrap()(vfs, name, len, output) }
+    }
+    unsafe fn owner_delete(vfs: *mut ffi::sqlite3_vfs, name: *const c_char, sync: c_int) -> c_int {
+        unsafe { (*vfs).xDelete.unwrap()(vfs, name, sync) }
+    }
+    struct Filename(ffi::sqlite3_filename);
+    impl Filename {
+        fn new(path: &CStr) -> Self {
+            let name = unsafe {
+                ffi::sqlite3_create_filename(
+                    path.as_ptr(),
+                    c"".as_ptr(),
+                    c"".as_ptr(),
+                    0,
+                    ptr::null_mut(),
+                )
+            };
+            assert!(!name.is_null());
+            Self(name)
+        }
+    }
+    impl Drop for Filename {
+        fn drop(&mut self) {
+            unsafe { ffi::sqlite3_free_filename(self.0) }
+        }
+    }
+    struct NativeFile {
+        storage: Vec<u64>,
+        filename: Filename,
+    }
+    impl NativeFile {
+        fn new(vfs: *mut ffi::sqlite3_vfs, path: &CStr) -> Self {
+            let bytes = usize::try_from(unsafe { (*vfs).szOsFile }).unwrap();
+            Self {
+                storage: vec![0; bytes.div_ceil(std::mem::size_of::<u64>())],
+                filename: Filename::new(path),
+            }
+        }
+        fn file(&mut self) -> *mut ffi::sqlite3_file {
+            self.storage.as_mut_ptr().cast()
+        }
+        fn open(
+            &mut self,
+            dispatch: *mut ffi::sqlite3_vfs,
+            argument: *mut ffi::sqlite3_vfs,
+            flags: c_int,
+        ) -> c_int {
+            let filename = self.filename.0;
+            let file = self.file();
+            let mut out = 0;
+            unsafe { (*dispatch).xOpen.unwrap()(argument, filename, file, flags, &mut out) }
+        }
+        fn close(&mut self) {
+            let file = self.file();
+            let methods = unsafe { (*file).pMethods };
+            if !methods.is_null() {
+                let close = unsafe { (*methods).xClose }.unwrap();
+                assert_eq!(unsafe { close(file) }, ffi::SQLITE_OK);
+                assert!(unsafe { (*file).pMethods }.is_null());
+            }
+        }
+    }
+    impl Drop for NativeFile {
+        fn drop(&mut self) {
+            // Filename/storage and owner registration are still live through close.
+            // A refused native open has already cleared pMethods and is not closed twice.
+            self.close();
+        }
+    }
+    fn main_flags() -> c_int {
+        ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_MAIN_DB
+    }
+    fn access_answer(vfs: *mut ffi::sqlite3_vfs, name: &CStr) -> (c_int, c_int) {
+        let mut exists = -1;
+        let code =
+            unsafe { owner_access(vfs, name.as_ptr(), ffi::SQLITE_ACCESS_EXISTS, &mut exists) };
+        (code, exists)
+    }
 
     fn test_access(locator: &CStr, expected: Identity) -> Arc<Access> {
         use std::os::windows::fs::OpenOptionsExt;
@@ -456,11 +467,10 @@ mod tests {
         flags: OpenFlags,
     ) -> Result<BoundSqliteConnection> {
         let access = test_access(&locator, expected);
-        open_with_access(locator, expected, flags, access)
+        open_with_access(access, flags)
     }
 
     fn fixture() -> (tempfile::TempDir, File, CString, Identity) {
-        default_vfs().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let file = OpenOptions::new()
             .read(true)
@@ -539,7 +549,7 @@ mod tests {
         let (_directory, _file, _path, expected) = fixture();
         let (_other_directory, _other_file, other_path, _) = fixture();
         assert!(open_locator(other_path, expected, OpenFlags::SQLITE_OPEN_READ_WRITE).is_err());
-        // A rejected open must also clear the per-thread context.
+        // A rejected open must also tear down its connection owner.
         let (_directory, _file, path, expected) = fixture();
         assert!(open_locator(path, expected, OpenFlags::SQLITE_OPEN_READ_WRITE).is_ok());
     }
@@ -563,20 +573,13 @@ mod tests {
     #[test]
     fn relative_name_cannot_replace_handle_locator() {
         let (_directory, _file, path, expected) = fixture();
-        OPENING.with(|slot| {
-            *slot.borrow_mut() = Some(Opening {
-                access: test_access(&path, expected),
-                locator: path,
-                expected,
-                opened: false,
-            })
-        });
-        let _guard = OpeningGuard;
+        let owner = registration(test_access(&path, expected)).unwrap();
+        let vfs = owner_vfs(&owner);
         let mut output = [0_i8; 512];
         assert_eq!(
             unsafe {
-                x_full_pathname(
-                    std::ptr::null_mut(),
+                owner_full_path(
+                    vfs,
                     c"source.db".as_ptr(),
                     output.len() as c_int,
                     output.as_mut_ptr(),
@@ -677,39 +680,29 @@ mod tests {
             std::fs::remove_file(&sidecar).unwrap();
             let conn =
                 open_locator(path.clone(), expected, OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+            let vfs = conn.registered_vfs_for_test().unwrap();
             let name = CString::new(format!("{}{suffix}", path.to_str().unwrap())).unwrap();
             let mut exists = -1;
             assert_eq!(
-                unsafe {
-                    x_access(
-                        std::ptr::null_mut(),
-                        name.as_ptr(),
-                        ffi::SQLITE_ACCESS_EXISTS,
-                        &mut exists,
-                    )
-                },
+                unsafe { owner_access(vfs, name.as_ptr(), ffi::SQLITE_ACCESS_EXISTS, &mut exists) },
                 ffi::SQLITE_OK
             );
             assert_eq!(exists, 0);
             std::fs::write(&sidecar, b"late recovery data").unwrap();
             assert_eq!(
-                unsafe {
-                    x_access(
-                        std::ptr::null_mut(),
-                        name.as_ptr(),
-                        ffi::SQLITE_ACCESS_EXISTS,
-                        &mut exists,
-                    )
-                },
+                unsafe { owner_access(vfs, name.as_ptr(), ffi::SQLITE_ACCESS_EXISTS, &mut exists) },
                 ffi::SQLITE_IOERR_ACCESS
             );
             drop(conn);
         }
+        let (_directory, _file, path, expected) = fixture();
+        let unknown_owner = registration(test_access(&path, expected)).unwrap();
+        let vfs = owner_vfs(&unknown_owner);
         let mut exists = -1;
         assert_eq!(
             unsafe {
-                x_access(
-                    std::ptr::null_mut(),
+                owner_access(
+                    vfs,
                     c"unknown.db-journal".as_ptr(),
                     ffi::SQLITE_ACCESS_EXISTS,
                     &mut exists,
@@ -720,40 +713,100 @@ mod tests {
     }
 
     #[test]
-    fn conflicting_live_binding_for_same_locator_is_rejected() {
-        let (_directory, _file, path, expected) = fixture();
-        let conn = open_locator(path.clone(), expected, OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
-        let other = test_access(&path, Identity(expected.0, expected.1 ^ 1));
-        ACCESS
-            .lock()
-            .unwrap()
-            .push((other.locator.clone(), Arc::downgrade(&other)));
-        let name = CString::new(format!("{}-journal", path.to_str().unwrap())).unwrap();
-        let mut exists = -1;
-        assert_eq!(
-            unsafe {
-                x_access(
-                    std::ptr::null_mut(),
-                    name.as_ptr(),
-                    ffi::SQLITE_ACCESS_EXISTS,
-                    &mut exists,
+    fn connection_owners_isolate_same_locator_authority() {
+        for drop_correct_first in [false, true] {
+            let (_directory, _file, path, expected) = fixture();
+            let conn =
+                open_locator(path.clone(), expected, OpenFlags::SQLITE_OPEN_READ_WRITE).unwrap();
+            let correct = conn.registered_vfs_for_test().unwrap();
+            let journal = CString::new(format!("{}-journal", path.to_str().unwrap())).unwrap();
+            let before = access_answer(correct, &journal);
+            assert_eq!(before, (ffi::SQLITE_OK, 0));
+
+            let bad_access = test_access(&path, Identity(expected.0, expected.1 ^ 1));
+            let other = registration(Arc::clone(&bad_access)).unwrap();
+            let bad = owner_vfs(&other);
+            let bad_name = owner_name(&other);
+            assert_ne!(correct, bad);
+            assert_eq!(access_answer(correct, &journal), before);
+            assert_eq!(access_answer(bad, &journal), before);
+
+            // Same actual native xOpen identity rejection as existing behaviour.
+            // The registration remains live while the refused file is inspected.
+            let mut rejected = NativeFile::new(bad, &path);
+            assert_eq!(rejected.open(bad, bad, main_flags()), ffi::SQLITE_CANTOPEN);
+            assert!(unsafe { (*rejected.file()).pMethods }.is_null());
+            drop(rejected);
+            // A fresh owner with the identical Arc<Access> also cannot become a
+            // rusqlite connection; the direct check above proves native refusal
+            // clears pMethods, rather than merely observing an SQL-level error.
+            assert!(
+                BoundSqliteConnection::open_registered(
+                    registration(Arc::clone(&bad_access)).unwrap(),
+                    Path::new(path.to_str().unwrap()),
+                    OpenFlags::SQLITE_OPEN_READ_WRITE,
                 )
-            },
-            ffi::SQLITE_IOERR_ACCESS
-        );
-        drop(other);
-        assert_eq!(
-            unsafe {
-                x_access(
-                    std::ptr::null_mut(),
-                    name.as_ptr(),
-                    ffi::SQLITE_ACCESS_EXISTS,
-                    &mut exists,
-                )
-            },
-            ffi::SQLITE_OK
-        );
-        drop(conn);
+                .is_err()
+            );
+            assert_eq!(access_answer(correct, &journal), before);
+
+            // Read only immutable marker/userdata fields. Never copy/read pNext.
+            let mut copied: ffi::sqlite3_vfs = unsafe { std::mem::zeroed() };
+            copied.pAppData = unsafe { (*correct).pAppData };
+            copied.xOpen = unsafe { (*correct).xOpen };
+            let foreign = unsafe { ffi::sqlite3_vfs_find(ptr::null()) };
+            assert!(!foreign.is_null());
+            for wrong in [ptr::null_mut(), foreign, ptr::addr_of_mut!(copied)] {
+                let mut exists = -1;
+                let mut output = vec![0 as c_char; path.to_bytes_with_nul().len()];
+                let mut closed = NativeFile::new(correct, &path);
+                assert_eq!(
+                    unsafe {
+                        (*correct).xAccess.unwrap()(
+                            wrong,
+                            journal.as_ptr(),
+                            ffi::SQLITE_ACCESS_EXISTS,
+                            &mut exists,
+                        )
+                    },
+                    ffi::SQLITE_IOERR_ACCESS
+                );
+                assert_eq!(
+                    closed.open(correct, wrong, main_flags()),
+                    ffi::SQLITE_CANTOPEN
+                );
+                assert!(unsafe { (*closed.file()).pMethods }.is_null());
+                assert_eq!(
+                    unsafe {
+                        (*correct).xFullPathname.unwrap()(
+                            wrong,
+                            path.as_ptr(),
+                            output.len() as c_int,
+                            output.as_mut_ptr(),
+                        )
+                    },
+                    ffi::SQLITE_CANTOPEN
+                );
+            }
+
+            if drop_correct_first {
+                drop(conn);
+                assert_eq!(access_answer(bad, &journal), before);
+                assert_eq!(unsafe { ffi::sqlite3_vfs_find(bad_name.as_ptr()) }, bad);
+                drop(other);
+            } else {
+                drop(other);
+                assert!(unsafe { ffi::sqlite3_vfs_find(bad_name.as_ptr()) }.is_null());
+                assert_eq!(access_answer(correct, &journal), before);
+                assert_eq!(
+                    conn.query_row("SELECT 42", [], |r| r.get::<_, i64>(0))
+                        .unwrap(),
+                    42
+                );
+                drop(conn);
+            }
+            assert!(unsafe { ffi::sqlite3_vfs_find(bad_name.as_ptr()) }.is_null());
+        }
     }
 
     #[test]
@@ -768,11 +821,107 @@ mod tests {
             conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE forbidden_wal(v);")
                 .is_err()
         );
+        let vfs = conn.registered_vfs_for_test().unwrap();
         assert_eq!(
-            unsafe { x_delete(std::ptr::null_mut(), c"foreign.db".as_ptr(), 0) },
+            unsafe { owner_delete(vfs, c"foreign.db".as_ptr(), 0) },
             ffi::SQLITE_IOERR_DELETE
         );
         drop(conn);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn main_file_authority_is_single_use_and_locator_bound() {
+        let (_directory, _file, path, expected) = fixture();
+        let owner = registration(test_access(&path, expected)).unwrap();
+        let vfs = owner_vfs(&owner);
+        let mut relative = NativeFile::new(vfs, c"source.db");
+        assert_eq!(relative.open(vfs, vfs, main_flags()), ffi::SQLITE_CANTOPEN);
+        assert!(unsafe { (*relative.file()).pMethods }.is_null());
+        let mut nonmain = NativeFile::new(vfs, &path);
+        assert_eq!(
+            nonmain.open(
+                vfs,
+                vfs,
+                ffi::SQLITE_OPEN_READWRITE | ffi::SQLITE_OPEN_MAIN_JOURNAL
+            ),
+            ffi::SQLITE_CANTOPEN
+        );
+        assert!(unsafe { (*nonmain.file()).pMethods }.is_null());
+        let mut null_name = NativeFile::new(vfs, &path);
+        let mut out = 0;
+        assert_eq!(
+            unsafe {
+                (*vfs).xOpen.unwrap()(vfs, ptr::null(), null_name.file(), main_flags(), &mut out)
+            },
+            ffi::SQLITE_CANTOPEN
+        );
+        assert!(unsafe { (*null_name.file()).pMethods }.is_null());
+
+        let mut main = NativeFile::new(vfs, &path);
+        assert_eq!(main.open(vfs, vfs, main_flags()), ffi::SQLITE_OK);
+        assert_eq!(unsafe { native_identity(main.file()) }, Some(expected));
+        let mut repeated = NativeFile::new(vfs, &path);
+        assert_eq!(repeated.open(vfs, vfs, main_flags()), ffi::SQLITE_CANTOPEN);
+        assert!(unsafe { (*repeated.file()).pMethods }.is_null());
+        let mut output = vec![0 as c_char; path.to_bytes_with_nul().len()];
+        assert_eq!(
+            unsafe {
+                owner_full_path(
+                    vfs,
+                    path.as_ptr(),
+                    output.len() as c_int,
+                    output.as_mut_ptr(),
+                )
+            },
+            ffi::SQLITE_CANTOPEN
+        );
+        main.close();
+        // Owner declared before every manual file, so unwind also closes first.
+        drop(repeated);
+        drop(main);
+        drop(null_name);
+        drop(nonmain);
+        drop(relative);
+        drop(owner);
+    }
+
+    #[test]
+    fn native_methods_retain_access_until_close_and_refuse_shm() {
+        let (directory, _file, path, expected) = fixture();
+        let access = test_access(&path, expected);
+        let weak = Arc::downgrade(&access);
+        let owner = registration(access).unwrap();
+        let vfs = owner_vfs(&owner);
+        let mut main = NativeFile::new(vfs, &path);
+        assert_eq!(main.open(vfs, vfs, main_flags()), ffi::SQLITE_OK);
+        let file = main.file();
+        let methods = unsafe { (*file).pMethods };
+        assert!(!methods.is_null());
+        // Verified native xOpen installs this private repr(C) Methods table.
+        let retained = unsafe { &*methods.cast::<Methods>() };
+        assert!(std::sync::Weak::ptr_eq(
+            &weak,
+            &Arc::downgrade(&retained._access)
+        ));
+        let before_close = weak.strong_count();
+        assert!(before_close >= 2);
+        let mut mapped: *mut c_void = ptr::null_mut();
+        assert_eq!(
+            unsafe { (*methods).xShmMap.unwrap()(file, 0, 4096, 0, &mut mapped) },
+            ffi::SQLITE_IOERR_SHMMAP
+        );
+        assert!(mapped.is_null());
+        assert_eq!(
+            unsafe { (*methods).xShmUnmap.unwrap()(file, 0) },
+            ffi::SQLITE_OK
+        );
+        assert!(!directory.path().join("source.db-shm").exists());
+        main.close();
+        assert_eq!(weak.strong_count(), before_close - 1);
+        assert!(weak.upgrade().is_some());
+        drop(main);
+        drop(owner);
+        assert!(weak.upgrade().is_none());
     }
 }
