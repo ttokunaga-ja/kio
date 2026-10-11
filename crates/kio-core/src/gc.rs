@@ -23,6 +23,9 @@ pub use control::{
     validated_final_shallow_receipts,
 };
 pub mod exchange;
+mod observed_read;
+pub(crate) use observed_read::read_regular_observed;
+use observed_read::{read_accounted_observed, read_required_accounted_observed};
 mod unreachable_inventory;
 #[cfg(all(test, windows))]
 #[path = "gc/windows_snapshot_state_tests.rs"]
@@ -32,7 +35,7 @@ pub use unreachable_inventory::{UnreachableInventoryLimits, UnreachableObjectInv
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use cap_primitives::{ambient_authority, fs as cap_fs};
@@ -3732,62 +3735,9 @@ fn names(
     v.sort();
     Ok(v)
 }
-pub(crate) fn read_regular_observed(
-    d: &std::fs::File,
-    n: &str,
-    max: u64,
-) -> Result<(Vec<u8>, FileObservation)> {
-    let p = Path::new(n);
-    let before = cap_fs::stat(d, p, cap_fs::FollowSymlinks::No).map_err(|e| ioerr(e, n))?;
-    valid_file(&before, max)?;
-    let mut o = cap_fs::OpenOptions::new();
-    o.read(true);
-    o._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut f = cap_fs::open(d, p, &o).map_err(|e| ioerr(e, n))?;
-    let opened = cap_fs::Metadata::from_file(&f).map_err(|e| ioerr(e, n))?;
-    valid_file(&opened, max)?;
-    if !same_file_state(&before, &opened)? {
-        return Err(corrupt("store file changed while opening"));
-    }
-    let mut b = Vec::with_capacity(usize::try_from(opened.len()).map_err(|_| limit("file bytes"))?);
-    (&mut f)
-        .take(max.saturating_add(1))
-        .read_to_end(&mut b)
-        .map_err(|e| ioerr(e, n))?;
-    if b.len() as u64 > max {
-        return Err(limit("file bytes"));
-    }
-    let after = cap_fs::stat(d, p, cap_fs::FollowSymlinks::No).map_err(|e| ioerr(e, n))?;
-    valid_file(&after, max)?;
-    if b.len() as u64 != opened.len() || !same_file_state(&after, &opened)? {
-        return Err(corrupt("store file changed while read"));
-    }
-    let observation = FileObservation {
-        identity: id_meta(&opened)?,
-        state: file_state(&opened),
-        digest: hash_bytes(&b),
-    };
-    Ok((b, observation))
-}
-
 #[cfg(all(test, unix))]
 fn read_regular(d: &std::fs::File, n: &str, max: u64) -> Result<Vec<u8>> {
     read_regular_observed(d, n, max).map(|(bytes, _)| bytes)
-}
-
-fn read_accounted_observed(
-    directory: &std::fs::File,
-    name: &str,
-    max: u64,
-    stats: &mut GcPlanStats,
-    limits: &GcPlanLimits,
-    observations: &mut BTreeMap<String, FileObservation>,
-    observation_name: &str,
-) -> Result<Vec<u8>> {
-    let (bytes, observation) = read_regular_observed(directory, name, max)?;
-    account(stats, bytes.len() as u64, limits)?;
-    insert_observation(observations, observation_name, observation)?;
-    Ok(bytes)
 }
 
 fn insert_observation(
@@ -3821,30 +3771,6 @@ fn observe_directory(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn read_required_accounted_observed(
-    directory: &std::fs::File,
-    name: &str,
-    max: u64,
-    missing_message: &str,
-    stats: &mut GcPlanStats,
-    limits: &GcPlanLimits,
-    observations: &mut BTreeMap<String, FileObservation>,
-    observation_name: &str,
-) -> Result<Vec<u8>> {
-    match read_accounted_observed(
-        directory,
-        name,
-        max,
-        stats,
-        limits,
-        observations,
-        observation_name,
-    ) {
-        Err(error) if is_io_not_found(&error) => Err(corrupt(missing_message)),
-        result => result,
-    }
-}
 pub(crate) fn valid_file(m: &cap_fs::Metadata, max: u64) -> Result<()> {
     if !m.is_file() || m.len() > max {
         return Err(if m.len() > max {
