@@ -1,10 +1,12 @@
-use super::{
-    bind_cache_parent, bound_cache_x_open, cache_internal_name_allowed, open_or_create_cache_parent,
-};
+use super::{bind_cache_parent, open_or_create_cache_parent};
+#[cfg(target_os = "macos")]
+use super::{bound_cache_x_open, cache_internal_name_allowed};
 use crate::Result;
 use cap_primitives::fs as cap_fs;
+#[cfg(target_os = "macos")]
 use std::ffi::CStr;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::sync::{Once, OnceLock};
 /// A cache leaf and its parent directory retained as capabilities.  The parent
 /// must stay alive: a public cache pathname can be redirected after opening it.
@@ -300,14 +302,19 @@ pub(crate) fn recreate_cache(
     Ok(cache)
 }
 
+#[cfg(target_os = "macos")]
 const BOUND_CACHE_VFS_NAME: &CStr = c"kio-bound-cache-unix";
 
+#[cfg(target_os = "macos")]
 static BOUND_CACHE_VFS_INIT: Once = Once::new();
 
+#[cfg(target_os = "macos")]
 static BOUND_CACHE_VFS_RESULT: OnceLock<std::result::Result<(), String>> = OnceLock::new();
 
+#[cfg(target_os = "macos")]
 pub(super) static BOUND_CACHE_DEFAULT_VFS: OnceLock<usize> = OnceLock::new();
 
+#[cfg(target_os = "macos")]
 pub(super) fn initialize_bound_cache_vfs() -> Result<()> {
     BOUND_CACHE_VFS_INIT.call_once(|| {
         let result = unsafe {
@@ -340,6 +347,7 @@ pub(super) fn initialize_bound_cache_vfs() -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 pub(super) unsafe extern "C" fn bound_cache_x_full_pathname(
     _: *mut rusqlite::ffi::sqlite3_vfs,
     name: *const std::ffi::c_char,
@@ -374,6 +382,7 @@ pub(super) unsafe extern "C" fn bound_cache_x_full_pathname(
     unsafe { callback(default_vfs, name, output_len, output) }
 }
 
+#[cfg(target_os = "macos")]
 pub(super) fn is_bound_cache_fd_name(value: &[u8]) -> bool {
     value
         .strip_prefix(b"/dev/fd/")

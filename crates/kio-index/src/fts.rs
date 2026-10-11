@@ -1,12 +1,12 @@
 //! FTS5 external-content index contracts.
 
-use crate::platform::open_bound_source_connection;
 use crate::platform::{
     BoundSourceIndex, SourceFileIdentity, bind_gc_source_leaf, bind_source_index,
     canonical_gc_index_identity, cap_source_leaf_identity, gc_cleanup_directory,
     open_gc_source_copy, remove_stale_gc_index_file, source_file_identity, source_file_state,
     sync_bound_gc_directory, validate_bound_source_file,
 };
+use crate::platform::{BoundSqliteConnection, open_bound_source_connection};
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -61,12 +61,12 @@ pub struct PurgeRawIndexReport {
 }
 
 pub struct SqliteFtsIndex {
-    conn: Connection,
+    conn: BoundSqliteConnection,
     _source: Option<BoundSourceIndex>,
 }
 
 pub struct SourceIndexConnection {
-    conn: Connection,
+    conn: BoundSqliteConnection,
     _source: BoundSourceIndex,
 }
 
@@ -99,11 +99,6 @@ impl std::ops::Deref for SourceIndexConnection {
         &self.conn
     }
 }
-impl std::ops::DerefMut for SourceIndexConnection {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.conn
-    }
-}
 impl std::fmt::Debug for SourceIndexConnection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SourceIndexConnection")
@@ -112,6 +107,11 @@ impl std::fmt::Debug for SourceIndexConnection {
 }
 
 impl SourceIndexConnection {
+    /// Begin a transaction without exposing a replaceable Connection.
+    pub fn transaction(&mut self) -> rusqlite::Result<rusqlite::Transaction<'_>> {
+        self.conn.transaction()
+    }
+
     /// Recheck that the retained SQLite descriptor is still the file denoted
     /// by its capability-relative public leaf. This catches a replacement
     /// after the connection has opened; callers must treat failure as fatal.
@@ -714,7 +714,7 @@ pub fn read_bound_gc_index_rotation_attestation(
 }
 
 fn write_gc_rotation_attestation(
-    conn: &mut Connection,
+    conn: &mut BoundSqliteConnection,
     attestation: &GcIndexRotationAttestation,
     lifecycle_epoch: u64,
 ) -> Result<()> {
@@ -862,7 +862,7 @@ fn open_bound_gc_index(
     kio_dir: &std::fs::File,
     config: &FtsSchemaConfig,
     writable: bool,
-) -> Result<Option<(BoundSourceIndex, Connection)>> {
+) -> Result<Option<(BoundSourceIndex, BoundSqliteConnection)>> {
     // Unix descriptor binding and Windows actual-HANDLE verification both
     // prove SQLite adopted the retained primary file before pager access.
 
@@ -887,7 +887,7 @@ fn open_bound_gc_index_leaf(
     leaf: &str,
     config: &FtsSchemaConfig,
     writable: bool,
-) -> Result<Option<(BoundSourceIndex, Connection)>> {
+) -> Result<Option<(BoundSourceIndex, BoundSqliteConnection)>> {
     let Some(source) = bind_gc_source_leaf(parent, leaf, writable)? else {
         return Ok(None);
     };
@@ -1010,7 +1010,7 @@ impl SqliteFtsIndex {
     #[cfg(test)]
     pub(crate) fn in_memory(config: FtsSchemaConfig) -> Result<Self> {
         crate::vec::ensure_registered();
-        let conn = Connection::open_in_memory()?;
+        let conn = BoundSqliteConnection::from_connection(Connection::open_in_memory()?);
         ensure_schema_on_connection(&conn, config)?;
         Ok(Self {
             conn,

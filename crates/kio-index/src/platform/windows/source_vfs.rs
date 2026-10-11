@@ -4,14 +4,16 @@
 //! sidecars and unnamed disk temporary files remain outside the retained
 //! source capability and are refused, including if a caller changes the
 //! temporary-storage pragma. SQLite reports memory exhaustion normally.
+use crate::platform::BoundSqliteConnection;
 use crate::platform::source::{BoundSourceIndex, source_file_identity};
 use crate::{IndexError, Result};
 use cap_primitives::fs as cap_fs;
+use rusqlite::OpenFlags;
 use rusqlite::ffi;
-use rusqlite::{Connection, OpenFlags};
 use std::cell::RefCell;
 use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::os::windows::io::AsRawHandle;
+use std::path::Path;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
 use windows_sys::Win32::Storage::FileSystem::{
@@ -125,7 +127,7 @@ fn default_vfs() -> Result<*mut ffi::sqlite3_vfs> {
         .map_err(|error| IndexError::Schema(error.clone()))
 }
 
-pub(crate) fn open(source: &BoundSourceIndex, flags: OpenFlags) -> Result<Connection> {
+pub(crate) fn open(source: &BoundSourceIndex, flags: OpenFlags) -> Result<BoundSqliteConnection> {
     default_vfs()?;
     let handle = source.file.as_raw_handle();
     let expected = identity(handle).ok_or_else(|| {
@@ -153,7 +155,7 @@ fn open_with_access(
     expected: Identity,
     flags: OpenFlags,
     access: Arc<Access>,
-) -> Result<Connection> {
+) -> Result<BoundSqliteConnection> {
     if !SIDECARS
         .iter()
         .all(|suffix| sidecar_absent(&access, suffix))
@@ -187,8 +189,12 @@ fn open_with_access(
         Ok(())
     })?;
     let _guard = OpeningGuard;
-    let conn =
-        Connection::open_with_flags_and_vfs(path, flags, NAME.to_str().expect("ASCII VFS name"))?;
+    let conn = BoundSqliteConnection::open::<()>(
+        Path::new(&path),
+        flags,
+        Some(NAME.to_str().expect("ASCII VFS name")),
+        None,
+    )?;
     // xOpen has verified the actual native main-file handle. Keep sorting,
     // materialization and temporary tables usable without granting SQLite
     // authority to create files in an ambient temporary directory.
@@ -444,7 +450,11 @@ mod tests {
             leaf: path.file_name().unwrap().to_owned(),
         })
     }
-    fn open_locator(locator: CString, expected: Identity, flags: OpenFlags) -> Result<Connection> {
+    fn open_locator(
+        locator: CString,
+        expected: Identity,
+        flags: OpenFlags,
+    ) -> Result<BoundSqliteConnection> {
         let access = test_access(&locator, expected);
         open_with_access(locator, expected, flags, access)
     }

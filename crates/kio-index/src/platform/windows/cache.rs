@@ -1,6 +1,7 @@
 use crate::Result;
+use crate::platform::BoundSqliteConnection;
 use cap_primitives::fs as cap_fs;
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::OpenFlags;
 use std::path::{Path, PathBuf};
 /// A cache leaf and its parent directory retained as capabilities.  The parent
 /// must stay alive: a public cache pathname can be redirected after opening it.
@@ -213,8 +214,8 @@ pub(crate) fn bind_cache(
 pub(crate) fn open_bound_cache_connection(
     cache: &BoundCache,
     flags: OpenFlags,
-) -> Result<Connection> {
-    Ok(Connection::open_with_flags(&cache.public_path, flags)?)
+) -> Result<BoundSqliteConnection> {
+    BoundSqliteConnection::open::<()>(&cache.public_path, flags, None, None)
 }
 
 pub(crate) fn recreate_cache(

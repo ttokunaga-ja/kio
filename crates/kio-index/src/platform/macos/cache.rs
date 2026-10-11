@@ -2,7 +2,8 @@ use super::unix_cache::{
     BOUND_CACHE_DEFAULT_VFS, BoundCache, initialize_bound_cache_vfs, is_bound_cache_fd_name,
 };
 use crate::Result;
-use rusqlite::{Connection, OpenFlags};
+use crate::platform::BoundSqliteConnection;
+use rusqlite::OpenFlags;
 use std::path::PathBuf;
 pub(super) fn cache_internal_name_allowed(bytes: &[u8]) -> bool {
     is_bound_cache_fd_name(bytes)
@@ -14,7 +15,7 @@ pub(super) fn cache_sqlite_path(cache: &BoundCache) -> PathBuf {
 pub(crate) fn open_bound_cache_connection(
     cache: &BoundCache,
     flags: OpenFlags,
-) -> Result<Connection> {
+) -> Result<BoundSqliteConnection> {
     initialize_bound_cache_vfs()?;
     let path = cache_sqlite_path(cache);
 
@@ -26,11 +27,7 @@ pub(crate) fn open_bound_cache_connection(
                 "bound cache SQLite path is not an internal descriptor path".to_owned(),
             ));
         }
-        Ok(Connection::open_with_flags_and_vfs(
-            &path,
-            flags,
-            "kio-bound-cache-unix",
-        )?)
+        BoundSqliteConnection::open::<()>(&path, flags, Some("kio-bound-cache-unix"), None)
     }
 }
 pub(super) unsafe extern "C" fn bound_cache_x_open(

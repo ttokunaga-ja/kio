@@ -47,14 +47,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter, types::Value};
+#[cfg(test)]
+use rusqlite::Connection;
+use rusqlite::{OpenFlags, OptionalExtension, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::Result;
 use crate::embedding_store::{EmbeddingProfileSummary, f32_from_le_bytes, f32_to_le_bytes};
 use crate::platform::{
-    BoundCache, bind_cache, open_bound_cache_connection, recreate_cache, validate_bound_cache_file,
+    BoundCache, BoundSqliteConnection, bind_cache, open_bound_cache_connection, recreate_cache,
+    validate_bound_cache_file,
 };
 
 /// One committed chunk as the collection sees it.
@@ -435,7 +438,7 @@ fn sqlite_sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
 }
 
 pub struct Aggregator {
-    conn: Connection,
+    conn: BoundSqliteConnection,
     // Retain the directory and leaf capabilities for the lifetime of SQLite.
     // Linux opens the final leaf through the retained parent descriptor;
     // other Unix platforms use `/dev/fd/N`. On Windows this denies
