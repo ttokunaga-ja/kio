@@ -37,7 +37,8 @@ fn test_context(working_directory: &Path) -> AppContext {
 #[cfg(debug_assertions)]
 #[test]
 fn recognized_mistral_ocr_test_control_allows_sync_admission_without_a_key() {
-    use super::{DebugTestControl, markdownize_test_credential_available};
+    use crate::markdownize_test_credential_available;
+    use kio_core::test_control::DebugTestControl;
     use kio_core::test_control::{AdapterTestControl, MistralOcrMode, Selector};
 
     let recognized = DebugTestControl {
@@ -142,7 +143,7 @@ fn index_reconciles_more_than_legacy_child_cap_and_deep_pages_in_one_run() {
         deep_scopes.push(deep.clone());
     }
 
-    let output = super::execute(
+    let output = crate::execute(
         &test_context(&root),
         crate::commands::CommandRequest::Index(IndexArgs {
             preview: false,
@@ -191,9 +192,9 @@ fn retry_reset_confirmation_and_lane_contract_is_enforced_for_direct_callers() {
         })),
     };
 
-    assert!(super::validate_batch_args(&retry(None, true, false)).is_err());
-    assert!(super::validate_batch_args(&retry(Some("token"), false, true)).is_err());
-    assert!(super::validate_batch_args(&retry(Some("token"), true, false)).is_ok());
+    assert!(crate::validate_batch_args(&retry(None, true, false)).is_err());
+    assert!(crate::validate_batch_args(&retry(Some("token"), false, true)).is_err());
+    assert!(crate::validate_batch_args(&retry(Some("token"), true, false)).is_ok());
 
     let resend = |selector: Option<&str>, yes, realtime| BatchArgs {
         command: Some(BatchCommand::Retry(RetryArgs {
@@ -206,9 +207,9 @@ fn retry_reset_confirmation_and_lane_contract_is_enforced_for_direct_callers() {
             batch: false,
         })),
     };
-    assert!(super::validate_batch_args(&resend(Some("token"), false, false)).is_err());
-    assert!(super::validate_batch_args(&resend(Some("token"), true, true)).is_err());
-    assert!(super::validate_batch_args(&resend(Some("token"), true, false)).is_ok());
+    assert!(crate::validate_batch_args(&resend(Some("token"), false, false)).is_err());
+    assert!(crate::validate_batch_args(&resend(Some("token"), true, true)).is_err());
+    assert!(crate::validate_batch_args(&resend(Some("token"), true, false)).is_ok());
 }
 
 #[test]
@@ -285,7 +286,7 @@ fn materialized_source_image_cas_failure_is_retryable_not_contract_reject() {
         usage: None,
     };
 
-    let failure = super::materialize_online_markdownize_response(
+    let failure = crate::materialize_online_markdownize_response(
         &repo,
         &task,
         vec![prepared],
@@ -374,7 +375,7 @@ fn invalid_online_markdown_is_rejected_before_normalized_publication() {
         usage: None,
     };
 
-    let failure = super::materialize_online_markdownize_response(
+    let failure = crate::materialize_online_markdownize_response(
         &repo,
         &task,
         vec![prepared],
@@ -389,7 +390,7 @@ fn invalid_online_markdown_is_rejected_before_normalized_publication() {
     assert_eq!(failure.retry_kind, RetryErrorKind::ContractViolation);
     response.updated_units[0].unit_key = "image:unknown".to_owned();
     response.updated_units[0].markdown = "otherwise valid text\n".to_owned();
-    let unknown_unit = super::materialize_online_markdownize_response(
+    let unknown_unit = crate::materialize_online_markdownize_response(
         &repo,
         &task,
         vec![PreparedUnit {
@@ -499,7 +500,7 @@ fn valid_partial_online_response_is_materialized() {
         reason: None,
         usage: None,
     };
-    let outcome = super::materialize_online_markdownize_response(
+    let outcome = crate::materialize_online_markdownize_response(
         &repo,
         &task,
         prepared.clone(),
@@ -530,7 +531,7 @@ fn valid_partial_online_response_is_materialized() {
         usage: None,
     };
     let retry_keys = BTreeSet::from(["page:2".to_owned()]);
-    let retried = super::materialize_online_markdownize_response(
+    let retried = crate::materialize_online_markdownize_response(
         &repo,
         &task,
         prepared,
@@ -584,7 +585,7 @@ fn valid_partial_online_response_is_materialized() {
         reason: None,
         usage: None,
     };
-    let all_failed_outcome = super::materialize_online_markdownize_response(
+    let all_failed_outcome = crate::materialize_online_markdownize_response(
         &repo,
         &task,
         vec![page(0, "page:1"), page(1, "page:2")],
@@ -642,7 +643,7 @@ fn unchanged_image_unit_reuses_pinned_markdown_verbatim() {
         page_number: None,
     };
     let previous_markdown = "legacy pinned OCR text\n".to_owned();
-    let previous = super::PreviousInstance {
+    let previous = crate::PreviousInstance {
         manifest: NormalizedInstanceManifest {
             raw_hash: raw_hash.clone(),
             tool_profile_hash: profile_hash.clone(),
@@ -681,7 +682,7 @@ fn unchanged_image_unit_reuses_pinned_markdown_verbatim() {
         usage: None,
     };
 
-    let units = super::normalized_units_from_response(
+    let units = crate::normalized_units_from_response(
         &repo,
         "image/png",
         raw_bytes,
@@ -749,7 +750,7 @@ fn preparation_profile_drift_bumps_generation_despite_changed_unit_keys() {
         reused_from: None,
         generated_at: "2026-09-08T00:00:00Z".to_owned(),
     };
-    let manifest = super::manifest_from_units(
+    let manifest = crate::manifest_from_units(
         std::slice::from_ref(&old_prepared),
         &[old_unit],
         &raw_hash,
@@ -784,7 +785,7 @@ fn preparation_profile_drift_bumps_generation_despite_changed_unit_keys() {
         ..old_prepared
     };
     assert_eq!(
-        super::prepared_hash_drift_new_gen(
+        crate::prepared_hash_drift_new_gen(
             &kio_dir,
             &raw_hash,
             &markdown_profile_hash,
@@ -801,34 +802,53 @@ use std::os::unix::fs::symlink;
 use kio_adapter::catalog::deterministic_embedding_vector;
 use kio_index::ChunkRow;
 
-use super::{
-    AssociationAppend, ChunkPublicationEvent, LaneOverride, MarkdownizeSendLane,
-    NormalizedUnitInput, PreferredRequestKind, Repository, StoredChunk,
-    append_chunk_publication_events, append_new_chunk_association, append_stored_chunks,
-    effective_invocation_lane, embedding_usd_per_token, estimate_embedding_cost,
-    estimate_embedding_tokens, lane_rate, markdownize_send_lane, parse_chunk_ledger,
-    publication_is_compatible, publication_is_include_deleted_compatible, publication_ranks,
-    query_embedding_send_lane, read_chunk_publication_events, read_stored_chunks,
-    realtime_lane_requested, resolve_invocation_lane, unit_authorities_from_inputs,
-    write_through_projection_with_requested_at,
-};
+use crate::LaneOverride;
+use crate::MarkdownizeSendLane;
+use crate::effective_invocation_lane;
+use crate::embedding_usd_per_token;
+use crate::estimate_embedding_cost;
+use crate::estimate_embedding_tokens;
+use crate::index::chunk_ledger::ChunkPublicationEvent;
+use crate::index::chunk_ledger::StoredChunk;
+use crate::index::chunk_ledger::append_chunk_publication_events;
+use crate::index::chunk_ledger::append_stored_chunks;
+use crate::index::chunk_ledger::parse_chunk_ledger;
+use crate::index::chunk_ledger::read_chunk_publication_events;
+use crate::index::chunk_ledger::read_stored_chunks;
 #[cfg(unix)]
-use super::{replace_chunk_ledger_contents, truncate_torn_chunk_tail};
+use crate::index::chunk_ledger::replace_chunk_ledger_contents;
+#[cfg(unix)]
+use crate::index::chunk_ledger::truncate_torn_chunk_tail;
+use crate::index::rebuild::AssociationAppend;
+use crate::index::rebuild::append_new_chunk_association;
+use crate::index::rebuild::unit_authorities_from_inputs;
+use crate::lane_rate;
+use crate::markdownize_send_lane;
+use crate::query_embedding_send_lane;
+use crate::realtime_lane_requested;
+use crate::resolve_invocation_lane;
+use crate::search::projection::publication_is_compatible;
+use crate::search::projection::publication_is_include_deleted_compatible;
+use crate::search::projection::publication_ranks;
+use crate::search::projection::write_through_projection_with_requested_at;
+use kio_adapter::traits::PreferredRequestKind;
+use kio_core::scope::Repository;
+use kio_index::chunking::NormalizedUnitInput;
 
 #[test]
 fn embedding_tool_lock_labels_cover_every_execution_mode() {
     use kio_adapter::types::ExecutionMode;
 
     assert_eq!(
-        super::embedding_execution_labels(ExecutionMode::OnlineApi),
+        crate::embedding_execution_labels(ExecutionMode::OnlineApi),
         ("online_api", "online")
     );
     assert_eq!(
-        super::embedding_execution_labels(ExecutionMode::OfflineApi),
+        crate::embedding_execution_labels(ExecutionMode::OfflineApi),
         ("offline_api", "offline")
     );
     assert_eq!(
-        super::embedding_execution_labels(ExecutionMode::DeterministicLibrary),
+        crate::embedding_execution_labels(ExecutionMode::DeterministicLibrary),
         ("deterministic_library", "deterministic")
     );
 }
@@ -837,15 +857,15 @@ fn embedding_tool_lock_labels_cover_every_execution_mode() {
 fn offline_keeps_only_the_in_process_embedding_evaluator_eligible() {
     use kio_adapter::types::ExecutionMode;
 
-    assert!(super::embedding_mode_transport_allowed(
+    assert!(crate::embedding_mode_transport_allowed(
         ExecutionMode::DeterministicLibrary,
         true,
     ));
-    assert!(!super::embedding_mode_transport_allowed(
+    assert!(!crate::embedding_mode_transport_allowed(
         ExecutionMode::OfflineApi,
         true,
     ));
-    assert!(!super::embedding_mode_transport_allowed(
+    assert!(!crate::embedding_mode_transport_allowed(
         ExecutionMode::OnlineApi,
         true,
     ));
@@ -858,12 +878,19 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
     ) {
         return;
     }
-    use super::{
-        DeclaredEmbeddingProfile, EmbeddingProjection, EmbeddingSendGroup, FtsSchemaConfig,
-        FtsTokenizer, RetainedEmbeddingChunk, SqliteFtsIndex, bind_embedding_work,
-        chunk_embedding_hash, current_embedding_policy, embedding_store, persist_group_vector,
-    };
+    use crate::EmbeddingProjection;
+    use crate::EmbeddingSendGroup;
+    use crate::bind_embedding_work;
+    use crate::chunk_embedding_hash;
+    use crate::embedding_owners::RetainedEmbeddingChunk;
+    use crate::persist_group_vector;
+    use crate::search::scope::current_embedding_policy;
+    use kio_adapter::catalog::DeclaredEmbeddingProfile;
     use kio_core::cas::ObjectStore;
+    use kio_index::embedding_store;
+    use kio_index::fts::FtsSchemaConfig;
+    use kio_index::fts::FtsTokenizer;
+    use kio_index::fts::SqliteFtsIndex;
 
     for corrupt_cas in [false, true] {
         let temp = tempfile::tempdir().unwrap();
@@ -1083,19 +1110,20 @@ fn held_chunk_ledger_root_survives_kio_replacement_without_touching_victim() {
     let temp = tempfile::tempdir().unwrap();
     let kio_dir = temp.path().join(".kio");
     fs::create_dir_all(kio_dir.join("index")).unwrap();
-    let directory = super::open_chunk_ledger_dir(&kio_dir, false).unwrap();
+    let directory = crate::index::chunk_ledger::open_chunk_ledger_dir(&kio_dir, false).unwrap();
     let victim = tempfile::tempdir().unwrap();
     let original = temp.path().join(".kio-original");
     fs::rename(&kio_dir, &original).unwrap();
     symlink(victim.path(), &kio_dir).unwrap();
 
-    let mut file = super::open_chunk_ledger_file(&directory, false, true, true, true)
-        .expect("held index handle must remain usable");
+    let mut file =
+        crate::index::chunk_ledger::open_chunk_ledger_file(&directory, false, true, true, true)
+            .expect("held index handle must remain usable");
     use std::io::Write;
     file.write_all(b"held-root-record\n").unwrap();
     file.sync_all().unwrap();
     drop(file);
-    super::sync_chunk_ledger_dir(&directory).unwrap();
+    crate::index::chunk_ledger::sync_chunk_ledger_dir(&directory).unwrap();
 
     assert!(!victim.path().join("index/chunks.jsonl").exists());
     assert_eq!(
@@ -1374,7 +1402,7 @@ fn adapter_scope_id_refuses_malformed_scope_identity_instead_of_unknown() {
 /// scoped, not a blanket exit-4 promotion for the whole variant.
 #[test]
 fn r23_13_store_constraint_contract_error_is_permanent_failure_exit_4() {
-    use super::pipeline_to_kio;
+    use crate::pipeline_to_kio;
 
     let constraint = pipeline_to_kio(kio_pipeline::PipelineError::contract(
         "KIO-E-STORE-CONSTRAINT-001",
@@ -1397,9 +1425,8 @@ fn r23_13_store_constraint_contract_error_is_permanent_failure_exit_4() {
 
 #[test]
 fn ct4_rebuild_refuses_visible_purge_and_filters_its_raw() {
-    use super::{
-        scope_access::ensure_no_visible_purge_journal, scope_access::purge_blocks_rebuild_raw,
-    };
+    use crate::scope_access::ensure_no_visible_purge_journal;
+    use crate::scope_access::purge_blocks_rebuild_raw;
     use kio_core::purge::{BeginOutcome, PurgePhase, PurgeReason, PurgeState, TombstoneMode};
 
     let dir = tempfile::tempdir().unwrap();
@@ -1638,7 +1665,7 @@ fn r23_10_erase_receipt_blocks_retained_embedding_liveness() {
         rusqlite::params![chunk_id],
     )
     .unwrap();
-    let retained = vec![super::RetainedNormalizedInstance {
+    let retained = vec![crate::historical_reindex::RetainedNormalizedInstance {
         raw_hash,
         normalize: kio_core::dag::NormalizeRef {
             tool_profile_hash: profile_hash,
@@ -1649,17 +1676,22 @@ fn r23_10_erase_receipt_blocks_retained_embedding_liveness() {
         policy_paths: BTreeSet::from(["reintroduced.md".to_owned()]),
         introductions: vec![commit_hash],
     }];
-    let chunks = super::retained_history_chunks(&conn, &repo, &retained, "config", None).unwrap();
+    let chunks = crate::retained_history_chunks(&conn, &repo, &retained, "config", None).unwrap();
     assert_eq!(chunks.len(), 0);
 }
 
 #[cfg(debug_assertions)]
 #[test]
 fn search_index_status_uses_preflight_month() {
-    use super::{
-        DebugTestControl, LedgerDb, LedgerReadSnapshot, PathBuf, Repository, SearchedScopeInfo,
-        compute_index_status, settings::user_config_toml_path, utc_month,
-    };
+    use crate::compute_index_status;
+    use crate::search::scope::SearchedScopeInfo;
+    use crate::settings::user_config_toml_path;
+    use kio_core::scope::Repository;
+    use kio_core::test_control::DebugTestControl;
+    use kio_pipeline::budget::utc_month;
+    use kio_pipeline::ledger::LedgerDb;
+    use kio_pipeline::ledger::LedgerReadSnapshot;
+    use std::path::PathBuf;
 
     // Re-exec only this unit test with private HOME/XDG/TMP roots so its
     // budget-policy reads cannot depend on the user's config. This is
@@ -1772,7 +1804,7 @@ fn search_index_status_uses_preflight_month() {
 
 #[test]
 fn search_budget_observation_retries_a_month_rollover_once() {
-    use super::capture_search_budget_observation_with;
+    use crate::capture_search_budget_observation_with;
     use kio_pipeline::ledger::LedgerDb;
 
     let root = crate::test_support::PrivateTempDir::new();
@@ -1819,7 +1851,8 @@ fn search_budget_observation_retries_a_month_rollover_once() {
 
 #[test]
 fn r23_aggregate_index_status_fails_closed_for_corrupt_scope_state() {
-    use super::{SearchedScopeInfo, compute_index_status};
+    use crate::compute_index_status;
+    use crate::search::scope::SearchedScopeInfo;
     use kio_core::scope::Repository;
 
     let healthy_root = tempfile::tempdir().unwrap();
@@ -1918,10 +1951,9 @@ fn r23_aggregate_index_status_fails_closed_for_corrupt_scope_state() {
 
 #[test]
 fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
-    use super::{
-        embedding_task_output_ref, hold_secret_embedding_tasks,
-        prune_terminal_embedding_secret_holds,
-    };
+    use crate::embedding_task_output_ref;
+    use crate::hold_secret_embedding_tasks;
+    use crate::prune_terminal_embedding_secret_holds;
     use kio_adapter::catalog::DeclaredEmbeddingProfile;
     use kio_core::scope::Repository;
     use kio_pipeline::ledger::LedgerDb;
@@ -1939,8 +1971,8 @@ fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
         profile_hash: format!("sha256:{}", "e".repeat(64)),
     };
     let chunk_id = format!("sha256:{}", "a".repeat(64));
-    let chunk = super::bind_embedding_work(
-        vec![super::RetainedEmbeddingChunk {
+    let chunk = crate::bind_embedding_work(
+        vec![crate::embedding_owners::RetainedEmbeddingChunk {
             chunk_id: chunk_id.clone(),
             text: "secret".into(),
             text_hash: format!("sha256:{}", "b".repeat(64)),
@@ -2008,10 +2040,10 @@ fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
 
 #[test]
 fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
-    use super::{
-        SECRETS_TIER_B_HOLD, embedding_task_output_ref, filter_embeddable_by_task_state,
-        prune_terminal_embedding_secret_holds,
-    };
+    use crate::SECRETS_TIER_B_HOLD;
+    use crate::embedding_task_output_ref;
+    use crate::filter_embeddable_by_task_state;
+    use crate::prune_terminal_embedding_secret_holds;
     use kio_core::scope::Repository;
     use kio_pipeline::task::{HoldReason, TaskDescriptor, TaskStatus, TaskStore, TaskType};
 
@@ -2026,8 +2058,8 @@ fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
         modality: "multimodal".into(),
         profile_hash: format!("sha256:{}", "e".repeat(64)),
     };
-    let chunk = super::bind_embedding_work(
-        vec![super::RetainedEmbeddingChunk {
+    let chunk = crate::bind_embedding_work(
+        vec![crate::embedding_owners::RetainedEmbeddingChunk {
             chunk_id: chunk_id.clone(),
             text: "must not send".into(),
             text_hash: format!("sha256:{}", "d".repeat(64)),
@@ -2103,7 +2135,8 @@ fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
 
 #[test]
 fn r23_secret_classification_preserves_retry_backoff_state() {
-    use super::{embedding_task_output_ref, hold_secret_embedding_tasks};
+    use crate::embedding_task_output_ref;
+    use crate::hold_secret_embedding_tasks;
     use kio_adapter::catalog::DeclaredEmbeddingProfile;
     use kio_core::scope::Repository;
     use kio_pipeline::ledger::LedgerDb;
@@ -2121,8 +2154,8 @@ fn r23_secret_classification_preserves_retry_backoff_state() {
         profile_hash: format!("sha256:{}", "e".repeat(64)),
     };
     let chunk_id = format!("sha256:{}", "e".repeat(64));
-    let chunk = super::bind_embedding_work(
-        vec![super::RetainedEmbeddingChunk {
+    let chunk = crate::bind_embedding_work(
+        vec![crate::embedding_owners::RetainedEmbeddingChunk {
             chunk_id: chunk_id.clone(),
             text: "retryable".into(),
             text_hash: format!("sha256:{}", "f".repeat(64)),
@@ -2185,7 +2218,7 @@ fn r23_secret_classification_preserves_retry_backoff_state() {
 
 #[test]
 fn r23_cand_057_scan_budget_charges_failures_and_caps_empty_entries() {
-    use super::WorkingTreeScanBudget;
+    use crate::open_view::WorkingTreeScanBudget;
 
     let mut failed = WorkingTreeScanBudget {
         remaining_bytes: 10,
@@ -2227,7 +2260,7 @@ fn r23_cand_057_scan_budget_charges_failures_and_caps_empty_entries() {
 /// merging on distance first is what makes the lane mean one thing.
 #[test]
 fn merge_vector_lane_ranks_both_tables_on_one_distance_order() {
-    use super::merge_vector_lane;
+    use crate::search::query::merge_vector_lane;
 
     let chunks = vec![
         ("sha256:chunk-near".to_owned(), 0.10),
@@ -2265,7 +2298,9 @@ fn merge_vector_lane_ranks_both_tables_on_one_distance_order() {
 /// chunk, so `fuse_rrf`'s `take(candidate_depth)` window cannot drop it.
 #[test]
 fn images_take_the_text_rank_of_their_citing_chunk() {
-    use super::{ChunkMeta, ImageCandidate, give_images_their_chunks_text_rank};
+    use crate::search::query::ImageCandidate;
+    use crate::search::query::give_images_their_chunks_text_rank;
+    use crate::search::scope::ChunkMeta;
     use kio_search::rrf::BackendRank;
     use std::collections::BTreeMap;
 
@@ -2327,10 +2362,11 @@ fn images_take_the_text_rank_of_their_citing_chunk() {
 
 #[test]
 fn r23_markdown_charge_and_send_share_one_verified_input() {
-    use super::{
-        OnlineMarkdownizePrecondition, classify_online_markdownize_precondition,
-        estimate_online_markdownize_cost, management::ExplicitRoot, prorated_markdownize_cost,
-    };
+    use crate::OnlineMarkdownizePrecondition;
+    use crate::classify_online_markdownize_precondition;
+    use crate::estimate_online_markdownize_cost;
+    use crate::management::ExplicitRoot;
+    use crate::prorated_markdownize_cost;
     use kio_pipeline::prepare::hash_bytes;
     use kio_pipeline::task::{TaskDescriptor, TaskStatus, TaskType};
 
@@ -2419,7 +2455,8 @@ fn r23_markdown_charge_and_send_share_one_verified_input() {
 
 #[test]
 fn r12_1_read_search_tuning_parses_documented_keys() {
-    use super::{DiversifyStrategy, read_search_tuning};
+    use crate::search::query::read_search_tuning;
+    use kio_search::query::DiversifyStrategy;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("config.toml");
     std::fs::write(
@@ -2462,9 +2499,8 @@ fn r12_1_read_incremental_tuning_parses_documented_keys() {
 
 #[test]
 fn ct4_bbox_001_reads_default_and_scope_over_user_annotation_policy() {
-    use super::{
-        settings::effective_bbox_annotation_policy, settings::read_bbox_annotation_config,
-    };
+    use crate::settings::effective_bbox_annotation_policy;
+    use crate::settings::read_bbox_annotation_config;
 
     let dir = tempfile::tempdir().unwrap();
     let scope = dir.path().join("scope.toml");
@@ -2482,10 +2518,9 @@ fn ct4_bbox_001_reads_default_and_scope_over_user_annotation_policy() {
 
 #[test]
 fn ct4_bbox_001_config_reads_are_bounded_regular_and_fail_closed() {
-    use super::{
-        settings::BBOX_ANNOTATION_CONFIG_MAX_BYTES, settings::effective_bbox_annotation_policy,
-        settings::read_bbox_annotation_config,
-    };
+    use crate::settings::BBOX_ANNOTATION_CONFIG_MAX_BYTES;
+    use crate::settings::effective_bbox_annotation_policy;
+    use crate::settings::read_bbox_annotation_config;
 
     let dir = tempfile::tempdir().unwrap();
 
@@ -2535,7 +2570,7 @@ fn ct4_bbox_001_config_read_rejects_symlink() {
 
 #[test]
 fn r10_1_vector_capacity_message_classifier() {
-    use super::is_vector_capacity_message;
+    use crate::search::scope::is_vector_capacity_message;
     // R10-1(a): sqlite-vec's KNN k-ceiling and SQLite's bound-variable ceiling are
     // capacity limits (degrade the scope), not schema faults.
     assert!(is_vector_capacity_message(
@@ -2553,7 +2588,7 @@ fn r10_1_vector_capacity_message_classifier() {
 
 #[test]
 fn pc8_long_query_still_builds_a_match_expression() {
-    use super::build_query_plan;
+    use crate::search::query::build_query_plan;
     // PC8 (05 §1.3 L110-115): the new MATCH-generation architecture has no
     // OLD-tier keyword cap (that was a pre-PC8 hardening specific to the
     // replaced bilingual/thousands-separator/tiered design) — 200
@@ -2571,7 +2606,7 @@ fn pc8_long_query_still_builds_a_match_expression() {
 
 #[test]
 fn pc8_pc9_mixed_script_query_quotes_each_whitespace_token_once() {
-    use super::build_query_plan;
+    use crate::search::query::build_query_plan;
     // PC9 (05 §1.3 L113-115): tokenization splits on Unicode whitespace
     // only — a CJK run with no internal spaces is ONE token (not
     // decomposed into trigrams by this layer; FTS5's own trigram
@@ -2623,7 +2658,7 @@ fn pc8_pc9_mixed_script_query_quotes_each_whitespace_token_once() {
 
 #[test]
 fn feedback2_segment_script_runs_splits_at_script_class_boundaries() {
-    use super::segment_script_runs;
+    use crate::search::query::segment_script_runs;
     // 05 §1.3 L120-134 (2026-07-22 spec feedback #2), worked examples.
 
     // han run + hiragana run + katakana run (ー continues the preceding
@@ -2662,7 +2697,7 @@ fn feedback2_segment_script_runs_splits_at_script_class_boundaries() {
     // `match_expr` verbatim) even though its only segmented piece "C" is
     // short and gets dropped (mixed-query short-unit rule, tested
     // separately below).
-    let plan = super::build_query_plan("C++");
+    let plan = crate::search::query::build_query_plan("C++");
     let match_expr = plan.match_expr.expect("\"C++\" is 3 Unicode scalars");
     assert_eq!(match_expr, "\"C++\"");
     assert!(plan.short_tokens.is_empty());
@@ -2670,7 +2705,7 @@ fn feedback2_segment_script_runs_splits_at_script_class_boundaries() {
 
 #[test]
 fn feedback2_segment_script_runs_edge_cases() {
-    use super::segment_script_runs;
+    use crate::search::query::segment_script_runs;
     // A `.`/`,` NOT flanked by digits on both sides is `Other` (dropped),
     // not folded into the neighboring Alnum run.
     assert_eq!(segment_script_runs("a.b"), vec!["a", "b"]);
@@ -2688,7 +2723,7 @@ fn feedback2_segment_script_runs_edge_cases() {
 
 #[test]
 fn r23_06_katakana_middle_dot_is_other_not_katakana() {
-    use super::segment_script_runs;
+    use crate::search::query::segment_script_runs;
     // 05 §1.3 2026-07-22 spec feedback #2 correction: U+30FB (・,
     // katakana middle dot) is script=Common, not script=Katakana,
     // despite sitting inside the katakana Unicode block -- classified
@@ -2715,7 +2750,7 @@ fn r23_06_katakana_middle_dot_is_other_not_katakana() {
 
 #[test]
 fn feedback2_mixed_query_drops_short_units_entirely_not_and_filtered() {
-    use super::build_query_plan;
+    use crate::search::query::build_query_plan;
     // 05 §1.3 2026-07-22 feedback #2 / step4b-contract-tests-p2c.md
     // R-追記: a mixed query (>= 1 long unit) fully discards every short
     // unit — it never enters `match_expr`, and (unlike the superseded
@@ -2752,7 +2787,7 @@ fn feedback2_mixed_query_drops_short_units_entirely_not_and_filtered() {
 
 #[test]
 fn feedback2_pure_short_query_preserves_pre_feedback2_behavior() {
-    use super::build_query_plan;
+    use crate::search::query::build_query_plan;
     // 05 §1.3 2026-07-22 feedback #2: when EVERY unit is short (which,
     // since no segmented piece can be longer than its own token, is
     // equivalent to "every original token is short"), `match_expr` stays
@@ -2778,7 +2813,7 @@ fn feedback2_pure_short_query_preserves_pre_feedback2_behavior() {
 /// `short_token_bind_values`, risking the bound-variable limit.
 #[test]
 fn r23_28_pure_short_query_dedups_short_tokens_first_occurrence() {
-    use super::build_query_plan;
+    use crate::search::query::build_query_plan;
     let plan = build_query_plan("ai ai");
     assert!(plan.match_expr.is_none());
     assert_eq!(plan.short_tokens, vec!["ai".to_owned()]);
@@ -2803,7 +2838,7 @@ fn r23_28_pure_short_query_dedups_short_tokens_first_occurrence() {
 
 #[test]
 fn pc8_deterministic_equivalence_expansion_is_query_derived() {
-    use super::build_query_plan;
+    use crate::search::query::build_query_plan;
     // 05 §1.3 L116-123 (2026-07-22 spec feedback #1): PC8's original
     // "query 由来でない追加語を含まない" reading was too strict — it
     // banned a token's own deterministic numeral/dictionary equivalence
@@ -2848,7 +2883,7 @@ fn pc8_deterministic_equivalence_expansion_is_query_derived() {
 
 #[test]
 fn pc8_numeric_equivalent_form_is_bidirectional_and_bounded() {
-    use super::numeric_equivalent_form;
+    use crate::search::query::numeric_equivalent_form;
     // (a) plain digits >= 4 gain the grouped twin.
     assert_eq!(numeric_equivalent_form("3600").as_deref(), Some("3,600"));
     assert_eq!(numeric_equivalent_form("30000").as_deref(), Some("30,000"));
@@ -2890,8 +2925,8 @@ fn lane_override_rejects_asking_for_both_lanes() {
     );
 }
 
-fn lane_test_row(kind: super::RequestKind) -> super::BatchRequestRow {
-    super::BatchRequestRow {
+fn lane_test_row(kind: kio_pipeline::ledger::RequestKind) -> kio_pipeline::ledger::BatchRequestRow {
+    kio_pipeline::ledger::BatchRequestRow {
         key: kio_pipeline::ledger::model::TaskKey {
             scope_id: "scope".to_owned(),
             adapter_kind: "markdownize".to_owned(),
@@ -2947,7 +2982,7 @@ fn realtime_moves_a_new_ocr_send_to_the_sync_lane() {
 fn realtime_never_hijacks_an_in_flight_batch_row() {
     // An open batch row owns a live provider job; switching it to the sync
     // lane mid-flight would strand that job outside §5.8 recovery.
-    let row = lane_test_row(super::RequestKind::Batch);
+    let row = lane_test_row(kio_pipeline::ledger::RequestKind::Batch);
     assert_eq!(
         markdownize_send_lane(true, Some(&row), true),
         MarkdownizeSendLane::Batch
@@ -2961,7 +2996,7 @@ fn realtime_never_hijacks_an_in_flight_batch_row() {
 
 #[test]
 fn reopened_sync_row_is_deferred_and_never_reused_for_a_second_send() {
-    let row = lane_test_row(super::RequestKind::Sync);
+    let row = lane_test_row(kio_pipeline::ledger::RequestKind::Sync);
     assert_eq!(
         markdownize_send_lane(true, Some(&row), false),
         MarkdownizeSendLane::DeferToRecovery
@@ -3087,7 +3122,9 @@ fn query_embedding_is_always_priced_on_the_sync_lane() {
 
 #[test]
 fn r11_2_exit_override_priority_batch_vs_enrichment() {
-    use super::{ExecOutcome, batch_exit_override, enrichment_exit_override};
+    use crate::ExecOutcome;
+    use crate::batch_exit_override;
+    use crate::enrichment_exit_override;
     use kio_core::ExitCode;
 
     // A clean pass overrides nothing (exit 0).
@@ -3200,7 +3237,9 @@ fn qb15_parent_and_child_index_exits_keep_user_action_priority() {
 
 #[test]
 fn r10_4_partial_retry_plan_gates_on_retryability_and_budget() {
-    use super::{NormalizedInstanceManifest, partial_retry_plan_from_manifest, unit_ref};
+    use crate::partial_retry_plan_from_manifest;
+    use kio_pipeline::markdownize::NormalizedInstanceManifest;
+    use kio_pipeline::prepare::unit_ref;
     let manifest = |first_error: Option<&str>, second_error: Option<&str>| {
         serde_json::from_value::<NormalizedInstanceManifest>(serde_json::json!({
                 "raw_hash": format!("sha256:{}", "a".repeat(64)),
@@ -3256,10 +3295,12 @@ fn subset_retry_preserves_unrequested_failed_unit_kind() {
 
     use kio_adapter::types::{FailedUnit, MarkdownizeMode, MarkdownizeResponse};
 
-    use super::{
-        NormalizedInstanceManifest, PreviousInstance, RetryErrorKind,
-        merged_failed_unit_retry_kinds, partial_retry_plan_from_manifest, unit_ref,
-    };
+    use crate::PreviousInstance;
+    use crate::merged_failed_unit_retry_kinds;
+    use crate::partial_retry_plan_from_manifest;
+    use kio_pipeline::markdownize::NormalizedInstanceManifest;
+    use kio_pipeline::prepare::unit_ref;
+    use kio_pipeline::task::RetryErrorKind;
     let manifest: NormalizedInstanceManifest = serde_json::from_value(serde_json::json!({
             "raw_hash": format!("sha256:{}", "a".repeat(64)),
             "tool_profile_hash": format!("sha256:{}", "b".repeat(64)),
@@ -3304,7 +3345,8 @@ fn subset_retry_preserves_unrequested_failed_unit_kind() {
 
 #[test]
 fn r10_5_persist_failure_is_retryable() {
-    use super::{persist_failure_retry_kind, retry_policy};
+    use crate::persist_failure_retry_kind;
+    use kio_pipeline::task::retry_policy;
     // R10-5: a post-OCR persist I/O fault must be retryable so `batch retry` can
     // recover the already-billed normalized output.
     assert!(retry_policy(persist_failure_retry_kind()).retryable);
@@ -3312,7 +3354,7 @@ fn r10_5_persist_failure_is_retryable() {
 
 #[test]
 fn r10_6_open_cache_path_uses_full_hash() {
-    use super::open_cache_path;
+    use crate::open_view::open_cache_path;
     // R10-6: the per-object cache dir is the FULL 64-hex sha256, not a 12-char
     // prefix, so a prefix+basename collision can't serve the wrong object.
     let hash = format!("sha256:{}", "a".repeat(64));
@@ -3339,7 +3381,7 @@ fn r10_6_open_cache_path_uses_full_hash() {
 
 #[test]
 fn r10_6_open_cache_write_is_atomic_readonly_and_cleans_temp() {
-    use super::write_open_cache_atomic;
+    use crate::open_view::write_open_cache_atomic;
     let dir = tempfile::tempdir().unwrap();
     let cache = dir.path().join("obj").join("doc.md");
     std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
@@ -3361,7 +3403,7 @@ fn r10_6_open_cache_write_is_atomic_readonly_and_cleans_temp() {
 
 #[test]
 fn r10_6_open_cache_torn_write_leaves_no_temp() {
-    use super::write_open_cache_atomic;
+    use crate::open_view::write_open_cache_atomic;
     // Force the rename to fail (destination is an existing directory) — a torn
     // write must clean its temp and never publish a partial file.
     let dir = tempfile::tempdir().unwrap();
@@ -3382,7 +3424,8 @@ fn r10_6_open_cache_torn_write_leaves_no_temp() {
 
 #[test]
 fn r10_8_snapshot_tree_entries_insert_is_atomic() {
-    use super::{TreeEntryProjection, insert_snapshot_tree_entries};
+    use crate::search::query::TreeEntryProjection;
+    use crate::search::query::insert_snapshot_tree_entries;
     use rusqlite::Connection;
     let conn = Connection::open_in_memory().unwrap();
     // A CHECK lets the test force a mid-batch failure deterministically.
@@ -3448,7 +3491,7 @@ fn r10_8_snapshot_tree_entries_insert_is_atomic() {
 
 #[test]
 fn r9_8_atomic_write_cas_object_removes_temp_on_failure() {
-    use super::atomic_write_cas_object;
+    use crate::atomic_write_cas_object;
     // R9-8: a torn derived-CAS write must not leave an orphan `.tmp-*` in the
     // fanout dir. Force the rename to fail deterministically by making the
     // destination an existing directory after the temp is created + fsynced.
@@ -3471,7 +3514,7 @@ fn r9_8_atomic_write_cas_object_removes_temp_on_failure() {
 
 #[test]
 fn r23_cand_031_existing_prepared_slot_must_match_exact_bytes() {
-    use super::atomic_write_cas_object;
+    use crate::atomic_write_cas_object;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("prepared-object");
@@ -3487,7 +3530,7 @@ fn r23_cand_031_existing_prepared_slot_must_match_exact_bytes() {
 fn r23_prepared_writer_rejects_symlinked_store_ancestor() {
     use std::os::unix::fs::symlink;
 
-    use super::write_prepared_objects;
+    use crate::write_prepared_objects;
     use kio_core::scope::Repository;
     use kio_pipeline::prepare::{PreparedUnit, UnitFingerprint, UnitType, hash_bytes};
 
@@ -3525,7 +3568,8 @@ fn r23_prepared_writer_rejects_symlinked_store_ancestor() {
 
 #[test]
 fn r9_5_unit_file_and_orphan_temp_classification() {
-    use super::{is_normalized_unit_file, is_orphan_temp_name};
+    use crate::is_normalized_unit_file;
+    use crate::is_orphan_temp_name;
     // Real unit files: 16 lowercase-hex chars + `.json`.
     assert!(is_normalized_unit_file("1a2b3c4d5e6f7089.json"));
     assert!(is_normalized_unit_file("0000000000000000.json"));
@@ -3562,10 +3606,11 @@ fn mock_embedding_vector_is_deterministic_and_normalized() {
 // never breached even without concurrency, and nothing is double-reserved.
 #[test]
 fn serial_task_charges_reread_and_enforce_the_cap() {
-    use super::{
-        BudgetCaps, TaskChargeOutcome, budget_cap_config, reserve_or_reuse_task_charge,
-        task_ledger_key,
-    };
+    use crate::TaskChargeOutcome;
+    use crate::budget_cap_config;
+    use crate::reserve_or_reuse_task_charge;
+    use crate::task_ledger_key;
+    use kio_pipeline::budget::BudgetCaps;
     use kio_pipeline::ledger::RequestKind;
     use std::collections::BTreeMap;
 
@@ -3650,7 +3695,8 @@ fn serial_task_charges_reread_and_enforce_the_cap() {
 
 #[test]
 fn store_lock_preserves_retryable_cli_error_contract() {
-    use super::{ExitCode, pipeline_to_kio};
+    use crate::pipeline_to_kio;
+    use kio_core::ExitCode;
 
     let err = pipeline_to_kio(kio_pipeline::PipelineError::locked(
         "/tmp/example-device-lock.lock",
@@ -3665,7 +3711,8 @@ fn store_lock_preserves_retryable_cli_error_contract() {
 // simply a task that was never charged) can never manufacture a settlement.
 #[test]
 fn release_task_charge_if_open_is_a_no_op_without_a_matching_row() {
-    use super::{release_task_charge_if_open, task_ledger_key};
+    use crate::release_task_charge_if_open;
+    use crate::task_ledger_key;
 
     let tmp = crate::test_support::PrivateTempDir::new();
     let ledger =
@@ -3677,7 +3724,8 @@ fn release_task_charge_if_open_is_a_no_op_without_a_matching_row() {
 
 #[test]
 fn q1_read_stored_chunks_tolerates_torn_tail() {
-    use super::{chunks_jsonl_path, read_stored_chunks};
+    use crate::index::chunk_ledger::chunks_jsonl_path;
+    use crate::index::chunk_ledger::read_stored_chunks;
     let dir = tempfile::tempdir().unwrap();
     let kio_dir = dir.path().join(".kio");
     let path = chunks_jsonl_path(&kio_dir);
@@ -3701,7 +3749,8 @@ fn q1_read_stored_chunks_tolerates_torn_tail() {
 
 #[test]
 fn q1_read_stored_chunks_flags_mid_file_corruption() {
-    use super::{chunks_jsonl_path, read_stored_chunks};
+    use crate::index::chunk_ledger::chunks_jsonl_path;
+    use crate::index::chunk_ledger::read_stored_chunks;
     let dir = tempfile::tempdir().unwrap();
     let kio_dir = dir.path().join(".kio");
     let path = chunks_jsonl_path(&kio_dir);
@@ -3721,7 +3770,8 @@ fn q1_read_stored_chunks_flags_mid_file_corruption() {
 
 #[test]
 fn ct4_chunk_ledger_rejects_missing_association_rowid() {
-    use super::{chunks_jsonl_path, read_stored_chunks};
+    use crate::index::chunk_ledger::chunks_jsonl_path;
+    use crate::index::chunk_ledger::read_stored_chunks;
     let dir = tempfile::tempdir().unwrap();
     let kio_dir = dir.path().join(".kio");
     let path = chunks_jsonl_path(&kio_dir);
@@ -3736,7 +3786,8 @@ fn ct4_chunk_ledger_rejects_missing_association_rowid() {
 
 #[test]
 fn ct4_chunk_ledger_retains_two_configs_for_one_chunk() {
-    use super::{chunks_jsonl_path, read_stored_chunks};
+    use crate::index::chunk_ledger::chunks_jsonl_path;
+    use crate::index::chunk_ledger::read_stored_chunks;
     let dir = tempfile::tempdir().unwrap();
     let kio_dir = dir.path().join(".kio");
     let path = chunks_jsonl_path(&kio_dir);
@@ -3766,7 +3817,10 @@ fn ct4_chunk_ledger_retains_two_configs_for_one_chunk() {
 
 #[test]
 fn q2_open_cas_byte_object_rejects_corrupt_object() {
-    use super::{ScopeTarget, cas_object_path, hash_bytes, open_cas_byte_object};
+    use crate::open_view::cas_object_path;
+    use crate::open_view::open_cas_byte_object;
+    use crate::search::scope::ScopeTarget;
+    use kio_pipeline::prepare::hash_bytes;
     let dir = tempfile::tempdir().unwrap();
     let kio_dir = dir.path().join(".kio");
     // The correct `sha256:` filename for the AUTHENTIC bytes...
@@ -3798,7 +3852,10 @@ fn q2_open_cas_byte_object_rejects_corrupt_object() {
 
 #[test]
 fn portable_cas_leaf_uses_digest_and_presence_rejects_nonregular_slot() {
-    use super::{MAX_RAW_OBJECT_BYTES, cas_object_path, cas_object_present, hash_bytes};
+    use crate::open_view::cas_object_path;
+    use crate::open_view::cas_object_present;
+    use kio_core::cas::MAX_RAW_OBJECT_BYTES;
+    use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
     let hash = hash_bytes(b"portable object");
@@ -3833,7 +3890,10 @@ fn non_current_colon_leaf(
 #[cfg(not(windows))]
 #[test]
 fn non_current_only_cas_leaf_is_ignored_as_not_found() {
-    use super::{MAX_RAW_OBJECT_BYTES, cas_object_present, hash_bytes, read_cas_byte_object};
+    use crate::open_view::cas_object_present;
+    use crate::open_view::read_cas_byte_object;
+    use kio_core::cas::MAX_RAW_OBJECT_BYTES;
+    use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
     let bytes = b"non-current object layout";
@@ -3852,7 +3912,10 @@ fn non_current_only_cas_leaf_is_ignored_as_not_found() {
 
 #[test]
 fn canonical_cas_read_succeeds_and_hash_mismatch_fails_closed() {
-    use super::{MAX_RAW_OBJECT_BYTES, cas_object_path, hash_bytes, read_cas_byte_object};
+    use crate::open_view::cas_object_path;
+    use crate::open_view::read_cas_byte_object;
+    use kio_core::cas::MAX_RAW_OBJECT_BYTES;
+    use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
     let bytes = b"canonical object";
@@ -3875,7 +3938,9 @@ fn canonical_cas_read_succeeds_and_hash_mismatch_fails_closed() {
 
 #[test]
 fn prepared_writer_publishes_new_objects_to_canonical_leaf() {
-    use super::{cas_object_path, hash_bytes, write_canonical_cas_object_or_reuse};
+    use crate::open_view::cas_object_path;
+    use crate::write_canonical_cas_object_or_reuse;
+    use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
     let kio_dir = dir.path().join(".kio");
@@ -3891,10 +3956,11 @@ fn prepared_writer_publishes_new_objects_to_canonical_leaf() {
 #[cfg(not(windows))]
 #[test]
 fn non_current_conflict_cannot_influence_canonical_read_or_write() {
-    use super::{
-        MAX_RAW_OBJECT_BYTES, cas_object_path, hash_bytes, read_cas_byte_object,
-        write_canonical_cas_object_or_reuse,
-    };
+    use crate::open_view::cas_object_path;
+    use crate::open_view::read_cas_byte_object;
+    use crate::write_canonical_cas_object_or_reuse;
+    use kio_core::cas::MAX_RAW_OBJECT_BYTES;
+    use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
     let kio_dir = dir.path().join(".kio");
@@ -3921,7 +3987,7 @@ fn non_current_conflict_cannot_influence_canonical_read_or_write() {
 
 #[test]
 fn q3_reclaims_orphaned_running_task_to_pending() {
-    use super::reclaim_orphaned_running_tasks;
+    use crate::reclaim_orphaned_running_tasks;
     use kio_pipeline::markdownize::MarkdownizeMode;
     use kio_pipeline::task::{TaskDescriptor, TaskStatus, TaskStore, TaskType};
     let dir = tempfile::tempdir().unwrap();
@@ -3935,7 +4001,7 @@ fn q3_reclaims_orphaned_running_task_to_pending() {
         previous_raw_hash: None,
         parent_run_id: None,
         changed_unit_keys: Vec::new(),
-        output_ref: super::online_output_ref("test_markdownize_adapter"),
+        output_ref: crate::online_output_ref("test_markdownize_adapter"),
         unit_keys: None,
         // A task stuck Running is bit-identical to a crash between the
         // Running-persist and the Done-persist.
@@ -3965,10 +4031,13 @@ fn q3_reclaims_orphaned_running_task_to_pending() {
 
 #[test]
 fn chunk_authentication_rejects_forged_text_with_a_valid_identity_hash() {
-    use super::{
-        ChunkingConfig, ChunkingInput, NormalizedUnitInput, authenticate_chunk_row,
-        chunk_normalized_instance, hash_bytes, unit_authorities_from_inputs,
-    };
+    use crate::index::rebuild::authenticate_chunk_row;
+    use crate::index::rebuild::unit_authorities_from_inputs;
+    use kio_index::chunking::ChunkingConfig;
+    use kio_index::chunking::ChunkingInput;
+    use kio_index::chunking::NormalizedUnitInput;
+    use kio_index::chunking::chunk_normalized_instance;
+    use kio_pipeline::prepare::hash_bytes;
 
     let markdown = "# Heading\nattested text\n".to_owned();
     let unit = NormalizedUnitInput {
@@ -4047,7 +4116,7 @@ fn registry_snapshot_error_mapping_preserves_typed_exit_and_closed_reason() {
 #[test]
 fn ledger_snapshot_error_mapping_preserves_typed_exit_and_closed_reason() {
     let path = "/private/test/cost-ledger.sqlite";
-    let unsafe_error = super::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
+    let unsafe_error = crate::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
         path,
         kio_pipeline::ledger::LedgerSnapshotError::UnsafeIntegrity("linked ledger main".to_owned()),
     ));
@@ -4062,7 +4131,7 @@ fn ledger_snapshot_error_mapping_preserves_typed_exit_and_closed_reason() {
     assert_eq!(unsafe_error.context()["reason"], "unsafe_integrity");
     assert_eq!(unsafe_error.context()["ledger_path"], path);
 
-    let transient_error = super::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
+    let transient_error = crate::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
         path,
         kio_pipeline::ledger::LedgerSnapshotError::UnstableBusy(
             "retry budget exhausted".to_owned(),
@@ -4075,7 +4144,7 @@ fn ledger_snapshot_error_mapping_preserves_typed_exit_and_closed_reason() {
     );
     assert_eq!(transient_error.context()["reason"], "unstable_or_busy");
 
-    let impossible_missing = super::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
+    let impossible_missing = crate::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
         path,
         kio_pipeline::ledger::LedgerSnapshotError::Missing,
     ));
@@ -4110,35 +4179,37 @@ fn search_request(mode: Option<crate::commands::SearchMode>) -> crate::commands:
 
 #[test]
 fn constructed_search_request_preserves_mode_and_limit_validation() {
-    let parsed =
-        super::parsed_search(search_request(Some(crate::commands::SearchMode::Vector))).unwrap();
-    assert_eq!(parsed.requested_mode, super::SearchMode::Vector);
+    let parsed = crate::search::query::parsed_search(search_request(Some(
+        crate::commands::SearchMode::Vector,
+    )))
+    .unwrap();
+    assert_eq!(parsed.requested_mode, kio_search::query::SearchMode::Vector);
     assert!(parsed.explicit_mode);
-    let parsed = super::parsed_search(search_request(None)).unwrap();
-    assert_eq!(parsed.requested_mode, super::SearchMode::Auto);
+    let parsed = crate::search::query::parsed_search(search_request(None)).unwrap();
+    assert_eq!(parsed.requested_mode, kio_search::query::SearchMode::Auto);
     assert!(!parsed.explicit_mode);
     let mut request = search_request(None);
     request.limit = 0;
-    assert!(super::parsed_search(request).is_err());
+    assert!(crate::search::query::parsed_search(request).is_err());
 }
 
 #[test]
 fn constructed_search_request_rejects_invalid_time_scope_combination() {
     let mut request = search_request(None);
     request.at = Some("HEAD".to_owned());
-    assert!(super::parsed_search(request).is_err());
+    assert!(crate::search::query::parsed_search(request).is_err());
     let mut request = search_request(None);
     request.at = Some("HEAD".to_owned());
     request.scope = Some(std::path::PathBuf::from("."));
-    assert!(super::parsed_search(request).is_ok());
+    assert!(crate::search::query::parsed_search(request).is_ok());
 }
 
 #[test]
 fn current_policy_redacts_denied_alias_without_hiding_allowed_alias() {
-    use super::{
-        binding_for_repo, management::ExplicitRoot, management::initialize_explicit_root,
-        redact_current_policy_paths,
-    };
+    use crate::management::ExplicitRoot;
+    use crate::management::binding_for_repo;
+    use crate::management::initialize_explicit_root;
+    use crate::search::scope::redact_current_policy_paths;
     use kio_core::management::read_record;
     use kio_pipeline::policy::CurrentPolicyEvaluator;
 
@@ -4174,19 +4245,19 @@ fn current_policy_redacts_denied_alias_without_hiding_allowed_alias() {
 #[test]
 fn image_payload_mime_is_derived_from_verified_magic_only() {
     assert_eq!(
-        super::verified_image_mime(b"\x89PNG\r\n\x1a\nbody").unwrap(),
+        crate::verified_image_mime(b"\x89PNG\r\n\x1a\nbody").unwrap(),
         "image/png"
     );
     assert_eq!(
-        super::verified_image_mime(&[0xff, 0xd8, 0xff, 0x00]).unwrap(),
+        crate::verified_image_mime(&[0xff, 0xd8, 0xff, 0x00]).unwrap(),
         "image/jpeg"
     );
-    assert!(super::verified_image_mime(b"not-an-image").is_err());
+    assert!(crate::verified_image_mime(b"not-an-image").is_err());
 }
 
 #[test]
 fn embedding_secret_hold_applies_to_authenticated_local_http() {
-    use super::secret_embedding_hold_required;
+    use crate::secret_embedding_hold_required;
     use kio_adapter::types::ExecutionMode;
 
     for mode in [ExecutionMode::OnlineApi, ExecutionMode::OfflineApi] {
@@ -4208,10 +4279,10 @@ fn embedding_admission_rechecks_policy_and_exact_network_grant() {
     let adapter_settings =
         &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
 
-    use super::{
-        admit_embedding_transport, current_embedding_policy, management::ExplicitRoot,
-        management::initialize_explicit_root,
-    };
+    use crate::admit_embedding_transport;
+    use crate::management::ExplicitRoot;
+    use crate::management::initialize_explicit_root;
+    use crate::search::scope::current_embedding_policy;
     use kio_adapter::catalog::{
         AdoptedEmbeddingExecution, DeclaredEmbeddingProfile, EmbeddingExecution,
     };
@@ -4273,10 +4344,11 @@ fn embedding_admission_rechecks_policy_and_exact_network_grant() {
 
 #[test]
 fn cursor_policy_revalidation_rejects_a_live_ignore_change() {
-    use super::{
-        SearchedScopeInfo, binding_for_repo, management::ExplicitRoot,
-        management::initialize_explicit_root, revalidate_current_search_policies,
-    };
+    use crate::management::ExplicitRoot;
+    use crate::management::binding_for_repo;
+    use crate::management::initialize_explicit_root;
+    use crate::search::scope::SearchedScopeInfo;
+    use crate::search::scope::revalidate_current_search_policies;
     use kio_core::management::read_record;
     use kio_pipeline::policy::CurrentPolicyEvaluator;
     use std::collections::BTreeMap;
@@ -4317,11 +4389,11 @@ fn cursor_policy_revalidation_rejects_a_live_ignore_change() {
 
 #[test]
 fn only_typed_same_scope_image_ownership_selects_local_bytes_or_projection() {
-    use super::{
-        RetainedEmbeddingChunk, authorized_local_image_object_hash, local_image_object_hash,
-        referenced_authorized_image_hashes_for_chunks,
-    };
+    use crate::authorized_local_image_object_hash;
+    use crate::embedding_owners::RetainedEmbeddingChunk;
     use crate::image_authority::{ImageAuthorityEntry, ImageAuthorityMap};
+    use crate::local_image_object_hash;
+    use crate::referenced_authorized_image_hashes_for_chunks;
 
     let hash = format!("sha256:{}", "a".repeat(64));
     let foreign_uri = format!("kio://scope-b/object/image/{hash}");
@@ -4379,8 +4451,9 @@ fn only_typed_same_scope_image_ownership_selects_local_bytes_or_projection() {
 
 #[test]
 fn secret_typed_owner_cannot_be_bypassed_by_a_public_same_scope_link() {
-    use super::{RetainedEmbeddingChunk, referenced_authorized_image_hashes_for_chunks};
+    use crate::embedding_owners::RetainedEmbeddingChunk;
     use crate::image_authority::{ImageAuthorityEntry, ImageAuthorityMap};
+    use crate::referenced_authorized_image_hashes_for_chunks;
 
     let hash = format!("sha256:{}", "b".repeat(64));
     let chunks = [RetainedEmbeddingChunk {

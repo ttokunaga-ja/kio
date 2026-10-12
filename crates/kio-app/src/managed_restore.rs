@@ -9,13 +9,17 @@ use kio_core::{ExitCode, KioError, Result};
 use serde_json::{Value, json};
 
 use crate::commands::RestoreArgs;
+use crate::index::chunk_ledger::recover_index_generation;
+use crate::index::rebuild::rebuild_step3_index;
+use crate::management::binding_for_repo;
 use crate::management::open_existing_managed_root;
-use crate::{
-    binding_for_repo, current_embedding_policy, mark_replica_rebuilding_or_log,
-    mark_replica_unavailable_or_log, pipeline_to_kio, rebuild_step3_index,
-    recover_index_generation, set_exit_override, settings::validate_repo_tool_lock,
-    write_through_projection_full,
-};
+use crate::pipeline_to_kio;
+use crate::search::projection::mark_replica_rebuilding_or_log;
+use crate::search::projection::mark_replica_unavailable_or_log;
+use crate::search::projection::write_through_projection_full;
+use crate::search::scope::current_embedding_policy;
+use crate::set_exit_override;
+use crate::settings::validate_repo_tool_lock;
 
 pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: RestoreArgs) -> Result<Value> {
     // This is intentionally the strict, bound managed-root open.  In

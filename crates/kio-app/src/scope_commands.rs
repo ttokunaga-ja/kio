@@ -1,7 +1,7 @@
 use crate::budget_status_json;
 use crate::commands;
 use crate::current_unsupported_inputs;
-use crate::ensure_purge_epoch_initialized;
+use crate::index::chunk_ledger::ensure_purge_epoch_initialized;
 use crate::invocation::Invocation;
 use crate::ledger_db_path;
 use crate::management::ExplicitRoot;

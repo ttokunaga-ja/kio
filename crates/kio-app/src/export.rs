@@ -22,7 +22,6 @@ use kio_core::{ExitCode, KioError, Result};
 use serde_json::{Value, json};
 use sha2::Digest;
 
-use super::{ScopeTarget, scope_access::ReadBarrierCheckpoint};
 use crate::commands::ExportArgs;
 use crate::platform::{
     DestinationIdentity, configure_cap_no_follow, configure_export_temp,
@@ -31,6 +30,8 @@ use crate::platform::{
     validate_export_directory_metadata_native, validate_export_directory_native,
     validate_export_regular_metadata_native, validate_export_regular_native,
 };
+use crate::scope_access::ReadBarrierCheckpoint;
+use crate::search::scope::ScopeTarget;
 
 const MAX_POINTER_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_EXPORT_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -100,7 +101,8 @@ pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: ExportArgs) -> 
     // rename — after the private-temp staging completes and before the
     // irreversible publish, matching the spec's fixed "expand -> recheck ->
     // publish" order.
-    let checkpoint = super::preflight_barrier_and_index(&source.target.kio_dir, ctx.control)?;
+    let checkpoint =
+        crate::scope_access::preflight_barrier_and_index(&source.target.kio_dir, ctx.control)?;
     let validated_destination = validate_destination(ctx, &args.to, &source.target)?;
     let _initial_preflight = preflight(
         &source,
@@ -157,8 +159,8 @@ fn resolve_evidence_source(
     operand: &str,
 ) -> Result<ExportSource> {
     let text = read_pointer_operand(ctx, operand)?;
-    let pointer = super::parse_pointer_text(&text)?;
-    let target = super::resolve_scope_target(
+    let pointer = crate::open_view::parse_pointer_text(&text)?;
+    let target = crate::scope_access::resolve_scope_target(
         ctx.cwd(),
         ctx.interaction.as_ref(),
         &pointer.scope_id,
@@ -166,12 +168,14 @@ fn resolve_evidence_source(
         ctx.control,
     )?;
     let repo = Repository::open_in_session(&target.repo_root, ctx.control.clone(), ctx.locks)?;
-    super::validate_repo_tool_lock(&repo)?;
+    crate::settings::validate_repo_tool_lock(&repo)?;
 
     let commit = match repo.read_commit(&pointer.commit) {
         Ok(commit) => commit,
-        Err(error) if super::is_store_not_found(&error) => {
-            return Err(super::unresolvable_commit_pointer_error(&pointer));
+        Err(error) if crate::scope_access::is_store_not_found(&error) => {
+            return Err(crate::scope_access::unresolvable_commit_pointer_error(
+                &pointer,
+            ));
         }
         Err(error) => return Err(error),
     };
@@ -181,11 +185,13 @@ fn resolve_evidence_source(
         .as_deref()
         .is_some_and(|tree| tree != commit.tree)
     {
-        return Err(super::invalid_pointer_identity_error(&pointer));
+        return Err(crate::scope_access::invalid_pointer_identity_error(
+            &pointer,
+        ));
     }
     let tree = match repo.read_tree(&commit.tree) {
         Ok(tree) => tree,
-        Err(error) if super::is_store_not_found(&error) => {
+        Err(error) if crate::scope_access::is_store_not_found(&error) => {
             kio_core::gc::validate_final_shallow_tree_with_control(
                 &target.kio_dir,
                 &pointer.commit,
@@ -210,14 +216,14 @@ fn resolve_evidence_source(
     check_purge_state(&target, &pointer.raw_hash, raw_present, ctx.control)?;
     match store.inspect_object(ObjectKind::Raw, &pointer.raw_hash) {
         Ok(_) => {}
-        Err(error) if super::is_store_not_found(&error) => {
+        Err(error) if crate::scope_access::is_store_not_found(&error) => {
             return Err(missing_live_raw_error(&target, &pointer.raw_hash));
         }
         Err(error) => return Err(error),
     }
     let chunk = match store.read_chunk(&pointer.chunk_hash) {
         Ok(chunk) => chunk,
-        Err(error) if super::is_store_not_found(&error) => {
+        Err(error) if crate::scope_access::is_store_not_found(&error) => {
             return Err(KioError::new(
                 "KIO-E-EVIDENCE-RETARGET-REQUIRED-001",
                 "chunk not materialized for this tool_profile_hash; retarget required",
@@ -232,7 +238,9 @@ fn resolve_evidence_source(
         Err(error) => return Err(error),
     };
     if chunk.raw_hash != pointer.raw_hash || chunk.tool_profile_hash != pointer.tool_profile_hash {
-        return Err(super::invalid_pointer_identity_error(&pointer));
+        return Err(crate::scope_access::invalid_pointer_identity_error(
+            &pointer,
+        ));
     }
     let mut matching_entries = tree.entries.iter().filter(|entry| {
         entry.raw_hash == pointer.raw_hash
@@ -244,10 +252,10 @@ fn resolve_evidence_source(
     let entry = match pointer.path_at_commit.as_deref() {
         Some(path) => matching_entries
             .find(|entry| entry.path == path)
-            .ok_or_else(|| super::invalid_pointer_identity_error(&pointer))?,
+            .ok_or_else(|| crate::scope_access::invalid_pointer_identity_error(&pointer))?,
         None => matching_entries
             .next()
-            .ok_or_else(|| super::invalid_pointer_identity_error(&pointer))?,
+            .ok_or_else(|| crate::scope_access::invalid_pointer_identity_error(&pointer))?,
     };
 
     Ok(ExportSource {
@@ -284,15 +292,15 @@ fn resolve_local_source(
     operand: &str,
 ) -> Result<ExportSource> {
     let repo = ctx.open_recovery_repository()?;
-    super::validate_repo_tool_lock(&repo)?;
-    let target = super::scope_target(repo.root(), ctx.control)?;
+    crate::settings::validate_repo_tool_lock(&repo)?;
+    let target = crate::scope_access::scope_target(repo.root(), ctx.control)?;
 
     if operand == "HEAD" {
         let commit_hash = repo
             .head_commit_hash()?
             .ok_or_else(|| export_source_not_found("HEAD"))?;
         repo.read_commit(&commit_hash).map_err(|error| {
-            if super::is_store_not_found(&error) {
+            if crate::scope_access::is_store_not_found(&error) {
                 export_source_not_found(&commit_hash)
             } else {
                 error
@@ -305,7 +313,7 @@ fn resolve_local_source(
         let store = ObjectStore::new_with_control(repo.kio_dir(), ctx.control.clone());
         match store.inspect_object(ObjectKind::Commit, operand) {
             Ok(_) => return resolve_commit_source(target, operand.to_owned(), ctx.control),
-            Err(error) if super::is_store_not_found(&error) => {}
+            Err(error) if crate::scope_access::is_store_not_found(&error) => {}
             Err(error) => return Err(error),
         }
         if store.inspect_object(ObjectKind::Raw, operand).is_ok() {
@@ -318,7 +326,7 @@ fn resolve_local_source(
 
     match repo.resolve_commit(operand) {
         Ok(commit_hash) => resolve_commit_source(target, commit_hash, ctx.control),
-        Err(error) if super::is_store_not_found(&error) => {
+        Err(error) if crate::scope_access::is_store_not_found(&error) => {
             resolve_path_source(target, operand, ctx.control, ctx.locks)
         }
         Err(error) => Err(error),
@@ -429,7 +437,7 @@ fn preflight(
                     verified_raws.insert(item.raw_hash.clone(), metadata.size_bytes);
                     (metadata.size_bytes, true)
                 }
-                Err(error) if super::is_store_not_found(&error) => (0, false),
+                Err(error) if crate::scope_access::is_store_not_found(&error) => (0, false),
                 Err(error) => return Err(error),
             },
         };
@@ -534,7 +542,7 @@ fn preflight_in_dir(
                     verified_raws.insert(item.raw_hash.clone(), metadata.size_bytes);
                     (metadata.size_bytes, true)
                 }
-                Err(error) if super::is_store_not_found(&error) => (0, false),
+                Err(error) if crate::scope_access::is_store_not_found(&error) => (0, false),
                 Err(error) => return Err(error),
             },
         };
@@ -1355,7 +1363,7 @@ fn check_purge_state(
             })));
         }
         Some(event) if event.kind == EventKind::Erased && !raw_present => {
-            return Err(super::purge_not_found_error(target, raw_hash));
+            return Err(crate::scope_access::purge_not_found_error(target, raw_hash));
         }
         Some(event) if event.kind == EventKind::Retired && !raw_present => {
             return Err(crate::scope_access::retired_raw_missing_error(
@@ -1391,7 +1399,7 @@ fn raw_present_now(target: &ScopeTarget, raw_hash: &str, control: &ControlHandle
         .inspect_object(ObjectKind::Raw, raw_hash)
     {
         Ok(_) => Ok(true),
-        Err(error) if super::is_store_not_found(&error) => Ok(false),
+        Err(error) if crate::scope_access::is_store_not_found(&error) => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -1418,7 +1426,7 @@ fn stage_all(
             let copied =
                 match store.copy_object_to(ObjectKind::Raw, &file.source.raw_hash, &mut output) {
                     Ok(metadata) => metadata,
-                    Err(error) if super::is_store_not_found(&error) => {
+                    Err(error) if crate::scope_access::is_store_not_found(&error) => {
                         cleanup_one(destination, &temp);
                         return Err(missing_live_raw_error(
                             &source.target,
@@ -2072,7 +2080,7 @@ fn partial_output(
             "message": error.message(),
         }],
     });
-    super::set_exit_override(&mut output, ExitCode::PartialFailure);
+    crate::set_exit_override(&mut output, ExitCode::PartialFailure);
     output
 }
 
@@ -2092,12 +2100,16 @@ mod tests {
     #[cfg(unix)]
     use std::io::Write;
 
-    use super::{
-        ExportItem, ScopeTarget, check_purge_state, destination_lstat_identity,
-        missing_live_raw_error, normalize_absolute, open_destination_dir, validate_source_names,
-    };
+    use super::ExportItem;
+    use super::check_purge_state;
+    use super::destination_lstat_identity;
+    use super::missing_live_raw_error;
+    use super::normalize_absolute;
+    use super::open_destination_dir;
+    use super::validate_source_names;
     #[cfg(unix)]
     use super::{create_private_temp, no_replace_move, sync_directory_handle};
+    use crate::search::scope::ScopeTarget;
 
     fn entry_names(path: &std::path::Path) -> Vec<String> {
         let mut names = fs::read_dir(path)

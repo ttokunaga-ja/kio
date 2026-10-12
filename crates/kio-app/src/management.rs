@@ -102,14 +102,14 @@ pub(crate) fn reconcile_planned_child(
         &parent_binding,
         parent_record.case_insensitive,
     )
-    .map_err(super::pipeline_to_kio)?;
+    .map_err(crate::pipeline_to_kio)?;
     if !policy
         .allows_directory(&child_name)
-        .map_err(super::pipeline_to_kio)?
+        .map_err(crate::pipeline_to_kio)?
     {
         return Ok(ChildScope::ExcludedByPolicy);
     }
-    policy.revalidate().map_err(super::pipeline_to_kio)?;
+    policy.revalidate().map_err(crate::pipeline_to_kio)?;
     kio_core::management::validate_prospective_child(&parent_binding, &root, &canonical_root)?;
 
     if let Some(repo) =

@@ -1,8 +1,18 @@
 use super::*;
 use crate::commands::EvidenceRetargetArgs;
+use crate::historical_reindex::pinned_done_units;
+use crate::open_view::AssociationCheck;
+use crate::open_view::MAX_MANIFEST_OBJECT_READ_BYTES;
+use crate::open_view::check_publication_and_association_on_connection;
+use crate::open_view::parse_object_uri;
+use crate::open_view::parse_pointer_text;
+use crate::open_view::read_pointer_input;
 use crate::scope_access::is_store_not_found;
 use crate::scope_access::unresolvable_commit_pointer_error;
 use kio_index::fts::RetargetCandidates;
+use kio_search::evidence::EvidencePointer;
+use kio_search::evidence::EvidencePointerIssueRequest;
+use kio_search::evidence::issue_evidence_pointer;
 
 const MAX_RETARGET_VERIFIED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 

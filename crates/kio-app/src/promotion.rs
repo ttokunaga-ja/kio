@@ -4,12 +4,15 @@
 //! strictly after a task reached `Done`: it re-opens the typed normalized-instance
 //! reference and verifies that the manifest and every unit form one complete,
 //! immutable identity before the CLI is allowed to bind that identity into HEAD.
+use crate::index::rebuild::rebuild_step3_index;
 use crate::scope_access::ensure_raw_ingest_allowed;
 use crate::scope_access::is_store_not_found;
+use crate::search::projection::mark_replica_rebuilding_or_log;
 use crate::settings::bbox_annotation_enabled;
 use crate::settings::effective_max_input_bytes;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_core::control::ControlHandle;
+use kio_core::dag::CommitType;
 use std::sync::Arc;
 
 use std::fs;

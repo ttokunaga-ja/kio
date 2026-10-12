@@ -159,7 +159,7 @@ pub(crate) fn harden_open_cache_subtree(leaf: &Path, root: &Path) {
 
 pub(crate) fn validate_cached_cas_links(metadata: &fs::Metadata, path: &Path) -> Result<()> {
     if metadata.nlink() != 1 {
-        return Err(crate::store_corrupt_error(
+        return Err(crate::index::rebuild::store_corrupt_error(
             path,
             "CAS object has an unexpected hard-link count",
         ));
@@ -169,7 +169,7 @@ pub(crate) fn validate_cached_cas_links(metadata: &fs::Metadata, path: &Path) ->
 
 pub(crate) fn validate_exact_cas_links(metadata: &fs::Metadata, path: &Path) -> Result<()> {
     if metadata.nlink() != 1 {
-        return Err(crate::store_corrupt_error(
+        return Err(crate::index::rebuild::store_corrupt_error(
             path,
             "content-addressed object has an unexpected hard-link count",
         ));

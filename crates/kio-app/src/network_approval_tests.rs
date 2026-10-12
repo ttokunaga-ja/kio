@@ -212,7 +212,7 @@ impl Fixture {
         adapter_settings: &Arc<AdapterRuntimeSettings>,
         profile: &str,
     ) -> bool {
-        super::persistent_network_allowed_for(
+        crate::persistent_network_allowed_for(
             adapter_settings,
             &self.repo,
             super::approvals::AdapterRole::Markdown,
@@ -225,7 +225,7 @@ impl Fixture {
     fn in_context<T>(
         &self,
         settings: &Arc<AdapterRuntimeSettings>,
-        operation: impl FnOnce(&super::Invocation<'_>) -> kio_core::Result<T>,
+        operation: impl FnOnce(&crate::invocation::Invocation<'_>) -> kio_core::Result<T>,
     ) -> kio_core::Result<T> {
         self.in_context_at(settings, &self.root, operation)
     }
@@ -234,13 +234,13 @@ impl Fixture {
         &self,
         settings: &Arc<AdapterRuntimeSettings>,
         root: &Path,
-        operation: impl FnOnce(&super::Invocation<'_>) -> kio_core::Result<T>,
+        operation: impl FnOnce(&crate::invocation::Invocation<'_>) -> kio_core::Result<T>,
     ) -> kio_core::Result<T> {
         let context = AppContext {
             working_directory: root.to_path_buf(),
             interaction: Arc::new(TestInteraction),
         };
-        operation(&super::Invocation {
+        operation(&crate::invocation::Invocation {
             context: &context,
             settings,
             control: self.repo.control(),
@@ -557,7 +557,7 @@ fn copied_scope_approval_reference_cannot_reuse_the_source_device_grant() {
 
     assert_eq!(copied.read_network_approvals().unwrap().len(), 1);
     assert!(
-        !super::persistent_network_allowed_for(
+        !crate::persistent_network_allowed_for(
             adapter_settings,
             &copied,
             super::approvals::AdapterRole::Markdown,
@@ -593,8 +593,9 @@ fn profile_or_network_policy_change_denies_until_an_explicit_approval_command() 
 
 #[test]
 fn embedding_grants_require_the_explicit_current_role_and_profile() {
-    use super::approvals::{AdapterRole, allowed};
-    use super::grants::GrantOperation;
+    use crate::approvals::AdapterRole;
+    use crate::approvals::allowed;
+    use crate::grants::GrantOperation;
     use kio_adapter::tool_lock::{AdapterRuntimeSettings, DeclaredAdapter};
     use kio_core::test_control::{DebugTestControl, GeminiEmbedMode, Selector};
 
@@ -615,8 +616,8 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
     };
     {
         let adapter_settings = &std::sync::Arc::new(settings);
-        let profile = super::declared_embedding_profile(
-            super::embedding_execution(adapter_settings, control).unwrap(),
+        let profile = crate::declared_embedding_profile(
+            crate::embedding_execution(adapter_settings, control).unwrap(),
         );
         let target = AdapterTarget::Tool(profile.tool_id.clone());
         let preview = fixture
@@ -698,7 +699,7 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
         // when rebuild has no active embedding adapter.
         {
             let adapter_settings = &std::sync::Arc::new(AdapterRuntimeSettings::default());
-            assert!(super::embedding_execution(adapter_settings, control).is_none());
+            assert!(crate::embedding_execution(adapter_settings, control).is_none());
             for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
                 assert!(
                     !query(
@@ -724,8 +725,8 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
             control.adapters.gemini_embed = Selector::Known(GeminiEmbedMode::IncompatibleProfile);
             let drift = ControlHandle::new(control);
             let drift_repo = fixture.repo.rebind_with_control(drift.clone());
-            let current = super::declared_embedding_profile(
-                super::embedding_execution(adapter_settings, &drift).unwrap(),
+            let current = crate::declared_embedding_profile(
+                crate::embedding_execution(adapter_settings, &drift).unwrap(),
             );
             assert_ne!(current.profile_hash, profile.profile_hash);
             for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
@@ -765,8 +766,9 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
 fn approval_query_preserves_current_runtime_and_config_errors() {
     let adapter_settings = &Arc::new(AdapterRuntimeSettings::default());
 
-    use super::approvals::{AdapterRole, allowed};
-    use super::grants::GrantOperation;
+    use crate::approvals::AdapterRole;
+    use crate::approvals::allowed;
+    use crate::grants::GrantOperation;
     use kio_adapter::tool_lock::{AdapterRuntimeSettings, DeclaredAdapter};
     let fixture = Fixture::new();
     fixture.approve(adapter_settings, true);
@@ -951,7 +953,7 @@ fn ancestor_reregistration_invalidates_a_childs_network_and_secret_grants() {
     let grant_bytes = fs::read(fixture.grant_path()).unwrap();
     let scope_rows = child.read_network_approvals().unwrap();
     assert!(
-        super::persistent_network_allowed_for(
+        crate::persistent_network_allowed_for(
             adapter_settings,
             &child,
             super::approvals::AdapterRole::Markdown,
@@ -984,7 +986,7 @@ fn ancestor_reregistration_invalidates_a_childs_network_and_secret_grants() {
     assert_eq!(fs::read(fixture.grant_path()).unwrap(), grant_bytes);
     assert_eq!(child.read_network_approvals().unwrap(), scope_rows);
     assert!(
-        !super::persistent_network_allowed_for(
+        !crate::persistent_network_allowed_for(
             adapter_settings,
             &child,
             super::approvals::AdapterRole::Markdown,

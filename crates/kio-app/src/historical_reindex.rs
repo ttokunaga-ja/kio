@@ -6,11 +6,34 @@
 //! associations and their derived search/embedding projections.
 
 use super::*;
+use crate::index::chunk_ledger::StoredChunk;
+use crate::index::chunk_ledger::append_stored_chunks;
+use crate::index::chunk_ledger::persist_chunk_object;
+use crate::index::chunk_ledger::read_stored_chunks;
+use crate::index::chunk_ledger::sqlite_path;
+use crate::index::chunk_ledger::truncate_torn_chunk_tail;
+use crate::index::rebuild::AssociationAppend;
+use crate::index::rebuild::AuthenticatedNormalizedUnit;
+use crate::index::rebuild::AuthenticatedNormalizedUnits;
+use crate::index::rebuild::Step3RebuildReport;
+use crate::index::rebuild::append_new_chunk_association;
+use crate::index::rebuild::attach_skipped_units;
+use crate::index::rebuild::authenticate_chunk_row;
+use crate::index::rebuild::is_rebuild_skippable_unit_error;
+use crate::index::rebuild::read_chunking_config;
+use crate::index::rebuild::unit_authorities_from_inputs;
+use crate::open_view::MAX_MANIFEST_OBJECT_READ_BYTES;
 use crate::scope_access::active_erase_purge_explains_historical_missing_manifest;
 use crate::scope_access::ensure_no_visible_purge_journal;
 use crate::scope_access::purge_blocks_historical_reindex_raw;
 use crate::scope_access::purge_blocks_rebuild_raw;
+use kio_core::history::HistoryReader;
 use kio_core::history::TreeBinding;
+use kio_index::TreeEntryRow;
+use kio_index::chunking::ChunkingInput;
+use kio_index::chunking::NormalizedUnitInput;
+use kio_index::chunking::chunk_normalized_instance;
+use kio_index::fts::SqliteFtsIndex;
 use kio_pipeline::markdownize::NormalizedInstanceIdentity;
 use kio_pipeline::markdownize::validate_normalized_instance;
 
@@ -54,19 +77,20 @@ pub(super) fn pinned_manifest_and_units(
     )?;
     let manifest_path = Path::new("objects/manifests/<retained>");
     if kio_core::cas::hash_bytes(&bytes) != *manifest_hash {
-        return Err(crate::store_corrupt_error(
+        return Err(crate::index::rebuild::store_corrupt_error(
             manifest_path,
             "pinned manifest CAS object does not match its tree hash",
         ));
     }
-    let manifest: NormalizedInstanceManifest = serde_json::from_slice(&bytes)
-        .map_err(|error| crate::store_corrupt_error(manifest_path, error.to_string()))?;
-    let canonical_manifest = canonical_json_bytes(
-        &serde_json::to_value(&manifest)
-            .map_err(|error| crate::store_corrupt_error(manifest_path, error.to_string()))?,
-    )?;
+    let manifest: NormalizedInstanceManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        crate::index::rebuild::store_corrupt_error(manifest_path, error.to_string())
+    })?;
+    let canonical_manifest =
+        canonical_json_bytes(&serde_json::to_value(&manifest).map_err(|error| {
+            crate::index::rebuild::store_corrupt_error(manifest_path, error.to_string())
+        })?)?;
     if canonical_manifest != bytes {
-        return Err(crate::store_corrupt_error(
+        return Err(crate::index::rebuild::store_corrupt_error(
             manifest_path,
             "pinned manifest CAS object is not canonical JSON",
         ));
@@ -75,7 +99,7 @@ pub(super) fn pinned_manifest_and_units(
         || manifest.tool_profile_hash != normalize.tool_profile_hash
         || manifest.r#gen != normalize.r#gen
     {
-        return Err(crate::store_corrupt_error(
+        return Err(crate::index::rebuild::store_corrupt_error(
             manifest_path,
             "pinned manifest identity does not match its tree normalization reference",
         ));
@@ -90,7 +114,7 @@ pub(super) fn pinned_manifest_and_units(
     };
     validate_normalized_instance(manifest_path, &identity, &manifest, &selected_units).map_err(
         |error| {
-            crate::store_corrupt_error(
+            crate::index::rebuild::store_corrupt_error(
                 manifest_path,
                 format!("pinned manifest/unit validation failed: {error}"),
             )
@@ -637,12 +661,14 @@ pub(super) fn run(
                         )
                     })?;
                 for introduction_commit in &instance.introductions {
-                    pending_publication_events.push(crate::ChunkPublicationEvent {
-                        event: "publication".to_owned(),
-                        chunk_id: chunk_id.clone(),
-                        chunking_config_hash: chunking_config_hash.clone(),
-                        introduction_commit: introduction_commit.clone(),
-                    });
+                    pending_publication_events.push(
+                        crate::index::chunk_ledger::ChunkPublicationEvent {
+                            event: "publication".to_owned(),
+                            chunk_id: chunk_id.clone(),
+                            chunking_config_hash: chunking_config_hash.clone(),
+                            introduction_commit: introduction_commit.clone(),
+                        },
+                    );
                 }
                 debug_assert_eq!(
                     pending_after,
@@ -654,7 +680,10 @@ pub(super) fn run(
         projected_instances.push(instance.clone());
     }
     append_stored_chunks(repo.kio_dir(), &appended)?;
-    crate::append_chunk_publication_events(repo.kio_dir(), &pending_publication_events)?;
+    crate::index::chunk_ledger::append_chunk_publication_events(
+        repo.kio_dir(),
+        &pending_publication_events,
+    )?;
 
     let selected_instances = projected_instances
         .into_iter()
@@ -961,8 +990,11 @@ fn project_selected_snapshot(
             // increment: `index_chunk_with_rowids` re-affirms existing rows as
             // readily as it adds new ones.
             drop(fts);
-            crate::rotate_index_generation_unconditionally(repo.kio_dir(), repo.control())?;
-            crate::write_through_projection_or_log_for_at_snapshot(
+            crate::index::chunk_ledger::rotate_index_generation_unconditionally(
+                repo.kio_dir(),
+                repo.control(),
+            )?;
+            crate::search::projection::write_through_projection_or_log_for_at_snapshot(
                 ctx,
                 repo.kio_dir(),
                 selected_commit,
@@ -1024,7 +1056,7 @@ mod tests {
                 .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
                 .unwrap()
                 .0;
-            let commit = CommitObject::new(
+            let commit = kio_core::dag::CommitObject::new(
                 tree_hash,
                 parent,
                 "2026-08-12T00:00:00Z".to_owned(),
@@ -1035,7 +1067,7 @@ mod tests {
                     files_modified: 0,
                     files_deleted: 0,
                 },
-                CommitType::Manual,
+                kio_core::dag::CommitType::Manual,
             )
             .unwrap();
             store

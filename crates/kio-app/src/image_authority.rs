@@ -137,7 +137,7 @@ mod tests {
             crate::management::ExplicitRoot::Created(repo) => repo,
             crate::management::ExplicitRoot::Existing(_) => panic!("fresh root must be created"),
         };
-        let policy = crate::current_embedding_policy(&repo).unwrap();
+        let policy = crate::search::scope::current_embedding_policy(&repo).unwrap();
         let mut instance = crate::historical_reindex::RetainedNormalizedInstance {
             raw_hash: hash_bytes(b"raw"),
             normalize: NormalizeRef {

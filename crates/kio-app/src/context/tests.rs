@@ -4,7 +4,8 @@ use kio_core::{Result, test_control::TestEnvGuard};
 use serde_json::{Value, json};
 
 use super::{AppContext, Interaction, test_support};
-use crate::{Command, commands::PointerArgs};
+use crate::commands::CommandRequest as Command;
+use crate::commands::PointerArgs;
 
 struct NestedInput {
     inner: AppContext,
@@ -102,7 +103,7 @@ fn nested_execute_keeps_outer_repository_and_interaction() {
         control: &invocation_control,
         locks: &kio_core::scope::LockSession::default(),
     };
-    let expected = outcome(crate::run_view(
+    let expected = outcome(crate::open_view::run_view(
         &invocation,
         PointerArgs {
             pointer: Some(pointer.clone()),

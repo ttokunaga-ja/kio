@@ -196,7 +196,7 @@ fn compute_purge_closure(
         })
         .collect::<Vec<_>>();
 
-    let stored_chunks = crate::read_stored_chunks(repo.kio_dir())?;
+    let stored_chunks = crate::index::chunk_ledger::read_stored_chunks(repo.kio_dir())?;
     let embeddings = purge_embedding_inventory(repo)?;
     let surviving_text =
         authenticate_purge_chunk_inventory(repo, &targets, &stored_chunks, &embeddings)?;
@@ -325,7 +325,7 @@ fn purge_embedding_inventory(repo: &Repository) -> Result<Vec<PurgeEmbedding>> {
 fn extend_embedding_closure(
     repo: &Repository,
     targets: &BTreeSet<&str>,
-    stored_chunks: &[crate::StoredChunk],
+    stored_chunks: &[crate::index::chunk_ledger::StoredChunk],
     surviving_text: &BTreeSet<String>,
     embeddings: &[PurgeEmbedding],
     items: &mut Vec<ClosureItem>,
@@ -344,7 +344,7 @@ fn extend_embedding_closure(
         .iter()
         .map(|stored| (stored.row.chunk_id.as_str(), &stored.row))
         .collect::<BTreeMap<_, _>>();
-    let sqlite = crate::sqlite_path(repo.kio_dir());
+    let sqlite = crate::index::chunk_ledger::sqlite_path(repo.kio_dir());
     if path_exists(&sqlite)? {
         let index = open_existing_source_index_connection(
             &sqlite,
@@ -449,12 +449,14 @@ fn purge_authority_incomplete(message: &str) -> KioError {
 fn authenticate_purge_chunk_inventory(
     repo: &Repository,
     targets: &BTreeSet<&str>,
-    stored_chunks: &[crate::StoredChunk],
+    stored_chunks: &[crate::index::chunk_ledger::StoredChunk],
     embeddings: &[PurgeEmbedding],
 ) -> Result<BTreeSet<String>> {
-    let retained =
-        crate::retained_history_instances_for_roots(repo, &crate::durable_history_roots(repo)?)?;
-    let authorities = crate::retained_unit_introductions(repo, &retained)?;
+    let retained = crate::historical_reindex::retained_history_instances_for_roots(
+        repo,
+        &crate::index::rebuild::durable_history_roots(repo)?,
+    )?;
+    let authorities = crate::index::rebuild::retained_unit_introductions(repo, &retained)?;
     let store = repo.object_store();
     let target_text = stored_chunks
         .iter()
@@ -478,7 +480,7 @@ fn authenticate_purge_chunk_inventory(
         if !target && !relevant_text.contains(&row.text_hash) {
             continue;
         }
-        crate::authenticate_chunk_row(row, &authorities)
+        crate::index::rebuild::authenticate_chunk_row(row, &authorities)
             .map_err(chunk_ledger_authentication_error)?;
         if !target
             && crate::scope_access::purge_blocks_rebuild_raw(
@@ -774,7 +776,10 @@ fn execute_phase_machine(
             // chunk/config/vector rows change the search-visible set,
             // independent of whether this purge also happened to move the
             // lifecycle-epoch counter) — rotate unconditionally first.
-            crate::rotate_index_generation_unconditionally(repo.kio_dir(), repo.control())?;
+            crate::index::chunk_ledger::rotate_index_generation_unconditionally(
+                repo.kio_dir(),
+                repo.control(),
+            )?;
             // LC42-LC44 (item 2): purge's own `tombstoned`-phase marker
             // append (and any resurrection retire folded into the same
             // mutation) advances `.kio/tombstones/lifecycle-epoch` directly
@@ -786,7 +791,7 @@ fn execute_phase_machine(
             // this purge completes and LC45's read-side check would reject
             // every read command until an unrelated index-touching write
             // happened to run.
-            crate::recover_index_generation(repo.kio_dir(), repo.control())?;
+            crate::index::chunk_ledger::recover_index_generation(repo.kio_dir(), repo.control())?;
             // 05 §1.8 write-through. Ranking is not the reason here: the
             // rotation makes an incomplete replica fail closed; it does not
             // ask a reader to re-project this scope. The
@@ -808,16 +813,18 @@ fn execute_phase_machine(
             // text the user asked to stop existing, so reporting success while
             // it is still readable under the cache root is not a degraded
             // result — it is a false one.
-            crate::write_through_projection(ctx, repo.kio_dir()).map_err(|reason| {
-                KioError::new(
-                    "KIO-E-PURGE-REPLICA-001",
-                    "purge removed the content but could not remove it from the \
+            crate::search::projection::write_through_projection(ctx, repo.kio_dir()).map_err(
+                |reason| {
+                    KioError::new(
+                        "KIO-E-PURGE-REPLICA-001",
+                        "purge removed the content but could not remove it from the \
                      device search replica; re-run purge, or delete \
                      `aggregator.sqlite` under the cache root",
-                    json!({ "reason": reason }),
-                    ExitCode::Failure,
-                )
-            })?;
+                        json!({ "reason": reason }),
+                        ExitCode::Failure,
+                    )
+                },
+            )?;
             Ok(attach_working_tree_warning(
                 success_report(&locked_plan, &report),
                 working_tree_alias_count,
@@ -1026,7 +1033,7 @@ fn delete_content_surfaces(
         }
     }
 
-    let stored = crate::read_stored_chunks(repo.kio_dir())?;
+    let stored = crate::index::chunk_ledger::read_stored_chunks(repo.kio_dir())?;
     let kept = stored
         .into_iter()
         .filter(|stored| !targets.contains(stored.row.raw_hash.as_str()))
@@ -1035,9 +1042,12 @@ fn delete_content_surfaces(
     Ok(())
 }
 
-fn rewrite_chunk_ledger(repo: &Repository, kept: &[crate::StoredChunk]) -> Result<u64> {
+fn rewrite_chunk_ledger(
+    repo: &Repository,
+    kept: &[crate::index::chunk_ledger::StoredChunk],
+) -> Result<u64> {
     let kio_dir = repo.kio_dir();
-    let original_count = crate::read_stored_chunks(kio_dir)?.len();
+    let original_count = crate::index::chunk_ledger::read_stored_chunks(kio_dir)?.len();
     let mut bytes = Vec::new();
     for stored in kept {
         serde_json::to_writer(&mut bytes, stored)
@@ -1061,7 +1071,7 @@ fn rewrite_chunk_ledger(repo: &Repository, kept: &[crate::StoredChunk]) -> Resul
     // it through the retained `.kio/index` capability so a concurrent public
     // path replacement cannot redirect the replacement into an attacker-owned
     // directory.
-    crate::replace_chunk_ledger_contents(kio_dir, &bytes)?;
+    crate::index::chunk_ledger::replace_chunk_ledger_contents(kio_dir, &bytes)?;
     Ok(u64::try_from(original_count.saturating_sub(kept.len())).unwrap_or(u64::MAX))
 }
 
@@ -1071,8 +1081,8 @@ fn rewrite_chunk_ledger(repo: &Repository, kept: &[crate::StoredChunk]) -> Resul
 /// event remains corruption and is never carried through a purge rewrite.
 fn authenticated_publication_events(
     repo: &Repository,
-    creations: &[crate::StoredChunk],
-) -> Result<Vec<crate::ChunkPublicationEvent>> {
+    creations: &[crate::index::chunk_ledger::StoredChunk],
+) -> Result<Vec<crate::index::chunk_ledger::ChunkPublicationEvent>> {
     let creations_by_association = creations
         .iter()
         .map(|creation| {
@@ -1086,8 +1096,8 @@ fn authenticated_publication_events(
         })
         .collect::<std::collections::BTreeMap<_, _>>();
     let mut authenticated = Vec::new();
-    let mut authentication_cache = crate::PublicationAuthenticationCache::default();
-    for event in crate::read_chunk_publication_events(repo.kio_dir())? {
+    let mut authentication_cache = crate::index::rebuild::PublicationAuthenticationCache::default();
+    for event in crate::index::chunk_ledger::read_chunk_publication_events(repo.kio_dir())? {
         let Some(creation) = creations_by_association
             .get(&(event.chunk_id.clone(), event.chunking_config_hash.clone()))
         else {
@@ -1095,7 +1105,7 @@ fn authenticated_publication_events(
             // preserved liveness or the rewritten ledger.
             continue;
         };
-        if crate::authenticate_publication_event_cached(
+        if crate::index::rebuild::authenticate_publication_event_cached(
             repo,
             repo.kio_dir(),
             &event,
@@ -1174,7 +1184,7 @@ fn delete_derived_surfaces(
     // SQLite owns derived rows and counts. Every CAS target was authenticated
     // and frozen before these rows could disappear; DELETE RETURNING IDs must
     // never become new removal authority or the only crash-recovery inventory.
-    let sqlite = crate::sqlite_path(repo.kio_dir());
+    let sqlite = crate::index::chunk_ledger::sqlite_path(repo.kio_dir());
     let chunk_ids = closure.hashes_for("chunk");
     if path_exists(&sqlite)? {
         validate_existing_regular(&sqlite, None)?;
@@ -1562,7 +1572,7 @@ fn extend_inventory_from_reachable_refs(
     // publication introductions against immutable commit/tree state, allowing
     // only a missing pre-commit crash residue.  Do not re-add raw ledger
     // fields here by commit existence alone.
-    let roots = crate::durable_history_roots(repo)?;
+    let roots = crate::index::rebuild::durable_history_roots(repo)?;
     if roots.is_empty() {
         return Ok(());
     }
@@ -2793,7 +2803,7 @@ fn resolve_plan(repo: &Repository, args: &PurgeArgs) -> Result<PurgePlan> {
             // Reuse the persisted TreeEntry boundary rather than interpreting a
             // deleted historical operand through host filesystem canonicalization.
             TreeEntry::raw_file(logical_path, VALIDATION_HASH)?;
-            let roots = crate::durable_history_roots(repo)?;
+            let roots = crate::index::rebuild::durable_history_roots(repo)?;
             let bindings = if roots.is_empty() {
                 Vec::new()
             } else {

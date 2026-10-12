@@ -5,7 +5,20 @@
 //! path to the immutable graph's exact manifest binding.
 
 use super::*;
+use crate::historical_reindex::pinned_done_units;
+use crate::index::chunk_ledger::read_chunk_publication_events;
+use crate::index::chunk_ledger::read_stored_chunks;
+use crate::index::rebuild::AuthenticatedNormalizedUnit;
+use crate::index::rebuild::AuthenticatedNormalizedUnits;
+use crate::index::rebuild::NormalizedUnitKey;
+use crate::index::rebuild::PublicationAuthenticationCache;
+use crate::index::rebuild::authenticate_chunk_row;
+use crate::index::rebuild::authenticate_publication_event_cached;
+use crate::index::rebuild::durable_history_roots;
 use crate::scope_access::purge_blocks_rebuild_raw;
+use kio_core::cas::ChunkObject;
+use kio_core::history::HistoryReader;
+use kio_index::ChunkRow;
 #[cfg(test)]
 use kio_pipeline::markdownize::persist_normalized_instance;
 use std::sync::Arc;
@@ -708,7 +721,7 @@ mod tests {
             text: markdown.to_owned(),
             created_at: "2026-09-26T00:00:00Z".to_owned(),
         };
-        row.chunk_id = chunk_hash(&row).unwrap();
+        row.chunk_id = kio_index::chunking::chunk_hash(&row).unwrap();
         repo.object_store().write_chunk(&chunk_body(&row)).unwrap();
         (normalize, row)
     }

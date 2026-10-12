@@ -3,14 +3,22 @@
 use super::*;
 use crate::commands::{CommandRequest, InitArgs, RepairArgs, RepairOperation, RepairRebuildDbArgs};
 use crate::context::{AppContext, Interaction};
+use crate::index::chunk_ledger::sqlite_path;
 use crate::management::ExplicitRoot;
 #[cfg(test)]
 use crate::management::initialize_explicit_root;
+use crate::open_view::cas_object_path;
 use crate::scope_access::purge_blocks_rebuild_raw;
+use crate::search::projection::replica_scope_stamp;
+use crate::search::query::snapshot_chunking_config_hash;
+use crate::search::scope::aggregator_path;
+use crate::search::scope::current_embedding_policy;
 use crate::settings::embedding_profile_summary;
 use crate::settings::persisted_embedding_is_deterministic;
 use crate::settings::rebuild_embedding_entry_from_tool_lock;
 use kio_core::control::ControlHandle;
+use kio_core::purge::EventKind;
+use kio_core::purge::PurgeState;
 use std::sync::Arc;
 
 const CHILD: &str = "KIO_CONTEXTUAL_EMBEDDING_TEST_CHILD";

@@ -84,7 +84,7 @@ impl RuntimeTrust {
 }
 
 pub(crate) fn directory_path(control: &ControlHandle) -> PathBuf {
-    super::data_home(control).join("kio/local-trust")
+    crate::settings::data_home(control).join("kio/local-trust")
 }
 
 /// Read status without creating a directory, lock, repair, or snapshot.
@@ -116,7 +116,7 @@ pub(crate) fn acquire_runtime_trust(
     }
     let path = trust_directory.join(&record.snapshot);
     let digest = kio_adapter::local_peer::capture_private_local_trust_with_control(&path, control)
-        .map_err(super::adapter_to_kio)?;
+        .map_err(crate::adapter_to_kio)?;
     if digest != record.digest {
         return Err(err(
             "KIO-E-LOCAL-TRUST-CHANGED-001",
@@ -614,7 +614,7 @@ fn publish(
             Some(existing) => {
                 let existing_digest =
                     kio_adapter::local_peer::local_trust_digest_from_pem_bytes(&existing)
-                        .map_err(super::adapter_to_kio)?;
+                        .map_err(crate::adapter_to_kio)?;
                 if existing_digest != record.digest {
                     return Err(write_error);
                 }
@@ -644,7 +644,7 @@ fn validated_source(path: &Path, control: &ControlHandle) -> Result<ValidatedSou
     }
     let bytes = kio_core::private_fs::read_private_file_with_control(path, MAX_CA_BYTES, control)?;
     let digest = kio_adapter::local_peer::local_trust_digest_from_pem_bytes(&bytes)
-        .map_err(super::adapter_to_kio)?;
+        .map_err(crate::adapter_to_kio)?;
     // Do not reopen `path` here: a second pathname read creates a TOCTOU
     // window. The owner-private no-follow read above is the complete source
     // authority; these retained bytes are what gets published.

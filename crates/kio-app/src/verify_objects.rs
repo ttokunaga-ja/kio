@@ -1,6 +1,15 @@
 //! Bounded object-store verification for `repair verify-objects`.
 
 use crate::context::EvidenceRegistry;
+use crate::index::chunk_ledger::check_index_generation_current;
+use crate::index::chunk_ledger::recover_index_generation;
+use crate::index::chunk_ledger::sqlite_path;
+use crate::index::rebuild::durable_history_roots;
+use crate::open_view::PointInTimeAttribution;
+use crate::open_view::parse_object_uri;
+use crate::open_view::parse_pointer_text;
+use crate::open_view::read_pointer_input;
+use crate::open_view::verify_point_in_time_attribution;
 use crate::scope_access::ReadBarrierCheckpoint;
 use crate::scope_access::enforce_canonical_marker_barrier;
 use crate::scope_access::invalid_pointer_identity_error;
@@ -8,7 +17,9 @@ use crate::scope_access::is_store_not_found;
 use crate::scope_access::preflight_barrier_and_index;
 use crate::scope_access::resolve_evidence_scope_target;
 use crate::scope_access::unresolvable_commit_pointer_error;
+use crate::search::scope::ScopeTarget;
 use kio_core::control::ControlHandle;
+use kio_search::evidence::EvidencePointer;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
