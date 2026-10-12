@@ -5,6 +5,17 @@ use crate::index::pipeline::explicitly_allowed_tier_a_paths;
 use crate::invocation::Invocation;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
+use crate::response::CommandResponse;
+use crate::response::Completion;
+use crate::response::ResponseBody;
+use crate::response::history::DiffResponse;
+use crate::response::history::InspectResponse;
+use crate::response::history::LogResponse;
+use crate::response::history::RawInspection;
+use crate::response::history::TagDeleteResponse;
+use crate::response::history::TagResponse;
+use crate::response::history::TagSetResponse;
+use crate::response::project_legacy;
 use crate::scope_access::enforce_purge_read_barrier;
 use crate::scope_access::preflight_barrier_and_index;
 use crate::scope_access::scope_target;
@@ -211,7 +222,13 @@ pub(crate) fn run_log(ctx: &Invocation<'_>, args: commands::LogArgs) -> Result<V
     // §I checkpoint 2 (LC54/LC55). QB57: the wire shape (`commits` +
     // `truncated`) is unchanged by `--at`/`--since` — they narrow
     // which commits are listed, not the response shape.
-    checkpoint.finish(json!({ "commits": entries, "truncated": report.truncated }))
+    checkpoint.finish(project_legacy(CommandResponse {
+        body: ResponseBody::Log(LogResponse {
+            commits: entries,
+            truncated: report.truncated,
+        }),
+        completion: Completion::Complete,
+    })?)
 }
 
 pub(crate) fn run_diff(ctx: &Invocation<'_>, args: commands::DiffArgs) -> Result<Value> {
@@ -221,7 +238,10 @@ pub(crate) fn run_diff(ctx: &Invocation<'_>, args: commands::DiffArgs) -> Result
     let checkpoint = preflight_barrier_and_index(repo.kio_dir(), repo.control())?;
     let changes = repo.diff(&args.a, &args.b)?;
     // §I checkpoint 2 (LC54/LC55).
-    checkpoint.finish(json!({ "changes": changes }))
+    checkpoint.finish(project_legacy(CommandResponse {
+        body: ResponseBody::Diff(DiffResponse { changes }),
+        completion: Completion::Complete,
+    })?)
 }
 
 pub(crate) fn run_inspect(ctx: &Invocation<'_>, args: commands::InspectArgs) -> Result<Value> {
@@ -235,14 +255,18 @@ pub(crate) fn run_inspect(ctx: &Invocation<'_>, args: commands::InspectArgs) -> 
     enforce_purge_read_barrier(&target, &args.hash, ctx.control)?;
     match repo.inspect(&args.hash)? {
         InspectedObject::Tree(tree) => {
-            let value =
-                serde_json::to_value(tree).map_err(|err| KioError::schema(err.to_string()))?;
+            let value = project_legacy(CommandResponse {
+                body: ResponseBody::Inspect(InspectResponse::Tree(tree)),
+                completion: Completion::Complete,
+            })?;
             // §I checkpoint 2 (LC54/LC55).
             checkpoint.finish(value)
         }
         InspectedObject::Commit(commit) => {
-            let value =
-                serde_json::to_value(commit).map_err(|err| KioError::schema(err.to_string()))?;
+            let value = project_legacy(CommandResponse {
+                body: ResponseBody::Inspect(InspectResponse::Commit(commit)),
+                completion: Completion::Complete,
+            })?;
             // §I checkpoint 2 (LC54/LC55).
             checkpoint.finish(value)
         }
@@ -254,11 +278,14 @@ pub(crate) fn run_inspect(ctx: &Invocation<'_>, args: commands::InspectArgs) -> 
             // the inspect window cannot leak even the raw object's size.
             enforce_purge_read_barrier(&target, &raw_hash, ctx.control)?;
             // §I checkpoint 2 (LC54/LC55).
-            checkpoint.finish(json!({
-                "object_type": "raw",
-                "raw_hash": raw_hash,
-                "size_bytes": size_bytes,
-            }))
+            checkpoint.finish(project_legacy(CommandResponse {
+                body: ResponseBody::Inspect(InspectResponse::Raw(RawInspection {
+                    object_type: "raw".to_owned(),
+                    raw_hash,
+                    size_bytes,
+                })),
+                completion: Completion::Complete,
+            })?)
         }
     }
 }
@@ -282,19 +309,25 @@ pub(crate) fn run_tag(ctx: &Invocation<'_>, args: commands::TagArgs) -> Result<V
         .join(PORTABLE_TAGS_DIRECTORY)
         .join(portable_tag_leaf(&args.name));
     if args.delete {
-        Ok(json!({
-            "operation": "tag_delete",
-            "status": "deleted",
-            "tag": args.name,
-            "commit_hash": commit_hash,
-            "path": path,
-        }))
+        project_legacy(CommandResponse {
+            body: ResponseBody::Tag(TagResponse::Delete(TagDeleteResponse {
+                operation: "tag_delete".to_owned(),
+                status: "deleted".to_owned(),
+                tag: args.name,
+                commit_hash,
+                path,
+            })),
+            completion: Completion::Complete,
+        })
     } else {
-        Ok(json!({
-            "tag": args.name,
-            "commit_hash": commit_hash,
-            "path": path,
-        }))
+        project_legacy(CommandResponse {
+            body: ResponseBody::Tag(TagResponse::Set(TagSetResponse {
+                tag: args.name,
+                commit_hash,
+                path,
+            })),
+            completion: Completion::Complete,
+        })
     }
 }
 

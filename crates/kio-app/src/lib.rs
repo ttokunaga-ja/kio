@@ -90,6 +90,7 @@ mod watch_service;
 
 pub mod commands;
 pub mod context;
+pub mod response;
 
 pub fn execute(ctx: &AppContext, command: Command) -> Result<Value> {
     #[cfg(debug_assertions)]
