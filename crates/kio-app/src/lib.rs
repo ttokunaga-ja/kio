@@ -425,366 +425,18 @@ fn execute_dispatch(ctx: &Invocation<'_>, command: Command) -> Result<Value> {
 
     match command {
         Command::RootRegister(args) => root_registration::run(ctx, args),
-        Command::Init(args) => {
-            let working_directory = ctx.cwd().to_path_buf();
-            let requested = args.path.unwrap_or(working_directory.clone());
-            let path = if requested.is_absolute() {
-                requested
-            } else {
-                working_directory.join(requested)
-            };
-            // Management records are created only by the exclusive creation path.
-            // Any pre-existing store must already have a valid live chain.
-            let (repo, created) =
-                match initialize_explicit_root_in_session(&path, ctx.control, ctx.locks)? {
-                    ExplicitRoot::Created(repo) => (repo, true),
-                    ExplicitRoot::Existing(repo) => (repo, false),
-                };
-            let repo = repo.in_lock_session(ctx.locks);
-            // Existing stores may finish only a verified publication intent.
-            // Missing/corrupt HEAD has no second ref from which to guess a tip.
-            let (repaired, _existing_store_lock) = if created {
-                (Vec::new(), None)
-            } else {
-                let lock = repo.lock_store_in_session(repo.lock_session())?;
-                let repaired = if repo.recover_publication()? {
-                    vec!["publication".to_owned()]
-                } else {
-                    Vec::new()
-                };
-                // A recovery-capable open deliberately permits a missing HEAD
-                // long enough to replay an intent. With no valid intent, init
-                // must still reject the missing/malformed canonical history.
-                repo.head_commit_hash()?;
-                (repaired, Some(lock))
-            };
-            // LC39/LC40: seed `.kio/purge/epoch` from scope creation onward, so
-            // no read command ever fail-closes on a file that simply was never
-            // created (see `ensure_purge_epoch_initialized`'s doc comment).
-            ensure_purge_epoch_initialized(repo.kio_dir(), repo.control())?;
-            // Register the scope in the device-local registry so multi-scope search
-            // can enumerate it (05 §1.8). `indexed=false` until `kio index` runs.
-            // The registry is a cache, never truth (03 §4): a write failure is a
-            // warning, never a hard error.
-            register_scope(ctx, &repo, false);
-            let status = if created {
-                "initialized"
-            } else if repaired.is_empty() {
-                "already initialized"
-            } else {
-                "repaired"
-            };
-            Ok(json!({
-                "status": status,
-                "repaired": repaired,
-                "path": repo.root(),
-                "kio_path": repo.kio_dir(),
-            }))
-        }
-        Command::Status => {
-            let repo = ctx.open_recovery_repository()?;
-            validate_repo_tool_lock(&repo)?;
-            let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
-            // R15-4: `status` is a pure read — a shallow HEAD (tree object gone)
-            // degrades to listing files without a classification (`head_shallow`)
-            // instead of dying on a raw KIO-E-STORE-NOT-FOUND-001.
-            let status = repo.status()?;
-            let (unsupported_inputs, unsupported_inputs_complete) = if status.head_shallow {
-                UnsupportedInputStore::new(repo.kio_dir())
-                    .latest_by_path()
-                    .map_err(pipeline_to_kio)?;
-                (Vec::new(), false)
-            } else {
-                (current_unsupported_inputs(&repo)?, true)
-            };
-            let tasks = task_store.all().map_err(pipeline_to_kio)?;
-            let ledger_snapshot =
-                open_search_budget_snapshot(&ledger_db_path(ctx.control), ctx.control)?;
-            Ok(json!({
-                "scope_path": repo.kio_dir(),
-                "files": status.files,
-                "head_shallow": status.head_shallow,
-                // QA4 (step4b-contract-tests-p3a.md §A, 10 §1 L117): the
-                // paused-task count broken down by hold_reason (budget/auth/
-                // tier_b_approval), alongside the raw task list callers
-                // previously had to filter client-side themselves.
-                "paused_by_hold_reason": paused_tasks_by_hold_reason(&tasks),
-                "tasks": tasks,
-                "quarantine": quarantine_status_records(&repo)?,
-                "unsupported_inputs": unsupported_inputs,
-                "unsupported_inputs_complete": unsupported_inputs_complete,
-                "budget": budget_status_json(&repo, ledger_snapshot.as_ref())?,
-                // CL37/CL68: permanently-stalled (settled but residue-cleanup-
-                // pending) cost-ledger.sqlite batch_requests rows, device-global
-                // — not scoped to this folder, since the ledger itself is not.
-                "stalled_batch": stalled_batch_status_json(ledger_snapshot.as_ref(), ctx.control)?,
-                // 05 §3.5 / LC51: `status` is the one read command the §I barrier
-                // does NOT reject on an active journal — it shows the journal as
-                // state instead, for recovery visibility into a crashed purge.
-                "active_purge_journal": PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?
-                    .read_journal()?
-                    .map(serde_json::to_value)
-                    .transpose()
-                    .map_err(|err| KioError::schema(err.to_string()))?,
-                // GC has its own durable recovery marker.  As with purge,
-                // status exposes it rather than attempting recovery or
-                // collapsing an interrupted destructive operation into a
-                // normal healthy state.
-                "active_gc_sweep": kio_core::gc::read_active_marker_with_control(repo.kio_dir(), repo.control())?
-                    .map(serde_json::to_value)
-                    .transpose()
-                    .map_err(|err| KioError::schema(err.to_string()))?,
-            }))
-        }
+        Command::Init(args) => run_init(ctx, args),
+        Command::Status => run_status(ctx),
         Command::Snapshot(SnapshotArgs {
             action: SnapshotAction::Auto,
         }) => run_snapshot_auto(ctx),
         Command::Snapshot(SnapshotArgs {
             action: SnapshotAction::Create(args),
-        }) => {
-            // Opening an ordinary repository can self-heal HEAD. Bind and
-            // validate without repair first, acquire the GC-aware store lock,
-            // and only then perform that write. This keeps even the open path
-            // behind the active-sweep barrier without following a replaced
-            // public `.kio` pathname.
-            let repo =
-                Repository::open_recovery_in_session(ctx.cwd(), ctx.control.clone(), ctx.locks)?;
-            let (recovered_before_publication, gc_binding) =
-                match gc::preflight_automatic(&repo, "snapshot")? {
-                    gc::AutomaticGcPreflight::Proceed { recovered, binding } => {
-                        (recovered, binding)
-                    }
-                    gc::AutomaticGcPreflight::Deferred(report) => {
-                        return Ok(gc::deferred_before_publication("snapshot", report));
-                    }
-                };
-            let lock = repo.lock_store_in_session(repo.lock_session())?;
-            repo.recover_publication()?;
-            validate_repo_tool_lock(&repo)?;
-            // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment): a
-            // scope created before this session's read-barrier wiring, or one
-            // whose epoch file was otherwise lost, self-heals on its next write.
-            ensure_purge_epoch_initialized(repo.kio_dir(), repo.control())?;
-            // N2: a manual snapshot must exclude the same Tier A secrets `kio index`
-            // does, or `.env`/`*.pem` plaintext lands irreversibly in objects/raw and
-            // the latest tree. Compute the exclusion set from the scan preview (the
-            // shared classifier) and pass it through the filtered snapshot path.
-            let preview = build_scan_preview(
-                &adapter_settings.declared_pricing("markdown"),
-                &adapter_settings.declared_pricing("embedding"),
-                ScanPreviewRequest {
-                    scope_path: repo.root().display().to_string(),
-                    include_raw_hashes: false,
-                    require_network_approval: false,
-                },
-            )
-            .map_err(pipeline_to_kio)?;
-            let excluded = preview
-                .candidates
-                .iter()
-                .filter(|candidate| candidate.ignored)
-                .map(|candidate| candidate.input_path.clone())
-                .collect::<BTreeSet<_>>();
-            let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&preview);
-            // Keep the source HEAD, its ready replica header, and the optional
-            // same-content projection reuse in one writer critical section.
-            // `snapshot_filtered_with_policy` takes this lock reentrantly.
-            let ready_replica_before_snapshot = capture_ready_replica_snapshot(&repo);
-            let outcome = repo.snapshot_filtered_with_policy(
-                args.message.as_deref(),
-                None,
-                &excluded,
-                &explicitly_allowed_tier_a,
-            )?;
-            if let Some(commit_hash) = &outcome.commit_hash {
-                ctx.control.append_event_log_in_session(
-                    ctx.locks,
-                    "KIO-I-COMMIT-CREATED-001",
-                    "commit created",
-                    json!({
-                        "commit_hash": commit_hash,
-                        "tree_hash": outcome.tree_hash,
-                    }),
-                )?;
-            }
-            if let Some(commit_hash) = outcome.commit_hash.as_deref() {
-                // Never leave the old Ready projection certified once HEAD has
-                // advanced.  A narrow writer-side reuse path below may make the
-                // new snapshot Ready again, but only after proving that it merely
-                // removed no source content or normalization identity.
-                mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), commit_hash);
-                if let Some(before) = ready_replica_before_snapshot.as_ref() {
-                    match republish_equivalent_manual_snapshot(&repo, before, commit_hash) {
-                        Ok(true) => {}
-                        Ok(false) => {}
-                        Err(reason) => log_aggregator_degraded(
-                            ctx,
-                            &format!(
-                                "manual snapshot replica reuse {commit_hash} failed: {reason}"
-                            ),
-                        ),
-                    }
-                }
-            }
-            let output = json!({
-                "status": if outcome.noop { "noop" } else { "created" },
-                "message": outcome.message,
-                "tree_hash": outcome.tree_hash,
-                "commit_hash": outcome.commit_hash,
-                "commit": outcome.commit,
-                "stats": {
-                    "files_added": outcome.stats.files_added,
-                    "files_modified": outcome.stats.files_modified,
-                    "files_deleted": outcome.stats.files_deleted,
-                }
-            });
-            // Automatic GC owns a distinct bound store lock.  The snapshot,
-            // replica publication, and event log are already durable here;
-            // release the writer lock before entering the resumable sweep.
-            drop(lock);
-            Ok(gc::attach_after_success(
-                &repo,
-                "snapshot",
-                recovered_before_publication,
-                gc_binding,
-                output,
-            ))
-        }
-        Command::Log(args) => {
-            let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
-            validate_repo_tool_lock(&repo)?;
-            // QB5/QB6/裁定1: shared (1)+(3) preflight pair.
-            let checkpoint = preflight_barrier_and_index(repo.kio_dir(), repo.control())?;
-            // QB50/QB51/QB54 (step4b-contract-tests-p3b.md §D, 裁定5): `--at
-            // <commit>` resolves through the same HEAD/tag/hash operand
-            // grammar `diff`/`tag`/`restore` already use
-            // (`Repository::resolve_commit`) and becomes the history walk's
-            // starting point instead of HEAD. QB51: a shallow-but-present
-            // commit is a fine `--at` target — `log` only walks the
-            // commit-object parent chain, never a tree, so tree discard is
-            // irrelevant here (unlike `restore`/`search --at`).
-            let start = args
-                .at
-                .as_deref()
-                .map(|value| repo.resolve_commit(value))
-                .transpose()?;
-            // R16-1: `log` degrades on a missing ancestor commit — it returns the
-            // healthy prefix plus `truncated` rather than dying on a raw
-            // KIO-E-STORE-NOT-FOUND-001.
-            let report = repo.log_from(start)?;
-            // QB52/QB55/QB56 (§D, 裁定5): `--since <dur>` filters the walked
-            // entries to `commit.created_at >= now - <dur>`, reusing search's
-            // duration grammar (`PositiveDuration` — accepts `s`/`m`/`h`/`d`/`w`
-            // units). Composes with `--at` as an intersection (recommendation
-            // (a) — narrows whatever `--at` already selected as the walk's
-            // origin, rather than picking a competing origin of its own); the
-            // default HEAD-rooted walk origin is unchanged when `--at` is
-            // absent (QB52's non-breaking requirement).
-            let entries = match args.since.as_deref() {
-                Some(duration) => {
-                    let duration = PositiveDuration::parse(duration)?;
-                    let now =
-                        parse_utc_seconds(&ctx.control.now_utc_seconds()).ok_or_else(|| {
-                            KioError::schema("current time is not canonical UTC seconds")
-                        })?;
-                    let cutoff = since_cutoff_seconds(now, duration)?;
-                    report
-                        .entries
-                        .into_iter()
-                        .filter(|entry| {
-                            parse_utc_seconds(&entry.commit.created_at)
-                                .is_some_and(|created_at| created_at >= cutoff)
-                        })
-                        .collect::<Vec<_>>()
-                }
-                None => report.entries,
-            };
-            // §I checkpoint 2 (LC54/LC55). QB57: the wire shape (`commits` +
-            // `truncated`) is unchanged by `--at`/`--since` — they narrow
-            // which commits are listed, not the response shape.
-            checkpoint.finish(json!({ "commits": entries, "truncated": report.truncated }))
-        }
-        Command::Diff(args) => {
-            let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
-            validate_repo_tool_lock(&repo)?;
-            // QB5/QB6/裁定1: shared (1)+(3) preflight pair.
-            let checkpoint = preflight_barrier_and_index(repo.kio_dir(), repo.control())?;
-            let changes = repo.diff(&args.a, &args.b)?;
-            // §I checkpoint 2 (LC54/LC55).
-            checkpoint.finish(json!({ "changes": changes }))
-        }
-        Command::Inspect(args) => {
-            let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
-            validate_repo_tool_lock(&repo)?;
-            let target = scope_target(repo.root(), ctx.control)?;
-            // QB5/QB6/裁定1: shared (1)+(3) preflight pair. Distinct from the
-            // per-raw_hash `enforce_purge_read_barrier` calls below (LC11-14
-            // tombstone dispatch) — see `ReadBarrierCheckpoint`'s doc comment.
-            let checkpoint = preflight_barrier_and_index(&target.kio_dir, ctx.control)?;
-            enforce_purge_read_barrier(&target, &args.hash, ctx.control)?;
-            match repo.inspect(&args.hash)? {
-                InspectedObject::Tree(tree) => {
-                    let value = serde_json::to_value(tree)
-                        .map_err(|err| KioError::schema(err.to_string()))?;
-                    // §I checkpoint 2 (LC54/LC55).
-                    checkpoint.finish(value)
-                }
-                InspectedObject::Commit(commit) => {
-                    let value = serde_json::to_value(commit)
-                        .map_err(|err| KioError::schema(err.to_string()))?;
-                    // §I checkpoint 2 (LC54/LC55).
-                    checkpoint.finish(value)
-                }
-                InspectedObject::Raw {
-                    raw_hash,
-                    size_bytes,
-                } => {
-                    // Recheck after the metadata read so a barrier published in
-                    // the inspect window cannot leak even the raw object's size.
-                    enforce_purge_read_barrier(&target, &raw_hash, ctx.control)?;
-                    // §I checkpoint 2 (LC54/LC55).
-                    checkpoint.finish(json!({
-                        "object_type": "raw",
-                        "raw_hash": raw_hash,
-                        "size_bytes": size_bytes,
-                    }))
-                }
-            }
-        }
-        Command::Tag(args) => {
-            if args.delete && args.commit.is_some() {
-                return Err(KioError::invalid_usage(
-                    "tag deletion does not accept a commit operand",
-                ));
-            }
-            let repo = ctx.open_recovery_repository()?;
-            validate_repo_tool_lock(&repo)?;
-            let commit_hash = if args.delete {
-                repo.delete_tag(&args.name)?
-            } else {
-                repo.tag(&args.name, args.commit.as_deref())?
-            };
-            let path = repo
-                .kio_dir()
-                .join("refs")
-                .join(PORTABLE_TAGS_DIRECTORY)
-                .join(portable_tag_leaf(&args.name));
-            if args.delete {
-                Ok(json!({
-                    "operation": "tag_delete",
-                    "status": "deleted",
-                    "tag": args.name,
-                    "commit_hash": commit_hash,
-                    "path": path,
-                }))
-            } else {
-                Ok(json!({
-                    "tag": args.name,
-                    "commit_hash": commit_hash,
-                    "path": path,
-                }))
-            }
-        }
+        }) => run_snapshot_create(ctx, args, adapter_settings),
+        Command::Log(args) => run_log(ctx, args),
+        Command::Diff(args) => run_diff(ctx, args),
+        Command::Inspect(args) => run_inspect(ctx, args),
+        Command::Tag(args) => run_tag(ctx, args),
         Command::Index(args) => run_index(ctx, args),
         Command::Watch(args) => watch_command::run(ctx, args, ctx.control),
         Command::Batch(args) => run_batch(ctx, args),
@@ -800,6 +452,364 @@ fn execute_dispatch(ctx: &Invocation<'_>, command: Command) -> Result<Value> {
         Command::Export(args) => export::run(ctx, args),
         Command::Restore(args) => managed_restore::run(ctx, args),
         Command::Purge(args) => purge::run(ctx, args),
+    }
+}
+
+fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result<Value> {
+    let working_directory = ctx.cwd().to_path_buf();
+    let requested = args.path.unwrap_or(working_directory.clone());
+    let path = if requested.is_absolute() {
+        requested
+    } else {
+        working_directory.join(requested)
+    };
+    // Management records are created only by the exclusive creation path.
+    // Any pre-existing store must already have a valid live chain.
+    let (repo, created) = match initialize_explicit_root_in_session(&path, ctx.control, ctx.locks)?
+    {
+        ExplicitRoot::Created(repo) => (repo, true),
+        ExplicitRoot::Existing(repo) => (repo, false),
+    };
+    let repo = repo.in_lock_session(ctx.locks);
+    // Existing stores may finish only a verified publication intent.
+    // Missing/corrupt HEAD has no second ref from which to guess a tip.
+    let (repaired, _existing_store_lock) = if created {
+        (Vec::new(), None)
+    } else {
+        let lock = repo.lock_store_in_session(repo.lock_session())?;
+        let repaired = if repo.recover_publication()? {
+            vec!["publication".to_owned()]
+        } else {
+            Vec::new()
+        };
+        // A recovery-capable open deliberately permits a missing HEAD
+        // long enough to replay an intent. With no valid intent, init
+        // must still reject the missing/malformed canonical history.
+        repo.head_commit_hash()?;
+        (repaired, Some(lock))
+    };
+    // LC39/LC40: seed `.kio/purge/epoch` from scope creation onward, so
+    // no read command ever fail-closes on a file that simply was never
+    // created (see `ensure_purge_epoch_initialized`'s doc comment).
+    ensure_purge_epoch_initialized(repo.kio_dir(), repo.control())?;
+    // Register the scope in the device-local registry so multi-scope search
+    // can enumerate it (05 §1.8). `indexed=false` until `kio index` runs.
+    // The registry is a cache, never truth (03 §4): a write failure is a
+    // warning, never a hard error.
+    register_scope(ctx, &repo, false);
+    let status = if created {
+        "initialized"
+    } else if repaired.is_empty() {
+        "already initialized"
+    } else {
+        "repaired"
+    };
+    Ok(json!({
+        "status": status,
+        "repaired": repaired,
+        "path": repo.root(),
+        "kio_path": repo.kio_dir(),
+    }))
+}
+
+fn run_status(ctx: &Invocation<'_>) -> Result<Value> {
+    let repo = ctx.open_recovery_repository()?;
+    validate_repo_tool_lock(&repo)?;
+    let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
+    // R15-4: `status` is a pure read — a shallow HEAD (tree object gone)
+    // degrades to listing files without a classification (`head_shallow`)
+    // instead of dying on a raw KIO-E-STORE-NOT-FOUND-001.
+    let status = repo.status()?;
+    let (unsupported_inputs, unsupported_inputs_complete) = if status.head_shallow {
+        UnsupportedInputStore::new(repo.kio_dir())
+            .latest_by_path()
+            .map_err(pipeline_to_kio)?;
+        (Vec::new(), false)
+    } else {
+        (current_unsupported_inputs(&repo)?, true)
+    };
+    let tasks = task_store.all().map_err(pipeline_to_kio)?;
+    let ledger_snapshot = open_search_budget_snapshot(&ledger_db_path(ctx.control), ctx.control)?;
+    Ok(json!({
+        "scope_path": repo.kio_dir(),
+        "files": status.files,
+        "head_shallow": status.head_shallow,
+        // QA4 (step4b-contract-tests-p3a.md §A, 10 §1 L117): the
+        // paused-task count broken down by hold_reason (budget/auth/
+        // tier_b_approval), alongside the raw task list callers
+        // previously had to filter client-side themselves.
+        "paused_by_hold_reason": paused_tasks_by_hold_reason(&tasks),
+        "tasks": tasks,
+        "quarantine": quarantine_status_records(&repo)?,
+        "unsupported_inputs": unsupported_inputs,
+        "unsupported_inputs_complete": unsupported_inputs_complete,
+        "budget": budget_status_json(&repo, ledger_snapshot.as_ref())?,
+        // CL37/CL68: permanently-stalled (settled but residue-cleanup-
+        // pending) cost-ledger.sqlite batch_requests rows, device-global
+        // — not scoped to this folder, since the ledger itself is not.
+        "stalled_batch": stalled_batch_status_json(ledger_snapshot.as_ref(), ctx.control)?,
+        // 05 §3.5 / LC51: `status` is the one read command the §I barrier
+        // does NOT reject on an active journal — it shows the journal as
+        // state instead, for recovery visibility into a crashed purge.
+        "active_purge_journal": PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?
+            .read_journal()?
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|err| KioError::schema(err.to_string()))?,
+        // GC has its own durable recovery marker.  As with purge,
+        // status exposes it rather than attempting recovery or
+        // collapsing an interrupted destructive operation into a
+        // normal healthy state.
+        "active_gc_sweep": kio_core::gc::read_active_marker_with_control(repo.kio_dir(), repo.control())?
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|err| KioError::schema(err.to_string()))?,
+    }))
+}
+
+fn run_snapshot_create(
+    ctx: &Invocation<'_>,
+    args: commands::SnapshotCreateArgs,
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+) -> Result<Value> {
+    // Opening an ordinary repository can self-heal HEAD. Bind and
+    // validate without repair first, acquire the GC-aware store lock,
+    // and only then perform that write. This keeps even the open path
+    // behind the active-sweep barrier without following a replaced
+    // public `.kio` pathname.
+    let repo = Repository::open_recovery_in_session(ctx.cwd(), ctx.control.clone(), ctx.locks)?;
+    let (recovered_before_publication, gc_binding) =
+        match gc::preflight_automatic(&repo, "snapshot")? {
+            gc::AutomaticGcPreflight::Proceed { recovered, binding } => (recovered, binding),
+            gc::AutomaticGcPreflight::Deferred(report) => {
+                return Ok(gc::deferred_before_publication("snapshot", report));
+            }
+        };
+    let lock = repo.lock_store_in_session(repo.lock_session())?;
+    repo.recover_publication()?;
+    validate_repo_tool_lock(&repo)?;
+    // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment): a
+    // scope created before this session's read-barrier wiring, or one
+    // whose epoch file was otherwise lost, self-heals on its next write.
+    ensure_purge_epoch_initialized(repo.kio_dir(), repo.control())?;
+    // N2: a manual snapshot must exclude the same Tier A secrets `kio index`
+    // does, or `.env`/`*.pem` plaintext lands irreversibly in objects/raw and
+    // the latest tree. Compute the exclusion set from the scan preview (the
+    // shared classifier) and pass it through the filtered snapshot path.
+    let preview = build_scan_preview(
+        &adapter_settings.declared_pricing("markdown"),
+        &adapter_settings.declared_pricing("embedding"),
+        ScanPreviewRequest {
+            scope_path: repo.root().display().to_string(),
+            include_raw_hashes: false,
+            require_network_approval: false,
+        },
+    )
+    .map_err(pipeline_to_kio)?;
+    let excluded = preview
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.ignored)
+        .map(|candidate| candidate.input_path.clone())
+        .collect::<BTreeSet<_>>();
+    let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&preview);
+    // Keep the source HEAD, its ready replica header, and the optional
+    // same-content projection reuse in one writer critical section.
+    // `snapshot_filtered_with_policy` takes this lock reentrantly.
+    let ready_replica_before_snapshot = capture_ready_replica_snapshot(&repo);
+    let outcome = repo.snapshot_filtered_with_policy(
+        args.message.as_deref(),
+        None,
+        &excluded,
+        &explicitly_allowed_tier_a,
+    )?;
+    if let Some(commit_hash) = &outcome.commit_hash {
+        ctx.control.append_event_log_in_session(
+            ctx.locks,
+            "KIO-I-COMMIT-CREATED-001",
+            "commit created",
+            json!({
+                "commit_hash": commit_hash,
+                "tree_hash": outcome.tree_hash,
+            }),
+        )?;
+    }
+    if let Some(commit_hash) = outcome.commit_hash.as_deref() {
+        // Never leave the old Ready projection certified once HEAD has
+        // advanced.  A narrow writer-side reuse path below may make the
+        // new snapshot Ready again, but only after proving that it merely
+        // removed no source content or normalization identity.
+        mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), commit_hash);
+        if let Some(before) = ready_replica_before_snapshot.as_ref() {
+            match republish_equivalent_manual_snapshot(&repo, before, commit_hash) {
+                Ok(true) => {}
+                Ok(false) => {}
+                Err(reason) => log_aggregator_degraded(
+                    ctx,
+                    &format!("manual snapshot replica reuse {commit_hash} failed: {reason}"),
+                ),
+            }
+        }
+    }
+    let output = json!({
+        "status": if outcome.noop { "noop" } else { "created" },
+        "message": outcome.message,
+        "tree_hash": outcome.tree_hash,
+        "commit_hash": outcome.commit_hash,
+        "commit": outcome.commit,
+        "stats": {
+            "files_added": outcome.stats.files_added,
+            "files_modified": outcome.stats.files_modified,
+            "files_deleted": outcome.stats.files_deleted,
+        }
+    });
+    // Automatic GC owns a distinct bound store lock.  The snapshot,
+    // replica publication, and event log are already durable here;
+    // release the writer lock before entering the resumable sweep.
+    drop(lock);
+    Ok(gc::attach_after_success(
+        &repo,
+        "snapshot",
+        recovered_before_publication,
+        gc_binding,
+        output,
+    ))
+}
+
+fn run_log(ctx: &Invocation<'_>, args: commands::LogArgs) -> Result<Value> {
+    let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
+    validate_repo_tool_lock(&repo)?;
+    // QB5/QB6/裁定1: shared (1)+(3) preflight pair.
+    let checkpoint = preflight_barrier_and_index(repo.kio_dir(), repo.control())?;
+    // QB50/QB51/QB54 (step4b-contract-tests-p3b.md §D, 裁定5): `--at
+    // <commit>` resolves through the same HEAD/tag/hash operand
+    // grammar `diff`/`tag`/`restore` already use
+    // (`Repository::resolve_commit`) and becomes the history walk's
+    // starting point instead of HEAD. QB51: a shallow-but-present
+    // commit is a fine `--at` target — `log` only walks the
+    // commit-object parent chain, never a tree, so tree discard is
+    // irrelevant here (unlike `restore`/`search --at`).
+    let start = args
+        .at
+        .as_deref()
+        .map(|value| repo.resolve_commit(value))
+        .transpose()?;
+    // R16-1: `log` degrades on a missing ancestor commit — it returns the
+    // healthy prefix plus `truncated` rather than dying on a raw
+    // KIO-E-STORE-NOT-FOUND-001.
+    let report = repo.log_from(start)?;
+    // QB52/QB55/QB56 (§D, 裁定5): `--since <dur>` filters the walked
+    // entries to `commit.created_at >= now - <dur>`, reusing search's
+    // duration grammar (`PositiveDuration` — accepts `s`/`m`/`h`/`d`/`w`
+    // units). Composes with `--at` as an intersection (recommendation
+    // (a) — narrows whatever `--at` already selected as the walk's
+    // origin, rather than picking a competing origin of its own); the
+    // default HEAD-rooted walk origin is unchanged when `--at` is
+    // absent (QB52's non-breaking requirement).
+    let entries = match args.since.as_deref() {
+        Some(duration) => {
+            let duration = PositiveDuration::parse(duration)?;
+            let now = parse_utc_seconds(&ctx.control.now_utc_seconds())
+                .ok_or_else(|| KioError::schema("current time is not canonical UTC seconds"))?;
+            let cutoff = since_cutoff_seconds(now, duration)?;
+            report
+                .entries
+                .into_iter()
+                .filter(|entry| {
+                    parse_utc_seconds(&entry.commit.created_at)
+                        .is_some_and(|created_at| created_at >= cutoff)
+                })
+                .collect::<Vec<_>>()
+        }
+        None => report.entries,
+    };
+    // §I checkpoint 2 (LC54/LC55). QB57: the wire shape (`commits` +
+    // `truncated`) is unchanged by `--at`/`--since` — they narrow
+    // which commits are listed, not the response shape.
+    checkpoint.finish(json!({ "commits": entries, "truncated": report.truncated }))
+}
+
+fn run_diff(ctx: &Invocation<'_>, args: commands::DiffArgs) -> Result<Value> {
+    let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
+    validate_repo_tool_lock(&repo)?;
+    // QB5/QB6/裁定1: shared (1)+(3) preflight pair.
+    let checkpoint = preflight_barrier_and_index(repo.kio_dir(), repo.control())?;
+    let changes = repo.diff(&args.a, &args.b)?;
+    // §I checkpoint 2 (LC54/LC55).
+    checkpoint.finish(json!({ "changes": changes }))
+}
+
+fn run_inspect(ctx: &Invocation<'_>, args: commands::InspectArgs) -> Result<Value> {
+    let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
+    validate_repo_tool_lock(&repo)?;
+    let target = scope_target(repo.root(), ctx.control)?;
+    // QB5/QB6/裁定1: shared (1)+(3) preflight pair. Distinct from the
+    // per-raw_hash `enforce_purge_read_barrier` calls below (LC11-14
+    // tombstone dispatch) — see `ReadBarrierCheckpoint`'s doc comment.
+    let checkpoint = preflight_barrier_and_index(&target.kio_dir, ctx.control)?;
+    enforce_purge_read_barrier(&target, &args.hash, ctx.control)?;
+    match repo.inspect(&args.hash)? {
+        InspectedObject::Tree(tree) => {
+            let value =
+                serde_json::to_value(tree).map_err(|err| KioError::schema(err.to_string()))?;
+            // §I checkpoint 2 (LC54/LC55).
+            checkpoint.finish(value)
+        }
+        InspectedObject::Commit(commit) => {
+            let value =
+                serde_json::to_value(commit).map_err(|err| KioError::schema(err.to_string()))?;
+            // §I checkpoint 2 (LC54/LC55).
+            checkpoint.finish(value)
+        }
+        InspectedObject::Raw {
+            raw_hash,
+            size_bytes,
+        } => {
+            // Recheck after the metadata read so a barrier published in
+            // the inspect window cannot leak even the raw object's size.
+            enforce_purge_read_barrier(&target, &raw_hash, ctx.control)?;
+            // §I checkpoint 2 (LC54/LC55).
+            checkpoint.finish(json!({
+                "object_type": "raw",
+                "raw_hash": raw_hash,
+                "size_bytes": size_bytes,
+            }))
+        }
+    }
+}
+
+fn run_tag(ctx: &Invocation<'_>, args: commands::TagArgs) -> Result<Value> {
+    if args.delete && args.commit.is_some() {
+        return Err(KioError::invalid_usage(
+            "tag deletion does not accept a commit operand",
+        ));
+    }
+    let repo = ctx.open_recovery_repository()?;
+    validate_repo_tool_lock(&repo)?;
+    let commit_hash = if args.delete {
+        repo.delete_tag(&args.name)?
+    } else {
+        repo.tag(&args.name, args.commit.as_deref())?
+    };
+    let path = repo
+        .kio_dir()
+        .join("refs")
+        .join(PORTABLE_TAGS_DIRECTORY)
+        .join(portable_tag_leaf(&args.name));
+    if args.delete {
+        Ok(json!({
+            "operation": "tag_delete",
+            "status": "deleted",
+            "tag": args.name,
+            "commit_hash": commit_hash,
+            "path": path,
+        }))
+    } else {
+        Ok(json!({
+            "tag": args.name,
+            "commit_hash": commit_hash,
+            "path": path,
+        }))
     }
 }
 
