@@ -11,6 +11,7 @@ use kio_core::management::{begin_registration, read_record};
 use kio_core::management::{
     detect_case_insensitive, finish_registration, publish_registration_record,
 };
+use kio_index::registry::RegistryEntry;
 use kio_pipeline::scan::BoundPlannedChild;
 use std::fs;
 use std::path::{Path, PathBuf};

@@ -128,14 +128,14 @@ mod tests {
         use kio_core::dag::NormalizeRef;
 
         let root = tempfile::tempdir().unwrap();
-        let repo = match crate::initialize_explicit_root(
+        let repo = match crate::management::initialize_explicit_root(
             root.path(),
             &kio_core::control::ControlHandle::default(),
         )
         .unwrap()
         {
-            crate::ExplicitRoot::Created(repo) => repo,
-            crate::ExplicitRoot::Existing(_) => panic!("fresh root must be created"),
+            crate::management::ExplicitRoot::Created(repo) => repo,
+            crate::management::ExplicitRoot::Existing(_) => panic!("fresh root must be created"),
         };
         let policy = crate::current_embedding_policy(&repo).unwrap();
         let mut instance = crate::historical_reindex::RetainedNormalizedInstance {

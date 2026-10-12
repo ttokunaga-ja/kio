@@ -3,6 +3,13 @@
 use super::*;
 use crate::commands::{CommandRequest, InitArgs, RepairArgs, RepairOperation, RepairRebuildDbArgs};
 use crate::context::{AppContext, Interaction};
+use crate::management::ExplicitRoot;
+#[cfg(test)]
+use crate::management::initialize_explicit_root;
+use crate::scope_access::purge_blocks_rebuild_raw;
+use crate::settings::embedding_profile_summary;
+use crate::settings::persisted_embedding_is_deterministic;
+use crate::settings::rebuild_embedding_entry_from_tool_lock;
 use kio_core::control::ControlHandle;
 use std::sync::Arc;
 

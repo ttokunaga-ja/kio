@@ -138,7 +138,7 @@ struct PurgeReport {
     log_fields_masked: u64,
 }
 
-pub(crate) fn run(ctx: &crate::Invocation<'_>, args: PurgeArgs) -> Result<Value> {
+pub(crate) fn run(ctx: &crate::invocation::Invocation<'_>, args: PurgeArgs) -> Result<Value> {
     let repo = ctx.open_recovery_repository()?;
     // Orphan cleanup is transaction recovery, not target mutation. Run it under
     // the store lock before preview/working-copy refusal so a tombstoned raw temp
@@ -481,7 +481,11 @@ fn authenticate_purge_chunk_inventory(
         crate::authenticate_chunk_row(row, &authorities)
             .map_err(chunk_ledger_authentication_error)?;
         if !target
-            && crate::purge_blocks_rebuild_raw(repo.kio_dir(), &row.raw_hash, repo.control())?
+            && crate::scope_access::purge_blocks_rebuild_raw(
+                repo.kio_dir(),
+                &row.raw_hash,
+                repo.control(),
+            )?
         {
             return Err(purge_authority_incomplete(
                 "relevant survivor has a blocking purge lifecycle",
@@ -578,7 +582,7 @@ fn chunk_ledger_authentication_error(error: KioError) -> KioError {
 /// deterministic — the store lock has been held throughout) and publishes it
 /// for real, making it ref-reachable for the first time.
 fn execute_phase_machine(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     repo: &Repository,
     args: &PurgeArgs,
     preview: &PurgePreview,
@@ -1868,7 +1872,7 @@ fn settle_inflight_reservations_for_purge(
         .iter()
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
-    let scope_id = crate::scope_id(repo.kio_dir())?;
+    let scope_id = crate::scope_access::scope_id(repo.kio_dir())?;
     let Some(ledger) = crate::open_optional_ledger_db(repo.control())? else {
         // A fresh offline device has no billing state. A local reservation
         // without its operational ledger must be recovered before deleting it.
@@ -2150,7 +2154,7 @@ fn evict_open_cache(
     is_image: bool,
     control: &ControlHandle,
 ) -> Result<u64> {
-    let mut root = crate::cache_home(control).join("kio/open");
+    let mut root = crate::settings::cache_home(control).join("kio/open");
     if is_image {
         root = root.join("image");
     }
@@ -2174,7 +2178,7 @@ fn scrub_logs(
     journal: &PurgeJournal,
     report: &mut PurgeReport,
 ) -> Result<()> {
-    let device_root = crate::data_home(repo.control()).join("kio/logs");
+    let device_root = crate::settings::data_home(repo.control()).join("kio/logs");
     let scope_root = repo.kio_dir().join("logs");
     let _device_lock = StoreLock::acquire_path_in_session(
         repo.lock_session(),
@@ -2201,7 +2205,7 @@ fn scrub_logs(
     // permanently unscrubbable). `access` logs live under this scope's own
     // `.kio/logs/`, already scoped by directory location, so no additional
     // gate is needed there.
-    let scope_id = crate::scope_id(repo.kio_dir())?;
+    let scope_id = crate::scope_access::scope_id(repo.kio_dir())?;
     let mut pass_files = 0_u64;
     let mut pass_rows = 0_u64;
     let mut pass_fields = 0_u64;
@@ -2248,7 +2252,7 @@ fn finalize_purge(
     // Hold both append/scrub locks across the final pass and journal removal.
     // `scrub_logs` re-acquires these paths reentrantly, so its inner guards drop
     // without releasing the outer exclusion window.
-    let device_root = crate::data_home(repo.control()).join("kio/logs");
+    let device_root = crate::settings::data_home(repo.control()).join("kio/logs");
     let scope_root = repo.kio_dir().join("logs");
     let _device_lock = StoreLock::acquire_path_in_session(
         repo.lock_session(),

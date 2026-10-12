@@ -45,7 +45,7 @@ impl EvidenceRegistry {
             return Ok(path.clone());
         }
         kio_index::registry::default_registry_path_with_control(control).map_err(|error| {
-            crate::registry_snapshot_transient_error(
+            crate::scope_access::registry_snapshot_transient_error(
                 Path::new("<unresolved>"),
                 "path_resolution",
                 error.to_string(),

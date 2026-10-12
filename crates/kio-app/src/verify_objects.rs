@@ -1,6 +1,13 @@
 //! Bounded object-store verification for `repair verify-objects`.
 
 use crate::context::EvidenceRegistry;
+use crate::scope_access::ReadBarrierCheckpoint;
+use crate::scope_access::enforce_canonical_marker_barrier;
+use crate::scope_access::invalid_pointer_identity_error;
+use crate::scope_access::is_store_not_found;
+use crate::scope_access::preflight_barrier_and_index;
+use crate::scope_access::resolve_evidence_scope_target;
+use crate::scope_access::unresolvable_commit_pointer_error;
 use kio_core::control::ControlHandle;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -145,7 +152,10 @@ const MAX_BATCH_RECORDS: usize = 4096;
 const MAX_BATCH_SCOPES: usize = 256;
 const MAX_BATCH_VERIFIED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-pub(super) fn run_evidence(ctx: &crate::Invocation<'_>, args: EvidenceArgs) -> Result<Value> {
+pub(super) fn run_evidence(
+    ctx: &crate::invocation::Invocation<'_>,
+    args: EvidenceArgs,
+) -> Result<Value> {
     let registry_input = &EvidenceRegistry::default();
     match args.command {
         EvidenceCommand::Verify(args) => run_evidence_verify(ctx, registry_input, args),
@@ -154,7 +164,7 @@ pub(super) fn run_evidence(ctx: &crate::Invocation<'_>, args: EvidenceArgs) -> R
 }
 
 fn run_evidence_verify(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     args: EvidenceVerifyArgs,
 ) -> Result<Value> {
@@ -181,7 +191,7 @@ fn run_evidence_verify(
 }
 
 fn verify_batch_row(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     strict: bool,
@@ -224,7 +234,7 @@ fn evidence_pointer_cache_key(pointer: &EvidencePointer) -> Result<Vec<u8>> {
 }
 
 fn bind_batch_scopes(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     pointers: &[EvidencePointer],
     strict: bool,
@@ -365,7 +375,7 @@ fn batch_limit_error(line: usize, limit: &str, maximum: usize) -> KioError {
 /// judgment `resolve_pointer_for_cli` (open/view/restore) uses — PB66's
 /// structural requirement.
 fn verify_pointer_for_cli(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     strict: bool,
@@ -405,7 +415,7 @@ struct EvidenceScopeBinding {
 impl EvidenceScopeBinding {
     fn recheck(
         &self,
-        ctx: &crate::Invocation<'_>,
+        ctx: &crate::invocation::Invocation<'_>,
         registry_input: &EvidenceRegistry,
     ) -> Result<()> {
         self.reads.ensure_active()?;
@@ -473,7 +483,7 @@ impl EvidenceScopeBinding {
 }
 
 fn unavailable_evidence_result(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     scope_id: &str,
     scope_path: Option<&str>,
@@ -519,7 +529,7 @@ fn is_registry_snapshot_error(error: &KioError) -> bool {
 }
 
 fn bind_evidence_scope(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     strict: bool,
@@ -3485,9 +3495,9 @@ pub(crate) fn registry_prune_plan_with_control(
     let registry = RegistryDb::open_default_with_control(control).map_err(index_to_kio)?;
     let mut rows = Vec::new();
     for entry in registry.all_entries().map_err(index_to_kio)? {
-        if crate::open_scope_from_hint_with_mode(
+        if crate::scope_access::open_scope_from_hint_with_mode(
             &entry.root_path,
-            crate::ScopeResolutionMode::Normal,
+            crate::scope_access::ScopeResolutionMode::Normal,
             control,
         )
         .is_none()
@@ -3916,7 +3926,7 @@ mod tests {
         let context = crate::context::test_support::context(dir.path());
         let settings = Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
         let control = ControlHandle::default();
-        let ctx = &crate::Invocation {
+        let ctx = &crate::invocation::Invocation {
             context: &context,
             settings: &settings,
             control: &control,
@@ -3985,7 +3995,7 @@ mod tests {
         let settings = Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
         let control = ControlHandle::default();
         let locks = kio_core::scope::LockSession::default();
-        let ctx = &crate::Invocation {
+        let ctx = &crate::invocation::Invocation {
             context: &context,
             settings: &settings,
             control: &control,

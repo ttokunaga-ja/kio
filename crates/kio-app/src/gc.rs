@@ -458,7 +458,7 @@ fn is_runtime_deferred(report: &Value) -> bool {
 }
 
 pub(super) fn run(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     dry_run: bool,
     yes: bool,
     prune_unreachable: bool,

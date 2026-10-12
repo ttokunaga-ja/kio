@@ -6,7 +6,13 @@
 //! associations and their derived search/embedding projections.
 
 use super::*;
+use crate::scope_access::active_erase_purge_explains_historical_missing_manifest;
+use crate::scope_access::ensure_no_visible_purge_journal;
+use crate::scope_access::purge_blocks_historical_reindex_raw;
+use crate::scope_access::purge_blocks_rebuild_raw;
 use kio_core::history::TreeBinding;
+use kio_pipeline::markdownize::NormalizedInstanceIdentity;
+use kio_pipeline::markdownize::validate_normalized_instance;
 
 #[derive(Debug, Default)]
 pub(super) struct ParsedReindex {
@@ -353,7 +359,7 @@ pub(super) fn retained_history_instances_for_roots(
 }
 
 pub(super) fn run(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     repo: &Repository,
     operand: &str,
     online: bool,
@@ -801,7 +807,7 @@ fn reindex_history_limit_error(exceeded: &str, attempted: u64, limit: u64) -> Ki
 /// exact tree projection. Rebuilding the whole ledger would be observable work on
 /// non-selected history; this narrow transaction is the enrichment-only boundary.
 fn project_selected_snapshot(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     repo: &Repository,
     selected_commit: &str,
     tree_entries: &[TreeEntryRow],

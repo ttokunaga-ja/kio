@@ -256,7 +256,7 @@ impl Reconcile for LocalReconciler {
             )
         })();
         let output = result.map_err(|error| WatchError::invariant(error.to_string()))?;
-        if crate::peek_exit_override(&output).is_some()
+        if crate::invocation::peek_exit_override(&output).is_some()
             || output.get("status").and_then(Value::as_str) == Some("deferred")
         {
             // Keep the durable queue retry semantics, while making a partial
@@ -281,7 +281,7 @@ fn incomplete_output_reason(output: &Value) -> String {
         .get("error_code")
         .and_then(Value::as_str)
         .unwrap_or("missing");
-    let exit_code = crate::peek_exit_override(output)
+    let exit_code = crate::invocation::peek_exit_override(output)
         .map(|code| code.code().to_string())
         .unwrap_or_else(|| "none".into());
     let discovery = output.get("child_scope_discovery");

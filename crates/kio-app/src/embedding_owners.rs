@@ -5,6 +5,9 @@
 //! path to the immutable graph's exact manifest binding.
 
 use super::*;
+use crate::scope_access::purge_blocks_rebuild_raw;
+#[cfg(test)]
+use kio_pipeline::markdownize::persist_normalized_instance;
 use std::sync::Arc;
 
 type InstanceKey = (String, String, u64, String);

@@ -316,7 +316,7 @@ fn open_network_policy(repo: &Repository) -> Result<()> {
 }
 
 pub(crate) fn approve(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     args: ApproveArgs,
     control: &ApprovalControl,
 ) -> Result<Value> {
@@ -514,7 +514,10 @@ pub(crate) fn revoke(ctx: &AppContext, args: RevokeArgs, control: &ControlHandle
     )
 }
 
-pub(crate) fn status(ctx: &crate::Invocation<'_>, args: AdapterStatusArgs) -> Result<Value> {
+pub(crate) fn status(
+    ctx: &crate::invocation::Invocation<'_>,
+    args: AdapterStatusArgs,
+) -> Result<Value> {
     let adapter_settings = ctx.settings;
 
     let repo = ctx.open_recovery_repository()?;

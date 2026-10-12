@@ -71,7 +71,10 @@ struct Node {
     retired_children: BTreeMap<String, ChildEnrollment>,
 }
 
-pub(crate) fn run(ctx: &crate::Invocation<'_>, args: RootRegisterArgs) -> Result<Value> {
+pub(crate) fn run(
+    ctx: &crate::invocation::Invocation<'_>,
+    args: RootRegisterArgs,
+) -> Result<Value> {
     if args.preview == args.yes || (args.resume.is_some() && !args.yes) {
         return Err(KioError::invalid_usage(
             "root register requires exactly one of --preview or --yes; --resume requires --yes",

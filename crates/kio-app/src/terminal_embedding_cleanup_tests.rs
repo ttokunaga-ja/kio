@@ -106,7 +106,7 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
         // There is deliberately no scope SQLite DB or vector projection here:
         // releasing a completed operational cleanup must not depend on either.
         super::recover_terminal_embedding_batch_cleanup(
-            &crate::Invocation {
+            &crate::invocation::Invocation {
                 context: &crate::context::test_support::context(std::path::Path::new(".")),
                 settings: &std::sync::Arc::new(
                     kio_adapter::tool_lock::AdapterRuntimeSettings::default(),
@@ -126,7 +126,7 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
             expected.intent_token = None;
             assert_eq!(after, expected);
             super::recover_terminal_embedding_batch_cleanup(
-                &crate::Invocation {
+                &crate::invocation::Invocation {
                     context: &crate::context::test_support::context(std::path::Path::new(".")),
                     settings: &std::sync::Arc::new(
                         kio_adapter::tool_lock::AdapterRuntimeSettings::default(),

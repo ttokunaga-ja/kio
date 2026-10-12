@@ -1,5 +1,6 @@
 //! Read-only blocker, staging-residue, and complete immutable live-set proof.
 use super::*;
+use crate::scope_access::is_store_not_found;
 use kio_core::control::ControlHandle;
 use kio_core::store_dir::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
 use kio_pipeline::markdownize::{NormalizedUnitObject, UnitStatus};
@@ -876,7 +877,7 @@ fn cache_candidates(
     budget: &mut Budget,
     control: &ControlHandle,
 ) -> Checked<()> {
-    let cache = crate::cache_home(control).join("kio/open");
+    let cache = crate::settings::cache_home(control).join("kio/open");
     match fs::symlink_metadata(&cache) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(Blocker::unsafe_state(error)),

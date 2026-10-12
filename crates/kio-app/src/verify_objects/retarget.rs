@@ -1,5 +1,7 @@
 use super::*;
 use crate::commands::EvidenceRetargetArgs;
+use crate::scope_access::is_store_not_found;
+use crate::scope_access::unresolvable_commit_pointer_error;
 use kio_index::fts::RetargetCandidates;
 
 const MAX_RETARGET_VERIFIED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -100,7 +102,7 @@ fn retarget_old_verification_error(
 /// bounded possible chunks; every authority used below comes from the target
 /// tree, manifest/unit CAS, and chunk CAS.
 pub(super) fn run_evidence_retarget(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     args: EvidenceRetargetArgs,
 ) -> Result<Value> {
@@ -134,7 +136,7 @@ pub(super) fn run_evidence_retarget(
 }
 
 fn run_evidence_retarget_bound(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     at: &str,

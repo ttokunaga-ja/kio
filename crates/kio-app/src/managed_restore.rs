@@ -13,11 +13,11 @@ use crate::management::open_existing_managed_root;
 use crate::{
     binding_for_repo, current_embedding_policy, mark_replica_rebuilding_or_log,
     mark_replica_unavailable_or_log, pipeline_to_kio, rebuild_step3_index,
-    recover_index_generation, set_exit_override, validate_repo_tool_lock,
+    recover_index_generation, set_exit_override, settings::validate_repo_tool_lock,
     write_through_projection_full,
 };
 
-pub(super) fn run(ctx: &crate::Invocation<'_>, args: RestoreArgs) -> Result<Value> {
+pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: RestoreArgs) -> Result<Value> {
     // This is intentionally the strict, bound managed-root open.  In
     // particular, restore never invokes the recovery opener, so --preview has
     // no publication, index, ledger, or working-tree side effect.
@@ -107,7 +107,7 @@ pub(super) fn run(ctx: &crate::Invocation<'_>, args: RestoreArgs) -> Result<Valu
 /// `repair recover-restore` is intentionally distinct from ordinary
 /// publication recovery.  A pending restore journal governs working bytes and
 /// must be resolved by core before any generic publication-recovery pathway.
-pub(super) fn recover(ctx: &crate::Invocation<'_>) -> Result<Value> {
+pub(super) fn recover(ctx: &crate::invocation::Invocation<'_>) -> Result<Value> {
     let repo = Repository::open_recovery_in_session(ctx.cwd(), ctx.control.clone(), ctx.locks)?;
     validate_repo_tool_lock(&repo)?;
     // Recovery has to be possible when the policy that permitted the original
@@ -150,7 +150,7 @@ pub(super) fn recover(ctx: &crate::Invocation<'_>) -> Result<Value> {
 /// immutable CAS plus the restored HEAD; it neither polls nor submits work and
 /// does not call the online-capable repair entrypoint.
 fn rebuild_projection(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     repo: &Repository,
     policy: Option<(
         &kio_pipeline::policy::CurrentPolicyEvaluator,

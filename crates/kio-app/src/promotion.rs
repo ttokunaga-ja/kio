@@ -4,6 +4,10 @@
 //! strictly after a task reached `Done`: it re-opens the typed normalized-instance
 //! reference and verifies that the manifest and every unit form one complete,
 //! immutable identity before the CLI is allowed to bind that identity into HEAD.
+use crate::scope_access::ensure_raw_ingest_allowed;
+use crate::scope_access::is_store_not_found;
+use crate::settings::bbox_annotation_enabled;
+use crate::settings::effective_max_input_bytes;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_core::control::ControlHandle;
 use std::sync::Arc;
@@ -537,7 +541,7 @@ pub(super) fn apply_online_promotion_to_index(
 /// by a batch pass. The repository primitive changes only matching HEAD bindings;
 /// unrelated deferred working-tree edits are never captured.
 pub(super) fn promote_completed_online_markdownize(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     repo: &Repository,
 ) -> kio_core::Result<bool> {
     let adapter_settings = ctx.settings;
@@ -644,7 +648,7 @@ pub(super) fn recover_pending_online_promotion(repo: &Repository) -> kio_core::R
 }
 
 pub(super) fn finish_pending_online_promotion(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     repo: &Repository,
 ) -> kio_core::Result<()> {
     rebuild_step3_index(ctx, repo)?;

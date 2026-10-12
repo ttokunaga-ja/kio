@@ -225,7 +225,8 @@ pub fn prune_orphans_plan(repo: &Repository) -> Result<PruneOrphansPlan> {
                     .map(RemovalPin::Directory)
                 }
                 TargetKey::Cache(path) => {
-                    let cache_root_path = crate::cache_home(repo.control()).join("kio/open");
+                    let cache_root_path =
+                        crate::settings::cache_home(repo.control()).join("kio/open");
                     let cache_root = StoreDirectory::open_with_control(
                         &cache_root_path,
                         repo.control().clone(),

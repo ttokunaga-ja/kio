@@ -96,7 +96,7 @@ fn nested_execute_keeps_outer_repository_and_interaction() {
     let settings = Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
     let invocation_control =
         kio_core::control::ControlHandle::new(kio_core::test_control::DebugTestControl::from_env());
-    let invocation = crate::Invocation {
+    let invocation = crate::invocation::Invocation {
         context: &control,
         settings: &settings,
         control: &invocation_control,

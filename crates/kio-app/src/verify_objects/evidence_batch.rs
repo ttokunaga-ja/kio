@@ -14,7 +14,7 @@ use super::{
 };
 
 pub(super) fn run_evidence_batch(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     path: &Path,
     strict: bool,

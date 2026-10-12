@@ -22,7 +22,7 @@ use kio_core::{ExitCode, KioError, Result};
 use serde_json::{Value, json};
 use sha2::Digest;
 
-use super::{ReadBarrierCheckpoint, ScopeTarget};
+use super::{ScopeTarget, scope_access::ReadBarrierCheckpoint};
 use crate::commands::ExportArgs;
 use crate::platform::{
     DestinationIdentity, configure_cap_no_follow, configure_export_temp,
@@ -75,7 +75,7 @@ struct DestinationDir {
     handle: File,
 }
 
-pub(super) fn run(ctx: &crate::Invocation<'_>, args: ExportArgs) -> Result<Value> {
+pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: ExportArgs) -> Result<Value> {
     if args.yes && !args.force {
         return Err(KioError::invalid_usage(
             "export --yes is valid only together with --force",
@@ -142,7 +142,7 @@ pub(super) fn run(ctx: &crate::Invocation<'_>, args: ExportArgs) -> Result<Value
     publish_all(ctx, &source, &destination_dir, staged, &checkpoint)
 }
 
-fn resolve_source(ctx: &crate::Invocation<'_>, operand: &str) -> Result<ExportSource> {
+fn resolve_source(ctx: &crate::invocation::Invocation<'_>, operand: &str) -> Result<ExportSource> {
     if operand == "-" || operand.starts_with("kio://") {
         return resolve_evidence_source(ctx, operand);
     }
@@ -152,7 +152,10 @@ fn resolve_source(ctx: &crate::Invocation<'_>, operand: &str) -> Result<ExportSo
     resolve_local_source(ctx, operand)
 }
 
-fn resolve_evidence_source(ctx: &crate::Invocation<'_>, operand: &str) -> Result<ExportSource> {
+fn resolve_evidence_source(
+    ctx: &crate::invocation::Invocation<'_>,
+    operand: &str,
+) -> Result<ExportSource> {
     let text = read_pointer_operand(ctx, operand)?;
     let pointer = super::parse_pointer_text(&text)?;
     let target = super::resolve_scope_target(
@@ -258,7 +261,7 @@ fn resolve_evidence_source(ctx: &crate::Invocation<'_>, operand: &str) -> Result
     })
 }
 
-fn read_pointer_operand(ctx: &crate::Invocation<'_>, operand: &str) -> Result<String> {
+fn read_pointer_operand(ctx: &crate::invocation::Invocation<'_>, operand: &str) -> Result<String> {
     if operand != "-" {
         if operand.len() as u64 > MAX_POINTER_INPUT_BYTES {
             return Err(KioError::invalid_usage(
@@ -276,7 +279,10 @@ fn read_pointer_operand(ctx: &crate::Invocation<'_>, operand: &str) -> Result<St
         .map_err(|_| KioError::invalid_usage("evidence pointer input must be UTF-8"))
 }
 
-fn resolve_local_source(ctx: &crate::Invocation<'_>, operand: &str) -> Result<ExportSource> {
+fn resolve_local_source(
+    ctx: &crate::invocation::Invocation<'_>,
+    operand: &str,
+) -> Result<ExportSource> {
     let repo = ctx.open_recovery_repository()?;
     super::validate_repo_tool_lock(&repo)?;
     let target = super::scope_target(repo.root(), ctx.control)?;
@@ -678,7 +684,7 @@ struct ValidatedDestination {
 }
 
 fn validate_destination(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     input: &Path,
     target: &ScopeTarget,
 ) -> Result<ValidatedDestination> {
@@ -1088,7 +1094,7 @@ pub(crate) fn unsafe_export_error(path: &Path, message: &str) -> KioError {
     )
 }
 
-fn confirm_force(ctx: &crate::Invocation<'_>) -> Result<()> {
+fn confirm_force(ctx: &crate::invocation::Invocation<'_>) -> Result<()> {
     if !ctx.interaction.is_interactive() {
         return Err(confirmation_rejected(
             "export --force requires --yes in non-interactive mode",
@@ -1340,7 +1346,7 @@ fn check_purge_state(
         canonical_final_event(tombstone_tail.as_ref(), receipt_tail.as_ref())?.map(|c| c.event);
     match canonical_event {
         Some(event) if event.kind == EventKind::Purged => {
-            return Err(super::tombstone_error(json!({
+            return Err(crate::scope_access::tombstone_error(json!({
                 "raw_hash": raw_hash,
                 "purged_at": event.at,
                 "purged_reason": event.reason,
@@ -1352,10 +1358,14 @@ fn check_purge_state(
             return Err(super::purge_not_found_error(target, raw_hash));
         }
         Some(event) if event.kind == EventKind::Retired && !raw_present => {
-            return Err(super::retired_raw_missing_error(target, raw_hash));
+            return Err(crate::scope_access::retired_raw_missing_error(
+                target, raw_hash,
+            ));
         }
         None if !raw_present => {
-            return Err(super::unmarked_missing_raw_error(target, raw_hash));
+            return Err(crate::scope_access::unmarked_missing_raw_error(
+                target, raw_hash,
+            ));
         }
         _ => {}
     }
@@ -1507,7 +1517,7 @@ fn create_private_temp(destination: &DestinationDir) -> Result<(OsString, File)>
 }
 
 fn publish_all(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     source: &ExportSource,
     destination: &DestinationDir,
     staged: Vec<StagedFile>,
@@ -1647,7 +1657,7 @@ fn publish_all(
 type PublishSuccess = Option<String>;
 
 fn publish_one(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     destination: &DestinationDir,
     file: &StagedFile,
 ) -> std::result::Result<PublishSuccess, (KioError, bool)> {
@@ -1769,7 +1779,7 @@ fn publish_one(
 /// (best-effort) and reported as a fresh conflict instead of the original
 /// recheck failure.
 fn rollback_published_file(
-    ctx: &crate::Invocation<'_>,
+    ctx: &crate::invocation::Invocation<'_>,
     destination: &DestinationDir,
     preflight: &PreflightFile,
     backup: Option<&str>,
