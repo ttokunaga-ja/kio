@@ -9,3 +9,45 @@ __pycache__/
 # 運用シークレット (雛形は .env.example — 実値ファイルは絶対にコミットしない)
 .env
 .env.local
+
+# OS and editor temporary files
+Thumbs.db
+desktop.ini
+.AppleDouble/
+._*
+~$*
+*.swp
+*.swo
+
+# Local environment and credential files; keep templates
+/.env.*
+!/.env.example
+!/.env.sample
+!/.env.template
+/gha-creds-*.json
+/application_default_credentials.json
+/.netrc
+/.git-credentials
+
+# Local agent state; shared commands and settings stay tracked
+/.claude/settings.local.json
+/.claude/worktrees/
+/.claude/.cc-writes/
+
+# Python environments and caches
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local Claude runtime state previously protected only by info/exclude
+/.claude/scheduled_tasks.lock
+/.claude/scheduled_tasks.json
+/.claude/routines/.state/
+/.claude/checkpoints/
+/.claude/mailbox/
+/.claude/agent-registry.json
+/.claude/agent-memory-local
+/.claude/first-run
+/.claude/assistant-daemon-state.json
