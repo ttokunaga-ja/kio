@@ -12,6 +12,19 @@ use crate::ledger_access::ledger_db_path;
 use crate::multi_scope;
 use crate::object_persistence::pipeline_to_kio;
 use crate::object_persistence::search_to_kio;
+use crate::response::CommandResponse;
+use crate::response::Completion;
+use crate::response::ResponseBody;
+use crate::response::project_legacy;
+use crate::response::search::AggregatorResponse;
+use crate::response::search::ChunkSearchHit;
+use crate::response::search::ExcludedScopeResponse;
+use crate::response::search::ImageSearchHit;
+use crate::response::search::PagingResponse;
+use crate::response::search::SearchGcRecoveryPending;
+use crate::response::search::SearchHit;
+use crate::response::search::SearchResponse;
+use crate::response::search::SearchedScopeResponse;
 use crate::scope_access::ReadBarrierCheckpoint;
 use crate::scope_access::enumerate_scope_targets;
 use crate::scope_access::gc_marker_active_for_scopes;
@@ -37,7 +50,6 @@ use crate::search::query::read_instance_figures;
 use crate::search::query::replay_query_vector;
 use crate::search::query::resolve_cursor_exec_scopes;
 use crate::search::query::scope_selection_from_cursor;
-use crate::search::query::search_mode_json;
 use crate::search::query::selector_for_search;
 use crate::search::query::selector_from_cursor;
 use crate::search::query::significant_related_images;
@@ -269,16 +281,18 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
                     registry_duplicate_groups(ctx.control)?
                         .unwrap_or_default()
                         .into_iter()
-                        .map(|(scope_id, candidates)| {
-                            json!({
-                                "scope_id": scope_id,
-                                "scope_path": Value::Null,
-                                "reason": "registry_duplicate",
-                                "candidates": candidates
+                        .map(|(scope_id, candidates)| ExcludedScopeResponse {
+                            scope_id,
+                            scope_path: None,
+                            reason: "registry_duplicate".to_owned(),
+                            candidates: Some(
+                                candidates
                                     .iter()
                                     .map(|path| path.display().to_string())
                                     .collect::<Vec<_>>(),
-                            })
+                            ),
+                            recovery: None,
+                            error_code: None,
                         })
                         .collect::<Vec<_>>()
                 } else {
@@ -327,15 +341,14 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
                 if reason == "unreachable" {
                     retainable_all_scopes.remove(&exec.target.scope_id);
                 }
-                let mut entry = json!({
-                    "scope_id": exec.target.scope_id,
-                    "scope_path": exec.target.kio_dir,
-                    "reason": reason,
-                    "error_code": error.error_code(),
-                });
-                if let Some(hint) = store_corruption_recovery_hint(reason) {
-                    entry["recovery"] = json!(hint);
-                }
+                let entry = ExcludedScopeResponse {
+                    scope_id: exec.target.scope_id.clone(),
+                    scope_path: Some(exec.target.kio_dir.clone()),
+                    reason: reason.to_owned(),
+                    candidates: None,
+                    recovery: store_corruption_recovery_hint(reason).map(str::to_owned),
+                    error_code: Some(error.error_code().to_owned()),
+                };
                 cursor_excluded.push(entry);
                 continue;
             }
@@ -348,11 +361,14 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
                 ));
             }
             policy_denied_scope_ids.insert(exec.target.scope_id.clone());
-            cursor_excluded.push(json!({
-                "scope_id": exec.target.scope_id,
-                "scope_path": exec.target.kio_dir,
-                "reason": "policy_denied",
-            }));
+            cursor_excluded.push(ExcludedScopeResponse {
+                scope_id: exec.target.scope_id.clone(),
+                scope_path: Some(exec.target.kio_dir.clone()),
+                reason: "policy_denied".to_owned(),
+                candidates: None,
+                recovery: None,
+                error_code: None,
+            });
             continue;
         }
         search_repositories.insert(exec.target.scope_id.clone(), repo);
@@ -365,9 +381,9 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
     // "embedding endpoint unavailable" failure for an explicit vector query.
     if exec_scopes.is_empty() {
         if !cursor_excluded.is_empty()
-            && cursor_excluded.iter().all(|entry| {
-                entry.get("reason").and_then(Value::as_str) == Some("registry_duplicate")
-            })
+            && cursor_excluded
+                .iter()
+                .all(|entry| entry.reason == "registry_duplicate")
         {
             return Err(KioError::new(
                 "KIO-E-REGISTRY-DUP-001",
@@ -880,17 +896,17 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
                 // only to the all-scopes-failed aggregate below), so a PARTIAL exclusion
                 // (some scopes healthy → `searched` non-empty → the aggregate block is
                 // skipped) is still agent-detectable.
-                let mut entry = json!({
-                    "scope_id": exec.target.scope_id,
+                let entry = ExcludedScopeResponse {
+                    scope_id: exec.target.scope_id.clone(),
                     // R23-20 (03 §4 L296): canonical `.kio` path, matching
                     // `excluded_scopes[].scope_path`'s documented example
                     // value (05 §1.8, "/Volumes/ext/Research/.kio").
-                    "scope_path": exec.target.kio_dir,
-                    "reason": reason,
-                });
-                if let Some(hint) = store_corruption_recovery_hint(&reason) {
-                    entry["recovery"] = json!(hint);
-                }
+                    scope_path: Some(exec.target.kio_dir.clone()),
+                    reason: reason.clone(),
+                    candidates: None,
+                    recovery: store_corruption_recovery_hint(&reason).map(str::to_owned),
+                    error_code: None,
+                };
                 excluded.push(entry);
             }
             Err(ScopeSearchError::Fatal(error)) => {
@@ -908,15 +924,16 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
                 // Fatal must stay fail-fast, so only the explicit store class is caught.
                 if is_store_corrupt_class(&error) {
                     // R18-4: same per-entry recovery hint as the Excluded arm above.
-                    let mut entry = json!({
-                        "scope_id": exec.target.scope_id,
+                    let entry = ExcludedScopeResponse {
+                        scope_id: exec.target.scope_id.clone(),
                         // R23-20 (03 §4 L296): canonical `.kio` path.
-                        "scope_path": exec.target.kio_dir,
-                        "reason": "store_corrupt",
-                    });
-                    if let Some(hint) = store_corruption_recovery_hint("store_corrupt") {
-                        entry["recovery"] = json!(hint);
-                    }
+                        scope_path: Some(exec.target.kio_dir.clone()),
+                        reason: "store_corrupt".to_owned(),
+                        candidates: None,
+                        recovery: store_corruption_recovery_hint("store_corrupt")
+                            .map(str::to_owned),
+                        error_code: None,
+                    };
                     excluded.push(entry);
                 } else {
                     return Err(error);
@@ -948,14 +965,14 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
                 if decoded_cursor.is_some() {
                     return Err(policy_cursor_mismatch(&scope.scope_id, "store_corrupt"));
                 }
-                let mut entry = json!({
-                    "scope_id": scope.scope_id.clone(),
-                    "scope_path": scope.scope_path.clone(),
-                    "reason": "store_corrupt",
-                });
-                if let Some(hint) = store_corruption_recovery_hint("store_corrupt") {
-                    entry["recovery"] = json!(hint);
-                }
+                let entry = ExcludedScopeResponse {
+                    scope_id: scope.scope_id.clone(),
+                    scope_path: Some(scope.scope_path.clone()),
+                    reason: "store_corrupt".to_owned(),
+                    candidates: None,
+                    recovery: store_corruption_recovery_hint("store_corrupt").map(str::to_owned),
+                    error_code: None,
+                };
                 excluded.push(entry);
                 image_authority_exclusions.insert(scope.scope_id.clone());
             }
@@ -978,8 +995,8 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
         let all_vec_incompatible = !excluded.is_empty()
             && excluded.iter().all(|entry| {
                 matches!(
-                    entry.get("reason").and_then(Value::as_str),
-                    Some(VEC_PROFILE_INCOMPATIBLE_REASON) | Some(VEC_PROFILE_ABSENT_REASON)
+                    entry.reason.as_str(),
+                    VEC_PROFILE_INCOMPATIBLE_REASON | VEC_PROFILE_ABSENT_REASON
                 )
             });
         if all_vec_incompatible {
@@ -999,9 +1016,9 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
         // checked first per 10-operations.md §3's priority order ((1) purge
         // journal/epoch precedes (3) index availability).
         let all_purge_journal_active = !excluded.is_empty()
-            && excluded.iter().all(|entry| {
-                entry.get("reason").and_then(Value::as_str) == Some(PURGE_JOURNAL_ACTIVE_REASON)
-            });
+            && excluded
+                .iter()
+                .all(|entry| entry.reason == PURGE_JOURNAL_ACTIVE_REASON);
         if all_purge_journal_active {
             return Err(KioError::new(
                 "KIO-E-PURGE-JOURNAL-ACTIVE-001",
@@ -1019,9 +1036,9 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
         // priority (journal → DUP → REBUILDING). The command-wide exact-format
         // gate has already stopped any version mismatch before this aggregate.
         let all_registry_duplicate = !excluded.is_empty()
-            && excluded.iter().all(|entry| {
-                entry.get("reason").and_then(Value::as_str) == Some("registry_duplicate")
-            });
+            && excluded
+                .iter()
+                .all(|entry| entry.reason == "registry_duplicate");
         if all_registry_duplicate {
             return Err(KioError::new(
                 "KIO-E-REGISTRY-DUP-001",
@@ -1050,8 +1067,8 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
         let all_rebuilding = !excluded.is_empty()
             && excluded.iter().all(|entry| {
                 matches!(
-                    entry.get("reason").and_then(Value::as_str),
-                    Some(INDEX_REBUILDING_REASON) | Some("index_missing") | Some("index_corrupt")
+                    entry.reason.as_str(),
+                    INDEX_REBUILDING_REASON | "index_missing" | "index_corrupt"
                 )
             });
         if all_rebuilding {
@@ -1078,9 +1095,9 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
         // since this reason is not retryable — re-running the identical
         // query cannot shrink the walk — but the CODE must survive).
         let all_history_limit_exceeded = !excluded.is_empty()
-            && excluded.iter().all(|entry| {
-                entry.get("reason").and_then(Value::as_str) == Some("history_limit_exceeded")
-            });
+            && excluded
+                .iter()
+                .all(|entry| entry.reason == "history_limit_exceeded");
         if all_history_limit_exceeded {
             return Err(KioError::new(
                 "KIO-E-COMMIT-HISTORY-LIMIT-001",
@@ -1105,18 +1122,11 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
         // when that source state cannot be read (manual intervention required); the
         // `recovery` context is what makes the path agent-detectable.
         let store_corruption = !excluded.is_empty()
-            && excluded.iter().all(|entry| {
-                matches!(
-                    entry.get("reason").and_then(Value::as_str),
-                    Some("store_corrupt") | Some("snapshot_shallow")
-                )
-            });
+            && excluded
+                .iter()
+                .all(|entry| matches!(entry.reason.as_str(), "store_corrupt" | "snapshot_shallow"));
         if store_corruption {
-            let reason_is = |want: &str| {
-                excluded
-                    .iter()
-                    .any(|entry| entry.get("reason").and_then(Value::as_str) == Some(want))
-            };
+            let reason_is = |want: &str| excluded.iter().any(|entry| entry.reason == want);
             // R18-4: the same hints the per-entry attachment uses, aggregated here for
             // the all-scopes-failed response (identical strings via the shared helper).
             let mut recovery = Vec::<&str>::new();
@@ -1144,12 +1154,7 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
         // stays SCOPE-ALL-FAILED-001 (docs frozen — no new code) and exit 4 (a store_corrupt
         // member needs manual object restore, so not the exit-1 VEC-UNAVAIL rebuild path).
         let all_recoverable = !excluded.is_empty()
-            && excluded.iter().all(|e| {
-                matches!(
-                    e.get("reason").and_then(Value::as_str),
-                    Some(reason) if store_corruption_recovery_hint(reason).is_some()
-                )
-            })
+            && excluded.iter().all(|e| store_corruption_recovery_hint(&e.reason).is_some())
             // R23-14(b): `store_corruption_recovery_hint` also answers for
             // `index_missing`/`index_corrupt`, which (unlike `store_corrupt`/
             // `snapshot_shallow`) are now retryable (folded into
@@ -1158,11 +1163,7 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
             // block's flat exit 4 — defer to the PC57 split below, which
             // promotes such a mix to the retryable exit 3 per 05 §1.8's
             // "retryable 理由を含めば exit 3" rule.
-            && !excluded.iter().any(|e| {
-                e.get("reason")
-                    .and_then(Value::as_str)
-                    .is_some_and(is_retryable_scope_reason)
-            });
+            && !excluded.iter().any(|e| is_retryable_scope_reason(&e.reason));
         if all_recoverable {
             let recovery = aggregate_store_recovery_hints(&excluded);
             return Err(KioError::new(
@@ -1182,12 +1183,9 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
         // one retryable reason anywhere in the set is enough to promise a
         // retry MIGHT make progress (exit 3); an all-permanent mix cannot
         // (exit 4).
-        let any_retryable = excluded.iter().any(|entry| {
-            entry
-                .get("reason")
-                .and_then(Value::as_str)
-                .is_some_and(is_retryable_scope_reason)
-        });
+        let any_retryable = excluded
+            .iter()
+            .any(|entry| is_retryable_scope_reason(&entry.reason));
         let exit = if any_retryable {
             ExitCode::PartialFailure
         } else {
@@ -1338,11 +1336,14 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
                 ));
             }
             blocked_candidate_scopes.insert(scope_index);
-            excluded.push(json!({
-                "scope_id": exec.target.scope_id,
-                "scope_path": exec.target.kio_dir,
-                "reason": "purge_journal_active",
-            }));
+            excluded.push(ExcludedScopeResponse {
+                scope_id: exec.target.scope_id.clone(),
+                scope_path: Some(exec.target.kio_dir.clone()),
+                reason: "purge_journal_active".to_owned(),
+                candidates: None,
+                recovery: None,
+                error_code: None,
+            });
             continue;
         }
         match ReadBarrierCheckpoint::open(&exec.target.kio_dir, ctx.control) {
@@ -1365,11 +1366,14 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
                     ));
                 }
                 blocked_candidate_scopes.insert(scope_index);
-                excluded.push(json!({
-                    "scope_id": exec.target.scope_id,
-                    "scope_path": exec.target.kio_dir,
-                    "reason": "purge_journal_active",
-                }));
+                excluded.push(ExcludedScopeResponse {
+                    scope_id: exec.target.scope_id.clone(),
+                    scope_path: Some(exec.target.kio_dir.clone()),
+                    reason: "purge_journal_active".to_owned(),
+                    candidates: None,
+                    recovery: None,
+                    error_code: None,
+                });
             }
             Err(error) => return Err(error),
         }
@@ -1494,11 +1498,14 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
         }
         late_failed.insert(*scope_index);
         searched_drop.push(*searched_pos);
-        excluded.push(json!({
-            "scope_id": exec.target.scope_id,
-            "scope_path": exec.target.kio_dir,
-            "reason": "purge_journal_active",
-        }));
+        excluded.push(ExcludedScopeResponse {
+            scope_id: exec.target.scope_id.clone(),
+            scope_path: Some(exec.target.kio_dir.clone()),
+            reason: "purge_journal_active".to_owned(),
+            candidates: None,
+            recovery: None,
+            error_code: None,
+        });
     }
     if !late_failed.is_empty() {
         expanded.retain(|hit| !late_failed.contains(&hit.candidate.scope_index));
@@ -1541,11 +1548,9 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
     // CT3-CURSOR-006). Preserves the frozen scope set even at 0 consumed.
     let mut signed_exclusions = excluded
         .iter()
-        .filter_map(|entry| {
-            Some(CursorExcludedScope {
-                scope_id: entry.get("scope_id")?.as_str()?.to_owned(),
-                reason: entry.get("reason")?.as_str()?.to_owned(),
-            })
+        .map(|entry| CursorExcludedScope {
+            scope_id: entry.scope_id.clone(),
+            reason: entry.reason.clone(),
         })
         .collect::<Vec<_>>();
     signed_exclusions.sort_by(|a, b| a.scope_id.cmp(&b.scope_id));
@@ -1654,38 +1659,59 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
         // 05 §1.7: every row declares what it points at, and `evidence_pointer`
         // is a CHUNK's either way — an object URI carries no commit, tree or
         // path, so it satisfies neither time-travel nor `evidence verify`.
-        let mut result = json!({
-            "result_type": candidate.payload.result_type(),
-            "chunk_hash": candidate.chunk_hash,
-            "evidence_pointer": pointer,
-            "evidence_uri": uri,
-            "score": candidate.rrf_score,
-            "scope_path": candidate.scope_path,
-            "title": binding.path_at_commit,
-        });
-        match &candidate.payload {
+        let mut result = match &candidate.payload {
             ResultPayload::Chunk => {
                 // The payload IS this chunk, so `evidence_uri` already points at
                 // it and 05 §1.7 omits `payload_uri` here.
-                result["snippet"] =
-                    json!(candidate.meta.text.chars().take(200).collect::<String>());
+                SearchHit::Chunk(ChunkSearchHit {
+                    result_type: candidate.payload.result_type().to_owned(),
+                    chunk_hash: candidate.chunk_hash.clone(),
+                    evidence_pointer: pointer,
+                    evidence_uri: uri,
+                    score: candidate.rrf_score,
+                    scope_path: candidate.scope_path.clone(),
+                    title: binding.path_at_commit.clone(),
+                    snippet: candidate.meta.text.chars().take(200).collect(),
+                    related_images: Vec::new(),
+                    current_paths: None,
+                    current_path: None,
+                })
             }
             ResultPayload::Image { image_uri, .. } => {
                 // What the Agent opens to get the bytes. Never base64 — 05 §1.7
                 // is explicit that the response passes URIs, since inlining
                 // images would hit the Agent's context and cost directly and
                 // contradict a contract that otherwise returns pointers.
-                result["payload_uri"] = json!(image_uri);
                 // No `snippet`: its documented meaning is the start of THIS
                 // row's chunk body, and this row is not a chunk. The citing
                 // text is reachable through the chunk row that carries the same
                 // pointer, where it means what it says.
+                SearchHit::Image(ImageSearchHit {
+                    result_type: candidate.payload.result_type().to_owned(),
+                    chunk_hash: candidate.chunk_hash.clone(),
+                    evidence_pointer: pointer,
+                    evidence_uri: uri,
+                    score: candidate.rrf_score,
+                    scope_path: candidate.scope_path.clone(),
+                    title: binding.path_at_commit.clone(),
+                    payload_uri: image_uri.clone(),
+                    current_paths: None,
+                    current_path: None,
+                })
             }
-        }
+        };
         if time_selector.all_history() && !binding.current_paths.is_empty() {
-            result["current_paths"] = json!(binding.current_paths);
-            if let Some(current_path) = binding.current_path() {
-                result["current_path"] = json!(current_path);
+            let current_paths = Some(binding.current_paths.clone());
+            let current_path = binding.current_path().map(str::to_owned);
+            match &mut result {
+                SearchHit::Chunk(hit) => {
+                    hit.current_paths = current_paths;
+                    hit.current_path = current_path;
+                }
+                SearchHit::Image(hit) => {
+                    hit.current_paths = current_paths;
+                    hit.current_path = current_path;
+                }
             }
         }
         // 05 §1.7: the images this chunk body references, so a multimodal Agent
@@ -1730,8 +1756,10 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
                     );
                 }
             }
-            if !related_images.is_empty() {
-                result["related_images"] = json!(related_images);
+            if !related_images.is_empty()
+                && let SearchHit::Chunk(hit) = &mut result
+            {
+                hit.related_images = related_images;
             }
         }
         results.push(result);
@@ -1740,19 +1768,16 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
     let searched_scopes = searched
         .iter()
         .map(|scope| {
-            let mut entry = json!({
-                "scope_id": scope.scope_id,
-                "scope_path": scope.scope_path,
-                "snapshot_at": scope.snapshot_at,
-            });
             // PC46 / §R note-3 ruling (2026-07-22): a per-scope field, count
             // omitted when zero — not a top-level aggregate, not folded into
             // excluded_scopes (the scope is not excluded, only partially
             // degraded).
-            if scope.shallow_skipped > 0 {
-                entry["shallow_skipped"] = json!(scope.shallow_skipped);
+            SearchedScopeResponse {
+                scope_id: scope.scope_id.clone(),
+                scope_path: scope.scope_path.clone(),
+                snapshot_at: scope.snapshot_at.clone(),
+                shallow_skipped: scope.shallow_skipped,
             }
-            entry
         })
         .collect::<Vec<_>>();
     let index_status = compute_index_status(
@@ -1770,42 +1795,46 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
     let any_shallow_skipped = searched.iter().any(|scope| scope.shallow_skipped > 0);
     let partial_failure = !excluded.is_empty() || any_shallow_skipped;
 
-    let mut response = json!({
-        "query": parsed.query,
-        "requested_mode": search_mode_json(mode.requested),
-        "resolved_mode": search_mode_json(mode.resolved),
-        "fallback": mode.fallback,
-        "fallback_reason": mode.fallback_reason.clone().map(Value::from).unwrap_or(Value::Null),
-        "error_code": mode.error_code.clone().map(Value::from).unwrap_or(Value::Null),
+    let mut response = SearchResponse {
+        query: parsed.query,
+        requested_mode: mode.requested,
+        resolved_mode: mode.resolved,
+        fallback: mode.fallback,
+        fallback_reason: mode.fallback_reason,
+        error_code: mode.error_code,
         // PC3 / §R note-1 ruling: `warnings[]` array (replaces the retired
         // singular `warning` field) — non-empty only under
         // [search].fail_behavior = "warn" text fallback.
-        "warnings": mode.warnings.clone(),
-        "diversify": diversify_summary,
-        "aggregator": {
-            "collection_generation": global_ranks.collection_generation,
+        warnings: mode.warnings,
+        diversify: diversify_summary,
+        aggregator: AggregatorResponse {
+            collection_generation: global_ranks.collection_generation,
         },
-        "paging": { "limit": parsed.limit, "next_cursor": next_cursor },
-        "searched_scopes": searched_scopes,
-        "excluded_scopes": excluded,
-        "index_status": index_status,
-        "results": results,
-    });
+        paging: PagingResponse {
+            limit: parsed.limit,
+            next_cursor,
+        },
+        searched_scopes,
+        excluded_scopes: excluded,
+        index_status,
+        results,
+        gc_recovery_pending: None,
+    };
     if gc_recovery_pending {
-        response["gc_recovery_pending"] = json!({
-            "reason": "gc_sweep_active",
-            "next_cursor_suppressed": true,
+        response.gc_recovery_pending = Some(SearchGcRecoveryPending {
+            reason: "gc_sweep_active".to_owned(),
+            next_cursor_suppressed: true,
         });
     }
     append_search_logs(ctx, &repo, &response, started);
-    if partial_failure {
+    let completion = if partial_failure {
         // Some scopes were excluded, or a searched scope skipped shallow
         // ancestors, but others succeeded: emit results on stdout and exit 3
         // (05 §1.8 partial-failure row, CT3-MULTI-005; PC45/PC46).
-        if let Some(object) = response.as_object_mut() {
-            object.insert("__exit_code".to_owned(), json!(3));
-        }
-    }
+        Completion::Partial
+    } else {
+        Completion::Complete
+    };
 
     // The earlier candidate-time recheck preserves per-scope isolation before
     // pagination.  Response assembly can still take long enough for a purge
@@ -1831,11 +1860,14 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
                 ExitCode::InvalidUsage,
             ));
         }
-        response["paging"]["next_cursor"] = Value::Null;
-        response["gc_recovery_pending"] = json!({
-            "reason": "gc_sweep_active",
-            "next_cursor_suppressed": true,
+        response.paging.next_cursor = None;
+        response.gc_recovery_pending = Some(SearchGcRecoveryPending {
+            reason: "gc_sweep_active".to_owned(),
+            next_cursor_suppressed: true,
         });
     }
-    Ok(response)
+    project_legacy(CommandResponse {
+        body: ResponseBody::Search(response),
+        completion,
+    })
 }

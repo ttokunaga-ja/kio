@@ -1815,7 +1815,7 @@ fn search_index_status_uses_preflight_month() {
             )
             .unwrap();
             assert_eq!(
-                status["budget_paused"], paused,
+                status.budget_paused, paused,
                 "device_only={device_only} month={month}"
             );
         }
@@ -1941,30 +1941,21 @@ fn r23_aggregate_index_status_fails_closed_for_corrupt_scope_state() {
         &kio_core::scope::LockSession::default(),
     )
     .unwrap();
-    assert_eq!(status["tasks_complete"], false);
-    assert_eq!(status["unsupported_inputs_complete"], false);
-    assert_eq!(status["task_errors"].as_array().unwrap().len(), 2);
-    assert_eq!(
-        status["unsupported_input_errors"].as_array().unwrap().len(),
-        2
-    );
-    for field in ["task_errors", "unsupported_input_errors"] {
-        assert!(status[field].as_array().unwrap().iter().any(|error| {
-            error["scope_path"]
-                .as_str()
-                .is_some_and(|path| std::path::Path::new(path) == vanished_root.path().join(".kio"))
-        }));
+    assert!(!status.tasks_complete);
+    assert!(!status.unsupported_inputs_complete);
+    assert_eq!(status.task_errors.len(), 2);
+    assert_eq!(status.unsupported_input_errors.len(), 2);
+    for errors in [&status.task_errors, &status.unsupported_input_errors] {
+        assert!(
+            errors
+                .iter()
+                .any(|error| { error.scope_path == vanished_root.path().join(".kio") })
+        );
     }
+    assert!(status.task_errors[0].error_code.contains("STORE-CORRUPT"));
     assert!(
-        status["task_errors"][0]["error_code"]
-            .as_str()
-            .unwrap()
-            .contains("STORE-CORRUPT")
-    );
-    assert!(
-        status["unsupported_input_errors"][0]["error_code"]
-            .as_str()
-            .unwrap()
+        status.unsupported_input_errors[0]
+            .error_code
             .contains("STORE-CORRUPT")
     );
 }

@@ -47,6 +47,10 @@ use crate::object_persistence::pipeline_to_kio;
 use crate::promotion::apply_online_promotion_to_index;
 use crate::promotion::finish_pending_online_promotion;
 use crate::promotion::recover_pending_online_promotion;
+use crate::response::search::FileDispositionResponse;
+use crate::response::search::IndexStatusError;
+use crate::response::search::IndexStatusResponse;
+use crate::response::search::OfficeConversionUnavailableResponse;
 use crate::scope_access::ensure_raw_ingest_allowed;
 use crate::scope_access::register_scope;
 use crate::scope_access::resolve_evidence_scope_target;
@@ -972,7 +976,7 @@ pub(crate) fn compute_index_status(
     budget_month: &str,
     control: &ControlHandle,
     locks: &kio_core::scope::LockSession,
-) -> Result<Value> {
+) -> Result<IndexStatusResponse> {
     let mut total = 0u64;
     let mut done = 0u64;
     let mut pending = 0u64;
@@ -1002,11 +1006,11 @@ pub(crate) fn compute_index_status(
             Ok(tasks) => tasks,
             Err(error) => {
                 let error = pipeline_to_kio(error);
-                task_errors.push(json!({
-                    "scope_path": scope.scope_path,
-                    "error_code": error.error_code(),
-                    "message": error.message(),
-                }));
+                task_errors.push(IndexStatusError {
+                    scope_path: scope.scope_path.clone(),
+                    error_code: error.error_code().to_owned(),
+                    message: error.message().to_owned(),
+                });
                 Vec::new()
             }
         };
@@ -1088,14 +1092,14 @@ pub(crate) fn compute_index_status(
                         total = total.saturating_add(unsupported.len() as u64);
                         total = total.saturating_add(office_unavailable.len() as u64);
                         unsupported_inputs.extend(unsupported.into_iter().map(|disposition| {
-                            json!({
-                                "scope_path": scope.scope_path,
-                                "path": disposition.path,
-                                "raw_hash": disposition.raw_hash,
-                                "media_type": disposition.media_type,
-                                "size_bytes": disposition.size_bytes,
-                                "reason": disposition.reason,
-                            })
+                            FileDispositionResponse {
+                                scope_path: scope.scope_path.clone(),
+                                path: disposition.path,
+                                raw_hash: disposition.raw_hash,
+                                media_type: disposition.media_type,
+                                size_bytes: disposition.size_bytes,
+                                reason: disposition.reason,
+                            }
                         }));
                         // 07 §5.1: an Office file with no resolvable converter has
                         // NO enrichment task at all (item 1's enqueue gate) -- it
@@ -1107,22 +1111,22 @@ pub(crate) fn compute_index_status(
                         // differ.
                         office_conversion_unavailable_inputs.extend(
                             office_unavailable.into_iter().map(|disposition| {
-                                json!({
-                                    "scope_path": scope.scope_path,
-                                    "path": disposition.path,
-                                    "raw_hash": disposition.raw_hash,
-                                    "media_type": disposition.media_type,
-                                    "size_bytes": disposition.size_bytes,
-                                    "reason": disposition.reason,
-                                })
+                                FileDispositionResponse {
+                                    scope_path: scope.scope_path.clone(),
+                                    path: disposition.path,
+                                    raw_hash: disposition.raw_hash,
+                                    media_type: disposition.media_type,
+                                    size_bytes: disposition.size_bytes,
+                                    reason: disposition.reason,
+                                }
                             }),
                         );
                     }
-                    Err(error) => unsupported_input_errors.push(json!({
-                        "scope_path": scope.scope_path,
-                        "error_code": error.error_code(),
-                        "message": error.message(),
-                    })),
+                    Err(error) => unsupported_input_errors.push(IndexStatusError {
+                        scope_path: scope.scope_path.clone(),
+                        error_code: error.error_code().to_owned(),
+                        message: error.message().to_owned(),
+                    }),
                 }
                 // Preserve the established best-effort treatment of unrelated
                 // per-scope budget-config/identity failures: they must not
@@ -1155,11 +1159,11 @@ pub(crate) fn compute_index_status(
                 }
             }
             Err(error) => {
-                let error = json!({
-                    "scope_path": scope.scope_path,
-                    "error_code": error.error_code(),
-                    "message": error.message(),
-                });
+                let error = IndexStatusError {
+                    scope_path: scope.scope_path.clone(),
+                    error_code: error.error_code().to_owned(),
+                    message: error.message().to_owned(),
+                };
                 task_errors.push(error.clone());
                 unsupported_input_errors.push(error);
             }
@@ -1173,26 +1177,26 @@ pub(crate) fn compute_index_status(
     };
     let unsupported_inputs_complete = unsupported_input_errors.is_empty();
     let tasks_complete = task_errors.is_empty();
-    Ok(json!({
-        "enriched_ratio": enriched_ratio,
-        "pending_enrichment_tasks": pending,
-        "budget_paused": budget_paused,
-        "unsupported_inputs": unsupported_inputs,
-        "unsupported_input_errors": unsupported_input_errors,
-        "unsupported_inputs_complete": unsupported_inputs_complete,
-        "task_errors": task_errors,
-        "tasks_complete": tasks_complete,
+    Ok(IndexStatusResponse {
+        enriched_ratio,
+        pending_enrichment_tasks: pending,
+        budget_paused,
+        unsupported_inputs,
+        unsupported_input_errors,
+        unsupported_inputs_complete,
+        task_errors,
+        tasks_complete,
         // 07 §5.1: Office (DOCX/PPTX) files skipped for online enrichment
         // because no converter (`KIO_OFFICE_CONVERTER` / PATH `soffice`)
         // resolved at `kio index` time -- no doomed task was enqueued for
         // them (item 1's enqueue gate). Disappears once a converter is
         // installed and the file is re-indexed (the disposition transitions
         // to `resolved`, dropping it from this "still live" view).
-        "office_conversion_unavailable": {
-            "count": office_conversion_unavailable_inputs.len(),
-            "files": office_conversion_unavailable_inputs,
+        office_conversion_unavailable: OfficeConversionUnavailableResponse {
+            count: office_conversion_unavailable_inputs.len(),
+            files: office_conversion_unavailable_inputs,
         },
-    }))
+    })
 }
 
 pub(crate) fn current_unsupported_inputs(

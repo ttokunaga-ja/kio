@@ -9,6 +9,9 @@ use crate::object_persistence::index_to_kio;
 use crate::object_persistence::search_to_kio;
 use crate::open_view::harden_open_cache_subtree;
 use crate::open_view::write_open_cache_atomic;
+use crate::response::search::DiversifySummary;
+use crate::response::search::ExcludedScopeResponse;
+use crate::response::search::SearchResponse;
 use crate::scope_access::resolve_scope_id_in_registry;
 use crate::search::scope::ExecScope;
 use crate::search::scope::ParsedSearch;
@@ -451,7 +454,7 @@ pub(crate) fn diversify_merged<'a>(
     candidates: &'a [ScoredCandidate],
     resolved_mode: SearchMode,
     request: &DiversifyRequest,
-) -> Result<(Vec<&'a ScoredCandidate>, Value)> {
+) -> Result<(Vec<&'a ScoredCandidate>, DiversifySummary)> {
     let mmr_candidates = candidates
         .iter()
         .enumerate()
@@ -502,11 +505,18 @@ pub(crate) fn diversify_merged<'a>(
         && request.strategy == DiversifyStrategy::Mmr
         && all_have_embeddings;
     let summary = match request.strategy {
-        DiversifyStrategy::Off => json!({ "strategy": "off" }),
-        DiversifyStrategy::Mmr if mmr_ran => {
-            json!({ "strategy": "mmr", "mmr_lambda": request.mmr_lambda.unwrap_or(0.7) })
-        }
-        _ => json!({ "strategy": "group_by_raw_hash" }),
+        DiversifyStrategy::Off => DiversifySummary {
+            strategy: DiversifyStrategy::Off,
+            mmr_lambda: None,
+        },
+        DiversifyStrategy::Mmr if mmr_ran => DiversifySummary {
+            strategy: DiversifyStrategy::Mmr,
+            mmr_lambda: Some(request.mmr_lambda.unwrap_or(0.7)),
+        },
+        _ => DiversifySummary {
+            strategy: DiversifyStrategy::GroupByRawHash,
+            mmr_lambda: None,
+        },
     };
     Ok((ordered, summary))
 }
@@ -949,17 +959,18 @@ pub(crate) fn cursor_mode_from_selection(mode: ScopeSelectionMode) -> ScopeMode 
 pub(crate) fn resolve_cursor_exec_scopes(
     ctx: &Invocation<'_>,
     cursor: &CursorToken,
-) -> Result<(Vec<ExecScope>, Vec<Value>)> {
+) -> Result<(Vec<ExecScope>, Vec<ExcludedScopeResponse>)> {
     let mut exec = Vec::new();
     let excluded = cursor
         .excluded_scopes
         .iter()
-        .map(|scope| {
-            json!({
-                "scope_id": scope.scope_id,
-                "scope_path": Value::Null,
-                "reason": scope.reason,
-            })
+        .map(|scope| ExcludedScopeResponse {
+            scope_id: scope.scope_id.clone(),
+            scope_path: None,
+            reason: scope.reason.clone(),
+            candidates: None,
+            recovery: None,
+            error_code: None,
         })
         .collect::<Vec<_>>();
     for sub in &cursor.scopes {
@@ -1437,20 +1448,12 @@ pub(crate) fn cursor_query_vector_error() -> KioError {
 pub(crate) fn append_search_logs(
     ctx: &Invocation<'_>,
     repo: &Repository,
-    response: &Value,
+    response: &SearchResponse,
     started: Instant,
 ) {
     let latency_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let scope_count = response
-        .get("searched_scopes")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
-    let result_count = response
-        .get("results")
-        .and_then(Value::as_array)
-        .map(Vec::len)
-        .unwrap_or(0);
+    let scope_count = response.searched_scopes.len();
+    let result_count = response.results.len();
     // Per-search latency record (05 §7, K8a): code KIO-M-SEARCH-001 / component
     // "search" / metric search.latency_ms. redact_logs default omits query & path.
     if let Err(error) = append_jsonl_cli(
@@ -1465,7 +1468,7 @@ pub(crate) fn append_search_logs(
             "metric": "search.latency_ms",
             "value": latency_ms,
             "context": {
-                "mode": response.get("resolved_mode").and_then(Value::as_str).unwrap_or("text"),
+                "mode": search_mode_json(response.resolved_mode),
                 "scope_count": scope_count,
                 "result_count": result_count,
             },
@@ -1485,10 +1488,7 @@ pub(crate) fn append_search_logs(
     let query_field = if access_log_redact(repo) {
         json!("[redacted]")
     } else {
-        response
-            .get("query")
-            .cloned()
-            .unwrap_or_else(|| json!("[redacted]"))
+        json!(response.query)
     };
     if let Err(error) = append_jsonl_cli(
         ctx.locks,
@@ -1501,7 +1501,7 @@ pub(crate) fn append_search_logs(
             "message": "search access",
             "context": {
                 "query": query_field,
-                "mode": response.get("resolved_mode").and_then(Value::as_str).unwrap_or("text"),
+                "mode": search_mode_json(response.resolved_mode),
                 "result_count": result_count,
             },
         }),

@@ -5,6 +5,7 @@ use crate::management::binding_for_repo;
 use crate::management::open_existing_managed_root;
 use crate::multi_scope;
 use crate::object_persistence::pipeline_to_kio;
+use crate::response::search::ExcludedScopeResponse;
 use crate::search_history::SearchHistoryBinding;
 use crate::search_history::plan_search_history;
 use crate::search_time::TimeSelector;
@@ -27,7 +28,6 @@ use kio_pipeline::policy::CurrentPolicyEvaluator;
 use kio_search::query::ScopeSelectionMode;
 use kio_search::query::SearchMode;
 use kio_search::rrf::RrfConfig;
-use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -1125,7 +1125,10 @@ pub(crate) fn is_vector_capacity_message(message: &str) -> bool {
     message.contains("knn query too large") || message.contains("too many SQL variables")
 }
 
-pub(crate) fn scope_all_failed_error(message: &str, excluded: Vec<Value>) -> KioError {
+pub(crate) fn scope_all_failed_error(
+    message: &str,
+    excluded: Vec<ExcludedScopeResponse>,
+) -> KioError {
     KioError::new(
         "KIO-E-SEARCH-SCOPE-ALL-FAILED-001",
         message,
@@ -1202,7 +1205,9 @@ pub(crate) fn store_corruption_recovery_hint(reason: &str) -> Option<&'static st
 /// all-scopes-failed response's top-level `context.recovery` — so the `index_unusable`
 /// exit and a HETEROGENEOUS all-failed mix (which R18-4 left hintless) both surface
 /// guidance, matching the homogeneous store-corruption branch.
-pub(crate) fn aggregate_store_recovery_hints(excluded: &[Value]) -> Vec<&'static str> {
+pub(crate) fn aggregate_store_recovery_hints(
+    excluded: &[ExcludedScopeResponse],
+) -> Vec<&'static str> {
     let mut out: Vec<&'static str> = Vec::new();
     for reason in [
         "store_corrupt",
@@ -1210,9 +1215,7 @@ pub(crate) fn aggregate_store_recovery_hints(excluded: &[Value]) -> Vec<&'static
         "index_missing",
         "index_corrupt",
     ] {
-        let present = excluded
-            .iter()
-            .any(|e| e.get("reason").and_then(Value::as_str) == Some(reason));
+        let present = excluded.iter().any(|e| e.reason == reason);
         if present
             && let Some(hint) = store_corruption_recovery_hint(reason)
             && !out.contains(&hint)

@@ -5,6 +5,7 @@ use serde_json::Value;
 pub mod device;
 pub mod history;
 pub mod pointer;
+pub mod search;
 pub mod snapshot;
 
 #[derive(Debug)]
@@ -34,6 +35,7 @@ pub enum ResponseBody {
     Tag(history::TagResponse),
     Open(pointer::OpenResponse),
     View(pointer::ViewResponse),
+    Search(search::SearchResponse),
 }
 
 // Temporary C3 projection into the existing execution path; removed in C4
@@ -60,3 +62,6 @@ mod device_snapshot_tests;
 mod history_tests;
 #[cfg(test)]
 mod pointer_tests;
+
+#[cfg(test)]
+mod search_tests;
