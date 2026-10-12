@@ -13,6 +13,17 @@ use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
 use crate::object_persistence::search_to_kio;
 use crate::platform;
+use crate::response::CommandResponse;
+use crate::response::Completion;
+use crate::response::ResponseBody;
+use crate::response::pointer::EvidenceOpenResponse;
+use crate::response::pointer::EvidenceViewResponse;
+use crate::response::pointer::ObjectChunkResponse;
+use crate::response::pointer::ObjectFileResponse;
+use crate::response::pointer::OpenResponse;
+use crate::response::pointer::RawPointerResponse;
+use crate::response::pointer::ViewResponse;
+use crate::response::project_legacy;
 use crate::scope_access::ReadBarrierCheckpoint;
 use crate::scope_access::enforce_canonical_marker_barrier;
 use crate::scope_access::enforce_canonical_tombstone_only;
@@ -88,15 +99,18 @@ pub(crate) fn run_open(ctx: &Invocation<'_>, args: PointerArgs) -> Result<Value>
     }
     let pointer = parse_pointer_text(&raw)?;
     let resolved = resolve_pointer_for_cli(ctx, &pointer)?;
-    Ok(json!({
-        "status": "opened",
-        "path": resolved.path,
-        "raw_hash": pointer.raw_hash,
-        "chunk_hash": pointer.chunk_hash,
-        "temporary": resolved.temporary,
-        "commit_shallow": resolved.commit_shallow,
-        "manifest_missing": resolved.manifest_missing,
-    }))
+    project_legacy(CommandResponse {
+        body: ResponseBody::Open(OpenResponse::Evidence(EvidenceOpenResponse {
+            status: "opened".to_owned(),
+            path: resolved.path,
+            raw_hash: pointer.raw_hash,
+            chunk_hash: pointer.chunk_hash,
+            temporary: resolved.temporary,
+            commit_shallow: resolved.commit_shallow,
+            manifest_missing: resolved.manifest_missing,
+        })),
+        completion: Completion::Complete,
+    })
 }
 
 pub(crate) fn run_view(ctx: &Invocation<'_>, args: PointerArgs) -> Result<Value> {
@@ -109,23 +123,26 @@ pub(crate) fn run_view(ctx: &Invocation<'_>, args: PointerArgs) -> Result<Value>
     }
     let pointer = parse_pointer_text(&raw)?;
     let resolved = resolve_pointer_for_cli(ctx, &pointer)?;
-    Ok(json!({
-        "status": "viewed",
-        "raw_hash": pointer.raw_hash,
-        "chunk_hash": pointer.chunk_hash,
-        // 05 §1.7.2 / §4.2 (2026-08-11): `view` returns the full-text
-        // normalized view's path plus the chunk's view-local span, not the
-        // chunk body — null when the view's backing cache cannot be read.
-        "view_path": resolved.view_path,
-        "view_byte_start": resolved.view_byte_start,
-        "view_byte_end": resolved.view_byte_end,
-        "path": resolved.path,
-        // R11-9: mirror `kio open --json`, which exposes `temporary` from the same
-        // resolved pointer — `view` resolves identically and Agents branch on it.
-        "temporary": resolved.temporary,
-        "commit_shallow": resolved.commit_shallow,
-        "manifest_missing": resolved.manifest_missing,
-    }))
+    project_legacy(CommandResponse {
+        body: ResponseBody::View(ViewResponse::Evidence(EvidenceViewResponse {
+            status: "viewed".to_owned(),
+            raw_hash: pointer.raw_hash,
+            chunk_hash: pointer.chunk_hash,
+            // 05 §1.7.2 / §4.2 (2026-08-11): `view` returns the full-text
+            // normalized view's path plus the chunk's view-local span, not the
+            // chunk body — null when the view's backing cache cannot be read.
+            view_path: resolved.view_path,
+            view_byte_start: resolved.view_byte_start,
+            view_byte_end: resolved.view_byte_end,
+            path: resolved.path,
+            // R11-9: mirror `kio open --json`, which exposes `temporary` from the same
+            // resolved pointer — `view` resolves identically and Agents branch on it.
+            temporary: Some(resolved.temporary),
+            commit_shallow: resolved.commit_shallow,
+            manifest_missing: resolved.manifest_missing,
+        })),
+        completion: Completion::Complete,
+    })
 }
 
 #[derive(Debug)]
@@ -370,28 +387,35 @@ fn resolve_short_hash_command(ctx: &Invocation<'_>, hash: &str, as_view: bool) -
         ShortHash::Chunk(pointer) => {
             let resolved = resolve_pointer_for_cli(ctx, &pointer)?;
             if as_view {
-                Ok(json!({
-                    "status": "viewed",
-                    "raw_hash": pointer.raw_hash,
-                    "chunk_hash": pointer.chunk_hash,
-                    // 05 §1.7.2 / §4.2 (2026-08-11): see `run_view`'s matching fields.
-                    "view_path": resolved.view_path,
-                    "view_byte_start": resolved.view_byte_start,
-                    "view_byte_end": resolved.view_byte_end,
-                    "path": resolved.path,
-                    "commit_shallow": resolved.commit_shallow,
-                    "manifest_missing": resolved.manifest_missing,
-                }))
+                project_legacy(CommandResponse {
+                    body: ResponseBody::View(ViewResponse::Evidence(EvidenceViewResponse {
+                        status: "viewed".to_owned(),
+                        raw_hash: pointer.raw_hash,
+                        chunk_hash: pointer.chunk_hash,
+                        // 05 §1.7.2 / §4.2 (2026-08-11): see `run_view`'s matching fields.
+                        view_path: resolved.view_path,
+                        view_byte_start: resolved.view_byte_start,
+                        view_byte_end: resolved.view_byte_end,
+                        path: resolved.path,
+                        temporary: None,
+                        commit_shallow: resolved.commit_shallow,
+                        manifest_missing: resolved.manifest_missing,
+                    })),
+                    completion: Completion::Complete,
+                })
             } else {
-                Ok(json!({
-                    "status": "opened",
-                    "path": resolved.path,
-                    "raw_hash": pointer.raw_hash,
-                    "chunk_hash": pointer.chunk_hash,
-                    "temporary": resolved.temporary,
-                    "commit_shallow": resolved.commit_shallow,
-                    "manifest_missing": resolved.manifest_missing,
-                }))
+                project_legacy(CommandResponse {
+                    body: ResponseBody::Open(OpenResponse::Evidence(EvidenceOpenResponse {
+                        status: "opened".to_owned(),
+                        path: resolved.path,
+                        raw_hash: pointer.raw_hash,
+                        chunk_hash: pointer.chunk_hash,
+                        temporary: resolved.temporary,
+                        commit_shallow: resolved.commit_shallow,
+                        manifest_missing: resolved.manifest_missing,
+                    })),
+                    completion: Completion::Complete,
+                })
             }
         }
         ShortHash::Raw {
@@ -445,13 +469,22 @@ fn resolve_short_hash_command(ctx: &Invocation<'_>, hash: &str, as_view: bool) -
                         return Err(error);
                     }
                     let status = if as_view { "viewed" } else { "opened" };
-                    Ok(json!({
-                        "status": status,
-                        "object_type": "raw",
-                        "raw_hash": raw_hash,
-                        "path": path,
-                        "temporary": temporary,
-                    }))
+                    let payload = RawPointerResponse {
+                        status: status.to_owned(),
+                        object_type: "raw".to_owned(),
+                        raw_hash,
+                        path,
+                        temporary,
+                    };
+                    let body = if as_view {
+                        ResponseBody::View(ViewResponse::Raw(payload))
+                    } else {
+                        ResponseBody::Open(OpenResponse::Raw(payload))
+                    };
+                    project_legacy(CommandResponse {
+                        body,
+                        completion: Completion::Complete,
+                    })
                 }
                 // raw_present=false always yields Err from the canonical
                 // dispatch (LC12/13/14 jointly cover every marker state), so
@@ -1844,12 +1877,21 @@ fn resolve_object_uri(ctx: &Invocation<'_>, object: &ObjectUri, as_view: bool) -
         let raw_present = raw_object_present(&target, &chunk.raw_hash)?;
         enforce_canonical_marker_barrier(&target, &chunk.raw_hash, raw_present, ctx.control)?;
         checkpoint.recheck()?;
-        return Ok(json!({
-            "status": status,
-            "object_type": "chunk",
-            "hash": object.hash,
-            "text": chunk.text,
-        }));
+        let payload = ObjectChunkResponse {
+            status: status.to_owned(),
+            object_type: "chunk".to_owned(),
+            hash: object.hash.clone(),
+            text: chunk.text,
+        };
+        let body = if as_view {
+            ResponseBody::View(ViewResponse::ObjectChunk(payload))
+        } else {
+            ResponseBody::Open(OpenResponse::ObjectChunk(payload))
+        };
+        return project_legacy(CommandResponse {
+            body,
+            completion: Completion::Complete,
+        });
     }
     // M7: dispatch each object_type to its correct CAS directory (03 §2 / 07 §5.2)
     // instead of routing every byte object through objects/raw:
@@ -1943,13 +1985,22 @@ fn resolve_object_uri(ctx: &Invocation<'_>, object: &ObjectUri, as_view: bool) -
                 }
                 return Err(error);
             }
-            Ok(json!({
-                "status": status,
-                "object_type": object.object_type,
-                "hash": object.hash,
-                "path": path,
-                "temporary": temporary,
-            }))
+            let payload = ObjectFileResponse {
+                status: status.to_owned(),
+                object_type: object.object_type.clone(),
+                hash: object.hash.clone(),
+                path,
+                temporary,
+            };
+            let body = if as_view {
+                ResponseBody::View(ViewResponse::ObjectFile(payload))
+            } else {
+                ResponseBody::Open(OpenResponse::ObjectFile(payload))
+            };
+            project_legacy(CommandResponse {
+                body,
+                completion: Completion::Complete,
+            })
         }
         // raw_present=false always yields Err from the canonical dispatch
         // (LC12/13/14 jointly cover every marker state).

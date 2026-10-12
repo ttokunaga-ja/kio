@@ -3,6 +3,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 pub mod history;
+pub mod pointer;
 
 #[derive(Debug)]
 pub struct CommandResponse {
@@ -26,6 +27,8 @@ pub enum ResponseBody {
     Diff(history::DiffResponse),
     Inspect(history::InspectResponse),
     Tag(history::TagResponse),
+    Open(pointer::OpenResponse),
+    View(pointer::ViewResponse),
 }
 
 // Temporary C3 projection into the existing execution path; removed in C4
@@ -48,3 +51,5 @@ pub(crate) fn project_legacy(response: CommandResponse) -> Result<Value> {
 
 #[cfg(test)]
 mod history_tests;
+#[cfg(test)]
+mod pointer_tests;
