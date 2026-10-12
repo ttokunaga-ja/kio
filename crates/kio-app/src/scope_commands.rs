@@ -9,6 +9,11 @@ use crate::ledger_access::open_search_budget_snapshot;
 use crate::management::ExplicitRoot;
 use crate::management::initialize_explicit_root_in_session;
 use crate::object_persistence::pipeline_to_kio;
+use crate::response::CommandResponse;
+use crate::response::Completion;
+use crate::response::ResponseBody;
+use crate::response::device::InitResponse;
+use crate::response::project_legacy;
 use crate::scope_access::register_scope;
 use crate::settings::validate_repo_tool_lock;
 use crate::task_execution::budget_status_json;
@@ -70,12 +75,15 @@ pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result
     } else {
         "repaired"
     };
-    Ok(json!({
-        "status": status,
-        "repaired": repaired,
-        "path": repo.root(),
-        "kio_path": repo.kio_dir(),
-    }))
+    project_legacy(CommandResponse {
+        body: ResponseBody::Init(InitResponse {
+            status: status.to_owned(),
+            repaired,
+            path: repo.root().to_path_buf(),
+            kio_path: repo.kio_dir().to_path_buf(),
+        }),
+        completion: Completion::Complete,
+    })
 }
 
 pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<Value> {

@@ -16,6 +16,8 @@ use crate::response::history::TagDeleteResponse;
 use crate::response::history::TagResponse;
 use crate::response::history::TagSetResponse;
 use crate::response::project_legacy;
+use crate::response::snapshot::SnapshotCreateResponse;
+use crate::response::snapshot::SnapshotResponse;
 use crate::scope_access::enforce_purge_read_barrier;
 use crate::scope_access::preflight_barrier_and_index;
 use crate::scope_access::scope_target;
@@ -147,18 +149,17 @@ pub(crate) fn run_snapshot_create(
             }
         }
     }
-    let output = json!({
-        "status": if outcome.noop { "noop" } else { "created" },
-        "message": outcome.message,
-        "tree_hash": outcome.tree_hash,
-        "commit_hash": outcome.commit_hash,
-        "commit": outcome.commit,
-        "stats": {
-            "files_added": outcome.stats.files_added,
-            "files_modified": outcome.stats.files_modified,
-            "files_deleted": outcome.stats.files_deleted,
-        }
-    });
+    let output = project_legacy(CommandResponse {
+        body: ResponseBody::Snapshot(SnapshotResponse::Create(SnapshotCreateResponse {
+            status: if outcome.noop { "noop" } else { "created" }.to_owned(),
+            message: outcome.message,
+            tree_hash: outcome.tree_hash,
+            commit_hash: outcome.commit_hash,
+            commit: outcome.commit,
+            stats: outcome.stats,
+        })),
+        completion: Completion::Complete,
+    })?;
     // Automatic GC owns a distinct bound store lock.  The snapshot,
     // replica publication, and event log are already durable here;
     // release the writer lock before entering the resumable sweep.

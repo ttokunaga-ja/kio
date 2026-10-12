@@ -23,6 +23,14 @@ use std::{
 };
 
 use crate::commands::RootRegisterArgs;
+use crate::response::CommandResponse;
+use crate::response::Completion;
+use crate::response::ResponseBody;
+use crate::response::device::RetiredChild;
+use crate::response::device::RootRegisterAppliedResponse;
+use crate::response::device::RootRegisterPreviewResponse;
+use crate::response::device::RootRegisterResponse;
+use crate::response::project_legacy;
 
 /// This entrypoint is intentionally separate from init/index: only an explicit
 /// root-register request may recover a management record whose path binding no
@@ -110,10 +118,13 @@ pub(crate) fn run(
                 kio_core::ExitCode::Failure,
             ));
         }
-        return Ok(preview(
-            &plan_new(&canonical, binding.clone(), ctx.control)?,
-            None,
-        ));
+        return project_legacy(CommandResponse {
+            body: ResponseBody::RootRegister(RootRegisterResponse::Preview(preview(
+                &plan_new(&canonical, binding.clone(), ctx.control)?,
+                None,
+            ))),
+            completion: Completion::Complete,
+        });
     }
     if !args.yes {
         return Err(KioError::invalid_usage(
@@ -523,9 +534,24 @@ fn execute(
         nodes[0].binding.revalidate()?;
         control.quarantine_then_remove(Path::new(JOURNAL_LEAF), &bytes, MAX_JOURNAL_BYTES)?;
     }
-    Ok(
-        json!({"status":"registered","operation_id":journal.operation_id,"scope_id":nodes[0].before.scope_id,"path":root,"registration_generation":nodes[0].after.registration_generation,"scopes_registered":nodes.len(),"child_memberships_retired":nodes.iter().map(|node| node.retired_children.len()).sum::<usize>(),"grants_revoked":true}),
-    )
+    project_legacy(CommandResponse {
+        body: ResponseBody::RootRegister(RootRegisterResponse::Applied(
+            RootRegisterAppliedResponse {
+                status: "registered".to_owned(),
+                operation_id: journal.operation_id.clone(),
+                scope_id: nodes[0].before.scope_id.clone(),
+                path: root.to_path_buf(),
+                registration_generation: nodes[0].after.registration_generation,
+                scopes_registered: nodes.len(),
+                child_memberships_retired: nodes
+                    .iter()
+                    .map(|node| node.retired_children.len())
+                    .sum(),
+                grants_revoked: true,
+            },
+        )),
+        completion: Completion::Complete,
+    })
 }
 fn validate_journal_plan(nodes: &[Node]) -> Result<()> {
     validate_topology(&nodes.iter().map(node_to_journal).collect::<Vec<_>>())?;
@@ -1007,18 +1033,39 @@ fn advance(
     c.write_atomic(Path::new(JOURNAL_LEAF), &b, Publication::Replace)?;
     Ok(b)
 }
-fn preview(nodes: &[Node], op: Option<&str>) -> Value {
+fn preview(nodes: &[Node], op: Option<&str>) -> RootRegisterPreviewResponse {
     let n = &nodes[0];
     let retired = nodes
         .iter()
         .flat_map(|node| {
-            node.retired_children.iter().map(|(name, enrollment)| {
-                json!({"path": node.relative.join(name), "scope_id": enrollment.scope_id,
-                "reason": "directory_absent"})
-            })
+            node.retired_children
+                .iter()
+                .map(|(name, enrollment)| RetiredChild {
+                    path: node.relative.join(name),
+                    scope_id: enrollment.scope_id.clone(),
+                    reason: "directory_absent".to_owned(),
+                })
         })
         .collect::<Vec<_>>();
-    json!({"operation":"root_register","operation_id":op,"path":n.binding.canonical_root(),"scope_id":n.before.scope_id,"preview":true,"requires_yes":true,"detaches_from_former_parent":!matches!(n.before.authority,ManagementAuthority::Root),"scopes_registered":nodes.len(),"child_memberships_retired":retired.len(),"retired_children":retired,"effects":["rebind management path and directory identity for enrolled subtree","revoke device grants","refresh registry registration as unindexed","retire memberships of absent children","detachment preserves descendant parent IDs and enrollment tokens but changes their root scope"]})
+    RootRegisterPreviewResponse {
+        operation: "root_register".to_owned(),
+        operation_id: op.map(str::to_owned),
+        path: n.binding.canonical_root().to_path_buf(),
+        scope_id: n.before.scope_id.clone(),
+        preview: true,
+        requires_yes: true,
+        detaches_from_former_parent: !matches!(n.before.authority, ManagementAuthority::Root),
+        scopes_registered: nodes.len(),
+        child_memberships_retired: retired.len(),
+        retired_children: retired,
+        effects: [
+            "rebind management path and directory identity for enrolled subtree",
+            "revoke device grants",
+            "refresh registry registration as unindexed",
+            "retire memberships of absent children",
+            "detachment preserves descendant parent IDs and enrollment tokens but changes their root scope",
+        ].into_iter().map(str::to_owned).collect(),
+    }
 }
 
 #[cfg(test)]

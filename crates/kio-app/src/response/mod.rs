@@ -2,8 +2,10 @@ use kio_core::{ExitCode, KioError, Result};
 use serde::Serialize;
 use serde_json::Value;
 
+pub mod device;
 pub mod history;
 pub mod pointer;
+pub mod snapshot;
 
 #[derive(Debug)]
 pub struct CommandResponse {
@@ -23,6 +25,9 @@ pub enum Completion {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum ResponseBody {
+    Init(device::InitResponse),
+    RootRegister(device::RootRegisterResponse),
+    Snapshot(snapshot::SnapshotResponse),
     Log(history::LogResponse),
     Diff(history::DiffResponse),
     Inspect(history::InspectResponse),
@@ -49,6 +54,8 @@ pub(crate) fn project_legacy(response: CommandResponse) -> Result<Value> {
     Ok(value)
 }
 
+#[cfg(test)]
+mod device_snapshot_tests;
 #[cfg(test)]
 mod history_tests;
 #[cfg(test)]
