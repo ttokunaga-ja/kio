@@ -37,7 +37,7 @@ fn test_context(working_directory: &Path) -> AppContext {
 #[cfg(debug_assertions)]
 #[test]
 fn recognized_mistral_ocr_test_control_allows_sync_admission_without_a_key() {
-    use crate::markdownize_test_credential_available;
+    use crate::markdownize::batch::markdownize_test_credential_available;
     use kio_core::test_control::DebugTestControl;
     use kio_core::test_control::{AdapterTestControl, MistralOcrMode, Selector};
 
@@ -192,9 +192,11 @@ fn retry_reset_confirmation_and_lane_contract_is_enforced_for_direct_callers() {
         })),
     };
 
-    assert!(crate::validate_batch_args(&retry(None, true, false)).is_err());
-    assert!(crate::validate_batch_args(&retry(Some("token"), false, true)).is_err());
-    assert!(crate::validate_batch_args(&retry(Some("token"), true, false)).is_ok());
+    assert!(crate::batch::command::validate_batch_args(&retry(None, true, false)).is_err());
+    assert!(
+        crate::batch::command::validate_batch_args(&retry(Some("token"), false, true)).is_err()
+    );
+    assert!(crate::batch::command::validate_batch_args(&retry(Some("token"), true, false)).is_ok());
 
     let resend = |selector: Option<&str>, yes, realtime| BatchArgs {
         command: Some(BatchCommand::Retry(RetryArgs {
@@ -207,9 +209,15 @@ fn retry_reset_confirmation_and_lane_contract_is_enforced_for_direct_callers() {
             batch: false,
         })),
     };
-    assert!(crate::validate_batch_args(&resend(Some("token"), false, false)).is_err());
-    assert!(crate::validate_batch_args(&resend(Some("token"), true, true)).is_err());
-    assert!(crate::validate_batch_args(&resend(Some("token"), true, false)).is_ok());
+    assert!(
+        crate::batch::command::validate_batch_args(&resend(Some("token"), false, false)).is_err()
+    );
+    assert!(
+        crate::batch::command::validate_batch_args(&resend(Some("token"), true, true)).is_err()
+    );
+    assert!(
+        crate::batch::command::validate_batch_args(&resend(Some("token"), true, false)).is_ok()
+    );
 }
 
 #[test]
@@ -286,7 +294,7 @@ fn materialized_source_image_cas_failure_is_retryable_not_contract_reject() {
         usage: None,
     };
 
-    let failure = crate::materialize_online_markdownize_response(
+    let failure = crate::markdownize::execution::materialize_online_markdownize_response(
         &repo,
         &task,
         vec![prepared],
@@ -375,7 +383,7 @@ fn invalid_online_markdown_is_rejected_before_normalized_publication() {
         usage: None,
     };
 
-    let failure = crate::materialize_online_markdownize_response(
+    let failure = crate::markdownize::execution::materialize_online_markdownize_response(
         &repo,
         &task,
         vec![prepared],
@@ -390,7 +398,7 @@ fn invalid_online_markdown_is_rejected_before_normalized_publication() {
     assert_eq!(failure.retry_kind, RetryErrorKind::ContractViolation);
     response.updated_units[0].unit_key = "image:unknown".to_owned();
     response.updated_units[0].markdown = "otherwise valid text\n".to_owned();
-    let unknown_unit = crate::materialize_online_markdownize_response(
+    let unknown_unit = crate::markdownize::execution::materialize_online_markdownize_response(
         &repo,
         &task,
         vec![PreparedUnit {
@@ -500,7 +508,7 @@ fn valid_partial_online_response_is_materialized() {
         reason: None,
         usage: None,
     };
-    let outcome = crate::materialize_online_markdownize_response(
+    let outcome = crate::markdownize::execution::materialize_online_markdownize_response(
         &repo,
         &task,
         prepared.clone(),
@@ -531,7 +539,7 @@ fn valid_partial_online_response_is_materialized() {
         usage: None,
     };
     let retry_keys = BTreeSet::from(["page:2".to_owned()]);
-    let retried = crate::materialize_online_markdownize_response(
+    let retried = crate::markdownize::execution::materialize_online_markdownize_response(
         &repo,
         &task,
         prepared,
@@ -585,18 +593,19 @@ fn valid_partial_online_response_is_materialized() {
         reason: None,
         usage: None,
     };
-    let all_failed_outcome = crate::materialize_online_markdownize_response(
-        &repo,
-        &task,
-        vec![page(0, "page:1"), page(1, "page:2")],
-        "application/pdf",
-        raw,
-        None,
-        all_failed_profile.clone(),
-        all_failed,
-        &[],
-    )
-    .unwrap();
+    let all_failed_outcome =
+        crate::markdownize::execution::materialize_online_markdownize_response(
+            &repo,
+            &task,
+            vec![page(0, "page:1"), page(1, "page:2")],
+            "application/pdf",
+            raw,
+            None,
+            all_failed_profile.clone(),
+            all_failed,
+            &[],
+        )
+        .unwrap();
     assert_eq!(all_failed_outcome.status, TaskStatus::Failed);
     let all_failed_instance = kio_pipeline::markdownize::load_validated_normalized_instance(
         repo.kio_dir(),
@@ -643,7 +652,7 @@ fn unchanged_image_unit_reuses_pinned_markdown_verbatim() {
         page_number: None,
     };
     let previous_markdown = "legacy pinned OCR text\n".to_owned();
-    let previous = crate::PreviousInstance {
+    let previous = crate::markdownize::execution::PreviousInstance {
         manifest: NormalizedInstanceManifest {
             raw_hash: raw_hash.clone(),
             tool_profile_hash: profile_hash.clone(),
@@ -682,7 +691,7 @@ fn unchanged_image_unit_reuses_pinned_markdown_verbatim() {
         usage: None,
     };
 
-    let units = crate::normalized_units_from_response(
+    let units = crate::markdownize::execution::normalized_units_from_response(
         &repo,
         "image/png",
         raw_bytes,
@@ -750,7 +759,7 @@ fn preparation_profile_drift_bumps_generation_despite_changed_unit_keys() {
         reused_from: None,
         generated_at: "2026-09-08T00:00:00Z".to_owned(),
     };
-    let manifest = crate::manifest_from_units(
+    let manifest = crate::markdownize::execution::manifest_from_units(
         std::slice::from_ref(&old_prepared),
         &[old_unit],
         &raw_hash,
@@ -785,7 +794,7 @@ fn preparation_profile_drift_bumps_generation_despite_changed_unit_keys() {
         ..old_prepared
     };
     assert_eq!(
-        crate::prepared_hash_drift_new_gen(
+        crate::index::pipeline::prepared_hash_drift_new_gen(
             &kio_dir,
             &raw_hash,
             &markdown_profile_hash,
@@ -802,12 +811,15 @@ use std::os::unix::fs::symlink;
 use kio_adapter::catalog::deterministic_embedding_vector;
 use kio_index::ChunkRow;
 
-use crate::LaneOverride;
-use crate::MarkdownizeSendLane;
-use crate::effective_invocation_lane;
-use crate::embedding_usd_per_token;
-use crate::estimate_embedding_cost;
-use crate::estimate_embedding_tokens;
+use crate::embedding::transport::LaneOverride;
+use crate::embedding::transport::effective_invocation_lane;
+use crate::embedding::transport::embedding_usd_per_token;
+use crate::embedding::transport::estimate_embedding_cost;
+use crate::embedding::transport::estimate_embedding_tokens;
+use crate::embedding::transport::lane_rate;
+use crate::embedding::transport::query_embedding_send_lane;
+use crate::embedding::transport::realtime_lane_requested;
+use crate::embedding::transport::resolve_invocation_lane;
 use crate::index::chunk_ledger::ChunkPublicationEvent;
 use crate::index::chunk_ledger::StoredChunk;
 use crate::index::chunk_ledger::append_chunk_publication_events;
@@ -822,11 +834,8 @@ use crate::index::chunk_ledger::truncate_torn_chunk_tail;
 use crate::index::rebuild::AssociationAppend;
 use crate::index::rebuild::append_new_chunk_association;
 use crate::index::rebuild::unit_authorities_from_inputs;
-use crate::lane_rate;
-use crate::markdownize_send_lane;
-use crate::query_embedding_send_lane;
-use crate::realtime_lane_requested;
-use crate::resolve_invocation_lane;
+use crate::markdownize::batch::MarkdownizeSendLane;
+use crate::markdownize::batch::markdownize_send_lane;
 use crate::search::projection::publication_is_compatible;
 use crate::search::projection::publication_is_include_deleted_compatible;
 use crate::search::projection::publication_ranks;
@@ -840,15 +849,17 @@ fn embedding_tool_lock_labels_cover_every_execution_mode() {
     use kio_adapter::types::ExecutionMode;
 
     assert_eq!(
-        crate::embedding_execution_labels(ExecutionMode::OnlineApi),
+        crate::embedding::transport::embedding_execution_labels(ExecutionMode::OnlineApi),
         ("online_api", "online")
     );
     assert_eq!(
-        crate::embedding_execution_labels(ExecutionMode::OfflineApi),
+        crate::embedding::transport::embedding_execution_labels(ExecutionMode::OfflineApi),
         ("offline_api", "offline")
     );
     assert_eq!(
-        crate::embedding_execution_labels(ExecutionMode::DeterministicLibrary),
+        crate::embedding::transport::embedding_execution_labels(
+            ExecutionMode::DeterministicLibrary
+        ),
         ("deterministic_library", "deterministic")
     );
 }
@@ -857,18 +868,24 @@ fn embedding_tool_lock_labels_cover_every_execution_mode() {
 fn offline_keeps_only_the_in_process_embedding_evaluator_eligible() {
     use kio_adapter::types::ExecutionMode;
 
-    assert!(crate::embedding_mode_transport_allowed(
-        ExecutionMode::DeterministicLibrary,
-        true,
-    ));
-    assert!(!crate::embedding_mode_transport_allowed(
-        ExecutionMode::OfflineApi,
-        true,
-    ));
-    assert!(!crate::embedding_mode_transport_allowed(
-        ExecutionMode::OnlineApi,
-        true,
-    ));
+    assert!(
+        crate::embedding::transport::embedding_mode_transport_allowed(
+            ExecutionMode::DeterministicLibrary,
+            true,
+        )
+    );
+    assert!(
+        !crate::embedding::transport::embedding_mode_transport_allowed(
+            ExecutionMode::OfflineApi,
+            true,
+        )
+    );
+    assert!(
+        !crate::embedding::transport::embedding_mode_transport_allowed(
+            ExecutionMode::OnlineApi,
+            true,
+        )
+    );
 }
 
 #[test]
@@ -878,12 +895,12 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
     ) {
         return;
     }
-    use crate::EmbeddingProjection;
-    use crate::EmbeddingSendGroup;
-    use crate::bind_embedding_work;
-    use crate::chunk_embedding_hash;
+    use crate::embedding::enrichment::EmbeddingProjection;
+    use crate::embedding::enrichment::EmbeddingSendGroup;
+    use crate::embedding::enrichment::bind_embedding_work;
+    use crate::embedding::enrichment::persist_group_vector;
+    use crate::embedding::transport::chunk_embedding_hash;
     use crate::embedding_owners::RetainedEmbeddingChunk;
-    use crate::persist_group_vector;
     use crate::search::scope::current_embedding_policy;
     use kio_adapter::catalog::DeclaredEmbeddingProfile;
     use kio_core::cas::ObjectStore;
@@ -1402,7 +1419,7 @@ fn adapter_scope_id_refuses_malformed_scope_identity_instead_of_unknown() {
 /// scoped, not a blanket exit-4 promotion for the whole variant.
 #[test]
 fn r23_13_store_constraint_contract_error_is_permanent_failure_exit_4() {
-    use crate::pipeline_to_kio;
+    use crate::object_persistence::pipeline_to_kio;
 
     let constraint = pipeline_to_kio(kio_pipeline::PipelineError::contract(
         "KIO-E-STORE-CONSTRAINT-001",
@@ -1676,14 +1693,17 @@ fn r23_10_erase_receipt_blocks_retained_embedding_liveness() {
         policy_paths: BTreeSet::from(["reintroduced.md".to_owned()]),
         introductions: vec![commit_hash],
     }];
-    let chunks = crate::retained_history_chunks(&conn, &repo, &retained, "config", None).unwrap();
+    let chunks = crate::embedding::enrichment::retained_history_chunks(
+        &conn, &repo, &retained, "config", None,
+    )
+    .unwrap();
     assert_eq!(chunks.len(), 0);
 }
 
 #[cfg(debug_assertions)]
 #[test]
 fn search_index_status_uses_preflight_month() {
-    use crate::compute_index_status;
+    use crate::index::command::compute_index_status;
     use crate::search::scope::SearchedScopeInfo;
     use crate::settings::user_config_toml_path;
     use kio_core::scope::Repository;
@@ -1804,7 +1824,7 @@ fn search_index_status_uses_preflight_month() {
 
 #[test]
 fn search_budget_observation_retries_a_month_rollover_once() {
-    use crate::capture_search_budget_observation_with;
+    use crate::ledger_access::capture_search_budget_observation_with;
     use kio_pipeline::ledger::LedgerDb;
 
     let root = crate::test_support::PrivateTempDir::new();
@@ -1851,7 +1871,7 @@ fn search_budget_observation_retries_a_month_rollover_once() {
 
 #[test]
 fn r23_aggregate_index_status_fails_closed_for_corrupt_scope_state() {
-    use crate::compute_index_status;
+    use crate::index::command::compute_index_status;
     use crate::search::scope::SearchedScopeInfo;
     use kio_core::scope::Repository;
 
@@ -1951,9 +1971,9 @@ fn r23_aggregate_index_status_fails_closed_for_corrupt_scope_state() {
 
 #[test]
 fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
-    use crate::embedding_task_output_ref;
-    use crate::hold_secret_embedding_tasks;
-    use crate::prune_terminal_embedding_secret_holds;
+    use crate::egress::prune_terminal_embedding_secret_holds;
+    use crate::embedding::enrichment::embedding_task_output_ref;
+    use crate::embedding::enrichment::hold_secret_embedding_tasks;
     use kio_adapter::catalog::DeclaredEmbeddingProfile;
     use kio_core::scope::Repository;
     use kio_pipeline::ledger::LedgerDb;
@@ -1971,7 +1991,7 @@ fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
         profile_hash: format!("sha256:{}", "e".repeat(64)),
     };
     let chunk_id = format!("sha256:{}", "a".repeat(64));
-    let chunk = crate::bind_embedding_work(
+    let chunk = crate::embedding::enrichment::bind_embedding_work(
         vec![crate::embedding_owners::RetainedEmbeddingChunk {
             chunk_id: chunk_id.clone(),
             text: "secret".into(),
@@ -2040,10 +2060,10 @@ fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
 
 #[test]
 fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
-    use crate::SECRETS_TIER_B_HOLD;
-    use crate::embedding_task_output_ref;
-    use crate::filter_embeddable_by_task_state;
-    use crate::prune_terminal_embedding_secret_holds;
+    use crate::egress::SECRETS_TIER_B_HOLD;
+    use crate::egress::prune_terminal_embedding_secret_holds;
+    use crate::embedding::enrichment::embedding_task_output_ref;
+    use crate::embedding::transport::filter_embeddable_by_task_state;
     use kio_core::scope::Repository;
     use kio_pipeline::task::{HoldReason, TaskDescriptor, TaskStatus, TaskStore, TaskType};
 
@@ -2058,7 +2078,7 @@ fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
         modality: "multimodal".into(),
         profile_hash: format!("sha256:{}", "e".repeat(64)),
     };
-    let chunk = crate::bind_embedding_work(
+    let chunk = crate::embedding::enrichment::bind_embedding_work(
         vec![crate::embedding_owners::RetainedEmbeddingChunk {
             chunk_id: chunk_id.clone(),
             text: "must not send".into(),
@@ -2135,8 +2155,8 @@ fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
 
 #[test]
 fn r23_secret_classification_preserves_retry_backoff_state() {
-    use crate::embedding_task_output_ref;
-    use crate::hold_secret_embedding_tasks;
+    use crate::embedding::enrichment::embedding_task_output_ref;
+    use crate::embedding::enrichment::hold_secret_embedding_tasks;
     use kio_adapter::catalog::DeclaredEmbeddingProfile;
     use kio_core::scope::Repository;
     use kio_pipeline::ledger::LedgerDb;
@@ -2154,7 +2174,7 @@ fn r23_secret_classification_preserves_retry_backoff_state() {
         profile_hash: format!("sha256:{}", "e".repeat(64)),
     };
     let chunk_id = format!("sha256:{}", "e".repeat(64));
-    let chunk = crate::bind_embedding_work(
+    let chunk = crate::embedding::enrichment::bind_embedding_work(
         vec![crate::embedding_owners::RetainedEmbeddingChunk {
             chunk_id: chunk_id.clone(),
             text: "retryable".into(),
@@ -2362,11 +2382,11 @@ fn images_take_the_text_rank_of_their_citing_chunk() {
 
 #[test]
 fn r23_markdown_charge_and_send_share_one_verified_input() {
-    use crate::OnlineMarkdownizePrecondition;
-    use crate::classify_online_markdownize_precondition;
-    use crate::estimate_online_markdownize_cost;
     use crate::management::ExplicitRoot;
-    use crate::prorated_markdownize_cost;
+    use crate::markdownize::execution::OnlineMarkdownizePrecondition;
+    use crate::markdownize::execution::classify_online_markdownize_precondition;
+    use crate::markdownize::execution::prorated_markdownize_cost;
+    use crate::task_execution::estimate_online_markdownize_cost;
     use kio_pipeline::prepare::hash_bytes;
     use kio_pipeline::task::{TaskDescriptor, TaskStatus, TaskType};
 
@@ -3122,9 +3142,9 @@ fn query_embedding_is_always_priced_on_the_sync_lane() {
 
 #[test]
 fn r11_2_exit_override_priority_batch_vs_enrichment() {
-    use crate::ExecOutcome;
-    use crate::batch_exit_override;
-    use crate::enrichment_exit_override;
+    use crate::task_execution::ExecOutcome;
+    use crate::task_execution::batch_exit_override;
+    use crate::task_execution::enrichment_exit_override;
     use kio_core::ExitCode;
 
     // A clean pass overrides nothing (exit 0).
@@ -3237,7 +3257,7 @@ fn qb15_parent_and_child_index_exits_keep_user_action_priority() {
 
 #[test]
 fn r10_4_partial_retry_plan_gates_on_retryability_and_budget() {
-    use crate::partial_retry_plan_from_manifest;
+    use crate::batch::command::partial_retry_plan_from_manifest;
     use kio_pipeline::markdownize::NormalizedInstanceManifest;
     use kio_pipeline::prepare::unit_ref;
     let manifest = |first_error: Option<&str>, second_error: Option<&str>| {
@@ -3295,9 +3315,9 @@ fn subset_retry_preserves_unrequested_failed_unit_kind() {
 
     use kio_adapter::types::{FailedUnit, MarkdownizeMode, MarkdownizeResponse};
 
-    use crate::PreviousInstance;
-    use crate::merged_failed_unit_retry_kinds;
-    use crate::partial_retry_plan_from_manifest;
+    use crate::batch::command::partial_retry_plan_from_manifest;
+    use crate::markdownize::execution::PreviousInstance;
+    use crate::markdownize::execution::merged_failed_unit_retry_kinds;
     use kio_pipeline::markdownize::NormalizedInstanceManifest;
     use kio_pipeline::prepare::unit_ref;
     use kio_pipeline::task::RetryErrorKind;
@@ -3345,7 +3365,7 @@ fn subset_retry_preserves_unrequested_failed_unit_kind() {
 
 #[test]
 fn r10_5_persist_failure_is_retryable() {
-    use crate::persist_failure_retry_kind;
+    use crate::markdownize::execution::persist_failure_retry_kind;
     use kio_pipeline::task::retry_policy;
     // R10-5: a post-OCR persist I/O fault must be retryable so `batch retry` can
     // recover the already-billed normalized output.
@@ -3491,7 +3511,7 @@ fn r10_8_snapshot_tree_entries_insert_is_atomic() {
 
 #[test]
 fn r9_8_atomic_write_cas_object_removes_temp_on_failure() {
-    use crate::atomic_write_cas_object;
+    use crate::object_persistence::atomic_write_cas_object;
     // R9-8: a torn derived-CAS write must not leave an orphan `.tmp-*` in the
     // fanout dir. Force the rename to fail deterministically by making the
     // destination an existing directory after the temp is created + fsynced.
@@ -3514,7 +3534,7 @@ fn r9_8_atomic_write_cas_object_removes_temp_on_failure() {
 
 #[test]
 fn r23_cand_031_existing_prepared_slot_must_match_exact_bytes() {
-    use crate::atomic_write_cas_object;
+    use crate::object_persistence::atomic_write_cas_object;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("prepared-object");
@@ -3530,7 +3550,7 @@ fn r23_cand_031_existing_prepared_slot_must_match_exact_bytes() {
 fn r23_prepared_writer_rejects_symlinked_store_ancestor() {
     use std::os::unix::fs::symlink;
 
-    use crate::write_prepared_objects;
+    use crate::object_persistence::write_prepared_objects;
     use kio_core::scope::Repository;
     use kio_pipeline::prepare::{PreparedUnit, UnitFingerprint, UnitType, hash_bytes};
 
@@ -3568,8 +3588,8 @@ fn r23_prepared_writer_rejects_symlinked_store_ancestor() {
 
 #[test]
 fn r9_5_unit_file_and_orphan_temp_classification() {
-    use crate::is_normalized_unit_file;
-    use crate::is_orphan_temp_name;
+    use crate::object_persistence::is_normalized_unit_file;
+    use crate::object_persistence::is_orphan_temp_name;
     // Real unit files: 16 lowercase-hex chars + `.json`.
     assert!(is_normalized_unit_file("1a2b3c4d5e6f7089.json"));
     assert!(is_normalized_unit_file("0000000000000000.json"));
@@ -3606,10 +3626,10 @@ fn mock_embedding_vector_is_deterministic_and_normalized() {
 // never breached even without concurrency, and nothing is double-reserved.
 #[test]
 fn serial_task_charges_reread_and_enforce_the_cap() {
-    use crate::TaskChargeOutcome;
-    use crate::budget_cap_config;
-    use crate::reserve_or_reuse_task_charge;
-    use crate::task_ledger_key;
+    use crate::ledger_access::TaskChargeOutcome;
+    use crate::ledger_access::budget_cap_config;
+    use crate::ledger_access::reserve_or_reuse_task_charge;
+    use crate::ledger_access::task_ledger_key;
     use kio_pipeline::budget::BudgetCaps;
     use kio_pipeline::ledger::RequestKind;
     use std::collections::BTreeMap;
@@ -3695,7 +3715,7 @@ fn serial_task_charges_reread_and_enforce_the_cap() {
 
 #[test]
 fn store_lock_preserves_retryable_cli_error_contract() {
-    use crate::pipeline_to_kio;
+    use crate::object_persistence::pipeline_to_kio;
     use kio_core::ExitCode;
 
     let err = pipeline_to_kio(kio_pipeline::PipelineError::locked(
@@ -3711,8 +3731,8 @@ fn store_lock_preserves_retryable_cli_error_contract() {
 // simply a task that was never charged) can never manufacture a settlement.
 #[test]
 fn release_task_charge_if_open_is_a_no_op_without_a_matching_row() {
-    use crate::release_task_charge_if_open;
-    use crate::task_ledger_key;
+    use crate::ledger_access::release_task_charge_if_open;
+    use crate::ledger_access::task_ledger_key;
 
     let tmp = crate::test_support::PrivateTempDir::new();
     let ledger =
@@ -3938,8 +3958,8 @@ fn canonical_cas_read_succeeds_and_hash_mismatch_fails_closed() {
 
 #[test]
 fn prepared_writer_publishes_new_objects_to_canonical_leaf() {
+    use crate::object_persistence::write_canonical_cas_object_or_reuse;
     use crate::open_view::cas_object_path;
-    use crate::write_canonical_cas_object_or_reuse;
     use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
@@ -3956,9 +3976,9 @@ fn prepared_writer_publishes_new_objects_to_canonical_leaf() {
 #[cfg(not(windows))]
 #[test]
 fn non_current_conflict_cannot_influence_canonical_read_or_write() {
+    use crate::object_persistence::write_canonical_cas_object_or_reuse;
     use crate::open_view::cas_object_path;
     use crate::open_view::read_cas_byte_object;
-    use crate::write_canonical_cas_object_or_reuse;
     use kio_core::cas::MAX_RAW_OBJECT_BYTES;
     use kio_pipeline::prepare::hash_bytes;
 
@@ -3987,7 +4007,7 @@ fn non_current_conflict_cannot_influence_canonical_read_or_write() {
 
 #[test]
 fn q3_reclaims_orphaned_running_task_to_pending() {
-    use crate::reclaim_orphaned_running_tasks;
+    use crate::batch::command::reclaim_orphaned_running_tasks;
     use kio_pipeline::markdownize::MarkdownizeMode;
     use kio_pipeline::task::{TaskDescriptor, TaskStatus, TaskStore, TaskType};
     let dir = tempfile::tempdir().unwrap();
@@ -4001,7 +4021,7 @@ fn q3_reclaims_orphaned_running_task_to_pending() {
         previous_raw_hash: None,
         parent_run_id: None,
         changed_unit_keys: Vec::new(),
-        output_ref: crate::online_output_ref("test_markdownize_adapter"),
+        output_ref: crate::index::pipeline::online_output_ref("test_markdownize_adapter"),
         unit_keys: None,
         // A task stuck Running is bit-identical to a crash between the
         // Running-persist and the Done-persist.
@@ -4116,10 +4136,13 @@ fn registry_snapshot_error_mapping_preserves_typed_exit_and_closed_reason() {
 #[test]
 fn ledger_snapshot_error_mapping_preserves_typed_exit_and_closed_reason() {
     let path = "/private/test/cost-ledger.sqlite";
-    let unsafe_error = crate::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
-        path,
-        kio_pipeline::ledger::LedgerSnapshotError::UnsafeIntegrity("linked ledger main".to_owned()),
-    ));
+    let unsafe_error =
+        crate::object_persistence::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
+            path,
+            kio_pipeline::ledger::LedgerSnapshotError::UnsafeIntegrity(
+                "linked ledger main".to_owned(),
+            ),
+        ));
     assert_eq!(
         unsafe_error.error_code(),
         "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001"
@@ -4131,12 +4154,13 @@ fn ledger_snapshot_error_mapping_preserves_typed_exit_and_closed_reason() {
     assert_eq!(unsafe_error.context()["reason"], "unsafe_integrity");
     assert_eq!(unsafe_error.context()["ledger_path"], path);
 
-    let transient_error = crate::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
-        path,
-        kio_pipeline::ledger::LedgerSnapshotError::UnstableBusy(
-            "retry budget exhausted".to_owned(),
-        ),
-    ));
+    let transient_error =
+        crate::object_persistence::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
+            path,
+            kio_pipeline::ledger::LedgerSnapshotError::UnstableBusy(
+                "retry budget exhausted".to_owned(),
+            ),
+        ));
     assert_eq!(transient_error.error_code(), "KIO-E-LEDGER-SNAPSHOT-001");
     assert_eq!(
         transient_error.exit_code(),
@@ -4144,10 +4168,11 @@ fn ledger_snapshot_error_mapping_preserves_typed_exit_and_closed_reason() {
     );
     assert_eq!(transient_error.context()["reason"], "unstable_or_busy");
 
-    let impossible_missing = crate::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
-        path,
-        kio_pipeline::ledger::LedgerSnapshotError::Missing,
-    ));
+    let impossible_missing =
+        crate::object_persistence::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
+            path,
+            kio_pipeline::ledger::LedgerSnapshotError::Missing,
+        ));
     assert_eq!(
         impossible_missing.error_code(),
         "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001"
@@ -4245,19 +4270,19 @@ fn current_policy_redacts_denied_alias_without_hiding_allowed_alias() {
 #[test]
 fn image_payload_mime_is_derived_from_verified_magic_only() {
     assert_eq!(
-        crate::verified_image_mime(b"\x89PNG\r\n\x1a\nbody").unwrap(),
+        crate::embedding::enrichment::verified_image_mime(b"\x89PNG\r\n\x1a\nbody").unwrap(),
         "image/png"
     );
     assert_eq!(
-        crate::verified_image_mime(&[0xff, 0xd8, 0xff, 0x00]).unwrap(),
+        crate::embedding::enrichment::verified_image_mime(&[0xff, 0xd8, 0xff, 0x00]).unwrap(),
         "image/jpeg"
     );
-    assert!(crate::verified_image_mime(b"not-an-image").is_err());
+    assert!(crate::embedding::enrichment::verified_image_mime(b"not-an-image").is_err());
 }
 
 #[test]
 fn embedding_secret_hold_applies_to_authenticated_local_http() {
-    use crate::secret_embedding_hold_required;
+    use crate::embedding::enrichment::secret_embedding_hold_required;
     use kio_adapter::types::ExecutionMode;
 
     for mode in [ExecutionMode::OnlineApi, ExecutionMode::OfflineApi] {
@@ -4279,7 +4304,7 @@ fn embedding_admission_rechecks_policy_and_exact_network_grant() {
     let adapter_settings =
         &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
 
-    use crate::admit_embedding_transport;
+    use crate::egress::admit_embedding_transport;
     use crate::management::ExplicitRoot;
     use crate::management::initialize_explicit_root;
     use crate::search::scope::current_embedding_policy;
@@ -4389,11 +4414,11 @@ fn cursor_policy_revalidation_rejects_a_live_ignore_change() {
 
 #[test]
 fn only_typed_same_scope_image_ownership_selects_local_bytes_or_projection() {
-    use crate::authorized_local_image_object_hash;
+    use crate::embedding::enrichment::authorized_local_image_object_hash;
+    use crate::embedding::enrichment::local_image_object_hash;
+    use crate::embedding::enrichment::referenced_authorized_image_hashes_for_chunks;
     use crate::embedding_owners::RetainedEmbeddingChunk;
     use crate::image_authority::{ImageAuthorityEntry, ImageAuthorityMap};
-    use crate::local_image_object_hash;
-    use crate::referenced_authorized_image_hashes_for_chunks;
 
     let hash = format!("sha256:{}", "a".repeat(64));
     let foreign_uri = format!("kio://scope-b/object/image/{hash}");
@@ -4451,9 +4476,9 @@ fn only_typed_same_scope_image_ownership_selects_local_bytes_or_projection() {
 
 #[test]
 fn secret_typed_owner_cannot_be_bypassed_by_a_public_same_scope_link() {
+    use crate::embedding::enrichment::referenced_authorized_image_hashes_for_chunks;
     use crate::embedding_owners::RetainedEmbeddingChunk;
     use crate::image_authority::{ImageAuthorityEntry, ImageAuthorityMap};
-    use crate::referenced_authorized_image_hashes_for_chunks;
 
     let hash = format!("sha256:{}", "b".repeat(64));
     let chunks = [RetainedEmbeddingChunk {

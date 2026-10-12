@@ -1,7 +1,7 @@
-use crate::adapter_to_kio;
 use crate::batch_recovery_key;
 use crate::cursor_key;
-use crate::declared_embedding_profile;
+use crate::embedding::transport::declared_embedding_profile;
+use crate::object_persistence::adapter_to_kio;
 use crate::search::query::toml_f64;
 use crate::search::query::toml_u64;
 use kio_adapter::catalog::EmbeddingExecution;

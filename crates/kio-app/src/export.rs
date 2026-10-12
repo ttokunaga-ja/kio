@@ -2080,7 +2080,7 @@ fn partial_output(
             "message": error.message(),
         }],
     });
-    crate::set_exit_override(&mut output, ExitCode::PartialFailure);
+    crate::task_execution::set_exit_override(&mut output, ExitCode::PartialFailure);
     output
 }
 

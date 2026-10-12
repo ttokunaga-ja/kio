@@ -1,4 +1,4 @@
-use crate::index_to_kio;
+use crate::object_persistence::index_to_kio;
 use crate::platform;
 use cap_primitives::fs as cap_fs;
 use kio_core::ExitCode;

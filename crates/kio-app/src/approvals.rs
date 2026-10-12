@@ -64,8 +64,11 @@ fn binding(
     let chain = validate_live_chain(&retained)?;
     let current = chain.scopes.first().expect("validated chain is nonempty");
     let policy = CurrentPolicyEvaluator::load(&retained, current.record.case_insensitive)
-        .map_err(crate::pipeline_to_kio)?;
-    if !policy.allows_scope().map_err(crate::pipeline_to_kio)? {
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
+    if !policy
+        .allows_scope()
+        .map_err(crate::object_persistence::pipeline_to_kio)?
+    {
         return Err(denied("scope is excluded by its current management policy"));
     }
     let memberships = chain
@@ -90,8 +93,10 @@ fn binding(
             tool_profile_hash: profile,
         },
     )
-    .map_err(crate::adapter_to_kio)?;
-    policy.revalidate().map_err(crate::pipeline_to_kio)?;
+    .map_err(crate::object_persistence::adapter_to_kio)?;
+    policy
+        .revalidate()
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
     Ok(GrantBinding {
         scope_id: current.record.scope_id.clone(),
         canonical_root: retained.canonical_root().to_path_buf(),
@@ -116,7 +121,7 @@ fn configured_profile(
     // invalid declaration must remain an error, not look like an absent lane.
     if let Some(declared) = adapter_settings.declared_adapter(role.as_str()) {
         kio_adapter::tool_lock::validate_declared_runtime_target(role.as_str(), &declared)
-            .map_err(crate::adapter_to_kio)?;
+            .map_err(crate::object_persistence::adapter_to_kio)?;
     }
     let (tool_id, profile) = match role {
         AdapterRole::Markdown => {
@@ -125,20 +130,21 @@ fn configured_profile(
                 repo.control(),
             ) {
                 Some(execution) => kio_adapter::local_ocr_markdownize::profile_for(execution),
-                None => crate::online_markdownize_profile_for(repo)?,
+                None => crate::index::pipeline::online_markdownize_profile_for(repo)?,
             };
             (profile.adapter_id, profile.tool_profile_hash)
         }
         AdapterRole::Embedding => {
-            let Some(execution) = crate::embedding_execution(adapter_settings, repo.control())
+            let Some(execution) =
+                crate::embedding::transport::embedding_execution(adapter_settings, repo.control())
             else {
                 return Ok(None);
             };
             // A library has no external recipient to approve.
-            if crate::embedding_is_deterministic(execution) {
+            if crate::embedding::transport::embedding_is_deterministic(execution) {
                 return Ok(None);
             }
-            let profile = crate::declared_embedding_profile(execution);
+            let profile = crate::embedding::transport::declared_embedding_profile(execution);
             (profile.tool_id, profile.profile_hash)
         }
     };

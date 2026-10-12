@@ -1,9 +1,9 @@
 use crate::context;
 use crate::context::EvidenceRegistry;
-use crate::diagnostic_safe_text;
 use crate::index::chunk_ledger::check_index_generation_current;
-use crate::index_to_kio;
 use crate::invocation::Invocation;
+use crate::object_persistence::diagnostic_safe_text;
+use crate::object_persistence::index_to_kio;
 use crate::open_view::is_ancestor_or_equal;
 use crate::open_view::read_tombstone;
 use crate::search::scope::ExecScope;

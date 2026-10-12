@@ -13,13 +13,13 @@ use crate::index::chunk_ledger::recover_index_generation;
 use crate::index::rebuild::rebuild_step3_index;
 use crate::management::binding_for_repo;
 use crate::management::open_existing_managed_root;
-use crate::pipeline_to_kio;
+use crate::object_persistence::pipeline_to_kio;
 use crate::search::projection::mark_replica_rebuilding_or_log;
 use crate::search::projection::mark_replica_unavailable_or_log;
 use crate::search::projection::write_through_projection_full;
 use crate::search::scope::current_embedding_policy;
-use crate::set_exit_override;
 use crate::settings::validate_repo_tool_lock;
+use crate::task_execution::set_exit_override;
 
 pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: RestoreArgs) -> Result<Value> {
     // This is intentionally the strict, bound managed-root open.  In

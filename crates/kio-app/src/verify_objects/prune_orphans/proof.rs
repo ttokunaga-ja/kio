@@ -1,19 +1,31 @@
 //! Read-only blocker, staging-residue, and complete immutable live-set proof.
 use super::*;
 use crate::scope_access::is_store_not_found;
+use kio_core::KioError;
+use kio_core::cas::ContentObjectKind;
+use kio_core::cas::canonical_json_bytes;
+use kio_core::cas::is_hash;
 use kio_core::control::ControlHandle;
 use kio_core::dag::CommitObject;
 use kio_core::dag::TreeObject;
 use kio_core::purge::EventKind;
 use kio_core::purge::PurgeState;
+use kio_core::scope::Repository;
 use kio_core::store_dir::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
+use kio_pipeline::markdownize::NormalizedInstanceManifest;
 use kio_pipeline::markdownize::{NormalizedUnitObject, UnitStatus};
+use kio_pipeline::prepare::hash_bytes;
 use kio_pipeline::task::{
     TaskDescriptor, TaskOutputRef, TaskStatus, TaskStore, task_failure_is_terminal,
     validate_task_output_ref,
 };
 use serde::Serialize;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
 
 const MAX_SCAN_ENTRIES: usize = 1_000_000;
 const MAX_SCAN_BYTES: u64 = 1024 * 1024 * 1024;
@@ -223,7 +235,9 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
             "Run kio repair verify-objects to recover the interrupted publication before pruning",
         ));
     }
-    let ledger = checked(crate::open_optional_ledger_db(repo.control()))?;
+    let ledger = checked(crate::ledger_access::open_optional_ledger_db(
+        repo.control(),
+    ))?;
     if let Some(ledger) = ledger {
         let rows = kio_pipeline::ledger::ops::inflight_requests_for_scope(&ledger, &scope.scope_id)
             .map_err(Blocker::unsafe_state)?;
@@ -320,7 +334,7 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
                         "Resume or repair the partial normalized instance before pruning",
                     )
                 })?;
-            if !crate::partial_retry_plan_from_manifest(manifest, task.attempts)
+            if !crate::batch::command::partial_retry_plan_from_manifest(manifest, task.attempts)
                 .retryable_units
                 .is_empty()
             {

@@ -448,7 +448,7 @@ fn lexical_absolute(path: &Path) -> Result<PathBuf> {
 
 fn manifest_store(create: bool, control: &ControlHandle) -> Result<Option<StoreDirectory>> {
     let registry = kio_index::registry::default_registry_path_with_control(control)
-        .map_err(crate::index_to_kio)?;
+        .map_err(crate::object_persistence::index_to_kio)?;
     let Some(data) = registry.parent() else {
         return Err(service_error("device data directory is unavailable"));
     };

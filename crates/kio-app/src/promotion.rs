@@ -4,15 +4,28 @@
 //! strictly after a task reached `Done`: it re-opens the typed normalized-instance
 //! reference and verifies that the manifest and every unit form one complete,
 //! immutable identity before the CLI is allowed to bind that identity into HEAD.
+use crate::index::command::read_repository_scan_input;
+use crate::index::command::repository_scan_policy_allows_file;
+use crate::index::pipeline::IndexPipelineResult;
 use crate::index::rebuild::rebuild_step3_index;
+use crate::object_persistence::adapter_to_kio;
+use crate::object_persistence::pipeline_to_kio;
 use crate::scope_access::ensure_raw_ingest_allowed;
 use crate::scope_access::is_store_not_found;
 use crate::search::projection::mark_replica_rebuilding_or_log;
 use crate::settings::bbox_annotation_enabled;
 use crate::settings::effective_max_input_bytes;
+use kio_adapter::catalog::resolve_standard_online_markdownize_profile_with_bbox_with_control;
+use kio_adapter::catalog::standard_online_markdownize_profile;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_core::control::ControlHandle;
 use kio_core::dag::CommitType;
+use kio_core::dag::NormalizeRef;
+use kio_core::scope::PendingNormalizeRef;
+use kio_pipeline::task::TaskStore;
+use kio_pipeline::task::TaskType;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use std::fs;
@@ -30,7 +43,7 @@ use kio_pipeline::{PipelineError, Result as PipelineResult};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-use crate::atomic_overwrite_file;
+use crate::object_persistence::atomic_overwrite_file;
 use crate::*;
 
 const PROMOTION_STATE_FILE: &str = "promotion-state.json";
@@ -467,7 +480,7 @@ fn plan_online_markdownize_promotion(
             // materialized (`validated_online_promotions` above already
             // opened and validated its manifest/units), so its manifest.json
             // is hashable here.
-            let manifest_hash = crate::compute_manifest_hash(
+            let manifest_hash = crate::object_persistence::compute_manifest_hash(
                 repo,
                 &candidate.raw_hash,
                 &candidate.tool_profile_hash,

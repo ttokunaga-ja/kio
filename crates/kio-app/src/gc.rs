@@ -216,7 +216,7 @@ pub(super) fn attach_after_success(
                 }
             }
             if deferred {
-                crate::set_exit_override(&mut output, ExitCode::PartialFailure);
+                crate::task_execution::set_exit_override(&mut output, ExitCode::PartialFailure);
             }
         }
         Err(error) => {
@@ -237,7 +237,7 @@ pub(super) fn attach_after_success(
                     }),
                 );
             }
-            crate::set_exit_override(&mut output, exit);
+            crate::task_execution::set_exit_override(&mut output, exit);
         }
     }
     output
@@ -705,7 +705,7 @@ fn require_automatic_index_binding(
     };
     let kio = session.retained_kio_handle()?;
     let observed = read_bound_gc_index_metadata(&kio, &bound_fts_config())
-        .map_err(crate::index_to_kio)?
+        .map_err(crate::object_persistence::index_to_kio)?
         .ok_or_else(|| {
             KioError::new(
                 "KIO-E-GC-INDEX-BINDING-001",
@@ -861,8 +861,8 @@ fn bound_fts_config() -> FtsSchemaConfig {
 
 fn index_state_bound(session: &GcSweepSession) -> Result<GcIndexState> {
     let kio = session.retained_kio_handle()?;
-    let metadata =
-        read_bound_gc_index_metadata(&kio, &bound_fts_config()).map_err(crate::index_to_kio)?;
+    let metadata = read_bound_gc_index_metadata(&kio, &bound_fts_config())
+        .map_err(crate::object_persistence::index_to_kio)?;
     session.assert_public_identity()?;
     let Some(metadata) = metadata else {
         return Ok(GcIndexState::Absent);

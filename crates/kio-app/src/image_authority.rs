@@ -15,7 +15,7 @@ use kio_pipeline::policy::CurrentPolicyEvaluator;
 use kio_pipeline::scan::classify_secret;
 
 use crate::historical_reindex::{RetainedNormalizedInstance, pinned_done_units};
-use crate::pipeline_to_kio;
+use crate::object_persistence::pipeline_to_kio;
 
 /// Current authority for one typed, immutable image CAS object.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

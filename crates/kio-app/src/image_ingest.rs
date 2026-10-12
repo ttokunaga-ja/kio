@@ -356,7 +356,7 @@ pub(crate) fn ingest_standalone_image(
     )?;
     let stamped = persist_normalized_instance_bound(&directory, &manifest, &[unit])
         .map_err(|error| KioError::schema(error.to_string()))?;
-    let manifest_hash = crate::hash_and_write_manifest_object(repo, &stamped)?;
+    let manifest_hash = crate::object_persistence::hash_and_write_manifest_object(repo, &stamped)?;
     Ok(ImageIngested {
         normalize: NormalizeRef {
             tool_profile_hash: native_profile_hash,

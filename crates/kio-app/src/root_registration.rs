@@ -230,7 +230,8 @@ fn plan_new(root: &Path, binding: ManagementBinding, control: &ControlHandle) ->
     // The registry is a derived cache. Planning must neither create it nor
     // require it to exist when importing a moved tree on a new device.
     let db = match RegistryDb::open_read_only_with_control(
-        default_registry_path_with_control(control).map_err(crate::index_to_kio)?,
+        default_registry_path_with_control(control)
+            .map_err(crate::object_persistence::index_to_kio)?,
         control,
     ) {
         Ok(db) => Some(db),
@@ -241,7 +242,7 @@ fn plan_new(root: &Path, binding: ManagementBinding, control: &ControlHandle) ->
         let entries = match &db {
             Some(db) => db
                 .lookup_scope_id(&n.before.scope_id)
-                .map_err(crate::index_to_kio)?,
+                .map_err(crate::object_persistence::index_to_kio)?,
             None => Vec::new(),
         };
         let destination = n
@@ -470,8 +471,8 @@ fn execute(
     }
     if journal.phase == Phase::Published {
         recheck_old_paths(&nodes)?;
-        let mut db =
-            RegistryDb::open_default_with_control(runtime_control).map_err(crate::index_to_kio)?;
+        let mut db = RegistryDb::open_default_with_control(runtime_control)
+            .map_err(crate::object_persistence::index_to_kio)?;
         let rs = nodes
             .iter()
             .map(|n| ScopeRegistrationRebind {
@@ -493,7 +494,7 @@ fn execute(
             })
             .collect::<Vec<_>>();
         db.rebind_scope_registrations(&rs)
-            .map_err(crate::index_to_kio)?;
+            .map_err(crate::object_persistence::index_to_kio)?;
         for node in &nodes {
             // Foreign persisted paths cannot address this device's cache.
             if node.before.directory_identity.is_native_platform() {
@@ -505,7 +506,7 @@ fn execute(
                             .display()
                             .to_string(),
                     )
-                    .map_err(crate::index_to_kio)?;
+                    .map_err(crate::object_persistence::index_to_kio)?;
                 }
             }
         }

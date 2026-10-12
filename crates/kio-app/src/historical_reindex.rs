@@ -6,6 +6,8 @@
 //! associations and their derived search/embedding projections.
 
 use super::*;
+use crate::egress::embedding_online_allowed;
+use crate::embedding::enrichment::run_historical_embedding_enrichment;
 use crate::index::chunk_ledger::StoredChunk;
 use crate::index::chunk_ledger::append_stored_chunks;
 use crate::index::chunk_ledger::persist_chunk_object;
@@ -22,20 +24,41 @@ use crate::index::rebuild::authenticate_chunk_row;
 use crate::index::rebuild::is_rebuild_skippable_unit_error;
 use crate::index::rebuild::read_chunking_config;
 use crate::index::rebuild::unit_authorities_from_inputs;
+use crate::object_persistence::index_to_kio;
+use crate::object_persistence::pipeline_to_kio;
 use crate::open_view::MAX_MANIFEST_OBJECT_READ_BYTES;
 use crate::scope_access::active_erase_purge_explains_historical_missing_manifest;
 use crate::scope_access::ensure_no_visible_purge_journal;
 use crate::scope_access::purge_blocks_historical_reindex_raw;
 use crate::scope_access::purge_blocks_rebuild_raw;
+use crate::task_execution::enrichment_exit_override;
+use crate::task_execution::set_exit_override;
+use kio_core::ExitCode;
+use kio_core::KioError;
+use kio_core::cas::ContentObjectKind;
+use kio_core::cas::canonical_json_bytes;
+use kio_core::control::ControlHandle;
+use kio_core::dag::NormalizeRef;
 use kio_core::history::HistoryReader;
 use kio_core::history::TreeBinding;
+use kio_core::scope::Repository;
 use kio_index::TreeEntryRow;
 use kio_index::chunking::ChunkingInput;
 use kio_index::chunking::NormalizedUnitInput;
 use kio_index::chunking::chunk_normalized_instance;
+use kio_index::fts::FtsSchemaConfig;
+use kio_index::fts::FtsTokenizer;
 use kio_index::fts::SqliteFtsIndex;
 use kio_pipeline::markdownize::NormalizedInstanceIdentity;
+use kio_pipeline::markdownize::NormalizedInstanceManifest;
+use kio_pipeline::markdownize::NormalizedUnitObject;
+use kio_pipeline::markdownize::UnitStatus;
 use kio_pipeline::markdownize::validate_normalized_instance;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Default)]
 pub(super) struct ParsedReindex {
@@ -1124,7 +1147,7 @@ mod tests {
             r#gen: 1,
             parent_gen: None,
             run_id: "retained-test".to_owned(),
-            units: vec![NormalizedUnitManifestEntry {
+            units: vec![kio_pipeline::markdownize::NormalizedUnitManifestEntry {
                 order: 0,
                 unit_key: unit.unit_key.clone(),
                 unit_ref: unit_ref(&unit.unit_key),
@@ -1201,7 +1224,7 @@ mod tests {
             parent_gen: None,
             run_id: "partial-test".to_owned(),
             units: vec![
-                NormalizedUnitManifestEntry {
+                kio_pipeline::markdownize::NormalizedUnitManifestEntry {
                     order: 0,
                     unit_key: done.unit_key.clone(),
                     unit_ref: unit_ref(&done.unit_key),
@@ -1212,7 +1235,7 @@ mod tests {
                     unit_object_hash: None,
                     error_kind: None,
                 },
-                NormalizedUnitManifestEntry {
+                kio_pipeline::markdownize::NormalizedUnitManifestEntry {
                     order: 1,
                     unit_key: "page:2".to_owned(),
                     unit_ref: unit_ref("page:2"),

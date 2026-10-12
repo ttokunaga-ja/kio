@@ -353,7 +353,7 @@ fn extend_embedding_closure(
                 tokenizer: FtsTokenizer::Trigram,
             },
         )
-        .map_err(crate::index_to_kio)?;
+        .map_err(crate::object_persistence::index_to_kio)?;
         // Match the existing closure's item ceiling. Stream bounded metadata;
         // SQLite rows must agree with the ledger and confer no ownership.
         let limit = kio_core::purge::MAX_PURGE_TARGETS.saturating_mul(8);
@@ -390,7 +390,7 @@ fn extend_embedding_closure(
         }
         index
             .recheck_source_identity()
-            .map_err(crate::index_to_kio)?;
+            .map_err(crate::object_persistence::index_to_kio)?;
     }
     let removable_images = items
         .iter()
@@ -1194,7 +1194,7 @@ fn delete_derived_surfaces(
                 tokenizer: FtsTokenizer::Trigram,
             },
         )
-        .map_err(crate::index_to_kio)?;
+        .map_err(crate::object_persistence::index_to_kio)?;
         // The journal-bound closure fixes image liveness from authenticated,
         // immutable unit ownership. Markdown/metadata and mutable chunk rows
         // can cite an image but cannot establish a local CAS lifecycle edge.
@@ -1210,7 +1210,7 @@ fn delete_derived_surfaces(
                         &no_images
                     },
                 )
-                .map_err(crate::index_to_kio)?;
+                .map_err(crate::object_persistence::index_to_kio)?;
             report.deleted.sqlite_chunks = report
                 .deleted
                 .sqlite_chunks
@@ -1503,7 +1503,7 @@ fn scan_derived_inventory(
         let manifest = read_verified_manifest_object(store, &manifest_hash, &leaf)?;
         validate_instance_leaf(&leaf, &manifest)?;
         let units = load_validated_normalized_units_from_manifest(store, &manifest)
-            .map_err(crate::pipeline_to_kio)?;
+            .map_err(crate::object_persistence::pipeline_to_kio)?;
         let unit_hashes = manifest
             .units
             .iter()
@@ -1607,7 +1607,7 @@ fn extend_inventory_from_reachable_refs(
                     }
                 };
             let units = load_validated_normalized_units_from_manifest(&store, &manifest)
-                .map_err(crate::pipeline_to_kio)?;
+                .map_err(crate::object_persistence::pipeline_to_kio)?;
             let unit_hashes = manifest
                 .units
                 .iter()
@@ -1883,12 +1883,12 @@ fn settle_inflight_reservations_for_purge(
         .map(String::as_str)
         .collect::<BTreeSet<_>>();
     let scope_id = crate::scope_access::scope_id(repo.kio_dir())?;
-    let Some(ledger) = crate::open_optional_ledger_db(repo.control())? else {
+    let Some(ledger) = crate::ledger_access::open_optional_ledger_db(repo.control())? else {
         // A fresh offline device has no billing state. A local reservation
         // without its operational ledger must be recovered before deleting it.
         if TaskStore::new_with_control(repo.kio_dir(), repo.control().clone())
             .all()
-            .map_err(crate::pipeline_to_kio)?
+            .map_err(crate::object_persistence::pipeline_to_kio)?
             .iter()
             .any(|task| task.reservation_id.is_some())
         {
@@ -1911,7 +1911,7 @@ fn settle_inflight_reservations_for_purge(
     }
     for task in TaskStore::new_with_control(repo.kio_dir(), repo.control().clone())
         .all()
-        .map_err(crate::pipeline_to_kio)?
+        .map_err(crate::object_persistence::pipeline_to_kio)?
     {
         let attributed = targets.contains(task.input_hash.as_str())
             || task
@@ -1926,7 +1926,7 @@ fn settle_inflight_reservations_for_purge(
         };
         let resolution =
             resolve_abandon_selector(&ledger, &AbandonSelector::IntentToken(token.to_owned()))
-                .map_err(crate::pipeline_to_kio)?;
+                .map_err(crate::object_persistence::pipeline_to_kio)?;
         let AbandonResolution::Found(key) = resolution else {
             // Already terminal + cleaned (or the token never resolved) —
             // nothing left to settle, an idempotent no-op.
@@ -1935,19 +1935,21 @@ fn settle_inflight_reservations_for_purge(
         if !handled.insert(key.clone()) {
             continue;
         }
-        let Some(row) = get_batch_request(&ledger, &key).map_err(crate::pipeline_to_kio)? else {
+        let Some(row) =
+            get_batch_request(&ledger, &key).map_err(crate::object_persistence::pipeline_to_kio)?
+        else {
             continue;
         };
         if row.state.is_inflight() {
             recovery_settle_unknown(&ledger, &key, token, row.estimated_usd, true)
-                .map_err(crate::pipeline_to_kio)?;
+                .map_err(crate::object_persistence::pipeline_to_kio)?;
             settled = settled.saturating_add(1);
         }
     }
 
     // (b) direct ledger scan for rows tasks.jsonl no longer references.
     let orphans = kio_pipeline::ledger::ops::requests_with_intent_for_scope(&ledger, &scope_id)
-        .map_err(crate::pipeline_to_kio)?;
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
     for row in orphans {
         let TaskKey {
             adapter_kind,
@@ -1967,7 +1969,9 @@ fn settle_inflight_reservations_for_purge(
         if handled.contains(&key) {
             continue;
         }
-        let Some(row) = get_batch_request(&ledger, &key).map_err(crate::pipeline_to_kio)? else {
+        let Some(row) =
+            get_batch_request(&ledger, &key).map_err(crate::object_persistence::pipeline_to_kio)?
+        else {
             continue;
         };
         let Some(token) = row.intent_token.clone() else {
@@ -1975,10 +1979,11 @@ fn settle_inflight_reservations_for_purge(
         };
         if row.state.is_inflight() {
             recovery_settle_unknown(&ledger, &key, &token, row.estimated_usd, true)
-                .map_err(crate::pipeline_to_kio)?;
+                .map_err(crate::object_persistence::pipeline_to_kio)?;
             settled = settled.saturating_add(1);
         } else if row.cleanup_pending() {
-            recovery_finish_cleanup(&ledger, &key, &token).map_err(crate::pipeline_to_kio)?;
+            recovery_finish_cleanup(&ledger, &key, &token)
+                .map_err(crate::object_persistence::pipeline_to_kio)?;
         }
     }
 
@@ -1997,7 +2002,9 @@ fn delete_target_tasks(
         validate_existing_regular(&path, Some(MAX_TASK_STORE_BYTES))?;
     }
     let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
-    let tasks = store.all().map_err(crate::pipeline_to_kio)?;
+    let tasks = store
+        .all()
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
     let mut removed = Vec::new();
     let mut kept = Vec::new();
     for task in tasks {
@@ -2021,7 +2028,9 @@ fn delete_target_tasks(
     // (`settle_inflight_reservations_for_purge`, PA40/41) — this is now pure
     // task-row removal.
     if !removed.is_empty() {
-        store.replace_all(&kept).map_err(crate::pipeline_to_kio)?;
+        store
+            .replace_all(&kept)
+            .map_err(crate::object_persistence::pipeline_to_kio)?;
         report.deleted.tasks = report
             .deleted
             .tasks
@@ -2630,7 +2639,7 @@ fn incomplete_report(
     value["message"] = json!("purge is incomplete and will resume on the next identical command");
     value["failure_phase"] = json!(journal.phase);
     value["cause_error_code"] = json!(error.error_code());
-    crate::set_exit_override(&mut value, ExitCode::PartialFailure);
+    crate::task_execution::set_exit_override(&mut value, ExitCode::PartialFailure);
     value
 }
 

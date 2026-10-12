@@ -1,11 +1,11 @@
-use crate::authorized_local_image_object_hash;
+use crate::embedding::enrichment::authorized_local_image_object_hash;
 use crate::historical_reindex::pinned_done_units;
 use crate::historical_reindex::retained_history_instances;
 use crate::image_authority;
 use crate::index::chunk_ledger::rotate_index_generation_unconditionally;
 use crate::index::chunk_ledger::sqlite_path;
-use crate::index_to_kio;
 use crate::invocation::Invocation;
+use crate::object_persistence::index_to_kio;
 use crate::scope_access::purge_blocks_rebuild_raw;
 use crate::scope_access::scope_id;
 use crate::search::query::TreeEntryProjection;

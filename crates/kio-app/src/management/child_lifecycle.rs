@@ -8,7 +8,7 @@ mod cancel;
 
 use super::binding_for_repo;
 use crate::grants::PrivateGrantStore;
-use crate::index_to_kio;
+use crate::object_persistence::index_to_kio;
 use kio_core::management::{
     ChildEnrollment, DirectoryIdentity, ManagementBinding, ManagementRecord,
     compare_and_remove_child_enrollment_in_session, enroll_child_in_session, observe_direct_child,
@@ -636,11 +636,13 @@ fn policy_allows(parent: &ManagementBinding, basename: &str) -> Result<bool> {
     let record = read_record(parent)?;
     let policy =
         kio_pipeline::policy::CurrentPolicyEvaluator::load(parent, record.case_insensitive)
-            .map_err(crate::pipeline_to_kio)?;
+            .map_err(crate::object_persistence::pipeline_to_kio)?;
     let allowed = policy
         .allows_directory(basename)
-        .map_err(crate::pipeline_to_kio)?;
-    policy.revalidate().map_err(crate::pipeline_to_kio)?;
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
+    policy
+        .revalidate()
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
     Ok(allowed)
 }
 
@@ -709,16 +711,18 @@ fn resume_initialization(
         parent_binding,
         parent_record.case_insensitive,
     )
-    .map_err(crate::pipeline_to_kio)?;
+    .map_err(crate::object_persistence::pipeline_to_kio)?;
     if !policy
         .allows_directory(&journal.basename)
-        .map_err(crate::pipeline_to_kio)?
+        .map_err(crate::object_persistence::pipeline_to_kio)?
     {
         return Err(KioError::invalid_usage(
             "planned child is no longer allowed by parent policy",
         ));
     }
-    policy.revalidate().map_err(crate::pipeline_to_kio)?;
+    policy
+        .revalidate()
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
     let child_root = StoreDirectory::from_retained_with_control(
         observed.handle.try_clone().map_err(|e| {
             KioError::io(e.to_string(), observed.canonical_root.display().to_string())
@@ -904,16 +908,18 @@ fn revalidate_policy(parent: &ManagementBinding, basename: &str) -> Result<()> {
     let record = read_record(parent)?;
     let policy =
         kio_pipeline::policy::CurrentPolicyEvaluator::load(parent, record.case_insensitive)
-            .map_err(crate::pipeline_to_kio)?;
+            .map_err(crate::object_persistence::pipeline_to_kio)?;
     if !policy
         .allows_directory(basename)
-        .map_err(crate::pipeline_to_kio)?
+        .map_err(crate::object_persistence::pipeline_to_kio)?
     {
         return Err(KioError::invalid_usage(
             "planned child is no longer allowed by parent policy",
         ));
     }
-    policy.revalidate().map_err(crate::pipeline_to_kio)
+    policy
+        .revalidate()
+        .map_err(crate::object_persistence::pipeline_to_kio)
 }
 
 fn same_planned_child_record(actual: &ManagementRecord, planned: &ManagementRecord) -> bool {

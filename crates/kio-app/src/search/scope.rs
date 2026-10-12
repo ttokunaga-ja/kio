@@ -1,10 +1,10 @@
-use crate::embedding_execution;
+use crate::embedding::transport::embedding_execution;
 use crate::historical_reindex::retained_history_instances;
 use crate::image_authority;
 use crate::management::binding_for_repo;
 use crate::management::open_existing_managed_root;
 use crate::multi_scope;
-use crate::pipeline_to_kio;
+use crate::object_persistence::pipeline_to_kio;
 use crate::search_history::SearchHistoryBinding;
 use crate::search_history::plan_search_history;
 use crate::search_time::TimeSelector;

@@ -372,7 +372,7 @@ fn state_directory(
     control: &ControlHandle,
 ) -> Result<Option<StoreDirectory>> {
     let registry = kio_index::registry::default_registry_path_with_control(control)
-        .map_err(crate::index_to_kio)?;
+        .map_err(crate::object_persistence::index_to_kio)?;
     let data = registry
         .parent()
         .ok_or_else(|| watch_error("device data directory is unavailable"))?;
@@ -500,7 +500,7 @@ mod tests {
             "error_code": "KIO-E-INDEX-PARTIAL-001",
             "child_scope_discovery": {"has_more": true, "rows_total": 128},
         });
-        crate::set_exit_override(&mut output, ExitCode::PartialFailure);
+        crate::task_execution::set_exit_override(&mut output, ExitCode::PartialFailure);
         assert_eq!(
             incomplete_output_reason(&output),
             "status=indexed error_code=KIO-E-INDEX-PARTIAL-001 exit_code=3 child_discovery_has_more=true child_discovery_rows_total=128"

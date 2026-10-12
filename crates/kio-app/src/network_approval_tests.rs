@@ -212,7 +212,7 @@ impl Fixture {
         adapter_settings: &Arc<AdapterRuntimeSettings>,
         profile: &str,
     ) -> bool {
-        crate::persistent_network_allowed_for(
+        crate::egress::persistent_network_allowed_for(
             adapter_settings,
             &self.repo,
             super::approvals::AdapterRole::Markdown,
@@ -557,7 +557,7 @@ fn copied_scope_approval_reference_cannot_reuse_the_source_device_grant() {
 
     assert_eq!(copied.read_network_approvals().unwrap().len(), 1);
     assert!(
-        !crate::persistent_network_allowed_for(
+        !crate::egress::persistent_network_allowed_for(
             adapter_settings,
             &copied,
             super::approvals::AdapterRole::Markdown,
@@ -616,8 +616,8 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
     };
     {
         let adapter_settings = &std::sync::Arc::new(settings);
-        let profile = crate::declared_embedding_profile(
-            crate::embedding_execution(adapter_settings, control).unwrap(),
+        let profile = crate::embedding::transport::declared_embedding_profile(
+            crate::embedding::transport::embedding_execution(adapter_settings, control).unwrap(),
         );
         let target = AdapterTarget::Tool(profile.tool_id.clone());
         let preview = fixture
@@ -699,7 +699,10 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
         // when rebuild has no active embedding adapter.
         {
             let adapter_settings = &std::sync::Arc::new(AdapterRuntimeSettings::default());
-            assert!(crate::embedding_execution(adapter_settings, control).is_none());
+            assert!(
+                crate::embedding::transport::embedding_execution(adapter_settings, control)
+                    .is_none()
+            );
             for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
                 assert!(
                     !query(
@@ -725,8 +728,8 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
             control.adapters.gemini_embed = Selector::Known(GeminiEmbedMode::IncompatibleProfile);
             let drift = ControlHandle::new(control);
             let drift_repo = fixture.repo.rebind_with_control(drift.clone());
-            let current = crate::declared_embedding_profile(
-                crate::embedding_execution(adapter_settings, &drift).unwrap(),
+            let current = crate::embedding::transport::declared_embedding_profile(
+                crate::embedding::transport::embedding_execution(adapter_settings, &drift).unwrap(),
             );
             assert_ne!(current.profile_hash, profile.profile_hash);
             for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
@@ -953,7 +956,7 @@ fn ancestor_reregistration_invalidates_a_childs_network_and_secret_grants() {
     let grant_bytes = fs::read(fixture.grant_path()).unwrap();
     let scope_rows = child.read_network_approvals().unwrap();
     assert!(
-        crate::persistent_network_allowed_for(
+        crate::egress::persistent_network_allowed_for(
             adapter_settings,
             &child,
             super::approvals::AdapterRole::Markdown,
@@ -986,7 +989,7 @@ fn ancestor_reregistration_invalidates_a_childs_network_and_secret_grants() {
     assert_eq!(fs::read(fixture.grant_path()).unwrap(), grant_bytes);
     assert_eq!(child.read_network_approvals().unwrap(), scope_rows);
     assert!(
-        !crate::persistent_network_allowed_for(
+        !crate::egress::persistent_network_allowed_for(
             adapter_settings,
             &child,
             super::approvals::AdapterRole::Markdown,

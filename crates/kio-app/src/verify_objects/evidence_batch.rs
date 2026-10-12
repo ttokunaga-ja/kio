@@ -6,7 +6,7 @@ use kio_core::cas::{hash_bytes, read_bounded_regular_file};
 use kio_core::{ExitCode, Result};
 use serde_json::{Value, json};
 
-use crate::set_exit_override;
+use crate::task_execution::set_exit_override;
 
 use super::{
     EvidenceVerification, MAX_BATCH_INPUT_BYTES, MAX_BATCH_VERIFIED_BYTES, batch_limit_error,

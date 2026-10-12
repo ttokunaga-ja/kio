@@ -5,6 +5,7 @@ use crate::index::chunk_ledger::check_index_generation_current;
 use crate::index::chunk_ledger::recover_index_generation;
 use crate::index::chunk_ledger::sqlite_path;
 use crate::index::rebuild::durable_history_roots;
+use crate::object_persistence::index_to_kio;
 use crate::open_view::PointInTimeAttribution;
 use crate::open_view::parse_object_uri;
 use crate::open_view::parse_pointer_text;
@@ -18,7 +19,15 @@ use crate::scope_access::preflight_barrier_and_index;
 use crate::scope_access::resolve_evidence_scope_target;
 use crate::scope_access::unresolvable_commit_pointer_error;
 use crate::search::scope::ScopeTarget;
+use crate::task_execution::set_exit_override;
+use kio_core::ExitCode;
 use kio_core::control::ControlHandle;
+use kio_index::fts::ExistingSourceIndexOpenMode;
+use kio_index::fts::FtsSchemaConfig;
+use kio_index::fts::FtsTokenizer;
+use kio_index::fts::open_existing_source_index_connection;
+use kio_index::registry::RegistryDb;
+use kio_pipeline::markdownize::UnitStatus;
 use kio_search::evidence::EvidencePointer;
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -47,8 +56,6 @@ use kio_pipeline::markdownize::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
-
-use crate::*;
 
 mod evidence_batch;
 mod retarget;
@@ -3935,7 +3942,8 @@ mod tests {
             scope_path: Some(dir.path().join("missing-scope").display().to_string()),
         };
         let context = crate::context::test_support::context(dir.path());
-        let settings = Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+        let settings =
+            std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
         let control = ControlHandle::default();
         let ctx = &crate::invocation::Invocation {
             context: &context,
@@ -4003,7 +4011,8 @@ mod tests {
             scope_path: Some(dir.path().join("missing-scope").display().to_string()),
         };
         let context = crate::context::test_support::context(dir.path());
-        let settings = Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+        let settings =
+            std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
         let control = ControlHandle::default();
         let locks = kio_core::scope::LockSession::default();
         let ctx = &crate::invocation::Invocation {
@@ -4064,7 +4073,7 @@ mod tests {
             .run(expected, |reads| {
                 let store = store.with_verified_reads(reads)?;
                 load_validated_normalized_units_from_manifest(&store, &manifest)
-                    .map_err(pipeline_to_kio)
+                    .map_err(crate::object_persistence::pipeline_to_kio)
             })
             .unwrap();
         assert_eq!(units, vec![unit]);
@@ -4073,7 +4082,7 @@ mod tests {
             .run(expected - 1, |reads| {
                 let store = store.with_verified_reads(reads)?;
                 load_validated_normalized_units_from_manifest(&store, &manifest)
-                    .map_err(pipeline_to_kio)
+                    .map_err(crate::object_persistence::pipeline_to_kio)
             })
             .unwrap_err();
         assert!(error.to_string().contains("aggregate byte limit"));
