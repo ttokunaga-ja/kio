@@ -9,7 +9,7 @@ use super::{
 };
 use crate::management::binding_for_repo;
 use crate::response::repair::*;
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use kio_core::management::{
     DirectoryIdentity, ManagementBinding, directory_identity_from_handle, observe_direct_child,
     planned_child_management_record, read_registration_recovery_record,
@@ -19,7 +19,6 @@ use kio_core::scope::{Repository, validate_planned_kio_layout};
 use kio_core::store_dir::{AtomicWorkspaceState, Publication, StoreDirectory};
 use kio_core::{KioError, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::path::Path;
 
 const CANCELLATION: &str = "child-initialization-cancel.json";
@@ -48,7 +47,11 @@ struct CheckedInitialization {
     stage_identity: Option<DirectoryIdentity>,
 }
 
-pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -> Result<Value> {
+pub(super) fn run(
+    parent: &Repository,
+    preview: bool,
+    operation: Option<&str>,
+) -> Result<CommandResponse> {
     if preview {
         let binding = binding_for_repo(parent)?;
         let store = control(&binding, parent.control())?;
@@ -70,7 +73,7 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
             .filter(|(journal, _)| operation.is_none_or(|id| id == journal.operation_id))
             .map(|(journal, bytes)| preview_row(&binding, &store, journal, bytes))
             .collect::<Result<Vec<_>>>()?;
-        return project_legacy(CommandResponse {
+        return Ok(CommandResponse {
             body: ResponseBody::Repair(RepairResponse::CancelChildInitialization(
                 CancelChildInitializationResponse::Preview(CancelChildPreview {
                     preview: true,
@@ -97,7 +100,7 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
             ));
         }
         finish(&binding, &store, marker, bytes)?;
-        return project_legacy(CommandResponse {
+        return Ok(CommandResponse {
             body: ResponseBody::Repair(RepairResponse::CancelChildInitialization(
                 CancelChildInitializationResponse::Applied(CancelChildApplied {
                     operation: operation.to_owned(),
@@ -139,7 +142,7 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
         KioError::invalid_usage("child initialization cancellation marker disappeared")
     })?;
     finish(&binding, &store, marker, marker_bytes)?;
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Repair(RepairResponse::CancelChildInitialization(
             CancelChildInitializationResponse::Applied(CancelChildApplied {
                 operation: operation.to_owned(),
@@ -644,7 +647,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let parent = parent(&temp);
         let empty = interrupted(&parent, "empty", false, false);
-        let preview = run(&parent, true, None).unwrap();
+        let response = run(&parent, true, None).unwrap();
+        assert_eq!(response.completion, Completion::Complete);
+        let preview =
+            serde_json::to_value(response.body).expect("cfg(test) cancellation body projection");
         assert_eq!(preview["preview"], true);
         assert!(!parent.kio_dir().join(CANCELLATION).exists());
         assert!(

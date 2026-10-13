@@ -1,7 +1,7 @@
 //! Existing Evidence response records and return assembly.
 
 use crate::response::evidence::EvidenceResponse;
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use kio_core::{ExitCode, Result};
 use serde::Serialize;
 use serde_json::Value;
@@ -49,7 +49,7 @@ impl EvidenceVerification {
     }
 }
 
-pub(super) fn verification_output(verification: EvidenceVerification) -> Result<Value> {
+pub(super) fn verification_output(verification: EvidenceVerification) -> Result<CommandResponse> {
     let completion = match verification.exit {
         ExitCode::Success => Completion::Complete,
         ExitCode::PartialFailure => Completion::Partial,
@@ -58,7 +58,7 @@ pub(super) fn verification_output(verification: EvidenceVerification) -> Result<
             unreachable!("Evidence verification emits only success, retryable or permanent results")
         }
     };
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Evidence(EvidenceResponse::Verify(verification.result)),
         completion,
     })

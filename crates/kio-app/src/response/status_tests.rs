@@ -1,6 +1,6 @@
 use super::batch::StalledBatchStatus;
 use super::status::{BudgetStatusResponse, PausedTasksByHoldReason, StatusResponse};
-use super::{CommandResponse, Completion, ResponseBody, project_legacy};
+use super::{CommandResponse, Completion, ResponseBody};
 use kio_core::scope::FileStatus;
 use kio_pipeline::budget::BudgetCapKind;
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
@@ -221,11 +221,12 @@ fn status_complete_projection_keeps_shallow_and_paused_inspection_successful() {
         legacy["unsupported_inputs_complete"] = json!(!shallow);
         legacy["paused_by_hold_reason"] =
             json!({"budget":1,"auth":2,"tier_b_approval":3,"ledger_initialization_required":4});
-        let actual = project_legacy(CommandResponse {
+        let response = CommandResponse {
             body: ResponseBody::Status(Box::new(dto)),
             completion: Completion::Complete,
-        })
-        .unwrap();
+        };
+        assert_eq!(response.completion, Completion::Complete);
+        let actual = serde_json::to_value(response.body).unwrap();
         assert_eq!(actual, legacy);
         assert_eq!(
             serde_json::to_vec(&actual).unwrap(),

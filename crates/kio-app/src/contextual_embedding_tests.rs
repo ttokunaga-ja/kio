@@ -543,10 +543,17 @@ fn batch_resume_repairs_interrupted_replica_publication_without_embedding_work()
             }),
         )
         .unwrap();
-        assert_eq!(result["tasks_executed"], 0, "{state}");
-        assert_eq!(result["tasks_attempted"], 0, "{state}");
-        assert_eq!(result["tasks_updated"], 0, "{state}");
-        assert_eq!(result["tasks_failed"], 0, "{state}");
+
+        let crate::response::ResponseBody::Batch(crate::response::batch::BatchResponse::Resume(
+            result,
+        )) = result.body
+        else {
+            panic!("expected Batch Resume response");
+        };
+        assert_eq!(result.counts.tasks_executed, 0, "{state}");
+        assert_eq!(result.counts.tasks_attempted, 0, "{state}");
+        assert_eq!(result.counts.tasks_updated, 0, "{state}");
+        assert_eq!(result.counts.tasks_failed, 0, "{state}");
         assert!(embedding_replica_projection_is_current(&repo), "{state}");
         assert_eq!(
             replica_scope_stamp(repo.kio_dir()).unwrap(),
@@ -612,9 +619,15 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
                 batch: false,
             }),
         )
+        .map(|response| match response.body {
+            crate::response::ResponseBody::Index(
+                crate::response::index::IndexResponse::Published(report),
+            ) => report,
+            _ => panic!("expected published Index response"),
+        })
         .unwrap()
     };
-    assert_eq!(index_result()["embedding_tasks_executed"], 6);
+    assert_eq!(index_result().embedding_tasks_executed, 6);
     let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let profile = declared_embedding_profile(EmbeddingExecution::DeterministicEvaluator);
 
@@ -636,11 +649,11 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
             fs::rename(root.path().join(OLD_PATH), root.path().join(CURRENT_PATH)).unwrap();
         }
         let result = index_result();
-        assert_eq!(result["embedding_tasks_executed"], executed);
-        assert_eq!(result["embedding_tasks_failed"], 0);
+        assert_eq!(result.embedding_tasks_executed, executed);
+        assert_eq!(result.embedding_tasks_failed, 0);
         assert_eq!(
             projection(&repo).sources.len(),
-            before.sources.len() + executed as usize
+            before.sources.len() + executed
         );
 
         let head = repo.head_commit_hash().unwrap().unwrap();
@@ -688,7 +701,7 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
         );
         let materialized = projection(&repo);
         let noop = index_result();
-        assert_eq!(noop["embedding_tasks_executed"], 0);
+        assert_eq!(noop.embedding_tasks_executed, 0);
         assert_eq!(projection(&repo), materialized);
         assert_eq!(TaskStore::new(repo.kio_dir()).all().unwrap(), tasks);
     }

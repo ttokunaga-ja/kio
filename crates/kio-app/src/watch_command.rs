@@ -2,10 +2,11 @@
 //! management or send authority. Each pass reopens the registered root and
 //! runs the same local index operation as the interactive command.
 
+use crate::response::index::IndexResponse;
 use crate::response::watch::{
     WatchLifecycleResponse, WatchObservation as InstanceState, WatchResponse,
 };
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use std::fs::TryLockError;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use kio_core::scope::new_ulid;
 use kio_core::store_dir::{Publication, StoreDirectory};
 use kio_core::{ExitCode, KioError, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::commands::{CommandRequest, IndexArgs, WatchArgs, WatchCommand};
@@ -39,7 +40,11 @@ struct StopRequest {
     instance: String,
 }
 
-pub(crate) fn run(ctx: &AppContext, args: WatchArgs, control: &ControlHandle) -> Result<Value> {
+pub(crate) fn run(
+    ctx: &AppContext,
+    args: WatchArgs,
+    control: &ControlHandle,
+) -> Result<CommandResponse> {
     let WatchArgs {
         root: configured_root,
         command,
@@ -47,7 +52,7 @@ pub(crate) fn run(ctx: &AppContext, args: WatchArgs, control: &ControlHandle) ->
     let command = match command {
         WatchCommand::Service(command) => {
             let body = crate::watch_service::run(ctx, configured_root, command, control)?;
-            return project_legacy(CommandResponse {
+            return Ok(CommandResponse {
                 body: ResponseBody::Watch(body),
                 completion: Completion::Complete,
             });
@@ -73,7 +78,7 @@ pub(crate) fn run(ctx: &AppContext, args: WatchArgs, control: &ControlHandle) ->
         WatchCommand::Stop => inspect(&root, true, control).map(WatchResponse::Stop),
         WatchCommand::Service(_) => unreachable!("service commands return before root resolution"),
     }?;
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Watch(body),
         completion: Completion::Complete,
     })
@@ -236,7 +241,7 @@ impl Reconcile for LocalReconciler {
         _: DirtyReason,
         _: &[PathBuf],
     ) -> std::result::Result<ReconcileCompletion, WatchError> {
-        let result = (|| -> Result<Value> {
+        let result = (|| -> Result<CommandResponse> {
             self.binding.revalidate()?;
             let record = read_record(&self.binding)?;
             if record.scope_id != self.scope_id || record.authority != ManagementAuthority::Root {
@@ -268,43 +273,78 @@ impl Reconcile for LocalReconciler {
             )
         })();
         let output = result.map_err(|error| WatchError::invariant(error.to_string()))?;
-        if crate::invocation::peek_exit_override(&output).is_some()
-            || output.get("status").and_then(Value::as_str) == Some("deferred")
+        let index = match &output.body {
+            ResponseBody::Index(index) => index,
+            _ => unreachable!("Index request returns an Index response"),
+        };
+        if output.completion != Completion::Complete || matches!(index, IndexResponse::Deferred(_))
         {
             // Keep the durable queue retry semantics, while making a partial
             // index result diagnosable without copying its potentially large
             // child-scope rows into watcher output or device state.
-            Unattended.diagnostic(&format!(
-                "watch reconciliation incomplete: {}",
-                incomplete_output_reason(&output)
-            ));
+            Unattended.diagnostic(&format!("watch reconciliation incomplete: {}", {
+                let (status, has_more, rows_total) = match index {
+                    IndexResponse::Published(report) => (
+                        report.status.as_str(),
+                        report
+                            .child_scope_discovery
+                            .as_ref()
+                            .map(|discovery| discovery.has_more),
+                        report
+                            .child_scope_discovery
+                            .as_ref()
+                            .map(|discovery| discovery.rows_total),
+                    ),
+                    IndexResponse::Preview(report) => (
+                        report.status.as_str(),
+                        report
+                            .child_scope_discovery
+                            .as_ref()
+                            .map(|discovery| discovery.has_more),
+                        None,
+                    ),
+                    IndexResponse::Deferred(report) => (report.status.as_str(), None, None),
+                };
+                incomplete_output_reason(
+                    status,
+                    index.error_code(),
+                    output.completion,
+                    has_more,
+                    rows_total,
+                )
+            }));
             return Ok(ReconcileCompletion::Incomplete);
         }
         Ok(ReconcileCompletion::Complete)
     }
 }
 
-fn incomplete_output_reason(output: &Value) -> String {
-    let status = output
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("missing");
-    let error_code = output
-        .get("error_code")
-        .and_then(Value::as_str)
-        .unwrap_or("missing");
-    let exit_code = crate::invocation::peek_exit_override(output)
+fn incomplete_output_reason(
+    status: &str,
+    error_code: Option<&str>,
+    completion: Completion,
+    has_more: Option<bool>,
+    rows_total: Option<u64>,
+) -> String {
+    let error_code = error_code.unwrap_or("missing");
+
+    // Preserve the existing numeric diagnostic text using core's established
+    // exit classifications. Completion controls retry; these values never
+    // determine a process exit or a successful wire response in the app.
+    let diagnostic_exit = match completion {
+        Completion::Complete => None,
+        Completion::Partial => Some(ExitCode::PartialFailure),
+        Completion::Permanent => Some(ExitCode::PermanentFailure),
+        Completion::AuthRequired => Some(ExitCode::AuthError),
+        Completion::BudgetBlocked => Some(ExitCode::BudgetExceeded),
+    };
+    let exit_code = diagnostic_exit
         .map(|code| code.code().to_string())
         .unwrap_or_else(|| "none".into());
-    let discovery = output.get("child_scope_discovery");
-    let has_more = discovery
-        .and_then(|value| value.get("has_more"))
-        .and_then(Value::as_bool)
+    let has_more = has_more
         .map(|value| value.to_string())
         .unwrap_or_else(|| "missing".into());
-    let rows_total = discovery
-        .and_then(|value| value.get("rows_total"))
-        .and_then(Value::as_u64)
+    let rows_total = rows_total
         .map(|value| value.to_string())
         .unwrap_or_else(|| "missing".into());
     format!(
@@ -507,14 +547,20 @@ mod tests {
 
     #[test]
     fn incomplete_output_reason_is_bounded_and_identifies_child_discovery() {
-        let mut output = json!({
+        let output = json!({
             "status": "indexed",
             "error_code": "KIO-E-INDEX-PARTIAL-001",
             "child_scope_discovery": {"has_more": true, "rows_total": 128},
         });
-        crate::task_execution::set_exit_override(&mut output, ExitCode::PartialFailure);
+
         assert_eq!(
-            incomplete_output_reason(&output),
+            incomplete_output_reason(
+                output["status"].as_str().unwrap_or("missing"),
+                output["error_code"].as_str(),
+                Completion::Partial,
+                output["child_scope_discovery"]["has_more"].as_bool(),
+                output["child_scope_discovery"]["rows_total"].as_u64(),
+            ),
             "status=indexed error_code=KIO-E-INDEX-PARTIAL-001 exit_code=3 child_discovery_has_more=true child_discovery_rows_total=128"
         );
     }

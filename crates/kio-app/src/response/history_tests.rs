@@ -2,7 +2,7 @@ use super::history::{
     DiffResponse, InspectResponse, LogResponse, RawInspection, TagDeleteResponse, TagResponse,
     TagSetResponse,
 };
-use super::{CommandResponse, Completion, ResponseBody, project_legacy};
+use super::{CommandResponse, Completion, ResponseBody};
 use kio_core::dag::{CommitObject, CommitStats, CommitType, TreeEntry, TreeObject};
 use kio_core::scope::{DiffEntry, LogEntry};
 use serde_json::{Value, json};
@@ -33,7 +33,7 @@ fn assert_projection(body: ResponseBody, legacy: Value) {
         completion: Completion::Complete,
     };
     assert_eq!(response.completion, Completion::Complete);
-    let actual = project_legacy(response).expect("project typed history response");
+    let actual = serde_json::to_value(response.body).expect("project typed history response");
     assert_eq!(actual, legacy);
     assert_eq!(
         serde_json::to_vec(&actual).expect("typed response bytes"),
@@ -180,7 +180,7 @@ fn tag_projection_preserves_set_and_delete_distinct_shapes() {
 
 #[test]
 fn legacy_glue_preserves_noncomplete_outcomes_during_migration() {
-    for (completion, code) in [
+    for (completion, _code) in [
         (Completion::Partial, 3),
         (Completion::Permanent, 4),
         (Completion::AuthRequired, 5),
@@ -193,9 +193,10 @@ fn legacy_glue_preserves_noncomplete_outcomes_during_migration() {
             }),
             completion,
         };
+        assert_eq!(response.completion, completion);
         assert_eq!(
-            project_legacy(response).expect("legacy completion projection"),
-            json!({ "commits": [], "truncated": false, "__exit_code": code })
+            serde_json::to_value(response.body).expect("legacy completion projection"),
+            json!({ "commits": [], "truncated": false })
         );
     }
 }

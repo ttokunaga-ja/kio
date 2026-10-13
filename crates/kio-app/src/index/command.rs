@@ -56,7 +56,7 @@ use crate::response::search::IndexStatusError;
 use crate::response::search::IndexStatusResponse;
 use crate::response::search::OfficeConversionUnavailableResponse;
 use crate::response::skipped_units::SkippedUnit;
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use crate::scope_access::ensure_raw_ingest_allowed;
 use crate::scope_access::register_scope;
 use crate::scope_access::resolve_evidence_scope_target;
@@ -97,7 +97,6 @@ use kio_pipeline::task::TaskType;
 use kio_pipeline::unsupported::UNSUPPORTED_REASON_UNRECOGNIZED_BINARY;
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
 use kio_pipeline::unsupported::UnsupportedInputStore;
-use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -115,13 +114,13 @@ use std::sync::Arc;
 /// `kio-pipeline`.
 pub(crate) const OFFICE_CONVERSION_UNAVAILABLE_REASON: &str = "office_conversion_unavailable";
 
-pub(crate) fn run_index(ctx: &Invocation<'_>, args: IndexArgs) -> Result<Value> {
+pub(crate) fn run_index(ctx: &Invocation<'_>, args: IndexArgs) -> Result<CommandResponse> {
     // `index --preview` is read-only all the way through opening the repository:
     // the ordinary open path may repair a missing HEAD, which would violate the
     // preview no-state-creation contract before scanning.
     let repo = open_existing_managed_root(ctx.cwd(), ctx.control)?.in_lock_session(ctx.locks);
     let execution = run_index_for_repo(ctx, args, &repo, true)?;
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Index(execution.response),
         completion: execution.completion,
     })
@@ -1281,9 +1280,9 @@ pub(crate) fn record_unsupported_if_changed(
     Ok(true)
 }
 
-pub(crate) fn run_reindex(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Value> {
+pub(crate) fn run_reindex(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<CommandResponse> {
     let execution = run_reindex_response(ctx, args)?;
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Reindex(execution.response),
         completion: execution.completion,
     })

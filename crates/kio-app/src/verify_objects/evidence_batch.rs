@@ -4,13 +4,12 @@ use std::path::Path;
 
 use kio_core::cas::{hash_bytes, read_bounded_regular_file};
 use kio_core::{ExitCode, Result};
-use serde_json::Value;
 
 use crate::response::evidence::{
     EvidenceBatchResponse, EvidenceBatchRow, EvidenceBatchSummary, EvidenceResponse,
     EvidenceStatusCounts, batch_completion,
 };
-use crate::response::{CommandResponse, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, ResponseBody};
 
 use super::{
     EvidenceVerification, MAX_BATCH_INPUT_BYTES, MAX_BATCH_VERIFIED_BYTES, batch_limit_error,
@@ -22,7 +21,7 @@ pub(super) fn run_evidence_batch(
     registry_input: &EvidenceRegistry,
     path: &Path,
     strict: bool,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     let bytes = read_bounded_regular_file(path, MAX_BATCH_INPUT_BYTES).map_err(|error| {
         if matches!(
             error.error_code(),
@@ -74,7 +73,7 @@ pub(super) fn run_evidence_batch(
             }
         })
         .collect::<Vec<_>>();
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Evidence(EvidenceResponse::Batch(EvidenceBatchResponse {
             schema: "kio.evidence.batch-verify".to_owned(),
             schema_version: 1,

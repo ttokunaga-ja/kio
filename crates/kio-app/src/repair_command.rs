@@ -13,7 +13,7 @@ use crate::index::chunk_ledger::recover_index_generation;
 use crate::index::rebuild::rebuild_step3_index;
 use crate::index::rebuild::skipped_disclosure;
 use crate::invocation::Invocation;
-use crate::invocation::exit_override_error_code;
+use crate::invocation::non_success_error_code;
 use crate::ledger_access::open_optional_ledger_db;
 use crate::ledger_access::recover_stale_sync_rows;
 use crate::managed_restore;
@@ -24,7 +24,7 @@ use crate::promotion::clear_promotion_state;
 use crate::promotion::maybe_inject_promotion_fault;
 use crate::promotion::recover_pending_online_promotion;
 use crate::response::repair::*;
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use crate::scope_access::scope_id;
 use crate::search::projection::log_aggregator_degraded;
 use crate::search::projection::mark_replica_rebuilding_or_log;
@@ -46,7 +46,6 @@ use kio_core::scope::Repository;
 use kio_index::registry::RegistryDb;
 use kio_index::registry::RegistryEntry;
 use kio_pipeline::task::TaskStore;
-use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -71,7 +70,7 @@ fn reject_inert_repair_yes(args: &RepairArgs) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run_repair(ctx: &Invocation<'_>, args: RepairArgs) -> Result<Value> {
+pub(crate) fn run_repair(ctx: &Invocation<'_>, args: RepairArgs) -> Result<CommandResponse> {
     if matches!(&args.operation, RepairOperation::VerifyObjects(_)) {
         return kio_core::cas::VerifiedCasReadBudget::new()
             .run(u64::MAX, |reads| {
@@ -86,7 +85,7 @@ fn run_repair_with_reads(
     ctx: &Invocation<'_>,
     args: RepairArgs,
     reads: Option<&kio_core::cas::VerifiedCasReadCapability>,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     reject_inert_repair_yes(&args)?;
     if let RepairOperation::CancelChildInitialization(cancel) = args.operation {
         if cancel.preview == cancel.yes || (cancel.yes && cancel.operation.is_none()) {
@@ -125,7 +124,7 @@ fn run_repair_with_reads(
         let plan = verify_objects::registry_prune_plan_with_control(ctx.control)?;
         confirm_repair_prune(ctx, "registry-prune", &plan.target_lines(), prune.yes)?;
         let report = verify_objects::registry_prune_apply_with_control(&plan, ctx.control)?;
-        return project_legacy(CommandResponse {
+        return Ok(CommandResponse {
             body: ResponseBody::Repair(RepairResponse::RegistryPrune(report)),
             completion: Completion::Complete,
         });
@@ -138,7 +137,7 @@ fn run_repair_with_reads(
                 && error.error_code() == "KIO-E-STORE-NAMESPACE-001" =>
         {
             let report = verify_objects::VerifyObjectsReport::namespace_unavailable(&error);
-            return project_legacy(CommandResponse {
+            return Ok(CommandResponse {
                 body: ResponseBody::Repair(RepairResponse::VerifyObjects(RepairVerifyResponse {
                     report,
                     prune_orphans: None,
@@ -174,7 +173,7 @@ fn run_repair_with_reads(
     ) && kio_core::gc::read_active_marker_with_control(repo.kio_dir(), repo.control())?.is_some()
     {
         let report = verify_objects::verify_objects(&repo)?;
-        return project_legacy(CommandResponse {
+        return Ok(CommandResponse {
             body: ResponseBody::Repair(RepairResponse::VerifyObjects(RepairVerifyResponse {
                 report,
                 prune_orphans: None,
@@ -188,7 +187,7 @@ fn run_repair_with_reads(
     if mode == RepairMode::VerifyObjectsPruneOrphans
         && let Some(prune) = verify_objects::prune_orphans_preflight(&repo)?
     {
-        return project_legacy(CommandResponse {
+        return Ok(CommandResponse {
             body: ResponseBody::Repair(RepairResponse::PruneBlocked(RepairPruneBlockedResponse {
                 prune_orphans: prune,
                 error_code: "KIO-E-PRUNE-ORPHANS-BLOCKED-001".to_owned(),
@@ -245,7 +244,7 @@ fn run_repair_with_reads(
                 .to_owned(),
             );
             // PB15: never prune on top of an unverified/corrupt store.
-            return project_legacy(CommandResponse {
+            return Ok(CommandResponse {
                 body: ResponseBody::Repair(RepairResponse::VerifyObjects(output)),
                 completion: Completion::Partial,
             });
@@ -278,14 +277,14 @@ fn run_repair_with_reads(
             }
             output.prune_orphans = Some(prune);
         }
-        return project_legacy(CommandResponse {
+        return Ok(CommandResponse {
             body: ResponseBody::Repair(RepairResponse::VerifyObjects(output)),
             completion,
         });
     }
     let (response, completion) =
         run_rebuild_db_locked(ctx, &repo, parsed.online, parsed.offline, true)?;
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Repair(RepairResponse::RebuildDb(response)),
         completion,
     })
@@ -399,7 +398,7 @@ fn run_rebuild_db_locked(
 /// Device-global repair deliberately enumerates the registry before opening any
 /// scope.  The registry connection is dropped before locks are taken: a repair
 /// must never hold the device database while it waits on a scope writer.
-fn run_device_repair(ctx: &Invocation<'_>, rebuild_source: bool) -> Result<Value> {
+fn run_device_repair(ctx: &Invocation<'_>, rebuild_source: bool) -> Result<CommandResponse> {
     let entries = {
         let registry = RegistryDb::open_default_with_control(ctx.control).map_err(index_to_kio)?;
         registry.all_entries().map_err(index_to_kio)?
@@ -561,7 +560,7 @@ fn run_device_repair(ctx: &Invocation<'_>, rebuild_source: bool) -> Result<Value
         output.error_code = Some(code.to_owned());
         completion = outcome;
     }
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Repair(RepairResponse::Device(output)),
         completion,
     })
@@ -728,7 +727,7 @@ fn run_one_device_repair(
         };
         if let Some(exit) = exit {
             return Err(KioError::new(
-                exit_override_error_code(exit),
+                non_success_error_code(exit),
                 "source SQLite recovery completed with outstanding work",
                 serde_json::to_value(&result)
                     .map_err(|error| KioError::schema(error.to_string()))?,

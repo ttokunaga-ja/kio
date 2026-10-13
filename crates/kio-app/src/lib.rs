@@ -24,6 +24,7 @@ use crate::ledger_access::run_ledger;
 use crate::open_view::run_open;
 use crate::open_view::run_view;
 use crate::repair_command::run_repair;
+use crate::response::CommandResponse;
 use crate::scope_commands::run_init;
 use crate::scope_commands::run_status;
 use crate::search::command::run_search;
@@ -40,7 +41,6 @@ use crate::snapshot_history::run_tag;
 use kio_core::Result;
 #[cfg(debug_assertions)]
 use kio_core::test_control::DebugTestControl;
-use serde_json::Value;
 use std::sync::Arc;
 
 mod index;
@@ -92,7 +92,7 @@ pub mod commands;
 pub mod context;
 pub mod response;
 
-pub fn execute(ctx: &AppContext, command: Command) -> Result<Value> {
+pub fn execute(ctx: &AppContext, command: Command) -> Result<CommandResponse> {
     #[cfg(debug_assertions)]
     let control = kio_core::control::ControlHandle::new(DebugTestControl::from_env());
     #[cfg(not(debug_assertions))]
@@ -163,7 +163,7 @@ pub fn execute(ctx: &AppContext, command: Command) -> Result<Value> {
     )
 }
 
-fn execute_dispatch(ctx: &Invocation<'_>, command: Command) -> Result<Value> {
+fn execute_dispatch(ctx: &Invocation<'_>, command: Command) -> Result<CommandResponse> {
     let adapter_settings = ctx.settings;
 
     match command {

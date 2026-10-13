@@ -3,7 +3,7 @@ use crate::commands::CommandRequest as Command;
 use crate::context::AppContext;
 use crate::ledger_access::run_ledger_lifecycle;
 use crate::multi_scope;
-use crate::response::Completion;
+use crate::response::{CommandResponse, Completion};
 use crate::trust;
 use crate::watch_command;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
@@ -11,25 +11,7 @@ use kio_core::ExitCode;
 use kio_core::Result;
 use kio_core::control::ControlHandle;
 use kio_core::scope::Repository;
-use serde_json::Value;
 use std::sync::Arc;
-
-pub(crate) fn peek_exit_override(output: &Value) -> Option<ExitCode> {
-    output
-        .get("__exit_code")
-        .and_then(Value::as_u64)
-        .and_then(exit_code_from_override)
-}
-
-fn exit_code_from_override(code: u64) -> Option<ExitCode> {
-    match code {
-        3 => Some(ExitCode::PartialFailure),
-        4 => Some(ExitCode::PermanentFailure),
-        5 => Some(ExitCode::AuthError),
-        6 => Some(ExitCode::BudgetExceeded),
-        _ => None,
-    }
-}
 
 pub(crate) fn merged_index_completion(
     parent: Completion,
@@ -59,7 +41,7 @@ pub(crate) fn merged_index_completion(
     }
 }
 
-pub(crate) fn exit_override_error_code(code: ExitCode) -> &'static str {
+pub(crate) fn non_success_error_code(code: ExitCode) -> &'static str {
     match code {
         ExitCode::AuthError => "KIO-E-ADAPTER-AUTH-001",
         ExitCode::BudgetExceeded => "KIO-E-BUDGET-EXCEEDED-001",
@@ -118,7 +100,7 @@ pub(crate) fn execute_lifecycle(
     ctx: &AppContext,
     control: &ControlHandle,
     command: Command,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     match command {
         Command::Watch(args) => watch_command::run(ctx, args, control),
         Command::Adapter(args) => run_adapter_lifecycle(ctx, args.command, control),

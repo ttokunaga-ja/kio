@@ -13,7 +13,6 @@ use crate::response::CommandResponse;
 use crate::response::Completion;
 use crate::response::ResponseBody;
 use crate::response::device::InitResponse;
-use crate::response::project_legacy;
 use crate::response::status::StatusResponse;
 use crate::scope_access::register_scope;
 use crate::settings::validate_repo_tool_lock;
@@ -23,9 +22,8 @@ use kio_core::Result;
 use kio_core::purge::PurgeState;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::unsupported::UnsupportedInputStore;
-use serde_json::Value;
 
-pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result<Value> {
+pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result<CommandResponse> {
     let working_directory = ctx.cwd().to_path_buf();
     let requested = args.path.unwrap_or(working_directory.clone());
     let path = if requested.is_absolute() {
@@ -74,7 +72,7 @@ pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result
     } else {
         "repaired"
     };
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Init(InitResponse {
             status: status.to_owned(),
             repaired,
@@ -85,7 +83,7 @@ pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result
     })
 }
 
-pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<Value> {
+pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<CommandResponse> {
     let repo = ctx.open_recovery_repository()?;
     validate_repo_tool_lock(&repo)?;
     let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
@@ -103,7 +101,7 @@ pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<Value> {
     };
     let tasks = task_store.all().map_err(pipeline_to_kio)?;
     let ledger_snapshot = open_search_budget_snapshot(&ledger_db_path(ctx.control), ctx.control)?;
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Status(Box::new(StatusResponse {
             scope_path: repo.kio_dir().to_path_buf(),
             files: status.files,

@@ -15,7 +15,6 @@ use crate::object_persistence::search_to_kio;
 use crate::response::CommandResponse;
 use crate::response::Completion;
 use crate::response::ResponseBody;
-use crate::response::project_legacy;
 use crate::response::search::AggregatorResponse;
 use crate::response::search::ChunkSearchHit;
 use crate::response::search::ExcludedScopeResponse;
@@ -111,14 +110,13 @@ use kio_search::query::QueryHashInput;
 use kio_search::query::ScopeSelectionMode;
 use kio_search::query::SearchMode;
 use kio_search::query::query_hash;
-use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::time::Instant;
 use unicode_normalization::UnicodeNormalization;
 
-pub(crate) fn run_search(ctx: &Invocation<'_>, args: SearchArgs) -> Result<Value> {
+pub(crate) fn run_search(ctx: &Invocation<'_>, args: SearchArgs) -> Result<CommandResponse> {
     // R12-4: a FAILED search (cursor mismatch, all-scope-failed, …) returns before
     // `append_search_logs`, so it never wrote a per-search metrics line and dropped
     // out of the p50/p95/p99 latency population (docs/05:578). Emit that line here on
@@ -132,7 +130,11 @@ pub(crate) fn run_search(ctx: &Invocation<'_>, args: SearchArgs) -> Result<Value
     result
 }
 
-fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) -> Result<Value> {
+fn run_search_inner(
+    ctx: &Invocation<'_>,
+    args: SearchArgs,
+    started: Instant,
+) -> Result<CommandResponse> {
     let adapter_settings = ctx.settings;
 
     let parsed = parsed_search(args)?;
@@ -1866,7 +1868,7 @@ fn run_search_inner(ctx: &Invocation<'_>, args: SearchArgs, started: Instant) ->
             next_cursor_suppressed: true,
         });
     }
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Search(response),
         completion,
     })

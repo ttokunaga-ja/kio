@@ -3,7 +3,7 @@
 use crate::response::mutation::{
     ExportFailure, ExportPartial, ExportResponse, ExportSuccess, ExportedFile,
 };
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use kio_core::control::ControlHandle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -23,7 +23,7 @@ use kio_core::portable::portable_collision_key;
 use kio_core::purge::{EventKind, PurgeState, canonical_final_event};
 use kio_core::scope::Repository;
 use kio_core::{ExitCode, KioError, Result};
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::Digest;
 
 use crate::commands::ExportArgs;
@@ -80,7 +80,10 @@ struct DestinationDir {
     handle: File,
 }
 
-pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: ExportArgs) -> Result<Value> {
+pub(super) fn run(
+    ctx: &crate::invocation::Invocation<'_>,
+    args: ExportArgs,
+) -> Result<CommandResponse> {
     if args.yes && !args.force {
         return Err(KioError::invalid_usage(
             "export --yes is valid only together with --force",
@@ -150,7 +153,7 @@ pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: ExportArgs) -> 
         ExportResponse::Exported(_) => Completion::Complete,
         ExportResponse::Partial(_) => Completion::Partial,
     };
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Export(body),
         completion,
     })

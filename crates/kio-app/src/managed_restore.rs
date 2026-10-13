@@ -4,12 +4,12 @@
 
 use crate::response::mutation::{RestoreProvenance, RestoreResponse};
 use crate::response::repair::*;
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use std::path::PathBuf;
 
 use kio_core::scope::{ManagedRestorePlan, ManagedRestoreRequest, Repository};
 use kio_core::{ExitCode, KioError, Result};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::commands::RestoreArgs;
 use crate::index::chunk_ledger::recover_index_generation;
@@ -23,7 +23,10 @@ use crate::search::projection::write_through_projection_full;
 use crate::search::scope::current_embedding_policy;
 use crate::settings::validate_repo_tool_lock;
 
-pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: RestoreArgs) -> Result<Value> {
+pub(super) fn run(
+    ctx: &crate::invocation::Invocation<'_>,
+    args: RestoreArgs,
+) -> Result<CommandResponse> {
     // This is intentionally the strict, bound managed-root open.  In
     // particular, restore never invokes the recovery opener, so --preview has
     // no publication, index, ledger, or working-tree side effect.
@@ -66,7 +69,7 @@ pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: RestoreArgs) ->
     ensure_planned_paths_allowed(&policy, &plan)?;
 
     if args.preview {
-        return project_legacy(CommandResponse {
+        return Ok(CommandResponse {
             body: ResponseBody::Restore(plan_response("preview", &plan, None)),
             completion: Completion::Complete,
         });
@@ -90,7 +93,7 @@ pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: RestoreArgs) ->
     let mut completion = Completion::Complete;
     if outcome.noop {
         result.projection_status = Some("unchanged".to_owned());
-        return project_legacy(CommandResponse {
+        return Ok(CommandResponse {
             body: ResponseBody::Restore(result),
             completion,
         });
@@ -114,7 +117,7 @@ pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: RestoreArgs) ->
             completion = Completion::Partial;
         }
     }
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Restore(result),
         completion,
     })
@@ -123,7 +126,7 @@ pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: RestoreArgs) ->
 /// `repair recover-restore` is intentionally distinct from ordinary
 /// publication recovery.  A pending restore journal governs working bytes and
 /// must be resolved by core before any generic publication-recovery pathway.
-pub(super) fn recover(ctx: &crate::invocation::Invocation<'_>) -> Result<Value> {
+pub(super) fn recover(ctx: &crate::invocation::Invocation<'_>) -> Result<CommandResponse> {
     let repo = Repository::open_recovery_in_session(ctx.cwd(), ctx.control.clone(), ctx.locks)?;
     validate_repo_tool_lock(&repo)?;
     // Recovery has to be possible when the policy that permitted the original
@@ -168,7 +171,7 @@ pub(super) fn recover(ctx: &crate::invocation::Invocation<'_>) -> Result<Value> 
             }
         }
     }
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Repair(RepairResponse::RecoverRestore(result)),
         completion,
     })

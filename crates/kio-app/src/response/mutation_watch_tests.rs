@@ -1,8 +1,7 @@
-// Install as response/mutation_watch_tests.rs. Evidence-only, uncompiled draft.
 use super::mutation::*;
 use super::skipped_units::SkippedUnit;
 use super::watch::*;
-use super::{CommandResponse, Completion, ResponseBody, project_legacy};
+use super::{CommandResponse, Completion, ResponseBody};
 use kio_core::purge::{PurgePhase, PurgeReason, TombstoneMode};
 use kio_core::scope::{ManagedRestoreChange, ManagedRestoreOutcome};
 use serde::Serialize;
@@ -442,12 +441,12 @@ fn mutation_legacy_projection_preserves_partial_body_and_marker_outside_payload(
     expected["error_code"] = json!("KIO-E-COMMIT-EXPORT-PARTIAL-001");
     expected["failed"] = json!([{"path":PathBuf::from("failed"),"path_at_commit":"file","raw_hash":"raw",
         "error_code":"KIO-E-STORE-IO-001","message":"failed"}]);
-    expected["__exit_code"] = json!(3);
-    let actual = project_legacy(CommandResponse {
+    let response = CommandResponse {
         body,
         completion: Completion::Partial,
-    })
-    .unwrap();
+    };
+    assert_eq!(response.completion, Completion::Partial);
+    let actual = serde_json::to_value(response.body).unwrap();
     assert_eq!(actual, expected);
     assert_eq!(
         serde_json::to_vec(&actual).unwrap(),
@@ -461,11 +460,12 @@ fn watch_success_with_degraded_observation_projects_as_complete() {
         root: "scope/日本語".into(),
         last_observation: Some(observation()),
     }));
-    let actual = project_legacy(CommandResponse {
+    let response = CommandResponse {
         body,
         completion: Completion::Complete,
-    })
-    .unwrap();
+    };
+    assert_eq!(response.completion, Completion::Complete);
+    let actual = serde_json::to_value(response.body).unwrap();
     let expected = json!({"status":"stopped","root":PathBuf::from("scope/日本語"),"last_observation":expected_observation()});
     assert_eq!(actual, expected);
     assert_eq!(

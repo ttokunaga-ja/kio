@@ -10,7 +10,7 @@ use crate::open_view::parse_object_uri;
 use crate::open_view::parse_pointer_text;
 use crate::open_view::read_pointer_input;
 use crate::response::evidence::{EvidenceResponse, EvidenceRetargetResponse};
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use crate::scope_access::is_store_not_found;
 use crate::scope_access::unresolvable_commit_pointer_error;
 use kio_core::ExitCode;
@@ -120,7 +120,7 @@ pub(super) fn run_evidence_retarget(
     ctx: &crate::invocation::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     args: EvidenceRetargetArgs,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     if !is_hash(&args.at) {
         return Err(KioError::invalid_usage(
             "--at must be a full lowercase `sha256:` object hash",
@@ -137,11 +137,9 @@ pub(super) fn run_evidence_retarget(
         .run(MAX_RETARGET_VERIFIED_BYTES, |reads| {
             run_evidence_retarget_bound(ctx, registry_input, &pointer, &args.at, reads)
         })
-        .and_then(|(body, _)| {
-            project_legacy(CommandResponse {
-                body: ResponseBody::Evidence(EvidenceResponse::Retarget(Box::new(body))),
-                completion: Completion::Complete,
-            })
+        .map(|(body, _)| CommandResponse {
+            body: ResponseBody::Evidence(EvidenceResponse::Retarget(Box::new(body))),
+            completion: Completion::Complete,
         })
         .map_err(|error| {
             if matches!(

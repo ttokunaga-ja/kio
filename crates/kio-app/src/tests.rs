@@ -156,10 +156,16 @@ fn index_reconciles_more_than_legacy_child_cap_and_deep_pages_in_one_run() {
     )
     .unwrap();
 
-    let discovery = output["child_scope_discovery"].as_object().unwrap();
-    assert_eq!(discovery["has_more"], false);
-    assert_eq!(discovery["rows_total"], 578);
-    assert_eq!(discovery["rows_omitted"], 450);
+    let crate::response::ResponseBody::Index(crate::response::index::IndexResponse::Published(
+        output,
+    )) = output.body
+    else {
+        panic!("expected published Index response");
+    };
+    let discovery = output.child_scope_discovery.as_ref().unwrap();
+    assert!(!discovery.has_more);
+    assert_eq!(discovery.rows_total, 578);
+    assert_eq!(discovery.rows_omitted, 450);
     assert!((0..513).all(|index| {
         root.join(format!("flat-{index:04}/.kio/scope.json"))
             .is_file()

@@ -2,7 +2,7 @@ use kio_core::purge::{PurgePhase, PurgeReason, TombstoneMode};
 use kio_core::scope::{ManagedRestoreChange, ManagedRestoreOutcome};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-// One canonical shared definition, prepared by C3d. No duplicate recovery schema.
+// Restore and repair share the same recovery projection and error records.
 pub use super::repair::{
     ManagedRestoreProjection as RestoreProjection,
     ManagedRestoreProjectionError as RestoreProjectionError,

@@ -1,5 +1,3 @@
-// Install in response/completion_tests.rs after C3d projection Red is recorded.
-// Expected initial failure is missing canonical helper API, not a behaviour claim.
 use super::Completion;
 use crate::task_execution::{
     ExecOutcome, batch_completion, batch_error_code, enrichment_completion,

@@ -6,6 +6,7 @@ use serde_json::{Value, json};
 use super::{AppContext, Interaction, test_support};
 use crate::commands::CommandRequest as Command;
 use crate::commands::PointerArgs;
+use crate::response::CommandResponse;
 
 struct NestedInput {
     inner: AppContext,
@@ -23,7 +24,8 @@ impl Interaction for NestedInput {
         let result = crate::execute(&self.inner, Command::Status)?;
         let mut observed = self.observed.lock().unwrap();
         assert!(observed.is_none(), "outer input is consumed exactly once");
-        *observed = Some(result);
+        *observed =
+            Some(serde_json::to_value(result.body).expect("test-only nested response projection"));
         Ok(self.pointer.clone())
     }
 
@@ -40,9 +42,13 @@ impl Interaction for NestedInput {
     }
 }
 
-fn outcome(result: Result<Value>) -> Value {
+fn outcome(result: Result<CommandResponse>) -> Value {
     match result {
-        Ok(value) => json!({"value": value}),
+        Ok(value) => json!({"value":
+        serde_json::to_value(
+        value
+        .body).expect("test-only response projection")
+        }),
         Err(error) => json!({
             "error_code": error.error_code(),
             "message": error.message(),

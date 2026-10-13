@@ -23,7 +23,6 @@ use crate::response::pointer::ObjectFileResponse;
 use crate::response::pointer::OpenResponse;
 use crate::response::pointer::RawPointerResponse;
 use crate::response::pointer::ViewResponse;
-use crate::response::project_legacy;
 use crate::scope_access::ReadBarrierCheckpoint;
 use crate::scope_access::enforce_canonical_marker_barrier;
 use crate::scope_access::enforce_canonical_tombstone_only;
@@ -89,7 +88,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process;
 
-pub(crate) fn run_open(ctx: &Invocation<'_>, args: PointerArgs) -> Result<Value> {
+pub(crate) fn run_open(ctx: &Invocation<'_>, args: PointerArgs) -> Result<CommandResponse> {
     let raw = read_pointer_input(ctx, args.pointer.into_iter().collect())?;
     if let Some(object) = parse_object_uri(&raw)? {
         return resolve_object_uri(ctx, &object, false);
@@ -99,7 +98,7 @@ pub(crate) fn run_open(ctx: &Invocation<'_>, args: PointerArgs) -> Result<Value>
     }
     let pointer = parse_pointer_text(&raw)?;
     let resolved = resolve_pointer_for_cli(ctx, &pointer)?;
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Open(OpenResponse::Evidence(EvidenceOpenResponse {
             status: "opened".to_owned(),
             path: resolved.path,
@@ -113,7 +112,7 @@ pub(crate) fn run_open(ctx: &Invocation<'_>, args: PointerArgs) -> Result<Value>
     })
 }
 
-pub(crate) fn run_view(ctx: &Invocation<'_>, args: PointerArgs) -> Result<Value> {
+pub(crate) fn run_view(ctx: &Invocation<'_>, args: PointerArgs) -> Result<CommandResponse> {
     let raw = read_pointer_input(ctx, args.pointer.into_iter().collect())?;
     if let Some(object) = parse_object_uri(&raw)? {
         return resolve_object_uri(ctx, &object, true);
@@ -123,7 +122,7 @@ pub(crate) fn run_view(ctx: &Invocation<'_>, args: PointerArgs) -> Result<Value>
     }
     let pointer = parse_pointer_text(&raw)?;
     let resolved = resolve_pointer_for_cli(ctx, &pointer)?;
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::View(ViewResponse::Evidence(EvidenceViewResponse {
             status: "viewed".to_owned(),
             raw_hash: pointer.raw_hash,
@@ -382,12 +381,16 @@ fn raw_object_present(target: &ScopeTarget, raw_hash: &str) -> Result<bool> {
 
 /// Resolve a `sha256:` short-form operand for `kio open` / `kio view`
 /// (08 §2.3 rule 4). Handles both the chunk_hash and raw_hash kinds.
-fn resolve_short_hash_command(ctx: &Invocation<'_>, hash: &str, as_view: bool) -> Result<Value> {
+fn resolve_short_hash_command(
+    ctx: &Invocation<'_>,
+    hash: &str,
+    as_view: bool,
+) -> Result<CommandResponse> {
     match classify_short_hash(ctx, hash)? {
         ShortHash::Chunk(pointer) => {
             let resolved = resolve_pointer_for_cli(ctx, &pointer)?;
             if as_view {
-                project_legacy(CommandResponse {
+                Ok(CommandResponse {
                     body: ResponseBody::View(ViewResponse::Evidence(EvidenceViewResponse {
                         status: "viewed".to_owned(),
                         raw_hash: pointer.raw_hash,
@@ -404,7 +407,7 @@ fn resolve_short_hash_command(ctx: &Invocation<'_>, hash: &str, as_view: bool) -
                     completion: Completion::Complete,
                 })
             } else {
-                project_legacy(CommandResponse {
+                Ok(CommandResponse {
                     body: ResponseBody::Open(OpenResponse::Evidence(EvidenceOpenResponse {
                         status: "opened".to_owned(),
                         path: resolved.path,
@@ -481,7 +484,7 @@ fn resolve_short_hash_command(ctx: &Invocation<'_>, hash: &str, as_view: bool) -
                     } else {
                         ResponseBody::Open(OpenResponse::Raw(payload))
                     };
-                    project_legacy(CommandResponse {
+                    Ok(CommandResponse {
                         body,
                         completion: Completion::Complete,
                     })
@@ -1834,7 +1837,11 @@ pub(crate) fn parse_object_uri(input: &str) -> Result<Option<ObjectUri>> {
 
 /// Resolves an `object` reference URI (08 §2.3) for `kio open` / `kio view`.
 /// This is a distinct path from Evidence Pointer resolution.
-fn resolve_object_uri(ctx: &Invocation<'_>, object: &ObjectUri, as_view: bool) -> Result<Value> {
+fn resolve_object_uri(
+    ctx: &Invocation<'_>,
+    object: &ObjectUri,
+    as_view: bool,
+) -> Result<CommandResponse> {
     let status = if as_view { "viewed" } else { "opened" };
     let target = resolve_scope_target(
         ctx.cwd(),
@@ -1888,7 +1895,7 @@ fn resolve_object_uri(ctx: &Invocation<'_>, object: &ObjectUri, as_view: bool) -
         } else {
             ResponseBody::Open(OpenResponse::ObjectChunk(payload))
         };
-        return project_legacy(CommandResponse {
+        return Ok(CommandResponse {
             body,
             completion: Completion::Complete,
         });
@@ -1997,7 +2004,7 @@ fn resolve_object_uri(ctx: &Invocation<'_>, object: &ObjectUri, as_view: bool) -
             } else {
                 ResponseBody::Open(OpenResponse::ObjectFile(payload))
             };
-            project_legacy(CommandResponse {
+            Ok(CommandResponse {
                 body,
                 completion: Completion::Complete,
             })

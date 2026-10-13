@@ -31,6 +31,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(debug_assertions)]
 use std::time::Instant;
 
 /// Mutation-side purge gate. U19/LC22: a public tombstone (active or

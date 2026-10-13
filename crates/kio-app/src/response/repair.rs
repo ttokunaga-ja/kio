@@ -122,8 +122,8 @@ pub struct CancelChildApplied {
     pub cancelled: bool,
     pub resumed: bool,
 }
-// These DTOs also cover the recovery branch consumed by C3e Restore.
-// Keep one canonical definition when that candidate is installed.
+// Restore responses reuse these recovery projection and error records.
+
 #[derive(Debug, Serialize)]
 pub struct ManagedRestoreRecoveryResponse {
     pub operation: String,

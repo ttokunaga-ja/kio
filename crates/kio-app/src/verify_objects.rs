@@ -115,7 +115,7 @@ const MAX_BATCH_VERIFIED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 pub(super) fn run_evidence(
     ctx: &crate::invocation::Invocation<'_>,
     args: EvidenceArgs,
-) -> Result<Value> {
+) -> Result<crate::response::CommandResponse> {
     let registry_input = &EvidenceRegistry::default();
     match args.command {
         EvidenceCommand::Verify(args) => run_evidence_verify(ctx, registry_input, args),
@@ -127,7 +127,7 @@ fn run_evidence_verify(
     ctx: &crate::invocation::Invocation<'_>,
     registry_input: &EvidenceRegistry,
     args: EvidenceVerifyArgs,
-) -> Result<Value> {
+) -> Result<crate::response::CommandResponse> {
     if let Some(batch) = args.batch {
         return run_evidence_batch(ctx, registry_input, &batch, args.strict);
     }

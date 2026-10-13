@@ -9,7 +9,7 @@ use crate::response::mutation::{
     DeletedCounts, PurgeIncomplete, PurgeResponse, PurgeSuccess, SharedArtifactsPreserved,
     WorkingTreeWarning,
 };
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use kio_core::control::ControlHandle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -103,7 +103,10 @@ struct PurgeReport {
     log_fields_masked: u64,
 }
 
-pub(crate) fn run(ctx: &crate::invocation::Invocation<'_>, args: PurgeArgs) -> Result<Value> {
+pub(crate) fn run(
+    ctx: &crate::invocation::Invocation<'_>,
+    args: PurgeArgs,
+) -> Result<CommandResponse> {
     let repo = ctx.open_recovery_repository()?;
     // Orphan cleanup is transaction recovery, not target mutation. Run it under
     // the store lock before preview/working-copy refusal so a tombstoned raw temp
@@ -126,7 +129,7 @@ pub(crate) fn run(ctx: &crate::invocation::Invocation<'_>, args: PurgeArgs) -> R
         PurgeResponse::Purged(_) => Completion::Complete,
         PurgeResponse::Incomplete(_) => Completion::Partial,
     };
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Purge(body),
         completion,
     })

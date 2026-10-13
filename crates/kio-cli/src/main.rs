@@ -9,6 +9,7 @@ use clap::Parser;
 
 use crate::args::Cli;
 use kio_app::context::{AppContext, Interaction};
+use kio_app::response::Completion;
 use kio_core::{ExitCode, KioError, Result};
 use serde_json::{Value, json};
 
@@ -28,11 +29,15 @@ fn main() {
         working_directory,
         interaction: Arc::new(TerminalInteraction { json_mode }),
     };
-    let exit_code = match kio_app::execute(&context, cli.command.into()) {
-        Ok(mut output) => {
-            let code = take_exit_override(&mut output).unwrap_or(ExitCode::Success);
+    let exit_code = match kio_app::execute(&context, cli.command.into()).and_then(|response| {
+        let code = completion_exit_code(response.completion);
+        let output = serde_json::to_value(response.body)
+            .map_err(|error| KioError::schema(error.to_string()))?;
+        Ok((output, code))
+    }) {
+        Ok((output, code)) => {
             if code != ExitCode::Success {
-                append_exit_override_error(&output, code);
+                append_completion_error(&output, code);
             }
             print_output(output, json_mode);
             code
@@ -107,27 +112,22 @@ fn read_confirmation(reader: impl BufRead) -> Result<bool> {
     ))
 }
 
-fn take_exit_override(output: &mut Value) -> Option<ExitCode> {
-    let code = output.as_object_mut()?.remove("__exit_code")?.as_u64()?;
-    exit_code_from_override(code)
-}
-
-fn exit_code_from_override(code: u64) -> Option<ExitCode> {
-    match code {
-        3 => Some(ExitCode::PartialFailure),
-        4 => Some(ExitCode::PermanentFailure),
-        5 => Some(ExitCode::AuthError),
-        6 => Some(ExitCode::BudgetExceeded),
-        _ => None,
+fn completion_exit_code(completion: Completion) -> ExitCode {
+    match completion {
+        Completion::Complete => ExitCode::Success,
+        Completion::Partial => ExitCode::PartialFailure,
+        Completion::Permanent => ExitCode::PermanentFailure,
+        Completion::AuthRequired => ExitCode::AuthError,
+        Completion::BudgetBlocked => ExitCode::BudgetExceeded,
     }
 }
 
-fn append_exit_override_error(output: &Value, code: ExitCode) {
+fn append_completion_error(output: &Value, code: ExitCode) {
     let error_code = output
         .get("error_code")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .unwrap_or_else(|| exit_override_error_code(code).to_owned());
+        .unwrap_or_else(|| completion_error_code(code).to_owned());
     let mut context = json!({ "exit_code": code.code() });
     if let Some(excluded) = output.get("excluded_scopes")
         && excluded.as_array().is_some_and(|array| !array.is_empty())
@@ -149,7 +149,7 @@ fn append_exit_override_error(output: &Value, code: ExitCode) {
     ));
 }
 
-fn exit_override_error_code(code: ExitCode) -> &'static str {
+fn completion_error_code(code: ExitCode) -> &'static str {
     match code {
         ExitCode::AuthError => "KIO-E-ADAPTER-AUTH-001",
         ExitCode::BudgetExceeded => "KIO-E-BUDGET-EXCEEDED-001",
@@ -406,3 +406,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod completion_tests;

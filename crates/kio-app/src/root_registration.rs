@@ -16,7 +16,7 @@ use kio_index::registry::{
     default_registry_path_with_control,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -30,7 +30,6 @@ use crate::response::device::RetiredChild;
 use crate::response::device::RootRegisterAppliedResponse;
 use crate::response::device::RootRegisterPreviewResponse;
 use crate::response::device::RootRegisterResponse;
-use crate::response::project_legacy;
 
 /// This entrypoint is intentionally separate from init/index: only an explicit
 /// root-register request may recover a management record whose path binding no
@@ -82,7 +81,7 @@ struct Node {
 pub(crate) fn run(
     ctx: &crate::invocation::Invocation<'_>,
     args: RootRegisterArgs,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     if args.preview == args.yes || (args.resume.is_some() && !args.yes) {
         return Err(KioError::invalid_usage(
             "root register requires exactly one of --preview or --yes; --resume requires --yes",
@@ -118,7 +117,7 @@ pub(crate) fn run(
                 kio_core::ExitCode::Failure,
             ));
         }
-        return project_legacy(CommandResponse {
+        return Ok(CommandResponse {
             body: ResponseBody::RootRegister(RootRegisterResponse::Preview(preview(
                 &plan_new(&canonical, binding.clone(), ctx.control)?,
                 None,
@@ -388,7 +387,7 @@ fn execute(
     persisted: bool,
     runtime_control: &ControlHandle,
     session: &kio_core::scope::LockSession,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     retained_root.revalidate()?;
     let root = retained_root.canonical_root();
     let control = control_for(retained_root, runtime_control)?;
@@ -534,7 +533,7 @@ fn execute(
         nodes[0].binding.revalidate()?;
         control.quarantine_then_remove(Path::new(JOURNAL_LEAF), &bytes, MAX_JOURNAL_BYTES)?;
     }
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::RootRegister(RootRegisterResponse::Applied(
             RootRegisterAppliedResponse {
                 status: "registered".to_owned(),

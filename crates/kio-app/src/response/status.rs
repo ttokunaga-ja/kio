@@ -17,7 +17,7 @@ pub struct StatusResponse {
     pub head_shallow: bool,
     pub paused_by_hold_reason: PausedTasksByHoldReason,
     pub tasks: Vec<TaskDescriptor>,
-    // Supervisor answer 1: current reader accepts arbitrary JSON rows.
+    // The status reader returns every valid JSON row verbatim.
     pub quarantine: Vec<Value>,
     pub unsupported_inputs: Vec<UnsupportedInputDisposition>,
     pub unsupported_inputs_complete: bool,

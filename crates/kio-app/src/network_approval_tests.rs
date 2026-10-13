@@ -171,12 +171,17 @@ impl Fixture {
                 },
                 &super::approvals::ApprovalControl { stop_after },
             )
+            .map(|response| {
+                serde_json::to_value(response.body).expect("cfg(test) approval body projection")
+            })
         })
     }
 
     fn status(&self, adapter_settings: &Arc<AdapterRuntimeSettings>) -> Value {
         self.in_context(adapter_settings, |ctx| {
-            super::approvals::status(ctx, AdapterStatusArgs { tool_id: None })
+            super::approvals::status(ctx, AdapterStatusArgs { tool_id: None }).map(|response| {
+                serde_json::to_value(response.body).expect("cfg(test) approval body projection")
+            })
         })
         .unwrap()
     }
@@ -191,6 +196,9 @@ impl Fixture {
                 },
                 ctx.control,
             )
+            .map(|response| {
+                serde_json::to_value(response.body).expect("cfg(test) approval body projection")
+            })
         })
         .unwrap()
     }
@@ -343,6 +351,9 @@ fn revoke_rejects_an_invalid_target_before_repository_access() {
         },
         &ControlHandle::default(),
     )
+    .map(|response| {
+        serde_json::to_value(response.body).expect("cfg(test) approval body projection")
+    })
     .expect_err("control characters are not adapter identifiers");
     assert_eq!(error.error_code(), "KIO-E-CONFIG-USAGE-001");
 }
@@ -369,6 +380,9 @@ fn preview_and_status_are_readonly_and_do_not_create_or_repair_grants() {
                 },
                 &super::approvals::ApprovalControl::default(),
             )
+            .map(|response| {
+                serde_json::to_value(response.body).expect("cfg(test) approval body projection")
+            })
         })
         .unwrap();
     assert_eq!(preview["status"], "preview");
@@ -633,6 +647,9 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
                     },
                     &super::approvals::ApprovalControl::default(),
                 )
+                .map(|response| {
+                    serde_json::to_value(response.body).expect("cfg(test) approval body projection")
+                })
             })
             .unwrap();
         assert_eq!(preview["adapters"][0]["tool_id"], profile.tool_id);
@@ -939,6 +956,9 @@ fn ancestor_reregistration_invalidates_a_childs_network_and_secret_grants() {
                 },
                 &super::approvals::ApprovalControl::default(),
             )
+            .map(|response| {
+                serde_json::to_value(response.body).expect("cfg(test) approval body projection")
+            })
         })
         .unwrap();
     let profile = child

@@ -9,7 +9,7 @@ use crate::response::gc::{
     GcNoCandidatesReport, GcReport, GcResponse, GcRuntimeDeferredReport,
     PrepublicationDeferredResponse,
 };
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use std::time::{Duration, Instant};
 
 use kio_core::gc::{
@@ -29,7 +29,7 @@ use kio_index::fts::{
     remove_prepared_bound_gc_index,
 };
 use serde::Serialize;
-use serde_json::{Value, json};
+use serde_json::json;
 
 /// A soft monotonic execution budget.  The executor consults it only after a
 /// durable, resumable state transition, so an invocation always makes forward
@@ -448,9 +448,9 @@ pub(super) fn run(
     yes: bool,
     prune_unreachable: bool,
     json_mode: bool,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     let response = run_response(ctx, dry_run, yes, prune_unreachable, json_mode)?;
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Gc(response),
         completion: Completion::Complete,
     })

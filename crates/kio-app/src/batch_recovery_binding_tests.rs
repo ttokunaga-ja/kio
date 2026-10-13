@@ -24,12 +24,11 @@ use kio_pipeline::task::TaskDescriptor;
 use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::cell::Cell;
 use std::fs;
 use std::path::Path;
 
-use super::*;
 use kio_adapter::batch_client::{BatchJobRecord, BatchOutputLine, BatchUploadRecord};
 use kio_adapter::gemini_batch_client::{
     GeminiBatchClient, GeminiBatchEmbedInput, GeminiBatchJobRecord, GeminiBatchPoll,

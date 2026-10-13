@@ -1,6 +1,6 @@
 //! Explicit device grants paired with the current scope's approval references.
 use crate::response::adapter::*;
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_core::control::ControlHandle;
 use std::sync::Arc;
@@ -327,7 +327,7 @@ pub(crate) fn approve(
     ctx: &crate::invocation::Invocation<'_>,
     args: ApproveArgs,
     control: &ApprovalControl,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     let adapter_settings = ctx.settings;
 
     let tool = selected_tool(&args.target)?;
@@ -357,7 +357,7 @@ pub(crate) fn approve(
         resume: args.resume.clone(),
     };
     if args.preview {
-        return project_legacy(CommandResponse {
+        return Ok(CommandResponse {
             body: ResponseBody::Adapter(AdapterResponse::ApprovalPreview(preview)),
             completion: Completion::Complete,
         });
@@ -518,7 +518,7 @@ pub(crate) fn approve(
             secrets_grant_id: secret.map(|record| record.grant_id),
         }));
     }
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Adapter(AdapterResponse::Approved(ApprovedResponse {
             status: "approved".to_owned(),
             approvals: outcomes,
@@ -527,7 +527,11 @@ pub(crate) fn approve(
     })
 }
 
-pub(crate) fn revoke(ctx: &AppContext, args: RevokeArgs, control: &ControlHandle) -> Result<Value> {
+pub(crate) fn revoke(
+    ctx: &AppContext,
+    args: RevokeArgs,
+    control: &ControlHandle,
+) -> Result<CommandResponse> {
     let tool = selected_tool(&args.target)?;
     let repo = Repository::open_for_recovery_with_control(ctx.cwd(), control.clone())?;
     let _lock = repo.lock_store_in_session(repo.lock_session())?;
@@ -544,7 +548,7 @@ pub(crate) fn revoke(ctx: &AppContext, args: RevokeArgs, control: &ControlHandle
             Vec::new()
         };
     let outcome = repo.revoke_network_approval(tool, &now)?;
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Adapter(AdapterResponse::Revoked(ApprovalRevokeResponse {
             status: if outcome.changed() || !revoked_grants.is_empty() {
                 "revoked"
@@ -565,7 +569,7 @@ pub(crate) fn revoke(ctx: &AppContext, args: RevokeArgs, control: &ControlHandle
 pub(crate) fn status(
     ctx: &crate::invocation::Invocation<'_>,
     args: AdapterStatusArgs,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     let adapter_settings = ctx.settings;
 
     let repo = ctx.open_recovery_repository()?;
@@ -642,7 +646,7 @@ pub(crate) fn status(
             reason,
         });
     }
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Adapter(AdapterResponse::Status(ApprovalStatusResponse {
             scope_id,
             grants: records.into_iter().cloned().collect(),

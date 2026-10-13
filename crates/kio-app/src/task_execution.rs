@@ -62,7 +62,6 @@ use kio_adapter::office_convert::is_office_media;
 use kio_adapter::office_convert::resolve_office_converter_with_control;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_adapter::traits::PreferredRequestKind;
-use kio_core::ExitCode;
 use kio_core::KioError;
 use kio_core::Result;
 use kio_core::control::ControlHandle;
@@ -102,8 +101,6 @@ use kio_pipeline::task::retry_policy;
 use kio_pipeline::unsupported::UNSUPPORTED_REASON_RESOLVED;
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
 use kio_pipeline::unsupported::UnsupportedInputStore;
-use serde_json::Value;
-use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -201,8 +198,6 @@ impl ExecOutcome {
     }
 }
 
-// Replace existing helper bodies in task_execution.rs; this is a draft only.
-// Update callers and helper tests atomically. Error ExitCode classification stays.
 pub(crate) fn batch_completion(outcome: &ExecOutcome) -> crate::response::Completion {
     use crate::response::Completion;
     if outcome.auth_failed > 0 {
@@ -233,15 +228,6 @@ pub(crate) fn enrichment_completion(outcome: &ExecOutcome) -> crate::response::C
         Completion::BudgetBlocked
     } else {
         Completion::Complete
-    }
-}
-
-/// Embed the private `__exit_code` marker (stripped by `take_exit_override` before
-/// printing) so a command prints its full result JSON to stdout yet exits non-zero
-/// (05 §1.8 search pattern, extended by R11-2/R11-3 to index/repair/reindex/batch).
-pub(crate) fn set_exit_override(output: &mut Value, code: ExitCode) {
-    if let Some(object) = output.as_object_mut() {
-        object.insert("__exit_code".to_owned(), json!(code.code()));
     }
 }
 

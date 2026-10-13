@@ -2,16 +2,17 @@ use super::pointer::{
     EvidenceOpenResponse, EvidenceViewResponse, ObjectChunkResponse, ObjectFileResponse,
     OpenResponse, RawPointerResponse, ViewResponse,
 };
-use super::{CommandResponse, Completion, ResponseBody, project_legacy};
+use super::{CommandResponse, Completion, ResponseBody};
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
 fn assert_projection(body: ResponseBody, legacy: Value) {
-    let actual = project_legacy(CommandResponse {
+    let response = CommandResponse {
         body,
         completion: Completion::Complete,
-    })
-    .expect("project typed pointer response");
+    };
+    assert_eq!(response.completion, Completion::Complete);
+    let actual = serde_json::to_value(response.body).expect("project typed pointer response");
     assert_eq!(actual, legacy);
     assert_eq!(
         serde_json::to_vec(&actual).expect("typed pointer response bytes"),

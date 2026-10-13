@@ -38,7 +38,7 @@ use crate::object_persistence::pipeline_to_kio;
 use crate::online_task::targets_standard_online_markdownize;
 use crate::response::batch::*;
 use crate::response::ledger::*;
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use crate::scope_access::scope_id;
 use crate::search::query::snapshot_chunking_config_hash;
 use crate::search::scope::current_embedding_policy;
@@ -89,14 +89,13 @@ use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
 use kio_pipeline::task::retry_policy;
 use kio_pipeline::task::validate_task_output_ref;
-use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Value> {
+pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<CommandResponse> {
     let adapter_settings = ctx.settings;
 
     validate_batch_args(&args)?;
@@ -246,7 +245,7 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Value> 
             )?;
             outcome.add(batch_poll_outcome);
             let completion = batch_completion(&outcome);
-            project_legacy(CommandResponse {
+            Ok(CommandResponse {
                 body: ResponseBody::Batch(BatchResponse::Resume(BatchResumeResponse {
                     status: "resumed".to_owned(),
                     recheck_budget: resume.recheck_budget,
@@ -324,7 +323,7 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Value> 
             )?;
             outcome.add(batch_poll_outcome);
             let completion = batch_completion(&outcome);
-            project_legacy(CommandResponse {
+            Ok(CommandResponse {
                 body: ResponseBody::Batch(BatchResponse::Retry(BatchRetryResponse {
                     status: "retry scheduled".to_owned(),
                     counts: BatchCounts {
@@ -378,7 +377,7 @@ pub(crate) fn validate_batch_args(args: &BatchArgs) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run_adapter(ctx: &Invocation<'_>, args: AdapterArgs) -> Result<Value> {
+pub(crate) fn run_adapter(ctx: &Invocation<'_>, args: AdapterArgs) -> Result<CommandResponse> {
     match args.command {
         Some(AdapterCommand::Approve(args)) => {
             approvals::approve(ctx, args, &approvals::ApprovalControl::default())
@@ -392,7 +391,7 @@ pub(crate) fn run_adapter_lifecycle(
     ctx: &AppContext,
     command: Option<AdapterCommand>,
     control: &ControlHandle,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     match command {
         Some(AdapterCommand::Revoke(args)) => approvals::revoke(ctx, args, control),
         Some(AdapterCommand::Trust(command)) => {
@@ -419,7 +418,7 @@ pub(crate) fn run_adapter_lifecycle(
 pub(crate) fn run_ledger_reconcile(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     control: &ControlHandle,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     let ledger = open_ledger_db(control)?;
     let conn = &ledger;
 
@@ -476,7 +475,7 @@ pub(crate) fn run_ledger_reconcile(
     // billing history lost from an older database never existed. This path
     // must never clear a history-loss gate or lower the durable checkpoint.
 
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Ledger(LedgerResponse::Reconcile(LedgerReconcileResponse {
             status: "reconciled".to_owned(),
             integrity,
@@ -879,7 +878,11 @@ fn batch_confirmation_rejected(message: &str) -> KioError {
 
 /// `kio batch abandon <selector>` (06 §1 / 04 §5.8 恒久 unknown 脱出路,
 /// CL62-CL68). Runs inside `run_batch`'s already-acquired `.kio/.lock`.
-fn run_batch_abandon(ctx: &Invocation<'_>, selector_input: &str, yes: bool) -> Result<Value> {
+fn run_batch_abandon(
+    ctx: &Invocation<'_>,
+    selector_input: &str,
+    yes: bool,
+) -> Result<CommandResponse> {
     let selector = parse_batch_selector(selector_input)?;
     let ledger = open_ledger_db(ctx.control)?;
     let resolution = resolve_abandon_selector(&ledger, &selector).map_err(pipeline_to_kio)?;
@@ -887,7 +890,7 @@ fn run_batch_abandon(ctx: &Invocation<'_>, selector_input: &str, yes: bool) -> R
         // CL66: no matching row (terminal-confirmed / device-row pruned /
         // already abandoned-and-cleaned / never existed) is an idempotent
         // exit-0 success — no confirmation prompt needed, nothing to abandon.
-        AbandonResolution::NotFound => project_legacy(CommandResponse {
+        AbandonResolution::NotFound => Ok(CommandResponse {
             body: ResponseBody::Batch(BatchResponse::Abandon(BatchSelectionResponse::NoTarget(
                 BatchNoTargetResponse {
                     status: "no_target".to_owned(),
@@ -909,7 +912,7 @@ fn run_batch_abandon(ctx: &Invocation<'_>, selector_input: &str, yes: bool) -> R
                 yes,
             )?;
             let execution = execute_abandon(&ledger, &key).map_err(pipeline_to_kio)?;
-            project_legacy(CommandResponse {
+            Ok(CommandResponse {
                 body: ResponseBody::Batch(BatchResponse::Abandon(
                     BatchSelectionResponse::Selected(BatchSelectedResponse {
                         status: (match execution {
@@ -933,12 +936,12 @@ fn run_batch_reset_violations(
     ctx: &Invocation<'_>,
     selector_input: &str,
     yes: bool,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     let selector = parse_batch_selector(selector_input)?;
     let ledger = open_ledger_db(ctx.control)?;
     let resolution = resolve_abandon_selector(&ledger, &selector).map_err(pipeline_to_kio)?;
     match resolution {
-        AbandonResolution::NotFound => project_legacy(CommandResponse {
+        AbandonResolution::NotFound => Ok(CommandResponse {
             body: ResponseBody::Batch(BatchResponse::ResetViolations(
                 BatchSelectionResponse::NoTarget(BatchNoTargetResponse {
                     status: "no_target".to_owned(),
@@ -963,7 +966,7 @@ fn run_batch_reset_violations(
             // the SQL) is a no-op success; only a terminal, non-zero-count row
             // actually changes.
             let did_reset = reset_contract_violations(&ledger, &key).map_err(pipeline_to_kio)?;
-            project_legacy(CommandResponse {
+            Ok(CommandResponse {
                 body: ResponseBody::Batch(BatchResponse::ResetViolations(
                     BatchSelectionResponse::Selected(BatchSelectedResponse {
                         status: (if did_reset { "reset" } else { "unchanged" }).to_owned(),
@@ -986,7 +989,7 @@ fn run_batch_resend_unknown(
     repo: &Repository,
     selector_input: &str,
     yes: bool,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     let adapter_settings = ctx.settings;
 
     let selector = parse_batch_selector(selector_input)?;
@@ -996,7 +999,7 @@ fn run_batch_resend_unknown(
         AbandonResolution::Found(key) => key,
         other => {
             return match other {
-                AbandonResolution::NotFound => project_legacy(CommandResponse {
+                AbandonResolution::NotFound => Ok(CommandResponse {
                     body: ResponseBody::Batch(BatchResponse::ResendUnknown(
                         BatchResendResponse::NoTarget(BatchNoTargetResponse {
                             status: "no_target".to_owned(),
@@ -1118,7 +1121,7 @@ fn run_batch_resend_unknown(
             true
         })
         .map_err(pipeline_to_kio)?;
-    project_legacy(CommandResponse { body: ResponseBody::Batch(BatchResponse::ResendUnknown(BatchResendResponse::Authorized(BatchResendAuthorizedResponse {
+    Ok(CommandResponse { body: ResponseBody::Batch(BatchResponse::ResendUnknown(BatchResendResponse::Authorized(BatchResendAuthorizedResponse {
         status: "resend_authorized".to_owned(), authorization_created: newly_authorized, tasks_queued: queued,
         scope_id: key.scope_id, adapter_kind: key.adapter_kind, input_hash: key.input_hash,
         next_step: "run an explicit online resume; it will perform a fresh reservation and current policy, grant, and budget checks before any provider request".to_owned(),

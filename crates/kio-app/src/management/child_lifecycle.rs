@@ -9,6 +9,7 @@ mod cancel;
 use super::binding_for_repo;
 use crate::grants::PrivateGrantStore;
 use crate::object_persistence::index_to_kio;
+use crate::response::CommandResponse;
 use kio_core::management::{
     ChildEnrollment, DirectoryIdentity, ManagementBinding, ManagementRecord,
     compare_and_remove_child_enrollment_in_session, enroll_child_in_session, observe_direct_child,
@@ -21,7 +22,6 @@ use kio_core::store_dir::{
 };
 use kio_core::{KioError, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 const RETIREMENT: &str = "child-retirement.json";
@@ -316,7 +316,7 @@ pub(super) fn cancel_child_initialization(
     parent: &Repository,
     preview: bool,
     operation: Option<&str>,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     cancel::run(parent, preview, operation)
 }
 

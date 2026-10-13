@@ -16,7 +16,6 @@ use crate::response::history::RawInspection;
 use crate::response::history::TagDeleteResponse;
 use crate::response::history::TagResponse;
 use crate::response::history::TagSetResponse;
-use crate::response::project_legacy;
 use crate::response::snapshot::SnapshotResponse;
 use crate::response::snapshot::{
     SnapshotAutoResponse, SnapshotCreateReport, SnapshotCreateResponse,
@@ -56,7 +55,6 @@ use kio_pipeline::scan::ScanPreview;
 use kio_pipeline::scan::ScanPreviewRequest;
 use kio_pipeline::scan::build_bound_scan_preview;
 use kio_pipeline::scan::build_scan_preview;
-use serde_json::Value;
 use serde_json::json;
 use sha2::Digest;
 use sha2::Sha256;
@@ -71,7 +69,7 @@ pub(crate) fn run_snapshot_create(
     ctx: &Invocation<'_>,
     args: commands::SnapshotCreateArgs,
     adapter_settings: &Arc<AdapterRuntimeSettings>,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     // Opening an ordinary repository can self-heal HEAD. Bind and
     // validate without repair first, acquire the GC-aware store lock,
     // and only then perform that write. This keeps even the open path
@@ -82,7 +80,7 @@ pub(crate) fn run_snapshot_create(
         match gc::preflight_automatic(&repo, "snapshot")? {
             gc::AutomaticGcPreflight::Proceed { recovered, binding } => (recovered, binding),
             gc::AutomaticGcPreflight::Deferred(report) => {
-                return project_legacy(CommandResponse {
+                return Ok(CommandResponse {
                     body: ResponseBody::Snapshot(SnapshotResponse::Deferred(
                         gc::deferred_before_publication("snapshot", *report),
                     )),
@@ -168,7 +166,7 @@ pub(crate) fn run_snapshot_create(
     drop(lock);
     let attachment =
         gc::attach_after_success(&repo, "snapshot", recovered_before_publication, gc_binding);
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Snapshot(SnapshotResponse::Create(SnapshotCreateReport {
             base,
             gc: attachment.report,
@@ -181,7 +179,7 @@ pub(crate) fn run_snapshot_create(
     })
 }
 
-pub(crate) fn run_log(ctx: &Invocation<'_>, args: commands::LogArgs) -> Result<Value> {
+pub(crate) fn run_log(ctx: &Invocation<'_>, args: commands::LogArgs) -> Result<CommandResponse> {
     let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
     validate_repo_tool_lock(&repo)?;
     // QB5/QB6/裁定1: shared (1)+(3) preflight pair.
@@ -231,29 +229,32 @@ pub(crate) fn run_log(ctx: &Invocation<'_>, args: commands::LogArgs) -> Result<V
     // §I checkpoint 2 (LC54/LC55). QB57: the wire shape (`commits` +
     // `truncated`) is unchanged by `--at`/`--since` — they narrow
     // which commits are listed, not the response shape.
-    checkpoint.finish(project_legacy(CommandResponse {
+    checkpoint.finish(CommandResponse {
         body: ResponseBody::Log(LogResponse {
             commits: entries,
             truncated: report.truncated,
         }),
         completion: Completion::Complete,
-    })?)
+    })
 }
 
-pub(crate) fn run_diff(ctx: &Invocation<'_>, args: commands::DiffArgs) -> Result<Value> {
+pub(crate) fn run_diff(ctx: &Invocation<'_>, args: commands::DiffArgs) -> Result<CommandResponse> {
     let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
     validate_repo_tool_lock(&repo)?;
     // QB5/QB6/裁定1: shared (1)+(3) preflight pair.
     let checkpoint = preflight_barrier_and_index(repo.kio_dir(), repo.control())?;
     let changes = repo.diff(&args.a, &args.b)?;
     // §I checkpoint 2 (LC54/LC55).
-    checkpoint.finish(project_legacy(CommandResponse {
+    checkpoint.finish(CommandResponse {
         body: ResponseBody::Diff(DiffResponse { changes }),
         completion: Completion::Complete,
-    })?)
+    })
 }
 
-pub(crate) fn run_inspect(ctx: &Invocation<'_>, args: commands::InspectArgs) -> Result<Value> {
+pub(crate) fn run_inspect(
+    ctx: &Invocation<'_>,
+    args: commands::InspectArgs,
+) -> Result<CommandResponse> {
     let repo = ctx.open_recovery_repository()?; // (0) kio_format_version
     validate_repo_tool_lock(&repo)?;
     let target = scope_target(repo.root(), ctx.control)?;
@@ -264,18 +265,18 @@ pub(crate) fn run_inspect(ctx: &Invocation<'_>, args: commands::InspectArgs) -> 
     enforce_purge_read_barrier(&target, &args.hash, ctx.control)?;
     match repo.inspect(&args.hash)? {
         InspectedObject::Tree(tree) => {
-            let value = project_legacy(CommandResponse {
+            let value = CommandResponse {
                 body: ResponseBody::Inspect(InspectResponse::Tree(tree)),
                 completion: Completion::Complete,
-            })?;
+            };
             // §I checkpoint 2 (LC54/LC55).
             checkpoint.finish(value)
         }
         InspectedObject::Commit(commit) => {
-            let value = project_legacy(CommandResponse {
+            let value = CommandResponse {
                 body: ResponseBody::Inspect(InspectResponse::Commit(commit)),
                 completion: Completion::Complete,
-            })?;
+            };
             // §I checkpoint 2 (LC54/LC55).
             checkpoint.finish(value)
         }
@@ -287,19 +288,19 @@ pub(crate) fn run_inspect(ctx: &Invocation<'_>, args: commands::InspectArgs) -> 
             // the inspect window cannot leak even the raw object's size.
             enforce_purge_read_barrier(&target, &raw_hash, ctx.control)?;
             // §I checkpoint 2 (LC54/LC55).
-            checkpoint.finish(project_legacy(CommandResponse {
+            checkpoint.finish(CommandResponse {
                 body: ResponseBody::Inspect(InspectResponse::Raw(RawInspection {
                     object_type: "raw".to_owned(),
                     raw_hash,
                     size_bytes,
                 })),
                 completion: Completion::Complete,
-            })?)
+            })
         }
     }
 }
 
-pub(crate) fn run_tag(ctx: &Invocation<'_>, args: commands::TagArgs) -> Result<Value> {
+pub(crate) fn run_tag(ctx: &Invocation<'_>, args: commands::TagArgs) -> Result<CommandResponse> {
     if args.delete && args.commit.is_some() {
         return Err(KioError::invalid_usage(
             "tag deletion does not accept a commit operand",
@@ -318,7 +319,7 @@ pub(crate) fn run_tag(ctx: &Invocation<'_>, args: commands::TagArgs) -> Result<V
         .join(PORTABLE_TAGS_DIRECTORY)
         .join(portable_tag_leaf(&args.name));
     if args.delete {
-        project_legacy(CommandResponse {
+        Ok(CommandResponse {
             body: ResponseBody::Tag(TagResponse::Delete(TagDeleteResponse {
                 operation: "tag_delete".to_owned(),
                 status: "deleted".to_owned(),
@@ -329,7 +330,7 @@ pub(crate) fn run_tag(ctx: &Invocation<'_>, args: commands::TagArgs) -> Result<V
             completion: Completion::Complete,
         })
     } else {
-        project_legacy(CommandResponse {
+        Ok(CommandResponse {
             body: ResponseBody::Tag(TagResponse::Set(TagSetResponse {
                 tag: args.name,
                 commit_hash,
@@ -441,9 +442,9 @@ macro_rules! snapshot_auto_test_barrier {
     }};
 }
 
-pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
+pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<CommandResponse> {
     let (response, completion) = run_snapshot_auto_response(ctx)?;
-    project_legacy(CommandResponse {
+    Ok(CommandResponse {
         body: ResponseBody::Snapshot(SnapshotResponse::Auto(response)),
         completion,
     })

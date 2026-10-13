@@ -67,10 +67,13 @@ use kio_adapter::traits::MarkdownizeAdapter;
 #[cfg(debug_assertions)]
 use kio_adapter::types::AdapterKind;
 use kio_adapter::types::AdapterProfile;
+#[cfg(debug_assertions)]
 use kio_adapter::types::ExecutionMode;
+#[cfg(debug_assertions)]
 use kio_adapter::types::MarkdownUnit;
 use kio_adapter::types::MarkdownizeMode as AdapterMarkdownizeMode;
 use kio_adapter::types::MarkdownizeRequest;
+#[cfg(debug_assertions)]
 use kio_adapter::types::PreparedUnitHint;
 use kio_adapter::types::PreviousMarkdownizeContext;
 use kio_adapter::types::RawInput;

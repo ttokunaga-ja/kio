@@ -4,7 +4,7 @@ use crate::commands::LedgerCommand;
 use crate::invocation::Invocation;
 use crate::object_persistence::pipeline_to_kio;
 use crate::response::ledger::*;
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use crate::scope_access::registry_duplicate_guard;
 use crate::settings::data_home;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
@@ -33,7 +33,6 @@ use kio_pipeline::ledger::ops::terminal_transaction;
 use kio_pipeline::task::RESULT_UNKNOWN_REASON;
 use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
-use serde_json::Value;
 use serde_json::json;
 use std::path::Path;
 use std::path::PathBuf;
@@ -43,14 +42,17 @@ pub(crate) fn run_ledger(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     args: LedgerArgs,
     control: &ControlHandle,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     match args.command {
         Some(LedgerCommand::Reconcile(_)) => run_ledger_reconcile(adapter_settings, control),
         command => run_ledger_lifecycle(LedgerArgs { command }, control),
     }
 }
 
-pub(crate) fn run_ledger_lifecycle(args: LedgerArgs, control: &ControlHandle) -> Result<Value> {
+pub(crate) fn run_ledger_lifecycle(
+    args: LedgerArgs,
+    control: &ControlHandle,
+) -> Result<CommandResponse> {
     match args.command {
         Some(LedgerCommand::Init { resume }) => {
             let path = ledger_db_path(control);
@@ -60,7 +62,7 @@ pub(crate) fn run_ledger_lifecycle(args: LedgerArgs, control: &ControlHandle) ->
                 LedgerDb::initialize_with_control(&path, control.clone())
             }
             .map_err(pipeline_to_kio)?;
-            project_legacy(CommandResponse {
+            Ok(CommandResponse {
                 body: ResponseBody::Ledger(LedgerResponse::Initialized(LedgerPathResponse {
                     status: "initialized".to_owned(),
                     path,
@@ -70,14 +72,14 @@ pub(crate) fn run_ledger_lifecycle(args: LedgerArgs, control: &ControlHandle) ->
         }
         Some(LedgerCommand::Status) => {
             match open_search_budget_snapshot(&ledger_db_path(control), control) {
-                Ok(Some(_ledger)) => project_legacy(CommandResponse {
+                Ok(Some(_ledger)) => Ok(CommandResponse {
                     body: ResponseBody::Ledger(LedgerResponse::Status(LedgerPathResponse {
                         status: "ready".to_owned(),
                         path: ledger_db_path(control),
                     })),
                     completion: Completion::Complete,
                 }),
-                Ok(None) => project_legacy(CommandResponse {
+                Ok(None) => Ok(CommandResponse {
                     body: ResponseBody::Ledger(LedgerResponse::Status(LedgerPathResponse {
                         status: "uninitialized".to_owned(),
                         path: ledger_db_path(control),
@@ -99,7 +101,7 @@ pub(crate) fn run_ledger_lifecycle(args: LedgerArgs, control: &ControlHandle) ->
             backup
                 .publish_create_only_with_control(&args.to, control)
                 .map_err(pipeline_to_kio)?;
-            project_legacy(CommandResponse {
+            Ok(CommandResponse {
                 body: ResponseBody::Ledger(LedgerResponse::Backup(LedgerPathResponse {
                     status: "backed_up".to_owned(),
                     path: args.to,
@@ -120,7 +122,7 @@ pub(crate) fn run_ledger_lifecycle(args: LedgerArgs, control: &ControlHandle) ->
             let _ledger =
                 LedgerDb::restore_missing_database_with_control(&path, &backup, control.clone())
                     .map_err(pipeline_to_kio)?;
-            project_legacy(CommandResponse {
+            Ok(CommandResponse {
                 body: ResponseBody::Ledger(LedgerResponse::Restore(LedgerPathResponse {
                     status: "restored".to_owned(),
                     path,
@@ -132,7 +134,7 @@ pub(crate) fn run_ledger_lifecycle(args: LedgerArgs, control: &ControlHandle) ->
             let path = ledger_db_path(control);
             let recovery = LedgerDb::recover_pending_write_with_control(&path, control.clone())
                 .map_err(pipeline_to_kio)?;
-            project_legacy(CommandResponse {
+            Ok(CommandResponse {
                 body: ResponseBody::Ledger(LedgerResponse::Recover(LedgerRecoverResponse {
                     status: "ready".to_owned(),
                     recovery,

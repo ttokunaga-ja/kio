@@ -1,11 +1,9 @@
-// Install as response/c3d_tests.rs and register #[cfg(test)] mod c3d_tests.
-// Draft only: not formatted, compiled, run, or accepted.
 use super::adapter::*;
 use super::batch::*;
 use super::ledger::*;
 use super::repair::*;
 use super::skipped_units::{PublishedSkippedUnit, SkippedDisclosure, SkippedUnit};
-use super::{CommandResponse, Completion, ResponseBody, project_legacy};
+use super::{CommandResponse, Completion, ResponseBody};
 use kio_core::{ExitCode, KioError};
 use kio_pipeline::ledger::PendingWriteRecovery;
 use serde::Serialize;
@@ -590,26 +588,24 @@ fn repair_restore_recovery_projection_preserves_no_pending_and_projection_failur
 }
 #[test]
 fn c3d_legacy_projection_keeps_completion_out_of_body_and_preserves_independent_code() {
-    for (completion, marker) in [
+    for (completion, _marker) in [
         (Completion::Complete, None),
         (Completion::Partial, Some(3)),
         (Completion::Permanent, Some(4)),
         (Completion::AuthRequired, Some(5)),
         (Completion::BudgetBlocked, Some(6)),
     ] {
-        let mut expected = json!({"status":"no_target"});
-        if let Some(marker) = marker {
-            expected["__exit_code"] = json!(marker);
-        }
-        let actual = project_legacy(CommandResponse {
+        let expected = json!({"status":"no_target"});
+        let response = CommandResponse {
             body: ResponseBody::Batch(BatchResponse::Abandon(BatchSelectionResponse::NoTarget(
                 BatchNoTargetResponse {
                     status: "no_target".into(),
                 },
             ))),
             completion,
-        })
-        .unwrap();
+        };
+        assert_eq!(response.completion, completion);
+        let actual = serde_json::to_value(response.body).unwrap();
         assert_eq!(actual, expected);
         assert_eq!(
             serde_json::to_vec(&actual).unwrap(),
@@ -618,16 +614,17 @@ fn c3d_legacy_projection_keeps_completion_out_of_body_and_preserves_independent_
     }
     let expected = json!({"status":"retry scheduled","tasks_updated":1,"tasks_executed":2,
         "tasks_attempted":5,"tasks_failed":3,"tasks_paused":4,"tasks_inflight":6,
-        "tasks_inflight_unreadable":1,"error_code":"KIO-E-BATCH-PARTIAL-001","__exit_code":5});
-    let actual = project_legacy(CommandResponse {
+        "tasks_inflight_unreadable":1,"error_code":"KIO-E-BATCH-PARTIAL-001"});
+    let response = CommandResponse {
         body: ResponseBody::Batch(BatchResponse::Retry(BatchRetryResponse {
             status: "retry scheduled".into(),
             counts: counts(),
             error_code: Some("KIO-E-BATCH-PARTIAL-001".into()),
         })),
         completion: Completion::AuthRequired,
-    })
-    .unwrap();
+    };
+    assert_eq!(response.completion, Completion::AuthRequired);
+    let actual = serde_json::to_value(response.body).unwrap();
     assert_eq!(actual, expected);
     assert_eq!(
         serde_json::to_vec(&actual).unwrap(),

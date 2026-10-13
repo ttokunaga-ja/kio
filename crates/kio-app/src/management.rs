@@ -8,7 +8,7 @@ use kio_core::control::ControlHandle;
 mod child_lifecycle;
 mod root_bootstrap;
 
-use serde_json::Value;
+use crate::response::CommandResponse;
 use std::fs::File;
 use std::path::Path;
 
@@ -76,7 +76,7 @@ pub(crate) fn cancel_child_initialization(
     parent: &Repository,
     preview: bool,
     operation: Option<&str>,
-) -> Result<Value> {
+) -> Result<CommandResponse> {
     child_lifecycle::cancel_child_initialization(parent, preview, operation)
 }
 

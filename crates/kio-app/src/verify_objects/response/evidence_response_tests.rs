@@ -4,7 +4,7 @@ use crate::response::evidence::{
     EvidenceBatchResponse, EvidenceBatchRow, EvidenceBatchSummary, EvidenceResponse,
     EvidenceRetargetResponse, EvidenceStatusCounts,
 };
-use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use kio_core::ExitCode;
 use kio_search::evidence::EvidencePointer;
 use serde_json::{Value, json};
@@ -74,11 +74,16 @@ fn evidence_verify_projection_preserves_existing_statuses_optional_error_and_det
         if let Some(code) = code {
             expected["error_code"] = json!(code);
         }
-        if exit != ExitCode::Success {
-            expected["__exit_code"] = json!(exit.code());
-        }
-        let actual =
+        let response =
             verification_output(EvidenceVerification::new(status, code, details, exit)).unwrap();
+        let expected_completion = match exit {
+            ExitCode::Success => Completion::Complete,
+            ExitCode::PartialFailure => Completion::Partial,
+            ExitCode::PermanentFailure => Completion::Permanent,
+            _ => unreachable!(),
+        };
+        assert_eq!(response.completion, expected_completion);
+        let actual = serde_json::to_value(response.body).unwrap();
         assert_bytes(actual, expected);
     }
 }
@@ -106,15 +111,22 @@ fn evidence_verify_strict_tombstoned_not_found_and_scope_unreachable_keep_comple
         ),
     ] {
         let details = json!({"scope_id":"scope","opaque_context":{"hint":null,"items":[]}});
+        let response = verification_output(EvidenceVerification::new(
+            status,
+            Some(code),
+            details.clone(),
+            exit,
+        ))
+        .unwrap();
+        let expected_completion = match exit {
+            ExitCode::PermanentFailure => Completion::Permanent,
+            ExitCode::PartialFailure => Completion::Partial,
+            _ => unreachable!(),
+        };
+        assert_eq!(response.completion, expected_completion);
         assert_bytes(
-            verification_output(EvidenceVerification::new(
-                status,
-                Some(code),
-                details.clone(),
-                exit,
-            ))
-            .unwrap(),
-            json!({"status":text,"error_code":code,"details":details,"__exit_code":exit.code()}),
+            serde_json::to_value(response.body).unwrap(),
+            json!({"status":text,"error_code":code,"details":details}),
         );
     }
 }
@@ -210,7 +222,7 @@ fn evidence_batch_projection_keeps_zero_counts_and_does_not_decorate_individual_
     );
     let mut counts = EvidenceStatusCounts::default();
     counts.record(EvidenceStatus::Alive);
-    let actual = project_legacy(CommandResponse {
+    let response = CommandResponse {
         body: ResponseBody::Evidence(EvidenceResponse::Batch(EvidenceBatchResponse {
             schema: "kio.evidence.batch-verify".to_owned(),
             schema_version: 1,
@@ -227,8 +239,9 @@ fn evidence_batch_projection_keeps_zero_counts_and_does_not_decorate_individual_
             verified_count: 1,
         })),
         completion: Completion::Complete,
-    })
-    .unwrap();
+    };
+    assert_eq!(response.completion, Completion::Complete);
+    let actual = serde_json::to_value(response.body).unwrap();
     assert_bytes(
         actual,
         json!({"schema":"kio.evidence.batch-verify","schema_version":1,"input_sha256":"input","strict":false,
@@ -257,7 +270,7 @@ fn evidence_batch_completion_preserves_strict_permanent_priority_and_retryable_n
 
 #[test]
 fn evidence_batch_mixed_projection_keeps_root_completion_and_undecorated_rows() {
-    for (strict, completion, exit) in [
+    for (strict, completion, _exit) in [
         (true, Completion::Permanent, 4),
         (false, Completion::Partial, 3),
     ] {
@@ -277,7 +290,7 @@ fn evidence_batch_mixed_projection_keeps_root_completion_and_undecorated_rows() 
             json!({"scope_id":"scope"}),
             ExitCode::PartialFailure,
         );
-        let actual = project_legacy(CommandResponse {
+        let response = CommandResponse {
             body: ResponseBody::Evidence(EvidenceResponse::Batch(EvidenceBatchResponse {
                 schema: "kio.evidence.batch-verify".to_owned(),
                 schema_version: 1,
@@ -307,14 +320,15 @@ fn evidence_batch_mixed_projection_keeps_root_completion_and_undecorated_rows() 
                 verified_count: 2,
             })),
             completion,
-        })
-        .unwrap();
+        };
+        assert_eq!(response.completion, completion);
+        let actual = serde_json::to_value(response.body).unwrap();
         assert_bytes(
             actual,
             json!({"schema":"kio.evidence.batch-verify","schema_version":1,"input_sha256":"input","strict":strict,
             "results":[{"line":1,"result":{"status":"tombstoned","error_code":"KIO-E-PURGE-TOMBSTONED-001","details":{"reason":"privacy"}}},
                 {"line":2,"result":{"status":"registry_duplicate","error_code":"KIO-E-REGISTRY-DUP-001","details":{"scope_id":"scope"}}}],
-            "summary":{"total":2,"status_counts":{"alive":0,"tombstoned":1,"not_found":0,"scope_unreachable":0,"unverifiable":0,"registry_duplicate":1}},"verified_count":2,"__exit_code":exit}),
+            "summary":{"total":2,"status_counts":{"alive":0,"tombstoned":1,"not_found":0,"scope_unreachable":0,"unverifiable":0,"registry_duplicate":1}},"verified_count":2}),
         );
     }
 }
@@ -342,10 +356,10 @@ fn evidence_retarget_projection_reuses_native_pointers_and_preserves_optional_om
     let old = pointer(false);
     let new = pointer(true);
     let target = new.commit.clone();
-    // Current legacy assembly directly serializes the existing pointer domain types.
+    // Pointer fields retain their native domain serialization and omissions.
     let expected = json!({"schema":"kio.evidence.retarget","schema_version":1,"status":"retargeted",
         "target_commit":target,"retargeted_from":old,"new_pointer":new,"match_method":"heading_path_exact"});
-    let actual = project_legacy(CommandResponse {
+    let response = CommandResponse {
         body: ResponseBody::Evidence(EvidenceResponse::Retarget(Box::new(
             EvidenceRetargetResponse {
                 schema: "kio.evidence.retarget".to_owned(),
@@ -358,8 +372,9 @@ fn evidence_retarget_projection_reuses_native_pointers_and_preserves_optional_om
             },
         ))),
         completion: Completion::Complete,
-    })
-    .unwrap();
+    };
+    assert_eq!(response.completion, Completion::Complete);
+    let actual = serde_json::to_value(response.body).unwrap();
     assert!(actual["retargeted_from"].get("tree").is_none());
     assert!(actual["new_pointer"].get("section_id").is_none());
     assert_bytes(actual, expected);
