@@ -8,6 +8,7 @@ use crate::object_persistence::pipeline_to_kio;
 use crate::response::CommandResponse;
 use crate::response::Completion;
 use crate::response::ResponseBody;
+use crate::response::gc::{GcOnIdleFailure, GcOnIdleSkip, GcReport};
 use crate::response::history::DiffResponse;
 use crate::response::history::InspectResponse;
 use crate::response::history::LogResponse;
@@ -16,8 +17,10 @@ use crate::response::history::TagDeleteResponse;
 use crate::response::history::TagResponse;
 use crate::response::history::TagSetResponse;
 use crate::response::project_legacy;
-use crate::response::snapshot::SnapshotCreateResponse;
 use crate::response::snapshot::SnapshotResponse;
+use crate::response::snapshot::{
+    SnapshotAutoResponse, SnapshotCreateReport, SnapshotCreateResponse,
+};
 use crate::scope_access::enforce_purge_read_barrier;
 use crate::scope_access::preflight_barrier_and_index;
 use crate::scope_access::scope_target;
@@ -28,7 +31,6 @@ use crate::search::projection::republish_equivalent_manual_snapshot;
 use crate::search_time::PositiveDuration;
 use crate::search_time::since_cutoff_seconds;
 use crate::settings::validate_repo_tool_lock;
-use crate::task_execution::set_exit_override;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_core::ExitCode;
 use kio_core::KioError;
@@ -80,7 +82,12 @@ pub(crate) fn run_snapshot_create(
         match gc::preflight_automatic(&repo, "snapshot")? {
             gc::AutomaticGcPreflight::Proceed { recovered, binding } => (recovered, binding),
             gc::AutomaticGcPreflight::Deferred(report) => {
-                return Ok(gc::deferred_before_publication("snapshot", report));
+                return project_legacy(CommandResponse {
+                    body: ResponseBody::Snapshot(SnapshotResponse::Deferred(
+                        gc::deferred_before_publication("snapshot", *report),
+                    )),
+                    completion: Completion::Partial,
+                });
             }
         };
     let lock = repo.lock_store_in_session(repo.lock_session())?;
@@ -149,28 +156,29 @@ pub(crate) fn run_snapshot_create(
             }
         }
     }
-    let output = project_legacy(CommandResponse {
-        body: ResponseBody::Snapshot(SnapshotResponse::Create(SnapshotCreateResponse {
-            status: if outcome.noop { "noop" } else { "created" }.to_owned(),
-            message: outcome.message,
-            tree_hash: outcome.tree_hash,
-            commit_hash: outcome.commit_hash,
-            commit: outcome.commit,
-            stats: outcome.stats,
-        })),
-        completion: Completion::Complete,
-    })?;
-    // Automatic GC owns a distinct bound store lock.  The snapshot,
-    // replica publication, and event log are already durable here;
-    // release the writer lock before entering the resumable sweep.
+    let base = SnapshotCreateResponse {
+        status: if outcome.noop { "noop" } else { "created" }.to_owned(),
+        message: outcome.message,
+        tree_hash: outcome.tree_hash,
+        commit_hash: outcome.commit_hash,
+        commit: outcome.commit,
+        stats: outcome.stats,
+    };
+    // Automatic GC owns a distinct bound store lock after durable publication.
     drop(lock);
-    Ok(gc::attach_after_success(
-        &repo,
-        "snapshot",
-        recovered_before_publication,
-        gc_binding,
-        output,
-    ))
+    let attachment =
+        gc::attach_after_success(&repo, "snapshot", recovered_before_publication, gc_binding);
+    project_legacy(CommandResponse {
+        body: ResponseBody::Snapshot(SnapshotResponse::Create(SnapshotCreateReport {
+            base,
+            gc: attachment.report,
+            publication_status: attachment.publication_status,
+            error_code: attachment.error_code,
+        })),
+        completion: attachment
+            .completion_override
+            .unwrap_or(Completion::Complete),
+    })
 }
 
 pub(crate) fn run_log(ctx: &Invocation<'_>, args: commands::LogArgs) -> Result<Value> {
@@ -434,6 +442,14 @@ macro_rules! snapshot_auto_test_barrier {
 }
 
 pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
+    let (response, completion) = run_snapshot_auto_response(ctx)?;
+    project_legacy(CommandResponse {
+        body: ResponseBody::Snapshot(SnapshotResponse::Auto(response)),
+        completion,
+    })
+}
+
+fn run_snapshot_auto_response(ctx: &Invocation<'_>) -> Result<(SnapshotAutoResponse, Completion)> {
     let adapter_settings = ctx.settings;
 
     #[cfg(debug_assertions)]
@@ -455,14 +471,17 @@ pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
                 "scheduled snapshot is disabled while checkpoint recovery is pending",
             ));
         }
-        return Ok(snapshot_auto_output(
-            "skipped",
-            "disabled",
-            "not_started",
-            None,
-            None,
-            None,
-            false,
+        return Ok((
+            snapshot_auto_output(
+                "skipped",
+                "disabled",
+                "not_started",
+                None,
+                None,
+                None,
+                false,
+            ),
+            Completion::Complete,
         ));
     }
     // A Windows checkpoint exchange can temporarily remove its public name.
@@ -497,14 +516,17 @@ pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
         ));
     }
     if !first_indexed {
-        return Ok(snapshot_auto_output(
-            "skipped",
-            "not_indexed",
-            "not_started",
-            None,
-            None,
-            None,
-            false,
+        return Ok((
+            snapshot_auto_output(
+                "skipped",
+                "not_indexed",
+                "not_started",
+                None,
+                None,
+                None,
+                false,
+            ),
+            Completion::Complete,
         ));
     }
     wait_at_snapshot_auto_test_barrier(snapshot_auto_test_barrier!(
@@ -525,15 +547,11 @@ pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
                 "not_started",
                 None,
                 None,
-                Some(report),
+                Some(*report),
                 true,
             );
-            output
-                .as_object_mut()
-                .expect("snapshot output object")
-                .insert("error_code".to_owned(), json!("KIO-E-GC-RUNTIME-LIMIT-001"));
-            set_exit_override(&mut output, ExitCode::PartialFailure);
-            return Ok(output);
+            output.error_code = Some("KIO-E-GC-RUNTIME-LIMIT-001".to_owned());
+            return Ok((output, Completion::Partial));
         }
     };
     if gc_binding != first_gc
@@ -566,14 +584,17 @@ pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
         } else {
             ("skipped", "not_eligible")
         };
-        return Ok(snapshot_auto_output(
-            status,
-            reason,
-            "not_started",
-            Some(&initial),
-            None,
-            None,
-            recovered_gc,
+        return Ok((
+            snapshot_auto_output(
+                status,
+                reason,
+                "not_started",
+                Some(&initial),
+                None,
+                None,
+                recovered_gc,
+            ),
+            Completion::Complete,
         ));
     }
     wait_at_snapshot_auto_test_barrier(snapshot_auto_test_barrier!(
@@ -697,34 +718,53 @@ pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
     };
 
     match &publication_observation.idle {
-        ScheduledIdleObservation::Baseline { .. } => Ok(snapshot_auto_output(
-            "baseline_recorded",
-            "first_observation",
-            publication_status,
-            Some(&publication_observation),
-            outcome.as_ref(),
-            Some(json!({"status":"skipped","reason":"baseline_recorded","mode":"on_idle"})),
-            recovered_gc,
-        )),
-        ScheduledIdleObservation::Changed { .. } => Ok(snapshot_auto_output(
-            "not_idle",
-            "working_set_changed",
-            publication_status,
-            Some(&publication_observation),
-            outcome.as_ref(),
-            Some(json!({"status":"skipped","reason":"working_set_changed","mode":"on_idle"})),
-            recovered_gc,
-        )),
-        ScheduledIdleObservation::Waiting { .. } => Ok(snapshot_auto_output(
-            "not_idle",
-            "idle_threshold_not_reached",
-            publication_status,
-            Some(&publication_observation),
-            outcome.as_ref(),
-            Some(
-                json!({"status":"skipped","reason":"idle_threshold_not_reached","mode":"on_idle"}),
+        ScheduledIdleObservation::Baseline { .. } => Ok((
+            snapshot_auto_output(
+                "baseline_recorded",
+                "first_observation",
+                publication_status,
+                Some(&publication_observation),
+                outcome.as_ref(),
+                Some(GcReport::OnIdleSkip(GcOnIdleSkip {
+                    status: "skipped".to_owned(),
+                    reason: "baseline_recorded".to_owned(),
+                    mode: "on_idle".to_owned(),
+                })),
+                recovered_gc,
             ),
-            recovered_gc,
+            Completion::Complete,
+        )),
+        ScheduledIdleObservation::Changed { .. } => Ok((
+            snapshot_auto_output(
+                "not_idle",
+                "working_set_changed",
+                publication_status,
+                Some(&publication_observation),
+                outcome.as_ref(),
+                Some(GcReport::OnIdleSkip(GcOnIdleSkip {
+                    status: "skipped".to_owned(),
+                    reason: "working_set_changed".to_owned(),
+                    mode: "on_idle".to_owned(),
+                })),
+                recovered_gc,
+            ),
+            Completion::Complete,
+        )),
+        ScheduledIdleObservation::Waiting { .. } => Ok((
+            snapshot_auto_output(
+                "not_idle",
+                "idle_threshold_not_reached",
+                publication_status,
+                Some(&publication_observation),
+                outcome.as_ref(),
+                Some(GcReport::OnIdleSkip(GcOnIdleSkip {
+                    status: "skipped".to_owned(),
+                    reason: "idle_threshold_not_reached".to_owned(),
+                    mode: "on_idle".to_owned(),
+                })),
+                recovered_gc,
+            ),
+            Completion::Complete,
         )),
         ScheduledIdleObservation::Eligible { .. } => {
             let gc = match gc::run_on_idle_after_snapshot_bound(
@@ -750,30 +790,26 @@ pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
                         publication_status,
                         Some(&publication_observation),
                         outcome.as_ref(),
-                        Some(json!({
-                            "status": "failed",
-                            "reason": "gc_failed",
-                            "mode": "on_idle",
-                            "recovery_pending": recovery_pending,
-                            "error": error.to_error_json(),
+                        Some(GcReport::OnIdleFailure(GcOnIdleFailure {
+                            status: "failed".to_owned(),
+                            reason: "gc_failed".to_owned(),
+                            mode: "on_idle".to_owned(),
+                            recovery_pending,
+                            error: (&error).into(),
                         })),
                         recovered_gc,
                     );
-                    output
-                        .as_object_mut()
-                        .expect("snapshot output object")
-                        .insert("error_code".to_owned(), json!(error.error_code()));
-                    let exit = if error.exit_code() == ExitCode::PermanentFailure {
-                        ExitCode::PermanentFailure
+                    output.error_code = Some(error.error_code().to_owned());
+                    let completion = if error.exit_code() == ExitCode::PermanentFailure {
+                        Completion::Permanent
                     } else {
-                        ExitCode::PartialFailure
+                        Completion::Partial
                     };
-                    set_exit_override(&mut output, exit);
-                    return Ok(output);
+                    return Ok((output, completion));
                 }
             };
-            let deferred = gc.get("status").and_then(Value::as_str) == Some("deferred");
-            let no_candidates = gc.get("reason").and_then(Value::as_str) == Some("no_candidates");
+            let deferred = gc.is_runtime_deferred();
+            let no_candidates = gc.has_no_candidates();
             let snapshot_created = outcome.as_ref().is_some_and(|value| !value.noop);
             let (status, reason) = if deferred {
                 ("deferred", "max_runtime_seconds")
@@ -792,13 +828,16 @@ pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
                 recovered_gc,
             );
             if deferred {
-                output
-                    .as_object_mut()
-                    .expect("snapshot output object")
-                    .insert("error_code".to_owned(), json!("KIO-E-GC-RUNTIME-LIMIT-001"));
-                set_exit_override(&mut output, ExitCode::PartialFailure);
+                output.error_code = Some("KIO-E-GC-RUNTIME-LIMIT-001".to_owned());
             }
-            Ok(output)
+            Ok((
+                output,
+                if deferred {
+                    Completion::Partial
+                } else {
+                    Completion::Complete
+                },
+            ))
         }
         ScheduledIdleObservation::Inactive => {
             let (status, reason) = match outcome.as_ref() {
@@ -806,14 +845,17 @@ pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<Value> {
                 Some(_) => ("completed", "snapshot_created"),
                 None => ("skipped", "not_eligible"),
             };
-            Ok(snapshot_auto_output(
-                status,
-                reason,
-                publication_status,
-                Some(&publication_observation),
-                outcome.as_ref(),
-                None,
-                recovered_gc,
+            Ok((
+                snapshot_auto_output(
+                    status,
+                    reason,
+                    publication_status,
+                    Some(&publication_observation),
+                    outcome.as_ref(),
+                    None,
+                    recovered_gc,
+                ),
+                Completion::Complete,
             ))
         }
     }
@@ -825,45 +867,47 @@ fn snapshot_auto_output(
     publication_status: &str,
     observation: Option<&ScheduledAutoObservation>,
     outcome: Option<&SnapshotOutcome>,
-    gc: Option<Value>,
+    gc: Option<GcReport>,
     recovered_gc: bool,
-) -> Value {
+) -> SnapshotAutoResponse {
     let idle = observation.map(|value| &value.idle);
     let recovery_pending = gc
         .as_ref()
-        .and_then(|value| value.get("recovery_pending"))
-        .and_then(Value::as_bool)
+        .and_then(GcReport::recovery_pending)
         .unwrap_or(status == "deferred");
-    json!({
-        "operation": "snapshot_auto",
-        "status": status,
-        "reason": reason,
-        "publication_status": publication_status,
-        "snapshot_status": match outcome {
+    SnapshotAutoResponse {
+        operation: "snapshot_auto".to_owned(),
+        status: status.to_owned(),
+        reason: reason.to_owned(),
+        publication_status: publication_status.to_owned(),
+        snapshot_status: match outcome {
             Some(value) if value.noop => "noop",
             Some(_) => "completed",
             None => "not_started",
-        },
-        "eligibility_reason": observation.and_then(|value| value.eligibility_reason),
-        "eligible": observation.is_some_and(|value| value.eligible),
-        "change_count": observation.map(|value| value.change_count),
-        "next_eligible_at": observation.and_then(|value| value.next_eligible_at.as_deref()),
-        "commit_hash": outcome.and_then(|value| value.commit_hash.as_deref()),
-        "tree_hash": outcome.map(|value| value.tree_hash.as_str()),
-        "stats": outcome.map(|value| json!({
-            "files_added": value.stats.files_added,
-            "files_modified": value.stats.files_modified,
-            "files_deleted": value.stats.files_deleted,
-        })),
-        "working_set_digest": observation.map(|value| value.working_set_digest.as_str()),
-        "idle_observed_since": idle.and_then(|value| value.observed_since()),
-        "idle_observed_seconds": idle.and_then(|value| value.observed_seconds()),
-        "idle_threshold_seconds": idle.and_then(|value| value.threshold_seconds()),
-        "idle_eligible": idle.is_some_and(|value| matches!(value, ScheduledIdleObservation::Eligible { .. })),
-        "recovered_gc": recovered_gc,
-        "recovery_pending": recovery_pending,
-        "gc": gc,
-    })
+        }
+        .to_owned(),
+        eligibility_reason: observation
+            .and_then(|value| value.eligibility_reason)
+            .map(str::to_owned),
+        eligible: observation.is_some_and(|value| value.eligible),
+        change_count: observation.map(|value| value.change_count),
+        next_eligible_at: observation.and_then(|value| value.next_eligible_at.clone()),
+        commit_hash: outcome.and_then(|value| value.commit_hash.clone()),
+        tree_hash: outcome.map(|value| value.tree_hash.clone()),
+        stats: outcome.map(|value| value.stats.clone()),
+        working_set_digest: observation.map(|value| value.working_set_digest.clone()),
+        idle_observed_since: idle
+            .and_then(|value| value.observed_since())
+            .map(str::to_owned),
+        idle_observed_seconds: idle.and_then(|value| value.observed_seconds()),
+        idle_threshold_seconds: idle.and_then(|value| value.threshold_seconds()),
+        idle_eligible: idle
+            .is_some_and(|value| matches!(value, ScheduledIdleObservation::Eligible { .. })),
+        recovered_gc,
+        recovery_pending,
+        gc,
+        error_code: None,
+    }
 }
 
 fn snapshot_auto_authority_changed(message: &str) -> KioError {

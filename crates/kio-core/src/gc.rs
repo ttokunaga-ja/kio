@@ -33,7 +33,11 @@ mod unreachable_inventory;
 #[path = "gc/windows_snapshot_state_tests.rs"]
 mod windows_snapshot_state;
 
-pub use unreachable_inventory::{UnreachableInventoryLimits, UnreachableObjectInventory};
+pub use unreachable_inventory::{
+    InventoryObject, InventoryStats, ShallowBoundary, UnreachableInventoryLimits,
+    UnreachableInventoryPassStats, UnreachableInventoryReport, UnreachableInventorySummary,
+    UnreachableObjectInventory,
+};
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};

@@ -22,16 +22,14 @@ use crate::historical_reindex;
 use crate::index::chunk_ledger::ensure_purge_epoch_initialized;
 use crate::index::chunk_ledger::recover_index_generation;
 use crate::index::pipeline::explicitly_allowed_tier_a_paths;
-use crate::index::pipeline::index_preview_json;
+use crate::index::pipeline::index_preview_response;
 use crate::index::pipeline::run_index_pipeline;
-use crate::index::rebuild::attach_skipped_units;
 use crate::index::rebuild::is_rebuild_skippable_unit_error;
 use crate::index::rebuild::read_head_tree_for_rebuild;
 use crate::index::rebuild::rebuild_step3_index;
+use crate::index::rebuild::skipped_disclosure;
 use crate::invocation::Invocation;
-use crate::invocation::exit_override_error_code;
-use crate::invocation::merged_index_exit_override;
-use crate::invocation::peek_exit_override;
+use crate::invocation::merged_index_completion;
 use crate::ledger_access::RETIRED_NON_LIVE;
 use crate::ledger_access::open_optional_ledger_db;
 use crate::ledger_access::recover_stale_sync_rows;
@@ -47,10 +45,18 @@ use crate::object_persistence::pipeline_to_kio;
 use crate::promotion::apply_online_promotion_to_index;
 use crate::promotion::finish_pending_online_promotion;
 use crate::promotion::recover_pending_online_promotion;
+use crate::response::gc::{GcPreflightRecovered, GcReport};
+use crate::response::index::{
+    ChildPreviewRow, ChildPublishedRow, IndexPublishedResponse, IndexResponse,
+    PreviewChildDiscovery, PublishedChildDiscovery,
+};
+use crate::response::reindex::{HeadReindexResponse, ReindexExecution, ReindexResponse};
 use crate::response::search::FileDispositionResponse;
 use crate::response::search::IndexStatusError;
 use crate::response::search::IndexStatusResponse;
 use crate::response::search::OfficeConversionUnavailableResponse;
+use crate::response::skipped_units::SkippedUnit;
+use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
 use crate::scope_access::ensure_raw_ingest_allowed;
 use crate::scope_access::register_scope;
 use crate::scope_access::resolve_evidence_scope_target;
@@ -63,7 +69,6 @@ use crate::settings::user_config_toml_path;
 use crate::settings::validate_repo_tool_lock;
 use crate::task_execution::enrichment_exit_override;
 use crate::task_execution::scope_budget_warning;
-use crate::task_execution::set_exit_override;
 use crate::task_execution::task_retry_allowed;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_core::ExitCode;
@@ -115,7 +120,16 @@ pub(crate) fn run_index(ctx: &Invocation<'_>, args: IndexArgs) -> Result<Value> 
     // the ordinary open path may repair a missing HEAD, which would violate the
     // preview no-state-creation contract before scanning.
     let repo = open_existing_managed_root(ctx.cwd(), ctx.control)?.in_lock_session(ctx.locks);
-    run_index_for_repo(ctx, args, &repo, true)
+    let execution = run_index_for_repo(ctx, args, &repo, true)?;
+    project_legacy(CommandResponse {
+        body: ResponseBody::Index(execution.response),
+        completion: execution.completion,
+    })
+}
+
+struct IndexExecution {
+    response: IndexResponse,
+    completion: Completion,
 }
 
 /// Index one scope. Only the user-invoked parent discovers children; child
@@ -125,7 +139,7 @@ fn run_index_for_repo(
     args: IndexArgs,
     repo: &Repository,
     discover_children: bool,
-) -> Result<Value> {
+) -> Result<IndexExecution> {
     run_index_for_repo_inner(ctx, args, repo, discover_children)
 }
 
@@ -187,7 +201,7 @@ fn run_index_for_repo_inner(
     args: IndexArgs,
     repo: &Repository,
     discover_children: bool,
-) -> Result<Value> {
+) -> Result<IndexExecution> {
     let adapter_settings = ctx.settings;
 
     if args.online && args.offline {
@@ -235,7 +249,12 @@ fn run_index_for_repo_inner(
         match gc::preflight_automatic(repo, "index")? {
             gc::AutomaticGcPreflight::Proceed { recovered, binding } => (recovered, Some(binding)),
             gc::AutomaticGcPreflight::Deferred(report) => {
-                return Ok(gc::deferred_before_publication("index", report));
+                return Ok(IndexExecution {
+                    response: IndexResponse::Deferred(gc::deferred_before_publication(
+                        "index", *report,
+                    )),
+                    completion: Completion::Partial,
+                });
             }
         }
     };
@@ -255,7 +274,7 @@ fn run_index_for_repo_inner(
             },
         )
         .map_err(pipeline_to_kio)?;
-        let mut output = index_preview_json(repo.canonical_root(), &preview);
+        let mut output = index_preview_response(repo.canonical_root(), &preview);
         if let Some(discovery) = child_discovery.as_ref() {
             let plan = &discovery.slice.plan;
             let mut children = Vec::new();
@@ -278,14 +297,18 @@ fn run_index_for_repo_inner(
             let parent_binding = binding_for_repo(repo)?;
             let parent_case = kio_core::management::read_record(&parent_binding)?.case_insensitive;
             for child in plan.candidates.clone() {
-                let mut row = serde_json::to_value(&child)
-                    .unwrap_or_else(|_| json!({ "path": child.path, "status": child.status }));
+                let mut row = ChildPreviewRow {
+                    discovery: child.clone(),
+                    estimated_file_count: None,
+                    estimated_size_bytes: None,
+                    estimated_cost_usd: None,
+                };
                 if child.status == "planned" {
                     let Some(bound) =
                         bind_planned_child(plan, &child.path).map_err(pipeline_to_kio)?
                     else {
-                        row["status"] = json!("skipped_vcs");
-                        row["reason"] = json!("vcs_marker_added_after_discovery");
+                        row.discovery.status = "skipped_vcs".to_owned();
+                        row.discovery.reason = Some("vcs_marker_added_after_discovery".to_owned());
                         children.push(row);
                         continue;
                     };
@@ -316,27 +339,30 @@ fn run_index_for_repo_inner(
                         .as_ref()
                         .map(|cost| cost.estimated_usd)
                         .unwrap_or_default();
-                    row["estimated_file_count"] = json!(count);
-                    row["estimated_size_bytes"] = json!(bytes);
-                    row["estimated_cost_usd"] = json!(cost);
+                    row.estimated_file_count = Some(count);
+                    row.estimated_size_bytes = Some(bytes);
+                    row.estimated_cost_usd = Some(cost);
                     aggregate_files += count;
                     aggregate_bytes += bytes;
                     aggregate_cost += cost;
                 }
                 children.push(row);
             }
-            output["child_scopes"] = json!(children);
-            output["estimated_aggregate_file_count"] = json!(aggregate_files);
-            output["estimated_aggregate_size_bytes"] = json!(aggregate_bytes);
-            output["estimated_aggregate_cost_usd"] = json!(aggregate_cost);
-            output["child_scope_discovery"] = json!({
-                "page_size": CHILD_SCOPE_DISCOVERY_PAGE_SIZE,
-                "has_more": discovery.slice.continuation.is_some(),
-                "preview": true,
+            output.child_scopes = Some(children);
+            output.estimated_aggregate_file_count = Some(aggregate_files);
+            output.estimated_aggregate_size_bytes = Some(aggregate_bytes);
+            output.estimated_aggregate_cost_usd = Some(aggregate_cost);
+            output.child_scope_discovery = Some(PreviewChildDiscovery {
+                page_size: CHILD_SCOPE_DISCOVERY_PAGE_SIZE,
+                has_more: discovery.slice.continuation.is_some(),
+                preview: true,
             });
         }
         admission_policy.revalidate().map_err(pipeline_to_kio)?;
-        return Ok(output);
+        return Ok(IndexExecution {
+            response: IndexResponse::Preview(output),
+            completion: Completion::Complete,
+        });
     }
 
     // An explicit network request must not silently turn into an offline
@@ -483,49 +509,37 @@ fn run_index_for_repo_inner(
     // The scope now has a search index; register it as indexed so it participates
     // in default multi-scope search (05 §1.8, K3). Cache write, never fatal.
     register_scope(ctx, repo, true);
-    let mut output = json!({
-        "status": if outcome.noop { "noop" } else { "indexed" },
-        "approval_method": if args.yes { "yes" } else { "existing" },
-        "network_allowed": index_result.network_allowed,
-        "network_opt_in": persistent_network_allowed(adapter_settings, repo)?,
-        "pending_online_tasks": index_result.pending_online_tasks,
-        // R11-2: fold enrichment's budget pauses in with the enqueue-paused markdownize
-        // tasks so `paused_tasks` reflects everything the run left paused.
-        "paused_tasks": index_result.paused_tasks + enrichment.paused,
-        "failed_files": index_result.failed_files,
-        "normalized_files": index_result.normalized_files,
-        "pending_files": index_result.pending_files,
-        // R12-2: files skipped for adapter processing by the max_input_bytes gate.
-        "skipped_oversized_files": index_result.skipped_oversized_files,
-        // R22-4: archived binaries that no local pass and no online OCR can enrich.
-        "skipped_unrecognized_binary_files": index_result.skipped_unrecognized_binary_files,
-        // R11-2: disclose the inline embedding enrichment (was entirely absent, so an
-        // auth/rate failure during index was invisible in the result JSON).
-        "embedding_tasks_executed": enrichment.executed,
-        "embedding_tasks_failed": enrichment.failed,
-        "tree_hash": outcome.tree_hash,
-        "commit_hash": outcome.commit_hash,
-        "commit": outcome.commit,
-        // F5: non-blocking budget warning (null unless a cap crossed warn_at_percent).
-        "budget_warning": scope_budget_warning(repo)?,
-    });
-    // R16-4: disclose any documents skipped for missing/corrupt units (empty on a
-    // clean index — the units were just written, so this normally stays empty).
-    attach_skipped_units(&mut output, &rebuild_report, repo.kio_dir());
-    // R11-3: an index that partially failed to normalize local files keeps its full
-    // result JSON on stdout (commit_hash, tree_hash, …) with `error_code` +
-    // `__exit_code:3`, matching search's "result + nonzero exit" shape — instead of
-    // the old Err envelope that buried commit_hash inside a private `context.output`.
-    if index_result.failed_files > 0 {
-        output["error_code"] = json!("KIO-E-INDEX-PARTIAL-001");
-    }
-    // Exit priority (docs/04 §5.6 / §7): enrichment auth (5) > budget pause (6) >
-    // local partial (3). All still print the full result JSON to stdout.
-    let exit_override = enrichment_exit_override(&enrichment)
-        .or_else(|| (index_result.failed_files > 0).then_some(ExitCode::PartialFailure));
-    if let Some(code) = exit_override {
-        set_exit_override(&mut output, code);
-    }
+    let mut output = IndexPublishedResponse {
+        status: if outcome.noop { "noop" } else { "indexed" }.to_owned(),
+        approval_method: if args.yes { "yes" } else { "existing" }.to_owned(),
+        network_allowed: index_result.network_allowed,
+        network_opt_in: persistent_network_allowed(adapter_settings, repo)?,
+        pending_online_tasks: index_result.pending_online_tasks,
+        paused_tasks: index_result.paused_tasks + enrichment.paused,
+        failed_files: index_result.failed_files,
+        normalized_files: index_result.normalized_files,
+        pending_files: index_result.pending_files,
+        skipped_oversized_files: index_result.skipped_oversized_files,
+        skipped_unrecognized_binary_files: index_result.skipped_unrecognized_binary_files,
+        embedding_tasks_executed: enrichment.executed,
+        embedding_tasks_failed: enrichment.failed,
+        tree_hash: outcome.tree_hash,
+        commit_hash: outcome.commit_hash,
+        commit: outcome.commit,
+        budget_warning: scope_budget_warning(repo)?,
+        skipped: skipped_disclosure(&rebuild_report, repo.kio_dir()),
+        error_code: (index_result.failed_files > 0).then(|| "KIO-E-INDEX-PARTIAL-001".to_owned()),
+        gc: None,
+        publication_status: None,
+        child_scopes: None,
+        child_scope_discovery: None,
+    };
+    let mut completion = match enrichment_exit_override(&enrichment) {
+        Some(ExitCode::AuthError) => Completion::AuthRequired,
+        Some(ExitCode::BudgetExceeded) => Completion::BudgetBlocked,
+        _ if index_result.failed_files > 0 => Completion::Partial,
+        _ => Completion::Complete,
+    };
     // This scope's publication and projection are complete. Enrollment takes
     // its own retained parent lock, so holding the indexing lock while entering
     // a child would contend with ourselves. No parent content is changed by the
@@ -546,9 +560,9 @@ fn run_index_for_repo_inner(
         let mut children = Vec::new();
         let mut child_rows_total = 0_u64;
         let mut managed_parents = BTreeMap::<String, Repository>::new();
-        let mut child_gc_reports = BTreeMap::<String, Value>::new();
-        let parent_exit_override = peek_exit_override(&output);
-        let mut child_exit_overrides = Vec::new();
+        let mut child_gc_reports = BTreeMap::<String, GcReport>::new();
+        let parent_completion = completion;
+        let mut child_completions = Vec::new();
         let mut incomplete_child_discovery = false;
         let mut restart_count = u8::from(page.restarted_from_root);
         let mut continuation_committed = false;
@@ -630,14 +644,14 @@ fn run_index_for_repo_inner(
                         child.reason = Some("current_parent_policy".to_owned());
                     }
                     Ok(BoundChildIndex::Output(child_output, child_repo))
-                        if peek_exit_override(&child_output).is_none() =>
+                        if child_output.completion == Completion::Complete =>
                     {
                         cache_managed_child_parent(
                             &mut managed_parents,
                             child.path.clone(),
                             *child_repo,
                         );
-                        if let Some(gc) = child_output.get("gc") {
+                        if let Some(gc) = child_output.response.gc() {
                             child_gc_reports.insert(child.path.clone(), gc.clone());
                         }
                         child.status = "indexed".to_owned()
@@ -648,37 +662,54 @@ fn run_index_for_repo_inner(
                             child.path.clone(),
                             *child_repo,
                         );
-                        if let Some(gc) = child_output.get("gc") {
+                        if let Some(gc) = child_output.response.gc() {
                             child_gc_reports.insert(child.path.clone(), gc.clone());
                         }
-                        let child_exit = peek_exit_override(&child_output)
-                            .expect("guarded child output must carry a supported exit override");
-                        child_exit_overrides.push(child_exit);
+                        let child_completion = child_output.completion;
+                        child_completions.push(child_completion);
                         child.status = "indexed_partial".to_owned();
                         child.error_code = child_output
-                            .get("error_code")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                            .or_else(|| Some(exit_override_error_code(child_exit).to_owned()));
-                        child.message = child_output
-                            .get("message")
-                            .and_then(Value::as_str)
+                            .response
+                            .error_code()
                             .map(str::to_owned)
                             .or_else(|| {
-                                Some("child index completed with a non-success exit".to_owned())
+                                Some(
+                                    match child_completion {
+                                        Completion::AuthRequired => "KIO-E-ADAPTER-AUTH-001",
+                                        Completion::BudgetBlocked => "KIO-E-BUDGET-EXCEEDED-001",
+                                        Completion::Partial => "KIO-E-SEARCH-PARTIAL-001",
+                                        Completion::Permanent => {
+                                            "KIO-E-SEARCH-SCOPE-ALL-FAILED-001"
+                                        }
+                                        Completion::Complete => {
+                                            unreachable!("guarded child must be noncomplete")
+                                        }
+                                    }
+                                    .to_owned(),
+                                )
                             });
+                        child.message =
+                            child_output
+                                .response
+                                .message()
+                                .map(str::to_owned)
+                                .or_else(|| {
+                                    Some("child index completed with a non-success exit".to_owned())
+                                });
                     }
                     Err(error) => {
                         incomplete_child_discovery = true;
                         page_completed = false;
-                        if matches!(
-                            error.exit_code(),
-                            ExitCode::AuthError
-                                | ExitCode::BudgetExceeded
-                                | ExitCode::PartialFailure
-                                | ExitCode::PermanentFailure
-                        ) {
-                            child_exit_overrides.push(error.exit_code());
+                        match error.exit_code() {
+                            ExitCode::AuthError => child_completions.push(Completion::AuthRequired),
+                            ExitCode::BudgetExceeded => {
+                                child_completions.push(Completion::BudgetBlocked)
+                            }
+                            ExitCode::PartialFailure => child_completions.push(Completion::Partial),
+                            ExitCode::PermanentFailure => {
+                                child_completions.push(Completion::Permanent)
+                            }
+                            _ => {}
                         }
                         child.status = "skipped_error".to_owned();
                         child.error_code = Some(error.error_code().to_owned());
@@ -713,63 +744,68 @@ fn run_index_for_repo_inner(
             page = next;
         };
         let child_rows_omitted = child_rows_total.saturating_sub(children.len() as u64);
-        let mut child_values = serde_json::to_value(children).unwrap_or_else(|_| json!([]));
-        if let Some(rows) = child_values.as_array_mut() {
-            for row in rows {
-                let Some(path) = row.get("path").and_then(Value::as_str) else {
-                    continue;
-                };
-                if let Some(gc) = child_gc_reports.get(path) {
-                    row["gc"] = gc.clone();
-                }
-            }
-        }
-        output["child_scopes"] = child_values;
-        output["child_scope_discovery"] = json!({
-            "page_size": CHILD_SCOPE_DISCOVERY_PAGE_SIZE,
-            "has_more": has_more,
-            "continuation_committed": continuation_committed,
-            "restarted_from_root": restart_count > 0,
-            "rows_total": child_rows_total,
-            "rows_omitted": child_rows_omitted,
+        output.child_scopes = Some(
+            children
+                .into_iter()
+                .map(|discovery| {
+                    let gc = child_gc_reports.get(&discovery.path).cloned();
+                    ChildPublishedRow { discovery, gc }
+                })
+                .collect(),
+        );
+        output.child_scope_discovery = Some(PublishedChildDiscovery {
+            page_size: CHILD_SCOPE_DISCOVERY_PAGE_SIZE,
+            has_more,
+            continuation_committed,
+            restarted_from_root: restart_count > 0,
+            rows_total: child_rows_total,
+            rows_omitted: child_rows_omitted,
         });
-        if let Some(code) = merged_index_exit_override(
-            parent_exit_override,
-            child_exit_overrides,
+        completion = merged_index_completion(
+            parent_completion,
+            child_completions,
             incomplete_child_discovery,
-        ) {
-            if output.get("error_code").is_none() {
-                output["error_code"] = json!(match code {
-                    ExitCode::AuthError => "KIO-E-ADAPTER-AUTH-001",
-                    ExitCode::BudgetExceeded => "KIO-E-BUDGET-EXCEEDED-001",
+        );
+        if completion != Completion::Complete && output.error_code.is_none() {
+            output.error_code = Some(
+                match completion {
+                    Completion::AuthRequired => "KIO-E-ADAPTER-AUTH-001",
+                    Completion::BudgetBlocked => "KIO-E-BUDGET-EXCEEDED-001",
                     _ => "KIO-E-INDEX-PARTIAL-001",
-                });
-            }
-            set_exit_override(&mut output, code);
+                }
+                .to_owned(),
+            );
         }
     }
-    let successful_publication = peek_exit_override(&output).is_none();
+    let successful_publication = completion == Completion::Complete;
     if !successful_publication && recovered_before_publication {
-        output["gc"] = json!({
-            "status": "completed",
-            "trigger": "preflight_recovery",
-            "mode": "after_index",
-            "recovered_before_publication": true,
-        });
+        output.gc = Some(GcReport::PreflightRecovered(GcPreflightRecovered {
+            status: "completed".to_owned(),
+            trigger: "preflight_recovery".to_owned(),
+            mode: "after_index".to_owned(),
+            recovered_before_publication: true,
+        }));
     }
     // Automatic GC acquires its own descriptor-bound lock after publication.
     if successful_publication {
         let gc_binding = gc_binding.expect("successful index has automatic GC preflight binding");
-        Ok(gc::attach_after_success(
-            repo,
-            "index",
-            recovered_before_publication,
-            gc_binding,
-            output,
-        ))
-    } else {
-        Ok(output)
+        let attachment =
+            gc::attach_after_success(repo, "index", recovered_before_publication, gc_binding);
+        output.gc = Some(attachment.report);
+        if let Some(status) = attachment.publication_status {
+            output.publication_status = Some(status);
+        }
+        if let Some(code) = attachment.error_code {
+            output.error_code = Some(code);
+        }
+        if let Some(override_completion) = attachment.completion_override {
+            completion = override_completion;
+        }
     }
+    Ok(IndexExecution {
+        response: IndexResponse::Published(Box::new(output)),
+        completion,
+    })
 }
 
 /// Build a preview through retained management and live ancestor policy.
@@ -826,7 +862,7 @@ enum BoundChildIndex {
     SkippedVcs,
     ExcludedIndependentRoot,
     ExcludedByPolicy,
-    Output(Value, Box<Repository>),
+    Output(Box<IndexExecution>, Box<Repository>),
 }
 
 /// Keep CLI output bounded even when one invocation reconciles many pages.
@@ -959,7 +995,7 @@ fn run_bound_child_index(
             // execution lane through that child's ordinary send gates.
             child_args.yes = false;
             let output = run_index_for_repo(ctx, child_args, &repo, false)?;
-            Ok(BoundChildIndex::Output(output, repo))
+            Ok(BoundChildIndex::Output(Box::new(output), repo))
         }
     }
 }
@@ -1248,6 +1284,14 @@ pub(crate) fn record_unsupported_if_changed(
 }
 
 pub(crate) fn run_reindex(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Value> {
+    let execution = run_reindex_response(ctx, args)?;
+    project_legacy(CommandResponse {
+        body: ResponseBody::Reindex(execution.response),
+        completion: execution.completion,
+    })
+}
+
+fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<ReindexExecution> {
     let adapter_settings = ctx.settings;
 
     // B: `--regenerate`/`--at` exclusivity and the flag vocabulary are enforced
@@ -1348,7 +1392,7 @@ pub(crate) fn run_reindex(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Val
     // copy). A skippable failure keeps the document's PREVIOUS gen (so the snapshot
     // still points at its last-good normalized instance and search keeps serving that
     // gen's cached chunks) and is recorded; healthy documents still re-normalize.
-    let mut reindex_skipped = Vec::<Value>::new();
+    let mut reindex_skipped = Vec::<SkippedUnit>::new();
     for entry in &tree.entries {
         let Some(normalize) = &entry.normalize else {
             continue;
@@ -1404,12 +1448,12 @@ pub(crate) fn run_reindex(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Val
                         },
                     },
                 );
-                reindex_skipped.push(json!({
-                    "raw_hash": entry.raw_hash,
-                    "path": entry.path,
-                    "gen": normalize.r#gen,
-                    "reason": error.error_code(),
-                }));
+                reindex_skipped.push(SkippedUnit {
+                    raw_hash: entry.raw_hash.clone(),
+                    path: entry.path.clone(),
+                    r#gen: normalize.r#gen,
+                    reason: error.error_code().to_owned(),
+                });
             }
             Err(error) => return Err(error),
         }
@@ -1475,19 +1519,23 @@ pub(crate) fn run_reindex(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Val
     // R11-2: keep the enrichment ExecOutcome (was discarded) so a new-generation
     // embedding auth/budget-pause is disclosed and raises the exit (result on stdout).
     let enrichment = run_embedding_enrichment(ctx, &repo, embedding_online, false, false)?;
-    let mut output = json!({
-        "status": "reindexed",
-        "reindexed_files": reindexed,
-        "commit_hash": outcome.commit_hash,
-        "rebuilt_chunks": report.rebuilt_chunks,
-        "embedding_tasks_executed": enrichment.executed,
-        "embedding_tasks_failed": enrichment.failed,
-        "paused_tasks": enrichment.paused,
-    });
-    // R16-4: disclose any documents skipped for missing/corrupt units.
-    attach_skipped_units(&mut output, &report, repo.kio_dir());
-    if let Some(code) = enrichment_exit_override(&enrichment) {
-        set_exit_override(&mut output, code);
-    }
-    Ok(output)
+    let response = HeadReindexResponse {
+        status: "reindexed".to_owned(),
+        reindexed_files: reindexed,
+        commit_hash: outcome.commit_hash,
+        rebuilt_chunks: report.rebuilt_chunks,
+        embedding_tasks_executed: enrichment.executed,
+        embedding_tasks_failed: enrichment.failed,
+        paused_tasks: enrichment.paused,
+        skipped: skipped_disclosure(&report, repo.kio_dir()),
+    };
+    let completion = match enrichment_exit_override(&enrichment) {
+        Some(ExitCode::AuthError) => Completion::AuthRequired,
+        Some(ExitCode::BudgetExceeded) => Completion::BudgetBlocked,
+        _ => Completion::Complete,
+    };
+    Ok(ReindexExecution {
+        response: ReindexResponse::Head(response),
+        completion,
+    })
 }

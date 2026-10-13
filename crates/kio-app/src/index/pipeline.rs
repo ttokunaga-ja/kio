@@ -38,6 +38,10 @@ use crate::object_persistence::normalized_output_ref;
 use crate::object_persistence::pipeline_to_kio;
 use crate::object_persistence::write_prepared_objects;
 use crate::online_task::targets_standard_online_markdownize;
+use crate::response::index::{
+    AdapterExecutionMode, IndexPreviewResponse, LargeFile, NetworkTransmissionPolicy,
+    SensitiveCandidate,
+};
 use crate::scope_access::ensure_raw_ingest_allowed;
 use crate::settings::bbox_annotation_enabled;
 use crate::settings::effective_incremental_config;
@@ -104,14 +108,13 @@ use kio_pipeline::unsupported::UNSUPPORTED_REASON_RESOLVED;
 use kio_pipeline::unsupported::UNSUPPORTED_REASON_UNRECOGNIZED_BINARY;
 use kio_pipeline::unsupported::UnsupportedInputDisposition;
 use kio_pipeline::unsupported::UnsupportedInputStore;
-use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
-pub(crate) fn index_preview_json(root: &Path, preview: &ScanPreview) -> Value {
+pub(crate) fn index_preview_response(root: &Path, preview: &ScanPreview) -> IndexPreviewResponse {
     let included = preview
         .candidates
         .iter()
@@ -130,49 +133,59 @@ pub(crate) fn index_preview_json(root: &Path, preview: &ScanPreview) -> Value {
     let sensitive_candidates = preview
         .candidates
         .iter()
-        .filter(|candidate| candidate.quarantine_reason.is_some())
-        .map(|candidate| {
-            json!({
-                "path": candidate.input_path,
-                "reason": candidate.quarantine_reason,
-                "ignored": candidate.ignored,
-            })
+        .filter_map(|candidate| {
+            candidate
+                .quarantine_reason
+                .as_ref()
+                .map(|reason| SensitiveCandidate {
+                    path: candidate.input_path.clone(),
+                    reason: reason.clone(),
+                    ignored: candidate.ignored,
+                })
         })
-        .collect::<Vec<_>>();
+        .collect();
     let large_files = preview
         .candidates
         .iter()
         .filter(|candidate| candidate.size_bytes >= 10 * 1024 * 1024)
-        .map(|candidate| {
-            json!({
-                "path": candidate.input_path,
-                "size_bytes": candidate.size_bytes,
-            })
+        .map(|candidate| LargeFile {
+            path: candidate.input_path.clone(),
+            size_bytes: candidate.size_bytes,
         })
-        .collect::<Vec<_>>();
-    json!({
-        "status": "preview",
-        "root": root,
-        "scope": preview.scope_id,
-        "estimated_file_count": included.len(),
-        "estimated_size_bytes": estimated_size_bytes,
-        "large_files": large_files,
-        "effective_ignore": ".kioignore + built-in secrets Tier A",
-        "excluded_candidates": excluded_candidates,
-        "sensitive_candidates": sensitive_candidates,
-        "network_transmission_policy": {
-            "default": "disabled until adapter approve",
-            "yes_grants_network": false,
+        .collect();
+    IndexPreviewResponse {
+        status: "preview".to_owned(),
+        root: root.to_path_buf(),
+        scope: preview.scope_id.clone(),
+        estimated_file_count: included.len(),
+        estimated_size_bytes,
+        large_files,
+        effective_ignore: ".kioignore + built-in secrets Tier A".to_owned(),
+        excluded_candidates,
+        sensitive_candidates,
+        network_transmission_policy: NetworkTransmissionPolicy {
+            default: "disabled until adapter approve".to_owned(),
+            yes_grants_network: false,
         },
-        "adapter_execution_mode": {
-            "markdownize": "deterministic_library baseline",
-            "embedding": "not generated without online opt-in",
+        adapter_execution_mode: AdapterExecutionMode {
+            markdownize: "deterministic_library baseline".to_owned(),
+            embedding: "not generated without online opt-in".to_owned(),
         },
-        "estimated_cost": preview.estimated_cost,
-        "budget_cap": preview.estimated_cost.as_ref().and_then(|cost| cost.budget_cap_usd),
-        "estimated_completion": "baseline completes in this run; online enhancement depends on budget and opt-in",
-        "candidates": preview.candidates,
-    })
+        estimated_cost: preview.estimated_cost.clone(),
+        budget_cap: preview
+            .estimated_cost
+            .as_ref()
+            .and_then(|cost| cost.budget_cap_usd),
+        estimated_completion:
+            "baseline completes in this run; online enhancement depends on budget and opt-in"
+                .to_owned(),
+        candidates: preview.candidates.clone(),
+        child_scopes: None,
+        estimated_aggregate_file_count: None,
+        estimated_aggregate_size_bytes: None,
+        estimated_aggregate_cost_usd: None,
+        child_scope_discovery: None,
+    }
 }
 
 #[derive(Debug, Default)]

@@ -3,6 +3,7 @@ use crate::commands::CommandRequest as Command;
 use crate::context::AppContext;
 use crate::ledger_access::run_ledger_lifecycle;
 use crate::multi_scope;
+use crate::response::Completion;
 use crate::trust;
 use crate::watch_command;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
@@ -35,33 +36,31 @@ fn exit_code_from_override(code: u64) -> Option<ExitCode> {
     }
 }
 
-pub(crate) fn merged_index_exit_override(
-    parent: Option<ExitCode>,
-    children: impl IntoIterator<Item = ExitCode>,
+pub(crate) fn merged_index_completion(
+    parent: Completion,
+    children: impl IntoIterator<Item = Completion>,
     incomplete_child_discovery: bool,
-) -> Option<ExitCode> {
-    let mut auth = parent == Some(ExitCode::AuthError);
-    let mut budget = parent == Some(ExitCode::BudgetExceeded);
-    let mut partial = incomplete_child_discovery
-        || parent.is_some_and(|code| {
-            matches!(code, ExitCode::PartialFailure | ExitCode::PermanentFailure)
-        });
-    for code in children {
-        match code {
-            ExitCode::AuthError => auth = true,
-            ExitCode::BudgetExceeded => budget = true,
-            ExitCode::PartialFailure | ExitCode::PermanentFailure => partial = true,
-            _ => {}
+) -> Completion {
+    let mut auth = parent == Completion::AuthRequired;
+    let mut budget = parent == Completion::BudgetBlocked;
+    let mut partial =
+        incomplete_child_discovery || matches!(parent, Completion::Partial | Completion::Permanent);
+    for completion in children {
+        match completion {
+            Completion::AuthRequired => auth = true,
+            Completion::BudgetBlocked => budget = true,
+            Completion::Partial | Completion::Permanent => partial = true,
+            Completion::Complete => {}
         }
     }
     if auth {
-        Some(ExitCode::AuthError)
+        Completion::AuthRequired
     } else if budget {
-        Some(ExitCode::BudgetExceeded)
+        Completion::BudgetBlocked
     } else if partial {
-        Some(ExitCode::PartialFailure)
+        Completion::Partial
     } else {
-        None
+        Completion::Complete
     }
 }
 

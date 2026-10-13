@@ -3,9 +3,13 @@ use serde::Serialize;
 use serde_json::Value;
 
 pub mod device;
+pub mod gc;
 pub mod history;
+pub mod index;
 pub mod pointer;
+pub mod reindex;
 pub mod search;
+pub mod skipped_units;
 pub mod snapshot;
 
 #[derive(Debug)]
@@ -26,6 +30,9 @@ pub enum Completion {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum ResponseBody {
+    Index(index::IndexResponse),
+    Reindex(reindex::ReindexResponse),
+    Gc(gc::GcResponse),
     Init(device::InitResponse),
     RootRegister(device::RootRegisterResponse),
     Snapshot(snapshot::SnapshotResponse),
@@ -65,3 +72,12 @@ mod pointer_tests;
 
 #[cfg(test)]
 mod search_tests;
+
+#[cfg(test)]
+mod index_tests;
+#[cfg(test)]
+mod inventory_tests;
+#[cfg(test)]
+mod reindex_skipped_tests;
+#[cfg(test)]
+mod snapshot_gc_tests;

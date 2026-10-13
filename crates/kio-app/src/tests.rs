@@ -3206,42 +3206,38 @@ fn r11_2_exit_override_priority_batch_vs_enrichment() {
 
 #[test]
 fn qb15_parent_and_child_index_exits_keep_user_action_priority() {
-    use crate::invocation::merged_index_exit_override;
-    use kio_core::ExitCode;
+    use crate::invocation::merged_index_completion;
+    use crate::response::Completion;
 
     assert_eq!(
-        merged_index_exit_override(None, [], false),
-        None,
+        merged_index_completion(Completion::Complete, [], false),
+        Completion::Complete,
         "a clean parent and child set exits successfully"
     );
     assert_eq!(
-        merged_index_exit_override(None, [], true),
-        Some(ExitCode::PartialFailure)
+        merged_index_completion(Completion::Complete, [], true),
+        Completion::Partial
     );
     assert_eq!(
-        merged_index_exit_override(
-            Some(ExitCode::PartialFailure),
-            [ExitCode::BudgetExceeded, ExitCode::AuthError],
+        merged_index_completion(
+            Completion::Partial,
+            [Completion::BudgetBlocked, Completion::AuthRequired],
             true,
         ),
-        Some(ExitCode::AuthError)
+        Completion::AuthRequired
     );
     assert_eq!(
-        merged_index_exit_override(
-            Some(ExitCode::PartialFailure),
-            [ExitCode::BudgetExceeded],
-            false,
-        ),
-        Some(ExitCode::BudgetExceeded)
+        merged_index_completion(Completion::Partial, [Completion::BudgetBlocked], false,),
+        Completion::BudgetBlocked
     );
     assert_eq!(
-        merged_index_exit_override(None, [ExitCode::PermanentFailure], false),
-        Some(ExitCode::PartialFailure),
+        merged_index_completion(Completion::Complete, [Completion::Permanent], false),
+        Completion::Partial,
         "a failed child cannot erase already-published parent work"
     );
     assert_eq!(
-        merged_index_exit_override(None, [ExitCode::AuthError], true),
-        Some(ExitCode::AuthError),
+        merged_index_completion(Completion::Complete, [Completion::AuthRequired], true),
+        Completion::AuthRequired,
         "a Result::Err child retains the same auth priority as an output marker"
     );
 }

@@ -19,20 +19,22 @@ use crate::index::rebuild::AuthenticatedNormalizedUnit;
 use crate::index::rebuild::AuthenticatedNormalizedUnits;
 use crate::index::rebuild::Step3RebuildReport;
 use crate::index::rebuild::append_new_chunk_association;
-use crate::index::rebuild::attach_skipped_units;
 use crate::index::rebuild::authenticate_chunk_row;
 use crate::index::rebuild::is_rebuild_skippable_unit_error;
 use crate::index::rebuild::read_chunking_config;
+use crate::index::rebuild::skipped_disclosure;
 use crate::index::rebuild::unit_authorities_from_inputs;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
 use crate::open_view::MAX_MANIFEST_OBJECT_READ_BYTES;
+use crate::response::Completion;
+use crate::response::reindex::{HistoricalReindexResponse, ReindexExecution, ReindexResponse};
+use crate::response::skipped_units::SkippedUnit;
 use crate::scope_access::active_erase_purge_explains_historical_missing_manifest;
 use crate::scope_access::ensure_no_visible_purge_journal;
 use crate::scope_access::purge_blocks_historical_reindex_raw;
 use crate::scope_access::purge_blocks_rebuild_raw;
 use crate::task_execution::enrichment_exit_override;
-use crate::task_execution::set_exit_override;
 use kio_core::ExitCode;
 use kio_core::KioError;
 use kio_core::cas::ContentObjectKind;
@@ -184,23 +186,17 @@ pub(super) fn pinned_manifest_is_complete(
 /// Projection predicates only need keys, but deliberately go through the same
 /// immutable-CAS validation as chunk reconstruction. A mutable normalized-unit
 /// cache must never make an older pinned snapshot appear to contain new text.
-pub(super) fn merge_reindex_skips(report: &mut Step3RebuildReport, reindex_skipped: Vec<Value>) {
+pub(super) fn merge_reindex_skips(
+    report: &mut Step3RebuildReport,
+    reindex_skipped: Vec<SkippedUnit>,
+) {
     let seen: BTreeSet<String> = report
         .skipped_units
         .iter()
-        .filter_map(|entry| {
-            entry
-                .get("raw_hash")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+        .map(|entry| entry.raw_hash.clone())
         .collect();
     for skip in reindex_skipped {
-        let already = skip
-            .get("raw_hash")
-            .and_then(Value::as_str)
-            .is_some_and(|raw_hash| seen.contains(raw_hash));
-        if !already {
+        if !seen.contains(&skip.raw_hash) {
             report.skipped_units.push(skip);
         }
     }
@@ -411,7 +407,7 @@ pub(super) fn run(
     operand: &str,
     online: bool,
     offline: bool,
-) -> Result<Value> {
+) -> Result<ReindexExecution> {
     let adapter_settings = ctx.settings;
 
     ensure_no_visible_purge_journal(repo.kio_dir(), repo.control())?;
@@ -572,7 +568,7 @@ pub(super) fn run(
         + 1;
     let mut appended = Vec::<StoredChunk>::new();
     let mut pending_publication_events = Vec::new();
-    let mut skipped_units = Vec::<Value>::new();
+    let mut skipped_units = Vec::<SkippedUnit>::new();
     let mut reindexed_instances = 0_u64;
     // Only instances whose pinned immutable closure was actually available
     // can be projected below.  An active erase-purge explained gap is a
@@ -628,12 +624,12 @@ pub(super) fn run(
                     return Err(error);
                 }
                 if is_rebuild_skippable_unit_error(&error) {
-                    skipped_units.push(json!({
-                        "raw_hash": instance.raw_hash,
-                        "path": instance.raw_path,
-                        "gen": instance.normalize.r#gen,
-                        "reason": error.error_code(),
-                    }));
+                    skipped_units.push(SkippedUnit {
+                        raw_hash: instance.raw_hash.clone(),
+                        path: instance.raw_path.clone(),
+                        r#gen: instance.normalize.r#gen,
+                        reason: error.error_code().to_owned(),
+                    });
                     continue;
                 }
                 return Err(error);
@@ -761,22 +757,27 @@ pub(super) fn run(
         rebuilt_tree_entries: tree_entries.len() as u64,
         skipped_units,
     };
-    let mut output = json!({
-        "status": "reindexed",
-        "snapshot_at": selected_commit,
-        "head_commit": head_after,
-        "reindexed_files": reindexed_instances,
-        "rebuilt_chunks": report.rebuilt_chunks,
-        "embedding_tasks_executed": enrichment.executed,
-        "embedding_tasks_failed": enrichment.failed,
-        "paused_tasks": enrichment.paused,
-        "blocked_raw_hashes": blocked_raw_hashes.len(),
-    });
-    attach_skipped_units(&mut output, &report, repo.kio_dir());
-    if let Some(code) = enrichment_exit_override(&enrichment) {
-        set_exit_override(&mut output, code);
-    }
-    Ok(output)
+    let response = HistoricalReindexResponse {
+        status: "reindexed".to_owned(),
+        snapshot_at: selected_commit,
+        head_commit: head_after,
+        reindexed_files: reindexed_instances,
+        rebuilt_chunks: report.rebuilt_chunks,
+        embedding_tasks_executed: enrichment.executed,
+        embedding_tasks_failed: enrichment.failed,
+        paused_tasks: enrichment.paused,
+        blocked_raw_hashes: blocked_raw_hashes.len(),
+        skipped: skipped_disclosure(&report, repo.kio_dir()),
+    };
+    let completion = match enrichment_exit_override(&enrichment) {
+        Some(ExitCode::AuthError) => Completion::AuthRequired,
+        Some(ExitCode::BudgetExceeded) => Completion::BudgetBlocked,
+        _ => Completion::Complete,
+    };
+    Ok(ReindexExecution {
+        response: ReindexResponse::Historical(response),
+        completion,
+    })
 }
 
 /// Collect introduction candidates for the composite relation of exact

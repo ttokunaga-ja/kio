@@ -22,6 +22,7 @@ use crate::index::chunk_ledger::truncate_torn_chunk_tail;
 use crate::invocation::Invocation;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
+use crate::response::skipped_units::{PublishedSkippedUnit, SkippedDisclosure, SkippedUnit};
 use crate::scope_access::ensure_no_visible_purge_journal;
 use crate::scope_access::is_store_not_found;
 use crate::scope_access::purge_blocks_rebuild_raw;
@@ -458,7 +459,7 @@ pub(crate) fn rebuild_step3_index(
     // reported here rather than aborting the whole rebuild (docs/10 §7.2: "最悪
     // objects/ と refs/ が保全されていれば復旧できる" — one bad unit must not veto
     // the recovery of every healthy document). Never silent: the caller surfaces this.
-    let mut skipped_units = Vec::<Value>::new();
+    let mut skipped_units = Vec::<SkippedUnit>::new();
 
     // PC61/62 (04 §4.6, U145): a retained instance NOT referenced by HEAD's own
     // tree, that ALREADY has some durable association from an earlier pass (it
@@ -513,12 +514,12 @@ pub(crate) fn rebuild_step3_index(
                 if !is_rebuild_skippable_unit_error(&error) {
                     return Err(error);
                 }
-                skipped_units.push(json!({
-                    "raw_hash": retained.raw_hash,
-                    "path": retained.raw_path,
-                    "gen": retained.normalize.r#gen,
-                    "reason": error.error_code(),
-                }));
+                skipped_units.push(SkippedUnit {
+                    raw_hash: retained.raw_hash.clone(),
+                    path: retained.raw_path.clone(),
+                    r#gen: retained.normalize.r#gen,
+                    reason: error.error_code().to_owned(),
+                });
                 continue;
             }
         };
@@ -596,15 +597,12 @@ pub(crate) fn rebuild_step3_index(
             // simply has no live chunks until re-normalized). Any other error class is
             // not a localized unit fault and still aborts.
             Err(error) if is_rebuild_skippable_unit_error(&error) => {
-                skipped_units.push(json!({
-                    "raw_hash": entry.raw_hash,
-                    "path": entry.path,
-                    // R17-6: carry the tree entry's gen so `attach_skipped_units` can
-                    // tell a stale-but-searchable document (its cached chunks at this
-                    // gen survive in chunks.jsonl) from a genuinely unserveable one.
-                    "gen": normalize.r#gen,
-                    "reason": error.error_code(),
-                }));
+                skipped_units.push(SkippedUnit {
+                    raw_hash: entry.raw_hash.clone(),
+                    path: entry.path.clone(),
+                    r#gen: normalize.r#gen,
+                    reason: error.error_code().to_owned(),
+                });
                 continue;
             }
             Err(error) => return Err(error),
@@ -867,6 +865,51 @@ pub(crate) fn is_rebuild_skippable_unit_error(error: &KioError) -> bool {
 /// un-bricked — no longer false-alarms on a searchable document. Matching on gen too is
 /// load-bearing: a reindex may advance a document's gen and then fail to chunk the new
 /// gen, leaving only DEAD old-gen chunks that must NOT read as live.
+pub(crate) fn skipped_disclosure(report: &Step3RebuildReport, kio_dir: &Path) -> SkippedDisclosure {
+    // Best-effort: an unreadable ledger conservatively makes every skip unsearchable.
+    let live: BTreeSet<(String, u64)> = read_stored_chunks(kio_dir)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|chunk| (chunk.row.raw_hash, chunk.row.r#gen))
+        .collect();
+    let mut any_unsearchable = false;
+    let entries = report
+        .skipped_units
+        .iter()
+        .map(|unit| {
+            let searchable = live.contains(&(unit.raw_hash.clone(), unit.r#gen));
+            any_unsearchable |= !searchable;
+            PublishedSkippedUnit {
+                unit: unit.clone(),
+                searchable,
+                guidance: if searchable {
+                    "re-serving cached chunks; the normalized source is stale — \
+                 re-normalize with `kio reindex --force` when convenient"
+                } else {
+                    "no live chunks remain for this document; run `kio reindex --force` \
+                 to re-normalize it from the raw objects"
+                }
+                .to_owned(),
+            }
+        })
+        .collect::<Vec<_>>();
+    let guidance = (!entries.is_empty()).then(|| {
+        if any_unsearchable {
+            "some documents' normalized units are missing or corrupt and have no live \
+         chunks; run `kio reindex --force` to re-normalize them from the raw objects"
+        } else {
+            "some documents' normalized sources are stale but their cached chunks are \
+         still served; re-normalize with `kio reindex --force` when convenient"
+        }
+        .to_owned()
+    });
+    SkippedDisclosure {
+        skipped_units: entries,
+        skipped_units_guidance: guidance,
+    }
+}
+
+// Pending Repair still has a Value root; attach only the canonical typed disclosure leaves.
 pub(crate) fn attach_skipped_units(
     output: &mut Value,
     report: &Step3RebuildReport,
@@ -875,53 +918,10 @@ pub(crate) fn attach_skipped_units(
     let Some(object) = output.as_object_mut() else {
         return;
     };
-    // Best-effort: if chunks.jsonl cannot be read, treat every skip as unsearchable
-    // (the conservative "emergency" side) rather than falsely reassuring the user.
-    let live: BTreeSet<(String, u64)> = read_stored_chunks(kio_dir)
-        .unwrap_or_default()
-        .into_iter()
-        .map(|chunk| (chunk.row.raw_hash, chunk.row.r#gen))
-        .collect();
-    let mut entries = report.skipped_units.clone();
-    let mut any_unsearchable = false;
-    for entry in &mut entries {
-        let raw_hash = entry
-            .get("raw_hash")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned();
-        let r#gen = entry.get("gen").and_then(Value::as_u64);
-        let searchable = r#gen.is_some_and(|r#gen| live.contains(&(raw_hash.clone(), r#gen)));
-        if !searchable {
-            any_unsearchable = true;
-        }
-        if let Some(object) = entry.as_object_mut() {
-            object.insert("searchable".to_owned(), json!(searchable));
-            object.insert(
-                "guidance".to_owned(),
-                json!(if searchable {
-                    "re-serving cached chunks; the normalized source is stale — \
-                     re-normalize with `kio reindex --force` when convenient"
-                } else {
-                    "no live chunks remain for this document; run `kio reindex --force` \
-                     to re-normalize it from the raw objects"
-                }),
-            );
-        }
-    }
-    let non_empty = !entries.is_empty();
-    object.insert("skipped_units".to_owned(), json!(entries));
-    if non_empty {
-        object.insert(
-            "skipped_units_guidance".to_owned(),
-            json!(if any_unsearchable {
-                "some documents' normalized units are missing or corrupt and have no live \
-                 chunks; run `kio reindex --force` to re-normalize them from the raw objects"
-            } else {
-                "some documents' normalized sources are stale but their cached chunks are \
-                 still served; re-normalize with `kio reindex --force` when convenient"
-            }),
-        );
+    let disclosure = skipped_disclosure(report, kio_dir);
+    object.insert("skipped_units".to_owned(), json!(disclosure.skipped_units));
+    if let Some(guidance) = disclosure.skipped_units_guidance {
+        object.insert("skipped_units_guidance".to_owned(), json!(guidance));
     }
 }
 
@@ -931,7 +931,7 @@ pub(crate) struct Step3RebuildReport {
     pub(crate) rebuilt_tree_entries: u64,
     /// R16-4: documents skipped because their normalized units are missing/corrupt,
     /// each `{raw_hash, path, reason}`. Empty on a clean rebuild.
-    pub(crate) skipped_units: Vec<Value>,
+    pub(crate) skipped_units: Vec<SkippedUnit>,
 }
 
 pub(crate) fn read_chunking_config(repo: &Repository) -> Result<ChunkingConfig> {

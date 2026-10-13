@@ -86,30 +86,61 @@ pub struct UnreachableObjectInventory {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct InventoryObject {
-    kind: String,
-    hash: String,
-    physical_bytes: u64,
-    classification: String,
-    reason: String,
+pub struct InventoryObject {
+    pub kind: String,
+    pub hash: String,
+    pub physical_bytes: u64,
+    pub classification: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ShallowBoundary {
-    commit_hash: String,
-    tree_hash: String,
+pub struct ShallowBoundary {
+    pub commit_hash: String,
+    pub tree_hash: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct InventoryStats {
-    objects: u64,
-    physical_bytes: u64,
-    verified_bytes: u64,
-    refs: u64,
-    receipts: u64,
-    manifest_units: u64,
-    history_steps: u64,
-    directory_entries: u64,
+pub struct InventoryStats {
+    pub objects: u64,
+    pub physical_bytes: u64,
+    pub verified_bytes: u64,
+    pub refs: u64,
+    pub receipts: u64,
+    pub manifest_units: u64,
+    pub history_steps: u64,
+    pub directory_entries: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnreachableInventoryReport {
+    pub schema_version: u64,
+    pub operation: String,
+    pub status: String,
+    pub read_only: bool,
+    pub diagnostic_only: bool,
+    pub mutation_authority: bool,
+    pub objects: Vec<InventoryObject>,
+    pub summary: UnreachableInventorySummary,
+    pub shallow_boundaries: Vec<ShallowBoundary>,
+    pub limits: UnreachableInventoryLimits,
+    pub stats: UnreachableInventoryPassStats,
+}
+#[derive(Debug, Serialize)]
+pub struct UnreachableInventorySummary {
+    pub object_count: u64,
+    pub physical_bytes: u64,
+    pub candidate_count: u64,
+    pub candidate_bytes: u64,
+    pub protected_count: u64,
+    pub protected_bytes: u64,
+    pub inventory_only_count: u64,
+    pub inventory_only_bytes: u64,
+}
+#[derive(Debug, Serialize)]
+pub struct UnreachableInventoryPassStats {
+    pub inventory_pass: InventoryStats,
+    pub stability_pass: InventoryStats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -462,7 +493,7 @@ impl UnreachableObjectInventory {
         }
     }
 
-    pub fn inventory(&self) -> Result<Value> {
+    pub fn inventory(&self) -> Result<UnreachableInventoryReport> {
         self.assert_stable()?;
         let guard = acquire_bound_store_read_guard_with_control(&self.kio, &self.control)?;
         guard.recheck_idle()?;
@@ -492,7 +523,7 @@ impl UnreachableObjectInventory {
         Ok(())
     }
 
-    fn report(&self, pass: Pass, stability_stats: InventoryStats) -> Value {
+    fn report(&self, pass: Pass, stability_stats: InventoryStats) -> UnreachableInventoryReport {
         let mut candidate_count = 0_u64;
         let mut candidate_bytes = 0_u64;
         let mut protected_count = 0_u64;
@@ -516,31 +547,31 @@ impl UnreachableObjectInventory {
                 _ => unreachable!("inventory classification is closed"),
             }
         }
-        json!({
-            "schema_version": 1,
-            "operation": "unreachable_object_inventory",
-            "status": "dry_run",
-            "read_only": true,
-            "diagnostic_only": true,
-            "mutation_authority": false,
-            "objects": pass.objects,
-            "summary": {
-                "object_count": pass.stats.objects,
-                "physical_bytes": pass.stats.physical_bytes,
-                "candidate_count": candidate_count,
-                "candidate_bytes": candidate_bytes,
-                "protected_count": protected_count,
-                "protected_bytes": protected_bytes,
-                "inventory_only_count": inventory_only_count,
-                "inventory_only_bytes": inventory_only_bytes,
+        UnreachableInventoryReport {
+            schema_version: 1,
+            operation: "unreachable_object_inventory".to_owned(),
+            status: "dry_run".to_owned(),
+            read_only: true,
+            diagnostic_only: true,
+            mutation_authority: false,
+            objects: pass.objects,
+            summary: UnreachableInventorySummary {
+                object_count: pass.stats.objects,
+                physical_bytes: pass.stats.physical_bytes,
+                candidate_count,
+                candidate_bytes,
+                protected_count,
+                protected_bytes,
+                inventory_only_count,
+                inventory_only_bytes,
             },
-            "shallow_boundaries": pass.shallow_boundaries,
-            "limits": self.limits,
-            "stats": {
-                "inventory_pass": pass.stats,
-                "stability_pass": stability_stats,
+            shallow_boundaries: pass.shallow_boundaries,
+            limits: self.limits.clone(),
+            stats: UnreachableInventoryPassStats {
+                inventory_pass: pass.stats,
+                stability_pass: stability_stats,
             },
-        })
+        }
     }
 
     fn pass(&self, invocation_time: &str) -> Result<Pass> {
