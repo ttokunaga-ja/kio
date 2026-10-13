@@ -5,6 +5,10 @@
 //! the OS has registered or been asked to start.
 
 use crate::context::AppContext;
+use crate::response::watch::{
+    NativeServiceState, ServicePhase, WatchResponse, WatchServiceInstalledResponse,
+    WatchServiceLifecycleResponse, WatchServiceStatusResponse,
+};
 
 use std::env;
 use std::fs::{self, File};
@@ -19,7 +23,9 @@ use kio_core::store_dir::{Publication, StoreDirectory};
 use kio_core::{ExitCode, KioError, Result};
 use kio_process::{BoundedProcessOptions, BoundedProcessOutput, run_bounded_command};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::Value;
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::commands::WatchServiceCommand;
@@ -63,13 +69,6 @@ pub(crate) struct ServiceEnvironment {
     pub(crate) xdg_cache_home: PathBuf,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ServicePhase {
-    Installing,
-    Installed,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NativeRegistration {
     Absent,
@@ -82,7 +81,7 @@ pub(crate) fn run(
     root_argument: Option<PathBuf>,
     command: WatchServiceCommand,
     control: &ControlHandle,
-) -> Result<Value> {
+) -> Result<WatchResponse> {
     match command {
         WatchServiceCommand::Install {
             reconcile_interval_seconds,
@@ -95,7 +94,9 @@ pub(crate) fn run(
         WatchServiceCommand::Uninstall => {
             mutate_existing(ctx, root_argument, Lifecycle::Uninstall, control)
         }
-        WatchServiceCommand::Runner { manifest } => run_watch_service_runner(manifest, control),
+        WatchServiceCommand::Runner { manifest } => {
+            run_watch_service_runner(manifest, control).map(WatchResponse::ServiceRunner)
+        }
     }
 }
 
@@ -104,7 +105,7 @@ fn install(
     root_argument: Option<PathBuf>,
     interval: u64,
     control: &ControlHandle,
-) -> Result<Value> {
+) -> Result<WatchResponse> {
     if !(1..=86_400).contains(&interval) {
         return Err(invalid(
             "reconciliation interval must be 1 through 86400 seconds",
@@ -204,7 +205,7 @@ fn recover_install<S: Scheduler>(
     leaf: &Path,
     mut manifest: ServiceManifest,
     scheduler: &S,
-) -> Result<Value> {
+) -> Result<WatchResponse> {
     if manifest.phase != ServicePhase::Installing {
         return Err(service_error("watch service is already installed"));
     }
@@ -220,12 +221,14 @@ fn recover_install<S: Scheduler>(
     manifest.phase = ServicePhase::Installed;
     write_manifest(store, leaf, &manifest, Publication::Replace)?;
     store.ensure_owner_private(leaf)?;
-    Ok(json!({
-        "status": "installed",
-        "service_id": manifest.id,
-        "root": manifest.root,
-        "native_registration": "enabled_not_started",
-    }))
+    Ok(WatchResponse::ServiceInstalled(
+        WatchServiceInstalledResponse {
+            status: "installed".to_owned(),
+            service_id: manifest.id,
+            root: manifest.root,
+            native_registration: "enabled_not_started".to_owned(),
+        },
+    ))
 }
 
 #[derive(Clone, Copy)]
@@ -240,7 +243,7 @@ fn mutate_existing(
     root_argument: Option<PathBuf>,
     lifecycle: Lifecycle,
     control: &ControlHandle,
-) -> Result<Value> {
+) -> Result<WatchResponse> {
     let (store, leaf, manifest) = find_manifest(ctx, root_argument, control)?;
     let _native_location = NativeDefinitionLocation::admit(&manifest.native_path, control)?;
     let _mutation_lock = acquire_mutation_lock(&store, &manifest.id)?;
@@ -269,24 +272,45 @@ fn mutate_existing(
             }
             transition_checked(&scheduler, &manifest, lifecycle, registration, |root| {
                 crate::watch_command::inspect_liveness(root, control)
+                    .map(|response| Some(response.status))
             })?;
-            Ok(json!({"status":"start_requested", "service_id":manifest.id, "root":manifest.root}))
+            Ok(WatchResponse::ServiceLifecycle(
+                WatchServiceLifecycleResponse {
+                    status: "start_requested".to_owned(),
+                    service_id: manifest.id,
+                    root: manifest.root,
+                },
+            ))
         }
         Lifecycle::Stop => {
             // Disable scheduler restart before asking the foreground instance to
             // stop; otherwise a failed process may be restarted during shutdown.
             transition_checked(&scheduler, &manifest, lifecycle, registration, |root| {
                 crate::watch_command::inspect_liveness(root, control)
+                    .map(|response| Some(response.status))
             })?;
-            Ok(json!({"status":"stopped", "service_id":manifest.id, "root":manifest.root}))
+            Ok(WatchResponse::ServiceLifecycle(
+                WatchServiceLifecycleResponse {
+                    status: "stopped".to_owned(),
+                    service_id: manifest.id,
+                    root: manifest.root,
+                },
+            ))
         }
         Lifecycle::Uninstall => {
             transition_checked(&scheduler, &manifest, lifecycle, registration, |root| {
                 crate::watch_command::inspect_liveness(root, control)
+                    .map(|response| Some(response.status))
             })?;
             let bytes = serde_json::to_vec(&manifest).map_err(service_error)?;
             store.quarantine_then_remove(&leaf, &bytes, MAX_MANIFEST_BYTES)?;
-            Ok(json!({"status":"uninstalled", "service_id":manifest.id, "root":manifest.root}))
+            Ok(WatchResponse::ServiceLifecycle(
+                WatchServiceLifecycleResponse {
+                    status: "uninstalled".to_owned(),
+                    service_id: manifest.id,
+                    root: manifest.root,
+                },
+            ))
         }
     }
 }
@@ -296,7 +320,7 @@ fn transition_checked<S: Scheduler>(
     manifest: &ServiceManifest,
     lifecycle: Lifecycle,
     registration: NativeRegistration,
-    inspect_liveness: impl FnOnce(&Path) -> Result<Value>,
+    inspect_liveness: impl FnOnce(&Path) -> Result<Option<String>>,
 ) -> Result<()> {
     if registration == NativeRegistration::Foreign {
         return Err(service_error(
@@ -312,7 +336,7 @@ fn transition_checked<S: Scheduler>(
             // and the native command. Instance-lock liveness also detects a
             // watcher still starting, before it publishes its state or PID.
             let liveness = inspect_liveness(&manifest.root)?;
-            match liveness.get("status").and_then(Value::as_str) {
+            match liveness.as_deref() {
                 Some("stopped") => scheduler.start(manifest),
                 Some("running") => Err(service_error("watcher is already running")),
                 _ => Err(service_error("watch instance liveness is unavailable")),
@@ -331,7 +355,7 @@ fn status(
     ctx: &AppContext,
     root_argument: Option<PathBuf>,
     control: &ControlHandle,
-) -> Result<Value> {
+) -> Result<WatchResponse> {
     let (_, _, manifest) = find_manifest(ctx, root_argument, control)?;
     let scheduler = NativeScheduler(control.clone());
     let registration = scheduler.inspect(&manifest)?;
@@ -344,13 +368,13 @@ fn status(
     // The device-private watcher lock is still authoritative even if a user
     // removed the root after installing the service.
     let liveness = crate::watch_command::inspect_liveness(&manifest.root, control)?;
-    Ok(json!({
-        "status":"service",
-        "service_id":manifest.id,
-        "root":manifest.root,
-        "install_phase":manifest.phase,
-        "native_registration":native_state,
-        "instance":liveness,
+    Ok(WatchResponse::ServiceStatus(WatchServiceStatusResponse {
+        status: "service".to_owned(),
+        service_id: manifest.id,
+        root: manifest.root,
+        install_phase: manifest.phase,
+        native_registration: native_state,
+        instance: liveness,
     }))
 }
 
@@ -676,7 +700,11 @@ pub(crate) trait Scheduler {
     fn start(&self, manifest: &ServiceManifest) -> Result<()>;
     fn stop(&self, manifest: &ServiceManifest) -> Result<()>;
     fn uninstall(&self, manifest: &ServiceManifest) -> Result<()>;
-    fn state(&self, manifest: &ServiceManifest, registration: NativeRegistration) -> Result<Value>;
+    fn state(
+        &self,
+        manifest: &ServiceManifest,
+        registration: NativeRegistration,
+    ) -> Result<NativeServiceState>;
 }
 
 #[cfg(test)]
@@ -866,13 +894,20 @@ impl Scheduler for NativeScheduler {
         native_after_remove()?;
         location.revalidate()
     }
-    fn state(&self, manifest: &ServiceManifest, registration: NativeRegistration) -> Result<Value> {
+    fn state(
+        &self,
+        manifest: &ServiceManifest,
+        registration: NativeRegistration,
+    ) -> Result<NativeServiceState> {
         let location = NativeDefinitionLocation::admit(&manifest.native_path, &self.0)?;
         if location.inspect(manifest.definition.as_bytes())? != registration {
             return Err(service_error("native registration changed during status"));
         }
         match registration {
-            NativeRegistration::Absent => Ok(json!({"registered":false, "active":false})),
+            NativeRegistration::Absent => Ok(NativeServiceState {
+                registered: false,
+                active: false,
+            }),
             NativeRegistration::Foreign => Err(service_error("foreign native registration")),
             NativeRegistration::Owned => {
                 let state = native_state(manifest)?;
@@ -1175,8 +1210,15 @@ mod tests {
                 Ok(())
             }
         }
-        fn state(&self, _: &ServiceManifest, _: NativeRegistration) -> Result<Value> {
-            Ok(json!({}))
+        fn state(
+            &self,
+            _: &ServiceManifest,
+            registration: NativeRegistration,
+        ) -> Result<NativeServiceState> {
+            Ok(NativeServiceState {
+                registered: registration == NativeRegistration::Owned,
+                active: false,
+            })
         }
     }
 
@@ -1348,7 +1390,14 @@ mod tests {
                 &manifest,
                 lifecycle,
                 fake.inspect(&manifest).unwrap(),
-                |_| Ok(json!({"status":"stopped", "last_observation":{"pid":std::process::id()}})),
+                |_| {
+                    Ok(
+                        json!({"status":"stopped", "last_observation":{"pid":std::process::id()}})
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned),
+                    )
+                },
             )
             .unwrap();
         }
@@ -1421,7 +1470,10 @@ mod tests {
             let stored: ServiceManifest = serde_json::from_slice(&bytes).unwrap();
             match registration {
                 NativeRegistration::Owned | NativeRegistration::Absent => {
-                    assert_eq!(result.unwrap()["status"], "installed");
+                    assert_eq!(
+                        serde_json::to_value(result.unwrap()).unwrap()["status"],
+                        "installed"
+                    );
                     assert_eq!(stored.phase, ServicePhase::Installed);
                     assert_eq!(
                         fake.installs.get(),
@@ -1452,7 +1504,10 @@ mod tests {
             |root| {
                 assert_eq!(root, manifest.root);
                 // The authoritative held lock is running even before state/PID publication.
-                Ok(json!({"status":"running", "last_observation":null}))
+                Ok(json!({"status":"running", "last_observation":null})
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned))
             },
         )
         .unwrap_err();
@@ -1494,7 +1549,12 @@ mod tests {
                 &manifest,
                 Lifecycle::Start,
                 NativeRegistration::Owned,
-                |_| Ok(liveness),
+                |_| {
+                    Ok(liveness
+                        .get("status")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned))
+                },
             )
             .unwrap_err();
             assert!(error.to_string().contains("instance liveness"));
@@ -1522,7 +1582,10 @@ mod tests {
                 &manifest,
                 Lifecycle::Start,
                 NativeRegistration::Owned,
-                |_| Ok(json!({"status":"stopped"})),
+                |_| Ok(json!({"status":"stopped"})
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)),
             )
             .is_err()
         );

@@ -5,6 +5,11 @@
 //! shallow.  Mutable manifests and index/cache projections are never accepted as
 //! purge truth.
 
+use crate::response::mutation::{
+    DeletedCounts, PurgeIncomplete, PurgeResponse, PurgeSuccess, SharedArtifactsPreserved,
+    WorkingTreeWarning,
+};
+use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
 use kio_core::control::ControlHandle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
@@ -87,46 +92,6 @@ struct PurgePreview {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct DeletedCounts {
-    raw_objects: u64,
-    chunk_objects: u64,
-    chunk_ledger_rows: u64,
-    sqlite_chunks: u64,
-    sqlite_associations: u64,
-    sqlite_vectors: u64,
-    sqlite_orphan_embeddings: u64,
-    normalized_instances: u64,
-    normalized_views: u64,
-    prepared_objects: u64,
-    image_objects: u64,
-    tasks: u64,
-    reservations: u64,
-    manifest_rows: u64,
-    unsupported_rows: u64,
-    quarantine_rows: u64,
-    cache_directories: u64,
-    #[serde(default)]
-    staging_descriptors: u64,
-    /// PB04/item 3: `objects/manifests/` CAS objects removed for this
-    /// purge's target instances. Distinct from `manifest_rows` (the
-    /// scope-level `.kio/manifest.json` file-inventory row count).
-    #[serde(default)]
-    manifest_objects: u64,
-    /// Immutable normalized-unit CAS bodies selected by target manifest
-    /// objects. These are distinct from the mutable normalized instance cache.
-    #[serde(default)]
-    normalized_unit_objects: u64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct SharedArtifactsPreserved {
-    prepared_objects: u64,
-    image_objects: u64,
-    #[serde(default)]
-    normalized_unit_objects: u64,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PurgeReport {
     purged_in_commit: Option<String>,
     deleted: DeletedCounts,
@@ -156,7 +121,15 @@ pub(crate) fn run(ctx: &crate::invocation::Invocation<'_>, args: PurgeArgs) -> R
     }
     let preview = preflight(&repo, &args)?;
     confirm(ctx, &preview, args.yes)?;
-    execute_phase_machine(ctx, &repo, &args, &preview)
+    let body = execute_phase_machine(ctx, &repo, &args, &preview)?;
+    let completion = match &body {
+        PurgeResponse::Purged(_) => Completion::Complete,
+        PurgeResponse::Incomplete(_) => Completion::Partial,
+    };
+    project_legacy(CommandResponse {
+        body: ResponseBody::Purge(body),
+        completion,
+    })
 }
 
 /// The actor recorded on new journal/lifecycle records (05-runtime.md §3.5's
@@ -588,7 +561,7 @@ fn execute_phase_machine(
     repo: &Repository,
     args: &PurgeArgs,
     preview: &PurgePreview,
-) -> Result<Value> {
+) -> Result<PurgeResponse> {
     let _store_lock = repo.lock_store_in_session(repo.lock_session())?;
     let locked_plan = resolve_plan(repo, args)?;
     if locked_plan != preview.plan {
@@ -826,7 +799,7 @@ fn execute_phase_machine(
                 },
             )?;
             Ok(attach_working_tree_warning(
-                success_report(&locked_plan, &report),
+                PurgeResponse::Purged(success_report(&locked_plan, &report)),
                 working_tree_alias_count,
             ))
         }
@@ -2576,54 +2549,54 @@ fn working_tree_warning_text(alias_count: u64) -> String {
     )
 }
 
-fn attach_working_tree_warning(mut value: Value, alias_count: u64) -> Value {
-    if alias_count > 0
-        && let Some(object) = value.as_object_mut()
-    {
-        object.insert(
-            "working_tree_warning".to_owned(),
-            json!({
-                "live_alias_count": alias_count,
-                "message": working_tree_warning_text(alias_count),
-            }),
-        );
+fn attach_working_tree_warning(mut response: PurgeResponse, alias_count: u64) -> PurgeResponse {
+    if alias_count > 0 {
+        let report = match &mut response {
+            PurgeResponse::Purged(report) => report,
+            PurgeResponse::Incomplete(incomplete) => &mut incomplete.report,
+        };
+        report.working_tree_warning = Some(WorkingTreeWarning {
+            live_alias_count: alias_count,
+            message: working_tree_warning_text(alias_count),
+        });
     }
-    value
+    response
 }
 
-fn completed_report(plan: &PurgePlan, completed: CompletedTerminal) -> Value {
+fn completed_report(plan: &PurgePlan, completed: CompletedTerminal) -> PurgeResponse {
     let report = PurgeReport {
         purged_in_commit: Some(completed.purged_in_commit),
         tombstone_count: completed.tombstone_count,
         erase_receipt_count: completed.erase_receipt_count,
         ..PurgeReport::default()
     };
-    success_report(plan, &report)
+    PurgeResponse::Purged(success_report(plan, &report))
 }
 
-fn success_report(plan: &PurgePlan, report: &PurgeReport) -> Value {
-    json!({
-        "status": "purged",
-        "purged_in_commit": report.purged_in_commit,
-        "reason": plan.reason,
-        "target_raw_count": plan.target_raw_hashes.len(),
-        "deleted_counts": report.deleted,
-        "shared_artifacts_preserved": report.shared,
-        "tombstone_mode": plan.tombstone_mode,
-        "tombstone_count": report.tombstone_count,
-        "erase_receipt_count": report.erase_receipt_count,
-        "logs_scrubbed": true,
-        "log_files_scrubbed": report.log_files_scrubbed,
-        "log_rows_removed": report.log_rows_removed,
-        "log_fields_masked": report.log_fields_masked,
-        "guarantee": "removed from KIO-managed history",
-        "not_covered": [
-            "external backups and Time Machine",
-            "exported or manually copied files",
-            "cloud-sync past versions",
-            "logs outside Kio management"
+fn success_report(plan: &PurgePlan, report: &PurgeReport) -> PurgeSuccess {
+    PurgeSuccess {
+        status: "purged".to_owned(),
+        purged_in_commit: report.purged_in_commit.clone(),
+        reason: plan.reason,
+        target_raw_count: plan.target_raw_hashes.len(),
+        deleted_counts: report.deleted.clone(),
+        shared_artifacts_preserved: report.shared.clone(),
+        tombstone_mode: plan.tombstone_mode,
+        tombstone_count: report.tombstone_count,
+        erase_receipt_count: report.erase_receipt_count,
+        logs_scrubbed: true,
+        log_files_scrubbed: report.log_files_scrubbed,
+        log_rows_removed: report.log_rows_removed,
+        log_fields_masked: report.log_fields_masked,
+        guarantee: "removed from KIO-managed history".to_owned(),
+        not_covered: vec![
+            "external backups and Time Machine".to_owned(),
+            "exported or manually copied files".to_owned(),
+            "cloud-sync past versions".to_owned(),
+            "logs outside Kio management".to_owned(),
         ],
-    })
+        working_tree_warning: None,
+    }
 }
 
 fn incomplete_report(
@@ -2631,16 +2604,17 @@ fn incomplete_report(
     journal: &PurgeJournal,
     report: &PurgeReport,
     error: &KioError,
-) -> Value {
-    let mut value = success_report(plan, report);
-    value["status"] = json!("purge_incomplete");
-    value["logs_scrubbed"] = json!(journal.phase >= PurgePhase::Deleted);
-    value["error_code"] = json!("KIO-E-PURGE-INCOMPLETE-001");
-    value["message"] = json!("purge is incomplete and will resume on the next identical command");
-    value["failure_phase"] = json!(journal.phase);
-    value["cause_error_code"] = json!(error.error_code());
-    crate::task_execution::set_exit_override(&mut value, ExitCode::PartialFailure);
-    value
+) -> PurgeResponse {
+    let mut report = success_report(plan, report);
+    report.status = "purge_incomplete".to_owned();
+    report.logs_scrubbed = journal.phase >= PurgePhase::Deleted;
+    PurgeResponse::Incomplete(PurgeIncomplete {
+        report,
+        error_code: "KIO-E-PURGE-INCOMPLETE-001".to_owned(),
+        message: "purge is incomplete and will resume on the next identical command".to_owned(),
+        failure_phase: journal.phase,
+        cause_error_code: error.error_code().to_owned(),
+    })
 }
 
 fn maybe_inject_fault(phase: &str, control: &ControlHandle) -> Result<()> {

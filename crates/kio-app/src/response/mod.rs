@@ -9,12 +9,14 @@ pub mod gc;
 pub mod history;
 pub mod index;
 pub mod ledger;
+pub mod mutation;
 pub mod pointer;
 pub mod reindex;
 pub mod repair;
 pub mod search;
 pub mod skipped_units;
 pub mod snapshot;
+pub mod watch;
 
 #[derive(Debug)]
 pub struct CommandResponse {
@@ -34,6 +36,10 @@ pub enum Completion {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum ResponseBody {
+    Export(mutation::ExportResponse),
+    Restore(mutation::RestoreResponse),
+    Purge(mutation::PurgeResponse),
+    Watch(watch::WatchResponse),
     Batch(batch::BatchResponse),
     Adapter(adapter::AdapterResponse),
     Ledger(ledger::LedgerResponse),
@@ -94,3 +100,6 @@ mod snapshot_gc_tests;
 mod c3d_completion_tests;
 #[cfg(test)]
 mod c3d_tests;
+
+#[cfg(test)]
+mod mutation_watch_tests;

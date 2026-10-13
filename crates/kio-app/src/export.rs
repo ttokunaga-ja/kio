@@ -1,5 +1,9 @@
 //! Step 4 destination-only export.
 
+use crate::response::mutation::{
+    ExportFailure, ExportPartial, ExportResponse, ExportSuccess, ExportedFile,
+};
+use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
 use kio_core::control::ControlHandle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -141,7 +145,15 @@ pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: ExportArgs) -> 
     // Re-run the complete leaf check before staging any content.
     let preflight_files = preflight_in_dir(&source, &destination_dir, args.force, ctx.control)?;
     let staged = stage_all(&source, preflight_files, &destination_dir, ctx.control)?;
-    publish_all(ctx, &source, &destination_dir, staged, &checkpoint)
+    let body = publish_all(ctx, &source, &destination_dir, staged, &checkpoint)?;
+    let completion = match &body {
+        ExportResponse::Exported(_) => Completion::Complete,
+        ExportResponse::Partial(_) => Completion::Partial,
+    };
+    project_legacy(CommandResponse {
+        body: ResponseBody::Export(body),
+        completion,
+    })
 }
 
 fn resolve_source(ctx: &crate::invocation::Invocation<'_>, operand: &str) -> Result<ExportSource> {
@@ -1530,7 +1542,7 @@ fn publish_all(
     destination: &DestinationDir,
     staged: Vec<StagedFile>,
     checkpoint: &ReadBarrierCheckpoint,
-) -> Result<Value> {
+) -> Result<ExportResponse> {
     let mut published = Vec::new();
     let mut overwritten_count = 0_u64;
     let mut remaining = staged.into_iter();
@@ -2043,15 +2055,15 @@ fn success_output(
     destination: &Path,
     files: Vec<PreflightFile>,
     overwritten_count: u64,
-) -> Value {
-    json!({
-        "status": "exported",
-        "source_kind": source.source_kind,
-        "source_commit": source.source_commit,
-        "destination": destination,
-        "exported_count": files.len(),
-        "overwritten_count": overwritten_count,
-        "files": files.iter().map(exported_file_json).collect::<Vec<_>>(),
+) -> ExportResponse {
+    ExportResponse::Exported(ExportSuccess {
+        status: "exported".to_owned(),
+        source_kind: source.source_kind.to_owned(),
+        source_commit: source.source_commit.clone(),
+        destination: destination.to_path_buf(),
+        exported_count: files.len(),
+        overwritten_count,
+        files: files.iter().map(exported_file).collect(),
     })
 }
 
@@ -2062,35 +2074,35 @@ fn partial_output(
     overwritten_count: u64,
     failed: &PreflightFile,
     error: KioError,
-) -> Value {
-    let mut output = json!({
-        "status": "partial",
-        "error_code": "KIO-E-COMMIT-EXPORT-PARTIAL-001",
-        "source_kind": source.source_kind,
-        "source_commit": source.source_commit,
-        "destination": destination,
-        "exported_count": files.len(),
-        "overwritten_count": overwritten_count,
-        "files": files.iter().map(exported_file_json).collect::<Vec<_>>(),
-        "failed": [{
-            "path": failed.destination,
-            "path_at_commit": failed.source.path_at_commit,
-            "raw_hash": failed.source.raw_hash,
-            "error_code": error.error_code(),
-            "message": error.message(),
+) -> ExportResponse {
+    ExportResponse::Partial(ExportPartial {
+        report: ExportSuccess {
+            status: "partial".to_owned(),
+            source_kind: source.source_kind.to_owned(),
+            source_commit: source.source_commit.clone(),
+            destination: destination.to_path_buf(),
+            exported_count: files.len(),
+            overwritten_count,
+            files: files.iter().map(exported_file).collect(),
+        },
+        error_code: "KIO-E-COMMIT-EXPORT-PARTIAL-001".to_owned(),
+        failed: vec![ExportFailure {
+            path: failed.destination.clone(),
+            path_at_commit: failed.source.path_at_commit.clone(),
+            raw_hash: failed.source.raw_hash.clone(),
+            error_code: error.error_code().to_owned(),
+            message: error.message().to_owned(),
         }],
-    });
-    crate::task_execution::set_exit_override(&mut output, ExitCode::PartialFailure);
-    output
+    })
 }
 
-fn exported_file_json(file: &PreflightFile) -> Value {
-    json!({
-        "path": file.destination,
-        "path_at_commit": file.source.path_at_commit,
-        "raw_hash": file.source.raw_hash,
-        "overwritten": file.overwritten,
-    })
+fn exported_file(file: &PreflightFile) -> ExportedFile {
+    ExportedFile {
+        path: file.destination.clone(),
+        path_at_commit: file.source.path_at_commit.clone(),
+        raw_hash: file.source.raw_hash.clone(),
+        overwritten: file.overwritten,
+    }
 }
 
 #[cfg(test)]

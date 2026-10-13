@@ -2,6 +2,10 @@
 //! management or send authority. Each pass reopens the registered root and
 //! runs the same local index operation as the interactive command.
 
+use crate::response::watch::{
+    WatchLifecycleResponse, WatchObservation as InstanceState, WatchResponse,
+};
+use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
 use std::fs::TryLockError;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -31,23 +35,6 @@ const MAX_STATE_BYTES: u64 = 64 * 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct InstanceState {
-    version: u8,
-    instance: String,
-    root: PathBuf,
-    scope_id: String,
-    pid: u32,
-    backend: String,
-    backlog: usize,
-    degraded: bool,
-    last_success_ms: Option<u64>,
-    last_failure: Option<String>,
-    observed_at_ms: u64,
-    reconcile_interval_seconds: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StopRequest {
     instance: String,
 }
@@ -59,7 +46,11 @@ pub(crate) fn run(ctx: &AppContext, args: WatchArgs, control: &ControlHandle) ->
     } = args;
     let command = match command {
         WatchCommand::Service(command) => {
-            return crate::watch_service::run(ctx, configured_root, command, control);
+            let body = crate::watch_service::run(ctx, configured_root, command, control)?;
+            return project_legacy(CommandResponse {
+                body: ResponseBody::Watch(body),
+                completion: Completion::Complete,
+            });
         }
         command => command,
     };
@@ -73,23 +64,35 @@ pub(crate) fn run(ctx: &AppContext, args: WatchArgs, control: &ControlHandle) ->
     let root = requested
         .canonicalize()
         .map_err(|e| KioError::io(e.to_string(), requested.display().to_string()))?;
-    match command {
+    let body = match command {
         WatchCommand::Run {
             reconcile_interval_seconds,
-        } => run_foreground(ctx, &root, reconcile_interval_seconds, control),
-        WatchCommand::Status => inspect(&root, false, control),
-        WatchCommand::Stop => inspect(&root, true, control),
+        } => run_foreground(ctx, &root, reconcile_interval_seconds, control)
+            .map(WatchResponse::Foreground),
+        WatchCommand::Status => inspect(&root, false, control).map(WatchResponse::Status),
+        WatchCommand::Stop => inspect(&root, true, control).map(WatchResponse::Stop),
         WatchCommand::Service(_) => unreachable!("service commands return before root resolution"),
-    }
+    }?;
+    project_legacy(CommandResponse {
+        body: ResponseBody::Watch(body),
+        completion: Completion::Complete,
+    })
 }
 
-pub(crate) fn inspect_liveness(root: &Path, control: &ControlHandle) -> Result<Value> {
+pub(crate) fn inspect_liveness(
+    root: &Path,
+    control: &ControlHandle,
+) -> Result<WatchLifecycleResponse> {
     inspect(root, false, control)
 }
 
-fn inspect(root: &Path, stop: bool, control: &ControlHandle) -> Result<Value> {
+fn inspect(root: &Path, stop: bool, control: &ControlHandle) -> Result<WatchLifecycleResponse> {
     let Some(directory) = state_directory(root, false, control)? else {
-        return Ok(json!({"status":"stopped", "root":root, "last_observation":null}));
+        return Ok(WatchLifecycleResponse {
+            status: "stopped".to_owned(),
+            root: root.to_path_buf(),
+            last_observation: None,
+        });
     };
     let lock = open_watch_instance_lock(&directory, false)?;
     let running = match lock {
@@ -113,11 +116,16 @@ fn inspect(root: &Path, stop: bool, control: &ControlHandle) -> Result<Value> {
         .map_err(watch_error)?;
         directory.write_atomic(Path::new(STOP), &request, Publication::Upsert)?;
     }
-    Ok(json!({
-        "status": if running { if stop { "stop_requested" } else { "running" } } else { "stopped" },
-        "root":root,
-        "last_observation":state,
-    }))
+    Ok(WatchLifecycleResponse {
+        status: if running {
+            if stop { "stop_requested" } else { "running" }
+        } else {
+            "stopped"
+        }
+        .to_owned(),
+        root: root.to_path_buf(),
+        last_observation: state,
+    })
 }
 
 fn run_foreground(
@@ -125,7 +133,7 @@ fn run_foreground(
     root: &Path,
     interval: u64,
     control: &ControlHandle,
-) -> Result<Value> {
+) -> Result<WatchLifecycleResponse> {
     if !(1..=86400).contains(&interval) {
         return Err(KioError::invalid_usage(
             "reconciliation interval must be 1 through 86400 seconds",
@@ -208,7 +216,11 @@ fn run_foreground(
     drop(_native);
     drop(engine);
     drop(lock);
-    Ok(json!({"status":"stopped", "root":root, "last_observation":state}))
+    Ok(WatchLifecycleResponse {
+        status: "stopped".to_owned(),
+        root: root.to_path_buf(),
+        last_observation: Some(state),
+    })
 }
 
 struct LocalReconciler {

@@ -2,6 +2,7 @@ use crate::management::{binding_for_repo, open_existing_managed_root};
 use crate::platform::watch_service::native_windows_task_definition_matches;
 use crate::platform::windows::wait_supervised_child;
 use crate::platform::{validate_runner_manifest_locator, watch_argv};
+use crate::response::watch::WatchServiceRunnerResponse;
 use crate::watch_service::{
     MAX_MANIFEST_BYTES, NativeRegistration, NativeScheduler, Scheduler, ServiceManifest, invalid,
     service_environment_pairs, service_error, validate_manifest,
@@ -10,7 +11,6 @@ use kio_core::Result;
 use kio_core::control::ControlHandle;
 use kio_core::management::{ManagementAuthority, read_record};
 use kio_core::store_dir::StoreDirectory;
-use serde_json::{Value, json};
 use std::env;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -25,7 +25,7 @@ use std::process::Command;
 pub(crate) fn run_watch_service_runner(
     manifest_path: PathBuf,
     control: &ControlHandle,
-) -> Result<Value> {
+) -> Result<WatchServiceRunnerResponse> {
     let manifest = load_runner_manifest(&manifest_path, control)?;
     let current_binary = env::current_exe()
         .map_err(service_error)?
@@ -67,7 +67,10 @@ pub(crate) fn run_watch_service_runner(
             "watch service child exited unsuccessfully: {status}"
         )));
     }
-    Ok(json!({"status":"watcher_exited", "service_id":manifest.id}))
+    Ok(WatchServiceRunnerResponse {
+        status: "watcher_exited".to_owned(),
+        service_id: manifest.id,
+    })
 }
 
 fn load_runner_manifest(manifest_path: &Path, control: &ControlHandle) -> Result<ServiceManifest> {

@@ -1,10 +1,10 @@
+use crate::response::watch::NativeServiceState;
 use crate::watch_service::{
     ServiceEnvironment, ServiceManifest, invalid, run_native, run_native_output,
     service_environment_pairs, service_error,
 };
 use kio_core::Result;
 use kio_process::BoundedProcessOutput;
-use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
@@ -102,7 +102,7 @@ pub(crate) fn native_after_remove() -> Result<()> {
     run_systemctl(["daemon-reload".into()]).map(|_| ())
 }
 
-pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<Value> {
+pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<NativeServiceState> {
     let enabled = run_native_output(
         systemctl_path()?,
         ["--user".into(), "is-enabled".into(), manifest.id.clone()],
@@ -115,7 +115,10 @@ pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<Value> {
     )?
     .status
     .success();
-    Ok(json!({"registered":enabled,"active":active}))
+    Ok(NativeServiceState {
+        registered: enabled,
+        active,
+    })
 }
 
 fn systemctl_path() -> Result<&'static str> {

@@ -1,10 +1,10 @@
 use crate::platform::watch_argv;
+use crate::response::watch::NativeServiceState;
 use crate::watch_service::{
     ServiceEnvironment, ServiceManifest, invalid, run_native, run_native_output,
     service_environment_pairs, service_error,
 };
 use kio_core::Result;
-use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 
 pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
@@ -173,7 +173,7 @@ pub(crate) fn native_after_remove() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<Value> {
+pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<NativeServiceState> {
     let active = run_native_output(
         "/bin/launchctl",
         [
@@ -183,7 +183,10 @@ pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<Value> {
     )?
     .status
     .success();
-    Ok(json!({"registered":true,"active":active}))
+    Ok(NativeServiceState {
+        registered: true,
+        active,
+    })
 }
 
 fn xml_escape(value: &str) -> Result<String> {
