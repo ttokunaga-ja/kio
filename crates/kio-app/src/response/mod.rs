@@ -2,12 +2,16 @@ use kio_core::{ExitCode, KioError, Result};
 use serde::Serialize;
 use serde_json::Value;
 
+pub mod adapter;
+pub mod batch;
 pub mod device;
 pub mod gc;
 pub mod history;
 pub mod index;
+pub mod ledger;
 pub mod pointer;
 pub mod reindex;
+pub mod repair;
 pub mod search;
 pub mod skipped_units;
 pub mod snapshot;
@@ -30,6 +34,10 @@ pub enum Completion {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum ResponseBody {
+    Batch(batch::BatchResponse),
+    Adapter(adapter::AdapterResponse),
+    Ledger(ledger::LedgerResponse),
+    Repair(repair::RepairResponse),
     Index(index::IndexResponse),
     Reindex(reindex::ReindexResponse),
     Gc(gc::GcResponse),
@@ -81,3 +89,8 @@ mod inventory_tests;
 mod reindex_skipped_tests;
 #[cfg(test)]
 mod snapshot_gc_tests;
+
+#[cfg(test)]
+mod c3d_completion_tests;
+#[cfg(test)]
+mod c3d_tests;

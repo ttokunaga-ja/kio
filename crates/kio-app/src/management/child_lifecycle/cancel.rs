@@ -8,6 +8,8 @@ use super::{
     operation_leaf, pending_initializations, policy_allows, recover_lifecycle_atomic,
 };
 use crate::management::binding_for_repo;
+use crate::response::repair::*;
+use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
 use kio_core::management::{
     DirectoryIdentity, ManagementBinding, directory_identity_from_handle, observe_direct_child,
     planned_child_management_record, read_registration_recovery_record,
@@ -17,7 +19,7 @@ use kio_core::scope::{Repository, validate_planned_kio_layout};
 use kio_core::store_dir::{AtomicWorkspaceState, Publication, StoreDirectory};
 use kio_core::{KioError, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::Value;
 use std::path::Path;
 
 const CANCELLATION: &str = "child-initialization-cancel.json";
@@ -51,11 +53,14 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
         let binding = binding_for_repo(parent)?;
         let store = control(&binding, parent.control())?;
         let pending = pending_initializations(&store)?;
-        let cancellation = load_marker(&store)?.map(|(marker, _)| {
-            json!({
-                "operation": marker.initialization.operation_id,
-                "phase": marker.phase,
-            })
+        let cancellation = load_marker(&store)?.map(|(marker, _)| PendingCancellation {
+            operation: marker.initialization.operation_id,
+            phase: match marker.phase {
+                Phase::Prepared => "prepared",
+                Phase::Quarantined => "quarantined",
+                Phase::Removed => "removed",
+            }
+            .to_owned(),
         });
         if let Some(operation) = operation {
             operation_leaf(operation)?;
@@ -65,11 +70,16 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
             .filter(|(journal, _)| operation.is_none_or(|id| id == journal.operation_id))
             .map(|(journal, bytes)| preview_row(&binding, &store, journal, bytes))
             .collect::<Result<Vec<_>>>()?;
-        return Ok(json!({
-            "preview": true,
-            "operations": rows,
-            "pending_cancellation": cancellation,
-        }));
+        return project_legacy(CommandResponse {
+            body: ResponseBody::Repair(RepairResponse::CancelChildInitialization(
+                CancelChildInitializationResponse::Preview(CancelChildPreview {
+                    preview: true,
+                    operations: rows,
+                    pending_cancellation: cancellation,
+                }),
+            )),
+            completion: Completion::Complete,
+        });
     }
     let operation = operation.ok_or_else(|| {
         KioError::invalid_usage("child initialization cancellation requires an operation ID")
@@ -87,7 +97,16 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
             ));
         }
         finish(&binding, &store, marker, bytes)?;
-        return Ok(json!({"operation": operation, "cancelled": true, "resumed": true}));
+        return project_legacy(CommandResponse {
+            body: ResponseBody::Repair(RepairResponse::CancelChildInitialization(
+                CancelChildInitializationResponse::Applied(CancelChildApplied {
+                    operation: operation.to_owned(),
+                    cancelled: true,
+                    resumed: true,
+                }),
+            )),
+            completion: Completion::Complete,
+        });
     }
     let (journal, bytes) = pending_initializations(&store)?
         .into_iter()
@@ -120,7 +139,16 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
         KioError::invalid_usage("child initialization cancellation marker disappeared")
     })?;
     finish(&binding, &store, marker, marker_bytes)?;
-    Ok(json!({"operation": operation, "cancelled": true, "resumed": false}))
+    project_legacy(CommandResponse {
+        body: ResponseBody::Repair(RepairResponse::CancelChildInitialization(
+            CancelChildInitializationResponse::Applied(CancelChildApplied {
+                operation: operation.to_owned(),
+                cancelled: true,
+                resumed: false,
+            }),
+        )),
+        completion: Completion::Complete,
+    })
 }
 
 /// Resume only an explicit cancellation marker. It never starts cancellation
@@ -141,7 +169,7 @@ fn preview_row(
     control: &StoreDirectory,
     journal: Initialization,
     bytes: Vec<u8>,
-) -> Result<Value> {
+) -> Result<CancelChildRow> {
     validate_live_chain(parent)?;
     let operation = journal.operation_id.clone();
     let path = parent.canonical_root().join(&journal.basename);
@@ -150,24 +178,19 @@ fn preview_row(
         .join(".kio")
         .join(&journal.stage_leaf);
     let policy = policy_allows(parent, &journal.basename).ok();
-    match check_initialization(parent, control, &journal, &bytes, false) {
-        Ok(_) => Ok(json!({
-            "operation": operation,
-            "path": path,
-            "stage": stage,
-            "cancelable": true,
-            "reason": null,
-            "current_policy_allows": policy,
-        })),
-        Err(error) => Ok(json!({
-            "operation": operation,
-            "path": path,
-            "stage": stage,
-            "cancelable": false,
-            "reason": error.to_string(),
-            "current_policy_allows": policy,
-        })),
-    }
+    let (cancelable, reason) = match check_initialization(parent, control, &journal, &bytes, false)
+    {
+        Ok(_) => (true, None),
+        Err(error) => (false, Some(error.to_string())),
+    };
+    Ok(CancelChildRow {
+        operation,
+        path,
+        stage,
+        cancelable,
+        reason,
+        current_policy_allows: policy,
+    })
 }
 
 fn load_marker(control: &StoreDirectory) -> Result<Option<(Cancellation, Vec<u8>)>> {

@@ -61,7 +61,6 @@ use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
 use rusqlite::Connection;
-use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -906,22 +905,6 @@ pub(crate) fn skipped_disclosure(report: &Step3RebuildReport, kio_dir: &Path) ->
     SkippedDisclosure {
         skipped_units: entries,
         skipped_units_guidance: guidance,
-    }
-}
-
-// Pending Repair still has a Value root; attach only the canonical typed disclosure leaves.
-pub(crate) fn attach_skipped_units(
-    output: &mut Value,
-    report: &Step3RebuildReport,
-    kio_dir: &Path,
-) {
-    let Some(object) = output.as_object_mut() else {
-        return;
-    };
-    let disclosure = skipped_disclosure(report, kio_dir);
-    object.insert("skipped_units".to_owned(), json!(disclosure.skipped_units));
-    if let Some(guidance) = disclosure.skipped_units_guidance {
-        object.insert("skipped_units_guidance".to_owned(), json!(guidance));
     }
 }
 

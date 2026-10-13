@@ -10,11 +10,10 @@ use crate::embedding::transport::poll_batch_embedding_jobs;
 use crate::embedding::transport::resolve_invocation_lane;
 use crate::index::chunk_ledger::ensure_purge_epoch_initialized;
 use crate::index::chunk_ledger::recover_index_generation;
-use crate::index::rebuild::attach_skipped_units;
 use crate::index::rebuild::rebuild_step3_index;
+use crate::index::rebuild::skipped_disclosure;
 use crate::invocation::Invocation;
 use crate::invocation::exit_override_error_code;
-use crate::invocation::take_exit_override;
 use crate::ledger_access::open_optional_ledger_db;
 use crate::ledger_access::recover_stale_sync_rows;
 use crate::managed_restore;
@@ -24,6 +23,8 @@ use crate::object_persistence::index_to_kio;
 use crate::promotion::clear_promotion_state;
 use crate::promotion::maybe_inject_promotion_fault;
 use crate::promotion::recover_pending_online_promotion;
+use crate::response::repair::*;
+use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
 use crate::scope_access::scope_id;
 use crate::search::projection::log_aggregator_degraded;
 use crate::search::projection::mark_replica_rebuilding_or_log;
@@ -35,8 +36,7 @@ use crate::search::scope::aggregator_path;
 use crate::settings::rebuild_embedding_profile_from_tool_lock;
 use crate::settings::validate_repo_tool_lock;
 use crate::task_execution::ExecOutcome;
-use crate::task_execution::enrichment_exit_override;
-use crate::task_execution::set_exit_override;
+use crate::task_execution::enrichment_completion;
 use crate::verify_objects;
 use kio_core::ExitCode;
 use kio_core::KioError;
@@ -125,7 +125,10 @@ fn run_repair_with_reads(
         let plan = verify_objects::registry_prune_plan_with_control(ctx.control)?;
         confirm_repair_prune(ctx, "registry-prune", &plan.target_lines(), prune.yes)?;
         let report = verify_objects::registry_prune_apply_with_control(&plan, ctx.control)?;
-        return serde_json::to_value(report).map_err(|error| KioError::schema(error.to_string()));
+        return project_legacy(CommandResponse {
+            body: ResponseBody::Repair(RepairResponse::RegistryPrune(report)),
+            completion: Completion::Complete,
+        });
     }
     let repo = match Repository::open_recovery_in_session(ctx.cwd(), ctx.control.clone(), ctx.locks)
     {
@@ -135,11 +138,14 @@ fn run_repair_with_reads(
                 && error.error_code() == "KIO-E-STORE-NAMESPACE-001" =>
         {
             let report = verify_objects::VerifyObjectsReport::namespace_unavailable(&error);
-            let mut output = serde_json::to_value(report)
-                .map_err(|error| KioError::schema(error.to_string()))?;
-            output["error_code"] = json!("KIO-E-STORE-NAMESPACE-001");
-            output["__exit_code"] = json!(3);
-            return Ok(output);
+            return project_legacy(CommandResponse {
+                body: ResponseBody::Repair(RepairResponse::VerifyObjects(RepairVerifyResponse {
+                    report,
+                    prune_orphans: None,
+                    error_code: Some("KIO-E-STORE-NAMESPACE-001".to_owned()),
+                })),
+                completion: Completion::Partial,
+            });
         }
         Err(error) => return Err(error),
     };
@@ -168,22 +174,27 @@ fn run_repair_with_reads(
     ) && kio_core::gc::read_active_marker_with_control(repo.kio_dir(), repo.control())?.is_some()
     {
         let report = verify_objects::verify_objects(&repo)?;
-        let mut output =
-            serde_json::to_value(report).map_err(|error| KioError::schema(error.to_string()))?;
-        if let Some(object) = output.as_object_mut() {
-            object.insert("error_code".to_owned(), json!("KIO-E-GC-SWEEP-ACTIVE-001"));
-            object.insert("__exit_code".to_owned(), json!(3));
-        }
-        return Ok(output);
+        return project_legacy(CommandResponse {
+            body: ResponseBody::Repair(RepairResponse::VerifyObjects(RepairVerifyResponse {
+                report,
+                prune_orphans: None,
+                error_code: Some("KIO-E-GC-SWEEP-ACTIVE-001".to_owned()),
+            })),
+            completion: Completion::Partial,
+        });
     }
     // M1(a): serialize the DB rebuild against concurrent index/repair/reindex.
     let _lock = repo.lock_store_in_session(repo.lock_session())?;
     if mode == RepairMode::VerifyObjectsPruneOrphans
         && let Some(prune) = verify_objects::prune_orphans_preflight(&repo)?
     {
-        return Ok(
-            json!({"prune_orphans":prune,"error_code":"KIO-E-PRUNE-ORPHANS-BLOCKED-001","__exit_code":3}),
-        );
+        return project_legacy(CommandResponse {
+            body: ResponseBody::Repair(RepairResponse::PruneBlocked(RepairPruneBlockedResponse {
+                prune_orphans: prune,
+                error_code: "KIO-E-PRUNE-ORPHANS-BLOCKED-001".to_owned(),
+            })),
+            completion: Completion::Partial,
+        });
     }
     repo.recover_publication()?;
     validate_repo_tool_lock(&repo)?;
@@ -218,22 +229,26 @@ fn run_repair_with_reads(
             .remaining_findings
             .iter()
             .any(|finding| finding.kind == "purge_incomplete");
-        let mut output =
-            serde_json::to_value(report).map_err(|error| KioError::schema(error.to_string()))?;
+        let mut output = RepairVerifyResponse {
+            report,
+            prune_orphans: None,
+            error_code: None,
+        };
+        let mut completion = Completion::Complete;
         if has_findings {
-            if let Some(object) = output.as_object_mut() {
-                object.insert(
-                    "error_code".to_owned(),
-                    json!(if purge_incomplete {
-                        "KIO-E-PURGE-INCOMPLETE-001"
-                    } else {
-                        "KIO-E-STORE-CORRUPT-001"
-                    }),
-                );
-                object.insert("__exit_code".to_owned(), json!(3));
-            }
+            output.error_code = Some(
+                if purge_incomplete {
+                    "KIO-E-PURGE-INCOMPLETE-001"
+                } else {
+                    "KIO-E-STORE-CORRUPT-001"
+                }
+                .to_owned(),
+            );
             // PB15: never prune on top of an unverified/corrupt store.
-            return Ok(output);
+            return project_legacy(CommandResponse {
+                body: ResponseBody::Repair(RepairResponse::VerifyObjects(output)),
+                completion: Completion::Partial,
+            });
         }
         // PB12-17: `--prune-orphans` runs only after a clean verify pass.
         if mode == RepairMode::VerifyObjectsPruneOrphans {
@@ -257,27 +272,23 @@ fn run_repair_with_reads(
                 )?;
             }
             let prune = verify_objects::prune_orphans_apply(&repo, plan)?;
-            if let (Some(object), Ok(prune_value)) = (
-                output.as_object_mut(),
-                serde_json::to_value(&prune).map_err(|error| KioError::schema(error.to_string())),
-            ) {
-                object.insert("prune_orphans".to_owned(), prune_value);
-                if prune.status == "blocked" {
-                    // H2-5 (R24b, 3/3 一致): a non-zero exit without an
-                    // `error_code` is the one asymmetry every other failure
-                    // path in this command avoids — a caller reading the JSON
-                    // saw `__exit_code: 3` and no way to tell why.
-                    object.insert(
-                        "error_code".to_owned(),
-                        json!("KIO-E-PRUNE-ORPHANS-BLOCKED-001"),
-                    );
-                    object.insert("__exit_code".to_owned(), json!(3));
-                }
+            if prune.status == "blocked" {
+                output.error_code = Some("KIO-E-PRUNE-ORPHANS-BLOCKED-001".to_owned());
+                completion = Completion::Partial;
             }
+            output.prune_orphans = Some(prune);
         }
-        return Ok(output);
+        return project_legacy(CommandResponse {
+            body: ResponseBody::Repair(RepairResponse::VerifyObjects(output)),
+            completion,
+        });
     }
-    run_rebuild_db_locked(ctx, &repo, parsed.online, parsed.offline, true)
+    let (response, completion) =
+        run_rebuild_db_locked(ctx, &repo, parsed.online, parsed.offline, true)?;
+    project_legacy(CommandResponse {
+        body: ResponseBody::Repair(RepairResponse::RebuildDb(response)),
+        completion,
+    })
 }
 
 /// The locked, source-SQLite half of `repair rebuild-db`.  Keeping it separate
@@ -289,7 +300,7 @@ fn run_rebuild_db_locked(
     online_requested: bool,
     offline: bool,
     poll_remote_jobs: bool,
-) -> Result<Value> {
+) -> Result<(RepairRebuildResponse, Completion)> {
     let adapter_settings = ctx.settings;
 
     // CL45/item 5: reconcile any stale `request_kind='sync'` cost-ledger.sqlite
@@ -372,21 +383,17 @@ fn run_rebuild_db_locked(
     } else {
         ExecOutcome::default()
     };
-    let mut output = json!({
-        "status": "rebuilt",
-        "rebuilt_chunks": report.rebuilt_chunks,
-        "rebuilt_tree_entries": report.rebuilt_tree_entries,
-        "sqlite_db": db,
-        "embedding_tasks_executed": enrichment.executed,
-        "embedding_tasks_failed": enrichment.failed,
-        "paused_tasks": enrichment.paused,
-    });
-    // R16-4: disclose any documents skipped for missing/corrupt units (partial recovery).
-    attach_skipped_units(&mut output, &report, repo.kio_dir());
-    if let Some(code) = enrichment_exit_override(&enrichment) {
-        set_exit_override(&mut output, code);
-    }
-    Ok(output)
+    let output = RepairRebuildResponse {
+        status: "rebuilt".to_owned(),
+        rebuilt_chunks: report.rebuilt_chunks,
+        rebuilt_tree_entries: report.rebuilt_tree_entries,
+        sqlite_db: db,
+        embedding_tasks_executed: enrichment.executed,
+        embedding_tasks_failed: enrichment.failed,
+        paused_tasks: enrichment.paused,
+        skipped: skipped_disclosure(&report, repo.kio_dir()),
+    };
+    Ok((output, enrichment_completion(&enrichment)))
 }
 
 /// Device-global repair deliberately enumerates the registry before opening any
@@ -473,12 +480,18 @@ fn run_device_repair(ctx: &Invocation<'_>, rebuild_source: bool) -> Result<Value
                 DeviceRepairOperation::Replica
             },
         ) {
-            Ok(value) => successes.push(json!({
-                "scope_id": entry.scope_id,
-                "path": entry.root_path,
-                "status": value.get("status").cloned().unwrap_or_else(|| json!("repaired")),
-                "result": value,
-            })),
+            Ok(value) => {
+                let status = match &value {
+                    ScopeRepairResult::All(output) => output.rebuild.status.clone(),
+                    ScopeRepairResult::Replica(output) => output.status.clone(),
+                };
+                successes.push(RepairedScope {
+                    scope_id: entry.scope_id,
+                    path: entry.root_path,
+                    status,
+                    result: value,
+                });
+            }
             Err(error) if error.error_code() == "KIO-E-STORE-VERSION-001" => {
                 return Err(error);
             }
@@ -489,10 +502,10 @@ fn run_device_repair(ctx: &Invocation<'_>, rebuild_source: bool) -> Result<Value
             )),
         }
     }
-    successes.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-    failures.sort_by(|a, b| a["path"].as_str().cmp(&b["path"].as_str()));
-    let mut output = json!({
-        "status": if failures.is_empty() && successes.is_empty() {
+    successes.sort_by(|a, b| a.path.cmp(&b.path));
+    failures.sort_by(|a, b| a.path.cmp(&b.path));
+    let mut output = DeviceRepairResponse {
+        status: if failures.is_empty() && successes.is_empty() {
             "up_to_date"
         } else if failures.is_empty() {
             "repaired"
@@ -500,51 +513,58 @@ fn run_device_repair(ctx: &Invocation<'_>, rebuild_source: bool) -> Result<Value
             "failed"
         } else {
             "partial"
+        }
+        .to_owned(),
+        operation: if rebuild_source { "all" } else { "replica" }.to_owned(),
+        summary: RepairSummary {
+            repaired: successes.len(),
+            failed: failures.len(),
         },
-        "operation": if rebuild_source { "all" } else { "replica" },
-        "repaired_scopes": successes,
-        "failed_scopes": failures,
-        "summary": { "repaired": successes.len(), "failed": failures.len() },
-    });
-    if !failures.is_empty() {
-        let homogeneous = successes.is_empty()
-            && failures.iter().all(|f| {
-                f["error_code"] == failures[0]["error_code"]
-                    && f["exit_code"] == failures[0]["exit_code"]
+        repaired_scopes: successes,
+        failed_scopes: failures,
+        error_code: None,
+    };
+    let mut completion = Completion::Complete;
+    if !output.failed_scopes.is_empty() {
+        let failures = &output.failed_scopes;
+        let homogeneous = output.repaired_scopes.is_empty()
+            && failures.iter().all(|failure| {
+                failure.error_code == failures[0].error_code
+                    && failure.exit_code == failures[0].exit_code
             });
         if homogeneous {
-            let exit = failures[0]["exit_code"].as_i64().unwrap_or(4);
-            let code = failures[0]["error_code"]
-                .as_str()
-                .unwrap_or("KIO-E-REPAIR-ALL-FAILED-001")
-                .to_owned();
+            let exit = failures[0].exit_code;
+            let code = failures[0].error_code.clone();
             return Err(KioError::new(
                 code,
                 "device repair failed for every registered scope",
-                output,
-                exit_code_from_i64(exit),
+                serde_json::to_value(&output)
+                    .map_err(|error| KioError::schema(error.to_string()))?,
+                exit_code_from_i64(i64::from(exit)),
             ));
         }
-        let (code, exit) = if successes.is_empty() {
-            // Retryable classes retain an exit that invites another run. A
-            // heterogeneous set never borrows one arbitrary scope's code.
+        let (code, outcome) = if output.repaired_scopes.is_empty() {
             let retryable = failures
                 .iter()
-                .any(|failure| matches!(failure["exit_code"].as_i64(), Some(1 | 3 | 5 | 6 | 7)));
-            ("KIO-E-REPAIR-ALL-FAILED-001", if retryable { 3 } else { 4 })
+                .any(|failure| matches!(failure.exit_code, 1 | 3 | 5 | 6 | 7));
+            (
+                "KIO-E-REPAIR-ALL-FAILED-001",
+                if retryable {
+                    Completion::Partial
+                } else {
+                    Completion::Permanent
+                },
+            )
         } else {
-            ("KIO-E-REPAIR-PARTIAL-001", 3)
+            ("KIO-E-REPAIR-PARTIAL-001", Completion::Partial)
         };
-        output
-            .as_object_mut()
-            .unwrap()
-            .insert("error_code".to_owned(), json!(code));
-        output
-            .as_object_mut()
-            .unwrap()
-            .insert("__exit_code".to_owned(), json!(exit));
+        output.error_code = Some(code.to_owned());
+        completion = outcome;
     }
-    Ok(output)
+    project_legacy(CommandResponse {
+        body: ResponseBody::Repair(RepairResponse::Device(output)),
+        completion,
+    })
 }
 
 fn exit_code_from_i64(code: i64) -> ExitCode {
@@ -563,17 +583,17 @@ fn exit_code_from_i64(code: i64) -> ExitCode {
     }
 }
 
-fn device_repair_failure(entry: &RegistryEntry, stage: &str, error: &KioError) -> Value {
-    json!({
-        "scope_id": entry.scope_id,
-        "path": entry.root_path,
-        "stage": stage,
-        "reason": device_repair_reason(stage, error),
-        "error_code": error.error_code(),
-        "message": error.message(),
-        "context": error.context(),
-        "exit_code": error.exit_code().code(),
-    })
+fn device_repair_failure(entry: &RegistryEntry, stage: &str, error: &KioError) -> FailedScope {
+    FailedScope {
+        scope_id: entry.scope_id.clone(),
+        path: entry.root_path.clone(),
+        stage: stage.to_owned(),
+        reason: device_repair_reason(stage, error).to_owned(),
+        error_code: error.error_code().to_owned(),
+        message: error.message().to_owned(),
+        context: error.context().clone(),
+        exit_code: error.exit_code().code(),
+    }
 }
 
 fn validate_device_registry_entry(entry: &RegistryEntry, repo: &Repository) -> Result<()> {
@@ -648,7 +668,7 @@ fn run_one_device_repair(
     repo: &Repository,
     entry: &RegistryEntry,
     operation: DeviceRepairOperation,
-) -> Result<Value> {
+) -> Result<ScopeRepairResult> {
     let _lock = repo.lock_store_in_session(repo.lock_session())?;
     // Revalidate after taking the lock so a path replaced between registry
     // enumeration and execution cannot be repaired under the stale identity.
@@ -697,18 +717,21 @@ fn run_one_device_repair(
                 ExitCode::PartialFailure,
             ));
         }
-        let mut result = run_rebuild_db_locked(ctx, repo, false, true, false)?;
-        let exit = take_exit_override(&mut result);
+        let (result, completion) = run_rebuild_db_locked(ctx, repo, false, true, false)?;
+        // This branch consumes completion as an error classification, retaining the original error context body.
+        let exit = match completion {
+            Completion::Complete => None,
+            Completion::AuthRequired => Some(ExitCode::AuthError),
+            Completion::BudgetBlocked => Some(ExitCode::BudgetExceeded),
+            Completion::Partial => Some(ExitCode::PartialFailure),
+            Completion::Permanent => Some(ExitCode::PermanentFailure),
+        };
         if let Some(exit) = exit {
-            let code = result
-                .get("error_code")
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| exit_override_error_code(exit))
-                .to_owned();
             return Err(KioError::new(
-                code,
+                exit_override_error_code(exit),
                 "source SQLite recovery completed with outstanding work",
-                result,
+                serde_json::to_value(&result)
+                    .map_err(|error| KioError::schema(error.to_string()))?,
                 exit,
             ));
         }
@@ -720,10 +743,10 @@ fn run_one_device_repair(
                 ExitCode::PartialFailure,
             )
         })?;
-        if let Some(object) = result.as_object_mut() {
-            object.insert("replica".to_owned(), json!("ready"));
-        }
-        Ok(result)
+        Ok(ScopeRepairResult::All(ScopeRepairAll {
+            rebuild: result,
+            replica: "ready".to_owned(),
+        }))
     } else {
         // Replica recovery must leave the source store (including HEAD and
         // sqlite.db) untouched; only the device projection is regenerated.
@@ -736,7 +759,9 @@ fn run_one_device_repair(
                 ExitCode::PartialFailure,
             )
         })?;
-        Ok(json!({ "status": "replica_rebuilt" }))
+        Ok(ScopeRepairResult::Replica(ScopeRepairReplica {
+            status: "replica_rebuilt".to_owned(),
+        }))
     }
 }
 

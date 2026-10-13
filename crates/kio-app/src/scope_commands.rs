@@ -1,4 +1,4 @@
-use crate::batch::command::stalled_batch_status_json;
+use crate::batch::command::stalled_batch_status;
 use crate::commands;
 use crate::egress::quarantine_status_records;
 use crate::index::chunk_ledger::ensure_purge_epoch_initialized;
@@ -121,7 +121,7 @@ pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<Value> {
         // CL37/CL68: permanently-stalled (settled but residue-cleanup-
         // pending) cost-ledger.sqlite batch_requests rows, device-global
         // — not scoped to this folder, since the ledger itself is not.
-        "stalled_batch": stalled_batch_status_json(ledger_snapshot.as_ref(), ctx.control)?,
+        "stalled_batch": stalled_batch_status(ledger_snapshot.as_ref(), ctx.control)?,
         // 05 §3.5 / LC51: `status` is the one read command the §I barrier
         // does NOT reject on an active journal — it shows the journal as
         // state instead, for recovery visibility into a crashed purge.

@@ -2,6 +2,8 @@
 //! managed working tree.  Export remains destination-only; this module is the
 //! only path that can materialize historical bytes under the managed root.
 
+use crate::response::repair::*;
+use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
 use std::path::PathBuf;
 
 use kio_core::scope::{ManagedRestorePlan, ManagedRestoreRequest, Repository};
@@ -89,7 +91,7 @@ pub(super) fn run(ctx: &crate::invocation::Invocation<'_>, args: RestoreArgs) ->
     match rebuild_projection(ctx, &repo, Some((&policy, &plan))) {
         Ok(projection) => {
             result["projection_status"] = json!("ready");
-            result["projection"] = projection;
+            result["projection"] = json!(projection);
         }
         Err(error) => {
             // The restored commit and its durable provenance are already
@@ -120,34 +122,46 @@ pub(super) fn recover(ctx: &crate::invocation::Invocation<'_>) -> Result<Value> 
     // bytes back or finish the already-journaled publication.
     kio_core::management::validate_live_chain(&binding_for_repo(&repo)?)?;
     let recovered = repo.recover_managed_restore()?;
-    let mut result = json!({
-        "operation": "managed_restore_recovery",
-        "status": if recovered { "recovered" } else { "no_pending_restore" },
-        "recovered": recovered,
-        "egress": false,
-    });
+    let mut result = ManagedRestoreRecoveryResponse {
+        operation: "managed_restore_recovery".to_owned(),
+        status: if recovered {
+            "recovered"
+        } else {
+            "no_pending_restore"
+        }
+        .to_owned(),
+        recovered,
+        egress: false,
+        projection_status: None,
+        projection: None,
+        projection_error: None,
+    };
+    let mut completion = Completion::Complete;
     if recovered {
         if let Some(head) = repo.head_commit_hash()? {
             mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), &head);
         }
         match rebuild_projection(ctx, &repo, None) {
             Ok(projection) => {
-                result["projection_status"] = json!("ready");
-                result["projection"] = projection;
+                result.projection_status = Some("ready".to_owned());
+                result.projection = Some(projection);
             }
             Err(error) => {
                 mark_replica_unavailable_or_log(ctx, repo.kio_dir());
-                result["status"] = json!("recovered_projection_failed");
-                result["projection_status"] = json!("failed");
-                result["projection_error"] = json!({
-                    "error_code": error.error_code(),
-                    "message": error.message(),
+                result.status = "recovered_projection_failed".to_owned();
+                result.projection_status = Some("failed".to_owned());
+                result.projection_error = Some(ManagedRestoreProjectionError {
+                    error_code: error.error_code().to_owned(),
+                    message: error.message().to_owned(),
                 });
-                set_exit_override(&mut result, ExitCode::PartialFailure);
+                completion = Completion::Partial;
             }
         }
     }
-    Ok(result)
+    project_legacy(CommandResponse {
+        body: ResponseBody::Repair(RepairResponse::RecoverRestore(result)),
+        completion,
+    })
 }
 
 /// Rebuild only local, reproducible derived state after a restore.  This uses
@@ -160,7 +174,7 @@ fn rebuild_projection(
         &kio_pipeline::policy::CurrentPolicyEvaluator,
         &ManagedRestorePlan,
     )>,
-) -> Result<Value> {
+) -> Result<ManagedRestoreProjection> {
     let _lock = repo.lock_store_in_session(repo.lock_session())?;
     if let Some((policy, plan)) = policy {
         ensure_scope_allowed(policy)?;
@@ -176,13 +190,13 @@ fn rebuild_projection(
             ExitCode::PartialFailure,
         )
     })?;
-    Ok(json!({
-        "status": "ready",
-        "rebuilt_chunks": report.rebuilt_chunks,
-        "rebuilt_tree_entries": report.rebuilt_tree_entries,
-        "skipped_units": report.skipped_units,
-        "egress": false,
-    }))
+    Ok(ManagedRestoreProjection {
+        status: "ready".to_owned(),
+        rebuilt_chunks: report.rebuilt_chunks,
+        rebuilt_tree_entries: report.rebuilt_tree_entries,
+        skipped_units: report.skipped_units,
+        egress: false,
+    })
 }
 
 fn requested_paths(

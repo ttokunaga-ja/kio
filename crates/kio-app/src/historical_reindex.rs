@@ -27,14 +27,13 @@ use crate::index::rebuild::unit_authorities_from_inputs;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
 use crate::open_view::MAX_MANIFEST_OBJECT_READ_BYTES;
-use crate::response::Completion;
 use crate::response::reindex::{HistoricalReindexResponse, ReindexExecution, ReindexResponse};
 use crate::response::skipped_units::SkippedUnit;
 use crate::scope_access::active_erase_purge_explains_historical_missing_manifest;
 use crate::scope_access::ensure_no_visible_purge_journal;
 use crate::scope_access::purge_blocks_historical_reindex_raw;
 use crate::scope_access::purge_blocks_rebuild_raw;
-use crate::task_execution::enrichment_exit_override;
+use crate::task_execution::enrichment_completion;
 use kio_core::ExitCode;
 use kio_core::KioError;
 use kio_core::cas::ContentObjectKind;
@@ -769,11 +768,7 @@ pub(super) fn run(
         blocked_raw_hashes: blocked_raw_hashes.len(),
         skipped: skipped_disclosure(&report, repo.kio_dir()),
     };
-    let completion = match enrichment_exit_override(&enrichment) {
-        Some(ExitCode::AuthError) => Completion::AuthRequired,
-        Some(ExitCode::BudgetExceeded) => Completion::BudgetBlocked,
-        _ => Completion::Complete,
-    };
+    let completion = enrichment_completion(&enrichment);
     Ok(ReindexExecution {
         response: ReindexResponse::Historical(response),
         completion,

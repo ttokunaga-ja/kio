@@ -3133,14 +3133,20 @@ fn query_embedding_is_always_priced_on_the_sync_lane() {
 
 #[test]
 fn r11_2_exit_override_priority_batch_vs_enrichment() {
+    use crate::response::Completion;
     use crate::task_execution::ExecOutcome;
-    use crate::task_execution::batch_exit_override;
-    use crate::task_execution::enrichment_exit_override;
-    use kio_core::ExitCode;
+    use crate::task_execution::batch_completion;
+    use crate::task_execution::enrichment_completion;
 
     // A clean pass overrides nothing (exit 0).
-    assert!(batch_exit_override(&ExecOutcome::default()).is_none());
-    assert!(enrichment_exit_override(&ExecOutcome::default()).is_none());
+    assert_eq!(
+        batch_completion(&ExecOutcome::default()),
+        Completion::Complete
+    );
+    assert_eq!(
+        enrichment_completion(&ExecOutcome::default()),
+        Completion::Complete
+    );
 
     // Batch priority: auth (5) > budget-paused (6) > some-retryable (3) >
     // all-permanent (4).
@@ -3153,54 +3159,54 @@ fn r11_2_exit_override_priority_batch_vs_enrichment() {
         inflight: 0,
         held_unreadable: 0,
     };
-    assert_eq!(batch_exit_override(&all), Some(ExitCode::AuthError));
+    assert_eq!(batch_completion(&all), Completion::AuthRequired);
     assert_eq!(
-        batch_exit_override(&ExecOutcome {
+        batch_completion(&ExecOutcome {
             auth_failed: 0,
             ..all
         }),
-        Some(ExitCode::BudgetExceeded)
+        Completion::BudgetBlocked
     );
     assert_eq!(
-        batch_exit_override(&ExecOutcome {
+        batch_completion(&ExecOutcome {
             auth_failed: 0,
             paused: 0,
             ..all
         }),
-        Some(ExitCode::PartialFailure)
+        Completion::Partial
     );
     // Failures present but none retryable / auth / paused → all permanent (4).
     assert_eq!(
-        batch_exit_override(&ExecOutcome {
+        batch_completion(&ExecOutcome {
             failed: 2,
             ..ExecOutcome::default()
         }),
-        Some(ExitCode::PermanentFailure)
+        Completion::Permanent
     );
 
     // Enrichment (index/repair/reindex) overrides ONLY on auth (5) / budget (6);
     // a retryable/permanent embedding failure stays exit 0 (disclosed in JSON).
     assert_eq!(
-        enrichment_exit_override(&ExecOutcome {
+        enrichment_completion(&ExecOutcome {
             auth_failed: 1,
             ..ExecOutcome::default()
         }),
-        Some(ExitCode::AuthError)
+        Completion::AuthRequired
     );
     assert_eq!(
-        enrichment_exit_override(&ExecOutcome {
+        enrichment_completion(&ExecOutcome {
             paused: 1,
             ..ExecOutcome::default()
         }),
-        Some(ExitCode::BudgetExceeded)
+        Completion::BudgetBlocked
     );
-    assert!(
-        enrichment_exit_override(&ExecOutcome {
+    assert_eq!(
+        enrichment_completion(&ExecOutcome {
             failed: 2,
             failed_retryable: 2,
             ..ExecOutcome::default()
-        })
-        .is_none()
+        }),
+        Completion::Complete
     );
 }
 

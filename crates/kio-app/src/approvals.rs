@@ -1,4 +1,6 @@
 //! Explicit device grants paired with the current scope's approval references.
+use crate::response::adapter::*;
+use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_core::control::ControlHandle;
 use std::sync::Arc;
@@ -344,14 +346,26 @@ pub(crate) fn approve(
             "selected adapter is not configured",
         ));
     }
-    let preview = json!({"status":"preview", "scope_id":repo.scope_identity()?.scope_id,
-        "adapters":selected.iter().map(|(_, binding)| binding).collect::<Vec<_>>(), "send_secrets":args.send_secrets, "resume":args.resume});
+    let preview = ApprovalPreviewResponse {
+        status: "preview".to_owned(),
+        scope_id: repo.scope_identity()?.scope_id,
+        adapters: selected
+            .iter()
+            .map(|(_, binding)| binding.clone())
+            .collect(),
+        send_secrets: args.send_secrets,
+        resume: args.resume.clone(),
+    };
     if args.preview {
-        return Ok(preview);
+        return project_legacy(CommandResponse {
+            body: ResponseBody::Adapter(AdapterResponse::ApprovalPreview(preview)),
+            completion: Completion::Complete,
+        });
     }
     if !args.yes
         && !ctx.interaction.confirm(&format!(
-            "Approve these adapter permissions? [y/N]\n{preview}"
+            "Approve these adapter permissions? [y/N]\n{}",
+            serde_json::to_value(&preview).map_err(|error| KioError::schema(error.to_string()))?
         ))?
     {
         return Err(denied(
@@ -387,7 +401,10 @@ pub(crate) fn approve(
             if expected.execution_mode == "online_api" {
                 open_network_policy(&repo)?;
             }
-            outcomes.push(json!({"tool_id":expected.tool_id,"status":"already_approved"}));
+            outcomes.push(ApprovalOutcome::AlreadyApproved(AlreadyApproved {
+                tool_id: expected.tool_id,
+                status: "already_approved".to_owned(),
+            }));
             continue;
         }
         let now = ctx.control.now_utc_seconds();
@@ -433,7 +450,13 @@ pub(crate) fn approve(
                             matching_record(store.records(), row, &secret_binding).is_some()
                         })
                 }) {
-                    outcomes.push(json!({"tool_id":expected.tool_id,"status":"already_approved","grant_id":pending.grant_id}));
+                    outcomes.push(ApprovalOutcome::ResumedAlreadyApproved(
+                        ResumedAlreadyApproved {
+                            tool_id: expected.tool_id,
+                            status: "already_approved".to_owned(),
+                            grant_id: pending.grant_id,
+                        },
+                    ));
                     continue;
                 }
                 return Err(denied(
@@ -488,12 +511,20 @@ pub(crate) fn approve(
         }
         store.activate_approval(&pending, secret.as_ref(), now)?;
         approval_checkpoint(control, "device_active")?;
-        outcomes.push(
-            json!({"tool_id":expected.tool_id,"status":"approved","grant_id":pending.grant_id,
-            "secrets_grant_id":secret.map(|record|record.grant_id)}),
-        );
+        outcomes.push(ApprovalOutcome::Approved(ApprovedApproval {
+            tool_id: expected.tool_id,
+            status: "approved".to_owned(),
+            grant_id: pending.grant_id,
+            secrets_grant_id: secret.map(|record| record.grant_id),
+        }));
     }
-    Ok(json!({"status":"approved","approvals":outcomes}))
+    project_legacy(CommandResponse {
+        body: ResponseBody::Adapter(AdapterResponse::Approved(ApprovedResponse {
+            status: "approved".to_owned(),
+            approvals: outcomes,
+        })),
+        completion: Completion::Complete,
+    })
 }
 
 pub(crate) fn revoke(ctx: &AppContext, args: RevokeArgs, control: &ControlHandle) -> Result<Value> {
@@ -513,11 +544,22 @@ pub(crate) fn revoke(ctx: &AppContext, args: RevokeArgs, control: &ControlHandle
             Vec::new()
         };
     let outcome = repo.revoke_network_approval(tool, &now)?;
-    Ok(
-        json!({"status":if outcome.changed() || !revoked_grants.is_empty() {"revoked"} else {"no_target"},
-        "tool_id":tool,"all":tool.is_none(),"revoked_tool_ids":outcome.revoked_tool_ids,
-        "revoked_grant_ids":revoked_grants,"pending_removed":outcome.pending_removed}),
-    )
+    project_legacy(CommandResponse {
+        body: ResponseBody::Adapter(AdapterResponse::Revoked(ApprovalRevokeResponse {
+            status: if outcome.changed() || !revoked_grants.is_empty() {
+                "revoked"
+            } else {
+                "no_target"
+            }
+            .to_owned(),
+            tool_id: tool.map(str::to_owned),
+            all: tool.is_none(),
+            revoked_tool_ids: outcome.revoked_tool_ids,
+            revoked_grant_ids: revoked_grants,
+            pending_removed: outcome.pending_removed,
+        })),
+        completion: Completion::Complete,
+    })
 }
 
 pub(crate) fn status(
@@ -594,12 +636,22 @@ pub(crate) fn status(
             ),
             Err(error_code) => (false, Some(error_code)),
         };
-        effective.push(json!({"grant_id":record.grant_id, "permitted":permitted, "reason":reason}));
+        effective.push(EffectiveApproval {
+            grant_id: record.grant_id.clone(),
+            permitted,
+            reason,
+        });
     }
-    Ok(
-        json!({"scope_id":scope_id,"grants":records,"effective":effective,
-        "scope_approvals":rows,"pending":pending}),
-    )
+    project_legacy(CommandResponse {
+        body: ResponseBody::Adapter(AdapterResponse::Status(ApprovalStatusResponse {
+            scope_id,
+            grants: records.into_iter().cloned().collect(),
+            effective,
+            scope_approvals: rows,
+            pending,
+        })),
+        completion: Completion::Complete,
+    })
 }
 
 fn denied(message: &str) -> KioError {

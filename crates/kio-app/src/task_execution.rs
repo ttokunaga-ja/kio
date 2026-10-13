@@ -200,73 +200,38 @@ impl ExecOutcome {
     }
 }
 
-/// R11-2: the batch exit code (docs/04 §5.6 / docs/06 §7) a `batch resume`/`retry`
-/// pass reports, computed from the tasks it TOUCHED this pass (its `ExecOutcome`,
-/// not the whole store — a pass that leaves a pre-existing paused/failed task
-/// untouched changed nothing and exits 0, preserving the L2 sticky-pause symmetry).
-/// Priority, highest first: auth (5, user re-auth), then budget-paused (6, needs
-/// `--override-budget`), then some-retryable-failed (3, `batch retry` can recover),
-/// then all-permanent-failed (4). A clean pass returns `None` = exit 0.
-pub(crate) fn batch_exit_override(outcome: &ExecOutcome) -> Option<ExitCode> {
+// Replace existing helper bodies in task_execution.rs; this is a draft only.
+// Update callers and helper tests atomically. Error ExitCode classification stays.
+pub(crate) fn batch_completion(outcome: &ExecOutcome) -> crate::response::Completion {
+    use crate::response::Completion;
     if outcome.auth_failed > 0 {
-        Some(ExitCode::AuthError)
+        Completion::AuthRequired
     } else if outcome.paused > 0 {
-        Some(ExitCode::BudgetExceeded)
+        Completion::BudgetBlocked
     } else if outcome.failed_retryable > 0 || outcome.inflight > 0 {
-        // Batch-lane in-flight jobs (submitted/queued/running — 04 §5.8) are
-        // retryable-remaining work in exactly the docs/04 §5.6 exit-3 sense:
-        // "retryable な失敗が残っている" — a later `kio batch resume` poll is
-        // what completes them.
-        Some(ExitCode::PartialFailure)
+        Completion::Partial
     } else if outcome.failed > 0 {
-        Some(ExitCode::PermanentFailure)
+        Completion::Permanent
     } else {
-        None
+        Completion::Complete
     }
 }
-
-/// R14-5: the batch-owned observability `error_code` for a Partial(3)/Permanent(4) batch
-/// exit, mirroring how `index` self-sets `KIO-E-INDEX-PARTIAL-001` on its partial exit.
-/// Without it, `append_exit_override_error` fell back to `exit_override_error_code`, which
-/// labels 3/4 with SEARCH codes (`KIO-E-SEARCH-PARTIAL-001` — not even in the catalog —
-/// and `KIO-E-SEARCH-SCOPE-ALL-FAILED-001`, the multi-scope-search all-failed code), so a
-/// batch task failure was mis-classified as a search failure in errors.jsonl. Auth(5) /
-/// budget(6) keep their shared codes (`KIO-E-ADAPTER-AUTH-001` / `KIO-E-BUDGET-EXCEEDED-001`),
-/// which are correct for batch too, so they return `None` and use the shared fallback.
-fn batch_error_code(code: ExitCode) -> Option<&'static str> {
-    match code {
-        ExitCode::PartialFailure => Some("KIO-E-BATCH-PARTIAL-001"),
-        ExitCode::PermanentFailure => Some("KIO-E-BATCH-TASK-FAILED-001"),
+pub(crate) fn batch_error_code(completion: crate::response::Completion) -> Option<String> {
+    use crate::response::Completion;
+    match completion {
+        Completion::Partial => Some("KIO-E-BATCH-PARTIAL-001".to_owned()),
+        Completion::Permanent => Some("KIO-E-BATCH-TASK-FAILED-001".to_owned()),
         _ => None,
     }
 }
-
-/// R14-5: apply the batch exit override to `output`, carrying a batch-owned `error_code`
-/// (so errors.jsonl classifies the failure as batch, not search) before embedding the
-/// `__exit_code` marker. Shared by `batch resume` and `batch retry`.
-pub(crate) fn apply_batch_exit_override(output: &mut Value, outcome: &ExecOutcome) {
-    if let Some(code) = batch_exit_override(outcome) {
-        if let Some(error_code) = batch_error_code(code) {
-            output["error_code"] = json!(error_code);
-        }
-        set_exit_override(output, code);
-    }
-}
-
-/// R11-2: the exit code `index`/`repair`/`reindex` reports for its inline enrichment
-/// (embedding) outcome. Unlike `batch`, a retryable/permanent embedding failure does
-/// NOT override the exit — docs/05 says enrichment failure never aborts the local
-/// index; it is disclosed in the result JSON and left for `batch resume` (exit 0).
-/// Only the two states that need user intervention override the exit while the full
-/// result JSON still prints to stdout (the search-exit-3 "result + nonzero" pattern):
-/// auth (5) and budget-pause (6).
-pub(crate) fn enrichment_exit_override(outcome: &ExecOutcome) -> Option<ExitCode> {
+pub(crate) fn enrichment_completion(outcome: &ExecOutcome) -> crate::response::Completion {
+    use crate::response::Completion;
     if outcome.auth_failed > 0 {
-        Some(ExitCode::AuthError)
+        Completion::AuthRequired
     } else if outcome.paused > 0 {
-        Some(ExitCode::BudgetExceeded)
+        Completion::BudgetBlocked
     } else {
-        None
+        Completion::Complete
     }
 }
 

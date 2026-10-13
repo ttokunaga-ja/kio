@@ -14,11 +14,6 @@ use kio_core::scope::Repository;
 use serde_json::Value;
 use std::sync::Arc;
 
-pub(crate) fn take_exit_override(output: &mut Value) -> Option<ExitCode> {
-    let code = output.as_object_mut()?.remove("__exit_code")?.as_u64()?;
-    exit_code_from_override(code)
-}
-
 pub(crate) fn peek_exit_override(output: &Value) -> Option<ExitCode> {
     output
         .get("__exit_code")

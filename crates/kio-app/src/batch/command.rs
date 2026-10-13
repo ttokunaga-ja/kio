@@ -36,6 +36,9 @@ use crate::object_persistence::adapter_to_kio;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
 use crate::online_task::targets_standard_online_markdownize;
+use crate::response::batch::*;
+use crate::response::ledger::*;
+use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
 use crate::scope_access::scope_id;
 use crate::search::query::snapshot_chunking_config_hash;
 use crate::search::scope::current_embedding_policy;
@@ -43,11 +46,11 @@ use crate::settings::batch_recovery_context;
 use crate::settings::require_repo_tool_lock;
 use crate::settings::user_config_toml_path;
 use crate::task_execution::ExecOutcome;
-use crate::task_execution::apply_batch_exit_override;
 use crate::task_execution::execute_pending_tasks;
 use crate::task_execution::retry_kind_from_reason;
 use crate::task_execution::task_retry_allowed;
 use crate::task_execution::task_retry_due;
+use crate::task_execution::{batch_completion, batch_error_code};
 use crate::trust;
 use kio_adapter::catalog::DeclaredEmbeddingProfile;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
@@ -242,34 +245,25 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Value> 
                 resume.offline,
             )?;
             outcome.add(batch_poll_outcome);
-            let mut output = json!({
-                "status": "resumed",
-                "recheck_budget": resume.recheck_budget,
-                "override_budget": resume.override_budget,
-                "tasks_updated": changed,
-                "tasks_executed": outcome.executed,
-                // R9-7: surface driven online-send attempts and failures, not just
-                // successes, so an orchestrator sees rate-limit / auth / charge
-                // consumption even when nothing completed.
-                "tasks_attempted": outcome.attempted(),
-                "tasks_failed": outcome.failed,
-                // R11-2: pauses this pass are a real state change (previously invisible
-                // — `tasks_updated` reported 0 while the store flipped to paused).
-                "tasks_paused": outcome.paused,
-                // Batch lane (04 §5.8): jobs submitted or still queued/running
-                // provider-side after this pass — completed by a later resume's poll.
-                "tasks_inflight": outcome.inflight,
-                // Subset of the above that is held because the provider's
-                // response could not be READ. Non-zero = a fault to look at,
-                // not a job to wait for.
-                "tasks_inflight_unreadable": outcome.held_unreadable,
-            });
-            // R11-2: report the batch exit code (docs/04 §5.6) from what this pass did
-            // — auth (5) / budget-paused (6) / partial (3) / all-permanent (4) — while
-            // the full result JSON still prints to stdout. R14-5: with a batch-owned
-            // error_code so errors.jsonl does not borrow a search code.
-            apply_batch_exit_override(&mut output, &outcome);
-            Ok(output)
+            let completion = batch_completion(&outcome);
+            project_legacy(CommandResponse {
+                body: ResponseBody::Batch(BatchResponse::Resume(BatchResumeResponse {
+                    status: "resumed".to_owned(),
+                    recheck_budget: resume.recheck_budget,
+                    override_budget: resume.override_budget,
+                    counts: BatchCounts {
+                        tasks_updated: changed,
+                        tasks_executed: outcome.executed,
+                        tasks_attempted: outcome.attempted(),
+                        tasks_failed: outcome.failed,
+                        tasks_paused: outcome.paused,
+                        tasks_inflight: outcome.inflight,
+                        tasks_inflight_unreadable: outcome.held_unreadable,
+                    },
+                    error_code: batch_error_code(completion),
+                })),
+                completion,
+            })
         }
         Some(BatchCommand::Retry(retry_args)) => {
             // CL62-CL68/§M note-4: `--reset-violations <selector>` is a distinct
@@ -329,25 +323,23 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Value> 
                 retry_args.offline,
             )?;
             outcome.add(batch_poll_outcome);
-            let mut output = json!({
-                "status": "retry scheduled",
-                "tasks_updated": changed + incomplete_reenqueued,
-                "tasks_executed": outcome.executed,
-                // R9-7: surface driven online-send attempts and failures.
-                "tasks_attempted": outcome.attempted(),
-                "tasks_failed": outcome.failed,
-                // R11-2: pause transitions this pass (docs/04 §5.6 visibility).
-                "tasks_paused": outcome.paused,
-                // Batch lane (04 §5.8): see the Resume arm's `tasks_inflight`.
-                "tasks_inflight": outcome.inflight,
-                // Subset of the above that is held because the provider's
-                // response could not be READ. Non-zero = a fault to look at,
-                // not a job to wait for.
-                "tasks_inflight_unreadable": outcome.held_unreadable,
-            });
-            // R14-5: batch-owned error_code on the Partial(3)/Permanent(4) override.
-            apply_batch_exit_override(&mut output, &outcome);
-            Ok(output)
+            let completion = batch_completion(&outcome);
+            project_legacy(CommandResponse {
+                body: ResponseBody::Batch(BatchResponse::Retry(BatchRetryResponse {
+                    status: "retry scheduled".to_owned(),
+                    counts: BatchCounts {
+                        tasks_updated: changed + incomplete_reenqueued,
+                        tasks_executed: outcome.executed,
+                        tasks_attempted: outcome.attempted(),
+                        tasks_failed: outcome.failed,
+                        tasks_paused: outcome.paused,
+                        tasks_inflight: outcome.inflight,
+                        tasks_inflight_unreadable: outcome.held_unreadable,
+                    },
+                    error_code: batch_error_code(completion),
+                })),
+                completion,
+            })
         }
         Some(BatchCommand::Abandon(_)) => unreachable!("handled before polling"),
         None => Err(KioError::not_implemented("batch command")),
@@ -418,7 +410,7 @@ pub(crate) fn run_adapter_lifecycle(
 /// `kio adapter *`, this command is device-global — it does not operate on
 /// the current directory's `.kio` scope (there may not even be one), so it
 /// takes no `Repository::open_current()` and holds no `.kio/.lock` (the same
-/// device-global-read posture `stalled_batch_status_json` already has;
+/// device-global-read posture `stalled_batch_status` already has;
 /// unlike that function, this one also writes, but every write it makes
 /// funnels through the same CAS/savepoint-guarded primitives every other
 /// ledger writer uses, so no additional locking is needed here). Runnable
@@ -484,30 +476,25 @@ pub(crate) fn run_ledger_reconcile(
     // billing history lost from an older database never existed. This path
     // must never clear a history-loss gate or lower the durable checkpoint.
 
-    Ok(json!({
-        // `print_output`'s non-JSON fallback renders a one-line summary for
-        // any payload carrying a `status` string (06-cli-spec.md §4's own
-        // "human output = short summary" convention every other command
-        // here already follows).
-        "status": "reconciled",
-        "integrity": integrity,
-        "sync_settled": sync_settled,
-        "batch_found": batch_walk.found,
-        "batch_found_keys": batch_walk.found_keys,
-        "batch_settled_unknown": batch_walk.settled_unknown,
-        "batch_settled_unknown_keys": batch_walk.settled_unknown_keys,
-        "unlistable": batch_walk.unlistable,
-        "unlistable_keys": batch_walk.unlistable_keys,
-        // Additive beyond the QA14 design's minimum JSON shape (04 §5.8
-        // L1063-1066's "相 2b 未着手行は job 一覧照合の対象外" rows — reported,
-        // not silently dropped, since no upload-cleanup machinery exists yet
-        // to do anything else with them).
-        "phase2b_not_started": batch_walk.not_job_matchable,
-        "phase2b_not_started_keys": batch_walk.not_job_matchable_keys,
-        "orphans": orphan_walk.orphans,
-        "unknown": orphan_walk.unknown,
-        "unknown_uploads": orphan_walk.unknown_uploads,
-    }))
+    project_legacy(CommandResponse {
+        body: ResponseBody::Ledger(LedgerResponse::Reconcile(LedgerReconcileResponse {
+            status: "reconciled".to_owned(),
+            integrity,
+            sync_settled,
+            batch_found: batch_walk.found,
+            batch_found_keys: batch_walk.found_keys,
+            batch_settled_unknown: batch_walk.settled_unknown,
+            batch_settled_unknown_keys: batch_walk.settled_unknown_keys,
+            unlistable: batch_walk.unlistable,
+            unlistable_keys: batch_walk.unlistable_keys,
+            phase2b_not_started: batch_walk.not_job_matchable,
+            phase2b_not_started_keys: batch_walk.not_job_matchable_keys,
+            orphans: orphan_walk.orphans,
+            unknown: orphan_walk.unknown,
+            unknown_uploads: orphan_walk.unknown_uploads,
+        })),
+        completion: Completion::Complete,
+    })
 }
 
 /// `scope_id/adapter_kind/input_hash/tool_profile_hash` — the same 4-tuple
@@ -655,9 +642,9 @@ fn verified_local_scope_ids(control: &ControlHandle) -> BTreeSet<String> {
 }
 
 pub(crate) struct OrphanAttributionReport {
-    orphans: Vec<Value>,
-    pub(crate) unknown: Vec<Value>,
-    pub(crate) unknown_uploads: Vec<Value>,
+    orphans: Vec<OrphanJob>,
+    pub(crate) unknown: Vec<UnknownJob>,
+    pub(crate) unknown_uploads: Vec<UnknownUpload>,
 }
 
 /// QA15 design steps (d)+(e) — `kio ledger reconcile`'s orphan/unknown-
@@ -683,38 +670,28 @@ pub(crate) fn run_orphan_attribution_walk(
             }
             match &job.task_key {
                 Some(task_key) if verified_scopes.contains(&task_key.scope_id) => {
-                    orphans.push(json!({
-                        "job_id": job.job_id,
-                        "task_key": {
-                            "scope_id": task_key.scope_id,
-                            "adapter_kind": task_key.adapter_kind,
-                            "input_hash": task_key.input_hash,
-                            "tool_profile_hash": task_key.tool_profile_hash,
-                        },
-                        "guidance": {
-                            "result_fetch": "read-only-safe: fetching this job's result does not create new state",
-                            "deletion": "delete only after confirming no other Kio instance shares this provider scope",
-                        },
-                    }));
+                    orphans.push(OrphanJob { job_id: job.job_id.clone(), task_key: AttributionTaskKey { scope_id: task_key.scope_id.clone(), adapter_kind: task_key.adapter_kind.clone(), input_hash: task_key.input_hash.clone(), tool_profile_hash: task_key.tool_profile_hash.clone() }, guidance: OrphanGuidance { result_fetch: "read-only-safe: fetching this job's result does not create new state".to_owned(), deletion: "delete only after confirming no other Kio instance shares this provider scope".to_owned() } });
                 }
                 Some(task_key) => {
-                    unknown.push(json!({
-                        "job_id": job.job_id,
-                        "task_key": {
-                            "scope_id": task_key.scope_id,
-                            "adapter_kind": task_key.adapter_kind,
-                            "input_hash": task_key.input_hash,
-                            "tool_profile_hash": task_key.tool_profile_hash,
-                        },
-                        "reason": "task_key.scope_id is not a locally-verified registered scope",
-                    }));
+                    unknown.push(UnknownJob {
+                        job_id: job.job_id.clone(),
+                        task_key: Some(AttributionTaskKey {
+                            scope_id: task_key.scope_id.clone(),
+                            adapter_kind: task_key.adapter_kind.clone(),
+                            input_hash: task_key.input_hash.clone(),
+                            tool_profile_hash: task_key.tool_profile_hash.clone(),
+                        }),
+                        reason: "task_key.scope_id is not a locally-verified registered scope"
+                            .to_owned(),
+                    });
                 }
                 None => {
-                    unknown.push(json!({
-                        "job_id": job.job_id,
-                        "task_key": Value::Null,
-                        "reason": "job metadata carries no task_key (unreadable or absent)",
-                    }));
+                    unknown.push(UnknownJob {
+                        job_id: job.job_id.clone(),
+                        task_key: None,
+                        reason: "job metadata carries no task_key (unreadable or absent)"
+                            .to_owned(),
+                    });
                 }
             }
         }
@@ -728,10 +705,10 @@ pub(crate) fn run_orphan_attribution_walk(
                 None => false,
             };
             if !accounted_for {
-                unknown_uploads.push(json!({
-                    "upload_id": upload.upload_id,
-                    "filename_token": upload.filename_token,
-                }));
+                unknown_uploads.push(UnknownUpload {
+                    upload_id: upload.upload_id.clone(),
+                    filename_token: upload.filename_token.clone(),
+                });
             }
         }
     }
@@ -910,7 +887,14 @@ fn run_batch_abandon(ctx: &Invocation<'_>, selector_input: &str, yes: bool) -> R
         // CL66: no matching row (terminal-confirmed / device-row pruned /
         // already abandoned-and-cleaned / never existed) is an idempotent
         // exit-0 success — no confirmation prompt needed, nothing to abandon.
-        AbandonResolution::NotFound => Ok(json!({ "status": "no_target" })),
+        AbandonResolution::NotFound => project_legacy(CommandResponse {
+            body: ResponseBody::Batch(BatchResponse::Abandon(BatchSelectionResponse::NoTarget(
+                BatchNoTargetResponse {
+                    status: "no_target".to_owned(),
+                },
+            ))),
+            completion: Completion::Complete,
+        }),
         AbandonResolution::Ambiguous => Err(KioError::invalid_usage(
             "abandon selector is ambiguous (multiple tool_profile_hash rows match this \
              scope/adapter/input_hash) — specify the intent_token or the full 4-tuple",
@@ -925,15 +909,21 @@ fn run_batch_abandon(ctx: &Invocation<'_>, selector_input: &str, yes: bool) -> R
                 yes,
             )?;
             let execution = execute_abandon(&ledger, &key).map_err(pipeline_to_kio)?;
-            Ok(json!({
-                "status": match execution {
-                    AbandonExecution::NoTarget => "no_target",
-                    AbandonExecution::Abandoned => "abandoned",
-                },
-                "scope_id": key.scope_id,
-                "adapter_kind": key.adapter_kind,
-                "input_hash": key.input_hash,
-            }))
+            project_legacy(CommandResponse {
+                body: ResponseBody::Batch(BatchResponse::Abandon(
+                    BatchSelectionResponse::Selected(BatchSelectedResponse {
+                        status: (match execution {
+                            AbandonExecution::NoTarget => "no_target",
+                            AbandonExecution::Abandoned => "abandoned",
+                        })
+                        .to_owned(),
+                        scope_id: key.scope_id,
+                        adapter_kind: key.adapter_kind,
+                        input_hash: key.input_hash,
+                    }),
+                )),
+                completion: Completion::Complete,
+            })
         }
     }
 }
@@ -948,7 +938,14 @@ fn run_batch_reset_violations(
     let ledger = open_ledger_db(ctx.control)?;
     let resolution = resolve_abandon_selector(&ledger, &selector).map_err(pipeline_to_kio)?;
     match resolution {
-        AbandonResolution::NotFound => Ok(json!({ "status": "no_target" })),
+        AbandonResolution::NotFound => project_legacy(CommandResponse {
+            body: ResponseBody::Batch(BatchResponse::ResetViolations(
+                BatchSelectionResponse::NoTarget(BatchNoTargetResponse {
+                    status: "no_target".to_owned(),
+                }),
+            )),
+            completion: Completion::Complete,
+        }),
         AbandonResolution::Ambiguous => Err(KioError::invalid_usage(
             "--reset-violations selector is ambiguous (multiple tool_profile_hash rows match \
              this scope/adapter/input_hash) — specify the intent_token or the full 4-tuple",
@@ -966,12 +963,17 @@ fn run_batch_reset_violations(
             // the SQL) is a no-op success; only a terminal, non-zero-count row
             // actually changes.
             let did_reset = reset_contract_violations(&ledger, &key).map_err(pipeline_to_kio)?;
-            Ok(json!({
-                "status": if did_reset { "reset" } else { "unchanged" },
-                "scope_id": key.scope_id,
-                "adapter_kind": key.adapter_kind,
-                "input_hash": key.input_hash,
-            }))
+            project_legacy(CommandResponse {
+                body: ResponseBody::Batch(BatchResponse::ResetViolations(
+                    BatchSelectionResponse::Selected(BatchSelectedResponse {
+                        status: (if did_reset { "reset" } else { "unchanged" }).to_owned(),
+                        scope_id: key.scope_id,
+                        adapter_kind: key.adapter_kind,
+                        input_hash: key.input_hash,
+                    }),
+                )),
+                completion: Completion::Complete,
+            })
         }
     }
 }
@@ -994,7 +996,14 @@ fn run_batch_resend_unknown(
         AbandonResolution::Found(key) => key,
         other => {
             return match other {
-                AbandonResolution::NotFound => Ok(json!({ "status": "no_target" })),
+                AbandonResolution::NotFound => project_legacy(CommandResponse {
+                    body: ResponseBody::Batch(BatchResponse::ResendUnknown(
+                        BatchResendResponse::NoTarget(BatchNoTargetResponse {
+                            status: "no_target".to_owned(),
+                        }),
+                    )),
+                    completion: Completion::Complete,
+                }),
                 AbandonResolution::Ambiguous => Err(KioError::invalid_usage(
                     "--resend-unknown selector is ambiguous; specify the intent_token or full 4-tuple",
                 )),
@@ -1109,16 +1118,12 @@ fn run_batch_resend_unknown(
             true
         })
         .map_err(pipeline_to_kio)?;
-    Ok(json!({
-        "status": "resend_authorized",
-        "authorization_created": newly_authorized,
-        "tasks_queued": queued,
-        "scope_id": key.scope_id,
-        "adapter_kind": key.adapter_kind,
-        "input_hash": key.input_hash,
-        "next_step": "run an explicit online resume; it will perform a fresh reservation and current policy, grant, and budget checks before any provider request",
-        "warning": "the prior synchronous request may already have been charged",
-    }))
+    project_legacy(CommandResponse { body: ResponseBody::Batch(BatchResponse::ResendUnknown(BatchResendResponse::Authorized(BatchResendAuthorizedResponse {
+        status: "resend_authorized".to_owned(), authorization_created: newly_authorized, tasks_queued: queued,
+        scope_id: key.scope_id, adapter_kind: key.adapter_kind, input_hash: key.input_hash,
+        next_step: "run an explicit online resume; it will perform a fresh reservation and current policy, grant, and budget checks before any provider request".to_owned(),
+        warning: "the prior synchronous request may already have been charged".to_owned(),
+    }))), completion: Completion::Complete })
 }
 
 /// Resolve the sole current embedding content group attached to a result-unknown
@@ -1227,10 +1232,10 @@ fn current_embedding_unknown_group_task_ids(
 /// `kio status`'s stalled-batch section (CL37/CL68): permanently-unresolvable
 /// `batch_requests` rows (settled but residue cleanup still pending), each with
 /// its `intent_token` so it can be passed straight to `kio batch abandon`.
-pub(crate) fn stalled_batch_status_json(
+pub(crate) fn stalled_batch_status(
     ledger: Option<&LedgerReadSnapshot>,
     control: &ControlHandle,
-) -> Result<Vec<Value>> {
+) -> Result<Vec<StalledBatchStatus>> {
     let Some(ledger) = ledger else {
         return Ok(Vec::new());
     };
@@ -1245,16 +1250,16 @@ pub(crate) fn stalled_batch_status_json(
                 .intent_token
                 .as_deref()
                 .and_then(uuid_v7_timestamp_millis);
-            json!({
-                "scope_id": row.key.scope_id,
-                "adapter_kind": row.key.adapter_kind,
-                "input_hash": row.key.input_hash,
-                "tool_profile_hash": row.key.tool_profile_hash,
-                "intent_token": row.intent_token,
-                "error": row.error,
-                "estimated_usd": row.estimated_usd,
-                "issued_at_ms": issued_at_ms,
-            })
+            StalledBatchStatus {
+                scope_id: row.key.scope_id,
+                adapter_kind: row.key.adapter_kind,
+                input_hash: row.key.input_hash,
+                tool_profile_hash: row.key.tool_profile_hash,
+                intent_token: row.intent_token,
+                error: row.error,
+                estimated_usd: row.estimated_usd,
+                issued_at_ms,
+            }
         })
         .collect())
 }

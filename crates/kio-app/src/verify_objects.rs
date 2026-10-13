@@ -3467,7 +3467,9 @@ fn commit_roots(repo: &Repository, state: &mut State) -> Result<BTreeSet<String>
 mod prune_orphans;
 #[cfg(test)]
 use prune_orphans::PruneOrphansPlan;
-pub use prune_orphans::{prune_orphans_apply, prune_orphans_plan, prune_orphans_preflight};
+pub use prune_orphans::{
+    PruneOrphansReport, prune_orphans_apply, prune_orphans_plan, prune_orphans_preflight,
+};
 
 // ===========================================================================
 // `kio repair registry-prune` (step4b-contract-tests-p2b.md §H, U46,

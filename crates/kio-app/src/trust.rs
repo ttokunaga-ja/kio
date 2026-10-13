@@ -5,6 +5,8 @@
 //! snapshot before its record is published; an interrupted rotation therefore
 //! leaves either the prior active record or a fully durable new snapshot.
 
+use crate::response::adapter::*;
+use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
 use std::path::{Path, PathBuf};
 
 #[cfg(test)]
@@ -41,7 +43,7 @@ pub(crate) enum TrustStatus {
 /// material or a source path supplied by the user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct TrustRecord {
+pub struct TrustRecord {
     version: u8,
     generation: u64,
     status: TrustStatus,
@@ -709,27 +711,24 @@ pub(crate) fn run(
                 args.resume.as_deref(),
                 control,
             )?;
-            Ok(record_value(
+            record_value(
                 if args.preview {
                     "preview"
                 } else {
                     "registered"
                 },
                 Some(record),
-            ))
+            )
         }
         TrustCommand::Rotate(args) => {
             validate_confirmation(args.preview, args.yes)?;
             let record = rotate(trust_directory, &args.ca_pem, args.preview, control)?;
-            Ok(record_value(
+            record_value(
                 if args.preview { "preview" } else { "rotated" },
                 Some(record),
-            ))
+            )
         }
-        TrustCommand::Revoke => Ok(record_value(
-            "revoked",
-            revoke(trust_directory, false, control)?,
-        )),
+        TrustCommand::Revoke => record_value("revoked", revoke(trust_directory, false, control)?),
         TrustCommand::Status => status_value(trust_directory, control),
     }
 }
@@ -745,26 +744,41 @@ fn validate_confirmation(preview: bool, yes: bool) -> Result<()> {
 
 fn status_value(trust_directory: &Path, control: &ControlHandle) -> Result<serde_json::Value> {
     let Some(directory) = crate::private_state::open_readonly(trust_directory, control)? else {
-        return Ok(record_value("status", None));
+        return record_value("status", None);
     };
     let record = read_record_from(&directory)?;
     let pending = read_pending_from(&directory)?;
     match (record, pending) {
-        (_, Some(pending)) => Ok(json!({
-            "operation": "status",
-            "trust": "registration_pending",
-            "registration_id": pending.registration_id,
-        })),
-        (Some(record), None) => Ok(record_value("status", Some(record))),
+        (_, Some(pending)) => project_legacy(CommandResponse {
+            body: ResponseBody::Adapter(AdapterResponse::Trust(TrustResponse::Pending(
+                TrustPendingResponse {
+                    operation: "status".to_owned(),
+                    trust: "registration_pending".to_owned(),
+                    registration_id: pending.registration_id,
+                },
+            ))),
+            completion: Completion::Complete,
+        }),
+        (Some(record), None) => record_value("status", Some(record)),
         (None, None) => Err(missing_record()),
     }
 }
 
-fn record_value(operation: &str, record: Option<TrustRecord>) -> serde_json::Value {
-    match record {
-        Some(record) => json!({ "operation": operation, "trust": record }),
-        None => json!({ "operation": operation, "trust": "unregistered" }),
-    }
+fn record_value(operation: &str, record: Option<TrustRecord>) -> Result<serde_json::Value> {
+    let response = match record {
+        Some(record) => TrustResponse::Record(TrustRecordResponse {
+            operation: operation.to_owned(),
+            trust: record,
+        }),
+        None => TrustResponse::Unregistered(TrustUnregisteredResponse {
+            operation: operation.to_owned(),
+            trust: "unregistered".to_owned(),
+        }),
+    };
+    project_legacy(CommandResponse {
+        body: ResponseBody::Adapter(AdapterResponse::Trust(response)),
+        completion: Completion::Complete,
+    })
 }
 
 #[cfg(test)]

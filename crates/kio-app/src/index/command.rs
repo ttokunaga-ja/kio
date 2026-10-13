@@ -67,7 +67,7 @@ use crate::search::scope::SearchedScopeInfo;
 use crate::search::scope::current_embedding_policy;
 use crate::settings::user_config_toml_path;
 use crate::settings::validate_repo_tool_lock;
-use crate::task_execution::enrichment_exit_override;
+use crate::task_execution::enrichment_completion;
 use crate::task_execution::scope_budget_warning;
 use crate::task_execution::task_retry_allowed;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
@@ -534,11 +534,9 @@ fn run_index_for_repo_inner(
         child_scopes: None,
         child_scope_discovery: None,
     };
-    let mut completion = match enrichment_exit_override(&enrichment) {
-        Some(ExitCode::AuthError) => Completion::AuthRequired,
-        Some(ExitCode::BudgetExceeded) => Completion::BudgetBlocked,
-        _ if index_result.failed_files > 0 => Completion::Partial,
-        _ => Completion::Complete,
+    let mut completion = match enrichment_completion(&enrichment) {
+        Completion::Complete if index_result.failed_files > 0 => Completion::Partial,
+        completion => completion,
     };
     // This scope's publication and projection are complete. Enrollment takes
     // its own retained parent lock, so holding the indexing lock while entering
@@ -1495,7 +1493,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // LC42-LC44 (item 2), same ordering rationale as `run_index`'s call.
     recover_index_generation(repo.kio_dir(), repo.control())?;
     // R17-2: fold the re-normalization loop's skips into the rebuild report so the one
-    // `attach_skipped_units` disclosure below covers both phases. Dedup by raw_hash: a
+    // `skipped_disclosure` disclosure below covers both phases. Dedup by raw_hash: a
     // skipped document whose kept previous gen is ALSO unloadable is already reported by
     // the rebuild above; this appends only reindex-only skips (e.g. a corrupt non-`Done`
     // unit whose healthy `Done` units still let the rebuild serve the document).
@@ -1529,11 +1527,7 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
         paused_tasks: enrichment.paused,
         skipped: skipped_disclosure(&report, repo.kio_dir()),
     };
-    let completion = match enrichment_exit_override(&enrichment) {
-        Some(ExitCode::AuthError) => Completion::AuthRequired,
-        Some(ExitCode::BudgetExceeded) => Completion::BudgetBlocked,
-        _ => Completion::Complete,
-    };
+    let completion = enrichment_completion(&enrichment);
     Ok(ReindexExecution {
         response: ReindexResponse::Head(response),
         completion,
