@@ -19,7 +19,6 @@ use crate::scope_access::preflight_barrier_and_index;
 use crate::scope_access::resolve_evidence_scope_target;
 use crate::scope_access::unresolvable_commit_pointer_error;
 use crate::search::scope::ScopeTarget;
-use crate::task_execution::set_exit_override;
 use kio_core::ExitCode;
 use kio_core::control::ControlHandle;
 use kio_index::fts::ExistingSourceIndexOpenMode;
@@ -58,7 +57,10 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 mod evidence_batch;
+mod response;
 mod retarget;
+
+use response::{EvidenceStatus, EvidenceVerification};
 
 use evidence_batch::run_evidence_batch;
 use retarget::run_evidence_retarget;
@@ -104,66 +106,6 @@ fn exact_pinned_content_unit_for_chunk<'a>(
         .ok_or(ChunkPinnedUnitError::IdentityMismatch)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum EvidenceStatus {
-    Alive,
-    Tombstoned,
-    NotFound,
-    ScopeUnreachable,
-    Unverifiable,
-    RegistryDuplicate,
-}
-
-impl EvidenceStatus {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Alive => "alive",
-            Self::Tombstoned => "tombstoned",
-            Self::NotFound => "not_found",
-            Self::ScopeUnreachable => "scope_unreachable",
-            Self::Unverifiable => "unverifiable",
-            Self::RegistryDuplicate => "registry_duplicate",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct EvidenceVerifyResult {
-    status: EvidenceStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error_code: Option<String>,
-    details: Value,
-}
-
-#[derive(Debug, Clone)]
-struct EvidenceVerification {
-    result: EvidenceVerifyResult,
-    exit: ExitCode,
-}
-
-impl EvidenceVerification {
-    fn new(
-        status: EvidenceStatus,
-        error_code: Option<&str>,
-        details: Value,
-        exit: ExitCode,
-    ) -> Self {
-        Self {
-            result: EvidenceVerifyResult {
-                status,
-                error_code: error_code.map(str::to_owned),
-                details,
-            },
-            exit,
-        }
-    }
-
-    fn value(&self) -> Result<Value> {
-        serde_json::to_value(&self.result).map_err(|error| KioError::schema(error.to_string()))
-    }
-}
-
 const MAX_BATCH_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_BATCH_LINE_BYTES: usize = 64 * 1024;
 const MAX_BATCH_RECORDS: usize = 4096;
@@ -201,11 +143,7 @@ fn run_evidence_verify(
     let (verification, _) = kio_core::cas::VerifiedCasReadBudget::new().run(u64::MAX, |reads| {
         verify_pointer_for_cli(ctx, registry_input, &pointer, strict, reads)
     })?;
-    let mut output = verification.value()?;
-    if verification.exit != ExitCode::Success {
-        set_exit_override(&mut output, verification.exit);
-    }
-    Ok(output)
+    response::verification_output(verification)
 }
 
 fn verify_batch_row(
