@@ -4,9 +4,13 @@ use std::path::Path;
 
 use kio_core::cas::{hash_bytes, read_bounded_regular_file};
 use kio_core::{ExitCode, Result};
-use serde_json::{Value, json};
+use serde_json::Value;
 
-use crate::task_execution::set_exit_override;
+use crate::response::evidence::{
+    EvidenceBatchResponse, EvidenceBatchRow, EvidenceBatchSummary, EvidenceResponse,
+    EvidenceStatusCounts, batch_completion,
+};
+use crate::response::{CommandResponse, ResponseBody, project_legacy};
 
 use super::{
     EvidenceVerification, MAX_BATCH_INPUT_BYTES, MAX_BATCH_VERIFIED_BYTES, batch_limit_error,
@@ -47,25 +51,14 @@ pub(super) fn run_evidence_batch(
             }
             Ok(verifications)
         })?;
-    let mut counts = BTreeMap::<&str, usize>::new();
-    for key in [
-        "alive",
-        "tombstoned",
-        "not_found",
-        "scope_unreachable",
-        "unverifiable",
-        "registry_duplicate",
-    ] {
-        counts.insert(key, 0);
-    }
+    let mut counts = EvidenceStatusCounts::default();
     let mut permanent = false;
     let mut retryable = false;
     let results = verifications
         .iter()
         .enumerate()
         .map(|(index, verification)| {
-            let status = verification.result.status.as_str();
-            *counts.get_mut(status).expect("closed status set") += 1;
+            counts.record(verification.result.status);
             if strict {
                 match verification.exit {
                     ExitCode::PermanentFailure => permanent = true,
@@ -75,27 +68,25 @@ pub(super) fn run_evidence_batch(
             } else if verification.exit == ExitCode::PartialFailure {
                 retryable = true;
             }
-            json!({"line": index + 1, "result": verification.result})
+            EvidenceBatchRow {
+                line: index + 1,
+                result: verification.result.clone(),
+            }
         })
         .collect::<Vec<_>>();
-    let mut output = json!({
-        "schema": "kio.evidence.batch-verify",
-        "schema_version": 1,
-        "input_sha256": input_sha256,
-        "strict": strict,
-        "results": results,
-        "summary": {"total": pointers.len(), "status_counts": counts},
-        "verified_count": pointers.len(),
-    });
-    let exit = if strict && permanent {
-        ExitCode::PermanentFailure
-    } else if retryable {
-        ExitCode::PartialFailure
-    } else {
-        ExitCode::Success
-    };
-    if exit != ExitCode::Success {
-        set_exit_override(&mut output, exit);
-    }
-    Ok(output)
+    project_legacy(CommandResponse {
+        body: ResponseBody::Evidence(EvidenceResponse::Batch(EvidenceBatchResponse {
+            schema: "kio.evidence.batch-verify".to_owned(),
+            schema_version: 1,
+            input_sha256,
+            strict,
+            results,
+            summary: EvidenceBatchSummary {
+                total: pointers.len(),
+                status_counts: counts,
+            },
+            verified_count: pointers.len(),
+        })),
+        completion: batch_completion(strict, permanent, retryable),
+    })
 }

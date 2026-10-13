@@ -57,7 +57,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 mod evidence_batch;
-mod response;
+pub(crate) mod response;
 mod retarget;
 
 use response::{EvidenceStatus, EvidenceVerification};

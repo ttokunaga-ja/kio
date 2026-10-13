@@ -9,6 +9,8 @@ use crate::open_view::check_publication_and_association_on_connection;
 use crate::open_view::parse_object_uri;
 use crate::open_view::parse_pointer_text;
 use crate::open_view::read_pointer_input;
+use crate::response::evidence::{EvidenceResponse, EvidenceRetargetResponse};
+use crate::response::{CommandResponse, Completion, ResponseBody, project_legacy};
 use crate::scope_access::is_store_not_found;
 use crate::scope_access::unresolvable_commit_pointer_error;
 use kio_core::ExitCode;
@@ -135,7 +137,12 @@ pub(super) fn run_evidence_retarget(
         .run(MAX_RETARGET_VERIFIED_BYTES, |reads| {
             run_evidence_retarget_bound(ctx, registry_input, &pointer, &args.at, reads)
         })
-        .map(|(value, _)| value)
+        .and_then(|(body, _)| {
+            project_legacy(CommandResponse {
+                body: ResponseBody::Evidence(EvidenceResponse::Retarget(Box::new(body))),
+                completion: Completion::Complete,
+            })
+        })
         .map_err(|error| {
             if matches!(
                 error.error_code(),
@@ -154,7 +161,7 @@ fn run_evidence_retarget_bound(
     pointer: &EvidencePointer,
     at: &str,
     reads: &kio_core::cas::VerifiedCasReadCapability,
-) -> Result<Value> {
+) -> Result<EvidenceRetargetResponse> {
     let binding = bind_evidence_scope(ctx, registry_input, pointer, true, reads)?;
     let EvidenceScopeState::Ready {
         target,
@@ -392,11 +399,15 @@ fn run_evidence_retarget_bound(
     if verification.result.status != EvidenceStatus::Alive {
         return Err(retarget_not_found_error());
     }
-    Ok(json!({
-        "schema": "kio.evidence.retarget", "schema_version": 1, "status": "retargeted",
-        "target_commit": at, "retargeted_from": pointer, "new_pointer": issued,
-        "match_method": "heading_path_exact",
-    }))
+    Ok(EvidenceRetargetResponse {
+        schema: "kio.evidence.retarget".to_owned(),
+        schema_version: 1,
+        status: "retargeted".to_owned(),
+        target_commit: at.to_owned(),
+        retargeted_from: pointer.clone(),
+        new_pointer: issued,
+        match_method: "heading_path_exact".to_owned(),
+    })
 }
 
 /// Read `--at` as exactly one commit object. A missing hash or an object from

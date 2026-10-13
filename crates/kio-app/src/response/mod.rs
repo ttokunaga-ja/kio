@@ -5,6 +5,7 @@ use serde_json::Value;
 pub mod adapter;
 pub mod batch;
 pub mod device;
+pub mod evidence;
 pub mod gc;
 pub mod history;
 pub mod index;
@@ -50,6 +51,7 @@ pub enum ResponseBody {
     Reindex(reindex::ReindexResponse),
     Gc(gc::GcResponse),
     Init(device::InitResponse),
+    Evidence(evidence::EvidenceResponse),
     RootRegister(device::RootRegisterResponse),
     Snapshot(snapshot::SnapshotResponse),
     Log(history::LogResponse),
