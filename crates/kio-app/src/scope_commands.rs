@@ -14,17 +14,16 @@ use crate::response::Completion;
 use crate::response::ResponseBody;
 use crate::response::device::InitResponse;
 use crate::response::project_legacy;
+use crate::response::status::StatusResponse;
 use crate::scope_access::register_scope;
 use crate::settings::validate_repo_tool_lock;
-use crate::task_execution::budget_status_json;
+use crate::task_execution::budget_status;
 use crate::task_execution::paused_tasks_by_hold_reason;
-use kio_core::KioError;
 use kio_core::Result;
 use kio_core::purge::PurgeState;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::unsupported::UnsupportedInputStore;
 use serde_json::Value;
-use serde_json::json;
 
 pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result<Value> {
     let working_directory = ctx.cwd().to_path_buf();
@@ -104,39 +103,42 @@ pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<Value> {
     };
     let tasks = task_store.all().map_err(pipeline_to_kio)?;
     let ledger_snapshot = open_search_budget_snapshot(&ledger_db_path(ctx.control), ctx.control)?;
-    Ok(json!({
-        "scope_path": repo.kio_dir(),
-        "files": status.files,
-        "head_shallow": status.head_shallow,
-        // QA4 (step4b-contract-tests-p3a.md §A, 10 §1 L117): the
-        // paused-task count broken down by hold_reason (budget/auth/
-        // tier_b_approval), alongside the raw task list callers
-        // previously had to filter client-side themselves.
-        "paused_by_hold_reason": paused_tasks_by_hold_reason(&tasks),
-        "tasks": tasks,
-        "quarantine": quarantine_status_records(&repo)?,
-        "unsupported_inputs": unsupported_inputs,
-        "unsupported_inputs_complete": unsupported_inputs_complete,
-        "budget": budget_status_json(&repo, ledger_snapshot.as_ref())?,
-        // CL37/CL68: permanently-stalled (settled but residue-cleanup-
-        // pending) cost-ledger.sqlite batch_requests rows, device-global
-        // — not scoped to this folder, since the ledger itself is not.
-        "stalled_batch": stalled_batch_status(ledger_snapshot.as_ref(), ctx.control)?,
-        // 05 §3.5 / LC51: `status` is the one read command the §I barrier
-        // does NOT reject on an active journal — it shows the journal as
-        // state instead, for recovery visibility into a crashed purge.
-        "active_purge_journal": PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?
-            .read_journal()?
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|err| KioError::schema(err.to_string()))?,
-        // GC has its own durable recovery marker.  As with purge,
-        // status exposes it rather than attempting recovery or
-        // collapsing an interrupted destructive operation into a
-        // normal healthy state.
-        "active_gc_sweep": kio_core::gc::read_active_marker_with_control(repo.kio_dir(), repo.control())?
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|err| KioError::schema(err.to_string()))?,
-    }))
+    project_legacy(CommandResponse {
+        body: ResponseBody::Status(Box::new(StatusResponse {
+            scope_path: repo.kio_dir().to_path_buf(),
+            files: status.files,
+            head_shallow: status.head_shallow,
+            // QA4 (step4b-contract-tests-p3a.md §A, 10 §1 L117): the
+            // paused-task count broken down by hold_reason (budget/auth/
+            // tier_b_approval), alongside the raw task list callers
+            // previously had to filter client-side themselves.
+            paused_by_hold_reason: paused_tasks_by_hold_reason(&tasks),
+            tasks,
+            quarantine: quarantine_status_records(&repo)?,
+            unsupported_inputs,
+            unsupported_inputs_complete,
+            budget: budget_status(&repo, ledger_snapshot.as_ref())?,
+            // CL37/CL68: permanently-stalled (settled but residue-cleanup-
+            // pending) cost-ledger.sqlite batch_requests rows, device-global
+            // — not scoped to this folder, since the ledger itself is not.
+            stalled_batch: stalled_batch_status(ledger_snapshot.as_ref(), ctx.control)?,
+            // 05 §3.5 / LC51: `status` is the one read command the §I barrier
+            // does NOT reject on an active journal — it shows the journal as
+            // state instead, for recovery visibility into a crashed purge.
+            active_purge_journal: PurgeState::open_with_control(
+                repo.kio_dir(),
+                repo.control().clone(),
+            )?
+            .read_journal()?,
+            // GC has its own durable recovery marker.  As with purge,
+            // status exposes it rather than attempting recovery or
+            // collapsing an interrupted destructive operation into a
+            // normal healthy state.
+            active_gc_sweep: kio_core::gc::read_active_marker_with_control(
+                repo.kio_dir(),
+                repo.control(),
+            )?,
+        })),
+        completion: Completion::Complete,
+    })
 }

@@ -16,6 +16,7 @@ pub mod repair;
 pub mod search;
 pub mod skipped_units;
 pub mod snapshot;
+pub mod status;
 pub mod watch;
 
 #[derive(Debug)]
@@ -36,6 +37,7 @@ pub enum Completion {
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub enum ResponseBody {
+    Status(Box<status::StatusResponse>),
     Export(mutation::ExportResponse),
     Restore(mutation::RestoreResponse),
     Purge(mutation::PurgeResponse),
@@ -103,3 +105,6 @@ mod c3d_tests;
 
 #[cfg(test)]
 mod mutation_watch_tests;
+
+#[cfg(test)]
+mod status_tests;

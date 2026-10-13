@@ -53,6 +53,7 @@ use crate::online_task::targets_standard_online_markdownize;
 use crate::promotion::finish_pending_online_promotion;
 use crate::promotion::promote_completed_online_markdownize;
 use crate::promotion::recover_pending_online_promotion;
+use crate::response::status::{BudgetStatusResponse, PausedTasksByHoldReason};
 use crate::settings::bbox_annotation_enabled;
 use crate::settings::user_config_toml_path;
 use kio_adapter::catalog::active_local_ocr_execution_with_control;
@@ -1314,7 +1315,7 @@ pub(crate) fn media_type_for_cli_path(path: &Path) -> &'static str {
 /// A current task record always stamps one matching reason for a paused task,
 /// so the three named buckets always appear (even at 0) and there is no
 /// compatibility/unknown bucket.
-pub(crate) fn paused_tasks_by_hold_reason(tasks: &[TaskDescriptor]) -> Value {
+pub(crate) fn paused_tasks_by_hold_reason(tasks: &[TaskDescriptor]) -> PausedTasksByHoldReason {
     let mut budget = 0u64;
     let mut auth = 0u64;
     let mut tier_b_approval = 0u64;
@@ -1331,12 +1332,12 @@ pub(crate) fn paused_tasks_by_hold_reason(tasks: &[TaskDescriptor]) -> Value {
             None => unreachable!("TaskStore accepts only stamped paused tasks"),
         }
     }
-    json!({
-        "budget": budget,
-        "auth": auth,
-        "tier_b_approval": tier_b_approval,
-        "ledger_initialization_required": ledger_initialization_required,
-    })
+    PausedTasksByHoldReason {
+        budget,
+        auth,
+        tier_b_approval,
+        ledger_initialization_required,
+    }
 }
 
 /// R9-2: whether `media_type` is text-native (Markdown / plain text / code) — the
@@ -1350,10 +1351,10 @@ pub(crate) fn is_text_native_media(media_type: &str) -> bool {
     matches!(media_type, "text/markdown" | "text/plain" | "text/x-code")
 }
 
-pub(crate) fn budget_status_json(
+pub(crate) fn budget_status(
     repo: &Repository,
     ledger: Option<&LedgerReadSnapshot>,
-) -> Result<Value> {
+) -> Result<BudgetStatusResponse> {
     let caps = read_budget_policy(
         user_config_toml_path(repo.control()),
         repo.kio_dir().join("config.toml"),
@@ -1363,22 +1364,22 @@ pub(crate) fn budget_status_json(
     let month = utc_month(&now);
     let scope_id = repo.scope_identity()?.scope_id;
     let Some(ledger) = ledger else {
-        return Ok(json!({
-            "month": month,
-            "device_monthly_usd_cap": caps.device_monthly_usd_cap,
-            "folder_monthly_usd_cap": caps.folder_monthly_usd_cap,
-            "device_spent_usd": Value::Null,
-            "folder_spent_usd": Value::Null,
-            "device_remaining_usd": Value::Null,
-            "folder_remaining_usd": Value::Null,
-            "cap_kind": Value::Null,
-            "device_per_adapter": caps.device_per_adapter,
-            "hard_stop": caps.hard_stop,
-            "warn_at_percent": caps.warn_at_percent,
-            "warned": false,
-            "warning": Value::Null,
-            "ledger_status": "uninitialized",
-        }));
+        return Ok(BudgetStatusResponse {
+            month,
+            device_monthly_usd_cap: caps.device_monthly_usd_cap,
+            folder_monthly_usd_cap: caps.folder_monthly_usd_cap,
+            device_spent_usd: None,
+            folder_spent_usd: None,
+            device_remaining_usd: None,
+            folder_remaining_usd: None,
+            cap_kind: None,
+            device_per_adapter: caps.device_per_adapter,
+            hard_stop: caps.hard_stop,
+            warn_at_percent: caps.warn_at_percent,
+            warned: false,
+            warning: None,
+            ledger_status: Some("uninitialized".to_owned()),
+        });
     };
     let ledger_path = ledger_db_path(repo.control());
     let device_spent = ledger
@@ -1396,27 +1397,25 @@ pub(crate) fn budget_status_json(
     // F5: surface the non-blocking `warn_at_percent` warning and the active
     // policy (hard_stop / warn_at_percent) alongside the numbers.
     let warning = budget_warning(&caps, device_spent, folder_spent);
-    Ok(json!({
-        "month": month,
-        "device_monthly_usd_cap": caps.device_monthly_usd_cap,
-        "folder_monthly_usd_cap": caps.folder_monthly_usd_cap,
-        "device_spent_usd": device_spent,
-        "folder_spent_usd": folder_spent,
-        "device_remaining_usd": device_remaining,
-        "folder_remaining_usd": folder_remaining,
-        "cap_kind": match cap_kind {
-            BudgetCapKind::Device => "device",
-            BudgetCapKind::Folder => "folder",
-        },
-        "device_per_adapter": caps.device_per_adapter,
+    Ok(BudgetStatusResponse {
+        month,
+        device_monthly_usd_cap: caps.device_monthly_usd_cap,
+        folder_monthly_usd_cap: caps.folder_monthly_usd_cap,
+        device_spent_usd: Some(device_spent),
+        folder_spent_usd: Some(folder_spent),
+        device_remaining_usd: Some(device_remaining),
+        folder_remaining_usd: folder_remaining,
+        cap_kind: Some(cap_kind),
+        device_per_adapter: caps.device_per_adapter,
         // QA11 (step4b-contract-tests-p3a.md §D): folder per_adapter does not
         // exist (04 §5.4 — device-layer only), so `kio status` must not
         // present a constraint that is not real.
-        "hard_stop": caps.hard_stop,
-        "warn_at_percent": caps.warn_at_percent,
-        "warned": warning.is_some(),
-        "warning": warning,
-    }))
+        hard_stop: caps.hard_stop,
+        warn_at_percent: caps.warn_at_percent,
+        warned: warning.is_some(),
+        warning,
+        ledger_status: None,
+    })
 }
 
 /// F5: the current scope's non-blocking budget warning (or `None`), for embedding
@@ -1736,7 +1735,7 @@ fn matches_batch_override(_args: &IndexArgs) -> bool {
 /// send-time check-then-reserve (`reserve_or_reuse_task_charge`, which
 /// independently re-checks atomically inside its own `BEGIN IMMEDIATE` Tx — this
 /// function is for the READ-ONLY enqueue-time estimate, not a substitute for
-/// that atomicity), and the status/warning reports (`budget_status_json` /
+/// that atomicity), and the status/warning reports (`budget_status` /
 /// `scope_budget_warning`). `ledger_month_total` (CL59) already sums confirmed
 /// `cost_ledger` charges plus unterminated `batch_requests` reservations — the
 /// retired JSONL design's separate reclaim-ledger netting
