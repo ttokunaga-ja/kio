@@ -8481,12 +8481,12 @@ fn r23_materialized_embedding_completes_failed_task_without_charge() {
 }
 
 // ===========================================================================
-// R12-4: exit 3/5/6 __exit_code overrides and clap usage errors bypassed
+// R12-4: non-success completion exits 3/5/6 and clap usage errors bypassed
 // errors.jsonl, and a failed search dropped its per-search metrics.jsonl line —
 // the whole failure surface was invisible to the observability logs.
 // ===========================================================================
 
-// Enrichment auth failure (exit 5 via __exit_code) must now reach errors.jsonl.
+// Enrichment auth failure (process exit 5) must now reach errors.jsonl.
 #[test]
 fn r12_4_enrichment_auth_failure_reaches_errors_jsonl() {
     let dir = canonical_tempdir();
@@ -8511,7 +8511,7 @@ fn r12_4_enrichment_auth_failure_reaches_errors_jsonl() {
     );
 }
 
-// Multi-scope partial failure (exit 3 via __exit_code) must record the exclusion.
+// Multi-scope partial failure (process exit 3) must record the exclusion.
 #[cfg(unix)]
 #[test]
 fn r12_4_multi_scope_partial_records_exclusion_in_errors_jsonl() {

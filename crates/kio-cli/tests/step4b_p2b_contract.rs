@@ -97,11 +97,11 @@ fn run(dir: &TempDir, args: &[&str]) -> (i32, Value) {
     let output = kio(dir, args).arg("--json").output().unwrap();
     let code = output.status.code().unwrap();
     // A non-zero exit does NOT imply the JSON landed on stderr: several
-    // commands (`repair verify-objects` findings, search partial failure,
-    // this session's `evidence verify` status responses) succeed at the
-    // `run()` level and request a non-zero process exit via a private
-    // `__exit_code` marker while still printing their JSON body to STDOUT
-    // (main.rs's `take_exit_override`) — only a genuine `Err(KioError)`
+    // commands (`repair verify-objects` findings, partial search failure,
+    // and `evidence verify` status responses) serialize their response
+    // body to stdout while typed completion sets the process exit.
+    // The completion can select a nonzero process exit. For a genuine
+    // `Err(KioError)`, the JSON diagnostic
     // prints to stderr. Prefer whichever stream is non-empty.
     let stream: &[u8] = if !output.stdout.is_empty() {
         &output.stdout

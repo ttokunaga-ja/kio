@@ -250,7 +250,7 @@ fn json_failure<const N: usize>(dir: &TempDir, args: [&str; N], code: i32) -> Va
 /// R11-2/R11-3: a command that prints its full result JSON to STDOUT yet exits
 /// non-zero (batch 3/4/5/6, index partial 3) — the "result + nonzero exit" shape
 /// (05 §1.8 search parity), distinct from an Err envelope (stderr). Asserts the
-/// exit code and returns the stdout payload (with `__exit_code` already stripped).
+/// exit code and returns the serialized response body from stdout.
 fn json_code_stdout_with_env<const N: usize>(
     dir: &TempDir,
     args: [&str; N],
@@ -785,7 +785,7 @@ fn ct2_accept_008_full_fallback_failure_is_per_candidate_partial_exit() {
     )
     .unwrap();
     // R11-3: a partial index now prints its full result JSON to stdout with a
-    // top-level `error_code` + `__exit_code:3` (search parity), not an Err envelope
+    // top-level `error_code` with process exit 3 (search parity), not an Err envelope
     // that buried `failed_files`/`commit_hash` inside a private `context.output`.
     let output = json_code_stdout_with_env(
         &dir,

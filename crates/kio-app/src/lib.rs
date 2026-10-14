@@ -48,6 +48,7 @@ mod open_view;
 mod search;
 
 mod invocation;
+pub use invocation::non_success_error_code;
 mod repair_command;
 mod scope_access;
 mod scope_commands;
