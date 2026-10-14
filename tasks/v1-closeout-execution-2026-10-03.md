@@ -1460,3 +1460,112 @@ pathが変わった141件は対応表で照合し、名前・種類・期待値�
 - 証跡はrepo外の `~/Documents/Codex/2026-10-08/kio-r2/` にある（`runs/` に各段階の指示・イベント・最終報告・証跡、
   `wip/` にWIPの指紋）。Macの未追跡WIP 128件はR2開始前の指紋と一致し、各段階の前後でも変わらなかった。
 - 照合用のcheckoutはWSLとWindowsの `r2-platform` に残した。
+
+## 29. R3: kio-appの分解と型付きAPI
+
+2026-10-14 JST記録。`f2140ee8` から34 commitで行った（最終 `284c8363…`、tree `948f93b7475a2296ef8586544a4f4b0982f2a602`、
+248 file、+57,606 / −39,661行）。うち2 commitは計画の追記（型付きAPIとthread-localの範囲 `0aa5f0b8`、共通上限の扱い
+`3012855f`）、1 commitは利用者の`.gitignore`（`06c21978`、mainの`abfe6c9b`と同じ内容）である。
+
+段階は次のとおり。各段階の候補は振る舞いを変えない。
+
+1. **保護4ファイルからの移動。** R4で分割する`scope.rs`・`cas.rs`・`core/gc.rs`・`verify_objects.rs`を増やさないため、
+   R3が触る部分（storeのlock管理、CAS読取予算、GCの観測読取と構築、Evidenceのbatchとretarget）を先に別moduleへ移した。
+2. **engineのthread-localの除去。** 実行context、adapter設定、debug/test制御、lockの再入管理（`LockSession`）、CAS読取予算、
+   SQLite VFSの状態（Linux・Windowsとも接続ごとのowner）、test seamを、明示引数か操作・接続が所有するfieldに置き換えた。
+   残るthread-localはengine外の2件（CLI試験の隔離HOME、評価toolの故障注入）である。
+3. **`lib.rs`の分割。** inlineのdispatch腕をhandlerへ出した後、invocation・設定・小コマンド、search・projection・open/view・
+   index storage、indexing・embedding・markdownize・batchを各moduleへ移した。`lib.rs`は21,289行から178行になり、
+   module宣言、`execute`、plain dispatchだけが残る。
+4. **型付きresponse。** コマンド群ごとに`response/`の型を作り、既存のdomain型を再利用した。各群は先にprojection
+   goldenを書き、型付きpayloadのJSONが旧builderの出力とValue・byteの両方で一致することを確かめてから置き換えた。
+5. **CLIでのJSON化と終了コード。** `kio_app::execute`は`CommandResponse { body, completion }`を返し、CLIが
+   `serde_json::to_value`で一度だけJSON化して、`Completion`を終了コード0/3/4/5/6へ写す。`__exit_code`、その
+   peek/take/set、移行用の一時glue、旧builderを削除した。`Err(KioError)`と`exit_code()`は変えていない。
+6. **共通上限の引き上げ。** [09 §3](../docs/09-mvp-scope.md) の上限と`kio-ci`の定数を、最終実測から106,000行にした
+   （`284c8363`、2026-10-10の利用者判断による）。
+
+移動のcommitでは、移動前後の字句の一致と、候補がrawの編集をrustfmtした結果とbyte一致することを確かめた。
+
+計測（`kio-code-limits`、Mac・WSL・Windows MSVCの出力がバイト一致、SHA-256 `40d8b5d8…a820`）:
+
+| 区分 | R2終了時 | R3終了時 | 上限 |
+|---|---:|---:|---:|
+| OS共通の製品ロジック | 98,084 | 105,725 | 106,000 |
+| Windows | 11,720 | 11,807 | 14,000 |
+| Unix | 6,549 | 6,644 | 9,000 |
+| Linux | 3,241 | 3,278 | 4,000 |
+| macOS | 1,789 | 1,806 | 3,000 |
+| 検証tooling | 63,365 | 63,365 | 65,000 |
+| 共通ロジック内のOS条件 | 0 | 0 | 許可リスト0 |
+
+- 共通ロジックの増加は、型付きresponse（kio-app +5,557行）と、明示した実行context・lock session・読取予算等
+  （kio-core +1,421行、kio-index +350行ほか）による。responseをJSON値の包みにして行数を減らすことはしなかった。
+- 1ファイルの上限超過は4本で、R4で扱う。`kio-core/src/scope.rs` 4,661、`cas.rs` 3,924、`gc.rs` 3,800、
+  `kio-app/src/verify_objects.rs` 3,315行で、いずれもR2終了時の値以下である。計測の終了値1は、この4本だけによる。
+  R3で新設・増加した計数対象の177ファイルは、すべて3,000行以下である。
+
+終了検証（最終tree、Rust 1.98.0）。3 OSとも`fmt --all -- --check`、`clippy --workspace --all-targets --locked -- -D warnings`、
+`test --workspace --all-targets --locked`、`build --release --workspace --locked` のcargo実exitが0で、release buildに
+warningはなく、`Cargo.lock` は変わらなかった。
+
+| OS | test結果（libtest summary合計） | test所要 | libtest一覧 |
+|---|---|---|---|
+| macOS | 101 summary、3,500 pass / 0 fail / 0 ignored | 32.9分 | 90 target / 3,489件 |
+| Linux (WSL) | 104 summary、3,515 pass / 0 fail / 1 ignored | 13.0分 | 90 target / 3,502件 |
+| Windows 11 (MSVC) | 98 summary、3,196 pass / 0 fail / 1 ignored | 45.0分 | 90 target / 3,189件 |
+
+Windowsの初回のtestでは `tls_loopback_proxy_forwards_only_the_bounded_contract` がHTTP 200のassertionで1件失敗し、
+sourceを変えずに全workspaceを再実行して通った（上表は再実行の値）。その間に他のjobはなく、原因は特定していない。
+
+一覧はR0と比べ、R1で追加したkio-ciの試験と、R3で追加した試験（Mac 170、WSL 176、Windows 172件、台帳518行）だけが
+増えた。試験の移動でpathが変わった141件は対応表で照合した。CLI契約試験51ファイルは`f2140ee8`から変更していない。
+CLIの出力はB1の基準とbyte比較し、Mac 193、WSL 191、Windows 186件が一致した（Windowsの既存のplatform除外5件は
+一致数に数えない）。
+
+R3で決めた例外と扱い:
+
+- Windowsの既存試験 `conflicting_live_binding_for_same_locator_is_rejected` を
+  `connection_owners_isolate_same_locator_authority` に置き換えた。旧試験はprocess全体の`ACCESS`登録と名前による
+  検索の曖昧さを確かめていたが、接続ごとのVFS ownerにしてその登録と検索を削除したためである。新しい試験は、
+  同じlocatorの別ownerが生きていても正しい接続の応答が変わらないこと、identityの合わないbindingは既存の
+  `xOpen`の検査で接続にならないこと、nullや他のVFS pointerでは名前で探さずfail-closedになること、一方の
+  ownerを捨てても他方が影響を受けないことを確かめる。libtest台帳には置換として記録した。
+- SQLiteの`close`が失敗した場合（閉じ忘れたprepared statementがあるときだけ起こる）は、VFS ownerと登録を
+  process終了まで保持し、SQLiteがまだ使い得る状態を解放しない。
+- Evidenceのresponse記録を`verify_objects.rs`から子moduleへ移す際、親と兄弟moduleが読む10箇所に`pub(super)`を
+  付けた。この10箇所を戻すと元の字句と一致する。
+- strict Clippyが`large_enum_variant`を出したvariantだけを`Box`にした（応答の`Status`、Evidenceのretarget、
+  indexのpublishedと、内部のGC deferred・index出力）。
+- `status`の`quarantine`は、読取りが任意の有効なJSON行をそのまま返すため、`serde_json::Value`の列のままにした。
+- releaseで使われなくなったdebug/test制御用のimportは`debug_assertions`の条件付きにした。
+
+進め方と経緯:
+
+- 読み取り調査、実装、3 OS検証はCodex CLI（ChatGPT認証）に任せた。監督側で設計判断を決め、候補ごとにtreeと
+  検証結果を照合し、候補のpatchからcommitした。候補ごとの検証はMacの全workspace test、WSL・Windowsのkio-app・
+  kio-cli試験、3 OSのCLI byte比較とlibtest比較で行った。
+- Windowsへの1 MB超の標準入力転送がSSHの45秒timeoutで切れた。以後、Windowsは32 KiB、WSLは256 KiBに分けて送る。
+- Windowsのbyte比較でfixtureのpathが長すぎた（PathTooLong）。harness側でfixtureのrootを短くした。
+- SearchのWindows基準側で一度STORE-LOCKEDが出て、変更なしの再実行で通った。原因は特定していない。
+- Macの空き容量が、他プロジェクト（Docker Desktopの仮想ディスク、別sessionの一時ファイル）で数回10 GiBを切り、
+  検証が止まった。利用者の承認により、空きが15 GiB未満のときだけ`target/debug/incremental`と24時間より古い
+  `deps/*.o`を削除した。それ以外のcacheは削除していない。
+- Macが再起動し（2026-10-13 15:01）、boot時刻の基準を更新した。監督側のsessionが利用制限で終わってCodexの
+  processも止まったときは、同じsessionを再開した。中断した転送の残りのprocess（同じrun IDとPID・起動時刻・親・実行fileが一致するものだけ）を
+  Windowsで止め、新しいrun IDでやり直した。中断・停止した記録はすべて残した。
+- Windows実機の空き時間に、EmbeddingGemma 2のin-process測定を行った（R3の検証とは別。結果は埋め込みの仕様作業で扱う）。
+
+残る扱い:
+
+- R4（保護4ファイルの分割）が続く。共通上限の余裕は275行で、R4の分割で`mod`・`use`行が増えて超える場合は、
+  R4の中で吸収するか、利用者に諮る。
+- Windowsで一度だけ失敗した `tls_loopback_proxy_forwards_only_the_bounded_contract` の原因調査。
+- R3の範囲外として残したもの: `kio-eval`の`__exit_code`拒否判定、CLI契約試験のコメントと試験名
+  `r11_2_exit_override_priority_batch_vs_enrichment`に残る旧名、終了コードからerror codeへの対応表がkio-appとCLIの
+  2箇所にあること、`quarantine`の行を厳密な記録型として読むかの判断。
+- hosted CIとpushは未実施である（リポジトリの公開範囲とActionsの有無を確認していない）。
+- 証跡はrepo外の `~/Documents/Codex/2026-10-10/kio-r3/` にある（`runs/` に各段階の指示・イベント・最終報告・
+  候補・証跡、`wip/` にWIPの指紋、`disk-cleanup.log`）。Macの未追跡WIPはR3開始前の指紋（利用者の`.gitignore`
+  commit後に取り直したもの）と一致し、各段階の前後でも変わらなかった。
+- 照合用のcheckoutはWSLとWindowsのB4/B5のdirectoryに残した。
