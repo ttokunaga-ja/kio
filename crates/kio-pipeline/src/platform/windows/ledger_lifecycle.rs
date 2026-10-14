@@ -50,11 +50,16 @@ fn windows_change_time(file: &File, path: &Path) -> Result<i64> {
     })
 }
 
-pub(crate) fn verify_existing_ancestor_path(path: &Path) -> Result<()> {
+pub(crate) fn verify_existing_ancestor_path(
+    path: &Path,
+    control: &kio_core::control::ControlHandle,
+) -> Result<()> {
     // StoreDirectory already opened every component without traversing a
     // reparse point. The newly created final parent receives the protected ACL
     // and is checked through its retained handle before lock publication.
-    StoreDirectory::open(path).map(|_| ()).map_err(core_private)
+    StoreDirectory::open_with_control(path, control.clone())
+        .map(|_| ())
+        .map_err(core_private)
 }
 
 pub(crate) fn revalidate_lock_contents(
@@ -190,6 +195,7 @@ pub(crate) fn sqlite_path_from_retained_parent(
 pub(crate) fn try_inherited_parent(
     _path: &Path,
     _allow_create: bool,
+    _control: kio_core::control::ControlHandle,
 ) -> Result<Option<StoreDirectory>> {
     Ok(None)
 }

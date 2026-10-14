@@ -5,6 +5,33 @@
 //! path to the immutable graph's exact manifest binding.
 
 use super::*;
+use crate::historical_reindex::RetainedNormalizedInstance;
+use crate::historical_reindex::pinned_done_units;
+use crate::index::chunk_ledger::read_chunk_publication_events;
+use crate::index::chunk_ledger::read_stored_chunks;
+use crate::index::rebuild::AuthenticatedNormalizedUnit;
+use crate::index::rebuild::AuthenticatedNormalizedUnits;
+use crate::index::rebuild::NormalizedUnitKey;
+use crate::index::rebuild::PublicationAuthenticationCache;
+use crate::index::rebuild::authenticate_chunk_row;
+use crate::index::rebuild::authenticate_publication_event_cached;
+use crate::index::rebuild::durable_history_roots;
+use crate::object_persistence::pipeline_to_kio;
+use crate::scope_access::purge_blocks_rebuild_raw;
+use kio_core::KioError;
+use kio_core::cas::ChunkObject;
+use kio_core::dag::NormalizeRef;
+use kio_core::history::HistoryReader;
+use kio_core::scope::Repository;
+use kio_index::ChunkRow;
+#[cfg(test)]
+use kio_pipeline::markdownize::persist_normalized_instance;
+use kio_pipeline::policy::CurrentPolicyEvaluator;
+use kio_pipeline::prepare::hash_bytes;
+use kio_pipeline::scan::classify_secret;
+use rusqlite::Connection;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 
 type InstanceKey = (String, String, u64, String);
@@ -282,7 +309,8 @@ pub(super) fn collect_retained_embedding_chunks(
         return Ok(Vec::new());
     };
     let roots = durable_history_roots(repo)?;
-    let (graph, _) = HistoryReader::new(repo.kio_dir()).walk_for_roots_allow_shallowed(&roots)?;
+    let (graph, _) = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
+        .walk_for_roots_allow_shallowed(&roots)?;
     let mut bindings = OwnerBindings::default();
     for node in graph.nodes_in_visit_order() {
         for entry in &node.tree.entries {
@@ -295,7 +323,8 @@ pub(super) fn collect_retained_embedding_chunks(
         let raw_blocked = match blocked.get(&instance.raw_hash) {
             Some(value) => *value,
             None => {
-                let value = purge_blocks_rebuild_raw(repo.kio_dir(), &instance.raw_hash)?;
+                let value =
+                    purge_blocks_rebuild_raw(repo.kio_dir(), &instance.raw_hash, repo.control())?;
                 blocked.insert(instance.raw_hash.clone(), value);
                 value
             }
@@ -583,8 +612,8 @@ mod tests {
         assert!(!rows[1].is_head_owner);
         assert!(rows.iter().all(|row| row.requires_secret_approval));
         assert_ne!(
-            embedding_store::chunk_embedding_context(&rows[0].raw_path),
-            embedding_store::chunk_embedding_context(&rows[1].raw_path),
+            kio_index::embedding_store::chunk_embedding_context(&rows[0].raw_path),
+            kio_index::embedding_store::chunk_embedding_context(&rows[1].raw_path),
         );
     }
 
@@ -639,33 +668,33 @@ mod tests {
     ) -> (NormalizeRef, ChunkRow) {
         let raw = hash_bytes(b"same raw");
         let profile = hash_bytes(b"same profile");
-        let unit = NormalizedUnitObject {
+        let unit = kio_pipeline::markdownize::NormalizedUnitObject {
             unit_key: unit_key.to_owned(),
-            unit_type: UnitType::Page,
+            unit_type: kio_pipeline::prepare::UnitType::Page,
             raw_hash: raw.clone(),
             prepared_hash: hash_bytes(b"prepared"),
             preparation_profile_hash: hash_bytes(b"prepare profile"),
             tool_profile_hash: profile.clone(),
             r#gen: 0,
-            mode: MarkdownizeMode::Full,
+            mode: kio_pipeline::markdownize::MarkdownizeMode::Full,
             markdown: markdown.to_owned(),
             owned_image_hashes: BTreeSet::new(),
             metadata: BTreeMap::new(),
             reused_from: None,
             generated_at: "2026-09-26T00:00:00Z".to_owned(),
         };
-        let manifest = NormalizedInstanceManifest {
+        let manifest = kio_pipeline::markdownize::NormalizedInstanceManifest {
             raw_hash: raw.clone(),
             tool_profile_hash: profile.clone(),
             r#gen: 0,
             parent_gen: None,
             run_id: "embedding-owner-test".to_owned(),
-            units: vec![NormalizedUnitManifestEntry {
+            units: vec![kio_pipeline::markdownize::NormalizedUnitManifestEntry {
                 order: 0,
                 unit_key: unit_key.to_owned(),
-                unit_ref: unit_ref(unit_key),
-                unit_type: UnitType::Page,
-                status: UnitStatus::Done,
+                unit_ref: kio_pipeline::prepare::unit_ref(unit_key),
+                unit_type: kio_pipeline::prepare::UnitType::Page,
+                status: kio_pipeline::markdownize::UnitStatus::Done,
                 prepared_hash: unit.prepared_hash.clone(),
                 preparation_profile_hash: unit.preparation_profile_hash.clone(),
                 unit_object_hash: None,
@@ -677,8 +706,9 @@ mod tests {
         let manifest_hash = repo
             .object_store()
             .write_content_object(
-                ContentObjectKind::Manifest,
-                &canonical_json_bytes(&serde_json::to_value(&stamped).unwrap()).unwrap(),
+                kio_core::cas::ContentObjectKind::Manifest,
+                &kio_core::cas::canonical_json_bytes(&serde_json::to_value(&stamped).unwrap())
+                    .unwrap(),
             )
             .unwrap();
         let normalize = NormalizeRef {
@@ -703,7 +733,7 @@ mod tests {
             text: markdown.to_owned(),
             created_at: "2026-09-26T00:00:00Z".to_owned(),
         };
-        row.chunk_id = chunk_hash(&row).unwrap();
+        row.chunk_id = kio_index::chunking::chunk_hash(&row).unwrap();
         repo.object_store().write_chunk(&chunk_body(&row)).unwrap();
         (normalize, row)
     }

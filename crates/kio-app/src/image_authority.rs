@@ -15,7 +15,7 @@ use kio_pipeline::policy::CurrentPolicyEvaluator;
 use kio_pipeline::scan::classify_secret;
 
 use crate::historical_reindex::{RetainedNormalizedInstance, pinned_done_units};
-use crate::pipeline_to_kio;
+use crate::object_persistence::pipeline_to_kio;
 
 /// Current authority for one typed, immutable image CAS object.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -128,11 +128,16 @@ mod tests {
         use kio_core::dag::NormalizeRef;
 
         let root = tempfile::tempdir().unwrap();
-        let repo = match crate::initialize_explicit_root(root.path()).unwrap() {
-            crate::ExplicitRoot::Created(repo) => repo,
-            crate::ExplicitRoot::Existing(_) => panic!("fresh root must be created"),
+        let repo = match crate::management::initialize_explicit_root(
+            root.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
+            crate::management::ExplicitRoot::Created(repo) => repo,
+            crate::management::ExplicitRoot::Existing(_) => panic!("fresh root must be created"),
         };
-        let policy = crate::current_embedding_policy(&repo).unwrap();
+        let policy = crate::search::scope::current_embedding_policy(&repo).unwrap();
         let mut instance = crate::historical_reindex::RetainedNormalizedInstance {
             raw_hash: hash_bytes(b"raw"),
             normalize: NormalizeRef {

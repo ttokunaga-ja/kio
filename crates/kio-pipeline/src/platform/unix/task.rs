@@ -5,10 +5,14 @@ pub(crate) fn retain_task_root(
     root: &Path,
     listed: &std::fs::Metadata,
     path: &Path,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<kio_core::store_dir::StoreDirectory> {
     let canonical = root.canonicalize().pipeline_io(root)?;
-    let retained = kio_core::store_dir::StoreDirectory::open(&canonical)
-        .map_err(|error| PipelineError::corrupt(path.display().to_string(), error.to_string()))?;
+    let retained =
+        kio_core::store_dir::StoreDirectory::open_with_control(&canonical, control.clone())
+            .map_err(|error| {
+                PipelineError::corrupt(path.display().to_string(), error.to_string())
+            })?;
 
     let identity_matches = {
         use std::os::unix::fs::MetadataExt;

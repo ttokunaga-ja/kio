@@ -14,7 +14,7 @@ use std::{
 use kio_core::{
     Result,
     cas::{ChunkObject, ContentObjectKind, EmbeddingObject, ObjectKind, ObjectStore, hash_bytes},
-    test_control::{DebugTestControl, install_scoped},
+    test_control::DebugTestControl,
 };
 
 const KINDS: [&str; 5] = ["raw", "chunk", "prepared", "image", "embedding"];
@@ -249,8 +249,13 @@ fn cas_removal_crash_child() {
     let kind = std::env::var("KIO_CAS_CRASH_KIND").unwrap();
     let hash = std::env::var("KIO_CAS_CRASH_HASH").unwrap();
     let bound = std::env::var("KIO_CAS_CRASH_BOUND").unwrap() == "true";
-    let _control = install_scoped(DebugTestControl::from_env());
-    remove(&store(Path::new(&root), bound), &kind, &hash).unwrap();
+    let control = kio_core::control::ControlHandle::new(DebugTestControl::from_env());
+    remove(
+        &store(Path::new(&root), bound).rebind_with_control(control),
+        &kind,
+        &hash,
+    )
+    .unwrap();
     panic!("child should stop at the selected durability barrier");
 }
 

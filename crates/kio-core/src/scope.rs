@@ -1,12 +1,11 @@
 //! Folder-scope repository operations for Step 1.
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Component;
 use std::path::{Path, PathBuf};
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -47,7 +46,16 @@ use crate::store_dir::StoreDirectory;
 #[cfg(all(test, windows))]
 use crate::platform::scope_same_file_identity as same_scope_file_identity;
 
+mod construction;
+mod control;
+pub(crate) mod locks;
 mod managed_restore;
+
+pub use locks::{LockSession, StoreLock};
+use locks::{
+    acquire_retained_lock_kind_with_control, acquire_retained_store_lock,
+    acquire_retained_store_lock_with_control,
+};
 pub(crate) use managed_restore::reject_pending_managed_restore;
 pub use managed_restore::{
     ManagedRestoreChange, ManagedRestoreOutcome, ManagedRestorePlan, ManagedRestoreRequest,
@@ -77,70 +85,6 @@ struct PublicationJournal {
 /// Bound structured scope metadata on every supported operating system.
 /// Management and policy reads must never become unbounded parser inputs.
 const MAX_BOUND_CONFIG_BYTES: u64 = 1024 * 1024;
-
-/// One operation-local snapshot of the debug-only core controls.  This stays
-/// private so release builds expose neither test-control schema nor parser.
-struct SnapshotTestControl {
-    #[cfg(debug_assertions)]
-    core: crate::test_control::CoreTestControl,
-}
-
-impl SnapshotTestControl {
-    #[cfg(debug_assertions)]
-    fn capture() -> Self {
-        Self {
-            // Snapshot entrypoints are library operation roots. Reuse an
-            // installed CLI snapshot when present; otherwise capture exactly
-            // once for this operation.
-            core: crate::test_control::capture_for_operation().core,
-        }
-    }
-
-    #[cfg(not(debug_assertions))]
-    fn capture() -> Self {
-        Self {}
-    }
-
-    #[cfg(debug_assertions)]
-    fn authority_capture_ready(&self) -> Option<&Path> {
-        self.core.snapshot_authority_capture_ready.as_deref()
-    }
-
-    #[cfg(not(debug_assertions))]
-    fn authority_capture_ready(&self) -> Option<&Path> {
-        None
-    }
-
-    #[cfg(debug_assertions)]
-    fn pre_checkpoint_ready(&self) -> Option<&Path> {
-        self.core.snapshot_pre_checkpoint_ready.as_deref()
-    }
-
-    #[cfg(not(debug_assertions))]
-    fn pre_checkpoint_ready(&self) -> Option<&Path> {
-        None
-    }
-
-    #[cfg(debug_assertions)]
-    fn after_state_write_ready(&self) -> Option<&Path> {
-        self.core.snapshot_after_state_write_ready.as_deref()
-    }
-
-    #[cfg(not(debug_assertions))]
-    fn after_state_write_ready(&self) -> Option<&Path> {
-        None
-    }
-
-    #[cfg(debug_assertions)]
-    fn hold_lock_ready(&self) -> Option<&Path> {
-        self.core.hold_lock_ready.as_deref()
-    }
-
-    #[cfg(not(debug_assertions))]
-    fn hold_lock_ready(&self) -> Option<&Path> {
-        None
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ArchiveLimits {
@@ -205,6 +149,7 @@ impl Drop for StagedWorkingFile {
 
 #[derive(Debug, Clone)]
 pub struct Repository {
+    lock_session: LockSession,
     root: PathBuf,
     /// Stable public scope identity. Ordinary repositories use the same path
     /// as `root`; bound child indexing keeps it separate from operational I/O.
@@ -221,6 +166,15 @@ pub struct Repository {
 }
 
 impl Repository {
+    pub fn with_verified_reads(
+        &self,
+        reads: &crate::cas::VerifiedCasReadCapability,
+    ) -> Result<Self> {
+        let mut repo = self.clone();
+        repo.store = self.store.with_verified_reads(reads)?;
+        Ok(repo)
+    }
+
     /// Clone the repository's retained CAS authority for bounded object reads.
     #[must_use]
     pub fn object_store(&self) -> ObjectStore {
@@ -322,244 +276,6 @@ pub enum InspectedObject {
 }
 
 impl Repository {
-    pub fn init(path: impl AsRef<Path>) -> Result<Self> {
-        let root = path.as_ref();
-        if !root.exists() {
-            return Err(KioError::invalid_usage("init path does not exist"));
-        }
-        if !root.is_dir() {
-            return Err(KioError::invalid_usage("init path must be a directory"));
-        }
-
-        let root = root.canonicalize().kio_io(root)?;
-        let scope = StoreDirectory::open(&root)?;
-        let retained_root = scope
-            .root_handle()
-            .as_ref()
-            .try_clone()
-            .map_err(|error| KioError::io(error.to_string(), "."))?;
-        match Self::create_bound(root.clone(), retained_root) {
-            Ok(repo) => Ok(repo),
-            // Preserve `init`'s existing-store behavior, but make the second
-            // open a fresh retained binding rather than trusting the failed
-            // create attempt's public name.
-            Err(error) if error.error_code() == "KIO-E-STORE-EXISTS-001" => Self::open(root),
-            Err(error) => Err(error),
-        }
-    }
-
-    pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let repo = Self::open_for_recovery(path)?;
-        repo.ensure_no_pending_managed_restore()?;
-        // A normal open is observational when no interrupted publication is
-        // present. This preserves read access to a legitimate read-only scope;
-        // the store lock is needed only to replay a durable journal.
-        if repo.publication_journal()?.is_some() {
-            repo.recover_publication()?;
-        }
-        repo.validate()?;
-        // A journal which appeared after the initial observation must never be
-        // hidden behind a freshly validated mutable projection.
-        repo.ensure_no_pending_publication()?;
-        Ok(repo)
-    }
-
-    /// Open only after proving no incomplete mutable publication exists.
-    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        let repo = Self::open_for_recovery(path)?;
-        repo.ensure_no_pending_managed_restore()?;
-        repo.ensure_no_pending_publication()?;
-        repo.validate()?;
-        Ok(repo)
-    }
-
-    /// Open the minimal durable authority required to replay a publication.
-    /// This is intentionally not a general read API: callers must lock and
-    /// call [`Self::recover_publication`] before observing mutable projections.
-    pub fn open_for_recovery(path: impl AsRef<Path>) -> Result<Self> {
-        let root = path.as_ref().canonicalize().kio_io(path.as_ref())?;
-        Self::open_retained_for_recovery(root)
-    }
-
-    pub fn open_current() -> Result<Self> {
-        let cwd = std::env::current_dir().map_err(|err| KioError::io(err.to_string(), "."))?;
-        Self::open(cwd)
-    }
-
-    pub fn open_current_read_only() -> Result<Self> {
-        let cwd = std::env::current_dir().map_err(|err| KioError::io(err.to_string(), "."))?;
-        Self::open_read_only(cwd)
-    }
-
-    /// Initialize a scope from a retained root directory. The process current
-    /// directory is never observed or changed.
-    pub fn init_bound(canonical_root: PathBuf, scope: File) -> Result<Self> {
-        let scope_directory = StoreDirectory::from_retained(scope, canonical_root.clone())?;
-        crate::management::validate_controlled_root(
-            scope_directory.root_handle().as_ref(),
-            &canonical_root,
-        )?;
-        let existing = scope_directory.contains_entry(Path::new(".kio"))?;
-        let kio = if existing {
-            scope_directory.open_directory(Path::new(".kio"))?
-        } else {
-            let created = scope_directory.create_directory(Path::new(".kio"))?;
-            crate::store_dir::restrict_new_private_directory(&created)?;
-            let directory = StoreDirectory::from_retained(
-                created
-                    .try_clone()
-                    .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
-                canonical_root.join(".kio"),
-            )?;
-            crate::management::validate_controlled_root(
-                scope_directory.root_handle().as_ref(),
-                &canonical_root,
-            )?;
-            initialize_bound_kio_layout_directory(&directory, &canonical_root)?;
-            created
-        };
-        Self::open_bound_existing(
-            canonical_root,
-            scope_directory
-                .root_handle()
-                .as_ref()
-                .try_clone()
-                .map_err(|error| KioError::io(error.to_string(), "."))?,
-            kio,
-        )
-    }
-
-    /// Create a new retained scope and reject an existing `.kio` leaf.
-    pub fn create_bound(canonical_root: PathBuf, scope: File) -> Result<Self> {
-        let scope_directory = StoreDirectory::from_retained(scope, canonical_root.clone())?;
-        crate::management::validate_controlled_root(
-            scope_directory.root_handle().as_ref(),
-            &canonical_root,
-        )?;
-        let kio = scope_directory
-            .create_directory(Path::new(".kio"))
-            .map_err(|error| {
-                KioError::new(
-                    "KIO-E-STORE-EXISTS-001",
-                    "refusing to create over an existing .kio store",
-                    json!({"cause": error.error_code()}),
-                    ExitCode::InvalidUsage,
-                )
-            })?;
-        crate::store_dir::restrict_new_private_directory(&kio)?;
-        let directory = StoreDirectory::from_retained(
-            kio.try_clone()
-                .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
-            canonical_root.join(".kio"),
-        )?;
-        crate::management::validate_controlled_root(
-            scope_directory.root_handle().as_ref(),
-            &canonical_root,
-        )?;
-        initialize_bound_kio_layout_directory(&directory, &canonical_root)?;
-        Self::open_bound_existing(
-            canonical_root,
-            scope_directory
-                .root_handle()
-                .as_ref()
-                .try_clone()
-                .map_err(|error| KioError::io(error.to_string(), "."))?,
-            kio,
-        )
-    }
-
-    /// Open an initialized scope exclusively through retained root and `.kio`
-    /// handles. `ManagementBinding` compares the named child to the retained
-    /// handle on every supported platform before any operational I/O begins.
-    pub fn open_bound_existing(canonical_root: PathBuf, scope: File, kio: File) -> Result<Self> {
-        let repo = Self::open_bound_for_recovery(canonical_root, scope, kio)?;
-        wait_at_bound_snapshot_auto_layout_barrier();
-        repo.validate()?;
-        Ok(repo)
-    }
-
-    /// Bind retained scope authority for publication recovery without reading
-    /// mutable projections. Callers may lock and replay a pending journal
-    /// before invoking the normal validating open path.
-    pub fn open_bound_for_recovery(
-        canonical_root: PathBuf,
-        scope: File,
-        kio: File,
-    ) -> Result<Self> {
-        let (scope, kio) = crate::platform::scope_semantics::normalize_repository_handles(
-            scope,
-            kio,
-            &canonical_root,
-        )?;
-        crate::management::ManagementBinding::from_retained(
-            scope
-                .try_clone()
-                .map_err(|error| KioError::io(error.to_string(), "."))?,
-            kio.try_clone()
-                .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
-            canonical_root.clone(),
-        )?;
-        let repo = Self {
-            root: canonical_root.clone(),
-            kio_dir: canonical_root.join(".kio"),
-            canonical_root,
-            store: ObjectStore::from_bound_kio(&kio)?,
-            bound_root: Some(Arc::new(scope)),
-            bound_kio: Some(Arc::new(kio)),
-        };
-        repo.validate_config()?;
-        repo.validate_scope()?;
-        Ok(repo)
-    }
-
-    /// Bind an ordinary public-path request to retained root and `.kio`
-    /// directories before any repository read.  The displayed paths remain
-    /// useful diagnostics only; operational metadata and CAS access use the
-    /// retained handles constructed here.
-    fn open_retained_for_recovery(canonical_root: PathBuf) -> Result<Self> {
-        let scope = StoreDirectory::open(&canonical_root)?;
-        let kio = scope.open_directory(Path::new(".kio"))?;
-        Self::open_bound_for_recovery(
-            canonical_root,
-            scope
-                .root_handle()
-                .as_ref()
-                .try_clone()
-                .map_err(|error| KioError::io(error.to_string(), "."))?,
-            kio,
-        )
-    }
-
-    /// Open a scope for immutable CAS/index search while treating
-    /// `manifest.json` as a derived acceleration artifact. Search history is
-    /// committed tree truth, so a malformed mutable manifest must not invalidate a
-    /// signed cursor replay. Config, scope identity, store directory, and HEAD are
-    /// validated exactly as in [`Self::open`].
-    pub fn open_for_search(path: impl AsRef<Path>) -> Result<Self> {
-        let root = path.as_ref().canonicalize().kio_io(path.as_ref())?;
-        let repo = Self::open_retained_for_recovery(root)?;
-        repo.ensure_no_pending_managed_restore()?;
-        repo.head_commit_hash()?;
-        repo.ensure_no_pending_publication()?;
-        Ok(repo)
-    }
-
-    /// The read-only counterpart to [`Self::open_for_search`]. It validates the
-    /// same immutable store and scope state but never repairs HEAD or refs.
-    pub fn open_for_search_read_only(path: impl AsRef<Path>) -> Result<Self> {
-        let root = path.as_ref().canonicalize().kio_io(path.as_ref())?;
-        let repo = Self::open_retained_for_recovery(root)?;
-        repo.ensure_no_pending_managed_restore()?;
-        repo.head_commit_hash()?;
-        repo.ensure_no_pending_publication()?;
-        Ok(repo)
-    }
-
-    pub fn open_current_for_search() -> Result<Self> {
-        let cwd = std::env::current_dir().map_err(|err| KioError::io(err.to_string(), "."))?;
-        Self::open_for_search(cwd)
-    }
-
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.root
@@ -688,7 +404,7 @@ impl Repository {
     /// store lock. It refuses a changed HEAD, a missing commit, or a commit
     /// that is not the exact child named by the journal.
     pub fn recover_publication(&self) -> Result<bool> {
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
         let atomic_recovered = self.recover_atomic_storage()?;
         // A publication journal may be the last phase of a managed restore.
         // It must never advance HEAD while that restore's working-tree journal
@@ -778,15 +494,18 @@ impl Repository {
             &bytes,
             crate::store_dir::Publication::CreateOnly,
         )?;
-        crate::durability::checkpoint(crate::durability::DurabilityPoint::PublicationJournal)?;
+        self.control()
+            .checkpoint(crate::durability::DurabilityPoint::PublicationJournal)?;
         directory.write_atomic(
             Path::new("HEAD"),
             format!("{new_head}\n").as_bytes(),
             crate::store_dir::Publication::Replace,
         )?;
-        crate::durability::checkpoint(crate::durability::DurabilityPoint::PublicationHead)?;
+        self.control()
+            .checkpoint(crate::durability::DurabilityPoint::PublicationHead)?;
         self.write_manifest_value(&journal.manifest)?;
-        crate::durability::checkpoint(crate::durability::DurabilityPoint::PublicationManifest)?;
+        self.control()
+            .checkpoint(crate::durability::DurabilityPoint::PublicationManifest)?;
         self.remove_publication_journal()?;
         Ok(())
     }
@@ -843,16 +562,20 @@ impl Repository {
     /// Acquire the exclusive `.kio/.lock` store lock (05 §6) and return an RAII
     /// guard held for the caller's lifetime. Used to serialize whole mutating
     /// commands (`kio index` / `repair` / `reindex`) end-to-end, not just their
-    /// snapshot sub-step. The lock is reentrant within a single process, so a
-    /// held guard does not deadlock when `snapshot` re-acquires it internally.
+    /// snapshot sub-step. Independent calls use fresh authority and contend
+    /// through the OS; nested engine work uses `lock_store_in_session`.
     /// The loser of a concurrent acquisition gets `KIO-E-STORE-LOCKED-001`
     /// (exit 3), the same contract as `snapshot` / `tag`.
     pub fn lock_store(&self) -> Result<RetainedStoreLock> {
+        self.lock_store_in_session(&LockSession::default())
+    }
+
+    pub fn lock_store_in_session(&self, session: &LockSession) -> Result<RetainedStoreLock> {
         let kio = self.bound_kio.as_deref().ok_or_else(|| {
             KioError::invalid_usage("repository store lock requires retained .kio authority")
         })?;
-        let lock = acquire_retained_store_lock(kio)?;
-        if let Err(error) = crate::gc::ensure_no_active_sweep_bound(kio) {
+        let lock = acquire_retained_store_lock_with_control(session, kio, self.control())?;
+        if let Err(error) = crate::gc::ensure_no_active_sweep_bound(kio, self.control()) {
             drop(lock);
             return Err(error);
         }
@@ -863,32 +586,43 @@ impl Repository {
     /// a distinct leaf, so a purge holding the writer lease can acquire it
     /// without reopening a pathname or contending on the directory flock.
     pub fn lock_purge_publication(&self) -> Result<RetainedPublicationLock> {
+        self.lock_purge_publication_in_session(&LockSession::default())
+    }
+
+    pub fn lock_purge_publication_in_session(
+        &self,
+        session: &LockSession,
+    ) -> Result<RetainedPublicationLock> {
         let kio = self.bound_kio.as_deref().ok_or_else(|| {
             KioError::invalid_usage("publication lock requires retained .kio authority")
         })?;
-        acquire_retained_publication_lock(kio)
+        acquire_retained_publication_lock(session, kio, self.control())
     }
 
     fn purge_state(&self) -> Result<PurgeState> {
         if let Some(kio) = self.bound_kio.as_deref() {
-            return Ok(PurgeState::from_directory(StoreDirectory::from_retained(
-                kio.try_clone()
-                    .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
-                self.kio_dir.clone(),
-            )?));
+            return Ok(PurgeState::from_directory(
+                StoreDirectory::from_retained_with_control(
+                    kio.try_clone()
+                        .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
+                    self.kio_dir.clone(),
+                    self.control().clone(),
+                )?,
+            ));
         }
-        PurgeState::open(&self.kio_dir)
+        PurgeState::open_with_control(&self.kio_dir, self.control().clone())
     }
 
     pub(crate) fn store_directory(&self) -> Result<StoreDirectory> {
         if let Some(kio) = self.bound_kio.as_deref() {
-            return StoreDirectory::from_retained(
+            return StoreDirectory::from_retained_with_control(
                 kio.try_clone()
                     .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
                 self.kio_dir.clone(),
+                self.control().clone(),
             );
         }
-        StoreDirectory::open(&self.kio_dir)
+        StoreDirectory::open_with_control(&self.kio_dir, self.control().clone())
     }
 
     fn metadata_text(&self, leaf: &str, max_bytes: u64) -> Result<String> {
@@ -924,12 +658,13 @@ impl Repository {
     /// current named-identity and store-layout safety check.
     fn validate_store_authority(&self) -> Result<()> {
         if let (Some(root), Some(kio)) = (self.bound_root.as_deref(), self.bound_kio.as_deref()) {
-            let binding = crate::management::ManagementBinding::from_retained(
+            let binding = crate::management::ManagementBinding::from_retained_with_control(
                 root.try_clone()
                     .map_err(|error| KioError::io(error.to_string(), "."))?,
                 kio.try_clone()
                     .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
                 self.canonical_root.clone(),
+                self.control().clone(),
             )?;
             binding.revalidate()?;
             validate_retained_store_directory(kio, &self.kio_dir)?;
@@ -980,7 +715,7 @@ impl Repository {
         }
         validate_scope_config_document(replacement)?;
         self.validate_store_authority()?;
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
         self.validate_store_authority()?;
         let result = (|| {
             let directory = self.store_directory()?;
@@ -1097,7 +832,7 @@ impl Repository {
         operation: impl FnOnce(&StoreDirectory) -> Result<T>,
     ) -> Result<T> {
         self.validate_store_authority()?;
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
         self.validate_store_authority()?;
         let result = (|| {
             let directory = self.store_directory()?;
@@ -1188,7 +923,7 @@ impl Repository {
             // Raw publication and erase-receipt retirement are one store-locked
             // operation even for direct callers of this public builder. Snapshot
             // callers already hold this reentrant lock.
-            let _lock = self.lock_store()?;
+            let _lock = self.lock_store_in_session(&self.lock_session)?;
             // Every caller of this public builder except `snapshot_with_type`'s
             // purge path is a non-purge write (`purge_self_targets` empty —
             // see `archive_staged_working_tree`'s doc comment): the barrier
@@ -1207,7 +942,7 @@ impl Repository {
         let mut entries = Vec::new();
         let mut consumed_scope_bytes = 0_u64;
         for candidate in candidates {
-            let mut file = open_working_file_candidate(&candidate)?;
+            let mut file = open_working_file_candidate(&candidate, self.control())?;
             let metadata = file.metadata().kio_io(&candidate.path)?;
             let remaining = limits
                 .max_scope_bytes
@@ -1280,7 +1015,7 @@ impl Repository {
                     .checked_sub(consumed_scope_bytes)
                     .ok_or_else(|| scope_input_oversized(&candidate.file_name, limits, u64::MAX))?;
                 let allowed = limits.max_file_bytes.min(remaining);
-                let mut source = open_working_file_candidate(&candidate)?;
+                let mut source = open_working_file_candidate(&candidate, self.control())?;
                 let before = source.metadata().kio_io(&candidate.path)?;
                 let identity = scheduled_source_identity(&source)?;
                 if before.len() > allowed {
@@ -1389,7 +1124,8 @@ impl Repository {
                 .checked_sub(consumed_scope_bytes)
                 .ok_or_else(|| scope_input_oversized(&candidate.file_name, limits, u64::MAX))?;
             let allowed = limits.max_file_bytes.min(remaining);
-            let staged_file = stage_scope_file(&self.kio_dir, candidate, allowed, limits)?;
+            let staged_file =
+                stage_scope_file(&self.kio_dir, candidate, allowed, limits, self.control())?;
             consumed_scope_bytes = consumed_scope_bytes
                 .checked_add(staged_file.size_bytes)
                 .ok_or_else(|| {
@@ -1565,7 +1301,7 @@ impl Repository {
                         candidates.len().saturating_add(1),
                     ));
                 }
-                let file = open_bound_scope_file_nofollow(root, &file_name, &path)?;
+                let file = open_bound_scope_file_nofollow(root, &file_name, &path, self.control())?;
                 let metadata = file.metadata().kio_io(&path)?;
                 if metadata.len() > limits.max_file_bytes {
                     return Err(scope_input_oversized(&file_name, limits, metadata.len()));
@@ -1745,7 +1481,6 @@ impl Repository {
             None,
             None,
             None,
-            None,
         )
     }
 
@@ -1797,7 +1532,6 @@ impl Repository {
             None,
             None,
             None,
-            None,
             publication_guard,
         )
     }
@@ -1815,10 +1549,7 @@ impl Repository {
     /// `.kio` directory.  This deliberately has stricter semantics than the
     /// ordinary open path: an empty HEAD with a populated branch ref is
     /// corruption here, not an opportunity for automatic repair.
-    fn validate_scheduled_auto_prerequisites(
-        &self,
-        test_control: &SnapshotTestControl,
-    ) -> Result<ScheduledSnapshotAuthority> {
+    fn validate_scheduled_auto_prerequisites(&self) -> Result<ScheduledSnapshotAuthority> {
         if self.bound_kio.is_none() {
             return Err(KioError::invalid_usage(
                 "scheduled snapshot publication requires a retained .kio capability",
@@ -1829,7 +1560,7 @@ impl Repository {
                 "scheduled snapshot publication requires a retained scope capability",
             ));
         }
-        let authority = self.capture_scheduled_snapshot_authority(test_control)?;
+        let authority = self.capture_scheduled_snapshot_authority()?;
         if let Some(head) = parse_head_ref(&authority.head)? {
             // Both objects are CAS-bound in this repository.  Do not permit a
             // scheduled writer to extend a shallow/corrupt history.
@@ -1843,16 +1574,13 @@ impl Repository {
     /// Capture every mutable metadata leaf that selects the scheduled
     /// snapshot's parent and tool identity.  Values alone are not enough: a
     /// same-byte inode replacement is an authority change too.
-    fn capture_scheduled_snapshot_authority(
-        &self,
-        test_control: &SnapshotTestControl,
-    ) -> Result<ScheduledSnapshotAuthority> {
+    fn capture_scheduled_snapshot_authority(&self) -> Result<ScheduledSnapshotAuthority> {
         let kio = self.bound_kio.as_deref().ok_or_else(|| {
             KioError::invalid_usage("scheduled snapshot requires retained .kio capability")
         })?;
         let (head, head_observation) =
             read_bound_regular_text_observed_at(kio, "HEAD", MAX_BOUND_CONFIG_BYTES)?;
-        wait_at_bound_snapshot_auto_barrier(test_control.authority_capture_ready());
+        wait_at_bound_snapshot_auto_barrier(self.authority_capture_ready());
         let (tool_lock, tool_lock_observation) =
             read_bound_regular_text_observed_at(kio, "tool-lock.json", MAX_BOUND_CONFIG_BYTES)?;
         let tool_lock_value: Value = serde_json::from_str(&tool_lock)
@@ -1869,13 +1597,10 @@ impl Repository {
     fn recheck_scheduled_snapshot_authority(
         &self,
         expected: &ScheduledSnapshotAuthority,
-        test_control: &SnapshotTestControl,
     ) -> Result<()> {
-        let actual = self
-            .capture_scheduled_snapshot_authority(test_control)
-            .map_err(|_| {
-                snapshot_authority_changed("scheduled snapshot metadata authority changed")
-            })?;
+        let actual = self.capture_scheduled_snapshot_authority().map_err(|_| {
+            snapshot_authority_changed("scheduled snapshot metadata authority changed")
+        })?;
         if actual != *expected {
             return Err(snapshot_authority_changed(
                 "scheduled snapshot HEAD or tool lock changed",
@@ -1889,13 +1614,10 @@ impl Repository {
         expected: &ScheduledSnapshotAuthority,
         published: &ScheduledSnapshotAuthority,
         commit_hash: &str,
-        test_control: &SnapshotTestControl,
     ) -> Result<()> {
-        let actual = self
-            .capture_scheduled_snapshot_authority(test_control)
-            .map_err(|_| {
-                snapshot_authority_changed("scheduled snapshot metadata authority changed")
-            })?;
+        let actual = self.capture_scheduled_snapshot_authority().map_err(|_| {
+            snapshot_authority_changed("scheduled snapshot metadata authority changed")
+        })?;
         if actual.head.trim() != commit_hash
             || actual.head_observation != published.head_observation
             || actual.tool_lock != expected.tool_lock
@@ -1982,17 +1704,16 @@ impl Repository {
         expected_snapshot_policy: &SnapshotAutoBinding,
         before_ref_publication: &mut dyn FnMut() -> Result<SnapshotAutoStateBinding>,
     ) -> Result<SnapshotOutcome> {
-        let test_control = SnapshotTestControl::capture();
         // Freeze HEAD and its normalization references in the same writer
         // critical section as the eventual snapshot. Otherwise a concurrent
         // promotion on unchanged raw bytes could be replaced by the older
         // reference captured just before the nested snapshot lock.
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
         // This entrypoint is only valid for the retained-descriptor repository
         // constructed by the scheduler handoff.  In particular, do not apply
         // the ordinary empty-HEAD recovery here: a scheduled writer must never
         // turn a replaceable mutable ref into a new authority for publication.
-        let scheduled_authority = self.validate_scheduled_auto_prerequisites(&test_control)?;
+        let scheduled_authority = self.validate_scheduled_auto_prerequisites()?;
         self.store.validate_bound_layout()?;
         expected_snapshot_policy.recheck(
             self.bound_root.as_deref().expect("scheduled bound root"),
@@ -2035,7 +1756,6 @@ impl Repository {
             Some(expected_snapshot_policy),
             Some(&scheduled_authority),
             Some(before_ref_publication),
-            Some(&test_control),
             None,
         )
     }
@@ -2093,7 +1813,7 @@ impl Repository {
         staged_tool_lock_hash: Option<&str>,
     ) -> Result<SnapshotOutcome> {
         self.validate()?;
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
         let head_hash = self
             .head_commit_hash()?
             .ok_or_else(|| KioError::invalid_usage("cannot promote in an unborn scope"))?;
@@ -2110,11 +1830,8 @@ impl Repository {
         let prior_tree = match self.read_tree(&head_commit.tree) {
             Ok(tree) => tree,
             Err(error) if is_store_not_found(&error) => {
-                crate::gc::validate_final_shallow_tree(
-                    &self.kio_dir,
-                    &head_hash,
-                    &head_commit.tree,
-                )?;
+                crate::gc::GcSweepSession::bind_repository(self)?
+                    .validate_final_shallow_tree(&head_hash, &head_commit.tree)?;
                 return Err(KioError::commit_shallow(
                     "HEAD tree object is missing; online output was not promoted",
                     head_hash.clone(),
@@ -2159,7 +1876,7 @@ impl Repository {
         let tree_value = serde_json::to_value(&promoted_tree)
             .map_err(|error| KioError::schema(error.to_string()))?;
         let (tree_hash, _) = self.store.write_json(ObjectKind::Tree, &tree_value)?;
-        let created_at = fixed_now_override().unwrap_or_else(now_utc_seconds);
+        let created_at = self.now_utc_seconds();
         let commit = CommitObject::new(
             tree_hash.clone(),
             Some(head_hash.clone()),
@@ -2212,7 +1929,7 @@ impl Repository {
         publish_ref: bool,
     ) -> Result<SnapshotOutcome> {
         self.validate()?;
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
         let head = self
             .head_commit_hash()?
             .ok_or_else(|| KioError::invalid_usage("cannot purge an unborn scope"))?;
@@ -2249,7 +1966,6 @@ impl Repository {
             None,
             None,
             None,
-            None,
         )
     }
 
@@ -2259,14 +1975,14 @@ impl Repository {
     /// commit object is durable.
     pub fn record_repaired_commit(&self, message: Option<&str>) -> Result<String> {
         self.validate()?;
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
         let head = self
             .head_commit_hash()?
             .ok_or_else(|| KioError::invalid_usage("cannot record repair in an unborn scope"))?;
         let head_commit = self.read_commit(&head)?;
         // The tree itself must still be verified before a new commit refers to it.
         self.read_tree(&head_commit.tree)?;
-        let created_at = now_utc_seconds();
+        let created_at = self.now_utc_seconds();
         let commit = CommitObject::new(
             head_commit.tree.clone(),
             Some(head.clone()),
@@ -2308,25 +2024,16 @@ impl Repository {
         expected_snapshot_policy: Option<&SnapshotAutoBinding>,
         expected_scheduled_authority: Option<&ScheduledSnapshotAuthority>,
         before_ref_publication: Option<&mut dyn FnMut() -> Result<SnapshotAutoStateBinding>>,
-        operation_test_control: Option<&SnapshotTestControl>,
         publication_guard: Option<&dyn Fn() -> Result<()>>,
     ) -> Result<SnapshotOutcome> {
-        let captured_test_control;
-        let test_control = match operation_test_control {
-            Some(control) => control,
-            None => {
-                captured_test_control = SnapshotTestControl::capture();
-                &captured_test_control
-            }
-        };
         // A retained repository is also used by the existing child-index
         // subprocess.  Bound descriptors plus `commit_type=auto` therefore do
         // not identify a scheduled publication by themselves.  The scheduler
         // is the only caller that supplies its validated authority binding.
         let scheduled_bound = expected_scheduled_authority.is_some();
         self.validate()?;
-        let _lock = self.lock_store()?;
-        maybe_hold_lock_for_tests(test_control.hold_lock_ready());
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
+        maybe_hold_lock_for_tests(self.hold_lock_ready());
         let chunking_config_hash = self.effective_chunking_config_hash()?;
 
         // Validate the base before archiving any working-tree bytes.  A normal
@@ -2372,8 +2079,7 @@ impl Repository {
             Some(hash) => match self.read_tree(hash) {
                 Ok(tree) => Some(tree),
                 Err(error) if is_store_not_found(&error) => {
-                    crate::gc::validate_final_shallow_tree(
-                        &self.kio_dir,
+                    crate::gc::GcSweepSession::bind_repository(self)?.validate_final_shallow_tree(
                         head_hash.as_deref().unwrap_or_default(),
                         hash,
                     )?;
@@ -2408,7 +2114,7 @@ impl Repository {
             ArchiveLimits::default(),
         )?;
         let working = {
-            let _archive_lock = self.lock_store()?;
+            let _archive_lock = self.lock_store_in_session(&self.lock_session)?;
             self.archive_staged_working_tree(
                 working_candidates,
                 normalize_by_path,
@@ -2479,10 +2185,10 @@ impl Repository {
             // this point. Publish their scheduler checkpoint before returning
             // so a failed state CAS can never follow an already-advanced ref.
             if scheduled_bound {
-                wait_at_bound_snapshot_auto_barrier(test_control.pre_checkpoint_ready());
+                wait_at_bound_snapshot_auto_barrier(self.pre_checkpoint_ready());
                 self.store.validate_bound_layout()?;
                 if let Some(authority) = expected_scheduled_authority {
-                    self.recheck_scheduled_snapshot_authority(authority, test_control)?;
+                    self.recheck_scheduled_snapshot_authority(authority)?;
                 }
                 if let Some(policy) = expected_snapshot_policy {
                     policy.recheck(
@@ -2505,11 +2211,14 @@ impl Repository {
                             self.bound_kio.as_deref().expect("scheduled bound kio"),
                         )?;
                     }
-                    checkpoint.recheck(self.bound_kio.as_deref().expect("scheduled bound kio"))?;
-                    wait_at_bound_snapshot_auto_barrier(test_control.after_state_write_ready());
+                    checkpoint.recheck(
+                        self.bound_kio.as_deref().expect("scheduled bound kio"),
+                        self.control(),
+                    )?;
+                    wait_at_bound_snapshot_auto_barrier(self.after_state_write_ready());
                     self.store.validate_bound_layout()?;
                     if let Some(authority) = expected_scheduled_authority {
-                        self.recheck_scheduled_snapshot_authority(authority, test_control)?;
+                        self.recheck_scheduled_snapshot_authority(authority)?;
                     }
                     if let Some(policy) = expected_snapshot_policy {
                         policy.recheck(
@@ -2517,7 +2226,10 @@ impl Repository {
                             self.bound_kio.as_deref().expect("scheduled bound kio"),
                         )?;
                     }
-                    checkpoint.recheck(self.bound_kio.as_deref().expect("scheduled bound kio"))?;
+                    checkpoint.recheck(
+                        self.bound_kio.as_deref().expect("scheduled bound kio"),
+                        self.control(),
+                    )?;
                     self.reject_scheduled_bound_purge_state()?;
                     self.reject_scheduled_marker_targets(
                         working.entries.iter().map(|entry| &entry.raw_hash),
@@ -2548,8 +2260,7 @@ impl Repository {
 
         let created_at = fixed_now
             .map(str::to_owned)
-            .or_else(fixed_now_override)
-            .unwrap_or_else(now_utc_seconds);
+            .unwrap_or_else(|| self.now_utc_seconds());
         let message = message
             .map(str::to_owned)
             .unwrap_or_else(|| match commit_type {
@@ -2603,10 +2314,10 @@ impl Repository {
         // has moved yet.  If its conditional state publication fails, return
         // without making the object reachable.
         if scheduled_bound {
-            wait_at_bound_snapshot_auto_barrier(test_control.pre_checkpoint_ready());
+            wait_at_bound_snapshot_auto_barrier(self.pre_checkpoint_ready());
             self.store.validate_bound_layout()?;
             if let Some(authority) = expected_scheduled_authority {
-                self.recheck_scheduled_snapshot_authority(authority, test_control)?;
+                self.recheck_scheduled_snapshot_authority(authority)?;
             }
             if let Some(policy) = expected_snapshot_policy {
                 policy.recheck(
@@ -2628,7 +2339,7 @@ impl Repository {
         let published_authority = if scheduled_bound {
             self.store.validate_bound_layout()?;
             if let Some(authority) = expected_scheduled_authority {
-                self.recheck_scheduled_snapshot_authority(authority, test_control)?;
+                self.recheck_scheduled_snapshot_authority(authority)?;
             }
             if let Some(policy) = expected_snapshot_policy {
                 policy.recheck(
@@ -2637,12 +2348,15 @@ impl Repository {
                 )?;
             }
             if let Some(checkpoint) = checkpoint.as_ref() {
-                checkpoint.recheck(self.bound_kio.as_deref().expect("scheduled bound kio"))?;
+                checkpoint.recheck(
+                    self.bound_kio.as_deref().expect("scheduled bound kio"),
+                    self.control(),
+                )?;
             }
-            wait_at_bound_snapshot_auto_barrier(test_control.after_state_write_ready());
+            wait_at_bound_snapshot_auto_barrier(self.after_state_write_ready());
             self.store.validate_bound_layout()?;
             if let Some(authority) = expected_scheduled_authority {
-                self.recheck_scheduled_snapshot_authority(authority, test_control)?;
+                self.recheck_scheduled_snapshot_authority(authority)?;
             }
             if let Some(policy) = expected_snapshot_policy {
                 policy.recheck(
@@ -2651,14 +2365,17 @@ impl Repository {
                 )?;
             }
             if let Some(checkpoint) = checkpoint.as_ref() {
-                checkpoint.recheck(self.bound_kio.as_deref().expect("scheduled bound kio"))?;
+                checkpoint.recheck(
+                    self.bound_kio.as_deref().expect("scheduled bound kio"),
+                    self.control(),
+                )?;
             }
             self.reject_scheduled_bound_purge_state()?;
             self.reject_scheduled_marker_targets(
                 working.entries.iter().map(|entry| &entry.raw_hash),
             )?;
             self.publish_with_journal(parent.as_deref(), &commit_hash, &commit, manifest.clone())?;
-            Some(self.capture_scheduled_snapshot_authority(test_control)?)
+            Some(self.capture_scheduled_snapshot_authority()?)
         } else {
             if let Some(guard) = publication_guard {
                 guard()?;
@@ -2675,7 +2392,6 @@ impl Repository {
                         .as_ref()
                         .expect("scheduled published authority binding"),
                     &commit_hash,
-                    test_control,
                 )?;
             }
             if let Some(policy) = expected_snapshot_policy {
@@ -2685,7 +2401,10 @@ impl Repository {
                 )?;
             }
             if let Some(checkpoint) = checkpoint.as_ref() {
-                checkpoint.recheck(self.bound_kio.as_deref().expect("scheduled bound kio"))?;
+                checkpoint.recheck(
+                    self.bound_kio.as_deref().expect("scheduled bound kio"),
+                    self.control(),
+                )?;
             }
         }
 
@@ -2850,7 +2569,8 @@ impl Repository {
         match self.read_tree(&commit.tree) {
             Ok(tree) => Ok(tree),
             Err(error) if is_store_not_found(&error) => {
-                crate::gc::validate_final_shallow_tree(&self.kio_dir, commit_hash, &commit.tree)?;
+                crate::gc::GcSweepSession::bind_repository(self)?
+                    .validate_final_shallow_tree(commit_hash, &commit.tree)?;
                 Err(diff_side_shallow_error(side, commit_hash))
             }
             Err(error) => Err(error),
@@ -2873,7 +2593,7 @@ impl Repository {
     pub fn tag(&self, name: &str, commit: Option<&str>) -> Result<String> {
         self.validate()?;
         validate_tag_name(name)?;
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
         let commit_hash = match commit {
             Some(value) => self.resolve_commit(value)?,
             None => self
@@ -2909,11 +2629,8 @@ impl Repository {
         // best-effort hint).
         match self.read_tree(&tagged_commit.tree) {
             Err(error) if is_store_not_found(&error) => {
-                crate::gc::validate_final_shallow_tree(
-                    &self.kio_dir,
-                    &commit_hash,
-                    &tagged_commit.tree,
-                )?;
+                crate::gc::GcSweepSession::bind_repository(self)?
+                    .validate_final_shallow_tree(&commit_hash, &tagged_commit.tree)?;
                 return Err(KioError::commit_shallow(
                     "cannot create a tag on a final shallow commit; restore a non-shallow commit first",
                     commit_hash.clone(),
@@ -2958,7 +2675,7 @@ impl Repository {
         let row = canonical_json_bytes(&json!({
             "digest64": portable_tag_digest64(name),
             "logical_name": name.nfc().collect::<String>(),
-            "recorded_at": now_utc_seconds(),
+            "recorded_at": self.now_utc_seconds(),
         }))?;
         let mut row = row;
         row.push(b'\n');
@@ -2990,7 +2707,7 @@ impl Repository {
     pub fn delete_tag(&self, name: &str) -> Result<String> {
         self.validate()?;
         validate_tag_name(name)?;
-        let _lock = self.lock_store()?;
+        let _lock = self.lock_store_in_session(&self.lock_session)?;
         let directory = self.store_directory()?;
         // An interrupted removal may already have unpublished the ref while
         // leaving a durable atomic intent/quarantine. Complete that exact
@@ -3164,10 +2881,11 @@ impl Repository {
 
     pub fn head_commit_hash(&self) -> Result<Option<String>> {
         if let Some(kio) = self.bound_kio.as_deref() {
-            let directory = StoreDirectory::from_retained(
+            let directory = StoreDirectory::from_retained_with_control(
                 kio.try_clone()
                     .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
                 self.kio_dir.clone(),
+                self.control().clone(),
             )?;
             let bytes = directory
                 .read_optional(Path::new("HEAD"), MAX_TAG_REF_BYTES)?
@@ -3202,7 +2920,8 @@ impl Repository {
         match self.read_tree(&tree_hash) {
             Ok(tree) => Ok(HeadTreeState::Present(tree)),
             Err(error) if is_store_not_found(&error) => {
-                crate::gc::validate_final_shallow_tree(&self.kio_dir, &commit_hash, &tree_hash)?;
+                crate::gc::GcSweepSession::bind_repository(self)?
+                    .validate_final_shallow_tree(&commit_hash, &tree_hash)?;
                 Ok(HeadTreeState::Shallow)
             }
             Err(error) => Err(error),
@@ -3386,7 +3105,7 @@ impl Repository {
         Ok(json!({
             "schema_version": 1,
             "files": files,
-            "updated_at": now_utc_seconds(),
+            "updated_at": self.now_utc_seconds(),
         }))
     }
 
@@ -3923,14 +3642,34 @@ pub fn read_adapter_lane(config_toml_path: &Path) -> Option<String> {
 /// concurrent process's `O_APPEND` handle on the renamed inode loses no lines —
 /// rename is atomic and its bytes land in the dated file.
 pub fn append_jsonl_rotating(path: &Path, value: &Value, retention_days: u32) -> Result<()> {
+    append_jsonl_rotating_with_control(
+        &LockSession::default(),
+        &crate::control::ControlHandle::default(),
+        path,
+        value,
+        retention_days,
+    )
+}
+
+pub(crate) fn append_jsonl_rotating_with_control(
+    session: &LockSession,
+    control: &crate::control::ControlHandle,
+    path: &Path,
+    value: &Value,
+    retention_days: u32,
+) -> Result<()> {
     // CT4-PURGE-008: every current-log append is serialized against purge's
     // current+rotated scrub. A contended nonblocking lock makes this best-effort
     // append fail without landing a post-scrub row; existing observability callers
     // already downgrade log failures so user operations remain unaffected.
     let _scrub_lock = scrub_lock_path(path)
-        .map(StoreLock::acquire_path)
+        .map(|path| StoreLock::acquire_path_in_session(session, path, control))
         .transpose()?;
-    let today = today_utc_date();
+    let today = control
+        .now_utc_seconds()
+        .get(..10)
+        .unwrap_or_default()
+        .to_owned();
     // R22-8: `rotate_stale_log` is a check-then-rename (`!dated.exists()` then `fs::rename`),
     // which two processes crossing the first append after midnight can both enter. P1 renames
     // yesterday's live file to the dated name and appends a line to the fresh live file; P2
@@ -3943,7 +3682,8 @@ pub fn append_jsonl_rotating(path: &Path, value: &Value, retention_days: u32) ->
     // itself (R12-5/R13-3: a read-only log dir must never kill the command), and only the
     // final append can fail the caller.
     if rotation_due(path, &today)
-        && let Ok(_rotate_lock) = StoreLock::acquire_path(rotate_lock_path(path))
+        && let Ok(_rotate_lock) =
+            StoreLock::acquire_path_in_session(session, rotate_lock_path(path), control)
     {
         let _ = rotate_stale_log(path, &today);
     }
@@ -3984,10 +3724,6 @@ fn rotate_lock_path(path: &Path) -> PathBuf {
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| "log".to_owned());
     path.with_file_name(format!("{stem}.rotate.lock"))
-}
-
-fn today_utc_date() -> String {
-    now_utc_seconds().get(..10).unwrap_or_default().to_owned()
 }
 
 fn rotate_stale_log(path: &Path, today: &str) -> Result<()> {
@@ -4081,27 +3817,23 @@ fn date_to_days(date: &str) -> Option<i64> {
 }
 
 pub fn append_event_log(code: &str, message: &str, context: Value) -> Result<()> {
-    append_observation("events.jsonl", "info", code, message, context)
+    crate::control::ControlHandle::default().append_event_log(code, message, context)
 }
 
 pub fn append_error_log(error: &KioError) -> Result<()> {
-    append_observation(
-        "errors.jsonl",
-        "error",
-        error.error_code(),
-        error.message(),
-        error.context().clone(),
-    )
+    crate::control::ControlHandle::default().append_error_log(error)
 }
 
 /// Record a `level=warn` observation to `errors.jsonl` (P3, CT2-ADAPTER-010).
 /// Non-fatal: callers use it for warnings that must be observable but must not
 /// stop startup (e.g. a world-readable plaintext `plain:` API key in tools.toml).
 pub fn append_warn_log(code: &str, message: &str, context: Value) -> Result<()> {
-    append_observation("errors.jsonl", "warn", code, message, context)
+    crate::control::ControlHandle::default().append_warn_log(code, message, context)
 }
 
-fn append_observation(
+pub(crate) fn append_observation(
+    session: &LockSession,
+    control: &crate::control::ControlHandle,
     file_name: &str,
     level: &str,
     code: &str,
@@ -4114,7 +3846,7 @@ fn append_observation(
     // invocation, but its OWN error would still be logged here first and scatter
     // `./kio/logs/errors.jsonl` under the working directory. Skip silently (logging
     // is best-effort) rather than create it.
-    let log_dir = data_home().join("kio/logs");
+    let log_dir = data_home(control).join("kio/logs");
     if !log_dir.is_absolute() {
         return Ok(());
     }
@@ -4124,7 +3856,7 @@ fn append_observation(
     // and defeats purge, whose scrubber assumes "path is never recorded". Mask the
     // sensitive keys recursively so nested contexts (e.g. an index partial-failure
     // `output`) are covered too.
-    let redact = redact_logs_enabled();
+    let redact = redact_logs_enabled(control);
     if redact {
         redact_context(&mut context);
     }
@@ -4143,12 +3875,14 @@ fn append_observation(
     // R13-3: the device-global logs (events/errors/metrics) are governed by the
     // device-level `[observability] retention_days` (default 30). Rotation/prune is
     // best-effort inside `append_jsonl_rotating`.
-    let retention = read_logs_retention_days(&config_home().join("kio/config.toml"))
+    let retention = read_logs_retention_days(&config_home(control).join("kio/config.toml"))
         .unwrap_or(DEFAULT_LOG_RETENTION_DAYS);
-    append_jsonl_rotating(
+    append_jsonl_rotating_with_control(
+        session,
+        control,
         &path,
         &json!({
-            "ts": now_utc_seconds(),
+            "ts": control.now_utc_seconds(),
             "level": level,
             "code": code,
             "component": "kio-cli",
@@ -4201,8 +3935,8 @@ fn looks_like_absolute_path_token(token: &str) -> bool {
 /// Whether `redact_logs` is in effect (06 §8 default true). Read from the user
 /// config's `[adapter.policy]`; the observation logs are device-global so the
 /// device-level config governs them. Absent config / key -> the secure default.
-fn redact_logs_enabled() -> bool {
-    let path = config_home().join("kio/config.toml");
+fn redact_logs_enabled(control: &crate::control::ControlHandle) -> bool {
+    let path = config_home(control).join("kio/config.toml");
     let Ok(text) = fs::read_to_string(&path) else {
         return true;
     };
@@ -4251,13 +3985,13 @@ fn redact_context(value: &mut Value) {
     }
 }
 
-fn config_home() -> PathBuf {
+fn config_home(control: &crate::control::ControlHandle) -> PathBuf {
     // R12-6 / R13-6: empty/relative `XDG_CONFIG_HOME` AND empty/relative `HOME` are
     // both invalid — fall back to `$HOME/.config` only for an absolute `HOME`,
     // never to a CWD-relative dir. The CLI startup guard rejects the no-absolute-
     // base case loudly before we reach the `"."` last resort.
     crate::xdg::xdg_dir("XDG_CONFIG_HOME")
-        .or_else(|| crate::xdg::home_dir().map(|home| home.join(".config")))
+        .or_else(|| crate::xdg::home_dir_with_control(control).map(|home| home.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -4594,13 +4328,15 @@ pub(crate) fn tag_ref_corrupt(path: &Path, message: &str) -> KioError {
     )
 }
 
-fn data_home() -> PathBuf {
+fn data_home(control: &crate::control::ControlHandle) -> PathBuf {
     // R12-6 / R13-6: empty/relative `XDG_DATA_HOME` AND empty/relative `HOME` are
     // both invalid — fall back to `$HOME/.local/share` only for an absolute `HOME`,
     // never to a CWD-relative dir. The CLI startup guard rejects the no-absolute-
     // base case loudly before we reach the `"."` last resort.
     crate::xdg::xdg_dir("XDG_DATA_HOME")
-        .or_else(|| crate::xdg::home_dir().map(|home| home.join(".local/share")))
+        .or_else(|| {
+            crate::xdg::home_dir_with_control(control).map(|home| home.join(".local/share"))
+        })
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
@@ -4732,9 +4468,17 @@ pub(crate) fn unsafe_store_error(path: &Path, message: &str) -> KioError {
     )
 }
 
-fn open_working_file_candidate(candidate: &WorkingFileCandidate) -> Result<File> {
+fn open_working_file_candidate(
+    candidate: &WorkingFileCandidate,
+    control: &crate::control::ControlHandle,
+) -> Result<File> {
     if let Some(root) = candidate.bound_root.as_deref() {
-        return open_bound_scope_file_nofollow(root, &candidate.file_name, &candidate.path);
+        return open_bound_scope_file_nofollow(
+            root,
+            &candidate.file_name,
+            &candidate.path,
+            control,
+        );
     }
     open_scope_file_nofollow(&candidate.path)
 }
@@ -4774,8 +4518,9 @@ fn stage_scope_file(
     candidate: WorkingFileCandidate,
     allowed: u64,
     limits: ArchiveLimits,
+    control: &crate::control::ControlHandle,
 ) -> Result<StagedWorkingFile> {
-    let mut source = open_working_file_candidate(&candidate)?;
+    let mut source = open_working_file_candidate(&candidate, control)?;
     let metadata = source.metadata().kio_io(&candidate.path)?;
     if metadata.len() > allowed {
         return Err(scope_input_oversized(
@@ -5014,16 +4759,16 @@ fn bound_marker_exists(kio: &File, namespace: &str, raw_hash: &str) -> Result<bo
 /// Debug-only synchronization seam for descriptor-replacement integration
 /// tests. Production builds never inspect the environment or wait.
 #[cfg(debug_assertions)]
-fn wait_at_bound_snapshot_auto_layout_barrier() {
+fn wait_at_bound_snapshot_auto_layout_barrier(control: &crate::control::ControlHandle) {
     // This helper can run inside an already captured snapshot operation. It
     // must not consult ambient environment variables midway through that
     // operation, or a test barrier could change after the writer lock.
-    let test_control = crate::test_control::current_or_default().core;
+    let test_control = &control.debug().core;
     wait_at_bound_snapshot_auto_barrier(test_control.snapshot_bound_layout_ready.as_deref());
 }
 
 #[cfg(not(debug_assertions))]
-fn wait_at_bound_snapshot_auto_layout_barrier() {}
+fn wait_at_bound_snapshot_auto_layout_barrier(_control: &crate::control::ControlHandle) {}
 
 #[cfg(debug_assertions)]
 fn wait_at_bound_snapshot_auto_barrier(ready_path: Option<&Path>) {
@@ -5251,183 +4996,6 @@ fn validate_format_version(version: &str) -> Result<()> {
     }
 }
 
-thread_local! {
-    /// Reentrancy depth per `.lock` path for the current thread. A whole-command
-    /// lock held by `kio index`/`repair`/`reindex` must not deadlock against the
-    /// `snapshot` sub-step re-acquiring the same lock inside the same process.
-    static LOCK_DEPTH: RefCell<HashMap<(PathBuf, bool), u32>> = RefCell::new(HashMap::new());
-    /// Distinct lock names in one directory (notably `.lock` followed by
-    /// `purge-publication.lock`) share the same directory-flock open file
-    /// description within a thread. This keeps the crash-released gate
-    /// reentrant without weakening cross-process serialization.
-    static LOCK_GATE_POOL: RefCell<HashMap<PathBuf, (u32, File)>> = RefCell::new(HashMap::new());
-}
-
-pub(crate) struct LockGate {
-    key: PathBuf,
-    _file: File,
-    unlock: fn(&File),
-}
-
-impl Drop for LockGate {
-    fn drop(&mut self) {
-        let final_owner = LOCK_GATE_POOL.with(|pool| {
-            let mut pool = pool.borrow_mut();
-            let Some((count, _)) = pool.get_mut(&self.key) else {
-                return false;
-            };
-            *count -= 1;
-            if *count == 0 {
-                pool.remove(&self.key);
-                true
-            } else {
-                false
-            }
-        });
-        if final_owner {
-            (self.unlock)(&self._file);
-        }
-    }
-}
-
-/// RAII guard over the `.kio/.lock` store lock (05 §6). Reentrant within a
-/// process/thread: nested acquisitions increment a depth counter instead of
-/// contending on the same `O_EXCL` file; the on-disk lock is removed only when
-/// the outermost guard drops.
-pub struct StoreLock {
-    path: PathBuf,
-    store_gate: bool,
-    reentrant: bool,
-    // Windows nested guards share an Rc lease, including when the first guard
-    // drops first. Unix keeps the original outer-owner release condition.
-    native: Option<crate::platform::PathLockLease>,
-}
-
-thread_local! {
-    static PATH_LOCK_OWNERS: RefCell<HashMap<(PathBuf, bool), Weak<crate::platform::PathLock>>> = RefCell::new(HashMap::new());
-}
-
-impl StoreLock {
-    pub fn acquire(kio_dir: &Path) -> Result<Self> {
-        validate_store_lock_authority(&StoreDirectory::open(kio_dir)?)?;
-        let lock = Self::acquire_path_kind(kio_dir.join(".lock"), true)?;
-        // The outer acquisition already performed this check while it owned
-        // the real lock.  Besides avoiding redundant work, skipping the
-        // ambient-path read for a nested acquisition lets a descriptor-bound
-        // automatic writer safely reuse this ordinary API.
-        if lock.reentrant {
-            return Ok(lock);
-        }
-        // Acquire first, then inspect through the strict GC parser. This closes
-        // the marker-publication race for every ordinary writer sharing this
-        // central lock entrypoint; GC uses its retained-descriptor counterpart.
-        if let Err(error) = crate::gc::ensure_no_active_sweep(kio_dir) {
-            drop(lock);
-            return Err(error);
-        }
-        Ok(lock)
-    }
-
-    /// Acquire a lock at an explicit file path. Used for device-global locks that
-    /// live outside any single `.kio` store (F8) — e.g. serializing a
-    /// budget/cost read-check-append across every scope on the device (the
-    /// pre-2026-07-18 JSONL cost ledger used this for exactly that; the current
-    /// `cost-ledger.sqlite`, `kio_pipeline::ledger`, instead serializes writers via
-    /// its own `BEGIN IMMEDIATE` transactions — 04-pipeline.md §5.4/§5.8 — so this
-    /// primitive no longer has a live device-global caller, but remains available
-    /// for any future one). Same reentrancy (thread-local depth, keyed by the lock
-    /// path) and stale-reclaim semantics as [`acquire`]; the parent directory is
-    /// created if missing.
-    pub fn acquire_path(path: PathBuf) -> Result<Self> {
-        // Generic device/publication locks are explicitly outside store gating.
-        Self::acquire_path_kind(path, false)
-    }
-
-    fn acquire_path_kind(path: PathBuf, _store_gate: bool) -> Result<Self> {
-        let pid = std::process::id();
-
-        // Reentrant fast path: this thread already holds the lock for `path`.
-        let already_held = LOCK_DEPTH.with(|depth| {
-            let mut depth = depth.borrow_mut();
-            if let Some(count) = depth.get_mut(&(path.clone(), _store_gate)) {
-                *count += 1;
-                true
-            } else {
-                false
-            }
-        });
-        if already_held {
-            let owner = PATH_LOCK_OWNERS.with(|owners| {
-                owners
-                    .borrow()
-                    .get(&(path.clone(), _store_gate))
-                    .and_then(Weak::upgrade)
-            });
-            let native = match crate::platform::scope_semantics::reentrant_path_lock_lease(owner) {
-                Ok(native) => native,
-                Err(error) => {
-                    LOCK_DEPTH.with(|depth| {
-                        if let Some(count) =
-                            depth.borrow_mut().get_mut(&(path.clone(), _store_gate))
-                        {
-                            *count -= 1;
-                        }
-                    });
-                    return Err(error);
-                }
-            };
-            return Ok(Self {
-                path,
-                store_gate: _store_gate,
-                reentrant: true,
-                native,
-            });
-        }
-
-        let native = crate::platform::acquire_path_lock(
-            path.clone(),
-            pid,
-            _store_gate,
-            validate_bound_store_lock_authority,
-            acquire_lock_gate,
-        )?;
-        let (native, owner) = crate::platform::scope_semantics::prepare_path_lock_lease(native);
-        if let Some(owner) = owner {
-            PATH_LOCK_OWNERS.with(|owners| {
-                let mut owners = owners.borrow_mut();
-                owners.retain(|_, owner| owner.strong_count() != 0);
-                owners.insert((path.clone(), _store_gate), Rc::downgrade(&owner));
-            });
-        }
-        LOCK_DEPTH.with(|depth| depth.borrow_mut().insert((path.clone(), _store_gate), 1));
-        Ok(Self {
-            path,
-            store_gate: _store_gate,
-            reentrant: false,
-            native: Some(native),
-        })
-    }
-}
-
-impl Drop for StoreLock {
-    fn drop(&mut self) {
-        let _released = LOCK_DEPTH.with(|depth| {
-            let mut depth = depth.borrow_mut();
-            if let Some(count) = depth.get_mut(&(self.path.clone(), self.store_gate)) {
-                *count -= 1;
-                if *count == 0 {
-                    depth.remove(&(self.path.clone(), self.store_gate));
-                    return true;
-                }
-            }
-            false
-        });
-        crate::platform::finish_path_lock(&mut self.native, _released && !self.reentrant);
-        // `gate` drops after the on-disk release operation, and the kernel
-        // automatically releases it after a process crash.
-    }
-}
-
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct LockFile {
     pub(crate) pid: u32,
@@ -5450,43 +5018,6 @@ pub(crate) fn new_lock_token(pid: u32) -> String {
     hex_prefix(&digest, 32)
 }
 
-pub(crate) type AcquireLockGate =
-    fn(&Path, fn(&Path, &Path) -> Result<File>, fn(&File)) -> Result<LockGate>;
-
-pub(crate) fn acquire_lock_gate(
-    lock_path: &Path,
-    acquire: fn(&Path, &Path) -> Result<File>,
-    unlock: fn(&File),
-) -> Result<LockGate> {
-    let parent = lock_path
-        .parent()
-        .ok_or_else(|| KioError::io("lock path has no parent", lock_path.display().to_string()))?;
-    let key = parent.to_path_buf();
-    if let Some(cloned) = LOCK_GATE_POOL.with(|pool| {
-        let mut pool = pool.borrow_mut();
-        let (count, file) = pool.get_mut(&key)?;
-        let cloned = file.try_clone().ok()?;
-        *count += 1;
-        Some(cloned)
-    }) {
-        return Ok(LockGate {
-            key,
-            _file: cloned,
-            unlock,
-        });
-    }
-    let gate = acquire(parent, lock_path)?;
-    let pooled = gate.try_clone().kio_io(parent)?;
-    LOCK_GATE_POOL.with(|pool| {
-        pool.borrow_mut().insert(key.clone(), (1, pooled));
-    });
-    Ok(LockGate {
-        key,
-        _file: gate,
-        unlock,
-    })
-}
-
 /// A descriptor-relative owner of the ordinary `.kio/.lock` protocol.
 /// Common writer authority and same-thread leases wrap its selected native inner.
 pub struct BoundStoreLock {
@@ -5501,14 +5032,30 @@ impl BoundStoreReadGuard {
         self.native.recheck_idle()
     }
 }
+#[cfg(test)]
 pub(crate) fn acquire_bound_store_lock(kio: &File) -> Result<BoundStoreLock> {
-    validate_bound_store_lock_authority(kio)?;
+    acquire_bound_store_lock_with_control(kio, &crate::control::ControlHandle::default())
+}
+
+pub(crate) fn acquire_bound_store_lock_with_control(
+    kio: &File,
+    control: &crate::control::ControlHandle,
+) -> Result<BoundStoreLock> {
+    validate_bound_store_lock_authority(kio, control)?;
     Ok(BoundStoreLock {
-        _native: crate::platform::acquire_bound_lock(kio, true)?,
+        _native: crate::platform::acquire_bound_lock(kio, true, control)?,
     })
 }
+#[cfg(test)]
 pub(crate) fn acquire_bound_store_read_guard(kio: &File) -> Result<BoundStoreReadGuard> {
-    validate_bound_store_lock_authority(kio)?;
+    acquire_bound_store_read_guard_with_control(kio, &crate::control::ControlHandle::default())
+}
+
+pub(crate) fn acquire_bound_store_read_guard_with_control(
+    kio: &File,
+    control: &crate::control::ControlHandle,
+) -> Result<BoundStoreReadGuard> {
+    validate_bound_store_lock_authority(kio, control)?;
     Ok(BoundStoreReadGuard {
         native: crate::platform::acquire_bound_read_gate(kio)?,
     })
@@ -5518,6 +5065,7 @@ pub(crate) fn acquire_bound_store_read_guard(kio: &File) -> Result<BoundStoreRea
 /// `Rc` deliberately makes it !Send: a different thread must contend through
 /// the real retained lock rather than inheriting reentrancy by path spelling.
 pub struct RetainedStoreLock {
+    _session: LockSession,
     _owner: Rc<BoundStoreLock>,
 }
 
@@ -5525,19 +5073,24 @@ pub struct RetainedPublicationLock {
     _owner: RetainedStoreLock,
 }
 
-fn acquire_retained_publication_lock(kio: &File) -> Result<RetainedPublicationLock> {
-    validate_bound_store_lock_authority(kio)?;
-    let directory = StoreDirectory::from_retained(
+fn acquire_retained_publication_lock(
+    session: &LockSession,
+    kio: &File,
+    control: &crate::control::ControlHandle,
+) -> Result<RetainedPublicationLock> {
+    validate_bound_store_lock_authority(kio, control)?;
+    let directory = StoreDirectory::from_retained_with_control(
         kio.try_clone()
             .map_err(|error| KioError::io(error.to_string(), ".kio"))?,
         PathBuf::from(".kio"),
+        control.clone(),
     )?;
     // A distinct retained child gives publication its own OS-lock identity,
     // including the existing stale-owner recovery protocol, without taking a
     // second flock on the writer's `.kio` directory.
     let publication = directory.create_directory_all(Path::new("internal/publication"))?;
     Ok(RetainedPublicationLock {
-        _owner: acquire_retained_lock_kind(&publication, false)?,
+        _owner: acquire_retained_lock_kind_with_control(session, &publication, false, control)?,
     })
 }
 
@@ -5545,60 +5098,23 @@ fn acquire_retained_publication_lock(kio: &File) -> Result<RetainedPublicationLo
 /// identity lease; the historical path-alias bridge no longer exists.
 pub type BoundReentrantStoreLock = RetainedStoreLock;
 
-#[derive(Clone, PartialEq, Eq)]
-struct BoundLeaseIdentity {
-    store_gate: bool,
-    identity: crate::platform::DirectoryHandleIdentity,
-}
-
-thread_local! {
-    static BOUND_STORE_LEASES: RefCell<Vec<(BoundLeaseIdentity, Weak<BoundStoreLock>)>> = const { RefCell::new(Vec::new()) };
-}
-
-/// Acquire or share the physical lock only for the same retained directory
-/// identity in this thread. A weak entry never keeps an old store alive after
-/// the final guard is dropped.
-pub(crate) fn acquire_retained_store_lock(kio: &File) -> Result<RetainedStoreLock> {
-    validate_bound_store_lock_authority(kio)?;
-    acquire_retained_lock_kind(kio, true)
-}
-
-pub(crate) fn acquire_retained_lock_kind(
+pub(crate) fn acquire_bound_reentrant_store_lock_with_control(
+    session: &LockSession,
     kio: &File,
-    _store_gate: bool,
-) -> Result<RetainedStoreLock> {
-    let identity = BoundLeaseIdentity {
-        store_gate: _store_gate,
-        identity: crate::platform::directory_lease_identity(kio)?,
-    };
-    if let Some(owner) = BOUND_STORE_LEASES.with(|leases| {
-        let mut leases = leases.borrow_mut();
-        leases.retain(|(_, owner)| owner.strong_count() != 0);
-        leases
-            .iter()
-            .find_map(|(known, owner)| (known == &identity).then(|| owner.upgrade()).flatten())
-    }) {
-        return Ok(RetainedStoreLock { _owner: owner });
-    }
-    if _store_gate {
-        validate_bound_store_lock_authority(kio)?;
-    }
-    let owner = Rc::new(BoundStoreLock {
-        _native: crate::platform::acquire_bound_lock(kio, _store_gate)?,
-    });
-    BOUND_STORE_LEASES.with(|leases| leases.borrow_mut().push((identity, Rc::downgrade(&owner))));
-    Ok(RetainedStoreLock { _owner: owner })
+    control: &crate::control::ControlHandle,
+) -> Result<BoundReentrantStoreLock> {
+    acquire_retained_store_lock_with_control(session, kio, control)
 }
 
-pub(crate) fn acquire_bound_reentrant_store_lock(kio: &File) -> Result<BoundReentrantStoreLock> {
-    acquire_retained_store_lock(kio)
-}
-
-pub(crate) fn canonical_lock_bytes(pid: u32, token: &str) -> Result<Vec<u8>> {
+pub(crate) fn canonical_lock_bytes_with_control(
+    control: &crate::control::ControlHandle,
+    pid: u32,
+    token: &str,
+) -> Result<Vec<u8>> {
     let lock = LockFile {
         pid,
         token: token.to_owned(),
-        created_at: now_utc_seconds(),
+        created_at: control.now_utc_seconds(),
     };
     serde_json::to_vec(&lock).map_err(|error| KioError::io(error.to_string(), ".kio/.lock"))
 }
@@ -5693,31 +5209,11 @@ pub(crate) fn is_ulid(value: &str) -> bool {
 }
 
 pub fn now_utc_seconds() -> String {
-    if let Some(value) = fixed_now_override() {
-        return value;
-    }
     let secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
     format_unix_seconds(secs)
-}
-
-/// Debug-only override for the current time via `KIO_FIXED_NOW`. The contract
-/// tests (which build in debug) use it to pin `created_at`. It is compiled out
-/// of release binaries so a production timestamp cannot be forged through the
-/// environment.
-#[cfg(debug_assertions)]
-fn fixed_now_override() -> Option<String> {
-    crate::test_control::current_or_default()
-        .fixed_now
-        .known()
-        .cloned()
-}
-
-#[cfg(not(debug_assertions))]
-fn fixed_now_override() -> Option<String> {
-    None
 }
 
 fn format_unix_seconds(secs: i64) -> String {
@@ -5867,11 +5363,15 @@ fn validate_store_lock_authority(directory: &StoreDirectory) -> Result<()> {
     validate_stable_store_gate(directory)
 }
 
-pub(crate) fn validate_bound_store_lock_authority(kio: &File) -> Result<()> {
-    let directory = StoreDirectory::from_retained(
+pub(crate) fn validate_bound_store_lock_authority(
+    kio: &File,
+    control: &crate::control::ControlHandle,
+) -> Result<()> {
+    let directory = StoreDirectory::from_retained_with_control(
         kio.try_clone()
             .map_err(|e| KioError::io(e.to_string(), ".kio"))?,
         PathBuf::from(".kio"),
+        control.clone(),
     )?;
     validate_store_lock_authority(&directory)
 }
@@ -5881,10 +5381,8 @@ pub(crate) fn validate_bound_store_lock_authority(kio: &File) -> Result<()> {
 /// public path is used only to acquire the initial no-follow directory
 /// capability; the closure never resolves it again.
 ///
-/// Approval writers are also called while a repository command already holds
-/// [`Repository::lock_store`].  `acquire_retained_store_lock` keys leases by
-/// the retained directory identity, so that case shares the caller's guard
-/// instead of attempting a second OS lock.
+/// Standalone approval writers own fresh lock authority. Nested repository
+/// approval mutations use the repository's explicit operation session.
 fn with_bound_scope_approval_write<T>(
     kio_dir: &Path,
     operation: impl FnOnce(&StoreDirectory) -> Result<T>,
@@ -6274,7 +5772,13 @@ fn revoke_network_approval_in_directory(
 #[cfg(test)]
 mod tests {
     #[cfg(windows)]
-    use super::canonical_lock_bytes;
+    fn canonical_lock_bytes(pid: u32, token: &str) -> super::Result<Vec<u8>> {
+        super::canonical_lock_bytes_with_control(
+            &crate::control::ControlHandle::default(),
+            pid,
+            token,
+        )
+    }
     use super::{
         ArchiveLimits, DEFAULT_MAX_ARCHIVE_FILE_BYTES, MAX_TREE_ENTRIES, PendingNormalizeRef,
         RELEASED_LOCK_PID, Repository, StoreLock, append_jsonl_rotating, civil_from_days,
@@ -6532,11 +6036,16 @@ mod tests {
         let scope = tempfile::tempdir().unwrap();
         let repo = Repository::init(scope.path()).unwrap();
         let retained = cap_fs::open_ambient_dir(repo.kio_dir(), ambient_authority()).unwrap();
-        let outer = super::acquire_bound_reentrant_store_lock(&retained).unwrap();
+        let outer = super::acquire_bound_reentrant_store_lock_with_control(
+            repo.lock_session(),
+            &retained,
+            repo.control(),
+        )
+        .unwrap();
         // Model a fork-inherited duplicate of the directory open-file
         // description. The final logical lease must explicitly unlock it.
         let inherited_gate = outer._owner._native._gate.file.try_clone().unwrap();
-        let nested = repo.lock_store().unwrap();
+        let nested = repo.lock_store_in_session(repo.lock_session()).unwrap();
         drop(outer);
         // Each logical guard owns the same Rc lease; dropping the outer
         // scheduler guard cannot release the physical lock while nested work
@@ -6552,7 +6061,7 @@ mod tests {
     fn retained_repository_lock_contends_across_threads() {
         let scope = tempfile::tempdir().unwrap();
         let repo = Repository::init(scope.path()).unwrap();
-        let held = repo.lock_store().unwrap();
+        let held = repo.lock_store_in_session(repo.lock_session()).unwrap();
         let root = scope.path().to_path_buf();
         let contender =
             std::thread::spawn(move || Repository::open(&root).unwrap().lock_store().map(drop));
@@ -6583,7 +6092,7 @@ mod tests {
     fn retained_publication_lock_is_distinct_from_writer_and_stays_on_retained_parent() {
         let scope = tempfile::tempdir().unwrap();
         let repo = Repository::init(scope.path()).unwrap();
-        let writer = repo.lock_store().unwrap();
+        let writer = repo.lock_store_in_session(repo.lock_session()).unwrap();
         let publication = repo.lock_purge_publication().unwrap();
         assert!(
             scope
@@ -6833,10 +6342,11 @@ mod tests {
             .join("refs/tags-v1")
             .join(super::portable_tag_leaf("held"));
 
-        let held = repo.lock_store().unwrap();
+        let held = repo.lock_store_in_session(repo.lock_session()).unwrap();
+        let root = repo.canonical_root().to_path_buf();
         let blocked = std::thread::scope(|scope| {
             scope
-                .spawn(|| repo.delete_tag("held"))
+                .spawn(|| Repository::open(&root).unwrap().delete_tag("held"))
                 .join()
                 .unwrap()
                 .unwrap_err()
@@ -7265,7 +6775,7 @@ mod tests {
         // The cross-thread call cannot enter revoke's read/modify/write
         // region while this command owns the same retained store identity.
         // This is a deterministic contention check, not a scheduling race.
-        let held = repo.lock_store().unwrap();
+        let held = repo.lock_store_in_session(repo.lock_session()).unwrap();
         let kio = repo.kio_dir().to_path_buf();
         let blocked = std::thread::spawn(move || {
             revoke_network_approval(
@@ -7437,9 +6947,9 @@ mod tests {
         let repo = Repository::init(dir.path()).unwrap();
         let kio = repo.bound_kio_handle().unwrap();
         let held = super::acquire_bound_store_lock(kio).unwrap();
-        assert!(repo.lock_store().is_err());
+        assert!(repo.lock_store_in_session(repo.lock_session()).is_err());
         drop(held);
-        let ordinary = repo.lock_store().unwrap();
+        let ordinary = repo.lock_store_in_session(repo.lock_session()).unwrap();
         assert!(super::acquire_bound_store_lock(kio).is_err());
         drop(ordinary);
         assert!(super::acquire_bound_store_lock(kio).is_ok());
@@ -7469,7 +6979,11 @@ mod tests {
         fs::rename(&root, dir.path().join("moved")).unwrap();
         fs::create_dir(&root).unwrap();
         fs::write(root.join("doc.md"), b"replacement must not be read").unwrap();
-        let mut file = super::open_working_file_candidate(candidate).unwrap();
+        let mut file = super::open_working_file_candidate(
+            candidate,
+            &crate::control::ControlHandle::default(),
+        )
+        .unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"retained input");
@@ -8486,7 +8000,6 @@ mod tests {
                 None,
                 None,
                 None,
-                None,
             )
             .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-SNAPSHOT-AUTHORITY-CHANGED-001");
@@ -8634,7 +8147,9 @@ mod tests {
             "KIO-E-PUBLICATION-RECOVERY-REQUIRED-001"
         );
         let recover = Repository::open_for_recovery(dir.path()).unwrap();
-        let _lock = recover.lock_store().unwrap();
+        let _lock = recover
+            .lock_store_in_session(recover.lock_session())
+            .unwrap();
         assert!(recover.recover_publication().unwrap());
         assert_eq!(recover.head_commit_hash().unwrap(), Some(c2_hash.clone()));
         assert!(

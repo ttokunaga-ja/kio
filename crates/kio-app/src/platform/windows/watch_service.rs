@@ -1,10 +1,10 @@
 use crate::platform::{runner_argv, xml_escape};
+use crate::response::watch::NativeServiceState;
 use crate::watch_service::{
     ServiceEnvironment, ServiceManifest, invalid, manifest_locator, run_native, run_native_output,
     service_error, validate_argument_path,
 };
 use kio_core::Result;
-use serde_json::{Value, json};
 use std::env;
 use std::path::{Path, PathBuf};
 
@@ -169,7 +169,7 @@ pub(crate) fn native_after_remove() -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<Value> {
+pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<NativeServiceState> {
     let output = run_native_output(
         schtasks_path()?,
         [
@@ -185,7 +185,10 @@ pub(crate) fn native_state(manifest: &ServiceManifest) -> Result<Value> {
             "Task Scheduler could not report native watch registration",
         ));
     }
-    Ok(json!({"registered":true,"active":output.stdout.contains("Running")}))
+    Ok(NativeServiceState {
+        registered: true,
+        active: output.stdout.contains("Running"),
+    })
 }
 
 fn schtasks_path() -> Result<PathBuf> {

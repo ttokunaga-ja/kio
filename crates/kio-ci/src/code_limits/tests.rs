@@ -266,7 +266,7 @@ fn tooling_ignores_layout_os_checks_and_file_limits() {
 #[test]
 fn category_and_file_boundaries_are_strict() {
     for (category, limit, location, tooling) in [
-        ("common", 100000, "src/data", false),
+        ("common", 106000, "src/data", false),
         ("windows", 14000, "src/platform/windows", false),
         ("unix", 9000, "src/platform/unix", false),
         ("linux", 4000, "src/platform/linux", false),

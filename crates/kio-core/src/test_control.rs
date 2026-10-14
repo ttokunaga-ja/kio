@@ -5,7 +5,6 @@
 //! [`Selector::Unknown`] for a set but unsupported selector; unknown values are
 //! never silently treated as an enabled mock or fault point.
 
-use std::cell::RefCell;
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
@@ -197,6 +196,7 @@ pub struct CliTestControl {
     pub aggregator_projection_fault: Selector<AggregatorProjectionFault>,
     pub replica_after_head_fault: Selector<ReplicaFault>,
     pub search_response_barrier_ready: Option<PathBuf>,
+    pub search_final_consent_barrier_ready: Option<PathBuf>,
     pub query_embed_trace: Option<PathBuf>,
     pub markdownize_adapter: Selector<MarkdownizeAdapterMode>,
     pub gc_post_publication_ready: Option<PathBuf>,
@@ -215,53 +215,6 @@ pub struct DebugTestControl {
     pub adapters: AdapterTestControl,
     pub core: CoreTestControl,
     pub cli: CliTestControl,
-}
-
-thread_local! {
-    static INSTALLED: RefCell<Option<DebugTestControl>> = const { RefCell::new(None) };
-}
-
-/// Install the operation snapshot used by downstream crates on this thread.
-///
-/// The CLI calls this exactly once after parsing arguments. Library operation
-/// roots that do not run through the CLI use [`capture_for_operation`] and pass
-/// the relevant typed sub-control explicitly instead.
-pub fn install(control: DebugTestControl) {
-    INSTALLED.with(|slot| *slot.borrow_mut() = Some(control));
-}
-
-/// Temporarily replace the installed snapshot and restore it on drop.
-pub struct InstalledTestControlGuard {
-    previous: Option<DebugTestControl>,
-}
-
-pub fn install_scoped(control: DebugTestControl) -> InstalledTestControlGuard {
-    let previous = INSTALLED.with(|slot| slot.borrow_mut().replace(control));
-    InstalledTestControlGuard { previous }
-}
-
-impl Drop for InstalledTestControlGuard {
-    fn drop(&mut self) {
-        INSTALLED.with(|slot| *slot.borrow_mut() = self.previous.take());
-    }
-}
-
-/// Return the snapshot installed by the current composition root.
-pub fn current() -> Option<DebugTestControl> {
-    INSTALLED.with(|slot| slot.borrow().clone())
-}
-
-/// Capture one operation-local snapshot, reusing the composition-root value
-/// when one is already installed.
-pub fn capture_for_operation() -> DebugTestControl {
-    current().unwrap_or_else(DebugTestControl::from_env)
-}
-
-/// Read the installed snapshot without consulting the ambient environment.
-/// Downstream helpers use this so a missing composition root disables test
-/// controls instead of reparsing them part-way through an operation.
-pub fn current_or_default() -> DebugTestControl {
-    current().unwrap_or_default()
 }
 
 /// Process-wide lock for tests that temporarily mutate environment variables.
@@ -362,6 +315,9 @@ impl DebugTestControl {
                     ReplicaFault::parse,
                 ),
                 search_response_barrier_ready: path("KIO_TEST_SEARCH_RESPONSE_BARRIER_READY"),
+                search_final_consent_barrier_ready: path(
+                    "KIO_TEST_SEARCH_FINAL_CONSENT_BARRIER_READY",
+                ),
                 query_embed_trace: path("KIO_TEST_QUERY_EMBED_TRACE"),
                 markdownize_adapter: selector(
                     "KIO_TEST_MARKDOWNIZE_ADAPTER",
@@ -437,12 +393,109 @@ mod tests {
     fn installed_snapshot_ignores_later_environment_mutation() {
         let _lock = test_env_lock().lock().unwrap();
         let _initial = TestEnvGuard::set("KIO_TEST_GC_PRELOCK_READY", "/tmp/initial-ready");
-        let _installed = install_scoped(DebugTestControl::from_env());
+        let control = crate::control::ControlHandle::new(DebugTestControl::from_env());
         let _changed = TestEnvGuard::set("KIO_TEST_GC_PRELOCK_READY", "/tmp/later-ready");
 
         assert_eq!(
-            current_or_default().cli.gc_prelock_ready,
+            control.debug().cli.gc_prelock_ready,
             Some(PathBuf::from("/tmp/initial-ready"))
+        );
+    }
+
+    #[test]
+    fn owner_control_isolation_survives_nested_error_panic_and_worker() {
+        use crate::control::ControlHandle;
+
+        let outer = ControlHandle::new(DebugTestControl {
+            fixed_now: Selector::Known("2026-08-25T00:00:00Z".to_owned()),
+            ..DebugTestControl::default()
+        });
+        let inner = ControlHandle::new(DebugTestControl {
+            fixed_now: Selector::Known("2026-08-26T00:00:00Z".to_owned()),
+            ..DebugTestControl::default()
+        });
+        let nested: crate::Result<()> = {
+            assert_eq!(inner.now_utc_seconds(), "2026-08-26T00:00:00Z");
+            Err(crate::KioError::invalid_usage("nested operation failed"))
+        };
+        assert!(nested.is_err());
+        assert_eq!(outer.now_utc_seconds(), "2026-08-25T00:00:00Z");
+        assert!(
+            std::panic::catch_unwind(|| {
+                assert_eq!(inner.now_utc_seconds(), "2026-08-26T00:00:00Z");
+                panic!("nested operation panicked");
+            })
+            .is_err()
+        );
+        let worker = outer.clone();
+        assert_eq!(
+            std::thread::spawn(move || worker.now_utc_seconds())
+                .join()
+                .unwrap(),
+            "2026-08-25T00:00:00Z"
+        );
+        assert_eq!(outer.now_utc_seconds(), "2026-08-25T00:00:00Z");
+        fn require_send_sync<T: Send + Sync>() {}
+        require_send_sync::<ControlHandle>();
+    }
+
+    #[test]
+    fn owner_control_clock_preserves_literal_ledger_parser_behavior() {
+        use crate::control::ControlHandle;
+
+        let control = |value: &str| {
+            ControlHandle::new(DebugTestControl {
+                fixed_now: Selector::Known(value.to_owned()),
+                ..DebugTestControl::default()
+            })
+        };
+        let epoch = control("1970-01-01T00:00:00Z");
+        assert_eq!(epoch.now_utc_seconds(), "1970-01-01T00:00:00Z");
+        assert_eq!(epoch.now_millis(), 0);
+        // Existing ledger parsing accepts signed two-byte numeric fields and
+        // checks only upper bounds on hour/minute/second. Preserve that shape.
+        assert_eq!(control("1970-01-01T-1:00:00Z").now_millis(), -3_600_000);
+        assert_eq!(control("1970-01-01T+1:00:00Z").now_millis(), 3_600_000);
+        assert_eq!(control("1970-01-01T00:-1:00Z").now_millis(), -60_000);
+        assert_eq!(control("1970-01-01T00:00:-1Z").now_millis(), -1_000);
+        let fractional = control("1970-01-01T00:00:00.123Z");
+        assert_eq!(fractional.now_utc_seconds(), "1970-01-01T00:00:00.123Z");
+        assert!(fractional.now_millis() > 0);
+        assert!(ControlHandle::default().now_millis() > 0);
+    }
+
+    #[test]
+    fn owner_control_derived_directory_inherits_durability_snapshot() {
+        use crate::control::ControlHandle;
+        use crate::store_dir::{Publication, StoreDirectory};
+        use std::path::Path;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let ready = fixture.path().join("ready");
+        std::fs::write(ready.with_extension("release"), b"release").unwrap();
+        let control = ControlHandle::new(DebugTestControl {
+            core: CoreTestControl {
+                durability_point: Selector::Known(DurabilityPoint::AtomicWriteStaged),
+                durability_ready: Some(ready.clone()),
+                ..CoreTestControl::default()
+            },
+            ..DebugTestControl::default()
+        });
+        let root = fixture.path().canonicalize().unwrap();
+        let owner = StoreDirectory::open_with_control(&root, control).unwrap();
+        owner.create_directory(Path::new("child")).unwrap();
+        let (derived, leaf) = owner.retained_parent(Path::new("child/value")).unwrap();
+        derived
+            .write_atomic(Path::new(&leaf), b"complete", Publication::CreateOnly)
+            .unwrap();
+        assert_eq!(
+            std::fs::read(fixture.path().join("child/value")).unwrap(),
+            b"complete"
+        );
+        assert!(
+            std::fs::read_to_string(ready)
+                .unwrap()
+                .contains("point=atomic_write_staged\n")
         );
     }
 

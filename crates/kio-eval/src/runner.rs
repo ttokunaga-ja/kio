@@ -1099,25 +1099,6 @@ mod tests {
     }
 
     #[cfg(windows)]
-    struct WindowsPreAttachDelay(Option<Duration>);
-
-    #[cfg(windows)]
-    impl WindowsPreAttachDelay {
-        fn set(delay: Duration) -> Self {
-            let previous =
-                kio_process::platform::replace_windows_pre_attach_delay_for_test(Some(delay));
-            Self(previous)
-        }
-    }
-
-    #[cfg(windows)]
-    impl Drop for WindowsPreAttachDelay {
-        fn drop(&mut self) {
-            let _ = kio_process::platform::replace_windows_pre_attach_delay_for_test(self.0);
-        }
-    }
-
-    #[cfg(windows)]
     fn assert_windows_job_timeout_terminates_descendant(
         delay_before_attach: Option<Duration>,
         timeout: Duration,
@@ -1129,7 +1110,6 @@ mod tests {
             System::Threading::{OpenProcess, WaitForSingleObject},
         };
 
-        let _delay = delay_before_attach.map(WindowsPreAttachDelay::set);
         let marker = tempfile::NamedTempFile::new()
             .expect("create descendant marker")
             .into_temp_path();
@@ -1140,16 +1120,21 @@ mod tests {
             .arg("--nocapture")
             .env("KIO_EVAL_WINDOWS_JOB_MARKER", &marker);
         let started = Instant::now();
-        let error = run_bounded_command(
-            &mut command,
-            BoundedProcessOptions {
-                timeout,
-                max_stdout_bytes: 1024,
-                max_stderr_bytes: 1024,
-            },
-            None,
-        )
-        .unwrap_err();
+        let options = BoundedProcessOptions {
+            timeout,
+            max_stdout_bytes: 1024,
+            max_stderr_bytes: 1024,
+        };
+        let result = match delay_before_attach {
+            Some(delay) => kio_process::platform::run_bounded_command_with_control_for_test(
+                &mut command,
+                options,
+                None,
+                kio_process::platform::ProcessControl::pre_attach_delay(delay),
+            ),
+            None => run_bounded_command(&mut command, options, None),
+        };
+        let error = result.unwrap_err();
         assert!(matches!(
             error,
             BoundedProcessError::Timeout { timeout_ms }

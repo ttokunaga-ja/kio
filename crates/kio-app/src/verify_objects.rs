@@ -1,25 +1,54 @@
 //! Bounded object-store verification for `repair verify-objects`.
 
+use crate::context::EvidenceRegistry;
+use crate::index::chunk_ledger::check_index_generation_current;
+use crate::index::chunk_ledger::recover_index_generation;
+use crate::index::chunk_ledger::sqlite_path;
+use crate::index::rebuild::durable_history_roots;
+use crate::object_persistence::index_to_kio;
+use crate::open_view::PointInTimeAttribution;
+use crate::open_view::parse_object_uri;
+use crate::open_view::parse_pointer_text;
+use crate::open_view::read_pointer_input;
+use crate::open_view::verify_point_in_time_attribution;
+use crate::scope_access::ReadBarrierCheckpoint;
+use crate::scope_access::enforce_canonical_marker_barrier;
+use crate::scope_access::invalid_pointer_identity_error;
+use crate::scope_access::is_store_not_found;
+use crate::scope_access::preflight_barrier_and_index;
+use crate::scope_access::resolve_evidence_scope_target;
+use crate::scope_access::unresolvable_commit_pointer_error;
+use crate::search::scope::ScopeTarget;
+use kio_core::ExitCode;
+use kio_core::control::ControlHandle;
+use kio_index::fts::ExistingSourceIndexOpenMode;
+use kio_index::fts::FtsSchemaConfig;
+use kio_index::fts::FtsTokenizer;
+use kio_index::fts::open_existing_source_index_connection;
+use kio_index::registry::RegistryDb;
+use kio_pipeline::markdownize::UnitStatus;
+use kio_search::evidence::EvidencePointer;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::commands::{EvidenceArgs, EvidenceCommand, EvidenceRetargetArgs, EvidenceVerifyArgs};
+use crate::commands::{EvidenceArgs, EvidenceCommand, EvidenceVerifyArgs};
 
 use kio_core::cas::{
     AccountedReadError, ChunkObject, ContentObjectKind, EmbeddingObject, MAX_RAW_OBJECT_BYTES,
     ObjectKind, ObjectStore, canonical_json_bytes, hash_bytes, is_hash, read_bounded_regular_file,
 };
 use kio_core::dag::{CommitObject, NormalizeRef, TreeObject};
-use kio_core::gc::{GcSweepSession, read_active_marker, read_shallow_receipts};
+use kio_core::gc::{GcSweepSession, read_active_marker_with_control, read_shallow_receipts};
 use kio_core::portable::{portable_tag_digest64, portable_tag_name_has_unassigned};
 use kio_core::purge::{
     CanonicalFinalEvent, EventKind, LifecycleEvent, MAX_PURGE_RECORD_BYTES, PurgeState,
     TombstoneMode, canonical_final_event,
 };
-use kio_core::scope::{Repository, names_jsonl_path, now_utc_seconds};
+use kio_core::scope::{Repository, names_jsonl_path};
 use kio_core::{KioError, Result};
-use kio_index::fts::{RetargetCandidates, SourceIndexConnection};
+use kio_index::fts::SourceIndexConnection;
 use kio_pipeline::markdownize::{
     NormalizedInstanceIdentity, NormalizedInstanceManifest, ValidatedNormalizedInstance,
     load_validated_normalized_units_from_manifest, validate_normalized_instance,
@@ -27,7 +56,14 @@ use kio_pipeline::markdownize::{
 use serde::Serialize;
 use serde_json::{Value, json};
 
-use crate::*;
+mod evidence_batch;
+pub(crate) mod response;
+mod retarget;
+
+use response::{EvidenceStatus, EvidenceVerification};
+
+use evidence_batch::run_evidence_batch;
+use retarget::run_evidence_retarget;
 
 const MAX_OBJECTS: usize = 1_000_000;
 const MAX_VERIFIED_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
@@ -70,669 +106,49 @@ fn exact_pinned_content_unit_for_chunk<'a>(
         .ok_or(ChunkPinnedUnitError::IdentityMismatch)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum EvidenceStatus {
-    Alive,
-    Tombstoned,
-    NotFound,
-    ScopeUnreachable,
-    Unverifiable,
-    RegistryDuplicate,
-}
-
-impl EvidenceStatus {
-    const fn as_str(self) -> &'static str {
-        match self {
-            Self::Alive => "alive",
-            Self::Tombstoned => "tombstoned",
-            Self::NotFound => "not_found",
-            Self::ScopeUnreachable => "scope_unreachable",
-            Self::Unverifiable => "unverifiable",
-            Self::RegistryDuplicate => "registry_duplicate",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct EvidenceVerifyResult {
-    status: EvidenceStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error_code: Option<String>,
-    details: Value,
-}
-
-#[derive(Debug, Clone)]
-struct EvidenceVerification {
-    result: EvidenceVerifyResult,
-    exit: ExitCode,
-}
-
-impl EvidenceVerification {
-    fn new(
-        status: EvidenceStatus,
-        error_code: Option<&str>,
-        details: Value,
-        exit: ExitCode,
-    ) -> Self {
-        Self {
-            result: EvidenceVerifyResult {
-                status,
-                error_code: error_code.map(str::to_owned),
-                details,
-            },
-            exit,
-        }
-    }
-
-    fn value(&self) -> Result<Value> {
-        serde_json::to_value(&self.result).map_err(|error| KioError::schema(error.to_string()))
-    }
-}
-
 const MAX_BATCH_INPUT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_BATCH_LINE_BYTES: usize = 64 * 1024;
 const MAX_BATCH_RECORDS: usize = 4096;
 const MAX_BATCH_SCOPES: usize = 256;
 const MAX_BATCH_VERIFIED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
-pub(super) fn run_evidence(args: EvidenceArgs) -> Result<Value> {
+pub(super) fn run_evidence(
+    ctx: &crate::invocation::Invocation<'_>,
+    args: EvidenceArgs,
+) -> Result<crate::response::CommandResponse> {
+    let registry_input = &EvidenceRegistry::default();
     match args.command {
-        EvidenceCommand::Verify(args) => run_evidence_verify(args),
-        EvidenceCommand::Retarget(args) => run_evidence_retarget(args),
+        EvidenceCommand::Verify(args) => run_evidence_verify(ctx, registry_input, args),
+        EvidenceCommand::Retarget(args) => run_evidence_retarget(ctx, registry_input, args),
     }
 }
 
-fn run_evidence_verify(args: EvidenceVerifyArgs) -> Result<Value> {
+fn run_evidence_verify(
+    ctx: &crate::invocation::Invocation<'_>,
+    registry_input: &EvidenceRegistry,
+    args: EvidenceVerifyArgs,
+) -> Result<crate::response::CommandResponse> {
     if let Some(batch) = args.batch {
-        return run_evidence_batch(&batch, args.strict);
+        return run_evidence_batch(ctx, registry_input, &batch, args.strict);
     }
     let pointer_operand = args.pointer.expect("clap requires pointer or --batch");
     let strict = args.strict;
-    let raw = read_pointer_input(vec![pointer_operand])?;
+    let raw = read_pointer_input(ctx, vec![pointer_operand])?;
     if raw.starts_with("sha256:") || parse_object_uri(&raw)?.is_some() {
         return Err(KioError::invalid_usage(
             "evidence verify accepts only a pointer URI, inline JSON, or '-' stdin",
         ));
     }
     let pointer = parse_pointer_text(&raw)?;
-    let verification = verify_pointer_for_cli(&pointer, strict)?;
-    let mut output = verification.value()?;
-    if verification.exit != ExitCode::Success {
-        set_exit_override(&mut output, verification.exit);
-    }
-    Ok(output)
-}
-
-const MAX_RETARGET_VERIFIED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-
-fn retarget_error(code: &'static str, message: &'static str) -> KioError {
-    KioError::new(code, message, json!({}), ExitCode::PermanentFailure)
-}
-
-fn retarget_limit_error() -> KioError {
-    retarget_error(
-        "KIO-E-EVIDENCE-RETARGET-LIMIT-001",
-        "evidence retarget exceeded a bounded read or candidate limit",
-    )
-}
-
-fn retarget_not_found_error() -> KioError {
-    retarget_error(
-        "KIO-E-EVIDENCE-RETARGET-NOT-FOUND-001",
-        "no exact Evidence retarget match exists at the requested commit",
-    )
-}
-
-fn retarget_ambiguous_error() -> KioError {
-    retarget_error(
-        "KIO-E-EVIDENCE-RETARGET-AMBIG-001",
-        "more than one exact Evidence retarget match exists at the requested commit",
-    )
-}
-
-fn retarget_shallow_error(message: &'static str, commit_hash: &str) -> KioError {
-    KioError::new(
-        "KIO-E-COMMIT-SHALLOW-001",
-        message,
-        json!({"commit_hash": commit_hash}),
-        ExitCode::PartialFailure,
-    )
-}
-
-fn map_retarget_old_authority_error(error: KioError) -> KioError {
-    if error.error_code() == "KIO-E-EVIDENCE-RETARGET-REQUIRED-001"
-        || is_store_not_found(&error)
-        || error.exit_code() == ExitCode::InvalidUsage
-    {
-        retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "old Evidence CAS authority is missing or has an invalid schema",
-        )
-    } else {
-        error
-    }
-}
-
-fn retarget_old_verification_error(
-    verification: EvidenceVerification,
-    pointer: &EvidencePointer,
-) -> KioError {
-    match verification.result.status {
-        EvidenceStatus::Tombstoned | EvidenceStatus::NotFound => KioError::new(
-            verification
-                .result
-                .error_code
-                .as_deref()
-                .unwrap_or("KIO-E-EVIDENCE-RETARGET-NOT-FOUND-001"),
-            "old Evidence pointer is not retargetable",
-            verification.result.details,
-            ExitCode::PermanentFailure,
-        ),
-        EvidenceStatus::Unverifiable => {
-            if verification
-                .result
-                .details
-                .get("reason")
-                .and_then(Value::as_str)
-                == Some("commit_shallow")
-            {
-                retarget_shallow_error(
-                    "old Evidence commit is shallow; retarget requires its tree",
-                    &pointer.commit,
-                )
-            } else {
-                retarget_error(
-                    "KIO-E-STORE-CORRUPT-001",
-                    "old Evidence attribution cannot be authenticated",
-                )
-            }
-        }
-        EvidenceStatus::Alive => retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "old Evidence verification unexpectedly reported alive as a failure",
-        ),
-        EvidenceStatus::ScopeUnreachable | EvidenceStatus::RegistryDuplicate => {
-            retarget_not_found_error()
-        }
-    }
-}
-
-/// Exact, history-pinned Evidence reissue.  SQLite is used only to enumerate
-/// bounded possible chunks; every authority used below comes from the target
-/// tree, manifest/unit CAS, and chunk CAS.
-fn run_evidence_retarget(args: EvidenceRetargetArgs) -> Result<Value> {
-    if !is_hash(&args.at) {
-        return Err(KioError::invalid_usage(
-            "--at must be a full lowercase `sha256:` object hash",
-        ));
-    }
-    let raw = read_pointer_input(vec![args.pointer])?;
-    if raw.starts_with("sha256:") || parse_object_uri(&raw)?.is_some() {
-        return Err(KioError::invalid_usage(
-            "evidence retarget accepts only a pointer URI, inline JSON, or '-' stdin",
-        ));
-    }
-    let pointer = parse_pointer_text(&raw)?;
-    kio_core::cas::with_verified_cas_read_budget(MAX_RETARGET_VERIFIED_BYTES, || {
-        run_evidence_retarget_bound(&pointer, &args.at)
-    })
-    .map(|(value, _)| value)
-    .map_err(|error| {
-        if matches!(
-            error.error_code(),
-            "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001" | "KIO-E-COMMIT-HISTORY-LIMIT-001"
-        ) {
-            retarget_limit_error()
-        } else {
-            error
-        }
-    })
-}
-
-fn run_evidence_retarget_bound(pointer: &EvidencePointer, at: &str) -> Result<Value> {
-    let binding = bind_evidence_scope(pointer, true)?;
-    let EvidenceScopeState::Ready {
-        target,
-        repo,
-        checkpoint,
-        source_index,
-        ..
-    } = &binding.state
-    else {
-        // Scope discovery has its own externally visible classifications; do
-        // not turn an authority failure into an ordinary exact-match miss.
-        return match &binding.state {
-            EvidenceScopeState::Unavailable(result) => Err(KioError::new(
-                result
-                    .result
-                    .error_code
-                    .as_deref()
-                    .unwrap_or("KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001"),
-                "Evidence retarget scope is unavailable",
-                result.result.details.clone(),
-                result.exit,
-            )),
-            EvidenceScopeState::Ready { .. } => unreachable!(),
-        };
-    };
-    // Authenticate and bound the old immutable inputs before the canonical
-    // verifier can traverse their manifest units. Missing chunk CAS is a
-    // retarget corruption condition, whereas a missing tree is left to the
-    // verifier's existing shallow-state judgment.
-    let old_commit = match repo.read_commit(&pointer.commit) {
-        Ok(commit) => commit,
-        Err(error) if is_store_not_found(&error) => {
-            return Err(unresolvable_commit_pointer_error(pointer));
-        }
-        Err(error) if error.exit_code() == ExitCode::InvalidUsage => {
-            return Err(retarget_error(
-                "KIO-E-STORE-CORRUPT-001",
-                "old Evidence commit CAS object has an invalid schema",
-            ));
-        }
-        Err(error) => return Err(error),
-    };
-    let old_tree = match repo.read_tree(&old_commit.tree) {
-        Ok(tree) => Some(tree),
-        Err(error) if is_store_not_found(&error) => None,
-        Err(error) if error.exit_code() == ExitCode::InvalidUsage => {
-            return Err(retarget_error(
-                "KIO-E-STORE-CORRUPT-001",
-                "old Evidence tree CAS object has an invalid schema",
-            ));
-        }
-        Err(error) => return Err(error),
-    };
-    let store = ObjectStore::new(&target.kio_dir);
-    if let Some(marker_verification) =
-        canonical_pointer_marker_verification(pointer, true, target, &store, checkpoint)?
-    {
-        binding.recheck()?;
-        return Err(retarget_old_verification_error(
-            marker_verification,
-            pointer,
-        ));
-    }
-    if let Some(tree) = &old_tree
-        && let Some(entry) = canonical_pointer_tree_entry(tree, pointer)
-        && let Some(normalize) = &entry.normalize
-    {
-        retarget_manifest_unit_preflight(&target.kio_dir, &pointer.raw_hash, normalize, false)?;
-    }
-    // Run the same canonical verifier used by `evidence verify` before doing
-    // any retarget-specific reconstruction.  Optional presentation fields on
-    // the input have no effect on this judgment.
-    let canonical = verify_pointer_in_scope(pointer, true, target, repo, checkpoint, source_index)
-        .map_err(map_retarget_old_authority_error)?;
-    if canonical.result.status != EvidenceStatus::Alive {
-        // A final retained binding check takes precedence over a stale
-        // classification produced before a concurrent purge/index change.
-        binding.recheck()?;
-        return Err(retarget_old_verification_error(canonical, pointer));
-    }
-    let old_tree = old_tree.ok_or_else(|| {
-        retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "canonical old Evidence verification accepted a missing tree",
-        )
+    let (verification, _) = kio_core::cas::VerifiedCasReadBudget::new().run(u64::MAX, |reads| {
+        verify_pointer_for_cli(ctx, registry_input, &pointer, strict, reads)
     })?;
-    let old_entry = canonical_pointer_tree_entry(&old_tree, pointer).ok_or_else(|| {
-        retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "old Evidence pointer has no canonical normalized tree entry",
-        )
-    })?;
-    let old_normalize = old_entry
-        .normalize
-        .as_ref()
-        .expect("filtered normalized entry");
-    let old_chunk = match store.read_chunk(&pointer.chunk_hash) {
-        Ok(chunk) => chunk,
-        Err(error) if is_store_not_found(&error) => {
-            return Err(retarget_error(
-                "KIO-E-STORE-CORRUPT-001",
-                "old Evidence pointer is missing its chunk CAS object",
-            ));
-        }
-        Err(error) => return Err(error),
-    };
-    if old_chunk.raw_hash != pointer.raw_hash
-        || old_chunk.tool_profile_hash != pointer.tool_profile_hash
-        || old_chunk.r#gen != old_normalize.r#gen
-    {
-        return Err(retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "old Evidence pointer chunk does not match its canonical tree entry",
-        ));
-    }
-
-    // `--at` was grammar-checked above; this is deliberately a direct object
-    // read, never a ref/tag/HEAD resolver.
-    let target_commit = read_exact_retarget_commit(&target.kio_dir, at)?;
-    let target_tree = match repo.read_tree(&target_commit.tree) {
-        Ok(tree) => tree,
-        Err(error) if is_store_not_found(&error) => {
-            kio_core::gc::validate_final_shallow_tree(&target.kio_dir, at, &target_commit.tree)?;
-            return Err(retarget_shallow_error(
-                "target Evidence commit is shallow; retarget requires its tree",
-                at,
-            ));
-        }
-        Err(error) if error.exit_code() == ExitCode::InvalidUsage => {
-            return Err(retarget_error(
-                "KIO-E-STORE-CORRUPT-001",
-                "target Evidence tree contradicts its commit CAS object",
-            ));
-        }
-        Err(error) => return Err(error),
-    };
-    let target_entry = target_tree
-        .entries
-        .iter()
-        .find(|entry| entry.path == old_entry.path && entry.raw_hash == pointer.raw_hash)
-        .ok_or_else(retarget_not_found_error)?;
-    let target_normalize = target_entry
-        .normalize
-        .as_ref()
-        .ok_or_else(retarget_not_found_error)?;
-    retarget_manifest_unit_preflight(&target.kio_dir, &pointer.raw_hash, target_normalize, true)?;
-    let target_units =
-        pinned_done_units(repo, &pointer.raw_hash, target_normalize).map_err(|error| {
-            if is_store_not_found(&error) {
-                retarget_error(
-                    "KIO-E-STORE-CORRUPT-001",
-                    "target retarget manifest or normalized-unit CAS object is missing",
-                )
-            } else {
-                error
-            }
-        })?;
-    let candidates = match source_index
-        .exact_retarget_candidates(
-            &pointer.raw_hash,
-            &target_normalize.tool_profile_hash,
-            target_normalize.r#gen,
-        )
-        .map_err(index_to_kio)?
-    {
-        RetargetCandidates::Candidates(candidates) => candidates,
-        RetargetCandidates::Overflow => return Err(retarget_limit_error()),
-    };
-    // Retain at most one large chunk body. Continue authenticating later
-    // candidates so corruption still outranks ambiguity, but never let many
-    // individually valid 128 MiB chunks accumulate in memory.
-    let mut first_match = None;
-    let mut ambiguous = false;
-    for candidate in candidates {
-        if !is_hash(&candidate.chunk_id) {
-            return Err(retarget_error(
-                "KIO-E-STORE-CORRUPT-001",
-                "retarget candidate has a non-canonical chunk hash",
-            ));
-        }
-        let chunk = match store.read_chunk(&candidate.chunk_id) {
-            Ok(chunk) => chunk,
-            Err(error) if is_store_not_found(&error) => {
-                return Err(retarget_error(
-                    "KIO-E-STORE-CORRUPT-001",
-                    "retarget candidate is missing its chunk CAS object",
-                ));
-            }
-            Err(error) => return Err(error),
-        };
-        if chunk.raw_hash != pointer.raw_hash
-            || chunk.tool_profile_hash != target_normalize.tool_profile_hash
-            || chunk.r#gen != target_normalize.r#gen
-        {
-            return Err(retarget_error(
-                "KIO-E-STORE-CORRUPT-001",
-                "retarget candidate chunk contradicts its SQLite target identity",
-            ));
-        }
-        match check_publication_and_association_on_connection(
-            source_index,
-            repo,
-            &candidate.chunk_id,
-            at,
-        )? {
-            AssociationCheck::Ok => {}
-            AssociationCheck::NotFound => continue,
-            AssociationCheck::IndexRebuilding => return Err(index_rebuilding_error()),
-        }
-        if !target_units.iter().any(|unit| {
-            unit.unit_key == chunk.unit_key
-                && hash_bytes(unit.markdown.as_bytes()) == chunk.unit_content_hash
-        }) || chunk.heading_path != old_chunk.heading_path
-        {
-            continue;
-        }
-        if first_match.is_some() {
-            ambiguous = true;
-        } else {
-            first_match = Some((candidate.chunk_id, chunk));
-        }
-    }
-    if ambiguous {
-        return Err(retarget_ambiguous_error());
-    }
-    let (chunk_hash, chunk) = first_match.ok_or_else(retarget_not_found_error)?;
-    binding.recheck()?;
-    // Re-read the exact target object/tree after all candidate CAS reads.
-    recheck_retarget_target(repo, at, &target_commit, &target_tree)?;
-    let issued = issue_evidence_pointer(EvidencePointerIssueRequest {
-        scope_id: pointer.scope_id.clone(),
-        scope_path: Some(target.kio_dir.display().to_string()),
-        commit: at.to_owned(),
-        tree: Some(target_commit.tree.clone()),
-        raw_hash: pointer.raw_hash.clone(),
-        tool_profile_hash: target_normalize.tool_profile_hash.clone(),
-        chunk_hash,
-        path_at_commit: Some(target_entry.path.clone()),
-        heading_path: Some(chunk.heading_path.clone()),
-        section_id: chunk.section_id.clone(),
-        byte_start: Some(chunk.byte_start),
-        byte_end: Some(chunk.byte_end),
-    })
-    .map_err(search_to_kio)?;
-    let verification = verify_pointer_for_cli(&issued, true)?;
-    // Drift checks take precedence over a stale final-verifier result.  Only
-    // classify a stable non-alive result after every retained authority still
-    // denotes the command-start snapshot.
-    binding.recheck()?;
-    recheck_retarget_target(repo, at, &target_commit, &target_tree)?;
-    if verification.result.status != EvidenceStatus::Alive {
-        return Err(retarget_not_found_error());
-    }
-    Ok(json!({
-        "schema": "kio.evidence.retarget", "schema_version": 1, "status": "retargeted",
-        "target_commit": at, "retargeted_from": pointer, "new_pointer": issued,
-        "match_method": "heading_path_exact",
-    }))
-}
-
-/// Read `--at` as exactly one commit object. A missing hash or an object from
-/// another namespace is an invalid operand; malformed bytes inside the commit
-/// namespace are authenticated store corruption, not a spelling error.
-fn read_exact_retarget_commit(kio_dir: &Path, at: &str) -> Result<CommitObject> {
-    let object = ObjectStore::new(kio_dir)
-        .read_by_hash(at)
-        .map_err(|error| {
-            if is_store_not_found(&error) {
-                KioError::invalid_usage("--at does not name a commit object in this scope")
-            } else {
-                error
-            }
-        })?;
-    if object.kind != ObjectKind::Commit {
-        return Err(KioError::invalid_usage(
-            "--at does not name a commit object in this scope",
-        ));
-    }
-    let commit: CommitObject = serde_json::from_slice(&object.bytes).map_err(|_| {
-        retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "target commit CAS object has an invalid schema",
-        )
-    })?;
-    if commit.validate().is_err() {
-        return Err(retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "target commit CAS object has an invalid schema",
-        ));
-    }
-    Ok(commit)
-}
-
-/// Authenticate the manifest object and bound its declared unit count before
-/// any unit CAS loader is reached. This is intentionally retarget-local: the
-/// existing verifier retains its own historical degraded-result contract.
-fn retarget_manifest_unit_preflight(
-    kio_dir: &Path,
-    raw_hash: &str,
-    normalize: &NormalizeRef,
-    missing_is_corrupt: bool,
-) -> Result<()> {
-    let store = ObjectStore::new(kio_dir);
-    let bytes = match store.read_content_object_bytes(
-        ContentObjectKind::Manifest,
-        &normalize.manifest_hash,
-        MAX_MANIFEST_OBJECT_READ_BYTES,
-    ) {
-        Ok(bytes) => bytes,
-        Err(error) if is_store_not_found(&error) && missing_is_corrupt => {
-            return Err(retarget_error(
-                "KIO-E-STORE-CORRUPT-001",
-                "target retarget manifest is missing",
-            ));
-        }
-        Err(error) if is_store_not_found(&error) => return Ok(()),
-        Err(error) => return Err(error),
-    };
-    if hash_bytes(&bytes) != normalize.manifest_hash {
-        return Err(retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "retarget manifest bytes do not match their CAS hash",
-        ));
-    }
-    let manifest: NormalizedInstanceManifest = serde_json::from_slice(&bytes).map_err(|_| {
-        retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "retarget manifest is not a valid normalized-instance manifest",
-        )
-    })?;
-    if manifest.raw_hash != raw_hash
-        || manifest.tool_profile_hash != normalize.tool_profile_hash
-        || manifest.r#gen != normalize.r#gen
-    {
-        return Err(retarget_error(
-            "KIO-E-STORE-CORRUPT-001",
-            "retarget manifest identity contradicts its tree normalization reference",
-        ));
-    }
-    if manifest.units.len() > 4096 {
-        return Err(retarget_limit_error());
-    }
-    Ok(())
-}
-
-fn recheck_retarget_target(
-    repo: &Repository,
-    at: &str,
-    expected_commit: &CommitObject,
-    expected_tree: &TreeObject,
-) -> Result<()> {
-    let commit = repo.read_commit(at).map_err(|_| batch_changed_error())?;
-    let tree = repo
-        .read_tree(&commit.tree)
-        .map_err(|_| batch_changed_error())?;
-    if &commit != expected_commit || &tree != expected_tree {
-        return Err(batch_changed_error());
-    }
-    Ok(())
-}
-
-fn run_evidence_batch(path: &Path, strict: bool) -> Result<Value> {
-    let bytes = read_bounded_regular_file(path, MAX_BATCH_INPUT_BYTES).map_err(|error| {
-        if matches!(
-            error.error_code(),
-            "KIO-E-STORE-OBJECT-TOO-LARGE-001" | "KIO-E-STORE-OBJECT-OVERSIZED-001"
-        ) {
-            batch_limit_error(0, "file_bytes", MAX_BATCH_INPUT_BYTES as usize)
-        } else {
-            error
-        }
-    })?;
-    let pointers = parse_batch_pointers(&bytes)?;
-    let input_sha256 = hash_bytes(&bytes);
-
-    let (verifications, _) =
-        kio_core::cas::with_verified_cas_read_budget(MAX_BATCH_VERIFIED_BYTES, || {
-            let bindings = bind_batch_scopes(&pointers, strict)?;
-            let mut cache = BTreeMap::<Vec<u8>, EvidenceVerification>::new();
-            let verifications = pointers
-                .iter()
-                .map(|pointer| verify_batch_row(pointer, strict, &bindings, &mut cache))
-                .collect::<Result<Vec<_>>>()?;
-            for binding in &bindings {
-                binding.recheck()?;
-            }
-            Ok(verifications)
-        })?;
-    let mut counts = BTreeMap::<&str, usize>::new();
-    for key in [
-        "alive",
-        "tombstoned",
-        "not_found",
-        "scope_unreachable",
-        "unverifiable",
-        "registry_duplicate",
-    ] {
-        counts.insert(key, 0);
-    }
-    let mut permanent = false;
-    let mut retryable = false;
-    let results = verifications
-        .iter()
-        .enumerate()
-        .map(|(index, verification)| {
-            let status = verification.result.status.as_str();
-            *counts.get_mut(status).expect("closed status set") += 1;
-            if strict {
-                match verification.exit {
-                    ExitCode::PermanentFailure => permanent = true,
-                    ExitCode::PartialFailure => retryable = true,
-                    _ => {}
-                }
-            } else if verification.exit == ExitCode::PartialFailure {
-                retryable = true;
-            }
-            json!({"line": index + 1, "result": verification.result})
-        })
-        .collect::<Vec<_>>();
-    let mut output = json!({
-        "schema": "kio.evidence.batch-verify",
-        "schema_version": 1,
-        "input_sha256": input_sha256,
-        "strict": strict,
-        "results": results,
-        "summary": {"total": pointers.len(), "status_counts": counts},
-        "verified_count": pointers.len(),
-    });
-    let exit = if strict && permanent {
-        ExitCode::PermanentFailure
-    } else if retryable {
-        ExitCode::PartialFailure
-    } else {
-        ExitCode::Success
-    };
-    if exit != ExitCode::Success {
-        set_exit_override(&mut output, exit);
-    }
-    Ok(output)
+    response::verification_output(verification)
 }
 
 fn verify_batch_row(
+    ctx: &crate::invocation::Invocation<'_>,
+    registry_input: &EvidenceRegistry,
     pointer: &EvidencePointer,
     strict: bool,
     bindings: &[EvidenceScopeBinding],
@@ -745,6 +161,7 @@ fn verify_batch_row(
             binding.scope_id == pointer.scope_id && binding.scope_path == pointer.scope_path
         })
         .ok_or_else(batch_changed_error)?;
+    binding.reads.ensure_active()?;
     let cached = cache.get(&key).cloned();
     let verification = match cached {
         Some(verification) => verification,
@@ -761,7 +178,7 @@ fn verify_batch_row(
     };
     // Cache entries only avoid repeated object traversal. Every row, including
     // a duplicate cache hit, crosses the live scope/registry/index/read barrier.
-    binding.recheck()?;
+    binding.recheck(ctx, registry_input)?;
     cache.entry(key).or_insert_with(|| verification.clone());
     Ok(verification)
 }
@@ -773,8 +190,11 @@ fn evidence_pointer_cache_key(pointer: &EvidencePointer) -> Result<Vec<u8>> {
 }
 
 fn bind_batch_scopes(
+    ctx: &crate::invocation::Invocation<'_>,
+    registry_input: &EvidenceRegistry,
     pointers: &[EvidencePointer],
     strict: bool,
+    reads: &kio_core::cas::VerifiedCasReadCapability,
 ) -> Result<Vec<EvidenceScopeBinding>> {
     let mut bindings = Vec::new();
     let mut seen = BTreeSet::new();
@@ -783,7 +203,13 @@ fn bind_batch_scopes(
         if !seen.insert(key) {
             continue;
         }
-        bindings.push(bind_evidence_scope(pointer, strict)?);
+        bindings.push(bind_evidence_scope(
+            ctx,
+            registry_input,
+            pointer,
+            strict,
+            reads,
+        )?);
     }
     Ok(bindings)
 }
@@ -904,8 +330,14 @@ fn batch_limit_error(line: usize, limit: &str, maximum: usize) -> KioError {
 /// downgrade (with resurrection-link fallback) all flow through the same
 /// judgment `resolve_pointer_for_cli` (open/view/restore) uses — PB66's
 /// structural requirement.
-fn verify_pointer_for_cli(pointer: &EvidencePointer, strict: bool) -> Result<EvidenceVerification> {
-    let binding = bind_evidence_scope(pointer, strict)?;
+fn verify_pointer_for_cli(
+    ctx: &crate::invocation::Invocation<'_>,
+    registry_input: &EvidenceRegistry,
+    pointer: &EvidencePointer,
+    strict: bool,
+    reads: &kio_core::cas::VerifiedCasReadCapability,
+) -> Result<EvidenceVerification> {
+    let binding = bind_evidence_scope(ctx, registry_input, pointer, strict, reads)?;
     match &binding.state {
         EvidenceScopeState::Unavailable(result) => Ok(result.clone()),
         EvidenceScopeState::Ready {
@@ -930,13 +362,19 @@ enum EvidenceScopeState {
 }
 
 struct EvidenceScopeBinding {
+    reads: kio_core::cas::VerifiedCasReadCapability,
     scope_id: String,
     scope_path: Option<String>,
     state: EvidenceScopeState,
 }
 
 impl EvidenceScopeBinding {
-    fn recheck(&self) -> Result<()> {
+    fn recheck(
+        &self,
+        ctx: &crate::invocation::Invocation<'_>,
+        registry_input: &EvidenceRegistry,
+    ) -> Result<()> {
+        self.reads.ensure_active()?;
         match &self.state {
             EvidenceScopeState::Ready {
                 target,
@@ -945,21 +383,26 @@ impl EvidenceScopeBinding {
                 source_index,
                 ..
             } => {
-                let current =
-                    resolve_evidence_scope_target(&self.scope_id, self.scope_path.as_deref())
-                        .map_err(|error| {
-                            // A second resolver invocation is the existing
-                            // post-bind authority re-observation.  Only a known
-                            // target/index drift becomes BATCH-CHANGED; an unsafe
-                            // or unstable registry snapshot remains the original
-                            // command-level error and never turns into a nested
-                            // verification result.
-                            if is_registry_snapshot_error(&error) {
-                                error
-                            } else {
-                                batch_changed_error()
-                            }
-                        })?;
+                let current = resolve_evidence_scope_target(
+                    ctx.cwd(),
+                    registry_input,
+                    &self.scope_id,
+                    self.scope_path.as_deref(),
+                    ctx.control,
+                )
+                .map_err(|error| {
+                    // A second resolver invocation is the existing
+                    // post-bind authority re-observation.  Only a known
+                    // target/index drift becomes BATCH-CHANGED; an unsafe
+                    // or unstable registry snapshot remains the original
+                    // command-level error and never turns into a nested
+                    // verification result.
+                    if is_registry_snapshot_error(&error) {
+                        error
+                    } else {
+                        batch_changed_error()
+                    }
+                })?;
                 if current.repo_root != target.repo_root || current.kio_dir != target.kio_dir {
                     return Err(batch_changed_error());
                 }
@@ -973,13 +416,15 @@ impl EvidenceScopeBinding {
                 if retained_generation != *index_generation {
                     return Err(batch_changed_error());
                 }
-                check_index_generation_current(&target.kio_dir)?;
+                check_index_generation_current(&target.kio_dir, ctx.control)?;
                 if index_generation_for_evidence(&target.kio_dir)? != *index_generation {
                     return Err(batch_changed_error());
                 }
             }
             EvidenceScopeState::Unavailable(expected) => {
                 let current = unavailable_evidence_result(
+                    ctx,
+                    registry_input,
                     &self.scope_id,
                     self.scope_path.as_deref(),
                     expected.exit,
@@ -994,11 +439,19 @@ impl EvidenceScopeBinding {
 }
 
 fn unavailable_evidence_result(
+    ctx: &crate::invocation::Invocation<'_>,
+    registry_input: &EvidenceRegistry,
     scope_id: &str,
     scope_path: Option<&str>,
     strict_exit: ExitCode,
 ) -> Result<EvidenceVerification> {
-    match resolve_evidence_scope_target(scope_id, scope_path) {
+    match resolve_evidence_scope_target(
+        ctx.cwd(),
+        registry_input,
+        scope_id,
+        scope_path,
+        ctx.control,
+    ) {
         Err(error) if error.error_code() == "KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001" => {
             Ok(EvidenceVerification::new(
                 EvidenceStatus::ScopeUnreachable,
@@ -1031,43 +484,57 @@ fn is_registry_snapshot_error(error: &KioError) -> bool {
     )
 }
 
-fn bind_evidence_scope(pointer: &EvidencePointer, strict: bool) -> Result<EvidenceScopeBinding> {
-    let target =
-        match resolve_evidence_scope_target(&pointer.scope_id, pointer.scope_path.as_deref()) {
-            Ok(target) => target,
-            // PB53: a structured `status`, not a raw command failure — exit 0
-            // unless `--strict` (PB56 promotes it to 3).
-            Err(error) if error.error_code() == "KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001" => {
-                return Ok(EvidenceScopeBinding {
-                    scope_id: pointer.scope_id.clone(),
-                    scope_path: pointer.scope_path.clone(),
-                    state: EvidenceScopeState::Unavailable(EvidenceVerification::new(
-                        EvidenceStatus::ScopeUnreachable,
-                        Some(error.error_code()),
-                        error.context().clone(),
-                        if strict {
-                            ExitCode::PartialFailure
-                        } else {
-                            ExitCode::Success
-                        },
-                    )),
-                });
-            }
-            // PB54: live registry duplicate — exit 3 regardless of --strict.
-            Err(error) if error.error_code() == "KIO-E-REGISTRY-DUP-001" => {
-                return Ok(EvidenceScopeBinding {
-                    scope_id: pointer.scope_id.clone(),
-                    scope_path: pointer.scope_path.clone(),
-                    state: EvidenceScopeState::Unavailable(EvidenceVerification::new(
-                        EvidenceStatus::RegistryDuplicate,
-                        Some(error.error_code()),
-                        error.context().clone(),
-                        ExitCode::PartialFailure,
-                    )),
-                });
-            }
-            Err(error) => return Err(error),
-        };
+fn bind_evidence_scope(
+    ctx: &crate::invocation::Invocation<'_>,
+    registry_input: &EvidenceRegistry,
+    pointer: &EvidencePointer,
+    strict: bool,
+    reads: &kio_core::cas::VerifiedCasReadCapability,
+) -> Result<EvidenceScopeBinding> {
+    reads.ensure_active()?;
+    let target = match resolve_evidence_scope_target(
+        ctx.cwd(),
+        registry_input,
+        &pointer.scope_id,
+        pointer.scope_path.as_deref(),
+        ctx.control,
+    ) {
+        Ok(target) => target,
+        // PB53: a structured `status`, not a raw command failure — exit 0
+        // unless `--strict` (PB56 promotes it to 3).
+        Err(error) if error.error_code() == "KIO-E-EVIDENCE-SCOPE-UNREACHABLE-001" => {
+            return Ok(EvidenceScopeBinding {
+                reads: reads.clone(),
+                scope_id: pointer.scope_id.clone(),
+                scope_path: pointer.scope_path.clone(),
+                state: EvidenceScopeState::Unavailable(EvidenceVerification::new(
+                    EvidenceStatus::ScopeUnreachable,
+                    Some(error.error_code()),
+                    error.context().clone(),
+                    if strict {
+                        ExitCode::PartialFailure
+                    } else {
+                        ExitCode::Success
+                    },
+                )),
+            });
+        }
+        // PB54: live registry duplicate — exit 3 regardless of --strict.
+        Err(error) if error.error_code() == "KIO-E-REGISTRY-DUP-001" => {
+            return Ok(EvidenceScopeBinding {
+                reads: reads.clone(),
+                scope_id: pointer.scope_id.clone(),
+                scope_path: pointer.scope_path.clone(),
+                state: EvidenceScopeState::Unavailable(EvidenceVerification::new(
+                    EvidenceStatus::RegistryDuplicate,
+                    Some(error.error_code()),
+                    error.context().clone(),
+                    ExitCode::PartialFailure,
+                )),
+            });
+        }
+        Err(error) => return Err(error),
+    };
     // PB57: sqlite.db missing/unavailable is a command-level retryable error
     // (never a `status` field), independent of `--strict` — the verification
     // itself has not run, so there is nothing to report as a result.
@@ -1079,12 +546,14 @@ fn bind_evidence_scope(pointer: &EvidencePointer, strict: bool) -> Result<Eviden
     // used to open second, so a format-incompatible scope with an active
     // purge journal surfaced the lower-priority
     // `KIO-E-PURGE-JOURNAL-ACTIVE-001` instead of `KIO-E-STORE-VERSION-001`.
-    let repo = Repository::open_for_search_read_only(&target.repo_root)?;
+    let repo =
+        Repository::open_search_in_session(&target.repo_root, ctx.control.clone(), ctx.locks)?
+            .with_verified_reads(reads)?;
     // QB5/QB6/裁定1: shared (1)+(3) preflight pair. Evidence verify's whole
     // response IS existence information (08 §4.3 — it never returns body),
     // so checkpoint 2 below (LC54/LC55) gates every return point, not only a
     // single "success" path.
-    let checkpoint = preflight_barrier_and_index(&target.kio_dir)?;
+    let checkpoint = preflight_barrier_and_index(&target.kio_dir, ctx.control)?;
     let source_index = open_existing_source_index_connection(
         sqlite_path(&target.kio_dir),
         ExistingSourceIndexOpenMode::ReadOnly,
@@ -1097,6 +566,7 @@ fn bind_evidence_scope(pointer: &EvidencePointer, strict: bool) -> Result<Eviden
         .map_err(index_to_kio)?
         .map(|metadata| metadata.index_generation);
     Ok(EvidenceScopeBinding {
+        reads: reads.clone(),
         scope_id: pointer.scope_id.clone(),
         scope_path: pointer.scope_path.clone(),
         state: EvidenceScopeState::Ready {
@@ -1124,7 +594,7 @@ fn verify_pointer_in_scope(
         }
         Err(error) => return Err(error),
     };
-    let store = ObjectStore::new(&target.kio_dir);
+    let store = repo.object_store();
     let (commit_shallow, entry_gen, entry_normalize) = match repo.read_tree(&commit.tree) {
         Ok(tree) => {
             // PB42/43/44 (§O, verify side): select the entry whose
@@ -1151,11 +621,8 @@ fn verify_pointer_in_scope(
             (false, entry_gen, entry.normalize.clone())
         }
         Err(error) if is_store_not_found(&error) => {
-            kio_core::gc::validate_final_shallow_tree(
-                &target.kio_dir,
-                &pointer.commit,
-                &commit.tree,
-            )?;
+            GcSweepSession::bind_repository(repo)?
+                .validate_final_shallow_tree(&pointer.commit, &commit.tree)?;
             (true, None, None)
         }
         Err(error) => return Err(error),
@@ -1229,7 +696,9 @@ fn verify_pointer_in_scope(
     // Defense-in-depth: re-run the identical canonical dispatch after the
     // chunk read, in case a purge raced the resolution above (mirrors the
     // pre-existing double-check this function has always performed).
-    if let Err(marker_error) = enforce_canonical_marker_barrier(target, &pointer.raw_hash, true) {
+    if let Err(marker_error) =
+        enforce_canonical_marker_barrier(target, &pointer.raw_hash, true, repo.control())
+    {
         return dispatch_marker_barrier_error(
             checkpoint,
             target,
@@ -1302,7 +771,12 @@ fn canonical_pointer_marker_verification(
         Err(error) if is_store_not_found(&error) => false,
         Err(error) => return Err(error),
     };
-    match enforce_canonical_marker_barrier(target, &pointer.raw_hash, raw_present) {
+    match enforce_canonical_marker_barrier(
+        target,
+        &pointer.raw_hash,
+        raw_present,
+        &checkpoint.control,
+    ) {
         Ok(()) => Ok(None),
         Err(marker_error) => dispatch_marker_barrier_error(
             checkpoint,
@@ -1525,9 +999,16 @@ fn verify_objects_with_limits(
     repo: &Repository,
     limits: VerifyLimits,
 ) -> Result<VerifyObjectsReport> {
+    if repo.object_store().verified_reads()?.is_none() {
+        return kio_core::cas::VerifiedCasReadBudget::new()
+            .run(u64::MAX, |reads| {
+                verify_objects_with_limits(&repo.with_verified_reads(reads)?, limits)
+            })
+            .map(|(report, _)| report);
+    }
     let store = repo.object_store();
-    let purge = PurgeState::open(repo.kio_dir())?;
-    let invocation_time = now_utc_seconds();
+    let purge = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
+    let invocation_time = repo.control().now_utc_seconds();
     let mut state = State {
         max_objects: limits.max_objects,
         max_verified_bytes: limits.max_verified_bytes,
@@ -1557,7 +1038,7 @@ fn verify_objects_with_limits(
             return Ok(finish_report(state, 0, None));
         }
     };
-    let active_gc_marker = match read_active_marker(repo.kio_dir()) {
+    let active_gc_marker = match read_active_marker_with_control(repo.kio_dir(), repo.control()) {
         Ok(marker) => marker,
         Err(error) => {
             state.finding("gc_sweep_marker_corrupt", "", &error.to_string(), &[]);
@@ -1571,7 +1052,9 @@ fn verify_objects_with_limits(
     // sole tree that named it was shallow-discarded.
     let mut final_shallow_commits = BTreeSet::new();
     if active_gc_marker.is_none() {
-        match kio_core::gc::validated_final_shallow_receipts(repo.kio_dir()) {
+        match GcSweepSession::bind_repository(repo)
+            .and_then(|session| session.validated_final_shallow_receipts())
+        {
             Ok(receipts) => {
                 final_shallow_commits.extend(receipts.into_keys());
             }
@@ -1587,7 +1070,7 @@ fn verify_objects_with_limits(
         // tree state.  This is the same state machine used by `kio gc --yes`,
         // so impossible combinations are corruption rather than a misleading
         // retryable finding.
-        let session = match GcSweepSession::bind(repo.root().to_path_buf()) {
+        let session = match GcSweepSession::bind_repository(repo) {
             Ok(session) => session,
             Err(error) => {
                 state.finding("gc_sweep_marker_corrupt", "", &error.to_string(), &[]);
@@ -2452,7 +1935,7 @@ fn verify_objects_with_limits(
         let max_event_lifecycle_epoch = purge.max_recorded_lifecycle_epoch()?;
         purge.recover_lifecycle_epoch(0, max_event_lifecycle_epoch)?;
         if index_exists {
-            recover_index_generation(repo.kio_dir())?;
+            recover_index_generation(repo.kio_dir(), repo.control())?;
         }
     }
     let repair_actor = std::env::var("USER").unwrap_or_else(|_| "local-user".to_owned());
@@ -2502,7 +1985,7 @@ fn verify_objects_with_limits(
     // of its own -- its other callers run only after `rebuild_step3_index`
     // already guarantees the file is there).
     if any_retired && index_exists {
-        recover_index_generation(repo.kio_dir())?;
+        recover_index_generation(repo.kio_dir(), repo.control())?;
     }
     let repaired = staged_raws.len() as u64;
     let repaired_commit_hash = if repaired > 0 && repairs_allowed && !state.exceeded_bounds {
@@ -2999,9 +2482,10 @@ pub(super) fn purge_explains_missing_retained_instance(
     normalize: &NormalizeRef,
 ) -> Result<bool> {
     let session = GcSweepSession::bind_repository(repo)?;
-    let directory = kio_core::store_dir::StoreDirectory::from_retained(
+    let directory = kio_core::store_dir::StoreDirectory::from_retained_with_control(
         session.retained_kio_handle()?,
         repo.kio_dir().to_path_buf(),
+        repo.control().clone(),
     )?;
     let purge = PurgeState::from_directory(directory);
     if purge.barrier_blocks(raw_hash)? {
@@ -3059,7 +2543,7 @@ pub(super) fn purge_explains_missing_retained_instance(
         &trees,
         &reachable,
         repo.head_commit_hash()?.as_deref(),
-        &now_utc_seconds(),
+        &repo.control().now_utc_seconds(),
     );
     if !authority
         .get(&normalize.manifest_hash)
@@ -3921,7 +3405,9 @@ fn commit_roots(repo: &Repository, state: &mut State) -> Result<BTreeSet<String>
 mod prune_orphans;
 #[cfg(test)]
 use prune_orphans::PruneOrphansPlan;
-pub use prune_orphans::{prune_orphans_apply, prune_orphans_plan, prune_orphans_preflight};
+pub use prune_orphans::{
+    PruneOrphansReport, prune_orphans_apply, prune_orphans_plan, prune_orphans_preflight,
+};
 
 // ===========================================================================
 // `kio repair registry-prune` (step4b-contract-tests-p2b.md §H, U46,
@@ -3961,13 +3447,16 @@ impl RegistryPrunePlan {
 }
 
 /// Compute which registry rows are unreachable. Removes nothing.
-pub fn registry_prune_plan() -> Result<RegistryPrunePlan> {
-    let registry = RegistryDb::open_default().map_err(index_to_kio)?;
+pub(crate) fn registry_prune_plan_with_control(
+    control: &ControlHandle,
+) -> Result<RegistryPrunePlan> {
+    let registry = RegistryDb::open_default_with_control(control).map_err(index_to_kio)?;
     let mut rows = Vec::new();
     for entry in registry.all_entries().map_err(index_to_kio)? {
-        if crate::open_scope_from_hint_with_mode(
+        if crate::scope_access::open_scope_from_hint_with_mode(
             &entry.root_path,
-            crate::ScopeResolutionMode::Normal,
+            crate::scope_access::ScopeResolutionMode::Normal,
+            control,
         )
         .is_none()
         {
@@ -3977,13 +3466,16 @@ pub fn registry_prune_plan() -> Result<RegistryPrunePlan> {
     Ok(RegistryPrunePlan { rows })
 }
 
-/// Retire exactly the rows [`registry_prune_plan`] listed.
+/// Retire exactly the rows [`registry_prune_plan_with_control`] listed.
 ///
 /// H2-6 (R24b terra-002, fatal): re-scanning here instead would let a row that
 /// became unreachable AFTER the user saw the preview be deleted without ever
 /// having been shown.
-pub fn registry_prune_apply(plan: &RegistryPrunePlan) -> Result<RegistryPruneReport> {
-    let registry = RegistryDb::open_default().map_err(index_to_kio)?;
+pub(crate) fn registry_prune_apply_with_control(
+    plan: &RegistryPrunePlan,
+    control: &ControlHandle,
+) -> Result<RegistryPruneReport> {
+    let registry = RegistryDb::open_default_with_control(control).map_err(index_to_kio)?;
     let mut pruned = 0u64;
     for (scope_id, kio_path, _) in &plan.rows {
         registry.remove(scope_id, kio_path).map_err(index_to_kio)?;
@@ -4389,30 +3881,151 @@ mod tests {
             scope_id: "batch-cache-final-recheck-unreachable".to_owned(),
             scope_path: Some(dir.path().join("missing-scope").display().to_string()),
         };
-        with_evidence_registry_path_for_test(registry_path.clone(), || {
-            let mut bindings = bind_batch_scopes(std::slice::from_ref(&pointer), false).unwrap();
-            let original = match &bindings[0].state {
-                EvidenceScopeState::Unavailable(result) => result.clone(),
-                EvidenceScopeState::Ready { .. } => panic!("fixture scope must be unreachable"),
-            };
-            let key = evidence_pointer_cache_key(&pointer).unwrap();
-            let mut cache = BTreeMap::from([(key, original)]);
+        let context = crate::context::test_support::context(dir.path());
+        let settings =
+            std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+        let control = ControlHandle::default();
+        let ctx = &crate::invocation::Invocation {
+            context: &context,
+            settings: &settings,
+            control: &control,
+            locks: &kio_core::scope::LockSession::default(),
+        };
+        let registry = EvidenceRegistry::fixture(registry_path.clone());
+        let registry_input = &registry;
+        kio_core::cas::VerifiedCasReadBudget::new()
+            .run(0, |reads| {
+                let mut bindings = bind_batch_scopes(
+                    ctx,
+                    registry_input,
+                    std::slice::from_ref(&pointer),
+                    false,
+                    reads,
+                )
+                .unwrap();
+                let original = match &bindings[0].state {
+                    EvidenceScopeState::Unavailable(result) => result.clone(),
+                    EvidenceScopeState::Ready { .. } => panic!("fixture scope must be unreachable"),
+                };
+                let key = evidence_pointer_cache_key(&pointer).unwrap();
+                let mut cache = BTreeMap::from([(key, original)]);
 
-            let EvidenceScopeState::Unavailable(expected) = &mut bindings[0].state else {
-                unreachable!("fixture scope must remain unreachable");
-            };
-            expected
-                .result
-                .details
-                .as_object_mut()
-                .unwrap()
-                .insert("changed_after_cache_fill".to_owned(), json!(true));
+                let EvidenceScopeState::Unavailable(expected) = &mut bindings[0].state else {
+                    unreachable!("fixture scope must remain unreachable");
+                };
+                expected
+                    .result
+                    .details
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("changed_after_cache_fill".to_owned(), json!(true));
 
-            let error = verify_batch_row(&pointer, false, &bindings, &mut cache).unwrap_err();
-            assert_eq!(error.error_code(), "KIO-E-EVIDENCE-BATCH-CHANGED-001");
-        });
+                let error =
+                    verify_batch_row(ctx, registry_input, &pointer, false, &bindings, &mut cache)
+                        .unwrap_err();
+                assert_eq!(error.error_code(), "KIO-E-EVIDENCE-BATCH-CHANGED-001");
+                assert!(!registry_path.exists());
+                assert!(!registry_path.parent().unwrap().exists());
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn batch_cache_hit_requires_an_active_budget_even_without_cas_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry_path = dir.path().join("isolated-data/kio/scope-registry.sqlite");
+        let pointer = EvidencePointer {
+            schema_version: 1,
+            commit: hash('a'),
+            tree: None,
+            raw_hash: hash('b'),
+            tool_profile_hash: hash('c'),
+            chunk_hash: hash('d'),
+            path_at_commit: None,
+            heading_path: None,
+            section_id: None,
+            byte_start: None,
+            byte_end: None,
+            scope_id: "batch-cache-expired-budget-unreachable".to_owned(),
+            scope_path: Some(dir.path().join("missing-scope").display().to_string()),
+        };
+        let context = crate::context::test_support::context(dir.path());
+        let settings =
+            std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+        let control = ControlHandle::default();
+        let locks = kio_core::scope::LockSession::default();
+        let ctx = &crate::invocation::Invocation {
+            context: &context,
+            settings: &settings,
+            control: &control,
+            locks: &locks,
+        };
+        let registry = EvidenceRegistry::fixture(registry_path.clone());
+        let owner = kio_core::cas::VerifiedCasReadBudget::new();
+        let ((bindings, mut cache), consumed) = owner
+            .run(0, |reads| {
+                let bindings = bind_batch_scopes(
+                    ctx,
+                    &registry,
+                    std::slice::from_ref(&pointer),
+                    false,
+                    reads,
+                )?;
+                let original = match &bindings[0].state {
+                    EvidenceScopeState::Unavailable(result) => result.clone(),
+                    EvidenceScopeState::Ready { .. } => panic!("fixture scope must be unreachable"),
+                };
+                let mut cache = BTreeMap::from([(evidence_pointer_cache_key(&pointer)?, original)]);
+                let result =
+                    verify_batch_row(ctx, &registry, &pointer, false, &bindings, &mut cache)?;
+                assert_eq!(result.result.status, EvidenceStatus::ScopeUnreachable);
+                Ok((bindings, cache))
+            })
+            .unwrap();
+        assert_eq!(consumed, 0);
+        let error =
+            verify_batch_row(ctx, &registry, &pointer, false, &bindings, &mut cache).unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001");
+        let ((), consumed) = owner
+            .run(0, |_| {
+                assert!(
+                    verify_batch_row(ctx, &registry, &pointer, false, &bindings, &mut cache)
+                        .is_err()
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(consumed, 0);
         assert!(!registry_path.exists());
         assert!(!registry_path.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn verified_pipeline_units_charge_both_inspection_and_body_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, _, manifest, unit) = pinned_fixture(dir.path());
+        let bytes = canonical_json_bytes(&serde_json::to_value(&unit).unwrap()).unwrap();
+        let expected = 2 * bytes.len() as u64;
+        let store = ObjectStore::new(dir.path());
+        let owner = kio_core::cas::VerifiedCasReadBudget::new();
+        let (units, consumed) = owner
+            .run(expected, |reads| {
+                let store = store.with_verified_reads(reads)?;
+                load_validated_normalized_units_from_manifest(&store, &manifest)
+                    .map_err(crate::object_persistence::pipeline_to_kio)
+            })
+            .unwrap();
+        assert_eq!(units, vec![unit]);
+        assert_eq!(consumed, expected);
+        let error = owner
+            .run(expected - 1, |reads| {
+                let store = store.with_verified_reads(reads)?;
+                load_validated_normalized_units_from_manifest(&store, &manifest)
+                    .map_err(crate::object_persistence::pipeline_to_kio)
+            })
+            .unwrap_err();
+        assert!(error.to_string().contains("aggregate byte limit"));
     }
 
     fn commit(kind: CommitType, created_at: &str) -> CommitObject {

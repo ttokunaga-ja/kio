@@ -30,6 +30,7 @@ pub(crate) fn remove_prepared_bound_gc_index(
     temp_leaf: &str,
     expected_private_dir_identity: &str,
     expected_identity: &str,
+    _control: &kio_core::control::ControlHandle,
 ) -> Result<PreparedGcIndexCleanup> {
     validate_gc_temp_leaf(temp_leaf)?;
     let private = open_existing_gc_internal_index_dir(kio_dir)?;
@@ -83,6 +84,7 @@ pub(crate) fn exchange_prepared_bound_gc_index(
     expected_source_identity: &str,
     expected_source_state_digest: &str,
     expected_target_identity: &str,
+    _control: &kio_core::control::ControlHandle,
 ) -> Result<()> {
     validate_gc_temp_leaf(temp_leaf)?;
     let index = cap_fs::open_dir_nofollow(kio_dir, Path::new("index")).map_err(|error| {

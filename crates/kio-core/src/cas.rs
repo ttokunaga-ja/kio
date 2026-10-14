@@ -1,6 +1,8 @@
 //! Content-addressed storage primitives.
 
-use std::cell::RefCell;
+mod removal;
+use removal::{CasRemovalKind, bound_remove_verified, remove_verified_cas_path};
+
 use std::fs::{self, File, OpenOptions};
 use std::io::Seek;
 use std::io::{Read, Write};
@@ -47,105 +49,10 @@ pub const MAX_EMBEDDING_OBJECT_BYTES: u64 = 1024 * 1024;
 /// manifest reader can apply its own bound.
 pub const MAX_MANIFEST_OBJECT_BYTES: u64 = 8 * 1024 * 1024;
 
-#[derive(Debug, Clone, Copy)]
-struct VerifiedCasReadBudget {
-    max_bytes: u64,
-    consumed_bytes: u64,
-}
+mod read_budget;
 
-thread_local! {
-    /// Evidence verification is synchronous, so a thread-scoped budget binds all
-    /// of its canonical CAS reads without changing every store API. It is only
-    /// active inside [`with_verified_cas_read_budget`].
-    static VERIFIED_CAS_READ_BUDGET: RefCell<Option<VerifiedCasReadBudget>> = const { RefCell::new(None) };
-}
-
-struct VerifiedCasReadBudgetGuard;
-
-impl Drop for VerifiedCasReadBudgetGuard {
-    fn drop(&mut self) {
-        VERIFIED_CAS_READ_BUDGET.with(|budget| *budget.borrow_mut() = None);
-    }
-}
-
-/// Bound aggregate bytes physically read from CAS during one synchronous
-/// verification operation. Repeated reads are charged repeatedly.
-///
-/// Nesting is rejected so an inner caller cannot obscure the outer authority's
-/// accounting. The scope is removed even when `operation` returns an error or
-/// unwinds.
-pub fn with_verified_cas_read_budget<T>(
-    max_bytes: u64,
-    operation: impl FnOnce() -> Result<T>,
-) -> Result<(T, u64)> {
-    VERIFIED_CAS_READ_BUDGET.with(|budget| {
-        let mut budget = budget.borrow_mut();
-        if budget.is_some() {
-            return Err(KioError::new(
-                "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001",
-                "verified CAS read budget cannot be nested",
-                serde_json::json!({ "max_bytes": max_bytes }),
-                crate::ExitCode::PermanentFailure,
-            ));
-        }
-        *budget = Some(VerifiedCasReadBudget {
-            max_bytes,
-            consumed_bytes: 0,
-        });
-        Ok(())
-    })?;
-    let _guard = VerifiedCasReadBudgetGuard;
-    let value = operation()?;
-    let consumed_bytes = VERIFIED_CAS_READ_BUDGET.with(|budget| {
-        budget
-            .borrow()
-            .as_ref()
-            .map(|budget| budget.consumed_bytes)
-            .ok_or_else(|| {
-                KioError::new(
-                    "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001",
-                    "verified CAS read budget unexpectedly unavailable",
-                    serde_json::json!({ "max_bytes": max_bytes }),
-                    crate::ExitCode::PermanentFailure,
-                )
-            })
-    })?;
-    Ok((value, consumed_bytes))
-}
-
-fn charge_verified_cas_read(bytes: u64) -> Result<()> {
-    VERIFIED_CAS_READ_BUDGET.with(|budget| {
-        let mut budget = budget.borrow_mut();
-        let Some(budget) = budget.as_mut() else {
-            return Ok(());
-        };
-        let attempted = budget.consumed_bytes.checked_add(bytes).ok_or_else(|| {
-            verified_cas_read_budget_error(budget.max_bytes, u64::MAX, budget.consumed_bytes)
-        })?;
-        if attempted > budget.max_bytes {
-            return Err(verified_cas_read_budget_error(
-                budget.max_bytes,
-                attempted,
-                budget.consumed_bytes,
-            ));
-        }
-        budget.consumed_bytes = attempted;
-        Ok(())
-    })
-}
-
-fn verified_cas_read_budget_error(max_bytes: u64, attempted: u64, consumed: u64) -> KioError {
-    KioError::new(
-        "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001",
-        "verified CAS reads exceed the aggregate byte limit",
-        serde_json::json!({
-            "max_bytes": max_bytes,
-            "attempted_bytes": attempted,
-            "consumed_bytes": consumed,
-        }),
-        crate::ExitCode::PermanentFailure,
-    )
-}
+pub(crate) use read_budget::CasReadAccess;
+pub use read_budget::{VerifiedCasReadBudget, VerifiedCasReadCapability};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ContentObjectKind {
@@ -584,6 +491,8 @@ pub struct AccountedReadError {
 
 #[derive(Debug, Clone)]
 pub struct ObjectStore {
+    reads: CasReadAccess,
+    control: crate::control::ControlHandle,
     kio_dir: Option<PathBuf>,
     /// Scheduled writers retain these handles before taking their writer
     /// boundary.  The ambient `.kio/objects` pathname is deliberately never
@@ -646,6 +555,18 @@ impl PlannedContentRemoval {
 }
 
 impl ObjectStore {
+    #[must_use]
+    pub fn control(&self) -> &crate::control::ControlHandle {
+        &self.control
+    }
+
+    #[must_use]
+    pub fn rebind_with_control(&self, control: crate::control::ControlHandle) -> Self {
+        let mut store = self.clone();
+        store.control = control;
+        store
+    }
+
     /// Capture an exact physical content file through already-retained CAS
     /// parents. Quarantine residue is only a candidate; hash verification and
     /// the caller's fresh orphan proof are required on every new plan.
@@ -655,6 +576,7 @@ impl ObjectStore {
         hash: &str,
         budget: &mut crate::store_dir::RemovalBudget,
     ) -> Result<Option<PlannedContentRemoval>> {
+        self.read_access().charge(0)?;
         if !matches!(kind, ContentObjectKind::Prepared | ContentObjectKind::Image) || !is_hash(hash)
         {
             return Err(KioError::invalid_usage(
@@ -674,15 +596,17 @@ impl ObjectStore {
             &parent,
             Path::new("planned CAS parent"),
         )?;
-        let directory = crate::store_dir::StoreDirectory::from_retained(
+        let directory = crate::store_dir::StoreDirectory::from_retained_with_control(
             parent,
             PathBuf::from("planned CAS parent"),
+            self.control.clone(),
         )?;
         let Some(target) = crate::store_dir::PlannedFileRemoval::capture_content(
             &directory,
             Path::new(&leaf),
             kind.max_bytes(),
             budget,
+            self.read_access(),
         )?
         else {
             return Ok(None);
@@ -700,7 +624,17 @@ impl ObjectStore {
 
     #[must_use]
     pub fn new(kio_dir: impl Into<PathBuf>) -> Self {
+        Self::new_with_control(kio_dir, crate::control::ControlHandle::default())
+    }
+
+    #[must_use]
+    pub fn new_with_control(
+        kio_dir: impl Into<PathBuf>,
+        control: crate::control::ControlHandle,
+    ) -> Self {
         Self {
+            control,
+            reads: CasReadAccess::Unmetered,
             kio_dir: Some(kio_dir.into()),
             bound: None,
         }
@@ -720,6 +654,13 @@ impl ObjectStore {
     /// missing/replaced/symlinked object namespace rather than recovering via
     /// the public pathname.
     pub fn from_bound_kio(kio: &File) -> Result<Self> {
+        Self::from_bound_kio_with_control(kio, crate::control::ControlHandle::default())
+    }
+
+    pub fn from_bound_kio_with_control(
+        kio: &File,
+        control: crate::control::ControlHandle,
+    ) -> Result<Self> {
         let objects = bound_open_dir(kio, "objects")?;
         let raw = bound_open_dir(&objects, ObjectKind::Raw.directory())?;
         let trees = bound_open_dir(&objects, ObjectKind::Tree.directory())?;
@@ -749,6 +690,8 @@ impl ObjectStore {
         let toollocks = optional_dir(ContentObjectKind::Toollock.directory())?;
         let normalized_units = optional_dir(ContentObjectKind::NormalizedUnit.directory())?;
         Ok(Self {
+            control,
+            reads: CasReadAccess::Unmetered,
             kio_dir: None,
             bound: Some(BoundObjectDirs {
                 kio: {
@@ -849,7 +792,15 @@ impl ObjectStore {
             return Ok(true);
         };
         let path = path.as_path();
-        if read_verified_object(path, ObjectKind::Raw, expected_hash, false).is_ok() {
+        if read_verified_object(
+            &CasReadAccess::Unmetered,
+            path,
+            ObjectKind::Raw,
+            expected_hash,
+            false,
+        )
+        .is_ok()
+        {
             return Ok(false);
         }
 
@@ -905,7 +856,13 @@ impl ObjectStore {
                 let _ = fs::remove_file(&quarantine);
                 return Err(error);
             }
-            if let Err(error) = read_verified_object(path, ObjectKind::Raw, expected_hash, false) {
+            if let Err(error) = read_verified_object(
+                &CasReadAccess::Unmetered,
+                path,
+                ObjectKind::Raw,
+                expected_hash,
+                false,
+            ) {
                 let _ = replace_file(&quarantine, path);
                 return Err(error);
             }
@@ -944,13 +901,14 @@ impl ObjectStore {
         if let Some(bound) = &self.bound {
             let (parent, leaf) = bound.chunk_fanout(&hash, true)?;
             bound_write_semantic(&parent, &leaf, &bytes, MAX_CHUNK_OBJECT_BYTES)?;
-            bound_read_chunk_accounted(&parent, &leaf, &hash).map_err(|e| e.error)?;
+            bound_read_chunk_accounted(&CasReadAccess::Unmetered, &parent, &leaf, &hash)
+                .map_err(|e| e.error)?;
             return Ok(hash);
         }
         self.ensure_chunk_parent(&hash)?;
         if let Some(existing) = self.existing_chunk_path(&hash)? {
             verify_existing_bytes(&existing, &hash, &bytes)?;
-            read_chunk_path(&existing, &hash)?;
+            read_chunk_path(&CasReadAccess::Unmetered, &existing, &hash)?;
             return Ok(hash);
         }
 
@@ -967,7 +925,7 @@ impl ObjectStore {
             let Some(published_path) = self.existing_chunk_path(&hash)? else {
                 return Err(KioError::not_found(&hash));
             };
-            let (object, _) = read_chunk_path(&published_path, &hash)?;
+            let (object, _) = read_chunk_path(&CasReadAccess::Unmetered, &published_path, &hash)?;
             if &object != chunk {
                 return Err(chunk_corrupt_error(
                     "published chunk object changed identity or text",
@@ -1003,7 +961,7 @@ impl ObjectStore {
         let Some(path) = self.existing_chunk_path(hash)? else {
             return Err(KioError::not_found(hash));
         };
-        let (object, bytes) = read_chunk_path(&path, hash)?;
+        let (object, bytes) = read_chunk_path(&self.reads, &path, hash)?;
         Ok((object, bytes.len() as u64))
     }
 
@@ -1019,7 +977,7 @@ impl ObjectStore {
                         error,
                         consumed_bytes: 0,
                     })?;
-            return bound_read_chunk_accounted(&parent, &leaf, hash);
+            return bound_read_chunk_accounted(&self.reads, &parent, &leaf, hash);
         }
         let path = (|| -> Result<PathBuf> {
             if !is_hash(hash) {
@@ -1035,7 +993,7 @@ impl ObjectStore {
             error,
             consumed_bytes: 0,
         })?;
-        let (result, consumed_bytes) = read_chunk_path_accounted(&path, hash);
+        let (result, consumed_bytes) = read_chunk_path_accounted(&self.reads, &path, hash);
         let (object, _) = result.map_err(|error| AccountedReadError {
             error,
             consumed_bytes,
@@ -1051,7 +1009,7 @@ impl ObjectStore {
         hash: &str,
     ) -> Result<StoredContentObjectMetadata> {
         if let Some(bound) = &self.bound {
-            return bound.inspect_content_object(kind, hash);
+            return bound.inspect_content_object(&self.reads, kind, hash);
         }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid content object hash"));
@@ -1062,7 +1020,7 @@ impl ObjectStore {
         let Some(path) = self.existing_content_path(kind, hash)? else {
             return Err(KioError::not_found(hash));
         };
-        let size_bytes = verify_content_object_path(&path, kind, hash)?;
+        let size_bytes = verify_content_object_path(&self.reads, &path, kind, hash)?;
         Ok(StoredContentObjectMetadata {
             kind,
             hash: hash.to_owned(),
@@ -1076,7 +1034,7 @@ impl ObjectStore {
         hash: &str,
     ) -> std::result::Result<StoredContentObjectMetadata, AccountedReadError> {
         if let Some(bound) = &self.bound {
-            return bound.inspect_content_accounted(kind, hash);
+            return bound.inspect_content_accounted(&self.reads, kind, hash);
         }
         let path = (|| -> Result<PathBuf> {
             if !is_hash(hash) {
@@ -1092,7 +1050,8 @@ impl ObjectStore {
             error,
             consumed_bytes: 0,
         })?;
-        let (result, consumed_bytes) = verify_content_object_path_accounted(&path, kind, hash);
+        let (result, consumed_bytes) =
+            verify_content_object_path_accounted(&self.reads, &path, kind, hash);
         result.map_err(|error| AccountedReadError {
             error,
             consumed_bytes,
@@ -1132,7 +1091,7 @@ impl ObjectStore {
         if let Some(bound) = &self.bound {
             let (parent, leaf) = bound.content_fanout(ContentObjectKind::Embedding, &hash, true)?;
             bound_write_semantic(&parent, &leaf, &bytes, MAX_EMBEDDING_OBJECT_BYTES)?;
-            bound_read_embedding(&parent, &leaf, &hash)?;
+            bound_read_embedding(&CasReadAccess::Unmetered, &parent, &leaf, &hash)?;
             return Ok(hash);
         }
         self.ensure_embedding_parent(&hash)?;
@@ -1173,9 +1132,9 @@ impl ObjectStore {
     pub fn read_embedding(&self, hash: &str) -> Result<EmbeddingObject> {
         if let Some(bound) = &self.bound {
             let (parent, leaf) = bound.content_fanout(ContentObjectKind::Embedding, hash, false)?;
-            return bound_read_embedding(&parent, &leaf, hash);
+            return bound_read_embedding(&self.reads, &parent, &leaf, hash);
         }
-        read_embedding_path(&self.embedding_path(hash)?, hash)
+        read_embedding_path(&self.reads, &self.embedding_path(hash)?, hash)
     }
 
     /// Remove one embedding object after identity verification.
@@ -1190,7 +1149,7 @@ impl ObjectStore {
     /// Missing is an idempotent `false`.
     pub fn remove_embedding(&self, hash: &str) -> Result<bool> {
         if let Some(bound) = &self.bound {
-            return bound.remove_embedding(hash);
+            return bound.remove_embedding(hash, &self.control);
         }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid embedding hash"));
@@ -1199,6 +1158,7 @@ impl ObjectStore {
             return Ok(false);
         }
         remove_verified_cas_path(
+            &self.control,
             self.ambient_kio_dir()?,
             &self.embedding_path(hash)?,
             CasRemovalKind::Embedding,
@@ -1214,6 +1174,7 @@ impl ObjectStore {
         &self,
         mut visit: impl FnMut(&str, &ChunkObject) -> Result<()>,
     ) -> Result<()> {
+        self.reads.charge(0)?;
         if let Some(bound) = &self.bound {
             let mut retained = bound
                 .chunks
@@ -1233,7 +1194,7 @@ impl ObjectStore {
                 .expect("retained chunks namespace")
                 .clone();
             drop(retained);
-            return bound_visit_chunks(&base, &mut visit);
+            return bound_visit_chunks(&self.reads, &base, &mut visit);
         }
         Err(KioError::invalid_usage(
             "chunk completeness inventory requires a retained object store",
@@ -1247,8 +1208,9 @@ impl ObjectStore {
     /// empty list when the namespace does not exist, which is the ordinary
     /// state of a scope nothing has embedded yet.
     pub fn embedding_hashes(&self) -> Result<Vec<String>> {
+        self.reads.charge(0)?;
         if let Some(bound) = &self.bound {
-            return bound.embedding_hashes();
+            return bound.embedding_hashes(&self.reads);
         }
         let base = self.ambient_kio_dir()?.join("objects/embeddings");
         let mut hashes = Vec::new();
@@ -1495,7 +1457,13 @@ impl ObjectStore {
             let Some(published) = self.existing_object_path(ObjectKind::Raw, &hash)? else {
                 return Err(KioError::not_found(&hash));
             };
-            read_verified_object(&published, ObjectKind::Raw, &hash, false)?;
+            read_verified_object(
+                &CasReadAccess::Unmetered,
+                &published,
+                ObjectKind::Raw,
+                &hash,
+                false,
+            )?;
             Ok((hash, total))
         })();
         if result.is_err() {
@@ -1506,10 +1474,10 @@ impl ObjectStore {
 
     pub fn read_by_hash(&self, hash: &str) -> Result<StoredObject> {
         if let Some(bound) = &self.bound {
-            return bound.read_by_hash(hash);
+            return bound.read_by_hash(&self.reads, hash);
         }
         let (kind, path) = self.locate_object(hash)?;
-        let (_, bytes) = read_verified_object(&path, kind, hash, true)?;
+        let (_, bytes) = read_verified_object(&self.reads, &path, kind, hash, true)?;
         Ok(StoredObject {
             kind,
             hash: hash.to_owned(),
@@ -1524,7 +1492,7 @@ impl ObjectStore {
     /// closed before unlink.
     pub fn remove_raw(&self, hash: &str) -> Result<bool> {
         if let Some(bound) = &self.bound {
-            return bound.remove_raw(hash);
+            return bound.remove_raw(hash, &self.control);
         }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid raw hash"));
@@ -1533,6 +1501,7 @@ impl ObjectStore {
             return Ok(false);
         }
         remove_verified_cas_path(
+            &self.control,
             self.ambient_kio_dir()?,
             &self.object_path(ObjectKind::Raw, hash)?,
             CasRemovalKind::Raw,
@@ -1543,7 +1512,7 @@ impl ObjectStore {
     /// Remove one semantic chunk object after identity/text verification.
     pub fn remove_chunk(&self, hash: &str) -> Result<bool> {
         if let Some(bound) = &self.bound {
-            return bound.remove_chunk(hash);
+            return bound.remove_chunk(hash, &self.control);
         }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid chunk hash"));
@@ -1552,6 +1521,7 @@ impl ObjectStore {
             return Ok(false);
         }
         remove_verified_cas_path(
+            &self.control,
             self.ambient_kio_dir()?,
             &self.chunk_path(hash)?,
             CasRemovalKind::Chunk,
@@ -1566,7 +1536,7 @@ impl ObjectStore {
     /// before the first unlink.
     pub fn remove_content(&self, kind: ContentObjectKind, hash: &str) -> Result<bool> {
         if let Some(bound) = &self.bound {
-            return bound.remove_content(kind, hash);
+            return bound.remove_content(kind, hash, &self.control);
         }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid content object hash"));
@@ -1575,6 +1545,7 @@ impl ObjectStore {
             return Ok(false);
         }
         remove_verified_cas_path(
+            &self.control,
             self.ambient_kio_dir()?,
             &self.content_path(kind, hash)?,
             CasRemovalKind::Content(kind),
@@ -1666,7 +1637,7 @@ impl ObjectStore {
         max_bytes: u64,
     ) -> Result<Vec<u8>> {
         if let Some(bound) = &self.bound {
-            return bound.read_content_object_bytes(kind, hash, max_bytes);
+            return bound.read_content_object_bytes(&self.reads, kind, hash, max_bytes);
         }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid content object hash"));
@@ -1677,7 +1648,7 @@ impl ObjectStore {
         let Some(path) = self.existing_content_path(kind, hash)? else {
             return Err(KioError::not_found(hash));
         };
-        read_bounded_regular_file_inner(&path, max_bytes, true)
+        read_bounded_regular_file_inner(&path, max_bytes, &self.reads)
     }
 
     /// Read and verify a hash from one required CAS namespace. Unlike
@@ -1695,7 +1666,7 @@ impl ObjectStore {
         hash: &str,
     ) -> Result<(StoredObject, u64)> {
         if let Some(bound) = &self.bound {
-            return bound.read_object_with_size(kind, hash);
+            return bound.read_object_with_size(&self.reads, kind, hash);
         }
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid hash"));
@@ -1706,7 +1677,7 @@ impl ObjectStore {
         let Some(path) = self.existing_object_path(kind, hash)? else {
             return Err(KioError::not_found(hash));
         };
-        let (size_bytes, bytes) = read_verified_object(&path, kind, hash, true)?;
+        let (size_bytes, bytes) = read_verified_object(&self.reads, &path, kind, hash, true)?;
         Ok((
             StoredObject {
                 kind,
@@ -1731,7 +1702,7 @@ impl ObjectStore {
             return Err(KioError::not_found(hash));
         }
         let (kind, path) = self.locate_object(hash)?;
-        let (size_bytes, _) = read_verified_object(&path, kind, hash, false)?;
+        let (size_bytes, _) = read_verified_object(&self.reads, &path, kind, hash, false)?;
         Ok(StoredObjectMetadata {
             kind,
             hash: hash.to_owned(),
@@ -1744,7 +1715,8 @@ impl ObjectStore {
     pub fn inspect_object(&self, kind: ObjectKind, hash: &str) -> Result<StoredObjectMetadata> {
         if let Some(bound) = &self.bound {
             let (parent, leaf) = bound.fanout(kind, hash, false)?;
-            let (size_bytes, _) = bound_read_verified(&parent, &leaf, kind, hash, false)?;
+            let (size_bytes, _) =
+                bound_read_verified(&self.reads, &parent, &leaf, kind, hash, false)?;
             return Ok(StoredObjectMetadata {
                 kind,
                 hash: hash.to_owned(),
@@ -1760,7 +1732,7 @@ impl ObjectStore {
         let Some(path) = self.existing_object_path(kind, hash)? else {
             return Err(KioError::not_found(hash));
         };
-        let (size_bytes, _) = read_verified_object(&path, kind, hash, false)?;
+        let (size_bytes, _) = read_verified_object(&self.reads, &path, kind, hash, false)?;
         Ok(StoredObjectMetadata {
             kind,
             hash: hash.to_owned(),
@@ -1777,7 +1749,7 @@ impl ObjectStore {
         hash: &str,
     ) -> std::result::Result<StoredObjectMetadata, AccountedReadError> {
         if let Some(bound) = &self.bound {
-            let (size_bytes, _) = bound.read_object_accounted(kind, hash, false)?;
+            let (size_bytes, _) = bound.read_object_accounted(&self.reads, kind, hash, false)?;
             return Ok(StoredObjectMetadata {
                 kind,
                 hash: hash.to_owned(),
@@ -1798,7 +1770,8 @@ impl ObjectStore {
             error,
             consumed_bytes: 0,
         })?;
-        let (result, consumed_bytes) = read_verified_object_accounted(&path, kind, hash, false);
+        let (result, consumed_bytes) =
+            read_verified_object_accounted(&self.reads, &path, kind, hash, false);
         result.map_err(|error| AccountedReadError {
             error,
             consumed_bytes,
@@ -1817,7 +1790,7 @@ impl ObjectStore {
         hash: &str,
     ) -> std::result::Result<(StoredObject, u64), AccountedReadError> {
         if let Some(bound) = &self.bound {
-            let (size_bytes, bytes) = bound.read_object_accounted(kind, hash, true)?;
+            let (size_bytes, bytes) = bound.read_object_accounted(&self.reads, kind, hash, true)?;
             return Ok((
                 StoredObject {
                     kind,
@@ -1841,7 +1814,8 @@ impl ObjectStore {
             error,
             consumed_bytes: 0,
         })?;
-        let (result, consumed_bytes) = read_verified_object_accounted(&path, kind, hash, true);
+        let (result, consumed_bytes) =
+            read_verified_object_accounted(&self.reads, &path, kind, hash, true);
         let (_, bytes) = result.map_err(|error| AccountedReadError {
             error,
             consumed_bytes,
@@ -1870,10 +1844,11 @@ impl ObjectStore {
         if let Some(bound) = &self.bound {
             let (parent, leaf) = bound.fanout(kind, hash, false)?;
             let mut hasher = Sha256::new();
-            let (result, _) = bound_stream_regular(&parent, &leaf, kind.max_bytes(), |bytes| {
-                hasher.update(bytes);
-                writer.write_all(bytes).kio_io(Path::new(&leaf))
-            });
+            let (result, _) =
+                bound_stream_regular(&self.reads, &parent, &leaf, kind.max_bytes(), |bytes| {
+                    hasher.update(bytes);
+                    writer.write_all(bytes).kio_io(Path::new(&leaf))
+                });
             let size_bytes = result?;
             let actual = format!("sha256:{}", lower_hex(&hasher.finalize()));
             if actual != hash {
@@ -1899,7 +1874,7 @@ impl ObjectStore {
         let path = self
             .existing_object_path(kind, hash)?
             .ok_or_else(|| KioError::not_found(hash))?;
-        let size_bytes = copy_verified_object(&path, kind, hash, writer)?;
+        let size_bytes = copy_verified_object(&self.reads, &path, kind, hash, writer)?;
         Ok(StoredObjectMetadata {
             kind,
             hash: hash.to_owned(),
@@ -2120,9 +2095,21 @@ impl BoundObjectDirs {
         // type and single-link identity before accepting it.
         cas_semantics::prepare_bound_raw_stage(&mut stage.file);
         let (parent, leaf) = self.fanout(ObjectKind::Raw, &hash, true)?;
-        match bound_read_verified(&parent, &leaf, ObjectKind::Raw, &hash, true) {
+        match bound_read_verified(
+            &CasReadAccess::Unmetered,
+            &parent,
+            &leaf,
+            ObjectKind::Raw,
+            &hash,
+            true,
+        ) {
             Ok((existing_size, existing)) => {
-                let (_, staged) = bound_read_regular(&self.raw, &stage.name, MAX_RAW_OBJECT_BYTES)?;
+                let (_, staged) = bound_read_regular(
+                    &CasReadAccess::Unmetered,
+                    &self.raw,
+                    &stage.name,
+                    MAX_RAW_OBJECT_BYTES,
+                )?;
                 if existing_size != size || existing != staged {
                     return Err(corrupt_object_error(
                         Path::new(&leaf),
@@ -2174,7 +2161,12 @@ impl BoundObjectDirs {
             if !bound_ingest_name(name) {
                 return Err(bound_stage_corrupt("bound raw stage name is malformed"));
             }
-            let (size, _) = bound_read_regular(&self.raw, name, MAX_RAW_OBJECT_BYTES)?;
+            let (size, _) = bound_read_regular(
+                &CasReadAccess::Unmetered,
+                &self.raw,
+                name,
+                MAX_RAW_OBJECT_BYTES,
+            )?;
             total = total
                 .checked_add(size)
                 .ok_or_else(|| bound_stage_corrupt("bound raw stage byte count overflow"))?;
@@ -2198,6 +2190,7 @@ impl BoundObjectDirs {
 
     fn read_object_accounted(
         &self,
+        reads: &CasReadAccess,
         kind: ObjectKind,
         hash: &str,
         materialize: bool,
@@ -2209,7 +2202,7 @@ impl BoundObjectDirs {
                     consumed_bytes: 0,
                 })?;
         let (result, consumed_bytes) =
-            bound_read_verified_accounted(&parent, &leaf, kind, hash, materialize);
+            bound_read_verified_accounted(reads, &parent, &leaf, kind, hash, materialize);
         result.map_err(|error| AccountedReadError {
             error,
             consumed_bytes,
@@ -2321,7 +2314,12 @@ impl BoundObjectDirs {
             ));
         }
         let (parent, leaf) = self.fanout(ObjectKind::Raw, expected_hash, true)?;
-        match bound_read_regular(&parent, &leaf, ObjectKind::Raw.max_bytes()) {
+        match bound_read_regular(
+            &CasReadAccess::Unmetered,
+            &parent,
+            &leaf,
+            ObjectKind::Raw.max_bytes(),
+        ) {
             Ok((_, existing)) if hash_bytes(&existing) == expected_hash => return Ok(false),
             Ok(_) => {}
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
@@ -2338,7 +2336,12 @@ impl BoundObjectDirs {
         // quarantine must prove it names this handle, never merely whatever
         // pathname happened to occupy the leaf after the corrupt read.
         let mut source = bound_open_regular_handle(&parent, &leaf)?;
-        if bound_hash_open_regular(&mut source, ObjectKind::Raw.max_bytes())? == expected_hash {
+        if bound_hash_open_regular(
+            &CasReadAccess::Unmetered,
+            &mut source,
+            ObjectKind::Raw.max_bytes(),
+        )? == expected_hash
+        {
             return Err(corrupt_object_error(
                 Path::new(&leaf),
                 "raw repair observed an unstable CAS slot",
@@ -2381,9 +2384,14 @@ impl BoundObjectDirs {
                 let _ = bound_remove(&parent, &temp);
                 return publish;
             }
-            if let Err(error) =
-                bound_read_verified(&parent, &leaf, ObjectKind::Raw, expected_hash, false)
-            {
+            if let Err(error) = bound_read_verified(
+                &CasReadAccess::Unmetered,
+                &parent,
+                &leaf,
+                ObjectKind::Raw,
+                expected_hash,
+                false,
+            ) {
                 let _ = bound_remove(&parent, &leaf);
                 let _ = cap_primitives::fs::hard_link(
                     &parent,
@@ -2405,16 +2413,24 @@ impl BoundObjectDirs {
         Ok(true)
     }
 
-    fn remove_raw(&self, hash: &str) -> Result<bool> {
+    fn remove_raw(&self, hash: &str, control: &crate::control::ControlHandle) -> Result<bool> {
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid raw hash"));
         }
-        self.remove_verified(ObjectKind::Raw, hash, |parent, leaf| {
-            bound_read_verified(parent, leaf, ObjectKind::Raw, hash, false).map(|_| ())
+        self.remove_verified(control, ObjectKind::Raw, hash, |parent, leaf| {
+            bound_read_verified(
+                &CasReadAccess::Unmetered,
+                parent,
+                leaf,
+                ObjectKind::Raw,
+                hash,
+                false,
+            )
+            .map(|_| ())
         })
     }
 
-    fn remove_chunk(&self, hash: &str) -> Result<bool> {
+    fn remove_chunk(&self, hash: &str, control: &crate::control::ControlHandle) -> Result<bool> {
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid chunk hash"));
         }
@@ -2423,14 +2439,18 @@ impl BoundObjectDirs {
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
             Err(error) => return Err(error),
         };
-        bound_remove_verified(&parent, &leaf, |parent, leaf| {
-            bound_read_chunk_accounted(parent, leaf, hash)
+        bound_remove_verified(control, &parent, &leaf, |parent, leaf| {
+            bound_read_chunk_accounted(&CasReadAccess::Unmetered, parent, leaf, hash)
                 .map(|_| ())
                 .map_err(|error| error.error)
         })
     }
 
-    fn remove_embedding(&self, hash: &str) -> Result<bool> {
+    fn remove_embedding(
+        &self,
+        hash: &str,
+        control: &crate::control::ControlHandle,
+    ) -> Result<bool> {
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid embedding hash"));
         }
@@ -2439,12 +2459,18 @@ impl BoundObjectDirs {
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
             Err(error) => return Err(error),
         };
-        bound_remove_verified(&parent, &leaf, |parent, leaf| {
-            bound_read_embedding(parent, leaf, hash).map(|_| ())
+        bound_remove_verified(control, &parent, &leaf, |parent, leaf| {
+            bound_read_embedding(&CasReadAccess::Unmetered, parent, leaf, hash).map(|_| ())
         })
     }
 
-    fn remove_verified<F>(&self, kind: ObjectKind, hash: &str, verify: F) -> Result<bool>
+    fn remove_verified<F>(
+        &self,
+        control: &crate::control::ControlHandle,
+        kind: ObjectKind,
+        hash: &str,
+        verify: F,
+    ) -> Result<bool>
     where
         F: Fn(&File, &str) -> Result<()>,
     {
@@ -2453,10 +2479,10 @@ impl BoundObjectDirs {
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
             Err(error) => return Err(error),
         };
-        bound_remove_verified(&parent, &leaf, verify)
+        bound_remove_verified(control, &parent, &leaf, verify)
     }
 
-    fn embedding_hashes(&self) -> Result<Vec<String>> {
+    fn embedding_hashes(&self, reads: &CasReadAccess) -> Result<Vec<String>> {
         let mut retained = self.content_slot(ContentObjectKind::Embedding)?;
         if retained.is_none() {
             match bound_open_dir(&self.objects, ContentObjectKind::Embedding.directory()) {
@@ -2470,11 +2496,12 @@ impl BoundObjectDirs {
         let Some(base) = retained.as_ref() else {
             return Ok(Vec::new());
         };
-        bound_embedding_hashes(base)
+        bound_embedding_hashes(reads, base)
     }
 
     fn inspect_content_object(
         &self,
+        reads: &CasReadAccess,
         kind: ContentObjectKind,
         hash: &str,
     ) -> Result<StoredContentObjectMetadata> {
@@ -2482,7 +2509,7 @@ impl BoundObjectDirs {
             return Err(KioError::invalid_usage("invalid content object hash"));
         }
         let (parent, leaf) = self.content_fanout(kind, hash, false)?;
-        let size_bytes = bound_verify_content(&parent, &leaf, kind, hash)?;
+        let size_bytes = bound_verify_content(reads, &parent, &leaf, kind, hash)?;
         Ok(StoredContentObjectMetadata {
             kind,
             hash: hash.to_owned(),
@@ -2492,6 +2519,7 @@ impl BoundObjectDirs {
 
     fn inspect_content_accounted(
         &self,
+        reads: &CasReadAccess,
         kind: ContentObjectKind,
         hash: &str,
     ) -> std::result::Result<StoredContentObjectMetadata, AccountedReadError> {
@@ -2501,7 +2529,8 @@ impl BoundObjectDirs {
                     error,
                     consumed_bytes: 0,
                 })?;
-        let (result, consumed_bytes) = bound_verify_content_accounted(&parent, &leaf, kind, hash);
+        let (result, consumed_bytes) =
+            bound_verify_content_accounted(reads, &parent, &leaf, kind, hash);
         let size_bytes = result.map_err(|error| AccountedReadError {
             error,
             consumed_bytes,
@@ -2523,7 +2552,7 @@ impl BoundObjectDirs {
         }
         let hash = hash_bytes(bytes);
         let (parent, leaf) = self.content_fanout(kind, &hash, true)?;
-        match bound_read_content(&parent, &leaf, kind.max_bytes(), true) {
+        match bound_read_regular(&CasReadAccess::Unmetered, &parent, &leaf, kind.max_bytes()) {
             Ok((_, existing)) => {
                 if hash_bytes(&existing) == hash && existing == bytes {
                     return Ok(hash);
@@ -2553,6 +2582,7 @@ impl BoundObjectDirs {
 
     fn read_content_object_bytes(
         &self,
+        reads: &CasReadAccess,
         kind: ContentObjectKind,
         hash: &str,
         max_bytes: u64,
@@ -2561,10 +2591,15 @@ impl BoundObjectDirs {
             return Err(KioError::invalid_usage("invalid content object hash"));
         }
         let (parent, leaf) = self.content_fanout(kind, hash, false)?;
-        bound_read_content(&parent, &leaf, max_bytes, true).map(|(_, bytes)| bytes)
+        bound_read_regular(reads, &parent, &leaf, max_bytes).map(|(_, bytes)| bytes)
     }
 
-    fn remove_content(&self, kind: ContentObjectKind, hash: &str) -> Result<bool> {
+    fn remove_content(
+        &self,
+        kind: ContentObjectKind,
+        hash: &str,
+        control: &crate::control::ControlHandle,
+    ) -> Result<bool> {
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid content object hash"));
         }
@@ -2573,17 +2608,22 @@ impl BoundObjectDirs {
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
             Err(error) => return Err(error),
         };
-        bound_remove_verified(&parent, &leaf, |parent, leaf| {
-            bound_verify_content(parent, leaf, kind, hash).map(|_| ())
+        bound_remove_verified(control, &parent, &leaf, |parent, leaf| {
+            bound_verify_content(&CasReadAccess::Unmetered, parent, leaf, kind, hash).map(|_| ())
         })
     }
 
-    fn read_object_with_size(&self, kind: ObjectKind, hash: &str) -> Result<(StoredObject, u64)> {
+    fn read_object_with_size(
+        &self,
+        reads: &CasReadAccess,
+        kind: ObjectKind,
+        hash: &str,
+    ) -> Result<(StoredObject, u64)> {
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid hash"));
         }
         let (parent, leaf) = self.fanout(kind, hash, false)?;
-        let (size_bytes, bytes) = bound_read_verified(&parent, &leaf, kind, hash, true)?;
+        let (size_bytes, bytes) = bound_read_verified(reads, &parent, &leaf, kind, hash, true)?;
         Ok((
             StoredObject {
                 kind,
@@ -2594,12 +2634,12 @@ impl BoundObjectDirs {
         ))
     }
 
-    fn read_by_hash(&self, hash: &str) -> Result<StoredObject> {
+    fn read_by_hash(&self, reads: &CasReadAccess, hash: &str) -> Result<StoredObject> {
         if !is_hash(hash) {
             return Err(KioError::invalid_usage("invalid hash"));
         }
         for kind in [ObjectKind::Tree, ObjectKind::Commit, ObjectKind::Raw] {
-            match self.read_object_with_size(kind, hash) {
+            match self.read_object_with_size(reads, kind, hash) {
                 Ok((object, _)) => return Ok(object),
                 Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => continue,
                 Err(error) => return Err(error),
@@ -2622,7 +2662,7 @@ impl BoundObjectDirs {
             ));
         }
         let (parent, leaf) = self.fanout(kind, hash, true)?;
-        match bound_read_verified(&parent, &leaf, kind, hash, true) {
+        match bound_read_verified(&CasReadAccess::Unmetered, &parent, &leaf, kind, hash, true) {
             Ok((_, existing)) => {
                 if existing == bytes {
                     return Ok(());
@@ -2692,10 +2732,21 @@ impl BoundObjectDirs {
             let (parent, leaf) = self.fanout(ObjectKind::Raw, &hash, true)?;
             // A temp in raw's base cannot be linked across a fanout directory
             // by a path-based fallback; linkat keeps both endpoints capability-bound.
-            match bound_read_verified(&parent, &leaf, ObjectKind::Raw, &hash, true) {
+            match bound_read_verified(
+                &CasReadAccess::Unmetered,
+                &parent,
+                &leaf,
+                ObjectKind::Raw,
+                &hash,
+                true,
+            ) {
                 Ok((_, existing)) => {
-                    let (_, staged) =
-                        bound_read_regular(&self.raw, &temp_name, ObjectKind::Raw.max_bytes())?;
+                    let (_, staged) = bound_read_regular(
+                        &CasReadAccess::Unmetered,
+                        &self.raw,
+                        &temp_name,
+                        ObjectKind::Raw.max_bytes(),
+                    )?;
                     if existing != staged {
                         return Err(corrupt_object_error(
                             Path::new(&leaf),
@@ -2797,6 +2848,7 @@ fn bound_open_or_create_dir(parent: &File, leaf: &str, create: bool) -> Result<F
 }
 
 fn bound_stream_regular(
+    reads: &CasReadAccess,
     parent: &File,
     leaf: &str,
     max: u64,
@@ -2804,6 +2856,7 @@ fn bound_stream_regular(
 ) -> (Result<u64>, u64) {
     let mut consumed = 0_u64;
     let result = (|| -> Result<u64> {
+        reads.charge(0)?;
         use cap_primitives::fs as cap_fs;
         let name = bound_leaf(leaf, "object")?;
         let label = Path::new(leaf);
@@ -2851,7 +2904,7 @@ fn bound_stream_regular(
             consumed = consumed
                 .checked_add(count as u64)
                 .ok_or_else(|| bound_stage_corrupt("CAS read byte count overflow"))?;
-            charge_verified_cas_read(count as u64)?;
+            reads.charge(count as u64)?;
             if consumed > max {
                 return Err(KioError::new(
                     "KIO-E-STORE-OBJECT-OVERSIZED-001",
@@ -2886,9 +2939,14 @@ fn bound_stream_regular(
     (result, consumed)
 }
 
-fn bound_read_regular(parent: &File, leaf: &str, max: u64) -> Result<(u64, Vec<u8>)> {
+fn bound_read_regular(
+    reads: &CasReadAccess,
+    parent: &File,
+    leaf: &str,
+    max: u64,
+) -> Result<(u64, Vec<u8>)> {
     let mut bytes = Vec::new();
-    let (result, _) = bound_stream_regular(parent, leaf, max, |part| {
+    let (result, _) = bound_stream_regular(reads, parent, leaf, max, |part| {
         bytes
             .try_reserve(part.len())
             .map_err(|_| bound_stage_corrupt("cannot allocate bounded CAS body"))?;
@@ -2899,13 +2957,14 @@ fn bound_read_regular(parent: &File, leaf: &str, max: u64) -> Result<(u64, Vec<u
 }
 
 fn bound_read_chunk_accounted(
+    reads: &CasReadAccess,
     parent: &File,
     leaf: &str,
     hash: &str,
 ) -> std::result::Result<(ChunkObject, u64), AccountedReadError> {
     let mut bytes = Vec::new();
     let (result, consumed_bytes) =
-        bound_stream_regular(parent, leaf, MAX_CHUNK_OBJECT_BYTES, |part| {
+        bound_stream_regular(reads, parent, leaf, MAX_CHUNK_OBJECT_BYTES, |part| {
             bytes
                 .try_reserve(part.len())
                 .map_err(|_| chunk_size_error(u64::MAX))?;
@@ -2920,8 +2979,13 @@ fn bound_read_chunk_accounted(
         })
 }
 
-fn bound_read_embedding(parent: &File, leaf: &str, hash: &str) -> Result<EmbeddingObject> {
-    let (_, bytes) = bound_read_regular(parent, leaf, MAX_EMBEDDING_OBJECT_BYTES)?;
+fn bound_read_embedding(
+    reads: &CasReadAccess,
+    parent: &File,
+    leaf: &str,
+    hash: &str,
+) -> Result<EmbeddingObject> {
+    let (_, bytes) = bound_read_regular(reads, parent, leaf, MAX_EMBEDDING_OBJECT_BYTES)?;
     decode_embedding(&bytes, hash, Path::new(leaf))
 }
 
@@ -2930,7 +2994,7 @@ fn bound_read_embedding(parent: &File, leaf: &str, hash: &str) -> Result<Embeddi
 /// entire bounded object, including text/vector data outside the key.
 fn bound_write_semantic(parent: &File, leaf: &str, bytes: &[u8], max: u64) -> Result<()> {
     let verify = || -> Result<()> {
-        let (_, existing) = bound_read_regular(parent, leaf, max)?;
+        let (_, existing) = bound_read_regular(&CasReadAccess::Unmetered, parent, leaf, max)?;
         if existing != bytes {
             return Err(bound_stage_corrupt(
                 "semantic CAS key already contains different bytes",
@@ -2964,6 +3028,7 @@ fn bound_write_semantic(parent: &File, leaf: &str, bytes: &[u8], max: u64) -> Re
 }
 
 fn bound_read_verified_accounted(
+    reads: &CasReadAccess,
     parent: &File,
     leaf: &str,
     kind: ObjectKind,
@@ -2972,7 +3037,7 @@ fn bound_read_verified_accounted(
 ) -> (Result<(u64, Vec<u8>)>, u64) {
     let mut bytes = Vec::new();
     let mut hasher = Sha256::new();
-    let (result, consumed) = bound_stream_regular(parent, leaf, kind.max_bytes(), |part| {
+    let (result, consumed) = bound_stream_regular(reads, parent, leaf, kind.max_bytes(), |part| {
         hasher.update(part);
         if materialize {
             bytes
@@ -2998,46 +3063,39 @@ fn bound_read_verified_accounted(
 }
 
 fn bound_read_verified(
+    reads: &CasReadAccess,
     parent: &File,
     leaf: &str,
     kind: ObjectKind,
     hash: &str,
     materialize: bool,
 ) -> Result<(u64, Vec<u8>)> {
-    bound_read_verified_accounted(parent, leaf, kind, hash, materialize).0
+    bound_read_verified_accounted(reads, parent, leaf, kind, hash, materialize).0
 }
 
 /// Content namespaces use the same retained-parent, no-follow and identity
 /// checks as raw/tree/commit objects. The content byte hash is deliberately
 /// checked by `bound_verify_content`; bounded semantic reads only require a
 /// regular stable leaf, matching the public-path API contract.
-fn bound_read_content(
-    parent: &File,
-    leaf: &str,
-    max: u64,
-    materialize: bool,
-) -> Result<(u64, Vec<u8>)> {
-    let (size, bytes) = bound_read_regular(parent, leaf, max)?;
-    Ok((size, if materialize { bytes } else { Vec::new() }))
-}
-
 fn bound_verify_content(
+    reads: &CasReadAccess,
     parent: &File,
     leaf: &str,
     kind: ContentObjectKind,
     hash: &str,
 ) -> Result<u64> {
-    bound_verify_content_accounted(parent, leaf, kind, hash).0
+    bound_verify_content_accounted(reads, parent, leaf, kind, hash).0
 }
 
 fn bound_verify_content_accounted(
+    reads: &CasReadAccess,
     parent: &File,
     leaf: &str,
     kind: ContentObjectKind,
     hash: &str,
 ) -> (Result<u64>, u64) {
     let mut hasher = Sha256::new();
-    let (result, consumed) = bound_stream_regular(parent, leaf, kind.max_bytes(), |part| {
+    let (result, consumed) = bound_stream_regular(reads, parent, leaf, kind.max_bytes(), |part| {
         hasher.update(part);
         Ok(())
     });
@@ -3098,7 +3156,8 @@ fn bound_open_regular_handle(parent: &File, leaf: &str) -> Result<File> {
     Ok(file)
 }
 
-fn bound_hash_open_regular(file: &mut File, max: u64) -> Result<String> {
+fn bound_hash_open_regular(reads: &CasReadAccess, file: &mut File, max: u64) -> Result<String> {
+    reads.charge(0)?;
     file.seek(std::io::SeekFrom::Start(0))
         .map_err(|error| KioError::io(error.to_string(), "bound CAS repair source"))?;
     let mut total = 0_u64;
@@ -3121,7 +3180,7 @@ fn bound_hash_open_regular(file: &mut File, max: u64) -> Result<String> {
         if total > max {
             return Err(object_size_error(ObjectKind::Raw, max, total));
         }
-        charge_verified_cas_read(count as u64)?;
+        reads.charge(count as u64)?;
         hasher.update(&buffer[..count]);
     }
     Ok(format!("sha256:{}", lower_hex(&hasher.finalize())))
@@ -3139,66 +3198,16 @@ fn bound_quarantine_matches(parent: &File, quarantine: &str, source: &File) -> R
     cas_semantics::same_repair_quarantine(source, &quarantined, Path::new(quarantine))
 }
 
-/// The explicit removal request supplies kind/hash authority for this one
-/// deterministic sibling. A retry must inspect it even when canonical is absent.
-/// No directory scan or legacy random-quarantine cleanup is authorized here.
-fn bound_remove_verified<F>(parent: &File, leaf: &str, verify: F) -> Result<bool>
-where
-    F: Fn(&File, &str) -> Result<()>,
-{
-    use crate::durability::{DurabilityPoint, checkpoint};
-    use crate::store_dir::{Publication, StoreDirectory};
-
-    let directory = StoreDirectory::from_retained(
-        parent.try_clone().kio_io(Path::new(leaf))?,
-        PathBuf::from("CAS removal parent"),
-    )?;
-    let quarantine = format!(".kio-cas-remove-{leaf}");
-    let canonical_exists = directory.contains_entry(Path::new(leaf))?;
-    let quarantine_exists = directory.contains_entry(Path::new(&quarantine))?;
-    if canonical_exists && quarantine_exists {
-        return Err(bound_stage_corrupt(
-            "CAS removal canonical and quarantine both exist",
-        ));
-    }
-    if !canonical_exists && !quarantine_exists {
-        // Also close an interrupted post-unlink sync window on an absent retry.
-        directory.sync()?;
-        return Ok(false);
-    }
-    if canonical_exists {
-        verify(parent, leaf)?;
-        checkpoint(DurabilityPoint::CasRemoveReady)?;
-        // Single-link, no-replace atomic rename: never a second plaintext link.
-        directory.rename_regular_between_raw(
-            Path::new(leaf),
-            &directory,
-            Path::new(&quarantine),
-            Publication::CreateOnly,
-        )?;
-    }
-    directory.sync()?;
-    checkpoint(DurabilityPoint::CasRemoveQuarantined)?;
-    // Retained-parent verifiers reject links, unstable identities, and bytes
-    // not attributable to the explicitly authorized semantic CAS key.
-    verify(parent, &quarantine)?;
-    if directory.contains_entry(Path::new(leaf))? {
-        return Err(bound_stage_corrupt("CAS removal canonical reappeared"));
-    }
-    bound_remove(parent, &quarantine)?;
-    directory.sync()?;
-    checkpoint(DurabilityPoint::CasRemoveDeleted)?;
-    Ok(true)
-}
-
 fn bound_visit_chunks(
+    reads: &CasReadAccess,
     base: &File,
     visit: &mut impl FnMut(&str, &ChunkObject) -> Result<()>,
 ) -> Result<()> {
-    bound_visit_chunks_with_limits(base, 100_000, 512 * 1024 * 1024, visit)
+    bound_visit_chunks_with_limits(reads, base, 100_000, 512 * 1024 * 1024, visit)
 }
 
 fn bound_visit_chunks_with_limits(
+    reads: &CasReadAccess,
     base: &File,
     max_entries: usize,
     max_bytes: u64,
@@ -3264,6 +3273,7 @@ fn bound_visit_chunks_with_limits(
                 }
                 let remaining = max_bytes.saturating_sub(total_bytes);
                 let (_, bytes) = bound_read_regular(
+                    reads,
                     &second_dir,
                     &leaf_name,
                     MAX_CHUNK_OBJECT_BYTES.min(remaining),
@@ -3277,7 +3287,7 @@ fn bound_visit_chunks_with_limits(
     Ok(())
 }
 
-fn bound_embedding_hashes(base: &File) -> Result<Vec<String>> {
+fn bound_embedding_hashes(reads: &CasReadAccess, base: &File) -> Result<Vec<String>> {
     const MAX_ENTRIES: usize = 100_000;
     const MAX_BYTES: u64 = 512 * 1024 * 1024;
     let mut hashes = Vec::new();
@@ -3331,7 +3341,7 @@ fn bound_embedding_hashes(base: &File) -> Result<Vec<String>> {
                     ));
                 }
                 let (_, bytes) =
-                    bound_read_regular(&second_dir, &leaf_name, MAX_EMBEDDING_OBJECT_BYTES)?;
+                    bound_read_regular(reads, &second_dir, &leaf_name, MAX_EMBEDDING_OBJECT_BYTES)?;
                 total_bytes = total_bytes.checked_add(bytes.len() as u64).ok_or_else(|| {
                     bound_stage_corrupt("embedding inventory byte count overflow")
                 })?;
@@ -3385,7 +3395,8 @@ fn bound_publish_between(
             sync_bound_directory(to, Path::new(leaf))?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let (_, existing) = bound_read_verified(to, leaf, kind, hash, true)?;
+            let (_, existing) =
+                bound_read_verified(&CasReadAccess::Unmetered, to, leaf, kind, hash, true)?;
             if existing.len() as u64 != size || expected.is_some_and(|bytes| bytes != existing) {
                 return Err(corrupt_object_error(
                     Path::new(leaf),
@@ -3398,7 +3409,8 @@ fn bound_publish_between(
         }
         Err(error) => return Err(KioError::io(error.to_string(), leaf)),
     }
-    let (actual_size, actual) = bound_read_verified(to, leaf, kind, hash, true)?;
+    let (actual_size, actual) =
+        bound_read_verified(&CasReadAccess::Unmetered, to, leaf, kind, hash, true)?;
     if actual_size != size || expected.is_some_and(|bytes| bytes != actual) {
         return Err(corrupt_object_error(
             Path::new(leaf),
@@ -3424,7 +3436,8 @@ fn bound_publish_content(
             sync_bound_directory(parent, Path::new(leaf))?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let (_, existing) = bound_read_content(parent, leaf, kind.max_bytes(), true)?;
+            let (_, existing) =
+                bound_read_regular(&CasReadAccess::Unmetered, parent, leaf, kind.max_bytes())?;
             if hash_bytes(&existing) != hash || existing != expected {
                 return Err(corrupt_object_error(
                     Path::new(leaf),
@@ -3437,7 +3450,8 @@ fn bound_publish_content(
         }
         Err(error) => return Err(KioError::io(error.to_string(), leaf)),
     }
-    let (actual_size, actual) = bound_read_content(parent, leaf, kind.max_bytes(), true)?;
+    let (actual_size, actual) =
+        bound_read_regular(&CasReadAccess::Unmetered, parent, leaf, kind.max_bytes())?;
     if actual_size != expected.len() as u64 || hash_bytes(&actual) != hash || actual != expected {
         return Err(corrupt_object_error(
             Path::new(leaf),
@@ -3513,15 +3527,17 @@ fn bound_create_private_temp(
 }
 
 fn read_verified_object(
+    reads: &CasReadAccess,
     path: &Path,
     kind: ObjectKind,
     expected_hash: &str,
     materialize: bool,
 ) -> Result<(u64, Vec<u8>)> {
-    read_verified_object_accounted(path, kind, expected_hash, materialize).0
+    read_verified_object_accounted(reads, path, kind, expected_hash, materialize).0
 }
 
 fn read_verified_object_accounted(
+    reads: &CasReadAccess,
     path: &Path,
     kind: ObjectKind,
     expected_hash: &str,
@@ -3529,6 +3545,7 @@ fn read_verified_object_accounted(
 ) -> (Result<(u64, Vec<u8>)>, u64) {
     let mut consumed = 0_u64;
     let result = (|| -> Result<(u64, Vec<u8>)> {
+        reads.charge(0)?;
         let mut file = open_regular_nofollow(path)?;
         let metadata = file.metadata().kio_io(path)?;
         let limit = kind.max_bytes();
@@ -3551,7 +3568,7 @@ fn read_verified_object_accounted(
             consumed = consumed
                 .checked_add(count as u64)
                 .ok_or_else(|| object_size_error(kind, limit, u64::MAX))?;
-            charge_verified_cas_read(count as u64)?;
+            reads.charge(count as u64)?;
             if consumed > limit {
                 return Err(object_size_error(kind, limit, consumed));
             }
@@ -3575,20 +3592,23 @@ fn read_verified_object_accounted(
 }
 
 fn verify_content_object_path(
+    reads: &CasReadAccess,
     path: &Path,
     kind: ContentObjectKind,
     expected_hash: &str,
 ) -> Result<u64> {
-    verify_content_object_path_accounted(path, kind, expected_hash).0
+    verify_content_object_path_accounted(reads, path, kind, expected_hash).0
 }
 
 fn verify_content_object_path_accounted(
+    reads: &CasReadAccess,
     path: &Path,
     kind: ContentObjectKind,
     expected_hash: &str,
 ) -> (Result<u64>, u64) {
     let mut consumed = 0_u64;
     let result = (|| -> Result<u64> {
+        reads.charge(0)?;
         let mut file = open_regular_nofollow(path)?;
         let metadata = file.metadata().kio_io(path)?;
         let limit = kind.max_bytes();
@@ -3607,7 +3627,7 @@ fn verify_content_object_path_accounted(
                 break;
             }
             consumed = consumed.saturating_add(count as u64);
-            charge_verified_cas_read(count as u64)?;
+            reads.charge(count as u64)?;
             if consumed > limit {
                 return Err(KioError::new(
                     "KIO-E-STORE-OBJECT-OVERSIZED-001",
@@ -3654,11 +3674,13 @@ fn content_object_size_error(
 }
 
 fn copy_verified_object<W: Write>(
+    reads: &CasReadAccess,
     path: &Path,
     kind: ObjectKind,
     expected_hash: &str,
     writer: &mut W,
 ) -> Result<u64> {
+    reads.charge(0)?;
     let mut file = open_regular_nofollow(path)?;
     let metadata = file.metadata().kio_io(path)?;
     let limit = kind.max_bytes();
@@ -3681,6 +3703,7 @@ fn copy_verified_object<W: Write>(
         total = total
             .checked_add(count as u64)
             .ok_or_else(|| object_size_error(kind, limit, u64::MAX))?;
+        reads.charge(count as u64)?;
         if total > limit {
             return Err(object_size_error(kind, limit, total));
         }
@@ -3812,66 +3835,6 @@ fn create_repair_quarantine(path: &Path, opened: &File) -> Result<PathBuf> {
     ))
 }
 
-enum CasRemovalKind {
-    Raw,
-    Chunk,
-    Embedding,
-    Content(ContentObjectKind),
-}
-
-/// Ambient callers retain the validated parent and use exactly the same
-/// namespace-safe removal and semantic recovery as bound callers.
-fn remove_verified_cas_path(
-    kio: &Path,
-    path: &Path,
-    kind: CasRemovalKind,
-    hash: &str,
-) -> Result<bool> {
-    {
-        let parent_path = path
-            .parent()
-            .ok_or_else(|| KioError::io("CAS path has no parent", path.display().to_string()))?;
-        let leaf = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                KioError::io("CAS path has no UTF-8 leaf", path.display().to_string())
-            })?;
-        // The ambient prefix outside .kio keeps its existing OS path semantics
-        // (including relative paths and macOS /var aliases). Retain .kio with
-        // no-follow, then open every controlled ancestor through that handle.
-        let mut options = OpenOptions::new();
-        options.read(true);
-        cas_semantics::configure_removal_root(&mut options);
-        let mut parent = options.open(kio).kio_io(kio)?;
-        ensure_bound_directory(&parent, kio)?;
-        let relative_parent = parent_path
-            .strip_prefix(kio)
-            .map_err(|_| KioError::invalid_usage("CAS removal parent escapes .kio"))?;
-        for component in relative_parent.components() {
-            let std::path::Component::Normal(name) = component else {
-                return Err(KioError::invalid_usage("invalid CAS removal ancestor"));
-            };
-            let name = name
-                .to_str()
-                .ok_or_else(|| KioError::invalid_usage("invalid CAS removal ancestor"))?;
-            parent = bound_open_dir(&parent, name)?;
-        }
-        bound_remove_verified(&parent, leaf, |parent, candidate| match kind {
-            CasRemovalKind::Raw => {
-                bound_read_verified(parent, candidate, ObjectKind::Raw, hash, false).map(|_| ())
-            }
-            CasRemovalKind::Chunk => bound_read_chunk_accounted(parent, candidate, hash)
-                .map(|_| ())
-                .map_err(|error| error.error),
-            CasRemovalKind::Embedding => bound_read_embedding(parent, candidate, hash).map(|_| ()),
-            CasRemovalKind::Content(kind) => {
-                bound_verify_content(parent, candidate, kind, hash).map(|_| ())
-            }
-        })
-    }
-}
-
 fn verify_existing_matches_file(
     destination: &Path,
     source: &Path,
@@ -3912,8 +3875,12 @@ fn verify_existing_matches_file(
 /// Read and fully verify the embedding object at one exact path. Path-scoped
 /// (rather than hash-scoped) so callers can verify an exact candidate without
 /// deriving a canonical pathname from its hash.
-fn read_embedding_path(path: &Path, expected_hash: &str) -> Result<EmbeddingObject> {
-    let bytes = read_bounded_regular_file(path, MAX_EMBEDDING_OBJECT_BYTES)?;
+fn read_embedding_path(
+    reads: &CasReadAccess,
+    path: &Path,
+    expected_hash: &str,
+) -> Result<EmbeddingObject> {
+    let bytes = read_bounded_regular_file_inner(path, MAX_EMBEDDING_OBJECT_BYTES, reads)?;
     decode_embedding(&bytes, expected_hash, path)
 }
 
@@ -3935,16 +3902,22 @@ fn decode_embedding(bytes: &[u8], expected_hash: &str, path: &Path) -> Result<Em
     Ok(object)
 }
 
-fn read_chunk_path(path: &Path, expected_hash: &str) -> Result<(ChunkObject, Vec<u8>)> {
-    read_chunk_path_accounted(path, expected_hash).0
+fn read_chunk_path(
+    reads: &CasReadAccess,
+    path: &Path,
+    expected_hash: &str,
+) -> Result<(ChunkObject, Vec<u8>)> {
+    read_chunk_path_accounted(reads, path, expected_hash).0
 }
 
 fn read_chunk_path_accounted(
+    reads: &CasReadAccess,
     path: &Path,
     expected_hash: &str,
 ) -> (Result<(ChunkObject, Vec<u8>)>, u64) {
     let mut consumed = 0_u64;
     let result = (|| -> Result<(ChunkObject, Vec<u8>)> {
+        reads.charge(0)?;
         let mut file = open_regular_nofollow(path)?;
         let metadata = file.metadata().kio_io(path)?;
         if metadata.len() > MAX_CHUNK_OBJECT_BYTES {
@@ -3965,7 +3938,7 @@ fn read_chunk_path_accounted(
                 break;
             }
             consumed = consumed.saturating_add(count as u64);
-            charge_verified_cas_read(count as u64)?;
+            reads.charge(count as u64)?;
             bytes.extend_from_slice(&buffer[..count]);
         }
         consumed = bytes.len() as u64;
@@ -4289,7 +4262,7 @@ pub fn fanout_path(base: impl AsRef<Path>, hash: &str) -> Result<PathBuf> {
 /// Read a non-CAS metadata record through the same no-follow/single-link boundary
 /// as CAS objects while enforcing a caller-selected byte limit.
 pub fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    read_bounded_regular_file_inner(path, max_bytes, false)
+    read_bounded_regular_file_inner(path, max_bytes, &CasReadAccess::Unmetered)
 }
 
 /// Shared implementation for bounded metadata records and bounded CAS content
@@ -4298,8 +4271,9 @@ pub fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>>
 fn read_bounded_regular_file_inner(
     path: &Path,
     max_bytes: u64,
-    charge_cas_reads: bool,
+    reads: &CasReadAccess,
 ) -> Result<Vec<u8>> {
+    reads.charge(0)?;
     let mut file = open_regular_nofollow(path)?;
     let metadata = file.metadata().kio_io(path)?;
     let initial_stability = observe_regular_file_stability(&metadata, path)?;
@@ -4329,9 +4303,7 @@ fn read_bounded_regular_file_inner(
         if count == 0 {
             break;
         }
-        if charge_cas_reads {
-            charge_verified_cas_read(count as u64)?;
-        }
+        reads.charge(count as u64)?;
         bytes.extend_from_slice(&buffer[..count]);
     }
     if bytes.len() as u64 > max_bytes {
@@ -4449,10 +4421,15 @@ mod tests {
         let bytes = vec![b'b'; CAS_STREAM_BUFFER_BYTES + 2];
         let hash = store.write_raw(&bytes).unwrap();
 
-        let error = with_verified_cas_read_budget(CAS_STREAM_BUFFER_BYTES as u64, || {
-            store.inspect_object(ObjectKind::Raw, &hash).map(|_| ())
-        })
-        .unwrap_err();
+        let owner = super::VerifiedCasReadBudget::new();
+        let error = owner
+            .run(CAS_STREAM_BUFFER_BYTES as u64, |reads| {
+                store
+                    .with_verified_reads(reads)?
+                    .inspect_object(ObjectKind::Raw, &hash)
+                    .map(|_| ())
+            })
+            .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001");
         assert_eq!(error.exit_code(), crate::ExitCode::PermanentFailure);
         assert_eq!(error.context()["max_bytes"], CAS_STREAM_BUFFER_BYTES as u64);
@@ -4463,11 +4440,133 @@ mod tests {
         );
 
         // The failed scope must not leak into the next independent operation.
-        let ((), consumed) = with_verified_cas_read_budget(bytes.len() as u64, || {
-            store.inspect_object(ObjectKind::Raw, &hash).map(|_| ())
-        })
-        .unwrap();
+        let ((), consumed) = owner
+            .run(bytes.len() as u64, |reads| {
+                store
+                    .with_verified_reads(reads)?
+                    .inspect_object(ObjectKind::Raw, &hash)
+                    .map(|_| ())
+            })
+            .unwrap();
         assert_eq!(consumed, bytes.len() as u64);
+    }
+
+    #[test]
+    fn verified_cas_reads_share_one_limit_across_scopes_and_store_clones() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<ObjectStore>();
+        assert_send_sync::<super::VerifiedCasReadCapability>();
+        let (_first_dir, first) = object_store();
+        let (_second_dir, second) = object_store();
+        let first_hash = first.write_raw(b"first").unwrap();
+        let second_hash = second.write_raw(b"second").unwrap();
+        let owner = super::VerifiedCasReadBudget::new();
+        let read_all = |reads: &super::VerifiedCasReadCapability| -> Result<()> {
+            let first = first.with_verified_reads(reads)?;
+            let second = second.with_verified_reads(reads)?;
+            first.inspect_object(ObjectKind::Raw, &first_hash)?;
+            first.clone().inspect_object(ObjectKind::Raw, &first_hash)?;
+            second.inspect_object(ObjectKind::Raw, &second_hash)?;
+            Ok(())
+        };
+        let ((), consumed) = owner.run(16, read_all).unwrap();
+        assert_eq!(consumed, 16);
+        let error = owner.run(15, read_all).unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001");
+        assert_eq!(error.context()["attempted_bytes"], 16);
+        assert_eq!(error.context()["consumed_bytes"], 10);
+    }
+
+    #[test]
+    fn verified_cas_owner_rejects_nested_reset_and_token_replacement() {
+        let (_dir, store) = object_store();
+        let hash = store.write_raw(b"owner").unwrap();
+        let owner = super::VerifiedCasReadBudget::new();
+        let ((), consumed) = owner
+            .run(10, |reads| {
+                let metered = store.with_verified_reads(reads)?;
+                metered.inspect_object(ObjectKind::Raw, &hash)?;
+                let error = owner.run(0, |_| Ok(())).unwrap_err();
+                assert_eq!(error.error_code(), "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001");
+                let independent = super::VerifiedCasReadBudget::new();
+                let ((), independent_consumed) = independent.run(5, |other_reads| {
+                    let error = metered.with_verified_reads(other_reads).unwrap_err();
+                    assert_eq!(error.error_code(), "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001");
+                    store
+                        .with_verified_reads(other_reads)?
+                        .inspect_object(ObjectKind::Raw, &hash)?;
+                    Ok(())
+                })?;
+                assert_eq!(independent_consumed, 5);
+                metered
+                    .with_verified_reads(reads)?
+                    .inspect_object(ObjectKind::Raw, &hash)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(consumed, 10);
+    }
+
+    #[test]
+    fn expired_verified_cas_token_rejects_empty_reads_and_never_reactivates() {
+        let (_dir, store) = object_store();
+        let hash = store.write_raw(b"").unwrap();
+        let owner = super::VerifiedCasReadBudget::new();
+        let ((old_reads, old_store), consumed) = owner
+            .run(0, |reads| {
+                let metered = store.with_verified_reads(reads)?;
+                metered.inspect_object(ObjectKind::Raw, &hash)?;
+                Ok((reads.clone(), metered))
+            })
+            .unwrap();
+        assert_eq!(consumed, 0);
+        assert_eq!(
+            old_reads.ensure_active().unwrap_err().error_code(),
+            "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001"
+        );
+        assert_eq!(
+            old_store
+                .inspect_object(ObjectKind::Raw, &hash)
+                .unwrap_err()
+                .error_code(),
+            "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001"
+        );
+        let ((), consumed) = owner
+            .run(0, |fresh_reads| {
+                assert!(old_reads.ensure_active().is_err());
+                assert!(old_store.inspect_object(ObjectKind::Raw, &hash).is_err());
+                store
+                    .with_verified_reads(fresh_reads)?
+                    .inspect_object(ObjectKind::Raw, &hash)?;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(consumed, 0);
+        assert!(store.inspect_object(ObjectKind::Raw, &hash).is_ok());
+    }
+
+    #[test]
+    fn verified_cas_tokens_close_after_error_and_unwind() {
+        let owner = super::VerifiedCasReadBudget::new();
+        let mut escaped = None;
+        let error = owner
+            .run::<()>(0, |reads| {
+                escaped = Some(reads.clone());
+                Err(KioError::invalid_usage("injected operation error"))
+            })
+            .unwrap_err();
+        assert_eq!(error.exit_code(), crate::ExitCode::InvalidUsage);
+        assert!(escaped.take().unwrap().ensure_active().is_err());
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            owner.run::<()>(0, |reads| {
+                escaped = Some(reads.clone());
+                panic!("injected operation unwind");
+            })
+        }));
+        assert!(panic_result.is_err());
+        assert!(escaped.take().unwrap().ensure_active().is_err());
+        let ((), consumed) = owner.run(0, |reads| reads.ensure_active()).unwrap();
+        assert_eq!(consumed, 0);
     }
 
     #[cfg(unix)]
@@ -4811,25 +4910,43 @@ mod tests {
             fs::metadata(&first_path).unwrap().len() + fs::metadata(&second_path).unwrap().len();
         let base = File::open(dir.path().join(".kio/objects/chunks")).unwrap();
         let mut seen = 0;
-        bound_visit_chunks_with_limits(&base, 100, total, &mut |_, _| {
-            seen += 1;
-            Ok(())
-        })
+        bound_visit_chunks_with_limits(
+            &CasReadAccess::Unmetered,
+            &base,
+            100,
+            total,
+            &mut |_, _| {
+                seen += 1;
+                Ok(())
+            },
+        )
         .unwrap();
         assert_eq!(seen, 2);
         let mut seen = 0;
-        let error = bound_visit_chunks_with_limits(&base, 2, total, &mut |_, _| {
-            seen += 1;
-            Ok(())
-        })
+        let error = bound_visit_chunks_with_limits(
+            &CasReadAccess::Unmetered,
+            &base,
+            2,
+            total,
+            &mut |_, _| {
+                seen += 1;
+                Ok(())
+            },
+        )
         .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
         assert_eq!(seen, 0, "fanout directories count before the first leaf");
         let mut seen = 0;
-        let error = bound_visit_chunks_with_limits(&base, 100, total - 1, &mut |_, _| {
-            seen += 1;
-            Ok(())
-        })
+        let error = bound_visit_chunks_with_limits(
+            &CasReadAccess::Unmetered,
+            &base,
+            100,
+            total - 1,
+            &mut |_, _| {
+                seen += 1;
+                Ok(())
+            },
+        )
         .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-OBJECT-OVERSIZED-001");
         assert_eq!(
@@ -4841,7 +4958,16 @@ mod tests {
             .unwrap()
             .join(".kio-cas-remove-unattributed");
         fs::write(&unknown, b"unknown plaintext").unwrap();
-        assert!(bound_visit_chunks_with_limits(&base, 100, total, &mut |_, _| Ok(())).is_err());
+        assert!(
+            bound_visit_chunks_with_limits(
+                &CasReadAccess::Unmetered,
+                &base,
+                100,
+                total,
+                &mut |_, _| Ok(())
+            )
+            .is_err()
+        );
         assert_eq!(fs::read(&unknown).unwrap(), b"unknown plaintext");
         assert!(first_path.exists() && second_path.exists());
     }
@@ -5077,11 +5203,18 @@ mod tests {
         let poisoned = vec![b'x'; expected.len()];
         fs::write(&path, &poisoned).unwrap();
 
-        let failure = store
-            .inspect_object_accounted(ObjectKind::Raw, &hash)
-            .unwrap_err();
+        let owner = super::VerifiedCasReadBudget::new();
+        let (failure, consumed) = owner
+            .run(poisoned.len() as u64, |reads| {
+                let store = store.with_verified_reads(reads)?;
+                Ok(store
+                    .inspect_object_accounted(ObjectKind::Raw, &hash)
+                    .unwrap_err())
+            })
+            .unwrap();
         assert_eq!(failure.error.error_code(), "KIO-E-STORE-CORRUPT-001");
         assert_eq!(failure.consumed_bytes, poisoned.len() as u64);
+        assert_eq!(consumed, poisoned.len() as u64);
     }
 
     #[test]

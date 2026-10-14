@@ -11,6 +11,7 @@ pub(crate) fn open_bound_scope_file_nofollow(
     root: &File,
     file_name: &str,
     display_path: &Path,
+    control: &crate::control::ControlHandle,
 ) -> Result<File> {
     let name = Path::new(file_name);
     if name.components().count() != 1
@@ -18,12 +19,13 @@ pub(crate) fn open_bound_scope_file_nofollow(
     {
         return Err(scope_file_changed_path(display_path));
     }
-    let directory = StoreDirectory::from_retained(
+    let directory = StoreDirectory::from_retained_with_control(
         root.try_clone().kio_io(display_path)?,
         display_path
             .parent()
             .unwrap_or(Path::new("."))
             .to_path_buf(),
+        control.clone(),
     )?;
     // Source enumeration and each read/staging caller enforce archive limits
     // from this descriptor's metadata before reading, then bound the stream.

@@ -1555,13 +1555,9 @@ pub struct MockLocalOcrClient {
 impl MockLocalOcrClient {
     /// Capture the selected response body with the adapter operation, so the
     /// request cannot observe an environment mutation after construction.
-    pub fn from_test_control() -> Self {
+    pub fn from_control(control: &kio_core::control::ControlHandle) -> Self {
         Self {
-            body_mode: crate::debug_test_control()
-                .adapters
-                .local_ocr_body
-                .known()
-                .copied(),
+            body_mode: control.debug().adapters.local_ocr_body.known().copied(),
         }
     }
 }
@@ -1739,6 +1735,23 @@ mod tests {
                 items_remaining: items,
             },
         )
+    }
+
+    #[test]
+    fn mock_clients_keep_independent_control_snapshots() {
+        use kio_core::control::ControlHandle;
+        use kio_core::test_control::{DebugTestControl, LocalOcrBodyMode, Selector};
+        let mut snapshot = DebugTestControl::default();
+        snapshot.adapters.local_ocr_body = Selector::Known(LocalOcrBodyMode::Nonconforming);
+        let controlled = MockLocalOcrClient::from_control(&ControlHandle::new(snapshot));
+        let ordinary = MockLocalOcrClient::from_control(&ControlHandle::default());
+        let before = controlled.layout_parse("", LayoutFileType::Image).unwrap();
+        let other = ordinary.layout_parse("", LayoutFileType::Image).unwrap();
+        assert_ne!(before, other);
+        assert_eq!(
+            controlled.layout_parse("", LayoutFileType::Image).unwrap(),
+            before
+        );
     }
 
     #[test]

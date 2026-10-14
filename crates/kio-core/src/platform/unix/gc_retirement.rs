@@ -15,6 +15,7 @@ pub(crate) fn rename_snapshot_state_noreplace(
     dir: &std::fs::File,
     from: &str,
     to: &str,
+    _control: &crate::control::ControlHandle,
 ) -> Result<()> {
     rename_noreplace_bound(dir, from, to)
 }
@@ -29,6 +30,7 @@ pub(crate) fn retire_snapshot_state_temporary(
     temporary: &str,
     expected_bytes: &[u8],
     expected: &FileObservation,
+    _control: &crate::control::ControlHandle,
 ) -> Result<()> {
     let (bytes, current) = read_regular_observed(dir, temporary, MAX_METADATA)?;
     if bytes != expected_bytes

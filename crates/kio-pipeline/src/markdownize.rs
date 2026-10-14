@@ -10,8 +10,8 @@ use kio_core::cas::{
     ContentObjectKind, MAX_NORMALIZED_UNIT_OBJECT_BYTES, ObjectStore, canonical_json_bytes,
     hash_bytes as cas_hash_bytes,
 };
-use kio_core::scope::{new_ulid, now_utc_seconds};
 use kio_core::store_dir::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, StoreDirectory};
+use kio_core::{control::ControlHandle, scope::new_ulid};
 use serde::de::{Deserializer, Error as _};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -304,7 +304,14 @@ pub struct IncrementalModeDecision {
 }
 
 pub fn markdownize_units(request: MarkdownizeStageRequest) -> Result<MarkdownizeStageOutput> {
-    let generated_at = now_utc_seconds();
+    markdownize_units_with_control(request, &ControlHandle::default())
+}
+
+pub fn markdownize_units_with_control(
+    request: MarkdownizeStageRequest,
+    control: &ControlHandle,
+) -> Result<MarkdownizeStageOutput> {
+    let generated_at = control.now_utc_seconds();
     let unit_key = "doc:1".to_owned();
     let prepared_hash = request.new_raw.raw_hash.clone();
     let unit_ref = prepared_unit_ref(&unit_key);
@@ -688,6 +695,22 @@ pub fn load_validated_normalized_instance(
     tool_profile_hash: &str,
     r#gen: u64,
 ) -> Result<ValidatedNormalizedInstance> {
+    load_validated_normalized_instance_with_control(
+        kio_dir,
+        raw_hash,
+        tool_profile_hash,
+        r#gen,
+        &ControlHandle::default(),
+    )
+}
+
+pub fn load_validated_normalized_instance_with_control(
+    kio_dir: impl AsRef<Path>,
+    raw_hash: &str,
+    tool_profile_hash: &str,
+    r#gen: u64,
+    control: &ControlHandle,
+) -> Result<ValidatedNormalizedInstance> {
     if !kio_core::cas::is_hash(raw_hash) || !kio_core::cas::is_hash(tool_profile_hash) {
         return Err(PipelineError::corrupt(
             kio_dir.as_ref().display().to_string(),
@@ -716,6 +739,7 @@ pub fn load_validated_normalized_instance(
         &canonical_relative,
         &canonical_dir,
         &identity,
+        control,
     )
 }
 
@@ -728,12 +752,29 @@ pub fn normalized_instance_read_budget(
     tool_profile_hash: &str,
     r#gen: u64,
 ) -> Result<u64> {
+    normalized_instance_read_budget_with_control(
+        kio_dir,
+        raw_hash,
+        tool_profile_hash,
+        r#gen,
+        &ControlHandle::default(),
+    )
+}
+
+pub fn normalized_instance_read_budget_with_control(
+    kio_dir: impl AsRef<Path>,
+    raw_hash: &str,
+    tool_profile_hash: &str,
+    r#gen: u64,
+    control: &ControlHandle,
+) -> Result<u64> {
     normalized_instance_read_budget_with_file_limit(
         kio_dir.as_ref(),
         raw_hash,
         tool_profile_hash,
         r#gen,
         MAX_NORMALIZED_INSTANCE_FILES,
+        control,
     )
 }
 
@@ -743,6 +784,7 @@ fn normalized_instance_read_budget_with_file_limit(
     tool_profile_hash: &str,
     r#gen: u64,
     max_files: usize,
+    control: &ControlHandle,
 ) -> Result<u64> {
     if !kio_core::cas::is_hash(raw_hash) || !kio_core::cas::is_hash(tool_profile_hash) {
         return Err(PipelineError::corrupt(
@@ -769,7 +811,7 @@ fn normalized_instance_read_budget_with_file_limit(
         // manifest and units. It is operational metadata rather than a loader
         // input, but incomplete or malformed recovery residue must still fail
         // closed before fsck accounts the instance.
-        let store_directory = StoreDirectory::open(&directory)
+        let store_directory = StoreDirectory::open_with_control(&directory, control.clone())
             .map_err(|error| normalized_corrupt(&directory, error.to_string()))?;
         let atomic = store_directory
             .inspect_atomic()
@@ -817,6 +859,7 @@ fn load_validated_normalized_instance_at(
     relative_dir: &Path,
     canonical_dir: &Path,
     identity: &NormalizedInstanceIdentity,
+    control: &ControlHandle,
 ) -> Result<ValidatedNormalizedInstance> {
     let dir = kio_dir.join(relative_dir);
     let manifest_path = dir.join("manifest.json");
@@ -834,7 +877,7 @@ fn load_validated_normalized_instance_at(
 
     // The mutable per-instance files are a cache only. The manifest's exact
     // CAS pins select the authoritative normalized unit bodies.
-    let store = ObjectStore::new(kio_dir);
+    let store = ObjectStore::new_with_control(kio_dir, control.clone());
     let (units, unit_bytes) =
         load_validated_normalized_units_from_manifest_with_size(&store, &manifest_path, &manifest)?;
     let total_bytes = manifest_bytes.len() as u64 + unit_bytes;
@@ -872,6 +915,9 @@ fn load_validated_normalized_units_from_manifest_with_size(
     source_path: &Path,
     manifest: &NormalizedInstanceManifest,
 ) -> Result<(Vec<NormalizedUnitObject>, u64)> {
+    store
+        .verified_reads()
+        .map_err(|error| normalized_corrupt(source_path, error.to_string()))?;
     let identity = NormalizedInstanceIdentity {
         raw_hash: manifest.raw_hash.clone(),
         tool_profile_hash: manifest.tool_profile_hash.clone(),
@@ -1297,8 +1343,11 @@ pub fn persist_normalized_instance_bound(
         .read_optional(&view, MAX_NORMALIZED_INSTANCE_BYTES)
         .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
     let manifest_cas = canonical_normalized_manifest_bytes(&stamped)?;
-    let store = ObjectStore::from_bound_kio(directory.root_handle().as_ref())
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
+    let store = ObjectStore::from_bound_kio_with_control(
+        directory.root_handle().as_ref(),
+        directory.control().clone(),
+    )
+    .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
     for bytes in &canonical_units {
         store
             .write_content_object(ContentObjectKind::NormalizedUnit, bytes)
@@ -1319,8 +1368,12 @@ pub fn persist_normalized_instance_bound(
     let staged_handle = directory
         .create_directory(&staged)
         .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
-    let staged_dir = StoreDirectory::from_retained(staged_handle, directory.path().join(&staged))
-        .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
+    let staged_dir = StoreDirectory::from_retained_with_control(
+        staged_handle,
+        directory.path().join(&staged),
+        directory.control().clone(),
+    )
+    .map_err(|e| normalized_corrupt(directory.path(), e.to_string()))?;
     staged_dir
         .write_atomic(
             Path::new("manifest.json"),
@@ -1422,7 +1475,16 @@ pub fn persist_normalized_instance(
     manifest: &NormalizedInstanceManifest,
     units: &[NormalizedUnitObject],
 ) -> Result<NormalizedInstanceManifest> {
-    let directory = StoreDirectory::open(kio_dir.as_ref())
+    persist_normalized_instance_with_control(kio_dir, manifest, units, &ControlHandle::default())
+}
+
+pub fn persist_normalized_instance_with_control(
+    kio_dir: impl AsRef<Path>,
+    manifest: &NormalizedInstanceManifest,
+    units: &[NormalizedUnitObject],
+    control: &ControlHandle,
+) -> Result<NormalizedInstanceManifest> {
+    let directory = StoreDirectory::open_with_control(kio_dir.as_ref(), control.clone())
         .map_err(|e| normalized_corrupt(kio_dir.as_ref(), e.to_string()))?;
     persist_normalized_instance_bound(&directory, manifest, units)
 }
@@ -1742,6 +1804,109 @@ fn contract_violation(message: &str) -> PipelineError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn owner_control_markdownize_timestamps_stay_with_entry_snapshot() {
+        use kio_core::control::ControlHandle;
+        use kio_core::test_control::{DebugTestControl, Selector};
+        let request = MarkdownizeStageRequest {
+            mode: MarkdownizeMode::Full,
+            new_raw: RawRef {
+                path: "note.txt".to_owned(),
+                raw_hash: format!("sha256:{}", "a".repeat(64)),
+            },
+            previous: None,
+            hints: None,
+            tool_profile_hash: format!("sha256:{}", "b".repeat(64)),
+            spec_version: 1,
+        };
+        let clock = |value: &str| {
+            let debug = DebugTestControl {
+                fixed_now: Selector::Known(value.to_owned()),
+                ..Default::default()
+            };
+            ControlHandle::new(debug)
+        };
+        let outer = clock("2000-01-01T00:00:00Z");
+        let inner = clock("2001-01-01T00:00:00Z");
+        let inner_output = markdownize_units_with_control(request.clone(), &inner).unwrap();
+        let outer_output = markdownize_units_with_control(request, &outer).unwrap();
+        assert_eq!(inner_output.manifest.generated_at, "2001-01-01T00:00:00Z");
+        assert_eq!(outer_output.manifest.generated_at, "2000-01-01T00:00:00Z");
+        assert_eq!(
+            outer_output.updated_units[0].generated_at,
+            outer_output.manifest.generated_at
+        );
+        assert_eq!(
+            outer_output.run.created_at,
+            outer_output.manifest.generated_at
+        );
+        assert_eq!(
+            outer_output.run.finished_at.as_deref(),
+            Some("2000-01-01T00:00:00Z")
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn owner_control_persist_publication_isolation() {
+        use kio_core::durability::DurabilityPoint;
+        use kio_core::test_control::{DebugTestControl, Selector};
+        let controlled = canonical_tempdir();
+        let sibling = canonical_tempdir();
+        let ordinary = canonical_tempdir();
+        for root in [&controlled, &sibling, &ordinary] {
+            initialize_persist_store(root.path());
+        }
+        let occupied = controlled.path().join("occupied-publication-barrier");
+        fs::write(&occupied, b"occupied").unwrap();
+        let mut debug = DebugTestControl::default();
+        debug.core.durability_point = Selector::Known(DurabilityPoint::AtomicWriteStaged);
+        debug.core.durability_ready = Some(occupied.clone());
+        let control = ControlHandle::new(debug);
+        let (identity, manifest, units) = normalized_fixture();
+        let error = persist_normalized_instance_with_control(
+            controlled.path(),
+            &manifest,
+            &units,
+            &control,
+        )
+        .expect_err("controlled staged publication must reach its durability barrier");
+        assert!(error.to_string().contains("KIO-E-STORE-IO-001"), "{error}");
+        assert_eq!(fs::read(&occupied).unwrap(), b"occupied");
+        assert!(
+            !controlled
+                .path()
+                .join(normalized_instance_relative_path(
+                    &identity.raw_hash,
+                    &identity.tool_profile_hash,
+                    identity.r#gen
+                ))
+                .exists()
+        );
+        let sibling_manifest = persist_normalized_instance_with_control(
+            sibling.path(),
+            &manifest,
+            &units,
+            &ControlHandle::default(),
+        )
+        .unwrap();
+        let ordinary_manifest =
+            persist_normalized_instance(ordinary.path(), &manifest, &units).unwrap();
+        assert_eq!(sibling_manifest, ordinary_manifest);
+        assert_eq!(
+            load_validated_normalized_instance(
+                sibling.path(),
+                &identity.raw_hash,
+                &identity.tool_profile_hash,
+                identity.r#gen
+            )
+            .unwrap()
+            .units,
+            units
+        );
+    }
 
     fn canonical_tempdir() -> tempfile::TempDir {
         tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
@@ -3164,6 +3329,7 @@ mod tests {
                 &identity.tool_profile_hash,
                 identity.r#gen,
                 2,
+                &ControlHandle::default(),
             )
             .is_ok()
         );
@@ -3173,6 +3339,7 @@ mod tests {
             &identity.tool_profile_hash,
             identity.r#gen,
             1,
+            &ControlHandle::default(),
         )
         .unwrap_err();
         assert!(

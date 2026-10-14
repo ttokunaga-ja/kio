@@ -4,7 +4,7 @@ use super::*;
 mod tests {
     use super::*;
     use crate::platform::gc_snapshot_io::{directory, open_snapshot_source};
-    use crate::test_control::{DebugTestControl, GcFault, Selector, install_scoped};
+    use crate::test_control::{DebugTestControl, GcFault, Selector};
     use std::fs;
 
     fn fixture() -> (tempfile::TempDir, GcSweepSession, SnapshotAutoStateBinding) {
@@ -31,7 +31,11 @@ mod tests {
     fn interrupt(session: &GcSweepSession, first: &SnapshotAutoStateBinding, fault: GcFault) {
         let mut control = DebugTestControl::default();
         control.core.gc_fault = Selector::Known(fault);
-        let _guard = install_scoped(control);
+        let session = GcSweepSession::bind_with_control(
+            session.root.clone(),
+            crate::control::ControlHandle::new(control),
+        )
+        .unwrap();
         let error = session
             .publish_snapshot_auto_state(
                 first,
@@ -66,8 +70,12 @@ mod tests {
         writer.write_all(&original).unwrap();
         writer.sync_all().unwrap();
         fs::rename(&replacement, &path).unwrap();
-        let error =
-            open_snapshot_source(&session.kio, first.observation.as_ref().unwrap()).unwrap_err();
+        let error = open_snapshot_source(
+            &session.kio,
+            first.observation.as_ref().unwrap(),
+            session.control(),
+        )
+        .unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-SNAPSHOT-STATE-CHANGED-001");
         assert_eq!(fs::read(&path).unwrap(), original);
         assert_eq!(
@@ -94,13 +102,17 @@ mod tests {
             .open(&path)
             .unwrap();
         let original_error = crate::platform::open_gc_mutation(
-            &directory(&session.kio).unwrap(),
+            &directory(&session.kio, session.control()).unwrap(),
             Path::new(SNAPSHOT_AUTO_STATE_LEAF),
             MAX_METADATA,
         )
         .unwrap_err();
-        let error =
-            open_snapshot_source(&session.kio, first.observation.as_ref().unwrap()).unwrap_err();
+        let error = open_snapshot_source(
+            &session.kio,
+            first.observation.as_ref().unwrap(),
+            session.control(),
+        )
+        .unwrap_err();
         assert_eq!(original_error.error_code(), "KIO-E-STORE-IO-001");
         assert_eq!(error.error_code(), original_error.error_code());
         assert_eq!(error.message(), original_error.message());
@@ -180,7 +192,7 @@ mod tests {
             interrupt(&session, &first, fault);
             if fault != GcFault::AfterWindowsSnapshotStateExchangeIntentRemove {
                 assert!(session.snapshot_auto_state().is_err());
-                assert!(ensure_no_active_sweep_bound(&session.kio).is_err());
+                assert!(ensure_no_active_sweep_bound(&session.kio, session.control()).is_err());
             }
             let config = session.snapshot_auto_binding().unwrap();
             let gc = session.automation_binding().unwrap();

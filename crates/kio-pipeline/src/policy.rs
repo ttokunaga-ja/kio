@@ -63,11 +63,13 @@ impl CurrentPolicyEvaluator {
                 scope.binding.kio_handle(),
                 root.join(".kio"),
                 "retained .kio handle",
+                scope.binding.control(),
             )?;
             let root_directory = retained_directory(
                 scope.binding.root_handle(),
                 root.clone(),
                 "retained scope root handle",
+                scope.binding.control(),
             )?;
             let (config_bytes, ignore_bytes) = (
                 kio.read_optional(Path::new("config.toml"), MAX_CURRENT_POLICY_FILE_BYTES)
@@ -261,12 +263,14 @@ fn retained_directory(
     handle: &std::fs::File,
     logical: PathBuf,
     label: &str,
+    control: &kio_core::control::ControlHandle,
 ) -> Result<StoreDirectory> {
     let handle = handle.try_clone().map_err(|error| PipelineError::Io {
         path: logical.display().to_string(),
         message: format!("cannot clone {label}: {error}"),
     })?;
-    StoreDirectory::from_retained(handle, logical).map_err(policy_file_error)
+    StoreDirectory::from_retained_with_control(handle, logical, control.clone())
+        .map_err(policy_file_error)
 }
 
 fn policy_file_error(error: kio_core::KioError) -> PipelineError {

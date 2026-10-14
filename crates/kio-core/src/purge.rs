@@ -772,6 +772,13 @@ impl PurgeState {
     /// before the `.kio` leaf is appended: this accommodates platform-owned
     /// aliases such as macOS `/var` without ever resolving a `.kio` link.
     pub fn open(kio_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_control(kio_dir, crate::control::ControlHandle::default())
+    }
+
+    pub fn open_with_control(
+        kio_dir: impl AsRef<Path>,
+        control: crate::control::ControlHandle,
+    ) -> Result<Self> {
         let kio_dir = kio_dir.as_ref();
         let parent = kio_dir
             .parent()
@@ -782,8 +789,9 @@ impl PurgeState {
         let parent = parent
             .canonicalize()
             .map_err(|error| KioError::io(error.to_string(), parent.display().to_string()))?;
-        Ok(Self::from_directory(StoreDirectory::open(
+        Ok(Self::from_directory(StoreDirectory::open_with_control(
             &parent.join(leaf),
+            control,
         )?))
     }
 
@@ -1563,10 +1571,25 @@ pub fn verify_marker_binding_bounded(
     event: &LifecycleEvent,
     now: &str,
 ) -> Result<()> {
+    verify_marker_binding_bounded_with_control(
+        kio_dir,
+        raw_hash,
+        event,
+        now,
+        &crate::control::ControlHandle::default(),
+    )
+}
+pub fn verify_marker_binding_bounded_with_control(
+    kio_dir: &Path,
+    raw_hash: &str,
+    event: &LifecycleEvent,
+    now: &str,
+    control: &crate::control::ControlHandle,
+) -> Result<()> {
     if !matches!(event.kind, EventKind::Purged | EventKind::Erased) {
         return Ok(());
     }
-    let object = crate::cas::ObjectStore::new(kio_dir)
+    let object = crate::cas::ObjectStore::new_with_control(kio_dir, control.clone())
         .read_by_hash(&event.in_commit)
         .map_err(|_| {
             corrupt_state("lifecycle event in_commit does not resolve to a verified commit object")
@@ -1597,11 +1620,14 @@ pub fn verify_marker_binding_in_directory(
         return Ok(());
     }
     let root = directory.root_handle();
-    let object = crate::cas::ObjectStore::from_bound_kio(root.as_ref())
-        .and_then(|store| store.read_by_hash(&event.in_commit))
-        .map_err(|_| {
-            corrupt_state("lifecycle event in_commit does not resolve to a verified commit object")
-        })?;
+    let object = crate::cas::ObjectStore::from_bound_kio_with_control(
+        root.as_ref(),
+        directory.control().clone(),
+    )
+    .and_then(|store| store.read_by_hash(&event.in_commit))
+    .map_err(|_| {
+        corrupt_state("lifecycle event in_commit does not resolve to a verified commit object")
+    })?;
     if object.kind != crate::cas::ObjectKind::Commit {
         return Err(corrupt_state(
             "lifecycle event in_commit does not identify a commit object",

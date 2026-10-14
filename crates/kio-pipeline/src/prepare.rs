@@ -1,5 +1,6 @@
 //! Prepare stage contracts.
 
+use kio_core::control::ControlHandle;
 use std::io::Read;
 use std::path::Path;
 
@@ -120,6 +121,13 @@ pub fn prepare_units(request: PrepareStageRequest) -> Result<PrepareStageOutput>
 pub fn prepare_units_from_bytes(
     request: PrepareStageBytesRequest<'_>,
 ) -> Result<PrepareStageOutput> {
+    prepare_units_from_bytes_with_control(request, &ControlHandle::default())
+}
+
+pub fn prepare_units_from_bytes_with_control(
+    request: PrepareStageBytesRequest<'_>,
+    control: &ControlHandle,
+) -> Result<PrepareStageOutput> {
     let media_type = request.media_type;
     let is_text_native = matches!(media_type, "text/markdown" | "text/plain" | "text/x-code");
     let is_pdf = media_type == "application/pdf";
@@ -220,7 +228,7 @@ pub fn prepare_units_from_bytes(
     // recognize falls through to the `ContractViolation` bucket already,
     // `kio_pipeline::task::task_retry_kind`'s catch-all arm).
     let office_converted_pdf = if is_office {
-        match kio_adapter::office_convert::resolve_office_converter() {
+        match kio_adapter::office_convert::resolve_office_converter_with_control(control) {
             None => return Ok(empty_prepare_output()),
             Some(converter) => {
                 preparation_profile_hash = office_preparation_profile_hash(
@@ -895,19 +903,22 @@ mod tests {
             "KIO_TEST_OFFICE_CONVERT",
             fixture_path.display().to_string(),
         );
-        let _control = kio_core::test_control::install_scoped(
+        let control = kio_core::control::ControlHandle::new(
             kio_core::test_control::DebugTestControl::from_env(),
         );
 
         let raw_docx = b"fake docx bytes (content irrelevant under the seam)";
         let raw_hash = hash_bytes(raw_docx);
-        let output = prepare_units_from_bytes(PrepareStageBytesRequest {
-            raw_hash: &raw_hash,
-            media_type: DOCX_MEDIA_TYPE,
-            input_path: "doc.docx",
-            tool_profile_hash: "sha256:test",
-            bytes: raw_docx,
-        })
+        let output = prepare_units_from_bytes_with_control(
+            PrepareStageBytesRequest {
+                raw_hash: &raw_hash,
+                media_type: DOCX_MEDIA_TYPE,
+                input_path: "doc.docx",
+                tool_profile_hash: "sha256:test",
+                bytes: raw_docx,
+            },
+            &control,
+        )
         .unwrap();
 
         assert_eq!(output.prepared_units.len(), 2);
@@ -953,19 +964,22 @@ mod tests {
             "KIO_TEST_OFFICE_CONVERT",
             fixture_path.display().to_string(),
         );
-        let _control = kio_core::test_control::install_scoped(
+        let control = kio_core::control::ControlHandle::new(
             kio_core::test_control::DebugTestControl::from_env(),
         );
 
         let raw_pptx = b"fake pptx bytes (content irrelevant under the seam)";
         let raw_hash = hash_bytes(raw_pptx);
-        let output = prepare_units_from_bytes(PrepareStageBytesRequest {
-            raw_hash: &raw_hash,
-            media_type: PPTX_MEDIA_TYPE,
-            input_path: "deck.pptx",
-            tool_profile_hash: "sha256:test",
-            bytes: raw_pptx,
-        })
+        let output = prepare_units_from_bytes_with_control(
+            PrepareStageBytesRequest {
+                raw_hash: &raw_hash,
+                media_type: PPTX_MEDIA_TYPE,
+                input_path: "deck.pptx",
+                tool_profile_hash: "sha256:test",
+                bytes: raw_pptx,
+            },
+            &control,
+        )
         .unwrap();
 
         assert_eq!(output.prepared_units.len(), 3);
@@ -996,19 +1010,22 @@ mod tests {
         // (also matches CI without LibreOffice installed).
         let _scrub_path =
             kio_core::test_control::TestEnvGuard::set("PATH", "/nonexistent-kio-test-path");
-        let _control = kio_core::test_control::install_scoped(
+        let control = kio_core::control::ControlHandle::new(
             kio_core::test_control::DebugTestControl::from_env(),
         );
 
         let raw_docx = b"fake docx bytes, no converter available";
         let raw_hash = hash_bytes(raw_docx);
-        let output = prepare_units_from_bytes(PrepareStageBytesRequest {
-            raw_hash: &raw_hash,
-            media_type: DOCX_MEDIA_TYPE,
-            input_path: "doc.docx",
-            tool_profile_hash: "sha256:test",
-            bytes: raw_docx,
-        })
+        let output = prepare_units_from_bytes_with_control(
+            PrepareStageBytesRequest {
+                raw_hash: &raw_hash,
+                media_type: DOCX_MEDIA_TYPE,
+                input_path: "doc.docx",
+                tool_profile_hash: "sha256:test",
+                bytes: raw_docx,
+            },
+            &control,
+        )
         .unwrap();
 
         // Same empty shape as the R20-4 scanned-PDF / any other silently-skipped
@@ -1031,19 +1048,22 @@ mod tests {
             "KIO_TEST_OFFICE_CONVERT",
             "/definitely/not/a/real/kio-fixture-path.pdf",
         );
-        let _control = kio_core::test_control::install_scoped(
+        let control = kio_core::control::ControlHandle::new(
             kio_core::test_control::DebugTestControl::from_env(),
         );
 
         let raw_docx = b"fake docx bytes";
         let raw_hash = hash_bytes(raw_docx);
-        let error = prepare_units_from_bytes(PrepareStageBytesRequest {
-            raw_hash: &raw_hash,
-            media_type: DOCX_MEDIA_TYPE,
-            input_path: "doc.docx",
-            tool_profile_hash: "sha256:test",
-            bytes: raw_docx,
-        })
+        let error = prepare_units_from_bytes_with_control(
+            PrepareStageBytesRequest {
+                raw_hash: &raw_hash,
+                media_type: DOCX_MEDIA_TYPE,
+                input_path: "doc.docx",
+                tool_profile_hash: "sha256:test",
+                bytes: raw_docx,
+            },
+            &control,
+        )
         .unwrap_err();
         assert!(
             error

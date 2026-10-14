@@ -41,11 +41,12 @@ struct BoundScope {
 }
 impl BoundScope {
     fn bind(repo: &Repository) -> Result<Self> {
-        let lease = repo.lock_store()?;
+        let lease = repo.lock_store_in_session(repo.lock_session())?;
         let session = GcSweepSession::bind_repository(repo)?;
-        let directory = StoreDirectory::from_retained(
+        let directory = StoreDirectory::from_retained_with_control(
             session.retained_kio_handle()?,
             repo.kio_dir().to_path_buf(),
+            repo.control().clone(),
         )?;
         let identity = directory_identity_from_handle(&directory.root_handle())?;
         let scope_id = repo.scope_identity()?.scope_id;
@@ -166,6 +167,13 @@ pub fn prune_orphans_preflight(repo: &Repository) -> Result<Option<PruneOrphansR
 }
 
 pub fn prune_orphans_plan(repo: &Repository) -> Result<PruneOrphansPlan> {
+    let Some(reads) = repo.object_store().verified_reads()? else {
+        return kio_core::cas::VerifiedCasReadBudget::new()
+            .run(u64::MAX, |reads| {
+                prune_orphans_plan(&repo.with_verified_reads(reads)?)
+            })
+            .map(|(plan, _)| plan);
+    };
     let scope = BoundScope::bind(repo)?;
     let proof = match Proof::capture(repo, &scope) {
         Ok(proof) => proof,
@@ -173,7 +181,11 @@ pub fn prune_orphans_plan(repo: &Repository) -> Result<PruneOrphansPlan> {
     };
     let mut budget = kio_core::store_dir::RemovalBudget::new();
     budget.reserve_pins(6)?;
-    let store = ObjectStore::from_bound_kio(&scope.directory.root_handle())?;
+    let store = ObjectStore::from_bound_kio_with_control(
+        &scope.directory.root_handle(),
+        repo.control().clone(),
+    )?
+    .with_verified_reads(&reads)?;
     let mut targets = Vec::new();
     #[cfg(test)]
     let mut prepared = Vec::new();
@@ -194,11 +206,12 @@ pub fn prune_orphans_plan(repo: &Repository) -> Result<PruneOrphansPlan> {
                     let parent_relative = relative
                         .parent()
                         .ok_or_else(|| unsafe_prune("staging root has no parent"))?;
-                    let parent = StoreDirectory::from_retained(
+                    let parent = StoreDirectory::from_retained_with_control(
                         scope
                             .directory
                             .open_maintenance_directory(parent_relative)?,
                         scope.directory.path().join(parent_relative),
+                        repo.control().clone(),
                     )?;
                     scope.directory.require_same_filesystem(&parent)?;
                     let leaf = relative
@@ -212,8 +225,12 @@ pub fn prune_orphans_plan(repo: &Repository) -> Result<PruneOrphansPlan> {
                     .map(RemovalPin::Directory)
                 }
                 TargetKey::Cache(path) => {
-                    let cache_root_path = crate::cache_home().join("kio/open");
-                    let cache_root = StoreDirectory::open(&cache_root_path)?;
+                    let cache_root_path =
+                        crate::settings::cache_home(repo.control()).join("kio/open");
+                    let cache_root = StoreDirectory::open_with_control(
+                        &cache_root_path,
+                        repo.control().clone(),
+                    )?;
                     let parent_path = path
                         .parent()
                         .ok_or_else(|| unsafe_prune("cache root has no parent"))?;
@@ -223,9 +240,10 @@ pub fn prune_orphans_plan(repo: &Repository) -> Result<PruneOrphansPlan> {
                     let parent = if relative.as_os_str().is_empty() {
                         cache_root.clone()
                     } else {
-                        StoreDirectory::from_retained(
+                        StoreDirectory::from_retained_with_control(
                             cache_root.open_maintenance_directory(relative)?,
                             parent_path.to_path_buf(),
+                            repo.control().clone(),
                         )?
                     };
                     cache_root.require_same_filesystem(&parent)?;

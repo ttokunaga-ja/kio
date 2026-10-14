@@ -6,7 +6,60 @@
 //! associations and their derived search/embedding projections.
 
 use super::*;
+use crate::egress::embedding_online_allowed;
+use crate::embedding::enrichment::run_historical_embedding_enrichment;
+use crate::index::chunk_ledger::StoredChunk;
+use crate::index::chunk_ledger::append_stored_chunks;
+use crate::index::chunk_ledger::persist_chunk_object;
+use crate::index::chunk_ledger::read_stored_chunks;
+use crate::index::chunk_ledger::sqlite_path;
+use crate::index::chunk_ledger::truncate_torn_chunk_tail;
+use crate::index::rebuild::AssociationAppend;
+use crate::index::rebuild::AuthenticatedNormalizedUnit;
+use crate::index::rebuild::AuthenticatedNormalizedUnits;
+use crate::index::rebuild::Step3RebuildReport;
+use crate::index::rebuild::append_new_chunk_association;
+use crate::index::rebuild::authenticate_chunk_row;
+use crate::index::rebuild::is_rebuild_skippable_unit_error;
+use crate::index::rebuild::read_chunking_config;
+use crate::index::rebuild::skipped_disclosure;
+use crate::index::rebuild::unit_authorities_from_inputs;
+use crate::object_persistence::index_to_kio;
+use crate::object_persistence::pipeline_to_kio;
+use crate::open_view::MAX_MANIFEST_OBJECT_READ_BYTES;
+use crate::response::reindex::{HistoricalReindexResponse, ReindexExecution, ReindexResponse};
+use crate::response::skipped_units::SkippedUnit;
+use crate::scope_access::active_erase_purge_explains_historical_missing_manifest;
+use crate::scope_access::ensure_no_visible_purge_journal;
+use crate::scope_access::purge_blocks_historical_reindex_raw;
+use crate::scope_access::purge_blocks_rebuild_raw;
+use crate::task_execution::enrichment_completion;
+use kio_core::ExitCode;
+use kio_core::KioError;
+use kio_core::cas::ContentObjectKind;
+use kio_core::cas::canonical_json_bytes;
+use kio_core::control::ControlHandle;
+use kio_core::dag::NormalizeRef;
+use kio_core::history::HistoryReader;
 use kio_core::history::TreeBinding;
+use kio_core::scope::Repository;
+use kio_index::TreeEntryRow;
+use kio_index::chunking::ChunkingInput;
+use kio_index::chunking::NormalizedUnitInput;
+use kio_index::chunking::chunk_normalized_instance;
+use kio_index::fts::FtsSchemaConfig;
+use kio_index::fts::FtsTokenizer;
+use kio_index::fts::SqliteFtsIndex;
+use kio_pipeline::markdownize::NormalizedInstanceIdentity;
+use kio_pipeline::markdownize::NormalizedInstanceManifest;
+use kio_pipeline::markdownize::NormalizedUnitObject;
+use kio_pipeline::markdownize::UnitStatus;
+use kio_pipeline::markdownize::validate_normalized_instance;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+use std::fs;
+use std::path::Path;
 
 #[derive(Debug, Default)]
 pub(super) struct ParsedReindex {
@@ -48,19 +101,20 @@ pub(super) fn pinned_manifest_and_units(
     )?;
     let manifest_path = Path::new("objects/manifests/<retained>");
     if kio_core::cas::hash_bytes(&bytes) != *manifest_hash {
-        return Err(crate::store_corrupt_error(
+        return Err(crate::index::rebuild::store_corrupt_error(
             manifest_path,
             "pinned manifest CAS object does not match its tree hash",
         ));
     }
-    let manifest: NormalizedInstanceManifest = serde_json::from_slice(&bytes)
-        .map_err(|error| crate::store_corrupt_error(manifest_path, error.to_string()))?;
-    let canonical_manifest = canonical_json_bytes(
-        &serde_json::to_value(&manifest)
-            .map_err(|error| crate::store_corrupt_error(manifest_path, error.to_string()))?,
-    )?;
+    let manifest: NormalizedInstanceManifest = serde_json::from_slice(&bytes).map_err(|error| {
+        crate::index::rebuild::store_corrupt_error(manifest_path, error.to_string())
+    })?;
+    let canonical_manifest =
+        canonical_json_bytes(&serde_json::to_value(&manifest).map_err(|error| {
+            crate::index::rebuild::store_corrupt_error(manifest_path, error.to_string())
+        })?)?;
     if canonical_manifest != bytes {
-        return Err(crate::store_corrupt_error(
+        return Err(crate::index::rebuild::store_corrupt_error(
             manifest_path,
             "pinned manifest CAS object is not canonical JSON",
         ));
@@ -69,7 +123,7 @@ pub(super) fn pinned_manifest_and_units(
         || manifest.tool_profile_hash != normalize.tool_profile_hash
         || manifest.r#gen != normalize.r#gen
     {
-        return Err(crate::store_corrupt_error(
+        return Err(crate::index::rebuild::store_corrupt_error(
             manifest_path,
             "pinned manifest identity does not match its tree normalization reference",
         ));
@@ -84,7 +138,7 @@ pub(super) fn pinned_manifest_and_units(
     };
     validate_normalized_instance(manifest_path, &identity, &manifest, &selected_units).map_err(
         |error| {
-            crate::store_corrupt_error(
+            crate::index::rebuild::store_corrupt_error(
                 manifest_path,
                 format!("pinned manifest/unit validation failed: {error}"),
             )
@@ -131,23 +185,17 @@ pub(super) fn pinned_manifest_is_complete(
 /// Projection predicates only need keys, but deliberately go through the same
 /// immutable-CAS validation as chunk reconstruction. A mutable normalized-unit
 /// cache must never make an older pinned snapshot appear to contain new text.
-pub(super) fn merge_reindex_skips(report: &mut Step3RebuildReport, reindex_skipped: Vec<Value>) {
+pub(super) fn merge_reindex_skips(
+    report: &mut Step3RebuildReport,
+    reindex_skipped: Vec<SkippedUnit>,
+) {
     let seen: BTreeSet<String> = report
         .skipped_units
         .iter()
-        .filter_map(|entry| {
-            entry
-                .get("raw_hash")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
+        .map(|entry| entry.raw_hash.clone())
         .collect();
     for skip in reindex_skipped {
-        let already = skip
-            .get("raw_hash")
-            .and_then(Value::as_str)
-            .is_some_and(|raw_hash| seen.contains(raw_hash));
-        if !already {
+        if !seen.contains(&skip.raw_hash) {
             report.skipped_units.push(skip);
         }
     }
@@ -208,11 +256,11 @@ pub(super) struct RetainedNormalizedInstance {
 /// here; left unimplemented given the regression risk and the P2-C task's own
 /// completion gate (`cargo test --workspace` green).
 pub(super) fn retained_history_instances(
-    kio_dir: &Path,
+    repo: &Repository,
     head: &str,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
-    let graph = HistoryReader::new(kio_dir).walk(head)?;
-    retained_history_instances_from_graph(kio_dir, &graph)
+    let graph = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store()).walk(head)?;
+    retained_history_instances_from_graph(repo.kio_dir(), &graph, repo.control())
 }
 
 /// Derive retained instances from a complete strict graph.  Keeping the graph
@@ -221,6 +269,7 @@ pub(super) fn retained_history_instances(
 fn retained_history_instances_from_graph(
     kio_dir: &Path,
     graph: &kio_core::history::LinearHistory,
+    control: &ControlHandle,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
     let mut all_paths_by_raw = BTreeMap::<String, BTreeSet<String>>::new();
     for appearance in graph.bindings() {
@@ -244,7 +293,7 @@ fn retained_history_instances_from_graph(
     let mut by_instance =
         BTreeMap::<(String, String, u64, String), Vec<(TreeBinding, String)>>::new();
     for binding in exact_bindings {
-        if purge_blocks_rebuild_raw(kio_dir, &binding.raw_hash)? {
+        if purge_blocks_rebuild_raw(kio_dir, &binding.raw_hash, control)? {
             continue;
         }
         let normalize = binding
@@ -339,18 +388,28 @@ fn retained_history_instances_from_graph(
 /// introductions in that union is necessary to remove descendant
 /// re-introductions across roots deterministically.
 pub(super) fn retained_history_instances_for_roots(
-    kio_dir: &Path,
+    repo: &Repository,
     roots: &BTreeSet<String>,
 ) -> Result<Vec<RetainedNormalizedInstance>> {
+    repo.object_store().verified_reads()?;
     if roots.is_empty() {
         return Ok(Vec::new());
     }
-    let (graph, _) = HistoryReader::new(kio_dir).walk_for_roots_allow_shallowed(roots)?;
-    retained_history_instances_from_graph(kio_dir, &graph)
+    let (graph, _) = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
+        .walk_for_roots_allow_shallowed(roots)?;
+    retained_history_instances_from_graph(repo.kio_dir(), &graph, repo.control())
 }
 
-pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool) -> Result<Value> {
-    ensure_no_visible_purge_journal(repo.kio_dir())?;
+pub(super) fn run(
+    ctx: &crate::invocation::Invocation<'_>,
+    repo: &Repository,
+    operand: &str,
+    online: bool,
+    offline: bool,
+) -> Result<ReindexExecution> {
+    let adapter_settings = ctx.settings;
+
+    ensure_no_visible_purge_journal(repo.kio_dir(), repo.control())?;
     let head_before = repo
         .head_commit_hash()?
         .ok_or_else(|| KioError::not_found("HEAD"))?;
@@ -358,7 +417,8 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
     // Unlike a history walk, an explicit historical reindex needs only the exact
     // selected commit and tree. HistoryReader gives this read the same strict CAS,
     // shallow, per-object, no-cache semantics as `search --at`.
-    let snapshot = HistoryReader::new(repo.kio_dir()).snapshot(&selected_commit)?;
+    let snapshot = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
+        .snapshot(&selected_commit)?;
     let config = read_chunking_config(repo)?;
     if config.chunking_config_hash != snapshot.tree.chunking_config_hash {
         return Err(KioError::invalid_usage(
@@ -393,7 +453,11 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
         let blocked = match historical_purge_decisions.get(&entry.raw_hash) {
             Some(blocked) => *blocked,
             None => {
-                let blocked = purge_blocks_historical_reindex_raw(repo.kio_dir(), &entry.raw_hash)?;
+                let blocked = purge_blocks_historical_reindex_raw(
+                    repo.kio_dir(),
+                    &entry.raw_hash,
+                    repo.control(),
+                )?;
                 historical_purge_decisions.insert(entry.raw_hash.clone(), blocked);
                 blocked
             }
@@ -459,8 +523,8 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
     // graph as other derived-history paths: the selected root itself remains
     // strict, while a receipt-backed shallow ancestor is an intentional
     // boundary rather than a reason to consult mutable state.
-    let (selected_graph, _) =
-        HistoryReader::new(repo.kio_dir()).walk_allow_shallowed(&selected_commit)?;
+    let (selected_graph, _) = HistoryReader::new_with_store(repo.kio_dir(), repo.object_store())
+        .walk_allow_shallowed(&selected_commit)?;
     let introductions_by_identity =
         selected_history_introductions(&selected_graph, &selected, &config.chunking_config_hash)?;
     for (identity, instance) in &mut selected {
@@ -503,7 +567,7 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
         + 1;
     let mut appended = Vec::<StoredChunk>::new();
     let mut pending_publication_events = Vec::new();
-    let mut skipped_units = Vec::<Value>::new();
+    let mut skipped_units = Vec::<SkippedUnit>::new();
     let mut reindexed_instances = 0_u64;
     // Only instances whose pinned immutable closure was actually available
     // can be projected below.  An active erase-purge explained gap is a
@@ -559,12 +623,12 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
                     return Err(error);
                 }
                 if is_rebuild_skippable_unit_error(&error) {
-                    skipped_units.push(json!({
-                        "raw_hash": instance.raw_hash,
-                        "path": instance.raw_path,
-                        "gen": instance.normalize.r#gen,
-                        "reason": error.error_code(),
-                    }));
+                    skipped_units.push(SkippedUnit {
+                        raw_hash: instance.raw_hash.clone(),
+                        path: instance.raw_path.clone(),
+                        r#gen: instance.normalize.r#gen,
+                        reason: error.error_code().to_owned(),
+                    });
                     continue;
                 }
                 return Err(error);
@@ -575,7 +639,7 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
             raw_path: instance.raw_path.clone(),
             units: units?,
             config: config.clone(),
-            created_at: now_utc_seconds(),
+            created_at: ctx.control.now_utc_seconds(),
         };
         let unit_authorities = unit_authorities_from_inputs(&input.units);
         for mut row in chunk_normalized_instance(input).map_err(index_to_kio)? {
@@ -615,12 +679,14 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
                         )
                     })?;
                 for introduction_commit in &instance.introductions {
-                    pending_publication_events.push(crate::ChunkPublicationEvent {
-                        event: "publication".to_owned(),
-                        chunk_id: chunk_id.clone(),
-                        chunking_config_hash: chunking_config_hash.clone(),
-                        introduction_commit: introduction_commit.clone(),
-                    });
+                    pending_publication_events.push(
+                        crate::index::chunk_ledger::ChunkPublicationEvent {
+                            event: "publication".to_owned(),
+                            chunk_id: chunk_id.clone(),
+                            chunking_config_hash: chunking_config_hash.clone(),
+                            introduction_commit: introduction_commit.clone(),
+                        },
+                    );
                 }
                 debug_assert_eq!(
                     pending_after,
@@ -632,7 +698,10 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
         projected_instances.push(instance.clone());
     }
     append_stored_chunks(repo.kio_dir(), &appended)?;
-    crate::append_chunk_publication_events(repo.kio_dir(), &pending_publication_events)?;
+    crate::index::chunk_ledger::append_chunk_publication_events(
+        repo.kio_dir(),
+        &pending_publication_events,
+    )?;
 
     let selected_instances = projected_instances
         .into_iter()
@@ -645,6 +714,7 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
         })
         .collect::<Vec<_>>();
     project_selected_snapshot(
+        ctx,
         repo,
         &selected_commit,
         &tree_entries,
@@ -657,8 +727,10 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
     // `(false, false, false)` this used to pass unconditionally.
     // `online_confirmed = false`: `kio reindex` carries no same-invocation
     // `--yes`/`--approve`-equivalent confirming flag.
-    let embedding_online = embedding_online_allowed(repo, offline, online, false)?;
+    let embedding_online =
+        embedding_online_allowed(adapter_settings, repo, offline, online, false)?;
     let enrichment = run_historical_embedding_enrichment(
+        ctx,
         repo,
         embedding_online,
         &selected_instances,
@@ -684,22 +756,23 @@ pub(super) fn run(repo: &Repository, operand: &str, online: bool, offline: bool)
         rebuilt_tree_entries: tree_entries.len() as u64,
         skipped_units,
     };
-    let mut output = json!({
-        "status": "reindexed",
-        "snapshot_at": selected_commit,
-        "head_commit": head_after,
-        "reindexed_files": reindexed_instances,
-        "rebuilt_chunks": report.rebuilt_chunks,
-        "embedding_tasks_executed": enrichment.executed,
-        "embedding_tasks_failed": enrichment.failed,
-        "paused_tasks": enrichment.paused,
-        "blocked_raw_hashes": blocked_raw_hashes.len(),
-    });
-    attach_skipped_units(&mut output, &report, repo.kio_dir());
-    if let Some(code) = enrichment_exit_override(&enrichment) {
-        set_exit_override(&mut output, code);
-    }
-    Ok(output)
+    let response = HistoricalReindexResponse {
+        status: "reindexed".to_owned(),
+        snapshot_at: selected_commit,
+        head_commit: head_after,
+        reindexed_files: reindexed_instances,
+        rebuilt_chunks: report.rebuilt_chunks,
+        embedding_tasks_executed: enrichment.executed,
+        embedding_tasks_failed: enrichment.failed,
+        paused_tasks: enrichment.paused,
+        blocked_raw_hashes: blocked_raw_hashes.len(),
+        skipped: skipped_disclosure(&report, repo.kio_dir()),
+    };
+    let completion = enrichment_completion(&enrichment);
+    Ok(ReindexExecution {
+        response: ReindexResponse::Historical(response),
+        completion,
+    })
 }
 
 /// Collect introduction candidates for the composite relation of exact
@@ -782,6 +855,7 @@ fn reindex_history_limit_error(exceeded: &str, attempted: u64, limit: u64) -> Ki
 /// exact tree projection. Rebuilding the whole ledger would be observable work on
 /// non-selected history; this narrow transaction is the enrichment-only boundary.
 fn project_selected_snapshot(
+    ctx: &crate::invocation::Invocation<'_>,
     repo: &Repository,
     selected_commit: &str,
     tree_entries: &[TreeEntryRow],
@@ -833,7 +907,7 @@ fn project_selected_snapshot(
     }
     let mut selected_chunks = Vec::new();
     for chunk in read_stored_chunks(repo.kio_dir())? {
-        if purge_blocks_rebuild_raw(repo.kio_dir(), &chunk.row.raw_hash)? {
+        if purge_blocks_rebuild_raw(repo.kio_dir(), &chunk.row.raw_hash, repo.control())? {
             continue;
         }
         if chunk.row.chunking_config_hash == chunking_config_hash
@@ -935,8 +1009,15 @@ fn project_selected_snapshot(
             // increment: `index_chunk_with_rowids` re-affirms existing rows as
             // readily as it adds new ones.
             drop(fts);
-            crate::rotate_index_generation_unconditionally(repo.kio_dir())?;
-            crate::write_through_projection_or_log_for_at_snapshot(repo.kio_dir(), selected_commit);
+            crate::index::chunk_ledger::rotate_index_generation_unconditionally(
+                repo.kio_dir(),
+                repo.control(),
+            )?;
+            crate::search::projection::write_through_projection_or_log_for_at_snapshot(
+                ctx,
+                repo.kio_dir(),
+                selected_commit,
+            );
             Ok(())
         }
         Err(error) => {
@@ -994,7 +1075,7 @@ mod tests {
                 .write_json(ObjectKind::Tree, &serde_json::to_value(tree).unwrap())
                 .unwrap()
                 .0;
-            let commit = CommitObject::new(
+            let commit = kio_core::dag::CommitObject::new(
                 tree_hash,
                 parent,
                 "2026-08-12T00:00:00Z".to_owned(),
@@ -1005,7 +1086,7 @@ mod tests {
                     files_modified: 0,
                     files_deleted: 0,
                 },
-                CommitType::Manual,
+                kio_core::dag::CommitType::Manual,
             )
             .unwrap();
             store
@@ -1017,7 +1098,9 @@ mod tests {
         let public_root = commit("public", "z-public.md", Some(secret_root.clone()));
         let roots = BTreeSet::from([public_root.clone(), secret_root.clone()]);
         let graph = HistoryReader::new(&kio_dir).walk_for_roots(&roots).unwrap();
-        let instances = retained_history_instances_from_graph(&kio_dir, &graph).unwrap();
+        let instances =
+            retained_history_instances_from_graph(&kio_dir, &graph, &ControlHandle::default())
+                .unwrap();
 
         assert_eq!(instances.len(), 1);
         let instance = &instances[0];
@@ -1060,7 +1143,7 @@ mod tests {
             r#gen: 1,
             parent_gen: None,
             run_id: "retained-test".to_owned(),
-            units: vec![NormalizedUnitManifestEntry {
+            units: vec![kio_pipeline::markdownize::NormalizedUnitManifestEntry {
                 order: 0,
                 unit_key: unit.unit_key.clone(),
                 unit_ref: unit_ref(&unit.unit_key),
@@ -1137,7 +1220,7 @@ mod tests {
             parent_gen: None,
             run_id: "partial-test".to_owned(),
             units: vec![
-                NormalizedUnitManifestEntry {
+                kio_pipeline::markdownize::NormalizedUnitManifestEntry {
                     order: 0,
                     unit_key: done.unit_key.clone(),
                     unit_ref: unit_ref(&done.unit_key),
@@ -1148,7 +1231,7 @@ mod tests {
                     unit_object_hash: None,
                     error_kind: None,
                 },
-                NormalizedUnitManifestEntry {
+                kio_pipeline::markdownize::NormalizedUnitManifestEntry {
                     order: 1,
                     unit_key: "page:2".to_owned(),
                     unit_ref: unit_ref("page:2"),

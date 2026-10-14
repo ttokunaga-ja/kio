@@ -2,14 +2,15 @@ use crate::management::{binding_for_repo, open_existing_managed_root};
 use crate::platform::watch_service::native_windows_task_definition_matches;
 use crate::platform::windows::wait_supervised_child;
 use crate::platform::{validate_runner_manifest_locator, watch_argv};
+use crate::response::watch::WatchServiceRunnerResponse;
 use crate::watch_service::{
     MAX_MANIFEST_BYTES, NativeRegistration, NativeScheduler, Scheduler, ServiceManifest, invalid,
     service_environment_pairs, service_error, validate_manifest,
 };
 use kio_core::Result;
+use kio_core::control::ControlHandle;
 use kio_core::management::{ManagementAuthority, read_record};
 use kio_core::store_dir::StoreDirectory;
-use serde_json::{Value, json};
 use std::env;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -21,8 +22,11 @@ use std::process::Command;
 /// The scheduler does not provide a trustworthy inherited environment.  This
 /// runner therefore sets the captured device paths on the child `Command`
 /// rather than mutating this process environment.
-pub(crate) fn run_watch_service_runner(manifest_path: PathBuf) -> Result<Value> {
-    let manifest = load_runner_manifest(&manifest_path)?;
+pub(crate) fn run_watch_service_runner(
+    manifest_path: PathBuf,
+    control: &ControlHandle,
+) -> Result<WatchServiceRunnerResponse> {
+    let manifest = load_runner_manifest(&manifest_path, control)?;
     let current_binary = env::current_exe()
         .map_err(service_error)?
         .canonicalize()
@@ -40,7 +44,7 @@ pub(crate) fn run_watch_service_runner(manifest_path: PathBuf) -> Result<Value> 
             "watch service root no longer matches its canonical manifest path",
         ));
     }
-    let repo = open_existing_managed_root(&root)?;
+    let repo = open_existing_managed_root(&root, control)?;
     let binding = binding_for_repo(&repo)?;
     let record = read_record(&binding)?;
     if record.authority != ManagementAuthority::Root || record.scope_id != manifest.scope_id {
@@ -48,7 +52,7 @@ pub(crate) fn run_watch_service_runner(manifest_path: PathBuf) -> Result<Value> 
             "watch service manifest no longer matches the managed root authority",
         ));
     }
-    let scheduler = NativeScheduler;
+    let scheduler = NativeScheduler(control.clone());
     if scheduler.inspect(&manifest)? != NativeRegistration::Owned
         || !native_runner_registration_matches(&manifest)?
     {
@@ -63,16 +67,23 @@ pub(crate) fn run_watch_service_runner(manifest_path: PathBuf) -> Result<Value> 
             "watch service child exited unsuccessfully: {status}"
         )));
     }
-    Ok(json!({"status":"watcher_exited", "service_id":manifest.id}))
+    Ok(WatchServiceRunnerResponse {
+        status: "watcher_exited".to_owned(),
+        service_id: manifest.id,
+    })
 }
 
-fn load_runner_manifest(manifest_path: &Path) -> Result<ServiceManifest> {
+fn load_runner_manifest(manifest_path: &Path, control: &ControlHandle) -> Result<ServiceManifest> {
     if !manifest_path.is_absolute() {
         return Err(invalid("watch service manifest path must be absolute"));
     }
     // This first read proves every ancestor and the leaf are owner-private
     // without trusting scheduler-provided environment variables.
-    let private_bytes = kio_core::private_fs::read_private_file(manifest_path, MAX_MANIFEST_BYTES)?;
+    let private_bytes = kio_core::private_fs::read_private_file_with_control(
+        manifest_path,
+        MAX_MANIFEST_BYTES,
+        control,
+    )?;
     let manifest: ServiceManifest =
         serde_json::from_slice(&private_bytes).map_err(service_error)?;
     validate_manifest(&manifest)?;
@@ -86,7 +97,7 @@ fn load_runner_manifest(manifest_path: &Path) -> Result<ServiceManifest> {
     // Retain the verified parent before opening the leaf a second time.  The
     // byte comparison catches a replacement between the private-file audit
     // and capability-relative read.
-    let store = StoreDirectory::open(parent)?;
+    let store = StoreDirectory::open_with_control(parent, control.clone())?;
     let file = store.open_regular_read(Path::new(leaf), MAX_MANIFEST_BYTES)?;
     store.ensure_owner_private(Path::new(leaf))?;
     let mut retained_bytes = Vec::new();

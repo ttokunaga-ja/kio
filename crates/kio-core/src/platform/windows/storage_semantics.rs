@@ -23,12 +23,21 @@ pub(crate) fn normalize_management_handles(
     root: File,
     kio: File,
     canonical_root: &Path,
+    control: &crate::control::ControlHandle,
 ) -> Result<(File, File)> {
     // Keep the proved objects while consuming the original Windows
     // handles: retaining their delete-share-denying clones would
     // prevent later namespace moves even after `control` normalizes.
-    let root = StoreDirectory::from_retained(root, canonical_root.to_path_buf())?;
-    let kio = StoreDirectory::from_retained(kio, canonical_root.join(".kio"))?;
+    let root = StoreDirectory::from_retained_with_control(
+        root,
+        canonical_root.to_path_buf(),
+        control.clone(),
+    )?;
+    let kio = StoreDirectory::from_retained_with_control(
+        kio,
+        canonical_root.join(".kio"),
+        control.clone(),
+    )?;
     Ok((
         root.root_handle().try_clone().map_err(io)?,
         kio.root_handle().try_clone().map_err(io)?,

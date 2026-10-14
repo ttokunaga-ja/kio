@@ -8,16 +8,17 @@ use super::{
     operation_leaf, pending_initializations, policy_allows, recover_lifecycle_atomic,
 };
 use crate::management::binding_for_repo;
+use crate::response::repair::*;
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use kio_core::management::{
     DirectoryIdentity, ManagementBinding, directory_identity_from_handle, observe_direct_child,
-    planned_child_management_record, read_registration_recovery_record, validate_controlled_root,
-    validate_live_chain,
+    planned_child_management_record, read_registration_recovery_record,
+    validate_controlled_root_with_control, validate_live_chain,
 };
 use kio_core::scope::{Repository, validate_planned_kio_layout};
 use kio_core::store_dir::{AtomicWorkspaceState, Publication, StoreDirectory};
 use kio_core::{KioError, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
 use std::path::Path;
 
 const CANCELLATION: &str = "child-initialization-cancel.json";
@@ -46,16 +47,23 @@ struct CheckedInitialization {
     stage_identity: Option<DirectoryIdentity>,
 }
 
-pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -> Result<Value> {
+pub(super) fn run(
+    parent: &Repository,
+    preview: bool,
+    operation: Option<&str>,
+) -> Result<CommandResponse> {
     if preview {
         let binding = binding_for_repo(parent)?;
-        let store = control(&binding)?;
+        let store = control(&binding, parent.control())?;
         let pending = pending_initializations(&store)?;
-        let cancellation = load_marker(&store)?.map(|(marker, _)| {
-            json!({
-                "operation": marker.initialization.operation_id,
-                "phase": marker.phase,
-            })
+        let cancellation = load_marker(&store)?.map(|(marker, _)| PendingCancellation {
+            operation: marker.initialization.operation_id,
+            phase: match marker.phase {
+                Phase::Prepared => "prepared",
+                Phase::Quarantined => "quarantined",
+                Phase::Removed => "removed",
+            }
+            .to_owned(),
         });
         if let Some(operation) = operation {
             operation_leaf(operation)?;
@@ -65,19 +73,24 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
             .filter(|(journal, _)| operation.is_none_or(|id| id == journal.operation_id))
             .map(|(journal, bytes)| preview_row(&binding, &store, journal, bytes))
             .collect::<Result<Vec<_>>>()?;
-        return Ok(json!({
-            "preview": true,
-            "operations": rows,
-            "pending_cancellation": cancellation,
-        }));
+        return Ok(CommandResponse {
+            body: ResponseBody::Repair(RepairResponse::CancelChildInitialization(
+                CancelChildInitializationResponse::Preview(CancelChildPreview {
+                    preview: true,
+                    operations: rows,
+                    pending_cancellation: cancellation,
+                }),
+            )),
+            completion: Completion::Complete,
+        });
     }
     let operation = operation.ok_or_else(|| {
         KioError::invalid_usage("child initialization cancellation requires an operation ID")
     })?;
     operation_leaf(operation)?;
-    let _lock = parent.lock_store()?;
+    let _lock = parent.lock_store_in_session(parent.lock_session())?;
     let binding = binding_for_repo(parent)?;
-    let store = control(&binding)?;
+    let store = control(&binding, parent.control())?;
     recover_lifecycle_atomic(&store)?;
     validate_live_chain(&binding)?;
     if let Some((marker, bytes)) = load_marker(&store)? {
@@ -87,7 +100,16 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
             ));
         }
         finish(&binding, &store, marker, bytes)?;
-        return Ok(json!({"operation": operation, "cancelled": true, "resumed": true}));
+        return Ok(CommandResponse {
+            body: ResponseBody::Repair(RepairResponse::CancelChildInitialization(
+                CancelChildInitializationResponse::Applied(CancelChildApplied {
+                    operation: operation.to_owned(),
+                    cancelled: true,
+                    resumed: true,
+                }),
+            )),
+            completion: Completion::Complete,
+        });
     }
     let (journal, bytes) = pending_initializations(&store)?
         .into_iter()
@@ -120,15 +142,24 @@ pub(super) fn run(parent: &Repository, preview: bool, operation: Option<&str>) -
         KioError::invalid_usage("child initialization cancellation marker disappeared")
     })?;
     finish(&binding, &store, marker, marker_bytes)?;
-    Ok(json!({"operation": operation, "cancelled": true, "resumed": false}))
+    Ok(CommandResponse {
+        body: ResponseBody::Repair(RepairResponse::CancelChildInitialization(
+            CancelChildInitializationResponse::Applied(CancelChildApplied {
+                operation: operation.to_owned(),
+                cancelled: true,
+                resumed: false,
+            }),
+        )),
+        completion: Completion::Complete,
+    })
 }
 
 /// Resume only an explicit cancellation marker. It never starts cancellation
 /// for an ordinary initialization journal.
 pub(super) fn recover(parent: &Repository) -> Result<()> {
-    let _lock = parent.lock_store()?;
+    let _lock = parent.lock_store_in_session(parent.lock_session())?;
     let binding = binding_for_repo(parent)?;
-    let store = control(&binding)?;
+    let store = control(&binding, parent.control())?;
     recover_lifecycle_atomic(&store)?;
     let Some((marker, bytes)) = load_marker(&store)? else {
         return Ok(());
@@ -141,7 +172,7 @@ fn preview_row(
     control: &StoreDirectory,
     journal: Initialization,
     bytes: Vec<u8>,
-) -> Result<Value> {
+) -> Result<CancelChildRow> {
     validate_live_chain(parent)?;
     let operation = journal.operation_id.clone();
     let path = parent.canonical_root().join(&journal.basename);
@@ -150,24 +181,19 @@ fn preview_row(
         .join(".kio")
         .join(&journal.stage_leaf);
     let policy = policy_allows(parent, &journal.basename).ok();
-    match check_initialization(parent, control, &journal, &bytes, false) {
-        Ok(_) => Ok(json!({
-            "operation": operation,
-            "path": path,
-            "stage": stage,
-            "cancelable": true,
-            "reason": null,
-            "current_policy_allows": policy,
-        })),
-        Err(error) => Ok(json!({
-            "operation": operation,
-            "path": path,
-            "stage": stage,
-            "cancelable": false,
-            "reason": error.to_string(),
-            "current_policy_allows": policy,
-        })),
-    }
+    let (cancelable, reason) = match check_initialization(parent, control, &journal, &bytes, false)
+    {
+        Ok(_) => (true, None),
+        Err(error) => (false, Some(error.to_string())),
+    };
+    Ok(CancelChildRow {
+        operation,
+        path,
+        stage,
+        cancelable,
+        reason,
+        current_policy_allows: policy,
+    })
 }
 
 fn load_marker(control: &StoreDirectory) -> Result<Option<(Cancellation, Vec<u8>)>> {
@@ -250,7 +276,11 @@ fn check_initialization(
             "planned child identity changed during cancellation",
         ));
     }
-    validate_controlled_root(&observed.handle, &observed.canonical_root)?;
+    validate_controlled_root_with_control(
+        &observed.handle,
+        &observed.canonical_root,
+        parent.control().clone(),
+    )?;
     let expected = planned_child_management_record(
         parent,
         &observed,
@@ -270,7 +300,7 @@ fn check_initialization(
             "child initialization already has a parent enrollment",
         ));
     }
-    let child = StoreDirectory::from_retained(
+    let child = StoreDirectory::from_retained_with_control(
         observed.handle.try_clone().map_err(|error| {
             KioError::io(
                 error.to_string(),
@@ -278,6 +308,7 @@ fn check_initialization(
             )
         })?,
         observed.canonical_root,
+        control.control().clone(),
     )?;
     if child.contains_entry(Path::new(".kio"))? {
         return Err(KioError::invalid_usage(
@@ -311,12 +342,13 @@ fn stage_from_source(
             stage_identity: None,
         });
     }
-    let stage = StoreDirectory::from_retained(
+    let stage = StoreDirectory::from_retained_with_control(
         control.open_directory(Path::new(&journal.stage_leaf))?,
         parent
             .canonical_root()
             .join(".kio")
             .join(&journal.stage_leaf),
+        control.control().clone(),
     )?;
     kio_core::private_fs::verify_private_directory_handle(&stage)?;
     let identity = directory_identity_from_handle(stage.root_handle().as_ref())?;
@@ -361,12 +393,13 @@ fn open_quarantine(
     if !control.contains_entry(Path::new(&marker.quarantine_leaf))? {
         return Ok(None);
     }
-    let stage = StoreDirectory::from_retained(
+    let stage = StoreDirectory::from_retained_with_control(
         control.open_directory(Path::new(&marker.quarantine_leaf))?,
         parent
             .canonical_root()
             .join(".kio")
             .join(&marker.quarantine_leaf),
+        control.control().clone(),
     )?;
     kio_core::private_fs::verify_private_directory_handle(&stage)?;
     let identity = directory_identity_from_handle(stage.root_handle().as_ref())?;
@@ -446,8 +479,12 @@ fn finish(
                     "planned child identity changed before cancellation probe cleanup",
                 ));
             }
-            validate_controlled_root(&observed.handle, &observed.canonical_root)?;
-            let child = StoreDirectory::from_retained(
+            validate_controlled_root_with_control(
+                &observed.handle,
+                &observed.canonical_root,
+                parent.control().clone(),
+            )?;
+            let child = StoreDirectory::from_retained_with_control(
                 observed.handle.try_clone().map_err(|error| {
                     KioError::io(
                         error.to_string(),
@@ -455,6 +492,7 @@ fn finish(
                     )
                 })?,
                 observed.canonical_root,
+                control.control().clone(),
             )?;
             let _ = kio_core::management::cleanup_case_probe_in_directory(&child, &stage)?;
             control.rename_directory_create_only(
@@ -538,7 +576,9 @@ mod tests {
     use std::fs;
 
     fn parent(temp: &tempfile::TempDir) -> Repository {
-        match initialize_explicit_root(temp.path()).unwrap() {
+        match initialize_explicit_root(temp.path(), &kio_core::control::ControlHandle::default())
+            .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("test parent unexpectedly existed"),
         }
@@ -569,7 +609,7 @@ mod tests {
             stage_identity: None,
             management,
         };
-        let store = control(&binding).unwrap();
+        let store = control(&binding, parent.control()).unwrap();
         let stage = StoreDirectory::from_retained(
             store
                 .create_directory(Path::new(&journal.stage_leaf))
@@ -607,7 +647,10 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let parent = parent(&temp);
         let empty = interrupted(&parent, "empty", false, false);
-        let preview = run(&parent, true, None).unwrap();
+        let response = run(&parent, true, None).unwrap();
+        assert_eq!(response.completion, Completion::Complete);
+        let preview =
+            serde_json::to_value(response.body).expect("cfg(test) cancellation body projection");
         assert_eq!(preview["preview"], true);
         assert!(!parent.kio_dir().join(CANCELLATION).exists());
         assert!(
@@ -667,7 +710,7 @@ mod tests {
         let parent = parent(&temp);
         let operation = interrupted(&parent, "child", true, true);
         let binding = binding_for_repo(&parent).unwrap();
-        let store = control(&binding).unwrap();
+        let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let (journal, _) = pending_initializations(&store)
             .unwrap()
             .into_iter()
@@ -709,7 +752,7 @@ mod tests {
         let parent = parent(&temp);
         let operation = interrupted(&parent, "child", true, true);
         let binding = binding_for_repo(&parent).unwrap();
-        let store = control(&binding).unwrap();
+        let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let (journal, bytes) = pending_initializations(&store)
             .unwrap()
             .into_iter()
@@ -745,7 +788,7 @@ mod tests {
         let parent = parent(&temp);
         let operation = interrupted(&parent, "crash", true, true);
         let binding = binding_for_repo(&parent).unwrap();
-        let store = control(&binding).unwrap();
+        let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let (journal, bytes) = pending_initializations(&store)
             .unwrap()
             .into_iter()
@@ -801,7 +844,7 @@ mod tests {
         let parent = parent(&temp);
         let operation = interrupted(&parent, "partial-delete", false, false);
         let binding = binding_for_repo(&parent).unwrap();
-        let store = control(&binding).unwrap();
+        let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let (journal, bytes) = pending_initializations(&store)
             .unwrap()
             .into_iter()
@@ -867,7 +910,7 @@ mod tests {
         let parent = parent(&temp);
         let operation = interrupted(&parent, "terminal", true, false);
         let binding = binding_for_repo(&parent).unwrap();
-        let store = control(&binding).unwrap();
+        let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let (journal, bytes) = pending_initializations(&store)
             .unwrap()
             .into_iter()

@@ -220,16 +220,27 @@ pub fn generated_parent_policy_for_child(
         .collect()
 }
 
-pub fn build_scan_preview(request: ScanPreviewRequest) -> Result<ScanPreview> {
+pub fn build_scan_preview(
+    markdownize_pricing: &BTreeMap<String, f64>,
+    embedding_pricing: &BTreeMap<String, f64>,
+    request: ScanPreviewRequest,
+) -> Result<ScanPreview> {
     let scope_path = PathBuf::from(&request.scope_path);
     let inherited = load_generated_parent_ignore(&scope_path)?;
-    build_scan_preview_with_inherited_rules(request, &inherited)
+    build_scan_preview_with_inherited_rules(
+        markdownize_pricing,
+        embedding_pricing,
+        request,
+        &inherited,
+    )
 }
 
 /// Build a mutation-free direct-file preview with explicitly supplied ancestor
 /// rules.  This lets a parent disclose the same child totals it would persist
 /// during a real bound-child index, without trusting a stale child config.
 pub fn build_scan_preview_with_inherited_rules(
+    markdownize_pricing: &BTreeMap<String, f64>,
+    embedding_pricing: &BTreeMap<String, f64>,
     request: ScanPreviewRequest,
     inherited_rules: &[IgnoreRule],
 ) -> Result<ScanPreview> {
@@ -251,10 +262,8 @@ pub fn build_scan_preview_with_inherited_rules(
     )?;
     apply_inherited_denials(&mut candidates, inherited_rules, case_insensitive)?;
     candidates.sort_by(|a, b| a.input_path.cmp(&b.input_path));
-    let markdownize_pricing = kio_adapter::tool_lock::registered_declared_pricing("markdown");
-    let embedding_pricing = kio_adapter::tool_lock::registered_declared_pricing("embedding");
     let (estimated_markdownize_usd, estimated_embedding_usd) =
-        estimated_enrichment_cost_usd(&candidates, &markdownize_pricing, &embedding_pricing);
+        estimated_enrichment_cost_usd(&candidates, markdownize_pricing, embedding_pricing);
     Ok(ScanPreview {
         scope_id: scope_id_from_scope_json(&scope_path).unwrap_or_else(|| "unknown".to_owned()),
         candidates,
@@ -275,6 +284,8 @@ pub fn build_scan_preview_with_inherited_rules(
 /// rename or symlink replacement of the public scope name cannot redirect a
 /// source or policy read.
 pub fn build_bound_scan_preview(
+    markdownize_pricing: &BTreeMap<String, f64>,
+    embedding_pricing: &BTreeMap<String, f64>,
     root: &File,
     kio: &File,
     request: ScanPreviewRequest,
@@ -294,10 +305,8 @@ pub fn build_bound_scan_preview(
     )?;
     apply_inherited_denials(&mut candidates, inherited_rules, case_insensitive)?;
     candidates.sort_by(|left, right| left.input_path.cmp(&right.input_path));
-    let markdownize_pricing = kio_adapter::tool_lock::registered_declared_pricing("markdown");
-    let embedding_pricing = kio_adapter::tool_lock::registered_declared_pricing("embedding");
     let (estimated_markdownize_usd, estimated_embedding_usd) =
-        estimated_enrichment_cost_usd(&candidates, &markdownize_pricing, &embedding_pricing);
+        estimated_enrichment_cost_usd(&candidates, markdownize_pricing, embedding_pricing);
     Ok(ScanPreview {
         scope_id: bound_scope_id_from_scope_json(kio).unwrap_or_else(|| "unknown".to_owned()),
         candidates,
@@ -316,6 +325,8 @@ pub fn build_bound_scan_preview(
 /// eligibility is checked before a candidate's raw bytes are opened or hashed.
 /// The request path is presentation-only; it cannot redirect this operation.
 pub fn build_managed_scan_preview(
+    markdownize_pricing: &BTreeMap<String, f64>,
+    embedding_pricing: &BTreeMap<String, f64>,
     binding: &ManagementBinding,
     request: ScanPreviewRequest,
 ) -> Result<ScanPreview> {
@@ -361,10 +372,8 @@ pub fn build_managed_scan_preview(
     }
     candidates.sort_by(|left, right| left.input_path.cmp(&right.input_path));
     policy.revalidate()?;
-    let markdownize_pricing = kio_adapter::tool_lock::registered_declared_pricing("markdown");
-    let embedding_pricing = kio_adapter::tool_lock::registered_declared_pricing("embedding");
     let (estimated_markdownize_usd, estimated_embedding_usd) =
-        estimated_enrichment_cost_usd(&candidates, &markdownize_pricing, &embedding_pricing);
+        estimated_enrichment_cost_usd(&candidates, markdownize_pricing, embedding_pricing);
     Ok(ScanPreview {
         scope_id: record.scope_id,
         candidates,
@@ -384,6 +393,8 @@ pub fn build_managed_scan_preview(
 /// case capability; ancestor policy is the in-memory projection retained by
 /// [`BoundPlannedChild`].
 pub fn build_planned_child_scan_preview(
+    markdownize_pricing: &BTreeMap<String, f64>,
+    embedding_pricing: &BTreeMap<String, f64>,
     child: &BoundPlannedChild,
     request: ScanPreviewRequest,
     case_insensitive: bool,
@@ -432,10 +443,8 @@ pub fn build_planned_child_scan_preview(
         });
     }
     candidates.sort_by(|left, right| left.input_path.cmp(&right.input_path));
-    let markdownize_pricing = kio_adapter::tool_lock::registered_declared_pricing("markdown");
-    let embedding_pricing = kio_adapter::tool_lock::registered_declared_pricing("embedding");
     let (estimated_markdownize_usd, estimated_embedding_usd) =
-        estimated_enrichment_cost_usd(&candidates, &markdownize_pricing, &embedding_pricing);
+        estimated_enrichment_cost_usd(&candidates, markdownize_pricing, embedding_pricing);
     Ok(ScanPreview {
         scope_id: "unmanaged-child".to_owned(),
         candidates,
@@ -1324,7 +1333,7 @@ pub fn load_index_vcs_repos(scope_path: &Path) -> Result<bool> {
 /// "コスト概算は…tools.toml の [pricing] 単価表 × 推定ページ数/トークン数から算出
 /// する桁の目安" — the declared unit price (`markdownize_pricing`/
 /// `embedding_pricing`, sourced by the caller from `kio-adapter`'s
-/// `tool_lock::registered_declared_pricing`) times a rough page/token count
+/// explicitly supplied role pricing) times a rough page/token count
 /// derived from candidate byte sizes. Takes pricing as parameters (rather
 /// than reading the process-global registry itself) so this arithmetic is
 /// unit-testable without depending on `tool_lock`'s once-per-process
@@ -2495,6 +2504,8 @@ mod tests {
         symlink(&replacement, &public).unwrap();
 
         let preview = build_bound_scan_preview(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             &root,
             &kio,
             ScanPreviewRequest {
@@ -2698,11 +2709,15 @@ mod tests {
     fn qa19_combined_estimated_usd_is_the_sum_of_the_split_fields() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("a.pdf"), vec![0_u8; 100]).unwrap();
-        let preview = build_scan_preview(ScanPreviewRequest {
-            scope_path: dir.path().display().to_string(),
-            include_raw_hashes: false,
-            require_network_approval: false,
-        })
+        let preview = build_scan_preview(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            ScanPreviewRequest {
+                scope_path: dir.path().display().to_string(),
+                include_raw_hashes: false,
+                require_network_approval: false,
+            },
+        )
         .unwrap();
         let cost = preview.estimated_cost.expect("cost preview present");
         assert!(
@@ -2710,6 +2725,31 @@ mod tests {
                 .abs()
                 < 1e-9
         );
+    }
+
+    #[test]
+    fn scan_preview_pricing_is_explicit_and_isolated_between_invocations() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.md"), vec![b'a'; 4_000]).unwrap();
+        let request = || ScanPreviewRequest {
+            scope_path: dir.path().display().to_string(),
+            include_raw_hashes: false,
+            require_network_approval: false,
+        };
+        let markdown = BTreeMap::new();
+        let first = BTreeMap::from([("tokens_in".to_owned(), 0.001)]);
+        let second = BTreeMap::from([("tokens_in".to_owned(), 0.002)]);
+        let cost = |prices: &BTreeMap<String, f64>| {
+            build_scan_preview(&markdown, prices, request())
+                .unwrap()
+                .estimated_cost
+                .unwrap()
+                .estimated_embedding_usd
+        };
+        assert_eq!(cost(&first), 1.0);
+        assert_eq!(cost(&second), 2.0);
+        assert_eq!(cost(&first), 1.0);
+        assert_eq!(cost(&BTreeMap::new()), 0.0);
     }
 
     #[test]
@@ -2889,11 +2929,15 @@ mod tests {
         std::fs::write(dir.path().join("é.txt"), b"excluded").unwrap();
         std::fs::write(dir.path().join("ab.txt"), b"included").unwrap();
 
-        let preview = build_scan_preview(ScanPreviewRequest {
-            scope_path: dir.path().display().to_string(),
-            include_raw_hashes: false,
-            require_network_approval: false,
-        })
+        let preview = build_scan_preview(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            ScanPreviewRequest {
+                scope_path: dir.path().display().to_string(),
+                include_raw_hashes: false,
+                require_network_approval: false,
+            },
+        )
         .unwrap();
         assert!(
             preview
@@ -2940,11 +2984,15 @@ mod tests {
         let bytes = vec![0x5a; 256 * 1024];
         std::fs::write(dir.path().join("large.bin"), &bytes).unwrap();
 
-        let preview = build_scan_preview(ScanPreviewRequest {
-            scope_path: dir.path().display().to_string(),
-            include_raw_hashes: true,
-            require_network_approval: false,
-        })
+        let preview = build_scan_preview(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            ScanPreviewRequest {
+                scope_path: dir.path().display().to_string(),
+                include_raw_hashes: true,
+                require_network_approval: false,
+            },
+        )
         .unwrap();
         let candidate = preview
             .candidates
@@ -3052,6 +3100,8 @@ mod tests {
         let parent_plan = discover_child_scopes(parent.path()).unwrap();
         let child_rules = generated_parent_policy_for_child(&parent_plan, "project").unwrap();
         let child_preview = build_scan_preview_with_inherited_rules(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             ScanPreviewRequest {
                 scope_path: child.display().to_string(),
                 include_raw_hashes: false,
@@ -3080,6 +3130,8 @@ mod tests {
         let child_plan = discover_child_scopes(&child).unwrap();
         let grandchild_rules = generated_parent_policy_for_child(&child_plan, "nested").unwrap();
         let nested_preview = build_scan_preview_with_inherited_rules(
+            &BTreeMap::new(),
+            &BTreeMap::new(),
             ScanPreviewRequest {
                 scope_path: nested.display().to_string(),
                 include_raw_hashes: false,
@@ -3117,11 +3169,15 @@ mod tests {
         )
         .unwrap();
         assert!(
-            build_scan_preview(ScanPreviewRequest {
-                scope_path: dir.path().display().to_string(),
-                include_raw_hashes: false,
-                require_network_approval: false,
-            })
+            build_scan_preview(
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                ScanPreviewRequest {
+                    scope_path: dir.path().display().to_string(),
+                    include_raw_hashes: false,
+                    require_network_approval: false,
+                }
+            )
             .is_err()
         );
     }

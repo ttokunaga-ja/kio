@@ -1,10 +1,11 @@
 //! macos source SQLite descriptor path and open verification.
+use crate::platform::BoundSqliteConnection;
 use crate::platform::source::BoundSourceIndex;
 use crate::platform::unix_source_vfs::{
     BOUND_SOURCE_DEFAULT_VFS, ensure_source_vfs_registered, is_bound_source_fd_name,
 };
 use crate::{IndexError, Result};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::OpenFlags;
 use std::path::PathBuf;
 
 fn sqlite_path(source: &BoundSourceIndex) -> PathBuf {
@@ -15,7 +16,7 @@ fn sqlite_path(source: &BoundSourceIndex) -> PathBuf {
 pub(crate) fn open_bound_source_connection(
     source: &BoundSourceIndex,
     flags: OpenFlags,
-) -> Result<Connection> {
+) -> Result<BoundSqliteConnection> {
     use std::os::unix::ffi::OsStrExt;
 
     let path = sqlite_path(source);
@@ -25,11 +26,7 @@ pub(crate) fn open_bound_source_connection(
         ));
     }
     ensure_source_vfs_registered()?;
-    Ok(Connection::open_with_flags_and_vfs(
-        &path,
-        flags,
-        "kio-bound-source-unix",
-    )?)
+    BoundSqliteConnection::open::<()>(&path, flags, Some("kio-bound-source-unix"), None)
 }
 
 pub(crate) unsafe extern "C" fn bound_source_x_open(

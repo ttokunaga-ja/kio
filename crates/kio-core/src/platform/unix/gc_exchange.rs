@@ -24,6 +24,7 @@ pub(crate) fn replace_snapshot_state_expected(
     temporary: &str,
     replacement: &[u8],
     expected: &FileObservation,
+    control: &crate::control::ControlHandle,
 ) -> Result<()> {
     exchange_bound(dir, leaf, temporary)?;
     sync_bound_directory(dir, leaf)?;
@@ -67,7 +68,7 @@ pub(crate) fn replace_snapshot_state_expected(
                 "snapshot auto state changed during failed replacement rollback",
             ));
         }
-        retire_snapshot_state_temporary(dir, temporary, replacement, &replacement_before)?;
+        retire_snapshot_state_temporary(dir, temporary, replacement, &replacement_before, control)?;
         return Err(snapshot_auto_state_changed());
     }
     let old_handle = open_verified_file_handle(
@@ -210,6 +211,7 @@ pub(crate) fn remove_completed_marker(
     markers: &std::fs::File,
     _expected: &GcInProgressMarker,
     observation: &FileObservation,
+    _control: &crate::control::ControlHandle,
 ) -> Result<()> {
     let archive = unique_internal_name("completed");
     rename_noreplace_between(gc, "in_progress", markers, &archive)?;

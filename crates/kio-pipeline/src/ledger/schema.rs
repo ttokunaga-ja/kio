@@ -141,8 +141,14 @@ pub const RETIRED_LEDGER_BASENAMES: &[&str] = &[
 /// `$HOME/.local/share/kio/cost-ledger.sqlite` (04 §5.4: "デバイスグローバル 1 個").
 /// Mirrors `kio_index::registry::default_registry_path`'s XDG resolution exactly.
 pub fn default_ledger_path() -> Result<PathBuf> {
+    default_ledger_path_with_control(&kio_core::control::ControlHandle::default())
+}
+
+pub fn default_ledger_path_with_control(
+    control: &kio_core::control::ControlHandle,
+) -> Result<PathBuf> {
     let data_home = kio_core::xdg::xdg_dir("XDG_DATA_HOME")
-        .or_else(|| kio_core::xdg::home_dir().map(|home| home.join(".local/share")))
+        .or_else(|| control.home_dir().map(|home| home.join(".local/share")))
         .ok_or_else(|| {
             PipelineError::Schema(
                 "cannot resolve an absolute user data directory; refusing a CWD-relative cost ledger"

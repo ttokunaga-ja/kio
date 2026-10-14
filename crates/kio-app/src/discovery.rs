@@ -39,14 +39,15 @@ impl ChildDiscoveryFrontier {
         let kio = repo.bound_kio_handle().ok_or_else(|| {
             KioError::invalid_usage("child discovery requires a retained .kio handle")
         })?;
-        let kio = StoreDirectory::from_retained(
+        let kio = StoreDirectory::from_retained_with_control(
             kio.try_clone().map_err(|error| {
                 KioError::io(error.to_string(), repo.kio_dir().display().to_string())
             })?,
             repo.kio_dir().to_path_buf(),
+            repo.control().clone(),
         )?;
         let child_directory = kio.create_directory_all(Path::new(DIRECTORY))?;
-        let directory = StoreDirectory::from_retained(
+        let directory = StoreDirectory::from_retained_with_control(
             child_directory.try_clone().map_err(|error| {
                 KioError::io(
                     error.to_string(),
@@ -54,6 +55,7 @@ impl ChildDiscoveryFrontier {
                 )
             })?,
             repo.kio_dir().join(DIRECTORY),
+            repo.control().clone(),
         )?;
         validate_directory(&directory)?;
         let lock = acquire_lock(&directory)?;
@@ -221,7 +223,12 @@ mod tests {
     #[test]
     fn retained_frontier_round_trips_and_clears() {
         let temp = tempfile::tempdir().unwrap();
-        let repo = match initialize_explicit_root(temp.path()).unwrap() {
+        let repo = match initialize_explicit_root(
+            temp.path(),
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap()
+        {
             ExplicitRoot::Created(repo) => repo,
             ExplicitRoot::Existing(_) => panic!("new root must be created"),
         };

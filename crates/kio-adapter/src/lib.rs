@@ -28,22 +28,6 @@ pub mod xlsx_extract;
 
 use thiserror::Error;
 
-/// Return the debug control captured by the composition root for this adapter
-/// operation. Production callers must never re-read the ambient environment:
-/// the CLI installs one snapshot before dispatch. Crate unit tests are library
-/// operation roots, so they capture once when no caller installed a snapshot.
-#[cfg(debug_assertions)]
-pub(crate) fn debug_test_control() -> kio_core::test_control::DebugTestControl {
-    #[cfg(test)]
-    {
-        kio_core::test_control::capture_for_operation()
-    }
-    #[cfg(not(test))]
-    {
-        kio_core::test_control::current_or_default()
-    }
-}
-
 pub type Result<T> = std::result::Result<T, AdapterError>;
 
 #[derive(Debug, Error)]

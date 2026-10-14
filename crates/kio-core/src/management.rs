@@ -3,9 +3,9 @@ use crate::platform::{
     management_file_identity as file_identity,
     management_same_case_probe_file as same_case_probe_file,
 };
-use crate::scope::KIO_FORMAT_VERSION;
 use crate::store_dir::{Publication, StoreDirectory};
 use crate::{ExitCode, KioError, Result};
+use crate::{control::ControlHandle, scope::KIO_FORMAT_VERSION};
 use cap_primitives::fs as cap_fs;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -124,6 +124,14 @@ pub struct ObservedDirectChild {
 }
 impl ManagementBinding {
     pub fn from_retained(root: File, kio: File, canonical_root: PathBuf) -> Result<Self> {
+        Self::from_retained_with_control(root, kio, canonical_root, ControlHandle::default())
+    }
+    pub fn from_retained_with_control(
+        root: File,
+        kio: File,
+        canonical_root: PathBuf,
+        control: ControlHandle,
+    ) -> Result<Self> {
         if !canonical_root.is_absolute()
             || canonical_root
                 .components()
@@ -131,10 +139,15 @@ impl ManagementBinding {
         {
             return Err(err("canonical root path is invalid"));
         }
-        controlled_root_directory(&root, &canonical_root)?;
-        Self::from_validated_retained(root, kio, canonical_root)
+        controlled_root_directory(&root, &canonical_root, control.clone())?;
+        Self::from_validated_retained(root, kio, canonical_root, control)
     }
-    fn from_validated_retained(root: File, kio: File, canonical_root: PathBuf) -> Result<Self> {
+    fn from_validated_retained(
+        root: File,
+        kio: File,
+        canonical_root: PathBuf,
+        control: ControlHandle,
+    ) -> Result<Self> {
         let directory_identity = file_identity(&root)?;
         let kio_identity = file_identity(&kio)?;
         let named = cap_fs::open_dir_nofollow(&root, Path::new(".kio")).map_err(io)?;
@@ -145,10 +158,12 @@ impl ManagementBinding {
             root,
             kio,
             &canonical_root,
+            &control,
         )?;
-        let control = StoreDirectory::from_retained(
+        let control = StoreDirectory::from_retained_with_control(
             kio.try_clone().map_err(io)?,
             canonical_root.join(".kio"),
+            control,
         )?;
         Ok(Self {
             canonical_root,
@@ -160,6 +175,9 @@ impl ManagementBinding {
         })
     }
     pub fn bind(path: impl AsRef<Path>) -> Result<Self> {
+        Self::bind_with_control(path, ControlHandle::default())
+    }
+    pub fn bind_with_control(path: impl AsRef<Path>, control: ControlHandle) -> Result<Self> {
         let path = path.as_ref();
         if !path.is_absolute()
             || path
@@ -168,10 +186,14 @@ impl ManagementBinding {
         {
             return Err(err("scope path must be absolute and canonical"));
         }
-        let checked = controlled_root_directory_from_path(path)?;
+        let checked = controlled_root_directory_from_path(path, control.clone())?;
         let root = checked.root_handle().try_clone().map_err(io)?;
         let kio = cap_fs::open_dir_nofollow(&root, Path::new(".kio")).map_err(io)?;
-        Self::from_validated_retained(root, kio, path.to_path_buf())
+        Self::from_validated_retained(root, kio, path.to_path_buf(), control)
+    }
+    #[must_use]
+    pub fn control(&self) -> &ControlHandle {
+        self.control.control()
     }
     #[must_use]
     pub fn canonical_root(&self) -> &Path {
@@ -195,7 +217,11 @@ impl ManagementBinding {
         self.recheck()
     }
     fn recheck(&self) -> Result<()> {
-        validate_controlled_root(&self.root, &self.canonical_root)?;
+        validate_controlled_root_with_control(
+            &self.root,
+            &self.canonical_root,
+            self.control().clone(),
+        )?;
         if file_identity(&self.root)? != self.directory_identity
             || file_identity(&self.kio)? != self.kio_identity
         {
@@ -215,11 +241,23 @@ impl ManagementBinding {
 /// shared-read-parent policy, then its retained identity is matched to `root`.
 /// This only validates; it never repairs permissions or changes ACLs.
 pub fn validate_controlled_root(root: &File, canonical_root: &Path) -> Result<()> {
-    controlled_root_directory(root, canonical_root).map(|_| ())
+    validate_controlled_root_with_control(root, canonical_root, ControlHandle::default())
 }
 
-fn controlled_root_directory(root: &File, canonical_root: &Path) -> Result<StoreDirectory> {
-    let checked = controlled_root_directory_from_path(canonical_root)?;
+pub fn validate_controlled_root_with_control(
+    root: &File,
+    canonical_root: &Path,
+    control: ControlHandle,
+) -> Result<()> {
+    controlled_root_directory(root, canonical_root, control).map(|_| ())
+}
+
+fn controlled_root_directory(
+    root: &File,
+    canonical_root: &Path,
+    control: ControlHandle,
+) -> Result<StoreDirectory> {
+    let checked = controlled_root_directory_from_path(canonical_root, control)?;
     let expected = file_identity(root)
         .map_err(|error| controlled_root_err(canonical_root, error.to_string()))?;
     let checked_identity = file_identity(checked.root_handle().as_ref())
@@ -233,8 +271,11 @@ fn controlled_root_directory(root: &File, canonical_root: &Path) -> Result<Store
     Ok(checked)
 }
 
-fn controlled_root_directory_from_path(canonical_root: &Path) -> Result<StoreDirectory> {
-    crate::private_fs::verify_private_creation_parent(canonical_root)
+fn controlled_root_directory_from_path(
+    canonical_root: &Path,
+    control: ControlHandle,
+) -> Result<StoreDirectory> {
+    crate::private_fs::verify_private_creation_parent_with_control(canonical_root, &control)
         .map_err(|error| controlled_root_err(canonical_root, error.to_string()))
 }
 pub fn initialize_root(
@@ -266,10 +307,22 @@ pub fn initialize_root(
 /// No read/search path calls this probe. The unique lower-case leaf is created
 /// with CreateOnly and is removed only through byte-verified quarantine.
 pub fn detect_case_insensitive(binding: &ManagementBinding) -> Result<bool> {
-    let _lock = crate::scope::acquire_retained_store_lock(&binding.kio)?;
-    let root = StoreDirectory::from_retained(
+    detect_case_insensitive_in_session(&crate::scope::LockSession::default(), binding)
+}
+
+pub fn detect_case_insensitive_in_session(
+    session: &crate::scope::LockSession,
+    binding: &ManagementBinding,
+) -> Result<bool> {
+    let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
+        &binding.kio,
+        binding.control(),
+    )?;
+    let root = StoreDirectory::from_retained_with_control(
         binding.root.try_clone().map_err(io)?,
         binding.canonical_root.clone(),
+        binding.control().clone(),
     )?;
     detect_case_insensitive_with_recheck(&root, &binding.control, || binding.recheck())
 }
@@ -498,8 +551,20 @@ fn initialization_pending(
 }
 
 pub fn begin_registration(binding: &ManagementBinding, operation_id: &str) -> Result<()> {
+    begin_registration_in_session(&crate::scope::LockSession::default(), binding, operation_id)
+}
+
+pub fn begin_registration_in_session(
+    session: &crate::scope::LockSession,
+    binding: &ManagementBinding,
+    operation_id: &str,
+) -> Result<()> {
     validate_operation_id(operation_id)?;
-    let _lock = crate::scope::acquire_retained_store_lock(&binding.kio)?;
+    let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
+        &binding.kio,
+        binding.control(),
+    )?;
     binding.recheck()?;
     let marker = registration_marker_bytes(operation_id)?;
     match binding
@@ -524,8 +589,29 @@ pub fn publish_registration_record(
     before: &ManagementRecord,
     after: &ManagementRecord,
 ) -> Result<()> {
+    publish_registration_record_in_session(
+        &crate::scope::LockSession::default(),
+        binding,
+        operation_id,
+        before,
+        after,
+    )
+}
+
+pub fn publish_registration_record_in_session(
+    session: &crate::scope::LockSession,
+
+    binding: &ManagementBinding,
+    operation_id: &str,
+    before: &ManagementRecord,
+    after: &ManagementRecord,
+) -> Result<()> {
     validate_operation_id(operation_id)?;
-    let _lock = crate::scope::acquire_retained_store_lock(&binding.kio)?;
+    let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
+        &binding.kio,
+        binding.control(),
+    )?;
     if peek_registration_marker(binding)?.as_deref() != Some(operation_id) {
         return Err(registration_pending_err());
     }
@@ -546,8 +632,27 @@ pub fn finish_registration(
     operation_id: &str,
     expected_after: &ManagementRecord,
 ) -> Result<()> {
+    finish_registration_in_session(
+        &crate::scope::LockSession::default(),
+        binding,
+        operation_id,
+        expected_after,
+    )
+}
+
+pub fn finish_registration_in_session(
+    session: &crate::scope::LockSession,
+
+    binding: &ManagementBinding,
+    operation_id: &str,
+    expected_after: &ManagementRecord,
+) -> Result<()> {
     validate_operation_id(operation_id)?;
-    let _lock = crate::scope::acquire_retained_store_lock(&binding.kio)?;
+    let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
+        &binding.kio,
+        binding.control(),
+    )?;
     if peek_registration_marker(binding)?.as_deref() != Some(operation_id) {
         return Err(registration_pending_err());
     }
@@ -580,7 +685,7 @@ pub fn validate_prospective_child(
         .and_then(|relative| relative.to_str())
         .ok_or_else(|| err("prospective child is not beneath its parent"))?;
     validate_basename(basename)?;
-    validate_controlled_root(child, canonical_root)?;
+    validate_controlled_root_with_control(child, canonical_root, parent.control().clone())?;
     let observed = observe_direct_child(parent, basename)?
         .ok_or_else(|| err("prospective child is absent"))?;
     let identity = file_identity(child)?;
@@ -627,7 +732,7 @@ fn observe_direct_child_once(
         Err(error) => return Err(io(error)),
     };
     let canonical_root = parent.canonical_root.join(basename);
-    validate_controlled_root(&handle, &canonical_root)?;
+    validate_controlled_root_with_control(&handle, &canonical_root, parent.control().clone())?;
     let directory_identity = file_identity(&handle)?;
     Ok(Some(ObservedDirectChild {
         handle,
@@ -643,7 +748,30 @@ pub fn enroll_child(
     token: impl Into<String>,
     expected_directory_identity: &DirectoryIdentity,
 ) -> Result<()> {
-    let _lock = crate::scope::acquire_retained_store_lock(&parent.kio)?;
+    enroll_child_in_session(
+        &crate::scope::LockSession::default(),
+        parent,
+        basename,
+        scope_id,
+        token,
+        expected_directory_identity,
+    )
+}
+
+pub fn enroll_child_in_session(
+    session: &crate::scope::LockSession,
+
+    parent: &ManagementBinding,
+    basename: &str,
+    scope_id: impl Into<String>,
+    token: impl Into<String>,
+    expected_directory_identity: &DirectoryIdentity,
+) -> Result<()> {
+    let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
+        &parent.kio,
+        parent.control(),
+    )?;
     validate_live_chain(parent)?;
     validate_basename(basename)?;
     let (scope_id, token) = (scope_id.into(), token.into());
@@ -683,7 +811,26 @@ pub fn compare_and_remove_child_enrollment(
     basename: &str,
     expected: &ChildEnrollment,
 ) -> Result<bool> {
-    let _lock = crate::scope::acquire_retained_store_lock(&parent.kio)?;
+    compare_and_remove_child_enrollment_in_session(
+        &crate::scope::LockSession::default(),
+        parent,
+        basename,
+        expected,
+    )
+}
+
+pub fn compare_and_remove_child_enrollment_in_session(
+    session: &crate::scope::LockSession,
+
+    parent: &ManagementBinding,
+    basename: &str,
+    expected: &ChildEnrollment,
+) -> Result<bool> {
+    let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
+        &parent.kio,
+        parent.control(),
+    )?;
     validate_live_chain(parent)?;
     validate_basename(basename)?;
     validate_id(&expected.scope_id, "child scope_id")?;
@@ -702,7 +849,19 @@ pub fn compare_and_remove_child_enrollment(
     }
 }
 pub fn revoke_child(parent: &ManagementBinding, basename: &str) -> Result<bool> {
-    let _lock = crate::scope::acquire_retained_store_lock(&parent.kio)?;
+    revoke_child_in_session(&crate::scope::LockSession::default(), parent, basename)
+}
+
+pub fn revoke_child_in_session(
+    session: &crate::scope::LockSession,
+    parent: &ManagementBinding,
+    basename: &str,
+) -> Result<bool> {
+    let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
+        &parent.kio,
+        parent.control(),
+    )?;
     validate_live_chain(parent)?;
     validate_basename(basename)?;
     let mut r = read_record(parent)?;
@@ -718,7 +877,28 @@ pub fn initialize_child(
     scope_id: impl Into<String>,
     token: impl Into<String>,
 ) -> Result<ManagementRecord> {
-    let _lock = crate::scope::acquire_retained_store_lock(&parent.kio)?;
+    initialize_child_in_session(
+        &crate::scope::LockSession::default(),
+        parent,
+        child,
+        scope_id,
+        token,
+    )
+}
+
+pub fn initialize_child_in_session(
+    session: &crate::scope::LockSession,
+
+    parent: &ManagementBinding,
+    child: &ManagementBinding,
+    scope_id: impl Into<String>,
+    token: impl Into<String>,
+) -> Result<ManagementRecord> {
+    let _lock = crate::scope::locks::acquire_retained_store_lock_with_control(
+        session,
+        &parent.kio,
+        parent.control(),
+    )?;
     validate_live_chain(parent)?;
     child.recheck()?;
     let name = child_name(parent, child)?;
@@ -877,7 +1057,7 @@ pub fn validate_live_chain(target: &ManagementBinding) -> Result<ValidatedManage
                     .canonical_root
                     .parent()
                     .ok_or_else(|| err("child has no physical parent"))?;
-                let parent = ManagementBinding::bind(path)?;
+                let parent = ManagementBinding::bind_with_control(path, current.control().clone())?;
                 if !same_volume(parent.directory_identity(), current.directory_identity()) {
                     return Err(err("parent and child are on different filesystem volumes"));
                 }

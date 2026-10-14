@@ -1,18 +1,18 @@
 use super::gc_retirement::GC_RETIRE_SENTINEL;
-use crate::cas::MAX_TREE_OBJECT_BYTES;
+use crate::cas::{CasReadAccess, MAX_TREE_OBJECT_BYTES};
 use crate::error::Result;
 use crate::gc::{
     FileObservation, GcInProgressMarker, SnapshotExchangeAuthority, corrupt,
-    has_pending_marker_exchange, is_io_not_found, read_regular_observed,
-    reject_pending_snapshot_state_exchange,
+    has_pending_marker_exchange, is_io_not_found, reject_pending_snapshot_state_exchange,
 };
 use std::fs::File;
 use std::path::{Path, PathBuf};
 pub(crate) fn recover_marker(
     kio: &File,
+    control: &crate::control::ControlHandle,
     _validate_marker: impl Fn(Option<GcInProgressMarker>, GcInProgressMarker) -> Result<()>,
 ) -> Result<()> {
-    if has_pending_marker_exchange(kio)? {
+    if has_pending_marker_exchange(kio, control)? {
         return Err(corrupt(
             "Windows GC marker exchange cannot recover on this platform",
         ));
@@ -21,6 +21,7 @@ pub(crate) fn recover_marker(
 }
 pub(crate) fn exchange_marker(
     gc: &File,
+    _control: &crate::control::ControlHandle,
     _internal: &File,
     markers: &File,
     marker: &GcInProgressMarker,
@@ -37,6 +38,7 @@ pub(crate) fn exchange_marker(
 }
 pub(crate) fn replace_snapshot_state<D, R>(
     kio: &File,
+    _control: &crate::control::ControlHandle,
     temporary: &str,
     bytes: &[u8],
     expected: &FileObservation,
@@ -53,25 +55,34 @@ where
         temporary,
         bytes,
         expected,
+        _control,
     )
 }
 pub(crate) fn recover_snapshot_state(
     kio: &File,
+    control: &crate::control::ControlHandle,
     _derive: impl Fn() -> Result<SnapshotExchangeAuthority>,
     _admit: impl Fn() -> Result<()>,
 ) -> Result<()> {
-    reject_pending_snapshot_state_exchange(kio)
+    reject_pending_snapshot_state_exchange(kio, control)
 }
 pub(crate) fn marker_archive_presence(
+    reads: &CasReadAccess,
     archives: &File,
     archive: &str,
     captured_name: &str,
     validate_bytes: impl Fn(&[u8]) -> Result<()>,
 ) -> Result<(bool, bool)> {
     Ok(
-        match read_regular_observed(archives, archive, MAX_TREE_OBJECT_BYTES) {
+        match crate::gc::read_cas_regular_observed(reads, archives, archive, MAX_TREE_OBJECT_BYTES)
+        {
             Ok((sentinel, _)) if sentinel == GC_RETIRE_SENTINEL => {
-                match read_regular_observed(archives, captured_name, MAX_TREE_OBJECT_BYTES) {
+                match crate::gc::read_cas_regular_observed(
+                    reads,
+                    archives,
+                    captured_name,
+                    MAX_TREE_OBJECT_BYTES,
+                ) {
                     Ok((bytes, _)) => {
                         validate_bytes(&bytes)?;
                         (false, true)

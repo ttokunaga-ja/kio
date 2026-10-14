@@ -4,7 +4,11 @@ use std::path::Path;
 use std::sync::Arc;
 
 pub(crate) fn retain_bound_kio(retained: File) -> Result<Arc<File>> {
-    Ok(crate::store_dir::StoreDirectory::from_retained(retained, ".kio".into())?.root_handle())
+    super::store::validate_directory(&retained, Path::new(".kio"))?;
+    Ok(Arc::new(super::store::normalize_directory_handle(
+        retained,
+        Path::new(".kio"),
+    )?))
 }
 pub(crate) struct RepairSource<'a> {
     source: File,
@@ -43,9 +47,9 @@ pub(crate) fn same_bound_directory_native(current: &File, retained: &File) -> Re
         == super::cas_identity::directory_handle_identity(retained))
 }
 pub(crate) fn normalize_bound_child(directory: File, leaf: &str) -> Result<File> {
-    let retained = crate::store_dir::StoreDirectory::from_retained(directory, leaf.into())?;
+    super::store::validate_directory(&directory, Path::new(leaf))?;
+    let retained = super::store::normalize_directory_handle(directory, Path::new(leaf))?;
     retained
-        .root_handle()
         .try_clone()
         .map_err(|error| KioError::io(error.to_string(), leaf))
 }

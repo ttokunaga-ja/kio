@@ -47,14 +47,17 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter, types::Value};
+#[cfg(test)]
+use rusqlite::Connection;
+use rusqlite::{OpenFlags, OptionalExtension, params, params_from_iter, types::Value};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::Result;
 use crate::embedding_store::{EmbeddingProfileSummary, f32_from_le_bytes, f32_to_le_bytes};
 use crate::platform::{
-    BoundCache, bind_cache, open_bound_cache_connection, recreate_cache, validate_bound_cache_file,
+    BoundCache, BoundSqliteConnection, bind_cache, open_bound_cache_connection, recreate_cache,
+    validate_bound_cache_file,
 };
 
 /// One committed chunk as the collection sees it.
@@ -435,7 +438,7 @@ fn sqlite_sidecar(path: &Path, suffix: &str) -> std::path::PathBuf {
 }
 
 pub struct Aggregator {
-    conn: Connection,
+    conn: BoundSqliteConnection,
     // Retain the directory and leaf capabilities for the lifetime of SQLite.
     // Linux opens the final leaf through the retained parent descriptor;
     // other Unix platforms use `/dev/fd/N`. On Windows this denies
@@ -452,7 +455,14 @@ impl Aggregator {
     /// tokenizer mismatch would make the projection and its candidate query
     /// disagree about what the user asked for.
     pub fn open(path: &Path) -> Result<Self> {
-        let cache = bind_cache(path, true)?;
+        Self::open_with_control(path, &kio_core::control::ControlHandle::default())
+    }
+
+    pub fn open_with_control(
+        path: &Path,
+        control: &kio_core::control::ControlHandle,
+    ) -> Result<Self> {
+        let cache = bind_cache(path, true, control)?;
         Self::open_bound(cache)
     }
 
@@ -613,7 +623,14 @@ impl Aggregator {
     /// never turn discovery of an incompatible cache into a write.  Callers
     /// invoke it only under the user-authorized device repair operation.
     pub fn recreate(path: &Path) -> Result<Self> {
-        Self::open_bound(recreate_cache(path)?)
+        Self::recreate_with_control(path, &kio_core::control::ControlHandle::default())
+    }
+
+    pub fn recreate_with_control(
+        path: &Path,
+        control: &kio_core::control::ControlHandle,
+    ) -> Result<Self> {
+        Self::open_bound(recreate_cache(path, control)?)
     }
 
     /// Validate an existing replica before opening it for writing.

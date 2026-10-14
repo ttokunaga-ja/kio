@@ -13,7 +13,7 @@ use std::{
 use kio_core::{
     scope::Repository,
     store_dir::{AtomicWorkspaceState, StoreDirectory},
-    test_control::{DebugTestControl, install_scoped},
+    test_control::DebugTestControl,
 };
 use tempfile::TempDir;
 
@@ -96,8 +96,9 @@ fn tag_delete_crash_child() {
         return;
     }
     let root = PathBuf::from(std::env::var_os(ROOT).expect("fixture root"));
-    let repo = Repository::open_for_recovery(&root).expect("retained repository");
-    let _test_control = install_scoped(DebugTestControl::from_env());
+    let control = kio_core::control::ControlHandle::new(DebugTestControl::from_env());
+    let repo =
+        Repository::open_for_recovery_with_control(&root, control).expect("retained repository");
     repo.delete_tag("gone").expect("delete tag");
 }
 

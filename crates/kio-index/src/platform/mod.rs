@@ -61,9 +61,7 @@ mod windows_cache;
 #[cfg(target_os = "linux")]
 pub(crate) use linux_cache::open_bound_cache_connection;
 #[cfg(target_os = "linux")]
-use linux_cache::{
-    bind_cache_parent, bound_cache_x_open, cache_internal_name_allowed, open_or_create_cache_parent,
-};
+use linux_cache::{bind_cache_parent, open_or_create_cache_parent};
 #[cfg(target_os = "macos")]
 pub(crate) use macos_cache::open_bound_cache_connection;
 #[cfg(target_os = "macos")]
@@ -97,7 +95,7 @@ mod linux_source_vfs;
 #[cfg(target_os = "macos")]
 #[path = "macos/source_vfs.rs"]
 mod macos_source_vfs;
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 #[path = "unix/source_vfs.rs"]
 mod unix_source_vfs;
 #[cfg(windows)]
@@ -143,3 +141,11 @@ pub(crate) use windows_source::{
     open_gc_source_copy, remove_stale_gc_index_file, source_file_identity, source_file_state,
     sync_bound_gc_directory, validate_bound_source_file,
 };
+
+#[path = "../bound_sqlite.rs"]
+mod bound_sqlite;
+pub(crate) use bound_sqlite::BoundSqliteConnection;
+
+#[cfg(target_os = "linux")]
+#[path = "linux/bound_sqlite.rs"]
+mod linux_bound_sqlite;

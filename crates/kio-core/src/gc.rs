@@ -15,17 +15,33 @@ use crate::platform::{
 
 use crate::platform::gc_verify_retained_receipt_observation as verify_retained_receipt_observation;
 
+mod construction;
+pub use construction::{ensure_no_active_sweep_with_control, read_active_marker_with_control};
+mod control;
+pub use control::{
+    ensure_no_active_sweep, read_active_marker, validate_final_shallow_tree,
+    validated_final_shallow_receipts,
+};
 pub mod exchange;
+mod observed_read;
+use observed_read::{
+    read_accounted_observed, read_cas_accounted_observed, read_required_accounted_observed,
+};
+pub(crate) use observed_read::{read_cas_regular_observed, read_regular_observed};
 mod unreachable_inventory;
 #[cfg(all(test, windows))]
 #[path = "gc/windows_snapshot_state_tests.rs"]
 mod windows_snapshot_state;
 
-pub use unreachable_inventory::{UnreachableInventoryLimits, UnreachableObjectInventory};
+pub use unreachable_inventory::{
+    InventoryObject, InventoryStats, ShallowBoundary, UnreachableInventoryLimits,
+    UnreachableInventoryPassStats, UnreachableInventoryReport, UnreachableInventorySummary,
+    UnreachableObjectInventory,
+};
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Component, Path, PathBuf};
 
 use cap_primitives::{ambient_authority, fs as cap_fs};
@@ -34,17 +50,16 @@ use serde_json::json;
 
 use crate::ExitCode;
 use crate::cas::{
-    MAX_COMMIT_OBJECT_BYTES, MAX_RAW_OBJECT_BYTES, MAX_TREE_OBJECT_BYTES, canonical_json_bytes,
-    hash_bytes, is_hash,
+    CasReadAccess, MAX_COMMIT_OBJECT_BYTES, MAX_RAW_OBJECT_BYTES, MAX_TREE_OBJECT_BYTES,
+    canonical_json_bytes, hash_bytes, is_hash,
 };
 use crate::dag::{CommitObject, CommitType, MAX_TREE_ENTRIES, TreeObject};
 use crate::error::{KioError, Result};
 use crate::schema::{SchemaKind, validate_json_schema};
-use crate::scope::acquire_bound_reentrant_store_lock;
 use crate::scope::{
     BoundReentrantStoreLock, BoundStoreLock, KIO_FORMAT_VERSION, Repository,
-    acquire_bound_store_lock, enforce_scope_config_semantics, format_utc_seconds,
-    parse_utc_seconds, reject_pending_managed_restore,
+    enforce_scope_config_semantics, format_utc_seconds, parse_utc_seconds,
+    reject_pending_managed_restore,
 };
 use crate::store_dir::StoreDirectory;
 
@@ -479,13 +494,12 @@ fn read_shallow_receipts_bound(kio: &std::fs::File) -> Result<BTreeMap<String, S
     Ok(result)
 }
 
-pub fn read_active_marker(kio_dir: &Path) -> Result<Option<GcInProgressMarker>> {
-    let kio = open_bound_absolute(&absolute_lexical_path(kio_dir)?)?;
-    read_active_marker_bound(&kio)
-}
-fn read_active_marker_bound(kio: &std::fs::File) -> Result<Option<GcInProgressMarker>> {
-    reject_pending_snapshot_state_exchange(kio)?;
-    if has_pending_marker_exchange(kio)? {
+fn read_active_marker_bound(
+    kio: &std::fs::File,
+    control: &crate::control::ControlHandle,
+) -> Result<Option<GcInProgressMarker>> {
+    reject_pending_snapshot_state_exchange(kio, control)?;
+    if has_pending_marker_exchange(kio, control)? {
         return Err(corrupt(
             "pending GC marker exchange requires locked recovery",
         ));
@@ -493,7 +507,10 @@ fn read_active_marker_bound(kio: &std::fs::File) -> Result<Option<GcInProgressMa
     read_marker_without_pending_check(kio)
 }
 
-pub(crate) fn has_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<bool> {
+pub(crate) fn has_pending_snapshot_state_exchange(
+    kio: &std::fs::File,
+    control: &crate::control::ControlHandle,
+) -> Result<bool> {
     let mut parent = kio
         .try_clone()
         .map_err(|e| ioerr(e, "snapshot state exchange"))?;
@@ -503,12 +520,19 @@ pub(crate) fn has_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result
         };
         parent = child;
     }
-    let owner = StoreDirectory::from_retained(parent, PathBuf::from("<snapshot state exchange>"))?;
+    let owner = StoreDirectory::from_retained_with_control(
+        parent,
+        PathBuf::from("<snapshot state exchange>"),
+        control.clone(),
+    )?;
     exchange::inspect_pending(&owner)
 }
 
-pub(crate) fn reject_pending_snapshot_state_exchange(kio: &std::fs::File) -> Result<()> {
-    if has_pending_snapshot_state_exchange(kio)? {
+pub(crate) fn reject_pending_snapshot_state_exchange(
+    kio: &std::fs::File,
+    control: &crate::control::ControlHandle,
+) -> Result<()> {
+    if has_pending_snapshot_state_exchange(kio, control)? {
         return Err(corrupt(
             "pending snapshot auto state exchange requires locked scheduler recovery",
         ));
@@ -516,7 +540,10 @@ pub(crate) fn reject_pending_snapshot_state_exchange(kio: &std::fs::File) -> Res
     Ok(())
 }
 
-pub(crate) fn has_pending_marker_exchange(kio: &std::fs::File) -> Result<bool> {
+pub(crate) fn has_pending_marker_exchange(
+    kio: &std::fs::File,
+    control: &crate::control::ControlHandle,
+) -> Result<bool> {
     let mut parent = kio
         .try_clone()
         .map_err(|e| ioerr(e, "GC marker exchange"))?;
@@ -526,7 +553,11 @@ pub(crate) fn has_pending_marker_exchange(kio: &std::fs::File) -> Result<bool> {
         };
         parent = child;
     }
-    let owner = StoreDirectory::from_retained(parent, PathBuf::from("<GC marker exchange>"))?;
+    let owner = StoreDirectory::from_retained_with_control(
+        parent,
+        PathBuf::from("<GC marker exchange>"),
+        control.clone(),
+    )?;
     exchange::inspect_pending(&owner)
 }
 
@@ -542,17 +573,13 @@ fn read_marker_without_pending_check(kio: &std::fs::File) -> Result<Option<GcInP
     GcInProgressMarker::parse_canonical(&bytes).map(Some)
 }
 
-pub fn ensure_no_active_sweep(kio_dir: &Path) -> Result<()> {
-    if let Some(marker) = read_active_marker(kio_dir)? {
-        return Err(active_sweep_error(&marker));
-    }
-    Ok(())
-}
-
 /// Retained-authority counterpart for repository and scheduler writers which
 /// already own the exact `.kio` directory and must not reopen its pathname.
-pub(crate) fn ensure_no_active_sweep_bound(kio: &std::fs::File) -> Result<()> {
-    if let Some(marker) = read_active_marker_bound(kio)? {
+pub(crate) fn ensure_no_active_sweep_bound(
+    kio: &std::fs::File,
+    control: &crate::control::ControlHandle,
+) -> Result<()> {
+    if let Some(marker) = read_active_marker_bound(kio, control)? {
         return Err(active_sweep_error(&marker));
     }
     Ok(())
@@ -574,7 +601,10 @@ fn active_sweep_error(marker: &GcInProgressMarker) -> KioError {
 /// only when every sharer has its own exact final receipt.  Keeping this as one
 /// inventory prevents callers that need all receipts from multiplying the
 /// bounded commit walk by the number of receipts.
-pub fn validated_final_shallow_receipts(kio_dir: &Path) -> Result<BTreeMap<String, String>> {
+pub fn validated_final_shallow_receipts_with_control(
+    kio_dir: &Path,
+    control: &crate::control::ControlHandle,
+) -> Result<BTreeMap<String, String>> {
     // Bind the supplied `.kio` spelling before any canonical diagnostic
     // lookup.  This rejects a symlink/reparse replacement at the public
     // boundary; `GcPlanner::bind` may subsequently canonicalize the already
@@ -583,7 +613,7 @@ pub fn validated_final_shallow_receipts(kio_dir: &Path) -> Result<BTreeMap<Strin
     let root = bound_kio_path
         .parent()
         .ok_or_else(|| corrupt("Kio directory has no scope root"))?;
-    let planner = GcPlanner::bind(root.to_path_buf())?;
+    let planner = GcPlanner::bind_with_control(root.to_path_buf(), control.clone())?;
     let supplied_kio = open_bound_absolute(&bound_kio_path)?;
     if id_file(&supplied_kio)? != id_file(&planner.kio)? {
         return Err(corrupt(
@@ -594,6 +624,7 @@ pub fn validated_final_shallow_receipts(kio_dir: &Path) -> Result<BTreeMap<Strin
 }
 
 fn validated_final_shallow_receipts_bound(planner: &GcPlanner) -> Result<BTreeMap<String, String>> {
+    planner.reads.charge(0)?;
     let root_id = id_file(&planner.scope)?;
     let kio_id = id_file(&planner.kio)?;
     planner.require_layout()?;
@@ -640,7 +671,7 @@ fn inventory_final_shallow_receipts(planner: &GcPlanner) -> Result<FinalShallowI
     let mut stats = GcPlanStats::default();
     let mut observations = BTreeMap::new();
     observe_directory(&planner.kio, "dir:.kio", &mut observations)?;
-    if let Some(marker) = read_active_marker_bound(&planner.kio)? {
+    if let Some(marker) = read_active_marker_bound(&planner.kio, &planner.control)? {
         return Err(KioError::new(
             "KIO-E-GC-SWEEP-ACTIVE-001",
             "a GC shallow sweep is active; resume it with kio gc --yes",
@@ -702,7 +733,12 @@ fn inventory_final_shallow_receipts(planner: &GcPlanner) -> Result<FinalShallowI
                             format!("dir:objects/trees/{}/{}", &raw[..2], &raw[2..4]),
                             &mut observations,
                         )?;
-                        match read_regular_observed(&second, raw, MAX_TREE_OBJECT_BYTES) {
+                        match read_cas_regular_observed(
+                            &planner.reads,
+                            &second,
+                            raw,
+                            MAX_TREE_OBJECT_BYTES,
+                        ) {
                             Ok((_, observation)) => {
                                 insert_observation(
                                     &mut observations,
@@ -733,12 +769,24 @@ fn inventory_final_shallow_receipts(planner: &GcPlanner) -> Result<FinalShallowI
 /// Validate one exact member of [`validated_final_shallow_receipts`].
 ///
 /// Call this only after the tree read has returned STORE-NOT-FOUND.
-pub fn validate_final_shallow_tree(
+pub fn validate_final_shallow_tree_with_control(
     kio_dir: &Path,
     commit_hash: &str,
     tree_hash: &str,
+    control: &crate::control::ControlHandle,
 ) -> Result<()> {
-    let receipts = validated_final_shallow_receipts(kio_dir)?;
+    validate_final_shallow_receipt(
+        &validated_final_shallow_receipts_with_control(kio_dir, control)?,
+        commit_hash,
+        tree_hash,
+    )
+}
+
+fn validate_final_shallow_receipt(
+    receipts: &BTreeMap<String, String>,
+    commit_hash: &str,
+    tree_hash: &str,
+) -> Result<()> {
     match receipts.get(commit_hash) {
         Some(receipt_tree) if receipt_tree == tree_hash => Ok(()),
         Some(receipt_tree) => Err(KioError::new(
@@ -765,11 +813,12 @@ pub fn validate_final_shallow_tree(
 /// ambient victim path, making accidental commit/raw/index deletion impossible.
 #[derive(Debug)]
 pub struct GcSweepSession {
+    reads: CasReadAccess,
+    lock_session: crate::scope::LockSession,
     root: PathBuf,
     scope: std::fs::File,
     kio: std::fs::File,
-    #[cfg(debug_assertions)]
-    test_control: crate::test_control::CoreTestControl,
+    control: crate::control::ControlHandle,
 }
 
 /// How the CLI may invoke bounded automatic shallow GC.
@@ -954,77 +1003,22 @@ impl GcSweepSession {
     /// capability.  Public mutation entry points call this after their caller
     /// holds the bound writer lock, closing the bind-to-first-write race.
     fn ensure_no_pending_managed_restore_under_lock(&self) -> Result<()> {
-        let directory = StoreDirectory::from_retained(
+        let directory = StoreDirectory::from_retained_with_control(
             self.kio
                 .try_clone()
                 .map_err(|error| ioerr(error, &self.root))?,
             self.root.join(".kio"),
+            self.control.clone(),
         )?;
         reject_pending_managed_restore(&directory)
-    }
-
-    pub fn bind(root: impl Into<PathBuf>) -> Result<Self> {
-        let root = root.into();
-        if !root.is_absolute() {
-            return Err(KioError::invalid_usage(
-                "GC sweep scope root must be absolute",
-            ));
-        }
-        let scope = open_bound_absolute(&root)?;
-        // A genuinely absent `.kio` is ordinary CLI misuse, not store
-        // corruption.  Keep every other no-follow/open failure observable so
-        // a symlink, reparse point, or non-directory can never masquerade as
-        // an uninitialized scope.
-        let kio = open_optional_dir(&scope, ".kio")?
-            .ok_or_else(|| KioError::invalid_usage("current directory is not a Kio scope"))?;
-        let canonical = root.canonicalize().map_err(|e| ioerr(e, &root))?;
-        if id_file(&scope)? != id_path(&canonical)? || id_file(&kio)? != id_child(&scope, ".kio")? {
-            return Err(corrupt("scope changed while binding GC sweep"));
-        }
-        let kio_directory = StoreDirectory::from_retained(
-            kio.try_clone().map_err(|error| ioerr(error, &canonical))?,
-            canonical.join(".kio"),
-        )?;
-        reject_pending_managed_restore(&kio_directory)?;
-        Ok(Self {
-            root: canonical,
-            scope,
-            kio,
-            #[cfg(debug_assertions)]
-            // Binding a sweep is a library operation root. Capture once here so
-            // every later checkpoint observes the same controls, even when no
-            // CLI composition root installed a snapshot.
-            test_control: crate::test_control::capture_for_operation().core,
-        })
-    }
-    /// Bind an automatic sweep to the exact repository capability already
-    /// used by an internal child index. Ordinary repositories have no retained
-    /// handles and use the same public no-follow bind as [`Self::bind`].
-    pub fn bind_repository(repository: &Repository) -> Result<Self> {
-        let session = Self::bind(repository.canonical_root().to_path_buf())?;
-        match (
-            repository.bound_root_handle(),
-            repository.bound_kio_handle(),
-        ) {
-            (Some(scope), Some(kio)) => {
-                if id_file(&session.scope)? != id_file(scope)?
-                    || id_file(&session.kio)? != id_file(kio)?
-                {
-                    return Err(corrupt(
-                        "automatic GC scope differs from bound child repository",
-                    ));
-                }
-            }
-            (None, None) => {}
-            _ => return Err(corrupt("incomplete bound child repository capability")),
-        }
-        Ok(session)
     }
 
     fn inject_gc_tree_fault(&self, _point: GcTreeFaultPoint) -> Result<()> {
         #[cfg(debug_assertions)]
         if self
-            .test_control
+            .control
+            .debug()
+            .core
             .gc_fault
             .known()
             .is_some_and(|fault| _point.matches(*fault))
@@ -1041,13 +1035,21 @@ impl GcSweepSession {
 
     fn wait_at_gc_tree_quarantine_barrier(&self) {
         #[cfg(debug_assertions)]
-        wait_at_gc_test_barrier(self.test_control.gc_tree_quarantine_ready.as_deref());
+        wait_at_gc_test_barrier(
+            self.control
+                .debug()
+                .core
+                .gc_tree_quarantine_ready
+                .as_deref(),
+        );
     }
 
     fn wait_at_gc_before_state_write_barrier(&self) {
         #[cfg(debug_assertions)]
         wait_at_gc_test_barrier(
-            self.test_control
+            self.control
+                .debug()
+                .core
                 .snapshot_before_state_write_ready
                 .as_deref(),
         );
@@ -1055,22 +1057,22 @@ impl GcSweepSession {
 
     fn wait_at_gc_pre_quarantine_barrier(&self) {
         #[cfg(debug_assertions)]
-        wait_at_gc_test_barrier(self.test_control.gc_pre_quarantine_ready.as_deref());
+        wait_at_gc_test_barrier(self.control.debug().core.gc_pre_quarantine_ready.as_deref());
     }
 
     pub fn read_marker(&self) -> Result<Option<GcInProgressMarker>> {
-        read_active_marker_bound(&self.kio)
+        read_active_marker_bound(&self.kio, &self.control)
     }
     pub fn has_pending_marker_exchange(&self) -> Result<bool> {
         self.recheck_binding()?;
-        has_pending_marker_exchange(&self.kio)
+        has_pending_marker_exchange(&self.kio, &self.control)
     }
 
     /// Read-only query for coordinators which must enter locked recovery even
     /// when a pending exchange temporarily removed the public marker.
     pub fn has_active_or_pending_marker(&self) -> Result<bool> {
         self.recheck_binding()?;
-        if has_pending_marker_exchange(&self.kio)? {
+        if has_pending_marker_exchange(&self.kio, &self.control)? {
             return Ok(true);
         }
         Ok(self.read_marker()?.is_some())
@@ -1080,31 +1082,35 @@ impl GcSweepSession {
     /// lock. Read-only callers must use `has_active_or_pending_marker` instead.
     pub fn recover_pending_marker_under_lock(&self) -> Result<()> {
         self.recheck_binding()?;
-        reject_pending_snapshot_state_exchange(&self.kio)?;
+        reject_pending_snapshot_state_exchange(&self.kio, &self.control)?;
         self.ensure_no_pending_managed_restore_under_lock()?;
-        crate::platform::recover_marker(&self.kio, |source, target| {
+        crate::platform::recover_marker(&self.kio, &self.control, |source, target| {
             self.validate_pending_marker_data(source, target)
         })
     }
 
     pub fn acquire_store_lock(&self) -> Result<BoundStoreLock> {
         self.recheck_binding()?;
-        let lock = acquire_bound_store_lock(&self.kio)?;
-        reject_pending_snapshot_state_exchange(&self.kio)?;
+        let lock = crate::scope::acquire_bound_store_lock_with_control(&self.kio, &self.control)?;
+        reject_pending_snapshot_state_exchange(&self.kio, &self.control)?;
         Ok(lock)
     }
     /// Read-only pending-state query; never treats a missing public state as fresh.
     pub fn has_pending_snapshot_auto_state_exchange(&self) -> Result<bool> {
         self.recheck_binding()?;
-        has_pending_snapshot_state_exchange(&self.kio)
+        has_pending_snapshot_state_exchange(&self.kio, &self.control)
     }
 
     /// Acquire the scheduler recovery barrier, allowing only its own pending journal.
     pub fn acquire_snapshot_auto_recovery_lock(&self) -> Result<BoundReentrantStoreLock> {
         self.recheck_binding()?;
-        let lock = acquire_bound_reentrant_store_lock(&self.kio)?;
+        let lock = crate::scope::acquire_bound_reentrant_store_lock_with_control(
+            &self.lock_session,
+            &self.kio,
+            &self.control,
+        )?;
         self.recheck_binding()?;
-        if has_pending_marker_exchange(&self.kio)? {
+        if has_pending_marker_exchange(&self.kio, &self.control)? {
             return Err(corrupt("pending GC marker blocks scheduler recovery"));
         }
         if let Some(marker) = read_marker_without_pending_check(&self.kio)? {
@@ -1121,7 +1127,7 @@ impl GcSweepSession {
         gc: &GcAutomationBinding,
     ) -> Result<()> {
         self.recheck_binding()?;
-        if has_pending_marker_exchange(&self.kio)? {
+        if has_pending_marker_exchange(&self.kio, &self.control)? {
             return Err(corrupt("pending GC marker blocks scheduler recovery"));
         }
         if let Some(marker) = read_marker_without_pending_check(&self.kio)? {
@@ -1134,6 +1140,7 @@ impl GcSweepSession {
         }
         crate::platform::recover_snapshot_state(
             &self.kio,
+            &self.control,
             || self.snapshot_exchange_authority(snapshot, gc),
             || self.snapshot_auto_state().map(|_| ()),
         )?;
@@ -1142,17 +1149,21 @@ impl GcSweepSession {
 
     /// Acquire the scheduler writer barrier relative to the retained `.kio`
     /// descriptor, then make nested [`Repository`] store-lock acquisitions
-    /// reentrant on this thread. There is deliberately no ambient fallback:
+    /// reentrant through the explicitly shared operation session. No ambient fallback:
     /// platforms that cannot prove the descriptor-relative lock boundary fail
     /// closed through the underlying bound-lock primitive.
     pub fn acquire_snapshot_auto_store_lock(&self) -> Result<BoundReentrantStoreLock> {
         self.recheck_binding()?;
-        let lock = acquire_bound_reentrant_store_lock(&self.kio)?;
+        let lock = crate::scope::acquire_bound_reentrant_store_lock_with_control(
+            &self.lock_session,
+            &self.kio,
+            &self.control,
+        )?;
         if let Err(error) = self.recheck_binding() {
             drop(lock);
             return Err(error);
         }
-        if let Err(error) = ensure_no_active_sweep_bound(&self.kio) {
+        if let Err(error) = ensure_no_active_sweep_bound(&self.kio, &self.control) {
             drop(lock);
             return Err(error);
         }
@@ -1211,7 +1222,7 @@ impl GcSweepSession {
     /// scheduled attempt.
     pub fn snapshot_auto_state(&self) -> Result<SnapshotAutoStateBinding> {
         self.recheck_binding()?;
-        reject_pending_snapshot_state_exchange(&self.kio)?;
+        reject_pending_snapshot_state_exchange(&self.kio, &self.control)?;
         let (state, observation) =
             match read_regular_observed(&self.kio, SNAPSHOT_AUTO_STATE_LEAF, MAX_METADATA) {
                 Ok((bytes, observation)) => {
@@ -1285,7 +1296,13 @@ impl GcSweepSession {
         let (_, temporary_observation) =
             read_regular_observed(&self.kio, &temporary, MAX_METADATA)?;
         if let Err(error) = self.recheck_binding() {
-            retire_snapshot_state_temporary(&self.kio, &temporary, &bytes, &temporary_observation)?;
+            retire_snapshot_state_temporary(
+                &self.kio,
+                &temporary,
+                &bytes,
+                &temporary_observation,
+                &self.control,
+            )?;
             return Err(error);
         }
         let observed_state = match self.snapshot_auto_state() {
@@ -1296,20 +1313,30 @@ impl GcSweepSession {
                     &temporary,
                     &bytes,
                     &temporary_observation,
+                    &self.control,
                 )?;
                 return Err(error);
             }
         };
         if &observed_state != expected {
-            retire_snapshot_state_temporary(&self.kio, &temporary, &bytes, &temporary_observation)?;
+            retire_snapshot_state_temporary(
+                &self.kio,
+                &temporary,
+                &bytes,
+                &temporary_observation,
+                &self.control,
+            )?;
             return Err(snapshot_auto_state_changed());
         }
         self.wait_at_gc_before_state_write_barrier();
         match expected.observation.as_ref() {
             None => {
-                if let Err(error) =
-                    rename_snapshot_state_noreplace(&self.kio, &temporary, SNAPSHOT_AUTO_STATE_LEAF)
-                {
+                if let Err(error) = rename_snapshot_state_noreplace(
+                    &self.kio,
+                    &temporary,
+                    SNAPSHOT_AUTO_STATE_LEAF,
+                    &self.control,
+                ) {
                     let state_changed = self
                         .snapshot_auto_state()
                         .map(|state| &state != expected)
@@ -1319,6 +1346,7 @@ impl GcSweepSession {
                         &temporary,
                         &bytes,
                         &temporary_observation,
+                        &self.control,
                     )?;
                     if state_changed {
                         return Err(snapshot_auto_state_changed());
@@ -1350,6 +1378,7 @@ impl GcSweepSession {
     ) -> Result<()> {
         crate::platform::replace_snapshot_state(
             &self.kio,
+            &self.control,
             temporary,
             bytes,
             expected,
@@ -1384,7 +1413,7 @@ impl GcSweepSession {
         if &self.snapshot_auto_state()? != expected {
             return Err(snapshot_auto_state_changed());
         }
-        cleanup_snapshot_auto_state_temporaries(&self.kio)?;
+        cleanup_snapshot_auto_state_temporaries(&self.kio, &self.control)?;
         // Cleanup has no reason to modify the public state leaf.  Re-observe
         // it anyway so a competing namespace writer cannot race the cleanup
         // precondition and leave a commit published before its checkpoint
@@ -1702,6 +1731,7 @@ impl GcSweepSession {
             &bytes,
             MAX_MARKER_BYTES,
             || self.inject_gc_tree_fault(GcTreeFaultPoint::MarkerStageFsync),
+            &self.control,
         )?;
 
         sync_bound_directory(&gc, "in_progress")?;
@@ -1746,6 +1776,7 @@ impl GcSweepSession {
         let markers = ensure_child_dir(&internal, "markers")?;
         crate::platform::exchange_marker(
             &gc,
+            &self.control,
             &internal,
             &markers,
             marker,
@@ -1817,6 +1848,7 @@ impl GcSweepSession {
                     &bytes,
                     MAX_METADATA,
                     || self.inject_gc_tree_fault(GcTreeFaultPoint::ReceiptStageFsync),
+                    &self.control,
                 )?;
 
                 sync_bound_directory(&shallowed, leaf)?;
@@ -1937,6 +1969,7 @@ impl GcSweepSession {
                 self.recheck_tree_receipts(marker, tree_hash)
             },
             || self.inject_gc_tree_fault(GcTreeFaultPoint::TreeRetirementCapture),
+            &self.control,
         )
     }
 
@@ -1950,7 +1983,7 @@ impl GcSweepSession {
         let gc = open_required_dir(&self.kio, "gc", "GC directory is missing")?;
         let internal = ensure_child_dir(&gc, "internal")?;
         let markers = ensure_child_dir(&internal, "markers")?;
-        remove_completed_marker(&gc, &markers, expected, &observation)
+        remove_completed_marker(&gc, &markers, expected, &observation, &self.control)
     }
 
     /// Check that the caller's public scope pathname still names exactly the
@@ -1968,11 +2001,21 @@ impl GcSweepSession {
     }
     /// Validate final shallow receipts through this retained scope capability.
     pub fn validated_final_shallow_receipts(&self) -> Result<BTreeMap<String, String>> {
+        self.reads.charge(0)?;
         self.recheck_binding()?;
         validated_final_shallow_receipts_bound(&self.bound_planner()?)
     }
+    pub fn validate_final_shallow_tree(&self, commit_hash: &str, tree_hash: &str) -> Result<()> {
+        validate_final_shallow_receipt(
+            &self.validated_final_shallow_receipts()?,
+            commit_hash,
+            tree_hash,
+        )
+    }
     fn bound_planner(&self) -> Result<GcPlanner> {
         Ok(GcPlanner {
+            reads: self.reads.clone(),
+            control: self.control.clone(),
             root: self.root.clone(),
             scope: self.scope.try_clone().map_err(|e| ioerr(e, "scope"))?,
             kio: self.kio.try_clone().map_err(|e| ioerr(e, "kio"))?,
@@ -1989,7 +2032,7 @@ impl GcSweepSession {
         }
     }
     fn read_marker_observed(&self) -> Result<(GcInProgressMarker, FileObservation)> {
-        if has_pending_marker_exchange(&self.kio)? {
+        if has_pending_marker_exchange(&self.kio, &self.control)? {
             return Err(corrupt(
                 "pending GC marker exchange requires locked recovery",
             ));
@@ -2008,6 +2051,7 @@ impl GcSweepSession {
         Ok(observed)
     }
     fn marker_tree_presence(&self, marker: &GcInProgressMarker) -> Result<(bool, bool)> {
+        self.reads.charge(0)?;
         let trees = open_path(&self.kio, "objects/trees")?;
         let mut any_missing = false;
         let mut all_missing = true;
@@ -2020,7 +2064,12 @@ impl GcSweepSession {
                 None => false,
                 Some(a) => match open_optional_dir(&a, &raw[2..4])? {
                     None => false,
-                    Some(dir) => match read_regular_observed(&dir, raw, MAX_TREE_OBJECT_BYTES) {
+                    Some(dir) => match read_cas_regular_observed(
+                        &self.reads,
+                        &dir,
+                        raw,
+                        MAX_TREE_OBJECT_BYTES,
+                    ) {
                         Ok((bytes, _)) => {
                             self.validate_committed_tree_bytes(marker, tree_hash, &bytes)?;
                             true
@@ -2046,6 +2095,7 @@ impl GcSweepSession {
                 };
                 match archives.as_ref() {
                     Some(archives) => crate::platform::marker_archive_presence(
+                        &self.reads,
                         archives,
                         &archive,
                         &format!("{}-{raw}-captured", marker.sweep_id),
@@ -2261,8 +2311,12 @@ impl SnapshotAutoBinding {
 impl SnapshotAutoStateBinding {
     /// Confirm that the checkpoint just published still names the exact
     /// durable state leaf before a scheduled ref can advance.
-    pub(crate) fn recheck(&self, kio: &std::fs::File) -> Result<()> {
-        reject_pending_snapshot_state_exchange(kio)?;
+    pub(crate) fn recheck(
+        &self,
+        kio: &std::fs::File,
+        control: &crate::control::ControlHandle,
+    ) -> Result<()> {
+        reject_pending_snapshot_state_exchange(kio, control)?;
         let actual = match read_regular_observed(kio, SNAPSHOT_AUTO_STATE_LEAF, MAX_METADATA) {
             Ok((bytes, observation)) => Some((parse_snapshot_auto_state(&bytes)?, observation)),
             Err(error) if is_io_not_found(&error) => None,
@@ -2449,8 +2503,11 @@ pub(crate) fn create_new_bound(
 /// grammar are deliberately ignored; a name in the namespace which does not
 /// conform is evidence of interference and stops publication without
 /// deleting anything.
-fn cleanup_snapshot_auto_state_temporaries(dir: &std::fs::File) -> Result<()> {
-    reject_pending_snapshot_state_exchange(dir)?;
+fn cleanup_snapshot_auto_state_temporaries(
+    dir: &std::fs::File,
+    control: &crate::control::ControlHandle,
+) -> Result<()> {
+    reject_pending_snapshot_state_exchange(dir, control)?;
     let mut temporaries = Vec::new();
     for entry in cap_fs::read_base_dir(dir).map_err(|error| ioerr(error, "directory"))? {
         let entry = entry.map_err(|error| ioerr(error, "directory"))?;
@@ -2476,7 +2533,7 @@ fn cleanup_snapshot_auto_state_temporaries(dir: &std::fs::File) -> Result<()> {
     for temporary in temporaries {
         let (bytes, observation) = read_regular_observed(dir, &temporary, MAX_METADATA)?;
         parse_snapshot_auto_state(&bytes)?;
-        retire_snapshot_state_temporary(dir, &temporary, &bytes, &observation)?;
+        retire_snapshot_state_temporary(dir, &temporary, &bytes, &observation, control)?;
     }
     // The individual retirement operation syncs the directory, including the
     // no-op case this makes the cleanup completion boundary explicit.
@@ -2661,6 +2718,8 @@ impl GcPlan {
 
 #[derive(Debug)]
 pub struct GcPlanner {
+    reads: CasReadAccess,
+    control: crate::control::ControlHandle,
     root: PathBuf,
     scope: std::fs::File,
     kio: std::fs::File,
@@ -2678,42 +2737,12 @@ struct TruthSnapshot {
     observations: BTreeMap<String, FileObservation>,
 }
 impl GcPlanner {
-    pub fn bind_current() -> Result<Self> {
-        Self::bind(std::env::current_dir().map_err(|e| ioerr(e, "."))?)
-    }
-    pub fn bind(root: impl Into<PathBuf>) -> Result<Self> {
-        let requested = root.into();
-        if !requested.is_absolute() {
-            return Err(KioError::invalid_usage(
-                "GC planner scope root must be absolute",
-            ));
-        }
-        // Bind the caller's actual path component-by-component before asking
-        // the OS for a canonical diagnostic name. This rejects a symlink or
-        // reparse component instead of silently following it during bind.
-        let scope = open_bound_absolute(&requested)?;
-        let public = requested.canonicalize().map_err(|e| ioerr(e, "scope"))?;
-        if id_file(&scope)? != id_path(&public)? {
-            return Err(corrupt("scope root changed while binding"));
-        }
-        let kio = open_optional_dir(&scope, ".kio")?
-            .ok_or_else(|| KioError::invalid_usage("current directory is not a Kio scope"))?;
-        Ok(Self {
-            root: public,
-            scope,
-            kio,
-            limits: GcPlanLimits::default(),
-        })
-    }
-    pub fn with_limits(mut self, limits: GcPlanLimits) -> Self {
-        self.limits = limits;
-        self
-    }
     pub fn plan_at(&self, now: i64) -> Result<GcPlan> {
         self.plan_at_inner(now, || {})
     }
 
     fn plan_at_inner(&self, now: i64, before_stability_check: impl FnOnce()) -> Result<GcPlan> {
+        self.reads.charge(0)?;
         let root_id = id_file(&self.scope)?;
         let kio_id = id_file(&self.kio)?;
         self.require_layout()?;
@@ -2973,6 +3002,7 @@ impl GcPlanner {
         s: &mut GcPlanStats,
         observations: &mut BTreeMap<String, FileObservation>,
     ) -> Result<HashMap<String, CommitObject>> {
+        self.reads.charge(0)?;
         let b = open_path(&self.kio, "objects/commits")?;
         let mut o = HashMap::new();
         for a in names(&b, s, &self.limits, 2)? {
@@ -2989,10 +3019,9 @@ impl GcPlanner {
                     if n.len() != 64 || !hex(&n) || n[..2] != a || n[2..4] != bb {
                         return Err(corrupt("invalid commit leaf"));
                     }
-                    let x = read_accounted_observed(
-                        &bd,
-                        &n,
-                        MAX_COMMIT_OBJECT_BYTES,
+                    let x = read_cas_accounted_observed(
+                        &self.reads,
+                        (&bd, &n, MAX_COMMIT_OBJECT_BYTES),
                         s,
                         &self.limits,
                         observations,
@@ -3023,6 +3052,7 @@ impl GcPlanner {
         s: &mut GcPlanStats,
         observations: &mut BTreeMap<String, FileObservation>,
     ) -> Result<u64> {
+        self.reads.charge(0)?;
         let raw = h
             .strip_prefix("sha256:")
             .ok_or_else(|| corrupt("invalid tree hash"))?;
@@ -3033,9 +3063,8 @@ impl GcPlanner {
         let a = open_required_dir(&b, &raw[..2], "tree object fanout is missing")?;
         let d = open_required_dir(&a, &raw[2..4], "tree object fanout is missing")?;
         let x = read_required_accounted_observed(
-            &d,
-            raw,
-            MAX_TREE_OBJECT_BYTES,
+            &self.reads,
+            (&d, raw, MAX_TREE_OBJECT_BYTES),
             "tree object is missing",
             s,
             &self.limits,
@@ -3068,7 +3097,8 @@ impl GcPlanner {
         receipts: &HashMap<String, String>,
         commits: &HashMap<String, CommitObject>,
     ) -> Result<()> {
-        if read_active_marker_bound(&self.kio)?.is_some() {
+        self.reads.charge(0)?;
+        if read_active_marker_bound(&self.kio, &self.control)?.is_some() {
             return Ok(());
         }
         for (commit, tree) in receipts {
@@ -3090,7 +3120,12 @@ impl GcPlanner {
                     None => None,
                 };
                 match second.as_ref() {
-                    Some(dir) => match read_regular_observed(dir, raw, MAX_TREE_OBJECT_BYTES) {
+                    Some(dir) => match read_cas_regular_observed(
+                        &self.reads,
+                        dir,
+                        raw,
+                        MAX_TREE_OBJECT_BYTES,
+                    ) {
                         Ok(_) => true,
                         Err(error) if is_io_not_found(&error) => false,
                         Err(error) => return Err(error),
@@ -3748,62 +3783,9 @@ fn names(
     v.sort();
     Ok(v)
 }
-pub(crate) fn read_regular_observed(
-    d: &std::fs::File,
-    n: &str,
-    max: u64,
-) -> Result<(Vec<u8>, FileObservation)> {
-    let p = Path::new(n);
-    let before = cap_fs::stat(d, p, cap_fs::FollowSymlinks::No).map_err(|e| ioerr(e, n))?;
-    valid_file(&before, max)?;
-    let mut o = cap_fs::OpenOptions::new();
-    o.read(true);
-    o._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut f = cap_fs::open(d, p, &o).map_err(|e| ioerr(e, n))?;
-    let opened = cap_fs::Metadata::from_file(&f).map_err(|e| ioerr(e, n))?;
-    valid_file(&opened, max)?;
-    if !same_file_state(&before, &opened)? {
-        return Err(corrupt("store file changed while opening"));
-    }
-    let mut b = Vec::with_capacity(usize::try_from(opened.len()).map_err(|_| limit("file bytes"))?);
-    (&mut f)
-        .take(max.saturating_add(1))
-        .read_to_end(&mut b)
-        .map_err(|e| ioerr(e, n))?;
-    if b.len() as u64 > max {
-        return Err(limit("file bytes"));
-    }
-    let after = cap_fs::stat(d, p, cap_fs::FollowSymlinks::No).map_err(|e| ioerr(e, n))?;
-    valid_file(&after, max)?;
-    if b.len() as u64 != opened.len() || !same_file_state(&after, &opened)? {
-        return Err(corrupt("store file changed while read"));
-    }
-    let observation = FileObservation {
-        identity: id_meta(&opened)?,
-        state: file_state(&opened),
-        digest: hash_bytes(&b),
-    };
-    Ok((b, observation))
-}
-
 #[cfg(all(test, unix))]
 fn read_regular(d: &std::fs::File, n: &str, max: u64) -> Result<Vec<u8>> {
     read_regular_observed(d, n, max).map(|(bytes, _)| bytes)
-}
-
-fn read_accounted_observed(
-    directory: &std::fs::File,
-    name: &str,
-    max: u64,
-    stats: &mut GcPlanStats,
-    limits: &GcPlanLimits,
-    observations: &mut BTreeMap<String, FileObservation>,
-    observation_name: &str,
-) -> Result<Vec<u8>> {
-    let (bytes, observation) = read_regular_observed(directory, name, max)?;
-    account(stats, bytes.len() as u64, limits)?;
-    insert_observation(observations, observation_name, observation)?;
-    Ok(bytes)
 }
 
 fn insert_observation(
@@ -3837,30 +3819,6 @@ fn observe_directory(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn read_required_accounted_observed(
-    directory: &std::fs::File,
-    name: &str,
-    max: u64,
-    missing_message: &str,
-    stats: &mut GcPlanStats,
-    limits: &GcPlanLimits,
-    observations: &mut BTreeMap<String, FileObservation>,
-    observation_name: &str,
-) -> Result<Vec<u8>> {
-    match read_accounted_observed(
-        directory,
-        name,
-        max,
-        stats,
-        limits,
-        observations,
-        observation_name,
-    ) {
-        Err(error) if is_io_not_found(&error) => Err(corrupt(missing_message)),
-        result => result,
-    }
-}
 pub(crate) fn valid_file(m: &cap_fs::Metadata, max: u64) -> Result<()> {
     if !m.is_file() || m.len() > max {
         return Err(if m.len() > max {
@@ -4309,14 +4267,51 @@ mod tests {
     use crate::scope::Repository;
 
     #[test]
+    fn shallow_receipt_verification_charges_both_physical_commit_inventory_passes() {
+        let root = tempfile::tempdir().unwrap();
+        let repo = Repository::init(root.path()).unwrap();
+        std::fs::write(root.path().join("file.txt"), b"gc budget fixture").unwrap();
+        repo.snapshot(Some("gc budget fixture"), Some("2026-08-14T00:00:00Z"))
+            .unwrap();
+        let head = repo.head_commit_hash().unwrap().unwrap();
+        let commit_bytes = repo
+            .object_store()
+            .read_object(crate::cas::ObjectKind::Commit, &head)
+            .unwrap()
+            .bytes
+            .len() as u64;
+        let expected = 2 * commit_bytes;
+        let owner = crate::cas::VerifiedCasReadBudget::new();
+        let (receipts, consumed) = owner
+            .run(expected, |reads| {
+                let metered = repo.with_verified_reads(reads)?;
+                GcSweepSession::bind_repository(&metered)?.validated_final_shallow_receipts()
+            })
+            .unwrap();
+        assert!(receipts.is_empty());
+        assert_eq!(consumed, expected);
+        let error = owner
+            .run(expected - 1, |reads| {
+                let metered = repo.with_verified_reads(reads)?;
+                GcSweepSession::bind_repository(&metered)?.validated_final_shallow_receipts()
+            })
+            .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001");
+    }
+
+    #[test]
     fn pending_marker_exchange_blocks_readers_when_public_marker_is_missing() {
         let temp = tempfile::tempdir().unwrap();
         let owner = temp.path().join("gc/internal/marker-exchange");
         std::fs::create_dir_all(&owner).unwrap();
         std::fs::write(owner.join("intent.json"), b"incomplete intent").unwrap();
         let bound = open_bound_absolute(&std::fs::canonicalize(temp.path()).unwrap()).unwrap();
-        assert!(has_pending_marker_exchange(&bound).unwrap());
-        assert!(read_active_marker_bound(&bound).is_err());
+        assert!(
+            has_pending_marker_exchange(&bound, &crate::control::ControlHandle::default()).unwrap()
+        );
+        assert!(
+            read_active_marker_bound(&bound, &crate::control::ControlHandle::default()).is_err()
+        );
         assert!(ensure_no_active_sweep(&std::fs::canonicalize(temp.path()).unwrap()).is_err());
         assert_eq!(
             std::fs::read(owner.join("intent.json")).unwrap(),
@@ -4332,8 +4327,12 @@ mod tests {
         std::fs::create_dir_all(&owner).unwrap();
         std::fs::write(owner.join("foreign"), b"preserve").unwrap();
         let bound = open_bound_absolute(&std::fs::canonicalize(temp.path()).unwrap()).unwrap();
-        assert!(has_pending_marker_exchange(&bound).is_err());
-        assert!(read_active_marker_bound(&bound).is_err());
+        assert!(
+            has_pending_marker_exchange(&bound, &crate::control::ControlHandle::default()).is_err()
+        );
+        assert!(
+            read_active_marker_bound(&bound, &crate::control::ControlHandle::default()).is_err()
+        );
         assert_eq!(std::fs::read(owner.join("foreign")).unwrap(), b"preserve");
     }
 
@@ -4343,8 +4342,14 @@ mod tests {
         let owner = temp.path().join("gc/internal/marker-exchange");
         std::fs::create_dir_all(&owner).unwrap();
         let bound = open_bound_absolute(&std::fs::canonicalize(temp.path()).unwrap()).unwrap();
-        assert!(!has_pending_marker_exchange(&bound).unwrap());
-        assert_eq!(read_active_marker_bound(&bound).unwrap(), None);
+        assert!(
+            !has_pending_marker_exchange(&bound, &crate::control::ControlHandle::default())
+                .unwrap()
+        );
+        assert_eq!(
+            read_active_marker_bound(&bound, &crate::control::ControlHandle::default()).unwrap(),
+            None
+        );
         assert_eq!(std::fs::read_dir(owner).unwrap().count(), 0);
     }
 
@@ -4512,7 +4517,7 @@ mod tests {
         .unwrap();
         assert!(session.has_pending_snapshot_auto_state_exchange().unwrap());
         assert!(session.snapshot_auto_state().is_err());
-        assert!(ensure_no_active_sweep_bound(&session.kio).is_err());
+        assert!(ensure_no_active_sweep_bound(&session.kio, &session.control).is_err());
         assert_eq!(
             std::fs::read(owner.join("intent.json")).unwrap(),
             b"foreign pending Windows snapshot state"

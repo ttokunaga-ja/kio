@@ -1,5 +1,10 @@
 //! Step 4 destination-only export.
 
+use crate::response::mutation::{
+    ExportFailure, ExportPartial, ExportResponse, ExportSuccess, ExportedFile,
+};
+use crate::response::{CommandResponse, Completion, ResponseBody};
+use kio_core::control::ControlHandle;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -11,17 +16,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use cap_primitives::fs as cap_fs;
 use kio_core::cas::{MAX_RAW_OBJECT_BYTES, ObjectKind, ObjectStore, hash_bytes, is_hash};
 use kio_core::dag::{CommitType, TreeEntry};
-use kio_core::gc::ensure_no_active_sweep;
+use kio_core::gc::ensure_no_active_sweep_with_control;
 use kio_core::history::HistoryReader;
 use kio_core::platform::same_cap_file_identity;
 use kio_core::portable::portable_collision_key;
 use kio_core::purge::{EventKind, PurgeState, canonical_final_event};
 use kio_core::scope::Repository;
 use kio_core::{ExitCode, KioError, Result};
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::Digest;
 
-use super::{ReadBarrierCheckpoint, ScopeTarget};
 use crate::commands::ExportArgs;
 use crate::platform::{
     DestinationIdentity, configure_cap_no_follow, configure_export_temp,
@@ -30,6 +34,8 @@ use crate::platform::{
     validate_export_directory_metadata_native, validate_export_directory_native,
     validate_export_regular_metadata_native, validate_export_regular_native,
 };
+use crate::scope_access::ReadBarrierCheckpoint;
+use crate::search::scope::ScopeTarget;
 
 const MAX_POINTER_INPUT_BYTES: u64 = 1024 * 1024;
 const MAX_EXPORT_TOTAL_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -74,7 +80,10 @@ struct DestinationDir {
     handle: File,
 }
 
-pub(super) fn run(args: ExportArgs) -> Result<Value> {
+pub(super) fn run(
+    ctx: &crate::invocation::Invocation<'_>,
+    args: ExportArgs,
+) -> Result<CommandResponse> {
     if args.yes && !args.force {
         return Err(KioError::invalid_usage(
             "export --yes is valid only together with --force",
@@ -87,24 +96,30 @@ pub(super) fn run(args: ExportArgs) -> Result<Value> {
     // runs ahead of the shared (1)+(3) pair below — QB5 (step4b-contract-
     // tests-p3b.md §A): this ordering was already correct, unlike
     // open/view/evidence-verify (QB6).
-    let source = resolve_source(&args.source)?;
+    let source = resolve_source(ctx, &args.source)?;
     // A shallow sweep publishes its durable receipt before removing the tree.
     // Export must not stage bytes, prompt, or publish while that state machine
     // is active.  The helper also rejects a malformed marker rather than
     // treating it as absence.
-    ensure_no_active_sweep(&source.target.kio_dir)?;
+    ensure_no_active_sweep_with_control(&source.target.kio_dir, ctx.control)?;
     // QB5/QB6/裁定1: shared (1)+(3) preflight pair, opened as soon as the
     // source scope is known. LC57: export's checkpoint 2 (below, in
     // `publish_all`) fires per file, immediately before that file's atomic
     // rename — after the private-temp staging completes and before the
     // irreversible publish, matching the spec's fixed "expand -> recheck ->
     // publish" order.
-    let checkpoint = super::preflight_barrier_and_index(&source.target.kio_dir)?;
-    let validated_destination = validate_destination(&args.to, &source.target)?;
-    let _initial_preflight = preflight(&source, &validated_destination.path, args.force)?;
+    let checkpoint =
+        crate::scope_access::preflight_barrier_and_index(&source.target.kio_dir, ctx.control)?;
+    let validated_destination = validate_destination(ctx, &args.to, &source.target)?;
+    let _initial_preflight = preflight(
+        &source,
+        &validated_destination.path,
+        args.force,
+        ctx.control,
+    )?;
 
     if args.force && !args.yes {
-        confirm_force()?;
+        confirm_force(ctx)?;
     }
 
     let destination_dir = open_destination_dir(
@@ -119,39 +134,63 @@ pub(super) fn run(args: ExportArgs) -> Result<Value> {
     // takes store -> publication, while export takes publication only, so no
     // reverse lock order exists. Keep it across the authoritative recheck,
     // private staging, and every final publication.
-    let publication_repo = Repository::open_for_recovery(&source.target.repo_root)?;
-    let _purge_publication_lock = publication_repo.lock_purge_publication()?;
+    let publication_repo = Repository::open_recovery_in_session(
+        &source.target.repo_root,
+        ctx.control.clone(),
+        ctx.locks,
+    )?;
+    let _purge_publication_lock =
+        publication_repo.lock_purge_publication_in_session(publication_repo.lock_session())?;
     // Recheck after the only lock export takes and before any private
     // destination staging.  GC deliberately does not share this lock.
-    ensure_no_active_sweep(&source.target.kio_dir)?;
+    ensure_no_active_sweep_with_control(&source.target.kio_dir, ctx.control)?;
     // The directory may have appeared between the first preflight and creation.
     // Re-run the complete leaf check before staging any content.
-    let preflight_files = preflight_in_dir(&source, &destination_dir, args.force)?;
-    let staged = stage_all(&source, preflight_files, &destination_dir)?;
-    publish_all(&source, &destination_dir, staged, &checkpoint)
+    let preflight_files = preflight_in_dir(&source, &destination_dir, args.force, ctx.control)?;
+    let staged = stage_all(&source, preflight_files, &destination_dir, ctx.control)?;
+    let body = publish_all(ctx, &source, &destination_dir, staged, &checkpoint)?;
+    let completion = match &body {
+        ExportResponse::Exported(_) => Completion::Complete,
+        ExportResponse::Partial(_) => Completion::Partial,
+    };
+    Ok(CommandResponse {
+        body: ResponseBody::Export(body),
+        completion,
+    })
 }
 
-fn resolve_source(operand: &str) -> Result<ExportSource> {
+fn resolve_source(ctx: &crate::invocation::Invocation<'_>, operand: &str) -> Result<ExportSource> {
     if operand == "-" || operand.starts_with("kio://") {
-        return resolve_evidence_source(operand);
+        return resolve_evidence_source(ctx, operand);
     }
     if operand.trim_start().starts_with('{') {
-        return resolve_evidence_source(operand.trim());
+        return resolve_evidence_source(ctx, operand.trim());
     }
-    resolve_local_source(operand)
+    resolve_local_source(ctx, operand)
 }
 
-fn resolve_evidence_source(operand: &str) -> Result<ExportSource> {
-    let text = read_pointer_operand(operand)?;
-    let pointer = super::parse_pointer_text(&text)?;
-    let target = super::resolve_scope_target(&pointer.scope_id, pointer.scope_path.as_deref())?;
-    let repo = Repository::open(&target.repo_root)?;
-    super::validate_repo_tool_lock(&repo)?;
+fn resolve_evidence_source(
+    ctx: &crate::invocation::Invocation<'_>,
+    operand: &str,
+) -> Result<ExportSource> {
+    let text = read_pointer_operand(ctx, operand)?;
+    let pointer = crate::open_view::parse_pointer_text(&text)?;
+    let target = crate::scope_access::resolve_scope_target(
+        ctx.cwd(),
+        ctx.interaction.as_ref(),
+        &pointer.scope_id,
+        pointer.scope_path.as_deref(),
+        ctx.control,
+    )?;
+    let repo = Repository::open_in_session(&target.repo_root, ctx.control.clone(), ctx.locks)?;
+    crate::settings::validate_repo_tool_lock(&repo)?;
 
     let commit = match repo.read_commit(&pointer.commit) {
         Ok(commit) => commit,
-        Err(error) if super::is_store_not_found(&error) => {
-            return Err(super::unresolvable_commit_pointer_error(&pointer));
+        Err(error) if crate::scope_access::is_store_not_found(&error) => {
+            return Err(crate::scope_access::unresolvable_commit_pointer_error(
+                &pointer,
+            ));
         }
         Err(error) => return Err(error),
     };
@@ -161,15 +200,18 @@ fn resolve_evidence_source(operand: &str) -> Result<ExportSource> {
         .as_deref()
         .is_some_and(|tree| tree != commit.tree)
     {
-        return Err(super::invalid_pointer_identity_error(&pointer));
+        return Err(crate::scope_access::invalid_pointer_identity_error(
+            &pointer,
+        ));
     }
     let tree = match repo.read_tree(&commit.tree) {
         Ok(tree) => tree,
-        Err(error) if super::is_store_not_found(&error) => {
-            kio_core::gc::validate_final_shallow_tree(
+        Err(error) if crate::scope_access::is_store_not_found(&error) => {
+            kio_core::gc::validate_final_shallow_tree_with_control(
                 &target.kio_dir,
                 &pointer.commit,
                 &commit.tree,
+                repo.control(),
             )?;
             return Err(KioError::commit_shallow(
                 "export requires the complete evidence commit tree; the tree object is missing or shallow",
@@ -184,19 +226,19 @@ fn resolve_evidence_source(operand: &str) -> Result<ExportSource> {
     // presence is resolved FIRST so the canonical dispatch inside
     // `check_purge_state` can distinguish an ordinary `erased` absence
     // (PA48(a)) from a `retired`/unmarked absence (PA48(b)/(c), corruption).
-    let store = ObjectStore::new(&target.kio_dir);
-    let raw_present = raw_present_now(&target, &pointer.raw_hash)?;
-    check_purge_state(&target, &pointer.raw_hash, raw_present)?;
+    let store = ObjectStore::new_with_control(&target.kio_dir, ctx.control.clone());
+    let raw_present = raw_present_now(&target, &pointer.raw_hash, ctx.control)?;
+    check_purge_state(&target, &pointer.raw_hash, raw_present, ctx.control)?;
     match store.inspect_object(ObjectKind::Raw, &pointer.raw_hash) {
         Ok(_) => {}
-        Err(error) if super::is_store_not_found(&error) => {
+        Err(error) if crate::scope_access::is_store_not_found(&error) => {
             return Err(missing_live_raw_error(&target, &pointer.raw_hash));
         }
         Err(error) => return Err(error),
     }
     let chunk = match store.read_chunk(&pointer.chunk_hash) {
         Ok(chunk) => chunk,
-        Err(error) if super::is_store_not_found(&error) => {
+        Err(error) if crate::scope_access::is_store_not_found(&error) => {
             return Err(KioError::new(
                 "KIO-E-EVIDENCE-RETARGET-REQUIRED-001",
                 "chunk not materialized for this tool_profile_hash; retarget required",
@@ -211,7 +253,9 @@ fn resolve_evidence_source(operand: &str) -> Result<ExportSource> {
         Err(error) => return Err(error),
     };
     if chunk.raw_hash != pointer.raw_hash || chunk.tool_profile_hash != pointer.tool_profile_hash {
-        return Err(super::invalid_pointer_identity_error(&pointer));
+        return Err(crate::scope_access::invalid_pointer_identity_error(
+            &pointer,
+        ));
     }
     let mut matching_entries = tree.entries.iter().filter(|entry| {
         entry.raw_hash == pointer.raw_hash
@@ -223,10 +267,10 @@ fn resolve_evidence_source(operand: &str) -> Result<ExportSource> {
     let entry = match pointer.path_at_commit.as_deref() {
         Some(path) => matching_entries
             .find(|entry| entry.path == path)
-            .ok_or_else(|| super::invalid_pointer_identity_error(&pointer))?,
+            .ok_or_else(|| crate::scope_access::invalid_pointer_identity_error(&pointer))?,
         None => matching_entries
             .next()
-            .ok_or_else(|| super::invalid_pointer_identity_error(&pointer))?,
+            .ok_or_else(|| crate::scope_access::invalid_pointer_identity_error(&pointer))?,
     };
 
     Ok(ExportSource {
@@ -240,7 +284,7 @@ fn resolve_evidence_source(operand: &str) -> Result<ExportSource> {
     })
 }
 
-fn read_pointer_operand(operand: &str) -> Result<String> {
+fn read_pointer_operand(ctx: &crate::invocation::Invocation<'_>, operand: &str) -> Result<String> {
     if operand != "-" {
         if operand.len() as u64 > MAX_POINTER_INPUT_BYTES {
             return Err(KioError::invalid_usage(
@@ -250,36 +294,41 @@ fn read_pointer_operand(operand: &str) -> Result<String> {
         return Ok(operand.to_owned());
     }
 
-    let input = crate::context::read_input(MAX_POINTER_INPUT_BYTES as usize)?;
+    let input = ctx
+        .interaction
+        .read_input(MAX_POINTER_INPUT_BYTES as usize)?;
     String::from_utf8(input)
         .map(|input| input.trim().to_owned())
         .map_err(|_| KioError::invalid_usage("evidence pointer input must be UTF-8"))
 }
 
-fn resolve_local_source(operand: &str) -> Result<ExportSource> {
-    let repo = crate::open_current_recovery_repository()?;
-    super::validate_repo_tool_lock(&repo)?;
-    let target = super::scope_target(repo.root())?;
+fn resolve_local_source(
+    ctx: &crate::invocation::Invocation<'_>,
+    operand: &str,
+) -> Result<ExportSource> {
+    let repo = ctx.open_recovery_repository()?;
+    crate::settings::validate_repo_tool_lock(&repo)?;
+    let target = crate::scope_access::scope_target(repo.root(), ctx.control)?;
 
     if operand == "HEAD" {
         let commit_hash = repo
             .head_commit_hash()?
             .ok_or_else(|| export_source_not_found("HEAD"))?;
         repo.read_commit(&commit_hash).map_err(|error| {
-            if super::is_store_not_found(&error) {
+            if crate::scope_access::is_store_not_found(&error) {
                 export_source_not_found(&commit_hash)
             } else {
                 error
             }
         })?;
-        return resolve_commit_source(target, commit_hash);
+        return resolve_commit_source(target, commit_hash, ctx.control);
     }
 
     if is_hash(operand) {
-        let store = ObjectStore::new(repo.kio_dir());
+        let store = ObjectStore::new_with_control(repo.kio_dir(), ctx.control.clone());
         match store.inspect_object(ObjectKind::Commit, operand) {
-            Ok(_) => return resolve_commit_source(target, operand.to_owned()),
-            Err(error) if super::is_store_not_found(&error) => {}
+            Ok(_) => return resolve_commit_source(target, operand.to_owned(), ctx.control),
+            Err(error) if crate::scope_access::is_store_not_found(&error) => {}
             Err(error) => return Err(error),
         }
         if store.inspect_object(ObjectKind::Raw, operand).is_ok() {
@@ -291,14 +340,20 @@ fn resolve_local_source(operand: &str) -> Result<ExportSource> {
     }
 
     match repo.resolve_commit(operand) {
-        Ok(commit_hash) => resolve_commit_source(target, commit_hash),
-        Err(error) if super::is_store_not_found(&error) => resolve_path_source(target, operand),
+        Ok(commit_hash) => resolve_commit_source(target, commit_hash, ctx.control),
+        Err(error) if crate::scope_access::is_store_not_found(&error) => {
+            resolve_path_source(target, operand, ctx.control, ctx.locks)
+        }
         Err(error) => Err(error),
     }
 }
 
-fn resolve_commit_source(target: ScopeTarget, commit_hash: String) -> Result<ExportSource> {
-    let reader = HistoryReader::new(&target.kio_dir);
+fn resolve_commit_source(
+    target: ScopeTarget,
+    commit_hash: String,
+    control: &ControlHandle,
+) -> Result<ExportSource> {
+    let reader = HistoryReader::new_with_control(&target.kio_dir, control.clone());
     let snapshot = reader.snapshot(&commit_hash)?;
     reject_purged_commit(&commit_hash, snapshot.commit.commit_type)?;
     let files = snapshot
@@ -318,13 +373,18 @@ fn resolve_commit_source(target: ScopeTarget, commit_hash: String) -> Result<Exp
     })
 }
 
-fn resolve_path_source(target: ScopeTarget, path: &str) -> Result<ExportSource> {
+fn resolve_path_source(
+    target: ScopeTarget,
+    path: &str,
+    control: &ControlHandle,
+    locks: &kio_core::scope::LockSession,
+) -> Result<ExportSource> {
     validate_export_name(path, &hash_bytes(b"export-path-validation"))?;
-    let repo = Repository::open(&target.repo_root)?;
+    let repo = Repository::open_in_session(&target.repo_root, control.clone(), locks)?;
     let head = repo
         .head_commit_hash()?
         .ok_or_else(|| export_source_not_found(path))?;
-    let history = HistoryReader::new(&target.kio_dir).walk(&head)?;
+    let history = HistoryReader::new_with_control(&target.kio_dir, control.clone()).walk(&head)?;
     let binding = history
         .newest_binding_for_path(path)
         .ok_or_else(|| export_source_not_found(path))?;
@@ -364,14 +424,19 @@ fn export_source_not_found(source: &str) -> KioError {
     )
 }
 
-fn preflight(source: &ExportSource, destination: &Path, force: bool) -> Result<Vec<PreflightFile>> {
+fn preflight(
+    source: &ExportSource,
+    destination: &Path,
+    force: bool,
+    control: &ControlHandle,
+) -> Result<Vec<PreflightFile>> {
     validate_source_names(&source.files)?;
     let existing = if destination.exists() {
         scan_destination(destination)?
     } else {
         BTreeMap::new()
     };
-    let store = ObjectStore::new(&source.target.kio_dir);
+    let store = ObjectStore::new_with_control(&source.target.kio_dir, control.clone());
     let mut total_bytes = 0_u64;
     let mut verified_raws = BTreeMap::<String, u64>::new();
     let mut files = Vec::with_capacity(source.files.len());
@@ -387,11 +452,11 @@ fn preflight(source: &ExportSource, destination: &Path, force: bool) -> Result<V
                     verified_raws.insert(item.raw_hash.clone(), metadata.size_bytes);
                     (metadata.size_bytes, true)
                 }
-                Err(error) if super::is_store_not_found(&error) => (0, false),
+                Err(error) if crate::scope_access::is_store_not_found(&error) => (0, false),
                 Err(error) => return Err(error),
             },
         };
-        check_purge_state(&source.target, &item.raw_hash, raw_present)?;
+        check_purge_state(&source.target, &item.raw_hash, raw_present, control)?;
         // PA21: same-name evacuation/quarantine residue is checked before any
         // mutation, independent of `--force`/destination existence.
         check_no_stale_evacuation_namespace_std(destination, &item.path_at_commit)?;
@@ -473,10 +538,11 @@ fn preflight_in_dir(
     source: &ExportSource,
     destination: &DestinationDir,
     force: bool,
+    control: &ControlHandle,
 ) -> Result<Vec<PreflightFile>> {
     validate_source_names(&source.files)?;
     let existing = scan_destination_handle(destination)?;
-    let store = ObjectStore::new(&source.target.kio_dir);
+    let store = ObjectStore::new_with_control(&source.target.kio_dir, control.clone());
     let mut total_bytes = 0_u64;
     let mut verified_raws = BTreeMap::<String, u64>::new();
     let mut files = Vec::with_capacity(source.files.len());
@@ -491,11 +557,11 @@ fn preflight_in_dir(
                     verified_raws.insert(item.raw_hash.clone(), metadata.size_bytes);
                     (metadata.size_bytes, true)
                 }
-                Err(error) if super::is_store_not_found(&error) => (0, false),
+                Err(error) if crate::scope_access::is_store_not_found(&error) => (0, false),
                 Err(error) => return Err(error),
             },
         };
-        check_purge_state(&source.target, &item.raw_hash, raw_present)?;
+        check_purge_state(&source.target, &item.raw_hash, raw_present, control)?;
         // PA21: same-name evacuation/quarantine residue is checked before any
         // mutation, independent of `--force`/destination existence.
         check_no_stale_evacuation_namespace(destination, &item.path_at_commit)?;
@@ -640,8 +706,12 @@ struct ValidatedDestination {
     identity: Option<DestinationIdentity>,
 }
 
-fn validate_destination(input: &Path, target: &ScopeTarget) -> Result<ValidatedDestination> {
-    let destination = normalize_absolute(input)?;
+fn validate_destination(
+    ctx: &crate::invocation::Invocation<'_>,
+    input: &Path,
+    target: &ScopeTarget,
+) -> Result<ValidatedDestination> {
+    let destination = normalize_absolute(ctx, input)?;
     verify_destination_input_chain(&destination, target)?;
     let destination = effective_destination(&destination)?;
     verify_existing_directory_chain(&destination)?;
@@ -734,13 +804,11 @@ fn verify_destination_input_chain(path: &Path, target: &ScopeTarget) -> Result<(
     Ok(())
 }
 
-fn normalize_absolute(path: &Path) -> Result<PathBuf> {
+fn normalize_absolute(ctx: &crate::context::AppContext, path: &Path) -> Result<PathBuf> {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
-        crate::context_working_directory()
-            .map_err(|error| KioError::io(error.to_string(), "."))?
-            .join(path)
+        ctx.cwd().join(path)
     };
     let mut normalized = PathBuf::new();
     for component in absolute.components() {
@@ -1049,13 +1117,16 @@ pub(crate) fn unsafe_export_error(path: &Path, message: &str) -> KioError {
     )
 }
 
-fn confirm_force() -> Result<()> {
-    if !crate::context::is_interactive()? {
+fn confirm_force(ctx: &crate::invocation::Invocation<'_>) -> Result<()> {
+    if !ctx.interaction.is_interactive() {
         return Err(confirmation_rejected(
             "export --force requires --yes in non-interactive mode",
         ));
     }
-    if crate::context::confirm("Export may replace existing files. Continue? [y/N]")? {
+    if ctx
+        .interaction
+        .confirm("Export may replace existing files. Continue? [y/N]")?
+    {
         Ok(())
     } else {
         Err(confirmation_rejected("export confirmation was rejected"))
@@ -1275,8 +1346,13 @@ fn missing_live_raw_error(target: &ScopeTarget, raw_hash: &str) -> KioError {
 /// keeps its existing in-progress-journal behavior unchanged — it is a
 /// DIFFERENT check (an active-but-not-yet-terminal transaction) from the
 /// canonical-marker dispatch above it.
-fn check_purge_state(target: &ScopeTarget, raw_hash: &str, raw_present: bool) -> Result<()> {
-    let state = PurgeState::open(&target.kio_dir)?;
+fn check_purge_state(
+    target: &ScopeTarget,
+    raw_hash: &str,
+    raw_present: bool,
+    control: &ControlHandle,
+) -> Result<()> {
+    let state = PurgeState::open_with_control(&target.kio_dir, control.clone())?;
     let tombstone_tail = state
         .read_tombstone(raw_hash)?
         .map(|record| record.tail().clone());
@@ -1293,7 +1369,7 @@ fn check_purge_state(target: &ScopeTarget, raw_hash: &str, raw_present: bool) ->
         canonical_final_event(tombstone_tail.as_ref(), receipt_tail.as_ref())?.map(|c| c.event);
     match canonical_event {
         Some(event) if event.kind == EventKind::Purged => {
-            return Err(super::tombstone_error(json!({
+            return Err(crate::scope_access::tombstone_error(json!({
                 "raw_hash": raw_hash,
                 "purged_at": event.at,
                 "purged_reason": event.reason,
@@ -1302,13 +1378,17 @@ fn check_purge_state(target: &ScopeTarget, raw_hash: &str, raw_present: bool) ->
             })));
         }
         Some(event) if event.kind == EventKind::Erased && !raw_present => {
-            return Err(super::purge_not_found_error(target, raw_hash));
+            return Err(crate::scope_access::purge_not_found_error(target, raw_hash));
         }
         Some(event) if event.kind == EventKind::Retired && !raw_present => {
-            return Err(super::retired_raw_missing_error(target, raw_hash));
+            return Err(crate::scope_access::retired_raw_missing_error(
+                target, raw_hash,
+            ));
         }
         None if !raw_present => {
-            return Err(super::unmarked_missing_raw_error(target, raw_hash));
+            return Err(crate::scope_access::unmarked_missing_raw_error(
+                target, raw_hash,
+            ));
         }
         _ => {}
     }
@@ -1329,10 +1409,12 @@ fn check_purge_state(target: &ScopeTarget, raw_hash: &str, raw_present: bool) ->
 
 /// PA47-50 helper: the caller's own fresh answer to "does the raw CAS object
 /// currently exist", fed to [`check_purge_state`].
-fn raw_present_now(target: &ScopeTarget, raw_hash: &str) -> Result<bool> {
-    match ObjectStore::new(&target.kio_dir).inspect_object(ObjectKind::Raw, raw_hash) {
+fn raw_present_now(target: &ScopeTarget, raw_hash: &str, control: &ControlHandle) -> Result<bool> {
+    match ObjectStore::new_with_control(&target.kio_dir, control.clone())
+        .inspect_object(ObjectKind::Raw, raw_hash)
+    {
         Ok(_) => Ok(true),
-        Err(error) if super::is_store_not_found(&error) => Ok(false),
+        Err(error) if crate::scope_access::is_store_not_found(&error) => Ok(false),
         Err(error) => Err(error),
     }
 }
@@ -1341,8 +1423,9 @@ fn stage_all(
     source: &ExportSource,
     files: Vec<PreflightFile>,
     destination: &DestinationDir,
+    control: &ControlHandle,
 ) -> Result<Vec<StagedFile>> {
-    let store = ObjectStore::new(&source.target.kio_dir);
+    let store = ObjectStore::new_with_control(&source.target.kio_dir, control.clone());
     let mut staged = Vec::with_capacity(files.len());
     let result = (|| -> Result<()> {
         for file in files {
@@ -1353,12 +1436,12 @@ fn stage_all(
             // handling below independently covers a "went absent right now"
             // race; this recheck's purpose is the tombstone/journal-barrier
             // gate, which does not depend on `raw_present`.
-            check_purge_state(&source.target, &file.source.raw_hash, true)?;
+            check_purge_state(&source.target, &file.source.raw_hash, true, control)?;
             let (temp, mut output) = create_private_temp(destination)?;
             let copied =
                 match store.copy_object_to(ObjectKind::Raw, &file.source.raw_hash, &mut output) {
                     Ok(metadata) => metadata,
-                    Err(error) if super::is_store_not_found(&error) => {
+                    Err(error) if crate::scope_access::is_store_not_found(&error) => {
                         cleanup_one(destination, &temp);
                         return Err(missing_live_raw_error(
                             &source.target,
@@ -1401,7 +1484,7 @@ fn stage_all(
 
     // A race that creates a conflicting case variant or changes a target after
     // staging is rejected before the first final publication.
-    let rescanned = match preflight_in_dir(source, destination, true) {
+    let rescanned = match preflight_in_dir(source, destination, true, control) {
         Ok(rescanned) => rescanned,
         Err(error) => {
             cleanup_staged(destination, &staged);
@@ -1457,11 +1540,12 @@ fn create_private_temp(destination: &DestinationDir) -> Result<(OsString, File)>
 }
 
 fn publish_all(
+    ctx: &crate::invocation::Invocation<'_>,
     source: &ExportSource,
     destination: &DestinationDir,
     staged: Vec<StagedFile>,
     checkpoint: &ReadBarrierCheckpoint,
-) -> Result<Value> {
+) -> Result<ExportResponse> {
     let mut published = Vec::new();
     let mut overwritten_count = 0_u64;
     let mut remaining = staged.into_iter();
@@ -1469,11 +1553,19 @@ fn publish_all(
         // §I checkpoint 2 (LC54/LC55), combined with the per-raw_hash
         // canonical-marker recheck (LC8-14/item 3, PA50) immediately before
         // this file's atomic, irreversible publish (LC57).
-        let raw_present = raw_present_now(&source.target, &file.preflight.source.raw_hash)?;
-        if let Err(error) = ensure_no_active_sweep(&source.target.kio_dir).and_then(|()| {
-            check_purge_state(&source.target, &file.preflight.source.raw_hash, raw_present)
+        let raw_present =
+            raw_present_now(&source.target, &file.preflight.source.raw_hash, ctx.control)?;
+        if let Err(error) = ensure_no_active_sweep_with_control(&source.target.kio_dir, ctx.control)
+            .and_then(|()| {
+                check_purge_state(
+                    &source.target,
+                    &file.preflight.source.raw_hash,
+                    raw_present,
+                    ctx.control,
+                )
                 .and_then(|()| checkpoint.recheck())
-        }) {
+            })
+        {
             cleanup_one(destination, &file.temp);
             for pending in remaining {
                 cleanup_one(destination, &pending.temp);
@@ -1490,7 +1582,7 @@ fn publish_all(
                 error,
             ));
         }
-        match publish_one(destination, &file) {
+        match publish_one(ctx, destination, &file) {
             Ok(backup) => {
                 // PA24 (§E, U26): rename completed — re-resolve the target
                 // raw's canonical state one more time (a second, independent
@@ -1500,18 +1592,21 @@ fn publish_all(
                 // publication lock) rolls the publication back (PA25/26)
                 // rather than leaving purged/hidden bytes sitting published.
                 let post_publish_raw_present =
-                    raw_present_now(&source.target, &file.preflight.source.raw_hash)?;
-                if let Err(recheck_error) = ensure_no_active_sweep(&source.target.kio_dir)
-                    .and_then(|()| {
-                        check_purge_state(
-                            &source.target,
-                            &file.preflight.source.raw_hash,
-                            post_publish_raw_present,
-                        )
-                    })
-                    .and_then(|()| checkpoint.recheck())
+                    raw_present_now(&source.target, &file.preflight.source.raw_hash, ctx.control)?;
+                if let Err(recheck_error) =
+                    ensure_no_active_sweep_with_control(&source.target.kio_dir, ctx.control)
+                        .and_then(|()| {
+                            check_purge_state(
+                                &source.target,
+                                &file.preflight.source.raw_hash,
+                                post_publish_raw_present,
+                                ctx.control,
+                            )
+                        })
+                        .and_then(|()| checkpoint.recheck())
                 {
                     let error = rollback_published_file(
+                        ctx,
                         destination,
                         &file.preflight,
                         backup.as_deref(),
@@ -1585,6 +1680,7 @@ fn publish_all(
 type PublishSuccess = Option<String>;
 
 fn publish_one(
+    ctx: &crate::invocation::Invocation<'_>,
     destination: &DestinationDir,
     file: &StagedFile,
 ) -> std::result::Result<PublishSuccess, (KioError, bool)> {
@@ -1633,10 +1729,10 @@ fn publish_one(
             }
             Err(MoveOutcome::Io(error)) => return Err((error, false)),
         }
-        eprintln!(
+        ctx.interaction.diagnostic(&format!(
             "export: evacuated existing '{}' to '{bak_name}'",
             file.preflight.source.path_at_commit
-        );
+        ));
         backup_name_opt = Some(bak_name);
     }
     // PA23: no-replace publish (uniform for both branches now — overwrite
@@ -1706,6 +1802,7 @@ fn publish_one(
 /// (best-effort) and reported as a fresh conflict instead of the original
 /// recheck failure.
 fn rollback_published_file(
+    ctx: &crate::invocation::Invocation<'_>,
     destination: &DestinationDir,
     preflight: &PreflightFile,
     backup: Option<&str>,
@@ -1756,11 +1853,11 @@ fn rollback_published_file(
             &preflight.destination,
         );
     }
-    eprintln!(
+    ctx.interaction.diagnostic(&format!(
         "export: rolled back publish of '{}' via quarantine '{quarantine}' ({})",
         preflight.source.path_at_commit,
         recheck_error.error_code()
-    );
+    ));
     let _ = cap_fs::remove_file(&destination.handle, Path::new(&quarantine));
     if let Some(bak_name) = backup
         && let Err(error) =
@@ -1961,15 +2058,15 @@ fn success_output(
     destination: &Path,
     files: Vec<PreflightFile>,
     overwritten_count: u64,
-) -> Value {
-    json!({
-        "status": "exported",
-        "source_kind": source.source_kind,
-        "source_commit": source.source_commit,
-        "destination": destination,
-        "exported_count": files.len(),
-        "overwritten_count": overwritten_count,
-        "files": files.iter().map(exported_file_json).collect::<Vec<_>>(),
+) -> ExportResponse {
+    ExportResponse::Exported(ExportSuccess {
+        status: "exported".to_owned(),
+        source_kind: source.source_kind.to_owned(),
+        source_commit: source.source_commit.clone(),
+        destination: destination.to_path_buf(),
+        exported_count: files.len(),
+        overwritten_count,
+        files: files.iter().map(exported_file).collect(),
     })
 }
 
@@ -1980,49 +2077,54 @@ fn partial_output(
     overwritten_count: u64,
     failed: &PreflightFile,
     error: KioError,
-) -> Value {
-    let mut output = json!({
-        "status": "partial",
-        "error_code": "KIO-E-COMMIT-EXPORT-PARTIAL-001",
-        "source_kind": source.source_kind,
-        "source_commit": source.source_commit,
-        "destination": destination,
-        "exported_count": files.len(),
-        "overwritten_count": overwritten_count,
-        "files": files.iter().map(exported_file_json).collect::<Vec<_>>(),
-        "failed": [{
-            "path": failed.destination,
-            "path_at_commit": failed.source.path_at_commit,
-            "raw_hash": failed.source.raw_hash,
-            "error_code": error.error_code(),
-            "message": error.message(),
+) -> ExportResponse {
+    ExportResponse::Partial(ExportPartial {
+        report: ExportSuccess {
+            status: "partial".to_owned(),
+            source_kind: source.source_kind.to_owned(),
+            source_commit: source.source_commit.clone(),
+            destination: destination.to_path_buf(),
+            exported_count: files.len(),
+            overwritten_count,
+            files: files.iter().map(exported_file).collect(),
+        },
+        error_code: "KIO-E-COMMIT-EXPORT-PARTIAL-001".to_owned(),
+        failed: vec![ExportFailure {
+            path: failed.destination.clone(),
+            path_at_commit: failed.source.path_at_commit.clone(),
+            raw_hash: failed.source.raw_hash.clone(),
+            error_code: error.error_code().to_owned(),
+            message: error.message().to_owned(),
         }],
-    });
-    super::set_exit_override(&mut output, ExitCode::PartialFailure);
-    output
+    })
 }
 
-fn exported_file_json(file: &PreflightFile) -> Value {
-    json!({
-        "path": file.destination,
-        "path_at_commit": file.source.path_at_commit,
-        "raw_hash": file.source.raw_hash,
-        "overwritten": file.overwritten,
-    })
+fn exported_file(file: &PreflightFile) -> ExportedFile {
+    ExportedFile {
+        path: file.destination.clone(),
+        path_at_commit: file.source.path_at_commit.clone(),
+        raw_hash: file.source.raw_hash.clone(),
+        overwritten: file.overwritten,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use kio_core::control::ControlHandle;
     use std::fs;
     #[cfg(unix)]
     use std::io::Write;
 
-    use super::{
-        ExportItem, ScopeTarget, check_purge_state, destination_lstat_identity,
-        missing_live_raw_error, normalize_absolute, open_destination_dir, validate_source_names,
-    };
+    use super::ExportItem;
+    use super::check_purge_state;
+    use super::destination_lstat_identity;
+    use super::missing_live_raw_error;
+    use super::normalize_absolute;
+    use super::open_destination_dir;
+    use super::validate_source_names;
     #[cfg(unix)]
     use super::{create_private_temp, no_replace_move, sync_directory_handle};
+    use crate::search::scope::ScopeTarget;
 
     fn entry_names(path: &std::path::Path) -> Vec<String> {
         let mut names = fs::read_dir(path)
@@ -2064,16 +2166,19 @@ mod tests {
                 false
             }
             fn diagnostic(&self, _: &str) {}
+            fn write_diagnostic(&self, _: &str) -> kio_core::Result<()> {
+                Ok(())
+            }
+            fn flush_diagnostics(&self) -> kio_core::Result<()> {
+                Ok(())
+            }
         }
         let directory = tempfile::tempdir().unwrap();
         let context = crate::context::AppContext {
             working_directory: directory.path().to_path_buf(),
             interaction: std::sync::Arc::new(NonInteractive),
         };
-        let normalized = crate::context::with_context(&context, || {
-            normalize_absolute(std::path::Path::new("a/../b"))
-        })
-        .unwrap();
+        let normalized = normalize_absolute(&context, std::path::Path::new("a/../b")).unwrap();
         assert_eq!(normalized, directory.path().join("b"));
     }
 
@@ -2112,7 +2217,8 @@ mod tests {
         // absence. The still-load-bearing property this test pins: the
         // resulting error must not disclose the fsck-private receipt's
         // existence or contents either way.
-        let error = check_purge_state(&target, &raw_hash, false).unwrap_err();
+        let error =
+            check_purge_state(&target, &raw_hash, false, &ControlHandle::default()).unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
         assert_eq!(error.exit_code(), kio_core::ExitCode::PermanentFailure);
         assert!(!error.context().to_string().contains("receipt"));

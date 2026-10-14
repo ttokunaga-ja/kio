@@ -2,26 +2,35 @@
 //! managed working tree.  Export remains destination-only; this module is the
 //! only path that can materialize historical bytes under the managed root.
 
+use crate::response::mutation::{RestoreProvenance, RestoreResponse};
+use crate::response::repair::*;
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use std::path::PathBuf;
 
-use kio_core::scope::{ManagedRestorePlan, ManagedRestoreRequest, Repository, now_utc_seconds};
+use kio_core::scope::{ManagedRestorePlan, ManagedRestoreRequest, Repository};
 use kio_core::{ExitCode, KioError, Result};
-use serde_json::{Value, json};
+use serde_json::json;
 
 use crate::commands::RestoreArgs;
+use crate::index::chunk_ledger::recover_index_generation;
+use crate::index::rebuild::rebuild_step3_index;
+use crate::management::binding_for_repo;
 use crate::management::open_existing_managed_root;
-use crate::{
-    binding_for_repo, context_working_directory, current_embedding_policy,
-    mark_replica_rebuilding_or_log, mark_replica_unavailable_or_log, pipeline_to_kio,
-    rebuild_step3_index, recover_index_generation, set_exit_override, validate_repo_tool_lock,
-    write_through_projection_full,
-};
+use crate::object_persistence::pipeline_to_kio;
+use crate::search::projection::mark_replica_rebuilding_or_log;
+use crate::search::projection::mark_replica_unavailable_or_log;
+use crate::search::projection::write_through_projection_full;
+use crate::search::scope::current_embedding_policy;
+use crate::settings::validate_repo_tool_lock;
 
-pub(super) fn run(args: RestoreArgs) -> Result<Value> {
+pub(super) fn run(
+    ctx: &crate::invocation::Invocation<'_>,
+    args: RestoreArgs,
+) -> Result<CommandResponse> {
     // This is intentionally the strict, bound managed-root open.  In
     // particular, restore never invokes the recovery opener, so --preview has
     // no publication, index, ledger, or working-tree side effect.
-    let repo = open_existing_managed_root(&context_working_directory()?)?;
+    let repo = open_existing_managed_root(ctx.cwd(), ctx.control)?.in_lock_session(ctx.locks);
     validate_repo_tool_lock(&repo)?;
     let source_commit = repo.resolve_commit(&args.source)?;
     let policy = current_embedding_policy(&repo)?;
@@ -40,7 +49,7 @@ pub(super) fn run(args: RestoreArgs) -> Result<Value> {
         args.message
             .clone()
             .unwrap_or_else(|| format!("restore {source_commit}")),
-        now_utc_seconds(),
+        ctx.control.now_utc_seconds(),
     ))?;
     if let Some(expected) = args.expected_head.as_deref() {
         if !kio_core::cas::is_hash(expected) {
@@ -60,7 +69,10 @@ pub(super) fn run(args: RestoreArgs) -> Result<Value> {
     ensure_planned_paths_allowed(&policy, &plan)?;
 
     if args.preview {
-        return Ok(plan_json("preview", &plan, None));
+        return Ok(CommandResponse {
+            body: ResponseBody::Restore(plan_response("preview", &plan, None)),
+            completion: Completion::Complete,
+        });
     }
 
     let outcome = repo.apply_restore(&plan, || {
@@ -75,40 +87,47 @@ pub(super) fn run(args: RestoreArgs) -> Result<Value> {
         // A restored HEAD has no guarantee that its historical normalized
         // outputs are current.  Mark the projection unavailable instead of
         // claiming a synchronous rebuild that could run adapters or egress.
-        mark_replica_rebuilding_or_log(repo.kio_dir(), commit_hash);
+        mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), commit_hash);
     }
-    let mut result = plan_json("applied", &plan, Some(&outcome));
+    let mut result = plan_response("applied", &plan, Some(&outcome));
+    let mut completion = Completion::Complete;
     if outcome.noop {
-        result["projection_status"] = json!("unchanged");
-        return Ok(result);
+        result.projection_status = Some("unchanged".to_owned());
+        return Ok(CommandResponse {
+            body: ResponseBody::Restore(result),
+            completion,
+        });
     }
-    match rebuild_projection(&repo, Some((&policy, &plan))) {
+    match rebuild_projection(ctx, &repo, Some((&policy, &plan))) {
         Ok(projection) => {
-            result["projection_status"] = json!("ready");
-            result["projection"] = projection;
+            result.projection_status = Some("ready".to_owned());
+            result.projection = Some(projection);
         }
         Err(error) => {
             // The restored commit and its durable provenance are already
             // valid.  Cache rebuild failure must be visible and fail closed,
             // but never rolls HEAD back or rewrites the restored files.
-            mark_replica_unavailable_or_log(repo.kio_dir());
-            result["status"] = json!("applied_projection_failed");
-            result["projection_status"] = json!("failed");
-            result["projection_error"] = json!({
-                "error_code": error.error_code(),
-                "message": error.message(),
+            mark_replica_unavailable_or_log(ctx, repo.kio_dir());
+            result.status = "applied_projection_failed".to_owned();
+            result.projection_status = Some("failed".to_owned());
+            result.projection_error = Some(ManagedRestoreProjectionError {
+                error_code: error.error_code().to_owned(),
+                message: error.message().to_owned(),
             });
-            set_exit_override(&mut result, ExitCode::PartialFailure);
+            completion = Completion::Partial;
         }
     }
-    Ok(result)
+    Ok(CommandResponse {
+        body: ResponseBody::Restore(result),
+        completion,
+    })
 }
 
 /// `repair recover-restore` is intentionally distinct from ordinary
 /// publication recovery.  A pending restore journal governs working bytes and
 /// must be resolved by core before any generic publication-recovery pathway.
-pub(super) fn recover() -> Result<Value> {
-    let repo = Repository::open_for_recovery(context_working_directory()?)?;
+pub(super) fn recover(ctx: &crate::invocation::Invocation<'_>) -> Result<CommandResponse> {
+    let repo = Repository::open_recovery_in_session(ctx.cwd(), ctx.control.clone(), ctx.locks)?;
     validate_repo_tool_lock(&repo)?;
     // Recovery has to be possible when the policy that permitted the original
     // restore has since denied a path.  Validate the retained management
@@ -116,54 +135,67 @@ pub(super) fn recover() -> Result<Value> {
     // bytes back or finish the already-journaled publication.
     kio_core::management::validate_live_chain(&binding_for_repo(&repo)?)?;
     let recovered = repo.recover_managed_restore()?;
-    let mut result = json!({
-        "operation": "managed_restore_recovery",
-        "status": if recovered { "recovered" } else { "no_pending_restore" },
-        "recovered": recovered,
-        "egress": false,
-    });
+    let mut result = ManagedRestoreRecoveryResponse {
+        operation: "managed_restore_recovery".to_owned(),
+        status: if recovered {
+            "recovered"
+        } else {
+            "no_pending_restore"
+        }
+        .to_owned(),
+        recovered,
+        egress: false,
+        projection_status: None,
+        projection: None,
+        projection_error: None,
+    };
+    let mut completion = Completion::Complete;
     if recovered {
         if let Some(head) = repo.head_commit_hash()? {
-            mark_replica_rebuilding_or_log(repo.kio_dir(), &head);
+            mark_replica_rebuilding_or_log(ctx, repo.kio_dir(), &head);
         }
-        match rebuild_projection(&repo, None) {
+        match rebuild_projection(ctx, &repo, None) {
             Ok(projection) => {
-                result["projection_status"] = json!("ready");
-                result["projection"] = projection;
+                result.projection_status = Some("ready".to_owned());
+                result.projection = Some(projection);
             }
             Err(error) => {
-                mark_replica_unavailable_or_log(repo.kio_dir());
-                result["status"] = json!("recovered_projection_failed");
-                result["projection_status"] = json!("failed");
-                result["projection_error"] = json!({
-                    "error_code": error.error_code(),
-                    "message": error.message(),
+                mark_replica_unavailable_or_log(ctx, repo.kio_dir());
+                result.status = "recovered_projection_failed".to_owned();
+                result.projection_status = Some("failed".to_owned());
+                result.projection_error = Some(ManagedRestoreProjectionError {
+                    error_code: error.error_code().to_owned(),
+                    message: error.message().to_owned(),
                 });
-                set_exit_override(&mut result, ExitCode::PartialFailure);
+                completion = Completion::Partial;
             }
         }
     }
-    Ok(result)
+    Ok(CommandResponse {
+        body: ResponseBody::Repair(RepairResponse::RecoverRestore(result)),
+        completion,
+    })
 }
 
 /// Rebuild only local, reproducible derived state after a restore.  This uses
 /// immutable CAS plus the restored HEAD; it neither polls nor submits work and
 /// does not call the online-capable repair entrypoint.
 fn rebuild_projection(
+    ctx: &crate::invocation::Invocation<'_>,
     repo: &Repository,
     policy: Option<(
         &kio_pipeline::policy::CurrentPolicyEvaluator,
         &ManagedRestorePlan,
     )>,
-) -> Result<Value> {
-    let _lock = repo.lock_store()?;
+) -> Result<ManagedRestoreProjection> {
+    let _lock = repo.lock_store_in_session(repo.lock_session())?;
     if let Some((policy, plan)) = policy {
         ensure_scope_allowed(policy)?;
         ensure_planned_paths_allowed(policy, plan)?;
     }
-    let report = rebuild_step3_index(repo)?;
-    recover_index_generation(repo.kio_dir())?;
-    write_through_projection_full(repo.kio_dir()).map_err(|reason| {
+    let report = rebuild_step3_index(ctx, repo)?;
+    recover_index_generation(repo.kio_dir(), repo.control())?;
+    write_through_projection_full(repo.kio_dir(), ctx.control).map_err(|reason| {
         KioError::new(
             "KIO-E-MANAGED-RESTORE-PROJECTION-001",
             "restored HEAD committed but local replica projection failed",
@@ -171,13 +203,13 @@ fn rebuild_projection(
             ExitCode::PartialFailure,
         )
     })?;
-    Ok(json!({
-        "status": "ready",
-        "rebuilt_chunks": report.rebuilt_chunks,
-        "rebuilt_tree_entries": report.rebuilt_tree_entries,
-        "skipped_units": report.skipped_units,
-        "egress": false,
-    }))
+    Ok(ManagedRestoreProjection {
+        status: "ready".to_owned(),
+        rebuilt_chunks: report.rebuilt_chunks,
+        rebuilt_tree_entries: report.rebuilt_tree_entries,
+        skipped_units: report.skipped_units,
+        egress: false,
+    })
 }
 
 fn requested_paths(
@@ -254,31 +286,33 @@ fn ensure_planned_paths_allowed(
     Ok(())
 }
 
-fn plan_json(
+fn plan_response(
     status: &str,
     plan: &ManagedRestorePlan,
     outcome: Option<&kio_core::scope::ManagedRestoreOutcome>,
-) -> Value {
-    json!({
-        "operation": "managed_restore",
-        "status": status,
-        "source_commit": plan.source_commit(),
-        "expected_head": plan.expected_head(),
-        "new_commit_hash": if plan.is_noop() { None } else { Some(plan.new_commit_hash()) },
-        "new_head": outcome.and_then(|value| value.commit_hash.as_deref()),
-        "new_tree_hash": plan.new_tree_hash(),
-        "changes": plan.changes(),
-        "provenance": {
-            "source_commit": plan.source_commit(),
-            "parent_commit": plan.expected_head(),
-            "commit_type": "restored",
+) -> RestoreResponse {
+    RestoreResponse {
+        operation: "managed_restore".to_owned(),
+        status: status.to_owned(),
+        source_commit: plan.source_commit().to_owned(),
+        expected_head: plan.expected_head().to_owned(),
+        new_commit_hash: if plan.is_noop() {
+            None
+        } else {
+            Some(plan.new_commit_hash().to_owned())
         },
-        "apply": outcome.map(|value| json!({
-            "noop": value.noop,
-            "commit_hash": value.commit_hash,
-            "tree_hash": value.tree_hash,
-            "restored_paths": value.restored_paths,
-        })),
-        "egress": false,
-    })
+        new_head: outcome.and_then(|value| value.commit_hash.clone()),
+        new_tree_hash: plan.new_tree_hash().to_owned(),
+        changes: plan.changes().to_vec(),
+        provenance: RestoreProvenance {
+            source_commit: plan.source_commit().to_owned(),
+            parent_commit: plan.expected_head().to_owned(),
+            commit_type: "restored".to_owned(),
+        },
+        apply: outcome.cloned(),
+        egress: false,
+        projection_status: None,
+        projection: None,
+        projection_error: None,
+    }
 }

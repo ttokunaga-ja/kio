@@ -15,6 +15,7 @@ use std::{
     path::{Component, Path, PathBuf},
 };
 
+use kio_core::control::ControlHandle;
 use kio_core::store_dir::{Publication, StoreDirectory};
 use rusqlite::{Connection, OpenFlags};
 
@@ -144,10 +145,15 @@ impl FsSession {
     /// Acquire the stable device lifecycle lock. `allow_create` is reserved for
     /// explicit ledger initialization; ordinary opens never create a parent or
     /// lock and never repair an unsafe existing object.
-    pub(crate) fn acquire(db_path: &Path, allow_create: bool) -> Result<Self> {
+    pub(crate) fn acquire_with_control(
+        db_path: &Path,
+        allow_create: bool,
+        control: ControlHandle,
+    ) -> Result<Self> {
         let db_path = normalized_absolute_db_path(db_path)?;
         let (parent_path, names) = ArtifactNames::from_db_path(&db_path)?;
-        let (parent, inherited_parent) = open_or_create_parent(&parent_path, allow_create)?;
+        let (parent, inherited_parent) =
+            open_or_create_parent(&parent_path, allow_create, control)?;
         let sqlite_path = if inherited_parent {
             sqlite_path_from_retained_parent(&parent, &names.db)?
         } else {
@@ -170,6 +176,7 @@ impl FsSession {
         parent: &File,
         parent_path: &Path,
         db_leaf: &str,
+        control: ControlHandle,
     ) -> Result<Self> {
         let db_path = parent_path.join(db_leaf);
         let (_, names) = ArtifactNames::from_db_path(&db_path)?;
@@ -183,8 +190,12 @@ impl FsSession {
             path: parent_path.display().to_string(),
             message: error.to_string(),
         })?;
-        let parent = StoreDirectory::from_retained(retained, parent_path.to_path_buf())
-            .map_err(core_private)?;
+        let parent = StoreDirectory::from_retained_with_control(
+            retained,
+            parent_path.to_path_buf(),
+            control,
+        )
+        .map_err(core_private)?;
         Self::acquire_bound_parent(
             parent_path.to_path_buf(),
             db_path,
@@ -194,6 +205,10 @@ impl FsSession {
             true,
             false,
         )
+    }
+
+    pub(crate) fn control(&self) -> &ControlHandle {
+        self.parent.control()
     }
 
     fn acquire_bound_parent(
@@ -533,7 +548,9 @@ impl FsSession {
             // retargeted, so the retained capability is the authority below.
             verify_private_parent_handle(self.parent.root_handle().as_ref(), &self.parent_path)?;
         } else {
-            let named_parent = StoreDirectory::open(&self.parent_path).map_err(core_private)?;
+            let named_parent =
+                StoreDirectory::open_with_control(&self.parent_path, self.control().clone())
+                    .map_err(core_private)?;
             verify_private_parent_handle(named_parent.root_handle().as_ref(), &self.parent_path)?;
             if directory_identity(named_parent.root_handle().as_ref(), &self.parent_path)?
                 != self.parent_identity
@@ -716,13 +733,17 @@ fn revalidate_retained_leaf(session: &FsSession, retained: &RetainedSqliteFile) 
     Ok(())
 }
 
-fn open_or_create_parent(path: &Path, allow_create: bool) -> Result<(StoreDirectory, bool)> {
-    if let Some(parent) = try_inherited_parent(path, allow_create)? {
+fn open_or_create_parent(
+    path: &Path,
+    allow_create: bool,
+    control: ControlHandle,
+) -> Result<(StoreDirectory, bool)> {
+    if let Some(parent) = try_inherited_parent(path, allow_create, control.clone())? {
         return Ok((parent, true));
     }
-    match StoreDirectory::open(path) {
+    match StoreDirectory::open_with_control(path, control.clone()) {
         Ok(parent) => {
-            verify_existing_ancestor_path(path)?;
+            verify_existing_ancestor_path(path, &control)?;
             return Ok((parent, false));
         }
         Err(error) if !allow_create => {
@@ -739,8 +760,8 @@ fn open_or_create_parent(path: &Path, allow_create: bool) -> Result<(StoreDirect
 
     let mut ancestor = path.to_path_buf();
     let (base, suffix) = loop {
-        if let Ok(base) = StoreDirectory::open(&ancestor) {
-            verify_existing_ancestor_path(&ancestor)?;
+        if let Ok(base) = StoreDirectory::open_with_control(&ancestor, control.clone()) {
+            verify_existing_ancestor_path(&ancestor, &control)?;
             let suffix = path.strip_prefix(&ancestor).map_err(|_| {
                 contract(
                     "KIO-E-LEDGER-PATH-001",
@@ -801,7 +822,12 @@ fn create_missing_private_path(
             }
         };
         logical.push(leaf);
-        current = StoreDirectory::from_retained(retained, logical.clone()).map_err(core_private)?;
+        current = StoreDirectory::from_retained_with_control(
+            retained,
+            logical.clone(),
+            current.control().clone(),
+        )
+        .map_err(core_private)?;
     }
     Ok(current)
 }
@@ -901,7 +927,12 @@ mod tests {
                 .strip_prefix("/private/var")
                 .expect("test directory is below /private/var"),
         );
-        let session = FsSession::acquire(&alias, true).unwrap();
+        let session = FsSession::acquire_with_control(
+            &alias,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         assert_eq!(session.db_path, canonical);
         let authority = session.names().authority.clone();
         session.create_only(&authority, b"private").unwrap();
@@ -913,7 +944,12 @@ mod tests {
     fn creates_private_parent_and_classifies_partial_state() {
         let temp = private_tempdir();
         let path = db_path(temp.path());
-        let session = FsSession::acquire(&path, true).unwrap();
+        let session = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         assert_eq!(session.artifact_state().unwrap(), ArtifactSetState::Missing);
         session
             .create_only(&session.names().init_pending, b"pending")
@@ -934,7 +970,12 @@ mod tests {
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
         let path = parent.join("ledger.db");
 
-        let uninitialized = FsSession::acquire(&path, false).unwrap_err();
+        let uninitialized = FsSession::acquire_with_control(
+            &path,
+            false,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap_err();
         assert!(matches!(
             uninitialized,
             PipelineError::Contract {
@@ -950,7 +991,12 @@ mod tests {
             fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        let partial = FsSession::acquire(&path, false).unwrap_err();
+        let partial = FsSession::acquire_with_control(
+            &path,
+            false,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap_err();
         assert!(matches!(
             partial,
             PipelineError::Contract {
@@ -960,7 +1006,12 @@ mod tests {
         ));
 
         fs::write(parent.join(RETIRED_LEDGER_BASENAMES[0]), b"retired").unwrap();
-        let retired = FsSession::acquire(&path, false).unwrap_err();
+        let retired = FsSession::acquire_with_control(
+            &path,
+            false,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap_err();
         assert!(matches!(
             retired,
             PipelineError::Contract {
@@ -974,16 +1025,31 @@ mod tests {
     fn lifecycle_lock_is_exclusive_and_never_replaced() {
         let temp = private_tempdir();
         let path = db_path(temp.path());
-        let first = FsSession::acquire(&path, true).unwrap();
+        let first = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         let lock_path = path.parent().unwrap().join(LIFECYCLE_LOCK);
         let before = regular_file_identity(&first.lock, &lock_path).unwrap();
         first.revalidate_boundary().unwrap();
         first.revalidate_boundary().unwrap();
-        let error = FsSession::acquire(&path, false).unwrap_err();
+        let error = FsSession::acquire_with_control(
+            &path,
+            false,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap_err();
         assert!(matches!(error, PipelineError::Locked { .. }));
         first.revalidate_boundary().unwrap();
         drop(first);
-        let second = FsSession::acquire(&path, false).unwrap();
+        let second = FsSession::acquire_with_control(
+            &path,
+            false,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         second.revalidate_boundary().unwrap();
         assert_eq!(
             before,
@@ -999,11 +1065,21 @@ mod tests {
 
         let temp = private_tempdir();
         let path = db_path(temp.path());
-        let mut session = FsSession::acquire(&path, true).unwrap();
+        let mut session = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         session.lock.seek(SeekFrom::End(0)).unwrap();
         session.revalidate_boundary().unwrap();
         session.revalidate_boundary().unwrap();
-        let contender = FsSession::acquire(&path, false).unwrap_err();
+        let contender = FsSession::acquire_with_control(
+            &path,
+            false,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap_err();
         assert!(matches!(contender, PipelineError::Locked { .. }));
     }
 
@@ -1013,13 +1089,21 @@ mod tests {
         for replacement in [LOCK_BYTES, b"replacement marker".as_slice()] {
             let temp = private_tempdir();
             let path = db_path(temp.path());
-            drop(FsSession::acquire(&path, true).unwrap());
+            drop(
+                FsSession::acquire_with_control(
+                    &path,
+                    true,
+                    kio_core::control::ControlHandle::default(),
+                )
+                .unwrap(),
+            );
             let parent_path = path.parent().unwrap();
             let parent = StoreDirectory::open(parent_path).unwrap();
             let session = FsSession::acquire_retained_snapshot_parent(
                 parent.root_handle().as_ref(),
                 parent_path,
                 "cost-ledger.sqlite",
+                ControlHandle::default(),
             )
             .unwrap();
             assert!(session.inherited_parent);
@@ -1057,7 +1141,14 @@ mod tests {
     fn retained_snapshot_parent_stays_bound_after_diagnostic_parent_replacement() {
         let temp = private_tempdir();
         let path = db_path(temp.path());
-        drop(FsSession::acquire(&path, true).unwrap());
+        drop(
+            FsSession::acquire_with_control(
+                &path,
+                true,
+                kio_core::control::ControlHandle::default(),
+            )
+            .unwrap(),
+        );
         let parent_path = path.parent().unwrap();
         let parent = StoreDirectory::open(parent_path).unwrap();
         let displaced = temp.path().join("displaced.device");
@@ -1066,11 +1157,17 @@ mod tests {
         // Rename before acquiring a regular-file lock: the directory
         // capability stays bound, while no named descendant handle prevents
         // Windows from moving its ancestor directory.
-        let replacement = FsSession::acquire(&path, true).unwrap();
+        let replacement = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         let session = FsSession::acquire_retained_snapshot_parent(
             parent.root_handle().as_ref(),
             parent_path,
             "cost-ledger.sqlite",
+            ControlHandle::default(),
         )
         .unwrap();
         // The original diagnostic spelling now names an independent valid
@@ -1083,6 +1180,7 @@ mod tests {
             parent.root_handle().as_ref(),
             parent_path,
             "cost-ledger.sqlite",
+            ControlHandle::default(),
         )
         .unwrap_err();
         assert!(matches!(contender, PipelineError::Locked { .. }));
@@ -1103,12 +1201,22 @@ mod tests {
     fn private_sidecars_keep_identity_through_wal_checkpoint_and_reopen() {
         let temp = private_tempdir();
         let path = db_path(temp.path());
-        let session = FsSession::acquire(&path, true).unwrap();
+        let session = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         publish_private_test_database(&session);
         drop(session);
 
         for expected_rows in 1..=3 {
-            let session = FsSession::acquire(&path, false).unwrap();
+            let session = FsSession::acquire_with_control(
+                &path,
+                false,
+                kio_core::control::ControlHandle::default(),
+            )
+            .unwrap();
             let mut bound = session
                 .open_existing_sqlite(OpenFlags::SQLITE_OPEN_READ_WRITE)
                 .unwrap();
@@ -1154,7 +1262,12 @@ mod tests {
         for unsafe_leaf in ["main", "wal", "shm"] {
             let temp = private_tempdir();
             let path = db_path(temp.path());
-            let session = FsSession::acquire(&path, true).unwrap();
+            let session = FsSession::acquire_with_control(
+                &path,
+                true,
+                kio_core::control::ControlHandle::default(),
+            )
+            .unwrap();
             if unsafe_leaf != "main" {
                 publish_private_test_database(&session);
             }
@@ -1200,7 +1313,12 @@ mod tests {
         for unsafe_wal in [true, false] {
             let temp = private_tempdir();
             let path = db_path(temp.path());
-            let session = FsSession::acquire(&path, true).unwrap();
+            let session = FsSession::acquire_with_control(
+                &path,
+                true,
+                kio_core::control::ControlHandle::default(),
+            )
+            .unwrap();
             publish_private_test_database(&session);
             session
                 .create_only(&session.names.authority, b"hardlinked private bytes")
@@ -1233,7 +1351,12 @@ mod tests {
     fn missing_sqlite_main_never_creates_sidecars() {
         let temp = private_tempdir();
         let path = db_path(temp.path());
-        let session = FsSession::acquire(&path, true).unwrap();
+        let session = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         let error = session
             .open_existing_sqlite(OpenFlags::SQLITE_OPEN_READ_WRITE)
             .err()
@@ -1255,7 +1378,12 @@ mod tests {
     fn read_only_sqlite_open_does_not_precreate_sidecars() {
         let temp = private_tempdir();
         let path = db_path(temp.path());
-        let session = FsSession::acquire(&path, true).unwrap();
+        let session = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         publish_private_test_database(&session);
         let before = fs::read(&path).unwrap();
         let bound = session
@@ -1277,14 +1405,24 @@ mod tests {
     fn dropping_session_explicitly_unlocks_a_duplicated_lock_description() {
         let temp = private_tempdir();
         let path = db_path(temp.path());
-        let first = FsSession::acquire(&path, true).unwrap();
+        let first = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         // `try_clone` duplicates the same open-file description, matching an
         // inherited descriptor across fork/exec. Keep it open after session
         // drop: success below proves Drop called unlock rather than relying on
         // the final descriptor close.
         let inherited = first.lock.try_clone().unwrap();
         drop(first);
-        let second = FsSession::acquire(&path, false).unwrap();
+        let second = FsSession::acquire_with_control(
+            &path,
+            false,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         drop(second);
         drop(inherited);
     }
@@ -1293,7 +1431,12 @@ mod tests {
     fn actual_sqlite_connection_is_opened_and_finished_under_the_session() {
         let temp = private_tempdir();
         let path = db_path(temp.path());
-        let session = FsSession::acquire(&path, true).unwrap();
+        let session = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         session.prepare_empty_db_create_only().unwrap();
         let bound = session
             .open_existing_sqlite(
@@ -1321,7 +1464,12 @@ mod tests {
         assert!(descriptor >= 3, "allocate inherited directory descriptor");
         let inherited = PathBuf::from(format!("/dev/fd/{descriptor}/device/cost-ledger.sqlite"));
 
-        let session = FsSession::acquire(&inherited, true).unwrap();
+        let session = FsSession::acquire_with_control(
+            &inherited,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         // Retargeting the caller's descriptor after acquire must not redirect a
         // lock-protected marker or SQLite's path-only open to root_b.
         assert_eq!(
@@ -1364,11 +1512,25 @@ mod tests {
         fs::write(&target, LOCK_BYTES).unwrap();
         fs::set_permissions(&target, fs::Permissions::from_mode(0o600)).unwrap();
         symlink(&target, parent.join(LIFECYCLE_LOCK)).unwrap();
-        assert!(FsSession::acquire(&parent.join("ledger.db"), false).is_err());
+        assert!(
+            FsSession::acquire_with_control(
+                &parent.join("ledger.db"),
+                false,
+                kio_core::control::ControlHandle::default()
+            )
+            .is_err()
+        );
 
         fs::remove_file(parent.join(LIFECYCLE_LOCK)).unwrap();
         fs::hard_link(&target, parent.join(LIFECYCLE_LOCK)).unwrap();
-        assert!(FsSession::acquire(&parent.join("ledger.db"), false).is_err());
+        assert!(
+            FsSession::acquire_with_control(
+                &parent.join("ledger.db"),
+                false,
+                kio_core::control::ControlHandle::default()
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1377,19 +1539,38 @@ mod tests {
         let temp = private_tempdir();
         let path = db_path(temp.path());
         {
-            let session = FsSession::acquire(&path, true).unwrap();
+            let session = FsSession::acquire_with_control(
+                &path,
+                true,
+                kio_core::control::ControlHandle::default(),
+            )
+            .unwrap();
             drop(session);
         }
         let parent = path.parent().unwrap();
         fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(FsSession::acquire(&path, false).is_err());
+        assert!(
+            FsSession::acquire_with_control(
+                &path,
+                false,
+                kio_core::control::ControlHandle::default()
+            )
+            .is_err()
+        );
         fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
         fs::set_permissions(
             parent.join(LIFECYCLE_LOCK),
             fs::Permissions::from_mode(0o644),
         )
         .unwrap();
-        assert!(FsSession::acquire(&path, false).is_err());
+        assert!(
+            FsSession::acquire_with_control(
+                &path,
+                false,
+                kio_core::control::ControlHandle::default()
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]
@@ -1402,7 +1583,14 @@ mod tests {
         let missing_parent = unsafe_ancestor.join("new").join("device");
         let path = missing_parent.join("ledger.db");
 
-        assert!(FsSession::acquire(&path, true).is_err());
+        assert!(
+            FsSession::acquire_with_control(
+                &path,
+                true,
+                kio_core::control::ControlHandle::default()
+            )
+            .is_err()
+        );
         assert!(!unsafe_ancestor.join("new").exists());
     }
 
@@ -1419,7 +1607,12 @@ mod tests {
         symlink(&target, &alias).unwrap();
         let path = alias.join("device/ledger.db");
 
-        let error = FsSession::acquire(&path, true).unwrap_err();
+        let error = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap_err();
         assert!(matches!(
             error,
             PipelineError::Contract {
@@ -1435,7 +1628,12 @@ mod tests {
     fn retained_parent_swap_is_detected_before_artifact_write() {
         let temp = private_tempdir();
         let path = db_path(temp.path());
-        let session = FsSession::acquire(&path, true).unwrap();
+        let session = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         let parent = path.parent().unwrap();
         let displaced = temp.path().join("displaced");
         fs::rename(parent, &displaced).unwrap();
@@ -1469,7 +1667,12 @@ mod tests {
     fn sqlite_main_replacement_is_detected_while_used_connection_is_live() {
         let temp = private_tempdir();
         let path = db_path(temp.path());
-        let session = FsSession::acquire(&path, true).unwrap();
+        let session = FsSession::acquire_with_control(
+            &path,
+            true,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
         session.prepare_empty_db_create_only().unwrap();
         let mut bound = session
             .open_existing_sqlite(

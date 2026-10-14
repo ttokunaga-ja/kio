@@ -2,17 +2,24 @@
 //! management or send authority. Each pass reopens the registered root and
 //! runs the same local index operation as the interactive command.
 
+use crate::response::index::IndexResponse;
+use crate::response::watch::{
+    WatchLifecycleResponse, WatchObservation as InstanceState, WatchResponse,
+};
+use crate::response::{CommandResponse, Completion, ResponseBody};
 use std::fs::TryLockError;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use kio_core::control::ControlHandle;
 use kio_core::management::{ManagementAuthority, ManagementBinding, read_record};
 use kio_core::scope::new_ulid;
 use kio_core::store_dir::{Publication, StoreDirectory};
 use kio_core::{ExitCode, KioError, Result};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::commands::{CommandRequest, IndexArgs, WatchArgs, WatchCommand};
@@ -29,39 +36,30 @@ const MAX_STATE_BYTES: u64 = 64 * 1024;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct InstanceState {
-    version: u8,
-    instance: String,
-    root: PathBuf,
-    scope_id: String,
-    pid: u32,
-    backend: String,
-    backlog: usize,
-    degraded: bool,
-    last_success_ms: Option<u64>,
-    last_failure: Option<String>,
-    observed_at_ms: u64,
-    reconcile_interval_seconds: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct StopRequest {
     instance: String,
 }
 
-pub(crate) fn run(args: WatchArgs) -> Result<Value> {
+pub(crate) fn run(
+    ctx: &AppContext,
+    args: WatchArgs,
+    control: &ControlHandle,
+) -> Result<CommandResponse> {
     let WatchArgs {
         root: configured_root,
         command,
     } = args;
     let command = match command {
         WatchCommand::Service(command) => {
-            return crate::watch_service::run(configured_root, command);
+            let body = crate::watch_service::run(ctx, configured_root, command, control)?;
+            return Ok(CommandResponse {
+                body: ResponseBody::Watch(body),
+                completion: Completion::Complete,
+            });
         }
         command => command,
     };
-    let cwd = crate::context_working_directory()?;
+    let cwd = ctx.cwd().to_path_buf();
     let requested = configured_root.clone().unwrap_or(cwd.clone());
     let requested = if requested.is_absolute() {
         requested
@@ -71,23 +69,35 @@ pub(crate) fn run(args: WatchArgs) -> Result<Value> {
     let root = requested
         .canonicalize()
         .map_err(|e| KioError::io(e.to_string(), requested.display().to_string()))?;
-    match command {
+    let body = match command {
         WatchCommand::Run {
             reconcile_interval_seconds,
-        } => run_foreground(&root, reconcile_interval_seconds),
-        WatchCommand::Status => inspect(&root, false),
-        WatchCommand::Stop => inspect(&root, true),
+        } => run_foreground(ctx, &root, reconcile_interval_seconds, control)
+            .map(WatchResponse::Foreground),
+        WatchCommand::Status => inspect(&root, false, control).map(WatchResponse::Status),
+        WatchCommand::Stop => inspect(&root, true, control).map(WatchResponse::Stop),
         WatchCommand::Service(_) => unreachable!("service commands return before root resolution"),
-    }
+    }?;
+    Ok(CommandResponse {
+        body: ResponseBody::Watch(body),
+        completion: Completion::Complete,
+    })
 }
 
-pub(crate) fn inspect_liveness(root: &Path) -> Result<Value> {
-    inspect(root, false)
+pub(crate) fn inspect_liveness(
+    root: &Path,
+    control: &ControlHandle,
+) -> Result<WatchLifecycleResponse> {
+    inspect(root, false, control)
 }
 
-fn inspect(root: &Path, stop: bool) -> Result<Value> {
-    let Some(directory) = state_directory(root, false)? else {
-        return Ok(json!({"status":"stopped", "root":root, "last_observation":null}));
+fn inspect(root: &Path, stop: bool, control: &ControlHandle) -> Result<WatchLifecycleResponse> {
+    let Some(directory) = state_directory(root, false, control)? else {
+        return Ok(WatchLifecycleResponse {
+            status: "stopped".to_owned(),
+            root: root.to_path_buf(),
+            last_observation: None,
+        });
     };
     let lock = open_watch_instance_lock(&directory, false)?;
     let running = match lock {
@@ -111,20 +121,30 @@ fn inspect(root: &Path, stop: bool) -> Result<Value> {
         .map_err(watch_error)?;
         directory.write_atomic(Path::new(STOP), &request, Publication::Upsert)?;
     }
-    Ok(json!({
-        "status": if running { if stop { "stop_requested" } else { "running" } } else { "stopped" },
-        "root":root,
-        "last_observation":state,
-    }))
+    Ok(WatchLifecycleResponse {
+        status: if running {
+            if stop { "stop_requested" } else { "running" }
+        } else {
+            "stopped"
+        }
+        .to_owned(),
+        root: root.to_path_buf(),
+        last_observation: state,
+    })
 }
 
-fn run_foreground(root: &Path, interval: u64) -> Result<Value> {
+fn run_foreground(
+    ctx: &AppContext,
+    root: &Path,
+    interval: u64,
+    control: &ControlHandle,
+) -> Result<WatchLifecycleResponse> {
     if !(1..=86400).contains(&interval) {
         return Err(KioError::invalid_usage(
             "reconciliation interval must be 1 through 86400 seconds",
         ));
     }
-    let repo = open_existing_managed_root(root)?;
+    let repo = open_existing_managed_root(root, control)?;
     let binding = binding_for_repo(&repo)?;
     let record = read_record(&binding)?;
     if record.authority != ManagementAuthority::Root {
@@ -132,7 +152,7 @@ fn run_foreground(root: &Path, interval: u64) -> Result<Value> {
             "watch requires an explicitly registered root; use its management root",
         ));
     }
-    let directory = state_directory(root, true)?
+    let directory = state_directory(root, true, control)?
         .ok_or_else(|| watch_error("watch state directory is unavailable"))?;
     crate::platform::validate_watch_queue_directory(&directory).map_err(watch_error)?;
     let lock = open_watch_instance_lock(&directory, true)?
@@ -146,6 +166,7 @@ fn run_foreground(root: &Path, interval: u64) -> Result<Value> {
     let watch_root =
         WatchRoot::new(&record.scope_id, root.to_path_buf(), 1).map_err(watch_error)?;
     let reconciler = LocalReconciler {
+        control: control.clone(),
         binding,
         scope_id: record.scope_id.clone(),
     };
@@ -176,7 +197,7 @@ fn run_foreground(root: &Path, interval: u64) -> Result<Value> {
         reconcile_interval_seconds: interval,
     };
     publish_state(&directory, &engine, &mut state)?;
-    crate::context::diagnostic(
+    ctx.interaction.diagnostic(
         "watch started; reconciliation is local and grants no external-send permission",
     );
     let mut next_observation = Instant::now();
@@ -200,10 +221,15 @@ fn run_foreground(root: &Path, interval: u64) -> Result<Value> {
     drop(_native);
     drop(engine);
     drop(lock);
-    Ok(json!({"status":"stopped", "root":root, "last_observation":state}))
+    Ok(WatchLifecycleResponse {
+        status: "stopped".to_owned(),
+        root: root.to_path_buf(),
+        last_observation: Some(state),
+    })
 }
 
 struct LocalReconciler {
+    control: ControlHandle,
     binding: ManagementBinding,
     scope_id: String,
 }
@@ -215,13 +241,13 @@ impl Reconcile for LocalReconciler {
         _: DirtyReason,
         _: &[PathBuf],
     ) -> std::result::Result<ReconcileCompletion, WatchError> {
-        let result = (|| -> Result<Value> {
+        let result = (|| -> Result<CommandResponse> {
             self.binding.revalidate()?;
             let record = read_record(&self.binding)?;
             if record.scope_id != self.scope_id || record.authority != ManagementAuthority::Root {
                 return Err(watch_error("registered watch root authority changed"));
             }
-            let repo = open_existing_managed_root(&root.canonical_root)?;
+            let repo = open_existing_managed_root(&root.canonical_root, &self.control)?;
             let current = binding_for_repo(&repo)?;
             if current.directory_identity() != self.binding.directory_identity()
                 || repo.scope_identity()?.scope_id != self.scope_id
@@ -247,43 +273,78 @@ impl Reconcile for LocalReconciler {
             )
         })();
         let output = result.map_err(|error| WatchError::invariant(error.to_string()))?;
-        if crate::peek_exit_override(&output).is_some()
-            || output.get("status").and_then(Value::as_str) == Some("deferred")
+        let index = match &output.body {
+            ResponseBody::Index(index) => index,
+            _ => unreachable!("Index request returns an Index response"),
+        };
+        if output.completion != Completion::Complete || matches!(index, IndexResponse::Deferred(_))
         {
             // Keep the durable queue retry semantics, while making a partial
             // index result diagnosable without copying its potentially large
             // child-scope rows into watcher output or device state.
-            eprintln!(
-                "watch reconciliation incomplete: {}",
-                incomplete_output_reason(&output)
-            );
+            Unattended.diagnostic(&format!("watch reconciliation incomplete: {}", {
+                let (status, has_more, rows_total) = match index {
+                    IndexResponse::Published(report) => (
+                        report.status.as_str(),
+                        report
+                            .child_scope_discovery
+                            .as_ref()
+                            .map(|discovery| discovery.has_more),
+                        report
+                            .child_scope_discovery
+                            .as_ref()
+                            .map(|discovery| discovery.rows_total),
+                    ),
+                    IndexResponse::Preview(report) => (
+                        report.status.as_str(),
+                        report
+                            .child_scope_discovery
+                            .as_ref()
+                            .map(|discovery| discovery.has_more),
+                        None,
+                    ),
+                    IndexResponse::Deferred(report) => (report.status.as_str(), None, None),
+                };
+                incomplete_output_reason(
+                    status,
+                    index.error_code(),
+                    output.completion,
+                    has_more,
+                    rows_total,
+                )
+            }));
             return Ok(ReconcileCompletion::Incomplete);
         }
         Ok(ReconcileCompletion::Complete)
     }
 }
 
-fn incomplete_output_reason(output: &Value) -> String {
-    let status = output
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("missing");
-    let error_code = output
-        .get("error_code")
-        .and_then(Value::as_str)
-        .unwrap_or("missing");
-    let exit_code = crate::peek_exit_override(output)
+fn incomplete_output_reason(
+    status: &str,
+    error_code: Option<&str>,
+    completion: Completion,
+    has_more: Option<bool>,
+    rows_total: Option<u64>,
+) -> String {
+    let error_code = error_code.unwrap_or("missing");
+
+    // Preserve the existing numeric diagnostic text using core's established
+    // exit classifications. Completion controls retry; these values never
+    // determine a process exit or a successful wire response in the app.
+    let diagnostic_exit = match completion {
+        Completion::Complete => None,
+        Completion::Partial => Some(ExitCode::PartialFailure),
+        Completion::Permanent => Some(ExitCode::PermanentFailure),
+        Completion::AuthRequired => Some(ExitCode::AuthError),
+        Completion::BudgetBlocked => Some(ExitCode::BudgetExceeded),
+    };
+    let exit_code = diagnostic_exit
         .map(|code| code.code().to_string())
         .unwrap_or_else(|| "none".into());
-    let discovery = output.get("child_scope_discovery");
-    let has_more = discovery
-        .and_then(|value| value.get("has_more"))
-        .and_then(Value::as_bool)
+    let has_more = has_more
         .map(|value| value.to_string())
         .unwrap_or_else(|| "missing".into());
-    let rows_total = discovery
-        .and_then(|value| value.get("rows_total"))
-        .and_then(Value::as_u64)
+    let rows_total = rows_total
         .map(|value| value.to_string())
         .unwrap_or_else(|| "missing".into());
     format!(
@@ -304,6 +365,18 @@ impl Interaction for Unattended {
     }
     fn diagnostic(&self, message: &str) {
         eprintln!("{message}");
+    }
+    fn write_diagnostic(&self, text: &str) -> Result<()> {
+        std::io::stderr()
+            .lock()
+            .write_all(text.as_bytes())
+            .map_err(|error| KioError::io(error.to_string(), "stderr"))
+    }
+    fn flush_diagnostics(&self) -> Result<()> {
+        std::io::stderr()
+            .lock()
+            .flush()
+            .map_err(|error| KioError::io(error.to_string(), "stderr"))
     }
 }
 
@@ -345,8 +418,13 @@ fn requested_stop(directory: &StoreDirectory, instance: &str) -> Result<bool> {
     Ok(request.instance == instance)
 }
 
-fn state_directory(root: &Path, create: bool) -> Result<Option<StoreDirectory>> {
-    let registry = kio_index::registry::default_registry_path().map_err(crate::index_to_kio)?;
+fn state_directory(
+    root: &Path,
+    create: bool,
+    control: &ControlHandle,
+) -> Result<Option<StoreDirectory>> {
+    let registry = kio_index::registry::default_registry_path_with_control(control)
+        .map_err(crate::object_persistence::index_to_kio)?;
     let data = registry
         .parent()
         .ok_or_else(|| watch_error("device data directory is unavailable"))?;
@@ -362,11 +440,11 @@ fn state_directory(root: &Path, create: bool) -> Result<Option<StoreDirectory>> 
     // resolver; canonicalizing and reopening a diagnostic pathname here would
     // make a later rename select attacker-controlled state instead.
     if create {
-        crate::private_state::ensure_private_directory(&target)
+        crate::private_state::ensure_private_directory(&target, control)
             .map(Some)
             .map_err(watch_error)
     } else {
-        crate::private_state::open_readonly(&target).map_err(watch_error)
+        crate::private_state::open_readonly(&target, control).map_err(watch_error)
     }
 }
 
@@ -399,7 +477,9 @@ mod tests {
     fn private_watch_directory() -> (tempfile::TempDir, StoreDirectory) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().canonicalize().unwrap().join("watch-state");
-        let directory = crate::private_state::ensure_private_directory(&path).unwrap();
+        let directory =
+            crate::private_state::ensure_private_directory(&path, &ControlHandle::default())
+                .unwrap();
         (temp, directory)
     }
 
@@ -467,14 +547,20 @@ mod tests {
 
     #[test]
     fn incomplete_output_reason_is_bounded_and_identifies_child_discovery() {
-        let mut output = json!({
+        let output = json!({
             "status": "indexed",
             "error_code": "KIO-E-INDEX-PARTIAL-001",
             "child_scope_discovery": {"has_more": true, "rows_total": 128},
         });
-        crate::set_exit_override(&mut output, ExitCode::PartialFailure);
+
         assert_eq!(
-            incomplete_output_reason(&output),
+            incomplete_output_reason(
+                output["status"].as_str().unwrap_or("missing"),
+                output["error_code"].as_str(),
+                Completion::Partial,
+                output["child_scope_discovery"]["has_more"].as_bool(),
+                output["child_scope_discovery"]["rows_total"].as_u64(),
+            ),
             "status=indexed error_code=KIO-E-INDEX-PARTIAL-001 exit_code=3 child_discovery_has_more=true child_discovery_rows_total=128"
         );
     }

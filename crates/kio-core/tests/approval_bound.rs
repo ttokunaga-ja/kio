@@ -102,7 +102,7 @@ fn retained_writes_block_concurrent_revoke_and_never_resurrect_stale_pending() {
 
     // The owned guard determines ordering: the other repository must fail
     // before it can enter revoke's read/modify/write section.
-    let held = repo.lock_store().unwrap();
+    let held = repo.lock_store_in_session(repo.lock_session()).unwrap();
     let root = fixture.path().to_path_buf();
     let blocked = thread::spawn(move || {
         Repository::open(&root)

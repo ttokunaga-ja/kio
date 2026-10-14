@@ -163,8 +163,6 @@ pub struct PendingExchange<'a> {
     public: &'a StoreDirectory,
     prepared: &'a StoreDirectory,
     intent: Intent,
-    #[cfg(debug_assertions)]
-    test_control: crate::test_control::CoreTestControl,
     source: Option<File>,
     target: File,
     state: Placement,
@@ -319,7 +317,7 @@ impl PendingExchange<'_> {
                     GcFault::AfterWindowsSnapshotStateExchangeIntentRemove
                 }
             };
-            if self.test_control.gc_fault.known() == Some(&fault) {
+            if self.owner.control().debug().core.gc_fault.known() == Some(&fault) {
                 return Err(KioError::new(
                     "KIO-E-GC-TEST-INTERRUPTED-001",
                     "GC exchange test fault interrupted the sweep",
@@ -396,8 +394,6 @@ pub fn open_pending_under_lock<'a>(
     max: u64,
     authority_binding: &str,
 ) -> Result<Option<PendingExchange<'a>>> {
-    #[cfg(debug_assertions)]
-    let test_control = crate::test_control::capture_for_operation().core;
     inspect_pending(owner)?;
     owner.recover_atomic(&[owner])?;
     let Some(bytes) = owner.read_optional(Path::new(INTENT), MAX_INTENT)? else {
@@ -440,8 +436,6 @@ pub fn open_pending_under_lock<'a>(
     }
     let state = placement(roles[0], roles[1], roles[2])?;
     let pending = PendingExchange {
-        #[cfg(debug_assertions)]
-        test_control,
         owner,
         public,
         prepared,
@@ -469,8 +463,6 @@ pub fn begin<'a>(
     authority_binding: &str,
     validate_initial: impl FnOnce(&File, &File) -> Result<()>,
 ) -> Result<PendingExchange<'a>> {
-    #[cfg(debug_assertions)]
-    let test_control = crate::test_control::capture_for_operation().core;
     validate_leaves(kind, public_leaf, prepared_leaf)?;
     if inspect_pending(owner)? {
         return Err(failure("exchange already pending"));
@@ -502,8 +494,6 @@ pub fn begin<'a>(
     target.sync_all().map_err(|e| failure(e.to_string()))?;
     owner.write_atomic(Path::new(INTENT), &bytes, Publication::CreateOnly)?;
     let pending = PendingExchange {
-        #[cfg(debug_assertions)]
-        test_control,
         owner,
         public,
         prepared,
@@ -526,7 +516,7 @@ mod windows_tests {
     #[test]
     fn atomic_journal_boot_and_cleanup_interruptions_preserve_exchange_files() {
         use crate::durability::DurabilityPoint;
-        use crate::test_control::{DebugTestControl, Selector, install_scoped};
+        use crate::test_control::{DebugTestControl, Selector};
         for point in [
             DurabilityPoint::AtomicWriteStaged,
             DurabilityPoint::AtomicWritePublished,
@@ -565,9 +555,10 @@ mod windows_tests {
             control.core.durability_point = Selector::Known(point);
             control.core.durability_ready = Some(signal);
             {
-                let _guard = install_scoped(control);
+                let controlled_owner =
+                    owner.rebind_with_control(crate::control::ControlHandle::new(control));
                 let result = begin(
-                    owner,
+                    &controlled_owner,
                     public,
                     "in_progress",
                     prepared,

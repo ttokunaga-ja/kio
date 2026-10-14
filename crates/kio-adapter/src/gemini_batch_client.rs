@@ -36,8 +36,11 @@
 //! the hermetic suite (`docs/07-adapter-spec.md` §5.3); the contract is covered through the mock
 //! seam ([`TEST_GEMINI_BATCH_ENV`]).
 
+use crate::tool_lock::AdapterRuntimeSettings;
+use kio_core::control::ControlHandle;
 #[cfg(debug_assertions)]
 use std::io::Write as _;
+use std::sync::Arc;
 
 #[cfg(debug_assertions)]
 use serde::Deserialize;
@@ -45,7 +48,7 @@ use serde_json::{Value, json};
 
 use crate::batch_recovery::{BatchRecoveryContext, PinnedBatchIdentity, configured_qualifier};
 use crate::http_policy::{
-    HttpPolicy, HttpResponse, authenticated_agent, read_json_bounded, require_success,
+    AuthenticatedHttpClient, HttpPolicy, HttpResponse, read_json_bounded, require_success,
 };
 use crate::{AdapterError, Result};
 
@@ -504,12 +507,15 @@ pub(crate) fn parse_inlined_results(value: &Value) -> Result<Vec<GeminiBatchEmbe
 #[derive(Debug, Clone)]
 pub struct EnvGeminiBatchClient {
     identity: PinnedBatchIdentity,
-    http_policy: HttpPolicy,
+    http: AuthenticatedHttpClient,
 }
 
 impl EnvGeminiBatchClient {
-    pub fn new(context: &BatchRecoveryContext) -> Result<Self> {
-        let credential = crate::tool_lock::resolve_role_api_key("embedding")?.ok_or_else(|| {
+    pub fn new(
+        settings: Arc<AdapterRuntimeSettings>,
+        context: &BatchRecoveryContext,
+    ) -> Result<Self> {
+        let credential = settings.resolve_role_api_key("embedding")?.ok_or_else(|| {
             AdapterError::Auth("declared gemini batch credential is unavailable".into())
         })?;
         Self::from_captured(context, GEMINI_API_ORIGIN, credential)
@@ -523,23 +529,19 @@ impl EnvGeminiBatchClient {
         let qualifier = configured_qualifier(GEMINI_PROJECT_ID_ENV)?;
         Ok(Self {
             identity: context.capture("gemini", origin, qualifier.as_deref(), credential)?,
-            http_policy: HttpPolicy::default(),
+            http: AuthenticatedHttpClient::new(HttpPolicy::default()),
         })
     }
 
     #[cfg(test)]
-    fn with_base_url(base_url: impl Into<String>) -> Self {
-        crate::tool_lock::with_test_role_auth("embedding", || {
-            let credential = crate::tool_lock::resolve_role_api_key("embedding")
-                .unwrap()
-                .unwrap();
-            Self::from_captured(
-                &BatchRecoveryContext::from_key([7; 32]),
-                &base_url.into(),
-                credential,
-            )
-            .unwrap()
-        })
+    fn with_base_url(settings: Arc<AdapterRuntimeSettings>, base_url: impl Into<String>) -> Self {
+        let credential = settings.resolve_role_api_key("embedding").unwrap().unwrap();
+        Self::from_captured(
+            &BatchRecoveryContext::from_key([7; 32]),
+            &base_url.into(),
+            credential,
+        )
+        .unwrap()
     }
 
     fn base_url(&self) -> &str {
@@ -548,7 +550,9 @@ impl EnvGeminiBatchClient {
 
     fn get_json(&self, url: &str, max_bytes: usize, context: &str) -> Result<Value> {
         let api_key = self.identity.credential();
-        let response = authenticated_agent(self.http_policy)
+        let response = self
+            .http
+            .agent()
             .get(url)
             .header("x-goog-api-key", api_key)
             .header("Accept-Encoding", "identity")
@@ -563,7 +567,9 @@ impl EnvGeminiBatchClient {
     fn get_batch_listing(&self, page_token: Option<&str>) -> Result<Value> {
         let api_key = self.identity.credential();
         let url = format!("{}/v1beta/batches", self.base_url());
-        let request = authenticated_agent(self.http_policy)
+        let request = self
+            .http
+            .agent()
             .get(&url)
             .query("pageSize", BATCH_LIST_PAGE_SIZE.to_string());
         let request = match page_token {
@@ -599,7 +605,9 @@ impl GeminiBatchClient for EnvGeminiBatchClient {
             self.base_url(),
             qualified_model(model)
         );
-        let response = authenticated_agent(self.http_policy)
+        let response = self
+            .http
+            .agent()
             .post(&url)
             .header("x-goog-api-key", api_key)
             .header("Accept-Encoding", "identity")
@@ -964,21 +972,31 @@ impl GeminiBatchClient for MockGeminiBatchClient {
     }
 }
 
-/// The active embedding Batch client: the mock seam when
-/// [`TEST_GEMINI_BATCH_ENV`] is set, otherwise the real client when an API key
-/// is resolvable from declared `tools.toml [embedding] auth`.
+/// The active embedding Batch client when an API key is resolvable from
+/// declared `tools.toml [embedding] auth`. The controlled entry point can
+/// select a mock using its captured debug snapshot.
 /// `None` means the lane is unavailable and the caller must not send.
 pub fn resolve_gemini_batch_client(
+    settings: &AdapterRuntimeSettings,
     recovery_context: impl FnOnce() -> Result<BatchRecoveryContext>,
+) -> Result<Option<Box<dyn GeminiBatchClient>>> {
+    resolve_gemini_batch_client_with_control(settings, recovery_context, &ControlHandle::default())
+}
+
+/// Resolve a client using the invocation's immutable debug snapshot.
+pub fn resolve_gemini_batch_client_with_control(
+    settings: &AdapterRuntimeSettings,
+    recovery_context: impl FnOnce() -> Result<BatchRecoveryContext>,
+    _control: &ControlHandle,
 ) -> Result<Option<Box<dyn GeminiBatchClient>>> {
     #[cfg(debug_assertions)]
     {
         use kio_core::test_control::Selector;
-        if let Selector::Known(raw) = crate::debug_test_control().adapters.gemini_batch {
-            return Ok(Some(Box::new(MockGeminiBatchClient::from_env_value(&raw)?)));
+        if let Selector::Known(raw) = &_control.debug().adapters.gemini_batch {
+            return Ok(Some(Box::new(MockGeminiBatchClient::from_env_value(raw)?)));
         }
     }
-    if let Some(credential) = crate::tool_lock::resolve_role_api_key("embedding")? {
+    if let Some(credential) = settings.resolve_role_api_key("embedding")? {
         let context = recovery_context()?;
         return Ok(Some(Box::new(EnvGeminiBatchClient::from_captured(
             &context,
@@ -1008,13 +1026,13 @@ mod tests {
         let old = crate::batch_recovery::with_test_env_credential(
             "embedding",
             "KIO_TEST_CAPTURED_BATCH_KEY",
-            || {
-                let old = EnvGeminiBatchClient::new(&context).unwrap();
+            |settings| {
+                let old = EnvGeminiBatchClient::new(Arc::new(settings.clone()), &context).unwrap();
                 let _rotated = kio_core::test_control::TestEnvGuard::set(
                     "KIO_TEST_CAPTURED_BATCH_KEY",
                     "credential-after",
                 );
-                let new = EnvGeminiBatchClient::new(&context).unwrap();
+                let new = EnvGeminiBatchClient::new(Arc::new(settings.clone()), &context).unwrap();
                 assert_ne!(
                     old.provider_scope_id().unwrap(),
                     new.provider_scope_id().unwrap()
@@ -1098,7 +1116,7 @@ mod tests {
         );
     }
 
-    fn with_test_gemini_auth<T>(operation: impl FnOnce() -> T) -> T {
+    fn with_test_gemini_auth<T>(operation: impl FnOnce(&AdapterRuntimeSettings) -> T) -> T {
         crate::tool_lock::with_test_role_auth("embedding", operation)
     }
 
@@ -1114,7 +1132,7 @@ mod tests {
     ) -> (
         String,
         std::thread::JoinHandle<Vec<String>>,
-        crate::http_policy::test_tls::TrustGuard,
+        crate::http_policy::AuthenticatedHttpClient,
     ) {
         use std::io::{Read as _, Write as _};
         use std::net::TcpListener;
@@ -1123,7 +1141,7 @@ mod tests {
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
         let tls = crate::http_policy::test_tls::Fixture::new();
-        let trust = tls.trust();
+        let http = tls.client(HttpPolicy::default());
         let handle = std::thread::spawn(move || {
             let mut requests = Vec::new();
             for response in responses {
@@ -1144,7 +1162,7 @@ mod tests {
             }
             requests
         });
-        (format!("https://{address}"), handle, trust)
+        (format!("https://{address}"), handle, http)
     }
 
     #[test]
@@ -1507,15 +1525,19 @@ mod tests {
         let _guard = crate::batch_client::test_env_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let (base, server, _trust) = spawn_listing_server(vec![
+        let (base, server, http) = spawn_listing_server(vec![
             http_response(r#"{"operations":[],"nextPageToken":"cursor /?&+%"}"#),
             http_response(
                 r#"{"operations":[{"name":"batches/after-empty","state":"BATCH_STATE_RUNNING"}]}"#,
             ),
         ]);
-        let client = EnvGeminiBatchClient::with_base_url(base);
+        let client = with_test_gemini_auth(|settings| {
+            let mut client = EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base);
+            client.http = http;
+            client
+        });
 
-        let jobs = with_test_gemini_auth(|| client.list_jobs()).unwrap();
+        let jobs = client.list_jobs().unwrap();
 
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].name, "batches/after-empty");
@@ -1534,13 +1556,17 @@ mod tests {
         let _guard = crate::batch_client::test_env_lock()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let (base, server, _trust) = spawn_listing_server(vec![
+        let (base, server, http) = spawn_listing_server(vec![
             http_response(r#"{"operations":[],"nextPageToken":"again"}"#),
             http_response(r#"{"operations":[],"nextPageToken":"again"}"#),
         ]);
-        let client = EnvGeminiBatchClient::with_base_url(base);
+        let client = with_test_gemini_auth(|settings| {
+            let mut client = EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base);
+            client.http = http;
+            client
+        });
 
-        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        let error = client.list_jobs().unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(_)));
         assert_eq!(server.join().unwrap().len(), 2);
     }
@@ -1551,11 +1577,15 @@ mod tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
 
-        let (base, server, _trust) = spawn_listing_server(vec![http_response(
+        let (base, server, http) = spawn_listing_server(vec![http_response(
             r#"{"operations":[],"nextPageToken":17}"#,
         )]);
-        let client = EnvGeminiBatchClient::with_base_url(base);
-        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        let client = with_test_gemini_auth(|settings| {
+            let mut client = EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base);
+            client.http = http;
+            client
+        });
+        let error = client.list_jobs().unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(_)));
         assert_eq!(server.join().unwrap().len(), 1);
 
@@ -1567,11 +1597,15 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
-        let (base, server, _trust) = spawn_listing_server(vec![http_response(
+        let (base, server, http) = spawn_listing_server(vec![http_response(
             &json!({ "operations": operations }).to_string(),
         )]);
-        let client = EnvGeminiBatchClient::with_base_url(base);
-        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        let client = with_test_gemini_auth(|settings| {
+            let mut client = EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base);
+            client.http = http;
+            client
+        });
+        let error = client.list_jobs().unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(_)));
         assert_eq!(server.join().unwrap().len(), 1);
     }
@@ -1588,10 +1622,14 @@ mod tests {
                 ))
             })
             .collect();
-        let (base, server, _trust) = spawn_listing_server(responses);
-        let client = EnvGeminiBatchClient::with_base_url(base);
+        let (base, server, http) = spawn_listing_server(responses);
+        let client = with_test_gemini_auth(|settings| {
+            let mut client = EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), base);
+            client.http = http;
+            client
+        });
 
-        let error = with_test_gemini_auth(|| client.list_jobs()).unwrap_err();
+        let error = client.list_jobs().unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(_)));
         assert_eq!(server.join().unwrap().len(), BATCH_LIST_MAX_PAGES);
     }

@@ -82,7 +82,7 @@ fn batch_ocr_image_is_owned_reopenable_and_retained_for_its_source_unit() {
         page_number: None,
     };
     let tool_profile_hash = hash_bytes(b"markdown");
-    let normalized = super::normalized_units_from_response(
+    let normalized = crate::markdownize::execution::normalized_units_from_response(
         &repo,
         "image/png",
         &source,
@@ -102,7 +102,7 @@ fn batch_ocr_image_is_owned_reopenable_and_retained_for_its_source_unit() {
     );
     assert!(normalized[0].markdown.contains(&expected_uri));
     assert_eq!(response.mode_used, AdapterMarkdownizeMode::Full);
-    let manifest = super::manifest_from_units(
+    let manifest = crate::markdownize::execution::manifest_from_units(
         std::slice::from_ref(&prepared),
         &normalized,
         &raw_hash,

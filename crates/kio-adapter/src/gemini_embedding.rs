@@ -15,6 +15,7 @@ use crate::http_policy::{
     authenticated_agent, read_json_bounded, require_success,
 };
 use crate::identity::{is_mutable_model_alias, tool_profile_hash};
+use crate::tool_lock::AdapterRuntimeSettings;
 use crate::traits::{EmbeddingAdapter, PreferredRequestKind};
 use crate::types::{
     AdapterKind, AdapterProfile, AdapterUsage, BillableUnit, BillableUnitKind, EmbeddingContent,
@@ -23,6 +24,7 @@ use crate::types::{
 };
 use crate::{AdapterError, Result};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 /// Adopted embedding profile constants. Non-adapter crates access this profile
 /// through `crate::catalog`, not by naming this adapter directly.
@@ -63,16 +65,29 @@ pub struct EmbedBatchOutput {
     pub prompt_tokens: Option<u64>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct EnvGeminiEmbeddingClient {
+    settings: Arc<AdapterRuntimeSettings>,
     base_url: Option<String>,
     http_policy: HttpPolicy,
 }
 
+// Runtime settings contain credentials for both roles and must not enter diagnostics.
+impl std::fmt::Debug for EnvGeminiEmbeddingClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvGeminiEmbeddingClient")
+            .field("base_url", &self.base_url)
+            .field("http_policy", &self.http_policy)
+            .finish_non_exhaustive()
+    }
+}
+
 impl EnvGeminiEmbeddingClient {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(settings: Arc<AdapterRuntimeSettings>) -> Self {
         Self {
+            settings,
             base_url: None,
             http_policy: HttpPolicy::default(),
         }
@@ -80,8 +95,12 @@ impl EnvGeminiEmbeddingClient {
 
     #[allow(dead_code)]
     #[must_use]
-    pub fn with_base_url(base_url: impl Into<String>) -> Self {
+    pub fn with_base_url(
+        settings: Arc<AdapterRuntimeSettings>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
+            settings,
             base_url: Some(base_url.into()),
             http_policy: HttpPolicy::default(),
         }
@@ -95,12 +114,14 @@ impl EnvGeminiEmbeddingClient {
             .to_owned()
     }
 
-    fn api_key() -> Result<String> {
-        crate::tool_lock::resolve_role_api_key("embedding")?.ok_or_else(|| {
-            AdapterError::Auth(
-                "no Gemini embedding API key: declare tools.toml `[embedding] auth`".to_owned(),
-            )
-        })
+    fn api_key(&self) -> Result<String> {
+        self.settings
+            .resolve_role_api_key("embedding")?
+            .ok_or_else(|| {
+                AdapterError::Auth(
+                    "no Gemini embedding API key: declare tools.toml `[embedding] auth`".to_owned(),
+                )
+            })
     }
 }
 
@@ -109,7 +130,7 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
         if !is_mutable_model_alias(configured_model) {
             return Ok(configured_model.to_owned());
         }
-        let api_key = Self::api_key()?;
+        let api_key = self.api_key()?;
         let response = authenticated_agent(self.http_policy)
             .get(&format!("{}/v1beta/models", self.base_url()))
             .header("x-goog-api-key", &api_key)
@@ -171,7 +192,7 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
         dimensions: u32,
         idempotency_header: Option<(&str, &str)>,
     ) -> Result<EmbedBatchOutput> {
-        let api_key = Self::api_key()?;
+        let api_key = self.api_key()?;
         // `:batchEmbedContents` embeds the whole batch in ONE SYNCHRONOUS
         // request — the batching here is client-side, and this is the Sync lane
         // even though the endpoint name contains "batch". The provider's actual
@@ -323,16 +344,6 @@ pub struct GeminiEmbeddingAdapter<C = EnvGeminiEmbeddingClient> {
     provider_idempotency: crate::types::ProviderIdempotency,
 }
 
-impl Default for GeminiEmbeddingAdapter<EnvGeminiEmbeddingClient> {
-    fn default() -> Self {
-        Self::new(
-            EnvGeminiEmbeddingClient::new(),
-            ADOPTED_MODEL_PIN,
-            ADOPTED_DIMENSIONS,
-        )
-    }
-}
-
 impl<C> GeminiEmbeddingAdapter<C> {
     pub fn new(client: C, configured_model: impl Into<String>, dimensions: u32) -> Self {
         Self {
@@ -361,63 +372,81 @@ impl<C> GeminiEmbeddingAdapter<C> {
     /// The adopted profile JSON value (07 §5.3).
     #[must_use]
     pub fn profile_value(&self) -> Value {
-        // Network-free (like Mistral): if an unresolved mutable alias is still
-        // held, use a deterministic placeholder rather than resolving over HTTP.
-        let model_pin = if is_mutable_model_alias(&self.configured_model) {
-            format!(
-                "{}-unresolved",
-                self.configured_model.trim_end_matches("-latest")
-            )
-        } else {
-            self.configured_model.clone()
-        };
-        json!({
-            "adapter_kind": "embedding",
-            "adapter_role": "multimodal",
-            "dimensions": self.dimensions,
-            "distance": "cosine",
-            // 2026-07-24 (07 §5.3 contextual-embedding addendum): Kio prepends a
-            // chunk's humanized filename to the embedded text
-            // (`embedding_store::contextualized_embedding_input`). That changes
-            // what a chunk vector MEANS, so it is part of the vector-space
-            // identity the profile hash pins (03 §7 compat gate): a store of
-            // pre-addendum, non-contextual vectors must read as INCOMPATIBLE with
-            // a contextual query profile, and bumping this field is what makes it
-            // so (and re-triggers a full re-embed on the next online index).
-            "input_construction": "chunk_filename_context_v1",
-            "modality": "multimodal",
-            "model_or_tool_family": ADOPTED_MODEL_FAMILY,
-            "model_version_pin": model_pin,
-            "runtime_kind": "cloud",
-            "spec_version": 1
-        })
+        gemini_embedding_profile_value(&self.configured_model, self.dimensions)
+    }
+}
+
+fn gemini_embedding_profile_value(configured_model: &str, dimensions: u32) -> Value {
+    // Network-free (like Mistral): if an unresolved mutable alias is still
+    // held, use a deterministic placeholder rather than resolving over HTTP.
+    let model_pin = if is_mutable_model_alias(configured_model) {
+        format!(
+            "{}-unresolved",
+            configured_model.trim_end_matches("-latest")
+        )
+    } else {
+        configured_model.to_owned()
+    };
+    json!({
+        "adapter_kind": "embedding",
+        "adapter_role": "multimodal",
+        "dimensions": dimensions,
+        "distance": "cosine",
+        // 2026-07-24 (07 §5.3 contextual-embedding addendum): Kio prepends a
+        // chunk's humanized filename to the embedded text
+        // (`embedding_store::contextualized_embedding_input`). That changes
+        // what a chunk vector MEANS, so it is part of the vector-space
+        // identity the profile hash pins (03 §7 compat gate): a store of
+        // pre-addendum, non-contextual vectors must read as INCOMPATIBLE with
+        // a contextual query profile, and bumping this field is what makes it
+        // so (and re-triggers a full re-embed on the next online index).
+        "input_construction": "chunk_filename_context_v1",
+        "modality": "multimodal",
+        "model_or_tool_family": ADOPTED_MODEL_FAMILY,
+        "model_version_pin": model_pin,
+        "runtime_kind": "cloud",
+        "spec_version": 1
+    })
+}
+
+/// Construct the cloud adapter profile without credentials or network access.
+#[must_use]
+pub(crate) fn gemini_embedding_profile(
+    configured_model: &str,
+    dimensions: u32,
+    provider_idempotency: crate::types::ProviderIdempotency,
+) -> AdapterProfile {
+    let profile = gemini_embedding_profile_value(configured_model, dimensions);
+    AdapterProfile {
+        adapter_kind: AdapterKind::Embedding,
+        adapter_id: "gemini_embedding_2".to_owned(),
+        execution_mode: ExecutionMode::OnlineApi,
+        tool_profile_hash: tool_profile_hash(&profile)
+            .expect("built-in Gemini embedding profile is valid"),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        capability_flags: vec!["text".to_owned(), "multimodal".to_owned()],
+        allow_network: true,
+        // QA18: Gemini embedding bills per input token; there is no
+        // output-token leg for an embedding response.
+        billable_kinds: vec![crate::types::BillableUnitKind::TokensIn],
+        reject_billing: Some(crate::types::BillingDeclaration::Billable),
+        // QA13 (04 §5.5 L880): the real Gemini `:batchEmbedContents`
+        // endpoint offers no idempotency parameter — "job 作成に
+        // idempotency key の無い provider が現実" — so the shipped
+        // adapter's `::new()` default, `NotProvided`, flows straight
+        // through here. Only a test-seam adapter overrides it via
+        // `with_provider_idempotency`.
+        provider_idempotency,
     }
 }
 
 impl<C: GeminiEmbeddingClient> EmbeddingAdapter for GeminiEmbeddingAdapter<C> {
     fn profile(&self) -> AdapterProfile {
-        let profile = self.profile_value();
-        AdapterProfile {
-            adapter_kind: AdapterKind::Embedding,
-            adapter_id: "gemini_embedding_2".to_owned(),
-            execution_mode: ExecutionMode::OnlineApi,
-            tool_profile_hash: tool_profile_hash(&profile)
-                .expect("built-in Gemini embedding profile is valid"),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            capability_flags: vec!["text".to_owned(), "multimodal".to_owned()],
-            allow_network: true,
-            // QA18: Gemini embedding bills per input token; there is no
-            // output-token leg for an embedding response.
-            billable_kinds: vec![crate::types::BillableUnitKind::TokensIn],
-            reject_billing: Some(crate::types::BillingDeclaration::Billable),
-            // QA13 (04 §5.5 L880): the real Gemini `:batchEmbedContents`
-            // endpoint offers no idempotency parameter — "job 作成に
-            // idempotency key の無い provider が現実" — so the shipped
-            // adapter's `::new()` default, `NotProvided`, flows straight
-            // through here. Only a test-seam adapter overrides it via
-            // `with_provider_idempotency`.
-            provider_idempotency: self.provider_idempotency.clone(),
-        }
+        gemini_embedding_profile(
+            &self.configured_model,
+            self.dimensions,
+            self.provider_idempotency.clone(),
+        )
     }
 
     /// 07 §5.3 の 2026-07-24 訂正: the Gemini Developer API bills an embedding
@@ -569,6 +598,58 @@ mod tests {
                 prompt_tokens: Some(7),
             })
         }
+    }
+
+    #[test]
+    fn client_and_adapter_debug_omit_both_role_credentials() {
+        const MARKDOWN_SECRET: &str = "DEBUG-MARKDOWN-CANARY-7ea4";
+        const EMBEDDING_SECRET: &str = "DEBUG-EMBEDDING-CANARY-b189";
+        let settings = AdapterRuntimeSettings {
+            declarations: [
+                ("markdown", MARKDOWN_SECRET),
+                ("embedding", EMBEDDING_SECRET),
+            ]
+            .into_iter()
+            .map(|(role, secret)| {
+                (
+                    role.to_owned(),
+                    crate::tool_lock::DeclaredAdapter {
+                        auth: Some(format!("plain:{secret}")),
+                        ..crate::tool_lock::DeclaredAdapter::default()
+                    },
+                )
+            })
+            .collect(),
+            ..AdapterRuntimeSettings::default()
+        };
+        let client =
+            EnvGeminiEmbeddingClient::with_base_url(Arc::new(settings), "https://fixture.invalid");
+        let adapter =
+            GeminiEmbeddingAdapter::new(client.clone(), ADOPTED_MODEL_PIN, ADOPTED_DIMENSIONS);
+        for debug in [
+            format!("{client:?}"),
+            format!("{adapter:?}"),
+            format!("{client:#?}"),
+            format!("{adapter:#?}"),
+        ] {
+            assert!(!debug.contains(MARKDOWN_SECRET));
+            assert!(!debug.contains(EMBEDDING_SECRET));
+            assert!(!debug.contains("settings"));
+            assert!(debug.contains("https://fixture.invalid"));
+            assert!(debug.contains("http_policy"));
+        }
+    }
+
+    #[test]
+    fn explicit_client_settings_do_not_share_credentials() {
+        crate::tool_lock::with_test_role_auth("embedding", |settings| {
+            let configured = EnvGeminiEmbeddingClient::new(Arc::new(settings.clone()));
+            let unconfigured =
+                EnvGeminiEmbeddingClient::new(Arc::new(AdapterRuntimeSettings::default()));
+            assert_eq!(configured.api_key().unwrap(), "test-key");
+            assert!(matches!(unconfigured.api_key(), Err(AdapterError::Auth(_))));
+            assert_eq!(configured.api_key().unwrap(), "test-key");
+        });
     }
 
     #[test]

@@ -9,6 +9,7 @@ use crate::http_policy::{
     read_json_bounded, require_success,
 };
 use crate::identity::hash_bytes;
+use crate::tool_lock::AdapterRuntimeSettings;
 use crate::traits::{MarkdownizeAdapter, PreferredRequestKind};
 use crate::types::{
     AdapterKind, AdapterProfile, ExecutionMode, MarkdownUnit, MarkdownizeMode, MarkdownizeRequest,
@@ -23,6 +24,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 const MISTRAL_API_ORIGIN: &str = "https://api.mistral.ai";
 
@@ -114,17 +116,31 @@ pub trait MistralOcrClient: Clone {
     ) -> Result<OcrResponse>;
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Clone)]
 pub struct EnvMistralOcrClient {
+    settings: Arc<AdapterRuntimeSettings>,
     base_url: Option<String>,
     http_policy: HttpPolicy,
     response_policy: OcrResponsePolicy,
 }
 
+// Runtime settings contain credentials for both roles and must not enter diagnostics.
+impl std::fmt::Debug for EnvMistralOcrClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvMistralOcrClient")
+            .field("base_url", &self.base_url)
+            .field("http_policy", &self.http_policy)
+            .field("response_policy", &self.response_policy)
+            .finish_non_exhaustive()
+    }
+}
+
 impl EnvMistralOcrClient {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(settings: Arc<AdapterRuntimeSettings>) -> Self {
         Self {
+            settings,
             base_url: None,
             http_policy: HttpPolicy::default(),
             response_policy: OcrResponsePolicy::default(),
@@ -133,8 +149,12 @@ impl EnvMistralOcrClient {
 
     #[allow(dead_code)]
     #[must_use]
-    pub fn with_base_url(base_url: impl Into<String>) -> Self {
+    pub fn with_base_url(
+        settings: Arc<AdapterRuntimeSettings>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
+            settings,
             base_url: Some(base_url.into()),
             http_policy: HttpPolicy::default(),
             response_policy: OcrResponsePolicy::default(),
@@ -149,12 +169,14 @@ impl EnvMistralOcrClient {
             .to_owned()
     }
 
-    fn api_key() -> Result<String> {
-        crate::tool_lock::resolve_role_api_key("markdown")?.ok_or_else(|| {
-            AdapterError::Auth(
-                "no Mistral OCR API key: declare tools.toml `[markdown] auth`".to_owned(),
-            )
-        })
+    fn api_key(&self) -> Result<String> {
+        self.settings
+            .resolve_role_api_key("markdown")?
+            .ok_or_else(|| {
+                AdapterError::Auth(
+                    "no Mistral OCR API key: declare tools.toml `[markdown] auth`".to_owned(),
+                )
+            })
     }
 }
 
@@ -163,7 +185,7 @@ impl MistralOcrClient for EnvMistralOcrClient {
         if !configured_model.ends_with("-latest") {
             return Ok(configured_model.to_owned());
         }
-        let api_key = Self::api_key()?;
+        let api_key = self.api_key()?;
         let response = authenticated_agent(self.http_policy)
             .get(&format!("{}/v1/models", self.base_url()))
             .header("Authorization", &format!("Bearer {api_key}"))
@@ -215,7 +237,7 @@ impl MistralOcrClient for EnvMistralOcrClient {
         verified_raw_bytes: &[u8],
         idempotency_header: Option<(&str, &str)>,
     ) -> Result<OcrResponse> {
-        let api_key = Self::api_key()?;
+        let api_key = self.api_key()?;
         // R14-4: in incremental mode, restrict the OCR request to the changed+added
         // pages via the `pages` parameter (built from `prepared_unit_hint`), instead of
         // silently sending — and re-billing — the whole document every revision. Full
@@ -472,15 +494,8 @@ pub struct MistralOcrMarkdownizeAdapter<C = EnvMistralOcrClient> {
     bbox_annotation_enabled: bool,
     /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): defaults to
     /// `NotProvided` (the real, shipped Mistral OCR `/v1/ocr` endpoint offers
-    /// no provider idempotency key) — see [`Self::with_provider_idempotency`].
+    /// no provider idempotency key) — see `with_provider_idempotency`.
     provider_idempotency: crate::types::ProviderIdempotency,
-}
-
-impl Default for MistralOcrMarkdownizeAdapter<EnvMistralOcrClient> {
-    fn default() -> Self {
-        Self::new(EnvMistralOcrClient::new(), "mistral-ocr-latest", "unknown")
-            .with_bbox_annotation(true)
-    }
 }
 
 impl<C> MistralOcrMarkdownizeAdapter<C> {
@@ -523,6 +538,7 @@ impl<C> MistralOcrMarkdownizeAdapter<C> {
     /// [`crate::types::ProviderIdempotency`]. The real, shipped Mistral OCR
     /// adapter never calls this (it stays at the `::new()` default,
     /// `NotProvided`) — only a test-seam profile does.
+    #[cfg(any(debug_assertions, test))]
     #[must_use]
     pub fn with_provider_idempotency(
         mut self,
@@ -533,63 +549,76 @@ impl<C> MistralOcrMarkdownizeAdapter<C> {
     }
 }
 
+/// Construct the cloud adapter profile without credentials or network access.
+#[must_use]
+pub(crate) fn mistral_ocr_profile(
+    configured_model: &str,
+    bbox_annotation_enabled: bool,
+    provider_idempotency: crate::types::ProviderIdempotency,
+) -> AdapterProfile {
+    // Network-free: `profile()` never resolves the model pin over HTTP
+    // (Step2c I5). The pin is resolved exactly once at execution time and
+    // the resolved value is passed in as `configured_model`, so the profile
+    // reflects the resolved pin without a second `GET /v1/models`. If the
+    // adapter still holds an unresolved `*-latest` alias, fall back to a deterministic immutable
+    // placeholder rather than contacting the network — the identity layer
+    // rejects a mutable alias as a `model_version_pin`.
+    let model_pin = if crate::identity::is_mutable_model_alias(configured_model) {
+        format!(
+            "{}-unresolved",
+            configured_model.trim_end_matches("-latest")
+        )
+    } else {
+        configured_model.to_owned()
+    };
+    let profile = mistral_markdownize_profile(&model_pin, bbox_annotation_enabled);
+    AdapterProfile {
+        adapter_kind: AdapterKind::Markdownize,
+        adapter_id: "mistral_ocr_markdownize".to_owned(),
+        execution_mode: ExecutionMode::OnlineApi,
+        tool_profile_hash: crate::identity::tool_profile_hash(&profile)
+            .expect("built-in Mistral profile is valid"),
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        capability_flags: vec![
+            "ocr".to_owned(),
+            "layout_detection".to_owned(),
+            "table_extraction".to_owned(),
+            // R13-1: the standard document-processing adapter DOES support
+            // incremental Markdownize — via unit (page) fingerprint reuse
+            // (docs/04 §2.2, docs/07 §8 note), not the generative-LLM prompt
+            // path. Declaring it lets `choose_markdownize_mode` reach the
+            // incremental gate on the online route (previously it always fell
+            // to `full("adapter_lacks_incremental_update")`). capability_flags
+            // is NOT a `tool_profile_hash` input (see identity::PROFILE_FIELDS),
+            // so this does not change any adapter identity / fixture hash.
+            "incremental_update".to_owned(),
+        ],
+        allow_network: true,
+        // QA18: Mistral OCR bills per page (03 §11's `[pricing] pages =
+        // 0.004` example); there is no separate token leg. 2026-07-23
+        // ユーザー裁定: production sends take the Batch lane only, whose
+        // page rate is $2/1,000 pages (= `pages = 0.002`) — half the sync
+        // rate. No built-in price constant exists to flip: the 単価の正本
+        // is the user `tools.toml [pricing]` table (07 §4), which users
+        // should now declare at the batch rate.
+        billable_kinds: vec![crate::types::BillableUnitKind::Pages],
+        reject_billing: Some(crate::types::BillingDeclaration::Billable),
+        // QA13 (04 §5.5 L880): the real Mistral `/v1/ocr` endpoint offers
+        // no idempotency parameter — "job 作成に idempotency key の無い
+        // provider が現実" — so the shipped adapter's `::new()` default,
+        // `NotProvided`, flows straight through here. Only a test-seam
+        // adapter overrides it via `with_provider_idempotency`.
+        provider_idempotency,
+    }
+}
+
 impl<C: MistralOcrClient> MarkdownizeAdapter for MistralOcrMarkdownizeAdapter<C> {
     fn profile(&self) -> AdapterProfile {
-        // Network-free: `profile()` never resolves the model pin over HTTP
-        // (Step2c I5). The pin is resolved exactly once at execution time and
-        // the resolved value is passed in as `configured_model`, so the profile
-        // reflects the resolved pin without a second `GET /v1/models`. If the
-        // adapter still holds an unresolved `*-latest` alias (e.g. the `Default`
-        // used in unit tests), fall back to a deterministic immutable
-        // placeholder rather than contacting the network — the identity layer
-        // rejects a mutable alias as a `model_version_pin`.
-        let model_pin = if crate::identity::is_mutable_model_alias(&self.configured_model) {
-            format!(
-                "{}-unresolved",
-                self.configured_model.trim_end_matches("-latest")
-            )
-        } else {
-            self.configured_model.clone()
-        };
-        let profile = mistral_markdownize_profile(&model_pin, self.bbox_annotation_enabled);
-        AdapterProfile {
-            adapter_kind: AdapterKind::Markdownize,
-            adapter_id: "mistral_ocr_markdownize".to_owned(),
-            execution_mode: ExecutionMode::OnlineApi,
-            tool_profile_hash: crate::identity::tool_profile_hash(&profile)
-                .expect("built-in Mistral profile is valid"),
-            version: env!("CARGO_PKG_VERSION").to_owned(),
-            capability_flags: vec![
-                "ocr".to_owned(),
-                "layout_detection".to_owned(),
-                "table_extraction".to_owned(),
-                // R13-1: the standard document-processing adapter DOES support
-                // incremental Markdownize — via unit (page) fingerprint reuse
-                // (docs/04 §2.2, docs/07 §8 note), not the generative-LLM prompt
-                // path. Declaring it lets `choose_markdownize_mode` reach the
-                // incremental gate on the online route (previously it always fell
-                // to `full("adapter_lacks_incremental_update")`). capability_flags
-                // is NOT a `tool_profile_hash` input (see identity::PROFILE_FIELDS),
-                // so this does not change any adapter identity / fixture hash.
-                "incremental_update".to_owned(),
-            ],
-            allow_network: true,
-            // QA18: Mistral OCR bills per page (03 §11's `[pricing] pages =
-            // 0.004` example); there is no separate token leg. 2026-07-23
-            // ユーザー裁定: production sends take the Batch lane only, whose
-            // page rate is $2/1,000 pages (= `pages = 0.002`) — half the sync
-            // rate. No built-in price constant exists to flip: the 単価の正本
-            // is the user `tools.toml [pricing]` table (07 §4), which users
-            // should now declare at the batch rate.
-            billable_kinds: vec![crate::types::BillableUnitKind::Pages],
-            reject_billing: Some(crate::types::BillingDeclaration::Billable),
-            // QA13 (04 §5.5 L880): the real Mistral `/v1/ocr` endpoint offers
-            // no idempotency parameter — "job 作成に idempotency key の無い
-            // provider が現実" — so the shipped adapter's `::new()` default,
-            // `NotProvided`, flows straight through here. Only a test-seam
-            // adapter overrides it via `with_provider_idempotency`.
-            provider_idempotency: self.provider_idempotency.clone(),
-        }
+        mistral_ocr_profile(
+            &self.configured_model,
+            self.bbox_annotation_enabled,
+            self.provider_idempotency.clone(),
+        )
     }
 
     /// 2026-07-23 ユーザー裁定: OCR 課金は Batch レーンのみ許可 ($2/1,000
@@ -1822,6 +1851,58 @@ mod tests {
     }
 
     #[test]
+    fn client_and_adapter_debug_omit_both_role_credentials() {
+        const MARKDOWN_SECRET: &str = "DEBUG-MARKDOWN-CANARY-7ea4";
+        const EMBEDDING_SECRET: &str = "DEBUG-EMBEDDING-CANARY-b189";
+        let settings = AdapterRuntimeSettings {
+            declarations: [
+                ("markdown", MARKDOWN_SECRET),
+                ("embedding", EMBEDDING_SECRET),
+            ]
+            .into_iter()
+            .map(|(role, secret)| {
+                (
+                    role.to_owned(),
+                    crate::tool_lock::DeclaredAdapter {
+                        auth: Some(format!("plain:{secret}")),
+                        ..crate::tool_lock::DeclaredAdapter::default()
+                    },
+                )
+            })
+            .collect(),
+            ..AdapterRuntimeSettings::default()
+        };
+        let client =
+            EnvMistralOcrClient::with_base_url(Arc::new(settings), "https://fixture.invalid");
+        let adapter =
+            MistralOcrMarkdownizeAdapter::new(client.clone(), "mistral-ocr-2505", "fixture-scope");
+        for debug in [
+            format!("{client:?}"),
+            format!("{adapter:?}"),
+            format!("{client:#?}"),
+            format!("{adapter:#?}"),
+        ] {
+            assert!(!debug.contains(MARKDOWN_SECRET));
+            assert!(!debug.contains(EMBEDDING_SECRET));
+            assert!(!debug.contains("settings"));
+            assert!(debug.contains("https://fixture.invalid"));
+            assert!(debug.contains("http_policy"));
+        }
+    }
+
+    #[test]
+    fn explicit_client_settings_do_not_share_credentials() {
+        crate::tool_lock::with_test_role_auth("markdown", |settings| {
+            let configured = EnvMistralOcrClient::new(Arc::new(settings.clone()));
+            let unconfigured =
+                EnvMistralOcrClient::new(Arc::new(AdapterRuntimeSettings::default()));
+            assert_eq!(configured.api_key().unwrap(), "test-key");
+            assert!(matches!(unconfigured.api_key(), Err(AdapterError::Auth(_))));
+            assert_eq!(configured.api_key().unwrap(), "test-key");
+        });
+    }
+
+    #[test]
     fn ct2_profile_001_tool_profile_hash_mistral() {
         assert_eq!(
             jcs_bytes(&canonical_profile_value(&frozen_profile_value()).unwrap()).unwrap(),
@@ -1877,8 +1958,11 @@ mod tests {
 
     #[test]
     fn placeholder_mistral_profile_declares_ocr() {
-        let adapter = MistralOcrMarkdownizeAdapter::default();
-        let profile = adapter.profile();
+        let profile = mistral_ocr_profile(
+            "mistral-ocr-latest",
+            true,
+            crate::types::ProviderIdempotency::NotProvided,
+        );
 
         assert!(profile.capability_flags.iter().any(|flag| flag == "ocr"));
         assert_eq!(profile.adapter_id, "mistral_ocr_markdownize");
@@ -1889,7 +1973,11 @@ mod tests {
     // `/v1/ocr` endpoint offers no provider idempotency key.
     #[test]
     fn qa13_default_mistral_profile_declares_not_provided() {
-        let profile = MistralOcrMarkdownizeAdapter::default().profile();
+        let profile = mistral_ocr_profile(
+            "mistral-ocr-latest",
+            true,
+            crate::types::ProviderIdempotency::NotProvided,
+        );
         assert_eq!(
             profile.provider_idempotency,
             crate::types::ProviderIdempotency::NotProvided
@@ -1902,7 +1990,12 @@ mod tests {
     /// lane declaration must not perturb adapter identity.
     #[test]
     fn mistral_adapter_prefers_the_batch_lane_without_changing_identity() {
-        let adapter = MistralOcrMarkdownizeAdapter::default();
+        let adapter = MistralOcrMarkdownizeAdapter::new(
+            EnvMistralOcrClient::new(Arc::new(AdapterRuntimeSettings::default())),
+            "mistral-ocr-latest",
+            "unknown",
+        )
+        .with_bbox_annotation(true);
         assert_eq!(
             adapter.preferred_request_kind(),
             PreferredRequestKind::Batch

@@ -46,17 +46,23 @@ pub struct StoreEntry {
 pub struct StoreDirectory {
     handle: Arc<File>,
     logical: PathBuf,
+    control: crate::control::ControlHandle,
 }
 
 impl StoreDirectory {
     /// Open an absolute directory one component at a time without following
     /// links.  The supplied path is retained only for error reporting.
     pub fn open(path: &Path) -> Result<Self> {
+        Self::open_with_control(path, crate::control::ControlHandle::default())
+    }
+
+    pub fn open_with_control(path: &Path, control: crate::control::ControlHandle) -> Result<Self> {
         let handle = platform::open(path)?;
         let handle = platform::normalize_directory_handle(handle, path)?;
         Ok(Self {
             handle: Arc::new(handle),
             logical: path.to_path_buf(),
+            control,
         })
     }
 
@@ -64,12 +70,35 @@ impl StoreDirectory {
     /// validates the handle itself; callers that have a named binding must
     /// compare that binding separately before adopting it.
     pub fn from_retained(file: File, logical: PathBuf) -> Result<Self> {
+        Self::from_retained_with_control(file, logical, crate::control::ControlHandle::default())
+    }
+
+    pub fn from_retained_with_control(
+        file: File,
+        logical: PathBuf,
+        control: crate::control::ControlHandle,
+    ) -> Result<Self> {
         platform::validate_directory(&file, &logical)?;
         let file = platform::normalize_directory_handle(file, &logical)?;
         Ok(Self {
             handle: Arc::new(file),
             logical,
+            control,
         })
+    }
+
+    #[must_use]
+    pub fn control(&self) -> &crate::control::ControlHandle {
+        &self.control
+    }
+
+    #[must_use]
+    pub fn rebind_with_control(&self, control: crate::control::ControlHandle) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            logical: self.logical.clone(),
+            control,
+        }
     }
 
     #[must_use]
@@ -307,7 +336,11 @@ impl StoreDirectory {
         }
         let parent = self.open_directory(&parent_relative)?;
         Ok((
-            Self::from_retained(parent, self.logical.join(parent_relative))?,
+            Self::from_retained_with_control(
+                parent,
+                self.logical.join(parent_relative),
+                self.control.clone(),
+            )?,
             leaf,
         ))
     }

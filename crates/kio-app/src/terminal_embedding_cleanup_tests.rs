@@ -61,7 +61,12 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
     ] {
         let root = crate::test_support::PrivateTempDir::new();
         let ledger = LedgerDb::initialize(root.path().join("device/ledger.sqlite")).unwrap();
-        let key = TaskKey::new("scope", super::EMBEDDING_ADAPTER_KIND, "input", "profile");
+        let key = TaskKey::new(
+            "scope",
+            crate::embedding::transport::EMBEDDING_ADAPTER_KIND,
+            "input",
+            "profile",
+        );
         let intent = phase1_intent(&ledger, &key, RequestKind::Batch, 1.0, None).unwrap();
         phase2a_record_provider_scope(&ledger, &key, &intent.intent_token, "gemini:project")
             .unwrap();
@@ -105,14 +110,40 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
         };
         // There is deliberately no scope SQLite DB or vector projection here:
         // releasing a completed operational cleanup must not depend on either.
-        super::recover_terminal_embedding_batch_cleanup(&ledger, &client, "scope").unwrap();
+        crate::embedding::transport::recover_terminal_embedding_batch_cleanup(
+            &crate::invocation::Invocation {
+                context: &crate::context::test_support::context(std::path::Path::new(".")),
+                settings: &std::sync::Arc::new(
+                    kio_adapter::tool_lock::AdapterRuntimeSettings::default(),
+                ),
+                control: ledger.control(),
+                locks: &kio_core::scope::LockSession::default(),
+            },
+            &ledger,
+            &client,
+            "scope",
+        )
+        .unwrap();
         let after = get_batch_request(&ledger, &key).unwrap().unwrap();
         if case == "terminal" {
             assert!(after.intent_token.is_none());
             let mut expected = before.clone();
             expected.intent_token = None;
             assert_eq!(after, expected);
-            super::recover_terminal_embedding_batch_cleanup(&ledger, &client, "scope").unwrap();
+            crate::embedding::transport::recover_terminal_embedding_batch_cleanup(
+                &crate::invocation::Invocation {
+                    context: &crate::context::test_support::context(std::path::Path::new(".")),
+                    settings: &std::sync::Arc::new(
+                        kio_adapter::tool_lock::AdapterRuntimeSettings::default(),
+                    ),
+                    control: ledger.control(),
+                    locks: &kio_core::scope::LockSession::default(),
+                },
+                &ledger,
+                &client,
+                "scope",
+            )
+            .unwrap();
             assert_eq!(client.polls.get(), 1, "cleaned rows must not poll again");
         } else {
             assert_eq!(after, before, "{case} must remain pending");

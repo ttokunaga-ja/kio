@@ -17,6 +17,7 @@
 //! changes (07 §5.1: "renderer の名称・版は provenance として記録し、hash 入力には
 //! しない").
 
+use kio_core::control::ControlHandle;
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
@@ -54,38 +55,6 @@ pub(crate) const MAX_OFFICE_LOG_BYTES: usize = 64 * 1024;
 const OFFICE_NORMALIZATION_PROFILE: &str = "pdf-volatile-fields-v1";
 const MACOS_UNO_FILTER_VERSION: &str = "macos-spell-component-v1";
 
-// This thread-local switch is intentionally test-only. It permits bounded
-// renderer stderr to appear in the assertion from the explicit synthetic
-// native acceptance lane, while production errors never forward renderer
-// output into application logs or user-visible diagnostics.
-#[cfg(test)]
-thread_local! {
-    static NATIVE_ACCEPTANCE_DIAGNOSTICS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-struct NativeAcceptanceDiagnosticGuard;
-
-#[cfg(test)]
-impl NativeAcceptanceDiagnosticGuard {
-    fn enable() -> Self {
-        NATIVE_ACCEPTANCE_DIAGNOSTICS.with(|enabled| enabled.set(true));
-        Self
-    }
-}
-
-#[cfg(test)]
-impl Drop for NativeAcceptanceDiagnosticGuard {
-    fn drop(&mut self) {
-        NATIVE_ACCEPTANCE_DIAGNOSTICS.with(|enabled| enabled.set(false));
-    }
-}
-
-#[cfg(test)]
-fn native_acceptance_diagnostics_enabled() -> bool {
-    NATIVE_ACCEPTANCE_DIAGNOSTICS.with(std::cell::Cell::get)
-}
-
 const DOCX_MEDIA_TYPE: &str =
     "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const PPTX_MEDIA_TYPE: &str =
@@ -117,11 +86,20 @@ enum ConverterBackend {
 /// [`resolve_office_converter`].
 #[derive(Debug, Clone)]
 pub struct OfficeConverter {
+    control: ControlHandle,
+    #[cfg(test)]
+    native_acceptance_diagnostics: bool,
     backend: ConverterBackend,
     version: String,
 }
 
 impl OfficeConverter {
+    #[cfg(test)]
+    fn with_native_acceptance_diagnostics(mut self) -> Self {
+        self.native_acceptance_diagnostics = true;
+        self
+    }
+
     /// The renderer's self-reported version (provenance-only — never a hash
     /// input, 07 §5.1). `"test-converter"` for the test seam.
     #[must_use]
@@ -191,7 +169,7 @@ impl OfficeConverter {
             } => {
                 crate::ooxml_package::validate_real_office_package(input, media_type)?;
                 verify_renderer_fingerprint(program, program_digest, "before conversion")?;
-                let pdf = convert_with_real_binary(program, runtime, input, media_type)?;
+                let pdf = convert_with_real_binary(program, runtime, input, media_type, self)?;
                 verify_renderer_fingerprint(program, program_digest, "after conversion")?;
                 Ok(normalize_converted_pdf(&pdf))
             }
@@ -200,8 +178,9 @@ impl OfficeConverter {
 }
 
 /// Resolve an Office converter (07 §5.1). Resolution order:
-/// [`TEST_OFFICE_CONVERT_ENV`] (test seam) → [`OFFICE_CONVERTER_ENV`]
-/// (explicit binary path) → `soffice` on PATH — the first of these that is
+/// [`OFFICE_CONVERTER_ENV`] (explicit binary path) → `soffice` on PATH.
+/// [`resolve_office_converter_with_control`] first checks its captured test seam.
+/// The first of these that is
 /// SET wins outright (a set-but-broken explicit override does not fall
 /// through to PATH; that would silently substitute a different converter
 /// than the one named). `None` means unavailable — a probe/version failure
@@ -210,14 +189,25 @@ impl OfficeConverter {
 /// enqueueing rather than crash).
 #[must_use]
 pub fn resolve_office_converter() -> Option<OfficeConverter> {
+    resolve_office_converter_with_control(&ControlHandle::default())
+}
+
+/// Resolve a converter using the invocation's immutable debug snapshot.
+#[must_use]
+pub fn resolve_office_converter_with_control(control: &ControlHandle) -> Option<OfficeConverter> {
     #[cfg(debug_assertions)]
-    if let Some(fixture_path) = crate::debug_test_control().adapters.office_convert {
+    if let Some(fixture_path) = &control.debug().adapters.office_convert {
         if fixture_path.is_empty() {
             return None;
         }
         return Some(OfficeConverter {
+            control: control.clone(),
+            #[cfg(test)]
+            native_acceptance_diagnostics: false,
             #[cfg(debug_assertions)]
-            backend: ConverterBackend::Seam { fixture_path },
+            backend: ConverterBackend::Seam {
+                fixture_path: fixture_path.clone(),
+            },
             version: "test-converter".to_owned(),
         });
     }
@@ -225,9 +215,11 @@ pub fn resolve_office_converter() -> Option<OfficeConverter> {
         if explicit.is_empty() {
             return None;
         }
-        return resolve_program(PathBuf::from(explicit)).and_then(probe_real_converter);
+        return resolve_program(PathBuf::from(explicit))
+            .and_then(|program| probe_real_converter(program, control));
     }
-    resolve_program(PathBuf::from(DEFAULT_OFFICE_CONVERTER_PROGRAM)).and_then(probe_real_converter)
+    resolve_program(PathBuf::from(DEFAULT_OFFICE_CONVERTER_PROGRAM))
+        .and_then(|program| probe_real_converter(program, control))
 }
 
 /// Resolve the executable before dropping the ambient environment.  The
@@ -249,15 +241,18 @@ fn resolve_program(program: PathBuf) -> Option<PathBuf> {
 /// Probe a candidate converter binary via `--version`. ANY failure (spawn
 /// error / missing binary, non-zero exit, empty stdout) resolves to `None`
 /// — never an `Err`, per [`resolve_office_converter`]'s contract.
-fn probe_real_converter(program: PathBuf) -> Option<OfficeConverter> {
-    probe_real_converter_diagnostic(program).ok()
+fn probe_real_converter(program: PathBuf, control: &ControlHandle) -> Option<OfficeConverter> {
+    probe_real_converter_diagnostic(program, control).ok()
 }
 
 /// Diagnostic variant for native acceptance tests. Production availability
 /// remains optional, but a required real-renderer lane can expose a bounded,
 /// non-secret failure reason rather than silently treating a broken sandbox as
 /// an absent binary.
-fn probe_real_converter_diagnostic(program: PathBuf) -> Result<OfficeConverter> {
+fn probe_real_converter_diagnostic(
+    program: PathBuf,
+    control: &ControlHandle,
+) -> Result<OfficeConverter> {
     let program_digest = fingerprint_renderer_program(&program)?;
     let runtime = OfficeRuntime::new(&program)?;
     let scratch = private_temp_dir()?;
@@ -318,6 +313,9 @@ fn probe_real_converter_diagnostic(program: PathBuf) -> Result<OfficeConverter> 
             )
         })?;
     Ok(OfficeConverter {
+        control: control.clone(),
+        #[cfg(test)]
+        native_acceptance_diagnostics: false,
         backend: ConverterBackend::Real {
             program,
             program_digest,
@@ -396,6 +394,7 @@ fn convert_with_real_binary(
     runtime: &OfficeRuntime,
     input: &[u8],
     media_type: &str,
+    converter: &OfficeConverter,
 ) -> Result<Vec<u8>> {
     let extension = office_extension(media_type).ok_or_else(|| {
         AdapterError::ContractViolation(format!(
@@ -436,7 +435,7 @@ fn convert_with_real_binary(
     // namespace used to recover output: the renderer can replace path names
     // underneath it, but cannot redirect a descriptor-relative no-follow
     // read to a file outside this retained directory.
-    let output_directory = kio_core::store_dir::StoreDirectory::from_retained(
+    let output_directory = kio_core::store_dir::StoreDirectory::from_retained_with_control(
         std::fs::File::open(&outdir).map_err(|err| {
             AdapterError::ContractViolation(format!(
                 "failed to retain office-convert output dir at {}: {err}",
@@ -444,6 +443,7 @@ fn convert_with_real_binary(
             ))
         })?,
         outdir.clone(),
+        converter.control.clone(),
     )
     .map_err(|err| {
         AdapterError::ContractViolation(format!(
@@ -476,7 +476,7 @@ fn convert_with_real_binary(
     ];
     let mut environment = runtime.environment(program, Some(&profile_dir));
     #[cfg(test)]
-    if native_acceptance_diagnostics_enabled() {
+    if converter.native_acceptance_diagnostics {
         // This is a fixed diagnostic switch for checked-in synthetic OOXML
         // fixtures only. It never accepts ambient log configuration.
         environment.push((
@@ -503,7 +503,7 @@ fn convert_with_real_binary(
         })?;
     if !output.status.success() {
         #[cfg(test)]
-        if native_acceptance_diagnostics_enabled() {
+        if converter.native_acceptance_diagnostics {
             return Err(AdapterError::ContractViolation(format!(
                 "office converter {} exited with {} after {:?}; bounded stdout for the synthetic native acceptance fixture: {}; bounded stderr: {}",
                 program.display(),
@@ -910,7 +910,10 @@ mod tests {
             TEST_OFFICE_CONVERT_ENV,
             fixture_path.as_os_str(),
         );
-        let converter = resolve_office_converter().expect("seam converter resolves");
+        let converter = resolve_office_converter_with_control(&ControlHandle::new(
+            kio_core::test_control::DebugTestControl::from_env(),
+        ))
+        .expect("seam converter resolves");
         assert_eq!(converter.version(), "test-converter");
 
         // "returned verbatim for ANY input" — arbitrary bytes/media type.
@@ -938,7 +941,10 @@ mod tests {
             TEST_OFFICE_CONVERT_ENV,
             fixture_path.as_os_str(),
         );
-        let converter = resolve_office_converter().expect("seam must win over explicit");
+        let converter = resolve_office_converter_with_control(&ControlHandle::new(
+            kio_core::test_control::DebugTestControl::from_env(),
+        ))
+        .expect("seam must win over explicit");
         assert_eq!(converter.version(), "test-converter");
     }
 
@@ -949,7 +955,12 @@ mod tests {
         let _clear_explicit = kio_core::test_control::TestEnvGuard::remove(OFFICE_CONVERTER_ENV);
         let _scrub_path =
             kio_core::test_control::TestEnvGuard::set("PATH", "/nonexistent-kio-test-path");
-        assert!(resolve_office_converter().is_none());
+        assert!(
+            resolve_office_converter_with_control(&ControlHandle::new(
+                kio_core::test_control::DebugTestControl::from_env()
+            ))
+            .is_none()
+        );
     }
 
     #[test]
@@ -961,7 +972,10 @@ mod tests {
             "/definitely/not/a/real/kio-office-converter-binary",
         );
         assert!(
-            resolve_office_converter().is_none(),
+            resolve_office_converter_with_control(&ControlHandle::new(
+                kio_core::test_control::DebugTestControl::from_env()
+            ))
+            .is_none(),
             "a probe failure on an explicit override must resolve to None, not fall through to PATH"
         );
     }
@@ -991,7 +1005,7 @@ mod tests {
         let _secret = kio_core::test_control::TestEnvGuard::set("KIO_CONVERTER_SECRET", "leak");
         let _explicit =
             kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
-        let converter = probe_real_converter_diagnostic(script.clone())
+        let converter = probe_real_converter_diagnostic(script.clone(), &ControlHandle::default())
             .expect("fixture renderer probes with a secret-free bounded environment");
         let pdf = converter
             .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
@@ -1009,7 +1023,10 @@ mod tests {
         executable_script(&script, "#!/bin/sh\nprintf 'fixture renderer 1\\n'\n");
         let _explicit =
             kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
-        let converter = resolve_office_converter().expect("fixture renderer probes");
+        let converter = resolve_office_converter_with_control(&ControlHandle::new(
+            kio_core::test_control::DebugTestControl::from_env(),
+        ))
+        .expect("fixture renderer probes");
 
         executable_script(&script, "#!/bin/sh\nprintf 'replacement renderer 2\\n'\n");
         let error = converter
@@ -1045,7 +1062,10 @@ mod tests {
         );
         let _explicit =
             kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
-        let converter = resolve_office_converter().expect("fixture renderer probes");
+        let converter = resolve_office_converter_with_control(&ControlHandle::new(
+            kio_core::test_control::DebugTestControl::from_env(),
+        ))
+        .expect("fixture renderer probes");
         let error = converter
             .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
             .expect_err("a renderer-controlled output symlink must be rejected");
@@ -1087,7 +1107,10 @@ mod tests {
         );
         let _explicit =
             kio_core::test_control::TestEnvGuard::set(OFFICE_CONVERTER_ENV, script.as_os_str());
-        let converter = resolve_office_converter().expect("fixture renderer probes");
+        let converter = resolve_office_converter_with_control(&ControlHandle::new(
+            kio_core::test_control::DebugTestControl::from_env(),
+        ))
+        .expect("fixture renderer probes");
         let error = converter
             .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
             .expect_err("a replaced output directory must not redirect the retained read");
@@ -1634,7 +1657,7 @@ mod tests {
         let program = resolve_program(selected).expect(
             "KIO_REAL_OFFICE=1 requires KIO_OFFICE_CONVERTER or PATH to resolve a converter",
         );
-        let converter = probe_real_converter_diagnostic(program)
+        let converter = probe_real_converter_diagnostic(program, &ControlHandle::default())
             .expect("KIO_REAL_OFFICE=1 requires a working sandboxed Office converter");
         assert_ne!(converter.version(), "test-converter");
         Some(converter)
@@ -1645,8 +1668,9 @@ mod tests {
         let _lock = kio_core::test_control::test_env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _diagnostic = NativeAcceptanceDiagnosticGuard::enable();
-        let Some(converter) = required_real_office_converter() else {
+        let Some(converter) = required_real_office_converter()
+            .map(OfficeConverter::with_native_acceptance_diagnostics)
+        else {
             return;
         };
 
@@ -1690,8 +1714,9 @@ mod tests {
         let _lock = kio_core::test_control::test_env_lock()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let _diagnostic = NativeAcceptanceDiagnosticGuard::enable();
-        let Some(converter) = required_real_office_converter() else {
+        let Some(converter) = required_real_office_converter()
+            .map(OfficeConverter::with_native_acceptance_diagnostics)
+        else {
             return;
         };
 

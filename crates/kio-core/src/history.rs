@@ -5,7 +5,7 @@
 //! as history truth.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::json;
 
@@ -300,6 +300,36 @@ impl HistoryReader {
 
     #[must_use]
     pub fn with_limits(kio_dir: impl Into<PathBuf>, limits: HistoryLimits) -> Self {
+        Self::with_limits_with_control(kio_dir, limits, crate::control::ControlHandle::default())
+    }
+
+    #[must_use]
+    pub fn new_with_store(kio_dir: impl Into<PathBuf>, store: ObjectStore) -> Self {
+        let kio_dir = kio_dir.into();
+        Self {
+            kio_dir: std::fs::canonicalize(&kio_dir).unwrap_or(kio_dir),
+            store,
+            limits: HistoryLimits::default(),
+        }
+    }
+
+    pub fn new_with_control(
+        kio_dir: impl AsRef<Path>,
+        control: crate::control::ControlHandle,
+    ) -> Self {
+        Self::with_limits_with_control(
+            kio_dir.as_ref().to_path_buf(),
+            HistoryLimits::default(),
+            control,
+        )
+    }
+
+    #[must_use]
+    pub fn with_limits_with_control(
+        kio_dir: impl Into<PathBuf>,
+        limits: HistoryLimits,
+        control: crate::control::ControlHandle,
+    ) -> Self {
         let supplied = kio_dir.into();
         // HistoryReader has historically accepted ordinary ambient paths
         // (including macOS tempfile paths spelled through `/var` while the
@@ -310,9 +340,23 @@ impl HistoryReader {
         // established typed error at use time.
         let kio_dir = supplied.canonicalize().unwrap_or(supplied);
         Self {
-            store: ObjectStore::new(&kio_dir),
+            store: ObjectStore::new_with_control(&kio_dir, control),
             kio_dir,
             limits,
+        }
+    }
+
+    fn gc_session(&self) -> Result<crate::gc::GcSweepSession> {
+        let reads = self.store.verified_reads()?;
+        let root = self
+            .kio_dir
+            .parent()
+            .ok_or_else(|| KioError::invalid_usage("history store has no scope root"))?;
+        let session =
+            crate::gc::GcSweepSession::bind_with_control(root, self.store.control().clone())?;
+        match reads {
+            Some(reads) => session.with_verified_reads(&reads),
+            None => Ok(session),
         }
     }
 
@@ -399,6 +443,7 @@ impl HistoryReader {
     }
 
     fn walk_many<'a>(&self, starts: impl IntoIterator<Item = &'a str>) -> Result<WalkState> {
+        self.store.verified_reads()?;
         let mut state = WalkState::default();
         let scheduled = starts
             .into_iter()
@@ -435,6 +480,7 @@ impl HistoryReader {
         starts: impl IntoIterator<Item = &'a str>,
         _allowed_shallow: &BTreeMap<String, String>,
     ) -> Result<TolerantWalkState> {
+        self.store.verified_reads()?;
         let mut state = TolerantWalkState::default();
         let strict_starts = starts
             .into_iter()
@@ -555,11 +601,8 @@ impl HistoryReader {
             Ok(object) => Ok(object),
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
                 if kind == ObjectKind::Tree {
-                    crate::gc::validate_final_shallow_tree(
-                        &self.kio_dir,
-                        commit_hash,
-                        object_hash,
-                    )?;
+                    self.gc_session()?
+                        .validate_final_shallow_tree(commit_hash, object_hash)?;
                 }
                 Err(history_shallow_error(commit_hash, kind, object_hash))
             }
@@ -673,7 +716,7 @@ impl HistoryReader {
     /// tolerated until recovery completes. `read_shallow_receipts` is itself a
     /// strict no-follow, canonical receipt inventory.
     fn markerless_shallow_receipts(&self) -> Result<BTreeMap<String, String>> {
-        crate::gc::validated_final_shallow_receipts(&self.kio_dir)
+        self.gc_session()?.validated_final_shallow_receipts()
     }
 }
 
@@ -1006,6 +1049,42 @@ mod tests {
             r#gen: 7,
             manifest_hash: hash_bytes(b"manifest"),
         }
+    }
+
+    #[test]
+    fn history_reader_preserves_the_supplied_operation_read_budget() {
+        let fixture = Fixture::new();
+        let tree = fixture.tree(Vec::new());
+        let commit = fixture.commit("metered history", &tree, Vec::new());
+        let commit_bytes = fixture
+            .store
+            .read_object(ObjectKind::Commit, &commit)
+            .unwrap()
+            .bytes
+            .len() as u64;
+        let tree_bytes = fixture
+            .store
+            .read_object(ObjectKind::Tree, &tree)
+            .unwrap()
+            .bytes
+            .len() as u64;
+        let expected = commit_bytes + tree_bytes;
+        let owner = crate::cas::VerifiedCasReadBudget::new();
+        let (snapshot, consumed) = owner
+            .run(expected, |reads| {
+                let store = fixture.store.with_verified_reads(reads)?;
+                HistoryReader::new_with_store(&fixture.kio_dir, store).snapshot(&commit)
+            })
+            .unwrap();
+        assert_eq!(snapshot.commit_hash, commit);
+        assert_eq!(consumed, expected);
+        let error = owner
+            .run(expected - 1, |reads| {
+                let store = fixture.store.with_verified_reads(reads)?;
+                HistoryReader::new_with_store(&fixture.kio_dir, store).snapshot(&commit)
+            })
+            .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-VERIFIED-BYTES-LIMIT-001");
     }
 
     #[test]

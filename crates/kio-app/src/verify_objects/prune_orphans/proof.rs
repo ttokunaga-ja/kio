@@ -1,12 +1,31 @@
 //! Read-only blocker, staging-residue, and complete immutable live-set proof.
 use super::*;
+use crate::scope_access::is_store_not_found;
+use kio_core::KioError;
+use kio_core::cas::ContentObjectKind;
+use kio_core::cas::canonical_json_bytes;
+use kio_core::cas::is_hash;
+use kio_core::control::ControlHandle;
+use kio_core::dag::CommitObject;
+use kio_core::dag::TreeObject;
+use kio_core::purge::EventKind;
+use kio_core::purge::PurgeState;
+use kio_core::scope::Repository;
 use kio_core::store_dir::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
+use kio_pipeline::markdownize::NormalizedInstanceManifest;
 use kio_pipeline::markdownize::{NormalizedUnitObject, UnitStatus};
+use kio_pipeline::prepare::hash_bytes;
 use kio_pipeline::task::{
     TaskDescriptor, TaskOutputRef, TaskStatus, TaskStore, task_failure_is_terminal,
     validate_task_output_ref,
 };
+use serde::Serialize;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::fs;
+use std::path::Path;
+use std::path::PathBuf;
 
 const MAX_SCAN_ENTRIES: usize = 1_000_000;
 const MAX_SCAN_BYTES: u64 = 1024 * 1024 * 1024;
@@ -84,18 +103,20 @@ impl Budget {
     }
 }
 fn clone_directory(directory: &StoreDirectory) -> Result<StoreDirectory> {
-    StoreDirectory::from_retained(
+    StoreDirectory::from_retained_with_control(
         directory
             .root_handle()
             .try_clone()
             .map_err(|e| KioError::io(e.to_string(), directory.path().display().to_string()))?,
         directory.path().to_path_buf(),
+        directory.control().clone(),
     )
 }
 fn child(directory: &StoreDirectory, leaf: &Path) -> Result<StoreDirectory> {
-    StoreDirectory::from_retained(
+    StoreDirectory::from_retained_with_control(
         directory.open_maintenance_directory(leaf)?,
         directory.path().join(leaf),
+        directory.control().clone(),
     )
 }
 fn optional_child(directory: &StoreDirectory, relative: &Path) -> Result<Option<StoreDirectory>> {
@@ -184,6 +205,15 @@ pub(super) struct Preflight {
 }
 
 pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Preflight> {
+    if checked(repo.object_store().verified_reads())?.is_none() {
+        return checked(
+            kio_core::cas::VerifiedCasReadBudget::new().run(u64::MAX, |reads| {
+                let repo = repo.with_verified_reads(reads)?;
+                Ok(preflight(&repo, scope))
+            }),
+        )?
+        .0;
+    }
     checked(scope.recheck(repo))?;
     let purge = PurgeState::from_directory(checked(clone_directory(&scope.directory))?);
     if let Some(journal) = checked(purge.read_journal())? {
@@ -205,7 +235,9 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
             "Run kio repair verify-objects to recover the interrupted publication before pruning",
         ));
     }
-    let ledger = checked(crate::open_optional_ledger_db())?;
+    let ledger = checked(crate::ledger_access::open_optional_ledger_db(
+        repo.control(),
+    ))?;
     if let Some(ledger) = ledger {
         let rows = kio_pipeline::ledger::ops::inflight_requests_for_scope(&ledger, &scope.scope_id)
             .map_err(Blocker::unsafe_state)?;
@@ -224,7 +256,8 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
             ));
         }
     }
-    let task_store = TaskStore::new(scope.directory.path());
+    let task_store =
+        TaskStore::new_with_control(scope.directory.path(), scope.directory.control().clone());
     let tasks = task_store
         .all_bound(&scope.directory)
         .map_err(Blocker::unsafe_state)?;
@@ -241,7 +274,7 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
             ));
         }
     }
-    let store = checked(ObjectStore::from_bound_kio(&scope.directory.root_handle()))?;
+    let store = proof_store(repo, scope)?;
     let mut result = Preflight {
         tasks,
         ..Preflight::default()
@@ -301,7 +334,7 @@ pub(super) fn preflight(repo: &Repository, scope: &BoundScope) -> Checked<Prefli
                         "Resume or repair the partial normalized instance before pruning",
                     )
                 })?;
-            if !crate::partial_retry_plan_from_manifest(manifest, task.attempts)
+            if !crate::batch::command::partial_retry_plan_from_manifest(manifest, task.attempts)
                 .retryable_units
                 .is_empty()
             {
@@ -500,19 +533,43 @@ fn inspect_instance(
     Ok((manifest, units))
 }
 
+fn proof_store(repo: &Repository, scope: &BoundScope) -> Checked<ObjectStore> {
+    let reads = checked(repo.object_store().verified_reads())?
+        .ok_or_else(|| Blocker::unsafe_state("verification read capability required"))?;
+    checked(
+        ObjectStore::from_bound_kio_with_control(
+            &scope.directory.root_handle(),
+            repo.control().clone(),
+        )
+        .and_then(|store| store.with_verified_reads(&reads)),
+    )
+}
+
 pub(super) struct Proof {
     pub candidates: BTreeSet<TargetKey>,
 }
 impl Proof {
     pub fn capture(repo: &Repository, scope: &BoundScope) -> Checked<Self> {
+        if checked(repo.object_store().verified_reads())?.is_none() {
+            return checked(
+                kio_core::cas::VerifiedCasReadBudget::new().run(u64::MAX, |reads| {
+                    let repo = repo.with_verified_reads(reads)?;
+                    Ok(Self::capture(&repo, scope))
+                }),
+            )?
+            .0;
+        }
         let mut progress = preflight(repo, scope)?;
-        let store = checked(ObjectStore::from_bound_kio(&scope.directory.root_handle()))?;
+        let store = proof_store(repo, scope)?;
         let purge = PurgeState::from_directory(checked(clone_directory(&scope.directory))?);
-        let now = now_utc_seconds();
+        let now = repo.control().now_utc_seconds();
         let mut budget = std::mem::take(&mut progress.budget);
         let roots = checked(repo.current_ref_targets())?;
         let head = checked(repo.head_commit_hash())?;
-        let shallow = checked(scope.session.validated_final_shallow_receipts())?;
+        let shallow = checked(
+            GcSweepSession::bind_repository(repo)
+                .and_then(|session| session.validated_final_shallow_receipts()),
+        )?;
         let mut commits = BTreeMap::<String, CommitObject>::new();
         let mut trees = BTreeMap::<String, TreeObject>::new();
         let mut reachable = BTreeSet::new();
@@ -687,6 +744,7 @@ impl Proof {
             &progress.protected_images,
             &mut candidates,
             &mut budget,
+            repo.control(),
         )?;
         checked(scope.recheck(repo))?;
         Ok(Self { candidates })
@@ -836,8 +894,9 @@ fn cache_candidates(
     live_images: &BTreeSet<String>,
     candidates: &mut BTreeSet<TargetKey>,
     budget: &mut Budget,
+    control: &ControlHandle,
 ) -> Checked<()> {
-    let cache = crate::cache_home().join("kio/open");
+    let cache = crate::settings::cache_home(control).join("kio/open");
     match fs::symlink_metadata(&cache) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(Blocker::unsafe_state(error)),
@@ -846,7 +905,7 @@ fn cache_candidates(
         }
         Ok(_) => {}
     }
-    let base = checked(StoreDirectory::open(&cache))?;
+    let base = checked(StoreDirectory::open_with_control(&cache, control.clone()))?;
     for name in children(&base, budget)? {
         let actual = text_leaf(&name)?;
         if actual == "image" {

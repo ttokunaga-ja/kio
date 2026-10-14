@@ -42,8 +42,8 @@ pub(crate) use windows::process::{
 pub use windows::confinement::protect_owner_private_scratch;
 #[cfg(target_os = "windows")]
 pub use windows::process::{
-    replace_windows_pre_attach_delay_for_test, replace_windows_supervised_attach_failure_for_test,
-    wait_supervised_child,
+    ProcessControl, run_bounded_command_with_control_for_test, wait_supervised_child,
+    wait_supervised_child_with_control_for_test,
 };
 
 #[cfg(target_os = "linux")]

@@ -60,10 +60,13 @@ impl Fixture {
     }
 
     fn report(&self) -> Value {
-        UnreachableObjectInventory::bind(self.root().canonicalize().unwrap())
-            .unwrap()
-            .inventory()
-            .unwrap()
+        serde_json::to_value(
+            UnreachableObjectInventory::bind(self.root().canonicalize().unwrap())
+                .unwrap()
+                .inventory()
+                .unwrap(),
+        )
+        .unwrap()
     }
 
     fn error(&self) -> kio_core::KioError {

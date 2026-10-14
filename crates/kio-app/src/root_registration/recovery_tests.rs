@@ -6,7 +6,12 @@ use super::*;
 use crate::management::{
     ExplicitRoot, binding_for_repo, initialize_explicit_root, reconcile_planned_child,
 };
+use kio_core::control::ControlHandle;
 use kio_core::management::{begin_registration, read_record};
+use kio_core::management::{
+    detect_case_insensitive, finish_registration, publish_registration_record,
+};
+use kio_index::registry::RegistryEntry;
 use kio_pipeline::scan::BoundPlannedChild;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -85,7 +90,9 @@ fn setup() -> (tempfile::TempDir, PathBuf, Vec<u8>, String, String) {
     let child_path = old.join("child");
     fs::create_dir_all(&child_path).unwrap();
     fs::write(old.join("note.txt"), b"recovery knowledge").unwrap();
-    let root = match initialize_explicit_root(&old).unwrap() {
+    let root = match initialize_explicit_root(&old, &kio_core::control::ControlHandle::default())
+        .unwrap()
+    {
         ExplicitRoot::Created(repo) | ExplicitRoot::Existing(repo) => repo,
     };
     reconcile_planned_child(&root, child(&child_path)).unwrap();
@@ -110,7 +117,7 @@ fn setup() -> (tempfile::TempDir, PathBuf, Vec<u8>, String, String) {
 
 fn persist_cut(root: &Path, phase: Phase, remove_child_marker: bool) {
     let binding = ManagementBinding::bind(root).unwrap();
-    let mut nodes = plan_new(root, binding).unwrap();
+    let mut nodes = plan_new(root, binding, &ControlHandle::default()).unwrap();
     for node in &mut nodes {
         let case = detect_case_insensitive(&node.binding).unwrap();
         node.after.case_insensitive = case;
@@ -123,7 +130,11 @@ fn persist_cut(root: &Path, phase: Phase, remove_child_marker: bool) {
         nodes: nodes.iter().map(node_to_journal).collect(),
     };
     let bytes = encode(&journal).unwrap();
-    let control = control_for(&nodes[0].binding).unwrap();
+    let control = control_for(
+        &nodes[0].binding,
+        &kio_core::control::ControlHandle::default(),
+    )
+    .unwrap();
     control
         .write_atomic(Path::new(JOURNAL_LEAF), &bytes, Publication::CreateOnly)
         .unwrap();
@@ -167,7 +178,7 @@ fn persist_cut(root: &Path, phase: Phase, remove_child_marker: bool) {
                     root_path: node.binding.canonical_root().display().to_string(),
                     participates_in_global_search: false,
                     indexed: false,
-                    last_seen_at: crate::now_utc_seconds(),
+                    last_seen_at: kio_core::scope::now_utc_seconds(),
                 },
             })
             .collect::<Vec<_>>();
@@ -188,7 +199,7 @@ fn assert_recovered(root: &Path, bytes: &[u8], root_id: &str, child_id: &str) {
     assert_eq!(read_record(&root_binding).unwrap().scope_id, root_id);
     assert_eq!(read_record(&child_binding).unwrap().scope_id, child_id);
     assert!(
-        control_for(&root_binding)
+        control_for(&root_binding, &kio_core::control::ControlHandle::default())
             .unwrap()
             .read_optional(Path::new(JOURNAL_LEAF), MAX_JOURNAL_BYTES)
             .unwrap()
@@ -255,13 +266,21 @@ fn preserved_bytes(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> 
 fn resume(root: &Path) {
     let before = preserved_bytes(root);
     let binding = ManagementBinding::bind(root).unwrap();
-    let control = control_for(&binding).unwrap();
+    let control = control_for(&binding, &kio_core::control::ControlHandle::default()).unwrap();
     let bytes = control
         .read_optional(Path::new(JOURNAL_LEAF), MAX_JOURNAL_BYTES)
         .unwrap()
         .unwrap();
     let mut journal = decode(&bytes, root).unwrap();
-    execute(&binding, &mut journal, bytes, true).unwrap();
+    execute(
+        &binding,
+        &mut journal,
+        bytes,
+        true,
+        &kio_core::control::ControlHandle::default(),
+        &kio_core::scope::LockSession::default(),
+    )
+    .unwrap();
     assert_eq!(preserved_bytes(root), before);
 }
 
@@ -309,7 +328,7 @@ fn refuses_child_initialization_started_after_registration_planning() {
     }
     let (_temp, root, _, _, _) = setup();
     let binding = ManagementBinding::bind(&root).unwrap();
-    let nodes = plan_new(&root, binding.clone()).unwrap();
+    let nodes = plan_new(&root, binding.clone(), &ControlHandle::default()).unwrap();
     let mut journal = Journal {
         version: 1,
         operation_id: new_ulid(&root),
@@ -318,7 +337,7 @@ fn refuses_child_initialization_started_after_registration_planning() {
         nodes: nodes.iter().map(node_to_journal).collect(),
     };
     let bytes = encode(&journal).unwrap();
-    let control = control_for(&binding).unwrap();
+    let control = control_for(&binding, &kio_core::control::ControlHandle::default()).unwrap();
     control
         .create_directory_all(Path::new("child-initializations"))
         .unwrap();
@@ -331,7 +350,17 @@ fn refuses_child_initialization_started_after_registration_planning() {
         )
         .unwrap();
     let before = read_registration_recovery_record(&binding).unwrap();
-    assert!(execute(&binding, &mut journal, bytes, false).is_err());
+    assert!(
+        execute(
+            &binding,
+            &mut journal,
+            bytes,
+            false,
+            &kio_core::control::ControlHandle::default(),
+            &kio_core::scope::LockSession::default(),
+        )
+        .is_err()
+    );
     assert_eq!(read_registration_recovery_record(&binding).unwrap(), before);
     assert!(!control.contains_entry(Path::new(JOURNAL_LEAF)).unwrap());
     assert!(peek_registration_marker(&binding).unwrap().is_none());
@@ -355,13 +384,23 @@ fn refuses_retirement_if_absent_child_reappears_before_resume() {
     fs::write(root.join("child/new.txt"), b"new unregistered content").unwrap();
     let before = preserved_bytes(&root);
     let binding = ManagementBinding::bind(&root).unwrap();
-    let control = control_for(&binding).unwrap();
+    let control = control_for(&binding, &kio_core::control::ControlHandle::default()).unwrap();
     let bytes = control
         .read_optional(Path::new(JOURNAL_LEAF), MAX_JOURNAL_BYTES)
         .unwrap()
         .unwrap();
     let mut journal = decode(&bytes, &root).unwrap();
-    assert!(execute(&binding, &mut journal, bytes.clone(), true).is_err());
+    assert!(
+        execute(
+            &binding,
+            &mut journal,
+            bytes.clone(),
+            true,
+            &kio_core::control::ControlHandle::default(),
+            &kio_core::scope::LockSession::default(),
+        )
+        .is_err()
+    );
     assert_eq!(preserved_bytes(&root), before);
     assert_eq!(
         control
@@ -382,7 +421,7 @@ fn rejects_truncated_canonical_subtree_journal() {
     }
     let (_temp, root, _bytes, _root_id, _child_id) = setup();
     let binding = ManagementBinding::bind(&root).unwrap();
-    let nodes = plan_new(&root, binding).unwrap();
+    let nodes = plan_new(&root, binding, &ControlHandle::default()).unwrap();
     let journal = Journal {
         version: 1,
         operation_id: new_ulid(&root),
@@ -394,7 +433,17 @@ fn rejects_truncated_canonical_subtree_journal() {
     assert!(decode(&bytes, &root).is_err());
     let before = preserved_bytes(&root);
     let mut malformed = journal;
-    assert!(execute(&nodes[0].binding, &mut malformed, bytes, false).is_err());
+    assert!(
+        execute(
+            &nodes[0].binding,
+            &mut malformed,
+            bytes,
+            false,
+            &kio_core::control::ControlHandle::default(),
+            &kio_core::scope::LockSession::default(),
+        )
+        .is_err()
+    );
     assert_eq!(preserved_bytes(&root), before);
     assert!(!root.join(".kio").join(JOURNAL_LEAF).exists());
 }

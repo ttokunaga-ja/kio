@@ -19,12 +19,22 @@ const MAX_CA_PEM_BYTES: u64 = 1024 * 1024;
 /// A local service destination whose server identity is authenticated with a
 /// user-provided device CA.  It deliberately has no `From<String>` conversion:
 /// raw URLs must never reach a local client.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct AuthenticatedLocalEndpoint {
     base_url: String,
     ca_pem_path: PathBuf,
     expected_trust_digest: String,
+    control: kio_core::control::ControlHandle,
 }
+
+impl PartialEq for AuthenticatedLocalEndpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.base_url == other.base_url
+            && self.ca_pem_path == other.ca_pem_path
+            && self.expected_trust_digest == other.expected_trust_digest
+    }
+}
+impl Eq for AuthenticatedLocalEndpoint {}
 
 impl AuthenticatedLocalEndpoint {
     /// Capture the current private CA digest for a direct fixture endpoint.
@@ -33,7 +43,12 @@ impl AuthenticatedLocalEndpoint {
     #[cfg(test)]
     pub fn new(base_url: impl AsRef<str>, ca_pem_path: PathBuf) -> Result<Self> {
         let expected_trust_digest = capture_private_local_trust(&ca_pem_path)?;
-        Self::new_bound(base_url, ca_pem_path, expected_trust_digest)
+        Self::new_bound(
+            base_url,
+            ca_pem_path,
+            expected_trust_digest,
+            kio_core::control::ControlHandle::default(),
+        )
     }
 
     /// Construct an endpoint bound to the CA digest captured by the command
@@ -43,6 +58,7 @@ impl AuthenticatedLocalEndpoint {
         base_url: impl AsRef<str>,
         ca_pem_path: PathBuf,
         expected_trust_digest: String,
+        control: kio_core::control::ControlHandle,
     ) -> Result<Self> {
         let base_url = validate_local_https_url(base_url.as_ref())?;
         if !ca_pem_path.is_absolute() {
@@ -54,7 +70,7 @@ impl AuthenticatedLocalEndpoint {
         // Construction is also a fail-closed validation boundary.  The agent
         // deliberately reloads it later, but no client may be created with an
         // absent or unsafe trust anchor.
-        let trust = load_ca_bundle(&ca_pem_path)?;
+        let trust = load_ca_bundle(&ca_pem_path, &control)?;
         if trust.digest != expected_trust_digest {
             return Err(trust_changed(&ca_pem_path));
         }
@@ -62,6 +78,7 @@ impl AuthenticatedLocalEndpoint {
             base_url,
             ca_pem_path,
             expected_trust_digest,
+            control,
         })
     }
 
@@ -108,7 +125,7 @@ impl AuthenticatedLocalEndpoint {
     }
 
     fn current_trust(&self) -> Result<TrustBundle> {
-        let trust = load_ca_bundle(&self.ca_pem_path)?;
+        let trust = load_ca_bundle(&self.ca_pem_path, &self.control)?;
         if trust.digest != self.expected_trust_digest {
             return Err(trust_changed(&self.ca_pem_path));
         }
@@ -125,7 +142,14 @@ struct TrustBundle {
 /// The returned value is suitable for `AdapterRuntimeSettings`; it contains no
 /// certificate bytes and must be matched by every later local-peer request.
 pub fn capture_private_local_trust(path: &Path) -> Result<String> {
-    Ok(load_ca_bundle(path)?.digest)
+    capture_private_local_trust_with_control(path, &kio_core::control::ControlHandle::default())
+}
+
+pub fn capture_private_local_trust_with_control(
+    path: &Path,
+    control: &kio_core::control::ControlHandle,
+) -> Result<String> {
+    Ok(load_ca_bundle(path, control)?.digest)
 }
 
 /// Compute the authenticated local-CA identity from already-read PEM bytes.
@@ -192,14 +216,15 @@ pub(crate) fn validate_local_https_url(input: &str) -> Result<String> {
     Ok(input.trim_end_matches('/').to_owned())
 }
 
-fn load_ca_bundle(path: &Path) -> Result<TrustBundle> {
+fn load_ca_bundle(path: &Path, control: &kio_core::control::ControlHandle) -> Result<TrustBundle> {
     let bytes =
-        kio_core::private_fs::read_private_file(path, MAX_CA_PEM_BYTES).map_err(|error| {
-            config_error(
-                "KIO-E-LOCAL-PEER-CA-PROTECTION-001",
-                format!("{}: {}", error.error_code(), error.message()),
-            )
-        })?;
+        kio_core::private_fs::read_private_file_with_control(path, MAX_CA_PEM_BYTES, control)
+            .map_err(|error| {
+                config_error(
+                    "KIO-E-LOCAL-PEER-CA-PROTECTION-001",
+                    format!("{}: {}", error.error_code(), error.message()),
+                )
+            })?;
     load_ca_bundle_bytes(&bytes)
 }
 
@@ -658,6 +683,7 @@ mod tests {
             "https://127.0.0.1:8443",
             ca_path.clone(),
             digest,
+            kio_core::control::ControlHandle::default(),
         )
         .unwrap();
         let rcgen::CertifiedKey { cert, .. } =

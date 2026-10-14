@@ -437,11 +437,14 @@ fn management_mutations_share_a_held_repository_store_lock() {
     let child = scope(root.canonical_root(), "child");
     let child_id = scope_id(&child);
     let repository = Repository::open(root.canonical_root()).unwrap();
-    let _held_store_lock = repository.lock_store().unwrap();
+    let _held_store_lock = repository
+        .lock_store_in_session(repository.lock_session())
+        .unwrap();
 
     let observed = observe_direct_child(&root, "child").unwrap().unwrap();
     assert!(planned_child_management_record(&root, &observed, &child_id, "planned-token").is_ok());
-    enroll_child(
+    kio_core::management::enroll_child_in_session(
+        repository.lock_session(),
         &root,
         "child",
         &child_id,
@@ -450,7 +453,15 @@ fn management_mutations_share_a_held_repository_store_lock() {
     )
     .unwrap();
     let expected = read_record(&root).unwrap().children["child"].clone();
-    assert!(compare_and_remove_child_enrollment(&root, "child", &expected).unwrap());
+    assert!(
+        kio_core::management::compare_and_remove_child_enrollment_in_session(
+            repository.lock_session(),
+            &root,
+            "child",
+            &expected
+        )
+        .unwrap()
+    );
 }
 
 #[test]
@@ -897,18 +908,74 @@ fn registration_publish_is_idempotent_and_requires_the_matching_marker() {
     let root = scope(temp.path(), "root");
     let before = initialize_root(&root, scope_id(&root), false).unwrap();
     let repository = Repository::open(root.canonical_root()).unwrap();
-    let _held_session_lock = repository.lock_store().unwrap();
-    begin_registration(&root, "operation-1").unwrap();
-    begin_registration(&root, "operation-1").unwrap();
-    assert!(begin_registration(&root, "other-operation").is_err());
+    let _held_session_lock = repository
+        .lock_store_in_session(repository.lock_session())
+        .unwrap();
+    kio_core::management::begin_registration_in_session(
+        repository.lock_session(),
+        &root,
+        "operation-1",
+    )
+    .unwrap();
+    kio_core::management::begin_registration_in_session(
+        repository.lock_session(),
+        &root,
+        "operation-1",
+    )
+    .unwrap();
+    assert!(
+        kio_core::management::begin_registration_in_session(
+            repository.lock_session(),
+            &root,
+            "other-operation"
+        )
+        .is_err()
+    );
 
     let mut after = before.clone();
     after.case_insensitive = true;
     after.registration_generation += 1;
-    assert!(publish_registration_record(&root, "wrong", &before, &after).is_err());
-    publish_registration_record(&root, "operation-1", &before, &after).unwrap();
-    publish_registration_record(&root, "operation-1", &before, &after).unwrap();
-    assert!(finish_registration(&root, "wrong", &after).is_err());
-    finish_registration(&root, "operation-1", &after).unwrap();
+    assert!(
+        kio_core::management::publish_registration_record_in_session(
+            repository.lock_session(),
+            &root,
+            "wrong",
+            &before,
+            &after
+        )
+        .is_err()
+    );
+    kio_core::management::publish_registration_record_in_session(
+        repository.lock_session(),
+        &root,
+        "operation-1",
+        &before,
+        &after,
+    )
+    .unwrap();
+    kio_core::management::publish_registration_record_in_session(
+        repository.lock_session(),
+        &root,
+        "operation-1",
+        &before,
+        &after,
+    )
+    .unwrap();
+    assert!(
+        kio_core::management::finish_registration_in_session(
+            repository.lock_session(),
+            &root,
+            "wrong",
+            &after
+        )
+        .is_err()
+    );
+    kio_core::management::finish_registration_in_session(
+        repository.lock_session(),
+        &root,
+        "operation-1",
+        &after,
+    )
+    .unwrap();
     assert_eq!(read_record(&root).unwrap(), after);
 }

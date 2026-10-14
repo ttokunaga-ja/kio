@@ -103,13 +103,9 @@ where
     ];
     let unit = unique_unit()?;
     #[cfg(test)]
-    let unit = TEST_UNIT
-        .with(|value| value.borrow().clone())
-        .unwrap_or(unit);
+    let unit = sandbox.test_fixture.unit.clone().unwrap_or(unit);
     #[cfg(test)]
-    let gate_override = TEST_GATE.with(|value| value.borrow().clone());
-    #[cfg(test)]
-    let gate_script = gate_override.as_deref().unwrap_or(GATE);
+    let gate_script = sandbox.test_fixture.gate_script.as_deref().unwrap_or(GATE);
     #[cfg(not(test))]
     let gate_script = GATE;
     let cgroup_mount =
@@ -125,6 +121,8 @@ where
     let keep_fd = child_keep.as_raw_fd();
     let ready_fd = child_ready.as_raw_fd();
     let mut monitor = Scope {
+        #[cfg(test)]
+        test_fixture: sandbox.test_fixture.clone(),
         unit,
         systemctl,
         manager_environment,
@@ -564,6 +562,8 @@ fn scope_is_empty(mount: &File, controls: &Controls) -> io::Result<bool> {
 }
 
 struct Scope {
+    #[cfg(test)]
+    test_fixture: ConfinementFixture,
     unit: String,
     systemctl: PathBuf,
     manager_environment: Vec<(OsString, OsString)>,
@@ -949,7 +949,7 @@ impl BoundedProcessMonitor for Scope {
         self.accept_keeper(child)?;
         self.resources()?;
         #[cfg(test)]
-        if TEST_PAUSE_BEFORE_ACTIVATION.with(std::cell::Cell::get) {
+        if self.test_fixture.pause_before_activation {
             fs::write(
                 self.scratch.scratch_path.join("phase"),
                 b"before activation",
@@ -960,7 +960,7 @@ impl BoundedProcessMonitor for Scope {
             }
         }
         #[cfg(test)]
-        if TEST_REFUSE.with(std::cell::Cell::get) {
+        if self.test_fixture.refuse_before_activation {
             if scope_is_empty(
                 &self.mount,
                 self.controls.as_ref().expect("admitted test scope"),
@@ -982,7 +982,7 @@ impl BoundedProcessMonitor for Scope {
         gate.write_all(TOKEN).map_err(Error::Write)?;
         drop(gate);
         #[cfg(test)]
-        if TEST_OBSERVE_RUNTIME_FUSE.with(std::cell::Cell::get) {
+        if self.test_fixture.observe_runtime_fuse {
             let deadline = self.deadline + CLEANUP_GRACE;
             loop {
                 if crate::platform::child_has_exited(child).map_err(Error::Wait)? {
@@ -1059,12 +1059,13 @@ impl Drop for Scope {
 }
 
 #[cfg(test)]
-thread_local! {
-    static TEST_UNIT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-    static TEST_GATE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
-    static TEST_REFUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static TEST_PAUSE_BEFORE_ACTIVATION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static TEST_OBSERVE_RUNTIME_FUSE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+#[derive(Debug, Clone, Default)]
+pub(super) struct ConfinementFixture {
+    unit: Option<String>,
+    gate_script: Option<String>,
+    refuse_before_activation: bool,
+    pause_before_activation: bool,
+    observe_runtime_fuse: bool,
 }
 
 #[cfg(test)]
@@ -1149,6 +1150,11 @@ mod tests {
         )
         .unwrap()
     }
+    fn fixture_with_controls(root: &Path, controls: ConfinementFixture) -> RenderSandbox {
+        let mut sandbox = fixture(root);
+        sandbox.native.test_fixture = controls;
+        sandbox
+    }
     fn options() -> BoundedProcessOptions {
         BoundedProcessOptions {
             timeout: Duration::from_secs(10),
@@ -1208,12 +1214,16 @@ mod tests {
     fn native_refusal_after_keeper_ready_never_executes_renderer() {
         let scratch = tempfile::tempdir().unwrap();
         let unit = unique_unit().unwrap();
-        TEST_UNIT.with(|value| *value.borrow_mut() = Some(unit.clone()));
-        TEST_REFUSE.with(|value| value.set(true));
-        let result =
-            fixture(scratch.path()).run(["-c", "printf forbidden > marker"], &[], options());
-        let _ = TEST_UNIT.with(|value| value.borrow_mut().take());
-        TEST_REFUSE.with(|value| value.set(false));
+        let controls = ConfinementFixture {
+            unit: Some(unit.clone()),
+            refuse_before_activation: true,
+            ..ConfinementFixture::default()
+        };
+        let result = fixture_with_controls(scratch.path(), controls).run(
+            ["-c", "printf forbidden > marker"],
+            &[],
+            options(),
+        );
         let error = result.unwrap_err().to_string();
         assert!(
             error.contains("test refusal before renderer activation"),
@@ -1226,15 +1236,18 @@ mod tests {
     fn native_keeper_exit_before_activation_never_executes_renderer() {
         let scratch = tempfile::tempdir().unwrap();
         let unit = unique_unit().unwrap();
-        TEST_UNIT.with(|value| *value.borrow_mut() = Some(unit.clone()));
-        TEST_GATE.with(|value| {
-            *value.borrow_mut() =
-                Some(GATE.replace("    IFS= read -r -u \"$keep_fd\" keepalive", "    exit 0"))
-        });
-        let result =
-            fixture(scratch.path()).run(["-c", "printf forbidden > marker"], &[], options());
-        let _ = TEST_UNIT.with(|value| value.borrow_mut().take());
-        let _ = TEST_GATE.with(|value| value.borrow_mut().take());
+        let controls = ConfinementFixture {
+            unit: Some(unit.clone()),
+            gate_script: Some(
+                GATE.replace("    IFS= read -r -u \"$keep_fd\" keepalive", "    exit 0"),
+            ),
+            ..ConfinementFixture::default()
+        };
+        let result = fixture_with_controls(scratch.path(), controls).run(
+            ["-c", "printf forbidden > marker"],
+            &[],
+            options(),
+        );
         let error = result.unwrap_err().to_string();
         assert!(error.contains("keeper"), "{error}");
         assert!(!scratch.path().join("marker").exists());
@@ -1248,8 +1261,11 @@ mod tests {
         let existing_unit = unit.clone();
         let path = first.path().to_owned();
         let runner = std::thread::spawn(move || {
-            TEST_UNIT.with(|value| *value.borrow_mut() = Some(existing_unit));
-            fixture(&path).run(["-c", "printf ready > ready; while ! test -f stop; do /bin/sleep 0.02; done; printf survived"], &[], options())
+            let controls = ConfinementFixture {
+                unit: Some(existing_unit),
+                ..ConfinementFixture::default()
+            };
+            fixture_with_controls(&path, controls).run(["-c", "printf ready > ready; while ! test -f stop; do /bin/sleep 0.02; done; printf survived"], &[], options())
         });
         let deadline = Instant::now() + Duration::from_secs(8);
         while !first.path().join("ready").exists() {
@@ -1260,10 +1276,15 @@ mod tests {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
-        TEST_UNIT.with(|value| *value.borrow_mut() = Some(unit.clone()));
-        let collision =
-            fixture(second.path()).run(["-c", "printf forbidden > marker"], &[], options());
-        let _ = TEST_UNIT.with(|value| value.borrow_mut().take());
+        let controls = ConfinementFixture {
+            unit: Some(unit.clone()),
+            ..ConfinementFixture::default()
+        };
+        let collision = fixture_with_controls(second.path(), controls).run(
+            ["-c", "printf forbidden > marker"],
+            &[],
+            options(),
+        );
         assert!(collision.is_err());
         assert!(!second.path().join("marker").exists());
         assert!(!runner.is_finished(), "collision killed the existing unit");
@@ -1280,18 +1301,27 @@ mod tests {
         };
         let path = PathBuf::from(std::env::var_os("KIO_CGROUP_TEST_SCRATCH").unwrap());
         let unit = std::env::var("KIO_CGROUP_TEST_UNIT").unwrap();
-        TEST_UNIT.with(|value| *value.borrow_mut() = Some(unit));
-        match stage.as_str() {
-            "before" => TEST_PAUSE_BEFORE_ACTIVATION.with(|value| value.set(true)),
-            "after" => TEST_GATE.with(|value| {
-                *value.borrow_mut() = Some(GATE.replace(
+        let controls = match stage.as_str() {
+            "before" => ConfinementFixture {
+                unit: Some(unit),
+                pause_before_activation: true,
+                ..ConfinementFixture::default()
+            },
+            "after" => ConfinementFixture {
+                unit: Some(unit),
+                gate_script: Some(GATE.replace(
                     "exec 0</dev/null\nexec \"$@\"",
                     "printf phase > phase\nwhile :; do :; done",
-                ))
-            }),
+                )),
+                ..ConfinementFixture::default()
+            },
             _ => panic!("invalid test death stage"),
-        }
-        let result = fixture(&path).run(["-c", "printf forbidden > marker"], &[], options());
+        };
+        let result = fixture_with_controls(&path, controls).run(
+            ["-c", "printf forbidden > marker"],
+            &[],
+            options(),
+        );
         panic!("parent-death fixture returned unexpectedly: {result:?}");
     }
     #[test]
@@ -1334,10 +1364,13 @@ mod tests {
     fn native_runtime_fuse_terminates_scope_without_monitor_cancellation() {
         let scratch = tempfile::tempdir().unwrap();
         let unit = unique_unit().unwrap();
-        TEST_UNIT.with(|value| *value.borrow_mut() = Some(unit.clone()));
-        TEST_OBSERVE_RUNTIME_FUSE.with(|value| value.set(true));
+        let controls = ConfinementFixture {
+            unit: Some(unit.clone()),
+            observe_runtime_fuse: true,
+            ..ConfinementFixture::default()
+        };
         let started = Instant::now();
-        let result = fixture(scratch.path()).run(
+        let result = fixture_with_controls(scratch.path(), controls).run(
             ["-c", "printf ready > ready; while :; do :; done"],
             &[],
             BoundedProcessOptions {
@@ -1345,8 +1378,6 @@ mod tests {
                 ..options()
             },
         );
-        TEST_OBSERVE_RUNTIME_FUSE.with(|value| value.set(false));
-        let _ = TEST_UNIT.with(|value| value.borrow_mut().take());
         let error = result.unwrap_err().to_string();
         assert!(
             error.contains("test observed independent runtime fuse exit"),

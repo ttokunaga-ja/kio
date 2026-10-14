@@ -21,7 +21,7 @@ use crate::purge::{
     CanonicalFinalEvent, EraseReceipt, EventKind, TombstoneRecord, canonical_final_event,
     parse_erase_receipt_bytes, parse_tombstone_bytes, timestamp_is_after, verify_marker_binding,
 };
-use crate::scope::{acquire_bound_store_read_guard, canonical_tool_lock_value, now_utc_seconds};
+use crate::scope::{acquire_bound_store_read_guard_with_control, canonical_tool_lock_value};
 
 const CAS_KINDS: [(&str, &str, u64, bool); 10] = [
     ("commit", "commits", MAX_COMMIT_OBJECT_BYTES, true),
@@ -76,37 +76,71 @@ impl Default for UnreachableInventoryLimits {
 
 #[derive(Debug)]
 pub struct UnreachableObjectInventory {
+    control: crate::control::ControlHandle,
     root: PathBuf,
     scope: std::fs::File,
     kio: std::fs::File,
     limits: UnreachableInventoryLimits,
+    #[cfg(test)]
+    first_pass_barrier: Option<FirstPassTestBarrier>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct InventoryObject {
-    kind: String,
-    hash: String,
-    physical_bytes: u64,
-    classification: String,
-    reason: String,
+pub struct InventoryObject {
+    pub kind: String,
+    pub hash: String,
+    pub physical_bytes: u64,
+    pub classification: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-struct ShallowBoundary {
-    commit_hash: String,
-    tree_hash: String,
+pub struct ShallowBoundary {
+    pub commit_hash: String,
+    pub tree_hash: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-struct InventoryStats {
-    objects: u64,
-    physical_bytes: u64,
-    verified_bytes: u64,
-    refs: u64,
-    receipts: u64,
-    manifest_units: u64,
-    history_steps: u64,
-    directory_entries: u64,
+pub struct InventoryStats {
+    pub objects: u64,
+    pub physical_bytes: u64,
+    pub verified_bytes: u64,
+    pub refs: u64,
+    pub receipts: u64,
+    pub manifest_units: u64,
+    pub history_steps: u64,
+    pub directory_entries: u64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct UnreachableInventoryReport {
+    pub schema_version: u64,
+    pub operation: String,
+    pub status: String,
+    pub read_only: bool,
+    pub diagnostic_only: bool,
+    pub mutation_authority: bool,
+    pub objects: Vec<InventoryObject>,
+    pub summary: UnreachableInventorySummary,
+    pub shallow_boundaries: Vec<ShallowBoundary>,
+    pub limits: UnreachableInventoryLimits,
+    pub stats: UnreachableInventoryPassStats,
+}
+#[derive(Debug, Serialize)]
+pub struct UnreachableInventorySummary {
+    pub object_count: u64,
+    pub physical_bytes: u64,
+    pub candidate_count: u64,
+    pub candidate_bytes: u64,
+    pub protected_count: u64,
+    pub protected_bytes: u64,
+    pub inventory_only_count: u64,
+    pub inventory_only_bytes: u64,
+}
+#[derive(Debug, Serialize)]
+pub struct UnreachableInventoryPassStats {
+    pub inventory_pass: InventoryStats,
+    pub stability_pass: InventoryStats,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -397,6 +431,13 @@ impl UnreachableObjectInventory {
     }
 
     pub fn bind(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::bind_with_control(root, crate::control::ControlHandle::default())
+    }
+
+    pub fn bind_with_control(
+        root: impl Into<PathBuf>,
+        control: crate::control::ControlHandle,
+    ) -> Result<Self> {
         let requested = root.into();
         if !requested.is_absolute() {
             return Err(KioError::invalid_usage(
@@ -416,10 +457,13 @@ impl UnreachableObjectInventory {
             return Err(corrupt(".kio changed while binding inventory"));
         }
         Ok(Self {
+            control,
             root,
             scope,
             kio,
             limits: UnreachableInventoryLimits::default(),
+            #[cfg(test)]
+            first_pass_barrier: None,
         })
     }
 
@@ -429,14 +473,35 @@ impl UnreachableObjectInventory {
         self
     }
 
-    pub fn inventory(&self) -> Result<Value> {
+    #[cfg(all(test, unix))]
+    fn with_first_pass_test_barrier(mut self, barrier: FirstPassTestBarrier) -> Self {
+        self.first_pass_barrier = Some(barrier);
+        self
+    }
+
+    #[cfg(test)]
+    fn wait_at_first_pass_test_barrier(&self) {
+        if let Some(barrier) = self.first_pass_barrier.as_ref() {
+            barrier
+                .ready
+                .send(())
+                .expect("inventory race test receiver exists");
+            barrier
+                .release
+                .recv()
+                .expect("inventory race test release sender exists");
+        }
+    }
+
+    pub fn inventory(&self) -> Result<UnreachableInventoryReport> {
         self.assert_stable()?;
-        let guard = acquire_bound_store_read_guard(&self.kio)?;
+        let guard = acquire_bound_store_read_guard_with_control(&self.kio, &self.control)?;
         guard.recheck_idle()?;
-        let invocation_time = now_utc_seconds();
+        let invocation_time = self.control.now_utc_seconds();
         let first = self.pass(&invocation_time)?;
         guard.recheck_idle()?;
-        wait_at_first_pass_test_barrier();
+        #[cfg(test)]
+        self.wait_at_first_pass_test_barrier();
         let second = self.pass(&invocation_time)?;
         guard.recheck_idle()?;
         self.assert_stable()?;
@@ -458,7 +523,7 @@ impl UnreachableObjectInventory {
         Ok(())
     }
 
-    fn report(&self, pass: Pass, stability_stats: InventoryStats) -> Value {
+    fn report(&self, pass: Pass, stability_stats: InventoryStats) -> UnreachableInventoryReport {
         let mut candidate_count = 0_u64;
         let mut candidate_bytes = 0_u64;
         let mut protected_count = 0_u64;
@@ -482,31 +547,31 @@ impl UnreachableObjectInventory {
                 _ => unreachable!("inventory classification is closed"),
             }
         }
-        json!({
-            "schema_version": 1,
-            "operation": "unreachable_object_inventory",
-            "status": "dry_run",
-            "read_only": true,
-            "diagnostic_only": true,
-            "mutation_authority": false,
-            "objects": pass.objects,
-            "summary": {
-                "object_count": pass.stats.objects,
-                "physical_bytes": pass.stats.physical_bytes,
-                "candidate_count": candidate_count,
-                "candidate_bytes": candidate_bytes,
-                "protected_count": protected_count,
-                "protected_bytes": protected_bytes,
-                "inventory_only_count": inventory_only_count,
-                "inventory_only_bytes": inventory_only_bytes,
+        UnreachableInventoryReport {
+            schema_version: 1,
+            operation: "unreachable_object_inventory".to_owned(),
+            status: "dry_run".to_owned(),
+            read_only: true,
+            diagnostic_only: true,
+            mutation_authority: false,
+            objects: pass.objects,
+            summary: UnreachableInventorySummary {
+                object_count: pass.stats.objects,
+                physical_bytes: pass.stats.physical_bytes,
+                candidate_count,
+                candidate_bytes,
+                protected_count,
+                protected_bytes,
+                inventory_only_count,
+                inventory_only_bytes,
             },
-            "shallow_boundaries": pass.shallow_boundaries,
-            "limits": self.limits,
-            "stats": {
-                "inventory_pass": pass.stats,
-                "stability_pass": stability_stats,
+            shallow_boundaries: pass.shallow_boundaries,
+            limits: self.limits.clone(),
+            stats: UnreachableInventoryPassStats {
+                inventory_pass: pass.stats,
+                stability_pass: stability_stats,
             },
-        })
+        }
     }
 
     fn pass(&self, invocation_time: &str) -> Result<Pass> {
@@ -538,7 +603,7 @@ impl UnreachableObjectInventory {
     }
 
     fn observe_gc_and_purge_barriers(&self, state: &mut ScanState<'_>, phase: &str) -> Result<()> {
-        if let Some(marker) = read_active_marker_bound(&self.kio)? {
+        if let Some(marker) = read_active_marker_bound(&self.kio, &self.control)? {
             return Err(active_sweep_error(&marker));
         }
         let current_gc_barrier = if let Some(gc) = open_optional_dir(&self.kio, "gc")? {
@@ -1670,37 +1735,11 @@ fn active_purge_error() -> KioError {
 }
 
 #[cfg(test)]
-thread_local! {
-    static TEST_FIRST_PASS_BARRIER: std::cell::RefCell<Option<(
-        std::sync::mpsc::SyncSender<()>,
-        std::sync::mpsc::Receiver<()>,
-    )>> = const { std::cell::RefCell::new(None) };
+#[derive(Debug)]
+struct FirstPassTestBarrier {
+    ready: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
 }
-
-#[cfg(all(test, unix))]
-fn set_first_pass_test_barrier(
-    barrier: Option<(
-        std::sync::mpsc::SyncSender<()>,
-        std::sync::mpsc::Receiver<()>,
-    )>,
-) {
-    TEST_FIRST_PASS_BARRIER.with(|slot| *slot.borrow_mut() = barrier);
-}
-
-#[cfg(test)]
-fn wait_at_first_pass_test_barrier() {
-    TEST_FIRST_PASS_BARRIER.with(|slot| {
-        if let Some((ready, release)) = slot.borrow().as_ref() {
-            ready.send(()).expect("inventory race test receiver exists");
-            release
-                .recv()
-                .expect("inventory race test release sender exists");
-        }
-    });
-}
-
-#[cfg(not(test))]
-fn wait_at_first_pass_test_barrier() {}
 
 #[cfg(all(test, unix))]
 mod tests {
@@ -1714,12 +1753,11 @@ mod tests {
         let inventory = UnreachableObjectInventory::bind(root.canonicalize().unwrap()).unwrap();
         let (ready_tx, ready_rx) = mpsc::sync_channel(0);
         let (release_tx, release_rx) = mpsc::sync_channel(0);
-        let child = std::thread::spawn(move || {
-            set_first_pass_test_barrier(Some((ready_tx, release_rx)));
-            let result = inventory.inventory();
-            set_first_pass_test_barrier(None);
-            result
+        let inventory = inventory.with_first_pass_test_barrier(FirstPassTestBarrier {
+            ready: ready_tx,
+            release: release_rx,
         });
+        let child = std::thread::spawn(move || inventory.inventory());
         ready_rx
             .recv_timeout(Duration::from_secs(5))
             .expect("inventory reached its first-pass test barrier");

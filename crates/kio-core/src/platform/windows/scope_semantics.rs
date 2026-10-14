@@ -8,10 +8,18 @@ pub(crate) fn normalize_repository_handles(
     scope: File,
     kio: File,
     canonical_root: &Path,
+    control: crate::control::ControlHandle,
 ) -> Result<(File, File)> {
-    let scope =
-        crate::store_dir::StoreDirectory::from_retained(scope, canonical_root.to_path_buf())?;
-    let kio = crate::store_dir::StoreDirectory::from_retained(kio, canonical_root.join(".kio"))?;
+    let scope = crate::store_dir::StoreDirectory::from_retained_with_control(
+        scope,
+        canonical_root.to_path_buf(),
+        control.clone(),
+    )?;
+    let kio = crate::store_dir::StoreDirectory::from_retained_with_control(
+        kio,
+        canonical_root.join(".kio"),
+        control,
+    )?;
     Ok((
         scope
             .root_handle()

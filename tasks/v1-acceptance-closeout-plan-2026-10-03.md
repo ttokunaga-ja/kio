@@ -238,7 +238,7 @@ Unix共通約7,600、Linux約2,300、macOS約1,300）、検証tooling約63,000�
 | R0 基準 | 開始SHA（2026-10-06の小修正を含むmain）で3 OSの正式四工程（fmt・strict Clippy・全workspace test・release build）とlibtest一覧を取得 | 3 OSで実exit 0。test一覧を候補別に保存 |
 | R1 計測ツール | `kio-ci`に09 §3の計測（区分別のコード行、製品ファイルの上限、共通ロジック内のOS条件）を実装。例外の許可リストは理由を必須にする。まず報告だけをCIへ接続 | 手計測の推定値と照合できる。分類・除外・許可リストの単体試験がpass |
 | R2 OS固有層の分離 | crateごとに`src/platform/`（interfaceは`mod.rs`、実装は`windows`/`unix`/`linux`/`macos`）へ移す。順序はkio-core→kio-index・kio-pipeline・kio-adapter・kio-process→kio-app。複数crateが使うprimitiveはkio-coreのplatformへ置く。対象外OS向けの代替実装を削除し、未対応targetはbuild時に拒否する | 共通ロジック内のOS条件が許可リスト以外0。crateごとにWindows/WSLのbuildとtestが成功 |
-| R3 kio-appの分解と型付きAPI | `execute`を型付きresponseに変え、JSON化と終了コードの決定をCLIへ移す（`__exit_code`を廃止）。thread-localの暗黙contextを明示引数にする。`lib.rs`をコマンド群ごとのmodule（index、search、embedding・batch、snapshot・履歴、adapter・ledger、repair、open・view等）へ分ける | CLI契約試験を変更せずpass。`lib.rs`はdispatchだけになる。各ファイル3,000行以下 |
+| R3 kio-appの分解と型付きAPI | `execute`をコマンド別の型付きresponse（serializeしない完了状態を含む）に変え、JSON化と数値の終了コードの決定をCLIへ移す（`__exit_code`を廃止）。結果の意味と集約規則はkio-appに残し、`Err(KioError)`と`exit_code()`は変えない。下位crateを含むengine全体のthread-local（実行context・設定・debug/test制御・lockの再入管理・CAS読取予算・SQLite callbackの状態）を、明示引数または操作・connectionが所有するfieldへ置き換える。engineの外にあるtest・toolingのharnessは理由を記録して残してよい。OS固有処理は各crateの`src/platform/`に保つ。`lib.rs`をコマンド群ごとのmodule（index、search、embedding・batch、snapshot・履歴、adapter・ledger、repair、open・view等）へ分ける | CLI契約試験を移動に伴うpath・import以外変更せずpass。`lib.rs`はdispatchだけになる。engineのthread-localが0。`lib.rs`から分けたファイルとR3で新設・増加するファイルは3,000行以下。既存の`kio-app/src/verify_objects.rs`と`kio-core/src/cas.rs`・`gc.rs`・`scope.rs`の分割はR4で行い、R3では行数を増やさない。R3終了時に3 OSの正式四工程、libtest集合の比較、`kio-code-limits`の出力一致、CLI出力のbyte比較を行う |
 | R4 kio-coreほかの分割 | `scope.rs`（repositoryのopen・lock、refs・HEAD・tag、承認記録、log）、`gc.rs`、`cas.rs`、`kio-app/src/verify_objects.rs`を責務別のmoduleへ分ける | 製品ファイルの上限超過0 |
 | R5 gate | R1のツールをCIの必須gateにし、上限・分離規則・ファイル上限を検査する。計測値を09 §3へ記録する | 全区分が上限内。3 OSの正式四工程が成功。C3へ進む |
 
@@ -246,6 +246,10 @@ Unix共通約7,600、Linux約2,300、macOS約1,300）、検証tooling約63,000�
 - 局所検証はMacの全workspace testと、Windows/WSLの関係crate。3 OSの全体回帰はR2・R3・R5の終了時に行う。
 - testの期待値を変えて通さない。CLI契約試験（`crates/kio-cli/tests`）の変更は、移動に伴うpath・importの修正に限る。ただし、対象外targetのbuild拒否で対応3 OSのどれでもcompileされなくなったtest・assertion・guard・commentの削除はR2の対象外OS向け代替実装の削除に含め、この制限の例外とする。対応3 OSのtest集合と期待値は変えない。
 - K3（状態モデルの仕様）は並行してよい。K4以降の実装はR3の型付きAPIの上に作る。
+- R3の型付きresponseとthread-localの除去でOS共通の製品ロジックが100,000行を超える場合は、実測で必要な分だけ
+  [09 §3](../docs/09-mvp-scope.md)の上限と`kio-ci`の定数を引き上げる（2026-10-10利用者判断）。R3の途中の候補は超過を
+  記録して進め、引き上げはR3終了検証の前に最終の実測値で一度だけ、独立したcommitで行う。responseをJSON値の包みにして
+  行数を節約することはしない。
 
 D工程は [docs/README §6](../docs/README.md) の「仕様書に書くもの / 書かないもの」を基準にする。
 

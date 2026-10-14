@@ -12,65 +12,13 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Current UTC time as epoch milliseconds. Honors `KIO_FIXED_NOW` (debug builds
-/// only) using the same RFC3339 UTC-seconds shape `kio_core::scope::now_utc_seconds`
-/// accepts, so contract tests can pin "now" with the one env var already used
-/// elsewhere in this codebase instead of inventing a second knob.
+/// Current UTC time as epoch milliseconds from the real system clock.
 #[must_use]
 pub fn now_millis() -> i64 {
-    if let Some(value) = fixed_now_override_millis() {
-        return value;
-    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     now.as_millis() as i64
-}
-
-#[cfg(debug_assertions)]
-fn fixed_now_override_millis() -> Option<i64> {
-    // Ledger calls may happen repeatedly within one CLI operation; read the
-    // installed snapshot rather than reparsing ambient environment state.
-    let control = kio_core::test_control::current_or_default();
-    parse_utc_seconds(control.fixed_now.known()?).map(|secs| secs * 1000)
-}
-
-#[cfg(not(debug_assertions))]
-fn fixed_now_override_millis() -> Option<i64> {
-    None
-}
-
-/// Parse `YYYY-MM-DDTHH:MM:SSZ` into Unix seconds. `None` on any shape mismatch.
-#[cfg(debug_assertions)]
-#[must_use]
-fn parse_utc_seconds(value: &str) -> Option<i64> {
-    let bytes = value.as_bytes();
-    if bytes.len() != 20
-        || bytes[4] != b'-'
-        || bytes[7] != b'-'
-        || bytes[10] != b'T'
-        || bytes[13] != b':'
-        || bytes[16] != b':'
-        || bytes[19] != b'Z'
-    {
-        return None;
-    }
-    let field = |start: usize, end: usize| value.get(start..end)?.parse::<i64>().ok();
-    let year = field(0, 4)?;
-    let month = field(5, 7)?;
-    let day = field(8, 10)?;
-    let hour = field(11, 13)?;
-    let minute = field(14, 16)?;
-    let second = field(17, 19)?;
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return None;
-    }
-    Some(days_from_civil(year, month, day) * 86_400 + hour * 3_600 + minute * 60 + second)
 }
 
 fn civil_from_days(days: i64) -> (i64, i64, i64) {

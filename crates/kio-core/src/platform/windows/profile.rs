@@ -4,7 +4,7 @@ use std::path::PathBuf;
 #[cfg(debug_assertions)]
 use crate::xdg::home_dir_from;
 
-pub(crate) fn profile_dir() -> Option<PathBuf> {
+pub(crate) fn profile_dir(_control: &crate::control::ControlHandle) -> Option<PathBuf> {
     use std::os::windows::ffi::OsStringExt;
     use std::ptr::{NonNull, null_mut};
 
@@ -12,10 +12,12 @@ pub(crate) fn profile_dir() -> Option<PathBuf> {
     use windows_sys::Win32::UI::Shell::{FOLDERID_Profile, KF_FLAG_DEFAULT, SHGetKnownFolderPath};
 
     #[cfg(debug_assertions)]
-    if let Some(profile) = crate::test_control::current_or_default()
+    if let Some(profile) = _control
+        .debug()
         .core
         .windows_profile
-        .and_then(|profile| home_dir_from(Some(profile.into_os_string())))
+        .as_ref()
+        .and_then(|profile| home_dir_from(Some(profile.clone().into_os_string())))
     {
         return Some(profile);
     }
@@ -52,7 +54,8 @@ mod tests {
 
     #[test]
     fn windows_known_profile_is_an_absolute_fallback() {
-        let profile = profile_dir().expect("Windows profile known folder");
+        let profile = profile_dir(&crate::control::ControlHandle::default())
+            .expect("Windows profile known folder");
         assert!(profile.is_absolute());
     }
 }

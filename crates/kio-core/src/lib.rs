@@ -1,6 +1,7 @@
 //! Core types shared by Kio crates.
 
 pub mod cas;
+pub mod control;
 pub mod dag;
 pub mod durability;
 pub mod error;

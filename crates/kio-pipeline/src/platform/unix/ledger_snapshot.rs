@@ -16,9 +16,11 @@ pub(crate) struct Identity {
 }
 pub(crate) struct PrivateStorage(tempfile::TempDir);
 impl PrivateStorage {
-    pub(crate) fn create() -> Result<Self, AttemptError> {
+    pub(crate) fn create(
+        #[cfg(test)] hooks: Option<&crate::ledger::snapshot::SnapshotTestHooks>,
+    ) -> Result<Self, AttemptError> {
         #[cfg(test)]
-        crate::ledger::snapshot::run_private_storage_create_hook()?;
+        crate::ledger::snapshot::run_private_storage_create_hook(hooks)?;
         use std::os::unix::fs::PermissionsExt;
         let mut builder = tempfile::Builder::new();
         builder.prefix("kio-ledger-snapshot-");
