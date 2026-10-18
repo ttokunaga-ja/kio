@@ -347,11 +347,10 @@ fn success(dir: &TempDir, args: &[&str]) -> Value {
     serde_json::from_slice(&output).unwrap()
 }
 
-/// Runs and returns `(exit_code, parsed_json)`, reading stdout on success and
-/// stderr on failure (a partial-failure search prints its JSON body to stdout
-/// with a non-zero exit via the private `__exit_code` marker — main.rs's
-/// `take_exit_override` — so prefer whichever stream is non-empty rather than
-/// assuming exit-zero-vs-not decides which stream to parse).
+/// Runs and returns `(exit_code, parsed_json)` from whichever JSON stream is
+/// populated. A typed non-success completion can put its serialized body on
+/// stdout with a nonzero process exit; errors are printed on stderr, so the
+/// process exit alone does not identify which stream contains the response.
 fn run(dir: &TempDir, args: &[&str]) -> (i32, Value) {
     let output = kio(dir, args).arg("--json").output().unwrap();
     let code = output.status.code().unwrap();

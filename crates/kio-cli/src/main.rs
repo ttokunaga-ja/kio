@@ -127,7 +127,7 @@ fn append_completion_error(output: &Value, code: ExitCode) {
         .get("error_code")
         .and_then(Value::as_str)
         .map(str::to_owned)
-        .unwrap_or_else(|| completion_error_code(code).to_owned());
+        .unwrap_or_else(|| kio_app::non_success_error_code(code).to_owned());
     let mut context = json!({ "exit_code": code.code() });
     if let Some(excluded) = output.get("excluded_scopes")
         && excluded.as_array().is_some_and(|array| !array.is_empty())
@@ -147,16 +147,6 @@ fn append_completion_error(output: &Value, code: ExitCode) {
         context,
         code,
     ));
-}
-
-fn completion_error_code(code: ExitCode) -> &'static str {
-    match code {
-        ExitCode::AuthError => "KIO-E-ADAPTER-AUTH-001",
-        ExitCode::BudgetExceeded => "KIO-E-BUDGET-EXCEEDED-001",
-        ExitCode::PartialFailure => "KIO-E-SEARCH-PARTIAL-001",
-        ExitCode::PermanentFailure => "KIO-E-SEARCH-SCOPE-ALL-FAILED-001",
-        _ => "KIO-E-INTERNAL-001",
-    }
 }
 
 fn exit_with_error(error: KioError, json_mode: bool) -> ! {

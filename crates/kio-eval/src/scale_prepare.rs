@@ -707,9 +707,7 @@ fn run_scope(
     let object = value
         .as_object()
         .ok_or_else(|| ScalePrepareError::Input("Kio output must be an object".into()))?;
-    if object.get("error_code").is_some()
-        || object.get("__exit_code").is_some()
-        || object.get("status").and_then(Value::as_str).is_none()
+    if object.get("error_code").is_some() || object.get("status").and_then(Value::as_str).is_none()
     {
         return Err(ScalePrepareError::Input(
             "Kio output contains an error or lacks status".into(),

@@ -41,7 +41,7 @@ pub(crate) fn merged_index_completion(
     }
 }
 
-pub(crate) fn non_success_error_code(code: ExitCode) -> &'static str {
+pub fn non_success_error_code(code: ExitCode) -> &'static str {
     match code {
         ExitCode::AuthError => "KIO-E-ADAPTER-AUTH-001",
         ExitCode::BudgetExceeded => "KIO-E-BUDGET-EXCEEDED-001",

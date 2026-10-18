@@ -632,8 +632,69 @@ mod tests {
         (Arc::new(loaded), Arc::new(client), directory)
     }
 
+    struct CappedRead<R> {
+        inner: R,
+        max_chunk: usize,
+    }
+
+    impl<R: Read> Read for CappedRead<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let limit = buf.len().min(self.max_chunk);
+            self.inner.read(&mut buf[..limit])
+        }
+    }
+
+    fn assert_fragmented_http_frame() {
+        let input = b"POST /layout-parsing HTTP/1.1\r\nContent-Length: 10\r\n\r\n0123456789";
+        let mut fragments = CappedRead {
+            inner: Cursor::new(input),
+            max_chunk: 7,
+        };
+        let (headers, body) = read_http_frame(&mut fragments);
+        assert_eq!(
+            headers,
+            "POST /layout-parsing HTTP/1.1\r\nContent-Length: 10\r\n\r\n"
+        );
+        assert_eq!(body, b"0123456789");
+    }
+
+    fn read_http_frame(reader: &mut impl Read) -> (String, Vec<u8>) {
+        let mut headers = Vec::new();
+        loop {
+            assert!(
+                headers.len() < MAX_HEADERS,
+                "HTTP headers exceed test bound"
+            );
+            let mut byte = [0_u8; 1];
+            reader
+                .read_exact(&mut byte)
+                .expect("incomplete HTTP header");
+            headers.push(byte[0]);
+            if headers.ends_with(b"\r\n\r\n") {
+                break;
+            }
+        }
+        let headers = String::from_utf8(headers).expect("non-UTF-8 HTTP header");
+        let mut content_length = None;
+        for line in headers.split("\r\n") {
+            if let Some(length) = line.strip_prefix("Content-Length: ") {
+                let length = length.parse::<usize>().expect("invalid Content-Length");
+                assert!(
+                    content_length.replace(length).is_none(),
+                    "duplicate Content-Length"
+                );
+            }
+        }
+        let length = content_length.expect("missing Content-Length");
+        assert!(length <= MAX_BODY, "HTTP body exceeds test bound");
+        let mut body = vec![0_u8; length];
+        reader.read_exact(&mut body).expect("incomplete HTTP body");
+        (headers, body)
+    }
+
     #[test]
     fn tls_loopback_proxy_forwards_only_the_bounded_contract() {
+        assert_fragmented_http_frame();
         let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
         let upstream_port = upstream.local_addr().unwrap().port();
         let upstream_task = thread::spawn(move || {
@@ -642,12 +703,11 @@ mod tests {
             stream
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            let mut request = [0_u8; 1024];
-            let length = stream.read(&mut request).unwrap();
-            let request = std::str::from_utf8(&request[..length]).unwrap();
+            let (request, body) = read_http_frame(&mut stream);
             assert!(request.starts_with("POST /layout-parsing HTTP/1.1\r\n"));
             assert!(request.contains("Content-Type: application/json\r\n"));
             assert!(!request.contains("X-Untrusted:"));
+            assert_eq!(body, b"{}");
             stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}").unwrap();
         });
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -673,10 +733,9 @@ mod tests {
         .unwrap();
         let mut tls = StreamOwned::new(connection, stream);
         tls.write_all(b"POST /layout-parsing HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nX-Untrusted: dropped\r\nContent-Length: 2\r\n\r\n{}").unwrap();
-        let mut response = String::new();
-        let _ = tls.read_to_string(&mut response);
+        let (response, body) = read_http_frame(&mut tls);
         assert!(response.starts_with("HTTP/1.1 200 OK\r\n"));
-        assert!(response.ends_with("\r\n\r\n{}"));
+        assert_eq!(body, b"{}");
         proxy_task.join().unwrap();
         upstream_task.join().unwrap();
     }

@@ -3138,7 +3138,7 @@ fn query_embedding_is_always_priced_on_the_sync_lane() {
 }
 
 #[test]
-fn r11_2_exit_override_priority_batch_vs_enrichment() {
+fn r11_2_completion_priority_batch_vs_enrichment() {
     use crate::response::Completion;
     use crate::task_execution::ExecOutcome;
     use crate::task_execution::batch_completion;

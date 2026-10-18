@@ -1569,3 +1569,90 @@ R3で決めた例外と扱い:
   候補・証跡、`wip/` にWIPの指紋、`disk-cleanup.log`）。Macの未追跡WIPはR3開始前の指紋（利用者の`.gitignore`
   commit後に取り直したもの）と一致し、各段階の前後でも変わらなかった。
 - 照合用のcheckoutはWSLとWindowsのB4/B5のdirectoryに残した。
+
+## 30. R4: 保護4ファイルの分割
+
+2026-10-18 JST記録。`127d57f2`（R3のmerge）から6 commitで行った（最終 `97a2ea38…`、tree
+`bbe289f741e15981873fa4d03e9f2b7714d406d5`、29 file、+9,520 / −9,346行）。
+
+| commit | 内容 | 計数行（前→後） |
+|---|---|---|
+| `cb36e205` | R3の残りの整理 | — |
+| `d3157a76` | `kio-core/src/cas.rs` をobject storeとbound directoryへ分割 | 3,924 → 1,931 |
+| `e6a6e4d4` | `kio-core/src/gc.rs` をmarker・sweep session・plannerへ分割 | 3,800 → 1,911 |
+| `56830175` | `kio-app/src/verify_objects.rs` をpointer検証とnormalized historyへ分割 | 3,315 → 2,219 |
+| `0ee1a14a` | `kio-core/src/scope.rs` をrepository・working tree・snapshot・history・config・logging・approvalsへ分割 | 4,661 → 1,674 |
+| `97a2ea38` | Windowsで時々失敗したTLS loopback試験の修正 | — |
+
+- **R3の残りの整理（`cb36e205`）。** 何も出力しなくなった`__exit_code`を`kio-eval`が拒否する判定を除いた（他の出力検査は残す）。
+  CLIは終了コードからerror codeへの対応を自前で持たず、kio-appの`non_success_error_code`を使う。終了コードを確かめる
+  既存のCLI試験で、各error codeも固定した。試験名を`r11_2_completion_priority_batch_vs_enrichment`に改め、CLI契約試験4ファイルのコメントから
+  廃止した印の説明を除いた。assertionと期待値は変えていない。
+- **4ファイルの分割。** 移動だけのcommitで、本体・呼出し元のpathは変えていない。親・兄弟module・既存試験から呼ばれる
+  移動先の項目に`pub(super)`を付けた（cas 24、gc 7、verify_objects 22、scope 43、計96件）。これを戻すと元の字句と一致し、
+  候補の親fileは編集台帳から元のbyteを再構成でき、rawの編集をrustfmtした結果は候補とbyte一致した。公開・crate内の
+  項目は親からの再exportで従来のpathのまま使える。計画からの変更は2件で、いずれもstrict build・Clippyの診断による。
+  `verify_objects`では、変更しない`prune_orphans/proof.rs`が親経由で使う1件を親の非公開`use`一覧に加えた。`scope`では、
+  `approvals`の中だけで使う`read_scope_json_value`を親の非公開`use`一覧から除いた。
+- **TLS loopback試験（`97a2ea38`）。** `tls_loopback_proxy_forwards_only_the_bounded_contract`の偽upstreamは要求を1回の
+  `read`で受け、clientは結果を捨てて`read_to_string`で応答を読んでいた。TCPで分割された要求や、TLSの終了で途中まで
+  しか読めなかった応答で、proxyに問題がなくても失敗し得る。両側ともheaderを空行まで読み、`Content-Length`分のbodyを
+  読むようにし、転送されたbodyも確かめる。1回に7 byteまでしか返さないreaderで読取りを先に検査し、変更前に失敗、
+  変更後に成功することを確かめた。製品コードは変えていない。
+
+計測（`kio-code-limits`、Mac・WSL・Windows MSVCの出力がバイト一致、終了値0）:
+
+| 区分 | R3終了時 | R4終了時 | 上限 |
+|---|---:|---:|---:|
+| OS共通の製品ロジック | 105,725 | 105,825 | 106,000 |
+| Windows | 11,807 | 11,807 | 14,000 |
+| Unix | 6,644 | 6,644 | 9,000 |
+| Linux | 3,278 | 3,278 | 4,000 |
+| macOS | 1,806 | 1,806 | 3,000 |
+| 検証tooling | 63,365 | 63,363 | 65,000 |
+| 共通ロジック内のOS条件 | 0 | 0 | 許可リスト0 |
+
+- 1ファイルの上限超過は0本になった。最大の製品ファイルは `kio-app/src/purge.rs` の2,512行である。
+- 共通ロジックの増加100行は、分割で増えた`mod`・`use`・再export行など（kio-core +92、kio-app +17）と、CLIの対応表の
+  削除（kio-cli −9）による。
+
+終了検証（最終tree、Rust 1.98.0）。3 OSとも`fmt --all -- --check`、`clippy --workspace --all-targets --locked -- -D warnings`、
+`test --workspace --all-targets --locked`、`build --release --workspace --locked` のcargo実exitが0で、release buildに
+warningはなく、`Cargo.lock` は変わらなかった。
+
+| OS | test結果（libtest summary合計） | test所要 | libtest一覧 |
+|---|---|---|---|
+| macOS | 101 summary、3,500 pass / 0 fail / 0 ignored | 34.0分 | 90 target / 3,489件 |
+| Linux (WSL) | 104 summary、3,515 pass / 0 fail / 1 ignored | 12.8分 | 90 target / 3,502件 |
+| Windows 11 (MSVC) | 98 summary、3,196 pass / 0 fail / 1 ignored | 43.6分 | 90 target / 3,189件 |
+
+一覧はR3終了時と同じで、R4-0の試験名の変更1件だけが異なる。CLIの出力はR3のB1基準とbyte比較し、Mac 193、
+WSL 191、Windows 186件が一致した（Windowsの既存のplatform除外5件は一致数に数えない）。
+
+進め方と経緯:
+
+- 実装と3 OS検証はCodex CLI（ChatGPT認証）に任せ、監督側で候補ごとにtreeと検証結果を照合し、候補のpatchから
+  commitした。候補ごとの検証はMacの全workspace test、WSL・Windowsの全workspaceまたは関係crateのtest、3 OSのCLI
+  byte比較・libtest比較・`kio-code-limits`で行った。
+- 移動で必要になった可視性と親の`use`一覧の編集は、同じcrate内に限り、診断を記録して進める規則を監督側で決めた。
+  crate外へ見える変更、本体や呼出し元のpathの変更は対象外とした。
+- Macの`kio-ci`の試験 `output_overflow_is_refused` が、変更していないtreeでも3回続けて失敗した。原因は別のapp
+  （ChatGPT desktopのCodex app-server）が約2,100本のpipeを持ち続けて、新しいpipeのbufferが480 byteまで縮んだこと
+  である。利用者がappを終了すると65,520 byteに戻り、試験は通った。以後、Macの全workspace testの前にpipeの容量を
+  測り、16,384 byte未満なら始めない。
+- 研究室のWindowsはWindows Updateで再起動し（2026-10-14 19:30 JST）、WSLが止まった。利用者がlogonしてWSLを再開し、
+  Updateを2026-11-19まで止めた。2026-10-16にも利用者の操作で再起動した。いずれもboot時刻の基準を更新し、中断した
+  検証は新しいrun IDでやり直した。
+- Windowsで既存試験が1度ずつ失敗し、sourceを変えずに全workspaceを再実行して通った（R4-1のTLS loopback試験、R4-2の
+  `ocr_eval::tests::provider_http_timeout_is_bounded_and_secret_free`）。前者は`97a2ea38`で直した。
+
+残る扱い:
+
+- 次は画像のオンライン埋め込みとEmbeddingGemma 2のin-process実装の仕様である。共通上限の余裕は175行で、
+  この実装では上限を超える。利用者は上限を再び引き上げる方針を承認した（2026-10-18）。引き上げは実装の最終実測から、
+  独立したcommitで行う。
+- Windowsで一度だけ失敗した `ocr_eval::tests::provider_http_timeout_is_bounded_and_secret_free` の原因は特定していない。
+- R3から持ち越した `status` の `quarantine` を厳密な記録型として読むかの判断。
+- hosted CIとpushは未実施である（リポジトリの公開範囲とActionsの有無を確認していない）。
+- 証跡はrepo外の `~/Documents/Codex/2026-10-14/kio-r4/` にある（`runs/A1` に分割計画と調査、`runs/B1` に指示・
+  監督回答・候補・各OSの証跡と最終報告、`wip/` にWIPの指紋）。Macの未追跡WIPはR4開始前の指紋と一致した。
