@@ -493,6 +493,35 @@ task journal の normalized output はこの physical path ではなく `normali
 これは物理ファイル名の portability 規約であり、object hash 算出・論理 identity の変更や
 `kio_format_version` の MAJOR bump ではない ([03-data-model.md §2 / §8.1](03-data-model.md))。
 
+## 5.1 EG2 のモデル・runtime 配置と取得
+
+runtime library は Kio release 所有の `lib/litert-lm/0.18.0/<target>/` に同梱し、配布 manifest の
+ target ごとの SHA-256 と照合する。macOS arm64 / Windows x64 / Linux x64 の各配布物は library、
+必要 export、依存関係と license/third-party NOTICE を固定し、検証済みとして配布する。
+未検証の path/hash を推測せず、`.kio`、repo、current directory、PATH から native library を探索しない。
+利用者による Python 導入、runtime download、自動 update は要求しない。
+
+モデルだけを明示取得または file import する。固定 artifact は次のとおり。
+
+| 項目 | 値 |
+| --- | --- |
+| source | [litert-community/embeddinggemma-2-text-vision-440m-litert-lm](https://huggingface.co/litert-community/embeddinggemma-2-text-vision-440m-litert-lm) |
+| revision | e301f74d5551b0c2641bd5cb4652a76239d5c5f8 |
+| file | embeddinggemma-2-text-vision-440m.litertlm |
+| bytes | 387,710,976 |
+| SHA-256 | 92dcbea108899e5d6e30d919b0744f90d9967e80c67a4ab5503ac16d54f62eb0 |
+| 固定取得先 | [revision 固定の model file](https://huggingface.co/litert-community/embeddinggemma-2-text-vision-440m-litert-lm/resolve/e301f74d5551b0c2641bd5cb4652a76239d5c5f8/embeddinggemma-2-text-vision-440m.litertlm) |
+| license / 声明参照先 | [Apache-2.0](https://www.apache.org/licenses/LICENSE-2.0)、[Google model card](https://ai.google.dev/gemma/docs/embeddinggemma/model_card_2)、[Gemma Prohibited Use Policy](https://ai.google.dev/gemma/prohibited_use_policy) |
+
+確認内容と CLI は [06-cli-spec.md §1](06-cli-spec.md) を正本とする。
+モデルは device-private data root の `models/embeddinggemma-2/<revision>/<sha>/` に置き、
+`.kio` の共有・履歴・restore 対象にしない。cache は device cache 配下とする。
+取得/import は temp で size/SHA-256 を検証してから atomic publish し、利用者の import 元を変更しない。
+hash 不一致・disk 不足・中断は既存 valid model を保持し、ready と報告しない。
+推論時、watch 起動時、通常の build 時に暗黙取得せず、モデル欠落は理由付き未準備とする。
+取得確認は device 状態であり、scope の送信同意とは独立する。旧 store の migration や backfill は作らず、
+current-format 検査と明示再 index の境界を維持する。
+
 ---
 
 # 6. 検索バックエンド統一
@@ -1049,7 +1078,12 @@ validation 失敗は exit code 2 で停止し、`KIO-E-CONFIG-SCHEMA-001` を返
 
 `folder-config.schema.json` は `[chunking].unicode_version` を **required** とする (省略不可・default なし — `kio init` が実装同梱の UCD 版 (現在の既定 = 17.0.0) を明示記録する、[03-data-model.md §5.3](03-data-model.md) / [06-cli-spec.md §1](06-cli-spec.md))。これを欠く `.kio/config.toml` は schema error (exit 2) とする — required field に既定値の代替経路は持たない。`[markdownize].bbox_annotation` (boolean、既定 true — [07-adapter-spec.md §5.2](07-adapter-spec.md)、値は tool_profile_hash に畳み込む) も本 schema の正式 key として定義する。
 
-`tools.schema.json` は adapter ごとの `pricing` を定義する: **key = billable_units の kind 閉 enum (pages | tokens_in | tokens_out — [07-adapter-spec.md §4](07-adapter-spec.md))、値 = 有限・非負の USD 単価 (REAL)、未知 key は schema error**。**billable を宣言する Adapter ([07-adapter-spec.md §5.5](07-adapter-spec.md) 条件 6) は、AdapterProfile の `billable_kinds` (報告し得る kind の閉集合の宣言 — [07-adapter-spec.md §4](07-adapter-spec.md)) の全 kind が `pricing` に被覆されること (pricing keys ⊇ billable_kinds) を送信前に検査する (欠落は config error — fail-closed)**。billable 宣言 Adapter の profile required には `reject_billing` (閉 enum — [07-adapter-spec.md §4](07-adapter-spec.md)) も含める (**AdapterProfile の実行時受入規範であり、tools.schema.json の検証対象ではない** — 欠落は 07 §4 のとおり fail-closed "billable" として読む)。終端時に初めて解決不能と判明した場合の縮退は [04-pipeline.md §5.4](04-pipeline.md)。
+`tools.schema.json` は adapter ごとの `pricing` を定義する: **key = billable_units の kind 閉 enum (pages | tokens_in | image_tokens_in | tokens_out — [07-adapter-spec.md §4](07-adapter-spec.md))、値 = 有限・非負の USD 単価 (REAL)、未知 key は schema error**。**billable を宣言する Adapter ([07-adapter-spec.md §5.5](07-adapter-spec.md) 条件 6) は、AdapterProfile の `billable_kinds` (報告し得る kind の閉集合の宣言 — [07-adapter-spec.md §4](07-adapter-spec.md)) の全 kind が `pricing` に被覆されること (pricing keys ⊇ billable_kinds) を送信前に検査する (欠落は config error — fail-closed)**。billable 宣言 Adapter の profile required には `reject_billing` (閉 enum — [07-adapter-spec.md §4](07-adapter-spec.md)) も含める (**AdapterProfile の実行時受入規範であり、tools.schema.json の検証対象ではない** — 欠落は 07 §4 のとおり fail-closed "billable" として読む)。終端時に初めて解決不能と判明した場合の縮退は [04-pipeline.md §5.4](04-pipeline.md)。
+
+embedding の `embedding_semantics` と image receipt の型付き入力は
+[03-data-model.md §5.1 / §8.1](03-data-model.md)、`external_send` の閉 enum は同 §11 に従い、
+profile hash の canonical whitelist と対応 schema に明示的に含める。未知 JSON field の黙認で代用しない。
+汎用 local endpoint の model/wire/capability は [07-adapter-spec.md §5.3](07-adapter-spec.md) に従う。
 
 `user-config.schema.json` は device cap (`[budget]`、[04-pipeline.md §5.4](04-pipeline.md)) を含む。**log 保持の正規 key = `[observability] retention_days`** (整数 1〜3650・既定 30 — §11.6 の「config 上書き可」の実体。device logs (events / metrics / errors) と scope-local `.kio/logs/access.jsonl` の双方に適用する)。
 

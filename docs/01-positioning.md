@@ -77,11 +77,11 @@ kio search "あの PDF"
 kio open <検索結果の pointer>
 ```
 
-これで価値が成立する状態を MVP の Definition of Done に含める。`kio index` が**初回の**取り込みと検索 index 構築の入口であり (後着の online 成果は batch resume / retry / reindex の finalize が検索対象化する — [05-runtime.md §8.1](05-runtime.md))、成功時に auto snapshot も作られる — 明示 `kio snapshot` は任意。この 4 コマンドは **API キー未設定でも成立する** (同梱 deterministic Adapter によるベースライン index + text 検索。[07-adapter-spec.md §2.1](07-adapter-spec.md))。frontier AI は意味検索・スキャン PDF・画像内テキストへ検索品質を引き上げる推奨 opt-in である。
+これで価値が成立する状態を MVP の Definition of Done に含める。`kio index` が**初回の**取り込みと検索 index 構築の入口であり (後着の online 成果は batch resume / retry / reindex の finalize が検索対象化する — [05-runtime.md §8.1](05-runtime.md))、成功時に auto snapshot も作られる — 明示 `kio snapshot` は任意。この 4 コマンドは **API キー未設定でも成立する** (同梱 deterministic Adapter によるベースライン index + text 検索。[07-adapter-spec.md §2.1](07-adapter-spec.md))。既定 local の EG2 はモデル準備後に意味検索・画像検索を強化する。初回モデル取得前の baseline は FTS のままである。取得契約は [10-operations.md §5.1](10-operations.md)、Adapter は [07-adapter-spec.md §5.3](07-adapter-spec.md) を参照する。frontier AI は OCR 等を強化する opt-in である。
 
 即効価値と履歴価値は分けて訴求する。
 
-- **初日から効く**: 意味検索 (語彙一致しない言い換え・スキャン PDF・画像内テキストに届く) と Evidence Pointer 表示 (意味検索は online Adapter 承認済み構成での Done 条件 — API キー未設定時は text 検索ベースライン)。OS 全文検索 (Spotlight / ripgrep-all) が失敗するクエリで勝つことを Done 条件に含める ([09-mvp-scope.md §4](09-mvp-scope.md))。
+- **初日から効く**: 意味検索 (語彙一致しない言い換え・スキャン PDF・画像内テキストに届く) と Evidence Pointer 表示 (意味検索は EG2 モデル準備済み、または HTTP Adapter 承認済み構成の Done 条件。モデル未準備・HTTP 未承認時は text 検索ベースライン)。OS 全文検索 (Spotlight / ripgrep-all) が失敗するクエリで勝つことを Done 条件に含める ([09-mvp-scope.md §4](09-mvp-scope.md))。
 - **使うほど効く**: リネーム横断 (M3-2)・削除済み再発見 (M3-3) は snapshot 履歴の蓄積とともに立ち上がる価値であり、導入初日の差別化としては訴求しない。
 
 ---

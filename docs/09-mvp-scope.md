@@ -85,6 +85,9 @@ multiuser ACL ではない。
 
 # 3. 実装 Step とコード規模・構造の上限
 
+embedding は既定 local の EG2 と Gemini がともに画像を扱う。統一実行契約は
+[04-pipeline.md §5](04-pipeline.md)、Adapter 条件は [07-adapter-spec.md §5.3](07-adapter-spec.md) を参照する。
+
 ```text
 Step 1: kio-core + kio-cli で init / status / snapshot / log / diff / inspect / tag
 Step 2: kio-pipeline + kio-adapter (ベースライン抽出、opt-in の AI 強化、batch / budget)

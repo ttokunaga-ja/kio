@@ -444,7 +444,7 @@ adapter_kind          "prepare" | "markdownize" | "embedding" | ...
 adapter_role          "text" | "image" | "multimodal"
 model_or_tool_family  "gemini-2.5-pro" | "gpt-4o" | "tesseract" の正規化名
 model_version_pin     ベンダー側 immutable tag (latest 等の可変 alias は禁止)
-                      **runtime_kind="local" かつ execution_mode="offline_api" (重みを持つ
+                      **runtime_kind="local" かつ execution_mode="offline_api" または "native_library" (重みを持つ
                       ローカルモデル) では、重みファイル (GGUF / safetensors) の sha256 を
                       pin とする** — `gemma-3-4b-it-q4_k_m` 等のタグ名は量子化違いで同名に
                       なり得て、ベンダー側 immutable tag と同じ強さを持たないため。
@@ -453,7 +453,7 @@ model_version_pin     ベンダー側 immutable tag (latest 等の可変 alias �
                       する。単一ファイルのモデルではそのファイルの sha256 をそのまま採る**
                       (集約式を通さない — pin が配布元の blob hash と一致し、ダウンロード
                       健全性の確認をそのまま兼ねるため)。対象は拡張子 `.safetensors` /
-                      `.gguf` / `.bin` / `.pt` のファイルで、相対パスにするのは pin を保管
+                      `.gguf` / `.bin` / `.pt` / `.litertlm` のファイルで、相対パスにするのは pin を保管
                       場所から独立させるため。
                       **deterministic_library の同梱 Adapter は semver 規約のまま**
                       ([07-adapter-spec.md §2.1](07-adapter-spec.md) の PDF text layer 抽出が
@@ -468,6 +468,12 @@ bbox_annotation       markdownize 専用: boolean — folder config `[markdowniz
                       実効値を採用時に畳み込む (値は出力に影響する — [07-adapter-spec.md §5.2](07-adapter-spec.md)、
                       schema key は [10-operations.md §11.3](10-operations.md))
 dimensions / distance / modality   embedding 専用
+input_construction    embedding 専用: chunk_filename_context_v1 等の入力構築規約
+embedding_semantics   embedding 専用: 明示的な canonical hash whitelist/schema の要素。
+                      model id/revision/file SHA、runtime version/API contract pin と固定 artifact set、
+                      query/document prompt、windowing（cap=2048/overflow=ERROR/特殊 token/重み）、
+                      正規化・集約 algorithm、image-input receipt 規約を JCS で固定する。
+                      ローカル窓では model と wire 形式、chat template/instruction を固定する
 runtime_kind          "cloud" | "local" (capability レベル)
 spec_version          この計算規約自体のバージョン
 ```
@@ -609,10 +615,21 @@ dimensions / distance / modality / embedding profile_hash がすべて一致
 
 不一致なら BM25 のみ横断検索、または再 index 要求。
 
-**modality は `"multimodal"` に固定する (2026-07-03 確定)**。text と image 等を別ベクトル空間に埋め込む
-構成 (`modality="text"` 等の非 multimodal profile) は**採用不可**であり、tool-lock への materialize /
-adapter 登録の時点で `KIO-E-EMBED-MODALITY-001` (exit 2、[06-cli-spec.md §8](06-cli-spec.md)) として
-拒否する。採用 profile は [07-adapter-spec.md §5.3](07-adapter-spec.md) の単一マルチモーダル profile のみ。
+Gemini と EG2 はともに 768 / cosine / multimodal だが別 profile であり混合しない。
+汎用 local endpoint の text-only capability も許可する。modality は宣言した空間を識別し、
+image capability がない profile の画像は理由付き Skipped とする（[07-adapter-spec.md §5.3](07-adapter-spec.md)）。
+
+同一意味的 profile の SHA 固定 runtime artifact から作った vector は OS/arch をまたいで混合・検索・
+追記を許す。CPU/platform の認定 gate を設けず、OS 移動だけで再 embedding しない。
+`producer_fingerprint` は OS/arch、runtime library SHA-256、runtime version と semantic profile hash を
+各 vector の provenance に記録する。CPU/backend、threads も provenance として扱い、意味的 hash に入れない。
+価格、grant、取得場所/path、thread 数、priority、worker PID も意味的 identity 外である。
+profile は固定 runtime release の artifact set を bind し、実行 OS の library hash は producer 側で区別する。
+
+model/file、prompt/context、windowing、次元、正規化・集約、runtime の意味が変われば再 embedding を要する。
+価格・取得場所・thread/priority の変更は再生成を要しない。Gemini の既存 text prompt/context/hash/vector は
+維持し、画像 capability と料金の追加で EG2 専用 field を Gemini に付加しない。
+変換 codec pin の変更は §8.1 に従い変換画像だけを失効させる。
 
 # 8. 主要テーブル / object スキーマ
 
@@ -753,16 +770,90 @@ chunk_hash = "sha256:" + base16(sha256(JCS({
 ```text
 embedding_hash = "sha256:" + base16(sha256(JCS({
   "spec_version": 1,
-  "target_type": "chunk",
-  "target_hash": <text_hash>,
+  "target_type": "chunk" | "image",
+  "target_hash": <text_hash | source_image_hash>,
   "profile_hash": <embedding profile_hash>,
   "modality": "...", "dimensions": <int>, "distance": "..."
 })))
 ```
 
 - cursor replay の query vector は embedding object / source SQLite row の identity ではない。device-local の `${XDG_CACHE_HOME:-$HOME/.cache}/kio/search-query-cache/<query_vector_digest>` に digest を名前として保存し、replay 時に同じ digest を再検証する。欠落・不一致は cursor を拒否するだけで、query を再 embedding したり scope の SQLite を読んだりはしない ([05-runtime.md §1.5](05-runtime.md))
-- `target_hash` は対象 chunk の **`text_hash`** (chunk 抽出範囲のみの content hash、§8) であって `chunk_hash` ではない。embedding は Markdown 本文そのものの関数なので、同一本文を持つ複数 chunk (別世代・別ファイルの同一断片) は 1 本の `embeddings` 行を共有する — これが **content ベース再利用** ([04-pipeline.md §4.3 / §5.5](04-pipeline.md)) の identity 基盤である。`chunk_vec` (vec0) は `chunk_hash → embedding` の写像として `embeddings` から導出する。
-- embedding object の保存 bytes は **`JCS(identity fields) + LF + base64(vector, float32 little-endian) + LF + lower_hex64(sha256(vector bytes))`** に固定する。fsck ([10-operations.md §7.5.1](10-operations.md)) は identity hash の再計算に加え、vector 長 (= dimensions × 4 bytes)・有限値 (NaN / Inf の拒否)・**vector digest の一致** (有限値への bit flip の検出) を検査する。
+- chunk の `target_hash` は **`text_hash`** (chunk 抽出範囲のみの content hash、§8) であって `chunk_hash` ではない。filename context を持つ場合は typed `context` を identity の JCS に含め、省略時は元の identity を維持する。同一本文・context・profile を持つ複数 chunk は 1 本の `embeddings` 行を共有する — これが **content ベース再利用** ([04-pipeline.md §4.3 / §5.5](04-pipeline.md)) の identity 基盤である。`chunk_vec` (vec0) は `chunk_hash → embedding` の写像として `embeddings` から導出する。
+- image の target は元 `image_hash`。PNG/JPEG は context なしの original identity を維持する。
+  GIF/WebP の変換 receipt は `source_hash/mime`、`sent_hash/mime`、`transcoder_pin` を持ち、
+  その JCS の SHA-256 を `image_input_hash` として typed image context に含める。
+  変換の identity は [07-adapter-spec.md §5.3](07-adapter-spec.md) に従う。
+- 現在 projection の image reuse key は `(source image hash, profile, input identity)`。
+  同 profile の古い入力は退役させ、rebuild で復活させない。receipt は immutable CAS embedding object、
+  Task、DB projection で一致させ、CAS を上書きしない。codec pin 変更は変換画像だけを再生成し、
+  text と原 PNG/JPEG を失効させない。producer provenance は vector に付随して保存・復元するが reuse key にしない。
+### embedding object の current 保存形式
+
+保存 bytes は次の5行に固定する。各行は UTF-8、末尾 LF 一つ、BOM/空行なし。
+最初の3行の identity/vector 表現は維持し、4–5行を追加した新しい current object format とする。
+旧3行形式の reader・migration・推測補完は持たない。record format と意味的 profile/identity の版は別であり、
+metadata 追加だけでは Gemini の text profile hash、embedding identity、vector の数値を変更しない。
+
+```text
+JCS(identity fields)
+base64(vector bytes, float32 little-endian)
+lower_hex64(sha256(vector bytes))
+JCS(metadata)
+lower_hex64(sha256(JCS(metadata)))
+```
+
+base64 は RFC 4648 standard alphabet・padding あり・折返しなし、digest は lowercase64桁とする。
+metadata は次の key をすべて持ち、未知 key を拒否する。null を省略せず、RFC 8785 JCS で encoding する。
+
+```json
+{
+  "record_format": 2,
+  "producer": {
+    "execution_mode": "native_library",
+    "os": "linux",
+    "arch": "x86_64",
+    "runtime_version": "0.18.0",
+    "runtime_library_sha256": "sha256:<64 lowercase hex>",
+    "profile_hash": "sha256:<64 lowercase hex>",
+    "cpu_backend": "<backend identifier>",
+    "threads": 2
+  },
+  "image_input_receipt": null
+}
+```
+
+この JSON の producer は native の形の例である。`execution_mode` は [07-adapter-spec.md §2](07-adapter-spec.md) の実行形態、
+`os`/`arch` は生成 device の識別文字列、`profile_hash` は1行目と完全一致する canonical hash。
+native は `runtime_version`、`runtime_library_sha256`、`cpu_backend`（実際の CPU/backend 識別）、
+`threads`（正整数）を必須とし、runtime version/library SHA を profile が bind する固定 artifact set と照合する。
+非 native で native runtime 情報を持たない field は null とし、値を捏造しない。
+producer は provenance であり identity hash/reuse key に含めず、CPU/platform 認定 gate を追加しない。
+
+`image_input_receipt` は GIF/WebP の変換 image だけに次の object を持ち、text と原 PNG/JPEG は null とする。
+receipt の未知 key を拒否し、全 key を必須とする。
+
+```json
+{
+  "source_hash": "sha256:<64 lowercase hex>",
+  "source_mime": "image/webp",
+  "sent_hash": "sha256:<64 lowercase hex>",
+  "sent_mime": "image/png",
+  "transcoder_pin": "<fixed codec and kio_image_png_v1 pin>"
+}
+```
+
+source MIME は image/gif または image/webp、sent MIME は image/png。
+source_hash は1行目の image target と一致し、sent_hash は固定変換後の bytes の SHA-256、
+transcoder_pin は固定変換の codec/実装・設定 pin を指す非空文字列とする。
+この receipt 自体の JCS の SHA-256 が typed image context の `image_input_hash` と一致しなければならない。
+
+store・restore・fsck（[10-operations.md §7.5.1](10-operations.md)）は同じ current format を検証する。
+5行・canonical JCS/base64/digest・metadata schema を確認し、identity hash と object locator、
+profile/target/context の binding、vector の長さ（dimensions × 4 bytes）・有限値・非零/単位 norm・digest、
+metadata digest、producer/profile/artifact set、receipt/context/source hash/MIME の一致を検査する。
+画像 bytes を入力または再公開する際は source CAS hash/MIME と bounded decode を再検証し、
+固定変換後の sent_hash/MIME と receipt を照合する。Task/DB projection の receipt はこの CAS 正本と一致させる。
+不一致・旧形式・必須 provenance 欠落を補完せず拒否し、immutable CAS を上書きしない。
 
 ## tree / commit object
 
@@ -995,17 +1086,20 @@ capabilities = ["ocr", "layout_detection", "table_extraction"]
 [markdown.mistral_ocr_markdownize.pricing]   # 単価の正本 (07 §4 billable_units の換算元 — tool-lock ではない)
 pages = 0.004                                # unit kind → USD 単価。換算は終端 Tx 時点の表で確定 (07 §4)
 
-[embedding.gemini_embedding.pricing]
-tokens_in = 0.00000015
+[embedding.gemini_embedding_2.pricing]
+tokens_in = 0.00000020
+image_tokens_in = 0.00000045  # Standard 単価。レーン別単価は 07 §5.3
 ```
 
-現行版の認証付き Markdownize / Embedding adapter は Kio 組込み target のみを実行する。`cmd` / `args` / `url` による任意 target は受理しない。
+Markdownize / Embedding は Kio 組込み Adapter を使う。`cmd` / `args` による任意実行は受理しない。汎用 local endpoint の `url` とモデル設定は [07-adapter-spec.md §3.1 / §5.3](07-adapter-spec.md) に従う。
 
 `.kio/config.toml`:
 
 ```toml
 [scope]
 participates_in_global_search = true
+[embedding]
+external_send = "text_and_images" # 既定。もう一つの値は text_only
 [chunking]
 strategy = "heading"
 max_chars = 6000
@@ -1017,7 +1111,7 @@ unicode_version = "17.0.0"  # slug 正規化の UCD 版 (§5.3 — 省略不可�
 enabled = true
 threshold = 0.30
 max_consecutive = 5
-[adapter]                  # online 送信レーン (07 §5.3 の 2026-07-24 裁定)
+[adapter]                  # online 送信レーン。価格解決は 07 §4
 lane = "batch"             # "batch" (既定・半額) | "realtime" (即時・単価 2 倍)
                            # OCR と embedding の**両方**に同時に効く — 片方だけ別レーンにはできない。
                            # 解決順は network opt-in と同形: CLI (--realtime/--batch) > 本キー
@@ -1029,6 +1123,12 @@ mode = "on_idle"               # 明示 opt-in。省略時は manual_only (05-ru
 max_runtime_seconds = 60         # 1..86400
 idle_threshold_seconds = 300     # 1..31536000
 ```
+
+`[embedding].external_send` は `text_and_images`（既定）または `text_only` の閉 enum。
+外部送信同意は text と image を含む。`text_only` は external-egress の未送信画像だけを
+Skipped(images_excluded_from_external_send) にし、local の画像処理と既存 vector の検索を許す。
+別の画像 grant/flag や grant migration は設けない。dispatch 直前の再確認と送信済み job の扱いは
+[04-pipeline.md §5.1](04-pipeline.md) に従う。
 
 すべての設定は JSON Schema/TOML Schema で validate ([10-operations.md §11.3](10-operations.md))。
 `[gc]` を置かない場合だけ `manual_only` が既定となる。`[gc]` がある場合は `mode` が必須で、

@@ -161,6 +161,11 @@ tag名は内容固定の引用識別子として使わず、既発行pointerをt
 
 ---
 
+画像 embedding の入力変換 receipt は送信入力の provenance であり、元 source pointer と
+`owned_image_hashes` の authority を差し替えない。identity は
+[03-data-model.md §8.1](03-data-model.md)、画像候補の pointer 解決は
+[05-runtime.md §1.1](05-runtime.md) に従う。
+
 # 3. Evidence Pointer の解決
 
 ```

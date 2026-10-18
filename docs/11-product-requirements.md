@@ -9,6 +9,9 @@
 - canonical な管理領域名は `.kio`。`.kcs` は指定誤りであり、alias、migration、互換 reader は要件にしない。
 - CLI は hybrid search、vector search、image search を提供する。LLM による Markdown/PDF 前処理と
   外部 Adapter を利用できる。特定 provider やモデルの同梱・利用可能性は別途実証する。
+- 既定 local embedding は EG2 とし、一般利用者に外部 server/Python/証明書の設定を要求しない。
+  Gemini と同じ text/image/query の処理・検索・失敗表示を提供する。モデル準備と runtime 配布は
+  [10-operations.md §5.1](10-operations.md) に従う。
 - 知識の正本はフォルダごとの `.kio` にある。各 `.kio/index/sqlite.db` と central replica は、
   per-folder CAS / metadata から再構築できる検索用 projection であり、SQLite 単体は knowledge の正本ではない。
 - scope と外部送信の consent を機能させる。consent は scope × Adapter の egress gate であり、
@@ -39,6 +42,14 @@ Windows の自動 child mutation は RC で未対応である。RC の platform 
 v1 の受入では macOS、Linux、Windows の 3 OS で機能的 CI を行い、実際の converter と provider 接続経路の
 証拠を確認する。converter/provider を実行しない skip を pass と数えず、証拠がない経路を CI 成功だけで
 充足と扱わない。
+
+EG2 の受入では、背景/対話の両 engine を含む親＋worker の同時 resident peak を
+8,000,000,000 bytes 以下とし、7 GB で中断する余裕値、低空き memory 時の load 前 pause を設ける。
+任意入力で瞬間 peak を数学的に保証したとは扱わず、画像・長文・同時実行の stress で確認する。
+warm query latency と fresh CLI の engine load は別条件とし、cold-cache / warm-cache load を分けて確認する。
+fresh CLI の end-to-end p95 ≤0.5 秒を warm query の結果から充足と扱わない。
+同一 profile の混合 producer を用いる cross-producer 検索評価と Linux x64（WSL）の評価を受入に含め、
+画像 margin を満たさない producer があれば混在 policy を黙って変更せず判断を止める。
 
 PersonaScope/personaCorpus による性能・品質評価は準備後に行い、v1 の nonblocking とする。これは機能、
 security、recovery の受入を不要にするものではない。

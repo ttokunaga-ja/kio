@@ -3,7 +3,7 @@
 > **Local-first knowledge archive, powered by frontier AI.**
 > **データはローカル、計算は最強の AI を使う。**
 
-Kio は **local-first** な知識アーカイブ。データの主権はあなたのマシンにあり、Markdownize や Embedding には外部 Adapter を opt-in で利用できる。現行 RC の組込み接続は Mistral OCR と Gemini embedding が中心であり、任意の Claude / GPT 等を呼ぶ汎用 dispatcher は未提供である。実 provider の利用可能性は接続試験で確認する。
+Kio は **local-first** な知識アーカイブ。データの主権はあなたのマシンにあり、Markdownize や Embedding には外部 Adapter を opt-in で利用できる。embedding はモデル準備後の既定 local EG2 と Gemini、汎用 local endpoint を同じ契約で扱う（[07 §5.3](07-adapter-spec.md)）。取得済み EG2 はネットワークなしで動く。現行 RC の組込み接続は Mistral OCR と Gemini embedding が中心であり、任意の Claude / GPT 等を呼ぶ汎用 dispatcher は未提供である。実 provider の利用可能性は接続試験で確認する。
 
 二次表現: **Evidence-grounded local knowledge archive (原文根拠付きローカル知識アーカイブ)**。
 

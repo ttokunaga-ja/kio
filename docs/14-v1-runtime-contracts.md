@@ -19,7 +19,8 @@ is tracked in [the implementation record](../tasks/v1-implementation-progress.md
 ### Device billing lifecycle
 
 Billing is operational information, not knowledge reconstructed from a folder.
-`ledger init` explicitly creates the central device ledger. Scope initialization,
+`ledger init` explicitly creates the central device ledger. As an explicit device setup step,
+`kio model install` also initializes a missing ledger exactly as `ledger init` does. Scope initialization,
 offline indexing and text search do not initialize it. Before initialization,
 budget observations are unknown; absence is never evidence of zero spending or
 permission to submit paid work. `ledger status` reads a private snapshot without
@@ -395,20 +396,22 @@ authority. `status` reports the records and their effective current match. See
 [the CLI specification](06-cli-spec.md) for command syntax and confirmation
 rules.
 
-Local Adapter endpoints require HTTPS loopback and an explicit port. Their CA
-is a device-local managed snapshot registered through the Adapter trust lifecycle;
-the active record carries a generation, digest, and snapshot identity, never a
-user-configured source path or certificate bytes. The retired
-`adapter.policy.offline_api.ca_pem_path` setting is rejected. Trust registration,
-rotation, revocation, and status are device-local operations that do not read a
-scope. Registration/resume creates a managed snapshot, rotation advances the
-generation, and revocation leaves a durable tombstone; an active CA cannot be
-silently replaced by registration. Runtime admission acquires the active managed
-CA and retains the trust-store lock through Adapter dispatch, so rotation or
-revocation cannot race an already admitted send. Only the managed active root is
-trusted; proxy and redirect use are disabled. Certificate validity and name
-verification finish before a body is sent. Authentication errors are permanent;
-connection refusal remains a transport error.
+Local Adapter windows (Embedding, Markdownize OCR and Rerank) allow HTTP or HTTPS
+loopback with an explicit port. URL rules, paired grants and secret holds follow
+[07-adapter-spec.md §3.1](07-adapter-spec.md). Approval and status identify an HTTP
+peer as unauthenticated. For HTTPS, the CA is a device-local managed snapshot
+registered through the Adapter trust lifecycle. The active record carries a
+generation, digest and snapshot identity, never a user-configured source path or
+certificate bytes. The retired `adapter.policy.offline_api.ca_pem_path` setting
+is rejected. Trust registration, rotation, revocation and status are device-local
+operations that do not read a scope. Registration/resume creates a managed
+snapshot, rotation advances the generation and revocation leaves a durable
+tombstone; registration cannot silently replace an active CA. HTTPS admission
+acquires the active managed CA and retains the trust-store lock through dispatch,
+so rotation or revocation cannot race an admitted send. Only the managed active
+root is trusted; proxies and redirects are disabled. Certificate validity and
+name verification finish before a body is sent. Authentication errors are
+permanent; connection refusal remains a transport error.
 
 `--offline` blocks every HTTP dispatch for that invocation, including an
 authenticated local Adapter. It does not turn a local endpoint into a
