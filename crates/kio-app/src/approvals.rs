@@ -138,15 +138,15 @@ fn configured_profile(
         }
         AdapterRole::Embedding => {
             let Some(execution) =
-                crate::embedding::transport::embedding_execution(adapter_settings, repo.control())
+                crate::embedding::admission::embedding_execution(adapter_settings, repo.control())
             else {
                 return Ok(None);
             };
             // A library has no external recipient to approve.
-            if crate::embedding::transport::embedding_is_deterministic(execution) {
+            if crate::embedding::admission::embedding_is_deterministic(execution) {
                 return Ok(None);
             }
-            let profile = crate::embedding::transport::declared_embedding_profile(execution);
+            let profile = crate::embedding::admission::declared_embedding_profile(execution);
             (profile.tool_id, profile.profile_hash)
         }
     };

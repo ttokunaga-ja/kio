@@ -1,10 +1,10 @@
 use crate::commands::SearchArgs;
 use crate::egress::active_embedding_adapter_identity;
 use crate::egress::embedding_opt_in_for_scopes;
+use crate::embedding::admission::embedding_execution;
+use crate::embedding::admission::embedding_is_deterministic;
 use crate::embedding::transport::QueryEmbeddingOutcome;
 use crate::embedding::transport::compute_query_embedding_page1;
-use crate::embedding::transport::embedding_execution;
-use crate::embedding::transport::embedding_is_deterministic;
 use crate::index::command::compute_index_status;
 use crate::invocation::Invocation;
 use crate::ledger_access::capture_search_budget_observation;

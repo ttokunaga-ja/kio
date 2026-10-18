@@ -297,3 +297,87 @@ fn sync_embedding_network_result_unknown_fences_restart_until_explicit_resend() 
     );
     assert_eq!(source_embedding_count(&dir), 0, "restart wrote no vector");
 }
+
+/// O0 characterizes the current sync order. A fixture-only trigger interrupts
+/// terminal settlement after the mock send; the vector has already been saved.
+#[test]
+fn sync_embedding_saves_cas_and_source_before_terminal_settlement() {
+    let dir = fixture_dir();
+    fs::write(
+        dir.scope().join("one.md"),
+        "# One\n\nsettlement order witness\n",
+    )
+    .unwrap();
+    let now = "2026-09-08T00:00:00Z";
+    let seam = "require_idempotency_token";
+    kio(&dir, seam, now).args(["init"]).assert().success();
+    kio(&dir, seam, now)
+        .args(["ledger", "init"])
+        .assert()
+        .success();
+    kio(&dir, seam, now)
+        .args(["index", "--offline"])
+        .assert()
+        .success();
+    kio(&dir, seam, now)
+        .args(["adapter", "approve", "gemini_embedding_2", "--yes"])
+        .assert()
+        .success();
+
+    // The ledger validator compares required table/index definitions; an
+    // additional trigger on this disposable fixture leaves those unchanged.
+    let ledger_path = dir.home().join("data/kio/cost-ledger.sqlite");
+    Connection::open(&ledger_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER test_block_embedding_success
+             BEFORE UPDATE OF state ON batch_requests
+             WHEN NEW.adapter_kind = 'embedding' AND NEW.state = 2
+             BEGIN SELECT RAISE(ABORT, 'test settlement blocked'); END;",
+        )
+        .unwrap();
+
+    let output = kio(&dir, seam, now)
+        .args(["index", "--online", "--realtime", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "the fixture trigger must interrupt terminal settlement"
+    );
+
+    let rows = embedding_rows(&dir);
+    assert_eq!(
+        rows.len(),
+        1,
+        "one sent group has one reservation: {rows:?}"
+    );
+    assert!(
+        matches!(rows[0].0, 0 | 1),
+        "settlement did not commit: {rows:?}"
+    );
+    assert!(rows[0].2 > 0.0, "the send had a positive reservation");
+    assert!(
+        rows[0].3.is_some(),
+        "the in-flight intent token is retained"
+    );
+    assert!(
+        embedding_ledger_outcomes(&dir).is_empty(),
+        "the failed terminal transaction recorded no completed charge"
+    );
+
+    let conn = Connection::open(dir.scope().join(".kio/index/sqlite.db")).unwrap();
+    let (embedding_hash, stored_bytes): (String, Vec<u8>) = conn
+        .query_row("SELECT id, vector FROM embeddings", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .unwrap();
+    let object = kio_core::cas::ObjectStore::new(dir.scope().join(".kio"))
+        .read_embedding(&embedding_hash)
+        .unwrap();
+    assert_eq!(
+        stored_bytes,
+        kio_index::embedding_store::f32_to_le_bytes(&object.vector),
+        "source vector bytes and durable CAS vector agree before settlement"
+    );
+}

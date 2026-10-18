@@ -1,10 +1,10 @@
 use crate::approvals;
 use crate::commands::IndexArgs;
-use crate::embedding::transport::declared_embedding_profile;
-use crate::embedding::transport::embedding_execution;
-use crate::embedding::transport::embedding_is_deterministic;
-use crate::embedding::transport::embedding_tool_lock_entry;
-use crate::embedding::transport::embedding_transport_allowed;
+use crate::embedding::admission::declared_embedding_profile;
+use crate::embedding::admission::embedding_execution;
+use crate::embedding::admission::embedding_is_deterministic;
+use crate::embedding::admission::embedding_tool_lock_entry;
+use crate::embedding::admission::embedding_transport_allowed;
 use crate::grants;
 use crate::index::pipeline::active_markdown_adapter;
 use crate::index::pipeline::offline_output_ref;

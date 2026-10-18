@@ -1,6 +1,6 @@
 use crate::approvals;
 use crate::egress::SECRETS_TIER_B_HOLD;
-use crate::embedding::enrichment::selected_embedding_contexts;
+use crate::embedding::plan::selected_embedding_contexts;
 use crate::embedding_owners;
 use crate::embedding_owners::RetainedEmbeddingChunk;
 use crate::grants;

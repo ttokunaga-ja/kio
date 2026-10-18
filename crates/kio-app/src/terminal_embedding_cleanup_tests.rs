@@ -63,7 +63,7 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
         let ledger = LedgerDb::initialize(root.path().join("device/ledger.sqlite")).unwrap();
         let key = TaskKey::new(
             "scope",
-            crate::embedding::transport::EMBEDDING_ADAPTER_KIND,
+            crate::embedding::admission::EMBEDDING_ADAPTER_KIND,
             "input",
             "profile",
         );
@@ -110,7 +110,7 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
         };
         // There is deliberately no scope SQLite DB or vector projection here:
         // releasing a completed operational cleanup must not depend on either.
-        crate::embedding::transport::recover_terminal_embedding_batch_cleanup(
+        crate::embedding::batch::recover_terminal_embedding_batch_cleanup(
             &crate::invocation::Invocation {
                 context: &crate::context::test_support::context(std::path::Path::new(".")),
                 settings: &std::sync::Arc::new(
@@ -130,7 +130,7 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
             let mut expected = before.clone();
             expected.intent_token = None;
             assert_eq!(after, expected);
-            crate::embedding::transport::recover_terminal_embedding_batch_cleanup(
+            crate::embedding::batch::recover_terminal_embedding_batch_cleanup(
                 &crate::invocation::Invocation {
                     context: &crate::context::test_support::context(std::path::Path::new(".")),
                     settings: &std::sync::Arc::new(

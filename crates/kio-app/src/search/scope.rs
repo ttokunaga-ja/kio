@@ -1,4 +1,4 @@
-use crate::embedding::transport::embedding_execution;
+use crate::embedding::admission::embedding_execution;
 use crate::historical_reindex::retained_history_instances;
 use crate::image_authority;
 use crate::management::binding_for_repo;

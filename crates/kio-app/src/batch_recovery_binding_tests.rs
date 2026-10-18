@@ -1,6 +1,6 @@
 use crate::batch::command::run_orphan_attribution_walk;
-use crate::embedding::transport::EMBEDDING_ADAPTER_KIND;
-use crate::embedding::transport::poll_attributed_embedding_batch_job;
+use crate::embedding::admission::EMBEDDING_ADAPTER_KIND;
+use crate::embedding::batch::poll_attributed_embedding_batch_job;
 use crate::markdownize::batch::BatchPollDisposition;
 use crate::markdownize::batch::cleanup_batch_residue;
 use crate::markdownize::batch::poll_attributed_markdownize_batch_job;

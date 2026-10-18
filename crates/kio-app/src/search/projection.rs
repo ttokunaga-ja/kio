@@ -1,4 +1,4 @@
-use crate::embedding::enrichment::authorized_local_image_object_hash;
+use crate::embedding::input::authorized_local_image_object_hash;
 use crate::historical_reindex::pinned_done_units;
 use crate::historical_reindex::retained_history_instances;
 use crate::image_authority;
