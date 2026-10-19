@@ -25,14 +25,14 @@ use crate::mistral_ocr::{EnvMistralOcrClient, MistralOcrClient, MistralOcrMarkdo
 use crate::mistral_ocr::{OcrImage, OcrPage, OcrResponse};
 use crate::office_convert::{is_office_media, resolve_office_converter_with_control};
 use crate::traits::{EmbeddingAdapter, MarkdownizeAdapter, PrepareAdapter};
-#[cfg(debug_assertions)]
-use crate::types::FailedUnit;
 use crate::types::{
-    AdapterProfile, AdapterUsage, EmbeddingInputType, EmbeddingItem, EmbeddingRequest,
-    EmbeddingVector, ExecutionMode, IncrementalHints, MarkdownizeMode, MarkdownizeRequest,
+    AdapterProfile, EmbeddingDescriptor, EmbeddingInputType, EmbeddingItem, EmbeddingOutcome,
+    EmbeddingRequest, ExecutionMode, IncrementalHints, MarkdownizeMode, MarkdownizeRequest,
     MarkdownizeResponse, PreparedUnitHint, PreviousMarkdownizeContext, ProviderIdempotency,
     RawInput,
 };
+#[cfg(debug_assertions)]
+use crate::types::{EmbeddingVector, FailedUnit};
 use crate::{AdapterError, Result};
 
 // This module deliberately translates the typed, debug-only core control at
@@ -1317,7 +1317,7 @@ pub fn declared_adopted_embedding_profile(
             dimensions: ADOPTED_DIMENSIONS as u64,
             distance: "cosine".to_owned(),
             modality: "multimodal".to_owned(),
-            profile_hash: "sha256:00000000000000000000000000000000000000000000000000000000incompat"
+            profile_hash: "sha256:cd6621891aa7ad8afc4fdff8aaf4b84f416b98b476aaed1b319ad45edf542613"
                 .to_owned(),
         },
         #[cfg(debug_assertions)]
@@ -1338,22 +1338,6 @@ pub fn declared_adopted_embedding_profile(
     }
 }
 
-/// What one adopted-embedding send produced: the vectors, plus the usage the
-/// adapter self-reported for THIS call.
-///
-/// I12: this used to be a bare `Vec<EmbeddingVector>`, so `response.usage` was
-/// discarded at the crate boundary. The Batch lane grew its own token-count
-/// path and left both sync settle sites pricing themselves from the
-/// reservation estimate — while four doc comments went on asserting the
-/// endpoint reports no token count, which stopped being true the moment the
-/// adapter started populating `usage`. Carrying it here means a caller can no
-/// longer settle a sync send without at least deciding what to do with the
-/// real number.
-pub struct AdoptedEmbeddingOutcome {
-    pub vectors: Vec<EmbeddingVector>,
-    pub usage: Option<AdapterUsage>,
-}
-
 /// Runs whichever embedding implementation is active over one batch.
 ///
 /// Replaces the per-seam `match` that used to build a `GeminiEmbeddingAdapter`
@@ -1365,7 +1349,7 @@ pub fn run_embedding(
     items: Vec<EmbeddingItem>,
     input_type: EmbeddingInputType,
     idempotency_token: Option<String>,
-) -> Result<AdoptedEmbeddingOutcome> {
+) -> Result<EmbeddingOutcome> {
     run_embedding_with_control(
         settings,
         execution,
@@ -1383,17 +1367,40 @@ pub fn run_embedding_with_control(
     input_type: EmbeddingInputType,
     idempotency_token: Option<String>,
     control: &ControlHandle,
-) -> Result<AdoptedEmbeddingOutcome> {
+) -> Result<EmbeddingOutcome> {
     let adapter = embedding_adapter_for_with_control(settings.clone(), execution, control)?;
-    let response = adapter.embed(EmbeddingRequest {
+    adapter.embed(EmbeddingRequest {
         input_type,
         items,
         idempotency_token,
-    })?;
-    Ok(AdoptedEmbeddingOutcome {
-        vectors: response.vectors,
-        usage: response.usage,
     })
+}
+
+/// Execution effects and limits for the active implementation, outside identity.
+pub fn embedding_descriptor(
+    settings: &AdapterRuntimeSettings,
+    execution: EmbeddingExecution,
+) -> Result<EmbeddingDescriptor> {
+    embedding_descriptor_with_control(settings, execution, &ControlHandle::default())
+}
+
+pub fn embedding_descriptor_with_control(
+    settings: &AdapterRuntimeSettings,
+    execution: EmbeddingExecution,
+    control: &ControlHandle,
+) -> Result<EmbeddingDescriptor> {
+    let mut descriptor =
+        embedding_adapter_for_with_control(Arc::new(settings.clone()), execution, control)?
+            .descriptor();
+    let declared = settings.declared_pricing("embedding");
+    for price in &mut descriptor.pricing {
+        let kind = serde_json::to_value(price.kind).expect("billable kind is serializable");
+        if let Some(value) = kind.as_str().and_then(|kind| declared.get(kind)) {
+            price.standard_usd_per_unit = *value;
+            price.batch_usd_per_unit = descriptor.completion.batch.then_some(*value * 0.5);
+        }
+    }
+    Ok(descriptor)
 }
 
 /// The send lane the active implementation prefers (07 §5.5). The offline
@@ -1448,7 +1455,7 @@ pub fn run_adopted_embedding(
     // `EmbeddingRequest::idempotency_token`'s doc. `None` for a call with no
     // ledger charge.
     idempotency_token: Option<String>,
-) -> Result<AdoptedEmbeddingOutcome> {
+) -> Result<EmbeddingOutcome> {
     run_adopted_embedding_with_control(
         settings,
         execution,
@@ -1466,7 +1473,7 @@ pub fn run_adopted_embedding_with_control(
     input_type: EmbeddingInputType,
     idempotency_token: Option<String>,
     control: &ControlHandle,
-) -> Result<AdoptedEmbeddingOutcome> {
+) -> Result<EmbeddingOutcome> {
     run_embedding_with_control(
         settings,
         EmbeddingExecution::Online(execution),
@@ -1733,9 +1740,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(outcome.vectors.len(), 2);
-        assert_eq!(outcome.vectors[0].id, "a");
-        assert_eq!(outcome.vectors[1].id, "b");
+        let outcome = outcome.into_completed().unwrap();
+        assert_eq!(outcome.members.len(), 2);
+        assert_eq!(outcome.members[0].id, "a");
+        assert_eq!(outcome.members[1].id, "b");
     }
 
     #[test]

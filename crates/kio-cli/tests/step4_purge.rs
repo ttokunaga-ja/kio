@@ -1003,6 +1003,15 @@ fn ct4_purge_preserves_shared_image_until_last_reference_is_removed() {
             distance: "cosine".into(),
             context: None,
             vector: vec![1.0, 0.0],
+            metadata: kio_core::cas::EmbeddingMetadata {
+                record_format: 2,
+                producer: kio_core::cas::ProducerProvenance::non_native(
+                    kio_core::cas::ProducerExecutionMode::DeterministicLibrary,
+                    &hash_bytes(b"shared image vector fixture"),
+                )
+                .unwrap(),
+                image_input_receipt: None,
+            },
         })
         .unwrap();
     fs::remove_file(dir.path().join("a.md")).unwrap();
@@ -1417,6 +1426,15 @@ fn removal_restart_fixture() -> (TempDir, String, String, Vec<String>) {
             distance: "cosine".into(),
             context: None,
             vector,
+            metadata: kio_core::cas::EmbeddingMetadata {
+                record_format: 2,
+                producer: kio_core::cas::ProducerProvenance::non_native(
+                    kio_core::cas::ProducerExecutionMode::DeterministicLibrary,
+                    &hash_bytes(b"purge restart fixture profile"),
+                )
+                .unwrap(),
+                image_input_receipt: None,
+            },
         };
         let id = store.write_embedding(&object).unwrap();
         conn.execute("INSERT INTO embeddings(id,target_type,target_id,modality,vector,dimensions,distance,profile_hash,context_key) VALUES (?1,'chunk',?2,'text',?3,768,'cosine',?4,NULL)",

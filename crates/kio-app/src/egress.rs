@@ -294,6 +294,7 @@ fn execution_mode_name(mode: ExecutionMode) -> &'static str {
     match mode {
         ExecutionMode::OnlineApi => "online_api",
         ExecutionMode::OfflineApi => "offline_api",
+        ExecutionMode::NativeLibrary => "native_library",
         ExecutionMode::DeterministicLibrary => "deterministic_library",
     }
 }
@@ -334,7 +335,9 @@ pub(crate) fn markdown_output_ref_for_profile(profile: &AdapterProfile) -> Strin
     match profile.execution_mode {
         ExecutionMode::OfflineApi => offline_output_ref(&profile.adapter_id),
         ExecutionMode::OnlineApi => online_output_ref(&profile.adapter_id),
-        ExecutionMode::DeterministicLibrary => unreachable!("OCR profiles are external adapters"),
+        ExecutionMode::DeterministicLibrary | ExecutionMode::NativeLibrary => {
+            unreachable!("OCR profiles are external adapters")
+        }
     }
 }
 

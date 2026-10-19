@@ -382,10 +382,10 @@ fn ledger_lifecycle_bypasses_malformed_adapter_configuration() {
     assert_eq!(fixture.json_ok(&["ledger", "status"])["status"], "ready");
 }
 
-/// An existing paid ledger is no reason to take mutable billing authority for
-/// local embeddings, including when the provider lane defaults to Batch.
+/// 04 §5.4: local documents and fresh queries reserve and settle exact zero
+/// in the physical ledger, even when paid budget caps are exhausted.
 #[test]
-fn local_embedding_and_vector_search_preserve_an_initialized_ledger() {
+fn local_embedding_and_vector_search_record_zero_in_initialized_ledger() {
     let fixture = Fixture::new();
     fs::write(
         fixture.repo.join("note.md"),
@@ -394,7 +394,15 @@ fn local_embedding_and_vector_search_preserve_an_initialized_ledger() {
     .unwrap();
     fixture.json_ok(&["init"]);
     fixture.json_ok(&["ledger", "init"]);
-    let before = ledger_artifacts(&fixture);
+    let config_root = fixture.home.join("config");
+    let config_dir = config_root.join("kio");
+    fs::create_dir_all(&config_dir).unwrap();
+    make_owner_private(&config_root);
+    make_owner_private(&config_dir);
+    fs::write(
+        config_dir.join("config.toml"),
+        "[budget]\nmonthly_usd_cap = 0.0\nhard_stop = true\n[budget.per_adapter]\nembedding = 0.0\n",
+    ).unwrap();
     for args in [
         vec!["index", "--yes", "--offline"],
         vec![
@@ -424,10 +432,41 @@ fn local_embedding_and_vector_search_preserve_an_initialized_ledger() {
                 "{result}"
             );
         }
-        assert_eq!(
-            ledger_artifacts(&fixture),
-            before,
-            "{args:?} mutated billing state"
+        let conn = support::immutable_sqlite(fixture.ledger_path());
+        let (documents, queries, invalid): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COALESCE(SUM(scope_id <> 'device'),0),
+                    COALESCE(SUM(scope_id = 'device'),0),
+                    COALESCE(SUM(state <> 2 OR request_kind <> 'sync'
+                        OR estimated_usd <> 0 OR batch_job_id IS NOT NULL),0)
+             FROM batch_requests WHERE adapter_kind='embedding'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert!(
+            documents > 0,
+            "local documents need physical scoped intents"
         );
+        assert_eq!(
+            invalid, 0,
+            "local intents must settle at zero without a remote handle"
+        );
+        assert_eq!(
+            queries,
+            i64::from(args[0] == "search"),
+            "only the fresh query creates a device-scope intent"
+        );
+        let (settled, invalid): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(usd <> 0 OR estimated <> 0 OR outcome <> 'succeeded'),0)
+             FROM cost_ledger WHERE adapter_kind='embedding'",
+            [], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).unwrap();
+        assert_eq!(
+            settled,
+            documents + queries,
+            "every local intent needs one terminal record"
+        );
+        assert_eq!(invalid, 0, "local usage is confirmed zero, never estimated");
     }
 }

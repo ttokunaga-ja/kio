@@ -13,7 +13,6 @@
 //! - create: `POST {base}/v1beta/{model}:asyncBatchEmbedContent`
 //! - poll:   `GET  {base}/v1beta/{name}` where `name` = `batches/{id}`
 //! - list:   `GET  {base}/v1beta/batches?pageSize=N[&pageToken=…]`
-//! - cancel: `POST {base}/v1beta/{name}:cancel`
 //! - results: inline in the poll response, under BOTH
 //!   `metadata.output.inlinedResponses.inlinedResponses[]` and
 //!   `response.inlinedResponses.inlinedResponses[]`
@@ -37,6 +36,7 @@
 //! seam ([`TEST_GEMINI_BATCH_ENV`]).
 
 use crate::tool_lock::AdapterRuntimeSettings;
+use crate::types::{EmbeddingOutcome, EmbeddingRemoteHandle};
 use kio_core::control::ControlHandle;
 #[cfg(debug_assertions)]
 use std::io::Write as _;
@@ -144,7 +144,7 @@ impl GeminiBatchState {
 #[derive(Debug, Clone)]
 pub struct GeminiBatchJobRecord {
     /// Resource name, `batches/{id}` — the value stored in `batch_job_id`.
-    pub name: String,
+    pub name: EmbeddingRemoteHandle,
     pub state: GeminiBatchState,
     /// The job-level free-form label the intent_token rides in
     /// ([`batch_display_name`]).
@@ -288,14 +288,16 @@ fn qualified_model(model: &str) -> String {
 pub trait GeminiBatchClient {
     fn provider_scope_id(&self) -> Result<String>;
 
-    /// Create an inline embedding batch job; returns the created job record.
-    fn create_embedding_job(
+    /// Submit an inline embedding batch and return the common Pending outcome.
+    /// The provider handle is parsed from the receipt. Poll/list attribution
+    /// is validated by the runner against the durable intent before use.
+    fn submit_job(
         &self,
         model: &str,
         dimensions: u32,
         display_name: &str,
         inputs: &[GeminiBatchEmbedInput],
-    ) -> Result<GeminiBatchJobRecord>;
+    ) -> Result<EmbeddingOutcome>;
 
     /// One poll: the job record and, once the job has finished, its results.
     ///
@@ -306,7 +308,7 @@ pub trait GeminiBatchClient {
     /// bounds. One of them was sized for "metadata", which silently stranded
     /// every job past ~20 members. A single fetch makes that divergence
     /// unrepresentable rather than merely fixed.
-    fn poll_job(&self, name: &str) -> Result<GeminiBatchPoll>;
+    fn poll_job(&self, name: &EmbeddingRemoteHandle) -> Result<GeminiBatchPoll>;
 
     fn list_jobs(&self) -> Result<Vec<GeminiBatchJobRecord>>;
 }
@@ -369,7 +371,7 @@ pub(crate) fn parse_job_record(value: &Value) -> Result<GeminiBatchJobRecord> {
         .filter(|file| !file.is_empty())
         .map(str::to_owned);
     Ok(GeminiBatchJobRecord {
-        name,
+        name: EmbeddingRemoteHandle(name),
         state,
         display_name,
         responses_file,
@@ -591,13 +593,13 @@ impl GeminiBatchClient for EnvGeminiBatchClient {
         Ok(self.identity.scope().to_owned())
     }
 
-    fn create_embedding_job(
+    fn submit_job(
         &self,
         model: &str,
         dimensions: u32,
         display_name: &str,
         inputs: &[GeminiBatchEmbedInput],
-    ) -> Result<GeminiBatchJobRecord> {
+    ) -> Result<EmbeddingOutcome> {
         let body = inline_embed_batch_body(model, display_name, dimensions, inputs)?;
         let api_key = self.identity.credential();
         let url = format!(
@@ -619,10 +621,13 @@ impl GeminiBatchClient for EnvGeminiBatchClient {
             BATCH_METADATA_MAX_BYTES,
             "Gemini batch create response",
         )?;
-        parse_job_record(&value)
+        let record = parse_job_record(&value)?;
+        Ok(EmbeddingOutcome::Pending {
+            remote_handle: record.name,
+        })
     }
 
-    fn poll_job(&self, name: &str) -> Result<GeminiBatchPoll> {
+    fn poll_job(&self, name: &EmbeddingRemoteHandle) -> Result<GeminiBatchPoll> {
         let value = self.get_json(
             &format!("{}/v1beta/{name}", self.base_url()),
             BATCH_POLL_MAX_BYTES,
@@ -879,7 +884,7 @@ impl MockGeminiBatchClient {
 
     fn record(&self, state: &str) -> Result<GeminiBatchJobRecord> {
         Ok(GeminiBatchJobRecord {
-            name: self.script.job_name.clone(),
+            name: EmbeddingRemoteHandle(self.script.job_name.clone()),
             state: GeminiBatchState::parse(state),
             display_name: match &self.script.display_name {
                 Some(display_name) => display_name.clone(),
@@ -899,13 +904,13 @@ impl GeminiBatchClient for MockGeminiBatchClient {
         Ok(self.script.provider_scope_id.clone())
     }
 
-    fn create_embedding_job(
+    fn submit_job(
         &self,
         model: &str,
         dimensions: u32,
         display_name: &str,
         inputs: &[GeminiBatchEmbedInput],
-    ) -> Result<GeminiBatchJobRecord> {
+    ) -> Result<EmbeddingOutcome> {
         // Validate the real body shape even in the mock, so a caller that
         // would exceed the inline bounds fails identically offline.
         inline_embed_batch_body(model, display_name, dimensions, inputs)?;
@@ -925,12 +930,14 @@ impl GeminiBatchClient for MockGeminiBatchClient {
                 .map_or("BATCH_STATE_PENDING", String::as_str),
         )?;
         record.display_name = display_name.to_owned();
-        Ok(record)
+        Ok(EmbeddingOutcome::Pending {
+            remote_handle: record.name,
+        })
     }
 
-    fn poll_job(&self, name: &str) -> Result<GeminiBatchPoll> {
-        self.capture(json!({ "call": "poll_job", "name": name }));
-        self.fail_if_named(name)?;
+    fn poll_job(&self, name: &EmbeddingRemoteHandle) -> Result<GeminiBatchPoll> {
+        self.capture(json!({ "call": "poll_job", "name": name.as_str() }));
+        self.fail_if_named(name.as_str())?;
         self.fail_if_scripted("poll_job")?;
         let step = self.poll_step();
         let state = self
@@ -1056,7 +1063,7 @@ mod tests {
         let client = MockGeminiBatchClient::from_env_value(&script.to_string()).unwrap();
         assert!(
             client
-                .poll_job(&default_job())
+                .poll_job(&EmbeddingRemoteHandle(default_job()))
                 .unwrap()
                 .record
                 .display_name
@@ -1067,16 +1074,20 @@ mod tests {
             text: "text".into(),
         }];
         client
-            .create_embedding_job("model", 768, "kio-submitted-intent", &inputs)
+            .submit_job("model", 768, "kio-submitted-intent", &inputs)
             .unwrap();
         assert_eq!(
-            client.poll_job(&default_job()).unwrap().record.display_name,
+            client
+                .poll_job(&EmbeddingRemoteHandle(default_job()))
+                .unwrap()
+                .record
+                .display_name,
             "kio-submitted-intent"
         );
         let reopened = MockGeminiBatchClient::from_env_value(&script.to_string()).unwrap();
         assert_eq!(
             reopened
-                .poll_job(&default_job())
+                .poll_job(&EmbeddingRemoteHandle(default_job()))
                 .unwrap()
                 .record
                 .display_name,
@@ -1088,7 +1099,7 @@ mod tests {
             let client = MockGeminiBatchClient::from_env_value(&other.to_string()).unwrap();
             assert!(
                 client
-                    .poll_job("different")
+                    .poll_job(&EmbeddingRemoteHandle("different".to_owned()))
                     .unwrap()
                     .record
                     .display_name
@@ -1099,16 +1110,20 @@ mod tests {
         mismatch["display_name"] = json!("kio-wrong");
         let client = MockGeminiBatchClient::from_env_value(&mismatch.to_string()).unwrap();
         assert_eq!(
-            client.poll_job(&default_job()).unwrap().record.display_name,
+            client
+                .poll_job(&EmbeddingRemoteHandle(default_job()))
+                .unwrap()
+                .record
+                .display_name,
             "kio-wrong"
         );
         let memory_only = MockGeminiBatchClient::from_env_value("{}").unwrap();
         memory_only
-            .create_embedding_job("model", 768, "kio-memory", &inputs)
+            .submit_job("model", 768, "kio-memory", &inputs)
             .unwrap();
         assert_eq!(
             memory_only
-                .poll_job(&default_job())
+                .poll_job(&EmbeddingRemoteHandle(default_job()))
                 .unwrap()
                 .record
                 .display_name,
@@ -1270,7 +1285,7 @@ mod tests {
             "displayName": "kio-tok",
         });
         let record = parse_job_record(&flat).unwrap();
-        assert_eq!(record.name, "batches/abc");
+        assert_eq!(record.name.as_str(), "batches/abc");
         assert_eq!(record.state, GeminiBatchState::Running);
         assert_eq!(record.display_name, "kio-tok");
         assert!(record.responses_file.is_none());
@@ -1284,7 +1299,7 @@ mod tests {
             },
         });
         let record = parse_job_record(&wrapped).unwrap();
-        assert_eq!(record.name, "batches/abc");
+        assert_eq!(record.name.as_str(), "batches/abc");
         assert_eq!(record.state, GeminiBatchState::Pending);
     }
 
@@ -1492,7 +1507,10 @@ mod tests {
     fn real_poll_response_yields_a_terminal_job_record() {
         let value: Value = serde_json::from_str(REAL_POLL_RESPONSE).unwrap();
         let record = parse_job_record(&value).unwrap();
-        assert_eq!(record.name, "batches/pq1j6cr5x7usrrlj98tlukhnsav7gcq5lt8x");
+        assert_eq!(
+            record.name.as_str(),
+            "batches/pq1j6cr5x7usrrlj98tlukhnsav7gcq5lt8x"
+        );
         assert_eq!(record.state, GeminiBatchState::Succeeded);
         assert!(record.state.is_terminal());
         // The recovery walk keys off this, so an empty display name would make
@@ -1510,7 +1528,7 @@ mod tests {
             .expect("the live listing shape must resolve, or recovery never finds a job");
         assert_eq!(records.len(), 1);
         assert_eq!(
-            records[0].name,
+            records[0].name.as_str(),
             "batches/o828in12yctmkpzraz93m0a2p6nqerf2fpre"
         );
         assert_eq!(records[0].state, GeminiBatchState::Succeeded);
@@ -1540,7 +1558,7 @@ mod tests {
         let jobs = client.list_jobs().unwrap();
 
         assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].name, "batches/after-empty");
+        assert_eq!(jobs[0].name.as_str(), "batches/after-empty");
         let requests = server.join().unwrap();
         assert_eq!(requests.len(), 2);
         assert!(requests[0].starts_with("GET /v1beta/batches?pageSize=100 "));
@@ -1641,7 +1659,7 @@ mod tests {
         });
         let records = parse_job_listing(&value).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].name, "batches/abc");
+        assert_eq!(records[0].name.as_str(), "batches/abc");
         assert!(parse_job_listing(&json!({})).unwrap().is_empty());
     }
 
@@ -1664,7 +1682,7 @@ mod tests {
         .to_string();
         let client = MockGeminiBatchClient::from_env_value(&script).unwrap();
         let created = client
-            .create_embedding_job(
+            .submit_job(
                 "gemini-embedding-2",
                 768,
                 "kio-tok",
@@ -1674,21 +1692,23 @@ mod tests {
                 }],
             )
             .unwrap();
-        assert_eq!(created.state, GeminiBatchState::Pending);
-        assert_eq!(created.display_name, "kio-tok");
-        let pending = client.poll_job(&created.name).unwrap();
+        let EmbeddingOutcome::Pending { remote_handle } = created else {
+            panic!("Batch submission must return Pending");
+        };
+        let pending = client.poll_job(&remote_handle).unwrap();
+        assert_eq!(pending.record.display_name, "kio-tok");
         assert_eq!(pending.record.state, GeminiBatchState::Pending);
         // A job that has not finished carries no results, and that absence is
         // normal rather than a read failure.
         assert!(pending.results.is_none());
 
-        let running = client.poll_job(&created.name).unwrap();
+        let running = client.poll_job(&remote_handle).unwrap();
         assert_eq!(running.record.state, GeminiBatchState::Running);
         assert!(running.results.is_none());
 
         // I8: the terminal poll delivers the record AND the results in ONE
         // call, because the provider delivers them in one document.
-        let done = client.poll_job(&created.name).unwrap();
+        let done = client.poll_job(&remote_handle).unwrap();
         assert_eq!(done.record.state, GeminiBatchState::Succeeded);
         let outputs = done.results.expect("a succeeded job carries its results");
         assert_eq!(outputs.len(), 1);
@@ -1701,7 +1721,7 @@ mod tests {
         let script = json!({ "fail_phase": "create_job" }).to_string();
         let client = MockGeminiBatchClient::from_env_value(&script).unwrap();
         let error = client
-            .create_embedding_job(
+            .submit_job(
                 "gemini-embedding-2",
                 768,
                 "kio-tok",
@@ -1719,7 +1739,7 @@ mod tests {
         let client = MockGeminiBatchClient::from_env_value("{}").unwrap();
         assert!(
             client
-                .create_embedding_job("gemini-embedding-2", 768, "kio-tok", &[])
+                .submit_job("gemini-embedding-2", 768, "kio-tok", &[])
                 .is_err()
         );
     }

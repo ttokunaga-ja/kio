@@ -3018,6 +3018,12 @@ mod task_retirement_tests {
         let task = |id: &str, chunk: &str, embedding: &str| TaskDescriptor {
             task_id: id.to_owned(),
             task_type: TaskType::Embedding,
+            embedding_target: Some(kio_pipeline::task::EmbeddingTaskTarget::Chunk {
+                chunk_hash: chunk.to_owned(),
+                embedding_hash: embedding.to_owned(),
+                profile_hash: hash_bytes(b"purge fixture profile"),
+                input_hash: hash_bytes(b"shared chunk text"),
+            }),
             mode: None,
             input_path: "document.md".to_owned(),
             input_hash: hash_bytes(b"shared chunk text"),

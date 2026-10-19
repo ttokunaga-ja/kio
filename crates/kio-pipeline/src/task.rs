@@ -1,5 +1,8 @@
 //! Batch task descriptor contracts.
 
+mod embedding_target;
+pub use embedding_target::EmbeddingTaskTarget;
+
 use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, Read, Write};
@@ -117,6 +120,7 @@ pub enum TaskStatus {
     Partial,
     Failed,
     Paused,
+    Skipped,
 }
 
 // R17-3: `Eq` is intentionally NOT derived — `reserved_usd` is an `f64`, which
@@ -164,6 +168,8 @@ pub struct TaskDescriptor {
     /// Identity of the matching record in the trusted device reservation ledger.
     /// An absent reservation is represented as an explicit JSON null.
     pub reservation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub embedding_target: Option<EmbeddingTaskTarget>,
 }
 
 /// A persisted nullable field that still must be present in every current task row.
@@ -198,6 +204,7 @@ struct TaskDescriptorWire {
     reserved_usd: RequiredNullable<f64>,
     reserved_month: RequiredNullable<String>,
     reservation_id: RequiredNullable<String>,
+    embedding_target: Option<EmbeddingTaskTarget>,
 }
 
 impl<'de> Deserialize<'de> for TaskDescriptor {
@@ -206,6 +213,18 @@ impl<'de> Deserialize<'de> for TaskDescriptor {
         D: Deserializer<'de>,
     {
         let wire = TaskDescriptorWire::deserialize(deserializer)?;
+        match (wire.task_type, &wire.embedding_target) {
+            (TaskType::Markdownize, None) => {}
+            (TaskType::Embedding, Some(target))
+                if target.is_valid()
+                    && (!matches!(target, EmbeddingTaskTarget::Query { .. })
+                        || target.input_hash() == wire.input_hash) => {}
+            _ => {
+                return Err(serde::de::Error::custom(
+                    "task requires its exact current typed embedding target",
+                ));
+            }
+        }
         Ok(Self {
             task_id: wire.task_id,
             task_type: wire.task_type,
@@ -229,6 +248,7 @@ impl<'de> Deserialize<'de> for TaskDescriptor {
             reserved_usd: wire.reserved_usd.0,
             reserved_month: wire.reserved_month.0,
             reservation_id: wire.reservation_id.0,
+            embedding_target: wire.embedding_target,
         })
     }
 }
@@ -293,6 +313,12 @@ pub enum TaskOutputRef {
     },
     Embedding {
         work_key: EmbeddingWorkKey,
+    },
+    ImageEmbedding {
+        target: EmbeddingTaskTarget,
+    },
+    QueryEmbedding {
+        target: EmbeddingTaskTarget,
     },
     NormalizedInstance {
         path: PathBuf,
@@ -702,6 +728,26 @@ pub fn validate_task_output_ref(
             adapter_id: adapter_id.to_owned(),
         });
     }
+    if descriptor.task_type == TaskType::Embedding {
+        let target = descriptor
+            .embedding_target
+            .as_ref()
+            .filter(|target| target.is_valid() && target.output_ref() == descriptor.output_ref)
+            .ok_or_else(|| invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref))?;
+        match target {
+            EmbeddingTaskTarget::Image { .. } => {
+                return Ok(TaskOutputRef::ImageEmbedding {
+                    target: target.clone(),
+                });
+            }
+            EmbeddingTaskTarget::Query { .. } => {
+                return Ok(TaskOutputRef::QueryEmbedding {
+                    target: target.clone(),
+                });
+            }
+            EmbeddingTaskTarget::Chunk { .. } => {}
+        }
+    }
     if descriptor.output_ref.starts_with("embedding:") {
         let work_key = EmbeddingWorkKey::parse(&descriptor.output_ref)
             .ok_or_else(|| invalid_output_ref(kio_dir.as_ref(), &descriptor.output_ref))?;
@@ -836,7 +882,7 @@ pub fn task_can_complete_from_materialized_output(task: &TaskDescriptor) -> bool
             task.fallback_reason.as_deref(),
             Some(BUDGET_EXCEEDED_REASON) | Some("auth_error")
         ),
-        TaskStatus::Done | TaskStatus::Partial => false,
+        TaskStatus::Done | TaskStatus::Partial | TaskStatus::Skipped => false,
     }
 }
 
@@ -900,8 +946,16 @@ fn validate_task_descriptor_fields(kio_dir: &Path, descriptor: &TaskDescriptor) 
             "task_id is not a bounded logical identifier".to_owned(),
         ));
     }
+    let query = matches!(
+        descriptor.embedding_target,
+        Some(EmbeddingTaskTarget::Query { .. })
+    );
     if descriptor.input_path.len() > MAX_TASK_PATH_BYTES
-        || !is_scope_local_file_name(&descriptor.input_path)
+        || if query {
+            !descriptor.input_path.is_empty()
+        } else {
+            !is_scope_local_file_name(&descriptor.input_path)
+        }
     {
         return Err(PipelineError::path(descriptor.input_path.clone()));
     }
@@ -940,6 +994,28 @@ fn validate_task_descriptor_fields(kio_dir: &Path, descriptor: &TaskDescriptor) 
     }
     if descriptor.output_ref.len() > MAX_TASK_PATH_BYTES {
         return Err(corrupt("task output_ref is oversized".to_owned()));
+    }
+    match (descriptor.task_type, &descriptor.embedding_target) {
+        (TaskType::Markdownize, None) => {}
+        (TaskType::Embedding, Some(target))
+            if target.is_valid()
+                && (!matches!(target, EmbeddingTaskTarget::Query { .. })
+                    || target.input_hash() == descriptor.input_hash) => {}
+        _ => {
+            return Err(corrupt(
+                "missing or invalid typed embedding target".to_owned(),
+            ));
+        }
+    }
+    if descriptor.status == TaskStatus::Skipped
+        && descriptor
+            .fallback_reason
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Err(corrupt(
+            "skipped task requires an exclusion reason".to_owned(),
+        ));
     }
     match (descriptor.status, descriptor.hold_reason) {
         (TaskStatus::Paused, Some(hold_reason))
@@ -1193,6 +1269,16 @@ pub fn idempotency_key(input_hash: &str, tool_profile_hash: &str) -> String {
 mod tests {
     use super::*;
 
+    fn bind_test_target(task: &mut TaskDescriptor) {
+        let key = EmbeddingWorkKey::parse(&task.output_ref).unwrap();
+        task.embedding_target = Some(EmbeddingTaskTarget::Chunk {
+            chunk_hash: key.chunk_id().to_owned(),
+            embedding_hash: key.embedding_hash().to_owned(),
+            profile_hash: format!("sha256:{}", "d".repeat(64)),
+            input_hash: task.input_hash.clone(),
+        });
+    }
+
     fn valid_task() -> TaskDescriptor {
         TaskDescriptor {
             task_id: "task_01H".to_owned(),
@@ -1217,6 +1303,7 @@ mod tests {
             reserved_usd: None,
             reserved_month: None,
             reservation_id: None,
+            embedding_target: None,
         }
     }
 
@@ -1245,6 +1332,7 @@ mod tests {
             reserved_usd: None,
             reserved_month: None,
             reservation_id: None,
+            embedding_target: None,
         };
 
         let value = serde_json::to_value(descriptor).expect("serialize task descriptor");
@@ -1365,6 +1453,7 @@ mod tests {
             reserved_usd: None,
             reserved_month: None,
             reservation_id: None,
+            embedding_target: None,
         };
         store.append(&task).unwrap();
         // A bare-name task reads back fine.
@@ -1419,6 +1508,7 @@ mod tests {
             reserved_usd: None,
             reserved_month: None,
             reservation_id: None,
+            embedding_target: None,
         };
         let mut encoded = serde_json::to_vec(&task).unwrap();
         encoded.push(b'\n');
@@ -1730,6 +1820,7 @@ mod tests {
         .unwrap();
         task.output_ref = work_key.output_ref();
         task.changed_unit_keys = vec![work_key.chunk_id().to_owned()];
+        bind_test_target(&mut task);
         assert!(matches!(
             validate_task_output_ref(dir.path(), &task).unwrap(),
             TaskOutputRef::Embedding { .. }
@@ -1755,6 +1846,7 @@ mod tests {
         task.task_type = TaskType::Embedding;
         task.output_ref = key.output_ref();
         task.changed_unit_keys = vec![chunk];
+        bind_test_target(&mut task);
         assert_eq!(
             validate_task_output_ref(dir.path(), &task).unwrap(),
             TaskOutputRef::Embedding { work_key: key }
@@ -1817,6 +1909,7 @@ mod tests {
             .unwrap()
             .output_ref();
         valid.changed_unit_keys = vec![chunk.clone()];
+        bind_test_target(&mut valid);
         let mut invalid = Vec::new();
         for members in [vec![], vec![embedding], vec![chunk.clone(), chunk]] {
             let mut task = valid.clone();
@@ -2036,6 +2129,7 @@ mod tests {
         .unwrap();
         task.output_ref = work_key.output_ref();
         task.changed_unit_keys = vec![work_key.chunk_id().to_owned()];
+        bind_test_target(&mut task);
         assert!(task_can_enter_secret_hold(&task));
 
         task.status = TaskStatus::Failed;

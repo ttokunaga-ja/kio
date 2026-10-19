@@ -2157,6 +2157,27 @@ fn scale_embedding_object(
     bytes.extend_from_slice(BASE64.encode(vector).as_bytes());
     bytes.push(b'\n');
     bytes.extend_from_slice(lower_hex(&Sha256::digest(vector)).as_bytes());
+    bytes.push(b'\n');
+    let metadata = serde_json::json!({
+        "record_format": 2,
+        "producer": {
+            "execution_mode": "deterministic_library",
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "runtime_version": null,
+            "runtime_library_sha256": null,
+            "profile_hash": DETERMINISTIC_EMBEDDING_PROFILE_HASH,
+            "cpu_backend": null,
+            "threads": null,
+        },
+        "image_input_receipt": null,
+    });
+    let metadata =
+        canonical_json_bytes(&metadata).map_err(|error| other("embedding CAS metadata", error))?;
+    bytes.extend_from_slice(&metadata);
+    bytes.push(b'\n');
+    bytes.extend_from_slice(lower_hex(&Sha256::digest(&metadata)).as_bytes());
+    bytes.push(b'\n');
     Ok(bytes)
 }
 

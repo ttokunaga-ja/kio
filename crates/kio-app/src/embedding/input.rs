@@ -1,7 +1,9 @@
 use crate::embedding_owners::RetainedEmbeddingChunk;
 use crate::image_authority;
+use kio_adapter::types::MAX_EMBEDDING_ITEM_BYTES;
 use kio_core::KioError;
 use kio_core::Result;
+use kio_core::cas::{ContentObjectKind, ObjectStore, hash_bytes};
 use kio_search::object_uri::extract_related_images;
 use std::collections::BTreeSet;
 
@@ -20,6 +22,30 @@ pub(crate) fn verified_image_mime(bytes: &[u8]) -> Result<&'static str> {
             "image object has unsupported or unverifiable MIME",
         ))
     }
+}
+
+/// Authenticate and decode the original source image before an embedding
+/// send or a CAS-backed image projection. The object read is bounded, and the
+/// caller decides whether a missing source can be skipped or must fail.
+pub(crate) fn read_verified_embedding_image(
+    store: &ObjectStore,
+    image_hash: &str,
+) -> Result<(Vec<u8>, &'static str)> {
+    store.inspect_content_object(ContentObjectKind::Image, image_hash)?;
+    let bytes = store.read_content_object_bytes(
+        ContentObjectKind::Image,
+        image_hash,
+        u64::try_from(MAX_EMBEDDING_ITEM_BYTES)
+            .map_err(|_| KioError::schema("embedding image cap exceeds u64"))?,
+    )?;
+    if hash_bytes(&bytes) != image_hash {
+        return Err(KioError::schema(
+            "verified image payload hash changed while reading",
+        ));
+    }
+    let mime = verified_image_mime(&bytes)?;
+    let _ = crate::image_ingest::validate_source_image_payload(&bytes, mime)?;
+    Ok((bytes, mime))
 }
 
 /// Every image object hash referenced by a live chunk body and owned by a

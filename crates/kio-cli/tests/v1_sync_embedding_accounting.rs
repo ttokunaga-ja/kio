@@ -1,3 +1,5 @@
+mod support;
+
 use std::fs;
 
 use assert_cmd::Command;
@@ -73,6 +75,14 @@ fn kio(dir: &Fixture, seam: &str, now: &str) -> Command {
     command
 }
 
+fn kio_deterministic(dir: &Fixture, now: &str) -> Command {
+    let mut command = kio(dir, "mock", now);
+    command
+        .env_remove("KIO_TEST_GEMINI_EMBED")
+        .env("KIO_EVAL_DETERMINISTIC_EMBED", "scale-v3");
+    command
+}
+
 fn run_json_success(dir: &Fixture, seam: &str, now: &str, args: &[&str]) -> serde_json::Value {
     let output = kio(dir, seam, now)
         .args(args)
@@ -97,7 +107,7 @@ fn run_json_success(dir: &Fixture, seam: &str, now: &str, args: &[&str]) -> serd
 }
 
 fn embedding_rows(dir: &Fixture) -> Vec<(i64, String, f64, Option<String>)> {
-    let conn = Connection::open(dir.home().join("data/kio/cost-ledger.sqlite")).unwrap();
+    let conn = support::immutable_sqlite(dir.home().join("data/kio/cost-ledger.sqlite"));
     conn.prepare(
         "SELECT state, COALESCE(error, ''), estimated_usd, intent_token
          FROM batch_requests WHERE adapter_kind = 'embedding' ORDER BY submission_seq",
@@ -112,7 +122,7 @@ fn embedding_rows(dir: &Fixture) -> Vec<(i64, String, f64, Option<String>)> {
 }
 
 fn source_embedding_count(dir: &Fixture) -> i64 {
-    let conn = Connection::open(dir.scope().join(".kio/index/sqlite.db")).unwrap();
+    let conn = support::immutable_sqlite(dir.scope().join(".kio/index/sqlite.db"));
     // `chunk_vec` is a sqlite-vec virtual table; opening the source database
     // through plain `rusqlite` does not load that extension. `embeddings` is
     // the persisted source-of-truth and proves the same provider effect.
@@ -121,7 +131,7 @@ fn source_embedding_count(dir: &Fixture) -> i64 {
 }
 
 fn embedding_ledger_outcomes(dir: &Fixture) -> Vec<(String, f64)> {
-    let conn = Connection::open(dir.home().join("data/kio/cost-ledger.sqlite")).unwrap();
+    let conn = support::immutable_sqlite(dir.home().join("data/kio/cost-ledger.sqlite"));
     conn.prepare(
         "SELECT outcome, usd FROM cost_ledger
          WHERE adapter_kind = 'embedding' ORDER BY submission_seq",
@@ -298,10 +308,10 @@ fn sync_embedding_network_result_unknown_fences_restart_until_explicit_resend() 
     assert_eq!(source_embedding_count(&dir), 0, "restart wrote no vector");
 }
 
-/// O0 characterizes the current sync order. A fixture-only trigger interrupts
-/// terminal settlement after the mock send; the vector has already been saved.
+/// 04 §5.1: no vector is published before terminal settlement is durable.
+/// A fixture-only trigger interrupts settlement after the mock send.
 #[test]
-fn sync_embedding_saves_cas_and_source_before_terminal_settlement() {
+fn sync_embedding_cannot_publish_before_terminal_settlement() {
     let dir = fixture_dir();
     fs::write(
         dir.scope().join("one.md"),
@@ -327,6 +337,7 @@ fn sync_embedding_saves_cas_and_source_before_terminal_settlement() {
     // The ledger validator compares required table/index definitions; an
     // additional trigger on this disposable fixture leaves those unchanged.
     let ledger_path = dir.home().join("data/kio/cost-ledger.sqlite");
+    support::prepare_private_sqlite_sidecars(&ledger_path).unwrap();
     Connection::open(&ledger_path)
         .unwrap()
         .execute_batch(
@@ -366,18 +377,418 @@ fn sync_embedding_saves_cas_and_source_before_terminal_settlement() {
         "the failed terminal transaction recorded no completed charge"
     );
 
-    let conn = Connection::open(dir.scope().join(".kio/index/sqlite.db")).unwrap();
-    let (embedding_hash, stored_bytes): (String, Vec<u8>) = conn
-        .query_row("SELECT id, vector FROM embeddings", [], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })
-        .unwrap();
-    let object = kio_core::cas::ObjectStore::new(dir.scope().join(".kio"))
-        .read_embedding(&embedding_hash)
+    let published_objects = kio_core::cas::ObjectStore::new(dir.scope().join(".kio"))
+        .embedding_hashes()
         .unwrap();
     assert_eq!(
-        stored_bytes,
-        kio_index::embedding_store::f32_to_le_bytes(&object.vector),
-        "source vector bytes and durable CAS vector agree before settlement"
+        (published_objects.len(), source_embedding_count(&dir)),
+        (0, 0),
+        "unsettled members must have neither a published CAS vector nor a source vector row"
+    );
+}
+
+/// 04 §5.4: a deterministic 0 USD embedding and a fresh page-1 query both
+/// journal in the initialized physical device ledger, even while paid caps are
+/// exhausted. No remote handle is invented for a local request.
+#[test]
+fn deterministic_embedding_index_and_query_settle_zero_in_the_physical_ledger() {
+    let dir = fixture_dir();
+    let now = "2026-09-08T00:00:00Z";
+    fs::write(dir.scope().join("one.md"), "# Local\n\nlocalvectorneedle\n").unwrap();
+    kio_deterministic(&dir, now)
+        .args(["init"])
+        .assert()
+        .success();
+    kio_deterministic(&dir, now)
+        .args(["ledger", "init"])
+        .assert()
+        .success();
+    fs::create_dir_all(dir.home().join("config/kio")).unwrap();
+    fs::write(
+        dir.home().join("config/kio/config.toml"),
+        "[budget]\nmonthly_usd_cap = 0.0\nhard_stop = true\n[budget.per_adapter]\nembedding = 0.0\n",
+    )
+    .unwrap();
+
+    let indexed = kio_deterministic(&dir, now)
+        .args(["index", "--offline", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        indexed.status.success(),
+        "local indexing under exhausted caps: {}",
+        String::from_utf8_lossy(&indexed.stderr)
+    );
+    assert!(source_embedding_count(&dir) > 0, "local index must embed");
+
+    let queried = kio_deterministic(&dir, now)
+        .args([
+            "search",
+            "localvectorneedle",
+            "--mode",
+            "vector",
+            "--offline",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        queried.status.success(),
+        "local query under exhausted caps: {}",
+        String::from_utf8_lossy(&queried.stderr)
+    );
+    let result: serde_json::Value = serde_json::from_slice(&queried.stdout).unwrap();
+    assert_eq!(result["resolved_mode"], "vector", "{result}");
+
+    let conn = support::immutable_sqlite(dir.home().join("data/kio/cost-ledger.sqlite"));
+    let local_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM batch_requests
+             WHERE adapter_kind = 'embedding' AND request_kind = 'sync'
+               AND state = 2 AND estimated_usd = 0 AND batch_job_id IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        local_rows >= 2,
+        "index and query need separate 0 USD intents"
+    );
+    let scoped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM batch_requests
+             WHERE adapter_kind = 'embedding' AND scope_id <> 'device' AND state = 2",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let device: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM batch_requests
+             WHERE adapter_kind = 'embedding' AND scope_id = 'device' AND state = 2",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        scoped > 0 && device > 0,
+        "index uses scope, query uses device"
+    );
+    let outcomes = embedding_ledger_outcomes(&dir);
+    assert!(
+        outcomes.len() >= 2,
+        "every local request settles: {outcomes:?}"
+    );
+    assert!(
+        outcomes
+            .iter()
+            .all(|(outcome, usd)| outcome == "succeeded" && *usd == 0.0),
+        "local work must settle at exact zero: {outcomes:?}"
+    );
+}
+
+/// 04 §5.4: missing physical ledger authority pauses local work; an ordinary
+/// index or search must not initialize that authority as a side effect.
+#[test]
+fn deterministic_embedding_without_ledger_does_not_publish_or_create_one() {
+    let dir = fixture_dir();
+    let now = "2026-09-08T00:00:00Z";
+    fs::write(dir.scope().join("one.md"), "# Local\n\nlocalvectorneedle\n").unwrap();
+    kio_deterministic(&dir, now)
+        .args(["init"])
+        .assert()
+        .success();
+    let index = kio_deterministic(&dir, now)
+        .args(["index", "--offline", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        index.status.code(),
+        Some(6),
+        "uninitialized ledger must use the existing budget-pause exit: stdout={} stderr={}",
+        String::from_utf8_lossy(&index.stdout),
+        String::from_utf8_lossy(&index.stderr)
+    );
+    let payload: serde_json::Value = serde_json::from_slice(&index.stdout).unwrap();
+    assert_eq!(payload["error_code"], "KIO-E-BUDGET-EXCEEDED-001");
+    assert_eq!(payload["paused_tasks"], 1);
+    let tasks = fs::read_to_string(dir.scope().join(".kio/tasks.jsonl")).unwrap();
+    let embedding = tasks
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .rfind(|task| task["type"] == "embedding")
+        .expect("index must record its embedding task");
+    assert_eq!(embedding["status"], "paused", "{embedding}");
+    assert_eq!(
+        embedding["hold_reason"], "ledger_initialization_required",
+        "{embedding}"
+    );
+    let ledger_path = dir.home().join("data/kio/cost-ledger.sqlite");
+    assert!(
+        !ledger_path.exists(),
+        "index must not implicitly create ledger"
+    );
+    assert_eq!(
+        source_embedding_count(&dir),
+        0,
+        "unpaid local work is paused"
+    );
+    assert!(
+        kio_core::cas::ObjectStore::new(dir.scope().join(".kio"))
+            .embedding_hashes()
+            .unwrap()
+            .is_empty(),
+        "no embedding CAS may be published before ledger setup"
+    );
+    let searched = kio_deterministic(&dir, now)
+        .args([
+            "search",
+            "localvectorneedle",
+            "--mode",
+            "vector",
+            "--offline",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        !searched.status.success(),
+        "explicit vector search needs initialized ledger authority"
+    );
+    assert!(
+        !ledger_path.exists(),
+        "search must not implicitly create ledger"
+    );
+}
+
+/// 04 §§5.1/5.4: the response is already known when a source-table write
+/// fails. Its successful charge and durable result must survive a new process;
+/// recovery republishes without an additional provider attempt.
+#[test]
+fn known_sync_result_publication_failure_recovers_without_resend() {
+    let dir = fixture_dir();
+    let now = "2026-09-08T00:00:00Z";
+    fs::write(dir.scope().join("one.md"), "# One\n\nknownvectorneedle\n").unwrap();
+    let seam = "require_idempotency_token";
+    kio(&dir, seam, now).args(["init"]).assert().success();
+    kio(&dir, seam, now)
+        .args(["ledger", "init"])
+        .assert()
+        .success();
+    kio(&dir, seam, now)
+        .args(["index", "--offline"])
+        .assert()
+        .success();
+    kio(&dir, seam, now)
+        .args(["adapter", "approve", "gemini_embedding_2", "--yes"])
+        .assert()
+        .success();
+
+    // A typed debug fault fires after embedding CAS publication but before the
+    // source-table write; the source schema remains identical to production.
+    let first = kio(&dir, seam, now)
+        .env(
+            "KIO_TEST_EMBEDDING_PUBLICATION_FAULT",
+            "before_source_write",
+        )
+        .args(["batch", "resume", "--online", "--realtime", "--json"])
+        .output()
+        .unwrap();
+    let published_objects = kio_core::cas::ObjectStore::new(dir.scope().join(".kio"))
+        .embedding_hashes()
+        .unwrap();
+    assert!(
+        !published_objects.is_empty(),
+        "fixture must reach a known provider vector before source publication fails: status={:?} stdout={} stderr={}",
+        first.status.code(),
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        source_embedding_count(&dir),
+        0,
+        "debug fault blocked source publish: status={:?} stdout={} stderr={}",
+        first.status.code(),
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let before = embedding_ledger_outcomes(&dir);
+    assert_eq!(
+        before.len(),
+        1,
+        "one submitted group has one terminal charge: status={:?} stdout={} stderr={}",
+        first.status.code(),
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert_eq!(
+        before[0].0, "succeeded",
+        "known response settles as success"
+    );
+    fs::remove_file(dir.scope().join(".kio/tasks.jsonl")).unwrap();
+    // If recovery tries a second POST, this seam fails. A staged result has
+    // enough bytes and original binding to republish even without tasks.jsonl.
+    let _ = kio(&dir, "network_error", "2026-09-08T00:01:00Z")
+        .args(["batch", "resume", "--online", "--realtime", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        source_embedding_count(&dir),
+        1,
+        "known vector was republished"
+    );
+    assert_eq!(
+        embedding_ledger_outcomes(&dir),
+        before,
+        "republication must neither charge nor submit again"
+    );
+}
+
+/// A durable known response must recover through ordinary index command entry
+/// after its original sync reservation becomes stale, without another send.
+#[test]
+fn stale_known_sync_result_recovers_at_normal_index_entry_without_resend() {
+    let dir = fixture_dir();
+    fs::write(
+        dir.scope().join("one.md"),
+        "# One\n\nsettlement order witness\n",
+    )
+    .unwrap();
+    let now = "2026-09-08T00:00:00Z";
+    let seam = "require_idempotency_token";
+    kio(&dir, seam, now).args(["init"]).assert().success();
+    kio(&dir, seam, now)
+        .args(["ledger", "init"])
+        .assert()
+        .success();
+    kio(&dir, seam, now)
+        .args(["index", "--offline"])
+        .assert()
+        .success();
+    kio(&dir, seam, now)
+        .args(["adapter", "approve", "gemini_embedding_2", "--yes"])
+        .assert()
+        .success();
+
+    // The ledger validator compares required table/index definitions; an
+    // additional trigger on this disposable fixture leaves those unchanged.
+    let ledger_path = dir.home().join("data/kio/cost-ledger.sqlite");
+    support::prepare_private_sqlite_sidecars(&ledger_path).unwrap();
+    Connection::open(&ledger_path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER test_block_embedding_success
+             BEFORE UPDATE OF state ON batch_requests
+             WHEN NEW.adapter_kind = 'embedding' AND NEW.state = 2
+             BEGIN SELECT RAISE(ABORT, 'test settlement blocked'); END;",
+        )
+        .unwrap();
+
+    let output = kio(&dir, seam, now)
+        .args(["index", "--online", "--realtime", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "the fixture trigger must interrupt terminal settlement"
+    );
+
+    let rows = embedding_rows(&dir);
+    assert_eq!(
+        rows.len(),
+        1,
+        "one sent group has one reservation: {rows:?}"
+    );
+    assert!(
+        matches!(rows[0].0, 0 | 1),
+        "settlement did not commit: {rows:?}"
+    );
+    assert!(rows[0].2 > 0.0, "the send had a positive reservation");
+    assert!(
+        rows[0].3.is_some(),
+        "the in-flight intent token is retained"
+    );
+    assert!(
+        embedding_ledger_outcomes(&dir).is_empty(),
+        "the failed terminal transaction recorded no completed charge"
+    );
+
+    let published_objects = kio_core::cas::ObjectStore::new(dir.scope().join(".kio"))
+        .embedding_hashes()
+        .unwrap();
+    assert_eq!(
+        (published_objects.len(), source_embedding_count(&dir)),
+        (0, 0),
+        "unsettled members must have neither a published CAS vector nor a source vector row"
+    );
+    // The successful response and original binding were staged even though the
+    // disposable trigger prevented the terminal transaction from committing.
+    let private_results = fs::read_dir(dir.home().join("data/kio"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.to_string_lossy().ends_with(".result.json"))
+        .count();
+    assert_eq!(
+        private_results, 1,
+        "fixture requires one durable known result"
+    );
+    let before: (i64, Option<String>, i64) = support::immutable_sqlite(&ledger_path)
+        .query_row("SELECT submission_seq, intent_token, stale_after_at FROM batch_requests WHERE adapter_kind='embedding'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+    support::prepare_private_sqlite_sidecars(&ledger_path).unwrap();
+    Connection::open(&ledger_path)
+        .unwrap()
+        .execute_batch("DROP TRIGGER test_block_embedding_success;")
+        .unwrap();
+    fs::remove_file(dir.scope().join(".kio/tasks.jsonl")).unwrap();
+    let restart_at = "2026-09-08T00:20:00Z";
+    assert!(
+        kio_core::scope::parse_utc_seconds(restart_at).unwrap() * 1000 > before.2,
+        "restart must exceed the actual durable stale deadline"
+    );
+
+    // Existing network_error seam makes an attempted replacement send fail.
+    // Success + unchanged submission sequence/one successful charge below
+    // demonstrate that recovery used the durable response instead.
+    let recovered = kio(&dir, "network_error", restart_at)
+        .args(["index", "--online", "--realtime", "--json"])
+        .output()
+        .unwrap();
+    assert!(
+        recovered.status.success(),
+        "normal index must recover stale known response without unknown settlement or resend: status={:?} stdout={} stderr={}",
+        recovered.status.code(),
+        String::from_utf8_lossy(&recovered.stdout),
+        String::from_utf8_lossy(&recovered.stderr)
+    );
+    assert_eq!(
+        source_embedding_count(&dir),
+        1,
+        "known response must be republished"
+    );
+    let outcomes = embedding_ledger_outcomes(&dir);
+    assert_eq!(
+        outcomes.len(),
+        1,
+        "recovery records only the original attempt"
+    );
+    assert_eq!(
+        outcomes[0].0, "succeeded",
+        "a known response never settles unknown"
+    );
+    let after: (i64, i64, Option<String>) = support::immutable_sqlite(&ledger_path)
+        .query_row("SELECT submission_seq, state, intent_token FROM batch_requests WHERE adapter_kind='embedding'", [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+    assert_eq!(
+        after,
+        (before.0, 2, None),
+        "no fresh reservation or token survives recovery"
+    );
+    assert_eq!(
+        kio_core::cas::ObjectStore::new(dir.scope().join(".kio"))
+            .embedding_hashes()
+            .unwrap()
+            .len(),
+        1
     );
 }

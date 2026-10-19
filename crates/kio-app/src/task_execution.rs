@@ -1631,6 +1631,7 @@ pub(crate) fn enqueue_online_placeholder_task(
                 TaskStatus::Running => {
                     targets_standard_online_markdownize(task_store.kio_dir(), task, &output_ref)
                 }
+                TaskStatus::Skipped => false,
             }
         })
     {

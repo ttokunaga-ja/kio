@@ -6679,6 +6679,7 @@ mod tests {
             .replace_all(&[TaskDescriptor {
                 task_id: "task_01H".into(),
                 task_type: TaskType::Markdownize,
+                embedding_target: None,
                 mode: Some(MarkdownizeMode::Full),
                 input_path: "fixture.pdf".into(),
                 input_hash: raw_hash.clone(),
@@ -6763,6 +6764,7 @@ mod tests {
             .replace_all(&[TaskDescriptor {
                 task_id: "task_01H".into(),
                 task_type: TaskType::Markdownize,
+                embedding_target: None,
                 mode: Some(MarkdownizeMode::Full),
                 input_path: "fixture.pdf".into(),
                 input_hash: raw_hash.clone(),

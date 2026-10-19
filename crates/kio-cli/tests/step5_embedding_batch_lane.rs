@@ -9,6 +9,8 @@
 //! `input_hash` digests the job's member set. These tests pin the observable
 //! consequences of that choice.
 
+mod support;
+
 use std::path::Path;
 
 use assert_cmd::Command;
@@ -111,7 +113,7 @@ fn run_ignoring_output(dir: &TempDir, batch_script: &str, args: &[&str]) {
 
 fn ledger_query(dir: &TempDir, sql: &str) -> String {
     let db = dir.path().join("home/data/kio/cost-ledger.sqlite");
-    let conn = rusqlite::Connection::open(db).unwrap();
+    let conn = support::immutable_sqlite(db);
     conn.query_row(sql, [], |row| row.get::<_, String>(0))
         .unwrap_or_default()
 }
@@ -630,7 +632,7 @@ fn a_permanently_failing_job_stops_being_resubmitted() {
 
     // And the charging stops with it: no more cost_ledger rows than jobs.
     let db = dir.path().join("home/data/kio/cost-ledger.sqlite");
-    let conn = rusqlite::Connection::open(db).unwrap();
+    let conn = support::immutable_sqlite(db);
     let charges: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind = 'embedding'",
@@ -901,9 +903,7 @@ fn a_short_result_set_does_not_settle_the_row_as_succeeded() {
         let blocked = error["context"]["blocked_attempts"].as_array().unwrap();
         assert_eq!(blocked.len(), 1, "{error}");
 
-        let ledger =
-            rusqlite::Connection::open(dir.path().join("home/data/kio/cost-ledger.sqlite"))
-                .unwrap();
+        let ledger = support::immutable_sqlite(dir.path().join("home/data/kio/cost-ledger.sqlite"));
         let (selector, sequence): (String, i64) = ledger.query_row(
                 "SELECT b.state, b.contract_violation_count, b.intent_token IS NULL,
                         b.estimated_usd, l.outcome, l.estimated, l.usd,
@@ -946,7 +946,7 @@ fn a_short_result_set_does_not_settle_the_row_as_succeeded() {
             "resume must not reserve or settle another job"
         );
 
-        let index = rusqlite::Connection::open(root(&dir).join(".kio/index/sqlite.db")).unwrap();
+        let index = support::immutable_sqlite(root(&dir).join(".kio/index/sqlite.db"));
         let published: i64 = index
             .query_row("SELECT COUNT(*) FROM embeddings", [], |row| row.get(0))
             .unwrap();
@@ -964,6 +964,143 @@ fn a_short_result_set_does_not_settle_the_row_as_succeeded() {
         creates, 1,
         "contract hold must prevent a second provider job"
     );
+}
+
+#[test]
+fn partial_batch_result_publishes_valid_member_and_retries_only_failed_member() {
+    let dir = fixture_dir();
+    prepare_private_home(&dir);
+    std::fs::write(
+        root(&dir).join("auth.md"),
+        "# 認証仕様\n\nトークン TTL は 3600 秒です。\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root(&dir).join("billing.md"),
+        "# 請求仕様\n\n締め日は毎月 15 日です。\n",
+    )
+    .unwrap();
+    kio(&dir).arg("init").assert().success();
+    kio(&dir).args(["ledger", "init"]).assert().success();
+    approve_online_profiles(&dir);
+
+    let capture = root(&dir).join("partial-capture.jsonl");
+    let submit = serde_json::json!({
+        "state_sequence": ["BATCH_STATE_PENDING"],
+        "job_name": "batches/partial-1",
+        "capture_path": capture.to_string_lossy(),
+    })
+    .to_string();
+    json(&dir, &submit, &["index", "--online"]);
+    let keys = submitted_keys(&capture);
+    assert_eq!(keys.len(), 2, "fixture must submit two members: {keys:?}");
+
+    let component = 1.0f64 / (768.0f64).sqrt();
+    let partial = serde_json::json!({
+        "state_sequence": ["BATCH_STATE_SUCCEEDED"],
+        "job_name": "batches/partial-1",
+        "capture_path": capture.to_string_lossy(),
+        "inlined_responses": [
+            {
+                "metadata": { "key": keys[0] },
+                "output": { "response": {
+                    "embedding": { "values": vec![component; 768] },
+                    "usageMetadata": { "promptTokenCount": 40 },
+                } },
+            },
+            {
+                "metadata": { "key": keys[1] },
+                "output": { "error": { "code": 503, "message": "member temporarily unavailable" } },
+            },
+        ],
+    })
+    .to_string();
+    let resumed = json_any(&dir, &partial, &["batch", "resume"]);
+    let source = support::immutable_sqlite(root(&dir).join(".kio/index/sqlite.db"));
+    let published = |key: &str| -> i64 {
+        source
+            .query_row(
+                "SELECT COUNT(*) FROM embeddings WHERE id=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(
+        published(&keys[0]),
+        1,
+        "valid member must publish: {resumed}"
+    );
+    assert_eq!(
+        published(&keys[1]),
+        0,
+        "failed member must not publish: {resumed}"
+    );
+    assert_eq!(
+        ledger_query(
+            &dir,
+            "SELECT CAST(COUNT(*) AS TEXT) FROM cost_ledger WHERE adapter_kind='embedding' AND outcome='succeeded'"
+        ),
+        "1"
+    );
+
+    let tasks = std::fs::read_to_string(root(&dir).join(".kio/tasks.jsonl")).unwrap();
+    let by_key = |key: &str| -> Value {
+        tasks
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .rfind(|task| {
+                task["type"] == "embedding" && task["embedding_target"]["embedding_hash"] == key
+            })
+            .unwrap_or_else(|| panic!("missing typed member task for {key}: {tasks}"))
+    };
+    let succeeded = by_key(&keys[0]);
+    let failed = by_key(&keys[1]);
+    assert_eq!(succeeded["status"], "done", "{succeeded}");
+    assert_eq!(failed["status"], "failed", "{failed}");
+    assert!(failed["attempts"].as_u64().unwrap_or(0) >= 1, "{failed}");
+
+    drop(source);
+
+    // Retry is a new member attempt; the successful member must not be sent again.
+    let retry = serde_json::json!({
+        "state_sequence": ["BATCH_STATE_PENDING"],
+        "job_name": "batches/partial-retry",
+        "capture_path": capture.to_string_lossy(),
+    })
+    .to_string();
+    let retry_output = kio(&dir)
+        .env("KIO_FIXED_NOW", "2030-01-01T00:00:00Z")
+        .env(
+            "KIO_TEST_GEMINI_BATCH",
+            script_with_attribution(&dir, &retry),
+        )
+        .args(["--json", "batch", "retry", "--online"])
+        .output()
+        .unwrap();
+    assert!(
+        retry_output.status.success() || retry_output.status.code() == Some(3),
+        "retry output: stdout={} stderr={}",
+        String::from_utf8_lossy(&retry_output.stdout),
+        String::from_utf8_lossy(&retry_output.stderr)
+    );
+    let creates = std::fs::read_to_string(&capture)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| event["call"] == "create_embedding_job")
+        .collect::<Vec<_>>();
+    assert!(
+        creates.len() >= 2,
+        "failed member must become retry-eligible: {creates:?}"
+    );
+    for event in creates.iter().skip(1) {
+        assert_eq!(
+            event["keys"],
+            serde_json::json!([keys[1]]),
+            "retry must contain only the failed member: {event}"
+        );
+    }
 }
 
 /// G1 (2026-07-25): a row stranded in §5.8's job-creation window is recoverable.

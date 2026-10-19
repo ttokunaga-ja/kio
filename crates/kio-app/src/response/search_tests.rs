@@ -55,6 +55,9 @@ fn image_uri() -> String {
 fn empty_index_status() -> IndexStatusResponse {
     IndexStatusResponse {
         enriched_ratio: 1.0,
+        total_enrichment_tasks: 0,
+        skipped_enrichment_tasks: 0,
+        skipped_enrichment_reasons: Default::default(),
         pending_enrichment_tasks: 0,
         budget_paused: false,
         unsupported_inputs: Vec::new(),
@@ -72,6 +75,9 @@ fn empty_index_status() -> IndexStatusResponse {
 fn legacy_empty_index_status() -> Value {
     json!({
         "enriched_ratio": 1.0,
+        "total_enrichment_tasks": 0,
+        "skipped_enrichment_tasks": 0,
+        "skipped_enrichment_reasons": {},
         "pending_enrichment_tasks": 0,
         "budget_paused": false,
         "unsupported_inputs": [],
@@ -450,6 +456,12 @@ fn index_status_projection_preserves_empty_and_populated_finite_records() {
         assert_projection(
             IndexStatusResponse {
                 enriched_ratio,
+                total_enrichment_tasks: u64::MAX,
+                skipped_enrichment_tasks: 1,
+                skipped_enrichment_reasons: std::collections::BTreeMap::from([(
+                    "images_excluded_from_external_send".to_owned(),
+                    1,
+                )]),
                 pending_enrichment_tasks: u64::MAX,
                 budget_paused: true,
                 unsupported_inputs: vec![make_file(reason)],
@@ -464,6 +476,9 @@ fn index_status_projection_preserves_empty_and_populated_finite_records() {
             },
             json!({
                 "enriched_ratio": enriched_ratio,
+                "total_enrichment_tasks": u64::MAX,
+                "skipped_enrichment_tasks": 1,
+                "skipped_enrichment_reasons": {"images_excluded_from_external_send": 1},
                 "pending_enrichment_tasks": u64::MAX,
                 "budget_paused": true,
                 "unsupported_inputs": [file_legacy(reason)],

@@ -2,7 +2,7 @@
 
 use crate::Result;
 use crate::types::{
-    AdapterProfile, EmbeddingRequest, EmbeddingResponse, MarkdownizeRequest, MarkdownizeResponse,
+    AdapterProfile, EmbeddingOutcome, EmbeddingRequest, MarkdownizeRequest, MarkdownizeResponse,
     PrepareRequest, PrepareResponse, RerankRequest, RerankResponse,
 };
 
@@ -39,7 +39,11 @@ pub enum PreferredRequestKind {
 pub trait EmbeddingAdapter {
     fn profile(&self) -> AdapterProfile;
 
-    fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse>;
+    fn descriptor(&self) -> crate::types::EmbeddingDescriptor {
+        crate::types::EmbeddingDescriptor::from_profile(&self.profile())
+    }
+
+    fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingOutcome>;
 
     /// Which request lane this adapter's online sends should take (07 §5.3 の
     /// 2026-07-24 訂正 / §5.7). Default = Sync, same as

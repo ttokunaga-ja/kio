@@ -696,6 +696,7 @@ mod tests {
         TaskDescriptor {
             task_id: "task_01TEST".to_owned(),
             task_type: TaskType::Markdownize,
+            embedding_target: None,
             mode: Some(MarkdownizeMode::Full),
             input_path: "report.pdf".to_owned(),
             input_hash: raw_hash,

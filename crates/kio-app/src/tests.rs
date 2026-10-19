@@ -261,6 +261,7 @@ fn materialized_source_image_cas_failure_is_retryable_not_contract_reject() {
     let task = TaskDescriptor {
         task_id: "task_known_provider_result".to_owned(),
         task_type: TaskType::Markdownize,
+        embedding_target: None,
         mode: Some(kio_pipeline::markdownize::MarkdownizeMode::Full),
         input_path: "image.png".to_owned(),
         input_hash: raw_hash.clone(),
@@ -350,6 +351,7 @@ fn invalid_online_markdown_is_rejected_before_normalized_publication() {
     let task = TaskDescriptor {
         task_id: "task_invalid_known_provider_result".to_owned(),
         task_type: TaskType::Markdownize,
+        embedding_target: None,
         mode: Some(kio_pipeline::markdownize::MarkdownizeMode::Full),
         input_path: "image.png".to_owned(),
         input_hash: raw_hash.clone(),
@@ -473,6 +475,7 @@ fn valid_partial_online_response_is_materialized() {
     let task = TaskDescriptor {
         task_id: "task_valid_partial".to_owned(),
         task_type: TaskType::Markdownize,
+        embedding_target: None,
         mode: Some(kio_pipeline::markdownize::MarkdownizeMode::Full),
         input_path: "document.pdf".to_owned(),
         input_hash: raw_hash.clone(),
@@ -977,6 +980,7 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
         )]);
         let projection = EmbeddingProjection {
             repo: &repo,
+            execution: kio_adapter::catalog::EmbeddingExecution::DeterministicEvaluator,
             policy: &policy,
             selected_contexts: &contexts,
             invalidated: std::cell::Cell::new(false),
@@ -2010,6 +2014,7 @@ fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
         .append(&TaskDescriptor {
             task_id: "task_terminal".to_owned(),
             task_type: TaskType::Embedding,
+            embedding_target: Some(crate::embedding::plan::chunk_task_target(&chunk, &profile)),
             mode: None,
             input_path: "credentials_backup.md".to_owned(),
             input_hash: format!("sha256:{}", "b".repeat(64)),
@@ -2096,6 +2101,7 @@ fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
     let terminal = TaskDescriptor {
         task_id: "task_terminal".to_owned(),
         task_type: TaskType::Embedding,
+        embedding_target: Some(crate::embedding::plan::chunk_task_target(&chunk, &profile)),
         mode: None,
         input_path: "credentials_backup.md".to_owned(),
         input_hash: format!("sha256:{}", "d".repeat(64)),
@@ -2146,6 +2152,7 @@ fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
     let sendable = filter_embeddable_by_task_state(
         &store,
         vec![chunk.clone()],
+        &profile,
         false,
         &kio_core::control::ControlHandle::default(),
     )
@@ -2193,6 +2200,7 @@ fn r23_secret_classification_preserves_retry_backoff_state() {
         .append(&TaskDescriptor {
             task_id: "task_retry_backoff".to_owned(),
             task_type: TaskType::Embedding,
+            embedding_target: Some(crate::embedding::plan::chunk_task_target(&chunk, &profile)),
             mode: None,
             input_path: "credentials_backup.md".to_owned(),
             input_hash: format!("sha256:{}", "f".repeat(64)),
@@ -2405,6 +2413,7 @@ fn r23_markdown_charge_and_send_share_one_verified_input() {
     let task = TaskDescriptor {
         task_id: "task_verified_charge".to_owned(),
         task_type: TaskType::Markdownize,
+        embedding_target: None,
         mode: None,
         input_path: "doc.pdf".to_owned(),
         input_hash: hash_bytes(pdf),
@@ -4018,6 +4027,7 @@ fn q3_reclaims_orphaned_running_task_to_pending() {
     let task = TaskDescriptor {
         task_id: "t1".to_owned(),
         task_type: TaskType::Markdownize,
+        embedding_target: None,
         mode: Some(MarkdownizeMode::Full),
         input_path: "notes.txt".to_owned(),
         input_hash: format!("sha256:{}", "a".repeat(64)),

@@ -67,6 +67,15 @@ fn seed(root: &Path, kind: &str) -> (String, PathBuf) {
                 distance: "cosine".into(),
                 context: None,
                 vector: vec![1.0, 0.0],
+                metadata: kio_core::cas::EmbeddingMetadata {
+                    record_format: 2,
+                    producer: kio_core::cas::ProducerProvenance::non_native(
+                        kio_core::cas::ProducerExecutionMode::DeterministicLibrary,
+                        &hash_bytes(b"profile"),
+                    )
+                    .unwrap(),
+                    image_input_receipt: None,
+                },
             })
             .unwrap(),
         "prepared" => objects

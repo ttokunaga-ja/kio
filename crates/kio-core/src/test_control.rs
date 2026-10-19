@@ -76,6 +76,7 @@ finite_selector!(MarkdownizeAdapterMode {
     "reject_incremental_and_full" => RejectIncrementalAndFull,
 });
 finite_selector!(AggregatorProjectionFault { "refresh" => Refresh });
+finite_selector!(EmbeddingPublicationFault { "before_source_write" => BeforeSourceWrite });
 finite_selector!(ReplicaFault {
     "index_before_marker" => IndexBeforeMarker, "index" => Index,
     "reindex_before_marker" => ReindexBeforeMarker, "reindex" => Reindex,
@@ -194,6 +195,7 @@ pub struct CliTestControl {
     pub snapshot_before_publication_ready: Option<PathBuf>,
     pub snapshot_writer_boundary_ready: Option<PathBuf>,
     pub aggregator_projection_fault: Selector<AggregatorProjectionFault>,
+    pub embedding_publication_fault: Selector<EmbeddingPublicationFault>,
     pub replica_after_head_fault: Selector<ReplicaFault>,
     pub search_response_barrier_ready: Option<PathBuf>,
     pub search_final_consent_barrier_ready: Option<PathBuf>,
@@ -309,6 +311,10 @@ impl DebugTestControl {
                 aggregator_projection_fault: selector(
                     "KIO_TEST_AGGREGATOR_PROJECTION_FAULT",
                     AggregatorProjectionFault::parse,
+                ),
+                embedding_publication_fault: selector(
+                    "KIO_TEST_EMBEDDING_PUBLICATION_FAULT",
+                    EmbeddingPublicationFault::parse,
                 ),
                 replica_after_head_fault: selector(
                     "KIO_TEST_REPLICA_AFTER_HEAD_FAULT",

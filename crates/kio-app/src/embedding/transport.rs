@@ -5,14 +5,13 @@ use crate::embedding::admission::declared_embedding_profile;
 use crate::embedding::admission::embedding_billed_from_usage;
 use crate::embedding::admission::embedding_execution;
 use crate::embedding::admission::embedding_is_deterministic;
-use crate::embedding::admission::embedding_is_online;
 use crate::embedding::admission::embedding_transport_allowed;
 use crate::embedding::admission::estimate_embedding_cost;
 use crate::embedding::admission::query_embedding_send_lane;
 use crate::invocation::Invocation;
 use crate::ledger_access::TASK_SYNC_EFFECTIVE_TIMEOUT_SECONDS;
 use crate::ledger_access::budget_cap_config;
-use crate::ledger_access::open_ledger_db;
+use crate::ledger_access::open_optional_ledger_db;
 use crate::ledger_access::settle_task_charge_success;
 use crate::ledger_access::settle_task_charge_unknown;
 use crate::markdownize::execution::TaskExecutionFailure;
@@ -22,19 +21,37 @@ use crate::scope_access::maybe_wait_at_test_search_final_consent_barrier;
 use crate::search::scope::ExecScope;
 use crate::search::scope::revalidate_current_policy_map;
 use crate::settings::user_config_toml_path;
+use crate::task_execution::retry_reason;
+use kio_adapter::AdapterError;
 use kio_adapter::catalog::EmbeddingExecution;
+use kio_adapter::catalog::embedding_descriptor_with_control;
 use kio_adapter::catalog::run_embedding_with_control;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
+use kio_adapter::types::EmbeddingCompleted;
 use kio_adapter::types::EmbeddingInputType;
 use kio_adapter::types::EmbeddingItem;
+use kio_adapter::types::EmbeddingLogicalJobId;
+use kio_adapter::types::EmbeddingMemberResult;
+use kio_adapter::types::EmbeddingUsage;
 use kio_core::Result;
 use kio_core::control::ControlHandle;
 use kio_core::scope::Repository;
 use kio_pipeline::budget::read_budget_policy;
+use kio_pipeline::ledger::BatchState;
+use kio_pipeline::ledger::Outcome;
 use kio_pipeline::ledger::TaskKey as LedgerTaskKey;
-use kio_pipeline::ledger::ops::ClaimOutcome;
+use kio_pipeline::ledger::embedding_job::EmbeddingDeviceClaimOutcome;
+use kio_pipeline::ledger::embedding_job::EmbeddingDeviceClaimRequest;
+use kio_pipeline::ledger::embedding_job::EmbeddingJobBinding;
+use kio_pipeline::ledger::embedding_job::EmbeddingJobMember;
+use kio_pipeline::ledger::ops::BilledAmount;
+use kio_pipeline::ledger::ops::TerminalWrite;
+use kio_pipeline::ledger::ops::claim_device_embedding_job;
 use kio_pipeline::ledger::ops::device_input_hash;
+use kio_pipeline::ledger::ops::finish_embedding_publication;
+use kio_pipeline::ledger::ops::terminal_transaction;
 use kio_pipeline::policy::CurrentPolicyEvaluator;
+use kio_pipeline::task::EmbeddingTaskTarget;
 use kio_pipeline::task::RetryErrorKind;
 use std::collections::BTreeMap;
 #[cfg(debug_assertions)]
@@ -55,7 +72,18 @@ pub(crate) fn run_embedding_adapter(
     // `kio_adapter::types::EmbeddingRequest::idempotency_token`'s doc.
     idempotency_token: Option<String>,
     control: &ControlHandle,
-) -> std::result::Result<kio_adapter::catalog::AdoptedEmbeddingOutcome, TaskExecutionFailure> {
+) -> std::result::Result<EmbeddingCompleted, TaskExecutionFailure> {
+    let profile = declared_embedding_profile(execution);
+    let expected = EmbeddingAcceptance {
+        dimensions: u32::try_from(profile.dimensions).map_err(|_| TaskExecutionFailure {
+            retry_kind: RetryErrorKind::ContractViolation,
+            retry_after_ms: None,
+        })?,
+        distance: &profile.distance,
+        modality: &profile.modality,
+        profile_hash: &profile.profile_hash,
+        member_ids: items.iter().map(|item| item.id.clone()).collect(),
+    };
     run_embedding_with_control(
         std::sync::Arc::clone(adapter_settings),
         execution,
@@ -64,7 +92,164 @@ pub(crate) fn run_embedding_adapter(
         idempotency_token,
         control,
     )
+    .and_then(kio_adapter::types::EmbeddingOutcome::into_completed)
+    .and_then(|mut completed| {
+        validate_completed_mapping(&completed, &expected)?;
+        for member in &mut completed.members {
+            if let EmbeddingMemberResult::Vector { vector } = &mut member.result {
+                normalize_inline_vector(vector, expected.dimensions)?;
+            }
+        }
+        validate_completed_embedding(&completed, &expected)?;
+        if completed
+            .members
+            .iter()
+            .any(|member| matches!(member.result, EmbeddingMemberResult::Failed { .. }))
+        {
+            return Err(AdapterError::ContractViolation(
+                "synchronous embedding member failed".to_owned(),
+            ));
+        }
+        Ok(completed)
+    })
     .map_err(task_failure_from_adapter)
+}
+
+/// Frozen completion contract, shared by inline and collected Batch results.
+/// Acceptance checks inspect f32 values without rewriting their bytes.
+pub(crate) struct EmbeddingAcceptance<'a> {
+    pub(crate) dimensions: u32,
+    pub(crate) distance: &'a str,
+    pub(crate) modality: &'a str,
+    pub(crate) profile_hash: &'a str,
+    pub(crate) member_ids: Vec<String>,
+}
+
+pub(crate) fn validate_completed_embedding(
+    completed: &EmbeddingCompleted,
+    expected: &EmbeddingAcceptance<'_>,
+) -> kio_adapter::Result<()> {
+    validate_completed_mapping(completed, expected)?;
+    for member in &completed.members {
+        match &member.result {
+            EmbeddingMemberResult::Vector { vector } => {
+                kio_adapter::types::validate_cosine_vector(vector, expected.dimensions)?;
+                let norm = vector
+                    .iter()
+                    .map(|value| f64::from(*value).powi(2))
+                    .sum::<f64>()
+                    .sqrt();
+                if (norm - 1.0).abs() > 0.0001 {
+                    return Err(AdapterError::ContractViolation(
+                        "embedding vector is not normalized".to_owned(),
+                    ));
+                }
+            }
+            EmbeddingMemberResult::Failed { reason }
+                if reason.is_empty()
+                    || reason.len() > 256
+                    || reason.chars().any(char::is_control) =>
+            {
+                return Err(AdapterError::ContractViolation(
+                    "invalid embedding member failure".to_owned(),
+                ));
+            }
+            EmbeddingMemberResult::Failed { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_completed_mapping(
+    completed: &EmbeddingCompleted,
+    expected: &EmbeddingAcceptance<'_>,
+) -> kio_adapter::Result<()> {
+    if completed.dimensions != expected.dimensions
+        || completed.distance != expected.distance
+        || completed.modality != expected.modality
+        || completed.embedding_profile_hash != expected.profile_hash
+        || completed.members.len() != expected.member_ids.len()
+    {
+        return Err(AdapterError::ContractViolation(
+            "embedding completion metadata mismatch".to_owned(),
+        ));
+    }
+    let ids = expected
+        .member_ids
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    if ids.len() != expected.member_ids.len() {
+        return Err(AdapterError::ContractViolation(
+            "duplicate embedding request member".to_owned(),
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for member in &completed.members {
+        if !ids.contains(member.id.as_str()) || !seen.insert(member.id.as_str()) {
+            return Err(AdapterError::ContractViolation(
+                "embedding completion member mismatch".to_owned(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_inline_vector(vector: &mut [f32], dimensions: u32) -> kio_adapter::Result<()> {
+    kio_adapter::types::validate_cosine_vector(vector, dimensions)?;
+    let norm = vector
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    if (norm - 1.0).abs() <= 0.0001 {
+        return Ok(());
+    }
+    for value in vector {
+        *value = (f64::from(*value) / norm) as f32;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod completion_numeric_tests {
+    use super::*;
+    use kio_adapter::types::{EmbeddingMemberOutcome, EmbeddingUsage};
+
+    #[test]
+    fn completion_norm_matches_cas_boundary_without_rewriting_valid_f32() {
+        let expected = EmbeddingAcceptance {
+            dimensions: 3,
+            distance: "cosine",
+            modality: "multimodal",
+            profile_hash: "profile",
+            member_ids: vec!["one".to_owned()],
+        };
+        let mut result = EmbeddingCompleted {
+            members: vec![EmbeddingMemberOutcome {
+                id: "one".to_owned(),
+                result: EmbeddingMemberResult::Vector {
+                    vector: vec![1.0, 0.0, 0.0],
+                },
+            }],
+            dimensions: 3,
+            distance: "cosine".to_owned(),
+            modality: "multimodal".to_owned(),
+            embedding_profile_hash: "profile".to_owned(),
+            usage: EmbeddingUsage::Unmetered,
+        };
+        let before = result.clone();
+        validate_completed_embedding(&result, &expected).unwrap();
+        assert_eq!(result, before);
+        result.members[0].result = EmbeddingMemberResult::Vector {
+            vector: vec![1.0002, 0.0, 0.0],
+        };
+        assert!(validate_completed_embedding(&result, &expected).is_err());
+        if let EmbeddingMemberResult::Vector { vector } = &mut result.members[0].result {
+            normalize_inline_vector(vector, expected.dimensions).unwrap();
+        }
+        validate_completed_embedding(&result, &expected).unwrap();
+    }
 }
 
 /// The `fallback_reason`s [`compute_query_embedding_page1`] can report through
@@ -88,36 +273,10 @@ pub(crate) enum QueryEmbeddingOutcome {
     NotAuthorized,
 }
 
-/// vector|hybrid search page 1's query embedding call, wired onto the sync
-/// degenerate 2-phase device row (04 §5.4 §H, CL48-55 in
-/// tasks/step4b-contract-tests-ledger.md): a bounded sweep of stale/prunable
-/// device rows first (CL52 — own key unconditionally, pruning >= 128 of the
-/// shared 256-row cap), then phase 1 claim (`device_claim`: CL54 in-flight
-/// text-fallback, or a fresh/reclaimed-and-fresh `stale_after_at` reservation),
-/// the response's provider request id recorded durably BEFORE the terminal Tx
-/// (CL43 — this Adapter integration reports no real id, so the intent_token is
-/// used, the DDL's own documented fallback), and a terminal settlement
-/// (success billed at the reservation estimate, or `unknown_settled` on
-/// adapter failure — CL45/CL69's "no post-hoc query capability" posture, same
-/// as the task-charge helpers above). R23-02: device rows are NOT exempt from
-/// the device/per_adapter(embedding) cap — `ops::device_claim` now performs
-/// that judgement itself, inside the same claim Tx, and returns `Denied` on
-/// exceedance (04 §5.4: "device cap / per_adapter (embedding) の合算には通常
-/// どおり含まれる — 判定式は不変"). Only folder cap does not apply, matching
-/// the same clause's "folder cap 判定 ... には現れず" — this claim has no
-/// single owning `.kio` folder to read one from (`exec_scopes` may span zero,
-/// one, or many), so only the device-layer config (`~/.config/kio/config.toml`)
-/// is consulted, never a folder's `.kio/config.toml`.
-///
-/// Only called for a FRESH page 1 (no cursor) — a cursor replay (page 2+) calls
-/// the unmetered [`compute_query_embedding`] unchanged, exactly as before this
-/// session's ledger migration (item 2 of the implementation instructions scopes
-/// the device-row protocol to "page 1" specifically; 04 §5.4 §H's own text is
-/// page-1-scoped: "vector|hybrid 検索 page 1 の query embedding 呼出").
-///
-/// The caller supplied the policy-filtered scopes and their retained repository
-/// handles. This function selects one authorized scope, holds its writer lease,
-/// and performs the final exact device+scope grant check before the adapter call.
+/// Fresh vector/hybrid page-one query admission. The device claim and send
+/// are shared by local and remote executions below; text and cursor replay
+/// never reach this function. A remote execution must retain an exact grant
+/// under the chosen scope's writer lease before any ledger write.
 pub(crate) fn compute_query_embedding_page1(
     invocation: &Invocation<'_>,
     query: &str,
@@ -137,7 +296,7 @@ pub(crate) fn compute_query_embedding_page1(
     };
     if embedding_is_deterministic(execution) {
         revalidate_current_policy_map(current_policies, false)?;
-        return local_query_embedding(adapter_settings, execution, query, invocation.control);
+        return run_query_embedding_job(invocation, execution, query);
     }
     if !embedding_transport_allowed(execution, offline) {
         return Ok(None);
@@ -193,40 +352,40 @@ pub(crate) fn compute_query_embedding_page1(
         return Ok(Some(QueryEmbeddingOutcome::NotAuthorized));
     }
 
-    if !embedding_is_online(execution) {
-        return local_query_embedding(adapter_settings, execution, query, invocation.control);
-    }
+    run_query_embedding_job(invocation, execution, query)
+}
 
-    let ledger = open_ledger_db(invocation.control)?;
-    let conn = &ledger;
+/// One device claim, adapter completion, validation and terminal outcome for
+/// every fresh query posture. The caller owns consent and policy admission.
+fn run_query_embedding_job(
+    invocation: &Invocation<'_>,
+    execution: EmbeddingExecution,
+    query: &str,
+) -> Result<Option<QueryEmbeddingOutcome>> {
+    let adapter_settings = invocation.settings;
+    let profile = declared_embedding_profile(execution);
+    let descriptor =
+        embedding_descriptor_with_control(adapter_settings, execution, invocation.control)
+            .map_err(crate::object_persistence::adapter_to_kio)?;
+    if !descriptor.capability.text || !descriptor.completion.sync {
+        return Ok(None);
+    }
+    let Some(ledger) = open_optional_ledger_db(invocation.control)? else {
+        return Ok(None);
+    };
+    let input_hash = device_input_hash(query);
     let key = LedgerTaskKey::new(
         LedgerTaskKey::DEVICE_SCOPE_ID,
         EMBEDDING_ADAPTER_KIND,
-        device_input_hash(query),
+        input_hash.clone(),
         profile.profile_hash.clone(),
     );
-
-    // CL52: bounded sweep BEFORE the claim — own key's stale row (if any) is
-    // swept unconditionally (outside the 256 cap), pruning gets >= 128 of the
-    // shared cap, decided by `allocate_sweep_capacity`'s fixed, deterministic
-    // rule. Never queries the provider (CL53 — search stays responsive).
-    let now = kio_pipeline::ledger::time::now_millis();
-
-    // §M note-2: the "effective timeout" is max(participating scopes' resolved
-    // `timeout_seconds`) — currently a no-op maximum, since
-    // `adapter.policy.timeout_seconds` other than the documented default (300)
-    // is loud-rejected at config load (`kio_core::scope`'s R12-2 decision: real
-    // per-adapter timeout wiring is a separate, larger change no scope's config
-    // can currently deviate from), so every participating scope's resolved
-    // value is always exactly 300 and the max is trivially 300 too.
-    //
-    // R23-02: resolve the device-layer cap config (no folder cap — this claim
-    // has no single owning `.kio` folder). `read_budget_policy` requires a
-    // second (folder) path argument that this call has no legitimate value
-    // for; a deliberately-nonexistent sentinel path reads back as an empty
-    // `ParsedBudgetConfig::default()` (`NotFound` → defaults, `budget.rs`'s own
-    // documented behavior), and `budget_cap_config`'s resulting `folder_cap` is
-    // never read below — only `device_cap`/`device_per_adapter_cap` are used.
+    let local = !descriptor.effects.paid_authorization;
+    let candidate_usd = if local {
+        0.0
+    } else {
+        estimate_embedding_cost(adapter_settings, query, query_embedding_send_lane())
+    };
     let device_config_path = user_config_toml_path(invocation.control);
     let no_folder_cap_sentinel =
         device_config_path.with_file_name("__kio_device_claim_no_folder_cap__.toml");
@@ -237,124 +396,118 @@ pub(crate) fn compute_query_embedding_page1(
         LedgerTaskKey::DEVICE_SCOPE_ID,
         EMBEDDING_ADAPTER_KIND,
     );
-    let claim = kio_pipeline::ledger::ops::sweep_then_device_claim(
-        conn,
-        &key,
-        now,
-        estimate_embedding_cost(adapter_settings, query, query_embedding_send_lane()),
-        TASK_SYNC_EFFECTIVE_TIMEOUT_SECONDS,
-        device_cap_config.device_cap,
-        device_cap_config.device_per_adapter_cap,
+    let binding = EmbeddingJobBinding {
+        logical_job_id: EmbeddingLogicalJobId(input_hash.clone()),
+        local,
+        dimensions: u32::try_from(profile.dimensions)
+            .map_err(|_| kio_core::KioError::schema("embedding profile dimensions exceed u32"))?,
+        distance: profile.distance.clone(),
+        modality: profile.modality.clone(),
+        members: vec![EmbeddingJobMember {
+            id: "query".to_owned(),
+            target: EmbeddingTaskTarget::Query {
+                query_hash: input_hash.clone(),
+                profile_hash: profile.profile_hash.clone(),
+                input_hash,
+            },
+        }],
+    };
+    let claim = claim_device_embedding_job(
+        &ledger,
+        &EmbeddingDeviceClaimRequest {
+            key: &key,
+            now_ms: kio_pipeline::ledger::time::now_millis(),
+            candidate_usd,
+            timeout_seconds: TASK_SYNC_EFFECTIVE_TIMEOUT_SECONDS,
+            device_cap: device_cap_config.device_cap,
+            per_adapter_cap: device_cap_config.device_per_adapter_cap,
+            binding: &binding,
+        },
     )
     .map_err(pipeline_to_kio)?;
-    let intent_token = match claim {
-        ClaimOutcome::InFlight => return Ok(Some(QueryEmbeddingOutcome::InFlight)),
-        // R23-02: cap exceeded — no reservation was made; fall back to text
-        // search via the existing bare-`None` branch at the search command's
-        // own call site (`vector_unavailable_reason` stays at its default
-        // `"query_embedding_unavailable"`). A dedicated `"budget_denied"`
-        // reason would need a new `QueryEmbeddingOutcome` variant, which would
-        // widen the exhaustive match at that call site (main.rs ~L1771) —
-        // that call site is outside this item's assigned main.rs range and is
-        // owned by a parallel agent for this fix wave, so it is left
-        // unmodified and this is flagged in the report.
-        ClaimOutcome::Denied(_layer) => return Ok(None),
-        ClaimOutcome::Claimed(outcome) => outcome.intent_token,
+    let job = match claim {
+        EmbeddingDeviceClaimOutcome::Claimed(job) => job,
+        EmbeddingDeviceClaimOutcome::InFlight => return Ok(Some(QueryEmbeddingOutcome::InFlight)),
+        EmbeddingDeviceClaimOutcome::Denied(_) => return Ok(None),
     };
-
-    // O2 regression seam: mark that the query is about to be SENT to the embedding
-    // endpoint, so a test can prove `--text` never reaches this path. No-op unless
-    // the env var is set (mirrors the KIO_TEST_* adapter seams).
     record_query_embed_trace(query, invocation.control);
-    let items = vec![EmbeddingItem::text("query", query)];
-    // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): a single-item
-    // sync query embed with its own single ledger reservation. Both sync sites
-    // are now 1 token to 1 HTTP call — `send_embed_group` reaches it by
-    // sending one group per call rather than by being inherently single.
     match run_embedding_adapter(
         adapter_settings,
         execution,
-        items,
+        vec![EmbeddingItem::text("query", query)],
         EmbeddingInputType::Query,
-        Some(intent_token.clone()),
+        Some(job.intent_token.clone()),
         invocation.control,
     ) {
         Ok(outcome) => {
-            // This adapter returns usage and vectors but no provider request
-            // identifier or result-lookup capability. Keep batch_job_id absent;
-            // a local intent token is not a queryable provider request ID.
-            // I12: `:batchEmbedContents` reports `usageMetadata.promptTokenCount`
-            // as a per-CALL total, which is the granularity it bills at, so this
-            // settles on the measured number. The reservation estimate remains
-            // the fallback for a response that carried no usable report.
-            let billed = embedding_billed_from_usage(
-                adapter_settings,
-                outcome.usage.as_ref(),
-                query_embedding_send_lane(),
-                estimate_embedding_cost(adapter_settings, query, query_embedding_send_lane()),
-                invocation.control,
-                invocation.locks,
-            );
-            settle_task_charge_success(&ledger, &key, &intent_token, billed)?;
-            Ok(outcome
-                .vectors
-                .into_iter()
-                .next()
-                .map(|vector| QueryEmbeddingOutcome::Vector(vector.vector)))
+            let billed = if local {
+                BilledAmount {
+                    usd: 0.0,
+                    estimated: false,
+                }
+            } else {
+                embedding_billed_from_usage(
+                    adapter_settings,
+                    match &outcome.usage {
+                        EmbeddingUsage::Metered { usage } => Some(usage),
+                        EmbeddingUsage::Estimated | EmbeddingUsage::Unmetered => None,
+                    },
+                    query_embedding_send_lane(),
+                    candidate_usd,
+                    invocation.control,
+                    invocation.locks,
+                )
+            };
+            settle_task_charge_success(&ledger, &key, &job.intent_token, billed)?;
+            finish_embedding_publication(&ledger, &job).map_err(pipeline_to_kio)?;
+            Ok(outcome.members.into_iter().find_map(|member| {
+                if member.id != "query" {
+                    return None;
+                }
+                match member.result {
+                    EmbeddingMemberResult::Vector { vector } => {
+                        Some(QueryEmbeddingOutcome::Vector(vector))
+                    }
+                    EmbeddingMemberResult::Failed { .. } => None,
+                }
+            }))
         }
         Err(failure) => {
-            let billed_usd =
-                estimate_embedding_cost(adapter_settings, query, query_embedding_send_lane());
-            settle_task_charge_unknown(&ledger, &key, &intent_token, billed_usd)?;
-            // PC7: classify a contract-violation adapter failure distinctly
-            // from a generic technical unavailability.
+            if local {
+                terminal_transaction(
+                    &ledger,
+                    &TerminalWrite {
+                        key: &key,
+                        outcome: if failure.retry_kind == RetryErrorKind::ContractViolation {
+                            Outcome::ContractViolation
+                        } else {
+                            Outcome::SubmitRejected
+                        },
+                        billed: BilledAmount {
+                            usd: 0.0,
+                            estimated: false,
+                        },
+                        ledger_batch_job_id: &job.intent_token,
+                        next_state: BatchState::Terminal,
+                        error: Some(retry_reason(failure.retry_kind)),
+                        increment_contract_violation: false,
+                        attempts_delta: 1,
+                        clear_intent_token: true,
+                        intent_token_guard: Some(&job.intent_token),
+                        reseat_submission_seq: false,
+                    },
+                )
+                .map_err(pipeline_to_kio)?;
+            } else {
+                settle_task_charge_unknown(&ledger, &key, &job.intent_token, candidate_usd)?;
+            }
+            finish_embedding_publication(&ledger, &job).map_err(pipeline_to_kio)?;
             if failure.retry_kind == RetryErrorKind::ContractViolation {
                 Ok(Some(QueryEmbeddingOutcome::ContractViolation))
             } else {
                 Ok(None)
             }
         }
-    }
-}
-
-/// The non-remote counterpart of [`compute_query_embedding_page1`]: embed the
-/// query and return the vector with no ledger row. The caller has already
-/// admitted an `OfflineApi` under an exact grant and writer lease; the
-/// deterministic evaluator needs neither because it is in-process.
-///
-/// The failure classification is deliberately identical to the online path's —
-/// a contract violation is still a contract violation when it comes from a
-/// local server, and 05 §1.1 keeps `embedding_contract_violation` subject to
-/// `fail_behavior` regardless of where the vector came from.
-fn local_query_embedding(
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
-    execution: EmbeddingExecution,
-    query: &str,
-    control: &ControlHandle,
-) -> Result<Option<QueryEmbeddingOutcome>> {
-    // O2 seam: the query is about to be embedded. That `--text` must never
-    // reach this point holds for a local adapter exactly as for a remote one.
-    record_query_embed_trace(query, control);
-    let items = vec![EmbeddingItem::text("query", query)];
-    // No `idempotency_token`: that identifies a ledger reservation, and this
-    // path makes none.
-    match run_embedding_adapter(
-        adapter_settings,
-        execution,
-        items,
-        EmbeddingInputType::Query,
-        None,
-        control,
-    ) {
-        Ok(outcome) => Ok(outcome
-            .vectors
-            .into_iter()
-            .next()
-            .map(|vector| QueryEmbeddingOutcome::Vector(vector.vector))),
-        Err(failure) if failure.retry_kind == RetryErrorKind::ContractViolation => {
-            Ok(Some(QueryEmbeddingOutcome::ContractViolation))
-        }
-        Err(_) => Ok(None),
     }
 }
 
@@ -376,3 +529,7 @@ fn record_query_embed_trace(query: &str, control: &ControlHandle) {
 
 #[cfg(not(debug_assertions))]
 fn record_query_embed_trace(_query: &str, _control: &ControlHandle) {}
+
+#[cfg(test)]
+#[path = "query_acceptance_tests.rs"]
+mod query_acceptance_tests;

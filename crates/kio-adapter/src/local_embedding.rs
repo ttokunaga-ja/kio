@@ -35,9 +35,9 @@ use crate::identity::tool_profile_hash;
 use crate::local_peer::{AuthenticatedLocalEndpoint, is_local_peer_tls_error};
 use crate::traits::EmbeddingAdapter;
 use crate::types::{
-    AdapterKind, AdapterProfile, EmbeddingContent, EmbeddingItem, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingVector, ExecutionMode, validate_cosine_vector,
-    validate_embedding_request_bytes,
+    AdapterKind, AdapterProfile, EmbeddingCompleted, EmbeddingContent, EmbeddingItem,
+    EmbeddingOutcome, EmbeddingRequest, EmbeddingUsage, EmbeddingVector, ExecutionMode,
+    validate_cosine_vector, validate_embedding_request_bytes,
 };
 use crate::{AdapterError, Result};
 
@@ -408,9 +408,8 @@ pub fn profile_for(execution: LocalEmbeddingExecution) -> AdapterProfile {
             "multimodal".to_owned(),
             IMAGE_OBJECT_CAPABILITY.to_owned(),
         ],
-        // 07 §3: an offline_api adapter reaches loopback only, which is why
-        // it is exempt from the §3 consent gate. This flag is what the
-        // exemption keys off, so it must stay false.
+        // Local egress still requires an exact paired grant. The descriptor
+        // declares that effect independently of this online-policy flag.
         allow_network: false,
         // Nothing to bill: the model runs on hardware the user already has.
         // An empty set is also what stops the ledger from reserving and
@@ -426,7 +425,14 @@ impl<C: LocalEmbeddingClient> EmbeddingAdapter for LocalEmbeddingAdapter<C> {
         profile_for(self.execution())
     }
 
-    fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+    fn descriptor(&self) -> crate::types::EmbeddingDescriptor {
+        let mut descriptor = crate::types::EmbeddingDescriptor::from_profile(&self.profile());
+        descriptor.capability.image_mime_types =
+            vec!["image/png".to_owned(), "image/jpeg".to_owned()];
+        descriptor
+    }
+
+    fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingOutcome> {
         validate_embedding_request_bytes(&request)?;
         let vectors = match &self.backend {
             // One request per item, in order. 07 §5.3 (2) forbids the batching
@@ -461,16 +467,16 @@ impl<C: LocalEmbeddingClient> EmbeddingAdapter for LocalEmbeddingAdapter<C> {
             }
             validate_cosine_vector(&vector.vector, self.dimensions)?;
         }
-        Ok(EmbeddingResponse {
-            vectors,
+        Ok(EmbeddingOutcome::Completed(EmbeddingCompleted {
+            members: vectors.into_iter().map(Into::into).collect(),
             dimensions: self.dimensions,
             distance: "cosine".to_owned(),
             modality: "multimodal".to_owned(),
-            embedding_profile_hash: Some(self.profile().tool_profile_hash),
+            embedding_profile_hash: self.profile().tool_profile_hash,
             // No token accounting: there is no provider and no invoice. The
             // ledger path reads `billable_kinds` (empty, above) and skips.
-            usage: None,
-        })
+            usage: EmbeddingUsage::Unmetered,
+        }))
     }
 }
 
@@ -573,30 +579,36 @@ mod tests {
     #[test]
     fn embed_returns_one_usable_vector_per_input_in_order() {
         let adapter = LocalEmbeddingAdapter::with_client(RecordingClient::new());
-        let response = adapter.embed(request(&["alpha", "beta", "gamma"])).unwrap();
-        assert_eq!(response.vectors.len(), 3);
+        let response = adapter
+            .embed(request(&["alpha", "beta", "gamma"]))
+            .unwrap()
+            .into_completed()
+            .unwrap();
+        assert_eq!(response.vectors().len(), 3);
         assert_eq!(response.dimensions, LOCAL_EMBEDDING_DIMENSIONS);
         assert_eq!(response.distance, "cosine");
         assert_eq!(response.modality, "multimodal");
         assert_eq!(
-            response.embedding_profile_hash.as_deref(),
-            Some(adapter.profile().tool_profile_hash.as_str())
+            response.embedding_profile_hash,
+            adapter.profile().tool_profile_hash
         );
-        for (index, vector) in response.vectors.iter().enumerate() {
+        for (index, vector) in response.vectors().iter().enumerate() {
             assert_eq!(vector.id, format!("item-{index}"));
             validate_cosine_vector(&vector.vector, LOCAL_EMBEDDING_DIMENSIONS).unwrap();
         }
         // Distinct inputs must not collapse onto one vector, or vector search
         // would rank every chunk identically.
-        assert_ne!(response.vectors[0].vector, response.vectors[1].vector);
+        assert_ne!(response.vectors()[0].vector, response.vectors()[1].vector);
     }
 
     #[test]
     fn embed_reports_no_usage_because_there_is_no_invoice() {
         let response = LocalEmbeddingAdapter::with_client(RecordingClient::new())
             .embed(request(&["alpha"]))
+            .unwrap()
+            .into_completed()
             .unwrap();
-        assert!(response.usage.is_none());
+        assert_eq!(response.usage, EmbeddingUsage::Unmetered);
     }
 
     /// 07 §5.5: no batch lane. A local server has no job queue to submit to,

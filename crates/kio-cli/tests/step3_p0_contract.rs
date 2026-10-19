@@ -5801,12 +5801,39 @@ fn ct3_l2_budget_paused_resume_symmetry_across_adapters() {
             .all(|task| task["status"] == "done"),
         "override must run markdownize (L2 i): {status}"
     );
+    let embedding_tasks = tasks_of_type(&status, "embedding");
     assert!(
-        tasks_of_type(&status, "embedding")
+        embedding_tasks
             .iter()
-            .all(|task| task["status"] == "done"),
-        "override must run embedding: {status}"
+            .any(|task| task["embedding_target"]["kind"] == "chunk")
     );
+    assert!(
+        embedding_tasks
+            .iter()
+            .any(|task| task["embedding_target"]["kind"] == "image")
+    );
+    for task in embedding_tasks {
+        match task["embedding_target"]["kind"].as_str() {
+            Some("chunk") => {
+                assert_eq!(task["status"], "done", "chunk work must complete: {status}")
+            }
+            Some("image") => {
+                assert_eq!(
+                    task["status"], "skipped",
+                    "unsupported image must be explicit: {status}"
+                );
+                assert_eq!(
+                    task["fallback_reason"], "image_capability_unavailable",
+                    "{status}"
+                );
+                assert!(
+                    task["reservation_id"].is_null(),
+                    "unsupported image must not reserve: {status}"
+                );
+            }
+            other => panic!("unexpected embedding target {other:?}: {status}"),
+        }
+    }
 }
 
 // An operator who raises a hard cap must be able to recheck the previously
@@ -5862,12 +5889,39 @@ fn ct3_l2_recheck_budget_enforces_the_current_cap_for_both_adapters() {
             .all(|task| task["status"] == "done"),
         "rechecked markdownize must complete under the raised cap: {status}"
     );
+    let embedding_tasks = tasks_of_type(&status, "embedding");
     assert!(
-        tasks_of_type(&status, "embedding")
+        embedding_tasks
             .iter()
-            .all(|task| task["status"] == "done"),
-        "rechecked embedding must complete under the raised cap: {status}"
+            .any(|task| task["embedding_target"]["kind"] == "chunk")
     );
+    assert!(
+        embedding_tasks
+            .iter()
+            .any(|task| task["embedding_target"]["kind"] == "image")
+    );
+    for task in embedding_tasks {
+        match task["embedding_target"]["kind"].as_str() {
+            Some("chunk") => {
+                assert_eq!(task["status"], "done", "chunk work must complete: {status}")
+            }
+            Some("image") => {
+                assert_eq!(
+                    task["status"], "skipped",
+                    "unsupported image must be explicit: {status}"
+                );
+                assert_eq!(
+                    task["fallback_reason"], "image_capability_unavailable",
+                    "{status}"
+                );
+                assert!(
+                    task["reservation_id"].is_null(),
+                    "unsupported image must not reserve: {status}"
+                );
+            }
+            other => panic!("unexpected embedding target {other:?}: {status}"),
+        }
+    }
 }
 
 // Scenario (c) — L3: a bare `kio snapshot` advances HEAD with a raw-only
@@ -8740,6 +8794,7 @@ fn indexed_scope_deterministic_embed() -> TempDir {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
+    kio(&dir, &["ledger", "init"]).assert().success();
     json_success_deterministic_embed(&dir, &["index", "--yes"]);
     dir
 }
@@ -8789,33 +8844,98 @@ fn offline_flag_does_not_degrade_the_deterministic_embedding_adapter() {
     );
 }
 
-/// The evaluator adapter declares no billable kinds, so no reservation is
-/// taken and no charge is settled.
+/// 04 §5.4: local execution reserves and settles in the physical device ledger
+/// at exact zero USD, including the device-scoped query attempt.
 #[test]
-fn deterministic_embedding_never_touches_the_cost_ledger() {
+fn deterministic_embedding_records_zero_usd_index_and_query_attempts() {
     let dir = indexed_scope_deterministic_embed();
     json_success_deterministic_embed(&dir, &["search", "トークン", "--mode", "vector"]);
     assert!(
-        !dir.path()
+        dir.path()
             .join(".test-data/kio/cost-ledger.sqlite")
-            .exists(),
-        "local embedding and vector search must not create a ledger"
+            .is_file()
+    );
+    let db = ledger_db(&dir);
+    for scope_predicate in ["scope_id <> 'device'", "scope_id = 'device'"] {
+        let sql = format!(
+            "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind = 'embedding' \
+             AND request_kind = 'sync' AND state = 2 AND estimated_usd = 0 \
+             AND batch_job_id IS NULL AND {scope_predicate}"
+        );
+        assert!(
+            count(&db, &sql) > 0,
+            "index and query need separate zero USD attempts"
+        );
+    }
+    let mut statement = db
+        .prepare("SELECT outcome, usd, estimated FROM cost_ledger WHERE adapter_kind = 'embedding'")
+        .unwrap();
+    let settlements = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(
+        settlements.len() >= 2,
+        "each local attempt must settle: {settlements:?}"
+    );
+    assert!(
+        settlements.iter().all(|(outcome, usd, estimated)| {
+            outcome == "succeeded" && *usd == 0.0 && !estimated
+        }),
+        "local settlements must be confirmed zero USD: {settlements:?}"
     );
 }
 
-/// A crash after a local vector is committed must converge without creating a
-/// paid ledger or sending the already materialized chunk again.
+/// 04 §5.4: reconciliation of already materialized local vectors completes
+/// stranded tasks without creating another reservation or settlement.
 #[test]
-fn deterministic_embedding_reconciles_stranded_tasks_without_a_ledger() {
+fn deterministic_embedding_reconciles_cached_tasks_without_new_ledger_attempts() {
     use kio_pipeline::task::{TaskStatus, TaskStore, TaskType};
 
     let dir = indexed_scope_deterministic_embed();
     let store = TaskStore::new(dir.path().join(".kio").canonicalize().unwrap());
     let before = store.all().unwrap();
+    let ledger_rows = || {
+        let conn = ledger_db(&dir);
+        ["batch_requests", "cost_ledger"].map(|table| {
+            let mut statement = conn
+                .prepare(&format!(
+                    "SELECT * FROM {table} WHERE adapter_kind='embedding' \
+                 ORDER BY scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq"
+                ))
+                .unwrap();
+            statement
+                .query_map([], |row| {
+                    (0..row.as_ref().column_count())
+                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        })
+    };
+    let ledger_before = ledger_rows();
     assert!(
         before
             .iter()
             .any(|task| task.task_type == TaskType::Embedding)
+    );
+    let reservations_before = reservation_row_count(&dir, "embedding");
+    let settlements_before = count(
+        &ledger_db(&dir),
+        "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind = 'embedding'",
+    );
+    assert!(
+        reservations_before > 0 && settlements_before > 0,
+        "fixture must have physical local accounting"
     );
     store
         .update_matching(|task| {
@@ -8823,25 +8943,86 @@ fn deterministic_embedding_reconciles_stranded_tasks_without_a_ledger() {
                 return false;
             }
             assert_eq!(task.status, TaskStatus::Done);
-            assert!(task.reservation_claim().is_none());
+            let claim = task
+                .reservation_claim()
+                .expect("local completion retains its zero-USD claim");
+            assert_eq!(claim.usd, 0.0);
+            let linked: i64 = ledger_db(&dir)
+                .query_row(
+                    "SELECT COUNT(*) FROM cost_ledger c JOIN batch_requests b \
+                 ON c.scope_id=b.scope_id AND c.adapter_kind=b.adapter_kind \
+                 AND c.input_hash=b.input_hash AND c.tool_profile_hash=b.tool_profile_hash \
+                 AND c.submission_seq=b.submission_seq \
+                 WHERE c.batch_job_id=?1 AND c.adapter_kind='embedding' \
+                 AND c.usd=0 AND c.estimated=0 AND c.outcome='succeeded' \
+                 AND b.state=2 AND b.intent_token IS NULL AND b.estimated_usd=0",
+                    [claim.reservation_id],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                linked, 1,
+                "Task claim must link a terminal released zero-USD attempt"
+            );
             task.status = TaskStatus::Pending;
             task.fallback_reason = Some("ready_for_online_adapter".to_owned());
             true
         })
         .unwrap();
-    json_success_deterministic_embed(&dir, &["index", "--yes", "--offline"]);
+    let indexed = json_success_deterministic_embed(&dir, &["index", "--yes", "--offline"]);
+    assert_eq!(indexed["embedding_tasks_executed"], 0);
     let after = store.all().unwrap();
     assert_eq!(after.len(), before.len());
-    assert!(
-        after
+    for task in after
+        .iter()
+        .filter(|task| task.task_type == TaskType::Embedding)
+    {
+        assert_eq!(task.status, TaskStatus::Done);
+        let original = before
             .iter()
-            .filter(|task| task.task_type == TaskType::Embedding)
-            .all(|task| task.status == TaskStatus::Done && task.reservation_claim().is_none())
+            .find(|old| old.task_id == task.task_id)
+            .unwrap();
+        // O0 paid cached reconciliation clears the stamp before marking Done
+        // (embedding/plan.rs), without changing the completed SQL attempt.
+        assert!(task.reservation_claim().is_none());
+        assert!(task.reservation_id.is_none());
+        assert!(task.reserved_usd.is_none());
+        assert!(task.reserved_month.is_none());
+        assert_eq!(task.attempts, original.attempts);
+        assert_eq!(task.embedding_target, original.embedding_target);
+        assert_eq!(task.input_hash, original.input_hash);
+        assert_eq!(task.input_path, original.input_path);
+        assert_eq!(
+            task.fallback_reason.as_deref(),
+            Some("embedding_adapter_done")
+        );
+    }
+    assert_eq!(
+        reservation_row_count(&dir, "embedding"),
+        reservations_before,
+        "cached reconciliation must not reserve another attempt"
     );
-    assert!(
-        !dir.path()
-            .join(".test-data/kio/cost-ledger.sqlite")
-            .exists()
+    assert_eq!(
+        count(
+            &ledger_db(&dir),
+            "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind = 'embedding'"
+        ),
+        settlements_before,
+        "cached reconciliation must not append another settlement"
+    );
+    assert_eq!(embedding_ledger_usd(&dir), 0.0);
+    assert_eq!(
+        ledger_rows(),
+        ledger_before,
+        "cached recovery preserves the original ledger rows exactly"
+    );
+    assert_eq!(
+        count(
+            &ledger_db(&dir),
+            "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind='embedding' AND (state IN (0,1) OR intent_token IS NOT NULL)"
+        ),
+        0,
+        "no task reservation remains in flight"
     );
 }
 
@@ -8892,8 +9073,8 @@ fn indexed_scope_deterministic_embed_with_images() -> TempDir {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    // Embedding is local, but the fixture deliberately sends OCR through its
-    // billed mock seam during `batch resume`.
+    // Both local zero-USD embedding and billed mock OCR need the explicitly
+    // initialized physical ledger (04 §5.4).
     initialize_paid_ledger(&dir);
     json_success_deterministic_embed(&dir, &["index"]);
     approve_markdownize(&dir, "mock_link_image");
@@ -8954,6 +9135,11 @@ fn image_objects_referenced_by_chunks_are_embedded_into_image_vec() {
 #[test]
 fn image_embedding_enrichment_writes_through_the_empty_chunk_branch() {
     let dir = indexed_scope_deterministic_embed_with_images();
+    let reservations_before = reservation_row_count(&dir, "embedding");
+    let settlements_before = count(
+        &ledger_db(&dir),
+        "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind = 'embedding'",
+    );
     let (source_images, chunks, chunk_vectors) = {
         let conn = index_db(&dir);
         let source_images = count(&conn, "SELECT COUNT(*) FROM image_vec");
@@ -8992,6 +9178,308 @@ fn image_embedding_enrichment_writes_through_the_empty_chunk_branch() {
     assert_eq!(
         replica_images, source_after,
         "image enrichment must refresh the device projection without a search"
+    );
+    assert_eq!(
+        reservation_row_count(&dir, "embedding"),
+        reservations_before,
+        "restoring a published image must not reserve or submit another attempt"
+    );
+    assert_eq!(
+        count(
+            &ledger_db(&dir),
+            "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind = 'embedding'"
+        ),
+        settlements_before,
+        "restoring a published image must not append another charge"
+    );
+}
+
+/// Supervisor Decision 2 / 04 §5.4: the sole fresh Image representative
+/// retains the exact terminal zero-USD claim, like a paid successful task.
+#[test]
+fn local_image_done_retains_its_terminal_zero_usd_attempt_claim() {
+    use kio_pipeline::task::{EmbeddingTaskTarget, TaskStatus, TaskStore, TaskType};
+
+    let dir = indexed_scope_deterministic_embed_with_images();
+    let store = TaskStore::new(dir.path().join(".kio").canonicalize().unwrap());
+    let tasks = store.all().unwrap();
+    let task = tasks
+        .iter()
+        .find(|task| {
+            task.task_type == TaskType::Embedding
+                && matches!(
+                    task.embedding_target,
+                    Some(EmbeddingTaskTarget::Image { .. })
+                )
+        })
+        .expect("fixture must execute a typed image task");
+    assert_eq!(task.status, TaskStatus::Done);
+    assert_eq!(task.attempts, 1, "fresh image executes exactly one attempt");
+    let EmbeddingTaskTarget::Image {
+        image_hash,
+        embedding_hash,
+        profile_hash,
+        ..
+    } = task.embedding_target.as_ref().unwrap()
+    else {
+        unreachable!()
+    };
+    let repo = Repository::open(dir.path()).unwrap();
+    let vector = repo.object_store().read_embedding(embedding_hash).unwrap();
+    assert_eq!(&vector.target_hash, image_hash);
+    assert_eq!(&vector.profile_hash, profile_hash);
+    assert!(
+        repo.object_store()
+            .inspect_content_object(ContentObjectKind::Image, image_hash)
+            .is_ok()
+    );
+    let claim = task
+        .reservation_claim()
+        .expect("fresh Image Done must retain its sole terminal zero-USD claim");
+    assert_eq!(claim.usd, 0.0);
+    assert_eq!(claim.task_id, task.task_id);
+    let scope_id = repo.scope_identity().unwrap().scope_id;
+    let db = ledger_db(&dir);
+    let mut statement = db
+        .prepare(
+            "SELECT c.month FROM cost_ledger c JOIN batch_requests b
+         ON c.scope_id=b.scope_id AND c.adapter_kind=b.adapter_kind
+         AND c.input_hash=b.input_hash AND c.tool_profile_hash=b.tool_profile_hash
+         AND c.submission_seq=b.submission_seq
+         WHERE c.scope_id=?1 AND c.adapter_kind='embedding' AND c.input_hash=?2
+         AND c.tool_profile_hash=?3 AND c.batch_job_id=?4
+         AND c.outcome='succeeded' AND c.usd=0 AND c.estimated=0
+         AND b.state=2 AND b.intent_token IS NULL AND b.estimated_usd=0
+         AND b.batch_job_id IS NULL AND b.request_kind='sync'",
+        )
+        .unwrap();
+    let months = statement
+        .query_map(
+            rusqlite::params![scope_id, embedding_hash, profile_hash, claim.reservation_id],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(
+        months.len(),
+        1,
+        "claim must link exactly its released physical Image attempt"
+    );
+    assert_eq!(
+        claim.month, months[0],
+        "claim month must match the original UTC ledger month"
+    );
+}
+
+/// A cached Image Pending task follows paid cached reconciliation: clear its
+/// old claim, complete the same task, and never execute or alter physical rows.
+#[test]
+fn local_image_cached_reconciliation_completes_without_new_attempt() {
+    use kio_pipeline::task::{EmbeddingTaskTarget, TaskStatus, TaskStore, TaskType};
+
+    let dir = indexed_scope_deterministic_embed_with_images();
+    kio_index::vec::ensure_registered();
+    let store = TaskStore::new(dir.path().join(".kio").canonicalize().unwrap());
+    let before = store.all().unwrap();
+    let original = before
+        .iter()
+        .find(|task| {
+            task.task_type == TaskType::Embedding
+                && matches!(
+                    task.embedding_target,
+                    Some(EmbeddingTaskTarget::Image { .. })
+                )
+        })
+        .expect("fixture must materialize a typed image task")
+        .clone();
+    assert_eq!(original.status, TaskStatus::Done);
+    let EmbeddingTaskTarget::Image {
+        image_hash,
+        embedding_hash,
+        profile_hash,
+        ..
+    } = original.embedding_target.as_ref().unwrap()
+    else {
+        unreachable!()
+    };
+    let repo = Repository::open(dir.path()).unwrap();
+    let scope_id = repo.scope_identity().unwrap().scope_id;
+    let vector_before = repo
+        .object_store()
+        .read_embedding(embedding_hash)
+        .unwrap()
+        .to_bytes()
+        .unwrap();
+    let image_before = repo
+        .object_store()
+        .read_content_object_bytes(ContentObjectKind::Image, image_hash, 16 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(kio_core::cas::hash_bytes(&image_before), *image_hash);
+    let projected_before: Vec<u8> =
+        support::immutable_sqlite(dir.path().join(".kio/index/sqlite.db"))
+            .query_row(
+                "SELECT embedding FROM image_vec WHERE image_id=?1",
+                [image_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+    // Normalize a crash fixture from the exact existing terminal attempt so
+    // this test reaches cached reconciliation independently of the fresh-claim
+    // bug covered above. No SQL row, target, vector or attempt is fabricated.
+    let (token, month): (String, String) = ledger_db(&dir)
+        .query_row(
+            "SELECT c.batch_job_id,c.month FROM cost_ledger c JOIN batch_requests b
+         ON c.scope_id=b.scope_id AND c.adapter_kind=b.adapter_kind
+         AND c.input_hash=b.input_hash AND c.tool_profile_hash=b.tool_profile_hash
+         AND c.submission_seq=b.submission_seq
+         WHERE c.scope_id=?1 AND c.adapter_kind='embedding' AND c.input_hash=?2
+         AND c.tool_profile_hash=?3 AND c.outcome='succeeded' AND c.usd=0
+         AND c.estimated=0 AND b.state=2 AND b.intent_token IS NULL
+         AND b.estimated_usd=0 AND b.batch_job_id IS NULL AND b.request_kind='sync'",
+            rusqlite::params![scope_id, embedding_hash, profile_hash],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let ledger_rows = || {
+        let conn = ledger_db(&dir);
+        ["batch_requests", "cost_ledger"].map(|table| {
+            let mut statement = conn.prepare(&format!(
+                "SELECT * FROM {table} ORDER BY scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq"
+            )).unwrap();
+            statement.query_map([], |row| (0..row.as_ref().column_count())
+                .map(|column| row.get::<_,rusqlite::types::Value>(column))
+                .collect::<rusqlite::Result<Vec<_>>>())
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        })
+    };
+    let ledger_before = ledger_rows();
+    store
+        .update_matching(|task| {
+            if task.task_id != original.task_id {
+                return false;
+            }
+            task.reservation_id = Some(token.clone());
+            task.reserved_usd = Some(0.0);
+            task.reserved_month = Some(month.clone());
+            task.status = TaskStatus::Pending;
+            task.fallback_reason = Some("ready_for_online_adapter".to_owned());
+            true
+        })
+        .unwrap();
+    drop(repo);
+    let indexed = json_success_deterministic_embed(&dir, &["index", "--yes", "--offline"]);
+    assert_eq!(
+        indexed["embedding_tasks_executed"], 0,
+        "cached Image must not execute: {indexed}"
+    );
+    let after = store.all().unwrap();
+    assert_eq!(
+        after.len(),
+        before.len(),
+        "cached reconciliation keeps the same task set"
+    );
+    let completed = after
+        .iter()
+        .find(|task| task.task_id == original.task_id)
+        .unwrap();
+    assert_eq!(
+        completed.status,
+        TaskStatus::Done,
+        "materialized Image Pending must become Done"
+    );
+    assert!(completed.reservation_claim().is_none());
+    assert!(completed.reservation_id.is_none());
+    assert!(completed.reserved_usd.is_none());
+    assert!(completed.reserved_month.is_none());
+    assert_eq!(completed.attempts, original.attempts);
+    assert_eq!(completed.embedding_target, original.embedding_target);
+    assert_eq!(completed.input_hash, original.input_hash);
+    assert_eq!(completed.input_path, original.input_path);
+    assert_eq!(completed.output_ref, original.output_ref);
+    assert_eq!(
+        ledger_rows(),
+        ledger_before,
+        "cached Image recovery leaves every physical request/settlement field exact"
+    );
+    let repo = Repository::open(dir.path()).unwrap();
+    assert_eq!(
+        repo.object_store()
+            .read_embedding(embedding_hash)
+            .unwrap()
+            .to_bytes()
+            .unwrap(),
+        vector_before
+    );
+    assert_eq!(
+        repo.object_store()
+            .read_content_object_bytes(ContentObjectKind::Image, image_hash, 16 * 1024 * 1024)
+            .unwrap(),
+        image_before
+    );
+    let projected_after: Vec<u8> =
+        support::immutable_sqlite(dir.path().join(".kio/index/sqlite.db"))
+            .query_row(
+                "SELECT embedding FROM image_vec WHERE image_id=?1",
+                [image_hash],
+                |row| row.get(0),
+            )
+            .unwrap();
+    assert_eq!(projected_after, projected_before);
+    assert_eq!(
+        count(
+            &ledger_db(&dir),
+            "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind='embedding' AND (state IN (0,1) OR intent_token IS NOT NULL)"
+        ),
+        0
+    );
+    // A token from another input is only a lookup hint, never authority to
+    // clear a claim or settle that other task. Keep the exact ledger unchanged.
+    let foreign = after
+        .iter()
+        .find(|task| {
+            matches!(
+                task.embedding_target,
+                Some(EmbeddingTaskTarget::Chunk { .. })
+            ) && task.reservation_claim().is_some()
+        })
+        .expect("fixture must retain a separate terminal chunk claim");
+    let foreign_claim = foreign.reservation_claim().unwrap();
+    store
+        .update_matching(|task| {
+            if task.task_id != original.task_id {
+                return false;
+            }
+            task.status = TaskStatus::Pending;
+            task.fallback_reason = Some("ready_for_online_adapter".to_owned());
+            task.reservation_id = Some(foreign_claim.reservation_id.to_owned());
+            task.reserved_usd = Some(foreign_claim.usd);
+            task.reserved_month = Some(foreign_claim.month.to_owned());
+            true
+        })
+        .unwrap();
+    let held = json_success_deterministic_embed(&dir, &["index", "--yes", "--offline"]);
+    assert_eq!(held["embedding_tasks_executed"], 0);
+    let held_tasks = store.all().unwrap();
+    let held_image = held_tasks
+        .iter()
+        .find(|task| task.task_id == original.task_id)
+        .unwrap();
+    assert_eq!(
+        held_image.status,
+        TaskStatus::Pending,
+        "a foreign input claim cannot be discarded"
+    );
+    let retained = held_image.reservation_claim().unwrap();
+    assert_eq!(retained.reservation_id, foreign_claim.reservation_id);
+    assert_eq!(retained.month, foreign_claim.month);
+    assert_eq!(retained.usd, foreign_claim.usd);
+    assert_eq!(held_image.embedding_target, original.embedding_target);
+    assert_eq!(held_image.attempts, original.attempts);
+    assert_eq!(
+        ledger_rows(),
+        ledger_before,
+        "foreign claim must not mutate either physical attempt"
     );
 }
 
@@ -9041,6 +9529,107 @@ fn the_online_adapter_embeds_no_images_because_it_declares_no_capability() {
         count(&conn, "SELECT COUNT(*) FROM image_vec"),
         0,
         "an adapter that reads only `text` must not be handed image items"
+    );
+}
+
+/// 03 §11 and 04 §5.2: text_only excludes unsent images from external egress,
+/// records the exclusion as a typed Skipped task, and leaves local image work
+/// available when the embedding profile changes.
+#[test]
+fn text_only_external_send_skips_image_task_then_local_profile_replans_it() {
+    let dir = canonical_tempdir();
+    fs::write(
+        dir.path().join("figures.pdf"),
+        fake_pdf(&["figure page one"]),
+    )
+    .unwrap();
+    kio(&dir, &["init"]).assert().success();
+    initialize_paid_ledger(&dir);
+    write_scope_config(&dir, "[embedding]\nexternal_send = \"text_only\"\n");
+    approve_markdownize(&dir, "mock");
+    approve_embed(&dir, "mock");
+    approve_markdownize(&dir, "mock_link_image");
+    json_success_embed(&dir, "mock", &["index"]);
+    kio(&dir, &["batch", "resume"])
+        .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
+        .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock_link_image")
+        .arg("--json")
+        .assert()
+        .success();
+    json_success_embed(&dir, "mock", &["index"]);
+
+    let online_status = json_success_embed(&dir, "mock", &["status"]);
+    let image_tasks = tasks_of_type(&online_status, "embedding")
+        .into_iter()
+        .filter(|task| task["embedding_target"]["kind"] == "image")
+        .collect::<Vec<_>>();
+    assert!(
+        !image_tasks.is_empty(),
+        "image task missing: {online_status}"
+    );
+    assert!(
+        image_tasks.iter().all(|task| {
+            task["status"] == "skipped"
+                && task["fallback_reason"] == "images_excluded_from_external_send"
+                && task["embedding_target"]["image_hash"].as_str().is_some()
+        }),
+        "external image exclusion must be explicit: {image_tasks:?}"
+    );
+    let skipped_profiles = image_tasks
+        .iter()
+        .filter_map(|task| task["embedding_target"]["profile_hash"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(count(&index_db(&dir), "SELECT COUNT(*) FROM image_vec"), 0);
+
+    let online_search = json_success_embed(&dir, "mock", &["search", "figure", "--mode", "text"]);
+    assert_eq!(
+        online_search["index_status"]["pending_enrichment_tasks"], 0,
+        "{online_search}"
+    );
+    assert_eq!(
+        online_search["index_status"]["enriched_ratio"], 1.0,
+        "{online_search}"
+    );
+    assert!(
+        online_search["index_status"]["total_enrichment_tasks"]
+            .as_u64()
+            .is_some_and(|total| total >= image_tasks.len() as u64),
+        "target count must include skipped images: {online_search}"
+    );
+    assert!(
+        online_search["index_status"]["skipped_enrichment_tasks"]
+            .as_u64()
+            .is_some_and(|count| count >= image_tasks.len() as u64),
+        "skipped targets need a separate count: {online_search}"
+    );
+    assert!(
+        online_search["index_status"]["skipped_enrichment_reasons"]
+            ["images_excluded_from_external_send"]
+            .as_u64()
+            .is_some_and(|count| count >= image_tasks.len() as u64),
+        "image policy exclusions need a reason count: {online_search}"
+    );
+
+    json_success_deterministic_embed(&dir, &["index"]);
+    let local_status = json_success_deterministic_embed(&dir, &["status"]);
+    let local_image_tasks = tasks_of_type(&local_status, "embedding")
+        .into_iter()
+        .filter(|task| task["embedding_target"]["kind"] == "image")
+        .filter(|task| {
+            task["embedding_target"]["profile_hash"]
+                .as_str()
+                .is_some_and(|profile| !skipped_profiles.contains(&profile))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        local_image_tasks
+            .iter()
+            .any(|task| task["status"] == "done"),
+        "local profile must replan and finish image work: {local_status}"
+    );
+    assert!(
+        count(&index_db(&dir), "SELECT COUNT(*) FROM image_vec") > 0,
+        "text_only must still allow local image vectors"
     );
 }
 
@@ -10334,10 +10923,10 @@ fn approve_markdownize(dir: &TempDir, seam: &str) {
     run_markdownize_seam(dir, seam, None, &["adapter", "approve", "--all", "--yes"]);
 }
 
-/// `cost-ledger.sqlite`, opened read-only-in-spirit (queries only) for test
+/// `cost-ledger.sqlite`, opened as an immutable read-only snapshot for test
 /// assertions. The harness roots `$XDG_DATA_HOME` at `.test-data`.
 fn ledger_db(dir: &TempDir) -> Connection {
-    Connection::open(dir.path().join(".test-data/kio/cost-ledger.sqlite")).unwrap()
+    support::immutable_sqlite(dir.path().join(".test-data/kio/cost-ledger.sqlite"))
 }
 
 /// Count of DISTINCT task-key reservations EVER made for `adapter_kind` — open
@@ -11903,6 +12492,83 @@ fn assert_secret_hold_without_a_ledger(with_retained_claim: bool) {
     );
 }
 
+/// A ledger pause on opted-in work must yield to a later Tier B secret hold,
+/// even when the physical ledger is still absent. The original task retains its
+/// claim for later accounting; the renamed context receives no claim.
+#[test]
+fn r22_2_ledger_paused_task_becomes_secret_hold_without_losing_claim() {
+    let dir = canonical_tempdir();
+    fs::write(
+        dir.path().join("plain.md"),
+        "# Plain\n\nalpha bravo charlie delta echo foxtrot golf hotel india juliet.\n",
+    )
+    .unwrap();
+    kio(&dir, &["init"]).assert().success();
+    approve_embed(&dir, "mock");
+    json_code_stdout_embed(&dir, "mock", 6, &["index", "--online"]);
+    let status = json_success_embed(&dir, "mock", &["status"]);
+    let embedding = tasks_of_type(&status, "embedding");
+    assert_eq!(embedding.len(), 1, "one original embedding task: {status}");
+    assert_eq!(embedding[0]["status"], "paused", "{status}");
+    assert_eq!(
+        embedding[0]["fallback_reason"], "ledger_initialization_required",
+        "{status}"
+    );
+    let original_ref = embedding[0]["output_ref"].as_str().unwrap().to_owned();
+    const CLAIM_ID: &str = "01992840-5c00-7000-8000-000000000002";
+    let store = kio_pipeline::task::TaskStore::new(dir.path().join(".kio").canonicalize().unwrap());
+    store
+        .update_matching(|task| {
+            if task.task_type != kio_pipeline::task::TaskType::Embedding
+                || task.output_ref != original_ref
+            {
+                return false;
+            }
+            task.reservation_id = Some(CLAIM_ID.to_owned());
+            task.reserved_usd = Some(0.25);
+            task.reserved_month = Some("2026-09".to_owned());
+            true
+        })
+        .unwrap();
+    fs::rename(
+        dir.path().join("plain.md"),
+        dir.path().join("credentials_backup.md"),
+    )
+    .unwrap();
+    json_success_embed(&dir, "mock", &["index", "--yes"]);
+    let status = json_success_embed(&dir, "mock", &["status"]);
+    let embedding = tasks_of_type(&status, "embedding");
+    assert_eq!(
+        embedding.len(),
+        2,
+        "original and renamed contexts: {status}"
+    );
+    assert!(
+        embedding
+            .iter()
+            .all(|task| task["status"] == "paused"
+                && task["fallback_reason"] == "secrets_tier_b_hold"),
+        "secret policy must outrank ledger pause: {status}"
+    );
+    let original = embedding
+        .iter()
+        .find(|task| task["output_ref"] == original_ref)
+        .unwrap();
+    assert_eq!(original["reservation_id"], CLAIM_ID, "{status}");
+    assert_eq!(original["reserved_usd"], 0.25, "{status}");
+    assert_eq!(original["reserved_month"], "2026-09", "{status}");
+    let renamed = embedding
+        .iter()
+        .find(|task| task["input_path"] == "credentials_backup.md")
+        .unwrap();
+    assert!(renamed["reservation_id"].is_null(), "{status}");
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
+    );
+}
+
 /// A Done task remains terminal for its original contextual identity. Renaming
 /// into a Tier B name creates separate held work; terminal history does not
 /// authorize exposing the chunk's scalar projection.
@@ -12246,5 +12912,146 @@ fn r22_7_budget_paused_false_for_secrets_hold() {
     assert_eq!(
         index_status["pending_enrichment_tasks"], 1,
         "R22-7: the single secrets hold must count as pending enrichment: {search}"
+    );
+}
+
+/// 03 §8.1: an embedding CAS vector is insufficient to republish an image
+/// whose authenticated source image CAS object has disappeared. The attempt
+/// remains terminal and no new charge/send is authorized by projection repair.
+#[test]
+fn missing_owned_image_cas_blocks_vector_reprojection_without_new_attempt() {
+    use kio_core::cas::ContentObjectKind;
+    use kio_core::scope::Repository;
+
+    let dir = indexed_scope_deterministic_embed_with_images();
+    let source = index_db(&dir);
+    let (embedding_hash, image_hash): (String, String) = source
+        .query_row(
+            "SELECT id, target_id FROM embeddings WHERE target_type='image' LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("fixture needs a published image vector");
+    assert_eq!(
+        count(&source, "SELECT COUNT(*) FROM image_vec"),
+        1,
+        "fixture needs one searchable image vector"
+    );
+    let repo = Repository::open(dir.path()).unwrap();
+    let original_vector = repo
+        .object_store()
+        .read_embedding(&embedding_hash)
+        .expect("fixture needs a valid retained embedding CAS object")
+        .to_bytes()
+        .unwrap();
+    assert!(
+        repo.object_store()
+            .remove_content(ContentObjectKind::Image, &image_hash)
+            .unwrap(),
+        "fixture must remove the original owned image CAS object"
+    );
+    assert!(
+        repo.object_store()
+            .inspect_content_object(ContentObjectKind::Image, &image_hash)
+            .is_err(),
+        "the image source must be absent before recovery"
+    );
+    source.execute("DELETE FROM image_vec", []).unwrap();
+    source
+        .execute("DELETE FROM embeddings WHERE target_type='image'", [])
+        .unwrap();
+    drop(source);
+
+    let replica =
+        rusqlite::Connection::open(dir.path().join(".test-cache/kio/aggregator.sqlite")).unwrap();
+    replica.execute("DELETE FROM agg_image_refs", []).unwrap();
+    replica
+        .execute("DELETE FROM agg_image_embeddings", [])
+        .unwrap();
+    drop(replica);
+    let ledger = ledger_db(&dir);
+    let (requests_before, charges_before): (i64, i64) = (
+        ledger
+            .query_row(
+                "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind='embedding' AND input_hash=?1",
+                [&embedding_hash],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        ledger
+            .query_row(
+                "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind='embedding' AND input_hash=?1",
+                [&embedding_hash],
+                |row| row.get(0),
+            )
+            .unwrap(),
+    );
+    assert_eq!((requests_before, charges_before), (1, 1));
+    drop(ledger);
+
+    let resume = kio(&dir, &["batch", "resume"])
+        .env(TEST_DETERMINISTIC_EMBEDDING_ENV, "scale-v3")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let after = index_db(&dir);
+    assert_eq!(
+        count(
+            &after,
+            "SELECT COUNT(*) FROM embeddings WHERE target_type='image'"
+        ),
+        0,
+        "missing source CAS must block image projection: status={:?} stdout={} stderr={}",
+        resume.status.code(),
+        String::from_utf8_lossy(&resume.stdout),
+        String::from_utf8_lossy(&resume.stderr)
+    );
+    assert_eq!(count(&after, "SELECT COUNT(*) FROM image_vec"), 0);
+    let replica =
+        rusqlite::Connection::open(dir.path().join(".test-cache/kio/aggregator.sqlite")).unwrap();
+    assert_eq!(
+        count(&replica, "SELECT COUNT(*) FROM agg_image_embeddings"),
+        0
+    );
+    assert_eq!(
+        resume.status.code(),
+        Some(4),
+        "missing source is store failure"
+    );
+    let failure: serde_json::Value = serde_json::from_slice(&resume.stderr).unwrap();
+    assert_eq!(
+        failure["error_code"], "KIO-E-STORE-NOT-FOUND-001",
+        "the missing source must be classified, not silently skipped: {failure}"
+    );
+    let ledger = ledger_db(&dir);
+    let (requests_after, charges_after): (i64, i64) = (
+        ledger
+            .query_row(
+                "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind='embedding' AND input_hash=?1",
+                [&embedding_hash],
+                |row| row.get(0),
+            )
+            .unwrap(),
+        ledger
+            .query_row(
+                "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind='embedding' AND input_hash=?1",
+                [&embedding_hash],
+                |row| row.get(0),
+            )
+            .unwrap(),
+    );
+    assert_eq!(
+        (requests_after, charges_after),
+        (requests_before, charges_before),
+        "projection failure must not reserve or charge a new image attempt"
+    );
+    assert_eq!(
+        repo.object_store()
+            .read_embedding(&embedding_hash)
+            .unwrap()
+            .to_bytes()
+            .unwrap(),
+        original_vector,
+        "a missing source does not rewrite the immutable vector CAS"
     );
 }

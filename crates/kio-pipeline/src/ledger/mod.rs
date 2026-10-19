@@ -10,6 +10,7 @@
 //!   query-embedding device row, budget cap check-then-reserve, and abandon.
 
 pub mod backup;
+pub mod embedding_job;
 pub(crate) mod lifecycle;
 pub(crate) mod lifecycle_fs;
 pub mod model;

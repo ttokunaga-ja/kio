@@ -108,6 +108,9 @@ pub struct LedgerDb {
 pub(crate) struct LedgerWriteTxn<'a> {
     conn: &'a Connection,
     control: &'a ControlHandle,
+    pub(super) fs: &'a FsSession,
+    pub(super) ledger_id: &'a str,
+    pub(super) era: &'a str,
 }
 impl LedgerWriteTxn<'_> {
     pub(super) fn control(&self) -> &ControlHandle {
@@ -489,12 +492,23 @@ impl LedgerDb {
         })
     }
     pub(crate) fn read<T>(&self, operation: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+        self.read_artifacts(|conn, _, _, _| operation(conn))
+    }
+    pub(super) fn read_artifacts<T>(
+        &self,
+        operation: impl FnOnce(&Connection, &FsSession, &str, &str) -> Result<T>,
+    ) -> Result<T> {
         let fs = FsSession::acquire_with_control(&self.path, false, self.control.clone())?;
         let (authority, checkpoint) = self.expected_authority(&fs)?;
         let mut bound = fs.open_existing_sqlite(READ_WRITE)?;
         let result = (|| {
             validate_bound_connection(bound.connection(), &authority, &checkpoint)?;
-            let value = operation(bound.connection())?;
+            let value = operation(
+                bound.connection(),
+                &fs,
+                &authority.ledger_id,
+                &authority.era,
+            )?;
             bound.revalidate_open()?;
             Ok(value)
         })();
@@ -551,6 +565,9 @@ impl LedgerDb {
                 let mut tx = LedgerWriteTxn {
                     conn,
                     control: &self.control,
+                    fs: &fs,
+                    ledger_id: &authority.ledger_id,
+                    era: &authority.era,
                 };
                 operation(&mut tx)?
             };

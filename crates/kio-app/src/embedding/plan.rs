@@ -20,6 +20,7 @@ use crate::task_execution::task_retry_due;
 use kio_adapter::catalog::DeclaredEmbeddingProfile;
 use kio_core::KioError;
 use kio_core::Result;
+use kio_core::cas::hash_bytes;
 use kio_core::control::ControlHandle;
 use kio_core::scope::Repository;
 use kio_core::scope::new_ulid;
@@ -32,6 +33,7 @@ use kio_pipeline::ledger::ops::AbandonResolution;
 use kio_pipeline::ledger::ops::AbandonSelector;
 use kio_pipeline::ledger::ops::resolve_abandon_selector;
 use kio_pipeline::policy::CurrentPolicyEvaluator;
+use kio_pipeline::task::EmbeddingTaskTarget;
 use kio_pipeline::task::EmbeddingWorkKey;
 use kio_pipeline::task::HoldReason;
 use kio_pipeline::task::RetryErrorKind;
@@ -70,6 +72,20 @@ impl AsRef<RetainedEmbeddingChunk> for EmbeddableChunk {
 impl AsRef<RetainedEmbeddingChunk> for RetainedEmbeddingChunk {
     fn as_ref(&self) -> &RetainedEmbeddingChunk {
         self
+    }
+}
+
+pub(crate) fn chunk_task_target(
+    chunk: &EmbeddableChunk,
+    profile: &DeclaredEmbeddingProfile,
+) -> EmbeddingTaskTarget {
+    let context = embedding_store::chunk_embedding_context(&chunk.raw_path);
+    let input = embedding_store::contextualized_embedding_input(context.as_deref(), &chunk.text);
+    EmbeddingTaskTarget::Chunk {
+        chunk_hash: chunk.chunk_id.clone(),
+        embedding_hash: chunk.work_key.embedding_hash().to_owned(),
+        profile_hash: profile.profile_hash.clone(),
+        input_hash: hash_bytes(input.as_bytes()),
     }
 }
 
@@ -218,6 +234,7 @@ pub(crate) fn retained_chunks_without_embedding(
 pub(crate) fn validate_embedding_task_bindings(
     task_store: &TaskStore,
     chunks: &[EmbeddableChunk],
+    profile: &DeclaredEmbeddingProfile,
 ) -> Result<()> {
     let by_ref = chunks
         .iter()
@@ -228,7 +245,8 @@ pub(crate) fn validate_embedding_task_bindings(
             continue;
         }
         if let Some(chunk) = by_ref.get(&task.output_ref)
-            && (task.input_hash != chunk.text_hash
+            && (task.embedding_target.as_ref() != Some(&chunk_task_target(chunk, profile))
+                || task.input_hash != chunk.text_hash
                 || task.changed_unit_keys != [chunk.chunk_id.clone()])
         {
             return Err(KioError::schema(
@@ -508,7 +526,7 @@ pub(crate) fn hold_secret_embedding_tasks(
     if held.is_empty() {
         return Ok(());
     }
-    validate_embedding_task_bindings(task_store, held)?;
+    validate_embedding_task_bindings(task_store, held, profile)?;
     let all_tasks = task_store.all().map_err(pipeline_to_kio)?;
     // R22-2: `existing` used to mean "any non-retired task ⇒ already classified", which
     // silently assumed a chunk's secret classification never changes after its task is
@@ -573,7 +591,10 @@ pub(crate) fn hold_secret_embedding_tasks(
         .iter()
         .filter(|task| task.task_type == TaskType::Embedding)
         .filter(|task| {
-            task_can_enter_secret_hold(task)
+            (task_can_enter_secret_hold(task)
+                || (task.status == TaskStatus::Paused
+                    && task.fallback_reason.as_deref()
+                        == Some(kio_pipeline::task::LEDGER_INITIALIZATION_REQUIRED_REASON)))
                 && !already_held.contains(&task.output_ref)
                 && !done.contains(&task.output_ref)
                 && !terminal_failed.contains(&task.output_ref)
@@ -607,6 +628,7 @@ pub(crate) fn hold_secret_embedding_tasks(
         let task = TaskDescriptor {
             task_id: format!("task_{}", new_ulid(repo.canonical_root())),
             task_type: TaskType::Embedding,
+            embedding_target: Some(chunk_task_target(chunk, profile)),
             mode: None,
             input_path: chunk.raw_path.clone(),
             input_hash: chunk.text_hash.clone(),
@@ -709,10 +731,11 @@ pub(crate) fn enqueue_embedding_tasks(
     task_store: &TaskStore,
     repo: &Repository,
     pending: &[EmbeddableChunk],
+    profile: &DeclaredEmbeddingProfile,
     online: bool,
     now: &str,
 ) -> Result<()> {
-    validate_embedding_task_bindings(task_store, pending)?;
+    validate_embedding_task_bindings(task_store, pending, profile)?;
     let all_tasks = task_store.all().map_err(pipeline_to_kio)?;
     // R22-1: a Paused `secrets_tier_b_hold` must not block this enqueue either. Reaching
     // `enqueue_embedding_tasks` means the chunk landed in `sendable`, i.e. NO live path of
@@ -782,6 +805,7 @@ pub(crate) fn enqueue_embedding_tasks(
         let task = TaskDescriptor {
             task_id: format!("task_{}", new_ulid(repo.canonical_root())),
             task_type: TaskType::Embedding,
+            embedding_target: Some(chunk_task_target(chunk, profile)),
             mode: None,
             input_path: chunk.raw_path.clone(),
             input_hash: chunk.text_hash.clone(),
@@ -871,10 +895,11 @@ pub(crate) fn enqueue_embedding_tasks(
 pub(crate) fn filter_embeddable_by_task_state(
     task_store: &TaskStore,
     pending: Vec<EmbeddableChunk>,
+    profile: &DeclaredEmbeddingProfile,
     override_budget: bool,
     control: &ControlHandle,
 ) -> Result<Vec<EmbeddableChunk>> {
-    validate_embedding_task_bindings(task_store, &pending)?;
+    validate_embedding_task_bindings(task_store, &pending, profile)?;
     let tasks = task_store.all().map_err(pipeline_to_kio)?;
     let mut by_ref = BTreeMap::<String, Vec<&TaskDescriptor>>::new();
     for task in tasks

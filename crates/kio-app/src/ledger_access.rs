@@ -308,27 +308,15 @@ pub(crate) fn sync_result_unknown_fenced(row: Option<&BatchRequestRow>) -> bool 
     })
 }
 
-/// CL45/§5.4 sync crash recovery — the write-command-entry pass 04 §5.8's
-/// batch recovery (CL32) runs alongside, but explicitly excludes
-/// `request_kind='sync'` rows from (item 5 of this session's task: the
-/// ledger-side settlement primitive, `recovery_settle_unknown`, is already
-/// implemented and already reused for exactly this purpose by
-/// `settle_task_charge_unknown` — this function is the write-entry caller
-/// that was still missing).
+/// Reconcile stale scope sync attempts at write-command entry (04 §5.4).
+/// An authenticated document embedding result remains known even after its
+/// reservation becomes stale: the common runner must settle and publish that
+/// original response, so this pass leaves its row and Task state untouched.
 ///
-/// No Adapter in this codebase exposes a post-hoc "query a past sync call's
-/// result by provider request id" capability (confirmed by grep of
-/// `kio-adapter`'s traits — the same fact `settle_task_charge_unknown`'s own
-/// doc comment already records), so CL45's "batch_job_id 記録済みで照会可能"
-/// branch is unreachable today: every stale sync row this finds settles via
-/// the "未記録・照会不能" branch — `estimated_usd` billed with `estimated=1`,
-/// `state=3`, `intent_token` cleared in the same Tx (CL47: sync rows have no
-/// upload/job residue to wait on, unlike batch rows).
-///
-/// Scoped to `scope_id` (a sync row belongs to one scope; only that scope's
-/// `.kio/.lock` holder reconciles it) and gated on `stale_after_at`
-/// (`sync_recovery_candidates`'s own doc comment) so a genuinely live
-/// concurrent sync call from another process is never raced.
+/// Unknown remote sync attempts retain conservative estimated settlement and
+/// the explicit resend fence. The ledger wrapper records unknown local attempts
+/// at confirmed zero. Device query inline recovery follows its separate rules.
+/// Scope locking and the durable `stale_after_at` gate protect live calls.
 pub(crate) fn recover_stale_sync_rows(
     ledger: &LedgerDb,
     store: Option<&TaskStore>,
@@ -345,6 +333,16 @@ pub(crate) fn recover_stale_sync_rows(
             // invariant is ever violated.
             continue;
         };
+        if row.key.adapter_kind == "embedding"
+            && !row.key.is_device()
+            && let Some(job) =
+                kio_pipeline::ledger::ops::embedding_job(ledger, &row).map_err(pipeline_to_kio)?
+            && job.known_result.is_some()
+        {
+            // Original binding and staged bytes were authenticated against the
+            // ledger. Staleness does not turn this response into an unknown.
+            continue;
+        }
         recovery_settle_unknown(ledger, &row.key, intent_token, row.estimated_usd, true)
             .map_err(pipeline_to_kio)?;
         // `reservation_id` is the precise task-side binding to this intent.
@@ -556,6 +554,7 @@ pub(crate) fn declared_billable_kind_strings(
         .map(|kind| match kind {
             kio_adapter::types::BillableUnitKind::Pages => "pages",
             kio_adapter::types::BillableUnitKind::TokensIn => "tokens_in",
+            kio_adapter::types::BillableUnitKind::ImageTokensIn => "image_tokens_in",
             kio_adapter::types::BillableUnitKind::TokensOut => "tokens_out",
         })
         .map(str::to_owned)

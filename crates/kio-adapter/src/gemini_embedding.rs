@@ -18,9 +18,9 @@ use crate::identity::{is_mutable_model_alias, tool_profile_hash};
 use crate::tool_lock::AdapterRuntimeSettings;
 use crate::traits::{EmbeddingAdapter, PreferredRequestKind};
 use crate::types::{
-    AdapterKind, AdapterProfile, AdapterUsage, BillableUnit, BillableUnitKind, EmbeddingContent,
-    EmbeddingItem, EmbeddingRequest, EmbeddingResponse, EmbeddingVector, ExecutionMode,
-    validate_cosine_vector, validate_embedding_request_bytes,
+    AdapterKind, AdapterProfile, AdapterUsage, BillableUnit, BillableUnitKind, EmbeddingCompleted,
+    EmbeddingContent, EmbeddingItem, EmbeddingOutcome, EmbeddingRequest, EmbeddingUsage,
+    EmbeddingVector, ExecutionMode, validate_cosine_vector, validate_embedding_request_bytes,
 };
 use crate::{AdapterError, Result};
 use serde_json::{Value, json};
@@ -368,12 +368,6 @@ impl<C> GeminiEmbeddingAdapter<C> {
         self.provider_idempotency = provider_idempotency;
         self
     }
-
-    /// The adopted profile JSON value (07 §5.3).
-    #[must_use]
-    pub fn profile_value(&self) -> Value {
-        gemini_embedding_profile_value(&self.configured_model, self.dimensions)
-    }
 }
 
 fn gemini_embedding_profile_value(configured_model: &str, dimensions: u32) -> Value {
@@ -456,7 +450,27 @@ impl<C: GeminiEmbeddingClient> EmbeddingAdapter for GeminiEmbeddingAdapter<C> {
         PreferredRequestKind::Batch
     }
 
-    fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+    fn descriptor(&self) -> crate::types::EmbeddingDescriptor {
+        let mut descriptor = crate::types::EmbeddingDescriptor::from_profile(&self.profile());
+        descriptor.completion.batch = true;
+        descriptor.limits.max_encoded_bytes = Some(16 * 1024 * 1024);
+        descriptor.limits.max_tokens_per_member = Some(8192);
+        descriptor.pricing = vec![
+            crate::types::EmbeddingPrice {
+                kind: BillableUnitKind::TokensIn,
+                standard_usd_per_unit: 0.20 / 1_000_000.0,
+                batch_usd_per_unit: Some(0.10 / 1_000_000.0),
+            },
+            crate::types::EmbeddingPrice {
+                kind: BillableUnitKind::ImageTokensIn,
+                standard_usd_per_unit: 0.45 / 1_000_000.0,
+                batch_usd_per_unit: Some(0.225 / 1_000_000.0),
+            },
+        ];
+        descriptor
+    }
+
+    fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingOutcome> {
         validate_embedding_request_bytes(&request)?;
         if request
             .items
@@ -500,31 +514,27 @@ impl<C: GeminiEmbeddingClient> EmbeddingAdapter for GeminiEmbeddingAdapter<C> {
             }
             validate_cosine_vector(&vector.vector, self.dimensions)?;
         }
-        Ok(EmbeddingResponse {
-            vectors,
+        Ok(EmbeddingOutcome::Completed(EmbeddingCompleted {
+            members: vectors.into_iter().map(Into::into).collect(),
             dimensions: self.dimensions,
             distance: "cosine".to_owned(),
             modality: "multimodal".to_owned(),
             // QA49: the profile in force for this response, so the consumer
             // can reject a same-dimension vector from an unexpected profile.
-            embedding_profile_hash: tool_profile_hash(&self.profile_value()).ok(),
-            // I4 (2026-07-25, measured against the live endpoint): the
-            // response DOES carry `usageMetadata.promptTokenCount` — as a
-            // per-CALL total, not per request, which is the granularity the
-            // provider bills at. This used to report `None` on the reasoning
-            // that a per-request count was absent, which made every
-            // synchronous embedding settle at the caller's reservation
-            // estimate rather than at cost. `None` remains the honest answer
-            // when the field is missing, and still degrades that way.
+            embedding_profile_hash: self.profile().tool_profile_hash,
+            // Missing provider usage is an explicit conservative estimate.
             usage: batch
                 .prompt_tokens
-                .map(|count| AdapterUsage::BillableUnits {
-                    billable_units: vec![BillableUnit {
-                        kind: BillableUnitKind::TokensIn,
-                        count,
-                    }],
-                }),
-        })
+                .map(|count| EmbeddingUsage::Metered {
+                    usage: AdapterUsage::BillableUnits {
+                        billable_units: vec![BillableUnit {
+                            kind: BillableUnitKind::TokensIn,
+                            count,
+                        }],
+                    },
+                })
+                .unwrap_or(EmbeddingUsage::Estimated),
+        }))
     }
 }
 
@@ -653,6 +663,30 @@ mod tests {
     }
 
     #[test]
+    fn descriptor_declares_actual_effects_prices_and_current_text_capability() {
+        let adapter =
+            GeminiEmbeddingAdapter::new(StubClient, ADOPTED_MODEL_PIN, ADOPTED_DIMENSIONS);
+        let hash = adapter.profile().tool_profile_hash;
+        let descriptor = adapter.descriptor();
+        assert!(descriptor.effects.egress);
+        assert!(descriptor.effects.paid_authorization);
+        assert!(descriptor.capability.text);
+        assert!(descriptor.capability.image_mime_types.is_empty());
+        assert!(descriptor.completion.sync && descriptor.completion.batch);
+        assert_eq!(descriptor.limits.max_tokens_per_member, Some(8192));
+        assert_eq!(descriptor.limits.max_encoded_bytes, Some(16 * 1024 * 1024));
+        let text = &descriptor.pricing[0];
+        let image = &descriptor.pricing[1];
+        assert_eq!(text.kind, BillableUnitKind::TokensIn);
+        assert_eq!(text.standard_usd_per_unit, 0.20 / 1_000_000.0);
+        assert_eq!(text.batch_usd_per_unit, Some(0.10 / 1_000_000.0));
+        assert_eq!(image.kind, BillableUnitKind::ImageTokensIn);
+        assert_eq!(image.standard_usd_per_unit, 0.45 / 1_000_000.0);
+        assert_eq!(image.batch_usd_per_unit, Some(0.225 / 1_000_000.0));
+        assert_eq!(hash, adapter.profile().tool_profile_hash);
+    }
+
+    #[test]
     fn the_reported_token_count_becomes_a_billable_unit() {
         // I4: measured against the live `:batchEmbedContents` — the response
         // carries `usageMetadata.promptTokenCount` as a per-CALL total. The
@@ -667,9 +701,13 @@ mod tests {
                 items: vec![EmbeddingItem::text("a", "hello")],
                 idempotency_token: None,
             })
-            .expect("embed");
+            .expect("embed")
+            .into_completed()
+            .unwrap();
         match response.usage {
-            Some(AdapterUsage::BillableUnits { billable_units }) => {
+            EmbeddingUsage::Metered {
+                usage: AdapterUsage::BillableUnits { billable_units },
+            } => {
                 assert_eq!(billable_units.len(), 1);
                 assert_eq!(billable_units[0].kind, BillableUnitKind::TokensIn);
                 assert_eq!(billable_units[0].count, 7);
@@ -752,8 +790,12 @@ mod tests {
             items: vec![item],
             idempotency_token: Some("intent-token-xyz".to_owned()),
         };
-        let response = adapter.embed(with_token_request).unwrap();
-        assert_eq!(response.vectors.len(), 1);
+        let response = adapter
+            .embed(with_token_request)
+            .unwrap()
+            .into_completed()
+            .unwrap();
+        assert_eq!(response.vectors().len(), 1);
     }
 
     #[test]
@@ -769,8 +811,10 @@ mod tests {
                 ],
                 idempotency_token: None,
             })
+            .unwrap()
+            .into_completed()
             .unwrap();
-        assert_eq!(response.vectors.len(), 2);
+        assert_eq!(response.vectors().len(), 2);
         assert_eq!(response.dimensions, 768);
         assert_eq!(response.distance, "cosine");
         assert_eq!(response.modality, "multimodal");

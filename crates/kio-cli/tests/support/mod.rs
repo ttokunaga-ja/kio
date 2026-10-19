@@ -1,5 +1,6 @@
 //! Shared temporary roots for CLI fixtures with private device state.
 
+#[allow(dead_code)]
 pub fn canonical_tempdir() -> tempfile::TempDir {
     // Resolve the system root before creation: macOS /var is a symlink.
     // Preserve each fixture's child paths, including deliberate symlink targets.
@@ -79,4 +80,38 @@ pub fn prepare_private_sqlite_sidecars(path: &std::path::Path) -> kio_core::Resu
     #[cfg(not(windows))]
     let _ = path;
     Ok(())
+}
+
+/// Inspect a completed CLI invocation without creating SQLite coordination files.
+/// Drop this snapshot before another invocation and reopen it for fresh assertions.
+#[allow(dead_code)]
+pub fn immutable_sqlite(path: impl AsRef<std::path::Path>) -> rusqlite::Connection {
+    let path = path.as_ref().canonicalize().unwrap();
+    let path = path.to_str().expect("fixture database path must be UTF-8");
+    // Canonical Windows paths use verbatim prefixes; SQLite file URIs use
+    // forward slashes, an empty authority and an absolute drive/UNC path.
+    let path = if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!("//{}", unc.replace('\\', "/"))
+    } else if let Some(verbatim) = path.strip_prefix(r"\\?\") {
+        format!("/{}", verbatim.replace('\\', "/"))
+    } else if path.as_bytes().get(1) == Some(&b':') {
+        format!("/{}", path.replace('\\', "/"))
+    } else {
+        path.to_owned()
+    };
+    let mut uri = String::from("file://");
+    for byte in path.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b':' | b'-' | b'_' | b'.' | b'~') {
+            uri.push(char::from(byte));
+        } else {
+            use std::fmt::Write;
+            write!(uri, "%{byte:02X}").unwrap();
+        }
+    }
+    uri.push_str("?mode=ro&immutable=1");
+    rusqlite::Connection::open_with_flags(
+        uri,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+    )
+    .unwrap()
 }

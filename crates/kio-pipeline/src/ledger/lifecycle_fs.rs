@@ -433,6 +433,91 @@ impl FsSession {
         self.revalidate_boundary()
     }
 
+    /// Immutable embedding recovery evidence. The caller supplies the exact
+    /// authority-bound locator; ordinary lifecycle artifact guards stay closed.
+    pub(super) fn create_embedding_artifact(&self, leaf: &Path, bytes: &[u8]) -> Result<()> {
+        require_leaf(leaf)?;
+        let name = leaf
+            .to_str()
+            .ok_or_else(|| contract("KIO-E-LEDGER-PATH-001", "invalid job locator"))?;
+        if !name.starts_with("embedding-job-") || !name.ends_with(".json") {
+            return Err(contract(
+                "KIO-E-LEDGER-PATH-001",
+                "invalid embedding job artifact",
+            ));
+        }
+        self.revalidate_boundary()?;
+        self.parent
+            .write_atomic(leaf, bytes, Publication::CreateOnly)
+            .map_err(core_private)?;
+        self.parent
+            .ensure_owner_private(leaf)
+            .map_err(core_private)?;
+        self.sync_parent()?;
+        self.revalidate_boundary()
+    }
+
+    pub(super) fn remove_embedding_artifact(
+        &self,
+        leaf: &Path,
+        bytes: &[u8],
+        max: u64,
+    ) -> Result<()> {
+        require_leaf(leaf)?;
+        let name = leaf
+            .to_str()
+            .ok_or_else(|| contract("KIO-E-LEDGER-PATH-001", "invalid job locator"))?;
+        if !name.starts_with("embedding-job-") || !name.ends_with(".json") {
+            return Err(contract(
+                "KIO-E-LEDGER-PATH-001",
+                "invalid embedding job artifact",
+            ));
+        }
+        self.revalidate_boundary()?;
+        self.parent
+            .ensure_owner_private(leaf)
+            .map_err(core_private)?;
+        self.parent
+            .quarantine_then_remove(leaf, bytes, max)
+            .map_err(core_private)?;
+        self.sync_parent()?;
+        self.revalidate_boundary()
+    }
+
+    /// The single bounded deferred-cleanup manifest for one ledger authority.
+    pub(super) fn write_embedding_cleanup_manifest(&self, leaf: &Path, bytes: &[u8]) -> Result<()> {
+        require_leaf(leaf)?;
+        let name = leaf
+            .to_str()
+            .ok_or_else(|| contract("KIO-E-LEDGER-PATH-001", "invalid cleanup locator"))?;
+        if !name.starts_with("embedding-cleanup-")
+            || !name.ends_with(".json")
+            || bytes.len() > 256 * 1024
+        {
+            return Err(contract(
+                "KIO-E-LEDGER-PATH-001",
+                "invalid embedding cleanup manifest",
+            ));
+        }
+        self.revalidate_boundary()?;
+        let publication = if self.parent.contains_entry(leaf).map_err(core_private)? {
+            self.parent
+                .ensure_owner_private(leaf)
+                .map_err(core_private)?;
+            Publication::Replace
+        } else {
+            Publication::CreateOnly
+        };
+        self.parent
+            .write_atomic(leaf, bytes, publication)
+            .map_err(core_private)?;
+        self.parent
+            .ensure_owner_private(leaf)
+            .map_err(core_private)?;
+        self.sync_parent()?;
+        self.revalidate_boundary()
+    }
+
     /// Replace an already-existing verified private leaf. This deliberately
     /// has no upsert behavior, so checkpoint loss remains distinguishable from
     /// an ordinary update and authority files cannot be silently recreated.

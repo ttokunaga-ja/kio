@@ -2,12 +2,15 @@
 
 use super::*;
 use crate::commands::IndexArgs;
-use crate::commands::{CommandRequest, InitArgs, RepairArgs, RepairOperation, RepairRebuildDbArgs};
+use crate::commands::{
+    CommandRequest, InitArgs, LedgerArgs, LedgerCommand, RepairArgs, RepairOperation,
+    RepairRebuildDbArgs,
+};
 use crate::context::{AppContext, Interaction};
 use crate::embedding::admission::declared_embedding_profile;
 use crate::embedding::admission::embedding_execution;
+use crate::embedding::batch::completed_batch_result;
 use crate::embedding::batch::embedding_job_input_hash;
-use crate::embedding::batch::validated_embedding_batch_vectors;
 use crate::embedding::executor::apply_embedding_transitions;
 use crate::embedding::executor::embedding_done_transition;
 use crate::embedding::executor::embedding_fail_transition;
@@ -94,6 +97,17 @@ fn private_tempdir() -> crate::test_support::PrivateTempDir {
 
 pub(super) fn isolated_child_for(test_name: &str) -> bool {
     if std::env::var_os(CHILD).is_some() {
+        let context = AppContext {
+            working_directory: std::env::current_dir().unwrap(),
+            interaction: Arc::new(QuietInteraction),
+        };
+        execute(
+            &context,
+            CommandRequest::Ledger(LedgerArgs {
+                command: Some(LedgerCommand::Init { resume: false }),
+            }),
+        )
+        .unwrap();
         return true;
     }
     let private = private_tempdir();
@@ -856,15 +870,44 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
 #[test]
 fn batch_result_admission_validates_all_keys_and_vectors_before_returning_any() {
     use kio_adapter::gemini_batch_client::GeminiBatchEmbedOutput;
+    use kio_adapter::types::EmbeddingLogicalJobId;
+    use kio_pipeline::ledger::embedding_job::{
+        EmbeddingJob, EmbeddingJobBinding, EmbeddingJobMember,
+    };
+    use kio_pipeline::task::EmbeddingTaskTarget;
     let first = hash_bytes(b"first contextual input");
     let second = hash_bytes(b"second contextual input");
     let input_hash = embedding_job_input_hash(&BTreeSet::from([first.clone(), second.clone()]));
-    let profile = DeclaredEmbeddingProfile {
-        tool_id: "test".to_owned(),
-        dimensions: 3,
-        distance: "cosine".to_owned(),
-        modality: "multimodal".to_owned(),
-        profile_hash: hash_bytes(b"profile"),
+    let profile_hash = hash_bytes(b"profile");
+    let job = EmbeddingJob {
+        key: kio_pipeline::ledger::TaskKey::new(
+            "scope_test",
+            "embedding",
+            input_hash.clone(),
+            profile_hash.clone(),
+        ),
+        submission_seq: 1,
+        intent_token: "test_token".to_owned(),
+        binding: EmbeddingJobBinding {
+            logical_job_id: EmbeddingLogicalJobId(input_hash),
+            local: false,
+            dimensions: 3,
+            distance: "cosine".to_owned(),
+            modality: "multimodal".to_owned(),
+            members: [first.clone(), second.clone()]
+                .into_iter()
+                .map(|id| EmbeddingJobMember {
+                    target: EmbeddingTaskTarget::Chunk {
+                        chunk_hash: id.clone(),
+                        embedding_hash: id.clone(),
+                        profile_hash: profile_hash.clone(),
+                        input_hash: id.clone(),
+                    },
+                    id,
+                })
+                .collect(),
+        },
+        known_result: None,
     };
     let output = |key: &str| GeminiBatchEmbedOutput {
         key: key.to_owned(),
@@ -873,20 +916,26 @@ fn batch_result_admission_validates_all_keys_and_vectors_before_returning_any() 
         prompt_tokens: Some(1),
     };
     let valid = vec![output(&first), output(&second)];
-    let accepted = validated_embedding_batch_vectors(&valid, &input_hash, Some(&profile)).unwrap();
-    assert_eq!(accepted.len(), 2);
-    assert_eq!(accepted[&first], vec![1.0, 0.0, 0.0]);
+    let accepted = completed_batch_result(&job, &valid).unwrap();
+    assert_eq!(accepted.members.len(), 2);
+    assert_eq!(accepted.members[0].id, first);
+    assert!(
+        matches!(&accepted.members[0].result, kio_adapter::types::EmbeddingMemberResult::Vector { vector } if vector == &vec![1.0, 0.0, 0.0])
+    );
     let mut reversed = valid.clone();
     reversed.reverse();
-    assert_eq!(
-        validated_embedding_batch_vectors(&reversed, &input_hash, Some(&profile)).unwrap(),
-        accepted
-    );
-    assert!(
-        validated_embedding_batch_vectors(&valid, &input_hash, None)
-            .unwrap()
-            .is_empty()
-    );
+    let accepted_by_id = accepted
+        .members
+        .iter()
+        .map(|member| (member.id.clone(), member.result.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let reversed_by_id = completed_batch_result(&job, &reversed)
+        .unwrap()
+        .members
+        .into_iter()
+        .map(|member| (member.id, member.result))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(reversed_by_id, accepted_by_id);
 
     let mut malformed = vec![
         vec![],
@@ -910,10 +959,18 @@ fn batch_result_admission_validates_all_keys_and_vectors_before_returning_any() 
     malformed.push(conflicting_error);
     for results in malformed {
         assert!(
-            validated_embedding_batch_vectors(&results, &input_hash, Some(&profile)).is_err(),
+            completed_batch_result(&job, &results).is_err(),
             "must not return the valid first line when a later line fails: {results:?}"
         );
     }
+    let mut failed_member = valid;
+    failed_member[1].values = None;
+    failed_member[1].error = Some(json!({"code": "invalid"}));
+    let partial = completed_batch_result(&job, &failed_member).unwrap();
+    assert!(matches!(
+        partial.members[1].result,
+        kio_adapter::types::EmbeddingMemberResult::Failed { .. }
+    ));
 }
 
 #[test]
@@ -947,7 +1004,7 @@ fn contextual_task_mixed_outcomes_crash_recovery_and_retry_are_independent() {
     assert_ne!(work[0].work_key, work[1].work_key);
     let store = TaskStore::new(repo.kio_dir());
     let now = "2026-09-26T00:00:00Z";
-    enqueue_embedding_tasks(&store, &repo, &work, true, now).unwrap();
+    enqueue_embedding_tasks(&store, &repo, &work, &profile, true, now).unwrap();
     let mut transitions = BTreeMap::new();
     record_embedding_transitions(&mut transitions, [&work[0]], embedding_done_transition());
     record_embedding_transitions(
@@ -1042,7 +1099,8 @@ fn contextual_task_mixed_outcomes_crash_recovery_and_retry_are_independent() {
         })
         .unwrap();
     let retry =
-        filter_embeddable_by_task_state(&store, work[1..].to_vec(), false, &control).unwrap();
+        filter_embeddable_by_task_state(&store, work[1..].to_vec(), &profile, false, &control)
+            .unwrap();
     assert_eq!(retry.len(), 1);
     assert_eq!(retry[0].work_key, work[1].work_key);
 
@@ -1057,9 +1115,11 @@ fn contextual_task_mixed_outcomes_crash_recovery_and_retry_are_independent() {
         })
         .unwrap();
     let before = fs::read(repo.kio_dir().join("tasks.jsonl")).unwrap();
-    assert!(validate_embedding_task_bindings(&store, &work).is_err());
-    assert!(filter_embeddable_by_task_state(&store, work.clone(), false, &control).is_err());
-    assert!(enqueue_embedding_tasks(&store, &repo, &work, true, now).is_err());
+    assert!(validate_embedding_task_bindings(&store, &work, &profile).is_err());
+    assert!(
+        filter_embeddable_by_task_state(&store, work.clone(), &profile, false, &control).is_err()
+    );
+    assert!(enqueue_embedding_tasks(&store, &repo, &work, &profile, true, now).is_err());
     assert_eq!(
         fs::read(repo.kio_dir().join("tasks.jsonl")).unwrap(),
         before

@@ -24,7 +24,8 @@ use crate::{
 
 const CORPUS_MANIFEST: &str = "corpus-manifest.json";
 const MAX_OBSERVED_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_REPLAY_SUBPROCESSES: usize = 62;
+// One explicit device ledger setup, followed by the 62 frozen replay commands.
+const MAX_REPLAY_SUBPROCESSES: usize = 63;
 
 #[derive(Debug, Error)]
 pub enum ReplayError {
@@ -80,6 +81,19 @@ pub fn replay_history(corpus: &Path, bin: &Path) -> Result<ReplaySummary, Replay
     let mut verified = BTreeMap::new();
     let mut initialized = BTreeSet::new();
     let mut initialized_authorities = BTreeMap::new();
+    let first_scope = plan
+        .scopes
+        .first()
+        .and_then(|name| boundary.scope(name))
+        .ok_or_else(|| ReplayError::Input("missing first bound scope for ledger setup".into()))?;
+    command_context.run(
+        "ledger_init",
+        first_scope,
+        &["--json", "ledger", "init"],
+        &expected,
+        &initialized,
+        &initialized_authorities,
+    )?;
     for scope_name in &plan.scopes {
         let scope = boundary
             .scope(scope_name)
@@ -579,7 +593,7 @@ fn validate_result(
     let value = object(output, command)?;
     let status = value.get("status").and_then(Value::as_str);
     match command {
-        "init" if status == Some("initialized") => Ok(()),
+        "init" | "ledger_init" if status == Some("initialized") => Ok(()),
         "index" if status == Some("indexed") => {
             if value.get("failed_files").and_then(Value::as_u64) != Some(0)
                 || value.get("network_allowed").and_then(Value::as_bool) != Some(false)
@@ -1000,6 +1014,10 @@ mod tests {
             br##"#!/bin/sh
 set -eu
 case "${2-}" in
+  ledger)
+    [ "${3-}" = init ] || exit 10
+    printf '%s\n' '{"status":"initialized"}'
+    ;;
   init)
     mkdir .kio
     : > .kio/config.toml
@@ -1036,8 +1054,12 @@ count=0
 if [ -f "$counter" ]; then read -r count < "$counter"; fi
 count=$((count + 1))
 printf '%s\n' "$count" > "$counter"
-if [ "$count" -eq 4 ]; then exit 9; fi
+if [ "$count" -eq 5 ]; then exit 9; fi
 case "${2-}" in
+  ledger)
+    [ "${3-}" = init ] || exit 10
+    printf '%s\n' '{"status":"initialized"}'
+    ;;
   init)
     mkdir .kio
     : > .kio/config.toml

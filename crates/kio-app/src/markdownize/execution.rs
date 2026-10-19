@@ -1251,6 +1251,7 @@ pub(crate) fn task_descriptor(
     TaskDescriptor {
         task_id: format!("task_{}", new_ulid(repo.canonical_root())),
         task_type,
+        embedding_target: None,
         mode,
         input_path: candidate.input_path.clone(),
         input_hash: input_hash.to_owned(),

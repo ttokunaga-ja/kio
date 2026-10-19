@@ -140,6 +140,7 @@ pub(crate) fn embedding_tool_lock_entry(
 pub(crate) fn embedding_execution_labels(mode: ExecutionMode) -> (&'static str, &'static str) {
     match mode {
         ExecutionMode::OnlineApi => ("online_api", "online"),
+        ExecutionMode::NativeLibrary => ("native_library", "offline"),
         ExecutionMode::OfflineApi => ("offline_api", "offline"),
         ExecutionMode::DeterministicLibrary => ("deterministic_library", "deterministic"),
     }

@@ -116,7 +116,8 @@ impl Outcome {
 
 /// The 4-tuple task identity shared by `cost_ledger` and `batch_requests` (§5.5
 /// task identity key, reused verbatim as the ledger row key — 04 §5.4).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TaskKey {
     pub scope_id: String,
     pub adapter_kind: String,

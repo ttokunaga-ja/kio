@@ -8,6 +8,7 @@ use crate::markdownize::batch::poll_one_batch_markdownize_row;
 use kio_adapter::batch_client::BatchJobStatus;
 use kio_adapter::batch_client::MistralBatchClient;
 use kio_adapter::catalog::standard_online_markdownize_profile;
+use kio_adapter::types::{EmbeddingOutcome, EmbeddingRemoteHandle};
 use kio_core::scope::Repository;
 use kio_pipeline::ledger::BatchRequestRow;
 use kio_pipeline::ledger::LedgerDb;
@@ -54,17 +55,17 @@ impl GeminiBatchClient for GeminiClient {
     fn provider_scope_id(&self) -> kio_adapter::Result<String> {
         self.scope.clone().ok_or_else(unreadable)
     }
-    fn create_embedding_job(
+    fn submit_job(
         &self,
         _: &str,
         _: u32,
         _: &str,
         _: &[GeminiBatchEmbedInput],
-    ) -> kio_adapter::Result<GeminiBatchJobRecord> {
+    ) -> kio_adapter::Result<EmbeddingOutcome> {
         panic!("recovery must not create jobs")
     }
-    fn poll_job(&self, name: &str) -> kio_adapter::Result<GeminiBatchPoll> {
-        assert_eq!(name, "batches/recorded");
+    fn poll_job(&self, name: &EmbeddingRemoteHandle) -> kio_adapter::Result<GeminiBatchPoll> {
+        assert_eq!(name.as_str(), "batches/recorded");
         self.polls.set(self.polls.get() + 1);
         Ok(GeminiBatchPoll {
             record: self.record.clone(),
@@ -125,12 +126,14 @@ fn gemini_collection_requires_scope_profile_and_returned_job_attribution() {
                 )
             },
             record: GeminiBatchJobRecord {
-                name: if case == "wrong_job" {
-                    "batches/foreign"
-                } else {
-                    "batches/recorded"
-                }
-                .into(),
+                name: EmbeddingRemoteHandle(
+                    if case == "wrong_job" {
+                        "batches/foreign"
+                    } else {
+                        "batches/recorded"
+                    }
+                    .to_owned(),
+                ),
                 display_name: batch_display_name(if case == "wrong_token" {
                     "foreign-token"
                 } else {
@@ -242,6 +245,7 @@ fn markdown_task(row: &BatchRequestRow) -> TaskDescriptor {
     TaskDescriptor {
         task_id: "task_recovery".into(),
         task_type: TaskType::Markdownize,
+        embedding_target: None,
         mode: Some(MarkdownizeMode::Full),
         input_path: "report.pdf".into(),
         input_hash: row.key.input_hash.clone(),
@@ -604,7 +608,7 @@ fn credential_or_device_key_rotation_holds_existing_rows_without_provider_effect
         let gemini = GeminiClient {
             scope: Some(current.1),
             record: GeminiBatchJobRecord {
-                name: "batches/recorded".into(),
+                name: EmbeddingRemoteHandle("batches/recorded".to_owned()),
                 display_name: batch_display_name(row.intent_token.as_deref().unwrap()),
                 state: GeminiBatchState::Succeeded,
                 responses_file: None,

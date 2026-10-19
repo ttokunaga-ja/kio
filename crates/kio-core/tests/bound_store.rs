@@ -32,6 +32,15 @@ fn embedding() -> EmbeddingObject {
         distance: "cosine".to_owned(),
         context: None,
         vector: vec![1.0, 0.0],
+        metadata: kio_core::cas::EmbeddingMetadata {
+            record_format: 2,
+            producer: kio_core::cas::ProducerProvenance::non_native(
+                kio_core::cas::ProducerExecutionMode::DeterministicLibrary,
+                &format!("sha256:{}", "e".repeat(64)),
+            )
+            .unwrap(),
+            image_input_receipt: None,
+        },
     }
 }
 
