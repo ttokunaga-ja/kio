@@ -395,7 +395,7 @@ pub(crate) const RETIRED_NON_LIVE: &str = "retired_non_live";
 /// query-embedding row (§H, `compute_query_embedding`) resolves the effective
 /// timeout per §M note-2's config-layer rule; TASK rows use this fixed default
 /// instead — the same "conservative fixed constant, not a live adapter-config
-/// re-read" posture `estimate_online_markdownize_cost`/`estimate_embedding_cost`
+/// re-read" posture `estimate_online_markdownize_cost`/`embedding_text_reservation`
 /// already use for the *amount* side of the charge. Flagged in the
 /// implementation report as unfinished per-scope timeout resolution for task rows.
 pub(crate) const TASK_SYNC_EFFECTIVE_TIMEOUT_SECONDS: i64 = 300;

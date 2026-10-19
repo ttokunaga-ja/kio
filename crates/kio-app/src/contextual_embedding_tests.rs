@@ -384,7 +384,13 @@ fn rename_retains_contexts_and_rebuild_selects_allowed_head_then_history() {
     for (hash, text_hash, stored_context, vector) in &renamed.sources {
         let object = repo.object_store().read_embedding(hash).unwrap();
         assert_eq!(&object.target_hash, text_hash);
-        assert_eq!(&object.context, stored_context);
+        assert_eq!(
+            object
+                .context
+                .as_ref()
+                .and_then(kio_core::cas::EmbeddingContext::as_text),
+            stored_context.as_deref()
+        );
         assert_eq!(&f32_to_le_bytes(&object.vector), vector);
     }
     assert_ne!(
@@ -913,7 +919,14 @@ fn batch_result_admission_validates_all_keys_and_vectors_before_returning_any() 
         key: key.to_owned(),
         values: Some(vec![2.0, 0.0, 0.0]),
         error: None,
-        prompt_tokens: Some(1),
+        usage: kio_adapter::types::EmbeddingUsage::Metered {
+            usage: kio_adapter::types::AdapterUsage::BillableUnits {
+                billable_units: vec![kio_adapter::types::BillableUnit {
+                    kind: kio_adapter::types::BillableUnitKind::TokensIn,
+                    count: 1,
+                }],
+            },
+        },
     };
     let valid = vec![output(&first), output(&second)];
     let accepted = completed_batch_result(&job, &valid).unwrap();

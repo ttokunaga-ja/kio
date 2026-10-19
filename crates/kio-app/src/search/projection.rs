@@ -187,6 +187,21 @@ pub(crate) fn replica_candidates_for(
             .expect("candidate scope participates in the current policy set");
         let mut bindings = Vec::with_capacity(row.bindings.len());
         for binding in row.bindings {
+            if let ResultPayload::Image { image_hash, .. } = &payload
+                && !image_authorities
+                    .get(&row.scope_id)
+                    .expect("candidate scope has current image authority")
+                    .unit_owns_image(
+                        &binding.raw_hash,
+                        &binding.tool_profile_hash,
+                        binding.r#gen,
+                        &binding.manifest_hash,
+                        &row.unit_key,
+                        image_hash,
+                    )
+            {
+                continue;
+            }
             let current_paths = redact_current_policy_paths(policy, binding.current_paths)
                 .map_err(|error| format!("current policy path redaction failed: {error}"))?;
             bindings.push(SearchHistoryBinding {
@@ -199,6 +214,12 @@ pub(crate) fn replica_candidates_for(
                 current_paths,
                 is_live: binding.is_live,
             });
+        }
+        // Old replica rows may predate unit-level image reference authority.
+        // They cannot provide an image Evidence Pointer until rebuilt from
+        // an authenticated owning unit.
+        if matches!(&payload, ResultPayload::Image { .. }) && bindings.is_empty() {
+            continue;
         }
         let text_term = row
             .text_rank
@@ -562,13 +583,20 @@ fn collect_scope_projection(
         }
     }
 
-    // Image vectors remain attached to every committed citing chunk. At query
-    // time the same eligible chunk binding gates the image reference, so a
-    // historical image never needs a second visibility rule. The strict
-    // source-index schema guarantees that `image_vec` is present.
+    // Only a citing chunk's own pinned normalized unit may provide an image
+    // Evidence Pointer. A globally owned hash cannot authorize arbitrary
+    // user-written links in another unit. Query-time bindings retain the same
+    // exact manifest check for current and historical selectors.
     let mut image_vectors = BTreeMap::<String, Option<Vec<f32>>>::new();
     let mut seen_references = BTreeSet::<(String, String)>::new();
     let mut images = Vec::new();
+    let mut image_bindings = BTreeMap::<&str, Vec<&kio_index::aggregator::AggBinding>>::new();
+    for binding in &bindings {
+        image_bindings
+            .entry(binding.chunk_id.as_str())
+            .or_default()
+            .push(binding);
+    }
     for chunk in &chunks {
         for image in extract_related_images(&chunk.text) {
             let Some(image_id) =
@@ -576,6 +604,23 @@ fn collect_scope_projection(
             else {
                 continue;
             };
+            if !image_bindings
+                .get(chunk.chunk_id.as_str())
+                .is_some_and(|owners| {
+                    owners.iter().any(|binding| {
+                        image_authority.unit_owns_image(
+                            &binding.raw_hash,
+                            &binding.tool_profile_hash,
+                            binding.r#gen,
+                            &binding.manifest_hash,
+                            &chunk.unit_key,
+                            &image_id,
+                        )
+                    })
+                })
+            {
+                continue;
+            }
             // `agg_image_refs` has one reference per image/chunk pair. Keep
             // the first URI deterministically if malformed non-canonical content
             // happens to name the same image twice with different authorities.

@@ -5,7 +5,8 @@ mod embedding_format_tests;
 
 mod embedding_metadata;
 pub use embedding_metadata::{
-    EmbeddingMetadata, ImageInputReceipt, ProducerExecutionMode, ProducerProvenance,
+    EmbeddingContext, EmbeddingMetadata, ImageInputReceipt, ProducerExecutionMode,
+    ProducerProvenance,
 };
 
 mod bound;
@@ -182,11 +183,9 @@ pub struct EmbeddingObject {
     pub modality: String,
     pub dimensions: u64,
     pub distance: String,
-    /// 07 §5.3's contextual-embedding addendum (2026-07-24): the humanized
-    /// filename prefix folded into the adapter INPUT, and therefore into the
-    /// identity. `None` omits the key entirely rather than writing a JSON null,
-    /// so a non-chunk target hashes byte-for-byte as it did before the addendum.
-    pub context: Option<String>,
+    /// Chunk filename text or a converted-image receipt digest (03 §8.1).
+    /// `None` omits the key entirely, preserving original image/text identity.
+    pub context: Option<EmbeddingContext>,
     pub vector: Vec<f32>,
     pub metadata: EmbeddingMetadata,
 }
@@ -205,7 +204,7 @@ impl EmbeddingObject {
         modality: &str,
         dimensions: u64,
         distance: &str,
-        context: Option<&str>,
+        context: Option<&EmbeddingContext>,
     ) -> Value {
         let mut value = Map::new();
         value.insert("dimensions".to_owned(), Value::from(dimensions));
@@ -216,7 +215,13 @@ impl EmbeddingObject {
         value.insert("target_hash".to_owned(), Value::from(target_hash));
         value.insert("target_type".to_owned(), Value::from(target_type));
         if let Some(context) = context {
-            value.insert("context".to_owned(), Value::from(context));
+            let context = match context {
+                EmbeddingContext::Text(text) => Value::from(text.clone()),
+                EmbeddingContext::Image { image_input_hash } => {
+                    serde_json::json!({ "image_input_hash": image_input_hash })
+                }
+            };
+            value.insert("context".to_owned(), context);
         }
         Value::Object(value)
     }
@@ -231,7 +236,7 @@ impl EmbeddingObject {
             &self.modality,
             self.dimensions,
             &self.distance,
-            self.context.as_deref(),
+            self.context.as_ref(),
         ))
     }
 
@@ -245,7 +250,7 @@ impl EmbeddingObject {
             &self.modality,
             self.dimensions,
             &self.distance,
-            self.context.as_deref(),
+            self.context.as_ref(),
         ))?;
         let vector_bytes = vector_to_le_bytes(&self.vector);
         let mut out = header;
@@ -340,8 +345,11 @@ impl EmbeddingObject {
             distance: string("distance")?,
             context: object
                 .get("context")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+                .map(|context| {
+                    serde_json::from_value(context.clone())
+                        .map_err(|error| embedding_corrupt_error(&error.to_string(), None))
+                })
+                .transpose()?,
             vector,
             metadata,
         };
@@ -385,7 +393,12 @@ impl EmbeddingObject {
                 None,
             ));
         }
-        self.metadata.validate(&self.profile_hash)?;
+        self.metadata.validate(
+            &self.profile_hash,
+            &self.target_type,
+            &self.target_hash,
+            self.context.as_ref(),
+        )?;
         if self.dimensions == 0 || self.vector.len() as u64 != self.dimensions {
             return Err(embedding_corrupt_error(
                 "embedding vector length must equal its declared dimensions",
@@ -2246,7 +2259,7 @@ mod tests {
             modality: "multimodal".to_owned(),
             dimensions: vector.len() as u64,
             distance: "cosine".to_owned(),
-            context: Some("recovery window".to_owned()),
+            context: Some(EmbeddingContext::Text("recovery window".to_owned())),
             vector,
             metadata: EmbeddingMetadata {
                 record_format: 2,
@@ -2489,7 +2502,7 @@ mod tests {
         );
 
         let mut other_context = base.clone();
-        other_context.context = Some("control coverage".to_owned());
+        other_context.context = Some(EmbeddingContext::Text("control coverage".to_owned()));
         assert_ne!(
             base.identity_hash().unwrap(),
             other_context.identity_hash().unwrap()

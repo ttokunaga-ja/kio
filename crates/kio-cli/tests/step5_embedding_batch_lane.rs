@@ -230,9 +230,10 @@ fn success_script(job: &str, key: &str) -> String {
             "metadata": { "key": key },
             "output": { "response": {
                 "embedding": { "values": values },
-                // The live endpoint reports this per line; the fixture must
-                // too, or the settlement path it drives is never exercised.
-                "usageMetadata": { "promptTokenCount": 40 },
+                // Complete per-member TEXT metering exercises measured Batch
+                // settlement under docs07 §5.3; a scalar total is incomplete.
+                "usageMetadata": { "promptTokenCount": 40,
+                    "promptTokenDetails": [{"modality": "TEXT", "tokenCount": 40}] },
             } },
         }],
     })
@@ -736,10 +737,9 @@ fn realtime_uses_the_synchronous_lane_and_never_creates_a_batch_row() {
 /// every realtime chunk embed fell back to a reservation that I10 measured at
 /// -32%..+52%. One call per row removes the question instead of answering it.
 ///
-/// The inputs are pure ASCII, where `estimate_embedding_tokens` counts one
-/// token per 4 scalars and the mock reports one per scalar — so a settled row
-/// is exactly 4x its own reservation, and "did it settle on the measurement"
-/// has an arithmetic answer rather than an approximate one.
+/// The authoritative typed mock reports one token per contextualized input
+/// scalar. Each row must settle on that exact count at the Standard text rate,
+/// while its separate reservation remains the full 8,192-token upper bound.
 #[test]
 fn every_row_of_a_realtime_pass_settles_on_its_own_reported_tokens() {
     let dir = fixture_dir();
@@ -783,20 +783,100 @@ fn every_row_of_a_realtime_pass_settles_on_its_own_reported_tokens() {
         "a per-call row is measured, not estimated"
     );
 
-    // Row by row, not just in aggregate: an apportioned split could match the
-    // total while getting every individual row wrong.
-    // `ledger_query` reads column 0 as TEXT, so a bare COUNT(*) comes back
-    // empty and would pass every comparison it is given.
-    let mismatched = ledger_query(
-        &dir,
-        "SELECT printf('%d', COUNT(*)) FROM cost_ledger l
-         JOIN batch_requests b USING (scope_id, adapter_kind, input_hash, tool_profile_hash)
-         WHERE l.adapter_kind = 'embedding'
-           AND abs(l.usd - b.estimated_usd * 4.0) > 1e-12",
-    );
-    assert_eq!(
-        mismatched, "0",
-        "every row must settle at 4x its OWN reservation"
+    // Derive each expected charge from that fixture member's canonical input,
+    // not its reservation or a share of any aggregate measured cost.
+    let source = support::immutable_sqlite(root(&dir).join(".kio/index/sqlite.db"));
+    let chunks = source
+        .prepare("SELECT DISTINCT text_hash, raw_path, text FROM chunks ORDER BY raw_path")
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    let profile = kio_adapter::catalog::adopted_embedding_profile();
+    let mut expected = std::collections::BTreeMap::new();
+    const TEXT_USD_PER_TOKEN: f64 = 0.20 / 1_000_000.0;
+    for (text_hash, path, text) in chunks {
+        assert!(["alpha.md", "beta.md", "gamma.md"].contains(&path.as_str()));
+        let context = kio_index::embedding_store::chunk_embedding_context(&path);
+        let input =
+            kio_index::embedding_store::contextualized_embedding_input(context.as_deref(), &text);
+        assert!(
+            input.is_ascii(),
+            "this fixture's measured units are explicit ASCII scalar counts"
+        );
+        let units = input.chars().count() as u64;
+        assert!(units > 0 && units <= 8192);
+        let context = context.map(kio_core::cas::EmbeddingContext::Text);
+        let identity = kio_index::embedding_store::embedding_hash(
+            kio_index::EmbeddingTargetType::Chunk,
+            &text_hash,
+            768,
+            kio_index::EmbeddingDistance::Cosine,
+            kio_index::EmbeddingModality::Multimodal,
+            &profile.tool_profile_hash,
+            context.as_ref(),
+        )
+        .unwrap();
+        assert!(
+            expected
+                .insert(identity, units as f64 * TEXT_USD_PER_TOKEN)
+                .is_none()
+        );
+    }
+    drop(source);
+    assert_eq!(expected.len(), executed as usize);
+    let ledger = support::immutable_sqlite(dir.path().join("home/data/kio/cost-ledger.sqlite"));
+    let rows = ledger
+        .prepare(
+            "SELECT b.input_hash, b.estimated_usd, l.outcome, l.estimated, l.usd, b.request_kind
+         FROM cost_ledger l JOIN batch_requests b
+         USING (scope_id, adapter_kind, input_hash, tool_profile_hash)
+         WHERE l.adapter_kind='embedding' AND l.scope_id<>'device'",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, bool>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), executed as usize);
+    for (identity, reserved, outcome, estimated, settled, kind) in rows {
+        let member_usd = expected
+            .remove(&identity)
+            .expect("each physical row must name an exact fixture member");
+        assert_eq!(outcome, "succeeded");
+        assert_eq!(kind, "sync");
+        assert!(
+            !estimated,
+            "{identity}: a complete typed invoice must be measured"
+        );
+        assert!(
+            (reserved - 8192.0 * TEXT_USD_PER_TOKEN).abs() < 1e-12,
+            "{identity}: reservation must use the member upper bound"
+        );
+        assert!(
+            (settled - member_usd).abs() < 1e-12,
+            "{identity}: settlement must equal this member's exact reported units, not an apportioned share"
+        );
+    }
+    assert!(
+        expected.is_empty(),
+        "every fixture member must have its own measured row"
     );
 }
 
@@ -1005,7 +1085,8 @@ fn partial_batch_result_publishes_valid_member_and_retries_only_failed_member() 
                 "metadata": { "key": keys[0] },
                 "output": { "response": {
                     "embedding": { "values": vec![component; 768] },
-                    "usageMetadata": { "promptTokenCount": 40 },
+                    "usageMetadata": { "promptTokenCount": 40,
+                        "promptTokenDetails": [{"modality": "TEXT", "tokenCount": 40}] },
                 } },
             },
             {

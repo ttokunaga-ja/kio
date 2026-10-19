@@ -55,3 +55,45 @@ fn o1_skipped_status_is_distinct_and_cannot_complete_from_cached_output() {
     assert!(!task_can_complete_from_materialized_output(&task));
     assert_eq!(serde_json::to_value(skipped).unwrap(), json!("skipped"));
 }
+
+#[test]
+fn o2_converted_image_task_round_trips_bound_receipt_and_input_identity() {
+    use kio_core::cas::ImageInputReceipt;
+    let hash = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+    let receipt = ImageInputReceipt {
+        source_hash: hash('a'),
+        source_mime: "image/webp".to_owned(),
+        sent_hash: hash('b'),
+        sent_mime: "image/png".to_owned(),
+        transcoder_pin: "kio_image_png_v1/test-codec-pin".to_owned(),
+    };
+    let input_hash = receipt.image_input_hash().unwrap();
+    let mut wire = markdownize_task();
+    wire["type"] = json!("embedding");
+    wire["mode"] = Value::Null;
+    wire["bbox_annotation_enabled"] = Value::Null;
+    wire["input_hash"] = json!(input_hash);
+    wire["changed_unit_keys"] = json!([hash('a')]);
+    wire["output_ref"] = json!(format!("embedding-image:{}/{}", hash('a'), hash('c')));
+    wire["embedding_target"] = json!({
+        "kind":"image", "image_hash":hash('a'), "embedding_hash":hash('c'),
+        "profile_hash":hash('d'), "input_hash":input_hash,
+        "image_input_receipt":receipt,
+    });
+    let task: TaskDescriptor = serde_json::from_value(wire.clone())
+        .expect("converted input receipt must survive typed task persistence");
+    assert_eq!(serde_json::to_value(task).unwrap(), wire);
+    for mutation in ["source", "input"] {
+        let mut invalid = wire.clone();
+        if mutation == "source" {
+            invalid["embedding_target"]["image_input_receipt"]["source_hash"] = json!(hash('e'));
+        } else {
+            invalid["embedding_target"]["input_hash"] = json!(hash('e'));
+            invalid["input_hash"] = json!(hash('e'));
+        }
+        assert!(
+            serde_json::from_value::<TaskDescriptor>(invalid).is_err(),
+            "{mutation}"
+        );
+    }
+}

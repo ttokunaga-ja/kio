@@ -16,6 +16,7 @@ use crate::deterministic_embedding::{
 };
 #[cfg(debug_assertions)]
 use crate::gemini_embedding::GeminiEmbeddingClient;
+pub use crate::gemini_embedding::validate_gemini_sync_inputs;
 use crate::gemini_embedding::{ADOPTED_DIMENSIONS, ADOPTED_MODEL_PIN, GeminiEmbeddingAdapter};
 use crate::local_embedding::{
     LOCAL_EMBEDDING_DEFAULT_MODEL, LocalEmbeddingAdapter, LocalEmbeddingExecution,
@@ -1567,31 +1568,31 @@ impl GeminiEmbeddingClient for MockAdoptedEmbeddingClient {
                     },
                 })
                 .collect(),
-            // I12: this used to be `None` on the reasoning that "a mock cannot
-            // invent a provider's token count". The live endpoint always
-            // returns `usageMetadata.promptTokenCount`, so a seam that reports
-            // nothing is not the honest case — it is a shape the provider never
-            // sends, and it silently pins every mock-driven settlement to the
-            // degrade-to-estimate branch. That is the I3 failure again: a mock
-            // that disagrees with the wire makes its own tests vacuous. The
-            // count is derived from the input so it is deterministic and moves
-            // when the input does; `AdoptedEmbeddingExecution::NoUsageReport`
-            // still exercises the degrade path deliberately.
-            prompt_tokens: (self.execution != AdoptedEmbeddingExecution::NoUsageReport).then(
-                || {
-                    items
-                        .iter()
-                        .map(|item| match &item.content {
-                            crate::types::EmbeddingContent::Text { text } => {
-                                text.chars().count() as u64
-                            }
-                            crate::types::EmbeddingContent::Image { bytes, .. } => {
-                                bytes.len() as u64
-                            }
-                        })
-                        .sum()
-                },
-            ),
+            usage: if self.execution == AdoptedEmbeddingExecution::NoUsageReport {
+                crate::types::EmbeddingUsage::Estimated
+            } else {
+                crate::types::EmbeddingUsage::Metered {
+                    usage: crate::types::AdapterUsage::BillableUnits {
+                        billable_units: items
+                            .iter()
+                            .map(|item| match &item.content {
+                                crate::types::EmbeddingContent::Text { text } => {
+                                    crate::types::BillableUnit {
+                                        kind: crate::types::BillableUnitKind::TokensIn,
+                                        count: text.chars().count() as u64,
+                                    }
+                                }
+                                crate::types::EmbeddingContent::Image { bytes, .. } => {
+                                    crate::types::BillableUnit {
+                                        kind: crate::types::BillableUnitKind::ImageTokensIn,
+                                        count: (bytes.len() as u64).min(8192),
+                                    }
+                                }
+                            })
+                            .collect(),
+                    },
+                }
+            },
         })
     }
 }
@@ -1748,11 +1749,16 @@ mod tests {
 
     #[test]
     fn run_adopted_embedding_mock_errors_are_classified() {
+        // Exercise provider errors with a valid query member; an empty member
+        // set fails local request validation before reaching the mock client.
         assert!(matches!(
             run_adopted_embedding(
                 Arc::new(AdapterRuntimeSettings::default()),
                 AdoptedEmbeddingExecution::AuthError,
-                Vec::new(),
+                vec![EmbeddingItem::text(
+                    "query-fixture",
+                    "valid classification query"
+                )],
                 EmbeddingInputType::Query,
                 None,
             ),
@@ -1762,7 +1768,10 @@ mod tests {
             run_adopted_embedding(
                 Arc::new(AdapterRuntimeSettings::default()),
                 AdoptedEmbeddingExecution::RateLimit,
-                Vec::new(),
+                vec![EmbeddingItem::text(
+                    "query-fixture",
+                    "valid classification query"
+                )],
                 EmbeddingInputType::Query,
                 None,
             ),

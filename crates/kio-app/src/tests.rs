@@ -822,9 +822,8 @@ use kio_index::ChunkRow;
 
 use crate::embedding::admission::LaneOverride;
 use crate::embedding::admission::effective_invocation_lane;
+use crate::embedding::admission::embedding_text_reservation;
 use crate::embedding::admission::embedding_usd_per_token;
-use crate::embedding::admission::estimate_embedding_cost;
-use crate::embedding::admission::estimate_embedding_tokens;
 use crate::embedding::admission::lane_rate;
 use crate::embedding::admission::query_embedding_send_lane;
 use crate::embedding::admission::realtime_lane_requested;
@@ -3058,17 +3057,6 @@ fn the_invocation_lane_defaults_to_batch() {
 }
 
 #[test]
-fn embedding_token_estimate_counts_cjk_at_one_token_per_char() {
-    // 4 Latin chars ≈ 1 token; 4 CJK scalars ≈ 4 tokens. The old
-    // `chars / 4` rule charged the Japanese case at a quarter of its cost.
-    assert!((estimate_embedding_tokens("abcd") - 1.0).abs() < 1e-9);
-    assert!((estimate_embedding_tokens("日本語だ") - 4.0).abs() < 1e-9);
-    // Mixed text adds the two ratios rather than picking one.
-    assert!((estimate_embedding_tokens("abcd日本語だ") - 5.0).abs() < 1e-9);
-    assert!(estimate_embedding_tokens("").abs() < 1e-9);
-}
-
-#[test]
 fn embedding_rate_is_lane_aware_and_batch_is_half_of_sync() {
     let adapter_settings =
         &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
@@ -3129,17 +3117,12 @@ fn a_batch_rate_is_never_above_the_sync_rate_for_any_declared_price() {
 }
 
 #[test]
-fn embedding_cost_multiplies_the_token_estimate_by_the_lane_rate() {
-    let adapter_settings =
-        &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
-
-    // 1M Latin chars ≈ 250k tokens → $0.05 at the sync rate.
-    let text = "a".repeat(1_000_000);
-    let usd = estimate_embedding_cost(adapter_settings, &text, PreferredRequestKind::Sync);
-    assert!((usd - 0.05).abs() < 1e-9, "usd: {usd}");
-    // The same text on the Batch lane costs exactly half.
-    let batch_usd = estimate_embedding_cost(adapter_settings, &text, PreferredRequestKind::Batch);
-    assert!((usd - batch_usd * 2.0).abs() < 1e-12);
+fn embedding_text_reservation_prices_full_bound_in_each_lane() {
+    let settings = &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+    let sync = embedding_text_reservation(settings, PreferredRequestKind::Sync);
+    let batch = embedding_text_reservation(settings, PreferredRequestKind::Batch);
+    assert!((sync - 0.0016384).abs() < 1e-15);
+    assert!((batch - 0.0008192).abs() < 1e-15);
 }
 
 #[test]

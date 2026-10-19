@@ -1,5 +1,5 @@
-//! Embedding record provenance (03 §8.1); independent of semantic identity.
-use super::{embedding_corrupt_error, is_hash};
+//! Embedding provenance and typed input binding (03 §8.1).
+use super::{embedding_corrupt_error, hash_json, is_hash};
 use crate::error::Result;
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -92,6 +92,27 @@ impl ProducerProvenance {
     }
 }
 
+/// Semantic input context: chunk filename text or a converted-image receipt digest.
+/// Absent context remains absent in the identity; these variants keep the
+/// existing string and selected image-object wire shapes without a tag.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum EmbeddingContext {
+    Text(String),
+    Image { image_input_hash: String },
+}
+
+impl EmbeddingContext {
+    /// Extract filename context without treating an image digest as text.
+    #[must_use]
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            Self::Text(text) => Some(text),
+            Self::Image { .. } => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ImageInputReceipt {
@@ -103,6 +124,14 @@ pub struct ImageInputReceipt {
 }
 
 impl ImageInputReceipt {
+    /// The converted input identity binds every validated receipt field by JCS.
+    pub fn image_input_hash(&self) -> Result<String> {
+        self.validate()?;
+        let value = serde_json::to_value(self)
+            .map_err(|error| embedding_corrupt_error(&error.to_string(), None))?;
+        hash_json(&value)
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !is_hash(&self.source_hash)
             || !is_hash(&self.sent_hash)
@@ -129,7 +158,13 @@ pub struct EmbeddingMetadata {
 }
 
 impl EmbeddingMetadata {
-    pub(super) fn validate(&self, profile_hash: &str) -> Result<()> {
+    pub(super) fn validate(
+        &self,
+        profile_hash: &str,
+        target_type: &str,
+        target_hash: &str,
+        context: Option<&EmbeddingContext>,
+    ) -> Result<()> {
         if self.record_format != 2 {
             return Err(embedding_corrupt_error(
                 "embedding record_format must be exactly 2",
@@ -137,9 +172,19 @@ impl EmbeddingMetadata {
             ));
         }
         self.producer.validate(profile_hash)?;
-        if self.image_input_receipt.is_some() {
+        let bound = match (target_type, context, self.image_input_receipt.as_ref()) {
+            ("chunk", None | Some(EmbeddingContext::Text(_)), None) => true,
+            ("image", None, None) => true,
+            ("image", Some(EmbeddingContext::Image { image_input_hash }), Some(receipt)) => {
+                receipt.source_hash == target_hash
+                    && is_hash(image_input_hash)
+                    && receipt.image_input_hash()? == *image_input_hash
+            }
+            _ => false,
+        };
+        if !bound {
             return Err(embedding_corrupt_error(
-                "image receipt requires authenticated typed input context",
+                "embedding target, context and image receipt are not bound",
                 None,
             ));
         }

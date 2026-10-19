@@ -286,6 +286,21 @@ pub(crate) fn embedding_usd_per_token(
     lane_rate(standard, lane)
 }
 
+/// Image tokens have their own declared rate and conservative fallback.
+pub(crate) fn embedding_image_usd_per_token(
+    settings: &Arc<AdapterRuntimeSettings>,
+    lane: PreferredRequestKind,
+) -> f64 {
+    lane_rate(
+        settings
+            .declared_pricing("embedding")
+            .get("image_tokens_in")
+            .copied()
+            .unwrap_or(0.000_000_45),
+        lane,
+    )
+}
+
 /// The lane split applied to a STANDARD per-token rate, whatever its source.
 /// Split out from [`embedding_usd_per_token`] so the declared-pricing path is
 /// testable: `register_declared_pricing` is a process-global `OnceLock`, so a
@@ -297,56 +312,13 @@ pub(crate) fn lane_rate(standard: f64, lane: PreferredRequestKind) -> f64 {
     }
 }
 
-/// Rough token count for `text`.
-///
-/// The previous `chars / 4` assumed Latin script throughout and undercounts
-/// CJK badly — a Japanese chunk is closer to one token per character, so a
-/// mixed corpus was estimated (and, because `EmbeddingResponse.usage` is
-/// `None`, *charged*) well under what it costs. Count CJK scalars as one token
-/// each and the rest at the ~4-chars/token Latin ratio.
-pub(crate) fn estimate_embedding_tokens(text: &str) -> f64 {
-    let mut cjk = 0u64;
-    let mut other = 0u64;
-    for ch in text.chars() {
-        if is_cjk_scalar(ch) {
-            cjk += 1;
-        } else {
-            other += 1;
-        }
-    }
-    cjk as f64 + other as f64 / 4.0
-}
-
-/// Scalars that tokenize at roughly one token each: Han, kana, Hangul, and the
-/// CJK punctuation/fullwidth blocks that sit between them.
-fn is_cjk_scalar(ch: char) -> bool {
-    matches!(ch as u32,
-        0x3000..=0x30FF      // CJK symbols and punctuation, hiragana, katakana
-        | 0x3130..=0x318F    // Hangul compatibility jamo
-        | 0x3400..=0x4DBF    // CJK unified ideographs extension A
-        | 0x4E00..=0x9FFF    // CJK unified ideographs
-        | 0xAC00..=0xD7AF    // Hangul syllables
-        | 0xF900..=0xFAFF    // CJK compatibility ideographs
-        | 0xFF00..=0xFFEF    // Halfwidth and fullwidth forms
-        | 0x20000..=0x2FA1F  // CJK extensions B-F and compatibility supplement
-    )
-}
-
-/// Cost estimate for embedding `text` on `lane`.
-///
-/// This is the RESERVATION, and — per I12's fix — only the settlement fallback
-/// for a send whose response carried no usable usage report. It used to be the
-/// settled charge outright, on the since-falsified reasoning that the endpoint
-/// returns no token count. It still has to be right: I10 measured this
-/// estimator against 33 real jobs and found -32%..+52% error with 24% of jobs
-/// UNDER-estimated, and the budget cap gates on the reservation, not on the
-/// settlement.
-pub(crate) fn estimate_embedding_cost(
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
-    text: &str,
+/// Gemini reserves the full per-member token bound before every attempt.
+/// Measured usage determines settlement; absent usage settles this upper bound.
+pub(crate) fn embedding_text_reservation(
+    settings: &Arc<AdapterRuntimeSettings>,
     lane: PreferredRequestKind,
 ) -> f64 {
-    estimate_embedding_tokens(text) * embedding_usd_per_token(adapter_settings, lane)
+    8192.0 * embedding_usd_per_token(settings, lane)
 }
 
 /// Price one embedding send from the usage the adapter reported, degrading to
@@ -366,23 +338,59 @@ pub(crate) fn embedding_billed_from_usage(
     fallback_estimated_usd: f64,
     control: &ControlHandle,
     session: &kio_core::scope::LockSession,
+    input_type: kio_adapter::types::EmbeddingInputType,
 ) -> BilledAmount {
+    let (kind, rate) = match input_type {
+        kio_adapter::types::EmbeddingInputType::ImageObject => (
+            "image_tokens_in",
+            embedding_image_usd_per_token(adapter_settings, lane),
+        ),
+        _ => ("tokens_in", embedding_usd_per_token(adapter_settings, lane)),
+    };
     let (billed, uncovered) = resolve_billing_from_reported_usage(
         reported,
-        // The embedding adapter declares exactly one billable kind
-        // (`gemini_embedding`'s profile: `TokensIn`). Its module is private, so
-        // the set is restated rather than fabricated from an `AdapterProfile`
-        // these call sites do not have.
-        &std::collections::BTreeSet::from(["tokens_in".to_owned()]),
-        // The SAME rate resolution the reservation used, fallback included.
-        // Pricing the two sides from different sources is how a reservation and
-        // its settlement drift apart.
-        &std::collections::BTreeMap::from([(
-            "tokens_in".to_owned(),
-            embedding_usd_per_token(adapter_settings, lane),
-        )]),
+        &std::collections::BTreeSet::from([kind.to_owned()]),
+        &std::collections::BTreeMap::from([(kind.to_owned(), rate)]),
         fallback_estimated_usd,
     );
     warn_uncovered_pricing_kinds_once(EMBEDDING_ADAPTER_KIND, &uncovered, control, session);
     billed
+}
+
+#[cfg(test)]
+mod image_billing_tests {
+    use super::*;
+    use kio_adapter::types::{AdapterUsage, BillableUnit, BillableUnitKind};
+
+    #[test]
+    fn image_usage_settlement_prices_image_units_separately_in_both_lanes() {
+        let settings = Arc::new(AdapterRuntimeSettings::default());
+        let control = ControlHandle::new(kio_core::test_control::DebugTestControl::default());
+        let locks = kio_core::scope::LockSession::default();
+        let usage = AdapterUsage::BillableUnits {
+            billable_units: vec![BillableUnit {
+                kind: BillableUnitKind::ImageTokensIn,
+                count: 7,
+            }],
+        };
+        for (lane, rate) in [
+            (PreferredRequestKind::Sync, 0.000_000_45),
+            (PreferredRequestKind::Batch, 0.000_000_225),
+        ] {
+            let billed = embedding_billed_from_usage(
+                &settings,
+                Some(&usage),
+                lane,
+                0.0036864,
+                &control,
+                &locks,
+                kio_adapter::types::EmbeddingInputType::ImageObject,
+            );
+            assert!(!billed.estimated, "complete IMAGE usage must be metered");
+            assert!(
+                (billed.usd - 7.0 * rate).abs() < 1e-15,
+                "IMAGE must use its own lane price: {billed:?}"
+            );
+        }
+    }
 }

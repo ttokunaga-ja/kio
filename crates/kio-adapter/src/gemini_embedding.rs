@@ -6,21 +6,21 @@
 //! profile is the single multimodal profile fixed on 2026-07-03: `gemini-embedding-2`
 //! (GA, pinned at startup) / 768 dims (MRL) / cosine / `modality="multimodal"`.
 //!
-//! The live HTTP path is not exercised in the hermetic test suite (`docs/07-adapter-spec.md` §5.3);
-//! the wire format below is documentation-accurate best effort and the contract is
-//! covered by the CLI mock seam. `profile()` never performs network I/O.
+//! Rooted local HTTP tests exercise the serialized wire contract without a
+//! provider connection. CLI tests use the mock seam. `profile()` never performs
+//! network I/O.
 
 use crate::http_policy::{
-    EMBEDDING_RESPONSE_MAX_BYTES, HttpPolicy, HttpResponse, MODEL_CATALOG_MAX_BYTES,
-    authenticated_agent, read_json_bounded, require_success,
+    AuthenticatedHttpClient, EMBEDDING_RESPONSE_MAX_BYTES, HttpPolicy, HttpResponse,
+    MODEL_CATALOG_MAX_BYTES, read_json_bounded, require_success,
 };
 use crate::identity::{is_mutable_model_alias, tool_profile_hash};
 use crate::tool_lock::AdapterRuntimeSettings;
 use crate::traits::{EmbeddingAdapter, PreferredRequestKind};
 use crate::types::{
-    AdapterKind, AdapterProfile, AdapterUsage, BillableUnit, BillableUnitKind, EmbeddingCompleted,
-    EmbeddingContent, EmbeddingItem, EmbeddingOutcome, EmbeddingRequest, EmbeddingUsage,
-    EmbeddingVector, ExecutionMode, validate_cosine_vector, validate_embedding_request_bytes,
+    AdapterKind, AdapterProfile, BillableUnitKind, EmbeddingCompleted, EmbeddingItem,
+    EmbeddingOutcome, EmbeddingRequest, EmbeddingUsage, EmbeddingVector, ExecutionMode,
+    validate_cosine_vector, validate_embedding_request_bytes,
 };
 use crate::{AdapterError, Result};
 use serde_json::{Value, json};
@@ -32,6 +32,19 @@ pub const ADOPTED_MODEL_FAMILY: &str = "gemini-embedding";
 pub const ADOPTED_MODEL_PIN: &str = "gemini-embedding-2";
 pub const ADOPTED_DIMENSIONS: u32 = 768;
 const GEMINI_API_ORIGIN: &str = "https://generativelanguage.googleapis.com";
+pub(crate) mod usage;
+pub(crate) mod wire;
+#[cfg(all(test, debug_assertions))]
+use crate::types::{AdapterUsage, BillableUnit, EmbeddingContent};
+
+/// Check the exact production sync envelope before reserving any billed work.
+pub fn validate_gemini_sync_inputs(
+    items: &[EmbeddingItem],
+    model: &str,
+    dimensions: u32,
+) -> Result<()> {
+    wire::sync_body(model, dimensions, items).map(|_| ())
+}
 
 /// Network boundary for the Gemini embedding backend.
 pub trait GeminiEmbeddingClient: Clone {
@@ -55,21 +68,26 @@ pub trait GeminiEmbeddingClient: Clone {
     ) -> Result<EmbedBatchOutput>;
 }
 
-/// One `:batchEmbedContents` response: the vectors, plus the token count the
-/// provider reported for the call.
-#[derive(Debug, Clone, Default)]
+/// One synchronous call's vectors and validated modality-bearing usage.
+#[derive(Debug, Clone)]
 pub struct EmbedBatchOutput {
     pub vectors: Vec<EmbeddingVector>,
-    /// `usageMetadata.promptTokenCount` — a total for the whole call, which is
-    /// also the granularity the provider bills at.
-    pub prompt_tokens: Option<u64>,
+    pub usage: EmbeddingUsage,
+}
+impl Default for EmbedBatchOutput {
+    fn default() -> Self {
+        Self {
+            vectors: Vec::new(),
+            usage: EmbeddingUsage::Estimated,
+        }
+    }
 }
 
 #[derive(Clone)]
 pub struct EnvGeminiEmbeddingClient {
     settings: Arc<AdapterRuntimeSettings>,
     base_url: Option<String>,
-    http_policy: HttpPolicy,
+    http: AuthenticatedHttpClient,
 }
 
 // Runtime settings contain credentials for both roles and must not enter diagnostics.
@@ -78,7 +96,7 @@ impl std::fmt::Debug for EnvGeminiEmbeddingClient {
         formatter
             .debug_struct("EnvGeminiEmbeddingClient")
             .field("base_url", &self.base_url)
-            .field("http_policy", &self.http_policy)
+            .field("http_policy", &self.http)
             .finish_non_exhaustive()
     }
 }
@@ -89,7 +107,7 @@ impl EnvGeminiEmbeddingClient {
         Self {
             settings,
             base_url: None,
-            http_policy: HttpPolicy::default(),
+            http: AuthenticatedHttpClient::new(HttpPolicy::default()),
         }
     }
 
@@ -102,7 +120,7 @@ impl EnvGeminiEmbeddingClient {
         Self {
             settings,
             base_url: Some(base_url.into()),
-            http_policy: HttpPolicy::default(),
+            http: AuthenticatedHttpClient::new(HttpPolicy::default()),
         }
     }
 
@@ -131,7 +149,9 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
             return Ok(configured_model.to_owned());
         }
         let api_key = self.api_key()?;
-        let response = authenticated_agent(self.http_policy)
+        let response = self
+            .http
+            .agent()
             .get(&format!("{}/v1beta/models", self.base_url()))
             .header("x-goog-api-key", &api_key)
             .header("Accept-Encoding", "identity")
@@ -200,22 +220,10 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
         // `crate::gemini_batch_client` — see `preferred_request_kind` and the
         // 2026-07-24 correction in 07 §5.3. (The earlier comment here claimed
         // Vertex has no batch inference; this adapter does not call Vertex.)
-        let requests = items
-            .iter()
-            .map(|item| {
-                let EmbeddingContent::Text { text } = &item.content else {
-                    return Err(AdapterError::ContractViolation(
-                        "Gemini embedding adapter does not accept image content".to_owned(),
-                    ));
-                };
-                Ok(json!({
-                    "model": format!("models/{model_pin}"),
-                    "content": { "parts": [{ "text": text }] },
-                    "outputDimensionality": dimensions,
-                }))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut http_request = authenticated_agent(self.http_policy)
+        let (body, kind, count) = wire::sync_body(model_pin, dimensions, items)?;
+        let mut http_request = self
+            .http
+            .agent()
             .post(&format!(
                 "{}/v1beta/models/{model_pin}:batchEmbedContents",
                 self.base_url()
@@ -232,7 +240,7 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
             http_request = http_request.header(name, value);
         }
         let response = http_request
-            .send_json(json!({ "requests": requests }))
+            .send_json(body)
             .map_err(http_error)
             .and_then(|response| require_success(response, http_status_error))?;
         let response = read_json_bounded(
@@ -242,23 +250,14 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
         )?;
         Ok(EmbedBatchOutput {
             vectors: parse_embeddings(&response, items, dimensions)?,
-            prompt_tokens: parse_prompt_tokens(&response),
+            usage: u64::try_from(count)
+                .ok()
+                .and_then(|count| count.checked_mul(8192))
+                .map_or(EmbeddingUsage::Estimated, |max| {
+                    usage::parse(&response, max, Some(kind))
+                }),
         })
     }
-}
-
-/// `usageMetadata.promptTokenCount`, when the response carried one.
-///
-/// The endpoint reports a total for the CALL rather than per request, which is
-/// what the previous comment here observed — but it then concluded there was
-/// "no real signal to self-report", and a per-call total is exactly the
-/// granularity the provider bills at. Reporting `None` made every synchronous
-/// embedding settle at the caller's reservation estimate instead of at cost.
-fn parse_prompt_tokens(response: &Value) -> Option<u64> {
-    let value = response.get("usageMetadata")?.get("promptTokenCount")?;
-    value
-        .as_u64()
-        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
 }
 
 fn parse_embeddings(
@@ -418,11 +417,15 @@ pub(crate) fn gemini_embedding_profile(
         tool_profile_hash: tool_profile_hash(&profile)
             .expect("built-in Gemini embedding profile is valid"),
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        capability_flags: vec!["text".to_owned(), "multimodal".to_owned()],
+        capability_flags: vec![
+            "text".to_owned(),
+            "multimodal".to_owned(),
+            "image_object".to_owned(),
+        ],
         allow_network: true,
         // QA18: Gemini embedding bills per input token; there is no
         // output-token leg for an embedding response.
-        billable_kinds: vec![crate::types::BillableUnitKind::TokensIn],
+        billable_kinds: vec![BillableUnitKind::TokensIn, BillableUnitKind::ImageTokensIn],
         reject_billing: Some(crate::types::BillingDeclaration::Billable),
         // QA13 (04 §5.5 L880): the real Gemini `:batchEmbedContents`
         // endpoint offers no idempotency parameter — "job 作成に
@@ -453,6 +456,7 @@ impl<C: GeminiEmbeddingClient> EmbeddingAdapter for GeminiEmbeddingAdapter<C> {
     fn descriptor(&self) -> crate::types::EmbeddingDescriptor {
         let mut descriptor = crate::types::EmbeddingDescriptor::from_profile(&self.profile());
         descriptor.completion.batch = true;
+        descriptor.capability.image_mime_types = vec!["image/png".into(), "image/jpeg".into()];
         descriptor.limits.max_encoded_bytes = Some(16 * 1024 * 1024);
         descriptor.limits.max_tokens_per_member = Some(8192);
         descriptor.pricing = vec![
@@ -472,15 +476,7 @@ impl<C: GeminiEmbeddingClient> EmbeddingAdapter for GeminiEmbeddingAdapter<C> {
 
     fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingOutcome> {
         validate_embedding_request_bytes(&request)?;
-        if request
-            .items
-            .iter()
-            .any(|item| matches!(item.content, EmbeddingContent::Image { .. }))
-        {
-            return Err(AdapterError::ContractViolation(
-                "Gemini embedding adapter does not accept image content".to_owned(),
-            ));
-        }
+        wire::validate_contents(request.items.iter().map(|item| &item.content))?;
         // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): resolve (and
         // fail closed on) the provider idempotency header BEFORE any network
         // call — a `HttpHeader`-declaring provider with no caller-supplied
@@ -522,18 +518,7 @@ impl<C: GeminiEmbeddingClient> EmbeddingAdapter for GeminiEmbeddingAdapter<C> {
             // QA49: the profile in force for this response, so the consumer
             // can reject a same-dimension vector from an unexpected profile.
             embedding_profile_hash: self.profile().tool_profile_hash,
-            // Missing provider usage is an explicit conservative estimate.
-            usage: batch
-                .prompt_tokens
-                .map(|count| EmbeddingUsage::Metered {
-                    usage: AdapterUsage::BillableUnits {
-                        billable_units: vec![BillableUnit {
-                            kind: BillableUnitKind::TokensIn,
-                            count,
-                        }],
-                    },
-                })
-                .unwrap_or(EmbeddingUsage::Estimated),
+            usage: batch.usage,
         }))
     }
 }
@@ -574,6 +559,105 @@ fn http_status_error(response: &HttpResponse) -> AdapterError {
 }
 
 #[cfg(all(test, debug_assertions))]
+pub(crate) mod http_tests;
+
+#[cfg(all(test, debug_assertions))]
+mod o2_image_guard_first_tests {
+    use super::*;
+    use crate::types::EmbeddingInputType;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Clone, Default)]
+    struct CountingClient(Arc<AtomicUsize>);
+    impl GeminiEmbeddingClient for CountingClient {
+        fn resolve_model_pin(&self, _: &str) -> Result<String> {
+            Ok(ADOPTED_MODEL_PIN.into())
+        }
+        fn embed(
+            &self,
+            items: &[EmbeddingItem],
+            _: &str,
+            dimensions: u32,
+            _: Option<(&str, &str)>,
+        ) -> Result<EmbedBatchOutput> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(EmbedBatchOutput {
+                vectors: items
+                    .iter()
+                    .map(|item| {
+                        let mut vector = vec![0.0; dimensions as usize];
+                        vector[0] = 1.0;
+                        EmbeddingVector {
+                            id: item.id.clone(),
+                            vector,
+                        }
+                    })
+                    .collect(),
+                usage: EmbeddingUsage::Metered {
+                    usage: AdapterUsage::BillableUnits {
+                        billable_units: vec![BillableUnit {
+                            kind: BillableUnitKind::TokensIn,
+                            count: 7,
+                        }],
+                    },
+                },
+            })
+        }
+    }
+
+    #[test]
+    fn original_png_with_spoofed_or_unsupported_mime_never_reaches_client() {
+        use base64::Engine as _;
+        let png = base64::engine::general_purpose::STANDARD.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=").unwrap();
+        for mime in ["image/jpeg", "image/gif", "text/plain"] {
+            let client = CountingClient::default();
+            let adapter =
+                GeminiEmbeddingAdapter::new(client.clone(), ADOPTED_MODEL_PIN, ADOPTED_DIMENSIONS);
+            let result = adapter.embed(EmbeddingRequest {
+                input_type: EmbeddingInputType::ImageObject,
+                items: vec![EmbeddingItem {
+                    id: "spoofed-mime".into(),
+                    content: EmbeddingContent::Image {
+                        bytes: png.clone(),
+                        mime: mime.into(),
+                    },
+                }],
+                idempotency_token: None,
+            });
+            assert!(
+                matches!(result, Err(AdapterError::ContractViolation(_))),
+                "{mime}"
+            );
+            assert_eq!(
+                client.0.load(Ordering::SeqCst),
+                0,
+                "{mime}: a fake image declaration must fail before the selected client"
+            );
+        }
+    }
+
+    #[test]
+    fn source_image_over_raw_bound_never_reaches_client() {
+        let client = CountingClient::default();
+        let adapter =
+            GeminiEmbeddingAdapter::new(client.clone(), ADOPTED_MODEL_PIN, ADOPTED_DIMENSIONS);
+        let result = adapter.embed(EmbeddingRequest {
+            input_type: EmbeddingInputType::ImageObject,
+            items: vec![EmbeddingItem {
+                id: "over-bound".into(),
+                content: EmbeddingContent::Image {
+                    bytes: vec![0; crate::types::MAX_EMBEDDING_ITEM_BYTES + 1],
+                    mime: "image/png".into(),
+                },
+            }],
+            idempotency_token: None,
+        });
+        assert!(matches!(result, Err(AdapterError::ContractViolation(_))));
+        assert_eq!(client.0.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
     use crate::types::{EmbeddingContent, EmbeddingInputType};
@@ -605,7 +689,21 @@ mod tests {
                         },
                     })
                     .collect(),
-                prompt_tokens: Some(7),
+                usage: EmbeddingUsage::Metered {
+                    usage: AdapterUsage::BillableUnits {
+                        billable_units: vec![BillableUnit {
+                            kind: if matches!(
+                                items.first().map(|item| &item.content),
+                                Some(EmbeddingContent::Image { .. })
+                            ) {
+                                BillableUnitKind::ImageTokensIn
+                            } else {
+                                BillableUnitKind::TokensIn
+                            },
+                            count: 7,
+                        }],
+                    },
+                },
             })
         }
     }
@@ -671,7 +769,15 @@ mod tests {
         assert!(descriptor.effects.egress);
         assert!(descriptor.effects.paid_authorization);
         assert!(descriptor.capability.text);
-        assert!(descriptor.capability.image_mime_types.is_empty());
+        assert_eq!(
+            descriptor
+                .capability
+                .image_mime_types
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["image/png", "image/jpeg"])
+        );
         assert!(descriptor.completion.sync && descriptor.completion.batch);
         assert_eq!(descriptor.limits.max_tokens_per_member, Some(8192));
         assert_eq!(descriptor.limits.max_encoded_bytes, Some(16 * 1024 * 1024));
@@ -717,20 +823,32 @@ mod tests {
     }
 
     #[test]
-    fn a_response_without_usage_metadata_reports_nothing() {
-        // `None` still degrades to the caller's reservation estimate, which is
-        // the conservative direction; a fabricated 0 would not be.
-        assert_eq!(parse_prompt_tokens(&json!({ "embeddings": [] })), None);
-        assert_eq!(
-            parse_prompt_tokens(&json!({ "usageMetadata": { "promptTokenCount": 42 } })),
-            Some(42)
-        );
-        // The API quotes counts as strings in some fields; accept both rather
-        // than dropping a real count.
-        assert_eq!(
-            parse_prompt_tokens(&json!({ "usageMetadata": { "promptTokenCount": "42" } })),
-            Some(42)
-        );
+    fn incomplete_usage_requires_estimate_and_complete_text_details_are_metered() {
+        // docs07 §5.3 now requires a complete, consistent modality report.
+        for value in [
+            json!({"embeddings": []}),
+            json!({"usageMetadata":{"promptTokenCount":42}}),
+        ] {
+            assert_eq!(
+                usage::parse(&value, 8192, Some(BillableUnitKind::TokensIn)),
+                EmbeddingUsage::Estimated
+            );
+        }
+        for count in [json!(42), json!("42")] {
+            let value = json!({"usageMetadata":{"promptTokenCount":count,
+                "promptTokenDetails":[{"modality":"TEXT","tokenCount":count}]}});
+            assert_eq!(
+                usage::parse(&value, 8192, Some(BillableUnitKind::TokensIn)),
+                EmbeddingUsage::Metered {
+                    usage: AdapterUsage::BillableUnits {
+                        billable_units: vec![BillableUnit {
+                            kind: BillableUnitKind::TokensIn,
+                            count: 42
+                        }]
+                    }
+                }
+            );
+        }
     }
 
     #[test]
@@ -876,10 +994,89 @@ mod tests {
         );
     }
 
+    #[derive(Clone, Default)]
+    struct RecordingImageClient {
+        calls: std::sync::Arc<std::sync::Mutex<Vec<Vec<EmbeddingItem>>>>,
+    }
+
+    impl GeminiEmbeddingClient for RecordingImageClient {
+        fn resolve_model_pin(&self, configured_model: &str) -> Result<String> {
+            StubClient.resolve_model_pin(configured_model)
+        }
+
+        fn embed(
+            &self,
+            items: &[EmbeddingItem],
+            model_pin: &str,
+            dimensions: u32,
+            idempotency_header: Option<(&str, &str)>,
+        ) -> Result<EmbedBatchOutput> {
+            self.calls.lock().unwrap().push(items.to_vec());
+            StubClient.embed(items, model_pin, dimensions, idempotency_header)
+        }
+    }
+
+    /// 07 §5.3: valid original PNG bytes reach the selected client unchanged.
+    /// This records an actual adapter/client call, not an HTTP wire exchange.
     #[test]
-    fn image_content_is_rejected_before_any_client_call() {
+    fn original_png_reaches_client_and_returns_one_current_profile_vector() {
+        use base64::Engine as _;
+        let png = base64::engine::general_purpose::STANDARD
+            .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAC0lEQVR4nGP4DwQACfsD/fteaysAAAAASUVORK5CYII=")
+            .unwrap();
+        let client = RecordingImageClient::default();
         let adapter =
-            GeminiEmbeddingAdapter::new(StubClient, ADOPTED_MODEL_PIN, ADOPTED_DIMENSIONS);
+            GeminiEmbeddingAdapter::new(client.clone(), ADOPTED_MODEL_PIN, ADOPTED_DIMENSIONS);
+        let profile = adapter.profile().tool_profile_hash;
+        let completed = adapter
+            .embed(EmbeddingRequest {
+                input_type: EmbeddingInputType::ImageObject,
+                items: vec![EmbeddingItem {
+                    id: "original-png".to_owned(),
+                    content: EmbeddingContent::Image {
+                        bytes: png.clone(),
+                        mime: "image/png".to_owned(),
+                    },
+                }],
+                idempotency_token: None,
+            })
+            .expect("a valid original PNG must be accepted")
+            .into_completed()
+            .unwrap();
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(
+            calls.len(),
+            1,
+            "one image member reaches the selected client once"
+        );
+        assert_eq!(calls[0].len(), 1);
+        assert_eq!(calls[0][0].id, "original-png");
+        assert_eq!(
+            calls[0][0].content,
+            EmbeddingContent::Image {
+                bytes: png,
+                mime: "image/png".to_owned()
+            }
+        );
+        assert_eq!(completed.embedding_profile_hash, profile);
+        assert_eq!(adapter.profile().tool_profile_hash, profile);
+        assert_eq!(completed.dimensions, 768);
+        assert_eq!(completed.distance, "cosine");
+        assert_eq!(completed.modality, "multimodal");
+        assert_eq!(completed.members.len(), 1);
+        assert_eq!(completed.members[0].id, "original-png");
+        let crate::types::EmbeddingMemberResult::Vector { vector } = &completed.members[0].result
+        else {
+            panic!("accepted PNG must return its vector");
+        };
+        validate_cosine_vector(vector, 768).unwrap();
+    }
+
+    #[test]
+    fn broken_image_bytes_are_rejected_before_any_client_call() {
+        let client = RecordingImageClient::default();
+        let adapter =
+            GeminiEmbeddingAdapter::new(client.clone(), ADOPTED_MODEL_PIN, ADOPTED_DIMENSIONS);
         let error = adapter
             .embed(EmbeddingRequest {
                 input_type: EmbeddingInputType::ImageObject,
@@ -894,5 +1091,9 @@ mod tests {
             })
             .unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(_)));
+        assert!(
+            client.calls.lock().unwrap().is_empty(),
+            "broken bytes must not reach the client"
+        );
     }
 }

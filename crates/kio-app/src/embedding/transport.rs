@@ -5,8 +5,8 @@ use crate::embedding::admission::declared_embedding_profile;
 use crate::embedding::admission::embedding_billed_from_usage;
 use crate::embedding::admission::embedding_execution;
 use crate::embedding::admission::embedding_is_deterministic;
+use crate::embedding::admission::embedding_text_reservation;
 use crate::embedding::admission::embedding_transport_allowed;
-use crate::embedding::admission::estimate_embedding_cost;
 use crate::embedding::admission::query_embedding_send_lane;
 use crate::invocation::Invocation;
 use crate::ledger_access::TASK_SYNC_EFFECTIVE_TIMEOUT_SECONDS;
@@ -384,7 +384,7 @@ fn run_query_embedding_job(
     let candidate_usd = if local {
         0.0
     } else {
-        estimate_embedding_cost(adapter_settings, query, query_embedding_send_lane())
+        embedding_text_reservation(adapter_settings, query_embedding_send_lane())
     };
     let device_config_path = user_config_toml_path(invocation.control);
     let no_folder_cap_sentinel =
@@ -456,6 +456,7 @@ fn run_query_embedding_job(
                     candidate_usd,
                     invocation.control,
                     invocation.locks,
+                    EmbeddingInputType::Query,
                 )
             };
             settle_task_charge_success(&ledger, &key, &job.intent_token, billed)?;

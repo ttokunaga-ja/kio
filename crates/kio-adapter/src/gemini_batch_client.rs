@@ -31,12 +31,12 @@
 //! its upload filename — see [`batch_display_name`]. That name is the recovery
 //! walk's 発見キー (04 §5.8 / 10 §7.5.2).
 //!
-//! Like the sibling embedding adapter, the live HTTP path is not exercised in
-//! the hermetic suite (`docs/07-adapter-spec.md` §5.3); the contract is covered through the mock
-//! seam ([`TEST_GEMINI_BATCH_ENV`]).
+//! Rooted local HTTP tests exercise serialized request and response contracts;
+//! provider receipts remain separate. CLI tests also use [`TEST_GEMINI_BATCH_ENV`].
 
+use crate::gemini_embedding::{usage, wire};
 use crate::tool_lock::AdapterRuntimeSettings;
-use crate::types::{EmbeddingOutcome, EmbeddingRemoteHandle};
+use crate::types::{EmbeddingContent, EmbeddingOutcome, EmbeddingRemoteHandle, EmbeddingUsage};
 use kio_core::control::ControlHandle;
 #[cfg(debug_assertions)]
 use std::io::Write as _;
@@ -94,7 +94,7 @@ const BATCH_LIST_MAX_PAGES: usize = 50;
 /// Provider cap on an inline batch is 20 MB. Bound the serialized request array
 /// below that with margin, so a job is rejected locally (a contract error the
 /// caller can split on) rather than by the provider after a round trip.
-pub const MAX_INLINE_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+pub const MAX_INLINE_REQUEST_BYTES: usize = wire::MAX_ENCODED_BYTES;
 
 /// Secondary bound on one job's request count. 07 §5.3 requires the caller to
 /// keep a job bounded; this is the ceiling the client itself enforces.
@@ -179,21 +179,15 @@ pub struct GeminiBatchEmbedOutput {
     pub values: Option<Vec<f32>>,
     /// Provider error object for this line, when present.
     pub error: Option<Value>,
-    /// `response.usageMetadata.promptTokenCount` for this line.
-    ///
-    /// The endpoint DOES report token counts — both here and on the
-    /// synchronous `embedContent`. The adapter used to assert the opposite in
-    /// a comment and degrade `usage` to `None`, which made every embedding
-    /// charge settle at the reservation estimate instead of what was actually
-    /// billed (07 §5.3, 2026-07-25 correction).
-    pub prompt_tokens: Option<u64>,
+    /// Validated per-member TEXT/IMAGE metering, or conservative estimation.
+    pub usage: EmbeddingUsage,
 }
 
-/// One inline request element: the caller's key plus the text to embed.
+/// One inline member: its stable key and exactly one typed content payload.
 #[derive(Debug, Clone)]
 pub struct GeminiBatchEmbedInput {
     pub key: String,
-    pub text: String,
+    pub content: EmbeddingContent,
 }
 
 /// Job-level attribution. The intent_token embedding is the ONLY attribution a
@@ -234,6 +228,7 @@ pub fn inline_embed_batch_body(
             inputs.len()
         )));
     }
+    wire::validate_contents(inputs.iter().map(|input| &input.content))?;
     let model_name = qualified_model(model);
     let requests = inputs
         .iter()
@@ -241,29 +236,32 @@ pub fn inline_embed_batch_body(
             json!({
                 "request": {
                     "model": model_name,
-                    "content": { "parts": [{ "text": input.text }] },
+                    "content": wire::content(&input.content),
                     "outputDimensionality": dimensions,
                 },
-                "metadata": { "key": input.key },
+                "metadata": {"key": input.key},
             })
         })
         .collect::<Vec<_>>();
     let body = json!({
         "batch": {
+            "model": model_name,
             "displayName": display_name,
             "inputConfig": { "requests": { "requests": requests } },
         }
     });
-    let encoded = serde_json::to_vec(&body).map_err(|error| {
-        AdapterError::ContractViolation(format!("Gemini embedding batch body: {error}"))
-    })?;
-    if encoded.len() > MAX_INLINE_REQUEST_BYTES {
-        return Err(AdapterError::ContractViolation(format!(
-            "Gemini embedding batch body is {} bytes, over the {MAX_INLINE_REQUEST_BYTES} inline bound",
-            encoded.len()
-        )));
-    }
+    wire::check_body(&body)?;
     Ok(body)
+}
+
+/// Check the exact production create envelope before reserving billed work.
+pub fn validate_gemini_batch_inputs(
+    model: &str,
+    dimensions: u32,
+    display_name: &str,
+    inputs: &[GeminiBatchEmbedInput],
+) -> Result<()> {
+    inline_embed_batch_body(model, display_name, dimensions, inputs).map(|_| ())
 }
 
 /// `models/x` passes through; a bare `x` is qualified.
@@ -428,14 +426,6 @@ fn inlined_response_lines(value: &Value) -> Option<&Vec<Value>> {
 /// Extract `inlinedResponses[]` into keyed outputs. A line without a usable
 /// `metadata.key` is a contract violation: silently dropping it would leave the
 /// caller's chunk permanently unembedded while the job counted as complete.
-/// The API returns counts as JSON numbers here and as quoted strings in
-/// `batchStats`; accept both rather than silently dropping a token count.
-fn json_u64(value: &Value) -> Option<u64> {
-    value
-        .as_u64()
-        .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
-}
-
 pub(crate) fn parse_inlined_results(value: &Value) -> Result<Vec<GeminiBatchEmbedOutput>> {
     let lines = inlined_response_lines(value).ok_or_else(|| {
         AdapterError::ContractViolation("Gemini batch result missing inlinedResponses".to_owned())
@@ -454,19 +444,13 @@ pub(crate) fn parse_inlined_results(value: &Value) -> Result<Vec<GeminiBatchEmbe
             })?
             .to_owned();
         let output = line.get("output").unwrap_or(line);
-        // `response.usageMetadata.promptTokenCount` — what the provider
-        // actually billed for this line.
-        let prompt_tokens = output
-            .get("response")
-            .and_then(|response| response.get("usageMetadata"))
-            .and_then(|usage| usage.get("promptTokenCount"))
-            .and_then(json_u64);
+        let usage = usage::parse(output.get("response").unwrap_or(&Value::Null), 8192, None);
         if let Some(error) = output.get("error").filter(|error| !error.is_null()) {
             outputs.push(GeminiBatchEmbedOutput {
                 key,
                 values: None,
                 error: Some(error.clone()),
-                prompt_tokens,
+                usage,
             });
             continue;
         }
@@ -493,7 +477,7 @@ pub(crate) fn parse_inlined_results(value: &Value) -> Result<Vec<GeminiBatchEmbe
             key,
             values: Some(values),
             error: None,
-            prompt_tokens,
+            usage,
         });
     }
     Ok(outputs)
@@ -1015,6 +999,245 @@ pub fn resolve_gemini_batch_client_with_control(
 }
 
 #[cfg(all(test, debug_assertions))]
+mod image_http_tests;
+
+#[cfg(all(test, debug_assertions))]
+mod o2_wire_first_tests {
+    use super::*;
+    use std::io::Read as _;
+    use std::net::TcpListener;
+
+    // Existing fixture roots are attached to the actual Batch client instance.
+    // The bounded reader captures the serialized POST body, not a mock event.
+    fn capture_one_response(
+        response: Value,
+    ) -> (
+        String,
+        AuthenticatedHttpClient,
+        std::thread::JoinHandle<(String, Value)>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let tls = crate::http_policy::test_tls::Fixture::new();
+        let http = tls.client(HttpPolicy::default());
+        let server = std::thread::spawn(move || {
+            let mut stream = tls.accept(&listener);
+            let mut bytes = Vec::new();
+            let mut block = [0_u8; 4096];
+            let end = loop {
+                if let Some(at) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break at + 4;
+                }
+                let n = stream.read(&mut block).unwrap();
+                assert!(n > 0);
+                bytes.extend_from_slice(&block[..n]);
+                assert!(bytes.len() <= 64 * 1024);
+            };
+            let head = String::from_utf8(bytes[..end].to_vec()).unwrap();
+            let length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            assert!(length <= 64 * 1024);
+            let mut body = bytes[end..].to_vec();
+            while body.len() < length {
+                let n = stream.read(&mut block).unwrap();
+                assert!(n > 0);
+                body.extend_from_slice(&block[..n]);
+                assert!(body.len() <= 64 * 1024);
+            }
+            assert_eq!(body.len(), length);
+            let response = serde_json::to_vec(&response).unwrap();
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", response.len()).unwrap();
+            stream.write_all(&response).unwrap();
+            let body = if body.is_empty() {
+                Value::Null
+            } else {
+                serde_json::from_slice(&body).unwrap()
+            };
+            (head, body)
+        });
+        (format!("https://{address}"), http, server)
+    }
+
+    #[test]
+    fn batch_http_post_preserves_text_order_keys_and_documented_batch_nesting() {
+        crate::tool_lock::with_test_role_auth("embedding", |settings| {
+            let (url, http, server) = capture_one_response(json!({
+                "name": "batches/wire-one",
+                "metadata": {"name": "batches/wire-one", "state": "BATCH_STATE_PENDING", "displayName": "kio-wire-one"}
+            }));
+            let mut client = EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), url);
+            client.http = http;
+            let inputs = [
+                GeminiBatchEmbedInput {
+                    key: "member-z".into(),
+                    content: EmbeddingContent::Text {
+                        text: "file: z.md\n世界".into(),
+                    },
+                },
+                GeminiBatchEmbedInput {
+                    key: "member-a".into(),
+                    content: EmbeddingContent::Text {
+                        text: "file: a.md\nhello".into(),
+                    },
+                },
+            ];
+            let outcome = client.submit_job("gemini-embedding-2", 768, "kio-wire-one", &inputs);
+            let (head, body) = server.join().unwrap();
+            assert!(
+                matches!(outcome.unwrap(), EmbeddingOutcome::Pending { remote_handle } if remote_handle.as_str() == "batches/wire-one")
+            );
+            assert!(head.starts_with(
+                "POST /v1beta/models/gemini-embedding-2:asyncBatchEmbedContent HTTP/1.1\r\n"
+            ));
+            // docs07 §5.3 explicitly requires model on batch itself. Inner
+            // text, dimensions and per-member keys retain their existing form.
+            assert_eq!(
+                body,
+                json!({"batch": {
+                    "model": "models/gemini-embedding-2",
+                    "displayName": "kio-wire-one",
+                    "inputConfig": {"requests": {"requests": [
+                        {"request": {"model": "models/gemini-embedding-2", "content": {"parts": [{"text": "file: z.md\n世界"}]}, "outputDimensionality": 768}, "metadata": {"key": "member-z"}},
+                        {"request": {"model": "models/gemini-embedding-2", "content": {"parts": [{"text": "file: a.md\nhello"}]}, "outputDimensionality": 768}, "metadata": {"key": "member-a"}}
+                    ]}}
+                }})
+            );
+        });
+    }
+
+    #[test]
+    fn batch_http_poll_invalid_member_usage_keeps_vector_but_requires_estimate() {
+        // docs07 §5.3: invalid metering becomes Estimated while valid vectors
+        // remain available. Real modality details retain separate billing units.
+        let cases = [
+            (
+                "valid-text",
+                json!({"promptTokenCount":7,"promptTokenDetails":[{"modality":"TEXT","tokenCount":7}]}),
+                Some(7),
+            ),
+            (
+                "valid-image",
+                json!({"promptTokenCount":7,"promptTokenDetails":[{"modality":"IMAGE","tokenCount":7}]}),
+                Some(7),
+            ),
+            ("missing-details", json!({"promptTokenCount":7}), None),
+            (
+                "empty-details",
+                json!({"promptTokenCount":7,"promptTokenDetails":[]}),
+                None,
+            ),
+            (
+                "mismatched-total",
+                json!({"promptTokenCount":7,"promptTokenDetails":[{"modality":"IMAGE","tokenCount":6}]}),
+                None,
+            ),
+            (
+                "negative",
+                json!({"promptTokenCount":7,"promptTokenDetails":[{"modality":"IMAGE","tokenCount":-1}]}),
+                None,
+            ),
+            (
+                "unknown-modality",
+                json!({"promptTokenCount":7,"promptTokenDetails":[{"modality":"AUDIO","tokenCount":7}]}),
+                None,
+            ),
+            (
+                "duplicate-modality",
+                json!({"promptTokenCount":7,"promptTokenDetails":[{"modality":"IMAGE","tokenCount":3},{"modality":"IMAGE","tokenCount":4}]}),
+                None,
+            ),
+            (
+                "over-reservation",
+                json!({"promptTokenCount":8193,"promptTokenDetails":[{"modality":"IMAGE","tokenCount":8193}]}),
+                None,
+            ),
+        ];
+        crate::tool_lock::with_test_role_auth("embedding", |settings| {
+            for (key, usage, expected_tokens) in cases {
+                // A separate one-member job per case; no mixed-modality job.
+                let mut vector = vec![0.0_f32; 768];
+                vector[0] = 1.0;
+                let (url, http, server) = capture_one_response(json!({
+                    "name":"batches/usage-one", "done":true,
+                    "metadata":{"name":"batches/usage-one","state":"BATCH_STATE_SUCCEEDED","displayName":"kio-usage-one"},
+                    "response":{"inlinedResponses":{"inlinedResponses":[{
+                        "metadata":{"key":key},"response":{"embedding":{"values":vector},"usageMetadata":usage}
+                    }]}}
+                }));
+                let mut client =
+                    EnvGeminiBatchClient::with_base_url(Arc::new(settings.clone()), url);
+                client.http = http;
+                let poll = client.poll_job(&EmbeddingRemoteHandle("batches/usage-one".into()));
+                let (head, body) = server.join().unwrap();
+                assert!(head.starts_with("GET /v1beta/batches/usage-one HTTP/1.1\r\n"));
+                assert!(body.is_null());
+                let lines = poll.unwrap().results.unwrap();
+                assert_eq!(lines.len(), 1);
+                assert_eq!(lines[0].key, key);
+                assert_eq!(lines[0].values.as_ref().unwrap(), &vector);
+                assert!(lines[0].error.is_none());
+                assert_eq!(
+                    lines[0].usage,
+                    expected_tokens.map_or(EmbeddingUsage::Estimated, |count| {
+                        EmbeddingUsage::Metered {
+                            usage: crate::types::AdapterUsage::BillableUnits {
+                                billable_units: vec![crate::types::BillableUnit {
+                                    kind: if key == "valid-image" {
+                                        crate::types::BillableUnitKind::ImageTokensIn
+                                    } else {
+                                        crate::types::BillableUnitKind::TokensIn
+                                    },
+                                    count,
+                                }],
+                            },
+                        }
+                    }),
+                    "{key}: invalid usage must not become a measured invoice"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn batch_encoded_body_over_limit_never_opens_a_provider_connection() {
+        crate::tool_lock::with_test_role_auth("embedding", |settings| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let tls = crate::http_policy::test_tls::Fixture::new();
+            let mut client = EnvGeminiBatchClient::with_base_url(
+                Arc::new(settings.clone()),
+                format!("https://{}", listener.local_addr().unwrap()),
+            );
+            client.http = tls.client(HttpPolicy::with_timeout_seconds(1));
+            let error = client
+                .submit_job(
+                    "gemini-embedding-2",
+                    768,
+                    "kio-over-limit",
+                    &[GeminiBatchEmbedInput {
+                        key: "too-large".into(),
+                        content: EmbeddingContent::Text {
+                            text: "x".repeat(MAX_INLINE_REQUEST_BYTES + 1),
+                        },
+                    }],
+                )
+                .unwrap_err();
+            assert!(matches!(error, AdapterError::ContractViolation(_)));
+            assert_eq!(
+                listener.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        });
+    }
+}
+
+#[cfg(all(test, debug_assertions))]
 mod tests {
     use super::*;
 
@@ -1071,7 +1294,9 @@ mod tests {
         );
         let inputs = [GeminiBatchEmbedInput {
             key: "input".into(),
-            text: "text".into(),
+            content: EmbeddingContent::Text {
+                text: "text".into(),
+            },
         }];
         client
             .submit_job("model", 768, "kio-submitted-intent", &inputs)
@@ -1215,11 +1440,15 @@ mod tests {
         let inputs = vec![
             GeminiBatchEmbedInput {
                 key: "chunk-a".to_owned(),
-                text: "hello".to_owned(),
+                content: EmbeddingContent::Text {
+                    text: "hello".to_owned(),
+                },
             },
             GeminiBatchEmbedInput {
                 key: "chunk-b".to_owned(),
-                text: "世界".to_owned(),
+                content: EmbeddingContent::Text {
+                    text: "世界".to_owned(),
+                },
             },
         ];
         let body = inline_embed_batch_body("gemini-embedding-2", "kio-tok", 768, &inputs).unwrap();
@@ -1244,7 +1473,9 @@ mod tests {
         let too_many = (0..MAX_INLINE_REQUESTS + 1)
             .map(|index| GeminiBatchEmbedInput {
                 key: format!("chunk-{index}"),
-                text: "x".to_owned(),
+                content: EmbeddingContent::Text {
+                    text: "x".to_owned(),
+                },
             })
             .collect::<Vec<_>>();
         assert!(
@@ -1258,7 +1489,9 @@ mod tests {
         // One request whose text alone exceeds the inline byte bound.
         let huge = GeminiBatchEmbedInput {
             key: "chunk-huge".to_owned(),
-            text: "x".repeat(MAX_INLINE_REQUEST_BYTES + 1),
+            content: EmbeddingContent::Text {
+                text: "x".repeat(MAX_INLINE_REQUEST_BYTES + 1),
+            },
         };
         let error = inline_embed_batch_body("gemini-embedding-2", "kio-tok", 768, &[huge])
             .expect_err("oversized inline payload must be rejected before the round trip");
@@ -1478,21 +1711,19 @@ mod tests {
     }
 
     #[test]
-    fn real_poll_response_carries_the_billed_token_counts() {
-        // I4: the provider DOES report per-line `promptTokenCount`. Dropping it
-        // made every embedding charge settle at the reservation estimate
-        // instead of at what was billed.
+    fn real_poll_total_without_modality_details_requires_estimation() {
+        // docs07 §5.3 requires complete modality details. Preserve these
+        // captured response bytes, but no longer treat their scalar total as
+        // a complete, priceable invoice.
         let value: Value = serde_json::from_str(REAL_POLL_RESPONSE).unwrap();
         let outputs = parse_inlined_results(&value).unwrap();
-        assert_eq!(outputs[0].prompt_tokens, Some(81));
-        assert_eq!(outputs[1].prompt_tokens, Some(25));
+        assert_eq!(outputs[0].usage, EmbeddingUsage::Estimated);
+        assert_eq!(outputs[1].usage, EmbeddingUsage::Estimated);
     }
 
     #[test]
-    fn a_line_without_a_usage_report_yields_no_token_count() {
-        // Absence must stay `None` (which routes billing to the conservative
-        // estimate), never a fabricated zero — a zero would settle the charge
-        // at $0 and let the budget cap release spending already incurred.
+    fn a_line_without_a_usage_report_requires_estimation() {
+        // Absence requires the conservative estimate, never fabricated zero.
         let value = json!({
             "inlinedResponses": [{
                 "metadata": { "key": "chunk-a" },
@@ -1500,7 +1731,7 @@ mod tests {
             }]
         });
         let outputs = parse_inlined_results(&value).unwrap();
-        assert_eq!(outputs[0].prompt_tokens, None);
+        assert_eq!(outputs[0].usage, EmbeddingUsage::Estimated);
     }
 
     #[test]
@@ -1688,7 +1919,9 @@ mod tests {
                 "kio-tok",
                 &[GeminiBatchEmbedInput {
                     key: "chunk-a".to_owned(),
-                    text: "hello".to_owned(),
+                    content: EmbeddingContent::Text {
+                        text: "hello".to_owned(),
+                    },
                 }],
             )
             .unwrap();
@@ -1727,7 +1960,9 @@ mod tests {
                 "kio-tok",
                 &[GeminiBatchEmbedInput {
                     key: "chunk-a".to_owned(),
-                    text: "hello".to_owned(),
+                    content: EmbeddingContent::Text {
+                        text: "hello".to_owned(),
+                    },
                 }],
             )
             .expect_err("scripted create_job failure");

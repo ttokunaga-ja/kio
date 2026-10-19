@@ -76,11 +76,20 @@ impl EmbeddingTaskTarget {
                 image_hash,
                 embedding_hash,
                 image_input_receipt,
+                input_hash,
                 ..
             } => {
-                is_hash(image_hash) && is_hash(embedding_hash)
-                    // Converted images require authenticated receipt binding (O2).
-                    && image_input_receipt.is_none()
+                is_hash(image_hash)
+                    && is_hash(embedding_hash)
+                    && match image_input_receipt {
+                        Some(receipt) => {
+                            receipt.source_hash == *image_hash
+                                && receipt
+                                    .image_input_hash()
+                                    .is_ok_and(|hash| hash == *input_hash)
+                        }
+                        None => input_hash == image_hash,
+                    }
             }
             Self::Query {
                 query_hash,

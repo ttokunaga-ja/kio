@@ -524,11 +524,9 @@ mod tests {
         assert!(profile.reject_billing.is_none());
     }
 
-    /// The flag that gates image enrichment. The local adapter reads an item's
-    /// `path`/`mime`; the adopted online one does not, and declaring
-    /// `multimodal` is not the same claim.
+    /// Both local and online adapters now declare actual PNG/JPEG image support.
     #[test]
-    fn declares_the_image_object_capability_that_the_online_adapter_does_not() {
+    fn declares_image_object_capability_for_local_and_online_png_jpeg() {
         let local = LocalEmbeddingAdapter::with_client(RecordingClient::new()).profile();
         assert!(
             local
@@ -538,12 +536,26 @@ mod tests {
         );
         let online = crate::catalog::adopted_embedding_profile();
         assert!(
-            !online
+            online
                 .capability_flags
                 .iter()
-                .any(|flag| flag == IMAGE_OBJECT_CAPABILITY),
-            "the online adapter reads only `text`; claiming this flag would have \
-             it embed the empty string for every image"
+                .any(|flag| flag == IMAGE_OBJECT_CAPABILITY)
+        );
+        let descriptor = crate::catalog::embedding_descriptor(
+            &crate::tool_lock::AdapterRuntimeSettings::default(),
+            crate::catalog::EmbeddingExecution::Online(
+                crate::catalog::AdoptedEmbeddingExecution::Real,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            descriptor
+                .capability
+                .image_mime_types
+                .iter()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            ["image/jpeg", "image/png"].into_iter().collect()
         );
     }
 

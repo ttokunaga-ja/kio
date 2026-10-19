@@ -978,7 +978,8 @@ pub(crate) fn chunk_embedding_hash(
     // the context prepended to the adapter input in `send_embed_group`. Two
     // chunks with identical bodies but different filenames therefore get
     // distinct `embedding_hash`es (and distinct vectors), never a shared one.
-    let context = embedding_store::chunk_embedding_context(&chunk.raw_path);
+    let context = embedding_store::chunk_embedding_context(&chunk.raw_path)
+        .map(kio_core::cas::EmbeddingContext::Text);
     embedding_store::embedding_hash(
         EmbeddingTargetType::Chunk,
         &chunk.text_hash,
@@ -986,7 +987,7 @@ pub(crate) fn chunk_embedding_hash(
         EmbeddingDistance::Cosine,
         EmbeddingModality::Multimodal,
         &profile.profile_hash,
-        context.as_deref(),
+        context.as_ref(),
     )
     .map_err(index_to_kio)
 }

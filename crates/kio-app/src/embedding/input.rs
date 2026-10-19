@@ -94,3 +94,76 @@ pub(crate) fn authorized_local_image_object_hash(
     let hash = local_image_object_hash(scope_id, image_uri)?;
     authority.permits(&hash).then_some(hash)
 }
+
+/// Frozen input identity; no corpus-sized image byte collection is retained.
+#[derive(Clone)]
+pub(crate) struct ImageEmbeddingPlan {
+    pub(crate) target: kio_pipeline::task::EmbeddingTaskTarget,
+    pub(crate) context: Option<kio_core::cas::EmbeddingContext>,
+}
+
+impl ImageEmbeddingPlan {
+    pub(crate) fn context_key(&self) -> Option<&str> {
+        match self.context.as_ref() {
+            Some(kio_core::cas::EmbeddingContext::Image { image_input_hash }) => {
+                Some(image_input_hash)
+            }
+            _ => None,
+        }
+    }
+    pub(crate) fn receipt(&self) -> Option<&kio_core::cas::ImageInputReceipt> {
+        match &self.target {
+            kio_pipeline::task::EmbeddingTaskTarget::Image {
+                image_input_receipt,
+                ..
+            } => image_input_receipt.as_ref(),
+            _ => None,
+        }
+    }
+    pub(crate) fn embedding_hash(&self) -> &str {
+        match &self.target {
+            kio_pipeline::task::EmbeddingTaskTarget::Image { embedding_hash, .. } => embedding_hash,
+            _ => unreachable!("image input plan owns an image target"),
+        }
+    }
+}
+
+pub(crate) fn prepare_owned_embedding_image(
+    store: &ObjectStore,
+    image_hash: &str,
+    profile: &kio_adapter::catalog::DeclaredEmbeddingProfile,
+) -> Result<(
+    ImageEmbeddingPlan,
+    super::image_input::PreparedEmbeddingImage,
+)> {
+    let (bytes, mime) = read_verified_embedding_image(store, image_hash)?;
+    let prepared = super::image_input::prepare_embedding_image(image_hash, bytes, mime)?;
+    let input_hash = prepared
+        .receipt
+        .as_ref()
+        .map(|receipt| receipt.image_input_hash())
+        .transpose()?;
+    let context = input_hash
+        .as_ref()
+        .map(|hash| kio_core::cas::EmbeddingContext::Image {
+            image_input_hash: hash.clone(),
+        });
+    let embedding_hash = kio_index::embedding_store::embedding_hash(
+        kio_index::EmbeddingTargetType::Image,
+        image_hash,
+        profile.dimensions,
+        kio_index::EmbeddingDistance::Cosine,
+        kio_index::EmbeddingModality::Multimodal,
+        &profile.profile_hash,
+        context.as_ref(),
+    )
+    .map_err(crate::object_persistence::index_to_kio)?;
+    let target = kio_pipeline::task::EmbeddingTaskTarget::Image {
+        image_hash: image_hash.to_owned(),
+        embedding_hash,
+        profile_hash: profile.profile_hash.clone(),
+        input_hash: input_hash.unwrap_or_else(|| image_hash.to_owned()),
+        image_input_receipt: prepared.receipt.clone(),
+    };
+    Ok((ImageEmbeddingPlan { target, context }, prepared))
+}

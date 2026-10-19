@@ -6,7 +6,7 @@
 //! derives the current policy and secret-send consequences from those pinned
 //! objects and their complete retained owner aliases.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use kio_core::cas::is_hash;
 use kio_core::scope::Repository;
@@ -33,6 +33,9 @@ pub(crate) struct ImageAuthorityEntry {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ImageAuthorityMap {
     entries: BTreeMap<String, ImageAuthorityEntry>,
+    // A global owned hash permits access, but cannot turn another unit's
+    // Markdown link into an authenticated image citation.
+    unit_images: BTreeMap<(String, String, u64, String, String), BTreeSet<String>>,
 }
 
 impl ImageAuthorityMap {
@@ -48,6 +51,26 @@ impl ImageAuthorityMap {
             .is_some_and(|entry| entry.requires_secret_approval)
     }
 
+    pub(crate) fn unit_owns_image(
+        &self,
+        raw_hash: &str,
+        profile_hash: &str,
+        generation: u64,
+        manifest_hash: &str,
+        unit_key: &str,
+        image_hash: &str,
+    ) -> bool {
+        self.unit_images
+            .get(&(
+                raw_hash.to_owned(),
+                profile_hash.to_owned(),
+                generation,
+                manifest_hash.to_owned(),
+                unit_key.to_owned(),
+            ))
+            .is_some_and(|images| images.contains(image_hash))
+    }
+
     pub(crate) fn allowed_hashes(&self) -> impl Iterator<Item = &str> {
         self.entries
             .iter()
@@ -56,7 +79,10 @@ impl ImageAuthorityMap {
 
     #[cfg(test)]
     pub(crate) fn test_map(entries: BTreeMap<String, ImageAuthorityEntry>) -> Self {
-        Self { entries }
+        Self {
+            entries,
+            unit_images: BTreeMap::new(),
+        }
     }
 }
 
@@ -101,6 +127,19 @@ pub(crate) fn retained_image_authority(
             }
         };
         for unit in units {
+            if policy_allowed && !unit.owned_image_hashes.is_empty() {
+                authority
+                    .unit_images
+                    .entry((
+                        instance.raw_hash.clone(),
+                        instance.normalize.tool_profile_hash.clone(),
+                        instance.normalize.r#gen,
+                        instance.normalize.manifest_hash.clone(),
+                        unit.unit_key.clone(),
+                    ))
+                    .or_default()
+                    .extend(unit.owned_image_hashes.iter().cloned());
+            }
             for image_hash in unit.owned_image_hashes {
                 if !is_hash(&image_hash) {
                     return Err(KioError::schema(
@@ -163,6 +202,66 @@ mod tests {
     }
 
     #[test]
+    fn image_citation_requires_exact_owning_unit_and_manifest() {
+        use kio_core::cas::hash_bytes;
+        use std::collections::{BTreeMap, BTreeSet};
+        let source = hash_bytes(b"scan.png");
+        let image = hash_bytes(b"verified image pixels");
+        let profile = hash_bytes(b"normalizer profile");
+        let manifest = hash_bytes(b"pinned owner manifest");
+        let authority = ImageAuthorityMap {
+            entries: BTreeMap::from([(
+                image.clone(),
+                ImageAuthorityEntry {
+                    policy_allowed: true,
+                    requires_secret_approval: false,
+                },
+            )]),
+            unit_images: BTreeMap::from([(
+                (
+                    source.clone(),
+                    profile.clone(),
+                    1,
+                    manifest.clone(),
+                    "image:1".to_owned(),
+                ),
+                BTreeSet::from([image.clone()]),
+            )]),
+        };
+        assert!(
+            authority.permits(&image),
+            "the retained source owns these pixels"
+        );
+        assert!(authority.unit_owns_image(&source, &profile, 1, &manifest, "image:1", &image));
+        assert!(
+            !authority.unit_owns_image(
+                &hash_bytes(b"public-citation.md"),
+                &profile,
+                1,
+                &manifest,
+                "image:1",
+                &image
+            ),
+            "a public Markdown link does not acquire another unit's owned image"
+        );
+        assert!(
+            !authority.unit_owns_image(
+                &source,
+                &profile,
+                1,
+                &hash_bytes(b"other manifest"),
+                "image:1",
+                &image
+            ),
+            "a same-generation retry cannot borrow ownership from another manifest"
+        );
+        assert!(
+            !authority.unit_owns_image(&source, &profile, 1, &manifest, "image:2", &image),
+            "another unit in one manifest cannot supply this image citation"
+        );
+    }
+
+    #[test]
     fn public_alias_does_not_remove_secret_requirement() {
         let mut entries = std::collections::BTreeMap::new();
         entries.insert(
@@ -172,7 +271,10 @@ mod tests {
                 requires_secret_approval: true,
             },
         );
-        let authority = ImageAuthorityMap { entries };
+        let authority = ImageAuthorityMap {
+            entries,
+            ..ImageAuthorityMap::default()
+        };
         assert!(
             authority
                 .permits("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
