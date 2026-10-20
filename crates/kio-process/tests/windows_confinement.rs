@@ -646,7 +646,14 @@ fn output_cap_terminates_renderer_promptly() {
 // The child uses filesystem handshakes so readiness and permitted completion
 // are explicit. No network delay tool or new helper binary is required.
 fn stage_launcher_and_child(scratch: &Path, child_action: &str, redirect_pipes: bool) {
-    let redirect = if redirect_pipes { " >nul 2>nul" } else { "" };
+    // Detach both inherited output pipes without opening the host's NUL device:
+    // AppContainer access to that device depends on its system ACL. Scratch is
+    // explicitly granted to this invocation, including on hosted Server runners.
+    let redirect = if redirect_pipes {
+        " >child.stdout 2>child.stderr"
+    } else {
+        ""
+    };
     std::fs::write(
         scratch.join("launcher.cmd"),
         format!("@echo off\r\nstart \"\" /b \"%SystemRoot%\\System32\\cmd.exe\" /d /c child.cmd{redirect}\r\nexit /b 7\r\n"),
@@ -687,7 +694,11 @@ fn release_ready_child<T>(scratch: &Path, result: &mpsc::Receiver<T>) {
 #[test]
 fn launcher_exit_and_pipe_eof_wait_for_descendant_output() {
     let scratch = tempfile::tempdir().unwrap();
-    stage_launcher_and_child(scratch.path(), "echo complete>child-output", true);
+    stage_launcher_and_child(
+        scratch.path(),
+        "echo complete>child-output\r\necho descendant-stdout\r\necho descendant-stderr 1>&2",
+        true,
+    );
     let (sandbox, root) = sandbox(scratch.path());
     let (sender, result) = mpsc::channel();
     let child_environment = environment(root, scratch.path());
@@ -707,6 +718,20 @@ fn launcher_exit_and_pipe_eof_wait_for_descendant_output() {
         .unwrap();
     worker.join().unwrap();
     assert_eq!(output.status.code(), Some(7), "preserve launcher status");
+    assert!(output.stdout.is_empty(), "descendant stdout leaked to host");
+    assert!(output.stderr.is_empty(), "descendant stderr leaked to host");
+    for (name, expected) in [
+        ("child.stdout", "descendant-stdout"),
+        ("child.stderr", "descendant-stderr"),
+    ] {
+        assert_eq!(
+            std::fs::read_to_string(scratch.path().join(name))
+                .unwrap()
+                .trim(),
+            expected,
+            "descendant redirection must stay inside scratch"
+        );
+    }
     assert_eq!(
         std::fs::read_to_string(scratch.path().join("child-output"))
             .unwrap()

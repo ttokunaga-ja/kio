@@ -5,7 +5,7 @@ use kio_core::store_dir::{Publication, StoreDirectory};
 fn store_root() -> tempfile::TempDir {
     tempfile::Builder::new()
         .prefix("kio-store-directory-")
-        .tempdir_in(std::env::current_dir().unwrap())
+        .tempdir()
         .unwrap()
 }
 
