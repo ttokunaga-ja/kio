@@ -1046,6 +1046,412 @@ fn a_short_result_set_does_not_settle_the_row_as_succeeded() {
     );
 }
 
+/// O3 Runtime Red: proven keys isolate a vector failure, while the successful
+/// member remains durable/searchable and complete usage settles the original job.
+#[test]
+fn o3_keyed_invalid_batch_vector_preserves_physical_success_and_charge() {
+    let cases = ["zero_norm", "non_numeric", "missing_values"]
+        .into_iter()
+        .flat_map(|kind| {
+            [false, true]
+                .into_iter()
+                .map(move |reverse| (kind, reverse, false))
+        })
+        .collect::<Vec<_>>();
+    keyed_invalid_batch_vector_cases(&cases);
+}
+
+/// A terminal contract hold must retain known valid bytes for publication
+/// recovery; it must not turn a source-write failure into another submission.
+#[test]
+fn o3_terminal_contract_known_result_republishes_after_source_failure_without_resubmit() {
+    keyed_invalid_batch_vector_cases(&[("zero_norm", false, true), ("zero_norm", true, true)]);
+}
+
+fn keyed_invalid_batch_vector_cases(cases: &[(&str, bool, bool)]) {
+    for &(invalid_kind, reverse, publication_fault) in cases {
+        let dir = fixture_dir();
+        prepare_private_home(&dir);
+        std::fs::write(
+            root(&dir).join("auth.md"),
+            "# 認証仕様\n\nトークン TTL は 3600 秒です。\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root(&dir).join("billing.md"),
+            "# 請求仕様\n\n締め日は毎月 15 日です。\n",
+        )
+        .unwrap();
+        kio(&dir).arg("init").assert().success();
+        kio(&dir).args(["ledger", "init"]).assert().success();
+        approve_online_profiles(&dir);
+        let capture = root(&dir).join("keyed-vector-capture.jsonl");
+        let job_name = "batches/o3-keyed-vector";
+        let submit = serde_json::json!({
+            "state_sequence": ["BATCH_STATE_PENDING"],
+            "job_name": job_name,
+            "capture_path": capture.to_string_lossy(),
+        })
+        .to_string();
+        json(&dir, &submit, &["index", "--online"]);
+        let keys = submitted_keys(&capture);
+        assert_eq!(keys.len(), 2, "authenticated two-member fixture: {keys:?}");
+        assert_ne!(keys[0], keys[1]);
+        // Materialize immutable observations and close before the next CLI.
+        let original = {
+            let ledger =
+                support::immutable_sqlite(dir.path().join("home/data/kio/cost-ledger.sqlite"));
+            ledger
+                .query_row(
+                    "SELECT scope_id, adapter_kind, input_hash, tool_profile_hash,
+                        submission_seq, intent_token, estimated_usd, batch_job_id
+                 FROM batch_requests WHERE adapter_kind='embedding' AND scope_id<>'device'",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, f64>(6)?,
+                            row.get::<_, String>(7)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        assert_eq!(original.7, job_name);
+        assert!(kio_pipeline::ledger::ops::is_uuid_v7(&original.5));
+        assert!((original.6 - 2.0 * 8192.0 * 0.10 / 1_000_000.0).abs() < 1e-12);
+        let submitted: Value = serde_json::from_str(
+            std::fs::read_to_string(&capture)
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            kio_adapter::gemini_batch_client::display_name_intent_token(
+                submitted["display_name"].as_str().unwrap(),
+            ),
+            Some(original.5.as_str()),
+            "the actual submit carries the original intent",
+        );
+        let component = 1.0f64 / (768.0f64).sqrt();
+        let mut responses = vec![
+            serde_json::json!({
+                "metadata": {"key": keys[0]},
+                "output": {"response": {
+                    "embedding": {"values": vec![component; 768]},
+                    "usageMetadata": {"promptTokenCount": 40,
+                        "promptTokenDetails": [{"modality": "TEXT", "tokenCount": 40}]},
+                }},
+            }),
+            serde_json::json!({
+                "metadata": {"key": keys[1]},
+                "output": {"response": {
+                    "embedding": {"values": vec![0.0; 768]},
+                    "usageMetadata": {"promptTokenCount": 7,
+                        "promptTokenDetails": [{"modality": "TEXT", "tokenCount": 7}]},
+                }},
+            }),
+        ];
+        match invalid_kind {
+            "non_numeric" => {
+                responses[1]["output"]["response"]["embedding"]["values"] =
+                    serde_json::json!(["invalid"])
+            }
+            "missing_values" => {
+                responses[1]["output"]["response"]["embedding"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("values");
+            }
+            _ => {}
+        }
+        if reverse {
+            responses.reverse();
+        }
+        let complete = serde_json::json!({
+            "state_sequence": ["BATCH_STATE_SUCCEEDED"],
+            "job_name": job_name,
+            "capture_path": capture.to_string_lossy(),
+            "inlined_responses": responses,
+        })
+        .to_string();
+        let terminal = || {
+            let ledger =
+                support::immutable_sqlite(dir.path().join("home/data/kio/cost-ledger.sqlite"));
+            ledger
+                .prepare(
+                    "SELECT l.scope_id,l.adapter_kind,l.input_hash,l.tool_profile_hash,
+                        l.submission_seq,l.batch_job_id,l.outcome,l.estimated,l.usd,l.month,
+                        strftime('%Y-%m',l.recorded_at/1000,'unixepoch'),
+                        b.state,b.intent_token IS NULL,b.contract_violation_count
+                 FROM cost_ledger l JOIN batch_requests b
+                 USING(scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq)
+                 WHERE l.adapter_kind='embedding' AND l.scope_id<>'device'",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((
+                        (
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, i64>(4)?,
+                        ),
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, bool>(7)?,
+                        row.get::<_, f64>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, bool>(12)?,
+                        row.get::<_, i64>(13)?,
+                    ))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        let verify_terminal = || {
+            let settled = terminal();
+            assert_eq!(settled.len(), 1, "{settled:?}");
+            let charge = &settled[0];
+            assert_eq!(
+                &charge.0,
+                &(
+                    original.0.clone(),
+                    original.1.clone(),
+                    original.2.clone(),
+                    original.3.clone(),
+                    original.4
+                )
+            );
+            assert_eq!(charge.1, original.7);
+            assert_eq!(charge.2, "contract_violation");
+            assert!(
+                !charge.3,
+                "both valid complete TEXT invoices remain billable"
+            );
+            assert!((charge.4 - 47.0 * 0.10 / 1_000_000.0).abs() < 1e-12);
+            assert_eq!(
+                charge.5, charge.6,
+                "recorded_at UTC month, not current/reservation month"
+            );
+            assert_eq!(charge.7, 3);
+            assert_eq!(
+                charge.9, 1,
+                "typed contract violation keeps the Batch send hold"
+            );
+            assert!(
+                charge.8,
+                "terminal original inline attempt must release its token"
+            );
+            settled
+        };
+        let mut command = kio(&dir);
+        command.env(
+            "KIO_TEST_GEMINI_BATCH",
+            script_with_attribution(&dir, &complete),
+        );
+        if publication_fault {
+            command.env(
+                "KIO_TEST_EMBEDDING_PUBLICATION_FAULT",
+                "before_source_write",
+            );
+        }
+        let collect = command
+            .args(["--json", "batch", "resume"])
+            .output()
+            .unwrap();
+        let diagnostic = format!(
+            "invalid_kind={invalid_kind}, reverse={reverse}, exit={:?}, stdout={}, stderr={}",
+            collect.status.code(),
+            String::from_utf8_lossy(&collect.stdout),
+            String::from_utf8_lossy(&collect.stderr)
+        );
+        let fault_snapshot = if publication_fault {
+            {
+                let source = support::immutable_sqlite(root(&dir).join(".kio/index/sqlite.db"));
+                let count: i64 = source
+                    .query_row(
+                        "SELECT COUNT(*) FROM embeddings WHERE id IN (?1,?2)",
+                        [&keys[0], &keys[1]],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(
+                    count, 0,
+                    "source-write fault must actually be reached: {diagnostic}"
+                );
+            }
+            let store = kio_core::cas::ObjectStore::new(root(&dir).join(".kio"));
+            let known = store
+                .read_embedding(&keys[0])
+                .expect("successful keyed vector must already be durable in CAS at the source cut");
+            assert_eq!(known.dimensions, 768);
+            assert!(!store.embedding_hashes().unwrap().contains(&keys[1]));
+            let before_tasks =
+                std::fs::read_to_string(root(&dir).join(".kio/tasks.jsonl")).unwrap();
+            let before = before_tasks
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .rfind(|task| {
+                    task["type"] == "embedding"
+                        && task["embedding_target"]["embedding_hash"] == keys[0]
+                })
+                .expect("original successful member Task remains reconstructible");
+            assert_ne!(
+                before["status"], "done",
+                "Task Done must await source publication"
+            );
+            assert_eq!(
+                ledger_query(
+                    &dir,
+                    "SELECT (SELECT COUNT(*) FROM batch_requests WHERE adapter_kind='embedding' AND scope_id<>'device') || '|' || (SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind='embedding' AND scope_id<>'device')"
+                ),
+                "1|1",
+                "fault must leave exactly the original attempt and terminal invoice",
+            );
+            let settled_before = verify_terminal();
+            let known_bytes = known.to_bytes().unwrap();
+            // This ordinary recovery has no fault env, no reset and no resend
+            // permission. It must publish from the terminal known result even
+            // while the original typed scope-wide Batch hold remains active.
+            run_ignoring_output(&dir, &complete, &["batch", "resume"]);
+            Some((settled_before, known_bytes))
+        } else {
+            None
+        };
+        let (source_vector, source_chunk, source_path) = {
+            let source = support::immutable_sqlite(root(&dir).join(".kio/index/sqlite.db"));
+            let count = |key: &str| -> i64 {
+                source
+                    .query_row(
+                        "SELECT COUNT(*) FROM embeddings WHERE id=?1",
+                        [key],
+                        |row| row.get(0),
+                    )
+                    .unwrap()
+            };
+            // This physical contract observable is the intended Runtime Red.
+            // It runs before Task/exit/helper assertions, even if collection
+            // rejected the response before reaching the common converter.
+            assert_eq!(
+                count(&keys[0]),
+                1,
+                "valid keyed sibling must publish: {diagnostic}"
+            );
+            assert_eq!(
+                count(&keys[1]),
+                0,
+                "zero-norm member must not publish: {diagnostic}"
+            );
+            source
+                .query_row(
+                    "SELECT e.vector,c.chunk_id,c.raw_path FROM embeddings e JOIN chunks c
+                 ON c.text_hash=e.target_id WHERE e.id=?1",
+                    [&keys[0]],
+                    |row| {
+                        Ok((
+                            row.get::<_, Vec<u8>>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .unwrap()
+        };
+        let store = kio_core::cas::ObjectStore::new(root(&dir).join(".kio"));
+        let valid = store.read_embedding(&keys[0]).unwrap();
+        assert_eq!(valid.dimensions, 768);
+        assert_eq!(valid.profile_hash, original.3);
+        assert_eq!(valid.vector.len(), 768);
+        let norm = valid
+            .vector
+            .iter()
+            .map(|v| f64::from(*v).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
+        assert_eq!(
+            source_vector,
+            kio_index::embedding_store::f32_to_le_bytes(&valid.vector)
+        );
+        assert!(!store.embedding_hashes().unwrap().contains(&keys[1]));
+        let tasks = std::fs::read_to_string(root(&dir).join(".kio/tasks.jsonl")).unwrap();
+        let task = |key: &str| -> Value {
+            tasks
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .rfind(|value| {
+                    value["type"] == "embedding"
+                        && value["embedding_target"]["embedding_hash"] == key
+                })
+                .unwrap_or_else(|| panic!("missing member {key}: {tasks}"))
+        };
+        assert_eq!(task(&keys[0])["status"], "done");
+        let failed = task(&keys[1]);
+        assert_eq!(failed["status"], "failed", "{failed}");
+        assert_eq!(failed["fallback_reason"], "contract_violation", "{failed}");
+        assert!(failed["attempts"].as_u64().unwrap_or(0) >= 1, "{failed}");
+        let settled = verify_terminal();
+        if let Some((before, cas_bytes)) = &fault_snapshot {
+            assert_eq!(
+                ledger_query(
+                    &dir,
+                    "SELECT (SELECT COUNT(*) FROM batch_requests WHERE adapter_kind='embedding' AND scope_id<>'device') || '|' || (SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind='embedding' AND scope_id<>'device')"
+                ),
+                "1|1",
+                "republication must not reserve or settle another attempt",
+            );
+            assert_eq!(
+                &settled, before,
+                "republication must retain the exact terminal contract audit"
+            );
+            assert_eq!(
+                &valid.to_bytes().unwrap(),
+                cas_bytes,
+                "known vector object bytes must remain unchanged"
+            );
+        }
+        // Ordinary recovery must not re-submit the failed member or success.
+        run_ignoring_output(&dir, &complete, &["batch", "resume"]);
+        let searched = json(&dir, &complete, &["search", "認証", "--mode", "vector"]);
+        assert_eq!(searched["resolved_mode"], "vector", "{searched}");
+        let results = searched["results"].as_array().unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "only the valid member is searchable: {searched}"
+        );
+        assert_eq!(results[0]["chunk_hash"], source_chunk, "{searched}");
+        assert_eq!(
+            results[0]["evidence_pointer"]["path_at_commit"], source_path,
+            "{searched}"
+        );
+        assert_eq!(
+            terminal(),
+            settled,
+            "restart/search must retain original terminal billing"
+        );
+        let creates = std::fs::read_to_string(&capture)
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|call| call["call"] == "create_embedding_job")
+            .count();
+        assert_eq!(creates, 1, "collection/recovery/search must not resubmit");
+    }
+}
+
 #[test]
 fn partial_batch_result_publishes_valid_member_and_retries_only_failed_member() {
     let dir = fixture_dir();
@@ -1404,3 +1810,6 @@ fn an_unreachable_row_does_not_block_collection_of_the_others() {
         "the unreachable row must be held, not settled"
     );
 }
+
+#[path = "step5_embedding_batch_lane/o3_scope_hold.rs"]
+mod o3_scope_hold;

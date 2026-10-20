@@ -73,6 +73,26 @@ pub(crate) fn run_embedding_adapter(
     idempotency_token: Option<String>,
     control: &ControlHandle,
 ) -> std::result::Result<EmbeddingCompleted, TaskExecutionFailure> {
+    #[cfg(debug_assertions)]
+    if let Some(path) = &control.debug().cli.task_embed_trace {
+        let input_type_name = match input_type {
+            EmbeddingInputType::Text | EmbeddingInputType::MarkdownChunk => "text",
+            EmbeddingInputType::Image | EmbeddingInputType::ImageObject => "image",
+            EmbeddingInputType::Query => "query",
+        };
+        let mut line = serde_json::json!({
+            "input_type": input_type_name,
+            "member_ids": items.iter().map(|item| &item.id).collect::<Vec<_>>(),
+            "intent_token": &idempotency_token,
+        })
+        .to_string();
+        line.push('\n');
+        let _ = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .and_then(|mut file| file.write_all(line.as_bytes()));
+    }
     let profile = declared_embedding_profile(execution);
     let expected = EmbeddingAcceptance {
         dimensions: u32::try_from(profile.dimensions).map_err(|_| TaskExecutionFailure {

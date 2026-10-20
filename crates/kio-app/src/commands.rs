@@ -384,6 +384,7 @@ pub struct ReindexArgs {
 pub enum SearchMode {
     Auto,
     Text,
+    Image,
     Vector,
     Hybrid,
 }

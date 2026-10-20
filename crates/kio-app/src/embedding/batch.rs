@@ -300,9 +300,14 @@ pub(crate) fn completed_batch_result(
         .iter()
         .map(|result| {
             let result_value = match (&result.values, &result.error) {
-                (Some(values), None) => EmbeddingMemberResult::Vector {
-                    vector: normalize_embedding_vector(values, job.binding.dimensions)?,
-                },
+                (Some(values), None) => {
+                    match normalize_embedding_vector(values, job.binding.dimensions) {
+                        Ok(vector) => EmbeddingMemberResult::Vector { vector },
+                        Err(_) => EmbeddingMemberResult::Failed {
+                            reason: retry_reason(RetryErrorKind::ContractViolation).to_owned(),
+                        },
+                    }
+                }
                 (None, Some(error)) => EmbeddingMemberResult::Failed {
                     reason: retry_reason(batch_member_failure_kind(error)).to_owned(),
                 },
@@ -394,14 +399,30 @@ fn settle_batch_staged_job(
             .batch_job_id
             .as_deref()
             .ok_or_else(|| KioError::schema("staged batch job lost remote handle"))?;
+        // A keyed member violation does not discard valid siblings or their
+        // known usage. Keep the job-level durable hold while publishing those
+        // siblings from the staged result, including after a terminal restart.
+        let contract_violation = result.members.iter().any(|member| {
+            matches!(&member.result, EmbeddingMemberResult::Failed { reason }
+                if reason == retry_reason(RetryErrorKind::ContractViolation))
+        });
+        let (outcome, state, error) = if contract_violation {
+            (
+                Outcome::ContractViolation,
+                BatchState::Terminal,
+                Some(EMBEDDING_BATCH_RESULT_CONTRACT_ERROR),
+            )
+        } else {
+            (Outcome::Succeeded, BatchState::Completed, None)
+        };
         settle_batch_charge_terminal(
             ledger,
             &job.key,
             &job.intent_token,
             job_name,
-            Outcome::Succeeded,
-            BatchState::Completed,
-            None,
+            outcome,
+            state,
+            error,
             embedding_billed_from_usage(
                 ctx.settings,
                 match &result.usage {
@@ -423,11 +444,37 @@ fn settle_batch_staged_job(
                     kio_adapter::types::EmbeddingInputType::MarkdownChunk
                 },
             ),
-            false,
+            contract_violation,
             true,
         )?;
     }
     Ok(true)
+}
+
+fn reject_embedding_batch_contract_holds(
+    scope_id: &str,
+    contract_holds: &[BatchRequestRow],
+) -> Result<()> {
+    if !contract_holds.is_empty() {
+        let attempts = contract_holds
+            .iter()
+            .map(|row| {
+                json!({
+                    "input_hash": row.key.input_hash,
+                    "tool_profile_hash": row.key.tool_profile_hash,
+                    "submission_seq": row.submission_seq,
+                    "selector": format!("{}/{}/{}/{}", row.key.scope_id, row.key.adapter_kind, row.key.input_hash, row.key.tool_profile_hash),
+                })
+            })
+            .collect::<Vec<_>>();
+        return Err(KioError::new(
+            "KIO-E-EMBED-BATCH-CONTRACT-HOLD-001",
+            "new embedding batch submissions are held after a malformed result; run kio batch retry --reset-violations <selector> --yes for each blocked attempt",
+            json!({"scope_id": scope_id, "adapter_kind": EMBEDDING_ADAPTER_KIND, "blocked_attempts": attempts}),
+            ExitCode::PermanentFailure,
+        ));
+    }
+    Ok(())
 }
 
 /// Submit this pass's pending embeddings as provider batch jobs and return.
@@ -469,24 +516,8 @@ pub(crate) fn submit_embedding_batch_jobs(
     })?;
     // The durable batch breaker precedes client resolution: losing the batch
     // client must not turn a blocked batch into an automatic sync resend.
-    if !contract_holds.is_empty() && !plan.to_send.is_empty() {
-        let attempts = contract_holds
-            .iter()
-            .map(|row| {
-                json!({
-                    "input_hash": row.key.input_hash,
-                    "tool_profile_hash": row.key.tool_profile_hash,
-                    "submission_seq": row.submission_seq,
-                    "selector": format!("{}/{}/{}/{}", row.key.scope_id, row.key.adapter_kind, row.key.input_hash, row.key.tool_profile_hash),
-                })
-            })
-            .collect::<Vec<_>>();
-        return Err(KioError::new(
-            "KIO-E-EMBED-BATCH-CONTRACT-HOLD-001",
-            "new embedding batch submissions are held after a malformed result; run kio batch retry --reset-violations <selector> --yes for each blocked attempt",
-            json!({"scope_id": scope_id, "adapter_kind": EMBEDDING_ADAPTER_KIND, "blocked_attempts": attempts}),
-            ExitCode::PermanentFailure,
-        ));
+    if !plan.to_send.is_empty() {
+        reject_embedding_batch_contract_holds(scope_id, &contract_holds)?;
     }
     // The lazy context is loaded only for a configured real client. Invalid
     // recovery authority is a hard hold, never permission to switch lanes.
@@ -1289,6 +1320,15 @@ pub(crate) fn submit_image_embedding_job(
             return Ok(ImageBatchDispatch::Handled(ExecOutcome::default()));
         }
     }
+    // Existing in-flight/known jobs above remain collectible. A genuinely
+    // new image job shares the same scope-wide typed Batch breaker as text.
+    let contract_holds = kio_pipeline::ledger::ops::unreset_contract_violations_for_scope_adapter(
+        ledger,
+        &scope_id,
+        EMBEDDING_ADAPTER_KIND,
+    )
+    .map_err(pipeline_to_kio)?;
+    reject_embedding_batch_contract_holds(&scope_id, &contract_holds)?;
     let policy = current_embedding_policy(repo)?;
     admit_embedding_transport(
         ctx.settings,

@@ -2198,6 +2198,31 @@ fn run_image_embedding_enrichment(
                     target: plan.target.clone(),
                 }],
             };
+            if let Some(row) = get_batch_request(ledger, &key).map_err(pipeline_to_kio)?
+                && embedding_is_online(embedding.execution)
+                && sync_result_unknown_fenced(Some(&row))
+            {
+                cost_ledger_rows_for_key(ledger, &key)
+                    .map_err(pipeline_to_kio)?
+                    .into_iter()
+                    .find(|cost| {
+                        cost.submission_seq == row.submission_seq
+                            && cost.outcome == Outcome::UnknownSettled
+                            && kio_pipeline::ledger::ops::is_uuid_v7(&cost.batch_job_id)
+                    })
+                    .ok_or_else(|| KioError::schema("fenced image lost its terminal attempt"))?;
+                apply_image_embedding_failure(
+                    task_store,
+                    &image_output_ref,
+                    &TaskExecutionFailure {
+                        retry_kind: RetryErrorKind::ResultUnknown,
+                        retry_after_ms: None,
+                    },
+                    &now,
+                    &mut outcome,
+                )?;
+                continue;
+            }
             let job = match reserve_embedding_job(
                 ledger,
                 &EmbeddingReserveRequest {
@@ -2224,16 +2249,28 @@ fn run_image_embedding_enrichment(
             )
             .map_err(pipeline_to_kio)?
             {
-                EmbeddingReservationOutcome::Reserved(job)
-                | EmbeddingReservationOutcome::KnownResult(job) => job,
+                EmbeddingReservationOutcome::Reserved(job) => {
+                    invocation
+                        .control
+                        .checkpoint(kio_core::durability::DurabilityPoint::EmbeddingReserved)?;
+                    job
+                }
+                EmbeddingReservationOutcome::KnownResult(job) => job,
                 EmbeddingReservationOutcome::InFlight(job) => {
+                    let row = get_batch_request(ledger, &key)
+                        .map_err(pipeline_to_kio)?
+                        .ok_or_else(|| KioError::schema("image attempt lost reservation"))?;
+                    if row
+                        .stale_after_at
+                        .is_none_or(|deadline| deadline > invocation.control.now_millis())
+                    {
+                        outcome.inflight += 1;
+                        continue;
+                    }
                     if job.binding.local {
                         kio_pipeline::ledger::ops::settle_local_embedding_crash(ledger, &job)
                             .map_err(pipeline_to_kio)?;
                     } else {
-                        let row = get_batch_request(ledger, &key)
-                            .map_err(pipeline_to_kio)?
-                            .ok_or_else(|| KioError::schema("image attempt lost reservation"))?;
                         settle_task_charge_unknown(
                             ledger,
                             &key,
@@ -2263,6 +2300,75 @@ fn run_image_embedding_enrichment(
             let staged = if job.known_result.is_some() {
                 job
             } else {
+                // A reservation is not permission to send after consent or
+                // policy changes. A proven-unsent request closes at zero.
+                let external_excluded = if descriptor.effects.egress {
+                    match embedding.repo.image_external_send_allowed() {
+                        Ok(allowed) => !allowed,
+                        Err(error) => {
+                            close_unsent_image_attempt(
+                                ledger,
+                                &job,
+                                task_store,
+                                TaskStatus::Skipped,
+                                "image_policy_changed",
+                            )?;
+                            return Err(error);
+                        }
+                    }
+                } else {
+                    false
+                };
+                if external_excluded {
+                    close_unsent_image_attempt(
+                        ledger,
+                        &job,
+                        task_store,
+                        TaskStatus::Skipped,
+                        "images_excluded_from_external_send",
+                    )?;
+                    continue;
+                }
+                if let Err(error) = embedding.current_policy.revalidate() {
+                    close_unsent_image_attempt(
+                        ledger,
+                        &job,
+                        task_store,
+                        TaskStatus::Skipped,
+                        "image_policy_changed",
+                    )?;
+                    return Err(pipeline_to_kio(error));
+                }
+                if let Err(error) = admit_embedding_transport(
+                    adapter_settings,
+                    embedding.repo,
+                    embedding.execution,
+                    embedding.profile,
+                    embedding.current_policy,
+                    image_authority.requires_secret_approval(image_hash),
+                ) {
+                    let reason = if image_authority.requires_secret_approval(image_hash)
+                        && matches!(
+                            embedding_secrets_allowed(
+                                adapter_settings,
+                                embedding.repo,
+                                embedding.profile,
+                            ),
+                            Ok(false)
+                        ) {
+                        "secrets_tier_b_hold"
+                    } else {
+                        "network_opt_in_required"
+                    };
+                    close_unsent_image_attempt(
+                        ledger,
+                        &job,
+                        task_store,
+                        TaskStatus::Pending,
+                        reason,
+                    )?;
+                    return Err(error);
+                }
                 let result = run_embedding_adapter(
                     adapter_settings,
                     embedding.execution,
@@ -2273,21 +2379,79 @@ fn run_image_embedding_enrichment(
                 );
                 let outcome = match result {
                     Ok(outcome) => outcome,
-                    Err(_) => {
-                        if job.binding.local {
-                            settle_local_image_failure(ledger, &key, &job.intent_token)?;
+                    Err(mut failure) => {
+                        let row = get_batch_request(ledger, &key)
+                            .map_err(pipeline_to_kio)?
+                            .ok_or_else(|| KioError::schema("image send lost reservation"))?;
+                        let known_rejection = matches!(
+                            failure.retry_kind,
+                            RetryErrorKind::AuthError
+                                | RetryErrorKind::RateLimit
+                                | RetryErrorKind::QuotaExceeded
+                        );
+                        if known_rejection || job.binding.local {
+                            terminal_transaction(
+                                ledger,
+                                &TerminalWrite {
+                                    key: &key,
+                                    outcome: if job.binding.local {
+                                        Outcome::ContractViolation
+                                    } else {
+                                        Outcome::SubmitRejected
+                                    },
+                                    billed: BilledAmount {
+                                        usd: 0.0,
+                                        estimated: false,
+                                    },
+                                    ledger_batch_job_id: &job.intent_token,
+                                    next_state: BatchState::Terminal,
+                                    error: Some(retry_reason(failure.retry_kind)),
+                                    increment_contract_violation: false,
+                                    attempts_delta: 1,
+                                    clear_intent_token: true,
+                                    intent_token_guard: Some(&job.intent_token),
+                                    reseat_submission_seq: false,
+                                },
+                            )
+                            .map_err(pipeline_to_kio)?;
                         } else {
-                            let row = get_batch_request(ledger, &key)
-                                .map_err(pipeline_to_kio)?
-                                .ok_or_else(|| KioError::schema("image send lost reservation"))?;
                             settle_task_charge_unknown(
                                 ledger,
                                 &key,
                                 &job.intent_token,
                                 row.estimated_usd,
                             )?;
+                            failure.retry_kind = RetryErrorKind::ResultUnknown;
+                            failure.retry_after_ms = None;
                         }
-                        set_image_task_status(task_store, &image_output_ref, false, None)?;
+                        cost_ledger_rows_for_key(ledger, &key)
+                            .map_err(pipeline_to_kio)?
+                            .into_iter()
+                            .find(|cost| {
+                                cost.batch_job_id == job.intent_token
+                                    && cost.outcome
+                                        == if job.binding.local {
+                                            Outcome::ContractViolation
+                                        } else if known_rejection {
+                                            Outcome::SubmitRejected
+                                        } else {
+                                            Outcome::UnknownSettled
+                                        }
+                                    && (cost.submission_seq == job.submission_seq
+                                        || (job.submission_seq.checked_add(1)
+                                            == Some(cost.submission_seq)
+                                            && cost.outcome == Outcome::UnknownSettled))
+                            })
+                            .ok_or_else(|| {
+                                KioError::schema("failed image lost its terminal attempt")
+                            })?;
+                        apply_image_embedding_failure(
+                            task_store,
+                            &image_output_ref,
+                            &failure,
+                            &now,
+                            &mut outcome,
+                        )?;
                         continue;
                     }
                 };
@@ -2444,6 +2608,65 @@ fn run_image_embedding_enrichment(
     Ok(outcome)
 }
 
+/// Close a reservation whose live owner proves it has not dispatched.
+fn close_unsent_image_attempt(
+    ledger: &LedgerDb,
+    job: &EmbeddingJob,
+    tasks: &TaskStore,
+    status: TaskStatus,
+    reason: &str,
+) -> Result<()> {
+    terminal_transaction(
+        ledger,
+        &TerminalWrite {
+            key: &job.key,
+            outcome: Outcome::Abandoned,
+            billed: BilledAmount {
+                usd: 0.0,
+                estimated: false,
+            },
+            ledger_batch_job_id: &job.intent_token,
+            next_state: BatchState::Terminal,
+            error: Some(reason),
+            increment_contract_violation: false,
+            attempts_delta: 0,
+            clear_intent_token: true,
+            intent_token_guard: Some(&job.intent_token),
+            reseat_submission_seq: false,
+        },
+    )
+    .map_err(pipeline_to_kio)?;
+    let target = &job.binding.members[0].target;
+    tasks
+        .update_matching(|task| {
+            if task.task_type != TaskType::Embedding
+                || task.embedding_target.as_ref() != Some(target)
+            {
+                return false;
+            }
+            task.status = status;
+            task.fallback_reason = Some(reason.to_owned());
+            task.hold_reason = None;
+            task.deadline = None;
+            task.heartbeat_at = None;
+            task.next_retry_at = None;
+            // An older retained claim belongs to its original attempt. Do not
+            // erase it while demoting a task to a secret/network hold.
+            if task
+                .reservation_id
+                .as_deref()
+                .is_none_or(|token| token == job.intent_token)
+            {
+                task.reservation_id = None;
+                task.reserved_usd = None;
+                task.reserved_month = None;
+            }
+            true
+        })
+        .map_err(pipeline_to_kio)?;
+    finish_embedding_publication(ledger, job).map_err(pipeline_to_kio)
+}
+
 /// Complete only this exact typed/materialized image. Done tasks keep their
 /// successful attempt stamp; other eligible cached states follow the shared
 /// paid-task eligibility policy. A retained stamp needs proof of its original
@@ -2534,6 +2757,22 @@ fn set_image_task_status(
             true
         })
         .map_err(pipeline_to_kio)?;
+    Ok(())
+}
+
+fn apply_image_embedding_failure(
+    task_store: &TaskStore,
+    output_ref: &str,
+    failure: &TaskExecutionFailure,
+    now: &str,
+    outcome: &mut ExecOutcome,
+) -> Result<()> {
+    let transitions =
+        BTreeMap::from([(output_ref.to_owned(), embedding_failure_transition(failure))]);
+    // Failure transitions preserve any previous claim, matching text tasks.
+    outcome.failed_retryable +=
+        apply_embedding_transitions(task_store, &transitions, now, &BTreeMap::new())?;
+    count_embedding_failure(outcome, failure.retry_kind, 1);
     Ok(())
 }
 
@@ -2672,6 +2911,14 @@ pub(crate) fn publish_image_job_member(
             image_input_receipt: image_input_receipt.clone(),
         },
     };
+    #[cfg(debug_assertions)]
+    if _ctx.control.debug().cli.embedding_publication_fault.known()
+        == Some(&EmbeddingPublicationFault::BeforeSourceWrite)
+    {
+        return Err(KioError::schema(
+            "injected image publication failure before CAS/source write",
+        ));
+    }
     publish_verified_embedding(repo, embedding_hash, &object)?;
     embedding_store::write_image_embedding(
         conn,

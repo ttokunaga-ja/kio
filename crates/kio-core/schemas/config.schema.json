@@ -63,7 +63,7 @@
       "properties": {
         "default_mode": {
           "type": "string",
-          "enum": ["auto", "text", "vector", "hybrid"]
+          "enum": ["auto", "text", "image", "vector", "hybrid"]
         },
         "related_images_min_area_ratio": {
           "type": "number",

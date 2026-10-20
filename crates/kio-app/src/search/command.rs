@@ -477,15 +477,38 @@ fn run_search_inner(
     let replica_embedding_states = exec_scopes
         .iter()
         .map(|exec| {
-            replica_embedding_state(
-                adapter_settings,
-                replica_headers
-                    .get(&exec.target.scope_id)
-                    .and_then(Option::as_ref),
-                ctx.control,
-            )
+            let header = replica_headers
+                .get(&exec.target.scope_id)
+                .and_then(Option::as_ref);
+            if requested_mode == SearchMode::Image {
+                let profiles = replica
+                    .as_ref()
+                    .map(|replica| replica.image_embedding_profiles(&exec.target.scope_id))
+                    .transpose()
+                    .map_err(|error| {
+                        KioError::new(
+                            "KIO-E-AGGREGATOR-001",
+                            "the device search replica could not read image profiles",
+                            json!({"reason":error.to_string()}),
+                            ExitCode::PartialFailure,
+                        )
+                    })?
+                    .unwrap_or_default();
+                Ok(crate::search::scope::replica_image_embedding_state(
+                    adapter_settings,
+                    header,
+                    &profiles,
+                    ctx.control,
+                ))
+            } else {
+                Ok(replica_embedding_state(
+                    adapter_settings,
+                    header,
+                    ctx.control,
+                ))
+            }
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
 
     // Mode resolution (05 §1.1). O2: the query embedding is SENT to the online
     // embedding endpoint, so it must not be computed until the resolved mode
@@ -560,7 +583,7 @@ fn run_search_inner(
     // never sent.
     let uses_vectors = matches!(
         precheck_mode.resolved,
-        SearchMode::Hybrid | SearchMode::Vector
+        SearchMode::Hybrid | SearchMode::Vector | SearchMode::Image
     );
     // F2: the FTS index projection is NFC-normalized (kio-index `index_chunk`), so
     // the FTS query and the embedded query must use the same normal form or NFD
@@ -781,8 +804,12 @@ fn run_search_inner(
                     ))
                 })?
                 .ok_or_else(|| ScopeSearchError::Excluded(INDEX_REBUILDING_REASON.to_owned()))?;
-            if mode.resolved == SearchMode::Vector {
-                match replica_embedding_state(adapter_settings, Some(&resolution.header), ctx.control) {
+            if matches!(mode.resolved, SearchMode::Vector | SearchMode::Image) {
+                let state = if mode.resolved == SearchMode::Image {
+                    let profiles=replica.image_embedding_profiles(&exec.target.scope_id).map_err(|error| ScopeSearchError::Fatal(KioError::new("KIO-E-AGGREGATOR-001","the device search replica could not read image profiles",json!({"reason":error.to_string()}),ExitCode::PartialFailure)))?;
+                    crate::search::scope::replica_image_embedding_state(adapter_settings,Some(&resolution.header),&profiles,ctx.control)
+                } else {replica_embedding_state(adapter_settings,Some(&resolution.header),ctx.control)};
+                match state {
                     ScopeEmbedState::Compatible => {}
                     ScopeEmbedState::Incompatible => {
                         return Err(ScopeSearchError::Excluded(
@@ -1244,9 +1271,12 @@ fn run_search_inner(
 
     // The replica is the sole candidate selector and has already assigned
     // global text/vector ranks before this merge and diversify stage.
-    let query_vec_for_replica = matches!(mode.resolved, SearchMode::Vector | SearchMode::Hybrid)
-        .then(|| query_embedding.as_deref())
-        .flatten();
+    let query_vec_for_replica = matches!(
+        mode.resolved,
+        SearchMode::Vector | SearchMode::Hybrid | SearchMode::Image
+    )
+    .then(|| query_embedding.as_deref())
+    .flatten();
     // This is the candidate-read admission boundary.  A replay turns a
     // changed policy into the cursor contract error rather than recomputing
     // the page against a different visibility set.
@@ -1268,6 +1298,8 @@ fn run_search_inner(
         )
     })?;
     let eligible_images = eligible_image_pairs(&image_authorities);
+    let query_profile =
+        crate::search::scope::active_embedding_profile_summary(adapter_settings, ctx.control);
     let (global_ranks, replica_candidates) = replica_candidates_for(ReplicaCandidateRequest {
         replica: replica
             .as_mut()
@@ -1287,6 +1319,7 @@ fn run_search_inner(
         short_tokens: &query_plan.short_tokens,
         mode: mode.resolved,
         query_vec: query_vec_for_replica,
+        query_profile: &query_profile,
         config: rrf_config,
     })
     .map_err(|reason| {

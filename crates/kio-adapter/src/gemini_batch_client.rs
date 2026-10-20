@@ -454,29 +454,29 @@ pub(crate) fn parse_inlined_results(value: &Value) -> Result<Vec<GeminiBatchEmbe
             });
             continue;
         }
-        let raw = output
+        // Once this line has a key, malformed values belong to that member.
+        // Keep independently parsed usage and every other keyed result; the
+        // caller still proves the complete ID bijection before publication.
+        let values = output
             .get("response")
             .and_then(|response| response.get("embedding"))
             .and_then(|embedding| embedding.get("values"))
             .and_then(Value::as_array)
-            .ok_or_else(|| {
-                AdapterError::ContractViolation(format!(
-                    "Gemini batch result line {key} missing embedding values"
-                ))
-            })?;
-        let mut values = Vec::with_capacity(raw.len());
-        for element in raw {
-            let number = element.as_f64().ok_or_else(|| {
-                AdapterError::ContractViolation(format!(
-                    "Gemini batch result line {key} has a non-numeric embedding element"
-                ))
-            })?;
-            values.push(number as f32);
-        }
+            .and_then(|raw| {
+                raw.iter()
+                    .map(|element| element.as_f64().map(|number| number as f32))
+                    .collect::<Option<Vec<_>>>()
+            });
+        let error = values.is_none().then(|| {
+            json!({
+                "code": "contract_violation",
+                "message": "Gemini batch result member has missing or non-numeric embedding values"
+            })
+        });
         outputs.push(GeminiBatchEmbedOutput {
             key,
-            values: Some(values),
-            error: None,
+            values,
+            error,
             usage,
         });
     }
@@ -1593,15 +1593,58 @@ mod tests {
 
     #[test]
     fn a_result_line_with_non_numeric_values_is_rejected() {
-        let value = json!({
-            "inlinedResponses": [
-                {
-                    "metadata": { "key": "chunk-a" },
-                    "output": { "response": { "embedding": { "values": ["nope"] } } },
-                }
-            ]
-        });
-        assert!(parse_inlined_results(&value).is_err());
+        use crate::types::{AdapterUsage, BillableUnit, BillableUnitKind, EmbeddingUsage};
+        let mut valid = vec![0.0_f32; 768];
+        valid[0] = 1.0;
+        // Rejection is member-local after a key is present. The complete-ID
+        // validation remains the caller's obligation, not an invented key here.
+        for missing in [false, true] {
+            let mut response = json!({
+                "embedding": {"values": ["nope"]},
+                "usageMetadata": {"promptTokenCount": 7,
+                    "promptTokenDetails": [{"modality": "TEXT", "tokenCount": 7}]}
+            });
+            if missing {
+                response["embedding"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("values");
+            }
+            let value = json!({
+                "inlinedResponses": [
+                    {"metadata": {"key": "chunk-a"}, "output": {"response": response}},
+                    {"metadata": {"key": "chunk-b"}, "output": {"response": {
+                        "embedding": {"values": valid},
+                        "usageMetadata": {"promptTokenCount": 40,
+                            "promptTokenDetails": [{"modality": "TEXT", "tokenCount": 40}]}
+                    }}},
+                ]
+            });
+            let outputs = parse_inlined_results(&value).unwrap();
+            assert_eq!(outputs.len(), 2);
+            assert_eq!(outputs[0].key, "chunk-a");
+            assert!(outputs[0].values.is_none());
+            assert_eq!(
+                outputs[0].error.as_ref().unwrap()["code"],
+                "contract_violation"
+            );
+            assert_eq!(outputs[1].key, "chunk-b");
+            assert_eq!(outputs[1].values.as_deref(), Some(valid.as_slice()));
+            assert!(outputs[1].error.is_none());
+            for (output, count) in outputs.iter().zip([7, 40]) {
+                assert_eq!(
+                    output.usage,
+                    EmbeddingUsage::Metered {
+                        usage: AdapterUsage::BillableUnits {
+                            billable_units: vec![BillableUnit {
+                                kind: BillableUnitKind::TokensIn,
+                                count
+                            }]
+                        }
+                    }
+                );
+            }
+        }
     }
 
     #[test]

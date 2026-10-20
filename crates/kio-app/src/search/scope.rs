@@ -178,7 +178,7 @@ pub(crate) enum ScopeEmbedState {
 /// When nothing is active there is no space to be compatible WITH, so the
 /// online profile stays the answer; `resolve_vector_availability` has already
 /// declined on `endpoint_configured` before this can matter.
-fn active_embedding_profile_summary(
+pub(crate) fn active_embedding_profile_summary(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     control: &ControlHandle,
 ) -> embedding_store::EmbeddingProfileSummary {
@@ -220,6 +220,29 @@ pub(crate) fn replica_embedding_state(
         .embedding_profiles
         .iter()
         .all(|profile| profile.matches_profile(&expected))
+    {
+        ScopeEmbedState::Compatible
+    } else {
+        ScopeEmbedState::Incompatible
+    }
+}
+
+pub(crate) fn replica_image_embedding_state(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    header: Option<&kio_index::aggregator::AggScopeHeader>,
+    profiles: &[embedding_store::EmbeddingProfileSummary],
+    control: &ControlHandle,
+) -> ScopeEmbedState {
+    if header
+        .is_none_or(|header| header.index_status != kio_index::aggregator::AggIndexStatus::Ready)
+        || profiles.is_empty()
+    {
+        return ScopeEmbedState::Absent;
+    }
+    let expected = active_embedding_profile_summary(adapter_settings, control);
+    if profiles
+        .iter()
+        .any(|profile| profile.matches_profile(&expected))
     {
         ScopeEmbedState::Compatible
     } else {
@@ -276,7 +299,9 @@ pub(crate) fn resolve_vector_availability(
     // failing IS "zero compatible", so it still falls through to
     // `Incompatible` below exactly as before).
     let vector_explicit_partial_compat =
-        requested == SearchMode::Vector && any_compatible && (any_incompatible || any_absent);
+        matches!(requested, SearchMode::Vector | SearchMode::Image)
+            && any_compatible
+            && (any_incompatible || any_absent);
     // PC1 line (b): profile incompatibility precedes the PC1 line (c) consent
     // check below (an incompatible scope's approval state is moot).
     if (any_incompatible || (any_compatible && any_absent)) && !vector_explicit_partial_compat {
@@ -367,11 +392,11 @@ pub(crate) fn resolve_search_mode(
             error_code: None,
             warnings: Vec::new(),
         }),
-        SearchMode::Vector => {
+        SearchMode::Vector | SearchMode::Image => {
             if vector_ok {
                 Ok(ResolvedMode {
                     requested,
-                    resolved: SearchMode::Vector,
+                    resolved: requested,
                     fallback: false,
                     fallback_reason: None,
                     error_code: None,
@@ -636,6 +661,7 @@ pub(crate) struct ReplicaCandidateRequest<'a> {
     pub(crate) short_tokens: &'a [String],
     pub(crate) mode: SearchMode,
     pub(crate) query_vec: Option<&'a [f32]>,
+    pub(crate) query_profile: &'a embedding_store::EmbeddingProfileSummary,
     pub(crate) config: RrfConfig,
 }
 

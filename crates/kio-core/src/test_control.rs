@@ -200,6 +200,7 @@ pub struct CliTestControl {
     pub search_response_barrier_ready: Option<PathBuf>,
     pub search_final_consent_barrier_ready: Option<PathBuf>,
     pub query_embed_trace: Option<PathBuf>,
+    pub task_embed_trace: Option<PathBuf>,
     pub markdownize_adapter: Selector<MarkdownizeAdapterMode>,
     pub gc_post_publication_ready: Option<PathBuf>,
     pub gc_runtime_checkpoints: Selector<u64>,
@@ -325,6 +326,7 @@ impl DebugTestControl {
                     "KIO_TEST_SEARCH_FINAL_CONSENT_BARRIER_READY",
                 ),
                 query_embed_trace: path("KIO_TEST_QUERY_EMBED_TRACE"),
+                task_embed_trace: path("KIO_TEST_TASK_EMBED_TRACE"),
                 markdownize_adapter: selector(
                     "KIO_TEST_MARKDOWNIZE_ADAPTER",
                     MarkdownizeAdapterMode::parse,

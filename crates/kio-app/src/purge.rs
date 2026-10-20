@@ -789,18 +789,26 @@ fn execute_phase_machine(
             // text the user asked to stop existing, so reporting success while
             // it is still readable under the cache root is not a degraded
             // result — it is a false one.
-            crate::search::projection::write_through_projection(ctx, repo.kio_dir()).map_err(
-                |reason| {
-                    KioError::new(
-                        "KIO-E-PURGE-REPLICA-001",
-                        "purge removed the content but could not remove it from the \
+            (|| -> Result<()> {
+                // The finalized purge has a distinct durable HEAD. Its surviving
+                // tree must enter the derived cache before Current is projected.
+                let head = repo
+                    .head_commit_hash()?
+                    .ok_or_else(|| KioError::schema("finalized purge has no durable HEAD"))?;
+                crate::search::projection::materialize_repaired_snapshot_entries(repo, &head)
+            })()
+            .map_err(|error| error.to_string())
+            .and_then(|()| crate::search::projection::write_through_projection(ctx, repo.kio_dir()))
+            .map_err(|reason| {
+                KioError::new(
+                    "KIO-E-PURGE-REPLICA-001",
+                    "purge removed the content but could not remove it from the \
                      device search replica; re-run purge, or delete \
                      `aggregator.sqlite` under the cache root",
-                        json!({ "reason": reason }),
-                        ExitCode::Failure,
-                    )
-                },
-            )?;
+                    json!({ "reason": reason }),
+                    ExitCode::Failure,
+                )
+            })?;
             Ok(attach_working_tree_warning(
                 PurgeResponse::Purged(success_report(&locked_plan, &report)),
                 working_tree_alias_count,
