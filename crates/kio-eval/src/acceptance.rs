@@ -1407,6 +1407,7 @@ pub fn run_a05(options: &A05Options) -> Result<AcceptanceReceipt, AcceptanceErro
         fs::create_dir_all(directory).map_err(io_error)?;
     }
     let (fixture, scopes) = materialize_fixture_bundle(&options.fixture, &isolated.join("scopes"))?;
+    initialize_deterministic_ledger(&options.binary, &isolated, deterministic_runtime)?;
     let mut commits = BTreeMap::new();
     for (name, scope) in &scopes {
         let scope_text = scope
@@ -1698,6 +1699,7 @@ pub fn run_a06(options: &A06Options) -> Result<AcceptanceReceipt, AcceptanceErro
         fs::create_dir_all(directory).map_err(io_error)?;
     }
     let (fixture, scopes) = materialize_fixture_bundle(&options.fixture, &isolated.join("scopes"))?;
+    initialize_deterministic_ledger(&options.binary, &isolated, runtime)?;
     let mut initial_commits = BTreeMap::new();
     for (name, scope) in &scopes {
         let scope_text = scope
@@ -3444,6 +3446,32 @@ fn assert_a06_concurrent_cli_outcomes(
     Ok(())
 }
 
+/// Each native embedding case owns a fresh, create-only device. Initialize its
+/// physical ledger before local deterministic work reserves and settles zero.
+fn initialize_deterministic_ledger(
+    binary: &Path,
+    isolated: &Path,
+    runtime: &str,
+) -> Result<(), AcceptanceError> {
+    let initialized = command_json_with_runtime(
+        binary,
+        isolated,
+        isolated,
+        &["--json", "ledger", "init"],
+        runtime,
+    )?;
+    if initialized
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        != Some("initialized")
+    {
+        return Err(AcceptanceError::Command(
+            "deterministic embedding ledger init did not report initialized status".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn command_json_with_runtime(
     binary: &Path,
     isolated: &Path,
@@ -3985,6 +4013,153 @@ fn io_error(error: std::io::Error) -> AcceptanceError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    fn assert_native_ledger_bootstrap(case: AcceptanceCase, ledger_status: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let fixture = temp.path().join("fixture");
+        write_fixture_bundle(
+            &fixture,
+            FixtureBundleRequirements {
+                require_image: true,
+                require_vector: true,
+                deterministic_embedding_runtime: Some("scale-v3".into()),
+            },
+        );
+        let manifest_path = fixture.join(FIXTURE_BUNDLE_MANIFEST);
+        let mut manifest = read_fixture_bundle(&fixture).unwrap();
+        fs::write(fixture.join("alpha/image.png"), b"bound image fixture").unwrap();
+        let image_hash = sha256_bytes(b"bound image fixture");
+        manifest.files.insert(
+            0,
+            FixtureBundleFile {
+                scope: "alpha".into(),
+                path: "image.png".into(),
+                sha256: image_hash.clone(),
+            },
+        );
+        manifest.queries[0].expect_image = Some(FixtureImageExpectation {
+            scope: "alpha".into(),
+            path: "image.png".into(),
+            sha256: image_hash,
+        });
+        fs::write(
+            &manifest_path,
+            kio_core::cas::canonical_json_bytes(&serde_json::to_value(manifest).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let binary = temp.path().join("kio-test");
+        let script = r#"#!/bin/sh
+printf '%s|%s\n' "$*" "$KIO_EVAL_DETERMINISTIC_EMBED" >> "$XDG_DATA_HOME/command-trace"
+case "$2" in
+ledger)
+    printf '%s\n' initialized > "$XDG_DATA_HOME/ledger-initialized"
+    printf '%s\n' '{"status":"@STATUS@"}'
+    ;;
+init) printf '%s\n' '{}' ;;
+index)
+    if [ ! -f "$XDG_DATA_HOME/ledger-initialized" ]; then
+        printf '%s\n' 'ledger missing before index' >&2; exit 6
+    fi
+    printf '%s\n' 'index sentinel after initialized ledger' >&2; exit 6
+    ;;
+*) exit 99 ;;
+esac
+"#
+        .replace("@STATUS@", ledger_status);
+        fs::write(&binary, script).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut binding = expected(requirement(
+            case,
+            AcceptanceLane::NativeContract,
+            AcceptanceSubcase::Core,
+            if cfg!(target_os = "macos") {
+                NativeOs::Macos
+            } else {
+                NativeOs::Linux
+            },
+        ));
+        binding.candidate.binary_sha256 = sha256_regular_file(&binary, MAX_BINARY_BYTES).unwrap();
+        binding.fixture.sha256 = fixture_bundle_digest(&fixture).unwrap();
+        binding.evaluator_sha256 = current_evaluator_sha256().unwrap();
+        let work_dir = temp.path().join("work");
+        let receipt = temp.path().join("receipt.json");
+        let result = match case {
+            AcceptanceCase::A05 => run_a05(&A05Options {
+                binary,
+                fixture,
+                expected: binding,
+                work_dir: work_dir.clone(),
+                receipt: receipt.clone(),
+            }),
+            AcceptanceCase::A06 => run_a06(&A06Options {
+                binary,
+                fixture,
+                expected: binding,
+                work_dir: work_dir.clone(),
+                receipt: receipt.clone(),
+            }),
+            _ => unreachable!(),
+        };
+        let error = result.unwrap_err().to_string();
+        let trace = fs::read_to_string(work_dir.join("isolated/xdg-data/command-trace")).unwrap();
+        let commands = trace.lines().collect::<Vec<_>>();
+        let ledger_commands = commands
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| **line == "--json ledger init|scale-v3")
+            .map(|(position, _)| position)
+            .collect::<Vec<_>>();
+        assert_eq!(ledger_commands.len(), 1, "{case:?}: {trace}; {error}");
+        let index = commands
+            .iter()
+            .position(|line| *line == "--json index --offline|scale-v3");
+        if ledger_status == "initialized" {
+            assert!(
+                ledger_commands[0] < index.expect("index must run after ledger init"),
+                "{trace}"
+            );
+            assert!(
+                error.contains("index sentinel after initialized ledger"),
+                "{error}"
+            );
+        } else {
+            assert!(
+                index.is_none(),
+                "invalid ledger init must stop before index: {trace}"
+            );
+            assert!(error.contains("ledger init"), "{error}");
+        }
+        assert!(
+            !receipt.exists(),
+            "failure must not issue an acceptance receipt"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_embedding_acceptance_a05_initializes_ledger_before_index() {
+        assert_native_ledger_bootstrap(AcceptanceCase::A05, "initialized");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_embedding_acceptance_a06_initializes_ledger_before_index() {
+        assert_native_ledger_bootstrap(AcceptanceCase::A06, "initialized");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_embedding_acceptance_a05_rejects_uninitialized_ledger_before_index() {
+        assert_native_ledger_bootstrap(AcceptanceCase::A05, "uninitialized");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_embedding_acceptance_a06_rejects_uninitialized_ledger_before_index() {
+        assert_native_ledger_bootstrap(AcceptanceCase::A06, "uninitialized");
+    }
 
     fn hex(value: char, length: usize) -> String {
         std::iter::repeat_n(value, length).collect()

@@ -497,7 +497,7 @@ pub fn prepare(corpus: &Path, bin: &Path) -> Result<PrepareSummary, ScalePrepare
             Err(crate::scale_attest::AttestError::Incomplete(_)) => {
                 // Registry-only recovery: do not rebuild ready scopes. Each
                 // no-op index invocation re-registers its retained scope.
-                let device = DeviceBoundary::bind_or_create(&root, corpus)?;
+                let device = prepare_device(&root, corpus, &executable, &fixture)?;
                 for scope in scopes {
                     let boundary = ScopeBoundary::bind(&root, &scope.name, corpus)?;
                     let head = read_head(&boundary.kio)?;
@@ -563,7 +563,7 @@ pub fn prepare(corpus: &Path, bin: &Path) -> Result<PrepareSummary, ScalePrepare
         }
     }
     debug_assert!(has_incomplete_scope);
-    let device = DeviceBoundary::bind_or_create(&root, corpus)?;
+    let device = prepare_device(&root, corpus, &executable, &fixture)?;
     let mut initialized = Vec::new();
     let mut indexed = Vec::new();
     for scope in &fixture.manifest().scopes {
@@ -655,6 +655,44 @@ pub fn prepare(corpus: &Path, bin: &Path) -> Result<PrepareSummary, ScalePrepare
     )
 }
 
+/// Bootstrap the local embedding ledger through the same retained CLI boundary
+/// as indexing. Status makes recovery safe without treating interrupted or
+/// malformed ledger state as permission to replace it.
+fn prepare_device(
+    root: &fs::File,
+    corpus: &Path,
+    executable: &DescriptorExecutable,
+    fixture: &crate::scale_fixture::ValidatedFixture,
+) -> Result<DeviceBoundary, ScalePrepareError> {
+    let device = DeviceBoundary::bind_or_create(root, corpus)?;
+    let status = run_scope(
+        executable,
+        fixture,
+        root,
+        &device,
+        &["--json", "ledger", "status"],
+    )?;
+    match status.get("status").and_then(Value::as_str) {
+        Some("ready") => {}
+        Some("uninitialized") => {
+            let initialized = run_scope(
+                executable,
+                fixture,
+                root,
+                &device,
+                &["--json", "ledger", "init"],
+            )?;
+            if initialized.get("status").and_then(Value::as_str) != Some("initialized") {
+                return Err(ScalePrepareError::Input(
+                    "ledger init did not report initialized status".into(),
+                ));
+            }
+        }
+        _ => return Err(ScalePrepareError::Input("unexpected ledger status".into())),
+    }
+    Ok(device)
+}
+
 fn run_scope(
     executable: &DescriptorExecutable,
     fixture: &crate::scale_fixture::ValidatedFixture,
@@ -696,10 +734,36 @@ fn run_scope(
     fixture.recheck()?;
     executable.recheck_original().map_err(process_error)?;
     device.recheck(fixture.root())?;
+    parse_command_output(args, &output)
+}
+
+fn parse_command_output(
+    args: &[&str],
+    output: &crate::runner::BoundedProcessOutput,
+) -> Result<Value, ScalePrepareError> {
     if !output.status.success() {
+        let stderr = output.stderr.trim();
+        let (stream, diagnostic) = if stderr.is_empty() {
+            ("stdout", output.stdout.trim())
+        } else {
+            ("stderr", stderr)
+        };
+        // Keep even an allowed one-MiB JSON response from drowning the useful
+        // command/status context. Truncate only at a UTF-8 character boundary.
+        let mut end = diagnostic.len().min(4096);
+        while !diagnostic.is_char_boundary(end) {
+            end -= 1;
+        }
+        let truncated = if end < diagnostic.len() {
+            " [truncated]"
+        } else {
+            ""
+        };
         return Err(ScalePrepareError::Input(format!(
-            "Kio command failed: {}",
-            output.stderr.trim()
+            "Kio command failed: args={args:?}; status={}; code={:?}; {stream}: {}{truncated}",
+            output.status,
+            output.status.code(),
+            &diagnostic[..end]
         )));
     }
     let value: Value = serde_json::from_str(&output.stdout)
@@ -731,7 +795,7 @@ fn prepare_history_overlay(
         ));
     }
     let root = fixture.try_clone_root()?;
-    let device = DeviceBoundary::bind_or_create(&root, corpus)?;
+    let device = prepare_device(&root, corpus, executable, fixture)?;
     let mut initialized = 0usize;
     let mut base = Vec::with_capacity(fixture.manifest().scopes.len());
     for scope in &fixture.manifest().scopes {
@@ -1521,6 +1585,158 @@ fn same_directory_file(a: &cap_fs::Metadata, b: &cap_fs::Metadata) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_command_reports_arguments_exit_code_and_stderr() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = crate::runner::BoundedProcessOutput {
+            status: std::process::ExitStatus::from_raw(6 << 8),
+            stdout: "private output should not replace stderr".into(),
+            stderr: "ledger unavailable".into(),
+            duration: Duration::ZERO,
+        };
+        let message = parse_command_output(&OFFLINE_INDEX_ARGS, &output)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("[\"--json\", \"index\", \"--offline\", \"--yes\"]"),
+            "{message}"
+        );
+        assert!(message.contains("code=Some(6)"), "{message}");
+        assert!(message.contains("stderr: ledger unavailable"), "{message}");
+        assert!(!message.contains("private output"), "{message}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_command_reports_bounded_stdout_when_stderr_is_empty() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = crate::runner::BoundedProcessOutput {
+            status: std::process::ExitStatus::from_raw(6 << 8),
+            stdout: format!(
+                "{{\"error_code\":\"KIO-E-BUDGET-001\"}}{}",
+                "界".repeat(5000)
+            ),
+            stderr: " \n".into(),
+            duration: Duration::ZERO,
+        };
+        let message = parse_command_output(&OFFLINE_INDEX_ARGS, &output)
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("code=Some(6)"), "{message}");
+        assert!(
+            message.contains("stdout: {\"error_code\":\"KIO-E-BUDGET-001\"}"),
+            "{message}"
+        );
+        assert!(message.contains("[truncated]"), "{message}");
+        assert!(message.len() < 5000, "diagnostic must stay bounded");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn write_preparation_initializes_ledger_before_scope_index() {
+        use std::os::unix::fs::PermissionsExt;
+        for lane in [
+            scale_spec::ScaleLane::CurrentText,
+            scale_spec::ScaleLane::HistoryOverlay,
+        ] {
+            for status in ["uninitialized", "ready", "unknown", "failed", "bad-init"] {
+                let temp = tempfile::tempdir().unwrap();
+                let corpus = temp.path().join("corpus");
+                crate::scale_fixture::generate(
+                    &corpus,
+                    scale_spec::ScaleProfile::Tiny,
+                    lane,
+                    false,
+                )
+                .unwrap();
+                let bin = temp.path().join("kio-test");
+                let script = r#"#!/bin/sh
+printf '%s\n' "$*" >> "$XDG_DATA_HOME/command-trace"
+case "$2" in
+ledger)
+    if [ "$3" = status ]; then
+        case '@STATUS@' in
+        ready)
+            printf '%s\n' initialized > "$XDG_DATA_HOME/ledger-initialized"
+            printf '%s\n' '{"status":"ready"}' ;;
+        unknown) printf '%s\n' '{"status":"unknown"}' ;;
+        failed) printf '%s\n' '{"status":"failed","error_code":"ledger-status-failed"}'; exit 6 ;;
+        *) printf '%s\n' '{"status":"uninitialized"}' ;;
+        esac
+    else
+        printf '%s\n' initialized > "$XDG_DATA_HOME/ledger-initialized"
+        if [ '@STATUS@' = bad-init ]; then
+            printf '%s\n' '{"status":"ready"}'
+        else
+            printf '%s\n' '{"status":"initialized"}'
+        fi
+    fi
+    ;;
+init)
+    /bin/mkdir .kio
+    scope=$(pwd -P)
+    printf '{"status":"initialized","path":"%s","kio_path":"%s/.kio","repaired":[]}\n' "$scope" "$scope"
+    ;;
+index)
+    if [ ! -f "$XDG_DATA_HOME/ledger-initialized" ]; then exit 97; fi
+    printf '%s\n' '{"error_code":"KIO-E-BUDGET-001","status":"paused"}'; exit 6
+    ;;
+*) exit 99 ;;
+esac
+"#.replace("@STATUS@", status);
+                fs::write(&bin, script).unwrap();
+                fs::set_permissions(&bin, fs::Permissions::from_mode(0o700)).unwrap();
+                let error = prepare(&corpus, &bin).unwrap_err().to_string();
+                let trace =
+                    fs::read_to_string(corpus.join(DEVICE_DIR_NAME).join("data/command-trace"))
+                        .unwrap();
+                let commands = trace.lines().collect::<Vec<_>>();
+                assert_eq!(commands.first(), Some(&"--json ledger status"));
+                let ledger = commands
+                    .iter()
+                    .position(|line| *line == "--json ledger init");
+                let index = commands
+                    .iter()
+                    .position(|line| *line == "--json index --offline --yes");
+                match status {
+                    "uninitialized" => {
+                        assert!(
+                            ledger.expect("ledger init must run") < index.expect("index must run"),
+                            "{lane:?}: {trace}"
+                        );
+                        assert!(error.contains("KIO-E-BUDGET-001"), "{error}");
+                    }
+                    "ready" => {
+                        assert!(
+                            ledger.is_none(),
+                            "existing ledger must not be initialized again"
+                        );
+                        assert!(index.is_some(), "{lane:?}: {error}");
+                        assert!(error.contains("KIO-E-BUDGET-001"), "{error}");
+                    }
+                    "bad-init" => {
+                        assert!(ledger.is_some());
+                        assert!(index.is_none());
+                        assert!(
+                            error.contains("ledger init did not report initialized"),
+                            "{error}"
+                        );
+                    }
+                    _ => {
+                        assert_eq!(commands, ["--json ledger status"]);
+                        let expected = if status == "failed" {
+                            "ledger-status-failed"
+                        } else {
+                            "unexpected ledger status"
+                        };
+                        assert!(error.contains(expected), "{error}");
+                    }
+                }
+            }
+        }
+    }
 
     fn indexed_output() -> Value {
         let tree = format!("sha256:{}", "a".repeat(64));
