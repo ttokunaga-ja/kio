@@ -16,14 +16,29 @@ is tracked in [the implementation record](../tasks/v1-implementation-progress.md
 | Central billing intents, reservations and results | Non-rebuildable operational truth | Authority-bound, create-only backup and explicit reconciliation; absence must not authorize a fresh paid submission |
 | Device configuration and local Adapter trust | Device-specific execution authority | Explicit device enrollment; never import trust from a scope |
 
+### Operation-specific prerequisites
+
+A command validates only the configuration and authority it actually consumes.
+Local status, text search, init, export, restore and local indexing must remain
+usable when an unused Adapter configuration or managed CA is missing, pending,
+invalid or unsafe. An invalid selected dependency is reported for that operation;
+Kio never repairs it or silently substitutes another configured destination.
+Adapter readiness and its reason are reported separately from local results.
+Credential-file protection is checked before credentials are consumed. Managed
+CA acquisition and validation happen only for a selected HTTPS send, retaining
+the trust lock through dispatch as specified below; HTTP and native work do not
+read the CA as a startup prerequisite. Configuration required for local policy,
+content integrity and code execution remains mandatory.
+
 ### Device billing lifecycle
 
 Billing is operational information, not knowledge reconstructed from a folder.
-`ledger init` explicitly creates the central device ledger. As an explicit device setup step,
-`kio model install` also initializes a missing ledger exactly as `ledger init` does. Scope initialization,
-offline indexing and text search do not initialize it. Before initialization,
+`ledger init` explicitly creates the central device ledger. Model install/import,
+scope initialization, offline indexing and text search do not initialize it.
+Model preparation does not inspect or repair billing state. Before initialization,
 budget observations are unknown; absence is never evidence of zero spending or
-permission to submit paid work. `ledger status` reads a private snapshot without
+permission to submit paid work. Free local execution and unavailable budget
+observations follow [04 §5.4](04-pipeline.md#54-cost-guardrail--kill-switch). `ledger status` reads a private snapshot without
 opening the source SQLite database for writing.
 
 An initialized ledger consists of `cost-ledger.sqlite`, its normal SQLite WAL
@@ -53,7 +68,13 @@ by `ledger init`.
 `ledger backup` captures a WAL-safe SQLite image while holding the lifecycle
 lock, binds it to the authority and checkpoint, records a private exact-proof
 for that generation, and publishes the requested owner-private backup directory
-create-only. `ledger restore` loads that artifact but can recreate only a
+create-only. Snapshot and backup use bounded streaming or SQLite online-backup
+steps under the same lifecycle/identity validation, rather than refusing solely
+at the old fixed database/copy byte limits. A copy is never accepted until its
+complete database, WAL-consistent image, authority and checkpoint are verified.
+Source bytes and permissions remain unchanged; partial backups are not published
+as complete. Resource exhaustion is reported separately from corruption, and
+neither case permits a fresh paid submission. `ledger restore` loads that artifact but can recreate only a
 missing database. Before it publishes either a restore journal or a database,
 the surviving private authority, checkpoint, and backup proof must all bind the
 same exact image. An existing database, a stale generation, a changed backup,
@@ -166,10 +187,22 @@ workspace.
 
 An explicit CLI root bootstrap is serialized by `.root-init-journal.json` and a
 permanent `.root-init-gate`. Normal management remains blocked until the exact
-record is verified. Only an empty pre-marker new root may retry. Admission
-authenticates only the immediate parent and holds that parent's lease; it refuses
-to recreate an independent root for the same child when a lost `.kio` remains
-parent-enrolled, while a valid existing Child is idempotent. Existing unknown,
+record is verified. Only an empty pre-marker new root may retry. Default admission authenticates only the immediate parent and holds that parent's
+lease; a valid existing Child remains idempotent. For a new root with no existing
+child store, explicit `init --independent` previews the observed parent relationship,
+including an unreadable/inconsistent parent or uncertain enrollment, and requires
+confirmation before creating an independent boundary. In this new-root operation,
+Kio neither changes nor adopts the parent: it takes no parent mutation authority,
+retires no parent enrollment, and preserves all parent bytes and history. An
+uncertain parent relationship is displayed as uncertainty, not repaired or inferred.
+Normal discovery must respect the confirmed independent boundary and not re-adopt it.
+Detaching an existing valid Child is a separate operation: it requires authenticated
+parent enrollment, the parent's lease and the root registration protocol; it retires
+only that exact enrollment and journals the independent identity. Recovering a lost
+child store likewise requires exact authenticated enrollment before any parent
+change; an unreadable/inconsistent parent or ambiguous enrollment refuses this
+parent-changing detach/recovery and calls for explicit repair. No parent or child
+user data is deleted. Existing unknown,
 old-format, or unmanaged non-empty stores are refused unchanged. The retained
 scope root may contain only the fixed exact transient `.kio-case-probe`; it may
 be resumed, while differing probe residue fails closed. The core unmanaged
@@ -383,7 +416,7 @@ not a PID. A saved status includes its observation time and is not liveness proo
 Each pass reloads current device settings and validates the retained registered
 root before invoking the same local index operation used manually. No network or
 secret grants are created. The watch path is offline: it performs no provider-job
-polling, download, or cleanup, and it does not use an HTTP Adapter. User-service
+polling, download, or cleanup, and loopback use follows [07 §3](07-adapter-spec.md#3-ネットワーク送信原則と-opt-in-正本). User-service
 registration and lifecycle behavior are implemented as specified there; native
 scheduler lifecycle acceptance remains a separate gate on each OS.
 
@@ -414,23 +447,13 @@ does not establish content identity: reconciliation hashes the relevant bytes.
 
 ## Local Adapter and renderer boundaries
 
-Adapter approval is paired authority: `adapter approve`, `revoke`, and `status`
-coordinate the current scope's approval references with device-local grant
-records. A send requires both active records and an exact current binding; a
-scope row or device record alone cannot authorize it. Bindings cover the managed
-scope/membership, execution identity and profile, destination, credential
-binding, trust binding, and operation. Secret transmission, when selected, has
-its own paired grant. Approval publishes resumable pending records across the
-two stores; revocation removes the scope-side active or pending reference and
-revokes matching device grants, so a later approval must establish fresh paired
-authority. `status` reports the records and their effective current match. See
-[the CLI specification](06-cli-spec.md) for command syntax and confirmation
-rules.
-
-Local Adapter windows (Embedding, Markdownize OCR and Rerank) allow HTTP or HTTPS
-loopback with an explicit port. URL rules, paired grants and secret holds follow
-[07-adapter-spec.md §3.1](07-adapter-spec.md). Approval and status identify an HTTP
-peer as unauthenticated. For HTTPS, the CA is a device-local managed snapshot
+Network approval, exact destination binding, lifetime and revocation are defined
+once in [07 §3](07-adapter-spec.md#3-ネットワーク送信原則と-opt-in-正本): external
+sends use paired scope/device authority, while loopback uses device endpoint
+approval. Secret-send authority stays separate. CLI confirmation and status
+forms are defined in [06](06-cli-spec.md). Local Embedding, Markdownize OCR and
+Rerank permit the HTTP/HTTPS endpoints defined there; HTTP status is explicitly
+unauthenticated. For HTTPS, the CA is a device-local managed snapshot
 registered through the Adapter trust lifecycle. The active record carries a
 generation, digest and snapshot identity, never a user-configured source path or
 certificate bytes. The retired `adapter.policy.offline_api.ca_pem_path` setting
@@ -446,11 +469,7 @@ root is trusted; proxies and redirects are disabled. Certificate validity and
 name verification finish before a body is sent. Authentication errors are
 permanent; connection refusal remains a transport error.
 
-`--offline` blocks every HTTP dispatch for that invocation, including an
-authenticated local Adapter. It does not turn a local endpoint into a
-non-network execution route. Offline behavior and the command-specific flag
-forms are defined in [the Adapter specification](07-adapter-spec.md) and [the
-CLI specification](06-cli-spec.md).
+Offline invocation and watch obey [07 §3](07-adapter-spec.md#3-ネットワーク送信原則と-opt-in-正本).
 
 Renderer scratch follows [the Kio-created-object contract](#protection-of-kio-created-objects).
 Renderer execution uses an explicit environment, private scratch space,
@@ -486,8 +505,10 @@ invented current profile.
 The macOS Office invocation creates its own bounded service catalog without the
 native MacSpellChecker component. That component initializes AppKit during
 headless Writer startup and caused a confined conversion to abort. The filter
-must match exactly one expected standalone component and preserve the remaining
-catalog bytes. It neither edits the installed application nor loads the user's
+removes the component only when exactly one structurally valid standalone match
+is present, preserving the remaining catalog bytes. A distribution without that
+component may use its unmodified private catalog if the confined capability probe
+succeeds; malformed or ambiguous catalogs remain a refusal. It neither edits the installed application nor loads the user's
 LibreOffice profile. Its source identity is rechecked before each invocation.
 
 The native Windows/Linux/macOS lanes must execute the real renderer and local

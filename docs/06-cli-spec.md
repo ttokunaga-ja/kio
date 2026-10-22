@@ -6,7 +6,7 @@
 kio watch [--root <directory>] run [--reconcile-interval-seconds <1..86400>]
 kio watch [--root <directory>] status
 kio watch [--root <directory>] stop
-kio watch [--root <directory>] service install [--reconcile-interval-seconds <1..86400>]
+kio watch [--root <directory>] service install [--replace] [--yes] [--reconcile-interval-seconds <1..86400>]
 kio watch [--root <directory>] service (start|stop|status|uninstall)
 ```
 
@@ -16,13 +16,17 @@ OS 通知、起動時照合、既定 300 秒ごとの完全照合を、手動 `i
 空の子・孫フォルダも対象で、Ignore と独立した nested root の境界を維持する。
 
 この実装の監視はローカル処理を行い、新規の外部送信承認や secret 承認を作らない。
-実行済み provider job のポーリング・ダウンロード・掃除も行わず、HTTP Adapter（local Adapter を含む）も利用しない。
+実行済み provider job のポーリング・ダウンロード・掃除も行わず、承認済み loopback だけは [07 §3.1](07-adapter-spec.md#31-ローカル窓の送信境界) に従い利用できる。
 `status` は状態を作成せず、OS lock による稼働状態と、観測時刻付きの backend/backlog/最後の成功・失敗を表示する。
 `stop` はその起動 instance への停止要求を記録し、進行中の照合が終わった後に停止する。停止要求の受理と終了完了は別の状態である。
 強制終了後は OS lock が解放され、再起動時に完全照合して未処理変更を回復する。
 OS のログインユーザー service への登録・起動は実装済みだが、native scheduler の実機 lifecycle acceptance は OS ごとに別途必要である。
 
-`service install` は明示初期化済みの root だけを検証して、現在のログインユーザーの native scheduler 登録を device-private manifest とともに作成する。manifest には絶対・UTF-8 の `HOME`、`USERPROFILE`、`XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_CACHE_HOME` を固定する。macOS と systemd は native definition がその値を child watcher に明示する。Windows Task Scheduler は環境変数を definition の説明欄へ保存せず、絶対 manifest locator だけを hidden runner に渡す。runner は private manifest、現在の executable、managed root/scope、Task Scheduler の定義を照合してから、子 watcher の `Command` にだけこの環境を設定する。Windows の runner は kill-on-close Job Object に子を参加させるため、scheduler が runner を終了しても watcher を孤立させない。登録は login 時に有効だが、この操作自体は実行を開始しない。service ID ごとの private OS lock は install/start/stop/uninstall と manifest 更新を直列化し、install の途中で中断されても保存済みの installing intent を同じ定義だけで回復できる。`installed` 済みの重複 `install` は拒否する。`start` は実際の watcher instance lock が稼働中なら、同じ scheduler 登録の再起動も拒否する。`start` と `stop` は scheduler の登録状態を変更してから開始／停止し、`stop` は再起動を無効化して foreground watcher の通常の停止要求とは別に扱う。`status` は scheduler の登録状態と watcher の OS instance lock による実際の稼働状態を別々に表示する。root が後で削除されても `status` は device-private watcher lock を照合し、`uninstall` は manifest と完全一致する登録だけを削除して queue を残す。native service 名または definition が foreign に変わった場合は lifecycle 操作を拒否する。
+`service install` は明示初期化済みの root だけを検証して、現在のログインユーザーの native scheduler 登録を device-private manifest とともに作成する。manifest には絶対・UTF-8 の `HOME`、`USERPROFILE`、`XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_CACHE_HOME` を固定する。macOS と systemd は native definition がその値を child watcher に明示する。Windows Task Scheduler は環境変数を definition の説明欄へ保存せず、絶対 manifest locator だけを hidden runner に渡す。runner は private manifest、現在の executable、managed root/scope、Task Scheduler の定義を照合してから、子 watcher の `Command` にだけこの環境を設定する。Windows の runner は kill-on-close Job Object に子を参加させるため、scheduler が runner を終了しても watcher を孤立させない。登録は login 時に有効だが、この操作自体は実行を開始しない。service ID ごとの private OS lock は install/start/stop/uninstall と manifest 更新を直列化し、install の途中で中断されても保存済みの installing intent を同じ定義だけで回復できる。`installed` 済みで定義が同一なら冪等成功とする。自身が登録した service の executable / 環境 / interval を
+更新する場合は `service install --replace` で旧／新の差分と再起動影響を表示し、端末確認または
+`--yes` 後に停止・置換・再検証する。private intent に旧／新 definition と段階を保持し、
+中断時は一致した自分の定義だけを回復する。foreign な scheduler 登録・変更は上書きしない。
+更新する executable / installation path にも同じ trust 検証を行う。`start` は実際の watcher instance lock が稼働中なら、同じ scheduler 登録の再起動も拒否する。`start` と `stop` は scheduler の登録状態を変更してから開始／停止し、`stop` は再起動を無効化して foreground watcher の通常の停止要求とは別に扱う。`status` は scheduler の登録状態と watcher の OS instance lock による実際の稼働状態を別々に表示する。root が後で削除されても `status` は device-private watcher lock を照合し、`uninstall` は manifest と完全一致する登録だけを削除して queue を残す。native service 名または definition が foreign に変わった場合は lifecycle 操作を拒否する。
 
 scheduler executable と installation path の trust、および service の private storage は
 [14 の watch 契約](14-v1-runtime-contracts.md#watching-defaults) に従う。
@@ -54,10 +58,10 @@ kio index [--preview|--yes] [--online|--offline] [--realtime|--batch]  # 取り�
                                         # (レーン単価は 07 §4 の価格解決規則に従う)。--batch はその逆向き上書き。
                                         # 同じ --realtime/--batch を batch resume / batch retry / repair rebuild-db /
                                         # reindex も受ける (いずれも online 送信を駆動するため)。
-                                        # --online は configured Adapter のいずれかに active paired grant が
-                                        # あることを index 前に要求する。各 HTTP dispatch は当該 Adapter の
-                                        # exact grant を別途要求する。--offline は local Adapter を含む
-                                        # 当該実行の全 HTTP dispatch を止める (正本 07-adapter-spec.md §3)。
+                                        # --online は選択した configured Adapter 宛先の少なくとも一つに有効な承認が
+                                        # あることを index 前に要求する (承認済み loopback も可)。各 HTTP dispatch は当該 Adapter の
+                                        # 宛先に応じた承認を別途要求する。--offline は外部ネットワークを止める
+                                        # (承認済み loopback は利用可能) (正本 07-adapter-spec.md §3)。
 kio root register [path] (--preview|--yes) [--resume <OPERATION_ID>]
                                         # 明示的に moved managed root を再登録する。path 省略時は cwd。
                                         # --preview と --yes は排他で必須。preview は registry を作成せず、書込みもしない。
@@ -69,12 +73,12 @@ kio repair cancel-child-initialization [PARENT_PATH] --yes --operation <OPERATIO
                                         # 同一 operation の未公開 private stage だけを明示取消する。通常の recovery は
                                         # 利用者の取消意思を推測せず、既存の取消 marker のみを再生する。
 kio adapter approve (<tool_id> | --all) [--preview|--yes] [--resume <grant_id>] [--send-secrets]
-                                        # 現在の scope の Adapter destination/profile を device grant と対にして承認する。
+                                        # 外部宛先は scope/device paired、loopback は device endpoint 承認 (07 §3)。
                                         # selector は positional tool_id と --all のいずれか一方が必須。
                                         # --preview と --yes は排他。いずれも省略した場合は対話確認を要求する。
                                         # --resume は --all と排他で、同一の pending grant と現在の identity にだけ使える。
                                         # revoke 済み grant は resume できず、--send-secrets の選択も元の pending grant と一致しなければならない。
-kio adapter status [<tool_id>]          # scope 側 approval、device grant、pending と現在の effective match を read-only 表示
+kio adapter status [<tool_id>]          # 宛先ごとの承認・pending・effective match を read-only 表示 (07 §3)
 kio adapter trust register --ca-pem <absolute-pem> (--preview|--yes) [--resume <registration_id>]
 kio adapter trust rotate --ca-pem <absolute-pem> (--preview|--yes)
 kio adapter trust (revoke|status)       # device-local managed CA lifecycle。scope を読まず、status は state を作成・修復しない
@@ -91,8 +95,8 @@ kio batch resume [--recheck-budget|--override-budget] [--online|--offline]
                                         # 中断タスクの再開。--recheck-budget は上限を変更した後に
                                         # 現在の hard cap を再判定して budget pause を再開する。
                                         # --override-budget は current cap 自体を無視するため別用途。
-                                        # --online は grant を作らず、各 Adapter の既存 exact paired grant を
-                                        # 置き換えない。--offline は provider/local peer を含む全 HTTP dispatch を
+                                        # --online は grant を作らず、各 Adapter の宛先に応じた既存 grant を
+                                        # 置き換えない。--offline は外部ネットワーク dispatch を
                                         # 禁止するため、HTTP を要する照会・出力取得・cleanup も実行しない。
                                         # markdownize online タスクと embedding enrichment パスを両方駆動 (04-pipeline.md §5.4)
 kio batch retry [--online|--offline] [--reset-violations <selector> --yes] [--resend-unknown <selector> --yes]
@@ -108,9 +112,9 @@ kio batch retry [--online|--offline] [--reset-violations <selector> --yes] [--re
                                         # 新しい reservation で送信する。OCR の明示再送は以前の incremental 応答を繰り返さず Full request を選ぶ。
                                         # 以前の同期送信は既に課金されている可能性がある。
                                         # `--reset-violations`、`--online`、`--offline`、`--realtime`、`--batch` とは併用不可。
-kio adapter revoke (<tool_id> | --all)  # 対応する scope approval/pending と device grant を revoke。
+kio adapter revoke (<tool_id> | --all)  # 宛先に応じた通常送信承認を revoke (07 §3)。loopback は端末全 scope に効く。
                                         # selector は approve と同じく positional tool_id と --all のいずれか一方が必須。
-                                        # 対象なしは no_target の冪等成功。再承認は fresh paired grant を要する。
+                                        # 対象なしは no_target の冪等成功。再承認は宛先別の fresh grant を要する。
 kio batch abandon <intent_token|scope/adapter/input_hash/tool_profile_hash> [--yes]
                                         # 照合が恒久不能な in-flight Batch job の打ち切り (estimated 記帳 + terminal 化。
                                         # 指定子は intent_token または batch_requests の 4 組タスクキー (3 組では別
@@ -196,10 +200,9 @@ kio model install embeddinggemma-2 --from <file> [--yes]
 ```
 
 status は read-only で、取得・修復・同意・処理再開を起こさない。install は download または
-指定 file の import を行う。`kio ledger init` と `kio model install` だけが device ledger を作成できる。
-model install は確認済みの device setup として、missing ledger を ledger init と同じ authority/checkpoint 検証・初期化で
-作成する。既存 ledger を置換・修復せず、unsafe/破損/中断 state は自動再作成しない。
-台帳未初期化時の embedding/search は [04-pipeline.md §5.4](04-pipeline.md) に従う。`--offline` 下の network 取得は不可であり、import はネットワークを使わない。
+指定 file の import を行う。device ledger を作成するのは `kio ledger init` だけである。
+model install/import は課金台帳を検査・初期化・修復せず、model の確認・完全性検証だけを行う。
+無料 local embedding は台帳初期化を前提にしない。embedding/search の記録先と予算観測は [04-pipeline.md §5.4](04-pipeline.md) に従う。`--offline` 下の network 取得は不可であり、import はネットワークを使わない。
 確認には公式 source、revision、size、SHA-256、保存先、Apache-2.0 と Google の
 「deployments must adhere to the Gemma Prohibited Use Policy」という声明をリンク付きで表示する。
 `--yes` はこの device 操作の確認を非対話で承認する。scope 内容送信や paid 権限は作らず、token を保存しない。
@@ -290,13 +293,17 @@ stateを残し、ref不達objectを履歴authorityとして扱わない。
 
 **`kio diff` の差分種別**: raw / path の差分に加え、tree schema v2/v3 ([03-data-model.md §8](03-data-model.md)) が生む derived-only の変化 — `normalize_manifest_changed` (unit の failed → done 完成を含む) / `chunking_config_changed` / `chunk_set_changed` (公開 chunk 集合のみの変化) / `tool_lock_changed` (旧新 tool_lock_hash と変更 role) / `resurrection_published` (no-op 例外 (a) の publication commit — [05-runtime.md §8.1](05-runtime.md)) — を差分として表示する (`--json` も同種別を持つ)。derived-only commit を「差分なし」と表示してはならない。current tree の required field が欠落する場合は `unknown` へ縮退せず corruption / incompatible format として fail-closed にする。
 
-`kio init` は指定フォルダ (省略時 = カレント) の `.kio` を 1 つだけ作成する (子孫には作らない)。自動子 scope mutation が RC 対象の platform では、子フォルダの `.kio` は `kio index` の探索が対象を検出した時点で必要に応じて生成される (**VCS repo root 配下には既定で生成しない**。既存子 scope を grandfather する分岐は置かない — [03-data-model.md §3](03-data-model.md))。この結果、深いフォルダ木では scope 数が多くなる。`kio search` のデフォルトが全 indexed scope 横断である ([05-runtime.md §1.8](05-runtime.md)) のはこの帰結を受けた設計である。また `kio init` は生成する `.kio/config.toml` の `[chunking] unicode_version` に実装同梱の UCD 版 (現在の既定 = 17.0.0) を明示記録する ([03-data-model.md §5.3](03-data-model.md) — 省略不可・default なし。schema でも required — [10-operations.md §11.3](10-operations.md))。
+`kio init [path] [--independent] [--yes]` は指定フォルダ (省略時 = カレント) の `.kio` を 1 つだけ作成する (子孫には作らない)。自動子 scope mutation が RC 対象の platform では、子フォルダの `.kio` は `kio index` の探索が対象を検出した時点で必要に応じて生成される (**VCS repo root 配下には既定で生成しない**。既存子 scope を grandfather する分岐は置かない — [03-data-model.md §3](03-data-model.md))。この結果、深いフォルダ木では scope 数が多くなる。`kio search` のデフォルトが全 indexed scope 横断である ([05-runtime.md §1.8](05-runtime.md)) のはこの帰結を受けた設計である。また `kio init` は生成する `.kio/config.toml` の `[chunking] unicode_version` に実装同梱の UCD 版 (現在の既定 = 17.0.0) を明示記録する ([03-data-model.md §5.3](03-data-model.md) — 省略不可・default なし。schema でも required — [10-operations.md §11.3](10-operations.md))。
 
 明示 root の `init` は中断後も同じ root に対してだけ再開する。初期化中の root は通常の管理操作で
 利用できず、既知の初期化記録と directory identity が一致しない `.kio`、旧形式、または unmanaged な非空 store は
 変更せず拒否する。直近の managed parent が同じ child を enrollment したまま child の `.kio` が失われた場合も、
 独立 root への作り直しを拒否する。直近 parent のみを認証して lease を保持し、既に有効な Child は冪等に開く。
 read-only command は初期化残骸を cleanup しない。
+
+`init --independent` の関係変更 preview・確認・journal・親 enrollment の扱いは
+[14 の root bootstrap 契約](14-v1-runtime-contracts.md#atomic-crash-recovery-and-explicit-root-bootstrap) に従う。
+通常の `init` / child discovery に独立 root 化の暗黙副作用を加えない。
 
 ### Kio-created object protection
 
@@ -418,6 +425,10 @@ object URI / hash 短縮形は同じ `status` / `path` / `temporary` に `object
 
 # 2. 初回スキャン承認 (init / index preview)
 
+`index` / `snapshot create` の原本 byte 予算引数は [03 の原本保存契約](03-data-model.md#原本保存の資源境界)、
+`index` / `reindex` / `repair rebuild-db` の `--resource-tier standard|large` は
+[07 の抽出資源契約](07-adapter-spec.md#pdf--xlsx-の抽出資源-tier) に従う。
+
 未承認 scope に対する `kio index` は、raw object 保存・Adapter 実行を始める前に **対象範囲 preview** を表示し、明示承認を要求する。
 
 ```bash
@@ -448,7 +459,7 @@ preview 内容:
 1. network opt-in を付与しない。opt-in 未成立の scope では、--yes で index を
    開始しても online_api Adapter への送信 task は発行されず pending のまま残る
    (07-adapter-spec.md §3)。非対話環境で永続 opt-in が必要な場合は、事前に対話環境または
-   `kio adapter approve <tool_id> --yes` または対話操作で**paired grant を成立させておく**。
+   `kio adapter approve <tool_id> --yes` または対話操作で**宛先に応じた承認を成立させておく** (07 §3)。
    config の `allow_network = true`、scope 側の行、または device record のいずれか一つだけでは
    送信 gate を満たさない。pending からの自動 publish もない。`--online` は grant を作らず、
    index 前に configured Adapter のいずれかの active grant を要求する (07-adapter-spec.md §3)。
@@ -485,10 +496,10 @@ kio search "..." --mode <auto|text|image|vector|hybrid>   # 当該実行の上�
                               #  fallback。--online 明示時は vector 経路の precheck 不成立を error にする。
                               #  embedding_in_flight は技術的失敗として対象。
                               #  正本 05-runtime.md §1.1 consent gate)
-kio search "..." [--online|--offline]   # HTTP query embedding は current exact paired grant を要する
+kio search "..." [--online|--offline]   # HTTP query embedding の承認は 07 §3 に従う
                                        # --online は cloud / local endpoint と vector 経路を要求する。
                                        # 一時承認ではなく、Adapter / grant / index の不足は error。
-                                       # --offline は local HTTP/HTTPS も含む全 HTTP dispatch を禁止する。
+                                       # --offline の境界は 07 §3 に従う。
                                        # native EG2 / in-process deterministic は禁止対象外 (--online は指定不可)。
                                        # cursor replay は cache vector を再利用するが current gate / cursor 検査は残る。
                                        # 正本 07-adapter-spec.md §3・05-runtime.md §1.1 / §1.5
@@ -507,7 +518,10 @@ kio search "..." --json                 # 機械可読
 
 レスポンス schema は [05-runtime.md §1.7](05-runtime.md)。`json` モードでは Evidence Pointer フル構造 + `next_cursor` を返す。
 
-`index_status.budget_paused` は task の budget pause と、cost ledger から観測した device / folder 月次 cap 枯渇の OR である。この観測は searched scope ごとに source ledger を reopen せず、1 invocation の command preflight で取得した同じ owned read-only snapshot から device total を1回、folder total を scope ごとに読む。snapshot は既存の入力・mode 判定後、fresh image / vector / hybrid page 1 の writable ledger open・claim / reservation・query embedding 送信より前に取得する。集計対象の UTC 月も preflight 時点で固定し、取得後の別 writer や同一 invocation の charge はその response の月次 cap 観測へ混ぜない。explicit text、cursor replay、および HTTP の offline / profile incompatibility / final consent rejection による**pre-attempt** auto→text は source ledger の main / `.write-seq` / SQLite sidecar を作成・変更しない。final consent check を通過した fresh image / vector / hybrid page 1 は query embedding 記帳の既存例外に従い、claim / reservation / send 後に最終結果が text fallback になった場合も同じである ([05-runtime.md §6](05-runtime.md))。snapshot が unsafe / unstable な場合は `budget_paused=false` に縮退せず、下記の command-level error で stdout を空のまま停止する。
+`index_status` は `budget_status=known|unknown` と `budget_reason`（known なら null、unknown なら
+元の typed error code または ledger 未初期化理由）を返す。`budget_paused` の nullable 表現、
+同一 snapshot / UTC 月、無料 local 実行の記録先は [04 §5.4](04-pipeline.md#54-cost-guardrail--kill-switch)
+を正本とする。予算観測不能だけではローカル結果の stdout や成功 exit を失わない。
 
 ---
 
@@ -525,7 +539,7 @@ kio <command> --json
 
 # 5. Export
 
-過去 commit の raw bytes を別の宛先へ書き出す。`export` は管理中の最新版へ直接書き戻さない。`restore` は export の互換 alias ではなく、次節の journaled managed restore だけを指す:
+過去 commit の raw bytes を指定の宛先へ書き出す。`export` は管理中の最新版へ直接書き戻さない。`restore` は export の互換 alias ではなく、次節の journaled managed restore だけを指す:
 
 ```bash
 kio export <evidence|path|commit> --to <dir>
@@ -533,36 +547,8 @@ kio export <commit> --to ~/Recovered/<commit>     # 通常
 kio export <pointer> --to ./recovered/ --force    # 既存上書き許可 (確認 prompt)
 ```
 
-安全要件:
-
-```
-- --to <dir> は必須 (canonical 解決先が当該 scope root 配下 (`.kio` 含む) は KIO-E-CONFIG-USAGE-001
-  (exit 2) で拒否 — working tree への直接書き戻し禁止の迂回を許さない。canonical 解決は
-  05 §1.8 の算出規則と同一 (realpath 含む)。展開前に --to を open した fd の実体 (dev/inode) を
-  canonical 解決先と対照し (不一致 = KIO-E-CONFIG-USAGE-001 で mutation 前拒否)、以後の展開は
-  同一 fd 配下に限定する — 05 §4)
-- 全出力 path の退避 / 隔離の同名残存は --force の有無・宛先の存否に関わらず mutation 前に検査し、
-  残存 = 先行未完として拒否 + 回復案内 (正本 05 §3.5)
-- 既存ファイル上書きは --force + 確認 prompt
-- --force 上書きは旧ファイルを同 directory の退避名 `<basename>.kio-export-bak` へ no-replace で
-  保全 (同名残存 = 先行未完として拒否 + 回復案内。退避名は stderr に表示・dev/inode を記録) して
-  から publish し、rename 後再検査の purge / erase / journal 終端時のみ原状復帰する (対象 alive の
-  無関係変化は publish 維持 — 05 §3.5。成功時に退避を除去)
-- publish (--force 含む)・隔離・復帰の rename は全て no-replace。巻き戻しの削除も退避の復帰・
-  除去も、path 上の対照ではなく決定的隔離名 `<basename>.kio-export-quarantine` への隔離 rename +
-  rename した実体の dev/inode 検証で行う (隔離名は stderr に表示。同名残存 = 先行未完として拒否 +
-  回復案内。隔離・退避はユーザー領域 — Kio は自動削除しない)
-- 競合処置は段階別 (--force publish 競合 = 退避を復帰 / 隔離実体の不一致 = 元 path へ復帰を試行 /
-  退避の不一致・復帰 rename 失敗 = 不触) — いずれも両所在を表示して
-  KIO-E-COMMIT-EXPORT-CONFLICT-001 (retryable exit 3、context に conflict_kind・retry_disposition)
-  で終端 (05 §3.5)
-- 出力名・上書き対象名が `.kio-export-bak` / `.kio-export-quarantine` で終わる場合は展開前に
-  明示拒否 (改名復元を案内)
-- export は raw object をそのまま展開 (再 Markdownize しない)
-- evidence は pointer URI / inline JSON / stdin、path は論理 direct-child 名、commit は HEAD / tag / full commit hash。tag と同名の path は tag を優先する。raw_hash shorthand は export では受理しない
-- shallow commit からの export は KIO-E-COMMIT-SHALLOW-001 で拒否
-- purged 対象は KIO-E-PURGE-NOT-FOUND-001 / tombstone
-```
+`--to <dir>` は必須。入力 operand、`--force` の確認、宛先・衝突の許否、
+展開・回復・error code / exit の正本は [05 §4.1 Export](05-runtime.md#41-export)。
 
 ## Managed restore
 
@@ -789,16 +775,12 @@ scope status や `batch_changed` に変換しない。registry main / `-wal` / `
 の場合だけは cache miss であり、既存の validated hint / CWD 候補規則を継続できる。main absent で
 sidecar が存在する形は unsafe integrity である。
 
-Search の cost-ledger snapshot も command-level preflight である。source ledger のmain / `-wal` /
-`-shm` の全3 leaf absent は no-create のまま未初期化・budget-unknown とし、zero-total として
-cap 判定を続けない。embedding の Paused と検索の auto/hybrid fallback・明示 image/vector の失敗は
-[04-pipeline.md §5.4](04-pipeline.md) に従う。
-source symlink / hardlink / non-regular / oversize leaf、pre/open/post identity 不一致、main absent +
-sidecar present、または source 再観測が一致した owned copy の SQLite integrity failure は
-`KIO-E-LEDGER-SNAPSHOT-UNSAFE-001` / exit 4 とする。source leaf の presence/hash drift、busy、
-bounded retry exhaustion、temp I/O、または copy/open/query 中に integrity を確定できない
-failure は `KIO-E-LEDGER-SNAPSHOT-001` / exit 3 とする。どちらも stdout を空にし、
-scope fallback / excluded scope / `budget_paused=false` / 他 domain の error code へ変換しない。
+明示 ledger snapshot / status と有料 admission では、source symlink / hardlink / non-regular、
+identity 不一致、不完全 sidecar、確定した integrity failure を
+`KIO-E-LEDGER-SNAPSHOT-UNSAFE-001` / exit 4 とする。drift / busy / retry exhaustion / temp I/O /
+未確定 integrity は `KIO-E-LEDGER-SNAPSHOT-001` / exit 3 とする。資源予算超過は不正データと区別する。
+search / scope status / 無料 local index の予算観測では、この code を budget_reason に残し、
+[04 §5.4](04-pipeline.md#54-cost-guardrail--kill-switch) に従ってローカル結果を返す。
 
 スクリプト連携 (`kio index && kio search`) はこれらを参照する。コマンド固有の補足は各 sub-command の docstring で明記。
 
@@ -891,7 +873,9 @@ Adapter 種別と契約は [07-adapter-spec.md](07-adapter-spec.md)。
 
 # 10. Settings / Schema
 
-すべての設定ファイルは JSON Schema (TOML は JSON 等価表現) で validate。CLI 起動時に schema-driven validation を行う:
+設定ファイルは、そのコマンドが利用する依存を読むときに JSON Schema (TOML は JSON 等価表現)
+で validate する。未使用設定を CLI 全体の起動条件にしない。利用範囲と readiness の扱いは
+[操作別前提条件の正本](14-v1-runtime-contracts.md#operation-specific-prerequisites) に従う:
 
 ```
 ~/.config/kio/tools.toml          tools.schema.json

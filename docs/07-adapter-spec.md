@@ -23,7 +23,9 @@ Adapter の実行設定 (cmd / args / url / 認証情報) は **`.kio/` の共�
 R23 の同梱 runtime が実行できる online target は `mistral_ocr_markdownize` と
 `gemini_embedding_2` の built-in 実装に限定する。これらの role では `cmd` / `args` /
 `url` による実行先の差し替えを受理せず、宣言された model と built-in target の一致を
-起動時と実行直前に検証する。上記の実行設定フィールドは現在の built-in role では受理しない。
+その role を利用するコマンドの設定読取り時と実行直前に検証する。未使用 role は起動条件にしない
+([操作別前提条件](14-v1-runtime-contracts.md#operation-specific-prerequisites))。
+上記の実行設定フィールドは現在の built-in role では受理しない。
 
 認証情報の保存規約:
 
@@ -39,7 +41,7 @@ Kio が作っていない親ディレクトリにはその要件を課さず、�
 2. tools.toml 直書き:  auth = "plain:<api_key>"
    - 条件を満たさない平文 credential は KIO-E-ADAPTER-TOOLS-PRIVATE-001
      (exit 2) で拒否する。既存の permission を自動変更しない。
-   - 起動時と credential 使用時に、1 MiB 上限の regular・single-link・
+   - そのコマンドが credential を利用する設定読取り時と使用直前に、1 MiB 上限の regular・single-link・
      no-follow 読込みを行う。使用時の宣言が読込み済み設定と変わっていたら拒否する。
      事前の形式判定すらできない unsafe file は通常の bounded-read error になる。
    - TOML 構文エラーには設定本文・credential を含めず、byte offset だけを示す。
@@ -85,13 +87,11 @@ Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱す�
 > **PDF text layer 抽出の範囲 (実装フィードバック 2026-07-23)**: 実世界の text-layer PDF
 > (TeX / LibreOffice 出力) は FlateDecode 圧縮 content stream + subset font の glyph index +
 > font ごとの ToUnicode CMap (TeX Live はさらに `/Type /ObjStm` 内へ辞書を格納) で構成される。
-> deterministic Adapter の text layer 抽出はここまでを対象とする: **FlateDecode の有界展開**
-> (stream あたり 16 MiB 上限)、`/Type /ObjStm`
-> の展開、Page → Resources → Font → ToUnicode の解決、CMap (`bfchar`/`bfrange`) による glyph
-> index 復号。1 decode の resource ceiling は object 8,192 個 / materialized object 128 MiB /
-> decoded stream 合計 64 MiB / page content 16 MiB / emitted text 32 MiB / materialized CMap
-> 65,536 entries・32 MiB / page あたり content reference 8,192 個である。これらの超過と malformed
-> object-stream admission は `contract_violation` として拒否し、より弱い fallback へ送らない。
+> deterministic Adapter の text layer 抽出はここまでを対象とする: **FlateDecode の有界展開**、`/Type /ObjStm` の展開、Page → Resources → Font → ToUnicode の解決、
+> CMap (`bfchar`/`bfrange`) による glyph index 復号。PDF は page ごとに streaming し、
+> 256 pages / 8,192 objects を文書全体の固定拒否条件にしない。資源 tier は下記の共通規則に従う。
+> malformed object stream、循環参照、不正 offset/length は `contract_violation` とし、
+> 資源予算超過と区別する。いずれも弱い parser や有料 OCR へ無断 fallback しない。
 > **確信を持って復号できないファイルは空抽出へ縮退し (fail-empty)、従来どおり
 > online OCR ルーティングに乗る** — FlateDecode 以外の filter (DCTDecode 等)・ToUnicode を
 > 持たない font の glyph 列・スキャン/画像系は引き続き OCR の領分である。この抽出意味論の
@@ -115,10 +115,10 @@ Kio core は、**明示オプトインなしにネットワーク越し API へ�
 default: no network transmission (opt-in 未成立の scope からはオンライン送信しない)
 ```
 
-opt-in の単位・成立・寿命:
+外部ネットワーク opt-in の単位・成立・寿命（loopback は §3.1）:
 
 ```text
-単位: scope と Adapter の完全な paired identity。
+単位: 外部ネットワーク送信は scope と Adapter の完全な paired identity。
   scope 側の active approval reference と device-private active grant の両方が、
   scope/membership、tool_id、execution_mode、tool_profile_hash、destination、
   credential binding、trust binding、operation に一致しなければならない。
@@ -141,19 +141,20 @@ opt-in の単位・成立・寿命:
 ```
 
 `--online` は temporary opt-in でも grant 作成手段でもない。`index --online` は、
-current scope の configured Adapter の少なくとも一つに active external-send paired grant
-があることを preflight で要求する。Gemini-only の grant でもこの preflight を満たし得るが、
-各 Adapter の dispatch は依然としてその Adapter 自身の exact grant を要求する。検索の
-query embedding も current exact paired grant を要求する。`--online` は revoke、identity
+選択した configured Adapter 宛先の少なくとも一つに有効な承認があることを preflight で要求する。
+外部宛先は本節の current scope/device paired grant、loopback は §3.1 の device approval を使う。
+承認済み loopback だけの構成もこの preflight を満たすが、
+各 Adapter の dispatch と query embedding は、宛先に応じて本節／§3.1 の承認を要求する。`--online` は revoke、identity
 不一致、または policy 拒否を修復しない。
 
-`--offline` は当該 invocation の**全 HTTP dispatch**を禁止する。online provider だけでなく、
-loopback local Adapter、provider の poll、output download、upload cleanup も対象である。
-未実行の task はこの invocation で送信せず、HTTP 回復も行わない。適用対象は index、batch
-resume/retry、reindex、repair rebuild-db、search、および HTTP Adapter を使い得る同等の経路である。
+`--offline` は当該 invocation の外部ネットワークを禁止する。provider の submit / poll、
+output download、upload cleanup、model download も外部宛先なら禁止する。
+§3.1 の承認済み loopback Adapter と native 実行は許可し、offline watch にも同じ規則を適用する。
+offline は承認を作成しない。index、batch resume/retry、reindex、repair rebuild-db、search と
+同等の送信経路すべてで admission / dispatch の双方に適用する。
 
-既定 local EG2 の準備は [10-operations.md §5.1](10-operations.md) に従う。HTTP Adapter は
-同梱されていても paired grant 成立前に内容を送信しない。FTS baseline はモデルや API key に依存しない。
+既定 local EG2 の準備は [10-operations.md §5.1](10-operations.md) に従う。
+FTS baseline はモデルや API key に依存しない。
 
 ## 3.1 ローカル窓の送信境界
 
@@ -162,12 +163,28 @@ loopback リテラルと 0 以外の明示ポートを要求する。host は `1
 名前解決結果による許可、userinfo、query、redirect、proxy を許可しない。パスは許可する。
 違反は `KIO-E-LOCAL-PEER-URL-001`。設定検証と dispatch 直前に同じ条件を検査する。
 
-HTTP peer は認証されていないことを承認画面と status に表示する。HTTP でも scope/device の
-exact paired grant、secrets hold と必要な secret-send grant、`--offline` の禁止は変わらない。
-HTTPS では device-local の登録済み managed CA snapshot だけを信頼し、送信前に証明書の
-有効性と名前を検証する。CA の登録・回転・失効・status と snapshot の寿命は
-[14-v1-runtime-contracts.md](14-v1-runtime-contracts.md) の既存 trust 契約に従う。
-`ca_pem_path` による直接指定は拒否する。`auth` の省略も paired grant を免除しない。
+loopback endpoint は端末で一度だけ明示承認する。device-private record は
+scheme / literal host / port / path の完全な destination、credential binding、HTTPS の
+trust generation/digest に結び付ける。scope/membership、tool/profile と operation を通常の
+送信承認キーに含めず、同じ端末の別 scope / profile / 用途で同一 endpoint を再確認しない。
+endpoint / credential / trust identity の変更・revoke 後は
+再承認が必要で、admission と dispatch 直前に現行 record を検査する。scope からの trust / grant
+import は認めない。承認・status は宛先、用途、送る内容の種類、端末内の対象 scope に適用される
+ことを表示する。HTTP peer は未認証であることを明示する。proxy / redirect 禁止と URL 完全一致を
+維持する。config の存在や auth 省略を承認にしない。
+
+通常 loopback 承認は device-private な状態として保持する。未完了の承認を dispatch に使わず、
+`approve --resume <grant_id>` は一致する endpoint identity と元の確認内容だけを再開できる。
+中断後も確認されていない承認を active と推測せず、成功済み承認または未完了を一意に表示する。
+revoke 完了後は後続 admission / dispatch が拒否され、送信済み bytes は取り消せない。
+通常 index/watch は承認を補完しない。status は scope がなくても端末の承認・中断・失効を表示し、
+破損・不一致を active と推測しない。
+
+secret hold と必要な scope/device の secret-send paired grant は別に維持し、端末の通常送信承認で
+秘密を解放しない。HTTPS は device-local の登録済み managed CA snapshot だけを信頼し、
+送信前に証明書の有効性と名前を検証する。HTTP に CA を要求しない。CA の登録・回転・失効・status と
+snapshot の寿命は [14](14-v1-runtime-contracts.md#local-adapter-and-renderer-boundaries) に従う。
+`ca_pem_path` による直接指定は拒否する。
 
 ローカル窓の接続先は device の tools 設定に置き、`cmd` / `args` は受理しない。
 Markdownize OCR は `POST {url}/layout-parsing` を使う。Embedding の wire は §5.3 に従う。
@@ -269,29 +286,26 @@ unit 化 ([04-pipeline.md §2](04-pipeline.md) の表) は外部 renderer (Libre
 揮発メタデータを同長固定値へ正規化してから hash する (xref offset を壊さない)。これにより同一
 renderer 版内で prepared_hash が安定し、renderer 更新による出力変化は
 [03-data-model.md §2.1](03-data-model.md) の「prepare profile / renderer 変更による prepared_hash
-変化が駆動する再 Markdownize」(gen+1 の第二の合法経路 — 確認プロンプト + budget guardrail) が
+変化が駆動する再 Markdownize」(gen+1 の第二の合法経路) が
 そのまま吸収する。renderer の名称・版は provenance として記録し、hash 入力にはしない (同一 bytes =
 同一 identity)。**renderer が環境に存在しない場合、当該 Office ファイルの online タスクは enqueue
 しない** (doomed task を作らない) — `index_status` ([05-runtime.md §1.7](05-runtime.md)) に理由付きで
 可視化する。実行時の変換失敗は contract_violation ([04-pipeline.md §5.3](04-pipeline.md) — 同一入力の
 再試行 1 回) に合流する。音声の変換機構は現在の契約に含めない。
 
-macOS の LibreOffice は、Document Foundation の署名を検証できる bundle と
-26.8 以降の release を必要とする。公式 26.2.5 は `--version` が成功しても、
-headless backend を含まないため、実変換時に Cocoa の初期化で隔離内から異常終了する。
-対応版未満・不正な version 応答は変換前に拒否する。この版の条件は対応方針であり、
-将来の配布物がすべて動作するという保証ではない。各固定配布物について実際の
-DOCX/PPTX 変換と隔離の受入試験を行う。v1 の 3 OS Actions は公式 26.8.0 を
-配布物ごとの SHA-256 で固定する。bundle 内の変更や隔離の緩和で旧版を動かさない。
+renderer の検出は配布元名、固定 install prefix、最低 version の文字列だけで可否を決めない。
+実 executable identity と必要 runtime resource を特定・検証し、隔離内の bounded な実変換 probe で
+headless PDF 出力 capability を確認する。名称・version・配布物 digest は provenance と診断に残す。
+macOS の署名検証は有効性と実コードの binding を確認し、特定 vendor の署名だけを許可条件にしない。
+version 応答の形式差だけを「未導入」と扱わず、検出済みだが利用不能なら具体的な理由を表示する。
+CI の配布物 SHA pin は再現性のため維持し、製品の一般的な版許可リストにはしない。
 
-外部 renderer の実行コード・読み込み資源の trust 検証は storage の祖先 ACL 判定とは別の実行境界である。
-以下の配布物検証は維持し、renderer scratch は [14 の storage 契約](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
-
-Linux の TDF 公式 DEB では、厳密な `/opt/libreoffice<major>.<minor>/program/soffice`
-配置を認識し、`program`、`share` と初回の専用 profile 作成に必要な `presets` を
-読み取り専用で許可する。各 leaf とその祖先は root 所有・group/other 書込み不可の
-実ディレクトリであることを検証し、symlink 経由の配置を拒否する。必要な leaf が
-欠ける場合は拒否し、実行ファイルの指定だけで任意の sibling を読み取り可能にしない。
+実行コードと必要 runtime path の置換防止・trust は storage の祖先 ACL 契約とは別に維持する。
+Linux の distro / TDF / portable の配置は実際に必要な read-only runtime root の検証で受け入れ、
+固定 `/opt/libreoffice<major>.<minor>` と sibling 名だけで決めない。runtime 内の symlink は
+解決した対象を同じ許可済み runtime closure に固定できる場合だけ許可し、任意の host path へ
+読み取り権限を広げない。network / unrelated private files / write の隔離を弱めて probe を通さない。
+renderer scratch は [14 の storage 契約](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
 
 **Office package preflight (DOCX / PPTX)**: LibreOffice に渡す前に raw ZIP を最大 100 MiB、central-directory を最大 4,096 entry、各 member を最大 32 MiB、全 member の declared aggregate を最大 256 MiB として検証する。必要な `[Content_Types].xml`、`_rels/.rels`、main XML の読取り合計は 6 MiB に制限し、CRC を検証して読む。encrypted / split ZIP、ZIP64、重複・非 UTF-8・unsafe part name、非 Stored/Deflated member は拒否する。XML は UTF-8、nesting 256、attribute 1,024 を上限とし、DTD/entity declaration を受けない。DOCX / PPTX ごとに genuine な MIME override、内部 root relationship、main part と namespace を検証する。preflight failure は renderer を起動せず contract violation とする。
 
@@ -300,6 +314,11 @@ Linux の TDF 公式 DEB では、厳密な `/opt/libreoffice<major>.<minor>/pro
 `cgroup.kill`、安全な descriptor 相対解決、利用者の systemd manager が必須であり、
 不足時は変換を拒否する。製品が sudo を呼び出したり、ホストの権限設定を変更したりしない。
 native Actions の受入対象は Ubuntu 24.04 / systemd 255 である。
+Linux desktop の対応条件は、この user manager と delegated cgroup v2 の資源制御、および既存の
+filesystem/network 隔離を実検査で満たす構成とする。失敗時は `systemd user manager`、controller 名、
+`cgroup.kill`、descriptor 解決、sandbox helper のどれが不足したかを表示し、単に renderer missing と
+しない。隔離不能時も text/Markdown、PDF text layer、XLSX 直接抽出、既存保存内容の検索など
+利用可能な経路を案内する。sudo・ホスト設定変更や隔離なしへの暗黙縮退は行わない。
 
 既定値は invocation 全体で memory 2 GiB、swap 0、task 64、CPU bandwidth 1 CPU とする。
 task 数には launcher、監視用の待機プロセス、renderer の全 thread を含む。
@@ -326,12 +345,21 @@ unit** だからであり、sheet にはそれが無い。実測: 10 列 1 シ�
 指し先として誤りであり、OCR を通せばさらに劣化する。加えて cell は**既に構造化テキスト**であり、
 画素へ落として読み戻すのは失われていない構造を壊す往復である。
 
-したがって XLSX は**ローカルで決定論的に直接抽出する** (`kio_adapter::xlsx_extract`)。受理上限は
-workbook あたり 256 sheets・1,000,000 cells（疎な列位置の padding を含む）・セル文字列合計 16 MiB・
-出力 Markdown 合計 16 MiB、sheet あたり 50,000 rows・1,024 columns、ZIP central-directory 4,096 entries、
-任意の inflated ZIP member 64 MiB とする。self-closing row/cell にも同じ上限を適用し、
-共有文字列の複写・列 padding・Markdown escape より前に残量を検査する。raw ZIP は 100 MiB、aggregate read は 256 MiB、XML は nesting 256 / attribute 1,024 を上限とする。central/local header の name、size、CRC は一致を確認し、CRC-checked read を行う。encrypted / split ZIP、ZIP64、重複・非 UTF-8・unsafe part name、非 Stored/Deflated member、DTD/entity declaration、malformed XML は拒否する。超過・不正 ZIP/XML は部分抽出や空成功にせず
-`KIO-E-PREPARE-XLSX-EXTRACT-001` の contract violation とする。
+したがって XLSX は**ローカルで決定論的に直接抽出する** (`kio_adapter::xlsx_extract`)。
+row / sheet 単位で有界 streaming し、256 sheets / 50,000 rows / 1,024 columns /
+1,000,000 padded cells を workbook 全体の固定拒否条件にしない。疎な列の padding を常駐展開せず、
+共有文字列の参照・Markdown escape も資源予算へ数える。資源 tier は下記に従う。
+ZIP central/local header の name、size、CRC の一致と CRC-checked read、unsafe/重複 part name、
+encryption、split ZIP、ZIP64、非 UTF-8 part name、Stored/Deflated 以外の圧縮方式、
+XML DTD/entity declaration・malformed 構造は拒否する。XML は UTF-8、nesting 256、
+要素あたり attribute 1,024 以下を受理する。`[Content_Types].xml`、内部 root relationship、
+workbook main part と worksheet relationship は XLSX の MIME / namespace / 対象 part と一致し、
+外部 relationship を取得しない。必要 part の欠落や参照の不整合を空成功にしない。
+これが XLSX ZIP/package 受入条件の正本であり、DOCX/PPTX の preflight 容量値は流用しない。
+不正 ZIP/XML と上記の不受理 variant は `KIO-E-PREPARE-XLSX-EXTRACT-001`、
+容量・work 予算超過は [04 §5.3](04-pipeline.md#53-エラー種別と-retry-budget) の
+`resource_limit` と区別し、部分抽出を完成済み workbook として公開しない。
+preview は完了 sheet/row、未処理範囲とその理由を表示する。再開時も元 sheet/row identity を保持する。
 
 - **unit = worksheet 1 枚**。`unit_key` は 04 §2 / QB27 の `sheet:` 規則 —
   NFC 正規化 → 元名の `#` を `##` へ escape → **その後で**同名 2 枚目以降に `#2` / `#3` を付す
@@ -348,6 +376,30 @@ workbook あたり 256 sheets・1,000,000 cells（疎な列位置の padding を
   「file X の sheet M の中の image N」という evidence 上の同一性が未定義であり、
   `image_object_hashes` は 3 つの構造体に**宣言があるだけで書き手も読み手も無い**。
   半端に配線せず、抽出器が**件数を報告して穴を可視に保つ** (`XlsxDocument::media_paths`)。
+
+### PDF / XLSX の抽出資源 tier
+
+`index` / `reindex` / `repair rebuild-db` の `--resource-tier standard|large` はローカル抽出の
+invocation 限定の資源選択で、省略時は standard。永続的な安全確認無効化設定は作らない。
+
+| 予算 | standard | large |
+|---|---:|---:|
+| 同時に保持する展開 object / stream / text / string table の合計 | 256 MiB | 1 GiB |
+| parser work（object/reference 訪問、cell、展開 byte の 1 KiB 単位を加算）/file | 10,000,000 | 100,000,000 |
+| 1 unit の出力 text | 16 MiB | 64 MiB |
+| XLSX raw ZIP / file | 100 MiB | 1 GiB |
+| XLSX 1 member の展開 bytes | 64 MiB | 256 MiB |
+| XLSX 全 member の declared / 実読取り展開 bytes 合計 / file | 256 MiB | 4 GiB |
+
+XLSX の容量値は選択 tier に対応し、declared size と実読取りの両方に適用する。
+member / aggregate の容量枠は streaming で消費する総量であり、同時保持 memory 枠の拡張ではない。
+共有文字列・escape・出力を含む保持 bytes、parser work、unit text、ZIP 容量の全枠を同時に満たす。
+全て有限の checked counter とし、割当・展開前に予算を検査する。メモリ予算は allocator の
+全 RSS の保証ではなく parser が保持する bytes の上限である。page / sheet 出力は順に private stage へ
+流し、文書全体の展開 bytes を同時保持しない。旧固定限界を超える正常 fixture が処理できることと、
+不正構造・展開爆弾・循環が有限 work で止まることの両方を受入条件とする。
+未完了の場合は処理済み範囲・未処理範囲・予算と再実行方法を表示し、cell / page を黙って捨てない。
+preview も同じ予算と受入検査に従い、有料 fallback や外部送信の承認を追加しない。
 
 ## 5.2 Markdownize
 
@@ -480,7 +532,7 @@ media 別の変換規約 (何を見出しにするか等) は Adapter 実装の�
 ## 5.3 Embedding
 
 text chunk、所有権を検証した image object、text query は同じ Adapter 契約を使う。
-対象選択・Task・論理 job・物理台帳・member 受入・再試行・公開は
+対象選択・Task・論理 job・実行記録・member 受入・再試行・公開は
 [04-pipeline.md §5](04-pipeline.md) の共通 runner が所有し、Adapter はそれらを分岐実装しない。
 audio/video、PDF の直接 embedding、画像ファイルを query にする入力は対象外である。
 
@@ -566,7 +618,7 @@ local crash の再計算・0 USD 回復は [04-pipeline.md §5](04-pipeline.md) 
 wire 形式・model・重み pin・chat template/instruction を意味的 profile に固定する。
 空 instruction も固定し、同一 profile で input/messages を混用しない。
 出力は768次元を要求し、形式が許す場合だけ余剰次元を切り詰めて正規化し、そうでなければ明示拒否する。
-窓は同じ Task・0 USD 台帳・member 受入・回復契約を使う。Kio は endpoint server を起動・管理しない。
+窓は同じ Task・無料 local execution state・member 受入・回復契約を使う。Kio は endpoint server を起動・管理しない。
 HTTP/HTTPS の送信境界は §3.1 に従い、別の実行 pipeline や管理 server 選択肢は設けない。
 
 ## 5.4 Rerank (optional)
@@ -740,7 +792,7 @@ R23 の Markdownize / Embedding runtime は同梱 target だけを実行し、�
 task_id, adapter_id, tool_profile_hash, execution_mode, scope_id
 input_raw_hash, output_hash
 status, error_code, error_category, retry_after_ms
-network_consent (current paired grant identity — HTTP dispatch を伴った実行のみ)
+network_consent (宛先に応じた current grant identity — HTTP dispatch を伴った実行のみ)
 started_at, finished_at
 adapter_kind, input_hash, intent_token, submission_seq
 usage_validation (missing | invalid), billing_source (estimated)

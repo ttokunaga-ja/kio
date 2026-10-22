@@ -14,7 +14,7 @@
   [10-operations.md §5.1](10-operations.md) に従う。
 - 知識の正本はフォルダごとの `.kio` にある。各 `.kio/index/sqlite.db` と central replica は、
   per-folder CAS / metadata から再構築できる検索用 projection であり、SQLite 単体は knowledge の正本ではない。
-- scope と外部送信の consent を機能させる。consent は scope × Adapter の egress gate であり、
+- scope と外部送信の consent を機能させる。consent の宛先別単位は [07 §3](07-adapter-spec.md#3-ネットワーク送信原則と-opt-in-正本) に従い、
   user/group ACL ではない。user/group ACL は v3 の要件である。
 - ignore されない新規子フォルダを自動発見し、`.kio` を作成して独立 scope として管理する。
   空フォルダも対象に含む。exact debounce/SLA と、一般的でない filesystem の対応範囲は未決である。

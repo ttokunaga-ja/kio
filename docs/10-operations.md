@@ -884,10 +884,14 @@ sqlite.db / scope-registry.sqlite / aggregator.sqlite は正本から再構築�
 rename、**JSONL cutover 用** marker、列 default/backfill を用いる後方互換 migration は置かない。current
 `schema_migrations` の historical restore marker は拒否 artifact として読むだけで、通常操作が clear / repair する経路は持たない。
 
-起動時は `cost_ledger` / `batch_requests` / `schema_migrations` / `ledger_metadata` の **4 表すべて**の table 定義、および
+台帳を利用する操作でのみ ([操作別前提条件](14-v1-runtime-contracts.md#operation-specific-prerequisites))、
+`cost_ledger` / `batch_requests` / `schema_migrations` / `ledger_metadata` の **4 表すべて**の table 定義、および
 `idx_cost_ledger_month` / `idx_batch_requests_inflight` を canonical DDL と比較する。明示 init で完全に空の artifact set
 だけを current schema で初期化できる。既存 ledger が不一致・欠損・読取不能なら、**bytes を保存した
-まま一切 rename / ALTER / DROP / import せず fail-closed** にする。エラーは ledger が non-rebuildable
+まま一切 rename / ALTER / DROP / import せず、その台帳依存操作を fail-closed** にする。
+無料 local 処理は台帳を前提にせず、read-only 予算観測の取得不能は
+[04 §5.4](04-pipeline.md#54-cost-guardrail--kill-switch) の unknown 表示に従う。
+エラーは ledger が non-rebuildable
 であることと、明示的な operator recovery が必要なことを示す。推測変換や startup の自動修復で課金額・
 intent・監査履歴を失わせてはならない。current-schema ledger の torn write / provider crash recovery は
 §5.4 / §5.8 の既存の recovery 契約として維持するが、旧 shape を current shape と見なす契約ではない。
@@ -948,10 +952,14 @@ secret redaction
 [07-adapter-spec.md §7.1](07-adapter-spec.md) を正本とする。
 
 オンライン Adapter は、明示 opt-in なしにファイル内容を送信してはならない。opt-in の
-単位 (scope × adapter)・寿命・revoke は [07-adapter-spec.md §3](07-adapter-spec.md) を
+単位（外部宛先／loopback の区別）・寿命・revoke は [07-adapter-spec.md §3](07-adapter-spec.md) を
 正本とする。初回スキャン preview でも、network transmission policy を表示する。
 
 ---
+
+Office renderer の対応 Linux desktop 条件、不足する機構の診断と代替抽出経路は
+[07 §5.1](07-adapter-spec.md#51-prepare) を正本とする。隔離不能を未導入と表示せず、
+既存のローカル検索・抽出まで停止しない。
 
 ## 9.1 Incremental Markdownize (要件)
 
@@ -1052,7 +1060,7 @@ exit code の一覧と割当規則の正本は [06-cli-spec.md §7](06-cli-spec.
 
 ## 11.3 設定ファイル schema validation
 
-すべての設定ファイルは JSON Schema (TOML は JSON 等価表現に変換して同 schema で validate) を持ち、CLI 起動時に schema-driven validation を行う。schema は Kio 本体に同梱する。
+すべての設定ファイルは JSON Schema (TOML は JSON 等価表現に変換して同 schema で validate) を持ち、[14 の操作別前提条件](14-v1-runtime-contracts.md#operation-specific-prerequisites) に従い、その操作が使う設定を schema-driven validation する。schema は Kio 本体に同梱する。
 
 ```text
 ~/.config/kio/tools.toml          → schemas/tools.schema.json
@@ -1065,7 +1073,7 @@ exit code の一覧と割当規則の正本は [06-cli-spec.md §7](06-cli-spec.
 
 validation 失敗は exit code 2 で停止し、`KIO-E-CONFIG-SCHEMA-001` を返す。schema は semver で版管理する。format change は新しい current version を選択するが、migration / old-version read-only / dual-read を定義しない (§11.5)。
 
-`scope.schema.json` は少なくとも次の key を定義する: `scope_id` (required)・子 `.kio` リンク ([03-data-model.md §2](03-data-model.md))・`scan_approval` (optional — §1 の取り込み承認記録。required field は §1 の記録一覧と一致)・`approvals[]` (optional — adapter 単位の network opt-in。要素の required field = scope_id / tool_id / execution_mode / tool_profile_hash / approved_at / approval_method / status (`active` | `revoked`)、status=revoked の行は revoked_at も必須 — [07-adapter-spec.md §3](07-adapter-spec.md))・`approval_pending` (optional — 中断した明示承認の監査・診断記録。単一 object で、存在する場合の required field = scope_id / tool_id / execution_mode / tool_profile_hash / approved_at / approval_method。pending は active 行を作らず、自動 publish・cleanup・監査値補完の対象にしない。次の送信には fresh な明示承認が必要)・`approvals_initialized` (optional boolean — 承認 lifecycle の監査状態。行の有効化、初回例外、または自動 materialize の根拠にはしない)。これらの更新は retained store lock と束縛済み metadata handle による serialized compare/write で行う。atomic rename は検証済み bytes の publication 手段であって CAS ではない。**`approval_pending` key 全体の不在は valid で pending intent 無しを表す。一方、存在する pending の required field 欠落・型不正は schema error / fail-closed** である。`approvals[]` が存在する場合の各行も同じく strict に検証し、`status` 欠落行は送信を許可しない (既定値で active と読む経路は持たない)。**未知 key は schema error** (fail-closed)。この schema validation は `kio_format_version == KIO_FORMAT_VERSION` の完全一致判定より後に走る。missing / non-string / malformed / older / newer / unknown を含む non-current store は schema validation へ進めず `KIO-E-STORE-VERSION-001` / exit 8 で全 command が拒否する。`approvals[]`・`approval_pending`・`approvals_initialized` の**全て**を欠く current-version scope.json は valid であり、欠落 = 当該承認なしとして扱う。
+`scope.schema.json` は少なくとも次の key を定義する: `scope_id` (required)・子 `.kio` リンク ([03-data-model.md §2](03-data-model.md))・`scan_approval` (optional — §1 の取り込み承認記録。required field は §1 の記録一覧と一致)・`approvals[]` (optional — 外部宛先の adapter 単位 network opt-in（loopback の通常承認は 07 §3.1 の device record）。要素の required field = scope_id / tool_id / execution_mode / tool_profile_hash / approved_at / approval_method / status (`active` | `revoked`)、status=revoked の行は revoked_at も必須 — [07-adapter-spec.md §3](07-adapter-spec.md))・`approval_pending` (optional — 外部宛先の中断した明示承認の監査・診断記録。単一 object で、存在する場合の required field = scope_id / tool_id / execution_mode / tool_profile_hash / approved_at / approval_method。pending は active 行を作らず、自動 publish・cleanup・監査値補完の対象にしない。次の送信には fresh な明示承認が必要)・`approvals_initialized` (optional boolean — 承認 lifecycle の監査状態。行の有効化、初回例外、または自動 materialize の根拠にはしない)。これらの更新は retained store lock と束縛済み metadata handle による serialized compare/write で行う。atomic rename は検証済み bytes の publication 手段であって CAS ではない。**`approval_pending` key 全体の不在は valid で pending intent 無しを表す。一方、存在する pending の required field 欠落・型不正は schema error / fail-closed** である。`approvals[]` が存在する場合の各行も同じく strict に検証し、`status` 欠落行は送信を許可しない (既定値で active と読む経路は持たない)。**未知 key は schema error** (fail-closed)。この schema validation は `kio_format_version == KIO_FORMAT_VERSION` の完全一致判定より後に走る。missing / non-string / malformed / older / newer / unknown を含む non-current store は schema validation へ進めず `KIO-E-STORE-VERSION-001` / exit 8 で全 command が拒否する。`approvals[]`・`approval_pending`・`approvals_initialized` の**全て**を欠く current-version scope.json は valid であり、欠落 = 当該承認なしとして扱う。
 
 `folder-config.schema.json` は `[chunking].unicode_version` を **required** とする (省略不可・default なし — `kio init` が実装同梱の UCD 版 (現在の既定 = 17.0.0) を明示記録する、[03-data-model.md §5.3](03-data-model.md) / [06-cli-spec.md §1](06-cli-spec.md))。これを欠く `.kio/config.toml` は schema error (exit 2) とする — required field に既定値の代替経路は持たない。`[markdownize].bbox_annotation` (boolean、既定 true — [07-adapter-spec.md §5.2](07-adapter-spec.md)、値は tool_profile_hash に畳み込む) も本 schema の正式 key として定義する。
 

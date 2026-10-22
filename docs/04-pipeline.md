@@ -592,7 +592,7 @@ CAS から `embeddings` への再構築は、正本履歴・chunk 本文・現�
 backfill する fallback は持たない。
 再構築・検索公開の承認要否は descriptor の実際の外部作用で決める。
 EG2 はネットワーク送信を行わず network grant/secret-send grant を要求しないが、local access と
-stored-secret policy は維持する。HTTP の local endpoint は exact paired grant と secrets hold を要求する。
+stored-secret policy は維持する。HTTP の local endpoint の承認と secrets hold は [07 §3.1](07-adapter-spec.md#31-ローカル窓の送信境界) に従う。
 HTTP の承認照合は、保存済み tool-lock の recipient/profile と明示した embedding role の現行設定を用い、
 tool ID から role を推測しない。必要な grant がある場合は destination/credential/trust の完全一致を要求し、
 設定の欠落・不一致を承認済みとしない。通常文書の保存済み vector は Adapter 不在でも再送信せず復元できる。
@@ -725,7 +725,7 @@ Markdownize と、text/image/query の Embedding 処理は同期・非同期・n
 
 ```text
 対象選択 → 入力構築/検証 → dedup/Task・論理 job 確定 → admission
-→ durable reserve → submit → Completed/Pending 回収 → member 検査
+→ durable 実行記録（有料のみ reserve）→ submit → Completed/Pending 回収 → member 検査
 → 精算 → CAS/DB/replica 公開 → status/search
 ```
 
@@ -753,16 +753,16 @@ member ID は missing/extra/duplicate を拒否し、profile/次元/distance/mod
 既知結果の保存失敗は保存済み結果の再収集・再公開で回復し、新しい有料送信にしない。
 remote POST 後の結果不明は §5.4/§5.8 の保守的精算と明示再送承認に従う。
 local crash は 0 USD で終端記録し、§5.3 の attempt 上限内で再計算できる。同一入力を無限に再起動しない。
-ledger 自身の失敗は成功へ縮退しない。
+必要な実行 state 自身の失敗は成功へ縮退しない。無料／有料の記録先は §5.4 に従う。
 
 
-タスクストアは `.kio/tasks.jsonl` (append-only・喪失許容 — §5.7)。**bounded compaction**: 書き込み系
-コマンド冒頭で行数が閾値 (既定 4096 行) を超えていたら、`.kio/.lock` 下で terminal task の行を落とし
-(task の現在状態 = 当該 task_id の最新行 — terminal task はその全行 (旧遷移行を含む) を落とす)、
-非 terminal task は **task_id ごとの最新行 1 行のみ**を temp 完書き → fsync → atomic rename で再生成する
-(旧遷移行も落とす — `rate_limit` は max_attempts=∞ (§5.3) のため全行保持では有界にならない。状態 = 最新行
-であり attempts / next_retry_at も最新行が持つため lossless。喪失許容データのため compaction
-は常に安全 — 正確さは object store / cost-ledger からの再検出が担保する。§5.7)。
+タスクストアは `.kio/tasks.jsonl` (喪失許容 — §5.7)。task / unsupported の再構築可能 projection は、
+累積 append bytes の寿命上限で利用不能にしない。保持量の整理後も未終端 task の現在状態、
+attempt / next_retry_at / ownership と unsupported の現在理由を失わない。
+中断・回復後も検証済みの現在状態を一意に採用し、成功や新規入力へ巻き戻さない。
+canonical path、no-follow、record schema、identity と不正 record の拒否を維持する。
+課金／秘密／送信承認の正本はこの整理の対象にしない。容量不足は §5.3 の `resource_limit` として
+破損から区別し、部分成功や必要な状態の黙った切捨てにしない。
 
 ```json
 {
@@ -817,8 +817,11 @@ null は全 unit 対象。**上記 Markdownize object に列挙した key は全
 Embedding Task の target/image receipt/query hash は本節の typed variant として検証する。旧 task 行を default 値で current task として解釈する reader は持たない。
 
 `bbox_annotation_enabled` は online Markdownize では必須の boolean policy stamp（他の task は
-`null`）。`status="paused"` は `fallback_reason` と一致する `hold_reason` を必須とし、他の
-status は `hold_reason=null`。予約の3 field は全て `null`、または有限・非負の USD、UTC 月、
+`null`）。`status="paused"` は `fallback_reason` と一致する `hold_reason` を必須とする。
+`status="partial"` も未完了 unit に `resource_limit` がある間だけ
+`hold_reason="resource_limit"` と一致する `fallback_reason` を持てる。それ以外の status は
+`hold_reason=null`。部分成功と資源保留は直交し、hold を全 unit 成功や terminal と解釈しない。
+予約の3 field は全て `null`、または有限・非負の USD、UTC 月、
 canonical lowercase UUID の完全な組だけを許可する。これらの不変条件は append と read の
 両方で検証し、不完全な旧レコードは課金や再開の経路へ進めず fail-closed にする。
 
@@ -828,16 +831,21 @@ canonical lowercase UUID の完全な組だけを許可する。これらの不�
 pending → skipped                           current policy/capability による除外。理由必須
 pending → running → done                     全 unit done
 pending → running → partial                  1 unit 以上 done かつ 1 unit 以上 failed
-pending → running → failed → pending         全 unit 失敗、または run 前提の失敗 (prepare 失敗等)。retryable
+pending → running → failed → pending         全 unit 失敗、または run 前提の失敗。下記 resource_limit の優先規則を除き通常 retry 判定
 partial → done                               失敗 unit の再投入がすべて成功
 pending → paused → pending                   保留。hold_reason = budget (§5.4) | auth |
                                              tier_b_approval (10-operations.md §1.1) |
-                                             ledger_initialization_required | model_not_ready | model_consent_required | resource_busy。解除条件 =
+                                             ledger_initialization_required | model_not_ready | model_consent_required | resource_busy | resource_limit。解除条件 =
                                              理由の解消 (budget は §5.4 の再開規則、tier_b は明示承認、
                                              ledger は明示的な ledger init 後の再開)。
                                              rate_limit は paused ではなく pending + next_retry_at で
                                              表現する (§5.3 — 呼出後に判明し Retry-After が解除条件)。
-                                             paused は Adapter 未呼出のため AdapterRun には現れない
+                                             resource_limit の解除は下記の明示 resource-change 再開のみ。
+                                             呼出前の paused は AdapterRun を作らない。呼出中・応答後に
+                                             resource_limit が判明した paused は実際の呼出・応答記録を保持する。
+running → paused → pending                   resource_limit で成功 unit なし。hold_reason=resource_limit
+running → partial                            成功 unit と resource_limit unit が併存。hold_reason=resource_limit
+partial → partial / done                     資源条件変更後の明示再投入。検証済み成功 unit は保持
 running が heartbeat_at + 5min を超えたら stale。別 worker が pull 可能
 ```
 
@@ -845,10 +853,27 @@ Skipped は Pending/Done/Failed と排他的に集計し、理由別件数を表
 `images_excluded_from_external_send` と `image_capability_unavailable` は成功でも待機でもなく、
 done/enriched ratio の分子に含めない。対象総数と skipped 数を併記し、除外を完了率へ隠さない。
 
-受け入れ検査を通った応答でも、要求した全 unit が `failed_units` のときは `partial` ではなく
-`failed` とする。この場合も manifest は耐久化するが成功 unit object は 0 件であり、既知の応答として
-通常どおり課金を終端する。`result_unknown` や Batch の結果再収集へ変換しない。成功 unit と failed unit が
-併存する受理応答だけが `partial` である。
+**resource_limit の状態・優先規則**（通常の全 unit 失敗規則より優先）:
+
+| 判明時点 / 検証済み成功 unit | task status / hold_reason | 結果・再開 |
+|---|---|---|
+| 呼出前の資源検査 / なし | paused / resource_limit | Adapter は呼ばず、呼出記録を捏造しない。資源条件変更後の明示操作だけで pending へ戻す |
+| 呼出中に中断 / なし | paused / resource_limit | 実際の呼出記録を保持し、未検証・未完成の出力を公開しない。資源条件変更後の明示操作だけで pending へ戻す |
+| 受理応答の failed_units に resource_limit / 成功なし | paused / resource_limit | 全 unit failed でも failed にしない。各 unit の failed/error_kind と既知応答を保持し、資源条件変更後の明示操作で保留 unit を再投入する |
+| 受理応答の failed_units に resource_limit / 成功あり | partial / resource_limit | 検証済み done unit は採用・索引化し、resource_limit unit は failed として保持して成功に数えない。資源条件変更後の明示操作でその unit だけ再投入する |
+
+明示操作は §5.3 の index / reindex / repair / retry とし、選択 tier の増加または不足資源の
+解消を再検査してから保留を解除する。再検査で条件を満たさなければ元の status / hold_reason を保つ。
+通常 resume / watch は資源保留 unit を再投入しない。partial に別種別の failed unit があれば、
+その unit は従来の種別別 retry 判定に従う。resource_limit unit が残る限り settled としない。
+資源保留が全て解消した後は hold_reason を null に戻し、残る unit に通常の done / partial / failed
+規則を適用する。部分応答でも成功 unit と failed unit の対応を検証できなければこの受理規則を使わない。
+
+resource_limit がない受理応答で要求した全 unit が `failed_units` のときは `partial` ではなく
+`failed` とする。成功 unit と failed unit が併存する受理応答は `partial` である。
+どちらの分類でも manifest と実際の呼出・応答は保持し、実支出・既知 usage は通常どおり精算する。
+呼出中の資源不足を課金 0 と推測せず、結果不明なら §5.4 の保守的精算・再送承認を維持する。
+既知応答を資源保留のために `result_unknown` や Batch の結果再収集へ変換しない。
 
 **不完全な既知応答の規範** (partial / 全 unit failed の markdownize task):
 
@@ -859,7 +884,9 @@ done/enriched ratio の分子に含めない。対象総数と skipped 数を併
   failed unit 由来の chunk は index に載せない (= 検索対象は成功 unit のみ)
 - `kio status` は partial のファイルについて失敗 unit_key と error_kind を表示する (silent 欠落の禁止)
 - 応答の `failed_units[].error_kind` を各 unit の manifest に保存し、全失敗を一律の通信エラーへ置換しない。
-  受理した不完全応答ごとに task の `attempts` を一度だけ増やす。`batch retry` は manifest の失敗 unit を
+  resource_limit だけによる不完全応答は task の `attempts` を増やさない。別の失敗種別が併存する
+  不完全応答では、その種別の通常規則で task 共通の `attempts` を一度だけ増やす（資源保留の解除を
+  retry budget 消費と扱わない）。`batch retry` は manifest の失敗 unit を
   個別に判定し、その種別の有限上限に達した unit を再投入しない。別 unit の `rate_limit` が無制限でも、
   `network_error` 等の上限を解除しない。カウンタは task 共通であり、後から失敗した unit に対しても
   既に消費した回数を差し引く保守的な判定とする。
@@ -923,7 +950,22 @@ contract_violation retryable             max_attempts=1 (同一 mode で 1 回�
                                          fallback はしない: 正本 07 §8.1、capability 非互換のみ §8.4)
                                          KIO-E-ADAPTER-CONTRACT-001
 budget_exceeded    paused                KIO-E-BATCH-BUDGET-001
+resource_limit     paused                max_attempts=0 (自動 retry なし)
+                                         KIO-E-RESOURCE-LIMIT-001 / exit 3
 ```
+
+`resource_limit` は Task / manifest `units[]` / Adapter `failed_units[]` の閉 enum
+`error_kind` に含める。CLI error は `error_code="KIO-E-RESOURCE-LIMIT-001"`、exit 3、
+context は `resource`（memory|work|unit_text|raw_bytes|member_bytes|aggregate_bytes|storage）、
+`limit`（bytes / work 上限、OS 容量を確定できなければ null）、`observed`（超過予定値、
+不明なら null）、`resource_tier`（standard|large、tier 非適用なら null）を持つ。
+`retry_disposition="explicit_after_resource_change"` とし、自動 retry / backoff を予約せず
+`next_retry_at=null`、attempt と contract_violation_count を増やさない。
+利用者が大きい tier を選ぶか、容量・memory 等の制約を解消した後、明示的な同一入力の
+index / reindex / repair / retry で再実行できる。同じ制約のまま通常 resume / watch が
+繰り返し再実行しない。保存済み結果と原本を保持し、未完成結果を完成扱いしない。
+不正入力・record 破損・identity 不一致を `resource_limit` に変換せず、
+`contract_violation` の 1 回再投入・違反解除手順も適用しない。
 
 `network_error` の待機時間は各 retry attempt に対して決定論的に
 `min(2s * 2^(attempts-1), 60s)` とする。現在の serial CLI は jitter を加えないため、
@@ -933,18 +975,36 @@ native の失敗は network_error へ変換せず、論理 job の attempt 上�
 
 ## 5.4 Cost Guardrail / Kill Switch
 
-全 embedding profile は 0 USD を含めて一つの物理 ledger に reserve/settle と Task を記録する。
-local の `usage=Unmetered` は usage 不明とは区別し、確定 0 USD とする。cap 枯渇は確定 0 USD の処理を止めない。
-device ledger は明示的な device setup だけで作成する（作成操作は [06-cli-spec.md §1](06-cli-spec.md)）。
-未初期化なら local 0 USD を含む全 embedding profile を既存の budget/ledger-unknown 理由で Paused とし、
-通常の index/search/resume が暗黙にファイルを作成しない。検索の auto/hybrid は text fallback、
-明示 image/vector は失敗とする。破損/unsafe store を削除・再作成しない。
-以下の provider request/remote job の SQL と 2 相回復は remote 作用に適用し、local の論理 job を
-remote handle 列へ代入しない。local の記録も同じ authority/checkpoint と追記・冪等精算を満たす。
-query の fresh page 1 は native/local を含め同じ runner の device-scope claim/0 USD journal に載せる。
-text mode、実行前 fallback、cursor replay は embedding と新予約・台帳書込みを行わない。
-query 本文は保存せず hash と profile を使う。
+無料ローカル処理（deterministic / native / 確定 0 USD の loopback Adapter）は課金台帳を
+作成・open・reserve/settle せず実行する。台帳の未初期化・破損・unsafe・busy・容量は無料処理の
+前提条件にしない。`usage=Unmetered` の確定 0 USD と、有料処理の usage 不明は区別する。
+有料処理は従来どおり明示初期化した device ledger と正しい authority/checkpoint、予算、送信承認が
+揃うまで開始しない。不明な価格を無料と推測せず、破損・unsafe store を削除・再作成しない。
+台帳の作成操作は [06 §1](06-cli-spec.md) に従う。
 
+無料処理も共通 runner の durable intent、attempt 上限、retry/backoff、結果検証、publish recovery、
+同一 query の claim を維持する。文書 Task は scope の Kio 管理状態、query claim と必要な無料 job 回復記録は
+`${XDG_STATE_HOME:-$HOME/.local/state}/kio/local-execution/` に保存し、課金 ledger / remote handle と分離する。
+この state は version・job/input/profile identity・attempt・next_retry_at・phase・検証済み結果参照を持つ
+strict な private record として検証する。同じ claim の実行が並行しないことを保証し、
+中断後の再開では claim の現在の ownership を再検証する。結果 bytes と digest の検証後にだけ再公開する。
+非終端 attempt を成功または新入力と扱って初期化しない。active claim / 未公開結果は cleanup せず、
+終端して公開済みの record だけを exact identity 検査下で退役できる。無料 state は knowledge から
+再計画可能で mandatory billing backup の対象ではなく、喪失しても送信／課金 authority を作らない。
+local state は owner-private、identity-bound に検証し、破損を成功扱いしない。local crash は上限内で
+再計算できる。query 本文は保存せず hash と profile を使う。text mode、実行前 fallback、cursor replay は
+embedding と新 claim を行わない。無料 state の回復で有料 job の送信済み／未送信を推測しない。
+
+予算観測はローカル結果の前提条件ではない。search / scope status / index は、取得できた同じ
+read-only snapshot と UTC 集計月を invocation 内で共有する。未初期化・不完全・破損・unsafe・busy・
+不安定・資源不足で取得不能なら `budget_status=unknown` と `budget_reason` を表示し、
+ローカル結果を返す。`budget_paused` は unknown 時に `null`、既知時だけ従来の boolean とし、
+支出ゼロ／cap 未到達という意味の `false` に変換しない。unsafe な source は開き続けず、
+理由に元の typed error code を残す。この表示によって有料 admission を許可しない。
+明示 ledger コマンドと有料 admission の拒否・回復規則は維持する。
+
+以下の provider request/remote job の SQL と 2 相回復は有料 remote 作用に適用し、
+local の論理 job を remote handle 列へ代入しない。
 
 online Adapter の外部支出を制御するため budget guardrail を適用する。
 
@@ -972,8 +1032,8 @@ monthly_usd_cap = 10.0
 - `result_unknown`の追加試行は、`kio batch retry --resend-unknown <selector> --yes`で一つのrequest identityを明示承認する。これは送信操作ではなく、現在のscopeに属する対象を再びqueueへ載せる操作である。既存課金を保持し、端末台帳の`unknown_resend_authorized`を一度だけ新しい相1へ消費する。次のonline実行は通常のscope/policy/Adapter承認と予算を再検証する。承認なしのlane切替、task再生成、再起動、月境界でこの制約を迂回できない。unknownと承認待ちのtask行は通常のdevice行剪定で削除しない。
 - Batchは既知のjob/outputを再取得する回復経路を持つ。結果のローカル保存失敗ではjobと予約を保持し、同じoutputを再収集する。新規job作成を結果回収の代わりに行わない。Batchのupload/jobの掃除は§5.8に従う。
 - 同期requestはupload/job残骸を持たず、終端transactionでintent tokenを解放する。解放は未知の結果の再送許可を意味しない。検索queryのdevice行は、利用者が実行する個々の検索の予約として次項の独立したclaim規則に従う。
-- **query embedding request** (image|vector|hybrid 検索の page 1 — [05-runtime.md §1](05-runtime.md)) は `scope_id = 'device'` (予約値 — scope_id は ULID のため実 scope と衝突しない) の `request_kind='sync'` 行として上記縮退 2 相に載せる。`adapter_kind = 'embedding'`・`input_hash = NFC 正規化した query 文字列の sha256` (query 本文は保存しない — [05-runtime.md §1.5](05-runtime.md) と同じ方針)。folder cap 判定 (scope 別集計) には現れず、device cap / `per_adapter` (embedding) の合算には通常どおり含まれる — 判定式は不変。送信可否の consent gate は [05-runtime.md §1.1](05-runtime.md) / [07-adapter-spec.md §3](07-adapter-spec.md)。**回収と並行 claim**: `kio search` は読み取り系だが ([05-runtime.md §6](05-runtime.md))、image|vector|hybrid の page 1 に限り device 行の書込主体である。**sync 行は相 1 で `job_create_started_at` に開始時刻を記録し** (batch 行の猶予起点と同じ既存列 — sync では staleness 判定にのみ使う)、**回収の対象は `stale_after_at` (下記 DDL — 相 1 で耐久保存する絶対期限) を過ぎた stale 行に限る**。`stale_after_at` は相 1 Tx で「当該 request に適用する実効 `timeout_seconds` ([07-adapter-spec.md §7](07-adapter-spec.md) `[adapter.policy]` — **device 行では参加 scope の実効値の最大値**) + 60 秒マージン (下限 600 秒)」から算出して保存し、**回収は保存値のみを参照する** — config を後から変更しても、rate_limit の Retry-After 追従 (§5.3 max_attempts=∞) で呼出が長引いても、生存中の呼出を stale と誤認しない (Retry-After を受信した保持プロセスは自 token の CAS UPDATE で `stale_after_at` を **`max(現行値, 現在 + Retry-After + timeout + 60 秒)`** へ延長する — **単調**: 短い Retry-After で期限を縮めない。Retry-After は有限・非負を検証する (**不正値のみ 3600 秒の代替値とし、有効な実値は clamp しない** — 実待機より短い保護期限を作ると、待機中の stale 回収と覚醒後の provider 再呼出という二重呼出窓が再発する)。**延長 UPDATE が 0 行 (= 他プロセスが回収済み) なら claim 喪失として以後の待機・provider 再呼出・記帳を全て中止する** — 下記の状態遷移 CAS 敗者規則と同じ非記帳。累積延長に上限は設けない (§5.3 max_attempts=∞ / Retry-After 追従の設計意図 — 解放の脱出路は `kio batch abandon`))。§5.8 の可視化猶予 (既定 10 分) とは独立の機構である。猶予内の crash 残骸が device cap 予約 (`estimated_usd`) を最大猶予時間保持することは既知の有界挙動として許容する。相 1 の claim に先立ち、**`scope_id='device'` の全 sync stale 行を回収する (同一 4 組 key に限らない — 別 query の crash 残骸も search-only 運用で回収されるように)**。回収は上記 crash 回収と同じ規則で行う (`BEGIN IMMEDIATE` Tx 下。下記剪定と合わせて **1 回の実行あたり合計 256 行を上限とする bounded 処理**とし、**配分と順序を固定する: (1) 自 key (今回 claim する 4 組 key) の stale 行は上限枠外で常に最優先に回収する / (2) 剪定に最低 128 行を保証する / (3) 残余枠を一般 stale 回収に充てる (対象不足の側の未使用枠は相互融通)。各集合の処理・持ち越しの選択順は (sync stale 行 = `job_create_started_at`、terminal 行 = `completed_at`) の昇順 + 4 組 PK の byte 順で完全に決定的とする。残余は次回実行へ持ち越す**。`.kio/.lock` は不要 — device 行はどの scope にも属さず、直列化は cost-ledger 側の Tx が担う。**inline 回収では provider 照会を行わない** — 常に unknown 精算とする (検索応答性の保護。照会つき回収は書き込み系冒頭の crash 回収のみ))。同一 key が stale でない in-flight (他プロセスの生存 claim) のときは当該実行を text fallback (`fallback_reason="embedding_in_flight"` — mode 別の扱いは [05-runtime.md §1.1](05-runtime.md)) に落とし、送信しない (同一 query の並行 claim・token 上書きを作らない)。**device 行の全ての状態遷移 UPDATE (request id 記録・終端) は `WHERE intent_token = <自 token>` の条件付き (CAS) で行う** — 0 行更新 = 他プロセスに回収済みであり、自プロセスは応答・課金のどちらも記帳しない (回収側の unknown 精算が既に確定記帳されており二重計上を作らない。受信済み vector を当該検索の結果に使うことは課金と独立に可)。**terminal device 行の剪定**: `scope_id='device'` ∧ **`state IN (2, 3)`** (成功終端 = state 2 を含む — 含めないと成功 query 行が恒久蓄積する) ∧ `intent_token IS NULL` ∧ **`contract_violation_count = 0`** (「1 回のみ」の durable 判定源を消さない) ∧ `completed_at` が前月以前 (**UTC 暦月** — 当月 UTC 月初の epoch ms 未満。`cost_ledger.month` も `recorded_at` の UTC 暦月から導出する) の行は、書き込み系コマンド冒頭の掃除 (§5.8 の回復と同時) **および `kio search` の inline 回収と同一 Tx** で DELETE してよい (device 行の唯一の作成者は search — search-only の定常運用でも剪定が発火するための併設。**上記 bounded 上限 256 行/回を回収と共有し、超過分は次回へ持ち越す** — 月替わり直後の一括削除で検索応答性 (M3-1) を損なわないための上限)。当月の cap 判定は cost_ledger 合算 + state 0/1 予約のみを参照するため影響せず、確定課金の台帳は cost_ledger 側が恒久保持する (**恒久保持は監査台帳としての既定** — 行数は request 数に比例して増えるが、当月 cap 判定は月次 index (下記 DDL) で有界)。剪定は `submission_seq` の直列化と両立する (通算連番の高水位の正本は cost_ledger — 行の再作成は ledger の MAX から継承するため衝突しない。下記 DDL コメント)。剪定・確定済みの 4 組 key への `kio batch abandon` は**対象なしの冪等成功** (exit 0 + 「対象なし」表示 — [06-cli-spec.md §1](06-cli-spec.md))
-- 累積コストは Adapter 報告値を device-global `cost-ledger.sqlite` に記録する。これは `.kio` truth でも cache でもない非再構築の運用台帳である。初期化要件は本節冒頭に従う。通常は authority / checkpoint / stable lifecycle lock を検証して既存 ledger を開き、欠損・不一致・unknown budget は支出 0 と扱わず paused/unknown とする。local embedding も同じ物理 device ledger に reserve/settle を 0 USD で記録する。central billing の確認済み artifact はこの非知識原則の明示的例外である。
+- **有料 query embedding request** (image|vector|hybrid 検索の page 1 — [05-runtime.md §1](05-runtime.md)) は `scope_id = 'device'` (予約値 — scope_id は ULID のため実 scope と衝突しない) の `request_kind='sync'` 行として上記縮退 2 相に載せる。`adapter_kind = 'embedding'`・`input_hash = NFC 正規化した query 文字列の sha256` (query 本文は保存しない — [05-runtime.md §1.5](05-runtime.md) と同じ方針)。folder cap 判定 (scope 別集計) には現れず、device cap / `per_adapter` (embedding) の合算には通常どおり含まれる — 判定式は不変。送信可否の consent gate は [05-runtime.md §1.1](05-runtime.md) / [07-adapter-spec.md §3](07-adapter-spec.md)。**回収と並行 claim**: `kio search` は読み取り系だが ([05-runtime.md §6](05-runtime.md))、image|vector|hybrid の page 1 に限り device 行の書込主体である。**sync 行は相 1 で `job_create_started_at` に開始時刻を記録し** (batch 行の猶予起点と同じ既存列 — sync では staleness 判定にのみ使う)、**回収の対象は `stale_after_at` (下記 DDL — 相 1 で耐久保存する絶対期限) を過ぎた stale 行に限る**。`stale_after_at` は相 1 Tx で「当該 request に適用する実効 `timeout_seconds` ([07-adapter-spec.md §7](07-adapter-spec.md) `[adapter.policy]` — **device 行では参加 scope の実効値の最大値**) + 60 秒マージン (下限 600 秒)」から算出して保存し、**回収は保存値のみを参照する** — config を後から変更しても、rate_limit の Retry-After 追従 (§5.3 max_attempts=∞) で呼出が長引いても、生存中の呼出を stale と誤認しない (Retry-After を受信した保持プロセスは自 token の CAS UPDATE で `stale_after_at` を **`max(現行値, 現在 + Retry-After + timeout + 60 秒)`** へ延長する — **単調**: 短い Retry-After で期限を縮めない。Retry-After は有限・非負を検証する (**不正値のみ 3600 秒の代替値とし、有効な実値は clamp しない** — 実待機より短い保護期限を作ると、待機中の stale 回収と覚醒後の provider 再呼出という二重呼出窓が再発する)。**延長 UPDATE が 0 行 (= 他プロセスが回収済み) なら claim 喪失として以後の待機・provider 再呼出・記帳を全て中止する** — 下記の状態遷移 CAS 敗者規則と同じ非記帳。累積延長に上限は設けない (§5.3 max_attempts=∞ / Retry-After 追従の設計意図 — 解放の脱出路は `kio batch abandon`))。§5.8 の可視化猶予 (既定 10 分) とは独立の機構である。猶予内の crash 残骸が device cap 予約 (`estimated_usd`) を最大猶予時間保持することは既知の有界挙動として許容する。相 1 の claim に先立ち、**`scope_id='device'` の全 sync stale 行を回収する (同一 4 組 key に限らない — 別 query の crash 残骸も search-only 運用で回収されるように)**。回収は上記 crash 回収と同じ規則で行う (`BEGIN IMMEDIATE` Tx 下。下記剪定と合わせて **1 回の実行あたり合計 256 行を上限とする bounded 処理**とし、**配分と順序を固定する: (1) 自 key (今回 claim する 4 組 key) の stale 行は上限枠外で常に最優先に回収する / (2) 剪定に最低 128 行を保証する / (3) 残余枠を一般 stale 回収に充てる (対象不足の側の未使用枠は相互融通)。各集合の処理・持ち越しの選択順は (sync stale 行 = `job_create_started_at`、terminal 行 = `completed_at`) の昇順 + 4 組 PK の byte 順で完全に決定的とする。残余は次回実行へ持ち越す**。`.kio/.lock` は不要 — device 行はどの scope にも属さず、直列化は cost-ledger 側の Tx が担う。**inline 回収では provider 照会を行わない** — 常に unknown 精算とする (検索応答性の保護。照会つき回収は書き込み系冒頭の crash 回収のみ))。同一 key が stale でない in-flight (他プロセスの生存 claim) のときは当該実行を text fallback (`fallback_reason="embedding_in_flight"` — mode 別の扱いは [05-runtime.md §1.1](05-runtime.md)) に落とし、送信しない (同一 query の並行 claim・token 上書きを作らない)。**device 行の全ての状態遷移 UPDATE (request id 記録・終端) は `WHERE intent_token = <自 token>` の条件付き (CAS) で行う** — 0 行更新 = 他プロセスに回収済みであり、自プロセスは応答・課金のどちらも記帳しない (回収側の unknown 精算が既に確定記帳されており二重計上を作らない。受信済み vector を当該検索の結果に使うことは課金と独立に可)。**terminal device 行の剪定**: `scope_id='device'` ∧ **`state IN (2, 3)`** (成功終端 = state 2 を含む — 含めないと成功 query 行が恒久蓄積する) ∧ `intent_token IS NULL` ∧ **`contract_violation_count = 0`** (「1 回のみ」の durable 判定源を消さない) ∧ `completed_at` が前月以前 (**UTC 暦月** — 当月 UTC 月初の epoch ms 未満。`cost_ledger.month` も `recorded_at` の UTC 暦月から導出する) の行は、書き込み系コマンド冒頭の掃除 (§5.8 の回復と同時) **および `kio search` の inline 回収と同一 Tx** で DELETE してよい (device 行の唯一の作成者は search — search-only の定常運用でも剪定が発火するための併設。**上記 bounded 上限 256 行/回を回収と共有し、超過分は次回へ持ち越す** — 月替わり直後の一括削除で検索応答性 (M3-1) を損なわないための上限)。当月の cap 判定は cost_ledger 合算 + state 0/1 予約のみを参照するため影響せず、確定課金の台帳は cost_ledger 側が恒久保持する (**恒久保持は監査台帳としての既定** — 行数は request 数に比例して増えるが、当月 cap 判定は月次 index (下記 DDL) で有界)。剪定は `submission_seq` の直列化と両立する (通算連番の高水位の正本は cost_ledger — 行の再作成は ledger の MAX から継承するため衝突しない。下記 DDL コメント)。剪定・確定済みの 4 組 key への `kio batch abandon` は**対象なしの冪等成功** (exit 0 + 「対象なし」表示 — [06-cli-spec.md §1](06-cli-spec.md))
+- 累積コストは Adapter 報告値を device-global `cost-ledger.sqlite` に記録する。これは `.kio` truth でも cache でもない非再構築の運用台帳である。初期化要件は本節冒頭に従う。通常は authority / checkpoint / stable lifecycle lock を検証して既存 ledger を開き、欠損・不一致・unknown budget は支出 0 と扱わず paused/unknown とする。無料 local embedding の記録先は本節冒頭の local execution state とする。central billing の確認済み artifact はこの非知識原則の明示的例外である。
 - store は **4 表**で構成し、以下の DDL を SQL 正本とする。`ledger_metadata` は random ledger_id と era、signed SQLite sequence を保持し、`cost-ledger.sqlite.authority.json` / `cost-ledger.sqlite.checkpoint.json` と同一性・完全一致を要求する。外側の write は checkpoint を fsync してから SQLite `COMMIT` し、失敗後の mismatch は通常処理を拒否する。schema/index の auto-create、repair、`user_version` write-seq は持たない:
 
 ```sql
@@ -1083,12 +1143,13 @@ CREATE TABLE ledger_metadata (
     sequence INTEGER NOT NULL CHECK (sequence >= 0)
 ) WITHOUT ROWID;
 ```
+- 以下の cap pause / recheck / override は有料処理だけに適用し、無料 local task を止めない。
 - いずれかの cap 超過時、走行中タスクは完了させ、新規タスクは `paused` 状態へ。`kio status` は超過した cap の種別 (`device` | `folder`) と scope を表示する
 - configured cap を上げた後は `kio batch resume --recheck-budget` で budget pause を Pending に戻し、**各** markdownize / embedding の新規 reservation 時点で現在の device / folder cap を原子的に再判定する。したがって、新しい cap にも収まらない task は Adapter を呼ばず再び `paused` のままになる。`--recheck-budget` は cap を無視しない。
 - `kio batch resume --override-budget` は明示的な別操作で、当月の device cap / folder cap の両方を無視して再開する。override は markdownize / embedding **両 Adapter の budget 判定に対称に**効く。`--recheck-budget` も `--override-budget` も指定しない `kio batch resume` は budget 超過 pause タスクを markdownize / embedding いずれも据え置き (sticky)、他要因の pause のみ再開する
-- ローカル LLM 利用時は単価 0 として記録 (= cap に効かない)
+- 無料ローカル実行は本節冒頭の local execution state に記録する (= cap に効かない)。
 
-**resume / retry / reindex が駆動する enrichment**: `kio batch resume` / `kio batch retry` は online markdownize タスクに加え、**embedding enrichment パスも駆動する** (embedding タスクは現行世代の live chunk 集合から DB 駆動で再検出される。承認要否は descriptor の外部作用に従い、HTTP embedding は自身の承認行を見る、[07-adapter-spec.md §3](07-adapter-spec.md))。同様に `kio reindex --regenerate` / `kio repair rebuild-db` は rebuild 後に enrichment を実行し、新世代 chunk の embedding を追随させる (§4.6)。`--offline` では HTTP dispatch を伴う embedding だけを enqueue のみとし `index_status` ([05-runtime.md §1.7](05-runtime.md)) に pending として可視化する。準備済み EG2 は §5.4 の台帳要件と current policy を満たせば `--offline` でも実行する。retry の失敗タスクは backoff / retry 予算 (§5.3) を尊重し、`next_retry_at` 未来または非 retryable の embedding タスクを持つ chunk は enrichment 対象から除外する。**`kio batch resume` / `retry` / `kio reindex --regenerate` が online 成果 (normalized / chunk) を finalize したときも、必要な snapshot と tagged publication event を同じ publication protocol で確定する**。chunk が検索対象になるのは、その event が introduction commit の tree config と exact normalized unit を認証した後だけである ([05-runtime.md §1.6](05-runtime.md))
+**resume / retry / reindex が駆動する enrichment**: `kio batch resume` / `kio batch retry` は online markdownize タスクに加え、**embedding enrichment パスも駆動する** (embedding タスクは現行世代の live chunk 集合から DB 駆動で再検出される。承認要否は descriptor の外部作用に従い、HTTP embedding は自身の承認行を見る、[07-adapter-spec.md §3](07-adapter-spec.md))。同様に `kio reindex --regenerate` / `kio repair rebuild-db` は rebuild 後に enrichment を実行し、新世代 chunk の embedding を追随させる (§4.6)。`--offline` では外部ネットワーク dispatch を伴う embedding だけを enqueue のみとし `index_status` ([05-runtime.md §1.7](05-runtime.md)) に pending として可視化する。準備済み EG2 と承認済み loopback は §5.4 と current policy を満たせば `--offline` でも実行する。retry の失敗タスクは backoff / retry 予算 (§5.3) を尊重し、`next_retry_at` 未来または非 retryable の embedding タスクを持つ chunk は enrichment 対象から除外する。**`kio batch resume` / `retry` / `kio reindex --regenerate` が online 成果 (normalized / chunk) を finalize したときも、必要な snapshot と tagged publication event を同じ publication protocol で確定する**。chunk が検索対象になるのは、その event が introduction commit の tree config と exact normalized unit を認証した後だけである ([05-runtime.md §1.6](05-runtime.md))
 
 ## 5.5 冪等性
 

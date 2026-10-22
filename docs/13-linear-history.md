@@ -85,6 +85,10 @@ working bytes・identity を再検証する。`--expected-head` は preview 時�
    変更・削除・衝突予定を検証する。scope 直下の管理対象だけを plan に固定する。
 2. scope lock 下で HEAD と対象 identity を再検証し、before/after と進行段階、
    復旧に必要な情報を journal に永続化する。新しい tree/commit を耐久化してから公開する。
+   raw bytes は有界 buffer で stage/hash し、journal は private stage の identity / digest / 長さと
+   before/after を参照する。64 MiB/file・512 MiB/operation の固定拒否と journal への本文埋込みは
+   廃止する。stage は全 bytes と digest の検証後にだけ使用する。分割進行の file 数・bytes と
+   durable phase を表示し、crash 復旧は検証済み phase から再開／巻戻しする。
 3. 同一 filesystem の stage と journal を使い、no-follow/handle-bound な置換・削除を行う。
    Kio の読み手は適用中の scope を除外または busy と表示し、古い検索結果を最新版として提供しない。
 4. 唯一の HEAD を expected-value 付きで公開する。復元済み原本と検索 projection の状態を分けて報告し、
