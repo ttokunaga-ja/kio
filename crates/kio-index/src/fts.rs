@@ -2664,6 +2664,7 @@ mod tests {
                 "cosine",
                 "multimodal",
                 "sha256:profile",
+                None,
             )
             .unwrap();
         }

@@ -12,11 +12,11 @@ use crate::egress::record_quarantine_candidates;
 use crate::egress::release_markdownize_secret_holds;
 use crate::egress::secrets_send_approved;
 use crate::egress::write_approval_record;
-use crate::embedding::enrichment::generate_scope_embeddings;
-use crate::embedding::enrichment::run_embedding_enrichment;
-use crate::embedding::transport::LaneOverride;
-use crate::embedding::transport::poll_batch_embedding_jobs;
-use crate::embedding::transport::resolve_invocation_lane;
+use crate::embedding::admission::LaneOverride;
+use crate::embedding::admission::resolve_invocation_lane;
+use crate::embedding::batch::poll_batch_embedding_jobs;
+use crate::embedding::executor::generate_scope_embeddings;
+use crate::embedding::executor::run_embedding_enrichment;
 use crate::gc;
 use crate::historical_reindex;
 use crate::index::chunk_ledger::ensure_purge_epoch_initialized;
@@ -1000,7 +1000,8 @@ fn run_bound_child_index(
 /// Aggregate `index_status` (05 §1.7, CT3-OBS-001) over the searched scopes.
 /// `enriched_ratio` = done AI-enrichment tasks / all AI-enrichment tasks pooled
 /// across scopes (count-weighted average). Enrichment tasks are Markdownize +
-/// Embedding; "done" is `Done`/`Partial`. `budget_paused` is a budget-paused task or
+/// Embedding; Skipped is reported separately and excluded from the ratio.
+/// `budget_paused` is a budget-paused task or
 /// an exhausted monthly budget (R22-7 — a secrets hold pauses work but not for budget).
 pub(crate) fn compute_index_status(
     searched: &[SearchedScopeInfo],
@@ -1011,6 +1012,9 @@ pub(crate) fn compute_index_status(
     locks: &kio_core::scope::LockSession,
 ) -> Result<IndexStatusResponse> {
     let mut total = 0u64;
+    let mut total_enrichment_tasks = 0u64;
+    let mut skipped_enrichment_tasks = 0u64;
+    let mut skipped_enrichment_reasons = BTreeMap::new();
     let mut done = 0u64;
     let mut pending = 0u64;
     let mut budget_paused = false;
@@ -1060,6 +1064,18 @@ pub(crate) fn compute_index_status(
             if task.fallback_reason.as_deref() == Some(RETIRED_NON_LIVE) {
                 continue;
             }
+            total_enrichment_tasks += 1;
+            if task.status == TaskStatus::Skipped {
+                skipped_enrichment_tasks += 1;
+                *skipped_enrichment_reasons
+                    .entry(
+                        task.fallback_reason
+                            .clone()
+                            .expect("validated skipped reason"),
+                    )
+                    .or_insert(0) += 1;
+                continue;
+            }
             total += 1;
             match task.status {
                 TaskStatus::Done => done += 1,
@@ -1095,7 +1111,7 @@ pub(crate) fn compute_index_status(
                 // (permanent gap) stays excluded: it surfaces only as
                 // ratio<1.0, never as actionable pending work.
                 TaskStatus::Failed if task_retry_allowed(&task) => pending += 1,
-                TaskStatus::Failed => {}
+                TaskStatus::Failed | TaskStatus::Skipped => {}
             }
         }
         // R23-20: `scope.scope_path` is the `.kio` directory; `Repository::open`
@@ -1212,6 +1228,9 @@ pub(crate) fn compute_index_status(
     let tasks_complete = task_errors.is_empty();
     Ok(IndexStatusResponse {
         enriched_ratio,
+        total_enrichment_tasks,
+        skipped_enrichment_tasks,
+        skipped_enrichment_reasons,
         pending_enrichment_tasks: pending,
         budget_paused,
         unsupported_inputs,

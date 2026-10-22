@@ -1579,17 +1579,20 @@ fn r23_01_fresh_vector_page_one_retains_allowed_ledger_open_semantics() {
         .success();
     assert_no_budget_paused_task(&dir);
 
-    // Leave enough device headroom for the query reservation, but less than
-    // the mock's measured charge (one reported token per input character).
-    // This invocation must report the below-cap preflight state even though
-    // its own settlement exhausts the cap for the following search.
+    // docs07 §5.3 reserves the full 8192-token Standard TEXT bound before
+    // a query send; the valid mock invoice then measures 19 input scalars.
+    // This positive vector/lifecycle fixture must admit that reservation.
+    // The sibling folder-cap-writer test independently proves reuse of the
+    // preflight snapshot while another writer changes budget truth mid-search.
     let ledger_path = dir.path().join(".test-data/kio/cost-ledger.sqlite");
     let month = kio_pipeline::ledger::time::utc_month_of(kio_pipeline::ledger::time::now_millis());
     let spent_before = kio_pipeline::ledger::LedgerReadSnapshot::open(&ledger_path)
         .unwrap()
         .month_total(None, None, &month)
         .unwrap();
-    let device_cap = spent_before + 0.000_002;
+    const QUERY_RESERVATION_USD: f64 = 8192.0 * 0.20 / 1_000_000.0;
+    const QUERY_MEASURED_USD: f64 = 19.0 * 0.20 / 1_000_000.0;
+    let device_cap = spent_before + QUERY_RESERVATION_USD + 0.000_010;
     write_budget_caps(&dir, device_cap, 1.0);
 
     let trace = dir.path().join("vector-page-one.trace");
@@ -1617,20 +1620,106 @@ fn r23_01_fresh_vector_page_one_retains_allowed_ledger_open_semantics() {
         .month_total(None, None, &month)
         .unwrap();
     assert!(
-        spent_after >= device_cap,
-        "the fresh query must settle a charge that exhausts the cap: \
-         before={spent_before} after={spent_after} cap={device_cap}"
+        (spent_after - spent_before - QUERY_MEASURED_USD).abs() < 1e-12,
+        "the fresh query must settle only its own 19 reported TEXT units: \
+         before={spent_before} after={spent_after}"
     );
+    assert!(
+        spent_after < device_cap,
+        "valid bounded usage stays below its reservation"
+    );
+    // Read the physical request and terminal row through a scoped immutable
+    // snapshot. Retain owned values only across later CLI calls: no mutable
+    // SQLite handle or sidecar can interfere with the private ledger lifecycle.
+    let query_hash = kio_pipeline::ledger::ops::device_input_hash("vectorpageoneneedle");
+    let profile_hash = kio_adapter::catalog::adopted_embedding_profile().tool_profile_hash;
+    let read_device_invoice = || {
+        let db = support::immutable_sqlite(&ledger_path);
+        let device_rows: i64 = db.query_row(
+            "SELECT COUNT(*) FROM cost_ledger WHERE scope_id='device' AND adapter_kind='embedding'",
+            [], |row| row.get(0)).unwrap();
+        assert_eq!(
+            device_rows, 1,
+            "only this fresh query may charge the device"
+        );
+        db.prepare(
+            "SELECT c.batch_job_id,c.submission_seq,c.month,b.estimated_usd,c.usd,
+             c.estimated,b.state,b.intent_token,b.batch_job_id,b.request_kind,c.outcome
+             FROM cost_ledger c JOIN batch_requests b
+             ON c.scope_id=b.scope_id AND c.adapter_kind=b.adapter_kind
+             AND c.input_hash=b.input_hash AND c.tool_profile_hash=b.tool_profile_hash
+             AND c.submission_seq=b.submission_seq
+             WHERE c.scope_id='device' AND c.adapter_kind='embedding'
+             AND c.input_hash=?1 AND c.tool_profile_hash=?2",
+        )
+        .unwrap()
+        .query_map(params![query_hash, profile_hash], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, bool>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    };
+    let invoice_before = read_device_invoice();
+    assert_eq!(
+        invoice_before.len(),
+        1,
+        "one exact original query attempt must settle"
+    );
+    let (
+        token,
+        sequence,
+        invoice_month,
+        reserved,
+        settled,
+        estimated,
+        state,
+        live_token,
+        remote_handle,
+        kind,
+        outcome,
+    ) = &invoice_before[0];
+    assert!(
+        kio_pipeline::ledger::ops::is_uuid_v7(token),
+        "sync without a provider request ID must retain its original intent token"
+    );
+    assert_eq!(*sequence, 1);
+    assert_eq!(invoice_month, &month);
+    assert!((*reserved - QUERY_RESERVATION_USD).abs() < 1e-15);
+    assert!((*settled - QUERY_MEASURED_USD).abs() < 1e-15);
+    assert!(!estimated, "valid authoritative TEXT usage must be metered");
+    assert_eq!(*state, 2);
+    assert!(live_token.is_none());
+    assert!(remote_handle.is_none());
+    assert_eq!(kind, "sync");
+    assert_eq!(outcome, "succeeded");
     assert!(
         matches!(ledger_leaf_states(&dir)[4], LedgerLeafState::Present(_)),
         "fresh vector page 1 retains the required lifecycle checkpoint"
     );
     assert_no_budget_paused_task(&dir);
     assert_eq!(
-        fs::read_to_string(trace).unwrap().lines().count(),
+        fs::read_to_string(&trace).unwrap().lines().count(),
         1,
         "fresh vector page 1 performs exactly one embedding request"
     );
+    // Exhaust the configured device cap only AFTER successful page one.
+    // A bounded valid settlement cannot exhaust a cap that admitted its full
+    // reservation. This separate config transition makes the next invocation
+    // observe budget pause without rewriting any physical ledger row.
+    write_budget_caps(&dir, 0.0, 1.0);
     let following = private_kio_process(&dir, &["search", "vectorpageoneneedle", "--mode", "text"])
         .arg("--json")
         .output()
@@ -1640,6 +1729,16 @@ fn r23_01_fresh_vector_page_one_retains_allowed_ledger_open_semantics() {
     assert_eq!(
         following["index_status"]["budget_paused"], true,
         "{following}"
+    );
+    assert_eq!(
+        read_device_invoice(),
+        invoice_before,
+        "the later text search must preserve the original token/key/sequence/month and invoice"
+    );
+    assert_eq!(
+        fs::read_to_string(&trace).unwrap().lines().count(),
+        1,
+        "the post-cap text search must not send another query"
     );
 }
 

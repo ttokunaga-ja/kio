@@ -1090,13 +1090,22 @@ fn write_embedding_fixture(kio_dir: &Path, vector: &[f32], declared_dimensions: 
     let object = EmbeddingObject {
         spec_version: 1,
         target_type: "chunk".to_owned(),
-        target_hash: "sha256:fixture-text".to_owned(),
-        profile_hash: "sha256:fixture-profile".to_owned(),
+        target_hash: hash_bytes(b"fixture-text"),
+        profile_hash: hash_bytes(b"fixture-profile"),
         modality: "multimodal".to_owned(),
         dimensions: declared_dimensions,
         distance: "cosine".to_owned(),
         context: None,
         vector: vector.to_vec(),
+        metadata: kio_core::cas::EmbeddingMetadata {
+            record_format: 2,
+            producer: kio_core::cas::ProducerProvenance::non_native(
+                kio_core::cas::ProducerExecutionMode::DeterministicLibrary,
+                &hash_bytes(b"fixture-profile"),
+            )
+            .unwrap(),
+            image_input_receipt: None,
+        },
     };
     // Written by hand rather than through `write_embedding`, because several of
     // these fixtures are deliberately invalid and the store would refuse them.
@@ -1107,6 +1116,7 @@ fn write_embedding_fixture(kio_dir: &Path, vector: &[f32], declared_dimensions: 
     // would have had if it were well-formed, which is what lets fsck find it.
     let mut keyed = object.clone();
     keyed.vector = vec![0.0; keyed.dimensions as usize];
+    keyed.vector[0] = 1.0;
     let hash = keyed.identity_hash().unwrap();
     let bytes = embedding_fixture_bytes(&object);
     let path = content_path(kio_dir, ContentObjectKind::Embedding.directory(), &hash);
@@ -1143,6 +1153,14 @@ fn embedding_fixture_bytes(object: &EmbeddingObject) -> Vec<u8> {
     out.extend_from_slice(
         kio_core::cas::lower_hex(&<sha2::Sha256 as sha2::Digest>::digest(&vector_bytes)).as_bytes(),
     );
+    out.push(b'\n');
+    let metadata = serde_jcs::to_vec(&object.metadata).unwrap();
+    out.extend_from_slice(&metadata);
+    out.push(b'\n');
+    out.extend_from_slice(
+        kio_core::cas::lower_hex(&<sha2::Sha256 as sha2::Digest>::digest(&metadata)).as_bytes(),
+    );
+    out.push(b'\n');
     out
 }
 
@@ -1152,7 +1170,7 @@ fn embedding_fixture_bytes(object: &EmbeddingObject) -> Vec<u8> {
 #[test]
 fn pb01_embedding_valid_vector_passes_verification() {
     let (dir, ..) = fixture();
-    write_embedding_fixture(&kio_dir(&dir), &[0.1, 0.2, 0.3], 3);
+    write_embedding_fixture(&kio_dir(&dir), &[1.0, 0.0, 0.0], 3);
     let output = success(&dir, &["repair", "verify-objects"]);
     assert_eq!(output["status"], "ok", "{output}");
     assert_eq!(output["checked"]["embeddings"], 1, "{output}");
@@ -1204,7 +1222,7 @@ fn pb01_embedding_non_finite_vector_element_is_a_finding() {
 #[test]
 fn pb01_embedding_digest_mismatch_is_a_finding() {
     let (dir, ..) = fixture();
-    let hash = write_embedding_fixture(&kio_dir(&dir), &[0.5], 1);
+    let hash = write_embedding_fixture(&kio_dir(&dir), &[1.0], 1);
     let path = content_path(
         &kio_dir(&dir),
         ContentObjectKind::Embedding.directory(),
@@ -1236,7 +1254,7 @@ fn pb01_embedding_digest_mismatch_is_a_finding() {
 #[test]
 fn pb01_embedding_under_a_foreign_identity_is_a_finding() {
     let (dir, ..) = fixture();
-    let hash = write_embedding_fixture(&kio_dir(&dir), &[0.5], 1);
+    let hash = write_embedding_fixture(&kio_dir(&dir), &[1.0], 1);
     let bytes = fs::read(content_path(
         &kio_dir(&dir),
         ContentObjectKind::Embedding.directory(),

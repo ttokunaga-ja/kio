@@ -261,6 +261,7 @@ fn materialized_source_image_cas_failure_is_retryable_not_contract_reject() {
     let task = TaskDescriptor {
         task_id: "task_known_provider_result".to_owned(),
         task_type: TaskType::Markdownize,
+        embedding_target: None,
         mode: Some(kio_pipeline::markdownize::MarkdownizeMode::Full),
         input_path: "image.png".to_owned(),
         input_hash: raw_hash.clone(),
@@ -350,6 +351,7 @@ fn invalid_online_markdown_is_rejected_before_normalized_publication() {
     let task = TaskDescriptor {
         task_id: "task_invalid_known_provider_result".to_owned(),
         task_type: TaskType::Markdownize,
+        embedding_target: None,
         mode: Some(kio_pipeline::markdownize::MarkdownizeMode::Full),
         input_path: "image.png".to_owned(),
         input_hash: raw_hash.clone(),
@@ -473,6 +475,7 @@ fn valid_partial_online_response_is_materialized() {
     let task = TaskDescriptor {
         task_id: "task_valid_partial".to_owned(),
         task_type: TaskType::Markdownize,
+        embedding_target: None,
         mode: Some(kio_pipeline::markdownize::MarkdownizeMode::Full),
         input_path: "document.pdf".to_owned(),
         input_hash: raw_hash.clone(),
@@ -817,15 +820,14 @@ use std::os::unix::fs::symlink;
 use kio_adapter::catalog::deterministic_embedding_vector;
 use kio_index::ChunkRow;
 
-use crate::embedding::transport::LaneOverride;
-use crate::embedding::transport::effective_invocation_lane;
-use crate::embedding::transport::embedding_usd_per_token;
-use crate::embedding::transport::estimate_embedding_cost;
-use crate::embedding::transport::estimate_embedding_tokens;
-use crate::embedding::transport::lane_rate;
-use crate::embedding::transport::query_embedding_send_lane;
-use crate::embedding::transport::realtime_lane_requested;
-use crate::embedding::transport::resolve_invocation_lane;
+use crate::embedding::admission::LaneOverride;
+use crate::embedding::admission::effective_invocation_lane;
+use crate::embedding::admission::embedding_text_reservation;
+use crate::embedding::admission::embedding_usd_per_token;
+use crate::embedding::admission::lane_rate;
+use crate::embedding::admission::query_embedding_send_lane;
+use crate::embedding::admission::realtime_lane_requested;
+use crate::embedding::admission::resolve_invocation_lane;
 use crate::index::chunk_ledger::ChunkPublicationEvent;
 use crate::index::chunk_ledger::StoredChunk;
 use crate::index::chunk_ledger::append_chunk_publication_events;
@@ -855,15 +857,15 @@ fn embedding_tool_lock_labels_cover_every_execution_mode() {
     use kio_adapter::types::ExecutionMode;
 
     assert_eq!(
-        crate::embedding::transport::embedding_execution_labels(ExecutionMode::OnlineApi),
+        crate::embedding::admission::embedding_execution_labels(ExecutionMode::OnlineApi),
         ("online_api", "online")
     );
     assert_eq!(
-        crate::embedding::transport::embedding_execution_labels(ExecutionMode::OfflineApi),
+        crate::embedding::admission::embedding_execution_labels(ExecutionMode::OfflineApi),
         ("offline_api", "offline")
     );
     assert_eq!(
-        crate::embedding::transport::embedding_execution_labels(
+        crate::embedding::admission::embedding_execution_labels(
             ExecutionMode::DeterministicLibrary
         ),
         ("deterministic_library", "deterministic")
@@ -875,19 +877,19 @@ fn offline_keeps_only_the_in_process_embedding_evaluator_eligible() {
     use kio_adapter::types::ExecutionMode;
 
     assert!(
-        crate::embedding::transport::embedding_mode_transport_allowed(
+        crate::embedding::admission::embedding_mode_transport_allowed(
             ExecutionMode::DeterministicLibrary,
             true,
         )
     );
     assert!(
-        !crate::embedding::transport::embedding_mode_transport_allowed(
+        !crate::embedding::admission::embedding_mode_transport_allowed(
             ExecutionMode::OfflineApi,
             true,
         )
     );
     assert!(
-        !crate::embedding::transport::embedding_mode_transport_allowed(
+        !crate::embedding::admission::embedding_mode_transport_allowed(
             ExecutionMode::OnlineApi,
             true,
         )
@@ -901,11 +903,11 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
     ) {
         return;
     }
-    use crate::embedding::enrichment::EmbeddingProjection;
-    use crate::embedding::enrichment::EmbeddingSendGroup;
-    use crate::embedding::enrichment::bind_embedding_work;
-    use crate::embedding::enrichment::persist_group_vector;
-    use crate::embedding::transport::chunk_embedding_hash;
+    use crate::embedding::executor::EmbeddingProjection;
+    use crate::embedding::executor::persist_group_vector;
+    use crate::embedding::plan::EmbeddingSendGroup;
+    use crate::embedding::plan::bind_embedding_work;
+    use crate::embedding::plan::chunk_embedding_hash;
     use crate::embedding_owners::RetainedEmbeddingChunk;
     use crate::search::scope::current_embedding_policy;
     use kio_adapter::catalog::DeclaredEmbeddingProfile;
@@ -977,6 +979,7 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
         )]);
         let projection = EmbeddingProjection {
             repo: &repo,
+            execution: kio_adapter::catalog::EmbeddingExecution::DeterministicEvaluator,
             policy: &policy,
             selected_contexts: &contexts,
             invalidated: std::cell::Cell::new(false),
@@ -1004,6 +1007,11 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
         if corrupt_cas {
             assert_eq!(fs::read(object_path).unwrap(), b"corrupt immutable object");
         } else {
+            let stored_bytes: Vec<u8> = index
+                .connection()
+                .query_row("SELECT vector FROM embeddings", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(stored_bytes, embedding_store::f32_to_le_bytes(&vector));
             assert_eq!(
                 repo.object_store()
                     .read_embedding(&group.embedding_hash)
@@ -1699,10 +1707,9 @@ fn r23_10_erase_receipt_blocks_retained_embedding_liveness() {
         policy_paths: BTreeSet::from(["reintroduced.md".to_owned()]),
         introductions: vec![commit_hash],
     }];
-    let chunks = crate::embedding::enrichment::retained_history_chunks(
-        &conn, &repo, &retained, "config", None,
-    )
-    .unwrap();
+    let chunks =
+        crate::embedding::plan::retained_history_chunks(&conn, &repo, &retained, "config", None)
+            .unwrap();
     assert_eq!(chunks.len(), 0);
 }
 
@@ -1969,8 +1976,8 @@ fn r23_aggregate_index_status_fails_closed_for_corrupt_scope_state() {
 #[test]
 fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
     use crate::egress::prune_terminal_embedding_secret_holds;
-    use crate::embedding::enrichment::embedding_task_output_ref;
-    use crate::embedding::enrichment::hold_secret_embedding_tasks;
+    use crate::embedding::plan::embedding_task_output_ref;
+    use crate::embedding::plan::hold_secret_embedding_tasks;
     use kio_adapter::catalog::DeclaredEmbeddingProfile;
     use kio_core::scope::Repository;
     use kio_pipeline::ledger::LedgerDb;
@@ -1988,7 +1995,7 @@ fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
         profile_hash: format!("sha256:{}", "e".repeat(64)),
     };
     let chunk_id = format!("sha256:{}", "a".repeat(64));
-    let chunk = crate::embedding::enrichment::bind_embedding_work(
+    let chunk = crate::embedding::plan::bind_embedding_work(
         vec![crate::embedding_owners::RetainedEmbeddingChunk {
             chunk_id: chunk_id.clone(),
             text: "secret".into(),
@@ -2006,6 +2013,7 @@ fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
         .append(&TaskDescriptor {
             task_id: "task_terminal".to_owned(),
             task_type: TaskType::Embedding,
+            embedding_target: Some(crate::embedding::plan::chunk_task_target(&chunk, &profile)),
             mode: None,
             input_path: "credentials_backup.md".to_owned(),
             input_hash: format!("sha256:{}", "b".repeat(64)),
@@ -2059,8 +2067,8 @@ fn r23_cand_001_terminal_failure_does_not_spawn_releasable_secret_hold() {
 fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
     use crate::egress::SECRETS_TIER_B_HOLD;
     use crate::egress::prune_terminal_embedding_secret_holds;
-    use crate::embedding::enrichment::embedding_task_output_ref;
-    use crate::embedding::transport::filter_embeddable_by_task_state;
+    use crate::embedding::plan::embedding_task_output_ref;
+    use crate::embedding::plan::filter_embeddable_by_task_state;
     use kio_core::scope::Repository;
     use kio_pipeline::task::{HoldReason, TaskDescriptor, TaskStatus, TaskStore, TaskType};
 
@@ -2075,7 +2083,7 @@ fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
         modality: "multimodal".into(),
         profile_hash: format!("sha256:{}", "e".repeat(64)),
     };
-    let chunk = crate::embedding::enrichment::bind_embedding_work(
+    let chunk = crate::embedding::plan::bind_embedding_work(
         vec![crate::embedding_owners::RetainedEmbeddingChunk {
             chunk_id: chunk_id.clone(),
             text: "must not send".into(),
@@ -2092,6 +2100,7 @@ fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
     let terminal = TaskDescriptor {
         task_id: "task_terminal".to_owned(),
         task_type: TaskType::Embedding,
+        embedding_target: Some(crate::embedding::plan::chunk_task_target(&chunk, &profile)),
         mode: None,
         input_path: "credentials_backup.md".to_owned(),
         input_hash: format!("sha256:{}", "d".repeat(64)),
@@ -2142,6 +2151,7 @@ fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
     let sendable = filter_embeddable_by_task_state(
         &store,
         vec![chunk.clone()],
+        &profile,
         false,
         &kio_core::control::ControlHandle::default(),
     )
@@ -2152,8 +2162,8 @@ fn r23_cand_001_duplicate_hold_cannot_override_terminal_failure() {
 
 #[test]
 fn r23_secret_classification_preserves_retry_backoff_state() {
-    use crate::embedding::enrichment::embedding_task_output_ref;
-    use crate::embedding::enrichment::hold_secret_embedding_tasks;
+    use crate::embedding::plan::embedding_task_output_ref;
+    use crate::embedding::plan::hold_secret_embedding_tasks;
     use kio_adapter::catalog::DeclaredEmbeddingProfile;
     use kio_core::scope::Repository;
     use kio_pipeline::ledger::LedgerDb;
@@ -2171,7 +2181,7 @@ fn r23_secret_classification_preserves_retry_backoff_state() {
         profile_hash: format!("sha256:{}", "e".repeat(64)),
     };
     let chunk_id = format!("sha256:{}", "e".repeat(64));
-    let chunk = crate::embedding::enrichment::bind_embedding_work(
+    let chunk = crate::embedding::plan::bind_embedding_work(
         vec![crate::embedding_owners::RetainedEmbeddingChunk {
             chunk_id: chunk_id.clone(),
             text: "retryable".into(),
@@ -2189,6 +2199,7 @@ fn r23_secret_classification_preserves_retry_backoff_state() {
         .append(&TaskDescriptor {
             task_id: "task_retry_backoff".to_owned(),
             task_type: TaskType::Embedding,
+            embedding_target: Some(crate::embedding::plan::chunk_task_target(&chunk, &profile)),
             mode: None,
             input_path: "credentials_backup.md".to_owned(),
             input_hash: format!("sha256:{}", "f".repeat(64)),
@@ -2401,6 +2412,7 @@ fn r23_markdown_charge_and_send_share_one_verified_input() {
     let task = TaskDescriptor {
         task_id: "task_verified_charge".to_owned(),
         task_type: TaskType::Markdownize,
+        embedding_target: None,
         mode: None,
         input_path: "doc.pdf".to_owned(),
         input_hash: hash_bytes(pdf),
@@ -3045,17 +3057,6 @@ fn the_invocation_lane_defaults_to_batch() {
 }
 
 #[test]
-fn embedding_token_estimate_counts_cjk_at_one_token_per_char() {
-    // 4 Latin chars ≈ 1 token; 4 CJK scalars ≈ 4 tokens. The old
-    // `chars / 4` rule charged the Japanese case at a quarter of its cost.
-    assert!((estimate_embedding_tokens("abcd") - 1.0).abs() < 1e-9);
-    assert!((estimate_embedding_tokens("日本語だ") - 4.0).abs() < 1e-9);
-    // Mixed text adds the two ratios rather than picking one.
-    assert!((estimate_embedding_tokens("abcd日本語だ") - 5.0).abs() < 1e-9);
-    assert!(estimate_embedding_tokens("").abs() < 1e-9);
-}
-
-#[test]
 fn embedding_rate_is_lane_aware_and_batch_is_half_of_sync() {
     let adapter_settings =
         &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
@@ -3116,17 +3117,12 @@ fn a_batch_rate_is_never_above_the_sync_rate_for_any_declared_price() {
 }
 
 #[test]
-fn embedding_cost_multiplies_the_token_estimate_by_the_lane_rate() {
-    let adapter_settings =
-        &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
-
-    // 1M Latin chars ≈ 250k tokens → $0.05 at the sync rate.
-    let text = "a".repeat(1_000_000);
-    let usd = estimate_embedding_cost(adapter_settings, &text, PreferredRequestKind::Sync);
-    assert!((usd - 0.05).abs() < 1e-9, "usd: {usd}");
-    // The same text on the Batch lane costs exactly half.
-    let batch_usd = estimate_embedding_cost(adapter_settings, &text, PreferredRequestKind::Batch);
-    assert!((usd - batch_usd * 2.0).abs() < 1e-12);
+fn embedding_text_reservation_prices_full_bound_in_each_lane() {
+    let settings = &std::sync::Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+    let sync = embedding_text_reservation(settings, PreferredRequestKind::Sync);
+    let batch = embedding_text_reservation(settings, PreferredRequestKind::Batch);
+    assert!((sync - 0.0016384).abs() < 1e-15);
+    assert!((batch - 0.0008192).abs() < 1e-15);
 }
 
 #[test]
@@ -4014,6 +4010,7 @@ fn q3_reclaims_orphaned_running_task_to_pending() {
     let task = TaskDescriptor {
         task_id: "t1".to_owned(),
         task_type: TaskType::Markdownize,
+        embedding_target: None,
         mode: Some(MarkdownizeMode::Full),
         input_path: "notes.txt".to_owned(),
         input_hash: format!("sha256:{}", "a".repeat(64)),
@@ -4269,19 +4266,19 @@ fn current_policy_redacts_denied_alias_without_hiding_allowed_alias() {
 #[test]
 fn image_payload_mime_is_derived_from_verified_magic_only() {
     assert_eq!(
-        crate::embedding::enrichment::verified_image_mime(b"\x89PNG\r\n\x1a\nbody").unwrap(),
+        crate::embedding::input::verified_image_mime(b"\x89PNG\r\n\x1a\nbody").unwrap(),
         "image/png"
     );
     assert_eq!(
-        crate::embedding::enrichment::verified_image_mime(&[0xff, 0xd8, 0xff, 0x00]).unwrap(),
+        crate::embedding::input::verified_image_mime(&[0xff, 0xd8, 0xff, 0x00]).unwrap(),
         "image/jpeg"
     );
-    assert!(crate::embedding::enrichment::verified_image_mime(b"not-an-image").is_err());
+    assert!(crate::embedding::input::verified_image_mime(b"not-an-image").is_err());
 }
 
 #[test]
 fn embedding_secret_hold_applies_to_authenticated_local_http() {
-    use crate::embedding::enrichment::secret_embedding_hold_required;
+    use crate::embedding::admission::secret_embedding_hold_required;
     use kio_adapter::types::ExecutionMode;
 
     for mode in [ExecutionMode::OnlineApi, ExecutionMode::OfflineApi] {
@@ -4413,9 +4410,9 @@ fn cursor_policy_revalidation_rejects_a_live_ignore_change() {
 
 #[test]
 fn only_typed_same_scope_image_ownership_selects_local_bytes_or_projection() {
-    use crate::embedding::enrichment::authorized_local_image_object_hash;
-    use crate::embedding::enrichment::local_image_object_hash;
-    use crate::embedding::enrichment::referenced_authorized_image_hashes_for_chunks;
+    use crate::embedding::input::authorized_local_image_object_hash;
+    use crate::embedding::input::local_image_object_hash;
+    use crate::embedding::input::referenced_authorized_image_hashes_for_chunks;
     use crate::embedding_owners::RetainedEmbeddingChunk;
     use crate::image_authority::{ImageAuthorityEntry, ImageAuthorityMap};
 
@@ -4475,7 +4472,7 @@ fn only_typed_same_scope_image_ownership_selects_local_bytes_or_projection() {
 
 #[test]
 fn secret_typed_owner_cannot_be_bypassed_by_a_public_same_scope_link() {
-    use crate::embedding::enrichment::referenced_authorized_image_hashes_for_chunks;
+    use crate::embedding::input::referenced_authorized_image_hashes_for_chunks;
     use crate::embedding_owners::RetainedEmbeddingChunk;
     use crate::image_authority::{ImageAuthorityEntry, ImageAuthorityMap};
 

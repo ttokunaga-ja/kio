@@ -4,6 +4,11 @@
 //! never a writable SQLite connection; lifecycle owns locking, the outer
 //! immediate transaction, commit/rollback, and write-sequence checkpointing.
 
+pub use super::embedding_job::{
+    claim_device_embedding_job, embedding_job, finish_embedding_publication,
+    pending_embedding_publications_for_scope, reserve_embedding_job, settle_local_embedding_crash,
+    stage_embedding_result,
+};
 use super::{LedgerDb, lifecycle::LedgerWriteTxn};
 use crate::Result;
 use crate::ledger::model::{BatchRequestRow, RequestKind, TaskKey};
@@ -21,6 +26,15 @@ pub use super::ops_sql::{
     resolve_billing_from_reported_usage, resolve_billing_from_usd_field, uuid_v7_timestamp_millis,
     visibility_grace_period_elapsed,
 };
+
+/// Record the adapter's typed Pending result at the embedding ledger boundary.
+pub fn record_embedding_pending(
+    db: &LedgerDb,
+    job: &super::embedding_job::EmbeddingJob,
+    outcome: &kio_adapter::types::EmbeddingOutcome,
+) -> Result<bool> {
+    super::embedding_job::record_embedding_pending(db, job, outcome)
+}
 
 /// Look up a request row through the ledger's read lifecycle.
 pub fn get_batch_request(db: &LedgerDb, key: &TaskKey) -> Result<Option<BatchRequestRow>> {
@@ -82,8 +96,21 @@ typed_read!(batch_poll_candidates(scope_id: &str, adapter_kind: &str) -> Vec<Bat
 typed_read!(sync_recovery_candidates(scope_id: &str, now_ms: i64) -> Vec<BatchRequestRow>);
 typed_read!(distinct_scope_ids_with_sync_rows() -> Vec<String>);
 typed_write!(recovery_mark_found(key: &TaskKey, batch_job_id: &str) -> bool);
-typed_write!(recovery_settle_unknown(key: &TaskKey, intent_token: &str, estimated_usd: f64,
-    cleanup_complete: bool) -> TerminalReceipt, control);
+pub fn recovery_settle_unknown(
+    db: &LedgerDb,
+    key: &TaskKey,
+    intent_token: &str,
+    estimated_usd: f64,
+    cleanup_complete: bool,
+) -> Result<TerminalReceipt> {
+    super::embedding_job::settle_unknown_with_cleanup(
+        db,
+        key,
+        intent_token,
+        estimated_usd,
+        cleanup_complete,
+    )
+}
 typed_write!(authorize_unknown_sync_resend(key: &TaskKey) -> bool);
 typed_write!(recovery_finish_cleanup(key: &TaskKey, intent_token: &str) -> bool);
 typed_read!(stalled_rows() -> Vec<BatchRequestRow>);
@@ -92,7 +119,13 @@ typed_write!(device_claim(key: &TaskKey, candidate_usd: f64, effective_timeout_s
 typed_write!(device_extend_stale_after(key: &TaskKey, intent_token: &str, retry_after_seconds: f64,
     effective_timeout_seconds: i64) -> ExtendOutcome, control);
 typed_read!(plan_bounded_sweep(own_key: Option<&TaskKey>, now_ms: i64) -> SweepPlan);
-typed_write!(execute_bounded_sweep(plan: &SweepPlan, now_ms: i64) -> SweepReport, control);
+pub fn execute_bounded_sweep(db: &LedgerDb, plan: &SweepPlan, now_ms: i64) -> Result<SweepReport> {
+    super::embedding_job::drain_cleanup(db)?;
+    let report = db.write(|tx| super::embedding_job::sweep_in_tx(tx, plan, now_ms))?;
+    super::embedding_job::drain_cleanup(db)?;
+    Ok(report)
+}
+
 pub fn ledger_month_total(
     db: &LedgerDb,
     scope_id: Option<&str>,
@@ -199,11 +232,13 @@ pub fn sweep_then_device_claim(
     device_cap: f64,
     per_adapter_cap: Option<f64>,
 ) -> Result<ClaimOutcome> {
-    db.write(|tx: &mut LedgerWriteTxn| {
+    super::embedding_job::drain_cleanup(db)?;
+    let outcome = db.write(|tx: &mut LedgerWriteTxn| {
+        let replaced_terminal = super::embedding_job::terminal_replacement_job(tx, key)?;
         let conn = tx.connection();
         let plan = super::ops_sql::plan_bounded_sweep(conn, Some(key), now_ms)?;
-        super::ops_sql::execute_bounded_sweep(conn, tx.control(), &plan, now_ms)?;
-        super::ops_sql::device_claim(
+        super::embedding_job::sweep_in_tx(tx, &plan, now_ms)?;
+        let outcome = super::ops_sql::device_claim(
             conn,
             tx.control(),
             key,
@@ -211,8 +246,16 @@ pub fn sweep_then_device_claim(
             effective_timeout_seconds,
             device_cap,
             per_adapter_cap,
-        )
-    })
+        )?;
+        if matches!(outcome, ClaimOutcome::Claimed(_))
+            && let Some(previous) = replaced_terminal
+        {
+            super::embedding_job::enqueue_cleanup(tx, &[previous])?;
+        }
+        Ok(outcome)
+    })?;
+    super::embedding_job::drain_cleanup(db)?;
+    Ok(outcome)
 }
 
 #[cfg(test)]

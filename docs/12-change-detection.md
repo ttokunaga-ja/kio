@@ -144,3 +144,7 @@ OS 固有 integration test と、通知の欠落・重複を注入する共通 e
 例えば原本保存済みで OCR 承認待ち、全文検索可能で embedding 未作成、旧版は検索可能で最新版は
 処理中という違いを表す。状態表示の追加は保存・検索正本の変更や 3 OS 受入完了を意味しない。
 具体的な受入条件と順序は [実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md) に置く。
+
+watch も embedding の共通 Task pipeline（[04-pipeline.md §5](04-pipeline.md)）を使い、
+watch 専用の local executor を作らない。モデルは暗黙取得せず、未準備理由を表示する。
+取得と device 状態の境界は [10-operations.md §5.1](10-operations.md) に従う。

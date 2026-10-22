@@ -1,3 +1,4 @@
+use kio_adapter::types::{EmbeddingOutcome, EmbeddingRemoteHandle};
 use std::cell::Cell;
 
 use kio_adapter::gemini_batch_client::{
@@ -21,17 +22,17 @@ impl GeminiBatchClient for CleanupClient {
     fn provider_scope_id(&self) -> kio_adapter::Result<String> {
         Ok(self.scope.clone())
     }
-    fn create_embedding_job(
+    fn submit_job(
         &self,
         _: &str,
         _: u32,
         _: &str,
         _: &[GeminiBatchEmbedInput],
-    ) -> kio_adapter::Result<GeminiBatchJobRecord> {
+    ) -> kio_adapter::Result<EmbeddingOutcome> {
         panic!("cleanup must never submit a new request")
     }
-    fn poll_job(&self, name: &str) -> kio_adapter::Result<GeminiBatchPoll> {
-        assert_eq!(name, "batches/recorded-job");
+    fn poll_job(&self, name: &EmbeddingRemoteHandle) -> kio_adapter::Result<GeminiBatchPoll> {
+        assert_eq!(name.as_str(), "batches/recorded-job");
         self.polls.set(self.polls.get() + 1);
         if self.unreadable {
             return Err(kio_adapter::AdapterError::Network("unavailable".into()));
@@ -63,7 +64,7 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
         let ledger = LedgerDb::initialize(root.path().join("device/ledger.sqlite")).unwrap();
         let key = TaskKey::new(
             "scope",
-            crate::embedding::transport::EMBEDDING_ADAPTER_KIND,
+            crate::embedding::admission::EMBEDDING_ADAPTER_KIND,
             "input",
             "profile",
         );
@@ -87,12 +88,14 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
             }
             .into(),
             record: GeminiBatchJobRecord {
-                name: if case == "foreign_job" {
-                    "batches/other"
-                } else {
-                    "batches/recorded-job"
-                }
-                .into(),
+                name: EmbeddingRemoteHandle(
+                    if case == "foreign_job" {
+                        "batches/other"
+                    } else {
+                        "batches/recorded-job"
+                    }
+                    .to_owned(),
+                ),
                 state: if case == "running" {
                     GeminiBatchState::Running
                 } else {
@@ -110,7 +113,7 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
         };
         // There is deliberately no scope SQLite DB or vector projection here:
         // releasing a completed operational cleanup must not depend on either.
-        crate::embedding::transport::recover_terminal_embedding_batch_cleanup(
+        crate::embedding::batch::recover_terminal_embedding_batch_cleanup(
             &crate::invocation::Invocation {
                 context: &crate::context::test_support::context(std::path::Path::new(".")),
                 settings: &std::sync::Arc::new(
@@ -130,7 +133,7 @@ fn terminal_cleanup_requires_attributed_terminal_inline_job_and_preserves_charge
             let mut expected = before.clone();
             expected.intent_token = None;
             assert_eq!(after, expected);
-            crate::embedding::transport::recover_terminal_embedding_batch_cleanup(
+            crate::embedding::batch::recover_terminal_embedding_batch_cleanup(
                 &crate::invocation::Invocation {
                     context: &crate::context::test_support::context(std::path::Path::new(".")),
                     settings: &std::sync::Arc::new(

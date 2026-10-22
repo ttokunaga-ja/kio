@@ -181,7 +181,7 @@ fn gemini_inventory_from_client(client: &dyn GeminiBatchClient) -> Result<Provid
         .list_jobs()?
         .into_iter()
         .map(|job| ProviderJobRecord {
-            job_id: job.name,
+            job_id: job.name.0,
             // A Gemini batch job carries no structured metadata — the
             // `displayName` is the only field Kio controls, so the
             // intent_token embedded there is its whole attribution

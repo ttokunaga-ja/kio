@@ -20,6 +20,7 @@ pub enum AdapterKind {
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionMode {
     OnlineApi,
+    NativeLibrary,
     OfflineApi,
     DeterministicLibrary,
 }
@@ -41,6 +42,7 @@ pub enum AdapterRunStatus {
 pub enum BillableUnitKind {
     Pages,
     TokensIn,
+    ImageTokensIn,
     TokensOut,
 }
 
@@ -495,35 +497,6 @@ pub struct RerankResponse {
     pub rerank_profile_hash: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EmbeddingResponse {
-    pub vectors: Vec<EmbeddingVector>,
-    pub dimensions: u32,
-    pub distance: String,
-    pub modality: String,
-    /// QA49 (step4b-contract-tests-p3a.md §N): the adapter's
-    /// `tool_profile_hash` at response time, so the consumer can reject a
-    /// same-dimension vector from an unexpected embedding profile (07 §5.3
-    /// (5)) instead of trusting `dimensions`/`distance`/`modality` alone.
-    /// `None` for an adapter that predates this field (degrades to the old
-    /// dimensions/distance/modality-only check).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub embedding_profile_hash: Option<String>,
-    /// QA17: this request's self-reported billing usage (07 §4 L291-307).
-    /// `None` when the concrete Adapter has no real per-call signal to report —
-    /// the caller degrades to the reservation estimate.
-    ///
-    /// I12: this doc used to name Gemini `batchEmbedContents` as the example of
-    /// an endpoint carrying no token count. It carries one — measured against
-    /// the live endpoint, `usageMetadata.promptTokenCount`, as a per-CALL total.
-    /// The absent per-REQUEST count is true and beside the point, since per-call
-    /// is the granularity the provider bills at. `gemini_embedding` populates
-    /// this field accordingly; a caller that settles on the reservation while
-    /// this is `Some` is discarding the provider's own number.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub usage: Option<AdapterUsage>,
-}
-
 /// Validate the numeric domain required by cosine distance. Width alone is not
 /// sufficient: non-finite values and a zero vector make cosine results
 /// undefined and must never reach persistence or search.
@@ -550,6 +523,8 @@ pub fn validate_cosine_vector(vector: &[f32], dimensions: u32) -> crate::Result<
     }
     Ok(())
 }
+
+pub use crate::embedding_contract::*;
 
 #[cfg(test)]
 mod tests {

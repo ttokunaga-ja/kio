@@ -1,6 +1,18 @@
 use super::*;
 
 impl Repository {
+    /// Current scope policy for images sent outside this process. Local image
+    /// computation remains eligible under either policy (03 §11).
+    pub fn image_external_send_allowed(&self) -> Result<bool> {
+        let value = self.validated_config_value()?;
+        Ok(value
+            .get("embedding")
+            .and_then(|embedding| embedding.get("external_send"))
+            .and_then(Value::as_str)
+            .unwrap_or("text_and_images")
+            == "text_and_images")
+    }
+
     /// `kio_format_version` is a `.kio/scope.json`-only concept. A config file
     /// carrying that retired key is rejected by the strict config schema.
     pub(super) fn validate_config(&self) -> Result<()> {

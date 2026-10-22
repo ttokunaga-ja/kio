@@ -8,6 +8,7 @@ pub mod bbox_annotation;
 pub mod catalog;
 pub mod deterministic;
 pub mod deterministic_embedding;
+mod embedding_contract;
 pub mod gemini_batch_client;
 mod gemini_embedding;
 mod http_policy;

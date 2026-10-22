@@ -2,6 +2,7 @@ use kio_search::evidence::EvidencePointer;
 use kio_search::object_uri::RelatedImage;
 use kio_search::query::{DiversifyStrategy, SearchMode};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize)]
@@ -118,6 +119,9 @@ pub struct ExcludedScopeResponse {
 #[derive(Debug, Serialize)]
 pub struct IndexStatusResponse {
     pub enriched_ratio: f64,
+    pub total_enrichment_tasks: u64,
+    pub skipped_enrichment_tasks: u64,
+    pub skipped_enrichment_reasons: BTreeMap<String, u64>,
     pub pending_enrichment_tasks: u64,
     pub budget_paused: bool,
     pub unsupported_inputs: Vec<FileDispositionResponse>,

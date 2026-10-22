@@ -1,0 +1,1489 @@
+use crate::egress::admit_embedding_transport;
+use crate::egress::embedding_secrets_allowed;
+use crate::embedding::admission::EMBEDDING_ADAPTER_KIND;
+use crate::embedding::admission::declared_embedding_profile;
+use crate::embedding::admission::embedding_billed_from_usage;
+use crate::embedding::admission::embedding_execution;
+use crate::embedding::admission::embedding_text_reservation;
+use crate::embedding::admission::secret_embedding_hold_required;
+use crate::embedding::admission::validate_embedding_aliases;
+use crate::embedding::executor::EmbeddingProjection;
+use crate::embedding::executor::EmbeddingTransition;
+use crate::embedding::executor::count_embedding_failure;
+use crate::embedding::executor::embedding_done_transition;
+use crate::embedding::executor::embedding_fail_transition;
+use crate::embedding::executor::embedding_failure_transition;
+use crate::embedding::executor::embedding_pause_transition;
+use crate::embedding::executor::link_reused_chunks;
+use crate::embedding::executor::persist_group_vector;
+use crate::embedding::executor::record_embedding_transitions;
+use crate::embedding::executor::refresh_embedding_projection;
+use crate::embedding::plan::EmbeddableChunk;
+use crate::embedding::plan::EmbeddingSendGroup;
+use crate::embedding::plan::bind_embedding_work;
+use crate::embedding::plan::chunk_task_target;
+use crate::embedding::plan::plan_embed_batch;
+use crate::embedding::plan::selected_embedding_contexts;
+use crate::embedding::transport::EmbeddingAcceptance;
+use crate::embedding::transport::validate_completed_embedding;
+use crate::embedding_owners;
+use crate::historical_reindex::retained_history_instances;
+use crate::index::chunk_ledger::sqlite_path;
+use crate::index::rebuild::held_secret_embedding_chunk_ids;
+use crate::invocation::Invocation;
+use crate::ledger_access::budget_cap_config;
+use crate::ledger_access::task_ledger_key;
+use crate::markdownize::batch::settle_batch_charge_terminal;
+use crate::markdownize::execution::task_failure_from_adapter;
+use crate::object_persistence::adapter_to_kio;
+use crate::object_persistence::index_to_kio;
+use crate::object_persistence::pipeline_to_kio;
+use crate::search::projection::publish_in_place_delta;
+use crate::search::projection::replica_scope_stamp;
+use crate::search::projection::write_through_projection_or_log_for_repo;
+use crate::search::scope::current_embedding_policy;
+use crate::settings::batch_recovery_context;
+use crate::task_execution::ExecOutcome;
+use crate::task_execution::retry_kind_from_reason;
+use crate::task_execution::retry_reason;
+use kio_adapter::catalog::DeclaredEmbeddingProfile;
+use kio_adapter::catalog::EmbeddingExecution;
+use kio_adapter::catalog::embedding_preferred_request_kind_with_control;
+use kio_adapter::traits::PreferredRequestKind;
+use kio_adapter::types::EmbeddingCompleted;
+use kio_adapter::types::EmbeddingLogicalJobId;
+use kio_adapter::types::EmbeddingMemberOutcome;
+use kio_adapter::types::EmbeddingMemberResult;
+use kio_adapter::types::EmbeddingOutcome;
+use kio_adapter::types::EmbeddingRemoteHandle;
+use kio_adapter::types::EmbeddingUsage;
+use kio_core::ExitCode;
+use kio_core::KioError;
+use kio_core::Result;
+use kio_core::scope::Repository;
+use kio_index::embedding_store;
+use kio_index::fts::ExistingSourceIndexOpenMode;
+use kio_index::fts::FtsSchemaConfig;
+use kio_index::fts::FtsTokenizer;
+use kio_index::fts::open_existing_source_index_connection;
+use kio_pipeline::budget::BudgetCaps;
+use kio_pipeline::ledger::BatchRequestRow;
+use kio_pipeline::ledger::BatchState;
+use kio_pipeline::ledger::LedgerDb;
+use kio_pipeline::ledger::Outcome;
+use kio_pipeline::ledger::RequestKind;
+use kio_pipeline::ledger::embedding_job::EmbeddingJob;
+use kio_pipeline::ledger::embedding_job::EmbeddingJobBinding;
+use kio_pipeline::ledger::embedding_job::EmbeddingJobMember;
+use kio_pipeline::ledger::embedding_job::EmbeddingReservationOutcome;
+use kio_pipeline::ledger::embedding_job::EmbeddingReserveRequest;
+use kio_pipeline::ledger::ops::BilledAmount;
+use kio_pipeline::ledger::ops::batch_poll_candidates;
+use kio_pipeline::ledger::ops::embedding_job;
+use kio_pipeline::ledger::ops::finish_embedding_publication;
+use kio_pipeline::ledger::ops::get_batch_request;
+use kio_pipeline::ledger::ops::pending_embedding_publications_for_scope;
+use kio_pipeline::ledger::ops::phase2a_record_provider_scope;
+use kio_pipeline::ledger::ops::phase2b_record_job_create_started;
+use kio_pipeline::ledger::ops::record_embedding_pending;
+use kio_pipeline::ledger::ops::recovery_finish_cleanup;
+use kio_pipeline::ledger::ops::reserve_embedding_job;
+use kio_pipeline::ledger::ops::stage_embedding_result;
+use kio_pipeline::policy::CurrentPolicyEvaluator;
+use kio_pipeline::task::RetryErrorKind;
+use kio_pipeline::task::TaskStore;
+use rusqlite::Connection;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+
+// Embedding Batch lane (07 §5.3 の 2026-07-24 訂正 / §5.7, 04 §5.8)
+//
+// The Gemini Developer API bills an embedding batch at half the sync rate, so
+// the Batch lane is the default. Unlike the OCR lane it takes its input
+// INLINE, so there is no upload phase (相 2a) and no provider residue to
+// sweep — see `kio_adapter::gemini_batch_client`.
+//
+// **1 job = 1 task** (07 §5.5's v1 contract) is preserved by making the JOB
+// itself the task: the batch row's `input_hash` is a digest of the job's
+// member set. Embedding's natural task granularity is the dedup group, and a
+// realistic scope has thousands of them (2,321 in the dogfood fixture), so
+// one job per group would mean thousands of provider jobs. One row per job
+// keeps the §5.8 state machine, its crash recovery, and `kio batch abandon`
+// working unchanged.
+// ===========================================================================
+
+/// Groups carried by one embedding batch job. Well under the adapter's inline
+/// bounds (`MAX_INLINE_REQUESTS` = 2048, 16 MiB serialized), leaving room for
+/// long chunks: 6,000 chars max per chunk (`[chunking] max_chars`) × 512 ≈ 3 MB
+/// of text before JSON overhead.
+const EMBEDDING_BATCH_JOB_MAX_MEMBERS: usize = 512;
+
+/// How many non-success terminals one embedding batch task (= one job's member
+/// set) may accumulate before it is failed instead of re-sent.
+///
+/// R24: a job that keeps ending in a non-success terminal state used to be
+/// re-submitted without bound — every `batch resume` settled the failure,
+/// cleared the row, and immediately created a new job with a fresh reservation.
+/// A failed send reports no usage — measured settlement (I4/I12) covers the
+/// success path only — so on this path the reservation IS the settled charge,
+/// and a permanently-failing member set recorded its full estimate once per
+/// pass until the budget cap hard-stopped the scope.
+///
+/// Counted on `contract_violation_count`, NOT on `attempts`, specifically
+/// because **`kio batch retry --reset-violations <selector> --yes` already exists as the operator escape
+/// hatch for it** (CL62-CL68) and nothing resets `attempts`. Bounding on
+/// `attempts` would have made an exhausted member set permanently
+/// unsubmittable — a dead end with no way out. 07 §5.3 already routes a
+/// response that yields no usable output through the contract-violation rules,
+/// so a FAILED/EXPIRED/CANCELLED job counting here is the established meaning.
+const EMBEDDING_BATCH_JOB_MAX_FAILURES: i64 = 3;
+
+/// G2: record one Batch-submit provider failure against the job's member
+/// chunks, using the same classification and the same 3-way disposition the
+/// synchronous send handler applies.
+///
+/// The reservation is deliberately LEFT IN PLACE (the F8 reserve-before-send
+/// posture): whether the provider actually created the job is unknown from
+/// here, so releasing it could double-charge on the next pass. 04 §5.8's
+/// recovery walk resolves it — found → the poll lane collects it, confirmed
+/// absent → the reservation is released.
+fn record_batch_submit_failure(
+    outcome: &mut ExecOutcome,
+    transitions: &mut BTreeMap<String, EmbeddingTransition>,
+    job_groups: &[EmbeddingSendGroup<'_>],
+    error: kio_adapter::AdapterError,
+) {
+    let failure = task_failure_from_adapter(error);
+    record_embedding_transitions(
+        transitions,
+        job_groups
+            .iter()
+            .flat_map(|group| group.members.iter().copied()),
+        embedding_failure_transition(&failure),
+    );
+    count_embedding_failure(
+        outcome,
+        failure.retry_kind,
+        job_groups.iter().map(|group| group.members.len()).sum(),
+    );
+}
+
+/// A complete report must cover each member's actual modality and bound.
+fn reported_member_usage(
+    results: &[kio_adapter::gemini_batch_client::GeminiBatchEmbedOutput],
+    image: bool,
+) -> EmbeddingUsage {
+    use kio_adapter::types::{AdapterUsage, BillableUnit, BillableUnitKind};
+    let kind = if image {
+        BillableUnitKind::ImageTokensIn
+    } else {
+        BillableUnitKind::TokensIn
+    };
+    let total = results.iter().try_fold(0_u64, |total, result| {
+        let EmbeddingUsage::Metered {
+            usage: AdapterUsage::BillableUnits { billable_units },
+        } = &result.usage
+        else {
+            return None;
+        };
+        let [unit] = billable_units.as_slice() else {
+            return None;
+        };
+        if unit.kind != kind || unit.count > 8192 {
+            return None;
+        }
+        total.checked_add(unit.count)
+    });
+    match total.filter(|_| !results.is_empty()) {
+        Some(count) => EmbeddingUsage::Metered {
+            usage: AdapterUsage::BillableUnits {
+                billable_units: vec![BillableUnit { kind, count }],
+            },
+        },
+        None => EmbeddingUsage::Estimated,
+    }
+}
+
+fn batch_member_failure_kind(error: &serde_json::Value) -> RetryErrorKind {
+    let code = error.get("code").and_then(serde_json::Value::as_i64);
+    match code {
+        Some(401 | 403) => RetryErrorKind::AuthError,
+        Some(429) => RetryErrorKind::RateLimit,
+        Some(500..=599) => RetryErrorKind::NetworkError,
+        Some(400..=499) => RetryErrorKind::InvalidInput,
+        _ => RetryErrorKind::ContractViolation,
+    }
+}
+
+/// The batch row's `input_hash` for a job: a digest over the job's member
+/// content identities, in a canonical order.
+///
+/// This is what makes "1 job = 1 task" hold for a lane whose task granularity
+/// is finer than a job. Two runs that select the same member set land on the
+/// same row (so a crash-stranded reservation is reused, not duplicated); a
+/// different selection is a different task, and any member already embedded by
+/// the earlier job drops out through content-addressed reuse before it is ever
+/// selected again.
+const EMBEDDING_BATCH_RESULT_CONTRACT_ERROR: &str =
+    "embedding batch result violates the complete response contract";
+
+pub(crate) fn embedding_job_input_hash(embedding_hashes: &BTreeSet<String>) -> String {
+    let joined = embedding_hashes
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join("\n");
+    kio_core::cas::hash_bytes(joined.as_bytes())
+}
+
+fn batch_job_binding(
+    key: &kio_pipeline::ledger::TaskKey,
+    profile: &DeclaredEmbeddingProfile,
+    groups: &[EmbeddingSendGroup<'_>],
+) -> Result<EmbeddingJobBinding> {
+    Ok(EmbeddingJobBinding {
+        logical_job_id: EmbeddingLogicalJobId(key.input_hash.clone()),
+        local: false,
+        dimensions: u32::try_from(profile.dimensions)
+            .map_err(|_| KioError::schema("embedding profile dimensions exceed u32"))?,
+        distance: profile.distance.clone(),
+        modality: profile.modality.clone(),
+        members: groups
+            .iter()
+            .map(|group| EmbeddingJobMember {
+                id: group.embedding_hash.clone(),
+                target: chunk_task_target(group.representative, profile),
+            })
+            .collect(),
+    })
+}
+
+/// 07 §5.3 (3)/(4): validate the provider's raw values, convert deterministically
+/// to unit-norm f32, then re-validate the RESULT — an underflowed zero vector or
+/// an overflowed infinity must never reach the index. The sync lane gets this
+/// inside the adapter; the Batch lane's values arrive raw from a job, so the
+/// same discipline is applied here.
+fn normalize_embedding_vector(values: &[f32], dimensions: u32) -> Result<Vec<f32>> {
+    kio_adapter::types::validate_cosine_vector(values, dimensions).map_err(adapter_to_kio)?;
+    let norm = values
+        .iter()
+        .map(|value| f64::from(*value).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let normalized = values
+        .iter()
+        .map(|value| (f64::from(*value) / norm) as f32)
+        .collect::<Vec<f32>>();
+    kio_adapter::types::validate_cosine_vector(&normalized, dimensions).map_err(adapter_to_kio)?;
+    Ok(normalized)
+}
+
+pub(crate) fn completed_batch_result(
+    job: &EmbeddingJob,
+    results: &[kio_adapter::gemini_batch_client::GeminiBatchEmbedOutput],
+) -> Result<EmbeddingCompleted> {
+    let expected = job
+        .binding
+        .members
+        .iter()
+        .map(|member| member.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let actual = results
+        .iter()
+        .map(|result| result.key.as_str())
+        .collect::<BTreeSet<_>>();
+    if results.len() != expected.len() || actual != expected {
+        return Err(KioError::schema(EMBEDDING_BATCH_RESULT_CONTRACT_ERROR));
+    }
+    let members = results
+        .iter()
+        .map(|result| {
+            let result_value = match (&result.values, &result.error) {
+                (Some(values), None) => {
+                    match normalize_embedding_vector(values, job.binding.dimensions) {
+                        Ok(vector) => EmbeddingMemberResult::Vector { vector },
+                        Err(_) => EmbeddingMemberResult::Failed {
+                            reason: retry_reason(RetryErrorKind::ContractViolation).to_owned(),
+                        },
+                    }
+                }
+                (None, Some(error)) => EmbeddingMemberResult::Failed {
+                    reason: retry_reason(batch_member_failure_kind(error)).to_owned(),
+                },
+                _ => return Err(KioError::schema(EMBEDDING_BATCH_RESULT_CONTRACT_ERROR)),
+            };
+            Ok(EmbeddingMemberOutcome {
+                id: result.key.clone(),
+                result: result_value,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let image = job.binding.members.iter().all(|member| {
+        matches!(
+            member.target,
+            kio_pipeline::task::EmbeddingTaskTarget::Image { .. }
+        )
+    });
+    let text = job.binding.members.iter().all(|member| {
+        matches!(
+            member.target,
+            kio_pipeline::task::EmbeddingTaskTarget::Chunk { .. }
+        )
+    });
+    if !image && !text {
+        return Err(KioError::schema(EMBEDDING_BATCH_RESULT_CONTRACT_ERROR));
+    }
+    let usage = reported_member_usage(results, image);
+    let completed = EmbeddingCompleted {
+        members,
+        dimensions: job.binding.dimensions,
+        distance: job.binding.distance.clone(),
+        modality: job.binding.modality.clone(),
+        embedding_profile_hash: job.binding.members[0].target.profile_hash().to_owned(),
+        usage,
+    };
+    validate_completed_embedding(
+        &completed,
+        &EmbeddingAcceptance {
+            dimensions: job.binding.dimensions,
+            distance: &job.binding.distance,
+            modality: &job.binding.modality,
+            profile_hash: job.binding.members[0].target.profile_hash(),
+            member_ids: job
+                .binding
+                .members
+                .iter()
+                .map(|member| member.id.clone())
+                .collect(),
+        },
+    )
+    .map_err(adapter_to_kio)?;
+    Ok(completed)
+}
+
+fn settle_known_batch_jobs(
+    ctx: &Invocation<'_>,
+    ledger: &LedgerDb,
+    scope_id: &str,
+) -> Result<Vec<EmbeddingJob>> {
+    let mut known = Vec::new();
+    for job in
+        pending_embedding_publications_for_scope(ledger, scope_id).map_err(pipeline_to_kio)?
+    {
+        if !settle_batch_staged_job(ctx, ledger, &job)? {
+            continue;
+        }
+        known.push(job);
+    }
+    Ok(known)
+}
+
+fn settle_batch_staged_job(
+    ctx: &Invocation<'_>,
+    ledger: &LedgerDb,
+    job: &EmbeddingJob,
+) -> Result<bool> {
+    let row = get_batch_request(ledger, &job.key)
+        .map_err(pipeline_to_kio)?
+        .ok_or_else(|| KioError::schema("staged batch job lost ledger row"))?;
+    if row.request_kind != RequestKind::Batch {
+        return Ok(false);
+    }
+    if row.state.is_inflight() {
+        let result = job
+            .known_result
+            .as_ref()
+            .ok_or_else(|| KioError::schema("pending publication lacks result"))?;
+        let job_name = row
+            .batch_job_id
+            .as_deref()
+            .ok_or_else(|| KioError::schema("staged batch job lost remote handle"))?;
+        // A keyed member violation does not discard valid siblings or their
+        // known usage. Keep the job-level durable hold while publishing those
+        // siblings from the staged result, including after a terminal restart.
+        let contract_violation = result.members.iter().any(|member| {
+            matches!(&member.result, EmbeddingMemberResult::Failed { reason }
+                if reason == retry_reason(RetryErrorKind::ContractViolation))
+        });
+        let (outcome, state, error) = if contract_violation {
+            (
+                Outcome::ContractViolation,
+                BatchState::Terminal,
+                Some(EMBEDDING_BATCH_RESULT_CONTRACT_ERROR),
+            )
+        } else {
+            (Outcome::Succeeded, BatchState::Completed, None)
+        };
+        settle_batch_charge_terminal(
+            ledger,
+            &job.key,
+            &job.intent_token,
+            job_name,
+            outcome,
+            state,
+            error,
+            embedding_billed_from_usage(
+                ctx.settings,
+                match &result.usage {
+                    EmbeddingUsage::Metered { usage } => Some(usage),
+                    EmbeddingUsage::Estimated | EmbeddingUsage::Unmetered => None,
+                },
+                PreferredRequestKind::Batch,
+                row.estimated_usd,
+                ctx.control,
+                ctx.locks,
+                if job.binding.members.iter().all(|member| {
+                    matches!(
+                        member.target,
+                        kio_pipeline::task::EmbeddingTaskTarget::Image { .. }
+                    )
+                }) {
+                    kio_adapter::types::EmbeddingInputType::ImageObject
+                } else {
+                    kio_adapter::types::EmbeddingInputType::MarkdownChunk
+                },
+            ),
+            contract_violation,
+            true,
+        )?;
+    }
+    Ok(true)
+}
+
+fn reject_embedding_batch_contract_holds(
+    scope_id: &str,
+    contract_holds: &[BatchRequestRow],
+) -> Result<()> {
+    if !contract_holds.is_empty() {
+        let attempts = contract_holds
+            .iter()
+            .map(|row| {
+                json!({
+                    "input_hash": row.key.input_hash,
+                    "tool_profile_hash": row.key.tool_profile_hash,
+                    "submission_seq": row.submission_seq,
+                    "selector": format!("{}/{}/{}/{}", row.key.scope_id, row.key.adapter_kind, row.key.input_hash, row.key.tool_profile_hash),
+                })
+            })
+            .collect::<Vec<_>>();
+        return Err(KioError::new(
+            "KIO-E-EMBED-BATCH-CONTRACT-HOLD-001",
+            "new embedding batch submissions are held after a malformed result; run kio batch retry --reset-violations <selector> --yes for each blocked attempt",
+            json!({"scope_id": scope_id, "adapter_kind": EMBEDDING_ADAPTER_KIND, "blocked_attempts": attempts}),
+            ExitCode::PermanentFailure,
+        ));
+    }
+    Ok(())
+}
+
+/// Submit this pass's pending embeddings as provider batch jobs and return.
+///
+/// Nothing is collected here: the results arrive at a later `poll_batch_embedding_jobs`
+/// (from `kio batch resume` or any write command), the same shape the OCR lane
+/// uses. Member tasks stay Pending, so `index_status` keeps reporting them.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn submit_embedding_batch_jobs(
+    ctx: &Invocation<'_>,
+    repo: &Repository,
+    execution: EmbeddingExecution,
+    conn: &Connection,
+    ledger: &LedgerDb,
+    profile: &DeclaredEmbeddingProfile,
+    embeddable: &[EmbeddableChunk],
+    scope_id: &str,
+    budget_caps: &BudgetCaps,
+    override_budget: bool,
+    current_policy: &CurrentPolicyEvaluator,
+    projection: &EmbeddingProjection<'_>,
+    transitions: &mut BTreeMap<String, EmbeddingTransition>,
+    replica: &mut kio_index::aggregator::ScopeDelta,
+) -> Result<Option<ExecOutcome>> {
+    let adapter_settings = ctx.settings;
+
+    let mut outcome = ExecOutcome::default();
+    let contract_holds = kio_pipeline::ledger::ops::unreset_contract_violations_for_scope_adapter(
+        ledger,
+        scope_id,
+        EMBEDDING_ADAPTER_KIND,
+    )
+    .map_err(pipeline_to_kio)?;
+    let plan = plan_embed_batch(conn, profile, embeddable).map_err(|failure| {
+        KioError::schema(format!(
+            "embedding batch planning failed: {:?}",
+            failure.retry_kind
+        ))
+    })?;
+    // The durable batch breaker precedes client resolution: losing the batch
+    // client must not turn a blocked batch into an automatic sync resend.
+    if !plan.to_send.is_empty() {
+        reject_embedding_batch_contract_holds(scope_id, &contract_holds)?;
+    }
+    // The lazy context is loaded only for a configured real client. Invalid
+    // recovery authority is a hard hold, never permission to switch lanes.
+    let Some(client) = kio_adapter::gemini_batch_client::resolve_gemini_batch_client_with_control(
+        adapter_settings,
+        || batch_recovery_context(ledger),
+        ctx.control,
+    )
+    .map_err(adapter_to_kio)?
+    else {
+        // The lane is unavailable (no batch client resolvable). Report that to
+        // the caller so it can fall back to the synchronous lane, exactly as
+        // `markdownize_send_lane`'s `(false, None) => Sync` rule does — leaving
+        // the work pending forever would be worse than paying the sync rate.
+        return Ok(None);
+    };
+    // Reuse links are free and always succeed — settle them here exactly as the
+    // sync lane does, so an unavailable provider cannot strand an already
+    // materialized chunk.
+    if !plan.reuse.is_empty() {
+        match link_reused_chunks(conn, profile, &plan.reuse, projection, replica) {
+            Ok(()) => {
+                record_embedding_transitions(
+                    transitions,
+                    plan.reuse.iter().map(|(chunk, _)| *chunk),
+                    embedding_done_transition(),
+                );
+                outcome.executed += plan.reuse.len();
+            }
+            Err(failure) => {
+                record_embedding_transitions(
+                    transitions,
+                    plan.reuse.iter().map(|(chunk, _)| *chunk),
+                    embedding_fail_transition(failure.retry_kind),
+                );
+                count_embedding_failure(&mut outcome, failure.retry_kind, plan.reuse.len());
+                return Ok(Some(outcome));
+            }
+        }
+    }
+    if plan.to_send.is_empty() {
+        return Ok(Some(outcome));
+    }
+    let caps = budget_cap_config(budget_caps, scope_id, EMBEDDING_ADAPTER_KIND);
+    let bypass_cap_denial = override_budget || !budget_caps.hard_stop;
+    for job_groups in plan.to_send.chunks(EMBEDDING_BATCH_JOB_MAX_MEMBERS) {
+        let member_identities = job_groups
+            .iter()
+            .map(|group| group.embedding_hash.clone())
+            .collect::<BTreeSet<_>>();
+        let key = task_ledger_key(
+            scope_id,
+            EMBEDDING_ADAPTER_KIND,
+            &embedding_job_input_hash(&member_identities),
+            &profile.profile_hash,
+        );
+        // R24 (6 系統一致, KNOWN GAP の是正): bound the retries. A job that ends
+        // in a non-success terminal settles the row and NULLs its
+        // `intent_token`, and `phase1_intent`'s ON CONFLICT clears
+        // `batch_job_id` — so without this gate the very next pass re-reserved
+        // the same task key and created another job, forever, recording an
+        // estimate every time. Neither counter is in that ON CONFLICT SET list,
+        // so both survive re-reservation; this uses `contract_violation_count`
+        // because `kio batch retry --reset-violations <selector> --yes` can clear it and nothing clears
+        // `attempts` (see `EMBEDDING_BATCH_JOB_MAX_FAILURES`).
+        let existing = get_batch_request(ledger, &key).map_err(pipeline_to_kio)?;
+        if let Some(row) = existing.as_ref()
+            && embedding_job(ledger, row)
+                .map_err(pipeline_to_kio)?
+                .is_some_and(|job| job.known_result.is_some())
+        {
+            continue;
+        }
+        if existing.as_ref().is_some_and(|row| {
+            !row.state.is_inflight()
+                && row.contract_violation_count >= EMBEDDING_BATCH_JOB_MAX_FAILURES
+        }) {
+            record_embedding_transitions(
+                transitions,
+                job_groups
+                    .iter()
+                    .flat_map(|group| group.members.iter().copied()),
+                embedding_fail_transition(RetryErrorKind::ContractViolation),
+            );
+            count_embedding_failure(
+                &mut outcome,
+                RetryErrorKind::ContractViolation,
+                job_groups
+                    .iter()
+                    .map(|group| group.members.len())
+                    .sum::<usize>(),
+            );
+            continue;
+        }
+        // This is an already-admitted request. Its poll/recovery owner may
+        // continue after a policy change; do not turn a resubmission scan into
+        // a fresh admission boundary for it.
+        if existing
+            .as_ref()
+            .is_some_and(|row| row.state.is_inflight() && row.batch_job_id.is_some())
+        {
+            continue;
+        }
+        // R24 (3 系統一致): build the inputs BEFORE the reservation so the
+        // estimate prices the string actually sent. Estimating
+        // `representative.text` while sending
+        // `contextualized_embedding_input(context, text)` undercounts by the
+        // whole context prefix. Settlement now corrects that from the reported
+        // tokens (I4/I12), but the RESERVATION is what the budget cap gates on
+        // and what a failed send settles at, so an undercount here still lets
+        // spending through the cap that the cap was set to stop (I10).
+        let inputs = job_groups
+            .iter()
+            .map(|group| {
+                let context =
+                    embedding_store::chunk_embedding_context(&group.representative.raw_path);
+                kio_adapter::gemini_batch_client::GeminiBatchEmbedInput {
+                    // The provider echoes this back in `metadata.key`; the
+                    // collect side keys on it to find the chunk again.
+                    key: group.embedding_hash.clone(),
+                    content: kio_adapter::types::EmbeddingContent::Text {
+                        text: embedding_store::contextualized_embedding_input(
+                            context.as_deref(),
+                            &group.representative.text,
+                        ),
+                    },
+                }
+            })
+            .collect::<Vec<_>>();
+        validate_embedding_aliases(
+            current_policy,
+            profile,
+            job_groups
+                .iter()
+                .flat_map(|group| group.members.iter().copied()),
+        )
+        .map_err(|_| KioError::schema("embedding owner policy changed before batch admission"))?;
+        // One reservation for the whole job — the cap is checked once against
+        // the job's total, which is also what the provider will bill.
+        let candidate_usd: f64 = inputs
+            .iter()
+            .map(|_| embedding_text_reservation(adapter_settings, PreferredRequestKind::Batch))
+            .sum();
+        // Final check before this new job's reservation/admission. Existing
+        // submitted jobs are polled elsewhere and deliberately do not pass
+        // through this new-submission boundary.
+        admit_embedding_transport(
+            adapter_settings,
+            repo,
+            execution,
+            profile,
+            current_policy,
+            job_groups
+                .iter()
+                .flat_map(|group| group.members.iter())
+                .any(|chunk| chunk.requires_secret_approval),
+        )?;
+        let binding = batch_job_binding(&key, profile, job_groups)?;
+        let reservation = reserve_embedding_job(
+            ledger,
+            &EmbeddingReserveRequest {
+                key: &key,
+                candidate_usd,
+                caps: &caps,
+                request_kind: RequestKind::Batch,
+                timeout_seconds: None,
+                bypass_cap_denial,
+                binding: &binding,
+            },
+        )
+        .map_err(pipeline_to_kio)?;
+        let reserved_job = match reservation {
+            EmbeddingReservationOutcome::BudgetExceeded => {
+                record_embedding_transitions(
+                    transitions,
+                    job_groups
+                        .iter()
+                        .flat_map(|group| group.members.iter().copied()),
+                    embedding_pause_transition(),
+                );
+                outcome.paused += job_groups
+                    .iter()
+                    .map(|group| group.members.len())
+                    .sum::<usize>();
+                continue;
+            }
+            EmbeddingReservationOutcome::Reserved(job) => job,
+            EmbeddingReservationOutcome::KnownResult(_)
+            | EmbeddingReservationOutcome::InFlight(_) => continue,
+        };
+        let intent_token = reserved_job.intent_token.clone();
+        // 相 2a is degenerate for an inline batch (no upload), so the provider
+        // scope is recorded immediately before job creation instead.
+        //
+        // G2: a provider-side failure here fails THIS job, not the invocation.
+        // These calls used to `?` straight out of the function, so one
+        // transient 429 aborted `kio index` for the whole scope — and, worse,
+        // did it after 相 2b was recorded, leaving the row stranded. The
+        // synchronous lane has always classified and recorded per chunk
+        // instead; this makes the Batch lane behave the same way. The stranded
+        // row is not a leak: §5.8's recovery walk owns it (G1 wired the Gemini
+        // provider into that walk, which is why this can safely give up here).
+        let provider_scope_id = match client.provider_scope_id() {
+            Ok(id) => id,
+            Err(error) => {
+                record_batch_submit_failure(&mut outcome, transitions, job_groups, error);
+                continue;
+            }
+        };
+        if !phase2a_record_provider_scope(ledger, &key, &intent_token, &provider_scope_id)
+            .map_err(pipeline_to_kio)?
+        {
+            continue;
+        }
+        if !phase2b_record_job_create_started(ledger, &key, &intent_token)
+            .map_err(pipeline_to_kio)?
+        {
+            continue;
+        }
+        let pending = match client.submit_job(
+            kio_adapter::catalog::ADOPTED_EMBEDDING_MODEL_PIN,
+            u32::try_from(profile.dimensions).unwrap_or(u32::MAX),
+            &kio_adapter::gemini_batch_client::batch_display_name(&intent_token),
+            &inputs,
+        ) {
+            Ok(job) => job,
+            Err(error) => {
+                record_batch_submit_failure(&mut outcome, transitions, job_groups, error);
+                continue;
+            }
+        };
+        if !matches!(&pending, EmbeddingOutcome::Pending { .. }) {
+            return Err(KioError::schema(
+                "batch submit did not return a pending remote handle",
+            ));
+        }
+        if !record_embedding_pending(ledger, &reserved_job, &pending).map_err(pipeline_to_kio)? {
+            continue;
+        }
+        outcome.inflight += job_groups
+            .iter()
+            .map(|group| group.members.len())
+            .sum::<usize>();
+    }
+    Ok(Some(outcome))
+}
+
+/// 04 §5.8 相 3 for this scope's in-flight embedding batch jobs.
+///
+/// Polling receives an EXISTING request, so like the OCR lane it needs no
+/// network opt-in. Rows whose job id is still unknown belong to the §5.8
+/// recovery walk (`kio ledger reconcile`), not here — `batch_poll_candidates`
+/// only returns rows with a durable `batch_job_id`.
+pub(crate) fn poll_batch_embedding_jobs(
+    ctx: &Invocation<'_>,
+    repo: &Repository,
+    ledger: &LedgerDb,
+) -> Result<ExecOutcome> {
+    let adapter_settings = ctx.settings;
+
+    let mut outcome = ExecOutcome::default();
+    let scope_id = repo.scope_identity()?.scope_id;
+    let mut staged_jobs = settle_known_batch_jobs(ctx, ledger, &scope_id)?;
+    let Some(execution) = embedding_execution(adapter_settings, ctx.control) else {
+        return Ok(outcome);
+    };
+    // 07 §5.5: the lane is a property of the adapter. An `offline_api` adapter
+    // prefers Sync because a local server has no provider job queue to submit
+    // to, and the half-price rationale that puts Gemini on Batch does not
+    // exist for it. There can be no in-flight rows to poll.
+    if embedding_preferred_request_kind_with_control(adapter_settings, execution, ctx.control)
+        .map_err(adapter_to_kio)?
+        != PreferredRequestKind::Batch
+        && staged_jobs.is_empty()
+    {
+        return Ok(outcome);
+    }
+    let profile = declared_embedding_profile(execution);
+    let mut rows = batch_poll_candidates(ledger, &scope_id, EMBEDDING_ADAPTER_KIND)
+        .map_err(pipeline_to_kio)?;
+    rows.retain(|row| {
+        !staged_jobs
+            .iter()
+            .any(|job| job.key == row.key && job.submission_seq == row.submission_seq)
+    });
+    // A staged response needs no provider client. When there is other work or
+    // terminal remote cleanup, retain the existing lazy client resolution.
+    let client = if rows.is_empty() && !staged_jobs.is_empty() {
+        None
+    } else {
+        match kio_adapter::gemini_batch_client::resolve_gemini_batch_client_with_control(
+            adapter_settings,
+            || batch_recovery_context(ledger),
+            ctx.control,
+        ) {
+            Ok(client) => client,
+            Err(error) if !staged_jobs.is_empty() => {
+                ctx.interaction.diagnostic(&format!(
+                    "kio: holding provider collection while publishing staged embedding results: {error}"
+                ));
+                None
+            }
+            Err(error) => return Err(adapter_to_kio(error)),
+        }
+    };
+    if let Some(client) = client.as_ref() {
+        recover_terminal_embedding_batch_cleanup(ctx, ledger, client.as_ref(), &scope_id)?;
+    }
+    if client.is_none() {
+        rows.clear();
+    }
+    if rows.is_empty() && staged_jobs.is_empty() {
+        return Ok(outcome);
+    }
+    let db_path = sqlite_path(repo.kio_dir());
+    if !db_path.exists() {
+        return Ok(outcome);
+    }
+    let conn = open_existing_source_index_connection(
+        &db_path,
+        ExistingSourceIndexOpenMode::ReadWrite,
+        &FtsSchemaConfig {
+            tokenizer: FtsTokenizer::Trigram,
+        },
+    )
+    .map_err(index_to_kio)?;
+    let Some(head) = repo.head_commit_hash()? else {
+        return Ok(outcome);
+    };
+    // Batch collection is likewise scoped by the required HEAD TreeObject
+    // field, never by a mutable working-tree config.toml.
+    let instances = retained_history_instances(repo, &head)?;
+    let chunks =
+        embedding_owners::collect_retained_embedding_chunks(repo, &conn, &instances, None, None)?;
+    let current_policy = current_embedding_policy(repo)?;
+    let selected_contexts = selected_embedding_contexts(&chunks, &current_policy)?;
+    let chunks = bind_embedding_work(chunks, &profile)?;
+    let by_embedding_hash = chunks
+        .iter()
+        .map(|chunk| (chunk.work_key.embedding_hash().to_owned(), chunk))
+        .collect::<BTreeMap<_, _>>();
+    let mut held = BTreeSet::new();
+    if secret_embedding_hold_required(
+        execution.execution_mode(),
+        embedding_secrets_allowed(adapter_settings, repo, &profile)?,
+        true,
+    ) {
+        held.extend(held_secret_embedding_chunk_ids(
+            repo.kio_dir(),
+            repo.control(),
+        )?);
+        held.extend(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.requires_secret_approval)
+                .map(|chunk| chunk.chunk_id.clone()),
+        );
+    }
+    let projection = EmbeddingProjection {
+        repo,
+        execution,
+        policy: &current_policy,
+        selected_contexts: &selected_contexts,
+        invalidated: std::cell::Cell::new(false),
+    };
+    refresh_embedding_projection(ctx, repo, &conn, &chunks, &profile, &projection, &held)?;
+    // 05 §1.8 write-through, accumulated across every collected job and flushed
+    // once below — see the sync lane's identical accumulator, including why the
+    // generation is read here rather than at the flush.
+    let replica_before = replica_scope_stamp(repo.kio_dir()).map(|(_, generation)| generation);
+    let mut replica = kio_index::aggregator::ScopeDelta::default();
+    let mut source_written = false;
+    let secrets_approved = embedding_secrets_allowed(adapter_settings, repo, &profile)?;
+    let image_authority =
+        crate::image_authority::retained_image_authority(repo, &instances, &current_policy)?;
+    let eligible_images = crate::embedding::input::referenced_authorized_image_hashes_for_chunks(
+        &chunks,
+        &scope_id,
+        &image_authority,
+        secrets_approved,
+    );
+    let mut image_source_written = false;
+    let mut published_jobs = Vec::new();
+    let mut transitions = BTreeMap::new();
+    for row in rows {
+        let (Some(job_name), Some(intent_token)) =
+            (row.batch_job_id.as_ref(), row.intent_token.as_ref())
+        else {
+            continue;
+        };
+        // G2: 04 §5.8 unknown — 何も変更せず保持し、次回再試行する。This used to
+        // `?` out of the whole function, so ONE unreachable row blocked
+        // collection for every other row in the scope (head-of-line blocking)
+        // and reported a transient network error as a permanent config fault.
+        // The OCR lane has always held-and-retried here; this matches it.
+        // I8: ONE fetch. The state and the results live in the same document,
+        // so asking twice downloaded a finished job's payload twice and let the
+        // two reads take different byte bounds — which is how every job past
+        // ~20 members came to be silently unreadable.
+        let Some(poll) = poll_attributed_embedding_batch_job(
+            ctx,
+            client
+                .as_ref()
+                .expect("batch poll rows require client")
+                .as_ref(),
+            &row,
+            None,
+        ) else {
+            outcome.inflight += 1;
+            outcome.held_unreadable += 1;
+            continue;
+        };
+        let job = poll.record;
+        if !job.state.is_terminal() {
+            outcome.inflight += 1;
+            continue;
+        }
+        if job.state != kio_adapter::gemini_batch_client::GeminiBatchState::Succeeded {
+            // Failed / cancelled / expired: terminate the row so the members
+            // become eligible for a fresh submission, and record the estimate
+            // (the provider may still have billed part of the job).
+            settle_batch_charge_terminal(
+                ledger,
+                &row.key,
+                intent_token,
+                job_name,
+                // §5.8 相 3: a provider-side non-success terminal. `Expired`
+                // is the closed-enum outcome for "the job ended without
+                // usable output" (the OCR lane uses it the same way).
+                Outcome::Expired,
+                BatchState::Terminal,
+                Some("embedding batch job did not succeed"),
+                BilledAmount {
+                    usd: row.estimated_usd,
+                    estimated: true,
+                },
+                // R24: count it. This is the durable counter the submit side
+                // bounds re-sends on, and `kio batch retry --reset-violations <selector> --yes` is its
+                // operator escape hatch.
+                true,
+                true,
+            )?;
+            outcome.failed += 1;
+            continue;
+        }
+        // G2: same §5.8 unknown rule. The job says SUCCEEDED but the response
+        // carried no results — settling on that would either discard the
+        // vectors (Succeeded with nothing persisted) or burn a retry
+        // (Terminal). Hold the row instead; the next pass re-reads it.
+        let Some(results) = poll.results else {
+            ctx.interaction.diagnostic(&format!(
+                "kio: holding {job_name}: job succeeded but carried no results"
+            ));
+            outcome.inflight += 1;
+            outcome.held_unreadable += 1;
+            continue;
+        };
+        // The frozen sidecar, not tasks.jsonl or the current profile, binds
+        // every original member. A local stage failure leaves this same remote
+        // job and reservation in place for another collection attempt.
+        let original = embedding_job(ledger, &row)
+            .map_err(pipeline_to_kio)?
+            .ok_or_else(|| KioError::schema("batch result has no original member binding"))?;
+        let completed = match completed_batch_result(&original, &results) {
+            Ok(result) => result,
+            Err(_) => {
+                settle_batch_charge_terminal(
+                    ledger,
+                    &row.key,
+                    intent_token,
+                    job_name,
+                    Outcome::ContractViolation,
+                    BatchState::Terminal,
+                    Some(EMBEDDING_BATCH_RESULT_CONTRACT_ERROR),
+                    BilledAmount {
+                        usd: row.estimated_usd,
+                        estimated: true,
+                    },
+                    true,
+                    true,
+                )?;
+                finish_embedding_publication(ledger, &original).map_err(pipeline_to_kio)?;
+                outcome.failed += 1;
+                continue;
+            }
+        };
+        stage_embedding_result(ledger, &original, &completed).map_err(pipeline_to_kio)?;
+        let staged_row = get_batch_request(ledger, &row.key)
+            .map_err(pipeline_to_kio)?
+            .ok_or_else(|| KioError::schema("staged batch result lost ledger row"))?;
+        let staged = embedding_job(ledger, &staged_row)
+            .map_err(pipeline_to_kio)?
+            .ok_or_else(|| KioError::schema("staged batch result lost binding"))?;
+        settle_batch_staged_job(ctx, ledger, &staged)?;
+        staged_jobs.push(staged);
+    }
+    for job in staged_jobs {
+        if job.binding.members[0].target.profile_hash() != profile.profile_hash {
+            continue;
+        }
+        let result = job
+            .known_result
+            .as_ref()
+            .ok_or_else(|| KioError::schema("staged batch publication lost result"))?;
+        if job.binding.members.iter().all(|member| {
+            matches!(
+                member.target,
+                kio_pipeline::task::EmbeddingTaskTarget::Image { .. }
+            )
+        }) {
+            let mut complete = true;
+            for member in &job.binding.members {
+                let kio_pipeline::task::EmbeddingTaskTarget::Image { image_hash, .. } =
+                    &member.target
+                else {
+                    unreachable!()
+                };
+                if !eligible_images.contains(image_hash) {
+                    complete = false;
+                    continue;
+                }
+                let (plan, _) = crate::embedding::input::prepare_owned_embedding_image(
+                    &repo.object_store(),
+                    image_hash,
+                    &profile,
+                )?;
+                if plan.target != member.target {
+                    complete = false;
+                    continue;
+                }
+                let Some(value) = result.members.iter().find(|value| value.id == member.id) else {
+                    return Err(KioError::schema(EMBEDDING_BATCH_RESULT_CONTRACT_ERROR));
+                };
+                match &value.result {
+                    EmbeddingMemberResult::Vector { .. } => {
+                        current_policy.revalidate().map_err(pipeline_to_kio)?;
+                        if !image_source_written {
+                            crate::search::projection::mark_replica_unavailable_or_log(
+                                ctx,
+                                repo.kio_dir(),
+                            );
+                        }
+                        if !crate::embedding::executor::publish_image_job_member(
+                            ctx, repo, &conn, &job, member, &plan,
+                        )? {
+                            complete = false;
+                            continue;
+                        }
+                        image_source_written = true;
+                        source_written = true;
+                        outcome.executed += 1;
+                        transitions.insert(member.target.output_ref(), embedding_done_transition());
+                    }
+                    EmbeddingMemberResult::Failed { reason } => {
+                        let kind = retry_kind_from_reason(Some(reason));
+                        transitions
+                            .insert(member.target.output_ref(), embedding_fail_transition(kind));
+                        count_embedding_failure(&mut outcome, kind, 1);
+                    }
+                }
+            }
+            if complete {
+                published_jobs.push(job);
+            }
+            continue;
+        }
+        for member in &result.members {
+            let Some(chunk) = by_embedding_hash.get(&member.id) else {
+                continue;
+            };
+            let members = chunks
+                .iter()
+                .filter(|candidate| {
+                    candidate.work_key.embedding_hash() == member.id
+                        && current_policy
+                            .allows_path(&candidate.raw_path)
+                            .unwrap_or(false)
+                })
+                .collect::<Vec<_>>();
+            let group = EmbeddingSendGroup {
+                embedding_hash: member.id.clone(),
+                representative: chunk,
+                members,
+            };
+            match &member.result {
+                EmbeddingMemberResult::Vector { vector } => {
+                    persist_group_vector(
+                        &conn,
+                        &profile,
+                        &group,
+                        vector,
+                        &held,
+                        &projection,
+                        &mut replica,
+                    )
+                    .map_err(|failure| {
+                        KioError::schema(format!(
+                            "staged embedding batch publication failed: {:?}",
+                            failure.retry_kind
+                        ))
+                    })?;
+                    source_written = true;
+                    outcome.executed += group.members.len();
+                    record_embedding_transitions(
+                        &mut transitions,
+                        group.members.iter().copied(),
+                        embedding_done_transition(),
+                    );
+                }
+                EmbeddingMemberResult::Failed { reason } => {
+                    let kind = retry_kind_from_reason(Some(reason));
+                    let failure = crate::markdownize::execution::TaskExecutionFailure {
+                        retry_kind: kind,
+                        retry_after_ms: None,
+                    };
+                    record_embedding_transitions(
+                        &mut transitions,
+                        group.members.iter().copied(),
+                        embedding_failure_transition(&failure),
+                    );
+                    count_embedding_failure(&mut outcome, kind, group.members.len());
+                }
+            }
+        }
+        published_jobs.push(job);
+    }
+    // A collected batch writes vectors straight into the LIVE index, and
+    // `run_batch` — unlike `run_index`/`run_reindex` — never rebuilds it
+    // afterward, so `index_generation` would otherwise still name the
+    // pre-embedding state. That retires every outstanding search cursor, which
+    // is what LC25 requires of any change that can make a replay rank
+    // differently. `publish_in_place_delta` owns both halves — it rotates and
+    // then stamps the replica with what the index now carries.
+    //
+    // Its empty-delta no-op replaces the former `outcome.executed > 0` test,
+    // and narrows it: a group whose every member is secrets-held writes a
+    // `content_vectors` row (so `executed` counts it) but links nothing into
+    // `chunk_vec`, and search reads `chunk_vec`. No replay can rank
+    // differently, so LC25 asks for no rotation — the old trigger retired
+    // cursors for a change no search could see.
+    current_policy.revalidate().map_err(pipeline_to_kio)?;
+    if image_source_written {
+        crate::index::chunk_ledger::rotate_index_generation_unconditionally(
+            repo.kio_dir(),
+            repo.control(),
+        )?;
+        write_through_projection_or_log_for_repo(ctx, repo);
+    } else {
+        publish_in_place_delta(ctx, repo.kio_dir(), replica_before.as_deref(), &replica)?;
+        if source_written && replica.is_empty() {
+            write_through_projection_or_log_for_repo(ctx, repo);
+        }
+    }
+    let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
+    outcome.failed_retryable += crate::embedding::executor::apply_embedding_transitions(
+        &task_store,
+        &transitions,
+        &ctx.control.now_utc_seconds(),
+        &BTreeMap::new(),
+    )?;
+    for job in published_jobs {
+        finish_embedding_publication(ledger, &job).map_err(pipeline_to_kio)?;
+    }
+    Ok(outcome)
+}
+
+/// Provider scope is the configured local identity, not a network lookup.
+/// Missing, unreadable, or changed authority never permits recovery effects.
+pub(crate) fn batch_provider_scope_matches(
+    stored: Option<&str>,
+    current: impl FnOnce() -> kio_adapter::Result<String>,
+) -> bool {
+    let Some(stored) = stored.filter(|scope| !scope.is_empty()) else {
+        return false;
+    };
+    current().is_ok_and(|current| current == stored)
+}
+
+/// Both collection and terminal cleanup use the same exact Gemini attribution.
+/// Collection additionally binds the active vector profile before any poll.
+pub(crate) fn poll_attributed_embedding_batch_job<
+    C: kio_adapter::gemini_batch_client::GeminiBatchClient + ?Sized,
+>(
+    ctx: &Invocation<'_>,
+    client: &C,
+    row: &BatchRequestRow,
+    required_profile: Option<&str>,
+) -> Option<kio_adapter::gemini_batch_client::GeminiBatchPoll> {
+    if required_profile.is_some_and(|profile| row.key.tool_profile_hash != profile)
+        || !batch_provider_scope_matches(row.provider_scope_id.as_deref(), || {
+            client.provider_scope_id()
+        })
+    {
+        ctx.interaction
+            .diagnostic("kio: holding embedding batch: provider scope or profile does not match");
+        return None;
+    }
+    let job_name = EmbeddingRemoteHandle(row.batch_job_id.as_deref()?.to_owned());
+    let intent_token = row.intent_token.as_deref()?;
+    let poll = match client.poll_job(&job_name) {
+        Ok(poll) => poll,
+        Err(error) => {
+            ctx.interaction.diagnostic(&format!(
+                "kio: holding {job_name}: poll unreadable: {error}"
+            ));
+            return None;
+        }
+    };
+    if poll.record.name != job_name
+        || poll.record.display_name
+            != kio_adapter::gemini_batch_client::batch_display_name(intent_token)
+    {
+        ctx.interaction.diagnostic(&format!(
+            "kio: holding {job_name}: returned job attribution does not match"
+        ));
+        return None;
+    }
+    Some(poll)
+}
+
+/// Finish only the narrow, no-residue cleanup case for an already-terminal
+/// Gemini embedding job. This never creates, cancels, or resubmits a job.
+pub(crate) fn recover_terminal_embedding_batch_cleanup<
+    C: kio_adapter::gemini_batch_client::GeminiBatchClient + ?Sized,
+>(
+    ctx: &Invocation<'_>,
+    ledger: &LedgerDb,
+    client: &C,
+    scope_id: &str,
+) -> Result<()> {
+    for row in kio_pipeline::ledger::ops::recovery_candidates(ledger).map_err(pipeline_to_kio)? {
+        if row.key.scope_id != scope_id
+            || row.key.adapter_kind != EMBEDDING_ADAPTER_KIND
+            || !row.state.is_terminal()
+        {
+            continue;
+        }
+        let Some(intent_token) = row.intent_token.as_deref() else {
+            continue;
+        };
+        let Some(poll) = poll_attributed_embedding_batch_job(ctx, client, &row, None) else {
+            continue;
+        };
+        let job = poll.record;
+        let job_name = &job.name;
+        if !job.state.is_terminal() || job.responses_file.is_some() {
+            ctx.interaction.diagnostic(&format!(
+                "kio: holding {job_name}: terminal cleanup attribution or output is not safe"
+            ));
+            continue;
+        }
+        recovery_finish_cleanup(ledger, &row.key, intent_token).map_err(pipeline_to_kio)?;
+    }
+    Ok(())
+}
+
+pub(crate) enum ImageBatchDispatch {
+    Sync(crate::embedding::image_input::PreparedEmbeddingImage),
+    Handled(ExecOutcome),
+}
+
+/// One image per call, with the same durable journal and collection protocol.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn submit_image_embedding_job(
+    ctx: &Invocation<'_>,
+    repo: &Repository,
+    ledger: &LedgerDb,
+    execution: EmbeddingExecution,
+    profile: &DeclaredEmbeddingProfile,
+    plan: &crate::embedding::input::ImageEmbeddingPlan,
+    prepared: crate::embedding::image_input::PreparedEmbeddingImage,
+    requires_secret: bool,
+    override_budget: bool,
+) -> Result<ImageBatchDispatch> {
+    use kio_pipeline::task::{EmbeddingTaskTarget, HoldReason, TaskStatus};
+    let EmbeddingTaskTarget::Image {
+        image_hash,
+        embedding_hash,
+        ..
+    } = &plan.target
+    else {
+        return Err(KioError::schema("image batch requires an image target"));
+    };
+    let scope_id = repo.scope_identity()?.scope_id;
+    let key = task_ledger_key(
+        &scope_id,
+        EMBEDDING_ADAPTER_KIND,
+        embedding_hash,
+        &profile.profile_hash,
+    );
+    if let Some(row) = get_batch_request(ledger, &key).map_err(pipeline_to_kio)? {
+        if row.state.is_inflight()
+            || embedding_job(ledger, &row)
+                .map_err(pipeline_to_kio)?
+                .is_some_and(|job| job.known_result.is_some())
+        {
+            return Ok(ImageBatchDispatch::Handled(ExecOutcome::default()));
+        }
+        if row.contract_violation_count >= EMBEDDING_BATCH_JOB_MAX_FAILURES {
+            return Ok(ImageBatchDispatch::Handled(ExecOutcome::default()));
+        }
+    }
+    // Existing in-flight/known jobs above remain collectible. A genuinely
+    // new image job shares the same scope-wide typed Batch breaker as text.
+    let contract_holds = kio_pipeline::ledger::ops::unreset_contract_violations_for_scope_adapter(
+        ledger,
+        &scope_id,
+        EMBEDDING_ADAPTER_KIND,
+    )
+    .map_err(pipeline_to_kio)?;
+    reject_embedding_batch_contract_holds(&scope_id, &contract_holds)?;
+    let policy = current_embedding_policy(repo)?;
+    admit_embedding_transport(
+        ctx.settings,
+        repo,
+        execution,
+        profile,
+        &policy,
+        requires_secret,
+    )?;
+    let Some(client) = kio_adapter::gemini_batch_client::resolve_gemini_batch_client_with_control(
+        ctx.settings,
+        || batch_recovery_context(ledger),
+        ctx.control,
+    )
+    .map_err(adapter_to_kio)?
+    else {
+        return Ok(ImageBatchDispatch::Sync(prepared));
+    };
+    let dimensions = u32::try_from(profile.dimensions)
+        .map_err(|_| KioError::schema("embedding dimensions exceed u32"))?;
+    let inputs = vec![kio_adapter::gemini_batch_client::GeminiBatchEmbedInput {
+        key: image_hash.clone(),
+        content: kio_adapter::types::EmbeddingContent::Image {
+            bytes: prepared.bytes,
+            mime: prepared.mime.to_owned(),
+        },
+    }];
+    let tasks = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
+    // Durable intent tokens are canonical 36-byte UUIDv7 strings; their JSON
+    // length is invariant. This preflight uses that exact-length shape before
+    // reserve; submit validates the actual display name through the same builder.
+    let preflight_name = kio_adapter::gemini_batch_client::batch_display_name(
+        "00000000-0000-7000-8000-000000000000",
+    );
+    if kio_adapter::gemini_batch_client::validate_gemini_batch_inputs(
+        kio_adapter::catalog::ADOPTED_EMBEDDING_MODEL_PIN,
+        dimensions,
+        &preflight_name,
+        &inputs,
+    )
+    .is_err()
+    {
+        tasks
+            .update_matching(|task| {
+                if task.embedding_target.as_ref() != Some(&plan.target) {
+                    return false;
+                }
+                task.status = TaskStatus::Failed;
+                task.fallback_reason = Some("invalid_input".to_owned());
+                task.hold_reason = None;
+                true
+            })
+            .map_err(pipeline_to_kio)?;
+        return Ok(ImageBatchDispatch::Handled(ExecOutcome::default()));
+    }
+    let budget = kio_pipeline::budget::read_budget_policy(
+        crate::settings::user_config_toml_path(ctx.control),
+        repo.kio_dir().join("config.toml"),
+    )
+    .map_err(pipeline_to_kio)?;
+    let caps = budget_cap_config(&budget, &scope_id, EMBEDDING_ADAPTER_KIND);
+    let candidate_usd = 8192.0
+        * crate::embedding::admission::embedding_image_usd_per_token(
+            ctx.settings,
+            PreferredRequestKind::Batch,
+        );
+    let binding = EmbeddingJobBinding {
+        logical_job_id: EmbeddingLogicalJobId(embedding_hash.clone()),
+        local: false,
+        dimensions,
+        distance: profile.distance.clone(),
+        modality: profile.modality.clone(),
+        members: vec![EmbeddingJobMember {
+            id: image_hash.clone(),
+            target: plan.target.clone(),
+        }],
+    };
+    let job = match reserve_embedding_job(
+        ledger,
+        &EmbeddingReserveRequest {
+            key: &key,
+            candidate_usd,
+            caps: &caps,
+            request_kind: RequestKind::Batch,
+            timeout_seconds: None,
+            bypass_cap_denial: override_budget || !budget.hard_stop,
+            binding: &binding,
+        },
+    )
+    .map_err(pipeline_to_kio)?
+    {
+        EmbeddingReservationOutcome::Reserved(job) => job,
+        EmbeddingReservationOutcome::KnownResult(_) | EmbeddingReservationOutcome::InFlight(_) => {
+            return Ok(ImageBatchDispatch::Handled(ExecOutcome::default()));
+        }
+        EmbeddingReservationOutcome::BudgetExceeded => {
+            tasks
+                .update_matching(|task| {
+                    if task.embedding_target.as_ref() != Some(&plan.target) {
+                        return false;
+                    }
+                    task.status = TaskStatus::Paused;
+                    task.fallback_reason = Some("budget_exceeded".to_owned());
+                    task.hold_reason = Some(HoldReason::Budget);
+                    true
+                })
+                .map_err(pipeline_to_kio)?;
+            return Ok(ImageBatchDispatch::Handled(ExecOutcome {
+                paused: 1,
+                ..ExecOutcome::default()
+            }));
+        }
+    };
+    let provider = client.provider_scope_id().map_err(adapter_to_kio)?;
+    if !phase2a_record_provider_scope(ledger, &key, &job.intent_token, &provider)
+        .map_err(pipeline_to_kio)?
+        || !phase2b_record_job_create_started(ledger, &key, &job.intent_token)
+            .map_err(pipeline_to_kio)?
+    {
+        return Ok(ImageBatchDispatch::Handled(ExecOutcome::default()));
+    }
+    // A policy change may block this still-unsent request; the durable intent
+    // remains available to the common recovery owner.
+    admit_embedding_transport(
+        ctx.settings,
+        repo,
+        execution,
+        profile,
+        &policy,
+        requires_secret,
+    )?;
+    let pending = match client.submit_job(
+        kio_adapter::catalog::ADOPTED_EMBEDDING_MODEL_PIN,
+        dimensions,
+        &kio_adapter::gemini_batch_client::batch_display_name(&job.intent_token),
+        &inputs,
+    ) {
+        Ok(pending) => pending,
+        Err(error) => {
+            let failure = task_failure_from_adapter(error);
+            tasks
+                .update_matching(|task| {
+                    if task.embedding_target.as_ref() != Some(&plan.target) {
+                        return false;
+                    }
+                    task.status = TaskStatus::Failed;
+                    task.attempts += 1;
+                    task.fallback_reason = Some(retry_reason(failure.retry_kind).to_owned());
+                    task.hold_reason = None;
+                    true
+                })
+                .map_err(pipeline_to_kio)?;
+            return Ok(ImageBatchDispatch::Handled(ExecOutcome::default()));
+        }
+    };
+    record_embedding_pending(ledger, &job, &pending).map_err(pipeline_to_kio)?;
+    Ok(ImageBatchDispatch::Handled(ExecOutcome::default()))
+}

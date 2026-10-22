@@ -7,7 +7,7 @@
 
 use super::*;
 use crate::egress::embedding_online_allowed;
-use crate::embedding::enrichment::run_historical_embedding_enrichment;
+use crate::embedding::executor::run_historical_embedding_enrichment;
 use crate::index::chunk_ledger::StoredChunk;
 use crate::index::chunk_ledger::append_stored_chunks;
 use crate::index::chunk_ledger::persist_chunk_object;

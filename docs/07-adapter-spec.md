@@ -8,7 +8,7 @@ Adapter (Prepare / Markdownize / Embedding / Rerank) の trait 契約 + 実行�
 
 # 1. 基本方針
 
-Prepare / Markdownize / Embedding / Rerank は Kio core に含めず、**Adapter に委譲** する。OCR は Markdownize Adapter の **内部能力 (capability)** として扱う。Embedding は Text / Image を分離せず、**単一マルチモーダル Embedding Adapter** に統合する。
+Prepare / Markdownize / Embedding / Rerank は Kio core に含めず、**Adapter に委譲** する。OCR は Markdownize Adapter の **内部能力 (capability)** として扱う。Embedding は Text / Image を分離せず、**一つの Embedding 契約** に統合する。画像 capability の有無は profile に宣言する。
 
 ```
 Kio core:                 Adapter:
@@ -60,7 +60,8 @@ Adapter は **提供主体ではなく実行形態と決定性** で分類する
 ```
 online_api               LLM 等のネットワーク越し API (frontier AI が中心)
                          明示的な network opt-in が必要
-offline_api              ローカル LLM / ローカル embedding server
+native_library           Kio 管理 worker 内の native library (ネットワーク不使用)
+offline_api              利用者管理のローカル LLM / embedding endpoint
                          loopback HTTP を使い得る。非決定的出力はあり得る
 deterministic_library    決定論的ライブラリ (PDF text extraction, parser)
                          同じ入力 + 同じ profile なら同じ出力
@@ -97,7 +98,7 @@ Kio は `deterministic_library` の Prepare / Markdownize Adapter を同梱す�
 > `tool_profile_hash`** に載せた (§9 / [03-data-model.md §5.1](03-data-model.md) — 既存
 > instance 内の prepared_hash drift ではなく新 identity としての基線再構築)。
 
-- online Adapter が未設定または network 未承認のとき、Markdownize タスクは同梱 deterministic Adapter で実行する (タスクを止めない)。Embedding タスクは生成しない (検索は text fallback、[05-runtime.md §1](05-runtime.md))
+- online Adapter が未設定または network 未承認のとき、Markdownize タスクは同梱 deterministic Adapter で実行する (タスクを止めない)。Embedding はモデル準備済みなら既定の EG2 を使い、未準備なら理由を表示して text fallback する ([05-runtime.md §1](05-runtime.md))
 - この状態を **ベースライン index** と呼ぶ。`init → index --yes → search → open <pointer>` の最低体験ライン ([01-positioning.md §3](01-positioning.md)) はベースライン index のみで成立しなければならない
 - online Adapter を承認した後の AI 強化は、別 `tool_profile_hash` の artifact として通常の Markdownize / Embedding タスクで生成する (identity 規約 [03-data-model.md §5](03-data-model.md) のとおり。ベースライン artifact とその Evidence Pointer は不変のまま残る)
 
@@ -146,100 +147,42 @@ query embedding も current exact paired grant を要求する。`--online` は 
 不一致、または policy 拒否を修復しない。
 
 `--offline` は当該 invocation の**全 HTTP dispatch**を禁止する。online provider だけでなく、
-認証済み loopback local Adapter、provider の poll、output download、upload cleanup も対象である。
+loopback local Adapter、provider の poll、output download、upload cleanup も対象である。
 未実行の task はこの invocation で送信せず、HTTP 回復も行わない。適用対象は index、batch
 resume/retry、reindex、repair rebuild-db、search、および HTTP Adapter を使い得る同等の経路である。
 
-**01-positioning.md との整合**: デフォルト同梱 Adapter は online_api (frontier AI) だが、
-paired grant が成立するまで送信は始まらない。
-"frontier AI default" は同梱・推奨構成を指し、"default: no network transmission" は
-opt-in 未成立状態の既定値を指す。両者は矛盾せず、明示承認フローが接続する。
+既定 local EG2 の準備は [10-operations.md §5.1](10-operations.md) に従う。HTTP Adapter は
+同梱されていても paired grant 成立前に内容を送信しない。FTS baseline はモデルや API key に依存しない。
 
-オンライン API Adapter を使う場合、ユーザーがどの scope / file / task を送信対象にしたかを
-記録する。オフライン API / 決定論的ライブラリの場合も `execution_mode` と `profile_hash` は
-記録する。
+## 3.1 ローカル窓の送信境界
 
-> **local HTTP Adapter の loopback 制限と paired grant (2026-09-08)**:
-> `execution_mode = "offline_api"` でも別 process への HTTP dispatch である。loopback
-> 制限は宛先制限であって consent/approval の免除ではない。local Adapter には current
-> scope/device paired network grant と device-local managed CA trust が必要である
-> ([14-v1-runtime-contracts.md](14-v1-runtime-contracts.md))。`--offline` はこの HTTP
-> dispatch も禁止する。
->
-> **(1) url は明示ポート付きの HTTPS loopback リテラルに限定する。**
->
-> - スキームは `https://` のみ。`http://`、`unix:`、スキームなしの形は受理しない
-> - ホストは `127.0.0.1` / `localhost` / `[::1]` との**完全一致**。判定はリテラル文字列に
->   対して行い、ホスト名解決の結果を見ない (DNS rebinding で loopback を名乗る外部ホストへ
->   送信させないため)。`localhost.evil.example` のような接尾辞付きは拒否する
-> - 0 以外の明示ポートが必須。userinfo (`@`) と query は拒否する。パスは任意
->
-> 違反は `KIO-E-LOCAL-PEER-URL-001` で拒否する。検証は `tools.toml` の検証時と
-> 実行直前の宣言再検査の両方で行う。
->
-> `kind = "offline_api"` が外部 URL を受理することはない。加えて、loopback endpoint
-> への本文送信は paired grant がなければ拒否する。scope config の一行だけ、device grant
-> だけ、または trust snapshot だけでは送信を許可しない。
->
-> **現行実装 (2026-08-02 更新)**: Embedding と Markdownize の**両方**で `url` が
-> 上記の条件下で**受理される** (Markdownize は 2026-08-02 に解禁。それ以前は
-> 一律 schema error だった)。**両者の `cmd` / `args` は引き続き一律 schema error**
-> 。
->
-> 緩和は **role 単位ではなく target 単位**である。`offline_api` を宣言できるのは
-> その kind を持つ tool_id だけで、cloud API の tool_id に `offline_api` を
-> 宣言することも、その逆も schema error になる。
->
-> ```toml
-> [embedding.qwen3_vl_embedding_local]
-> kind  = "offline_api"
-> url   = "https://127.0.0.1:8000"     # HTTPS loopback リテラルと明示ポート。末尾の /v1 は不要
-> model = "Qwen/Qwen3-VL-Embedding-2B" # 省略時はこの値
->
-> [markdown.paddleocr_vl_local]
-> kind  = "offline_api"
-> url   = "https://127.0.0.1:8080"     # 末尾の /layout-parsing は不要
-> model = "PaddleOCR-VL-0.9B"          # 接頭辞 `PaddleOCR-VL` で照合
-> ```
->
-> > **Markdownize の口は `POST {url}/layout-parsing` であって
-> > `/v1/chat/completions` ではない。** PaddleOCR-VL は 2 段構成で、
-> > OpenAI 互換の `genai_server` が提供するのは段 2 (VLM 認識) だけであり、
-> > bbox もレイアウトも読み順も返らない。上流も OpenAI クライアントでの
-> > 直接利用を明示的に非推奨としている。詳細は
-> > `tasks/local-adapter-plan.md` §11 の V2。
->
-> **secrets hold は offline_api にも適用する (2026-08-02 確定)。**
-> Tier A ([10 §1.1](10-operations.md)) として明示承認で取り込まれたファイルは、
-> `--send-secrets` が無い限り**ローカル Adapter にも渡さない**。paired network grant と
-> secret-send grant は別であり、secrets hold が問うているのは**中身が資格情報か**
-> であり、送り先のネットワーク上の位置ではない。ローカルモデルサーバは
-> 別プロセス (多くはコンテナ) であり、プロンプトをログに残しうる。
-> **誤る向きが非対称である**ことが決め手で、緩い側で誤れば資格情報が
-> モデルサーバのログに落ちるが、厳しい側で誤ってもユーザーがフラグを
-> 1 つ足すだけで済む。
->
-> **`tool_id` はテーブル名で表す。`[embedding]` の直下に `tool_id` は書けない**
-> (2026-07-28 訂正: 以前の例はそう書いていたが `KIO-E-CONFIG-SCHEMA-001` で
-> 弾かれる)。flat な `[embedding]` 形も使えるが、その形は tool_id を持てないため
-> **`kind` で target を解決する** — offline embedding 実装が 2 つ目になるまでは
-> 一意に定まる。
->
-> `auth` を省略しても paired grant は必要である。認証する local peer は、`adapter trust`
-> lifecycle が管理する CA snapshot だけを信頼する。legacy `ca_pem_path` は拒否する。Adapter
-> は `POST {url}/v1/embeddings` に §5.3 (2) の `messages` 形式で 1 item ずつ送る。
+Embedding、Markdownize OCR、Rerank のローカル窓は、`http://` または `https://` の
+loopback リテラルと 0 以外の明示ポートを要求する。host は `127.0.0.1`、`localhost`、`[::1]` とのリテラル完全一致とし、
+名前解決結果による許可、userinfo、query、redirect、proxy を許可しない。パスは許可する。
+違反は `KIO-E-LOCAL-PEER-URL-001`。設定検証と dispatch 直前に同じ条件を検査する。
+
+HTTP peer は認証されていないことを承認画面と status に表示する。HTTP でも scope/device の
+exact paired grant、secrets hold と必要な secret-send grant、`--offline` の禁止は変わらない。
+HTTPS では device-local の登録済み managed CA snapshot だけを信頼し、送信前に証明書の
+有効性と名前を検証する。CA の登録・回転・失効・status と snapshot の寿命は
+[14-v1-runtime-contracts.md](14-v1-runtime-contracts.md) の既存 trust 契約に従う。
+`ca_pem_path` による直接指定は拒否する。`auth` の省略も paired grant を免除しない。
+
+ローカル窓の接続先は device の tools 設定に置き、`cmd` / `args` は受理しない。
+Markdownize OCR は `POST {url}/layout-parsing` を使う。Embedding の wire は §5.3 に従う。
+EG2 はローカル窓ではなく native 実行であり、この HTTP/CA/送信 grant の対象外である。
 
 ---
 
 # 4. 共通メタデータ
 
-すべての Adapter は次を返す:
+すべての Adapter は次を返す。Embedding の outcome/usage は §5.3 の型付き契約を使う:
 
 ```
 AdapterProfile:
   adapter_kind          "prepare" | "markdownize" | "embedding" | ...
   adapter_id
-  execution_mode        "online_api" | "offline_api" | "deterministic_library"
+  execution_mode        "online_api" | "offline_api" | "native_library" | "deterministic_library"
   tool_profile_hash     計算規約は 03-data-model.md §5.1
   version
   capability_flags      ["ocr", "layout_detection", "incremental_update", ...]
@@ -277,7 +220,7 @@ AdapterRun:
                         usd = 有限・非負の実測額 (billable reject では provider が宣言する請求額を
                         これに充てる — §5.5 条件 6。第三の field は設けない)。billable_units =
                         **unique-kind の配列** `[{ kind, count }, ...]` (1 要素以上。kind = "pages" |
-                        "tokens_in" | "tokens_out" の閉 enum — 拡張は spec 改訂。count = 非負整数。
+                        "tokens_in" | "image_tokens_in" | "tokens_out" の閉 enum — 拡張は spec 改訂。count = 非負整数。
                         **kind の重複は課金 field の不良 (estimated 縮退 + warning —
                         [04-pipeline.md §5.4](04-pipeline.md))**。USD 換算は要素ごとの単価 × count の**合算** —
                         input/output token 両課金の provider を単一報告で表現する)。単価解決元 = tools.toml の
@@ -291,6 +234,12 @@ AdapterRun:
                         で必須** — 欠落・不正値は estimated 記帳へ縮退する ([04-pipeline.md §5.4](04-pipeline.md)
                         の記帳値事前検証と同一規範 — **応答の受否・outcome・violation 予算は変えない**)
 ```
+
+### レーン別の価格解決
+
+`tools.toml` の宣言単価は Standard 単価とする。Batch 対応 online Adapter の Batch 単価は
+その 0.5 倍、realtime は Standard とする。予約見積りと usage 精算は同じレーン・同じ価格解決を使い、
+Batch 単価を設定へ直接書いて二重に割り引かない。レーン選択は [03-data-model.md §11](03-data-model.md)。
 
 ---
 
@@ -524,343 +473,97 @@ Evidence Pointer のバイト位置は保存された bytes に対して定義�
 media 別の変換規約 (何を見出しにするか等) は Adapter 実装の裁量 (tool_profile_hash が識別する)。
 本節が固定するのは**バイト表現の規約のみ**である。
 
-## 5.3 Embedding (multimodal)
+## 5.3 Embedding
 
+text chunk、所有権を検証した image object、text query は同じ Adapter 契約を使う。
+対象選択・Task・論理 job・物理台帳・member 受入・再試行・公開は
+[04-pipeline.md §5](04-pipeline.md) の共通 runner が所有し、Adapter はそれらを分岐実装しない。
+audio/video、PDF の直接 embedding、画像ファイルを query にする入力は対象外である。
+
+```text
+request:  profile, input_type (markdown_chunk | image_object | query), members [{id, text | image_bytes, mime?}]
+outcome:  Completed { members: [{id, vector | failure_reason}], usage }
+        | Pending { remote_handle }
+usage:    Metered {usd | billable_units} | Estimated | Unmetered
 ```
-input_type:           "text" | "image" | "markdown_chunk" | "image_object" | "query"
-input:
-  items: [{ id, text|path, mime? }]
-output:
-  vectors: [{ id, vector }]
-  dimensions, distance, modality
-metadata:
-  adapter_id, model_family, version, embedding_profile_hash
-```
 
-**Embedding 応答の受入検査** (markdownize の V1〜V6 に相当する): (1) `vectors[].id` は入力 id 集合と**全単射** (欠落・過剰・重複は違反)、(2) `dimensions` は profile と一致し全 vector が同次元、(3) 全要素が**有限値** (NaN/Inf 拒否) かつ**非ゼロ vector**、(4) float32 への決定的変換と **L2 正規化は core 側で実施**する (Adapter の正規化有無に依存しない)。**変換・正規化後の最終 vector にも (3) と同じ有限・非ゼロ (かつ単位ノルム — 許容誤差内) を再検査する** (underflow の零 vector / overflow の Inf を index に入れない — 違反は同じ contract violation)、(5) 応答 metadata の `embedding_profile_hash`・`modality`・`distance` が期待 profile と一致する (同次元の別 vector space の混入を契約で拒否する — 不一致は同じ contract violation)。違反応答は全体 reject — contract violation として課金・再試行は §5.8 相 3 と同じ規則に従う ([04-pipeline.md §5.8](04-pipeline.md)。再試行分類は [04-pipeline.md §5.3](04-pipeline.md))。`failed_units` 相当の部分失敗 field を持たない **all-or-nothing 契約**である。
+ローカル実行は Completed のみを返し、remote handle や poll を捏造しない。
+共通 descriptor は modality/MIME、入力・encoded bytes 上限、completion 能力、価格・usage 単位、
+egress と paid authorization の要否を値で宣言する。native は bit 単位の OS 間決定性を約束しない。
 
-Batch 応答の契約違反には、本節の「契約違反後の新規 Batch 停止」を優先して適用する。
-共通の再試行予算が残っていても、未解除の違反がある scope / embedding adapter の新規 Batch は送信しない。
+### 入力構築
 
-Text Embedding Adapter / Image Embedding Adapter は**採用しない**。同一 Embedding Adapter が同一 profile で多モダリティを単一 vector space へ写像する。
+text の `chunk_filename_context_v1` は `{humanized filename}\n\n{chunk 本文}`。
+humanized filename は basename stem の `-`/`_` を空白へ、ASCII camelCase 境界を空白へ変換し、
+空白を畳み込む。英数字を含まない純記号名には prefix を付けない。
+認証済み chunk CAS 本文から NFC 正規化 → NUL 除去 → Markdown escape/entity 解決の順で
+検索用本文を作る。fenced block / inline code 内の escape は解決しない。FTS と同じ構築規則を使い、
+SQLite の本文を送信元の正本にしない。query は filename を持たない。
+context identity と reuse は [03-data-model.md §8.1](03-data-model.md) に従う。
 
-> **実地検証済み — 単一 multimodal profile を採用 (2026-07-03 再検証で確定)**: 初回調査は「Gemini Embedding 2 multimodal は preview で pin 不可」を根拠に text-only 緩和を適用したが、事実誤認 (`gemini-embedding-2` は 2026-04-22 に GA、pinned stable 版あり) が判明し**撤回**。再検証 (`tasks/step3-embedding-verify.md` の再検証節) により本節冒頭の本来の契約どおり **単一マルチモーダル Embedding Adapter** を採用する。確定 profile: **`gemini-embedding-2` (GA 版を Adapter が起動時解決して pin、§6) / 768 次元 (MRL 切り詰め — 切り詰め後次元も profile に固定) / cosine / `modality="multimodal"` / `mode="online"`** (Vertex はバッチ推論非対応のため sync 呼出 — client 側の並列は**タスク間** (別 batch_requests 行) で行い、単一タスク内の複数 request は直列 ([04-pipeline.md §5.4](04-pipeline.md) の縮退 2 相)。429 は rate_limit 分類で backoff — §5.5)。current enrichment は text chunk と chunk から参照される image object を同じ vector space に埋め込む。audio は現在の入力種別に含めない。text 品質は MTEB で前世代 text 専用モデルを上回り日本語も同格 (再検証節)。コスト: 10 万 chunk 初回 ≈ $10 (単月 budget 内)。**非 multimodal の embedding profile (`modality="text"` 等、別ベクトル空間への埋め込み) は採用不可** — tool-lock materialize / adapter 登録時に `KIO-E-EMBED-MODALITY-001` (exit 2) で拒否する ([03-data-model.md §7](03-data-model.md))。
+画像は PNG/JPEG の元 CAS bytes と MIME を保つ。GIF/WebP は固定変換 `kio_image_png_v1` を使う。
+frame 0 を full logical canvas に合成した透明 RGBA8 straight alpha とし、透明 pixel の RGB は 0、
+resize/crop なし、WebP EXIF orientation 適用、ICC/gamma 色変換なしの PNG とする。
+出力に可変 metadata/timestamp を含めず、固定 codec pin の同一入力は 3 OS で同じ SHA-256 を持つ。
+元 CAS、image target、Evidence Pointer は差し替えない。receipt と入力 identity は
+[03-data-model.md §8.1](03-data-model.md)、保護上限は
+[14-v1-runtime-contracts.md](14-v1-runtime-contracts.md) の画像契約に従う。
+MIME magic と宣言 MIME、bounded decode、元 hash、typed ownership を予約・dispatch 前に検証する。
+GIF の変換は animation 全体の取り込み検証を迂回しない。独立 GIF の新規 ingest は追加しない。
 
-> **訂正 — Embedding にも Batch レーンがある (2026-07-24)**: 直前の段落が採用理由に挙げる
-> 「Vertex はバッチ推論非対応のため sync 呼出」は、**根拠と実装先が食い違っていた**。
-> 実装のエンドポイントは Vertex AI ではなく **Gemini Developer API**
-> (`https://generativelanguage.googleapis.com/v1beta`) であり、そちらは
-> **embedding の Batch を提供している** ([Batch API](https://ai.google.dev/api/batch-api) /
-> [発表](https://developers.googleblog.com/en/gemini-batch-api-now-supports-embeddings-and-openai-compatibility/))。
-> Vertex AI Batch Prediction が `gemini-embedding-001` を除外している事実と混線したものである。
-> 単価は **標準 $0.20 / 1M tokens・Batch $0.10 / 1M tokens (50% off)** (text、`gemini-embedding-2`)。
->
-> したがって Embedding Adapter も **`preferred_request_kind` を持つ** (§5.5 のレーン選択子を
-> `MarkdownizeAdapter` 専用にしない)。Embedding の Batch レーンは次の形をとる。
->
-> - 投入: `POST {base}/v1beta/models/{model}:asyncBatchEmbedContent`。
->   入力は **inline** (`batch.inputConfig.requests.requests[]`、各要素が `request` (EmbedContentRequest) +
->   `metadata`) を用い、**File API へのアップロードは行わない**。
-> - **したがって相 2a (upload) が存在しない。** `upload_id` は恒久 NULL、`provider_scope_id` は
->   **job 作成の直前**に記録する (相 2a 着手の印としての意味を job 作成が引き継ぐ)。
->   upload 残骸が原理的に生じないため、[10-operations.md §7.5.2](10-operations.md) の
->   upload 照合・orphan 掃除は embedding 行に適用しない (`list_uploads` / `delete_upload` は
->   embedding の Batch trait に含めない)。相 1 / 相 2b / 相 3 と
->   [04-pipeline.md §5.8](04-pipeline.md) の状態機械はそのまま適用する。
-> - 照会: `GET {base}/v1beta/{name=batches/*}`。state は
->   `BATCH_STATE_PENDING | RUNNING | SUCCEEDED | FAILED | CANCELLED | EXPIRED`。
-> - 回収: `inlinedResponses[]` の `output.response.embedding.values` を `metadata` で入力へ対応づける。
->   受入検査は本節の (1)〜(5) をそのまま適用する (id 全単射・次元・有限非ゼロ・正規化後再検査・profile 一致)。
-> - inline の上限 (20 MB) に収まるよう、1 job あたりの request 数を実装側で有界にする。
-> - **task 単位 = job (2026-07-25 確定)**: §5.5 の v1 契約「1 job = 1 task」を embedding でも
->   保つため、**job そのものを 1 task として台帳に載せる**。`batch_requests.input_hash` は
->   当該 job のメンバ (= 各 group の `embedding_hash`) を整列・連結した digest とする。
->   embedding の自然な task 粒度は重複排除 group であり実規模で数千個 (dogfood fixture で
->   2,321) になるため、group 単位で job を作ると provider job が数千個になる。job 単位に
->   することで §5.8 の状態機械・crash 回復・`kio batch abandon` が無改造で適用できる。
->   同じメンバ集合を選び直した再実行は同じ task キーに落ち (= 宙に浮いた予約を再利用し
->   二重予約しない)、別の集合は別 task となる。先行 job が埋め込み済みのメンバは
->   content-addressed reuse で選択前に脱落するため無駄な再送は生じない。
-> - **終端で `intent_token` を NULL 化する。** §5.8 の「NULL 化は残骸掃除の完了時のみ」は
->   upload 残骸を持つ OCR レーンの規則であり、inline の embedding レーンは残骸を作らない
->   ので**終端 = 掃除完了**である (§5.4 が sync 行に与える規則と同じ理由)。NULL 化しないと
->   「旧 token の消し込み完了後にのみ再投入可」と衝突し、同一 task キーの再投入が恒久停止する。
-> - **レーンが使えない場合は sync へ落とす。** batch client を解決できない実行では、
->   `markdownize_send_lane` の `(batch client 無し, 開いた行無し) → Sync` と同じ規則で
->   同期レーンへフォールバックする (単価は sync の 2 倍で記帳する)。仕事を永久に pending の
->   まま残すより安全側。レーン可用性の判定は**認証不備の報告経路にしない** — 資格情報の
->   解決失敗は送信経路が R13-2(e) で報告する。
-> - **課金報告**: `:asyncBatchEmbedContent` の応答もトークン数を返さないため `usage` は
->   引き続き `None` に degrade する。**単価はレーンに依存する** ため、見積り (= 確定記帳)
->   はレーンを見て $0.10 / $0.20 を選ぶこと。実装が単価を定数で持つのは誤りで、
->   `tools.toml` の `[embedding.*.pricing] tokens_in` を正本とする (§4 の billable_units 換算と同じ扱い)。
->
->   **宣言値の解釈 (2026-07-25 R24 で確定)**: `[pricing]` のキーは
->   `pages` / `tokens_in` / `tokens_out` の閉じた enum であり (`PRICING_KIND_ENUM`)、
->   **レーンの次元を持たない**。したがって 1 つの宣言で両レーンの単価を書き分けることは
->   できない。宣言された `tokens_in` は **標準 (sync) 単価**と解釈し、**Batch レーンは
->   その 0.5 倍**として導出する。宣言が無い場合のみ既定値 ($0.20 / 1M) に落ちる。
->
->   > R24 で 3 系統が fatal として指摘した実装欠陥: 宣言値をレーン判定より**前に**
->   > return していたため、`tools.toml` に `tokens_in` を書いた瞬間に両レーンが同額に
->   > 潰れていた。`usage: None` により見積り = 確定記帳なので、Batch ジョブが実額の
->   > 2 倍で記帳され、budget cap が守る金額が倍速で消費される状態だった。
->
-> - **失敗ジョブの再投入は有界にする (2026-07-25 R24 で確定)**: 非成功終端は行を settle し
->   `intent_token` を NULL 化する。一方 §5.8 相 1 の `ON CONFLICT` は `batch_job_id` を
->   NULL に戻すため、**同じ task キーが即座に再予約・再投入できてしまう**。`usage: None` で
->   見積りがそのまま確定記帳になる以上、これは「成果ゼロの記帳が pass ごとに増え続ける」
->   ことを意味する。`batch_requests.attempts` は当該 `ON CONFLICT` の SET 対象外＝
->   **再予約をまたいで保存される**ので、これを上限 (既定 3) と突き合わせて打ち切る。
->
-> - **回復走査の対象に含める (2026-07-25 G1 で確定)**: embedding の Batch client も
->   [10-operations.md §7.5.2](10-operations.md) の provider inventory に**必ず載せる**。
->   相 2b 開始済み・job 作成前で中断した行は `batch_poll_candidates` の対象外
->   (`batch_job_id` が無い) なので、**回復は `kio ledger reconcile` だけが担う**。
->   inventory に載っていないと `unlistable` のまま恒久的に宙吊りとなり、予約が
->   device budget cap を食い続ける。attribution は **job の `displayName` に埋めた
->   intent_token** で行う (Gemini の job は task key 4 組を運べる metadata を持たない)。
->   §5.8 の回復方向は intent_token 一致で成立するので、これで足りる。
->   逆方向 (provider 側 job の orphan 判定) で帰属できない job は upload と同じく
->   `unknown` として**報告のみ**とする。upload は inline のため常に空である。
->
-> - **provider エラーは分類して保持する (2026-07-25 G2 で確定)**: 送信・照会の
->   provider エラーで**実行全体を落としてはならない**。§5.8 の unknown 規則
->   (「何も変更せず保持し、次回再試行する」) を OCR レーンと同じく適用する。
->   - 送信 (`provider_scope_id` / job 作成) の失敗は**その job だけ**を諦め、
->     同じ pass の他の job は続行する。分類は同期レーンと同一 (rate_limit は
->     `Pending + next_retry_at`、auth_error は `Paused(hold_reason=auth)`、他は Failed)。
->     予約は保持し、回収は上記の回復走査に委ねる (F8 の reserve-before-send 姿勢)。
->   - 照会 (`get_job` / 結果取得) の失敗は**その行だけ**を in-flight のまま保持し、
->     次の行の処理を続ける。1 行の不達が同一 scope の残り全部の回収を止めてはならない。
->   - ネットワークエラーを `KIO-E-CONFIG-SCHEMA-001` のような恒久エラーとして
->     報告しない。
->
-> - **回収は入力との全単射を検査する (2026-07-25 R24 で確定)**: 本節 (1) の全単射契約は
->   collect 側にも適用する。task キーが**メンバ集合の digest** である (上記「task 単位 = job」)
->   ことを利用し、**回収できた結果から digest を再計算して行の `input_hash` と突き合わせる**。
->   canonical な全 id が一意で、完全な集合の digest が一致することを、最初の CAS / DB 書込みより
->   前に検証する。現在の profile に属する応答は全 vector の受入検査・正規化も先に完了する。
->   不一致・欠落・余分・重複・不正 vector は、応答全体を `Outcome::ContractViolation` /
->   `BatchState::Terminal` として保守的な予約見積りで精算する。部分保存しない。
-> - **契約違反後の新規 Batch 停止**: 同じ scope / embedding adapter に、未 reset の
->   typed contract violation が一件でもあれば、新しい Batch 予約・送信を停止する。
->   判定は terminal 行の `contract_violation_count > 0` と、その完全な task key / 現在の
->   `submission_seq` に一致する cost ledger の outcome に基づく。自由文の error は判定に使わない。
->   新しいメンバ集合・profile へ組み直しても解除しない。digest だけから不正応答の元メンバを
->   推測しないための scope 単位の停止規則であり、既に送信した job の照会・精算は継続できる。
->   明示した sync レーンにはこの Batch 停止を適用せず、その承認・予算・再試行規則を適用する。
->   `KIO-E-EMBED-BATCH-CONTRACT-HOLD-001`（exit 4）は対象 attempt と完全な selector を示す。
->   原因確認後の `kio batch retry --reset-violations <selector> --yes` で該当 count を解除する。
->   過去の cost ledger は削除しない。通常の provider 失敗・期限切れはこの停止条件に含めない。
->
-> - **実物の wire 形 (2026-07-25 実 API 実行で確定)**: 上の「照会」「回収」の記述は
->   公式リファレンスの語彙に沿ったもので、**実際の応答とは 3 点ずれていた**。実行時に
->   採取した応答を正本とし、次を契約とする (`gemini_batch_client.rs` の `real_*` テストが
->   採取した応答そのものを固定している)。
->
->   1. **すべて long-running-operation の封筒である。** job レコードは最上位ではなく
->      `metadata` の下にある (`metadata.state` / `metadata.displayName` / `metadata.name`)。
->      完了後は `response` にも出力の複製が現れるが、こちらは `state` も `name` も持たない。
->   2. **一覧は `operations` キーで返る** (`batches` ではない)。`batches` だけを読むと
->      **常に空ページ**になり、回復走査は「回収すべき job は無い」と解釈して**黙って**
->      何もしない (§7.5.2 の inventory が恒久に空になる)。
->   3. **結果配列はキー名より 1 段深い。** `inlinedResponses` は出力先オブジェクトの名で、
->      その中の `inlinedResponses` が配列である
->      (`metadata.output.inlinedResponses.inlinedResponses[]` および
->      `response.inlinedResponses.inlinedResponses[]`)。各要素は
->      `{ response: { embedding: { values }, usageMetadata }, metadata: { key } }` で、
->      `output` でのラップは**無い**。
->
->   > 実装欠陥として観測された帰結: 2 と 3 により、**実 job は 1 件も回収できない**。
->   > 3 は `fetch_inlined_results` を contract violation にし、照会側の G2 規則
->   > (「その行だけ in-flight のまま保持」) がそれを飲み込むため、**終端した job が
->   > 診断なしで永久に in-flight のまま滞留する**。契約テストは全て通っていた —
->   > モック seam が `{"inlinedResponses": [...]}` という**実 API が返さない最内側の形**を
->   > パーサへ直接与えていたためである。**モックは provider と同じ封筒を通すこと**
->   > (seam が wire から乖離した瞬間、その経路のテストは何も保証しなくなる)。
->
-> - **応答はトークン数を返す (2026-07-25 実 API 実行で訂正・同日実装)**: 下の「課金報告」は
->   `usage` を `None` に degrade すると述べているが、**両レーンとも事実に反する**。
->   Batch は各結果行に `response.usageMetadata.promptTokenCount` を持ち、同期の
->   `:batchEmbedContents` は**呼び出し単位の合計**として同じフィールドを返す。
->   同期側の旧コメント「per-request のトークン数が無い」は字義どおり正しいが、
->   **課金の粒度は呼び出し単位**なので「自己申告する信号が無い」という結論が誤りだった。
->
->   したがって embedding は**両レーンとも実測トークンで確定記帳する**。ただし次の 3 つは
->   保守側 (予約見積り) を維持する — いずれも**過少記帳**になる経路だからである:
->   (a) 全単射が不成立の回収 (欠けた結果のトークン合計は本来の請求を下回る)、
->   (b) usage 報告が無い応答 (0 と解釈すると $0 で確定し、cap が既発生の支出を解放する)、
->   (c) 一部の行にしか報告が無い場合 (部分合計は静かに過少になる — all-or-nothing で退避)。
->
->   **予約見積りは保守側ではない (2026-07-25 実測)**: 33 実ジョブで突き合わせた
->   `estimate_embedding_tokens` の誤差は **-32% 〜 +52%**、**8/33 (24%) が過少**だった。
->   確定記帳は実測へ移ったが、**budget cap の事前判定は依然この見積りを使う**ため、
->   過少なジョブは cap を素通りしうる。
->
-> - **単価はレーンで割る — 宣言値は標準 (sync) 単価 (2026-07-25 統一)**: 確定記帳の経路には
->   レーン概念が無く、両 settle site が `registered_declared_pricing` を**生で**読んでいた。
->   markdownize でそれが正しく見えていたのは宣言値がたまたま Batch 単価だったためで、
->   その結果 **`--realtime` の OCR は実額の半分で記帳されていた**。過少記帳は budget cap が
->   構造的に防げない方向 (cap は小さい方の数字しか見ない) なので、`lane_adjusted_pricing`
->   を単一の適用点とし、**全 role で「宣言値 = 標準単価、Batch = 0.5 倍」に統一**する。
->   `tools.toml` の `[markdown.*.pricing] pages` は $4 / 1,000 pages (= 0.004) を宣言すること。
->   予約と確定は**同じ単価解決を通す** — 別々の源から引くと両者が乖離する。
->
-> **レーンは invocation 単位で 1 つ (2026-07-24 ユーザー裁定)**: OCR と embedding を
-> **別レーンに分けない** — 1 回の実行では**両方 Batch か、両方即時か**のいずれかである。
-> したがってレーン選択は adapter ごとの `preferred_request_kind()` を既定値としつつ、
-> **実行時に CLI 引数が両方まとめて上書きする**。
->
-> - 既定 = **Batch** (OCR $2/1,000 pages・embedding $0.10/1M tokens。turnaround は最大 24h)。
-> - `kio index --realtime` / `kio batch resume --realtime` / `kio batch retry --realtime` =
->   **両方を即時レーンへ倒す** (OCR $4/1,000 pages・embedding $0.20/1M tokens = いずれも 2 倍)。
-> - **これは 2026-07-23 の「OCR 課金は Batch レーンのみ・sync を本番送信に使わない」裁定を
->   明示的に上書きする。** 即時性が要る実行では倍額を承知で sync レーンを使う、が新しい規範。
->   ただし**既定では従来どおり Batch のみ**であり、倍額は明示 opt-in でしか発生しない。
-> - `--realtime` は `--online` とは**別の軸**である: `--online` は「送ってよいか」
->   (network opt-in、§3)、`--realtime` は「いつ返ってくるか」(turnaround)。
->   API 経由である以上 online は前提なので、即時性の指定に `--online` を流用しない。
-> - **飛行中の batch 行は `--realtime` で乗り換えない** — 既に provider job を持つ
->   `request_kind='batch'` 行を sync へ移すと、その job が [04-pipeline.md §5.8](04-pipeline.md)
->   の回復から外れて残骸化する。`--realtime` が効くのは**新規送信のレーン選択のみ**。
-> - 例外 = **query embedding は常に即時**。検索は batch の turnaround を待てないため、
->   `kio search` の query 埋め込みはレーン裁定の対象外で、常に sync 単価で記帳する。
+### Gemini
 
-embedding の SQLite schema (`embeddings` / `chunk_vec`) の正本は [04-pipeline.md §4.3](04-pipeline.md)
-とする (本節は profile — モデル / 次元 / 距離 / modality — の正本。SQL 定義の重複記載は 2026-07-14 に
-解消し、本節から参照する)。
+| 項目 | 契約 |
+| --- | --- |
+| model / 出力 | `models/gemini-embedding-2` / 768 次元 / cosine / multimodal |
+| text | 現行 filename context・query 入力・profile hash を維持。taskType/title/retrieval prefix を追加しない |
+| image | 1 member = 1 image、`content.parts[].inlineData {mimeType,data}`。text と image を一つの member に混ぜない |
+| sync | `POST /v1beta/models/gemini-embedding-2:batchEmbedContents`、`requests[]` の model/content/`embedContentConfig.outputDimensionality=768` |
+| Batch | `:asyncBatchEmbedContent`、`batch {model,displayName,inputConfig:{requests:{requests:[{request,metadata:{key}}]}}}`。displayName に intent attribution、key に member 対応を固定 |
+| 回収 | long-running operation の metadata/state、一覧の operations、`metadata.output.inlinedResponses.inlinedResponses[]` または `response.inlinedResponses.inlinedResponses[]` の metadata/key と response を検証。sync は入力順との対応を検証 |
+| 上限 | 全 modality 合計 8,192 tokens/member。PNG/JPEG。sync/Batch の encoded body は base64/JSON 込み 16 MiB 以下（Kio の保守上限） |
+| 分割・失敗 | job を bytes/member 上限の双方で分割。単体超過は理由付き Failed。自動 truncation、Files API、黙った resize、有料レーン変更による救済なし |
+| 単価 USD/1M | Standard: text 0.20 / image 0.45、Batch: text 0.10 / image 0.225。単位は tokens_in / image_tokens_in |
+| 予約 | member ごとに 8,192 × 当該 modality の token 単価を合算。image は Standard $0.0036864 / Batch $0.0018432 を予約。実際の画像 token 数を固定する意味ではない |
+| usage | promptTokenDetails の TEXT/IMAGE を対応単位へ写像。total 整合、非負、未知/重複 modality、予約上界を検査。sync は call 合計、Batch は各 member の usage を扱うため text/image は別 job |
 
-sqlite-vec の制約で vector table を物理分割してもよいが、概念上は単一の Embedding Adapter / 単一の `profile_hash`。profile が一致しない場合、Kio は vector 検索を強行せず再生成または text fallback。
+usage 欠落・不正・不完全な回収は予約額による Estimated 精算とし、請求一致とは表現しない。
+sync 失敗を無料と推測しない。価格は意味的 profile の対象外。request body、画像 bytes、key はログへ出さない。
+Batch の停止条件・明示解除と bounded attempt の正本は [04-pipeline.md §5.8](04-pipeline.md) に従う。
 
-> **実装フィードバック — chunk 埋め込みの contextual 化 (2026-07-24)**: MVP の実データ
-> ベースライン評価 (09 §4.1) で、vector レーンが「本文 1〜2 文＋定型 filler」の実機規模
-> (人格あたり 50 ファイル) で薄い解答本文を浮上させられず、`Kio ≥ 0.8` 腕が未達だった。
-> **ファイル名はユーザーが付けた意図信号**であるため、chunk の埋め込み**入力**を
-> `{humanized filename}\n\n{chunk 本文}` とする (contextual retrieval)。`humanized filename`
-> は basename stem の決定的変換 (`-`/`_`→空白、ASCII camelCase 境界→空白、空白畳み込み。
-> 英数字を含まない純記号名は変換不能として prefix なし)。凍結 24 問での事前計測: vector 単独
-> file-level Recall@10 が **14/24 → 23/24**。query 側は従来どおり素の埋め込み (ファイル名を
-> 持たない)。
->
-> - **同一性**: chunk ベクトルは `(text_hash, context, profile)` の関数になるため、
->   content-addressed identity (`embedding_hash`) に `context` を畳み込む (`None` = 従来と
->   バイト同一のハッシュ)。異なるファイル名の同一本文が同じ `id` に衝突して 1 ベクトルを
->   共有する事故を防ぐ。
-> - **profile**: 本節の profile が `input_construction = "chunk_filename_context_v1"` を宣言する
->   (04 §4.1 の識別フィールド許可リストに追加、embedding 専用で他 profile のハッシュ不変)。
->   これにより (a) 03 §7 の互換ゲートが非 contextual な旧ベクトル空間を **incompatible** と
->   正しく判定し、(b) profile hash 変化が全 chunk の再埋め込みを再起動する。
-> - **本文の構築**: 認証済み chunk CAS の本文から、NFC 正規化 → NUL 除去 → Markdown の
->   escape / entity 解決の順で検索用本文を導出し、上記 filename prefix と結合する。
->   fenced block / inline code 内の escape は解決しない。FTS と embedding は同じ純粋関数を使い、
->   SQLite の `chunks.text` を送信本文の正本として読まない。`text_hash` は変換前の認証済み
->   本文に対する hash のままとする。この構築規則を変更するときは `input_construction` を更新し、
->   同じ profile / embedding identity に異なる入力を混在させない。
-> - **content dedup の縮退**: cross-file の content-twin 再利用 (CT3-EMBED-006 / R19-4) は
->   同一 `(text_hash, context)` = 実質同一ファイル名に縮退する。これは意図した挙動 (contextual
->   ベクトルはファイルごとに異なるべき)。twin 収束の自己修復経路自体はコード上は健在
->   (同一 context の twin で発火)。
-> - **rebuild/snapshot**: 一つの `text_hash` が複数の filename context を持ち得る。
->   保存済み embedding を全 context について再構築し、現行 policy が許可する HEAD の名前を優先して
->   scalar 検索 vector を決定する。詳細は [04 §4.3](04-pipeline.md) の選択規則に従う。
->   候補が一つでも context 不一致を受理せず、応答順序による上書きで選択しない。
->
-> **ローカル multimodal embedding の identity 規約 (2026-07-26 確定)**:
-> `execution_mode = "offline_api"` の Embedding Adapter (ローカル embedding server) を
-> 導入するための規約。**3 項目とも「同一 profile_hash を名乗る 2 つのベクトル空間」を
-> 生まないための規範**である — [03-data-model.md §7](03-data-model.md) の互換ゲートが
-> 見るのは次元 / distance / modality / `profile_hash` の 4 つだけなので、
-> 同じ profile を名乗る限り**空間の分裂を原理的に検知できない**。しかも embedding は
-> content-addressed identity を持ち first-instance-wins で永続化されるため、
-> 誤った空間のベクトルは**恒久的に凍結される**。事後検知に頼らず構成段階で塞ぐ。
->
-> **(1) chat template と instruction を `prompt_template_hash` へ畳み込む。**
-> ローカルの multimodal embedding は chat template でラップされて初めてトークン列が
-> 決まり、タスク別 instruction (例: `"Represent the user's input."`) の有無・文面が
-> 出力ベクトルを変える。**同じ重みでも template が違えば別のベクトル空間である。**
-> [03-data-model.md §5.1](03-data-model.md) の `prompt_template_id` /
-> `prompt_template_hash` に固定する (どちらも既存の hash 入力フィールドであり、
-> 現行の cloud embedding profile では未設定のまま — ローカル profile で初めて埋まる)。
->
-> **結合規則を固定する** — 区切り文字連結は実装差を生むため、次の 2 key object を
-> JCS した byte 列の sha256 を `prompt_template_hash` とする
-> (§5.2 の `bbox_annotation` が `sha256(JCS(json_schema))` を採るのと同型 —
-> このフィールドは artifact 種別ごとに異なる canonicalization を既に許容している)。
->
-> ```json
-> { "chat_template": "<template 本文>", "instruction": "<instruction 本文>" }
-> ```
->
-> 各値は [03-data-model.md §5.1](03-data-model.md) の `prompt_template_hash` 前処理
-> (行末空白除去 → 改行正規化 → NFC → 末尾空行削除) を**適用してから** object に入れる。
-> instruction を使わない構成では `"instruction": ""` を明示する (key の省略と空文字を
-> 識別しない — 同節の null 規約と同じ姿勢)。
->
-> > **実測による裁定 (2026-07-27・V4)** — Qwen3-VL-Embedding-2B は
-> > **`instruction: ""` を採る**。`prompt_template_hash` は
-> > `sha256:7b7f4722…9e8b`、`tool_profile_hash` は `sha256:f9f610bb…439a`
-> > (`dimensions` は V3 決着まで暫定 — [eval/v4/results/](../eval/v4/results/README.md))。
-> >
-> > 本節が instruction の例に挙げた `"Represent the user's input."` は、実測の結果
-> > **モデルの chat template が system message 不在時に注入する
-> > `default_system_message`** だと判明した。つまりこの文字列は **T の一部であり、
-> > 既に hash 入力に入っている**。Kio は system message を送らない (テキスト・画像とも
-> > `messages: [{"role": "user", ...}]` の 1 通) ので、Kio が供給する instruction は
-> > 無く、上段が「`""` を明示する」と規定している当のケースに該当する。
-> >
-> > 非空を採っても**ベクトルは完全に同一**である (template が同じ文字列を注入するため)。
-> > 違うのは identity だけで、非空は 1 つの事実を T と instruction の 2 か所に記録し、
-> > かつ後から読む者に「Kio がこの instruction を選んだ」と誤読させる。実際には
-> > モデル側の既定を観測しただけである。
-> >
-> > **本項 (1) の規範自体は反証されていない。** 同じ probe で instruction の文面だけを
-> > 非既定に変えると cos は 0.7989 まで落ちる — instruction は実際にベクトルを動かす。
-> >
-> > **したがって「system message を送らない」は実装への拘束である。** 送るようにするなら
-> > その文面が `instruction` であり、`prompt_template_hash` を計算し直さねばならない。
-> > 送りながら `""` を記録すると、profile が実際のトークン列を偽ることになる —
-> > 本節冒頭が塞ごうとしている失敗そのもの。
->
-> **(2) wire 形式を `messages` に一本化する。**
-> ローカル embedding server の OpenAI 互換エンドポイントは、テキストを
-> `input: ["text"]` で受ける一方、**マルチモーダル入力には chat 形式の `messages` を
-> 要求する**。`messages` は chat template でラップされるため、**同じモデル・同じ文字列でも
-> `input` 経由と `messages` 経由ではトークン列が異なりベクトルが異なる。**
->
-> テキストチャンクを `input` で埋め込み、後から画像を `messages` で追加すると、
-> 同一 profile を名乗ったまま実質 2 空間に分裂する。したがって
-> **テキストのみのチャンクでも常に `messages` 形式を使う。** 代償は 1 リクエスト
-> 1 アイテム (バッチ不可) だが、Kio の送信は既に重複排除 group ごとに 1 コールであり、
-> ローカルサーバ側の continuous batching が吸収する。
->
-> > **実測による確認 (2026-07-27・V4)** — Qwen3-VL-Embedding-2B / vLLM 0.26.0 で
-> > `cos(input[] 経由, messages 経由)` = **0.4740**。同じ probe の
-> > `cos(無関係な 2 文, ともに messages 経由)` = **0.5966** なので、
-> > **同一文字列を 2 つの wire 形式で通すほうが、文章の内容を丸ごと差し替えるより
-> > 遠い**。本項が払うバッチ不可のコストは実際に空間の分裂を防いでいる。
-> > (両者は `messages` 経由の同一ベクトルを共通項に持つので比較は成立する。)
-> >
-> > エンドポイント形状も確定した — vLLM 0.26.0 では `/v1/embeddings` が
-> > `messages` をそのまま受け、`/pooling` への fallback は要らなかった。
-> > 測定の全文は [eval/v4/results/](../eval/v4/results/README.md)。
->
-> **(3) serving backend は identity に含めない。**
-> [03-data-model.md §5.1](03-data-model.md) が「実装バイナリのバージョン・OS・ハードウェアは
-> `binary_hash` として別保存し `tool_profile_hash` には含めない」と規定している系として、
-> **同一の重み・同一の chat template であれば、どの推論ランタイムが生成したベクトルでも
-> 同一 profile として扱う。** これにより serving backend の乗り換え (別 OS への移行等) が
-> **再埋め込みなしに**成立する。
->
-> したがって **`model_or_tool_family` をはじめ、いかなる hash 入力フィールドにも
-> backend 名を混ぜてはならない** (`"qwen3-vl-embedding-vllm"` のような命名の禁止)。
-> 混ぜると backend を替えただけで profile_hash が変わり、互換ゲートが全 chunk の
-> 再埋め込みを要求する。
->
-> **ただし identity が同じことは数値が同じことを保証しない。** backend を乗り換える際は
-> 参照実装との数値一致を確認する責務が実装側にある — 本節が定めるのは identity の
-> **規則**のみであり、検証手続きは別途とする。「テキストは一致・画像だけ乖離」という
-> 失敗モードは本節冒頭のとおり互換ゲートで検知できないため、これは形式的な注意ではない。
+### EmbeddingGemma 2 (EG2、既定 local)
+
+| 項目 | 契約 |
+| --- | --- |
+| runtime | 配布・対応 target・pin 検証は [10-operations.md §5.1](10-operations.md)。CPU text/vision、audio 不使用 |
+| engine | Kio と同一 binary の管理 worker 内で native library を使う。外部 server、Python、証明書は不要。ネットワーク送信・listen なし |
+| 入力・出力 | text/image/query、cap 2048、特殊 token と正規化有効、overflow ERROR、768 次元 / cosine / multimodal |
+| prompt | query prefix は `task: search result | query: `。document は `title: none | text: ` に上記 filename context 付き本文を続ける固定 template とし、exact prompt bytes を profile に pin。空 prompt や別文面へ置換しない |
+| 窓 | 全文を試し、code=3 かつ `Input sequence length (N) exceeds maximum supported signature length (2048).` の N>2048 だけを InputOverflow として二分。他の native error は分割理由にしない |
+| 境界 | 本文 Unicode scalar 中央半分で段落空行 → 文末 `.。!！?？` → 文字境界。同距離は先の境界。全連続 byte 区間を重複・欠落なく覆い、各窓に同じ prompt/context。長い query も同じ規則、truncation なし |
+| 集約 | 窓を L2 正規化 → 本文文字数で加重平均（prefix を除外）→ 再 L2 正規化。固定順 f64 集約、最終 f32。全窓成功後に一つの vector を返し、窓別 Task/保存を作らない |
+| 有界性 | 共通 max_chars=6000 を維持。depth 32、本文 scalar 数由来の二分木 call 上限と時間上限。空/零 norm/不正値/分割不能は明示失敗。小窓の overflow も本文を切り捨てない |
+| engine slots | device 全体で背景 indexing（2 threads、低優先度）と対話 query（CPU 数以下で最大4 threads、通常優先度）の2枠。query は indexing を待たない。第2 indexing は bounded wait 後 Paused(resource_busy) |
+| 寿命 | command 内は再利用し、終了/cancel 時に worker と resident memory を解放。常駐 daemon なし。fresh CLI は毎回 load |
+| 故障 | native abort、worker EOF、不正応答、timeout、cancel、memory limit は親 Kio を終了させず member を理由付き失敗にする。native diagnostic は有界・private に隔離し、通常出力は分類理由のみ |
+
+local crash の再計算・0 USD 回復は [04-pipeline.md §5](04-pipeline.md) に従う。online へ自動送信しない。
+モデル取得・保存・検証は [10-operations.md §5.1](10-operations.md)、CLI は [06-cli-spec.md](06-cli-spec.md)。
+
+### 汎用ローカル endpoint 窓
+
+モデル名を設定可能とし、次の二つの wire 形式を選ぶ。どちらも `POST {url}/v1/embeddings` を使う。
+
+| wire | 入力 capability |
+| --- | --- |
+| OpenAI 互換 input | text のみ（Ollama / LM Studio 等）。image capability は宣言せず、image は Skipped(image_capability_unavailable) |
+| vLLM chat-form messages | text と image。同 profile の text/query も messages を使う。image は data URI 付き user message、1 item/request |
+
+wire 形式・model・重み pin・chat template/instruction を意味的 profile に固定する。
+空 instruction も固定し、同一 profile で input/messages を混用しない。
+出力は768次元を要求し、形式が許す場合だけ余剰次元を切り詰めて正規化し、そうでなければ明示拒否する。
+窓は同じ Task・0 USD 台帳・member 受入・回復契約を使う。Kio は endpoint server を起動・管理しない。
+HTTP/HTTPS の送信境界は §3.1 に従い、別の実行 pipeline や管理 server 選択肢は設けない。
 
 ## 5.4 Rerank (optional)
 
@@ -875,7 +578,7 @@ Rerank Adapter は Kio の検索結果を再順位付けするだけで、**sear
 ## 5.5 Batch 実行契約とプロバイダ採用条件
 
 Batch モードを持つ online Adapter (Markdownize / Embedding) は、[04-pipeline.md §5.8](04-pipeline.md) の
-2 相プロトコルが要求する次の操作を trait として公開する:
+2 相プロトコルが要求する次の操作を trait として公開する。Gemini は inline 専用のため upload/list_uploads/delete_upload を持たず、intent attribution は §5.3 の displayName を使う:
 
 ```
 upload(bytes, filename)        client 指定の filename を受理する (intent_token 埋込のため)
@@ -910,11 +613,12 @@ provider_scope_id()            下記の versioned credential-bound recovery sco
 
 **Batch プロバイダ採用条件** (満たさない provider は sync 呼出のみで採用するか、採用しない。**例外 = 条件 7 は sync fallback の免除対象外**: sync 呼出も provider request id を同じ記帳キー (`batch_job_id` 列) と cost_ledger 恒久突合に使うため ([04-pipeline.md §5.4](04-pipeline.md))、条件 7 を満たさない provider は sync でも採用しない):
 
-1. job 一覧照会 (または token による job 発見) と **upload 一覧照会**が可能であること — これが無いと
-   未記録 in-flight・未記録 upload 残骸の回復が構造的に不可能になる
-2. job 作成 → 一覧可視化の遅延に上限があること (Kio の可視化猶予 既定 10 分以内)。**upload →
-   一覧可視化にも同じ上限を適用する** ([04-pipeline.md §5.8](04-pipeline.md) の upload 照合が前提とする)。
-   upload() は upload_id を返し (返却型必須)、list_uploads は pagination を提供すること
+1. job 一覧照会 (または token による job 発見) が可能であること。upload を行う provider/path だけは
+   upload/list_uploads/delete_upload も提供し、未記録 upload 残骸を発見・削除できること。
+   Gemini inline のような upload なし経路に upload 操作の提供・一覧・掃除を要求しない。
+2. job 作成 → 一覧可視化の遅延に上限があること (Kio の可視化猶予 既定 10 分以内)。upload を行う場合だけ
+   upload → 一覧可視化にも同じ上限を適用し、upload() は upload_id を返し、list_uploads は pagination を
+   提供すること（回復と終端 token 解放は [04-pipeline.md §5.8](04-pipeline.md)）。
 3. job / 一覧情報の保持期間が Kio の回復期限 (既定 48h) 以上であること
 4. job metadata / filename に client 任意の識別子 (intent_token) を埋め込めること
 5. 上記の versioned credential-bound recovery scope を提供し、記録済み scope と現在 client の完全一致を
@@ -937,19 +641,10 @@ provider_scope_id()            下記の versioned credential-bound recovery sco
 `mistral_ocr_markdownize` の Batch モードは 2026-07-03 の実地検証 (§5.2 末尾) の範囲でこの条件下で
 採用済み。
 
-> **Batch レーンの実装確定 (実装フィードバック 2026-07-23)**: `mistral_ocr_markdownize` の
-> 本番送信は Batch レーンに固定した (同日ユーザー裁定「OCR の課金は Batch 実行のみ許可」 —
-> $2/1,000 pages。**bbox 有効タスクも例外にしない** — bbox annotation は既定 ON のため、例外に
-> すると本番が sync に留まり裁定が空文化する。batch 入力 body は sync と同じ
-> `bbox_annotation_format` を同梱)。レーン選択 = 「Batch client が構成済み (markdown role の
-> 認証解決可) なら Batch」。`request_kind='sync'` の生存予約行のみ §5.8 の回復意味論保全のため
-> sync で完遂する。v1 確定事項: **1 job = 1 task** (`batch_job_id` 列がそのまま回復キー)、
-> custom_id = task の input_hash、job metadata = flat 5 key (`intent_token` / `scope_id` /
-> `adapter_kind` / `input_hash` / `tool_profile_hash`)、upload filename = `kio-<intent_token>.jsonl`。
-> 単価はコード内に per-page 定数の正本が無いため、tools.toml の `[pricing] pages = 0.002`
-> (batch 単価) 宣言を推奨する。終端の記帳: provider `TIMEOUT_EXCEEDED` は出力を読めず実費不明 =
-> `expired` として**予約額の estimated 記帳** (§5.8 と同じ over-count 安全側)、`FAILED`/`CANCELLED`
-> は未完了 entry 非課金の前提で 0 記帳。
+Markdownize の Batch は 1 job = 1 task、custom_id = task の input_hash、job metadata は
+`intent_token / scope_id / adapter_kind / input_hash / tool_profile_hash`、upload filename は
+`kio-<intent_token>.jsonl` とする。レーンは設定・CLI で選択し、価格解決は §4 に従う。
+期限切れで実費不明なら予約額の Estimated 精算、未完了 entry が非課金の FAILED/CANCELLED は 0 精算とする。
 
 ---
 

@@ -544,6 +544,7 @@ pub(crate) struct ReindexArgs {
 pub(crate) enum SearchModeArg {
     Auto,
     Text,
+    Image,
     Vector,
     Hybrid,
 }
@@ -856,6 +857,7 @@ impl From<SearchModeArg> for app::SearchMode {
         match value {
             SearchModeArg::Auto => Self::Auto,
             SearchModeArg::Text => Self::Text,
+            SearchModeArg::Image => Self::Image,
             SearchModeArg::Vector => Self::Vector,
             SearchModeArg::Hybrid => Self::Hybrid,
         }

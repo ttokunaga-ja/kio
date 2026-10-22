@@ -131,6 +131,7 @@ pub struct AggImage {
     /// object hash.
     pub image_uri: String,
     pub embedding: Vec<f32>,
+    pub profile: EmbeddingProfileSummary,
 }
 
 /// The source index state captured by a completed replica projection.
@@ -290,6 +291,18 @@ pub struct AggBindingFilter {
     pub is_live: bool,
 }
 
+/// Exact authenticated normalized-unit ownership required for an image citation.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AggImageBindingFilter {
+    pub scope_id: String,
+    pub image_id: String,
+    pub raw_hash: String,
+    pub tool_profile_hash: String,
+    pub r#gen: u64,
+    pub manifest_hash: String,
+    pub unit_key: String,
+}
+
 /// Inputs to the replica's only candidate-selection path.
 pub struct AggSearchRequest<'a> {
     pub scopes: &'a BTreeSet<String>,
@@ -305,6 +318,8 @@ pub struct AggSearchRequest<'a> {
     /// owner. This is required rather than optional: stale replica image rows
     /// must be excluded before vector ranking and `candidate_depth` truncate.
     pub eligible_images: &'a BTreeSet<(String, String)>,
+    pub image_binding_filter: &'a [AggImageBindingFilter],
+    pub query_profile: Option<&'a EmbeddingProfileSummary>,
     pub since_cutoff: Option<&'a str>,
     pub match_expr: Option<&'a str>,
     /// Equivalence-expanded forms for each pure-short query token.
@@ -312,6 +327,8 @@ pub struct AggSearchRequest<'a> {
     pub query_embedding: Option<&'a [f32]>,
     pub search_text: bool,
     pub search_vector: bool,
+    /// Restrict the vector lane to images before ranking and candidate-depth truncation.
+    pub image_only: bool,
     pub candidate_depth: u64,
 }
 
@@ -559,6 +576,9 @@ impl Aggregator {
                 image_id   TEXT NOT NULL,
                 vector     BLOB NOT NULL,
                 dimensions INTEGER NOT NULL,
+                profile_hash TEXT NOT NULL,
+                distance TEXT NOT NULL,
+                modality TEXT NOT NULL,
                 PRIMARY KEY (scope_id, image_id)
             );
             CREATE TABLE IF NOT EXISTS agg_image_refs (
@@ -709,6 +729,9 @@ impl Aggregator {
                     ("image_id", "TEXT", true, 2),
                     ("vector", "BLOB", true, 0),
                     ("dimensions", "INTEGER", true, 0),
+                    ("profile_hash", "TEXT", true, 0),
+                    ("distance", "TEXT", true, 0),
+                    ("modality", "TEXT", true, 0),
                 ],
             ),
             (
@@ -1517,8 +1540,8 @@ impl Aggregator {
             // projection: the same figure appearing twice is a fact about the
             // corpus, and the two rows carry the same vector by construction.
             let mut image_vecs = tx.prepare(
-                "INSERT OR REPLACE INTO agg_image_embeddings(scope_id, image_id, vector, dimensions)
-                 VALUES (?1, ?2, ?3, ?4)",
+                "INSERT OR REPLACE INTO agg_image_embeddings(scope_id, image_id, vector, dimensions, profile_hash, distance, modality)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )?;
             let mut image_refs = tx.prepare(
                 "INSERT INTO agg_image_refs(scope_id, image_id, chunk_id, image_uri)
@@ -1529,7 +1552,10 @@ impl Aggregator {
                     scope_id,
                     image.image_id,
                     f32_to_le_bytes(&image.embedding),
-                    image.embedding.len() as i64
+                    image.embedding.len() as i64,
+                    image.profile.profile_hash,
+                    image.profile.distance,
+                    image.profile.modality
                 ])?;
                 image_refs.execute(params![
                     scope_id,
@@ -1915,7 +1941,8 @@ impl Aggregator {
         if request.search_vector
             && let Some(query) = request.query_embedding
         {
-            let mut vectors = self.replica_vector_seeds(query)?;
+            let mut vectors =
+                self.replica_vector_seeds(query, request.image_only, request.query_profile)?;
             vectors.sort_by(|a, b| {
                 b.1.total_cmp(&a.1)
                     .then_with(|| a.0.scope_id.cmp(&b.0.scope_id))
@@ -2040,6 +2067,66 @@ impl Aggregator {
             ));
         }
         Ok(bindings)
+    }
+
+    /// Actual image-space metadata, projected atomically with image vectors.
+    pub fn image_embedding_profiles(&self, scope: &str) -> Result<Vec<EmbeddingProfileSummary>> {
+        let mut stmt=self.conn.prepare("SELECT DISTINCT dimensions,distance,modality,profile_hash FROM agg_image_embeddings WHERE scope_id=?1 ORDER BY dimensions,distance,modality,profile_hash")?;
+        let rows = stmt.query_map([scope], |r| {
+            Ok(EmbeddingProfileSummary {
+                dimensions: r.get::<_, i64>(0)? as u64,
+                distance: r.get(1)?,
+                modality: r.get(2)?,
+                profile_hash: r.get(3)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Enumerate exact projected owner identities before vector candidate ranking.
+    pub fn image_bindings_for_policy(
+        &self,
+        scope: &str,
+        selector: AggSelector,
+        snapshot: &str,
+        max_count: usize,
+    ) -> Result<Vec<AggImageBindingFilter>> {
+        if !self.has_completed_projection(scope, selector, snapshot)? {
+            return Err(crate::IndexError::Contract(
+                "image binding projection is incomplete".to_owned(),
+            ));
+        }
+        let mut stmt = self.conn.prepare("SELECT DISTINCT ref.image_id,b.raw_hash,b.tool_profile_hash,b.gen,b.manifest_hash,c.unit_key
+          FROM agg_image_refs ref JOIN agg_chunks c ON c.scope_id=ref.scope_id AND c.chunk_id=ref.chunk_id
+          JOIN agg_bindings b ON b.scope_id=c.scope_id AND b.chunk_id=c.chunk_id
+          WHERE b.scope_id=?1 AND b.selector_kind=?2 AND b.snapshot_commit=?3 LIMIT ?4")?;
+        let rows = stmt.query_map(
+            params![
+                scope,
+                selector.as_str(),
+                snapshot,
+                (max_count.saturating_add(1)) as i64
+            ],
+            |r| {
+                Ok(AggImageBindingFilter {
+                    scope_id: scope.to_owned(),
+                    image_id: r.get(0)?,
+                    raw_hash: r.get(1)?,
+                    tool_profile_hash: r.get(2)?,
+                    r#gen: r.get::<_, i64>(3)? as u64,
+                    manifest_hash: r.get(4)?,
+                    unit_key: r.get(5)?,
+                })
+            },
+        )?;
+        let rows = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        if rows.len() > max_count {
+            return Err(crate::IndexError::Contract(
+                "image binding enumeration exceeded configured limit".to_owned(),
+            ));
+        }
+        Ok(rows)
     }
 
     fn load_query_eligibility(&self, request: &AggSearchRequest<'_>) -> Result<()> {
@@ -2168,6 +2255,35 @@ impl Aggregator {
              FROM query_eligible_bindings;",
         )?;
         self.load_query_eligible_images(request.eligible_images)?;
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS query_image_owners (
+            scope_id TEXT, image_id TEXT, raw_hash TEXT, tool_profile_hash TEXT,
+            gen INTEGER, manifest_hash TEXT, unit_key TEXT);
+            DELETE FROM query_image_owners;
+            DROP TABLE IF EXISTS temp.query_eligible_image_bindings;",
+        )?;
+        for owner in request.image_binding_filter {
+            self.conn.execute(
+                "INSERT INTO query_image_owners VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                params![
+                    owner.scope_id,
+                    owner.image_id,
+                    owner.raw_hash,
+                    owner.tool_profile_hash,
+                    owner.r#gen as i64,
+                    owner.manifest_hash,
+                    owner.unit_key
+                ],
+            )?;
+        }
+        self.conn.execute_batch("CREATE TEMP TABLE query_eligible_image_bindings AS
+            SELECT DISTINCT eligible.*, refs.image_id FROM query_eligible_bindings eligible
+            JOIN agg_bindings binding USING(scope_id,selector_kind,snapshot_commit,chunk_id,path_at_commit,pointer_commit)
+            JOIN agg_chunks chunk ON chunk.scope_id=binding.scope_id AND chunk.chunk_id=binding.chunk_id
+            JOIN agg_image_refs refs ON refs.scope_id=chunk.scope_id AND refs.chunk_id=chunk.chunk_id
+            JOIN query_image_owners owner ON owner.scope_id=binding.scope_id AND owner.image_id=refs.image_id
+              AND owner.raw_hash=binding.raw_hash AND owner.tool_profile_hash=binding.tool_profile_hash
+              AND owner.gen=binding.gen AND owner.manifest_hash=binding.manifest_hash AND owner.unit_key=chunk.unit_key;")?;
         Ok(())
     }
 
@@ -2288,10 +2404,16 @@ impl Aggregator {
             .map_err(Into::into)
     }
 
-    fn replica_vector_seeds(&self, query: &[f32]) -> Result<Vec<(CandidateSeed, f64)>> {
+    fn replica_vector_seeds(
+        &self,
+        query: &[f32],
+        image_only: bool,
+        profile: Option<&EmbeddingProfileSummary>,
+    ) -> Result<Vec<(CandidateSeed, f64)>> {
         let mut scored = Vec::new();
-        let mut chunks = self.conn.prepare(
-            "SELECT c.scope_id, c.chunk_id, e.vector, e.dimensions
+        if !image_only {
+            let mut chunks = self.conn.prepare(
+                "SELECT c.scope_id, c.chunk_id, e.vector, e.dimensions
              FROM agg_embeddings e
              JOIN agg_chunks c ON c.rowid = e.chunk_rowid
              WHERE EXISTS (
@@ -2299,38 +2421,39 @@ impl Aggregator {
                  WHERE eligible.scope_id = c.scope_id
                    AND eligible.chunk_id = c.chunk_id
              )",
-        )?;
-        let rows = chunks.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, i64>(3)?,
-            ))
-        })?;
-        for row in rows {
-            let (scope_id, chunk_id, blob, dimensions) = row?;
-            if dimensions as usize != query.len() {
-                continue;
-            }
-            let embedding = f32_from_le_bytes(&blob);
-            if embedding.len() != query.len() {
-                continue;
-            }
-            let cosine = cosine_similarity(query, &embedding);
-            if cosine.is_finite() {
-                scored.push((
-                    CandidateSeed {
-                        scope_id,
-                        chunk_id,
-                        image_id: None,
-                        image_uri: None,
-                        text_rank: None,
-                        vector_rank: None,
-                        embedding: Some(embedding),
-                    },
-                    cosine,
-                ));
+            )?;
+            let rows = chunks.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (scope_id, chunk_id, blob, dimensions) = row?;
+                if dimensions as usize != query.len() {
+                    continue;
+                }
+                let embedding = f32_from_le_bytes(&blob);
+                if embedding.len() != query.len() {
+                    continue;
+                }
+                let cosine = cosine_similarity(query, &embedding);
+                if cosine.is_finite() {
+                    scored.push((
+                        CandidateSeed {
+                            scope_id,
+                            chunk_id,
+                            image_id: None,
+                            image_uri: None,
+                            text_rank: None,
+                            vector_rank: None,
+                            embedding: Some(embedding),
+                        },
+                        cosine,
+                    ));
+                }
             }
         }
         let mut images = self.conn.prepare(
@@ -2342,22 +2465,32 @@ impl Aggregator {
              JOIN query_eligible_images allowed
                ON allowed.scope_id = image.scope_id AND allowed.image_id = image.image_id
              WHERE EXISTS (
-                 SELECT 1 FROM query_eligible_chunks eligible
-                 WHERE eligible.scope_id = ref.scope_id
-                   AND eligible.chunk_id = ref.chunk_id
+                 SELECT 1 FROM query_eligible_image_bindings eligible
+                 WHERE eligible.scope_id = ref.scope_id AND eligible.chunk_id = ref.chunk_id
+                   AND eligible.image_id = ref.image_id
              )
+               AND (?1 IS NULL OR (image.profile_hash = ?1 AND image.distance = ?2
+                    AND image.modality = ?3 AND image.dimensions = ?4))
              ORDER BY image.scope_id, image.image_id, ref.chunk_id",
         )?;
-        let rows = images.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, Vec<u8>>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })?;
+        let rows = images.query_map(
+            params![
+                profile.map(|p| &p.profile_hash),
+                profile.map(|p| &p.distance),
+                profile.map(|p| &p.modality),
+                profile.map(|p| p.dimensions as i64)
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Vec<u8>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
         let mut seen_images = BTreeSet::new();
         for row in rows {
             let (scope_id, image_id, chunk_id, image_uri, blob, dimensions) = row?;
@@ -2446,10 +2579,20 @@ impl Aggregator {
              WHERE binding.scope_id = ?1
                AND binding.chunk_id = ?2
                AND binding.selector_kind = ?3
+               AND (?4 IS NULL OR EXISTS (SELECT 1 FROM query_eligible_image_bindings image
+                 WHERE image.scope_id=binding.scope_id AND image.chunk_id=binding.chunk_id
+                   AND image.selector_kind=binding.selector_kind AND image.snapshot_commit=binding.snapshot_commit
+                   AND image.path_at_commit=binding.path_at_commit AND image.pointer_commit=binding.pointer_commit
+                   AND image.image_id=?4))
              ORDER BY binding.path_at_commit, binding.pointer_commit",
         )?;
         let rows = stmt.query_map(
-            params![seed.scope_id, seed.chunk_id, selector.as_str()],
+            params![
+                seed.scope_id,
+                seed.chunk_id,
+                selector.as_str(),
+                seed.image_id
+            ],
             |row| {
                 let current_paths = serde_json::from_str::<Vec<String>>(&row.get::<_, String>(7)?)
                     .map_err(|error| {
@@ -3410,12 +3553,15 @@ mod tests {
                 selector: AggSelector::Current,
                 binding_filter: None,
                 eligible_images: &BTreeSet::new(),
+                image_binding_filter: &[],
+                query_profile: None,
                 since_cutoff: None,
                 match_expr: Some("needle"),
                 short_token_forms: &[],
                 query_embedding: None,
                 search_text: true,
                 search_vector: false,
+                image_only: false,
                 candidate_depth: 10,
             })
             .unwrap();
@@ -3429,12 +3575,15 @@ mod tests {
                 selector: AggSelector::AllHistory,
                 binding_filter: None,
                 eligible_images: &BTreeSet::new(),
+                image_binding_filter: &[],
+                query_profile: None,
                 since_cutoff: None,
                 match_expr: Some("needle"),
                 short_token_forms: &[],
                 query_embedding: None,
                 search_text: true,
                 search_vector: false,
+                image_only: false,
                 candidate_depth: 10,
             })
             .unwrap();
@@ -3454,12 +3603,15 @@ mod tests {
                 selector: AggSelector::Current,
                 binding_filter: None,
                 eligible_images: &BTreeSet::new(),
+                image_binding_filter: &[],
+                query_profile: None,
                 since_cutoff: None,
                 match_expr: None,
                 short_token_forms: &forms,
                 query_embedding: None,
                 search_text: true,
                 search_vector: false,
+                image_only: false,
                 candidate_depth: 10,
             })
             .unwrap();
@@ -3507,12 +3659,15 @@ mod tests {
                 selector: AggSelector::AllHistory,
                 binding_filter: None,
                 eligible_images: &BTreeSet::new(),
+                image_binding_filter: &[],
+                query_profile: None,
                 since_cutoff: None,
                 match_expr: Some("needle"),
                 short_token_forms: &[],
                 query_embedding: None,
                 search_text: true,
                 search_vector: false,
+                image_only: false,
                 candidate_depth: 1,
             })
             .unwrap();
@@ -3536,12 +3691,15 @@ mod tests {
                 selector: AggSelector::AllHistory,
                 binding_filter: Some(&allowed),
                 eligible_images: &BTreeSet::new(),
+                image_binding_filter: &[],
+                query_profile: None,
                 since_cutoff: None,
                 match_expr: Some("needle"),
                 short_token_forms: &[],
                 query_embedding: None,
                 search_text: true,
                 search_vector: false,
+                image_only: false,
                 candidate_depth: 1,
             })
             .unwrap();
@@ -3560,12 +3718,15 @@ mod tests {
                 selector: AggSelector::AllHistory,
                 binding_filter: Some(&empty),
                 eligible_images: &BTreeSet::new(),
+                image_binding_filter: &[],
+                query_profile: None,
                 since_cutoff: None,
                 match_expr: Some("needle"),
                 short_token_forms: &[],
                 query_embedding: None,
                 search_text: true,
                 search_vector: false,
+                image_only: false,
                 candidate_depth: 1,
             })
             .unwrap();
@@ -3666,6 +3827,7 @@ mod tests {
             chunk_id: "z-chunk".to_owned(),
             image_uri: "kio://scope/object/image/a-image".to_owned(),
             embedding: vec![1.0, 0.0],
+            profile: header("g").embedding_profiles[0].clone(),
         }];
         let bindings = [binding("current", "head", "z-chunk", "figure.md")];
         index
@@ -3689,12 +3851,18 @@ mod tests {
                 selector: AggSelector::Current,
                 binding_filter: None,
                 eligible_images: &eligible_images,
+                image_binding_filter: &images
+                    .iter()
+                    .map(|image| image_owner("s", &chunks[0], &image.image_id))
+                    .collect::<Vec<_>>(),
+                query_profile: Some(&images[0].profile),
                 since_cutoff: None,
                 match_expr: None,
                 short_token_forms: &[],
                 query_embedding: Some(&[1.0, 0.0]),
                 search_text: false,
                 search_vector: true,
+                image_only: false,
                 candidate_depth: 10,
             })
             .unwrap();
@@ -3740,12 +3908,18 @@ mod tests {
                 selector: AggSelector::Current,
                 binding_filter: None,
                 eligible_images: &eligible_images,
+                image_binding_filter: &images
+                    .iter()
+                    .map(|image| image_owner("s", &chunks[0], &image.image_id))
+                    .collect::<Vec<_>>(),
+                query_profile: Some(&images[0].profile),
                 since_cutoff: None,
                 match_expr: None,
                 short_token_forms: &[],
                 query_embedding: Some(&[1.0, 0.0]),
                 search_text: false,
                 search_vector: true,
+                image_only: false,
                 candidate_depth: 1,
             })
             .unwrap();
@@ -4432,12 +4606,235 @@ mod tests {
         assert_eq!(ranks[&("s2".into(), "far".into())], 2);
     }
 
+    fn image_owner(scope: &str, chunk: &AggChunk, image_id: &str) -> AggImageBindingFilter {
+        AggImageBindingFilter {
+            scope_id: scope.to_owned(),
+            image_id: image_id.to_owned(),
+            raw_hash: chunk.raw_hash.clone(),
+            tool_profile_hash: chunk.tool_profile_hash.clone(),
+            r#gen: chunk.r#gen,
+            manifest_hash: "manifest:test".to_owned(),
+            unit_key: chunk.unit_key.clone(),
+        }
+    }
+
+    #[test]
+    fn o3_image_owner_binding_is_selected_before_vector_depth() {
+        let (_dir, mut index) = store();
+        let chunks = [
+            chunk("a-untrusted", "untrusted link"),
+            chunk("z-owner", "owned figure"),
+        ];
+        let images = chunks
+            .iter()
+            .map(|chunk| AggImage {
+                chunk_id: chunk.chunk_id.clone(),
+                ..image("figure", vec![1.0, 0.0])
+            })
+            .collect::<Vec<_>>();
+        let bindings = [
+            binding("current", "head", "a-untrusted", "untrusted.md"),
+            binding("current", "head", "z-owner", "owner.pdf"),
+        ];
+        index
+            .refresh_scope_with_projection(AggProjectionRequest {
+                scope_id: "s",
+                header: &header("g"),
+                chunks: &chunks,
+                images: &images,
+                bindings: &bindings,
+                completions: &[completion(AggSelector::Current, "head")],
+                now_ms: 1,
+            })
+            .unwrap();
+        let scopes = only(&["s"]);
+        let snapshots = BTreeMap::from([("s".to_owned(), "head".to_owned())]);
+        let eligible = BTreeSet::from([("s".to_owned(), "figure".to_owned())]);
+        let allowed = [image_owner("s", &chunks[1], "figure")];
+        let profile = header("g").embedding_profiles[0].clone();
+        let request = AggSearchRequest {
+            scopes: &scopes,
+            snapshots: &snapshots,
+            selector: AggSelector::Current,
+            binding_filter: None,
+            eligible_images: &eligible,
+            image_binding_filter: &allowed,
+            query_profile: Some(&profile),
+            since_cutoff: None,
+            match_expr: None,
+            short_token_forms: &[],
+            query_embedding: Some(&[1.0, 0.0]),
+            search_text: false,
+            search_vector: true,
+            image_only: true,
+            candidate_depth: 1,
+        };
+        let rows = index.search_candidates(&request).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].chunk_id, "z-owner",
+            "smaller unauthorized ref must not consume the image anchor/depth"
+        );
+        assert_eq!(rows[0].bindings[0].path_at_commit, "owner.pdf");
+        for field in 0..7 {
+            let mut denied = allowed[0].clone();
+            match field {
+                0 => denied.scope_id = "other-scope".to_owned(),
+                1 => denied.image_id = "other-image".to_owned(),
+                2 => denied.raw_hash = "other-raw".to_owned(),
+                3 => denied.tool_profile_hash = "other-normalize-profile".to_owned(),
+                4 => denied.r#gen += 1,
+                5 => denied.manifest_hash = "other-manifest".to_owned(),
+                _ => denied.unit_key = "other-unit".to_owned(),
+            }
+            let denied = [denied];
+            assert!(
+                index
+                    .search_candidates(&AggSearchRequest {
+                        image_binding_filter: &denied,
+                        ..request
+                    })
+                    .unwrap()
+                    .is_empty(),
+                "every exact owner field is required: {field}"
+            );
+        }
+    }
+
+    #[test]
+    fn o3_wrong_image_profile_is_excluded_before_vector_depth() {
+        let (_dir, mut index) = store();
+        let chunks = [
+            chunk("wrong-owner", "wrong profile"),
+            chunk("right-owner", "matching profile"),
+        ];
+        let expected = header("g").embedding_profiles[0].clone();
+        let images = [
+            AggImage {
+                chunk_id: chunks[0].chunk_id.clone(),
+                profile: EmbeddingProfileSummary {
+                    profile_hash: "profile:other".to_owned(),
+                    ..expected.clone()
+                },
+                ..image("a-wrong-image", vec![1.0, 0.0])
+            },
+            AggImage {
+                chunk_id: chunks[1].chunk_id.clone(),
+                ..image("z-right-image", vec![0.8, 0.2])
+            },
+        ];
+        index
+            .refresh_scope_with_projection(AggProjectionRequest {
+                scope_id: "s",
+                header: &header("g"),
+                chunks: &chunks,
+                images: &images,
+                bindings: &[
+                    binding("current", "head", "wrong-owner", "wrong.pdf"),
+                    binding("current", "head", "right-owner", "right.pdf"),
+                ],
+                completions: &[completion(AggSelector::Current, "head")],
+                now_ms: 1,
+            })
+            .unwrap();
+        let scopes = only(&["s"]);
+        let snapshots = BTreeMap::from([("s".to_owned(), "head".to_owned())]);
+        let eligible = BTreeSet::from([
+            ("s".to_owned(), "a-wrong-image".to_owned()),
+            ("s".to_owned(), "z-right-image".to_owned()),
+        ]);
+        let owners = [
+            image_owner("s", &chunks[0], "a-wrong-image"),
+            image_owner("s", &chunks[1], "z-right-image"),
+        ];
+        for image_only in [false, true] {
+            let rows = index
+                .search_candidates(&AggSearchRequest {
+                    scopes: &scopes,
+                    snapshots: &snapshots,
+                    selector: AggSelector::Current,
+                    binding_filter: None,
+                    eligible_images: &eligible,
+                    image_binding_filter: &owners,
+                    query_profile: Some(&expected),
+                    since_cutoff: None,
+                    match_expr: None,
+                    short_token_forms: &[],
+                    query_embedding: Some(&[1.0, 0.0]),
+                    search_text: false,
+                    search_vector: true,
+                    image_only,
+                    candidate_depth: 1,
+                })
+                .unwrap();
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].image_id.as_deref(),
+                Some("z-right-image"),
+                "mismatched nearest image must not consume candidate depth"
+            );
+            assert_eq!(rows[0].bindings[0].path_at_commit, "right.pdf");
+        }
+    }
+
+    #[test]
+    fn o3_image_only_scope_queries_images_without_chunk_vectors() {
+        let (_dir, mut index) = store();
+        let owner = chunk("image-citation", "native source");
+        let mut empty_chunk_header = header("g");
+        empty_chunk_header.embedding_profiles.clear();
+        let image = image("standalone", vec![1.0, 0.0]);
+        index
+            .refresh_scope_with_projection(AggProjectionRequest {
+                scope_id: "s",
+                header: &empty_chunk_header,
+                chunks: std::slice::from_ref(&owner),
+                images: std::slice::from_ref(&image),
+                bindings: &[binding(
+                    "current",
+                    "head",
+                    "image-citation",
+                    "standalone.png",
+                )],
+                completions: &[completion(AggSelector::Current, "head")],
+                now_ms: 1,
+            })
+            .unwrap();
+        let scopes = only(&["s"]);
+        let snapshots = BTreeMap::from([("s".to_owned(), "head".to_owned())]);
+        let eligible = BTreeSet::from([("s".to_owned(), "standalone".to_owned())]);
+        let owners = [image_owner("s", &owner, "standalone")];
+        let rows = index
+            .search_candidates(&AggSearchRequest {
+                scopes: &scopes,
+                snapshots: &snapshots,
+                selector: AggSelector::Current,
+                binding_filter: None,
+                eligible_images: &eligible,
+                image_binding_filter: &owners,
+                query_profile: Some(&image.profile),
+                since_cutoff: None,
+                match_expr: None,
+                short_token_forms: &[],
+                query_embedding: Some(&[1.0, 0.0]),
+                search_text: false,
+                search_vector: true,
+                image_only: true,
+                candidate_depth: 1,
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].image_id.as_deref(), Some("standalone"));
+        assert_eq!(rows[0].bindings[0].path_at_commit, "standalone.png");
+    }
+
     fn image(id: &str, embedding: Vec<f32>) -> AggImage {
         AggImage {
             image_id: id.to_owned(),
             chunk_id: "image-citation".to_owned(),
             image_uri: format!("kio://scope/object/image/{id}"),
             embedding,
+            profile: header("g").embedding_profiles[0].clone(),
         }
     }
 

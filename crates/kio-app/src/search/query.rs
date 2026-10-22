@@ -501,8 +501,10 @@ pub(crate) fn diversify_merged<'a>(
         && candidates
             .iter()
             .all(|candidate| candidate.embedding.is_some());
-    let mmr_ran = matches!(resolved_mode, SearchMode::Hybrid | SearchMode::Vector)
-        && request.strategy == DiversifyStrategy::Mmr
+    let mmr_ran = matches!(
+        resolved_mode,
+        SearchMode::Hybrid | SearchMode::Vector | SearchMode::Image
+    ) && request.strategy == DiversifyStrategy::Mmr
         && all_have_embeddings;
     let summary = match request.strategy {
         DiversifyStrategy::Off => DiversifySummary {
@@ -1023,6 +1025,7 @@ pub(crate) fn parsed_search(args: SearchArgs) -> Result<ParsedSearch> {
     let (requested_mode, explicit_mode) = match args.mode {
         Some(SearchModeArg::Auto) => (SearchMode::Auto, true),
         Some(SearchModeArg::Text) => (SearchMode::Text, true),
+        Some(SearchModeArg::Image) => (SearchMode::Image, true),
         Some(SearchModeArg::Vector) => (SearchMode::Vector, true),
         Some(SearchModeArg::Hybrid) => (SearchMode::Hybrid, true),
         None => (SearchMode::Auto, false),
@@ -1116,6 +1119,7 @@ fn parse_search_mode_name(name: &str) -> Option<SearchMode> {
     match name {
         "auto" => Some(SearchMode::Auto),
         "text" => Some(SearchMode::Text),
+        "image" => Some(SearchMode::Image),
         "vector" => Some(SearchMode::Vector),
         "hybrid" => Some(SearchMode::Hybrid),
         _ => None,
@@ -1350,6 +1354,7 @@ pub(crate) fn search_mode_json(mode: SearchMode) -> &'static str {
     match mode {
         SearchMode::Auto => "auto",
         SearchMode::Text => "text",
+        SearchMode::Image => "image",
         SearchMode::Vector => "vector",
         SearchMode::Hybrid => "hybrid",
     }

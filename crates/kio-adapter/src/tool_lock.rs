@@ -226,7 +226,7 @@ const TOOLS_ENTRY_FIELDS: &[&str] = &[
 /// on kio-pipeline, so this list is independently maintained here; the test
 /// `pricing_kind_enum_matches_billable_unit_kind` cross-checks it against
 /// `types::BillableUnitKind`).
-const PRICING_KIND_ENUM: &[&str] = &["pages", "tokens_in", "tokens_out"];
+const PRICING_KIND_ENUM: &[&str] = &["pages", "tokens_in", "image_tokens_in", "tokens_out"];
 
 /// R13-2: typed validation of `tools.toml`. docs/06 §10 and docs/10 §11.3 promise
 /// a schema-driven check that never existed — the previous validator only walked
@@ -2239,6 +2239,7 @@ auth = "env:MISTRAL_API_KEY"
         let mut from_enum: Vec<String> = [
             BillableUnitKind::Pages,
             BillableUnitKind::TokensIn,
+            BillableUnitKind::ImageTokensIn,
             BillableUnitKind::TokensOut,
         ]
         .iter()

@@ -809,7 +809,7 @@ fn cas_update_one(conn: &Connection, sql: &str, params: impl rusqlite::Params) -
 // ---------------------------------------------------------------------------
 
 /// The closed `billable_units[].kind` enum (07-adapter-spec.md §4).
-pub const BILLABLE_UNIT_KINDS: &[&str] = &["pages", "tokens_in", "tokens_out"];
+pub const BILLABLE_UNIT_KINDS: &[&str] = &["pages", "tokens_in", "image_tokens_in", "tokens_out"];
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BilledAmount {
@@ -980,6 +980,7 @@ fn billable_unit_kind_name(kind: kio_adapter::types::BillableUnitKind) -> &'stat
     match kind {
         BillableUnitKind::Pages => "pages",
         BillableUnitKind::TokensIn => "tokens_in",
+        BillableUnitKind::ImageTokensIn => "image_tokens_in",
         BillableUnitKind::TokensOut => "tokens_out",
     }
 }

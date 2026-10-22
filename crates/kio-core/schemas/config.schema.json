@@ -2,6 +2,16 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "properties": {
+    "embedding": {
+      "type": "object",
+      "properties": {
+        "external_send": {
+          "type": "string",
+          "enum": ["text_and_images", "text_only"]
+        }
+      },
+      "additionalProperties": false
+    },
     "scope": {
       "type": "object",
       "properties": {
@@ -53,7 +63,7 @@
       "properties": {
         "default_mode": {
           "type": "string",
-          "enum": ["auto", "text", "vector", "hybrid"]
+          "enum": ["auto", "text", "image", "vector", "hybrid"]
         },
         "related_images_min_area_ratio": {
           "type": "number",

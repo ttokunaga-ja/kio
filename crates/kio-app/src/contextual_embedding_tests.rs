@@ -2,26 +2,29 @@
 
 use super::*;
 use crate::commands::IndexArgs;
-use crate::commands::{CommandRequest, InitArgs, RepairArgs, RepairOperation, RepairRebuildDbArgs};
+use crate::commands::{
+    CommandRequest, InitArgs, LedgerArgs, LedgerCommand, RepairArgs, RepairOperation,
+    RepairRebuildDbArgs,
+};
 use crate::context::{AppContext, Interaction};
-use crate::embedding::enrichment::EmbeddingReconcileContext;
-use crate::embedding::enrichment::apply_embedding_transitions;
-use crate::embedding::enrichment::bind_embedding_work;
-use crate::embedding::enrichment::embedding_done_transition;
-use crate::embedding::enrichment::embedding_fail_transition;
-use crate::embedding::enrichment::embedding_replica_projection_is_current;
-use crate::embedding::enrichment::enqueue_embedding_tasks;
-use crate::embedding::enrichment::invalidate_embedding_projection;
-use crate::embedding::enrichment::reconcile_committed_embedding_tasks;
-use crate::embedding::enrichment::record_embedding_transitions;
-use crate::embedding::enrichment::retained_history_chunks;
-use crate::embedding::enrichment::selected_embedding_contexts;
-use crate::embedding::enrichment::validate_embedding_task_bindings;
-use crate::embedding::transport::declared_embedding_profile;
-use crate::embedding::transport::embedding_execution;
-use crate::embedding::transport::embedding_job_input_hash;
-use crate::embedding::transport::filter_embeddable_by_task_state;
-use crate::embedding::transport::validated_embedding_batch_vectors;
+use crate::embedding::admission::declared_embedding_profile;
+use crate::embedding::admission::embedding_execution;
+use crate::embedding::batch::completed_batch_result;
+use crate::embedding::batch::embedding_job_input_hash;
+use crate::embedding::executor::apply_embedding_transitions;
+use crate::embedding::executor::embedding_done_transition;
+use crate::embedding::executor::embedding_fail_transition;
+use crate::embedding::executor::embedding_replica_projection_is_current;
+use crate::embedding::executor::invalidate_embedding_projection;
+use crate::embedding::executor::record_embedding_transitions;
+use crate::embedding::plan::EmbeddingReconcileContext;
+use crate::embedding::plan::bind_embedding_work;
+use crate::embedding::plan::enqueue_embedding_tasks;
+use crate::embedding::plan::filter_embeddable_by_task_state;
+use crate::embedding::plan::reconcile_committed_embedding_tasks;
+use crate::embedding::plan::retained_history_chunks;
+use crate::embedding::plan::selected_embedding_contexts;
+use crate::embedding::plan::validate_embedding_task_bindings;
 use crate::embedding_owners::RetainedEmbeddingChunk;
 use crate::historical_reindex::RetainedNormalizedInstance;
 use crate::historical_reindex::retained_history_instances;
@@ -94,6 +97,17 @@ fn private_tempdir() -> crate::test_support::PrivateTempDir {
 
 pub(super) fn isolated_child_for(test_name: &str) -> bool {
     if std::env::var_os(CHILD).is_some() {
+        let context = AppContext {
+            working_directory: std::env::current_dir().unwrap(),
+            interaction: Arc::new(QuietInteraction),
+        };
+        execute(
+            &context,
+            CommandRequest::Ledger(LedgerArgs {
+                command: Some(LedgerCommand::Init { resume: false }),
+            }),
+        )
+        .unwrap();
         return true;
     }
     let private = private_tempdir();
@@ -370,7 +384,13 @@ fn rename_retains_contexts_and_rebuild_selects_allowed_head_then_history() {
     for (hash, text_hash, stored_context, vector) in &renamed.sources {
         let object = repo.object_store().read_embedding(hash).unwrap();
         assert_eq!(&object.target_hash, text_hash);
-        assert_eq!(&object.context, stored_context);
+        assert_eq!(
+            object
+                .context
+                .as_ref()
+                .and_then(kio_core::cas::EmbeddingContext::as_text),
+            stored_context.as_deref()
+        );
         assert_eq!(&f32_to_le_bytes(&object.vector), vector);
     }
     assert_ne!(
@@ -856,37 +876,79 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
 #[test]
 fn batch_result_admission_validates_all_keys_and_vectors_before_returning_any() {
     use kio_adapter::gemini_batch_client::GeminiBatchEmbedOutput;
+    use kio_adapter::types::EmbeddingLogicalJobId;
+    use kio_pipeline::ledger::embedding_job::{
+        EmbeddingJob, EmbeddingJobBinding, EmbeddingJobMember,
+    };
+    use kio_pipeline::task::EmbeddingTaskTarget;
     let first = hash_bytes(b"first contextual input");
     let second = hash_bytes(b"second contextual input");
     let input_hash = embedding_job_input_hash(&BTreeSet::from([first.clone(), second.clone()]));
-    let profile = DeclaredEmbeddingProfile {
-        tool_id: "test".to_owned(),
-        dimensions: 3,
-        distance: "cosine".to_owned(),
-        modality: "multimodal".to_owned(),
-        profile_hash: hash_bytes(b"profile"),
+    let profile_hash = hash_bytes(b"profile");
+    let job = EmbeddingJob {
+        key: kio_pipeline::ledger::TaskKey::new(
+            "scope_test",
+            "embedding",
+            input_hash.clone(),
+            profile_hash.clone(),
+        ),
+        submission_seq: 1,
+        intent_token: "test_token".to_owned(),
+        binding: EmbeddingJobBinding {
+            logical_job_id: EmbeddingLogicalJobId(input_hash),
+            local: false,
+            dimensions: 3,
+            distance: "cosine".to_owned(),
+            modality: "multimodal".to_owned(),
+            members: [first.clone(), second.clone()]
+                .into_iter()
+                .map(|id| EmbeddingJobMember {
+                    target: EmbeddingTaskTarget::Chunk {
+                        chunk_hash: id.clone(),
+                        embedding_hash: id.clone(),
+                        profile_hash: profile_hash.clone(),
+                        input_hash: id.clone(),
+                    },
+                    id,
+                })
+                .collect(),
+        },
+        known_result: None,
     };
     let output = |key: &str| GeminiBatchEmbedOutput {
         key: key.to_owned(),
         values: Some(vec![2.0, 0.0, 0.0]),
         error: None,
-        prompt_tokens: Some(1),
+        usage: kio_adapter::types::EmbeddingUsage::Metered {
+            usage: kio_adapter::types::AdapterUsage::BillableUnits {
+                billable_units: vec![kio_adapter::types::BillableUnit {
+                    kind: kio_adapter::types::BillableUnitKind::TokensIn,
+                    count: 1,
+                }],
+            },
+        },
     };
     let valid = vec![output(&first), output(&second)];
-    let accepted = validated_embedding_batch_vectors(&valid, &input_hash, Some(&profile)).unwrap();
-    assert_eq!(accepted.len(), 2);
-    assert_eq!(accepted[&first], vec![1.0, 0.0, 0.0]);
+    let accepted = completed_batch_result(&job, &valid).unwrap();
+    assert_eq!(accepted.members.len(), 2);
+    assert_eq!(accepted.members[0].id, first);
+    assert!(
+        matches!(&accepted.members[0].result, kio_adapter::types::EmbeddingMemberResult::Vector { vector } if vector == &vec![1.0, 0.0, 0.0])
+    );
     let mut reversed = valid.clone();
     reversed.reverse();
-    assert_eq!(
-        validated_embedding_batch_vectors(&reversed, &input_hash, Some(&profile)).unwrap(),
-        accepted
-    );
-    assert!(
-        validated_embedding_batch_vectors(&valid, &input_hash, None)
-            .unwrap()
-            .is_empty()
-    );
+    let accepted_by_id = accepted
+        .members
+        .iter()
+        .map(|member| (member.id.clone(), member.result.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let reversed_by_id = completed_batch_result(&job, &reversed)
+        .unwrap()
+        .members
+        .into_iter()
+        .map(|member| (member.id, member.result))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(reversed_by_id, accepted_by_id);
 
     let mut malformed = vec![
         vec![],
@@ -895,25 +957,310 @@ fn batch_result_admission_validates_all_keys_and_vectors_before_returning_any() 
         vec![output(&first), output(&hash_bytes(b"foreign"))],
         vec![output(&first), output("not-canonical")],
     ];
-    for values in [
-        None,
-        Some(vec![1.0]),
-        Some(vec![0.0; 3]),
-        Some(vec![f32::NAN, 0.0, 1.0]),
-    ] {
-        let mut results = valid.clone();
-        results[1].values = values;
-        malformed.push(results);
-    }
+    // An absent result without an explicit error is an ambiguous envelope.
+    // Keyed vector validation failures are isolated by the O3 matrix below.
+    let mut absent_result = valid.clone();
+    absent_result[1].values = None;
+    malformed.push(absent_result);
     let mut conflicting_error = valid.clone();
     conflicting_error[1].error = Some(json!({"code": "invalid"}));
     malformed.push(conflicting_error);
     for results in malformed {
         assert!(
-            validated_embedding_batch_vectors(&results, &input_hash, Some(&profile)).is_err(),
+            completed_batch_result(&job, &results).is_err(),
             "must not return the valid first line when a later line fails: {results:?}"
         );
     }
+    let mut failed_member = valid;
+    failed_member[1].values = None;
+    failed_member[1].error = Some(json!({"code": "invalid"}));
+    let partial = completed_batch_result(&job, &failed_member).unwrap();
+    assert!(matches!(
+        partial.members[1].result,
+        kio_adapter::types::EmbeddingMemberResult::Failed { .. }
+    ));
+}
+
+// O3 typed acceptance tests: these call the production Batch converter. They
+// are not HTTP, durable accounting, publication, or retry-scheduling evidence.
+fn o3_batch_acceptance_fixture(
+    image: bool,
+) -> (
+    kio_pipeline::ledger::embedding_job::EmbeddingJob,
+    Vec<kio_adapter::gemini_batch_client::GeminiBatchEmbedOutput>,
+) {
+    use kio_adapter::types::{BillableUnitKind, EmbeddingLogicalJobId};
+    use kio_pipeline::ledger::embedding_job::{
+        EmbeddingJob, EmbeddingJobBinding, EmbeddingJobMember,
+    };
+    use kio_pipeline::task::EmbeddingTaskTarget;
+    // An image job has one member; text may batch. Synthetic canonical target
+    // hashes suffice at this typed result boundary; no source owner is forged.
+    let ids = if image {
+        vec![hash_bytes(b"original PNG member")]
+    } else {
+        vec![hash_bytes(b"text member A"), hash_bytes(b"text member B")]
+    };
+    let input_hash = embedding_job_input_hash(&ids.iter().cloned().collect());
+    let profile_hash = hash_bytes(b"O3 acceptance profile");
+    let members = ids
+        .iter()
+        .map(|id| EmbeddingJobMember {
+            id: id.clone(),
+            target: if image {
+                EmbeddingTaskTarget::Image {
+                    image_hash: id.clone(),
+                    embedding_hash: id.clone(),
+                    profile_hash: profile_hash.clone(),
+                    input_hash: id.clone(),
+                    image_input_receipt: None,
+                }
+            } else {
+                EmbeddingTaskTarget::Chunk {
+                    chunk_hash: id.clone(),
+                    embedding_hash: id.clone(),
+                    profile_hash: profile_hash.clone(),
+                    input_hash: id.clone(),
+                }
+            },
+        })
+        .collect();
+    let outputs = ids
+        .into_iter()
+        .map(|key| {
+            let mut vector = vec![0.0; 768];
+            vector[0] = 1.0;
+            kio_adapter::gemini_batch_client::GeminiBatchEmbedOutput {
+                key,
+                values: Some(vector),
+                error: None,
+                usage: o3_member_usage(
+                    if image {
+                        BillableUnitKind::ImageTokensIn
+                    } else {
+                        BillableUnitKind::TokensIn
+                    },
+                    7,
+                ),
+            }
+        })
+        .collect();
+    (
+        EmbeddingJob {
+            key: kio_pipeline::ledger::TaskKey::new(
+                "scope_test",
+                "embedding",
+                input_hash.clone(),
+                profile_hash,
+            ),
+            submission_seq: 1,
+            // No ledger API is called by this typed acceptance fixture.
+            intent_token: "typed-boundary-only".to_owned(),
+            binding: EmbeddingJobBinding {
+                logical_job_id: EmbeddingLogicalJobId(input_hash),
+                local: false,
+                dimensions: 768,
+                distance: "cosine".to_owned(),
+                modality: "multimodal".to_owned(),
+                members,
+            },
+            known_result: None,
+        },
+        outputs,
+    )
+}
+
+fn o3_member_usage(
+    kind: kio_adapter::types::BillableUnitKind,
+    count: u64,
+) -> kio_adapter::types::EmbeddingUsage {
+    use kio_adapter::types::{AdapterUsage, BillableUnit, EmbeddingUsage};
+    EmbeddingUsage::Metered {
+        usage: AdapterUsage::BillableUnits {
+            billable_units: vec![BillableUnit { kind, count }],
+        },
+    }
+}
+
+#[test]
+fn o3_batch_keyed_invalid_vector_preserves_valid_sibling_and_usage() {
+    use kio_adapter::types::{BillableUnitKind, EmbeddingMemberResult};
+    let (job, valid) = o3_batch_acceptance_fixture(false);
+    let mut nan = vec![0.0; 768];
+    nan[0] = f32::NAN;
+    let mut positive_infinity = vec![0.0; 768];
+    positive_infinity[0] = f32::INFINITY;
+    let mut negative_infinity = vec![0.0; 768];
+    negative_infinity[0] = f32::NEG_INFINITY;
+    for (label, invalid) in [
+        ("wrong_width", vec![1.0; 767]),
+        ("zero_norm", vec![0.0; 768]),
+        ("nan", nan),
+        ("positive_infinity", positive_infinity),
+        ("negative_infinity", negative_infinity),
+    ] {
+        for reverse in [false, true] {
+            let mut outputs = valid.clone();
+            outputs[1].values = Some(invalid.clone());
+            if reverse {
+                outputs.reverse();
+            }
+            // Intended O3 Runtime Red on O2: a bad keyed vector currently
+            // returns Err and discards its independently valid sibling.
+            let completed = completed_batch_result(&job, &outputs)
+                .unwrap_or_else(|error| panic!("{label}, reverse={reverse}: {error}"));
+            assert_eq!(completed.members.len(), 2);
+            let by_id = completed
+                .members
+                .iter()
+                .map(|member| (member.id.as_str(), &member.result))
+                .collect::<BTreeMap<_, _>>();
+            let EmbeddingMemberResult::Vector { vector } = by_id[valid[0].key.as_str()] else {
+                panic!("{label}: successful sibling was discarded");
+            };
+            let expected = valid[0].values.as_ref().unwrap();
+            assert_eq!(
+                vector
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                expected
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>(),
+                "{label}: successful f32 bits must survive neighbor failure",
+            );
+            assert!(
+                matches!(
+                    by_id[valid[1].key.as_str()],
+                    EmbeddingMemberResult::Failed { reason } if reason == "contract_violation"
+                ),
+                "{label}: only the invalid keyed member fails"
+            );
+            // Reported provider usage remains independent of vector validity.
+            assert_eq!(
+                completed.usage,
+                o3_member_usage(BillableUnitKind::TokensIn, 14)
+            );
+        }
+    }
+}
+
+#[test]
+fn o3_batch_usage_is_modality_complete_and_does_not_discard_valid_vectors() {
+    use kio_adapter::types::{AdapterUsage, BillableUnit, BillableUnitKind, EmbeddingUsage};
+    for image in [false, true] {
+        let (job, valid) = o3_batch_acceptance_fixture(image);
+        let baseline = completed_batch_result(&job, &valid).unwrap();
+        let correct = if image {
+            BillableUnitKind::ImageTokensIn
+        } else {
+            BillableUnitKind::TokensIn
+        };
+        let wrong = if image {
+            BillableUnitKind::TokensIn
+        } else {
+            BillableUnitKind::ImageTokensIn
+        };
+        assert_eq!(
+            baseline.usage,
+            o3_member_usage(correct, 7 * valid.len() as u64)
+        );
+        for (label, usage) in [
+            ("missing", EmbeddingUsage::Estimated),
+            ("unmetered_online", EmbeddingUsage::Unmetered),
+            ("wrong_modality", o3_member_usage(wrong, 7)),
+            ("over_bound", o3_member_usage(correct, 8193)),
+            (
+                "empty_units",
+                EmbeddingUsage::Metered {
+                    usage: AdapterUsage::BillableUnits {
+                        billable_units: vec![],
+                    },
+                },
+            ),
+            (
+                "duplicate_units",
+                EmbeddingUsage::Metered {
+                    usage: AdapterUsage::BillableUnits {
+                        billable_units: vec![
+                            BillableUnit {
+                                kind: correct,
+                                count: 3,
+                            },
+                            BillableUnit {
+                                kind: correct,
+                                count: 4,
+                            },
+                        ],
+                    },
+                },
+            ),
+            (
+                "mixed_units",
+                EmbeddingUsage::Metered {
+                    usage: AdapterUsage::BillableUnits {
+                        billable_units: vec![
+                            BillableUnit {
+                                kind: correct,
+                                count: 7,
+                            },
+                            BillableUnit {
+                                kind: wrong,
+                                count: 1,
+                            },
+                        ],
+                    },
+                },
+            ),
+        ] {
+            let mut outputs = valid.clone();
+            outputs.last_mut().unwrap().usage = usage;
+            let completed = completed_batch_result(&job, &outputs).unwrap();
+            assert_eq!(
+                completed.members, baseline.members,
+                "image={image}, {label}"
+            );
+            assert_eq!(
+                completed.usage,
+                EmbeddingUsage::Estimated,
+                "image={image}, {label}"
+            );
+        }
+    }
+}
+
+#[test]
+fn o3_batch_explicit_member_errors_preserve_sibling_and_classify_rejection() {
+    use kio_adapter::types::EmbeddingMemberResult;
+    let (job, valid) = o3_batch_acceptance_fixture(false);
+    for (error, reason) in [
+        (json!({"code": 401}), "auth_error"),
+        (json!({"code": 403}), "auth_error"),
+        (json!({"code": 429}), "rate_limit"),
+        (json!({"code": 503}), "network_error"),
+        (json!({"code": 400}), "invalid_input"),
+        (json!({"code": "unknown"}), "contract_violation"),
+        (json!({}), "contract_violation"),
+    ] {
+        let mut outputs = valid.clone();
+        outputs[1].values = None;
+        outputs[1].error = Some(error.clone());
+        let completed = completed_batch_result(&job, &outputs).unwrap();
+        assert!(matches!(
+            &completed.members[0].result,
+            EmbeddingMemberResult::Vector { .. }
+        ));
+        assert!(
+            matches!(
+                &completed.members[1].result,
+                EmbeddingMemberResult::Failed { reason: actual } if actual == reason
+            ),
+            "{error}: {completed:?}"
+        );
+    }
+    // Classification is not retry scheduling: this response type has no HTTP
+    // Retry-After, attempt counter, or durable result-unknown authority.
 }
 
 #[test]
@@ -947,7 +1294,7 @@ fn contextual_task_mixed_outcomes_crash_recovery_and_retry_are_independent() {
     assert_ne!(work[0].work_key, work[1].work_key);
     let store = TaskStore::new(repo.kio_dir());
     let now = "2026-09-26T00:00:00Z";
-    enqueue_embedding_tasks(&store, &repo, &work, true, now).unwrap();
+    enqueue_embedding_tasks(&store, &repo, &work, &profile, true, now).unwrap();
     let mut transitions = BTreeMap::new();
     record_embedding_transitions(&mut transitions, [&work[0]], embedding_done_transition());
     record_embedding_transitions(
@@ -1042,7 +1389,8 @@ fn contextual_task_mixed_outcomes_crash_recovery_and_retry_are_independent() {
         })
         .unwrap();
     let retry =
-        filter_embeddable_by_task_state(&store, work[1..].to_vec(), false, &control).unwrap();
+        filter_embeddable_by_task_state(&store, work[1..].to_vec(), &profile, false, &control)
+            .unwrap();
     assert_eq!(retry.len(), 1);
     assert_eq!(retry[0].work_key, work[1].work_key);
 
@@ -1057,9 +1405,11 @@ fn contextual_task_mixed_outcomes_crash_recovery_and_retry_are_independent() {
         })
         .unwrap();
     let before = fs::read(repo.kio_dir().join("tasks.jsonl")).unwrap();
-    assert!(validate_embedding_task_bindings(&store, &work).is_err());
-    assert!(filter_embeddable_by_task_state(&store, work.clone(), false, &control).is_err());
-    assert!(enqueue_embedding_tasks(&store, &repo, &work, true, now).is_err());
+    assert!(validate_embedding_task_bindings(&store, &work, &profile).is_err());
+    assert!(
+        filter_embeddable_by_task_state(&store, work.clone(), &profile, false, &control).is_err()
+    );
+    assert!(enqueue_embedding_tasks(&store, &repo, &work, &profile, true, now).is_err());
     assert_eq!(
         fs::read(repo.kio_dir().join("tasks.jsonl")).unwrap(),
         before
@@ -1167,4 +1517,169 @@ fn persisted_embedding_consent_requires_the_exact_builtin_identity() {
             "{field} is part of the exact built-in identity"
         );
     }
+}
+
+// O3 local-claim regression: below the scope writer lock, not two CLI writers.
+#[test]
+fn o3_fresh_local_image_claim_survives_competing_enrichment() {
+    use kio_adapter::types::EmbeddingLogicalJobId;
+    use kio_core::scope::LockSession;
+    use kio_core::test_control::TestEnvGuard;
+    use kio_pipeline::ledger::embedding_job::{
+        EmbeddingJobBinding, EmbeddingJobMember, EmbeddingReservationOutcome,
+        EmbeddingReserveRequest,
+    };
+    use kio_pipeline::ledger::ops::{
+        BudgetCapConfig, cost_ledger_rows_for_key, get_batch_request, reserve_embedding_job,
+    };
+    use kio_pipeline::ledger::{BatchState, RequestKind, TaskKey};
+    use std::sync::mpsc;
+
+    if !isolated_child_for(
+        "contextual_embedding_tests::o3_fresh_local_image_claim_survives_competing_enrichment",
+    ) {
+        return;
+    }
+    let control = ControlHandle::new(DebugTestControl::from_env());
+    let settings = Arc::new(kio_adapter::tool_lock::AdapterRuntimeSettings::default());
+    let root = private_tempdir();
+    let context = AppContext {
+        working_directory: root.path().to_path_buf(),
+        interaction: Arc::new(QuietInteraction),
+    };
+    // Complete, CRC-valid 1x1 RGBA PNG, filter0 + ffffffff. An unknown
+    // evaluator selector disables embedding only while native source ownership
+    // is indexed; it does not fabricate a CAS owner or remove an existing result.
+    let png: [u8; 68] = [
+        0x89, b'P', b'N', b'G', 13, 10, 26, 10, 0, 0, 0, 13, b'I', b'H', b'D', b'R', 0, 0, 0, 1, 0,
+        0, 0, 1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 11, b'I', b'D', b'A', b'T', 120, 156,
+        99, 248, 15, 4, 0, 9, 251, 3, 253, 251, 94, 107, 43, 0, 0, 0, 0, b'I', b'E', b'N', b'D',
+        174, 66, 96, 130,
+    ];
+    fs::write(root.path().join("claim.png"), png).unwrap();
+    {
+        let _disabled = TestEnvGuard::set("KIO_EVAL_DETERMINISTIC_EMBED", "fixture-disabled");
+        execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+        index(&context);
+    }
+    let execution = embedding_execution(&settings, &control).unwrap();
+    assert_eq!(execution, EmbeddingExecution::DeterministicEvaluator);
+    let profile = declared_embedding_profile(execution);
+    assert_eq!(profile.dimensions, 768);
+    let locks = LockSession::default();
+    let repo = Repository::open_in_session(root.path(), control.clone(), &locks).unwrap();
+    // The whole below-lock operation has real production writer authority.
+    // The reservation owner and competing sub-operation share that authority;
+    // no second public writer CLI is claimed to bypass the lock.
+    let _writer = repo.lock_store_in_session(&locks).unwrap();
+    let image_hash = hash_bytes(&png);
+    let (plan, _) = crate::embedding::input::prepare_owned_embedding_image(
+        &repo.object_store(),
+        &image_hash,
+        &profile,
+    )
+    .unwrap();
+    let target = plan.target.clone();
+    let kio_pipeline::task::EmbeddingTaskTarget::Image { embedding_hash, .. } = &target else {
+        panic!("owned image fixture must produce an image target");
+    };
+    let embedding_hash = embedding_hash.clone();
+    assert!(repo.object_store().read_embedding(&embedding_hash).is_err());
+    let scope_id = repo.scope_identity().unwrap().scope_id;
+    let key = TaskKey::new(
+        &scope_id,
+        "embedding",
+        &embedding_hash,
+        &profile.profile_hash,
+    );
+    let binding = EmbeddingJobBinding {
+        logical_job_id: EmbeddingLogicalJobId(embedding_hash.clone()),
+        local: true,
+        dimensions: 768,
+        distance: profile.distance.clone(),
+        modality: profile.modality.clone(),
+        members: vec![EmbeddingJobMember {
+            id: image_hash,
+            target,
+        }],
+    };
+    let ledger = crate::ledger_access::open_optional_ledger_db(&control)
+        .unwrap()
+        .unwrap();
+    let owner_db = ledger.clone();
+    let owner_key = key.clone();
+    let (ready_tx, ready_rx) = mpsc::sync_channel(0);
+    let (release_tx, release_rx) = mpsc::sync_channel(0);
+    let owner = std::thread::spawn(move || {
+        let caps = BudgetCapConfig {
+            device_cap: 10.0,
+            folder_cap: Some(10.0),
+            device_per_adapter_cap: None,
+        };
+        let reserved = reserve_embedding_job(
+            &owner_db,
+            &EmbeddingReserveRequest {
+                key: &owner_key,
+                candidate_usd: 0.0,
+                caps: &caps,
+                request_kind: RequestKind::Sync,
+                timeout_seconds: Some(300),
+                bypass_cap_denial: false,
+                binding: &binding,
+            },
+        )
+        .unwrap();
+        let EmbeddingReservationOutcome::Reserved(job) = reserved else {
+            panic!("fixture must own a fresh authentic image intent");
+        };
+        ready_tx.send(job.clone()).unwrap();
+        // A channel retains the live owner until the competitor has finished;
+        // no clock manipulation, sleeps, stale fixture or timeout is a Red oracle.
+        release_rx.recv().unwrap();
+        job
+    });
+    let original = ready_rx.recv().unwrap();
+    let before = get_batch_request(&ledger, &key).unwrap().unwrap();
+    assert_eq!(before.state, BatchState::Intent);
+    assert_eq!(
+        before.intent_token.as_deref(),
+        Some(original.intent_token.as_str())
+    );
+    assert!(before.stale_after_at.unwrap() > control.now_millis());
+    assert!(cost_ledger_rows_for_key(&ledger, &key).unwrap().is_empty());
+    let competing = crate::embedding::executor::run_embedding_enrichment(
+        &crate::invocation::Invocation {
+            context: &context,
+            settings: &settings,
+            control: &control,
+            locks: &locks,
+        },
+        &repo,
+        false,
+        false,
+        false,
+    );
+    // Capture owned physical values while the original owner is still alive.
+    // Release/join it before assertions so an intended failure cannot leave a
+    // blocked fixture thread behind.
+    let terminal = cost_ledger_rows_for_key(&ledger, &key).unwrap();
+    let after = get_batch_request(&ledger, &key).unwrap().unwrap();
+    release_tx.send(()).unwrap();
+    assert_eq!(owner.join().unwrap(), original);
+    // Intended O3 Runtime Red: current image InFlight handling records a local
+    // crash terminal row although this exact owner's deadline is still future.
+    assert!(
+        terminal.is_empty(),
+        "a live image owner's claim must not be crash-settled by its competitor: {terminal:?}"
+    );
+    competing.expect("fixture must reach and return from the competing image runner");
+    assert_eq!(after.state, BatchState::Intent);
+    assert_eq!(after.intent_token, before.intent_token);
+    assert_eq!(after.submission_seq, before.submission_seq);
+    assert_eq!(after.stale_after_at, before.stale_after_at);
+    assert_eq!(after.key, before.key);
+    assert!(
+        repo.object_store().read_embedding(&embedding_hash).is_err(),
+        "competing recovery must not publish the live owner's image result"
+    );
 }

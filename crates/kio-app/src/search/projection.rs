@@ -1,4 +1,4 @@
-use crate::embedding::enrichment::authorized_local_image_object_hash;
+use crate::embedding::input::authorized_local_image_object_hash;
 use crate::historical_reindex::pinned_done_units;
 use crate::historical_reindex::retained_history_instances;
 use crate::image_authority;
@@ -82,6 +82,7 @@ pub(crate) fn replica_candidates_for(
         short_tokens,
         mode,
         query_vec,
+        query_profile,
         config,
     } = request;
     let participating = searched
@@ -136,6 +137,30 @@ pub(crate) fn replica_candidates_for(
     // Keep `Some(&[])`: an empty CAS plan is a verified empty historical
     // answer, not permission to use every durable replica alias.
     let binding_filter = has_runtime_binding_filter.then_some(runtime_binding_filters.as_slice());
+    let mut image_bindings = Vec::new();
+    if matches!(
+        mode,
+        SearchMode::Hybrid | SearchMode::Vector | SearchMode::Image
+    ) {
+        for scope in searched {
+            let authority = image_authorities
+                .get(&scope.scope_id)
+                .ok_or_else(|| "missing current image ownership authority".to_owned())?;
+            let projected = replica
+                .image_bindings_for_policy(&scope.scope_id, selector, &scope.snapshot_at, 100_000)
+                .map_err(|error| format!("image ownership enumeration failed: {error}"))?;
+            image_bindings.extend(projected.into_iter().filter(|owner| {
+                authority.unit_owns_image(
+                    &owner.raw_hash,
+                    &owner.tool_profile_hash,
+                    owner.r#gen,
+                    &owner.manifest_hash,
+                    &owner.unit_key,
+                    &owner.image_id,
+                )
+            }));
+        }
+    }
     let rows = replica
         .search_candidates(&kio_index::aggregator::AggSearchRequest {
             scopes: &participating,
@@ -143,12 +168,18 @@ pub(crate) fn replica_candidates_for(
             selector,
             binding_filter,
             eligible_images,
+            image_binding_filter: &image_bindings,
+            query_profile: Some(query_profile),
             since_cutoff,
             match_expr,
             short_token_forms: &short_forms,
             query_embedding: query_vec,
-            search_text: mode != SearchMode::Vector,
-            search_vector: matches!(mode, SearchMode::Hybrid | SearchMode::Vector),
+            search_text: !matches!(mode, SearchMode::Vector | SearchMode::Image),
+            search_vector: matches!(
+                mode,
+                SearchMode::Hybrid | SearchMode::Vector | SearchMode::Image
+            ),
+            image_only: mode == SearchMode::Image,
             candidate_depth: config.candidate_depth.max(1),
         })
         .map_err(|error| format!("candidate query failed: {error}"))?;
@@ -187,6 +218,21 @@ pub(crate) fn replica_candidates_for(
             .expect("candidate scope participates in the current policy set");
         let mut bindings = Vec::with_capacity(row.bindings.len());
         for binding in row.bindings {
+            if let ResultPayload::Image { image_hash, .. } = &payload
+                && !image_authorities
+                    .get(&row.scope_id)
+                    .expect("candidate scope has current image authority")
+                    .unit_owns_image(
+                        &binding.raw_hash,
+                        &binding.tool_profile_hash,
+                        binding.r#gen,
+                        &binding.manifest_hash,
+                        &row.unit_key,
+                        image_hash,
+                    )
+            {
+                continue;
+            }
             let current_paths = redact_current_policy_paths(policy, binding.current_paths)
                 .map_err(|error| format!("current policy path redaction failed: {error}"))?;
             bindings.push(SearchHistoryBinding {
@@ -199,6 +245,12 @@ pub(crate) fn replica_candidates_for(
                 current_paths,
                 is_live: binding.is_live,
             });
+        }
+        // Old replica rows may predate unit-level image reference authority.
+        // They cannot provide an image Evidence Pointer until rebuilt from
+        // an authenticated owning unit.
+        if matches!(&payload, ResultPayload::Image { .. }) && bindings.is_empty() {
+            continue;
         }
         let text_term = row
             .text_rank
@@ -562,13 +614,20 @@ fn collect_scope_projection(
         }
     }
 
-    // Image vectors remain attached to every committed citing chunk. At query
-    // time the same eligible chunk binding gates the image reference, so a
-    // historical image never needs a second visibility rule. The strict
-    // source-index schema guarantees that `image_vec` is present.
+    // Only a citing chunk's own pinned normalized unit may provide an image
+    // Evidence Pointer. A globally owned hash cannot authorize arbitrary
+    // user-written links in another unit. Query-time bindings retain the same
+    // exact manifest check for current and historical selectors.
     let mut image_vectors = BTreeMap::<String, Option<Vec<f32>>>::new();
     let mut seen_references = BTreeSet::<(String, String)>::new();
     let mut images = Vec::new();
+    let mut image_bindings = BTreeMap::<&str, Vec<&kio_index::aggregator::AggBinding>>::new();
+    for binding in &bindings {
+        image_bindings
+            .entry(binding.chunk_id.as_str())
+            .or_default()
+            .push(binding);
+    }
     for chunk in &chunks {
         for image in extract_related_images(&chunk.text) {
             let Some(image_id) =
@@ -576,6 +635,23 @@ fn collect_scope_projection(
             else {
                 continue;
             };
+            if !image_bindings
+                .get(chunk.chunk_id.as_str())
+                .is_some_and(|owners| {
+                    owners.iter().any(|binding| {
+                        image_authority.unit_owns_image(
+                            &binding.raw_hash,
+                            &binding.tool_profile_hash,
+                            binding.r#gen,
+                            &binding.manifest_hash,
+                            &chunk.unit_key,
+                            &image_id,
+                        )
+                    })
+                })
+            {
+                continue;
+            }
             // `agg_image_refs` has one reference per image/chunk pair. Keep
             // the first URI deterministically if malformed non-canonical content
             // happens to name the same image twice with different authorities.
@@ -592,9 +668,19 @@ fn collect_scope_projection(
             };
             if let Some(embedding) = vector {
                 images.push(kio_index::aggregator::AggImage {
-                    image_id,
+                    image_id: image_id.clone(),
                     chunk_id: chunk.chunk_id.clone(),
                     image_uri: image.image_uri,
+                    profile: conn.query_row(
+                        "SELECT dimensions, distance, modality, profile_hash FROM embeddings WHERE target_type='image' AND target_id=?1",
+                        [&image_id],
+                        |row| Ok(embedding_store::EmbeddingProfileSummary {
+                            dimensions: row.get::<_, i64>(0)? as u64,
+                            distance: row.get(1)?,
+                            modality: row.get(2)?,
+                            profile_hash: row.get(3)?,
+                        }),
+                    ).map_err(|error| KioError::schema(format!("image profile projection: {error}")))?,
                     embedding,
                 });
             }
@@ -1143,14 +1229,14 @@ pub(crate) fn write_through_projection_or_log_for_at_snapshot(
     write_through_projection_or_log_with_requested_at(ctx, kio_dir, &[snapshot_commit]);
 }
 
-/// A repaired commit preserves its parent's tree, but it has a distinct commit
-/// identity. Populate the derived source cache for that new identity before a
-/// full replica projection asks `current_history_plan_from_cache` for it.
+/// Populate the derived source cache for a repaired or finalized purge commit
+/// before a full replica projection asks `current_history_plan_from_cache` for
+/// its distinct identity. Repair preserves the parent tree; purge preserves
+/// indexed survivors while excluding its targets.
 ///
-/// This runs only after `verify-objects` has durably recovered bytes and
-/// advanced HEAD. It is deliberately separate from manual `snapshot`: that
-/// path may introduce unindexed content and must remain `Rebuilding` until a
-/// real index pass replaces sqlite.db.
+/// Call only after the writer has durably advanced HEAD. This is deliberately
+/// separate from manual `snapshot`: that path may introduce unindexed content
+/// and must remain `Rebuilding` until a real index pass replaces sqlite.db.
 pub(crate) fn materialize_repaired_snapshot_entries(
     repo: &Repository,
     repaired_head: &str,

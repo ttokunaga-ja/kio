@@ -76,6 +76,7 @@ finite_selector!(MarkdownizeAdapterMode {
     "reject_incremental_and_full" => RejectIncrementalAndFull,
 });
 finite_selector!(AggregatorProjectionFault { "refresh" => Refresh });
+finite_selector!(EmbeddingPublicationFault { "before_source_write" => BeforeSourceWrite });
 finite_selector!(ReplicaFault {
     "index_before_marker" => IndexBeforeMarker, "index" => Index,
     "reindex_before_marker" => ReindexBeforeMarker, "reindex" => Reindex,
@@ -194,10 +195,12 @@ pub struct CliTestControl {
     pub snapshot_before_publication_ready: Option<PathBuf>,
     pub snapshot_writer_boundary_ready: Option<PathBuf>,
     pub aggregator_projection_fault: Selector<AggregatorProjectionFault>,
+    pub embedding_publication_fault: Selector<EmbeddingPublicationFault>,
     pub replica_after_head_fault: Selector<ReplicaFault>,
     pub search_response_barrier_ready: Option<PathBuf>,
     pub search_final_consent_barrier_ready: Option<PathBuf>,
     pub query_embed_trace: Option<PathBuf>,
+    pub task_embed_trace: Option<PathBuf>,
     pub markdownize_adapter: Selector<MarkdownizeAdapterMode>,
     pub gc_post_publication_ready: Option<PathBuf>,
     pub gc_runtime_checkpoints: Selector<u64>,
@@ -310,6 +313,10 @@ impl DebugTestControl {
                     "KIO_TEST_AGGREGATOR_PROJECTION_FAULT",
                     AggregatorProjectionFault::parse,
                 ),
+                embedding_publication_fault: selector(
+                    "KIO_TEST_EMBEDDING_PUBLICATION_FAULT",
+                    EmbeddingPublicationFault::parse,
+                ),
                 replica_after_head_fault: selector(
                     "KIO_TEST_REPLICA_AFTER_HEAD_FAULT",
                     ReplicaFault::parse,
@@ -319,6 +326,7 @@ impl DebugTestControl {
                     "KIO_TEST_SEARCH_FINAL_CONSENT_BARRIER_READY",
                 ),
                 query_embed_trace: path("KIO_TEST_QUERY_EMBED_TRACE"),
+                task_embed_trace: path("KIO_TEST_TASK_EMBED_TRACE"),
                 markdownize_adapter: selector(
                     "KIO_TEST_MARKDOWNIZE_ADAPTER",
                     MarkdownizeAdapterMode::parse,

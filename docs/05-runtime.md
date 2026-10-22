@@ -46,7 +46,7 @@ fail_behavior = "fallback"       # "fallback" | "error" | "warn"
 embedding profile_hash 不一致 → text fallback (KIO-E-SEARCH-VEC-INCOMPAT-001)
 embedding 承認なし (下記 consent gate。online_api / offline_api) → text fallback (KIO-E-SEARCH-VEC-UNAUTHORIZED-001)
 同一 query が in-flight ([04-pipeline.md §5.4](04-pipeline.md)) → text fallback (fallback_reason="embedding_in_flight")
-query embedding 応答が受入検査 ([07-adapter-spec.md §5.3](07-adapter-spec.md)) で contract violation → text fallback (fallback_reason="embedding_contract_violation")
+query embedding 応答が受入検査 ([04-pipeline.md §5.1](04-pipeline.md)) で contract violation → text fallback (fallback_reason="embedding_contract_violation")
 上記のいずれにも該当せず vector のみ利用不能 (index 未構築等の技術的理由) → text
 両方利用可能 → hybrid
 両方不可 → error (KIO-E-SEARCH-VEC-UNAVAIL-001)
@@ -58,7 +58,7 @@ query embedding 応答が受入検査 ([07-adapter-spec.md §5.3](07-adapter-spe
 構造化 warning を stderr / `--json` の `warnings[]` へ出す — exit code も fallback と同じ (error に
 しない)。
 
-**query embedding の consent gate**: vector | hybrid の fresh page 1 は query embedding
+**query embedding の consent gate**: image | vector | hybrid の fresh page 1 は query embedding
 (07 §5.3 の `input_type: "query"` — sync 呼出) を要する。`online_api` と `offline_api` の
 HTTP 呼出は、いずれも [07-adapter-spec.md §3](07-adapter-spec.md) の paired grant の対象である
 (payload は query 文字列のみで folder 内容を含まない)。**現在の policy で許可された参加 scope の
@@ -77,35 +77,45 @@ source cost ledger の open・stale sweep・claim より前に行う。先行し
 当該 in-flight 処理の終了後に明示的な再試行が必要となる。送信済み bytes は取り消せない。
 
 承認が成立しない場合、通常の auto / `--mode hybrid` は text fallback
-(`fallback_reason="embedding_not_authorized"`)、`--mode vector` 明示は
+(`fallback_reason="embedding_not_authorized"`)、`--mode image` / `--mode vector` 明示は
 `KIO-E-SEARCH-VEC-UNAUTHORIZED-001` で error。**ユーザー意思由来の text fallback は
 `fail_behavior` の対象外である** — `embedding_not_authorized` と `offline` は、設定値に関わらず
 通常の auto / `--mode hybrid` では text fallback になる。一方、`embedding_in_flight`
 (同一 query の並行実行 — [04-pipeline.md §5.4](04-pipeline.md)) と
-`embedding_contract_violation` (応答の受入検査違反 — [07-adapter-spec.md §5.3](07-adapter-spec.md))
+`embedding_contract_violation` (応答の受入検査違反 — [04-pipeline.md §5.1](04-pipeline.md))
 は技術的な過渡失敗であり `fail_behavior` の対象: auto は text fallback、`--mode hybrid` は
-fail_behavior に従い、`--mode vector` 明示は `KIO-E-SEARCH-VEC-UNAVAIL-001` で error。
+fail_behavior に従い、`--mode image` / `--mode vector` 明示は `KIO-E-SEARCH-VEC-UNAVAIL-001` で error。
 
 **`search --online` は active な HTTP embedding Adapter と利用可能な vector 経路を要求する**。
-cloud / authenticated local HTTPS の両方を選べるが、一時 opt-in ではなく既存の exact paired grant
+cloud / local endpoint の両方を選べるが、一時 opt-in ではなく既存の exact paired grant
 が必要である。この明示指定時は、通常の auto / hybrid の precheck fallback に任せず、承認・
 Adapter・index の不足を error にする。**`--offline` は当該 invocation の全 HTTP dispatch を禁止する**。
 `online_api` と `offline_api` の query embedding はともに禁止され、通常の auto / `--mode hybrid`
-は text fallback (`fallback_reason="offline"`)、`--mode vector` 明示は
+は text fallback (`fallback_reason="offline"`)、`--mode image` / `--mode vector` 明示は
 `KIO-E-SEARCH-VEC-UNAVAIL-001` で error になる。
 
-`offline_api` の local HTTPS Adapter にも exact paired network grant と device-local managed CA
-trust が必要であり、loopback は承認の免除ではない。local 呼出は paid ledger にゼロ単価の行を作らず、
-device cap を消費しない。`online_api` の query 課金は `scope_id='device'` の sync request として
-縮退 2 相に記帳し、folder cap の対象外、device cap / per_adapter には通常合算する
-([04-pipeline.md §5.4](04-pipeline.md))。**in-process の `deterministic_library` は HTTP を使わず、
-network grant と `--offline` の禁止対象から除外される**。この経路に `search --online` は指定できない。
-profile 互換性と vector の受入検査は local / deterministic にも適用する。
+ローカル endpoint の HTTP/HTTPS、paired grant と peer 表示は
+[07-adapter-spec.md §3.1](07-adapter-spec.md) に従う。EG2 の native 実行はネットワークを使わず、
+モデル準備済みなら `--offline` でも text/image/query を処理する。モデル download は行わない。
+`--online` は active HTTP profile と vector 経路の要求であり、EG2 への一時切替や送信許可ではない。
+Task と query の 0 USD 記帳は [04-pipeline.md §5](04-pipeline.md) に従う。
+
+モデル未準備・同意未了・hash 不一致・runtime/resource 失敗は理由付き unavailable とする。
+通常の auto/hybrid は既存 fail_behavior に従う text fallback、明示 image/vector は error とし、
+画像を空の成功へ置き換えない。モデル準備と失敗理由の public code/exit は
+[06-cli-spec.md §8](06-cli-spec.md) に従う。既存 vector/text の利用可能性を資源 pause で失わせない。
 
 **page 2+ の cursor replay は page 1 の device-local query vector を再利用し、再送信・再課金しない**
 (§1.5)。ただし、現在の policy・grant・`--offline` を含む mode precheck と cursor の整合性検査は残る。
 キャッシュ済み vector は失効した grant の代わりにはならず、条件変更で mode / query hash が変われば
 replay は拒否される。cache の欠落・破損時も再送信せず `KIO-E-SEARCH-CURSOR-001` で拒否する。
+
+image mode は文字 query を画像候補に限定する。画像ファイルを query にする構文ではない。
+共通 runner の Completed query vector で同 profile の image vector を cosine 採点する。
+独立画像は画像 pointer、文書内図は権限を持つ引用 chunk/document の pointer へ解決し、
+bare foreign image URI を返さない。`related_images` は vector 完成と独立した所有権付き参照である。
+image を mode enum、query digest、cursor binding に含め、page 2+ は §1.5 の cache だけを再利用する。
+producer 混在の互換性は [03-data-model.md §7](03-data-model.md) に従い、CPU 認定を検索 gate にしない。
 
 ## 1.2 CLI
 
@@ -301,9 +311,9 @@ page 1 の `since_cutoff` (UTC ISO8601 + `Z`) も保持する:
 - `since_cutoff`: `--since` の page 1 で一度だけ計算した下限。page 2 以降は現在時刻から再計算しない
 - `query_hash` (token 全体に 1 つ、§1.8) が不一致の cursor は `KIO-E-SEARCH-CURSOR-001` で拒否する
 
-2 ページ目以降は同一の候補取得 → RRF (§1.3) → MMR (§1.4) を再計算し、consumed 件を skip して続きを返す。**vector / hybrid の replay は page 1 の query vector を再利用する** — query の再 embedding は行わない (provider の非決定性で候補・順位が変わり、consumed の skip が重複・欠落を生む)。page 1 の正規化済み query vector は device-local の `${XDG_CACHE_HOME:-$HOME/.cache}/kio/search-query-cache/<query_vector_digest>` に best-effort で保存する（query 本文は保存しない）。digest (= `query_vector_digest`) は **token の独立 field であり、かつ §1.8 の query_hash 構成要素**である (query_hash は一方向 hash であり、replay が読む cache leaf の鍵は token field 側から得る。vector|hybrid のみ — text mode では field 省略)。replay はこの device cache **だけ**から vector を読み、canonical vector bytes の sha256 を digest と再照合する。cache が無い・壊れている・digest 不一致なら `KIO-E-SEARCH-CURSOR-001` (再検索が正) とし、再 embedding も source `.kio/index/sqlite.db` の `embeddings` / `chunk_vec`、CAS の embedding object も読取り・書込みもしない。replay が読む query vector の唯一の入力は上記 device-local cache である。順序安定性の根拠は SQLite WAL のスナップショット分離**ではなく**、「commit 単位で固定された chunk 集合 + 決定論的な順位計算 + `index_generation` による FTS 内容不変の保証」である。CLI 呼び出しを跨いでも成立する。
+2 ページ目以降は同一の候補取得 → RRF (§1.3) → MMR (§1.4) を再計算し、consumed 件を skip して続きを返す。**image / vector / hybrid の replay は page 1 の query vector を再利用する** — query の再 embedding は行わない (provider の非決定性で候補・順位が変わり、consumed の skip が重複・欠落を生む)。page 1 の正規化済み query vector は device-local の `${XDG_CACHE_HOME:-$HOME/.cache}/kio/search-query-cache/<query_vector_digest>` に best-effort で保存する（query 本文は保存しない）。digest (= `query_vector_digest`) は **token の独立 field であり、かつ §1.8 の query_hash 構成要素**である (query_hash は一方向 hash であり、replay が読む cache leaf の鍵は token field 側から得る。image|vector|hybrid のみ — text mode では field 省略)。replay はこの device cache **だけ**から vector を読み、canonical vector bytes の sha256 を digest と再照合する。cache が無い・壊れている・digest 不一致なら `KIO-E-SEARCH-CURSOR-001` (再検索が正) とし、再 embedding も source `.kio/index/sqlite.db` の `embeddings` / `chunk_vec`、CAS の embedding object も読取り・書込みもしない。replay が読む query vector の唯一の入力は上記 device-local cache である。順序安定性の根拠は SQLite WAL のスナップショット分離**ではなく**、「commit 単位で固定された chunk 集合 + 決定論的な順位計算 + `index_generation` による FTS 内容不変の保証」である。CLI 呼び出しを跨いでも成立する。
 
-`--offset` は cursor の糖衣であり、同じ再現規則で確定順序の `offset` 位置から `limit` 件を返す。**vector|hybrid の `--offset` は単一実行内の slice である** (当該実行が取得した query vector に対する確定順序 — CLI 呼び出しを跨ぐ継続は cursor が正。再 embedding の非決定性は cursor の digest 再利用でのみ回避される)。終端判定は **alias 展開後の final result stream の末尾** — それを超えたら `next_cursor: null` (`--all-history` / `--since` で候補プール末尾を終端にすると最後の alias group を取り残す。default 系は候補プール = final stream で同値)。
+`--offset` は cursor の糖衣であり、同じ再現規則で確定順序の `offset` 位置から `limit` 件を返す。**image|vector|hybrid の `--offset` は単一実行内の slice である** (当該実行が取得した query vector に対する確定順序 — CLI 呼び出しを跨ぐ継続は cursor が正。再 embedding の非決定性は cursor の digest 再利用でのみ回避される)。終端判定は **alias 展開後の final result stream の末尾** — それを超えたら `next_cursor: null` (`--all-history` / `--since` で候補プール末尾を終端にすると最後の alias group を取り残す。default 系は候補プール = final stream で同値)。
 
 ## 1.6 Snapshot 越し検索 (`--at`)
 
@@ -869,7 +879,7 @@ aggregate 上の bounded `instr` レーンを用い、FTS5 の trigram 下限に
    異なる folder 値の統合は定義しない。cursor が bind する実効値 (§1.5) もこの解決に従う —
    **ただし fail_behavior は挙動方針であり確定順序に影響しないため bind / query_hash preimage の
    対象外**)
-6. vector / hybrid の横断条件は [03-data-model.md §7](03-data-model.md) に従う。embedding profile が全 scope で一致しない場合、横断部分は text (BM25 rank) のみで統合し、`fallback_reason` に記録する (**`--mode vector` 明示時は fallback しない** — profile 不一致の scope を KIO-E-SEARCH-VEC-INCOMPAT-001 の excluded_scopes として除外し、全 scope 除外なら error — §1.2 の「失敗時は error」と同じ)。各 selected scope は replica/source-index candidate を読む前に `kio_format_version == KIO_FORMAT_VERSION` を検証する。missing、非 string、malformed、older/newer、未知を含む任意の不一致は `KIO-E-STORE-VERSION-001` / exit 8 で**command 全体を直ちに停止**し、当該 scope を `excluded_scopes` や `fallback_reason` に入れて healthy scope の partial result を返さない。source SQLite への書込みは行わない。**全 scope の除外理由が同一 code の場合、command は当該 code とその単独実行時の exit を返す (一般規則)** — REBUILDING → exit 3・INCOMPAT → exit 8・journal (`KIO-E-PURGE-JOURNAL-ACTIVE-001` — §3.5) → exit 3・DUP → exit 3 (ユーザーの dedupe 後に回復可能 — [08-evidence-pointer-spec.md §4.3](08-evidence-pointer-spec.md) の registry_duplicate = 3 と同一分類)。理由が混在して全 scope 除外となった場合は通常の SCOPE-ALL-FAILED とし、**exit は除外理由の retryability で分割する — 単独時 exit 3 の code (REBUILDING・journal・DUP・timeout 等の retryable 系) を 1 つでも含めば exit 3、全て permanent 系なら exit 4** (横断規約の「4 = 再試行で進展しない」([06-cli-spec.md §7](06-cli-spec.md)) と整合 — retryable 理由の scope は再試行で回復し得る)。個別理由は excluded_scopes[].reason で判別する。embedding 承認の consent gate (§1.1) は**送信 gate であり per-scope の除外条件ではない** — 承認ゼロなら通常の auto / hybrid は検索全体が text fallback (--mode vector / --online 明示時は error。excluded_scopes には計上しない)。§1.1 の送信 gate を満たして送信された query vector は profile 互換な全参加 scope の vector 検索に用いる (未承認 scope も含む — 送信は 1 回であり scope 別の再送信は発生しない)
+6. image / vector / hybrid の横断条件は [03-data-model.md §7](03-data-model.md) に従う。embedding profile が全 scope で一致しない場合、横断部分は text (BM25 rank) のみで統合し、`fallback_reason` に記録する (**`--mode image` / `--mode vector` 明示時は fallback しない** — profile 不一致の scope を KIO-E-SEARCH-VEC-INCOMPAT-001 の excluded_scopes として除外し、全 scope 除外なら error — §1.2 の「失敗時は error」と同じ)。各 selected scope は replica/source-index candidate を読む前に `kio_format_version == KIO_FORMAT_VERSION` を検証する。missing、非 string、malformed、older/newer、未知を含む任意の不一致は `KIO-E-STORE-VERSION-001` / exit 8 で**command 全体を直ちに停止**し、当該 scope を `excluded_scopes` や `fallback_reason` に入れて healthy scope の partial result を返さない。source SQLite への書込みは行わない。**全 scope の除外理由が同一 code の場合、command は当該 code とその単独実行時の exit を返す (一般規則)** — REBUILDING → exit 3・INCOMPAT → exit 8・journal (`KIO-E-PURGE-JOURNAL-ACTIVE-001` — §3.5) → exit 3・DUP → exit 3 (ユーザーの dedupe 後に回復可能 — [08-evidence-pointer-spec.md §4.3](08-evidence-pointer-spec.md) の registry_duplicate = 3 と同一分類)。理由が混在して全 scope 除外となった場合は通常の SCOPE-ALL-FAILED とし、**exit は除外理由の retryability で分割する — 単独時 exit 3 の code (REBUILDING・journal・DUP・timeout 等の retryable 系) を 1 つでも含めば exit 3、全て permanent 系なら exit 4** (横断規約の「4 = 再試行で進展しない」([06-cli-spec.md §7](06-cli-spec.md)) と整合 — retryable 理由の scope は再試行で回復し得る)。個別理由は excluded_scopes[].reason で判別する。embedding 承認の consent gate (§1.1) は**送信 gate であり per-scope の除外条件ではない** — 承認ゼロなら通常の auto / hybrid は検索全体が text fallback (--mode image / --mode vector / --online 明示時は error。excluded_scopes には計上しない)。§1.1 の送信 gate を満たして送信された query vector は profile 互換な全参加 scope の vector 検索に用いる (未承認 scope も含む — 送信は 1 回であり scope 別の再送信は発生しない)
 
 ### replica の候補経路と cursor
 
@@ -1771,7 +1781,7 @@ kio view <path> --at <commit>
 
 # 5. プロセスモデル (常駐なし)
 
-Kio は **常駐 daemon を持たない**。すべての処理は CLI コマンドのプロセス内で完結する。
+Kio は **常駐 daemon を持たない**。処理の寿命は CLI command に従う。EG2 は [07-adapter-spec.md §5.3](07-adapter-spec.md) の管理 worker を使い、command 終了後に常駐しない。
 
 - interval 発火 (定期 auto snapshot, Phase 4) は OS スケジューラ (launchd / systemd user timer / Task Scheduler) から `kio snapshot auto` を起動する委譲方式とする (§8.2)
 - idle 検出 (`gc.mode="on_idle"`) も OS scheduler が起動する `kio snapshot auto` の都度に判定し、Kio 自身は常駐しない (§2.3, §8.2)
@@ -1807,7 +1817,7 @@ batch 系と reindex は外部副作用 (upload / job 作成) と batch_requests
 規約:
 
 - 読み取り系 (search / log / view / open / inspect / evidence verify / export / status / diff) は通常 `.kio/.lock` を取得しない。`kio index` と `kio search` の同時実行は許容し、検索は scope の `.kio/index/sqlite.db` ではなく公開済み `aggregator.sqlite` の projection だけを読む。例外として、fresh page 1 で HTTP query embedding を送る search は、許可を与える参加 scope の writer lease を取得し、current policy / paired grant を最終検証して処理終了まで保持する (§1.1)
-- search の月次 budget 観測 (`index_status.budget_paused`) は、1 invocation につき device-global cost-ledger の read-only snapshot を command preflight で 1 個だけ作り、その snapshot と取得時の UTC 集計月を response まで保持する。snapshot は開始時と終了時の観測一致を要求する stable-or-fail であり、cross-file の atomic snapshot ではない。失敗時の code / exit は [06-cli-spec.md §7](06-cli-spec.md) に従う。final consent check を通過した online_api の vector|hybrid fresh page 1 に限り、search は cost-ledger の device 行 (`scope_id='device'`) へ claim と stale 回収・剪定を書き込む (claim 後の adapter failure で text fallback になっても同じ)。offline / profile 非互換 / final consent 拒否による送信前の auto→text では書き込まない。device 行の直列化は cost-ledger 側の transaction が担う ([04-pipeline.md §5.4](04-pipeline.md))
+- search の月次 budget 観測 (`index_status.budget_paused`) は、1 invocation につき device-global cost-ledger の read-only snapshot を command preflight で 1 個だけ作り、その snapshot と取得時の UTC 集計月を response まで保持する。snapshot は開始時と終了時の観測一致を要求する stable-or-fail であり、cross-file の atomic snapshot ではない。失敗時の code / exit は [06-cli-spec.md §7](06-cli-spec.md) に従う。admission を通過した全 embedding 実行形態の image|vector|hybrid fresh page 1 に限り、search は cost-ledger の device 行 (`scope_id='device'`) へ claim と stale 回収・剪定を書き込む (claim 後の adapter failure で text fallback になっても同じ)。HTTP の offline / profile 非互換 / final consent 拒否による実行前の auto→text では書き込まない。device 行の直列化は cost-ledger 側の transaction が担う ([04-pipeline.md §5.4](04-pipeline.md))
 - `.kio/.lock` を取得できない場合、書き込み系コマンドは**待機せず即座に失敗する**: error code `KIO-E-STORE-LOCKED-001`、exit code 3 (retryable、[06-cli-spec.md §7](06-cli-spec.md))。lock には保持プロセスの pid と取得時刻を記録する。保持プロセスが存在しない stale lock は次の取得試行で回収してよいが、回収と取得は同じ排他の下で行い、crash 後も二つの writer が同時に lock を保持しない。lock ファイルが存在するだけでは保持中と判定しない。排他の機構は OS 固有層が選び、spec は定めない
 - current storage format では `.kio/.store-gate` が必須である ([03-data-model.md](03-data-model.md))。writer と unreachable inventory は store を変更しない方法で相互排除する。gate の欠落・unsafe 状態は fail-closed とし自動修復しない。旧 1.0.0 / 2.0.0 は gate 検査より先の version 検査で `KIO-E-STORE-VERSION-001` / exit 8 とする
 - refs (refs/heads/main, refs/tags-v1/*) の更新は `.kio/.lock` 保持下で、temp file 書き込み + atomic rename により行う (部分書き込みを外部に見せない)

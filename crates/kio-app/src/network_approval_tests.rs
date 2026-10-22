@@ -630,8 +630,8 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
     };
     {
         let adapter_settings = &std::sync::Arc::new(settings);
-        let profile = crate::embedding::transport::declared_embedding_profile(
-            crate::embedding::transport::embedding_execution(adapter_settings, control).unwrap(),
+        let profile = crate::embedding::admission::declared_embedding_profile(
+            crate::embedding::admission::embedding_execution(adapter_settings, control).unwrap(),
         );
         let target = AdapterTarget::Tool(profile.tool_id.clone());
         let preview = fixture
@@ -717,7 +717,7 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
         {
             let adapter_settings = &std::sync::Arc::new(AdapterRuntimeSettings::default());
             assert!(
-                crate::embedding::transport::embedding_execution(adapter_settings, control)
+                crate::embedding::admission::embedding_execution(adapter_settings, control)
                     .is_none()
             );
             for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {
@@ -745,8 +745,8 @@ fn embedding_grants_require_the_explicit_current_role_and_profile() {
             control.adapters.gemini_embed = Selector::Known(GeminiEmbedMode::IncompatibleProfile);
             let drift = ControlHandle::new(control);
             let drift_repo = fixture.repo.rebind_with_control(drift.clone());
-            let current = crate::embedding::transport::declared_embedding_profile(
-                crate::embedding::transport::embedding_execution(adapter_settings, &drift).unwrap(),
+            let current = crate::embedding::admission::declared_embedding_profile(
+                crate::embedding::admission::embedding_execution(adapter_settings, &drift).unwrap(),
             );
             assert_ne!(current.profile_hash, profile.profile_hash);
             for operation in [GrantOperation::Network, GrantOperation::SendSecrets] {

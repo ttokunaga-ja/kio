@@ -28,7 +28,13 @@ pub(crate) fn targets_standard_online_markdownize(
         // this predicate drives the ONLINE lane — the network opt-in, the
         // ledger reservation, the batch send, the auth revive — and a local
         // pipeline's task must not be picked up by any of them.
-        Ok(TaskOutputRef::Offline { .. } | TaskOutputRef::Embedding { .. }) | Err(_) => false,
+        Ok(
+            TaskOutputRef::Offline { .. }
+            | TaskOutputRef::Embedding { .. }
+            | TaskOutputRef::ImageEmbedding { .. }
+            | TaskOutputRef::QueryEmbedding { .. },
+        )
+        | Err(_) => false,
     }
 }
 
@@ -43,6 +49,7 @@ mod tests {
         TaskDescriptor {
             task_id: "task_current".to_owned(),
             task_type: TaskType::Markdownize,
+            embedding_target: None,
             mode: Some(MarkdownizeMode::Full),
             input_path: "report.pdf".to_owned(),
             input_hash: format!("sha256:{}", "a".repeat(64)),

@@ -1,9 +1,8 @@
 //! Embedding metadata and chunk_vec store contracts.
 
+use kio_core::cas::{EmbeddingContext, EmbeddingObject};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::fts::CHUNK_VEC_DIMENSIONS;
@@ -16,32 +15,20 @@ pub fn embedding_hash(
     distance: EmbeddingDistance,
     modality: EmbeddingModality,
     profile_hash: &str,
-    // 2026-07-24 (07 §5.3 contextual-embedding addendum): the humanized filename
-    // context prepended to a chunk's embedding INPUT (`chunk_embedding_context`).
-    // A chunk's vector is now a function of `(text_hash, context, profile)`, not
-    // `text_hash` alone, so the content-addressed identity must fold the context
-    // in — else two chunks with identical bodies but different filenames collide
-    // on `id` and share one (wrong) vector. `None` omits the key ENTIRELY (not a
-    // JSON null), so every pre-2026-07-24 caller (non-chunk targets, the frozen
-    // CT3-EMBED-001 vector) hashes byte-for-byte as before.
-    context: Option<&str>,
+    // Absent/original context, chunk filename text, or converted image input
+    // digest all use the core CAS identity encoder (03 §8.1).
+    context: Option<&EmbeddingContext>,
 ) -> Result<String> {
-    let mut value = json!({
-        "dimensions": dimensions,
-        "distance": distance_name(distance),
-        "modality": modality_name(modality),
-        "profile_hash": profile_hash,
-        "spec_version": 1,
-        "target_hash": target_hash,
-        "target_type": target_type_name(target_type),
-    });
-    if let Some(context) = context {
-        value
-            .as_object_mut()
-            .expect("embedding_hash value is always a JSON object")
-            .insert("context".to_owned(), json!(context));
-    }
-    hash_jcs(&value)
+    let identity = EmbeddingObject::identity_value(
+        target_type_name(target_type),
+        target_hash,
+        profile_hash,
+        modality_name(modality),
+        dimensions,
+        distance_name(distance),
+        context,
+    );
+    kio_core::cas::hash_json(&identity).map_err(|error| IndexError::Schema(error.to_string()))
 }
 
 /// The humanized filename context prepended to a chunk's embedding input
@@ -256,9 +243,10 @@ pub fn write_chunk_embedding_source(
                 context_key
             ],
         )?;
-        let canonical = canonical_chunk_embedding(
+        let canonical = canonical_embedding(
             conn,
             embedding_hash,
+            "chunk",
             text_hash,
             dimensions,
             distance,
@@ -536,17 +524,11 @@ pub fn read_chunk_vector(conn: &Connection, chunk_id: &str) -> Result<Option<Vec
 // ---------------------------------------------------------------------------
 // Image object embeddings (04 §4.3's `image_vec`).
 //
-// The chunk path has to rediscover which chunk row currently carries a given
-// body, which is why it joins through `chunks.text_hash` and disambiguates on
-// `context_key`. None of that applies here: an image IS the content-addressed
-// object, so `embeddings.target_id` is already the `image_vec` key and there is
-// no owner to look up. `chunk_filename_context_v1` is likewise a rule about
-// chunk bodies and does not touch images, so no context key is stored.
+// Image targets retain their original source hash. Converted input identity
+// is carried in the existing context_key column; originals use NULL.
 // ---------------------------------------------------------------------------
 
-/// Persist one image object's vector and link it into `image_vec`.
-// Same shape as `write_chunk_embedding` above, and allowed for the same
-// reason: every parameter is a distinct column of the row being written.
+/// Persist the current source/profile/input identity and link its image vector.
 #[allow(clippy::too_many_arguments)]
 pub fn write_image_embedding(
     conn: &Connection,
@@ -557,16 +539,17 @@ pub fn write_image_embedding(
     distance: &str,
     modality: &str,
     profile_hash: &str,
+    context_key: Option<&str>,
 ) -> Result<()> {
     validate_embedding_vector(vector, dimensions)?;
+    validate_image_context_key(context_key)?;
     with_savepoint(conn, "kio_write_image_embedding", || {
-        // Same eviction rule as the chunk path: a vector from a retired profile
-        // is not stale data but invalid data, since it would go on being
-        // cosine-ranked against queries embedded in a different space (03 §7).
+        // Retire every other projection identity for this source, including a
+        // changed recipe under the same semantic profile. CAS stays immutable.
         let evicted = conn.execute(
             "DELETE FROM embeddings
-             WHERE target_type = 'image' AND target_id = ?1 AND profile_hash <> ?2",
-            params![image_hash, profile_hash],
+             WHERE target_type = 'image' AND target_id = ?1 AND id <> ?2",
+            params![image_hash, embedding_hash],
         )?;
         if evicted > 0 {
             conn.execute(
@@ -576,21 +559,39 @@ pub fn write_image_embedding(
         }
         conn.execute(
             "INSERT INTO embeddings(id, target_type, target_id, modality, vector, dimensions, distance, profile_hash, context_key)
-             VALUES (?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, NULL)
+             VALUES (?1, 'image', ?2, ?3, ?4, ?5, ?6, ?7, ?8)
              ON CONFLICT(id) DO NOTHING",
-            params![
-                embedding_hash,
-                image_hash,
-                modality,
-                vector,
-                dimensions as i64,
-                distance,
-                profile_hash
-            ],
+            params![embedding_hash, image_hash, modality, vector, dimensions as i64,
+                distance, profile_hash, context_key],
         )?;
-        link_image_vec(conn, image_hash, vector, dimensions)?;
+        let canonical = canonical_embedding(
+            conn,
+            embedding_hash,
+            "image",
+            image_hash,
+            dimensions,
+            distance,
+            modality,
+            profile_hash,
+            context_key,
+        )?;
+        if canonical.vector != vector {
+            return Err(IndexError::Contract(
+                "embedding identity already has a different canonical vector".to_owned(),
+            ));
+        }
+        link_image_vec(conn, image_hash, &canonical.vector, dimensions)?;
         Ok(())
     })
+}
+
+fn validate_image_context_key(context_key: Option<&str>) -> Result<()> {
+    if context_key.is_some_and(|key| !kio_core::cas::is_hash(key)) {
+        return Err(IndexError::Contract(
+            "image context_key must be a canonical image input hash".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Map an `image_hash` to a vector in `image_vec` (idempotent). No-op when the
@@ -618,21 +619,28 @@ pub fn link_image_vec(
     Ok(true)
 }
 
-/// Which image objects already carry a vector under `profile_hash`, so a
-/// re-index embeds only what is missing (the image counterpart of the chunk
-/// path's content-addressed reuse).
-pub fn embedded_image_hashes(
+/// Current image source -> input digest (or NULL for an original) under a
+/// semantic profile. Callers compare the prepared input, not source alone.
+pub fn embedded_image_inputs(
     conn: &Connection,
     profile_hash: &str,
-) -> Result<std::collections::BTreeSet<String>> {
+) -> Result<BTreeMap<String, Option<String>>> {
     let mut stmt = conn.prepare(
-        "SELECT target_id FROM embeddings
-         WHERE target_type = 'image' AND profile_hash = ?1",
+        "SELECT target_id, context_key FROM embeddings
+         WHERE target_type = 'image' AND profile_hash = ?1 ORDER BY target_id, id",
     )?;
-    let rows = stmt.query_map(params![profile_hash], |row| row.get::<_, String>(0))?;
-    let mut out = std::collections::BTreeSet::new();
+    let rows = stmt.query_map(params![profile_hash], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    let mut out = BTreeMap::new();
     for row in rows {
-        out.insert(row?);
+        let (image_hash, context_key) = row?;
+        validate_image_context_key(context_key.as_deref())?;
+        if out.insert(image_hash.clone(), context_key).is_some() {
+            return Err(IndexError::Schema(format!(
+                "multiple image input identities match {image_hash}"
+            )));
+        }
     }
     Ok(out)
 }
@@ -799,7 +807,7 @@ struct StoredEmbeddingVector {
     dimensions: u64,
 }
 
-struct StoredChunkEmbedding {
+struct CanonicalEmbedding {
     vector: Vec<u8>,
 }
 
@@ -823,16 +831,17 @@ fn stored_embedding_vector(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn canonical_chunk_embedding(
+fn canonical_embedding(
     conn: &Connection,
     embedding_hash: &str,
-    text_hash: &str,
+    expected_target_type: &str,
+    target_hash: &str,
     dimensions: u64,
     distance: &str,
     modality: &str,
     profile_hash: &str,
     context_key: Option<&str>,
-) -> Result<StoredChunkEmbedding> {
+) -> Result<CanonicalEmbedding> {
     let Some((
         target_type,
         target_id,
@@ -867,8 +876,8 @@ fn canonical_chunk_embedding(
         )));
     };
     let stored_dimensions = sql_dimension(stored_dimensions)?;
-    if target_type != "chunk"
-        || target_id != text_hash
+    if target_type != expected_target_type
+        || target_id != target_hash
         || stored_dimensions != dimensions
         || stored_distance != distance
         || stored_modality != modality
@@ -880,7 +889,7 @@ fn canonical_chunk_embedding(
         )));
     }
     validate_embedding_vector(&vector, stored_dimensions)?;
-    Ok(StoredChunkEmbedding { vector })
+    Ok(CanonicalEmbedding { vector })
 }
 
 fn expected_vector_len(dimensions: u64) -> Result<usize> {
@@ -937,27 +946,6 @@ fn modality_name(value: EmbeddingModality) -> &'static str {
     }
 }
 
-fn hash_jcs(value: &Value) -> Result<String> {
-    serde_jcs::to_vec(value)
-        .map(|bytes| hash_bytes(&bytes))
-        .map_err(|err| IndexError::Schema(err.to_string()))
-}
-
-fn hash_bytes(bytes: &[u8]) -> String {
-    let digest = Sha256::digest(bytes);
-    format!("sha256:{}", lower_hex(&digest))
-}
-
-fn lower_hex(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,6 +977,8 @@ mod tests {
     /// context differs from the bare form and from a different context.
     #[test]
     fn contextual_embedding_hash_folds_filename_context() {
+        let recovery_context = EmbeddingContext::Text("recovery window".to_owned());
+        let latency_context = EmbeddingContext::Text("latency review".to_owned());
         let args = |context| {
             embedding_hash(
                 EmbeddingTargetType::Chunk,
@@ -1002,11 +992,11 @@ mod tests {
             .unwrap()
         };
         let bare = args(None);
-        let recovery = args(Some("recovery window"));
-        let latency = args(Some("latency review"));
+        let recovery = args(Some(&recovery_context));
+        let latency = args(Some(&latency_context));
         assert_ne!(bare, recovery);
         assert_ne!(recovery, latency);
-        assert_eq!(recovery, args(Some("recovery window")));
+        assert_eq!(recovery, args(Some(&recovery_context)));
     }
 
     /// Contextual-embedding addendum: the humanizer turns filename stems into
@@ -1652,6 +1642,137 @@ mod tests {
 
         rebuild_chunk_vec_for_contexts(conn, None, &BTreeSet::new(), &contexts).unwrap();
         assert_eq!(chunk_vec_count(conn).unwrap(), 0);
+    }
+
+    /// 03 §8.1: a changed image input is a new immutable identity under the
+    /// same semantic profile; only the current identity remains projected.
+    #[test]
+    fn image_input_identity_replacement_retires_same_profile_row_and_rebuilds() {
+        use kio_core::cas::{EmbeddingContext, EmbeddingObject, hash_bytes, hash_json};
+
+        let store = schema_conn();
+        let conn = store.connection();
+        let image_hash = hash_bytes(b"original source image");
+        let profile_hash = hash_bytes(b"same semantic image profile");
+        let identity = |recipe: &[u8]| {
+            let input_hash = hash_bytes(recipe);
+            let context = EmbeddingContext::Image {
+                image_input_hash: input_hash.clone(),
+            };
+            let id = hash_json(&EmbeddingObject::identity_value(
+                "image",
+                &image_hash,
+                &profile_hash,
+                "multimodal",
+                CHUNK_VEC_DIMENSIONS as u64,
+                "cosine",
+                Some(&context),
+            ))
+            .unwrap();
+            (id, input_hash)
+        };
+        let (old_id, old_input) = identity(b"receipt for input A");
+        let (current_id, current_input) = identity(b"receipt for input B");
+        assert_ne!(old_id, current_id);
+        write_image_embedding(
+            conn,
+            &old_id,
+            &image_hash,
+            &basis_vector(0),
+            CHUNK_VEC_DIMENSIONS as u64,
+            "cosine",
+            "multimodal",
+            &profile_hash,
+            Some(&old_input),
+        )
+        .unwrap();
+        write_image_embedding(
+            conn,
+            &current_id,
+            &image_hash,
+            &basis_vector(1),
+            CHUNK_VEC_DIMENSIONS as u64,
+            "cosine",
+            "multimodal",
+            &profile_hash,
+            Some(&current_input),
+        )
+        .unwrap();
+        let ids = conn.prepare(
+            "SELECT id FROM embeddings WHERE target_type='image' AND target_id=?1 AND profile_hash=?2 ORDER BY id"
+        ).unwrap().query_map(params![image_hash, profile_hash], |row| row.get::<_, String>(0))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        assert_eq!(
+            ids,
+            vec![current_id],
+            "retired same-profile input must leave the current projection"
+        );
+        assert_eq!(
+            read_image_vector(conn, &image_hash).unwrap(),
+            Some(f32_from_le_bytes(&basis_vector(1)))
+        );
+        assert_eq!(
+            embedded_image_inputs(conn, &profile_hash).unwrap(),
+            BTreeMap::from([(image_hash.clone(), Some(current_input))])
+        );
+        let profile = EmbeddingProfileSummary {
+            dimensions: CHUNK_VEC_DIMENSIONS as u64,
+            distance: "cosine".to_owned(),
+            modality: "multimodal".to_owned(),
+            profile_hash,
+        };
+        rebuild_image_vec(conn, Some(&profile))
+            .expect("rebuild must not see a retired duplicate input");
+        assert_eq!(image_vec_count(conn).unwrap(), 1);
+        assert_eq!(
+            read_image_vector(conn, &image_hash).unwrap(),
+            Some(f32_from_le_bytes(&basis_vector(1)))
+        );
+    }
+
+    /// A vector cannot change under the same immutable embedding identity;
+    /// rejection must preserve both canonical source and image projection.
+    #[test]
+    fn image_identity_rejects_different_vector_without_mutating_projection() {
+        let store = schema_conn();
+        let conn = store.connection();
+        let image_hash = kio_core::cas::hash_bytes(b"image source");
+        let profile_hash = kio_core::cas::hash_bytes(b"image profile");
+        let id = kio_core::cas::hash_bytes(b"one immutable image embedding");
+        let original = basis_vector(0);
+        write_image_embedding(
+            conn,
+            &id,
+            &image_hash,
+            &original,
+            CHUNK_VEC_DIMENSIONS as u64,
+            "cosine",
+            "multimodal",
+            &profile_hash,
+            None,
+        )
+        .unwrap();
+        let changed = write_image_embedding(
+            conn,
+            &id,
+            &image_hash,
+            &basis_vector(1),
+            CHUNK_VEC_DIMENSIONS as u64,
+            "cosine",
+            "multimodal",
+            &profile_hash,
+            None,
+        );
+        assert!(
+            changed.is_err(),
+            "same immutable identity must reject a changed canonical vector"
+        );
+        assert_eq!(content_vector(conn, &id).unwrap(), Some(original.clone()));
+        assert_eq!(
+            read_image_vector(conn, &image_hash).unwrap(),
+            Some(f32_from_le_bytes(&original))
+        );
+        assert_eq!(image_vec_count(conn).unwrap(), 1);
     }
 
     #[test]

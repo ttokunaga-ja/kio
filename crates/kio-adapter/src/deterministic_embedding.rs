@@ -13,9 +13,9 @@ use crate::identity::tool_profile_hash;
 use crate::local_embedding::IMAGE_OBJECT_CAPABILITY;
 use crate::traits::EmbeddingAdapter;
 use crate::types::{
-    AdapterKind, AdapterProfile, BillingDeclaration, EmbeddingContent, EmbeddingRequest,
-    EmbeddingResponse, EmbeddingVector, ExecutionMode, ProviderIdempotency, validate_cosine_vector,
-    validate_embedding_request_bytes,
+    AdapterKind, AdapterProfile, BillingDeclaration, EmbeddingCompleted, EmbeddingContent,
+    EmbeddingOutcome, EmbeddingRequest, EmbeddingUsage, EmbeddingVector, ExecutionMode,
+    ProviderIdempotency, validate_cosine_vector, validate_embedding_request_bytes,
 };
 
 pub const DETERMINISTIC_EVAL_EMBEDDING_ADAPTER_ID: &str = "kio_eval_deterministic_embedding";
@@ -140,7 +140,14 @@ impl EmbeddingAdapter for DeterministicEmbeddingAdapter {
         }
     }
 
-    fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingResponse> {
+    fn descriptor(&self) -> crate::types::EmbeddingDescriptor {
+        let mut descriptor = crate::types::EmbeddingDescriptor::from_profile(&self.profile());
+        descriptor.capability.image_mime_types =
+            vec!["image/png".to_owned(), "image/jpeg".to_owned()];
+        descriptor
+    }
+
+    fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingOutcome> {
         validate_embedding_request_bytes(&request)?;
         let vectors = request
             .items
@@ -164,14 +171,14 @@ impl EmbeddingAdapter for DeterministicEmbeddingAdapter {
                 })
             })
             .collect::<Result<Vec<_>>>()?;
-        Ok(EmbeddingResponse {
-            vectors,
+        Ok(EmbeddingOutcome::Completed(EmbeddingCompleted {
+            members: vectors.into_iter().map(Into::into).collect(),
             dimensions: DETERMINISTIC_EVAL_EMBEDDING_DIMENSIONS,
             distance: "cosine".to_owned(),
             modality: "multimodal".to_owned(),
-            embedding_profile_hash: Some(self.profile().tool_profile_hash),
-            usage: None,
-        })
+            embedding_profile_hash: self.profile().tool_profile_hash,
+            usage: EmbeddingUsage::Unmetered,
+        }))
     }
 }
 
@@ -207,11 +214,15 @@ mod tests {
             idempotency_token: None,
         };
         let adapter = DeterministicEmbeddingAdapter;
-        let first = adapter.embed(request.clone()).unwrap();
-        let second = adapter.embed(request).unwrap();
-        assert_eq!(first.vectors, second.vectors);
-        assert_ne!(first.vectors[0].vector, first.vectors[1].vector);
-        for vector in first.vectors {
+        let first = adapter
+            .embed(request.clone())
+            .unwrap()
+            .into_completed()
+            .unwrap();
+        let second = adapter.embed(request).unwrap().into_completed().unwrap();
+        assert_eq!(first.vectors(), second.vectors());
+        assert_ne!(first.vectors()[0].vector, first.vectors()[1].vector);
+        for vector in first.vectors() {
             validate_cosine_vector(&vector.vector, DETERMINISTIC_EVAL_EMBEDDING_DIMENSIONS)
                 .unwrap();
         }
@@ -234,7 +245,9 @@ mod tests {
                     idempotency_token: None,
                 })
                 .unwrap()
-                .vectors
+                .into_completed()
+                .unwrap()
+                .vectors()
                 .pop()
                 .unwrap()
                 .vector

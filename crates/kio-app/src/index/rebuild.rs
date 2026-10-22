@@ -1,6 +1,6 @@
 use crate::approvals;
 use crate::egress::SECRETS_TIER_B_HOLD;
-use crate::embedding::enrichment::selected_embedding_contexts;
+use crate::embedding::plan::selected_embedding_contexts;
 use crate::embedding_owners;
 use crate::embedding_owners::RetainedEmbeddingChunk;
 use crate::grants;
@@ -1070,20 +1070,32 @@ fn rebuild_sqlite_index(
 /// `rebuild-db`'s hard case is a LOST database — the table it would read is the
 /// thing being rebuilt. `objects/` is the truth; the tables are the cache.
 ///
-/// Simpler than the chunk replay in one way: an image object's `target_hash` IS
-/// the `image_vec` key, so there is no owner to rediscover and no `context_key`
-/// to disambiguate on (that rule is about chunk bodies).
+/// Only the current authenticated source and codec identity may be replayed;
+/// converted image inputs carry their receipt digest in `context_key`.
 fn replay_image_embeddings_from_objects(
     ctx: &Invocation<'_>,
     repo: &Repository,
     conn: &Connection,
     expected_profile: Option<&embedding_store::EmbeddingProfileSummary>,
+    retained_instances: &[RetainedNormalizedInstance],
+    retained_chunks: &[RetainedEmbeddingChunk],
+    secrets_allowed: bool,
 ) -> Result<()> {
     let store = repo.object_store();
     let hashes = store.embedding_hashes()?;
     if hashes.is_empty() {
         return Ok(());
     }
+    let policy = current_embedding_policy(repo)?;
+    let authority =
+        crate::image_authority::retained_image_authority(repo, retained_instances, &policy)?;
+    let scope_id = repo.scope_identity()?.scope_id;
+    let eligible = crate::embedding::input::referenced_authorized_image_hashes_for_chunks(
+        retained_chunks,
+        &scope_id,
+        &authority,
+        secrets_allowed,
+    );
     for hash in hashes {
         let object = match store.read_embedding(&hash) {
             Ok(object) => object,
@@ -1096,7 +1108,7 @@ fn replay_image_embeddings_from_objects(
                 continue;
             }
         };
-        if object.target_type != "image" {
+        if object.target_type != "image" || !eligible.contains(&object.target_hash) {
             continue;
         }
         let Some(expected) = expected_profile else {
@@ -1109,6 +1121,39 @@ fn replay_image_embeddings_from_objects(
         {
             continue;
         }
+        // Re-derive the current codec identity from the authenticated source.
+        // An immutable object produced by a retired codec may remain in CAS,
+        // but must never become the current vector during a lost-DB rebuild.
+        let current = (|| -> Result<_> {
+            let (bytes, mime) = crate::embedding::input::read_verified_embedding_image(
+                &store,
+                &object.target_hash,
+            )?;
+            crate::embedding::image_input::prepare_embedding_image(&object.target_hash, bytes, mime)
+        })();
+        let prepared = match current {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                ctx.interaction.diagnostic(&format!(
+                    "kio: skipping image embedding {hash} without verified source: {error}"
+                ));
+                continue;
+            }
+        };
+        let input_hash = prepared
+            .receipt
+            .as_ref()
+            .map(|receipt| receipt.image_input_hash())
+            .transpose()?;
+        let context =
+            input_hash
+                .as_ref()
+                .map(|image_input_hash| kio_core::cas::EmbeddingContext::Image {
+                    image_input_hash: image_input_hash.clone(),
+                });
+        if object.context != context || object.metadata.image_input_receipt != prepared.receipt {
+            continue;
+        }
         embedding_store::write_image_embedding(
             conn,
             &hash,
@@ -1118,6 +1163,7 @@ fn replay_image_embeddings_from_objects(
             &object.distance,
             &object.modality,
             &object.profile_hash,
+            input_hash.as_deref(),
         )
         .map_err(index_to_kio)?;
     }
@@ -1196,7 +1242,12 @@ fn embeddings_from_objects(
         };
         let vector = kio_index::embedding_store::f32_to_le_bytes(&object.vector);
         for (chunk_id, context) in candidates {
-            if context.as_deref() != object.context.as_deref() {
+            if context.as_deref()
+                != object
+                    .context
+                    .as_ref()
+                    .and_then(kio_core::cas::EmbeddingContext::as_text)
+            {
                 continue;
             }
             replayed.push(ReplayedChunkEmbedding {
@@ -1208,7 +1259,11 @@ fn embeddings_from_objects(
                 distance: object.distance.clone(),
                 modality: object.modality.clone(),
                 profile_hash: object.profile_hash.clone(),
-                context_key: object.context.clone(),
+                context_key: object
+                    .context
+                    .as_ref()
+                    .and_then(kio_core::cas::EmbeddingContext::as_text)
+                    .map(str::to_owned),
             });
         }
     }
@@ -1618,6 +1673,9 @@ fn build_sqlite_index_at(
         repository,
         fts.connection(),
         expected_embedding_profile.as_ref(),
+        retained_instances,
+        &retained_embedding_chunks,
+        secrets_allowed,
     )?;
     embedding_store::rebuild_image_vec(fts.connection(), expected_embedding_profile.as_ref())
         .map_err(index_to_kio)?;

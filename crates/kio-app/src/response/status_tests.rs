@@ -244,6 +244,12 @@ fn status_projection_preserves_existing_task_nullable_fields_and_empty_unit_arra
     dto.tasks = vec![TaskDescriptor {
         task_id: "task".to_owned(),
         task_type: TaskType::Embedding,
+        embedding_target: Some(kio_pipeline::task::EmbeddingTaskTarget::Chunk {
+            chunk_hash: kio_core::cas::hash_bytes(b"status chunk"),
+            embedding_hash: kio_core::cas::hash_bytes(b"status embedding"),
+            profile_hash: kio_core::cas::hash_bytes(b"status profile"),
+            input_hash: kio_core::cas::hash_bytes(b"status input"),
+        }),
         mode: None,
         input_path: "doc.md".to_owned(),
         input_hash: "input".to_owned(),
@@ -270,6 +276,13 @@ fn status_projection_preserves_existing_task_nullable_fields_and_empty_unit_arra
         "output_ref":"output","unit_keys":[],"status":"pending","attempts":0,"next_retry_at":null,
         "deadline":null,"heartbeat_at":null,"fallback_reason":null,"created_at":"now",
         "bbox_annotation_enabled":null,"hold_reason":null,"reserved_usd":null,"reserved_month":null,"reservation_id":null}]);
+    legacy["tasks"][0]["embedding_target"] = json!({
+        "kind": "chunk",
+        "chunk_hash": kio_core::cas::hash_bytes(b"status chunk"),
+        "embedding_hash": kio_core::cas::hash_bytes(b"status embedding"),
+        "profile_hash": kio_core::cas::hash_bytes(b"status profile"),
+        "input_hash": kio_core::cas::hash_bytes(b"status input"),
+    });
     assert_projection(dto, legacy);
 }
 

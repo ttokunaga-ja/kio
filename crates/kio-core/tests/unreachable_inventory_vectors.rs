@@ -233,7 +233,16 @@ impl Fixture {
             dimensions: 1,
             distance: "cosine".to_owned(),
             context: None,
-            vector: vec![0.5],
+            vector: vec![1.0],
+            metadata: kio_core::cas::EmbeddingMetadata {
+                record_format: 2,
+                producer: kio_core::cas::ProducerProvenance::non_native(
+                    kio_core::cas::ProducerExecutionMode::DeterministicLibrary,
+                    &hash_bytes(b"embedding-profile"),
+                )
+                .unwrap(),
+                image_input_receipt: None,
+            },
         };
         let embedding = self.store().write_embedding(&embedding_object).unwrap();
         LiveGraph {
@@ -345,7 +354,16 @@ fn unreferenced_semantic_objects_are_candidates_only_when_proven() {
         dimensions: 1,
         distance: "cosine".to_owned(),
         context: None,
-        vector: vec![0.25],
+        vector: vec![1.0],
+        metadata: kio_core::cas::EmbeddingMetadata {
+            record_format: 2,
+            producer: kio_core::cas::ProducerProvenance::non_native(
+                kio_core::cas::ProducerExecutionMode::DeterministicLibrary,
+                &hash_bytes(b"profile"),
+            )
+            .unwrap(),
+            image_input_receipt: None,
+        },
     };
     let embedding = fixture.store().write_embedding(&embedding_object).unwrap();
     let report = fixture.report();

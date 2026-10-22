@@ -15,6 +15,7 @@ const SHA256_HEX_LEN: usize = 64;
 pub enum SearchMode {
     Auto,
     Text,
+    Image,
     Vector,
     Hybrid,
 }
@@ -275,6 +276,7 @@ pub fn search_mode_name(mode: SearchMode) -> &'static str {
     match mode {
         SearchMode::Auto => "auto",
         SearchMode::Text => "text",
+        SearchMode::Image => "image",
         SearchMode::Vector => "vector",
         SearchMode::Hybrid => "hybrid",
     }

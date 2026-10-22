@@ -4,6 +4,13 @@
 //! stable `kio://` image-object reference, which lets the normal chunk and image
 //! vector pipelines discover pixels without treating binary data as text.
 
+mod budget_gif;
+mod budget_jpeg;
+mod budget_jpeg_metadata;
+mod budget_png;
+mod budget_vp8;
+mod budget_webp;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
@@ -192,6 +199,7 @@ pub(crate) fn validate_source_image_payload<'a>(
 }
 
 fn inspect_gif(bytes: &[u8]) -> Result<()> {
+    budget_gif::validate_gif_layout(bytes)?;
     use std::io::{BufReader, Cursor};
 
     use image::codecs::gif::GifDecoder;
@@ -367,10 +375,8 @@ pub(crate) fn ingest_standalone_image(
 }
 
 fn inspect_image(bytes: &[u8], declared_media_type: &str) -> Result<(String, u32, u32)> {
+    use image::{DynamicImage, ImageDecoder, ImageFormat};
     use std::io::Cursor;
-
-    use image::{ImageFormat, ImageReader};
-
     let expected = match declared_media_type {
         "image/png" => ImageFormat::Png,
         "image/jpeg" => ImageFormat::Jpeg,
@@ -381,24 +387,111 @@ fn inspect_image(bytes: &[u8], declared_media_type: &str) -> Result<(String, u32
             ));
         }
     };
-    let mut reader = ImageReader::new(Cursor::new(bytes))
-        .with_guessed_format()
-        .map_err(|error| KioError::schema(format!("image format detection failed: {error}")))?;
-    if reader.format() != Some(expected) {
+    if image::guess_format(bytes).ok() != Some(expected) {
         return Err(KioError::schema(
             "standalone image media type disagrees with verified image bytes",
         ));
     }
-    reader.limits(image_decode_limits());
-    let decoded = reader
-        .decode()
-        .map_err(|error| KioError::schema(format!("image decode validation failed: {error}")))?;
+    if expected == ImageFormat::WebP {
+        let (_, width, height, _) = decode_webp_rgba(bytes)?;
+        return Ok((declared_media_type.to_owned(), width, height));
+    }
+    let decoded = if expected == ImageFormat::Png {
+        // PNG's internal counter cannot be changed by set_limits after reader
+        // construction. Reserve the exact EXPAND output before construction.
+        let decoder = image::codecs::png::PngDecoder::with_limits(
+            Cursor::new(bytes),
+            budget_png::png_limits(bytes)?,
+        )
+        .map_err(decode_error)?;
+        DynamicImage::from_decoder(decoder)
+    } else {
+        budget_jpeg::validate_jpeg_allocation(bytes)?;
+        let mut decoder =
+            image::codecs::jpeg::JpegDecoder::new(Cursor::new(bytes)).map_err(decode_error)?;
+        decoder
+            .set_limits(image_decode_limits())
+            .map_err(decode_error)?;
+        DynamicImage::from_decoder(decoder)
+    }
+    .map_err(decode_error)?;
     let (width, height) = (decoded.width(), decoded.height());
     validate_decoded_dimensions(width, height)?;
-    // Drop the decoded raster before any CAS mutation. It serves only as a
-    // complete-format validation gate; the persisted authority is raw bytes.
-    drop(decoded);
     Ok((declared_media_type.to_owned(), width, height))
+}
+
+fn decode_error(error: image::ImageError) -> KioError {
+    KioError::schema(format!("image decode validation failed: {error}"))
+}
+
+/// Return frame zero on a transparent full canvas. GIF's entire animation is
+/// validated first, without retaining any prior raster while the iterator runs.
+pub(crate) fn decode_embedding_rgba(bytes: &[u8], mime: &str) -> Result<(Vec<u8>, u32, u32, u8)> {
+    use image::{ImageDecoder, ImageFormat};
+    use std::io::Cursor;
+    match mime {
+        "image/gif" => {
+            validate_source_image_payload(bytes, mime)?;
+            let mut decoder =
+                image::codecs::gif::GifDecoder::new(Cursor::new(bytes)).map_err(decode_error)?;
+            decoder
+                .set_limits(image_decode_limits())
+                .map_err(decode_error)?;
+            let (width, height) = decoder.dimensions();
+            let mut rgba = vec![0; decoder.total_bytes() as usize];
+            // Account for the caller output in the decoder's optional offset
+            // subframe allocation allowance (ImageReader normally does this).
+            let mut limits = image_decode_limits();
+            limits.max_alloc = Some(MAX_IMAGE_DECODED_BYTES - rgba.len() as u64);
+            decoder.set_limits(limits).map_err(decode_error)?;
+            decoder.read_image(&mut rgba).map_err(decode_error)?;
+            Ok((rgba, width, height, 1))
+        }
+        "image/webp" => {
+            if bytes.len() > MAX_EMBEDDING_ITEM_BYTES
+                || image::guess_format(bytes).ok() != Some(ImageFormat::WebP)
+            {
+                return Err(KioError::schema(
+                    "source WebP exceeds source limit or disagrees with declared MIME",
+                ));
+            }
+            decode_webp_rgba(bytes)
+        }
+        _ => Err(KioError::schema(
+            "image conversion media type is unsupported",
+        )),
+    }
+}
+
+fn decode_webp_rgba(bytes: &[u8]) -> Result<(Vec<u8>, u32, u32, u8)> {
+    use image::ImageDecoder;
+    use std::io::Cursor;
+    let mut decoder =
+        image::codecs::webp::WebPDecoder::new(Cursor::new(bytes)).map_err(decode_error)?;
+    let (width, height) = decoder.dimensions();
+    validate_decoded_dimensions(width, height)?;
+    let rgba_bytes = checked_image_pixels(width, height)? * 4;
+    budget_webp::validate_webp_allocation(bytes, rgba_bytes)?;
+    if decoder.has_animation() {
+        decoder
+            .set_background_color(image::Rgba([0, 0, 0, 0]))
+            .map_err(decode_error)?;
+    }
+    // Metadata is read and dropped before allocating the decoded raster.
+    let orientation = decoder.orientation().map_err(decode_error)?.to_exif();
+    let decoded_bytes = decoder.total_bytes() as usize;
+    let rgb = decoder.color_type() == image::ColorType::Rgb8;
+    let mut rgba = vec![0; rgba_bytes as usize];
+    decoder
+        .read_image(&mut rgba[..decoded_bytes])
+        .map_err(decode_error)?;
+    if rgb {
+        for i in (0..rgba.len() / 4).rev() {
+            let pixel = [rgba[3 * i], rgba[3 * i + 1], rgba[3 * i + 2], 255];
+            rgba[4 * i..4 * i + 4].copy_from_slice(&pixel);
+        }
+    }
+    Ok((rgba, width, height, orientation))
 }
 
 fn image_decode_limits() -> image::Limits {
@@ -732,6 +825,114 @@ mod tests {
             repo.object_store()
                 .inspect_content_object(ContentObjectKind::Image, &raw_hash)
                 .is_err()
+        );
+    }
+
+    /// 07 §5.3 / 14: conversion of frame zero cannot bypass validation of
+    /// later GIF frames at the existing OCR original-source retention gate.
+    #[test]
+    fn malformed_later_gif_frame_rejects_source_retention_after_valid_first_frame() {
+        use image::AnimationDecoder;
+        use image::codecs::gif::GifDecoder;
+        use std::io::{BufReader, Cursor};
+
+        const VALID: &[u8] =
+            include_bytes!("../../kio-cli/tests/fixtures/o2_golden/gif-offset-poison-later.gif");
+        const MALFORMED: &[u8] =
+            include_bytes!("../../kio-cli/tests/fixtures/o2_golden/gif-offset-malformed-later.gif");
+        let valid_hash = hash_bytes(VALID);
+        let malformed_hash = hash_bytes(MALFORMED);
+        assert_eq!(
+            valid_hash,
+            "sha256:b852a8df6594cd3077ac6a255038a57619e89ab50a1c181af5782b119ff9574c"
+        );
+        assert_eq!(
+            malformed_hash,
+            "sha256:4ee1e35c9e07cfa804810fda06d97dbc4e4edab2a60a15a3f2acc0ede1486e22"
+        );
+        // Prove the fixture reaches a valid first full-canvas frame. The
+        // source differs in the later frame; a frame-zero-only path is unsafe.
+        let mut valid_frames = GifDecoder::new(BufReader::new(Cursor::new(VALID)))
+            .unwrap()
+            .into_frames();
+        let valid_first = valid_frames.next().unwrap().unwrap();
+        let mut malformed_frames = GifDecoder::new(BufReader::new(Cursor::new(MALFORMED)))
+            .unwrap()
+            .into_frames();
+        let malformed_first = malformed_frames.next().unwrap().unwrap();
+        assert_eq!(valid_first.buffer().dimensions(), (4, 3));
+        assert_eq!(malformed_first.buffer(), valid_first.buffer());
+        assert!(
+            malformed_frames.next().unwrap().is_err(),
+            "the unchanged first frame must not mask the malformed later LZW stream"
+        );
+        drop(valid_frames);
+        drop(malformed_frames);
+
+        let root = crate::test_support::PrivateTempDir::new();
+        let repo = Repository::init(root.path()).unwrap();
+        let original_head = repo.head_commit_hash().unwrap();
+        const OCR_TEXT: &str = "recognized OCR text\n";
+        let retained = retain_original_source_image_reference(
+            &repo,
+            &valid_hash,
+            VALID,
+            "image/gif",
+            UnitType::Image,
+            OCR_TEXT,
+        )
+        .expect("the same first-frame control with valid later data must retain its source");
+        let references = extract_related_images(&retained);
+        assert_eq!(references.len(), 1);
+        assert_eq!(
+            references[0].image_uri,
+            format!(
+                "kio://{}/object/image/{valid_hash}",
+                repo.scope_identity().unwrap().scope_id
+            )
+        );
+        assert_eq!(
+            repo.object_store()
+                .read_content_object_bytes(
+                    ContentObjectKind::Image,
+                    &valid_hash,
+                    VALID.len() as u64,
+                )
+                .unwrap(),
+            VALID
+        );
+
+        let failure = retain_original_source_image_reference(
+            &repo,
+            &malformed_hash,
+            MALFORMED,
+            "image/gif",
+            UnitType::Image,
+            OCR_TEXT,
+        )
+        .expect_err("malformed later frame must return no source-reference Markdown");
+        assert!(
+            matches!(failure, SourceImageRetentionError::SourceValidation(error)
+            if error.error_code() == "KIO-E-CONFIG-SCHEMA-001")
+        );
+        let missing = repo
+            .object_store()
+            .inspect_content_object(ContentObjectKind::Image, &malformed_hash)
+            .expect_err("failed animation validation must publish no original Image CAS");
+        assert_eq!(missing.error_code(), "KIO-E-STORE-NOT-FOUND-001");
+        // This boundary returns source-reference Markdown only on success. It
+        // neither publishes a normalized owner nor changes a source snapshot
+        // when validation fails; existing valid source authority stays exact.
+        assert_eq!(repo.head_commit_hash().unwrap(), original_head);
+        assert_eq!(
+            repo.object_store()
+                .read_content_object_bytes(
+                    ContentObjectKind::Image,
+                    &valid_hash,
+                    VALID.len() as u64,
+                )
+                .unwrap(),
+            VALID
         );
     }
 }

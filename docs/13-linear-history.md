@@ -94,6 +94,9 @@ working bytes・identity を再検証する。`--expected-head` は preview 時�
    journal が残る間は通常操作を拒否し、途中までの bytes から復元完了と推測しない。
 
 過去の raw 内容を採用しても、現在の ignore、送信承認、tool 設定、予算、課金台帳、保留タスクを巻き戻さない。
+device の model/runtime/取得同意は knowledge snapshot から継承・復元しない
+（[10-operations.md §5.1](10-operations.md)）。保存済み image receipt と producer provenance は
+[03-data-model.md §7 / §8.1](03-data-model.md) に従って検証し、OS 移動だけで vector を再生成しない。
 旧 Markdown/embedding は raw identity と現行 profile の互換性を検証できるときだけ再利用する。
 不適合な派生物は再生成対象にし、外部処理はその時点の承認を必要とする。purged/shallow な元データが
 欠ける場合は理由付きで拒否し、履歴復元を暗黙の resurrection にしない。

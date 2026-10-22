@@ -1,5 +1,14 @@
 //! Content-addressed storage primitives.
 
+#[cfg(test)]
+mod embedding_format_tests;
+
+mod embedding_metadata;
+pub use embedding_metadata::{
+    EmbeddingContext, EmbeddingMetadata, ImageInputReceipt, ProducerExecutionMode,
+    ProducerProvenance,
+};
+
 mod bound;
 mod store;
 
@@ -159,9 +168,10 @@ pub struct ChunkObject {
 /// `objects/normalized`), but the money and the wall-clock were.
 ///
 /// The stored bytes are fixed by 03 §8.1 as
-/// `JCS(identity fields) + LF + base64(vector) + LF + lower_hex64(sha256(vector bytes))`
+/// five LF-terminated lines: JCS identity, base64 vector, vector digest,
+/// JCS metadata, and metadata digest
 /// — a text header a human can read next to a compact body, plus a digest of the
-/// body alone. The trailing digest is not redundant with the storage key: the key
+/// vector body alone. Its digest is not redundant with the storage key: the key
 /// is the hash of the IDENTITY (what this vector is OF), so nothing else would
 /// notice a bit flip inside the vector itself.
 #[derive(Debug, Clone, PartialEq)]
@@ -173,12 +183,11 @@ pub struct EmbeddingObject {
     pub modality: String,
     pub dimensions: u64,
     pub distance: String,
-    /// 07 §5.3's contextual-embedding addendum (2026-07-24): the humanized
-    /// filename prefix folded into the adapter INPUT, and therefore into the
-    /// identity. `None` omits the key entirely rather than writing a JSON null,
-    /// so a non-chunk target hashes byte-for-byte as it did before the addendum.
-    pub context: Option<String>,
+    /// Chunk filename text or a converted-image receipt digest (03 §8.1).
+    /// `None` omits the key entirely, preserving original image/text identity.
+    pub context: Option<EmbeddingContext>,
     pub vector: Vec<f32>,
+    pub metadata: EmbeddingMetadata,
 }
 
 impl EmbeddingObject {
@@ -195,7 +204,7 @@ impl EmbeddingObject {
         modality: &str,
         dimensions: u64,
         distance: &str,
-        context: Option<&str>,
+        context: Option<&EmbeddingContext>,
     ) -> Value {
         let mut value = Map::new();
         value.insert("dimensions".to_owned(), Value::from(dimensions));
@@ -206,7 +215,13 @@ impl EmbeddingObject {
         value.insert("target_hash".to_owned(), Value::from(target_hash));
         value.insert("target_type".to_owned(), Value::from(target_type));
         if let Some(context) = context {
-            value.insert("context".to_owned(), Value::from(context));
+            let context = match context {
+                EmbeddingContext::Text(text) => Value::from(text.clone()),
+                EmbeddingContext::Image { image_input_hash } => {
+                    serde_json::json!({ "image_input_hash": image_input_hash })
+                }
+            };
+            value.insert("context".to_owned(), context);
         }
         Value::Object(value)
     }
@@ -221,7 +236,7 @@ impl EmbeddingObject {
             &self.modality,
             self.dimensions,
             &self.distance,
-            self.context.as_deref(),
+            self.context.as_ref(),
         ))
     }
 
@@ -235,7 +250,7 @@ impl EmbeddingObject {
             &self.modality,
             self.dimensions,
             &self.distance,
-            self.context.as_deref(),
+            self.context.as_ref(),
         ))?;
         let vector_bytes = vector_to_le_bytes(&self.vector);
         let mut out = header;
@@ -243,6 +258,15 @@ impl EmbeddingObject {
         out.extend_from_slice(base64_encode(&vector_bytes).as_bytes());
         out.push(b'\n');
         out.extend_from_slice(lower_hex(&Sha256::digest(&vector_bytes)).as_bytes());
+        out.push(b'\n');
+        let metadata = canonical_json_bytes(
+            &serde_json::to_value(&self.metadata)
+                .map_err(|error| embedding_corrupt_error(&error.to_string(), None))?,
+        )?;
+        out.extend_from_slice(&metadata);
+        out.push(b'\n');
+        out.extend_from_slice(lower_hex(&Sha256::digest(&metadata)).as_bytes());
+        out.push(b'\n');
         Ok(out)
     }
 
@@ -255,20 +279,21 @@ impl EmbeddingObject {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
         let text = std::str::from_utf8(bytes)
             .map_err(|_| embedding_corrupt_error("embedding object is not UTF-8", None))?;
-        let mut lines = text.split('\n');
-        let (Some(header), Some(body), Some(digest)) = (lines.next(), lines.next(), lines.next())
-        else {
+        let lines = text.split('\n').collect::<Vec<_>>();
+        let [header, body, digest, metadata, metadata_digest, ""] = lines.as_slice() else {
             return Err(embedding_corrupt_error(
-                "embedding object must be header, vector and digest on three lines",
+                "embedding object must have exactly five LF-terminated lines",
                 None,
             ));
         };
-        if lines.next().is_some() {
+        if lower_hex(&Sha256::digest(metadata.as_bytes())) != *metadata_digest {
             return Err(embedding_corrupt_error(
-                "embedding object has trailing content after the digest",
+                "embedding metadata digest does not match its bytes",
                 None,
             ));
         }
+        let metadata: EmbeddingMetadata = serde_json::from_str(metadata)
+            .map_err(|error| embedding_corrupt_error(&error.to_string(), None))?;
         let value: Value = serde_json::from_str(header)
             .map_err(|error| embedding_corrupt_error(&error.to_string(), None))?;
         let object = value.as_object().ok_or_else(|| {
@@ -288,7 +313,7 @@ impl EmbeddingObject {
             .and_then(Value::as_u64)
             .ok_or_else(|| embedding_corrupt_error("embedding header lacks dimensions", None))?;
         let vector_bytes = base64_decode(body)?;
-        if lower_hex(&Sha256::digest(&vector_bytes)) != digest {
+        if lower_hex(&Sha256::digest(&vector_bytes)) != *digest {
             return Err(embedding_corrupt_error(
                 "embedding vector digest does not match its bytes",
                 None,
@@ -320,11 +345,21 @@ impl EmbeddingObject {
             distance: string("distance")?,
             context: object
                 .get("context")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
+                .map(|context| {
+                    serde_json::from_value(context.clone())
+                        .map_err(|error| embedding_corrupt_error(&error.to_string(), None))
+                })
+                .transpose()?,
             vector,
+            metadata,
         };
         parsed.validate()?;
+        if parsed.to_bytes()? != bytes {
+            return Err(embedding_corrupt_error(
+                "embedding record is not in canonical current format",
+                None,
+            ));
+        }
         Ok(parsed)
     }
 
@@ -349,6 +384,21 @@ impl EmbeddingObject {
                 ));
             }
         }
+        if !is_hash(&self.target_hash)
+            || !is_hash(&self.profile_hash)
+            || !matches!(self.target_type.as_str(), "chunk" | "image")
+        {
+            return Err(embedding_corrupt_error(
+                "embedding target/profile identity is invalid",
+                None,
+            ));
+        }
+        self.metadata.validate(
+            &self.profile_hash,
+            &self.target_type,
+            &self.target_hash,
+            self.context.as_ref(),
+        )?;
         if self.dimensions == 0 || self.vector.len() as u64 != self.dimensions {
             return Err(embedding_corrupt_error(
                 "embedding vector length must equal its declared dimensions",
@@ -358,6 +408,18 @@ impl EmbeddingObject {
         if self.vector.iter().any(|component| !component.is_finite()) {
             return Err(embedding_corrupt_error(
                 "embedding vector holds a NaN or infinite component",
+                None,
+            ));
+        }
+        let norm = self
+            .vector
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if norm == 0.0 || (norm - 1.0).abs() > 0.0001 {
+            return Err(embedding_corrupt_error(
+                "embedding vector must have nonzero unit L2 norm",
                 None,
             ));
         }
@@ -2178,17 +2240,36 @@ mod tests {
         (dir, store)
     }
 
-    fn embedding_object(vector: Vec<f32>) -> EmbeddingObject {
+    fn embedding_object(mut vector: Vec<f32>) -> EmbeddingObject {
+        let norm = vector
+            .iter()
+            .map(|value| f64::from(*value).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        if norm.is_finite() && norm > 0.0 {
+            for value in &mut vector {
+                *value = (f64::from(*value) / norm) as f32;
+            }
+        }
         EmbeddingObject {
             spec_version: 1,
             target_type: "chunk".to_owned(),
-            target_hash: "sha256:text".to_owned(),
-            profile_hash: "sha256:profile".to_owned(),
+            target_hash: hash_bytes(b"text"),
+            profile_hash: hash_bytes(b"profile"),
             modality: "multimodal".to_owned(),
             dimensions: vector.len() as u64,
             distance: "cosine".to_owned(),
-            context: Some("recovery window".to_owned()),
+            context: Some(EmbeddingContext::Text("recovery window".to_owned())),
             vector,
+            metadata: EmbeddingMetadata {
+                record_format: 2,
+                producer: ProducerProvenance::non_native(
+                    ProducerExecutionMode::DeterministicLibrary,
+                    &hash_bytes(b"profile"),
+                )
+                .unwrap(),
+                image_input_receipt: None,
+            },
         }
     }
 
@@ -2397,10 +2478,11 @@ mod tests {
         let object = embedding_object(vec![0.5, -0.25, 0.125]);
         let bytes = object.to_bytes().unwrap();
         assert_eq!(EmbeddingObject::from_bytes(&bytes).unwrap(), object);
-        // 03 §8.1's shape: header, vector, digest — three lines, no more.
+        // 03 §8.1: identity, vector/digest, metadata/digest, each with LF.
         let text = String::from_utf8(bytes).unwrap();
         let lines = text.split('\n').collect::<Vec<_>>();
-        assert_eq!(lines.len(), 3, "{text}");
+        assert_eq!(lines.len(), 6, "{text}");
+        assert_eq!(lines[5], "");
         assert!(lines[0].starts_with('{') && lines[0].ends_with('}'));
     }
 
@@ -2420,7 +2502,7 @@ mod tests {
         );
 
         let mut other_context = base.clone();
-        other_context.context = Some("control coverage".to_owned());
+        other_context.context = Some(EmbeddingContext::Text("control coverage".to_owned()));
         assert_ne!(
             base.identity_hash().unwrap(),
             other_context.identity_hash().unwrap()
@@ -2480,7 +2562,7 @@ mod tests {
         let hash = store.write_embedding(&object).unwrap();
 
         let mut impostor = object.clone();
-        impostor.target_hash = "sha256:someone-else".to_owned();
+        impostor.target_hash = hash_bytes(b"someone-else");
         fs::write(
             store.embedding_path(&hash).unwrap(),
             impostor.to_bytes().unwrap(),

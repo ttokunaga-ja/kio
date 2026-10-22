@@ -534,12 +534,12 @@ CREATE TABLE embeddings (
   id TEXT NOT NULL PRIMARY KEY,
   target_type TEXT NOT NULL,    -- chunk | image
   target_id TEXT NOT NULL,
-  modality TEXT NOT NULL,       -- "multimodal" のみ (非 multimodal は KIO-E-EMBED-MODALITY-001 で採用不可、07 §5.3)
+  modality TEXT NOT NULL,       -- profile の宣言値。capability と互換性は 03 §7
   vector BLOB NOT NULL,
   dimensions INTEGER NOT NULL,
   distance TEXT NOT NULL,
   profile_hash TEXT NOT NULL,
-  context_key TEXT                 -- chunk_filename_context_v1。非 contextual chunk / image は NULL
+  context_key TEXT                 -- chunk filename context または typed image_input_hash。原 PNG/JPEG は NULL
 );
 CREATE INDEX idx_embeddings_type ON embeddings(target_type);
 -- target_type ごとの再構築・検証が corpus 全 embeddings を SCAN しないための index
@@ -559,7 +559,7 @@ CREATE VIRTUAL TABLE image_vec USING vec0(
 );
 ```
 
-`chunk_vec` / `image_vec` の次元は採用 profile の **768 (MRL 切り詰め) / cosine に固定** する ([07-adapter-spec.md §5.3](07-adapter-spec.md))。**両者は同一のベクトル空間である** — [03-data-model.md §7](03-data-model.md) が `modality="multimodal"` を固定し、[07-adapter-spec.md §5.3](07-adapter-spec.md) が単一 Adapter による多モダリティの単一空間写像を要求しているため、物理テーブルの分割は sqlite-vec の制約 (1 テーブル 1 主キー型) に由来するものであって、意味的な分離ではない。したがって chunk ベクトルと image ベクトルの cosine は直接比較可能であり、検索側は両者を 1 つのランキングへ統合してよい ([05-runtime.md §1.4](05-runtime.md))。保存 vector と query vector はいずれも L2 正規化済みのため、cosine distance の順位は厳密に一致する。
+`chunk_vec` / `image_vec` の次元は採用 profile の **768 / cosine に固定** する ([07-adapter-spec.md §5.3](07-adapter-spec.md))。**両者は同一のベクトル空間である** — [03-data-model.md §7](03-data-model.md) の profile 互換性と、[07-adapter-spec.md §5.3](07-adapter-spec.md) が単一 Adapter による多モダリティの単一空間写像を要求しているため、物理テーブルの分割は sqlite-vec の制約 (1 テーブル 1 主キー型) に由来するものであって、意味的な分離ではない。したがって chunk ベクトルと image ベクトルの cosine は直接比較可能であり、検索側は両者を 1 つのランキングへ統合してよい ([05-runtime.md §1.4](05-runtime.md))。保存 vector と query vector はいずれも L2 正規化済みのため、cosine distance の順位は厳密に一致する。
 
 `embeddings` テーブル (メタデータ + vector BLOB) と `chunk_vec` / `image_vec` (vec0 virtual table) は、いずれも `objects/` から再構築可能な加速層であり、真実は `objects/` にある (§4 冒頭)。これらの間では **`embeddings` テーブルを正** とし、`chunk_vec` / `image_vec` は `embeddings` からの導出物として扱う。不整合を検出した場合および `kio repair rebuild-db` では、`objects/` → `embeddings` → `chunk_vec` → `image_vec` の順に再構築する。**`objects/embeddings/` への書き出しは vector を persist する経路が行い、SQLite 行より先に書く** (2026-07-26、R25-6)
 — 両者の間で crash した場合、object があって行が無い状態は次の rebuild が復元できるが、行があって object が無い状態は
@@ -590,18 +590,17 @@ CAS から `embeddings` への再構築は、正本履歴・chunk 本文・現�
 `(profile_hash, dimensions, distance, modality)` に合致する全 context の保存済み vector を復元する。
 保存済み context の存在と、現行 policy に基づく送信・検索利用の許可は区別する。古い SQLite から object を
 backfill する fallback は持たない。
-再構築時の秘密送信承認は、同じ読取りで検証した tool-lock の recipient / profile を、明示した
-embedding role の現行設定と照合する。role を稼働中の tool ID から推測せず、設定の不在や
-tool / profile の不一致では秘密送信承認なしとする。通常文書の保存済み vector は、稼働中の
-embedding Adapter がなくても再送信せず復元できる。現行の一致する設定では、scope policy と
-device grant の destination / credential / trust の完全な照合を省略せず、不正な状態をエラーとして保持する。
-in-process の免除は `kind` だけで判断せず、組込みの
-決定的 Adapter と tool id / profile / 次元 / distance / modality が完全一致する場合だけ認める。
+再構築・検索公開の承認要否は descriptor の実際の外部作用で決める。
+EG2 はネットワーク送信を行わず network grant/secret-send grant を要求しないが、local access と
+stored-secret policy は維持する。HTTP の local endpoint は exact paired grant と secrets hold を要求する。
+HTTP の承認照合は、保存済み tool-lock の recipient/profile と明示した embedding role の現行設定を用い、
+tool ID から role を推測しない。必要な grant がある場合は destination/credential/trust の完全一致を要求し、
+設定の欠落・不一致を承認済みとしない。通常文書の保存済み vector は Adapter 不在でも再送信せず復元できる。
 
 `chunk_vec` は chunk ごとに一つの検索 vector を持つ。その選択は送信・応答順序に依存させない。
 対象 chunk の exact normalized identity を参照し、現行 policy が許可する HEAD の名前のうち UTF-8 byte 順で
 最小の名前を選ぶ。HEAD に許可された名前がなければ、保持済み履歴中の許可された名前から同じ順序で選ぶ。
-許可された名前がない、または必要な秘密送信承認を欠く場合は、その chunk の vector を検索へ公開しない。
+許可された名前がない、または descriptor の外部作用に対して必要な承認を欠く場合は、その chunk の vector を検索へ公開しない。
 chunk 作成時の `raw_path` は来歴として保持し、選択した名前で書き換えない。
 
 選択した名前の basename stem から `chunk_filename_context_v1`（`-` / `_` の空白化、ASCII camelCase 境界、
@@ -627,11 +626,11 @@ writer は replica への反映を再試行する。scalar 保存後の中断は
 job・credential・入力の binding に基づいて source CAS に保存・課金処理できるが、検索へ公開するには現在も
 許可された同一 context の owner を別途確認する。失効した scalar の除去と中央 replica の世代更新も同じ選択に従う。
 
-`image_vec` の導出は同型だが**結合が要らない**点だけが異なる — 結合対象は **`target_type='image'` の行のみ**で、`embeddings.target_id` がそのまま `image_vec.image_id` (= `objects/image/` の `image_hash`) になる。chunk 側の `chunks.text_hash` 結合は「その本文を今どの chunk 行が担っているか」を再導出するためのものだが、画像は content-addressed object そのものが target であり、担い手を探す必要が無いためである (`context_key` も画像には適用しない — 入力構築 ([07-adapter-spec.md §5.3](07-adapter-spec.md) の `chunk_filename_context_v1`) は chunk 本文に対する規約であり画像には掛からない)。**現行 tool-lock の embedding profile への限定は chunk 側と同一**に適用し、`image_hash` ごとに候補が 0 件または 1 件であることを検証する (0 件 = 未 enrichment で行を作らない。2 件以上は corruption)。
+`image_vec` の導出は同型だが**結合が要らない**点だけが異なる — 結合対象は **`target_type='image'` の行のみ**で、`embeddings.target_id` がそのまま `image_vec.image_id` (= `objects/image/` の `image_hash`) になる。chunk 側の `chunks.text_hash` 結合は「その本文を今どの chunk 行が担っているか」を再導出するためのものだが、画像は content-addressed object そのものが target であり、担い手を探す必要が無いためである （typed image context と現行入力 identity は [03-data-model.md §8.1](03-data-model.md) に従う）。**現行 tool-lock の embedding profile への限定は chunk 側と同一**に適用し、現行 `(image_hash, profile, input identity)` ごとに候補が 0 件または 1 件であることを検証する (0 件 = 未 enrichment で行を作らない。2 件以上は corruption)。
 
 **cursor replay の query-vector cache**: page 1 の query vector は source `embeddings` 表に入れず、`${XDG_CACHE_HOME:-$HOME/.cache}/kio/search-query-cache/<query_vector_digest>` の device-local file に best-effort で保存する ([03-data-model.md §4.1](03-data-model.md)、[05-runtime.md §1.5](05-runtime.md))。`query_vector_digest` は canonical な float32 little-endian bytes（L2 正規化済み）の sha256 であり、query 本文・text_hash は保存しない。replay は file bytes の digest を再検証し、欠落・破損・不一致なら `KIO-E-SEARCH-CURSOR-001` で拒否する。`kio repair rebuild-db` はこの cache を読まず、purge closure にも含めない（文書 lifecycle と無関係）。
 
-Kio は Text/Image を分けず **単一マルチモーダル Embedding Adapter** のみを許可する (非 multimodal profile は `KIO-E-EMBED-MODALITY-001` で採用拒否、[03-data-model.md §7](03-data-model.md))。
+text/image は同じ embedding 契約を使う。汎用 local endpoint の text-only capability を含む互換性は [03-data-model.md §7](03-data-model.md) に従う。
 
 ## 4.4 その他のテーブル / ストアの正本
 
@@ -713,11 +712,46 @@ order_index             unit の出現順 (03-data-model.md §2.1 の順序)
 
 # 5. バッチ実行 (Batch / Retry / Budget)
 
-非同期の Markdownize / Embedding 処理は **task** として記録する。
+Markdownize と、text/image/query の Embedding 処理は同期・非同期・native を問わず **Task** として記録する。
 
 初回大量投入では、deterministic なタスク (Prepare / ベースライン抽出 / FTS index) を online Adapter タスク (Markdownize / Embedding) より優先してスケジュールし、**ベースライン index を先に完了させる**。これにより budget pause ([§5.4](#54-cost-guardrail--kill-switch)) が起きても検索の成立自体は阻害されない。
 
 ## 5.1 タスクモデル
+
+### 統一 embedding 実行契約
+
+```text
+対象選択 → 入力構築/検証 → dedup/Task・論理 job 確定 → admission
+→ durable reserve → submit → Completed/Pending 回収 → member 検査
+→ 精算 → CAS/DB/replica 公開 → status/search
+```
+
+Gemini、EG2、汎用 local endpoint はこの一つの runner を使う。runner が durable intent、attempt、
+retry/backoff、結果不明と publish recovery を所有する。論理 job ID は remote handle と別の型・field とし、
+一つの job は複数 member を束ねられる。Task は member の対象・profile・入力 identity・状態を保持し、
+local に remote job ID/poll を作らない。EG2 の入力窓はモデルの入力アルゴリズムであり Task/retry 単位ではない。
+
+対象は retained history、current policy、typed ownership と秘密 owner 集合から一度だけ選ぶ。
+文書内図は normalized unit の `owned_image_hashes` と参照 chunk、独立画像は検証済み owner から選ぶ。
+CAS 全走査で未参照画像を投入せず、public alias が secret owner の制限を迂回しない。
+transport/model によって対象集合を変えず、capability/policy の除外を理由付き状態で表す。
+
+current policy と retained ownership は全実行に適用する。network grant、secret-send grant、paid 権限は
+descriptor の実際の外部作用に対してだけ要求する。EG2 は外部送信 grant/CA/secret-send を要求しないが、
+ローカルアクセス・保管秘密の policy を守る。取得確認は内容送信同意とは別である。
+[03-data-model.md §11](03-data-model.md) の external_send と policy を dispatch 直前にも再確認する。
+予約後の未送信画像が除外になれば 0 精算し Skipped とする。remote submit 済みなら回収・精算を続け、
+設定変更を cancel 完了と扱わない。設定を戻した場合も current input/authority から再計画する。
+
+member ID は missing/extra/duplicate を拒否し、profile/次元/distance/modality の一致、finite/非零 norm を
+検査する。core が float32 へ変換・L2 正規化した後も finite/非零/単位 norm を再検査する。
+対応関係を証明できない同期応答は全体拒否する。対応が検証できる部分成功は valid member だけを公開し、
+失敗 member だけを後続対象にする。欠落を成功扱いせず、usage は独立に保守的精算する。
+既知結果の保存失敗は保存済み結果の再収集・再公開で回復し、新しい有料送信にしない。
+remote POST 後の結果不明は §5.4/§5.8 の保守的精算と明示再送承認に従う。
+local crash は 0 USD で終端記録し、§5.3 の attempt 上限内で再計算できる。同一入力を無限に再起動しない。
+ledger 自身の失敗は成功へ縮退しない。
+
 
 タスクストアは `.kio/tasks.jsonl` (append-only・喪失許容 — §5.7)。**bounded compaction**: 書き込み系
 コマンド冒頭で行数が閾値 (既定 4096 行) を超えていたら、`.kio/.lock` 下で terminal task の行を落とし
@@ -755,15 +789,13 @@ order_index             unit の出現順 (03-data-model.md §2.1 の順序)
 ```
 
 `output_ref` の Markdownize instance は `normalized:<raw64>.<tool64>.g<gen>` の portable taskref に固定する。`raw64` は `input_hash`、`tool64` は `tool_profile_hash` の lowercase digest-only hex、`gen` は leading zero なしの canonical decimal であり、全体が完全一致しなければ mutation 前に拒否する。absolute / relative pathref を task journal へ書く互換経路はない。`online:<adapter_id>`、`offline:<adapter_id>` は typed placeholder とする。
-Embedding の `output_ref` は `embedding:<chunk_hash>/<embedding_hash>` に固定し、両 hash は
-`sha256:` と 64 桁の lowercase hex からなる canonical hash とする。`changed_unit_keys` は同じ
-`chunk_hash` 一つだけを持つ。`embedding_hash` は本文・ファイル名 context・profile を固定する。
-旧 chunk-only ref、複数 chunk、未知形式は mutation 前に拒否し、互換変換を行わない。
-タスクの完了・失敗・再試行・課金予約はこの組を識別子として扱う。一つの context の成功や承認で、
-別の context の状態を変更してはならない。同じ embedding を使う複数 chunk の provider 呼出しは
-`embedding_hash` でまとめられるが、各 task への結果反映と現在の権限確認を省略しない。
+Embedding Task は chunk/image/query の typed target と profile/input identity を固定する。
+chunk の `output_ref` は `embedding:<chunk_hash>/<embedding_hash>`、image は元 image hash と
+receipt を固定する typed target、query は本文を可読 payload にせず hash/profile を使う。
+chunk の `changed_unit_keys` はその chunk 一つとし、各 hash は canonical な `sha256:` + lowercase64桁。
+同じ embedding を使う Task は論理 job の member に dedup できるが、Task ごとの authority と結果反映を省略しない。
 
-`EmbeddingWorkKey` の parse は表記検査であり、実行権限の証明ではない。新規処理の cache 参照、予約、再試行、
+chunk の `EmbeddingWorkKey` の parse は表記検査であり、実行権限の証明ではない。新規処理の cache 参照、予約、再試行、
 状態変更、provider 入出力の対応付け、結果の公開では、正本から chunk と許可された owner を解決し、
 `task.input_hash == chunk.text_hash` を確認する。その本文・owner の context・使用 profile から embedding hash を
 再計算し、work key と完全一致することを要求する。構文上正しい他の hash を受理しない。既に送信した試行の
@@ -777,9 +809,9 @@ Embedding の `output_ref` は `embedding:<chunk_hash>/<embedding_hash>` に固�
 root registration と Q_hard snapshot は `tasks.jsonl` を byte-identical にコピーし、portable ref を path へ rebase しない。resume 等の runtime consumer だけが retained current `.kio` を基点に instance directory を解決・再検証する。
 
 `unit_keys` は unit スコープの再投入 (partial の retry) 時のみ非 null で、対象 unit_key の配列。
-null は全 unit 対象。**この object に列挙した key は全て current format では必須**であり、
+null は全 unit 対象。**上記 Markdownize object に列挙した key は全て current format では必須**であり、
 該当しない値も key の省略ではなく明示的な `null` で記録する。未知 key も reject する。
-したがって旧 task 行を default 値で current task として解釈する reader は持たない。
+Embedding Task の target/image receipt/query hash は本節の typed variant として検証する。旧 task 行を default 値で current task として解釈する reader は持たない。
 
 `bbox_annotation_enabled` は online Markdownize では必須の boolean policy stamp（他の task は
 `null`）。`status="paused"` は `fallback_reason` と一致する `hold_reason` を必須とし、他の
@@ -790,13 +822,14 @@ canonical lowercase UUID の完全な組だけを許可する。これらの不�
 ## 5.2 状態遷移
 
 ```text
+pending → skipped                           current policy/capability による除外。理由必須
 pending → running → done                     全 unit done
 pending → running → partial                  1 unit 以上 done かつ 1 unit 以上 failed
 pending → running → failed → pending         全 unit 失敗、または run 前提の失敗 (prepare 失敗等)。retryable
 partial → done                               失敗 unit の再投入がすべて成功
 pending → paused → pending                   保留。hold_reason = budget (§5.4) | auth |
                                              tier_b_approval (10-operations.md §1.1) |
-                                             ledger_initialization_required。解除条件 =
+                                             ledger_initialization_required | model_not_ready | model_consent_required | resource_busy。解除条件 =
                                              理由の解消 (budget は §5.4 の再開規則、tier_b は明示承認、
                                              ledger は明示的な ledger init 後の再開)。
                                              rate_limit は paused ではなく pending + next_retry_at で
@@ -804,6 +837,10 @@ pending → paused → pending                   保留。hold_reason = budget (
                                              paused は Adapter 未呼出のため AdapterRun には現れない
 running が heartbeat_at + 5min を超えたら stale。別 worker が pull 可能
 ```
+
+Skipped は Pending/Done/Failed と排他的に集計し、理由別件数を表示する。
+`images_excluded_from_external_send` と `image_capability_unavailable` は成功でも待機でもなく、
+done/enriched ratio の分子に含めない。対象総数と skipped 数を併記し、除外を完了率へ隠さない。
 
 受け入れ検査を通った応答でも、要求した全 unit が `failed_units` のときは `partial` ではなく
 `failed` とする。この場合も manifest は耐久化するが成功 unit object は 0 件であり、既知の応答として
@@ -860,9 +897,7 @@ running が heartbeat_at + 5min を超えたら stale。別 worker が pull 可�
 
 `task` テーブルが消えても問題ない設計 (object store と tool profile から再検出可能)。ただし `attempts` 履歴は失われる (リトライ予算がリセットされる) 点を許容。**§5.3 の max_attempts 判定はこの task 側の揮発カウンタで行う**。`batch_requests.attempts` は reject 終端 (§5.8 相 3) で耐久更新される監査・表示用カウンタであり、**「同一 mode で 1 回のみ」再試行の durable 判定源は `contract_violation_count` である** (§5.8 / §5.4 DDL コメントが正本 — 三つのカウンタは役割が異なる: task 側 = §5.3 retry budget、attempts = 監査・表示、contract_violation_count = 「1 回のみ」ゲート)。「1 回のみ」は task 通算である — 再投入できるのは count <= 1 のとき (0 = 未違反・`--reset-violations` 後を含む — §5.8 が正本) だけで、mode 切替後に別枠は生じない (「mode 切替後の違反も加算」の意図的帰結)。
 
-embedding の Batch には、上記の共通上限に加えて §5.8 / [07-adapter-spec.md §5.3](07-adapter-spec.md) の
-scope / adapter 単位の停止規則を適用する。未解除の契約違反が一件でもあれば、count が 1 でも
-新規 Batch を自動再投入しない。
+embedding Batch の追加停止条件と解除は §5.8「Embedding Batch の契約違反による停止」を参照する。
 
 ## 5.3 エラー種別と Retry Budget
 
@@ -891,9 +926,22 @@ budget_exceeded    paused                KIO-E-BATCH-BUDGET-001
 `min(2s * 2^(attempts-1), 60s)` とする。現在の serial CLI は jitter を加えないため、
 `next_retry_at` は再現可能である。並行実行時の jitter は、この契約を変更する別フェーズでのみ導入できる。
 
-エラーコード namespace は [10-operations.md §11.1](10-operations.md)。
+native の失敗は network_error へ変換せず、論理 job の attempt 上限（既定3）で再計算を打ち切る。model 未準備/同意待ちは取得操作まで Paused、hash 不一致は実行拒否、resource_busy は Paused とする。public code/exit の正本は [06-cli-spec.md §8](06-cli-spec.md)。
 
 ## 5.4 Cost Guardrail / Kill Switch
+
+全 embedding profile は 0 USD を含めて一つの物理 ledger に reserve/settle と Task を記録する。
+local の `usage=Unmetered` は usage 不明とは区別し、確定 0 USD とする。cap 枯渇は確定 0 USD の処理を止めない。
+device ledger は明示的な device setup だけで作成する（作成操作は [06-cli-spec.md §1](06-cli-spec.md)）。
+未初期化なら local 0 USD を含む全 embedding profile を既存の budget/ledger-unknown 理由で Paused とし、
+通常の index/search/resume が暗黙にファイルを作成しない。検索の auto/hybrid は text fallback、
+明示 image/vector は失敗とする。破損/unsafe store を削除・再作成しない。
+以下の provider request/remote job の SQL と 2 相回復は remote 作用に適用し、local の論理 job を
+remote handle 列へ代入しない。local の記録も同じ authority/checkpoint と追記・冪等精算を満たす。
+query の fresh page 1 は native/local を含め同じ runner の device-scope claim/0 USD journal に載せる。
+text mode、実行前 fallback、cursor replay は embedding と新予約・台帳書込みを行わない。
+query 本文は保存せず hash と profile を使う。
+
 
 online Adapter の外部支出を制御するため budget guardrail を適用する。
 
@@ -916,12 +964,13 @@ monthly_usd_cap = 10.0
 - 新規requestの予約条件は、当月の確定・推定課金と未終端予約の合計にcandidateを加えた額が、device、folder、device専用per-adapterの全capを下回ること。adapter_kindは`markdownize` / `embedding`の閉enumとし、未知キーはschema errorとする。candidate=0の無償処理はcap判定の対象外。判定と相1の予約は同じ`BEGIN IMMEDIATE` transactionで行う。
 - 同期requestの相1は`batch_requests`に新しいintent token、submission sequence、見積額、開始時刻、stale期限を保存する。この時点以降は送信された可能性がある。予約は一つの実送信の直前に作り、未送信の後続groupを先取りして予約しない。`cost_ledger`は追記専用であり、終端の課金記録とstate更新を同じtransactionで確定する。
 - 成功は報告usageを使い、usageが使えない場合は予約見積を使う。明示的な認証・rate limit・quota拒否は`submit_rejected`、課金0で終端する。再試行が許可される既知の拒否でも、次の実送信には新しいcap判定・予約が必要となる。
-- 同期OCRまたはdocument embeddingの通信結果、応答の受理、ローカル保存を確定できない場合は、見積額を`unknown_settled`として一度精算し、taskを非自動再試行の`result_unknown`にする。保存失敗を一般的なネットワーク再試行へ変換しない。既存の未終端sync行は再送せず、保存されたstale期限に従って回収する。現行Adapterは同期要求の結果を後から取得するAPIを提供していないため、回収から出力の成功を推測しない。
+- 同期OCRの回復は [14-v1-runtime-contracts.md](14-v1-runtime-contracts.md) の既存契約に従う。同期document embeddingの応答そのものが不明なら、見積額を`unknown_settled`として一度精算し、taskを非自動再試行の`result_unknown`にする。既存の未終端sync行は再送せず、保存されたstale期限に従って回収する。現行Adapterは同期要求の結果を後から取得するAPIを提供していないため、回収から出力の成功を推測しない。
+- 同期embeddingの応答が既知で publication だけが失敗した場合は、受信結果を回復可能に保持して受入検査・精算・再公開を完了する。一般的なネットワーク retry や `result_unknown` に変換せず、新しい有料送信を行わない。既知の受入違反は contract_violation として精算する。
 - `result_unknown`の追加試行は、`kio batch retry --resend-unknown <selector> --yes`で一つのrequest identityを明示承認する。これは送信操作ではなく、現在のscopeに属する対象を再びqueueへ載せる操作である。既存課金を保持し、端末台帳の`unknown_resend_authorized`を一度だけ新しい相1へ消費する。次のonline実行は通常のscope/policy/Adapter承認と予算を再検証する。承認なしのlane切替、task再生成、再起動、月境界でこの制約を迂回できない。unknownと承認待ちのtask行は通常のdevice行剪定で削除しない。
 - Batchは既知のjob/outputを再取得する回復経路を持つ。結果のローカル保存失敗ではjobと予約を保持し、同じoutputを再収集する。新規job作成を結果回収の代わりに行わない。Batchのupload/jobの掃除は§5.8に従う。
 - 同期requestはupload/job残骸を持たず、終端transactionでintent tokenを解放する。解放は未知の結果の再送許可を意味しない。検索queryのdevice行は、利用者が実行する個々の検索の予約として次項の独立したclaim規則に従う。
-- **query embedding request** (vector|hybrid 検索の page 1 — [05-runtime.md §1](05-runtime.md)) は `scope_id = 'device'` (予約値 — scope_id は ULID のため実 scope と衝突しない) の `request_kind='sync'` 行として上記縮退 2 相に載せる。`adapter_kind = 'embedding'`・`input_hash = NFC 正規化した query 文字列の sha256` (query 本文は保存しない — [05-runtime.md §1.5](05-runtime.md) と同じ方針)。folder cap 判定 (scope 別集計) には現れず、device cap / `per_adapter` (embedding) の合算には通常どおり含まれる — 判定式は不変。送信可否の consent gate は [05-runtime.md §1.1](05-runtime.md) / [07-adapter-spec.md §3](07-adapter-spec.md)。**回収と並行 claim**: `kio search` は読み取り系だが ([05-runtime.md §6](05-runtime.md))、vector|hybrid の page 1 に限り device 行の書込主体である。**sync 行は相 1 で `job_create_started_at` に開始時刻を記録し** (batch 行の猶予起点と同じ既存列 — sync では staleness 判定にのみ使う)、**回収の対象は `stale_after_at` (下記 DDL — 相 1 で耐久保存する絶対期限) を過ぎた stale 行に限る**。`stale_after_at` は相 1 Tx で「当該 request に適用する実効 `timeout_seconds` ([07-adapter-spec.md §7](07-adapter-spec.md) `[adapter.policy]` — **device 行では参加 scope の実効値の最大値**) + 60 秒マージン (下限 600 秒)」から算出して保存し、**回収は保存値のみを参照する** — config を後から変更しても、rate_limit の Retry-After 追従 (§5.3 max_attempts=∞) で呼出が長引いても、生存中の呼出を stale と誤認しない (Retry-After を受信した保持プロセスは自 token の CAS UPDATE で `stale_after_at` を **`max(現行値, 現在 + Retry-After + timeout + 60 秒)`** へ延長する — **単調**: 短い Retry-After で期限を縮めない。Retry-After は有限・非負を検証する (**不正値のみ 3600 秒の代替値とし、有効な実値は clamp しない** — 実待機より短い保護期限を作ると、待機中の stale 回収と覚醒後の provider 再呼出という二重呼出窓が再発する)。**延長 UPDATE が 0 行 (= 他プロセスが回収済み) なら claim 喪失として以後の待機・provider 再呼出・記帳を全て中止する** — 下記の状態遷移 CAS 敗者規則と同じ非記帳。累積延長に上限は設けない (§5.3 max_attempts=∞ / Retry-After 追従の設計意図 — 解放の脱出路は `kio batch abandon`))。§5.8 の可視化猶予 (既定 10 分) とは独立の機構である。猶予内の crash 残骸が device cap 予約 (`estimated_usd`) を最大猶予時間保持することは既知の有界挙動として許容する。相 1 の claim に先立ち、**`scope_id='device'` の全 sync stale 行を回収する (同一 4 組 key に限らない — 別 query の crash 残骸も search-only 運用で回収されるように)**。回収は上記 crash 回収と同じ規則で行う (`BEGIN IMMEDIATE` Tx 下。下記剪定と合わせて **1 回の実行あたり合計 256 行を上限とする bounded 処理**とし、**配分と順序を固定する: (1) 自 key (今回 claim する 4 組 key) の stale 行は上限枠外で常に最優先に回収する / (2) 剪定に最低 128 行を保証する / (3) 残余枠を一般 stale 回収に充てる (対象不足の側の未使用枠は相互融通)。各集合の処理・持ち越しの選択順は (sync stale 行 = `job_create_started_at`、terminal 行 = `completed_at`) の昇順 + 4 組 PK の byte 順で完全に決定的とする。残余は次回実行へ持ち越す**。`.kio/.lock` は不要 — device 行はどの scope にも属さず、直列化は cost-ledger 側の Tx が担う。**inline 回収では provider 照会を行わない** — 常に unknown 精算とする (検索応答性の保護。照会つき回収は書き込み系冒頭の crash 回収のみ))。同一 key が stale でない in-flight (他プロセスの生存 claim) のときは当該実行を text fallback (`fallback_reason="embedding_in_flight"` — mode 別の扱いは [05-runtime.md §1.1](05-runtime.md)) に落とし、送信しない (同一 query の並行 claim・token 上書きを作らない)。**device 行の全ての状態遷移 UPDATE (request id 記録・終端) は `WHERE intent_token = <自 token>` の条件付き (CAS) で行う** — 0 行更新 = 他プロセスに回収済みであり、自プロセスは応答・課金のどちらも記帳しない (回収側の unknown 精算が既に確定記帳されており二重計上を作らない。受信済み vector を当該検索の結果に使うことは課金と独立に可)。**terminal device 行の剪定**: `scope_id='device'` ∧ **`state IN (2, 3)`** (成功終端 = state 2 を含む — 含めないと成功 query 行が恒久蓄積する) ∧ `intent_token IS NULL` ∧ **`contract_violation_count = 0`** (「1 回のみ」の durable 判定源を消さない) ∧ `completed_at` が前月以前 (**UTC 暦月** — 当月 UTC 月初の epoch ms 未満。`cost_ledger.month` も `recorded_at` の UTC 暦月から導出する) の行は、書き込み系コマンド冒頭の掃除 (§5.8 の回復と同時) **および `kio search` の inline 回収と同一 Tx** で DELETE してよい (device 行の唯一の作成者は search — search-only の定常運用でも剪定が発火するための併設。**上記 bounded 上限 256 行/回を回収と共有し、超過分は次回へ持ち越す** — 月替わり直後の一括削除で検索応答性 (M3-1) を損なわないための上限)。当月の cap 判定は cost_ledger 合算 + state 0/1 予約のみを参照するため影響せず、確定課金の台帳は cost_ledger 側が恒久保持する (**恒久保持は監査台帳としての既定** — 行数は request 数に比例して増えるが、当月 cap 判定は月次 index (下記 DDL) で有界)。剪定は `submission_seq` の直列化と両立する (通算連番の高水位の正本は cost_ledger — 行の再作成は ledger の MAX から継承するため衝突しない。下記 DDL コメント)。剪定・確定済みの 4 組 key への `kio batch abandon` は**対象なしの冪等成功** (exit 0 + 「対象なし」表示 — [06-cli-spec.md §1](06-cli-spec.md))
-- 累積コストは Adapter 報告値を device-global `cost-ledger.sqlite` に記録する。これは `.kio` truth でも cache でもない非再構築の運用台帳である。明示 `kio ledger init` だけが完全に空の artifact set を初期化できる。通常は authority / checkpoint / stable lifecycle lock を検証して既存 ledger を開き、欠損・不一致・unknown budget は支出 0 と扱わず paused/unknown とする。ローカル offline 処理は金融行を作らない。central billing の確認済み artifact はこの非知識原則の明示的例外である。
+- **query embedding request** (image|vector|hybrid 検索の page 1 — [05-runtime.md §1](05-runtime.md)) は `scope_id = 'device'` (予約値 — scope_id は ULID のため実 scope と衝突しない) の `request_kind='sync'` 行として上記縮退 2 相に載せる。`adapter_kind = 'embedding'`・`input_hash = NFC 正規化した query 文字列の sha256` (query 本文は保存しない — [05-runtime.md §1.5](05-runtime.md) と同じ方針)。folder cap 判定 (scope 別集計) には現れず、device cap / `per_adapter` (embedding) の合算には通常どおり含まれる — 判定式は不変。送信可否の consent gate は [05-runtime.md §1.1](05-runtime.md) / [07-adapter-spec.md §3](07-adapter-spec.md)。**回収と並行 claim**: `kio search` は読み取り系だが ([05-runtime.md §6](05-runtime.md))、image|vector|hybrid の page 1 に限り device 行の書込主体である。**sync 行は相 1 で `job_create_started_at` に開始時刻を記録し** (batch 行の猶予起点と同じ既存列 — sync では staleness 判定にのみ使う)、**回収の対象は `stale_after_at` (下記 DDL — 相 1 で耐久保存する絶対期限) を過ぎた stale 行に限る**。`stale_after_at` は相 1 Tx で「当該 request に適用する実効 `timeout_seconds` ([07-adapter-spec.md §7](07-adapter-spec.md) `[adapter.policy]` — **device 行では参加 scope の実効値の最大値**) + 60 秒マージン (下限 600 秒)」から算出して保存し、**回収は保存値のみを参照する** — config を後から変更しても、rate_limit の Retry-After 追従 (§5.3 max_attempts=∞) で呼出が長引いても、生存中の呼出を stale と誤認しない (Retry-After を受信した保持プロセスは自 token の CAS UPDATE で `stale_after_at` を **`max(現行値, 現在 + Retry-After + timeout + 60 秒)`** へ延長する — **単調**: 短い Retry-After で期限を縮めない。Retry-After は有限・非負を検証する (**不正値のみ 3600 秒の代替値とし、有効な実値は clamp しない** — 実待機より短い保護期限を作ると、待機中の stale 回収と覚醒後の provider 再呼出という二重呼出窓が再発する)。**延長 UPDATE が 0 行 (= 他プロセスが回収済み) なら claim 喪失として以後の待機・provider 再呼出・記帳を全て中止する** — 下記の状態遷移 CAS 敗者規則と同じ非記帳。累積延長に上限は設けない (§5.3 max_attempts=∞ / Retry-After 追従の設計意図 — 解放の脱出路は `kio batch abandon`))。§5.8 の可視化猶予 (既定 10 分) とは独立の機構である。猶予内の crash 残骸が device cap 予約 (`estimated_usd`) を最大猶予時間保持することは既知の有界挙動として許容する。相 1 の claim に先立ち、**`scope_id='device'` の全 sync stale 行を回収する (同一 4 組 key に限らない — 別 query の crash 残骸も search-only 運用で回収されるように)**。回収は上記 crash 回収と同じ規則で行う (`BEGIN IMMEDIATE` Tx 下。下記剪定と合わせて **1 回の実行あたり合計 256 行を上限とする bounded 処理**とし、**配分と順序を固定する: (1) 自 key (今回 claim する 4 組 key) の stale 行は上限枠外で常に最優先に回収する / (2) 剪定に最低 128 行を保証する / (3) 残余枠を一般 stale 回収に充てる (対象不足の側の未使用枠は相互融通)。各集合の処理・持ち越しの選択順は (sync stale 行 = `job_create_started_at`、terminal 行 = `completed_at`) の昇順 + 4 組 PK の byte 順で完全に決定的とする。残余は次回実行へ持ち越す**。`.kio/.lock` は不要 — device 行はどの scope にも属さず、直列化は cost-ledger 側の Tx が担う。**inline 回収では provider 照会を行わない** — 常に unknown 精算とする (検索応答性の保護。照会つき回収は書き込み系冒頭の crash 回収のみ))。同一 key が stale でない in-flight (他プロセスの生存 claim) のときは当該実行を text fallback (`fallback_reason="embedding_in_flight"` — mode 別の扱いは [05-runtime.md §1.1](05-runtime.md)) に落とし、送信しない (同一 query の並行 claim・token 上書きを作らない)。**device 行の全ての状態遷移 UPDATE (request id 記録・終端) は `WHERE intent_token = <自 token>` の条件付き (CAS) で行う** — 0 行更新 = 他プロセスに回収済みであり、自プロセスは応答・課金のどちらも記帳しない (回収側の unknown 精算が既に確定記帳されており二重計上を作らない。受信済み vector を当該検索の結果に使うことは課金と独立に可)。**terminal device 行の剪定**: `scope_id='device'` ∧ **`state IN (2, 3)`** (成功終端 = state 2 を含む — 含めないと成功 query 行が恒久蓄積する) ∧ `intent_token IS NULL` ∧ **`contract_violation_count = 0`** (「1 回のみ」の durable 判定源を消さない) ∧ `completed_at` が前月以前 (**UTC 暦月** — 当月 UTC 月初の epoch ms 未満。`cost_ledger.month` も `recorded_at` の UTC 暦月から導出する) の行は、書き込み系コマンド冒頭の掃除 (§5.8 の回復と同時) **および `kio search` の inline 回収と同一 Tx** で DELETE してよい (device 行の唯一の作成者は search — search-only の定常運用でも剪定が発火するための併設。**上記 bounded 上限 256 行/回を回収と共有し、超過分は次回へ持ち越す** — 月替わり直後の一括削除で検索応答性 (M3-1) を損なわないための上限)。当月の cap 判定は cost_ledger 合算 + state 0/1 予約のみを参照するため影響せず、確定課金の台帳は cost_ledger 側が恒久保持する (**恒久保持は監査台帳としての既定** — 行数は request 数に比例して増えるが、当月 cap 判定は月次 index (下記 DDL) で有界)。剪定は `submission_seq` の直列化と両立する (通算連番の高水位の正本は cost_ledger — 行の再作成は ledger の MAX から継承するため衝突しない。下記 DDL コメント)。剪定・確定済みの 4 組 key への `kio batch abandon` は**対象なしの冪等成功** (exit 0 + 「対象なし」表示 — [06-cli-spec.md §1](06-cli-spec.md))
+- 累積コストは Adapter 報告値を device-global `cost-ledger.sqlite` に記録する。これは `.kio` truth でも cache でもない非再構築の運用台帳である。初期化要件は本節冒頭に従う。通常は authority / checkpoint / stable lifecycle lock を検証して既存 ledger を開き、欠損・不一致・unknown budget は支出 0 と扱わず paused/unknown とする。local embedding も同じ物理 device ledger に reserve/settle を 0 USD で記録する。central billing の確認済み artifact はこの非知識原則の明示的例外である。
 - store は **4 表**で構成し、以下の DDL を SQL 正本とする。`ledger_metadata` は random ledger_id と era、signed SQLite sequence を保持し、`cost-ledger.sqlite.authority.json` / `cost-ledger.sqlite.checkpoint.json` と同一性・完全一致を要求する。外側の write は checkpoint を fsync してから SQLite `COMMIT` し、失敗後の mismatch は通常処理を拒否する。schema/index の auto-create、repair、`user_version` write-seq は持たない:
 
 ```sql
@@ -976,12 +1025,12 @@ CREATE TABLE batch_requests (            -- in-flight Batch intent の正本 (§
         CHECK (request_kind IN ('batch', 'sync')),
                                          -- 縮退 2 相 (sync online) 行の判別 (§5.4)。回復の適用規則を
                                          --  分岐する — sync 行は job/upload 照合・猶予・期限の対象外
-    intent_token      TEXT,              -- UUIDv7 (相 1 で発行)。NULL 化は残骸掃除の完了時のみ (§5.8)
+    intent_token      TEXT,              -- UUIDv7。upload ありは掃除完了時、upload なしは終端 Tx で解放 (§5.8)
     upload_id         TEXT,              -- 相 2a 成功直後に記録
     batch_job_id      TEXT,              -- 相 2b 成功後・または回復の found 自己記述化で記録。
                                          --  sync 行では provider request id (応答受信直後に記録 — §5.4)
-    provider_scope_id TEXT,              -- 相 2a の upload 直前に記録 (§5.8 手順 2 — 非 NULL は
-                                         --  「相 2a 着手」の印)。相 1 の再発行で NULL へ戻る (手順 1)
+    provider_scope_id TEXT,              -- 最初の外部作用の直前。upload なしは job 作成直前 (§5.8)
+                                         -- 相 1 の再発行で NULL へ戻る (手順 1)
     job_create_started_at INTEGER,       -- UTC ミリ秒。batch 行 = 可視化猶予・回復期限の起点 (§5.8)。
                                          --  sync 行 = 相 1 の開始時刻 (bounded sweep の選択順キー — §5.4)
     stale_after_at    INTEGER,           -- UTC ミリ秒。sync 行のみ: 相 1 で耐久保存する回収期限 (§5.4 —
@@ -1036,19 +1085,19 @@ CREATE TABLE ledger_metadata (
 - `kio batch resume --override-budget` は明示的な別操作で、当月の device cap / folder cap の両方を無視して再開する。override は markdownize / embedding **両 Adapter の budget 判定に対称に**効く。`--recheck-budget` も `--override-budget` も指定しない `kio batch resume` は budget 超過 pause タスクを markdownize / embedding いずれも据え置き (sticky)、他要因の pause のみ再開する
 - ローカル LLM 利用時は単価 0 として記録 (= cap に効かない)
 
-**resume / retry / reindex が駆動する enrichment**: `kio batch resume` / `kio batch retry` は online markdownize タスクに加え、**embedding enrichment パスも駆動する** (embedding タスクは現行世代の live chunk 集合から DB 駆動で再検出される。opt-in は Adapter 単位 = embedding は自身の承認行を見る、[07-adapter-spec.md §3](07-adapter-spec.md))。同様に `kio reindex --regenerate` / `kio repair rebuild-db` は rebuild 後に enrichment を実行し、新世代 chunk の embedding を追随させる (§4.6)。offline なら embedding タスクを enqueue のみとし `index_status` ([05-runtime.md §1.7](05-runtime.md)) に pending として可視化する。retry の失敗タスクは backoff / retry 予算 (§5.3) を尊重し、`next_retry_at` 未来または非 retryable の embedding タスクを持つ chunk は enrichment 対象から除外する。**`kio batch resume` / `retry` / `kio reindex --regenerate` が online 成果 (normalized / chunk) を finalize したときも、必要な snapshot と tagged publication event を同じ publication protocol で確定する**。chunk が検索対象になるのは、その event が introduction commit の tree config と exact normalized unit を認証した後だけである ([05-runtime.md §1.6](05-runtime.md))
+**resume / retry / reindex が駆動する enrichment**: `kio batch resume` / `kio batch retry` は online markdownize タスクに加え、**embedding enrichment パスも駆動する** (embedding タスクは現行世代の live chunk 集合から DB 駆動で再検出される。承認要否は descriptor の外部作用に従い、HTTP embedding は自身の承認行を見る、[07-adapter-spec.md §3](07-adapter-spec.md))。同様に `kio reindex --regenerate` / `kio repair rebuild-db` は rebuild 後に enrichment を実行し、新世代 chunk の embedding を追随させる (§4.6)。`--offline` では HTTP dispatch を伴う embedding だけを enqueue のみとし `index_status` ([05-runtime.md §1.7](05-runtime.md)) に pending として可視化する。準備済み EG2 は §5.4 の台帳要件と current policy を満たせば `--offline` でも実行する。retry の失敗タスクは backoff / retry 予算 (§5.3) を尊重し、`next_retry_at` 未来または非 retryable の embedding タスクを持つ chunk は enrichment 対象から除外する。**`kio batch resume` / `retry` / `kio reindex --regenerate` が online 成果 (normalized / chunk) を finalize したときも、必要な snapshot と tagged publication event を同じ publication protocol で確定する**。chunk が検索対象になるのは、その event が introduction commit の tree config と exact normalized unit を認証した後だけである ([05-runtime.md §1.6](05-runtime.md))
 
 ## 5.5 冪等性
 
 `(input_hash, tool_profile_hash) → output_ref` 一致なら done として短絡 (キャッシュヒット)。これは **first-instance-wins** ([03-data-model.md §6](03-data-model.md))。LLM APIの二重課金防止はrequestごとの予約・終端と送信回復で行う。providerのidempotency keyを利用できる場合も、ローカルのintent token自体をproviderの重複排除保証とは扱わない。同期taskの不確定結果は§5.4の明示再試行承認を必要とし、Batch投入と結果回収は§5.8のprotocolに従う。
 
 **embedding の content ベース再利用**: embedding タスクは上記の短絡に加え、対象 chunk の
-`(text_hash, embedding profile_hash, dimensions, distance, modality)` に一致する既存 embedding が
+`(text_hash, filename context, embedding profile_hash, dimensions, distance, modality)` に一致する既存 embedding が
 同一 `.kio` 内にあれば、Adapter を呼ばず既存 vector を再利用する。`text_hash` は chunk 抽出範囲のみの
 hash ([03-data-model.md §8](03-data-model.md)) であり、normalized_hash (不採用) ではない。
 これにより incremental Markdownize 後、unchanged unit 由来で本文が変わらない chunk は
 embedding を再生成しない。budget 判定と cost ledger 記帳は **実際に Adapter へ送信した (再利用でない)
-chunk の文字数のみ**を対象とし、再利用 chunk (API 非呼出) は課金しない。バッチ内で再利用と実送信が
+member の descriptor による見積り**を対象とし、再利用 chunk (API 非呼出) は課金しない。バッチ内で再利用と実送信が
 混在し実送信側が失敗した場合も、再利用で既に `chunk_vec` を確定した chunk は done を保持する
 (送信失敗が再利用済み chunk に波及しない)。
 
@@ -1114,7 +1163,24 @@ collect」の各段の間にクラッシュ窓があり、provider 側に課金�
 **記録の正本**: `cost-ledger.sqlite` の `batch_requests` 行 (DDL は §5.4 が SQL 正本)。tasks.jsonl は
 喪失許容 (§5.7) のため、in-flight Batch の回復は batch_requests だけで可能でなければならない。各段の
 記録は同 DB の単一 Tx で行う。cost-ledger.sqlite ごと喪失した場合の最終回収線は、provider job 一覧の
-metadata から intent_token 規約に一致する job を全走査することである (帰属は metadata の (scope_id, adapter_kind, input_hash, tool_profile_hash) と出力 JSONL の custom_id が担う — 新規 UUIDv7 の token 単独では帰属できない)。tasks.jsonl の task 記述子 (mode / unit_keys / output_ref) は喪失しうるが、**確定先と対象 unit は決定論的に再導出できる**: 出力の取り込み先はタスクキー (input_hash = raw、tool_profile_hash) と gen 規則から (**gen 規則 = 当該タスクキーの最新 instance の未完了 unit を補完する、に固定** — 当該 attempt が `--force` 由来かは再導出不能のため、force の意図は tasks.jsonl 喪失で失われ得る (再実行で回復)。誤 gen への上書き・二重課金は first-instance-wins と記帳の冪等性が防ぐ)、対象 unit は provider 出力 JSONL の custom_id (= unit_key) から復元し (**失敗 unit は出力に現れない — 期待 unit 集合は prepared units (raw から決定論的に再導出) との差集合で判定する**)、mode が不明な場合は full として扱う (§5.7 の安全側規定と同型)。**この full 扱いの受け入れ検査では、差集合の unit を当該 job の failed_units と見なして §3.2 (V6 を含む) を評価する** — 部分 retry 由来の sparse な正当出力を V6 の全集合違反として reject しない (既 done unit への影響は first-instance-wins が遮断する)。**合成する failed_units の error_kind は `network_error` (retryable — §5.3) に固定する** — 回復時は転送欠落と provider 明示の unit 失敗を区別できないため安全側 (再試行) に倒す (合成失敗 unit は通常の retry 経路で回復し、既 done unit は first-instance-wins が保全する)。この回復経路の V6 は差集合の定義により被覆を構造的に満たす — 検証強度は mode 既知の通常経路より意図的に低く、転送欠落の検出は retry の自己回復に委ねる。**この差集合 → failed_units 合成は Markdownize の回復規則である** — Embedding Batch ([07-adapter-spec.md §5.3](07-adapter-spec.md)) は `failed_units` を持たない all-or-nothing 契約のため回復単位は request 全体とする。出力の完全な id 集合を保存済み job の `input_hash` と照合し、現在の chunk 集合や不完全な応答から元のメンバを推測しない。欠落を含む受入違反は全体を `Outcome::ContractViolation` / `BatchState::Terminal` として保守的に精算し、同じ scope / embedding adapter の新規 Batch 送信を明示的 reset まで停止する。既に送信した job の照会・精算と、別途承認された sync レーンは継続できる。書込み前の全件検証、停止条件、解除手順の正本は [07 §5.3](07-adapter-spec.md) とする。
+metadata から intent_token 規約に一致する job を全走査することである (帰属は metadata の (scope_id, adapter_kind, input_hash, tool_profile_hash) と出力 JSONL の custom_id が担う — 新規 UUIDv7 の token 単独では帰属できない)。tasks.jsonl の task 記述子 (mode / unit_keys / output_ref) は喪失しうるが、**確定先と対象 unit は決定論的に再導出できる**: 出力の取り込み先はタスクキー (input_hash = raw、tool_profile_hash) と gen 規則から (**gen 規則 = 当該タスクキーの最新 instance の未完了 unit を補完する、に固定** — 当該 attempt が `--force` 由来かは再導出不能のため、force の意図は tasks.jsonl 喪失で失われ得る (再実行で回復)。誤 gen への上書き・二重課金は first-instance-wins と記帳の冪等性が防ぐ)、対象 unit は provider 出力 JSONL の custom_id (= unit_key) から復元し (**失敗 unit は出力に現れない — 期待 unit 集合は prepared units (raw から決定論的に再導出) との差集合で判定する**)、mode が不明な場合は full として扱う (§5.7 の安全側規定と同型)。**この full 扱いの受け入れ検査では、差集合の unit を当該 job の failed_units と見なして §3.2 (V6 を含む) を評価する** — 部分 retry 由来の sparse な正当出力を V6 の全集合違反として reject しない (既 done unit への影響は first-instance-wins が遮断する)。**合成する failed_units の error_kind は `network_error` (retryable — §5.3) に固定する** — 回復時は転送欠落と provider 明示の unit 失敗を区別できないため安全側 (再試行) に倒す (合成失敗 unit は通常の retry 経路で回復し、既 done unit は first-instance-wins が保全する)。この回復経路の V6 は差集合の定義により被覆を構造的に満たす — 検証強度は mode 既知の通常経路より意図的に低く、転送欠落の検出は retry の自己回復に委ねる。**この差集合 → failed_units 合成は Markdownize の回復規則である**。
+Embedding は保存済み job の入力 binding を正本とし、現在の chunk 集合や不完全な応答から元 member を推測しない。
+member の対応を検証できる応答では、§5.1 の受入検査に通る member だけを公開し、失敗 member だけを後続対象にする。
+対応を確立できない応答だけを全体拒否する。欠落/不正を成功扱いせず、不完全な usage は保守的に精算する。
+
+### Embedding Batch の契約違反による停止
+
+同 scope / embedding adapter に未解除の typed contract violation が一件でもあれば、新規 Batch の予約・送信を停止する。
+判定は terminal な `batch_requests` の `contract_violation_count > 0` と、その完全な task key
+`(scope_id, adapter_kind, input_hash, tool_profile_hash)`・現在の `submission_seq` に一致する
+`cost_ledger` の `outcome='contract_violation'` を突合して行う。自由文 error は判定源にしない。
+profile や member 集合を組み直しても停止は解除されない。既存 job の照会・精算と別途承認された sync は継続できる。
+明示 reset は本節の解除規則に従い、過去の ledger を削除しない。public code/exit は
+[06-cli-spec.md §8](06-cli-spec.md) に従う。
+
+Gemini inline Batch は upload を持たない。`provider_scope_id` は job 作成直前に記録し、
+`upload_id` は常に NULL とする。upload のない経路では成功・拒否・失敗の終端 transaction で intent token を解放し、
+存在しない upload の削除完了を待たない。upload ありの手順と掃除規則は以下に従う。
 
 手順 (1 job 単位):
 
@@ -1138,22 +1204,22 @@ metadata から intent_token 規約に一致する job を全走査すること�
    再特定できない)。入力・中間ファイル (JSONL 等) の filename に intent_token を埋め込んで upload し、
    **成功直後に upload_id を行へ記録**する (job 作成が失敗しても残骸の handle を失わない)
 3. **相 2b — job 作成**: 呼出の**直前**に `job_create_started_at = now` を**単独の小 Tx**で行へ記録する
-   (`provider_scope_id` は相 2a で記録済み — **job 作成は同一 client instance で行い、記録後に設定を
-   再読みしない。現 instance の scope が記録値と一致しない場合は呼び出さず、旧 upload を掃除して
-   相 2a からやり直す** — [07-adapter-spec.md §5.5](07-adapter-spec.md))。job metadata に
+   (`provider_scope_id` は upload ありなら相 2a で記録済み、upload なしならこの直前に記録する。**job 作成は同一 client instance で行い、記録後に設定を
+   再読みしない。現 instance の scope が記録値と一致しない場合は呼び出さず、存在する旧 upload を掃除し、
+   upload なしなら job 作成前の scope 検証へ戻る** — [07-adapter-spec.md §5.5](07-adapter-spec.md))。job metadata に
    **intent_token と (scope_id, adapter_kind, input_hash, tool_profile_hash)** を埋め込んで作成 →
    成功後に batch_job_id と state=1 を記録する
 4. **相 3 — collect**: 出力の取得・persist 後、確定課金の cost_ledger 記帳と state=2 + completed_at を
    **同一 Tx** で行い、upload を削除する (**404 = 削除成功**として扱う。削除失敗・クラッシュは次回回復が
-   再試行し、**全削除の完了をもって intent_token を NULL 化**する)。
+   再試行し、**upload ありは全削除完了、upload なしは終端 Tx で intent_token を NULL 化**する)。
    **persist 直前に対象 raw の tombstone を再検査する** — purge 済みなら出力を破棄し、下記の reject 終端と
    同形 (error='purged') で閉じる (削除済み派生物を再 persist しない — [05-runtime.md §3.5](05-runtime.md))。
    **出力が受け入れ検査 (§3.2) で reject された場合 (contract_violation) も persist しない**: 同一 Tx で
    確定課金 (provider 報告値) の記帳 + `state=3`・`error='contract_violation'`・completed_at を行い、
    attempts を耐久更新する (**upload 掃除は Tx に含めない** — provider 側削除は SQLite Tx に原子参加
-   できない。相 3 collect と同じ回復規則に従い冪等に再試行し (404 = 削除成功)、**全削除の完了をもって
+   できない。相 3 collect と同じ回復規則に従い冪等に再試行し (404 = 削除成功)、**upload ありは全削除完了、upload なしは終端 Tx で
    intent_token を NULL 化**する)。§3.2 の「同一 mode で 1 回のみ再試行」は**この終端 Tx の完了後、かつ旧 attempt の
-   残骸掃除完了 (upload 全削除 + intent_token NULL 化) 後に**、
+   残骸掃除完了 (upload があれば全削除、intent_token NULL 化) 後に**、
    新 intent_token・新 submission_seq の相 1 として開始する (順序規範 (下記) と同型 — 相 1 の NULL
    戻しが掃除未完の旧 upload の唯一の locator を消さないため。旧 attempt を state=1 のまま放置して
    再 collect ループに入らない・記帳を落とさない)。再投入の mode は原則同一 — tasks.jsonl 喪失で
@@ -1161,8 +1227,7 @@ metadata から intent_token 規約に一致する job を全走査すること�
    reject 終端 Tx で `contract_violation_count` を increment する (相 1 の NULL 戻しの対象外)。
    共通の再試行上限として、再投入できるのは count <= 1 のとき (0 = 未違反・`--reset-violations` 後を含む)
    だけで、count >= 2 は failed permanent。ただし embedding の Batch は、さらに
-   [07-adapter-spec.md §5.3](07-adapter-spec.md) の scope / adapter 単位の停止規則を適用するため、
-   一件目の未解除の契約違反から新規予約・送信を停止する。
+   本節の「Embedding Batch の契約違反による停止」に従う。
    (tasks.jsonl 喪失後もこの判定は batch_requests から回復できる。error 列は最新状態の表示であり
    判定源にしない — 相 1 が NULL へ戻すため)。count は**タスクキー単位の通算**であり mode 別に
    数えない (mode 切替後の違反も加算)。検証済み Adapter 更新後の脱出路として
@@ -1210,7 +1275,7 @@ provider の reject 等) の usage 欠落は正当であり、確定額 0 (`usd=
 billable Adapter の pricing 被覆は送信前に検査される ([10-operations.md §11.3](10-operations.md))
 ため、この経路は途中で表が壊れた場合の防衛線)。**課金 field 単独の不良は応答の受否・outcome・`contract_violation_count` を
 変えない** — 成功は成功のまま、正常な制御応答は `outcome='fallback_to_full'` のまま (構造違反 (§3.2、
-Embedding は [07-adapter-spec.md §5.3](07-adapter-spec.md) の受入検査) だけが contract violation。
+Embedding は §5.1 の受入検査) だけが contract violation。
 課金 field の不良は warning log で可視化する —
 [07-adapter-spec.md §7](07-adapter-spec.md) の `usage_validation` / `billing_source` field と
 event code `KIO-EV-ADAPTER-USAGE-001`。[07-adapter-spec.md §4](07-adapter-spec.md) の「estimated 記帳へ
@@ -1234,15 +1299,17 @@ opt-in / `--online` なしで実行できる** ([07-adapter-spec.md §3](07-adap
 - **confirmed-absent**: 「不在」と断定できるのは、**記録済み provider_scope_id と同一 scope での
   全ページ走査済み一覧**に無く、かつ**可視化猶予 (既定 10 分)** を経過したときのみ (部分応答・別 scope の
   空応答は不在の証明にならない)。**相 2b 未着手 (job_create_started_at IS NULL) の行は job 一覧照合の
-  対象にしない** — job 不存在は記録から確定している。ただし **provider_scope_id 非 NULL (= 相 2a 着手)
-  の行は、記録済み scope の `list_uploads` を token で照合し、発見した upload の削除 (404 含む) または
-  採用 (再利用) を完了してから**、token 時刻起点の猶予経過で再投入してよい (upload 一覧にも可視化猶予を
-  適用。怠ると upload_id 記録前クラッシュの残骸が、新 token への置換で恒久に発見不能になる)
+  対象にしない** — job 不存在は記録から確定している。upload を行う provider/path で
+  provider_scope_id 非 NULL の場合だけ、記録済み scope の `list_uploads` を token で照合し、
+  発見した upload の削除 (404 含む) または採用 (再利用) を完了し、token 時刻起点の可視化猶予を待つ。
+  inline の upload なし経路は一覧照会・upload 掃除を要求しない。scope 記録後、job 開始時刻の記録前に
+  crash した行も、job 未着手として回復し、既存 intent を再開できる。新しい intent に置換する場合は
+  旧行を終端 transaction で閉じて token を解放してから再投入する。scope の一致検証は省略しない。
 - **unknown** (照会失敗・scope 不一致・部分応答): 何も変更せず保持し、次回再試行する。**回復期限**
   (max(intent_token 時刻, job_create_started_at) + 既定 48h、config で変更可) を超えたら「作成されたが
   確認不能」として **estimated 記帳** (上記の seq+1 行 UPDATE + token キー + usd = 推定額) を冪等に行ってから再投入する
   (記録喪失より過大計上を許容 — budget 判定は安全側に倒れる)。**ただし再投入 (新 token の相 1) は、
-  旧 intent_token による upload / job の照合・掃除が完了している場合に限る** — 照会不能のまま
+  旧 intent_token による job と、存在する upload の照合・掃除が完了している場合に限る** — 照会不能のまま
   掃除未完の行は再投入せず stalled として表示し続ける (恒久 unknown と同じ脱出路 = abandon。
   旧 token を上書きすると残骸の唯一の発見キーを失い、二重実行・課金・機密残留を発見できなくなる)
 - **恒久 unknown** (資格情報喪失等) の行は `kio status` に **stalled** として表示し (表示には
@@ -1250,14 +1317,16 @@ opt-in / `--online` なしで実行できる** ([07-adapter-spec.md §3](07-adap
   intent_token または (scope, adapter, input_hash, tool_profile_hash) の 4 組タスクキー** — 3 組では
   同一 input の別 profile 行と曖昧になる。曖昧な指定は拒否して token を要求する。tasks.jsonl の task_id
   は喪失許容の識別子であり、正本 batch_requests 行を指す手段にならない) を脱出路とする: ユーザー確認で estimated
-  記帳 + state=3 (error='abandoned') + completed_at。**intent_token は残骸掃除の完了まで NULL 化しない**
+  記帳 + state=3 (error='abandoned') + completed_at。**upload なし経路はこの終端 transaction で intent_token を NULL 化する。
+  upload を行う provider/path だけは残骸掃除の完了まで NULL 化しない**
   (intent_token 埋込 filename が upload 残骸の唯一の発見キーであるため、先に消すと掃除が残骸を発見
   できず provider TTL まで機密が残留する。掃除の完了 (404 含む) が NULL 化の条件。恒久に掃除できない
   場合は既知の残余として表示し続ける。このとき当該タスクキーの再投入は掃除完了まで開始できない —
   cleanup-first の帰結であり、機密残骸の追跡を新 attempt より優先する意図された設計)
 
-**残骸掃除**: terminal な task の upload (upload_id 記録分 + intent_token 埋込 filename の一覧照合分) を
-削除する。abandon 済み task は照合・記帳を行わず掃除のみ行う。
+**残骸掃除**: upload を行う provider/path だけで、terminal な task の upload
+(upload_id 記録分 + intent_token 埋込 filename の一覧照合分) を削除する。
+abandon 済み task は再記帳せず掃除のみ行い、upload なし経路に存在しない掃除を要求しない。
 
 **順序規範**: 明示 retry / `kio reindex --regenerate` が terminal task を再投入する場合、**旧 intent_token の
 照合・記帳・消し込みを完了してから**、retry 予算のリセットと新しい相 1 を行う (逆順だと旧 attempt の

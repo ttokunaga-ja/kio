@@ -135,6 +135,7 @@ fn same_scope_markdown_link_cannot_reauthorize_an_ignored_image_owner() {
 fn stale_replica_image_candidate_is_hidden_after_owner_ignore_without_reindex() {
     let dir = canonical_tempdir();
     ok(&dir, &["init"]);
+    ok(&dir, &["ledger", "init"]);
     let repo = Repository::open(dir.path()).unwrap();
     let bytes = png();
     let hash = kio_pipeline::prepare::hash_bytes(&bytes);

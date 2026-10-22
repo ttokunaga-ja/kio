@@ -16,7 +16,7 @@ OS 通知、起動時照合、既定 300 秒ごとの完全照合を、手動 `i
 空の子・孫フォルダも対象で、Ignore と独立した nested root の境界を維持する。
 
 この実装の監視はローカル処理を行い、新規の外部送信承認や secret 承認を作らない。
-実行済み provider job のポーリング・ダウンロード・掃除も行わず、HTTP Adapter（認証済み local Adapter を含む）も利用しない。
+実行済み provider job のポーリング・ダウンロード・掃除も行わず、HTTP Adapter（local Adapter を含む）も利用しない。
 `status` は状態を作成せず、OS lock による稼働状態と、観測時刻付きの backend/backlog/最後の成功・失敗を表示する。
 `stop` はその起動 instance への停止要求を記録し、進行中の照合が終わった後に停止する。停止要求の受理と終了完了は別の状態である。
 強制終了後は OS lock が解放され、再起動時に完全照合して未処理変更を回復する。
@@ -49,12 +49,12 @@ kio index [--preview|--yes] [--online|--offline] [--realtime|--batch]  # 取り�
                                         # 解決順は network opt-in と同形: CLI > scope config > user config > 既定 (Batch)。
                                         # config キーは `[adapter] lane = "batch" | "realtime"` (03 §11)。
                                         # --realtime は OCR と embedding を**両方まとめて**即時レーンへ倒す
-                                        # (単価は両方 2 倍。07 §5.3 の 2026-07-24 裁定)。--batch はその逆向き上書き。
+                                        # (レーン単価は 07 §4 の価格解決規則に従う)。--batch はその逆向き上書き。
                                         # 同じ --realtime/--batch を batch resume / batch retry / repair rebuild-db /
                                         # reindex も受ける (いずれも online 送信を駆動するため)。
                                         # --online は configured Adapter のいずれかに active paired grant が
                                         # あることを index 前に要求する。各 HTTP dispatch は当該 Adapter の
-                                        # exact grant を別途要求する。--offline は認証済み local Adapter を含む
+                                        # exact grant を別途要求する。--offline は local Adapter を含む
                                         # 当該実行の全 HTTP dispatch を止める (正本 07-adapter-spec.md §3)。
 kio root register [path] (--preview|--yes) [--resume <OPERATION_ID>]
                                         # 明示的に moved managed root を再登録する。path 省略時は cwd。
@@ -184,6 +184,31 @@ kio evidence retarget <pointer> --at <commit> # exact-only read-only retarget。
 
 検証範囲と残差は [実行記録](../tasks/v1-closeout-execution-2026-10-03.md) を参照する。
 3 OSの最終候補受入・配布と、後続の引用への影響表示は別の完成条件である。
+
+### Embedding モデル
+
+```bash
+kio model status
+kio model install embeddinggemma-2 [--yes]
+kio model install embeddinggemma-2 --from <file> [--yes]
+```
+
+status は read-only で、取得・修復・同意・処理再開を起こさない。install は download または
+指定 file の import を行う。`kio ledger init` と `kio model install` だけが device ledger を作成できる。
+model install は確認済みの device setup として、missing ledger を ledger init と同じ authority/checkpoint 検証・初期化で
+作成する。既存 ledger を置換・修復せず、unsafe/破損/中断 state は自動再作成しない。
+台帳未初期化時の embedding/search は [04-pipeline.md §5.4](04-pipeline.md) に従う。`--offline` 下の network 取得は不可であり、import はネットワークを使わない。
+確認には公式 source、revision、size、SHA-256、保存先、Apache-2.0 と Google の
+「deployments must adhere to the Gemma Prohibited Use Policy」という声明をリンク付きで表示する。
+`--yes` はこの device 操作の確認を非対話で承認する。scope 内容送信や paid 権限は作らず、token を保存しない。
+取得・import とも同じ確認と検証を行う。保存・検証契約は [10-operations.md §5.1](10-operations.md)。
+
+model/adapter status の typed fields は `selected_profile`、`profile_hash`、`model_revision`、`model_hash`、
+`runtime_version`、`readiness`（ready / missing / license-required / hash-mismatch）、
+`reembedding_count`、`producers`（OS/arch、library SHA、runtime version、件数）、`mixed_producers`。
+Task の Skipped は理由別件数、資源待ちは `resource_busy` として表示する。
+local HTTP peer には `peer_authenticated=false` を表示し、承認確認にも未認証と明示する。
+HTTPS の trust 状態は既存の managed CA status に従う。producer の認定状態は設けない。
 
 ### Device-global ledger recovery
 
@@ -460,10 +485,10 @@ kio search "..." --mode <auto|text|image|vector|hybrid>   # 当該実行の上�
                               #  embedding_in_flight は技術的失敗として対象。
                               #  正本 05-runtime.md §1.1 consent gate)
 kio search "..." [--online|--offline]   # HTTP query embedding は current exact paired grant を要する
-                                       # --online は cloud / authenticated local HTTPS と vector 経路を要求する。
+                                       # --online は cloud / local endpoint と vector 経路を要求する。
                                        # 一時承認ではなく、Adapter / grant / index の不足は error。
-                                       # --offline は local HTTPS も含む全 HTTP dispatch を禁止する。
-                                       # in-process deterministic は禁止対象外 (--online は指定不可)。
+                                       # --offline は local HTTP/HTTPS も含む全 HTTP dispatch を禁止する。
+                                       # native EG2 / in-process deterministic は禁止対象外 (--online は指定不可)。
                                        # cursor replay は cache vector を再利用するが current gate / cursor 検査は残る。
                                        # 正本 07-adapter-spec.md §3・05-runtime.md §1.1 / §1.5
 
@@ -481,7 +506,7 @@ kio search "..." --json                 # 機械可読
 
 レスポンス schema は [05-runtime.md §1.7](05-runtime.md)。`json` モードでは Evidence Pointer フル構造 + `next_cursor` を返す。
 
-`index_status.budget_paused` は task の budget pause と、cost ledger から観測した device / folder 月次 cap 枯渇の OR である。この観測は searched scope ごとに source ledger を reopen せず、1 invocation の command preflight で取得した同じ owned read-only snapshot から device total を1回、folder total を scope ごとに読む。snapshot は既存の入力・mode 判定後、fresh vector / hybrid page 1 の writable ledger open・claim / reservation・query embedding 送信より前に取得する。集計対象の UTC 月も preflight 時点で固定し、取得後の別 writer や同一 invocation の charge はその response の月次 cap 観測へ混ぜない。explicit text、cursor replay、および offline / profile incompatibility / final consent rejection による**pre-attempt** auto→text は source ledger の main / `.write-seq` / SQLite sidecar を作成・変更しない。final consent check を通過した fresh vector / hybrid page 1 は query embedding 記帳の既存例外に従い、claim / reservation / send 後に最終結果が text fallback になった場合も同じである ([05-runtime.md §6](05-runtime.md))。snapshot が unsafe / unstable な場合は `budget_paused=false` に縮退せず、下記の command-level error で stdout を空のまま停止する。
+`index_status.budget_paused` は task の budget pause と、cost ledger から観測した device / folder 月次 cap 枯渇の OR である。この観測は searched scope ごとに source ledger を reopen せず、1 invocation の command preflight で取得した同じ owned read-only snapshot から device total を1回、folder total を scope ごとに読む。snapshot は既存の入力・mode 判定後、fresh image / vector / hybrid page 1 の writable ledger open・claim / reservation・query embedding 送信より前に取得する。集計対象の UTC 月も preflight 時点で固定し、取得後の別 writer や同一 invocation の charge はその response の月次 cap 観測へ混ぜない。explicit text、cursor replay、および HTTP の offline / profile incompatibility / final consent rejection による**pre-attempt** auto→text は source ledger の main / `.write-seq` / SQLite sidecar を作成・変更しない。final consent check を通過した fresh image / vector / hybrid page 1 は query embedding 記帳の既存例外に従い、claim / reservation / send 後に最終結果が text fallback になった場合も同じである ([05-runtime.md §6](05-runtime.md))。snapshot が unsafe / unstable な場合は `budget_paused=false` に縮退せず、下記の command-level error で stdout を空のまま停止する。
 
 ---
 
@@ -764,7 +789,9 @@ scope status や `batch_changed` に変換しない。registry main / `-wal` / `
 sidecar が存在する形は unsafe integrity である。
 
 Search の cost-ledger snapshot も command-level preflight である。source ledger のmain / `-wal` /
-`-shm` の全3 leaf absent の場合だけは no-create / zero-total として cap 判定を継続する。
+`-shm` の全3 leaf absent は no-create のまま未初期化・budget-unknown とし、zero-total として
+cap 判定を続けない。embedding の Paused と検索の auto/hybrid fallback・明示 image/vector の失敗は
+[04-pipeline.md §5.4](04-pipeline.md) に従う。
 source symlink / hardlink / non-regular / oversize leaf、pre/open/post identity 不一致、main absent +
 sidecar present、または source 再観測が一致した owned copy の SQLite integrity failure は
 `KIO-E-LEDGER-SNAPSHOT-UNSAFE-001` / exit 4 とする。source leaf の presence/hash drift、busy、
@@ -785,6 +812,20 @@ code の一覧の正本は実装の発行箇所である。spec は、利用者�
 exit を、その振る舞いを定める節 (03〜08、12〜14) で定義する。本節は、他の節に置き場のない
 CLI 横断の code だけを定める。
 
+embedding のモデル準備・実行に対する public code/exit は本節だけを正本とする。
+
+| code | typed reason | exit | 条件 |
+| --- | --- | --- | --- |
+| `KIO-E-MODEL-NOT-READY-001` | model_not_ready | 4 | モデル未取得・未準備。明示 install が必要 |
+| `KIO-E-MODEL-HASH-001` | model_hash_mismatch | 4 | model/runtime の固定 SHA-256 不一致。利用せず正常 artifact を保持 |
+| `KIO-E-MODEL-CONSENT-001` | model_consent_required | 9 | 取得/import の確認未成立・拒否。非対話で確認指定なしも取得しない |
+| `KIO-E-EMBED-RUNTIME-001` | embedding_runtime | 4 | native abort/EOF/不正応答/timeout 等。member failure として有界 retry 後も残る場合 |
+| `KIO-E-EMBED-RESOURCE-001` | resource_busy | 3 | engine slot の bounded wait 超過、低空き memory、memory limit。Paused として再開可能 |
+
+cancel は既存 user 中断 exit 7 を使う。local crash の自動再計算は
+[04-pipeline.md §5.3](04-pipeline.md) の上限内とし、再試行可能な失敗が残る集約 exit は §7 に従う。
+通常の検索が text fallback を返した場合の code は縮退理由であり exit 0 を維持する。
+
 GC planner 固有の `KIO-E-GC-PLAN-LIMIT-001` は commit / tree entry / verified byte / ref / receipt / directory entry / path depth / graph traversal cap 超過を表し、exit 4 とする (§6.1)。`KIO-E-GC-RUNTIME-LIMIT-001` はbounded automatic sliceが安全なcheckpointで期限へ達したことを表すretryable exit 3であり、corruptionではない。`KIO-E-GC-CONFIG-CHANGED-001` はautomatic writer開始時に固定した`[gc]` authorityがpublication-to-GC handoff中に変化したため、publicationを保持したままGCを開始しなかったことを表すretryable exit 3である。
 
 `KIO-E-EMBED-PLAN-LIMIT-001` は保持済み履歴からの埋め込み候補収集が、100,000 件または
@@ -798,7 +839,7 @@ context は `scope_id`、`adapter_kind` と、各 `blocked_attempts` の `input_
 `tool_profile_hash`、`submission_seq`、完全な selector を含む。原因確認後、対象ごとに
 `kio batch retry --reset-violations <selector> --yes` を実行して解除する。
 既に送信した job の照会・精算、別途承認された sync レーンはこの停止の対象外とする。
-停止判定の正本は [07-adapter-spec.md §5.3](07-adapter-spec.md)。
+停止判定の正本は [04-pipeline.md §5.8](04-pipeline.md)。
 
 Evidence 解決の現行 code は、purged raw の tombstone 応答を
 `KIO-E-PURGE-TOMBSTONED-001` (exit 4)、raw/chunk の両方に一致する短縮 hash を
@@ -823,7 +864,7 @@ registry 行が on-disk の scope identity / path と一致しない場合は
 Adapter 境界で記録するもの:
   - 入力 object hash を明示
   - 処理対象 scope を明示
-  - execution_mode (online_api | offline_api | deterministic_library) を明示
+  - execution_mode (online_api | offline_api | native_library | deterministic_library) を明示
   - ネットワーク送信の許可状態を明示
   - 出力 artifact hash を記録
   - tool_profile_hash / agent_profile_hash を記録
@@ -860,7 +901,7 @@ Adapter 種別と契約は [07-adapter-spec.md](07-adapter-spec.md)。
 .kio/manifest.json                manifest.schema.json
 ```
 
-`tools.schema.json` の認証情報フィールド (`auth`) の形式は [07-adapter-spec.md §1](07-adapter-spec.md) に従う (`env:` / `plain:` prefix)。同じく `url` フィールドの受理条件は [07-adapter-spec.md §3](07-adapter-spec.md) に従う (`execution_mode = "offline_api"` では明示ポート付きの HTTPS loopback リテラルのみ — 違反は `KIO-E-LOCAL-PEER-URL-001`)。
+`tools.schema.json` の認証情報フィールド (`auth`) の形式は [07-adapter-spec.md §1](07-adapter-spec.md) に従う (`env:` / `plain:` prefix)。同じく `url` フィールドの受理条件は [07-adapter-spec.md §3](07-adapter-spec.md) に従う (`execution_mode = "offline_api"` では明示ポート付きの HTTP/HTTPS loopback リテラル — 違反は `KIO-E-LOCAL-PEER-URL-001`)。
 
 validation 失敗は **exit 2** + `KIO-E-CONFIG-SCHEMA-001`。現在の schema は厳格に検証し、legacy reader や migration branch は置かない。
 

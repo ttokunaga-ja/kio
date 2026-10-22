@@ -1,10 +1,10 @@
 use crate::approvals;
 use crate::commands::IndexArgs;
-use crate::embedding::transport::declared_embedding_profile;
-use crate::embedding::transport::embedding_execution;
-use crate::embedding::transport::embedding_is_deterministic;
-use crate::embedding::transport::embedding_tool_lock_entry;
-use crate::embedding::transport::embedding_transport_allowed;
+use crate::embedding::admission::declared_embedding_profile;
+use crate::embedding::admission::embedding_execution;
+use crate::embedding::admission::embedding_is_deterministic;
+use crate::embedding::admission::embedding_tool_lock_entry;
+use crate::embedding::admission::embedding_transport_allowed;
 use crate::grants;
 use crate::index::pipeline::active_markdown_adapter;
 use crate::index::pipeline::offline_output_ref;
@@ -294,6 +294,7 @@ fn execution_mode_name(mode: ExecutionMode) -> &'static str {
     match mode {
         ExecutionMode::OnlineApi => "online_api",
         ExecutionMode::OfflineApi => "offline_api",
+        ExecutionMode::NativeLibrary => "native_library",
         ExecutionMode::DeterministicLibrary => "deterministic_library",
     }
 }
@@ -334,7 +335,9 @@ pub(crate) fn markdown_output_ref_for_profile(profile: &AdapterProfile) -> Strin
     match profile.execution_mode {
         ExecutionMode::OfflineApi => offline_output_ref(&profile.adapter_id),
         ExecutionMode::OnlineApi => online_output_ref(&profile.adapter_id),
-        ExecutionMode::DeterministicLibrary => unreachable!("OCR profiles are external adapters"),
+        ExecutionMode::DeterministicLibrary | ExecutionMode::NativeLibrary => {
+            unreachable!("OCR profiles are external adapters")
+        }
     }
 }
 

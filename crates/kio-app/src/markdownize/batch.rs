@@ -1,6 +1,6 @@
 use crate::batch::command::provider_task_ledger_key;
-use crate::embedding::transport::batch_provider_scope_matches;
-use crate::embedding::transport::lane_adjusted_pricing;
+use crate::embedding::admission::lane_adjusted_pricing;
+use crate::embedding::batch::batch_provider_scope_matches;
 use crate::index::pipeline::online_markdownize_profile_for;
 use crate::index::pipeline::online_output_ref;
 use crate::ledger_access::RETIRED_NON_LIVE;

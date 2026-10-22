@@ -1510,16 +1510,15 @@ fn encode_base64(bytes: &[u8]) -> String {
     out
 }
 
-/// The mock's figure. A PNG signature and nothing after it: `sniff_media_type`
-/// reads the signature, and no consumer of an image object decodes the pixels.
+/// A complete 1×1 RGBA PNG with a red pixel and a Comment text witness.
+/// Image embedding fully decodes retained OCR images before dispatch.
 #[cfg(debug_assertions)]
-const MOCK_FIGURE_PNG: &[u8] = b"\x89PNG\r\n\x1a\nkio local ocr mock figure";
+const MOCK_FIGURE_PNG: &[u8] = b"\x89PNG\x0d\x0a\x1a\x0a\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00!tEXtComment\x00kio local ocr mock figured\xdejc\x00\x00\x00\x0dIDATx\xdac\xf8\xcf\xc0\xf0\x1f\x00\x05\x00\x01\xffV\xc7/\x0d\x00\x00\x00\x00IEND\xaeB`\x82";
 
-/// The mock's decoration, for the `decorated` body below. Distinct bytes from
-/// [`MOCK_FIGURE_PNG`] on purpose: identical bytes are one content-addressed
-/// object, and a test about telling two images apart cannot use one image.
+/// A complete blue-pixel PNG with its own Comment witness. Distinct bytes
+/// preserve the figure/decoration identity test and content-addressed objects.
 #[cfg(debug_assertions)]
-const MOCK_ICON_PNG: &[u8] = b"\x89PNG\r\n\x1a\nkio local ocr mock icon";
+const MOCK_ICON_PNG: &[u8] = b"\x89PNG\x0d\x0a\x1a\x0a\x00\x00\x00\x0dIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\x1ftEXtComment\x00kio local ocr mock icon`\xc7\xf9\xc4\x00\x00\x00\x0dIDATx\xdac``\xf8\xff\x1f\x00\x03\x02\x01\xff9)\x19\xbe\x00\x00\x00\x00IEND\xaeB`\x82";
 
 /// Test-only body selector for [`MockLocalOcrClient`]. `decorated` answers with
 /// a page carrying one real figure and one sticker, so that a consumer which
