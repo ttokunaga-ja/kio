@@ -27,15 +27,16 @@ R23 の同梱 runtime が実行できる online target は `mistral_ocr_markdown
 
 認証情報の保存規約:
 
+private credential file の保護は [14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+利用者が用意した tools.toml に平文 credential を置く場合も file 自体の owner-only 保護を必要とする。
+Kio が作っていない親ディレクトリにはその要件を課さず、権限を変更しない。
+
 ```text
 推奨:
 1. 環境変数参照:       auth = "env:GEMINI_API_KEY"
 
 許容 (非推奨):
 2. tools.toml 直書き:  auth = "plain:<api_key>"
-   - tools.toml と直上のディレクトリは利用者所有・所有者限定とする。
-     他の利用者へ権限を与える macOS ACL / Windows DACL も拒否する。
-     通常の Unix 設定例はファイル 0600、親ディレクトリ 0700。
    - 条件を満たさない平文 credential は KIO-E-ADAPTER-TOOLS-PRIVATE-001
      (exit 2) で拒否する。既存の permission を自動変更しない。
    - 起動時と credential 使用時に、1 MiB 上限の regular・single-link・
@@ -282,6 +283,9 @@ headless backend を含まないため、実変換時に Cocoa の初期化で�
 将来の配布物がすべて動作するという保証ではない。各固定配布物について実際の
 DOCX/PPTX 変換と隔離の受入試験を行う。v1 の 3 OS Actions は公式 26.8.0 を
 配布物ごとの SHA-256 で固定する。bundle 内の変更や隔離の緩和で旧版を動かさない。
+
+外部 renderer の実行コード・読み込み資源の trust 検証は storage の祖先 ACL 判定とは別の実行境界である。
+以下の配布物検証は維持し、renderer scratch は [14 の storage 契約](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
 
 Linux の TDF 公式 DEB では、厳密な `/opt/libreoffice<major>.<minor>/program/soffice`
 配置を認識し、`program`、`share` と初回の専用 profile 作成に必要な `presets` を

@@ -24,6 +24,8 @@ OS のログインユーザー service への登録・起動は実装済みだ�
 
 `service install` は明示初期化済みの root だけを検証して、現在のログインユーザーの native scheduler 登録を device-private manifest とともに作成する。manifest には絶対・UTF-8 の `HOME`、`USERPROFILE`、`XDG_CONFIG_HOME`、`XDG_DATA_HOME`、`XDG_CACHE_HOME` を固定する。macOS と systemd は native definition がその値を child watcher に明示する。Windows Task Scheduler は環境変数を definition の説明欄へ保存せず、絶対 manifest locator だけを hidden runner に渡す。runner は private manifest、現在の executable、managed root/scope、Task Scheduler の定義を照合してから、子 watcher の `Command` にだけこの環境を設定する。Windows の runner は kill-on-close Job Object に子を参加させるため、scheduler が runner を終了しても watcher を孤立させない。登録は login 時に有効だが、この操作自体は実行を開始しない。service ID ごとの private OS lock は install/start/stop/uninstall と manifest 更新を直列化し、install の途中で中断されても保存済みの installing intent を同じ定義だけで回復できる。`installed` 済みの重複 `install` は拒否する。`start` は実際の watcher instance lock が稼働中なら、同じ scheduler 登録の再起動も拒否する。`start` と `stop` は scheduler の登録状態を変更してから開始／停止し、`stop` は再起動を無効化して foreground watcher の通常の停止要求とは別に扱う。`status` は scheduler の登録状態と watcher の OS instance lock による実際の稼働状態を別々に表示する。root が後で削除されても `status` は device-private watcher lock を照合し、`uninstall` は manifest と完全一致する登録だけを削除して queue を残す。native service 名または definition が foreign に変わった場合は lifecycle 操作を拒否する。
 
+scheduler executable と installation path の trust、および service の private storage は
+[14 の watch 契約](14-v1-runtime-contracts.md#watching-defaults) に従う。
 native scheduler の実機 lifecycle acceptance は OS ごとに別途実施する。service は `watch run` と同じ offline local reconciliation を起動し、egress、budget、secret の承認を追加しない。
 
 詳細: [変更検知](12-change-detection.md)、[実装契約](14-v1-runtime-contracts.md)、
@@ -296,14 +298,13 @@ stateを残し、ref不達objectを履歴authorityとして扱わない。
 独立 root への作り直しを拒否する。直近 parent のみを認証して lease を保持し、既に有効な Child は冪等に開く。
 read-only command は初期化残骸を cleanup しない。
 
-### Controlled root
+### Kio-created object protection
 
-管理済み root を受ける全 command（`status`、`search`、`preview` を含む read-only command も含む）は、root と
-ancestor が current user または trusted OS administrator により controlled であることを capture / recheck 時に検証する。
-read sharing だけの `0755` は許容するが、他 OS principal が write、delete、または ACL mutation できる場合は
-`KIO-E-MANAGEMENT-ROOT-UNSAFE-001` / exit 4 で mutation 前に拒否する。Kio は既存 root を chmod、chown、re-owner、
-または ACL repair しない。`.kio` の exact current-owner private 規約はこの共有 read 規約より厳格なまま維持する。
-v1 は multi-user ACL mode を定義しない。この制約は将来の local OS folder model を約束するものではない。
+全 command の storage 保護は [14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+`KIO-E-MANAGEMENT-ROOT-UNSAFE-001` / exit 4 は、管理 store の Kio 作成 object の owner / private protection 不一致、
+期待した object の symlink / reparse point、または root / store の検出済み replacement を mutation 前に拒否するために使う。
+利用者が選んだ scope root や Kio が作っていない ancestor の ACL / mode だけを理由には返さない。
+credential、trust、ledger 等の個別 error 契約は各 command のまま維持する。
 
 ### Root registration
 

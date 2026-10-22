@@ -40,7 +40,8 @@ connection it uses, performs its SQL transaction, and durably publishes the next
 checkpoint before COMMIT. Failure between checkpoint publication and COMMIT
 leaves a mismatch that blocks subsequent paid work. A stale backup therefore
 cannot silently become a new accounting baseline. Retained directory/file
-handles, owner-private storage and no-follow checks reject unsafe substitutions;
+handles, storage protected under [the Kio-created-object contract](#protection-of-kio-created-objects)
+and no-follow checks reject unsafe substitutions;
 this is not protection from an adversary already controlling the same OS account.
 
 Initialization publishes an explicit pending record before the database. An
@@ -158,8 +159,8 @@ intent that binds typed physical owner, target, parent-chain, and source-file
 identities using the lossless hexadecimal string encoding above.
 Recovery acts only when those identities and exact bytes still match; otherwise
 it fails closed. On Windows, foreign-owner working-file removal is refused before
-any ACL or name mutation; a current-owner private DACL is validated through its
-retained handle. A working-tree restore names the `.kio` owner permitted to
+any name mutation; removal must not rewrite the ACL of an existing user file.
+A working-tree restore names the `.kio` owner permitted to
 recover its residue. Read-only inspection never creates, locks, or cleans this
 workspace.
 
@@ -177,24 +178,45 @@ but have no shipped CLI, app, or eval production caller and the core crate is
 not published; this is a low-level storage/testing concern, not an unimplemented
 CLI route.
 
-### Controlled managed roots
+### Protection of Kio-created objects
 
-This current-revision contract remains under validation. Binding, capture, and
-recheck require a managed root and its ancestors to be controlled by the current
-user or a trusted OS administrator under the creation-parent policy. Every
-command, including read-only status, search, and preview, refuses an unsafe
-existing managed root with `KIO-E-MANAGEMENT-ROOT-UNSAFE-001` / exit 4 before
-mutation. Read sharing such as Unix `0755` is permitted; write, delete, or ACL
-mutation by another OS principal is not. Kio never automatically chmods,
-re-owners, or repairs an existing root. `.kio` remains exact current-owner
-private, which is stricter than this shared-read root boundary.
+Kio creates its own storage with owner-only protection and verifies those
+objects whenever it opens them. This contract applies equally on macOS, Linux
+and Windows: scope `.kio` directories and their contents; private credential and
+trust files; device ledger artifacts (including coordination, authority,
+checkpoint, proof and backup artifacts); device data, cache and state roots and
+Kio-created children; and temporary files and directories Kio creates, including
+renderer scratch and query caches. The owner must be the current user. Unix
+modes are owner-only (directories `0700`, private files `0600`); extended ACLs
+must not defeat that protection. Windows objects have a protected owner-only
+DACL. Foreign write, delete or permission-changing access is refused; trusted
+OS administrator authority does not make a foreign-owned Kio object acceptable.
 
-On Windows, `NtCreateFile` creates a new private object with the current owner
-and a protected DACL; existing objects are never adopted. A working-file removal
-keeps its verified handle through move and DACL handling, while read sharing
-blocks a new writer or deleter. Unix does not claim inode-CAS protection against
-a hostile same-account filesystem writer. v1 multi-user ACL mode is outside this
-contract; it does not promise a future local-OS-folder model.
+Kio does not judge the owner, ACL or mode of ancestors it did not create,
+including filesystem/drive roots, profile and AppData directories, `/tmp`, and
+user folders above a scope. A user-selected scope root is the user's folder:
+Kio neither requires nor changes its ACL or mode. Its `.kio` remains private.
+An unrelated tool granting access to an ancestor, or the default permissions of
+a secondary drive, must not by itself prevent Kio from using its own storage.
+Kio never repairs permissions or ownership of objects it did not create, and
+never adopts an unsafe existing object by silently tightening its permissions.
+
+Every command, including read-only status, search and preview, refuses a
+Kio-created object with a foreign owner or unsafe access, a symlink/reparse point
+where its own directory or file is expected, or a detected identity replacement,
+before using it. Scope-root binding, capture and recheck retain the same tree;
+path-swap protection uses retained handles, no-follow opens and identity
+rechecks. A detected replacement stops the operation; Kio never follows the
+replaced path into another tree. Accepting writable ancestors does not promise
+availability against deletion/replacement by someone with access to them, or
+protection against an adversary controlling the same OS account. v1 multi-user
+ACL mode is outside this contract.
+
+The CLI mapping for an unsafe managed store is defined in
+[the CLI specification](06-cli-spec.md#kio-created-object-protection).
+This storage contract does not relax executable trust checks for a scheduled
+service or external renderer; see [watch reconciliation](#watching-defaults)
+and [the Adapter specification](07-adapter-spec.md).
 
 ## Current policy
 
@@ -365,6 +387,15 @@ polling, download, or cleanup, and it does not use an HTTP Adapter. User-service
 registration and lifecycle behavior are implemented as specified there; native
 scheduler lifecycle acceptance remains a separate gate on each OS.
 
+A scheduled service must execute a trusted, non-foreign-writable executable.
+Its installation path must also prevent an untrusted principal from replacing
+that executable through a writable ancestor. Registration and execution refuse
+an unsafe executable or installation path without repairing it. This separate
+persistence/code-execution boundary applies on every OS, even if Kio did not
+create the executable; it imposes no ACL requirement on scope or device-storage
+ancestors. Service manifests, definitions, locks and queue/state files follow
+[the Kio-created-object contract](#protection-of-kio-created-objects).
+
 All generated `.kio` paths, including HEAD, manifest, lock and task files, are
 suppressed as self-events. Management, policy, settings and consent paths still
 trigger full reconciliation. Runtime queue/state files live outside the watched
@@ -406,7 +437,9 @@ certificate bytes. The retired `adapter.policy.offline_api.ca_pem_path` setting
 is rejected. Trust registration, rotation, revocation and status are device-local
 operations that do not read a scope. Registration/resume creates a managed
 snapshot, rotation advances the generation and revocation leaves a durable
-tombstone; registration cannot silently replace an active CA. HTTPS admission
+tombstone; registration cannot silently replace an active CA. Managed trust
+records, snapshots and locks follow [the Kio-created-object contract](#protection-of-kio-created-objects).
+HTTPS admission
 acquires the active managed CA and retains the trust-store lock through dispatch,
 so rotation or revocation cannot race an admitted send. Only the managed active
 root is trusted; proxies and redirects are disabled. Certificate validity and
@@ -419,6 +452,7 @@ non-network execution route. Offline behavior and the command-specific flag
 forms are defined in [the Adapter specification](07-adapter-spec.md) and [the
 CLI specification](06-cli-spec.md).
 
+Renderer scratch follows [the Kio-created-object contract](#protection-of-kio-created-objects).
 Renderer execution uses an explicit environment, private scratch space,
 deadline and process-tree cleanup. OS confinement denies unnecessary network
 access and unrelated private files. Missing confinement is a refusal, not an

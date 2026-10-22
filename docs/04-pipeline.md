@@ -628,6 +628,9 @@ job・credential・入力の binding に基づいて source CAS に保存・課�
 
 `image_vec` の導出は同型だが**結合が要らない**点だけが異なる — 結合対象は **`target_type='image'` の行のみ**で、`embeddings.target_id` がそのまま `image_vec.image_id` (= `objects/image/` の `image_hash`) になる。chunk 側の `chunks.text_hash` 結合は「その本文を今どの chunk 行が担っているか」を再導出するためのものだが、画像は content-addressed object そのものが target であり、担い手を探す必要が無いためである （typed image context と現行入力 identity は [03-data-model.md §8.1](03-data-model.md) に従う）。**現行 tool-lock の embedding profile への限定は chunk 側と同一**に適用し、現行 `(image_hash, profile, input identity)` ごとに候補が 0 件または 1 件であることを検証する (0 件 = 未 enrichment で行を作らない。2 件以上は corruption)。
 
+query-vector cache の storage 保護は [14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+best-effort は cache 保存の可用性を指し、保護検証を省略する意味ではない。
+
 **cursor replay の query-vector cache**: page 1 の query vector は source `embeddings` 表に入れず、`${XDG_CACHE_HOME:-$HOME/.cache}/kio/search-query-cache/<query_vector_digest>` の device-local file に best-effort で保存する ([03-data-model.md §4.1](03-data-model.md)、[05-runtime.md §1.5](05-runtime.md))。`query_vector_digest` は canonical な float32 little-endian bytes（L2 正規化済み）の sha256 であり、query 本文・text_hash は保存しない。replay は file bytes の digest を再検証し、欠落・破損・不一致なら `KIO-E-SEARCH-CURSOR-001` で拒否する。`kio repair rebuild-db` はこの cache を読まず、purge closure にも含めない（文書 lifecycle と無関係）。
 
 text/image は同じ embedding 契約を使う。汎用 local endpoint の text-only capability を含む互換性は [03-data-model.md §7](03-data-model.md) に従う。

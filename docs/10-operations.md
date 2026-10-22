@@ -336,8 +336,8 @@ CREATE TABLE scopes (
   registry は cache なので削除は解決系には安全 (live scope は自分を再登録する)。**ただし live 重複の
   検出 (DUP gate) も registry に依存するため、削除直後は gate が一時的に盲目になる** — 各 clone の
   次回使用で再登録され次第回復する既知の窓 (削除を dedupe の手段にしない)
-- device data dir (`~/.local/share/kio/`) は owner-only (0700) に制限する (best-effort。非 unix は
-  no-op。registry / cost-ledger / logs は利用パターンとスコープ地図を含むため)
+- device data / cache / state の保護は [14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+  registry / cost-ledger / logs は利用パターンとスコープ地図を含む。
 
 
 ### 不変条件 (cache vs truth)
@@ -408,7 +408,7 @@ owner-private `.kio-atomic` は `.kio` または pinned private stage owner の�
 未公開 write の残骸は discard だけを許し、hardlink は受理せず、publish は no-replace rename 規約を守る。removal は
 対象を quarantine する前に、exact bytes、physical owner / target、parent-chain identity を結び付けた durable intent を
 置く。一致しない residue は回復も削除もせず fail-closed とする。Windows の foreign owner working-file removal は
-ACL または name を変更する前に拒否し、current owner の private DACL は retained handle に結び付けて検証する。
+name を変更する前に拒否する。既存 user file の ACL は removal のために書き換えない。
 working-tree restore は明示した `.kio` owner からだけこの回復を行う。
 
 明示 root の bootstrap は `.root-init-journal.json` と permanent `.root-init-gate` により直列化する。新規 retry は
@@ -419,20 +419,11 @@ pre-marker 時の空の `.kio` にだけ許し、record を検証するまで通
 child initialization の cancel は private stage を退役する前に verified exact probe を cleanup する。それ以外の probe
 residue は fail-closed とする。read-only operation は atomic state、bootstrap、probe のいずれも作成・lock・cleanup しない。
 
-### 4.3 Controlled root boundary
+### 4.3 Kio-created object boundary
 
-以下は現行 revision の実装契約であり、候補全体の検証は未完了である。managed root と ancestor は creation-parent
-policy により current user または trusted OS administrator が controlled でなければならない。read-only command を含む
-全 command は capture と recheck で同じ retained root を照合する。read sharing だけの Unix `0755` は許容するが、
-他 OS principal の write / delete / ACL mutation は `KIO-E-MANAGEMENT-ROOT-UNSAFE-001` / exit 4 で mutation 前に拒否する。
-既存 root の chmod、owner 変更、ACL repair を自動実行しない。`.kio` は exact current-owner private のままであり、
-この managed-root 規約はそれを緩めない。
-
-Windows は new private object を current owner + protected DACL で `NtCreateFile` 時に生成し、既存 object を
-adopt しない。working-file removal は verified handle を move と DACL 処理の間も保持し、read share は新しい write / delete
-を拒む。foreign owner は ACL または name mutation より前に拒否する。Unix は hostile な same-account filesystem writer に
-inode CAS を防御境界として主張しない。v1 multi-user ACL mode は out of scope であり、この文書は将来の local OS folder
-model を約束しない。
+storage の owner / permission、検証対象、拒否条件、scope root と外部 ancestor の扱いは
+[14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+利用者向け error は [06 の CLI 契約](06-cli-spec.md#kio-created-object-protection) を参照する。
 
 子 scope 経路を含む v1 実装境界は [09-mvp-scope.md §1.2](09-mvp-scope.md) を正本とする。macOS、Linux、
 Windows のいずれも pathname fallback を使わず、同じ retained-handle 境界で child mutation を行う。native
