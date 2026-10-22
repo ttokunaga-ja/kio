@@ -1656,3 +1656,61 @@ WSL 191、Windows 186件が一致した（Windowsの既存のplatform除外5件�
 - hosted CIとpushは未実施である（リポジトリの公開範囲とActionsの有無を確認していない）。
 - 証跡はrepo外の `~/Documents/Codex/2026-10-14/kio-r4/` にある（`runs/A1` に分割計画と調査、`runs/B1` に指示・
   監督回答・候補・各OSの証跡と最終報告、`wip/` にWIPの指紋）。Macの未追跡WIPはR4開始前の指紋と一致した。
+
+## 31. 埋め込みO段階: 共通の実行経路とオンライン画像
+
+2026-10-22 JST記録。`3d6c9a3c`（R4のmerge）から、branch `emb/unified` の7 commitと`main`の取り込み1件で行った
+（147 file、+22,317 / −4,582行）。契約はdocs変更 `32f3eb4b` を正とする。決定事項（EG2をKio管理のworkerで動かす、
+runtimeの同梱、OS間のvector混在、汎用ローカル窓とHTTP loopback、常駐なし）は2026-10-18〜19に利用者が承認した。
+
+| commit | 内容 |
+|---|---|
+| `32f3eb4b` | 統一embedding契約をdocs/01〜14へ記載 |
+| `5ce2a07e` | O0: embedding runnerをplan・input・admission・executor・batchへ分割（構造のみ） |
+| `a100e773` | O1: 全profileを一つのTask・論理job・device台帳へ。localも0 USDで記帳、精算後に公開、5行の保存形式 |
+| `33427973` | O2: オンライン画像（PNG/JPEG原bytes、GIF/WebPの固定変換、IMAGE usage精算、memberごと8,192 token予約） |
+| `fe959a89` | `main`の取り込み（hosted CI向けのテストfixture修正） |
+| `c5f76df3` | O3: `--mode image`、送信直前の再確認、回復matrix、画像taskのstatus |
+| `6c8020a5` | 評価toolが台帳を初期化してからlocal embeddingを実行し、失敗時に終了コードと出力を示す |
+
+主な挙動の変化:
+
+- local embeddingも台帳に0 USDで記録する。台帳が未初期化なら、実行される埋め込みは有料と同じくPausedになる。
+  送信承認の未成立と秘密holdは従来どおり先に判定する。API keyなしの`init`→offline `index`→`search`は台帳なしで動く。
+- 精算を記録してからCAS/DBへ公開し、公開だけに失敗した既知結果は再送せず再公開する。
+- 文字のqueryとchunkも、memberごとに8,192 token分を予約上限とする（docs/07 §5.3）。旧来の文字数÷4は上限ではなかった。
+- embedding objectは5行の現行形式（producer provenanceと画像入力receipt）とし、旧3行形式は読まない。
+
+終了検証（`c5f76df3`、Rust 1.98.0）。3 OSとも`fmt --all -- --check`、strict Clippy、`test --workspace --all-targets --locked`、
+`build --release --workspace --locked`のcargo実exitが0で、release buildにwarningはなかった。
+
+| OS | test結果 |
+|---|---|
+| macOS | 3,631 pass / 0 fail |
+| Linux (WSL) | 3,646 pass / 0 fail / 1 ignored |
+| Windows 11 (MSVC) | 3,327 pass / 0 fail / 1 ignored |
+
+CLIの出力はR4の基準と比べ、各OSとも11件だけが変わった（docs/04 §5.1のtyped target 3件、§5.2のSkippedと集計8件）。
+GitHub hosted CI（run 39620018009、`6c8020a5`）は全jobが成功した。synthetic-history-evalの結果は`main`の前回
+（run 39153852379）と同じで、crossscopeはRecall@10 0.750→0.875、3シナリオとも閾値を満たした。
+
+`kio-code-limits`: OS共通の製品ロジックは111,757行（上限106,000）で、他の区分は上限内、製品ファイルの最大は2,608行。
+上限は利用者の承認（2026-10-18）により、埋め込み作業全体（EG2まで）の最終実測から一度だけ引き上げる。
+
+進め方と経緯:
+
+- 実装と3 OS検証はCodex CLIに任せ、監督側で各段階の判断（O0は挙動を保存し順序変更はO1、hold優先順位、
+  完了taskのclaimは有料と同じ、文字の予約上限、検索の結果単位は現行の§1.7に揃える等）を出して、候補patchからcommitした。
+- Macのpipe枯渇（ChatGPT appのCodex app-serverが約2,100本を保持）で時間依存の試験が落ちたため、試験中もpipe容量を測る
+  条件を加えた。利用者がappを終了して回復した。
+- 研究室のWindowsで、外部ツール（Codex Windows sandbox）がprofile配下（`AppData`、`.local`）に他SIDへのmodify ACEを
+  追加し、Kioが正しく秘密fileを拒否した。設定は変えず、試験時だけTEMPとXDGを実行用directoryへ向けて検証した。
+
+残る扱い:
+
+- ローカル窓の汎用化とHTTP loopback（L1）、EG2のin-process実装（G0〜G3）、共通上限の引き上げ。
+- Windowsの管理rootの祖先ACL（2026-10-19利用者承認の案B）。あわせて、空contextの`KIO-E-PRIVATE-FILE-UNSAFE-001`、
+  query cacheのOS間の権限差、外部ツールがprofileにACEを足した場合の扱い、評価harnessのTrustedInstaller扱い。
+- docs/05 §1.7（alias行でのpaging）と§1.7.1（文書単位）の矛盾。実装は§1.7に従う。stage Dで解消する。
+- 証跡はrepo外の `~/Documents/Codex/2026-10-18/kio-embed-spec/runs/`（A1の設計、B1の候補・台帳・各OSの証跡）と
+  `~/Documents/Codex/2026-10-19/kio-embed/runs/`（指示と監督回答）にある。
