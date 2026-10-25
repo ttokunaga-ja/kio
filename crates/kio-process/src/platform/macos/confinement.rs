@@ -78,9 +78,11 @@ impl NativeRenderSandbox {
         let profile = self.scratch.join(".kio-render.sb");
         let profile_source = macos_profile(&self.scratch, &self.runtime_roots);
         use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt as _;
         let mut profile_file = fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&profile)
             .map_err(ConfinementError::Profile)?;
         profile_file

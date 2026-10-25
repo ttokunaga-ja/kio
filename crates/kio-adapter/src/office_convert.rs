@@ -31,8 +31,8 @@ use kio_process::{
 use sha2::{Digest, Sha256};
 
 use crate::platform::{
-    OfficeRuntime, canonical_renderer_program, file_url, private_temp_dir,
-    restrict_renderer_state_directory,
+    OfficeRuntime, canonical_renderer_program, file_url, finish_scratch, private_temp_dir,
+    restrict_renderer_state_directory, scratch_recovery_note,
 };
 use crate::{AdapterError, Result};
 
@@ -271,26 +271,28 @@ fn probe_real_converter_diagnostic(
     })?;
     let mut environment = runtime.environment(&program, Some(&profile_dir));
     runtime.configure_services(scratch.path(), &mut environment)?;
-    let output = sandbox
-        .run(
-            [
-                OsString::from("--headless"),
-                OsString::from("--norestore"),
-                OsString::from(format!("-env:UserInstallation={profile_url}")),
-                OsString::from("--version"),
-            ],
-            &environment,
-            BoundedProcessOptions {
-                timeout: OFFICE_PROBE_TIMEOUT,
-                max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
-                max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
-            },
-        )
-        .map_err(|error| {
-            AdapterError::ContractViolation(format!(
-                "office converter bounded probe failed: {error}"
-            ))
-        })?;
+    let output = match sandbox.run(
+        [
+            OsString::from("--headless"),
+            OsString::from("--norestore"),
+            OsString::from(format!("-env:UserInstallation={profile_url}")),
+            OsString::from("--version"),
+        ],
+        &environment,
+        BoundedProcessOptions {
+            timeout: OFFICE_PROBE_TIMEOUT,
+            max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
+            max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
+        },
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            let recovery_note = scratch_recovery_note(scratch);
+            return Err(AdapterError::ContractViolation(format!(
+                "office converter bounded probe failed: {error}{recovery_note}"
+            )));
+        }
+    };
     if !output.status.success() {
         return Err(AdapterError::ContractViolation(format!(
             "office converter probe exited with {}",
@@ -312,6 +314,7 @@ fn probe_real_converter_diagnostic(
                 "office converter probe returned no version line".to_owned(),
             )
         })?;
+    finish_scratch(scratch)?;
     Ok(OfficeConverter {
         control: control.clone(),
         #[cfg(test)]
@@ -356,23 +359,26 @@ fn office_extension(media_type: &str) -> Option<&'static str> {
 
 /// Construct all renderer-owned mutable state before process creation. These
 /// names are derived only from an exclusively-created private scratch parent;
-/// on Windows they inherit its protected owner DACL before AppContainer
-/// access is granted, and on Unix each leaf is explicitly mode 0700.
+/// each child is created with protected owner-only access before any
+/// invocation-specific renderer access is granted.
 fn create_private_renderer_state(scratch: &Path, purpose: &str) -> Result<PathBuf> {
     let profile = scratch.join("lo-profile");
-    let cache = scratch.join("cache");
-    let config = scratch.join("config");
-    for (path, label) in [
-        (&profile, "LibreOffice profile"),
-        (&cache, "renderer cache"),
-        (&config, "renderer configuration"),
+    let directory = kio_core::private_fs::verify_private_directory(scratch).map_err(|error| {
+        AdapterError::ContractViolation(format!("unsafe Office scratch for {purpose}: {error}"))
+    })?;
+    for (name, label) in [
+        ("lo-profile", "LibreOffice profile"),
+        ("cache", "renderer cache"),
+        ("config", "renderer configuration"),
     ] {
-        std::fs::create_dir(path).map_err(|error| {
-            AdapterError::ContractViolation(format!(
-                "failed to create private {purpose} {label}: {error}"
-            ))
-        })?;
-        restrict_renderer_state_directory(path, purpose, label)?;
+        directory
+            .create_directory(Path::new(name))
+            .map_err(|error| {
+                AdapterError::ContractViolation(format!(
+                    "failed to create private {purpose} {label}: {error}"
+                ))
+            })?;
+        restrict_renderer_state_directory(&scratch.join(name), purpose, label)?;
     }
     Ok(profile)
 }
@@ -416,39 +422,49 @@ fn convert_with_real_binary(
     let scratch = private_temp_dir()?;
     let workdir = scratch.path();
 
-    let input_path = workdir.join(format!("input.{extension}"));
-    std::fs::write(&input_path, input).map_err(|err| {
-        AdapterError::ContractViolation(format!(
-            "failed to stage office input at {}: {err}",
-            input_path.display()
-        ))
-    })?;
-
-    let outdir = workdir.join("out");
-    std::fs::create_dir(&outdir).map_err(|err| {
-        AdapterError::ContractViolation(format!(
-            "failed to create office-convert output dir at {}: {err}",
-            outdir.display()
-        ))
-    })?;
-    // Retain this directory before launching the renderer. It is the only
-    // namespace used to recover output: the renderer can replace path names
-    // underneath it, but cannot redirect a descriptor-relative no-follow
-    // read to a file outside this retained directory.
-    let output_directory = kio_core::store_dir::StoreDirectory::from_retained_with_control(
-        std::fs::File::open(&outdir).map_err(|err| {
+    let scratch_directory =
+        kio_core::private_fs::verify_private_directory_with_control(workdir, &converter.control)
+            .map_err(|error| {
+                AdapterError::ContractViolation(format!(
+                    "failed to retain private Office scratch: {error}"
+                ))
+            })?;
+    let input_leaf = format!("input.{extension}");
+    let input_path = workdir.join(&input_leaf);
+    let mut staged_input = scratch_directory
+        .create_private_file(Path::new(&input_leaf))
+        .map_err(|error| {
             AdapterError::ContractViolation(format!(
-                "failed to retain office-convert output dir at {}: {err}",
-                outdir.display()
+                "failed to create private Office input: {error}"
             ))
-        })?,
+        })?;
+    {
+        use std::io::Write as _;
+        staged_input.write_all(input).map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "failed to stage private Office input: {error}"
+            ))
+        })?;
+    }
+    drop(staged_input);
+    let outdir = workdir.join("out");
+    let output_handle = scratch_directory
+        .create_directory(Path::new("out"))
+        .map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "failed to create private Office output directory: {error}"
+            ))
+        })?;
+    // Keep the original output directory capability across renderer execution.
+    // Child path replacements cannot redirect the descriptor-relative PDF read.
+    let output_directory = kio_core::store_dir::StoreDirectory::from_retained_with_control(
+        output_handle,
         outdir.clone(),
         converter.control.clone(),
     )
-    .map_err(|err| {
+    .map_err(|error| {
         AdapterError::ContractViolation(format!(
-            "failed to validate office-convert output dir at {}: {err}",
-            outdir.display()
+            "failed to retain private Office output directory: {error}"
         ))
     })?;
     let profile_dir = create_private_renderer_state(workdir, "conversion")?;
@@ -485,22 +501,25 @@ fn convert_with_real_binary(
         ));
     }
     runtime.configure_services(workdir, &mut environment)?;
-    let output = sandbox
-        .run(
-            arguments,
-            &environment,
-            BoundedProcessOptions {
-                timeout: OFFICE_CONVERT_TIMEOUT,
-                max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
-                max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
-            },
-        )
-        .map_err(|err| {
-            AdapterError::ContractViolation(format!(
-                "office converter {} failed within confinement: {err}",
+    let output = match sandbox.run(
+        arguments,
+        &environment,
+        BoundedProcessOptions {
+            timeout: OFFICE_CONVERT_TIMEOUT,
+            max_stdout_bytes: MAX_OFFICE_LOG_BYTES,
+            max_stderr_bytes: MAX_OFFICE_LOG_BYTES,
+        },
+    ) {
+        Ok(output) => output,
+        Err(err) => {
+            // Platform cleanup retains scratch whenever recovery owns it.
+            let recovery_note = scratch_recovery_note(scratch);
+            return Err(AdapterError::ContractViolation(format!(
+                "office converter {} failed within confinement: {err}{recovery_note}",
                 program.display()
-            ))
-        })?;
+            )));
+        }
+    };
     if !output.status.success() {
         #[cfg(test)]
         if converter.native_acceptance_diagnostics {
@@ -520,22 +539,30 @@ fn convert_with_real_binary(
         )));
     }
 
-    let pdf_bytes = output_directory
-        .read_optional(Path::new("input.pdf"), MAX_OFFICE_PDF_BYTES as u64)
-        .map_err(|err| {
-            AdapterError::ContractViolation(format!(
-                "office converter output is absent, unsafe, or exceeded the {} byte limit: {err}",
-                MAX_OFFICE_PDF_BYTES
-            ))
-        })?
-        .ok_or_else(|| {
-            AdapterError::ContractViolation("office converter did not produce input.pdf".to_owned())
-        })?;
+    kio_core::private_fs::verify_private_directory_handle(&output_directory).map_err(|error| {
+        AdapterError::ContractViolation(format!(
+            "Office output directory lost private protection: {error}"
+        ))
+    })?;
+    let pdf_bytes = kio_core::private_fs::read_private_file_at(
+        &output_directory,
+        "input.pdf",
+        MAX_OFFICE_PDF_BYTES as u64,
+    )
+    .map_err(|error| {
+        AdapterError::ContractViolation(format!(
+            "office converter output is absent, unsafe, or exceeded the {} byte limit: {error}",
+            MAX_OFFICE_PDF_BYTES,
+        ))
+    })?;
     if !pdf_bytes.starts_with(b"%PDF") {
         return Err(AdapterError::ContractViolation(
             "office converter output is not a PDF (missing %PDF magic)".to_owned(),
         ));
     }
+    drop(output_directory);
+    drop(scratch_directory);
+    finish_scratch(scratch)?;
     Ok(pdf_bytes)
 }
 
@@ -1015,6 +1042,50 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn real_renderer_receives_private_staged_input_and_output_directory() {
+        const CHILD: &str = "KIO_OFFICE_PRIVATE_STAGE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new("/bin/sh")
+                .args(["-c", "umask 022; exec \"$@\"", "kio-office-private-stage"])
+                .arg(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "office_convert::tests::real_renderer_receives_private_staged_input_and_output_directory",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success(), "private staging regression child failed");
+            return;
+        }
+        let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
+        let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
+        let directory = tempfile::tempdir().unwrap();
+        let script = directory.path().join("renderer");
+        executable_script(
+            &script,
+            "#!/usr/bin/perl\n\
+             if (grep { $_ eq '--version' } @ARGV) { print qq(fixture renderer 1\\n); exit 0; }\n\
+             my $out; for (my $i=0; $i < @ARGV-1; $i++) { $out=$ARGV[$i+1] if $ARGV[$i] eq '--outdir'; }\n\
+             defined($out) or die 'no output directory';\n\
+             my $input = $ARGV[-1];\n\
+             ((stat($input))[2] & 0777) == 0600 or die 'staged input is not private';\n\
+             ((stat($out))[2] & 0777) == 0700 or die 'staged output directory is not private';\n\
+             open(my $pdf, '>', qq($out/input.pdf)) or die qq(open output: $!);\n\
+             print $pdf qq(%PDF-1.4\\nfixture\\n%%EOF\\n); close($pdf) or die qq(close output: $!);\n",
+        );
+        let mut converter = probe_real_converter_diagnostic(script, &ControlHandle::default())
+            .expect("private staging fixture renderer probes");
+        converter.native_acceptance_diagnostics = true;
+        let pdf = converter
+            .convert_to_pdf(&decode_fixture(DOCX_FIXTURE_B64), DOCX_MEDIA_TYPE)
+            .expect("renderer must receive private input and output directory under umask 022");
+        assert!(pdf.starts_with(b"%PDF"));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn real_renderer_rejects_executable_replacement_after_probe() {
         let _lock = kio_core::test_control::test_env_lock().lock().unwrap();
         let _clear_seam = kio_core::test_control::TestEnvGuard::remove(TEST_OFFICE_CONVERT_ENV);
@@ -1393,7 +1464,7 @@ mod tests {
             source: source.clone(),
             source_digest: hex_digest(&Sha256::digest(&bytes)),
         };
-        let scratch = tempfile::tempdir().unwrap();
+        let scratch = private_temp_dir().unwrap();
         let filtered = write_private_uno_catalog(&catalog, scratch.path()).unwrap();
         assert!(
             !std::fs::read_to_string(filtered)
@@ -1401,7 +1472,7 @@ mod tests {
                 .contains("MacOSXSpellChecker")
         );
         std::fs::write(&source, b"<malformed").unwrap();
-        let next_scratch = tempfile::tempdir().unwrap();
+        let next_scratch = private_temp_dir().unwrap();
         assert!(write_private_uno_catalog(&catalog, next_scratch.path()).is_err());
         let malformed_catalog = PrivateUnoCatalog {
             source_digest: hex_digest(&Sha256::digest(b"<malformed")),
@@ -1428,6 +1499,30 @@ mod tests {
         assert!(!roots.contains(&program.parent().unwrap().to_path_buf()));
         let roots = renderer_runtime_roots(&program, None).unwrap();
         assert!(!roots.contains(&bundle));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn windows_office_scratch_is_current_user_private_at_creation() {
+        let scratch = private_temp_dir().expect(
+            "Office scratch must be created for TokenUser even with elevated default owner",
+        );
+        let path = scratch.path().to_path_buf();
+        let directory = kio_core::private_fs::verify_private_directory(&path)
+            .expect("fresh Office scratch must satisfy the unchanged strict core verifier");
+        drop(
+            directory
+                .create_private_file(Path::new("owned-child"))
+                .expect("create a private child to exercise bound recursive cleanup"),
+        );
+        drop(directory);
+        scratch
+            .close()
+            .expect("explicit Office scratch cleanup must succeed");
+        assert!(
+            !path.exists(),
+            "successful cleanup must retire the original scratch path"
+        );
     }
 
     #[cfg(unix)]

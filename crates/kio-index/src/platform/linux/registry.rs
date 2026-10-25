@@ -133,6 +133,7 @@ pub(crate) fn registry_parent_and_leaf(
             index += 1;
         }
     }
+    crate::registry::verify_private_registry_parent(&handle, parent)?;
     Ok(RegistryParentBinding {
         parent: std::sync::Arc::new(handle),
         leaf: leaf.to_owned(),
@@ -225,6 +226,7 @@ pub(crate) fn inherited_registry_parent_and_leaf(
         }
         parent = std::sync::Arc::new(child);
     }
+    crate::registry::verify_private_registry_parent(parent.as_ref(), parent_path)?;
     Ok(RegistryParentBinding {
         parent,
         leaf: leaf.to_owned(),
@@ -570,21 +572,7 @@ pub(crate) fn prepare_registry_writer(
     let (sqlite_path, inherited_parent) = if let Some((sqlite_path, parent)) = inherited {
         (sqlite_path, Some(parent))
     } else {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)
-                .map_err(|err| crate::IndexError::Schema(err.to_string()))?;
-            // P2: the device data dir (`~/.local/share/kio`) that holds this
-            // registry, the cost ledger, logs and the open-cache carries usage
-            // patterns and the scope map — restrict it to the owner (0700) so a
-            // multi-user host cannot read another user's data. Best-effort (the
-            // registry is a recoverable cache); no-op on non-unix.
-
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-            }
-        }
-        (path.to_path_buf(), None)
+        return crate::registry::prepare_private_registry_writer(path);
     };
 
     Ok((sqlite_path, inherited_parent))

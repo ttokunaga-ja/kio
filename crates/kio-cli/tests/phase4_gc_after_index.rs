@@ -983,13 +983,15 @@ fn after_index_retains_a_tree_still_shared_by_a_protected_ref_tip() {
         )
         .unwrap()
         .0;
-    fs::write(
-        dir.path()
-            .join(".kio/refs/tags-v1")
-            .join(kio_core::portable::portable_tag_leaf("protected-shared")),
-        format!("{protected_hash}\n"),
-    )
-    .unwrap();
+    let tag_parent =
+        kio_core::store_dir::StoreDirectory::open(&dir.path().join(".kio/refs/tags-v1")).unwrap();
+    let mut tag_file = tag_parent
+        .create_private_file(Path::new(&kio_core::portable::portable_tag_leaf(
+            "protected-shared",
+        )))
+        .unwrap();
+    std::io::Write::write_all(&mut tag_file, format!("{protected_hash}\n").as_bytes()).unwrap();
+    drop(tag_file);
     configure(&dir, "after_index");
 
     let result = json_success(

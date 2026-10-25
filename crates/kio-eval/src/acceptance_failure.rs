@@ -949,16 +949,16 @@ mod tests {
 
     #[test]
     fn device_new_restricts_group_writable_scenario_ancestor() {
-        // Keep the fixture under the checkout, matching the private_fs contract
-        // tests, and explicitly seed 0775 instead of racing on process umask.
+        // Explicitly seed 0775 instead of racing on process umask. The
+        // scenario is an eval-created object, not an external ancestor.
         let temporary = tempfile::Builder::new()
             .prefix("kio-a08-private-scenario-")
             .tempdir_in(std::env::current_dir().expect("current directory"))
             .expect("scenario fixture");
         private_dir(temporary.path()).expect("private fixture root");
         let root = temporary.path().canonicalize().expect("canonical root");
-        kio_core::private_fs::verify_private_creation_parent(&root)
-            .expect("fixture ancestry must already satisfy the product policy");
+        kio_core::private_fs::verify_private_directory(&root)
+            .expect("fixture root must satisfy the Kio-created-object policy");
 
         for name in [
             "missing-credential",
@@ -973,7 +973,7 @@ mod tests {
             fs::set_permissions(&scenario, fs::Permissions::from_mode(0o775))
                 .expect("seed group-writable intermediate directory");
             assert!(
-                kio_core::private_fs::verify_private_creation_parent(&scenario).is_err(),
+                kio_core::private_fs::verify_private_directory(&scenario).is_err(),
                 "the product must reject the unsafe scenario fixture"
             );
 
@@ -986,7 +986,7 @@ mod tests {
                 device.private.join("xdg-cache"),
                 device.private.join("tmp"),
             ] {
-                kio_core::private_fs::verify_private_creation_parent(&path)
+                kio_core::private_fs::verify_private_directory(&path)
                     .unwrap_or_else(|error| panic!("unsafe A08 path {}: {error}", path.display()));
                 assert_eq!(
                     fs::metadata(&path)

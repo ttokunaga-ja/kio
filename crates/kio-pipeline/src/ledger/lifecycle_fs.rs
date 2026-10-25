@@ -1660,23 +1660,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unsafe_existing_creation_ancestor_is_rejected_without_mutation() {
+    fn st01_ledger_accepts_external_writable_ancestor_without_repair() {
         let temp = private_tempdir();
-        let unsafe_ancestor = temp.path().join("unsafe");
-        fs::create_dir(&unsafe_ancestor).unwrap();
-        fs::set_permissions(&unsafe_ancestor, fs::Permissions::from_mode(0o777)).unwrap();
-        let missing_parent = unsafe_ancestor.join("new").join("device");
-        let path = missing_parent.join("ledger.db");
-
-        assert!(
-            FsSession::acquire_with_control(
-                &path,
-                true,
-                kio_core::control::ControlHandle::default()
-            )
-            .is_err()
+        let ancestor = temp.path().join("external");
+        fs::create_dir(&ancestor).unwrap();
+        fs::set_permissions(&ancestor, fs::Permissions::from_mode(0o777)).unwrap();
+        let parent = ancestor.join("new/device");
+        let path = parent.join("ledger.db");
+        let control = kio_core::control::ControlHandle::default();
+        let session = FsSession::acquire_with_control(&path, true, control.clone()).unwrap();
+        assert_eq!(
+            fs::metadata(&ancestor).unwrap().permissions().mode() & 0o777,
+            0o777
         );
-        assert!(!unsafe_ancestor.join("new").exists());
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(session);
+        let reopened = FsSession::acquire_with_control(&path, false, control).unwrap();
+        drop(reopened);
+        assert_eq!(
+            fs::metadata(&ancestor).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
     }
 
     #[cfg(unix)]

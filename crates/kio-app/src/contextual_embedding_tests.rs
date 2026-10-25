@@ -362,7 +362,15 @@ fn rename_retains_contexts_and_rebuild_selects_allowed_head_then_history() {
         "# Knowledge\n\nThe retained document explains orbital telescope calibration.\n",
     )
     .unwrap();
-    execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+    execute(
+        &context,
+        CommandRequest::Init(InitArgs {
+            path: None,
+            independent: false,
+            yes: false,
+        }),
+    )
+    .unwrap();
     index(&context);
     let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let before = projection(&repo);
@@ -472,7 +480,15 @@ fn batch_resume_repairs_interrupted_replica_publication_without_embedding_work()
         "# Knowledge\n\nOrbital telescope calibration uses a stable reference star.\n",
     )
     .unwrap();
-    execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+    execute(
+        &context,
+        CommandRequest::Init(InitArgs {
+            path: None,
+            independent: false,
+            yes: false,
+        }),
+    )
+    .unwrap();
     index(&context);
     let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let scope = repo.scope_identity().unwrap().scope_id;
@@ -626,7 +642,15 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
     fs::write(root.path().join(OLD_PATH),
         "# Orchard\n\nThe orchard grows apples.\n\n# Soil\n\nThe soil contains clay.\n\n# Harvest\n\nThe harvest starts in autumn.\n",
     ).unwrap();
-    execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+    execute(
+        &context,
+        CommandRequest::Init(InitArgs {
+            path: None,
+            independent: false,
+            yes: false,
+        }),
+    )
+    .unwrap();
     let index_result = || {
         execute(
             &context,
@@ -744,7 +768,15 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
     };
     let document = "# Retained\n\nA purged document can be explicitly restored.\n";
     fs::write(root.path().join(CURRENT_PATH), document).unwrap();
-    execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+    execute(
+        &context,
+        CommandRequest::Init(InitArgs {
+            path: None,
+            independent: false,
+            yes: false,
+        }),
+    )
+    .unwrap();
     index(&context);
     let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let old_head = repo.head_commit_hash().unwrap().unwrap();
@@ -776,7 +808,12 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
         "KIO-E-STORE-NOT-FOUND-001",
         "an unexplained missing manifest must not be skipped"
     );
-    fs::write(&manifest, &manifest_bytes).unwrap();
+    assert_eq!(
+        repo.object_store()
+            .write_content_object(kio_core::cas::ContentObjectKind::Manifest, &manifest_bytes)
+            .unwrap(),
+        instance.normalize.manifest_hash,
+    );
 
     fs::remove_file(root.path().join(CURRENT_PATH)).unwrap();
     execute(
@@ -1559,7 +1596,15 @@ fn o3_fresh_local_image_claim_survives_competing_enrichment() {
     fs::write(root.path().join("claim.png"), png).unwrap();
     {
         let _disabled = TestEnvGuard::set("KIO_EVAL_DETERMINISTIC_EMBED", "fixture-disabled");
-        execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+        execute(
+            &context,
+            CommandRequest::Init(InitArgs {
+                path: None,
+                independent: false,
+                yes: false,
+            }),
+        )
+        .unwrap();
         index(&context);
     }
     let execution = embedding_execution(&settings, &control).unwrap();

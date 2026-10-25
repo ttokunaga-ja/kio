@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
-use kio_core::cas::{ContentObjectKind, ObjectKind, ObjectStore, fanout_path, hash_bytes};
+use kio_core::cas::{ContentObjectKind, ObjectKind, ObjectStore, hash_bytes};
 use kio_core::dag::{CommitObject, CommitStats, CommitType, TreeObject, build_tree};
 use kio_core::purge::{PurgeReason, PurgeState};
 use kio_core::scope::Repository;
@@ -193,9 +193,12 @@ fn add_image_reference(dir: &TempDir, raw_hash: &str, image_bytes: &[u8]) -> Str
     )
     .unwrap();
     let image_hash = hash_bytes(image_bytes);
-    let image_path = fanout_path(repo.kio_dir().join("objects/image"), &image_hash).unwrap();
-    fs::create_dir_all(image_path.parent().unwrap()).unwrap();
-    fs::write(&image_path, image_bytes).unwrap();
+    assert_eq!(
+        repo.object_store()
+            .write_content_object(ContentObjectKind::Image, image_bytes)
+            .unwrap(),
+        image_hash,
+    );
     instance.units[0]
         .metadata
         .insert("images".to_owned(), json!([{ "hash": image_hash }]));
@@ -239,9 +242,12 @@ fn add_image_references(dir: &TempDir, raw_hash: &str, images: &[&[u8]]) -> Vec<
     let mut entries = Vec::with_capacity(images.len());
     for image_bytes in images {
         let image_hash = hash_bytes(image_bytes);
-        let image_path = fanout_path(repo.kio_dir().join("objects/image"), &image_hash).unwrap();
-        fs::create_dir_all(image_path.parent().unwrap()).unwrap();
-        fs::write(&image_path, image_bytes).unwrap();
+        assert_eq!(
+            repo.object_store()
+                .write_content_object(ContentObjectKind::Image, image_bytes)
+                .unwrap(),
+            image_hash,
+        );
         entries.push(json!({ "hash": image_hash }));
         instance.units[0]
             .owned_image_hashes
@@ -1184,11 +1190,14 @@ fn pa36_log_scrub_never_touches_a_different_scopes_row_sharing_the_same_raw_hash
         "raw_hash": fixture.raw_hash,
         "query": "other-scope-must-survive",
     });
-    fs::write(
-        device_logs.join("events.jsonl.1"),
-        format!("{own_row}\n{other_scope_row}\n"),
-    )
-    .unwrap();
+    kio_core::store_dir::StoreDirectory::open(&device_logs)
+        .unwrap()
+        .write_atomic(
+            Path::new("events.jsonl.1"),
+            format!("{own_row}\n{other_scope_row}\n").as_bytes(),
+            kio_core::store_dir::Publication::CreateOnly,
+        )
+        .unwrap();
 
     fs::remove_file(fixture.dir.path().join("doc.md")).unwrap();
     json_success(

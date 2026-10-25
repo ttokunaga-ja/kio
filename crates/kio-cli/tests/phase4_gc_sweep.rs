@@ -1382,6 +1382,15 @@ fn same_generation_index_replacement_blocks_tree_retirement() {
     // inode.  Recovery must reject this before it can retire any tree.
     let sqlite = dir.path().join(".kio/index/sqlite.db");
     let replacement = dir.path().join(".kio/index/sqlite.replacement");
+    #[cfg(windows)]
+    {
+        let parent = kio_core::store_dir::StoreDirectory::open(sqlite.parent().unwrap()).unwrap();
+        let mut file = parent
+            .create_private_file(Path::new("sqlite.replacement"))
+            .unwrap();
+        std::io::Write::write_all(&mut file, &fs::read(&sqlite).unwrap()).unwrap();
+    }
+    #[cfg(not(windows))]
     fs::copy(&sqlite, &replacement).unwrap();
     fs::rename(&replacement, &sqlite).unwrap();
 
@@ -1718,4 +1727,106 @@ fn malformed_marker_or_receipt_is_rejected_without_tree_mutation() {
         .unwrap();
     assert_ne!(receipt.status.code(), Some(0));
     assert_eq!(fs::read(tree_path(&dir, &tree)).unwrap(), before);
+}
+
+#[cfg(unix)]
+fn outside_gc_permissions(path: &Path) -> Vec<u8> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::metadata(path)
+        .unwrap()
+        .permissions()
+        .mode()
+        .to_le_bytes()
+        .to_vec()
+}
+
+#[cfg(windows)]
+fn outside_gc_permissions(path: &Path) -> Vec<u8> {
+    let output = ProcessCommand::new("icacls.exe")
+        .arg(path)
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    output.stdout
+}
+
+fn assert_private_gc_objects(root: &Path) {
+    let mut pending = vec![root.to_path_buf()];
+    let mut files = 0;
+    while let Some(path) = pending.pop() {
+        let directory = kio_core::private_fs::verify_private_directory(&path).unwrap();
+        for entry in directory.entries(Path::new("")).unwrap() {
+            if entry.is_directory {
+                pending.push(path.join(&entry.name));
+            } else {
+                assert!(entry.is_regular_file);
+                directory
+                    .ensure_owner_private(Path::new(&entry.name))
+                    .unwrap();
+                files += 1;
+            }
+        }
+    }
+    assert!(files > 0, "GC must exercise persisted private leaves");
+}
+
+#[test]
+fn real_sweep_marker_receipt_and_scheduler_state_are_private_without_external_acl_changes() {
+    let (dir, commit, tree) = candidate_fixture();
+    let outside = ["", "document.md", "home", "data", "config", "cache"]
+        .into_iter()
+        .map(|name| dir.path().join(name))
+        .filter(|path| path.exists())
+        .map(|path| {
+            let acl = outside_gc_permissions(&path);
+            (path, acl)
+        })
+        .collect::<Vec<_>>();
+    for point in ["after_marker_stage_fsync", "after_receipt_stage_fsync"] {
+        let interrupted = kio(&dir, &["gc", "--yes"])
+            .env("KIO_FIXED_NOW", NOW)
+            .env("KIO_TEST_GC_FAULT", point)
+            .arg("--json")
+            .output()
+            .unwrap();
+        assert_eq!(
+            interrupted.status.code(),
+            Some(7),
+            "{point}: {}",
+            String::from_utf8_lossy(&interrupted.stderr)
+        );
+        assert_private_gc_objects(&dir.path().join(".kio/gc"));
+        assert!(tree_path(&dir, &tree).exists());
+    }
+    let completed = json_success(&dir, &["gc", "--yes"], NOW);
+    assert_eq!(completed["status"], "completed");
+    assert!(receipt_path(&dir, &commit).exists());
+    assert!(!tree_path(&dir, &tree).exists());
+    assert_private_gc_objects(&dir.path().join(".kio/gc"));
+
+    let owned = kio_core::store_dir::StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+    owned
+        .write_atomic(
+            Path::new("config.toml"),
+            b"[snapshot.auto]\nenabled = true\ninterval_seconds = 60\non_change_threshold = 99\n",
+            kio_core::store_dir::Publication::Upsert,
+        )
+        .unwrap();
+    json_success(&dir, &["snapshot", "auto"], NOW);
+    owned
+        .ensure_owner_private(Path::new("snapshot-auto.json"))
+        .unwrap();
+    assert_private_gc_objects(owned.path());
+    for (path, before) in outside {
+        assert_eq!(
+            outside_gc_permissions(&path),
+            before,
+            "outside ACL changed: {}",
+            path.display()
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(dir.path().join("document.md")).unwrap(),
+        "# current\n\ncurrent tip\n"
+    );
 }

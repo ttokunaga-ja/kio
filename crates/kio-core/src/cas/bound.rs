@@ -58,6 +58,7 @@ impl BoundObjectDirs {
         reader: &mut R,
         max_bytes: u64,
     ) -> Result<BoundRawStage> {
+        ensure_bound_directory(&self.kio, Path::new(".kio"))?;
         let max_bytes = max_bytes.min(MAX_RAW_OBJECT_BYTES);
         let (name, mut file) = bound_create_ingest_temp(&self.raw)?;
         let result = (|| {
@@ -109,6 +110,12 @@ impl BoundObjectDirs {
                 "bound raw stage belongs to another ObjectStore",
             ));
         }
+        crate::private_fs::verify_private_regular_file_handle(
+            stage
+                .file
+                .as_ref()
+                .ok_or_else(|| bound_stage_corrupt("bound raw stage handle is unavailable"))?,
+        )?;
         let opened = stage
             .file
             .as_ref()
@@ -175,6 +182,8 @@ impl BoundObjectDirs {
     }
 
     pub(super) fn cleanup_raw_ingest_orphans(&self) -> Result<()> {
+        ensure_bound_directory(&self.kio, Path::new(".kio"))?;
+        ensure_bound_directory(&self.raw, Path::new("raw"))?;
         const MAX_ENTRIES: usize = 100_000;
         let mut total = 0_u64;
         let entries = cap_primitives::fs::read_base_dir(&self.raw)
@@ -267,6 +276,8 @@ impl BoundObjectDirs {
         hash: &str,
         create: bool,
     ) -> Result<(File, String)> {
+        ensure_bound_directory(&self.kio, Path::new(".kio"))?;
+        ensure_bound_directory(&self.objects, Path::new("objects"))?;
         let digest = hash_path_component(hash)?;
         let first = &digest[..2];
         let second = &digest[2..4];
@@ -277,6 +288,8 @@ impl BoundObjectDirs {
     }
 
     pub(super) fn chunk_fanout(&self, hash: &str, create: bool) -> Result<(File, String)> {
+        ensure_bound_directory(&self.kio, Path::new(".kio"))?;
+        ensure_bound_directory(&self.objects, Path::new("objects"))?;
         let digest = hash_path_component(hash)?;
         let mut retained = self
             .chunks
@@ -307,6 +320,8 @@ impl BoundObjectDirs {
         hash: &str,
         create: bool,
     ) -> Result<(File, String)> {
+        ensure_bound_directory(&self.kio, Path::new(".kio"))?;
+        ensure_bound_directory(&self.objects, Path::new("objects"))?;
         let digest = hash_path_component(hash)?;
         let first = &digest[..2];
         let second = &digest[2..4];
@@ -532,6 +547,8 @@ impl BoundObjectDirs {
     }
 
     pub(super) fn embedding_hashes(&self, reads: &CasReadAccess) -> Result<Vec<String>> {
+        ensure_bound_directory(&self.kio, Path::new(".kio"))?;
+        ensure_bound_directory(&self.objects, Path::new("objects"))?;
         let mut retained = self.content_slot(ContentObjectKind::Embedding)?;
         if retained.is_none() {
             match bound_open_dir(&self.objects, ContentObjectKind::Embedding.directory()) {
@@ -605,32 +622,7 @@ impl BoundObjectDirs {
         }
         let hash = hash_bytes(bytes);
         let (parent, leaf) = self.content_fanout(kind, &hash, true)?;
-        match bound_read_regular(&CasReadAccess::Unmetered, &parent, &leaf, kind.max_bytes()) {
-            Ok((_, existing)) => {
-                if hash_bytes(&existing) == hash && existing == bytes {
-                    return Ok(hash);
-                }
-                return Err(corrupt_object_error(
-                    Path::new(&leaf),
-                    "CAS content bytes do not match existing object",
-                    &hash,
-                    Some(&hash_bytes(&existing)),
-                ));
-            }
-            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {}
-            Err(error) => return Err(error),
-        }
-        let (temp_name, mut temp) = bound_create_temp(&parent)?;
-        let result = (|| {
-            temp.write_all(bytes).kio_io(Path::new(&temp_name))?;
-            temp.sync_all().kio_io(Path::new(&temp_name))?;
-            drop(temp);
-            bound_publish_content(&parent, &temp_name, &leaf, kind, &hash, bytes)
-        })();
-        if result.is_err() {
-            let _ = bound_remove(&parent, &temp_name);
-        }
-        result.map(|()| hash)
+        write_bound_content_at(&parent, &leaf, kind, &hash, bytes).map(|()| hash)
     }
 
     pub(super) fn read_content_object_bytes(

@@ -19,6 +19,17 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
+// Synthetic Kio-owned records must meet docs/14's owned-object protection contract.
+fn write_private_fixture(path: &Path, bytes: impl AsRef<[u8]>) -> kio_core::Result<()> {
+    let directory = kio_core::store_dir::StoreDirectory::open(path.parent().unwrap())?;
+    kio_core::private_fs::verify_private_directory_handle(&directory)?;
+    directory.write_atomic(
+        Path::new(path.file_name().unwrap()),
+        bytes.as_ref(),
+        kio_core::store_dir::Publication::Upsert,
+    )
+}
+
 const CHILD_ENV_DENYLIST: &[&str] = &[
     "GEMINI_API_KEY",
     "MISTRAL_API_KEY",
@@ -236,9 +247,12 @@ fn add_image_reference(dir: &TempDir, raw_hash: &str, image_bytes: &[u8]) -> Str
     )
     .unwrap();
     let image_hash = hash_bytes(image_bytes);
-    let image_path = fanout_path(repo.kio_dir().join("objects/image"), &image_hash).unwrap();
-    fs::create_dir_all(image_path.parent().unwrap()).unwrap();
-    fs::write(&image_path, image_bytes).unwrap();
+    assert_eq!(
+        repo.object_store()
+            .write_content_object(ContentObjectKind::Image, image_bytes)
+            .unwrap(),
+        image_hash,
+    );
     instance.units[0]
         .metadata
         .insert("images".to_owned(), json!([{ "hash": image_hash }]));
@@ -448,8 +462,8 @@ fn ct4_purge_default_deletes_all_surfaces_blocks_reads_and_is_idempotent() {
     }
     let image_path = fanout_path(kio_dir.join("objects/image"), &image_hash).unwrap();
 
-    fs::write(
-        kio_dir.join("unsupported-inputs.jsonl"),
+    write_private_fixture(
+        &kio_dir.join("unsupported-inputs.jsonl"),
         format!(
             "{}\n{}\n",
             json!({"path":"doc.md","raw_hash":fixture.raw_hash,"media_type":"x","size_bytes":1,"reason":"test"}),
@@ -457,8 +471,8 @@ fn ct4_purge_default_deletes_all_surfaces_blocks_reads_and_is_idempotent() {
         ),
     )
     .unwrap();
-    fs::write(
-        kio_dir.join("quarantine.jsonl"),
+    write_private_fixture(
+        &kio_dir.join("quarantine.jsonl"),
         format!(
             "{}\n{}\n",
             json!({"path":"doc.md","reason":"secret","recorded_at":"2026-01-01T00:00:00Z","approval_method":"hold"}),
@@ -472,12 +486,12 @@ fn ct4_purge_default_deletes_all_surfaces_blocks_reads_and_is_idempotent() {
     fs::create_dir_all(&scope_logs).unwrap();
     let target_log =
         json!({"raw_hash":fixture.raw_hash,"path":"doc.md","query":"needle-purge-content"});
-    fs::write(
-        device_logs.join("events.jsonl.1"),
+    write_private_fixture(
+        &device_logs.join("events.jsonl.1"),
         format!("{target_log}\n{}\n", json!({"event":"keep"})),
     )
     .unwrap();
-    fs::write(scope_logs.join("access.jsonl"), format!("{target_log}\n")).unwrap();
+    write_private_fixture(&scope_logs.join("access.jsonl"), format!("{target_log}\n")).unwrap();
     let cache = fixture
         .dir
         .path()

@@ -1,6 +1,6 @@
 use crate::purge::store_corrupt;
 use kio_core::{KioError, Result};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::path::Path;
 
 use kio_core::platform::{DirectoryHandleIdentity, RegularFileHandleIdentity};
@@ -15,9 +15,6 @@ pub(crate) struct PurgeRemovalObservation {
 enum RemovalIdentity {
     Directory(DirectoryHandleIdentity),
     Regular(PurgeRegularObservation),
-}
-pub(crate) struct PurgeParentObservation {
-    identity: DirectoryHandleIdentity,
 }
 
 pub(crate) fn validate_purge_directory_native(path: &Path) -> Result<()> {
@@ -101,22 +98,6 @@ pub(crate) fn purge_removal_matches(
     }
 }
 
-pub(crate) fn observe_purge_parent(
-    path: &Path,
-    _listed: &fs::Metadata,
-) -> Result<PurgeParentObservation> {
-    let identity = kio_core::platform::real_directory_identity(path)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-        .ok_or_else(|| store_corrupt(path, "purge state parent is a reparse directory"))?;
-    Ok(PurgeParentObservation { identity })
-}
-
-pub(crate) fn purge_parent_matches(observed: &PurgeParentObservation, path: &Path) -> Result<bool> {
-    Ok(kio_core::platform::real_directory_identity(path)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-        == Some(observed.identity))
-}
-
 pub(crate) fn purge_regular_matches_named(
     observed: &PurgeRegularObservation,
     path: &Path,
@@ -125,5 +106,3 @@ pub(crate) fn purge_regular_matches_named(
     Ok(same_file_identity(&observed.listed, current)
         && windows_regular_file_identity(path)? == observed.identity)
 }
-
-pub(crate) fn configure_purge_private_temp(_options: &mut OpenOptions) {}

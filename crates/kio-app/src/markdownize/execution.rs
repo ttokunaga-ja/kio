@@ -528,7 +528,7 @@ fn execute_offline_markdownize_task(
         adapter_settings,
         execution,
         &scope_id,
-        repo.kio_dir(),
+        &image_store_for_task(repo)?,
         &bytes,
         repo.control(),
     )
@@ -693,7 +693,7 @@ pub(crate) fn execute_online_markdownize_task(
         std::sync::Arc::clone(adapter_settings),
         StandardOnlineMarkdownizeRequest {
             scope_id: &scope_id,
-            kio_dir: repo.kio_dir(),
+            image_store: image_store_for_task(repo)?,
             raw_hash: &task.input_hash,
             path: &path,
             media_type: &media_type,
@@ -770,11 +770,16 @@ pub(crate) fn materialize_online_markdownize_response(
         // No page artifact exists before OCR for a scanned PDF. The already-verified
         // immutable raw object is the bounded prepared source shared by each discovered
         // unit; publish it under the same content hash before the manifest can refer to it.
-        write_canonical_cas_object_or_reuse(repo.kio_dir(), "prepared", &task.input_hash, bytes)
-            .map_err(|_| TaskExecutionFailure {
-                retry_kind: persist_failure_retry_kind(),
-                retry_after_ms: None,
-            })?;
+        write_canonical_cas_object_or_reuse(
+            repo.kio_dir(),
+            kio_core::cas::ContentObjectKind::Prepared,
+            &task.input_hash,
+            bytes,
+        )
+        .map_err(|_| TaskExecutionFailure {
+            retry_kind: persist_failure_retry_kind(),
+            retry_after_ms: None,
+        })?;
     }
     // QA17 (step4b-contract-tests-p3a.md §F): carry the adapter's
     // self-reported billing usage (Mistral OCR's real processed-page count)
@@ -1024,7 +1029,7 @@ fn try_online_incremental_markdownize(
             std::sync::Arc::clone(adapter_settings),
             StandardOnlineMarkdownizeRequest {
                 scope_id,
-                kio_dir: repo.kio_dir(),
+                image_store: image_store_for_task(repo)?,
                 raw_hash: &task.input_hash,
                 path,
                 media_type,
@@ -1210,6 +1215,17 @@ fn consecutive_online_incremental_count(task_store: &TaskStore, input_path: &str
 /// strands the billed, normalized output forever (retry & re-index both refuse it).
 pub(crate) fn persist_failure_retry_kind() -> RetryErrorKind {
     RetryErrorKind::NetworkError
+}
+
+fn image_store_for_task(
+    repo: &Repository,
+) -> std::result::Result<kio_core::cas::ImageStore, TaskExecutionFailure> {
+    repo.object_store()
+        .image_store()
+        .map_err(|_| TaskExecutionFailure {
+            retry_kind: RetryErrorKind::ContractViolation,
+            retry_after_ms: None,
+        })
 }
 
 pub(crate) fn task_failure_from_adapter(error: kio_adapter::AdapterError) -> TaskExecutionFailure {

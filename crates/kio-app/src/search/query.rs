@@ -7,8 +7,7 @@ use crate::invocation::Invocation;
 use crate::object_persistence::diagnostic_safe_text;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::search_to_kio;
-use crate::open_view::harden_open_cache_subtree;
-use crate::open_view::write_open_cache_atomic;
+use crate::open_view::{cache_directory, read_private_cache};
 use crate::response::search::DiversifySummary;
 use crate::response::search::ExcludedScopeResponse;
 use crate::response::search::SearchResponse;
@@ -1395,25 +1394,32 @@ fn query_vector_cache_path(digest: &str, control: &ControlHandle) -> PathBuf {
 /// fresh search), never silently re-sending the query.
 pub(crate) fn persist_query_vector_cache(digest: &str, vector: &[f32], control: &ControlHandle) {
     let path = query_vector_cache_path(digest, control);
-    let Some(parent) = path.parent() else {
+    let Ok(Some(directory)) = cache_directory(&path, control, true) else {
         return;
     };
-    if fs::create_dir_all(parent).is_err() {
+    let Some(leaf) = path.file_name() else {
+        return;
+    };
+    // Best effort concerns availability only. Never overwrite or repair an
+    // existing unsafe cache object to make a future cursor usable.
+    if !matches!(
+        read_private_cache(&directory, Path::new(leaf), 64 * 1024 * 1024),
+        Ok(None)
+    ) {
         return;
     }
-    // R9-3-style hardening (mirrors `open_cache_path`'s tree): this cache
-    // holds derived query-vector bytes, not secrets, but the containing
-    // `$XDG_CACHE_HOME/kio` subtree convention is owner-only throughout.
-    harden_open_cache_subtree(parent, control);
-    let _ = write_open_cache_atomic(&path, &f32_to_le_bytes(vector));
+    let _ = directory.write_atomic(
+        Path::new(leaf),
+        &f32_to_le_bytes(vector),
+        kio_core::store_dir::Publication::CreateOnly,
+    );
 }
 
 /// R23-01: cursor replay's ONLY path to a query vector — reads page 1's
 /// vector back from its device-local cache file, re-verifying the digest on
 /// every read (an externally-modified or torn cache leaf must never be
-/// trusted, mirroring the CAS open-cache's own M5 reuse posture — this
-/// cache has no CAS backing to fsck, so a mismatch is handled by deleting
-/// the untrustworthy leaf here instead). Missing or mismatched is
+/// trusted, mirroring the CAS open-cache's own M5 reuse posture). A corrupt
+/// or unsafe leaf is refused without modifying it. Missing or mismatched is
 /// `KIO-E-SEARCH-CURSOR-001`, matching every other cursor-invalidity cause
 /// in this module (05 §1.5's own text: "欠落・不一致は... 同じく
 /// KIO-E-SEARCH-CURSOR-001"). Deliberately has **no** fallback to
@@ -1424,10 +1430,15 @@ pub(crate) fn persist_query_vector_cache(digest: &str, vector: &[f32], control: 
 /// contract this cache exists to protect.
 pub(crate) fn replay_query_vector(digest: &str, control: &ControlHandle) -> Result<Vec<f32>> {
     let path = query_vector_cache_path(digest, control);
-    let bytes = fs::read(&path).map_err(|_| cursor_query_vector_error())?;
+    let directory = cache_directory(&path, control, false)
+        .map_err(|_| cursor_query_vector_error())?
+        .ok_or_else(cursor_query_vector_error)?;
+    let leaf = path.file_name().ok_or_else(cursor_query_vector_error)?;
+    let bytes = read_private_cache(&directory, Path::new(leaf), 64 * 1024 * 1024)
+        .map_err(|_| cursor_query_vector_error())?
+        .ok_or_else(cursor_query_vector_error)?;
     let vector = f32_from_le_bytes(&bytes);
     if query_vector_digest_hex(&vector) != digest {
-        let _ = fs::remove_file(&path);
         return Err(cursor_query_vector_error());
     }
     Ok(vector)

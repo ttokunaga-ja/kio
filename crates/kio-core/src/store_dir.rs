@@ -56,6 +56,60 @@ impl StoreDirectory {
         Self::open_with_control(path, crate::control::ControlHandle::default())
     }
 
+    /// Retain existing ordinary directories and create only absent components
+    /// privately. Existing external ancestors are never adopted or restricted;
+    /// callers must separately admit their final Kio-owned directory.
+    pub fn open_or_create_directories(path: &Path) -> Result<Self> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map_err(|error| ioerr(path, error))?
+                .join(path)
+        };
+        let absolute = platform::normalize_store_path(&absolute);
+        let mut root = std::path::PathBuf::new();
+        let mut names = Vec::new();
+        for component in absolute.components() {
+            match component {
+                Component::Prefix(prefix) => root.push(prefix.as_os_str()),
+                Component::RootDir => root.push(component.as_os_str()),
+                Component::CurDir => {}
+                Component::Normal(name) => names.push(name.to_os_string()),
+                Component::ParentDir => {
+                    return Err(err(path, "directory path contains parent traversal"));
+                }
+            }
+        }
+        let root_handle =
+            cap_primitives::fs::open_ambient_dir(&root, cap_primitives::ambient_authority())
+                .map_err(|error| ioerr(path, error))?;
+        let mut directory = Self::from_retained(root_handle, root)?;
+        for name in names {
+            let leaf = Path::new(&name);
+            let handle = if directory.contains_entry(leaf)? {
+                directory.open_directory(leaf)?
+            } else {
+                match directory.create_directory(leaf) {
+                    Ok(handle) => handle,
+                    Err(error)
+                        if error.error_code() == "KIO-E-STORE-IO-001"
+                            && error
+                                .context()
+                                .get("io_error_kind")
+                                .and_then(serde_json::Value::as_str)
+                                == Some("already_exists") =>
+                    {
+                        directory.open_directory(leaf)?
+                    }
+                    Err(error) => return Err(error),
+                }
+            };
+            directory = Self::from_retained(handle, directory.path().join(&name))?;
+        }
+        Ok(directory)
+    }
+
     pub fn open_with_control(path: &Path, control: crate::control::ControlHandle) -> Result<Self> {
         let handle = platform::open(path)?;
         let handle = platform::normalize_directory_handle(handle, path)?;
@@ -185,6 +239,26 @@ impl StoreDirectory {
         atomic::write(self, self, relative, bytes, publication)
     }
 
+    /// Publish private bytes only after a caller's final target check succeeds.
+    /// The check runs after staging and syncing, immediately before publication,
+    /// with the actual retained destination parent and direct leaf name.
+    /// A rejected check leaves private staging residue for normal recovery.
+    pub fn write_atomic_checked(
+        &self,
+        relative: &Path,
+        bytes: &[u8],
+        publication: Publication,
+        before_publish: impl FnOnce(&StoreDirectory, &Path) -> Result<()>,
+    ) -> Result<()> {
+        atomic::write_checked(self, relative, bytes, publication, before_publish)
+    }
+
+    /// Atomically publish a private read-only file, refusing an existing name.
+    /// Read-only protection is applied through the staging handle before publication.
+    pub fn write_atomic_readonly(&self, relative: &Path, bytes: &[u8]) -> Result<()> {
+        atomic::write_readonly(self, relative, bytes)
+    }
+
     /// Publish into this retained target while keeping transient metadata in
     /// an explicitly supplied private owner. Working-tree restore uses its
     /// repository's `.kio` owner rather than creating metadata among user files.
@@ -231,6 +305,13 @@ impl StoreDirectory {
     /// serialization lock; this primitive only provides namespace safety.
     pub fn append(&self, relative: &Path, bytes: &[u8]) -> Result<()> {
         platform::append(&self.handle, relative, bytes, &self.logical)
+    }
+
+    /// Create an absent private log leaf, or append to an existing private
+    /// regular leaf after checking that exact append handle. No permissions
+    /// are repaired, and the caller retains its existing serialization lock.
+    pub fn append_private(&self, relative: &Path, bytes: &[u8]) -> Result<()> {
+        platform::append_private(&self.handle, relative, bytes, &self.logical)
     }
 
     pub fn remove_file(&self, relative: &Path) -> Result<()> {
@@ -345,8 +426,9 @@ impl StoreDirectory {
         ))
     }
 
-    /// Create one direct private regular-file child without publishing it.
-    pub(super) fn create_private_file_raw(&self, leaf: &Path) -> Result<File> {
+    /// Create one new owner-private regular child through the retained parent.
+    /// Existing names are refused; callers own byte writing and durability.
+    pub fn create_private_file(&self, leaf: &Path) -> Result<File> {
         platform::create_private_file_raw(&self.handle, leaf, &self.logical)
     }
 

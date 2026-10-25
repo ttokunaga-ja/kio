@@ -28,6 +28,8 @@ pub(crate) fn apply_unix_limits(
     })?;
     unsafe {
         command.pre_exec(move || {
+            // Change only the forked renderer child, never the multithreaded host.
+            libc::umask(0o077);
             for (resource, value, optional) in [
                 (libc::RLIMIT_CPU, cpu, false),
                 // Darwin exposes RLIMIT_AS but does not consistently support

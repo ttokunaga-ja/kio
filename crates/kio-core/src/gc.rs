@@ -27,6 +27,7 @@ pub use control::{
 };
 pub mod exchange;
 mod observed_read;
+use observed_read::read_user_regular_observed;
 use observed_read::{
     read_accounted_observed, read_cas_accounted_observed, read_required_accounted_observed,
 };
@@ -689,7 +690,7 @@ impl SnapshotAutoBinding {
     pub(crate) fn recheck(&self, scope: &std::fs::File, kio: &std::fs::File) -> Result<()> {
         if id_file(scope)? != self.scope_identity
             || id_file(kio)? != self.kio_identity
-            || id_child(scope, ".kio")? != self.kio_identity
+            || id_child(scope, ".kio", &self.kio_identity)? != self.kio_identity
         {
             return Err(snapshot_auto_authority_changed());
         }
@@ -703,12 +704,12 @@ impl SnapshotAutoBinding {
         {
             return Err(snapshot_auto_authority_changed());
         }
-        let root_ignore_observation = match read_regular_observed(scope, ".kioignore", MAX_METADATA)
-        {
-            Ok((_, observation)) => Some(observation),
-            Err(error) if is_io_not_found(&error) => None,
-            Err(error) => return Err(error),
-        };
+        let root_ignore_observation =
+            match read_user_regular_observed(scope, ".kioignore", MAX_METADATA) {
+                Ok((_, observation)) => Some(observation),
+                Err(error) if is_io_not_found(&error) => None,
+                Err(error) => return Err(error),
+            };
         if root_ignore_observation != self.root_ignore_observation {
             return Err(snapshot_auto_authority_changed());
         }
@@ -874,16 +875,25 @@ fn wait_at_gc_test_barrier(ready_path: Option<&Path>) {
 }
 
 pub(crate) fn ensure_child_dir(parent: &std::fs::File, name: &str) -> Result<std::fs::File> {
-    match open_optional_dir(parent, name)? {
-        Some(dir) => Ok(dir),
+    let retained = crate::store_dir::StoreDirectory::from_retained(
+        parent.try_clone().map_err(|error| ioerr(error, name))?,
+        PathBuf::from(name),
+    )?;
+    crate::private_fs::verify_private_directory_handle(&retained)?;
+    let dir = match open_optional_dir(parent, name)? {
+        Some(dir) => dir,
         None => {
-            let options = cap_fs::DirOptions::new();
-            cap_fs::create_dir(parent, Path::new(name), &options).map_err(|e| ioerr(e, name))?;
-            let dir = open_dir(parent, name)?;
+            let dir = retained.create_directory(Path::new(name))?;
             sync_bound_directory(parent, name)?;
-            Ok(dir)
+            dir
         }
-    }
+    };
+    let child = crate::store_dir::StoreDirectory::from_retained(
+        dir.try_clone().map_err(|error| ioerr(error, name))?,
+        PathBuf::from(name),
+    )?;
+    crate::private_fs::verify_private_directory_handle(&child)?;
+    Ok(dir)
 }
 pub(crate) fn create_new_bound(
     dir: &std::fs::File,
@@ -891,10 +901,12 @@ pub(crate) fn create_new_bound(
     bytes: &[u8],
     max: u64,
 ) -> Result<()> {
-    let mut options = cap_fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut file = cap_fs::open(dir, Path::new(leaf), &options).map_err(|e| ioerr(e, leaf))?;
+    let retained = crate::store_dir::StoreDirectory::from_retained(
+        dir.try_clone().map_err(|error| ioerr(error, leaf))?,
+        PathBuf::from(leaf),
+    )?;
+    crate::private_fs::verify_private_directory_handle(&retained)?;
+    let mut file = retained.create_private_file(Path::new(leaf))?;
     file.write_all(bytes).map_err(|e| ioerr(e, leaf))?;
     file.sync_all().map_err(|e| ioerr(e, leaf))?;
     drop(file);
@@ -1653,12 +1665,23 @@ fn open_path(base: &std::fs::File, path: &str) -> Result<std::fs::File> {
         let Component::Normal(x) = c else {
             return Err(corrupt("invalid store layout path"));
         };
-        d = open_dir_os(&d, x)?
+        d = open_dir_os(&d, x)?;
+        let retained = crate::store_dir::StoreDirectory::from_retained(
+            d.try_clone().map_err(|error| ioerr(error, path))?,
+            PathBuf::from(path),
+        )?;
+        crate::private_fs::verify_private_directory_handle(&retained)?;
     }
     Ok(d)
 }
 fn open_dir(base: &std::fs::File, n: &str) -> Result<std::fs::File> {
-    open_dir_os(base, std::ffi::OsStr::new(n))
+    let directory = open_dir_os(base, std::ffi::OsStr::new(n))?;
+    let retained = crate::store_dir::StoreDirectory::from_retained(
+        directory.try_clone().map_err(|error| ioerr(error, n))?,
+        PathBuf::from(n),
+    )?;
+    crate::private_fs::verify_private_directory_handle(&retained)?;
+    Ok(directory)
 }
 
 /// Open one optional direct-child directory without following its final
@@ -1672,6 +1695,11 @@ pub(crate) fn open_optional_dir(base: &std::fs::File, n: &str) -> Result<Option<
         Err(error) => return Err(ioerr(error, n)),
     };
     validate_directory_handle(&directory, n)?;
+    let retained = crate::store_dir::StoreDirectory::from_retained(
+        directory.try_clone().map_err(|error| ioerr(error, n))?,
+        PathBuf::from(n),
+    )?;
+    crate::private_fs::verify_private_directory_handle(&retained)?;
     Ok(Some(directory))
 }
 
@@ -1799,9 +1827,16 @@ fn id_path(p: &Path) -> Result<Identity> {
     let f = open_bound_absolute(p)?;
     id_file(&f)
 }
-fn id_child(d: &std::fs::File, n: &str) -> Result<Identity> {
-    let x = open_dir(d, n)?;
-    id_file(&x)
+fn id_child(d: &std::fs::File, n: &str, expected: &Identity) -> Result<Identity> {
+    let child = open_dir_os(d, std::ffi::OsStr::new(n))?;
+    let observed = id_file(&child)?;
+    // A replacement reaches the caller's identity mismatch guard. The same
+    // admitted object must still pass privacy checks before any owned read.
+    if &observed == expected {
+        let directory = crate::store_dir::StoreDirectory::from_retained(child, PathBuf::from(n))?;
+        crate::private_fs::verify_private_directory_handle(&directory)?;
+    }
+    Ok(observed)
 }
 pub(crate) fn is_io_not_found(error: &KioError) -> bool {
     error.error_code() == "KIO-E-STORE-IO-001"
@@ -2204,6 +2239,18 @@ pub(crate) fn ioerr(e: std::io::Error, p: impl AsRef<Path>) -> KioError {
 
 #[cfg(test)]
 mod tests {
+    fn private_fixture_directory(
+        root: &std::path::Path,
+        relative: &std::path::Path,
+    ) -> crate::store_dir::StoreDirectory {
+        let root = root.canonicalize().unwrap();
+        let external = crate::store_dir::StoreDirectory::open(&root).unwrap();
+        let handle = external.create_directory_all(relative).unwrap();
+        let directory =
+            crate::store_dir::StoreDirectory::from_retained(handle, root.join(relative)).unwrap();
+        crate::private_fs::verify_private_directory_handle(&directory).unwrap();
+        directory
+    }
     use super::*;
     use crate::dag::CommitStats;
     use crate::platform::gc_snapshot_logic::validate_snapshot_state_transition;
@@ -2246,8 +2293,11 @@ mod tests {
     fn pending_marker_exchange_blocks_readers_when_public_marker_is_missing() {
         let temp = tempfile::tempdir().unwrap();
         let owner = temp.path().join("gc/internal/marker-exchange");
-        std::fs::create_dir_all(&owner).unwrap();
-        std::fs::write(owner.join("intent.json"), b"incomplete intent").unwrap();
+        let owned =
+            private_fixture_directory(temp.path(), Path::new("gc/internal/marker-exchange"));
+        owned
+            .append_private(Path::new("intent.json"), b"incomplete intent")
+            .unwrap();
         let bound = open_bound_absolute(&std::fs::canonicalize(temp.path()).unwrap()).unwrap();
         assert!(
             has_pending_marker_exchange(&bound, &crate::control::ControlHandle::default()).unwrap()
@@ -2267,7 +2317,8 @@ mod tests {
     fn unexpected_marker_exchange_residue_fails_closed_without_cleanup() {
         let temp = tempfile::tempdir().unwrap();
         let owner = temp.path().join("gc/internal/marker-exchange");
-        std::fs::create_dir_all(&owner).unwrap();
+        let _owned =
+            private_fixture_directory(temp.path(), Path::new("gc/internal/marker-exchange"));
         std::fs::write(owner.join("foreign"), b"preserve").unwrap();
         let bound = open_bound_absolute(&std::fs::canonicalize(temp.path()).unwrap()).unwrap();
         assert!(
@@ -2283,7 +2334,8 @@ mod tests {
     fn empty_marker_exchange_owner_is_read_only_and_inactive() {
         let temp = tempfile::tempdir().unwrap();
         let owner = temp.path().join("gc/internal/marker-exchange");
-        std::fs::create_dir_all(&owner).unwrap();
+        let _owned =
+            private_fixture_directory(temp.path(), Path::new("gc/internal/marker-exchange"));
         let bound = open_bound_absolute(&std::fs::canonicalize(temp.path()).unwrap()).unwrap();
         assert!(
             !has_pending_marker_exchange(&bound, &crate::control::ControlHandle::default())
@@ -2452,12 +2504,16 @@ mod tests {
         let owner = repo
             .canonical_root()
             .join(".kio/gc/internal/snapshot-state-exchange");
-        std::fs::create_dir_all(&owner).unwrap();
-        std::fs::write(
-            owner.join("intent.json"),
-            b"foreign pending Windows snapshot state",
-        )
-        .unwrap();
+        let owned = private_fixture_directory(
+            repo.kio_dir(),
+            Path::new("gc/internal/snapshot-state-exchange"),
+        );
+        owned
+            .append_private(
+                Path::new("intent.json"),
+                b"foreign pending Windows snapshot state",
+            )
+            .unwrap();
         assert!(session.has_pending_snapshot_auto_state_exchange().unwrap());
         assert!(session.snapshot_auto_state().is_err());
         assert!(ensure_no_active_sweep_bound(&session.kio, &session.control).is_err());
@@ -2601,8 +2657,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let repo = Repository::init(root.path()).unwrap();
         let temporary = repo.kio_dir().join(".snapshot-auto-state-123-456");
-        std::fs::write(
-            &temporary,
+        crate::store_dir::StoreDirectory::open(repo.kio_dir()).unwrap().append_private(
+            Path::new(".snapshot-auto-state-123-456"),
             b"{\"idle_observed_since\":\"2026-08-14T00:00:00Z\",\"last_successful_eligible_attempt_at\":\"2026-08-14T00:00:00Z\",\"version\":2,\"working_set_digest\":\"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}\n",
         )
         .unwrap();
@@ -2776,9 +2832,92 @@ mod tests {
         assert!(bytes.len() as u64 > MAX_METADATA);
         assert!(bytes.len() as u64 <= MAX_MARKER_BYTES);
         let temp = tempfile::tempdir().unwrap();
-        let directory = cap_fs::open_ambient_dir(temp.path(), ambient_authority()).unwrap();
-        create_new_bound(&directory, "marker", &bytes, MAX_MARKER_BYTES).unwrap();
-        assert_eq!(std::fs::read(temp.path().join("marker")).unwrap(), bytes);
+        let owned = private_fixture_directory(temp.path(), Path::new("owned"));
+        create_new_bound(&owned.root_handle(), "marker", &bytes, MAX_MARKER_BYTES).unwrap();
+        assert_eq!(std::fs::read(owned.path().join("marker")).unwrap(), bytes);
+    }
+
+    #[test]
+    fn owned_gc_reads_reject_nonprivate_marker_receipt_and_state_without_mutation() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let external = crate::store_dir::StoreDirectory::open(&root).unwrap();
+        let owned = crate::store_dir::StoreDirectory::from_retained(
+            external.create_directory(Path::new("owned")).unwrap(),
+            root.join("owned"),
+        )
+        .unwrap();
+        let bytes = b"unchanged private GC record";
+        for leaf in ["in_progress", "receipt", "snapshot-auto.json"] {
+            owned.append_private(Path::new(leaf), bytes).unwrap();
+            let path = owned.path().join(leaf);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            }
+            #[cfg(windows)]
+            {
+                let status = std::process::Command::new("icacls.exe")
+                    .arg(&path)
+                    .args(["/grant", "*S-1-1-0:R"])
+                    .status()
+                    .unwrap();
+                assert!(status.success());
+            }
+            let before = owned.entries(Path::new("")).unwrap();
+            let error = read_regular_observed(&owned.root_handle(), leaf, MAX_METADATA)
+                .expect_err("GC must reject unsafe owned bytes before hashing or trusting them");
+            assert_eq!(error.error_code(), "KIO-E-PRIVATE-FILE-UNSAFE-001");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(owned.entries(Path::new("")).unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn snapshot_authority_accepts_user_ignore_permissions_without_repair() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let repo = Repository::init(&root).unwrap();
+        let ignore = root.join(".kioignore");
+        std::fs::write(&ignore, b"ignored.md\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&ignore, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        fn permissions(path: &Path) -> Vec<u8> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::metadata(path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    .to_le_bytes()
+                    .to_vec()
+            }
+            #[cfg(windows)]
+            {
+                let output = std::process::Command::new("icacls.exe")
+                    .arg(path)
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                output.stdout
+            }
+        }
+        let before = permissions(&ignore);
+        let session = GcSweepSession::bind_repository(&repo).unwrap();
+        let authority = session.snapshot_auto_binding().unwrap();
+        authority.recheck(&session.scope, &session.kio).unwrap();
+        assert_eq!(permissions(&ignore), before);
+        assert_eq!(std::fs::read(&ignore).unwrap(), b"ignored.md\n");
+        // User-file permission admission must not relax its exact authority
+        // observation: a content change still invalidates the capture.
+        std::fs::write(&ignore, b"other.md\n").unwrap();
+        assert!(authority.recheck(&session.scope, &session.kio).is_err());
+        assert_eq!(permissions(&ignore), before);
     }
 
     #[test]
@@ -2841,6 +2980,47 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn same_identity_kio_permission_drift_is_refused_without_repair() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let repo = Repository::init(fixture.path()).unwrap();
+        let planner = GcPlanner::bind(repo.canonical_root().to_path_buf()).unwrap();
+        let session = GcSweepSession::bind_repository(&repo).unwrap();
+        let authority = session.snapshot_auto_binding().unwrap();
+        let inventory =
+            UnreachableObjectInventory::bind(repo.canonical_root().to_path_buf()).unwrap();
+        let original_identity = id_file(&session.kio).unwrap();
+        let head_before = std::fs::read(repo.kio_dir().join("HEAD")).unwrap();
+        std::fs::set_permissions(repo.kio_dir(), std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(id_file(&session.kio).unwrap(), original_identity);
+        for result in [
+            planner.plan_at(0).map(|_| ()),
+            session.snapshot_auto_binding().map(|_| ()),
+            authority.recheck(&session.scope, &session.kio),
+            inventory.inventory().map(|_| ()),
+        ] {
+            assert_eq!(
+                result.unwrap_err().error_code(),
+                "KIO-E-PRIVATE-FILE-UNSAFE-001"
+            );
+        }
+        assert_eq!(
+            std::fs::metadata(repo.kio_dir())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o775
+        );
+        assert_eq!(
+            std::fs::read(repo.kio_dir().join("HEAD")).unwrap(),
+            head_before
+        );
+        assert!(!repo.kio_dir().join("gc").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn stability_check_rejects_same_content_identity_replacement() {
         let tmp = tempfile::tempdir().unwrap();
         Repository::init(tmp.path()).unwrap();
@@ -2852,7 +3032,11 @@ mod tests {
 
         let error = planner
             .plan_at_inner(0, || {
-                std::fs::write(&replacement, bytes).unwrap();
+                let directory =
+                    crate::store_dir::StoreDirectory::open(head.parent().unwrap()).unwrap();
+                directory
+                    .append_private(Path::new("HEAD.replacement"), &bytes)
+                    .unwrap();
                 std::fs::rename(&replacement, &head).unwrap();
             })
             .unwrap_err();

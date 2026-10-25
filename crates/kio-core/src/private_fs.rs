@@ -1,10 +1,8 @@
-//! Read small device-local trust files without accepting a path that another
-//! local user can replace while it is being inspected.
+//! Read protected Kio objects through retained, no-follow directory capabilities.
 //!
-//! This module deliberately has a narrower contract than general file I/O.
-//! Callers use it for credentials that authenticate a local peer (for example,
-//! a private CA certificate), so a convenient path based `read` would turn a
-//! writable ancestor or a symlink race into a trust-boundary bypass.
+//! Owner-private checks apply to Kio objects, while external ancestor permissions
+//! are outside the storage admission policy. Retained handles prevent a path
+//! replacement from redirecting an operation into another tree.
 
 use std::{ffi::OsString, path::Path};
 
@@ -23,10 +21,9 @@ const PRIVATE_FILE_RACE: &str = "KIO-E-PRIVATE-FILE-RACE-001";
 ///
 /// `path` must be absolute. Every component is opened with no-follow semantics
 /// from the retained root capability; the final leaf is never reopened by its
-/// absolute pathname. The final parent and leaf must be owned by the current
-/// user and owner-only. Ancestors must be owned by the current user or root and
-/// not writable by another user, except for root-owned sticky directories such
-/// as the OS temporary directory. No permissions are repaired by this API.
+/// absolute pathname. The leaf must be owned by the current user and owner-only.
+/// External ancestors, including the parent, have no owner/mode/ACL admission
+/// requirement. No permissions are repaired by this API.
 pub fn read_private_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
     read_private_file_with_control(path, max_bytes, &ControlHandle::default())
 }
@@ -39,12 +36,12 @@ pub fn read_private_file_with_control(
     native::read_private_file(path, max_bytes, control.clone())
 }
 
-/// Read a direct owner-private regular-file child of an already retained
-/// private directory capability.
+/// Read a direct owner-private regular-file child of a retained directory.
 ///
-/// `name` must be one ordinary path component. The directory is rechecked
-/// through its retained handle before the leaf is opened; its diagnostic path
-/// is never reopened.
+/// `name` must be one ordinary path component. The parent may be external; its
+/// permissions are not admission authority. Callers using a Kio-owned parent
+/// must separately verify it with [`verify_private_directory_handle`]. The leaf
+/// is opened through the retained parent; its diagnostic path is never reopened.
 pub fn read_private_file_at(
     parent: &StoreDirectory,
     name: &str,
@@ -60,7 +57,9 @@ pub fn read_private_file_at(
 /// Unix bytes must be exactly `/dev/fd/<canonical decimal fd>` followed by
 /// optional ordinary name components. The descriptor is duplicated with
 /// close-on-exec before it is inspected, so later operations retain the
-/// duplicated directory rather than reopening the magic path.
+/// duplicated directory rather than reopening the magic path. This resolver
+/// verifies only the directory capability: callers that use it as a Kio-owned
+/// object must verify its protection, including when the suffix is empty.
 pub fn resolve_inherited_private_root(
     path: &Path,
 ) -> Result<Option<(StoreDirectory, Vec<OsString>)>> {
@@ -79,11 +78,10 @@ pub fn resolve_inherited_private_root_with_control(
 /// final directory handle; its display path is diagnostic only and is never
 /// reopened for later mutations.
 ///
-/// `path` must be absolute. Every ancestor follows the same trusted-owner,
-/// no-untrusted-write policy as [`read_private_file`], and the final directory
-/// must be owned by the current user and owner-only (including macOS ACL or
-/// Windows DACL checks). This function never creates, repairs, or locks an
-/// entry.
+/// `path` must be absolute. External ancestor permissions are not admission
+/// authority. The final directory must be owned by the current user and
+/// owner-only (including macOS ACL or Windows DACL checks). This function never
+/// creates, repairs, or locks an entry.
 pub fn verify_private_directory(path: &Path) -> Result<StoreDirectory> {
     verify_private_directory_with_control(path, &ControlHandle::default())
 }
@@ -104,12 +102,19 @@ pub fn verify_private_directory_handle(directory: &StoreDirectory) -> Result<()>
     native::verify_private_directory_handle(directory)
 }
 
-/// Retain an existing directory that is safe to create owner-private children
-/// beneath. Unlike [`verify_private_directory`], the final directory may be a
-/// trusted shared-read parent such as an XDG data directory with mode `0755`.
-/// It must still be absolute, non-symlinked, and not writable, deletable, or
-/// ACL-mutable by an untrusted local principal. The retained handle prevents a
-/// later path re-resolution before private children are created.
+/// Verify owner-only protection on an already retained single-link regular file.
+/// Callers must separately bind its parent and open without following links.
+/// This never repairs permissions or reopens the diagnostic path.
+pub fn verify_private_regular_file_handle(file: &std::fs::File) -> Result<()> {
+    native::verify_private_regular_file_handle(file)
+}
+
+/// Retain an existing external directory for creating owner-private children.
+///
+/// The path must be absolute and non-symlinked. Its owner, mode and ACL are not
+/// admission authority. The retained handle prevents later path re-resolution
+/// before private children are created. Callers must separately protect and
+/// verify the Kio-owned children.
 ///
 /// This function only verifies an existing parent. It never creates, repairs,
 /// locks, or otherwise mutates filesystem state.

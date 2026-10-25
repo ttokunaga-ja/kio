@@ -705,7 +705,7 @@ fn require_automatic_index_binding(
     };
     let kio = session.retained_kio_handle()?;
     let observed = read_bound_gc_index_metadata(&kio, &bound_fts_config())
-        .map_err(crate::object_persistence::index_to_kio)?
+        .map_err(automatic_index_binding_error)?
         .ok_or_else(|| {
             KioError::new(
                 "KIO-E-GC-INDEX-BINDING-001",
@@ -724,6 +724,21 @@ fn require_automatic_index_binding(
         ));
     }
     Ok(())
+}
+
+// This recheck already holds a previously valid expected index. A schema
+// rejection here invalidates that binding. Other typed variants retain the
+// ordinary index classification rather than becoming permanent failures.
+fn automatic_index_binding_error(error: kio_index::IndexError) -> KioError {
+    match error {
+        kio_index::IndexError::Schema(message) => KioError::new(
+            "KIO-E-GC-INDEX-BINDING-001",
+            format!("index became unsafe or inconsistent during the on-idle GC handoff: {message}"),
+            json!({}),
+            ExitCode::PermanentFailure,
+        ),
+        error => crate::object_persistence::index_to_kio(error),
+    }
 }
 
 fn execute_locked(
@@ -1408,6 +1423,34 @@ fn maybe_wait_at_test_prelock_barrier(_control: &kio_core::control::ControlHandl
 #[cfg(test)]
 mod index_exchange_error_tests {
     use super::*;
+
+    #[test]
+    fn automatic_index_binding_only_reclassifies_schema_rejection() {
+        let error = automatic_index_binding_error(kio_index::IndexError::Schema(
+            "source parent is unsafe".into(),
+        ));
+        assert_eq!(error.error_code(), "KIO-E-GC-INDEX-BINDING-001");
+        assert_eq!(error.exit_code(), ExitCode::PermanentFailure);
+        assert!(error.message().contains("source parent is unsafe"));
+        for error in [
+            kio_index::IndexError::Contract("contract".into()),
+            kio_index::IndexError::RegistryUnstableBusy("busy".into()),
+            kio_index::IndexError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                None,
+            )),
+            kio_index::IndexError::Sqlite(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                None,
+            )),
+        ] {
+            let prior_message = error.to_string();
+            let mapped = automatic_index_binding_error(error);
+            assert_eq!(mapped.error_code(), "KIO-E-CONFIG-SCHEMA-001");
+            assert_eq!(mapped.exit_code(), ExitCode::InvalidUsage);
+            assert_eq!(mapped.message(), prior_message);
+        }
+    }
 
     #[test]
     fn gc_index_exchange_preserves_typed_interruption_outcome() {

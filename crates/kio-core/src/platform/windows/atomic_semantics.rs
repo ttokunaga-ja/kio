@@ -21,6 +21,43 @@ pub(crate) fn ensure_private_workspace(workspace: &StoreDirectory) -> Result<()>
     Ok(())
 }
 
+/// Retire only Kio's protected publication staging leaf. A crash may leave it
+/// read-only; deletion uses its retained identity without changing any ACL or
+/// file attributes. This helper is never used for existing user working files.
+pub(crate) fn remove_publication_residue(workspace: &StoreDirectory, name: &Path) -> Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+        FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX, FileDispositionInfoEx,
+        SetFileInformationByHandle,
+    };
+    ensure_private_workspace(workspace)?;
+    workspace.ensure_owner_private(name)?;
+    let file = workspace.open_regular_for_removal(name, u64::MAX)?;
+    super::private_fs::verify_owner_private_handle(&file)?;
+    let info = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE
+            | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS
+            | FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE,
+    };
+    if unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            &info as *const _ as _,
+            std::mem::size_of_val(&info) as u32,
+        )
+    } == 0
+    {
+        return Err(io_failure(
+            "cannot retire read-only publication residue",
+            std::io::Error::last_os_error(),
+        ));
+    }
+    drop(file);
+    Ok(())
+}
+
 pub(crate) fn atomic_file_identity(file: &File) -> Result<FileSystemIdentity> {
     let metadata = file
         .metadata()
@@ -103,7 +140,6 @@ pub(crate) fn finish_remove_retirement(
                 "removal quarantine does not match its ready intent",
             ));
         }
-        super::private_fs::restrict_existing_private_handle(&quarantined)?;
         drop(quarantined);
         remove_if_present(workspace, REMOVED)?;
         workspace

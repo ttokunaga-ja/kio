@@ -25,7 +25,8 @@ fn open_or_create_inherited_parent(
     path: &Path,
     allow_create: bool,
 ) -> Result<StoreDirectory> {
-    verify_private_parent_handle(current.root_handle().as_ref(), current.path())?;
+    // The inherited capability can denote an external creation parent. Each
+    // Kio-owned suffix and the final ledger directory are verified below.
     let mut logical = current.path().to_path_buf();
     for name in suffix {
         let leaf = Path::new(name);

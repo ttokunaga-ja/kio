@@ -1,4 +1,4 @@
-use crate::error::{IoResultExt, KioError, Result};
+use crate::error::{KioError, Result};
 use crate::platform::{PathLock, PathLockLease};
 use std::fs::{File, Metadata};
 use std::path::Path;
@@ -46,9 +46,9 @@ pub(crate) fn reentrant_path_lock_lease(
 ) -> Result<Option<PathLockLease>> {
     Ok(None)
 }
-pub(crate) fn acquire_path_gate(parent: &Path, lock_path: &Path) -> Result<File> {
+pub(crate) fn acquire_path_gate(parent: &File, lock_path: &Path) -> Result<File> {
     use std::os::fd::AsRawFd;
-    let gate = File::open(parent).kio_io(parent)?;
+    let gate = super::lock::open_bound_directory_for_io(parent, lock_path)?;
     // SAFETY: owned gate outlives its flock; LOCK_NB keeps writer contention nonblocking.
     if unsafe { libc::flock(gate.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         let error = std::io::Error::last_os_error();

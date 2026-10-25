@@ -955,17 +955,34 @@ fn copy_fixture_directory(
     destination: &Path,
     budget: &mut FixtureDigestBudget,
 ) -> Result<(), QhardError> {
+    let parent_path = destination
+        .parent()
+        .ok_or_else(|| QhardError::Input("fixture snapshot destination has no parent".into()))?;
+    let leaf = destination.file_name().ok_or_else(|| {
+        QhardError::Input("fixture snapshot destination has no directory name".into())
+    })?;
+    let parent = kio_core::private_fs::verify_private_creation_parent(parent_path)
+        .map_err(|e| QhardError::Input(format!("cannot retain fixture snapshot parent: {e}")))?;
+    copy_fixture_directory_into(source, &parent, Path::new(leaf), destination, budget)
+}
+
+fn copy_fixture_directory_into(
+    source: &fs::File,
+    parent: &StoreDirectory,
+    leaf: &Path,
+    destination: &Path,
+    budget: &mut FixtureDigestBudget,
+) -> Result<(), QhardError> {
     budget.directories += 1;
     if budget.directories > MAX_WALK_DIRECTORIES {
         return Err(QhardError::Input(
             "fixture snapshot exceeds directory traversal bound".into(),
         ));
     }
-    fs::create_dir(destination)
+    let directory = parent
+        .create_directory(leaf)
+        .and_then(|handle| StoreDirectory::from_retained(handle, destination.to_path_buf()))
         .map_err(|e| QhardError::Input(format!("cannot create private fixture directory: {e}")))?;
-    #[cfg(unix)]
-    fs::set_permissions(destination, fs::Permissions::from_mode(0o700))
-        .map_err(|e| QhardError::Input(format!("cannot secure private fixture directory: {e}")))?;
     let mut seen = 0usize;
     for entry in cap_fs::read_dir(source, Path::new("."))
         .map_err(|e| QhardError::Input(format!("cannot enumerate fixture snapshot source: {e}")))?
@@ -998,7 +1015,7 @@ fn copy_fixture_directory(
                     "fixture directory changed while snapshotting: {name}"
                 ))
             })?;
-            copy_fixture_directory(&child, &output, budget)?;
+            copy_fixture_directory_into(&child, &directory, Path::new(name), &output, budget)?;
         } else if ty.is_file() {
             budget.files += 1;
             if budget.files > MAX_LIVE_FIXTURE_FILES {
@@ -1023,12 +1040,13 @@ fn copy_fixture_directory(
                     "fixture snapshot exceeds aggregate byte bound".into(),
                 ));
             }
-            fs::write(&output, bytes).map_err(|e| {
+            let mut file = directory
+                .create_private_file(Path::new(name))
+                .map_err(|e| {
+                    QhardError::Input(format!("cannot create private fixture file: {e}"))
+                })?;
+            io::Write::write_all(&mut file, &bytes).map_err(|e| {
                 QhardError::Input(format!("cannot write private fixture snapshot: {e}"))
-            })?;
-            #[cfg(unix)]
-            fs::set_permissions(&output, fs::Permissions::from_mode(0o600)).map_err(|e| {
-                QhardError::Input(format!("cannot secure private fixture file: {e}"))
             })?;
         } else {
             return Err(QhardError::Input(format!(
@@ -6498,6 +6516,30 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn private_snapshot_copies_protect_every_owned_directory_and_file() {
+        let source = tempfile::tempdir().unwrap();
+        fs::create_dir(source.path().join("nested")).unwrap();
+        fs::write(source.path().join("nested/evidence"), b"secret").unwrap();
+        let bound = RetainedDirectory::open(source.path(), "source").unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let copied = output.path().join("copy");
+        copy_fixture_directory(&bound.handle, &copied, &mut FixtureDigestBudget::default())
+            .unwrap();
+        kio_core::private_fs::verify_private_directory(&copied).unwrap();
+        kio_core::private_fs::verify_private_directory(&copied.join("nested")).unwrap();
+        let directory = StoreDirectory::open(&copied.join("nested")).unwrap();
+        let file = directory
+            .open_regular_read(Path::new("evidence"), 6)
+            .unwrap();
+        kio_core::private_fs::verify_private_regular_file_handle(&file).unwrap();
+        assert_eq!(fs::read(copied.join("nested/evidence")).unwrap(), b"secret");
+        assert!(
+            copy_fixture_directory(&bound.handle, &copied, &mut FixtureDigestBudget::default())
+                .is_err()
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn private_snapshot_copies_are_owner_only() {
@@ -6674,7 +6716,8 @@ mod tests {
             &tool_hash,
             0,
         );
-        fs::create_dir_all(&source_output).unwrap();
+        let output = StoreDirectory::open_or_create_directories(&source_output).unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&output).unwrap();
         TaskStore::new(&source_kio)
             .replace_all(&[TaskDescriptor {
                 task_id: "task_01H".into(),
@@ -6759,7 +6802,8 @@ mod tests {
         let tool_hash = format!("sha256:{}", "d".repeat(64));
         let p01_output =
             kio_pipeline::markdownize::normalized_instance_dir(&p01_kio, &raw_hash, &tool_hash, 0);
-        fs::create_dir_all(&p01_output).unwrap();
+        let output = StoreDirectory::open_or_create_directories(&p01_output).unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&output).unwrap();
         TaskStore::new(&p01_kio)
             .replace_all(&[TaskDescriptor {
                 task_id: "task_01H".into(),
@@ -6791,7 +6835,8 @@ mod tests {
             .unwrap();
         for persona in baseline_personas() {
             let scope = source_root.join(&persona).join("home/work/.kio");
-            fs::create_dir_all(&scope).unwrap();
+            let scope_directory = StoreDirectory::open_or_create_directories(&scope).unwrap();
+            kio_core::private_fs::verify_private_directory_handle(&scope_directory).unwrap();
             let registry = source_root
                 .join("env")
                 .join(&persona)

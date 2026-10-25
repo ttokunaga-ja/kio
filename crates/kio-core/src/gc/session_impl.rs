@@ -273,7 +273,7 @@ impl GcSweepSession {
             read_regular_observed(&self.kio, "config.toml", MAX_METADATA)?;
         let config = read_snapshot_auto_config_bytes(&bytes)?;
         let root_ignore_observation =
-            match read_regular_observed(&self.scope, ".kioignore", MAX_METADATA) {
+            match read_user_regular_observed(&self.scope, ".kioignore", MAX_METADATA) {
                 Ok((_, observation)) => Some(observation),
                 Err(error) if is_io_not_found(&error) => None,
                 Err(error) => return Err(error),
@@ -1094,8 +1094,9 @@ impl GcSweepSession {
         })
     }
     fn recheck_binding(&self) -> Result<()> {
+        let kio_identity = id_file(&self.kio)?;
         if id_file(&self.scope)? != id_path(&self.root)?
-            || id_file(&self.kio)? != id_child(&self.scope, ".kio")?
+            || kio_identity != id_child(&self.scope, ".kio", &kio_identity)?
         {
             Err(corrupt("scope changed during GC sweep"))
         } else {
@@ -1247,6 +1248,7 @@ impl GcSweepSession {
             }
             Err(error) => return Err(ioerr(error, "index/sqlite.db")),
         };
+        crate::private_fs::verify_private_regular_file_handle(&file)?;
         let metadata =
             cap_fs::Metadata::from_file(&file).map_err(|error| ioerr(error, "index/sqlite.db"))?;
         valid_file(&metadata, u64::MAX)?;

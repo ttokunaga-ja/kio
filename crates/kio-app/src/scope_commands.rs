@@ -33,8 +33,30 @@ pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result
     };
     // Management records are created only by the exclusive creation path.
     // Any pre-existing store must already have a valid live chain.
-    let (repo, created) = match initialize_explicit_root_in_session(&path, ctx.control, ctx.locks)?
-    {
+    let independent_plan = if args.independent {
+        let plan = crate::management::preview_independent_root(&path, ctx.control)?;
+        let summary = plan.confirmation_summary();
+        if !args.yes && !ctx.interaction.confirm(&summary)? {
+            return Err(kio_core::KioError::invalid_usage(format!(
+                "{summary} Independent initialization requires confirmation; use init --independent --yes or confirm in an interactive terminal"
+            )));
+        }
+        Some(plan)
+    } else {
+        if args.yes {
+            return Err(kio_core::KioError::invalid_usage(
+                "init --yes requires --independent",
+            ));
+        }
+        None
+    };
+    let initialized = match &independent_plan {
+        Some(plan) => {
+            crate::management::initialize_independent_root_in_session(plan, ctx.control, ctx.locks)?
+        }
+        None => initialize_explicit_root_in_session(&path, ctx.control, ctx.locks)?,
+    };
+    let (repo, created) = match initialized {
         ExplicitRoot::Created(repo) => (repo, true),
         ExplicitRoot::Existing(repo) => (repo, false),
     };
@@ -78,6 +100,7 @@ pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result
             repaired,
             path: repo.root().to_path_buf(),
             kio_path: repo.kio_dir().to_path_buf(),
+            independent: independent_plan.map(|plan| plan.response()),
         }),
         completion: Completion::Complete,
     })

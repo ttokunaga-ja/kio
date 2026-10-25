@@ -51,6 +51,7 @@ fn owner(kio: &File, create: bool, control: &ControlHandle) -> Result<Option<Sto
     let mut parent = kio
         .try_clone()
         .map_err(|error| IndexError::Schema(format!("retain GC exchange root: {error}")))?;
+    kio_core::platform::verify_owner_private_handle(&parent).map_err(core_error)?;
     for leaf in ["gc", "internal", "index-exchange"] {
         parent = match cap_fs::open_dir_nofollow(&parent, Path::new(leaf)) {
             Ok(file) => file,
@@ -58,12 +59,9 @@ fn owner(kio: &File, create: bool, control: &ControlHandle) -> Result<Option<Sto
                 return Ok(None);
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                cap_fs::create_dir(&parent, Path::new(leaf), &cap_fs::DirOptions::new()).map_err(
-                    |error| IndexError::Schema(format!("create GC exchange owner {leaf}: {error}")),
-                )?;
-                cap_fs::open_dir_nofollow(&parent, Path::new(leaf)).map_err(|error| {
-                    IndexError::Schema(format!("open GC exchange owner {leaf}: {error}"))
-                })?
+                directory(&parent, control)?
+                    .create_directory(Path::new(leaf))
+                    .map_err(core_error)?
             }
             Err(error) => {
                 return Err(IndexError::Schema(format!(
@@ -71,6 +69,7 @@ fn owner(kio: &File, create: bool, control: &ControlHandle) -> Result<Option<Sto
                 )));
             }
         };
+        kio_core::platform::verify_owner_private_handle(&parent).map_err(core_error)?;
     }
     directory(&parent, control).map(Some)
 }
@@ -368,7 +367,13 @@ mod tests {
         fn new() -> Self {
             let directory = tempfile::tempdir().unwrap();
             let kio_path = directory.path().join(".kio");
-            std::fs::create_dir_all(kio_path.join("index")).unwrap();
+            // docs/14: .kio and index are Kio-created objects, while the
+            // enclosing TempDir is only an external fixture parent.
+            let index_directory =
+                StoreDirectory::open_or_create_directories(&kio_path.join("index")).unwrap();
+            kio_core::private_fs::verify_private_directory_handle(&index_directory).unwrap();
+            kio_core::private_fs::verify_private_directory(&kio_path).unwrap();
+            drop(index_directory);
             let config = FtsSchemaConfig {
                 tokenizer: FtsTokenizer::Trigram,
             };

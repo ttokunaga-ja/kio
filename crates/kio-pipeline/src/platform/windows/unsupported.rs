@@ -14,6 +14,10 @@ pub(crate) struct StoreRootSnapshot {
 
 impl UnsupportedInputStore {
     pub(crate) fn store_root_snapshot(&self) -> Result<StoreRootSnapshot> {
+        let retained = kio_core::store_dir::StoreDirectory::open(&self.kio_dir)
+            .map_err(|error| self.corrupt(error.to_string()))?;
+        kio_core::private_fs::verify_private_directory_handle(&retained)
+            .map_err(|error| self.corrupt(error.to_string()))?;
         {
             let handle =
                 crate::platform::open_path_no_follow(&self.kio_dir).pipeline_io(&self.kio_dir)?;

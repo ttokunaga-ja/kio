@@ -1230,7 +1230,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unsafe_child_refuses_initialization_without_creating_lifecycle_artifacts() {
+    fn writable_user_child_initializes_without_chmod_and_keeps_store_private() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = canonical_tempdir();
@@ -1239,7 +1239,35 @@ mod tests {
         fs::create_dir(&child).unwrap();
         fs::set_permissions(&child, fs::Permissions::from_mode(0o777)).unwrap();
 
-        assert!(reconcile_or_initialize_child(&parent, "child").is_err());
+        fs::write(child.join("user.txt"), b"preserve user bytes").unwrap();
+        let identity = directory_identity_from_handle(
+            StoreDirectory::open(&child).unwrap().root_handle().as_ref(),
+        )
+        .unwrap();
+        let repo = reconcile_or_initialize_child(&parent, "child").unwrap();
+        assert_eq!(
+            read_record(&binding_for_repo(&repo).unwrap())
+                .unwrap()
+                .directory_identity,
+            identity
+        );
+        assert_eq!(
+            fs::metadata(&child).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(
+            fs::read(child.join("user.txt")).unwrap(),
+            b"preserve user bytes"
+        );
+        kio_core::private_fs::verify_private_directory(&child.join(".kio")).unwrap();
+        assert_eq!(
+            fs::metadata(child.join(".kio/management.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
 
         let store = control(
             &binding_for_repo(&parent).unwrap(),
@@ -1255,14 +1283,14 @@ mod tests {
                 .iter()
                 .all(|entry| !entry.name.to_string_lossy().starts_with(".child-init-"))
         );
-        assert!(!child.join(".kio").exists());
+        assert!(child.join(".kio").is_dir());
         assert!(!child.join(".kio-case-probe").exists());
         assert!(!child.join(".kio-atomic").exists());
     }
 
     #[cfg(unix)]
     #[test]
-    fn unsafe_pending_child_refuses_resume_without_changing_journal_or_stage() {
+    fn writable_pending_child_resumes_exact_stage_without_chmod() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = canonical_tempdir();
@@ -1275,20 +1303,33 @@ mod tests {
             &kio_core::control::ControlHandle::default(),
         )
         .unwrap();
-        let (journal, bytes) = test_journal(&store);
+        let (journal, _) = test_journal(&store);
         fs::set_permissions(&child, fs::Permissions::from_mode(0o777)).unwrap();
 
-        assert!(reconcile_or_initialize_child(&parent, "child").is_err());
-
-        let (after, after_bytes) = test_journal(&store);
-        assert_eq!(after.operation_id, journal.operation_id);
-        assert_eq!(after_bytes, bytes);
+        let repo = reconcile_or_initialize_child(&parent, "child").unwrap();
+        let record = read_record(&binding_for_repo(&repo).unwrap()).unwrap();
+        assert_eq!(record.scope_id, journal.planned_scope_id);
+        assert_eq!(record.directory_identity, journal.retained_child_identity);
+        assert!(pending_initializations(&store).unwrap().is_empty());
         assert!(
-            store
+            !store
                 .contains_entry(std::path::Path::new(&journal.stage_leaf))
                 .unwrap()
         );
-        assert!(!child.join(".kio").exists());
+        assert!(!child.join(".kio/.child-init-journal.json").exists());
+        assert_eq!(
+            fs::metadata(&child).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        kio_core::private_fs::verify_private_directory(&child.join(".kio")).unwrap();
+        assert_eq!(
+            fs::metadata(child.join(".kio/management.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
         assert!(!child.join(".kio-case-probe").exists());
         assert!(!child.join(".kio-atomic").exists());
     }
@@ -1377,6 +1418,11 @@ mod tests {
 
     #[test]
     fn retirement_replay_after_authority_cutoff_cleans_journal() {
+        if !crate::contextual_embedding_tests::isolated_child_for(
+            "management::child_lifecycle::tests::retirement_replay_after_authority_cutoff_cleans_journal",
+        ) {
+            return;
+        }
         let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
@@ -1460,6 +1506,11 @@ mod tests {
 
     #[test]
     fn replacement_directory_retires_old_membership_then_mints_fresh_scope() {
+        if !crate::contextual_embedding_tests::isolated_child_for(
+            "management::child_lifecycle::tests::replacement_directory_retires_old_membership_then_mints_fresh_scope",
+        ) {
+            return;
+        }
         let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");

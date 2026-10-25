@@ -52,7 +52,7 @@ const PRIVATE_SQLITE_LEAVES: [&str; 3] = [
 
 #[derive(Clone, Copy)]
 enum AclShape {
-    ExactCreated { directory: bool },
+    ExactCreated,
     OwnerOnly,
 }
 
@@ -75,7 +75,7 @@ impl RegistrySnapshotPrivateDir {
 
         for _ in 0..MAX_CREATE_ATTEMPTS {
             let path = temp_root.join(random_leaf()?);
-            let mut descriptor = OwnerOnlyDescriptor::new(&owner, true)?;
+            let mut descriptor = OwnerOnlyDescriptor::new(&owner)?;
             let attributes = descriptor.security_attributes();
             let wide = wide_path(&path)?;
             // SAFETY: the UTF-16 path and descriptor remain live for the call.
@@ -138,7 +138,7 @@ impl RegistrySnapshotPrivateDir {
         validate_basename(basename)?;
         let owner = CurrentUserSid::current()?;
         let path = self.path.join(basename);
-        let mut descriptor = OwnerOnlyDescriptor::new(&owner, false)?;
+        let mut descriptor = OwnerOnlyDescriptor::new(&owner)?;
         let attributes = descriptor.security_attributes();
         let wide = wide_path(&path)?;
         // SAFETY: path and security descriptor outlive this call.  The result
@@ -297,7 +297,7 @@ struct OwnerOnlyDescriptor {
 }
 
 impl OwnerOnlyDescriptor {
-    fn new(owner: &CurrentUserSid, directory: bool) -> io::Result<Self> {
+    fn new(owner: &CurrentUserSid) -> io::Result<Self> {
         let owner = CurrentUserSid {
             bytes: owner.bytes.clone(),
         };
@@ -308,11 +308,10 @@ impl OwnerOnlyDescriptor {
         if unsafe { InitializeAcl(acl.as_mut_ptr().cast(), acl_size as u32, ACL_REVISION) } == 0 {
             return Err(context(last_error(), "initialize owner-private DACL"));
         }
-        let ace_flags = if directory {
-            CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE
-        } else {
-            0
-        };
+        // Every snapshot child is explicitly created with its own protected
+        // descriptor. Keep the directory ACE non-inheriting as required by
+        // the common Kio private-object policy.
+        let ace_flags = 0;
         // SAFETY: initialized ACL has sufficient room for exactly this ACE.
         if unsafe {
             AddAccessAllowedAceEx(
@@ -399,7 +398,7 @@ fn verify_directory_handle(file: &fs::File, path: &Path, owner: &CurrentUserSid)
             "private registry snapshot directory changed while opening",
         ));
     }
-    verify_owner_only_security(file, owner, AclShape::ExactCreated { directory: true })
+    verify_owner_only_security(file, owner, AclShape::ExactCreated)
 }
 
 fn verify_file_handle(file: &fs::File, path: &Path, owner: &CurrentUserSid) -> io::Result<()> {
@@ -417,7 +416,7 @@ fn verify_file_handle(file: &fs::File, path: &Path, owner: &CurrentUserSid) -> i
             "private registry snapshot leaf changed while opening",
         ));
     }
-    verify_owner_only_security(file, owner, AclShape::ExactCreated { directory: false })
+    verify_owner_only_security(file, owner, AclShape::ExactCreated)
 }
 
 /// Delete only the exact objects opened through the still-pinned private
@@ -610,7 +609,7 @@ fn verify_descriptor(
             "inspect owner-private security descriptor",
         ));
     }
-    let strict = matches!(shape, AclShape::ExactCreated { .. });
+    let strict = matches!(shape, AclShape::ExactCreated);
     if actual_owner.is_null()
         || unsafe { EqualSid(actual_owner, owner.as_psid()) } == 0
         || dacl_present == 0
@@ -653,12 +652,9 @@ fn verify_descriptor(
     // SAFETY: ACE type/size are checked before interpreting SID bytes.
     let flags = unsafe { (*header).AceFlags };
     let expected_flags = match shape {
-        AclShape::ExactCreated { directory: true } => {
-            (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE) as u8
-        }
-        AclShape::ExactCreated { directory: false } => 0,
-        // SQLite may create sidecars by inheriting this directory's ACE. It
-        // remains owner-only, but the OS marks the resulting ACE inherited.
+        AclShape::ExactCreated => 0,
+        // Cleanup checks owner-only access; exact creation checks above
+        // additionally reject every inheritance marker.
         AclShape::OwnerOnly => flags,
     };
     let owner_only_flags = (CONTAINER_INHERIT_ACE | OBJECT_INHERIT_ACE | INHERITED_ACE) as u8;
@@ -765,6 +761,16 @@ mod tests {
         .expect("directory remains owner-only");
         verify_file_handle(&child, &private.path().join("snapshot.sqlite"), &owner)
             .expect("leaf remains owner-only");
+        let retained = kio_core::store_dir::StoreDirectory::from_retained(
+            private.capability().expect("retained snapshot directory"),
+            private.path().to_path_buf(),
+        )
+        .expect("ordinary retained snapshot directory");
+        kio_core::private_fs::verify_private_directory_handle(&retained)
+            .expect("snapshot directory matches common private-object policy");
+        kio_core::private_fs::verify_private_regular_file_handle(&child)
+            .expect("snapshot leaf matches common private-object policy");
+        drop(retained);
         drop(child);
         drop(private);
         assert!(

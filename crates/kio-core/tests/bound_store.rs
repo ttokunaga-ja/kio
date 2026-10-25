@@ -49,7 +49,11 @@ fn bound_content_inspection_charges_corrupt_bytes_to_the_read_budget() {
     let fixture = tempfile::tempdir().unwrap();
     let kio = fixture.path().join(".kio");
     for kind in ["raw", "trees", "commits"] {
-        std::fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+        let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+            &kio.join("objects").join(kind),
+        )
+        .unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     }
     let retained =
         cap_primitives::fs::open_ambient_dir(&kio, cap_primitives::ambient_authority()).unwrap();
@@ -81,7 +85,11 @@ fn bound_inspection_accounted_reads_and_streaming_copy_follow_retained_namespace
     let fixture = tempfile::tempdir().unwrap();
     let kio = fixture.path().join(".kio");
     for kind in ["raw", "trees", "commits"] {
-        std::fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+        let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+            &kio.join("objects").join(kind),
+        )
+        .unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     }
     let retained =
         cap_primitives::fs::open_ambient_dir(&kio, cap_primitives::ambient_authority()).unwrap();
@@ -156,7 +164,11 @@ fn retained_store_stages_publishes_and_reads_without_a_public_kio_path() {
     let fixture = tempfile::tempdir().expect("temporary scope");
     let kio = fixture.path().join(".kio");
     for kind in ["raw", "trees", "commits"] {
-        std::fs::create_dir_all(kio.join("objects").join(kind)).expect("object namespace");
+        let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+            &kio.join("objects").join(kind),
+        )
+        .unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     }
 
     let retained_kio =
@@ -193,7 +205,11 @@ fn retained_repairs_removals_and_embedding_inventory_never_follow_public_substit
     let fixture = tempfile::tempdir().unwrap();
     let kio = fixture.path().join(".kio");
     for kind in ["raw", "trees", "commits"] {
-        std::fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+        let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+            &kio.join("objects").join(kind),
+        )
+        .unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     }
     let retained =
         cap_primitives::fs::open_ambient_dir(&kio, cap_primitives::ambient_authority()).unwrap();
@@ -243,7 +259,11 @@ fn store_owned_kio_clone_survives_moves_after_raw_caller_handle_is_closed() {
     let root = fixture.path().join("scope");
     let kio = root.join(".kio");
     for kind in ["raw", "trees", "commits"] {
-        std::fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+        let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+            &kio.join("objects").join(kind),
+        )
+        .unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     }
     // Deliberately pass a raw named handle, without fixture normalization.
     let caller =
@@ -259,7 +279,11 @@ fn store_owned_kio_clone_survives_moves_after_raw_caller_handle_is_closed() {
 
     std::fs::rename(&kio, root.join("retained-kio")).unwrap();
     for kind in ["raw", "trees", "commits"] {
-        std::fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+        let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+            &kio.join("objects").join(kind),
+        )
+        .unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     }
     let replacement = ObjectStore::new(&kio);
     let replacement_hash = replacement.write_raw(b"replacement bytes").unwrap();
@@ -282,7 +306,11 @@ fn store_owned_kio_clone_survives_moves_after_raw_caller_handle_is_closed() {
 
     std::fs::rename(&root, fixture.path().join("retained-scope")).unwrap();
     for kind in ["raw", "trees", "commits"] {
-        std::fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+        let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+            &kio.join("objects").join(kind),
+        )
+        .unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     }
     let replacement = ObjectStore::new(&kio);
     let replacement_hash = replacement.write_raw(b"replacement root bytes").unwrap();
@@ -317,7 +345,11 @@ fn retained_removal_rejects_a_hardlinked_raw_leaf_without_unlinking_either_name(
     let fixture = tempfile::tempdir().unwrap();
     let kio = fixture.path().join(".kio");
     for kind in ["raw", "trees", "commits"] {
-        std::fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+        let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+            &kio.join("objects").join(kind),
+        )
+        .unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     }
     let retained =
         cap_primitives::fs::open_ambient_dir(&kio, cap_primitives::ambient_authority()).unwrap();
@@ -347,7 +379,11 @@ fn retained_store_late_binds_peer_created_semantic_namespaces_without_ambient_fa
     let fixture = tempfile::tempdir().unwrap();
     let kio = fixture.path().join(".kio");
     for kind in ["raw", "trees", "commits"] {
-        std::fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+        let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+            &kio.join("objects").join(kind),
+        )
+        .unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     }
     let retained =
         cap_primitives::fs::open_ambient_dir(&kio, cap_primitives::ambient_authority()).unwrap();

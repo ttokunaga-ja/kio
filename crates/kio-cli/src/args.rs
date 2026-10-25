@@ -65,6 +65,12 @@ pub(crate) enum Command {
 #[derive(Debug, Args)]
 pub(crate) struct InitArgs {
     pub(crate) path: Option<PathBuf>,
+    /// Create an independent boundary after reviewing the parent relationship.
+    #[arg(long)]
+    pub(crate) independent: bool,
+    /// Confirm this independent initialization.
+    #[arg(long, requires = "independent")]
+    pub(crate) yes: bool,
 }
 
 #[derive(Debug, Args)]
@@ -598,7 +604,7 @@ macro_rules! plain_from {
         impl From<$cli> for app::$app { fn from(value: $cli) -> Self { let $cli { $($field),* } = value; Self { $($field),* } } }
     };
 }
-plain_from!(InitArgs => InitArgs { path });
+plain_from!(InitArgs => InitArgs { path, independent, yes });
 
 impl From<WatchArgs> for app::WatchArgs {
     fn from(value: WatchArgs) -> Self {

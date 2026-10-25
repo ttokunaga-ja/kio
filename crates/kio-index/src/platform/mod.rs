@@ -149,3 +149,22 @@ pub(crate) use bound_sqlite::BoundSqliteConnection;
 #[cfg(target_os = "linux")]
 #[path = "linux/bound_sqlite.rs"]
 mod linux_bound_sqlite;
+
+#[path = "../registry_vfs.rs"]
+mod registry_vfs;
+pub(crate) use registry_vfs::{
+    open as open_private_registry_connection, open_snapshot as open_private_registry_snapshot,
+};
+
+#[cfg(target_os = "linux")]
+#[path = "linux/registry_vfs.rs"]
+mod registry_native;
+#[cfg(target_os = "macos")]
+#[path = "macos/registry_vfs.rs"]
+mod registry_native;
+#[cfg(windows)]
+#[path = "windows/registry_vfs.rs"]
+mod registry_native;
+#[cfg(unix)]
+#[path = "unix/registry_vfs.rs"]
+mod registry_unix_native;

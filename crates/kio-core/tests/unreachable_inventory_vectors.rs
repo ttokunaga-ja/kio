@@ -25,6 +25,36 @@ const BAD_NONCANONICAL_TOOL_LOCK: &[u8] = br#"{ "spec_version": 1 }"#;
 const BAD_NONCANONICAL_HASH: &str =
     "sha256:75d24e72efec618faeb2df5aa7952f7ad5ea490335f78721664ebd644247a5f6";
 
+// Publish fixture bytes directly, independently of CAS serialization/hash writers.
+// Existing private leaves retain their inode for in-place corruption tests.
+fn write_private_fixture(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = path.as_ref();
+    let parent =
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(path.parent().unwrap())
+            .unwrap();
+    kio_core::private_fs::verify_private_directory_handle(&parent).unwrap();
+    let leaf = std::path::Path::new(path.file_name().unwrap());
+    let mut file = if parent.contains_entry(leaf).unwrap() {
+        kio_core::cas::open_regular_nofollow_read_write(path).unwrap()
+    } else {
+        parent.create_private_file(leaf).unwrap()
+    };
+    kio_core::private_fs::verify_private_regular_file_handle(&file).unwrap();
+    file.set_len(0)?;
+    file.write_all(bytes.as_ref())
+}
+
+fn create_private_fixture_directory(
+    path: impl AsRef<std::path::Path>,
+) -> Result<(), kio_core::KioError> {
+    let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(path.as_ref())?;
+    kio_core::private_fs::verify_private_directory_handle(&directory)
+}
+
 struct Fixture {
     root: TempDir,
 }
@@ -265,9 +295,9 @@ impl Fixture {
             .join(directory)
             .join(&digest[..2])
             .join(&digest[2..4]);
-        fs::create_dir_all(&parent).unwrap();
+        create_private_fixture_directory(&parent).unwrap();
         let path = parent.join(digest);
-        fs::write(&path, bytes).unwrap();
+        write_private_fixture(&path, bytes).unwrap();
         path
     }
 }
@@ -454,8 +484,8 @@ fn shallow_receipt_classifies_commit_and_explains_only_its_missing_tree() {
     let receipt =
         ShallowReceipt::new(old.commit.clone(), old.tree.clone(), AT_1.to_owned()).unwrap();
     let receipt_dir = fixture.kio().join("gc/shallowed");
-    fs::create_dir_all(&receipt_dir).unwrap();
-    fs::write(
+    create_private_fixture_directory(&receipt_dir).unwrap();
+    write_private_fixture(
         receipt_dir.join(old.commit.strip_prefix("sha256:").unwrap()),
         receipt.canonical_bytes().unwrap(),
     )
@@ -528,8 +558,8 @@ fn shallow_receipt_makes_orphaned_semantic_closure_inventory_only() {
     )
     .unwrap();
     let receipt_dir = fixture.kio().join("gc/shallowed");
-    fs::create_dir_all(&receipt_dir).unwrap();
-    fs::write(
+    create_private_fixture_directory(&receipt_dir).unwrap();
+    write_private_fixture(
         receipt_dir.join(boundary.commit.strip_prefix("sha256:").unwrap()),
         receipt.canonical_bytes().unwrap(),
     )
@@ -844,29 +874,40 @@ fn symlink_and_unsafe_hardlink_are_rejected() {
 
 #[test]
 fn active_gc_purge_and_uncertain_writer_states_fail_closed() {
+    let write_marker = |fixture: &Fixture, directory: &str, leaf: &str| {
+        let parent = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+            &fixture.kio().join(directory),
+        )
+        .unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&parent).unwrap();
+        let mut marker = parent.create_private_file(Path::new(leaf)).unwrap();
+        std::io::Write::write_all(&mut marker, b"active").unwrap();
+    };
     let active_gc = Fixture::new();
-    fs::create_dir_all(active_gc.kio().join("gc")).unwrap();
-    fs::write(active_gc.kio().join("gc/in_progress"), b"active").unwrap();
+    write_marker(&active_gc, "gc", "in_progress");
     assert_ne!(active_gc.error().exit_code().code(), 0);
 
     let active_purge = Fixture::new();
-    fs::create_dir_all(active_purge.kio().join("purge")).unwrap();
-    fs::write(active_purge.kio().join("purge/in-progress.json"), b"active").unwrap();
+    write_marker(&active_purge, "purge", "in-progress.json");
     assert_eq!(
         active_purge.error().error_code(),
         "KIO-E-PURGE-JOURNAL-ACTIVE-001"
     );
 
+    let write_lock = |fixture: &Fixture, bytes: &[u8]| {
+        let parent = kio_core::private_fs::verify_private_directory(&fixture.kio()).unwrap();
+        let mut lock = parent.create_private_file(Path::new(".lock")).unwrap();
+        std::io::Write::write_all(&mut lock, bytes).unwrap();
+    };
     let writer = Fixture::new();
-    fs::write(writer.kio().join(".lock"), b"uncertain writer").unwrap();
+    write_lock(&writer, b"uncertain writer");
     assert_ne!(writer.error().exit_code().code(), 0);
 
     let crashed_writer = Fixture::new();
-    fs::write(
-        crashed_writer.kio().join(".lock"),
+    write_lock(
+        &crashed_writer,
         br#"{"pid":999999999,"token":"crashed","created_at":"2026-08-20T00:00:00Z"}"#,
-    )
-    .unwrap();
+    );
     assert_eq!(
         crashed_writer.error().error_code(),
         "KIO-E-STORE-LOCKED-001"

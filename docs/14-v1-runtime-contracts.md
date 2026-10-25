@@ -222,7 +222,15 @@ Kio-created children; and temporary files and directories Kio creates, including
 renderer scratch and query caches. The owner must be the current user. Unix
 modes are owner-only (directories `0700`, private files `0600`); extended ACLs
 must not defeat that protection. Windows objects have a protected owner-only
-DACL. Foreign write, delete or permission-changing access is refused; trusted
+DACL. For a confined renderer on Windows, Kio may additionally grant the
+fresh invocation's bound AppContainer SID access only to that invocation's
+scratch objects, for the renderer's lifetime. This does not grant access to
+another user, an unrelated invocation, or other Kio storage. Kio verifies the
+current owner, protected DACL and exact invocation SID before using such an
+object; unknown principals and identity replacements are refused. The renderer
+keeps its network and unrelated-file isolation, and invocation authority is
+retired when the renderer finishes or recovery takes ownership.
+Foreign write, delete or permission-changing access is refused; trusted
 OS administrator authority does not make a foreign-owned Kio object acceptable.
 
 Kio does not judge the owner, ACL or mode of ancestors it did not create,

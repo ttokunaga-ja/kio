@@ -669,7 +669,10 @@ fn ct_cli_011_012_013_lock_and_schema_errors_are_structured() {
     assert_eq!(err["error_code"], "KIO-E-CONFIG-SCHEMA-001");
     fs::write(temp.path().join(".kio/HEAD"), "unborn\n").unwrap();
 
-    fs::write(temp.path().join(".kio/.lock"), "{}").unwrap();
+    let parent = kio_core::private_fs::verify_private_directory(&temp.path().join(".kio")).unwrap();
+    let mut lock = parent.create_private_file(Path::new(".lock")).unwrap();
+    std::io::Write::write_all(&mut lock, b"{}").unwrap();
+    drop(lock);
     fs::write(temp.path().join("a.pdf"), b"a").unwrap();
     let out = kio()
         .args(["snapshot", "create", "-m", "locked", "--json"])
@@ -1035,7 +1038,14 @@ fn write_invalid_commit_type(root: &Path) -> String {
     let bytes = canonical_json_bytes(&commit).unwrap();
     let hash = hash_bytes(&bytes);
     let path = fanout_path(root.join(".kio/objects/commits"), &hash).unwrap();
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, bytes).unwrap();
+    use std::io::Write;
+    let parent =
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(path.parent().unwrap())
+            .unwrap();
+    parent
+        .create_private_file(Path::new(path.file_name().unwrap()))
+        .unwrap()
+        .write_all(&bytes)
+        .unwrap();
     hash
 }

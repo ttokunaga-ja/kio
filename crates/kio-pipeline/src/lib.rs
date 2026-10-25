@@ -9,6 +9,8 @@ pub mod prepare;
 pub mod scan;
 mod store_path;
 pub mod task;
+#[cfg(test)]
+mod test_support;
 pub mod unsupported;
 
 use thiserror::Error;

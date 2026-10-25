@@ -1997,10 +1997,17 @@ fn pc47_at_a_shallow_commit_itself_still_hard_fails() {
         .path()
         .join(".kio/gc/shallowed")
         .join(head.strip_prefix("sha256:").unwrap());
-    fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+    let receipt_parent = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+        receipt_path.parent().unwrap(),
+    )
+    .unwrap();
     let receipt =
         ShallowReceipt::new(head.clone(), tree.clone(), "2026-08-14T00:00:00Z".into()).unwrap();
-    fs::write(receipt_path, receipt.canonical_bytes().unwrap()).unwrap();
+    let mut receipt_file = receipt_parent
+        .create_private_file(Path::new(receipt_path.file_name().unwrap()))
+        .unwrap();
+    std::io::Write::write_all(&mut receipt_file, &receipt.canonical_bytes().unwrap()).unwrap();
+    drop(receipt_file);
     let store = ObjectStore::new(dir.path().join(".kio"));
     fs::remove_file(store.object_path(ObjectKind::Tree, &tree).unwrap()).unwrap();
     let (code, err) = run(

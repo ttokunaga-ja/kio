@@ -51,7 +51,6 @@ unsafe extern "C" {
 
 #[derive(Clone, Copy)]
 pub(crate) enum Scope {
-    PrivateAncestor,
     PrivateParent,
     PrivateLeaf,
     ExecutableAncestor,
@@ -137,7 +136,7 @@ pub(crate) fn verify(file: &File, current_uid: u32, scope: Scope, path: &Path) -
                 Scope::PrivateParent | Scope::PrivateLeaf => {
                     mask & crate::platform::macos::private_acl::ACL_ALL_KNOWN_PERMISSIONS
                 }
-                Scope::PrivateAncestor | Scope::ExecutableAncestor => {
+                Scope::ExecutableAncestor => {
                     mask & crate::platform::macos::private_acl::MUTATE_DIRECTORY
                 }
                 Scope::ExecutableLeaf => mask & MUTATE_FILE,

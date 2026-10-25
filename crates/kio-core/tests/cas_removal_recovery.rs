@@ -34,7 +34,11 @@ fn store(root: &Path, bound: bool) -> ObjectStore {
 fn seed(root: &Path, kind: &str) -> (String, PathBuf) {
     let kio = root.join(".kio");
     for namespace in ["raw", "trees", "commits"] {
-        fs::create_dir_all(kio.join("objects").join(namespace)).unwrap();
+        let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+            &kio.join("objects").join(namespace),
+        )
+        .unwrap();
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     }
     let objects = store(root, false);
     let bytes = b"authorized target plaintext";

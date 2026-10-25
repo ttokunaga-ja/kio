@@ -453,7 +453,8 @@ impl UnreachableObjectInventory {
         }
         let kio = open_optional_dir(&scope, ".kio")?
             .ok_or_else(|| KioError::invalid_usage("current directory is not a Kio scope"))?;
-        if id_file(&kio)? != id_child(&scope, ".kio")? {
+        let kio_identity = id_file(&kio)?;
+        if kio_identity != id_child(&scope, ".kio", &kio_identity)? {
             return Err(corrupt(".kio changed while binding inventory"));
         }
         Ok(Self {
@@ -515,8 +516,9 @@ impl UnreachableObjectInventory {
     }
 
     fn assert_stable(&self) -> Result<()> {
+        let kio_identity = id_file(&self.kio)?;
         if id_file(&self.scope)? != id_path(&self.root)?
-            || id_file(&self.kio)? != id_child(&self.scope, ".kio")?
+            || kio_identity != id_child(&self.scope, ".kio", &kio_identity)?
         {
             return Err(corrupt("public scope changed during inventory"));
         }
@@ -1661,6 +1663,7 @@ fn inspect_regular_observed(
         .read(true)
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let mut file = cap_fs::open(directory, path, &options).map_err(|error| ioerr(error, name))?;
+    crate::private_fs::verify_private_regular_file_handle(&file)?;
     let opened = cap_fs::Metadata::from_file(&file).map_err(|error| ioerr(error, name))?;
     valid_file(&opened, max_bytes)?;
     if !same_file_state(&before, &opened)? {
@@ -1773,7 +1776,14 @@ mod tests {
         let scope_json = root.path().join(".kio/scope.json");
         let replacement = root.path().join(".kio/scope.json.replacement");
         let error = inventory_race(root.path(), move || {
-            fs::write(&replacement, fs::read(&scope_json).unwrap()).unwrap();
+            let directory =
+                crate::store_dir::StoreDirectory::open(scope_json.parent().unwrap()).unwrap();
+            directory
+                .append_private(
+                    Path::new("scope.json.replacement"),
+                    &fs::read(&scope_json).unwrap(),
+                )
+                .unwrap();
             fs::rename(&replacement, &scope_json).unwrap();
         });
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
@@ -1787,7 +1797,9 @@ mod tests {
         let displaced = root.path().join(".kio/objects.displaced");
         let error = inventory_race(root.path(), move || {
             fs::rename(&objects, &displaced).unwrap();
-            fs::create_dir(&objects).unwrap();
+            let directory =
+                crate::store_dir::StoreDirectory::open(objects.parent().unwrap()).unwrap();
+            directory.create_directory(Path::new("objects")).unwrap();
         });
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
     }

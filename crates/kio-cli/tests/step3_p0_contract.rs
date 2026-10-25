@@ -5149,6 +5149,22 @@ fn ct3_evidence_004_missing_chunk_row_requires_retarget() {
     );
 }
 
+fn write_private_shallow_receipt_fixture(kio: &Path, path: &Path, bytes: &[u8]) {
+    let owned = kio_core::store_dir::StoreDirectory::open(kio).unwrap();
+    let retained = owned
+        .create_directory_all(Path::new("gc/shallowed"))
+        .unwrap();
+    let receipts = kio_core::store_dir::StoreDirectory::from_retained(
+        retained,
+        path.parent().unwrap().to_path_buf(),
+    )
+    .unwrap();
+    let mut file = receipts
+        .create_private_file(Path::new(path.file_name().unwrap()))
+        .unwrap();
+    std::io::Write::write_all(&mut file, bytes).unwrap();
+}
+
 #[test]
 fn ct3_evidence_005_shallow_commit_rejects_pointer_and_preserves_tree_controls() {
     let dir = indexed_scope();
@@ -5177,14 +5193,17 @@ fn ct3_evidence_005_shallow_commit_rejects_pointer_and_preserves_tree_controls()
     let receipt_path = kio_dir
         .join("gc/shallowed")
         .join(commit.strip_prefix("sha256:").unwrap());
-    fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
     let receipt = ShallowReceipt::new(
         commit.to_owned(),
         tree.to_owned(),
         "2026-08-14T00:00:00Z".into(),
     )
     .unwrap();
-    fs::write(receipt_path, receipt.canonical_bytes().unwrap()).unwrap();
+    write_private_shallow_receipt_fixture(
+        &kio_dir,
+        &receipt_path,
+        &receipt.canonical_bytes().unwrap(),
+    );
     fs::remove_file(object_path(&kio_dir, "trees", tree)).unwrap();
 
     let mut later_generation_forgery = pointer.clone();
@@ -7164,7 +7183,10 @@ fn o3_batch_resume_takes_the_store_lock() {
     fs::write(dir.path().join("a.md"), "# A\n\n## B\n本文です。\n").unwrap();
     kio(&dir, &["init"]).assert().success();
     // A live (non-stale) lock held by "another process".
-    fs::write(dir.path().join(".kio/.lock"), "{}").unwrap();
+    let parent = kio_core::private_fs::verify_private_directory(&dir.path().join(".kio")).unwrap();
+    let mut lock = parent.create_private_file(Path::new(".lock")).unwrap();
+    std::io::Write::write_all(&mut lock, b"{}").unwrap();
+    drop(lock);
     let err = json_failure(&dir, &["batch", "resume"], 3);
     assert_eq!(err["error_code"], "KIO-E-STORE-LOCKED-001");
 }
@@ -7645,11 +7667,10 @@ fn r9_3_open_expansion_cache_is_owner_only() {
     }
 }
 
-/// R9-3 (reuse path): a cache dir/file left world-readable by an earlier (pre-fix)
-/// build must be re-hardened on the next `open`, not served as-is.
+/// Docs 14: refuse an unsafe owned cache without adopting it or changing its bytes.
 #[cfg(unix)]
 #[test]
-fn r9_3_open_reuse_rehardens_stale_permissions() {
+fn r9_3_open_reuse_refuses_unsafe_permissions_without_repair() {
     use std::os::unix::fs::PermissionsExt;
     let dir = indexed_scope();
     let search = json_success(&dir, &["search", "トークン TTL 3600"]);
@@ -7661,25 +7682,33 @@ fn r9_3_open_reuse_rehardens_stale_permissions() {
     let opened = json_success(&dir, &["open", &uri]);
     let path = std::path::PathBuf::from(opened["path"].as_str().unwrap());
     let leaf = path.parent().unwrap().to_path_buf();
+    let bytes = fs::read(&path).unwrap();
 
-    // Simulate a cache materialized by the pre-fix, world-readable code path.
     fs::set_permissions(&path, fs::Permissions::from_mode(0o444)).unwrap();
     fs::set_permissions(&leaf, fs::Permissions::from_mode(0o755)).unwrap();
-
-    // A second open reuses the cache (M5) and must correct the permissions.
-    let reopened = json_success(&dir, &["open", &uri]);
-    assert_eq!(reopened["path"].as_str().unwrap(), path.to_str().unwrap());
-    let file_mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(
-        file_mode & 0o077,
-        0,
-        "reused cache file must be re-hardened, got {file_mode:o}"
-    );
-    let dir_mode = fs::metadata(&leaf).unwrap().permissions().mode() & 0o777;
-    assert_eq!(
-        dir_mode, 0o700,
-        "reused cache dir must be re-hardened, got {dir_mode:o}"
-    );
+    for expected_directory_mode in [0o755, 0o700] {
+        if expected_directory_mode == 0o700 {
+            // Isolate the unsafe leaf after independently exercising its parent.
+            fs::set_permissions(&leaf, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let output = kio(&dir, &["open", &uri, "--json"])
+            .assert()
+            .code(4)
+            .get_output()
+            .clone();
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error_code"], "KIO-E-PRIVATE-FILE-UNSAFE-001");
+        assert!(output.stdout.is_empty());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o444
+        );
+        assert_eq!(
+            fs::metadata(&leaf).unwrap().permissions().mode() & 0o777,
+            expected_directory_mode
+        );
+    }
 }
 
 /// P10 (deterministic): once a writer moves the source HEAD before a replacement
@@ -11177,7 +11206,14 @@ fn r16_1_missing_commit_object_degrades_reads_and_rejects_writes() {
     }
 
     // (c) restore the commit object → reads are healthy again.
-    fs::write(&commit_path, &commit_bytes).unwrap();
+    use std::io::Write;
+    let parent =
+        kio_core::private_fs::verify_private_directory(commit_path.parent().unwrap()).unwrap();
+    parent
+        .create_private_file(Path::new(commit_path.file_name().unwrap()))
+        .unwrap()
+        .write_all(&commit_bytes)
+        .unwrap();
     let status2 = json_success(&dir, &["status"]);
     assert_eq!(
         status2["head_shallow"], false,
@@ -11238,14 +11274,17 @@ fn r17_1_forged_and_true_shallow_commit_pointers_are_rejected() {
     let receipt_path = kio_dir2
         .join("gc/shallowed")
         .join(commit2.strip_prefix("sha256:").unwrap());
-    fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
     let receipt = ShallowReceipt::new(
         commit2.to_owned(),
         tree2.to_owned(),
         "2026-08-14T00:00:00Z".into(),
     )
     .unwrap();
-    fs::write(receipt_path, receipt.canonical_bytes().unwrap()).unwrap();
+    write_private_shallow_receipt_fixture(
+        &kio_dir2,
+        &receipt_path,
+        &receipt.canonical_bytes().unwrap(),
+    );
     fs::remove_file(object_path(&kio_dir2, "trees", tree2)).unwrap();
     for command in ["view", "open"] {
         let error = json_failure(&dir2, &[command, &pointer2.to_string()], 1);
@@ -11535,14 +11574,17 @@ fn r16_5_diff_with_shallow_side_names_the_side() {
     let receipt_path = kio_dir
         .join("gc/shallowed")
         .join(c1_hash.strip_prefix("sha256:").unwrap());
-    fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
     let receipt = ShallowReceipt::new(
         c1_hash.clone(),
         c1_tree.to_owned(),
         "2026-08-14T00:00:00Z".into(),
     )
     .unwrap();
-    fs::write(receipt_path, receipt.canonical_bytes().unwrap()).unwrap();
+    write_private_shallow_receipt_fixture(
+        &kio_dir,
+        &receipt_path,
+        &receipt.canonical_bytes().unwrap(),
+    );
     fs::remove_file(object_path(&kio_dir, "trees", c1_tree)).unwrap();
 
     // Naming C1 as operand b → COMMIT-SHALLOW, context side="b".

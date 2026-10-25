@@ -147,7 +147,7 @@ impl GcPlanner {
         if id_file(&self.scope)? != r
             || id_file(&self.kio)? != k
             || id_path(&self.root)? != r
-            || id_child(&self.scope, ".kio")? != k
+            || id_child(&self.scope, ".kio", &k)? != k
         {
             Err(corrupt("scope root changed while planning"))
         } else {

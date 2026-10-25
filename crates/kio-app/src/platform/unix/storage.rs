@@ -4,7 +4,7 @@ use std::path::Path;
 use cap_primitives::fs as cap_fs;
 use kio_core::store_dir::StoreDirectory;
 use kio_core::{ExitCode, KioError, Result};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 
 fn same_directory_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
     before.dev() == after.dev() && before.ino() == after.ino()
@@ -64,10 +64,6 @@ pub(crate) fn configure_private_cap_directory(options: &mut cap_fs::DirOptions) 
 }
 
 pub(crate) fn configure_chunk_ledger_open(options: &mut cap_fs::OpenOptions) {
-    crate::platform::configure_cap_no_follow(options);
-}
-
-pub(crate) fn configure_chunk_ledger_temp(options: &mut cap_fs::OpenOptions) {
     use cap_fs::OpenOptionsExt;
     options.mode(0o600);
     crate::platform::configure_cap_no_follow(options);
@@ -132,46 +128,11 @@ pub(crate) fn sync_chunk_ledger_directory(directory: &File, path: &Path) -> Resu
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))
 }
 
-pub(crate) fn configure_owner_only_file(options: &mut fs::OpenOptions) {
-    options.mode(0o600);
-}
-
-pub(crate) fn harden_open_cache_hit(path: &Path) {
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o400));
-}
-
-pub(crate) fn harden_open_cache_subtree(leaf: &Path, root: &Path) {
-    if !leaf.starts_with(root) {
-        return;
-    }
-    let mut current = leaf.to_path_buf();
-    loop {
-        let _ = fs::set_permissions(&current, fs::Permissions::from_mode(0o700));
-        if current == root {
-            break;
-        }
-        match current.parent() {
-            Some(parent) => current = parent.to_path_buf(),
-            None => break,
-        }
-    }
-}
-
 pub(crate) fn validate_cached_cas_links(metadata: &fs::Metadata, path: &Path) -> Result<()> {
     if metadata.nlink() != 1 {
         return Err(crate::index::rebuild::store_corrupt_error(
             path,
             "CAS object has an unexpected hard-link count",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate_exact_cas_links(metadata: &fs::Metadata, path: &Path) -> Result<()> {
-    if metadata.nlink() != 1 {
-        return Err(crate::index::rebuild::store_corrupt_error(
-            path,
-            "content-addressed object has an unexpected hard-link count",
         ));
     }
     Ok(())

@@ -981,12 +981,28 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let temp = tempfile::tempdir().unwrap();
-            let kio_dir = temp.path().join(".kio");
-            fs::create_dir(&kio_dir).unwrap();
-            fs::create_dir_all(kio_dir.join("refs/heads")).unwrap();
-            fs::create_dir_all(kio_dir.join("refs/tags-v1")).unwrap();
-            fs::create_dir_all(kio_dir.join("objects/trees")).unwrap();
-            fs::write(kio_dir.join("HEAD"), b"unborn\n").unwrap();
+            let root = temp.path().canonicalize().unwrap();
+            let external = crate::store_dir::StoreDirectory::open(&root).unwrap();
+            let kio_dir = root.join(".kio");
+            let directory = crate::store_dir::StoreDirectory::from_retained(
+                external
+                    .create_directory(std::path::Path::new(".kio"))
+                    .unwrap(),
+                kio_dir.clone(),
+            )
+            .unwrap();
+            for relative in ["refs/heads", "refs/tags-v1", "objects/trees"] {
+                directory
+                    .create_directory_all(std::path::Path::new(relative))
+                    .unwrap();
+            }
+            directory
+                .write_atomic(
+                    std::path::Path::new("HEAD"),
+                    b"unborn\n",
+                    crate::store_dir::Publication::CreateOnly,
+                )
+                .unwrap();
             let store = ObjectStore::new(&kio_dir);
             Self {
                 _temp: temp,
@@ -1030,10 +1046,18 @@ mod tests {
 
         fn shallow_receipt(&self, commit: String, tree: String) {
             let leaf = commit.strip_prefix("sha256:").unwrap().to_owned();
-            let dir = self.kio_dir.join("gc/shallowed");
-            fs::create_dir_all(&dir).unwrap();
+            let directory = crate::store_dir::StoreDirectory::open(&self.kio_dir).unwrap();
+            directory
+                .create_directory_all(std::path::Path::new("gc/shallowed"))
+                .unwrap();
             let receipt = ShallowReceipt::new(commit, tree, "2026-07-13T00:00:00Z".into()).unwrap();
-            fs::write(dir.join(leaf), receipt.canonical_bytes().unwrap()).unwrap();
+            directory
+                .write_atomic(
+                    &std::path::Path::new("gc/shallowed").join(leaf),
+                    &receipt.canonical_bytes().unwrap(),
+                    crate::store_dir::Publication::CreateOnly,
+                )
+                .unwrap();
         }
     }
 

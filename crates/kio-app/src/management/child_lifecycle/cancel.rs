@@ -745,7 +745,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unsafe_pending_child_refuses_cancellation_without_mutating_lifecycle_artifacts() {
+    fn writable_pending_child_cancels_exact_stage_without_chmod_or_user_data_changes() {
         use std::os::unix::fs::PermissionsExt;
 
         let temp = tempfile::tempdir().unwrap();
@@ -753,7 +753,7 @@ mod tests {
         let operation = interrupted(&parent, "child", true, true);
         let binding = binding_for_repo(&parent).unwrap();
         let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
-        let (journal, bytes) = pending_initializations(&store)
+        let (journal, _) = pending_initializations(&store)
             .unwrap()
             .into_iter()
             .find(|(journal, _)| journal.operation_id == operation)
@@ -761,22 +761,31 @@ mod tests {
         let child_path = parent.canonical_root().join("child");
         fs::set_permissions(&child_path, fs::Permissions::from_mode(0o777)).unwrap();
 
-        assert!(run(&parent, false, Some(&operation)).is_err());
+        run(&parent, false, Some(&operation)).unwrap();
 
         assert!(!store.contains_entry(Path::new(CANCELLATION)).unwrap());
         assert!(
-            store
+            !store
                 .contains_entry(Path::new(&journal.stage_leaf))
                 .unwrap()
         );
+        assert!(pending_initializations(&store).unwrap().is_empty());
         assert_eq!(
-            initialization_directory(&store, false)
-                .unwrap()
-                .unwrap()
-                .read_optional(&operation_leaf(&operation).unwrap(), MAX_JOURNAL)
-                .unwrap(),
-            Some(bytes)
+            fs::metadata(&child_path).unwrap().permissions().mode() & 0o777,
+            0o777
         );
+        assert_eq!(fs::read(child_path.join("user.txt")).unwrap(), b"keep");
+        assert_eq!(
+            directory_identity_from_handle(
+                StoreDirectory::open(&child_path)
+                    .unwrap()
+                    .root_handle()
+                    .as_ref()
+            )
+            .unwrap(),
+            journal.retained_child_identity
+        );
+        kio_core::private_fs::verify_private_directory(parent.kio_dir()).unwrap();
         assert!(!child_path.join(".kio").exists());
         assert!(!child_path.join(CASE_PROBE_LEAF).exists());
         assert!(!child_path.join(".kio-atomic").exists());

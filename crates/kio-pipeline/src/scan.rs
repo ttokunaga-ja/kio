@@ -2184,22 +2184,15 @@ fn probe_case_insensitive(scope_path: &Path) -> bool {
             scope_path.to_path_buf()
         }
     };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    let stem = format!(".kio-caseprobe-{}-{}", std::process::id(), nanos);
-    let lower = dir.join(format!("{stem}-a"));
-    let upper = dir.join(format!("{stem}-A"));
-    if std::fs::write(&lower, b"").is_err() {
+    let Ok(directory) = kio_core::store_dir::StoreDirectory::open(&dir) else {
+        return false;
+    };
+    if dir != scope_path
+        && kio_core::private_fs::verify_private_directory_handle(&directory).is_err()
+    {
         return false;
     }
-    let insensitive = upper.exists();
-    // On an insensitive FS `lower` and `upper` are the same inode, so removing `lower`
-    // clears both; on a sensitive FS `upper` was never created.
-    let _ = std::fs::remove_file(&lower);
-    let _ = std::fs::remove_file(&upper);
-    insensitive
+    probe_bound_case_insensitive(&directory.root_handle())
 }
 
 /// Descriptor-relative equivalent of [`probe_case_insensitive`]. The probe
@@ -2214,14 +2207,28 @@ fn probe_bound_case_insensitive(kio: &File) -> bool {
     let stem = format!(".kio-caseprobe-{}-{nanos}", std::process::id());
     let lower = format!("{stem}-a");
     let upper = format!("{stem}-A");
-    let mut options = cap_fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    if cap_fs::open(kio, Path::new(&lower), &options).is_err() {
+    let Ok(handle) = kio.try_clone() else {
         return false;
+    };
+    let Ok(directory) =
+        kio_core::store_dir::StoreDirectory::from_retained(handle, PathBuf::from(".kio"))
+    else {
+        return false;
+    };
+    let Ok(probe) = directory.create_private_file(Path::new(&lower)) else {
+        return false;
+    };
+    let Ok(created) = cap_fs::Metadata::from_file(&probe) else {
+        return false;
+    };
+    let insensitive = cap_fs::stat(kio, Path::new(&upper), cap_fs::FollowSymlinks::No)
+        .is_ok_and(|metadata| same_cap_file_identity(&created, &metadata));
+    let unchanged = cap_fs::stat(kio, Path::new(&lower), cap_fs::FollowSymlinks::No)
+        .is_ok_and(|metadata| same_cap_file_identity(&created, &metadata));
+    drop(probe);
+    if unchanged {
+        let _ = cap_fs::remove_file(kio, Path::new(&lower));
     }
-    let insensitive = cap_fs::stat(kio, Path::new(&upper), cap_fs::FollowSymlinks::No).is_ok();
-    let _ = cap_fs::remove_file(kio, Path::new(&lower));
-    let _ = cap_fs::remove_file(kio, Path::new(&upper));
     insensitive
 }
 

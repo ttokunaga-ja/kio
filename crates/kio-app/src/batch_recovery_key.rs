@@ -46,6 +46,7 @@ fn load_or_create_at(
 }
 
 fn read_key(parent: &StoreDirectory) -> Result<BatchRecoveryContext> {
+    kio_core::private_fs::verify_private_directory_handle(parent)?;
     let bytes = kio_core::private_fs::read_private_file_at(parent, KEY_LEAF, KEY_BYTES)?;
     let key: [u8; 32] = bytes
         .try_into()

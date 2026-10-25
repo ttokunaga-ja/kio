@@ -69,37 +69,50 @@ pub(crate) fn append_jsonl_rotating_with_control(
     value: &Value,
     retention_days: u32,
 ) -> Result<()> {
-    // CT4-PURGE-008: every current-log append is serialized against purge's
-    // current+rotated scrub. A contended nonblocking lock makes this best-effort
-    // append fail without landing a post-scrub row; existing observability callers
-    // already downgrade log failures so user operations remain unaffected.
-    let _scrub_lock = scrub_lock_path(path)
-        .map(|path| StoreLock::acquire_path_in_session(session, path, control))
+    let directory = crate::cas::private_log_parent(path)?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| KioError::io("log path has no leaf", path.display().to_string()))?;
+    append_jsonl_rotating_at(
+        session,
+        control,
+        &directory,
+        Path::new(leaf),
+        value,
+        retention_days,
+    )
+}
+
+fn append_jsonl_rotating_at(
+    session: &LockSession,
+    control: &crate::control::ControlHandle,
+    directory: &crate::store_dir::StoreDirectory,
+    leaf: &Path,
+    value: &Value,
+    retention_days: u32,
+) -> Result<()> {
+    crate::private_fs::verify_private_directory_handle(directory)?;
+    if directory.contains_entry(leaf)? {
+        directory.ensure_owner_private(leaf)?;
+    }
+    // Locks and all log operations share the originally admitted capability.
+    // An external ancestor rename cannot redirect any part of this lease.
+    let _scrub_lock = scrub_lock_path(leaf)
+        .map(|name| StoreLock::acquire_at_in_session(session, directory, &name, control))
         .transpose()?;
     let today = control
         .now_utc_seconds()
         .get(..10)
         .unwrap_or_default()
         .to_owned();
-    // R22-8: `rotate_stale_log` is a check-then-rename (`!dated.exists()` then `fs::rename`),
-    // which two processes crossing the first append after midnight can both enter. P1 renames
-    // yesterday's live file to the dated name and appends a line to the fresh live file; P2
-    // then renames THAT file over the same dated name, and since `rename(2)` replaces its
-    // destination, yesterday's entire history is unlinked. Hold a per-log lock across the
-    // `exists()` check and the rename so they are one critical section. Only taken on the day
-    // a rotation is actually due — every other append stays lock-free. `acquire_path` never
-    // blocks (a contended lock is an immediate `Err`), so the loser simply skips this
-    // rotation and the next append performs it; the lock is best-effort like the rotation
-    // itself (R12-5/R13-3: a read-only log dir must never kill the command), and only the
-    // final append can fail the caller.
-    if rotation_due(path, &today)
+    if rotation_due_at(directory, leaf, &today)
         && let Ok(_rotate_lock) =
-            StoreLock::acquire_path_in_session(session, rotate_lock_path(path), control)
+            StoreLock::acquire_at_in_session(session, directory, &rotate_lock_path(leaf), control)
     {
-        let _ = rotate_stale_log(path, &today);
+        let _ = rotate_stale_log_at(directory, leaf, &today);
     }
-    let _ = prune_rotated_logs(path, &today, retention_days);
-    append_jsonl(path, value)
+    let _ = prune_rotated_logs_at(directory, leaf, &today, retention_days);
+    crate::cas::append_jsonl_at(directory, leaf, value)
 }
 
 fn scrub_lock_path(path: &Path) -> Option<PathBuf> {
@@ -117,8 +130,17 @@ fn scrub_lock_path(path: &Path) -> Option<PathBuf> {
 /// Cheap pre-check for [`append_jsonl_rotating`]: is the live log's last-written day older
 /// than today? `rotate_stale_log` re-checks this under the lock, so this is only a hint that
 /// keeps the common (same-day) append off the lock path.
-fn rotation_due(path: &Path, today: &str) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
+fn private_log_metadata(
+    directory: &crate::store_dir::StoreDirectory,
+    leaf: &Path,
+) -> Result<std::fs::Metadata> {
+    let file = directory.open_regular_read(leaf, u64::MAX)?;
+    crate::private_fs::verify_private_regular_file_handle(&file)?;
+    file.metadata().kio_io(&directory.path().join(leaf))
+}
+
+fn rotation_due_at(directory: &crate::store_dir::StoreDirectory, leaf: &Path, today: &str) -> bool {
+    let Ok(metadata) = private_log_metadata(directory, leaf) else {
         return false;
     };
     let Ok(modified) = metadata.modified() else {
@@ -137,31 +159,58 @@ fn rotate_lock_path(path: &Path) -> PathBuf {
     path.with_file_name(format!("{stem}.rotate.lock"))
 }
 
+#[cfg(test)]
 pub(super) fn rotate_stale_log(path: &Path, today: &str) -> Result<()> {
-    let Ok(metadata) = fs::metadata(path) else {
-        // No live file yet → nothing to rotate.
+    let directory = crate::cas::private_log_parent(path)?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| KioError::locked("log path has no leaf"))?;
+    rotate_stale_log_at(&directory, Path::new(leaf), today)
+}
+
+fn rotate_stale_log_at(
+    directory: &crate::store_dir::StoreDirectory,
+    leaf: &Path,
+    today: &str,
+) -> Result<()> {
+    let Ok(metadata) = private_log_metadata(directory, leaf) else {
         return Ok(());
     };
-    let modified = metadata.modified().kio_io(path)?;
+    let modified = metadata.modified().kio_io(&directory.path().join(leaf))?;
     let file_date = date_of_system_time(modified);
-    // Same day (or a backwards clock) → keep appending to the live file.
     if file_date.is_empty() || file_date.as_str() >= today {
         return Ok(());
     }
-    let dated = dated_log_path(path, &file_date);
-    // Never clobber an already-rotated dated file (rename is skipped, the live
-    // file keeps growing until the next distinct day — harmless).
-    if !dated.exists() {
-        fs::rename(path, &dated).kio_io(&dated)?;
+    let dated = dated_log_path(leaf, &file_date);
+    if !directory.contains_entry(&dated)? {
+        directory.rename_regular_between_raw(
+            leaf,
+            directory,
+            &dated,
+            crate::store_dir::Publication::CreateOnly,
+        )?;
     }
     Ok(())
 }
 
+#[cfg(test)]
 pub(super) fn prune_rotated_logs(path: &Path, today: &str, retention_days: u32) -> Result<()> {
-    let (Some(stem), Some(ext), Some(parent)) = (
-        path.file_stem().and_then(|s| s.to_str()),
-        path.extension().and_then(|s| s.to_str()),
-        path.parent(),
+    let directory = crate::cas::private_log_parent(path)?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| KioError::locked("log path has no leaf"))?;
+    prune_rotated_logs_at(&directory, Path::new(leaf), today, retention_days)
+}
+
+fn prune_rotated_logs_at(
+    directory: &crate::store_dir::StoreDirectory,
+    leaf: &Path,
+    today: &str,
+    retention_days: u32,
+) -> Result<()> {
+    let (Some(stem), Some(ext)) = (
+        leaf.file_stem().and_then(|s| s.to_str()),
+        leaf.extension().and_then(|s| s.to_str()),
     ) else {
         return Ok(());
     };
@@ -170,10 +219,8 @@ pub(super) fn prune_rotated_logs(path: &Path, today: &str, retention_days: u32) 
     };
     let prefix = format!("{stem}-");
     let suffix = format!(".{ext}");
-    for entry in fs::read_dir(parent).kio_io(parent)? {
-        let entry = entry.kio_io(parent)?;
-        let name = entry.file_name();
-        let Some(name) = name.to_str() else {
+    for entry in directory.entries(Path::new(""))? {
+        let Some(name) = entry.name.to_str() else {
             continue;
         };
         let Some(date) = name
@@ -185,8 +232,12 @@ pub(super) fn prune_rotated_logs(path: &Path, today: &str, retention_days: u32) 
         let Some(file_days) = date_to_days(date) else {
             continue;
         };
-        if today_days - file_days > i64::from(retention_days) {
-            let _ = fs::remove_file(entry.path());
+        if today_days - file_days > i64::from(retention_days)
+            && directory
+                .ensure_owner_private(Path::new(&entry.name))
+                .is_ok()
+        {
+            let _ = directory.remove_file(Path::new(&entry.name));
         }
     }
     Ok(())
@@ -242,6 +293,20 @@ pub fn append_warn_log(code: &str, message: &str, context: Value) -> Result<()> 
     crate::control::ControlHandle::default().append_warn_log(code, message, context)
 }
 
+#[cfg(test)]
+thread_local! {
+    static LOGS_ADMITTED_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn after_logs_admitted() {
+    let hook = LOGS_ADMITTED_HOOK.with(|slot| slot.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
+
 pub(crate) fn append_observation(
     session: &LockSession,
     control: &crate::control::ControlHandle,
@@ -257,10 +322,23 @@ pub(crate) fn append_observation(
     // invocation, but its OWN error would still be logged here first and scatter
     // `./kio/logs/errors.jsonl` under the working directory. Skip silently (logging
     // is best-effort) rather than create it.
-    let log_dir = data_home(control).join("kio/logs");
-    if !log_dir.is_absolute() {
+    let owned_path = data_home(control).join("kio");
+    if !owned_path.is_absolute() {
         return Ok(());
     }
+    // XDG ancestors are external namespace only. The explicit Kio-owned root
+    // must be private before any log child, rotation, or lock is created.
+    let owned = StoreDirectory::open_or_create_directories(&owned_path)?;
+    verify_device_log_root(&owned)?;
+    let log_dir = owned.path().join("logs");
+    let logs = StoreDirectory::from_retained(
+        owned.create_directory_all(Path::new("logs"))?,
+        log_dir.clone(),
+    )?;
+    crate::private_fs::verify_private_directory_handle(&logs)?;
+    verify_device_log_root(&owned)?;
+    #[cfg(test)]
+    after_logs_admitted();
     // N3: honor `redact_logs` (06 §8 / 10 §11.6, default true) before writing. The
     // KioError context routinely carries a `path` (and search/adapter contexts a
     // `query`/`prompt`); writing them verbatim both violates the redaction policy
@@ -282,16 +360,16 @@ pub(crate) fn append_observation(
     } else {
         Value::String(message.to_owned())
     };
-    let path = log_dir.join(file_name);
     // R13-3: the device-global logs (events/errors/metrics) are governed by the
     // device-level `[observability] retention_days` (default 30). Rotation/prune is
     // best-effort inside `append_jsonl_rotating`.
     let retention = read_logs_retention_days(&config_home(control).join("kio/config.toml"))
         .unwrap_or(DEFAULT_LOG_RETENTION_DAYS);
-    append_jsonl_rotating_with_control(
+    append_jsonl_rotating_at(
         session,
         control,
-        &path,
+        &logs,
+        Path::new(file_name),
         &json!({
             "ts": control.now_utc_seconds(),
             "level": level,
@@ -301,7 +379,20 @@ pub(crate) fn append_observation(
             "context": context,
         }),
         retention,
-    )
+    )?;
+    verify_device_log_root(&owned)
+}
+
+fn verify_device_log_root(owned: &StoreDirectory) -> Result<()> {
+    crate::private_fs::verify_private_directory_handle(owned)?;
+    let named = crate::platform::real_directory_identity(owned.path()).kio_io(owned.path())?;
+    if named != crate::platform::directory_handle_identity(&owned.root_handle()) {
+        return Err(KioError::io(
+            "device log root changed during append",
+            owned.path().display().to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Replace every absolute-path-looking token (a whitespace-delimited run) in a
@@ -404,4 +495,182 @@ fn config_home(control: &crate::control::ControlHandle) -> PathBuf {
     crate::xdg::xdg_dir("XDG_CONFIG_HOME")
         .or_else(|| crate::xdg::home_dir_with_control(control).map(|home| home.join(".config")))
         .unwrap_or_else(|| PathBuf::from("."))
+}
+
+#[cfg(all(test, unix))]
+mod owned_root_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn device_logging_refuses_unsafe_owned_root_without_adopting_external_ancestor() {
+        let _lock = crate::test_control::test_env_lock().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let external = temp.path().canonicalize().unwrap();
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o777)).unwrap();
+        let _data = crate::test_control::TestEnvGuard::set("XDG_DATA_HOME", &external);
+        let _config =
+            crate::test_control::TestEnvGuard::set("XDG_CONFIG_HOME", external.join("config"));
+        let control = crate::control::ControlHandle::default();
+        control
+            .append_event_log("TEST", "first", serde_json::json!({}))
+            .unwrap();
+        let root = external.join("kio");
+        let log = root.join("logs/events.jsonl");
+        let bytes = fs::read(&log).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            control
+                .append_event_log("TEST", "second", serde_json::json!({}))
+                .is_err()
+        );
+        assert_eq!(fs::read(&log).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(external).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+    }
+}
+
+#[cfg(test)]
+mod retained_log_root_tests {
+    use super::*;
+    use std::{cell::Cell, collections::BTreeMap, rc::Rc};
+
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        fn visit(root: &Path, relative: &Path, entries: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+            for entry in fs::read_dir(root.join(relative)).unwrap() {
+                let entry = entry.unwrap();
+                let path = relative.join(entry.file_name());
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    entries.insert(path.clone(), None);
+                    visit(root, &path, entries);
+                } else {
+                    assert!(kind.is_file(), "fixture contains an unexpected link");
+                    entries.insert(path, Some(fs::read(entry.path()).unwrap()));
+                }
+            }
+        }
+        let mut entries = BTreeMap::new();
+        visit(root, Path::new(""), &mut entries);
+        entries
+    }
+
+    #[test]
+    fn device_logging_does_not_mutate_private_replacement_after_admission() {
+        let _lock = crate::test_control::test_env_lock().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let external = temp.path().canonicalize().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&external, fs::Permissions::from_mode(0o777)).unwrap();
+        }
+        let _data = crate::test_control::TestEnvGuard::set("XDG_DATA_HOME", &external);
+        let _config =
+            crate::test_control::TestEnvGuard::set("XDG_CONFIG_HOME", external.join("config"));
+        let control = crate::control::ControlHandle::default();
+        control
+            .append_event_log("TREE-A", "first", json!({}))
+            .unwrap();
+        let original = external.join("kio");
+        let replacement = external.join("replacement-kio");
+        let parked = external.join("admitted-kio");
+        let outer = StoreDirectory::open(&external).unwrap();
+        let other = StoreDirectory::from_retained(
+            outer
+                .create_directory(Path::new("replacement-kio"))
+                .unwrap(),
+            replacement.clone(),
+        )
+        .unwrap();
+        other.create_directory_all(Path::new("logs")).unwrap();
+        for (name, bytes) in [
+            ("logs/events.jsonl", b"{\"tree\":\"B\"}\n".as_slice()),
+            (
+                "logs/events-2000-01-01.jsonl",
+                b"old private B record\n".as_slice(),
+            ),
+        ] {
+            other
+                .write_atomic(
+                    Path::new(name),
+                    bytes,
+                    crate::store_dir::Publication::CreateOnly,
+                )
+                .unwrap();
+        }
+        crate::private_fs::verify_private_directory_handle(&other).unwrap();
+        let before = snapshot(&replacement);
+        drop(other);
+        drop(outer);
+        let attempted = Rc::new(Cell::new(false));
+        let swapped = Rc::new(Cell::new(false));
+        let attempted_hook = attempted.clone();
+        let swapped_hook = swapped.clone();
+        let original_hook = original.clone();
+        let replacement_hook = replacement.clone();
+        let parked_hook = parked.clone();
+        LOGS_ADMITTED_HOOK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(Box::new(move || {
+                attempted_hook.set(true);
+                if let Err(error) = fs::rename(&original_hook, &parked_hook) {
+                    #[cfg(not(windows))]
+                    panic!("cannot exercise root replacement: {error}");
+                    #[cfg(windows)]
+                    assert!(
+                        matches!(error.raw_os_error(), Some(5 | 32 | 33)),
+                        "unexpected rename refusal: {error}"
+                    );
+                    #[cfg(windows)]
+                    return;
+                }
+                if let Err(error) = fs::rename(&replacement_hook, &original_hook) {
+                    fs::rename(&parked_hook, &original_hook).unwrap();
+                    #[cfg(not(windows))]
+                    panic!("cannot publish replacement fixture: {error}");
+                    #[cfg(windows)]
+                    assert!(
+                        matches!(error.raw_os_error(), Some(5 | 32 | 33)),
+                        "unexpected rename refusal: {error}"
+                    );
+                    #[cfg(windows)]
+                    return;
+                }
+                swapped_hook.set(true);
+            }));
+        });
+        // A safe refusal or retained-A append is acceptable. A path-only reopen
+        // must never rotate, prune, lock, or append inside private replacement B.
+        let _result = control.append_event_log("TREE-A", "after admission", json!({}));
+        assert!(
+            attempted.get(),
+            "the deterministic admission seam did not execute"
+        );
+        LOGS_ADMITTED_HOOK.with(|slot| assert!(slot.borrow().is_none()));
+        let current_b = if swapped.get() {
+            &original
+        } else {
+            &replacement
+        };
+        assert_eq!(
+            snapshot(current_b),
+            before,
+            "private replacement B was mutated after A was admitted"
+        );
+        if swapped.get() {
+            assert!(parked.is_dir());
+            assert!(
+                fs::read_to_string(parked.join("logs/events.jsonl"))
+                    .unwrap()
+                    .contains("first")
+            );
+        }
+    }
 }

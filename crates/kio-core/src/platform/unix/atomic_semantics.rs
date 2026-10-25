@@ -27,6 +27,11 @@ pub(crate) fn ensure_private_workspace(workspace: &StoreDirectory) -> Result<()>
     Ok(())
 }
 
+/// Remove only Kio's own private publication staging leaf.
+pub(crate) fn remove_publication_residue(workspace: &StoreDirectory, name: &Path) -> Result<()> {
+    workspace.remove_file(name)
+}
+
 pub(crate) fn atomic_file_identity(file: &File) -> Result<FileSystemIdentity> {
     let metadata = file
         .metadata()

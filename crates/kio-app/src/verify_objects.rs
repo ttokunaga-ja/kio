@@ -2752,7 +2752,7 @@ mod tests {
 
     #[test]
     fn verified_pipeline_units_charge_both_inspection_and_body_reads() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::PrivateTempDir::new();
         let (_, _, manifest, unit) = pinned_fixture(dir.path());
         let bytes = canonical_json_bytes(&serde_json::to_value(&unit).unwrap()).unwrap();
         let expected = 2 * bytes.len() as u64;
@@ -2890,7 +2890,7 @@ mod tests {
 
     #[test]
     fn pinned_normalized_closure_uses_immutable_cas_and_rejects_tamper_or_wrong_tuple() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::PrivateTempDir::new();
         let (raw_hash, normalize, manifest, _unit) = pinned_fixture(dir.path());
         let store = ObjectStore::new(dir.path());
         let mut state = State::default();
@@ -2914,7 +2914,7 @@ mod tests {
 
         // A validly hashed unit object carrying a different tuple is equally
         // invalid: CAS integrity alone must not retarget a tree reference.
-        let second = tempfile::tempdir().unwrap();
+        let second = crate::test_support::PrivateTempDir::new();
         let (raw_hash, mut normalize, mut manifest, mut unit) = pinned_fixture(second.path());
         unit.raw_hash = hash('9');
         let store = ObjectStore::new(second.path());
@@ -3497,7 +3497,7 @@ mod tests {
     fn raw_substitution_only_applies_when_prepared_slot_is_absent() {
         let dir = tempfile::tempdir().unwrap();
         let kio_dir = dir.path().join(".kio");
-        std::fs::create_dir(&kio_dir).unwrap();
+        crate::test_support::create_private_test_directory(&kio_dir);
         let store = ObjectStore::new(&kio_dir);
         let hash = store.write_raw(b"direct prepared bytes").unwrap();
         assert_eq!(verify_prepared_reference(&store, &hash, true).unwrap(), 0);
@@ -3508,7 +3508,8 @@ mod tests {
             .join(&digest[..2])
             .join(&digest[2..4])
             .join(digest);
-        std::fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
+        crate::test_support::create_private_test_directory(corrupt.parent().unwrap());
+        drop(crate::test_support::create_private_test_file(&corrupt));
         std::fs::write(&corrupt, b"corrupt prepared bytes").unwrap();
         assert!(verify_prepared_reference(&store, &hash, true).is_err());
     }
@@ -3534,7 +3535,7 @@ mod tests {
         let repo = Repository::init(dir.path()).unwrap();
         let name = "future\u{0378}";
         let names = names_jsonl_path(repo.kio_dir());
-        std::fs::create_dir_all(names.parent().unwrap()).unwrap();
+        drop(crate::test_support::create_private_test_file(&names));
         let row = json!({
             "digest64": portable_tag_digest64(name),
             "logical_name": name,
@@ -3562,7 +3563,7 @@ mod tests {
             .kio_dir()
             .join("refs/tags-v1")
             .join(kio_core::portable::portable_tag_leaf("Release"));
-        std::fs::create_dir_all(tag.parent().unwrap()).unwrap();
+        drop(crate::test_support::create_private_test_file(&tag));
         std::fs::write(&tag, hash('f')).unwrap();
 
         let report = verify_objects(&repo).unwrap();

@@ -41,9 +41,6 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -425,11 +422,9 @@ pub(crate) fn record_quarantine_candidates(
             Some((path, method))
         })
         .collect::<BTreeSet<_>>();
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
+    let directory = kio_core::store_dir::StoreDirectory::open(repo.kio_dir())?;
+    kio_core::private_fs::verify_private_directory_handle(&directory)?;
+    directory.append_private(Path::new("quarantine.jsonl"), &[])?;
     for candidate in &preview.candidates {
         let profile =
             match active_local_ocr_execution_with_control(adapter_settings, repo.control())
@@ -486,17 +481,25 @@ pub(crate) fn record_quarantine_candidates(
         let mut line = serde_json::to_string(&record)
             .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
         line.push('\n');
-        file.write_all(line.as_bytes())
-            .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
+        directory.append_private(Path::new("quarantine.jsonl"), line.as_bytes())?;
     }
     Ok(())
 }
 
 fn read_quarantine_records(repo: &Repository) -> Result<Vec<Value>> {
     let path = repo.kio_dir().join("quarantine.jsonl");
-    let Ok(text) = fs::read_to_string(&path) else {
+    let directory = kio_core::store_dir::StoreDirectory::open(repo.kio_dir())?;
+    kio_core::private_fs::verify_private_directory_handle(&directory)?;
+    if !directory.contains_entry(Path::new("quarantine.jsonl"))? {
         return Ok(Vec::new());
-    };
+    }
+    let bytes = kio_core::private_fs::read_private_file_at(
+        &directory,
+        "quarantine.jsonl",
+        16 * 1024 * 1024,
+    )?;
+    let text = String::from_utf8(bytes)
+        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
     Ok(text
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())

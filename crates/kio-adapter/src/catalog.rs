@@ -190,14 +190,14 @@ pub fn local_ocr_markdownize_adapter(
     settings: &AdapterRuntimeSettings,
     execution: LocalOcrExecution,
     scope_id: &str,
-    kio_dir: &Path,
+    image_store: &kio_core::cas::ImageStore,
     verified_raw_bytes: &[u8],
 ) -> Result<Box<dyn MarkdownizeAdapter>> {
     local_ocr_markdownize_adapter_with_control(
         settings,
         execution,
         scope_id,
-        kio_dir,
+        image_store,
         verified_raw_bytes,
         &ControlHandle::default(),
     )
@@ -207,7 +207,7 @@ pub fn local_ocr_markdownize_adapter_with_control(
     settings: &AdapterRuntimeSettings,
     execution: LocalOcrExecution,
     scope_id: &str,
-    kio_dir: &Path,
+    image_store: &kio_core::cas::ImageStore,
     verified_raw_bytes: &[u8],
     _control: &ControlHandle,
 ) -> Result<Box<dyn MarkdownizeAdapter>> {
@@ -218,7 +218,7 @@ pub fn local_ocr_markdownize_adapter_with_control(
             LocalOcrExecution::Mock,
             scope_id,
         )
-        .into_boxed(kio_dir, verified_raw_bytes),
+        .into_boxed(image_store, verified_raw_bytes),
         LocalOcrExecution::Real => {
             let declared = settings.declared_adapter("markdown").ok_or_else(|| {
                 AdapterError::ConfigSchema(
@@ -244,7 +244,7 @@ pub fn local_ocr_markdownize_adapter_with_control(
                 LocalOcrExecution::Real,
                 scope_id,
             )
-            .into_boxed(kio_dir, verified_raw_bytes)
+            .into_boxed(image_store, verified_raw_bytes)
         }
     };
     Ok(adapter)
@@ -266,7 +266,7 @@ pub fn adopted_embedding_profile() -> AdapterProfile {
 
 pub struct StandardOnlineMarkdownizeRequest<'a> {
     pub scope_id: &'a str,
-    pub kio_dir: &'a Path,
+    pub image_store: kio_core::cas::ImageStore,
     pub raw_hash: &'a str,
     pub path: &'a Path,
     pub media_type: &'a str,
@@ -477,7 +477,7 @@ pub fn run_standard_online_markdownize_with_bytes_with_control(
             };
             let model_pin = client.resolve_model_pin("mistral-ocr-latest")?;
             let adapter = MistralOcrMarkdownizeAdapter::new(client, model_pin, request.scope_id)
-                .with_image_store(request.kio_dir)
+                .with_image_store(request.image_store.clone())
                 .with_bbox_annotation(request.bbox_annotation_enabled)
                 .with_verified_raw_bytes(send_bytes.to_vec());
             let profile = adapter.profile();
@@ -546,7 +546,7 @@ pub fn run_standard_online_markdownize_with_bytes_with_control(
             };
             let model_pin = client.resolve_model_pin("mistral-ocr-latest")?;
             let adapter = MistralOcrMarkdownizeAdapter::new(client, model_pin, request.scope_id)
-                .with_image_store(request.kio_dir)
+                .with_image_store(request.image_store.clone())
                 .with_bbox_annotation(request.bbox_annotation_enabled)
                 .with_verified_raw_bytes(send_bytes.to_vec())
                 .with_provider_idempotency(ProviderIdempotency::HttpHeader(
@@ -577,7 +577,7 @@ pub fn run_standard_online_markdownize_with_bytes_with_control(
     let configured_model = declared_markdown_model(&settings)?;
     let model_pin = client.resolve_model_pin(&configured_model)?;
     let adapter = MistralOcrMarkdownizeAdapter::new(client, model_pin, request.scope_id)
-        .with_image_store(request.kio_dir)
+        .with_image_store(request.image_store.clone())
         .with_bbox_annotation(request.bbox_annotation_enabled)
         .with_verified_raw_bytes(send_bytes.to_vec());
     let profile = adapter.profile();
@@ -1782,7 +1782,12 @@ mod tests {
     #[test]
     fn standard_online_markdownize_mock_runs() {
         let _env_lock = kio_core::test_control::test_env_lock().lock().unwrap();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let kio_dir = temp.path().join(".kio");
+        kio_core::store_dir::StoreDirectory::open(temp.path())
+            .unwrap()
+            .create_directory(std::path::Path::new(".kio"))
+            .unwrap();
         let input = temp.path().join("input.pdf");
         let input_bytes = b"%PDF mock";
         std::fs::write(&input, input_bytes).unwrap();
@@ -1796,7 +1801,12 @@ mod tests {
                 Arc::new(AdapterRuntimeSettings::default()),
                 StandardOnlineMarkdownizeRequest {
                     scope_id: "01H00000000000000000000000",
-                    kio_dir: temp.path(),
+                    image_store: kio_core::cas::ImageStore::from_bound_kio(
+                        &kio_core::store_dir::StoreDirectory::open(&kio_dir)
+                            .unwrap()
+                            .root_handle(),
+                    )
+                    .unwrap(),
                     raw_hash: &input_hash,
                     path: &input,
                     media_type: "application/pdf",
@@ -1833,7 +1843,12 @@ mod tests {
                 Arc::new(AdapterRuntimeSettings::default()),
                 StandardOnlineMarkdownizeRequest {
                     scope_id: "01H00000000000000000000000",
-                    kio_dir: temp.path(),
+                    image_store: kio_core::cas::ImageStore::from_bound_kio(
+                        &kio_core::store_dir::StoreDirectory::open(&kio_dir)
+                            .unwrap()
+                            .root_handle(),
+                    )
+                    .unwrap(),
                     raw_hash: &input_hash,
                     path: &input,
                     media_type: "application/pdf",
@@ -1861,7 +1876,12 @@ mod tests {
     #[test]
     fn ct4_bbox_003_and_006_catalog_mock_persists_profile_metadata_and_search_text() {
         let _env_lock = kio_core::test_control::test_env_lock().lock().unwrap();
-        let temp = tempfile::tempdir().unwrap();
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let kio_dir = temp.path().join(".kio");
+        kio_core::store_dir::StoreDirectory::open(temp.path())
+            .unwrap()
+            .create_directory(std::path::Path::new(".kio"))
+            .unwrap();
         let input = temp.path().join("chart.pdf");
         let input_bytes = b"%PDF bbox mock";
         std::fs::write(&input, input_bytes).unwrap();
@@ -1875,7 +1895,12 @@ mod tests {
                 Arc::new(AdapterRuntimeSettings::default()),
                 StandardOnlineMarkdownizeRequest {
                     scope_id: "01H00000000000000000000000",
-                    kio_dir: temp.path(),
+                    image_store: kio_core::cas::ImageStore::from_bound_kio(
+                        &kio_core::store_dir::StoreDirectory::open(&kio_dir)
+                            .unwrap()
+                            .root_handle(),
+                    )
+                    .unwrap(),
                     raw_hash: &input_hash,
                     path: &input,
                     media_type: "application/pdf",
@@ -1909,7 +1934,7 @@ mod tests {
             unit.metadata["bbox_annotations"][0]["transcribed_text"],
             "Kio bbox label page\\:1 value 1000"
         );
-        let images = temp.path().join("objects/image");
+        let images = kio_dir.join("objects/image");
         assert!(
             images.exists(),
             "mock image bytes remain persisted in image CAS"

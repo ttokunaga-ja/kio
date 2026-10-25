@@ -191,6 +191,20 @@ pub(crate) fn bind_source_index(
             handle,
         )
     };
+    for (handle, label) in [
+        (&root_handle, parent.parent().unwrap_or(parent)),
+        (&parent_handle, parent),
+    ] {
+        let retained = kio_core::store_dir::StoreDirectory::from_retained(
+            handle
+                .try_clone()
+                .map_err(|error| IndexError::Schema(error.to_string()))?,
+            label.to_path_buf(),
+        )
+        .map_err(|error| IndexError::Schema(error.to_string()))?;
+        kio_core::private_fs::verify_private_directory_handle(&retained)
+            .map_err(|error| IndexError::Schema(error.to_string()))?;
+    }
     let before = parent_handle.metadata().map_err(|e| {
         IndexError::Schema(format!(
             "inspect opened source index parent {}: {e}",
@@ -221,11 +235,30 @@ pub(crate) fn bind_source_index(
     use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
     options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
 
-    if create_missing && before_leaf.is_none() {
-        options.create_new(true);
-    }
-    let file = cap_fs::open(&parent_handle, Path::new(leaf), &options)
-        .map_err(|e| IndexError::Schema(format!("inspect source index {}: {e}", path.display())))?;
+    let file = if create_missing && before_leaf.is_none() {
+        let retained = kio_core::store_dir::StoreDirectory::from_retained(
+            parent_handle
+                .try_clone()
+                .map_err(|error| IndexError::Schema(error.to_string()))?,
+            parent.to_path_buf(),
+        )
+        .map_err(|error| IndexError::Schema(error.to_string()))?;
+        let created = retained
+            .create_private_file(Path::new(leaf))
+            .map_err(|error| IndexError::Schema(error.to_string()))?;
+        let pinned = cap_fs::open(&parent_handle, Path::new(leaf), &options)
+            .map_err(|error| IndexError::Schema(error.to_string()))?;
+        if source_file_identity(&created)? != source_file_identity(&pinned)? {
+            return Err(IndexError::Schema(
+                "private source index changed after creation".to_owned(),
+            ));
+        }
+        pinned
+    } else {
+        cap_fs::open(&parent_handle, Path::new(leaf), &options).map_err(|e| {
+            IndexError::Schema(format!("inspect source index {}: {e}", path.display()))
+        })?
+    };
     validate_bound_source_file(&file, &path)?;
     if let Some(before_leaf) = before_leaf
         && source_file_identity(&file)? != before_leaf
@@ -339,6 +372,8 @@ pub(crate) fn sync_bound_gc_directory(directory: &std::fs::File, context: &str) 
 }
 
 pub(crate) fn validate_bound_source_file(file: &std::fs::File, path: &Path) -> Result<()> {
+    kio_core::private_fs::verify_private_regular_file_handle(file)
+        .map_err(|error| IndexError::Schema(error.to_string()))?;
     let metadata = file.metadata().map_err(|e| {
         IndexError::Schema(format!(
             "inspect opened source index {}: {e}",
@@ -377,6 +412,15 @@ pub(crate) fn bind_gc_source_leaf(
     leaf: &str,
     writable: bool,
 ) -> Result<Option<BoundSourceIndex>> {
+    let directory = kio_core::store_dir::StoreDirectory::from_retained(
+        parent
+            .try_clone()
+            .map_err(|error| IndexError::Schema(error.to_string()))?,
+        PathBuf::from(leaf),
+    )
+    .map_err(|error| IndexError::Schema(error.to_string()))?;
+    kio_core::private_fs::verify_private_directory_handle(&directory)
+        .map_err(|error| IndexError::Schema(error.to_string()))?;
     let root = parent
         .try_clone()
         .map_err(|e| IndexError::Schema(format!("retain GC index capability: {e}")))?;

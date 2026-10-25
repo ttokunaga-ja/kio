@@ -1,8 +1,6 @@
 use crate::index::rebuild::store_corrupt_error;
 use crate::ledger_access::ledger_snapshot_to_kio;
 use crate::open_view::cas_object_path;
-use crate::open_view::existing_cas_object_path;
-use crate::platform;
 use kio_adapter::catalog::convert_office_to_pdf_with_control;
 use kio_adapter::office_convert::is_office_media;
 use kio_core::ExitCode;
@@ -23,39 +21,31 @@ use kio_pipeline::prepare::pdf_text_pages_bounded;
 use kio_pipeline::task::normalized_task_output_ref;
 use serde_json::json;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Read;
-use std::io::Write;
 use std::path::Path;
-use std::process;
 
+/// Publish mutable Kio-owned metadata through its retained private directory.
+/// Every caller targets tool-lock.json or promotion-state.json inside `.kio`.
+/// Existing unsafe metadata is refused rather than replaced to repair access.
 pub(crate) fn atomic_overwrite_file(path: &Path, bytes: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| KioError::io("path has no parent", path.display().to_string()))?;
-    fs::create_dir_all(parent)
-        .map_err(|err| KioError::io(err.to_string(), parent.display().to_string()))?;
-    let name = path
+    let leaf = path
         .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("file");
-    let tmp = parent.join(format!(
-        ".{name}.tmp-{}-{}",
-        process::id(),
-        new_ulid(parent)
-    ));
-    let result = (|| -> std::io::Result<()> {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        fs::rename(&tmp, path)?;
-        Ok(())
-    })();
-    if let Err(err) = result {
-        let _ = fs::remove_file(&tmp);
-        return Err(KioError::io(err.to_string(), path.display().to_string()));
+        .ok_or_else(|| KioError::io("path has no leaf", path.display().to_string()))?;
+    // The store must already exist. Do not recreate a disappeared .kio or
+    // traverse a replaced name to initialize new metadata there.
+    let directory = kio_core::store_dir::StoreDirectory::open(parent)?;
+    kio_core::private_fs::verify_private_directory_handle(&directory)?;
+    if directory.contains_entry(Path::new(leaf))? {
+        directory.ensure_owner_private(Path::new(leaf))?;
     }
-    Ok(())
+    directory.write_atomic(
+        Path::new(leaf),
+        bytes,
+        kio_core::store_dir::Publication::Upsert,
+    )?;
+    crate::platform::verify_private_state_named_identity(&directory, parent)
 }
 
 pub(crate) fn copy_normalized_instance_gen(
@@ -146,187 +136,22 @@ pub(crate) fn search_to_kio(error: kio_search::SearchError) -> KioError {
     }
 }
 
-/// Q2: crash-atomic write of a derived CAS byte object (prepared / image). Writes
-/// to a uniquely-named temp file in the destination directory, fsyncs it, then
-/// renames into place, so a crash / ENOSPC mid-write can never leave a partial
-/// file under the final `sha256:` name. `cas::atomic_write` is `pub(crate)` and
-/// unreachable from here, so this mirrors it locally. The caller keeps its
-/// `if !path.exists()` dedup skip before calling this.
-fn ensure_contained_directory_chain(kio_dir: &Path, target: &Path) -> Result<()> {
-    let canonical_kio = kio_dir
-        .canonicalize()
-        .map_err(|error| KioError::io(error.to_string(), kio_dir.display().to_string()))?;
-    let relative = target
-        .strip_prefix(kio_dir)
-        .map_err(|_| KioError::schema("derived object directory escapes the repository store"))?;
-    let mut current = kio_dir.to_path_buf();
-    for component in relative.components() {
-        let std::path::Component::Normal(component) = component else {
-            return Err(KioError::schema(
-                "derived object directory contains a non-local path component",
-            ));
-        };
-        current.push(component);
-        match fs::symlink_metadata(&current) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => {
-                return Err(store_corrupt_error(
-                    &current,
-                    "derived object ancestor is not a real directory",
-                ));
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => fs::create_dir(&current)
-                .map_err(|error| KioError::io(error.to_string(), current.display().to_string()))?,
-            Err(error) => {
-                return Err(KioError::io(
-                    error.to_string(),
-                    current.display().to_string(),
-                ));
-            }
-        }
-        let canonical = current
-            .canonicalize()
-            .map_err(|error| KioError::io(error.to_string(), current.display().to_string()))?;
-        if !canonical.starts_with(&canonical_kio) {
-            return Err(store_corrupt_error(
-                &current,
-                "derived object ancestor resolves outside the repository store",
-            ));
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn atomic_write_cas_object(kio_dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let parent = path
-        .parent()
-        .ok_or_else(|| KioError::io("path has no parent", path.display().to_string()))?;
-    ensure_contained_directory_chain(kio_dir, parent)?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let temp = parent.join(format!(".tmp-{}-{}-{}", process::id(), nanos, seq));
-    match fs::symlink_metadata(path) {
-        Ok(_) => return verify_exact_cas_object(path, bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
-    }
-    let result = (|| -> Result<()> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        platform::configure_owner_only_file(&mut options);
-        let mut file = options
-            .open(&temp)
-            .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
-        file.write_all(bytes)
-            .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
-        file.sync_all()
-            .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
-        drop(file);
-        let mut permissions = fs::metadata(&temp)
-            .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?
-            .permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&temp, permissions)
-            .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
-        match fs::hard_link(&temp, path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                verify_exact_cas_object(path, bytes)?;
-            }
-            Err(error) => {
-                return Err(KioError::io(error.to_string(), path.display().to_string()));
-            }
-        }
-        fs::remove_file(&temp)
-            .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
-        verify_exact_cas_object(path, bytes)
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
-}
-
-fn verify_exact_cas_object(path: &Path, expected: &[u8]) -> Result<()> {
-    let metadata = fs::symlink_metadata(path)
-        .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
-    if !metadata.file_type().is_file() || metadata.len() != expected.len() as u64 {
-        return Err(store_corrupt_error(
-            path,
-            "content-addressed object is not the expected regular file",
-        ));
-    }
-    platform::validate_exact_cas_links(&metadata, path)?;
-    let mut file = fs::File::open(path)
-        .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
-    let opened = file
-        .metadata()
-        .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
-    if !opened.is_file() || opened.len() != expected.len() as u64 {
-        return Err(store_corrupt_error(
-            path,
-            "content-addressed object changed while it was verified",
-        ));
-    }
-    let mut actual = Vec::with_capacity(expected.len());
-    (&mut file)
-        .take((expected.len() as u64).saturating_add(1))
-        .read_to_end(&mut actual)
-        .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
-    if actual != expected || hash_bytes(&actual) != hash_bytes(expected) {
-        return Err(store_corrupt_error(
-            path,
-            "content-addressed object bytes do not match their identity",
-        ));
-    }
-    Ok(())
-}
-
-fn verify_existing_cas_object(
-    kio_dir: &Path,
-    subdir: &str,
-    hash: &str,
-    bytes: &[u8],
-) -> Result<bool> {
-    if let Some(path) = existing_cas_object_path(kio_dir, subdir, hash)? {
-        let parent = path
-            .parent()
-            .ok_or_else(|| KioError::io("path has no parent", path.display().to_string()))?;
-        ensure_contained_directory_chain(kio_dir, parent)?;
-        verify_exact_cas_object(&path, bytes)?;
-        Ok(true)
-    } else {
-        Ok(false)
-    }
-}
-
+/// Publish derived bytes through the shared private CAS boundary, retaining
+/// the declared content identity before any storage mutation.
 pub(crate) fn write_canonical_cas_object_or_reuse(
     kio_dir: &Path,
-    subdir: &str,
+    kind: ContentObjectKind,
     hash: &str,
     bytes: &[u8],
 ) -> Result<()> {
-    if verify_existing_cas_object(kio_dir, subdir, hash, bytes)? {
-        return Ok(());
+    let path = kio_core::cas::fanout_path(kio_dir.join("objects").join(kind.directory()), hash)?;
+    if hash_bytes(bytes) != hash {
+        return Err(store_corrupt_error(
+            &path,
+            "content-addressed object bytes do not match the declared hash",
+        ));
     }
-
-    // Close the preflight/publication window as far as possible before entering the
-    // atomic canonical writer. Its own create-new publication handles a canonical
-    // race, which is re-verified below.
-    if verify_existing_cas_object(kio_dir, subdir, hash, bytes)? {
-        return Ok(());
-    }
-
-    let canonical = cas_object_path(kio_dir, subdir, hash)?;
-    atomic_write_cas_object(kio_dir, &canonical, bytes)?;
-    if !verify_existing_cas_object(kio_dir, subdir, hash, bytes)? {
-        return Err(KioError::not_found(hash));
-    }
+    kio_core::cas::ObjectStore::new(kio_dir).write_content_object(kind, bytes)?;
     Ok(())
 }
 
@@ -411,7 +236,7 @@ pub(crate) fn write_prepared_objects(
         }
         write_canonical_cas_object_or_reuse(
             repo.kio_dir(),
-            "prepared",
+            ContentObjectKind::Prepared,
             prepared_hash,
             object_bytes,
         )?;

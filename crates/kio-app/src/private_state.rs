@@ -139,6 +139,7 @@ fn retained_private_directory(
         kio_core::private_fs::verify_private_directory_handle(&child)?;
         directory = child;
     }
+    kio_core::private_fs::verify_private_directory_handle(&directory)?;
     Ok(Some((directory, final_created)))
 }
 
@@ -381,6 +382,55 @@ mod tests {
     }
 
     #[test]
+    fn st01_private_state_accepts_external_writable_parent_without_repair() {
+        let root = private_tempdir();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let path = root.path().join("state");
+        let control = ControlHandle::default();
+        let state = super::open_or_create(&path, b"st01-lock", &control).unwrap();
+        assert_eq!(
+            fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(path.join(".lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        drop(state);
+        assert!(
+            open_existing(&path, b"st01-lock", &control)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+    }
+
+    #[test]
+    fn st01_private_state_rejects_unsafe_own_directory_without_repair() {
+        let root = private_tempdir();
+        let path = root.path().join("state");
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(super::open_or_create(&path, b"st01-lock", &ControlHandle::default()).is_err());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert!(!path.join(".lock").exists());
+    }
+
+    #[test]
     fn inherited_root_remains_bound_after_fd_replacement_and_path_rename() {
         let original = private_tempdir();
         let replacement = private_tempdir();
@@ -499,14 +549,25 @@ mod tests {
     }
 
     #[test]
-    fn inherited_public_root_is_rejected_before_store_creation() {
+    fn inherited_external_public_root_allows_private_store_creation() {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755)).unwrap();
         let handle = File::open(root.path()).unwrap();
         let inherited = inherited_path(&handle, "state");
 
-        assert!(kio_core::private_fs::resolve_inherited_private_root(&inherited).is_err());
-        assert!(super::open_or_create(&inherited, b"lock", &ControlHandle::default()).is_err());
-        assert!(!root.path().join("state").exists());
+        let state = super::open_or_create(&inherited, b"lock", &ControlHandle::default()).unwrap();
+        assert_eq!(
+            fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
+        assert_eq!(
+            fs::metadata(root.path().join("state"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        drop(state);
     }
 }

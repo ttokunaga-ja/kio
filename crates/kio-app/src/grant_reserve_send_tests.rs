@@ -72,7 +72,15 @@ fn run(change: Change, test_name: &str) {
         fs::write(root.path().join(path), png).unwrap();
     }
     assert!(kio_pipeline::scan::classify_secret("api_secret.png").is_some());
-    crate::execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+    crate::execute(
+        &context,
+        CommandRequest::Init(InitArgs {
+            path: None,
+            independent: false,
+            yes: false,
+        }),
+    )
+    .unwrap();
     // Offline ingest creates immutable native ownership, rather than test rows.
     crate::execute(&context, CommandRequest::Index(index_args(false))).unwrap();
     let base_control = ControlHandle::new(DebugTestControl::from_env());
@@ -183,7 +191,9 @@ fn run(change: Change, test_name: &str) {
             CommandRequest::Index(index_args(true)),
         )
     });
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Native Windows may spend longer opening the fixture before reservation.
+    // Keep a bounded arrival wait; the dispatch assertions remain unchanged.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !ready.exists() && !worker.is_finished() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }

@@ -81,12 +81,9 @@ use sha2::Digest;
 use sha2::Sha256;
 use std::collections::BTreeSet;
 use std::fs;
-use std::fs::OpenOptions;
 use std::io::Read;
-use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
-use std::process;
 
 pub(crate) fn run_open(ctx: &Invocation<'_>, args: PointerArgs) -> Result<CommandResponse> {
     let raw = read_pointer_input(ctx, args.pointer.into_iter().collect())?;
@@ -1311,49 +1308,23 @@ pub(crate) fn open_cas_byte_object(
     // P9 (06 §1.1): the read-only expansion cache belongs under $XDG_CACHE_HOME
     // (regenerable, safe to purge), not $XDG_DATA_HOME (durable truth/state).
     let cache = open_cache_path(subdir, basename, hash, control);
-    // M5/PA08 (06 §1.1 L150): the open cache is idempotent. A prior open
-    // already materialized this object read-only; a second open must reuse
-    // it, not `fs::copy` onto a read-only destination (EACCES). But reuse is
-    // never based on existence alone — the cache leaf's OWN content sha256
-    // is re-verified against the dir key (`hash`) on EVERY reuse, not just at
-    // first materialization (an externally-modified or torn-write cache leaf
-    // must never be served as authentic Evidence). A mismatch fails closed
-    // (`KIO-E-STORE-CORRUPT-001`, exit 4) WITHOUT touching the existing cache
-    // file — recovery is the user deleting the cache themselves.
-    if cache.is_file() {
-        verify_bounded_cas_object(&cache, hash, MAX_RAW_OBJECT_BYTES)?;
-        // R9-3: a cache dir/file materialized by an earlier (world-readable) build
-        // is corrected in place on reuse — harden the subtree to 0700 and the file
-        // to 0400 so document bytes written before this fix stop leaking to
-        // group/other on a multi-user host.
-        if let Some(parent) = cache.parent() {
-            harden_open_cache_subtree(parent, control);
-        }
-        platform::harden_open_cache_hit(&cache);
+    let directory = cache_directory(&cache, control, true)?
+        .ok_or_else(|| KioError::invalid_usage("cache directory disappeared"))?;
+    let leaf = cache
+        .file_name()
+        .ok_or_else(|| KioError::invalid_usage("cache has no leaf"))?;
+    if let Some(existing) = read_private_cache(&directory, Path::new(leaf), MAX_RAW_OBJECT_BYTES)? {
+        verify_cache_bytes(&cache, &existing, hash)?;
         return Ok(Some((cache, true)));
     }
-    // Q2: prepared / image CAS objects were historically written non-atomically
-    // (`fs::write` straight to the final path), so a crash / ENOSPC could leave a
-    // partial file under a correct `sha256:` name that `if !path.exists()` then
-    // adopts forever. Verify the object's bytes hash to their filename before
-    // serving — mirroring `ObjectStore::read_by_hash` (cas.rs) — so a torn /
-    // corrupt object is rejected as STORE-CORRUPT instead of returned as authentic
-    // evidence. The immutable object is verified once here at first
-    // materialization; the read-only open cache is reused as-is thereafter (M5).
-    if let Some(parent) = cache.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| KioError::io(err.to_string(), parent.display().to_string()))?;
-        // R9-3: the open/view expansion cache holds document bytes / images /
-        // pre-OCR raw data, so — like the CAS it mirrors (P2, 0600) — its whole
-        // `$XDG_CACHE_HOME/kio` subtree must be owner-only (0700), not the umask
-        // default (0755, world-readable).
-        harden_open_cache_subtree(parent, control);
+    // Publish only into an absent name; a concurrent winner must independently
+    // pass protection and content verification before its path can be returned.
+    if let Err(error) = directory.write_atomic_readonly(Path::new(leaf), &bytes) {
+        let existing =
+            read_private_cache(&directory, Path::new(leaf), MAX_RAW_OBJECT_BYTES)?.ok_or(error)?;
+        verify_cache_bytes(&cache, &existing, hash)?;
     }
-    // R10-6: write the cache file atomically (temp in the same dir -> fsync -> 0400
-    // -> rename) so a crash / ENOSPC / SIGKILL mid-write can never leave a torn
-    // partial under the final cache name that the M5 cache-hit path (which does NOT
-    // re-verify bytes) would later serve as authentic Evidence.
-    write_open_cache_atomic(&cache, &bytes)?;
+    crate::platform::verify_private_state_named_identity(&directory, directory.path())?;
     Ok(Some((cache, true)))
 }
 
@@ -1462,62 +1433,94 @@ pub(crate) fn open_cache_path(
         .join(portable_cache_leaf(basename))
 }
 
-/// R10-6: crash-atomic write of the open/view expansion cache file. Writes bytes to
-/// a uniquely-named temp in the SAME directory (created 0600 so the body never
-/// exists world-readable, R9-3), fsyncs, drops the temp to 0400 (read-only), then
-/// renames into the final path. A crash before the rename leaves only the temp,
-/// never a torn file at the served name; the temp is removed on any failure. Mirrors
-/// `atomic_write_cas_object`.
+/// Publish a private read-only leaf through its retained parent, never replacing
+/// or repairing an existing object.
+#[cfg(test)]
 pub(crate) fn write_open_cache_atomic(cache: &Path, bytes: &[u8]) -> Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
     let parent = cache
         .parent()
-        .ok_or_else(|| KioError::io("cache path has no parent", cache.display().to_string()))?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let temp = parent.join(format!(".tmp-{}-{}-{}", process::id(), nanos, seq));
-    let result = (|| -> Result<()> {
-        let mut open_options = OpenOptions::new();
-        open_options.write(true).create(true).truncate(true);
-        platform::configure_owner_only_file(&mut open_options);
-        let mut file = open_options
-            .open(&temp)
-            .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
-        file.write_all(bytes)
-            .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
-        file.sync_all()
-            .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
-        drop(file);
-        // Drop the temp to read-only BEFORE publishing so the served file is never
-        // writable (mirrors the pre-fix final-path 0400 hardening).
-        let mut permissions = fs::metadata(&temp)
-            .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?
-            .permissions();
-        permissions.set_readonly(true);
-        fs::set_permissions(&temp, permissions)
-            .map_err(|err| KioError::io(err.to_string(), temp.display().to_string()))?;
-        fs::rename(&temp, cache)
-            .map_err(|err| KioError::io(err.to_string(), cache.display().to_string()))
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+        .ok_or_else(|| KioError::invalid_usage("cache has no parent"))?;
+    let directory = kio_core::private_fs::verify_private_directory(parent)?;
+    let leaf = cache
+        .file_name()
+        .ok_or_else(|| KioError::invalid_usage("cache has no leaf"))?;
+    directory.write_atomic_readonly(Path::new(leaf), bytes)?;
+    crate::platform::verify_private_state_named_identity(&directory, parent)
 }
 
-/// R9-3: restrict the open/view expansion cache subtree to owner-only (0700) on
-/// unix, walking from `leaf` up to `$XDG_CACHE_HOME/kio` inclusive. The cache
-/// materializes raw / prepared / image CAS bytes, so it must carry the same
-/// 0700/0600 hardening as the CAS itself (P2) rather than inherit the umask
-/// default (0755). Best-effort (the cache is regenerable); the `starts_with`
-/// guard keeps the walk from ever chmod-ing anything above the cache root
-/// (e.g. `$XDG_CACHE_HOME` itself). No-op on non-unix.
-pub(crate) fn harden_open_cache_subtree(leaf: &Path, control: &ControlHandle) {
-    platform::harden_open_cache_subtree(leaf, &cache_home(control).join("kio"));
+/// Retain the Kio-owned cache root and every owned suffix. The configured cache
+/// home is an external parent: its permissions are neither judged nor repaired.
+pub(crate) fn cache_directory(
+    cache: &Path,
+    control: &ControlHandle,
+    create: bool,
+) -> Result<Option<kio_core::store_dir::StoreDirectory>> {
+    let root = cache_home(control).join("kio");
+    let parent = cache
+        .parent()
+        .ok_or_else(|| KioError::invalid_usage("cache has no parent"))?;
+    let relative = parent
+        .strip_prefix(&root)
+        .map_err(|_| KioError::invalid_usage("cache is outside the Kio cache root"))?;
+    let mut directory = if create {
+        crate::private_state::ensure_private_directory(&root, control)?
+    } else {
+        let Some(directory) = crate::private_state::open_readonly(&root, control)? else {
+            return Ok(None);
+        };
+        directory
+    };
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(KioError::invalid_usage("cache suffix must be normalized"));
+        };
+        let leaf = Path::new(name);
+        let handle = if directory.contains_entry(leaf)? {
+            directory.open_directory(leaf)?
+        } else if create {
+            directory.create_directory(leaf)?
+        } else {
+            return Ok(None);
+        };
+        directory = kio_core::store_dir::StoreDirectory::from_retained_with_control(
+            handle,
+            directory.path().join(leaf),
+            control.clone(),
+        )?;
+        kio_core::private_fs::verify_private_directory_handle(&directory)?;
+        crate::platform::verify_private_state_named_identity(&directory, directory.path())?;
+    }
+    crate::platform::verify_private_state_named_identity(&directory, parent)?;
+    Ok(Some(directory))
+}
+
+pub(crate) fn read_private_cache(
+    directory: &kio_core::store_dir::StoreDirectory,
+    leaf: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>> {
+    kio_core::private_fs::verify_private_directory_handle(directory)?;
+    crate::platform::verify_private_state_named_identity(directory, directory.path())?;
+    if !directory.contains_entry(leaf)? {
+        return Ok(None);
+    }
+    let name = leaf
+        .to_str()
+        .ok_or_else(|| KioError::invalid_usage("cache leaf is not UTF-8"))?;
+    let bytes = kio_core::private_fs::read_private_file_at(directory, name, max_bytes)?;
+    crate::platform::verify_private_state_named_identity(directory, directory.path())?;
+    Ok(Some(bytes))
+}
+
+fn verify_cache_bytes(path: &Path, bytes: &[u8], hash: &str) -> Result<()> {
+    let actual = format!(
+        "sha256:{}",
+        kio_core::cas::lower_hex(&Sha256::digest(bytes))
+    );
+    if actual != hash {
+        return Err(store_corrupt_error(path, "cache object hash mismatch"));
+    }
+    Ok(())
 }
 
 pub(crate) const MAX_WORKING_TREE_SCAN_ENTRIES: usize = 100_000;
@@ -1622,19 +1625,6 @@ fn path_entry_exists(path: &Path) -> Result<bool> {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(KioError::io(error.to_string(), path.display().to_string())),
-    }
-}
-
-pub(crate) fn existing_cas_object_path(
-    kio_dir: &Path,
-    subdir: &str,
-    hash: &str,
-) -> Result<Option<PathBuf>> {
-    let canonical = cas_object_path(kio_dir, subdir, hash)?;
-    if path_entry_exists(&canonical)? {
-        Ok(Some(canonical))
-    } else {
-        Ok(None)
     }
 }
 
@@ -2019,5 +2009,59 @@ fn resolve_object_uri(
             )
         }
         None => Err(KioError::not_found(object.hash.clone())),
+    }
+}
+
+#[cfg(all(test, unix))]
+mod st01_cache_tests {
+    use super::write_open_cache_atomic;
+    use std::fs;
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    #[test]
+    fn st01_open_cache_refuses_unsafe_existing_leaf_without_repair() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("cached");
+        fs::write(&path, b"original").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(write_open_cache_atomic(&path, b"replacement").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+    }
+
+    #[test]
+    fn st01_open_cache_refuses_symlink_leaf_without_touching_victim() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let victim = root.path().join("victim");
+        fs::write(&victim, b"original").unwrap();
+        let path = root.path().join("cached");
+        symlink(&victim, &path).unwrap();
+        assert!(write_open_cache_atomic(&path, b"replacement").is_err());
+        assert!(
+            fs::symlink_metadata(&path)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::read(&victim).unwrap(), b"original");
+    }
+
+    #[test]
+    fn st01_open_cache_publication_is_private_readonly_and_create_only() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.path().join("cached");
+        write_open_cache_atomic(&path, b"original").unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert!(write_open_cache_atomic(&path, b"replacement").is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"original");
     }
 }

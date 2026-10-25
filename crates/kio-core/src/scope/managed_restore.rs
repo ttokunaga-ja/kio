@@ -1176,7 +1176,7 @@ mod tests {
                 // owned by Administrators. Set TokenUser ownership at CreateNew,
                 // before managed restore is asked to remove the working file.
                 let mut file = parent
-                    .create_private_file_raw(Path::new(leaf))
+                    .create_private_file(Path::new(leaf))
                     .map_err(std::io::Error::other)?;
                 return file.write_all(bytes);
             }

@@ -833,14 +833,13 @@ fn make_pointer_commit_final_shallow(dir: &TempDir, pointer: &Value) {
     let receipt_path = kio_dir(dir)
         .join("gc/shallowed")
         .join(commit_hash.strip_prefix("sha256:").unwrap());
-    fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
     let receipt = ShallowReceipt::new(
         commit_hash.to_owned(),
         commit.tree.clone(),
         "2026-08-14T00:00:00Z".into(),
     )
     .unwrap();
-    fs::write(receipt_path, receipt.canonical_bytes().unwrap()).unwrap();
+    write_new_private_fixture(&receipt_path, receipt.canonical_bytes().unwrap());
 
     let store = ObjectStore::new(kio_dir(dir));
     fs::remove_file(store.object_path(ObjectKind::Tree, &commit.tree).unwrap()).unwrap();
@@ -874,11 +873,24 @@ fn content_path(kio_dir: &Path, kind_dir: &str, hash: &str) -> std::path::PathBu
         .join(digest)
 }
 
+// Malformed payloads still need a legitimately private namespace and leaf.
+fn write_new_private_fixture(path: &Path, bytes: impl AsRef<[u8]>) {
+    use std::io::Write;
+    let parent =
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(path.parent().unwrap())
+            .unwrap();
+    kio_core::private_fs::verify_private_directory_handle(&parent).unwrap();
+    parent
+        .create_private_file(Path::new(path.file_name().unwrap()))
+        .unwrap()
+        .write_all(bytes.as_ref())
+        .unwrap();
+}
+
 fn write_content_bytes(kio_dir: &Path, kind_dir: &str, bytes: &[u8]) -> String {
     let hash = hash_bytes(bytes);
     let path = content_path(kio_dir, kind_dir, &hash);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, bytes).unwrap();
+    write_new_private_fixture(&path, bytes);
     hash
 }
 
@@ -1120,8 +1132,7 @@ fn write_embedding_fixture(kio_dir: &Path, vector: &[f32], declared_dimensions: 
     let hash = keyed.identity_hash().unwrap();
     let bytes = embedding_fixture_bytes(&object);
     let path = content_path(kio_dir, ContentObjectKind::Embedding.directory(), &hash);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, bytes).unwrap();
+    write_new_private_fixture(&path, bytes);
     hash
 }
 
@@ -1267,8 +1278,7 @@ fn pb01_embedding_under_a_foreign_identity_is_a_finding() {
         ContentObjectKind::Embedding.directory(),
         foreign,
     );
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, bytes).unwrap();
+    write_new_private_fixture(&path, bytes);
     let (code, output) = run(&dir, &["repair", "verify-objects"]);
     assert_eq!(code, 3, "{output}");
     assert!(
@@ -1458,7 +1468,12 @@ fn pb09_canonical_ref_names_correspondence_is_asymmetric() {
     // pointing at HEAD that names.jsonl never recorded.
     let head = fs::read_to_string(kio_dir(&dir).join("HEAD")).unwrap();
     let orphan_leaf = format!("tag-{}", "1".repeat(64));
-    fs::write(canonical_dir.join(&orphan_leaf), head.trim()).unwrap();
+    let tag_parent = kio_core::store_dir::StoreDirectory::open(&canonical_dir).unwrap();
+    let mut tag_file = tag_parent
+        .create_private_file(Path::new(&orphan_leaf))
+        .unwrap();
+    std::io::Write::write_all(&mut tag_file, head.trim().as_bytes()).unwrap();
+    drop(tag_file);
     let (code, output) = run(&dir, &["repair", "verify-objects"]);
     assert_eq!(code, 3, "{output}");
     assert!(
@@ -1668,16 +1683,16 @@ fn prune_staging(dir: &TempDir, raw: &str, tool: &str, descriptor: bool) -> Path
         raw.trim_start_matches("sha256:"),
         tool.trim_start_matches("sha256:")
     ));
-    fs::create_dir_all(&root).unwrap();
+    let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(&root).unwrap();
+    kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     if descriptor {
         let value = serde_json::json!({"scope_id":scope,"raw_hash":raw,"tool_profile_hash":tool,"adapter_kind":"markdownize"});
-        fs::write(
-            root.join("descriptor.json"),
+        write_new_private_fixture(
+            &root.join("descriptor.json"),
             serde_jcs::to_vec(&value).unwrap(),
-        )
-        .unwrap();
+        );
     }
-    fs::write(root.join("payload.part"), b"unpublished staging payload").unwrap();
+    write_new_private_fixture(&root.join("payload.part"), b"unpublished staging payload");
     root
 }
 
@@ -2036,8 +2051,7 @@ fn pb16_unknown_retryable_generation_uses_explicit_confirmed_recovery() {
     let manifest_hash = store
         .write_content_object(ContentObjectKind::Manifest, &manifest_bytes)
         .unwrap();
-    fs::create_dir_all(&next).unwrap();
-    fs::write(next.join("manifest.json"), &manifest_bytes).unwrap();
+    write_new_private_fixture(&next.join("manifest.json"), &manifest_bytes);
     // Escape 1 is unavailable: g1 is retryable. Escape 2 permits explicit
     // locked repair because the manifest is finalized, task state is lost,
     // and no in-flight requests or other PB15 blockers exist.
@@ -2457,7 +2471,11 @@ fn pb13_unrelated_shallow_receipt_preserves_valid_partial_historical_closure() {
 #[test]
 fn pb20_incompatible_sqlite_schema_is_fail_closed_without_mutation() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("sqlite.db");
+    let index_path = directory.path().join("private/index");
+    let parent =
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(&index_path).unwrap();
+    drop(parent.create_private_file(Path::new("sqlite.db")).unwrap());
+    let path = index_path.join("sqlite.db");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE chunks (chunk_id TEXT PRIMARY KEY, chunking_config_hash TEXT NOT NULL);",

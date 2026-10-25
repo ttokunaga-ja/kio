@@ -42,7 +42,6 @@
 //! does not produce.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
@@ -1229,7 +1228,7 @@ pub struct LocalOcrMarkdownizeAdapter<C = EnvLocalOcrClient> {
     client: C,
     execution: LocalOcrExecution,
     scope_id: String,
-    image_store_dir: Option<PathBuf>,
+    image_store_dir: Option<kio_core::cas::ImageStore>,
     verified_raw_bytes: Option<Vec<u8>>,
 }
 
@@ -1245,8 +1244,8 @@ impl<C> LocalOcrMarkdownizeAdapter<C> {
     }
 
     #[must_use]
-    pub fn with_image_store(mut self, kio_dir: impl Into<PathBuf>) -> Self {
-        self.image_store_dir = Some(kio_dir.into());
+    pub fn with_image_store(mut self, store: kio_core::cas::ImageStore) -> Self {
+        self.image_store_dir = Some(store);
         self
     }
 
@@ -1272,11 +1271,11 @@ impl<C: LocalOcrClient + 'static> LocalOcrMarkdownizeAdapter<C> {
     #[must_use]
     pub fn into_boxed(
         self,
-        kio_dir: &Path,
+        image_store: &kio_core::cas::ImageStore,
         verified_raw_bytes: &[u8],
     ) -> Box<dyn MarkdownizeAdapter> {
         Box::new(
-            self.with_image_store(kio_dir.to_path_buf())
+            self.with_image_store(image_store.clone())
                 .with_verified_raw_bytes(verified_raw_bytes.to_vec()),
         )
     }
@@ -1470,7 +1469,10 @@ fn discovered_page_hints(
         .collect())
 }
 
-fn persist_pages_images(kio_dir: &Path, pages: &[LayoutParsedPage]) -> Result<()> {
+fn persist_pages_images(
+    kio_dir: &kio_core::cas::ImageStore,
+    pages: &[LayoutParsedPage],
+) -> Result<()> {
     let images = pages
         .iter()
         .flat_map(|page| page.images.iter())

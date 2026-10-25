@@ -9,8 +9,6 @@ use crate::gc::{
 };
 use crate::platform::gc_io as windows;
 use crate::store_dir::StoreDirectory;
-#[cfg(test)]
-use cap_primitives::ambient_authority;
 use cap_primitives::fs as cap_fs;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -57,6 +55,7 @@ pub(crate) fn verify_retained_receipt_observation(
 ) -> Result<()> {
     use std::io::{Seek, SeekFrom};
 
+    crate::private_fs::verify_private_regular_file_handle(file)?;
     let before = cap_fs::Metadata::from_file(file).map_err(|error| ioerr(error, leaf))?;
     valid_file(&before, MAX_METADATA)?;
     let mut reader = file;
@@ -134,7 +133,10 @@ pub(crate) fn directory(
 
 pub(crate) fn observe(file: &mut File, max: u64) -> Result<(Vec<u8>, FileObservation)> {
     let before = cap_fs::Metadata::from_file(file).map_err(|e| ioerr(e, "GC victim"))?;
+    // Classify structural corruption before the privacy verifier's overlapping
+    // single-link check. Keep the owner-private ACL check before reading bytes.
     valid_file(&before, max)?;
+    crate::private_fs::verify_private_regular_file_handle(file)?;
     file.seek(SeekFrom::Start(0))
         .map_err(|e| ioerr(e, "GC victim"))?;
     let mut bytes = Vec::new();
@@ -241,23 +243,21 @@ pub(crate) fn publish_staged(
     staged_checkpoint: impl FnOnce() -> Result<()>,
     control: &crate::control::ControlHandle,
 ) -> Result<()> {
-    use cap_fs::OpenOptionsExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_SHARE_READ, SYNCHRONIZE,
-    };
     if bytes.len() as u64 > max {
         return Err(limit("GC publication bytes"));
     }
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .access_mode(FILE_GENERIC_READ | FILE_GENERIC_WRITE | DELETE | SYNCHRONIZE)
-        .share_mode(FILE_SHARE_READ)
-        .create_new(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut file =
-        cap_fs::open(from_dir, Path::new(staged), &options).map_err(|e| ioerr(e, staged))?;
+    let source = directory(from_dir, control)?;
+    crate::private_fs::verify_private_directory_handle(&source)?;
+    let target = directory(to_dir, control)?;
+    crate::private_fs::verify_private_directory_handle(&target)?;
+    // Retain DELETE access and FILE_SHARE_READ for the complete publication;
+    // the existing native exclusive-file creator also installs a private DACL.
+    let mut file = super::private_fs::create_new_private_at(
+        from_dir,
+        std::ffi::OsStr::new(staged),
+        super::private_fs::NewPrivateObjectKind::LockFile,
+    )
+    .map_err(|error| ioerr(error, staged))?;
     file.write_all(bytes).map_err(|e| ioerr(e, staged))?;
     file.sync_all().map_err(|e| ioerr(e, staged))?;
     let (written, before) = observe(&mut file, max)?;
@@ -265,8 +265,6 @@ pub(crate) fn publish_staged(
         return Err(corrupt("GC staged publication changed"));
     }
     staged_checkpoint()?;
-    let source = directory(from_dir, control)?;
-    let target = directory(to_dir, control)?;
     crate::platform::move_verified_regular_handle_to_raw(&source, &file, &target, Path::new(leaf))?;
     let (published, after) = observe(&mut file, max)?;
     if published != bytes || !matches_stable(&after, &before) {
@@ -279,15 +277,29 @@ pub(crate) fn publish_staged(
 mod tests {
     use super::*;
 
-    fn parent(path: &Path) -> File {
-        cap_fs::open_ambient_dir(path, ambient_authority()).unwrap()
+    fn private_fixture() -> (tempfile::TempDir, StoreDirectory) {
+        let temp = tempfile::tempdir().unwrap();
+        // The external TempDir stays untouched; only the Kio-owned child is private.
+        let store = StoreDirectory::open_or_create_directories(&temp.path().join("gc")).unwrap();
+        crate::private_fs::verify_private_directory_handle(&store).unwrap();
+        (temp, store)
+    }
+
+    fn write_private(store: &StoreDirectory, leaf: &str, bytes: &[u8]) {
+        store
+            .write_atomic(
+                Path::new(leaf),
+                bytes,
+                crate::store_dir::Publication::CreateOnly,
+            )
+            .unwrap();
     }
 
     #[test]
     fn staged_publication_collision_preserves_both_files() {
-        let temp = tempfile::tempdir().unwrap();
-        let directory = parent(temp.path());
-        std::fs::write(temp.path().join("public"), b"existing").unwrap();
+        let (_temp, store) = private_fixture();
+        let directory = store.root_handle();
+        write_private(&store, "public", b"existing");
         assert!(
             publish_staged(
                 &directory,
@@ -302,56 +314,65 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            std::fs::read(temp.path().join("public")).unwrap(),
+            std::fs::read(store.path().join("public")).unwrap(),
             b"existing"
         );
         assert_eq!(
-            std::fs::read(temp.path().join("stage")).unwrap(),
+            std::fs::read(store.path().join("stage")).unwrap(),
             b"replacement"
         );
     }
 
     #[test]
     fn staged_publication_interruption_leaves_no_public_name() {
-        let temp = tempfile::tempdir().unwrap();
-        let directory = parent(temp.path());
-        assert!(
-            publish_staged(
-                &directory,
-                "stage",
-                &directory,
-                "public",
-                b"record",
-                64,
-                || Err(corrupt("test interruption")),
-                &crate::control::ControlHandle::default()
-            )
-            .is_err()
+        let (_temp, store) = private_fixture();
+        let directory = store.root_handle();
+        let error = publish_staged(
+            &directory,
+            "stage",
+            &directory,
+            "public",
+            b"record",
+            64,
+            || Err(corrupt("test interruption")),
+            &crate::control::ControlHandle::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.message(), "test interruption");
+        assert!(!store.path().join("public").exists());
+        assert_eq!(
+            std::fs::read(store.path().join("stage")).unwrap(),
+            b"record"
         );
-        assert!(!temp.path().join("public").exists());
-        assert_eq!(std::fs::read(temp.path().join("stage")).unwrap(), b"record");
     }
 
     #[test]
     fn exact_retirement_rejects_substituted_identity() {
-        let temp = tempfile::tempdir().unwrap();
-        let directory = parent(temp.path());
-        std::fs::write(temp.path().join("victim"), b"record").unwrap();
+        let (_temp, store) = private_fixture();
+        let directory = store.root_handle();
+        write_private(&store, "victim", b"record");
         let (bytes, expected) = read_regular_observed(&directory, "victim", 64).unwrap();
-        std::fs::rename(temp.path().join("victim"), temp.path().join("original")).unwrap();
-        std::fs::write(temp.path().join("victim"), &bytes).unwrap();
-        assert!(
-            retire_expected(
-                &directory,
-                "victim",
-                &bytes,
-                &expected,
-                64,
-                &crate::control::ControlHandle::default()
-            )
-            .is_err()
+        std::fs::rename(store.path().join("victim"), store.path().join("original")).unwrap();
+        write_private(&store, "victim", &bytes);
+        let (replacement, replacement_observation) =
+            read_regular_observed(&directory, "victim", 64).unwrap();
+        assert_eq!(replacement, bytes);
+        assert_ne!(replacement_observation.identity, expected.identity);
+        let error = retire_expected(
+            &directory,
+            "victim",
+            &bytes,
+            &expected,
+            64,
+            &crate::control::ControlHandle::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
+        assert_eq!(
+            error.message(),
+            "GC temporary changed before exact-handle retirement"
         );
-        assert_eq!(std::fs::read(temp.path().join("victim")).unwrap(), bytes);
-        assert_eq!(std::fs::read(temp.path().join("original")).unwrap(), bytes);
+        assert_eq!(std::fs::read(store.path().join("victim")).unwrap(), bytes);
+        assert_eq!(std::fs::read(store.path().join("original")).unwrap(), bytes);
     }
 }

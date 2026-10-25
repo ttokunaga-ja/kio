@@ -23,6 +23,7 @@ use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::Read as _;
+#[cfg(test)]
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -489,7 +490,7 @@ pub struct MistralOcrMarkdownizeAdapter<C = EnvMistralOcrClient> {
     client: C,
     configured_model: String,
     scope_id: String,
-    image_store_dir: Option<PathBuf>,
+    image_store_dir: Option<kio_core::cas::ImageStore>,
     verified_raw_bytes: Option<Vec<u8>>,
     bbox_annotation_enabled: bool,
     /// QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): defaults to
@@ -516,8 +517,8 @@ impl<C> MistralOcrMarkdownizeAdapter<C> {
     }
 
     #[must_use]
-    pub fn with_image_store(mut self, kio_dir: impl Into<PathBuf>) -> Self {
-        self.image_store_dir = Some(kio_dir.into());
+    pub fn with_image_store(mut self, store: kio_core::cas::ImageStore) -> Self {
+        self.image_store_dir = Some(store);
         self
     }
 
@@ -732,7 +733,7 @@ impl<C: MistralOcrClient> MarkdownizeAdapter for MistralOcrMarkdownizeAdapter<C>
             request.mode,
             hints,
             &self.scope_id,
-            self.image_store_dir.as_deref(),
+            self.image_store_dir.as_ref(),
         )
     }
 }
@@ -749,7 +750,7 @@ pub fn materialize_mistral_batch_ocr_body(
     media_type: &str,
     raw_hash: &str,
     scope_id: &str,
-    image_store_dir: &Path,
+    image_store_dir: &kio_core::cas::ImageStore,
     bbox_annotation_enabled: bool,
 ) -> std::result::Result<(MarkdownizeResponse, Vec<PreparedUnitHint>), BatchOcrMaterializationError>
 {
@@ -812,7 +813,7 @@ fn markdownize_response_from_ocr(
     mode_used: MarkdownizeMode,
     hints: Vec<PreparedUnitHint>,
     scope_id: &str,
-    image_store_dir: Option<&Path>,
+    image_store_dir: Option<&kio_core::cas::ImageStore>,
 ) -> Result<MarkdownizeResponse> {
     let images_persisted = image_store_dir.is_some();
     let response =
@@ -893,7 +894,7 @@ fn build_markdownize_response_from_ocr(
     })
 }
 
-fn persist_ocr_images(ocr: &OcrResponse, kio_dir: &Path) -> Result<()> {
+fn persist_ocr_images(ocr: &OcrResponse, kio_dir: &kio_core::cas::ImageStore) -> Result<()> {
     let images = ocr
         .pages
         .iter()
@@ -1531,69 +1532,17 @@ pub fn image_hash(bytes: &[u8]) -> String {
     hash_bytes(bytes)
 }
 
-/// Q2: crash-atomic write of an image CAS object. Writes to a uniquely-named temp
-/// file in the destination directory, fsyncs it, then renames into place, so a
-/// crash / ENOSPC mid-write can never leave a partial file under the final
-/// digest leaf (which an existence check would then adopt forever). The CLI's
-/// `open`/`view` serve path verifies the object hash before serving, but the CAS
-/// object itself must be written atomically so it is never partial in the first
-/// place.
-fn atomic_write_image_object(path: &Path, bytes: &[u8]) -> Result<()> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    let parent = path.parent().ok_or_else(|| AdapterError::Io {
-        path: path.display().to_string(),
-        message: "path has no parent".to_owned(),
-    })?;
-    std::fs::create_dir_all(parent).map_err(|err| AdapterError::Io {
-        path: parent.display().to_string(),
-        message: err.to_string(),
-    })?;
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-    let temp = parent.join(format!(".tmp-{}-{}-{}", std::process::id(), nanos, seq));
-    // R9-8: remove the temp on any write/sync/rename failure so a torn write does
-    // not leave an orphan `.tmp-*` in the image CAS fanout dir (no GC before Step
-    // 4). Same cleanup idiom as the core CAS writers.
-    let result = (|| -> Result<()> {
-        use std::io::Write as _;
-        let mut file = std::fs::File::create(&temp).map_err(|err| AdapterError::Io {
-            path: temp.display().to_string(),
-            message: err.to_string(),
-        })?;
-        file.write_all(bytes).map_err(|err| AdapterError::Io {
-            path: temp.display().to_string(),
-            message: err.to_string(),
-        })?;
-        file.sync_all().map_err(|err| AdapterError::Io {
-            path: temp.display().to_string(),
-            message: err.to_string(),
-        })?;
-        drop(file);
-        std::fs::rename(&temp, path).map_err(|err| AdapterError::Io {
-            path: path.display().to_string(),
-            message: err.to_string(),
-        })
-    })();
-    if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
-    }
-    result
-}
-
 #[cfg(test)]
 fn persist_images(kio_dir: impl AsRef<Path>, images: &[OcrImage]) -> Result<Vec<String>> {
     let image_refs = images.iter().collect::<Vec<_>>();
     persist_image_refs_bounded(
-        kio_dir,
+        &tests::image_store_fixture(kio_dir.as_ref()),
         &image_refs,
         OcrResponsePolicy::default().max_persisted_image_bytes,
     )
 }
 
+#[cfg(test)]
 fn image_hash_digest(hash: &str) -> Result<&str> {
     let digest = hash
         .strip_prefix("sha256:")
@@ -1610,6 +1559,7 @@ fn image_hash_digest(hash: &str) -> Result<&str> {
     Ok(digest)
 }
 
+#[cfg(test)]
 fn image_object_path(kio_dir: &Path, hash: &str) -> Result<PathBuf> {
     let digest = image_hash_digest(hash)?;
     Ok(kio_dir
@@ -1619,80 +1569,26 @@ fn image_object_path(kio_dir: &Path, hash: &str) -> Result<PathBuf> {
         .join(digest))
 }
 
-fn image_object_slot_exists(path: &Path) -> Result<bool> {
-    match std::fs::symlink_metadata(path) {
-        Ok(_) => Ok(true),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(AdapterError::Io {
-            path: path.display().to_string(),
-            message: err.to_string(),
-        }),
-    }
-}
-
-fn verify_existing_image_object(path: &Path, hash: &str, max_bytes: usize) -> Result<()> {
-    use std::io::Read as _;
-
-    let listed = std::fs::symlink_metadata(path).map_err(|err| AdapterError::Io {
-        path: path.display().to_string(),
-        message: err.to_string(),
-    })?;
-    if !listed.file_type().is_file() {
-        return Err(AdapterError::ContractViolation(format!(
-            "existing image object is not a regular file: {}",
-            path.display()
-        )));
-    }
-    let max_bytes_u64 = u64::try_from(max_bytes).unwrap_or(u64::MAX);
-    if listed.len() > max_bytes_u64 {
-        return Err(AdapterError::ContractViolation(format!(
-            "existing image object exceeds verification limit: {}",
-            path.display()
-        )));
-    }
-
-    let mut file = std::fs::File::open(path).map_err(|err| AdapterError::Io {
-        path: path.display().to_string(),
-        message: err.to_string(),
-    })?;
-    let opened = file.metadata().map_err(|err| AdapterError::Io {
-        path: path.display().to_string(),
-        message: err.to_string(),
-    })?;
-    if !opened.is_file() {
-        return Err(AdapterError::ContractViolation(format!(
-            "existing image object is not a regular file: {}",
-            path.display()
-        )));
-    }
-    if opened.len() > max_bytes_u64 {
-        return Err(AdapterError::ContractViolation(format!(
-            "existing image object exceeds verification limit: {}",
-            path.display()
-        )));
-    }
-
-    let mut existing = Vec::new();
-    (&mut file)
-        .take(max_bytes_u64.saturating_add(1))
-        .read_to_end(&mut existing)
-        .map_err(|err| AdapterError::Io {
-            path: path.display().to_string(),
-            message: err.to_string(),
-        })?;
-    if existing.len() > max_bytes {
-        return Err(AdapterError::ContractViolation(format!(
-            "existing image object exceeds verification limit: {}",
-            path.display()
-        )));
-    }
+fn image_object_exists_verified(
+    store: &kio_core::cas::ImageStore,
+    hash: &str,
+    max_bytes: usize,
+) -> Result<bool> {
+    let existing = match store.read(hash, u64::try_from(max_bytes).unwrap_or(u64::MAX)) {
+        Ok(bytes) => bytes,
+        Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => return Ok(false),
+        Err(error) => return Err(image_store_error(error)),
+    };
     if image_hash(&existing) != hash {
         return Err(AdapterError::ContractViolation(format!(
-            "existing image object does not match its hash: {}",
-            path.display()
+            "existing image object does not match its hash: {hash}"
         )));
     }
-    Ok(())
+    Ok(true)
+}
+
+fn image_store_error(error: kio_core::KioError) -> AdapterError {
+    AdapterError::ContractViolation(format!("image object store refused operation: {error}"))
 }
 
 /// `pub(crate)` so the local OCR adapter reuses this rather than growing a
@@ -1702,11 +1598,10 @@ fn verify_existing_image_object(path: &Path, hash: &str, max_bytes: usize) -> Re
 /// Mistral — and two implementations of them would be two chances to diverge
 /// on a rule that is permanent once an object is written (07 §9).
 pub(crate) fn persist_image_refs_bounded(
-    kio_dir: impl AsRef<Path>,
+    store: &kio_core::cas::ImageStore,
     images: &[&OcrImage],
     max_new_bytes: usize,
 ) -> Result<Vec<String>> {
-    let kio_dir = kio_dir.as_ref();
     let mut unique = BTreeMap::<String, &[u8]>::new();
     for image in images {
         let hash = image_hash(&image.bytes);
@@ -1716,10 +1611,7 @@ pub(crate) fn persist_image_refs_bounded(
     let mut new_bytes = 0_usize;
     let mut hashes_to_write = BTreeSet::new();
     for (hash, bytes) in &unique {
-        let path = image_object_path(kio_dir, hash)?;
-        if image_object_slot_exists(&path)? {
-            verify_existing_image_object(&path, hash, max_new_bytes)?;
-        } else {
+        if !image_object_exists_verified(store, hash, max_new_bytes)? {
             new_bytes = new_bytes.checked_add(bytes.len()).ok_or_else(|| {
                 AdapterError::ContractViolation("image persistence byte count overflow".to_owned())
             })?;
@@ -1736,29 +1628,14 @@ pub(crate) fn persist_image_refs_bounded(
         if !hashes_to_write.contains(&hash) {
             continue;
         }
-        let path = image_object_path(kio_dir, &hash)?;
-        // Another writer may have published this digest between the scan above and
-        // now; verify what it left rather than overwriting it.
-        if image_object_slot_exists(&path)? {
-            verify_existing_image_object(&path, &hash, max_new_bytes)?;
-            continue;
-        }
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| AdapterError::Io {
-                path: parent.display().to_string(),
-                message: err.to_string(),
-            })?;
-        }
-        // Q2: crash-atomic (temp + fsync + rename) so a torn write cannot leave
-        // a partial image object under the final digest leaf.
-        atomic_write_image_object(&path, bytes)?;
-        if !image_object_slot_exists(&path)? {
+        // Core CAS privately creates the namespace and publishes create-only;
+        // a concurrent publisher must match the same immutable bytes.
+        let published = store.write(bytes).map_err(image_store_error)?;
+        if published != hash || !image_object_exists_verified(store, &hash, max_new_bytes)? {
             return Err(AdapterError::ContractViolation(format!(
-                "published image object is missing: {}",
-                path.display()
+                "published image object is missing or has the wrong hash: {hash}"
             )));
         }
-        verify_existing_image_object(&path, &hash, max_new_bytes)?;
     }
     Ok(images
         .iter()
@@ -1838,6 +1715,44 @@ mod tests {
     use serde_json::Value;
     use std::path::PathBuf;
 
+    struct PrivateImageStore {
+        _outer: tempfile::TempDir,
+        path: PathBuf,
+    }
+
+    impl PrivateImageStore {
+        fn new() -> Self {
+            let outer = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let parent = kio_core::store_dir::StoreDirectory::open(outer.path()).unwrap();
+            parent.create_directory(Path::new("private")).unwrap();
+            let path = outer.path().join("private");
+            Self {
+                _outer: outer,
+                path,
+            }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    pub(super) fn image_store_fixture(path: &Path) -> kio_core::cas::ImageStore {
+        let directory = kio_core::store_dir::StoreDirectory::open(path).unwrap();
+        kio_core::cas::ImageStore::from_bound_kio(&directory.root_handle()).unwrap()
+    }
+
+    fn write_private_image_fixture(path: &Path, bytes: &[u8]) {
+        use std::io::Write as _;
+        let parent =
+            kio_core::store_dir::StoreDirectory::open_or_create_directories(path.parent().unwrap())
+                .unwrap();
+        let mut file = parent
+            .create_private_file(Path::new(path.file_name().unwrap()))
+            .unwrap();
+        file.write_all(bytes).unwrap();
+    }
+
     fn frozen_profile_value() -> Value {
         json!({
             "adapter_kind": "markdownize",
@@ -1911,29 +1826,6 @@ mod tests {
         assert_eq!(
             tool_profile_hash(&frozen_profile_value()).unwrap(),
             "sha256:393d7b062ec1fd573c0a061455bef3f3ee16367378ca4122a0684045178e974c"
-        );
-    }
-
-    #[test]
-    fn r9_8_atomic_write_image_object_removes_temp_on_failure() {
-        // R9-8: a torn image-object write must not leave an orphan `.tmp-*` in the
-        // image CAS fanout dir. Force the rename to fail deterministically by
-        // making the destination an existing directory (`rename(file, dir)` errors)
-        // after the temp is created + fsynced.
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("obj");
-        std::fs::create_dir(&dest).unwrap();
-        let result = atomic_write_image_object(&dest, b"image-bytes");
-        assert!(result.is_err(), "write onto a directory must fail");
-        let stray: Vec<_> = std::fs::read_dir(dir.path())
-            .unwrap()
-            .filter_map(std::result::Result::ok)
-            .map(|entry| entry.file_name().to_string_lossy().into_owned())
-            .filter(|name| name.starts_with(".tmp-"))
-            .collect();
-        assert!(
-            stray.is_empty(),
-            "temp not cleaned up on failure: {stray:?}"
         );
     }
 
@@ -2063,8 +1955,9 @@ mod tests {
     // (no torn / partial object under a correct name).
     #[test]
     fn q2_persist_images_writes_hash_consistent_object() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = PrivateImageStore::new();
         let kio_dir = dir.path().join(".kio");
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(&kio_dir).unwrap();
         let images = vec![OcrImage {
             bytes: b"\x89PNG image payload bytes".to_vec(),
             media_type: "image/png".to_owned(),
@@ -2107,23 +2000,28 @@ mod tests {
             annotation: None,
         };
 
-        let valid_dir = tempfile::tempdir().unwrap();
-        let valid = image_object_path(valid_dir.path(), &hash).unwrap();
-        std::fs::create_dir_all(valid.parent().unwrap()).unwrap();
-        std::fs::write(&valid, &image.bytes).unwrap();
+        let valid_dir = PrivateImageStore::new();
+        kio_core::cas::ObjectStore::new(valid_dir.path())
+            .write_content_object(kio_core::cas::ContentObjectKind::Image, &image.bytes)
+            .unwrap();
         // The budget covers only the ABSENT image. Passing means the present one
         // was reused rather than counted as bytes to write.
         assert_eq!(
-            persist_image_refs_bounded(valid_dir.path(), &[&image, &fresh], fresh.bytes.len())
-                .unwrap(),
+            persist_image_refs_bounded(
+                &image_store_fixture(valid_dir.path()),
+                &[&image, &fresh],
+                fresh.bytes.len()
+            )
+            .unwrap(),
             vec![hash.clone(), image_hash(&fresh.bytes)]
         );
 
-        let corrupt_dir = tempfile::tempdir().unwrap();
+        let corrupt_dir = PrivateImageStore::new();
         let corrupt = image_object_path(corrupt_dir.path(), &hash).unwrap();
-        std::fs::create_dir_all(corrupt.parent().unwrap()).unwrap();
-        std::fs::write(&corrupt, b"corrupt bytes").unwrap();
-        let error = persist_image_refs_bounded(corrupt_dir.path(), &[&image], 1024).unwrap_err();
+        write_private_image_fixture(&corrupt, b"corrupt bytes");
+        let error =
+            persist_image_refs_bounded(&image_store_fixture(corrupt_dir.path()), &[&image], 1024)
+                .unwrap_err();
         assert!(matches!(error, AdapterError::ContractViolation(message)
             if message.contains("does not match its hash")));
     }
@@ -2139,23 +2037,26 @@ mod tests {
         };
         let hash = image_hash(&image.bytes);
 
-        let type_dir = tempfile::tempdir().unwrap();
+        let type_dir = PrivateImageStore::new();
         let type_path = image_object_path(type_dir.path(), &hash).unwrap();
-        std::fs::create_dir_all(&type_path).unwrap();
-        let type_error = persist_image_refs_bounded(type_dir.path(), &[&image], 1024).unwrap_err();
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(&type_path).unwrap();
+        let type_error =
+            persist_image_refs_bounded(&image_store_fixture(type_dir.path()), &[&image], 1024)
+                .unwrap_err();
         assert!(
             matches!(type_error, AdapterError::ContractViolation(message)
-            if message.contains("not a regular file"))
+            if message.contains("not a real regular file"))
         );
 
-        let size_dir = tempfile::tempdir().unwrap();
+        let size_dir = PrivateImageStore::new();
         let size_path = image_object_path(size_dir.path(), &hash).unwrap();
-        std::fs::create_dir_all(size_path.parent().unwrap()).unwrap();
-        std::fs::write(&size_path, &image.bytes).unwrap();
-        let size_error = persist_image_refs_bounded(size_dir.path(), &[&image], 7).unwrap_err();
+        write_private_image_fixture(&size_path, &image.bytes);
+        let size_error =
+            persist_image_refs_bounded(&image_store_fixture(size_dir.path()), &[&image], 7)
+                .unwrap_err();
         assert!(
             matches!(size_error, AdapterError::ContractViolation(message)
-            if message.contains("exceeds verification limit"))
+            if message.contains("KIO-E-STORE-OBJECT-OVERSIZED-001"))
         );
     }
 
@@ -2549,7 +2450,7 @@ mod tests {
 
     #[test]
     fn image_quota_failure_leaves_cas_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = PrivateImageStore::new();
         let first = OcrImage {
             bytes: b"four".to_vec(),
             media_type: "image/png".to_owned(),
@@ -2564,9 +2465,95 @@ mod tests {
             confidence: None,
             annotation: None,
         };
-        let err = persist_image_refs_bounded(dir.path(), &[&first, &second], 7).unwrap_err();
+        let err =
+            persist_image_refs_bounded(&image_store_fixture(dir.path()), &[&first, &second], 7)
+                .unwrap_err();
         assert!(matches!(err, AdapterError::QuotaExceeded(_)));
-        assert!(!dir.path().join("objects/image").exists());
+        assert!(!dir.path().join("objects").exists());
+    }
+
+    // Swap a real ancestor only after the adapter has accepted its store and
+    // entered the provider call. Both stores are owner-private, so privacy
+    // checks alone cannot distinguish the replacement from the retained root.
+    #[cfg(unix)]
+    #[derive(Debug, Clone)]
+    struct SwappingImageClient {
+        original: PathBuf,
+        retired: PathBuf,
+        replacement: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl MistralOcrClient for SwappingImageClient {
+        fn resolve_model_pin(&self, _configured_model: &str) -> Result<String> {
+            Ok("mistral-ocr-2505".to_owned())
+        }
+
+        fn ocr_markdown(
+            &self,
+            _request: &MarkdownizeRequest,
+            model_pin: &str,
+            _verified_raw_bytes: &[u8],
+            _idempotency_header: Option<(&str, &str)>,
+        ) -> Result<OcrResponse> {
+            std::fs::rename(&self.original, &self.retired).unwrap();
+            std::fs::rename(&self.replacement, &self.original).unwrap();
+            Ok(OcrResponse {
+                pages: vec![OcrPage {
+                    index: 0,
+                    markdown: "![chart](provider.png)".to_owned(),
+                    images: vec![OcrImage {
+                        bytes: b"retained image payload".to_vec(),
+                        media_type: "image/png".to_owned(),
+                        bbox: None,
+                        confidence: None,
+                        annotation: None,
+                    }],
+                }],
+                model_version_pin: model_pin.to_owned(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn image_store_provider_ancestor_swap_never_writes_replacement() {
+        let original = PrivateImageStore::new();
+        let replacement = PrivateImageStore::new();
+        // The renamed directories are external ancestors, not the retained
+        // `.kio` directories themselves. Both replacement trees are private.
+        for ancestor in [original.path(), replacement.path()] {
+            kio_core::store_dir::StoreDirectory::open(ancestor)
+                .unwrap()
+                .create_directory(Path::new(".kio"))
+                .unwrap();
+        }
+        let original_kio = original.path().join(".kio");
+        let retired = original.path().with_file_name("retired-original");
+        let bytes = b"verified raw";
+        let adapter = MistralOcrMarkdownizeAdapter::new(
+            SwappingImageClient {
+                original: original.path().to_path_buf(),
+                retired: retired.clone(),
+                replacement: replacement.path().to_path_buf(),
+            },
+            "mistral-ocr-2505",
+            "scope",
+        )
+        .with_image_store(image_store_fixture(&original_kio))
+        .with_verified_raw_bytes(bytes.to_vec());
+        let result = adapter.markdownize(discovery_request(bytes, "application/pdf"));
+        assert!(
+            !original_kio.join("objects").exists(),
+            "provider-time ancestor replacement received image CAS writes: {result:?}"
+        );
+        if result.is_ok() {
+            let hash = image_hash(b"retained image payload");
+            assert_eq!(
+                std::fs::read(image_object_path(&retired.join(".kio"), &hash).unwrap()).unwrap(),
+                b"retained image payload"
+            );
+        }
     }
 
     #[derive(Debug, Clone)]

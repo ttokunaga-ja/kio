@@ -997,7 +997,7 @@ fn collect_batch_markdownize_output(
         &prepared_input.media_type,
         &task.input_hash,
         &row.key.scope_id,
-        repo.kio_dir(),
+        &repo.object_store().image_store()?,
         task.bbox_annotation_enabled.unwrap_or(false),
     );
     let (response, effective_hints) = match converted {

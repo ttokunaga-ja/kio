@@ -7,6 +7,9 @@ pub(crate) fn restrict_scratch(path: &Path) -> Result<()> {
             "failed to restrict office scratch directory permissions: {error}"
         ))
     })?;
+    kio_core::private_fs::verify_private_directory(path).map_err(|error| {
+        AdapterError::ContractViolation(format!("unsafe Office scratch directory: {error}"))
+    })?;
     Ok(())
 }
 pub(crate) fn restrict_renderer_state_directory(
@@ -14,11 +17,8 @@ pub(crate) fn restrict_renderer_state_directory(
     purpose: &str,
     label: &str,
 ) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(|error| {
-        AdapterError::ContractViolation(format!(
-            "failed to restrict private {purpose} {label}: {error}"
-        ))
+    kio_core::private_fs::verify_private_directory(path).map_err(|error| {
+        AdapterError::ContractViolation(format!("unsafe private {purpose} {label}: {error}"))
     })?;
     Ok(())
 }
@@ -55,4 +55,13 @@ pub(crate) fn file_url(path: &Path) -> Result<String> {
         "file://{}",
         crate::office_convert::encode_file_url_path(text)
     ))
+}
+
+pub(crate) fn scratch_recovery_note(scratch: tempfile::TempDir) -> String {
+    drop(scratch);
+    String::new()
+}
+pub(crate) fn finish_scratch(scratch: tempfile::TempDir) -> Result<()> {
+    drop(scratch);
+    Ok(())
 }

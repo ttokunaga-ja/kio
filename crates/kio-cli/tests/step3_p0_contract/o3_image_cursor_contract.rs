@@ -599,11 +599,13 @@ fn o3_image_cursor_binds_mode_and_digest_even_with_a_valid_matching_cache_entry(
     different[..4].copy_from_slice(&(if old == 0.25 { 0.5_f32 } else { 0.25_f32 }).to_le_bytes());
     let digest = kio_core::cas::hash_bytes(&different);
     assert_ne!(digest.as_str(), original_digest);
-    fs::write(
-        cache.join(digest.strip_prefix("sha256:").unwrap()),
-        &different,
-    )
-    .unwrap();
+    kio_core::store_dir::StoreDirectory::open(&cache)
+        .unwrap()
+        .write_atomic_readonly(
+            Path::new(digest.strip_prefix("sha256:").unwrap()),
+            &different,
+        )
+        .unwrap();
     let mut rebound = decoded.clone();
     rebound["query_vector_digest"] = Value::String(digest);
     assert_eq!(rebound["query_hash"], decoded["query_hash"]);

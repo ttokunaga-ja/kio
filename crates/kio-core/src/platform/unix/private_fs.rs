@@ -108,9 +108,7 @@ pub(crate) fn resolve_inherited_private_root(
         return Ok(None);
     };
     let root = duplicate_inherited_private_root(fd, path)?;
-    // SAFETY: geteuid has no arguments and no memory-safety preconditions.
-    let uid = unsafe { libc::geteuid() };
-    verify_private_parent(&root, uid, path)?;
+    verify_directory(&root, path)?;
     let logical = PathBuf::from(format!("/dev/fd/{fd}"));
     Ok(Some((
         StoreDirectory::from_retained_with_control(root, logical, control)?,
@@ -141,18 +139,14 @@ pub(crate) fn verify_private_directory(
             Some(path),
         )
     })?;
-    verify_ancestor(&root, uid, path)?;
     let mut directory = root;
-    for (index, component) in components.iter().enumerate() {
+    for component in &components {
         let next = cap_fs::open_dir_nofollow(&directory, Path::new(component)).map_err(|_| {
             unsafe_file(
                 "private directory has a missing, symlinked, or unsafe component",
                 Some(path),
             )
         })?;
-        if index + 1 < components.len() {
-            verify_ancestor(&next, uid, path)?;
-        }
         directory = next;
     }
     verify_private_parent(&directory, uid, path)?;
@@ -167,15 +161,12 @@ pub(crate) fn verify_private_creation_parent(
         return inherited_private_directory(root, &suffix, path, true);
     }
     let components = path_components(path)?;
-    // SAFETY: geteuid has no arguments and no memory-safety preconditions.
-    let uid = unsafe { libc::geteuid() };
     let root = cap_fs::open_ambient_dir(Path::new("/"), ambient_authority()).map_err(|_| {
         unsafe_file(
             "cannot open filesystem root for private directory creation",
             Some(path),
         )
     })?;
-    verify_ancestor(&root, uid, path)?;
     let mut directory = root;
     for component in &components {
         let next = cap_fs::open_dir_nofollow(&directory, Path::new(component)).map_err(|_| {
@@ -184,13 +175,9 @@ pub(crate) fn verify_private_creation_parent(
                 Some(path),
             )
         })?;
-        // The final creation parent intentionally follows the ancestor
-        // policy: it may be owner-readable (for example 0755), but never
-        // writable by another principal.
-        verify_ancestor(&next, uid, path)?;
         directory = next;
     }
-    verify_creation_parent(&directory, uid, path)?;
+    verify_directory(&directory, path)?;
     StoreDirectory::from_retained_with_control(directory, path.to_path_buf(), control)
 }
 
@@ -211,7 +198,6 @@ pub(crate) fn read_private_file(
             Some(path),
         )
     })?;
-    verify_ancestor(&root, uid, path)?;
 
     let mut parent = root;
     for component in &components[..components.len() - 1] {
@@ -221,10 +207,8 @@ pub(crate) fn read_private_file(
                 Some(path),
             )
         })?;
-        verify_ancestor(&next, uid, path)?;
         parent = next;
     }
-    verify_private_parent(&parent, uid, path)?;
     read_leaf(
         &parent,
         components.last().expect("nonempty components"),
@@ -243,7 +227,7 @@ pub(crate) fn read_private_file_at(
     // SAFETY: geteuid has no arguments and no memory-safety preconditions.
     let uid = unsafe { libc::geteuid() };
     let handle = parent.root_handle();
-    verify_private_parent(&handle, uid, parent.path())?;
+    verify_directory(&handle, parent.path())?;
     let label = parent.path().join(leaf);
     read_leaf(&handle, leaf, &label, max_bytes, uid)
 }
@@ -264,11 +248,10 @@ fn inherited_private_directory(
                 Some(path),
             )
         })?;
-        verify_ancestor(&next, uid, path)?;
         directory = std::sync::Arc::new(next);
     }
     if creation_parent {
-        verify_creation_parent(&directory, uid, path)?;
+        verify_directory(&directory, path)?;
     } else {
         verify_private_parent(&directory, uid, path)?;
     }
@@ -296,10 +279,8 @@ fn read_inherited_private_file(
                 Some(path),
             )
         })?;
-        verify_ancestor(&next, uid, path)?;
         parent = std::sync::Arc::new(next);
     }
-    verify_private_parent(&parent, uid, path)?;
     read_leaf(&parent, leaf, path, max_bytes, uid)
 }
 
@@ -320,26 +301,13 @@ fn metadata(file: &File, path: &Path) -> Result<std::fs::Metadata> {
         .map_err(|_| unsafe_file("cannot inspect private trust file component", Some(path)))
 }
 
-fn verify_ancestor(file: &File, uid: u32, path: &Path) -> Result<()> {
-    let meta = metadata(file, path)?;
-    if !meta.is_dir() {
+fn verify_directory(file: &File, path: &Path) -> Result<()> {
+    if !metadata(file, path)?.is_dir() {
         return Err(unsafe_file(
-            "private trust file ancestor is not a directory",
+            "private path component is not a directory",
             Some(path),
         ));
     }
-    let mode = meta.mode();
-    let owner_trusted = meta.uid() == uid || meta.uid() == 0;
-    let writable_by_others = mode & 0o022 != 0;
-    let root_owned_sticky = meta.uid() == 0 && mode & 0o1000 != 0;
-    if !owner_trusted || (writable_by_others && !root_owned_sticky) {
-        return Err(unsafe_file(
-            "private trust file ancestor is not privately controlled",
-            Some(path),
-        ));
-    }
-    #[cfg(target_os = "macos")]
-    macos_acl::verify(file, uid, macos_acl::Scope::PrivateAncestor, path)?;
     Ok(())
 }
 
@@ -353,19 +321,6 @@ fn verify_private_parent(file: &File, uid: u32, path: &Path) -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     macos_acl::verify(file, uid, macos_acl::Scope::PrivateParent, path)?;
-    Ok(())
-}
-
-fn verify_creation_parent(file: &File, uid: u32, path: &Path) -> Result<()> {
-    let meta = metadata(file, path)?;
-    if !meta.is_dir() || (meta.uid() != uid && meta.uid() != 0) || meta.mode() & 0o022 != 0 {
-        return Err(unsafe_file(
-            "private directory creation parent is writable by another user",
-            Some(path),
-        ));
-    }
-    #[cfg(target_os = "macos")]
-    macos_acl::verify(file, uid, macos_acl::Scope::PrivateAncestor, path)?;
     Ok(())
 }
 
@@ -422,6 +377,18 @@ fn read_leaf(
         return Err(raced_file(path));
     }
     Ok(bytes)
+}
+
+pub(crate) fn verify_private_regular_file_handle(file: &File) -> Result<()> {
+    verify_owner_private_regular_handle(file, Path::new("<retained>"))
+}
+
+pub(super) fn verify_owner_private_regular_handle(file: &File, path: &Path) -> Result<()> {
+    let uid = unsafe { libc::geteuid() };
+    verify_private_leaf(&metadata(file, path)?, uid, path)?;
+    #[cfg(target_os = "macos")]
+    macos_acl::verify(file, uid, macos_acl::Scope::PrivateLeaf, path)?;
+    Ok(())
 }
 
 fn verify_private_leaf(meta: &std::fs::Metadata, uid: u32, path: &Path) -> Result<()> {

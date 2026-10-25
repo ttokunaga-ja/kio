@@ -17,7 +17,7 @@ use unicode_normalization::UnicodeNormalization;
 use crate::ExitCode;
 use crate::cas::{
     CAS_STREAM_BUFFER_BYTES, ContentObjectKind, MAX_RAW_OBJECT_BYTES, ObjectKind, ObjectStore,
-    append_jsonl, canonical_json_bytes, is_hash, read_bounded_regular_file,
+    canonical_json_bytes, is_hash, read_bounded_regular_file,
 };
 use crate::dag::{
     CommitObject, CommitStats, CommitType, DEFAULT_CHUNKING_MAX_CHARS, DEFAULT_CHUNKING_STRATEGY,
@@ -2094,6 +2094,7 @@ mod tests {
         read_windows_lock, release_windows_owned_lock, windows_lock_leaf,
     };
     use serde_json::Value;
+    use std::path::Path;
     #[cfg(windows)]
     use std::path::PathBuf;
 
@@ -2157,34 +2158,42 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unsafe_root_control_refuses_init_and_bound_initialization_without_kio() {
+    fn external_root_permissions_allow_init_with_private_bound_store() {
         use crate::store_dir::StoreDirectory;
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-        let root = tempfile::tempdir().unwrap();
-        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(Repository::init(root.path()).is_err());
-        assert!(!root.path().join(".kio").exists());
-
-        let canonical = root.path().canonicalize().unwrap();
-        let retained = StoreDirectory::open(&canonical)
-            .unwrap()
-            .root_handle()
-            .as_ref()
-            .try_clone()
+        // docs14/ST01: external root permissions do not admit Kio's own store.
+        for constructor in 0..3 {
+            let root = tempfile::tempdir().unwrap();
+            fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+            let canonical = root.path().canonicalize().unwrap();
+            let directory = StoreDirectory::open(&canonical).unwrap();
+            let before = directory.root_handle().metadata().unwrap();
+            let retained = directory.root_handle().as_ref().try_clone().unwrap();
+            let repo = match constructor {
+                0 => Repository::init(root.path()),
+                1 => Repository::init_bound(canonical.clone(), retained),
+                _ => Repository::create_bound(canonical.clone(), retained),
+            }
             .unwrap();
-        assert!(Repository::init_bound(canonical, retained).is_err());
-        assert!(!root.path().join(".kio").exists());
-
-        let canonical = root.path().canonicalize().unwrap();
-        let retained = StoreDirectory::open(&canonical)
-            .unwrap()
-            .root_handle()
-            .as_ref()
-            .try_clone()
-            .unwrap();
-        assert!(Repository::create_bound(canonical, retained).is_err());
-        assert!(!root.path().join(".kio").exists());
+            assert_eq!(repo.canonical_root(), canonical);
+            let after = fs::metadata(root.path()).unwrap();
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            assert_eq!(
+                after.permissions().mode() & 0o777,
+                0o777,
+                "external root must not be repaired"
+            );
+            crate::private_fs::verify_private_directory(&root.path().join(".kio")).unwrap();
+            assert_eq!(
+                fs::metadata(root.path().join(".kio"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o700
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -2745,13 +2754,22 @@ mod tests {
             .expect("snapshot must create a commit");
         let tree = repo.read_commit(&commit).unwrap().tree;
         let shallow = repo.kio_dir().join("gc/shallowed");
-        std::fs::create_dir_all(&shallow).unwrap();
+        let shallow_directory =
+            crate::store_dir::StoreDirectory::open_or_create_directories(&shallow).unwrap();
+        crate::private_fs::verify_private_directory_handle(&shallow_directory).unwrap();
         let leaf = &commit["sha256:".len()..];
+        let write_receipt = |leaf: &str, bytes: &[u8]| {
+            use std::io::Write as _;
+            let mut file = shallow_directory
+                .create_private_file(Path::new(leaf))
+                .unwrap();
+            file.write_all(bytes).unwrap();
+        };
 
         let wrong_tree = format!("sha256:{}", "f".repeat(64));
-        std::fs::write(
-            shallow.join(leaf),
-            crate::gc::ShallowReceipt::new(
+        write_receipt(
+            leaf,
+            &crate::gc::ShallowReceipt::new(
                 commit.clone(),
                 wrong_tree,
                 "2026-01-01T00:00:01Z".into(),
@@ -2759,14 +2777,14 @@ mod tests {
             .unwrap()
             .canonical_bytes()
             .unwrap(),
-        )
-        .unwrap();
+        );
         let mismatch = repo.tag("mismatched", Some(&commit)).unwrap_err();
         assert_eq!(mismatch.error_code(), "KIO-E-STORE-CORRUPT-001");
+        std::fs::remove_file(shallow.join(leaf)).unwrap();
 
-        std::fs::write(
-            shallow.join(leaf),
-            crate::gc::ShallowReceipt::new(
+        write_receipt(
+            leaf,
+            &crate::gc::ShallowReceipt::new(
                 commit.clone(),
                 tree.clone(),
                 "2026-01-01T00:00:01Z".into(),
@@ -2774,8 +2792,7 @@ mod tests {
             .unwrap()
             .canonical_bytes()
             .unwrap(),
-        )
-        .unwrap();
+        );
         let coexistence = repo.tag("coexisting", Some(&commit)).unwrap_err();
         assert_eq!(coexistence.error_code(), "KIO-E-STORE-CORRUPT-001");
         std::fs::remove_file(shallow.join(leaf)).unwrap();
@@ -2800,9 +2817,9 @@ mod tests {
         repo.snapshot(Some("manual child"), Some("2026-01-01T00:00:03Z"))
             .unwrap();
         let auto_leaf = &auto["sha256:".len()..];
-        std::fs::write(
-            shallow.join(auto_leaf),
-            crate::gc::ShallowReceipt::new(
+        write_receipt(
+            auto_leaf,
+            &crate::gc::ShallowReceipt::new(
                 auto.clone(),
                 auto_tree.clone(),
                 "2026-01-01T00:00:04Z".into(),
@@ -2810,8 +2827,7 @@ mod tests {
             .unwrap()
             .canonical_bytes()
             .unwrap(),
-        )
-        .unwrap();
+        );
         std::fs::remove_file(
             store
                 .object_path(crate::cas::ObjectKind::Tree, &auto_tree)
@@ -2819,7 +2835,11 @@ mod tests {
         )
         .unwrap();
         let canonical_final = repo.tag("canonical-final", Some(&auto)).unwrap_err();
-        assert_eq!(canonical_final.error_code(), "KIO-E-COMMIT-SHALLOW-001");
+        assert_eq!(
+            canonical_final.error_code(),
+            "KIO-E-COMMIT-SHALLOW-001",
+            "canonical final shallow boundary: {canonical_final:?}"
+        );
     }
 
     #[test]
@@ -3473,12 +3493,16 @@ mod tests {
         use std::sync::{Arc, Barrier, Condvar, Mutex};
 
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("contended.lock");
-        fs::write(
-            &path,
-            canonical_lock_bytes(RELEASED_LOCK_PID, "retired-owner").unwrap(),
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("contended.lock");
+        let parent = crate::store_dir::StoreDirectory::open(&root).unwrap();
+        let stale = create_windows_lock(
+            &parent.root_handle(),
+            std::path::Path::new("contended.lock"),
+            &canonical_lock_bytes(RELEASED_LOCK_PID, "retired-owner").unwrap(),
         )
         .unwrap();
+        drop(stale);
         let start = Arc::new(Barrier::new(3));
         // The successful owner remains live until the other worker has made
         // its attempt, so the assertion measures overlap rather than timing.
@@ -3823,9 +3847,10 @@ mod tests {
     // older than retention_days are pruned.
     #[test]
     fn r13_3_rotate_renames_stale_log_and_prune_drops_old_dated_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let (_fixture, dir) = private_log_fixture();
         let log = dir.path().join("events.jsonl");
-        fs::write(&log, "line1\n").unwrap(); // mtime = real today
+        dir.append_private(std::path::Path::new("events.jsonl"), b"line1\n")
+            .unwrap(); // mtime = real today
 
         // A far-future "today" makes the live file stale → rotate it away.
         rotate_stale_log(&log, "2099-01-02").unwrap();
@@ -3839,8 +3864,10 @@ mod tests {
         assert_eq!(dated.len(), 1, "exactly one dated file created: {dated:?}");
 
         // Prune: a dated file older than retention_days goes; a recent one stays.
-        fs::write(dir.path().join("events-2000-01-01.jsonl"), "old\n").unwrap();
-        fs::write(dir.path().join("events-2099-01-01.jsonl"), "recent\n").unwrap();
+        dir.append_private(std::path::Path::new("events-2000-01-01.jsonl"), b"old\n")
+            .unwrap();
+        dir.append_private(std::path::Path::new("events-2099-01-01.jsonl"), b"recent\n")
+            .unwrap();
         prune_rotated_logs(&log, "2099-01-02", 30).unwrap();
         assert!(
             !dir.path().join("events-2000-01-01.jsonl").exists(),
@@ -3852,9 +3879,23 @@ mod tests {
         );
     }
 
+    fn private_log_fixture() -> (tempfile::TempDir, crate::store_dir::StoreDirectory) {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let external = crate::store_dir::StoreDirectory::open(&root).unwrap();
+        let directory = crate::store_dir::StoreDirectory::from_retained(
+            external
+                .create_directory(std::path::Path::new("logs"))
+                .unwrap(),
+            root.join("logs"),
+        )
+        .unwrap();
+        (fixture, directory)
+    }
+
     #[test]
     fn r13_3_append_rotating_keeps_same_day_writes_in_the_live_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let (_fixture, dir) = private_log_fixture();
         let log = dir.path().join("events.jsonl");
         append_jsonl_rotating(&log, &json!({ "a": 1 }), 30).unwrap();
         append_jsonl_rotating(&log, &json!({ "a": 2 }), 30).unwrap();
@@ -3877,7 +3918,7 @@ mod tests {
             ("events.jsonl", "scrub.lock"),
             ("access.jsonl", "access.scrub.lock"),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let (_fixture, dir) = private_log_fixture();
             let log = dir.path().join(file_name);
             let lock = dir.path().join(lock_name);
             let (ready_tx, ready_rx) = std::sync::mpsc::channel();
@@ -3904,7 +3945,7 @@ mod tests {
         // R13-3 / R12-5: rotation/prune are best-effort — a garbage file that looks
         // like a dated log but has no parseable date must be skipped (not error),
         // and the append must still succeed regardless.
-        let dir = tempfile::tempdir().unwrap();
+        let (_fixture, dir) = private_log_fixture();
         let log = dir.path().join("events.jsonl");
         fs::write(dir.path().join("events-not-a-date.jsonl"), "junk\n").unwrap();
         prune_rotated_logs(&log, "2099-01-02", 30).unwrap();
@@ -3974,7 +4015,12 @@ mod tests {
 
         fs::set_permissions(&kio_dir, fs::Permissions::from_mode(0o755)).unwrap();
         let error = Repository::open(dir.path()).unwrap_err();
-        assert_eq!(error.error_code(), "KIO-E-STORE-UNSAFE-001");
+        // docs06/docs14: unsafe own store uses the managed-store namespace.
+        assert_eq!(error.error_code(), "KIO-E-MANAGEMENT-ROOT-UNSAFE-001");
+        assert_eq!(
+            fs::metadata(&kio_dir).unwrap().permissions().mode() & 0o777,
+            0o755
+        );
 
         fs::set_permissions(&kio_dir, fs::Permissions::from_mode(0o700)).unwrap();
         Repository::open(dir.path()).unwrap();
@@ -4321,7 +4367,7 @@ mod tests {
         let hash = hash_bytes(b"expected bytes");
         let store = ObjectStore::new(repo.kio_dir());
         let object_path = store.object_path(ObjectKind::Raw, &hash).unwrap();
-        fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+        store.write_raw(b"expected bytes").unwrap();
         fs::write(&object_path, b"poisoned").unwrap();
         let head_before = fs::read(repo.kio_dir().join("HEAD")).unwrap();
 

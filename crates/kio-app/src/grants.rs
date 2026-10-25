@@ -124,6 +124,7 @@ impl PrivateGrantStore {
         // The retained capability read is the authority for ancestor, owner,
         // ACL, regular-file and single-link checks; the JSON read above is
         // only the bounded, descriptor-relative transport.
+        kio_core::private_fs::verify_private_directory_handle(&directory)?;
         let private_bytes =
             kio_core::private_fs::read_private_file_at(&directory, STORE_LEAF, MAX_STORE_BYTES)?;
         if private_bytes != bytes {
@@ -160,6 +161,7 @@ impl PrivateGrantStore {
         let (device_instance_id, records) =
             match directory.read_optional(Path::new(STORE_LEAF), MAX_STORE_BYTES)? {
                 Some(bytes) => {
+                    kio_core::private_fs::verify_private_directory_handle(directory)?;
                     let private_bytes = kio_core::private_fs::read_private_file_at(
                         directory,
                         STORE_LEAF,

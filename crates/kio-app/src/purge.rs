@@ -12,17 +12,14 @@ use crate::response::mutation::{
 use crate::response::{CommandResponse, Completion, ResponseBody};
 use kio_core::control::ControlHandle;
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::commands::PurgeArgs;
 use crate::platform::{
-    PurgeRemovalObservation, configure_purge_private_temp, observe_purge_parent,
-    observe_purge_regular, observe_purge_removal, purge_parent_matches,
+    PurgeRemovalObservation, observe_purge_regular, observe_purge_removal,
     purge_regular_matches_named, purge_regular_matches_opened, purge_removal_matches,
     validate_purge_directory_native, validate_purge_regular_native,
 };
@@ -2656,88 +2653,57 @@ fn purge_fault_enabled(_: &str, _control: &ControlHandle) -> bool {
     false
 }
 
+/// Rewrite Kio-owned purge state, manifests, and logs through a retained
+/// private parent. Existing unsafe leaves are refused, never adopted or repaired.
 fn atomic_private_replace(path: &Path, bytes: &[u8]) -> Result<()> {
-    static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let parent = path.parent().ok_or_else(|| {
         KioError::io("purge state path has no parent", path.display().to_string())
     })?;
-    fs::create_dir_all(parent)
-        .map_err(|error| KioError::io(error.to_string(), parent.display().to_string()))?;
-    let metadata = fs::symlink_metadata(parent)
-        .map_err(|error| KioError::io(error.to_string(), parent.display().to_string()))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(KioError::io(
-            "purge state parent is not a real directory",
-            parent.display().to_string(),
-        ));
-    }
-    let parent_observation = observe_purge_parent(parent, &metadata)?;
-    let original_leaf = if path_exists(path)? {
-        Some(validate_existing_regular(path, None)?)
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| KioError::io("purge state path has no leaf", path.display().to_string()))?;
+    // PurgeState creates its owned state parent before phase writes; all other
+    // callers rewrite existing records. Never recreate a disappeared store.
+    let directory = kio_core::store_dir::StoreDirectory::open(parent)?;
+    kio_core::private_fs::verify_private_directory_handle(&directory)?;
+    crate::platform::verify_private_state_named_identity(&directory, parent)?;
+    let original_leaf = if directory.contains_entry(Path::new(leaf))? {
+        directory.ensure_owner_private(Path::new(leaf))?;
+        let listed = validate_existing_regular(path, None)?;
+        Some(observe_purge_regular(path, &listed)?)
     } else {
         None
     };
-    let original_leaf_observation = original_leaf
-        .as_ref()
-        .map(|listed| observe_purge_regular(path, listed))
-        .transpose()?;
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let temp = parent.join(format!(
-        ".purge-write-{}-{nanos}-{sequence}.tmp",
-        std::process::id()
-    ));
-    let result = (|| -> Result<()> {
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        configure_purge_private_temp(&mut options);
-        let mut file = options
-            .open(&temp)
-            .map_err(|error| KioError::io(error.to_string(), temp.display().to_string()))?;
-        file.write_all(bytes)
-            .map_err(|error| KioError::io(error.to_string(), temp.display().to_string()))?;
-        file.sync_all()
-            .map_err(|error| KioError::io(error.to_string(), temp.display().to_string()))?;
-        drop(file);
-        if !purge_parent_matches(&parent_observation, parent)? {
-            return Err(store_corrupt(
-                parent,
-                "purge state parent changed during rewrite",
-            ));
-        }
-        match &original_leaf_observation {
-            Some(expected) => {
-                let current = validate_existing_regular(path, None)?;
-                let identity_matches = purge_regular_matches_named(expected, path, &current)?;
-                if !identity_matches {
+    directory.write_atomic_checked(
+        Path::new(leaf),
+        bytes,
+        kio_core::store_dir::Publication::Upsert,
+        |retained_parent, retained_leaf| {
+            kio_core::private_fs::verify_private_directory_handle(retained_parent)?;
+            crate::platform::verify_private_state_named_identity(retained_parent, parent)?;
+            match &original_leaf {
+                Some(expected) => {
+                    retained_parent.ensure_owner_private(retained_leaf)?;
+                    let current = validate_existing_regular(path, None)?;
+                    if !purge_regular_matches_named(expected, path, &current)? {
+                        return Err(store_corrupt(
+                            path,
+                            "purge state file changed during rewrite",
+                        ));
+                    }
+                }
+                None if retained_parent.contains_entry(retained_leaf)? => {
                     return Err(store_corrupt(
                         path,
-                        "purge state file changed during rewrite",
+                        "purge state leaf appeared during rewrite",
                     ));
                 }
+                None => {}
             }
-            None if path_exists(path)? => {
-                return Err(store_corrupt(
-                    path,
-                    "purge state leaf appeared during rewrite",
-                ));
-            }
-            None => {}
-        }
-        fs::rename(&temp, path)
-            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-        if let Ok(directory) = fs::File::open(parent) {
-            let _ = directory.sync_all();
-        }
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temp);
-    }
-    result
+            Ok(())
+        },
+    )?;
+    crate::platform::verify_private_state_named_identity(&directory, parent)
 }
 
 fn preflight(repo: &Repository, args: &PurgeArgs) -> Result<PurgePreview> {
@@ -3139,20 +3105,41 @@ mod windows_tests {
     #[test]
     fn ct4_atomic_private_replace_uses_stable_directory_identity() {
         let root = tempfile::tempdir().unwrap();
-        let purge_dir = root.path().join("purge");
+        let root_path = root.path().canonicalize().unwrap();
+        let root_acl = || {
+            let output = Command::new("icacls.exe").arg(&root_path).output().unwrap();
+            assert!(output.status.success());
+            output.stdout
+        };
+        let original_root_acl = root_acl();
+        let external_parent = kio_core::store_dir::StoreDirectory::open(&root_path).unwrap();
+        let purge_dir = root_path.join("purge");
+        let directory = kio_core::store_dir::StoreDirectory::from_retained(
+            external_parent
+                .create_directory(std::path::Path::new("purge"))
+                .unwrap(),
+            purge_dir.clone(),
+        )
+        .unwrap();
         let path = purge_dir.join("chunk-ids.json");
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
 
         atomic_private_replace(&path, b"[]").unwrap();
+        directory
+            .ensure_owner_private(std::path::Path::new("chunk-ids.json"))
+            .unwrap();
         atomic_private_replace(&path, b"[\"replacement\"]").unwrap();
 
-        assert_eq!(std::fs::read(&path).unwrap(), b"[\"replacement\"]");
-        assert!(std::fs::read_dir(&purge_dir).unwrap().all(|entry| {
-            !entry
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".purge-write-")
-        }));
+        assert_eq!(
+            kio_core::private_fs::read_private_file(&path, 1024).unwrap(),
+            b"[\"replacement\"]"
+        );
+        kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
+        assert_eq!(root_acl(), original_root_acl);
+        assert_eq!(
+            directory.inspect_atomic().unwrap(),
+            kio_core::store_dir::AtomicWorkspaceState::Clean
+        );
     }
 
     #[test]

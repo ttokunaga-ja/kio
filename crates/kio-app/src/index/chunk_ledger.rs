@@ -75,6 +75,12 @@ pub(crate) fn open_chunk_ledger_dir(
     create_missing: bool,
 ) -> Result<ChunkLedgerDir> {
     let kio = platform::open_chunk_ledger_root(kio_dir)?;
+    let root = kio_core::store_dir::StoreDirectory::from_retained(
+        kio.try_clone()
+            .map_err(|error| KioError::io(error.to_string(), kio_dir.display().to_string()))?,
+        kio_dir.to_path_buf(),
+    )?;
+    kio_core::private_fs::verify_private_directory_handle(&root)?;
     let path = index_dir(kio_dir);
     let handle = match cap_fs::open_dir_nofollow(&kio, Path::new("index")) {
         Ok(handle) => handle,
@@ -90,14 +96,15 @@ pub(crate) fn open_chunk_ledger_dir(
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound
                 ) =>
         {
-            let mut options = cap_fs::DirOptions::new();
-            platform::configure_private_cap_directory(&mut options);
-            let created = match cap_fs::create_dir(&kio, Path::new("index"), &options) {
-                Ok(()) => true,
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => false,
-                Err(error) => {
-                    return Err(KioError::io(error.to_string(), path.display().to_string()));
+            let created = match root.create_directory(Path::new("index")) {
+                Ok(_) => true,
+                Err(error)
+                    if error.context().get("io_error_kind").and_then(Value::as_str)
+                        == Some("already_exists") =>
+                {
+                    false
                 }
+                Err(error) => return Err(error),
             };
             if created {
                 // Persist the new `index` entry in `.kio` before its child
@@ -109,6 +116,13 @@ pub(crate) fn open_chunk_ledger_dir(
         }
         Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
     };
+    let retained = kio_core::store_dir::StoreDirectory::from_retained(
+        handle
+            .try_clone()
+            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?,
+        path.clone(),
+    )?;
+    kio_core::private_fs::verify_private_directory_handle(&retained)?;
     Ok(ChunkLedgerDir {
         path,
         _root: kio,
@@ -130,6 +144,17 @@ fn try_open_chunk_ledger_file(
         .append(append)
         .create(create);
     platform::configure_chunk_ledger_open(&mut options);
+    let retained = kio_core::store_dir::StoreDirectory::from_retained(
+        directory.handle.try_clone()?,
+        directory.path.clone(),
+    )
+    .map_err(|error| std::io::Error::other(error.to_string()))?;
+    if create {
+        retained
+            .append_private(Path::new("chunks.jsonl"), &[])
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+    }
+    options.create(false);
     let file = cap_fs::open(&directory.handle, Path::new("chunks.jsonl"), &options)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -139,6 +164,8 @@ fn try_open_chunk_ledger_file(
         ));
     }
     platform::validate_chunk_ledger_links(&metadata)?;
+    kio_core::private_fs::verify_private_regular_file_handle(&file)
+        .map_err(|error| std::io::Error::other(error.to_string()))?;
     Ok(file)
 }
 
@@ -180,6 +207,7 @@ pub(crate) fn replace_chunk_ledger_contents(kio_dir: &Path, bytes: &[u8]) -> Res
                 &metadata,
                 &directory.path.join(target),
             )?;
+            open_chunk_ledger_file(&directory, true, false, false, false)?;
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => {
@@ -202,16 +230,21 @@ pub(crate) fn replace_chunk_ledger_contents(kio_dir: &Path, bytes: &[u8]) -> Res
     let mut temp_file = None;
     for attempt in 0..32_u8 {
         let candidate = format!("{temp_name_prefix}-{attempt}");
-        let mut options = cap_fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        platform::configure_chunk_ledger_temp(&mut options);
-        match cap_fs::open(&directory.handle, Path::new(&candidate), &options) {
+        let retained = kio_core::store_dir::StoreDirectory::from_retained(
+            directory.handle.try_clone().map_err(|error| {
+                KioError::io(error.to_string(), directory.path.display().to_string())
+            })?,
+            directory.path.clone(),
+        )?;
+        match retained.create_private_file(Path::new(&candidate)) {
             Ok(file) => {
                 temp_name = Some(candidate);
                 temp_file = Some(file);
                 break;
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error)
+                if error.context().get("io_error_kind").and_then(Value::as_str)
+                    == Some("already_exists") => {}
             Err(error) => {
                 return Err(KioError::io(
                     error.to_string(),

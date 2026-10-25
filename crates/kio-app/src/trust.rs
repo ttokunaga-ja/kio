@@ -509,6 +509,7 @@ fn read_pending_from(directory: &StoreDirectory) -> Result<Option<PendingRegistr
     let Some(bytes) = directory.read_optional(Path::new(PENDING), MAX_RECORD_BYTES)? else {
         return Ok(None);
     };
+    kio_core::private_fs::verify_private_directory_handle(directory)?;
     if kio_core::private_fs::read_private_file_at(directory, PENDING, MAX_RECORD_BYTES)? != bytes {
         return Err(err(
             "KIO-E-LOCAL-TRUST-PENDING-CHANGED-001",
@@ -560,6 +561,7 @@ fn read_record_from(directory: &StoreDirectory) -> Result<Option<TrustRecord>> {
     let Some(bytes) = directory.read_optional(Path::new(ACTIVE), MAX_RECORD_BYTES)? else {
         return Ok(None);
     };
+    kio_core::private_fs::verify_private_directory_handle(directory)?;
     let private_bytes =
         kio_core::private_fs::read_private_file_at(directory, ACTIVE, MAX_RECORD_BYTES)?;
     if private_bytes != bytes {

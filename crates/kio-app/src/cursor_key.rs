@@ -45,6 +45,7 @@ fn load_or_create_at(parent: &StoreDirectory) -> Result<Vec<u8>> {
 }
 
 fn read_key(parent: &StoreDirectory) -> Result<Vec<u8>> {
+    kio_core::private_fs::verify_private_directory_handle(parent)?;
     let key =
         kio_core::private_fs::read_private_file_at(parent, CURSOR_KEY_LEAF, CURSOR_KEY_BYTES)?;
     if key.len() != CURSOR_KEY_BYTES as usize {

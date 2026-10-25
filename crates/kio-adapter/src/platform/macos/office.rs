@@ -429,10 +429,11 @@ pub(crate) fn write_private_uno_catalog(
     }
     let (start, end) = macos_spell_component_range(&bytes)?;
     let destination = scratch.join("services-without-macos-spell.rdb");
-    let mut output = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&destination)
+    let directory = kio_core::private_fs::verify_private_directory(scratch).map_err(|error| {
+        AdapterError::ContractViolation(format!("unsafe Office service catalog scratch: {error}"))
+    })?;
+    let mut output = directory
+        .create_private_file(Path::new("services-without-macos-spell.rdb"))
         .map_err(|error| {
             AdapterError::ContractViolation(format!(
                 "cannot create private Office service catalog: {error}"
@@ -448,16 +449,6 @@ pub(crate) fn write_private_uno_catalog(
                 "cannot write private Office service catalog: {error}"
             ))
         })?;
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600)).map_err(
-            |error| {
-                AdapterError::ContractViolation(format!(
-                    "cannot restrict private Office service catalog: {error}"
-                ))
-            },
-        )?;
-    }
     Ok(destination)
 }
 /// Create an exclusively allocated, owner-private scratch directory.
