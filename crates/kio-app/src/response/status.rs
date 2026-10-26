@@ -37,6 +37,8 @@ pub struct PausedTasksByHoldReason {
 
 #[derive(Debug, Serialize)]
 pub struct BudgetStatusResponse {
+    pub budget_status: String,
+    pub budget_reason: Option<String>,
     pub month: String,
     pub device_monthly_usd_cap: f64,
     pub folder_monthly_usd_cap: Option<f64>,

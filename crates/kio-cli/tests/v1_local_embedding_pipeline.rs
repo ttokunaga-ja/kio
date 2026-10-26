@@ -94,6 +94,7 @@ fn kio(dir: &TempDir, args: &[&str]) -> Command {
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
         .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
+        .env("XDG_STATE_HOME", dir.path().join(".test-state"))
         .args(args);
     if let Some(system_root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", system_root);
@@ -105,6 +106,7 @@ fn setup(dir: &TempDir, peer: &ClosingLoopback) {
     #[cfg(unix)]
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir_all(dir.path().join(".home")).unwrap();
+    support::create_private_child_dir(dir.path(), ".test-state");
     fs::create_dir_all(dir.path().join(".tmp")).unwrap();
     let config = dir.path().join(".test-config/kio/tools.toml");
     #[cfg(windows)]
@@ -237,27 +239,11 @@ fn offline_index_never_contacts_approved_local_embedding_peer() {
         String::from_utf8_lossy(&normal.stdout),
         String::from_utf8_lossy(&normal.stderr),
     );
-    let ledger = support::immutable_sqlite(dir.path().join(".test-data/kio/cost-ledger.sqlite"));
-    let (outcome, usd, estimated, state, null_handle): (String, f64, bool, i64, bool) = ledger.query_row(
-        "SELECT l.outcome, l.usd, l.estimated, b.state, b.batch_job_id IS NULL FROM cost_ledger l JOIN batch_requests b USING (scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq) WHERE l.adapter_kind='embedding'",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-    ).unwrap();
-    assert_ne!(outcome, "succeeded", "TLS EOF cannot be a successful send");
-    assert_ne!(
-        outcome, "unknown_settled",
-        "local TLS EOF has no paid remote uncertainty"
-    );
-    assert_eq!(usd, 0.0);
-    assert!(
-        !estimated,
-        "local confirmed-zero failure is not an estimate"
-    );
     assert_eq!(
-        state, 3,
-        "local transport failure must reach terminal state"
+        embedding_rows(&dir),
+        (0, 0),
+        "APP-01 local transport failure must not journal or settle billing"
     );
-    assert!(null_handle, "local execution has no remote job handle");
     let tasks = fs::read_to_string(dir.path().join(".kio/tasks.jsonl")).unwrap();
     let embedding = tasks
         .lines()

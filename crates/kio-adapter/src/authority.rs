@@ -3,8 +3,9 @@
 //! This module is deliberately a description of the production transport that
 //! the built-in clients will use.  It neither reads a credential value nor
 //! sends a probe.  Callers persist this identity with a grant and re-create it
-//! immediately before send, so a changed declaration, endpoint, or local CA
-//! cannot silently inherit an earlier approval.
+//! immediately before send. Local identity lookup reads only lifecycle metadata;
+//! the selected HTTPS boundary validates CA bytes and retains the lifecycle lock.
+//! A changed declaration, endpoint, or trust generation cannot inherit an earlier approval.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,7 +29,7 @@ pub struct RuntimeExecutionIdentityRequest<'a> {
 
 /// Stable, non-secret identity used by device grant approval and send-time
 /// matching.  Credential references never contain credential material; local
-/// trust is a freshly read CA-bundle digest.
+/// trust binds the read-only managed CA lifecycle identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RuntimeExecutionIdentity {
@@ -57,6 +58,7 @@ pub fn runtime_execution_identity(
     if request.tool_profile_hash.is_empty() {
         return Err(schema("tool_profile_hash must not be empty"));
     }
+    settings.role_credentials_ready(request.role)?;
     let declared = settings.declared_adapter(request.role);
     if let Some(declared) = declared.as_ref() {
         tool_lock::validate_declared_runtime_target(request.role, declared)?;
@@ -163,16 +165,16 @@ fn local_identity(
         .url
         .as_deref()
         .ok_or_else(|| schema("offline_api adapter has no declared url"))?;
-    let endpoint = settings.authenticated_local_endpoint(request.role, url)?;
+    let destination = crate::local_peer::validate_local_https_url(url)?;
     Ok(RuntimeExecutionIdentity {
         role: request.role.to_owned(),
         tool_id: tool_id.to_owned(),
         tool_profile_hash: request.tool_profile_hash.to_owned(),
         execution_mode: "offline_api".to_owned(),
-        canonical_destination: endpoint.destination_binding().to_owned(),
+        canonical_destination: destination,
         credential_binding: "none".to_owned(),
-        // Endpoint construction re-validates the certificate bytes against
-        // the captured digest. The grant additionally binds the managed
+        // Identity lookup reads only non-secret lifecycle metadata. Actual
+        // endpoint construction validates CA bytes and retains its lock. The grant binds the managed
         // lifecycle generation, preventing an A→B→A CA sequence from
         // reviving a grant minted for the original A generation.
         trust_binding: settings.local_peer_trust_binding()?,
@@ -306,37 +308,37 @@ mod tests {
 
     #[test]
     fn gemini_identity_covers_sync_and_async_batch_send_routes() {
-        with_declaration(
-            "embedding",
-            declared(
-                "gemini_embedding_2",
-                "online_api",
-                "plain:NEVER_PERSIST_THIS",
-            ),
-            |settings| {
-                let identity = runtime_execution_identity(
-                    settings,
-                    RuntimeExecutionIdentityRequest {
-                        role: "embedding",
-                        tool_id: "gemini_embedding_2",
-                        tool_profile_hash: "sha256:profile",
-                    },
-                )
-                .unwrap();
-                assert_eq!(identity.credential_binding, "plain:tools.toml:embedding");
-                assert!(!format!("{identity:?}").contains("NEVER_PERSIST_THIS"));
-                assert!(
-                    identity
-                        .canonical_destination
-                        .contains(":batchEmbedContents")
-                );
-                assert!(
-                    identity
-                        .canonical_destination
-                        .contains(":asyncBatchEmbedContent")
-                );
-            },
-        );
+        crate::tool_lock::with_test_role_auth("embedding", |settings| {
+            let mut settings = settings.clone();
+            let source = "[embedding.gemini_embedding_2]\nkind = \"online_api\"\nmodel = \"gemini-embedding-2\"\nauth = \"plain:NEVER_PERSIST_THIS\"\n";
+            std::fs::write(settings.tools_toml_path.as_ref().unwrap(), source).unwrap();
+            let value = toml::from_str(source).unwrap();
+            settings.declarations.insert(
+                "embedding".into(),
+                crate::tool_lock::declared_adapter_for_role(&value, "embedding").unwrap(),
+            );
+            let identity = runtime_execution_identity(
+                &settings,
+                RuntimeExecutionIdentityRequest {
+                    role: "embedding",
+                    tool_id: "gemini_embedding_2",
+                    tool_profile_hash: "sha256:profile",
+                },
+            )
+            .unwrap();
+            assert_eq!(identity.credential_binding, "plain:tools.toml:embedding");
+            assert!(!format!("{identity:?}").contains("NEVER_PERSIST_THIS"));
+            assert!(
+                identity
+                    .canonical_destination
+                    .contains(":batchEmbedContents")
+            );
+            assert!(
+                identity
+                    .canonical_destination
+                    .contains(":asyncBatchEmbedContent")
+            );
+        });
     }
 
     #[test]
@@ -459,7 +461,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn local_identity_binds_normalized_endpoint_and_current_ca_digest() {
+    fn local_identity_binds_normalized_endpoint_and_managed_lifecycle() {
         let directory = tempfile::Builder::new()
             .prefix("kio-authority-local-")
             .tempdir_in(std::env::current_dir().unwrap())

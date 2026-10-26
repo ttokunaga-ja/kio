@@ -5,6 +5,10 @@ use crate::index::command::repository_input_display_path;
 use crate::index::command::repository_scan_policy_allows_file;
 use crate::index::pipeline::offline_output_ref;
 use crate::ledger_access::SYNC_RESEND_AUTHORIZED_REASON;
+use crate::local_execution::{
+    Claim as LocalClaim, LocalContract, LocalExecution, LocalExecutionKind, LocalGuard,
+    LocalIdentity, LocalTarget,
+};
 use crate::object_persistence::compute_manifest_hash;
 use crate::object_persistence::normalized_output_ref;
 use crate::object_persistence::pipeline_to_kio;
@@ -165,6 +169,8 @@ pub(crate) fn prorated_markdownize_cost(
 /// same conditions as defense in depth; this is the loop's pre-charge gate.
 /// R21-3: outcome of the send-time online-markdownize precondition check.
 pub(crate) enum OnlineMarkdownizePrecondition {
+    /// Consumed source policy is unavailable; preserve task and billing authority.
+    PolicyUnavailable(KioError),
     /// File present, unchanged, within the input cap, non-text-native, with locally
     /// extracted units to enhance — ready to send.
     Send(PreparedOnlineMarkdownizeInput),
@@ -238,9 +244,11 @@ pub(crate) fn classify_online_markdownize_precondition(
     if !repository_scan_policy_allows_file(repo, &task.input_path).unwrap_or(false) {
         return OnlineMarkdownizePrecondition::Retire;
     }
-    let Ok(verified) =
-        read_repository_scan_input(repo, &task.input_path, effective_max_input_bytes(repo))
-    else {
+    let max_input_bytes = match effective_max_input_bytes(repo) {
+        Ok(limit) => limit,
+        Err(error) => return OnlineMarkdownizePrecondition::PolicyUnavailable(error),
+    };
+    let Ok(verified) = read_repository_scan_input(repo, &task.input_path, max_input_bytes) else {
         return OnlineMarkdownizePrecondition::Retire;
     };
     if verified.raw_hash != task.input_hash {
@@ -370,8 +378,11 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
     let mut executed = 0_usize;
     for task in store.all().map_err(pipeline_to_kio)? {
         if task.task_type != TaskType::Markdownize
-            || task.status != TaskStatus::Pending
+            || !(matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
+                || (task.status == TaskStatus::Paused
+                    && task.hold_reason == Some(kio_pipeline::task::HoldReason::Auth)))
             || task.output_ref != output_ref
+            || task.reservation_id.is_some()
         {
             continue;
         }
@@ -381,8 +392,13 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
         // would break content-addressing identically on either route.
         let prepared_input = match classify_online_markdownize_precondition(repo, &task) {
             OnlineMarkdownizePrecondition::Send(prepared_input) => prepared_input,
+            OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
             OnlineMarkdownizePrecondition::Retire => {
-                retire_offline_markdownize_task(store, &task.task_id, "invalid_input")?;
+                retire_offline_markdownize_task(
+                    store,
+                    &task.task_id,
+                    crate::ledger_access::RETIRED_NON_LIVE,
+                )?;
                 continue;
             }
             _ => continue,
@@ -398,87 +414,303 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
         )? {
             continue;
         }
-        let task_id = task.task_id.clone();
-        match execute_offline_markdownize_task(
-            adapter_settings,
+        let request_identity = serde_json::to_vec(&(
+            &task.input_path,
+            &task.unit_keys,
+            &prepared_input.media_type,
+            builtin_prepare_profile().tool_profile_hash,
+            prepared_unit_hints(&prepared_input.prepared_units),
+        ))
+        .map_err(|_| KioError::schema("cannot encode local OCR input identity"))?;
+        let identity = LocalIdentity {
+            execution: LocalExecutionKind::Loopback,
+            target: LocalTarget::Ocr {
+                scope_id: repo.scope_identity()?.scope_id,
+                target: kio_pipeline::prepare::hash_bytes(&request_identity),
+            },
+            input_sha256: task
+                .input_hash
+                .strip_prefix("sha256:")
+                .ok_or_else(|| KioError::schema("local OCR task has an invalid input hash"))?
+                .to_owned(),
+            profile: profile.tool_profile_hash.clone(),
+            contract: LocalContract::Ocr {
+                raw_hash: task.input_hash.clone(),
+                tool_profile: profile.tool_profile_hash.clone(),
+            },
+        };
+        let local = LocalExecution::new(
+            LocalExecution::default_root(repo.control())?,
+            repo.control().clone(),
+        )?;
+        let now = repo.control().now_utc_seconds();
+        let now_ms = kio_core::scope::parse_utc_seconds(&now)
+            .ok_or_else(|| KioError::schema("invalid local execution time"))?
+            .saturating_mul(1000);
+        let retry_at = task
+            .next_retry_at
+            .as_deref()
+            .map(|time| {
+                kio_core::scope::parse_utc_seconds(time)
+                    .map(|seconds| seconds.saturating_mul(1000))
+                    .ok_or_else(|| KioError::schema("invalid local OCR retry time"))
+            })
+            .transpose()?;
+        let mut claim = match local.claim(&identity, task.attempts, retry_at, 5, now_ms)? {
+            LocalClaim::Busy => continue,
+            LocalClaim::Backoff {
+                attempts,
+                next_retry_at,
+                kind,
+            } => {
+                mirror_local_ocr_wait(
+                    store,
+                    &task.task_id,
+                    attempts,
+                    Some(next_retry_at),
+                    kind,
+                    false,
+                )?;
+                continue;
+            }
+            LocalClaim::Exhausted { attempts, kind } => {
+                mirror_local_ocr_wait(store, &task.task_id, attempts, None, kind, true)?;
+                continue;
+            }
+            LocalClaim::Claimed(claim) => claim,
+        };
+        // The intent is durable before adapter construction. A restarted Running
+        // task must reclaim this same identity rather than reset its retry budget.
+        store
+            .update_matching(|candidate| {
+                if candidate.task_id != task.task_id {
+                    return false;
+                }
+                candidate.status = TaskStatus::Running;
+                candidate.hold_reason = None;
+                candidate.fallback_reason = None;
+                candidate.next_retry_at = None;
+                candidate.attempts = claim.attempts();
+                candidate.heartbeat_at = Some(now.clone());
+                true
+            })
+            .map_err(pipeline_to_kio)?;
+        let response = if let Some(bytes) = claim.result()? {
+            let response: kio_adapter::types::MarkdownizeResponse = serde_json::from_slice(&bytes)
+                .map_err(|_| KioError::schema("invalid durable local OCR result"))?;
+            if serde_json::to_vec(&response)
+                .map_err(|_| KioError::schema("invalid local OCR result"))?
+                != bytes
+            {
+                return Err(KioError::schema("noncanonical durable local OCR result"));
+            }
+            response
+        } else {
+            match request_offline_markdownize_task(
+                adapter_settings,
+                repo,
+                &task,
+                &prepared_input,
+                execution,
+                claim.token(),
+            ) {
+                Ok(response) => response,
+                Err(LocalOcrRequestFailure::Admission(error)) => {
+                    claim.cancel_unsent()?;
+                    mirror_local_ocr_wait(
+                        store,
+                        &task.task_id,
+                        claim.attempts(),
+                        None,
+                        None,
+                        false,
+                    )?;
+                    return Err(error);
+                }
+                Err(LocalOcrRequestFailure::Attempt(failure)) => {
+                    fail_local_ocr_claim(store, &task, &mut claim, failure, &now)?;
+                    continue;
+                }
+            }
+        };
+        let effective_hints = match validate_local_ocr_result(&task, &prepared_input, &response) {
+            Ok(hints) => hints,
+            Err(failure) => {
+                // A durable accepted result becoming invalid is corruption; do
+                // not overwrite it with a retry record or send the input again.
+                if claim.result()?.is_some() {
+                    return Err(KioError::schema(
+                        "durable local OCR result failed acceptance",
+                    ));
+                }
+                fail_local_ocr_claim(store, &task, &mut claim, failure, &now)?;
+                continue;
+            }
+        };
+        if claim.result()?.is_none() {
+            let bytes = serde_json::to_vec(&response)
+                .map_err(|_| KioError::schema("cannot encode local OCR result"))?;
+            claim.stage_result(&bytes)?;
+        }
+        let outcome = materialize_online_markdownize_response(
             repo,
             &task,
-            prepared_input,
-            execution,
-        ) {
-            Ok(outcome) => {
-                // `persist_normalized_instance` has just committed the immutable
-                // normalized-unit CAS objects.  Bind this pass's tree entry to the
-                // manifest selected from that authoritative representation before
-                // the later rebuild reads it.  The path-named normalized instance
-                // remains a cache; using its old pre-OCR manifest pin here would
-                // correctly make the CAS-aware rebuild see no units at all.
-                let manifest_hash =
-                    compute_manifest_hash(repo, &task.input_hash, &profile.tool_profile_hash, 0)?;
-                normalize_by_path.insert(
-                    task.input_path.clone(),
-                    PendingNormalizeRef {
-                        expected_raw_hash: task.input_hash.clone(),
-                        normalize: NormalizeRef {
-                            tool_profile_hash: profile.tool_profile_hash.clone(),
-                            r#gen: 0,
-                            manifest_hash,
-                        },
-                    },
-                );
-                store
-                    .update_matching(|candidate| {
-                        if candidate.task_id == task_id {
-                            candidate.status = outcome.status;
-                            candidate.output_ref = outcome.output_ref.clone();
-                            candidate.fallback_reason = Some("local_adapter_done".to_owned());
-                            candidate.heartbeat_at = None;
-                            candidate.mode = Some(outcome.mode);
-                            candidate.changed_unit_keys = outcome.changed_unit_keys.clone();
-                            if matches!(outcome.status, TaskStatus::Partial | TaskStatus::Failed) {
-                                candidate.attempts = candidate.attempts.saturating_add(1);
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    })
-                    .map_err(pipeline_to_kio)?;
-                executed += 1;
-            }
-            Err(failure) => {
-                // Left Pending on a retryable failure — a model server that is
-                // not up yet is the ordinary case, and the next `kio index`
-                // should simply pick the task up again. Only a genuinely
-                // non-retryable one is retired, so a stopped server never
-                // silently discards work.
-                let retryable = !matches!(
-                    failure.retry_kind,
-                    RetryErrorKind::InvalidInput | RetryErrorKind::ContractViolation
-                );
-                let reason = if retryable {
-                    "local_adapter_unavailable"
-                } else {
-                    "contract_violation"
-                };
-                store
-                    .update_matching(|candidate| {
-                        if candidate.task_id == task_id {
-                            candidate.attempts = candidate.attempts.saturating_add(1);
-                            candidate.fallback_reason = Some(reason.to_owned());
-                            if !retryable {
-                                candidate.status = TaskStatus::Failed;
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    })
-                    .map_err(pipeline_to_kio)?;
-            }
-        }
+            prepared_input.prepared_units,
+            &prepared_input.media_type,
+            &prepared_input.bytes,
+            None,
+            profile.tool_profile_hash.clone(),
+            response,
+            &effective_hints,
+        )
+        .map_err(|_| {
+            KioError::io(
+                "local OCR result publication failed; validated result retained for recovery",
+                repo.kio_dir().display().to_string(),
+            )
+        })?;
+        let manifest_hash =
+            compute_manifest_hash(repo, &task.input_hash, &profile.tool_profile_hash, 0)?;
+        normalize_by_path.insert(
+            task.input_path.clone(),
+            PendingNormalizeRef {
+                expected_raw_hash: task.input_hash.clone(),
+                normalize: NormalizeRef {
+                    tool_profile_hash: profile.tool_profile_hash.clone(),
+                    r#gen: 0,
+                    manifest_hash,
+                },
+            },
+        );
+        store
+            .update_matching(|candidate| {
+                if candidate.task_id != task.task_id {
+                    return false;
+                }
+                candidate.status = outcome.status;
+                candidate.output_ref = outcome.output_ref.clone();
+                candidate.fallback_reason = Some("local_adapter_done".to_owned());
+                candidate.heartbeat_at = None;
+                candidate.next_retry_at = None;
+                candidate.hold_reason = None;
+                candidate.mode = Some(outcome.mode);
+                candidate.changed_unit_keys = outcome.changed_unit_keys.clone();
+                candidate.attempts = claim.attempts();
+                true
+            })
+            .map_err(pipeline_to_kio)?;
+        claim.publish()?;
+        executed += 1;
     }
     Ok(executed)
+}
+
+/// Mirror an already-owned attempt outcome without incrementing a Task twice.
+fn mirror_local_ocr_wait(
+    store: &TaskStore,
+    task_id: &str,
+    attempts: u32,
+    next_retry_at: Option<i64>,
+    kind: Option<RetryErrorKind>,
+    terminal: bool,
+) -> Result<()> {
+    store
+        .update_matching(|task| {
+            if task.task_id != task_id {
+                return false;
+            }
+            task.attempts = attempts;
+            task.heartbeat_at = None;
+            if let Some(kind) = kind {
+                task.fallback_reason = Some(retry_reason(kind).to_owned());
+                task.hold_reason = hold_reason_for_reason(retry_reason(kind));
+            }
+            task.status = if task.hold_reason.is_some() {
+                TaskStatus::Paused
+            } else if terminal {
+                TaskStatus::Failed
+            } else {
+                TaskStatus::Pending
+            };
+            task.next_retry_at = next_retry_at
+                .map(|time| kio_core::scope::format_utc_seconds(time.div_euclid(1000)));
+            true
+        })
+        .map_err(pipeline_to_kio)?;
+    Ok(())
+}
+
+fn fail_local_ocr_claim(
+    store: &TaskStore,
+    task: &TaskDescriptor,
+    claim: &mut LocalGuard,
+    failure: TaskExecutionFailure,
+    now: &str,
+) -> Result<()> {
+    let kind = failure.retry_kind;
+    let policy = kio_pipeline::task::retry_policy(kind);
+    let consume = kind != RetryErrorKind::RateLimit;
+    let attempts = claim.attempts().saturating_sub(u32::from(!consume));
+    let terminal = !policy.retryable || policy.max_attempts.is_some_and(|max| attempts >= max);
+    let retry_at = if terminal || policy.paused {
+        None
+    } else {
+        let time = if kind == RetryErrorKind::RateLimit {
+            crate::task_execution::rate_limit_retry_at(now, failure.retry_after_ms)
+        } else {
+            crate::task_execution::scheduled_retry_at(now, &policy.backoff, attempts)
+        };
+        Some(
+            kio_core::scope::parse_utc_seconds(&time)
+                .ok_or_else(|| KioError::schema("invalid local OCR retry schedule"))?
+                .saturating_mul(1000),
+        )
+    };
+    claim.fail(kind, retry_at, consume, terminal)?;
+    mirror_local_ocr_wait(
+        store,
+        &task.task_id,
+        claim.attempts(),
+        retry_at,
+        Some(kind),
+        terminal,
+    )
+}
+
+/// Apply the common v1 acceptance gate before making a result recoverable.
+fn validate_local_ocr_result(
+    task: &TaskDescriptor,
+    prepared: &PreparedOnlineMarkdownizeInput,
+    response: &kio_adapter::types::MarkdownizeResponse,
+) -> std::result::Result<Vec<PreparedUnitHint>, TaskExecutionFailure> {
+    let hints = prepared_unit_hints(&prepared.prepared_units);
+    let effective = effective_prepared_unit_hints(&hints, &task.input_hash, response)
+        .map_err(task_failure_from_adapter)?;
+    let units = if prepared.prepared_units.is_empty() {
+        prepared_units_from_ocr_discovery(
+            &effective,
+            &prepared.media_type,
+            &task.input_hash,
+            &prepared.bytes,
+            &builtin_prepare_profile().tool_profile_hash,
+        )
+        .map_err(|_| TaskExecutionFailure {
+            retry_kind: RetryErrorKind::ContractViolation,
+            retry_after_ms: None,
+        })?
+    } else {
+        prepared.prepared_units.clone()
+    };
+    if !matches!(
+        validate_markdownize_response(response, &all_changed_hints(&units), &units),
+        Ok(kio_pipeline::markdownize::MarkdownizeAcceptance::Accepted)
+    ) {
+        return Err(TaskExecutionFailure {
+            retry_kind: RetryErrorKind::ContractViolation,
+            retry_after_ms: None,
+        });
+    }
+    Ok(effective)
 }
 
 fn retire_offline_markdownize_task(store: &TaskStore, task_id: &str, reason: &str) -> Result<()> {
@@ -503,13 +735,19 @@ fn retire_offline_markdownize_task(store: &TaskStore, task_id: &str, reason: &st
 /// to avoid re-billing pages that did not change; with nothing to bill, its
 /// only remaining effect would be extra ways to be wrong about page
 /// correspondence.
-fn execute_offline_markdownize_task(
+enum LocalOcrRequestFailure {
+    Admission(KioError),
+    Attempt(TaskExecutionFailure),
+}
+
+fn request_offline_markdownize_task(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     task: &TaskDescriptor,
-    prepared_input: PreparedOnlineMarkdownizeInput,
+    prepared_input: &PreparedOnlineMarkdownizeInput,
     execution: LocalOcrExecution,
-) -> std::result::Result<OnlineExecutionOutcome, TaskExecutionFailure> {
+    token: &str,
+) -> std::result::Result<kio_adapter::types::MarkdownizeResponse, LocalOcrRequestFailure> {
     let PreparedOnlineMarkdownizeInput {
         media_type,
         bytes,
@@ -519,21 +757,24 @@ fn execute_offline_markdownize_task(
     let profile = kio_adapter::local_ocr_markdownize::profile_for(execution);
     let scope_id = repo
         .scope_identity()
-        .map(|identity| identity.scope_id)
-        .map_err(|_| TaskExecutionFailure {
-            retry_kind: RetryErrorKind::InvalidInput,
-            retry_after_ms: None,
-        })?;
+        .map_err(LocalOcrRequestFailure::Admission)?
+        .scope_id;
+    let image_store = repo
+        .object_store()
+        .image_store()
+        .map_err(LocalOcrRequestFailure::Admission)?;
     let adapter = local_ocr_markdownize_adapter_with_control(
         adapter_settings,
         execution,
         &scope_id,
-        &image_store_for_task(repo)?,
-        &bytes,
+        &image_store,
+        bytes,
         repo.control(),
     )
-    .map_err(task_failure_from_adapter)?;
-    let hints = prepared_unit_hints(&prepared_units);
+    .map_err(|error| {
+        LocalOcrRequestFailure::Admission(crate::object_persistence::adapter_to_kio(error))
+    })?;
+    let hints = prepared_unit_hints(prepared_units);
     let response = adapter
         .markdownize(MarkdownizeRequest {
             raw: RawInput {
@@ -551,27 +792,10 @@ fn execute_offline_markdownize_task(
             bbox_annotation_enabled: false,
             tool_profile_hash: profile.tool_profile_hash.clone(),
             spec_version: 1,
-            // No ledger row exists, so there is no intent token to carry.
-            idempotency_token: None,
+            idempotency_token: Some(token.to_owned()),
         })
-        .map_err(task_failure_from_adapter)?;
-    // OCR-from-scratch is the normal case here: a scanned PDF has no text layer,
-    // so `prepared_units` is empty and the unit identities exist only in the
-    // response. Passing the empty request set straight through made every such
-    // document persist as zero units and fail the contract check.
-    let effective_hints = effective_prepared_unit_hints(&hints, &task.input_hash, &response)
-        .map_err(task_failure_from_adapter)?;
-    materialize_online_markdownize_response(
-        repo,
-        task,
-        prepared_units,
-        &media_type,
-        &bytes,
-        None,
-        profile.tool_profile_hash,
-        response,
-        &effective_hints,
-    )
+        .map_err(|error| LocalOcrRequestFailure::Attempt(task_failure_from_adapter(error)))?;
+    Ok(response)
 }
 
 pub(crate) fn execute_online_markdownize_task(
@@ -1236,12 +1460,14 @@ pub(crate) fn task_failure_from_adapter(error: kio_adapter::AdapterError) -> Tas
     let retry_kind = match error {
         kio_adapter::AdapterError::Auth(_) => RetryErrorKind::AuthError,
         kio_adapter::AdapterError::LocalPeerAuth(_) => RetryErrorKind::LocalPeerAuth,
-        kio_adapter::AdapterError::LocalPeerConfig { .. } => RetryErrorKind::LocalPeerConfig,
+        kio_adapter::AdapterError::LocalPeerConfig { .. }
+        | kio_adapter::AdapterError::RuntimeTrust(_) => RetryErrorKind::LocalPeerConfig,
         kio_adapter::AdapterError::RateLimit { .. } => RetryErrorKind::RateLimit,
         kio_adapter::AdapterError::QuotaExceeded(_) => RetryErrorKind::QuotaExceeded,
         kio_adapter::AdapterError::Network(_) | kio_adapter::AdapterError::Io { .. } => {
             RetryErrorKind::NetworkError
         }
+        kio_adapter::AdapterError::RuntimeConfiguration { .. } => RetryErrorKind::InvalidInput,
         kio_adapter::AdapterError::ContractViolation(_)
         | kio_adapter::AdapterError::ConfigSchema(_)
         | kio_adapter::AdapterError::ConfigSchemaCoded { .. } => RetryErrorKind::ContractViolation,

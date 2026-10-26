@@ -14,7 +14,7 @@ use crate::embedding::admission::secret_embedding_hold_required;
 use crate::embedding::admission::validate_embedding_aliases;
 use crate::embedding::admission::{embedding_is_deterministic, embedding_is_online};
 use crate::embedding::batch::submit_embedding_batch_jobs;
-use crate::embedding::input::referenced_authorized_image_hashes_for_chunks;
+use crate::embedding::image_executor::{ImageEnrichmentRequest, run_image_embedding_enrichment};
 use crate::embedding::plan::EMBEDDING_BATCH_SIZE;
 use crate::embedding::plan::EmbeddableChunk;
 use crate::embedding::plan::EmbeddingReconcileContext;
@@ -32,11 +32,10 @@ use crate::embedding::plan::retained_chunks_without_embedding;
 use crate::embedding::plan::retained_history_chunks;
 use crate::embedding::plan::selected_embedding_contexts;
 use crate::embedding::plan::validate_embedding_task_bindings;
-use crate::embedding::transport::run_embedding_adapter;
+use crate::embedding::transport::{EmbeddingRunFailure, run_embedding_adapter};
 use crate::embedding_owners;
 use crate::historical_reindex::RetainedNormalizedInstance;
 use crate::historical_reindex::retained_history_instances;
-use crate::image_authority;
 use crate::index::chunk_ledger::rotate_index_generation_unconditionally;
 use crate::index::chunk_ledger::sqlite_path;
 use crate::index::rebuild::held_secret_embedding_chunk_ids;
@@ -50,14 +49,11 @@ use crate::ledger_access::settle_task_charge_unknown;
 use crate::ledger_access::sync_result_unknown_fenced;
 use crate::ledger_access::task_ledger_key;
 use crate::markdownize::execution::TaskExecutionFailure;
-use crate::object_persistence::adapter_to_kio;
 use crate::object_persistence::index_to_kio;
 use crate::object_persistence::pipeline_to_kio;
-use crate::search::projection::mark_replica_unavailable_or_log;
 use crate::search::projection::publish_in_place_delta;
 use crate::search::projection::replica_now_ms;
 use crate::search::projection::replica_scope_stamp;
-use crate::search::projection::write_through_projection_or_log;
 use crate::search::projection::write_through_projection_or_log_for_repo;
 use crate::search::query::ensure_snapshot_tree_entries;
 use crate::search::query::snapshot_chunking_config_hash;
@@ -68,15 +64,11 @@ use crate::task_execution::ExecOutcome;
 use crate::task_execution::rate_limit_retry_at;
 use crate::task_execution::retry_reason;
 use crate::task_execution::scheduled_retry_at;
-use crate::task_execution::task_retry_allowed;
-use crate::task_execution::task_retry_due;
 use kio_adapter::catalog::DeclaredEmbeddingProfile;
 use kio_adapter::catalog::EmbeddingExecution;
-use kio_adapter::catalog::embedding_descriptor_with_control;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_adapter::traits::PreferredRequestKind;
 use kio_adapter::types::EmbeddingCompleted;
-use kio_adapter::types::EmbeddingContent;
 use kio_adapter::types::EmbeddingInputType;
 use kio_adapter::types::EmbeddingItem;
 use kio_adapter::types::EmbeddingLogicalJobId;
@@ -91,12 +83,8 @@ use kio_core::cas::ProducerExecutionMode;
 use kio_core::cas::ProducerProvenance;
 use kio_core::control::ControlHandle;
 use kio_core::scope::Repository;
-use kio_core::scope::new_ulid;
 #[cfg(debug_assertions)]
 use kio_core::test_control::EmbeddingPublicationFault;
-use kio_index::EmbeddingDistance;
-use kio_index::EmbeddingModality;
-use kio_index::EmbeddingTargetType;
 use kio_index::embedding_store;
 use kio_index::embedding_store::f32_to_le_bytes;
 use kio_index::fts::ExistingSourceIndexOpenMode;
@@ -109,7 +97,6 @@ use kio_pipeline::ledger::BatchState;
 use kio_pipeline::ledger::LedgerDb;
 use kio_pipeline::ledger::Outcome;
 use kio_pipeline::ledger::RequestKind;
-use kio_pipeline::ledger::TaskKey as LedgerTaskKey;
 use kio_pipeline::ledger::embedding_job::EmbeddingJob;
 use kio_pipeline::ledger::embedding_job::EmbeddingJobBinding;
 use kio_pipeline::ledger::embedding_job::EmbeddingJobMember;
@@ -117,7 +104,6 @@ use kio_pipeline::ledger::embedding_job::EmbeddingReservationOutcome;
 use kio_pipeline::ledger::embedding_job::EmbeddingReserveRequest;
 use kio_pipeline::ledger::ops::BilledAmount;
 use kio_pipeline::ledger::ops::TerminalWrite;
-use kio_pipeline::ledger::ops::cost_ledger_rows_for_key;
 use kio_pipeline::ledger::ops::embedding_job;
 use kio_pipeline::ledger::ops::finish_embedding_publication;
 use kio_pipeline::ledger::ops::get_batch_request;
@@ -126,15 +112,12 @@ use kio_pipeline::ledger::ops::stage_embedding_result;
 use kio_pipeline::ledger::ops::terminal_transaction;
 use kio_pipeline::policy::CurrentPolicyEvaluator;
 use kio_pipeline::task::EmbeddingTaskTarget;
-use kio_pipeline::task::HoldReason;
 use kio_pipeline::task::RetryErrorKind;
-use kio_pipeline::task::TaskDescriptor;
 use kio_pipeline::task::TaskStatus;
 use kio_pipeline::task::TaskStore;
 use kio_pipeline::task::TaskType;
 use kio_pipeline::task::hold_reason_for_reason;
 use kio_pipeline::task::retry_policy;
-use kio_pipeline::task::task_can_complete_from_materialized_output;
 use rusqlite::Connection;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -237,10 +220,18 @@ fn run_embedding_enrichment_for_instances(
     if profile.modality != "multimodal" {
         return Ok(ExecOutcome::default());
     }
-    // Every embedding profile uses the physical device ledger, including
-    // deterministic and 0 USD local work. A missing ledger pauses execution;
-    // ordinary index/resume must never initialize one implicitly.
-    let ledger = open_optional_ledger_db(invocation.control)?;
+    let free_execution = crate::embedding::transport::embedding_is_free(
+        adapter_settings,
+        execution,
+        invocation.control,
+    )?;
+    // Billing authority is consumed only by paid execution. A retained paid
+    // Task is not converted to local work by selecting a free profile.
+    let ledger = if free_execution {
+        None
+    } else {
+        open_optional_ledger_db(invocation.control)?
+    };
     let execute_now = online || embedding_is_deterministic(execution);
     let db_path = sqlite_path(repo.kio_dir());
     if !db_path.exists() {
@@ -502,7 +493,7 @@ fn run_embedding_enrichment_for_instances(
             .map_err(pipeline_to_kio)?;
         return Ok(outcome);
     }
-    if ledger.is_none() {
+    if !free_execution && ledger.is_none() {
         let mut holds = BTreeMap::new();
         record_embedding_transitions(
             &mut holds,
@@ -636,6 +627,15 @@ fn run_embedding_enrichment_for_instances(
         .map(|task| (task.output_ref.clone(), task))
         .collect::<BTreeMap<_, _>>();
 
+    let local_store = free_execution
+        .then(|| {
+            crate::local_execution::LocalExecution::new(
+                crate::local_execution::LocalExecution::default_root(invocation.control)?,
+                invocation.control.clone(),
+            )
+        })
+        .transpose()?;
+    let mut local_publications = Vec::new();
     'embedding_batches: for batch in embeddable.chunks(EMBEDDING_BATCH_SIZE) {
         // Split content-addressed reuse (no API call, free) from chunks that
         // require a live adapter call (CT3-EMBED-006).
@@ -684,56 +684,258 @@ fn run_embedding_enrichment_for_instances(
         if plan.to_send.is_empty() {
             continue;
         }
-        // Each `to_send` GROUP (one deduplicated content identity —
-        // `embedding_hash`, fanned out to every member chunk sharing that exact
-        // contextualized input) is ONE ledger reservation, keyed by that exact
-        // `embedding_hash` — never by a representative task's bare `text_hash`:
-        // the latter can collide across distinct filename contexts. A group's
-        // members share ONE 8,192-token upper-bound reservation at the lane's
-        // text price (or zero for local work). The reservation itself
-        // is intentionally delayed until the group is about to make its one
-        // provider call, so an earlier failure cannot strand rows for groups
-        // that never left Kio.
-        struct GroupCharge {
-            key: LedgerTaskKey,
-            candidate_usd: f64,
-        }
-        let mut charge_by_group: Vec<GroupCharge> = Vec::with_capacity(plan.to_send.len());
+        // Validate every Task owner before any group can dispatch.
         for group in &plan.to_send {
-            let output_ref = embedding_task_output_ref(group.representative);
-            if !embedding_tasks_by_ref.contains_key(&output_ref) {
+            if !embedding_tasks_by_ref
+                .contains_key(&embedding_task_output_ref(group.representative))
+            {
                 return Err(KioError::schema(
                     "embedding send has no matching task reservation owner",
                 ));
             }
+        }
+        // One physical call per group keeps provider usage and accounting on
+        // the same content identity, across every contextualized alias.
+        for group in &plan.to_send {
+            if free_execution {
+                let tasks = group
+                    .members
+                    .iter()
+                    .filter_map(|chunk| {
+                        embedding_tasks_by_ref.get(&embedding_task_output_ref(chunk))
+                    })
+                    .collect::<Vec<_>>();
+                // A selected free profile cannot consume a retained paid claim.
+                if tasks.iter().any(|task| task.reservation_claim().is_some()) {
+                    outcome.paused += group.members.len();
+                    continue;
+                }
+                validate_embedding_aliases(
+                    &current_policy,
+                    &profile,
+                    group.members.iter().copied(),
+                )
+                .map_err(|_| KioError::schema("local embedding policy changed before claim"))?;
+                admit_embedding_transport(
+                    adapter_settings,
+                    repo,
+                    execution,
+                    &profile,
+                    &current_policy,
+                    group
+                        .members
+                        .iter()
+                        .any(|chunk| chunk.requires_secret_approval),
+                )?;
+                let members = group_job_members(group, &profile);
+                let identity = crate::embedding::transport::local_embedding_identity(
+                    crate::local_execution::LocalTarget::Document {
+                        scope_id: scope_id.clone(),
+                        target: group.embedding_hash.clone(),
+                    },
+                    group.embedding_hash.clone(),
+                    &profile,
+                    execution,
+                    members.clone(),
+                )?;
+                let floor_attempts = tasks.iter().map(|task| task.attempts).max().unwrap_or(0);
+                let floor_next = tasks
+                    .iter()
+                    .filter_map(|task| task.next_retry_at.as_deref())
+                    .filter_map(kio_core::scope::parse_utc_seconds)
+                    .max()
+                    .map(|seconds| seconds * 1000);
+                let mut claim = match local_store.as_ref().expect("free execution state").claim(
+                    &identity,
+                    floor_attempts,
+                    floor_next,
+                    crate::embedding::transport::local_max_attempts(execution),
+                    invocation.control.now_millis(),
+                )? {
+                    crate::local_execution::Claim::Claimed(claim) => claim,
+                    crate::local_execution::Claim::Busy => {
+                        outcome.inflight += group.members.len();
+                        continue;
+                    }
+                    crate::local_execution::Claim::Backoff {
+                        attempts,
+                        next_retry_at,
+                        kind,
+                    } => {
+                        let refs = tasks.iter().map(|task| task.output_ref.clone()).collect();
+                        mirror_local_embedding_wait(
+                            &task_store,
+                            &refs,
+                            attempts,
+                            Some(next_retry_at),
+                            kind,
+                            false,
+                        )?;
+                        continue;
+                    }
+                    crate::local_execution::Claim::Exhausted { attempts, kind } => {
+                        let refs = tasks.iter().map(|task| task.output_ref.clone()).collect();
+                        mirror_local_embedding_wait(
+                            &task_store,
+                            &refs,
+                            attempts,
+                            None,
+                            kind,
+                            true,
+                        )?;
+                        continue;
+                    }
+                };
+                let recovered_bytes = claim.result()?;
+                let refs = tasks.iter().map(|task| task.output_ref.clone()).collect();
+                mirror_local_embedding_start(&task_store, &refs, claim.attempts(), &now)?;
+                let completed = if let Some(bytes) = recovered_bytes {
+                    crate::embedding::transport::decode_local_embedding_result(
+                        &bytes,
+                        &profile,
+                        members.iter().map(|member| member.id.clone()).collect(),
+                    )?
+                } else {
+                    match send_local_embed_group(
+                        adapter_settings,
+                        &embedding_context,
+                        group,
+                        claim.token().to_owned(),
+                        invocation.control,
+                    ) {
+                        Ok(result) => {
+                            let vector = result
+                                .members
+                                .iter()
+                                .find_map(|member| match &member.result {
+                                    EmbeddingMemberResult::Vector { vector } => Some(vector),
+                                    _ => None,
+                                })
+                                .ok_or_else(|| {
+                                    KioError::schema("local embedding completion has no vector")
+                                })?;
+                            let completed = EmbeddingCompleted {
+                                members: members
+                                    .iter()
+                                    .map(|member| EmbeddingMemberOutcome {
+                                        id: member.id.clone(),
+                                        result: EmbeddingMemberResult::Vector {
+                                            vector: vector.clone(),
+                                        },
+                                    })
+                                    .collect(),
+                                dimensions: u32::try_from(profile.dimensions).map_err(|_| {
+                                    KioError::schema("embedding dimensions exceed u32")
+                                })?,
+                                distance: profile.distance.clone(),
+                                modality: profile.modality.clone(),
+                                embedding_profile_hash: profile.profile_hash.clone(),
+                                usage: EmbeddingUsage::Unmetered,
+                            };
+                            claim.stage_result(&serde_json::to_vec(&completed).map_err(
+                                |_| KioError::schema("cannot serialize local embedding completion"),
+                            )?)?;
+                            completed
+                        }
+                        Err(crate::embedding::transport::LocalEmbeddingRunFailure::Classified(
+                            failure,
+                        )) => {
+                            let next = fail_local_embedding_claim(&mut claim, &failure, &now)?;
+                            let refs = tasks.iter().map(|task| task.output_ref.clone()).collect();
+                            mirror_local_embedding_failure(
+                                &task_store,
+                                &refs,
+                                claim.attempts(),
+                                next,
+                                failure.retry_kind,
+                            )?;
+                            if next.is_some() {
+                                outcome.failed_retryable += group.members.len();
+                            }
+                            count_embedding_failure(
+                                &mut outcome,
+                                failure.retry_kind,
+                                group.members.len(),
+                            );
+                            break 'embedding_batches;
+                        }
+                        Err(crate::embedding::transport::LocalEmbeddingRunFailure::Admission(
+                            error,
+                        )) => {
+                            claim.cancel_unsent()?;
+                            mirror_local_unsent(&task_store, &refs, claim.attempts())?;
+                            return Err(error);
+                        }
+                        Err(
+                            crate::embedding::transport::LocalEmbeddingRunFailure::InProcessIo(
+                                error,
+                            ),
+                        ) => {
+                            claim.interrupt()?;
+                            let refs = tasks.iter().map(|task| task.output_ref.clone()).collect();
+                            mirror_local_interruption(
+                                &task_store,
+                                &refs,
+                                claim.attempts(),
+                                claim.attempts() >= 3,
+                                None,
+                            )?;
+                            return Err(crate::embedding::transport::local_runtime_error(error));
+                        }
+                    }
+                };
+                let vector = completed
+                    .members
+                    .iter()
+                    .find_map(|member| match &member.result {
+                        EmbeddingMemberResult::Vector { vector } => Some(vector.as_slice()),
+                        _ => None,
+                    })
+                    .ok_or_else(|| KioError::schema("local embedding completion has no vector"))?;
+                #[cfg(debug_assertions)]
+                if invocation
+                    .control
+                    .debug()
+                    .cli
+                    .embedding_publication_fault
+                    .known()
+                    == Some(&EmbeddingPublicationFault::BeforeSourceWrite)
+                {
+                    return Err(KioError::schema(
+                        "local group publication interrupted before source write",
+                    ));
+                }
+                persist_group_vector(
+                    &conn,
+                    &profile,
+                    group,
+                    vector,
+                    &BTreeSet::new(),
+                    &embedding_context.projection,
+                    &mut replica,
+                )
+                .map_err(|_| KioError::schema("local embedding publication failed"))?;
+                local_publications.push(claim);
+                record_embedding_transitions(
+                    &mut transitions,
+                    group.members.iter().copied(),
+                    embedding_done_transition(),
+                );
+                outcome.executed += group.members.len();
+                continue;
+            }
+            let ledger = ledger
+                .as_ref()
+                .expect("embedding execution requires initialized ledger");
             let key = task_ledger_key(
                 &scope_id,
                 EMBEDDING_ADAPTER_KIND,
                 &group.embedding_hash,
                 &profile.profile_hash,
             );
-            let candidate_usd = if embedding_is_online(execution) {
-                embedding_text_reservation(adapter_settings, active_embedding_send_lane())
-            } else {
-                0.0
-            };
-            // Admission remains immediately before this group's provider call.
-            charge_by_group.push(GroupCharge { key, candidate_usd });
-        }
-        // One HTTP call per group, so this row's charge is the token count the
-        // provider reported for THIS row. `:batchEmbedContents` bills and
-        // reports per CALL, so any call spanning several rows can only be split
-        // by guesswork; the Batch lane avoids that by making the job the task
-        // (07 §5.5), and the sync lane avoids it by making the call the row.
-        // The realtime lane is opt-in and never the default (2026-07-25
-        // ruling), so its extra round trips buy exact per-row billing at a cost
-        // no default path pays.
-        for (index, charge) in charge_by_group.iter().enumerate() {
-            let group = &plan.to_send[index];
-            let ledger = ledger
-                .as_ref()
-                .expect("embedding execution requires initialized ledger");
-            let existing = get_batch_request(ledger, &charge.key).map_err(pipeline_to_kio)?;
+            let candidate_usd =
+                embedding_text_reservation(adapter_settings, active_embedding_send_lane());
+            let existing = get_batch_request(ledger, &key).map_err(pipeline_to_kio)?;
             if let Some(row) = existing.as_ref() {
                 if let Some(job) = embedding_job(ledger, row).map_err(pipeline_to_kio)?
                     && job.known_result.is_some()
@@ -779,17 +981,8 @@ fn run_embedding_enrichment_for_instances(
                     // A prior process may have sent this group before dying.
                     // Settle its unqueryable result and fence it instead of
                     // reusing that reservation for another provider request.
-                    if embedding_is_online(execution) {
-                        release_task_charge_if_open(ledger, &charge.key)?;
-                    } else if let Some(job) = embedding_job(ledger, row).map_err(pipeline_to_kio)? {
-                        kio_pipeline::ledger::ops::settle_local_embedding_crash(ledger, &job)
-                            .map_err(pipeline_to_kio)?;
-                    }
-                    let kind = if embedding_is_online(execution) {
-                        RetryErrorKind::ResultUnknown
-                    } else {
-                        RetryErrorKind::ContractViolation
-                    };
+                    release_task_charge_if_open(ledger, &key)?;
+                    let kind = RetryErrorKind::ResultUnknown;
                     record_embedding_transitions(
                         &mut transitions,
                         group.members.iter().copied(),
@@ -815,12 +1008,12 @@ fn run_embedding_enrichment_for_instances(
                     .any(|chunk| chunk.requires_secret_approval),
             )?;
             let caps = budget_cap_config(&budget_caps, &scope_id, EMBEDDING_ADAPTER_KIND);
-            let binding = group_job_binding(group, &profile, execution)?;
+            let binding = group_job_binding(group, &profile)?;
             let job = match reserve_embedding_job(
                 ledger,
                 &EmbeddingReserveRequest {
-                    key: &charge.key,
-                    candidate_usd: charge.candidate_usd,
+                    key: &key,
+                    candidate_usd,
                     caps: &caps,
                     request_kind: RequestKind::Sync,
                     timeout_seconds: Some(
@@ -866,7 +1059,7 @@ fn run_embedding_enrichment_for_instances(
                 }
             };
             let intent_token = job.intent_token.clone();
-            let reserved_usd = charge.candidate_usd;
+            let reserved_usd = candidate_usd;
             // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): a provider
             // idempotency key identifies one HTTP call, and now every call is
             // one group, so each send carries its OWN reservation's token
@@ -881,7 +1074,7 @@ fn run_embedding_enrichment_for_instances(
                 Ok((vector, usage)) => {
                     let completed = completed_group_result(&binding, &profile, &vector, usage);
                     stage_embedding_result(ledger, &job, &completed).map_err(pipeline_to_kio)?;
-                    let staged = get_batch_request(ledger, &charge.key)
+                    let staged = get_batch_request(ledger, &key)
                         .map_err(pipeline_to_kio)?
                         .ok_or_else(|| KioError::schema("staged embedding lost ledger row"))?;
                     let staged = embedding_job(ledger, &staged)
@@ -909,49 +1102,46 @@ fn run_embedding_enrichment_for_instances(
                     );
                     outcome.executed += group.members.len();
                 }
-                Err(failure) => {
+                Err(EmbeddingRunFailure::BeforeDispatch(error)) => {
+                    kio_pipeline::ledger::embedding_job::reject_unsent_embedding_job(ledger, &job)
+                        .map_err(pipeline_to_kio)?;
+                    release_unsent_embedding_tasks(&task_store, &job)?;
+                    return Err(error);
+                }
+                Err(EmbeddingRunFailure::Failure(failure)) => {
                     let known_rejection = matches!(
                         failure.retry_kind,
                         RetryErrorKind::AuthError
                             | RetryErrorKind::RateLimit
                             | RetryErrorKind::QuotaExceeded
                     );
-                    {
-                        if known_rejection || !embedding_is_online(execution) {
-                            terminal_transaction(
-                                ledger,
-                                &TerminalWrite {
-                                    key: &charge.key,
-                                    outcome: if embedding_is_online(execution) {
-                                        Outcome::SubmitRejected
-                                    } else {
-                                        Outcome::ContractViolation
-                                    },
-                                    billed: BilledAmount {
-                                        usd: 0.0,
-                                        estimated: false,
-                                    },
-                                    ledger_batch_job_id: &intent_token,
-                                    next_state: BatchState::Terminal,
-                                    error: Some(retry_reason(failure.retry_kind)),
-                                    increment_contract_violation: false,
-                                    attempts_delta: 1,
-                                    clear_intent_token: true,
-                                    intent_token_guard: Some(&intent_token),
-                                    reseat_submission_seq: false,
+
+                    if known_rejection {
+                        terminal_transaction(
+                            ledger,
+                            &TerminalWrite {
+                                key: &key,
+                                outcome: Outcome::SubmitRejected,
+                                billed: BilledAmount {
+                                    usd: 0.0,
+                                    estimated: false,
                                 },
-                            )
-                            .map_err(pipeline_to_kio)?;
-                        } else {
-                            settle_task_charge_unknown(
-                                ledger,
-                                &charge.key,
-                                &intent_token,
-                                reserved_usd,
-                            )?;
-                        }
+                                ledger_batch_job_id: &intent_token,
+                                next_state: BatchState::Terminal,
+                                error: Some(retry_reason(failure.retry_kind)),
+                                increment_contract_violation: false,
+                                attempts_delta: 1,
+                                clear_intent_token: true,
+                                intent_token_guard: Some(&intent_token),
+                                reseat_submission_seq: false,
+                            },
+                        )
+                        .map_err(pipeline_to_kio)?;
+                    } else {
+                        settle_task_charge_unknown(ledger, &key, &intent_token, reserved_usd)?;
                     }
-                    let result_unknown = embedding_is_online(execution) && !known_rejection;
+
+                    let result_unknown = !known_rejection;
                     let kind = if result_unknown {
                         RetryErrorKind::ResultUnknown
                     } else {
@@ -990,6 +1180,9 @@ fn run_embedding_enrichment_for_instances(
     publish_in_place_delta(ctx, repo.kio_dir(), replica_before.as_deref(), &replica)?;
     if outcome.executed > 0 && replica.is_empty() {
         write_through_projection_or_log_for_repo(ctx, repo);
+    }
+    for mut claim in local_publications {
+        claim.publish()?;
     }
     for job in publication_jobs {
         finish_embedding_publication(ledger.as_ref().expect("embedding ledger"), &job)
@@ -1200,7 +1393,7 @@ pub(crate) fn apply_embedding_transitions(
 /// The execution identity and current admission authority shared by chunk and
 /// image embedding call edges.
 pub(crate) struct EmbeddingExecutionContext<'a> {
-    repo: &'a Repository,
+    pub(crate) repo: &'a Repository,
     pub(crate) execution: EmbeddingExecution,
     pub(crate) profile: &'a DeclaredEmbeddingProfile,
     pub(crate) current_policy: &'a CurrentPolicyEvaluator,
@@ -1406,7 +1599,7 @@ pub(crate) fn send_embed_group(
     // representative from.
     idempotency_token: Option<String>,
     control: &ControlHandle,
-) -> std::result::Result<(Vec<f32>, Option<kio_adapter::types::AdapterUsage>), TaskExecutionFailure>
+) -> std::result::Result<(Vec<f32>, Option<kio_adapter::types::AdapterUsage>), EmbeddingRunFailure>
 {
     // Contextual-embedding addendum (07 §5.3, 2026-07-24): the adapter input is
     // the humanized filename context prepended to the chunk body. Every member
@@ -1417,34 +1610,7 @@ pub(crate) fn send_embed_group(
         embedding.profile,
         group.members.iter().copied(),
     )?;
-    let context = embedding_store::chunk_embedding_context(&group.representative.raw_path);
-    let items = vec![EmbeddingItem::text(
-        group.embedding_hash.clone(),
-        embedding_store::contextualized_embedding_input(
-            context.as_deref(),
-            &group.representative.text,
-        ),
-    )];
-    // Online sends were admitted immediately before their ledger reservation;
-    // local HTTP also has a zero-dollar reservation, and admission must be
-    // rechecked at its call edge.
-    if !embedding_is_online(embedding.execution) {
-        admit_embedding_transport(
-            adapter_settings,
-            embedding.repo,
-            embedding.execution,
-            embedding.profile,
-            embedding.current_policy,
-            group
-                .members
-                .iter()
-                .any(|chunk| chunk.requires_secret_approval),
-        )
-        .map_err(|_| TaskExecutionFailure {
-            retry_kind: RetryErrorKind::AuthError,
-            retry_after_ms: None,
-        })?;
-    }
+    let items = group_embedding_items(group);
     let outcome = run_embedding_adapter(
         adapter_settings,
         embedding.execution,
@@ -1461,13 +1627,15 @@ pub(crate) fn send_embed_group(
         return Err(TaskExecutionFailure {
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
-        });
+        }
+        .into());
     };
     let EmbeddingMemberResult::Vector { vector } = &member.result else {
         return Err(TaskExecutionFailure {
             retry_kind: RetryErrorKind::ContractViolation,
             retry_after_ms: None,
-        });
+        }
+        .into());
     };
     let usage = match outcome.usage {
         EmbeddingUsage::Metered { usage } => Some(usage),
@@ -1476,26 +1644,31 @@ pub(crate) fn send_embed_group(
     Ok((vector.clone(), usage))
 }
 
+fn group_job_members(
+    group: &EmbeddingSendGroup<'_>,
+    profile: &DeclaredEmbeddingProfile,
+) -> Vec<EmbeddingJobMember> {
+    group
+        .members
+        .iter()
+        .map(|chunk| EmbeddingJobMember {
+            id: chunk.chunk_id.clone(),
+            target: chunk_task_target(chunk, profile),
+        })
+        .collect()
+}
+
 fn group_job_binding(
     group: &EmbeddingSendGroup<'_>,
     profile: &DeclaredEmbeddingProfile,
-    execution: EmbeddingExecution,
 ) -> Result<EmbeddingJobBinding> {
     Ok(EmbeddingJobBinding {
         logical_job_id: EmbeddingLogicalJobId(group.embedding_hash.clone()),
-        local: !embedding_is_online(execution),
         dimensions: u32::try_from(profile.dimensions)
             .map_err(|_| KioError::schema("embedding profile dimensions exceed u32"))?,
         distance: profile.distance.clone(),
         modality: profile.modality.clone(),
-        members: group
-            .members
-            .iter()
-            .map(|chunk| EmbeddingJobMember {
-                id: chunk.chunk_id.clone(),
-                target: chunk_task_target(chunk, profile),
-            })
-            .collect(),
+        members: group_job_members(group, profile),
     })
 }
 
@@ -1520,13 +1693,9 @@ fn completed_group_result(
         distance: profile.distance.clone(),
         modality: profile.modality.clone(),
         embedding_profile_hash: profile.profile_hash.clone(),
-        usage: if binding.local {
-            EmbeddingUsage::Unmetered
-        } else {
-            usage.map_or(EmbeddingUsage::Estimated, |usage| EmbeddingUsage::Metered {
-                usage,
-            })
-        },
+        usage: usage.map_or(EmbeddingUsage::Estimated, |usage| EmbeddingUsage::Metered {
+            usage,
+        }),
     }
 }
 
@@ -1551,25 +1720,18 @@ impl GroupPublication<'_, '_> {
             return Err(KioError::schema("embedding publication attempt changed"));
         }
         if row.state.is_inflight() {
-            let billed = if job.binding.local {
-                BilledAmount {
-                    usd: 0.0,
-                    estimated: false,
-                }
-            } else {
-                embedding_billed_from_usage(
-                    self.invocation.settings,
-                    match &result.usage {
-                        EmbeddingUsage::Metered { usage } => Some(usage),
-                        EmbeddingUsage::Estimated | EmbeddingUsage::Unmetered => None,
-                    },
-                    active_embedding_send_lane(),
-                    row.estimated_usd,
-                    self.invocation.control,
-                    self.invocation.locks,
-                    EmbeddingInputType::MarkdownChunk,
-                )
-            };
+            let billed = embedding_billed_from_usage(
+                self.invocation.settings,
+                match &result.usage {
+                    EmbeddingUsage::Metered { usage } => Some(usage),
+                    EmbeddingUsage::Estimated | EmbeddingUsage::Unmetered => None,
+                },
+                active_embedding_send_lane(),
+                row.estimated_usd,
+                self.invocation.control,
+                self.invocation.locks,
+                EmbeddingInputType::MarkdownChunk,
+            );
             settle_task_charge_success(self.ledger, &job.key, &job.intent_token, billed)?;
         }
         let vector = result
@@ -1722,1084 +1884,6 @@ pub(crate) fn persist_group_vector(
     Ok(())
 }
 
-/// Embed typed-owned image objects cited by live chunks into `image_vec`.
-struct ImageEnrichmentRequest<'a> {
-    retained_instances: &'a [RetainedNormalizedInstance],
-    eligible_chunks: &'a [EmbeddableChunk],
-    task_store: &'a TaskStore,
-    ledger: Option<&'a LedgerDb>,
-    secrets_approved: bool,
-    execution_allowed: bool,
-    override_budget: bool,
-}
-
-fn run_image_embedding_enrichment(
-    invocation: Invocation<'_>,
-    embedding: &EmbeddingExecutionContext<'_>,
-    conn: &Connection,
-    request: ImageEnrichmentRequest<'_>,
-) -> Result<ExecOutcome> {
-    let ImageEnrichmentRequest {
-        retained_instances,
-        eligible_chunks,
-        task_store,
-        ledger,
-        secrets_approved,
-        execution_allowed,
-        override_budget,
-    } = request;
-    let ctx = &invocation;
-    let adapter_settings = invocation.settings;
-
-    let descriptor = embedding_descriptor_with_control(
-        adapter_settings,
-        embedding.execution,
-        invocation.control,
-    )
-    .map_err(adapter_to_kio)?;
-    let external_images_allowed = embedding.repo.image_external_send_allowed()?;
-    let exclusion = if descriptor.effects.egress && !external_images_allowed {
-        Some("images_excluded_from_external_send")
-    } else if descriptor.capability.image_mime_types.is_empty() {
-        Some("image_capability_unavailable")
-    } else {
-        None
-    };
-    let scope_id = embedding.repo.scope_identity()?.scope_id;
-    let image_authority = image_authority::retained_image_authority(
-        embedding.repo,
-        retained_instances,
-        embedding.current_policy,
-    )?;
-    let referenced = referenced_authorized_image_hashes_for_chunks(
-        eligible_chunks,
-        &scope_id,
-        &image_authority,
-        secrets_approved,
-    );
-    if referenced.is_empty() {
-        return Ok(ExecOutcome::default());
-    }
-    let mut already = embedding_store::embedded_image_inputs(conn, &embedding.profile.profile_hash)
-        .map_err(index_to_kio)?;
-    // The embedding CAS is immutable truth; the source image row and device
-    // replica are projections. Restore a missing projection from the exact
-    // current image/profile object without reserving or sending again.
-    let store = embedding.repo.object_store();
-    // Retain only small typed identities; source bytes are prepared one at a time.
-    let mut plans = BTreeMap::new();
-    for image_hash in &referenced {
-        match crate::embedding::input::prepare_owned_embedding_image(
-            &store,
-            image_hash,
-            embedding.profile,
-        ) {
-            Ok((plan, _)) => {
-                plans.insert(image_hash.clone(), plan);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    // A codec change retires only unsent tasks for the replaced input. A
-    // durable accepted/known job still owns its original binding and must be
-    // collected and settled even when that input is no longer current.
-    let mut retired_task_ids = BTreeSet::new();
-    for task in task_store.all().map_err(pipeline_to_kio)? {
-        if !matches!(
-            task.status,
-            TaskStatus::Pending | TaskStatus::Paused | TaskStatus::Failed | TaskStatus::Skipped
-        ) || task.reservation_id.is_some()
-            || task.reserved_usd.is_some()
-            || task.reserved_month.is_some()
-        {
-            continue;
-        }
-        if task.status == TaskStatus::Skipped
-            && task.fallback_reason.as_deref() == Some("image_input_changed")
-        {
-            continue;
-        }
-        let Some(EmbeddingTaskTarget::Image {
-            image_hash,
-            embedding_hash,
-            profile_hash,
-            ..
-        }) = task.embedding_target.as_ref()
-        else {
-            continue;
-        };
-        let Some(plan) = plans.get(image_hash) else {
-            continue;
-        };
-        if profile_hash != &embedding.profile.profile_hash
-            || task.embedding_target.as_ref() == Some(&plan.target)
-        {
-            continue;
-        }
-        if let Some(ledger) = ledger {
-            let key = task_ledger_key(
-                &scope_id,
-                EMBEDDING_ADAPTER_KIND,
-                embedding_hash,
-                profile_hash,
-            );
-            if let Some(row) = get_batch_request(ledger, &key).map_err(pipeline_to_kio)?
-                && (row.state.is_inflight()
-                    || embedding_job(ledger, &row)
-                        .map_err(pipeline_to_kio)?
-                        .is_some_and(|job| job.known_result.is_some()))
-            {
-                continue;
-            }
-        }
-        retired_task_ids.insert(task.task_id);
-    }
-    if !retired_task_ids.is_empty() {
-        task_store
-            .update_matching(|task| {
-                if !retired_task_ids.contains(&task.task_id) {
-                    return false;
-                }
-                task.status = TaskStatus::Skipped;
-                task.fallback_reason = Some("image_input_changed".to_owned());
-                task.hold_reason = None;
-                task.next_retry_at = None;
-                task.deadline = None;
-                task.heartbeat_at = None;
-                true
-            })
-            .map_err(pipeline_to_kio)?;
-    }
-    let mut restored = 0_usize;
-    let restoration = (|| -> Result<()> {
-        for image_hash in &referenced {
-            let Some(plan) = plans.get(image_hash) else {
-                continue;
-            };
-            if already
-                .get(image_hash)
-                .is_some_and(|input| input.as_deref() == plan.context_key())
-            {
-                continue;
-            }
-            let embedding_hash = embedding_store::embedding_hash(
-                EmbeddingTargetType::Image,
-                image_hash,
-                embedding.profile.dimensions,
-                EmbeddingDistance::Cosine,
-                EmbeddingModality::Multimodal,
-                &embedding.profile.profile_hash,
-                plan.context.as_ref(),
-            )
-            .map_err(index_to_kio)?;
-            let object = match store.read_embedding(&embedding_hash) {
-                Ok(object) => object,
-                Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => continue,
-                Err(error) => return Err(error),
-            };
-            if object.metadata.image_input_receipt.as_ref() != plan.receipt()
-                || object.context != plan.context
-            {
-                return Err(KioError::schema("image embedding input identity mismatch"));
-            }
-            if restored == 0 {
-                mark_replica_unavailable_or_log(ctx, embedding.repo.kio_dir());
-            }
-            embedding_store::write_image_embedding(
-                conn,
-                &embedding_hash,
-                image_hash,
-                &embedding_store::f32_to_le_bytes(&object.vector),
-                object.dimensions,
-                &object.distance,
-                &object.modality,
-                &object.profile_hash,
-                plan.context_key(),
-            )
-            .map_err(index_to_kio)?;
-            already.insert(image_hash.clone(), plan.context_key().map(str::to_owned));
-            restored += 1;
-        }
-        Ok(())
-    })();
-    if restored > 0 {
-        rotate_index_generation_unconditionally(
-            embedding.repo.kio_dir(),
-            embedding.repo.control(),
-        )?;
-        write_through_projection_or_log(ctx, embedding.repo.kio_dir());
-    }
-    restoration?;
-    let now = invocation.control.now_utc_seconds();
-    let existing_tasks = task_store.all().map_err(pipeline_to_kio)?;
-    for image_hash in &referenced {
-        let Some(plan) = plans.get(image_hash) else {
-            continue;
-        };
-        let target = plan.target.clone();
-        let materialized = already
-            .get(image_hash)
-            .is_some_and(|input| input.as_deref() == plan.context_key());
-        let output_ref = target.output_ref();
-        if let Some(existing) = existing_tasks
-            .iter()
-            .find(|task| task.output_ref == output_ref)
-        {
-            if exclusion.is_none()
-                && materialized
-                && materialized_image_task_can_complete(existing, &target, &scope_id, ledger)?
-            {
-                task_store
-                    .update_matching(|task| {
-                        if task.task_id != existing.task_id {
-                            return false;
-                        }
-                        task.clear_reservation();
-                        task.status = TaskStatus::Done;
-                        task.fallback_reason = Some("embedding_adapter_done".to_owned());
-                        task.next_retry_at = None;
-                        task.heartbeat_at = None;
-                        true
-                    })
-                    .map_err(pipeline_to_kio)?;
-                continue;
-            }
-            let admitted_pending = if !execution_allowed {
-                (TaskStatus::Pending, Some("network_opt_in_required"))
-            } else if ledger.is_none() {
-                (TaskStatus::Paused, Some("ledger_initialization_required"))
-            } else {
-                (TaskStatus::Pending, None)
-            };
-            let next = if (existing.status == TaskStatus::Skipped && exclusion.is_none())
-                || (existing.status == TaskStatus::Paused
-                    && existing.fallback_reason.as_deref()
-                        == Some("ledger_initialization_required")
-                    && (ledger.is_some() || !execution_allowed))
-                || (existing.status == TaskStatus::Pending
-                    && existing.fallback_reason.as_deref() == Some("network_opt_in_required")
-                    && execution_allowed)
-            {
-                Some(admitted_pending)
-            } else if existing.status == TaskStatus::Paused
-                && existing.hold_reason == Some(HoldReason::Budget)
-                && execution_allowed
-                && ledger.is_some()
-                && exclusion.is_none()
-                && override_budget
-            {
-                Some((TaskStatus::Pending, None))
-            } else if (existing.status != TaskStatus::Done
-                && existing.status != TaskStatus::Skipped
-                && exclusion.is_some())
-                || (existing.status == TaskStatus::Skipped
-                    && existing.fallback_reason.as_deref() != exclusion)
-            {
-                Some((TaskStatus::Skipped, exclusion))
-            } else {
-                None
-            };
-            if let Some((status, reason)) = next {
-                task_store
-                    .update_matching(|task| {
-                        if task.output_ref != output_ref {
-                            return false;
-                        }
-                        task.status = status;
-                        task.fallback_reason = reason.map(str::to_owned);
-                        task.hold_reason = (status == TaskStatus::Paused)
-                            .then_some(HoldReason::LedgerInitializationRequired);
-                        task.next_retry_at = None;
-                        task.heartbeat_at = None;
-                        true
-                    })
-                    .map_err(pipeline_to_kio)?;
-            }
-            continue;
-        }
-        let input_path = eligible_chunks
-            .iter()
-            .find(|chunk| chunk.text.contains(image_hash))
-            .map(|chunk| chunk.raw_path.clone())
-            .ok_or_else(|| KioError::schema("owned image has no citing chunk path"))?;
-        let status = if exclusion.is_some() {
-            TaskStatus::Skipped
-        } else if materialized {
-            TaskStatus::Done
-        } else if !execution_allowed {
-            TaskStatus::Pending
-        } else if ledger.is_none() {
-            TaskStatus::Paused
-        } else {
-            TaskStatus::Pending
-        };
-        let fallback_reason = exclusion
-            .or_else(|| (!execution_allowed).then_some("network_opt_in_required"))
-            .or_else(|| (ledger.is_none()).then_some("ledger_initialization_required"));
-        task_store
-            .append(&TaskDescriptor {
-                task_id: format!("task_{}", new_ulid(embedding.repo.canonical_root())),
-                task_type: TaskType::Embedding,
-                embedding_target: Some(target.clone()),
-                mode: None,
-                input_path,
-                input_hash: target.input_hash().to_owned(),
-                previous_raw_hash: None,
-                parent_run_id: None,
-                changed_unit_keys: vec![image_hash.clone()],
-                output_ref,
-                unit_keys: None,
-                status,
-                attempts: 0,
-                next_retry_at: None,
-                deadline: None,
-                heartbeat_at: None,
-                fallback_reason: fallback_reason.map(str::to_owned),
-                created_at: now.clone(),
-                bbox_annotation_enabled: None,
-                hold_reason: (status == TaskStatus::Paused)
-                    .then_some(HoldReason::LedgerInitializationRequired),
-                reserved_usd: None,
-                reserved_month: None,
-                reservation_id: None,
-            })
-            .map_err(pipeline_to_kio)?;
-    }
-    if exclusion.is_some() || !execution_allowed || ledger.is_none() {
-        return Ok(ExecOutcome::default());
-    }
-    let ledger = ledger.expect("image execution requires initialized ledger");
-    let pending = referenced
-        .into_iter()
-        .filter(|hash| {
-            plans.get(hash).is_some_and(|plan| {
-                !already
-                    .get(hash)
-                    .is_some_and(|input| input.as_deref() == plan.context_key())
-            })
-        })
-        .collect::<Vec<_>>();
-    if pending.is_empty() {
-        return Ok(ExecOutcome::default());
-    }
-    let budget_caps = read_budget_policy(
-        user_config_toml_path(invocation.control),
-        embedding.repo.kio_dir().join("config.toml"),
-    )
-    .map_err(pipeline_to_kio)?;
-    let caps = budget_cap_config(&budget_caps, &scope_id, EMBEDDING_ADAPTER_KIND);
-    let mut outcome = ExecOutcome::default();
-    let mut replica_marked_unavailable = false;
-    let mut published_jobs = Vec::new();
-    let send_tasks = task_store.all().map_err(pipeline_to_kio)?;
-    let result = (|| -> Result<()> {
-        let store = embedding.repo.object_store();
-        // The local adapter deliberately makes one HTTP request per image.
-        // Keep the app-side authorization and bounded CAS read at that same
-        // granularity: a policy change cannot admit later images, and a large
-        // corpus never accumulates all source bytes in memory.
-        for image_hash in &pending {
-            let plan = plans.get(image_hash).expect("prepared image plan");
-            let image_output_ref = plan.target.output_ref();
-            let Some(task) = send_tasks
-                .iter()
-                .find(|task| task.output_ref == image_output_ref)
-            else {
-                return Err(KioError::schema("image send has no typed task"));
-            };
-            if !(task.status == TaskStatus::Pending && task_retry_due(task, invocation.control))
-                && !(task.status == TaskStatus::Failed
-                    && task_retry_allowed(task)
-                    && task_retry_due(task, invocation.control))
-            {
-                continue;
-            }
-            // OCR-extracted figures and directly ingested images share the
-            // same bounded source validation used for CAS reprojection.
-            let (fresh_plan, prepared) = crate::embedding::input::prepare_owned_embedding_image(
-                &store,
-                image_hash,
-                embedding.profile,
-            )?;
-            if fresh_plan.target != plan.target {
-                return Err(KioError::schema("image input changed before send"));
-            }
-
-            // Re-read policy, exact network grant, and secret consent before
-            // every authenticated local HTTP request. A secret alias is
-            // conservative: it requires this embedding tool's paired grant
-            // even if a public alias names the same immutable image object.
-            admit_embedding_transport(
-                adapter_settings,
-                embedding.repo,
-                embedding.execution,
-                embedding.profile,
-                embedding.current_policy,
-                image_authority.requires_secret_approval(image_hash),
-            )?;
-            let prepared = if embedding_is_online(embedding.execution)
-                && effective_invocation_lane() == PreferredRequestKind::Batch
-            {
-                match crate::embedding::batch::submit_image_embedding_job(
-                    ctx,
-                    embedding.repo,
-                    ledger,
-                    embedding.execution,
-                    embedding.profile,
-                    plan,
-                    prepared,
-                    image_authority.requires_secret_approval(image_hash),
-                    override_budget,
-                )? {
-                    crate::embedding::batch::ImageBatchDispatch::Sync(prepared) => prepared,
-                    crate::embedding::batch::ImageBatchDispatch::Handled(batch_outcome) => {
-                        outcome.add(batch_outcome);
-                        continue;
-                    }
-                }
-            } else {
-                prepared
-            };
-            let items = vec![EmbeddingItem {
-                id: image_hash.clone(),
-                content: EmbeddingContent::Image {
-                    bytes: prepared.bytes,
-                    mime: prepared.mime.to_owned(),
-                },
-            }];
-            if embedding_is_online(embedding.execution)
-                && kio_adapter::catalog::validate_gemini_sync_inputs(
-                    &items,
-                    kio_adapter::catalog::ADOPTED_EMBEDDING_MODEL_PIN,
-                    u32::try_from(embedding.profile.dimensions)
-                        .map_err(|_| KioError::schema("embedding dimensions exceed u32"))?,
-                )
-                .is_err()
-            {
-                set_image_task_status(task_store, &image_output_ref, false, None)?;
-                continue;
-            }
-            let embedding_hash = plan.embedding_hash().to_owned();
-            let key = task_ledger_key(
-                &scope_id,
-                EMBEDDING_ADAPTER_KIND,
-                &embedding_hash,
-                &embedding.profile.profile_hash,
-            );
-            let binding = EmbeddingJobBinding {
-                logical_job_id: EmbeddingLogicalJobId(embedding_hash.clone()),
-                local: !embedding_is_online(embedding.execution),
-                dimensions: u32::try_from(embedding.profile.dimensions)
-                    .map_err(|_| KioError::schema("embedding dimensions exceed u32"))?,
-                distance: embedding.profile.distance.clone(),
-                modality: embedding.profile.modality.clone(),
-                members: vec![EmbeddingJobMember {
-                    id: image_hash.clone(),
-                    target: plan.target.clone(),
-                }],
-            };
-            if let Some(row) = get_batch_request(ledger, &key).map_err(pipeline_to_kio)?
-                && embedding_is_online(embedding.execution)
-                && sync_result_unknown_fenced(Some(&row))
-            {
-                cost_ledger_rows_for_key(ledger, &key)
-                    .map_err(pipeline_to_kio)?
-                    .into_iter()
-                    .find(|cost| {
-                        cost.submission_seq == row.submission_seq
-                            && cost.outcome == Outcome::UnknownSettled
-                            && kio_pipeline::ledger::ops::is_uuid_v7(&cost.batch_job_id)
-                    })
-                    .ok_or_else(|| KioError::schema("fenced image lost its terminal attempt"))?;
-                apply_image_embedding_failure(
-                    task_store,
-                    &image_output_ref,
-                    &TaskExecutionFailure {
-                        retry_kind: RetryErrorKind::ResultUnknown,
-                        retry_after_ms: None,
-                    },
-                    &now,
-                    &mut outcome,
-                )?;
-                continue;
-            }
-            let job = match reserve_embedding_job(
-                ledger,
-                &EmbeddingReserveRequest {
-                    key: &key,
-                    candidate_usd: if embedding_is_online(embedding.execution) {
-                        8192.0
-                            * crate::embedding::admission::embedding_image_usd_per_token(
-                                adapter_settings,
-                                PreferredRequestKind::Sync,
-                            )
-                    } else {
-                        0.0
-                    },
-                    caps: &caps,
-                    request_kind: RequestKind::Sync,
-                    timeout_seconds: Some(
-                        crate::ledger_access::TASK_SYNC_EFFECTIVE_TIMEOUT_SECONDS,
-                    ),
-                    bypass_cap_denial: !embedding_is_online(embedding.execution)
-                        || override_budget
-                        || !budget_caps.hard_stop,
-                    binding: &binding,
-                },
-            )
-            .map_err(pipeline_to_kio)?
-            {
-                EmbeddingReservationOutcome::Reserved(job) => {
-                    invocation
-                        .control
-                        .checkpoint(kio_core::durability::DurabilityPoint::EmbeddingReserved)?;
-                    job
-                }
-                EmbeddingReservationOutcome::KnownResult(job) => job,
-                EmbeddingReservationOutcome::InFlight(job) => {
-                    let row = get_batch_request(ledger, &key)
-                        .map_err(pipeline_to_kio)?
-                        .ok_or_else(|| KioError::schema("image attempt lost reservation"))?;
-                    if row
-                        .stale_after_at
-                        .is_none_or(|deadline| deadline > invocation.control.now_millis())
-                    {
-                        outcome.inflight += 1;
-                        continue;
-                    }
-                    if job.binding.local {
-                        kio_pipeline::ledger::ops::settle_local_embedding_crash(ledger, &job)
-                            .map_err(pipeline_to_kio)?;
-                    } else {
-                        settle_task_charge_unknown(
-                            ledger,
-                            &key,
-                            &job.intent_token,
-                            row.estimated_usd,
-                        )?;
-                    }
-                    set_image_task_status(task_store, &image_output_ref, false, None)?;
-                    continue;
-                }
-                EmbeddingReservationOutcome::BudgetExceeded => {
-                    task_store
-                        .update_matching(|task| {
-                            if task.output_ref != image_output_ref {
-                                return false;
-                            }
-                            task.status = TaskStatus::Paused;
-                            task.hold_reason = Some(HoldReason::Budget);
-                            task.fallback_reason = Some("budget_exceeded".to_owned());
-                            true
-                        })
-                        .map_err(pipeline_to_kio)?;
-                    outcome.paused += 1;
-                    continue;
-                }
-            };
-            let staged = if job.known_result.is_some() {
-                job
-            } else {
-                // A reservation is not permission to send after consent or
-                // policy changes. A proven-unsent request closes at zero.
-                let external_excluded = if descriptor.effects.egress {
-                    match embedding.repo.image_external_send_allowed() {
-                        Ok(allowed) => !allowed,
-                        Err(error) => {
-                            close_unsent_image_attempt(
-                                ledger,
-                                &job,
-                                task_store,
-                                TaskStatus::Skipped,
-                                "image_policy_changed",
-                            )?;
-                            return Err(error);
-                        }
-                    }
-                } else {
-                    false
-                };
-                if external_excluded {
-                    close_unsent_image_attempt(
-                        ledger,
-                        &job,
-                        task_store,
-                        TaskStatus::Skipped,
-                        "images_excluded_from_external_send",
-                    )?;
-                    continue;
-                }
-                if let Err(error) = embedding.current_policy.revalidate() {
-                    close_unsent_image_attempt(
-                        ledger,
-                        &job,
-                        task_store,
-                        TaskStatus::Skipped,
-                        "image_policy_changed",
-                    )?;
-                    return Err(pipeline_to_kio(error));
-                }
-                if let Err(error) = admit_embedding_transport(
-                    adapter_settings,
-                    embedding.repo,
-                    embedding.execution,
-                    embedding.profile,
-                    embedding.current_policy,
-                    image_authority.requires_secret_approval(image_hash),
-                ) {
-                    let reason = if image_authority.requires_secret_approval(image_hash)
-                        && matches!(
-                            embedding_secrets_allowed(
-                                adapter_settings,
-                                embedding.repo,
-                                embedding.profile,
-                            ),
-                            Ok(false)
-                        ) {
-                        "secrets_tier_b_hold"
-                    } else {
-                        "network_opt_in_required"
-                    };
-                    close_unsent_image_attempt(
-                        ledger,
-                        &job,
-                        task_store,
-                        TaskStatus::Pending,
-                        reason,
-                    )?;
-                    return Err(error);
-                }
-                let result = run_embedding_adapter(
-                    adapter_settings,
-                    embedding.execution,
-                    items,
-                    EmbeddingInputType::ImageObject,
-                    Some(job.intent_token.clone()),
-                    invocation.control,
-                );
-                let outcome = match result {
-                    Ok(outcome) => outcome,
-                    Err(mut failure) => {
-                        let row = get_batch_request(ledger, &key)
-                            .map_err(pipeline_to_kio)?
-                            .ok_or_else(|| KioError::schema("image send lost reservation"))?;
-                        let known_rejection = matches!(
-                            failure.retry_kind,
-                            RetryErrorKind::AuthError
-                                | RetryErrorKind::RateLimit
-                                | RetryErrorKind::QuotaExceeded
-                        );
-                        if known_rejection || job.binding.local {
-                            terminal_transaction(
-                                ledger,
-                                &TerminalWrite {
-                                    key: &key,
-                                    outcome: if job.binding.local {
-                                        Outcome::ContractViolation
-                                    } else {
-                                        Outcome::SubmitRejected
-                                    },
-                                    billed: BilledAmount {
-                                        usd: 0.0,
-                                        estimated: false,
-                                    },
-                                    ledger_batch_job_id: &job.intent_token,
-                                    next_state: BatchState::Terminal,
-                                    error: Some(retry_reason(failure.retry_kind)),
-                                    increment_contract_violation: false,
-                                    attempts_delta: 1,
-                                    clear_intent_token: true,
-                                    intent_token_guard: Some(&job.intent_token),
-                                    reseat_submission_seq: false,
-                                },
-                            )
-                            .map_err(pipeline_to_kio)?;
-                        } else {
-                            settle_task_charge_unknown(
-                                ledger,
-                                &key,
-                                &job.intent_token,
-                                row.estimated_usd,
-                            )?;
-                            failure.retry_kind = RetryErrorKind::ResultUnknown;
-                            failure.retry_after_ms = None;
-                        }
-                        cost_ledger_rows_for_key(ledger, &key)
-                            .map_err(pipeline_to_kio)?
-                            .into_iter()
-                            .find(|cost| {
-                                cost.batch_job_id == job.intent_token
-                                    && cost.outcome
-                                        == if job.binding.local {
-                                            Outcome::ContractViolation
-                                        } else if known_rejection {
-                                            Outcome::SubmitRejected
-                                        } else {
-                                            Outcome::UnknownSettled
-                                        }
-                                    && (cost.submission_seq == job.submission_seq
-                                        || (job.submission_seq.checked_add(1)
-                                            == Some(cost.submission_seq)
-                                            && cost.outcome == Outcome::UnknownSettled))
-                            })
-                            .ok_or_else(|| {
-                                KioError::schema("failed image lost its terminal attempt")
-                            })?;
-                        apply_image_embedding_failure(
-                            task_store,
-                            &image_output_ref,
-                            &failure,
-                            &now,
-                            &mut outcome,
-                        )?;
-                        continue;
-                    }
-                };
-                if outcome.members.len() != 1
-                    || outcome.members[0].id != *image_hash
-                    || !matches!(
-                        outcome.members[0].result,
-                        EmbeddingMemberResult::Vector { .. }
-                    )
-                {
-                    if job.binding.local {
-                        settle_local_image_failure(ledger, &key, &job.intent_token)?;
-                    } else {
-                        let row = get_batch_request(ledger, &key)
-                            .map_err(pipeline_to_kio)?
-                            .ok_or_else(|| KioError::schema("image send lost reservation"))?;
-                        settle_task_charge_unknown(
-                            ledger,
-                            &key,
-                            &job.intent_token,
-                            row.estimated_usd,
-                        )?;
-                    }
-                    set_image_task_status(task_store, &image_output_ref, false, None)?;
-                    continue;
-                }
-                stage_embedding_result(ledger, &job, &outcome).map_err(pipeline_to_kio)?;
-                let row = get_batch_request(ledger, &key)
-                    .map_err(pipeline_to_kio)?
-                    .ok_or_else(|| KioError::schema("staged image lost ledger row"))?;
-                embedding_job(ledger, &row)
-                    .map_err(pipeline_to_kio)?
-                    .ok_or_else(|| KioError::schema("staged image lost binding"))?
-            };
-            let result = staged
-                .known_result
-                .as_ref()
-                .ok_or_else(|| KioError::schema("staged image lost result"))?;
-            let EmbeddingMemberResult::Vector { vector } = &result.members[0].result else {
-                return Err(KioError::schema("staged image is not a vector"));
-            };
-            if get_batch_request(ledger, &key)
-                .map_err(pipeline_to_kio)?
-                .is_some_and(|row| row.state.is_inflight())
-            {
-                settle_task_charge_success(
-                    ledger,
-                    &key,
-                    &staged.intent_token,
-                    if staged.binding.local {
-                        BilledAmount {
-                            usd: 0.0,
-                            estimated: false,
-                        }
-                    } else {
-                        let row = get_batch_request(ledger, &key)
-                            .map_err(pipeline_to_kio)?
-                            .ok_or_else(|| KioError::schema("image result lost reservation"))?;
-                        embedding_billed_from_usage(
-                            adapter_settings,
-                            match &result.usage {
-                                EmbeddingUsage::Metered { usage } => Some(usage),
-                                _ => None,
-                            },
-                            PreferredRequestKind::Sync,
-                            row.estimated_usd,
-                            invocation.control,
-                            invocation.locks,
-                            EmbeddingInputType::ImageObject,
-                        )
-                    },
-                )?;
-            }
-            let terminal = cost_ledger_rows_for_key(ledger, &key)
-                .map_err(pipeline_to_kio)?
-                .into_iter()
-                .find(|row| {
-                    row.submission_seq == staged.submission_seq
-                        && row.batch_job_id == staged.intent_token
-                        && row.outcome == Outcome::Succeeded
-                })
-                .ok_or_else(|| KioError::schema("successful image lost its terminal attempt"))?;
-            // Settlement survives later policy changes; publication rechecks current consent.
-            admit_embedding_transport(
-                adapter_settings,
-                embedding.repo,
-                embedding.execution,
-                embedding.profile,
-                embedding.current_policy,
-                image_authority.requires_secret_approval(image_hash),
-            )?;
-            // CAS first, table second. This keeps a crash recoverable by a
-            // later rebuild instead of leaving a SQLite reference to no object.
-            if !replica_marked_unavailable {
-                // Mark before the first visible source mutation. If a later
-                // image or authorization check fails, readers cannot mistake
-                // a prior image vector for a complete replica projection.
-                mark_replica_unavailable_or_log(ctx, embedding.repo.kio_dir());
-                replica_marked_unavailable = true;
-            }
-            publish_image_embedding_object(
-                embedding.repo,
-                &embedding_hash,
-                image_hash,
-                vector,
-                embedding.profile,
-                embedding.execution,
-                plan,
-            )?;
-            embedding_store::write_image_embedding(
-                conn,
-                &embedding_hash,
-                image_hash,
-                &embedding_store::f32_to_le_bytes(vector),
-                embedding.profile.dimensions,
-                &embedding.profile.distance,
-                &embedding.profile.modality,
-                &embedding.profile.profile_hash,
-                plan.context_key(),
-            )
-            .map_err(index_to_kio)?;
-            set_image_task_status(
-                task_store,
-                &image_output_ref,
-                true,
-                Some((
-                    get_batch_request(ledger, &key)
-                        .map_err(pipeline_to_kio)?
-                        .ok_or_else(|| KioError::schema("published image lost reservation claim"))?
-                        .estimated_usd,
-                    &terminal.month,
-                    &staged.intent_token,
-                )),
-            )?;
-            published_jobs.push(staged);
-            outcome.executed += 1;
-        }
-        Ok(())
-    })();
-    if outcome.executed > 0 {
-        // `ScopeDelta` only represents chunk-vector additions. Image vectors
-        // also need their image-reference relation, so publish a complete
-        // projection after rotating the source generation.
-        rotate_index_generation_unconditionally(
-            embedding.repo.kio_dir(),
-            embedding.repo.control(),
-        )?;
-        write_through_projection_or_log(ctx, embedding.repo.kio_dir());
-    }
-    result?;
-    for job in published_jobs {
-        finish_embedding_publication(ledger, &job).map_err(pipeline_to_kio)?;
-    }
-    Ok(outcome)
-}
-
-/// Close a reservation whose live owner proves it has not dispatched.
-fn close_unsent_image_attempt(
-    ledger: &LedgerDb,
-    job: &EmbeddingJob,
-    tasks: &TaskStore,
-    status: TaskStatus,
-    reason: &str,
-) -> Result<()> {
-    terminal_transaction(
-        ledger,
-        &TerminalWrite {
-            key: &job.key,
-            outcome: Outcome::Abandoned,
-            billed: BilledAmount {
-                usd: 0.0,
-                estimated: false,
-            },
-            ledger_batch_job_id: &job.intent_token,
-            next_state: BatchState::Terminal,
-            error: Some(reason),
-            increment_contract_violation: false,
-            attempts_delta: 0,
-            clear_intent_token: true,
-            intent_token_guard: Some(&job.intent_token),
-            reseat_submission_seq: false,
-        },
-    )
-    .map_err(pipeline_to_kio)?;
-    let target = &job.binding.members[0].target;
-    tasks
-        .update_matching(|task| {
-            if task.task_type != TaskType::Embedding
-                || task.embedding_target.as_ref() != Some(target)
-            {
-                return false;
-            }
-            task.status = status;
-            task.fallback_reason = Some(reason.to_owned());
-            task.hold_reason = None;
-            task.deadline = None;
-            task.heartbeat_at = None;
-            task.next_retry_at = None;
-            // An older retained claim belongs to its original attempt. Do not
-            // erase it while demoting a task to a secret/network hold.
-            if task
-                .reservation_id
-                .as_deref()
-                .is_none_or(|token| token == job.intent_token)
-            {
-                task.reservation_id = None;
-                task.reserved_usd = None;
-                task.reserved_month = None;
-            }
-            true
-        })
-        .map_err(pipeline_to_kio)?;
-    finish_embedding_publication(ledger, job).map_err(pipeline_to_kio)
-}
-
-/// Complete only this exact typed/materialized image. Done tasks keep their
-/// successful attempt stamp; other eligible cached states follow the shared
-/// paid-task eligibility policy. A retained stamp needs proof of its original
-/// terminal attempt and never authorizes a write to another ledger key.
-fn materialized_image_task_can_complete(
-    task: &TaskDescriptor,
-    target: &EmbeddingTaskTarget,
-    scope_id: &str,
-    ledger: Option<&LedgerDb>,
-) -> Result<bool> {
-    if task.task_type != TaskType::Embedding
-        || !task_can_complete_from_materialized_output(task)
-        || task.embedding_target.as_ref() != Some(target)
-        || task.input_hash != target.input_hash()
-        || task.output_ref != target.output_ref()
-    {
-        return Ok(false);
-    }
-    let Some(claim) = task.reservation_claim() else {
-        return Ok(task.reservation_id.is_none()
-            && task.reserved_usd.is_none()
-            && task.reserved_month.is_none());
-    };
-    let Some(ledger) = ledger else {
-        return Ok(false);
-    };
-    let EmbeddingTaskTarget::Image {
-        embedding_hash,
-        profile_hash,
-        ..
-    } = target
-    else {
-        return Ok(false);
-    };
-    let key = task_ledger_key(
-        scope_id,
-        EMBEDDING_ADAPTER_KIND,
-        embedding_hash,
-        profile_hash,
-    );
-    let Some(request) = get_batch_request(ledger, &key).map_err(pipeline_to_kio)? else {
-        return Ok(false);
-    };
-    if request.state != BatchState::Completed
-        || request.intent_token.is_some()
-        || request.estimated_usd != claim.usd
-    {
-        return Ok(false);
-    }
-    Ok(cost_ledger_rows_for_key(ledger, &key)
-        .map_err(pipeline_to_kio)?
-        .iter()
-        .any(|row| {
-            row.submission_seq == request.submission_seq
-                && row.batch_job_id == claim.reservation_id
-                && row.month == claim.month
-                && row.outcome == Outcome::Succeeded
-        }))
-}
-
-fn set_image_task_status(
-    task_store: &TaskStore,
-    output_ref: &str,
-    succeeded: bool,
-    terminal_claim: Option<(f64, &str, &str)>,
-) -> Result<()> {
-    task_store
-        .update_matching(|task| {
-            if task.task_type != TaskType::Embedding || task.output_ref != output_ref {
-                return false;
-            }
-            task.status = if succeeded {
-                TaskStatus::Done
-            } else {
-                TaskStatus::Failed
-            };
-            task.attempts += 1;
-            if let Some((usd, month, token)) = terminal_claim {
-                task.reserved_usd = Some(usd);
-                task.reserved_month = Some(month.to_owned());
-                task.reservation_id = Some(token.to_owned());
-            }
-            task.next_retry_at = None;
-            task.heartbeat_at = None;
-            task.hold_reason = None;
-            task.fallback_reason = (!succeeded).then(|| "contract_violation".to_owned());
-            task.deadline = None;
-            true
-        })
-        .map_err(pipeline_to_kio)?;
-    Ok(())
-}
-
-fn apply_image_embedding_failure(
-    task_store: &TaskStore,
-    output_ref: &str,
-    failure: &TaskExecutionFailure,
-    now: &str,
-    outcome: &mut ExecOutcome,
-) -> Result<()> {
-    let transitions =
-        BTreeMap::from([(output_ref.to_owned(), embedding_failure_transition(failure))]);
-    // Failure transitions preserve any previous claim, matching text tasks.
-    outcome.failed_retryable +=
-        apply_embedding_transitions(task_store, &transitions, now, &BTreeMap::new())?;
-    count_embedding_failure(outcome, failure.retry_kind, 1);
-    Ok(())
-}
-
-fn settle_local_image_failure(ledger: &LedgerDb, key: &LedgerTaskKey, token: &str) -> Result<()> {
-    terminal_transaction(
-        ledger,
-        &TerminalWrite {
-            key,
-            outcome: Outcome::ContractViolation,
-            billed: BilledAmount {
-                usd: 0.0,
-                estimated: false,
-            },
-            ledger_batch_job_id: token,
-            next_state: BatchState::Terminal,
-            error: Some("local_image_embedding_failed"),
-            increment_contract_violation: true,
-            attempts_delta: 1,
-            clear_intent_token: true,
-            intent_token_guard: Some(token),
-            reseat_submission_seq: false,
-        },
-    )
-    .map_err(pipeline_to_kio)?;
-    Ok(())
-}
-
 /// Publish a vector to immutable CAS before writing source or replica rows.
 pub(crate) fn publish_embedding_object(
     repo: &Repository,
@@ -2890,11 +1974,7 @@ pub(crate) fn publish_image_job_member(
     }) else {
         return Ok(false);
     };
-    let mode = if job.binding.local {
-        ProducerExecutionMode::OfflineApi
-    } else {
-        ProducerExecutionMode::OnlineApi
-    };
+    let mode = ProducerExecutionMode::OnlineApi;
     let object = kio_core::cas::EmbeddingObject {
         spec_version: 1,
         target_type: "image".to_owned(),
@@ -2969,4 +2049,243 @@ fn publish_verified_embedding(
         ));
     }
     Ok(())
+}
+
+pub(crate) fn fail_local_embedding_claim(
+    claim: &mut crate::local_execution::LocalGuard,
+    failure: &TaskExecutionFailure,
+    now: &str,
+) -> Result<Option<i64>> {
+    let policy = retry_policy(failure.retry_kind);
+    let next = if failure.retry_kind == RetryErrorKind::RateLimit {
+        Some(rate_limit_retry_at(now, failure.retry_after_ms))
+    } else if policy.retryable && policy.max_attempts.is_none_or(|max| claim.attempts() < max) {
+        Some(scheduled_retry_at(now, &policy.backoff, claim.attempts()))
+    } else {
+        None
+    };
+    let next_ms = next
+        .as_deref()
+        .and_then(kio_core::scope::parse_utc_seconds)
+        .map(|seconds| seconds.saturating_mul(1000));
+    claim.fail(
+        failure.retry_kind,
+        next_ms,
+        !matches!(
+            failure.retry_kind,
+            RetryErrorKind::RateLimit | RetryErrorKind::AuthError
+        ),
+        failure.retry_kind != RetryErrorKind::AuthError && (!policy.retryable || next.is_none()),
+    )?;
+    Ok(next_ms)
+}
+
+/// The local record owns attempt accounting. Replaying this mirror is idempotent.
+pub(crate) fn mirror_local_embedding_failure(
+    store: &TaskStore,
+    output_refs: &BTreeSet<String>,
+    attempts: u32,
+    next_retry_at: Option<i64>,
+    kind: RetryErrorKind,
+) -> Result<()> {
+    let next = next_retry_at.map(|ms| kio_core::scope::format_utc_seconds(ms / 1000));
+    store
+        .update_matching(|task| {
+            if task.task_type != TaskType::Embedding
+                || !output_refs.contains(&task.output_ref)
+                || task.reservation_claim().is_some()
+            {
+                return false;
+            }
+            task.status = match kind {
+                RetryErrorKind::AuthError => TaskStatus::Paused,
+                RetryErrorKind::RateLimit => TaskStatus::Pending,
+                _ => TaskStatus::Failed,
+            };
+            task.attempts = attempts;
+            task.next_retry_at = next.clone();
+            task.fallback_reason = Some(retry_reason(kind).to_owned());
+            task.hold_reason = (task.status == TaskStatus::Paused)
+                .then(|| hold_reason_for_reason(retry_reason(kind)))
+                .flatten();
+            task.heartbeat_at = None;
+            true
+        })
+        .map(|_| ())
+        .map_err(pipeline_to_kio)
+}
+
+fn group_embedding_items(group: &EmbeddingSendGroup<'_>) -> Vec<EmbeddingItem> {
+    let context = embedding_store::chunk_embedding_context(&group.representative.raw_path);
+    vec![EmbeddingItem::text(
+        group.embedding_hash.clone(),
+        embedding_store::contextualized_embedding_input(
+            context.as_deref(),
+            &group.representative.text,
+        ),
+    )]
+}
+
+/// An unsent paid failure does not consume a logical Task attempt.
+pub(crate) fn release_unsent_embedding_tasks(store: &TaskStore, job: &EmbeddingJob) -> Result<()> {
+    store
+        .update_matching(|task| {
+            if task.task_type != TaskType::Embedding
+                || !job
+                    .binding
+                    .members
+                    .iter()
+                    .any(|member| task.embedding_target.as_ref() == Some(&member.target))
+                || task
+                    .reservation_id
+                    .as_deref()
+                    .is_some_and(|token| token != job.intent_token)
+            {
+                return false;
+            }
+            task.status = TaskStatus::Pending;
+            task.fallback_reason = Some("adapter_configuration".to_owned());
+            task.hold_reason = None;
+            task.deadline = None;
+            task.heartbeat_at = None;
+            task.next_retry_at = None;
+            task.reservation_id = None;
+            task.reserved_usd = None;
+            task.reserved_month = None;
+            true
+        })
+        .map(|_| ())
+        .map_err(pipeline_to_kio)
+}
+
+pub(crate) fn mirror_local_embedding_start(
+    store: &TaskStore,
+    refs: &BTreeSet<String>,
+    attempts: u32,
+    now: &str,
+) -> Result<()> {
+    store
+        .update_matching(|task| {
+            if task.task_type != TaskType::Embedding
+                || !refs.contains(&task.output_ref)
+                || task.reservation_claim().is_some()
+            {
+                return false;
+            }
+            task.status = TaskStatus::Running;
+            task.attempts = attempts;
+            task.next_retry_at = None;
+            task.heartbeat_at = Some(now.to_owned());
+            true
+        })
+        .map(|_| ())
+        .map_err(pipeline_to_kio)
+}
+
+pub(crate) fn mirror_local_embedding_wait(
+    store: &TaskStore,
+    refs: &BTreeSet<String>,
+    attempts: u32,
+    next: Option<i64>,
+    kind: Option<RetryErrorKind>,
+    exhausted: bool,
+) -> Result<()> {
+    if let Some(kind) = kind {
+        mirror_local_embedding_failure(store, refs, attempts, next, kind)
+    } else {
+        mirror_local_interruption(store, refs, attempts, exhausted, next)
+    }
+}
+
+pub(crate) fn mirror_local_interruption(
+    store: &TaskStore,
+    refs: &BTreeSet<String>,
+    attempts: u32,
+    exhausted: bool,
+    next: Option<i64>,
+) -> Result<()> {
+    store
+        .update_matching(|task| {
+            if task.task_type != TaskType::Embedding
+                || !refs.contains(&task.output_ref)
+                || task.reservation_claim().is_some()
+            {
+                return false;
+            }
+            task.status = if exhausted {
+                TaskStatus::Failed
+            } else {
+                TaskStatus::Pending
+            };
+            task.attempts = attempts;
+            task.fallback_reason = Some("local_execution_interrupted".to_owned());
+            task.next_retry_at = next.map(|ms| kio_core::scope::format_utc_seconds(ms / 1000));
+            task.hold_reason = None;
+            task.heartbeat_at = None;
+            true
+        })
+        .map(|_| ())
+        .map_err(pipeline_to_kio)
+}
+
+fn send_local_embed_group(
+    settings: &Arc<AdapterRuntimeSettings>,
+    embedding: &EmbeddingExecutionContext<'_>,
+    group: &EmbeddingSendGroup<'_>,
+    token: String,
+    control: &ControlHandle,
+) -> std::result::Result<EmbeddingCompleted, crate::embedding::transport::LocalEmbeddingRunFailure>
+{
+    use crate::embedding::transport::LocalEmbeddingRunFailure;
+    validate_embedding_aliases(
+        embedding.current_policy,
+        embedding.profile,
+        group.members.iter().copied(),
+    )
+    .map_err(LocalEmbeddingRunFailure::Classified)?;
+    admit_embedding_transport(
+        settings,
+        embedding.repo,
+        embedding.execution,
+        embedding.profile,
+        embedding.current_policy,
+        group
+            .members
+            .iter()
+            .any(|chunk| chunk.requires_secret_approval),
+    )
+    .map_err(LocalEmbeddingRunFailure::Admission)?;
+    crate::embedding::transport::run_local_embedding_adapter(
+        settings,
+        embedding.execution,
+        group_embedding_items(group),
+        EmbeddingInputType::MarkdownChunk,
+        Some(token),
+        control,
+    )
+}
+
+pub(crate) fn mirror_local_unsent(
+    store: &TaskStore,
+    refs: &BTreeSet<String>,
+    attempts: u32,
+) -> Result<()> {
+    store
+        .update_matching(|task| {
+            if task.task_type != TaskType::Embedding
+                || !refs.contains(&task.output_ref)
+                || task.reservation_claim().is_some()
+            {
+                return false;
+            }
+            task.status = TaskStatus::Pending;
+            task.attempts = attempts;
+            task.fallback_reason = Some("local_execution_not_admitted".to_owned());
+            task.next_retry_at = None;
+            task.hold_reason = None;
+            task.heartbeat_at = None;
+            true
+        })
+        .map(|_| ())
+        .map_err(pipeline_to_kio)
 }

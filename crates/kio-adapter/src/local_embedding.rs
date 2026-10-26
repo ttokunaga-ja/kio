@@ -318,6 +318,14 @@ pub struct LocalEmbeddingAdapter<C = EnvLocalEmbeddingClient> {
     dimensions: u32,
 }
 
+pub(crate) fn descriptor_from_profile(
+    profile: &AdapterProfile,
+) -> crate::types::EmbeddingDescriptor {
+    let mut descriptor = crate::types::EmbeddingDescriptor::from_profile(profile);
+    descriptor.capability.image_mime_types = vec!["image/png".to_owned(), "image/jpeg".to_owned()];
+    descriptor
+}
+
 impl<C: LocalEmbeddingClient> LocalEmbeddingAdapter<C> {
     /// The measured backend, over whichever transport `client` provides.
     #[must_use]
@@ -426,10 +434,7 @@ impl<C: LocalEmbeddingClient> EmbeddingAdapter for LocalEmbeddingAdapter<C> {
     }
 
     fn descriptor(&self) -> crate::types::EmbeddingDescriptor {
-        let mut descriptor = crate::types::EmbeddingDescriptor::from_profile(&self.profile());
-        descriptor.capability.image_mime_types =
-            vec!["image/png".to_owned(), "image/jpeg".to_owned()];
-        descriptor
+        descriptor_from_profile(&self.profile())
     }
 
     fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingOutcome> {

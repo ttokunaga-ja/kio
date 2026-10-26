@@ -336,6 +336,14 @@ pub(crate) mod test_tls {
                     Err(error) => panic!("TLS fixture accept failed: {error}"),
                 }
             };
+            self.accept_stream(stream)
+        }
+
+        pub(crate) fn accept_stream(
+            &self,
+            stream: TcpStream,
+        ) -> rustls::StreamOwned<rustls::ServerConnection, TcpStream> {
+            const TIMEOUT: Duration = Duration::from_secs(5);
             stream.set_nonblocking(false).unwrap();
             stream.set_read_timeout(Some(TIMEOUT)).unwrap();
             stream.set_write_timeout(Some(TIMEOUT)).unwrap();

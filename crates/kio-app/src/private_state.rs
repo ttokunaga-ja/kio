@@ -1,6 +1,7 @@
 //! Retained owner-private device-state directories shared by mutable stores.
 
 use std::fs::File;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use kio_core::control::ControlHandle;
@@ -247,9 +248,22 @@ fn acquire_lock(directory: &StoreDirectory, lock_bytes: &[u8]) -> Result<File> {
 
 fn lock_checked(directory: &StoreDirectory, lock_bytes: &[u8]) -> Result<File> {
     let leaf = Path::new(".lock");
-    let bytes = directory
-        .read_optional(leaf, 256)?
-        .ok_or_else(|| KioError::invalid_usage("private state lock disappeared"))?;
+    let mut file = directory.open_regular_read(leaf, 256)?;
+    kio_core::private_fs::verify_private_regular_file_handle(&file)?;
+    // Windows locks deny reads through a contender's separate handle. Acquire
+    // ownership before inspecting the marker, then read this same handle.
+    file.try_lock()
+        .map_err(|error| lock_acquisition_error(error, &directory.path().join(leaf)))?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(257)
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            KioError::io(
+                error.to_string(),
+                directory.path().join(leaf).display().to_string(),
+            )
+        })?;
     if bytes != lock_bytes {
         return Err(KioError::new(
             "KIO-E-PRIVATE-STATE-LOCK-001",
@@ -258,16 +272,21 @@ fn lock_checked(directory: &StoreDirectory, lock_bytes: &[u8]) -> Result<File> {
             ExitCode::PermanentFailure,
         ));
     }
-    let file = directory.open_regular_read(leaf, 256)?;
-    file.try_lock().map_err(|error| {
-        KioError::new(
+    Ok(file)
+}
+
+fn lock_acquisition_error(error: std::fs::TryLockError, path: &Path) -> KioError {
+    match error {
+        std::fs::TryLockError::WouldBlock => KioError::new(
             "KIO-E-PRIVATE-STATE-LOCKED-001",
-            error.to_string(),
+            std::fs::TryLockError::WouldBlock.to_string(),
             serde_json::json!({}),
             ExitCode::PartialFailure,
-        )
-    })?;
-    Ok(file)
+        ),
+        std::fs::TryLockError::Error(error) => {
+            KioError::io(error.to_string(), path.display().to_string())
+        }
+    }
 }
 
 /// Atomically publish a newly initialized private store. The callback writes
@@ -569,5 +588,61 @@ mod tests {
             0o700
         );
         drop(state);
+    }
+}
+
+#[cfg(test)]
+mod lock_marker_tests {
+    use super::{create_initialized, open_existing};
+    use kio_core::control::ControlHandle;
+    use std::fs;
+
+    #[test]
+    fn only_lock_contention_is_classified_as_busy() {
+        let path = std::path::Path::new("classified-state.lock");
+        let busy = super::lock_acquisition_error(std::fs::TryLockError::WouldBlock, path);
+        assert_eq!(busy.error_code(), "KIO-E-PRIVATE-STATE-LOCKED-001");
+        assert_eq!(busy.exit_code(), kio_core::ExitCode::PartialFailure);
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Unsupported,
+        ] {
+            let message = format!("lock error canary {kind:?}");
+            let error = super::lock_acquisition_error(
+                std::fs::TryLockError::Error(std::io::Error::new(kind, message.clone())),
+                path,
+            );
+            assert_eq!(error.error_code(), "KIO-E-STORE-IO-001");
+            assert_eq!(error.exit_code(), kio_core::ExitCode::Failure);
+            assert_eq!(error.message(), message);
+            assert_eq!(error.context()["path"], path.display().to_string());
+        }
+    }
+
+    #[test]
+    fn idle_bad_lock_markers_fail_without_repair_or_retaining_a_lock() {
+        const EXPECTED: &[u8] = b"private-state-marker-test/v1\n";
+        for marker in [Vec::new(), b"foreign marker".to_vec(), vec![b'x'; 257]] {
+            let temp = crate::test_support::PrivateTempDir::new();
+            let path = temp.path().join("state");
+            let control = ControlHandle::default();
+            let owner = create_initialized(&path, EXPECTED, |_| Ok(()), &control).unwrap();
+            drop(owner);
+            let lock = path.join(".lock");
+            // Intentional tamper of this idle fixture's existing lock inode.
+            fs::write(&lock, &marker).unwrap();
+            for _ in 0..2 {
+                let error = open_existing(&path, EXPECTED, &control).unwrap_err();
+                assert_ne!(error.error_code(), "KIO-E-PRIVATE-STATE-LOCKED-001");
+                if marker.len() <= 256 {
+                    assert_eq!(error.error_code(), "KIO-E-PRIVATE-STATE-LOCK-001");
+                }
+                assert_eq!(
+                    fs::read(&lock).unwrap(),
+                    marker,
+                    "bad marker must not be repaired"
+                );
+            }
+        }
     }
 }

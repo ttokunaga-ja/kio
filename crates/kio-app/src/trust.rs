@@ -66,6 +66,7 @@ struct PendingRegistration {
 /// A retained lock held from active-record validation until the caller's
 /// adapter dispatch returns. It serializes trust lifecycle changes with the
 /// send-time authority window.
+#[derive(Debug)]
 pub(crate) struct RuntimeTrust {
     _state: crate::private_state::PrivateState,
     path: PathBuf,
@@ -134,6 +135,135 @@ pub(crate) fn acquire_runtime_trust(
             record.version, record.generation, record.registration_id, record.digest
         ),
     }))
+}
+
+#[derive(Debug, Default)]
+struct RuntimeTrustState {
+    acquired: Option<std::sync::Arc<RuntimeTrust>>,
+    observed_binding: Option<String>,
+    readiness_reason: Option<String>,
+}
+
+/// One invocation owns this cache. A metadata-only grant lookup never locks or
+/// reads a CA; only explicit authorization or endpoint construction acquires it.
+#[derive(Debug)]
+pub(crate) struct RuntimeTrustProvider {
+    control: ControlHandle,
+    state: std::sync::Mutex<RuntimeTrustState>,
+}
+
+impl RuntimeTrustProvider {
+    pub(crate) fn new(control: ControlHandle) -> Self {
+        Self {
+            control,
+            state: std::sync::Mutex::new(RuntimeTrustState::default()),
+        }
+    }
+
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, RuntimeTrustState>> {
+        self.state.lock().map_err(|_| {
+            err(
+                "KIO-E-LOCAL-TRUST-UNAVAILABLE-001",
+                "managed trust invocation state is unavailable",
+            )
+        })
+    }
+
+    pub(crate) fn readiness_reason(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.readiness_reason.clone())
+    }
+
+    pub(crate) fn acquired(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.acquired.is_some())
+    }
+}
+
+fn record_binding(record: &TrustRecord) -> String {
+    format!(
+        "local-ca:v{}:g{}:{}:{}",
+        record.version, record.generation, record.registration_id, record.digest
+    )
+}
+
+fn runtime_metadata_binding(control: &ControlHandle) -> Result<String> {
+    let Some(directory) = crate::private_state::open_readonly(&directory_path(control), control)?
+    else {
+        return Err(absent());
+    };
+    if let Some(pending) = read_pending_from(&directory)? {
+        return Err(pending_requires_resume(&pending));
+    }
+    let record = active_record(read_record_from(&directory)?)?;
+    Ok(record_binding(&record))
+}
+
+impl kio_adapter::tool_lock::ManagedLocalTrustProvider for RuntimeTrustProvider {
+    fn binding(&self) -> Result<String> {
+        let mut state = self.state()?;
+        if let Some(acquired) = &state.acquired {
+            return Ok(acquired.binding().to_owned());
+        }
+        let result = runtime_metadata_binding(&self.control).and_then(|binding| {
+            if state
+                .observed_binding
+                .as_ref()
+                .is_some_and(|observed| observed != &binding)
+            {
+                return Err(err(
+                    "KIO-E-LOCAL-TRUST-CHANGED-001",
+                    "managed CA lifecycle changed after execution authority was observed",
+                ));
+            }
+            state.observed_binding = Some(binding.clone());
+            Ok(binding)
+        });
+        state.readiness_reason = result.as_ref().err().map(ToString::to_string);
+        result
+    }
+
+    fn acquire(&self) -> Result<kio_adapter::tool_lock::ManagedLocalTrustSnapshot> {
+        let mut state = self.state()?;
+        if state.acquired.is_none() {
+            let result = acquire_runtime_trust(&directory_path(&self.control), &self.control)
+                .and_then(|trust| trust.ok_or_else(absent))
+                .and_then(|trust| {
+                    if state
+                        .observed_binding
+                        .as_ref()
+                        .is_some_and(|observed| observed != trust.binding())
+                    {
+                        return Err(err(
+                            "KIO-E-LOCAL-TRUST-CHANGED-001",
+                            "managed CA lifecycle changed after execution authority was observed",
+                        ));
+                    }
+                    Ok(std::sync::Arc::new(trust))
+                });
+            match result {
+                Ok(trust) => {
+                    state.acquired = Some(trust);
+                    state.readiness_reason = None;
+                }
+                Err(error) => {
+                    state.readiness_reason = Some(error.to_string());
+                    return Err(error);
+                }
+            }
+        }
+        let trust = state
+            .acquired
+            .as_ref()
+            .expect("validated managed trust cache");
+        Ok(kio_adapter::tool_lock::ManagedLocalTrustSnapshot {
+            path: trust.path().to_path_buf(),
+            digest: trust.digest().to_owned(),
+        })
+    }
 }
 
 /// Register a managed local CA. The first record starts at generation one;

@@ -7,10 +7,7 @@ use crate::search::query::toml_u64;
 use kio_adapter::catalog::EmbeddingExecution;
 use kio_adapter::tool_lock::MAX_TOOLS_TOML_BYTES;
 use kio_adapter::tool_lock::load_tool_lock;
-use kio_adapter::tool_lock::parse_tools_toml;
-use kio_adapter::tool_lock::read_private_tools_toml_with_control;
-use kio_adapter::tool_lock::tools_toml_uses_plain_auth;
-use kio_adapter::tool_lock::validate_tools_toml;
+use kio_adapter::tool_lock::parse_tools_toml_for_roles;
 use kio_adapter::types::ExecutionMode;
 use kio_core::KioError;
 use kio_core::Result;
@@ -25,16 +22,20 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Documented default for `adapter.policy.max_input_bytes` (07 §7): 100 MB.
 const DEFAULT_MAX_INPUT_BYTES: u64 = 104_857_600;
 
 /// R12-2: effective `adapter.policy.max_input_bytes` — scope config wins over user
 /// config, default 100 MB (07 §7). Enforced as an input gate in `run_index_pipeline`.
-pub(crate) fn effective_max_input_bytes(repo: &Repository) -> u64 {
-    read_max_input_bytes_config(&repo.kio_dir().join("config.toml"))
-        .or_else(|| read_max_input_bytes_config(&user_config_toml_path(repo.control())))
-        .unwrap_or(DEFAULT_MAX_INPUT_BYTES)
+pub(crate) fn effective_max_input_bytes(repo: &Repository) -> Result<u64> {
+    if let Some(limit) = read_max_input_bytes_config(&repo.kio_dir().join("config.toml")) {
+        return Ok(limit);
+    }
+    let user = user_config_toml_path(repo.control());
+    validate_device_config_path(&user, DeviceConfigUse::Input)?;
+    Ok(read_max_input_bytes_config(&user).unwrap_or(DEFAULT_MAX_INPUT_BYTES))
 }
 
 fn read_max_input_bytes_config(path: &Path) -> Option<u64> {
@@ -64,6 +65,7 @@ pub(crate) fn effective_bbox_annotation_policy(
     if let Some(enabled) = read_bbox_annotation_config(scope_config)? {
         return Ok(enabled);
     }
+    validate_device_config_path(user_config, DeviceConfigUse::Bbox)?;
     Ok(read_bbox_annotation_config(user_config)?.unwrap_or(true))
 }
 
@@ -193,7 +195,20 @@ pub(crate) struct IncrementalConfig {
 
 pub(crate) fn effective_incremental_config(repo: &Repository) -> Result<IncrementalConfig> {
     let scope = read_incremental_tuning(&repo.kio_dir().join("config.toml"))?;
-    let user = read_incremental_tuning(&user_config_toml_path(repo.control()))?;
+    let user = if scope.0.is_some() && scope.1.is_some() && scope.2.is_some() {
+        (None, None, None)
+    } else {
+        let path = user_config_toml_path(repo.control());
+        validate_device_config_path(
+            &path,
+            DeviceConfigUse::Incremental {
+                enabled: scope.0.is_none(),
+                threshold: scope.1.is_none(),
+                max_consecutive: scope.2.is_none(),
+            },
+        )?;
+        read_incremental_tuning(&path)?
+    };
     Ok(IncrementalConfig {
         enabled: scope.0.or(user.0).unwrap_or(true),
         threshold: scope.1.or(user.1).unwrap_or(0.30),
@@ -254,129 +269,235 @@ pub(crate) fn scope_logs_retention_days(repo: &Repository) -> u32 {
         .unwrap_or(kio_core::scope::DEFAULT_LOG_RETENTION_DAYS)
 }
 
-/// Loads every adapter runtime input from the current device configuration.
-/// The returned value is installed only around one dispatch, so a changed or
-/// removed configuration cannot leak authority into a later invocation.
+/// Test convenience for inspecting all current device declaration metadata.
+#[cfg(test)]
 pub(crate) fn adapter_runtime_settings_from_user_config(
     control: &ControlHandle,
+) -> Result<kio_adapter::tool_lock::AdapterRuntimeSettings> {
+    adapter_runtime_settings_for_roles(control, &["prepare", "markdown", "embedding"])
+}
+
+/// Load metadata without consuming credentials or acquiring CA authority.
+/// Unavailable roles retain their original errors for work-specific checks.
+pub(crate) fn adapter_runtime_settings_for_roles(
+    control: &ControlHandle,
+    roles: &[&str],
 ) -> Result<kio_adapter::tool_lock::AdapterRuntimeSettings> {
     use kio_adapter::tool_lock::{
         AdapterRuntimeSettings, declared_adapter_for_role, declared_pricing_for_role,
     };
     let mut settings = AdapterRuntimeSettings::with_control(control.clone());
-    if let Some(path) = user_tools_toml_path(control)
-        && path.is_file()
-    {
-        let bytes = read_bounded_regular_file(&path, MAX_TOOLS_TOML_BYTES)?;
-        // A literal key is never carried from this ordinary configuration
-        // read into runtime settings. Re-read the same file through core's
-        // private no-follow boundary, then derive both declaration and key
-        // source from those verified bytes.
-        let bytes = if tools_toml_uses_plain_auth(&bytes).map_err(adapter_to_kio)? {
-            read_private_tools_toml_with_control(&path, control).map_err(adapter_to_kio)?
-        } else {
-            bytes
-        };
-        let value = parse_tools_toml(&bytes).map_err(adapter_to_kio)?;
-        for role in ["prepare", "markdown", "embedding"] {
-            if let Some(declared) = declared_adapter_for_role(&value, role) {
-                settings.declarations.insert(role.to_owned(), declared);
-            }
-            let pricing = declared_pricing_for_role(&value, role);
-            if !pricing.is_empty() {
-                settings.pricing.insert(role.to_owned(), pricing);
-            }
-        }
-        settings.tools_toml_path = Some(path);
-    }
-    let path = user_config_toml_path(control);
-    let bytes = match read_bounded_regular_file(&path, 1024 * 1024) {
-        Ok(bytes) => Some(bytes),
-        Err(_error)
-            if !path
-                .try_exists()
-                .map_err(|e| KioError::io(e.to_string(), path.display().to_string()))? =>
-        {
-            None
-        }
-        Err(error) => return Err(error),
-    };
-    let Some(bytes) = bytes else {
+    if roles.is_empty() {
         return Ok(settings);
-    };
-    let text = std::str::from_utf8(&bytes).map_err(|error| KioError::schema(error.to_string()))?;
-    let value: toml::Value =
-        toml::from_str(text).map_err(|error| KioError::schema(error.to_string()))?;
-    if let Some(seconds) = value
-        .get("adapter")
-        .and_then(|adapter| adapter.get("policy"))
-        .and_then(|policy| policy.get("offline_api"))
-        .and_then(|mode| mode.get("timeout_seconds"))
-        .and_then(toml::Value::as_integer)
-        .and_then(|seconds| u64::try_from(seconds).ok())
-    {
-        settings
-            .execution_timeouts
-            .insert("offline_api".to_owned(), seconds);
     }
-    if value
-        .get("adapter")
-        .and_then(|adapter| adapter.get("policy"))
-        .and_then(|policy| policy.get("offline_api"))
-        .and_then(|mode| mode.get("ca_pem_path"))
-        .is_some()
-    {
-        return Err(KioError::invalid_usage(
-            "adapter.policy.offline_api.ca_pem_path is retired; import it with `kio adapter trust register --ca-pem ABSOLUTE_PEM --yes`",
-        ));
+    let source = if let Some(path) = user_tools_toml_path(control) {
+        settings.tools_toml_path = Some(path.clone());
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            _ => Some(read_bounded_regular_file(&path, MAX_TOOLS_TOML_BYTES).map_err(Arc::new)),
+        }
+    } else {
+        None
+    };
+    for &role in roles {
+        let result = (|| {
+            if let Some(source) = &source {
+                let bytes = match source {
+                    Ok(bytes) => bytes,
+                    Err(error) => {
+                        settings
+                            .unavailable_roles
+                            .insert(role.to_owned(), error.clone());
+                        return Ok(());
+                    }
+                };
+                let value = parse_tools_toml_for_roles(bytes, &[role]).map_err(adapter_to_kio)?;
+                // Auth is an unconsumed declaration here. Any credential-derived
+                // binding or key must re-read the exact role privately at use.
+                if let Some(declared) = declared_adapter_for_role(&value, role) {
+                    settings.declarations.insert(role.to_owned(), declared);
+                }
+                let pricing = declared_pricing_for_role(&value, role);
+                if !pricing.is_empty() {
+                    settings.pricing.insert(role.to_owned(), pricing);
+                }
+            }
+            let mode = settings
+                .declarations
+                .get(role)
+                .and_then(|declared| declared.kind.as_deref())
+                .unwrap_or("online_api");
+            validate_device_config_path(
+                &user_config_toml_path(control),
+                DeviceConfigUse::Transport(mode),
+            )?;
+            if mode == "offline_api" {
+                let path = user_config_toml_path(control);
+                if path
+                    .try_exists()
+                    .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
+                {
+                    let bytes = read_bounded_regular_file(&path, 1024 * 1024)?;
+                    let value: toml::Value = toml::from_str(
+                        std::str::from_utf8(&bytes)
+                            .map_err(|error| KioError::schema(error.to_string()))?,
+                    )
+                    .map_err(|error| KioError::schema(error.to_string()))?;
+                    let policy = value
+                        .get("adapter")
+                        .and_then(|adapter| adapter.get("policy"))
+                        .and_then(|policy| policy.get("offline_api"));
+                    if policy
+                        .and_then(|policy| policy.get("ca_pem_path"))
+                        .is_some()
+                    {
+                        return Err(KioError::invalid_usage(
+                            "adapter.policy.offline_api.ca_pem_path is retired; import it with `kio adapter trust register --ca-pem ABSOLUTE_PEM --yes`",
+                        ));
+                    }
+                    if let Some(seconds) = policy
+                        .and_then(|policy| policy.get("timeout_seconds"))
+                        .and_then(toml::Value::as_integer)
+                        .and_then(|seconds| u64::try_from(seconds).ok())
+                    {
+                        settings
+                            .execution_timeouts
+                            .insert("offline_api".to_owned(), seconds);
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            settings
+                .unavailable_roles
+                .insert(role.to_owned(), Arc::new(error));
+        }
     }
     Ok(settings)
 }
 
-pub(crate) fn validate_user_tools_config(control: &ControlHandle) -> Result<()> {
-    let Some(path) = user_tools_toml_path(control) else {
-        return Ok(());
+/// Device policy is a prerequisite only where this invocation consumes it.
+/// Repository validation continues to enforce the complete scope policy.
+pub(crate) fn validate_user_config_for_command(
+    control: &ControlHandle,
+    command: &crate::commands::CommandRequest,
+) -> Result<()> {
+    use crate::commands::CommandRequest as Command;
+    let usage = match command {
+        Command::Search(_) => DeviceConfigUse::Search,
+        Command::Status => DeviceConfigUse::Budget,
+        _ => return Ok(()),
     };
-    if !path.is_file() {
-        return Ok(());
-    }
-    // This bounded no-follow read only classifies a configuration before it
-    // is used. A literal credential is never derived from it: that branch
-    // re-reads through `read_private_tools_toml` below. An unsafe file that
-    // cannot reach this classifier retains the generic bounded-read error.
-    let bytes = read_bounded_regular_file(&path, MAX_TOOLS_TOML_BYTES)?;
-    if tools_toml_uses_plain_auth(&bytes).map_err(adapter_to_kio)? {
-        // This is a refusal, not an advisory log: native Windows DACL and
-        // macOS ACL checks belong to the same shared private-file boundary as
-        // the later credential use. Its error is intentionally stable and
-        // never contains the credential or file bytes.
-        read_private_tools_toml_with_control(&path, control).map_err(adapter_to_kio)?;
-    }
-    validate_tools_toml(&bytes).map_err(adapter_to_kio)
+    validate_device_config_path(&user_config_toml_path(control), usage)
 }
 
-/// M8: validate the user (device) `config.toml` against `config.schema.json`
-/// before dispatch (10 §11 / 06 §10). The folder `.kio/config.toml` is already
-/// validated on `Repository::open` (scope.rs `validate_config`); the user config
-/// took no such path, so a negative budget cap etc. slipped through. Schema
-/// failures are `KIO-E-CONFIG-SCHEMA-001` (exit 2).
-pub(crate) fn validate_user_config(control: &ControlHandle) -> Result<()> {
-    let path = user_config_toml_path(control);
+/// Called only when CLI/scope precedence selects the device lane.
+pub(crate) fn validate_user_adapter_lane(control: &ControlHandle) -> Result<()> {
+    validate_device_config_path(&user_config_toml_path(control), DeviceConfigUse::Lane)
+}
+
+#[derive(Clone, Copy)]
+enum DeviceConfigUse<'a> {
+    Search,
+    Budget,
+    Lane,
+    Input,
+    Bbox,
+    Incremental {
+        enabled: bool,
+        threshold: bool,
+        max_consecutive: bool,
+    },
+    Transport(&'a str),
+}
+
+fn validate_device_config_path(path: &Path, usage: DeviceConfigUse<'_>) -> Result<()> {
     if !path.is_file() {
         return Ok(());
     }
-    let text = fs::read_to_string(&path)
+    let text = fs::read_to_string(path)
         .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
     let toml_value: toml::Value =
         toml::from_str(&text).map_err(|err| KioError::schema(err.to_string()))?;
-    let json_value =
+    let value =
         serde_json::to_value(&toml_value).map_err(|err| KioError::schema(err.to_string()))?;
-    validate_json_schema(SchemaKind::Config, &json_value)?;
-    // R12-2: apply the same documented-but-unwired value enforcement to the user
-    // config (device-global) as scope config gets in `validate_config`, so e.g.
-    // `store_request_body = true` there is a loud NOT-IMPLEMENTED, not a silent
-    // accept.
-    kio_core::scope::enforce_config_semantics(&json_value)
+    let selected: &[&str] = match usage {
+        DeviceConfigUse::Search => &["search", "observability", "adapter"],
+        DeviceConfigUse::Budget => &["budget"],
+        DeviceConfigUse::Bbox | DeviceConfigUse::Incremental { .. } => &["markdownize"],
+        _ => &["adapter"],
+    };
+    let mut value = kio_core::schema::project_config_sections(&value, selected)?;
+    if let Some(markdownize) = value.get_mut("markdownize").and_then(Value::as_object_mut) {
+        match usage {
+            DeviceConfigUse::Bbox => {
+                markdownize.remove("incremental");
+            }
+            DeviceConfigUse::Incremental {
+                enabled,
+                threshold,
+                max_consecutive,
+            } => {
+                markdownize.remove("bbox_annotation");
+                if let Some(incremental) = markdownize
+                    .get_mut("incremental")
+                    .and_then(Value::as_object_mut)
+                {
+                    for (key, selected) in [
+                        ("enabled", enabled),
+                        ("threshold", threshold),
+                        ("max_consecutive", max_consecutive),
+                    ] {
+                        if !selected {
+                            incremental.remove(key);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(adapter) = value.get_mut("adapter").and_then(Value::as_object_mut) {
+        if !matches!(usage, DeviceConfigUse::Lane) {
+            adapter.remove("lane");
+        }
+        if matches!(usage, DeviceConfigUse::Lane) {
+            adapter.remove("policy");
+        } else if let Some(policy) = adapter.get_mut("policy").and_then(Value::as_object_mut) {
+            // Remove only known, unconsumed keys. Unknown keys in a selected
+            // policy container remain visible to the closed schema.
+            for key in [
+                "allow_network",
+                "allowed_scope",
+                "max_input_bytes",
+                "timeout_seconds",
+                "redact_logs",
+                "store_request_body",
+                "store_response_body",
+                "require_command_confirmation",
+                "offline_api",
+                "online_api",
+                "deterministic_library",
+            ] {
+                let selected = match usage {
+                    DeviceConfigUse::Search => key == "redact_logs",
+                    DeviceConfigUse::Input => key == "max_input_bytes",
+                    DeviceConfigUse::Transport(mode) => {
+                        (!matches!(key, "offline_api" | "online_api" | "deterministic_library")
+                            && key != "max_input_bytes")
+                            || key == mode
+                    }
+                    _ => false,
+                };
+                if !selected {
+                    policy.remove(key);
+                }
+            }
+        }
+    }
+    validate_json_schema(SchemaKind::Config, &value)?;
+    kio_core::scope::enforce_config_semantics(&value)
 }
 
 pub(crate) fn validate_repo_tool_lock(repo: &Repository) -> Result<()> {

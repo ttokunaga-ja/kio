@@ -42,6 +42,15 @@ pub enum AdapterError {
     /// input to a listener whose identity remains unproven.
     #[error("local peer authentication failed: {0}")]
     LocalPeerAuth(String),
+    /// App-owned managed trust failure, retaining its original typed error.
+    #[error("{0}")]
+    RuntimeTrust(kio_core::KioError),
+    /// An unavailable selected role is distinct from an absent declaration.
+    #[error("adapter role {role} is unavailable: {error}")]
+    RuntimeConfiguration {
+        role: String,
+        error: std::sync::Arc<kio_core::KioError>,
+    },
     /// A local-peer destination or trust-anchor configuration failure.  The
     /// code is intentionally separate from generic schema errors so callers
     /// never retry a missing, unsafe, or revoked device trust anchor.
@@ -106,8 +115,9 @@ impl AdapterError {
     pub fn error_code(&self) -> &'static str {
         match self {
             Self::Auth(_) => "KIO-E-BATCH-AUTH-001",
+            Self::RuntimeConfiguration { .. } => "KIO-E-BATCH-INPUT-001",
             Self::LocalPeerAuth(_) => "KIO-E-LOCAL-PEER-AUTH-001",
-            Self::LocalPeerConfig { .. } => "KIO-E-LOCAL-PEER-CONFIG-001",
+            Self::LocalPeerConfig { .. } | Self::RuntimeTrust(_) => "KIO-E-LOCAL-PEER-CONFIG-001",
             Self::RateLimit { .. } => "KIO-E-BATCH-RATE-001",
             Self::QuotaExceeded(_) => "KIO-E-BATCH-QUOTA-001",
             Self::Network(_) | Self::Io { .. } => "KIO-E-BATCH-NET-001",
@@ -129,8 +139,10 @@ impl AdapterError {
         match self {
             Self::RateLimit { .. } => ErrorCategory::RateLimit,
             // Non-retryable in 04 §5.3's table (auth_error has max_attempts=0).
-            Self::Auth(_) => ErrorCategory::Permanent,
-            Self::LocalPeerAuth(_) | Self::LocalPeerConfig { .. } => ErrorCategory::Permanent,
+            Self::Auth(_) | Self::RuntimeConfiguration { .. } => ErrorCategory::Permanent,
+            Self::LocalPeerAuth(_) | Self::LocalPeerConfig { .. } | Self::RuntimeTrust(_) => {
+                ErrorCategory::Permanent
+            }
             // Retryable in 04 §5.3's table (network_error/quota_exceeded/
             // contract_violation all have max_attempts >= 1).
             Self::QuotaExceeded(_)

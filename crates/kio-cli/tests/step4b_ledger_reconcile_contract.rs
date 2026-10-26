@@ -387,11 +387,11 @@ fn qa14_restore_detection_gates_new_submissions() {
     );
 }
 
-/// QA14: a restored database behind its authority-bound checkpoint also blocks
-/// status. The read must not silently accept the old database or rewrite the
-/// checkpoint to manufacture a new baseline.
+/// QA14 / docs/04 §5.4: a restored database behind its authority-bound
+/// checkpoint leaves local scope status usable with unknown budget. Explicit
+/// billing status still rejects the unsafe snapshot; neither read repairs it.
 #[test]
-fn qa14_sequence_gap_blocks_status_without_mutating_lifecycle_artifacts() {
+fn qa14_sequence_gap_preserves_local_status_as_unknown_without_mutating_lifecycle_artifacts() {
     let dir = canonical_tempdir();
     init(&dir);
     fs::write(dir.path().join("a.pdf"), fake_pdf(&["alpha"])).unwrap();
@@ -412,11 +412,57 @@ fn qa14_sequence_gap_blocks_status_without_mutating_lifecycle_artifacts() {
     let authority_path = ledger.with_file_name("cost-ledger.sqlite.authority.json");
     let authority_before_status = fs::read(&authority_path).unwrap();
 
-    // Status reads an owned snapshot rather than reopening the mutable source.
-    // The stable lifecycle mismatch therefore reaches its public read path as
-    // an unsafe snapshot, while the paid submission path remains the direct
-    // sequence-mismatch exit checked above.
-    let output = kio(&dir, &["status"])
+    let database_before_status = fs::read(&ledger).unwrap();
+    let snapshot_artifacts = || {
+        fs::read_dir(ledger.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().into_string().unwrap();
+                if !(name.starts_with("cost-ledger.sqlite") || name == "ledger.lifecycle.lock") {
+                    return None;
+                }
+                let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+                Some((
+                    name,
+                    (
+                        fs::read(entry.path()).unwrap(),
+                        metadata.modified().unwrap(),
+                    ),
+                ))
+            })
+            .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    let artifacts_before_status = snapshot_artifacts();
+
+    // Scope status consumes billing only as a read-only observation. Unknown
+    // does not claim zero spend or grant authority for a new paid request.
+    let status = json_success(&dir, &["status"]);
+    assert!(status["files"].is_array() && status["tasks"].is_array());
+    assert_eq!(status["budget"]["budget_status"], "unknown");
+    assert_eq!(
+        status["budget"]["budget_reason"],
+        "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001"
+    );
+    for key in [
+        "device_spent_usd",
+        "folder_spent_usd",
+        "device_remaining_usd",
+        "folder_remaining_usd",
+    ] {
+        assert_eq!(
+            status["budget"][key],
+            Value::Null,
+            "unknown billing must not invent {key}: {status}"
+        );
+    }
+    assert_eq!(snapshot_artifacts(), artifacts_before_status);
+
+    // Explicit ledger status still owns the strict ledger read contract. The
+    // adjacent qa14_restore_detection_gates_new_submissions retains the paid
+    // submission/reconcile sequence-mismatch assertions unchanged.
+    let output = kio(&dir, &["ledger", "status"])
         .arg("--json")
         .assert()
         .code(4)
@@ -427,11 +473,13 @@ fn qa14_sequence_gap_blocks_status_without_mutating_lifecycle_artifacts() {
         error["error_code"], "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001",
         "{error}"
     );
+    assert_eq!(fs::read(&ledger).unwrap(), database_before_status);
     assert_eq!(
         fs::read(&checkpoint_path).unwrap(),
         checkpoint_before_status
     );
     assert_eq!(fs::read(&authority_path).unwrap(), authority_before_status);
+    assert_eq!(snapshot_artifacts(), artifacts_before_status);
 }
 
 // ---------------------------------------------------------------------------

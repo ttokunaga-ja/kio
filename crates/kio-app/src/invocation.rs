@@ -4,7 +4,6 @@ use crate::context::AppContext;
 use crate::ledger_access::run_ledger_lifecycle;
 use crate::multi_scope;
 use crate::response::{CommandResponse, Completion};
-use crate::trust;
 use crate::watch_command;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_core::ExitCode;
@@ -63,7 +62,6 @@ pub(crate) struct InvocationRuntime {
     pub(crate) locks: kio_core::scope::LockSession,
     pub(crate) control: kio_core::control::ControlHandle,
     pub(crate) settings: Arc<AdapterRuntimeSettings>,
-    pub(crate) _managed_trust: Option<trust::RuntimeTrust>,
 }
 
 impl std::ops::Deref for Invocation<'_> {

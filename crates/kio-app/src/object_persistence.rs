@@ -302,6 +302,40 @@ pub(crate) fn hash_and_write_manifest_object(
 
 pub(crate) fn adapter_to_kio(error: kio_adapter::AdapterError) -> KioError {
     match error {
+        kio_adapter::AdapterError::RuntimeConfiguration { role, error } => {
+            let mut context = if error.context().is_object() {
+                error.context().clone()
+            } else {
+                json!({"source_context": error.context()})
+            };
+            if let Some(context) = context.as_object_mut() {
+                context.insert("dependency".into(), json!("adapter_configuration"));
+                context.insert("role".into(), json!(role));
+            }
+            KioError::new(
+                error.error_code(),
+                error.message(),
+                context,
+                error.exit_code(),
+            )
+        }
+        kio_adapter::AdapterError::RuntimeTrust(error) => {
+            let mut context = if error.context().is_object() {
+                error.context().clone()
+            } else {
+                json!({"source_context": error.context()})
+            };
+            if let Some(context) = context.as_object_mut() {
+                context.insert("dependency".to_owned(), json!("managed_https_trust"));
+            }
+            KioError::new(
+                error.error_code(),
+                error.message(),
+                context,
+                error.exit_code(),
+            )
+        }
+
         kio_adapter::AdapterError::LocalPeerAuth(message) => KioError::new(
             "KIO-E-LOCAL-PEER-AUTH-001",
             message,

@@ -21,8 +21,10 @@ use crate::gc;
 use crate::historical_reindex;
 use crate::index::chunk_ledger::ensure_purge_epoch_initialized;
 use crate::index::chunk_ledger::recover_index_generation;
+use crate::index::pipeline::DeferredPaidPlaceholder;
 use crate::index::pipeline::explicitly_allowed_tier_a_paths;
 use crate::index::pipeline::index_preview_response;
+use crate::index::pipeline::optional_role_planning_ready;
 use crate::index::pipeline::run_index_pipeline;
 use crate::index::rebuild::is_rebuild_skippable_unit_error;
 use crate::index::rebuild::read_head_tree_for_rebuild;
@@ -30,7 +32,12 @@ use crate::index::rebuild::rebuild_step3_index;
 use crate::index::rebuild::skipped_disclosure;
 use crate::invocation::Invocation;
 use crate::invocation::merged_index_completion;
+use crate::ledger_access::BudgetObservation;
 use crate::ledger_access::RETIRED_NON_LIVE;
+use crate::ledger_access::incidental_paid_recovery_available;
+use crate::ledger_access::ledger_db_path;
+use crate::ledger_access::ledger_snapshot_to_kio;
+use crate::ledger_access::observe_budget;
 use crate::ledger_access::open_optional_ledger_db;
 use crate::ledger_access::recover_stale_sync_rows;
 use crate::management;
@@ -55,7 +62,9 @@ use crate::response::search::FileDispositionResponse;
 use crate::response::search::IndexStatusError;
 use crate::response::search::IndexStatusResponse;
 use crate::response::search::OfficeConversionUnavailableResponse;
+use crate::response::skipped_units::SkippedDisclosure;
 use crate::response::skipped_units::SkippedUnit;
+use crate::response::status::BudgetStatusResponse;
 use crate::response::{CommandResponse, Completion, ResponseBody};
 use crate::scope_access::ensure_raw_ingest_allowed;
 use crate::scope_access::register_scope;
@@ -67,19 +76,23 @@ use crate::search::scope::SearchedScopeInfo;
 use crate::search::scope::current_embedding_policy;
 use crate::settings::user_config_toml_path;
 use crate::settings::validate_repo_tool_lock;
+use crate::task_execution::budget_remaining_from_totals;
+use crate::task_execution::budget_status;
 use crate::task_execution::enrichment_completion;
-use crate::task_execution::scope_budget_warning;
 use crate::task_execution::task_retry_allowed;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_core::ExitCode;
 use kio_core::KioError;
 use kio_core::Result;
 use kio_core::control::ControlHandle;
+use kio_core::dag::CommitObject;
 use kio_core::dag::NormalizeRef;
 use kio_core::scope::PendingNormalizeRef;
 use kio_core::scope::Repository;
 use kio_pipeline::budget::read_budget_policy;
+use kio_pipeline::budget::{BudgetEstimate, evaluate_budget_with_caps};
 use kio_pipeline::ledger::LedgerReadSnapshot;
+use kio_pipeline::ledger::LedgerSnapshotError;
 use kio_pipeline::policy::CurrentPolicyEvaluator;
 use kio_pipeline::scan::CHILD_SCOPE_DISCOVERY_PAGE_SIZE;
 use kio_pipeline::scan::ScanPreview;
@@ -119,16 +132,277 @@ pub(crate) fn run_index(ctx: &Invocation<'_>, args: IndexArgs) -> Result<Command
     // the ordinary open path may repair a missing HEAD, which would violate the
     // preview no-state-creation contract before scanning.
     let repo = open_existing_managed_root(ctx.cwd(), ctx.control)?.in_lock_session(ctx.locks);
-    let execution = run_index_for_repo(ctx, args, &repo, true)?;
+    let mut state = IndexInvocationState {
+        root: repo.clone(),
+        deferred: Vec::new(),
+    };
+    let execution = run_index_for_repo(ctx, args, &repo, true, &mut state)?;
+    let response = match execution.response {
+        IndexWorkResponse::Published(mut work) => {
+            // All root/child paid work and recovery have finished. No provider
+            // action follows this one display capture and UTC month.
+            let mut observation = observe_budget(&ledger_db_path(ctx.control), ctx.control);
+            finalize_deferred_budget(&state, &mut observation, &mut work)?;
+            let budget = budget_status(&repo, &observation)?;
+            IndexResponse::Published(Box::new(work.publish(budget)))
+        }
+        IndexWorkResponse::Preview(work) => IndexResponse::Preview(work),
+        IndexWorkResponse::Deferred(work) => IndexResponse::Deferred(work),
+    };
     Ok(CommandResponse {
-        body: ResponseBody::Index(execution.response),
+        body: ResponseBody::Index(response),
         completion: execution.completion,
     })
 }
 
 struct IndexExecution {
-    response: IndexResponse,
+    response: IndexWorkResponse,
     completion: Completion,
+}
+
+struct IndexPublishedWork {
+    status: String,
+    approval_method: String,
+    network_allowed: bool,
+    network_opt_in: bool,
+    pending_online_tasks: usize,
+    paused_tasks: usize,
+    failed_files: usize,
+    normalized_files: usize,
+    pending_files: usize,
+    skipped_oversized_files: usize,
+    skipped_unrecognized_binary_files: usize,
+    embedding_tasks_executed: usize,
+    embedding_tasks_failed: usize,
+    tree_hash: String,
+    commit_hash: Option<String>,
+    commit: Option<CommitObject>,
+    skipped: SkippedDisclosure,
+    error_code: Option<String>,
+    gc: Option<GcReport>,
+    publication_status: Option<String>,
+    child_scopes: Option<Vec<ChildPublishedRow>>,
+    child_scope_discovery: Option<PublishedChildDiscovery>,
+}
+
+impl IndexPublishedWork {
+    fn publish(self, budget: BudgetStatusResponse) -> IndexPublishedResponse {
+        IndexPublishedResponse {
+            status: self.status,
+            approval_method: self.approval_method,
+            network_allowed: self.network_allowed,
+            network_opt_in: self.network_opt_in,
+            pending_online_tasks: self.pending_online_tasks,
+            paused_tasks: self.paused_tasks,
+            failed_files: self.failed_files,
+            normalized_files: self.normalized_files,
+            pending_files: self.pending_files,
+            skipped_oversized_files: self.skipped_oversized_files,
+            skipped_unrecognized_binary_files: self.skipped_unrecognized_binary_files,
+            embedding_tasks_executed: self.embedding_tasks_executed,
+            embedding_tasks_failed: self.embedding_tasks_failed,
+            tree_hash: self.tree_hash,
+            commit_hash: self.commit_hash,
+            commit: self.commit,
+            skipped: self.skipped,
+            error_code: self.error_code,
+            gc: self.gc,
+            publication_status: self.publication_status,
+            child_scopes: self.child_scopes,
+            child_scope_discovery: self.child_scope_discovery,
+            budget_status: budget.budget_status,
+            budget_reason: budget.budget_reason,
+            budget_warning: budget.warning,
+        }
+    }
+}
+
+enum IndexWorkResponse {
+    Preview(crate::response::index::IndexPreviewResponse),
+    Published(Box<IndexPublishedWork>),
+    Deferred(crate::response::gc::PrepublicationDeferredResponse),
+}
+
+impl IndexWorkResponse {
+    fn gc(&self) -> Option<&GcReport> {
+        match self {
+            Self::Published(work) => work.gc.as_ref(),
+            Self::Deferred(work) => Some(&work.gc),
+            Self::Preview(_) => None,
+        }
+    }
+    fn error_code(&self) -> Option<&str> {
+        match self {
+            Self::Published(work) => work.error_code.as_deref(),
+            Self::Deferred(work) => Some(&work.error_code),
+            Self::Preview(_) => None,
+        }
+    }
+    fn message(&self) -> Option<&str> {
+        match self {
+            Self::Deferred(work) => Some(&work.message),
+            Self::Published(_) | Self::Preview(_) => None,
+        }
+    }
+}
+
+struct IndexInvocationState {
+    root: Repository,
+    deferred: Vec<DeferredScopeBudget>,
+}
+
+struct DeferredScopeBudget {
+    relative: String,
+    scope_id: String,
+    tasks: Vec<DeferredPaidPlaceholder>,
+}
+
+impl IndexInvocationState {
+    fn defer(&mut self, repo: &Repository, tasks: Vec<DeferredPaidPlaceholder>) -> Result<()> {
+        if tasks.is_empty() {
+            return Ok(());
+        }
+        let relative = repo
+            .canonical_root()
+            .strip_prefix(self.root.canonical_root())
+            .map_err(|_| {
+                KioError::invalid_usage("deferred scope is outside the retained invocation root")
+            })?
+            .to_str()
+            .ok_or_else(|| KioError::invalid_usage("deferred scope path is not UTF-8"))?
+            .to_owned();
+        self.deferred.push(DeferredScopeBudget {
+            relative,
+            scope_id: repo.scope_identity()?.scope_id,
+            tasks,
+        });
+        Ok(())
+    }
+
+    fn reopen(&self, scope: &DeferredScopeBudget) -> Result<Repository> {
+        let repo = if scope.relative.is_empty() {
+            self.root.clone()
+        } else {
+            match reopen_managed_child_ancestor(&self.root, &scope.relative)? {
+                ManagedChildAncestor::Managed(repo) => *repo,
+                ManagedChildAncestor::ExcludedByPolicy | ManagedChildAncestor::IndependentRoot => {
+                    return Err(KioError::invalid_usage(
+                        "deferred scope no longer belongs to this index invocation",
+                    ));
+                }
+            }
+        };
+        if repo.scope_identity()?.scope_id != scope.scope_id {
+            return Err(KioError::invalid_usage(
+                "deferred scope identity changed before budget finalization",
+            ));
+        }
+        Ok(repo)
+    }
+}
+
+fn finalize_deferred_budget(
+    state: &IndexInvocationState,
+    observation: &mut BudgetObservation,
+    root_work: &mut IndexPublishedWork,
+) -> Result<()> {
+    if state.deferred.is_empty() {
+        return Ok(());
+    }
+    let Some(snapshot) = observation.snapshot.as_ref() else {
+        return Ok(());
+    };
+    // Complete every snapshot query before changing any task. A query failure
+    // makes the whole display unknown and leaves all new paid jobs held.
+    let totals = (|| {
+        let device = snapshot.month_total(None, None, &observation.month)?;
+        let adapter = snapshot.month_total(None, Some("markdownize"), &observation.month)?;
+        state
+            .deferred
+            .iter()
+            .map(|scope| {
+                snapshot
+                    .month_total(Some(&scope.scope_id), None, &observation.month)
+                    .map(|folder| (device, folder, adapter))
+            })
+            .collect::<std::result::Result<Vec<_>, LedgerSnapshotError>>()
+    })();
+    let totals = match totals {
+        Ok(totals) => totals,
+        Err(error) => {
+            observation.invalidate(&ledger_snapshot_to_kio(
+                &ledger_db_path(state.root.control()).display().to_string(),
+                error,
+            ));
+            return Ok(());
+        }
+    };
+    for (scope, (device, folder, adapter)) in state.deferred.iter().zip(totals) {
+        let repo = state.reopen(scope)?;
+        let _lock = repo.lock_store_in_session(repo.lock_session())?;
+        let policy = admit_scope_writer(&repo)?;
+        policy.revalidate().map_err(pipeline_to_kio)?;
+        let caps = read_budget_policy(
+            user_config_toml_path(repo.control()),
+            repo.kio_dir().join("config.toml"),
+        )
+        .map_err(pipeline_to_kio)?;
+        let (device, folder) =
+            budget_remaining_from_totals(&caps, "markdownize", device, folder, adapter);
+        let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
+        let exact = scope
+            .tasks
+            .iter()
+            .map(|entry| (entry.expected.task_id.as_str(), entry))
+            .collect::<BTreeMap<_, _>>();
+        store
+            .update_matching(|task| {
+                let Some(deferred) = exact.get(task.task_id.as_str()) else {
+                    return false;
+                };
+                // Never clear somebody else's hold, attempt, deadline or paid stamp.
+                if *task != deferred.expected {
+                    return false;
+                }
+                let estimate = BudgetEstimate {
+                    scope_id: scope.scope_id.clone(),
+                    task_type: TaskType::Markdownize,
+                    estimated_usd: deferred.estimated_usd,
+                    adapter_id: None,
+                };
+                let decision = evaluate_budget_with_caps(&estimate, device, folder, false);
+                let (status, reason) = if !decision.allowed && caps.hard_stop {
+                    (TaskStatus::Paused, "budget_exceeded")
+                } else {
+                    (TaskStatus::Pending, deferred.ready_reason)
+                };
+                task.status = status;
+                task.fallback_reason = Some(reason.to_owned());
+                task.hold_reason = kio_pipeline::task::hold_reason_for_reason(reason);
+                true
+            })
+            .map_err(pipeline_to_kio)?;
+        if scope.relative.is_empty() {
+            let current = store.all().map_err(pipeline_to_kio)?;
+            let statuses = current
+                .iter()
+                .map(|task| (task.task_id.as_str(), task.status))
+                .collect::<BTreeMap<_, _>>();
+            let mut paused = 0;
+            let mut pending = 0;
+            for deferred in &scope.tasks {
+                match statuses.get(deferred.expected.task_id.as_str()) {
+                    Some(TaskStatus::Paused) => paused += 1,
+                    Some(TaskStatus::Pending) => pending += 1,
+                    _ => {}
+                }
+            }
+            root_work.paused_tasks =
+                root_work.paused_tasks.saturating_sub(scope.tasks.len()) + paused;
+            root_work.pending_online_tasks += pending;
+        }
+    }
+    Ok(())
 }
 
 /// Index one scope. Only the user-invoked parent discovers children; child
@@ -138,8 +412,9 @@ fn run_index_for_repo(
     args: IndexArgs,
     repo: &Repository,
     discover_children: bool,
+    invocation_state: &mut IndexInvocationState,
 ) -> Result<IndexExecution> {
-    run_index_for_repo_inner(ctx, args, repo, discover_children)
+    run_index_for_repo_inner(ctx, args, repo, discover_children, invocation_state)
 }
 
 struct ChildDiscoveryPage {
@@ -200,6 +475,7 @@ fn run_index_for_repo_inner(
     args: IndexArgs,
     repo: &Repository,
     discover_children: bool,
+    invocation_state: &mut IndexInvocationState,
 ) -> Result<IndexExecution> {
     let adapter_settings = ctx.settings;
 
@@ -249,7 +525,7 @@ fn run_index_for_repo_inner(
             gc::AutomaticGcPreflight::Proceed { recovered, binding } => (recovered, Some(binding)),
             gc::AutomaticGcPreflight::Deferred(report) => {
                 return Ok(IndexExecution {
-                    response: IndexResponse::Deferred(gc::deferred_before_publication(
+                    response: IndexWorkResponse::Deferred(gc::deferred_before_publication(
                         "index", *report,
                     )),
                     completion: Completion::Partial,
@@ -359,7 +635,7 @@ fn run_index_for_repo_inner(
         }
         admission_policy.revalidate().map_err(pipeline_to_kio)?;
         return Ok(IndexExecution {
-            response: IndexResponse::Preview(output),
+            response: IndexWorkResponse::Preview(output),
             completion: Completion::Complete,
         });
     }
@@ -402,33 +678,57 @@ fn run_index_for_repo_inner(
     if args.yes {
         write_approval_record(repo, &preview, "yes")?;
     }
-    let markdown_profile = active_markdownize_profile_for(adapter_settings, repo)?;
-    let secrets_approved = secrets_send_approved(
-        adapter_settings,
-        repo,
-        approvals::AdapterRole::Markdown,
-        &markdown_profile.adapter_id,
-        &markdown_profile.tool_profile_hash,
-    );
-    if secrets_approved {
-        release_markdownize_secret_holds(
+    let markdown_planning_ready = optional_role_planning_ready(adapter_settings, "markdown")?;
+    let embedding_planning_ready = optional_role_planning_ready(adapter_settings, "embedding")?;
+    if markdown_planning_ready {
+        let markdown_profile = active_markdownize_profile_for(adapter_settings, repo)?;
+        let secrets_approved = secrets_send_approved(
+            adapter_settings,
             repo,
-            &markdown_output_ref_for_profile(&markdown_profile),
-        )?;
+            approvals::AdapterRole::Markdown,
+            &markdown_profile.adapter_id,
+            &markdown_profile.tool_profile_hash,
+        );
+        if secrets_approved {
+            release_markdownize_secret_holds(
+                repo,
+                &markdown_output_ref_for_profile(&markdown_profile),
+            )?;
+        }
     }
     record_quarantine_candidates(adapter_settings, repo, &preview)?;
 
     if recover_pending_online_promotion(repo)? {
         finish_pending_online_promotion(ctx, repo)?;
     }
+    let has_paid_recovery = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone())
+        .all()
+        .map_err(pipeline_to_kio)?
+        .iter()
+        .any(|task| task.reservation_id.is_some());
+    let ledger = if !args.offline {
+        match incidental_paid_recovery_available(
+            &scope_id(repo.kio_dir())?,
+            has_paid_recovery,
+            ctx.control,
+        ) {
+            Ok(true) => open_optional_ledger_db(ctx.control)?,
+            Ok(false) => None,
+            Err(
+                LedgerSnapshotError::Missing
+                | LedgerSnapshotError::UnsafeIntegrity(_)
+                | LedgerSnapshotError::UnstableBusy(_),
+            ) => None,
+        }
+    } else {
+        None
+    };
     // CL45/item 5: reconcile any stale `request_kind='sync'` cost-ledger.sqlite
     // rows left by a crashed prior run, same write-command-entry point as the
     // online-promotion recovery just above.
-    if !args.offline
-        && let Some(ledger) = open_optional_ledger_db(ctx.control)?
-    {
+    if let Some(ledger) = ledger.as_ref() {
         recover_stale_sync_rows(
-            &ledger,
+            ledger,
             Some(&TaskStore::new_with_control(
                 repo.kio_dir(),
                 repo.control().clone(),
@@ -441,22 +741,26 @@ fn run_index_for_repo_inner(
     // requests — no new send, no network opt-in needed). Results collected
     // here land as Done tasks that `apply_online_promotion_to_index` below
     // folds into this run's single snapshot.
-    if !args.offline
-        && let Some(ledger) = open_optional_ledger_db(ctx.control)?
-    {
-        poll_batch_markdownize_jobs(
-            adapter_settings,
-            repo,
-            &TaskStore::new_with_control(repo.kio_dir(), repo.control().clone()),
-            &ledger,
-        )?;
-        // Offline also forbids polling, downloading or deleting existing jobs.
-        poll_batch_embedding_jobs(ctx, repo, &ledger)?;
+    if let Some(ledger) = ledger.as_ref() {
+        if markdown_planning_ready {
+            poll_batch_markdownize_jobs(
+                adapter_settings,
+                repo,
+                &TaskStore::new_with_control(repo.kio_dir(), repo.control().clone()),
+                ledger,
+            )?;
+        }
+        // An unavailable role cannot poll, download, or delete its retained job.
+        if embedding_planning_ready {
+            poll_batch_embedding_jobs(ctx, repo, ledger)?;
+        }
     }
     // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment).
     ensure_purge_epoch_initialized(repo.kio_dir(), repo.control())?;
     materialize_tool_lock(adapter_settings, repo)?;
-    let mut index_result = run_index_pipeline(adapter_settings, repo, &preview, &args)?;
+    let mut index_result =
+        run_index_pipeline(adapter_settings, repo, &preview, &args, ledger.as_ref())?;
+    invocation_state.defer(repo, std::mem::take(&mut index_result.deferred_budget))?;
     // A prior batch may already have produced a complete accepted online
     // instance. Overlay it before the one normal index snapshot so an ordinary
     // index neither demotes the file to the deterministic baseline nor creates a
@@ -508,11 +812,12 @@ fn run_index_for_repo_inner(
     // The scope now has a search index; register it as indexed so it participates
     // in default multi-scope search (05 §1.8, K3). Cache write, never fatal.
     register_scope(ctx, repo, true);
-    let mut output = IndexPublishedResponse {
+    let mut output = IndexPublishedWork {
         status: if outcome.noop { "noop" } else { "indexed" }.to_owned(),
         approval_method: if args.yes { "yes" } else { "existing" }.to_owned(),
         network_allowed: index_result.network_allowed,
-        network_opt_in: persistent_network_allowed(adapter_settings, repo)?,
+        network_opt_in: markdown_planning_ready
+            && persistent_network_allowed(adapter_settings, repo)?,
         pending_online_tasks: index_result.pending_online_tasks,
         paused_tasks: index_result.paused_tasks + enrichment.paused,
         failed_files: index_result.failed_files,
@@ -525,7 +830,6 @@ fn run_index_for_repo_inner(
         tree_hash: outcome.tree_hash,
         commit_hash: outcome.commit_hash,
         commit: outcome.commit,
-        budget_warning: scope_budget_warning(repo)?,
         skipped: skipped_disclosure(&rebuild_report, repo.kio_dir()),
         error_code: (index_result.failed_files > 0).then(|| "KIO-E-INDEX-PARTIAL-001".to_owned()),
         gc: None,
@@ -627,7 +931,14 @@ fn run_index_for_repo_inner(
                             .expect("managed child ancestor was inserted")
                     }
                 };
-                match run_bound_child_index(ctx, direct_parent, plan, &child.path, &args) {
+                match run_bound_child_index(
+                    ctx,
+                    direct_parent,
+                    plan,
+                    &child.path,
+                    &args,
+                    invocation_state,
+                ) {
                     Ok(BoundChildIndex::SkippedVcs) => {
                         child.status = "skipped_vcs".to_owned();
                         child.reason = Some("vcs_marker_added_after_discovery".to_owned());
@@ -800,7 +1111,7 @@ fn run_index_for_repo_inner(
         }
     }
     Ok(IndexExecution {
-        response: IndexResponse::Published(Box::new(output)),
+        response: IndexWorkResponse::Published(Box::new(output)),
         completion,
     })
 }
@@ -978,6 +1289,7 @@ fn run_bound_child_index(
     plan: &kio_pipeline::scan::ChildScopePlan,
     relative: &str,
     args: &IndexArgs,
+    invocation_state: &mut IndexInvocationState,
 ) -> Result<BoundChildIndex> {
     let Some(bound) = bind_planned_child(plan, relative).map_err(pipeline_to_kio)? else {
         return Ok(BoundChildIndex::SkippedVcs);
@@ -991,7 +1303,7 @@ fn run_bound_child_index(
             // grants. Existing child grants may still authorize the requested
             // execution lane through that child's ordinary send gates.
             child_args.yes = false;
-            let output = run_index_for_repo(ctx, child_args, &repo, false)?;
+            let output = run_index_for_repo(ctx, child_args, &repo, false, invocation_state)?;
             Ok(BoundChildIndex::Output(Box::new(output), repo))
         }
     }
@@ -1022,17 +1334,26 @@ pub(crate) fn compute_index_status(
     let mut unsupported_input_errors = Vec::new();
     let mut task_errors = Vec::new();
     let mut office_conversion_unavailable_inputs = Vec::new();
-    let device_spent = match budget_ledger {
-        Some(snapshot) => snapshot
-            .month_total(None, None, budget_month)
-            .map_err(|error| {
-                pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
-                    ledger_path.display().to_string(),
-                    error,
-                ))
-            })?,
-        None => 0.0,
-    };
+    let mut budget_reason = budget_ledger
+        .is_none()
+        .then(|| "KIO-E-LEDGER-UNINITIALIZED-001".to_owned());
+    let device_spent =
+        budget_ledger.and_then(
+            |snapshot| match snapshot.month_total(None, None, budget_month) {
+                Ok(total) => Some(total),
+                Err(error) => {
+                    budget_reason = Some(
+                        crate::ledger_access::ledger_snapshot_to_kio(
+                            &ledger_path.display().to_string(),
+                            error,
+                        )
+                        .error_code()
+                        .to_owned(),
+                    );
+                    None
+                }
+            },
+        );
 
     for scope in searched {
         // R23-20 (03 §4 L296): `scope.scope_path` is now the canonical `.kio`
@@ -1180,30 +1501,42 @@ pub(crate) fn compute_index_status(
                 // Preserve the established best-effort treatment of unrelated
                 // per-scope budget-config/identity failures: they must not
                 // discard otherwise valid multi-scope search results. Snapshot
-                // query failures remain command-fatal inside the successful
-                // policy+identity branch and are never converted to zero.
-                if let Ok(caps) = read_budget_policy(
+                // query failures make this invocation's budget unknown; they
+                // never discard local search results or become zero spending.
+                let caps = read_budget_policy(
                     user_config_toml_path(control),
                     repo.kio_dir().join("config.toml"),
-                ) && let Ok(identity) = repo.scope_identity()
+                )
+                .map_err(pipeline_to_kio);
+                if budget_reason.is_none()
+                    && let Err(error) = &caps
                 {
-                    let folder_spent = match budget_ledger {
-                        Some(snapshot) => snapshot
-                            .month_total(Some(&identity.scope_id), None, budget_month)
-                            .map_err(|error| {
-                                pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
-                                    ledger_path.display().to_string(),
+                    budget_reason = Some(error.error_code().to_owned());
+                }
+                if let Ok(caps) = caps
+                    && let Ok(identity) = repo.scope_identity()
+                    && let (Some(snapshot), Some(device_spent)) = (budget_ledger, device_spent)
+                    && budget_reason.is_none()
+                {
+                    match snapshot.month_total(Some(&identity.scope_id), None, budget_month) {
+                        Ok(folder_spent) => {
+                            let device_exhausted =
+                                caps.device_monthly_usd_cap - device_spent <= 0.0;
+                            let folder_exhausted = caps
+                                .folder_monthly_usd_cap
+                                .is_some_and(|cap| cap - folder_spent <= 0.0);
+                            budget_paused |= device_exhausted || folder_exhausted;
+                        }
+                        Err(error) => {
+                            budget_reason = Some(
+                                crate::ledger_access::ledger_snapshot_to_kio(
+                                    &ledger_path.display().to_string(),
                                     error,
-                                ))
-                            })?,
-                        None => 0.0,
-                    };
-                    let device_exhausted = caps.device_monthly_usd_cap - device_spent <= 0.0;
-                    let folder_exhausted = caps
-                        .folder_monthly_usd_cap
-                        .is_some_and(|cap| cap - folder_spent <= 0.0);
-                    if device_exhausted || folder_exhausted {
-                        budget_paused = true;
+                                )
+                                .error_code()
+                                .to_owned(),
+                            );
+                        }
                     }
                 }
             }
@@ -1232,7 +1565,14 @@ pub(crate) fn compute_index_status(
         skipped_enrichment_tasks,
         skipped_enrichment_reasons,
         pending_enrichment_tasks: pending,
-        budget_paused,
+        budget_status: if budget_reason.is_some() {
+            "unknown"
+        } else {
+            "known"
+        }
+        .to_owned(),
+        budget_paused: budget_reason.is_none().then_some(budget_paused),
+        budget_reason,
         unsupported_inputs,
         unsupported_input_errors,
         unsupported_inputs_complete,
@@ -1339,32 +1679,40 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
     // CL45/item 5: reconcile any stale `request_kind='sync'` cost-ledger.sqlite
     // rows left by a crashed prior run — applies uniformly to both the
     // historical (`--at`) and HEAD (`--force`) reindex modes below.
-    if !parsed.offline
-        && let Some(ledger) = open_optional_ledger_db(ctx.control)?
-    {
-        recover_stale_sync_rows(
-            &ledger,
-            Some(&TaskStore::new_with_control(
-                repo.kio_dir(),
-                repo.control().clone(),
-            )),
+    let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
+    let has_paid_stamp = store
+        .all()
+        .map_err(pipeline_to_kio)?
+        .iter()
+        .any(|task| task.reservation_id.is_some());
+    let recovery_ledger = if !parsed.offline {
+        match incidental_paid_recovery_available(
             &scope_id(repo.kio_dir())?,
-        )?;
+            has_paid_stamp,
+            ctx.control,
+        ) {
+            Ok(true) => open_optional_ledger_db(ctx.control)?,
+            Ok(false)
+            | Err(
+                LedgerSnapshotError::Missing
+                | LedgerSnapshotError::UnsafeIntegrity(_)
+                | LedgerSnapshotError::UnstableBusy(_),
+            ) => None,
+        }
+    } else {
+        None
+    };
+    if let Some(ledger) = recovery_ledger.as_ref() {
+        recover_stale_sync_rows(ledger, Some(&store), &scope_id(repo.kio_dir())?)?;
+        // Receive/cleanup retains the same current role and policy guards.
+        if optional_role_planning_ready(adapter_settings, "markdown")? {
+            poll_batch_markdownize_jobs(adapter_settings, &repo, &store, ledger)?;
+        }
+        if optional_role_planning_ready(adapter_settings, "embedding")? {
+            poll_batch_embedding_jobs(ctx, &repo, ledger)?;
+        }
     }
-    // 04 §5.8 相 3: poll/collect in-flight Batch markdownize jobs at the same
-    // write-command entry point (see `poll_batch_markdownize_jobs`).
-    if !parsed.offline
-        && let Some(ledger) = open_optional_ledger_db(ctx.control)?
-    {
-        poll_batch_markdownize_jobs(
-            adapter_settings,
-            &repo,
-            &TaskStore::new_with_control(repo.kio_dir(), repo.control().clone()),
-            &ledger,
-        )?;
-        // 04 §5.8 相 3 for the embedding Batch lane at the same entry point.
-        poll_batch_embedding_jobs(ctx, &repo, &ledger)?;
-    }
+    drop(recovery_ledger);
     // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment).
     ensure_purge_epoch_initialized(repo.kio_dir(), repo.control())?;
     if let Some(at) = parsed.at.as_deref() {

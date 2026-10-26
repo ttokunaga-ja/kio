@@ -58,6 +58,7 @@ fn kio(dir: &TempDir, args: &[&str], env: &[(&str, &str)]) -> Command {
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
         .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
+        .env("XDG_STATE_HOME", dir.path().join(".test-state"))
         .args(args);
     for (name, value) in env {
         command.env(name, value);
@@ -856,5 +857,117 @@ fn s3e_changed_ocr_profile_does_not_borrow_a_mock_normalize_ref() {
     assert!(
         markdownize_task_count(&dir, "scan.pdf") > task_count,
         "a changed OCR profile must enqueue work instead of borrowing the mock result"
+    );
+}
+
+/// APP-01 / docs/04 §5.4: a free local task preserves its durable retry deadline.
+#[test]
+fn app01_local_ocr_respects_pending_task_retry_deadline_without_a_ledger() {
+    let dir = scanned_pdf_fixture();
+    let local = [("KIO_TEST_LOCAL_OCR", "mock")];
+    activate_local_ocr(&dir, &local);
+    json_success(&dir, &["index", "--offline"], &local);
+    let store = kio_pipeline::task::TaskStore::new(dir.path().join(".kio"));
+    let mut count = 0;
+    store
+        .update_matching(|task| {
+            if task.task_type == kio_pipeline::task::TaskType::Markdownize
+                && task.input_path.ends_with("scan.pdf")
+                && task.status == kio_pipeline::task::TaskStatus::Pending
+            {
+                task.attempts = 1;
+                task.next_retry_at = Some("2099-01-01T00:00:00Z".to_owned());
+                task.fallback_reason = Some("network_error".to_owned());
+                count += 1;
+                true
+            } else {
+                false
+            }
+        })
+        .unwrap();
+    assert_eq!(count, 1, "fixture must have one actual pending OCR task");
+    let before = tasks(&dir)
+        .into_iter()
+        .find(|t| {
+            t["input_path"]
+                .as_str()
+                .is_some_and(|p| p.ends_with("scan.pdf"))
+        })
+        .unwrap();
+    json_success(&dir, &["index"], &local);
+    let after = tasks(&dir)
+        .into_iter()
+        .find(|t| t["task_id"] == before["task_id"])
+        .unwrap();
+    assert_eq!(
+        after["status"], "pending",
+        "future deadline must prevent dispatch: {after}"
+    );
+    assert_eq!(after["attempts"], 1);
+    assert_eq!(after["next_retry_at"], "2099-01-01T00:00:00Z");
+    assert_eq!(
+        tasks(&dir)
+            .iter()
+            .filter(|task| task["type"] == "markdownize"
+                && task["input_path"] == "scan.pdf"
+                && task["input_hash"] == before["input_hash"])
+            .count(),
+        1,
+        "a fresh Task ID must not bypass the same local job's durable retry deadline"
+    );
+    assert!(
+        !chunk_texts(&dir)
+            .iter()
+            .any(|text| text.contains(MOCK_PAGE_TEXT)),
+        "no local OCR output before retry deadline"
+    );
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
+    );
+}
+
+/// APP-04 / docs/14 Operation-specific prerequisites: an unavailable unused
+/// adapter does not erase accepted local knowledge or select another endpoint.
+#[test]
+fn app04_unavailable_local_ocr_preserves_accepted_head_normalization() {
+    let dir = scanned_pdf_and_image_fixture();
+    let local = [("KIO_TEST_LOCAL_OCR", "mock")];
+    activate_local_ocr(&dir, &local);
+    json_success(&dir, &["index"], &local);
+    let before = current_ocr_normalizes(&dir);
+    assert_eq!(before.len(), 2, "both actual OCR results must be pinned");
+    let before_tasks = tasks(&dir).len();
+    fs::write(
+        dir.path().join(".test-config/kio/tools.toml"),
+        b"markdown = [invalid TOML\n",
+    )
+    .unwrap();
+    let poisoned = [
+        ("KIO_TEST_LOCAL_OCR", "mock"),
+        ("KIO_TEST_LOCAL_OCR_BODY", "nonconforming"),
+    ];
+    json_success(&dir, &["index"], &poisoned);
+    assert_eq!(
+        current_ocr_normalizes(&dir),
+        before,
+        "unavailable configuration must preserve exact accepted raw/profile/manifest bindings"
+    );
+    assert_eq!(
+        tasks(&dir).len(),
+        before_tasks,
+        "no new adapter job or implicit destination fallback"
+    );
+    assert!(
+        chunk_texts(&dir)
+            .iter()
+            .any(|text| text.contains(MOCK_PAGE_TEXT)),
+        "accepted OCR knowledge remains locally searchable"
+    );
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
     );
 }

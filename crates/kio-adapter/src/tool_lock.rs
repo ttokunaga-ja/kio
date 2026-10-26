@@ -125,7 +125,7 @@ pub fn canonical_tool_lock_value(value: &Value) -> Result<Value> {
 /// Parse and validate device adapter settings without copying source text into
 /// diagnostics. TOML's normal Display includes the failing line, which may be
 /// a plaintext credential; only the byte offset is safe to log.
-pub fn parse_tools_toml(bytes: &[u8]) -> Result<toml::Value> {
+fn parse_tools_toml_syntax(bytes: &[u8]) -> Result<toml::Value> {
     if bytes.len() as u64 > MAX_TOOLS_TOML_BYTES {
         return Err(AdapterError::ConfigSchema(
             "tools.toml exceeds its size limit".to_owned(),
@@ -140,6 +140,32 @@ pub fn parse_tools_toml(bytes: &[u8]) -> Result<toml::Value> {
             .unwrap_or_default();
         AdapterError::ConfigSchema(format!("tools.toml contains invalid TOML{location}"))
     })?;
+    Ok(value)
+}
+
+pub fn parse_tools_toml(bytes: &[u8]) -> Result<toml::Value> {
+    let value = parse_tools_toml_syntax(bytes)?;
+    validate_tools_toml_value(&value)?;
+    Ok(value)
+}
+
+/// Parse the source syntax strictly, validating only roles consumed by this operation.
+pub fn parse_tools_toml_for_roles(bytes: &[u8], roles: &[&str]) -> Result<toml::Value> {
+    let mut value = parse_tools_toml_syntax(bytes)?;
+    if let Some(table) = value.as_table_mut() {
+        // An unknown role cannot be safely attributed to an unused lane.
+        // Do not turn a misspelled declaration into permission for a default.
+        if let Some(role) = table
+            .keys()
+            .find(|role| !TOOLS_ADAPTER_ROLES.contains(&role.as_str()))
+        {
+            return Err(AdapterError::ConfigSchema(format!(
+                "unknown tools.toml section `{role}` (expected one of: {})",
+                TOOLS_ADAPTER_ROLES.join(", ")
+            )));
+        }
+        table.retain(|role, _| roles.contains(&role));
+    }
     validate_tools_toml_value(&value)?;
     Ok(value)
 }
@@ -148,22 +174,8 @@ pub fn validate_tools_toml(bytes: &[u8]) -> Result<()> {
     parse_tools_toml(bytes).map(|_| ())
 }
 
-/// Whether a syntactically valid `tools.toml` declares any literal API key.
-/// Only `auth` fields count: an unrelated argument string beginning with
-/// `plain:` must not turn a non-secret configuration file into a credential
-/// source.
-pub fn tools_toml_uses_plain_auth(bytes: &[u8]) -> Result<bool> {
-    Ok(toml_value_uses_plain_auth(&parse_tools_toml(bytes)?))
-}
-
-/// Read and validate a credential-bearing `tools.toml` through core's
-/// owner-private, regular-file, no-follow trust boundary. The returned bytes
-/// are the only bytes from which a literal key may be derived.
-pub fn read_private_tools_toml(path: &Path) -> Result<Vec<u8>> {
-    read_private_tools_toml_with_control(path, &kio_core::control::ControlHandle::default())
-}
-
-pub fn read_private_tools_toml_with_control(
+/// Read selected credential bytes through the owner-private no-follow boundary.
+fn read_private_tools_bytes_with_control(
     path: &Path,
     control: &kio_core::control::ControlHandle,
 ) -> Result<Vec<u8>> {
@@ -175,22 +187,17 @@ pub fn read_private_tools_toml_with_control(
                 "tools.toml containing a plain credential must be an owner-private regular file"
                     .to_owned(),
         })?;
-    validate_tools_toml(&bytes)?;
     Ok(bytes)
 }
 
-fn toml_value_uses_plain_auth(value: &toml::Value) -> bool {
-    match value {
-        toml::Value::Table(table) => table.iter().any(|(key, value)| {
-            (key == "auth"
-                && value
-                    .as_str()
-                    .is_some_and(|auth| auth.starts_with("plain:")))
-                || toml_value_uses_plain_auth(value)
-        }),
-        toml::Value::Array(items) => items.iter().any(toml_value_uses_plain_auth),
-        _ => false,
-    }
+pub fn read_private_tools_toml_for_roles_with_control(
+    path: &Path,
+    control: &kio_core::control::ControlHandle,
+    roles: &[&str],
+) -> Result<Vec<u8>> {
+    let bytes = read_private_tools_bytes_with_control(path, control)?;
+    parse_tools_toml_for_roles(&bytes, roles)?;
+    Ok(bytes)
 }
 
 /// R13-2: the adapter-role sections `tools.toml` may declare (docs/03 §11 +
@@ -1073,6 +1080,22 @@ fn optional_string_array(table: &toml::value::Table, field: &str) -> Vec<String>
         .collect()
 }
 
+/// Non-secret CA identity acquired by the application at a selected HTTPS boundary.
+#[derive(Debug, Clone)]
+pub struct ManagedLocalTrustSnapshot {
+    pub path: PathBuf,
+    pub digest: String,
+}
+
+/// The application owns the retained filesystem lock; settings retain this
+/// accessor for the entire invocation, including every selected HTTPS send.
+pub trait ManagedLocalTrustProvider:
+    std::fmt::Debug + Send + Sync + std::panic::RefUnwindSafe
+{
+    fn binding(&self) -> kio_core::Result<String>;
+    fn acquire(&self) -> kio_core::Result<ManagedLocalTrustSnapshot>;
+}
+
 /// All configuration that affects adapter execution.  The app loads this from
 /// the current device configuration and owns it for one command only;
 /// profile identities intentionally remain outside this execution context.
@@ -1080,11 +1103,15 @@ fn optional_string_array(table: &toml::value::Table, field: &str) -> Vec<String>
 pub struct AdapterRuntimeSettings {
     pub control: kio_core::control::ControlHandle,
     pub declarations: std::collections::HashMap<String, DeclaredAdapter>,
+    pub unavailable_roles: std::collections::HashMap<String, std::sync::Arc<kio_core::KioError>>,
+    pub credential_readiness:
+        std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<String, String>>>,
     pub pricing: std::collections::HashMap<String, BTreeMap<String, f64>>,
     pub execution_timeouts: std::collections::HashMap<String, u64>,
+    pub managed_local_trust: Option<std::sync::Arc<dyn ManagedLocalTrustProvider>>,
     pub local_peer_ca_path: Option<PathBuf>,
-    /// Digest captured from the private local CA at command composition. The
-    /// transport compares fresh bytes to this value before every TLS request.
+    /// Explicit captured trust for direct adapter fixtures. Application
+    /// invocations use managed_local_trust to acquire it at selected HTTPS use.
     pub local_peer_trust_digest: Option<String>,
     /// Lifecycle-bound non-secret identity for the managed local CA. This is
     /// distinct from the CA digest so A→B→A never revives a grant for A.
@@ -1106,8 +1133,11 @@ impl AdapterRuntimeSettings {
         Self {
             control,
             declarations: Default::default(),
+            unavailable_roles: Default::default(),
+            credential_readiness: Default::default(),
             pricing: Default::default(),
             execution_timeouts: Default::default(),
+            managed_local_trust: None,
             local_peer_ca_path: None,
             local_peer_trust_digest: None,
             local_peer_trust_binding: None,
@@ -1115,6 +1145,102 @@ impl AdapterRuntimeSettings {
         }
     }
     /// Read this invocation's declaration without ambient authority.
+    pub fn role_configuration_ready(&self, role: &str) -> Result<()> {
+        match self.unavailable_roles.get(role) {
+            Some(error) => Err(AdapterError::RuntimeConfiguration {
+                role: role.to_owned(),
+                error: error.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    pub fn readiness_reasons(&self) -> Vec<(String, String)> {
+        let mut reasons = self
+            .unavailable_roles
+            .iter()
+            .map(|(role, error)| (role.clone(), error.to_string()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if let Ok(credentials) = self.credential_readiness.lock() {
+            reasons.extend(credentials.clone());
+        }
+        reasons.into_iter().collect()
+    }
+
+    fn credential_failure(&self, role: &str, error: AdapterError) -> AdapterError {
+        if matches!(error, AdapterError::RuntimeConfiguration { .. }) {
+            return error;
+        }
+        let error = match error {
+            AdapterError::ConfigSchemaCoded { code, message }
+            | AdapterError::LocalPeerConfig { code, message } => kio_core::KioError::new(
+                code,
+                message,
+                serde_json::json!({}),
+                kio_core::ExitCode::InvalidUsage,
+            ),
+            other => kio_core::KioError::schema(other.to_string()),
+        };
+        if let Ok(mut reasons) = self.credential_readiness.lock() {
+            reasons.insert(role.to_owned(), error.to_string());
+        }
+        AdapterError::RuntimeConfiguration {
+            role: role.to_owned(),
+            error: std::sync::Arc::new(error),
+        }
+    }
+
+    /// Check only when a grant binding or transport consumes the credential.
+    /// Non-secret metadata parsing never makes this file a startup prerequisite.
+    pub fn role_credentials_ready(&self, role: &str) -> Result<()> {
+        self.role_configuration_ready(role)?;
+        if let Some(declared) = self.declarations.get(role)
+            && declared
+                .auth
+                .as_deref()
+                .is_some_and(|auth| auth.starts_with("plain:"))
+        {
+            self.verified_plain_declaration(role, declared)
+                .map_err(|error| self.credential_failure(role, error))?;
+        }
+        if let Ok(mut reasons) = self.credential_readiness.lock() {
+            reasons.remove(role);
+        }
+        Ok(())
+    }
+
+    fn verified_plain_declaration(
+        &self,
+        role: &str,
+        declared: &DeclaredAdapter,
+    ) -> Result<DeclaredAdapter> {
+        let path =
+            self.tools_toml_path
+                .as_deref()
+                .ok_or_else(|| AdapterError::ConfigSchemaCoded {
+                    code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
+                    message: "plain credential has no owner-private tools.toml source".to_owned(),
+                })?;
+        let bytes = read_private_tools_toml_for_roles_with_control(path, &self.control, &[role])?;
+        let value = parse_tools_toml_for_roles(&bytes, &[role])?;
+        let verified = declared_adapter_for_role(&value, role).ok_or_else(|| {
+            AdapterError::ConfigSchemaCoded {
+                code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
+                message: "owner-private tools.toml no longer declares this adapter credential"
+                    .to_owned(),
+            }
+        })?;
+        if &verified != declared {
+            return Err(AdapterError::ConfigSchemaCoded {
+                code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
+                message:
+                    "tools.toml changed after adapter configuration was loaded; retry the command"
+                        .to_owned(),
+            });
+        }
+        Ok(verified)
+    }
+
     #[must_use]
     pub fn declared_adapter(&self, role: &str) -> Option<DeclaredAdapter> {
         self.declarations.get(role).cloned()
@@ -1128,6 +1254,12 @@ impl AdapterRuntimeSettings {
         self.execution_timeouts.get(mode).copied()
     }
     pub fn local_peer_ca_path(&self) -> Result<PathBuf> {
+        if let Some(provider) = &self.managed_local_trust {
+            return provider
+                .acquire()
+                .map(|trust| trust.path)
+                .map_err(AdapterError::RuntimeTrust);
+        }
         self.local_peer_ca_path
             .clone()
             .ok_or_else(|| AdapterError::LocalPeerConfig {
@@ -1138,6 +1270,12 @@ impl AdapterRuntimeSettings {
             })
     }
     pub fn local_peer_trust_digest(&self) -> Result<String> {
+        if let Some(provider) = &self.managed_local_trust {
+            return provider
+                .acquire()
+                .map(|trust| trust.digest)
+                .map_err(AdapterError::RuntimeTrust);
+        }
         self.local_peer_trust_digest
             .clone()
             .ok_or_else(|| AdapterError::LocalPeerConfig {
@@ -1147,6 +1285,9 @@ impl AdapterRuntimeSettings {
             })
     }
     pub fn local_peer_trust_binding(&self) -> Result<String> {
+        if let Some(provider) = &self.managed_local_trust {
+            return provider.binding().map_err(AdapterError::RuntimeTrust);
+        }
         self.local_peer_trust_binding
             .clone()
             .ok_or_else(|| AdapterError::LocalPeerConfig {
@@ -1178,6 +1319,7 @@ impl AdapterRuntimeSettings {
     }
 
     pub fn resolve_role_api_key(&self, role: &str) -> Result<Option<String>> {
+        self.role_configuration_ready(role)?;
         let Some(declared) = self.declarations.get(role).cloned() else {
             return Ok(None);
         };
@@ -1191,30 +1333,7 @@ impl AdapterRuntimeSettings {
         if !auth.starts_with("plain:") {
             return resolve_auth(auth);
         }
-        let path =
-            self.tools_toml_path
-                .as_deref()
-                .ok_or_else(|| AdapterError::ConfigSchemaCoded {
-                    code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
-                    message: "plain credential has no owner-private tools.toml source".to_owned(),
-                })?;
-        let bytes = read_private_tools_toml_with_control(path, &self.control)?;
-        let value = parse_tools_toml(&bytes)?;
-        let verified = declared_adapter_for_role(&value, role).ok_or_else(|| {
-            AdapterError::ConfigSchemaCoded {
-                code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
-                message: "owner-private tools.toml no longer declares this adapter credential"
-                    .to_owned(),
-            }
-        })?;
-        if verified != declared {
-            return Err(AdapterError::ConfigSchemaCoded {
-                code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
-                message:
-                    "tools.toml changed after adapter configuration was loaded; retry the command"
-                        .to_owned(),
-            });
-        }
+        let verified = self.verified_plain_declaration(role, &declared)?;
         let key = verified
             .auth
             .as_deref()
@@ -1419,7 +1538,7 @@ mod tests {
             for error in [
                 super::parse_tools_toml(source.as_bytes()).unwrap_err(),
                 super::validate_tools_toml(source.as_bytes()).unwrap_err(),
-                super::tools_toml_uses_plain_auth(source.as_bytes()).unwrap_err(),
+                super::parse_tools_toml_for_roles(source.as_bytes(), &["markdown"]).unwrap_err(),
             ] {
                 let message = error.to_string();
                 assert!(message.contains("tools.toml contains invalid TOML at byte"));
@@ -1430,12 +1549,6 @@ mod tests {
                 );
             }
         }
-        assert!(
-            super::tools_toml_uses_plain_auth(
-                format!("[markdown]\nauth = \"plain:{CANARY}\"\n").as_bytes()
-            )
-            .unwrap()
-        );
     }
 
     #[test]
@@ -1559,11 +1672,14 @@ mod tests {
         AdapterRuntimeSettings {
             control: kio_core::control::ControlHandle::default(),
             declarations,
+            unavailable_roles: Default::default(),
+            credential_readiness: Default::default(),
             pricing,
             execution_timeouts: std::collections::HashMap::from([(
                 "offline_api".to_owned(),
                 timeout,
             )]),
+            managed_local_trust: None,
             local_peer_ca_path: ca_path,
             local_peer_trust_binding: local_peer_trust_digest
                 .as_ref()
@@ -2336,5 +2452,16 @@ pages = 0.004
             toml::from_str("[markdown.mistral_ocr_markdownize.pricing]\npages = 0\n").unwrap();
         let pricing = declared_pricing_for_role(&value, "markdown");
         assert_eq!(pricing.get("pages"), Some(&0.0));
+    }
+    #[test]
+    fn selected_role_parse_isolates_known_roles_without_defaulting_unknown_sections() {
+        let bytes = b"[embedding.gemini_embedding_2]\n[markdown.mistral_ocr_markdownize]\nurl = 'http://127.0.0.1:1'\n";
+        let selected = parse_tools_toml_for_roles(bytes, &["embedding"]).unwrap();
+        assert!(declared_adapter_for_role(&selected, "embedding").is_some());
+        assert!(parse_tools_toml_for_roles(bytes, &["markdown"]).is_err());
+        assert!(
+            parse_tools_toml_for_roles(b"[embeding.custom]\n", &["embedding"]).is_err(),
+            "an unknown declaration must not activate the default embedding destination"
+        );
     }
 }

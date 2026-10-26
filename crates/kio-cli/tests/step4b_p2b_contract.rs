@@ -401,6 +401,14 @@ fn assert_text_budget_pause_preserves_ledger(dir: &TempDir, query: &str, cap_kin
         );
         assert_eq!(response["resolved_mode"], "text", "{response}");
         assert_eq!(
+            response["index_status"]["budget_status"], "known",
+            "{response}"
+        );
+        assert!(
+            response["index_status"]["budget_reason"].is_null(),
+            "{response}"
+        );
+        assert_eq!(
             response["index_status"]["budget_paused"], true,
             "{label} must preserve exhausted {cap_kind} budget truth: {response}"
         );
@@ -511,12 +519,12 @@ fn pb_text_search_preserves_cost_ledger_and_write_sequence_identity() {
     assert_ledger_leaves_unchanged(&dir, &before, "auto/default search resolved to text");
 }
 
-/// A valid text query must not downgrade an unsafe device-ledger leaf to a
-/// no-ledger/zero-spend observation or a scope-level partial response. The
-/// fixture owns both aliases; no user cache is ever modified.
+/// docs/04 §5.4: an unsafe budget source cannot hide local text results or
+/// become zero spending. Preserve the typed reason and every source identity.
+/// The fixture owns both aliases; no user cache is ever modified.
 #[cfg(unix)]
 #[test]
-fn pb_text_search_unsafe_ledger_hardlink_fails_closed_without_search_fallback() {
+fn pb_text_search_unsafe_ledger_preserves_results_and_typed_unknown_budget() {
     let dir = canonical_tempdir();
     fs::write(
         dir.path().join("unsafe-ledger-search.md"),
@@ -542,21 +550,31 @@ fn pb_text_search_unsafe_ledger_hardlink_fails_closed_without_search_fallback() 
         .arg("--json")
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(4), "{output:?}");
-    assert!(output.stdout.is_empty(), "{output:?}");
-    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(
-        error["error_code"], "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001",
-        "{error}"
+    assert!(output.status.success(), "{output:?}");
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["requested_mode"], "text", "{response}");
+    assert_eq!(response["resolved_mode"], "text", "{response}");
+    assert!(
+        !response["results"].as_array().unwrap().is_empty(),
+        "{response}"
     );
-    assert_eq!(error["context"]["reason"], "unsafe_integrity", "{error}");
-    assert!(error.get("index_status").is_none(), "{error}");
-    assert!(error.get("excluded_scopes").is_none(), "{error}");
+    assert_eq!(
+        response["index_status"]["budget_status"], "unknown",
+        "{response}"
+    );
+    assert_eq!(
+        response["index_status"]["budget_reason"], "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001",
+        "{response}"
+    );
+    assert!(
+        response["index_status"]["budget_paused"].is_null(),
+        "{response}"
+    );
 
     assert_eq!(
         observe_unsafe_ledger_leaf(main),
         before_main,
-        "failed text search must not change the unsafe source main leaf"
+        "local text search must not change the unsafe source main leaf"
     );
     for (leaf, before) in leaves[1..].iter().zip(before_other_leaves) {
         assert_eq!(observe_ledger_leaf(leaf), before);
@@ -599,14 +617,28 @@ fn pb_text_search_budget_policy_error_remains_best_effort_and_non_mutating() {
         !response["results"].as_array().unwrap().is_empty(),
         "best-effort budget observation must not hide text results: {response}"
     );
+    // docs/04 §5.4 / docs/06 index_status: the existing supplementary
+    // observation remains non-blocking, but cannot claim known/false budget.
+    assert_eq!(
+        response["index_status"]["budget_status"], "unknown",
+        "{response}"
+    );
+    assert_eq!(
+        response["index_status"]["budget_reason"], "KIO-E-CONFIG-SCHEMA-001",
+        "{response}"
+    );
+    assert!(
+        response["index_status"]["budget_paused"].is_null(),
+        "{response}"
+    );
     assert_ledger_leaves_unchanged(&dir, &before, "invalid budget policy text search");
 }
 
-/// An entirely absent source main/WAL/SHM triad is the normal zero-spend
-/// observation. Text search must not recreate the ledger, lifecycle records,
-/// or SQLite sidecars merely to render `index_status`.
+/// docs/04 §5.4: absent billing state is unknown, never zero spending.
+/// Text search must not recreate the ledger, lifecycle records, or SQLite
+/// sidecars merely to render `index_status`.
 #[test]
-fn pb_text_search_missing_ledger_is_zero_spend_and_no_create() {
+fn pb_text_search_missing_ledger_is_unknown_and_no_create() {
     let dir = canonical_tempdir();
     fs::write(
         dir.path().join("missing-ledger-search.md"),
@@ -632,7 +664,15 @@ fn pb_text_search_missing_ledger_is_zero_spend_and_no_create() {
     assert_eq!(response["requested_mode"], "text", "{response}");
     assert_eq!(response["resolved_mode"], "text", "{response}");
     assert_eq!(
-        response["index_status"]["budget_paused"], false,
+        response["index_status"]["budget_status"], "unknown",
+        "{response}"
+    );
+    assert_eq!(
+        response["index_status"]["budget_reason"], "KIO-E-LEDGER-UNINITIALIZED-001",
+        "{response}"
+    );
+    assert!(
+        response["index_status"]["budget_paused"].is_null(),
         "{response}"
     );
     assert!(

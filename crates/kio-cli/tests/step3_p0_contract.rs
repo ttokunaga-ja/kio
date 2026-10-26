@@ -81,6 +81,7 @@ fn kio(dir: &TempDir, args: &[&str]) -> Command {
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
+        .env("XDG_STATE_HOME", dir.path().join(".test-state"))
         .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
         .args(args);
     command
@@ -137,6 +138,7 @@ fn json_success_path(path: &Path, data_home: &Path, args: &[&str]) -> Value {
         .current_dir(path)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(args)
         .arg("--json")
@@ -603,6 +605,7 @@ fn run_embed_path(path: &Path, data_home: &Path, embed: &str, args: &[&str]) -> 
         .current_dir(path)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .env(TEST_ADOPTED_EMBEDDING_ENV, embed)
         .args(args)
@@ -2268,6 +2271,7 @@ fn ct3_device_repairs_reject_non_current_scope_before_any_mutation() {
             .current_dir(parent.path())
             .env("XDG_CONFIG_HOME", data_home.join("config"))
             .env("XDG_DATA_HOME", data_home.join("data"))
+            .env("XDG_STATE_HOME", data_home.join("state"))
             .env("XDG_CACHE_HOME", data_home.join("cache"))
             .args(["repair", operation, "--json"])
             .assert()
@@ -2320,6 +2324,7 @@ fn ct3_repair_device_unreachable_registry_scope_is_partial_without_cwd_fallback(
         .current_dir(parent.path())
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["repair", "replica", "--json"])
         .assert()
@@ -2370,6 +2375,7 @@ fn ct3_repair_device_registry_unavailable_never_falls_back_to_cwd() {
         .current_dir(&scope)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["repair", "replica", "--json"])
         .assert()
@@ -2397,6 +2403,7 @@ fn ct3_repair_device_all_failed_homogeneous_promotes_scope_error() {
         .current_dir(parent.path())
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["repair", "replica", "--json"])
         .assert()
@@ -2461,6 +2468,7 @@ fn ct3_repair_device_active_purge_is_partial_and_leaves_no_stale_replica_rows() 
         .current_dir(parent.path())
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["repair", "replica", "--json"])
         .assert()
@@ -2697,6 +2705,7 @@ fn ct3_multi_011_a_departed_scope_stops_skewing_corpus_statistics() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["search", "--mode", "text", "zephyrterm", "--json"])
         .assert()
@@ -3091,6 +3100,7 @@ fn ct3_multi_017_a_cursor_replays_against_the_collection_that_ranked_page_1() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args([
             "search", "quokka", "--mode", "text", "--limit", "1", "--cursor", &cursor, "--json",
@@ -3237,6 +3247,7 @@ fn ct3_multi_019_purge_fails_closed_when_the_replica_cannot_be_cleared() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .env("KIO_TEST_AGGREGATOR_PROJECTION_FAULT", "refresh")
         .args(["purge", "a.md", "--reason", "legal", "--yes", "--json"])
@@ -3269,6 +3280,7 @@ fn ct3_multi_019_purge_fails_closed_when_the_replica_cannot_be_cleared() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["search", "zephyrterm", "--json"])
         .assert()
@@ -3357,6 +3369,7 @@ fn ct3_multi_021_replica_candidates_exclude_an_active_purge_scope() {
         .current_dir(&b)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["search", "purgebarrierneedle", "--mode", "text", "--json"])
         .assert()
@@ -3425,6 +3438,7 @@ fn ct3_multi_022_replica_response_boundary_rechecks_a_late_purge() {
         .current_dir(&scope)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .env("KIO_TEST_SEARCH_RESPONSE_BARRIER_READY", &ready)
         .args([
@@ -3613,6 +3627,7 @@ fn ct3_multi_005_partial_failure_returns_results_with_exit_3() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["search", "alphaunique", "--json"])
         .assert()
@@ -3678,6 +3693,7 @@ fn ct3_multi_006_completion_order_does_not_change_results_or_cursor() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         // Registry/input order is a then b. Delay a so b completes first.
         .env(
@@ -3727,6 +3743,7 @@ fn ct3_multi_006_timeout_preserves_fresh_all_failed_and_cursor_contracts() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .env("KIO_TEST_SCOPE_SEARCH_DELAY_SCOPE_ID", &b_scope_id)
         .env("KIO_TEST_SCOPE_SEARCH_DELAY_MS", "2500")
@@ -3750,6 +3767,7 @@ fn ct3_multi_006_timeout_preserves_fresh_all_failed_and_cursor_contracts() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .env("KIO_TEST_SCOPE_SEARCH_DELAY_SCOPE_ID", &b_scope_id)
         .env("KIO_TEST_SCOPE_SEARCH_DELAY_MS", "2500")
@@ -3777,6 +3795,7 @@ fn ct3_multi_006_timeout_preserves_fresh_all_failed_and_cursor_contracts() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .env("KIO_TEST_SCOPE_SEARCH_DELAY_SCOPE_ID", &b_scope_id)
         .env("KIO_TEST_SCOPE_SEARCH_DELAY_MS", "2500")
@@ -4129,7 +4148,9 @@ fn ct3_obs_001_index_status_reports_partial_enrichment() {
     // Offline index leaves online markdownize enhancement pending.
     assert!(status["enriched_ratio"].as_f64().unwrap() < 1.0);
     assert!(status["pending_enrichment_tasks"].as_u64().unwrap() > 0);
-    assert_eq!(status["budget_paused"], false);
+    assert_eq!(status["budget_paused"], Value::Null);
+    assert_eq!(status["budget_status"], "unknown");
+    assert_eq!(status["budget_reason"], "KIO-E-LEDGER-UNINITIALIZED-001");
 }
 
 /// A completed index writes its candidates through to the device replica.
@@ -4569,6 +4590,7 @@ fn ct3_replica_003_temporarily_excluded_scope_keeps_its_replica_projection() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args([
             "search",
@@ -4679,6 +4701,7 @@ fn ct3_replica_008_unresolvable_scope_identity_cannot_serve_a_ready_projection()
         .current_dir(&b)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args([
             "search",
@@ -4975,6 +4998,7 @@ fn run_json(cwd: &Path, data_home: &Path, args: &[&str]) -> (i32, Value) {
         .current_dir(cwd)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(args)
         .arg("--json")
@@ -6506,6 +6530,7 @@ fn m4_corrupt_source_sqlite_does_not_exclude_multiscope_replica_search() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["search", "token", "--mode", "text", "--json"])
         .assert()
@@ -7146,6 +7171,7 @@ fn o2_text_search_never_sends_query_embedding() {
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
+        .env("XDG_STATE_HOME", dir.path().join(".test-state"))
         .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .env("KIO_TEST_QUERY_EMBED_TRACE", &trace)
@@ -7162,6 +7188,7 @@ fn o2_text_search_never_sends_query_embedding() {
         .current_dir(dir.path())
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
+        .env("XDG_STATE_HOME", dir.path().join(".test-state"))
         .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .env("KIO_TEST_QUERY_EMBED_TRACE", &trace)
@@ -7444,11 +7471,11 @@ fn p2_init_restricts_kio_and_data_dir_to_owner() {
     assert_eq!(data_mode, 0o700, "data dir must be 0700, got {data_mode:o}");
 }
 
-/// P3: a plaintext `plain:` credential is admitted only from an owner-private
-/// `tools.toml` whose immediate parent is also owner-private.
+/// P3: a selected plaintext credential is consumed only from an owner-private
+/// tools.toml. External parent permissions are not credential authority.
 #[cfg(unix)]
 #[test]
-fn p3_plain_auth_tools_toml_requires_private_file_and_parent() {
+fn p3_selected_plain_auth_requires_owner_private_file() {
     use std::os::unix::fs::PermissionsExt;
     let temporary_root = fs::canonicalize(std::env::temp_dir()).unwrap();
     let dir = tempfile::tempdir_in(temporary_root).unwrap();
@@ -7464,12 +7491,21 @@ fn p3_plain_auth_tools_toml_requires_private_file_and_parent() {
     // A credential-bearing file cannot be read through the private trust
     // boundary while it is group/world-readable.
     fs::set_permissions(&tools, fs::Permissions::from_mode(0o644)).unwrap();
-    let error = json_failure(&dir, &["status"], 2);
+    let error = json_failure(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+        2,
+    );
     assert_eq!(error["error_code"], "KIO-E-ADAPTER-TOOLS-PRIVATE-001");
 
     // A 0600 leaf below a 0700 parent remains valid.
     fs::set_permissions(&tools, fs::Permissions::from_mode(0o600)).unwrap();
-    kio(&dir, &["status"]).assert().success();
+    kio(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+    )
+    .assert()
+    .success();
 }
 
 /// P5: a concurrent `kio search` during repeated `repair rebuild-db` must
@@ -7504,6 +7540,7 @@ fn p5_concurrent_search_during_rebuild_is_never_silently_empty() {
             .args(args)
             .current_dir(&root)
             .env("XDG_DATA_HOME", &data)
+            .env("XDG_STATE_HOME", data.with_file_name(".test-state"))
             .env("XDG_CONFIG_HOME", &config)
             .env("XDG_CACHE_HOME", &cache)
             .output()
@@ -7529,6 +7566,7 @@ fn p5_concurrent_search_during_rebuild_is_never_silently_empty() {
                     .args(["repair", "rebuild-db"])
                     .current_dir(&root)
                     .env("XDG_DATA_HOME", &data)
+                    .env("XDG_STATE_HOME", data.with_file_name(".test-state"))
                     .env("XDG_CONFIG_HOME", &config)
                     .env("XDG_CACHE_HOME", &cache)
                     .output();
@@ -7873,6 +7911,7 @@ fn p10_concurrent_search_during_reindex_is_never_silently_empty() {
             .args(args)
             .current_dir(&root)
             .env("XDG_DATA_HOME", &data)
+            .env("XDG_STATE_HOME", data.with_file_name(".test-state"))
             .env("XDG_CONFIG_HOME", &config)
             .env("XDG_CACHE_HOME", &cache)
             .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
@@ -7901,6 +7940,7 @@ fn p10_concurrent_search_during_reindex_is_never_silently_empty() {
                     .args(["reindex", "--regenerate", "--yes"])
                     .current_dir(&root)
                     .env("XDG_DATA_HOME", &data)
+                    .env("XDG_STATE_HOME", data.with_file_name(".test-state"))
                     .env("XDG_CONFIG_HOME", &config)
                     .env("XDG_CACHE_HOME", &cache)
                     .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
@@ -8271,6 +8311,7 @@ fn pc4_multiscope_query_embedding_sent_when_any_target_scope_opts_in() {
         .current_dir(a.path())
         .env("XDG_CONFIG_HOME", data_home.path().join("config"))
         .env("XDG_DATA_HOME", data_home.path().join("data"))
+        .env("XDG_STATE_HOME", data_home.path().join("state"))
         .env("XDG_CACHE_HOME", data_home.path().join("cache"))
         .env(TEST_ADOPTED_EMBEDDING_ENV, "mock")
         .env("KIO_TEST_QUERY_EMBED_TRACE", &trace)
@@ -8971,6 +9012,7 @@ fn r12_4_multi_scope_partial_records_exclusion_in_errors_jsonl() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["search", "alphaunique", "--json"])
         .assert()
@@ -9113,13 +9155,21 @@ fn logs_retention_days_is_rejected_in_scope_config() {
     assert_eq!(error["error_code"], "KIO-E-CONFIG-SCHEMA-001");
 }
 
+/// docs/14 operation preconditions: only consumed logging policy is validated.
 #[test]
-fn logs_retention_days_is_rejected_in_user_config() {
+fn consumed_observability_retention_days_is_rejected_in_user_config() {
     let dir = indexed_scope();
     let user_cfg = dir.path().join(".test-config/kio");
     fs::create_dir_all(&user_cfg).unwrap();
-    fs::write(user_cfg.join("config.toml"), "[logs]\nretention_days = 7\n").unwrap();
-    let error = json_failure(&dir, &["status"], 2);
+    fs::write(
+        user_cfg.join("config.toml"),
+        "[observability]\nretention_days = 0\n",
+    )
+    .unwrap();
+    // Status does not consume device logging rotation policy. Search does,
+    // and must reject the selected invalid value before dispatch.
+    json_success(&dir, &["status"]);
+    let error = json_failure(&dir, &["search", "トークン"], 2);
     assert_eq!(error["error_code"], "KIO-E-CONFIG-SCHEMA-001");
 }
 
@@ -9152,6 +9202,14 @@ fn r13_3_unwritable_log_path_does_not_fail_the_search() {
 fn json_success_deterministic_embed(dir: &TempDir, args: &[&str]) -> Value {
     let output = kio(dir, args)
         .env(TEST_DETERMINISTIC_EMBEDDING_ENV, "scale-v3")
+        .env(
+            "KIO_TEST_TASK_EMBED_TRACE",
+            dir.path().join(".test-data/free-task.trace"),
+        )
+        .env(
+            "KIO_TEST_QUERY_EMBED_TRACE",
+            dir.path().join(".test-data/free-query.trace"),
+        )
         .arg("--json")
         .assert()
         .success()
@@ -9159,6 +9217,127 @@ fn json_success_deterministic_embed(dir: &TempDir, args: &[&str]) -> Value {
         .stdout
         .clone();
     serde_json::from_slice(&output).unwrap()
+}
+
+/// docs/04 §5.4: inspect the public persisted local records without opening
+/// billing or invoking app-private execution helpers. All paths are our fixture.
+fn free_state_files(dir: &TempDir) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+    let root = dir.path().join(".test-state/kio/local-execution");
+    let mut files = std::collections::BTreeMap::new();
+    if !root.exists() {
+        return files;
+    }
+    let mut pending = vec![(root.clone(), 0_usize)];
+    let mut entries = 0;
+    while let Some((path, depth)) = pending.pop() {
+        assert!(depth <= 16);
+        for entry in fs::read_dir(path).unwrap() {
+            let entry = entry.unwrap();
+            entries += 1;
+            assert!(entries <= 4096);
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            assert!(!metadata.file_type().is_symlink());
+            if metadata.is_dir() {
+                pending.push((entry.path(), depth + 1));
+            } else {
+                assert!(metadata.is_file() && metadata.len() <= 32 * 1024 * 1024);
+                files.insert(
+                    entry.path().strip_prefix(&root).unwrap().to_path_buf(),
+                    fs::read(entry.path()).unwrap(),
+                );
+            }
+        }
+    }
+    files
+}
+fn free_records(dir: &TempDir) -> Vec<(PathBuf, Value)> {
+    free_state_files(dir)
+        .into_iter()
+        .filter(|(path, _)| path.file_name().is_some_and(|name| name == "record.json"))
+        .map(|(path, bytes)| (path, serde_json::from_slice(&bytes).unwrap()))
+        .collect()
+}
+fn free_record_for(dir: &TempDir, target: &str) -> Value {
+    let records = free_records(dir)
+        .into_iter()
+        .filter(|(_, record)| record["identity"]["target"]["target"] == target)
+        .map(|(_, record)| record)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records.len(),
+        1,
+        "one authentic local intent per target: {records:?}"
+    );
+    records.into_iter().next().unwrap()
+}
+fn assert_published_free_record(dir: &TempDir, target: &str, task_id: &str, attempts: u32) {
+    let record = free_record_for(dir, target);
+    assert_eq!(record["version"], 1);
+    assert_eq!(record["attempts"], attempts);
+    assert_eq!(record["phase"]["phase"], "published");
+    assert!(
+        record["identity"]["contract"]["members"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|member| member["id"] == task_id || member["target"]["embedding_hash"] == target)
+    );
+    let (path, _) = free_records(dir)
+        .into_iter()
+        .find(|(_, row)| row["key"] == record["key"])
+        .unwrap();
+    let bytes = fs::read(
+        dir.path()
+            .join(".test-state/kio/local-execution")
+            .join(path.parent().unwrap())
+            .join("result.bin"),
+    )
+    .unwrap();
+    assert_eq!(record["phase"]["bytes"], bytes.len());
+    // Local result integrity binds the exact job identity and claim token,
+    // as well as the bytes (docs/04 §5.4); it is not a plain CAS digest.
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    digest.update(b"kio.local-execution.result/v1\0");
+    digest.update(record["key"].as_str().unwrap().as_bytes());
+    digest.update(record["token"].as_str().unwrap().as_bytes());
+    digest.update(&bytes);
+    let digest = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    assert_eq!(record["phase"]["digest"], digest);
+}
+fn free_trace(dir: &TempDir) -> Vec<Value> {
+    fs::read_to_string(dir.path().join(".test-data/free-task.trace"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect()
+}
+fn billing_artifacts(
+    dir: &TempDir,
+) -> std::collections::BTreeMap<String, (Vec<u8>, std::time::SystemTime)> {
+    fs::read_dir(dir.path().join(".test-data/kio"))
+        .unwrap()
+        .filter_map(|entry| {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if !(name.starts_with("cost-ledger.sqlite") || name == "ledger.lifecycle.lock") {
+                return None;
+            }
+            let metadata = fs::symlink_metadata(entry.path()).unwrap();
+            assert!(metadata.is_file() && !metadata.file_type().is_symlink());
+            Some((
+                name,
+                (
+                    fs::read(entry.path()).unwrap(),
+                    metadata.modified().unwrap(),
+                ),
+            ))
+        })
+        .collect()
 }
 
 /// A scope indexed entirely through the deterministic evaluator adapter.
@@ -9225,126 +9404,90 @@ fn offline_flag_does_not_degrade_the_deterministic_embedding_adapter() {
     );
 }
 
-/// 04 §5.4: local execution reserves and settles in the physical device ledger
-/// at exact zero USD, including the device-scoped query attempt.
+/// 04 §5.4: free document/query attempts use local execution records and
+/// leave the initialized billing fixture unchanged.
 #[test]
-fn deterministic_embedding_records_zero_usd_index_and_query_attempts() {
+fn deterministic_embedding_records_local_index_and_query_attempts_without_billing() {
     let dir = indexed_scope_deterministic_embed();
-    json_success_deterministic_embed(&dir, &["search", "トークン", "--mode", "vector"]);
+    let billing_before = billing_artifacts(&dir);
+    let search =
+        json_success_deterministic_embed(&dir, &["search", "トークン", "--mode", "vector"]);
+    assert_eq!(search["resolved_mode"], "vector");
+    assert!(!search["results"].as_array().unwrap().is_empty());
+    let records = free_records(&dir);
+    let documents = records
+        .iter()
+        .filter(|(_, row)| row["identity"]["target"]["kind"] == "document")
+        .collect::<Vec<_>>();
     assert!(
-        dir.path()
-            .join(".test-data/kio/cost-ledger.sqlite")
-            .is_file()
+        !documents.is_empty(),
+        "actual local document intents are required"
     );
-    let db = ledger_db(&dir);
-    for scope_predicate in ["scope_id <> 'device'", "scope_id = 'device'"] {
-        let sql = format!(
-            "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind = 'embedding' \
-             AND request_kind = 'sync' AND state = 2 AND estimated_usd = 0 \
-             AND batch_job_id IS NULL AND {scope_predicate}"
-        );
-        assert!(
-            count(&db, &sql) > 0,
-            "index and query need separate zero USD attempts"
-        );
+    for (_, record) in documents {
+        assert_eq!(record["phase"]["phase"], "published");
+        assert_eq!(record["attempts"], 1);
+        assert_eq!(record["identity"]["execution"], "in_process");
     }
-    let mut statement = db
-        .prepare("SELECT outcome, usd, estimated FROM cost_ledger WHERE adapter_kind = 'embedding'")
-        .unwrap();
-    let settlements = statement
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, f64>(1)?,
-                row.get::<_, bool>(2)?,
-            ))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
-    assert!(
-        settlements.len() >= 2,
-        "each local attempt must settle: {settlements:?}"
+    let queries = records
+        .iter()
+        .filter(|(_, row)| row["identity"]["target"]["kind"] == "query")
+        .collect::<Vec<_>>();
+    assert_eq!(queries.len(), 1, "query has an independent local intent");
+    assert_eq!(queries[0].1["phase"]["phase"], "retired");
+    assert_eq!(queries[0].1["attempts"], 1);
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".test-data/free-query.trace"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
     );
-    assert!(
-        settlements.iter().all(|(outcome, usd, estimated)| {
-            outcome == "succeeded" && *usd == 0.0 && !estimated
-        }),
-        "local settlements must be confirmed zero USD: {settlements:?}"
+    let repo = Repository::open(dir.path()).unwrap();
+    assert!(!repo.object_store().embedding_hashes().unwrap().is_empty());
+    assert!(count(&index_db(&dir), "SELECT COUNT(*) FROM chunk_vec") > 0);
+    assert_eq!(
+        billing_artifacts(&dir),
+        billing_before,
+        "free query must not write billing"
     );
+    assert_eq!(reservation_row_count(&dir, "embedding"), 0);
+    assert_eq!(embedding_ledger_usd(&dir), 0.0);
 }
 
 /// 04 §5.4: reconciliation of already materialized local vectors completes
-/// stranded tasks without creating another reservation or settlement.
+/// stranded tasks without another local attempt, dispatch or billing write.
 #[test]
-fn deterministic_embedding_reconciles_cached_tasks_without_new_ledger_attempts() {
+fn deterministic_embedding_reconciles_cached_tasks_without_new_local_attempts() {
     use kio_pipeline::task::{TaskStatus, TaskStore, TaskType};
-
     let dir = indexed_scope_deterministic_embed();
     let store = TaskStore::new(dir.path().join(".kio").canonicalize().unwrap());
     let before = store.all().unwrap();
-    let ledger_rows = || {
-        let conn = ledger_db(&dir);
-        ["batch_requests", "cost_ledger"].map(|table| {
-            let mut statement = conn
-                .prepare(&format!(
-                    "SELECT * FROM {table} WHERE adapter_kind='embedding' \
-                 ORDER BY scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq"
-                ))
-                .unwrap();
-            statement
-                .query_map([], |row| {
-                    (0..row.as_ref().column_count())
-                        .map(|column| row.get::<_, rusqlite::types::Value>(column))
-                        .collect::<rusqlite::Result<Vec<_>>>()
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap()
-        })
-    };
-    let ledger_before = ledger_rows();
-    assert!(
-        before
-            .iter()
-            .any(|task| task.task_type == TaskType::Embedding)
-    );
-    let reservations_before = reservation_row_count(&dir, "embedding");
-    let settlements_before = count(
-        &ledger_db(&dir),
-        "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind = 'embedding'",
-    );
-    assert!(
-        reservations_before > 0 && settlements_before > 0,
-        "fixture must have physical local accounting"
-    );
+    let local_before = free_state_files(&dir);
+    let billing_before = billing_artifacts(&dir);
+    let trace_before = free_trace(&dir);
+    let embedded = before
+        .iter()
+        .filter(|task| task.task_type == TaskType::Embedding)
+        .collect::<Vec<_>>();
+    assert!(!embedded.is_empty());
+    for task in embedded {
+        assert_eq!(task.status, TaskStatus::Done);
+        assert_eq!(task.attempts, 1);
+        assert!(task.reservation_claim().is_none());
+        let target = task.embedding_target.as_ref().unwrap();
+        let target = serde_json::to_value(target).unwrap();
+        assert_published_free_record(
+            &dir,
+            target["embedding_hash"].as_str().unwrap(),
+            &task.task_id,
+            1,
+        );
+    }
     store
         .update_matching(|task| {
             if task.task_type != TaskType::Embedding {
                 return false;
             }
-            assert_eq!(task.status, TaskStatus::Done);
-            let claim = task
-                .reservation_claim()
-                .expect("local completion retains its zero-USD claim");
-            assert_eq!(claim.usd, 0.0);
-            let linked: i64 = ledger_db(&dir)
-                .query_row(
-                    "SELECT COUNT(*) FROM cost_ledger c JOIN batch_requests b \
-                 ON c.scope_id=b.scope_id AND c.adapter_kind=b.adapter_kind \
-                 AND c.input_hash=b.input_hash AND c.tool_profile_hash=b.tool_profile_hash \
-                 AND c.submission_seq=b.submission_seq \
-                 WHERE c.batch_job_id=?1 AND c.adapter_kind='embedding' \
-                 AND c.usd=0 AND c.estimated=0 AND c.outcome='succeeded' \
-                 AND b.state=2 AND b.intent_token IS NULL AND b.estimated_usd=0",
-                    [claim.reservation_id],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(
-                linked, 1,
-                "Task claim must link a terminal released zero-USD attempt"
-            );
             task.status = TaskStatus::Pending;
             task.fallback_reason = Some("ready_for_online_adapter".to_owned());
             true
@@ -9358,52 +9501,40 @@ fn deterministic_embedding_reconciles_cached_tasks_without_new_ledger_attempts()
         .iter()
         .filter(|task| task.task_type == TaskType::Embedding)
     {
-        assert_eq!(task.status, TaskStatus::Done);
         let original = before
             .iter()
             .find(|old| old.task_id == task.task_id)
             .unwrap();
-        // O0 paid cached reconciliation clears the stamp before marking Done
-        // (embedding/plan.rs), without changing the completed SQL attempt.
-        assert!(task.reservation_claim().is_none());
-        assert!(task.reservation_id.is_none());
-        assert!(task.reserved_usd.is_none());
-        assert!(task.reserved_month.is_none());
+        assert_eq!(task.status, TaskStatus::Done);
         assert_eq!(task.attempts, original.attempts);
         assert_eq!(task.embedding_target, original.embedding_target);
         assert_eq!(task.input_hash, original.input_hash);
         assert_eq!(task.input_path, original.input_path);
+        assert!(task.reservation_claim().is_none());
+        assert!(
+            task.reservation_id.is_none()
+                && task.reserved_usd.is_none()
+                && task.reserved_month.is_none()
+        );
         assert_eq!(
             task.fallback_reason.as_deref(),
             Some("embedding_adapter_done")
         );
     }
     assert_eq!(
-        reservation_row_count(&dir, "embedding"),
-        reservations_before,
-        "cached reconciliation must not reserve another attempt"
+        free_trace(&dir),
+        trace_before,
+        "cached vectors must not call the adapter again"
     );
     assert_eq!(
-        count(
-            &ledger_db(&dir),
-            "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind = 'embedding'"
-        ),
-        settlements_before,
-        "cached reconciliation must not append another settlement"
-    );
-    assert_eq!(embedding_ledger_usd(&dir), 0.0);
-    assert_eq!(
-        ledger_rows(),
-        ledger_before,
-        "cached recovery preserves the original ledger rows exactly"
+        free_state_files(&dir),
+        local_before,
+        "local identities/results/attempts remain exact"
     );
     assert_eq!(
-        count(
-            &ledger_db(&dir),
-            "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind='embedding' AND (state IN (0,1) OR intent_token IS NOT NULL)"
-        ),
-        0,
-        "no task reservation remains in flight"
+        billing_artifacts(&dir),
+        billing_before,
+        "cached local recovery never writes billing"
     );
 }
 
@@ -9454,14 +9585,18 @@ fn indexed_scope_deterministic_embed_with_images() -> TempDir {
     )
     .unwrap();
     kio(&dir, &["init"]).assert().success();
-    // Both local zero-USD embedding and billed mock OCR need the explicitly
-    // initialized physical ledger (04 §5.4).
+    // Billed mock OCR needs the explicitly initialized device ledger;
+    // free deterministic embedding uses separate local execution state (04 §5.4).
     initialize_paid_ledger(&dir);
     json_success_deterministic_embed(&dir, &["index"]);
     approve_markdownize(&dir, "mock_link_image");
     kio(&dir, &["batch", "resume"])
         .env(TEST_DETERMINISTIC_EMBEDDING_ENV, "scale-v3")
         .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock_link_image")
+        .env(
+            "KIO_TEST_TASK_EMBED_TRACE",
+            dir.path().join(".test-data/free-task.trace"),
+        )
         .arg("--json")
         .assert()
         .success();
@@ -9693,11 +9828,21 @@ fn image_objects_referenced_by_chunks_are_embedded_into_image_vec() {
 #[test]
 fn image_embedding_enrichment_writes_through_the_empty_chunk_branch() {
     let dir = indexed_scope_deterministic_embed_with_images();
-    let reservations_before = reservation_row_count(&dir, "embedding");
-    let settlements_before = count(
-        &ledger_db(&dir),
-        "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind = 'embedding'",
+    let local_before = free_state_files(&dir);
+    let billing_before = billing_artifacts(&dir);
+    let trace_before = free_trace(&dir);
+    let images = free_records(&dir)
+        .into_iter()
+        .filter(|(_, row)| row["identity"]["target"]["kind"] == "image")
+        .collect::<Vec<_>>();
+    assert!(
+        !images.is_empty(),
+        "fixture needs authentic local Image attempts"
     );
+    for (_, row) in images {
+        assert_eq!(row["attempts"], 1);
+        assert_eq!(row["phase"]["phase"], "published");
+    }
     let (source_images, chunks, chunk_vectors) = {
         let conn = index_db(&dir);
         let source_images = count(&conn, "SELECT COUNT(*) FROM image_vec");
@@ -9738,26 +9883,27 @@ fn image_embedding_enrichment_writes_through_the_empty_chunk_branch() {
         "image enrichment must refresh the device projection without a search"
     );
     assert_eq!(
-        reservation_row_count(&dir, "embedding"),
-        reservations_before,
-        "restoring a published image must not reserve or submit another attempt"
+        free_trace(&dir),
+        trace_before,
+        "vector reprojection must not call the adapter again"
     );
     assert_eq!(
-        count(
-            &ledger_db(&dir),
-            "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind = 'embedding'"
-        ),
-        settlements_before,
-        "restoring a published image must not append another charge"
+        free_state_files(&dir),
+        local_before,
+        "original local attempts/results remain exact"
+    );
+    assert_eq!(
+        billing_artifacts(&dir),
+        billing_before,
+        "free reprojection must not write billing"
     );
 }
 
-/// Supervisor Decision 2 / 04 §5.4: the sole fresh Image representative
-/// retains the exact terminal zero-USD claim, like a paid successful task.
+/// 04 §5.4: the fresh Image representative retains its published local result
+/// and exactly one attempt, without manufacturing a billing reservation.
 #[test]
-fn local_image_done_retains_its_terminal_zero_usd_attempt_claim() {
+fn local_image_done_retains_its_published_local_attempt_without_billing_claim() {
     use kio_pipeline::task::{EmbeddingTaskTarget, TaskStatus, TaskStore, TaskType};
-
     let dir = indexed_scope_deterministic_embed_with_images();
     let store = TaskStore::new(dir.path().join(".kio").canonicalize().unwrap());
     let tasks = store.all().unwrap();
@@ -9791,51 +9937,36 @@ fn local_image_done_retains_its_terminal_zero_usd_attempt_claim() {
             .inspect_content_object(ContentObjectKind::Image, image_hash)
             .is_ok()
     );
-    let claim = task
-        .reservation_claim()
-        .expect("fresh Image Done must retain its sole terminal zero-USD claim");
-    assert_eq!(claim.usd, 0.0);
-    assert_eq!(claim.task_id, task.task_id);
-    let scope_id = repo.scope_identity().unwrap().scope_id;
-    let db = ledger_db(&dir);
-    let mut statement = db
-        .prepare(
-            "SELECT c.month FROM cost_ledger c JOIN batch_requests b
-         ON c.scope_id=b.scope_id AND c.adapter_kind=b.adapter_kind
-         AND c.input_hash=b.input_hash AND c.tool_profile_hash=b.tool_profile_hash
-         AND c.submission_seq=b.submission_seq
-         WHERE c.scope_id=?1 AND c.adapter_kind='embedding' AND c.input_hash=?2
-         AND c.tool_profile_hash=?3 AND c.batch_job_id=?4
-         AND c.outcome='succeeded' AND c.usd=0 AND c.estimated=0
-         AND b.state=2 AND b.intent_token IS NULL AND b.estimated_usd=0
-         AND b.batch_job_id IS NULL AND b.request_kind='sync'",
-        )
-        .unwrap();
-    let months = statement
-        .query_map(
-            rusqlite::params![scope_id, embedding_hash, profile_hash, claim.reservation_id],
-            |row| row.get::<_, String>(0),
-        )
-        .unwrap()
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .unwrap();
+    assert!(task.reservation_claim().is_none());
+    assert!(
+        task.reservation_id.is_none()
+            && task.reserved_usd.is_none()
+            && task.reserved_month.is_none()
+    );
+    assert_published_free_record(&dir, embedding_hash, &task.task_id, 1);
+    let record = free_record_for(&dir, embedding_hash);
+    assert_eq!(record["identity"]["target"]["kind"], "image");
+    assert_eq!(record["identity"]["profile"], *profile_hash);
     assert_eq!(
-        months.len(),
-        1,
-        "claim must link exactly its released physical Image attempt"
+        record["identity"]["target"]["scope_id"],
+        repo.scope_identity().unwrap().scope_id
     );
     assert_eq!(
-        claim.month, months[0],
-        "claim month must match the original UTC ledger month"
+        free_trace(&dir)
+            .iter()
+            .filter(|row| row["input_type"] == "image")
+            .count(),
+        1
     );
+    assert_eq!(reservation_row_count(&dir, "embedding"), 0);
+    assert_eq!(embedding_ledger_usd(&dir), 0.0);
 }
 
-/// A cached Image Pending task follows paid cached reconciliation: clear its
-/// old claim, complete the same task, and never execute or alter physical rows.
+/// A cached Image Pending task completes from its own immutable local result.
+/// Its attempt, every unrelated local identity and all billing bytes stay exact.
 #[test]
 fn local_image_cached_reconciliation_completes_without_new_attempt() {
     use kio_pipeline::task::{EmbeddingTaskTarget, TaskStatus, TaskStore, TaskType};
-
     let dir = indexed_scope_deterministic_embed_with_images();
     kio_index::vec::ensure_registered();
     let store = TaskStore::new(dir.path().join(".kio").canonicalize().unwrap());
@@ -9852,17 +9983,46 @@ fn local_image_cached_reconciliation_completes_without_new_attempt() {
         .expect("fixture must materialize a typed image task")
         .clone();
     assert_eq!(original.status, TaskStatus::Done);
+    assert_eq!(original.attempts, 1);
+    assert!(original.reservation_claim().is_none());
     let EmbeddingTaskTarget::Image {
         image_hash,
         embedding_hash,
-        profile_hash,
         ..
     } = original.embedding_target.as_ref().unwrap()
     else {
         unreachable!()
     };
+    assert_published_free_record(&dir, embedding_hash, &original.task_id, 1);
+    let own_record = free_record_for(&dir, embedding_hash);
+    let own_target = serde_json::to_value(original.embedding_target.as_ref().unwrap()).unwrap();
+    let foreign = before
+        .iter()
+        .find(|task| {
+            matches!(
+                task.embedding_target,
+                Some(EmbeddingTaskTarget::Chunk { .. })
+            )
+        })
+        .expect("fixture must retain a separate authentic Chunk local identity");
+    let foreign_target = serde_json::to_value(foreign.embedding_target.as_ref().unwrap()).unwrap();
+    let foreign_record = free_record_for(&dir, foreign_target["embedding_hash"].as_str().unwrap());
+    assert_ne!(own_record["key"], foreign_record["key"]);
+    assert_ne!(own_record["token"], foreign_record["token"]);
+    let members = own_record["identity"]["contract"]["members"]
+        .as_array()
+        .unwrap();
+    assert!(members.iter().any(|member| member["target"] == own_target));
+    assert!(
+        members
+            .iter()
+            .all(|member| member["target"] != foreign_target),
+        "Image result cannot borrow another input's local authority"
+    );
+    let local_before = free_state_files(&dir);
+    let billing_before = billing_artifacts(&dir);
+    let trace_before = free_trace(&dir);
     let repo = Repository::open(dir.path()).unwrap();
-    let scope_id = repo.scope_identity().unwrap().scope_id;
     let vector_before = repo
         .object_store()
         .read_embedding(embedding_hash)
@@ -9882,44 +10042,13 @@ fn local_image_cached_reconciliation_completes_without_new_attempt() {
                 |row| row.get(0),
             )
             .unwrap();
-    // Normalize a crash fixture from the exact existing terminal attempt so
-    // this test reaches cached reconciliation independently of the fresh-claim
-    // bug covered above. No SQL row, target, vector or attempt is fabricated.
-    let (token, month): (String, String) = ledger_db(&dir)
-        .query_row(
-            "SELECT c.batch_job_id,c.month FROM cost_ledger c JOIN batch_requests b
-         ON c.scope_id=b.scope_id AND c.adapter_kind=b.adapter_kind
-         AND c.input_hash=b.input_hash AND c.tool_profile_hash=b.tool_profile_hash
-         AND c.submission_seq=b.submission_seq
-         WHERE c.scope_id=?1 AND c.adapter_kind='embedding' AND c.input_hash=?2
-         AND c.tool_profile_hash=?3 AND c.outcome='succeeded' AND c.usd=0
-         AND c.estimated=0 AND b.state=2 AND b.intent_token IS NULL
-         AND b.estimated_usd=0 AND b.batch_job_id IS NULL AND b.request_kind='sync'",
-            rusqlite::params![scope_id, embedding_hash, profile_hash],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    let ledger_rows = || {
-        let conn = ledger_db(&dir);
-        ["batch_requests", "cost_ledger"].map(|table| {
-            let mut statement = conn.prepare(&format!(
-                "SELECT * FROM {table} ORDER BY scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq"
-            )).unwrap();
-            statement.query_map([], |row| (0..row.as_ref().column_count())
-                .map(|column| row.get::<_,rusqlite::types::Value>(column))
-                .collect::<rusqlite::Result<Vec<_>>>())
-                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
-        })
-    };
-    let ledger_before = ledger_rows();
+    // Recreate only the scope mirror's interrupted publication, retaining the
+    // authentic local authority and exact identity/result for this input.
     store
         .update_matching(|task| {
             if task.task_id != original.task_id {
                 return false;
             }
-            task.reservation_id = Some(token.clone());
-            task.reserved_usd = Some(0.0);
-            task.reserved_month = Some(month.clone());
             task.status = TaskStatus::Pending;
             task.fallback_reason = Some("ready_for_online_adapter".to_owned());
             true
@@ -9932,34 +10061,32 @@ fn local_image_cached_reconciliation_completes_without_new_attempt() {
         "cached Image must not execute: {indexed}"
     );
     let after = store.all().unwrap();
-    assert_eq!(
-        after.len(),
-        before.len(),
-        "cached reconciliation keeps the same task set"
-    );
+    assert_eq!(after.len(), before.len());
     let completed = after
         .iter()
         .find(|task| task.task_id == original.task_id)
         .unwrap();
-    assert_eq!(
-        completed.status,
-        TaskStatus::Done,
-        "materialized Image Pending must become Done"
-    );
-    assert!(completed.reservation_claim().is_none());
-    assert!(completed.reservation_id.is_none());
-    assert!(completed.reserved_usd.is_none());
-    assert!(completed.reserved_month.is_none());
+    assert_eq!(completed.status, TaskStatus::Done);
     assert_eq!(completed.attempts, original.attempts);
     assert_eq!(completed.embedding_target, original.embedding_target);
     assert_eq!(completed.input_hash, original.input_hash);
     assert_eq!(completed.input_path, original.input_path);
     assert_eq!(completed.output_ref, original.output_ref);
-    assert_eq!(
-        ledger_rows(),
-        ledger_before,
-        "cached Image recovery leaves every physical request/settlement field exact"
+    assert!(completed.reservation_claim().is_none());
+    assert!(
+        completed.reservation_id.is_none()
+            && completed.reserved_usd.is_none()
+            && completed.reserved_month.is_none()
     );
+    // This compares every unrelated Chunk identity too: an Image reconciliation
+    // cannot mutate, consume or borrow another local input's authority/result.
+    assert_eq!(free_state_files(&dir), local_before);
+    assert_eq!(
+        free_trace(&dir),
+        trace_before,
+        "cached image must not call the adapter again"
+    );
+    assert_eq!(billing_artifacts(&dir), billing_before);
     let repo = Repository::open(dir.path()).unwrap();
     assert_eq!(
         repo.object_store()
@@ -9984,61 +10111,6 @@ fn local_image_cached_reconciliation_completes_without_new_attempt() {
             )
             .unwrap();
     assert_eq!(projected_after, projected_before);
-    assert_eq!(
-        count(
-            &ledger_db(&dir),
-            "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind='embedding' AND (state IN (0,1) OR intent_token IS NOT NULL)"
-        ),
-        0
-    );
-    // A token from another input is only a lookup hint, never authority to
-    // clear a claim or settle that other task. Keep the exact ledger unchanged.
-    let foreign = after
-        .iter()
-        .find(|task| {
-            matches!(
-                task.embedding_target,
-                Some(EmbeddingTaskTarget::Chunk { .. })
-            ) && task.reservation_claim().is_some()
-        })
-        .expect("fixture must retain a separate terminal chunk claim");
-    let foreign_claim = foreign.reservation_claim().unwrap();
-    store
-        .update_matching(|task| {
-            if task.task_id != original.task_id {
-                return false;
-            }
-            task.status = TaskStatus::Pending;
-            task.fallback_reason = Some("ready_for_online_adapter".to_owned());
-            task.reservation_id = Some(foreign_claim.reservation_id.to_owned());
-            task.reserved_usd = Some(foreign_claim.usd);
-            task.reserved_month = Some(foreign_claim.month.to_owned());
-            true
-        })
-        .unwrap();
-    let held = json_success_deterministic_embed(&dir, &["index", "--yes", "--offline"]);
-    assert_eq!(held["embedding_tasks_executed"], 0);
-    let held_tasks = store.all().unwrap();
-    let held_image = held_tasks
-        .iter()
-        .find(|task| task.task_id == original.task_id)
-        .unwrap();
-    assert_eq!(
-        held_image.status,
-        TaskStatus::Pending,
-        "a foreign input claim cannot be discarded"
-    );
-    let retained = held_image.reservation_claim().unwrap();
-    assert_eq!(retained.reservation_id, foreign_claim.reservation_id);
-    assert_eq!(retained.month, foreign_claim.month);
-    assert_eq!(retained.usd, foreign_claim.usd);
-    assert_eq!(held_image.embedding_target, original.embedding_target);
-    assert_eq!(held_image.attempts, original.attempts);
-    assert_eq!(
-        ledger_rows(),
-        ledger_before,
-        "foreign claim must not mutate either physical attempt"
-    );
 }
 
 /// U9: images deduplicate by `image_hash`, not by the chunk `text_hash` the
@@ -11051,17 +11123,25 @@ fn write_tools_toml(dir: &TempDir, body: &str) {
     fs::write(cfg.join("tools.toml"), body).unwrap();
 }
 
-/// R13-2(a): a bogus key / type-mismatch in tools.toml is exit 2 (schema),
-/// symmetric with config.toml — before, tools.toml silently accepted it at exit 0.
+/// docs14 Operation-specific prerequisites: malformed selected Markdown
+/// settings remain exit 2; local commands do not consume this dependency.
 #[test]
 fn r13_2_cli_tools_toml_bogus_key_and_type_are_exit_2() {
     let dir = indexed_scope();
     write_tools_toml(&dir, "[markdown]\ntotally_bogus_key = \"xyz\"\n");
-    let err = json_failure(&dir, &["status"], 2);
+    let err = json_failure(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+        2,
+    );
     assert_eq!(err["error_code"], "KIO-E-CONFIG-SCHEMA-001");
 
     write_tools_toml(&dir, "[markdown.x]\ncmd = 12345\n");
-    let err = json_failure(&dir, &["status"], 2);
+    let err = json_failure(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+        2,
+    );
     assert_eq!(err["error_code"], "KIO-E-CONFIG-SCHEMA-001");
 }
 
@@ -11081,7 +11161,11 @@ fn r13_2_cli_unsupported_documented_targets_are_rejected() {
          [embedding.gemini_embedding_2]\n\
          auth = \"env:GEMINI_API_KEY\"\n",
     );
-    let err = json_failure(&dir, &["status"], 2);
+    let err = json_failure(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+        2,
+    );
     assert_eq!(err["error_code"], "KIO-E-CONFIG-SCHEMA-001");
 }
 
@@ -11090,7 +11174,11 @@ fn r13_2_cli_unsupported_documented_targets_are_rejected() {
 fn r13_2_cli_custom_url_is_rejected() {
     let dir = indexed_scope();
     write_tools_toml(&dir, "[markdown.x]\nurl = \"plain:\"\n");
-    let err = json_failure(&dir, &["status"], 2);
+    let err = json_failure(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+        2,
+    );
     assert_eq!(err["error_code"], "KIO-E-CONFIG-SCHEMA-001");
 }
 
@@ -11103,7 +11191,11 @@ fn r13_2_keychain_auth_is_a_schema_error() {
         &dir,
         "[embedding.gemini_embedding_2]\nauth = \"keychain:login\"\n",
     );
-    let error = json_failure(&dir, &["status"], 2);
+    let error = json_failure(
+        &dir,
+        &["adapter", "approve", "gemini_embedding_2", "--yes"],
+        2,
+    );
     assert_eq!(error["error_code"], "KIO-E-CONFIG-SCHEMA-001");
 }
 
@@ -11418,6 +11510,7 @@ fn r16_2_one_scope_store_corruption_is_partial_not_all_failed() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["search", "alphaunique", "--all-scopes", "--json"])
         .assert()
@@ -11476,6 +11569,7 @@ fn r16_3_fresh_search_unreceipted_tree_loss_excludes_not_silent_empty() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["search", "alphaunique", "--all-scopes", "--json"])
         .assert()
@@ -12630,6 +12724,7 @@ fn r18_4_partial_store_corruption_entry_carries_recovery_hint() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["search", "alphaunique", "--all-scopes", "--json"])
         .assert()
@@ -12977,6 +13072,7 @@ fn r19_6_corrupt_source_index_does_not_create_a_search_exclusion() {
         .current_dir(&a)
         .env("XDG_CONFIG_HOME", data_home.join("config"))
         .env("XDG_DATA_HOME", data_home.join("data"))
+        .env("XDG_STATE_HOME", data_home.join("state"))
         .env("XDG_CACHE_HOME", data_home.join("cache"))
         .args(["search", "alphaunique", "--all-scopes", "--json"])
         .assert()
@@ -14016,28 +14112,20 @@ fn missing_owned_image_cas_blocks_vector_reprojection_without_new_attempt() {
         .execute("DELETE FROM agg_image_embeddings", [])
         .unwrap();
     drop(replica);
-    let ledger = ledger_db(&dir);
-    let (requests_before, charges_before): (i64, i64) = (
-        ledger
-            .query_row(
-                "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind='embedding' AND input_hash=?1",
-                [&embedding_hash],
-                |row| row.get(0),
-            )
-            .unwrap(),
-        ledger
-            .query_row(
-                "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind='embedding' AND input_hash=?1",
-                [&embedding_hash],
-                |row| row.get(0),
-            )
-            .unwrap(),
-    );
-    assert_eq!((requests_before, charges_before), (1, 1));
-    drop(ledger);
+    let record = free_record_for(&dir, &embedding_hash);
+    assert_eq!(record["identity"]["target"]["kind"], "image");
+    assert_eq!(record["phase"]["phase"], "published");
+    assert_eq!(record["attempts"], 1);
+    let local_before = free_state_files(&dir);
+    let billing_before = billing_artifacts(&dir);
+    let trace_before = free_trace(&dir);
 
     let resume = kio(&dir, &["batch", "resume"])
         .env(TEST_DETERMINISTIC_EMBEDDING_ENV, "scale-v3")
+        .env(
+            "KIO_TEST_TASK_EMBED_TRACE",
+            dir.path().join(".test-data/free-task.trace"),
+        )
         .arg("--json")
         .output()
         .unwrap();
@@ -14070,27 +14158,20 @@ fn missing_owned_image_cas_blocks_vector_reprojection_without_new_attempt() {
         failure["error_code"], "KIO-E-STORE-NOT-FOUND-001",
         "the missing source must be classified, not silently skipped: {failure}"
     );
-    let ledger = ledger_db(&dir);
-    let (requests_after, charges_after): (i64, i64) = (
-        ledger
-            .query_row(
-                "SELECT COUNT(*) FROM batch_requests WHERE adapter_kind='embedding' AND input_hash=?1",
-                [&embedding_hash],
-                |row| row.get(0),
-            )
-            .unwrap(),
-        ledger
-            .query_row(
-                "SELECT COUNT(*) FROM cost_ledger WHERE adapter_kind='embedding' AND input_hash=?1",
-                [&embedding_hash],
-                |row| row.get(0),
-            )
-            .unwrap(),
+    assert_eq!(
+        free_trace(&dir),
+        trace_before,
+        "missing image must not call the adapter"
     );
     assert_eq!(
-        (requests_after, charges_after),
-        (requests_before, charges_before),
-        "projection failure must not reserve or charge a new image attempt"
+        free_state_files(&dir),
+        local_before,
+        "missing CAS cannot consume or replace a local attempt/result"
+    );
+    assert_eq!(
+        billing_artifacts(&dir),
+        billing_before,
+        "projection failure must not write billing"
     );
     assert_eq!(
         repo.object_store()

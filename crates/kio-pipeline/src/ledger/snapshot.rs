@@ -137,9 +137,59 @@ pub struct LedgerReadSnapshot {
     conn: Connection,
     // Field order intentionally closes SQLite before deleting its private dir.
     _storage: PrivateStorage,
+    source_parent: fs::File,
+    source_parent_path: PathBuf,
+    source_main: String,
+    source_manifest: Manifest,
+    control: kio_core::control::ControlHandle,
 }
 
 impl LedgerReadSnapshot {
+    /// Discover existing scoped paid recovery without granting write/send
+    /// authority. A changed source or journal is unknown, never an empty queue.
+    pub fn has_paid_recovery_work_for_scope(
+        &self,
+        scope_id: &str,
+    ) -> Result<bool, LedgerSnapshotError> {
+        let recheck = || -> Result<(), AttemptError> {
+            let parent = fresh_parent_binding(
+                &self.source_parent,
+                &self.source_parent_path,
+                &self.source_main,
+                &self.control,
+                #[cfg(test)]
+                None,
+            )?;
+            if manifest_recheck(&parent, &self.source_parent_path, &self.source_main)?
+                != self.source_manifest
+            {
+                return Err(AttemptError::Unstable(
+                    "ledger changed after recovery snapshot capture".into(),
+                ));
+            }
+            Ok(())
+        };
+        let classify = |error| match error {
+            AttemptError::Missing => LedgerSnapshotError::UnstableBusy(
+                "ledger disappeared after recovery snapshot capture".into(),
+            ),
+            AttemptError::Unsafe(message) => LedgerSnapshotError::UnsafeIntegrity(message),
+            AttemptError::Unstable(message) => LedgerSnapshotError::UnstableBusy(message),
+        };
+        recheck().map_err(classify)?;
+        let found = super::lifecycle::read_snapshot_has_paid_recovery(
+            &self.source_parent,
+            &self.source_parent_path,
+            &self.source_main,
+            &self.conn,
+            scope_id,
+            &self.control,
+        )
+        .map_err(snapshot_query_error)?;
+        recheck().map_err(classify)?;
+        Ok(found)
+    }
+
     /// Capture a stable snapshot.  `Missing` is a normal no-create cache miss;
     /// unsafe source shape and source churn are deliberately distinct.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, LedgerSnapshotError> {
@@ -990,7 +1040,7 @@ fn attempt_snapshot(
             parent_path,
         );
     }
-    fresh_parent_binding(
+    let source_parent = fresh_parent_binding(
         parent,
         parent_path,
         main,
@@ -1001,6 +1051,11 @@ fn attempt_snapshot(
     Ok(LedgerReadSnapshot {
         conn,
         _storage: storage,
+        source_parent,
+        source_parent_path: parent_path.to_path_buf(),
+        source_main: main.to_owned(),
+        source_manifest: initial,
+        control: control.clone(),
     })
 }
 
@@ -2239,5 +2294,285 @@ mod tests {
             normalized_absolute(Path::new("/private/var/tmp/cost-ledger.sqlite")).unwrap(),
             PathBuf::from("/private/var/tmp/cost-ledger.sqlite")
         );
+    }
+    fn recovery_source_family(
+        path: &Path,
+    ) -> std::collections::BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !(name.starts_with("cost-ledger")
+                    || name.starts_with("ledger.")
+                    || name.starts_with("embedding-"))
+                {
+                    return None;
+                }
+                let metadata = fs::symlink_metadata(entry.path()).unwrap();
+                assert!(metadata.is_file());
+                Some((
+                    PathBuf::from(name),
+                    (
+                        fs::read(entry.path()).unwrap(),
+                        metadata.modified().unwrap(),
+                    ),
+                ))
+            })
+            .collect()
+    }
+
+    fn staged_recovery_fixture() -> (
+        tempfile::TempDir,
+        PathBuf,
+        LedgerDb,
+        crate::ledger::embedding_job::EmbeddingJob,
+    ) {
+        use crate::ledger::embedding_job::*;
+        use crate::ledger::{BatchState, Outcome, ops};
+        use crate::task::EmbeddingTaskTarget;
+        use kio_adapter::types::{
+            EmbeddingCompleted, EmbeddingLogicalJobId, EmbeddingMemberOutcome,
+            EmbeddingMemberResult, EmbeddingUsage,
+        };
+        let (dir, path, conn) = ledger();
+        drop(conn);
+        let db = LedgerDb::open_existing(&path).unwrap();
+        let hash = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+        let key = TaskKey::new("scope-staged", "embedding", hash('a'), hash('b'));
+        let binding = EmbeddingJobBinding {
+            logical_job_id: EmbeddingLogicalJobId("logical-staged".into()),
+            dimensions: 3,
+            distance: "cosine".into(),
+            modality: "multimodal".into(),
+            members: vec![EmbeddingJobMember {
+                id: "member1".into(),
+                target: EmbeddingTaskTarget::Chunk {
+                    chunk_hash: hash('c'),
+                    embedding_hash: hash('a'),
+                    profile_hash: hash('b'),
+                    input_hash: hash('d'),
+                },
+            }],
+        };
+        let EmbeddingReservationOutcome::Reserved(job) = reserve_embedding_job(
+            &db,
+            &EmbeddingReserveRequest {
+                key: &key,
+                candidate_usd: 1.0,
+                caps: &ops::BudgetCapConfig {
+                    device_cap: 100.0,
+                    folder_cap: None,
+                    device_per_adapter_cap: None,
+                },
+                request_kind: RequestKind::Batch,
+                timeout_seconds: None,
+                bypass_cap_denial: false,
+                binding: &binding,
+            },
+        )
+        .unwrap() else {
+            panic!("paid fixture must reserve");
+        };
+        ops::phase2b_record_job_created(&db, &key, &job.intent_token, "batch-staged").unwrap();
+        stage_embedding_result(
+            &db,
+            &job,
+            &EmbeddingCompleted {
+                members: vec![EmbeddingMemberOutcome {
+                    id: "member1".into(),
+                    result: EmbeddingMemberResult::Vector {
+                        vector: vec![1.0, 0.0, 0.0],
+                    },
+                }],
+                dimensions: 3,
+                distance: "cosine".into(),
+                modality: "multimodal".into(),
+                embedding_profile_hash: hash('b'),
+                usage: EmbeddingUsage::Estimated,
+            },
+        )
+        .unwrap();
+        ops::terminal_transaction(
+            &db,
+            &ops::TerminalWrite {
+                key: &key,
+                outcome: Outcome::Succeeded,
+                billed: ops::BilledAmount {
+                    usd: 1.0,
+                    estimated: true,
+                },
+                ledger_batch_job_id: "batch-staged",
+                next_state: BatchState::Completed,
+                error: None,
+                increment_contract_violation: false,
+                attempts_delta: 0,
+                clear_intent_token: false,
+                intent_token_guard: Some(&job.intent_token),
+                reseat_submission_seq: false,
+            },
+        )
+        .unwrap();
+        ops::recovery_finish_cleanup(&db, &key, &job.intent_token).unwrap();
+        let row = ops::get_batch_request(&db, &key).unwrap().unwrap();
+        assert!(row.intent_token.is_none());
+        let staged = embedding_job(&db, &row).unwrap().unwrap();
+        assert!(staged.known_result.is_some());
+        (dir, path, db, staged)
+    }
+
+    #[test]
+    fn recovery_discovery_finds_unstamped_scope_rows_without_source_mutation() {
+        use crate::ledger::ops;
+        let (_dir, path, conn) = ledger();
+        drop(conn);
+        let db = LedgerDb::open_existing(&path).unwrap();
+        let discover = |scope: &str| {
+            let before = recovery_source_family(&path);
+            let found = LedgerReadSnapshot::open(&path)
+                .unwrap()
+                .has_paid_recovery_work_for_scope(scope)
+                .unwrap();
+            assert_eq!(
+                recovery_source_family(&path),
+                before,
+                "read-only discovery changed source family"
+            );
+            found
+        };
+        assert!(!discover("scope-a"));
+        let other = TaskKey::new(
+            "scope-b",
+            "embedding",
+            format!("sha256:{}", "e".repeat(64)),
+            format!("sha256:{}", "f".repeat(64)),
+        );
+        ops::phase1_intent(&db, &other, RequestKind::Batch, 0.5, None).unwrap();
+        assert!(
+            !discover("scope-a"),
+            "unrelated paid scope must not select recovery"
+        );
+        let key = TaskKey::new("scope-a", "markdownize", "unstamped", "profile");
+        let intent = ops::phase1_intent(&db, &key, RequestKind::Batch, 0.5, None).unwrap();
+        assert!(
+            discover("scope-a"),
+            "create-recovery intent is owned by ledger, not Task stamps"
+        );
+        ops::recovery_mark_found(&db, &key, "found-after-crash").unwrap();
+        assert_eq!(
+            ops::get_batch_request(&db, &key).unwrap().unwrap().state,
+            crate::ledger::BatchState::Intent
+        );
+        assert!(discover("scope-a"), "state0 found-job must be collected");
+        ops::terminal_transaction(
+            &db,
+            &ops::TerminalWrite {
+                key: &key,
+                outcome: crate::ledger::Outcome::Succeeded,
+                billed: ops::BilledAmount {
+                    usd: 0.5,
+                    estimated: false,
+                },
+                ledger_batch_job_id: "found-after-crash",
+                next_state: crate::ledger::BatchState::Completed,
+                error: None,
+                increment_contract_violation: false,
+                attempts_delta: 0,
+                clear_intent_token: false,
+                intent_token_guard: Some(&intent.intent_token),
+                reseat_submission_seq: false,
+            },
+        )
+        .unwrap();
+        assert!(
+            discover("scope-a"),
+            "terminal remote residue still needs recovery"
+        );
+        ops::recovery_finish_cleanup(&db, &key, &intent.intent_token).unwrap();
+        assert!(
+            !discover("scope-a"),
+            "clean paid history is not recovery work"
+        );
+    }
+
+    #[test]
+    fn recovery_discovery_finds_terminal_known_results_but_not_clean_history() {
+        let (_dir, path, db, staged) = staged_recovery_fixture();
+        let before = recovery_source_family(&path);
+        let snapshot = LedgerReadSnapshot::open(&path).unwrap();
+        assert!(
+            snapshot
+                .has_paid_recovery_work_for_scope("scope-staged")
+                .unwrap()
+        );
+        assert!(!snapshot.has_paid_recovery_work_for_scope("other").unwrap());
+        assert_eq!(
+            recovery_source_family(&path),
+            before,
+            "discovery must not adopt/delete staged files"
+        );
+        crate::ledger::embedding_job::finish_embedding_publication(&db, &staged).unwrap();
+        let before = recovery_source_family(&path);
+        assert!(
+            !LedgerReadSnapshot::open(&path)
+                .unwrap()
+                .has_paid_recovery_work_for_scope("scope-staged")
+                .unwrap(),
+            "token-cleared published history must not trigger mutable open"
+        );
+        assert_eq!(recovery_source_family(&path), before);
+    }
+
+    #[test]
+    fn recovery_discovery_refuses_snapshot_authority_and_known_result_drift() {
+        for case in ["database", "authority", "result"] {
+            let (_dir, path, db, _staged) = staged_recovery_fixture();
+            let snapshot = LedgerReadSnapshot::open(&path).unwrap();
+            match case {
+                "database" => {
+                    crate::ledger::ops::phase1_intent(
+                        &db,
+                        &TaskKey::new("other", "markdownize", "new", "profile"),
+                        RequestKind::Batch,
+                        0.5,
+                        None,
+                    )
+                    .unwrap();
+                }
+                "authority" => {
+                    fs::write(
+                        PathBuf::from(format!("{}.authority.json", path.display())),
+                        b"broken authority\n",
+                    )
+                    .unwrap();
+                }
+                "result" => {
+                    let result = fs::read_dir(path.parent().unwrap())
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path())
+                        .find(|path| {
+                            path.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .ends_with(".result.json")
+                        })
+                        .unwrap();
+                    fs::write(result, b"broken known result\n").unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let before = recovery_source_family(&path);
+            assert!(
+                snapshot
+                    .has_paid_recovery_work_for_scope("scope-staged")
+                    .is_err(),
+                "{case} drift must be unknown, never authority"
+            );
+            assert_eq!(
+                recovery_source_family(&path),
+                before,
+                "{case} discovery repaired/mutated source"
+            );
+        }
     }
 }

@@ -309,9 +309,8 @@ fn markdownize_with_source(
             failed_units: Vec::new(),
             fallback_to_full: false,
             reason: None,
-            // QA17: the deterministic adapter never bills (local, no
-            // network) — it settles via `record_free_local_charge`'s
-            // `nonbillable_charge()`, not this codepath's `usage` field.
+            // Deterministic local execution has no provider usage and does
+            // not enter the billing ledger.
             usage: None,
         });
     }

@@ -3771,3 +3771,386 @@ fn r14_6_pin_change_gates_incremental_before_send() {
         "v1 + v2 online tasks both done (v2 via Full after the gate): {status}"
     );
 }
+
+// F5 / docs04 §5.4: final display observes genuine paid work performed by
+// children after the parent's own indexing phase, using one final snapshot.
+#[test]
+fn f5_final_index_warning_includes_paid_child_work_from_this_invocation() {
+    let fixture = canonical_tempdir();
+    let parent = fixture.path().join("knowledge");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).unwrap();
+    let config = fixture.path().join("config");
+    let data = fixture.path().join("data");
+    let cache = fixture.path().join("cache");
+    let state = fixture.path().join("state");
+    let trace = fixture.path().join("paid-embedding.trace");
+    for directory in [&config, &data, &cache, &state] {
+        fs::create_dir_all(directory).unwrap();
+    }
+    // Runtime roots stay outside knowledge, so auto-discovered child work is
+    // exactly our enrolled child, rather than test state/configuration files.
+    let run = |cwd: &Path, args: &[&str]| -> Value {
+        let output = hermetic_kio_command()
+            .current_dir(cwd)
+            .env("XDG_CONFIG_HOME", &config)
+            .env("XDG_DATA_HOME", &data)
+            .env("XDG_CACHE_HOME", &cache)
+            .env("XDG_STATE_HOME", &state)
+            .env_remove("KIO_EVAL_DETERMINISTIC_EMBED")
+            .env("KIO_TEST_GEMINI_EMBED", "mock")
+            .env("KIO_TEST_TASK_EMBED_TRACE", &trace)
+            .env("KIO_FIXED_NOW", "2026-07-15T00:00:00Z")
+            .args(args)
+            .arg("--json")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        serde_json::from_slice(&output).unwrap()
+    };
+    run(&parent, &["init", "--independent", "--yes"]);
+    run(&parent, &["ledger", "init"]);
+    // Explicit init would make the child an independent root, which parent
+    // discovery deliberately excludes. Enroll it through the parent first.
+    let enrolled = run(&parent, &["index", "--offline", "--yes"]);
+    assert!(
+        enrolled["child_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["path"] == "child" && row["status"] == "indexed" }),
+        "fixture must enroll a managed child: {enrolled}"
+    );
+    run(&parent, &["adapter", "approve", "--all", "--yes"]);
+    run(&child, &["adapter", "approve", "--all", "--yes"]);
+    fs::write(
+        child.join("priced.md"),
+        format!("# Priced content\n\n{}\n", "priced content ".repeat(240)),
+    )
+    .unwrap();
+    let child_id = kio_core::scope::Repository::open(&child)
+        .unwrap()
+        .scope_identity()
+        .unwrap()
+        .scope_id;
+    let config_dir = config.join("kio");
+    fs::create_dir_all(&config_dir).unwrap();
+    fs::write(
+        config_dir.join("config.toml"),
+        "[budget]\nmonthly_usd_cap = 0.02\nwarn_at_percent = 80\n",
+    )
+    .unwrap();
+    let ledger_path = data.join("kio/cost-ledger.sqlite");
+    Connection::open(&ledger_path).unwrap().execute(
+        "INSERT INTO cost_ledger (scope_id, adapter_kind, input_hash, tool_profile_hash, submission_seq, batch_job_id, usd, estimated, outcome, month, recorded_at) VALUES ('seed', 'embedding', 'sha256:seed', 'seed-profile', 1, 'seed-job', 0.0158, 0, 'succeeded', '2026-07', 0)", [],
+    ).unwrap();
+    let total = || {
+        kio_pipeline::ledger::LedgerReadSnapshot::open(&ledger_path)
+            .unwrap()
+            .month_total(None, None, "2026-07")
+            .unwrap()
+    };
+    let before = total();
+    assert!(
+        (before / 0.02 - 0.79).abs() < 1e-12,
+        "fixture must start at79%: {before}"
+    );
+    let before_status = run(&parent, &["status"]);
+    assert_eq!(before_status["budget"]["warned"], false, "{before_status}");
+    assert!(
+        before_status["budget"]["warning"].is_null(),
+        "{before_status}"
+    );
+    assert!(!trace.exists(), "setup must not issue an embedding attempt");
+
+    let indexed = run(&parent, &["index", "--online", "--yes", "--realtime"]);
+    let after = total();
+    let delta = after - before;
+    assert!(
+        delta > 0.0,
+        "must perform genuine paid work, not just reseed display truth: before={before} after={after} index={indexed} child_status={}",
+        run(&child, &["status"])
+    );
+    assert!(
+        (0.02 * 0.80..0.02).contains(&after),
+        "paid mock must cross80% while remaining under cap: before={before} after={after}"
+    );
+    assert!(
+        trace.exists(),
+        "genuine paid mock must cross the adapter boundary"
+    );
+    let conn = support::immutable_sqlite(&ledger_path);
+    let (paid_rows, paid_usd): (u64, f64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(usd),0) FROM cost_ledger WHERE scope_id=?1 AND adapter_kind='embedding' AND outcome='succeeded' AND estimated=0 AND month='2026-07'",
+        [&child_id], |row| Ok((row.get(0)?, row.get(1)?)),
+    ).unwrap();
+    assert!(paid_rows > 0, "child must settle measured paid requests");
+    assert!(
+        (paid_usd - delta).abs() < 1e-12,
+        "every new charge must belong to the child: measured={paid_usd} delta={delta}"
+    );
+    assert!(
+        indexed["child_scopes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|row| { row["path"] == "child" && row["status"] == "indexed" }),
+        "root invocation must finish child work: {indexed}"
+    );
+    let final_status = run(&parent, &["status"]);
+    assert_eq!(final_status["budget"]["warned"], true, "{final_status}");
+    assert_eq!(indexed["budget_status"], "known", "{indexed}");
+    assert!(
+        indexed["budget_warning"]
+            .as_str()
+            .is_some_and(|warning| warning.contains("device budget")),
+        "this invocation's final result must include its child's charge: {indexed}"
+    );
+    assert_eq!(
+        indexed["budget_warning"], final_status["budget"]["warning"],
+        "final index display must match current status after its own paid work"
+    );
+}
+
+// Final display classification must reopen an actual managed child. The MD
+// paid-spend warning fixture has no Markdownize placeholder and cannot prove this.
+#[test]
+fn f5_child_paid_placeholder_finalization_preserves_binding_and_pass_counts() {
+    fn billing_bytes(root: &Path) -> BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            files: &mut BTreeMap<PathBuf, (Vec<u8>, std::time::SystemTime)>,
+        ) {
+            if !path.exists() {
+                return;
+            }
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                if metadata.is_dir() {
+                    visit(root, &path, files);
+                    continue;
+                }
+                let relative = path.strip_prefix(root).unwrap();
+                if relative.components().any(|part| {
+                    let name = part.as_os_str().to_string_lossy();
+                    name.starts_with("cost-ledger") || name.starts_with("ledger.")
+                }) {
+                    assert!(
+                        metadata.is_file(),
+                        "billing leaf shape changed: {}",
+                        path.display()
+                    );
+                    files.insert(
+                        relative.to_path_buf(),
+                        (fs::read(&path).unwrap(), metadata.modified().unwrap()),
+                    );
+                }
+            }
+        }
+        let mut files = BTreeMap::new();
+        visit(root, root, &mut files);
+        files
+    }
+
+    // One focused regression covers the same child reopen/fingerprint path
+    // with known available budget, known exhausted budget, and unavailable budget.
+    for (case, cap, expected_status, expected_reason, expected_hold) in [
+        (
+            "known_available",
+            Some(50.0),
+            "pending",
+            "network_opt_in_required",
+            None,
+        ),
+        (
+            "known_exhausted",
+            Some(0.0),
+            "paused",
+            "budget_exceeded",
+            Some("budget"),
+        ),
+        (
+            "unknown",
+            None,
+            "paused",
+            "ledger_initialization_required",
+            Some("ledger_initialization_required"),
+        ),
+    ] {
+        let fixture = canonical_tempdir();
+        let parent = support::create_private_child_dir(fixture.path(), "knowledge");
+        let child = support::create_private_child_dir(&parent, "child");
+        let home = support::create_private_child_dir(fixture.path(), "home");
+        let data = support::create_private_child_dir(fixture.path(), "data");
+        let config = support::create_private_child_dir(fixture.path(), "config");
+        let cache = support::create_private_child_dir(fixture.path(), "cache");
+        let state = support::create_private_child_dir(fixture.path(), "state");
+        let tmp = support::create_private_child_dir(fixture.path(), "tmp");
+        let trace = fixture.path().join("forbidden-embedding.trace");
+        let run = |cwd: &Path, args: &[&str]| -> Value {
+            let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"));
+            command.env_clear();
+            for name in ["PATH", "SystemRoot", "WINDIR"] {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+            let output = command
+                .current_dir(cwd)
+                .env("HOME", &home)
+                .env("USERPROFILE", &home)
+                .env("XDG_DATA_HOME", &data)
+                .env("XDG_CONFIG_HOME", &config)
+                .env("XDG_CACHE_HOME", &cache)
+                .env("XDG_STATE_HOME", &state)
+                .env("TMPDIR", &tmp)
+                .env("TMP", &tmp)
+                .env("TEMP", &tmp)
+                .env("KIO_TEST_TASK_EMBED_TRACE", &trace)
+                .env("KIO_TEST_QUERY_EMBED_TRACE", &trace)
+                .args(args)
+                .arg("--json")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{case} {args:?}: {}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            serde_json::from_slice(&output.stdout).unwrap()
+        };
+        run(&parent, &["init", "--independent", "--yes"]);
+        if let Some(cap) = cap {
+            run(&parent, &["ledger", "init"]);
+            let config_dir = support::create_private_child_dir(&config, "kio");
+            kio_core::store_dir::StoreDirectory::open(&config_dir)
+                .unwrap()
+                .write_atomic(
+                    Path::new("config.toml"),
+                    format!("[budget]\nmonthly_usd_cap = {cap}\n").as_bytes(),
+                    kio_core::store_dir::Publication::CreateOnly,
+                )
+                .unwrap();
+        }
+        let enrolled = run(&parent, &["index", "--offline"]);
+        assert!(
+            enrolled["child_scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row["path"] == "child" && row["status"] == "indexed" }),
+            "fixture must enroll a managed child: {enrolled}"
+        );
+        let parent_id = kio_core::scope::Repository::open(&parent)
+            .unwrap()
+            .scope_identity()
+            .unwrap()
+            .scope_id;
+        let child_id = kio_core::scope::Repository::open(&child)
+            .unwrap()
+            .scope_identity()
+            .unwrap()
+            .scope_id;
+        let management_path = child.join(".kio/management.json");
+        let binding_before = fs::read(&management_path).unwrap();
+        let management: kio_core::management::ManagementRecord =
+            serde_json::from_slice(&binding_before).unwrap();
+        assert_eq!(management.scope_id, child_id);
+        assert!(
+            matches!(&management.authority, kio_core::management::ManagementAuthority::Child { parent_scope_id, .. } if parent_scope_id == &parent_id)
+        );
+
+        let pdf = fake_pdf(&["new child budget placeholder"]);
+        let raw_hash = hash_bytes(pdf.as_bytes());
+        fs::write(child.join("new.pdf"), pdf).unwrap();
+        let before = billing_bytes(&data);
+        let indexed = run(&parent, &["index", "--offline"]);
+        assert!(
+            indexed["child_scopes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| { row["path"] == "child" && row["status"] == "indexed" }),
+            "child publication/finalization must succeed: {indexed}"
+        );
+        let status = run(&child, &["status"]);
+        let tasks = status["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|task| {
+                task["type"] == "markdownize"
+                    && task["input_path"] == "new.pdf"
+                    && task["output_ref"]
+                        .as_str()
+                        .is_some_and(|output| output.starts_with("online:"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            tasks.len(),
+            1,
+            "one exact new child paid placeholder: {status}"
+        );
+        let task = tasks[0];
+        assert_eq!(task["input_hash"], raw_hash, "{case}: {task}");
+        assert_eq!(task["status"], expected_status, "{case}: {task}");
+        assert_eq!(task["fallback_reason"], expected_reason, "{case}: {task}");
+        assert_eq!(
+            task["hold_reason"],
+            serde_json::to_value(expected_hold).unwrap(),
+            "{case}: {task}"
+        );
+        assert_eq!(task["attempts"], 0, "no paid dispatch: {task}");
+        for key in [
+            "reservation_id",
+            "reserved_usd",
+            "reserved_month",
+            "next_retry_at",
+        ] {
+            assert!(
+                task[key].is_null(),
+                "no claim/retry/reset side effect: {task}"
+            );
+        }
+        assert_eq!(
+            fs::read(&management_path).unwrap(),
+            binding_before,
+            "exact managed child binding must survive deferred reopen"
+        );
+        assert_eq!(
+            kio_core::scope::Repository::open(&child)
+                .unwrap()
+                .scope_identity()
+                .unwrap()
+                .scope_id,
+            child_id
+        );
+        assert_eq!(
+            indexed["pending_online_tasks"], 0,
+            "root pass counter must not aggregate child backlog: {indexed}"
+        );
+        assert_eq!(
+            indexed["paused_tasks"], 0,
+            "root pass counter must not aggregate child holds: {indexed}"
+        );
+        assert_eq!(
+            indexed["budget_status"],
+            if cap.is_some() { "known" } else { "unknown" }
+        );
+        assert_eq!(
+            billing_bytes(&data),
+            before,
+            "free finalization must not change any billing bytes/mtime/sidecar"
+        );
+        assert!(
+            !trace.exists(),
+            "offline placeholder classification must not dispatch a provider"
+        );
+    }
+}

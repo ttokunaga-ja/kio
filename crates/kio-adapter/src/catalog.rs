@@ -170,6 +170,9 @@ pub fn active_local_ocr_execution_with_control(
         None => {}
     }
     let _ = control;
+    if settings.role_configuration_ready("markdown").is_err() {
+        return None;
+    }
     declared_offline_markdownize(settings).then_some(LocalOcrExecution::Real)
 }
 
@@ -211,6 +214,7 @@ pub fn local_ocr_markdownize_adapter_with_control(
     verified_raw_bytes: &[u8],
     _control: &ControlHandle,
 ) -> Result<Box<dyn MarkdownizeAdapter>> {
+    settings.role_credentials_ready("markdown")?;
     let adapter = match execution {
         #[cfg(debug_assertions)]
         LocalOcrExecution::Mock => LocalOcrMarkdownizeAdapter::new(
@@ -354,6 +358,7 @@ pub fn run_standard_online_markdownize_with_bytes_with_control(
     verified_raw_bytes: &[u8],
     control: &ControlHandle,
 ) -> Result<StandardOnlineMarkdownizeOutcome> {
+    settings.role_credentials_ready("markdown")?;
     // Borrow the caller snapshot, then retain only the mock client subcontrols.
     #[cfg(debug_assertions)]
     let (test_mode, capture_sent_media) = test_control::mistral_ocr_with_capture(control);
@@ -745,6 +750,7 @@ pub fn resolve_standard_online_markdownize_profile_with_bbox_with_control(
     bbox_annotation_enabled: bool,
     control: &ControlHandle,
 ) -> Result<AdapterProfile> {
+    settings.role_credentials_ready("markdown")?;
     let _ = control;
     #[cfg(debug_assertions)]
     let test_mode = test_control::mistral_ocr(control);
@@ -1086,6 +1092,9 @@ pub fn active_embedding_execution_with_control(
         Some(_) => return None,
         None => {}
     }
+    if settings.role_configuration_ready("embedding").is_err() {
+        return None;
+    }
     if let Some(local) = active_local_embedding_execution(settings) {
         return Some(EmbeddingExecution::Offline(local));
     }
@@ -1129,6 +1138,9 @@ pub fn embedding_adapter_for_with_control(
     control: &ControlHandle,
 ) -> Result<Box<dyn EmbeddingAdapter>> {
     let _ = control;
+    if !matches!(execution, EmbeddingExecution::DeterministicEvaluator) {
+        settings.role_credentials_ready("embedding")?;
+    }
     match execution {
         EmbeddingExecution::DeterministicEvaluator => Ok(Box::new(DeterministicEmbeddingAdapter)),
         // Same shape as the online `Real` arm below: the declaration is
@@ -1176,7 +1188,7 @@ pub fn embedding_adapter_for_with_control(
                 .and_then(|declared| declared.model)
                 .unwrap_or_else(|| ADOPTED_MODEL_PIN.to_owned());
             Ok(Box::new(GeminiEmbeddingAdapter::new(
-                crate::gemini_embedding::EnvGeminiEmbeddingClient::new(settings.clone()),
+                crate::gemini_embedding::EnvGeminiEmbeddingClient::new(settings.clone())?,
                 configured_model,
                 ADOPTED_DIMENSIONS,
             )))
@@ -1369,12 +1381,60 @@ pub fn run_embedding_with_control(
     idempotency_token: Option<String>,
     control: &ControlHandle,
 ) -> Result<EmbeddingOutcome> {
-    let adapter = embedding_adapter_for_with_control(settings.clone(), execution, control)?;
-    adapter.embed(EmbeddingRequest {
-        input_type,
+    run_embedding_attempt_with_control(
+        settings,
+        execution,
         items,
+        input_type,
         idempotency_token,
-    })
+        control,
+    )
+    .map_err(EmbeddingRunError::into_adapter_error)
+}
+
+/// Dispatch provenance is independent of the adapter error's retry taxonomy.
+#[derive(Debug)]
+pub enum EmbeddingRunError {
+    /// The factory failed before an adapter could invoke any provider operation.
+    BeforeDispatch(AdapterError),
+    /// Adapter execution began; callers must retain conservative accounting.
+    DispatchPossible(AdapterError),
+}
+
+impl EmbeddingRunError {
+    #[must_use]
+    pub fn error(&self) -> &AdapterError {
+        match self {
+            Self::BeforeDispatch(error) | Self::DispatchPossible(error) => error,
+        }
+    }
+
+    #[must_use]
+    pub fn into_adapter_error(self) -> AdapterError {
+        match self {
+            Self::BeforeDispatch(error) | Self::DispatchPossible(error) => error,
+        }
+    }
+}
+
+/// Construct one selected attempt before entering its provider execution.
+pub fn run_embedding_attempt_with_control(
+    settings: Arc<AdapterRuntimeSettings>,
+    execution: EmbeddingExecution,
+    items: Vec<EmbeddingItem>,
+    input_type: EmbeddingInputType,
+    idempotency_token: Option<String>,
+    control: &ControlHandle,
+) -> std::result::Result<EmbeddingOutcome, EmbeddingRunError> {
+    let adapter = embedding_adapter_for_with_control(settings, execution, control)
+        .map_err(EmbeddingRunError::BeforeDispatch)?;
+    adapter
+        .embed(EmbeddingRequest {
+            input_type,
+            items,
+            idempotency_token,
+        })
+        .map_err(EmbeddingRunError::DispatchPossible)
 }
 
 /// Execution effects and limits for the active implementation, outside identity.
@@ -1390,9 +1450,12 @@ pub fn embedding_descriptor_with_control(
     execution: EmbeddingExecution,
     control: &ControlHandle,
 ) -> Result<EmbeddingDescriptor> {
-    let mut descriptor =
-        embedding_adapter_for_with_control(Arc::new(settings.clone()), execution, control)?
-            .descriptor();
+    let profile = embedding_adapter_profile_with_control(settings, execution, control)?;
+    let mut descriptor = match execution {
+        EmbeddingExecution::DeterministicEvaluator => DeterministicEmbeddingAdapter.descriptor(),
+        EmbeddingExecution::Offline(_) => crate::local_embedding::descriptor_from_profile(&profile),
+        EmbeddingExecution::Online(_) => crate::gemini_embedding::descriptor_from_profile(&profile),
+    };
     let declared = settings.declared_pricing("embedding");
     for price in &mut descriptor.pricing {
         let kind = serde_json::to_value(price.kind).expect("billable kind is serializable");
@@ -1419,10 +1482,13 @@ pub fn embedding_preferred_request_kind_with_control(
     execution: EmbeddingExecution,
     control: &ControlHandle,
 ) -> Result<crate::traits::PreferredRequestKind> {
-    Ok(
-        embedding_adapter_for_with_control(Arc::new(settings.clone()), execution, control)?
-            .preferred_request_kind(),
-    )
+    embedding_adapter_profile_with_control(settings, execution, control)?;
+    Ok(match execution {
+        EmbeddingExecution::Online(_) => crate::traits::PreferredRequestKind::Batch,
+        EmbeddingExecution::Offline(_) | EmbeddingExecution::DeterministicEvaluator => {
+            crate::traits::PreferredRequestKind::Sync
+        }
+    })
 }
 
 /// The active implementation's `AdapterProfile` — the source for
@@ -1440,10 +1506,55 @@ pub fn embedding_adapter_profile_with_control(
     execution: EmbeddingExecution,
     control: &ControlHandle,
 ) -> Result<AdapterProfile> {
-    Ok(
-        embedding_adapter_for_with_control(Arc::new(settings.clone()), execution, control)?
-            .profile(),
-    )
+    let _ = control;
+    if !matches!(execution, EmbeddingExecution::DeterministicEvaluator) {
+        settings.role_configuration_ready("embedding")?;
+    }
+    match execution {
+        EmbeddingExecution::DeterministicEvaluator => Ok(DeterministicEmbeddingAdapter.profile()),
+        EmbeddingExecution::Offline(local) => {
+            let declared = settings.declared_adapter("embedding").ok_or_else(|| {
+                AdapterError::ConfigSchema(
+                    "the offline embedding adapter resolved without a declaration".to_owned(),
+                )
+            })?;
+            crate::tool_lock::validate_declared_runtime_target("embedding", &declared)?;
+            if declared.url.is_none() {
+                return Err(AdapterError::ConfigSchema(
+                    "an offline_api embedding adapter must declare `url`".to_owned(),
+                ));
+            }
+            Ok(crate::local_embedding::profile_for(local))
+        }
+        EmbeddingExecution::Online(AdoptedEmbeddingExecution::Real) => {
+            let declared = settings.declared_adapter("embedding");
+            if let Some(declared) = &declared {
+                crate::tool_lock::validate_declared_runtime_target("embedding", declared)?;
+            }
+            let model = declared
+                .and_then(|declared| declared.model)
+                .unwrap_or_else(|| ADOPTED_MODEL_PIN.to_owned());
+            Ok(crate::gemini_embedding::gemini_embedding_profile(
+                &model,
+                ADOPTED_DIMENSIONS,
+                ProviderIdempotency::NotProvided,
+            ))
+        }
+        #[cfg(debug_assertions)]
+        EmbeddingExecution::Online(AdoptedEmbeddingExecution::RequireIdempotencyToken) => {
+            Ok(crate::gemini_embedding::gemini_embedding_profile(
+                ADOPTED_MODEL_PIN,
+                ADOPTED_DIMENSIONS,
+                ProviderIdempotency::HttpHeader("Idempotency-Key".to_owned()),
+            ))
+        }
+        #[cfg(debug_assertions)]
+        EmbeddingExecution::Online(_) => Ok(crate::gemini_embedding::gemini_embedding_profile(
+            ADOPTED_MODEL_PIN,
+            ADOPTED_DIMENSIONS,
+            ProviderIdempotency::NotProvided,
+        )),
+    }
 }
 
 pub fn run_adopted_embedding(
@@ -1519,6 +1630,23 @@ struct MockAdoptedEmbeddingClient {
 }
 
 #[cfg(debug_assertions)]
+static MOCK_EMBEDDING_DISPATCH_COUNT: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Isolated-process tests only: reset the actual mock backend entry counter.
+#[cfg(debug_assertions)]
+pub fn reset_mock_embedding_dispatch_count() {
+    MOCK_EMBEDDING_DISPATCH_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Count actual mock backend invocations, including rejected requests.
+#[cfg(debug_assertions)]
+#[must_use]
+pub fn mock_embedding_dispatch_count() -> u64 {
+    MOCK_EMBEDDING_DISPATCH_COUNT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(debug_assertions)]
 impl GeminiEmbeddingClient for MockAdoptedEmbeddingClient {
     fn resolve_model_pin(&self, _configured_model: &str) -> Result<String> {
         Ok(ADOPTED_MODEL_PIN.to_owned())
@@ -1531,6 +1659,7 @@ impl GeminiEmbeddingClient for MockAdoptedEmbeddingClient {
         dimensions: u32,
         _idempotency_header: Option<(&str, &str)>,
     ) -> Result<crate::gemini_embedding::EmbedBatchOutput> {
+        MOCK_EMBEDDING_DISPATCH_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match self.execution {
             AdoptedEmbeddingExecution::AuthError => {
                 return Err(AdapterError::Auth("mock auth failure".to_owned()));
@@ -1601,6 +1730,51 @@ impl GeminiEmbeddingClient for MockAdoptedEmbeddingClient {
 mod tests {
     use super::*;
     use crate::types::AdapterKind;
+
+    #[test]
+    fn embedding_attempt_keeps_factory_provenance_and_original_typed_error() {
+        let original = Arc::new(kio_core::KioError::schema(
+            "selected declaration unavailable",
+        ));
+        let mut settings = AdapterRuntimeSettings::default();
+        settings
+            .unavailable_roles
+            .insert("embedding".into(), original.clone());
+        let error = run_embedding_attempt_with_control(
+            Arc::new(settings),
+            EmbeddingExecution::Online(AdoptedEmbeddingExecution::Mock),
+            vec![EmbeddingItem::text("query", "fixture")],
+            EmbeddingInputType::Query,
+            None,
+            &ControlHandle::default(),
+        )
+        .unwrap_err();
+        let EmbeddingRunError::BeforeDispatch(AdapterError::RuntimeConfiguration { error, .. }) =
+            error
+        else {
+            panic!("factory rejection must retain its typed unsent provenance");
+        };
+        assert!(Arc::ptr_eq(&error, &original));
+    }
+
+    #[test]
+    fn embedding_attempt_never_guesses_no_dispatch_from_execution_error() {
+        for execution in [
+            AdoptedEmbeddingExecution::NetworkError,
+            AdoptedEmbeddingExecution::AuthError,
+        ] {
+            let error = run_embedding_attempt_with_control(
+                Arc::new(AdapterRuntimeSettings::default()),
+                EmbeddingExecution::Online(execution),
+                vec![EmbeddingItem::text("query", "fixture")],
+                EmbeddingInputType::Query,
+                None,
+                &ControlHandle::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(error, EmbeddingRunError::DispatchPossible(_)));
+        }
+    }
 
     #[test]
     fn explicit_catalog_controls_remain_isolated_after_error_and_panic() {
@@ -1951,5 +2125,113 @@ mod tests {
             standard_online_markdownize_profile().tool_profile_hash,
             standard_online_markdownize_profile_with_bbox(false).tool_profile_hash
         );
+    }
+    #[derive(Debug)]
+    struct NoMetadataTrust;
+
+    impl crate::tool_lock::ManagedLocalTrustProvider for NoMetadataTrust {
+        fn binding(&self) -> kio_core::Result<String> {
+            panic!("embedding metadata read managed trust")
+        }
+        fn acquire(&self) -> kio_core::Result<crate::tool_lock::ManagedLocalTrustSnapshot> {
+            panic!("embedding metadata acquired a CA")
+        }
+    }
+
+    #[test]
+    fn embedding_metadata_matches_adapters_without_acquiring_trust() {
+        use kio_core::store_dir::{Publication, StoreDirectory, restrict_new_private_directory};
+        use std::path::Path;
+        let temporary = tempfile::tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let parent = StoreDirectory::open(temporary.path()).unwrap();
+        let child = parent.create_directory(Path::new("private")).unwrap();
+        restrict_new_private_directory(&child).unwrap();
+        let path = temporary.path().join("private");
+        let directory = StoreDirectory::from_retained(child, path.clone()).unwrap();
+        let rcgen::CertifiedKey { cert, .. } =
+            rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
+        directory
+            .write_atomic(
+                Path::new("ca.pem"),
+                cert.pem().as_bytes(),
+                Publication::CreateOnly,
+            )
+            .unwrap();
+        let ca = path.join("ca.pem");
+        let digest = crate::local_peer::capture_private_local_trust(&ca).unwrap();
+        let mut local = AdapterRuntimeSettings {
+            local_peer_ca_path: Some(ca),
+            local_peer_trust_digest: Some(digest),
+            local_peer_trust_binding: Some("local-ca:v1:g1:metadata-fixture".into()),
+            ..AdapterRuntimeSettings::default()
+        };
+        local.declarations.insert(
+            "embedding".into(),
+            crate::tool_lock::DeclaredAdapter {
+                tool_id: Some("qwen3_vl_embedding_local".into()),
+                kind: Some("offline_api".into()),
+                url: Some("https://127.0.0.1:8443".into()),
+                ..crate::tool_lock::DeclaredAdapter::default()
+            },
+        );
+        for (settings, execution) in [
+            (
+                local,
+                EmbeddingExecution::Offline(LocalEmbeddingExecution::Real),
+            ),
+            (
+                AdapterRuntimeSettings::default(),
+                EmbeddingExecution::Online(AdoptedEmbeddingExecution::Real),
+            ),
+            (
+                AdapterRuntimeSettings::default(),
+                EmbeddingExecution::Online(AdoptedEmbeddingExecution::Mock),
+            ),
+            (
+                AdapterRuntimeSettings::default(),
+                EmbeddingExecution::Online(AdoptedEmbeddingExecution::RequireIdempotencyToken),
+            ),
+            (
+                AdapterRuntimeSettings::default(),
+                EmbeddingExecution::DeterministicEvaluator,
+            ),
+        ] {
+            let adapter =
+                if execution == EmbeddingExecution::Online(AdoptedEmbeddingExecution::Real) {
+                    crate::tool_lock::with_test_role_auth("embedding", |selected| {
+                        embedding_adapter_for(Arc::new(selected.clone()), execution).unwrap()
+                    })
+                } else {
+                    embedding_adapter_for(Arc::new(settings.clone()), execution).unwrap()
+                };
+            let mut metadata_settings = settings;
+            // Metadata must not consume even a declared but unavailable key.
+            metadata_settings.tools_toml_path = None;
+            metadata_settings
+                .declarations
+                .entry("embedding".into())
+                .or_default()
+                .auth = Some("plain:METADATA_MUST_NOT_CONSUME_THIS".into());
+            metadata_settings.local_peer_ca_path = None;
+            metadata_settings.local_peer_trust_digest = None;
+            metadata_settings.local_peer_trust_binding = None;
+            metadata_settings.managed_local_trust = Some(Arc::new(NoMetadataTrust));
+            assert_eq!(
+                serde_json::to_value(embedding_descriptor(&metadata_settings, execution).unwrap())
+                    .unwrap(),
+                serde_json::to_value(adapter.descriptor()).unwrap()
+            );
+            assert_eq!(
+                serde_json::to_value(
+                    embedding_adapter_profile(&metadata_settings, execution).unwrap()
+                )
+                .unwrap(),
+                serde_json::to_value(adapter.profile()).unwrap()
+            );
+            assert_eq!(
+                embedding_preferred_request_kind(&metadata_settings, execution).unwrap(),
+                adapter.preferred_request_kind()
+            );
+        }
     }
 }

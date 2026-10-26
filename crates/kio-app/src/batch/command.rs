@@ -24,10 +24,10 @@ use crate::index::pipeline::online_markdownize_profile_for;
 use crate::index::pipeline::online_output_ref;
 use crate::invocation::Invocation;
 use crate::ledger_access::SYNC_RESEND_AUTHORIZED_REASON;
+use crate::ledger_access::incidental_paid_recovery_available;
 use crate::ledger_access::ledger_db_path;
 use crate::ledger_access::ledger_snapshot_to_kio;
 use crate::ledger_access::open_ledger_db;
-use crate::ledger_access::open_optional_ledger_db;
 use crate::ledger_access::recover_stale_sync_rows;
 use crate::markdownize::batch::poll_batch_markdownize_jobs;
 use crate::markdownize::execution::OnlineMarkdownizePrecondition;
@@ -78,6 +78,7 @@ use kio_pipeline::ledger::ops::recovery_settle_unknown;
 use kio_pipeline::ledger::ops::reset_contract_violations;
 use kio_pipeline::ledger::ops::resolve_abandon_selector;
 use kio_pipeline::ledger::ops::uuid_v7_timestamp_millis;
+use kio_pipeline::ledger::snapshot::LedgerSnapshotError;
 use kio_pipeline::markdownize::NormalizedInstanceManifest;
 use kio_pipeline::markdownize::UnitStatus;
 use kio_pipeline::markdownize::load_validated_normalized_instance_with_control;
@@ -153,8 +154,36 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
     let batch_offline = matches!(&args.command, Some(BatchCommand::Resume(resume)) if resume.offline)
         || matches!(&args.command, Some(BatchCommand::Retry(retry)) if retry.offline);
     let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
-    if !batch_offline && let Some(ledger) = open_optional_ledger_db(ctx.control)? {
-        recover_stale_sync_rows(&ledger, Some(&store), &scope_id(repo.kio_dir())?)?;
+    let markdown_ready =
+        crate::index::pipeline::optional_role_planning_ready(adapter_settings, "markdown")?;
+    let embedding_ready =
+        crate::index::pipeline::optional_role_planning_ready(adapter_settings, "embedding")?;
+    // Incidental recovery must not acquire billing authority for free work.
+    // Unknown observations retain paid state for explicit selected recovery.
+    let has_paid_stamp = store
+        .all()
+        .map_err(pipeline_to_kio)?
+        .iter()
+        .any(|task| task.reservation_id.is_some());
+    let recovery_ledger = if !batch_offline {
+        match incidental_paid_recovery_available(
+            &scope_id(repo.kio_dir())?,
+            has_paid_stamp,
+            ctx.control,
+        ) {
+            Ok(true) => Some(open_ledger_db(ctx.control)?),
+            Ok(false)
+            | Err(
+                LedgerSnapshotError::Missing
+                | LedgerSnapshotError::UnsafeIntegrity(_)
+                | LedgerSnapshotError::UnstableBusy(_),
+            ) => None,
+        }
+    } else {
+        None
+    };
+    if let Some(ledger) = recovery_ledger.as_ref() {
+        recover_stale_sync_rows(ledger, Some(&store), &scope_id(repo.kio_dir())?)?;
     }
     // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment).
     ensure_purge_epoch_initialized(repo.kio_dir(), repo.control())?;
@@ -164,21 +193,28 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
     // still-queued job extends its poll schedule. Folded into the Resume/Retry
     // ExecOutcome so "in-flight のみ残" maps to the batch exit-3 semantics.
     let mut batch_poll_outcome = ExecOutcome::default();
-    if !batch_offline && let Some(ledger) = open_optional_ledger_db(ctx.control)? {
-        batch_poll_outcome = poll_batch_markdownize_jobs(adapter_settings, &repo, &store, &ledger)?;
-        batch_poll_outcome.add(poll_batch_embedding_jobs(ctx, &repo, &ledger)?);
+    if let Some(ledger) = recovery_ledger.as_ref() {
+        if markdown_ready {
+            batch_poll_outcome =
+                poll_batch_markdownize_jobs(adapter_settings, &repo, &store, ledger)?;
+        }
+        if embedding_ready {
+            batch_poll_outcome.add(poll_batch_embedding_jobs(ctx, &repo, ledger)?);
+        }
     }
+    drop(recovery_ledger);
     // N1: a Tier B online hold is only lifted by an explicit `--send-secrets`
     // approval, never by a plain `batch resume`. Without this, resume's
     // Paused -> Pending flip would silently un-hold the candidate-secret task.
     let online_profile = online_markdownize_profile_for(&repo)?;
-    let secrets_approved = secrets_send_approved(
-        adapter_settings,
-        &repo,
-        approvals::AdapterRole::Markdown,
-        &online_profile.adapter_id,
-        &online_profile.tool_profile_hash,
-    );
+    let secrets_approved = markdown_ready
+        && secrets_send_approved(
+            adapter_settings,
+            &repo,
+            approvals::AdapterRole::Markdown,
+            &online_profile.adapter_id,
+            &online_profile.tool_profile_hash,
+        );
     match args.command {
         Some(BatchCommand::Resume(resume)) => {
             // QA30: same mutual-exclusion validation `kio index`/`kio repair`
@@ -202,6 +238,16 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
             }
             let changed = store
                 .update_matching(|task| {
+                    if (task.task_type == TaskType::Embedding && !embedding_ready)
+                        || (!markdown_ready
+                            && targets_standard_online_markdownize(
+                                store.kio_dir(),
+                                task,
+                                &online_output_ref(&online_profile.adapter_id),
+                            ))
+                    {
+                        return false;
+                    }
                     let held_secret = task.fallback_reason.as_deref() == Some(SECRETS_TIER_B_HOLD);
                     // QA2 (step4b-contract-tests-p3a.md §A, 04 §5.2): this generic
                     // flip already covers an auth hold (`hold_reason=auth`) — any
@@ -284,9 +330,23 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
             // execute_pending_markdownize_tasks selects it. On full success it
             // becomes Done, ending the silent data gap index_status showed as
             // fully enriched.
-            let incomplete_reenqueued = reenqueue_incomplete_markdownize_tasks(&store)?;
+            let incomplete_reenqueued = if markdown_ready {
+                reenqueue_incomplete_markdownize_tasks(&store)?
+            } else {
+                0
+            };
             let changed = store
                 .update_matching(|task| {
+                    if (task.task_type == TaskType::Embedding && !embedding_ready)
+                        || (!markdown_ready
+                            && targets_standard_online_markdownize(
+                                store.kio_dir(),
+                                task,
+                                &online_output_ref(&online_profile.adapter_id),
+                            ))
+                    {
+                        return false;
+                    }
                     if task.status == TaskStatus::Failed
                         // A validated online response with failed units has an immutable
                         // normalized manifest. Its unit-level retry plan owns recovery;
@@ -1026,10 +1086,10 @@ fn run_batch_resend_unknown(
     let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     let tasks = store.all().map_err(pipeline_to_kio)?;
     let matching_task_ids = match key.adapter_kind.as_str() {
-        "markdownize" if key.tool_profile_hash == markdown_profile.tool_profile_hash => tasks
-            .iter()
-            .filter(|task| {
-                task.task_type == TaskType::Markdownize
+        "markdownize" if key.tool_profile_hash == markdown_profile.tool_profile_hash => {
+            let mut matching = Vec::new();
+            for task in &tasks {
+                if task.task_type == TaskType::Markdownize
                     && task.input_hash == key.input_hash
                     && task.status == TaskStatus::Failed
                     && task.fallback_reason.as_deref() == Some(RESULT_UNKNOWN_REASON)
@@ -1038,13 +1098,20 @@ fn run_batch_resend_unknown(
                         task,
                         &online_output_ref(&markdown_profile.adapter_id),
                     )
-                    && matches!(
-                        classify_online_markdownize_precondition(repo, task),
-                        OnlineMarkdownizePrecondition::Send(_)
-                    )
-            })
-            .map(|task| task.task_id.clone())
-            .collect::<Vec<_>>(),
+                {
+                    match classify_online_markdownize_precondition(repo, task) {
+                        OnlineMarkdownizePrecondition::PolicyUnavailable(error) => {
+                            return Err(error);
+                        }
+                        OnlineMarkdownizePrecondition::Send(_) => {
+                            matching.push(task.task_id.clone())
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            matching
+        }
         "embedding"
             if embedding_profile
                 .as_ref()

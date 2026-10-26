@@ -21,6 +21,9 @@ serde_json.workspace = true
 windows-sys.workspace = true
 
 [dev-dependencies]
+# Authenticated loopback barrier fixtures reuse the adapter test TLS stack.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "pem"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12"] }
 assert_cmd = "2"
 kio-adapter = { path = "../kio-adapter" }
 kio-pipeline = { path = "../kio-pipeline" }

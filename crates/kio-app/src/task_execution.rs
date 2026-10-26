@@ -1,7 +1,6 @@
 use crate::approvals;
 use crate::batch::command::partial_retry_plan_from_instance;
 use crate::batch::command::reclaim_orphaned_running_tasks;
-use crate::commands::IndexArgs;
 use crate::egress::SECRETS_TIER_B_HOLD;
 use crate::egress::embedding_online_allowed;
 use crate::egress::persistent_network_allowed;
@@ -18,10 +17,10 @@ use crate::index::pipeline::offline_output_ref;
 use crate::index::pipeline::online_markdownize_profile_for;
 use crate::index::pipeline::online_output_ref;
 use crate::invocation::Invocation;
+use crate::ledger_access::BudgetObservation;
 use crate::ledger_access::RETIRED_NON_LIVE;
 use crate::ledger_access::TaskChargeOutcome;
 use crate::ledger_access::budget_cap_config;
-use crate::ledger_access::capture_search_budget_observation;
 use crate::ledger_access::declared_billable_kind_strings;
 use crate::ledger_access::ledger_db_path;
 use crate::ledger_access::ledger_snapshot_to_kio;
@@ -68,22 +67,18 @@ use kio_core::control::ControlHandle;
 use kio_core::scope::Repository;
 use kio_pipeline::budget::BudgetCapKind;
 use kio_pipeline::budget::BudgetCaps;
-use kio_pipeline::budget::BudgetEstimate;
 use kio_pipeline::budget::budget_warning;
 use kio_pipeline::budget::estimate_local_baseline_cost;
-use kio_pipeline::budget::evaluate_budget_with_caps;
 use kio_pipeline::budget::read_budget_policy;
 use kio_pipeline::budget::utc_month;
 use kio_pipeline::ledger::BatchState;
 use kio_pipeline::ledger::LedgerDb;
-use kio_pipeline::ledger::LedgerReadSnapshot;
 use kio_pipeline::ledger::Outcome;
 use kio_pipeline::ledger::RequestKind;
 use kio_pipeline::ledger::TaskKey as LedgerTaskKey;
 use kio_pipeline::ledger::ops::BilledAmount;
 use kio_pipeline::ledger::ops::TerminalWrite;
 use kio_pipeline::ledger::ops::get_batch_request;
-use kio_pipeline::ledger::ops::ledger_month_total;
 use kio_pipeline::ledger::ops::resolve_billing_from_reported_usage;
 use kio_pipeline::ledger::ops::terminal_transaction;
 use kio_pipeline::markdownize::MarkdownizeMode;
@@ -309,14 +304,10 @@ fn execute_pending_markdownize_tasks(
 ) -> Result<ExecOutcome> {
     let adapter_settings = ctx.settings;
 
-    let budget_caps = read_budget_policy(
-        user_config_toml_path(ctx.control),
-        repo.kio_dir().join("config.toml"),
-    )
-    .map_err(pipeline_to_kio)?;
-    let ledger = open_ledger_db(ctx.control)?;
-    let month = utc_month(&ctx.control.now_utc_seconds());
-    let scope_id = repo.scope_identity()?.scope_id;
+    if !crate::index::pipeline::optional_role_planning_ready(adapter_settings, "markdown")? {
+        return Ok(ExecOutcome::default());
+    }
+
     // N1a (defense in depth): even a Pending online markdownize task must not be
     // sent when its input is a Tier B (candidate-secret) file and the scope is not
     // `--send-secrets`-approved — in case the hold was cleared by some other path.
@@ -347,27 +338,47 @@ fn execute_pending_markdownize_tasks(
     // the loop below as before.
     let markdownize_adapter_kind = "markdownize";
     let markdown_profile_hash = online_profile.tool_profile_hash.clone();
-    let auth_revivable = if allow_auth_revive {
-        store
-            .all()
-            .map_err(pipeline_to_kio)?
-            .into_iter()
-            .filter(|task| {
-                task.task_type == TaskType::Markdownize
-                    && targets_standard_online_markdownize(store.kio_dir(), task, &output_ref)
-                    && task.status == TaskStatus::Paused
-                    && retry_kind_from_reason(task.fallback_reason.as_deref())
-                        == RetryErrorKind::AuthError
-                    && !matches!(
-                        classify_online_markdownize_precondition(repo, task),
-                        OnlineMarkdownizePrecondition::Retire
-                    )
-            })
-            .map(|task| task.task_id)
-            .collect::<BTreeSet<_>>()
-    } else {
-        BTreeSet::new()
-    };
+    let mut auth_revivable = BTreeSet::new();
+    if allow_auth_revive {
+        for task in store.all().map_err(pipeline_to_kio)? {
+            if task.task_type == TaskType::Markdownize
+                && targets_standard_online_markdownize(store.kio_dir(), &task, &output_ref)
+                && task.status == TaskStatus::Paused
+                && retry_kind_from_reason(task.fallback_reason.as_deref())
+                    == RetryErrorKind::AuthError
+            {
+                match classify_online_markdownize_precondition(repo, &task) {
+                    OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
+                    OnlineMarkdownizePrecondition::Retire => {}
+                    _ => {
+                        auth_revivable.insert(task.task_id);
+                    }
+                }
+            }
+        }
+    }
+    let has_paid_work = store.all().map_err(pipeline_to_kio)?.iter().any(|task| {
+        task.task_type == TaskType::Markdownize
+            && targets_standard_online_markdownize(store.kio_dir(), task, &output_ref)
+            && (task.reservation_id.is_some()
+                || auth_revivable.contains(&task.task_id)
+                || (task.status == TaskStatus::Pending
+                    && task_retry_due(task, ctx.control)
+                    && (secrets_approved || classify_secret(&task.input_path).is_none())))
+    });
+    if !has_paid_work {
+        return Ok(ExecOutcome::default());
+    }
+    // Only actual selected paid work consumes billing policy and authority.
+    // Preserve strict admission and retirement for every remaining paid task.
+    let budget_caps = read_budget_policy(
+        user_config_toml_path(ctx.control),
+        repo.kio_dir().join("config.toml"),
+    )
+    .map_err(pipeline_to_kio)?;
+    let ledger = open_ledger_db(ctx.control)?;
+    let month = utc_month(&ctx.control.now_utc_seconds());
+    let scope_id = repo.scope_identity()?.scope_id;
     if !auth_revivable.is_empty() {
         for task in store.all().map_err(pipeline_to_kio)? {
             if auth_revivable.contains(&task.task_id) {
@@ -438,6 +449,7 @@ fn execute_pending_markdownize_tasks(
         // hoisted ahead of the charge.
         let prepared_input = match classify_online_markdownize_precondition(repo, &task) {
             OnlineMarkdownizePrecondition::Send(prepared_input) => prepared_input,
+            OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
             OnlineMarkdownizePrecondition::AwaitConversion => {
                 // A live Office document remains honest Pending work until its bounded
                 // local conversion contract exists. Nothing was sent or charged.
@@ -1339,99 +1351,65 @@ pub(crate) fn is_text_native_media(media_type: &str) -> bool {
 
 pub(crate) fn budget_status(
     repo: &Repository,
-    ledger: Option<&LedgerReadSnapshot>,
+    observation: &BudgetObservation,
 ) -> Result<BudgetStatusResponse> {
     let caps = read_budget_policy(
         user_config_toml_path(repo.control()),
         repo.kio_dir().join("config.toml"),
     )
     .map_err(pipeline_to_kio)?;
-    let now = repo.control().now_utc_seconds();
-    let month = utc_month(&now);
     let scope_id = repo.scope_identity()?.scope_id;
-    let Some(ledger) = ledger else {
-        return Ok(BudgetStatusResponse {
-            month,
-            device_monthly_usd_cap: caps.device_monthly_usd_cap,
-            folder_monthly_usd_cap: caps.folder_monthly_usd_cap,
-            device_spent_usd: None,
-            folder_spent_usd: None,
-            device_remaining_usd: None,
-            folder_remaining_usd: None,
-            cap_kind: None,
-            device_per_adapter: caps.device_per_adapter,
-            hard_stop: caps.hard_stop,
-            warn_at_percent: caps.warn_at_percent,
-            warned: false,
-            warning: None,
-            ledger_status: Some("uninitialized".to_owned()),
-        });
-    };
-    let ledger_path = ledger_db_path(repo.control());
-    let device_spent = ledger
-        .month_total(None, None, &month)
-        .map_err(|error| ledger_snapshot_to_kio(&ledger_path.display().to_string(), error))?;
-    let folder_spent = ledger
-        .month_total(Some(&scope_id), None, &month)
-        .map_err(|error| ledger_snapshot_to_kio(&ledger_path.display().to_string(), error))?;
-    let device_remaining = caps.device_monthly_usd_cap - device_spent;
-    let folder_remaining = caps.folder_monthly_usd_cap.map(|cap| cap - folder_spent);
-    let cap_kind = match folder_remaining {
-        Some(folder) if folder <= device_remaining => BudgetCapKind::Folder,
+    let mut reason = observation.reason.clone();
+    let totals = observation.snapshot.as_ref().and_then(|ledger| {
+        let totals = (|| {
+            let device = ledger.month_total(None, None, &observation.month)?;
+            let folder = ledger.month_total(Some(&scope_id), None, &observation.month)?;
+            Ok::<_, kio_pipeline::ledger::LedgerSnapshotError>((device, folder))
+        })();
+        match totals {
+            Ok(totals) => Some(totals),
+            Err(error) => {
+                reason = Some(
+                    ledger_snapshot_to_kio(
+                        &ledger_db_path(repo.control()).display().to_string(),
+                        error,
+                    )
+                    .error_code()
+                    .to_owned(),
+                );
+                None
+            }
+        }
+    });
+    let device_remaining = totals.map(|(device, _)| caps.device_monthly_usd_cap - device);
+    let folder_remaining =
+        totals.and_then(|(_, folder)| caps.folder_monthly_usd_cap.map(|cap| cap - folder));
+    let cap_kind = device_remaining.map(|device| match folder_remaining {
+        Some(folder) if folder <= device => BudgetCapKind::Folder,
         _ => BudgetCapKind::Device,
-    };
-    // F5: surface the non-blocking `warn_at_percent` warning and the active
-    // policy (hard_stop / warn_at_percent) alongside the numbers.
-    let warning = budget_warning(&caps, device_spent, folder_spent);
+    });
+    let warning = totals.and_then(|(device, folder)| budget_warning(&caps, device, folder));
     Ok(BudgetStatusResponse {
-        month,
+        budget_status: if totals.is_some() { "known" } else { "unknown" }.to_owned(),
+        budget_reason: reason.clone(),
+        month: observation.month.clone(),
         device_monthly_usd_cap: caps.device_monthly_usd_cap,
         folder_monthly_usd_cap: caps.folder_monthly_usd_cap,
-        device_spent_usd: Some(device_spent),
-        folder_spent_usd: Some(folder_spent),
-        device_remaining_usd: Some(device_remaining),
+        device_spent_usd: totals.map(|(device, _)| device),
+        folder_spent_usd: totals.map(|(_, folder)| folder),
+        device_remaining_usd: device_remaining,
         folder_remaining_usd: folder_remaining,
-        cap_kind: Some(cap_kind),
+        cap_kind,
         device_per_adapter: caps.device_per_adapter,
-        // QA11 (step4b-contract-tests-p3a.md §D): folder per_adapter does not
-        // exist (04 §5.4 — device-layer only), so `kio status` must not
-        // present a constraint that is not real.
         hard_stop: caps.hard_stop,
         warn_at_percent: caps.warn_at_percent,
         warned: warning.is_some(),
         warning,
-        ledger_status: None,
+        ledger_status: reason
+            .as_deref()
+            .filter(|code| *code == "KIO-E-LEDGER-UNINITIALIZED-001")
+            .map(|_| "uninitialized".to_owned()),
     })
-}
-
-/// F5: the current scope's non-blocking budget warning (or `None`), for embedding
-/// in `index` / `batch` result JSON. Reads the caps and this month's ledger totals.
-pub(crate) fn scope_budget_warning(repo: &Repository) -> Result<Option<String>> {
-    let caps = read_budget_policy(
-        user_config_toml_path(repo.control()),
-        repo.kio_dir().join("config.toml"),
-    )
-    .map_err(pipeline_to_kio)?;
-    let path = ledger_db_path(repo.control());
-    let (month, snapshot) = capture_search_budget_observation(&path, repo.control())?;
-    let Some(snapshot) = snapshot else {
-        return Ok(None);
-    };
-    let scope_id = repo.scope_identity()?.scope_id;
-    let device_spent = snapshot
-        .month_total(None, None, &month)
-        .map_err(|error| ledger_snapshot_to_kio(&path.display().to_string(), error))?;
-    let folder_spent = snapshot
-        .month_total(Some(&scope_id), None, &month)
-        .map_err(|error| ledger_snapshot_to_kio(&path.display().to_string(), error))?;
-    Ok(budget_warning(&caps, device_spent, folder_spent))
-}
-
-/// Read-only enqueue classification is distinct from mutable billing authority.
-#[derive(Clone, Copy)]
-pub(crate) enum EnqueueBudget {
-    Uninitialized,
-    Available { device: f64, folder: Option<f64> },
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1441,14 +1419,10 @@ pub(crate) fn enqueue_online_placeholder_task(
     task_store: &TaskStore,
     candidate: &ScanCandidate,
     raw_hash: &str,
-    scope_id: &str,
     network_allowed: bool,
-    args: &IndexArgs,
     created_at: &str,
     result: &mut IndexPipelineResult,
     ledger: Option<&LedgerDb>,
-    enqueue_budget: EnqueueBudget,
-    budget_caps: &BudgetCaps,
     unsupported_store: &UnsupportedInputStore,
     unsupported_by_path: &mut BTreeMap<String, UnsupportedInputDisposition>,
     office_conversion_unavailable_paths: &mut BTreeSet<String>,
@@ -1566,6 +1540,11 @@ pub(crate) fn enqueue_online_placeholder_task(
         if !stale {
             continue;
         }
+        // A missing observation is not authority to discard a retained paid
+        // claim. Leave it recoverable until its ledger can settle the charge.
+        if ledger.is_none() && task.reservation_id.is_some() {
+            continue;
+        }
         let key = task_ledger_key(
             &reservation_scope_id,
             markdownize_adapter_kind,
@@ -1603,6 +1582,26 @@ pub(crate) fn enqueue_online_placeholder_task(
     //     (next_retry_at = None) would bypass the retry backoff gate and cause
     //     an extra API call. Failed tasks are owned by `kio batch retry`, which
     //     honors `next_retry_at` and the per-error retry budget.
+    let local_profile = local_ocr.map(kio_adapter::local_ocr_markdownize::profile_for);
+    let targets_selected = |task: &TaskDescriptor| {
+        if let Some(profile) = &local_profile {
+            match kio_pipeline::task::validate_task_output_ref(task_store.kio_dir(), task) {
+                Ok(kio_pipeline::task::TaskOutputRef::Offline { .. }) => {
+                    task.output_ref == output_ref
+                }
+                Ok(kio_pipeline::task::TaskOutputRef::NormalizedInstance {
+                    tool_profile_hash,
+                    ..
+                }) => {
+                    task.fallback_reason.as_deref() == Some("local_adapter_done")
+                        && tool_profile_hash == profile.tool_profile_hash
+                }
+                _ => false,
+            }
+        } else {
+            targets_standard_online_markdownize(task_store.kio_dir(), task, &output_ref)
+        }
+    };
     if let Some(existing) = task_store
         .all()
         .map_err(pipeline_to_kio)?
@@ -1611,26 +1610,26 @@ pub(crate) fn enqueue_online_placeholder_task(
             if task.input_path != candidate.input_path || task.input_hash != raw_hash {
                 return false;
             }
-            if task.bbox_annotation_enabled != Some(effective_bbox_policy) {
+            if local_ocr.is_none() && task.bbox_annotation_enabled != Some(effective_bbox_policy) {
                 return false;
             }
             match task.status {
-                TaskStatus::Pending | TaskStatus::Paused => {
-                    targets_standard_online_markdownize(task_store.kio_dir(), task, &output_ref)
-                }
+                TaskStatus::Pending | TaskStatus::Paused => targets_selected(task),
                 TaskStatus::Done | TaskStatus::Partial => {
-                    task.fallback_reason.as_deref() == Some("online_adapter_done")
+                    if local_ocr.is_some() {
+                        targets_selected(task)
+                    } else {
+                        task.fallback_reason.as_deref() == Some("online_adapter_done")
+                    }
                 }
                 // R19-3: a `retired_non_live` Failed task must NOT block a fresh enqueue
                 // when the (path,hash) identity reappears (revert/restore). Other Failed
                 // tasks stay deduped (owned by `batch retry`, which honors backoff).
                 TaskStatus::Failed => {
-                    targets_standard_online_markdownize(task_store.kio_dir(), task, &output_ref)
+                    targets_selected(task)
                         && task.fallback_reason.as_deref() != Some(RETIRED_NON_LIVE)
                 }
-                TaskStatus::Running => {
-                    targets_standard_online_markdownize(task_store.kio_dir(), task, &output_ref)
-                }
+                TaskStatus::Running => targets_selected(task),
                 TaskStatus::Skipped => false,
             }
         })
@@ -1643,23 +1642,8 @@ pub(crate) fn enqueue_online_placeholder_task(
         return Ok(());
     }
 
-    let estimate = BudgetEstimate {
-        scope_id: scope_id.to_owned(),
-        task_type: TaskType::Markdownize,
-        estimated_usd: estimate_online_markdownize_cost(
-            candidate.size_bytes,
-            effective_bbox_policy,
-        ),
-        adapter_id: Some(online_profile.adapter_id.clone()),
-    };
-    let budget = match enqueue_budget {
-        EnqueueBudget::Available { device, folder } => {
-            evaluate_budget_with_caps(&estimate, device, folder, matches_batch_override(args))
-        }
-        EnqueueBudget::Uninitialized => {
-            evaluate_budget_with_caps(&estimate, f64::NEG_INFINITY, Some(f64::NEG_INFINITY), false)
-        }
-    };
+    let estimated_usd =
+        estimate_online_markdownize_cost(candidate.size_bytes, effective_bbox_policy);
     // R10-7: an online markdownize task can only ever be DRIVEN by `batch`, whose
     // gate is the persistent per-adapter opt-in (`persistent_network_allowed`). A
     // one-shot `--online --yes` sets per-invocation `network_allowed = true` but
@@ -1677,19 +1661,13 @@ pub(crate) fn enqueue_online_placeholder_task(
         offline_markdownize_enqueue_status(secrets_hold)
     } else if secrets_hold {
         (TaskStatus::Paused, Some(SECRETS_TIER_B_HOLD))
-    } else if matches!(enqueue_budget, EnqueueBudget::Uninitialized) {
+    } else {
+        // A new paid placeholder is held until the invocation's single final
+        // display observation can classify its budget. This grants no admission.
         (
             TaskStatus::Paused,
             Some(LEDGER_INITIALIZATION_REQUIRED_REASON),
         )
-    } else if !budget.allowed && budget_caps.hard_stop {
-        // F5: only a hard-stop cap pauses the task. Under soft-stop the online task
-        // is enqueued normally and its over-cap charge is recorded at execution.
-        (TaskStatus::Paused, Some("budget_exceeded"))
-    } else if !markdownize_drivable {
-        (TaskStatus::Pending, Some("network_opt_in_required"))
-    } else {
-        (TaskStatus::Pending, Some("ready_for_online_adapter"))
     };
     let mut task = task_descriptor(
         repo,
@@ -1704,6 +1682,19 @@ pub(crate) fn enqueue_online_placeholder_task(
     );
     task.bbox_annotation_enabled = Some(effective_bbox_policy);
     task_store.append(&task).map_err(pipeline_to_kio)?;
+    if local_ocr.is_none() && !secrets_hold {
+        result
+            .deferred_budget
+            .push(crate::index::pipeline::DeferredPaidPlaceholder {
+                expected: task.clone(),
+                estimated_usd,
+                ready_reason: if markdownize_drivable {
+                    "ready_for_online_adapter"
+                } else {
+                    "network_opt_in_required"
+                },
+            });
+    }
     match status {
         TaskStatus::Paused => result.paused_tasks += 1,
         TaskStatus::Pending => result.pending_online_tasks += 1,
@@ -1712,45 +1703,8 @@ pub(crate) fn enqueue_online_placeholder_task(
     Ok(())
 }
 
-fn matches_batch_override(_args: &IndexArgs) -> bool {
-    false
-}
-
-/// This month's remaining `(device, folder)` budget for the `(scope, adapter)`
-/// filter, shared by the enqueue-time pre-check
-/// (`enqueue_online_placeholder_task`/`enqueue_embedding_tasks`'s siblings), the
-/// send-time check-then-reserve (`reserve_or_reuse_task_charge`, which
-/// independently re-checks atomically inside its own `BEGIN IMMEDIATE` Tx — this
-/// function is for the READ-ONLY enqueue-time estimate, not a substitute for
-/// that atomicity), and the status/warning reports (`budget_status` /
-/// `scope_budget_warning`). `ledger_month_total` (CL59) already sums confirmed
-/// `cost_ledger` charges plus unterminated `batch_requests` reservations — the
-/// retired JSONL design's separate reclaim-ledger netting
-/// (`net_monthly_spent`/R17-3/R18-3) has no equivalent here: this ledger never
-/// records a charge until a definitive terminal Tx, so there is nothing to
-/// reclaim after the fact (see the implementation report).
-pub(crate) fn budget_remaining_for_adapter(
-    ledger: &LedgerDb,
-    budget_caps: &BudgetCaps,
-    scope_id: &str,
-    adapter_kind: &str,
-) -> Result<(f64, Option<f64>)> {
-    let month = utc_month(&ledger.control().now_utc_seconds());
-    let conn = &ledger;
-    let device_spent = ledger_month_total(conn, None, None, &month).map_err(pipeline_to_kio)?;
-    let folder_spent =
-        ledger_month_total(conn, Some(scope_id), None, &month).map_err(pipeline_to_kio)?;
-    let device_adapter_spent =
-        ledger_month_total(conn, None, Some(adapter_kind), &month).map_err(pipeline_to_kio)?;
-    Ok(budget_remaining_from_totals(
-        budget_caps,
-        adapter_kind,
-        device_spent,
-        folder_spent,
-        device_adapter_spent,
-    ))
-}
-
+/// Remaining paid budget from the invocation's captured monthly totals.
+/// Paid reservation still rechecks caps atomically at actual admission.
 pub(crate) fn budget_remaining_from_totals(
     budget_caps: &BudgetCaps,
     adapter_kind: &str,

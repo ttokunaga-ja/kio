@@ -211,9 +211,13 @@ pub(crate) fn resolve_invocation_lane(
     } else if over.batch {
         LANE_CELL_BATCH
     } else {
-        let configured = scope_config
-            .and_then(kio_core::scope::read_adapter_lane)
-            .or_else(|| kio_core::scope::read_adapter_lane(&user_config_toml_path(control)));
+        let configured = match scope_config.and_then(kio_core::scope::read_adapter_lane) {
+            Some(lane) => Some(lane),
+            None => {
+                crate::settings::validate_user_adapter_lane(control)?;
+                kio_core::scope::read_adapter_lane(&user_config_toml_path(control))
+            }
+        };
         match configured.as_deref() {
             Some("realtime") => LANE_CELL_REALTIME,
             _ => LANE_CELL_BATCH,

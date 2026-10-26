@@ -884,6 +884,45 @@ pub(crate) fn validate_read_snapshot_from_retained_parent(
     validate_bound_connection(conn, &authority, &checkpoint)
 }
 
+/// Select scoped recovery only from a validated private copy and its retained
+/// live authority. This never adopts, cleans up, or writes source artifacts.
+pub(crate) fn read_snapshot_has_paid_recovery(
+    parent: &std::fs::File,
+    parent_path: &Path,
+    main: &str,
+    conn: &Connection,
+    scope_id: &str,
+    control: &ControlHandle,
+) -> Result<bool> {
+    let fs =
+        FsSession::acquire_retained_snapshot_parent(parent, parent_path, main, control.clone())?;
+    let (authority, checkpoint) = read_authority(&fs)?;
+    validate_bound_connection(conn, &authority, &checkpoint)?;
+    let active: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM batch_requests WHERE scope_id=?1 AND adapter_kind IN ('markdownize','embedding') AND (state IN (0,1) OR (request_kind='batch' AND state IN (2,3) AND intent_token IS NOT NULL)))",
+        [scope_id], |row| row.get(0),
+    )?;
+    // Settled embeddings can retain exact validated results after remote
+    // cleanup and task loss; clean historical rows alone are not work.
+    let staged = if scope_id == super::TaskKey::DEVICE_SCOPE_ID {
+        false
+    } else {
+        !super::embedding_job::pending_embedding_publications_from_bound_snapshot(
+            conn,
+            &fs,
+            &authority.ledger_id,
+            &authority.era,
+            scope_id,
+            1,
+        )?
+        .is_empty()
+    };
+    fs.revalidate_boundary()?;
+    let (after_authority, after_checkpoint) = read_authority(&fs)?;
+    validate_bound_connection(conn, &after_authority, &after_checkpoint)?;
+    Ok(active || staged)
+}
+
 /// Inspect lifecycle artifacts through a parent already retained by the
 /// snapshot reader. This is the all-absent counterpart to retained snapshot
 /// validation and cannot re-import a mutable `/dev/fd/N` diagnostic spelling.

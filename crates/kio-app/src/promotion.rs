@@ -351,7 +351,7 @@ fn plan_online_markdownize_promotion(
         .iter()
         .map(|entry| (entry.path.as_str(), entry))
         .collect::<BTreeMap<_, _>>();
-    let max_input_bytes = effective_max_input_bytes(repo);
+    let max_input_bytes = effective_max_input_bytes(repo)?;
     // Establish that the task still describes the live HEAD/working identity
     // before opening its normalized output. A corrupt output for the current
     // identity is fatal, but a stale previous generation must not break a later

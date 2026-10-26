@@ -1855,6 +1855,18 @@ fn is_xdg_state_inside_scope(scope_path: &Path, path: &Path) -> bool {
         .canonicalize()
         .unwrap_or_else(|_| scope_path.to_path_buf());
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Local execution records are operational state even when STATE is unset
+    // and HOME itself is indexed. Reserve only the active Kio-owned subtree;
+    // unrelated data under .local/state and prefix siblings remain knowledge.
+    let local_execution = kio_core::xdg::xdg_dir("XDG_STATE_HOME")
+        .or_else(|| kio_core::xdg::home_dir().map(|home| home.join(".local/state")))
+        .map(|state| state.join("kio/local-execution"));
+    if local_execution
+        .map(|root| root.canonicalize().unwrap_or(root))
+        .is_some_and(|root| path.starts_with(root))
+    {
+        return true;
+    }
     [
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",

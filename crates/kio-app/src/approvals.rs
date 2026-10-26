@@ -119,6 +119,9 @@ fn configured_profile(
     repo: &Repository,
     role: AdapterRole,
 ) -> Result<Option<(String, String)>> {
+    adapter_settings
+        .role_configuration_ready(role.as_str())
+        .map_err(crate::object_persistence::adapter_to_kio)?;
     // Validate the declared role before its optional execution resolver: an
     // invalid declaration must remain an error, not look like an absent lane.
     if let Some(declared) = adapter_settings.declared_adapter(role.as_str()) {
@@ -168,17 +171,50 @@ fn configured_binding(
 fn configured_bindings(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
+    selected: Option<&str>,
 ) -> Result<Vec<(AdapterRole, GrantBinding)>> {
     let mut bindings = Vec::new();
     for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
-        if let Some(binding) =
-            configured_binding(adapter_settings, repo, role, GrantOperation::Network)?
-        {
-            bindings.push((role, binding));
+        if let Some(selected) = selected {
+            let target_role = match selected {
+                "gemini_embedding_2" | "qwen3_vl_embedding_local" => Some(AdapterRole::Embedding),
+                "mistral_ocr_markdownize" | "paddleocr_vl_local" => Some(AdapterRole::Markdown),
+                _ => None,
+            };
+            if target_role.is_some_and(|target| target != role) {
+                continue;
+            }
         }
+        let Some((tool_id, profile)) = configured_profile(adapter_settings, repo, role)? else {
+            continue;
+        };
+        if selected.is_some_and(|selected| selected != tool_id) {
+            continue;
+        }
+        bindings.push((
+            role,
+            binding(
+                adapter_settings,
+                repo,
+                role,
+                &tool_id,
+                &profile,
+                GrantOperation::Network,
+            )?,
+        ));
     }
     bindings.sort_by(|a, b| a.1.tool_id.cmp(&b.1.tool_id));
     Ok(bindings)
+}
+
+fn optional_trust_readiness(error: &KioError) -> bool {
+    error
+        .context()
+        .get("dependency")
+        .and_then(Value::as_str)
+        .is_some_and(|dependency| {
+            matches!(dependency, "managed_https_trust" | "adapter_configuration")
+        })
 }
 
 /// Admission for an explicitly online index invocation. Individual adapters
@@ -188,7 +224,20 @@ pub(crate) fn any_network_allowed(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
 ) -> Result<bool> {
-    for (role, binding) in configured_bindings(adapter_settings, repo)? {
+    let mut unavailable = None;
+    for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
+        let binding =
+            match configured_binding(adapter_settings, repo, role, GrantOperation::Network) {
+                Ok(Some(binding)) => binding,
+                Ok(None) => continue,
+                Err(error) if optional_trust_readiness(&error) => {
+                    if unavailable.is_none() {
+                        unavailable = Some(error);
+                    }
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
         if allowed(
             adapter_settings,
             repo,
@@ -199,6 +248,9 @@ pub(crate) fn any_network_allowed(
         )? {
             return Ok(true);
         }
+    }
+    if let Some(error) = unavailable {
+        return Err(error);
     }
     Ok(false)
 }
@@ -259,7 +311,11 @@ pub(crate) fn allowed(
     if current_tool != tool_id || current_profile != profile {
         return Ok(false);
     }
-    let expected = binding(adapter_settings, repo, role, tool_id, profile, operation)?;
+    let expected = match binding(adapter_settings, repo, role, tool_id, profile, operation) {
+        Ok(binding) => binding,
+        Err(error) if optional_trust_readiness(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
     if expected.execution_mode == "online_api" {
         let document = repo.read_config_document()?;
         let config: toml::Value = toml::from_str(&document)
@@ -336,8 +392,41 @@ pub(crate) fn approve(
             "preview conflicts with --yes; --resume requires one adapter",
         ));
     }
+    let matches_target = |role: AdapterRole| {
+        tool.is_none_or(|tool| match role {
+            AdapterRole::Embedding => {
+                matches!(tool, "gemini_embedding_2" | "qwen3_vl_embedding_local")
+            }
+            AdapterRole::Markdown => {
+                matches!(tool, "mistral_ocr_markdownize" | "paddleocr_vl_local")
+            }
+        })
+    };
+    for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
+        if matches_target(role) {
+            adapter_settings
+                .role_credentials_ready(role.as_str())
+                .map_err(crate::object_persistence::adapter_to_kio)?;
+        }
+    }
     let repo = ctx.open_recovery_repository()?;
-    let selected = configured_bindings(adapter_settings, &repo)?
+    for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
+        if !matches_target(role) {
+            continue;
+        }
+        if let Some(declared) = adapter_settings.declared_adapter(role.as_str())
+            && declared.kind.as_deref() == Some("offline_api")
+            && let Some((tool_id, _)) = configured_profile(adapter_settings, &repo, role)?
+            && tool.is_none_or(|selected| selected == tool_id)
+            && let Some(url) = declared.url.as_deref()
+            && url.starts_with("https://")
+        {
+            adapter_settings
+                .authenticated_local_endpoint(role.as_str(), url)
+                .map_err(crate::object_persistence::adapter_to_kio)?;
+        }
+    }
+    let selected = configured_bindings(adapter_settings, &repo, tool)?
         .into_iter()
         .filter(|(_, b)| tool.is_none_or(|tool| b.tool_id == tool))
         .collect::<Vec<_>>();
@@ -375,7 +464,7 @@ pub(crate) fn approve(
     // Lock order is scope then device. Sends already hold scope writer leases;
     // device grant publication never acquires an additional scope lease.
     let _lock = repo.lock_store_in_session(repo.lock_session())?;
-    let refreshed = configured_bindings(adapter_settings, &repo)?
+    let refreshed = configured_bindings(adapter_settings, &repo, tool)?
         .into_iter()
         .filter(|(_, b)| tool.is_none_or(|tool| b.tool_id == tool))
         .collect::<Vec<_>>();
@@ -603,7 +692,7 @@ pub(crate) fn status(
             .is_none_or(|id| row.get("tool_id").and_then(Value::as_str) == Some(id))
     });
     let mut effective = Vec::new();
-    let configured = configured_bindings(adapter_settings, &repo);
+    let configured = configured_bindings(adapter_settings, &repo, args.tool_id.as_deref());
     for record in &records {
         // Roles are carried by current configuration, never guessed from a
         // historical grant's tool ID. Unsupported/absent identities stay inert.

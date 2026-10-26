@@ -427,7 +427,7 @@ pub(crate) fn phase1_intent(
     // `batch_requests` (every other write is a CAS UPDATE/DELETE against an
     // already-existing row), so gating here — rather than at each of its
     // several callers (`check_then_reserve`'s two branches, `device_claim`,
-    // `record_free_local_charge`, and the direct `bypass_cap_denial` call in
+    // and the direct `bypass_cap_denial` call in
     // `reserve_or_reuse_task_charge`) — covers every path that could start a
     // brand-new online submission. An already-open row (the "Reused" path in
     // `reserve_or_reuse_task_charge`, which never reaches this function at
@@ -3006,8 +3006,8 @@ mod tests {
 
     /// `phase1_intent` is the SOLE `batch_requests` INSERT — gating it here
     /// covers every caller (`check_then_reserve`'s two branches,
-    /// `device_claim`, and `kio-cli`'s `record_free_local_charge`/
-    /// `reserve_or_reuse_task_charge` bypass branch). No row is created —
+    /// `device_claim`, and `reserve_or_reuse_task_charge`'s bypass branch).
+    /// No row is created —
     /// the gate refuses BEFORE the INSERT runs.
     #[test]
     fn qa14_phase1_intent_refuses_a_new_submission_while_restore_marker_present() {

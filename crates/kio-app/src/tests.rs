@@ -1835,7 +1835,8 @@ fn search_index_status_uses_preflight_month() {
             )
             .unwrap();
             assert_eq!(
-                status.budget_paused, paused,
+                status.budget_paused,
+                Some(paused),
                 "device_only={device_only} month={month}"
             );
         }
@@ -4568,3 +4569,12 @@ fn secret_typed_owner_cannot_be_bypassed_by_a_public_same_scope_link() {
         BTreeSet::from([hash])
     );
 }
+
+#[path = "operation_preconditions_tests.rs"]
+mod operation_preconditions_tests;
+
+#[path = "budget_retirement_preconditions_tests.rs"]
+mod budget_retirement_preconditions_tests;
+
+#[path = "caller_ledger_independence_tests.rs"]
+mod caller_ledger_independence_tests;

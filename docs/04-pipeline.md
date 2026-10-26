@@ -996,8 +996,10 @@ local state は owner-private、identity-bound に検証し、破損を成功扱
 embedding と新 claim を行わない。無料 state の回復で有料 job の送信済み／未送信を推測しない。
 
 予算観測はローカル結果の前提条件ではない。search / scope status / index は、取得できた同じ
-read-only snapshot と UTC 集計月を invocation 内で共有する。未初期化・不完全・破損・unsafe・busy・
-不安定・資源不足で取得不能なら `budget_status=unknown` と `budget_reason` を表示し、
+read-only snapshot と UTC 集計月を invocation 内で共有する。index の表示用 snapshot は root と child の
+当該 invocation の処理が終わった後に取得し、その処理で確定した有料支出も表示・警告に反映する。
+有料 admission の計画・予約・回復は現在の ledger authority で別に検証し、表示用 snapshot で代替しない。
+未初期化・不完全・破損・unsafe・busy・不安定・資源不足で取得不能なら `budget_status=unknown` と `budget_reason` を表示し、
 ローカル結果を返す。`budget_paused` は unknown 時に `null`、既知時だけ従来の boolean とし、
 支出ゼロ／cap 未到達という意味の `false` に変換しない。unsafe な source は開き続けず、
 理由に元の typed error code を残す。この表示によって有料 admission を許可しない。

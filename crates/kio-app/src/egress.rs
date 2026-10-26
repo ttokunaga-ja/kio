@@ -48,6 +48,11 @@ pub(crate) fn persistent_network_allowed(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
 ) -> Result<bool> {
+    match adapter_settings.role_configuration_ready("markdown") {
+        Ok(()) => {}
+        Err(kio_adapter::AdapterError::RuntimeConfiguration { .. }) => return Ok(false),
+        Err(error) => return Err(adapter_to_kio(error)),
+    }
     let profile = match active_local_ocr_execution_with_control(adapter_settings, repo.control()) {
         Some(execution) => kio_adapter::local_ocr_markdownize::profile_for(execution),
         None => online_markdownize_profile_for(repo)?,
@@ -84,6 +89,9 @@ pub(crate) fn local_markdownize_transport_allowed(
     profile: &AdapterProfile,
     needs_secret: bool,
 ) -> Result<bool> {
+    adapter_settings
+        .role_credentials_ready("markdown")
+        .map_err(adapter_to_kio)?;
     current_embedding_policy(repo)?
         .revalidate()
         .map_err(pipeline_to_kio)?;
@@ -120,6 +128,9 @@ pub(crate) fn admit_embedding_transport(
     if embedding_is_deterministic(execution) {
         return Ok(());
     }
+    adapter_settings
+        .role_credentials_ready("embedding")
+        .map_err(adapter_to_kio)?;
     current_policy.revalidate().map_err(pipeline_to_kio)?;
     if !persistent_network_allowed_for(
         adapter_settings,
@@ -273,17 +284,46 @@ pub(crate) fn materialize_tool_lock(
     // A non-multimodal profile is rejected here (03 §7): `load_tool_lock` fails
     // with KIO-E-EMBED-MODALITY-001, which we surface as exit 2 (scenario (e))
     // *before* any indexing happens.
-    if let Some(entry) = embedding_tool_lock_entry(adapter_settings, repo.control())?
-        && let Some(object) = value.as_object_mut()
-    {
-        object.insert("embedding".to_owned(), entry);
+    let path = repo.kio_dir().join("tool-lock.json");
+    let existing = match std::fs::symlink_metadata(&path) {
+        Ok(_) => Some(
+            serde_json::from_slice::<Value>(&kio_core::cas::read_bounded_regular_file(
+                &path,
+                1024 * 1024,
+            )?)
+            .map_err(|error| KioError::schema(error.to_string()))?,
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
+    };
+    let native_embedding = embedding_execution(adapter_settings, repo.control())
+        .is_some_and(embedding_is_deterministic);
+    for role in ["markdown", "embedding"] {
+        let unavailable = match adapter_settings.role_configuration_ready(role) {
+            Ok(()) => false,
+            Err(kio_adapter::AdapterError::RuntimeConfiguration { .. }) => true,
+            Err(error) => return Err(adapter_to_kio(error)),
+        };
+        if unavailable && !(role == "embedding" && native_embedding) {
+            if let Some(retained) = existing.as_ref().and_then(|value| value.get(role)) {
+                value[role] = retained.clone();
+            } else {
+                value
+                    .as_object_mut()
+                    .expect("tool lock object")
+                    .remove(role);
+            }
+        } else if role == "embedding"
+            && let Some(entry) = embedding_tool_lock_entry(adapter_settings, repo.control())?
+        {
+            value[role] = entry;
+        }
     }
     let bytes =
         serde_json::to_vec_pretty(&value).map_err(|err| KioError::schema(err.to_string()))?;
     // `adapter_to_kio` reads the code off `ConfigSchemaCoded` and gives it
     // exit 2, so KIO-E-EMBED-MODALITY-001 needs no special case here.
     load_tool_lock(&bytes).map_err(adapter_to_kio)?;
-    let path = repo.kio_dir().join("tool-lock.json");
     atomic_overwrite_file(&path, &bytes)
 }
 
@@ -322,6 +362,9 @@ pub(crate) fn active_markdownize_profile_for(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
 ) -> Result<AdapterProfile> {
+    adapter_settings
+        .role_configuration_ready("markdown")
+        .map_err(adapter_to_kio)?;
     match active_local_ocr_execution_with_control(adapter_settings, repo.control()) {
         Some(execution) => Ok(kio_adapter::local_ocr_markdownize::profile_for(execution)),
         None => online_markdownize_profile_for(repo),
@@ -426,20 +469,28 @@ pub(crate) fn record_quarantine_candidates(
     kio_core::private_fs::verify_private_directory_handle(&directory)?;
     directory.append_private(Path::new("quarantine.jsonl"), &[])?;
     for candidate in &preview.candidates {
-        let profile =
-            match active_local_ocr_execution_with_control(adapter_settings, repo.control())
-                .filter(|_| local_ocr_handles_media_type(&candidate.media_type))
-            {
-                Some(execution) => kio_adapter::local_ocr_markdownize::profile_for(execution),
-                None => online_markdownize_profile_for(repo)?,
-            };
-        let secrets_approved = secrets_send_approved(
-            adapter_settings,
-            repo,
-            approvals::AdapterRole::Markdown,
-            &profile.adapter_id,
-            &profile.tool_profile_hash,
-        );
+        let secrets_approved = match adapter_settings.role_configuration_ready("markdown") {
+            Ok(()) => {
+                let profile =
+                    match active_local_ocr_execution_with_control(adapter_settings, repo.control())
+                        .filter(|_| local_ocr_handles_media_type(&candidate.media_type))
+                    {
+                        Some(execution) => {
+                            kio_adapter::local_ocr_markdownize::profile_for(execution)
+                        }
+                        None => online_markdownize_profile_for(repo)?,
+                    };
+                secrets_send_approved(
+                    adapter_settings,
+                    repo,
+                    approvals::AdapterRole::Markdown,
+                    &profile.adapter_id,
+                    &profile.tool_profile_hash,
+                )
+            }
+            Err(kio_adapter::AdapterError::RuntimeConfiguration { .. }) => false,
+            Err(error) => return Err(adapter_to_kio(error)),
+        };
         // N1b: record Tier A (excluded from ingest) AND Tier B (ingested locally
         // but held from online send) so `kio status` surfaces both. Tier B carries
         // its live disposition — "hold" until `--send-secrets`, then "send_approved".

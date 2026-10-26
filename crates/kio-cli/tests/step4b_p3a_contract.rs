@@ -662,15 +662,14 @@ fn qa13_embedding_sync_send_threads_intent_token_to_adapter() {
 // mock-seam coverage across `step2_p0_contract.rs`/`step3_p0_contract.rs`
 // regression-locks `AdapterError::RateLimit`'s shape change (tuple ->
 // struct variant with `retry_after_ms`). QA19's tools.toml `[pricing]`
-// table IS a CLI-process-level concern (schema validation at startup, and
-// the preview/scan_approval cost estimate) — tested here.
+// table is a selected-role concern: docs14 Operation-specific prerequisites
+// retains role schema checks and preview/scan_approval cost estimates.
 // ===========================================================================
 
 /// QA19 (step4b-contract-tests-p3a.md §F, 03 §11 L832-837): the spec's
 /// literal `[<kind>.<tool_id>.pricing]` example is accepted by `tools.toml`
-/// schema validation — before this fix `pricing` fell through the closed
-/// `TOOLS_ENTRY_FIELDS` list and every CLI invocation failed at startup
-/// (`validate_user_tools_config`, exit 2).
+/// schema validation when that role is selected (docs14 Operation-specific
+/// prerequisites); unrelated local status does not consume this declaration.
 #[test]
 fn qa19_tools_toml_pricing_example_is_accepted() {
     let dir = canonical_tempdir();
@@ -683,7 +682,10 @@ fn qa19_tools_toml_pricing_example_is_accepted() {
          [markdown.mistral_ocr_markdownize.pricing]\npages = 0.004\n",
     )
     .unwrap();
-    json_success(&dir, &["status"]);
+    json_success(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+    );
 }
 
 /// QA19: an unknown pricing kind is a config schema error, not a silently
@@ -701,7 +703,11 @@ fn qa19_tools_toml_pricing_unknown_kind_is_a_schema_error() {
          [markdown.mistral_ocr_markdownize.pricing]\nbogus_kind = 0.01\n",
     )
     .unwrap();
-    let err = json_failure(&dir, &["status"], 2);
+    let err = json_failure(
+        &dir,
+        &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+        2,
+    );
     assert_eq!(err["error_code"], "KIO-E-CONFIG-SCHEMA-001");
 }
 

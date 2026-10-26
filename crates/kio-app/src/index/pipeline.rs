@@ -10,10 +10,6 @@ use crate::index::command::record_unsupported_if_changed;
 use crate::index::command::repository_input_display_path;
 use crate::index::command::repository_scan_policy_allows_file;
 use crate::index::rebuild::read_head_tree_for_rebuild;
-use crate::ledger_access::capture_search_budget_observation;
-use crate::ledger_access::ledger_db_path;
-use crate::ledger_access::ledger_snapshot_to_kio;
-use crate::ledger_access::open_optional_ledger_db;
 use crate::ledger_access::release_task_charge_if_open;
 use crate::ledger_access::task_ledger_key;
 use crate::markdownize::batch::retire_online_task;
@@ -47,9 +43,6 @@ use crate::settings::bbox_annotation_enabled;
 use crate::settings::effective_incremental_config;
 use crate::settings::effective_max_input_bytes;
 use crate::settings::user_config_toml_path;
-use crate::task_execution::EnqueueBudget;
-use crate::task_execution::budget_remaining_for_adapter;
-use crate::task_execution::budget_remaining_from_totals;
 use crate::task_execution::enqueue_online_placeholder_task;
 use crate::task_execution::is_reservation_bearing_send_failure;
 use kio_adapter::catalog::active_local_ocr_execution_with_control;
@@ -200,6 +193,7 @@ pub(crate) struct IndexPipelineResult {
     pub(crate) normalized_files: usize,
     pub(crate) pending_files: usize,
     pub(crate) failed_files: usize,
+    pub(crate) deferred_budget: Vec<DeferredPaidPlaceholder>,
     // R12-2: files larger than adapter.policy.max_input_bytes, skipped for adapter
     // processing (input gate, 07 §7.1.2) but still archived.
     pub(crate) skipped_oversized_files: usize,
@@ -209,21 +203,51 @@ pub(crate) struct IndexPipelineResult {
     pub(crate) skipped_unrecognized_binary_files: usize,
 }
 
-/// Reuse only a HEAD-pinned local OCR instance whose profile is exactly the
-/// local OCR profile selected by current configuration for this media type.
-fn reusable_current_ocr_normalize(
+/// A new, unsubmitted paid placeholder. Existing/local task lifecycles are
+/// deliberately excluded from final budget classification.
+#[derive(Debug)]
+pub(crate) struct DeferredPaidPlaceholder {
+    pub(crate) expected: kio_pipeline::task::TaskDescriptor,
+    pub(crate) estimated_usd: f64,
+    pub(crate) ready_reason: &'static str,
+}
+
+/// Optional index planning may skip only a typed unavailable declaration.
+/// Integrity and other execution errors remain errors at their existing boundary.
+pub(crate) fn optional_role_planning_ready(
+    settings: &AdapterRuntimeSettings,
+    role: &str,
+) -> Result<bool> {
+    match settings.role_configuration_ready(role) {
+        Ok(()) => Ok(true),
+        Err(kio_adapter::AdapterError::RuntimeConfiguration { .. }) => Ok(false),
+        Err(error) => Err(adapter_to_kio(error)),
+    }
+}
+
+/// Keep exact HEAD knowledge when its current optional Adapter is unavailable.
+/// Available local OCR still requires an exact selected profile and a complete
+/// immutable result, so pending work remains eligible for its local drain.
+fn reusable_current_normalize(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     head: &BTreeMap<String, (String, NormalizeRef)>,
     path: &str,
     raw_hash: &str,
     media_type: &str,
-) -> Result<Option<NormalizeRef>> {
+    markdown_planning_ready: bool,
+) -> Result<Option<(NormalizeRef, bool)>> {
     let Some((head_raw, normalize)) = head.get(path) else {
         return Ok(None);
     };
     if head_raw != raw_hash {
         return Ok(None);
+    }
+    if !markdown_planning_ready {
+        // This validates the exact immutable CAS closure even when it is
+        // partial. Retain its accepted units without claiming it completed.
+        let complete = pinned_manifest_is_complete(repo, raw_hash, normalize)?;
+        return Ok(Some((normalize.clone(), complete)));
     }
     let Some(execution) = active_local_ocr_execution_with_control(adapter_settings, repo.control())
         .filter(|_| local_ocr_handles_media_type(media_type))
@@ -234,13 +258,10 @@ fn reusable_current_ocr_normalize(
     if normalize.tool_profile_hash != selected.tool_profile_hash {
         return Ok(None);
     }
-    // A HEAD pointer is authority, not a best-effort cache. Reuse requires
-    // a nonempty immutable closure whose every selected unit is durably Done;
-    // a partial or failed local OCR run must remain pending for local drain.
     if !pinned_manifest_is_complete(repo, raw_hash, normalize)? {
         return Ok(None);
     }
-    Ok(Some(normalize.clone()))
+    Ok(Some((normalize.clone(), true)))
 }
 
 pub(crate) fn online_output_ref(adapter_id: &str) -> String {
@@ -537,6 +558,7 @@ pub(crate) fn run_index_pipeline(
     repo: &Repository,
     preview: &ScanPreview,
     args: &IndexArgs,
+    ledger: Option<&kio_pipeline::ledger::LedgerDb>,
 ) -> Result<IndexPipelineResult> {
     let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     // Q3: index holds the folder store lock end-to-end, so any Running online task
@@ -546,53 +568,17 @@ pub(crate) fn run_index_pipeline(
     // state — invisible to the pending counter and unrecoverable by any command.
     reclaim_orphaned_running_tasks(&task_store)?;
     let now = repo.control().now_utc_seconds();
-    let scope_id = preview.scope_id.clone();
     let prepare_profile_hash = builtin_prepare_profile().tool_profile_hash;
     let markdown_adapter = active_markdown_adapter(repo);
     let markdown_profile = markdown_adapter.profile();
     let markdown_profile_hash = markdown_profile.tool_profile_hash.clone();
-    let network_allowed = network_allowed(adapter_settings, repo, args)?;
-    let ledger = if args.offline {
-        None
-    } else {
-        open_optional_ledger_db(repo.control())?
-    };
-    let budget_caps = read_budget_policy(
+    let markdown_planning_ready = optional_role_planning_ready(adapter_settings, "markdown")?;
+    let network_allowed = markdown_planning_ready && network_allowed(adapter_settings, repo, args)?;
+    read_budget_policy(
         user_config_toml_path(repo.control()),
         repo.kio_dir().join("config.toml"),
     )
     .map_err(pipeline_to_kio)?;
-
-    // An offline invocation intentionally has no mutable ledger handle. Capture
-    // the budget separately so that this is not mistaken for an uninitialized
-    // ledger when classifying new online tasks.
-    let enqueue_budget = if let Some(ledger) = ledger.as_ref() {
-        let (device, folder) =
-            budget_remaining_for_adapter(ledger, &budget_caps, &scope_id, "markdownize")?;
-        EnqueueBudget::Available { device, folder }
-    } else if args.offline {
-        let path = ledger_db_path(repo.control());
-        let (month, snapshot) = capture_search_budget_observation(&path, repo.control())?;
-        if let Some(snapshot) = snapshot {
-            let total = |scope: Option<&str>, adapter: Option<&str>| {
-                snapshot
-                    .month_total(scope, adapter, &month)
-                    .map_err(|error| ledger_snapshot_to_kio(&path.display().to_string(), error))
-            };
-            let (device, folder) = budget_remaining_from_totals(
-                &budget_caps,
-                "markdownize",
-                total(None, None)?,
-                total(Some(&scope_id), None)?,
-                total(None, Some("markdownize"))?,
-            );
-            EnqueueBudget::Available { device, folder }
-        } else {
-            EnqueueBudget::Uninitialized
-        }
-    } else {
-        EnqueueBudget::Uninitialized
-    };
 
     // R18-2: release the ledger reservation of DELETED / renamed files' orphaned
     // tasks. R17-3's enqueue supersede (`enqueue_online_placeholder_task`) releases
@@ -613,7 +599,7 @@ pub(crate) fn run_index_pipeline(
     // this to the 4 kinds that actually carry an open reservation, so a fresh
     // never-attempted Pending task or a budget/secrets Paused hold — neither
     // reservation-bearing — is unaffected).
-    if let Some(ledger) = ledger.as_ref() {
+    if markdown_planning_ready && let Some(ledger) = ledger {
         let online_profile = online_markdownize_profile_for(repo)?;
         let placeholder_output_ref = online_output_ref(&online_profile.adapter_id);
         let reservation_scope_id = repo.scope_identity()?.scope_id;
@@ -688,7 +674,7 @@ pub(crate) fn run_index_pipeline(
     // "Kio 側の入力制御" is an MVP contract). Scope config wins over user config,
     // default 100 MB. A file larger than the cap is never handed to the Markdownize
     // adapter (below); it stays archived but unenriched, and the count is disclosed.
-    let max_input_bytes = effective_max_input_bytes(repo);
+    let max_input_bytes = effective_max_input_bytes(repo)?;
     // R12-1: the documented `[markdownize.incremental]` overrides (were hardcoded).
     let incremental_config = effective_incremental_config(repo)?;
     let head_ocr_normalizes = repo
@@ -801,13 +787,14 @@ pub(crate) fn run_index_pipeline(
             &candidate.media_type,
         )?;
 
-        if let Some(normalize) = reusable_current_ocr_normalize(
+        if let Some((normalize, complete)) = reusable_current_normalize(
             adapter_settings,
             repo,
             &head_ocr_normalizes,
             &candidate.input_path,
             &raw_hash,
             &candidate.media_type,
+            markdown_planning_ready,
         )? {
             result.normalize_by_path.insert(
                 candidate.input_path.clone(),
@@ -816,7 +803,11 @@ pub(crate) fn run_index_pipeline(
                     normalize,
                 },
             );
-            result.normalized_files += 1;
+            if complete {
+                result.normalized_files += 1;
+            } else {
+                result.pending_files += 1;
+            }
             continue;
         }
 
@@ -871,24 +862,22 @@ pub(crate) fn run_index_pipeline(
             // Native image ingestion establishes the pixel authority locally;
             // OCR remains an optional later enrichment and has its own online
             // task/output identity, so it cannot replace this image object.
-            enqueue_online_placeholder_task(
-                adapter_settings,
-                repo,
-                &task_store,
-                candidate,
-                &raw_hash,
-                &scope_id,
-                network_allowed,
-                args,
-                &now,
-                &mut result,
-                ledger.as_ref(),
-                enqueue_budget,
-                &budget_caps,
-                &unsupported_store,
-                &mut unsupported_by_path,
-                &mut office_conversion_unavailable_paths,
-            )?;
+            if markdown_planning_ready {
+                enqueue_online_placeholder_task(
+                    adapter_settings,
+                    repo,
+                    &task_store,
+                    candidate,
+                    &raw_hash,
+                    network_allowed,
+                    &now,
+                    &mut result,
+                    ledger,
+                    &unsupported_store,
+                    &mut unsupported_by_path,
+                    &mut office_conversion_unavailable_paths,
+                )?;
+            }
             continue;
         }
 
@@ -921,24 +910,22 @@ pub(crate) fn run_index_pipeline(
                         },
                     )?;
                 }
-                enqueue_online_placeholder_task(
-                    adapter_settings,
-                    repo,
-                    &task_store,
-                    candidate,
-                    &raw_hash,
-                    &scope_id,
-                    network_allowed,
-                    args,
-                    &now,
-                    &mut result,
-                    ledger.as_ref(),
-                    enqueue_budget,
-                    &budget_caps,
-                    &unsupported_store,
-                    &mut unsupported_by_path,
-                    &mut office_conversion_unavailable_paths,
-                )?;
+                if markdown_planning_ready {
+                    enqueue_online_placeholder_task(
+                        adapter_settings,
+                        repo,
+                        &task_store,
+                        candidate,
+                        &raw_hash,
+                        network_allowed,
+                        &now,
+                        &mut result,
+                        ledger,
+                        &unsupported_store,
+                        &mut unsupported_by_path,
+                        &mut office_conversion_unavailable_paths,
+                    )?;
+                }
             } else {
                 // R22-4: the R21-4 skip left NO trace — no task, no counter, no event — so a
                 // real document whose extension is merely missing from the MIME table (a
@@ -1070,21 +1057,20 @@ pub(crate) fn run_index_pipeline(
             // fully and finally handled by the local passthrough — enqueuing an OCR task
             // shipped its bytes to the external API under `--online` (R9-2 routing violation)
             // and, when offline, left a permanent phantom pending that deflated enriched_ratio.
-            if candidate.media_type == "application/pdf" || is_office_media(&candidate.media_type) {
+            if markdown_planning_ready
+                && (candidate.media_type == "application/pdf"
+                    || is_office_media(&candidate.media_type))
+            {
                 enqueue_online_placeholder_task(
                     adapter_settings,
                     repo,
                     &task_store,
                     candidate,
                     &raw_hash,
-                    &scope_id,
                     network_allowed,
-                    args,
                     &now,
                     &mut result,
-                    ledger.as_ref(),
-                    enqueue_budget,
-                    &budget_caps,
+                    ledger,
                     &unsupported_store,
                     &mut unsupported_by_path,
                     &mut office_conversion_unavailable_paths,
@@ -1363,21 +1349,19 @@ pub(crate) fn run_index_pipeline(
         // (`.yaml`/`.json`/`Dockerfile`/uppercase-extension text-native) is fully handled
         // locally; enqueuing OCR sent its bytes online (R9-2 violation) or left an offline
         // phantom pending.
-        if candidate.media_type == "application/pdf" || is_office_media(&candidate.media_type) {
+        if markdown_planning_ready
+            && (candidate.media_type == "application/pdf" || is_office_media(&candidate.media_type))
+        {
             enqueue_online_placeholder_task(
                 adapter_settings,
                 repo,
                 &task_store,
                 candidate,
                 &raw_hash,
-                &scope_id,
                 network_allowed,
-                args,
                 &now,
                 &mut result,
-                ledger.as_ref(),
-                enqueue_budget,
-                &budget_caps,
+                ledger,
                 &unsupported_store,
                 &mut unsupported_by_path,
                 &mut office_conversion_unavailable_paths,
@@ -1388,14 +1372,16 @@ pub(crate) fn run_index_pipeline(
     // the active local peer has an exact device+scope network grant. The task is
     // created first and drained second, so a crash mid-OCR leaves a Pending task
     // that the next authorized index invocation can pick up.
-    let executed = execute_pending_offline_markdownize_tasks(
-        adapter_settings,
-        repo,
-        &task_store,
-        &mut result.normalize_by_path,
-        network_allowed,
-    )?;
-    result.pending_online_tasks = result.pending_online_tasks.saturating_sub(executed);
+    if markdown_planning_ready {
+        let executed = execute_pending_offline_markdownize_tasks(
+            adapter_settings,
+            repo,
+            &task_store,
+            &mut result.normalize_by_path,
+            network_allowed,
+        )?;
+        result.pending_online_tasks = result.pending_online_tasks.saturating_sub(executed);
+    }
     Ok(result)
 }
 

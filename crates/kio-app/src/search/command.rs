@@ -7,9 +7,10 @@ use crate::embedding::transport::QueryEmbeddingOutcome;
 use crate::embedding::transport::compute_query_embedding_page1;
 use crate::index::command::compute_index_status;
 use crate::invocation::Invocation;
-use crate::ledger_access::capture_search_budget_observation;
 use crate::ledger_access::ledger_db_path;
+use crate::ledger_access::observe_budget;
 use crate::multi_scope;
+use crate::object_persistence::adapter_to_kio;
 use crate::object_persistence::pipeline_to_kio;
 use crate::object_persistence::search_to_kio;
 use crate::response::CommandResponse;
@@ -94,7 +95,6 @@ use kio_core::ExitCode;
 use kio_core::KioError;
 use kio_core::Result;
 use kio_core::scope::Repository;
-use kio_pipeline::budget::utc_month;
 use kio_pipeline::policy::CurrentPolicyEvaluator;
 use kio_search::cursor::CursorExcludedScope;
 use kio_search::cursor::CursorToken;
@@ -517,6 +517,7 @@ fn run_search_inner(
     // length + per-scope compat) — never by eagerly calling the adapter.
     // QA21/23: the AND-gate's profile match needs the adapter's CURRENT
     // `tool_profile_hash` alongside its `tool_id`.
+    let query_embeddable = parsed.query.chars().count() >= 2;
     let adapter_identity = active_embedding_adapter_identity(adapter_settings, ctx.control)?;
     let adapter_id = adapter_identity.as_ref().map(|(id, _)| id.clone());
     // An embedding adapter can be an authenticated local HTTPS peer. Only the
@@ -525,6 +526,17 @@ fn run_search_inner(
     let active_embedding = embedding_execution(adapter_settings, ctx.control);
     let embedding_is_deterministic = active_embedding.is_some_and(embedding_is_deterministic);
     if parsed.online && (active_embedding.is_none() || embedding_is_deterministic) {
+        if requested_mode == SearchMode::Vector
+            && decoded_cursor.is_none()
+            && query_embeddable
+            && active_embedding.is_none()
+        {
+            // This explicit fresh vector request consumes a configured profile;
+            // retain its typed unavailable reason before the generic no-endpoint error.
+            adapter_settings
+                .role_configuration_ready("embedding")
+                .map_err(adapter_to_kio)?;
+        }
         return Err(KioError::invalid_usage(
             "search --online requires an active network embedding adapter",
         ));
@@ -544,7 +556,6 @@ fn run_search_inner(
             None => false,
         }
     };
-    let query_embeddable = parsed.query.chars().count() >= 2;
     let vector_precheck = resolve_vector_availability(
         requested_mode,
         &replica_embedding_states,
@@ -555,17 +566,24 @@ fn run_search_inner(
         embedding_opt_in,
         query_embeddable,
     );
+    if parsed.online
+        && requested_mode == SearchMode::Vector
+        && decoded_cursor.is_none()
+        && query_embeddable
+        && matches!(&vector_precheck, VectorAvailability::Unauthorized)
+    {
+        // Compatible index selection is already proven. An invalid selected
+        // private credential retains its original typed error; valid missing
+        // consent still follows the ordinary Unauthorized branch below.
+        adapter_settings
+            .role_credentials_ready("embedding")
+            .map_err(adapter_to_kio)?;
+    }
     let precheck_mode = resolve_search_mode(requested_mode, &vector_precheck, fail_behavior)?;
-    // The deterministic evaluator has no billable ledger operation. Do not
-    // initialize or inspect the device ledger for that in-process path; budget
-    // status is zero there. HTTP sends retain the stable snapshot used by both
-    // admission and output.
+    // Budget disclosure is observational for every search mode, including free
+    // local embeddings. Missing or unavailable billing state never means zero.
     let ledger_path = ledger_db_path(ctx.control);
-    let (budget_month, budget_ledger) = if embedding_is_deterministic {
-        (utc_month(&ctx.control.now_utc_seconds()), None)
-    } else {
-        capture_search_budget_observation(&ledger_path, ctx.control)?
-    };
+    let mut budget_observation = observe_budget(&ledger_path, ctx.control);
 
     if parsed.online {
         // `--online` selects the remote execution path; it neither manufactures
@@ -609,6 +627,7 @@ fn run_search_inner(
                 adapter_id.as_deref().unwrap_or_default(),
                 parsed.offline,
                 &current_policies,
+                budget_observation.original_error.take(),
             )? {
                 Some(QueryEmbeddingOutcome::Vector(vector)) => Some(vector),
                 // CL54: a live in-flight claim from another process already
@@ -1815,14 +1834,19 @@ fn run_search_inner(
             }
         })
         .collect::<Vec<_>>();
-    let index_status = compute_index_status(
+    let mut index_status = compute_index_status(
         &searched,
-        budget_ledger.as_ref(),
+        budget_observation.snapshot.as_ref(),
         &ledger_path,
-        &budget_month,
+        &budget_observation.month,
         ctx.control,
         ctx.locks,
     )?;
+    if let Some(reason) = budget_observation.reason {
+        index_status.budget_status = "unknown".to_owned();
+        index_status.budget_reason = Some(reason);
+        index_status.budget_paused = None;
+    }
     // PC45/PC46: a scope that skipped shallow ancestors mid-walk is not fully
     // complete even though it was not excluded — same partial-failure
     // treatment (exit 3) as an excluded_scopes entry (05 §1.6 "黙って欠落
