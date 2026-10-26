@@ -152,11 +152,15 @@ fn run(change: Change, test_name: &str) {
         &profile.tool_profile_hash,
     );
     let path = crate::approvals::store_path(&base_control);
-    let before_grants = PrivateGrantStore::open_readonly(&path, &base_control)
-        .unwrap()
-        .unwrap()
-        .records()
-        .to_vec();
+    let before_grants = PrivateGrantStore::open_readonly(
+        &path,
+        &crate::settings::data_home(&base_control),
+        &base_control,
+    )
+    .unwrap()
+    .unwrap()
+    .records()
+    .to_vec();
     let paired: Vec<_> = before_grants
         .iter()
         .filter(|r| r.binding.tool_id == tool && r.state == GrantState::Active)
@@ -214,7 +218,12 @@ fn run(change: Change, test_name: &str) {
             } else {
                 GrantOperation::SendSecrets
             };
-            let mut store = PrivateGrantStore::open_or_create(&path, &base_control).unwrap();
+            let mut store = PrivateGrantStore::open_or_create(
+                &path,
+                &crate::settings::data_home(&base_control),
+                &base_control,
+            )
+            .unwrap();
             let revoked = store
                 .revoke_matching("2026-10-20T00:00:00Z".into(), |binding| {
                     binding.tool_id == tool && binding.operation == operation

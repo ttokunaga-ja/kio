@@ -260,6 +260,43 @@ pub(crate) fn verify_private_directory_handle(directory: &StoreDirectory) -> Res
     verify_owner_only(&handle, &owner, directory.path())
 }
 
+/// Follow aliases only in a caller-declared external parent. Pin that exact
+/// directory before examining its canonical spelling; owned children are
+/// subsequently opened relative to this handle without following reparse
+/// points.
+pub(crate) fn retain_external_directory(
+    path: &Path,
+    control: crate::control::ControlHandle,
+) -> Result<StoreDirectory> {
+    windows_absolute_components(path)?;
+    let followed = cap_fs::open_ambient_dir(path, ambient_authority())
+        .map_err(|_| unsafe_file("cannot open external directory", Some(path)))?;
+    let identity = crate::platform::directory_handle_identity(&followed)
+        .ok_or_else(|| unsafe_file("external directory is not a real directory", Some(path)))?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|_| unsafe_file("cannot resolve external directory", Some(path)))?;
+    let (root_path, components) = windows_absolute_components(&canonical)?;
+    let mut checked = cap_fs::open_ambient_dir(&root_path, ambient_authority())
+        .map_err(|_| unsafe_file("cannot open canonical external root", Some(path)))?;
+    verify_real_directory(&checked, path)?;
+    for component in components {
+        checked = cap_fs::open_dir_nofollow(&checked, Path::new(component)).map_err(|_| {
+            unsafe_file(
+                "canonical external directory has an unsafe component",
+                Some(path),
+            )
+        })?;
+        verify_real_directory(&checked, path)?;
+    }
+    if crate::platform::directory_handle_identity(&checked) != Some(identity) {
+        return Err(unsafe_file(
+            "external directory changed during binding",
+            Some(path),
+        ));
+    }
+    StoreDirectory::from_retained_with_control(followed, path.to_path_buf(), control)
+}
+
 pub(crate) fn verify_private_directory(
     path: &Path,
     control: crate::control::ControlHandle,
@@ -338,9 +375,9 @@ pub(crate) fn read_private_file(
     )
 }
 
-pub(crate) fn read_private_file_at(
+pub(crate) fn read_private_file_at_path(
     parent: &StoreDirectory,
-    name: &str,
+    name: &Path,
     max_bytes: u64,
 ) -> Result<Vec<u8>> {
     let leaf = direct_leaf(name, parent.path())?;
@@ -413,8 +450,8 @@ fn read_private_leaf(
     Ok(body)
 }
 
-fn direct_leaf<'a>(name: &'a str, label: &Path) -> Result<&'a std::ffi::OsStr> {
-    let mut components = Path::new(name).components();
+fn direct_leaf<'a>(name: &'a Path, label: &Path) -> Result<&'a std::ffi::OsStr> {
+    let mut components = name.components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(leaf)), None) => {
             validate_windows_component(leaf, label)?;
@@ -960,5 +997,48 @@ mod acl_vectors {
             true,
         ));
         assert!(untrusted_effective_mutation(0, GENERIC_ALL, true));
+    }
+}
+
+#[cfg(test)]
+mod external_alias_tests {
+    use super::*;
+
+    fn create_junction(link: &Path, target: &Path) {
+        let result = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "junction creation failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn external_reparse_parent_allows_private_child_but_not_linked_owned_child() {
+        let fixture = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let real = fixture.path().join("external");
+        std::fs::create_dir(&real).unwrap();
+        let alias = fixture.path().join("alias");
+        create_junction(&alias, &real);
+
+        let external =
+            retain_external_directory(&alias, crate::control::ControlHandle::default()).unwrap();
+        external.create_directory(Path::new("private")).unwrap();
+        crate::private_fs::verify_private_directory_at(&external, Path::new("private")).unwrap();
+
+        let linked_private = real.join("linked-private");
+        create_junction(&linked_private, &real.join("private"));
+        assert!(
+            crate::private_fs::verify_private_directory_at(&external, Path::new("linked-private"),)
+                .is_err()
+        );
+        drop(external);
+        std::fs::remove_dir(linked_private).unwrap();
+        std::fs::remove_dir(alias).unwrap();
     }
 }

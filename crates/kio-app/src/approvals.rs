@@ -288,8 +288,11 @@ pub(crate) fn allowed(
     profile: &str,
     operation: GrantOperation,
 ) -> Result<bool> {
-    let Some(snapshot) =
-        PrivateGrantStore::open_readonly(&store_path(repo.control()), repo.control())?
+    let Some(snapshot) = PrivateGrantStore::open_readonly(
+        &store_path(repo.control()),
+        &crate::settings::data_home(repo.control()),
+        repo.control(),
+    )?
     else {
         return Ok(false);
     };
@@ -471,7 +474,11 @@ pub(crate) fn approve(
     if refreshed != selected {
         return Err(denied("adapter identity changed after confirmation"));
     }
-    let mut store = PrivateGrantStore::open_or_create(&store_path(ctx.control), ctx.control)?;
+    let mut store = PrivateGrantStore::open_or_create(
+        &store_path(ctx.control),
+        &crate::settings::data_home(ctx.control),
+        ctx.control,
+    )?;
     let mut outcomes = Vec::new();
     for (role, expected) in selected {
         let rows = repo.read_network_approvals()?;
@@ -626,16 +633,22 @@ pub(crate) fn revoke(
     let _lock = repo.lock_store_in_session(repo.lock_session())?;
     let scope_id = repo.scope_identity()?.scope_id;
     let now = control.now_utc_seconds();
-    let revoked_grants =
-        if PrivateGrantStore::open_readonly(&store_path(control), control)?.is_some() {
-            PrivateGrantStore::open_or_create(&store_path(control), control)?.revoke(
-                &scope_id,
-                tool,
-                now.clone(),
-            )?
-        } else {
-            Vec::new()
-        };
+    let revoked_grants = if PrivateGrantStore::open_readonly(
+        &store_path(control),
+        &crate::settings::data_home(control),
+        control,
+    )?
+    .is_some()
+    {
+        PrivateGrantStore::open_or_create(
+            &store_path(control),
+            &crate::settings::data_home(control),
+            control,
+        )?
+        .revoke(&scope_id, tool, now.clone())?
+    } else {
+        Vec::new()
+    };
     let outcome = repo.revoke_network_approval(tool, &now)?;
     Ok(CommandResponse {
         body: ResponseBody::Adapter(AdapterResponse::Revoked(ApprovalRevokeResponse {
@@ -663,7 +676,11 @@ pub(crate) fn status(
 
     let repo = ctx.open_recovery_repository()?;
     let scope_id = repo.scope_identity()?.scope_id;
-    let snapshot = PrivateGrantStore::open_readonly(&store_path(ctx.control), ctx.control)?;
+    let snapshot = PrivateGrantStore::open_readonly(
+        &store_path(ctx.control),
+        &crate::settings::data_home(ctx.control),
+        ctx.control,
+    )?;
     let records = snapshot
         .as_ref()
         .map(|snapshot| snapshot.records())

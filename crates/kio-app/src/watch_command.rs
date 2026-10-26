@@ -428,6 +428,9 @@ fn state_directory(
     let data = registry
         .parent()
         .ok_or_else(|| watch_error("device data directory is unavailable"))?;
+    let external_base = data
+        .parent()
+        .ok_or_else(|| watch_error("device data external base is unavailable"))?;
     let key = kio_core::cas::lower_hex(&Sha256::digest(root.as_os_str().as_encoded_bytes()));
     let target = data.join("watch").join(key);
     if target.starts_with(root) {
@@ -440,11 +443,11 @@ fn state_directory(
     // resolver; canonicalizing and reopening a diagnostic pathname here would
     // make a later rename select attacker-controlled state instead.
     if create {
-        crate::private_state::ensure_private_directory(&target, control)
+        crate::private_state::ensure_private_directory(&target, external_base, control)
             .map(Some)
             .map_err(watch_error)
     } else {
-        crate::private_state::open_readonly(&target, control).map_err(watch_error)
+        crate::private_state::open_readonly(&target, external_base, control).map_err(watch_error)
     }
 }
 
@@ -477,9 +480,12 @@ mod tests {
     fn private_watch_directory() -> (tempfile::TempDir, StoreDirectory) {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().canonicalize().unwrap().join("watch-state");
-        let directory =
-            crate::private_state::ensure_private_directory(&path, &ControlHandle::default())
-                .unwrap();
+        let directory = crate::private_state::ensure_private_directory(
+            &path,
+            path.parent().unwrap(),
+            &ControlHandle::default(),
+        )
+        .unwrap();
         (temp, directory)
     }
 

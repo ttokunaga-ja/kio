@@ -322,13 +322,23 @@ pub(crate) fn append_observation(
     // invocation, but its OWN error would still be logged here first and scatter
     // `./kio/logs/errors.jsonl` under the working directory. Skip silently (logging
     // is best-effort) rather than create it.
-    let owned_path = data_home(control).join("kio");
+    let external_path = data_home(control);
+    let owned_path = external_path.join("kio");
     if !owned_path.is_absolute() {
         return Ok(());
     }
     // XDG ancestors are external namespace only. The explicit Kio-owned root
     // must be private before any log child, rotation, or lock is created.
-    let owned = StoreDirectory::open_or_create_directories(&owned_path)?;
+    let external = crate::private_fs::retain_or_create_external_directory_with_control(
+        &external_path,
+        control,
+    )?;
+    let owned = StoreDirectory::from_retained_with_control(
+        external.create_directory_all(Path::new("kio"))?,
+        owned_path,
+        control.clone(),
+    )?;
+    crate::private_fs::verify_private_directory_handle(&owned)?;
     verify_device_log_root(&owned)?;
     let log_dir = owned.path().join("logs");
     let logs = StoreDirectory::from_retained(
@@ -501,6 +511,47 @@ fn config_home(control: &crate::control::ControlHandle) -> PathBuf {
 mod owned_root_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn device_logging_creates_missing_data_home_beneath_external_alias() {
+        use std::os::unix::fs::symlink;
+
+        let _lock = crate::test_control::test_env_lock().lock().unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let real = temp.path().canonicalize().unwrap().join("external-parent");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o777)).unwrap();
+        let alias = temp.path().join("parent-alias");
+        symlink(&real, &alias).unwrap();
+        let data_home = alias.join("new-data");
+        let _data = crate::test_control::TestEnvGuard::set("XDG_DATA_HOME", &data_home);
+        let _config =
+            crate::test_control::TestEnvGuard::set("XDG_CONFIG_HOME", real.join("config"));
+        assert!(!real.join("new-data").exists());
+
+        let control = crate::control::ControlHandle::default();
+        control
+            .append_event_log("TEST", "under external alias", serde_json::json!({}))
+            .unwrap();
+        let event = fs::read_to_string(real.join("new-data/kio/logs/events.jsonl")).unwrap();
+        assert!(event.contains("under external alias"));
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        for owned in ["new-data", "new-data/kio", "new-data/kio/logs"] {
+            assert_eq!(
+                fs::metadata(real.join(owned)).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
 
     #[test]
     fn device_logging_refuses_unsafe_owned_root_without_adopting_external_ancestor() {

@@ -459,6 +459,7 @@ pub(crate) fn run_image_embedding_enrichment(
         .then(|| {
             crate::local_execution::LocalExecution::new(
                 crate::local_execution::LocalExecution::default_root(invocation.control)?,
+                crate::local_execution::LocalExecution::default_external_base(invocation.control)?,
                 invocation.control.clone(),
             )
         })

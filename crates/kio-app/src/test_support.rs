@@ -138,7 +138,8 @@ pub(crate) fn create_private_test_directory(path: &Path) {
 
 /// Seed raw malformed/corrupt test bytes in a legitimately protected file.
 pub(crate) fn create_private_test_file(path: &Path) -> std::fs::File {
-    let parent = kio_core::private_fs::verify_private_directory(path.parent().unwrap()).unwrap();
+    let parent = StoreDirectory::open(path.parent().unwrap()).unwrap();
+    kio_core::private_fs::verify_private_directory_handle(&parent).unwrap();
     parent
         .create_private_file(Path::new(path.file_name().unwrap()))
         .unwrap()

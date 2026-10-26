@@ -3409,6 +3409,7 @@ fn r10_6_open_cache_write_is_atomic_readonly_and_cleans_temp() {
     let cache = dir.path().join("obj").join("doc.md");
     crate::private_state::ensure_private_directory(
         cache.parent().unwrap(),
+        dir.path(),
         &kio_core::control::ControlHandle::default(),
     )
     .unwrap();

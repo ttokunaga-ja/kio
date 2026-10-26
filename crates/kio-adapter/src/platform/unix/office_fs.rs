@@ -7,19 +7,22 @@ pub(crate) fn restrict_scratch(path: &Path) -> Result<()> {
             "failed to restrict office scratch directory permissions: {error}"
         ))
     })?;
-    kio_core::private_fs::verify_private_directory(path).map_err(|error| {
+    crate::office_convert::bind_private_scratch(path).map_err(|error| {
         AdapterError::ContractViolation(format!("unsafe Office scratch directory: {error}"))
     })?;
     Ok(())
 }
 pub(crate) fn restrict_renderer_state_directory(
-    path: &Path,
+    scratch: &kio_core::store_dir::StoreDirectory,
+    child: &str,
     purpose: &str,
     label: &str,
 ) -> Result<()> {
-    kio_core::private_fs::verify_private_directory(path).map_err(|error| {
-        AdapterError::ContractViolation(format!("unsafe private {purpose} {label}: {error}"))
-    })?;
+    kio_core::private_fs::verify_private_directory_at(scratch, Path::new(child)).map_err(
+        |error| {
+            AdapterError::ContractViolation(format!("unsafe private {purpose} {label}: {error}"))
+        },
+    )?;
     Ok(())
 }
 pub(crate) fn environment() -> Vec<(OsString, OsString)> {

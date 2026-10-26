@@ -123,6 +123,47 @@ pub(crate) fn verify_private_directory_handle(directory: &StoreDirectory) -> Res
     verify_private_parent(&handle, uid, directory.path())
 }
 
+/// The caller has identified this complete path as external ancestry. Resolve
+/// it once, compare the followed name with a strict open of the canonical
+/// directory, and retain that handle for all private-child operations.
+pub(crate) fn retain_external_directory(
+    path: &Path,
+    control: crate::control::ControlHandle,
+) -> Result<StoreDirectory> {
+    if let Some((root, suffix)) = resolve_inherited_private_root(path, control.clone())? {
+        if !suffix.is_empty() {
+            return Err(unsafe_file(
+                "external descriptor root must have no owned suffix",
+                Some(path),
+            ));
+        }
+        return Ok(root);
+    }
+    // The filesystem root is itself a valid external boundary. Other paths
+    // still require ordinary absolute components.
+    if path != Path::new("/") {
+        path_components(path)?;
+    }
+    let followed = File::open(path)
+        .map_err(|_| unsafe_file("cannot retain external directory", Some(path)))?;
+    verify_directory(&followed, path)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| unsafe_file("cannot resolve external directory", Some(path)))?;
+    let physical = crate::platform::store::open(&canonical).map_err(|_| {
+        unsafe_file(
+            "external directory has an unsafe canonical path",
+            Some(path),
+        )
+    })?;
+    let first = metadata(&followed, path)?;
+    let second = metadata(&physical, path)?;
+    if first.dev() != second.dev() || first.ino() != second.ino() {
+        return Err(raced_file(path));
+    }
+    StoreDirectory::from_retained_with_control(followed, path.to_path_buf(), control)
+}
+
 pub(crate) fn verify_private_directory(
     path: &Path,
     control: crate::control::ControlHandle,
@@ -218,9 +259,9 @@ pub(crate) fn read_private_file(
     )
 }
 
-pub(crate) fn read_private_file_at(
+pub(crate) fn read_private_file_at_path(
     parent: &StoreDirectory,
-    name: &str,
+    name: &Path,
     max_bytes: u64,
 ) -> Result<Vec<u8>> {
     let leaf = direct_leaf(name, parent.path())?;
@@ -284,9 +325,8 @@ fn read_inherited_private_file(
     read_leaf(&parent, leaf, path, max_bytes, uid)
 }
 
-fn direct_leaf<'a>(name: &'a str, label: &Path) -> Result<&'a std::ffi::OsStr> {
-    let path = Path::new(name);
-    let mut components = path.components();
+fn direct_leaf<'a>(name: &'a Path, label: &Path) -> Result<&'a std::ffi::OsStr> {
+    let mut components = name.components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(leaf)), None) => Ok(leaf),
         _ => Err(unsafe_file(
@@ -525,4 +565,89 @@ fn path_components(path: &Path) -> Result<Vec<&std::ffi::OsStr>> {
         ));
     }
     Ok(components)
+}
+
+#[cfg(test)]
+mod own_objects_host_paths_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn filesystem_root_is_a_valid_external_capability_boundary() {
+        let root =
+            retain_external_directory(Path::new("/"), crate::control::ControlHandle::default())
+                .unwrap();
+        assert!(root.root_handle().metadata().unwrap().is_dir());
+    }
+
+    #[test]
+    fn external_symlinked_ancestor_admits_private_children_without_adoption() {
+        let fixture = tempfile::tempdir().unwrap();
+        let external = fixture.path().canonicalize().unwrap().join("external");
+        fs::create_dir(&external).unwrap();
+        let real = external.join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = external.join("alias");
+        symlink(&real, &alias).unwrap();
+
+        let real_parent = StoreDirectory::open(&real).unwrap();
+        real_parent.create_directory(Path::new("owned")).unwrap();
+        let owned = real.join("owned");
+        let owned_handle = StoreDirectory::open(&owned).unwrap();
+        owned_handle
+            .create_private_file(Path::new("secret"))
+            .unwrap();
+        let before = fs::symlink_metadata(&alias).unwrap();
+
+        let external_boundary =
+            retain_external_directory(&alias, crate::control::ControlHandle::default()).unwrap();
+        let owned_boundary =
+            crate::private_fs::verify_private_directory_at(&external_boundary, Path::new("owned"))
+                .unwrap();
+        assert_eq!(
+            crate::private_fs::read_private_file_at(&owned_boundary, "secret", 16).unwrap(),
+            b""
+        );
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::symlink_metadata(&alias).unwrap().len(), before.len());
+
+        symlink(&owned, real.join("substituted-owned")).unwrap();
+        assert!(
+            crate::private_fs::verify_private_directory_at(
+                &external_boundary,
+                Path::new("substituted-owned"),
+            )
+            .is_err()
+        );
+
+        owned_handle.create_directory(Path::new("nested")).unwrap();
+        symlink(owned.join("nested"), owned.join("linked-nested")).unwrap();
+        assert!(
+            crate::private_fs::verify_private_directory_at(
+                &external_boundary,
+                Path::new("owned/linked-nested/child"),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_system_temp_accepts_private_child_without_rewriting_external_parent() {
+        let fixture = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let external = fixture.path();
+        let before = fs::metadata(external).unwrap();
+        let parent =
+            retain_external_directory(external, crate::control::ControlHandle::default()).unwrap();
+        parent.create_directory(Path::new("owned")).unwrap();
+        crate::private_fs::verify_private_directory_at(&parent, Path::new("owned")).unwrap();
+        let after = fs::metadata(external).unwrap();
+        assert_eq!(before.permissions(), after.permissions());
+    }
 }

@@ -961,7 +961,7 @@ fn copy_fixture_directory(
     let leaf = destination.file_name().ok_or_else(|| {
         QhardError::Input("fixture snapshot destination has no directory name".into())
     })?;
-    let parent = kio_core::private_fs::verify_private_creation_parent(parent_path)
+    let parent = kio_core::private_fs::retain_external_directory(parent_path)
         .map_err(|e| QhardError::Input(format!("cannot retain fixture snapshot parent: {e}")))?;
     copy_fixture_directory_into(source, &parent, Path::new(leaf), destination, budget)
 }
@@ -6526,9 +6526,15 @@ mod tests {
         let copied = output.path().join("copy");
         copy_fixture_directory(&bound.handle, &copied, &mut FixtureDigestBudget::default())
             .unwrap();
-        kio_core::private_fs::verify_private_directory(&copied).unwrap();
-        kio_core::private_fs::verify_private_directory(&copied.join("nested")).unwrap();
-        let directory = StoreDirectory::open(&copied.join("nested")).unwrap();
+        let external = kio_core::private_fs::retain_external_directory(output.path()).unwrap();
+        let copied_directory =
+            kio_core::private_fs::verify_private_directory_at(&external, Path::new("copy"))
+                .unwrap();
+        let directory = kio_core::private_fs::verify_private_directory_at(
+            &copied_directory,
+            Path::new("nested"),
+        )
+        .unwrap();
         let file = directory
             .open_regular_read(Path::new("evidence"), 6)
             .unwrap();

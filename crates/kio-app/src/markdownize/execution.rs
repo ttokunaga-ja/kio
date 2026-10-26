@@ -441,6 +441,7 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
         };
         let local = LocalExecution::new(
             LocalExecution::default_root(repo.control())?,
+            LocalExecution::default_external_base(repo.control())?,
             repo.control().clone(),
         )?;
         let now = repo.control().now_utc_seconds();

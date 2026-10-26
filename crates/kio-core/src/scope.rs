@@ -2184,7 +2184,8 @@ mod tests {
                 0o777,
                 "external root must not be repaired"
             );
-            crate::private_fs::verify_private_directory(&root.path().join(".kio")).unwrap();
+            let external = crate::private_fs::retain_external_directory(root.path()).unwrap();
+            crate::private_fs::verify_private_directory_at(&external, Path::new(".kio")).unwrap();
             assert_eq!(
                 fs::metadata(root.path().join(".kio"))
                     .unwrap()

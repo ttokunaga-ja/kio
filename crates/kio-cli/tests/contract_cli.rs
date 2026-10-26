@@ -669,7 +669,9 @@ fn ct_cli_011_012_013_lock_and_schema_errors_are_structured() {
     assert_eq!(err["error_code"], "KIO-E-CONFIG-SCHEMA-001");
     fs::write(temp.path().join(".kio/HEAD"), "unborn\n").unwrap();
 
-    let parent = kio_core::private_fs::verify_private_directory(&temp.path().join(".kio")).unwrap();
+    let external = kio_core::private_fs::retain_external_directory(temp.path()).unwrap();
+    let parent =
+        kio_core::private_fs::verify_private_directory_at(&external, Path::new(".kio")).unwrap();
     let mut lock = parent.create_private_file(Path::new(".lock")).unwrap();
     std::io::Write::write_all(&mut lock, b"{}").unwrap();
     drop(lock);

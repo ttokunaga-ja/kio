@@ -121,6 +121,9 @@ pub(crate) enum ArtifactSetState {
 /// Exclusive lifecycle session rooted in a retained owner-private directory.
 pub(crate) struct FsSession {
     parent_path: PathBuf,
+    /// The caller-declared external XDG data root for the default ledger.
+    /// Only its `kio` child is admitted as a Kio-owned directory.
+    external_data_root: Option<PathBuf>,
     db_path: PathBuf,
     names: ArtifactNames,
     parent: StoreDirectory,
@@ -152,8 +155,17 @@ impl FsSession {
     ) -> Result<Self> {
         let db_path = normalized_absolute_db_path(db_path)?;
         let (parent_path, names) = ArtifactNames::from_db_path(&db_path)?;
-        let (parent, inherited_parent) =
-            open_or_create_parent(&parent_path, allow_create, control)?;
+        let default_parent = super::schema::default_ledger_path_with_control(&control)
+            .ok()
+            .and_then(|path| normalized_absolute_db_path(&path).ok())
+            .filter(|path| path == &db_path)
+            .and_then(|path| path.parent().map(Path::to_path_buf));
+        let (parent, inherited_parent) = open_or_create_parent(
+            &parent_path,
+            allow_create,
+            default_parent.is_some(),
+            control,
+        )?;
         let sqlite_path = if inherited_parent {
             sqlite_path_from_retained_parent(&parent, &names.db)?
         } else {
@@ -165,6 +177,11 @@ impl FsSession {
             names,
             parent,
             inherited_parent,
+            if inherited_parent {
+                None
+            } else {
+                default_parent.and_then(|path| path.parent().map(Path::to_path_buf))
+            },
             allow_create,
         )
     }
@@ -203,6 +220,7 @@ impl FsSession {
             parent,
             // Never re-open a diagnostic path held by the snapshot reader.
             true,
+            None,
             false,
         )
     }
@@ -217,6 +235,7 @@ impl FsSession {
         names: ArtifactNames,
         parent: StoreDirectory,
         inherited_parent: bool,
+        external_data_root: Option<PathBuf>,
         allow_create: bool,
     ) -> Result<Self> {
         verify_private_parent_handle(parent.root_handle().as_ref(), &parent_path)?;
@@ -277,6 +296,7 @@ impl FsSession {
 
         let session = Self {
             parent_path,
+            external_data_root,
             db_path,
             names,
             parent,
@@ -633,9 +653,18 @@ impl FsSession {
             // retargeted, so the retained capability is the authority below.
             verify_private_parent_handle(self.parent.root_handle().as_ref(), &self.parent_path)?;
         } else {
-            let named_parent =
+            let named_parent = if let Some(external_root) = &self.external_data_root {
+                let external = kio_core::private_fs::retain_external_directory_with_control(
+                    external_root,
+                    self.control(),
+                )
+                .map_err(core_private)?;
+                kio_core::private_fs::verify_private_directory_at(&external, Path::new("kio"))
+                    .map_err(core_private)?
+            } else {
                 StoreDirectory::open_with_control(&self.parent_path, self.control().clone())
-                    .map_err(core_private)?;
+                    .map_err(core_private)?
+            };
             verify_private_parent_handle(named_parent.root_handle().as_ref(), &self.parent_path)?;
             if directory_identity(named_parent.root_handle().as_ref(), &self.parent_path)?
                 != self.parent_identity
@@ -821,10 +850,60 @@ fn revalidate_retained_leaf(session: &FsSession, retained: &RetainedSqliteFile) 
 fn open_or_create_parent(
     path: &Path,
     allow_create: bool,
+    default_device_parent: bool,
     control: ControlHandle,
 ) -> Result<(StoreDirectory, bool)> {
     if let Some(parent) = try_inherited_parent(path, allow_create, control.clone())? {
         return Ok((parent, true));
+    }
+    if default_device_parent {
+        let external_path = path.parent().ok_or_else(|| {
+            contract(
+                "KIO-E-LEDGER-PATH-001",
+                "default ledger has no external data root",
+            )
+        })?;
+        let external = if allow_create {
+            kio_core::private_fs::retain_or_create_external_directory_with_control(
+                external_path,
+                &control,
+            )
+        } else {
+            kio_core::private_fs::retain_external_directory_with_control(external_path, &control)
+        }
+        .map_err(|error| {
+            if !allow_create
+                && matches!(
+                    std::fs::symlink_metadata(external_path),
+                    Err(cause) if cause.kind() == std::io::ErrorKind::NotFound
+                )
+            {
+                contract(
+                    "KIO-E-LEDGER-UNINITIALIZED-001",
+                    "ledger parent is not initialized",
+                )
+            } else {
+                core_private(error)
+            }
+        })?;
+        let leaf = Path::new("kio");
+        if external.contains_entry(leaf).map_err(core_private)? {
+            let parent = kio_core::private_fs::verify_private_directory_at(&external, leaf)
+                .map_err(core_private)?;
+            return Ok((parent, false));
+        }
+        if !allow_create {
+            return Err(contract(
+                "KIO-E-LEDGER-UNINITIALIZED-001",
+                "ledger parent is not initialized",
+            ));
+        }
+        let created = external.create_directory(leaf).map_err(core_private)?;
+        let parent =
+            StoreDirectory::from_retained_with_control(created, path.to_path_buf(), control)
+                .map_err(core_private)?;
+        kio_core::private_fs::verify_private_directory_handle(&parent).map_err(core_private)?;
+        return Ok((parent, false));
     }
     match StoreDirectory::open_with_control(path, control.clone()) {
         Ok(parent) => {
@@ -1683,6 +1762,136 @@ mod tests {
         assert_eq!(
             fs::metadata(&ancestor).unwrap().permissions().mode() & 0o777,
             0o777
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_ledger_uses_external_xdg_alias_and_keeps_owned_kio_private() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let _environment_lock = kio_core::test_control::test_env_lock().lock().unwrap();
+        let fixture = private_tempdir();
+        let real = fixture.path().join("external-data");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o777)).unwrap();
+        let alias = fixture.path().join("data-alias");
+        symlink(&real, &alias).unwrap();
+        let alias_before = fs::symlink_metadata(&alias).unwrap();
+        let _xdg =
+            kio_core::test_control::TestEnvGuard::set("XDG_DATA_HOME", alias.to_str().unwrap());
+        let control = kio_core::control::ControlHandle::default();
+        let path = crate::ledger::schema::default_ledger_path_with_control(&control).unwrap();
+        assert_eq!(path, alias.join("kio/cost-ledger.sqlite"));
+
+        let session = FsSession::acquire_with_control(&path, true, control).unwrap();
+        session
+            .create_only(&session.names().authority, b"authority")
+            .unwrap();
+        assert_eq!(
+            session
+                .read_private(&session.names().authority, 64)
+                .unwrap(),
+            b"authority"
+        );
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(
+            fs::metadata(real.join("kio")).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::symlink_metadata(&alias).unwrap().len(),
+            alias_before.len()
+        );
+
+        drop(session);
+        let parked = real.join("parked-kio");
+        fs::rename(real.join("kio"), &parked).unwrap();
+        symlink(&parked, real.join("kio")).unwrap();
+        let before = fs::read(parked.join("cost-ledger.sqlite.authority.json")).unwrap();
+        let error = FsSession::acquire_with_control(
+            &path,
+            false,
+            kio_core::control::ControlHandle::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            PipelineError::Contract {
+                code: "KIO-E-LEDGER-PRIVATE-001",
+                ..
+            }
+        ));
+        assert_eq!(
+            fs::read(parked.join("cost-ledger.sqlite.authority.json")).unwrap(),
+            before
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_ledger_creates_missing_xdg_base_beneath_external_alias() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let _environment_lock = kio_core::test_control::test_env_lock().lock().unwrap();
+        let fixture = private_tempdir();
+        let real = fixture.path().join("external-parent");
+        fs::create_dir(&real).unwrap();
+        fs::set_permissions(&real, fs::Permissions::from_mode(0o777)).unwrap();
+        let alias = fixture.path().join("parent-alias");
+        symlink(&real, &alias).unwrap();
+        let xdg_base = alias.join("new-data");
+        let _xdg =
+            kio_core::test_control::TestEnvGuard::set("XDG_DATA_HOME", xdg_base.to_str().unwrap());
+        let control = kio_core::control::ControlHandle::default();
+        let path = crate::ledger::schema::default_ledger_path_with_control(&control).unwrap();
+        assert_eq!(path, xdg_base.join("kio/cost-ledger.sqlite"));
+        assert!(!real.join("new-data").exists());
+
+        let session = FsSession::acquire_with_control(&path, true, control).unwrap();
+        session
+            .create_only(&session.names().authority, b"authority")
+            .unwrap();
+        assert_eq!(
+            session
+                .read_private(&session.names().authority, 64)
+                .unwrap(),
+            b"authority"
+        );
+        assert_eq!(
+            fs::metadata(&real).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(
+            fs::metadata(real.join("new-data"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(real.join("new-data/kio"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
         );
     }
 

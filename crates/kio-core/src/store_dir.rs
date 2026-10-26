@@ -67,6 +67,10 @@ impl StoreDirectory {
                 .map_err(|error| ioerr(path, error))?
                 .join(path)
         };
+        if let Some((root, suffix)) = crate::private_fs::resolve_inherited_private_root(&absolute)?
+        {
+            return Self::open_or_create_suffix(root, suffix);
+        }
         let absolute = platform::normalize_store_path(&absolute);
         let mut root = std::path::PathBuf::new();
         let mut names = Vec::new();
@@ -84,7 +88,11 @@ impl StoreDirectory {
         let root_handle =
             cap_primitives::fs::open_ambient_dir(&root, cap_primitives::ambient_authority())
                 .map_err(|error| ioerr(path, error))?;
-        let mut directory = Self::from_retained(root_handle, root)?;
+        let directory = Self::from_retained(root_handle, root)?;
+        Self::open_or_create_suffix(directory, names)
+    }
+
+    fn open_or_create_suffix(mut directory: Self, names: Vec<std::ffi::OsString>) -> Result<Self> {
         for name in names {
             let leaf = Path::new(&name);
             let handle = if directory.contains_entry(leaf)? {
@@ -111,6 +119,19 @@ impl StoreDirectory {
     }
 
     pub fn open_with_control(path: &Path, control: crate::control::ControlHandle) -> Result<Self> {
+        if let Some((mut directory, suffix)) =
+            crate::private_fs::resolve_inherited_private_root_with_control(path, &control)?
+        {
+            for name in suffix {
+                let handle = directory.open_directory(Path::new(&name))?;
+                directory = Self::from_retained_with_control(
+                    handle,
+                    directory.path().join(name),
+                    control.clone(),
+                )?;
+            }
+            return Ok(directory);
+        }
         let handle = platform::open(path)?;
         let handle = platform::normalize_directory_handle(handle, path)?;
         Ok(Self {

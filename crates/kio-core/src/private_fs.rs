@@ -4,7 +4,10 @@
 //! are outside the storage admission policy. Retained handles prevent a path
 //! replacement from redirecting an operation into another tree.
 
-use std::{ffi::OsString, path::Path};
+use std::{
+    ffi::OsString,
+    path::{Component, Path},
+};
 
 use serde_json::json;
 
@@ -47,7 +50,17 @@ pub fn read_private_file_at(
     name: &str,
     max_bytes: u64,
 ) -> Result<Vec<u8>> {
-    native::read_private_file_at(parent, name, max_bytes)
+    read_private_file_at_path(parent, Path::new(name), max_bytes)
+}
+
+/// Preserve native OS filename bytes while opening exactly one private leaf
+/// through the retained parent. No pathname ancestor is resolved here.
+pub fn read_private_file_at_path(
+    parent: &StoreDirectory,
+    name: &Path,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
+    native::read_private_file_at_path(parent, name, max_bytes)
 }
 
 /// Resolve the sole supported inherited-directory spelling as a retained
@@ -100,6 +113,121 @@ pub fn verify_private_directory_with_control(
 /// beneath an inherited directory capability.
 pub fn verify_private_directory_handle(directory: &StoreDirectory) -> Result<()> {
     native::verify_private_directory_handle(directory)
+}
+
+/// Retain a caller-declared external directory without changing it. Its path
+/// may contain aliases; the followed result is compared with a strict open of
+/// its canonical name before its handle becomes the private-child boundary.
+/// Callers must never pass a Kio-created directory as this external boundary.
+pub fn retain_external_directory(path: &Path) -> Result<StoreDirectory> {
+    retain_external_directory_with_control(path, &ControlHandle::default())
+}
+
+pub fn retain_external_directory_with_control(
+    path: &Path,
+    control: &ControlHandle,
+) -> Result<StoreDirectory> {
+    native::retain_external_directory(path, control.clone())
+}
+
+/// Retain a configured external base, creating only its absent components.
+/// Existing external names and permissions are left untouched; each component
+/// this call creates is private and verified through its retained handle.
+pub fn retain_or_create_external_directory_with_control(
+    base: &Path,
+    control: &ControlHandle,
+) -> Result<StoreDirectory> {
+    if !base.is_absolute()
+        || base
+            .components()
+            .any(|part| matches!(part, Component::CurDir | Component::ParentDir))
+    {
+        return Err(unsafe_file(
+            "external base must be absolute and normalized",
+            Some(base),
+        ));
+    }
+    let mut current = base.to_path_buf();
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(&current) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let leaf = current.file_name().ok_or_else(|| {
+                    unsafe_file("external base has no existing ancestor", Some(base))
+                })?;
+                missing.push(leaf.to_os_string());
+                current = current
+                    .parent()
+                    .ok_or_else(|| {
+                        unsafe_file("external base has no existing ancestor", Some(base))
+                    })?
+                    .to_path_buf();
+            }
+            Err(error) => {
+                return Err(crate::KioError::io(
+                    error.to_string(),
+                    current.display().to_string(),
+                ));
+            }
+        }
+    }
+    let mut directory = retain_external_directory_with_control(&current, control)?;
+    for leaf in missing.into_iter().rev() {
+        let name = Path::new(&leaf);
+        let (handle, created) = if directory.contains_entry(name)? {
+            (directory.open_directory(name)?, false)
+        } else {
+            match directory.create_directory(name) {
+                Ok(handle) => (handle, true),
+                Err(error) => (directory.open_directory(name).map_err(|_| error)?, false),
+            }
+        };
+        let next = StoreDirectory::from_retained_with_control(
+            handle,
+            directory.path().join(&leaf),
+            control.clone(),
+        )?;
+        if created {
+            verify_private_directory_handle(&next)?;
+        }
+        directory = next;
+    }
+    Ok(directory)
+}
+
+/// Traverse a Kio-created suffix beneath a retained external or private
+/// directory. Every component is opened without following links and checked
+/// for current-owner private protection before the next component is used.
+pub fn verify_private_directory_at(
+    parent: &StoreDirectory,
+    relative: &Path,
+) -> Result<StoreDirectory> {
+    let mut directory = parent.clone();
+    let mut count = 0;
+    for component in relative.components() {
+        let Component::Normal(name) = component else {
+            return Err(unsafe_file(
+                "private directory suffix contains an unsafe component",
+                Some(relative),
+            ));
+        };
+        count += 1;
+        let child = directory.open_directory(Path::new(name))?;
+        directory = StoreDirectory::from_retained_with_control(
+            child,
+            directory.path().join(name),
+            parent.control().clone(),
+        )?;
+        verify_private_directory_handle(&directory)?;
+    }
+    if count == 0 {
+        return Err(unsafe_file(
+            "private directory suffix is empty",
+            Some(relative),
+        ));
+    }
+    Ok(directory)
 }
 
 /// Verify owner-only protection on an already retained single-link regular file.

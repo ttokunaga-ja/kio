@@ -183,13 +183,16 @@ pub(crate) fn private_temp_dir() -> Result<PrivateOfficeScratch> {
 }
 
 pub(crate) fn restrict_renderer_state_directory(
-    path: &Path,
+    scratch: &kio_core::store_dir::StoreDirectory,
+    child: &str,
     purpose: &str,
     label: &str,
 ) -> Result<()> {
-    kio_core::private_fs::verify_private_directory(path).map_err(|error| {
-        AdapterError::ContractViolation(format!("unsafe private {purpose} {label}: {error}"))
-    })?;
+    kio_core::private_fs::verify_private_directory_at(scratch, Path::new(child)).map_err(
+        |error| {
+            AdapterError::ContractViolation(format!("unsafe private {purpose} {label}: {error}"))
+        },
+    )?;
     Ok(())
 }
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -429,7 +429,7 @@ pub(crate) fn write_private_uno_catalog(
     }
     let (start, end) = macos_spell_component_range(&bytes)?;
     let destination = scratch.join("services-without-macos-spell.rdb");
-    let directory = kio_core::private_fs::verify_private_directory(scratch).map_err(|error| {
+    let directory = crate::office_convert::bind_private_scratch(scratch).map_err(|error| {
         AdapterError::ContractViolation(format!("unsafe Office service catalog scratch: {error}"))
     })?;
     let mut output = directory

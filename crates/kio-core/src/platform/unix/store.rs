@@ -908,6 +908,10 @@ fn operation_directory(held: &File, label: &Path) -> Result<File> {
 mod tests {
     use super::same_directory_identity;
     use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
 
     #[test]
     fn directory_identity_ignores_namespace_metadata_but_rejects_other_objects() {
@@ -925,5 +929,41 @@ mod tests {
         fs::write(&file_path, b"regular").unwrap();
         let regular = fs::metadata(file_path).unwrap();
         assert!(!same_directory_identity(&before, &regular));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_directory_descriptor_opens_owned_children_without_resolving_dev_fd() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let owner = crate::store_dir::StoreDirectory::open(&root).unwrap();
+        owner.create_directory(Path::new("owned")).unwrap();
+        let owned = crate::store_dir::StoreDirectory::open(&root.join("owned")).unwrap();
+
+        let inherited = format!("/dev/fd/{}", owned.root_handle().as_raw_fd());
+        let through_descriptor = crate::store_dir::StoreDirectory::open(Path::new(&inherited))
+            .expect("an inherited owned directory remains a retained capability");
+        let child_path = Path::new(&inherited).join("child");
+        let child = crate::store_dir::StoreDirectory::open_or_create_directories(&child_path)
+            .expect("missing owned child is created relative to the retained descriptor");
+        crate::private_fs::verify_private_directory_handle(&child).unwrap();
+        assert!(root.join("owned/child").is_dir());
+        through_descriptor
+            .open_directory(Path::new("child"))
+            .unwrap();
+        assert!(
+            crate::store_dir::StoreDirectory::open(Path::new(&format!(
+                "/dev/fd/0{}",
+                owned.root_handle().as_raw_fd()
+            )))
+            .is_err()
+        );
+        assert!(
+            crate::store_dir::StoreDirectory::open_or_create_directories(Path::new(&format!(
+                "{inherited}/./not-created"
+            ),))
+            .is_err()
+        );
+        assert!(!root.join("owned/not-created").exists());
     }
 }

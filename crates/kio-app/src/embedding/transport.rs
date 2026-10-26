@@ -672,6 +672,7 @@ fn run_free_query_embedding_job(
     )?;
     let store = LocalExecution::new(
         LocalExecution::default_root(invocation.control)?,
+        LocalExecution::default_external_base(invocation.control)?,
         invocation.control.clone(),
     )?;
     let mut claim = match store.claim(

@@ -1440,7 +1440,8 @@ pub(crate) fn write_open_cache_atomic(cache: &Path, bytes: &[u8]) -> Result<()> 
     let parent = cache
         .parent()
         .ok_or_else(|| KioError::invalid_usage("cache has no parent"))?;
-    let directory = kio_core::private_fs::verify_private_directory(parent)?;
+    let directory = kio_core::store_dir::StoreDirectory::open(parent)?;
+    kio_core::private_fs::verify_private_directory_handle(&directory)?;
     let leaf = cache
         .file_name()
         .ok_or_else(|| KioError::invalid_usage("cache has no leaf"))?;
@@ -1463,9 +1464,11 @@ pub(crate) fn cache_directory(
         .strip_prefix(&root)
         .map_err(|_| KioError::invalid_usage("cache is outside the Kio cache root"))?;
     let mut directory = if create {
-        crate::private_state::ensure_private_directory(&root, control)?
+        crate::private_state::ensure_private_directory(&root, &cache_home(control), control)?
     } else {
-        let Some(directory) = crate::private_state::open_readonly(&root, control)? else {
+        let Some(directory) =
+            crate::private_state::open_readonly(&root, &cache_home(control), control)?
+        else {
             return Ok(None);
         };
         directory

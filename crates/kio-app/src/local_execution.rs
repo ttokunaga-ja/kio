@@ -236,6 +236,7 @@ impl Record {
 
 pub(crate) struct LocalExecution {
     root: PathBuf,
+    external_base: PathBuf,
     control: ControlHandle,
 }
 
@@ -260,18 +261,37 @@ pub(crate) struct LocalGuard {
 }
 
 impl LocalExecution {
-    pub(crate) fn new(root: PathBuf, control: ControlHandle) -> Result<Self> {
-        if !root.is_absolute() {
-            return Err(invalid("local execution root must be absolute"));
+    pub(crate) fn new(
+        root: PathBuf,
+        external_base: PathBuf,
+        control: ControlHandle,
+    ) -> Result<Self> {
+        if !root.is_absolute()
+            || !external_base.is_absolute()
+            || root
+                .strip_prefix(&external_base)
+                .ok()
+                .is_none_or(|suffix| suffix.as_os_str().is_empty())
+        {
+            return Err(invalid(
+                "local execution root must be below its absolute external base",
+            ));
         }
-        Ok(Self { root, control })
+        Ok(Self {
+            root,
+            external_base,
+            control,
+        })
+    }
+
+    pub(crate) fn default_external_base(control: &ControlHandle) -> Result<PathBuf> {
+        kio_core::xdg::xdg_dir("XDG_STATE_HOME")
+            .or_else(|| control.home_dir().map(|home| home.join(".local/state")))
+            .ok_or_else(|| invalid("absolute state home is required"))
     }
 
     pub(crate) fn default_root(control: &ControlHandle) -> Result<PathBuf> {
-        let state = kio_core::xdg::xdg_dir("XDG_STATE_HOME")
-            .or_else(|| control.home_dir().map(|home| home.join(".local/state")))
-            .ok_or_else(|| invalid("absolute state home is required"))?;
-        Ok(state.join("kio/local-execution"))
+        Ok(Self::default_external_base(control)?.join("kio/local-execution"))
     }
 
     pub(crate) fn claim(
@@ -291,7 +311,8 @@ impl LocalExecution {
             return Err(invalid("max_attempts must be positive"));
         }
         let path = self.root.join(&key);
-        let existing = private_state::open_existing(&path, LOCK, &self.control);
+        let existing =
+            private_state::open_existing(&path, &self.external_base, LOCK, &self.control);
         let (state, mut record, created) = match existing {
             Ok(Some(state)) => {
                 let record = read_record(state.directory(), &key, identity)?;
@@ -321,12 +342,18 @@ impl LocalExecution {
                 }
                 match private_state::create_initialized(
                     &path,
+                    &self.external_base,
                     LOCK,
                     |directory| write_record(directory, &initial, Publication::CreateOnly),
                     &self.control,
                 ) {
                     Ok(state) => (state, Some(initial), true),
-                    Err(error) => match private_state::open_existing(&path, LOCK, &self.control) {
+                    Err(error) => match private_state::open_existing(
+                        &path,
+                        &self.external_base,
+                        LOCK,
+                        &self.control,
+                    ) {
                         Ok(Some(state)) => {
                             let record = read_record(state.directory(), &key, identity)?;
                             (state, Some(record), false)
@@ -914,8 +941,12 @@ mod tests {
     #[test]
     fn retirement_preserves_a_replaced_published_result() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let mut owner = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(owner) => owner,
@@ -951,8 +982,12 @@ mod tests {
     #[test]
     fn interrupted_retirement_rechecks_exact_result_before_cleanup() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let mut owner = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(owner) => owner,
@@ -991,8 +1026,12 @@ mod tests {
     #[test]
     fn retired_record_rejects_unexpected_leftover_result() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let mut owner = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(owner) => owner,
@@ -1022,8 +1061,12 @@ mod tests {
     #[test]
     fn retirement_recovers_after_exact_remove_before_terminal_record() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let mut owner = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(owner) => owner,
@@ -1060,8 +1103,12 @@ mod tests {
     #[test]
     fn result_ready_recovers_without_spending_another_attempt_or_storing_query() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let mut owner = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(owner) => owner,
@@ -1104,8 +1151,12 @@ mod tests {
     #[test]
     fn interrupted_intent_consumes_attempt_and_backoff_survives_restart() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let owner = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(owner) => owner,
@@ -1135,8 +1186,12 @@ mod tests {
     #[test]
     fn retired_query_is_a_fresh_invocation_with_the_same_lock() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         for _ in 0..6 {
             let mut guard = match store.claim(&identity, 0, None, 5, 0).unwrap() {
@@ -1153,8 +1208,12 @@ mod tests {
     #[test]
     fn published_query_from_previous_call_is_not_a_persistent_result_cache() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let mut first = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(guard) => guard,
@@ -1176,8 +1235,12 @@ mod tests {
     #[test]
     fn terminal_query_failure_allows_later_fresh_call_but_live_backoff_holds() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let mut first = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(guard) => guard,
@@ -1215,8 +1278,12 @@ mod tests {
     #[test]
     fn query_attempt_limit_does_not_cancel_live_network_backoff() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let mut first = match store.claim(&identity, 0, None, 1, 0).unwrap() {
             Claim::Claimed(guard) => guard,
@@ -1258,8 +1325,12 @@ mod tests {
     #[test]
     fn unbound_result_under_intent_is_preserved_and_refused() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let owner = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(guard) => guard,
@@ -1283,8 +1354,12 @@ mod tests {
     #[test]
     fn staged_result_crash_recovers_exact_bytes_without_new_adapter_attempt() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let owner = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(guard) => guard,
@@ -1317,8 +1392,12 @@ mod tests {
     #[test]
     fn staged_result_crash_rejects_mismatched_payload_without_removal() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let owner = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(guard) => guard,
@@ -1348,8 +1427,12 @@ mod tests {
     #[test]
     fn unconsumed_rate_limit_and_terminal_error_survive_restart() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = document_identity();
         let mut first = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(guard) => guard,
@@ -1388,8 +1471,12 @@ mod tests {
     #[test]
     fn durable_refund_overrides_stale_task_attempt_floor() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let mut first = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(guard) => guard,
@@ -1417,8 +1504,12 @@ mod tests {
     #[test]
     fn cancelled_unsent_intent_refunds_attempt_and_rotates_owner_token() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let mut first = match store.claim(&identity, 0, None, 5, 0).unwrap() {
             Claim::Claimed(guard) => guard,
@@ -1438,8 +1529,12 @@ mod tests {
     #[test]
     fn corrupt_known_result_and_unknown_record_fields_fail_closed() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         let path = temp.path().join("state").join(identity.key().unwrap());
         let mut guard = match store.claim(&identity, 0, None, 5, 0).unwrap() {
@@ -1462,7 +1557,12 @@ mod tests {
     fn missing_state_keeps_task_attempt_and_backoff_floor() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("state");
-        let store = LocalExecution::new(root.clone(), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            root.clone(),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let identity = query_identity();
         assert!(matches!(
             store.claim(&identity, 5, None, 5, 0).unwrap(),
@@ -1485,8 +1585,12 @@ mod tests {
     #[test]
     fn in_process_interruption_uses_three_logical_attempts_without_network_backoff() {
         let temp = tempfile::tempdir().unwrap();
-        let store =
-            LocalExecution::new(temp.path().join("state"), ControlHandle::default()).unwrap();
+        let store = LocalExecution::new(
+            temp.path().join("state"),
+            temp.path().to_path_buf(),
+            ControlHandle::default(),
+        )
+        .unwrap();
         let mut identity = query_identity();
         identity.execution = LocalExecutionKind::InProcess;
         let first = match store.claim(&identity, 0, None, 5, 0).unwrap() {

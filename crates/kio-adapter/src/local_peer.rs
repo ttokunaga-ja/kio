@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use ureq::tls::{Certificate, RootCerts, TlsConfig, parse_pem};
 
 use crate::http_policy::HttpPolicy;
+use crate::tool_lock::{ManagedLocalTrustProvider, ManagedLocalTrustSnapshot};
 use crate::{AdapterError, Result};
 
 const MAX_CA_PEM_BYTES: u64 = 1024 * 1024;
@@ -24,6 +25,7 @@ pub struct AuthenticatedLocalEndpoint {
     base_url: String,
     ca_pem_path: PathBuf,
     expected_trust_digest: String,
+    managed_local_trust: Option<std::sync::Arc<dyn ManagedLocalTrustProvider>>,
     control: kio_core::control::ControlHandle,
 }
 
@@ -78,6 +80,38 @@ impl AuthenticatedLocalEndpoint {
             base_url,
             ca_pem_path,
             expected_trust_digest,
+            managed_local_trust: None,
+            control,
+        })
+    }
+
+    /// Keep the application's managed trust lease alive for every use of this
+    /// endpoint. The CA is read from its retained private directory, including
+    /// after the settings object that created this endpoint has been dropped.
+    pub(crate) fn new_managed_bound(
+        base_url: impl AsRef<str>,
+        snapshot: ManagedLocalTrustSnapshot,
+        provider: std::sync::Arc<dyn ManagedLocalTrustProvider>,
+        control: kio_core::control::ControlHandle,
+    ) -> Result<Self> {
+        let base_url = validate_local_https_url(base_url.as_ref())?;
+        if !snapshot.path.is_absolute()
+            || snapshot.directory.path().join(&snapshot.leaf) != snapshot.path
+        {
+            return Err(config_error(
+                "KIO-E-LOCAL-PEER-CA-PATH-001",
+                "managed local CA snapshot has an invalid path binding",
+            ));
+        }
+        let trust = load_managed_ca_bundle(&snapshot)?;
+        if trust.digest != snapshot.digest {
+            return Err(trust_changed(&snapshot.path));
+        }
+        Ok(Self {
+            base_url,
+            ca_pem_path: snapshot.path,
+            expected_trust_digest: snapshot.digest,
+            managed_local_trust: Some(provider),
             control,
         })
     }
@@ -125,7 +159,18 @@ impl AuthenticatedLocalEndpoint {
     }
 
     fn current_trust(&self) -> Result<TrustBundle> {
-        let trust = load_ca_bundle(&self.ca_pem_path, &self.control)?;
+        let trust = if let Some(provider) = &self.managed_local_trust {
+            let snapshot = provider.acquire().map_err(AdapterError::RuntimeTrust)?;
+            if snapshot.path != self.ca_pem_path
+                || snapshot.directory.path().join(&snapshot.leaf) != snapshot.path
+                || snapshot.digest != self.expected_trust_digest
+            {
+                return Err(trust_changed(&self.ca_pem_path));
+            }
+            load_managed_ca_bundle(&snapshot)?
+        } else {
+            load_ca_bundle(&self.ca_pem_path, &self.control)?
+        };
         if trust.digest != self.expected_trust_digest {
             return Err(trust_changed(&self.ca_pem_path));
         }
@@ -217,14 +262,45 @@ pub(crate) fn validate_local_https_url(input: &str) -> Result<String> {
 }
 
 fn load_ca_bundle(path: &Path, control: &kio_core::control::ControlHandle) -> Result<TrustBundle> {
-    let bytes =
-        kio_core::private_fs::read_private_file_with_control(path, MAX_CA_PEM_BYTES, control)
-            .map_err(|error| {
-                config_error(
-                    "KIO-E-LOCAL-PEER-CA-PROTECTION-001",
-                    format!("{}: {}", error.error_code(), error.message()),
-                )
-            })?;
+    let read = || -> kio_core::Result<Vec<u8>> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| kio_core::KioError::invalid_usage("local CA path has no parent"))?;
+        let leaf = path
+            .file_name()
+            .ok_or_else(|| kio_core::KioError::invalid_usage("local CA path has no leaf"))?;
+        let retained =
+            kio_core::private_fs::retain_external_directory_with_control(parent, control)?;
+        kio_core::private_fs::read_private_file_at_path(
+            &retained,
+            Path::new(leaf),
+            MAX_CA_PEM_BYTES,
+        )
+    };
+    let bytes = read().map_err(|error| {
+        config_error(
+            "KIO-E-LOCAL-PEER-CA-PROTECTION-001",
+            format!("{}: {}", error.error_code(), error.message()),
+        )
+    })?;
+    load_ca_bundle_bytes(&bytes)
+}
+
+fn load_managed_ca_bundle(snapshot: &ManagedLocalTrustSnapshot) -> Result<TrustBundle> {
+    let read = || -> kio_core::Result<Vec<u8>> {
+        kio_core::private_fs::verify_private_directory_handle(&snapshot.directory)?;
+        kio_core::private_fs::read_private_file_at_path(
+            &snapshot.directory,
+            &snapshot.leaf,
+            MAX_CA_PEM_BYTES,
+        )
+    };
+    let bytes = read().map_err(|error| {
+        config_error(
+            "KIO-E-LOCAL-PEER-CA-PROTECTION-001",
+            format!("{}: {}", error.error_code(), error.message()),
+        )
+    })?;
     load_ca_bundle_bytes(&bytes)
 }
 
@@ -319,15 +395,7 @@ mod tests {
     use std::sync::Arc;
 
     fn private_ca_file(pem: &str) -> (tempfile::TempDir, PathBuf) {
-        // The platform temp root can itself be a symlink (notably `/var` on
-        // macOS), which the production trust reader must reject.  Place this
-        // private fixture beneath the checkout instead.
-        #[cfg(unix)]
-        let directory = tempfile::Builder::new()
-            .prefix("kio-local-peer-")
-            .tempdir_in(std::env::current_dir().unwrap())
-            .unwrap();
-        #[cfg(windows)]
+        // Exercise the system temp layout, including macOS's /var alias.
         let directory = tempfile::Builder::new()
             .prefix("kio-local-peer-")
             .tempdir()

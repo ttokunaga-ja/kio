@@ -83,8 +83,7 @@ impl LedgerBackup {
         destination: &Path,
         control: &ControlHandle,
     ) -> Result<()> {
-        let s = kio_core::private_fs::verify_private_directory_with_control(destination, control)
-            .map_err(store_err)?;
+        let s = bind_private_backup_destination(destination, control)?;
         if !s.entries(Path::new("")).map_err(store_err)?.is_empty() {
             return Err(err(
                 "KIO-E-LEDGER-BACKUP-EXISTS-001",
@@ -112,8 +111,7 @@ impl LedgerBackup {
         Self::load_with_control(destination, ControlHandle::default())
     }
     pub fn load_with_control(destination: &Path, control: ControlHandle) -> Result<Self> {
-        let s = kio_core::private_fs::verify_private_directory_with_control(destination, &control)
-            .map_err(store_err)?;
+        let s = bind_private_backup_destination(destination, &control)?;
         let atomic = s.inspect_atomic().map_err(|_| {
             err(
                 "KIO-E-LEDGER-BACKUP-MANIFEST-001",
@@ -190,6 +188,26 @@ fn put(s: &StoreDirectory, n: &str, b: &[u8]) -> Result<()> {
         .map_err(store_err)?;
     s.ensure_owner_private(Path::new(n)).map_err(store_err)
 }
+fn bind_private_backup_destination(
+    destination: &Path,
+    control: &ControlHandle,
+) -> Result<StoreDirectory> {
+    let parent = destination.parent().ok_or_else(|| {
+        err(
+            "KIO-E-LEDGER-BACKUP-PRIVATE-001",
+            "backup destination has no external parent",
+        )
+    })?;
+    let leaf = destination.file_name().ok_or_else(|| {
+        err(
+            "KIO-E-LEDGER-BACKUP-PRIVATE-001",
+            "backup destination has no private leaf",
+        )
+    })?;
+    let external = kio_core::private_fs::retain_external_directory_with_control(parent, control)
+        .map_err(store_err)?;
+    kio_core::private_fs::verify_private_directory_at(&external, Path::new(leaf)).map_err(store_err)
+}
 fn digest(b: &[u8]) -> DigestRecord {
     DigestRecord {
         bytes: b.len() as u64,
@@ -246,6 +264,29 @@ mod tests {
             path: temporary.path().join("private"),
             _temporary: temporary,
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backup_uses_external_alias_but_refuses_linked_private_destination() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().unwrap();
+        let real = temporary.path().join("external");
+        fs::create_dir(&real).unwrap();
+        let alias = temporary.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let external = kio_core::private_fs::retain_external_directory(&real).unwrap();
+        external.create_directory(Path::new("private")).unwrap();
+
+        let destination = alias.join("private");
+        let expected = backup();
+        expected.publish_create_only(&destination).unwrap();
+        let reopened = LedgerBackup::load(&destination).unwrap();
+        assert_eq!(reopened.identity(), expected.identity());
+
+        symlink(real.join("private"), real.join("linked-private")).unwrap();
+        assert!(LedgerBackup::load(&alias.join("linked-private")).is_err());
     }
 
     #[cfg(debug_assertions)]

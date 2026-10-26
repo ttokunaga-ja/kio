@@ -631,6 +631,7 @@ fn run_embedding_enrichment_for_instances(
         .then(|| {
             crate::local_execution::LocalExecution::new(
                 crate::local_execution::LocalExecution::default_root(invocation.control)?,
+                crate::local_execution::LocalExecution::default_external_base(invocation.control)?,
                 invocation.control.clone(),
             )
         })

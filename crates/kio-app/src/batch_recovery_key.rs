@@ -10,10 +10,12 @@ const KEY_BYTES: u64 = 32;
 
 pub(crate) fn load_or_create(
     parent_path: &Path,
+    external_base: &Path,
     pending_bound_authority: bool,
     control: &kio_core::control::ControlHandle,
 ) -> Result<BatchRecoveryContext> {
-    let parent = crate::private_state::ensure_private_directory(parent_path, control)?;
+    let parent =
+        crate::private_state::ensure_private_directory(parent_path, external_base, control)?;
     load_or_create_at(&parent, pending_bound_authority)
 }
 
@@ -77,6 +79,7 @@ mod tests {
         let root = private_tempdir();
         let parent = crate::private_state::ensure_private_directory(
             root.path(),
+            root.path().parent().unwrap(),
             &kio_core::control::ControlHandle::default(),
         )
         .unwrap();
@@ -109,6 +112,7 @@ mod tests {
         let root = private_tempdir();
         let parent = crate::private_state::ensure_private_directory(
             root.path(),
+            root.path().parent().unwrap(),
             &kio_core::control::ControlHandle::default(),
         )
         .unwrap();
@@ -125,6 +129,7 @@ mod tests {
         std::os::unix::fs::symlink(&target, root.path().join(KEY_LEAF)).unwrap();
         let parent = crate::private_state::ensure_private_directory(
             root.path(),
+            root.path().parent().unwrap(),
             &kio_core::control::ControlHandle::default(),
         )
         .unwrap();

@@ -88,7 +88,7 @@ fn config_flip_after_publication_cannot_activate_manual_only_gc() {
     let tree_before = fs::read(tree_path(&dir, &tree)).unwrap();
     let ready = dir.path().join("post-publication.ready");
 
-    let child = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("kio"))
         .current_dir(dir.path())
         .env("HOME", dir.path().join("home"))
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
@@ -101,14 +101,31 @@ fn config_flip_after_publication_cannot_activate_manual_only_gc() {
         .args(["index", "--offline", "--yes", "--json"])
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let started = std::time::Instant::now();
+    let deadline = started + std::time::Duration::from_secs(60);
+    let mut early_exit = None;
     while !ready.exists() && std::time::Instant::now() < deadline {
+        if let Some(status) = child.try_wait().unwrap() {
+            early_exit = Some(status);
+            break;
+        }
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
-    assert!(
-        ready.exists(),
-        "index did not reach the post-publication barrier"
-    );
+    if !ready.exists() {
+        // Preserve the child's actual failure instead of dropping it on a
+        // timeout. Only the process spawned above may be terminated here.
+        let child_pid = child.id();
+        let termination = early_exit.is_none().then(|| child.kill());
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "index did not reach the post-publication barrier after {:?}; child pid={}; early_exit={early_exit:?}; termination={termination:?}; status={:?}; stdout={}; stderr={}",
+            started.elapsed(),
+            child_pid,
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
     // This write lands strictly after preflight and the durable index result,
     // but before the automatic hook's second capability-bound config read.
     configure(&dir, "after_index");

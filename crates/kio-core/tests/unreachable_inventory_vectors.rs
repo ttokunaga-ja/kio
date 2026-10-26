@@ -895,7 +895,10 @@ fn active_gc_purge_and_uncertain_writer_states_fail_closed() {
     );
 
     let write_lock = |fixture: &Fixture, bytes: &[u8]| {
-        let parent = kio_core::private_fs::verify_private_directory(&fixture.kio()).unwrap();
+        let external = kio_core::private_fs::retain_external_directory(fixture.root()).unwrap();
+        let parent =
+            kio_core::private_fs::verify_private_directory_at(&external, Path::new(".kio"))
+                .unwrap();
         let mut lock = parent.create_private_file(Path::new(".lock")).unwrap();
         std::io::Write::write_all(&mut lock, bytes).unwrap();
     };

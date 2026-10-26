@@ -655,7 +655,8 @@ pub(crate) fn ensure_device_dirs_resolvable(control: &ControlHandle) -> Result<(
 /// to this device so a caller cannot forge or tamper a token to jump scope or
 /// page — `query_hash` alone covers only public inputs.
 pub(crate) fn cursor_signing_key(control: &ControlHandle) -> Result<Vec<u8>> {
-    cursor_key::load_or_create(&data_home(control).join("kio"), control)
+    let external_base = data_home(control);
+    cursor_key::load_or_create(&external_base.join("kio"), &external_base, control)
 }
 
 /// Invoked lazily only after a real batch credential is resolved. An absent
@@ -674,8 +675,10 @@ pub(crate) fn batch_recovery_context(
             .as_deref()
             .is_some_and(kio_adapter::batch_recovery::is_bound_recovery_scope)
     });
+    let external_base = data_home(ledger.control());
     batch_recovery_key::load_or_create(
-        &data_home(ledger.control()).join("kio"),
+        &external_base.join("kio"),
+        &external_base,
         pending,
         ledger.control(),
     )

@@ -15,9 +15,11 @@ const CURSOR_KEY_BYTES: u64 = 32;
 
 pub(crate) fn load_or_create(
     parent_path: &Path,
+    external_base: &Path,
     control: &kio_core::control::ControlHandle,
 ) -> Result<Vec<u8>> {
-    let parent = crate::private_state::ensure_private_directory(parent_path, control)?;
+    let parent =
+        crate::private_state::ensure_private_directory(parent_path, external_base, control)?;
     load_or_create_at(&parent)
 }
 
@@ -100,6 +102,7 @@ mod tests {
         let root = private_tempdir();
         let parent = crate::private_state::ensure_private_directory(
             root.path(),
+            root.path().parent().unwrap(),
             &kio_core::control::ControlHandle::default(),
         )
         .unwrap();
@@ -124,6 +127,7 @@ mod tests {
         let malformed_root = private_tempdir();
         let malformed_parent = crate::private_state::ensure_private_directory(
             malformed_root.path(),
+            malformed_root.path().parent().unwrap(),
             &kio_core::control::ControlHandle::default(),
         )
         .unwrap();
@@ -150,6 +154,7 @@ mod tests {
             symlink(&victim_key, symlink_root.path().join(CURSOR_KEY_LEAF)).unwrap();
             let symlink_parent = crate::private_state::ensure_private_directory(
                 symlink_root.path(),
+                symlink_root.path().parent().unwrap(),
                 &kio_core::control::ControlHandle::default(),
             )
             .unwrap();

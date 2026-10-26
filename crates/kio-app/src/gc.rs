@@ -405,7 +405,7 @@ fn wait_at_post_publication_test_barrier(control: &kio_core::control::ControlHan
         return;
     }
     let release_path = ready_path.with_extension("release");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !release_path.exists() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(5));
     }

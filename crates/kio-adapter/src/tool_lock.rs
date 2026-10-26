@@ -179,14 +179,26 @@ fn read_private_tools_bytes_with_control(
     path: &Path,
     control: &kio_core::control::ControlHandle,
 ) -> Result<Vec<u8>> {
-    let bytes =
-        kio_core::private_fs::read_private_file_with_control(path, MAX_TOOLS_TOML_BYTES, control)
-            .map_err(|_| AdapterError::ConfigSchemaCoded {
-            code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
-            message:
-                "tools.toml containing a plain credential must be an owner-private regular file"
-                    .to_owned(),
-        })?;
+    let read = || -> kio_core::Result<Vec<u8>> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| kio_core::KioError::invalid_usage("private tools path has no parent"))?;
+        let leaf = path
+            .file_name()
+            .ok_or_else(|| kio_core::KioError::invalid_usage("private tools path has no leaf"))?;
+        let retained =
+            kio_core::private_fs::retain_external_directory_with_control(parent, control)?;
+        kio_core::private_fs::read_private_file_at_path(
+            &retained,
+            Path::new(leaf),
+            MAX_TOOLS_TOML_BYTES,
+        )
+    };
+    let bytes = read().map_err(|_| AdapterError::ConfigSchemaCoded {
+        code: TOOLS_PRIVATE_CREDENTIAL_ERROR,
+        message: "tools.toml containing a plain credential must be an owner-private regular file"
+            .to_owned(),
+    })?;
     Ok(bytes)
 }
 
@@ -1080,11 +1092,13 @@ fn optional_string_array(table: &toml::value::Table, field: &str) -> Vec<String>
         .collect()
 }
 
-/// Non-secret CA identity acquired by the application at a selected HTTPS boundary.
+/// Managed CA identity and the retained private directory that owns its snapshot.
 #[derive(Debug, Clone)]
 pub struct ManagedLocalTrustSnapshot {
     pub path: PathBuf,
     pub digest: String,
+    pub directory: kio_core::store_dir::StoreDirectory,
+    pub leaf: PathBuf,
 }
 
 /// The application owns the retained filesystem lock; settings retain this
@@ -1301,15 +1315,25 @@ impl AdapterRuntimeSettings {
         role: &str,
         url: &str,
     ) -> Result<crate::local_peer::AuthenticatedLocalEndpoint> {
-        let ca_path = self.local_peer_ca_path()?;
-        let trust_digest = self.local_peer_trust_digest()?;
-        crate::local_peer::AuthenticatedLocalEndpoint::new_bound(
-            url,
-            ca_path,
-            trust_digest,
-            self.control.clone(),
-        )
-        .map_err(|error| match error {
+        let endpoint = if let Some(provider) = &self.managed_local_trust {
+            let trust = provider.acquire().map_err(AdapterError::RuntimeTrust)?;
+            crate::local_peer::AuthenticatedLocalEndpoint::new_managed_bound(
+                url,
+                trust,
+                std::sync::Arc::clone(provider),
+                self.control.clone(),
+            )
+        } else {
+            let ca_path = self.local_peer_ca_path()?;
+            let trust_digest = self.local_peer_trust_digest()?;
+            crate::local_peer::AuthenticatedLocalEndpoint::new_bound(
+                url,
+                ca_path,
+                trust_digest,
+                self.control.clone(),
+            )
+        };
+        endpoint.map_err(|error| match error {
             AdapterError::LocalPeerConfig { code, message } => AdapterError::LocalPeerConfig {
                 code,
                 message: format!("local peer for `{role}` is unavailable: {message}"),
@@ -2233,6 +2257,54 @@ auth = "env:MISTRAL_API_KEY"
             resolve_auth("plain:"),
             Err(AdapterError::ConfigSchema(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_tools_source_accepts_external_alias_without_changing_it() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let fixture = tempfile::tempdir().unwrap();
+        let real = fixture.path().join("external");
+        std::fs::create_dir(&real).unwrap();
+        let alias = fixture.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let path = real.join("tools.toml");
+        let source = b"[embedding.gemini_embedding_2]\nauth = \"plain:verified-key\"\n";
+        std::fs::write(&path, source).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let alias_before = std::fs::symlink_metadata(&alias).unwrap();
+
+        assert_eq!(
+            read_private_tools_toml_for_roles_with_control(
+                &alias.join("tools.toml"),
+                &kio_core::control::ControlHandle::default(),
+                &["embedding"],
+            )
+            .unwrap(),
+            source,
+        );
+        assert!(
+            std::fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(&alias).unwrap().len(),
+            alias_before.len()
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        symlink(fixture.path().join("wrong"), &path).unwrap();
+        assert!(
+            read_private_tools_toml_for_roles_with_control(
+                &alias.join("tools.toml"),
+                &kio_core::control::ControlHandle::default(),
+                &["embedding"],
+            )
+            .is_err()
+        );
     }
 
     #[cfg(unix)]

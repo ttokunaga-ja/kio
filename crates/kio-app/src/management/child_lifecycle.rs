@@ -367,12 +367,14 @@ fn finish_retirement(
     )?;
     if PrivateGrantStore::open_readonly(
         &crate::approvals::store_path(store.control()),
+        &crate::settings::data_home(store.control()),
         store.control(),
     )?
     .is_some()
     {
         PrivateGrantStore::open_or_create(
             &crate::approvals::store_path(store.control()),
+            &crate::settings::data_home(store.control()),
             store.control(),
         )?
         .revoke_scope_instance(

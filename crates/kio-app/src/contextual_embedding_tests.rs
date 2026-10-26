@@ -1655,6 +1655,7 @@ fn o3_fresh_local_image_claim_survives_competing_enrichment() {
     let owner = std::thread::spawn(move || {
         let store = crate::local_execution::LocalExecution::new(
             crate::local_execution::LocalExecution::default_root(&owner_control).unwrap(),
+            crate::local_execution::LocalExecution::default_external_base(&owner_control).unwrap(),
             owner_control.clone(),
         )
         .unwrap();

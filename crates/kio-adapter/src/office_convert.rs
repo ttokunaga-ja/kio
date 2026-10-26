@@ -357,13 +357,33 @@ fn office_extension(media_type: &str) -> Option<&'static str> {
     }
 }
 
+pub(crate) fn bind_private_scratch(
+    path: &Path,
+) -> kio_core::Result<kio_core::store_dir::StoreDirectory> {
+    bind_private_scratch_with_control(path, &kio_core::control::ControlHandle::default())
+}
+
+fn bind_private_scratch_with_control(
+    path: &Path,
+    control: &kio_core::control::ControlHandle,
+) -> kio_core::Result<kio_core::store_dir::StoreDirectory> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| kio_core::KioError::invalid_usage("Office scratch path has no parent"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| kio_core::KioError::invalid_usage("Office scratch path has no leaf"))?;
+    let external = kio_core::private_fs::retain_external_directory_with_control(parent, control)?;
+    kio_core::private_fs::verify_private_directory_at(&external, Path::new(leaf))
+}
+
 /// Construct all renderer-owned mutable state before process creation. These
 /// names are derived only from an exclusively-created private scratch parent;
 /// each child is created with protected owner-only access before any
 /// invocation-specific renderer access is granted.
 fn create_private_renderer_state(scratch: &Path, purpose: &str) -> Result<PathBuf> {
     let profile = scratch.join("lo-profile");
-    let directory = kio_core::private_fs::verify_private_directory(scratch).map_err(|error| {
+    let directory = bind_private_scratch(scratch).map_err(|error| {
         AdapterError::ContractViolation(format!("unsafe Office scratch for {purpose}: {error}"))
     })?;
     for (name, label) in [
@@ -378,7 +398,7 @@ fn create_private_renderer_state(scratch: &Path, purpose: &str) -> Result<PathBu
                     "failed to create private {purpose} {label}: {error}"
                 ))
             })?;
-        restrict_renderer_state_directory(&scratch.join(name), purpose, label)?;
+        restrict_renderer_state_directory(&directory, name, purpose, label)?;
     }
     Ok(profile)
 }
@@ -422,13 +442,12 @@ fn convert_with_real_binary(
     let scratch = private_temp_dir()?;
     let workdir = scratch.path();
 
-    let scratch_directory =
-        kio_core::private_fs::verify_private_directory_with_control(workdir, &converter.control)
-            .map_err(|error| {
-                AdapterError::ContractViolation(format!(
-                    "failed to retain private Office scratch: {error}"
-                ))
-            })?;
+    let scratch_directory = bind_private_scratch_with_control(workdir, &converter.control)
+        .map_err(|error| {
+            AdapterError::ContractViolation(format!(
+                "failed to retain private Office scratch: {error}"
+            ))
+        })?;
     let input_leaf = format!("input.{extension}");
     let input_path = workdir.join(&input_leaf);
     let mut staged_input = scratch_directory
@@ -1523,6 +1542,29 @@ mod tests {
             !path.exists(),
             "successful cleanup must retire the original scratch path"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn office_scratch_external_alias_keeps_private_children_nofollow() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().unwrap();
+        let real = fixture.path().join("external");
+        std::fs::create_dir(&real).unwrap();
+        let alias = fixture.path().join("alias");
+        symlink(&real, &alias).unwrap();
+        let external = kio_core::private_fs::retain_external_directory(&real).unwrap();
+        external.create_directory(Path::new("scratch")).unwrap();
+        let scratch = alias.join("scratch");
+
+        create_private_renderer_state(&scratch, "test").unwrap();
+        let directory = bind_private_scratch(&scratch).unwrap();
+        kio_core::private_fs::verify_private_directory_at(&directory, Path::new("lo-profile"))
+            .unwrap();
+
+        symlink(real.join("scratch"), real.join("linked-scratch")).unwrap();
+        assert!(bind_private_scratch(&alias.join("linked-scratch")).is_err());
     }
 
     #[cfg(unix)]
