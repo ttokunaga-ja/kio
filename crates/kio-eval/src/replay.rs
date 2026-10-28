@@ -581,7 +581,7 @@ fn validate_result(
     output: &BoundedProcessOutput,
     requested_message: Option<&str>,
 ) -> Result<(), ReplayError> {
-    if !output.stderr.is_empty() {
+    if !output.stderr.is_empty() && !is_replay_readiness_diagnostic(command, &output.stderr) {
         return Err(ReplayError::Result {
             command,
             reason: format!(
@@ -628,6 +628,16 @@ fn validate_result(
             command,
             reason: "unexpected JSON result".into(),
         }),
+    }
+}
+
+fn is_replay_readiness_diagnostic(command: &str, stderr: &str) -> bool {
+    const NO_ADAPTER: &str = "Adapter readiness: not evaluated; reason: this operation does not select a network Adapter\n";
+    const NO_MANAGED_CA: &str = "Adapter HTTPS readiness: not evaluated; reason: no managed CA was acquired for this operation\n";
+    match command {
+        "ledger_init" | "init" | "snapshot" | "log" => stderr == NO_ADAPTER,
+        "index" => stderr == NO_MANAGED_CA,
+        _ => false,
     }
 }
 
@@ -929,6 +939,30 @@ mod tests {
         assert!(matches!(
             validate_result("init", &out, None),
             Err(ReplayError::Result { reason, .. }) if reason.contains("degraded cache write\\n")
+        ));
+    }
+    #[test]
+    fn successful_local_replay_command_accepts_only_readiness_diagnostic() {
+        let out = BoundedProcessOutput {
+            status: successful_status(),
+            stdout: r#"{"status":"initialized"}"#.into(),
+            stderr: "Adapter readiness: not evaluated; reason: this operation does not select a network Adapter\n".into(),
+            duration: std::time::Duration::ZERO,
+        };
+        assert!(validate_result("init", &out, None).is_ok());
+        let mixed = BoundedProcessOutput {
+            stderr: format!("{}degraded cache write\n", out.stderr),
+            ..out
+        };
+        assert!(validate_result("init", &mixed, None).is_err());
+        assert!(!is_replay_readiness_diagnostic("index", &mixed.stderr));
+        assert!(is_replay_readiness_diagnostic(
+            "index",
+            "Adapter HTTPS readiness: not evaluated; reason: no managed CA was acquired for this operation\n"
+        ));
+        assert!(!is_replay_readiness_diagnostic(
+            "index",
+            "Adapter HTTPS readiness: not evaluated; reason: no managed CA was acquired for this operation\nextra\n"
         ));
     }
     #[test]
