@@ -1046,6 +1046,7 @@ dependencies = [
  "kio-adapter",
  "kio-app",
  "kio-core",
+ "kio-eval",
  "kio-index",
  "kio-pipeline",
  "miniz_oxide 0.9.1",
