@@ -1058,7 +1058,7 @@ mod tests {
             ..Default::default()
         };
         let endpoint = settings
-            .authenticated_local_endpoint("embedding", "https://127.0.0.1:8443")
+            .local_endpoint("embedding", "https://127.0.0.1:8443")
             .unwrap();
         drop(settings);
 

@@ -165,7 +165,7 @@ fn local_identity(
         .url
         .as_deref()
         .ok_or_else(|| schema("offline_api adapter has no declared url"))?;
-    let destination = crate::local_peer::validate_local_https_url(url)?;
+    let destination = crate::local_peer::validate_local_url(url)?;
     Ok(RuntimeExecutionIdentity {
         role: request.role.to_owned(),
         tool_id: tool_id.to_owned(),
@@ -177,7 +177,7 @@ fn local_identity(
         // endpoint construction validates CA bytes and retains its lock. The grant binds the managed
         // lifecycle generation, preventing an A→B→A CA sequence from
         // reviving a grant minted for the original A generation.
-        trust_binding: settings.local_peer_trust_binding()?,
+        trust_binding: settings.local_peer_trust_binding_for_url(url)?,
     })
 }
 
@@ -461,7 +461,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn local_identity_binds_normalized_endpoint_and_managed_lifecycle() {
+    fn local_identity_binds_exact_endpoint_and_managed_lifecycle() {
         let directory = tempfile::Builder::new()
             .prefix("kio-authority-local-")
             .tempdir_in(std::env::current_dir().unwrap())
@@ -500,9 +500,40 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(identity.canonical_destination, "https://127.0.0.1:8443");
+            assert_eq!(identity.canonical_destination, "https://127.0.0.1:8443/");
             assert_eq!(identity.trust_binding, "local-ca:v1:g1:sha256:test");
             assert_eq!(identity.credential_binding, "none");
         };
+    }
+
+    #[test]
+    fn local_http_identity_is_exact_and_requires_no_ca_or_auth() {
+        let declaration = DeclaredAdapter {
+            tool_id: Some("qwen3_vl_embedding_local".to_owned()),
+            kind: Some("offline_api".to_owned()),
+            url: Some("http://127.0.0.1:8443/model/".to_owned()),
+            model: Some("Qwen/Qwen3-VL-Embedding-2B".to_owned()),
+            ..DeclaredAdapter::default()
+        };
+        with_declaration("embedding", declaration, |settings| {
+            let identity = runtime_execution_identity(
+                settings,
+                RuntimeExecutionIdentityRequest {
+                    role: "embedding",
+                    tool_id: "qwen3_vl_embedding_local",
+                    tool_profile_hash: "sha256:local-http-profile",
+                },
+            )
+            .expect("unauthenticated local HTTP identity has no CA prerequisite");
+            assert_eq!(
+                identity.canonical_destination,
+                "http://127.0.0.1:8443/model/"
+            );
+            assert_eq!(identity.credential_binding, "none");
+            assert_eq!(
+                identity.trust_binding,
+                crate::local_peer::HTTP_UNAUTHENTICATED_TRUST_BINDING
+            );
+        });
     }
 }

@@ -619,13 +619,14 @@ pub(crate) fn run_image_embedding_enrichment(
                 // A known result still requires current policy/grant admission.
                 // Its accepted attempt is never refunded or dispatched again.
                 let recovered_bytes = claim.result()?;
+                let requires_secret = image_authority.requires_secret_approval(image_hash);
                 if let Err(error) = admit_embedding_transport(
                     adapter_settings,
                     embedding.repo,
                     embedding.execution,
                     embedding.profile,
                     embedding.current_policy,
-                    image_authority.requires_secret_approval(image_hash),
+                    requires_secret,
                 ) {
                     if recovered_bytes.is_none() {
                         claim.cancel_unsent()?;
@@ -647,12 +648,16 @@ pub(crate) fn run_image_embedding_enrichment(
                         embedding.execution,
                         embedding.profile,
                         embedding.current_policy,
-                        image_authority.requires_secret_approval(image_hash),
+                        requires_secret,
                     )
                     .map_err(crate::embedding::transport::LocalEmbeddingRunFailure::Admission)
                     .and_then(|_| {
                         crate::embedding::transport::run_local_embedding_adapter(
                             adapter_settings,
+                            Some(crate::embedding::transport::LocalSendAuthority {
+                                repo: embedding.repo,
+                                requires_secret,
+                            }),
                             embedding.execution,
                             items,
                             EmbeddingInputType::ImageObject,

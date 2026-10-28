@@ -18,7 +18,10 @@ use kio_pipeline::policy::CurrentPolicyEvaluator;
 use serde_json::{Value, json};
 
 use crate::commands::{AdapterStatusArgs, AdapterTarget, ApproveArgs, RevokeArgs};
-use crate::grants::{GrantBinding, GrantOperation, GrantRecord, GrantState, PrivateGrantStore};
+use crate::grants::{
+    GrantBinding, GrantOperation, GrantRecord, GrantSnapshot, GrantState, PrivateGrantStore,
+    ScopedGrantBinding,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum AdapterRole {
@@ -51,6 +54,88 @@ fn selected_tool(target: &AdapterTarget) -> Result<Option<&str>> {
     }
 }
 
+mod endpoint;
+
+pub(crate) fn approve(
+    ctx: &crate::invocation::Invocation<'_>,
+    args: ApproveArgs,
+    control: &ApprovalControl,
+) -> Result<CommandResponse> {
+    let selected = selected_tool(&args.target)?;
+    if args.preview && args.yes || args.resume.is_some() && selected.is_none() {
+        return Err(KioError::invalid_usage(
+            "preview conflicts with --yes; --resume requires one adapter",
+        ));
+    }
+    let repo = ctx.open_recovery_repository()?;
+    let mut targets = Vec::new();
+    for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
+        if selected.is_some_and(|tool| match role {
+            AdapterRole::Embedding => {
+                !matches!(tool, "gemini_embedding_2" | "qwen3_vl_embedding_local")
+            }
+            AdapterRole::Markdown => {
+                !matches!(tool, "mistral_ocr_markdownize" | "paddleocr_vl_local")
+            }
+        }) {
+            continue;
+        }
+        if let Some((tool, profile)) = configured_profile(ctx.settings, &repo, role)?
+            && selected.is_none_or(|requested| requested == tool)
+        {
+            let local = ctx
+                .settings
+                .declared_adapter(role.as_str())
+                .is_some_and(|d| d.kind.as_deref() == Some("offline_api"));
+            targets.push((role, tool, profile, local));
+        }
+    }
+    if targets.iter().all(|target| !target.3) {
+        return approve_scoped(ctx, args, control);
+    }
+    let mut outcomes = Vec::new();
+    let mut adapters = Vec::new();
+    let mut endpoints = Vec::new();
+    for (role, tool, profile, local) in targets {
+        let response = if local {
+            endpoint::approve(ctx, &repo, role, &tool, &profile, &args, control)?
+        } else {
+            let mut selected_args = args.clone();
+            selected_args.target = AdapterTarget::Tool(tool);
+            approve_scoped(ctx, selected_args, control)?
+        };
+        match response.body {
+            ResponseBody::Adapter(AdapterResponse::Approved(response)) => {
+                outcomes.extend(response.approvals)
+            }
+            ResponseBody::Adapter(AdapterResponse::ApprovalPreview(response)) => {
+                adapters.extend(response.adapters);
+                endpoints.extend(response.device_endpoints);
+            }
+            _ => unreachable!("approval returns only preview or outcome"),
+        }
+    }
+    let body = if args.preview {
+        AdapterResponse::ApprovalPreview(ApprovalPreviewResponse {
+            status: "preview".into(),
+            scope_id: repo.scope_identity()?.scope_id,
+            adapters,
+            device_endpoints: endpoints,
+            send_secrets: args.send_secrets,
+            resume: args.resume,
+        })
+    } else {
+        AdapterResponse::Approved(ApprovedResponse {
+            status: "approved".into(),
+            approvals: outcomes,
+        })
+    };
+    Ok(CommandResponse {
+        body: ResponseBody::Adapter(body),
+        completion: Completion::Complete,
+    })
+}
+
 /// Membership excludes sibling enrollment and mutable policy content. Current
 /// policy is independently reloaded at every admission; neither a new sibling
 /// nor this command's config update must silently invalidate an unrelated grant.
@@ -61,7 +146,7 @@ fn binding(
     tool_id: &str,
     profile: &str,
     operation: GrantOperation,
-) -> Result<GrantBinding> {
+) -> Result<ScopedGrantBinding> {
     let retained = crate::management::binding_for_repo(repo)?;
     let chain = validate_live_chain(&retained)?;
     let current = chain.scopes.first().expect("validated chain is nonempty");
@@ -99,7 +184,7 @@ fn binding(
     policy
         .revalidate()
         .map_err(crate::object_persistence::pipeline_to_kio)?;
-    Ok(GrantBinding {
+    Ok(ScopedGrantBinding {
         scope_id: current.record.scope_id.clone(),
         canonical_root: retained.canonical_root().to_path_buf(),
         directory_identity: retained.directory_identity().clone(),
@@ -161,7 +246,7 @@ fn configured_binding(
     repo: &Repository,
     role: AdapterRole,
     operation: GrantOperation,
-) -> Result<Option<GrantBinding>> {
+) -> Result<Option<ScopedGrantBinding>> {
     let Some((tool_id, profile)) = configured_profile(adapter_settings, repo, role)? else {
         return Ok(None);
     };
@@ -172,7 +257,7 @@ fn configured_bindings(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     selected: Option<&str>,
-) -> Result<Vec<(AdapterRole, GrantBinding)>> {
+) -> Result<Vec<(AdapterRole, ScopedGrantBinding)>> {
     let mut bindings = Vec::new();
     for role in [AdapterRole::Markdown, AdapterRole::Embedding] {
         if let Some(selected) = selected {
@@ -208,13 +293,14 @@ fn configured_bindings(
 }
 
 fn optional_trust_readiness(error: &KioError) -> bool {
-    error
-        .context()
-        .get("dependency")
-        .and_then(Value::as_str)
-        .is_some_and(|dependency| {
-            matches!(dependency, "managed_https_trust" | "adapter_configuration")
-        })
+    error.error_code() == "KIO-E-LOCAL-PEER-TRUST-BINDING-001"
+        || error
+            .context()
+            .get("dependency")
+            .and_then(Value::as_str)
+            .is_some_and(|dependency| {
+                matches!(dependency, "managed_https_trust" | "adapter_configuration")
+            })
 }
 
 /// Admission for an explicitly online index invocation. Individual adapters
@@ -258,7 +344,7 @@ pub(crate) fn any_network_allowed(
 fn matching_record<'a>(
     records: &'a [GrantRecord],
     row: &Value,
-    expected: &GrantBinding,
+    expected: &ScopedGrantBinding,
 ) -> Option<&'a GrantRecord> {
     if row.get("status").and_then(Value::as_str) != Some("active")
         || row.get("scope_id").and_then(Value::as_str) != Some(expected.scope_id.as_str())
@@ -276,7 +362,17 @@ fn matching_record<'a>(
     };
     let id = row.get(leaf)?.as_str()?;
     records.iter().find(|record| {
-        record.grant_id == id && record.state == GrantState::Active && &record.binding == expected
+        record.grant_id == id
+            && record.state == GrantState::Active
+            && record.binding == GrantBinding::Scoped(expected.clone())
+            && record
+                .parent_network_grant_id
+                .as_ref()
+                .is_none_or(|parent| {
+                    records
+                        .iter()
+                        .any(|r| &r.grant_id == parent && r.state == GrantState::Active)
+                })
     })
 }
 
@@ -296,6 +392,42 @@ pub(crate) fn allowed(
     else {
         return Ok(false);
     };
+    allowed_with_snapshot(
+        adapter_settings,
+        repo,
+        role,
+        tool_id,
+        profile,
+        operation,
+        &snapshot,
+    )
+}
+
+/// Evaluate both halves of current consent against one already verified
+/// snapshot. Dispatch callers hold its device shared lease for the send.
+fn allowed_with_snapshot(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    repo: &Repository,
+    role: AdapterRole,
+    tool_id: &str,
+    profile: &str,
+    operation: GrantOperation,
+    snapshot: &GrantSnapshot,
+) -> Result<bool> {
+    let endpoint = match endpoint::configured(adapter_settings, repo, role, tool_id, profile) {
+        Ok(endpoint) => endpoint,
+        Err(error) if optional_trust_readiness(&error) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if let Some(endpoint) = endpoint {
+        let parent = endpoint::active(snapshot.records(), &endpoint);
+        if operation == GrantOperation::Network {
+            return Ok(parent.is_some());
+        }
+        if parent.is_none() {
+            return Ok(false);
+        }
+    }
     let rows = repo.read_network_approvals()?;
     // An absent scope reference cannot be repaired from the device store.
     if !rows.iter().any(|row| {
@@ -336,6 +468,97 @@ pub(crate) fn allowed(
     Ok(rows
         .iter()
         .any(|row| matching_record(snapshot.records(), row, &expected).is_some()))
+}
+
+/// Held through one actual loopback send. A completed revoke wins before a
+/// later lease; an admitted in-flight send retains its device grant lock.
+pub(crate) fn endpoint_dispatch_lease(
+    settings: &Arc<AdapterRuntimeSettings>,
+    repo: &Repository,
+    role: AdapterRole,
+    tool_id: &str,
+    profile_hash: &str,
+    requires_secret: bool,
+) -> Result<Option<crate::private_state::PrivateState>> {
+    endpoint_dispatch_lease_with_checkpoint(
+        settings,
+        repo,
+        role,
+        tool_id,
+        profile_hash,
+        requires_secret,
+        |_| Ok(()),
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EndpointLeasePhase {
+    Configured,
+    Locked,
+}
+
+// Mechanical seam for deterministic dispatch timing tests. Production uses a
+// noop checkpoint and keeps the same acquisition/read sequence.
+pub(crate) fn endpoint_dispatch_lease_with_checkpoint(
+    settings: &Arc<AdapterRuntimeSettings>,
+    repo: &Repository,
+    role: AdapterRole,
+    tool_id: &str,
+    profile_hash: &str,
+    requires_secret: bool,
+    mut checkpoint: impl FnMut(EndpointLeasePhase) -> Result<()>,
+) -> Result<Option<crate::private_state::PrivateState>> {
+    if !settings
+        .declared_adapter(role.as_str())
+        .is_some_and(|d| d.kind.as_deref() == Some("offline_api"))
+    {
+        return Ok(None);
+    }
+    let expected = endpoint::configured(settings, repo, role, tool_id, profile_hash)?
+        .ok_or_else(|| denied("selected endpoint execution identity does not match"))?;
+    checkpoint(EndpointLeasePhase::Configured)?;
+    let path = store_path(repo.control());
+    let lease = crate::private_state::open_existing_shared(
+        path.parent().expect("grant store has parent"),
+        &crate::settings::data_home(repo.control()),
+        crate::grants::LOCK_BYTES,
+        repo.control(),
+    )?
+    .ok_or_else(|| denied("selected endpoint has no device approval"))?;
+    checkpoint(EndpointLeasePhase::Locked)?;
+    let snapshot = PrivateGrantStore::read_snapshot_at(lease.directory())?
+        .ok_or_else(|| denied("selected endpoint has no device approval"))?;
+    if endpoint::active(snapshot.records(), &expected).is_none()
+        || !allowed_with_snapshot(
+            settings,
+            repo,
+            role,
+            tool_id,
+            profile_hash,
+            GrantOperation::Network,
+            &snapshot,
+        )?
+    {
+        return Err(denied(
+            "selected endpoint approval is pending, revoked, or changed",
+        ));
+    }
+    if requires_secret
+        && !allowed_with_snapshot(
+            settings,
+            repo,
+            role,
+            tool_id,
+            profile_hash,
+            GrantOperation::SendSecrets,
+            &snapshot,
+        )?
+    {
+        return Err(denied(
+            "selected endpoint scoped secret-send approval is no longer current",
+        ));
+    }
+    Ok(Some(lease))
 }
 
 pub(crate) fn allowed_at(
@@ -382,7 +605,7 @@ fn open_network_policy(repo: &Repository) -> Result<()> {
     repo.compare_replace_config_document(&old, &document.to_string())
 }
 
-pub(crate) fn approve(
+fn approve_scoped(
     ctx: &crate::invocation::Invocation<'_>,
     args: ApproveArgs,
     control: &ApprovalControl,
@@ -425,7 +648,7 @@ pub(crate) fn approve(
             && url.starts_with("https://")
         {
             adapter_settings
-                .authenticated_local_endpoint(role.as_str(), url)
+                .local_endpoint(role.as_str(), url)
                 .map_err(crate::object_persistence::adapter_to_kio)?;
         }
     }
@@ -445,6 +668,7 @@ pub(crate) fn approve(
             .iter()
             .map(|(_, binding)| binding.clone())
             .collect(),
+        device_endpoints: vec![],
         send_secrets: args.send_secrets,
         resume: args.resume.clone(),
     };
@@ -517,7 +741,10 @@ pub(crate) fn approve(
                 .records()
                 .iter()
                 .find(|r| r.grant_id == id)
-                .filter(|r| r.state != GrantState::Revoked && r.binding == expected)
+                .filter(|r| {
+                    r.state != GrantState::Revoked
+                        && r.binding == GrantBinding::Scoped(expected.clone())
+                })
                 .ok_or_else(|| {
                     denied("grant intent is revoked or does not match the current adapter identity")
                 })?
@@ -527,13 +754,14 @@ pub(crate) fn approve(
                 .iter()
                 .find(|r| {
                     r.approval_id == pending.approval_id
-                        && r.binding.operation == GrantOperation::SendSecrets
+                        && r.binding.operation() == GrantOperation::SendSecrets
                 })
                 .cloned();
             if secret.is_some() != args.send_secrets
-                || secret
-                    .as_ref()
-                    .is_some_and(|r| r.state == GrantState::Revoked || r.binding != secret_binding)
+                || secret.as_ref().is_some_and(|r| {
+                    r.state == GrantState::Revoked
+                        || r.binding != GrantBinding::Scoped(secret_binding.clone())
+                })
             {
                 return Err(denied(
                     "resume must preserve the original secret-send selection and live grant identity",
@@ -629,40 +857,75 @@ pub(crate) fn revoke(
     control: &ControlHandle,
 ) -> Result<CommandResponse> {
     let tool = selected_tool(&args.target)?;
-    let repo = Repository::open_for_recovery_with_control(ctx.cwd(), control.clone())?;
-    let _lock = repo.lock_store_in_session(repo.lock_session())?;
-    let scope_id = repo.scope_identity()?.scope_id;
+    let repo = optional_repository(ctx, control)?;
+    let _lock = repo
+        .as_ref()
+        .map(|repo| repo.lock_store_in_session(repo.lock_session()))
+        .transpose()?;
     let now = control.now_utc_seconds();
-    let revoked_grants = if PrivateGrantStore::open_readonly(
+    let roles: &[&str] = match tool {
+        Some("qwen3_vl_embedding_local" | "gemini_embedding_2") => &["embedding"],
+        Some("paddleocr_vl_local" | "mistral_ocr_markdownize") => &["markdown"],
+        _ => &["markdown", "embedding"],
+    };
+    let mut settings = crate::settings::adapter_runtime_settings_for_roles(control, roles)?;
+    settings.managed_local_trust = Some(Arc::new(crate::trust::RuntimeTrustProvider::new(
+        control.clone(),
+    )));
+    let current = endpoint::current_bindings(&Arc::new(settings), tool);
+    let mut revoked = Vec::new();
+    if let Some(snapshot) = PrivateGrantStore::open_readonly(
         &store_path(control),
         &crate::settings::data_home(control),
         control,
-    )?
-    .is_some()
-    {
-        PrivateGrantStore::open_or_create(
+    )? {
+        let endpoints = snapshot
+            .records()
+            .iter()
+            .filter_map(|record| match &record.binding {
+                GrantBinding::DeviceEndpoint(binding)
+                    if tool.is_none()
+                        || record
+                            .disclosure
+                            .as_ref()
+                            .is_some_and(|d| Some(d.tool_id.as_str()) == tool)
+                        || current
+                            .as_ref()
+                            .is_ok_and(|bindings| bindings.contains(binding)) =>
+                {
+                    Some(binding.clone())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut store = PrivateGrantStore::open_or_create(
             &store_path(control),
             &crate::settings::data_home(control),
             control,
-        )?
-        .revoke(&scope_id, tool, now.clone())?
-    } else {
-        Vec::new()
-    };
-    let outcome = repo.revoke_network_approval(tool, &now)?;
+        )?;
+        for binding in endpoints {
+            revoked.extend(store.revoke_endpoint(&binding, now.clone())?);
+        }
+        if let Some(repo) = &repo {
+            revoked.extend(store.revoke(&repo.scope_identity()?.scope_id, tool, now.clone())?);
+        }
+    }
+    let outcome = repo
+        .as_ref()
+        .map(|repo| repo.revoke_network_approval(tool, &now))
+        .transpose()?;
+    let changed = !revoked.is_empty() || outcome.as_ref().is_some_and(|outcome| outcome.changed());
     Ok(CommandResponse {
         body: ResponseBody::Adapter(AdapterResponse::Revoked(ApprovalRevokeResponse {
-            status: if outcome.changed() || !revoked_grants.is_empty() {
-                "revoked"
-            } else {
-                "no_target"
-            }
-            .to_owned(),
+            status: if changed { "revoked" } else { "no_target" }.into(),
             tool_id: tool.map(str::to_owned),
             all: tool.is_none(),
-            revoked_tool_ids: outcome.revoked_tool_ids,
-            revoked_grant_ids: revoked_grants,
-            pending_removed: outcome.pending_removed,
+            revoked_tool_ids: outcome
+                .as_ref()
+                .map(|o| o.revoked_tool_ids.clone())
+                .unwrap_or_default(),
+            revoked_grant_ids: revoked,
+            pending_removed: outcome.as_ref().is_some_and(|o| o.pending_removed),
         })),
         completion: Completion::Complete,
     })
@@ -672,96 +935,151 @@ pub(crate) fn status(
     ctx: &crate::invocation::Invocation<'_>,
     args: AdapterStatusArgs,
 ) -> Result<CommandResponse> {
-    let adapter_settings = ctx.settings;
-
-    let repo = ctx.open_recovery_repository()?;
-    let scope_id = repo.scope_identity()?.scope_id;
+    let repo = optional_repository(ctx.context, ctx.control)?;
+    let scope_id = repo
+        .as_ref()
+        .map(|repo| repo.scope_identity().map(|id| id.scope_id))
+        .transpose()?;
     let snapshot = PrivateGrantStore::open_readonly(
         &store_path(ctx.control),
         &crate::settings::data_home(ctx.control),
         ctx.control,
     )?;
-    let records = snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.records())
-        .unwrap_or_default()
-        .iter()
-        .filter(|record| {
-            record.binding.scope_id == scope_id
-                && args
-                    .tool_id
-                    .as_ref()
-                    .is_none_or(|tool| record.binding.tool_id == *tool)
-        })
-        .collect::<Vec<_>>();
+    let current = endpoint::current_bindings(ctx.settings, args.tool_id.as_deref());
+    let mut records = Vec::new();
+    let mut effective = Vec::new();
     let rows = repo
-        .read_network_approvals()?
+        .as_ref()
+        .map(Repository::read_network_approvals)
+        .transpose()?
+        .unwrap_or_default()
         .into_iter()
         .filter(|row| {
             args.tool_id
                 .as_ref()
-                .is_none_or(|id| row.get("tool_id").and_then(Value::as_str) == Some(id))
+                .is_none_or(|tool| row.get("tool_id").and_then(Value::as_str) == Some(tool))
         })
         .collect::<Vec<_>>();
-    let pending = repo.read_network_approval_pending()?.filter(|row| {
-        args.tool_id
-            .as_ref()
-            .is_none_or(|id| row.get("tool_id").and_then(Value::as_str) == Some(id))
-    });
-    let mut effective = Vec::new();
-    let configured = configured_bindings(adapter_settings, &repo, args.tool_id.as_deref());
-    for record in &records {
-        // Roles are carried by current configuration, never guessed from a
-        // historical grant's tool ID. Unsupported/absent identities stay inert.
-        let check = match &configured {
-            Ok(bindings) => match bindings.iter().find(|(_, binding)| {
-                binding.tool_id == record.binding.tool_id
-                    && binding.tool_profile_hash == record.binding.tool_profile_hash
-            }) {
-                Some((role, _)) => allowed(
-                    adapter_settings,
-                    &repo,
-                    *role,
-                    &record.binding.tool_id,
-                    &record.binding.tool_profile_hash,
-                    record.binding.operation,
-                )
-                .map_err(|error| error.error_code().to_owned()),
-                None => Ok(false),
-            },
-            Err(error) => Err(error.error_code().to_owned()),
-        };
-        let (permitted, reason) = match check {
-            Ok(true)
-                if record.state == GrantState::Active
-                    && rows.iter().any(|row| {
-                        matching_record(&[(*record).clone()], row, &record.binding).is_some()
-                    }) =>
-            {
-                (true, None)
+    let pending = repo
+        .as_ref()
+        .map(Repository::read_network_approval_pending)
+        .transpose()?
+        .flatten()
+        .filter(|row| {
+            args.tool_id
+                .as_ref()
+                .is_none_or(|tool| row.get("tool_id").and_then(Value::as_str) == Some(tool))
+        });
+    for record in snapshot.as_ref().map(|s| s.records()).unwrap_or_default() {
+        let permitted = match &record.binding {
+            GrantBinding::DeviceEndpoint(binding) => {
+                if args.tool_id.as_ref().is_some_and(|tool| {
+                    record
+                        .disclosure
+                        .as_ref()
+                        .is_none_or(|d| &d.tool_id != tool)
+                }) && !current
+                    .as_ref()
+                    .is_ok_and(|bindings| bindings.contains(binding))
+                {
+                    continue;
+                }
+                current
+                    .as_ref()
+                    .map(|bindings| {
+                        record.state == GrantState::Active && bindings.contains(binding)
+                    })
+                    .map_err(|e| e.error_code().to_owned())
             }
+            GrantBinding::Scoped(binding) => {
+                if scope_id.as_deref() != Some(binding.scope_id.as_str())
+                    || args
+                        .tool_id
+                        .as_ref()
+                        .is_some_and(|tool| &binding.tool_id != tool)
+                {
+                    continue;
+                }
+                let repo = repo.as_ref().expect("scope binding matched");
+                let configured = configured_bindings(ctx.settings, repo, Some(&binding.tool_id));
+                match configured {
+                    Ok(bindings) => match bindings.iter().find(|(_, b)| {
+                        b.tool_id == binding.tool_id
+                            && b.tool_profile_hash == binding.tool_profile_hash
+                    }) {
+                        Some((role, _)) => allowed(
+                            ctx.settings,
+                            repo,
+                            *role,
+                            &binding.tool_id,
+                            &binding.tool_profile_hash,
+                            binding.operation,
+                        )
+                        .map_err(|e| e.error_code().to_owned()),
+                        None => Ok(false),
+                    },
+                    Err(error) => Err(error.error_code().to_owned()),
+                }
+            }
+        };
+        let (permitted, reason) = match permitted {
+            Ok(true) if record.state == GrantState::Active => (true, None),
             Ok(_) => (
                 false,
-                Some("current_scope_or_device_binding_does_not_match".to_owned()),
+                Some("current_scope_or_device_binding_does_not_match".into()),
             ),
-            Err(error_code) => (false, Some(error_code)),
+            Err(code) => (false, Some(code)),
         };
         effective.push(EffectiveApproval {
             grant_id: record.grant_id.clone(),
             permitted,
             reason,
         });
+        records.push(record.clone());
     }
+    // This transport view includes unapproved configured endpoints. It is not
+    // admission authority and never creates a grant or probes the peer.
+    let mut bindings = Vec::new();
+    if let Ok(current) = &current {
+        for binding in current {
+            if !bindings.contains(binding) {
+                bindings.push(binding.clone());
+            }
+        }
+    }
+    for record in &records {
+        if let GrantBinding::DeviceEndpoint(binding) = &record.binding
+            && !bindings.contains(binding)
+        {
+            bindings.push(binding.clone());
+        }
+    }
+    let device_endpoints = bindings
+        .into_iter()
+        .map(|binding| EndpointPeerStatus {
+            peer_authenticated: binding.destination.starts_with("https://"),
+            binding,
+        })
+        .collect();
     Ok(CommandResponse {
         body: ResponseBody::Adapter(AdapterResponse::Status(ApprovalStatusResponse {
             scope_id,
-            grants: records.into_iter().cloned().collect(),
+            device_endpoints,
+            grants: records,
             effective,
             scope_approvals: rows,
             pending,
         })),
         completion: Completion::Complete,
     })
+}
+
+fn optional_repository(ctx: &AppContext, control: &ControlHandle) -> Result<Option<Repository>> {
+    let root = kio_core::store_dir::StoreDirectory::open_with_control(ctx.cwd(), control.clone())?;
+    if !root.contains_entry(Path::new(".kio"))? {
+        return Ok(None);
+    }
+    Repository::open_for_recovery_with_control(ctx.cwd(), control.clone()).map(Some)
 }
 
 fn denied(message: &str) -> KioError {

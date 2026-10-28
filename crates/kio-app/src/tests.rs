@@ -113,6 +113,54 @@ fn index_reconciles_more_than_legacy_child_cap_and_deep_pages_in_one_run() {
             );
             return;
         }
+        // Observe only this isolated child's descriptor table after exec. The
+        // enumerator is dropped before F_GETFD, and no descriptor is closed or
+        // has its inheritance flags changed by this diagnostic.
+        let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        let limits = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            Some((limit.rlim_cur, limit.rlim_max))
+        } else {
+            None
+        };
+        let directory = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        let descriptors = fs::read_dir(directory).map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+                .collect::<Vec<_>>()
+        });
+        let mut open_count = 0_usize;
+        let mut cloexec_count = 0_usize;
+        let mut highest_fd = None;
+        let mut enumeration_error = None;
+        match descriptors {
+            Ok(descriptors) => {
+                for fd in descriptors {
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                    if flags < 0 {
+                        continue;
+                    }
+                    open_count += 1;
+                    cloexec_count += usize::from(flags & libc::FD_CLOEXEC != 0);
+                    highest_fd = Some(highest_fd.map_or(fd, |previous: i32| previous.max(fd)));
+                }
+            }
+            Err(error) => enumeration_error = Some(error.to_string()),
+        }
+        eprintln!(
+            "KIO_CHILD_DISCOVERY_DIAGNOSTIC {}",
+            serde_json::json!({
+                "stage": "child_start_descriptors", "nofile": limits,
+                "open_count": open_count, "cloexec_count": cloexec_count,
+                "non_cloexec_count": open_count.saturating_sub(cloexec_count),
+                "highest_fd": highest_fd, "enumeration_error": enumeration_error,
+                "enumerator_dropped_before_count": true,
+            })
+        );
     }
     let temporary = tempfile::tempdir().unwrap();
     let base = temporary.path().canonicalize().unwrap();
@@ -163,7 +211,69 @@ fn index_reconciles_more_than_legacy_child_cap_and_deep_pages_in_one_run() {
         panic!("expected published Index response");
     };
     let discovery = output.child_scope_discovery.as_ref().unwrap();
-    assert!(!discovery.has_more);
+    if discovery.has_more {
+        let expected = (0..513)
+            .map(|index| root.join(format!("flat-{index:04}")))
+            .chain(deep_scopes.iter().cloned())
+            .collect::<Vec<_>>();
+        let enrolled = expected
+            .iter()
+            .filter(|path| path.join(".kio/scope.json").is_file())
+            .count();
+        let indexed = expected
+            .iter()
+            .filter(|path| path.join(".kio/index/sqlite.db").is_file())
+            .count();
+        let missing_enrollment = expected
+            .iter()
+            .filter(|path| !path.join(".kio/scope.json").is_file())
+            .take(32)
+            .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
+            .collect::<Vec<_>>();
+        let missing_index = expected
+            .iter()
+            .filter(|path| !path.join(".kio/index/sqlite.db").is_file())
+            .take(32)
+            .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
+            .collect::<Vec<_>>();
+        let frontier = root.join(".kio/internal/child-discovery/frontier.json");
+        let frontier = match kio_core::cas::read_bounded_regular_file(&frontier, 1024 * 1024) {
+            Ok(bytes) => {
+                serde_json::json!({ "bytes": bytes.len(), "text": String::from_utf8_lossy(&bytes) })
+            }
+            Err(error) => {
+                serde_json::json!({ "error_code": error.error_code(), "message": error.message() })
+            }
+        };
+        eprintln!(
+            "KIO_CHILD_DISCOVERY_DIAGNOSTIC {}",
+            serde_json::json!({
+                "stage": "incomplete_fixture", "expected": expected.len(), "enrolled": enrolled,
+                "indexed": indexed, "missing_enrollment_first_32": missing_enrollment,
+                "missing_index_first_32": missing_index, "frontier": frontier,
+            })
+        );
+        // Retain only the failed synthetic fixture under this task's tmp-mac.
+        // Ordinary runs and any temporary root outside that exact owner scope
+        // preserve TempDir's existing cleanup behavior.
+        if let Some(run) = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3)
+            && let Ok(owned_temporary_root) = run.join("tmp-mac").canonicalize()
+            && base.starts_with(&owned_temporary_root)
+        {
+            let retained = temporary.keep();
+            eprintln!(
+                "KIO_CHILD_DISCOVERY_DIAGNOSTIC {}",
+                serde_json::json!({
+                    "stage": "retained_failed_fixture", "path": retained,
+                })
+            );
+        }
+    }
+    assert!(
+        !discovery.has_more,
+        "child discovery incomplete: {}",
+        serde_json::to_string(&output).unwrap()
+    );
     assert_eq!(discovery.rows_total, 578);
     assert_eq!(discovery.rows_omitted, 450);
     assert!((0..513).all(|index| {
@@ -873,25 +983,29 @@ fn embedding_tool_lock_labels_cover_every_execution_mode() {
 }
 
 #[test]
-fn offline_keeps_only_the_in_process_embedding_evaluator_eligible() {
+fn offline_keeps_local_embedding_modes_eligible_and_blocks_external_mode() {
     use kio_adapter::types::ExecutionMode;
 
-    assert!(
-        crate::embedding::admission::embedding_mode_transport_allowed(
-            ExecutionMode::DeterministicLibrary,
-            true,
-        )
-    );
-    assert!(
-        !crate::embedding::admission::embedding_mode_transport_allowed(
-            ExecutionMode::OfflineApi,
-            true,
-        )
-    );
+    for mode in [
+        ExecutionMode::DeterministicLibrary,
+        ExecutionMode::NativeLibrary,
+        ExecutionMode::OfflineApi,
+    ] {
+        assert!(
+            crate::embedding::admission::embedding_mode_transport_allowed(mode, true),
+            "docs07 §3 permits local mode {mode:?} during offline invocation",
+        );
+    }
     assert!(
         !crate::embedding::admission::embedding_mode_transport_allowed(
             ExecutionMode::OnlineApi,
             true,
+        )
+    );
+    assert!(
+        crate::embedding::admission::embedding_mode_transport_allowed(
+            ExecutionMode::OnlineApi,
+            false,
         )
     );
 }

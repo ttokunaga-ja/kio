@@ -901,7 +901,7 @@ fn managed_trust_cache_holds_one_lease_until_invocation_drop() {
     assert_eq!(settings.local_peer_trust_binding().unwrap(), binding);
     assert!(!settings.local_peer_trust_digest().unwrap().is_empty());
     settings
-        .authenticated_local_endpoint("markdown", "https://127.0.0.1:8443")
+        .local_endpoint("markdown", "https://127.0.0.1:8443")
         .unwrap();
     assert!(
         lock.try_lock().is_err(),

@@ -282,8 +282,8 @@ pub(crate) fn offline_output_ref(adapter_id: &str) -> String {
 /// The status a freshly-enqueued `offline_api` markdownize task takes.
 ///
 /// The budget branch has nothing to weigh — a local run has no price. Network
-/// approval and `--offline` are evaluated at dispatch, where a missing grant
-/// leaves this task Pending without constructing the local HTTP client. A Tier A
+/// approval is evaluated at dispatch even under `--offline`, where a missing
+/// local grant leaves this task Pending without constructing the HTTP client. A Tier A
 /// credential still needs `--send-secrets` before it is handed to a local model
 /// server, which is a separate process that can log what it is given.
 pub(crate) fn offline_markdownize_enqueue_status(
@@ -1368,19 +1368,20 @@ pub(crate) fn run_index_pipeline(
             )?;
         }
     }
-    // Stage 3: drain local-HTTP OCR only when this invocation is not offline and
-    // the active local peer has an exact device+scope network grant. The task is
+    // Stage 3: drain approved loopback OCR even when external networking is
+    // offline. Current endpoint approval still gates the selected peer. The task is
     // created first and drained second, so a crash mid-OCR leaves a Pending task
     // that the next authorized index invocation can pick up.
     if markdown_planning_ready {
-        let executed = execute_pending_offline_markdownize_tasks(
+        let outcome = execute_pending_offline_markdownize_tasks(
             adapter_settings,
             repo,
             &task_store,
             &mut result.normalize_by_path,
             network_allowed,
+            true,
         )?;
-        result.pending_online_tasks = result.pending_online_tasks.saturating_sub(executed);
+        result.pending_online_tasks = result.pending_online_tasks.saturating_sub(outcome.executed);
     }
     Ok(result)
 }

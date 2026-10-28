@@ -911,6 +911,15 @@ fn run_index_for_repo_inner(
                                     continue;
                                 }
                                 Err(error) => {
+                                    #[cfg(test)]
+                                    eprintln!(
+                                        "KIO_CHILD_DISCOVERY_DIAGNOSTIC {}",
+                                        json!({
+                                            "stage": "ancestor_error", "child": child.path.as_str(),
+                                            "parent": name, "error_code": error.error_code(),
+                                            "message": error.message(),
+                                        })
+                                    );
                                     page_completed = false;
                                     incomplete_child_discovery = true;
                                     child.status = "skipped_ancestor".to_owned();
@@ -1006,6 +1015,14 @@ fn run_index_for_repo_inner(
                                 });
                     }
                     Err(error) => {
+                        #[cfg(test)]
+                        eprintln!(
+                            "KIO_CHILD_DISCOVERY_DIAGNOSTIC {}",
+                            json!({
+                                "stage": "child_index_error", "child": child.path.as_str(),
+                                "error_code": error.error_code(), "message": error.message(),
+                            })
+                        );
                         incomplete_child_discovery = true;
                         page_completed = false;
                         match error.exit_code() {
@@ -1044,6 +1061,22 @@ fn run_index_for_repo_inner(
             if next.restarted_from_root {
                 restart_count = restart_count.saturating_add(1);
                 if restart_count > 1 {
+                    #[cfg(test)]
+                    eprintln!(
+                        "KIO_CHILD_DISCOVERY_DIAGNOSTIC {}",
+                        json!({
+                            "stage": "repeated_stale_continuation", "restart_count": restart_count,
+                            "rows_total": child_rows_total,
+                            "cursor": page.slice.continuation.as_ref().map(|cursor| json!({
+                                "version": cursor.version, "frame_count": cursor.frames.len(),
+                                "last_frame": cursor.frames.last().map(|frame| json!({
+                                    "relative_dir": frame.relative_dir.as_str(),
+                                    "after_entry": frame.after_entry.as_deref(),
+                                    "pending_count": frame.pending_entries.len(),
+                                })),
+                            })),
+                        })
+                    );
                     incomplete_child_discovery = true;
                     break true;
                 }

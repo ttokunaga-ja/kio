@@ -37,6 +37,7 @@ const CHILD_ENV_DENYLIST: &[&str] = &[
     "KIO_TEST_LOCAL_OCR_BODY",
     "KIO_TEST_MISTRAL_OCR",
     "KIO_TEST_MARKDOWNIZE_ADAPTER",
+    "KIO_TEST_PROMOTION_FAULT",
 ];
 
 /// The mock backend's own page text. Used as the witness that the local
@@ -706,29 +707,12 @@ fn s3e_an_undeclared_local_backend_leaves_the_online_route_alone() {
 /// document body, so it must remain pending without constructing its client
 /// when the caller requested no HTTP at all.
 #[test]
-fn s3e_offline_blocks_the_granted_local_https_peer() {
+fn s3e_offline_allows_the_granted_local_https_peer() {
     let dir = scanned_pdf_fixture();
     let local = [("KIO_TEST_LOCAL_OCR", "mock")];
     activate_local_ocr(&dir, &local);
     json_success(&dir, &["index", "--offline"], &local);
-
-    let tasks = tasks(&dir);
-    let scan = tasks
-        .iter()
-        .find(|task| {
-            task.get("input_path")
-                .and_then(Value::as_str)
-                .is_some_and(|path| path.ends_with("scan.pdf"))
-        })
-        .unwrap_or_else(|| panic!("no task for scan.pdf: {tasks:?}"));
-    assert_eq!(scan["output_ref"], "offline:paddleocr_vl_local", "{scan}");
-    assert_eq!(scan["status"], "pending", "{scan}");
-    assert!(
-        !chunk_texts(&dir)
-            .iter()
-            .any(|text| text.contains(MOCK_PAGE_TEXT)),
-        "--offline must not dispatch the local HTTPS peer"
-    );
+    assert_local_batch_publication(&dir, &local);
 }
 
 /// A second index over unchanged content must not re-run the pipeline.
@@ -865,8 +849,7 @@ fn s3e_changed_ocr_profile_does_not_borrow_a_mock_normalize_ref() {
 fn app01_local_ocr_respects_pending_task_retry_deadline_without_a_ledger() {
     let dir = scanned_pdf_fixture();
     let local = [("KIO_TEST_LOCAL_OCR", "mock")];
-    activate_local_ocr(&dir, &local);
-    json_success(&dir, &["index", "--offline"], &local);
+    queue_unapproved_local_ocr(&dir, &local);
     let store = kio_pipeline::task::TaskStore::new(dir.path().join(".kio"));
     let mut count = 0;
     store
@@ -894,6 +877,11 @@ fn app01_local_ocr_respects_pending_task_retry_deadline_without_a_ledger() {
                 .is_some_and(|p| p.ends_with("scan.pdf"))
         })
         .unwrap();
+    json_success(
+        &dir,
+        &["adapter", "approve", "paddleocr_vl_local", "--yes"],
+        &local,
+    );
     json_success(&dir, &["index"], &local);
     let after = tasks(&dir)
         .into_iter()
@@ -969,5 +957,425 @@ fn app04_unavailable_local_ocr_preserves_accepted_head_normalization() {
         !dir.path()
             .join(".test-data/kio/cost-ledger.sqlite")
             .exists()
+    );
+}
+
+// Existing CLI API regressions: local tasks queued before approval must be
+// executable and publishable by batch commands, including with --offline.
+fn queue_unapproved_local_ocr(dir: &TempDir, env: &[(&str, &str)]) {
+    configure_local_ocr(dir, env);
+    json_success(dir, &["init"], env);
+    json_success(dir, &["index", "--offline"], env);
+    assert!(
+        tasks(dir)
+            .iter()
+            .any(|task| task["input_path"] == "scan.pdf" && task["status"] == "pending"),
+        "fixture must queue a real unapproved local task: {:?}",
+        tasks(dir)
+    );
+    assert!(
+        !chunk_texts(dir)
+            .iter()
+            .any(|text| text.contains(MOCK_PAGE_TEXT))
+    );
+}
+
+fn local_ocr_records(dir: &TempDir) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+    fn walk(path: &std::path::Path, result: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
+        if !path.exists() {
+            return;
+        }
+        for entry in fs::read_dir(path).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                walk(&path, result);
+            } else if path.file_name().unwrap() == "record.json" {
+                result.insert(path.clone(), fs::read(path).unwrap());
+            }
+        }
+    }
+    let mut records = BTreeMap::new();
+    walk(
+        &dir.path().join(".test-state/kio/local-execution"),
+        &mut records,
+    );
+    records
+}
+
+fn assert_local_batch_publication(dir: &TempDir, env: &[(&str, &str)]) {
+    let scan = tasks(dir)
+        .into_iter()
+        .find(|task| task["input_path"] == "scan.pdf")
+        .unwrap();
+    assert_eq!(scan["status"], "done", "{scan}");
+    assert_eq!(scan["fallback_reason"], "local_adapter_done", "{scan}");
+    assert!(
+        scan["reservation_id"].is_null(),
+        "local work must carry no paid reservation: {scan}"
+    );
+    let witness = current_ocr_normalizes(dir)
+        .remove("scan.pdf")
+        .expect("local completion must be bound into HEAD");
+    assert_eq!(witness.raw_hash, scan["input_hash"].as_str().unwrap());
+    let repo = Repository::open(dir.path()).unwrap();
+    let head = repo.head_commit_hash().unwrap().unwrap();
+    let commit = repo.read_commit(&head).unwrap();
+    let lock: Value =
+        serde_json::from_slice(&fs::read(dir.path().join(".kio/tool-lock.json")).unwrap()).unwrap();
+    assert_eq!(lock["markdown"]["tool_id"], "paddleocr_vl_local", "{lock}");
+    assert_eq!(lock["markdown"]["kind"], "offline_api", "{lock}");
+    assert_eq!(
+        lock["markdown"]["profile_hash"], witness.tool_profile_hash,
+        "{lock}"
+    );
+    assert_eq!(
+        commit.tool_lock_hash,
+        kio_adapter::tool_lock::tool_lock_hash(&lock).unwrap()
+    );
+    assert!(
+        chunk_texts(dir)
+            .iter()
+            .any(|text| text.contains(MOCK_PAGE_TEXT)),
+        "real mock output must be indexed"
+    );
+    let search = json_success(
+        dir,
+        &["search", "Kio local OCR mock", "--mode", "text"],
+        env,
+    );
+    assert!(
+        !search["results"].as_array().unwrap().is_empty(),
+        "{search}"
+    );
+    assert!(
+        !local_ocr_records(dir).is_empty(),
+        "actual local execution must leave its durable claim"
+    );
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists(),
+        "local batch must never open/init a paid ledger"
+    );
+    assert!(!dir.path().join(".kio/promotion-state.json").exists());
+}
+
+#[test]
+fn app09_local_ocr_offline_batch_resume_publishes_and_is_idempotent() {
+    let dir = scanned_pdf_fixture();
+    let local = [("KIO_TEST_LOCAL_OCR", "mock")];
+    queue_unapproved_local_ocr(&dir, &local);
+    json_success(
+        &dir,
+        &["adapter", "approve", "paddleocr_vl_local", "--yes"],
+        &local,
+    );
+    let before = Repository::open(dir.path())
+        .unwrap()
+        .head_commit_hash()
+        .unwrap();
+    let result = json_success(&dir, &["batch", "resume", "--offline"], &local);
+    assert_eq!(
+        result["tasks_executed"], 1,
+        "batch must execute the queued local task: {result}"
+    );
+    assert_local_batch_publication(&dir, &local);
+    let after = Repository::open(dir.path())
+        .unwrap()
+        .head_commit_hash()
+        .unwrap();
+    assert_ne!(after, before, "batch must publish one normalization commit");
+    let repo = Repository::open(dir.path()).unwrap();
+    let promoted = repo.read_commit(after.as_deref().unwrap()).unwrap();
+    assert_eq!(
+        promoted.message, "local Markdownize promotion",
+        "local promotion must record its actual selected route"
+    );
+    let records = local_ocr_records(&dir);
+    let again = json_success(&dir, &["batch", "resume", "--offline"], &local);
+    assert_eq!(again["tasks_executed"], 0, "{again}");
+    assert_eq!(
+        Repository::open(dir.path())
+            .unwrap()
+            .head_commit_hash()
+            .unwrap(),
+        after
+    );
+    assert_eq!(
+        local_ocr_records(&dir),
+        records,
+        "repeat batch must not resend or spend a local attempt"
+    );
+}
+
+#[test]
+fn app09_local_ocr_offline_batch_retry_publishes_actual_retry() {
+    let dir = scanned_pdf_fixture();
+    let failing = [
+        ("KIO_TEST_LOCAL_OCR", "mock"),
+        ("KIO_TEST_LOCAL_OCR_BODY", "network_error"),
+        ("KIO_FIXED_NOW", "2030-01-01T00:00:00Z"),
+    ];
+    activate_local_ocr(&dir, &failing);
+    json_success(&dir, &["index"], &failing);
+    let failed = tasks(&dir)
+        .into_iter()
+        .find(|task| task["input_path"] == "scan.pdf")
+        .unwrap();
+    assert_eq!(
+        failed["status"], "pending",
+        "fixture must exercise actual retryable local network failure: {failed}"
+    );
+    assert_eq!(failed["fallback_reason"], "network_error", "{failed}");
+    assert_eq!(
+        failed["attempts"], 1,
+        "the real synthetic failure must consume attempt one"
+    );
+    assert!(
+        failed["next_retry_at"].as_str().unwrap() > "2030-01-01T00:00:00Z",
+        "network failure must schedule real backoff: {failed}"
+    );
+    assert!(
+        !chunk_texts(&dir)
+            .iter()
+            .any(|text| text.contains(MOCK_PAGE_TEXT)),
+        "failed attempt must not publish accepted OCR bytes"
+    );
+    let before_records = local_ocr_records(&dir);
+    let too_soon = [
+        ("KIO_TEST_LOCAL_OCR", "mock"),
+        ("KIO_FIXED_NOW", "2030-01-01T00:00:00Z"),
+    ];
+    let waiting = json_success(&dir, &["batch", "retry", "--offline"], &too_soon);
+    assert_eq!(
+        waiting["tasks_executed"], 0,
+        "retry cannot bypass backoff: {waiting}"
+    );
+    assert_eq!(
+        local_ocr_records(&dir),
+        before_records,
+        "backoff must preserve attempt one"
+    );
+    assert!(!local_ocr_records(&dir).is_empty());
+    let local = [
+        ("KIO_TEST_LOCAL_OCR", "mock"),
+        ("KIO_FIXED_NOW", "2030-01-02T00:00:00Z"),
+    ];
+    let result = json_success(&dir, &["batch", "retry", "--offline"], &local);
+    assert_eq!(result["tasks_executed"], 1, "{result}");
+    assert_local_batch_publication(&dir, &local);
+    let done = tasks(&dir)
+        .into_iter()
+        .find(|task| task["task_id"] == failed["task_id"])
+        .unwrap();
+    assert_eq!(
+        done["attempts"], 2,
+        "successful retry must consume exactly actual local attempt two: {failed} -> {done}"
+    );
+}
+
+#[test]
+fn app09_local_ocr_batch_recovers_done_task_before_head_without_resend() {
+    let dir = scanned_pdf_fixture();
+    let local = [("KIO_TEST_LOCAL_OCR", "mock")];
+    queue_unapproved_local_ocr(&dir, &local);
+    json_success(
+        &dir,
+        &["adapter", "approve", "paddleocr_vl_local", "--yes"],
+        &local,
+    );
+    let before = Repository::open(dir.path())
+        .unwrap()
+        .head_commit_hash()
+        .unwrap();
+    let output = kio(&dir, &["--json", "batch", "resume", "--offline"], &local)
+        .env("KIO_TEST_PROMOTION_FAULT", "before_head")
+        .output()
+        .unwrap();
+    let completed = tasks(&dir)
+        .into_iter()
+        .find(|task| task["input_path"] == "scan.pdf")
+        .unwrap();
+    assert_eq!(
+        completed["status"], "done",
+        "local result must be durable before the publication fault: {completed}"
+    );
+    assert_eq!(completed["fallback_reason"], "local_adapter_done");
+    assert!(
+        !output.status.success(),
+        "before_head seam must interrupt local publication"
+    );
+    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error_code"], "KIO-E-PROMOTION-FAULT-001", "{error}");
+    assert_eq!(
+        Repository::open(dir.path())
+            .unwrap()
+            .head_commit_hash()
+            .unwrap(),
+        before
+    );
+    assert!(dir.path().join(".kio/promotion-state.json").exists());
+    let records = local_ocr_records(&dir);
+    assert!(!records.is_empty());
+    json_success(&dir, &["batch", "resume", "--offline"], &local);
+    assert_local_batch_publication(&dir, &local);
+    assert_eq!(
+        local_ocr_records(&dir),
+        records,
+        "Done persisted task must be promoted without resending OCR"
+    );
+}
+
+#[test]
+fn app09_local_ocr_batch_publication_faults_restore_exact_local_tool_lock() {
+    for phase in ["after_head", "after_index_swap"] {
+        let dir = scanned_pdf_fixture();
+        let local = [("KIO_TEST_LOCAL_OCR", "mock")];
+        queue_unapproved_local_ocr(&dir, &local);
+        json_success(
+            &dir,
+            &["adapter", "approve", "paddleocr_vl_local", "--yes"],
+            &local,
+        );
+        let before = Repository::open(dir.path())
+            .unwrap()
+            .head_commit_hash()
+            .unwrap();
+        let output = kio(&dir, &["--json", "batch", "resume", "--offline"], &local)
+            .env("KIO_TEST_PROMOTION_FAULT", phase)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "{phase} must interrupt publication"
+        );
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error_code"], "KIO-E-PROMOTION-FAULT-001", "{error}");
+        assert_eq!(error["context"]["phase"], phase, "{error}");
+        let published = Repository::open(dir.path())
+            .unwrap()
+            .head_commit_hash()
+            .unwrap();
+        assert_ne!(published, before, "{phase} runs after HEAD moved");
+        assert!(dir.path().join(".kio/promotion-state.json").exists());
+        let records = local_ocr_records(&dir);
+        assert!(!records.is_empty());
+        json_success(&dir, &["batch", "resume", "--offline"], &local);
+        assert_local_batch_publication(&dir, &local);
+        assert_eq!(
+            Repository::open(dir.path())
+                .unwrap()
+                .head_commit_hash()
+                .unwrap(),
+            published
+        );
+        assert_eq!(
+            local_ocr_records(&dir),
+            records,
+            "{phase} recovery must never repeat OCR"
+        );
+    }
+}
+
+/// 04 §5.6: retry does not revive auth failures. This is a typed Task
+/// selection fixture, not a claim that a provider authentication call occurred.
+/// The local peer is currently approved, so resume has a real positive dispatch
+/// control after retry proves that authorization repair alone cannot revive it.
+#[test]
+fn app09_local_ocr_batch_retry_preserves_auth_hold_until_resume() {
+    let dir = scanned_pdf_fixture();
+    let local = [("KIO_TEST_LOCAL_OCR", "mock")];
+    queue_unapproved_local_ocr(&dir, &local);
+    let store = kio_pipeline::task::TaskStore::new(dir.path().join(".kio"));
+    let mut changed = 0;
+    store
+        .update_matching(|task| {
+            if task.task_type != kio_pipeline::task::TaskType::Markdownize
+                || task.input_path != "scan.pdf"
+                || task.status != kio_pipeline::task::TaskStatus::Pending
+            {
+                return false;
+            }
+            task.status = kio_pipeline::task::TaskStatus::Paused;
+            task.hold_reason = Some(kio_pipeline::task::HoldReason::Auth);
+            task.fallback_reason = Some("auth_error".to_owned());
+            task.next_retry_at = None;
+            changed += 1;
+            true
+        })
+        .unwrap();
+    assert_eq!(changed, 1, "fixture must address one real local Task");
+    json_success(
+        &dir,
+        &["adapter", "approve", "paddleocr_vl_local", "--yes"],
+        &local,
+    );
+    let before = tasks(&dir)
+        .into_iter()
+        .find(|task| task["input_path"] == "scan.pdf")
+        .unwrap();
+    assert_eq!(before["status"], "paused");
+    assert_eq!(before["hold_reason"], "auth");
+    assert_eq!(before["fallback_reason"], "auth_error");
+    let before_head = Repository::open(dir.path())
+        .unwrap()
+        .head_commit_hash()
+        .unwrap();
+    let before_records = local_ocr_records(&dir);
+    assert!(
+        before_records.is_empty(),
+        "auth-held fixture must have no dispatched local attempt"
+    );
+    let retry = json_success(&dir, &["batch", "retry", "--offline"], &local);
+    assert_eq!(
+        retry["tasks_executed"], 0,
+        "retry must not revive an auth hold: {retry}"
+    );
+    let after = tasks(&dir)
+        .into_iter()
+        .find(|task| task["task_id"] == before["task_id"])
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "retry must preserve the exact auth hold and attempt metadata"
+    );
+    assert_eq!(
+        local_ocr_records(&dir),
+        before_records,
+        "retry must not create an attempt or accepted result"
+    );
+    assert_eq!(
+        Repository::open(dir.path())
+            .unwrap()
+            .head_commit_hash()
+            .unwrap(),
+        before_head
+    );
+    assert!(
+        !chunk_texts(&dir)
+            .iter()
+            .any(|text| text.contains(MOCK_PAGE_TEXT))
+    );
+    assert!(
+        !dir.path()
+            .join(".test-data/kio/cost-ledger.sqlite")
+            .exists()
+    );
+
+    let resumed = json_success(&dir, &["batch", "resume", "--offline"], &local);
+    assert_eq!(
+        resumed["tasks_executed"], 1,
+        "resume may recheck repaired authorization: {resumed}"
+    );
+    assert_local_batch_publication(&dir, &local);
+    let done = tasks(&dir)
+        .into_iter()
+        .find(|task| task["task_id"] == before["task_id"])
+        .unwrap();
+    assert_eq!(done["status"], "done");
+    assert!(done["hold_reason"].is_null());
+    assert!(
+        !local_ocr_records(&dir).is_empty(),
+        "resume must perform the actual synthetic local execution"
     );
 }

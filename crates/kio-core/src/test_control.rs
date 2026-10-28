@@ -70,6 +70,7 @@ finite_selector!(GeminiEmbedMode {
 finite_selector!(LocalOcrMode { "mock" => Mock });
 finite_selector!(LocalOcrBodyMode {
     "nonconforming" => Nonconforming, "table" => Table, "decorated" => Decorated,
+    "network_error" => NetworkError,
 });
 finite_selector!(MarkdownizeAdapterMode {
     "incremental" => Incremental, "reject_incremental" => RejectIncremental,

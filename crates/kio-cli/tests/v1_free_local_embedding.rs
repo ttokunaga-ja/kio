@@ -1309,3 +1309,204 @@ fn app01_fresh_image_task_attempts_match_exact_local_owner_and_one_dispatch() {
     );
     assert_eq!(billing(&f), before);
 }
+
+fn completed_local_query_child(child: &mut QueryChild, label: &str) -> std::process::Output {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if child.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+            return child.0.take().unwrap().wait_with_output().unwrap();
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{label} did not finish after explicit fixture release"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn endpoint_revoke_was_explicitly_busy(output: &std::process::Output) -> bool {
+    output.status.code() == Some(3)
+        && serde_json::from_slice::<Value>(&output.stderr)
+            .is_ok_and(|error| error["error_code"] == "KIO-E-PRIVATE-STATE-LOCKED-001")
+}
+
+#[test]
+fn endpoint_revoke_from_other_scope_cannot_complete_while_actual_query_send_is_held() {
+    use std::sync::atomic::Ordering;
+    let _env = kio_core::test_control::test_env_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    const QUERY: &str = "C_endpoint_inflight_query_physical_canary_fa1b29";
+    let peer = QueryPeer::new(QUERY);
+    let fixture = LocalQueryFixture::new(&peer);
+    let grants = fixture.home.join("data/kio/grants/grants.json");
+    let grants_before = fs::read(&grants).unwrap();
+    let mut query = QueryChild(Some(
+        fixture
+            .command(0, &["search", QUERY, "--mode", "vector"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    peer.seen
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("scope A query must enter the actual TLS response barrier");
+    assert_eq!(peer.queries.load(Ordering::SeqCst), 1);
+    assert!(query.0.as_mut().unwrap().try_wait().unwrap().is_none());
+    let mut revoke = QueryChild(Some(
+        fixture
+            .command(1, &["adapter", "revoke", "qwen3_vl_embedding_local"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    let early = loop {
+        if revoke.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+            break Some(completed_local_query_child(&mut revoke, "early revoke"));
+        }
+        if std::time::Instant::now() >= deadline {
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    assert!(!peer.release.load(Ordering::SeqCst));
+    assert!(
+        query.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+        "physical query must remain held throughout revoke observation"
+    );
+    let succeeded_while_held = early.as_ref().is_some_and(|output| output.status.success());
+    if let Some(output) = early.as_ref().filter(|output| !output.status.success()) {
+        assert!(
+            endpoint_revoke_was_explicitly_busy(output),
+            "only explicit nonmutating lock contention is acceptable while held: status={} stdout={} stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read(&grants).unwrap(),
+            grants_before,
+            "refused revoke must not mutate endpoint authority"
+        );
+    }
+    // Always release/reap before checking the intended exclusion assertion.
+    peer.release.store(true, Ordering::SeqCst);
+    let query_output = completed_local_query_child(&mut query, "physical query");
+    assert!(
+        query_output.status.success(),
+        "query positive control failed: {} {}",
+        String::from_utf8_lossy(&query_output.stdout),
+        String::from_utf8_lossy(&query_output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&query_output.stdout).unwrap();
+    assert_eq!(response["resolved_mode"], "vector", "{response}");
+    let first_revoke = early
+        .unwrap_or_else(|| completed_local_query_child(&mut revoke, "revoke after query release"));
+    let revoked = if endpoint_revoke_was_explicitly_busy(&first_revoke) {
+        // The prior attempt explicitly refused without mutation; this is one
+        // fresh authorized retry, never replay of an ambiguous mutation.
+        fixture
+            .command(1, &["adapter", "revoke", "qwen3_vl_embedding_local"])
+            .output()
+            .unwrap()
+    } else {
+        first_revoke
+    };
+    assert!(
+        revoked.status.success(),
+        "revoke positive control failed: {} {}",
+        String::from_utf8_lossy(&revoked.stdout),
+        String::from_utf8_lossy(&revoked.stderr)
+    );
+    let revoked_json: Value = serde_json::from_slice(&revoked.stdout).unwrap();
+    assert_eq!(revoked_json["status"], "revoked", "{revoked_json}");
+    let denied = fixture.json(0, &["search", QUERY, "--mode", "hybrid"]);
+    assert_eq!(denied["resolved_mode"], "text", "{denied}");
+    assert_eq!(
+        denied["fallback_reason"], "embedding_not_authorized",
+        "{denied}"
+    );
+    assert_eq!(
+        peer.queries.load(Ordering::SeqCst),
+        1,
+        "completed cross-scope revoke must block the next actual query send"
+    );
+    fixture.assert_no_billing_artifacts();
+    assert!(
+        !succeeded_while_held,
+        "scope B revoke succeeded while scope A's real TLS request was still held; scope writer leases alone do not protect device endpoint authority"
+    );
+}
+
+#[test]
+fn endpoint_revoke_from_other_scope_before_final_query_consent_sends_nothing() {
+    use std::sync::atomic::Ordering;
+    let _env = kio_core::test_control::test_env_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    const QUERY: &str = "C_endpoint_predispatch_query_physical_canary_592a18";
+    let peer = QueryPeer::new(QUERY);
+    let fixture = LocalQueryFixture::new(&peer);
+    let ready = fixture.home.join("endpoint-final-consent.ready");
+    let mut query = QueryChild(Some(
+        fixture
+            .command(0, &["search", QUERY, "--mode", "hybrid"])
+            .env("KIO_TEST_SEARCH_FINAL_CONSENT_BARRIER_READY", &ready)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !ready.exists() && query.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "actual query must reach final-consent fixture barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert!(ready.exists());
+    assert_eq!(peer.queries.load(Ordering::SeqCst), 0);
+    let start = std::time::Instant::now();
+    let revoked = fixture.json(1, &["adapter", "revoke", "qwen3_vl_embedding_local"]);
+    assert_eq!(revoked["status"], "revoked", "{revoked}");
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(20),
+        "revoke fixture must finish inside the bounded debug-only final-consent hold"
+    );
+    assert_eq!(
+        peer.queries.load(Ordering::SeqCst),
+        0,
+        "revoke completed before a physical query send"
+    );
+    fs::write(ready.with_extension("release"), b"release").unwrap();
+    // A wrong implementation must still be reaped promptly if it sent anyway.
+    peer.release.store(true, Ordering::SeqCst);
+    let output =
+        completed_local_query_child(&mut query, "query after cross-scope final-consent revoke");
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["resolved_mode"], "text", "{response}");
+    assert_eq!(
+        response["fallback_reason"], "embedding_not_authorized",
+        "{response}"
+    );
+    assert_eq!(
+        peer.queries.load(Ordering::SeqCst),
+        0,
+        "fresh grant recheck must prevent any actual query send"
+    );
+    assert!(
+        !fixture.home.join("query.trace").exists(),
+        "pre-dispatch denial creates no query attempt"
+    );
+    fixture.assert_no_billing_artifacts();
+}

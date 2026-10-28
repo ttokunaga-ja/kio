@@ -106,10 +106,8 @@ impl Fixture {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let temp = tempfile::tempdir().unwrap();
-        // macOS commonly exposes tempfile paths below `/var`, whose canonical
-        // spelling is `/private/var`. Private grant validation intentionally
-        // rejects that unresolved alias, so bind every fixture path from the
-        // same canonical base before assigning HOME/XDG.
+        // Use one stable spelling for scope identity and the test's HOME/XDG.
+        // The external temporary-directory ancestors are outside Kio ownership.
         let base = temp.path().canonicalize().unwrap();
         let root = base.join("scope");
         fs::create_dir(&root).unwrap();
@@ -1237,4 +1235,882 @@ fn nested_execute_preserves_outer_control_after_inner_error() {
 #[test]
 fn nested_execute_preserves_outer_control_after_inner_panic() {
     assert_nested_approval_keeps_outer_control(NestedApprovalOutcome::Panic);
+}
+
+const LOOPBACK_TEST_CA: &str = "-----BEGIN CERTIFICATE-----\nMIIBWTCB/6ADAgECAhR5P0J0YMFaZPlrOFyN8/jwpGzhqjAKBggqhkjOPQQDAjAh\nMR8wHQYDVQQDDBZyY2dlbiBzZWxmIHNpZ25lZCBjZXJ0MCAXDTc1MDEwMTAwMDAw\nMFoYDzQwOTYwMTAxMDAwMDAwWjAhMR8wHQYDVQQDDBZyY2dlbiBzZWxmIHNpZ25l\nZCBjZXJ0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGhIwEPQnvWSlH+iUQ5Ui\nq0khmBj4hlxmW+mTL5xjjyxwwopOnkxLs2AofasS2lYPdILzMaIeRE78g2S7Hz1n\nX6MTMBEwDwYDVR0RBAgwBocEfwAAATAKBggqhkjOPQQDAgNJADBGAiEA0GBG4uEL\nSJJea18R17+yhRTyn3rsD6PzDhdg7F/v2sQCIQCccgcgjDh+ABNajeb1deKZoqbx\nnP4qBrGe09azOI4jbg==\n-----END CERTIFICATE-----\n";
+
+fn loopback_settings(fixture: &Fixture) -> Arc<AdapterRuntimeSettings> {
+    use kio_adapter::tool_lock::DeclaredAdapter;
+    use std::io::Write;
+    let ca = fixture.repo.kio_dir().join("loopback-test-ca.pem");
+    let mut file = crate::test_support::create_private_test_file(&ca);
+    file.write_all(LOOPBACK_TEST_CA.as_bytes()).unwrap();
+    file.sync_all().unwrap();
+    drop(file);
+    let mut settings = AdapterRuntimeSettings::default();
+    settings.local_peer_ca_path = Some(ca.clone());
+    settings.local_peer_trust_digest =
+        Some(kio_adapter::local_peer::capture_private_local_trust(&ca).unwrap());
+    settings.local_peer_trust_binding = Some(format!(
+        "local-ca:v1:g1:01ARZ3NDEKTSV4RRFFQ69G5FAV:{}",
+        settings.local_peer_trust_digest.as_ref().unwrap()
+    ));
+    settings.declarations.insert(
+        "embedding".into(),
+        DeclaredAdapter {
+            tool_id: Some("qwen3_vl_embedding_local".into()),
+            kind: Some("offline_api".into()),
+            url: Some("https://127.0.0.1:9443/v1/embeddings".into()),
+            ..Default::default()
+        },
+    );
+    Arc::new(settings)
+}
+
+#[test]
+fn loopback_endpoint_grant_reuses_device_authority_across_scopes_and_revokes_everywhere() {
+    use crate::grants::GrantOperation;
+    let fixture = Fixture::new();
+    let settings = loopback_settings(&fixture);
+    let profile = crate::embedding::admission::declared_embedding_profile(
+        crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
+            .expect("configured local embedding execution"),
+    );
+    let target = AdapterTarget::Tool(profile.tool_id.clone());
+    let interrupted = fixture.approve_with_control(
+        &settings,
+        target.clone(),
+        None,
+        false,
+        Some("device_pending"),
+    );
+    assert!(
+        interrupted.is_err(),
+        "fixture must stop with an unconfirmed device intent"
+    );
+    let pending = crate::grants::PrivateGrantStore::open_readonly(
+        &fixture.grant_path(),
+        &crate::settings::data_home(fixture.repo.control()),
+        fixture.repo.control(),
+    )
+    .unwrap()
+    .unwrap();
+    let grant_id = pending
+        .records()
+        .iter()
+        .find(|record| record.state == crate::grants::GrantState::Pending)
+        .unwrap()
+        .grant_id
+        .clone();
+    assert!(
+        !super::approvals::allowed(
+            &settings,
+            &fixture.repo,
+            super::approvals::AdapterRole::Embedding,
+            &profile.tool_id,
+            &profile.profile_hash,
+            GrantOperation::Network
+        )
+        .unwrap()
+    );
+    fixture
+        .approve_with(&settings, target, Some(grant_id), false)
+        .unwrap();
+    assert!(
+        super::approvals::allowed(
+            &settings,
+            &fixture.repo,
+            super::approvals::AdapterRole::Embedding,
+            &profile.tool_id,
+            &profile.profile_hash,
+            GrantOperation::Network
+        )
+        .unwrap(),
+        "same-scope positive control"
+    );
+    let sibling_root = fixture.root.with_file_name("second-endpoint-consumer");
+    fs::create_dir(&sibling_root).unwrap();
+    let sibling =
+        match crate::management::initialize_explicit_root(&sibling_root, fixture.repo.control())
+            .unwrap()
+        {
+            crate::management::ExplicitRoot::Created(repo) => repo,
+            _ => panic!("fresh independent scope expected"),
+        };
+    let before = snapshot_tree(sibling.kio_dir());
+    assert!(
+        super::approvals::allowed(
+            &settings,
+            &sibling,
+            super::approvals::AdapterRole::Embedding,
+            &profile.tool_id,
+            &profile.profile_hash,
+            GrantOperation::Network
+        )
+        .unwrap(),
+        "one device endpoint confirmation must authorize the same endpoint in another scope without a scope grant"
+    );
+    assert_eq!(
+        snapshot_tree(sibling.kio_dir()),
+        before,
+        "admission must not synthesize scope consent"
+    );
+    assert!(
+        !super::approvals::allowed(
+            &settings,
+            &sibling,
+            super::approvals::AdapterRole::Embedding,
+            &profile.tool_id,
+            &profile.profile_hash,
+            GrantOperation::SendSecrets
+        )
+        .unwrap(),
+        "ordinary endpoint consent cannot release secrets"
+    );
+    let mut changed = (*settings).clone();
+    changed.declarations.get_mut("embedding").unwrap().url =
+        Some("https://127.0.0.1:9443/other-path".into());
+    assert!(
+        !super::approvals::allowed(
+            &Arc::new(changed),
+            &sibling,
+            super::approvals::AdapterRole::Embedding,
+            &profile.tool_id,
+            &profile.profile_hash,
+            GrantOperation::Network
+        )
+        .unwrap(),
+        "path drift requires fresh endpoint consent"
+    );
+    fixture
+        .in_context_at(&settings, &sibling_root, |ctx| {
+            super::approvals::revoke(
+                ctx,
+                RevokeArgs {
+                    target: AdapterTarget::Tool(profile.tool_id.clone()),
+                },
+                ctx.control,
+            )
+        })
+        .unwrap();
+    for repo in [&fixture.repo, &sibling] {
+        assert!(
+            !super::approvals::allowed(
+                &settings,
+                repo,
+                super::approvals::AdapterRole::Embedding,
+                &profile.tool_id,
+                &profile.profile_hash,
+                GrantOperation::Network
+            )
+            .unwrap(),
+            "device endpoint revoke must affect every scope"
+        );
+    }
+}
+
+#[test]
+fn endpoint_secret_confirmation_is_scoped_resumable_and_requires_live_parent() {
+    use crate::grants::{GrantOperation, GrantState};
+    let fixture = Fixture::new();
+    let settings = loopback_settings(&fixture);
+    let tool = "qwen3_vl_embedding_local";
+    let profile = crate::embedding::admission::declared_embedding_profile(
+        crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
+            .unwrap(),
+    );
+    fixture
+        .approve_with(&settings, AdapterTarget::Tool(tool.into()), None, false)
+        .unwrap();
+    let second = fixture.root.with_file_name("secret-endpoint-scope");
+    fs::create_dir(&second).unwrap();
+    let repo = match crate::management::initialize_explicit_root(&second, fixture.repo.control())
+        .unwrap()
+    {
+        crate::management::ExplicitRoot::Created(repo) => repo,
+        _ => panic!("fresh scope"),
+    };
+    let approve_at = |resume: Option<String>, secrets: bool, stop_after| {
+        fixture.in_context_at(&settings, &second, |ctx| {
+            super::approvals::approve(
+                ctx,
+                ApproveArgs {
+                    target: AdapterTarget::Tool(tool.into()),
+                    preview: false,
+                    yes: true,
+                    resume,
+                    send_secrets: secrets,
+                },
+                &super::approvals::ApprovalControl { stop_after },
+            )
+        })
+    };
+    assert!(approve_at(None, true, Some("device_pending")).is_err());
+    let snapshot = crate::grants::PrivateGrantStore::open_readonly(
+        &fixture.grant_path(),
+        &crate::settings::data_home(fixture.repo.control()),
+        fixture.repo.control(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        snapshot
+            .records()
+            .iter()
+            .filter(|r| r.binding.operation() == GrantOperation::Network)
+            .count(),
+        1,
+        "adding scoped secrets must not duplicate device endpoint authority"
+    );
+    let pending = snapshot
+        .records()
+        .iter()
+        .find(|r| r.state == GrantState::Pending && r.parent_network_grant_id.is_some())
+        .unwrap();
+    let id = pending.grant_id.clone();
+    assert!(
+        !super::approvals::allowed(
+            &settings,
+            &repo,
+            super::approvals::AdapterRole::Embedding,
+            tool,
+            &profile.profile_hash,
+            GrantOperation::SendSecrets
+        )
+        .unwrap()
+    );
+    assert!(
+        approve_at(Some(id.clone()), false, None).is_err(),
+        "resume cannot change original secret disclosure"
+    );
+    approve_at(Some(id), true, None).unwrap();
+    assert!(
+        super::approvals::allowed(
+            &settings,
+            &repo,
+            super::approvals::AdapterRole::Embedding,
+            tool,
+            &profile.profile_hash,
+            GrantOperation::SendSecrets
+        )
+        .unwrap()
+    );
+    assert!(
+        !super::approvals::allowed(
+            &settings,
+            &fixture.repo,
+            super::approvals::AdapterRole::Embedding,
+            tool,
+            &profile.profile_hash,
+            GrantOperation::SendSecrets
+        )
+        .unwrap()
+    );
+    fixture
+        .in_context(&settings, |ctx| {
+            super::approvals::revoke(
+                ctx,
+                RevokeArgs {
+                    target: AdapterTarget::Tool(tool.into()),
+                },
+                ctx.control,
+            )
+        })
+        .unwrap();
+    assert!(
+        !super::approvals::allowed(
+            &settings,
+            &repo,
+            super::approvals::AdapterRole::Embedding,
+            tool,
+            &profile.profile_hash,
+            GrantOperation::SendSecrets
+        )
+        .unwrap()
+    );
+}
+
+#[test]
+fn combined_endpoint_secret_pending_cannot_resume_after_parent_revoke() {
+    use crate::grants::{GrantOperation, GrantState};
+    let fixture = Fixture::new();
+    let settings = loopback_settings(&fixture);
+    let tool = "qwen3_vl_embedding_local";
+    assert!(
+        fixture
+            .approve_with_control(
+                &settings,
+                AdapterTarget::Tool(tool.into()),
+                None,
+                true,
+                Some("device_pending")
+            )
+            .is_err()
+    );
+    let snapshot = crate::grants::PrivateGrantStore::open_readonly(
+        &fixture.grant_path(),
+        &crate::settings::data_home(fixture.repo.control()),
+        fixture.repo.control(),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(snapshot.records().len(), 2);
+    assert!(
+        snapshot
+            .records()
+            .iter()
+            .all(|r| r.state == GrantState::Pending)
+    );
+    let id = snapshot
+        .records()
+        .iter()
+        .find(|r| r.binding.operation() == GrantOperation::Network)
+        .unwrap()
+        .grant_id
+        .clone();
+    fixture
+        .in_context(&settings, |ctx| {
+            super::approvals::revoke(
+                ctx,
+                RevokeArgs {
+                    target: AdapterTarget::Tool(tool.into()),
+                },
+                ctx.control,
+            )
+        })
+        .unwrap();
+    assert!(
+        fixture
+            .approve_with(&settings, AdapterTarget::Tool(tool.into()), Some(id), true)
+            .is_err()
+    );
+    let snapshot = crate::grants::PrivateGrantStore::open_readonly(
+        &fixture.grant_path(),
+        &crate::settings::data_home(fixture.repo.control()),
+        fixture.repo.control(),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        snapshot
+            .records()
+            .iter()
+            .all(|r| r.state == GrantState::Revoked)
+    );
+}
+
+#[test]
+fn unused_missing_https_trust_with_unrelated_device_grants_is_optional_readiness() {
+    let fixture = Fixture::new();
+    fixture.approve(&Arc::new(AdapterRuntimeSettings::default()), false);
+    let mut settings = (*loopback_settings(&fixture)).clone();
+    settings.local_peer_trust_binding = None;
+    let settings = Arc::new(settings);
+    let profile = crate::embedding::admission::declared_embedding_profile(
+        crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
+            .unwrap(),
+    );
+    let before = fixture.metadata_snapshot();
+    let allowed = super::approvals::allowed(
+        &settings,
+        &fixture.repo,
+        super::approvals::AdapterRole::Embedding,
+        &profile.tool_id,
+        &profile.profile_hash,
+        crate::grants::GrantOperation::Network,
+    );
+    assert!(
+        matches!(allowed, Ok(false)),
+        "unused local trust must be unavailable readiness, not abort local work: {allowed:?}"
+    );
+    assert_eq!(fixture.metadata_snapshot(), before);
+}
+
+#[cfg(unix)]
+fn assert_dispatch_grant_directory_binding(active_original: bool) {
+    use crate::grants::{GrantBinding, PrivateGrantStore};
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    let fixture = Fixture::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/v1/embeddings",
+        listener.local_addr().unwrap().port()
+    );
+    let stopped = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(AtomicUsize::new(0));
+    let server_stop = stopped.clone();
+    let server_received = received.clone();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !server_stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // Darwin accept inherits the listener's nonblocking flag.
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut body = Vec::new();
+                    let marker = b"lease-directory-identity-probe";
+                    while body.len() < 65536 {
+                        let mut chunk = [0u8; 4096];
+                        let count = stream.read(&mut chunk).unwrap();
+                        if count == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = body.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&body[..end]);
+                            let length = headers
+                                .lines()
+                                .filter_map(|line| line.split_once(':'))
+                                .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, value)| value.trim().parse::<usize>().unwrap());
+                            if length.is_some_and(|length| body.len() >= end + 4 + length)
+                                || (headers
+                                    .to_ascii_lowercase()
+                                    .contains("transfer-encoding: chunked")
+                                    && body[end + 4..].ends_with(b"0\r\n\r\n"))
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    if body.windows(marker.len()).any(|part| part == marker) {
+                        server_received.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let mut vector = vec![0.0_f32; 768];
+                    vector[0] = 1.0;
+                    let response = serde_json::json!({"data":[{"embedding":vector}]}).to_string();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+                    stream.flush().unwrap();
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("synthetic loopback listener failed: {error}"),
+            }
+        }
+    });
+    let mut settings = (*loopback_settings(&fixture)).clone();
+    settings.declarations.get_mut("embedding").unwrap().url = Some(url);
+    let settings = Arc::new(settings);
+    let execution =
+        crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
+            .unwrap();
+    let profile = crate::embedding::admission::declared_embedding_profile(execution);
+    fixture
+        .approve_with(
+            &settings,
+            AdapterTarget::Tool(profile.tool_id.clone()),
+            None,
+            false,
+        )
+        .unwrap();
+    let path = fixture.grant_path();
+    let source = PrivateGrantStore::open_readonly(
+        &path,
+        &crate::settings::data_home(fixture.repo.control()),
+        fixture.repo.control(),
+    )
+    .unwrap()
+    .unwrap();
+    let network = source
+        .records()
+        .iter()
+        .find(|r| matches!(&r.binding, GrantBinding::DeviceEndpoint(_)))
+        .unwrap();
+    let GrantBinding::DeviceEndpoint(endpoint) = network.binding.clone() else {
+        unreachable!()
+    };
+    let replacement_directory = path.parent().unwrap().with_file_name("replacement-grants");
+    let replacement_path = replacement_directory.join("grants.json");
+    let mut replacement = PrivateGrantStore::open_or_create(
+        &replacement_path,
+        &crate::settings::data_home(fixture.repo.control()),
+        fixture.repo.control(),
+    )
+    .unwrap();
+    let (pending, _) = replacement
+        .begin_pending_endpoint(
+            endpoint.clone(),
+            network.disclosure.clone().unwrap(),
+            None,
+            "2026-10-20T00:00:00Z".into(),
+        )
+        .unwrap();
+    replacement
+        .activate_endpoint_records(&pending, None, "2026-10-20T00:01:00Z".into())
+        .unwrap();
+    if active_original {
+        replacement
+            .revoke_endpoint(&endpoint, "2026-10-20T00:02:00Z".into())
+            .unwrap();
+    }
+    drop(replacement);
+    if !active_original {
+        let mut original = PrivateGrantStore::open_or_create(
+            &path,
+            &crate::settings::data_home(fixture.repo.control()),
+            fixture.repo.control(),
+        )
+        .unwrap();
+        original
+            .revoke_endpoint(&endpoint, "2026-10-20T00:02:00Z".into())
+            .unwrap();
+    }
+    let parked = path
+        .parent()
+        .unwrap()
+        .with_file_name("retained-original-grants");
+    let admitted = super::approvals::endpoint_dispatch_lease_with_checkpoint(
+        &settings,
+        &fixture.repo,
+        super::approvals::AdapterRole::Embedding,
+        &profile.tool_id,
+        &profile.profile_hash,
+        false,
+        |phase| {
+            if phase != super::approvals::EndpointLeasePhase::Locked {
+                return Ok(());
+            }
+            fs::rename(path.parent().unwrap(), &parked).unwrap();
+            fs::rename(&replacement_directory, path.parent().unwrap()).unwrap();
+            Ok(())
+        },
+    );
+    let was_admitted = matches!(&admitted, Ok(Some(_)));
+    if let Ok(Some(lease)) = admitted {
+        // A writer for replacement B is independent of the retained A lock.
+        // Its completed revoke must not let B supply authority under A's lease.
+        let mut replacement = PrivateGrantStore::open_or_create(
+            &path,
+            &crate::settings::data_home(fixture.repo.control()),
+            fixture.repo.control(),
+        )
+        .unwrap();
+        replacement
+            .revoke_endpoint(&endpoint, "2026-10-20T00:03:00Z".into())
+            .unwrap();
+        drop(replacement);
+        let completed = crate::embedding::transport::run_embedding_adapter(
+            &settings,
+            execution,
+            vec![kio_adapter::types::EmbeddingItem::text(
+                "probe",
+                "lease-directory-identity-probe",
+            )],
+            kio_adapter::types::EmbeddingInputType::Query,
+            None,
+            fixture.repo.control(),
+        );
+        assert!(
+            completed.is_ok(),
+            "synthetic loopback physical embedding must complete"
+        );
+        drop(lease);
+    }
+    stopped.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        usize::from(active_original),
+        "actual content dispatch must use the grant snapshot in the directory protected by its lease"
+    );
+    assert_eq!(
+        was_admitted, active_original,
+        "nominal replacement must neither supply nor withdraw retained authority"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn revoked_retained_grant_directory_cannot_borrow_active_replacement_for_dispatch() {
+    assert_dispatch_grant_directory_binding(false);
+}
+
+#[cfg(unix)]
+#[test]
+fn active_retained_grant_directory_keeps_authority_when_nominal_replacement_is_revoked() {
+    assert_dispatch_grant_directory_binding(true);
+}
+
+#[cfg(unix)]
+fn assert_retired_child_secret_is_revalidated_under_dispatch_lease() {
+    use crate::grants::{GrantBinding, PrivateGrantStore};
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+    let fixture = Fixture::new();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let url = format!(
+        "http://127.0.0.1:{}/v1/embeddings",
+        listener.local_addr().unwrap().port()
+    );
+    let stopped = Arc::new(AtomicBool::new(false));
+    let received = Arc::new(AtomicUsize::new(0));
+    let server_stop = stopped.clone();
+    let server_received = received.clone();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline && !server_stop.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    // Darwin accept inherits the listener's nonblocking flag.
+                    stream.set_nonblocking(false).unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(3)))
+                        .unwrap();
+                    let mut body = Vec::new();
+                    let marker = b"lease-directory-identity-probe";
+                    while body.len() < 65536 {
+                        let mut chunk = [0u8; 4096];
+                        let count = stream.read(&mut chunk).unwrap();
+                        if count == 0 {
+                            break;
+                        }
+                        body.extend_from_slice(&chunk[..count]);
+                        if let Some(end) = body.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&body[..end]);
+                            let length = headers
+                                .lines()
+                                .filter_map(|line| line.split_once(':'))
+                                .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                                .map(|(_, value)| value.trim().parse::<usize>().unwrap());
+                            if length.is_some_and(|length| body.len() >= end + 4 + length)
+                                || (headers
+                                    .to_ascii_lowercase()
+                                    .contains("transfer-encoding: chunked")
+                                    && body[end + 4..].ends_with(b"0\r\n\r\n"))
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    if body.windows(marker.len()).any(|part| part == marker) {
+                        server_received.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let mut vector = vec![0.0_f32; 768];
+                    vector[0] = 1.0;
+                    let response = serde_json::json!({"data":[{"embedding":vector}]}).to_string();
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+                    stream.flush().unwrap();
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Err(error) => panic!("synthetic loopback listener failed: {error}"),
+            }
+        }
+    });
+    let mut settings = (*loopback_settings(&fixture)).clone();
+    settings.declarations.get_mut("embedding").unwrap().url = Some(url);
+    let settings = Arc::new(settings);
+    let execution =
+        crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
+            .unwrap();
+    let profile = crate::embedding::admission::declared_embedding_profile(execution);
+    let child_path = fixture.root.join("secret-child");
+    fs::create_dir(&child_path).unwrap();
+    let child =
+        match crate::management::reconcile_planned_child(&fixture.repo, bound_child(&child_path))
+            .unwrap()
+        {
+            crate::management::ChildScope::Managed { repo } => repo,
+            _ => panic!("real managed child required"),
+        };
+    fs::write(child_path.join(".env"), "lease-directory-identity-probe").unwrap();
+    let needs_secret = kio_pipeline::scan::classify_secret(".env").is_some();
+    assert!(
+        needs_secret,
+        "positive fixture must represent scoped secret content"
+    );
+    fixture
+        .in_context_at(&settings, &child_path, |ctx| {
+            super::approvals::approve(
+                ctx,
+                ApproveArgs {
+                    target: AdapterTarget::Tool(profile.tool_id.clone()),
+                    preview: false,
+                    yes: true,
+                    resume: None,
+                    send_secrets: true,
+                },
+                &super::approvals::ApprovalControl::default(),
+            )
+        })
+        .unwrap();
+    let child_lock = child.lock_store_in_session(child.lock_session()).unwrap();
+    let policy = crate::search::scope::current_embedding_policy(&child).unwrap();
+    crate::egress::admit_embedding_transport(
+        &settings,
+        &child,
+        execution,
+        &profile,
+        &policy,
+        needs_secret,
+    )
+    .unwrap();
+    let moved = fixture.root.with_file_name("retained-secret-child");
+    let admitted = super::approvals::endpoint_dispatch_lease_with_checkpoint(
+        &settings,
+        &child,
+        super::approvals::AdapterRole::Embedding,
+        &profile.tool_id,
+        &profile.profile_hash,
+        needs_secret,
+        |phase| {
+            if phase != super::approvals::EndpointLeasePhase::Configured {
+                return Ok(());
+            }
+            fs::rename(&child_path, &moved).unwrap();
+            // Real production retirement holds only the parent scope writer;
+            // the sender still holds the displaced old child's writer above.
+            crate::management::reconcile_child_lifecycle(&fixture.repo).unwrap();
+            let snapshot = PrivateGrantStore::open_readonly(
+                &fixture.grant_path(),
+                &crate::settings::data_home(fixture.repo.control()),
+                fixture.repo.control(),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(
+                snapshot.records().iter().any(|r| matches!(
+                    &r.binding,
+                    GrantBinding::DeviceEndpoint(_)
+                ) && r.state
+                    == crate::grants::GrantState::Active),
+                "ordinary endpoint must remain active"
+            );
+            assert!(
+                snapshot
+                    .records()
+                    .iter()
+                    .any(|r| r.parent_network_grant_id.is_some()
+                        && r.state == crate::grants::GrantState::Revoked),
+                "retirement must complete scoped secret withdrawal"
+            );
+            Ok(())
+        },
+    );
+    if let Ok(Some(lease)) = admitted {
+        let completed = crate::embedding::transport::run_embedding_adapter(
+            &settings,
+            execution,
+            vec![kio_adapter::types::EmbeddingItem::text(
+                "probe",
+                "lease-directory-identity-probe",
+            )],
+            kio_adapter::types::EmbeddingInputType::MarkdownChunk,
+            None,
+            fixture.repo.control(),
+        );
+        assert!(
+            completed.is_ok(),
+            "synthetic loopback physical embedding must complete"
+        );
+        drop(lease);
+    }
+    stopped.store(true, Ordering::SeqCst);
+    server.join().unwrap();
+    drop(child_lock);
+    assert_eq!(
+        received.load(Ordering::SeqCst),
+        0,
+        "completed parent-owned scoped-secret retirement must deny the old retained child's physical secret payload"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn parent_retirement_withdraws_scoped_secret_before_final_device_dispatch_lease() {
+    assert_retired_child_secret_is_revalidated_under_dispatch_lease();
+}
+
+#[test]
+fn final_endpoint_lease_checks_secret_pair_without_invalidating_normal_scope_authority() {
+    use crate::grants::{GrantOperation, GrantState, PrivateGrantStore};
+    let fixture = Fixture::new();
+    let settings = loopback_settings(&fixture);
+    let execution =
+        crate::embedding::admission::embedding_execution(&settings, fixture.repo.control())
+            .unwrap();
+    let profile = crate::embedding::admission::declared_embedding_profile(execution);
+    fixture
+        .approve_with(
+            &settings,
+            AdapterTarget::Tool(profile.tool_id.clone()),
+            None,
+            true,
+        )
+        .unwrap();
+    assert!(
+        super::approvals::allowed(
+            &settings,
+            &fixture.repo,
+            super::approvals::AdapterRole::Embedding,
+            &profile.tool_id,
+            &profile.profile_hash,
+            GrantOperation::SendSecrets
+        )
+        .unwrap()
+    );
+    let scope_before = fixture.metadata_snapshot();
+    let mut store = PrivateGrantStore::open_or_create(
+        &fixture.grant_path(),
+        &crate::settings::data_home(fixture.repo.control()),
+        fixture.repo.control(),
+    )
+    .unwrap();
+    let scope_id = fixture.repo.scope_identity().unwrap().scope_id;
+    let revoked = store
+        .revoke(
+            &scope_id,
+            Some(&profile.tool_id),
+            "2026-10-20T00:00:00Z".into(),
+        )
+        .unwrap();
+    assert_eq!(revoked.len(), 1, "withdraw only the scoped secret half");
+    assert!(
+        store
+            .records()
+            .iter()
+            .any(|r| r.binding.operation() == GrantOperation::Network
+                && r.state == GrantState::Active)
+    );
+    drop(store);
+    assert_eq!(
+        fixture.metadata_snapshot(),
+        scope_before,
+        "scope policy/reference and physical identity must remain valid"
+    );
+    let normal = super::approvals::endpoint_dispatch_lease(
+        &settings,
+        &fixture.repo,
+        super::approvals::AdapterRole::Embedding,
+        &profile.tool_id,
+        &profile.profile_hash,
+        false,
+    )
+    .unwrap()
+    .unwrap();
+    drop(normal);
+    let secret = super::approvals::endpoint_dispatch_lease(
+        &settings,
+        &fixture.repo,
+        super::approvals::AdapterRole::Embedding,
+        &profile.tool_id,
+        &profile.profile_hash,
+        true,
+    );
+    assert!(
+        matches!(secret, Err(ref error) if error.error_code() == "KIO-E-ADAPTER-APPROVAL-REQUIRED-001"),
+        "a valid normal endpoint lease cannot substitute for withdrawn scoped secret consent"
+    );
 }

@@ -1,4 +1,4 @@
-use crate::grants::{GrantBinding, GrantRecord};
+use crate::grants::{GrantRecord, ScopedGrantBinding};
 use crate::trust::TrustRecord;
 use serde::Serialize;
 use serde_json::Value;
@@ -16,9 +16,18 @@ pub enum AdapterResponse {
 pub struct ApprovalPreviewResponse {
     pub status: String,
     pub scope_id: String,
-    pub adapters: Vec<GrantBinding>,
+    pub adapters: Vec<ScopedGrantBinding>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub device_endpoints: Vec<EndpointPreview>,
     pub send_secrets: bool,
     pub resume: Option<String>,
+}
+#[derive(Debug, Serialize)]
+pub struct EndpointPreview {
+    pub peer_authenticated: bool,
+    pub binding: crate::grants::DeviceEndpointBinding,
+    pub disclosure: crate::grants::EndpointDisclosure,
+    pub secret_scope: Option<ScopedGrantBinding>,
 }
 #[derive(Debug, Serialize)]
 pub struct ApprovedResponse {
@@ -61,12 +70,20 @@ pub struct ApprovalRevokeResponse {
 }
 #[derive(Debug, Serialize)]
 pub struct ApprovalStatusResponse {
-    pub scope_id: String,
+    pub scope_id: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub device_endpoints: Vec<EndpointPeerStatus>,
     pub grants: Vec<GrantRecord>,
     pub effective: Vec<EffectiveApproval>,
     // Existing persisted JSON is deliberately returned verbatim.
     pub scope_approvals: Vec<Value>,
     pub pending: Option<Value>,
+}
+/// Presentation of a configured or recorded endpoint, independent of consent.
+#[derive(Debug, Serialize)]
+pub struct EndpointPeerStatus {
+    pub binding: crate::grants::DeviceEndpointBinding,
+    pub peer_authenticated: bool,
 }
 #[derive(Debug, Serialize)]
 pub struct EffectiveApproval {

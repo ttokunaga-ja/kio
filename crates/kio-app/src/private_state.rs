@@ -53,6 +53,22 @@ pub(crate) fn open_existing(
     Ok(Some(PrivateState { directory, lock }))
 }
 
+/// Acquire an existing-only shared dispatch lease. The permanent writer gate
+/// remains exclusive for lifecycle mutations; missing state is never created.
+pub(crate) fn open_existing_shared(
+    path: &Path,
+    external_base: &Path,
+    lock_bytes: &[u8],
+    control: &ControlHandle,
+) -> Result<Option<PrivateState>> {
+    let Some(directory) = open_readonly(path, external_base, control)? else {
+        return Ok(None);
+    };
+    directory.ensure_owner_private(Path::new(".lock"))?;
+    let lock = lock_checked(&directory, lock_bytes, true)?;
+    Ok(Some(PrivateState { directory, lock }))
+}
+
 pub(crate) fn open_or_create(
     path: &Path,
     external_base: &Path,
@@ -196,7 +212,7 @@ fn acquire_existing_lock(directory: &StoreDirectory, lock_bytes: &[u8]) -> Resul
     // repair a missing lock leaf. A registered store creates it once through
     // `open_or_create`; disappearance is a tamper/corruption error.
     directory.ensure_owner_private(leaf)?;
-    lock_checked(directory, lock_bytes)
+    lock_checked(directory, lock_bytes, false)
 }
 
 fn acquire_lock(directory: &StoreDirectory, lock_bytes: &[u8]) -> Result<File> {
@@ -205,17 +221,21 @@ fn acquire_lock(directory: &StoreDirectory, lock_bytes: &[u8]) -> Result<File> {
         let _ = directory.write_atomic(leaf, lock_bytes, Publication::CreateOnly);
     }
     directory.ensure_owner_private(leaf)?;
-    lock_checked(directory, lock_bytes)
+    lock_checked(directory, lock_bytes, false)
 }
 
-fn lock_checked(directory: &StoreDirectory, lock_bytes: &[u8]) -> Result<File> {
+fn lock_checked(directory: &StoreDirectory, lock_bytes: &[u8], shared: bool) -> Result<File> {
     let leaf = Path::new(".lock");
     let mut file = directory.open_regular_read(leaf, 256)?;
     kio_core::private_fs::verify_private_regular_file_handle(&file)?;
     // Windows locks deny reads through a contender's separate handle. Acquire
     // ownership before inspecting the marker, then read this same handle.
-    file.try_lock()
-        .map_err(|error| lock_acquisition_error(error, &directory.path().join(leaf)))?;
+    let acquired = if shared {
+        file.try_lock_shared()
+    } else {
+        file.try_lock()
+    };
+    acquired.map_err(|error| lock_acquisition_error(error, &directory.path().join(leaf)))?;
     let mut bytes = Vec::new();
     Read::by_ref(&mut file)
         .take(257)
@@ -633,6 +653,51 @@ mod lock_marker_tests {
     use super::{create_initialized, open_existing};
     use kio_core::control::ControlHandle;
     use std::fs;
+
+    #[test]
+    fn shared_existing_readers_overlap_and_keep_writer_blocked_until_both_drop() {
+        let root = crate::test_support::PrivateTempDir::new();
+        let path = root.path().join("grant-shared");
+        let control = ControlHandle::default();
+        let created =
+            create_initialized(&path, root.path(), b"shared-marker", |_| Ok(()), &control).unwrap();
+        drop(created);
+        let first = super::open_existing_shared(&path, root.path(), b"shared-marker", &control)
+            .unwrap()
+            .unwrap();
+        let second = super::open_existing_shared(&path, root.path(), b"shared-marker", &control)
+            .expect("independent approved dispatch readers must overlap")
+            .unwrap();
+        assert_eq!(
+            open_existing(&path, root.path(), b"shared-marker", &control)
+                .unwrap_err()
+                .error_code(),
+            "KIO-E-PRIVATE-STATE-LOCKED-001"
+        );
+        drop(first);
+        assert_eq!(
+            open_existing(&path, root.path(), b"shared-marker", &control)
+                .unwrap_err()
+                .error_code(),
+            "KIO-E-PRIVATE-STATE-LOCKED-001"
+        );
+        drop(second);
+        drop(
+            open_existing(&path, root.path(), b"shared-marker", &control)
+                .unwrap()
+                .unwrap(),
+        );
+        let missing = root.path().join("never-approved");
+        assert!(
+            super::open_existing_shared(&missing, root.path(), b"shared-marker", &control)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !missing.exists(),
+            "dispatch acquisition must not create private state"
+        );
+    }
 
     #[test]
     fn only_lock_contention_is_classified_as_busy() {

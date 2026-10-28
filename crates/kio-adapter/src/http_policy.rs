@@ -1,11 +1,11 @@
-//! Shared resource policy for authenticated adapter HTTP exchanges.
+//! Shared resource policy for adapter HTTP exchanges.
 
 use std::io::Read as _;
 use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::local_peer::AuthenticatedLocalEndpoint;
+use crate::local_peer::LocalEndpoint;
 use crate::types::ProviderIdempotency;
 use crate::{AdapterError, Result};
 
@@ -119,11 +119,10 @@ pub(crate) fn authenticated_agent(policy: HttpPolicy) -> ureq::Agent {
     AuthenticatedHttpClient::new(policy).agent()
 }
 
-/// The only transport constructor for an `offline_api` request.  Unlike the
-/// online helper above it uses an explicit device CA instead of web roots.
-/// Both constructors disable proxy inheritance.
-pub(crate) fn authenticated_local_agent(
-    endpoint: &AuthenticatedLocalEndpoint,
+/// The only transport constructor for an `offline_api` request. The endpoint
+/// selects unauthenticated HTTP or managed-CA HTTPS; both disable proxies.
+pub(crate) fn local_peer_agent(
+    endpoint: &LocalEndpoint,
     policy: HttpPolicy,
 ) -> Result<ureq::Agent> {
     endpoint.agent(policy)

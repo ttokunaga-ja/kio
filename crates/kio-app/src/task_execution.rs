@@ -45,11 +45,13 @@ use crate::markdownize::execution::OnlineMarkdownizePrecondition;
 use crate::markdownize::execution::TaskExecutionFailure;
 use crate::markdownize::execution::classify_online_markdownize_precondition;
 use crate::markdownize::execution::execute_online_markdownize_task;
+use crate::markdownize::execution::execute_pending_offline_markdownize_tasks;
 use crate::markdownize::execution::prorated_markdownize_cost;
 use crate::markdownize::execution::task_descriptor;
 use crate::object_persistence::pipeline_to_kio;
 use crate::online_task::targets_standard_online_markdownize;
 use crate::promotion::finish_pending_online_promotion;
+use crate::promotion::promote_completed_local_markdownize;
 use crate::promotion::promote_completed_online_markdownize;
 use crate::promotion::recover_pending_online_promotion;
 use crate::response::status::{BudgetStatusResponse, PausedTasksByHoldReason};
@@ -253,21 +255,39 @@ pub(crate) fn execute_pending_tasks(
     if recover_pending_online_promotion(repo)? {
         finish_pending_online_promotion(ctx, repo)?;
     }
-    // Markdownize and embedding opt-ins are per-adapter (07 §3, L4): gate each
-    // adapter on its own approval rather than one blanket check.
-    if !offline && persistent_network_allowed(adapter_settings, repo)? {
-        outcome.add(execute_pending_markdownize_tasks(
-            ctx,
-            repo,
-            store,
-            override_budget,
-            allow_auth_revive,
-        )?);
+    // Select one Markdownize route. Offline blocks the external paid route,
+    // while the selected loopback route still requires its current approval.
+    let mut promoted = false;
+    if crate::index::pipeline::optional_role_planning_ready(adapter_settings, "markdown")? {
+        if active_local_ocr_execution_with_control(adapter_settings, repo.control()).is_some() {
+            let local_allowed = persistent_network_allowed(adapter_settings, repo)?;
+            let mut normalize_by_path = BTreeMap::new();
+            outcome.add(execute_pending_offline_markdownize_tasks(
+                adapter_settings,
+                repo,
+                store,
+                &mut normalize_by_path,
+                local_allowed,
+                allow_auth_revive,
+            )?);
+            // Re-derive exact persisted results through the journaled publisher;
+            // this also recovers a crash after Task completion but before HEAD.
+            promoted = promote_completed_local_markdownize(ctx, repo)?;
+        } else {
+            if !offline && persistent_network_allowed(adapter_settings, repo)? {
+                outcome.add(execute_pending_markdownize_tasks(
+                    ctx,
+                    repo,
+                    store,
+                    override_budget,
+                    allow_auth_revive,
+                )?);
+            }
+            promoted = promote_completed_online_markdownize(ctx, repo)?;
+        }
     }
-    // Online Markdownize changes durable search truth only after the complete
-    // output is rebound into one auto commit and SQLite is rebuilt. Do this before
-    // embedding enrichment so the same batch pass can see/promote the new chunks.
-    if promote_completed_online_markdownize(ctx, repo)? {
+    // Publish the selected exact normalized output before embedding enrichment.
+    if promoted {
         finish_pending_online_promotion(ctx, repo)?;
     }
     // Embedding tasks are executed by the same enrichment pass `kio index` uses;

@@ -2244,20 +2244,25 @@ fn send_local_embed_group(
         group.members.iter().copied(),
     )
     .map_err(LocalEmbeddingRunFailure::Classified)?;
+    let requires_secret = group
+        .members
+        .iter()
+        .any(|chunk| chunk.requires_secret_approval);
     admit_embedding_transport(
         settings,
         embedding.repo,
         embedding.execution,
         embedding.profile,
         embedding.current_policy,
-        group
-            .members
-            .iter()
-            .any(|chunk| chunk.requires_secret_approval),
+        requires_secret,
     )
     .map_err(LocalEmbeddingRunFailure::Admission)?;
     crate::embedding::transport::run_local_embedding_adapter(
         settings,
+        Some(crate::embedding::transport::LocalSendAuthority {
+            repo: embedding.repo,
+            requires_secret,
+        }),
         embedding.execution,
         group_embedding_items(group),
         EmbeddingInputType::MarkdownChunk,

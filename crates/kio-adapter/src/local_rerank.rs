@@ -45,11 +45,11 @@
 use serde_json::{Value, json};
 
 use crate::http_policy::{
-    HttpPolicy, HttpResponse, RERANK_RESPONSE_MAX_BYTES, authenticated_local_agent,
-    read_json_bounded, require_success,
+    HttpPolicy, HttpResponse, RERANK_RESPONSE_MAX_BYTES, local_peer_agent, read_json_bounded,
+    require_success,
 };
 use crate::identity::tool_profile_hash;
-use crate::local_peer::{AuthenticatedLocalEndpoint, is_local_peer_tls_error};
+use crate::local_peer::{LocalEndpoint, is_local_peer_tls_error};
 use crate::traits::RerankAdapter;
 use crate::types::{
     AdapterKind, AdapterProfile, ExecutionMode, RerankRequest, RerankResponse, RerankedCandidate,
@@ -114,7 +114,7 @@ pub trait LocalRerankClient: Clone {
 /// move to TEI should not need this type renamed.
 #[derive(Debug, Clone)]
 pub struct EnvLocalRerankClient {
-    endpoint: AuthenticatedLocalEndpoint,
+    endpoint: LocalEndpoint,
     model: String,
     http_policy: HttpPolicy,
 }
@@ -126,7 +126,7 @@ impl EnvLocalRerankClient {
     /// stating that the two are the same field.
     #[must_use]
     pub fn new(
-        endpoint: AuthenticatedLocalEndpoint,
+        endpoint: LocalEndpoint,
         model: impl Into<String>,
         timeout_seconds: Option<u64>,
     ) -> Self {
@@ -146,8 +146,8 @@ impl LocalRerankClient for EnvLocalRerankClient {
         documents: &[String],
         top_n: usize,
     ) -> Result<Vec<(usize, f64)>> {
-        let url = format!("{}/v1/rerank", self.endpoint.base_url());
-        let response = authenticated_local_agent(&self.endpoint, self.http_policy)?
+        let url = self.endpoint.endpoint_url("/v1/rerank");
+        let response = local_peer_agent(&self.endpoint, self.http_policy)?
             .post(&url)
             .send_json(json!({
                 "model": self.model,

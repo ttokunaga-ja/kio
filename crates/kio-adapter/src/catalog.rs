@@ -238,7 +238,7 @@ pub fn local_ocr_markdownize_adapter_with_control(
                     "an offline_api markdownize adapter must declare `url`".to_owned(),
                 )
             })?;
-            let endpoint = settings.authenticated_local_endpoint("markdown", &base_url)?;
+            let endpoint = settings.local_endpoint("markdown", &base_url)?;
             // D7: `[adapter.policy.offline_api].timeout_seconds` (07 §7). A
             // document pipeline is the case that number exists for — a
             // multi-page PDF can hold the socket quiet for minutes.
@@ -1161,7 +1161,7 @@ pub fn embedding_adapter_for_with_control(
                     "an offline_api embedding adapter must declare `url`".to_owned(),
                 )
             })?;
-            let endpoint = settings.authenticated_local_endpoint("embedding", &base_url)?;
+            let endpoint = settings.local_endpoint("embedding", &base_url)?;
             let model = declared
                 .model
                 .clone()

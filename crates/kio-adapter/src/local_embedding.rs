@@ -28,11 +28,11 @@
 use serde_json::{Value, json};
 
 use crate::http_policy::{
-    EMBEDDING_RESPONSE_MAX_BYTES, HttpPolicy, HttpResponse, authenticated_local_agent,
-    read_json_bounded, require_success,
+    EMBEDDING_RESPONSE_MAX_BYTES, HttpPolicy, HttpResponse, local_peer_agent, read_json_bounded,
+    require_success,
 };
 use crate::identity::tool_profile_hash;
-use crate::local_peer::{AuthenticatedLocalEndpoint, is_local_peer_tls_error};
+use crate::local_peer::{LocalEndpoint, is_local_peer_tls_error};
 use crate::traits::EmbeddingAdapter;
 use crate::types::{
     AdapterKind, AdapterProfile, EmbeddingCompleted, EmbeddingContent, EmbeddingItem,
@@ -136,7 +136,7 @@ pub trait LocalEmbeddingClient: Clone {
 /// was needed, but nothing here depends on that being vLLM.
 #[derive(Debug, Clone)]
 pub struct EnvLocalEmbeddingClient {
-    endpoint: AuthenticatedLocalEndpoint,
+    endpoint: LocalEndpoint,
     model: String,
     http_policy: HttpPolicy,
 }
@@ -152,7 +152,7 @@ impl EnvLocalEmbeddingClient {
     /// value to Stage 3's local-OCR measurement.
     #[must_use]
     pub fn new(
-        endpoint: AuthenticatedLocalEndpoint,
+        endpoint: LocalEndpoint,
         model: impl Into<String>,
         timeout_seconds: Option<u64>,
     ) -> Self {
@@ -167,8 +167,8 @@ impl EnvLocalEmbeddingClient {
 
 impl LocalEmbeddingClient for EnvLocalEmbeddingClient {
     fn embed_messages(&self, messages: Value) -> Result<Vec<f32>> {
-        let url = format!("{}/v1/embeddings", self.endpoint.base_url());
-        let response = authenticated_local_agent(&self.endpoint, self.http_policy)?
+        let url = self.endpoint.endpoint_url("/v1/embeddings");
+        let response = local_peer_agent(&self.endpoint, self.http_policy)?
             .post(&url)
             .send_json(json!({
                 "model": self.model,
@@ -945,7 +945,7 @@ mod tests {
     #[test]
     fn plain_http_cannot_construct_the_real_client() {
         let directory = tempfile::tempdir().unwrap();
-        let error = AuthenticatedLocalEndpoint::new(
+        let error = LocalEndpoint::new_https(
             "http://127.0.0.1:8000",
             directory.path().join("peer-ca.pem"),
         )

@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 const STORE_LEAF: &str = "grants.json";
 const LOCK_LEAF: &str = ".lock";
-const LOCK_BYTES: &[u8] = b"kio-private-grants-lock-v1\n";
+pub(crate) const LOCK_BYTES: &[u8] = b"kio-private-grants-lock-v1\n";
 const MAX_STORE_BYTES: u64 = 1024 * 1024;
 const MAX_GRANTS: usize = 4096;
 const SCHEMA_VERSION: u8 = 1;
@@ -44,7 +44,7 @@ pub enum GrantState {
 /// bytes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GrantBinding {
+pub struct ScopedGrantBinding {
     pub scope_id: String,
     pub canonical_root: PathBuf,
     pub directory_identity: DirectoryIdentity,
@@ -59,6 +59,50 @@ pub struct GrantBinding {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum GrantBinding {
+    Scoped(ScopedGrantBinding),
+    DeviceEndpoint(DeviceEndpointBinding),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceEndpointBinding {
+    pub destination: String,
+    pub credential_binding: String,
+    pub trust_binding: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EndpointDisclosure {
+    pub tool_id: String,
+    pub tool_profile_hash: String,
+    pub purpose: String,
+    pub content_types: Vec<String>,
+    pub applies_to: String,
+    pub peer_authentication: String,
+    pub send_secrets: bool,
+}
+
+impl GrantBinding {
+    pub fn operation(&self) -> GrantOperation {
+        match self {
+            Self::Scoped(binding) => binding.operation,
+            Self::DeviceEndpoint(_) => GrantOperation::Network,
+        }
+    }
+    pub fn scoped(&self) -> Option<&ScopedGrantBinding> {
+        match self {
+            Self::Scoped(binding) => Some(binding),
+            _ => None,
+        }
+    }
+}
+
+mod endpoint;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GrantRecord {
     pub schema_version: u8,
@@ -67,6 +111,10 @@ pub struct GrantRecord {
     pub device_instance_id: String,
     pub state: GrantState,
     pub binding: GrantBinding,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disclosure: Option<EndpointDisclosure>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_network_grant_id: Option<String>,
     pub created_at: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub activated_at: Option<String>,
@@ -115,7 +163,14 @@ impl PrivateGrantStore {
         else {
             return Ok(None);
         };
-        if validate_directory_entries(&directory)? == AtomicWorkspaceState::Pending {
+        Self::read_snapshot_at(&directory)
+    }
+
+    /// Read only through the retained directory protected by the caller's
+    /// lease. Its diagnostic pathname is never reopened for grant authority.
+    pub(crate) fn read_snapshot_at(directory: &StoreDirectory) -> Result<Option<GrantSnapshot>> {
+        kio_core::private_fs::verify_private_directory_handle(directory)?;
+        if validate_directory_entries(directory)? == AtomicWorkspaceState::Pending {
             return Err(corrupt(
                 "grant store atomic workspace requires writer recovery before read admission",
             ));
@@ -126,9 +181,9 @@ impl PrivateGrantStore {
         // The retained capability read is the authority for ancestor, owner,
         // ACL, regular-file and single-link checks; the JSON read above is
         // only the bounded, descriptor-relative transport.
-        kio_core::private_fs::verify_private_directory_handle(&directory)?;
+        kio_core::private_fs::verify_private_directory_handle(directory)?;
         let private_bytes =
-            kio_core::private_fs::read_private_file_at(&directory, STORE_LEAF, MAX_STORE_BYTES)?;
+            kio_core::private_fs::read_private_file_at(directory, STORE_LEAF, MAX_STORE_BYTES)?;
         if private_bytes != bytes {
             return Err(corrupt("grant store changed while being read"));
         }
@@ -199,7 +254,7 @@ impl PrivateGrantStore {
 
     pub fn begin_pending_approval(
         &mut self,
-        binding: GrantBinding,
+        binding: ScopedGrantBinding,
         send_secrets: bool,
         created_at: String,
     ) -> Result<(GrantRecord, Option<GrantRecord>)> {
@@ -208,11 +263,10 @@ impl PrivateGrantStore {
             return Err(invalid("approval root binding must be a network grant"));
         }
         validate_binding(&binding)?;
-        if self
-            .records
-            .iter()
-            .any(|record| record.state == GrantState::Pending && record.binding == binding)
-        {
+        if self.records.iter().any(|record| {
+            record.state == GrantState::Pending
+                && record.binding == GrantBinding::Scoped(binding.clone())
+        }) {
             return Err(invalid("a matching approval intent is already pending"));
         }
         let approval_id = new_ulid(&self.path);
@@ -230,7 +284,9 @@ impl PrivateGrantStore {
             approval_id: approval_id.clone(),
             device_instance_id: self.device_instance_id.clone(),
             state: GrantState::Pending,
-            binding: binding.clone(),
+            binding: GrantBinding::Scoped(binding.clone()),
+            disclosure: None,
+            parent_network_grant_id: None,
             created_at: created_at.clone(),
             activated_at: None,
             revoked_at: None,
@@ -244,7 +300,9 @@ impl PrivateGrantStore {
                 approval_id,
                 device_instance_id: self.device_instance_id.clone(),
                 state: GrantState::Pending,
-                binding: secret_binding,
+                binding: GrantBinding::Scoped(secret_binding),
+                disclosure: None,
+                parent_network_grant_id: None,
                 created_at,
                 activated_at: None,
                 revoked_at: None,
@@ -275,12 +333,12 @@ impl PrivateGrantStore {
         activated_at: String,
     ) -> Result<()> {
         validate_timestamp(&activated_at)?;
-        if network.binding.operation != GrantOperation::Network {
+        if network.binding.operation() != GrantOperation::Network {
             return Err(invalid("approval network record has the wrong operation"));
         }
         let mut expected = vec![network];
         if let Some(secret) = secret {
-            if secret.binding.operation != GrantOperation::SendSecrets
+            if secret.binding.operation() != GrantOperation::SendSecrets
                 || secret.approval_id != network.approval_id
             {
                 return Err(invalid(
@@ -324,8 +382,10 @@ impl PrivateGrantStore {
         revoked_at: String,
     ) -> Result<Vec<String>> {
         self.revoke_matching(revoked_at, |binding| {
-            binding.scope_id == scope_id
-                && (tool_id.is_none() || Some(binding.tool_id.as_str()) == tool_id)
+            binding.scoped().is_some_and(|binding| {
+                binding.scope_id == scope_id
+                    && (tool_id.is_none() || Some(binding.tool_id.as_str()) == tool_id)
+            })
         })
     }
 
@@ -340,9 +400,11 @@ impl PrivateGrantStore {
         revoked_at: String,
     ) -> Result<Vec<String>> {
         self.revoke_matching(revoked_at, |binding| {
-            binding.scope_id == scope_id
-                && binding.canonical_root == canonical_root
-                && &binding.directory_identity == directory_identity
+            binding.scoped().is_some_and(|binding| {
+                binding.scope_id == scope_id
+                    && binding.canonical_root == canonical_root
+                    && &binding.directory_identity == directory_identity
+            })
         })
     }
 
@@ -449,86 +511,127 @@ fn decode_store(bytes: &[u8]) -> Result<(String, Vec<GrantRecord>)> {
     if records.len() > MAX_GRANTS {
         return Err(invalid("grant store has too many grants"));
     }
-    let mut ids = std::collections::BTreeSet::new();
-    let mut approval_groups = std::collections::BTreeMap::<String, (usize, usize)>::new();
-    for record in &records {
-        let counts = approval_groups
-            .entry(record.approval_id.clone())
-            .or_default();
-        match record.binding.operation {
-            GrantOperation::Network => counts.0 += 1,
-            GrantOperation::SendSecrets => counts.1 += 1,
-        }
-    }
-    for (approval_id, (network_count, secret_count)) in &approval_groups {
-        if *network_count != 1 || *secret_count > 1 {
-            return Err(corrupt("approval group has duplicate or missing records"));
-        }
-        if let Some(secret) = records.iter().find(|record| {
-            record.approval_id == *approval_id
-                && record.binding.operation == GrantOperation::SendSecrets
-        }) {
-            let network = records
-                .iter()
-                .find(|record| {
-                    record.approval_id == *approval_id
-                        && record.binding.operation == GrantOperation::Network
-                })
-                .expect("network count was checked");
-            if secret.state != network.state
-                || secret.activated_at != network.activated_at
-                || secret.revoked_at != network.revoked_at
-            {
-                return Err(corrupt("approval group states are inconsistent"));
-            }
-        }
-    }
-    for record in &records {
-        validate_record(record)?;
-        if record.schema_version != SCHEMA_VERSION || !ids.insert(record.grant_id.clone()) {
-            return Err(corrupt("grant store has an invalid or duplicate grant"));
-        }
-        if record.approval_id.is_empty()
-            || (record.approval_id == record.grant_id
-                && record.binding.operation == GrantOperation::SendSecrets)
-        {
-            return Err(corrupt("grant record has an invalid approval identity"));
-        }
-        if record.device_instance_id != device_instance_id {
-            return Err(corrupt("grant record device identity does not match store"));
-        }
-        if record.state == GrantState::Revoked && record.revoked_at.is_none() {
-            return Err(corrupt("revoked grant has no revocation time"));
-        }
-        if record.state == GrantState::Active && record.activated_at.is_none() {
-            return Err(corrupt("active grant has no activation time"));
-        }
-        if record.state == GrantState::Pending && record.activated_at.is_some() {
-            return Err(corrupt("pending grant has an activation time"));
-        }
-        if record.state != GrantState::Revoked && record.revoked_at.is_some() {
-            return Err(corrupt("non-revoked grant has a revocation time"));
-        }
-    }
-    for record in &records {
-        if record.binding.operation == GrantOperation::SendSecrets {
-            let Some(network) = records.iter().find(|candidate| {
-                candidate.approval_id == record.approval_id
-                    && candidate.binding.operation == GrantOperation::Network
-            }) else {
-                return Err(corrupt("secret grant has no network approval group"));
-            };
-            let mut expected = record.binding.clone();
-            expected.operation = GrantOperation::Network;
-            if network.binding != expected {
-                return Err(corrupt(
-                    "secret grant binding differs from network approval",
-                ));
-            }
-        }
-    }
+    validate_records(device_instance_id, &records)?;
     ensure_terminal_capacity(&records)?;
     Ok((device_instance_id.to_owned(), records))
+}
+
+fn validate_records(device: &str, records: &[GrantRecord]) -> Result<()> {
+    if records.len() > MAX_GRANTS || !is_ulid(device) {
+        return Err(corrupt("invalid device grant inventory"));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for record in records {
+        validate_record(record)?;
+        if record.schema_version != SCHEMA_VERSION
+            || record.device_instance_id != device
+            || !ids.insert(&record.grant_id)
+        {
+            return Err(corrupt("invalid or duplicate grant identity"));
+        }
+        if (record.state == GrantState::Active && record.activated_at.is_none())
+            || (record.state == GrantState::Pending && record.activated_at.is_some())
+            || (record.state == GrantState::Revoked) != record.revoked_at.is_some()
+        {
+            return Err(corrupt("grant lifecycle timestamps do not match state"));
+        }
+        if let GrantBinding::DeviceEndpoint(_) = &record.binding {
+            let original_secret = records.iter().any(|r| {
+                r.approval_id == record.approval_id
+                    && r.parent_network_grant_id.as_deref() == Some(record.grant_id.as_str())
+            });
+            if record
+                .disclosure
+                .as_ref()
+                .is_none_or(|d| d.send_secrets != original_secret)
+            {
+                return Err(corrupt(
+                    "endpoint original secret disclosure differs from its confirmation group",
+                ));
+            }
+            if record.state != GrantState::Revoked
+                && records.iter().any(|other| {
+                    other.grant_id != record.grant_id
+                        && other.state != GrantState::Revoked
+                        && other.binding == record.binding
+                })
+            {
+                return Err(corrupt("duplicate endpoint authority"));
+            }
+        }
+        if let Some(binding) = record.binding.scoped()
+            && binding.execution_mode
+                != if record.parent_network_grant_id.is_some() {
+                    "offline_api"
+                } else {
+                    "online_api"
+                }
+        {
+            return Err(corrupt("scoped grant has incompatible execution authority"));
+        }
+        if let Some(parent_id) = &record.parent_network_grant_id {
+            let secret = record
+                .binding
+                .scoped()
+                .filter(|b| b.operation == GrantOperation::SendSecrets)
+                .ok_or_else(|| corrupt("only a scoped secret grant may have an endpoint parent"))?;
+            let parent = records
+                .iter()
+                .find(|r| &r.grant_id == parent_id)
+                .ok_or_else(|| corrupt("secret endpoint parent is missing"))?;
+            let GrantBinding::DeviceEndpoint(endpoint) = &parent.binding else {
+                return Err(corrupt("secret parent is not an endpoint grant"));
+            };
+            let disclosure = record
+                .disclosure
+                .as_ref()
+                .filter(|d| d.send_secrets)
+                .ok_or_else(|| corrupt("scoped secret has no original secret-send disclosure"))?;
+            endpoint::validate_disclosure(disclosure, endpoint)?;
+            if secret.destination != endpoint.destination
+                || secret.credential_binding != endpoint.credential_binding
+                || secret.trust_binding != endpoint.trust_binding
+                || (record.state == GrantState::Active && parent.state != GrantState::Active)
+                || (record.state == GrantState::Pending && parent.state == GrantState::Revoked)
+                || (parent.state == GrantState::Pending && parent.approval_id != record.approval_id)
+            {
+                return Err(corrupt(
+                    "secret grant differs from its live endpoint parent",
+                ));
+            }
+        } else if let Some(secret) = record
+            .binding
+            .scoped()
+            .filter(|b| b.operation == GrantOperation::SendSecrets)
+        {
+            let mut expected = secret.clone();
+            expected.operation = GrantOperation::Network;
+            let network = records
+                .iter()
+                .find(|r| {
+                    r.approval_id == record.approval_id
+                        && r.binding == GrantBinding::Scoped(expected.clone())
+                })
+                .ok_or_else(|| corrupt("external secret lacks matching network approval"))?;
+            if record.state != network.state
+                || record.activated_at != network.activated_at
+                || record.revoked_at != network.revoked_at
+            {
+                return Err(corrupt("external approval group states are inconsistent"));
+            }
+        }
+        let same_operation = records
+            .iter()
+            .filter(|r| {
+                r.approval_id == record.approval_id
+                    && r.binding.operation() == record.binding.operation()
+            })
+            .count();
+        if same_operation != 1 {
+            return Err(corrupt("approval group has duplicate records"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_timestamp(value: &str) -> Result<()> {
@@ -579,7 +682,22 @@ fn validate_record(record: &GrantRecord) -> Result<()> {
     {
         return Err(corrupt("grant identity is not a canonical ULID"));
     }
-    validate_binding(&record.binding)?;
+    match &record.binding {
+        GrantBinding::Scoped(binding) => {
+            validate_binding(binding)?;
+            if binding.operation == GrantOperation::SendSecrets
+                && record.approval_id == record.grant_id
+            {
+                return Err(corrupt("grant record has an invalid approval identity"));
+            }
+            if record.disclosure.is_some() != record.parent_network_grant_id.is_some() {
+                return Err(corrupt("scoped endpoint secret disclosure is inconsistent"));
+            }
+        }
+        GrantBinding::DeviceEndpoint(binding) => {
+            endpoint::validate_endpoint_record(binding, record)?
+        }
+    }
     validate_timestamp(&record.created_at)?;
     if let Some(value) = &record.activated_at {
         validate_timestamp(value)?;
@@ -590,7 +708,7 @@ fn validate_record(record: &GrantRecord) -> Result<()> {
     Ok(())
 }
 
-fn validate_binding(binding: &GrantBinding) -> Result<()> {
+fn validate_binding(binding: &ScopedGrantBinding) -> Result<()> {
     if binding.scope_id.is_empty()
         || binding.tool_id.is_empty()
         || binding.execution_mode.is_empty()
@@ -684,7 +802,7 @@ fn corrupt(message: impl Into<String>) -> KioError {
 mod tests {
     use super::*;
 
-    fn binding(root: &Path) -> GrantBinding {
+    fn binding(root: &Path) -> ScopedGrantBinding {
         #[cfg(unix)]
         let directory_identity = DirectoryIdentity::Unix {
             device: 1,
@@ -695,7 +813,7 @@ mod tests {
             volume_serial_number: 1,
             file_index: 2,
         };
-        GrantBinding {
+        ScopedGrantBinding {
             scope_id: "01J8KIO0000000000000000000".into(),
             canonical_root: root.to_path_buf(),
             directory_identity,
@@ -707,6 +825,140 @@ mod tests {
             credential_binding: "env:TEST_KEY".into(),
             trust_binding: "sha256:trust".into(),
             operation: GrantOperation::Network,
+        }
+    }
+
+    #[test]
+    fn device_endpoint_decode_is_closed_and_cannot_authorize_external_or_ambiguous_targets() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let path = root.join("nested/grants/grants.json");
+        let control = kio_core::control::ControlHandle::default();
+        let mut store = PrivateGrantStore::open_or_create(&path, &root, &control).unwrap();
+        let binding = DeviceEndpointBinding {
+            destination: "http://127.0.0.1:9443/embedding".into(),
+            credential_binding: "none".into(),
+            trust_binding: kio_adapter::local_peer::HTTP_UNAUTHENTICATED_TRUST_BINDING.into(),
+        };
+        let disclosure = EndpointDisclosure {
+            tool_id: "qwen3_vl_embedding_local".into(),
+            tool_profile_hash: "profile".into(),
+            purpose: "embedding".into(),
+            content_types: vec!["query text".into(), "document text".into(), "images".into()],
+            applies_to: "all scopes on this device".into(),
+            peer_authentication: "unauthenticated".into(),
+            send_secrets: false,
+        };
+        store
+            .begin_pending_endpoint(binding, disclosure, None, "2026-09-08T00:00:00Z".into())
+            .unwrap();
+        drop(store);
+        let bytes = std::fs::read(&path).unwrap();
+        let original: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for destination in [
+            "https://example.com:9443/embedding",
+            "http://127.0.0.1/embedding",
+            "http://user@127.0.0.1:9443/embedding",
+            "http://127.0.0.1:9443/embedding?secret=x",
+            "https://127.0.0.1:9443/embedding",
+        ] {
+            let mut changed = original.clone();
+            changed["grants"][0]["binding"]["destination"] = serde_json::json!(destination);
+            assert!(
+                decode_store(&canonical_json_bytes(&changed).unwrap()).is_err(),
+                "invalid endpoint identity admitted: {destination}"
+            );
+        }
+        for (field, value) in [
+            ("scope_id", "unrelated"),
+            ("operation", "send_secrets"),
+            ("trust_binding", "local-ca:wrong"),
+        ] {
+            let mut changed = original.clone();
+            changed["grants"][0]["binding"][field] = serde_json::json!(value);
+            assert!(
+                decode_store(&canonical_json_bytes(&changed).unwrap()).is_err(),
+                "ambiguous endpoint payload admitted: {field}"
+            );
+        }
+        let mut duplicate = original.clone();
+        let mut record = duplicate["grants"][0].clone();
+        record["grant_id"] = serde_json::json!("01ARZ3NDEKTSV4RRFFQ69G5FAV");
+        record["approval_id"] = serde_json::json!("01ARZ3NDEKTSV4RRFFQ69G5FAW");
+        duplicate["grants"].as_array_mut().unwrap().push(record);
+        assert!(
+            decode_store(&canonical_json_bytes(&duplicate).unwrap()).is_err(),
+            "duplicate endpoint authority admitted"
+        );
+    }
+
+    #[test]
+    fn failed_endpoint_activation_cannot_publish_partial_authority_on_later_mutation() {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let path = root.join("nested/grants/grants.json");
+        let control = kio_core::control::ControlHandle::default();
+        let mut store = PrivateGrantStore::open_or_create(&path, &root, &control).unwrap();
+        let endpoint = DeviceEndpointBinding {
+            destination: "http://127.0.0.1:9443/embedding".into(),
+            credential_binding: "none".into(),
+            trust_binding: kio_adapter::local_peer::HTTP_UNAUTHENTICATED_TRUST_BINDING.into(),
+        };
+        let disclosure = EndpointDisclosure {
+            tool_id: "qwen3_vl_embedding_local".into(),
+            tool_profile_hash: "profile".into(),
+            purpose: "embedding".into(),
+            content_types: vec!["query text".into(), "document text".into(), "images".into()],
+            applies_to: "all scopes on this device".into(),
+            peer_authentication: "unauthenticated".into(),
+            send_secrets: true,
+        };
+        let mut secret = binding(&root);
+        secret.operation = GrantOperation::SendSecrets;
+        secret.execution_mode = "offline_api".into();
+        secret.destination = endpoint.destination.clone();
+        secret.credential_binding = endpoint.credential_binding.clone();
+        secret.trust_binding = endpoint.trust_binding.clone();
+        let (network, secret) = store
+            .begin_pending_endpoint(
+                endpoint,
+                disclosure,
+                Some(secret),
+                "2026-09-08T00:00:00Z".into(),
+            )
+            .unwrap();
+        let secret = secret.unwrap();
+        let mut missing_secret = secret.clone();
+        missing_secret.grant_id = "01ARZ3NDEKTSV4RRFFQ69G5FAV".into();
+        assert!(
+            store
+                .activate_endpoint_records(
+                    &network,
+                    Some(&missing_secret),
+                    "2026-09-08T00:01:00Z".into()
+                )
+                .is_err()
+        );
+        let mut other = binding(&root);
+        other.tool_id = "unrelated-tool".into();
+        store
+            .begin_pending_approval(other, false, "2026-09-08T00:02:00Z".into())
+            .unwrap();
+        drop(store);
+        let reopened = PrivateGrantStore::open_readonly(&path, &root, &control)
+            .unwrap()
+            .unwrap();
+        for id in [&network.grant_id, &secret.grant_id] {
+            assert_eq!(
+                reopened
+                    .records()
+                    .iter()
+                    .find(|r| &r.grant_id == id)
+                    .unwrap()
+                    .state,
+                GrantState::Pending,
+                "failed multi-record confirmation leaked active authority into a later valid write"
+            );
         }
     }
 
@@ -746,7 +998,7 @@ mod tests {
         .unwrap();
         assert_eq!(active.records().len(), 1);
         assert_eq!(
-            active.records()[0].binding.scope_id,
+            active.records()[0].binding.scoped().unwrap().scope_id,
             "01J8KIO0000000000000000000"
         );
         let directory =
@@ -907,7 +1159,7 @@ mod tests {
             .unwrap();
 
         let mut replacement_binding = binding(&replacement_path);
-        replacement_binding.scope_id = original.binding.scope_id.clone();
+        replacement_binding.scope_id = original.binding.scoped().unwrap().scope_id.clone();
         #[cfg(unix)]
         {
             replacement_binding.directory_identity = DirectoryIdentity::Unix {
@@ -932,7 +1184,7 @@ mod tests {
         assert_eq!(
             store
                 .revoke_scope_instance(
-                    &original.binding.scope_id,
+                    &original.binding.scoped().unwrap().scope_id,
                     &root_path,
                     &original_identity,
                     "2026-09-08T01:00:00Z".into(),
@@ -961,7 +1213,7 @@ mod tests {
         assert!(
             store
                 .revoke_scope_instance(
-                    &original.binding.scope_id,
+                    &original.binding.scoped().unwrap().scope_id,
                     &root_path,
                     &original_identity,
                     "2026-09-08T02:00:00Z".into(),
@@ -969,6 +1221,34 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn scoped_secret_decode_rejects_approval_identity_equal_to_its_grant() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let path = root_path.join("grants/grants.json");
+        let mut store = PrivateGrantStore::open_or_create(
+            &path,
+            &root_path,
+            &kio_core::control::ControlHandle::default(),
+        )
+        .unwrap();
+        let (network, secret) = store
+            .begin_pending_approval(binding(&root_path), true, "2026-09-08T00:00:00Z".into())
+            .unwrap();
+        let secret = secret.unwrap();
+        assert_ne!(network.approval_id, secret.grant_id);
+        drop(store);
+        let bytes = std::fs::read(&path).unwrap();
+        assert!(decode_store(&bytes).is_ok());
+        let mut changed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        for record in changed["grants"].as_array_mut().unwrap() {
+            record["approval_id"] = serde_json::json!(secret.grant_id);
+        }
+        let error = decode_store(&canonical_json_bytes(&changed).unwrap())
+            .expect_err("a paired network record cannot make an aliased secret approval valid");
+        assert_eq!(error.error_code(), "KIO-E-GRANT-CORRUPT-001");
     }
 
     #[test]

@@ -546,13 +546,13 @@ fn supported_embedding_tool_ids() -> String {
 /// this closes. `offline_api` still requires an exact network grant for every
 /// local HTTP exchange; loopback validation does not bypass consent.
 fn validate_offline_url(role: &str, url: &str) -> Result<()> {
-    crate::local_peer::validate_local_https_url(url)
+    crate::local_peer::validate_local_url(url)
         .map(|_| ())
         .map_err(|error| match error {
             AdapterError::LocalPeerConfig { code, message } => AdapterError::LocalPeerConfig {
                 code,
                 message: format!(
-                    "tools.toml `{role}.url` = `{url}` is not an authenticated local peer: {message}"
+                    "tools.toml `{role}.url` is not an allowed loopback peer: {message}"
                 ),
             },
             other => other,
@@ -1092,7 +1092,7 @@ fn optional_string_array(table: &toml::value::Table, field: &str) -> Vec<String>
         .collect()
 }
 
-/// Managed CA identity and the retained private directory that owns its snapshot.
+/// Non-secret CA identity acquired by the application at a selected HTTPS boundary.
 #[derive(Debug, Clone)]
 pub struct ManagedLocalTrustSnapshot {
     pub path: PathBuf,
@@ -1310,28 +1310,63 @@ impl AdapterRuntimeSettings {
                     .to_owned(),
             })
     }
-    pub fn authenticated_local_endpoint(
+    pub fn local_peer_trust_binding_for_url(&self, url: &str) -> Result<String> {
+        let normalized = crate::local_peer::validate_local_url(url)?;
+        let uri: ureq::http::Uri =
+            normalized
+                .parse()
+                .map_err(|_| AdapterError::LocalPeerConfig {
+                    code: "KIO-E-LOCAL-PEER-URL-001",
+                    message: "offline_api URL could not be parsed after validation".to_owned(),
+                })?;
+        match uri.scheme_str() {
+            Some("http") => Ok(crate::local_peer::HTTP_UNAUTHENTICATED_TRUST_BINDING.to_owned()),
+            Some("https") => self.local_peer_trust_binding(),
+            _ => Err(AdapterError::LocalPeerConfig {
+                code: "KIO-E-LOCAL-PEER-URL-001",
+                message: "offline_api URL must use HTTP or HTTPS".to_owned(),
+            }),
+        }
+    }
+    pub fn local_endpoint(
         &self,
         role: &str,
         url: &str,
-    ) -> Result<crate::local_peer::AuthenticatedLocalEndpoint> {
-        let endpoint = if let Some(provider) = &self.managed_local_trust {
-            let trust = provider.acquire().map_err(AdapterError::RuntimeTrust)?;
-            crate::local_peer::AuthenticatedLocalEndpoint::new_managed_bound(
-                url,
-                trust,
-                std::sync::Arc::clone(provider),
-                self.control.clone(),
-            )
-        } else {
-            let ca_path = self.local_peer_ca_path()?;
-            let trust_digest = self.local_peer_trust_digest()?;
-            crate::local_peer::AuthenticatedLocalEndpoint::new_bound(
-                url,
-                ca_path,
-                trust_digest,
-                self.control.clone(),
-            )
+    ) -> Result<crate::local_peer::LocalEndpoint> {
+        let normalized = crate::local_peer::validate_local_url(url)?;
+        let uri: ureq::http::Uri =
+            normalized
+                .parse()
+                .map_err(|_| AdapterError::LocalPeerConfig {
+                    code: "KIO-E-LOCAL-PEER-URL-001",
+                    message: "offline_api URL could not be parsed after validation".to_owned(),
+                })?;
+        let endpoint = match uri.scheme_str() {
+            Some("http") => {
+                crate::local_peer::LocalEndpoint::new_http_bound(&normalized, self.control.clone())
+            }
+            Some("https") => {
+                if let Some(provider) = &self.managed_local_trust {
+                    let snapshot = provider.acquire().map_err(AdapterError::RuntimeTrust)?;
+                    crate::local_peer::LocalEndpoint::new_https_managed_bound(
+                        &normalized,
+                        snapshot,
+                        std::sync::Arc::clone(provider),
+                        self.control.clone(),
+                    )
+                } else {
+                    crate::local_peer::LocalEndpoint::new_https_bound(
+                        &normalized,
+                        self.local_peer_ca_path()?,
+                        self.local_peer_trust_digest()?,
+                        self.control.clone(),
+                    )
+                }
+            }
+            _ => Err(AdapterError::LocalPeerConfig {
+                code: "KIO-E-LOCAL-PEER-URL-001",
+                message: "offline_api URL must use HTTP or HTTPS".to_owned(),
+            }),
         };
         endpoint.map_err(|error| match error {
             AdapterError::LocalPeerConfig { code, message } => AdapterError::LocalPeerConfig {
@@ -1623,7 +1658,7 @@ mod tests {
                 ..AdapterRuntimeSettings::default()
             };
             let error = settings
-                .authenticated_local_endpoint("embedding", "https://127.0.0.1:8443")
+                .local_endpoint("embedding", "https://127.0.0.1:8443")
                 .expect_err("runtime local peer must require a captured CA digest");
             assert!(
                 error
@@ -1965,8 +2000,8 @@ auth = "env:MISTRAL_API_KEY"
         );
     }
 
-    /// An `offline_api` embedding target must name an authenticated HTTPS
-    /// loopback peer; locality without server authentication is insufficient.
+    /// An `offline_api` embedding target must name a literal loopback peer;
+    /// HTTP is accepted only as explicitly unauthenticated transport.
     #[test]
     fn offline_embedding_accepts_only_a_loopback_url() {
         let entry = |url: &str| {
@@ -1987,6 +2022,9 @@ auth = "env:MISTRAL_API_KEY"
             "https://localhost:8000/v1",
             "https://[::1]:8000",
             "https://127.0.0.1:8443",
+            "http://127.0.0.1:8000",
+            "http://localhost:8000/v1",
+            "http://[::1]:8000",
         ] {
             validate_tools_toml(entry(url).as_bytes())
                 .unwrap_or_else(|error| panic!("{url} must be accepted: {error}"));
@@ -2004,7 +2042,13 @@ auth = "env:MISTRAL_API_KEY"
             // A scheme is required so the authority is unambiguous.
             "127.0.0.1:8000",
             "unix:/tmp/kio-embed.sock",
-            "http://127.0.0.1:8000",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1/path-without-port",
+            "http://localhost.evil.example:8000",
+            "http://127.0.0.1@evil.example:8000/",
+            "http://127.0.0.1:8000/path?redirect=1",
+            "http://127.0.0.1:8000/path#fragment",
+            "http://192.0.2.1:8000",
         ] {
             let error = validate_tools_toml(entry(url).as_bytes())
                 .expect_err(&format!("{url} must be rejected"));
@@ -2056,7 +2100,7 @@ auth = "env:MISTRAL_API_KEY"
         assert!(validate_tools_toml(cmd_local.as_bytes()).is_err());
     }
 
-    /// The markdown role uses the same authenticated-peer URL contract as
+    /// The markdown role uses the same HTTP/HTTPS loopback URL contract as
     /// embedding, resolved from the same target table.
     #[test]
     fn offline_markdown_accepts_only_a_loopback_url() {
@@ -2073,6 +2117,9 @@ auth = "env:MISTRAL_API_KEY"
             "https://127.0.0.1:8080",
             "https://localhost:8080",
             "https://[::1]:8080",
+            "http://127.0.0.1:8080",
+            "http://localhost:8080",
+            "http://[::1]:8080",
         ] {
             validate_tools_toml(entry(url).as_bytes())
                 .unwrap_or_else(|error| panic!("{url} must be accepted: {error}"));
@@ -2082,7 +2129,10 @@ auth = "env:MISTRAL_API_KEY"
             "https://localhost.evil.example:8080",
             "https://api.example.com",
             "https://10.0.0.5:8080",
-            "http://127.0.0.1:8080",
+            "http://localhost.evil.example:8080",
+            "http://10.0.0.5:8080",
+            "http://127.0.0.1:8080?q=bad",
+            "http://127.0.0.1:8080#fragment",
             "unix:/tmp/kio-ocr.sock",
         ] {
             let error = validate_tools_toml(entry(url).as_bytes())
@@ -2535,5 +2585,46 @@ pages = 0.004
             parse_tools_toml_for_roles(b"[embeding.custom]\n", &["embedding"]).is_err(),
             "an unknown declaration must not activate the default embedding destination"
         );
+    }
+    #[test]
+    fn rejected_local_url_diagnostics_do_not_echo_userinfo_or_query_canaries() {
+        let entry = |url: &str| {
+            format!(
+                "[embedding.{LOCAL_EMBEDDING_TOOL_ID}]\n\
+                 kind = \"offline_api\"\n\
+                 url = \"{url}\"\n\
+                 model = \"Qwen/Qwen3-VL-Embedding-2B\"\n\
+                 dimensions = 768\n\
+                 distance = \"cosine\"\n\
+                 modality = \"multimodal\"\n\
+                 mode = \"offline\"\n"
+            )
+        };
+
+        for (url, canary) in [
+            (
+                "http://user:userinfo-canary-91f3@127.0.0.1:8000/v1",
+                "userinfo-canary-91f3",
+            ),
+            (
+                "http://127.0.0.1:8000/v1?token=query-canary-a624",
+                "query-canary-a624",
+            ),
+        ] {
+            let error = validate_tools_toml(entry(url).as_bytes()).unwrap_err();
+            let diagnostic = error.to_string();
+            assert!(
+                diagnostic.contains("KIO-E-LOCAL-PEER-URL-001"),
+                "expected local URL rejection code: {diagnostic}"
+            );
+            assert!(
+                diagnostic.contains("embedding.url"),
+                "expected role and URL field context: {diagnostic}"
+            );
+            assert!(
+                !diagnostic.contains(canary),
+                "rejected URL secret leaked through diagnostics: {diagnostic}"
+            );
+        }
     }
 }

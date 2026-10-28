@@ -71,9 +71,8 @@ pub(crate) struct ParsedSearch {
     /// Select remote processing for this invocation; a matching explicit
     /// device grant remains required. Mutually exclusive with `offline`.
     pub(crate) online: bool,
-    /// PC5: forces the new-send prohibition for this invocation regardless of
-    /// any recorded approval — auto/`--hybrid` fall back to text
-    /// (`fallback_reason="offline"`), `--vector` explicit errors.
+    /// Prohibit external sends for this invocation regardless of approval.
+    /// Approved loopback and in-process execution remain eligible.
     pub(crate) offline: bool,
 }
 
@@ -120,8 +119,8 @@ pub(crate) enum VectorAvailability {
     /// Every searched scope has a compatible embedding index and a query
     /// embedding is obtainable → hybrid is offered.
     Available,
-    /// PC1 line (a) / PC5: `--offline` was given for this invocation — no
-    /// query embedding is sent regardless of any recorded approval. No
+    /// PC1 line (a) / PC5: `--offline` blocks the selected external transport.
+    /// A local transport is classified separately before this resolver. No
     /// dedicated `error_code` (05 §1.1 names one only for INCOMPAT/
     /// UNAUTHORIZED); `--vector` explicit still hard-errors
     /// (KIO-E-SEARCH-VEC-UNAVAIL-001, the shared fallback code).
@@ -254,7 +253,8 @@ pub(crate) fn replica_image_embedding_state(
 /// §1.1's 7-line resolution order — this function's own `if`/`else if` chain
 /// IS that judgment order, first-listed-condition-wins per PC1's "解決順の
 /// 列挙は判定順序でもある"). Vector search is offered only when: not
-/// `--offline`; the endpoint is configured; every searched scope has a
+/// blocked by offline external-network posture; the endpoint is configured;
+/// every searched scope has a
 /// compatible embedding index (03 §7, cross-scope inconsistency also counts
 /// as incompatible per 05 §1.8(5)); the send consent gate is satisfied
 /// (PC4 — OR across scopes, computed by the caller via
@@ -262,14 +262,14 @@ pub(crate) fn replica_image_embedding_state(
 pub(crate) fn resolve_vector_availability(
     requested: SearchMode,
     scope_embedding_states: &[ScopeEmbedState],
-    offline: bool,
+    offline_blocks_transport: bool,
     endpoint_configured: bool,
     embedding_opt_in: bool,
     query_embeddable: bool,
 ) -> VectorAvailability {
-    // PC1 line (a) / PC5: checked first, unconditionally — offline is a user
-    // decision, not a technical probe result.
-    if offline {
+    // The caller classifies the actual selected execution first. Offline
+    // remains an unconditional denial for external transport, not loopback.
+    if offline_blocks_transport {
         return VectorAvailability::Offline;
     }
     if !endpoint_configured {

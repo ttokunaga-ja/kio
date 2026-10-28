@@ -18,8 +18,10 @@ use crate::ocr_discovery::supports_ocr_from_scratch;
 use crate::scope_access::raw_ingest_is_purge_blocked;
 use crate::settings::effective_incremental_config;
 use crate::settings::effective_max_input_bytes;
+use crate::task_execution::ExecOutcome;
 use crate::task_execution::estimate_online_markdownize_cost;
 use crate::task_execution::is_text_native_media;
+use crate::task_execution::known_markdownize_completion;
 use crate::task_execution::media_type_for_cli_path;
 use crate::task_execution::retry_kind_from_reason;
 use crate::task_execution::retry_reason;
@@ -362,24 +364,26 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
     store: &TaskStore,
     normalize_by_path: &mut BTreeMap<String, PendingNormalizeRef>,
     network_allowed: bool,
-) -> Result<usize> {
-    // An `offline_api` adapter can still be an authenticated local HTTPS peer.
-    // `--offline` and an absent exact device+scope grant therefore leave the
-    // task pending before constructing its client or touching the peer.
+    allow_auth_revive: bool,
+) -> Result<ExecOutcome> {
+    // Offline permits a selected loopback peer. The caller still proves its
+    // current device approval; dispatch revalidates that exact peer and policy
+    // before constructing a client or handing it any input.
     if !network_allowed {
-        return Ok(0);
+        return Ok(ExecOutcome::default());
     }
     let Some(execution) = active_local_ocr_execution_with_control(adapter_settings, repo.control())
     else {
-        return Ok(0);
+        return Ok(ExecOutcome::default());
     };
     let profile = kio_adapter::local_ocr_markdownize::profile_for(execution);
     let output_ref = offline_output_ref(&profile.adapter_id);
-    let mut executed = 0_usize;
+    let mut counts = ExecOutcome::default();
     for task in store.all().map_err(pipeline_to_kio)? {
         if task.task_type != TaskType::Markdownize
             || !(matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
-                || (task.status == TaskStatus::Paused
+                || (allow_auth_revive
+                    && task.status == TaskStatus::Paused
                     && task.hold_reason == Some(kio_pipeline::task::HoldReason::Auth)))
             || task.output_ref != output_ref
             || task.reservation_id.is_some()
@@ -458,7 +462,10 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
             })
             .transpose()?;
         let mut claim = match local.claim(&identity, task.attempts, retry_at, 5, now_ms)? {
-            LocalClaim::Busy => continue,
+            LocalClaim::Busy => {
+                counts.inflight += 1;
+                continue;
+            }
             LocalClaim::Backoff {
                 attempts,
                 next_retry_at,
@@ -529,7 +536,9 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
                     return Err(error);
                 }
                 Err(LocalOcrRequestFailure::Attempt(failure)) => {
-                    fail_local_ocr_claim(store, &task, &mut claim, failure, &now)?;
+                    counts.add(fail_local_ocr_claim(
+                        store, &task, &mut claim, failure, &now,
+                    )?);
                     continue;
                 }
             }
@@ -544,7 +553,9 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
                         "durable local OCR result failed acceptance",
                     ));
                 }
-                fail_local_ocr_claim(store, &task, &mut claim, failure, &now)?;
+                counts.add(fail_local_ocr_claim(
+                    store, &task, &mut claim, failure, &now,
+                )?);
                 continue;
             }
         };
@@ -601,9 +612,9 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
             })
             .map_err(pipeline_to_kio)?;
         claim.publish()?;
-        executed += 1;
+        counts.add(known_markdownize_completion(store, &task.task_id)?);
     }
-    Ok(executed)
+    Ok(counts)
 }
 
 /// Mirror an already-owned attempt outcome without incrementing a Task twice.
@@ -647,7 +658,7 @@ fn fail_local_ocr_claim(
     claim: &mut LocalGuard,
     failure: TaskExecutionFailure,
     now: &str,
-) -> Result<()> {
+) -> Result<ExecOutcome> {
     let kind = failure.retry_kind;
     let policy = kio_pipeline::task::retry_policy(kind);
     let consume = kind != RetryErrorKind::RateLimit;
@@ -675,7 +686,13 @@ fn fail_local_ocr_claim(
         retry_at,
         Some(kind),
         terminal,
-    )
+    )?;
+    Ok(ExecOutcome {
+        failed: 1,
+        auth_failed: usize::from(kind == RetryErrorKind::AuthError),
+        failed_retryable: usize::from(!terminal && !policy.paused),
+        ..ExecOutcome::default()
+    })
 }
 
 /// Apply the common v1 acceptance gate before making a result recoverable.
@@ -764,6 +781,22 @@ fn request_offline_markdownize_task(
         .object_store()
         .image_store()
         .map_err(LocalOcrRequestFailure::Admission)?;
+    // Only an actual new loopback send acquires the current device consent
+    // lease. Durable result-ready replay never enters this request function.
+    // Retain it through adapter construction and the complete response.
+    let _endpoint_lease = if execution == LocalOcrExecution::Real {
+        crate::approvals::endpoint_dispatch_lease(
+            adapter_settings,
+            repo,
+            crate::approvals::AdapterRole::Markdown,
+            &profile.adapter_id,
+            &profile.tool_profile_hash,
+            classify_secret(&task.input_path).is_some(),
+        )
+        .map_err(LocalOcrRequestFailure::Admission)?
+    } else {
+        None
+    };
     let adapter = local_ocr_markdownize_adapter_with_control(
         adapter_settings,
         execution,

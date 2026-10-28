@@ -1,6 +1,6 @@
-//! Local embedding transport must honor `index --offline` even with a current
-//! loopback trust root and explicit adapter grant. The positive control proves
-//! this fixture reaches the real local TLS transport when offline is absent.
+//! docs/07 §3/3.1: approved loopback embedding remains eligible with `--offline`.
+//! Independent offline/default fixtures must reach real TLS, whose EOF precedes
+//! any HTTP body, while local failure/backoff creates no billing or vector.
 
 mod support;
 
@@ -60,14 +60,14 @@ impl ClosingLoopback {
         self.attempts.load(Ordering::SeqCst)
     }
 
-    fn wait_for_attempt(&self) {
+    fn wait_for_attempt_after(&self, before: usize) {
         let deadline = Instant::now() + Duration::from_secs(3);
-        while self.count() == 0 && Instant::now() < deadline {
+        while self.count() <= before && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(
-            self.count() > 0,
-            "positive control must reach the loopback TLS transport"
+            self.count() > before,
+            "each fresh fixture must reach the loopback TLS transport"
         );
     }
 }
@@ -195,71 +195,69 @@ fn source_embedding_count(dir: &TempDir) -> i64 {
 }
 
 #[test]
-fn offline_index_never_contacts_approved_local_embedding_peer() {
-    let dir = support::canonical_tempdir();
+fn approved_local_embedding_peer_is_attempted_with_and_without_offline() {
     let peer = ClosingLoopback::start();
-    setup(&dir, &peer);
-
-    let offline = kio(&dir, &["--json", "index", "--offline"])
-        .output()
-        .unwrap();
-    thread::sleep(Duration::from_millis(100));
-    assert_eq!(
-        peer.count(),
-        0,
-        "--offline must not attempt local TLS: status={} stdout={} stderr={}",
-        offline.status,
-        String::from_utf8_lossy(&offline.stdout),
-        String::from_utf8_lossy(&offline.stderr),
-    );
-    assert_eq!(
-        offline.status.code(),
-        Some(0),
-        "offline index must complete: stdout={} stderr={}",
-        String::from_utf8_lossy(&offline.stdout),
-        String::from_utf8_lossy(&offline.stderr),
-    );
-    assert_eq!(
-        embedding_rows(&dir),
-        (0, 0),
-        "--offline must not reserve or charge an embedding"
-    );
-    assert_eq!(
-        source_embedding_count(&dir),
-        0,
-        "--offline must not publish a vector"
-    );
-
-    // The same trust root, grant and document are a positive transport control.
-    let normal = kio(&dir, &["--json", "index"]).output().unwrap();
-    peer.wait_for_attempt();
-    assert!(
-        normal.status.success() || [3, 4, 5, 6].contains(&normal.status.code().unwrap_or(-1)),
-        "unexpected local TLS EOF outcome: stdout={} stderr={}",
-        String::from_utf8_lossy(&normal.stdout),
-        String::from_utf8_lossy(&normal.stderr),
-    );
-    assert_eq!(
-        embedding_rows(&dir),
-        (0, 0),
-        "APP-01 local transport failure must not journal or settle billing"
-    );
-    let tasks = fs::read_to_string(dir.path().join(".kio/tasks.jsonl")).unwrap();
-    let embedding = tasks
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .rfind(|task| task["type"] == "embedding")
-        .expect("local attempt must have a typed embedding task");
-    assert_eq!(embedding["status"], "failed", "{embedding}");
-    assert_ne!(
-        embedding["fallback_reason"], "result_unknown",
-        "{embedding}"
-    );
-    assert!(
-        embedding["fallback_reason"]
+    for args in [
+        &["--json", "index", "--offline"][..],
+        &["--json", "index"][..],
+    ] {
+        // Each posture gets fresh scope, device, grant and local execution state.
+        // A previous failed attempt/backoff cannot satisfy the next control.
+        let dir = support::canonical_tempdir();
+        setup(&dir, &peer);
+        let attempts_before = peer.count();
+        let output = kio(&dir, args).output().unwrap();
+        peer.wait_for_attempt_after(attempts_before);
+        assert!(
+            output.status.success() || [3, 4, 5, 6].contains(&output.status.code().unwrap_or(-1)),
+            "unexpected local TLS EOF outcome for {args:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            peer.count() > attempts_before,
+            "{args:?} must attempt its own local TLS connection"
+        );
+        assert_eq!(
+            embedding_rows(&dir),
+            (0, 0),
+            "free local TLS failure must not reserve, journal or settle billing: {args:?}"
+        );
+        let tasks = fs::read_to_string(dir.path().join(".kio/tasks.jsonl")).unwrap();
+        let embedding = tasks
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .rfind(|task| task["type"] == "embedding")
+            .expect("local attempt must have a typed embedding task");
+        assert_eq!(embedding["status"], "failed", "{embedding}");
+        assert_eq!(
+            embedding["attempts"], 1,
+            "one fresh local attempt: {embedding}"
+        );
+        assert_ne!(
+            embedding["fallback_reason"], "result_unknown",
+            "{embedding}"
+        );
+        assert_eq!(
+            embedding["fallback_reason"], "network_error",
+            "TLS EOF has a typed transport failure: {embedding}"
+        );
+        let retry_at = embedding["next_retry_at"]
             .as_str()
-            .is_some_and(|reason| !reason.is_empty()),
-        "failed task needs a concrete reason: {embedding}"
-    );
-    assert_eq!(source_embedding_count(&dir), 0);
+            .expect("TLS EOF must retain retry backoff");
+        let created_at = embedding["created_at"].as_str().unwrap();
+        assert!(
+            kio_core::scope::parse_utc_seconds(retry_at).unwrap()
+                > kio_core::scope::parse_utc_seconds(created_at).unwrap(),
+            "network failure must retain a future retry deadline: {embedding}",
+        );
+        assert!(embedding["reservation_id"].is_null());
+        assert!(embedding["reserved_usd"].is_null());
+        assert!(embedding["reserved_month"].is_null());
+        assert_eq!(
+            source_embedding_count(&dir),
+            0,
+            "failed TLS cannot publish a vector: {args:?}"
+        );
+    }
 }

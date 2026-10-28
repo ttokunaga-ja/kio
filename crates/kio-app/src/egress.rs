@@ -201,8 +201,14 @@ pub(crate) fn embedding_opt_in_for_scopes(
     offline: bool,
     control: &kio_core::control::ControlHandle,
 ) -> Result<bool> {
-    if offline {
+    let Some(execution) = embedding_execution(adapter_settings, control) else {
         return Ok(false);
+    };
+    if !embedding_transport_allowed(execution, offline) {
+        return Ok(false);
+    }
+    if embedding_is_deterministic(execution) {
+        return Ok(true);
     }
     for exec in exec_scopes {
         if persistent_network_allowed_for_kio_dir(
@@ -341,7 +347,11 @@ pub(crate) fn network_allowed(
     repo: &Repository,
     args: &IndexArgs,
 ) -> Result<bool> {
-    if args.offline {
+    // Offline denies external OCR, while a selected local peer still needs
+    // its current exact endpoint approval and dispatch-time validation.
+    if args.offline
+        && active_local_ocr_execution_with_control(adapter_settings, repo.control()).is_none()
+    {
         return Ok(false);
     }
     persistent_network_allowed(adapter_settings, repo)

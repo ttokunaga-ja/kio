@@ -3,6 +3,7 @@ use crate::egress::active_embedding_adapter_identity;
 use crate::egress::embedding_opt_in_for_scopes;
 use crate::embedding::admission::embedding_execution;
 use crate::embedding::admission::embedding_is_deterministic;
+use crate::embedding::admission::embedding_transport_allowed;
 use crate::embedding::transport::QueryEmbeddingOutcome;
 use crate::embedding::transport::compute_query_embedding_page1;
 use crate::index::command::compute_index_status;
@@ -520,9 +521,8 @@ fn run_search_inner(
     let query_embeddable = parsed.query.chars().count() >= 2;
     let adapter_identity = active_embedding_adapter_identity(adapter_settings, ctx.control)?;
     let adapter_id = adapter_identity.as_ref().map(|(id, _)| id.clone());
-    // An embedding adapter can be an authenticated local HTTPS peer. Only the
-    // deterministic evaluator is in-process; every other execution needs an
-    // exact device+scope grant.
+    // The evaluator has no transport. A selected loopback endpoint remains
+    // eligible offline, subject to its current device approval.
     let active_embedding = embedding_execution(adapter_settings, ctx.control);
     let embedding_is_deterministic = active_embedding.is_some_and(embedding_is_deterministic);
     if parsed.online && (active_embedding.is_none() || embedding_is_deterministic) {
@@ -559,9 +559,11 @@ fn run_search_inner(
     let vector_precheck = resolve_vector_availability(
         requested_mode,
         &replica_embedding_states,
-        // `--offline` forbids every adapter transport, including authenticated
-        // local peers, but never the in-process deterministic evaluator.
-        parsed.offline && !embedding_is_deterministic,
+        // Offline blocks only the selected external transport. Endpoint and
+        // current-approval checks remain independent predicates below.
+        parsed.offline
+            && active_embedding
+                .is_none_or(|execution| !embedding_transport_allowed(execution, true)),
         active_embedding.is_some(),
         embedding_opt_in,
         query_embeddable,

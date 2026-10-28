@@ -1,51 +1,67 @@
-//! Authenticated local-adapter transport.
+//! Explicit HTTP or managed-CA HTTPS transport for loopback adapters.
 //!
-//! A loopback address identifies a route, not the process listening on it.  The
-//! local adapters therefore accept only an opaque HTTPS endpoint which owns an
-//! explicit, device-local CA file. The CA is re-read before every request and
-//! must equal the digest captured for the runtime, so rotation or revocation
-//! fails closed instead of changing the peer under an existing grant.
+//! A loopback address identifies a route, not the process listening on it.
+//! The HTTP route is intentionally unauthenticated and never reads a CA. HTTPS
+//! uses only the device-managed CA snapshot captured for the runtime and checks
+//! it before every request. Both routes pin loopback names to loopback socket
+//! addresses and disable proxies and redirects.
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 use ureq::tls::{Certificate, RootCerts, TlsConfig, parse_pem};
+use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
+use ureq::unversioned::transport::{DefaultConnector, NextTimeout};
 
 use crate::http_policy::HttpPolicy;
 use crate::tool_lock::{ManagedLocalTrustProvider, ManagedLocalTrustSnapshot};
 use crate::{AdapterError, Result};
 
 const MAX_CA_PEM_BYTES: u64 = 1024 * 1024;
+pub const HTTP_UNAUTHENTICATED_TRUST_BINDING: &str = "http:unauthenticated";
 
-/// A local service destination whose server identity is authenticated with a
-/// user-provided device CA.  It deliberately has no `From<String>` conversion:
-/// raw URLs must never reach a local client.
+/// A loopback destination. HTTPS endpoints retain a managed CA snapshot;
+/// HTTP endpoints carry no trust material and are explicitly unauthenticated.
+/// This type deliberately has no `From<String>` conversion: unvalidated URLs
+/// must never reach a local client.
 #[derive(Debug, Clone)]
-pub struct AuthenticatedLocalEndpoint {
+pub struct LocalEndpoint {
     base_url: String,
-    ca_pem_path: PathBuf,
-    expected_trust_digest: String,
-    managed_local_trust: Option<std::sync::Arc<dyn ManagedLocalTrustProvider>>,
+    https_trust: Option<HttpsTrust>,
     control: kio_core::control::ControlHandle,
 }
 
-impl PartialEq for AuthenticatedLocalEndpoint {
+#[derive(Debug, Clone)]
+struct HttpsTrust {
+    ca_pem_path: PathBuf,
+    expected_trust_digest: String,
+    managed_local_trust: Option<std::sync::Arc<dyn ManagedLocalTrustProvider>>,
+}
+
+impl PartialEq for HttpsTrust {
     fn eq(&self, other: &Self) -> bool {
-        self.base_url == other.base_url
-            && self.ca_pem_path == other.ca_pem_path
+        self.ca_pem_path == other.ca_pem_path
             && self.expected_trust_digest == other.expected_trust_digest
     }
 }
-impl Eq for AuthenticatedLocalEndpoint {}
+impl Eq for HttpsTrust {}
 
-impl AuthenticatedLocalEndpoint {
+impl PartialEq for LocalEndpoint {
+    fn eq(&self, other: &Self) -> bool {
+        self.base_url == other.base_url && self.https_trust == other.https_trust
+    }
+}
+impl Eq for LocalEndpoint {}
+
+impl LocalEndpoint {
     /// Capture the current private CA digest for a direct fixture endpoint.
-    /// Production runtime construction must use [`Self::new_bound`] with the
+    /// Production runtime construction must use [`Self::new_https_bound`] with the
     /// composition root's pre-captured digest.
     #[cfg(test)]
-    pub fn new(base_url: impl AsRef<str>, ca_pem_path: PathBuf) -> Result<Self> {
+    pub fn new_https(base_url: impl AsRef<str>, ca_pem_path: PathBuf) -> Result<Self> {
         let expected_trust_digest = capture_private_local_trust(&ca_pem_path)?;
-        Self::new_bound(
+        Self::new_https_bound(
             base_url,
             ca_pem_path,
             expected_trust_digest,
@@ -53,10 +69,22 @@ impl AuthenticatedLocalEndpoint {
         )
     }
 
+    pub(crate) fn new_http_bound(
+        base_url: impl AsRef<str>,
+        control: kio_core::control::ControlHandle,
+    ) -> Result<Self> {
+        let base_url = validate_local_http_url(base_url.as_ref())?;
+        Ok(Self {
+            base_url,
+            https_trust: None,
+            control,
+        })
+    }
+
     /// Construct an endpoint bound to the CA digest captured by the command
     /// composition root. A later CA rotation is a fail-closed configuration
     /// change, never a silent change of the peer authorized by a grant.
-    pub(crate) fn new_bound(
+    pub(crate) fn new_https_bound(
         base_url: impl AsRef<str>,
         ca_pem_path: PathBuf,
         expected_trust_digest: String,
@@ -78,17 +106,18 @@ impl AuthenticatedLocalEndpoint {
         }
         Ok(Self {
             base_url,
-            ca_pem_path,
-            expected_trust_digest,
-            managed_local_trust: None,
+            https_trust: Some(HttpsTrust {
+                ca_pem_path,
+                expected_trust_digest,
+                managed_local_trust: None,
+            }),
             control,
         })
     }
 
-    /// Keep the application's managed trust lease alive for every use of this
-    /// endpoint. The CA is read from its retained private directory, including
-    /// after the settings object that created this endpoint has been dropped.
-    pub(crate) fn new_managed_bound(
+    /// Retain the managed trust lease and read its private leaf from the
+    /// acquired directory handle at construction and before every HTTPS use.
+    pub(crate) fn new_https_managed_bound(
         base_url: impl AsRef<str>,
         snapshot: ManagedLocalTrustSnapshot,
         provider: std::sync::Arc<dyn ManagedLocalTrustProvider>,
@@ -109,9 +138,11 @@ impl AuthenticatedLocalEndpoint {
         }
         Ok(Self {
             base_url,
-            ca_pem_path: snapshot.path,
-            expected_trust_digest: snapshot.digest,
-            managed_local_trust: Some(provider),
+            https_trust: Some(HttpsTrust {
+                ca_pem_path: snapshot.path,
+                expected_trust_digest: snapshot.digest,
+                managed_local_trust: Some(provider),
+            }),
             control,
         })
     }
@@ -127,19 +158,25 @@ impl AuthenticatedLocalEndpoint {
         &self.base_url
     }
 
+    /// Append an adapter-owned route while preserving the configured URL as
+    /// the approval identity. A terminal slash affects identity but is
+    /// removed only for joining the fixed endpoint suffix.
+    pub fn endpoint_url(&self, suffix: &str) -> String {
+        format!("{}{suffix}", self.base_url.trim_end_matches('/'))
+    }
+
     /// The digest bound to this endpoint, after confirming that the currently
     /// readable CA bytes still match it.
     pub fn trust_digest(&self) -> Result<String> {
         self.current_trust().map(|trust| trust.digest)
     }
 
-    /// Build a no-proxy TLS agent using only the explicit CA bundle.  Rustls
-    /// continues to perform normal chain, validity-period and SAN checks.
+    /// Build a no-proxy/no-redirect agent. HTTPS uses only the explicit CA
+    /// bundle, with normal chain, validity-period and SAN validation. HTTP
+    /// sends plaintext and never reads CA state.
     pub(crate) fn agent(&self, policy: HttpPolicy) -> Result<ureq::Agent> {
-        let trust = self.current_trust()?;
-        Ok(ureq::Agent::config_builder()
+        let mut builder = ureq::Agent::config_builder()
             .max_redirects(0)
-            .https_only(true)
             .proxy(None)
             .http_status_as_error(false)
             .timeout_connect(Some(policy.connect_timeout))
@@ -148,33 +185,77 @@ impl AuthenticatedLocalEndpoint {
                     .overall_timeout
                     .min(policy.read_timeout)
                     .min(policy.write_timeout),
-            ))
-            .tls_config(
+            ));
+        if self.https_trust.is_some() {
+            let trust = self.current_trust()?;
+            builder = builder.tls_config(
                 TlsConfig::builder()
                     .root_certs(RootCerts::new_with_certs(&trust.certificates))
                     .build(),
-            )
-            .build()
-            .into())
+            );
+        }
+        Ok(ureq::Agent::with_parts(
+            builder.build(),
+            DefaultConnector::default(),
+            LiteralLoopbackResolver,
+        ))
     }
 
     fn current_trust(&self) -> Result<TrustBundle> {
-        let trust = if let Some(provider) = &self.managed_local_trust {
+        let Some(expected) = &self.https_trust else {
+            return Err(config_error(
+                "KIO-E-LOCAL-PEER-TRUST-BINDING-001",
+                "HTTP local endpoint has no TLS trust snapshot",
+            ));
+        };
+        let trust = if let Some(provider) = &expected.managed_local_trust {
             let snapshot = provider.acquire().map_err(AdapterError::RuntimeTrust)?;
-            if snapshot.path != self.ca_pem_path
+            if snapshot.path != expected.ca_pem_path
                 || snapshot.directory.path().join(&snapshot.leaf) != snapshot.path
-                || snapshot.digest != self.expected_trust_digest
+                || snapshot.digest != expected.expected_trust_digest
             {
-                return Err(trust_changed(&self.ca_pem_path));
+                return Err(trust_changed(&expected.ca_pem_path));
             }
             load_managed_ca_bundle(&snapshot)?
         } else {
-            load_ca_bundle(&self.ca_pem_path, &self.control)?
+            load_ca_bundle(&expected.ca_pem_path, &self.control)?
         };
-        if trust.digest != self.expected_trust_digest {
-            return Err(trust_changed(&self.ca_pem_path));
+        if trust.digest != expected.expected_trust_digest {
+            return Err(trust_changed(&expected.ca_pem_path));
         }
         Ok(trust)
+    }
+}
+
+#[derive(Debug)]
+struct LiteralLoopbackResolver;
+
+impl Resolver for LiteralLoopbackResolver {
+    fn resolve(
+        &self,
+        uri: &ureq::http::Uri,
+        _config: &ureq::config::Config,
+        _timeout: NextTimeout,
+    ) -> std::result::Result<ResolvedSocketAddrs, ureq::Error> {
+        let port = uri.port_u16().ok_or(ureq::Error::HostNotFound)?;
+        let mut addresses = self.empty();
+        match uri.host() {
+            Some("localhost") => {
+                // `localhost` is defined as a loopback name. Pin it here rather
+                // than consulting system resolution, while retaining both
+                // families for services bound to either loopback interface.
+                addresses.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+                addresses.push(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port));
+            }
+            Some("127.0.0.1") => {
+                addresses.push(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port));
+            }
+            Some("::1" | "[::1]") => {
+                addresses.push(SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port));
+            }
+            _ => return Err(ureq::Error::HostNotFound),
+        }
+        Ok(addresses)
     }
 }
 
@@ -218,17 +299,68 @@ fn trust_changed(path: &Path) -> AdapterError {
     )
 }
 
+pub(crate) fn validate_local_http_url(input: &str) -> Result<String> {
+    validate_local_url_for_scheme(input, "http")
+}
+
 pub(crate) fn validate_local_https_url(input: &str) -> Result<String> {
+    validate_local_url_for_scheme(input, "https")
+}
+
+pub fn validate_local_url(input: &str) -> Result<String> {
     let uri: ureq::http::Uri = input.parse().map_err(|_| {
         config_error(
             "KIO-E-LOCAL-PEER-URL-001",
-            "offline_api url must be an absolute HTTPS loopback URL",
+            "offline_api url must be an absolute HTTP or HTTPS loopback URL",
         )
     })?;
-    if uri.scheme_str() != Some("https") || uri.query().is_some() {
+    match uri.scheme_str() {
+        Some("http") => validate_local_http_url(input),
+        Some("https") => validate_local_https_url(input),
+        _ => Err(config_error(
+            "KIO-E-LOCAL-PEER-URL-001",
+            "offline_api url must use HTTP or HTTPS",
+        )),
+    }
+}
+
+/// Check that a non-secret endpoint trust identity matches its transport.
+/// HTTP is unauthenticated and has one fixed marker; HTTPS must carry a
+/// managed lifecycle identity rather than that marker.
+pub fn validate_local_trust_binding(url: &str, binding: &str) -> Result<()> {
+    let normalized = validate_local_url(url)?;
+    let uri: ureq::http::Uri = normalized.parse().map_err(|_| {
+        config_error(
+            "KIO-E-LOCAL-PEER-URL-001",
+            "offline_api URL could not be parsed after validation",
+        )
+    })?;
+    let valid = match uri.scheme_str() {
+        Some("http") => binding == HTTP_UNAUTHENTICATED_TRUST_BINDING,
+        Some("https") => !binding.is_empty() && binding != HTTP_UNAUTHENTICATED_TRUST_BINDING,
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(config_error(
+            "KIO-E-LOCAL-PEER-TRUST-BINDING-001",
+            "local endpoint trust identity does not match its transport",
+        ))
+    }
+}
+
+fn validate_local_url_for_scheme(input: &str, expected_scheme: &str) -> Result<String> {
+    let uri: ureq::http::Uri = input.parse().map_err(|_| {
+        config_error(
+            "KIO-E-LOCAL-PEER-URL-001",
+            "offline_api url must be an absolute HTTP or HTTPS loopback URL",
+        )
+    })?;
+    if uri.scheme_str() != Some(expected_scheme) || uri.query().is_some() || input.contains('#') {
         return Err(config_error(
             "KIO-E-LOCAL-PEER-URL-001",
-            "offline_api url must use HTTPS and must not include a query",
+            "offline_api url uses the wrong scheme or includes a query or fragment",
         ));
     }
     let authority = uri.authority().ok_or_else(|| {
@@ -258,7 +390,17 @@ pub(crate) fn validate_local_https_url(input: &str) -> Result<String> {
             "offline_api url must include an explicit port",
         ));
     }
-    Ok(input.trim_end_matches('/').to_owned())
+    // Canonicalize only the scheme so downstream transport classification and
+    // approval identity agree. Keep the literal host, explicit port spelling,
+    // and configured path byte-for-byte; in particular, `/model` and
+    // `/model/` are distinct approvals.
+    let authority_start = input.find("://").ok_or_else(|| {
+        config_error(
+            "KIO-E-LOCAL-PEER-URL-001",
+            "offline_api url must be an absolute HTTP or HTTPS loopback URL",
+        )
+    })? + 3;
+    Ok(format!("{expected_scheme}://{}", &input[authority_start..]))
 }
 
 fn load_ca_bundle(path: &Path, control: &kio_core::control::ControlHandle) -> Result<TrustBundle> {
@@ -287,15 +429,15 @@ fn load_ca_bundle(path: &Path, control: &kio_core::control::ControlHandle) -> Re
 }
 
 fn load_managed_ca_bundle(snapshot: &ManagedLocalTrustSnapshot) -> Result<TrustBundle> {
-    let read = || -> kio_core::Result<Vec<u8>> {
+    let bytes = (|| -> kio_core::Result<Vec<u8>> {
         kio_core::private_fs::verify_private_directory_handle(&snapshot.directory)?;
         kio_core::private_fs::read_private_file_at_path(
             &snapshot.directory,
             &snapshot.leaf,
             MAX_CA_PEM_BYTES,
         )
-    };
-    let bytes = read().map_err(|error| {
+    })()
+    .map_err(|error| {
         config_error(
             "KIO-E-LOCAL-PEER-CA-PROTECTION-001",
             format!("{}: {}", error.error_code(), error.message()),
@@ -394,6 +536,114 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Arc;
 
+    #[test]
+    fn local_http_requires_an_explicit_literal_loopback_destination() {
+        for (url, expected) in [
+            ("http://127.0.0.1:8080/base/", "http://127.0.0.1:8080/base/"),
+            ("http://localhost:8080/base", "http://localhost:8080/base"),
+            ("http://[::1]:8080/base", "http://[::1]:8080/base"),
+        ] {
+            assert_eq!(validate_local_http_url(url).unwrap(), expected, "{url}");
+        }
+        assert_ne!(
+            validate_local_http_url("http://127.0.0.1:8080/model").unwrap(),
+            validate_local_http_url("http://127.0.0.1:8080/model/").unwrap(),
+            "configured path slash is part of approval identity"
+        );
+        for url in [
+            "http://127.0.0.1/base",
+            "http://127.0.0.1:0/base",
+            "http://localhost.evil.example:8080/base",
+            "http://127.0.0.1@evil.example:8080/base",
+            "http://127.0.0.1:8080/base?redirect=1",
+            "http://127.0.0.1:8080/base#fragment",
+            "http://192.0.2.1:8080/base",
+        ] {
+            assert!(validate_local_http_url(url).is_err(), "must reject {url}");
+        }
+    }
+
+    #[test]
+    fn validated_local_destination_canonicalizes_only_the_scheme() {
+        assert_eq!(
+            validate_local_url("HTTP://127.0.0.1:8123/model/").unwrap(),
+            "http://127.0.0.1:8123/model/"
+        );
+        assert_eq!(
+            validate_local_url("HTTPS://[::1]:8443/model").unwrap(),
+            "https://[::1]:8443/model"
+        );
+    }
+
+    #[test]
+    fn literal_resolver_returns_only_loopback_candidates_for_allowed_hosts() {
+        let resolver = LiteralLoopbackResolver;
+        let resolve = |host: &str| {
+            let uri: ureq::http::Uri = format!("http://{host}:8123/").parse().unwrap();
+            resolver
+                .resolve(
+                    &uri,
+                    &ureq::config::Config::default(),
+                    NextTimeout {
+                        after: std::time::Duration::from_secs(1).into(),
+                        reason: ureq::Timeout::Resolve,
+                    },
+                )
+                .unwrap()
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            resolve("localhost"),
+            vec![
+                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8123),
+                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8123),
+            ]
+        );
+        assert_eq!(
+            resolve("127.0.0.1"),
+            vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8123)]
+        );
+        assert_eq!(
+            resolve("[::1]"),
+            vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 8123)]
+        );
+    }
+
+    #[test]
+    fn endpoint_trust_binding_marker_must_match_transport_scheme() {
+        assert!(
+            validate_local_trust_binding(
+                "http://127.0.0.1:8080/model/",
+                HTTP_UNAUTHENTICATED_TRUST_BINDING,
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_local_trust_binding(
+                "https://127.0.0.1:8443/model",
+                "local-ca:v1:g1:sha256:fixture",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_local_trust_binding(
+                "https://127.0.0.1:8443/model",
+                HTTP_UNAUTHENTICATED_TRUST_BINDING,
+            )
+            .is_err()
+        );
+        assert!(
+            validate_local_trust_binding(
+                "http://127.0.0.1:8080/model",
+                "local-ca:v1:g1:sha256:fixture",
+            )
+            .is_err()
+        );
+    }
+
     fn private_ca_file(pem: &str) -> (tempfile::TempDir, PathBuf) {
         // Exercise the system temp layout, including macOS's /var alias.
         let directory = tempfile::Builder::new()
@@ -411,6 +661,53 @@ mod tests {
         #[cfg(windows)]
         private_acl_fixture::protect_owner_only(&path, false).unwrap();
         (directory, path)
+    }
+
+    fn plaintext_server(response: String) -> (String, std::thread::JoinHandle<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            let (mut stream, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "HTTP fixture accept timed out"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("HTTP fixture accept failed: {error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                assert_ne!(read, 0, "HTTP peer closed before request headers");
+                request.extend_from_slice(&chunk[..read]);
+                assert!(
+                    request.len() <= 64 * 1024,
+                    "HTTP headers exceeded fixture cap"
+                );
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            stream.write_all(response.as_bytes()).unwrap();
+            stream.flush().unwrap();
+            request
+        });
+        (format!("http://127.0.0.1:{}/base", address.port()), task)
     }
 
     #[cfg(windows)]
@@ -632,7 +929,7 @@ mod tests {
         (format!("https://{address}"), cert.pem(), task)
     }
 
-    type LocalClientCase = (&'static str, fn(AuthenticatedLocalEndpoint) -> Result<()>);
+    type LocalClientCase = (&'static str, fn(LocalEndpoint) -> Result<()>);
 
     fn local_client_cases() -> Vec<LocalClientCase> {
         use crate::local_embedding::{EnvLocalEmbeddingClient, LocalEmbeddingClient};
@@ -660,7 +957,7 @@ mod tests {
     }
 
     #[test]
-    fn only_explicit_https_loopback_destinations_are_accepted() {
+    fn https_url_validator_requires_explicit_https_loopback_destination() {
         for rejected in [
             "http://127.0.0.1:8443",
             "https://example.test:8443",
@@ -674,7 +971,7 @@ mod tests {
         }
         assert_eq!(
             validate_local_https_url("https://127.0.0.1:8443/").unwrap(),
-            "https://127.0.0.1:8443"
+            "https://127.0.0.1:8443/"
         );
         assert_eq!(
             validate_local_https_url("https://[::1]:8443").unwrap(),
@@ -699,19 +996,65 @@ mod tests {
         #[cfg(windows)]
         private_acl_fixture::protect_owner_only(directory.path(), true).unwrap();
         let path = directory.path().join("peer-ca.pem");
-        assert!(AuthenticatedLocalEndpoint::new("https://localhost:8443", path.clone()).is_err());
+        assert!(LocalEndpoint::new_https("https://localhost:8443", path.clone()).is_err());
         assert!(
-            AuthenticatedLocalEndpoint::new("https://localhost:8443", PathBuf::from("ca.pem"))
-                .is_err()
+            LocalEndpoint::new_https("https://localhost:8443", PathBuf::from("ca.pem")).is_err()
         );
         fs::write(&path, b"not a certificate").unwrap();
         #[cfg(unix)]
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         #[cfg(windows)]
         private_acl_fixture::protect_owner_only(&path, false).unwrap();
-        assert!(AuthenticatedLocalEndpoint::new("https://localhost:8443", path.clone()).is_err());
+        assert!(LocalEndpoint::new_https("https://localhost:8443", path.clone()).is_err());
         fs::hard_link(&path, directory.path().join("peer-ca-copy.pem")).unwrap();
         assert!(kio_core::private_fs::read_private_file(&path, MAX_CA_PEM_BYTES).is_err());
+    }
+
+    #[test]
+    fn unauthenticated_http_uses_loopback_without_ca_and_does_not_follow_redirects() {
+        let response =
+            "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_owned();
+        let (ip_url, server) = plaintext_server(response);
+        let url = ip_url.replacen("127.0.0.1", "localhost", 1);
+        let endpoint =
+            LocalEndpoint::new_http_bound(&url, kio_core::control::ControlHandle::default())
+                .unwrap();
+        assert_eq!(endpoint.destination_binding(), url);
+        let response = endpoint
+            .agent(HttpPolicy::default())
+            .unwrap()
+            .get(endpoint.endpoint_url("/status"))
+            .call()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        let request = server.join().unwrap();
+        assert!(request.starts_with(b"GET /base/status "), "{request:?}");
+
+        let target = TcpListener::bind("127.0.0.1:0").unwrap();
+        target.set_nonblocking(true).unwrap();
+        let target_url = format!(
+            "http://127.0.0.1:{}/target",
+            target.local_addr().unwrap().port()
+        );
+        let redirect = format!(
+            "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let (url, server) = plaintext_server(redirect);
+        let endpoint =
+            LocalEndpoint::new_http_bound(&url, kio_core::control::ControlHandle::default())
+                .unwrap();
+        let response = endpoint
+            .agent(HttpPolicy::default())
+            .unwrap()
+            .get(endpoint.endpoint_url("/redirect"))
+            .call()
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 302);
+        assert!(server.join().unwrap().starts_with(b"GET /base/redirect "));
+        assert!(matches!(
+            target.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
     }
 
     #[test]
@@ -719,7 +1062,7 @@ mod tests {
         let response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
         let (url, pem, server) = localhost_server(response);
         let (_directory, ca_path) = private_ca_file(&pem);
-        let endpoint = AuthenticatedLocalEndpoint::new(&url, ca_path.clone()).unwrap();
+        let endpoint = LocalEndpoint::new_https(&url, ca_path.clone()).unwrap();
         let digest = endpoint.trust_digest().unwrap();
         let response = endpoint
             .agent(HttpPolicy::default())
@@ -747,7 +1090,7 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
         let (_directory, ca_path) = private_ca_file(&cert.pem());
         let digest = capture_private_local_trust(&ca_path).unwrap();
-        let endpoint = AuthenticatedLocalEndpoint::new_bound(
+        let endpoint = LocalEndpoint::new_https_bound(
             "https://127.0.0.1:8443",
             ca_path.clone(),
             digest,
@@ -787,8 +1130,7 @@ mod tests {
         let rcgen::CertifiedKey { cert, .. } =
             rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()]).unwrap();
         let (_directory, ca_path) = private_ca_file(&cert.pem());
-        let endpoint =
-            AuthenticatedLocalEndpoint::new(format!("https://{address}"), ca_path).unwrap();
+        let endpoint = LocalEndpoint::new_https(format!("https://{address}"), ca_path).unwrap();
         let error = endpoint
             .agent(HttpPolicy::default())
             .unwrap()
@@ -812,7 +1154,7 @@ mod tests {
         let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let (url, pem, server) = tls_server_for_names(vec!["localhost".to_owned()], response);
         let (_directory, ca_path) = private_ca_file(&pem);
-        let endpoint = AuthenticatedLocalEndpoint::new(url, ca_path).unwrap();
+        let endpoint = LocalEndpoint::new_https(url, ca_path).unwrap();
         assert!(
             endpoint
                 .agent(HttpPolicy::default())
@@ -829,7 +1171,7 @@ mod tests {
         let response = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         let (url, pem, server) = expired_server(response);
         let (_directory, ca_path) = private_ca_file(&pem);
-        let endpoint = AuthenticatedLocalEndpoint::new(url, ca_path).unwrap();
+        let endpoint = LocalEndpoint::new_https(url, ca_path).unwrap();
         assert!(
             endpoint
                 .agent(HttpPolicy::default())
@@ -852,7 +1194,7 @@ mod tests {
         for ((name, client), response) in cases.iter().zip(responses) {
             let (url, pem, server) = localhost_server(response);
             let (_directory, ca_path) = private_ca_file(&pem);
-            let endpoint = AuthenticatedLocalEndpoint::new(url, ca_path).unwrap();
+            let endpoint = LocalEndpoint::new_https(url, ca_path).unwrap();
             client(endpoint).unwrap_or_else(|error| panic!("{name}: {error}"));
             let request = server.join().unwrap();
             assert!(
@@ -882,7 +1224,7 @@ mod tests {
                     _ => unreachable!(),
                 };
                 let (_directory, ca_path) = private_ca_file(&pem);
-                let endpoint = AuthenticatedLocalEndpoint::new(url, ca_path).unwrap();
+                let endpoint = LocalEndpoint::new_https(url, ca_path).unwrap();
                 let error = client(endpoint).expect_err("bad TLS peer must fail");
                 assert!(
                     matches!(error, AdapterError::LocalPeerAuth(_)),
@@ -906,8 +1248,7 @@ mod tests {
         let (_directory, ca_path) = private_ca_file(&cert.pem());
         for (name, client) in local_client_cases() {
             let endpoint =
-                AuthenticatedLocalEndpoint::new(format!("https://{address}"), ca_path.clone())
-                    .unwrap();
+                LocalEndpoint::new_https(format!("https://{address}"), ca_path.clone()).unwrap();
             let error = client(endpoint).expect_err("closed port must fail");
             assert!(
                 matches!(error, AdapterError::Network(_)),

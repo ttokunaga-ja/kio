@@ -1101,7 +1101,7 @@ pub(crate) fn maybe_wait_at_test_search_final_consent_barrier(control: &ControlH
         return;
     }
     let release_path = ready_path.with_extension("release");
-    let deadline = Instant::now() + std::time::Duration::from_secs(5);
+    let deadline = Instant::now() + std::time::Duration::from_secs(60);
     while !release_path.exists() && Instant::now() < deadline {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }

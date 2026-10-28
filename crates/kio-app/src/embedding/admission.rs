@@ -91,8 +91,8 @@ pub(crate) fn embedding_is_online(execution: EmbeddingExecution) -> bool {
     execution.is_online()
 }
 
-/// The evaluator runs in this process and never opens a transport. It is the
-/// only embedding execution exempt from network grants and `--offline`.
+/// The evaluator runs in this process and never opens a transport. Keep its
+/// execution semantics separate from local transport eligibility under offline.
 pub(crate) fn embedding_is_deterministic(execution: EmbeddingExecution) -> bool {
     embedding_mode_is_in_process(execution.execution_mode())
 }
@@ -102,7 +102,7 @@ fn embedding_mode_is_in_process(mode: ExecutionMode) -> bool {
 }
 
 pub(crate) fn embedding_mode_transport_allowed(mode: ExecutionMode, offline: bool) -> bool {
-    embedding_mode_is_in_process(mode) || !offline
+    !offline || mode != ExecutionMode::OnlineApi
 }
 
 pub(crate) fn embedding_transport_allowed(execution: EmbeddingExecution, offline: bool) -> bool {
@@ -396,5 +396,70 @@ mod image_billing_tests {
                 "IMAGE must use its own lane price: {billed:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod offline_local_admission_tests {
+    use super::embedding_mode_transport_allowed;
+    use crate::search::scope::{ScopeEmbedState, VectorAvailability, resolve_vector_availability};
+    use kio_adapter::types::ExecutionMode;
+    use kio_search::query::SearchMode;
+
+    #[test]
+    fn approved_compatible_local_search_stays_available_offline() {
+        for mode in [ExecutionMode::NativeLibrary, ExecutionMode::OfflineApi] {
+            let blocked = !embedding_mode_transport_allowed(mode, true);
+            for requested in [
+                SearchMode::Auto,
+                SearchMode::Vector,
+                SearchMode::Hybrid,
+                SearchMode::Image,
+            ] {
+                let available = resolve_vector_availability(
+                    requested,
+                    &[ScopeEmbedState::Compatible],
+                    blocked,
+                    true,
+                    true,
+                    true,
+                );
+                assert!(
+                    matches!(available, VectorAvailability::Available),
+                    "approved compatible {mode:?} must remain eligible for {requested:?} offline"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn offline_loopback_eligibility_still_requires_selected_approval() {
+        let blocked = !embedding_mode_transport_allowed(ExecutionMode::OfflineApi, true);
+        let available = resolve_vector_availability(
+            SearchMode::Vector,
+            &[ScopeEmbedState::Compatible],
+            blocked,
+            true,
+            false,
+            true,
+        );
+        assert!(
+            matches!(available, VectorAvailability::Unauthorized),
+            "local eligibility must not replace current loopback approval"
+        );
+    }
+
+    #[test]
+    fn offline_external_search_remains_blocked_even_with_approval() {
+        let blocked = !embedding_mode_transport_allowed(ExecutionMode::OnlineApi, true);
+        let available = resolve_vector_availability(
+            SearchMode::Vector,
+            &[ScopeEmbedState::Compatible],
+            blocked,
+            true,
+            true,
+            true,
+        );
+        assert!(matches!(available, VectorAvailability::Offline));
     }
 }

@@ -359,7 +359,7 @@ pub(crate) fn compute_query_embedding_page1(
     };
     if embedding_is_deterministic(execution) {
         revalidate_current_policy_map(current_policies, false)?;
-        return run_query_embedding_job(invocation, execution, query);
+        return run_query_embedding_job(invocation, execution, query, None);
     }
     if !embedding_transport_allowed(execution, offline) {
         return Ok(None);
@@ -372,10 +372,10 @@ pub(crate) fn compute_query_embedding_page1(
     // sweeping stale rows, or creating a claim. Once the check succeeds, later
     // claim/reservation/send/settlement outcomes remain the normal fresh-page-1
     // metered path.
-    // Select one currently-authorized scope deterministically, then acquire only
-    // that scope's retained writer lease. Rechecking the exact device+scope grant
-    // while the lease is held makes a concurrent revoke either win before this
-    // request or wait until this in-flight request completes.
+    // Select one currently-authorized scope deterministically, then retain its
+    // writer lease for current scope policy and scoped grants. Cross-scope
+    // device endpoint revocation is serialized separately by the shared grant
+    // lease held at the physical local send boundary.
     let mut candidates = exec_scopes
         .iter()
         .filter_map(|exec| {
@@ -420,7 +420,7 @@ pub(crate) fn compute_query_embedding_page1(
     {
         return Err(error);
     }
-    run_query_embedding_job(invocation, execution, query)
+    run_query_embedding_job(invocation, execution, query, Some(authorizing_repo))
 }
 
 /// One device claim, adapter completion, validation and terminal outcome for
@@ -429,6 +429,7 @@ fn run_query_embedding_job(
     invocation: &Invocation<'_>,
     execution: EmbeddingExecution,
     query: &str,
+    authorizing_repo: Option<&Repository>,
 ) -> Result<Option<QueryEmbeddingOutcome>> {
     let adapter_settings = invocation.settings;
     let profile = declared_embedding_profile(execution);
@@ -439,7 +440,7 @@ fn run_query_embedding_job(
         return Ok(None);
     }
     if embedding_is_free(adapter_settings, execution, invocation.control)? {
-        return run_free_query_embedding_job(invocation, execution, query);
+        return run_free_query_embedding_job(invocation, execution, query, authorizing_repo);
     }
     let Some(ledger) = open_optional_ledger_db(invocation.control)? else {
         return Ok(None);
@@ -646,6 +647,7 @@ fn run_free_query_embedding_job(
     invocation: &Invocation<'_>,
     execution: EmbeddingExecution,
     query: &str,
+    authorizing_repo: Option<&Repository>,
 ) -> Result<Option<QueryEmbeddingOutcome>> {
     use crate::local_execution::{Claim, LocalExecution, LocalTarget};
     let profile = declared_embedding_profile(execution);
@@ -693,6 +695,12 @@ fn run_free_query_embedding_job(
         record_query_embed_trace(query, invocation.control);
         match run_local_embedding_adapter(
             invocation.settings,
+            // Direct query text comes from this invocation, not a scoped
+            // TierB file or search hit; existing query semantics are ordinary.
+            authorizing_repo.map(|repo| LocalSendAuthority {
+                repo,
+                requires_secret: false,
+            }),
             execution,
             vec![EmbeddingItem::text("query", query)],
             EmbeddingInputType::Query,
@@ -779,14 +787,50 @@ pub(crate) fn local_max_attempts(execution: EmbeddingExecution) -> u32 {
     }
 }
 
+/// Exact selected input requirement for the final retained-grant evaluation.
+/// The lease helper validates current grants; this value is not a cached grant.
+pub(crate) struct LocalSendAuthority<'a> {
+    pub(crate) repo: &'a Repository,
+    pub(crate) requires_secret: bool,
+}
+
 pub(crate) fn run_local_embedding_adapter(
     settings: &Arc<AdapterRuntimeSettings>,
+    send_authority: Option<LocalSendAuthority<'_>>,
     execution: EmbeddingExecution,
     items: Vec<EmbeddingItem>,
     input_type: EmbeddingInputType,
     token: Option<String>,
     control: &ControlHandle,
 ) -> std::result::Result<EmbeddingCompleted, LocalEmbeddingRunFailure> {
+    // This owned shared lease survives the factory, physical HTTP exchange and
+    // common completion validation. Cached results never reach this function.
+    let _endpoint_dispatch_lease = if matches!(execution, EmbeddingExecution::Offline(_)) {
+        let authority = send_authority.ok_or_else(|| {
+            LocalEmbeddingRunFailure::Admission(kio_core::KioError::invalid_usage(
+                "loopback embedding dispatch has no authorizing scope",
+            ))
+        })?;
+        let profile = declared_embedding_profile(execution);
+        Some(
+            approvals::endpoint_dispatch_lease(
+                settings,
+                authority.repo,
+                approvals::AdapterRole::Embedding,
+                &profile.tool_id,
+                &profile.profile_hash,
+                authority.requires_secret,
+            )
+            .map_err(LocalEmbeddingRunFailure::Admission)?
+            .ok_or_else(|| {
+                LocalEmbeddingRunFailure::Admission(kio_core::KioError::invalid_usage(
+                    "loopback embedding dispatch has no endpoint grant lease",
+                ))
+            })?,
+        )
+    } else {
+        None
+    };
     run_embedding_adapter_unclassified(settings, execution, items, input_type, token, control)
         .map_err(|error| match error {
             EmbeddingRunError::BeforeDispatch(error) => LocalEmbeddingRunFailure::Admission(

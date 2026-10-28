@@ -1,6 +1,6 @@
-//! Validation and deterministic planning for online Markdownize promotion.
+//! Validation and deterministic planning for Markdownize promotion.
 //!
-//! The online executor owns adapter calls and task lifecycle.  This module starts
+//! The executors own adapter calls and task lifecycle.  This module starts
 //! strictly after a task reached `Done`: it re-opens the typed normalized-instance
 //! reference and verifies that the manifest and every unit form one complete,
 //! immutable identity before the CLI is allowed to bind that identity into HEAD.
@@ -15,9 +15,11 @@ use crate::scope_access::is_store_not_found;
 use crate::search::projection::mark_replica_rebuilding_or_log;
 use crate::settings::bbox_annotation_enabled;
 use crate::settings::effective_max_input_bytes;
+use kio_adapter::catalog::active_local_ocr_execution_with_control;
 use kio_adapter::catalog::resolve_standard_online_markdownize_profile_with_bbox_with_control;
 use kio_adapter::catalog::standard_online_markdownize_profile;
 use kio_adapter::tool_lock::AdapterRuntimeSettings;
+use kio_adapter::types::AdapterProfile;
 use kio_core::control::ControlHandle;
 use kio_core::dag::CommitType;
 use kio_core::dag::NormalizeRef;
@@ -215,6 +217,28 @@ fn validate_promotion_state(state: &PromotionState) -> kio_core::Result<()> {
     Ok(())
 }
 
+/// Tool ID and profile hash are canonical hash-bound identity. Execution kind
+/// is only an annotation: it must agree with the implemented producer and can
+/// never choose another recovery label by itself.
+fn promotion_messages(state: &PromotionState) -> kio_core::Result<(&'static str, &'static str)> {
+    validate_promotion_state(state)?;
+    let markdown = &state.staged_tool_lock["markdown"];
+    match (markdown["tool_id"].as_str(), markdown["kind"].as_str()) {
+        (Some("mistral_ocr_markdownize"), Some("online_api")) => Ok((
+            "online Markdownize promotion",
+            "online Markdownize promotion commit created",
+        )),
+        (Some("paddleocr_vl_local"), Some("offline_api")) => Ok((
+            "local Markdownize promotion",
+            "local Markdownize promotion commit created",
+        )),
+        _ => Err(promotion_recovery_error(
+            "invalid",
+            "staged Markdownize producer and execution annotation are inconsistent or unsupported",
+        )),
+    }
+}
+
 pub(crate) fn promotion_recovery_error(phase: &str, message: impl Into<String>) -> KioError {
     KioError::new(
         "KIO-E-PROMOTION-RECOVERY-001",
@@ -317,9 +341,9 @@ pub(crate) fn validated_online_promotions(
 }
 
 #[derive(Debug)]
-struct OnlinePromotionPlan {
+struct MarkdownizePromotionPlan {
     normalize_by_path: BTreeMap<String, PendingNormalizeRef>,
-    active_profile_hash: String,
+    markdown_profile: AdapterProfile,
 }
 
 /// Re-derive the promotable online result set from persisted task/instance truth.
@@ -330,7 +354,7 @@ struct OnlinePromotionPlan {
 fn plan_online_markdownize_promotion(
     adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
-) -> kio_core::Result<Option<OnlinePromotionPlan>> {
+) -> kio_core::Result<Option<MarkdownizePromotionPlan>> {
     let task_store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     let tasks = task_store.all().map_err(pipeline_to_kio)?;
     let Some(head_hash) = repo.head_commit_hash()? else {
@@ -499,26 +523,185 @@ fn plan_online_markdownize_promotion(
             ))
         })
         .collect::<Result<_>>()?;
-    Ok(Some(OnlinePromotionPlan {
+    let mut markdown_profile = standard_online_markdownize_profile();
+    markdown_profile.tool_profile_hash = active_profile_hash;
+    Ok(Some(MarkdownizePromotionPlan {
         normalize_by_path,
-        active_profile_hash,
+        markdown_profile,
     }))
+}
+
+/// Local completions come from persisted truth so a crash after Task
+/// publication but before HEAD never requires another OCR request.
+fn plan_local_markdownize_promotion(
+    adapter_settings: &Arc<AdapterRuntimeSettings>,
+    repo: &Repository,
+) -> kio_core::Result<Option<MarkdownizePromotionPlan>> {
+    let Some(execution) = active_local_ocr_execution_with_control(adapter_settings, repo.control())
+    else {
+        return Ok(None);
+    };
+    let profile = kio_adapter::local_ocr_markdownize::profile_for(execution);
+    let Some(head_hash) = repo.head_commit_hash()? else {
+        return Ok(None);
+    };
+    let head = repo.read_commit(&head_hash)?;
+    let tree = repo.read_tree(&head.tree)?;
+    let entries = tree
+        .entries
+        .iter()
+        .map(|entry| (entry.path.as_str(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let max_input_bytes = effective_max_input_bytes(repo)?;
+    let mut tasks = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone())
+        .all()
+        .map_err(pipeline_to_kio)?;
+    tasks.sort_by(|left, right| {
+        left.input_path
+            .as_bytes()
+            .cmp(right.input_path.as_bytes())
+            .then_with(|| left.created_at.cmp(&right.created_at))
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+    let mut normalize_by_path = BTreeMap::new();
+    for task in tasks {
+        if task.task_type != TaskType::Markdownize
+            || task.status != TaskStatus::Done
+            || task.fallback_reason.as_deref() != Some("local_adapter_done")
+        {
+            continue;
+        }
+        let Some(entry) = entries.get(task.input_path.as_str()) else {
+            continue;
+        };
+        if entry.raw_hash != task.input_hash
+            || !repository_scan_policy_allows_file(repo, &task.input_path)
+                .map_err(pipeline_to_kio)?
+        {
+            continue;
+        }
+        let Ok(verified) = read_repository_scan_input(repo, &task.input_path, max_input_bytes)
+        else {
+            continue;
+        };
+        if verified.raw_hash != task.input_hash {
+            continue;
+        }
+        ensure_raw_ingest_allowed(repo, &task.input_hash)?;
+        if let Some(normalize) = validated_local_normalize_ref(repo, &task, &profile)? {
+            normalize_by_path.insert(task.input_path, normalize);
+        }
+    }
+    if normalize_by_path.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(MarkdownizePromotionPlan {
+        normalize_by_path,
+        markdown_profile: profile,
+    }))
+}
+
+fn validated_local_normalize_ref(
+    repo: &Repository,
+    task: &TaskDescriptor,
+    profile: &AdapterProfile,
+) -> kio_core::Result<Option<PendingNormalizeRef>> {
+    if task.task_type != TaskType::Markdownize
+        || task.status != TaskStatus::Done
+        || task.fallback_reason.as_deref() != Some("local_adapter_done")
+    {
+        return Ok(None);
+    }
+    let output = validate_task_output_ref(repo.kio_dir(), task).map_err(pipeline_to_kio)?;
+    let TaskOutputRef::NormalizedInstance {
+        raw_hash,
+        tool_profile_hash,
+        r#gen,
+        ..
+    } = output
+    else {
+        return Err(pipeline_to_kio(PipelineError::corrupt(
+            task.output_ref.clone(),
+            "completed local Markdownize task has no normalized-instance output",
+        )));
+    };
+    if tool_profile_hash != profile.tool_profile_hash {
+        return Ok(None);
+    }
+    if raw_hash != task.input_hash
+        || task.reservation_id.is_some()
+        || task.reserved_month.is_some()
+        || task.reserved_usd.is_some()
+    {
+        return Err(pipeline_to_kio(PipelineError::corrupt(
+            task.output_ref.clone(),
+            "completed local Markdownize task has inconsistent raw or paid authority",
+        )));
+    }
+    let instance = load_validated_normalized_instance_with_control(
+        repo.kio_dir(),
+        &raw_hash,
+        &tool_profile_hash,
+        r#gen,
+        repo.control(),
+    )
+    .map_err(pipeline_to_kio)?;
+    if instance.manifest.units.is_empty()
+        || !instance
+            .manifest
+            .units
+            .iter()
+            .all(|unit| unit.status == UnitStatus::Done)
+        || instance.units.len() != instance.manifest.units.len()
+    {
+        return Err(pipeline_to_kio(PipelineError::corrupt(
+            task.output_ref.clone(),
+            "Done local Markdownize task points at an incomplete normalized instance",
+        )));
+    }
+    let manifest_hash = crate::object_persistence::compute_manifest_hash(
+        repo,
+        &raw_hash,
+        &tool_profile_hash,
+        r#gen,
+    )?;
+    Ok(Some(PendingNormalizeRef {
+        expected_raw_hash: raw_hash,
+        normalize: NormalizeRef {
+            tool_profile_hash,
+            r#gen,
+            manifest_hash,
+        },
+    }))
+}
+
+fn plan_selected_markdownize_promotion(
+    settings: &Arc<AdapterRuntimeSettings>,
+    repo: &Repository,
+) -> kio_core::Result<Option<MarkdownizePromotionPlan>> {
+    if active_local_ocr_execution_with_control(settings, repo.control()).is_some() {
+        plan_local_markdownize_promotion(settings, repo)
+    } else {
+        plan_online_markdownize_promotion(settings, repo)
+    }
 }
 
 /// Replace only the Markdownize identity in tool-lock. The entry deliberately
 /// carries no URL, command, arguments, credentials, or other execution authority.
-fn promoted_markdown_tool_lock(repo: &Repository, profile_hash: &str) -> kio_core::Result<Value> {
+fn promoted_markdown_tool_lock(
+    repo: &Repository,
+    profile: &AdapterProfile,
+) -> kio_core::Result<Value> {
     const TOOL_LOCK_MAX_BYTES: u64 = 1024 * 1024;
     let path = repo.kio_dir().join("tool-lock.json");
     let bytes = read_bounded_regular_file(&path, TOOL_LOCK_MAX_BYTES)?;
     let mut value: Value =
         serde_json::from_slice(&bytes).map_err(|error| KioError::schema(error.to_string()))?;
-    let online = standard_online_markdownize_profile();
     value["markdown"] = json!({
-        "tool_id": online.adapter_id,
-        "profile_hash": profile_hash,
-        "kind": "online_api",
-        "capabilities": online.capability_flags,
+        "tool_id": profile.adapter_id,
+        "profile_hash": profile.tool_profile_hash,
+        "kind": profile.execution_mode,
+        "capabilities": profile.capability_flags,
     });
     let bytes =
         serde_json::to_vec_pretty(&value).map_err(|error| KioError::schema(error.to_string()))?;
@@ -528,13 +711,72 @@ fn promoted_markdown_tool_lock(repo: &Repository, profile_hash: &str) -> kio_cor
 
 fn materialize_promoted_markdown_tool_lock(
     repo: &Repository,
-    profile_hash: &str,
+    profile: &AdapterProfile,
 ) -> kio_core::Result<()> {
     let path = repo.kio_dir().join("tool-lock.json");
-    let value = promoted_markdown_tool_lock(repo, profile_hash)?;
+    let value = promoted_markdown_tool_lock(repo, profile)?;
     let bytes =
         serde_json::to_vec_pretty(&value).map_err(|error| KioError::schema(error.to_string()))?;
     atomic_overwrite_file(&path, &bytes)
+}
+
+/// A pipeline can produce its first local output before HEAD exists. Verify
+/// the exact accepted refs rather than inferring provenance from configuration
+/// or requiring the complete-only batch promotion planner to find an old HEAD.
+fn has_accepted_local_pipeline_ref(
+    repo: &Repository,
+    refs: &BTreeMap<String, PendingNormalizeRef>,
+    profile: &AdapterProfile,
+) -> kio_core::Result<bool> {
+    let matching = refs
+        .iter()
+        .filter(|(_, pending)| pending.normalize.tool_profile_hash == profile.tool_profile_hash)
+        .collect::<Vec<_>>();
+    if matching.is_empty() {
+        return Ok(false);
+    }
+    let max_input_bytes = effective_max_input_bytes(repo)?;
+    let mut accepted = false;
+    for (path, pending) in matching {
+        if !repository_scan_policy_allows_file(repo, path).map_err(pipeline_to_kio)? {
+            continue;
+        }
+        let Ok(current) = read_repository_scan_input(repo, path, max_input_bytes) else {
+            continue;
+        };
+        if current.raw_hash != pending.expected_raw_hash {
+            continue;
+        }
+        ensure_raw_ingest_allowed(repo, &pending.expected_raw_hash)?;
+        let instance = load_validated_normalized_instance_with_control(
+            repo.kio_dir(),
+            &pending.expected_raw_hash,
+            &profile.tool_profile_hash,
+            pending.normalize.r#gen,
+            repo.control(),
+        )
+        .map_err(pipeline_to_kio)?;
+        let manifest_hash = crate::object_persistence::compute_manifest_hash(
+            repo,
+            &pending.expected_raw_hash,
+            &profile.tool_profile_hash,
+            pending.normalize.r#gen,
+        )?;
+        if manifest_hash != pending.normalize.manifest_hash {
+            return Err(pipeline_to_kio(PipelineError::corrupt(
+                path,
+                "local pipeline normalized manifest differs from its pending reference",
+            )));
+        }
+        // Partial output retains accepted Done units. This observation stamps
+        // provenance without promoting incomplete tasks or altering their refs.
+        accepted |= instance
+            .manifest
+            .units
+            .iter()
+            .any(|unit| unit.status == UnitStatus::Done);
+    }
+    Ok(accepted)
 }
 
 /// Reconcile already-Done online results into an ordinary index's single pending
@@ -545,11 +787,26 @@ pub(super) fn apply_online_promotion_to_index(
     repo: &Repository,
     result: &mut IndexPipelineResult,
 ) -> kio_core::Result<()> {
-    let Some(plan) = plan_online_markdownize_promotion(adapter_settings, repo)? else {
-        return Ok(());
+    let plan = plan_selected_markdownize_promotion(adapter_settings, repo)?;
+    let produced_local_profile = if let Some(execution) =
+        active_local_ocr_execution_with_control(adapter_settings, repo.control())
+    {
+        let profile = kio_adapter::local_ocr_markdownize::profile_for(execution);
+        has_accepted_local_pipeline_ref(repo, &result.normalize_by_path, &profile)?
+            .then_some(profile)
+    } else {
+        None
     };
-    materialize_promoted_markdown_tool_lock(repo, &plan.active_profile_hash)?;
-    result.normalize_by_path.extend(plan.normalize_by_path);
+    if let Some(profile) = plan
+        .as_ref()
+        .map(|plan| &plan.markdown_profile)
+        .or(produced_local_profile.as_ref())
+    {
+        materialize_promoted_markdown_tool_lock(repo, profile)?;
+    }
+    if let Some(plan) = plan {
+        result.normalize_by_path.extend(plan.normalize_by_path);
+    }
     Ok(())
 }
 
@@ -565,14 +822,33 @@ pub(super) fn promote_completed_online_markdownize(
     let Some(plan) = plan_online_markdownize_promotion(adapter_settings, repo)? else {
         return Ok(false);
     };
+    publish_markdownize_promotion(ctx, repo, plan)
+}
+
+pub(super) fn promote_completed_local_markdownize(
+    ctx: &crate::invocation::Invocation<'_>,
+    repo: &Repository,
+) -> kio_core::Result<bool> {
+    let Some(plan) = plan_local_markdownize_promotion(ctx.settings, repo)? else {
+        return Ok(false);
+    };
+    publish_markdownize_promotion(ctx, repo, plan)
+}
+
+fn publish_markdownize_promotion(
+    ctx: &crate::invocation::Invocation<'_>,
+    repo: &Repository,
+    plan: MarkdownizePromotionPlan,
+) -> kio_core::Result<bool> {
     let previous_head = repo
         .head_commit_hash()?
         .ok_or_else(|| KioError::invalid_usage("cannot promote in an unborn scope"))?;
-    let staged_tool_lock = promoted_markdown_tool_lock(repo, &plan.active_profile_hash)?;
+    let staged_tool_lock = promoted_markdown_tool_lock(repo, &plan.markdown_profile)?;
     let mut state = stage_promotion(repo, &previous_head, staged_tool_lock)?;
+    let (message, event_message) = promotion_messages(&state)?;
     maybe_inject_promotion_fault("before_head", ctx.control)?;
     let outcome = repo.promote_normalize_refs_with_staged_tool_lock(
-        Some("online Markdownize promotion"),
+        Some(message),
         &plan.normalize_by_path,
         &state.staged_tool_lock_hash,
     )?;
@@ -601,7 +877,7 @@ pub(super) fn promote_completed_online_markdownize(
         ctx.control.append_event_log_in_session(
             ctx.locks,
             "KIO-I-COMMIT-CREATED-001",
-            "online Markdownize promotion commit created",
+            event_message,
             json!({
                 "commit_hash": commit_hash,
                 "tree_hash": outcome.tree_hash,
@@ -620,6 +896,7 @@ pub(super) fn recover_pending_online_promotion(repo: &Repository) -> kio_core::R
     let Some(mut state) = load_promotion_state(repo.kio_dir())? else {
         return Ok(false);
     };
+    let (expected_message, _) = promotion_messages(&state)?;
     let current_head = repo
         .head_commit_hash()?
         .ok_or_else(|| promotion_recovery_error("invalid", "promotion HEAD is missing"))?;
@@ -647,7 +924,7 @@ pub(super) fn recover_pending_online_promotion(repo: &Repository) -> kio_core::R
     let commit = repo.read_commit(&current_head)?;
     if commit.parent.as_deref() != Some(state.previous_head.as_str())
         || commit.commit_type != CommitType::Auto
-        || commit.message != "online Markdownize promotion"
+        || commit.message != expected_message
         || commit.tool_lock_hash != state.staged_tool_lock_hash
     {
         return Err(promotion_recovery_error(
@@ -776,6 +1053,47 @@ mod tests {
         assert_eq!(planned[0].tool_profile_hash, profile_hash);
         assert!(planned[0].bbox_annotation_enabled);
 
+        let mut local = task.clone();
+        local.fallback_reason = Some("local_adapter_done".to_owned());
+        local.bbox_annotation_enabled = None;
+        let repo = Repository::open(dir.path()).unwrap();
+        let mut profile = kio_adapter::local_ocr_markdownize::profile_for(
+            kio_adapter::local_ocr_markdownize::LocalOcrExecution::Real,
+        );
+        profile.tool_profile_hash = profile_hash.clone();
+        let local_ref = super::validated_local_normalize_ref(&repo, &local, &profile)
+            .unwrap()
+            .unwrap();
+        assert_eq!(local_ref.expected_raw_hash, local.input_hash);
+        assert_eq!(local_ref.normalize.tool_profile_hash, profile_hash);
+        let lock = super::promoted_markdown_tool_lock(&repo, &profile).unwrap();
+        assert_eq!(lock["markdown"]["tool_id"], profile.adapter_id);
+        assert_eq!(lock["markdown"]["kind"], "offline_api");
+        assert_eq!(
+            lock["markdown"]["capabilities"],
+            serde_json::json!(profile.capability_flags)
+        );
+        let mut different = profile.clone();
+        different.tool_profile_hash = hash_bytes(b"other-local-profile");
+        assert!(
+            super::validated_local_normalize_ref(&repo, &local, &different)
+                .unwrap()
+                .is_none()
+        );
+        let mut partial_local = local.clone();
+        partial_local.status = TaskStatus::Partial;
+        assert!(
+            super::validated_local_normalize_ref(&repo, &partial_local, &profile)
+                .unwrap()
+                .is_none()
+        );
+        let mut missing_local = local.clone();
+        missing_local.output_ref =
+            normalized_task_output_ref(&missing_local.input_hash, &profile.tool_profile_hash, 1);
+        assert!(super::validated_local_normalize_ref(&repo, &missing_local, &profile).is_err());
+        local.reservation_id = Some("must-remain-paid".to_owned());
+        assert!(super::validated_local_normalize_ref(&repo, &local, &profile).is_err());
+
         let mut partial = task;
         partial.status = TaskStatus::Partial;
         assert!(
@@ -832,5 +1150,88 @@ mod tests {
         let mut task = done_task(output_ref, raw_hash);
         task.bbox_annotation_enabled = None;
         assert!(validated_online_promotions(&kio_dir, &[task], &ControlHandle::default()).is_err());
+    }
+    #[test]
+    fn promotion_label_is_bound_to_producer_not_unhashed_execution_annotation() {
+        let dir = canonical_tempdir();
+        let repo = Repository::init(dir.path()).unwrap();
+        let previous_head = hash_bytes(b"previous");
+        for (profile, expected_message, wrong_kind) in [
+            (
+                kio_adapter::catalog::standard_online_markdownize_profile(),
+                "online Markdownize promotion",
+                "offline_api",
+            ),
+            (
+                kio_adapter::local_ocr_markdownize::profile_for(
+                    kio_adapter::local_ocr_markdownize::LocalOcrExecution::Real,
+                ),
+                "local Markdownize promotion",
+                "online_api",
+            ),
+        ] {
+            let lock = super::promoted_markdown_tool_lock(&repo, &profile).unwrap();
+            let mut state = super::stage_promotion(&repo, &previous_head, lock).unwrap();
+            assert_eq!(
+                super::promotion_messages(&state).unwrap().0,
+                expected_message
+            );
+            state.staged_tool_lock["markdown"]["kind"] = serde_json::json!(wrong_kind);
+            assert_eq!(
+                kio_adapter::tool_lock::tool_lock_hash(&state.staged_tool_lock).unwrap(),
+                state.staged_tool_lock_hash,
+                "kind annotation is deliberately outside canonical identity"
+            );
+            // Use the actual journal APIs: this schema-valid annotation flip
+            // must not select the opposite route during recovery.
+            super::persist_promotion_state(repo.kio_dir(), &state).unwrap();
+            let loaded = super::load_promotion_state(repo.kio_dir())
+                .unwrap()
+                .unwrap();
+            assert!(super::promotion_messages(&loaded).is_err());
+            let recovery_error = super::recover_pending_online_promotion(&repo).unwrap_err();
+            assert_eq!(recovery_error.error_code(), "KIO-E-PROMOTION-RECOVERY-001");
+            assert!(
+                recovery_error
+                    .message()
+                    .contains("producer and execution annotation")
+            );
+            state.staged_tool_lock["markdown"]["tool_id"] =
+                serde_json::json!("unsupported_producer");
+            assert!(
+                super::promotion_messages(&state).is_err(),
+                "hash-bound identity tampering must fail before label selection"
+            );
+        }
+    }
+    #[test]
+    fn configured_local_pipeline_without_actual_refs_does_not_stamp_provenance() {
+        let dir = canonical_tempdir();
+        let repo = Repository::init(dir.path()).unwrap();
+        let profile = kio_adapter::local_ocr_markdownize::profile_for(
+            kio_adapter::local_ocr_markdownize::LocalOcrExecution::Real,
+        );
+        let path = repo.kio_dir().join("tool-lock.json");
+        let before = std::fs::read(&path).unwrap();
+        assert!(
+            !super::has_accepted_local_pipeline_ref(&repo, &BTreeMap::new(), &profile).unwrap()
+        );
+        let baseline = BTreeMap::from([(
+            "report.pdf".to_owned(),
+            kio_core::scope::PendingNormalizeRef {
+                expected_raw_hash: hash_bytes(b"raw"),
+                normalize: kio_core::dag::NormalizeRef {
+                    tool_profile_hash: hash_bytes(b"builtin-profile"),
+                    r#gen: 0,
+                    manifest_hash: hash_bytes(b"baseline-manifest"),
+                },
+            },
+        )]);
+        assert!(!super::has_accepted_local_pipeline_ref(&repo, &baseline, &profile).unwrap());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        assert!(
+            repo.head_commit_hash().unwrap().is_none(),
+            "fixture is an unborn first index"
+        );
     }
 }

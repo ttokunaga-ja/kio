@@ -47,10 +47,10 @@ use serde_json::{Value, json};
 
 use crate::bbox_annotation::{canonical_source_escape, validate_bbox as validate_annotation_bbox};
 use crate::http_policy::{
-    HttpPolicy, HttpResponse, authenticated_local_agent, read_json_bounded, require_success,
+    HttpPolicy, HttpResponse, local_peer_agent, read_json_bounded, require_success,
 };
 use crate::identity::tool_profile_hash;
-use crate::local_peer::{AuthenticatedLocalEndpoint, is_local_peer_tls_error};
+use crate::local_peer::{LocalEndpoint, is_local_peer_tls_error};
 use crate::mistral_ocr::{OcrImage, image_hash};
 use crate::traits::MarkdownizeAdapter;
 use crate::types::{
@@ -184,7 +184,7 @@ pub trait LocalOcrClient: Clone {
 /// Talks `POST {base_url}/layout-parsing` to a loopback pipeline service.
 #[derive(Debug, Clone)]
 pub struct EnvLocalOcrClient {
-    endpoint: AuthenticatedLocalEndpoint,
+    endpoint: LocalEndpoint,
     http_policy: HttpPolicy,
 }
 
@@ -194,7 +194,7 @@ impl EnvLocalOcrClient {
     /// pipeline is the case D7 was written for — a multi-page PDF can occupy
     /// the server for minutes with nothing on the socket.
     #[must_use]
-    pub fn new(endpoint: AuthenticatedLocalEndpoint, timeout_seconds: Option<u64>) -> Self {
+    pub fn new(endpoint: LocalEndpoint, timeout_seconds: Option<u64>) -> Self {
         Self {
             endpoint,
             http_policy: timeout_seconds
@@ -205,8 +205,8 @@ impl EnvLocalOcrClient {
 
 impl LocalOcrClient for EnvLocalOcrClient {
     fn layout_parse(&self, file_base64: &str, file_type: LayoutFileType) -> Result<Value> {
-        let url = format!("{}/layout-parsing", self.endpoint.base_url());
-        let response = authenticated_local_agent(&self.endpoint, self.http_policy)?
+        let url = self.endpoint.endpoint_url("/layout-parsing");
+        let response = local_peer_agent(&self.endpoint, self.http_policy)?
             .post(&url)
             .send_json(json!({
                 "file": file_base64,
@@ -1535,6 +1535,9 @@ const MOCK_ICON_PNG: &[u8] = b"\x89PNG\x0d\x0a\x1a\x0a\x00\x00\x00\x0dIHDR\x00\x
 /// cell, which GFM has no notation for and which the converter therefore leaves
 /// as raw HTML on purpose.
 ///
+/// Set to `network_error` to return the same retryable adapter error category as
+/// a local service connection failure, before synthesizing any response body.
+///
 /// It exists so the *refusal* can be exercised. Wiring a check and never seeing
 /// it fire is how the acceptance check came to be advisory in the first place.
 /// (Until 2026-08-06 this body was a plain `<table><tr><td>` — which the
@@ -1566,6 +1569,11 @@ impl MockLocalOcrClient {
 #[cfg(debug_assertions)]
 impl LocalOcrClient for MockLocalOcrClient {
     fn layout_parse(&self, _file_base64: &str, _file_type: LayoutFileType) -> Result<Value> {
+        if self.body_mode == Some(kio_core::test_control::LocalOcrBodyMode::NetworkError) {
+            return Err(AdapterError::Network(
+                "local OCR mock selected a retryable network failure".to_owned(),
+            ));
+        }
         if self.body_mode == Some(kio_core::test_control::LocalOcrBodyMode::Nonconforming) {
             // Parses fine — the refusal under test is the acceptance check's,
             // not this module's, so the page has to get all the way through
@@ -1753,6 +1761,27 @@ mod tests {
             controlled.layout_parse("", LayoutFileType::Image).unwrap(),
             before
         );
+    }
+
+    #[test]
+    fn local_ocr_network_error_selector_parses_and_returns_retryable_error() {
+        use kio_core::control::ControlHandle;
+        use kio_core::test_control::{
+            DebugTestControl, LocalOcrBodyMode, Selector, TestEnvGuard, test_env_lock,
+        };
+
+        let _lock = test_env_lock().lock().unwrap();
+        let _selector = TestEnvGuard::set(TEST_LOCAL_OCR_BODY_ENV, "network_error");
+        let parsed = DebugTestControl::from_env();
+        assert_eq!(
+            parsed.adapters.local_ocr_body,
+            Selector::Known(LocalOcrBodyMode::NetworkError)
+        );
+        let client = MockLocalOcrClient::from_control(&ControlHandle::new(parsed));
+        assert!(matches!(
+            client.layout_parse("", LayoutFileType::Pdf),
+            Err(AdapterError::Network(_))
+        ));
     }
 
     #[test]
