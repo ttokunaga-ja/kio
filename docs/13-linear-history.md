@@ -7,7 +7,7 @@
 旧 `parents` 配列と旧 format の移行・read/write 互換経路は置かない。別出力先への `export` と
 管理対象への `restore` は分離され、作業ファイルを含む journal 付き復元、preview、明示 recovery は実装済みである。
 以下の当初の設計理由・将来案と現行契約は区別し、CLI の詳細は [06-cli-spec.md](06-cli-spec.md) を正本とする。
-実装・試験の状況は [進捗記録](../tasks/v1-implementation-progress.md)、最終 3 OS 受入と次の改善は
+実装・試験の状況は [進捗記録](../tasks/v1-plan.md)、最終 3 OS 受入と次の改善は
 [実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md) を参照する。
 
 ## 1. 過去の状態を新しい commit として採用する

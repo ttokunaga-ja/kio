@@ -4,7 +4,7 @@
 //! # Written against a measured wire, not a guessed one
 //!
 //! Every shape below was recorded on real hardware on 2026-08-10 and lives in
-//! `tasks/gpu-reranker-verification.md` §5. That brief exists because the last
+//! `tasks/gpu-reranker-verification.md (git 56a6831)` §5. That brief exists because the last
 //! local adapter was written against an endpoint whose form was *known*, and
 //! the first real connection still found the response schema wrong in three
 //! places. Four things it measured are load-bearing here:
@@ -569,7 +569,7 @@ mod tests {
         );
     }
 
-    /// The recorded response from `tasks/gpu-reranker-verification.md` §5.2,
+    /// The recorded response from `tasks/gpu-reranker-verification.md (git 56a6831)` §5.2,
     /// verbatim. If the parser and the measured wire ever disagree, this is
     /// where it shows.
     #[test]

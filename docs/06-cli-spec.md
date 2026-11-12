@@ -33,7 +33,7 @@ scheduler executable と installation path の trust、および service の pri
 native scheduler の実機 lifecycle acceptance は OS ごとに別途実施する。service は `watch run` と同じ offline local reconciliation を起動し、egress、budget、secret の承認を追加しない。
 
 詳細: [変更検知](12-change-detection.md)、[実装契約](14-v1-runtime-contracts.md)、
-[検証状況](../tasks/v1-implementation-progress.md)。
+[検証状況](../tasks/v1-plan.md)。
 
 Kio の現在の CLI 契約。
 
@@ -188,7 +188,7 @@ kio evidence retarget <pointer> --at <commit> # exact-only read-only retarget。
 中断したatomic削除は再試行時に回復してから存在を確認する。既に削除が確定していれば
 残存intentを片付けて上記not-foundを返す。削除対象のcommit/treeの存在は要求しない。
 
-検証範囲と残差は [実行記録](../tasks/v1-closeout-execution-2026-10-03.md) を参照する。
+検証範囲と残差は [実行記録](../tasks/v1-plan.md) を参照する。
 3 OSの最終候補受入・配布と、後続の引用への影響表示は別の完成条件である。
 
 ### Embedding モデル

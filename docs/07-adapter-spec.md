@@ -334,7 +334,7 @@ OOM は scope 全体を終了させ、task 上限への抵触や資源情報の�
 確認できない場合は成功を返さない。親終了時の停止に加え、systemd の有限 runtime と
 明示した全プロセスへの SIGKILL を独立した終了手段とする。renderer には user bus、
 host cgroup / procfs、制御 descriptor を渡さず、既存の filesystem / network 隔離を保つ。
-この契約の実装・試験状況は [v1 実装記録](../tasks/v1-implementation-progress.md) に記録し、
+この契約の実装・試験状況は [v1 実装記録](../tasks/v1-plan.md) に記録し、
 前提検査の成功だけで実変換や native Actions の合格とは扱わない。
 
 **XLSX の unit 化 (実装フィードバック 2026-07-25 — 上の「対象外」を解除)**: XLSX は
@@ -769,8 +769,7 @@ require_command_confirmation = true
 >
 > **enforcement の単位は変えない** — §7.1 のとおり AdapterRun 1 回 (= 1 request / job) に
 > 適用する。上書きが変えるのは値だけであり、適用対象・適用時点は共通である。
-> `offline_api` の既定値は Stage 3 のローカル OCR 実測をもって確定する
-> ([tasks/local-adapter-plan.md](../tasks/local-adapter-plan.md))。
+> `offline_api` の既定値は Stage 3 のローカル OCR 実測をもって確定する。
 > なお `max_input_bytes` など他のキーも同じ機構で上書きできるが、**現時点で
 > execution_mode 差を必要とするのは `timeout_seconds` のみ**である。
 >

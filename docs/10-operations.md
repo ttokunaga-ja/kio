@@ -1113,8 +1113,6 @@ current-format の recovery は別契約である。fresh / missing derived SQLi
 
 format change が新しい `KIO_FORMAT_VERSION` を選択した時点で、旧 version は直ちに non-current となる。semver / CHANGELOG は変更を記録するが、migration、dual-read、read-only compatibility を認可しない。独立して version を持つ他の interface はそれぞれの validation 規約に従う。
 
-撤去の追跡は [tasks/pre-release-legacy-removal.md](../tasks/pre-release-legacy-removal.md) にある。
-
 **tree schema v2/v3 (2026-07-18 確定)**: tree entry へ `normalize.manifest_hash`、tree object へ
 `chunking_config_hash` (v2) と `chunk_set_hash` (v3 — 公開 chunk 集合の digest) を追加した
 ([03-data-model.md §8](03-data-model.md)) — hash/identity 規約の変更だが、

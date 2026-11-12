@@ -570,7 +570,7 @@ result 行は**検証可能な span** を指し (`kio evidence verify` が成立
   - **起こる条件は運ではない。**[04-pipeline.md §4.1](04-pipeline.md) の分割規則 5 は
     window 内の最後の空行で切り、空行が 1 つも無いときだけ文字位置で切る。
     したがって参照が分断されるのは **`max_chars` より長い「空行を含まない連続領域」の
-    内側だけ**である (実測は `tasks/local-adapter-plan.md` の V7)
+    内側だけ**である (実測は `tasks/local-adapter-plan.md (git 56a6831)` の V7)
 
 - **面積が下限に満たない画像は列挙から外す。** 同一 unit が記録した最大の図
   ([07-adapter-spec.md §5.2](07-adapter-spec.md) の `metadata["images"][].bbox`) に対する

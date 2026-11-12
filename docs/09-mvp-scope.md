@@ -74,7 +74,7 @@ grant、trust、ledger authority を作成・継承しない。
 - semantic diff / perceptual reuse
 - Summary / Classification adapters
 
-`tasks/` は過去の受入記録であり、現在の契約や将来実装を承認する文書ではない。
+`tasks/` には現在の計画、任意の検証手順、v1 後の設計と履歴がある。現在の工程は [v1 plan](../tasks/v1-plan.md) を参照する。
 
 v2 は GUI で CLI の全機能を提供し、履歴の選択と最新版への復元を含む。v3 は cloud sharing、
 collaboration、複数利用者を扱う。revert の transaction、CLI、線形履歴 schema は未決の提案であり、
@@ -96,8 +96,7 @@ Step 4: export + --at + time-travel + purge 最小形 (tombstone) + evidence ver
 ```
 
 Step は Phase 1〜3 の実装順序の記録である。現在の v1 工程は
-[v1完成計画](../tasks/v1-completion-plan-2026-09-08.md) と
-[受入完了計画](../tasks/v1-acceptance-closeout-plan-2026-10-03.md) を参照する。
+[v1 plan](../tasks/v1-plan.md) を参照する。
 
 2026-10-05 に旧上限 (テスト除き 11,000〜16,000 行、ripgrep 以下) を廃止した。v1 は 3 OS の
 handle-bound 保存、送信承認、課金台帳、回復、監視を含み、旧上限の前提を外れた。上限は実測した
@@ -163,7 +162,7 @@ R2 で 98,084 行に収めた後、R3 の型付き response と、thread-local �
 
 - 上限と分離規則は `kio-ci` の `kio-code-limits` で計測し、CI で検査する。終了値は違反なしで 0、
   違反ありで 1、計測失敗で 2 とする。R 工程の途中の扱いは
-  [受入完了計画 §10](../tasks/v1-acceptance-closeout-plan-2026-10-03.md) に従う。
+  [v1 plan](../tasks/v1-plan.md) に従う。
 - 上限を超える変更は、同じ変更の中で削減する。上限自体の変更は利用者の承認を得て、理由と日付を本節に記録する。
 - 上限は設計肥大化の検知に使う。行数を減らすために必要な検証、エラー処理、回復処理を削らない。
 

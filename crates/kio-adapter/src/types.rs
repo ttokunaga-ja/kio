@@ -478,7 +478,7 @@ pub struct RerankedCandidate {
     /// The model's relevance score.
     ///
     /// **Not comparable across models, and not a probability.** Measured
-    /// 2026-08-10 (`tasks/gpu-reranker-verification.md` §5.7): `bge-reranker-v2-m3`,
+    /// 2026-08-10 (`tasks/gpu-reranker-verification.md (git 56a6831)` §5.7): `bge-reranker-v2-m3`,
     /// `ruri-v3-reranker-310m` and `japanese-reranker-cross-encoder-large-v1`
     /// return values in (0,1), while `japanese-reranker-base-v2` returns an
     /// unbounded −11.2 … +4.5 and stays unbounded even with `use_activation`

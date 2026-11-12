@@ -5,8 +5,7 @@ Status: **historical (2026-11-13, [docs/decisions.md](../docs/decisions.md) D-20
 This document fixes the procedure for collecting new, distribution-bound manual
 evidence for Phase 4 milestones M1--M8. It does not amend the normative product
 contracts in `docs/`, authorize Kio internal Full, or convert any historical or
-automated result into manual acceptance. `tasks/phase4-current-evidence-audit.md`,
-`docs/09-mvp-scope.md`, `docs/10-operations.md`, and
+automated result into manual acceptance. `docs/09-mvp-scope.md`, `docs/10-operations.md`, and
 `tasks/manual-full-cold-gates.md` remain authoritative for their respective
 boundaries.
 

@@ -12,7 +12,7 @@ use crate::{AdapterError, Result};
 pub(crate) const MODEL_CATALOG_MAX_BYTES: usize = 1024 * 1024;
 pub(crate) const EMBEDDING_RESPONSE_MAX_BYTES: usize = 8 * 1024 * 1024;
 /// A rerank response echoes each returned candidate's full text back
-/// (`tasks/gpu-reranker-verification.md` §5.2), so the bound scales with
+/// (`tasks/gpu-reranker-verification.md (git 56a6831)` §5.2), so the bound scales with
 /// `top_n` x chunk size rather than with a vector width. 05 §1.3's
 /// `candidate_depth` = 200 against 04 §4.2's 6,000-character chunk ceiling is
 /// ~1.2M characters worst case; 8 MiB leaves room for that in UTF-8 without

@@ -6,7 +6,7 @@
 > 正本 spec は `docs/04-pipeline.md` **§5.4 (Cost Guardrail / Kill Switch)** と **§5.8 (Online Batch
 > 投入の 2 相プロトコル)** — この 2 節が契約の源泉であり、期待値はすべてこの 2 節 (および 2 節が
 > 明示的に参照する隣接節) の規範文から導く。ID 体系・優先度規約・「未定義/曖昧の切り出し」方針は
-> `tasks/step2a-contract-tests.md` と現行 Rust behavior tests から継承するが、
+> `tasks/step2a-contract-tests.md (git 56a6831)` と現行 Rust behavior tests から継承するが、
 > 各契約の記法は本タスクの指示書 (`step4b-ledger-contract-instructions.md`) が定める
 > `### CL<連番> ... - 正本 / 前提 / 操作 / 期待` 形式に従う (自己完結)。
 

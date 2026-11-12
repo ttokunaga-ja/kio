@@ -6422,7 +6422,7 @@ fn ct3_l4_embedding_without_own_optin_is_enqueue_only() {
 }
 
 // ===========================================================================
-// Exploratory-audit fix regression tests (tasks/step3-bughunt-fixes.md, M2-M8
+// Exploratory-audit fix regression tests (tasks/step3-bughunt-fixes.md (git 56a6831), M2-M8
 // + acceptance scenarios (b)-(f) and the two previously-untested error codes).
 // ===========================================================================
 
@@ -6840,7 +6840,7 @@ fn minor_evidence_scope_ambiguous_error_code_is_emitted() {
 }
 
 // ===========================================================================
-// Second exploratory-audit round (tasks/step3-bughunt2-fixes.md, N1-N8):
+// Second exploratory-audit round (tasks/step3-bughunt2-fixes.md (git 56a6831), N1-N8):
 // acceptance scenarios (a)-(f). Scenario (g) (O(N²) chunking) lives as a timing
 // proxy in kio-index/src/chunking.rs (n6_chunking_scales_linearly...).
 // ===========================================================================
@@ -7060,7 +7060,7 @@ fn n7_online_flag_drives_embedding_enrichment() {
 }
 
 // ===========================================================================
-// Third exploratory-audit round (tasks/step3-bughunt3-fixes.md, O1-O7):
+// Third exploratory-audit round (tasks/step3-bughunt3-fixes.md (git 56a6831), O1-O7):
 // acceptance scenarios (a)-(f).
 // ===========================================================================
 
@@ -13414,7 +13414,7 @@ fn ct4_bbox_006_scanned_pdf_completes_without_churn() {
 }
 
 // ===========================================================================
-// R22: exploratory-audit round 22 fixes (tasks/step3-bughunt22-fixes.md).
+// R22: exploratory-audit round 22 fixes (tasks/step3-bughunt22-fixes.md (git 56a6831)).
 // ===========================================================================
 
 /// Step 4 historical search retains old path aliases. Renaming a Tier B path to a

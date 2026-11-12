@@ -2,7 +2,7 @@
 
 **状態:** §1〜§2（文書単位の結果、文書名の時点規則、`changed_at`、`snippet` の廃止）は **v1 後**（2026-11-13、[docs/decisions.md](../docs/decisions.md) D-20261113-01）。§3（`kio view`）と §4（画像）は実装済みで、契約の正本は [docs/05-runtime.md](../docs/05-runtime.md) §1.7。
 
-`tasks/rerank-image-space-design.md` の議論から派生し、そちらの結論を**一部上書きする**
+`tasks/rerank-image-space-design.md (git 56a6831)` の議論から派生し、そちらの結論を**一部上書きする**
 (§4)。画像の扱いは最終的にこちらが正本。
 
 ---
@@ -170,7 +170,7 @@ view にはヘッダコメントと unit 間の `"\n\n"` 結合が入る。
 
 ---
 
-# 4. 画像 — `rerank-image-space-design.md` の決定を上書きする
+# 4. 画像 — `tasks/rerank-image-space-design.md (git 56a6831)` の決定を上書きする
 
 ## 4.1 2 つのヒットの仕方
 
@@ -196,7 +196,7 @@ view にはヘッダコメントと unit 間の `"\n\n"` 結合が入る。
 
 ## 4.3 これは前の決定を取り消す
 
-`rerank-image-space-design.md` §4 は「画像オブジェクト行は**既定のランキングに
+`tasks/rerank-image-space-design.md (git 56a6831)` §4 は「画像オブジェクト行は**既定のランキングに
 出さない**」と確定させていた。**取り消す。**`auto` は通常 hybrid に解決するので、
 上の規則では既定でも画像が入る。
 
@@ -262,7 +262,7 @@ rrf_score = w_text/(k+text_rank) + w_vector/(k+vector_rank) + w_rerank/(k+rerank
 **留保 2 点:**
 
 - **`w_rerank` は未測定。**語レーンで、等重み融合が高精度レーンを引きずり下ろすのを
-  実測している (`tasks/word-lane-measurement.md`)。reranker は役割が違う
+  実測している (`tasks/word-lane-measurement.md (git 56a6831)`)。reranker は役割が違う
   (プールを広げるのではなく精度を上げる) が、**重みは測って決めること**
 - **測定済みの +0.125 は「順序を全置換」した場合の値。**融合版は**未測定**
 
@@ -291,7 +291,7 @@ rrf_score = w_text/(k+text_rank) + w_vector/(k+vector_rank) + w_rerank/(k+rerank
 `w_text = w_vector = 1.0` 固定で `w_rerank` を掃き、**全置換の 0.8750 を超えるか**を見る。
 超えなければ融合しない — 単純な方 (全置換 + 画像を rerank 対象から外す) が勝つ。
 低い重みを含めるのは、語レーンで**等重み融合が高精度レーンを引きずり下ろした**
-実測があるため (`tasks/word-lane-measurement.md`)。
+実測があるため (`tasks/word-lane-measurement.md (git 56a6831)`)。
 
 **24 問では 1 問 = 0.0417。これ未満の差は差ではない。**3 モデルが +0.125 で
 並んだのを同点と読んだのと同じ基準を当てる。

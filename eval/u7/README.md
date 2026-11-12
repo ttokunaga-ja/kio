@@ -1,6 +1,6 @@
 # U7 — serving 経路の image/text 同一空間 受け入れ検査
 
-`tasks/local-adapter-plan.md` の **U7**。ある serving 経路を採用してよいかを、
+`tasks/local-adapter-plan.md (git 56a6831)` の **U7**。ある serving 経路を採用してよいかを、
 **参照実装 (PyTorch) との数値一致**で決める。
 
 ## この検査が存在する理由

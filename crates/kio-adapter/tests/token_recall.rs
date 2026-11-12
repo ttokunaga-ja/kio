@@ -201,7 +201,7 @@ fn pages(capture: &Value) -> &[Value] {
 /// This read `markdown.text` straight out of the capture and called it what Kio
 /// indexes. That held until the adapter began recovering the `header`, `footer`
 /// and `number` blocks the service leaves out of that field
-/// (`tasks/furniture-text-recovery-design.md`). The raw field and the archived
+/// (`tasks/furniture-text-recovery-design.md (git 56a6831)`). The raw field and the archived
 /// text are now different strings, and reading the field would report text as lost
 /// while it sits in the index — the exact inverse of the failure this file exists
 /// to catch.

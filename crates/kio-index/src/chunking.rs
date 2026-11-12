@@ -214,7 +214,7 @@ pub fn chunk_normalized_instance(input: ChunkingInput) -> Result<Vec<ChunkRow>> 
                 // of 05 §1.3's `candidate_depth` slots, can never legitimately
                 // match a query, and collects a meaningless score from anything
                 // that ranks it — a reranker scored 36 of them across 24
-                // queries (`tasks/rerank-differential-plan.md` §2.9.3).
+                // queries (`tasks/rerank-differential-plan.md (git 56a6831)` §2.9.3).
                 //
                 // Dropping one shifts nothing: spans come from section ranges
                 // computed independently, and `section_id` numbering is

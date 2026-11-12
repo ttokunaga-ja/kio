@@ -102,16 +102,14 @@ cache = aggregator                       全 scope の chunk (live + 過去) の
 
 詳細は [09-mvp-scope.md](09-mvp-scope.md)。
 
-現在のv1実行工程は [v1完成計画](../tasks/v1-completion-plan-2026-09-08.md)、候補別の実装・検証は
-[進捗記録](../tasks/v1-implementation-progress.md) を参照する。2026-10-03承認の
-[保存・復元・引用保持の実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md) は、
-既存v1受入を維持し、後続に版別状態表示、既存tagによる引用保持、復元操作表示を追加する。
-直近の実行順序と最終候補の証跡は
-[既存v1の受入完了と文書整合](../tasks/v1-acceptance-closeout-plan-2026-10-03.md) を参照する。
-作業開始後の基準・tag/Unicode是正・環境確認・残るgateは
-[実行記録](../tasks/v1-closeout-execution-2026-10-03.md) を参照する。2026-10-06に承認した構造是正
-(OS 固有層の分離、kio-app の分解と型付き API) と文書削減は、同計画の §10 に含める。
-jj連携・引用bundle・文書lineageは着手条件付きの検討候補であり、追加機能はまだ実装済みではない。
+現在の計画・進捗・残作業は [v1 plan](../tasks/v1-plan.md)、利用者の決定は
+[decisions](decisions.md)、技術契約は上記の docs/01〜14、役割と運用は
+[AGENTS.md](../AGENTS.md) を参照する。
+
+`tasks/` には、計画のほかに、任意の高コスト検証の手順、v1 後の設計、正式な受入の経路の資料、
+テストが節番号で引用する試験仕様（`step4b-contract-tests-*.md`）だけを置く。コードや資料にある
+`tasks/<名前>.md (git 56a6831)` という表記は、2026-11-13 に削除した資料を指し、その commit で読める
+（`git show 56a6831:tasks/<名前>.md`）。
 
 ```
 Phase 1: Evidence 基盤    raw / normalized / chunk / Evidence Pointer

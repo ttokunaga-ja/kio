@@ -161,7 +161,7 @@ pub struct XlsxDocument {
     /// not exist yet (`image_object_hashes` is declared on `PrepareStageOutput`
     /// and `PrepareResponse` but nothing populates or reads it). Counting them
     /// here keeps the gap VISIBLE instead of dropping the images silently —
-    /// see tasks/step4b-backlog.md §7.2 I9.
+    /// see tasks/step4b-backlog.md (git 56a6831) §7.2 I9.
     pub media_paths: Vec<String>,
 }
 

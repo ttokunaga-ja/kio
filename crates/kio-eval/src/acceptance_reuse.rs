@@ -258,7 +258,7 @@ mod tests {
     fn documentation_ci_helpers_and_integration_tests_are_neutral() {
         for path in [
             "docs/09-mvp-scope.md",
-            "tasks/v1-closeout-execution-2026-10-03.md",
+            "tasks/v1-plan.md",
             "strategy/cloud-competitive-advantage.md",
             "crates/kio-ci/src/linux.rs",
             "crates/kio-ci/Cargo.toml",

@@ -25,7 +25,7 @@
 2026-09-07 に承認済みであり、開発版には監視・共通reconciliation・永続queue・user serviceの実装がある。
 実装の存在はv1全体の充足や3 OS受入完了を意味しない。対応と後続改善は
 [12-change-detection.md](12-change-detection.md)、候補別の検証は
-[実装進捗](../tasks/v1-implementation-progress.md) を参照する。
+[実装進捗](../tasks/v1-plan.md) を参照する。
 
 ## 2. 正本と復旧
 
@@ -60,7 +60,7 @@ v2 は GUI で CLI の全機能を提供し、履歴選択と最新版への復�
 collaboration、複数利用者と user/group ACL を扱う。ブランチを持たず現在の HEAD の子として過去状態を復元する
 方針は 2026-09-07 に承認済みである。transaction、CLI、schema の詳細は実装契約として別途固定する。
 設計は [13-linear-history.md](13-linear-history.md)、工程と受入条件の提案は
-[v1-implementation-plan.md](../tasks/v1-implementation-plan.md) に記録する。
+[tasks/v1-plan.md](../tasks/v1-plan.md) に記録する。
 
 安定版前は破壊的変更を許可する。後方互換性、alias、migration は要求しない。旧 format は明示的に
 reject し、曖昧な読み替えをしない。ただし、breaking code は knowledge や利用者ファイルを破棄する

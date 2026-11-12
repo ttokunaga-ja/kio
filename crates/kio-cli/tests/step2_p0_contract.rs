@@ -1652,7 +1652,7 @@ fn ct2_budget_005_online_success_records_ledger_and_caps_next_task() {
     assert!(status["budget"].get("folder_per_adapter").is_none());
 }
 
-// R11-2: the batch-side Then of CT2-BUDGET-005 (tasks/step2a-contract-tests.md) —
+// R11-2: the batch-side Then of CT2-BUDGET-005 (tasks/step2a-contract-tests.md (git 56a6831)) —
 // finally verified. A `batch resume` that drives a Pending online task straight into
 // a budget pause THIS pass must exit 6 (docs/04 §5.6), print its full result JSON to
 // stdout (tasks_paused > 0), and leave the task Paused/budget_exceeded. Before R11-2

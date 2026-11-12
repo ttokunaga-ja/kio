@@ -7,7 +7,7 @@ service lifecycle、起動・定期・通知欠落時の再照合は実装され
 backlog、監視能力の低下、最終成功時刻、最終失敗がある。ただし、個々のファイルの版ごとに
 原本保存・抽出・全文検索・embedding の準備状態を示す機能は今後の改善である。
 実装と 3 OS の最終受入は別の判定とし、現行候補の最終受入完了は主張しない。
-[v1 進捗記録](../tasks/v1-implementation-progress.md)、[今後の実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md)、
+[v1 進捗記録](../tasks/v1-plan.md)、[今後の実装計画](../tasks/knowledge-ux-implementation-plan-2026-10-03.md)、
 [製品要求](11-product-requirements.md) を参照する。
 
 ## 1. 方針

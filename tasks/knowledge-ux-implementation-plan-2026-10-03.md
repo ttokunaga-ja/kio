@@ -12,7 +12,7 @@
 巻き戻さない。jj の保存基盤、分岐・rebase、ライブラリ依存は本工程に導入しない。
 
 製品要件の正本は [docs/11](../docs/11-product-requirements.md)、現行 CLI の正本は
-[docs/06](../docs/06-cli-spec.md)。既存 [v1完成計画](v1-completion-plan-2026-09-08.md) の
+[docs/06](../docs/06-cli-spec.md)。既存 [v1 plan](../tasks/v1-plan.md) の
 M0〜M7・A01〜A12と受入条件を維持し、本書の後続改善を v1 の追加待ち条件にしない。
 
 ## 2. 調査時点の基準と差分
@@ -25,7 +25,7 @@ M0〜M7・A01〜A12と受入条件を維持し、本書の後続改善を v1 の
 | GitHub main | `1ffdd0ca1bc9fba9ec0a5b0b8c58302daac80545` | 比較資料のソース基準と一致 |
 | 最新配布版 | `v0.1.0-rc.3` / `1df10f248b73910349f80f45c30f801b5bfef5f5` | 現行 main の機能と同一とは扱わない |
 | 公開 main の CI | [run 36287581490](https://github.com/ttokunaga-ja/kio/actions/runs/36287581490) | macOS SDK準備、Windows Clippy、Linux renderer環境導入が失敗 |
-| ローカル最終候補 | [実装・受入記録](v1-implementation-progress.md) | 全回帰、最終差分のsecurity検証、配布物、同一SHAのnative受入が残る |
+| ローカル最終候補 | [v1 plan](../tasks/v1-plan.md) | 全回帰、最終差分のsecurity検証、配布物、同一SHAのnative受入が残る |
 
 既存機能と追加対象を区別する。
 
@@ -62,9 +62,9 @@ K0〜K6は本計画の識別子であり、既存M0〜M7・A01〜A12を置き換
 
 K3の設計準備はv1受入を待たず進められるが、K4〜K6の製品変更はK2の候補に混ぜない。
 2026-10-06に、K2へ構造是正（R工程）と文書削減（D工程）を加えた。K4以降はR工程で作るkio-appの
-型付きAPIの上に実装する（[受入完了計画 §10・§11](v1-acceptance-closeout-plan-2026-10-03.md)）。
+型付きAPIの上に実装する（[v1 plan](../tasks/v1-plan.md)）。
 承認後のK0〜K2の実行工程、現在の残差、最終51件matrixは
-[既存v1の受入完了と文書整合の計画](v1-acceptance-closeout-plan-2026-10-03.md) に具体化した。
+[v1 plan](../tasks/v1-plan.md) に具体化した。
 工程日数はK0で残差と実行環境を確認してから見積もる。未準備のnative/provider環境を実装日数に
 埋め込んだ固定納期は置かない。
 
@@ -170,5 +170,5 @@ jjのCLI/ライブラリAPIには安定性の制約があるため、連携時�
 ## 10. 文書反映の記録
 
 2026-10-03: K1の文書整合作業として本計画を追加し、README、docs/06・08・11・12・13と索引、
-既存v1完成計画に対応を反映した。実施範囲は文書変更と差分・リンク・CLIソースとの照合であり、
+既存v1 planに対応を反映した。実施範囲は文書変更と差分・リンク・CLIソースとの照合であり、
 K2〜K6の製品実装、ビルド、追加受入ケース、Actions、配布公開はこの作業では実行していない。

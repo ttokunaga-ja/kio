@@ -15,12 +15,12 @@ Secondary framing: *evidence-grounded local knowledge archive*.
 Current development includes watch, managed restore, and recovery changes beyond
 that release. v1 acceptance is incomplete; implementation, local checks,
 three-OS acceptance, and packaged-binary verification are recorded separately in
-[the implementation record](tasks/v1-implementation-progress.md).
+[the v1 plan](tasks/v1-plan.md).
 The CLI surface can still change. There is no GUI.
 
 Development now uses storage format **3.0.0** for corrected Unicode tag identity.
 Older stores, including 2.0.0, are rejected without changing their bytes; no
-migration command is provided. See [the closeout execution record](tasks/v1-closeout-execution-2026-10-03.md).
+migration command is provided. See [the v1 plan](tasks/v1-plan.md).
 
 ---
 
@@ -156,12 +156,12 @@ Kio は、手元にある PDF・Office 文書・画像・コード・メモを�
 **状態: プレリリース。** 2026年10月3日時点の最新配布版は
 [`v0.1.0-rc.3`](https://github.com/ttokunaga-ja/kio/releases/tag/v0.1.0-rc.3) です。
 開発版には、その配布版以降の監視・管理対象復元・回復の変更があります。v1受入は未完了であり、
-実装・ローカル検証・3 OS受入・配布物確認は [進捗記録](tasks/v1-implementation-progress.md) で
+実装・ローカル検証・3 OS受入・配布物確認は [v1計画](tasks/v1-plan.md) で
 区別しています。CLI の仕様は変わりえます。GUI はありません。
 
 開発版の保存形式は、Unicode tag規則を是正した **3.0.0** です。2.0.0を含む旧storeは
 bytesを変更せず拒否します。移行コマンドは提供しません。
-[受入作業の実行記録](tasks/v1-closeout-execution-2026-10-03.md) を参照してください。
+[v1計画](tasks/v1-plan.md) を参照してください。
 
 ## 中核 3 点
 

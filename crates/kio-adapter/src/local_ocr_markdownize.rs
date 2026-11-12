@@ -273,7 +273,7 @@ pub struct LayoutParsedPage {
 ///
 /// **This is an observation, never a judgment.** "The provider labelled this span
 /// `footer`" can be measured; "this span is furniture" cannot — see
-/// `tasks/furniture-text-recovery-design.md` §2, where the label, the position and
+/// `tasks/furniture-text-recovery-design.md (git 56a6831)` §2, where the label, the position and
 /// the size were each measured against the nine captures and each failed to
 /// separate the twelve dropped blocks into furniture and body. One `footer` holds
 /// `Type a message...` and another holds `All critical tokens detected…`.
@@ -1976,7 +1976,7 @@ mod tests {
     /// slip's title and deadline, an infographic's closing summary — and no
     /// measurable property separates the two groups, so dropping the class to be
     /// rid of the status bars takes the body with it. See
-    /// `tasks/furniture-text-recovery-design.md`.
+    /// `tasks/furniture-text-recovery-design.md (git 56a6831)`.
     #[test]
     fn text_the_service_recognised_and_omitted_is_recovered_into_the_unit() {
         let body = page_body(

@@ -125,7 +125,7 @@ these three settings were applied and read back. Windows/WSL account, key,
 dispatcher installation, and SSH configuration changes were additionally
 approved with the detailed execution plan on 2026-10-04. They remain unapplied
 until the final candidate bundle is regenerated and validated. See the dated
-[execution record](../../tasks/v1-closeout-execution-2026-10-03.md) for evidence
+[v1 plan](../../tasks/v1-plan.md) for evidence
 and candidate-specific validation; no authenticated-local receipt is claimed.
 On 2026-09-26, the account's Daybreak Blue entitlement was
 confirmed. Collaboration invocation lacked `access_programs.cyber=daybreak_blue`;

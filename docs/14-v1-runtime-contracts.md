@@ -1,9 +1,8 @@
 # v1 implementation contracts
 
-This document fixes implementation choices from the approved
-[v1 plan](../tasks/v1-implementation-plan.md). It is a contract, not a statement
-that every implementation or native acceptance test is complete. Actual evidence
-is tracked in [the implementation record](../tasks/v1-implementation-progress.md).
+This document records v1 implementation contracts. User decisions are collected in
+[decisions](decisions.md). Implementation and acceptance progress is tracked in
+the [v1 plan](../tasks/v1-plan.md).
 
 ## Authority and stored information
 

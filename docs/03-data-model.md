@@ -148,7 +148,7 @@ names 行は残す [06-cli-spec.md §1](06-cli-spec.md))。同一 digest の複�
 同UCDの未割当tag文字を拒否する。sigmaの `Σ` / `σ` / `ς` は同じslotになり、`ß` と `ss` は
 別slotである。Turkic foldingや複数文字へ展開するfull foldingは使わない。
 保存先hashが変わる名前があるため、保存形式3.0.0で旧規則と区別する。
-是正と最終候補の検証状態は [実行記録](../tasks/v1-closeout-execution-2026-10-03.md) を参照する。
+是正と最終候補の検証状態は [実行記録](../tasks/v1-plan.md) を参照する。
 
 **format_version**: 旧称 `VERSION 0.1.0` (旧 research/kio.md) は `kio_format_version` に統一。semver は [10-operations.md §11.5](10-operations.md) 参照。**保存場所 = `.kio/scope.json` の必須 `kio_format_version` フィールド** (init 時に current version を記録する)。現在の保存形式は `KIO_FORMAT_VERSION = "3.0.0"`。これは製品の release/Cargo version や製品v2/v3の到達状態とは独立した storage format である。3.0.0はtagのUnicode identity是正を含む。current reader は `KIO_FORMAT_VERSION` と**完全一致**する string だけを受理する。2.0.0を含む旧形式、欠落、非 string、非 parseable、older/newer、未知を含む任意の不一致は current schema ではなく **incompatible format** として、`KIO-E-STORE-VERSION-001` / exit 8 で store bytes を変更せず fail-closed にする。**この完全一致判定は scope.json の schema validation より先に評価する**。reader / search / repair / historical を含む全 command に read-only、migration、old-reader の例外はなく、multi-scope search も当該 scope を除外して partial success を返さず command 全体を停止する。具体挙動は [10-operations.md §11.5](10-operations.md) が正本。
 

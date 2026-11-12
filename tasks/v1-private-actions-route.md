@@ -7,7 +7,7 @@ Environmentには専用SSH秘密鍵1件と接続・認証情報5件を登録し�
 2026-10-04に詳細実行計画が承認され、Windows/WSLの専用アカウント・鍵登録・
 dispatcher配置・SSH設定と条件付き復旧の本適用も承認範囲に入った。まだ未適用であり、
 最終候補に束縛したbundleの更新・検証とローカル回帰の後に進める。既存Mac/admin接続は維持されている。
-最新の状態と検証範囲は[実行記録](v1-closeout-execution-2026-10-03.md)を参照する。
+最新の状態と検証範囲は[v1計画](../tasks/v1-plan.md)を参照する。
 private CI routeとauthenticated local acceptanceの完了は主張しない。
 
 ## 2026-09-26までの事前確認状態
