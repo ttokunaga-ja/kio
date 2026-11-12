@@ -1,6 +1,6 @@
 # 検索結果の返し方と表示 — 設計
 
-**状態: 方針確定。実装前。** [2026-08-11]
+**状態:** §1〜§2（文書単位の結果、文書名の時点規則、`changed_at`、`snippet` の廃止）は **v1 後**（2026-11-13、[docs/decisions.md](../docs/decisions.md) D-20261113-01）。§3（`kio view`）と §4（画像）は実装済みで、契約の正本は [docs/05-runtime.md](../docs/05-runtime.md) §1.7。
 
 `tasks/rerank-image-space-design.md` の議論から派生し、そちらの結論を**一部上書きする**
 (§4)。画像の扱いは最終的にこちらが正本。

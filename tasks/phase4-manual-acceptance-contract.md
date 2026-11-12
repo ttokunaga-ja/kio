@@ -1,6 +1,6 @@
 # Phase 4 manual acceptance contract (`v0.1.0-rc.1`)
 
-Status: **approved manual replay procedure; no manual acceptance established**.
+Status: **historical (2026-11-13, [docs/decisions.md](../docs/decisions.md) D-20261113-03)**. This RC.1 procedure is not a v1 completion condition and is not run again. No manual acceptance was established under it.
 
 This document fixes the procedure for collecting new, distribution-bound manual
 evidence for Phase 4 milestones M1--M8. It does not amend the normative product

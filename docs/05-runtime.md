@@ -439,7 +439,9 @@ commit/evidence export は ancestry walk を必要としない。
         { "image_uri": "kio://scope_01J8ZQ.../object/image/sha256:a1b2...", "order": 0 }
       ],
       "score": 0.87,
-      "scope_path": "/Users/foo/Research/.kio"
+      "scope_path": "/Users/foo/Research/.kio",
+      "title": "report.pdf",
+      "snippet": "API Token は ..."
     }
   ]
 }
@@ -499,48 +501,24 @@ Kio の主たる消費者は LLM Agent であり ([06-cli-spec.md §9](06-cli-sp
 | `evidence_pointer` | **引用の不変固定**。time-travel と `kio evidence verify` が成立する | 常に必須 (従来どおり) |
 | `payload_uri` | **Agent が `kio open` して実体を得るハンドル** | `result_type: "chunk"` では省略 (実体は chunk 自身であり `evidence_uri` が既にそれを指す) |
 | `related_images[]` | この chunk 本文が参照している画像の列挙。`{image_uri, order}` の配列 | **空なら field ごと省略**。かつ `result_type: "chunk"` の行のみ (image 行では列挙対象が「参照元 chunk の図」になり、その先頭は自分自身の `payload_uri` である) |
-| ~~`snippet`~~ | **廃止 (2026-08-11、§1.7.1)。**クリックで正規化 Markdown 全体を表示するため、リストに抜粋を載せる意味が無い | 返さない |
-| `title` | **検索している時点の文書名** (§1.7.1 の時点規則)。従来は `path_at_commit` の字面 | 常に必須。意味は型に依らない (どちらの行も同じ chunk pointer を指す) |
-| `changed_at` | **内容が最後に変わった commit の日時** (§1.7.1)。resolver が選んだ qualifying publication introduction の日時。リネームでは動かない | 常に必須 |
+| `snippet` | chunk 本文の先頭 200 文字。本文そのものは返さない (実体は `kio view` / `kio open` で取得する) | `result_type: "chunk"` の行のみ。image 行では省略 (その行は chunk ではないため) |
+| `title` | `evidence_pointer.path_at_commit` と同じ値 | 常に必須 |
 
-### 1.7.1 結果は文書単位 (2026-08-11 確定)
+### 1.7.1 文書単位の結果は v1 後
 
-設計の全文と経緯は
-[tasks/search-result-presentation-design.md](../tasks/search-result-presentation-design.md)。
+v1 の result 行は、上の規則どおり **alias 展開後の chunk 行**であり、`--limit` / `--offset` / cursor の
+単位もその行である。同じ内容のリネーム前後の path は別の行として返す。
 
-**(1) 集約 — 1 文書 1 行。**キーは **`(scope_id, raw_hash)`**。
+2026-08-11 に方針を決めた次の変更は **v1 に入れない** ([decisions.md](decisions.md) D-20261113-01)。
+設計は [tasks/search-result-presentation-design.md](../tasks/search-result-presentation-design.md) §1〜§2 に残す。
 
-- **リネーム (内容不変)** は `raw_hash` が同じなので **1 行に畳む。**同じ内容を
-  複数行見せる意味は無い
-- **編集**は `raw_hash` が変わるので**自然に別行**。特別扱いではない
-- **同一内容が複数 scope にある場合は畳まない。**バイト列が同一でも
-  **階層が違えばアクセス権が違いうる**ため、1 行に畳むと到達できない経路を
-  到達できるように見せるか、逆に隠す。**内容の同一性は権限の同一性を含意しない**
+- 結果を `(scope_id, raw_hash)` で 1 文書 1 行に畳み、ページングの単位を文書にする
+- `title` を「検索している時点の文書名」にする時点規則
+- `changed_at` (内容が最後に変わった commit の日時) の追加
+- `snippet` の廃止
 
-`--limit` / `--offset` / cursor の単位も**文書**になる (従来は chunk)。
-§1.4 の `max_per_raw_hash` は、集約後は「同一内容が複数 scope にある場合」にのみ
-効く上限として意味が変わる。
-
-**(2) 文書名 — 検索している時点の名前を返す。**
-
-| 検索 | `title` |
-|---|---|
-| 現行ツリー | 現在の名前 |
-| `--at C` | **C 時点の名前** |
-| `--all-history` | その内容が存在した**最後の commit 時点の名前** |
-
-**`raw_hash` に path を混ぜない** ([03-data-model.md §5](03-data-model.md) の
-`sha256(原本バイト列)` を変えない)。混ぜると (a) `(raw_hash, tool_profile_hash)` の
-up-to-date 判定が外れてリネームだけで**再 OCR が走り**、(b) `chunk_hash` が
-`raw_hash` を入力に持つため**発行済み Evidence Pointer が全て切れ**、
-(c) content-addressed store の dedup 前提が崩れる。**path は commit の tree が
-持っており失われていない** — 足りなかったのは「どの時点の視点で名前を出すか」の
-規則だけだった。
-
-**(3) 本文はリストに載せない。**`--limit` は最大 100 で、全文を載せると応答が
-桁違いになる。加えて result 行が**検証可能な span** を指すことが
-`kio evidence verify` を成立させている。**リストは span、実体は別途取得**の二段。
-`snippet` の廃止も同じ理由による。
+**検索応答に本文の全文は載せない。**`--limit` は最大 100 で、全文を載せると応答が桁違いになる。
+result 行は**検証可能な span** を指し (`kio evidence verify` が成立する)、実体は別途取得する。
 
 ### 1.7.2 選択したときに表示するもの (2026-08-11 確定)
 
