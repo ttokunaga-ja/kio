@@ -1,4 +1,4 @@
-use crate::error::{IoResultExt, KioError, Result};
+use crate::error::{IoResultExt, Result};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Arc;
@@ -55,16 +55,7 @@ pub(crate) fn same_repair_quarantine(
         && source.dev() == quarantined.dev()
         && source.ino() == quarantined.ino())
 }
-pub(crate) fn private_bound_temp_is_safe(file: &File, label: &str) -> Result<bool> {
-    let metadata = cap_primitives::fs::Metadata::from_file(file)
-        .map_err(|error| KioError::io(error.to_string(), label))?;
-    Ok(metadata.is_file() && super::cas_io::bound_metadata_single_link(&metadata))
-}
 pub(crate) fn configure_removal_root(options: &mut OpenOptions) {
     use std::os::unix::fs::OpenOptionsExt;
     options.custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK);
-}
-pub(crate) fn configure_private_temp(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
 }

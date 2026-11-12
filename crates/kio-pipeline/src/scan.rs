@@ -1855,6 +1855,18 @@ fn is_xdg_state_inside_scope(scope_path: &Path, path: &Path) -> bool {
         .canonicalize()
         .unwrap_or_else(|_| scope_path.to_path_buf());
     let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    // Local execution records are operational state even when STATE is unset
+    // and HOME itself is indexed. Reserve only the active Kio-owned subtree;
+    // unrelated data under .local/state and prefix siblings remain knowledge.
+    let local_execution = kio_core::xdg::xdg_dir("XDG_STATE_HOME")
+        .or_else(|| kio_core::xdg::home_dir().map(|home| home.join(".local/state")))
+        .map(|state| state.join("kio/local-execution"));
+    if local_execution
+        .map(|root| root.canonicalize().unwrap_or(root))
+        .is_some_and(|root| path.starts_with(root))
+    {
+        return true;
+    }
     [
         "XDG_CONFIG_HOME",
         "XDG_DATA_HOME",
@@ -2184,22 +2196,15 @@ fn probe_case_insensitive(scope_path: &Path) -> bool {
             scope_path.to_path_buf()
         }
     };
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_nanos())
-        .unwrap_or_default();
-    let stem = format!(".kio-caseprobe-{}-{}", std::process::id(), nanos);
-    let lower = dir.join(format!("{stem}-a"));
-    let upper = dir.join(format!("{stem}-A"));
-    if std::fs::write(&lower, b"").is_err() {
+    let Ok(directory) = kio_core::store_dir::StoreDirectory::open(&dir) else {
+        return false;
+    };
+    if dir != scope_path
+        && kio_core::private_fs::verify_private_directory_handle(&directory).is_err()
+    {
         return false;
     }
-    let insensitive = upper.exists();
-    // On an insensitive FS `lower` and `upper` are the same inode, so removing `lower`
-    // clears both; on a sensitive FS `upper` was never created.
-    let _ = std::fs::remove_file(&lower);
-    let _ = std::fs::remove_file(&upper);
-    insensitive
+    probe_bound_case_insensitive(&directory.root_handle())
 }
 
 /// Descriptor-relative equivalent of [`probe_case_insensitive`]. The probe
@@ -2214,14 +2219,28 @@ fn probe_bound_case_insensitive(kio: &File) -> bool {
     let stem = format!(".kio-caseprobe-{}-{nanos}", std::process::id());
     let lower = format!("{stem}-a");
     let upper = format!("{stem}-A");
-    let mut options = cap_fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    if cap_fs::open(kio, Path::new(&lower), &options).is_err() {
+    let Ok(handle) = kio.try_clone() else {
         return false;
+    };
+    let Ok(directory) =
+        kio_core::store_dir::StoreDirectory::from_retained(handle, PathBuf::from(".kio"))
+    else {
+        return false;
+    };
+    let Ok(probe) = directory.create_private_file(Path::new(&lower)) else {
+        return false;
+    };
+    let Ok(created) = cap_fs::Metadata::from_file(&probe) else {
+        return false;
+    };
+    let insensitive = cap_fs::stat(kio, Path::new(&upper), cap_fs::FollowSymlinks::No)
+        .is_ok_and(|metadata| same_cap_file_identity(&created, &metadata));
+    let unchanged = cap_fs::stat(kio, Path::new(&lower), cap_fs::FollowSymlinks::No)
+        .is_ok_and(|metadata| same_cap_file_identity(&created, &metadata));
+    drop(probe);
+    if unchanged {
+        let _ = cap_fs::remove_file(kio, Path::new(&lower));
     }
-    let insensitive = cap_fs::stat(kio, Path::new(&upper), cap_fs::FollowSymlinks::No).is_ok();
-    let _ = cap_fs::remove_file(kio, Path::new(&lower));
-    let _ = cap_fs::remove_file(kio, Path::new(&upper));
     insensitive
 }
 

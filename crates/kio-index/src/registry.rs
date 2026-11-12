@@ -15,15 +15,17 @@ use std::{
 };
 
 use cap_primitives::fs as cap_fs;
-use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+#[cfg(test)]
+use rusqlite::Connection;
+use rusqlite::{OpenFlags, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
-use crate::Result;
 use crate::platform::{
     FileIdentity, PrivateSnapshotStorage, RegistryParentBinding, fresh_registry_parent_binding,
     leaf_identity, observe_leaf, prepare_registry_writer, stable_registry_parent_binding,
     validate_regular,
 };
+use crate::{IndexError, Result};
 #[cfg(test)]
 use std::path::Component;
 
@@ -55,7 +57,7 @@ pub struct ScopeRegistrationRebind {
 }
 
 pub struct RegistryDb {
-    conn: Connection,
+    conn: crate::platform::BoundSqliteConnection,
     // An inherited `/dev/fd/N` registry is opened through this duplicated
     // parent descriptor's procfs path. Keep it alive until SQLite closes so a
     // caller retargeting the original descriptor cannot redirect the database.
@@ -584,7 +586,10 @@ fn snapshot_attempt(
     #[cfg(not(test))] _hooks: Option<&()>,
     #[cfg(test)] attempt: usize,
     #[cfg(not(test))] _attempt: usize,
-) -> std::result::Result<(Connection, RegistrySnapshot), SnapshotAttemptError> {
+) -> std::result::Result<
+    (crate::platform::BoundSqliteConnection, RegistrySnapshot),
+    SnapshotAttemptError,
+> {
     #[cfg(test)]
     let hook = hooks.and_then(|hooks| hooks.snapshot.as_ref());
     let parent = binding.parent.as_ref();
@@ -668,12 +673,17 @@ fn snapshot_attempt(
         ));
     }
     let snapshot_path = storage.path().join(PRIVATE_REGISTRY_MAIN);
-    let conn = match Connection::open_with_flags(
+    let private_parent = kio_core::store_dir::StoreDirectory::from_retained(
+        private_dir
+            .try_clone()
+            .map_err(|error| SnapshotAttemptError::Unstable(error.to_string()))?,
+        storage.path().to_path_buf(),
+    )
+    .map_err(|error| SnapshotAttemptError::Unsafe(error.to_string()))?;
+    let conn = match crate::platform::open_private_registry_snapshot(
         &snapshot_path,
-        // The snapshot directory is private and owned.  Do not pass NOFOLLOW
-        // here: SQLite's Unix VFS applies it to the private SHM sidecar too,
-        // preventing the read-only handle from initializing that private file.
-        OpenFlags::SQLITE_OPEN_READ_ONLY,
+        &private_parent,
+        &storage,
     ) {
         Ok(conn) => conn,
         Err(error) => {
@@ -682,7 +692,12 @@ fn snapshot_attempt(
                 parent_path,
                 main,
                 &initial,
-                sqlite_snapshot_error(error, "open registry snapshot", false),
+                match error {
+                    IndexError::Sqlite(error) => {
+                        sqlite_snapshot_error(error, "open registry snapshot", false)
+                    }
+                    error => SnapshotAttemptError::Unsafe(error.to_string()),
+                },
             ));
         }
     };
@@ -771,6 +786,41 @@ fn snapshot_attempt(
             _storage: storage,
         },
     ))
+}
+
+pub(crate) fn prepare_private_registry_writer(
+    path: &Path,
+) -> Result<(PathBuf, Option<kio_core::store_dir::StoreDirectory>)> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|error| IndexError::Schema(error.to_string()))?
+            .join(path)
+    };
+    let parent = absolute
+        .parent()
+        .ok_or_else(|| IndexError::Schema("registry writer path has no parent".into()))?;
+    let retained = kio_core::store_dir::StoreDirectory::open_or_create_directories(parent)
+        .map_err(|error| IndexError::Schema(error.to_string()))?;
+    kio_core::private_fs::verify_private_directory_handle(&retained)
+        .map_err(|error| IndexError::Schema(error.to_string()))?;
+    Ok((absolute, Some(retained)))
+}
+
+pub(crate) fn verify_private_registry_parent(
+    handle: &fs::File,
+    path: &Path,
+) -> std::result::Result<(), RegistrySnapshotError> {
+    let retained = kio_core::store_dir::StoreDirectory::from_retained(
+        handle
+            .try_clone()
+            .map_err(|error| RegistrySnapshotError::UnstableBusy(error.to_string()))?,
+        path.to_path_buf(),
+    )
+    .map_err(|error| RegistrySnapshotError::UnsafeIntegrity(error.to_string()))?;
+    kio_core::private_fs::verify_private_directory_handle(&retained)
+        .map_err(|error| RegistrySnapshotError::UnsafeIntegrity(error.to_string()))
 }
 
 impl RegistryDb {
@@ -916,7 +966,16 @@ impl RegistryDb {
         control: &kio_core::control::ControlHandle,
     ) -> Result<Self> {
         let (sqlite_path, inherited_parent) = prepare_registry_writer(path.as_ref(), control)?;
-        let conn = Connection::open(sqlite_path)?;
+        let parent = inherited_parent
+            .as_ref()
+            .ok_or_else(|| IndexError::Schema("registry writer has no retained parent".into()))?;
+        let conn = crate::platform::open_private_registry_connection(
+            &sqlite_path,
+            parent,
+            OpenFlags::SQLITE_OPEN_READ_WRITE
+                | OpenFlags::SQLITE_OPEN_CREATE
+                | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )?;
         // P6 (05 §1.8 / docs/05:565): serialize concurrent writers with WAL +
         // busy_timeout so a parallel `kio init`/`index` upsert waits (up to 5s)
         // for the write lock instead of hitting SQLITE_BUSY and silently dropping
@@ -1199,6 +1258,8 @@ fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<RegistryEntry> {
 mod tests {
     use super::*;
 
+    include!("private_test_fixtures.rs");
+
     #[cfg(debug_assertions)]
     #[test]
     fn owner_control_registry_reads_xdg_at_resolution_time() {
@@ -1261,8 +1322,8 @@ mod tests {
         }
     }
 
-    fn open_temp() -> (tempfile::TempDir, RegistryDb) {
-        let dir = tempfile::tempdir().unwrap();
+    fn open_temp() -> (PrivateTestDirectory, RegistryDb) {
+        let dir = private_test_dir();
         let db = RegistryDb::open(dir.path().join("scope-registry.sqlite")).unwrap();
         (dir, db)
     }
@@ -1276,6 +1337,36 @@ mod tests {
             .permissions(fs::Permissions::from_mode(0o700))
             .tempdir()
             .unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_and_snapshot_keep_registry_files_private_and_refuse_unsafe_main() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let (directory, db) = open_temp();
+        let path = directory.path().join("scope-registry.sqlite");
+        db.upsert(&entry("scope-private", "/scope-private", true, true))
+            .unwrap();
+        for child in fs::read_dir(directory.path()).unwrap() {
+            let child = child.unwrap();
+            let metadata = child.metadata().unwrap();
+            if metadata.is_file() {
+                assert_eq!(metadata.mode() & 0o777, 0o600, "{}", child.path().display());
+            }
+        }
+        let snapshot = RegistryDb::open_read_only(&path).unwrap();
+        assert_eq!(snapshot.all_entries().unwrap().len(), 1);
+        drop(snapshot);
+        drop(db);
+        let bytes = fs::read(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(RegistryDb::open(&path).is_err());
+        assert!(matches!(
+            RegistryDb::open_read_only(&path),
+            Err(RegistrySnapshotError::UnsafeIntegrity(_))
+        ));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
     }
 
     #[test]
@@ -1471,7 +1562,7 @@ mod tests {
 
     #[test]
     fn read_only_lookup_does_not_create_wal_sidecars_or_mutate_registry() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let wal_path = dir.path().join("scope-registry.sqlite-wal");
         let shm_path = dir.path().join("scope-registry.sqlite-shm");
@@ -1530,7 +1621,7 @@ mod tests {
 
     #[test]
     fn read_only_snapshot_sees_committed_uncheckpointed_wal_without_touching_source() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let wal = dir.path().join("scope-registry.sqlite-wal");
         let shm = dir.path().join("scope-registry.sqlite-shm");
@@ -1679,9 +1770,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn all_absent_whole_parent_substitution_is_unsafe_not_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let canonical_parent = dir.path().join("canonical");
-        fs::create_dir(&canonical_parent).unwrap();
+        private_test_subdirectory(&canonical_parent);
         let path = canonical_parent.join("scope-registry.sqlite");
         let moved_parent = dir.path().join("detached");
         let replacement_parent = canonical_parent.clone();
@@ -1689,7 +1780,7 @@ mod tests {
         let hook: SnapshotTestHook = std::sync::Arc::new(move |phase, attempt, _| {
             if attempt == 0 && phase == SnapshotTestPhase::AfterFinalManifestBeforeParentRecheck {
                 fs::rename(&replacement_parent, &moved_parent).unwrap();
-                fs::create_dir(&replacement_parent).unwrap();
+                private_test_subdirectory(&replacement_parent);
                 let replacement = RegistryDb::open(&replacement_path).unwrap();
                 replacement
                     .upsert(&entry("replacement", "/tmp/replacement", true, true))
@@ -1709,9 +1800,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn present_snapshot_whole_parent_substitution_is_unsafe() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let canonical_parent = dir.path().join("canonical");
-        fs::create_dir(&canonical_parent).unwrap();
+        private_test_subdirectory(&canonical_parent);
         let path = canonical_parent.join("scope-registry.sqlite");
         let original = RegistryDb::open(&path).unwrap();
         original
@@ -1724,7 +1815,7 @@ mod tests {
         let hook: SnapshotTestHook = std::sync::Arc::new(move |phase, attempt, _| {
             if attempt == 0 && phase == SnapshotTestPhase::AfterFinalManifestBeforeParentRecheck {
                 fs::rename(&replacement_parent, &moved_parent).unwrap();
-                fs::create_dir(&replacement_parent).unwrap();
+                private_test_subdirectory(&replacement_parent);
                 let replacement = RegistryDb::open(&replacement_path).unwrap();
                 replacement
                     .upsert(&entry("replacement", "/tmp/replacement", true, true))
@@ -1743,7 +1834,7 @@ mod tests {
 
     #[test]
     fn snapshot_final_all_absent_is_unstable_not_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let writer = RegistryDb::open(&path).unwrap();
         writer
@@ -1768,7 +1859,7 @@ mod tests {
 
     #[test]
     fn snapshot_absent_to_present_sidecar_is_unstable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let writer = RegistryDb::open(&path).unwrap();
         writer
@@ -1778,6 +1869,9 @@ mod tests {
         let shm = dir.path().join("scope-registry.sqlite-shm");
         let hook: SnapshotTestHook = std::sync::Arc::new(move |phase, _, _| {
             if phase == SnapshotTestPhase::AfterSnapshotQueryBeforeRecheck {
+                if !shm.exists() {
+                    drop(private_test_file(&shm));
+                }
                 fs::write(&shm, b"changed").unwrap();
             }
         });
@@ -1792,7 +1886,7 @@ mod tests {
     fn private_snapshot_preopen_sidecar_symlink_is_unsafe() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let writer = RegistryDb::open(&path).unwrap();
         writer
@@ -1815,7 +1909,7 @@ mod tests {
 
     #[test]
     fn private_snapshot_preopen_main_replacement_is_unsafe() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let writer = RegistryDb::open(&path).unwrap();
         writer
@@ -1841,7 +1935,7 @@ mod tests {
 
     #[test]
     fn snapshot_identity_replacement_is_unstable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let writer = RegistryDb::open(&path).unwrap();
         writer
@@ -1852,7 +1946,7 @@ mod tests {
         let source = path.clone();
         let hook: SnapshotTestHook = std::sync::Arc::new(move |phase, _, _| {
             if phase == SnapshotTestPhase::AfterSnapshotQueryBeforeRecheck {
-                fs::copy(&source, &replacement).unwrap();
+                write_private_test_file(&replacement, fs::read(&source).unwrap());
                 #[cfg(windows)]
                 fs::remove_file(&source).unwrap();
                 fs::rename(&replacement, &source).unwrap();
@@ -1871,7 +1965,7 @@ mod tests {
     ) {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let expected = entry("scope_a", "/tmp/a", true, true);
         let writer = RegistryDb::open(&path).unwrap();
@@ -1881,7 +1975,7 @@ mod tests {
             &dir.path().join("scope-registry.sqlite-shm"),
         )
         .unwrap();
-        fs::write(&shm, b"initial").unwrap();
+        write_private_test_file(&shm, b"initial");
 
         let rotations = std::sync::Arc::new(AtomicUsize::new(0));
         let hook_rotations = std::sync::Arc::clone(&rotations);
@@ -1893,7 +1987,7 @@ mod tests {
                 return;
             }
             let replacement = shm.with_extension(format!("replacement-{attempt}"));
-            fs::write(&replacement, format!("rotated-{attempt}")).unwrap();
+            write_private_test_file(&replacement, format!("rotated-{attempt}"));
             fs::rename(&replacement, &shm).unwrap();
             hook_rotations.fetch_add(1, Ordering::SeqCst);
         });
@@ -1930,7 +2024,7 @@ mod tests {
 
     #[test]
     fn snapshot_churn_exhausts_deterministic_test_retry_budget() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let writer = RegistryDb::open(&path).unwrap();
         writer
@@ -1940,6 +2034,9 @@ mod tests {
         let shm = dir.path().join("scope-registry.sqlite-shm");
         let hook: SnapshotTestHook = std::sync::Arc::new(move |phase, attempt, _| {
             if phase == SnapshotTestPhase::AfterSnapshotQueryBeforeRecheck {
+                if !shm.exists() {
+                    drop(private_test_file(&shm));
+                }
                 fs::write(&shm, format!("churn-{attempt}")).unwrap();
             }
         });
@@ -1951,7 +2048,7 @@ mod tests {
 
     #[test]
     fn snapshot_instability_followed_by_disappearance_is_not_missing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let writer = RegistryDb::open(&path).unwrap();
         writer
@@ -1973,7 +2070,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn snapshot_wal_disappearance_is_unstable() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let wal = dir.path().join("scope-registry.sqlite-wal");
         let writer = RegistryDb::open(&path).unwrap();
@@ -2008,7 +2105,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let canonical_parent = dir.path().join("canonical");
-        fs::create_dir(&canonical_parent).unwrap();
+        private_test_subdirectory(&canonical_parent);
         let path = canonical_parent.join("scope-registry.sqlite");
         let moved_parent = dir.path().join("detached");
         let replacement_parent = canonical_parent.clone();
@@ -2053,7 +2150,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let canonical_parent = dir.path().join("canonical");
-        fs::create_dir(&canonical_parent).unwrap();
+        private_test_subdirectory(&canonical_parent);
         let path = canonical_parent.join("scope-registry.sqlite");
         let original = RegistryDb::open(&path).unwrap();
         original
@@ -2103,7 +2200,7 @@ mod tests {
     fn live_wal_blocks_deletion_and_preserves_original_snapshot() {
         use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let wal = dir.path().join("scope-registry.sqlite-wal");
         let expected = entry("scope_a", "/tmp/a", true, true);
@@ -2137,8 +2234,9 @@ mod tests {
 
     #[test]
     fn stable_malformed_registry_schema_is_unsafe() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
+        drop(private_test_file(&path));
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("CREATE TABLE scopes (scope_id TEXT);")
             .unwrap();
@@ -2434,7 +2532,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn windows_registry_writer_preserves_trusted_existing_parent_acl() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let retained = kio_core::private_fs::verify_private_creation_parent(dir.path()).unwrap();
         let handle = retained.root_handle();
         let before_acl = windows_security_descriptor(handle.as_ref());
@@ -2460,7 +2558,7 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_registry_writer_rejects_unsafe_existing_ancestor_without_acl_repair() {
+    fn windows_registry_writer_accepts_external_null_dacl_ancestor_without_acl_repair() {
         use std::os::windows::{fs::OpenOptionsExt, io::AsRawHandle};
         use windows_sys::Win32::{
             Foundation::HANDLE,
@@ -2496,19 +2594,31 @@ mod tests {
             },
             0
         );
-        assert!(kio_core::private_fs::verify_private_creation_parent(&ancestor).is_err());
+        assert!(kio_core::private_fs::verify_private_creation_parent(&ancestor).is_ok());
+        // The external ancestor is allowed, but cannot itself be adopted as
+        // an existing owner-private Kio directory or direct writer parent.
+        assert!(kio_core::private_fs::verify_private_directory(&ancestor).is_err());
         let before_acl = windows_security_descriptor(&handle);
         let before_identity = kio_core::platform::directory_handle_identity(&handle).unwrap();
         let path = ancestor.join("data/kio/scope-registry.sqlite");
 
-        assert!(RegistryDb::open(&path).is_err());
-        assert!(!ancestor.join("data").exists());
+        let direct = ancestor.join("direct.sqlite");
+        assert!(RegistryDb::open(&direct).is_err());
+        assert!(!direct.exists());
+        let writer = RegistryDb::open(&path).expect("private descendants under external ancestor");
+        for owned in [ancestor.join("data"), ancestor.join("data/kio")] {
+            kio_core::private_fs::verify_private_directory(&owned)
+                .expect("new Kio directory must have a protected owner-only DACL");
+        }
+        kio_core::private_fs::read_private_file(&path, 1024 * 1024)
+            .expect("new registry database must be an owner-private regular file");
+        drop(writer);
         assert_eq!(windows_security_descriptor(&handle), before_acl);
         assert_eq!(
             kio_core::platform::directory_handle_identity(&handle),
             Some(before_identity)
         );
-        assert_eq!(fs::read_dir(&ancestor).unwrap().count(), 0);
+        assert_eq!(fs::read_dir(&ancestor).unwrap().count(), 1);
     }
 
     #[cfg(windows)]
@@ -2561,7 +2671,7 @@ mod tests {
     fn read_only_snapshot_rejects_hardlinked_wal_leaf() {
         use std::fs::hard_link;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("scope-registry.sqlite");
         let wal = dir.path().join("scope-registry.sqlite-wal");
         let victim = dir.path().join("wal-victim");

@@ -336,8 +336,8 @@ CREATE TABLE scopes (
   registry は cache なので削除は解決系には安全 (live scope は自分を再登録する)。**ただし live 重複の
   検出 (DUP gate) も registry に依存するため、削除直後は gate が一時的に盲目になる** — 各 clone の
   次回使用で再登録され次第回復する既知の窓 (削除を dedupe の手段にしない)
-- device data dir (`~/.local/share/kio/`) は owner-only (0700) に制限する (best-effort。非 unix は
-  no-op。registry / cost-ledger / logs は利用パターンとスコープ地図を含むため)
+- device data / cache / state の保護は [14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+  registry / cost-ledger / logs は利用パターンとスコープ地図を含む。
 
 
 ### 不変条件 (cache vs truth)
@@ -408,7 +408,7 @@ owner-private `.kio-atomic` は `.kio` または pinned private stage owner の�
 未公開 write の残骸は discard だけを許し、hardlink は受理せず、publish は no-replace rename 規約を守る。removal は
 対象を quarantine する前に、exact bytes、physical owner / target、parent-chain identity を結び付けた durable intent を
 置く。一致しない residue は回復も削除もせず fail-closed とする。Windows の foreign owner working-file removal は
-ACL または name を変更する前に拒否し、current owner の private DACL は retained handle に結び付けて検証する。
+name を変更する前に拒否する。既存 user file の ACL は removal のために書き換えない。
 working-tree restore は明示した `.kio` owner からだけこの回復を行う。
 
 明示 root の bootstrap は `.root-init-journal.json` と permanent `.root-init-gate` により直列化する。新規 retry は
@@ -419,20 +419,11 @@ pre-marker 時の空の `.kio` にだけ許し、record を検証するまで通
 child initialization の cancel は private stage を退役する前に verified exact probe を cleanup する。それ以外の probe
 residue は fail-closed とする。read-only operation は atomic state、bootstrap、probe のいずれも作成・lock・cleanup しない。
 
-### 4.3 Controlled root boundary
+### 4.3 Kio-created object boundary
 
-以下は現行 revision の実装契約であり、候補全体の検証は未完了である。managed root と ancestor は creation-parent
-policy により current user または trusted OS administrator が controlled でなければならない。read-only command を含む
-全 command は capture と recheck で同じ retained root を照合する。read sharing だけの Unix `0755` は許容するが、
-他 OS principal の write / delete / ACL mutation は `KIO-E-MANAGEMENT-ROOT-UNSAFE-001` / exit 4 で mutation 前に拒否する。
-既存 root の chmod、owner 変更、ACL repair を自動実行しない。`.kio` は exact current-owner private のままであり、
-この managed-root 規約はそれを緩めない。
-
-Windows は new private object を current owner + protected DACL で `NtCreateFile` 時に生成し、既存 object を
-adopt しない。working-file removal は verified handle を move と DACL 処理の間も保持し、read share は新しい write / delete
-を拒む。foreign owner は ACL または name mutation より前に拒否する。Unix は hostile な same-account filesystem writer に
-inode CAS を防御境界として主張しない。v1 multi-user ACL mode は out of scope であり、この文書は将来の local OS folder
-model を約束しない。
+storage の owner / permission、検証対象、拒否条件、scope root と外部 ancestor の扱いは
+[14 の正本](14-v1-runtime-contracts.md#protection-of-kio-created-objects) に従う。
+利用者向け error は [06 の CLI 契約](06-cli-spec.md#kio-created-object-protection) を参照する。
 
 子 scope 経路を含む v1 実装境界は [09-mvp-scope.md §1.2](09-mvp-scope.md) を正本とする。macOS、Linux、
 Windows のいずれも pathname fallback を使わず、同じ retained-handle 境界で child mutation を行う。native
@@ -893,10 +884,14 @@ sqlite.db / scope-registry.sqlite / aggregator.sqlite は正本から再構築�
 rename、**JSONL cutover 用** marker、列 default/backfill を用いる後方互換 migration は置かない。current
 `schema_migrations` の historical restore marker は拒否 artifact として読むだけで、通常操作が clear / repair する経路は持たない。
 
-起動時は `cost_ledger` / `batch_requests` / `schema_migrations` / `ledger_metadata` の **4 表すべて**の table 定義、および
+台帳を利用する操作でのみ ([操作別前提条件](14-v1-runtime-contracts.md#operation-specific-prerequisites))、
+`cost_ledger` / `batch_requests` / `schema_migrations` / `ledger_metadata` の **4 表すべて**の table 定義、および
 `idx_cost_ledger_month` / `idx_batch_requests_inflight` を canonical DDL と比較する。明示 init で完全に空の artifact set
 だけを current schema で初期化できる。既存 ledger が不一致・欠損・読取不能なら、**bytes を保存した
-まま一切 rename / ALTER / DROP / import せず fail-closed** にする。エラーは ledger が non-rebuildable
+まま一切 rename / ALTER / DROP / import せず、その台帳依存操作を fail-closed** にする。
+無料 local 処理は台帳を前提にせず、read-only 予算観測の取得不能は
+[04 §5.4](04-pipeline.md#54-cost-guardrail--kill-switch) の unknown 表示に従う。
+エラーは ledger が non-rebuildable
 であることと、明示的な operator recovery が必要なことを示す。推測変換や startup の自動修復で課金額・
 intent・監査履歴を失わせてはならない。current-schema ledger の torn write / provider crash recovery は
 §5.4 / §5.8 の既存の recovery 契約として維持するが、旧 shape を current shape と見なす契約ではない。
@@ -957,10 +952,14 @@ secret redaction
 [07-adapter-spec.md §7.1](07-adapter-spec.md) を正本とする。
 
 オンライン Adapter は、明示 opt-in なしにファイル内容を送信してはならない。opt-in の
-単位 (scope × adapter)・寿命・revoke は [07-adapter-spec.md §3](07-adapter-spec.md) を
+単位（外部宛先／loopback の区別）・寿命・revoke は [07-adapter-spec.md §3](07-adapter-spec.md) を
 正本とする。初回スキャン preview でも、network transmission policy を表示する。
 
 ---
+
+Office renderer の対応 Linux desktop 条件、不足する機構の診断と代替抽出経路は
+[07 §5.1](07-adapter-spec.md#51-prepare) を正本とする。隔離不能を未導入と表示せず、
+既存のローカル検索・抽出まで停止しない。
 
 ## 9.1 Incremental Markdownize (要件)
 
@@ -1061,7 +1060,7 @@ exit code の一覧と割当規則の正本は [06-cli-spec.md §7](06-cli-spec.
 
 ## 11.3 設定ファイル schema validation
 
-すべての設定ファイルは JSON Schema (TOML は JSON 等価表現に変換して同 schema で validate) を持ち、CLI 起動時に schema-driven validation を行う。schema は Kio 本体に同梱する。
+すべての設定ファイルは JSON Schema (TOML は JSON 等価表現に変換して同 schema で validate) を持ち、[14 の操作別前提条件](14-v1-runtime-contracts.md#operation-specific-prerequisites) に従い、その操作が使う設定を schema-driven validation する。schema は Kio 本体に同梱する。
 
 ```text
 ~/.config/kio/tools.toml          → schemas/tools.schema.json
@@ -1074,7 +1073,7 @@ exit code の一覧と割当規則の正本は [06-cli-spec.md §7](06-cli-spec.
 
 validation 失敗は exit code 2 で停止し、`KIO-E-CONFIG-SCHEMA-001` を返す。schema は semver で版管理する。format change は新しい current version を選択するが、migration / old-version read-only / dual-read を定義しない (§11.5)。
 
-`scope.schema.json` は少なくとも次の key を定義する: `scope_id` (required)・子 `.kio` リンク ([03-data-model.md §2](03-data-model.md))・`scan_approval` (optional — §1 の取り込み承認記録。required field は §1 の記録一覧と一致)・`approvals[]` (optional — adapter 単位の network opt-in。要素の required field = scope_id / tool_id / execution_mode / tool_profile_hash / approved_at / approval_method / status (`active` | `revoked`)、status=revoked の行は revoked_at も必須 — [07-adapter-spec.md §3](07-adapter-spec.md))・`approval_pending` (optional — 中断した明示承認の監査・診断記録。単一 object で、存在する場合の required field = scope_id / tool_id / execution_mode / tool_profile_hash / approved_at / approval_method。pending は active 行を作らず、自動 publish・cleanup・監査値補完の対象にしない。次の送信には fresh な明示承認が必要)・`approvals_initialized` (optional boolean — 承認 lifecycle の監査状態。行の有効化、初回例外、または自動 materialize の根拠にはしない)。これらの更新は retained store lock と束縛済み metadata handle による serialized compare/write で行う。atomic rename は検証済み bytes の publication 手段であって CAS ではない。**`approval_pending` key 全体の不在は valid で pending intent 無しを表す。一方、存在する pending の required field 欠落・型不正は schema error / fail-closed** である。`approvals[]` が存在する場合の各行も同じく strict に検証し、`status` 欠落行は送信を許可しない (既定値で active と読む経路は持たない)。**未知 key は schema error** (fail-closed)。この schema validation は `kio_format_version == KIO_FORMAT_VERSION` の完全一致判定より後に走る。missing / non-string / malformed / older / newer / unknown を含む non-current store は schema validation へ進めず `KIO-E-STORE-VERSION-001` / exit 8 で全 command が拒否する。`approvals[]`・`approval_pending`・`approvals_initialized` の**全て**を欠く current-version scope.json は valid であり、欠落 = 当該承認なしとして扱う。
+`scope.schema.json` は少なくとも次の key を定義する: `scope_id` (required)・子 `.kio` リンク ([03-data-model.md §2](03-data-model.md))・`scan_approval` (optional — §1 の取り込み承認記録。required field は §1 の記録一覧と一致)・`approvals[]` (optional — 外部宛先の adapter 単位 network opt-in（loopback の通常承認は 07 §3.1 の device record）。要素の required field = scope_id / tool_id / execution_mode / tool_profile_hash / approved_at / approval_method / status (`active` | `revoked`)、status=revoked の行は revoked_at も必須 — [07-adapter-spec.md §3](07-adapter-spec.md))・`approval_pending` (optional — 外部宛先の中断した明示承認の監査・診断記録。単一 object で、存在する場合の required field = scope_id / tool_id / execution_mode / tool_profile_hash / approved_at / approval_method。pending は active 行を作らず、自動 publish・cleanup・監査値補完の対象にしない。次の送信には fresh な明示承認が必要)・`approvals_initialized` (optional boolean — 承認 lifecycle の監査状態。行の有効化、初回例外、または自動 materialize の根拠にはしない)。これらの更新は retained store lock と束縛済み metadata handle による serialized compare/write で行う。atomic rename は検証済み bytes の publication 手段であって CAS ではない。**`approval_pending` key 全体の不在は valid で pending intent 無しを表す。一方、存在する pending の required field 欠落・型不正は schema error / fail-closed** である。`approvals[]` が存在する場合の各行も同じく strict に検証し、`status` 欠落行は送信を許可しない (既定値で active と読む経路は持たない)。**未知 key は schema error** (fail-closed)。この schema validation は `kio_format_version == KIO_FORMAT_VERSION` の完全一致判定より後に走る。missing / non-string / malformed / older / newer / unknown を含む non-current store は schema validation へ進めず `KIO-E-STORE-VERSION-001` / exit 8 で全 command が拒否する。`approvals[]`・`approval_pending`・`approvals_initialized` の**全て**を欠く current-version scope.json は valid であり、欠落 = 当該承認なしとして扱う。
 
 `folder-config.schema.json` は `[chunking].unicode_version` を **required** とする (省略不可・default なし — `kio init` が実装同梱の UCD 版 (現在の既定 = 17.0.0) を明示記録する、[03-data-model.md §5.3](03-data-model.md) / [06-cli-spec.md §1](06-cli-spec.md))。これを欠く `.kio/config.toml` は schema error (exit 2) とする — required field に既定値の代替経路は持たない。`[markdownize].bbox_annotation` (boolean、既定 true — [07-adapter-spec.md §5.2](07-adapter-spec.md)、値は tool_profile_hash に畳み込む) も本 schema の正式 key として定義する。
 

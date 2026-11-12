@@ -7,6 +7,15 @@
 use kio_core::control::ControlHandle;
 mod child_lifecycle;
 mod root_bootstrap;
+pub(crate) use root_bootstrap::{IndependentRootPlan, preview_independent_root};
+
+pub(crate) fn initialize_independent_root_in_session(
+    plan: &IndependentRootPlan,
+    control: &ControlHandle,
+    locks: &kio_core::scope::LockSession,
+) -> Result<ExplicitRoot> {
+    root_bootstrap::initialize_confirmed_independent(plan, control, locks)
+}
 
 use crate::response::CommandResponse;
 use std::fs::File;

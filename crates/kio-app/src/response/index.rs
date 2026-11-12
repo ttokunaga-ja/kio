@@ -115,6 +115,8 @@ pub struct IndexPublishedResponse {
     pub tree_hash: String,
     pub commit_hash: Option<String>,
     pub commit: Option<CommitObject>,
+    pub budget_status: String,
+    pub budget_reason: Option<String>,
     pub budget_warning: Option<String>,
     #[serde(flatten)]
     pub skipped: SkippedDisclosure,
@@ -131,24 +133,11 @@ pub struct IndexPublishedResponse {
 }
 
 impl IndexResponse {
-    pub(crate) fn gc(&self) -> Option<&GcReport> {
-        match self {
-            Self::Published(report) => report.gc.as_ref(),
-            Self::Deferred(report) => Some(&report.gc),
-            Self::Preview(_) => None,
-        }
-    }
     pub(crate) fn error_code(&self) -> Option<&str> {
         match self {
             Self::Published(report) => report.error_code.as_deref(),
             Self::Deferred(report) => Some(&report.error_code),
             Self::Preview(_) => None,
-        }
-    }
-    pub(crate) fn message(&self) -> Option<&str> {
-        match self {
-            Self::Deferred(report) => Some(&report.message),
-            Self::Published(_) | Self::Preview(_) => None,
         }
     }
 }

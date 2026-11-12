@@ -7,6 +7,15 @@ pub struct InitResponse {
     pub repaired: Vec<String>,
     pub path: PathBuf,
     pub kio_path: PathBuf,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub independent: Option<IndependentInitResponse>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IndependentInitResponse {
+    pub parent: Option<PathBuf>,
+    pub parent_relationship: String,
+    pub confirmed: bool,
 }
 
 #[derive(Debug, Serialize)]

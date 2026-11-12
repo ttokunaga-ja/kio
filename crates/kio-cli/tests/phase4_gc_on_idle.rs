@@ -334,7 +334,13 @@ fn post_publication_index_replacement_fails_closed_without_retiring_stale_tree()
     fs::remove_dir(&index).unwrap();
     fs::rename(&parked, &index).unwrap();
 
-    assert_eq!(output.status.code(), Some(4));
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "post-publication index attack: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     let value = output_json(&output);
     assert_eq!(value["status"], "skipped");
     assert_eq!(value["reason"], "gc_failed");

@@ -47,6 +47,10 @@ impl ObjectStore {
             PathBuf::from("planned CAS parent"),
             self.control.clone(),
         )?;
+        crate::private_fs::verify_private_directory_handle(&directory)?;
+        if directory.contains_entry(Path::new(&leaf))? {
+            directory.ensure_owner_private(Path::new(&leaf))?;
+        }
         let Some(target) = crate::store_dir::PlannedFileRemoval::capture_content(
             &directory,
             Path::new(&leaf),
@@ -253,7 +257,7 @@ impl ObjectStore {
         // Re-open through the hardened no-follow/single-link boundary and consume
         // the complete corrupt body before authorizing replacement. Unsafe links
         // and path swaps fail before any namespace mutation.
-        let mut corrupt = open_regular_nofollow(path)?;
+        let mut corrupt = open_private_cas_file(path)?;
         let metadata = corrupt.metadata().kio_io(path)?;
         if metadata.len() > ObjectKind::Raw.max_bytes() {
             return Err(object_size_error(
@@ -284,7 +288,7 @@ impl ObjectStore {
         let parent = path
             .parent()
             .ok_or_else(|| KioError::io("CAS path has no parent", path.display().to_string()))?;
-        let (temp_path, mut temp) = create_private_temp(parent)?;
+        let (temp_path, mut temp, temp_parent) = create_private_temp(parent)?;
         let mut corrupt = Some(corrupt);
         let source = cas_semantics::retain_repair_source(&mut corrupt);
         let result = (|| -> Result<()> {
@@ -292,7 +296,9 @@ impl ObjectStore {
             temp.sync_all().kio_io(&temp_path)?;
             drop(temp);
 
+            verify_named_cas_directory(&temp_parent, parent)?;
             let quarantine = create_repair_quarantine(path, source.file())?;
+            verify_named_cas_directory(&temp_parent, parent)?;
             // MoveFileEx requires both path operands to be closed on Windows.
             // The verified quarantine hard link now pins the exact corrupt
             // object for rollback, so the original read handle can be released
@@ -320,10 +326,10 @@ impl ObjectStore {
             // that a crash could still undo. Retry is idempotent: a slot that
             // already verifies returns `false` before any mutation.
             sync_directory(parent).kio_io(parent)?;
-            Ok(())
+            verify_named_cas_directory(&temp_parent, parent)
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+            let _ = remove_private_temp(&temp_parent, &temp_path);
         }
         result.map(|()| true)
     }
@@ -359,7 +365,7 @@ impl ObjectStore {
         }
 
         let path = self.chunk_path(&hash)?;
-        let (temp_path, mut temp) = create_private_temp(
+        let (temp_path, mut temp, temp_parent) = create_private_temp(
             path.parent()
                 .ok_or_else(|| KioError::io("path has no parent", path.display().to_string()))?,
         )?;
@@ -367,7 +373,14 @@ impl ObjectStore {
             temp.write_all(&bytes).kio_io(&temp_path)?;
             temp.sync_all().kio_io(&temp_path)?;
             drop(temp);
-            publish_temp_object(&temp_path, &path, &hash, bytes.len() as u64, Some(&bytes))?;
+            publish_temp_object(
+                &temp_parent,
+                &temp_path,
+                &path,
+                &hash,
+                bytes.len() as u64,
+                Some(&bytes),
+            )?;
             let Some(published_path) = self.existing_chunk_path(&hash)? else {
                 return Err(KioError::not_found(&hash));
             };
@@ -381,7 +394,7 @@ impl ObjectStore {
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+            let _ = remove_private_temp(&temp_parent, &temp_path);
         }
         result.map(|()| hash)
     }
@@ -546,7 +559,7 @@ impl ObjectStore {
             verify_existing_bytes(&path, &hash, &bytes)?;
             return Ok(hash);
         }
-        let (temp_path, mut temp) = create_private_temp(
+        let (temp_path, mut temp, temp_parent) = create_private_temp(
             path.parent()
                 .ok_or_else(|| KioError::io("path has no parent", path.display().to_string()))?,
         )?;
@@ -554,7 +567,14 @@ impl ObjectStore {
             temp.write_all(&bytes).kio_io(&temp_path)?;
             temp.sync_all().kio_io(&temp_path)?;
             drop(temp);
-            publish_temp_object(&temp_path, &path, &hash, bytes.len() as u64, Some(&bytes))?;
+            publish_temp_object(
+                &temp_parent,
+                &temp_path,
+                &path,
+                &hash,
+                bytes.len() as u64,
+                Some(&bytes),
+            )?;
             // Read back through the same parser a rebuild will use, so a
             // publish that somehow lands unreadable fails HERE rather than in
             // the `repair rebuild-db` that was counting on it.
@@ -568,7 +588,7 @@ impl ObjectStore {
             Ok(())
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+            let _ = remove_private_temp(&temp_parent, &temp_path);
         }
         result.map(|()| hash)
     }
@@ -579,6 +599,9 @@ impl ObjectStore {
         if let Some(bound) = &self.bound {
             let (parent, leaf) = bound.content_fanout(ContentObjectKind::Embedding, hash, false)?;
             return bound_read_embedding(&self.reads, &parent, &leaf, hash);
+        }
+        if !self.validate_content_parent(ContentObjectKind::Embedding, hash)? {
+            return Err(KioError::not_found(hash));
         }
         read_embedding_path(&self.reads, &self.embedding_path(hash)?, hash)
     }
@@ -658,38 +681,23 @@ impl ObjectStore {
         if let Some(bound) = &self.bound {
             return bound.embedding_hashes(&self.reads);
         }
-        let base = self.ambient_kio_dir()?.join("objects/embeddings");
-        let mut hashes = Vec::new();
-        let Ok(first_level) = fs::read_dir(&base) else {
-            return Ok(hashes);
-        };
-        for first in first_level {
-            let first = first.kio_io(&base)?;
-            let Ok(second_level) = fs::read_dir(first.path()) else {
-                continue;
-            };
-            for second in second_level {
-                let second = second.kio_io(&first.path())?;
-                let Ok(leaves) = fs::read_dir(second.path()) else {
-                    continue;
-                };
-                for leaf in leaves {
-                    let leaf = leaf.kio_io(&second.path())?;
-                    if !leaf.file_type().is_ok_and(|kind| kind.is_file()) {
-                        continue;
-                    }
-                    // The fanout dirs are a PREFIX of the digest, which the
-                    // leaf then repeats in full (`fanout_path`), so the leaf
-                    // name alone is the digest.
-                    let Some(digest) = leaf.file_name().to_str().map(str::to_owned) else {
-                        continue;
-                    };
-                    hashes.push(format!("sha256:{digest}"));
-                }
+        ensure_real_directory(self.ambient_kio_dir()?, false)?;
+        let kio = crate::store_dir::StoreDirectory::open(self.ambient_kio_dir()?)?;
+        let objects = match bound_open_dir(&kio.root_handle(), "objects") {
+            Ok(directory) => directory,
+            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
+                return Ok(Vec::new());
             }
-        }
-        hashes.sort();
-        Ok(hashes)
+            Err(error) => return Err(error),
+        };
+        let embeddings = match bound_open_dir(&objects, "embeddings") {
+            Ok(directory) => directory,
+            Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
+                return Ok(Vec::new());
+            }
+            Err(error) => return Err(error),
+        };
+        bound_embedding_hashes(&self.reads, &embeddings)
     }
 
     fn ensure_embedding_parent(&self, hash: &str) -> Result<()> {
@@ -755,7 +763,10 @@ impl ObjectStore {
         ] {
             match fs::symlink_metadata(directory) {
                 Ok(metadata)
-                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+                {
+                    ensure_real_directory(directory, false)?;
+                }
                 Ok(_) => return Err(non_regular_object_error(directory)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => {
@@ -790,7 +801,10 @@ impl ObjectStore {
         for directory in [self.ambient_kio_dir()?, &objects, &base, &first, &second] {
             match fs::symlink_metadata(directory) {
                 Ok(metadata)
-                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+                {
+                    ensure_real_directory(directory, false)?;
+                }
                 Ok(_) => return Err(non_regular_object_error(directory)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => {
@@ -826,7 +840,7 @@ impl ObjectStore {
         }
 
         let path = self.object_path(kind, hash)?;
-        let (temp_path, mut temp) = create_private_temp(
+        let (temp_path, mut temp, temp_parent) = create_private_temp(
             path.parent()
                 .ok_or_else(|| KioError::io("path has no parent", path.display().to_string()))?,
         )?;
@@ -834,7 +848,14 @@ impl ObjectStore {
             temp.write_all(bytes).kio_io(&temp_path)?;
             temp.sync_all().kio_io(&temp_path)?;
             drop(temp);
-            publish_temp_object(&temp_path, &path, hash, bytes.len() as u64, Some(bytes))?;
+            publish_temp_object(
+                &temp_parent,
+                &temp_path,
+                &path,
+                hash,
+                bytes.len() as u64,
+                Some(bytes),
+            )?;
 
             let Some(published) = self.existing_object_path(kind, hash)? else {
                 return Err(KioError::not_found(hash));
@@ -842,7 +863,7 @@ impl ObjectStore {
             verify_existing_bytes(&published, hash, bytes)
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+            let _ = remove_private_temp(&temp_parent, &temp_path);
         }
         result
     }
@@ -864,7 +885,7 @@ impl ObjectStore {
             .join("objects")
             .join(ObjectKind::Raw.directory());
         self.ensure_kind_base(ObjectKind::Raw)?;
-        let (temp_path, mut temp) = create_private_temp(&raw_base)?;
+        let (temp_path, mut temp, temp_parent) = create_private_temp(&raw_base)?;
         let result = (|| -> Result<(String, u64)> {
             let mut hasher = Sha256::new();
             let mut buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
@@ -895,11 +916,11 @@ impl ObjectStore {
             self.ensure_object_parent(ObjectKind::Raw, &hash)?;
             if let Some(existing) = self.existing_object_path(ObjectKind::Raw, &hash)? {
                 verify_existing_matches_file(&existing, &temp_path, &hash, total)?;
-                fs::remove_file(&temp_path).kio_io(&temp_path)?;
+                remove_private_temp(&temp_parent, &temp_path)?;
                 return Ok((hash, total));
             }
 
-            publish_temp_object(&temp_path, &path, &hash, total, None)?;
+            publish_temp_object(&temp_parent, &temp_path, &path, &hash, total, None)?;
             let Some(published) = self.existing_object_path(ObjectKind::Raw, &hash)? else {
                 return Err(KioError::not_found(&hash));
             };
@@ -913,7 +934,7 @@ impl ObjectStore {
             Ok((hash, total))
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+            let _ = remove_private_temp(&temp_parent, &temp_path);
         }
         result
     }
@@ -1048,7 +1069,7 @@ impl ObjectStore {
             return Ok(hash);
         }
         let path = self.content_path(kind, &hash)?;
-        let (temp_path, mut temp) = create_private_temp(
+        let (temp_path, mut temp, temp_parent) = create_private_temp(
             path.parent()
                 .ok_or_else(|| KioError::io("path has no parent", path.display().to_string()))?,
         )?;
@@ -1056,14 +1077,21 @@ impl ObjectStore {
             temp.write_all(bytes).kio_io(&temp_path)?;
             temp.sync_all().kio_io(&temp_path)?;
             drop(temp);
-            publish_temp_object(&temp_path, &path, &hash, bytes.len() as u64, Some(bytes))?;
+            publish_temp_object(
+                &temp_parent,
+                &temp_path,
+                &path,
+                &hash,
+                bytes.len() as u64,
+                Some(bytes),
+            )?;
             let Some(published) = self.existing_content_path(kind, &hash)? else {
                 return Err(KioError::not_found(&hash));
             };
             verify_existing_bytes(&published, &hash, bytes)
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+            let _ = remove_private_temp(&temp_parent, &temp_path);
         }
         result.map(|()| hash)
     }
@@ -1094,7 +1122,7 @@ impl ObjectStore {
         let Some(path) = self.existing_content_path(kind, hash)? else {
             return Err(KioError::not_found(hash));
         };
-        read_bounded_regular_file_inner(&path, max_bytes, &self.reads)
+        read_bounded_regular_file_inner(&path, max_bytes, &self.reads, true)
     }
 
     /// Read and verify a hash from one required CAS namespace. Unlike
@@ -1395,7 +1423,10 @@ impl ObjectStore {
         ] {
             match fs::symlink_metadata(directory) {
                 Ok(metadata)
-                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {}
+                    if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() =>
+                {
+                    ensure_real_directory(directory, false)?;
+                }
                 Ok(_) => return Err(non_regular_object_error(directory)),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
                 Err(error) => {

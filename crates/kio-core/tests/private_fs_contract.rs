@@ -59,7 +59,7 @@ mod unix {
     }
 
     #[test]
-    fn retains_non_writable_shared_read_creation_parent_without_mutation() {
+    fn retains_external_creation_parent_without_permission_admission() {
         let dir = private_dir();
         let parent = dir.path().join("xdg-data");
         fs::create_dir(&parent).expect("create creation parent");
@@ -77,13 +77,14 @@ mod unix {
             .expect("unsafe ancestor mode");
         fs::create_dir(&child).expect("create child");
         fs::set_permissions(&child, fs::Permissions::from_mode(0o755)).expect("child mode");
-        assert!(verify_private_creation_parent(&child).is_err());
+        // docs14/ST01: external ancestor modes are not admission authority.
+        assert!(verify_private_creation_parent(&child).is_ok());
 
         let writable_final = dir.path().join("writable-final");
         fs::create_dir(&writable_final).expect("create writable final parent");
         fs::set_permissions(&writable_final, fs::Permissions::from_mode(0o777))
             .expect("writable final mode");
-        assert!(verify_private_creation_parent(&writable_final).is_err());
+        assert!(verify_private_creation_parent(&writable_final).is_ok());
     }
 
     #[test]
@@ -102,7 +103,8 @@ mod unix {
         fs::create_dir(&private_child).expect("private child directory");
         fs::set_permissions(&private_child, fs::Permissions::from_mode(0o700))
             .expect("private child mode");
-        assert!(verify_private_directory(&private_child).is_err());
+        // docs14/ST01: the private child remains protected under an external parent.
+        assert!(verify_private_directory(&private_child).is_ok());
 
         let target = outer.path().join("target");
         fs::create_dir(&target).expect("target directory");
@@ -128,7 +130,7 @@ mod unix {
         );
     }
     #[test]
-    fn rejects_insecure_parent_or_leaf_mode() {
+    fn rejects_insecure_leaf_mode_without_admitting_external_parent_modes() {
         let dir = private_dir();
         let file = private_file(dir.path(), "device-ca.pem", b"certificate");
         fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).expect("insecure leaf mode");
@@ -139,10 +141,8 @@ mod unix {
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).expect("restore leaf mode");
         fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))
             .expect("insecure parent mode");
-        assert_eq!(
-            read_private_file(&file, 1024).unwrap_err().error_code(),
-            "KIO-E-PRIVATE-FILE-UNSAFE-001"
-        );
+        // docs14/ST01: the credential leaf is private; its parent is external.
+        assert_eq!(read_private_file(&file, 1024).unwrap(), b"certificate");
     }
     #[test]
     fn rejects_symlink_components_and_hardlinked_or_nonregular_leaf() {
@@ -186,6 +186,29 @@ mod unix {
             .create_directory(Path::new("created"))
             .expect("create through retained root");
         assert!(renamed.join("created").is_dir());
+    }
+
+    #[test]
+    fn inherited_external_root_is_accepted_only_in_its_external_role() {
+        use std::os::fd::AsRawFd;
+        let root = private_dir();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let held = fs::File::open(root.path()).unwrap();
+        let inherited = std::path::PathBuf::from(format!("/dev/fd/{}", held.as_raw_fd()));
+        assert!(resolve_inherited_private_root(&inherited).is_ok());
+        assert!(verify_private_creation_parent(&inherited).is_ok());
+        assert!(verify_private_directory(&inherited).is_err());
+        let own = root.path().join("own");
+        fs::create_dir(&own).unwrap();
+        fs::set_permissions(&own, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(verify_private_directory(&inherited.join("own")).is_ok());
+        private_file(root.path(), "credential", b"private");
+        assert_eq!(
+            read_private_file(&inherited.join("credential"), 64).unwrap(),
+            b"private"
+        );
+        fs::set_permissions(&own, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(verify_private_directory(&inherited.join("own")).is_err());
     }
 
     #[test]
@@ -258,7 +281,7 @@ mod unix {
                 "/dev/fd/{}",
                 public_fd.as_raw_fd()
             )))
-            .is_err()
+            .is_ok()
         );
 
         let victim = private_dir();
@@ -298,7 +321,17 @@ mod unix {
 
     #[test]
     fn scheduler_executable_requires_non_writable_file_and_ancestors() {
-        let dir = private_dir();
+        // The checkout itself may have writable external ancestors. This
+        // positive execution fixture needs a trusted run-owned temp ancestry.
+        let temp = std::env::temp_dir()
+            .canonicalize()
+            .expect("canonical temp root");
+        let dir = tempfile::Builder::new()
+            .prefix("kio-trusted-executable-")
+            .tempdir_in(temp)
+            .expect("trusted executable fixture");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700))
+            .expect("private executable directory mode");
         let executable = private_file(dir.path(), "kio", b"fixture");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("executable mode");
@@ -336,7 +369,8 @@ mod unix {
         macos_acl_fixture::allow_untrusted_write(protected_dir.path(), false)
             .expect("directory ACL fixture");
         assert!(verify_private_directory(protected_dir.path()).is_err());
-        assert!(verify_private_creation_parent(protected_dir.path()).is_err());
+        // docs14/ST01: this API admits external creation parents without ACL policy.
+        assert!(verify_private_creation_parent(protected_dir.path()).is_ok());
     }
 
     #[cfg(target_os = "macos")]
@@ -366,8 +400,8 @@ mod unix {
         macos_acl_fixture::set_entries(dir.path(), &read).expect("ancestor read ACL");
         assert_eq!(verify_trusted_executable(&executable).unwrap(), executable);
         assert!(verify_private_directory(dir.path()).is_err());
-        // The same read grant is forbidden on a private parent.
-        assert!(read_private_file(&executable, 1024).is_err());
+        // docs14/ST01: an external parent ACL is irrelevant to a private leaf.
+        assert_eq!(read_private_file(&executable, 1024).unwrap(), b"fixture");
         macos_acl_fixture::set_entries(dir.path(), &[]).expect("empty parent ACL");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o600)).unwrap();
         macos_acl_fixture::set_entries(&executable, &read).expect("leaf read ACL");
@@ -577,7 +611,8 @@ mod windows {
         let delete_child = private_dir();
         private_acl_fixture::allow_untrusted_delete_child(delete_child.path())
             .expect("untrusted delete-child ACL fixture");
-        assert!(verify_private_creation_parent(delete_child.path()).is_err());
+        // docs14/ST01: external ACLs do not admit or reject a creation parent.
+        assert!(verify_private_creation_parent(delete_child.path()).is_ok());
         let dir = private_dir();
         let link = dir.path().join("directory-link");
         std::os::windows::fs::symlink_dir(dir.path(), &link).expect("directory reparse point");
@@ -604,6 +639,81 @@ mod windows {
         assert!(read_private_file(&target, 1024).is_err());
     }
 
+    #[test]
+    fn external_profile_acl_does_not_admit_or_repair_private_children() {
+        let external = private_dir();
+        private_acl_fixture::allow_untrusted_delete_child(external.path()).unwrap();
+        let before = private_acl_fixture::dacl_at(external.path(), true);
+        let own = external.path().join("own");
+        fs::create_dir(&own).unwrap();
+        private_acl_fixture::protect_owner_only(&own, true).unwrap();
+        let credential = private_file(external.path(), "credential", b"private");
+        verify_private_directory(&own).expect("private child under external profile ACL");
+        let retained_external =
+            verify_private_creation_parent(external.path()).expect("external creation parent");
+        assert_eq!(read_private_file(&credential, 64).unwrap(), b"private");
+        assert_eq!(
+            read_private_file_at(&retained_external, "credential", 64).unwrap(),
+            b"private"
+        );
+        assert_eq!(private_acl_fixture::dacl_at(external.path(), true), before);
+        private_acl_fixture::allow_untrusted_delete_child(&own).unwrap();
+        let unsafe_before = private_acl_fixture::dacl_at(&own, true);
+        assert!(verify_private_directory(&own).is_err());
+        assert_eq!(private_acl_fixture::dacl_at(&own, true), unsafe_before);
+    }
+
+    #[test]
+    fn working_file_removal_never_rewrites_its_dacl() {
+        let external = private_dir();
+        let root = StoreDirectory::open(external.path()).unwrap();
+        let owner = StoreDirectory::from_retained(
+            root.create_directory(Path::new("owner")).unwrap(),
+            external.path().join("owner"),
+        )
+        .unwrap();
+        let target = StoreDirectory::from_retained(
+            root.create_directory(Path::new("target")).unwrap(),
+            external.path().join("target"),
+        )
+        .unwrap();
+        let path = private_file(target.path(), "leaf", b"remove");
+        private_acl_fixture::allow_working_file_read(&path).unwrap();
+        let held = private_acl_fixture::retain_security(&path, false);
+        let before = private_acl_fixture::dacl(&held);
+        target
+            .quarantine_then_remove_with_owner(&owner, Path::new("leaf"), b"remove", 64)
+            .unwrap();
+        assert_eq!(
+            private_acl_fixture::dacl(&held),
+            before,
+            "deletion must preserve the object's DACL even after quarantine"
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn working_file_removal_needs_delete_rights_without_write_dac() {
+        let external = private_dir();
+        let root = StoreDirectory::open(external.path()).unwrap();
+        let owner = StoreDirectory::from_retained(
+            root.create_directory(Path::new("owner")).unwrap(),
+            external.path().join("owner"),
+        )
+        .unwrap();
+        let target = StoreDirectory::from_retained(
+            root.create_directory(Path::new("target")).unwrap(),
+            external.path().join("target"),
+        )
+        .unwrap();
+        let path = private_file(target.path(), "leaf", b"remove");
+        private_acl_fixture::deny_working_file_write_dac(&path).unwrap();
+        target
+            .quarantine_then_remove_with_owner(&owner, Path::new("leaf"), b"remove", 64)
+            .expect("deletion must not request permission to rewrite DACL");
+        assert!(!path.exists());
+    }
+
     mod private_acl_fixture {
         // Kept here so the core contract can run without making the index
         // crate's private registry test helper a cross-crate test API.
@@ -615,20 +725,155 @@ mod windows {
             ptr,
         };
         use windows_sys::Win32::{
-            Foundation::{CloseHandle, HANDLE},
-            Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo},
+            Foundation::{CloseHandle, HANDLE, LocalFree},
+            Security::Authorization::{
+                ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
+            },
             Security::{
-                ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, CreateWellKnownSid,
-                DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation, InitializeAcl,
-                OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, TOKEN_QUERY,
-                TOKEN_USER, TokenUser, WinBuiltinUsersSid,
+                ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, AddAccessDeniedAceEx,
+                CreateWellKnownSid, DACL_SECURITY_INFORMATION, GetLengthSid, GetTokenInformation,
+                InitializeAcl, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+                PSID, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinUsersSid,
             },
             Storage::FileSystem::{
-                FILE_ALL_ACCESS, FILE_DELETE_CHILD, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
+                FILE_ALL_ACCESS, FILE_DELETE_CHILD, FILE_READ_ATTRIBUTES, FILE_READ_DATA,
+                FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, READ_CONTROL, WRITE_DAC,
                 WRITE_OWNER,
             },
             System::Threading::{GetCurrentProcess, OpenProcessToken},
         };
+        pub fn retain_security(path: &Path, directory: bool) -> std::fs::File {
+            let mut options = OpenOptions::new();
+            options
+                .access_mode(READ_CONTROL)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+            if directory {
+                options.custom_flags(0x0200_0000);
+            }
+            options.open(path).unwrap()
+        }
+        pub fn dacl_at(path: &Path, directory: bool) -> Vec<u8> {
+            dacl(&retain_security(path, directory))
+        }
+        pub fn dacl(file: &std::fs::File) -> Vec<u8> {
+            let mut acl: *mut ACL = ptr::null_mut();
+            let mut descriptor = ptr::null_mut();
+            let status = unsafe {
+                GetSecurityInfo(
+                    file.as_raw_handle() as HANDLE,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut acl,
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+            assert_eq!(status, 0);
+            assert!(!acl.is_null());
+            let bytes =
+                unsafe { std::slice::from_raw_parts(acl.cast::<u8>(), (*acl).AclSize as usize) }
+                    .to_vec();
+            unsafe {
+                LocalFree(descriptor);
+            }
+            bytes
+        }
+        fn set_working_acl(path: &Path, deny_dac: bool) -> std::io::Result<()> {
+            let owner = CurrentUserSid::current()?;
+            let users = builtin_users_sid()?;
+            let owner_rights_text = "S-1-3-4\0".encode_utf16().collect::<Vec<_>>();
+            let mut owner_rights = ptr::null_mut();
+            if unsafe { ConvertStringSidToSidW(owner_rights_text.as_ptr(), &mut owner_rights) } == 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            let fixed = mem::size_of::<ACCESS_ALLOWED_ACE>() - mem::size_of::<u32>();
+            let size = mem::size_of::<ACL>()
+                + fixed
+                + owner.len()
+                + fixed
+                + users.len()
+                + if deny_dac {
+                    fixed + unsafe { GetLengthSid(owner_rights) } as usize
+                } else {
+                    0
+                };
+            let mut acl = vec![0_usize; size.div_ceil(mem::size_of::<usize>())];
+            let ok = unsafe { InitializeAcl(acl.as_mut_ptr().cast(), size as u32, ACL_REVISION) }
+                != 0
+                && (!deny_dac
+                    || unsafe {
+                        AddAccessDeniedAceEx(
+                            acl.as_mut_ptr().cast(),
+                            ACL_REVISION,
+                            0,
+                            WRITE_DAC,
+                            owner_rights,
+                        )
+                    } != 0)
+                && unsafe {
+                    AddAccessAllowedAceEx(
+                        acl.as_mut_ptr().cast(),
+                        ACL_REVISION,
+                        0,
+                        FILE_ALL_ACCESS,
+                        owner.as_psid(),
+                    )
+                } != 0
+                && unsafe {
+                    AddAccessAllowedAceEx(
+                        acl.as_mut_ptr().cast(),
+                        ACL_REVISION,
+                        0,
+                        FILE_READ_DATA,
+                        users.as_ptr().cast_mut().cast(),
+                    )
+                } != 0;
+            unsafe {
+                LocalFree(owner_rights);
+            }
+            if !ok {
+                return Err(std::io::Error::last_os_error());
+            }
+            let file = OpenOptions::new()
+                .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .open(path)
+                .map_err(|error| {
+                    std::io::Error::new(
+                        error.kind(),
+                        format!("open working-file ACL fixture handle: {error}"),
+                    )
+                })?;
+            let status = unsafe {
+                SetSecurityInfo(
+                    file.as_raw_handle() as HANDLE,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    acl.as_mut_ptr().cast(),
+                    ptr::null_mut(),
+                )
+            };
+            if status == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("set working-file fixture protected DACL: status={status}"),
+                ))
+            }
+        }
+        pub fn allow_working_file_read(path: &Path) -> std::io::Result<()> {
+            set_working_acl(path, false)
+        }
+        pub fn deny_working_file_write_dac(path: &Path) -> std::io::Result<()> {
+            set_working_acl(path, true)
+        }
+
         pub fn protect_owner_only(path: &Path, directory: bool) -> std::io::Result<()> {
             let owner = CurrentUserSid::current()?;
             let mut acl = owner_only_acl(&owner)?;

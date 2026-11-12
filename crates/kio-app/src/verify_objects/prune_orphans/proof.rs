@@ -951,7 +951,7 @@ mod tests {
 
     #[test]
     fn historical_missing_unit_does_not_hide_later_corruption_or_duplicate_keys() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::PrivateTempDir::new();
         let store = ObjectStore::new(directory.path());
         let raw = hash_bytes(b"raw");
         let profile = hash_bytes(b"profile");

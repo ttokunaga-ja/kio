@@ -6,7 +6,8 @@ use support::canonical_tempdir;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use kio_core::cas::{ObjectKind, ObjectStore};
@@ -15,6 +16,7 @@ use kio_core::gc::{
     ShallowReceipt,
 };
 use kio_core::scope::Repository;
+use kio_core::store_dir::StoreDirectory;
 use kio_index::fts::{FtsSchemaConfig, FtsTokenizer, read_bound_gc_index_metadata};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -132,12 +134,28 @@ fn receipt_path(dir: &TempDir, commit: &str) -> PathBuf {
     dir.path().join(".kio/gc/shallowed").join(leaf)
 }
 
+// Model Kio-owned GC storage with the same private creators as production.
+// Write bytes directly so forged marker fixtures do not use GC publication.
+fn write_private_gc_file(dir: &TempDir, relative: &Path, bytes: &[u8]) {
+    let owned = StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+    let parent = relative.parent().unwrap();
+    let retained = owned.create_directory_all(parent).unwrap();
+    let parent = StoreDirectory::from_retained(retained, owned.path().join(parent)).unwrap();
+    let mut file = parent
+        .create_private_file(Path::new(relative.file_name().unwrap()))
+        .unwrap();
+    file.write_all(bytes).unwrap();
+}
+
 fn write_receipt(dir: &TempDir, commit: &str, tree: &str) {
     let path = receipt_path(dir, commit);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
     let receipt =
         ShallowReceipt::new(commit.into(), tree.into(), "2026-08-14T00:00:00Z".into()).unwrap();
-    fs::write(path, receipt.canonical_bytes().unwrap()).unwrap();
+    write_private_gc_file(
+        dir,
+        path.strip_prefix(dir.path().join(".kio")).unwrap(),
+        &receipt.canonical_bytes().unwrap(),
+    );
 }
 
 fn write_marker(dir: &TempDir, commit: &str, tree: &str, phase: GcSweepPhase) {
@@ -183,9 +201,11 @@ fn write_marker(dir: &TempDir, commit: &str, tree: &str, phase: GcSweepPhase) {
             .unwrap();
         marker.phase = phase;
     }
-    let path = dir.path().join(".kio/gc/in_progress");
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(path, marker.canonical_bytes().unwrap()).unwrap();
+    write_private_gc_file(
+        dir,
+        Path::new("gc/in_progress"),
+        &marker.canonical_bytes().unwrap(),
+    );
 }
 
 #[test]
@@ -341,9 +361,11 @@ fn absent_pre_sweep_marker_cannot_authorize_retirement_against_live_index() {
     marker.phase = GcSweepPhase::Sweeping;
     // This models a forged on-disk marker.  Do not invoke the production
     // publication primitive.
-    let marker_path = dir.path().join(".kio/gc/in_progress");
-    fs::create_dir_all(marker_path.parent().unwrap()).unwrap();
-    fs::write(&marker_path, marker.canonical_bytes().unwrap()).unwrap();
+    write_private_gc_file(
+        &dir,
+        Path::new("gc/in_progress"),
+        &marker.canonical_bytes().unwrap(),
+    );
 
     // The public core mutator cannot be called from marker JSON alone: its
     // permit constructor is unsafe and reserved for the trusted index

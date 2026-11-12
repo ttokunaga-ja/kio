@@ -52,7 +52,11 @@ fn malformed_plain_credential_stays_out_of_terminal_and_error_log() {
             fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
             fs::set_permissions(&tools, fs::Permissions::from_mode(0o600)).unwrap();
         }
-        let mut run = command(&root, &home, &["status"]);
+        let mut run = command(
+            &root,
+            &home,
+            &["adapter", "approve", "mistral_ocr_markdownize", "--yes"],
+        );
         if json_mode {
             run.arg("--json");
         }

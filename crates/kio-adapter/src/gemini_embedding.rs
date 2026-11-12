@@ -85,12 +85,12 @@ impl Default for EmbedBatchOutput {
 
 #[derive(Clone)]
 pub struct EnvGeminiEmbeddingClient {
-    settings: Arc<AdapterRuntimeSettings>,
+    api_key: ureq::http::HeaderValue,
     base_url: Option<String>,
     http: AuthenticatedHttpClient,
 }
 
-// Runtime settings contain credentials for both roles and must not enter diagnostics.
+// The captured credential must never enter diagnostics.
 impl std::fmt::Debug for EnvGeminiEmbeddingClient {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -102,26 +102,31 @@ impl std::fmt::Debug for EnvGeminiEmbeddingClient {
 }
 
 impl EnvGeminiEmbeddingClient {
-    #[must_use]
-    pub fn new(settings: Arc<AdapterRuntimeSettings>) -> Self {
-        Self {
-            settings,
+    pub fn new(settings: Arc<AdapterRuntimeSettings>) -> Result<Self> {
+        let key = settings.resolve_role_api_key("embedding")?.ok_or_else(|| {
+            AdapterError::Auth(
+                "no Gemini embedding API key: declare tools.toml `[embedding] auth`".to_owned(),
+            )
+        })?;
+        let mut api_key = ureq::http::HeaderValue::from_str(&key).map_err(|_| {
+            AdapterError::Auth("embedding API key is not a valid HTTP header value".to_owned())
+        })?;
+        api_key.set_sensitive(true);
+        Ok(Self {
+            api_key,
             base_url: None,
             http: AuthenticatedHttpClient::new(HttpPolicy::default()),
-        }
+        })
     }
 
     #[allow(dead_code)]
-    #[must_use]
     pub fn with_base_url(
         settings: Arc<AdapterRuntimeSettings>,
         base_url: impl Into<String>,
-    ) -> Self {
-        Self {
-            settings,
-            base_url: Some(base_url.into()),
-            http: AuthenticatedHttpClient::new(HttpPolicy::default()),
-        }
+    ) -> Result<Self> {
+        let mut client = Self::new(settings)?;
+        client.base_url = Some(base_url.into());
+        Ok(client)
     }
 
     fn base_url(&self) -> String {
@@ -131,16 +136,6 @@ impl EnvGeminiEmbeddingClient {
             .trim_end_matches('/')
             .to_owned()
     }
-
-    fn api_key(&self) -> Result<String> {
-        self.settings
-            .resolve_role_api_key("embedding")?
-            .ok_or_else(|| {
-                AdapterError::Auth(
-                    "no Gemini embedding API key: declare tools.toml `[embedding] auth`".to_owned(),
-                )
-            })
-    }
 }
 
 impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
@@ -148,12 +143,11 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
         if !is_mutable_model_alias(configured_model) {
             return Ok(configured_model.to_owned());
         }
-        let api_key = self.api_key()?;
         let response = self
             .http
             .agent()
             .get(&format!("{}/v1beta/models", self.base_url()))
-            .header("x-goog-api-key", &api_key)
+            .header("x-goog-api-key", self.api_key.clone())
             .header("Accept-Encoding", "identity")
             .call()
             .map_err(http_error)
@@ -212,7 +206,6 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
         dimensions: u32,
         idempotency_header: Option<(&str, &str)>,
     ) -> Result<EmbedBatchOutput> {
-        let api_key = self.api_key()?;
         // `:batchEmbedContents` embeds the whole batch in ONE SYNCHRONOUS
         // request — the batching here is client-side, and this is the Sync lane
         // even though the endpoint name contains "batch". The provider's actual
@@ -228,7 +221,7 @@ impl GeminiEmbeddingClient for EnvGeminiEmbeddingClient {
                 "{}/v1beta/models/{model_pin}:batchEmbedContents",
                 self.base_url()
             ))
-            .header("x-goog-api-key", &api_key)
+            .header("x-goog-api-key", self.api_key.clone())
             .header("Content-Type", "application/json")
             .header("Accept-Encoding", "identity");
         // QA13 (step4b-contract-tests-p3a.md §E, 04 §5.5 L880): attach the
@@ -343,6 +336,29 @@ pub struct GeminiEmbeddingAdapter<C = EnvGeminiEmbeddingClient> {
     provider_idempotency: crate::types::ProviderIdempotency,
 }
 
+pub(crate) fn descriptor_from_profile(
+    profile: &AdapterProfile,
+) -> crate::types::EmbeddingDescriptor {
+    let mut descriptor = crate::types::EmbeddingDescriptor::from_profile(profile);
+    descriptor.completion.batch = true;
+    descriptor.capability.image_mime_types = vec!["image/png".into(), "image/jpeg".into()];
+    descriptor.limits.max_encoded_bytes = Some(16 * 1024 * 1024);
+    descriptor.limits.max_tokens_per_member = Some(8192);
+    descriptor.pricing = vec![
+        crate::types::EmbeddingPrice {
+            kind: BillableUnitKind::TokensIn,
+            standard_usd_per_unit: 0.20 / 1_000_000.0,
+            batch_usd_per_unit: Some(0.10 / 1_000_000.0),
+        },
+        crate::types::EmbeddingPrice {
+            kind: BillableUnitKind::ImageTokensIn,
+            standard_usd_per_unit: 0.45 / 1_000_000.0,
+            batch_usd_per_unit: Some(0.225 / 1_000_000.0),
+        },
+    ];
+    descriptor
+}
+
 impl<C> GeminiEmbeddingAdapter<C> {
     pub fn new(client: C, configured_model: impl Into<String>, dimensions: u32) -> Self {
         Self {
@@ -454,24 +470,7 @@ impl<C: GeminiEmbeddingClient> EmbeddingAdapter for GeminiEmbeddingAdapter<C> {
     }
 
     fn descriptor(&self) -> crate::types::EmbeddingDescriptor {
-        let mut descriptor = crate::types::EmbeddingDescriptor::from_profile(&self.profile());
-        descriptor.completion.batch = true;
-        descriptor.capability.image_mime_types = vec!["image/png".into(), "image/jpeg".into()];
-        descriptor.limits.max_encoded_bytes = Some(16 * 1024 * 1024);
-        descriptor.limits.max_tokens_per_member = Some(8192);
-        descriptor.pricing = vec![
-            crate::types::EmbeddingPrice {
-                kind: BillableUnitKind::TokensIn,
-                standard_usd_per_unit: 0.20 / 1_000_000.0,
-                batch_usd_per_unit: Some(0.10 / 1_000_000.0),
-            },
-            crate::types::EmbeddingPrice {
-                kind: BillableUnitKind::ImageTokensIn,
-                standard_usd_per_unit: 0.45 / 1_000_000.0,
-                batch_usd_per_unit: Some(0.225 / 1_000_000.0),
-            },
-        ];
-        descriptor
+        descriptor_from_profile(&self.profile())
     }
 
     fn embed(&self, request: EmbeddingRequest) -> Result<EmbeddingOutcome> {
@@ -711,52 +710,84 @@ mod tests {
     #[test]
     fn client_and_adapter_debug_omit_both_role_credentials() {
         const MARKDOWN_SECRET: &str = "DEBUG-MARKDOWN-CANARY-7ea4";
-        const EMBEDDING_SECRET: &str = "DEBUG-EMBEDDING-CANARY-b189";
-        let settings = AdapterRuntimeSettings {
-            declarations: [
-                ("markdown", MARKDOWN_SECRET),
-                ("embedding", EMBEDDING_SECRET),
-            ]
-            .into_iter()
-            .map(|(role, secret)| {
-                (
-                    role.to_owned(),
-                    crate::tool_lock::DeclaredAdapter {
-                        auth: Some(format!("plain:{secret}")),
-                        ..crate::tool_lock::DeclaredAdapter::default()
-                    },
-                )
-            })
-            .collect(),
-            ..AdapterRuntimeSettings::default()
-        };
-        let client =
-            EnvGeminiEmbeddingClient::with_base_url(Arc::new(settings), "https://fixture.invalid");
-        let adapter =
-            GeminiEmbeddingAdapter::new(client.clone(), ADOPTED_MODEL_PIN, ADOPTED_DIMENSIONS);
-        for debug in [
-            format!("{client:?}"),
-            format!("{adapter:?}"),
-            format!("{client:#?}"),
-            format!("{adapter:#?}"),
-        ] {
-            assert!(!debug.contains(MARKDOWN_SECRET));
-            assert!(!debug.contains(EMBEDDING_SECRET));
-            assert!(!debug.contains("settings"));
-            assert!(debug.contains("https://fixture.invalid"));
-            assert!(debug.contains("http_policy"));
-        }
+        const EMBEDDING_SECRET: &str = "test-key";
+        crate::tool_lock::with_test_role_auth("embedding", |settings| {
+            let mut settings = settings.clone();
+            settings.declarations.insert(
+                "markdown".to_owned(),
+                crate::tool_lock::DeclaredAdapter {
+                    auth: Some(format!("plain:{MARKDOWN_SECRET}")),
+                    ..crate::tool_lock::DeclaredAdapter::default()
+                },
+            );
+            let client = EnvGeminiEmbeddingClient::with_base_url(
+                Arc::new(settings),
+                "https://fixture.invalid",
+            )
+            .unwrap();
+            let adapter =
+                GeminiEmbeddingAdapter::new(client.clone(), ADOPTED_MODEL_PIN, ADOPTED_DIMENSIONS);
+            for debug in [
+                format!("{client:?}"),
+                format!("{adapter:?}"),
+                format!("{client:#?}"),
+                format!("{adapter:#?}"),
+            ] {
+                assert!(!debug.contains(MARKDOWN_SECRET));
+                assert!(!debug.contains(EMBEDDING_SECRET));
+                assert!(!debug.contains("settings"));
+                assert!(debug.contains("https://fixture.invalid"));
+                assert!(debug.contains("http_policy"));
+            }
+        });
     }
 
     #[test]
     fn explicit_client_settings_do_not_share_credentials() {
         crate::tool_lock::with_test_role_auth("embedding", |settings| {
-            let configured = EnvGeminiEmbeddingClient::new(Arc::new(settings.clone()));
+            let configured = EnvGeminiEmbeddingClient::new(Arc::new(settings.clone())).unwrap();
+            assert!(configured.api_key.is_sensitive());
             let unconfigured =
                 EnvGeminiEmbeddingClient::new(Arc::new(AdapterRuntimeSettings::default()));
-            assert_eq!(configured.api_key().unwrap(), "test-key");
-            assert!(matches!(unconfigured.api_key(), Err(AdapterError::Auth(_))));
-            assert_eq!(configured.api_key().unwrap(), "test-key");
+            assert_eq!(configured.api_key.to_str().unwrap(), "test-key");
+            assert!(matches!(unconfigured, Err(AdapterError::Auth(_))));
+            assert_eq!(configured.api_key.to_str().unwrap(), "test-key");
+        });
+    }
+
+    #[test]
+    fn malformed_credential_header_is_rejected_at_the_factory_without_key_disclosure() {
+        crate::tool_lock::with_test_role_auth("embedding", |settings| {
+            let mut settings = settings.clone();
+            let secret = "malformed-header-secret\nforbidden";
+            settings.declarations.get_mut("embedding").unwrap().auth =
+                Some(format!("plain:{secret}"));
+            std::fs::write(
+                settings.tools_toml_path.as_ref().unwrap(),
+                "[embedding]\nauth = \"plain:malformed-header-secret\\nforbidden\"\n",
+            )
+            .unwrap();
+            let error = crate::catalog::run_embedding_attempt_with_control(
+                Arc::new(settings),
+                crate::catalog::EmbeddingExecution::Online(
+                    crate::catalog::AdoptedEmbeddingExecution::Real,
+                ),
+                vec![EmbeddingItem::text("query", "fixture")],
+                EmbeddingInputType::Query,
+                None,
+                &kio_core::control::ControlHandle::default(),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                &error,
+                crate::catalog::EmbeddingRunError::BeforeDispatch(AdapterError::Auth(_))
+            ));
+            assert!(
+                !error
+                    .error()
+                    .to_string()
+                    .contains("malformed-header-secret")
+            );
         });
     }
 
@@ -1095,5 +1126,120 @@ mod tests {
             client.calls.lock().unwrap().is_empty(),
             "broken bytes must not reach the client"
         );
+    }
+    // Append inside gemini_embedding.rs's existing tests module for baseline Red.
+    // Green constructor API adaptation: append `.unwrap()` to with_base_url(...).
+    #[test]
+    fn one_attempt_keeps_verified_credential_through_model_lookup_and_embed() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+        crate::tool_lock::with_test_role_auth("embedding", |settings| {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base_url = format!("https://{}", listener.local_addr().unwrap());
+            let tls = crate::http_policy::test_tls::Fixture::new();
+            let http = tls.client(HttpPolicy::default());
+            let credential_path = settings.tools_toml_path.clone().unwrap();
+            let server = std::thread::spawn(move || {
+                let mut requests = Vec::new();
+                for ordinal in 0..2 {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::WouldBlock
+                                    && Instant::now() < deadline =>
+                            {
+                                std::thread::sleep(Duration::from_millis(5))
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                return requests;
+                            }
+                            Err(error) => panic!("mock accept: {error}"),
+                        }
+                    };
+                    let mut stream = tls.accept_stream(stream);
+                    stream
+                        .sock
+                        .set_read_timeout(Some(Duration::from_secs(2)))
+                        .unwrap();
+                    let mut bytes = Vec::new();
+                    let mut buffer = [0; 4096];
+                    loop {
+                        let read = stream.read(&mut buffer).unwrap();
+                        assert_ne!(read, 0);
+                        bytes.extend_from_slice(&buffer[..read]);
+                        if let Some(end) = bytes.windows(4).position(|part| part == b"\r\n\r\n") {
+                            let header = String::from_utf8_lossy(&bytes[..end]);
+                            let length = header
+                                .lines()
+                                .find_map(|line| {
+                                    let (key, value) = line.split_once(':')?;
+                                    key.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
+                            if bytes.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    requests.push(String::from_utf8(bytes).unwrap());
+                    let body = if ordinal == 0 {
+                        assert!(
+                            requests[0].starts_with("GET /v1beta/models "),
+                            "fixture must reach a genuine model lookup before credential mutation"
+                        );
+                        // Mutation occurs after credential consumption for GET,
+                        // before its successful response and subsequent POST.
+                        std::fs::write(
+                            &credential_path,
+                            "[embedding]\nauth = \"plain:changed-key\"\n",
+                        )
+                        .unwrap();
+                        r#"{"models":[{"name":"models/fixture-001"}]}"#
+                    } else {
+                        r#"{"embeddings":[{"values":[1.0,0.0]}]}"#
+                    };
+                    write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    stream.flush().unwrap();
+                }
+                requests
+            });
+            let mut client =
+                EnvGeminiEmbeddingClient::with_base_url(Arc::new(settings.clone()), base_url)
+                    .unwrap();
+            client.http = http;
+            let adapter = GeminiEmbeddingAdapter::new(client, "fixture-latest", 2);
+            let result = adapter.embed(EmbeddingRequest {
+                input_type: crate::types::EmbeddingInputType::Query,
+                items: vec![EmbeddingItem::text("query", "snapshot fixture")],
+                idempotency_token: None,
+            });
+            let requests = server.join().unwrap();
+            assert_eq!(
+                requests.len(),
+                2,
+                "one verified credential must cover GET and POST; result={result:?}"
+            );
+            for request in &requests {
+                assert!(
+                    request
+                        .to_ascii_lowercase()
+                        .contains("x-goog-api-key: test-key\r\n")
+                );
+                assert!(!request.contains("changed-key"));
+            }
+            assert!(
+                result.is_ok(),
+                "same attempt must complete with its captured credential: {result:?}"
+            );
+            assert!(
+                settings.resolve_role_api_key("embedding").is_err(),
+                "fresh credential consumption must reject source mutation"
+            );
+        });
     }
 }

@@ -347,16 +347,63 @@ struct IndexOutput {
     embedding_tasks_executed: u64,
     embedding_tasks_failed: u64,
     tree_hash: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
     commit_hash: Option<String>,
-    #[allow(dead_code)]
+    #[serde(deserialize_with = "required_nullable")]
     commit: Option<Value>,
-    budget_warning: Option<Value>,
+    budget_status: BudgetStatus,
+    #[serde(deserialize_with = "required_nullable")]
+    budget_reason: Option<String>,
+    #[serde(deserialize_with = "required_nullable")]
+    budget_warning: Option<String>,
+    error_code: Option<String>,
+    publication_status: Option<String>,
     skipped_units: Vec<Value>,
     child_scopes: Vec<Value>,
     child_scope_discovery: ChildScopeDiscoveryOutput,
     #[serde(default)]
     skipped_units_guidance: Option<String>,
     gc: GcReceipt,
+}
+
+// docs/06-cli-spec.md and docs/04-pipeline.md §5.4: an unobservable
+// budget does not prevent free local indexing. It must retain its typed reason.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum BudgetStatus {
+    Known,
+    Unknown,
+}
+
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
+impl IndexOutput {
+    fn has_consistent_budget_observation(&self) -> bool {
+        match (&self.budget_status, self.budget_reason.as_deref()) {
+            (BudgetStatus::Known, None) => true,
+            (BudgetStatus::Unknown, Some(reason)) => {
+                let Some((namespace, number)) = reason.rsplit_once('-') else {
+                    return false;
+                };
+                namespace.starts_with("KIO-E-")
+                    && namespace[6..].split('-').all(|part| {
+                        !part.is_empty()
+                            && part
+                                .bytes()
+                                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+                    })
+                    && number.len() == 3
+                    && number.bytes().all(|byte| byte.is_ascii_digit())
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Every preparer invocation is a public, mutating index command, including
@@ -954,6 +1001,18 @@ fn validate_init_output(value: &Value, scope: PathBuf) -> Result<(), ScalePrepar
     Ok(())
 }
 
+/// Validate real CLI stdout against the scale preparer's offline repair contract.
+/// The byte entry point and scale preparation share the same strict schema and
+/// commit-integrity checks; callers cannot substitute a looser index decoder.
+pub fn validate_offline_repair_index_output(
+    bytes: &[u8],
+    files: usize,
+    embeddings: usize,
+) -> Result<(), ScalePrepareError> {
+    let value = serde_json::from_slice(bytes)?;
+    validate_index_output(&value, IndexExpectation::Repair { files, embeddings })
+}
+
 fn validate_index_output(
     value: &Value,
     expected: IndexExpectation,
@@ -974,7 +1033,13 @@ fn validate_index_output(
         || !output.skipped_units.is_empty()
         || !output.child_scopes.is_empty()
         || !output.child_scope_discovery.is_completed_empty()
+        || !output.has_consistent_budget_observation()
         || output.budget_warning.is_some()
+        || output.error_code.is_some()
+        || output
+            .publication_status
+            .as_deref()
+            .is_some_and(|status| status != "completed")
         || output.skipped_units_guidance.is_some()
         || output.gc.mode != "manual_only"
         || output.gc.reason != "manual_only"
@@ -1760,7 +1825,8 @@ esac
             "embedding_tasks_failed":0,
             "tree_hash":tree,
             "commit_hash":commit_hash,
-            "commit":commit, "budget_warning":null, "skipped_units":[],
+            "commit":commit, "budget_status":"known", "budget_reason":null,
+            "budget_warning":null, "skipped_units":[],
             "child_scopes":[],
             "child_scope_discovery": {
                 "page_size": kio_pipeline::scan::CHILD_SCOPE_DISCOVERY_PAGE_SIZE,
@@ -1920,6 +1986,113 @@ esac
                 )
                 .is_err(),
                 "{key}"
+            );
+        }
+    }
+
+    #[test]
+    fn index_parser_accepts_known_or_typed_unknown_budget_observation() {
+        for (status, reason) in [
+            ("known", Value::Null),
+            (
+                "unknown",
+                serde_json::json!("KIO-E-LEDGER-UNINITIALIZED-001"),
+            ),
+            ("unknown", serde_json::json!("KIO-E-LEDGER-SNAPSHOT-001")),
+            ("unknown", serde_json::json!("KIO-E-IO-001")),
+            (
+                "unknown",
+                serde_json::json!("KIO-E-LEDGER-SNAPSHOT-UNSAFE-001"),
+            ),
+        ] {
+            for publication in [None, Some("completed")] {
+                let mut output = indexed_output();
+                output["budget_status"] = serde_json::json!(status);
+                output["budget_reason"] = reason.clone();
+                if let Some(publication) = publication {
+                    output["publication_status"] = serde_json::json!(publication);
+                }
+                assert!(
+                    validate_index_output(
+                        &output,
+                        IndexExpectation::Repair {
+                            files: 1,
+                            embeddings: 0
+                        },
+                    )
+                    .is_ok(),
+                    "{output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn index_parser_rejects_missing_malformed_and_inconsistent_budget_contract() {
+        let expected = IndexExpectation::Repair {
+            files: 1,
+            embeddings: 0,
+        };
+        for missing in [
+            "budget_status",
+            "budget_reason",
+            "budget_warning",
+            "commit_hash",
+            "commit",
+        ] {
+            let mut output = indexed_output();
+            output.as_object_mut().unwrap().remove(missing);
+            assert!(
+                validate_index_output(&output, expected.clone()).is_err(),
+                "missing {missing}"
+            );
+        }
+        for (field, value) in [
+            ("budget_status", serde_json::json!("unexpected")),
+            ("budget_status", Value::Null),
+            ("budget_status", serde_json::json!(false)),
+            ("budget_reason", serde_json::json!(7)),
+            (
+                "budget_reason",
+                serde_json::json!("KIO-E-LEDGER-SNAPSHOT-001"),
+            ),
+            ("budget_warning", serde_json::json!({})),
+            ("budget_warning", serde_json::json!("warning")),
+            ("publication_status", serde_json::json!("not_started")),
+            ("publication_status", serde_json::json!(false)),
+            ("error_code", serde_json::json!("KIO-E-ADAPTER-AUTH-001")),
+            ("error_code", serde_json::json!(false)),
+            ("unknown", serde_json::json!(false)),
+            (
+                "commit_hash",
+                serde_json::json!(format!("sha256:{}", "f".repeat(64))),
+            ),
+            ("commit", serde_json::json!({})),
+        ] {
+            let mut output = indexed_output();
+            output[field] = value;
+            assert!(
+                validate_index_output(&output, expected.clone()).is_err(),
+                "{field}: {output}"
+            );
+        }
+        for reason in [
+            Value::Null,
+            serde_json::json!(""),
+            serde_json::json!("ledger unavailable"),
+            serde_json::json!("KIO-E-"),
+            serde_json::json!("KIO-E-LEDGER--001"),
+            serde_json::json!("KIO-E-X"),
+            serde_json::json!("KIO-E-LEDGER-MISSING-NOPE"),
+            serde_json::json!("KIO-E-LEDGER-SNAPSHOT-01"),
+            serde_json::json!("KIO-E-LEDGER-SNAPSHOT-0001"),
+        ] {
+            let mut output = indexed_output();
+            output["budget_status"] = serde_json::json!("unknown");
+            output["budget_reason"] = reason;
+            assert!(
+                validate_index_output(&output, expected.clone()).is_err(),
+                "{output}"
             );
         }
     }

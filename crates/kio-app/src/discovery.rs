@@ -182,6 +182,7 @@ fn verify_private_transport(
     let name = leaf
         .to_str()
         .ok_or_else(|| KioError::invalid_usage("private state leaf must be UTF-8"))?;
+    kio_core::private_fs::verify_private_directory_handle(directory)?;
     let private =
         kio_core::private_fs::read_private_file_at(directory, name, expected.len() as u64)?;
     if private != expected {

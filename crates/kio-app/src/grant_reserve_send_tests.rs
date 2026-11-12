@@ -72,7 +72,15 @@ fn run(change: Change, test_name: &str) {
         fs::write(root.path().join(path), png).unwrap();
     }
     assert!(kio_pipeline::scan::classify_secret("api_secret.png").is_some());
-    crate::execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+    crate::execute(
+        &context,
+        CommandRequest::Init(InitArgs {
+            path: None,
+            independent: false,
+            yes: false,
+        }),
+    )
+    .unwrap();
     // Offline ingest creates immutable native ownership, rather than test rows.
     crate::execute(&context, CommandRequest::Index(index_args(false))).unwrap();
     let base_control = ControlHandle::new(DebugTestControl::from_env());
@@ -144,14 +152,23 @@ fn run(change: Change, test_name: &str) {
         &profile.tool_profile_hash,
     );
     let path = crate::approvals::store_path(&base_control);
-    let before_grants = PrivateGrantStore::open_readonly(&path, &base_control)
-        .unwrap()
-        .unwrap()
-        .records()
-        .to_vec();
+    let before_grants = PrivateGrantStore::open_readonly(
+        &path,
+        &crate::settings::data_home(&base_control),
+        &base_control,
+    )
+    .unwrap()
+    .unwrap()
+    .records()
+    .to_vec();
     let paired: Vec<_> = before_grants
         .iter()
-        .filter(|r| r.binding.tool_id == tool && r.state == GrantState::Active)
+        .filter(|r| {
+            r.binding
+                .scoped()
+                .is_some_and(|binding| binding.tool_id == tool)
+                && r.state == GrantState::Active
+        })
         .cloned()
         .collect();
     assert_eq!(paired.len(), 2);
@@ -183,7 +200,9 @@ fn run(change: Change, test_name: &str) {
             CommandRequest::Index(index_args(true)),
         )
     });
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // Native Windows may spend longer opening the fixture before reservation.
+    // Keep a bounded arrival wait; the dispatch assertions remain unchanged.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while !ready.exists() && !worker.is_finished() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -204,10 +223,17 @@ fn run(change: Change, test_name: &str) {
             } else {
                 GrantOperation::SendSecrets
             };
-            let mut store = PrivateGrantStore::open_or_create(&path, &base_control).unwrap();
+            let mut store = PrivateGrantStore::open_or_create(
+                &path,
+                &crate::settings::data_home(&base_control),
+                &base_control,
+            )
+            .unwrap();
             let revoked = store
                 .revoke_matching("2026-10-20T00:00:00Z".into(), |binding| {
-                    binding.tool_id == tool && binding.operation == operation
+                    binding.scoped().is_some_and(|binding| {
+                        binding.tool_id == tool && binding.operation == operation
+                    })
                 })
                 .unwrap();
             assert_eq!(
@@ -221,7 +247,7 @@ fn run(change: Change, test_name: &str) {
                     .iter()
                     .find(|r| r.grant_id == original.grant_id)
                     .unwrap();
-                if original.binding.operation == operation {
+                if original.binding.operation() == operation {
                     assert_eq!(current.state, GrantState::Revoked);
                 } else {
                     assert_eq!(current, original, "other paired authority unchanged");

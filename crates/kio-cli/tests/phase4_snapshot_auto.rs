@@ -795,7 +795,12 @@ fn malformed_checkpoint_temp_fails_before_snapshot_publication() {
     fs::write(dir.path().join("new.md"), new_bytes).unwrap();
     let before_head = head(&dir);
     let malformed = dir.path().join(".kio/.snapshot-auto-state-123-456");
-    fs::write(&malformed, b"not canonical scheduler state\n").unwrap();
+    let owned = kio_core::store_dir::StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+    let mut file = owned
+        .create_private_file(Path::new(malformed.file_name().unwrap()))
+        .unwrap();
+    std::io::Write::write_all(&mut file, b"not canonical scheduler state\n").unwrap();
+    drop(file);
 
     let output = kio(&dir, &["snapshot", "auto", "--json"], T0)
         .output()
@@ -832,12 +837,17 @@ fn concurrent_checkpoint_replacement_is_preserved_and_fails_closed() {
     let child = child.spawn().unwrap();
     wait_for_path(&ready);
 
-    let concurrent =
-        b"{\"last_successful_eligible_attempt_at\":\"2026-08-14T00:00:30Z\",\"version\":1}\n";
+    // A fresh inode with canonical private checkpoint bytes isolates identity
+    // replacement from schema and permission failures.
+    let concurrent = fs::read(dir.path().join(".kio/snapshot-auto.json")).unwrap();
     let replacement = dir.path().join(".kio/snapshot-auto.concurrent");
-    let mut file = fs::File::create(&replacement).unwrap();
-    file.write_all(concurrent).unwrap();
+    let owned = kio_core::store_dir::StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+    let mut file = owned
+        .create_private_file(Path::new(replacement.file_name().unwrap()))
+        .unwrap();
+    file.write_all(&concurrent).unwrap();
     file.sync_all().unwrap();
+    drop(file);
     let attacked = attack_succeeded(fs::rename(
         &replacement,
         dir.path().join(".kio/snapshot-auto.json"),
@@ -888,16 +898,18 @@ fn concurrent_first_checkpoint_publication_is_no_clobber() {
     let child = child.spawn().unwrap();
     wait_for_path(&ready);
 
-    let concurrent =
-        b"{\"last_successful_eligible_attempt_at\":\"2026-08-13T23:59:30Z\",\"version\":1}\n";
+    let concurrent = format!(
+        "{{\"idle_observed_since\":\"2026-08-13T23:59:30Z\",\"last_successful_eligible_attempt_at\":\"2026-08-13T23:59:30Z\",\"version\":2,\"working_set_digest\":\"{}\"}}\n",
+        hash_bytes(b"independent first checkpoint")
+    );
     let state = dir.path().join(".kio/snapshot-auto.json");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&state)
+    let owned = kio_core::store_dir::StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+    let mut file = owned
+        .create_private_file(Path::new("snapshot-auto.json"))
         .unwrap();
-    file.write_all(concurrent).unwrap();
+    file.write_all(concurrent.as_bytes()).unwrap();
     file.sync_all().unwrap();
+    drop(file);
     fs::write(ready.with_extension("release"), b"release").unwrap();
 
     let output = child.wait_with_output().unwrap();
@@ -906,7 +918,7 @@ fn concurrent_first_checkpoint_publication_is_no_clobber() {
         output_json(&output)["error_code"],
         "KIO-E-SNAPSHOT-STATE-CHANGED-001"
     );
-    assert_eq!(fs::read(&state).unwrap(), concurrent);
+    assert_eq!(fs::read(&state).unwrap(), concurrent.as_bytes());
     assert_eq!(head(&dir), before_head);
     assert!(fs::read_dir(dir.path().join(".kio")).unwrap().all(|entry| {
         !entry
@@ -1028,7 +1040,16 @@ fn config_inode_replacement_at_publication_is_retryable_and_nonpublishing() {
     let config = dir.path().join(".kio/config.toml");
     let bytes = fs::read(&config).unwrap();
     let replacement = dir.path().join(".kio/config.replacement");
-    fs::write(&replacement, bytes).unwrap();
+    // Replace identity while preserving the own-metadata access contract.
+    // The publication must reject the inode change independently of permissions.
+    kio_core::store_dir::StoreDirectory::open(&dir.path().join(".kio"))
+        .unwrap()
+        .write_atomic(
+            std::path::Path::new("config.replacement"),
+            &bytes,
+            kio_core::store_dir::Publication::CreateOnly,
+        )
+        .unwrap();
     let attacked = attack_succeeded(fs::rename(&replacement, &config));
     fs::write(ready.with_extension("release"), b"release").unwrap();
 

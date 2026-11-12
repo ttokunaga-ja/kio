@@ -230,24 +230,37 @@ pub(crate) fn validate_gc_temp_leaf(leaf: &str) -> Result<()> {
 /// deliberately lives below `gc/internal`, never beside the public index: a
 /// crashed preparation must not leave an executable-looking database in the
 /// public index directory.
+fn private_index_directory(
+    handle: &std::fs::File,
+    label: &Path,
+) -> Result<kio_core::store_dir::StoreDirectory> {
+    let directory = kio_core::store_dir::StoreDirectory::from_retained(
+        handle
+            .try_clone()
+            .map_err(|error| IndexError::Schema(error.to_string()))?,
+        label.to_path_buf(),
+    )
+    .map_err(|error| IndexError::Schema(error.to_string()))?;
+    kio_core::private_fs::verify_private_directory_handle(&directory)
+        .map_err(|error| IndexError::Schema(error.to_string()))?;
+    Ok(directory)
+}
+
 pub(crate) fn open_gc_internal_index_dir(kio_dir: &std::fs::File) -> Result<std::fs::File> {
     fn open_or_create(parent: &std::fs::File, leaf: &str) -> Result<std::fs::File> {
-        match cap_fs::open_dir_nofollow(parent, Path::new(leaf)) {
-            Ok(dir) => Ok(dir),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let options = cap_fs::DirOptions::new();
-                cap_fs::create_dir(parent, Path::new(leaf), &options).map_err(|error| {
-                    IndexError::Schema(format!("create private GC index directory {leaf}: {error}"))
-                })?;
-                sync_bound_gc_directory(parent, &format!("fsync private GC index parent {leaf}"))?;
-                cap_fs::open_dir_nofollow(parent, Path::new(leaf)).map_err(|error| {
-                    IndexError::Schema(format!("open private GC index directory {leaf}: {error}"))
-                })
-            }
-            Err(error) => Err(IndexError::Schema(format!(
-                "open private GC index directory {leaf}: {error}"
-            ))),
+        let retained = private_index_directory(parent, Path::new(leaf))?;
+        let handle = if retained
+            .contains_entry(Path::new(leaf))
+            .map_err(|error| IndexError::Schema(error.to_string()))?
+        {
+            retained.open_directory(Path::new(leaf))
+        } else {
+            retained.create_directory(Path::new(leaf))
         }
+        .map_err(|error| IndexError::Schema(error.to_string()))?;
+        private_index_directory(&handle, Path::new(leaf))?;
+        sync_bound_gc_directory(parent, &format!("fsync private GC index parent {leaf}"))?;
+        Ok(handle)
     }
     let gc = open_or_create(kio_dir, "gc")?;
     let internal = open_or_create(&gc, "internal")?;
@@ -257,14 +270,20 @@ pub(crate) fn open_gc_internal_index_dir(kio_dir: &std::fs::File) -> Result<std:
 pub(crate) fn open_existing_gc_internal_index_dir(
     kio_dir: &std::fs::File,
 ) -> Result<std::fs::File> {
-    let gc = cap_fs::open_dir_nofollow(kio_dir, Path::new("gc")).map_err(|error| {
-        IndexError::Schema(format!("open private GC index gc directory: {error}"))
-    })?;
-    let internal = cap_fs::open_dir_nofollow(&gc, Path::new("internal")).map_err(|error| {
-        IndexError::Schema(format!("open private GC index internal directory: {error}"))
-    })?;
-    cap_fs::open_dir_nofollow(&internal, Path::new("index"))
-        .map_err(|error| IndexError::Schema(format!("open private GC index directory: {error}")))
+    let root = private_index_directory(kio_dir, Path::new(".kio"))?;
+    let gc = root
+        .open_directory(Path::new("gc"))
+        .map_err(|error| IndexError::Schema(error.to_string()))?;
+    let gc = private_index_directory(&gc, Path::new("gc"))?;
+    let internal = gc
+        .open_directory(Path::new("internal"))
+        .map_err(|error| IndexError::Schema(error.to_string()))?;
+    let internal = private_index_directory(&internal, Path::new("internal"))?;
+    let index = internal
+        .open_directory(Path::new("index"))
+        .map_err(|error| IndexError::Schema(error.to_string()))?;
+    private_index_directory(&index, Path::new("index"))?;
+    Ok(index)
 }
 
 fn gc_private_dir_identity(dir: &std::fs::File) -> Result<String> {
@@ -430,13 +449,9 @@ pub fn prepare_bound_gc_index_rotation(
         ));
     }
     let source_state = source_file_state(&input)?;
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create_new(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-    let mut output = cap_fs::open(&private, Path::new(temp_leaf), &options)
+    let retained = private_index_directory(&private, Path::new(temp_leaf))?;
+    let mut output = retained
+        .create_private_file(Path::new(temp_leaf))
         .map_err(|error| IndexError::Schema(format!("create GC private index copy: {error}")))?;
     std::io::copy(&mut input, &mut output)
         .map_err(|error| IndexError::Schema(format!("copy GC private index: {error}")))?;
@@ -2399,6 +2414,8 @@ pub const CHUNK_VEC_DIMENSIONS: usize = 768;
 mod tests {
     use super::*;
 
+    include!("private_test_fixtures.rs");
+
     #[cfg(debug_assertions)]
     #[test]
     fn owner_control_gc_copy_barrier_isolation() {
@@ -2769,7 +2786,7 @@ mod tests {
 
     #[test]
     fn current_file_schema_reopens_without_mutation() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -2792,7 +2809,7 @@ mod tests {
 
     #[test]
     fn existing_source_connection_opens_only_a_current_real_database() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -2821,7 +2838,7 @@ mod tests {
 
     #[test]
     fn exact_retarget_candidates_are_exact_bounded_and_read_only() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -2883,7 +2900,7 @@ mod tests {
 
     #[test]
     fn exact_retarget_candidates_classify_overflow() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -2937,7 +2954,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn source_connection_recheck_rejects_named_leaf_replacement() {
-        let directory = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
         let replacement = directory.path().join("replacement.sqlite");
         let config = FtsSchemaConfig {
@@ -2952,21 +2971,28 @@ mod tests {
         )
         .unwrap();
         std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(source._source.file.metadata().unwrap().nlink(), 0);
         let error = source
             .recheck_source_identity()
             .expect_err("replacement must invalidate retained source identity");
-        assert!(
-            error.to_string().contains("hard link")
-                || error.to_string().contains("name changed while operating")
-        );
+        // docs/14: a replaced Kio object must fail closed. The retained
+        // unlinked inode fails the private single-link check before the later
+        // named-leaf identity comparison can run.
+        match error {
+            IndexError::Schema(message) => assert!(
+                message.starts_with("KIO-E-PRIVATE-FILE-UNSAFE-001:"),
+                "replacement must reject the unsafe retained object: {message}"
+            ),
+            other => panic!("replacement must be an unsafe source-integrity error: {other}"),
+        }
     }
 
     #[test]
     fn bound_gc_rotation_stays_on_retained_kio_capability_and_reports_missing() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let kio = directory.path().join(".kio");
         let index = kio.join("index");
-        std::fs::create_dir_all(&index).unwrap();
+        private_test_subdirectory(&index);
         let path = index.join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3014,10 +3040,10 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn bound_gc_rotation_rejects_an_unexpected_initial_generation_without_writing() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let kio = directory.path().join(".kio");
         let index = kio.join("index");
-        std::fs::create_dir_all(&index).unwrap();
+        private_test_subdirectory(&index);
         let path = index.join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3058,8 +3084,8 @@ mod tests {
     fn bound_gc_rotation_rejects_index_symlink_without_touching_victim() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
-        let victim = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
+        let victim = private_test_dir();
         let victim_db = victim.path().join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3067,7 +3093,7 @@ mod tests {
         drop(SqliteFtsIndex::open(&victim_db, config.clone()).unwrap());
         let before = std::fs::read(&victim_db).unwrap();
         let kio = directory.path().join(".kio");
-        std::fs::create_dir(&kio).unwrap();
+        private_test_subdirectory(&kio);
         symlink(victim.path(), kio.join("index")).unwrap();
         let kio_handle = cap_fs::open_ambient_dir(&kio, cap_primitives::ambient_authority())
             .expect("open retained .kio test capability");
@@ -3088,7 +3114,7 @@ mod tests {
     fn open_refuses_a_symlink_source_index_without_touching_its_destination() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let target = directory.path().join("target.sqlite");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3116,7 +3142,7 @@ mod tests {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let target = directory.path().join("target.sqlite");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3210,10 +3236,10 @@ mod tests {
     fn bound_source_fd_survives_parent_replacement_without_touching_victim() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
-        let victim = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
+        let victim = private_test_dir();
         let index = directory.path().join("index");
-        std::fs::create_dir(&index).unwrap();
+        private_test_subdirectory(&index);
         let path = index.join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3240,11 +3266,11 @@ mod tests {
     fn bound_source_fd_survives_repository_root_replacement_without_touching_victim() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
-        let victim = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
+        let victim = private_test_dir();
         let kio = directory.path().join(".kio");
         let index = kio.join("index");
-        std::fs::create_dir_all(&index).unwrap();
+        private_test_subdirectory(&index);
         let path = index.join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3270,7 +3296,7 @@ mod tests {
     fn bound_source_leaf_blocks_rename_and_delete_until_connection_drops() {
         use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3303,7 +3329,7 @@ mod tests {
     fn existing_source_connection_refuses_a_symlink_without_touching_target() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let target = directory.path().join("target.sqlite");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3331,7 +3357,7 @@ mod tests {
 
     #[test]
     fn existing_writable_source_connection_uses_memory_journal_without_sidecars() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3367,8 +3393,9 @@ mod tests {
 
     #[test]
     fn unknown_user_object_is_rejected_without_writing() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
+        drop(private_test_file(&path));
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch("CREATE TABLE unrelated_application_state (id INTEGER PRIMARY KEY);")
             .unwrap();
@@ -3389,7 +3416,7 @@ mod tests {
 
     #[test]
     fn current_schema_with_extra_user_object_is_rejected_without_writing() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3415,7 +3442,7 @@ mod tests {
 
     #[test]
     fn missing_unique_constraint_is_rejected_without_writing() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3453,7 +3480,7 @@ mod tests {
 
     #[test]
     fn disabled_trigger_is_rejected_without_writing() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
         let config = FtsSchemaConfig {
             tokenizer: FtsTokenizer::Trigram,
@@ -3768,9 +3795,10 @@ mod tests {
 
     #[test]
     fn ct4_non_current_chunk_config_column_is_rejected_without_writing() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
         let path = directory.path().join("sqlite.db");
         {
+            drop(private_test_file(&path));
             let conn = Connection::open(&path).unwrap();
             conn.execute_batch(
                 r#"

@@ -4,12 +4,15 @@ use support::canonical_tempdir;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
+use std::path::Path;
 
 use assert_cmd::Command;
 use kio_core::cas::{ObjectKind, ObjectStore, hash_bytes};
 use kio_core::dag::{CommitObject, CommitStats, CommitType};
 use kio_core::gc::ShallowReceipt;
 use kio_core::scope::Repository;
+use kio_core::store_dir::StoreDirectory;
 use rusqlite::{Connection, params};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -1761,14 +1764,22 @@ fn write_shallow_receipt(dir: &TempDir, commit_hash: &str) {
         .kio_dir()
         .join("gc/shallowed")
         .join(commit_hash.strip_prefix("sha256:").unwrap());
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let owned = StoreDirectory::open(repo.kio_dir()).unwrap();
+    let retained = owned
+        .create_directory_all(Path::new("gc/shallowed"))
+        .unwrap();
+    let receipts =
+        StoreDirectory::from_retained(retained, path.parent().unwrap().to_path_buf()).unwrap();
     let receipt = ShallowReceipt::new(
         commit_hash.to_owned(),
         tree_hash,
         "2026-08-14T00:00:00Z".into(),
     )
     .unwrap();
-    fs::write(path, receipt.canonical_bytes().unwrap()).unwrap();
+    let mut file = receipts
+        .create_private_file(Path::new(path.file_name().unwrap()))
+        .unwrap();
+    file.write_all(&receipt.canonical_bytes().unwrap()).unwrap();
 }
 
 #[test]

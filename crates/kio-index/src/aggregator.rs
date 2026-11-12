@@ -2880,6 +2880,25 @@ pub fn vector_ranks(scores: &[VectorScore]) -> BTreeMap<(String, String), u64> {
 mod tests {
     use super::*;
 
+    include!("private_test_fixtures.rs");
+
+    #[cfg(unix)]
+    #[test]
+    fn private_cache_creation_and_unsafe_existing_refusal() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = private_test_dir();
+        let path = directory.path().join("aggregator.sqlite");
+        let cache = Aggregator::open(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+        drop(cache);
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(Aggregator::open(&path).is_err());
+        assert!(Aggregator::recreate(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+    }
+
     fn chunk(id: &str, text: &str) -> AggChunk {
         AggChunk {
             chunk_id: id.to_owned(),
@@ -2952,8 +2971,8 @@ mod tests {
         scope_ids.iter().map(|id| (*id).to_owned()).collect()
     }
 
-    fn store() -> (tempfile::TempDir, Aggregator) {
-        let dir = tempfile::tempdir().unwrap();
+    fn store() -> (PrivateTestDirectory, Aggregator) {
+        let dir = private_test_dir();
         let index = Aggregator::open(&dir.path().join("aggregator.sqlite")).unwrap();
         (dir, index)
     }
@@ -3024,7 +3043,9 @@ mod tests {
             Ok(_) => panic!("regular descriptor must fail"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("owner-only"));
+        assert!(error.to_string().contains("not a directory"), "{error}");
+        assert_eq!(std::fs::read(&regular).unwrap(), b"not a directory");
+        assert!(!directory.path().join("kio").exists());
     }
 
     #[cfg(target_os = "linux")]
@@ -3123,8 +3144,9 @@ mod tests {
 
     #[test]
     fn obsolete_binding_schema_fails_closed_until_explicit_recreate() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("aggregator.sqlite");
+        drop(private_test_file(&path));
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE agg_bindings (scope_id TEXT NOT NULL); \
@@ -3172,8 +3194,9 @@ mod tests {
 
     #[test]
     fn partial_currentish_schema_fails_closed_without_creating_sidecars() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("aggregator.sqlite");
+        drop(private_test_file(&path));
         let conn = Connection::open(&path).unwrap();
         conn.execute_batch(
             "CREATE TABLE agg_bindings (
@@ -3198,7 +3221,7 @@ mod tests {
 
     #[test]
     fn complete_replica_schema_reopens_without_repair() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("aggregator.sqlite");
         drop(Aggregator::open(&path).unwrap());
 
@@ -3223,7 +3246,7 @@ mod tests {
 
     #[test]
     fn retired_image_vec_header_requires_explicit_replica_recreation() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("aggregator.sqlite");
         let replica = Aggregator::open(&path).unwrap();
         // This is the exact former device-cache column.  It is deliberately
@@ -3266,7 +3289,7 @@ mod tests {
     fn recreate_rejects_a_symlink_cache_target() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let target = dir.path().join("target.sqlite");
         std::fs::write(&target, b"must not be removed").unwrap();
         let path = dir.path().join("aggregator.sqlite");
@@ -3290,7 +3313,7 @@ mod tests {
     fn open_refuses_a_symlink_cache_target_without_touching_its_destination() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let target = dir.path().join("target.sqlite");
         std::fs::write(&target, b"must not be opened as a cache").unwrap();
         let path = dir.path().join("aggregator.sqlite");
@@ -3317,10 +3340,10 @@ mod tests {
     fn bound_cache_survives_parent_replacement_without_touching_victim() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap();
-        let victim = tempfile::tempdir().unwrap();
+        let directory = private_test_dir();
+        let victim = private_test_dir();
         let cache_parent = directory.path().join("cache");
-        std::fs::create_dir(&cache_parent).unwrap();
+        private_test_subdirectory(&cache_parent);
         let path = cache_parent.join("aggregator.sqlite");
         let index = Aggregator::open(&path).unwrap();
 
@@ -3387,7 +3410,7 @@ mod tests {
     fn ordinary_open_does_not_follow_attacker_controlled_wal_and_shm_sidecars() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("aggregator.sqlite");
         // Simulate an obsolete WAL-based cache layout.
         drop(Aggregator::open(&path).unwrap());
@@ -3434,7 +3457,7 @@ mod tests {
     fn recreate_refuses_symlink_wal_and_shm_sidecars_without_touching_targets() {
         use std::os::unix::fs::symlink;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_test_dir();
         let path = dir.path().join("aggregator.sqlite");
         drop(Aggregator::open(&path).unwrap());
         let wal_target = dir.path().join("wal-target");

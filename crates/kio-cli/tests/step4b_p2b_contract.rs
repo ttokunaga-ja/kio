@@ -401,6 +401,14 @@ fn assert_text_budget_pause_preserves_ledger(dir: &TempDir, query: &str, cap_kin
         );
         assert_eq!(response["resolved_mode"], "text", "{response}");
         assert_eq!(
+            response["index_status"]["budget_status"], "known",
+            "{response}"
+        );
+        assert!(
+            response["index_status"]["budget_reason"].is_null(),
+            "{response}"
+        );
+        assert_eq!(
             response["index_status"]["budget_paused"], true,
             "{label} must preserve exhausted {cap_kind} budget truth: {response}"
         );
@@ -511,12 +519,12 @@ fn pb_text_search_preserves_cost_ledger_and_write_sequence_identity() {
     assert_ledger_leaves_unchanged(&dir, &before, "auto/default search resolved to text");
 }
 
-/// A valid text query must not downgrade an unsafe device-ledger leaf to a
-/// no-ledger/zero-spend observation or a scope-level partial response. The
-/// fixture owns both aliases; no user cache is ever modified.
+/// docs/04 §5.4: an unsafe budget source cannot hide local text results or
+/// become zero spending. Preserve the typed reason and every source identity.
+/// The fixture owns both aliases; no user cache is ever modified.
 #[cfg(unix)]
 #[test]
-fn pb_text_search_unsafe_ledger_hardlink_fails_closed_without_search_fallback() {
+fn pb_text_search_unsafe_ledger_preserves_results_and_typed_unknown_budget() {
     let dir = canonical_tempdir();
     fs::write(
         dir.path().join("unsafe-ledger-search.md"),
@@ -542,21 +550,31 @@ fn pb_text_search_unsafe_ledger_hardlink_fails_closed_without_search_fallback() 
         .arg("--json")
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(4), "{output:?}");
-    assert!(output.stdout.is_empty(), "{output:?}");
-    let error: Value = serde_json::from_slice(&output.stderr).unwrap();
-    assert_eq!(
-        error["error_code"], "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001",
-        "{error}"
+    assert!(output.status.success(), "{output:?}");
+    let response: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(response["requested_mode"], "text", "{response}");
+    assert_eq!(response["resolved_mode"], "text", "{response}");
+    assert!(
+        !response["results"].as_array().unwrap().is_empty(),
+        "{response}"
     );
-    assert_eq!(error["context"]["reason"], "unsafe_integrity", "{error}");
-    assert!(error.get("index_status").is_none(), "{error}");
-    assert!(error.get("excluded_scopes").is_none(), "{error}");
+    assert_eq!(
+        response["index_status"]["budget_status"], "unknown",
+        "{response}"
+    );
+    assert_eq!(
+        response["index_status"]["budget_reason"], "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001",
+        "{response}"
+    );
+    assert!(
+        response["index_status"]["budget_paused"].is_null(),
+        "{response}"
+    );
 
     assert_eq!(
         observe_unsafe_ledger_leaf(main),
         before_main,
-        "failed text search must not change the unsafe source main leaf"
+        "local text search must not change the unsafe source main leaf"
     );
     for (leaf, before) in leaves[1..].iter().zip(before_other_leaves) {
         assert_eq!(observe_ledger_leaf(leaf), before);
@@ -599,14 +617,28 @@ fn pb_text_search_budget_policy_error_remains_best_effort_and_non_mutating() {
         !response["results"].as_array().unwrap().is_empty(),
         "best-effort budget observation must not hide text results: {response}"
     );
+    // docs/04 §5.4 / docs/06 index_status: the existing supplementary
+    // observation remains non-blocking, but cannot claim known/false budget.
+    assert_eq!(
+        response["index_status"]["budget_status"], "unknown",
+        "{response}"
+    );
+    assert_eq!(
+        response["index_status"]["budget_reason"], "KIO-E-CONFIG-SCHEMA-001",
+        "{response}"
+    );
+    assert!(
+        response["index_status"]["budget_paused"].is_null(),
+        "{response}"
+    );
     assert_ledger_leaves_unchanged(&dir, &before, "invalid budget policy text search");
 }
 
-/// An entirely absent source main/WAL/SHM triad is the normal zero-spend
-/// observation. Text search must not recreate the ledger, lifecycle records,
-/// or SQLite sidecars merely to render `index_status`.
+/// docs/04 §5.4: absent billing state is unknown, never zero spending.
+/// Text search must not recreate the ledger, lifecycle records, or SQLite
+/// sidecars merely to render `index_status`.
 #[test]
-fn pb_text_search_missing_ledger_is_zero_spend_and_no_create() {
+fn pb_text_search_missing_ledger_is_unknown_and_no_create() {
     let dir = canonical_tempdir();
     fs::write(
         dir.path().join("missing-ledger-search.md"),
@@ -632,7 +664,15 @@ fn pb_text_search_missing_ledger_is_zero_spend_and_no_create() {
     assert_eq!(response["requested_mode"], "text", "{response}");
     assert_eq!(response["resolved_mode"], "text", "{response}");
     assert_eq!(
-        response["index_status"]["budget_paused"], false,
+        response["index_status"]["budget_status"], "unknown",
+        "{response}"
+    );
+    assert_eq!(
+        response["index_status"]["budget_reason"], "KIO-E-LEDGER-UNINITIALIZED-001",
+        "{response}"
+    );
+    assert!(
+        response["index_status"]["budget_paused"].is_null(),
         "{response}"
     );
     assert!(
@@ -833,14 +873,13 @@ fn make_pointer_commit_final_shallow(dir: &TempDir, pointer: &Value) {
     let receipt_path = kio_dir(dir)
         .join("gc/shallowed")
         .join(commit_hash.strip_prefix("sha256:").unwrap());
-    fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
     let receipt = ShallowReceipt::new(
         commit_hash.to_owned(),
         commit.tree.clone(),
         "2026-08-14T00:00:00Z".into(),
     )
     .unwrap();
-    fs::write(receipt_path, receipt.canonical_bytes().unwrap()).unwrap();
+    write_new_private_fixture(&receipt_path, receipt.canonical_bytes().unwrap());
 
     let store = ObjectStore::new(kio_dir(dir));
     fs::remove_file(store.object_path(ObjectKind::Tree, &commit.tree).unwrap()).unwrap();
@@ -874,11 +913,24 @@ fn content_path(kio_dir: &Path, kind_dir: &str, hash: &str) -> std::path::PathBu
         .join(digest)
 }
 
+// Malformed payloads still need a legitimately private namespace and leaf.
+fn write_new_private_fixture(path: &Path, bytes: impl AsRef<[u8]>) {
+    use std::io::Write;
+    let parent =
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(path.parent().unwrap())
+            .unwrap();
+    kio_core::private_fs::verify_private_directory_handle(&parent).unwrap();
+    parent
+        .create_private_file(Path::new(path.file_name().unwrap()))
+        .unwrap()
+        .write_all(bytes.as_ref())
+        .unwrap();
+}
+
 fn write_content_bytes(kio_dir: &Path, kind_dir: &str, bytes: &[u8]) -> String {
     let hash = hash_bytes(bytes);
     let path = content_path(kio_dir, kind_dir, &hash);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, bytes).unwrap();
+    write_new_private_fixture(&path, bytes);
     hash
 }
 
@@ -1120,8 +1172,7 @@ fn write_embedding_fixture(kio_dir: &Path, vector: &[f32], declared_dimensions: 
     let hash = keyed.identity_hash().unwrap();
     let bytes = embedding_fixture_bytes(&object);
     let path = content_path(kio_dir, ContentObjectKind::Embedding.directory(), &hash);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, bytes).unwrap();
+    write_new_private_fixture(&path, bytes);
     hash
 }
 
@@ -1267,8 +1318,7 @@ fn pb01_embedding_under_a_foreign_identity_is_a_finding() {
         ContentObjectKind::Embedding.directory(),
         foreign,
     );
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(&path, bytes).unwrap();
+    write_new_private_fixture(&path, bytes);
     let (code, output) = run(&dir, &["repair", "verify-objects"]);
     assert_eq!(code, 3, "{output}");
     assert!(
@@ -1458,7 +1508,12 @@ fn pb09_canonical_ref_names_correspondence_is_asymmetric() {
     // pointing at HEAD that names.jsonl never recorded.
     let head = fs::read_to_string(kio_dir(&dir).join("HEAD")).unwrap();
     let orphan_leaf = format!("tag-{}", "1".repeat(64));
-    fs::write(canonical_dir.join(&orphan_leaf), head.trim()).unwrap();
+    let tag_parent = kio_core::store_dir::StoreDirectory::open(&canonical_dir).unwrap();
+    let mut tag_file = tag_parent
+        .create_private_file(Path::new(&orphan_leaf))
+        .unwrap();
+    std::io::Write::write_all(&mut tag_file, head.trim().as_bytes()).unwrap();
+    drop(tag_file);
     let (code, output) = run(&dir, &["repair", "verify-objects"]);
     assert_eq!(code, 3, "{output}");
     assert!(
@@ -1668,16 +1723,16 @@ fn prune_staging(dir: &TempDir, raw: &str, tool: &str, descriptor: bool) -> Path
         raw.trim_start_matches("sha256:"),
         tool.trim_start_matches("sha256:")
     ));
-    fs::create_dir_all(&root).unwrap();
+    let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(&root).unwrap();
+    kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
     if descriptor {
         let value = serde_json::json!({"scope_id":scope,"raw_hash":raw,"tool_profile_hash":tool,"adapter_kind":"markdownize"});
-        fs::write(
-            root.join("descriptor.json"),
+        write_new_private_fixture(
+            &root.join("descriptor.json"),
             serde_jcs::to_vec(&value).unwrap(),
-        )
-        .unwrap();
+        );
     }
-    fs::write(root.join("payload.part"), b"unpublished staging payload").unwrap();
+    write_new_private_fixture(&root.join("payload.part"), b"unpublished staging payload");
     root
 }
 
@@ -2036,8 +2091,7 @@ fn pb16_unknown_retryable_generation_uses_explicit_confirmed_recovery() {
     let manifest_hash = store
         .write_content_object(ContentObjectKind::Manifest, &manifest_bytes)
         .unwrap();
-    fs::create_dir_all(&next).unwrap();
-    fs::write(next.join("manifest.json"), &manifest_bytes).unwrap();
+    write_new_private_fixture(&next.join("manifest.json"), &manifest_bytes);
     // Escape 1 is unavailable: g1 is retryable. Escape 2 permits explicit
     // locked repair because the manifest is finalized, task state is lost,
     // and no in-flight requests or other PB15 blockers exist.
@@ -2457,7 +2511,11 @@ fn pb13_unrelated_shallow_receipt_preserves_valid_partial_historical_closure() {
 #[test]
 fn pb20_incompatible_sqlite_schema_is_fail_closed_without_mutation() {
     let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("sqlite.db");
+    let index_path = directory.path().join("private/index");
+    let parent =
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(&index_path).unwrap();
+    drop(parent.create_private_file(Path::new("sqlite.db")).unwrap());
+    let path = index_path.join("sqlite.db");
     let conn = rusqlite::Connection::open(&path).unwrap();
     conn.execute_batch(
         "CREATE TABLE chunks (chunk_id TEXT PRIMARY KEY, chunking_config_hash TEXT NOT NULL);",

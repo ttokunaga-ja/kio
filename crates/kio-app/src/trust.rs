@@ -66,9 +66,11 @@ struct PendingRegistration {
 /// A retained lock held from active-record validation until the caller's
 /// adapter dispatch returns. It serializes trust lifecycle changes with the
 /// send-time authority window.
+#[derive(Debug)]
 pub(crate) struct RuntimeTrust {
     _state: crate::private_state::PrivateState,
     path: PathBuf,
+    snapshot_leaf: PathBuf,
     digest: String,
     binding: String,
 }
@@ -89,6 +91,29 @@ pub(crate) fn directory_path(control: &ControlHandle) -> PathBuf {
     crate::settings::data_home(control).join("kio/local-trust")
 }
 
+fn external_base(trust_directory: &Path) -> Result<&Path> {
+    let owned_root = trust_directory.parent().ok_or_else(|| {
+        err(
+            "KIO-E-LOCAL-TRUST-CHANGED-001",
+            "managed local trust has no owned root",
+        )
+    })?;
+    if trust_directory.file_name() != Some(std::ffi::OsStr::new("local-trust"))
+        || owned_root.file_name() != Some(std::ffi::OsStr::new("kio"))
+    {
+        return Err(err(
+            "KIO-E-LOCAL-TRUST-CHANGED-001",
+            "managed local trust is outside its device root",
+        ));
+    }
+    owned_root.parent().ok_or_else(|| {
+        err(
+            "KIO-E-LOCAL-TRUST-CHANGED-001",
+            "managed local trust has no external base",
+        )
+    })
+}
+
 /// Read status without creating a directory, lock, repair, or snapshot.
 #[cfg(test)]
 pub(crate) fn status(
@@ -105,7 +130,12 @@ pub(crate) fn acquire_runtime_trust(
     trust_directory: &Path,
     control: &ControlHandle,
 ) -> Result<Option<RuntimeTrust>> {
-    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES, control)?
+    let Some(state) = crate::private_state::open_existing(
+        trust_directory,
+        external_base(trust_directory)?,
+        LOCK_BYTES,
+        control,
+    )?
     else {
         return Ok(None);
     };
@@ -117,7 +147,13 @@ pub(crate) fn acquire_runtime_trust(
         return Ok(None);
     }
     let path = trust_directory.join(&record.snapshot);
-    let digest = kio_adapter::local_peer::capture_private_local_trust_with_control(&path, control)
+    let snapshot_leaf = PathBuf::from(&record.snapshot);
+    let bytes = kio_core::private_fs::read_private_file_at_path(
+        state.directory(),
+        &snapshot_leaf,
+        MAX_CA_BYTES,
+    )?;
+    let digest = kio_adapter::local_peer::local_trust_digest_from_pem_bytes(&bytes)
         .map_err(crate::object_persistence::adapter_to_kio)?;
     if digest != record.digest {
         return Err(err(
@@ -128,12 +164,148 @@ pub(crate) fn acquire_runtime_trust(
     Ok(Some(RuntimeTrust {
         _state: state,
         path,
+        snapshot_leaf,
         digest,
         binding: format!(
             "local-ca:v{}:g{}:{}:{}",
             record.version, record.generation, record.registration_id, record.digest
         ),
     }))
+}
+
+#[derive(Debug, Default)]
+struct RuntimeTrustState {
+    acquired: Option<std::sync::Arc<RuntimeTrust>>,
+    observed_binding: Option<String>,
+    readiness_reason: Option<String>,
+}
+
+/// One invocation owns this cache. A metadata-only grant lookup never locks or
+/// reads a CA; only explicit authorization or endpoint construction acquires it.
+#[derive(Debug)]
+pub(crate) struct RuntimeTrustProvider {
+    control: ControlHandle,
+    state: std::sync::Mutex<RuntimeTrustState>,
+}
+
+impl RuntimeTrustProvider {
+    pub(crate) fn new(control: ControlHandle) -> Self {
+        Self {
+            control,
+            state: std::sync::Mutex::new(RuntimeTrustState::default()),
+        }
+    }
+
+    fn state(&self) -> Result<std::sync::MutexGuard<'_, RuntimeTrustState>> {
+        self.state.lock().map_err(|_| {
+            err(
+                "KIO-E-LOCAL-TRUST-UNAVAILABLE-001",
+                "managed trust invocation state is unavailable",
+            )
+        })
+    }
+
+    pub(crate) fn readiness_reason(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.readiness_reason.clone())
+    }
+
+    pub(crate) fn acquired(&self) -> bool {
+        self.state
+            .lock()
+            .is_ok_and(|state| state.acquired.is_some())
+    }
+}
+
+fn record_binding(record: &TrustRecord) -> String {
+    format!(
+        "local-ca:v{}:g{}:{}:{}",
+        record.version, record.generation, record.registration_id, record.digest
+    )
+}
+
+fn runtime_metadata_binding(control: &ControlHandle) -> Result<String> {
+    let Some(directory) = crate::private_state::open_readonly(
+        &directory_path(control),
+        &crate::settings::data_home(control),
+        control,
+    )?
+    else {
+        return Err(absent());
+    };
+    if let Some(pending) = read_pending_from(&directory)? {
+        return Err(pending_requires_resume(&pending));
+    }
+    let record = active_record(read_record_from(&directory)?)?;
+    Ok(record_binding(&record))
+}
+
+impl kio_adapter::tool_lock::ManagedLocalTrustProvider for RuntimeTrustProvider {
+    fn binding(&self) -> Result<String> {
+        let mut state = self.state()?;
+        if let Some(acquired) = &state.acquired {
+            return Ok(acquired.binding().to_owned());
+        }
+        let result = runtime_metadata_binding(&self.control).and_then(|binding| {
+            if state
+                .observed_binding
+                .as_ref()
+                .is_some_and(|observed| observed != &binding)
+            {
+                return Err(err(
+                    "KIO-E-LOCAL-TRUST-CHANGED-001",
+                    "managed CA lifecycle changed after execution authority was observed",
+                ));
+            }
+            state.observed_binding = Some(binding.clone());
+            Ok(binding)
+        });
+        state.readiness_reason = result.as_ref().err().map(ToString::to_string);
+        result
+    }
+
+    fn acquire(&self) -> Result<kio_adapter::tool_lock::ManagedLocalTrustSnapshot> {
+        let mut state = self.state()?;
+        if state.acquired.is_none() {
+            let result = acquire_runtime_trust(&directory_path(&self.control), &self.control)
+                .and_then(|trust| trust.ok_or_else(absent))
+                .and_then(|trust| {
+                    if state
+                        .observed_binding
+                        .as_ref()
+                        .is_some_and(|observed| observed != trust.binding())
+                    {
+                        return Err(err(
+                            "KIO-E-LOCAL-TRUST-CHANGED-001",
+                            "managed CA lifecycle changed after execution authority was observed",
+                        ));
+                    }
+                    Ok(std::sync::Arc::new(trust))
+                });
+            match result {
+                Ok(trust) => {
+                    state.acquired = Some(trust);
+                    state.readiness_reason = None;
+                }
+                Err(error) => {
+                    state.readiness_reason = Some(error.to_string());
+                    return Err(error);
+                }
+            }
+        }
+        let trust = state
+            .acquired
+            .as_ref()
+            .expect("validated managed trust cache");
+        Ok(kio_adapter::tool_lock::ManagedLocalTrustSnapshot {
+            path: trust.path().to_path_buf(),
+            digest: trust.digest().to_owned(),
+            directory: trust._state.directory().clone(),
+            leaf: trust.snapshot_leaf.clone(),
+        })
+    }
 }
 
 /// Register a managed local CA. The first record starts at generation one;
@@ -150,13 +322,20 @@ pub(crate) fn register(
     if preview {
         return preview_registration(trust_directory, &source, resume, control);
     }
-    if crate::private_state::open_readonly(trust_directory, control)?.is_none() {
+    if crate::private_state::open_readonly(
+        trust_directory,
+        external_base(trust_directory)?,
+        control,
+    )?
+    .is_none()
+    {
         if resume.is_some() {
             return Err(absent());
         }
         let record = register_record_for_digest(trust_directory, None, &source.digest, true)?;
         let state = crate::private_state::create_initialized(
             trust_directory,
+            external_base(trust_directory)?,
             LOCK_BYTES,
             |directory| write_pending(directory, &record, None),
             control,
@@ -170,8 +349,13 @@ pub(crate) fn register(
         clear_pending(state.directory())?;
         return Ok(record);
     }
-    let state = crate::private_state::open_existing(trust_directory, LOCK_BYTES, control)?
-        .ok_or_else(absent)?;
+    let state = crate::private_state::open_existing(
+        trust_directory,
+        external_base(trust_directory)?,
+        LOCK_BYTES,
+        control,
+    )?
+    .ok_or_else(absent)?;
     let current = read_record_from(state.directory())?;
     let pending = read_pending_from(state.directory())?;
     if let Some(resume) = resume {
@@ -203,7 +387,12 @@ fn preview_registration(
     resume: Option<&str>,
     control: &ControlHandle,
 ) -> Result<TrustRecord> {
-    let Some(directory) = crate::private_state::open_readonly(trust_directory, control)? else {
+    let Some(directory) = crate::private_state::open_readonly(
+        trust_directory,
+        external_base(trust_directory)?,
+        control,
+    )?
+    else {
         if resume.is_some() {
             return Err(absent());
         }
@@ -287,7 +476,12 @@ pub(crate) fn rotate(
         return rotated_record_for_digest(trust_directory, &current, &source.digest);
     }
 
-    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES, control)?
+    let Some(state) = crate::private_state::open_existing(
+        trust_directory,
+        external_base(trust_directory)?,
+        LOCK_BYTES,
+        control,
+    )?
     else {
         return Err(absent());
     };
@@ -316,7 +510,12 @@ pub(crate) fn revoke(
         let Some(initial) = read_record(trust_directory, control)? else {
             return Ok(None);
         };
-        let Some(directory) = crate::private_state::open_readonly(trust_directory, control)? else {
+        let Some(directory) = crate::private_state::open_readonly(
+            trust_directory,
+            external_base(trust_directory)?,
+            control,
+        )?
+        else {
             return Ok(None);
         };
         if let Some(pending) = read_pending_from(&directory)? {
@@ -331,7 +530,12 @@ pub(crate) fn revoke(
             }
         }));
     }
-    let Some(state) = crate::private_state::open_existing(trust_directory, LOCK_BYTES, control)?
+    let Some(state) = crate::private_state::open_existing(
+        trust_directory,
+        external_base(trust_directory)?,
+        LOCK_BYTES,
+        control,
+    )?
     else {
         return Ok(None);
     };
@@ -509,6 +713,7 @@ fn read_pending_from(directory: &StoreDirectory) -> Result<Option<PendingRegistr
     let Some(bytes) = directory.read_optional(Path::new(PENDING), MAX_RECORD_BYTES)? else {
         return Ok(None);
     };
+    kio_core::private_fs::verify_private_directory_handle(directory)?;
     if kio_core::private_fs::read_private_file_at(directory, PENDING, MAX_RECORD_BYTES)? != bytes {
         return Err(err(
             "KIO-E-LOCAL-TRUST-PENDING-CHANGED-001",
@@ -545,7 +750,12 @@ fn clear_pending(directory: &StoreDirectory) -> Result<()> {
 }
 
 fn read_record(trust_directory: &Path, control: &ControlHandle) -> Result<Option<TrustRecord>> {
-    let Some(directory) = crate::private_state::open_readonly(trust_directory, control)? else {
+    let Some(directory) = crate::private_state::open_readonly(
+        trust_directory,
+        external_base(trust_directory)?,
+        control,
+    )?
+    else {
         return Ok(None);
     };
     read_record_from(&directory)?
@@ -560,6 +770,7 @@ fn read_record_from(directory: &StoreDirectory) -> Result<Option<TrustRecord>> {
     let Some(bytes) = directory.read_optional(Path::new(ACTIVE), MAX_RECORD_BYTES)? else {
         return Ok(None);
     };
+    kio_core::private_fs::verify_private_directory_handle(directory)?;
     let private_bytes =
         kio_core::private_fs::read_private_file_at(directory, ACTIVE, MAX_RECORD_BYTES)?;
     if private_bytes != bytes {
@@ -644,11 +855,20 @@ fn validated_source(path: &Path, control: &ControlHandle) -> Result<ValidatedSou
     if !path.is_absolute() {
         return Err(KioError::invalid_usage("--ca-pem must be an absolute path"));
     }
-    let bytes = kio_core::private_fs::read_private_file_with_control(path, MAX_CA_BYTES, control)?;
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| KioError::invalid_usage("--ca-pem must have an external parent"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| KioError::invalid_usage("--ca-pem must name a private file"))?;
+    let external =
+        kio_core::private_fs::retain_external_directory_with_control(parent_path, control)?;
+    let bytes =
+        kio_core::private_fs::read_private_file_at_path(&external, Path::new(leaf), MAX_CA_BYTES)?;
     let digest = kio_adapter::local_peer::local_trust_digest_from_pem_bytes(&bytes)
         .map_err(crate::object_persistence::adapter_to_kio)?;
     // Do not reopen `path` here: a second pathname read creates a TOCTOU
-    // window. The owner-private no-follow read above is the complete source
+    // window. The retained-parent no-follow read above is the complete source
     // authority; these retained bytes are what gets published.
     Ok(ValidatedSource { bytes, digest })
 }
@@ -745,7 +965,12 @@ fn validate_confirmation(preview: bool, yes: bool) -> Result<()> {
 }
 
 fn status_response(trust_directory: &Path, control: &ControlHandle) -> Result<CommandResponse> {
-    let Some(directory) = crate::private_state::open_readonly(trust_directory, control)? else {
+    let Some(directory) = crate::private_state::open_readonly(
+        trust_directory,
+        external_base(trust_directory)?,
+        control,
+    )?
+    else {
         return record_response("status", None);
     };
     let record = read_record_from(&directory)?;
@@ -783,9 +1008,95 @@ fn record_response(operation: &str, record: Option<TrustRecord>) -> Result<Comma
     })
 }
 
+#[cfg(all(test, unix))]
+const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBWTCB/6ADAgECAhR5P0J0YMFaZPlrOFyN8/jwpGzhqjAKBggqhkjOPQQDAjAh\nMR8wHQYDVQQDDBZyY2dlbiBzZWxmIHNpZ25lZCBjZXJ0MCAXDTc1MDEwMTAwMDAw\nMFoYDzQwOTYwMTAxMDAwMDAwWjAhMR8wHQYDVQQDDBZyY2dlbiBzZWxmIHNpZ25l\nZCBjZXJ0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGhIwEPQnvWSlH+iUQ5Ui\nq0khmBj4hlxmW+mTL5xjjyxwwopOnkxLs2AofasS2lYPdILzMaIeRE78g2S7Hz1n\nX6MTMBEwDwYDVR0RBAgwBocEfwAAATAKBggqhkjOPQQDAgNJADBGAiEA0GBG4uEL\nSJJea18R17+yhRTyn3rsD6PzDhdg7F/v2sQCIQCccgcgjDh+ABNajeb1deKZoqbx\nnP4qBrGe09azOI4jbg==\n-----END CERTIFICATE-----\n";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct CapturedManagedTrust(std::sync::Arc<RuntimeTrust>);
+
+    #[cfg(unix)]
+    impl kio_adapter::tool_lock::ManagedLocalTrustProvider for CapturedManagedTrust {
+        fn binding(&self) -> Result<String> {
+            Ok(self.0.binding().to_owned())
+        }
+
+        fn acquire(&self) -> Result<kio_adapter::tool_lock::ManagedLocalTrustSnapshot> {
+            Ok(kio_adapter::tool_lock::ManagedLocalTrustSnapshot {
+                path: self.0.path().to_path_buf(),
+                digest: self.0.digest().to_owned(),
+                directory: self.0._state.directory().clone(),
+                leaf: self.0.snapshot_leaf.clone(),
+            })
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_local_ca_reads_retained_private_snapshot_after_parent_swap_and_rechecks_tamper() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().canonicalize().unwrap();
+        let trust_directory = root.join("kio/local-trust");
+        let source = root.join("source.pem");
+        std::fs::write(&source, PEM).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let control = ControlHandle::default();
+        let record = register(&trust_directory, &source, false, None, &control).unwrap();
+        let trust = std::sync::Arc::new(
+            acquire_runtime_trust(&trust_directory, &control)
+                .unwrap()
+                .unwrap(),
+        );
+        let settings = kio_adapter::tool_lock::AdapterRuntimeSettings {
+            managed_local_trust: Some(std::sync::Arc::new(CapturedManagedTrust(trust))),
+            ..Default::default()
+        };
+        let endpoint = settings
+            .local_endpoint("embedding", "https://127.0.0.1:8443")
+            .unwrap();
+        drop(settings);
+
+        let moved = root.join("kio/retained-trust");
+        std::fs::rename(&trust_directory, &moved).unwrap();
+        let external = root.join("external");
+        std::fs::create_dir(&external).unwrap();
+        let replacement = external.join(&record.snapshot);
+        std::fs::write(&replacement, b"not a certificate").unwrap();
+        std::fs::set_permissions(&replacement, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&external, &trust_directory).unwrap();
+
+        assert!(
+            crate::private_state::open_existing(&moved, &root, LOCK_BYTES, &control).is_err(),
+            "the managed trust lease must survive dropping runtime settings"
+        );
+
+        assert_eq!(
+            endpoint.trust_digest().unwrap(),
+            record.digest,
+            "a replaced parent must not redirect a retained managed CA"
+        );
+
+        let retained = moved.join(&record.snapshot);
+        std::fs::set_permissions(&retained, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::write(&retained, b"tampered certificate").unwrap();
+        assert!(
+            endpoint.trust_digest().is_err(),
+            "the retained managed snapshot must be checked on each use"
+        );
+        drop(endpoint);
+        assert!(
+            crate::private_state::open_existing(&moved, &root, LOCK_BYTES, &control)
+                .unwrap()
+                .is_some(),
+            "dropping the endpoint must release the managed trust lease"
+        );
+    }
     #[test]
     fn record_accepts_only_its_own_immutable_snapshot_name() {
         let bytes = b"public-ca-material";
@@ -903,12 +1214,36 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn ca_pem_accepts_external_alias_without_following_private_leaf() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let temporary = tempfile::tempdir().unwrap();
+        let physical = temporary.path().canonicalize().unwrap();
+        let external = physical.join("external");
+        std::fs::create_dir(&external).unwrap();
+        let alias = physical.join("alias");
+        symlink(&external, &alias).unwrap();
+        let source = external.join("source.pem");
+        std::fs::write(&source, PEM).unwrap();
+        std::fs::set_permissions(&source, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        let accepted = validated_source(&alias.join("source.pem"), &ControlHandle::default())
+            .expect("an external alias must not prevent reading a private CA leaf");
+        assert_eq!(accepted.bytes, PEM.as_bytes());
+
+        let linked = external.join("linked.pem");
+        symlink(&source, &linked).unwrap();
+        assert!(validated_source(&alias.join("linked.pem"), &ControlHandle::default()).is_err());
+        assert_eq!(std::fs::read(&source).unwrap(), PEM.as_bytes());
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn reregistering_equivalent_pem_reuses_snapshot_with_a_fresh_generation() {
         use std::os::unix::fs::PermissionsExt;
 
         // The newline changes the source bytes but not the parsed DER trust
         // anchor. This is the exact collision case for canonical snapshots.
-        const PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIBWTCB/6ADAgECAhR5P0J0YMFaZPlrOFyN8/jwpGzhqjAKBggqhkjOPQQDAjAh\nMR8wHQYDVQQDDBZyY2dlbiBzZWxmIHNpZ25lZCBjZXJ0MCAXDTc1MDEwMTAwMDAw\nMFoYDzQwOTYwMTAxMDAwMDAwWjAhMR8wHQYDVQQDDBZyY2dlbiBzZWxmIHNpZ25l\nZCBjZXJ0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEGhIwEPQnvWSlH+iUQ5Ui\nq0khmBj4hlxmW+mTL5xjjyxwwopOnkxLs2AofasS2lYPdILzMaIeRE78g2S7Hz1n\nX6MTMBEwDwYDVR0RBAgwBocEfwAAATAKBggqhkjOPQQDAgNJADBGAiEA0GBG4uEL\nSJJea18R17+yhRTyn3rsD6PzDhdg7F/v2sQCIQCccgcgjDh+ABNajeb1deKZoqbx\nnP4qBrGe09azOI4jbg==\n-----END CERTIFICATE-----\n";
         let temp = tempfile::tempdir().unwrap();
         std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();

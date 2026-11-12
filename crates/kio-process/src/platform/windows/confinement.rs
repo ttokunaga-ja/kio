@@ -32,14 +32,13 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::{
     Foundation::{
-        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_NO_MORE_FILES, GENERIC_ALL, HANDLE,
-        HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree, MAX_PATH, SetHandleInformation,
-        WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        CloseHandle, ERROR_NO_MORE_FILES, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+        LocalFree, MAX_PATH, SetHandleInformation, WAIT_FAILED, WAIT_OBJECT_0, WAIT_TIMEOUT,
     },
     Security::{
         Authorization::{
-            EXPLICIT_ACCESS_W, GetNamedSecurityInfoW, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
-            SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+            EXPLICIT_ACCESS_W, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW, SetSecurityInfo,
+            TRUSTEE_IS_SID, TRUSTEE_IS_USER,
         },
         CONTAINER_INHERIT_ACE, DACL_SECURITY_INFORMATION, FreeSid, GetTokenInformation,
         OBJECT_INHERIT_ACE, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SECURITY_ATTRIBUTES,
@@ -69,6 +68,12 @@ use windows_sys::Win32::{
 use crate::confinement::{ConfinementError, RenderResourceLimits, canonical_paths};
 use crate::{BoundedProcessError, BoundedProcessOptions, BoundedProcessOutput};
 use std::collections::BTreeSet;
+
+#[path = "child_token.rs"]
+mod child_token;
+#[path = "scratch_access.rs"]
+mod scratch_access;
+use scratch_access::ScratchGrant;
 
 #[derive(Debug, Clone)]
 pub(crate) struct NativeRenderSandbox {
@@ -260,72 +265,7 @@ pub fn protect_owner_private_scratch(path: &Path) -> Result<(), ConfinementError
             offset = offset.checked_add(next).ok_or_else(&invalid_records)?;
         }
     }
-    let mut token = std::ptr::null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-        return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
-    }
-    let token = OwnedHandle(token);
-    let mut size = 0;
-    let sized =
-        unsafe { GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut size) };
-    let error = std::io::Error::last_os_error();
-    if sized != 0 || error.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
-        return Err(ConfinementError::Profile(error));
-    }
-    if (size as usize) < std::mem::size_of::<TOKEN_USER>() {
-        return Err(ConfinementError::Profile(std::io::Error::other(
-            "invalid TokenUser buffer length",
-        )));
-    }
-    let mut buffer = vec![0_usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
-    let ok = unsafe {
-        GetTokenInformation(
-            token.0,
-            TokenUser,
-            buffer.as_mut_ptr().cast(),
-            size,
-            &mut size,
-        )
-    };
-    if ok == 0 {
-        return Err(ConfinementError::Profile(std::io::Error::last_os_error()));
-    }
-    let sid = unsafe { (&*buffer.as_ptr().cast::<TOKEN_USER>()).User.Sid };
-    let mut entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: FILE_ALL_ACCESS,
-        grfAccessMode: SET_ACCESS,
-        grfInheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-        ..Default::default()
-    };
-    entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    entry.Trustee.TrusteeType = TRUSTEE_IS_USER;
-    entry.Trustee.ptstrName = sid.cast();
-    let mut acl = std::ptr::null_mut();
-    let code = unsafe { SetEntriesInAclW(1, &entry, std::ptr::null(), &mut acl) };
-    if code != 0 {
-        return Err(ConfinementError::Profile(
-            std::io::Error::from_raw_os_error(code as i32),
-        ));
-    }
-    let code = unsafe {
-        SetSecurityInfo(
-            directory.0,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            acl,
-            std::ptr::null(),
-        )
-    };
-    unsafe {
-        LocalFree(acl as _);
-    }
-    if code != 0 {
-        return Err(ConfinementError::Profile(
-            std::io::Error::from_raw_os_error(code as i32),
-        ));
-    }
+    scratch_access::protect_empty(directory.0).map_err(ConfinementError::Profile)?;
     Ok(())
 }
 
@@ -343,138 +283,161 @@ where
     S: AsRef<OsStr>,
 {
     let profile = AppContainerProfile::create()?;
-    grant_scratch_access(sandbox.scratch(), profile.sid)?;
-    // We never relax ACLs on a renderer installation. A package must already
-    // be executable/readable by AppContainers (normally through the Windows
-    // All Application Packages ACE); otherwise CreateProcessW fails closed.
-    for root in sandbox.runtime_roots() {
-        verify_runtime_root(root)?;
-    }
-
-    let mut pipes = Pipes::new()?;
-    let job = Job::new(sandbox.limits())?;
-    let attributes = Attributes::new(profile.sid, pipes.child_handles())?;
-    let application = wide(sandbox.program().as_os_str());
-    let mut command_line = windows_command_line(sandbox.program().as_os_str(), args);
-    let environment = environment_block(environment)?;
-    let cwd = renderer_current_directory(sandbox.scratch());
-    let started = Instant::now();
-    let deadline = started
-        .checked_add(options.timeout)
-        .ok_or(ConfinementError::Process(
-            BoundedProcessError::InvalidLifetime,
-        ))?;
-    let mut startup = STARTUPINFOEXW::default();
-    startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-    startup.StartupInfo.dwFlags = 0x0000_0100; // STARTF_USESTDHANDLES
-    startup.StartupInfo.hStdInput = pipes.stdin_read;
-    startup.StartupInfo.hStdOutput = pipes.stdout_write;
-    startup.StartupInfo.hStdError = pipes.stderr_write;
-    startup.lpAttributeList = attributes.list;
-    let mut process = PROCESS_INFORMATION::default();
-    let created = unsafe {
-        CreateProcessW(
-            application.as_ptr(),
-            command_line.as_mut_ptr(),
-            std::ptr::null(),
-            std::ptr::null(),
-            1,
-            EXTENDED_STARTUPINFO_PRESENT
-                | CREATE_SUSPENDED
-                | CREATE_NO_WINDOW
-                | CREATE_UNICODE_ENVIRONMENT,
-            environment.as_ptr().cast(),
-            cwd.as_ptr(),
-            (&raw const startup).cast(),
-            &mut process,
-        )
-    };
-    if created == 0 {
-        return Err(ConfinementError::Process(BoundedProcessError::Spawn(
-            std::io::Error::last_os_error(),
-        )));
-    }
-    let primary = OwnedHandle(process.hProcess);
-    let thread = OwnedHandle(process.hThread);
-    // The handle-list attribute prevents unrelated host handles crossing this
-    // edge. Close our copies of the child's pipe ends before observing EOF.
-    pipes.close_child_ends();
-    if let Err(error) = job.attach(primary.0) {
-        // Assignment can fail before the suspended primary belongs to the Job.
-        // Preserve the assignment error before making any cleanup API calls.
-        unsafe {
-            TerminateProcess(primary.0, 1);
-            WaitForSingleObject(primary.0, remaining_wait_millis(deadline));
-        }
-        return Err(ConfinementError::Resource(error));
-    }
-    // All failures after assignment go through whole-Job cleanup, including
-    // resume, pipe setup, wait/accounting, output, and scratch failures.
+    let mut grant = grant_scratch_access(sandbox.scratch(), profile.sid)?;
     let result = (|| {
-        resume(thread.0).map_err(ConfinementError::Resource)?;
-        drop(thread);
-        let stdout = pipes.take_stdout()?;
-        let stderr = pipes.take_stderr()?;
-        let stdout_limit = options.max_stdout_bytes;
-        let stderr_limit = options.max_stderr_bytes;
-        let (sender, receiver) = mpsc::channel();
-        let stderr_sender = sender.clone();
-        std::thread::spawn(move || read_pipe(stdout, "stdout", stdout_limit, sender));
-        std::thread::spawn(move || read_pipe(stderr, "stderr", stderr_limit, stderr_sender));
-        let mut output = [None, None];
-        let mut status = None;
-        loop {
-            check_renderer_deadline(deadline, options)?;
-            while let Ok((stream, result)) = receiver.try_recv() {
-                output[usize::from(stream == "stderr")] = Some(result?);
+        // We never relax ACLs on a renderer installation. A package must already
+        // be executable/readable by AppContainers (normally through the Windows
+        // All Application Packages ACE); otherwise CreateProcessW fails closed.
+        for root in sandbox.runtime_roots() {
+            verify_runtime_root(root)?;
+        }
+
+        let mut pipes = Pipes::new()?;
+        let job = Job::new(sandbox.limits())?;
+        let attributes = Attributes::new(profile.sid, pipes.child_handles())?;
+        let application = wide(sandbox.program().as_os_str());
+        let mut command_line = windows_command_line(sandbox.program().as_os_str(), args);
+        let environment = environment_block(environment)?;
+        let cwd = renderer_current_directory(sandbox.scratch());
+        let started = Instant::now();
+        let deadline = started
+            .checked_add(options.timeout)
+            .ok_or(ConfinementError::Process(
+                BoundedProcessError::InvalidLifetime,
+            ))?;
+        let mut startup = STARTUPINFOEXW::default();
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.StartupInfo.dwFlags = 0x0000_0100; // STARTF_USESTDHANDLES
+        startup.StartupInfo.hStdInput = pipes.stdin_read;
+        startup.StartupInfo.hStdOutput = pipes.stdout_write;
+        startup.StartupInfo.hStdError = pipes.stderr_write;
+        startup.lpAttributeList = attributes.list;
+        let mut process = PROCESS_INFORMATION::default();
+        grant.stopped = false;
+        let created = unsafe {
+            CreateProcessW(
+                application.as_ptr(),
+                command_line.as_mut_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                1,
+                EXTENDED_STARTUPINFO_PRESENT
+                    | CREATE_SUSPENDED
+                    | CREATE_NO_WINDOW
+                    | CREATE_UNICODE_ENVIRONMENT,
+                environment.as_ptr().cast(),
+                cwd.as_ptr(),
+                (&raw const startup).cast(),
+                &mut process,
+            )
+        };
+        if created == 0 {
+            grant.stopped = true;
+            return Err(ConfinementError::Process(BoundedProcessError::Spawn(
+                std::io::Error::last_os_error(),
+            )));
+        }
+        let primary = OwnedHandle(process.hProcess);
+        let thread = OwnedHandle(process.hThread);
+        // The handle-list attribute prevents unrelated host handles crossing this
+        // edge. Close our copies of the child's pipe ends before observing EOF.
+        pipes.close_child_ends();
+        if let Err(error) = job.attach(primary.0) {
+            // Assignment can fail before the suspended primary belongs to the Job.
+            // Preserve the assignment error before making any cleanup API calls.
+            unsafe {
+                TerminateProcess(primary.0, 1);
+                grant.stopped = WaitForSingleObject(primary.0, remaining_wait_millis(deadline))
+                    == WAIT_OBJECT_0;
             }
-            observe_scratch_until(sandbox, deadline, options)?;
-            if status.is_none() {
-                match unsafe { WaitForSingleObject(primary.0, 0) } {
-                    WAIT_TIMEOUT => {}
-                    WAIT_OBJECT_0 => {
-                        let mut code = 0;
-                        if unsafe { GetExitCodeProcess(primary.0, &mut code) } == 0 {
+            return Err(ConfinementError::Resource(error));
+        }
+        // All failures after assignment go through whole-Job cleanup, including
+        // resume, pipe setup, wait/accounting, output, and scratch failures.
+        let result = (|| {
+            child_token::prepare_suspended_renderer_token(primary.0, profile.sid)
+                .map_err(ConfinementError::Profile)?;
+            resume(thread.0).map_err(ConfinementError::Resource)?;
+            drop(thread);
+            let stdout = pipes.take_stdout()?;
+            let stderr = pipes.take_stderr()?;
+            let stdout_limit = options.max_stdout_bytes;
+            let stderr_limit = options.max_stderr_bytes;
+            let (sender, receiver) = mpsc::channel();
+            let stderr_sender = sender.clone();
+            std::thread::spawn(move || read_pipe(stdout, "stdout", stdout_limit, sender));
+            std::thread::spawn(move || read_pipe(stderr, "stderr", stderr_limit, stderr_sender));
+            let mut output = [None, None];
+            let mut status = None;
+            loop {
+                check_renderer_deadline(deadline, options)?;
+                while let Ok((stream, result)) = receiver.try_recv() {
+                    output[usize::from(stream == "stderr")] = Some(result?);
+                }
+                grant.verify_active().map_err(ConfinementError::Profile)?;
+                observe_scratch_until(sandbox, deadline, options)?;
+                if status.is_none() {
+                    match unsafe { WaitForSingleObject(primary.0, 0) } {
+                        WAIT_TIMEOUT => {}
+                        WAIT_OBJECT_0 => {
+                            let mut code = 0;
+                            if unsafe { GetExitCodeProcess(primary.0, &mut code) } == 0 {
+                                return Err(ConfinementError::Process(BoundedProcessError::Wait(
+                                    std::io::Error::last_os_error(),
+                                )));
+                            }
+                            status = Some(std::os::windows::process::ExitStatusExt::from_raw(code));
+                        }
+                        WAIT_FAILED => {
                             return Err(ConfinementError::Process(BoundedProcessError::Wait(
                                 std::io::Error::last_os_error(),
                             )));
                         }
-                        status = Some(std::os::windows::process::ExitStatusExt::from_raw(code));
-                    }
-                    WAIT_FAILED => {
-                        return Err(ConfinementError::Process(BoundedProcessError::Wait(
-                            std::io::Error::last_os_error(),
-                        )));
-                    }
-                    _ => {
-                        return Err(ConfinementError::Process(BoundedProcessError::Wait(
-                            std::io::Error::other("unexpected renderer process wait result"),
-                        )));
+                        _ => {
+                            return Err(ConfinementError::Process(BoundedProcessError::Wait(
+                                std::io::Error::other("unexpected renderer process wait result"),
+                            )));
+                        }
                     }
                 }
-            }
-            if job.active_processes().map_err(ConfinementError::Resource)? == 0 {
-                // A private non-inherited Job with no breakaway allowance cannot
-                // acquire a new descendant after its last process has exited.
-                // If the primary exited between its poll and this query, poll
-                // it again on the next iteration to obtain its original status.
-                if let Some(status) = status {
-                    return finish_renderer_output(
-                        sandbox, options, started, status, &receiver, output,
-                    );
+                if job.active_processes().map_err(ConfinementError::Resource)? == 0 {
+                    // A private non-inherited Job with no breakaway allowance cannot
+                    // acquire a new descendant after its last process has exited.
+                    // If the primary exited between its poll and this query, poll
+                    // it again on the next iteration to obtain its original status.
+                    if let Some(status) = status {
+                        grant.stopped = true;
+                        return finish_renderer_output(
+                            sandbox, options, started, status, &receiver, output,
+                        );
+                    }
                 }
+                // The primary handle stays signaled after exit. Sleeping here also
+                // paces observation when descendants have already closed the pipes.
+                std::thread::sleep(
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(Duration::from_millis(20)),
+                );
             }
-            // The primary handle stays signaled after exit. Sleeping here also
-            // paces observation when descendants have already closed the pipes.
-            std::thread::sleep(
-                deadline
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_millis(20)),
-            );
+        })();
+        if result.is_err() {
+            job.terminate_until(deadline);
         }
+        if job.active_processes().is_ok_and(|count| count == 0) {
+            grant.stopped = true;
+        }
+        result
     })();
-    if result.is_err() {
-        job.terminate_until(deadline);
+    if let Err(cleanup) = grant.retire() {
+        return Err(ConfinementError::Profile(std::io::Error::other(format!(
+            "renderer scratch recovery required at {}: {cleanup}; execution result: {}",
+            sandbox.scratch().display(),
+            result
+                .as_ref()
+                .err()
+                .map_or_else(|| "completed".to_owned(), ToString::to_string),
+        ))));
     }
     result
 }
@@ -1110,70 +1073,8 @@ impl Drop for Pipes {
     }
 }
 
-fn grant_scratch_access(path: &Path, app_sid: PSID) -> Result<(), ConfinementError> {
-    // The caller establishes an owner-private directory before staging
-    // content. Preserve its current-user ACE while adding the invocation SID;
-    // protect the resulting DACL from parent-directory inheritance.
-    let wide_path = wide(path.as_os_str());
-    let mut previous_acl = std::ptr::null_mut();
-    let mut descriptor = std::ptr::null_mut();
-    let status = unsafe {
-        GetNamedSecurityInfoW(
-            wide_path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut previous_acl,
-            std::ptr::null_mut(),
-            &mut descriptor,
-        )
-    };
-    if status != 0 {
-        return Err(ConfinementError::Profile(
-            std::io::Error::from_raw_os_error(status as i32),
-        ));
-    }
-    let mut acl = std::ptr::null_mut();
-    let mut entry = EXPLICIT_ACCESS_W {
-        grfAccessPermissions: GENERIC_ALL,
-        grfAccessMode: SET_ACCESS,
-        grfInheritance: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-        ..Default::default()
-    };
-    entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    entry.Trustee.TrusteeType = TRUSTEE_IS_USER;
-    entry.Trustee.ptstrName = app_sid.cast();
-    let code = unsafe { SetEntriesInAclW(1, &entry, previous_acl, &mut acl) };
-    unsafe {
-        LocalFree(descriptor);
-    }
-    if code != 0 {
-        return Err(ConfinementError::Profile(
-            std::io::Error::from_raw_os_error(code as i32),
-        ));
-    }
-    let code = unsafe {
-        SetNamedSecurityInfoW(
-            wide_path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | 0x8000_0000,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            acl,
-            std::ptr::null(),
-        )
-    };
-    unsafe {
-        LocalFree(acl as _);
-    }
-    if code != 0 {
-        Err(ConfinementError::Profile(
-            std::io::Error::from_raw_os_error(code as i32),
-        ))
-    } else {
-        Ok(())
-    }
+fn grant_scratch_access(path: &Path, app_sid: PSID) -> Result<ScratchGrant, ConfinementError> {
+    ScratchGrant::new(path, app_sid).map_err(ConfinementError::Profile)
 }
 
 fn resume(thread: HANDLE) -> Result<(), std::io::Error> {
@@ -1625,5 +1526,272 @@ mod scratch_scan_tests {
                 .contains("reparse point")
         );
         std::fs::remove_dir(junction).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod scratch_invocation_grant_tests {
+    use super::*;
+    use windows_sys::Win32::Security::Authorization::GetNamedSecurityInfoW;
+    use windows_sys::Win32::Security::{ACCESS_ALLOWED_ACE, ACE_HEADER, EqualSid, GetAce};
+
+    // Create synthetic objects with TokenUser specified at creation. Elevated
+    // tokens may otherwise default to Administrators; product must refuse that.
+    fn create_current_user_fixture(path: &Path, directory: bool) -> Option<File> {
+        use windows_sys::Win32::{
+            Foundation::GENERIC_WRITE,
+            Security::{
+                InitializeSecurityDescriptor, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
+                SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
+                SetSecurityDescriptorOwner,
+            },
+            Storage::FileSystem::{CREATE_NEW, CreateDirectoryW, FILE_ATTRIBUTE_NORMAL},
+        };
+        let mut token = std::ptr::null_mut();
+        assert_ne!(
+            unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+            0
+        );
+        let token = OwnedHandle(token);
+        let mut size = 0;
+        unsafe {
+            GetTokenInformation(token.0, TokenUser, std::ptr::null_mut(), 0, &mut size);
+        }
+        assert!(size as usize >= std::mem::size_of::<TOKEN_USER>());
+        let mut user = vec![0_usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+        assert_ne!(
+            unsafe {
+                GetTokenInformation(
+                    token.0,
+                    TokenUser,
+                    user.as_mut_ptr().cast(),
+                    size,
+                    &mut size,
+                )
+            },
+            0
+        );
+        let sid = unsafe { (&*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+        let mut descriptor = SECURITY_DESCRIPTOR::default();
+        let descriptor_ptr = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
+        assert_ne!(
+            unsafe { InitializeSecurityDescriptor(descriptor_ptr, 1) },
+            0
+        );
+        assert_ne!(
+            unsafe { SetSecurityDescriptorOwner(descriptor_ptr, sid, 0) },
+            0
+        );
+        let mut acl = std::ptr::null_mut();
+        if directory {
+            let mut entry = EXPLICIT_ACCESS_W {
+                grfAccessPermissions: FILE_ALL_ACCESS,
+                grfAccessMode: SET_ACCESS,
+                grfInheritance: 0,
+                ..Default::default()
+            };
+            entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            entry.Trustee.TrusteeType = TRUSTEE_IS_USER;
+            entry.Trustee.ptstrName = sid.cast();
+            assert_eq!(
+                unsafe { SetEntriesInAclW(1, &entry, std::ptr::null(), &mut acl) },
+                0
+            );
+            assert_ne!(
+                unsafe { SetSecurityDescriptorDacl(descriptor_ptr, 1, acl, 0) },
+                0
+            );
+            assert_ne!(
+                unsafe {
+                    SetSecurityDescriptorControl(
+                        descriptor_ptr,
+                        SE_DACL_PROTECTED,
+                        SE_DACL_PROTECTED,
+                    )
+                },
+                0
+            );
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor_ptr,
+            bInheritHandle: 0,
+        };
+        let path = wide(path.as_os_str());
+        let file = if directory {
+            assert_ne!(
+                unsafe { CreateDirectoryW(path.as_ptr(), &attributes) },
+                0,
+                "create current-user directory: {}",
+                std::io::Error::last_os_error()
+            );
+            None
+        } else {
+            // With no explicit DACL the file inherits the bound invocation ACL,
+            // while its owner is explicitly TokenUser, as in an AppContainer.
+            let raw = unsafe {
+                CreateFileW(
+                    path.as_ptr(),
+                    GENERIC_WRITE,
+                    0,
+                    &attributes,
+                    CREATE_NEW,
+                    FILE_ATTRIBUTE_NORMAL,
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_ne!(
+                raw,
+                INVALID_HANDLE_VALUE,
+                "create current-user output: {}",
+                std::io::Error::last_os_error()
+            );
+            Some(unsafe { File::from_raw_handle(raw) })
+        };
+        if !acl.is_null() {
+            unsafe {
+                LocalFree(acl.cast());
+            }
+        }
+        file
+    }
+    fn current_user_scratch() -> (tempfile::TempDir, PathBuf) {
+        let holder = tempfile::tempdir().unwrap();
+        let scratch = holder.path().join("current-user-scratch");
+        assert!(create_current_user_fixture(&scratch, true).is_none());
+        (holder, scratch)
+    }
+
+    fn access_for_sid(path: &Path, sid: PSID) -> Option<u32> {
+        let mut acl = std::ptr::null_mut();
+        let mut descriptor = std::ptr::null_mut();
+        let code = unsafe {
+            GetNamedSecurityInfoW(
+                wide(path.as_os_str()).as_ptr(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut acl,
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        assert_eq!(code, 0);
+        assert!(!acl.is_null());
+        let found = (0..unsafe { (*acl).AceCount }).find_map(|index| {
+            let mut ace = std::ptr::null_mut();
+            assert_ne!(unsafe { GetAce(acl, u32::from(index), &mut ace) }, 0);
+            let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+            if header.AceType != 0 {
+                return None;
+            }
+            let allowed = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+            (unsafe { EqualSid((&allowed.SidStart as *const u32).cast_mut().cast(), sid) } != 0)
+                .then_some(allowed.Mask)
+        });
+        unsafe {
+            LocalFree(descriptor);
+        }
+        found
+    }
+
+    fn contains_sid(path: &Path, sid: PSID) -> bool {
+        access_for_sid(path, sid).is_some()
+    }
+
+    #[test]
+    fn scratch_grant_refuses_another_invocations_sid() {
+        let (_holder, scratch) = current_user_scratch();
+        protect_owner_private_scratch(&scratch).unwrap();
+        let first = AppContainerProfile::create().unwrap();
+        let second = AppContainerProfile::create().unwrap();
+        let _grant = grant_scratch_access(&scratch, first.sid).unwrap();
+        assert!(
+            grant_scratch_access(&scratch, second.sid).is_err(),
+            "a fresh invocation must not accept or preserve another invocation SID"
+        );
+        assert!(!contains_sid(&scratch, second.sid));
+    }
+
+    #[test]
+    fn scratch_grant_reaches_protected_staged_children() {
+        let (_holder, scratch) = current_user_scratch();
+        protect_owner_private_scratch(&scratch).unwrap();
+        let child = scratch.join("protected-output");
+        assert!(create_current_user_fixture(&child, true).is_none());
+        protect_owner_private_scratch(&child).unwrap();
+        let profile = AppContainerProfile::create().unwrap();
+        let _grant = grant_scratch_access(&scratch, profile.sid).unwrap();
+        assert!(
+            contains_sid(&child, profile.sid),
+            "root inheritance cannot grant access through a protected child DACL"
+        );
+    }
+    #[test]
+    fn scratch_grant_retirement_restores_owner_only_children() {
+        let (_holder, scratch) = current_user_scratch();
+        protect_owner_private_scratch(&scratch).unwrap();
+        let child = scratch.join("output");
+        assert!(create_current_user_fixture(&child, true).is_none());
+        protect_owner_private_scratch(&child).unwrap();
+        let profile = AppContainerProfile::create().unwrap();
+        let mut grant = grant_scratch_access(&scratch, profile.sid).unwrap();
+        assert_eq!(
+            access_for_sid(&child, profile.sid),
+            Some(
+                FILE_ALL_ACCESS
+                    & !(WRITE_DAC | windows_sys::Win32::Storage::FileSystem::WRITE_OWNER)
+            )
+        );
+        let generated = child.join("input.pdf");
+        {
+            use std::io::Write as _;
+            let mut output = create_current_user_fixture(&generated, false).unwrap();
+            output.write_all(b"%PDF-1.4 fixture").unwrap();
+        }
+        assert!(contains_sid(&generated, profile.sid));
+        grant.stopped = false;
+        assert!(
+            grant.retire().is_err(),
+            "live invocation cannot retire as completed"
+        );
+        grant.stopped = true;
+        grant.retire().unwrap();
+        assert!(!contains_sid(&scratch, profile.sid));
+        assert!(!contains_sid(&child, profile.sid));
+        assert!(!contains_sid(&generated, profile.sid));
+        let other = AppContainerProfile::create().unwrap();
+        let _next = grant_scratch_access(&scratch, other.sid).unwrap();
+    }
+    #[test]
+    fn scratch_acl_observation_allows_an_exclusively_open_renderer_output() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        let (_holder, scratch) = current_user_scratch();
+        protect_owner_private_scratch(&scratch).unwrap();
+        let profile = AppContainerProfile::create().unwrap();
+        let mut grant = grant_scratch_access(&scratch, profile.sid).unwrap();
+        let generated = scratch.join("exclusive-output.pdf");
+        drop(create_current_user_fixture(&generated, false).unwrap());
+        assert!(
+            contains_sid(&generated, profile.sid),
+            "fixture output must inherit the exact invocation SID"
+        );
+        let output = std::fs::OpenOptions::new()
+            .write(true)
+            .share_mode(0)
+            .open(&generated)
+            .unwrap();
+        let observation = grant.verify_active();
+        assert!(
+            observation.is_ok(),
+            "metadata and ACL observation must permit a renderer's exclusive output writer: {observation:?}"
+        );
+        drop(output);
+        grant.retire().unwrap();
+        assert!(!contains_sid(&generated, profile.sid));
+        let next = AppContainerProfile::create().unwrap();
+        let _next_grant = grant_scratch_access(&scratch, next.sid)
+            .expect("closed output and entire retired tree must be protected owner-only");
     }
 }

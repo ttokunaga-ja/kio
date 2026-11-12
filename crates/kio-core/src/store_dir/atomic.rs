@@ -389,7 +389,14 @@ fn lock_workspace(workspace: &StoreDirectory) -> Result<File> {
 
 pub(crate) fn remove_if_present(workspace: &StoreDirectory, name: &str) -> Result<bool> {
     if workspace.contains_entry(Path::new(name))? {
-        workspace.remove_file(Path::new(name))?;
+        if name == WRITE {
+            crate::platform::atomic_semantics::remove_publication_residue(
+                workspace,
+                Path::new(name),
+            )?;
+        } else {
+            workspace.remove_file(Path::new(name))?;
+        }
         return Ok(true);
     }
     Ok(false)
@@ -454,6 +461,56 @@ pub(super) fn write(
     bytes: &[u8],
     publication: Publication,
 ) -> Result<()> {
+    write_with_readonly(
+        owner,
+        target,
+        relative,
+        bytes,
+        publication,
+        false,
+        |_, _| Ok(()),
+    )
+}
+
+pub(super) fn write_checked(
+    owner: &StoreDirectory,
+    relative: &Path,
+    bytes: &[u8],
+    publication: Publication,
+    before_publish: impl FnOnce(&StoreDirectory, &Path) -> Result<()>,
+) -> Result<()> {
+    write_with_readonly(
+        owner,
+        owner,
+        relative,
+        bytes,
+        publication,
+        false,
+        before_publish,
+    )
+}
+
+pub(super) fn write_readonly(owner: &StoreDirectory, relative: &Path, bytes: &[u8]) -> Result<()> {
+    write_with_readonly(
+        owner,
+        owner,
+        relative,
+        bytes,
+        Publication::CreateOnly,
+        true,
+        |_, _| Ok(()),
+    )
+}
+
+fn write_with_readonly(
+    owner: &StoreDirectory,
+    target: &StoreDirectory,
+    relative: &Path,
+    bytes: &[u8],
+    publication: Publication,
+    readonly: bool,
+    before_publish: impl FnOnce(&StoreDirectory, &Path) -> Result<()>,
+) -> Result<()> {
     let normalized = valid_relative(relative)?;
     validate_target_namespace(owner, target, &normalized)?;
     let (preflight_parent, _, _) = parent_chain(target, relative)?;
@@ -463,10 +520,20 @@ pub(super) fn write(
     let _ = recover_locked(owner, &workspace, &[target])?;
     let (parent, leaf, _) = parent_chain(target, relative)?;
     same_volume(&workspace, &parent)?;
-    let mut staged = workspace.create_private_file_raw(Path::new(WRITE))?;
+    let mut staged = workspace.create_private_file(Path::new(WRITE))?;
     staged
         .write_all(bytes)
         .map_err(|e| io_failure("cannot write atomic publication artifact", e))?;
+    if readonly {
+        let mut permissions = staged
+            .metadata()
+            .map_err(|e| io_failure("cannot inspect atomic publication artifact", e))?
+            .permissions();
+        permissions.set_readonly(true);
+        staged
+            .set_permissions(permissions)
+            .map_err(|e| io_failure("cannot protect read-only publication artifact", e))?;
+    }
     staged
         .sync_all()
         .map_err(|e| io_failure("cannot sync atomic publication artifact", e))?;
@@ -475,12 +542,19 @@ pub(super) fn write(
     owner
         .control()
         .checkpoint(crate::durability::DurabilityPoint::AtomicWriteStaged)?;
-    workspace.rename_regular_between_raw(
+    before_publish(&parent, Path::new(&leaf))?;
+    if let Err(error) = workspace.rename_regular_between_raw(
         Path::new(WRITE),
         &parent,
         Path::new(&leaf),
         publication,
-    )?;
+    ) {
+        if readonly {
+            remove_if_present(&workspace, WRITE)?;
+            workspace.sync()?;
+        }
+        return Err(error);
+    }
     workspace.sync()?;
     parent.sync()?;
     owner
@@ -528,7 +602,7 @@ pub(super) fn remove(
         max_bytes,
     };
     let bytes = intent_bytes(&intent)?;
-    let mut pending = workspace.create_private_file_raw(Path::new(REMOVE_PENDING))?;
+    let mut pending = workspace.create_private_file(Path::new(REMOVE_PENDING))?;
     pending
         .write_all(&bytes)
         .map_err(|e| io_failure("cannot write removal boot intent", e))?;
@@ -755,10 +829,72 @@ mod tests {
 
     fn private_leaf(workspace: &StoreDirectory, leaf: &str, bytes: &[u8]) {
         let mut file = workspace
-            .create_private_file_raw(Path::new(leaf))
+            .create_private_file(Path::new(leaf))
             .expect("private residue");
         file.write_all(bytes).expect("residue bytes");
         file.sync_all().expect("residue sync");
+    }
+
+    #[test]
+    fn checked_write_refuses_changed_or_new_target_after_staging() {
+        for existed in [true, false] {
+            let (_temp, owner, _target) = directories();
+            owner.create_directory(Path::new("records")).unwrap();
+            let parent = StoreDirectory::from_retained(
+                owner.open_directory(Path::new("records")).unwrap(),
+                owner.path().join("records"),
+            )
+            .unwrap();
+            let leaf = Path::new("state");
+            let mut original = if existed {
+                private_leaf(&parent, "state", b"original");
+                Some(parent.open_regular_read(leaf, 1024).unwrap())
+            } else {
+                None
+            };
+            let expected = original.as_ref().map(|file| super::file_id(file).unwrap());
+            let mut called = false;
+            let result = owner.write_atomic_checked(
+                Path::new("records/state"),
+                b"must not publish",
+                Publication::Upsert,
+                |actual_parent, actual_leaf| {
+                    called = true;
+                    assert_eq!(directory_id(actual_parent)?, directory_id(&parent)?);
+                    assert_eq!(actual_leaf, leaf);
+                    let workspace = super::workspace_existing(&owner)?.unwrap();
+                    assert_eq!(
+                        workspace.read_optional(Path::new("write"), 1024)?,
+                        Some(b"must not publish".to_vec())
+                    );
+                    if existed {
+                        fs::rename(parent.path().join(leaf), parent.path().join("displaced"))
+                            .unwrap();
+                    }
+                    private_leaf(actual_parent, "state", b"concurrent");
+                    let current = actual_parent.open_regular_read(actual_leaf, 1024)?;
+                    if expected.as_ref() != Some(&super::file_id(&current)?) {
+                        return Err(super::failure("target changed before publication"));
+                    }
+                    Ok(())
+                },
+            );
+            assert!(called);
+            assert_eq!(
+                result.unwrap_err().message(),
+                "target changed before publication"
+            );
+            assert_eq!(fs::read(parent.path().join(leaf)).unwrap(), b"concurrent");
+            if let Some(file) = original.as_mut() {
+                let mut bytes = Vec::new();
+                std::io::Read::read_to_end(file, &mut bytes).unwrap();
+                assert_eq!(bytes, b"original");
+            }
+            assert_eq!(inspect(&owner).unwrap(), AtomicWorkspaceState::Pending);
+            assert!(recover(&owner, &[&owner]).unwrap());
+            assert_eq!(inspect(&owner).unwrap(), AtomicWorkspaceState::Clean);
+            assert_eq!(fs::read(parent.path().join(leaf)).unwrap(), b"concurrent");
+        }
     }
 
     #[test]

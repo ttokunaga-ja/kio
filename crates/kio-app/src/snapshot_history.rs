@@ -30,7 +30,6 @@ use crate::search::projection::republish_equivalent_manual_snapshot;
 use crate::search_time::PositiveDuration;
 use crate::search_time::since_cutoff_seconds;
 use crate::settings::validate_repo_tool_lock;
-use kio_adapter::tool_lock::AdapterRuntimeSettings;
 use kio_core::ExitCode;
 use kio_core::KioError;
 use kio_core::Result;
@@ -62,13 +61,11 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Instant;
 
 pub(crate) fn run_snapshot_create(
     ctx: &Invocation<'_>,
     args: commands::SnapshotCreateArgs,
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
 ) -> Result<CommandResponse> {
     // Opening an ordinary repository can self-heal HEAD. Bind and
     // validate without repair first, acquire the GC-aware store lock,
@@ -99,9 +96,9 @@ pub(crate) fn run_snapshot_create(
     // does, or `.env`/`*.pem` plaintext lands irreversibly in objects/raw and
     // the latest tree. Compute the exclusion set from the scan preview (the
     // shared classifier) and pass it through the filtered snapshot path.
-    let preview = build_scan_preview(
-        &adapter_settings.declared_pricing("markdown"),
-        &adapter_settings.declared_pricing("embedding"),
+    let mut preview = build_scan_preview(
+        &BTreeMap::new(),
+        &BTreeMap::new(),
         ScanPreviewRequest {
             scope_path: repo.root().display().to_string(),
             include_raw_hashes: false,
@@ -109,6 +106,7 @@ pub(crate) fn run_snapshot_create(
         },
     )
     .map_err(pipeline_to_kio)?;
+    preview.estimated_cost = None;
     let excluded = preview
         .candidates
         .iter()
@@ -451,8 +449,6 @@ pub(crate) fn run_snapshot_auto(ctx: &Invocation<'_>) -> Result<CommandResponse>
 }
 
 fn run_snapshot_auto_response(ctx: &Invocation<'_>) -> Result<(SnapshotAutoResponse, Completion)> {
-    let adapter_settings = ctx.settings;
-
     #[cfg(debug_assertions)]
     let test_control = Some(ctx.control.debug().clone());
     let repo = ctx.open_read_only_repository()?;
@@ -565,13 +561,13 @@ fn run_snapshot_auto_response(ctx: &Invocation<'_>) -> Result<(SnapshotAutoRespo
         ));
     }
     let now = ctx.control.now_utc_seconds();
-    let initial = observe_scheduled_auto(adapter_settings, &repo, &session, &now)?;
+    let initial = observe_scheduled_auto(&repo, &session, &now)?;
     if initial.gc != gc_binding {
         return Err(snapshot_auto_authority_changed(
             "GC automation changed after scheduled preflight",
         ));
     }
-    let confirmed = observe_scheduled_auto(adapter_settings, &repo, &session, &now)?;
+    let confirmed = observe_scheduled_auto(&repo, &session, &now)?;
     if confirmed != initial {
         return Err(snapshot_auto_authority_changed(
             "scheduled snapshot authority changed during observation",
@@ -610,7 +606,7 @@ fn run_snapshot_auto_response(ctx: &Invocation<'_>) -> Result<(SnapshotAutoRespo
         ctx.control.clone(),
         ctx.locks,
     )?;
-    let locked = observe_scheduled_auto(adapter_settings, &bound_repo, &session, &now)?;
+    let locked = observe_scheduled_auto(&bound_repo, &session, &now)?;
     if locked != initial || locked.gc != gc_binding {
         return Err(snapshot_auto_authority_changed(
             "scheduled snapshot authority changed during locked eligibility handoff",
@@ -620,7 +616,7 @@ fn run_snapshot_auto_response(ctx: &Invocation<'_>) -> Result<(SnapshotAutoRespo
         test_control,
         snapshot_locked_ready
     ));
-    let final_observation = observe_scheduled_auto(adapter_settings, &bound_repo, &session, &now)?;
+    let final_observation = observe_scheduled_auto(&bound_repo, &session, &now)?;
     if final_observation != locked || final_observation.gc != gc_binding {
         return Err(snapshot_auto_authority_changed(
             "scheduled snapshot authority changed immediately before publication",
@@ -630,8 +626,7 @@ fn run_snapshot_auto_response(ctx: &Invocation<'_>) -> Result<(SnapshotAutoRespo
         test_control,
         snapshot_before_publication_ready
     ));
-    let publication_observation =
-        observe_scheduled_auto(adapter_settings, &bound_repo, &session, &now)?;
+    let publication_observation = observe_scheduled_auto(&bound_repo, &session, &now)?;
     if publication_observation != final_observation || publication_observation.gc != gc_binding {
         return Err(snapshot_auto_authority_changed(
             "scheduled snapshot authority changed at publication boundary",
@@ -935,7 +930,6 @@ fn wait_at_snapshot_auto_test_barrier(ready_path: Option<&Path>) {
 }
 
 fn observe_scheduled_auto(
-    adapter_settings: &Arc<AdapterRuntimeSettings>,
     repo: &Repository,
     session: &GcSweepSession,
     now: &str,
@@ -977,9 +971,9 @@ fn observe_scheduled_auto(
     };
     let root = session.retained_scope_handle()?;
     let kio = session.retained_kio_handle()?;
-    let preview = build_bound_scan_preview(
-        &adapter_settings.declared_pricing("markdown"),
-        &adapter_settings.declared_pricing("embedding"),
+    let mut preview = build_bound_scan_preview(
+        &BTreeMap::new(),
+        &BTreeMap::new(),
         &root,
         &kio,
         ScanPreviewRequest {
@@ -990,6 +984,7 @@ fn observe_scheduled_auto(
         &[],
     )
     .map_err(pipeline_to_kio)?;
+    preview.estimated_cost = None;
     let working_set_digest = scheduled_working_set_digest(&preview)?;
     let idle = if gc.config.mode == GcAutomationMode::OnIdle {
         let threshold_seconds = gc

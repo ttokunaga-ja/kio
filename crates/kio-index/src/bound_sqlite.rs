@@ -330,6 +330,15 @@ impl BoundSqliteConnection {
     pub(crate) fn registered_vfs(&self) -> Option<*mut ffi::sqlite3_vfs> {
         self.registration.as_ref().and_then(|r| r.vfs())
     }
+    pub(crate) fn transaction_with_behavior(
+        &mut self,
+        behavior: rusqlite::TransactionBehavior,
+    ) -> rusqlite::Result<Transaction<'_>> {
+        self.conn
+            .as_mut()
+            .expect("live bound SQLite connection")
+            .transaction_with_behavior(behavior)
+    }
     pub(crate) fn transaction(&mut self) -> rusqlite::Result<Transaction<'_>> {
         self.conn
             .as_mut()

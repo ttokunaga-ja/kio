@@ -910,6 +910,7 @@ fn collect_batch_markdownize_output(
     // task instead of persisting under a stale identity.
     let prepared_input = match classify_online_markdownize_precondition(repo, task) {
         OnlineMarkdownizePrecondition::Send(prepared_input) => prepared_input,
+        OnlineMarkdownizePrecondition::PolicyUnavailable(error) => return Err(error),
         OnlineMarkdownizePrecondition::AwaitConversion
         | OnlineMarkdownizePrecondition::ConversionFailed => {
             // Transient local-material gap (e.g. office converter hiccup):
@@ -997,7 +998,7 @@ fn collect_batch_markdownize_output(
         &prepared_input.media_type,
         &task.input_hash,
         &row.key.scope_id,
-        repo.kio_dir(),
+        &repo.object_store().image_store()?,
         task.bbox_annotation_enabled.unwrap_or(false),
     );
     let (response, effective_hints) = match converted {

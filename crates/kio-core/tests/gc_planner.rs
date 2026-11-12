@@ -18,6 +18,36 @@ const NOW: i64 = 1_767_225_600; // 2026-01-01T00:00:00Z
 const TOOL: &str = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const RAW: &str = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+// Publish fixture bytes directly, independently of CAS serialization/hash writers.
+// Existing private leaves retain their inode for in-place corruption tests.
+fn write_private_fixture(
+    path: impl AsRef<std::path::Path>,
+    bytes: impl AsRef<[u8]>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let path = path.as_ref();
+    let parent =
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(path.parent().unwrap())
+            .unwrap();
+    kio_core::private_fs::verify_private_directory_handle(&parent).unwrap();
+    let leaf = std::path::Path::new(path.file_name().unwrap());
+    let mut file = if parent.contains_entry(leaf).unwrap() {
+        kio_core::cas::open_regular_nofollow_read_write(path).unwrap()
+    } else {
+        parent.create_private_file(leaf).unwrap()
+    };
+    kio_core::private_fs::verify_private_regular_file_handle(&file).unwrap();
+    file.set_len(0)?;
+    file.write_all(bytes.as_ref())
+}
+
+fn create_private_fixture_directory(
+    path: impl AsRef<std::path::Path>,
+) -> Result<(), kio_core::KioError> {
+    let directory = kio_core::store_dir::StoreDirectory::open_or_create_directories(path.as_ref())?;
+    kio_core::private_fs::verify_private_directory_handle(&directory)
+}
+
 struct Fixture {
     temp: TempDir,
 }
@@ -90,10 +120,10 @@ impl Fixture {
     }
 
     fn head(&self, hash: &str) {
-        fs::write(self.kio().join("HEAD"), format!("{hash}\n")).unwrap();
+        write_private_fixture(self.kio().join("HEAD"), format!("{hash}\n")).unwrap();
     }
     fn tag(&self, _name: &str, hash: &str) {
-        fs::write(
+        write_private_fixture(
             self.kio()
                 .join("refs/tags-v1")
                 .join(format!("tag-{}", &hash[7..])),
@@ -102,7 +132,7 @@ impl Fixture {
         .unwrap();
     }
     fn policy(&self, text: &str) {
-        fs::write(self.kio().join("config.toml"), text).unwrap();
+        write_private_fixture(self.kio().join("config.toml"), text).unwrap();
     }
     fn plan(&self) -> GcPlan {
         GcPlanner::bind(self.canonical_root())
@@ -219,9 +249,9 @@ fn recovery_rejects_preexisting_receipt_timestamp_or_inode_replacement() {
         f.head(&head);
         f.tag("main", &head);
         let receipt_dir = f.kio().join("gc/shallowed");
-        fs::create_dir_all(&receipt_dir).unwrap();
+        create_private_fixture_directory(&receipt_dir).unwrap();
         let leaf = &shallow[7..];
-        fs::write(
+        write_private_fixture(
             receipt_dir.join(leaf),
             ShallowReceipt::new(
                 shallow.clone(),
@@ -249,7 +279,7 @@ fn recovery_rejects_preexisting_receipt_timestamp_or_inode_replacement() {
     }
     let (f, commit, tree, marker, session) = fixture();
     let leaf = &commit[7..];
-    fs::write(
+    write_private_fixture(
         f.kio().join("gc/shallowed").join(leaf),
         ShallowReceipt::new(commit.clone(), tree.clone(), "2026-01-01T00:00:01Z".into())
             .unwrap()
@@ -267,7 +297,7 @@ fn recovery_rejects_preexisting_receipt_timestamp_or_inode_replacement() {
     let path = f.kio().join("gc/shallowed").join(&commit[7..]);
     let original = fs::read(&path).unwrap();
     let replacement = path.with_extension("replacement");
-    fs::write(&replacement, &original).unwrap();
+    write_private_fixture(&replacement, &original).unwrap();
     fs::rename(&replacement, &path).unwrap();
     assert!(
         session
@@ -361,8 +391,8 @@ fn recovery_recomputes_retention_and_rejects_forged_marker_candidates() {
         marker.trees = vec![tree.clone()];
         marker.estimated_bytes = marker.candidates[0].size_bytes;
         marker.validate().unwrap();
-        fs::create_dir_all(f.kio().join("gc/shallowed")).unwrap();
-        fs::write(
+        create_private_fixture_directory(f.kio().join("gc/shallowed")).unwrap();
+        write_private_fixture(
             f.kio().join("gc/shallowed").join(&commit[7..]),
             ShallowReceipt::new(commit, tree, "2026-01-01T00:00:00Z".into())
                 .unwrap()
@@ -431,8 +461,8 @@ fn recovery_recomputes_retention_and_rejects_forged_marker_candidates() {
         .into_iter()
         .collect();
     marker.validate().unwrap();
-    fs::create_dir_all(f.kio().join("gc/shallowed")).unwrap();
-    fs::write(
+    create_private_fixture_directory(f.kio().join("gc/shallowed")).unwrap();
+    write_private_fixture(
         f.kio().join("gc/shallowed").join(&head[7..]),
         ShallowReceipt::new(head, head_tree, "2026-01-01T00:00:00Z".into())
             .unwrap()
@@ -551,7 +581,7 @@ fn same_byte_ref_replacement_changes_plan_truth_binding() {
     let path = f.kio().join("HEAD");
     let bytes = fs::read(&path).unwrap();
     let replacement = path.with_extension("same-bytes");
-    fs::write(&replacement, bytes).unwrap();
+    write_private_fixture(&replacement, bytes).unwrap();
     fs::rename(&replacement, &path).unwrap();
     let second = f.plan();
     assert_ne!(first.truth_digest, second.truth_digest);
@@ -602,7 +632,7 @@ fn marker_owned_receipt_must_use_marker_timestamp() {
         .kio()
         .join("gc/shallowed")
         .join(&candidate.commit_hash[7..]);
-    fs::write(
+    write_private_fixture(
         &path,
         ShallowReceipt::new(
             candidate.commit_hash.clone(),
@@ -659,7 +689,7 @@ fn sweeping_receipt_binding_rejects_same_bytes_inode_replacement() {
         .join(&candidate.commit_hash[7..]);
     let bytes = fs::read(&path).unwrap();
     let replacement = path.with_extension("replacement");
-    fs::write(&replacement, bytes).unwrap();
+    write_private_fixture(&replacement, bytes).unwrap();
     fs::rename(&replacement, &path).unwrap();
     assert!(session.validate_recovery_state(&marker).is_err());
 }
@@ -831,7 +861,7 @@ fn head_and_tag_tips_and_protected_types_are_excluded() {
     );
     f.head(&head);
     f.tag("topic", &tagged_history);
-    fs::write(
+    write_private_fixture(
         f.kio()
             .join("refs/tags-v1")
             .join(format!("tag-{}", &tag[7..])),
@@ -980,8 +1010,8 @@ fn an_existing_shallow_receipt_is_idempotent_and_skips_missing_tree() {
     f.head(&head);
     let leaf = &shallow[7..];
     let receipt_dir = f.kio().join("gc/shallowed");
-    fs::create_dir_all(&receipt_dir).unwrap();
-    fs::write(
+    create_private_fixture_directory(&receipt_dir).unwrap();
+    write_private_fixture(
         receipt_dir.join(leaf),
         kio_core::gc::ShallowReceipt::new(
             shallow.clone(),
@@ -1025,8 +1055,8 @@ fn final_shallow_validation_requires_every_shared_tree_receipt() {
     );
     f.head(&head);
     let receipts = f.kio().join("gc/shallowed");
-    fs::create_dir_all(&receipts).unwrap();
-    fs::write(
+    create_private_fixture_directory(&receipts).unwrap();
+    write_private_fixture(
         receipts.join(&first[7..]),
         ShallowReceipt::new(
             first.clone(),
@@ -1128,8 +1158,8 @@ fn malformed_receipt_and_missing_unreceipted_tree_fail_safely() {
 
     let f = Fixture::new();
     let receipts = f.kio().join("gc/shallowed");
-    fs::create_dir_all(&receipts).unwrap();
-    fs::write(receipts.join("a".repeat(64)), b"not json").unwrap();
+    create_private_fixture_directory(&receipts).unwrap();
+    write_private_fixture(receipts.join("a".repeat(64)), b"not json").unwrap();
     assert_eq!(
         GcPlanner::bind(f.canonical_root())
             .unwrap()
@@ -1143,8 +1173,8 @@ fn malformed_receipt_and_missing_unreceipted_tree_fail_safely() {
     let tree = f.tree("invalid-receipt-time");
     let commit = f.commit(&tree, None, "2025-01-01T00:00:00Z", CommitType::Auto);
     let receipts = f.kio().join("gc/shallowed");
-    fs::create_dir_all(&receipts).unwrap();
-    fs::write(
+    create_private_fixture_directory(&receipts).unwrap();
+    write_private_fixture(
         receipts.join(&commit[7..]),
         serde_json::to_vec(&json!({
             "commit_hash": commit,

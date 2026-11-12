@@ -12,9 +12,7 @@ use kio_core::management::{
     validate_case_probe, validate_live_chain, write_planned_child_management_record,
 };
 #[cfg(unix)]
-use kio_core::management::{
-    CONTROLLED_ROOT_ERROR, validate_controlled_root, validate_prospective_child,
-};
+use kio_core::management::{validate_controlled_root, validate_prospective_child};
 use kio_core::scope::Repository;
 use kio_core::store_dir::StoreDirectory;
 
@@ -53,7 +51,7 @@ fn controlled_root_admits_safe_shared_read_directory() {
 
 #[cfg(unix)]
 #[test]
-fn captured_root_rejects_later_group_or_world_writes_without_store_mutation() {
+fn captured_root_accepts_external_permission_changes_without_store_mutation() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let temp = tempfile::tempdir().unwrap();
@@ -66,8 +64,16 @@ fn captured_root_rejects_later_group_or_world_writes_without_store_mutation() {
     let management = canonical.join(".kio/management.json");
     for mode in [0o770, 0o777] {
         fs::set_permissions(&canonical, fs::Permissions::from_mode(mode)).unwrap();
-        let error = binding.revalidate().unwrap_err();
-        assert_eq!(error.error_code(), CONTROLLED_ROOT_ERROR);
+        // docs14/ST01: the user's scope root is external, its identity still binds.
+        binding.revalidate().unwrap();
+        assert_eq!(
+            directory_identity_from_handle(binding.root_handle()).unwrap(),
+            *binding.directory_identity()
+        );
+        assert_eq!(
+            fs::metadata(&canonical).unwrap().permissions().mode() & 0o777,
+            mode
+        );
         assert!(!management.exists());
         fs::set_permissions(&canonical, fs::Permissions::from_mode(0o700)).unwrap();
     }
@@ -75,7 +81,7 @@ fn captured_root_rejects_later_group_or_world_writes_without_store_mutation() {
 
 #[cfg(unix)]
 #[test]
-fn unsafe_direct_child_is_rejected_before_journal_or_probe() {
+fn writable_external_direct_child_is_observed_without_journal_or_probe() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let temp = tempfile::tempdir().unwrap();
@@ -84,11 +90,18 @@ fn unsafe_direct_child_is_rejected_before_journal_or_probe() {
     let child = parent.canonical_root().join("child");
     fs::create_dir(&child).unwrap();
     fs::set_permissions(&child, fs::Permissions::from_mode(0o777)).unwrap();
-    let error = observe_direct_child(&parent, "child").err().unwrap();
-    assert_eq!(error.error_code(), CONTROLLED_ROOT_ERROR);
+    // docs14/ST01: writable external children may be observed without enrollment.
+    let observed = observe_direct_child(&parent, "child").unwrap().unwrap();
     let retained_child = fs::File::open(&child).unwrap();
-    let error = validate_prospective_child(&parent, &retained_child, &child).unwrap_err();
-    assert_eq!(error.error_code(), CONTROLLED_ROOT_ERROR);
+    validate_prospective_child(&parent, &retained_child, &child).unwrap();
+    assert_eq!(
+        directory_identity_from_handle(&retained_child).unwrap(),
+        observed.directory_identity
+    );
+    assert_eq!(
+        fs::metadata(&child).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
     assert!(!child.join(".kio").exists());
     assert!(!child.join(CASE_PROBE_LEAF).exists());
     assert!(peek_registration_marker(&parent).unwrap().is_none());
@@ -210,12 +223,24 @@ fn moved_and_copied_management_records_do_not_enroll_a_new_directory() {
     assert!(read_record(&moved_binding).is_err());
 
     let copy = temp.path().join("copy");
-    fs::create_dir_all(copy.join(".kio")).unwrap();
-    fs::copy(
-        moved.join(".kio/management.json"),
-        copy.join(".kio/management.json"),
+    fs::create_dir_all(&copy).unwrap();
+    // Keep the copied own-object protection valid so rejection tests enrollment identity.
+    let copy_root = StoreDirectory::open(&copy).unwrap();
+    let copy_kio = StoreDirectory::from_retained(
+        copy_root
+            .create_directory(std::path::Path::new(".kio"))
+            .unwrap(),
+        copy.join(".kio"),
     )
     .unwrap();
+    let copied = fs::read(moved.join(".kio/management.json")).unwrap();
+    copy_kio
+        .write_atomic(
+            std::path::Path::new("management.json"),
+            &copied,
+            kio_core::store_dir::Publication::CreateOnly,
+        )
+        .unwrap();
     let copy_binding = ManagementBinding::bind(copy.canonicalize().unwrap()).unwrap();
     assert!(read_record(&copy_binding).is_err());
 }

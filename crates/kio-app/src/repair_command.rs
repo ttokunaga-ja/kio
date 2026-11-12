@@ -14,12 +14,13 @@ use crate::index::rebuild::rebuild_step3_index;
 use crate::index::rebuild::skipped_disclosure;
 use crate::invocation::Invocation;
 use crate::invocation::non_success_error_code;
-use crate::ledger_access::open_optional_ledger_db;
 use crate::ledger_access::recover_stale_sync_rows;
+use crate::ledger_access::{incidental_paid_recovery_available, open_ledger_db};
 use crate::managed_restore;
 use crate::management;
 use crate::markdownize::batch::poll_batch_markdownize_jobs;
 use crate::object_persistence::index_to_kio;
+use crate::object_persistence::pipeline_to_kio;
 use crate::promotion::clear_promotion_state;
 use crate::promotion::maybe_inject_promotion_fault;
 use crate::promotion::recover_pending_online_promotion;
@@ -45,6 +46,7 @@ use kio_core::purge::PurgeState;
 use kio_core::scope::Repository;
 use kio_index::registry::RegistryDb;
 use kio_index::registry::RegistryEntry;
+use kio_pipeline::ledger::snapshot::LedgerSnapshotError;
 use kio_pipeline::task::TaskStore;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -301,35 +303,52 @@ fn run_rebuild_db_locked(
     poll_remote_jobs: bool,
 ) -> Result<(RepairRebuildResponse, Completion)> {
     let adapter_settings = ctx.settings;
+    let markdown_ready =
+        crate::index::pipeline::optional_role_planning_ready(adapter_settings, "markdown")?;
+    let embedding_ready =
+        crate::index::pipeline::optional_role_planning_ready(adapter_settings, "embedding")?;
 
     // CL45/item 5: reconcile any stale `request_kind='sync'` cost-ledger.sqlite
     // rows left by a crashed prior run — `--rebuild-db` only (CL32/CL45 do not
     // list `--verify-objects`, handled by the early return above).
-    if !offline && let Some(ledger) = open_optional_ledger_db(ctx.control)? {
-        recover_stale_sync_rows(
-            &ledger,
-            Some(&TaskStore::new_with_control(
-                repo.kio_dir(),
-                repo.control().clone(),
-            )),
+    let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
+    let has_paid_stamp = store
+        .all()
+        .map_err(pipeline_to_kio)?
+        .iter()
+        .any(|task| task.reservation_id.is_some());
+    // A rebuild's incidental billing recovery is optional; unavailable billing
+    // retains all paid state while deterministic rebuilding remains usable.
+    let recovery_ledger = if !offline {
+        match incidental_paid_recovery_available(
             &scope_id(repo.kio_dir())?,
-        )?;
-    }
-    if poll_remote_jobs {
-        // 04 §5.8 相 3: poll/collect in-flight Batch jobs at the scoped
-        // write-command entry point. Device-global `repair all` disables this
-        // entire block: its offline contract forbids provider polling and
-        // remote-residue cleanup as well as new paid sends.
-        if let Some(ledger) = open_optional_ledger_db(ctx.control)? {
-            poll_batch_markdownize_jobs(
-                adapter_settings,
-                repo,
-                &TaskStore::new_with_control(repo.kio_dir(), repo.control().clone()),
-                &ledger,
-            )?;
-            poll_batch_embedding_jobs(ctx, repo, &ledger)?;
+            has_paid_stamp,
+            ctx.control,
+        ) {
+            Ok(true) => Some(open_ledger_db(ctx.control)?),
+            Ok(false)
+            | Err(
+                LedgerSnapshotError::Missing
+                | LedgerSnapshotError::UnsafeIntegrity(_)
+                | LedgerSnapshotError::UnstableBusy(_),
+            ) => None,
+        }
+    } else {
+        None
+    };
+    if let Some(ledger) = recovery_ledger.as_ref() {
+        recover_stale_sync_rows(ledger, Some(&store), &scope_id(repo.kio_dir())?)?;
+        if poll_remote_jobs {
+            // Device-global/offline repair never polls or deletes provider work.
+            if markdown_ready {
+                poll_batch_markdownize_jobs(adapter_settings, repo, &store, ledger)?;
+            }
+            if embedding_ready {
+                poll_batch_embedding_jobs(ctx, repo, ledger)?;
+            }
         }
     }
+    drop(recovery_ledger);
     // LC39/LC40 (see `ensure_purge_epoch_initialized`'s doc comment).
     ensure_purge_epoch_initialized(repo.kio_dir(), repo.control())?;
     let promotion_rebuild_pending = recover_pending_online_promotion(repo)?;
@@ -360,16 +379,17 @@ fn run_rebuild_db_locked(
     // with a second vector space.  `index` is the explicit operation that may
     // materialize a new lock/profile.
     let locked_embedding_profile = rebuild_embedding_profile_from_tool_lock(repo.kio_dir())?;
-    let enrichment_authorized = locked_embedding_profile.as_ref().is_some_and(|locked| {
-        embedding_execution(adapter_settings, ctx.control)
-            .map(declared_embedding_profile)
-            .is_some_and(|active| {
-                active.dimensions == locked.dimensions
-                    && active.distance == locked.distance
-                    && active.modality == locked.modality
-                    && active.profile_hash == locked.profile_hash
-            })
-    });
+    let enrichment_authorized = embedding_ready
+        && locked_embedding_profile.as_ref().is_some_and(|locked| {
+            embedding_execution(adapter_settings, ctx.control)
+                .map(declared_embedding_profile)
+                .is_some_and(|active| {
+                    active.dimensions == locked.dimensions
+                        && active.distance == locked.distance
+                        && active.modality == locked.modality
+                        && active.profile_hash == locked.profile_hash
+                })
+        });
     let embedding_online = if enrichment_authorized {
         embedding_online_allowed(adapter_settings, repo, offline, online_requested, false)?
     } else {

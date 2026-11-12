@@ -83,7 +83,8 @@ fn sync_text_http_characterization_preserves_request_order_and_vector_bits() {
                 "promptTokenDetails": [{"modality": "TEXT", "tokenCount": 7}]
             }
         }));
-        let mut client = EnvGeminiEmbeddingClient::with_base_url(Arc::new(settings.clone()), url);
+        let mut client =
+            EnvGeminiEmbeddingClient::with_base_url(Arc::new(settings.clone()), url).unwrap();
         client.http = http;
         let adapter = GeminiEmbeddingAdapter::new(client, ADOPTED_MODEL_PIN, ADOPTED_DIMENSIONS);
         let profile = adapter.profile().tool_profile_hash;
@@ -197,7 +198,8 @@ fn original_image_wire(bytes: Vec<u8>, mime: &str) {
         let mut client = EnvGeminiEmbeddingClient::with_base_url(
             Arc::new(settings.clone()),
             capture.url.clone(),
-        );
+        )
+        .unwrap();
         client.http = capture.http.clone();
         let result = client.embed(
             &[EmbeddingItem {
@@ -272,7 +274,8 @@ fn sync_http_text_uses_documented_nested_768_config() {
             "usageMetadata": {"promptTokenCount": 7,
                 "promptTokenDetails": [{"modality": "TEXT", "tokenCount": 7}]}
         }));
-        let mut client = EnvGeminiEmbeddingClient::with_base_url(Arc::new(settings.clone()), url);
+        let mut client =
+            EnvGeminiEmbeddingClient::with_base_url(Arc::new(settings.clone()), url).unwrap();
         client.http = http;
         let output = client.embed(
             &[EmbeddingItem::text("text", "unchanged text")],

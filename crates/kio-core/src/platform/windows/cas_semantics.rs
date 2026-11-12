@@ -66,9 +66,6 @@ pub(crate) fn same_repair_quarantine(
         ),
     )
 }
-pub(crate) fn private_bound_temp_is_safe(file: &File, _label: &str) -> Result<bool> {
-    Ok(super::cas_identity::regular_file_handle_identity(file).is_some())
-}
 pub(crate) fn configure_removal_root(options: &mut OpenOptions) {
     use std::os::windows::fs::OpenOptionsExt;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -76,4 +73,3 @@ pub(crate) fn configure_removal_root(options: &mut OpenOptions) {
     };
     options.custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT);
 }
-pub(crate) fn configure_private_temp(_options: &mut OpenOptions) {}

@@ -9,9 +9,10 @@ use super::*;
 pub const NETWORK_APPROVAL_EXECUTION_MODE: &str = "online_api";
 
 pub(super) fn read_scope_json_value(kio_dir: &Path) -> Result<Value> {
-    let path = kio_dir.join("scope.json");
-    let value = serde_json::from_str(&fs::read_to_string(&path).kio_io(&path)?)
-        .map_err(|err| KioError::schema(err.to_string()))?;
+    let directory = crate::private_fs::verify_private_directory(kio_dir)
+        .map_err(|error| crate::management::controlled_root_err(kio_dir, error.to_string()))?;
+    let bytes = read_private_metadata(&directory, "scope.json", MAX_BOUND_CONFIG_BYTES)?;
+    let value = serde_json::from_slice(&bytes).map_err(|err| KioError::schema(err.to_string()))?;
     validate_scope_json_value(&value)?;
     Ok(value)
 }
@@ -75,10 +76,23 @@ fn with_bound_scope_approval_write<T>(
     operation(&directory)
 }
 
+pub(super) fn read_private_metadata(
+    directory: &StoreDirectory,
+    leaf: &str,
+    max: u64,
+) -> Result<Vec<u8>> {
+    let unsafe_store = |error: KioError| {
+        crate::management::controlled_root_err(directory.path(), error.to_string())
+    };
+    crate::private_fs::verify_private_directory_handle(directory).map_err(unsafe_store)?;
+    if !directory.contains_entry(Path::new(leaf))? {
+        return Err(KioError::schema(format!("{leaf} is missing")));
+    }
+    crate::private_fs::read_private_file_at(directory, leaf, max).map_err(unsafe_store)
+}
+
 pub(super) fn read_bound_scope_json_value(directory: &StoreDirectory) -> Result<Value> {
-    let bytes = directory
-        .read_optional(Path::new("scope.json"), MAX_BOUND_CONFIG_BYTES)?
-        .ok_or_else(|| KioError::schema("scope.json is missing"))?;
+    let bytes = read_private_metadata(directory, "scope.json", MAX_BOUND_CONFIG_BYTES)?;
     let value = serde_json::from_slice(&bytes).map_err(|err| KioError::schema(err.to_string()))?;
     validate_scope_json_value(&value)?;
     Ok(value)
@@ -95,9 +109,7 @@ fn overwrite_bound_scope_json_value(directory: &StoreDirectory, value: &Value) -
 }
 
 pub(super) fn read_bound_config_document(directory: &StoreDirectory) -> Result<String> {
-    let bytes = directory
-        .read_optional(Path::new("config.toml"), MAX_BOUND_CONFIG_BYTES)?
-        .ok_or_else(|| KioError::schema("config.toml is missing"))?;
+    let bytes = read_private_metadata(directory, "config.toml", MAX_BOUND_CONFIG_BYTES)?;
     let text =
         String::from_utf8(bytes).map_err(|_| KioError::schema("config.toml must be UTF-8"))?;
     validate_scope_config_document(&text)?;

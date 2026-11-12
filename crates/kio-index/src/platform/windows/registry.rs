@@ -125,6 +125,7 @@ pub(crate) fn registry_parent_and_leaf(
             index += 1;
         }
     }
+    crate::registry::verify_private_registry_parent(&handle, parent)?;
     Ok(RegistryParentBinding {
         parent: std::sync::Arc::new(handle),
         leaf: leaf.to_owned(),
@@ -309,12 +310,8 @@ pub(crate) fn normalized_absolute_registry_path(
 
 pub(crate) fn windows_registry_writer_parent(
     path: &Path,
-    control: &kio_core::control::ControlHandle,
+    _control: &kio_core::control::ControlHandle,
 ) -> Result<(PathBuf, kio_core::store_dir::StoreDirectory)> {
-    use kio_core::{private_fs, store_dir::StoreDirectory};
-    use std::os::windows::fs::MetadataExt;
-    use windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_REPARSE_POINT;
-
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -341,66 +338,10 @@ pub(crate) fn windows_registry_writer_parent(
             "registry writer path has no file name".to_owned(),
         ));
     }
-    let parent_path = absolute.parent().ok_or_else(|| {
-        crate::IndexError::Schema("registry writer path has no parent".to_owned())
+    let (absolute, parent) = crate::registry::prepare_private_registry_writer(&absolute)?;
+    let parent = parent.ok_or_else(|| {
+        crate::IndexError::Schema("registry writer has no retained parent".into())
     })?;
-    let mut ancestor = parent_path.to_path_buf();
-    let mut missing = Vec::new();
-    let mut parent = loop {
-        match fs::symlink_metadata(&ancestor) {
-            Ok(metadata) => {
-                if !metadata.is_dir()
-                    || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-                {
-                    return Err(crate::IndexError::Schema(format!(
-                        "registry writer ancestor is not a real directory: {}",
-                        ancestor.display()
-                    )));
-                }
-                // An occupied unsafe ancestor is a refusal, never a reason to
-                // back off farther or repair that ancestor's ACL.
-                break private_fs::verify_private_creation_parent_with_control(&ancestor, control)
-                    .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let component = ancestor.file_name().ok_or_else(|| {
-                    crate::IndexError::Schema("registry writer has no existing ancestor".to_owned())
-                })?;
-                missing.push(component.to_os_string());
-                if !ancestor.pop() {
-                    return Err(crate::IndexError::Schema(
-                        "registry writer has no existing ancestor".to_owned(),
-                    ));
-                }
-            }
-            Err(error) => return Err(crate::IndexError::Schema(error.to_string())),
-        }
-    };
-    let mut logical = ancestor;
-    for component in missing.into_iter().rev() {
-        let leaf = Path::new(&component);
-        let next = if parent
-            .contains_entry(leaf)
-            .map_err(|error| crate::IndexError::Schema(error.to_string()))?
-        {
-            parent
-                .open_directory(leaf)
-                .map_err(|error| crate::IndexError::Schema(error.to_string()))?
-        } else {
-            // The core primitive installs a protected owner-only DACL before
-            // exposing this create-only entry. Creation errors stay errors.
-            parent
-                .create_directory(leaf)
-                .map_err(|error| crate::IndexError::Schema(error.to_string()))?
-        };
-        logical.push(&component);
-        parent = StoreDirectory::from_retained_with_control(next, logical.clone(), control.clone())
-            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
-        // A component that appeared after the missing suffix was observed must
-        // also be private; neither that entry nor a new one is ACL-repaired.
-        private_fs::verify_private_directory_handle(&parent)
-            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
-    }
     Ok((absolute, parent))
 }
 
@@ -516,6 +457,8 @@ pub(crate) fn observe_leaf(
         SnapshotAttemptError::Unstable(format!("inspect opened registry {name}: {error}"))
     })?;
     validate_regular(&opened, name)?;
+    kio_core::private_fs::verify_private_regular_file_handle(&input)
+        .map_err(|error| SnapshotAttemptError::Unsafe(error.to_string()))?;
 
     verify_windows_regular_binding(&parent_path.join(name), &input, name)?;
     let before_identity = leaf_identity(&before).ok_or_else(|| {
@@ -623,6 +566,18 @@ impl PrivateSnapshotStorage {
                 "create owner-private registry snapshot {basename}: {error}"
             ))
         })
+    }
+    pub(super) fn native_binding(
+        &self,
+        path: &Path,
+        directory: &kio_core::store_dir::StoreDirectory,
+    ) -> crate::Result<super::registry_native::Binding> {
+        if path.parent() != Some(self.path()) {
+            return Err(crate::IndexError::Schema(
+                "native snapshot path is outside its owned storage".into(),
+            ));
+        }
+        super::registry_native::bind_snapshot(path, directory, &self.0)
     }
     pub(crate) fn capability(&self) -> std::result::Result<fs::File, SnapshotAttemptError> {
         self.0.capability().map_err(|error| {

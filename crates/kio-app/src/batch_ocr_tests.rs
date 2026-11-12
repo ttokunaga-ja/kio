@@ -47,7 +47,7 @@ fn batch_ocr_image_is_owned_reopenable_and_retained_for_its_source_unit() {
         "image/png",
         &raw_hash,
         &scope_id,
-        repo.kio_dir(),
+        &repo.object_store().image_store().unwrap(),
         false,
     )
     .unwrap();
@@ -149,8 +149,16 @@ fn batch_ocr_existing_image_cas_corruption_is_recollectable_persistence_failure(
         .join(&digest[..2])
         .join(&digest[2..4])
         .join(digest);
-    std::fs::create_dir_all(poisoned.parent().unwrap()).unwrap();
-    std::fs::write(&poisoned, b"not the claimed image").unwrap();
+    // Only the bytes are corrupt: namespace and file privacy must remain
+    // valid so this exercises recollectable CAS persistence failure.
+    let parent =
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(poisoned.parent().unwrap())
+            .unwrap();
+    let mut file = parent
+        .create_private_file(std::path::Path::new(poisoned.file_name().unwrap()))
+        .unwrap();
+    std::io::Write::write_all(&mut file, b"not the claimed image").unwrap();
+    drop(file);
     let encoded = base64::engine::general_purpose::STANDARD.encode(&source);
     let body = json!({
         "model": "mistral-ocr-2505",
@@ -173,7 +181,7 @@ fn batch_ocr_existing_image_cas_corruption_is_recollectable_persistence_failure(
             "application/pdf",
             &hash_bytes(b"raw"),
             &scope_id,
-            repo.kio_dir(),
+            &repo.object_store().image_store().unwrap(),
             false,
         ),
         Err(BatchOcrMaterializationError::Persistence(_))
@@ -202,7 +210,7 @@ fn batch_ocr_rejects_malformed_embedded_image_before_persistence() {
             "application/pdf",
             &hash_bytes(b"raw"),
             &scope_id,
-            repo.kio_dir(),
+            &repo.object_store().image_store().unwrap(),
             false,
         )
         .is_err()

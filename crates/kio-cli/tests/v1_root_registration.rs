@@ -536,3 +536,114 @@ fn moved_root_registers_after_an_enrolled_child_was_deleted() {
         b"retained root knowledge"
     );
 }
+
+#[test]
+fn app13_independent_requires_confirmation_and_reports_uncertain_parent() {
+    let f = Fixture::new();
+    let parent = f.root_parent.join("uncertain-parent");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).unwrap();
+    fs::write(parent.join(".kio"), b"unreadable parent store").unwrap();
+    let before = byte_fingerprint(&parent);
+    let output = f
+        .command(&child, &["init", "--independent", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let message = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(message.contains("uncertain"), "{message}");
+    assert!(message.contains("--yes"), "{message}");
+    assert_eq!(byte_fingerprint(&parent), before);
+    assert!(!child.join(".kio").exists());
+}
+
+#[test]
+fn app13_confirmed_independent_preserves_inconsistent_parent_bytes() {
+    let f = Fixture::new();
+    let parent = f.root_parent.join("inconsistent-parent");
+    let child = parent.join("child");
+    fs::create_dir_all(parent.join(".kio")).unwrap();
+    fs::create_dir(&child).unwrap();
+    fs::write(
+        parent.join(".kio/management.json"),
+        b"inconsistent enrollment",
+    )
+    .unwrap();
+    fs::write(
+        parent.join("history.txt"),
+        b"parent history stays unchanged",
+    )
+    .unwrap();
+    let parent_before = byte_fingerprint(&parent.join(".kio"));
+    let result = f.json(&child, &["init", "--independent", "--yes"]);
+    assert_eq!(result["independent"]["parent_relationship"], "uncertain");
+    assert_eq!(result["independent"]["confirmed"], true);
+    assert_eq!(management(&child)["authority"]["kind"], "root");
+    assert_eq!(byte_fingerprint(&parent.join(".kio")), parent_before);
+    assert_eq!(
+        fs::read(parent.join("history.txt")).unwrap(),
+        b"parent history stays unchanged"
+    );
+    assert_eq!(f.json(&child, &["init"])["status"], "already initialized");
+}
+
+#[test]
+fn app13_independent_existing_child_requires_authenticated_root_registration() {
+    let f = Fixture::new();
+    let parent = f.root_parent.join("managed-parent");
+    let child = parent.join("child");
+    fs::create_dir_all(&child).unwrap();
+    f.json(&parent, &["init"]);
+    f.json(&parent, &["index", "--offline"]);
+    let before = byte_fingerprint(&parent);
+    let (code, response) = f.run(&child, &["init", "--independent", "--yes"]);
+    assert_ne!(code, 0);
+    assert!(response.to_string().contains("root register"), "{response}");
+    assert_eq!(byte_fingerprint(&parent), before);
+}
+
+#[test]
+fn app13_independent_refuses_unknown_nonempty_store_unchanged() {
+    let f = Fixture::new();
+    let child = f.root_parent.join("unknown-store");
+    fs::create_dir_all(child.join(".kio")).unwrap();
+    fs::write(child.join(".kio/unknown"), b"must not be adopted").unwrap();
+    let before = byte_fingerprint(&child);
+    let output = f
+        .command(&child, &["init", "--independent", "--yes", "--json"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert_eq!(byte_fingerprint(&child), before);
+}
+
+#[test]
+fn app13_confirmed_independent_boundary_is_not_adopted_by_parent_discovery() {
+    let f = Fixture::new();
+    let parent = f.root_parent.join("discovery-parent");
+    let child = parent.join("independent");
+    fs::create_dir_all(&child).unwrap();
+    f.json(&parent, &["init"]);
+    let before = fs::read(parent.join(".kio/management.json")).unwrap();
+    f.json(&child, &["init", "--independent", "--yes"]);
+    assert_eq!(
+        fs::read(parent.join(".kio/management.json")).unwrap(),
+        before
+    );
+    let independent = fs::read(child.join(".kio/management.json")).unwrap();
+    f.json(&parent, &["index", "--offline"]);
+    assert!(
+        management(&parent)["children"]
+            .as_object()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fs::read(child.join(".kio/management.json")).unwrap(),
+        independent
+    );
+}

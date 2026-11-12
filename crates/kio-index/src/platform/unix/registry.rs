@@ -47,6 +47,18 @@ impl PrivateSnapshotStorage {
             ))
         })
     }
+    pub(super) fn native_binding(
+        &self,
+        path: &Path,
+        directory: &kio_core::store_dir::StoreDirectory,
+    ) -> crate::Result<super::registry_native::Binding> {
+        if path.parent() != Some(self.path()) {
+            return Err(crate::IndexError::Schema(
+                "native snapshot path is outside its owned storage".into(),
+            ));
+        }
+        super::registry_native::bind(path, directory)
+    }
     pub(crate) fn capability(&self) -> std::result::Result<fs::File, SnapshotAttemptError> {
         cap_fs::open_ambient_dir(self.path(), cap_primitives::ambient_authority()).map_err(
             |error| {
@@ -144,6 +156,8 @@ pub(crate) fn observe_leaf(
         SnapshotAttemptError::Unstable(format!("inspect opened registry {name}: {error}"))
     })?;
     validate_regular(&opened, name)?;
+    kio_core::private_fs::verify_private_regular_file_handle(&input)
+        .map_err(|error| SnapshotAttemptError::Unsafe(error.to_string()))?;
 
     let before_identity = leaf_identity(&before).ok_or_else(|| {
         SnapshotAttemptError::Unsafe(format!("scope registry {name} has no usable identity"))

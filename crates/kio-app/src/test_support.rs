@@ -128,3 +128,19 @@ pub(crate) fn assert_diagnostic_io_error(error: &kio_core::KioError, operation: 
     assert_eq!(error.to_error_json(), expected.to_error_json());
     assert_eq!(error.exit_code(), expected.exit_code());
 }
+
+/// Create a fresh private fixture namespace without repairing an existing one.
+pub(crate) fn create_private_test_directory(path: &Path) {
+    assert!(!path.exists(), "private fixture directory must be new");
+    let directory = StoreDirectory::open_or_create_directories(path).unwrap();
+    kio_core::private_fs::verify_private_directory_handle(&directory).unwrap();
+}
+
+/// Seed raw malformed/corrupt test bytes in a legitimately protected file.
+pub(crate) fn create_private_test_file(path: &Path) -> std::fs::File {
+    let parent = StoreDirectory::open(path.parent().unwrap()).unwrap();
+    kio_core::private_fs::verify_private_directory_handle(&parent).unwrap();
+    parent
+        .create_private_file(Path::new(path.file_name().unwrap()))
+        .unwrap()
+}

@@ -12,7 +12,6 @@ use crate::response::watch::{
 
 use std::env;
 use std::fs::{self, File};
-use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -721,12 +720,13 @@ fn install_checked<S: Scheduler>(scheduler: &S, manifest: &ServiceManifest) -> R
 }
 
 /// An admitted native-definition location. Missing suffixes are recorded only
-/// after the nearest existing ancestor has passed the full trust check. No
-/// lookup, lock, or publication may treat an unsafe parent as benign absence.
+/// after retaining the nearest external creation parent without following links.
+/// Newly created suffixes are owner-private; external parents are never repaired.
 struct NativeDefinitionLocation {
     directory: StoreDirectory,
     missing: Vec<PathBuf>,
     leaf: PathBuf,
+    created_parents: Vec<StoreDirectory>,
 }
 
 impl NativeDefinitionLocation {
@@ -768,10 +768,15 @@ impl NativeDefinitionLocation {
             directory,
             missing,
             leaf: PathBuf::from(leaf),
+            created_parents: Vec::new(),
         })
     }
 
     fn revalidate(&self) -> Result<()> {
+        for owned in &self.created_parents {
+            kio_core::private_fs::verify_private_directory_handle(owned)?;
+            crate::platform::verify_private_state_named_identity(owned, owned.path())?;
+        }
         let current = kio_core::private_fs::verify_private_creation_parent_with_control(
             self.directory.path(),
             self.directory.control(),
@@ -795,6 +800,11 @@ impl NativeDefinitionLocation {
                 self.directory.path().join(component),
                 self.directory.control().clone(),
             )?;
+            kio_core::private_fs::verify_private_directory_handle(&self.directory)?;
+            self.created_parents.push(
+                self.directory
+                    .rebind_with_control(self.directory.control().clone()),
+            );
             self.revalidate()?;
         }
         Ok(())
@@ -805,21 +815,15 @@ impl NativeDefinitionLocation {
         if !self.missing.is_empty() || !self.directory.contains_entry(&self.leaf)? {
             return Ok(NativeRegistration::Absent);
         }
-        let mut file = match self.directory.open_regular_read(&self.leaf, 64 * 1024) {
-            Ok(file) => file,
-            Err(_) => return Ok(NativeRegistration::Foreign),
-        };
-        if kio_core::private_fs::verify_trusted_owned_regular_file_handle(&file).is_err() {
+        let Some(name) = self.leaf.to_str() else {
             return Ok(NativeRegistration::Foreign);
-        }
-        let mut bytes = Vec::new();
-        (&mut file)
-            .take(64 * 1024 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(service_error)?;
-        if bytes != expected
-            || kio_core::private_fs::verify_trusted_owned_regular_file_handle(&file).is_err()
-        {
+        };
+        let bytes =
+            match kio_core::private_fs::read_private_file_at(&self.directory, name, 64 * 1024) {
+                Ok(bytes) => bytes,
+                Err(_) => return Ok(NativeRegistration::Foreign),
+            };
+        if bytes != expected {
             return Ok(NativeRegistration::Foreign);
         }
         self.revalidate()?;
@@ -1038,7 +1042,11 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         assert_eq!(
             location.inspect(b"unit").unwrap(),
-            NativeRegistration::Owned
+            NativeRegistration::Foreign
+        );
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
         );
         location.directory.remove_file(&location.leaf).unwrap();
         assert_eq!(
@@ -1049,22 +1057,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_location_rejects_writable_and_symlink_ancestors_before_mutation() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+    fn st01_native_location_accepts_external_writable_parent_without_repair() {
+        use std::os::unix::fs::PermissionsExt;
         let (_temp, root) = native_test_root();
-        let unsafe_parent = root.join("unsafe");
-        fs::create_dir(&unsafe_parent).unwrap();
-        for mode in [0o777, 0o775] {
-            fs::set_permissions(&unsafe_parent, fs::Permissions::from_mode(mode)).unwrap();
-            assert!(
-                NativeDefinitionLocation::admit(
-                    &unsafe_parent.join("missing/user/unit"),
-                    &ControlHandle::default()
-                )
-                .is_err()
-            );
-            assert_eq!(fs::read_dir(&unsafe_parent).unwrap().count(), 0);
-        }
+        let external = root.join("external");
+        fs::create_dir(&external).unwrap();
+        fs::set_permissions(&external, fs::Permissions::from_mode(0o777)).unwrap();
+        let mut location = NativeDefinitionLocation::admit(
+            &external.join("missing/user/unit"),
+            &ControlHandle::default(),
+        )
+        .unwrap();
+        location.create_parents().unwrap();
+        assert_eq!(
+            fs::metadata(&external).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(
+            fs::metadata(external.join("missing"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(external.join("missing/user"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        location.revalidate().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn st01_native_location_rejects_symlink_ancestor_without_mutation() {
+        use std::os::unix::fs::symlink;
+        let (_temp, root) = native_test_root();
         symlink(&root, root.join("alias")).unwrap();
         assert!(
             NativeDefinitionLocation::admit(
@@ -1125,7 +1157,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn native_location_revalidates_permissions_and_parent_identity() {
+    fn native_location_revalidates_external_parent_identity_without_permission_repair() {
         use std::os::unix::fs::PermissionsExt;
         let (_temp, root) = native_test_root();
         let parent = root.join("native");
@@ -1134,14 +1166,16 @@ mod tests {
             NativeDefinitionLocation::admit(&parent.join("unit"), &ControlHandle::default())
                 .unwrap();
         fs::set_permissions(&parent, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(location.publish(b"unit").is_err());
-        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        location.publish(b"unit").unwrap();
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
         fs::rename(&parent, root.join("old")).unwrap();
         fs::create_dir(&parent).unwrap();
-        assert!(location.publish(b"unit").is_err());
+        assert!(location.inspect(b"unit").is_err());
         assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
-        assert_eq!(fs::read_dir(root.join("old")).unwrap().count(), 0);
+        assert_eq!(fs::read(root.join("old/unit")).unwrap(), b"unit");
     }
 
     struct FakeScheduler {

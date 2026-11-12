@@ -33,13 +33,15 @@ use windows_sys::Win32::{
         BY_HANDLE_FILE_INFORMATION, DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES,
         FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
         GetFileInformationByHandle, GetFileInformationByHandleEx, READ_CONTROL, SYNCHRONIZE,
-        WRITE_DAC,
     },
     System::IO::IO_STATUS_BLOCK,
 };
 static TEMP: AtomicU64 = AtomicU64::new(0);
 fn full(label: &Path, relative: &Path) -> std::path::PathBuf {
     label.join(relative)
+}
+pub(crate) fn normalize_store_path(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 pub(crate) fn open(path: &Path) -> Result<File> {
     let (root_path, components) = absolute_components(path)?;
@@ -370,9 +372,7 @@ pub(crate) fn open_regular_for_removal(
     let mut options = cap_fs::OpenOptions::new();
     options
         .read(true)
-        .access_mode(
-            FILE_READ_DATA | READ_CONTROL | WRITE_DAC | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-        )
+        .access_mode(FILE_READ_DATA | READ_CONTROL | DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
         .share_mode(FILE_SHARE_READ)
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let file = cap_fs::open(&parent, Path::new(leaf), &options).map_err(|e| ioerr(&path, e))?;
@@ -794,6 +794,52 @@ pub(crate) fn append(root: &File, relative: &Path, bytes: &[u8], label: &Path) -
     regular(&f, &path)?;
     f.write_all(bytes).map_err(|e| ioerr(&path, e))?;
     f.sync_data().map_err(|e| ioerr(&path, e))
+}
+pub(crate) fn append_private(
+    root: &File,
+    relative: &Path,
+    bytes: &[u8],
+    label: &Path,
+) -> Result<()> {
+    let (parent, name) = parent(root, relative, label)?;
+    let path = full(label, relative);
+    let expected = match create_private_file_raw(
+        &parent,
+        Path::new(name),
+        path.parent().expect("leaf parent"),
+    ) {
+        Ok(file) => file,
+        Err(error) if is_io_kind(&error, "already_exists") => {
+            leaf(&parent, name, true, false, false, &path)?
+        }
+        Err(error) => return Err(error),
+    };
+    super::private_fs::verify_owner_private_handle(&expected)?;
+    let identity = crate::platform::regular_file_handle_identity(&expected).ok_or_else(|| {
+        err(
+            &path,
+            "private append leaf is not a single-link regular file",
+        )
+    })?;
+    let mut options = cap_fs::OpenOptions::new();
+    options
+        .append(true)
+        .access_mode(
+            windows_sys::Win32::Storage::FileSystem::FILE_APPEND_DATA
+                | windows_sys::Win32::Storage::FileSystem::FILE_READ_ATTRIBUTES
+                | windows_sys::Win32::Storage::FileSystem::READ_CONTROL
+                | windows_sys::Win32::Storage::FileSystem::SYNCHRONIZE,
+        )
+        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+    let mut file =
+        cap_fs::open(&parent, Path::new(name), &options).map_err(|error| ioerr(&path, error))?;
+    super::private_fs::verify_owner_private_handle(&file)?;
+    if crate::platform::regular_file_handle_identity(&file) != Some(identity) {
+        return Err(err(&path, "private append leaf changed while opening"));
+    }
+    file.write_all(bytes).map_err(|error| ioerr(&path, error))?;
+    file.sync_data().map_err(|error| ioerr(&path, error))?;
+    sync_directory(&parent, label)
 }
 pub(crate) fn remove_file(root: &File, relative: &Path, label: &Path) -> Result<()> {
     let (p, n) = parent(root, relative, label)?;

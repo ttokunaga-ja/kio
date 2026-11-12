@@ -4,11 +4,14 @@ use support::canonical_tempdir;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
+use std::path::Path;
 
 use assert_cmd::Command;
 use kio_core::cas::{ObjectKind, ObjectStore, fanout_path};
 use kio_core::gc::ShallowReceipt;
 use kio_core::scope::Repository;
+use kio_core::store_dir::StoreDirectory;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 
@@ -394,14 +397,26 @@ fn ct4_restore_rejects_shallow_tombstoned_and_store_destinations() {
         .path()
         .join(".kio/gc/shallowed")
         .join(commit.strip_prefix("sha256:").unwrap());
-    fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
+    let owned = StoreDirectory::open(&shallow.path().join(".kio")).unwrap();
+    let retained = owned
+        .create_directory_all(Path::new("gc/shallowed"))
+        .unwrap();
+    let receipts =
+        StoreDirectory::from_retained(retained, receipt_path.parent().unwrap().to_path_buf())
+            .unwrap();
     let receipt = ShallowReceipt::new(
         commit.clone(),
         tree_hash.clone(),
         "2026-08-14T00:00:02Z".into(),
     )
     .unwrap();
-    fs::write(receipt_path, receipt.canonical_bytes().unwrap()).unwrap();
+    let mut receipt_file = receipts
+        .create_private_file(Path::new(receipt_path.file_name().unwrap()))
+        .unwrap();
+    receipt_file
+        .write_all(&receipt.canonical_bytes().unwrap())
+        .unwrap();
+    drop(receipt_file);
     fs::remove_file(store.object_path(ObjectKind::Tree, &tree_hash).unwrap()).unwrap();
     let error = json_failure(
         &shallow,

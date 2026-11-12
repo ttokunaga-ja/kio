@@ -7,9 +7,10 @@ use crate::scope::{
     new_lock_token, unix_nanos, unsafe_store_error,
 };
 use crate::store_dir::StoreDirectory;
+use cap_primitives::fs::OpenOptionsExt;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 fn unlock_flock(file: &File) {
@@ -32,15 +33,19 @@ impl Drop for BoundLockGate {
     }
 }
 
-fn reclaim_stale_lock(path: &Path, replacement: &[u8]) -> Result<bool> {
+fn reclaim_stale_lock(directory: &File, path: &Path, replacement: &[u8]) -> Result<bool> {
     {
-        let Some(old) = read_lock_snapshot(path)? else {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| KioError::locked(path.display().to_string()))?;
+        let Some(old) = read_lock_snapshot(directory, Path::new(name))? else {
             return Ok(false);
         };
         if crate::platform::process_is_alive(old.lock.pid) {
             return Ok(false);
         }
-        let Some(again) = read_lock_snapshot(path)? else {
+        let Some(again) = read_lock_snapshot(directory, Path::new(name))? else {
             return Ok(false);
         };
         if old != again || crate::platform::process_is_alive(again.lock.pid) {
@@ -49,36 +54,32 @@ fn reclaim_stale_lock(path: &Path, replacement: &[u8]) -> Result<bool> {
         let parent = path
             .parent()
             .ok_or_else(|| KioError::io("lock path has no parent", path.display().to_string()))?;
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| KioError::locked(path.display().to_string()))?;
         let temp_name = format!(".{name}.reclaimed-{}-{}", std::process::id(), unix_nanos());
         let temp = parent.join(&temp_name);
-        let mut temp_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .kio_io(&temp)?;
+        let mut options = cap_primitives::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        options._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
+        let mut temp_file =
+            cap_primitives::fs::open(directory, Path::new(&temp_name), &options).kio_io(&temp)?;
+        super::private_fs::verify_owner_private_regular_handle(&temp_file, &temp)?;
         temp_file.write_all(replacement).kio_io(&temp)?;
         temp_file.sync_all().kio_io(&temp)?;
         drop(temp_file);
-        let Some(current) = read_lock_snapshot(path)? else {
+        let Some(current) = read_lock_snapshot(directory, Path::new(name))? else {
             return Ok(false);
         };
         if current != old {
             return Ok(false);
         }
-        let directory = File::open(parent).kio_io(parent)?;
-        exchange_bound_lock(&directory, name, &directory, &temp_name)?;
+        exchange_bound_lock(directory, name, directory, &temp_name)?;
         let expected_replacement = parse_canonical_lock(replacement)?;
-        let active_ok = read_lock_snapshot(path).is_ok_and(|snapshot| {
+        let active_ok = read_lock_snapshot(directory, Path::new(name)).is_ok_and(|snapshot| {
             snapshot.is_some_and(|snapshot| {
                 snapshot.bytes == replacement && snapshot.lock == expected_replacement
             })
         });
-        let stale_ok =
-            read_lock_snapshot(&temp).is_ok_and(|snapshot| snapshot == Some(old.clone()));
+        let stale_ok = read_lock_snapshot(directory, Path::new(&temp_name))
+            .is_ok_and(|snapshot| snapshot == Some(old.clone()));
         if !active_ok || !stale_ok {
             // Both postconditions must hold before a compensating exchange could
             // be safe. Retain the names instead: no concurrent replacement is
@@ -87,20 +88,25 @@ fn reclaim_stale_lock(path: &Path, replacement: &[u8]) -> Result<bool> {
                 "ordinary stale lock exchange validation failed",
             ));
         }
-        fs::remove_file(&temp).kio_io(&temp)?;
-        directory.sync_all().kio_io(parent)?;
+        cap_primitives::fs::remove_file(directory, Path::new(&temp_name)).kio_io(&temp)?;
+        sync_bound_directory(directory, parent)?;
         Ok(true)
     }
 }
 
 fn release_ordinary_lock(
+    directory: &File,
     path: &Path,
     pid: u32,
     token: &str,
     control: &crate::control::ControlHandle,
 ) -> Result<()> {
     {
-        let Some(owned) = read_lock_snapshot(path)? else {
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| KioError::locked(path.display().to_string()))?;
+        let Some(owned) = read_lock_snapshot(directory, Path::new(name))? else {
             return Ok(());
         };
         if owned.lock.pid != pid || owned.lock.token != token {
@@ -109,10 +115,6 @@ fn release_ordinary_lock(
         let parent = path
             .parent()
             .ok_or_else(|| KioError::io("lock path has no parent", path.display().to_string()))?;
-        let name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| KioError::locked(path.display().to_string()))?;
         let temp_name = format!(".{name}.released-{}-{}", std::process::id(), unix_nanos());
         let temp = parent.join(&temp_name);
         let sentinel = canonical_lock_bytes_with_control(
@@ -120,33 +122,34 @@ fn release_ordinary_lock(
             RELEASED_LOCK_PID,
             &new_lock_token(RELEASED_LOCK_PID),
         )?;
-        let mut temp_file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp)
-            .kio_io(&temp)?;
+        let mut options = cap_primitives::fs::OpenOptions::new();
+        options.write(true).create_new(true).mode(0o600);
+        options._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
+        let mut temp_file =
+            cap_primitives::fs::open(directory, Path::new(&temp_name), &options).kio_io(&temp)?;
+        super::private_fs::verify_owner_private_regular_handle(&temp_file, &temp)?;
         temp_file.write_all(&sentinel).kio_io(&temp)?;
         temp_file.sync_all().kio_io(&temp)?;
         drop(temp_file);
-        if read_lock_snapshot(path)? != Some(owned.clone()) {
+        if read_lock_snapshot(directory, Path::new(name))? != Some(owned.clone()) {
             return Ok(());
         }
-        let directory = File::open(parent).kio_io(parent)?;
-        exchange_bound_lock(&directory, name, &directory, &temp_name)?;
+        exchange_bound_lock(directory, name, directory, &temp_name)?;
         let sentinel_lock = parse_canonical_lock(&sentinel)?;
-        let active_ok = read_lock_snapshot(path).is_ok_and(|snapshot| {
+        let active_ok = read_lock_snapshot(directory, Path::new(name)).is_ok_and(|snapshot| {
             snapshot.is_some_and(|snapshot| {
                 snapshot.bytes == sentinel && snapshot.lock == sentinel_lock
             })
         });
-        let archived_ok = read_lock_snapshot(&temp).is_ok_and(|snapshot| snapshot == Some(owned));
+        let archived_ok = read_lock_snapshot(directory, Path::new(&temp_name))
+            .is_ok_and(|snapshot| snapshot == Some(owned));
         if !active_ok || !archived_ok {
             return Err(bound_lock_corrupt(
                 "ordinary lock release exchange validation failed",
             ));
         }
-        fs::remove_file(&temp).kio_io(&temp)?;
-        directory.sync_all().kio_io(parent)
+        cap_primitives::fs::remove_file(directory, Path::new(&temp_name)).kio_io(&temp)?;
+        sync_bound_directory(directory, parent)
     }
 }
 
@@ -241,30 +244,29 @@ fn parse_canonical_lock(bytes: &[u8]) -> Result<LockFile> {
     Ok(lock)
 }
 
-/// Strict ordinary-lock read used solely by stale recovery. The path based
-/// API needs this one retained file descriptor check before its atomic
-/// exchange; it never unlinks a name after a best-effort string comparison.
-fn read_lock_snapshot(path: &Path) -> Result<Option<LockSnapshot>> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-
-    let before = match fs::symlink_metadata(path) {
+/// Read ordinary lock state solely relative to the admitted parent.
+fn read_lock_snapshot(directory: &File, leaf: &Path) -> Result<Option<LockSnapshot>> {
+    use cap_primitives::fs::{self as cap_fs, MetadataExt};
+    let before = match cap_fs::stat(directory, leaf, cap_fs::FollowSymlinks::No) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
+        Err(error) => return Err(KioError::io(error.to_string(), leaf.display().to_string())),
     };
-    if !before.file_type().is_file() || before.nlink() != 1 || before.len() > MAX_BOUND_LOCK_BYTES {
-        return Err(KioError::locked(path.display().to_string()));
+    if !before.is_file() || before.nlink() != 1 || before.len() > MAX_BOUND_LOCK_BYTES {
+        return Err(KioError::locked(leaf.display().to_string()));
     }
-    let mut file = match OpenOptions::new()
+    let mut options = cap_fs::OpenOptions::new();
+    options
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-    {
+        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+    let mut file = match cap_fs::open(directory, leaf, &options) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
+        Err(error) => return Err(KioError::io(error.to_string(), leaf.display().to_string())),
     };
-    let opened = file.metadata().kio_io(path)?;
+    super::private_fs::verify_owner_private_regular_handle(&file, leaf)
+        .map_err(|_| KioError::locked(leaf.display().to_string()))?;
+    let opened = cap_fs::Metadata::from_file(&file).kio_io(leaf)?;
     if opened.dev() != before.dev() || opened.ino() != before.ino() || opened.len() != before.len()
     {
         return Err(bound_lock_corrupt("ordinary lock changed while opening"));
@@ -273,11 +275,11 @@ fn read_lock_snapshot(path: &Path) -> Result<Option<LockSnapshot>> {
     (&mut file)
         .take(MAX_BOUND_LOCK_BYTES.saturating_add(1))
         .read_to_end(&mut bytes)
-        .kio_io(path)?;
-    let after = match fs::symlink_metadata(path) {
+        .kio_io(leaf)?;
+    let after = match cap_fs::stat(directory, leaf, cap_fs::FollowSymlinks::No) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
+        Err(error) => return Err(KioError::io(error.to_string(), leaf.display().to_string())),
     };
     if bytes.len() as u64 != opened.len()
         || after.dev() != opened.dev()
@@ -297,7 +299,10 @@ fn read_lock_snapshot(path: &Path) -> Result<Option<LockSnapshot>> {
     }))
 }
 
-fn open_bound_directory_for_io(directory: &File, label: impl AsRef<Path>) -> Result<File> {
+pub(super) fn open_bound_directory_for_io(
+    directory: &File,
+    label: impl AsRef<Path>,
+) -> Result<File> {
     use cap_primitives::fs::{self as cap_fs, MetadataExt};
 
     let label = label.as_ref();
@@ -333,18 +338,27 @@ pub(crate) fn sync_bound_directory(directory: &File, label: impl AsRef<Path>) ->
 fn bound_lock_archive_dir(kio: &File) -> Result<File> {
     use cap_primitives::fs as cap_fs;
     fn ensure(parent: &File, leaf: &str) -> Result<File> {
-        use cap_primitives::fs as cap_fs;
-        match cap_fs::open_dir_nofollow(parent, Path::new(leaf)) {
-            Ok(dir) => Ok(dir),
-            Err(_) => {
-                cap_fs::create_dir(parent, Path::new(leaf), &cap_fs::DirOptions::new())
-                    .map_err(|e| KioError::io(e.to_string(), leaf))?;
-                let dir = cap_fs::open_dir_nofollow(parent, Path::new(leaf))
-                    .map_err(|e| KioError::io(e.to_string(), leaf))?;
-                sync_bound_directory(parent, leaf)?;
-                Ok(dir)
-            }
-        }
+        let retained = crate::store_dir::StoreDirectory::from_retained(
+            parent
+                .try_clone()
+                .map_err(|error| KioError::io(error.to_string(), leaf))?,
+            PathBuf::from(leaf),
+        )?;
+        crate::private_fs::verify_private_directory_handle(&retained)?;
+        let dir = if retained.contains_entry(Path::new(leaf))? {
+            retained.open_directory(Path::new(leaf))?
+        } else {
+            let dir = retained.create_directory(Path::new(leaf))?;
+            sync_bound_directory(parent, leaf)?;
+            dir
+        };
+        let child = crate::store_dir::StoreDirectory::from_retained(
+            dir.try_clone()
+                .map_err(|error| KioError::io(error.to_string(), leaf))?,
+            PathBuf::from(leaf),
+        )?;
+        crate::private_fs::verify_private_directory_handle(&child)?;
+        Ok(dir)
     }
     // Stale writer-lock archival is generic store plumbing, never GC state:
     // normal writer acquisition must not create a `gc/` namespace.
@@ -357,9 +371,9 @@ fn bound_lock_archive_dir(kio: &File) -> Result<File> {
 }
 
 fn create_bound_lock(kio: &File, leaf: &str, bytes: &[u8]) -> Result<BoundLockObservation> {
-    use cap_primitives::fs as cap_fs;
+    use cap_primitives::fs::{self as cap_fs, OpenOptionsExt};
     let mut options = cap_fs::OpenOptions::new();
-    options.write(true).create_new(true);
+    options.write(true).create_new(true).mode(0o600);
     options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let mut file =
         cap_fs::open(kio, Path::new(leaf), &options).map_err(|e| bound_lock_io(e, leaf))?;
@@ -386,6 +400,8 @@ fn read_bound_lock(kio: &File, leaf: &str) -> Result<(Vec<u8>, BoundLockObservat
     options.read(true);
     options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let mut file = cap_fs::open(kio, path, &options).map_err(|e| bound_lock_io(e, leaf))?;
+    super::private_fs::verify_owner_private_regular_handle(&file, path)
+        .map_err(|_| bound_lock_corrupt("bound lock leaf is not owner-private"))?;
     let opened =
         cap_fs::Metadata::from_file(&file).map_err(|e| KioError::io(e.to_string(), leaf))?;
     validate_bound_lock_meta(&opened)?;
@@ -705,25 +721,24 @@ const MAX_BOUND_LOCK_BYTES: u64 = 4096;
 pub(crate) struct PathLock {
     control: crate::control::ControlHandle,
     path: PathBuf,
+    parent: File,
     pid: u32,
     token: String,
     pub(crate) _gate: crate::scope::locks::LockGate,
 }
 pub(crate) fn acquire_path_lock(
     _session: &crate::scope::LockSession,
-    path: PathBuf,
+    target: crate::scope::locks::NamedLockTarget,
     control: &crate::control::ControlHandle,
     pid: u32,
     _store_gate: bool,
     _validate_authority: fn(&File, &crate::control::ControlHandle) -> Result<()>,
     acquire_gate: crate::scope::locks::AcquireLockGate,
 ) -> Result<PathLock> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).kio_io(parent)?;
-    }
-
+    let crate::scope::locks::NamedLockTarget { parent, path } = target;
     let gate = acquire_gate(
         _session,
+        &parent,
         &path,
         super::scope_semantics::acquire_path_gate,
         super::scope_semantics::unlock_path_gate,
@@ -731,21 +746,23 @@ pub(crate) fn acquire_path_lock(
 
     let token = new_lock_token(pid);
     let canonical = canonical_lock_bytes_with_control(control, pid, &token)?;
-    match OpenOptions::new().write(true).create_new(true).open(&path) {
-        Ok(mut file) => {
-            file.write_all(&canonical).kio_io(&path)?;
-            file.sync_all().kio_io(&path)?;
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            if !reclaim_stale_lock(&path, &canonical)? {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| KioError::locked(path.display().to_string()))?;
+    match create_bound_lock(&parent, name, &canonical) {
+        Ok(_) => {}
+        Err(error) if bound_is_exists(&error) => {
+            if !reclaim_stale_lock(&parent, &path, &canonical)? {
                 return Err(KioError::locked(path.display().to_string()));
             }
         }
-        Err(err) => return Err(KioError::io(err.to_string(), path.display().to_string())),
+        Err(error) => return Err(error),
     }
     Ok(PathLock {
         control: control.clone(),
         path,
+        parent,
         pid,
         token,
         _gate: gate,
@@ -753,7 +770,13 @@ pub(crate) fn acquire_path_lock(
 }
 impl PathLock {
     pub(crate) fn release_outer(&self) {
-        let _ = release_ordinary_lock(&self.path, self.pid, &self.token, &self.control);
+        let _ = release_ordinary_lock(
+            &self.parent,
+            &self.path,
+            self.pid,
+            &self.token,
+            &self.control,
+        );
     }
 }
 pub(crate) fn validate_store_gate(directory: &StoreDirectory) -> Result<()> {

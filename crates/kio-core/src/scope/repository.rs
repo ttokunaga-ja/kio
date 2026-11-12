@@ -351,10 +351,8 @@ impl Repository {
     }
 
     pub(super) fn metadata_text(&self, leaf: &str, max_bytes: u64) -> Result<String> {
-        let bytes = self
-            .store_directory()?
-            .read_optional(Path::new(leaf), max_bytes)?
-            .ok_or_else(|| KioError::schema(format!("{leaf} is missing")))?;
+        let bytes =
+            super::approvals::read_private_metadata(&self.store_directory()?, leaf, max_bytes)?;
         String::from_utf8(bytes).map_err(|_| KioError::schema(format!("{leaf} must be UTF-8")))
     }
 

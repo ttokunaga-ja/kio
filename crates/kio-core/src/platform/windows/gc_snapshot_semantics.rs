@@ -48,7 +48,12 @@ where
     let parent = directory(kio, control)?;
     let target_state = parse_snapshot_auto_state(bytes)?;
     let authority = {
-        let source = match open_snapshot_source(kio, expected, control) {
+        let source = match open_snapshot_source(kio, expected, control).and_then(|source| {
+            if observe(&source)?.1 != *expected {
+                return Err(snapshot_auto_state_changed());
+            }
+            Ok(source)
+        }) {
             Ok(source) => source,
             Err(error) => {
                 // Only this pre-journal CAS conflict may retire our prepared
@@ -68,9 +73,6 @@ where
                 return Err(error);
             }
         };
-        if observe(&source)?.1 != *expected {
-            return Err(snapshot_auto_state_changed());
-        }
         let target =
             crate::platform::open_gc_mutation(&parent, Path::new(temporary), MAX_METADATA)?;
         if observe(&target)?.0 != target_state {

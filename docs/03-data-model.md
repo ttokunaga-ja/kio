@@ -170,6 +170,12 @@ manifest schema:
   "parent_gen": null,
   "parent_instance": null,
   "run_id": "run_01H...",
+  "preparation_provenance": {
+    "renderer_name": null,
+    "renderer_version": null,
+    "producer_os": "macos",
+    "producer_arch": "aarch64"
+  },
   "units": [
     {
       "order": 0,
@@ -267,11 +273,19 @@ full NormalizedUnitObject を JCS CAS として確定する (per-.kio 重複容�
 **gen (generation)**: 同一 `(raw_hash, tool_profile_hash)` に対する instance の世代番号 (0 起点の整数)。
 通常は `g0` のみ存在する。`gen = 現最大 + 1` の新 instance を作れるのは `kio reindex --regenerate` と、
 **prepare profile / renderer 変更による `prepared_hash` 変化が駆動する再 Markdownize** (§6 — first-instance-wins の
-第二の合法経路。オンライン課金を伴うため 04 §4.6 と同型の確認プロンプト + budget guardrail の対象) だけであり、
+第二の合法経路) だけであり、
 既存 instance は保全する ([07-adapter-spec.md §9](07-adapter-spec.md))。identity はあくまで
 `(raw_hash, tool_profile_hash)` であり、gen は同一 identity 配下の instance の区別にのみ使う。
 **normalized_hash の代替ではない** (§5: Markdown の content hash は計算・保存・比較しない)。
 新規参照 (新規 commit の tree entry / 新規 chunk) は常に最新 gen を使う。
+ローカル前処理の出力変化は手動 index / watch とも追加確認なしで新 gen を作り、raw、旧 gen と
+その Evidence を保全する。新旧 prepared hash、prepare profile、renderer の名称／版と producer を
+由来として記録する。保存先は immutable manifest CAS の required `preparation_provenance`
+（renderer_name / renderer_version は非 renderer 経路なら null、producer_os / producer_arch は必須）と、
+各 unit の既存 prepared_hash / preparation_profile_hash、旧 gen の manifest 参照である。
+既存 manifest を書換えず、新 gen と旧 gen の unit_key 対応で新旧 hash を照合する。
+この可逆なローカル更新は外部送信や有料再生成の承認を与えない。
+後続の外部／有料処理には current grant、secret hold と [04 §5.4](04-pipeline.md) を適用する。
 
 **全文 view**: `objects/normalized/ab/cd/<raw64>.<tool64>.g<gen>.md` は
 unit を決定論的に結合した **再生成可能な cache** であり、正本ではない。組み立て規則:
@@ -412,6 +426,7 @@ purge を残すのは法務・秘匿の操作であり**文書名だけでも意
 | `~/.local/share/kio/scope-registry.sqlite` | **SQLite** (`scopes` 1 表) | cache | 各 `.kio` の rescan | [10-operations.md §3](10-operations.md) |
 | `~/.cache/kio/aggregator.sqlite` | **SQLite** (`agg_scopes` / `agg_chunks` / `agg_fts` / `agg_embeddings` / `agg_image_embeddings` / `agg_image_refs` / `agg_bindings` / `agg_projection_markers` の 8 表) | cache | writer の完全再射影、または device-global の `kio repair replica` (`-r`)。source SQLite も含めて検証・再構築する場合は `kio repair all` (`-a`)。欠落・不完全時は `kio search` が source index を読まず fail-closed | [05-runtime.md §1.8](05-runtime.md) |
 | `${XDG_CACHE_HOME:-$HOME/.cache}/kio/search-query-cache/<query_vector_digest>` | file (canonical float32 little-endian vector) | device-local cursor replay cache（query 本文は保存しない） | 欠落・digest 不一致は当該 cursor を `KIO-E-SEARCH-CURSOR-001` で拒否。再 embedding や source SQLite 読みには戻らない | [05-runtime.md §1.5](05-runtime.md) |
+| `${XDG_STATE_HOME:-$HOME/.local/state}/kio/local-execution/` | private versioned records / locks / result stage | 無料 local 実行と query claim の回復状態 | [04 §5.4](04-pipeline.md#54-cost-guardrail--kill-switch) の再計画・cleanup。課金 authority にしない | [04 §5.4](04-pipeline.md#54-cost-guardrail--kill-switch) |
 | `~/.local/share/kio/cost-ledger.sqlite` | **SQLite** (`cost_ledger` / `batch_requests` / `schema_migrations` の 3 表、WAL) | **device/central operational truth** (課金台帳 + **in-flight intent (Batch job / sync request) の正本** — [04-pipeline.md §5.8](04-pipeline.md)。knowledge ではなく、tasks.jsonl と異なり喪失許容ではない) | 確定課金は再構築不可 (Adapter 報告値の記録であり再導出元がない)。in-flight は batch 行が provider job 一覧の intent_token 全走査、sync 行が provider request id 照会 (照会不能は estimated 確定 — [04-pipeline.md §5.4](04-pipeline.md)) で回収 | [04-pipeline.md §5.4](04-pipeline.md) (SQL 正本) |
 
 **SQLite を使うのはこの表の 4 ファイル (public logical object は計 21 表 / virtual table)**。内訳は index/sqlite.db 9、scope-registry.sqlite 1、aggregator.sqlite 8、cost-ledger.sqlite 3 である。FTS5 / sqlite-vec の shadow table は SQLite の内部実装であり、この logical-object 数にも public schema 契約にも含めない。うち index/sqlite.db・scope-registry.sqlite・aggregator.sqlite は正本から再構築可能な検索キャッシュ、**cost-ledger.sqlite だけは再構築不可の運用台帳** (cache ではない — current schema と不一致な既存 bytes は fail-closed、[10-operations.md §7.5.3](10-operations.md))。cursor replay の query vector は source の `embeddings` 表ではなく上記の device-local file cache に置くため、破棄・欠落の影響は cursor 拒否だけである。**SQLite ファイルとして cache root (`$XDG_CACHE_HOME`) に置かれるのは aggregator.sqlite だけ**だが、query-vector replay cache も同じ cache root の file である — 他の 3 SQLite は data root。区別の基準は「ユーザーが知る情報を失うか」であり、aggregator は各 `.kio` の射影に過ぎず何も失わない (§4 不変条件 2)。コンテンツの truth は引き続きファイル (CAS objects/ ほか) が正本であり、tasks.jsonl は喪失許容の JSONL のまま。`schema_migrations` は current operational marker 専用であり、旧 JSONL cutover の importer marker は置かない。課金 + in-flight intent の current SQLite record は UNIQUE・単一 Tx・ON CONFLICT 冪等の保証を正本要件とする ([04-pipeline.md §5.4](04-pipeline.md))。
@@ -944,8 +959,22 @@ tree は entries を単一の flat 配列で持つ。スコープ境界規則 (�
 規範:
 
 - 1 scope の直下ファイル数の想定上限は 10,000 (soft limit)。超過時 `kio index` は警告を表示し、サブフォルダへの分割または ignore を提案する (処理自体は継続する)
+- tree schema / reader / writer は同じ件数契約を使い、10,001 件目を拒否しない。列挙・sort・hash・
+  canonical publication は有界 buffer と必要な private disk stage で行い、件数に比例する本文 bytes を
+  常駐させない。実資源不足は件数超過／破損と区別して理由を表示し、entry を黙って捨てない。
 - snapshot 時に tree_hash が現在の HEAD の tree と一致する場合、auto snapshot は commit を作らない (no-op。**例外 = resurrection finalize と tool_lock_hash の変化** — no-op 判定は tree_hash と commit の tool_lock_hash の両方を比較する。正本 [05-runtime.md §8.1](05-runtime.md))。tree は CAS object なので、内容不変なら新規 object も生成されない (tree_hash は保存バイト列の content hash、§8.1)
 - 1 ファイルの変更で tree 全体 (上表のサイズ) が新 object として書かれるのは仕様どおりの挙動である。
+
+### 原本保存の資源境界
+
+raw bytes は file ごとに有界 buffer で stage / hash / verify し、内容量に比例してメモリを確保しない。
+512 MiB/file・4 GiB/scope の固定 ingest 拒否を設けない。`index` / `snapshot create` に任意の
+`--max-file-bytes <positive-u64>` と `--max-total-bytes <positive-u64>` を設け、省略時は
+原本 bytes の製品上限を課さない。指定値はその invocation の archive 予算だけに適用する。
+超過 file または資源不足は path と理由・未保存状態を表示し、保存済み bytes と区別する。
+file を途中まで保存して成功扱いせず、未保存 file を削除扱いする snapshot を公開しない。
+`status` の metadata 列挙は ingest の byte 予算と分離し、これらの容量だけでは停止しない。
+不正 object、digest 不一致、identity replacement は引き続き拒否する。
 
 ## chunk
 

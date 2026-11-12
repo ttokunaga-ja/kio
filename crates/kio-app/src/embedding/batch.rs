@@ -244,7 +244,6 @@ fn batch_job_binding(
 ) -> Result<EmbeddingJobBinding> {
     Ok(EmbeddingJobBinding {
         logical_job_id: EmbeddingLogicalJobId(key.input_hash.clone()),
-        local: false,
         dimensions: u32::try_from(profile.dimensions)
             .map_err(|_| KioError::schema("embedding profile dimensions exceed u32"))?,
         distance: profile.distance.clone(),
@@ -1397,7 +1396,6 @@ pub(crate) fn submit_image_embedding_job(
         );
     let binding = EmbeddingJobBinding {
         logical_job_id: EmbeddingLogicalJobId(embedding_hash.clone()),
-        local: false,
         dimensions,
         distance: profile.distance.clone(),
         modality: profile.modality.clone(),

@@ -31,7 +31,10 @@ impl GcSweepSession {
         let kio = open_optional_dir(&scope, ".kio")?
             .ok_or_else(|| KioError::invalid_usage("current directory is not a Kio scope"))?;
         let canonical = root.canonicalize().map_err(|e| ioerr(e, &root))?;
-        if id_file(&scope)? != id_path(&canonical)? || id_file(&kio)? != id_child(&scope, ".kio")? {
+        let kio_identity = id_file(&kio)?;
+        if id_file(&scope)? != id_path(&canonical)?
+            || kio_identity != id_child(&scope, ".kio", &kio_identity)?
+        {
             return Err(corrupt("scope changed while binding GC sweep"));
         }
         let kio_directory = StoreDirectory::from_retained_with_control(

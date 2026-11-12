@@ -164,6 +164,13 @@ impl UnsupportedInputStore {
 
     fn open_for_append(&self) -> Result<fs::File> {
         let root = self.store_root_snapshot()?;
+        let directory = kio_core::store_dir::StoreDirectory::open(&self.kio_dir)
+            .map_err(|error| self.corrupt(error.to_string()))?;
+        kio_core::private_fs::verify_private_directory_handle(&directory)
+            .map_err(|error| self.corrupt(error.to_string()))?;
+        directory
+            .append_private(Path::new(UNSUPPORTED_INPUTS_FILE), &[])
+            .map_err(|error| self.corrupt(error.to_string()))?;
         let resolved = resolve_existing_store_path(
             &self.kio_dir,
             Path::new(UNSUPPORTED_INPUTS_FILE),
@@ -171,10 +178,12 @@ impl UnsupportedInputStore {
         )?;
         let open_path = resolved.as_deref().unwrap_or(&self.path);
         let mut options = OpenOptions::new();
-        options.create(true).append(true);
+        options.append(true);
         configure_no_follow(&mut options);
         let file = options.open(open_path).pipeline_io(open_path)?;
         self.validate_opened_file(&file, open_path, &root)?;
+        kio_core::private_fs::verify_private_regular_file_handle(&file)
+            .map_err(|error| self.corrupt(error.to_string()))?;
         Ok(file)
     }
 
@@ -193,6 +202,8 @@ impl UnsupportedInputStore {
         configure_no_follow(&mut options);
         let file = options.open(&resolved).pipeline_io(&resolved)?;
         self.validate_opened_file(&file, &resolved, &root)?;
+        kio_core::private_fs::verify_private_regular_file_handle(&file)
+            .map_err(|error| self.corrupt(error.to_string()))?;
         Ok(Some(file))
     }
 
@@ -235,8 +246,6 @@ fn validate_disposition(
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-
     use super::*;
 
     fn disposition(path: &str, digit: char) -> UnsupportedInputDisposition {
@@ -251,7 +260,7 @@ mod tests {
 
     #[test]
     fn r23_cand_014_missing_store_has_no_unsupported_inputs() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::PrivateTempDir::new();
         let store = UnsupportedInputStore::new(directory.path());
 
         assert!(store.latest_by_path().unwrap().is_empty());
@@ -259,7 +268,7 @@ mod tests {
 
     #[test]
     fn r23_cand_014_record_roundtrips_all_fields_and_latest_path_wins() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::PrivateTempDir::new();
         let store = UnsupportedInputStore::new(directory.path());
         store.record(&disposition("photo.bmp", 'a')).unwrap();
         store.record(&disposition("archive.zip", 'b')).unwrap();
@@ -279,9 +288,9 @@ mod tests {
 
     #[test]
     fn r23_cand_014_real_single_link_store_allows_append_and_read() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::PrivateTempDir::new();
         let store = UnsupportedInputStore::new(directory.path());
-        File::create(store.path()).unwrap();
+        crate::test_support::create_private_file(store.path());
 
         let expected = disposition("manual.pdf", 'd');
         store.record(&expected).unwrap();
@@ -377,13 +386,12 @@ mod tests {
 
     #[test]
     fn r23_cand_014_reader_rejects_oversized_record_before_json_parse() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::PrivateTempDir::new();
         let store = UnsupportedInputStore::new(directory.path());
-        fs::write(
+        crate::test_support::write_private_file(
             store.path(),
-            vec![b'x'; MAX_UNSUPPORTED_INPUT_RECORD_BYTES as usize + 1],
-        )
-        .unwrap();
+            &vec![b'x'; MAX_UNSUPPORTED_INPUT_RECORD_BYTES as usize + 1],
+        );
 
         let error = store.latest_by_path().unwrap_err().to_string();
         assert!(
@@ -394,9 +402,9 @@ mod tests {
 
     #[test]
     fn r23_cand_014_reader_rejects_oversized_store_before_reading() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::PrivateTempDir::new();
         let store = UnsupportedInputStore::new(directory.path());
-        let file = File::create(store.path()).unwrap();
+        let file = crate::test_support::create_private_file(store.path());
         file.set_len(MAX_UNSUPPORTED_INPUT_STORE_BYTES + 1).unwrap();
 
         let error = store.latest_by_path().unwrap_err().to_string();
@@ -405,10 +413,10 @@ mod tests {
 
     #[test]
     fn r23_cand_014_reader_rejects_unterminated_append_frame() {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = crate::test_support::PrivateTempDir::new();
         let store = UnsupportedInputStore::new(directory.path());
         let bytes = serde_json::to_vec(&disposition("photo.bmp", 'a')).unwrap();
-        fs::write(store.path(), bytes).unwrap();
+        crate::test_support::write_private_file(store.path(), &bytes);
 
         let error = store.latest_by_path().unwrap_err().to_string();
         assert!(error.contains("unterminated"), "unexpected error: {error}");

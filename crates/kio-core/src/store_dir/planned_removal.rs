@@ -67,8 +67,32 @@ pub(crate) use crate::platform::removal_semantics::{Identity, identity, require_
 struct Node {
     held: File,
     identity: Identity,
+    private_content: bool,
     kind: NodeKind,
 }
+#[derive(Clone, Copy)]
+enum CaptureKind {
+    Directory,
+    DirectoryMemberFile,
+    ContentFile,
+}
+impl CaptureKind {
+    fn is_dir(self) -> bool {
+        matches!(self, Self::Directory)
+    }
+    fn is_content(self) -> bool {
+        matches!(self, Self::ContentFile)
+    }
+}
+
+fn verify_content_parent(parent: &File, label: &Path) -> Result<()> {
+    let directory = StoreDirectory::from_retained(
+        parent.try_clone().map_err(|error| ioerr(label, error))?,
+        label.to_path_buf(),
+    )?;
+    crate::private_fs::verify_private_directory_handle(&directory)
+}
+
 #[derive(Debug)]
 enum NodeKind {
     File { length: u64, digest: String },
@@ -155,7 +179,7 @@ fn digest(file: &File, max: u64, label: &Path, reads: &CasReadAccess) -> Result<
 fn capture_node(
     parent: &File,
     leaf: &OsStr,
-    directory: bool,
+    role: CaptureKind,
     accounting: (&mut RemovalBudget, &CasReadAccess),
     depth: usize,
     max_file: u64,
@@ -166,7 +190,14 @@ fn capture_node(
         return Err(err(label, "planned removal exceeds depth 32"));
     }
     budget.reserve_pins(1)?;
+    let directory = role.is_dir();
+    if role.is_content() {
+        verify_content_parent(parent, label)?;
+    }
     let held = open(parent, leaf, directory, false, label)?;
+    if role.is_content() {
+        crate::private_fs::verify_private_regular_file_handle(&held)?;
+    }
     let id = identity(&held, directory, label)?;
     let kind = if directory {
         let mut children = BTreeMap::new();
@@ -178,7 +209,11 @@ fn capture_node(
             let child = capture_node(
                 &held,
                 &name,
-                metadata.is_dir(),
+                if metadata.is_dir() {
+                    CaptureKind::Directory
+                } else {
+                    CaptureKind::DirectoryMemberFile
+                },
                 (budget, reads),
                 depth + 1,
                 MAX_BYTES,
@@ -201,13 +236,21 @@ fn capture_node(
     let node = Node {
         held,
         identity: id,
+        private_content: role.is_content(),
         kind,
     };
     validate_named_identity(parent, leaf, &node, label)?;
     Ok(node)
 }
 fn validate_named_identity(parent: &File, leaf: &OsStr, node: &Node, label: &Path) -> Result<()> {
+    if node.private_content {
+        verify_content_parent(parent, label)?;
+        crate::private_fs::verify_private_regular_file_handle(&node.held)?;
+    }
     let named = open(parent, leaf, node.is_dir(), false, label)?;
+    if node.private_content {
+        crate::private_fs::verify_private_regular_file_handle(&named)?;
+    }
     if identity(&named, node.is_dir(), label)? != node.identity
         || identity(&node.held, node.is_dir(), label)? != node.identity
     {
@@ -220,6 +263,9 @@ fn validate_named(parent: &File, leaf: &OsStr, node: &Node, label: &Path) -> Res
     validate_node(node, label)
 }
 fn validate_node(node: &Node, label: &Path) -> Result<()> {
+    if node.private_content {
+        crate::private_fs::verify_private_regular_file_handle(&node.held)?;
+    }
     if identity(&node.held, node.is_dir(), label)? != node.identity {
         return Err(err(label, "planned handle identity changed"));
     }
@@ -253,6 +299,9 @@ fn validate_node(node: &Node, label: &Path) -> Result<()> {
             }
         }
     }
+    if node.private_content {
+        crate::private_fs::verify_private_regular_file_handle(&node.held)?;
+    }
     Ok(())
 }
 
@@ -269,12 +318,15 @@ impl Target {
         parent: &StoreDirectory,
         leaf: &Path,
         prefix: &str,
-        directory: bool,
+        role: CaptureKind,
         max_file: u64,
         budget: &mut RemovalBudget,
         reads: &CasReadAccess,
     ) -> Result<Option<Self>> {
         reads.charge(0)?;
+        if role.is_content() {
+            crate::private_fs::verify_private_directory_handle(parent)?;
+        }
         let canonical = direct_leaf(leaf)?.to_os_string();
         let quarantine = quarantine_leaf(prefix, &canonical)?;
         let root = parent.root_handle();
@@ -290,7 +342,7 @@ impl Target {
         let node = capture_node(
             &root,
             if retired { &quarantine } else { &canonical },
-            directory,
+            role,
             (budget, reads),
             0,
             max_file,
@@ -305,6 +357,9 @@ impl Target {
         }))
     }
     fn revalidate(&self) -> Result<bool> {
+        if self.node.private_content {
+            crate::private_fs::verify_private_directory_handle(&self.parent)?;
+        }
         let root = self.parent.root_handle();
         let source = if self.quarantined {
             &self.quarantine
@@ -347,6 +402,11 @@ impl Target {
                 self.parent.path(),
                 "planned mutation handle was substituted",
             ));
+        }
+        if self.node.private_content {
+            crate::private_fs::verify_private_directory_handle(&self.parent)?;
+            crate::private_fs::verify_private_regular_file_handle(&mutator)?;
+            crate::private_fs::verify_private_regular_file_handle(&self.node.held)?;
         }
         if !self.quarantined {
             rename(
@@ -416,6 +476,11 @@ fn remove_node(
     if identity(&mutator, node.is_dir(), label)? != node.identity {
         return Err(err(label, "planned child mutation handle changed"));
     }
+    if node.private_content {
+        verify_content_parent(parent, label)?;
+        crate::private_fs::verify_private_regular_file_handle(&mutator)?;
+        crate::private_fs::verify_private_regular_file_handle(&node.held)?;
+    }
     if let NodeKind::Directory(children) = &node.kind {
         for (name, child) in children {
             remove_node(&node.held, name, child, None, &label.join(name))?;
@@ -456,7 +521,7 @@ impl PlannedDirectoryRemoval {
             parent,
             leaf,
             PRUNE_DIRECTORY_QUARANTINE_PREFIX,
-            true,
+            CaptureKind::Directory,
             MAX_BYTES,
             budget,
             &CasReadAccess::Unmetered,
@@ -485,7 +550,7 @@ impl PlannedFileRemoval {
             parent,
             leaf,
             CAS_REMOVAL_QUARANTINE_PREFIX,
-            false,
+            CaptureKind::ContentFile,
             max,
             budget,
             reads,
@@ -511,11 +576,101 @@ mod tests {
     use super::*;
     #[cfg(target_os = "linux")]
     use crate::platform::mount_id;
-    fn fixture() -> (tempfile::TempDir, StoreDirectory) {
-        let temp = tempfile::tempdir().unwrap();
-        let parent = StoreDirectory::open(&temp.path().canonicalize().unwrap()).unwrap();
-        (temp, parent)
+    struct Fixture {
+        _external: tempfile::TempDir,
+        path: std::path::PathBuf,
     }
+    impl Fixture {
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+    fn fixture() -> (Fixture, StoreDirectory) {
+        let external = tempfile::tempdir().unwrap();
+        let root = external.path().canonicalize().unwrap();
+        let outer = StoreDirectory::open(&root).unwrap();
+        let path = root.join("private");
+        let parent = StoreDirectory::from_retained(
+            outer.create_directory(Path::new("private")).unwrap(),
+            path.clone(),
+        )
+        .unwrap();
+        (
+            Fixture {
+                _external: external,
+                path,
+            },
+            parent,
+        )
+    }
+    #[cfg(unix)]
+    #[test]
+    fn content_removal_refuses_unsafe_canonical_and_quarantine_without_adoption() {
+        use std::os::unix::fs::PermissionsExt;
+        for name in ["victim", ".kio-cas-remove-victim"] {
+            let (temp, parent) = fixture();
+            parent
+                .write_atomic(
+                    Path::new(name),
+                    b"private content",
+                    super::super::Publication::CreateOnly,
+                )
+                .unwrap();
+            let path = temp.path().join(name);
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                PlannedFileRemoval::capture_content(
+                    &parent,
+                    Path::new("victim"),
+                    1024,
+                    &mut RemovalBudget::new(),
+                    &CasReadAccess::Unmetered,
+                )
+                .is_err(),
+                "unsafe content candidate was accepted: {name}"
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), b"private content");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn content_removal_rechecks_private_authority_before_mutation() {
+        use std::os::unix::fs::PermissionsExt;
+        for unsafe_parent in [false, true] {
+            let (temp, parent) = fixture();
+            parent
+                .write_atomic(
+                    Path::new("victim"),
+                    b"private content",
+                    super::super::Publication::CreateOnly,
+                )
+                .unwrap();
+            let plan = file_plan(&parent, "victim");
+            let changed = if unsafe_parent {
+                temp.path().to_path_buf()
+            } else {
+                temp.path().join("victim")
+            };
+            let mode = if unsafe_parent { 0o755 } else { 0o644 };
+            std::fs::set_permissions(&changed, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(plan.revalidate().is_err());
+            assert!(plan.remove().is_err());
+            assert_eq!(
+                std::fs::read(temp.path().join("victim")).unwrap(),
+                b"private content"
+            );
+            assert_eq!(
+                std::fs::metadata(changed).unwrap().permissions().mode() & 0o777,
+                mode
+            );
+        }
+    }
+
     fn file_plan(parent: &StoreDirectory, name: &str) -> PlannedFileRemoval {
         PlannedFileRemoval::capture_content(
             parent,
@@ -535,10 +690,22 @@ mod tests {
     #[test]
     fn file_replacement_with_identical_bytes_is_never_adopted() {
         let (temp, parent) = fixture();
-        std::fs::write(temp.path().join("victim"), b"same").unwrap();
+        parent
+            .write_atomic(
+                Path::new("victim"),
+                b"same",
+                super::super::Publication::CreateOnly,
+            )
+            .unwrap();
         let plan = file_plan(&parent, "victim");
         std::fs::rename(temp.path().join("victim"), temp.path().join("saved")).unwrap();
-        std::fs::write(temp.path().join("victim"), b"same").unwrap();
+        parent
+            .write_atomic(
+                Path::new("victim"),
+                b"same",
+                super::super::Publication::CreateOnly,
+            )
+            .unwrap();
         assert!(plan.revalidate().is_err());
         assert!(plan.remove().is_err());
         assert_eq!(std::fs::read(temp.path().join("victim")).unwrap(), b"same");
@@ -547,7 +714,13 @@ mod tests {
     #[test]
     fn file_content_change_is_not_hidden_by_same_identity() {
         let (temp, parent) = fixture();
-        std::fs::write(temp.path().join("victim"), b"before").unwrap();
+        parent
+            .write_atomic(
+                Path::new("victim"),
+                b"before",
+                super::super::Publication::CreateOnly,
+            )
+            .unwrap();
         let plan = file_plan(&parent, "victim");
         std::fs::write(temp.path().join("victim"), b"after!").unwrap();
         assert!(plan.remove().is_err());
@@ -559,12 +732,24 @@ mod tests {
     #[test]
     fn absent_file_is_false_and_existing_quarantine_is_freshly_captured() {
         let (temp, parent) = fixture();
-        std::fs::write(temp.path().join("victim"), b"bytes").unwrap();
+        parent
+            .write_atomic(
+                Path::new("victim"),
+                b"bytes",
+                super::super::Publication::CreateOnly,
+            )
+            .unwrap();
         let plan = file_plan(&parent, "victim");
         std::fs::remove_file(temp.path().join("victim")).unwrap();
         assert!(!plan.revalidate().unwrap());
         assert!(!plan.remove().unwrap());
-        std::fs::write(temp.path().join(".kio-cas-remove-victim"), b"remaining").unwrap();
+        parent
+            .write_atomic(
+                Path::new(".kio-cas-remove-victim"),
+                b"remaining",
+                super::super::Publication::CreateOnly,
+            )
+            .unwrap();
         let recovered = file_plan(&parent, "victim");
         assert!(recovered.remove().unwrap());
         assert!(!temp.path().join(".kio-cas-remove-victim").exists());
@@ -617,8 +802,20 @@ mod tests {
     #[test]
     fn canonical_and_quarantine_collision_preserves_both() {
         let (temp, parent) = fixture();
-        std::fs::write(temp.path().join("victim"), b"canonical").unwrap();
-        std::fs::write(temp.path().join(".kio-cas-remove-victim"), b"quarantine").unwrap();
+        parent
+            .write_atomic(
+                Path::new("victim"),
+                b"canonical",
+                super::super::Publication::CreateOnly,
+            )
+            .unwrap();
+        parent
+            .write_atomic(
+                Path::new(".kio-cas-remove-victim"),
+                b"quarantine",
+                super::super::Publication::CreateOnly,
+            )
+            .unwrap();
         assert!(
             PlannedFileRemoval::capture_content(
                 &parent,
@@ -641,7 +838,13 @@ mod tests {
     #[test]
     fn hardlinks_and_budget_overflow_do_not_mutate_targets() {
         let (temp, parent) = fixture();
-        std::fs::write(temp.path().join("victim"), b"bytes").unwrap();
+        parent
+            .write_atomic(
+                Path::new("victim"),
+                b"bytes",
+                super::super::Publication::CreateOnly,
+            )
+            .unwrap();
         std::fs::hard_link(temp.path().join("victim"), temp.path().join("other")).unwrap();
         assert!(
             PlannedFileRemoval::capture_content(
@@ -740,7 +943,7 @@ mod tests {
         let error = capture_node(
             &root,
             leaf,
-            true,
+            CaptureKind::Directory,
             (&mut budget, &CasReadAccess::Unmetered),
             0,
             MAX_BYTES,

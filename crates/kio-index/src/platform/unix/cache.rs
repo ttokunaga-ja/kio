@@ -43,6 +43,15 @@ pub(super) fn bind_cache_parent_unchecked(
     })?;
     let (parent, resolved_parent) =
         open_or_create_cache_parent(lexical_parent, create_parent, control)?;
+    let retained = kio_core::store_dir::StoreDirectory::from_retained(
+        parent
+            .try_clone()
+            .map_err(|error| crate::IndexError::Schema(error.to_string()))?,
+        resolved_parent.clone(),
+    )
+    .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+    kio_core::private_fs::verify_private_directory_handle(&retained)
+        .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
     Ok(BoundCacheParent {
         parent,
         public_path: resolved_parent.join(file_name),
@@ -162,6 +171,8 @@ pub(super) fn cache_file_identity(file: &std::fs::File) -> Result<(u64, u64)> {
 }
 
 pub(crate) fn validate_bound_cache_file(file: &std::fs::File, path: &Path) -> Result<()> {
+    kio_core::private_fs::verify_private_regular_file_handle(file)
+        .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
     let metadata = file.metadata().map_err(|e| {
         crate::IndexError::Schema(format!(
             "inspect opened aggregator cache {}: {e}",
@@ -188,6 +199,22 @@ pub(crate) fn validate_bound_cache_file(file: &std::fs::File, path: &Path) -> Re
     Ok(())
 }
 
+fn create_private_cache_file(parent_handle: &std::fs::File, path: &Path) -> Result<std::fs::File> {
+    let leaf = path.file_name().expect("resolved cache has leaf");
+    let retained = kio_core::store_dir::StoreDirectory::from_retained(
+        parent_handle
+            .try_clone()
+            .map_err(|error| crate::IndexError::Schema(error.to_string()))?,
+        path.parent().expect("cache parent").to_path_buf(),
+    )
+    .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+    let file = retained
+        .create_private_file(Path::new(leaf))
+        .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+    validate_bound_cache_file(&file, path)?;
+    Ok(file)
+}
+
 pub(crate) fn bind_cache(
     path: &Path,
     create_missing: bool,
@@ -211,13 +238,15 @@ pub(crate) fn bind_cache(
         .write(true)
         ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
 
-    if create_missing && matches!(&before_leaf, Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+    let file = if create_missing
+        && matches!(&before_leaf, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
     {
-        options.create_new(true);
-    }
-    let file = cap_fs::open(&parent_handle, Path::new(leaf), &options).map_err(|e| {
-        crate::IndexError::Schema(format!("open aggregator cache {}: {e}", path.display()))
-    })?;
+        create_private_cache_file(&parent_handle, &path)?
+    } else {
+        cap_fs::open(&parent_handle, Path::new(leaf), &options).map_err(|error| {
+            crate::IndexError::Schema(format!("open aggregator cache {}: {error}", path.display()))
+        })?
+    };
     validate_bound_cache_file(&file, &path)?;
 
     if let Ok(before) = before_leaf {
@@ -277,6 +306,14 @@ pub(crate) fn recreate_cache(
                 )));
             }
         }
+        let mut options = cap_fs::OpenOptions::new();
+        options
+            .read(true)
+            ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
+        let file = cap_fs::open(&parent_handle, candidate, &options)
+            .map_err(|error| crate::IndexError::Schema(error.to_string()))?;
+        validate_bound_cache_file(&file, candidate)?;
+        drop(file);
         cap_fs::remove_file(&parent_handle, candidate).map_err(|e| {
             crate::IndexError::Schema(format!(
                 "remove aggregator cache {}: {e}",
@@ -284,16 +321,7 @@ pub(crate) fn recreate_cache(
             ))
         })?;
     }
-    let mut options = cap_fs::OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .create_new(true)
-        ._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
-
-    let file = cap_fs::open(&parent_handle, Path::new(leaf), &options).map_err(|e| {
-        crate::IndexError::Schema(format!("create aggregator cache {}: {e}", path.display()))
-    })?;
+    let file = create_private_cache_file(&parent_handle, &path)?;
     let cache = BoundCache {
         _parent: parent_handle,
         file,

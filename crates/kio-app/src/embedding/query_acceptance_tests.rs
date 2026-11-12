@@ -40,6 +40,7 @@ fn query_invalid_completion_never_settles_success_or_publishes_a_vector() {
         &invocation,
         EmbeddingExecution::Online(AdoptedEmbeddingExecution::NonMultimodal),
         QUERY,
+        None,
     )
     .expect("the attempted query must produce a classified terminal result");
     assert_eq!(

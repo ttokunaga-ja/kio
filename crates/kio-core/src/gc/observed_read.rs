@@ -28,6 +28,26 @@ pub(crate) fn read_cas_regular_observed(
     n: &str,
     max: u64,
 ) -> Result<(Vec<u8>, FileObservation)> {
+    read_observed(reads, d, n, max, true)
+}
+
+/// Working-tree ignore policy is user-owned; retain no-follow identity and
+/// byte observations without imposing Kio storage permissions on that file.
+pub(super) fn read_user_regular_observed(
+    d: &std::fs::File,
+    n: &str,
+    max: u64,
+) -> Result<(Vec<u8>, FileObservation)> {
+    read_observed(&CasReadAccess::Unmetered, d, n, max, false)
+}
+
+fn read_observed(
+    reads: &CasReadAccess,
+    d: &std::fs::File,
+    n: &str,
+    max: u64,
+    require_private: bool,
+) -> Result<(Vec<u8>, FileObservation)> {
     reads.charge(0)?;
     let p = Path::new(n);
     let before = cap_fs::stat(d, p, cap_fs::FollowSymlinks::No).map_err(|e| ioerr(e, n))?;
@@ -36,6 +56,9 @@ pub(crate) fn read_cas_regular_observed(
     o.read(true);
     o._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let mut f = cap_fs::open(d, p, &o).map_err(|e| ioerr(e, n))?;
+    if require_private {
+        crate::private_fs::verify_private_regular_file_handle(&f)?;
+    }
     let opened = cap_fs::Metadata::from_file(&f).map_err(|e| ioerr(e, n))?;
     valid_file(&opened, max)?;
     if !same_file_state(&before, &opened)? {

@@ -165,6 +165,7 @@ impl ManagementBinding {
             canonical_root.join(".kio"),
             control,
         )?;
+        verify_own_directory(&control)?;
         Ok(Self {
             canonical_root,
             root: Arc::new(root),
@@ -217,6 +218,7 @@ impl ManagementBinding {
         self.recheck()
     }
     fn recheck(&self) -> Result<()> {
+        verify_own_directory(&self.control)?;
         validate_controlled_root_with_control(
             &self.root,
             &self.canonical_root,
@@ -235,11 +237,11 @@ impl ManagementBinding {
     }
 }
 
-/// Require that a retained working root remains safe for Kio-managed writes.
+/// Require that the user's working root still matches its retained identity.
 ///
-/// The canonical path is walked through the existing platform-specific
-/// shared-read-parent policy, then its retained identity is matched to `root`.
-/// This only validates; it never repairs permissions or changes ACLs.
+/// The canonical path is walked without following links, then matched to `root`.
+/// External root and ancestor permissions are not admission authority. This
+/// never repairs permissions or changes ACLs.
 pub fn validate_controlled_root(root: &File, canonical_root: &Path) -> Result<()> {
     validate_controlled_root_with_control(root, canonical_root, ControlHandle::default())
 }
@@ -1255,7 +1257,7 @@ fn root_initialization_pending_err() -> KioError {
         ExitCode::PermanentFailure,
     )
 }
-fn controlled_root_err(canonical_root: &Path, cause: impl Into<String>) -> KioError {
+pub(crate) fn controlled_root_err(canonical_root: &Path, cause: impl Into<String>) -> KioError {
     KioError::new(
         CONTROLLED_ROOT_ERROR,
         "working root is unsafe for Kio-managed writes",
@@ -1336,9 +1338,17 @@ fn validate_id(v: &str, l: &str) -> Result<()> {
         Ok(())
     }
 }
+fn verify_own_directory(directory: &StoreDirectory) -> Result<()> {
+    crate::private_fs::verify_private_directory_handle(directory)
+        .map_err(|error| controlled_root_err(directory.path(), error.to_string()))
+}
 fn read_leaf(d: &StoreDirectory, n: &str, max: u64) -> Result<Vec<u8>> {
-    d.read_optional(Path::new(n), max)?
-        .ok_or_else(|| err("management control file is absent"))
+    verify_own_directory(d)?;
+    if !d.contains_entry(Path::new(n))? {
+        return Err(err("management control file is absent"));
+    }
+    crate::private_fs::read_private_file_at(d, n, max)
+        .map_err(|error| controlled_root_err(d.path(), error.to_string()))
 }
 fn write_record(b: &ManagementBinding, r: &ManagementRecord, replace: bool) -> Result<()> {
     b.recheck()?;

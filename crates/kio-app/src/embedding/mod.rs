@@ -1,7 +1,11 @@
 pub(crate) mod admission;
 pub(crate) mod batch;
 pub(crate) mod executor;
+pub(crate) mod image_executor;
 pub(crate) mod image_input;
 pub(crate) mod input;
 pub(crate) mod plan;
 pub(crate) mod transport;
+
+#[cfg(all(test, debug_assertions))]
+mod paid_admission_tests;

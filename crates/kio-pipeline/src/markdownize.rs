@@ -1908,8 +1908,8 @@ mod tests {
         );
     }
 
-    fn canonical_tempdir() -> tempfile::TempDir {
-        tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap()
+    fn canonical_tempdir() -> crate::test_support::PrivateTempDir {
+        crate::test_support::PrivateTempDir::new()
     }
 
     fn initialize_persist_store(path: &Path) {

@@ -362,7 +362,15 @@ fn rename_retains_contexts_and_rebuild_selects_allowed_head_then_history() {
         "# Knowledge\n\nThe retained document explains orbital telescope calibration.\n",
     )
     .unwrap();
-    execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+    execute(
+        &context,
+        CommandRequest::Init(InitArgs {
+            path: None,
+            independent: false,
+            yes: false,
+        }),
+    )
+    .unwrap();
     index(&context);
     let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let before = projection(&repo);
@@ -472,7 +480,15 @@ fn batch_resume_repairs_interrupted_replica_publication_without_embedding_work()
         "# Knowledge\n\nOrbital telescope calibration uses a stable reference star.\n",
     )
     .unwrap();
-    execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+    execute(
+        &context,
+        CommandRequest::Init(InitArgs {
+            path: None,
+            independent: false,
+            yes: false,
+        }),
+    )
+    .unwrap();
     index(&context);
     let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let scope = repo.scope_identity().unwrap().scope_id;
@@ -626,7 +642,15 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
     fs::write(root.path().join(OLD_PATH),
         "# Orchard\n\nThe orchard grows apples.\n\n# Soil\n\nThe soil contains clay.\n\n# Harvest\n\nThe harvest starts in autumn.\n",
     ).unwrap();
-    execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+    execute(
+        &context,
+        CommandRequest::Init(InitArgs {
+            path: None,
+            independent: false,
+            yes: false,
+        }),
+    )
+    .unwrap();
     let index_result = || {
         execute(
             &context,
@@ -744,7 +768,15 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
     };
     let document = "# Retained\n\nA purged document can be explicitly restored.\n";
     fs::write(root.path().join(CURRENT_PATH), document).unwrap();
-    execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+    execute(
+        &context,
+        CommandRequest::Init(InitArgs {
+            path: None,
+            independent: false,
+            yes: false,
+        }),
+    )
+    .unwrap();
     index(&context);
     let repo = open_existing_managed_root(root.path(), &control).unwrap();
     let old_head = repo.head_commit_hash().unwrap().unwrap();
@@ -776,7 +808,12 @@ fn collector_missing_manifest_requires_retired_purge_for_every_introduction() {
         "KIO-E-STORE-NOT-FOUND-001",
         "an unexplained missing manifest must not be skipped"
     );
-    fs::write(&manifest, &manifest_bytes).unwrap();
+    assert_eq!(
+        repo.object_store()
+            .write_content_object(kio_core::cas::ContentObjectKind::Manifest, &manifest_bytes)
+            .unwrap(),
+        instance.normalize.manifest_hash,
+    );
 
     fs::remove_file(root.path().join(CURRENT_PATH)).unwrap();
     execute(
@@ -896,7 +933,6 @@ fn batch_result_admission_validates_all_keys_and_vectors_before_returning_any() 
         intent_token: "test_token".to_owned(),
         binding: EmbeddingJobBinding {
             logical_job_id: EmbeddingLogicalJobId(input_hash),
-            local: false,
             dimensions: 3,
             distance: "cosine".to_owned(),
             modality: "multimodal".to_owned(),
@@ -1058,7 +1094,6 @@ fn o3_batch_acceptance_fixture(
             intent_token: "typed-boundary-only".to_owned(),
             binding: EmbeddingJobBinding {
                 logical_job_id: EmbeddingLogicalJobId(input_hash),
-                local: false,
                 dimensions: 768,
                 distance: "cosine".to_owned(),
                 modality: "multimodal".to_owned(),
@@ -1522,17 +1557,11 @@ fn persisted_embedding_consent_requires_the_exact_builtin_identity() {
 // O3 local-claim regression: below the scope writer lock, not two CLI writers.
 #[test]
 fn o3_fresh_local_image_claim_survives_competing_enrichment() {
-    use kio_adapter::types::EmbeddingLogicalJobId;
     use kio_core::scope::LockSession;
     use kio_core::test_control::TestEnvGuard;
-    use kio_pipeline::ledger::embedding_job::{
-        EmbeddingJobBinding, EmbeddingJobMember, EmbeddingReservationOutcome,
-        EmbeddingReserveRequest,
-    };
-    use kio_pipeline::ledger::ops::{
-        BudgetCapConfig, cost_ledger_rows_for_key, get_batch_request, reserve_embedding_job,
-    };
-    use kio_pipeline::ledger::{BatchState, RequestKind, TaskKey};
+    use kio_pipeline::ledger::TaskKey;
+    use kio_pipeline::ledger::embedding_job::EmbeddingJobMember;
+    use kio_pipeline::ledger::ops::{cost_ledger_rows_for_key, get_batch_request};
     use std::sync::mpsc;
 
     if !isolated_child_for(
@@ -1559,7 +1588,15 @@ fn o3_fresh_local_image_claim_survives_competing_enrichment() {
     fs::write(root.path().join("claim.png"), png).unwrap();
     {
         let _disabled = TestEnvGuard::set("KIO_EVAL_DETERMINISTIC_EMBED", "fixture-disabled");
-        execute(&context, CommandRequest::Init(InitArgs { path: None })).unwrap();
+        execute(
+            &context,
+            CommandRequest::Init(InitArgs {
+                path: None,
+                independent: false,
+                yes: false,
+            }),
+        )
+        .unwrap();
         index(&context);
     }
     let execution = embedding_execution(&settings, &control).unwrap();
@@ -1592,61 +1629,68 @@ fn o3_fresh_local_image_claim_survives_competing_enrichment() {
         &embedding_hash,
         &profile.profile_hash,
     );
-    let binding = EmbeddingJobBinding {
-        logical_job_id: EmbeddingLogicalJobId(embedding_hash.clone()),
-        local: true,
-        dimensions: 768,
-        distance: profile.distance.clone(),
-        modality: profile.modality.clone(),
-        members: vec![EmbeddingJobMember {
+    let identity = crate::embedding::transport::local_embedding_identity(
+        crate::local_execution::LocalTarget::Image {
+            scope_id,
+            target: embedding_hash.clone(),
+        },
+        embedding_hash.clone(),
+        &profile,
+        execution,
+        vec![EmbeddingJobMember {
             id: image_hash,
             target,
         }],
-    };
+    )
+    .unwrap();
     let ledger = crate::ledger_access::open_optional_ledger_db(&control)
         .unwrap()
         .unwrap();
-    let owner_db = ledger.clone();
-    let owner_key = key.clone();
+    assert!(get_batch_request(&ledger, &key).unwrap().is_none());
+    assert!(cost_ledger_rows_for_key(&ledger, &key).unwrap().is_empty());
+    let owner_control = control.clone();
+    let owner_identity = identity.clone();
     let (ready_tx, ready_rx) = mpsc::sync_channel(0);
     let (release_tx, release_rx) = mpsc::sync_channel(0);
     let owner = std::thread::spawn(move || {
-        let caps = BudgetCapConfig {
-            device_cap: 10.0,
-            folder_cap: Some(10.0),
-            device_per_adapter_cap: None,
-        };
-        let reserved = reserve_embedding_job(
-            &owner_db,
-            &EmbeddingReserveRequest {
-                key: &owner_key,
-                candidate_usd: 0.0,
-                caps: &caps,
-                request_kind: RequestKind::Sync,
-                timeout_seconds: Some(300),
-                bypass_cap_denial: false,
-                binding: &binding,
-            },
+        let store = crate::local_execution::LocalExecution::new(
+            crate::local_execution::LocalExecution::default_root(&owner_control).unwrap(),
+            crate::local_execution::LocalExecution::default_external_base(&owner_control).unwrap(),
+            owner_control.clone(),
         )
         .unwrap();
-        let EmbeddingReservationOutcome::Reserved(job) = reserved else {
-            panic!("fixture must own a fresh authentic image intent");
+        let crate::local_execution::Claim::Claimed(guard) = store
+            .claim(
+                &owner_identity,
+                0,
+                None,
+                crate::embedding::transport::local_max_attempts(execution),
+                owner_control.now_millis(),
+            )
+            .unwrap()
+        else {
+            panic!("fixture must own actual free image execution")
         };
-        ready_tx.send(job.clone()).unwrap();
-        // A channel retains the live owner until the competitor has finished;
-        // no clock manipulation, sleeps, stale fixture or timeout is a Red oracle.
+        let before = (
+            guard.token().to_owned(),
+            guard.attempts(),
+            guard.result().unwrap(),
+        );
+        assert_eq!(before.1, 1);
+        assert!(before.2.is_none());
+        ready_tx.send((owner_identity, before.clone())).unwrap();
         release_rx.recv().unwrap();
-        job
+        (
+            guard.token().to_owned(),
+            guard.attempts(),
+            guard.result().unwrap(),
+        )
     });
-    let original = ready_rx.recv().unwrap();
-    let before = get_batch_request(&ledger, &key).unwrap().unwrap();
-    assert_eq!(before.state, BatchState::Intent);
+    let (owned_identity, before) = ready_rx.recv().unwrap();
     assert_eq!(
-        before.intent_token.as_deref(),
-        Some(original.intent_token.as_str())
+        owned_identity, identity,
+        "live owner uses actual image plan/profile identity"
     );
-    assert!(before.stale_after_at.unwrap() > control.now_millis());
-    assert!(cost_ledger_rows_for_key(&ledger, &key).unwrap().is_empty());
     let competing = crate::embedding::executor::run_embedding_enrichment(
         &crate::invocation::Invocation {
             context: &context,
@@ -1659,27 +1703,28 @@ fn o3_fresh_local_image_claim_survives_competing_enrichment() {
         false,
         false,
     );
-    // Capture owned physical values while the original owner is still alive.
-    // Release/join it before assertions so an intended failure cannot leave a
-    // blocked fixture thread behind.
-    let terminal = cost_ledger_rows_for_key(&ledger, &key).unwrap();
-    let after = get_batch_request(&ledger, &key).unwrap().unwrap();
+    // Always release and join the real owner before checking the competitor.
     release_tx.send(()).unwrap();
-    assert_eq!(owner.join().unwrap(), original);
-    // Intended O3 Runtime Red: current image InFlight handling records a local
-    // crash terminal row although this exact owner's deadline is still future.
-    assert!(
-        terminal.is_empty(),
-        "a live image owner's claim must not be crash-settled by its competitor: {terminal:?}"
+    assert_eq!(
+        owner.join().unwrap(),
+        before,
+        "competitor must preserve live owner token/attempt/result"
     );
-    competing.expect("fixture must reach and return from the competing image runner");
-    assert_eq!(after.state, BatchState::Intent);
-    assert_eq!(after.intent_token, before.intent_token);
-    assert_eq!(after.submission_seq, before.submission_seq);
-    assert_eq!(after.stale_after_at, before.stale_after_at);
-    assert_eq!(after.key, before.key);
+    let outcome = competing.expect("competing image runner must return normally");
+    assert_eq!(
+        outcome.inflight, 1,
+        "exact owned image claim must be observed busy"
+    );
     assert!(
         repo.object_store().read_embedding(&embedding_hash).is_err(),
-        "competing recovery must not publish the live owner's image result"
+        "competitor cannot publish live owner's image"
+    );
+    assert!(
+        get_batch_request(&ledger, &key).unwrap().is_none(),
+        "free image cannot create SQL reservation"
+    );
+    assert!(
+        cost_ledger_rows_for_key(&ledger, &key).unwrap().is_empty(),
+        "free image cannot settle SQL cost"
     );
 }

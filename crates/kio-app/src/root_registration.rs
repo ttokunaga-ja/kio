@@ -617,12 +617,14 @@ fn validate_journal_plan(nodes: &[Node]) -> Result<()> {
 fn revoke_grants(nodes: &[Node], control: &ControlHandle) -> Result<()> {
     if crate::grants::PrivateGrantStore::open_readonly(
         &crate::approvals::store_path(control),
+        &crate::settings::data_home(control),
         control,
     )?
     .is_some()
     {
         let mut grants = crate::grants::PrivateGrantStore::open_or_create(
             &crate::approvals::store_path(control),
+            &crate::settings::data_home(control),
             control,
         )?;
         for node in nodes {

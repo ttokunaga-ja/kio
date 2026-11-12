@@ -2,6 +2,7 @@ mod batch;
 mod egress;
 mod embedding;
 mod ledger_access;
+mod local_execution;
 mod markdownize;
 mod object_persistence;
 mod task_execution;
@@ -28,10 +29,9 @@ use crate::response::CommandResponse;
 use crate::scope_commands::run_init;
 use crate::scope_commands::run_status;
 use crate::search::command::run_search;
-use crate::settings::adapter_runtime_settings_from_user_config;
+use crate::settings::adapter_runtime_settings_for_roles;
 use crate::settings::ensure_device_dirs_resolvable;
-use crate::settings::validate_user_config;
-use crate::settings::validate_user_tools_config;
+use crate::settings::validate_user_config_for_command;
 use crate::snapshot_history::run_diff;
 use crate::snapshot_history::run_inspect;
 use crate::snapshot_history::run_log;
@@ -138,22 +138,17 @@ pub fn execute(ctx: &AppContext, command: Command) -> Result<CommandResponse> {
     ) {
         return execute_lifecycle(ctx, &control, command);
     }
-    validate_user_tools_config(&control)?;
-    validate_user_config(&control)?;
-    let mut settings = adapter_runtime_settings_from_user_config(&control)?;
-    let managed_trust = trust::acquire_runtime_trust(&trust::directory_path(&control), &control)?;
-    if let Some(trust) = managed_trust.as_ref() {
-        settings.local_peer_ca_path = Some(trust.path().to_path_buf());
-        settings.local_peer_trust_digest = Some(trust.digest().to_owned());
-        settings.local_peer_trust_binding = Some(trust.binding().to_owned());
-    }
+    validate_user_config_for_command(&control, &command)?;
+    let roles = adapter_roles_for_command(&command);
+    let mut settings = adapter_runtime_settings_for_roles(&control, roles)?;
+    let managed_trust = Arc::new(trust::RuntimeTrustProvider::new(control.clone()));
+    settings.managed_local_trust = Some(managed_trust.clone());
     let runtime = InvocationRuntime {
         locks: kio_core::scope::LockSession::default(),
         control,
         settings: Arc::new(settings),
-        _managed_trust: managed_trust,
     };
-    execute_dispatch(
+    let result = execute_dispatch(
         &Invocation {
             context: ctx,
             settings: &runtime.settings,
@@ -161,7 +156,61 @@ pub fn execute(ctx: &AppContext, command: Command) -> Result<CommandResponse> {
             locks: &runtime.locks,
         },
         command,
-    )
+    );
+    if result.is_ok() {
+        let reasons = runtime.settings.readiness_reasons();
+        for (role, reason) in &reasons {
+            ctx.interaction.diagnostic(&format!(
+                "Adapter {role} readiness: unavailable; reason: {reason}"
+            ));
+        }
+        if roles.is_empty() {
+            ctx.interaction.diagnostic("Adapter readiness: not evaluated; reason: this operation does not select a network Adapter");
+        } else if let Some(reason) = managed_trust.readiness_reason() {
+            ctx.interaction.diagnostic(&format!(
+                "Adapter HTTPS readiness: unavailable; reason: {reason}"
+            ));
+        } else if !managed_trust.acquired() && reasons.is_empty() {
+            ctx.interaction.diagnostic("Adapter HTTPS readiness: not evaluated; reason: no managed CA was acquired for this operation");
+        }
+    }
+    result
+}
+
+/// Select only dependency roles this operation can consume. In-process
+/// offline work retains local policy validation without reading network tools.
+fn adapter_roles_for_command(command: &Command) -> &'static [&'static str] {
+    use commands::{RepairOperation, SearchMode};
+    match command {
+        Command::Search(args) if args.mode == Some(SearchMode::Text) => &[],
+        Command::Search(_) => &["embedding"],
+        Command::Index(_)
+        | Command::Reindex(_)
+        | Command::Watch(_)
+        | Command::Batch(_)
+        | Command::Adapter(_) => &["markdown", "embedding"],
+        Command::Repair(args) if matches!(args.operation, RepairOperation::RebuildDb(_)) => {
+            &["markdown", "embedding"]
+        }
+        Command::Repair(args) if matches!(args.operation, RepairOperation::All) => &["embedding"],
+        Command::Init(_)
+        | Command::RootRegister(_)
+        | Command::Status
+        | Command::Snapshot(_)
+        | Command::Log(_)
+        | Command::Diff(_)
+        | Command::Inspect(_)
+        | Command::Tag(_)
+        | Command::Ledger(_)
+        | Command::Repair(_)
+        | Command::Gc(_)
+        | Command::Open(_)
+        | Command::View(_)
+        | Command::Evidence(_)
+        | Command::Export(_)
+        | Command::Restore(_)
+        | Command::Purge(_) => &[],
+    }
 }
 
 fn execute_dispatch(ctx: &Invocation<'_>, command: Command) -> Result<CommandResponse> {
@@ -176,7 +225,7 @@ fn execute_dispatch(ctx: &Invocation<'_>, command: Command) -> Result<CommandRes
         }) => run_snapshot_auto(ctx),
         Command::Snapshot(SnapshotArgs {
             action: SnapshotAction::Create(args),
-        }) => run_snapshot_create(ctx, args, adapter_settings),
+        }) => run_snapshot_create(ctx, args),
         Command::Log(args) => run_log(ctx, args),
         Command::Diff(args) => run_diff(ctx, args),
         Command::Inspect(args) => run_inspect(ctx, args),

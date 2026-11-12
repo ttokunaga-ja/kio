@@ -122,6 +122,7 @@ pub(crate) fn registry_parent_and_leaf(
             index += 1;
         }
     }
+    crate::registry::verify_private_registry_parent(&handle, parent)?;
     Ok(RegistryParentBinding {
         parent: std::sync::Arc::new(handle),
         leaf: leaf.to_owned(),
@@ -252,12 +253,5 @@ pub(crate) fn prepare_registry_writer(
     path: &Path,
     _control: &kio_core::control::ControlHandle,
 ) -> Result<(PathBuf, Option<kio_core::store_dir::StoreDirectory>)> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|err| crate::IndexError::Schema(err.to_string()))?;
-        // The recoverable registry's owner-private parent permission remains best-effort.
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
-    }
-    Ok((path.to_path_buf(), None))
+    crate::registry::prepare_private_registry_writer(path)
 }

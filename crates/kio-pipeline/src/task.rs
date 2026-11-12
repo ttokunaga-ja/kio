@@ -4,10 +4,13 @@ mod embedding_target;
 pub use embedding_target::EmbeddingTaskTarget;
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, Read, Write};
+use std::fs;
+#[cfg(test)]
+use std::fs::OpenOptions;
+#[cfg(test)]
+use std::io::Write;
+use std::io::{BufRead, Read};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -411,24 +414,43 @@ impl TaskStore {
 
     pub fn append(&self, descriptor: &TaskDescriptor) -> Result<()> {
         let line = self.framed_record(descriptor)?;
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).pipeline_io(parent)?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)
-            .pipeline_io(&self.path)?;
-        // M1(b): frame the record and emit it with one write_all so concurrent
-        // appends cannot interleave byte-wise under O_APPEND.
-        let existing_len = file.metadata().pipeline_io(&self.path)?.len();
+        let retained = self.private_root()?;
+        let leaf = Path::new("tasks.jsonl");
+        let existing_len = if retained
+            .contains_entry(leaf)
+            .map_err(|error| self.private_error(error))?
+        {
+            let file = retained
+                .open_regular_read(leaf, MAX_TASK_STORE_BYTES)
+                .map_err(|error| self.private_error(error))?;
+            kio_core::private_fs::verify_private_regular_file_handle(&file)
+                .map_err(|error| self.private_error(error))?;
+            file.metadata().pipeline_io(&self.path)?.len()
+        } else {
+            0
+        };
         if existing_len.saturating_add(line.len() as u64) > MAX_TASK_STORE_BYTES {
             return Err(PipelineError::corrupt(
                 self.path.display().to_string(),
                 format!("tasks.jsonl exceeds {MAX_TASK_STORE_BYTES} byte limit"),
             ));
         }
-        file.write_all(&line).pipeline_io(&self.path)
+        retained
+            .append_private(leaf, &line)
+            .map_err(|error| self.private_error(error))
+    }
+
+    fn private_error(&self, error: kio_core::KioError) -> PipelineError {
+        PipelineError::corrupt(self.path.display().to_string(), error.to_string())
+    }
+
+    fn private_root(&self) -> Result<kio_core::store_dir::StoreDirectory> {
+        let retained =
+            kio_core::store_dir::StoreDirectory::open_or_create_directories(self.kio_dir())
+                .map_err(|error| self.private_error(error))?;
+        kio_core::private_fs::verify_private_directory_handle(&retained)
+            .map_err(|error| self.private_error(error))?;
+        Ok(retained)
     }
 
     pub fn all(&self) -> Result<Vec<TaskDescriptor>> {
@@ -456,6 +478,8 @@ impl TaskStore {
         &self,
         retained: &kio_core::store_dir::StoreDirectory,
     ) -> Result<Vec<TaskDescriptor>> {
+        kio_core::private_fs::verify_private_directory_handle(retained)
+            .map_err(|error| self.private_error(error))?;
         let leaf = Path::new("tasks.jsonl");
         if !retained.contains_entry(leaf).map_err(|error| {
             PipelineError::corrupt(self.path.display().to_string(), error.to_string())
@@ -467,6 +491,8 @@ impl TaskStore {
             .map_err(|error| {
                 PipelineError::corrupt(self.path.display().to_string(), error.to_string())
             })?;
+        kio_core::private_fs::verify_private_regular_file_handle(&file)
+            .map_err(|error| self.private_error(error))?;
         self.read_descriptors(file, |descriptor| {
             validate_task_descriptor(self.kio_dir(), descriptor)
         })
@@ -543,39 +569,33 @@ impl TaskStore {
         for descriptor in descriptors {
             validate_task_descriptor(self.kio_dir(), descriptor)?;
         }
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).pipeline_io(parent)?;
-        }
-        // O3: write through a unique, exclusively-created temp file instead of the
-        // fixed `tasks.jsonl.tmp`, so two concurrent writers can never share one
-        // temp and clobber each other's half-written content before the rename.
-        // (The `batch` folder store lock is the primary serialization guard; this
-        // is defense in depth for any other `replace_all` caller.)
-        let (mut file, temp_path) = self.create_unique_temp()?;
-        // R9-8: remove the temp on any serialize/write/rename failure so an
-        // ENOSPC/EIO error does not leave an orphan `.tasks.jsonl.*.tmp` in the
-        // tasks dir (no GC before Step 4). Same cleanup idiom as the CAS /
-        // normalized-instance writers.
-        let result = (|| -> Result<()> {
-            let mut total_bytes = 0u64;
-            for descriptor in descriptors {
-                let line = self.framed_record(descriptor)?;
-                total_bytes = total_bytes.saturating_add(line.len() as u64);
-                if total_bytes > MAX_TASK_STORE_BYTES {
-                    return Err(PipelineError::corrupt(
-                        self.path.display().to_string(),
-                        format!("tasks.jsonl exceeds {MAX_TASK_STORE_BYTES} byte limit"),
-                    ));
-                }
-                file.write_all(&line).pipeline_io(&temp_path)?;
+        let retained = self.private_root()?;
+        let mut bytes = Vec::new();
+        for descriptor in descriptors {
+            let line = self.framed_record(descriptor)?;
+            if (bytes.len() as u64).saturating_add(line.len() as u64) > MAX_TASK_STORE_BYTES {
+                return Err(PipelineError::corrupt(
+                    self.path.display().to_string(),
+                    format!("tasks.jsonl exceeds {MAX_TASK_STORE_BYTES} byte limit"),
+                ));
             }
-            drop(file);
-            fs::rename(&temp_path, &self.path).pipeline_io(&self.path)
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temp_path);
+            bytes.extend_from_slice(&line);
         }
-        result
+        retained
+            .write_atomic_checked(
+                Path::new("tasks.jsonl"),
+                &bytes,
+                kio_core::store_dir::Publication::Upsert,
+                |parent, leaf| {
+                    kio_core::private_fs::verify_private_directory_handle(parent)?;
+                    if parent.contains_entry(leaf)? {
+                        let file = parent.open_regular_read(leaf, MAX_TASK_STORE_BYTES)?;
+                        kio_core::private_fs::verify_private_regular_file_handle(&file)?;
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|error| self.private_error(error))
     }
 
     fn framed_record(&self, descriptor: &TaskDescriptor) -> Result<Vec<u8>> {
@@ -593,42 +613,6 @@ impl TaskStore {
             ));
         }
         Ok(line)
-    }
-
-    /// Create (`O_CREAT | O_EXCL`) a uniquely-named temp file next to the store
-    /// and return it with its path. The pid + monotonic-nanos + per-process
-    /// sequence make collisions vanishingly unlikely; `create_new` turns any
-    /// residual clash into a hard error rather than a silent overwrite.
-    fn create_unique_temp(&self) -> Result<(fs::File, PathBuf)> {
-        static SEQ: AtomicU64 = AtomicU64::new(0);
-        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
-        let stem = self
-            .path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("tasks.jsonl");
-        for _ in 0..8 {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|elapsed| elapsed.as_nanos())
-                .unwrap_or(0);
-            let seq = SEQ.fetch_add(1, Ordering::Relaxed);
-            let temp = parent.join(format!(".{stem}.{}.{nanos}.{seq}.tmp", std::process::id()));
-            match OpenOptions::new().write(true).create_new(true).open(&temp) {
-                Ok(file) => return Ok((file, temp)),
-                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                Err(err) => {
-                    return Err(PipelineError::Io {
-                        path: temp.display().to_string(),
-                        message: err.to_string(),
-                    });
-                }
-            }
-        }
-        Err(PipelineError::Io {
-            path: parent.display().to_string(),
-            message: "could not create a unique temp file for tasks.jsonl".to_owned(),
-        })
     }
 
     pub fn update_matching(
@@ -1279,6 +1263,39 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_task_journal_is_refused_without_permission_repair() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = crate::test_support::PrivateTempDir::new();
+        let store = TaskStore::new(directory.path());
+        store.append(&valid_task()).unwrap();
+        let path = directory.path().join("tasks.jsonl");
+        let original = fs::read(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(store.all().is_err());
+        assert!(store.append(&valid_task()).is_err());
+        assert!(store.replace_all(&[valid_task()]).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unsafe_task_root_is_refused_without_permission_repair() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join(".kio");
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        let store = TaskStore::new(&root);
+        assert!(store.append(&valid_task()).is_err());
+        assert!(store.replace_all(&[valid_task()]).is_err());
+        assert!(store.all().is_err());
+        assert!(!root.join("tasks.jsonl").exists());
+        assert_eq!(fs::metadata(&root).unwrap().mode() & 0o777, 0o755);
+    }
+
     fn valid_task() -> TaskDescriptor {
         TaskDescriptor {
             task_id: "task_01H".to_owned(),
@@ -1426,7 +1443,7 @@ mod tests {
         // P1: a poisoned tasks.jsonl line whose input_path escapes the scope is
         // rejected at read time with KIO-E-STORE-PATH-001, before any consumer can
         // read/send the file.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::PrivateTempDir::new();
         let store = TaskStore::new(dir.path());
         let mut task = TaskDescriptor {
             task_id: "task_01H".to_owned(),
@@ -1715,13 +1732,9 @@ mod tests {
 
     #[test]
     fn cand_050_task_store_rejects_oversized_file_before_reading() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::PrivateTempDir::new();
         let path = dir.path().join("tasks.jsonl");
-        let file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .unwrap();
+        let file = crate::test_support::create_private_file(&path);
         file.set_len(MAX_TASK_STORE_BYTES + 1).unwrap();
         let err = TaskStore::new(dir.path()).all().unwrap_err();
         assert!(matches!(err, PipelineError::Corrupt { .. }));
@@ -1730,11 +1743,11 @@ mod tests {
 
     #[test]
     fn cand_050_task_store_rejects_record_before_unbounded_line_allocation() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::PrivateTempDir::new();
         let path = dir.path().join("tasks.jsonl");
         let mut bytes = vec![b' '; MAX_TASK_RECORD_BYTES as usize + 1];
         bytes.push(b'\n');
-        fs::write(path, bytes).unwrap();
+        crate::test_support::write_private_file(&path, &bytes);
         let err = TaskStore::new(dir.path()).all().unwrap_err();
         assert!(matches!(err, PipelineError::Corrupt { .. }));
         assert!(err.to_string().contains("task record exceeds"));
@@ -1757,12 +1770,12 @@ mod tests {
             MAX_TASK_RECORD_BYTES as usize
         );
 
-        let append_dir = tempfile::tempdir().unwrap();
+        let append_dir = crate::test_support::PrivateTempDir::new();
         let append_store = TaskStore::new(append_dir.path());
         append_store.append(&task).unwrap();
         assert_eq!(append_store.all().unwrap(), vec![task.clone()]);
 
-        let replace_dir = tempfile::tempdir().unwrap();
+        let replace_dir = crate::test_support::PrivateTempDir::new();
         let replace_store = TaskStore::new(replace_dir.path());
         replace_store.replace_all(&[task.clone()]).unwrap();
         assert_eq!(replace_store.all().unwrap(), vec![task.clone()]);
@@ -1775,7 +1788,7 @@ mod tests {
 
     #[test]
     fn cand_050_task_store_bounds_collection_cardinality_and_keeps_valid_control() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::PrivateTempDir::new();
         let store = TaskStore::new(dir.path());
         store.append(&valid_task()).unwrap();
         assert_eq!(store.all().unwrap(), vec![valid_task()]);
@@ -1841,7 +1854,7 @@ mod tests {
         );
         assert_ne!(key, EmbeddingWorkKey::new(&chunk, &chunk).unwrap());
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::PrivateTempDir::new();
         let mut task = valid_task();
         task.task_type = TaskType::Embedding;
         task.output_ref = key.output_ref();
@@ -1984,7 +1997,7 @@ mod tests {
 
     #[test]
     fn normalized_output_ref_done_lookup_uses_the_exact_portable_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::PrivateTempDir::new();
         let mut task = valid_task();
         let tool = format!("sha256:{}", "b".repeat(64));
         task.output_ref = normalized_task_output_ref(&task.input_hash, &tool, u64::MAX);
@@ -2007,16 +2020,19 @@ mod tests {
 
     #[test]
     fn relocated_store_preserves_task_journal_bytes_and_resolves_in_the_destination() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = crate::test_support::PrivateTempDir::new();
         let source = parent.path().join("source");
         let destination = parent.path().join("destination");
-        fs::create_dir(&source).unwrap();
+        kio_core::store_dir::StoreDirectory::open(parent.path())
+            .unwrap()
+            .create_directory(Path::new("source"))
+            .unwrap();
         let mut normalized = valid_task();
         let tool = format!("sha256:{}", "b".repeat(64));
         normalized.output_ref = normalized_task_output_ref(&normalized.input_hash, &tool, 7);
         let source_instance =
             crate::markdownize::normalized_instance_dir(&source, &normalized.input_hash, &tool, 7);
-        fs::create_dir_all(&source_instance).unwrap();
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(&source_instance).unwrap();
         let store = TaskStore::new(&source);
         store.append(&normalized).unwrap();
         let bytes = fs::read(source.join("tasks.jsonl")).unwrap();
@@ -2056,7 +2072,7 @@ mod tests {
 
     #[test]
     fn relocated_store_does_not_create_missing_task_journal() {
-        let destination = tempfile::tempdir().unwrap();
+        let destination = crate::test_support::PrivateTempDir::new();
         assert!(TaskStore::new(destination.path()).all().unwrap().is_empty());
         assert!(!destination.path().join("tasks.jsonl").exists());
     }

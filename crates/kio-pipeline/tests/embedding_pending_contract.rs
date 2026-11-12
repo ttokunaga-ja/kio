@@ -14,11 +14,10 @@ use kio_pipeline::{
 fn hash(c: char) -> String {
     format!("sha256:{}", c.to_string().repeat(64))
 }
-fn reserve(db: &LedgerDb, local: bool) -> EmbeddingJob {
+fn reserve(db: &LedgerDb, request_kind: RequestKind) -> EmbeddingJob {
     let key = TaskKey::new("scope_pending", "embedding", hash('a'), hash('b'));
     let binding = EmbeddingJobBinding {
         logical_job_id: EmbeddingLogicalJobId("logical_pending".to_owned()),
-        local,
         dimensions: 3,
         distance: "cosine".to_owned(),
         modality: "multimodal".to_owned(),
@@ -41,13 +40,9 @@ fn reserve(db: &LedgerDb, local: bool) -> EmbeddingJob {
         db,
         &EmbeddingReserveRequest {
             key: &key,
-            candidate_usd: if local { 0.0 } else { 1.0 },
+            candidate_usd: 1.0,
             caps: &caps,
-            request_kind: if local {
-                RequestKind::Sync
-            } else {
-                RequestKind::Batch
-            },
+            request_kind,
             timeout_seconds: Some(300),
             bypass_cap_denial: false,
             binding: &binding,
@@ -78,16 +73,16 @@ fn prepare_remote(db: &LedgerDb, job: &EmbeddingJob) {
 }
 
 #[test]
-fn o1_typed_pending_cannot_attach_fake_remote_handle_to_local_sync_job() {
+fn o1_typed_pending_cannot_attach_remote_handle_to_paid_sync_job() {
     let temp = tempfile::tempdir().unwrap();
     let db = LedgerDb::initialize(temp.path().join("device/cost-ledger.sqlite")).unwrap();
-    let job = reserve(&db, true);
+    let job = reserve(&db, RequestKind::Sync);
     let before = ops::get_batch_request(&db, &job.key).unwrap().unwrap();
-    let outcome = ops::record_embedding_pending(&db, &job, &pending("batches/fake_local"));
+    let outcome = ops::record_embedding_pending(&db, &job, &pending("batches/fake_sync"));
     let after = ops::get_batch_request(&db, &job.key).unwrap().unwrap();
     assert_eq!(
         after, before,
-        "local execution cannot write a remote handle or change request state"
+        "a paid Sync claim cannot write a Batch remote handle or change request state"
     );
     assert!(outcome.is_err());
     assert!(
@@ -101,7 +96,7 @@ fn o1_typed_pending_cannot_attach_fake_remote_handle_to_local_sync_job() {
 fn o1_typed_pending_preserves_existing_remote_handle_and_is_idempotent() {
     let temp = tempfile::tempdir().unwrap();
     let db = LedgerDb::initialize(temp.path().join("device/cost-ledger.sqlite")).unwrap();
-    let job = reserve(&db, false);
+    let job = reserve(&db, RequestKind::Batch);
     prepare_remote(&db, &job);
     assert!(ops::record_embedding_pending(&db, &job, &pending("batches/original")).unwrap());
     let before = ops::get_batch_request(&db, &job.key).unwrap().unwrap();
@@ -119,7 +114,7 @@ fn o1_typed_pending_preserves_existing_remote_handle_and_is_idempotent() {
 fn o1_typed_pending_stale_original_job_is_a_cas_miss_without_sql_mutation() {
     let temp = tempfile::tempdir().unwrap();
     let db = LedgerDb::initialize(temp.path().join("device/cost-ledger.sqlite")).unwrap();
-    let original = reserve(&db, false);
+    let original = reserve(&db, RequestKind::Batch);
     prepare_remote(&db, &original);
     assert!(ops::record_embedding_pending(&db, &original, &pending("batches/original")).unwrap());
     ops::terminal_transaction(
@@ -127,7 +122,10 @@ fn o1_typed_pending_stale_original_job_is_a_cas_miss_without_sql_mutation() {
         &ops::TerminalWrite {
             key: &original.key,
             outcome: Outcome::Succeeded,
-            billed: ops::nonbillable_charge(),
+            billed: ops::BilledAmount {
+                usd: 1.0,
+                estimated: true,
+            },
             ledger_batch_job_id: "batches/original",
             next_state: BatchState::Completed,
             error: None,
@@ -139,7 +137,7 @@ fn o1_typed_pending_stale_original_job_is_a_cas_miss_without_sql_mutation() {
         },
     )
     .unwrap();
-    let fresh = reserve(&db, false);
+    let fresh = reserve(&db, RequestKind::Batch);
     prepare_remote(&db, &fresh);
     let before = ops::get_batch_request(&db, &fresh.key).unwrap().unwrap();
     assert!(!ops::record_embedding_pending(&db, &original, &pending("batches/stale")).unwrap());

@@ -25,7 +25,6 @@ pub struct EmbeddingJobMember {
 #[serde(deny_unknown_fields)]
 pub struct EmbeddingJobBinding {
     pub logical_job_id: EmbeddingLogicalJobId,
-    pub local: bool,
     pub dimensions: u32,
     pub distance: String,
     pub modality: String,
@@ -255,7 +254,6 @@ pub(super) fn drain_cleanup(db: &LedgerDb) -> Result<()> {
                 &entry.key,
                 entry.submission_seq,
                 &entry.intent_token,
-                intent.binding.local,
             ) {
                 continue;
             }
@@ -278,16 +276,10 @@ pub(super) fn drain_cleanup(db: &LedgerDb) -> Result<()> {
     })
 }
 
-fn terminal_proof(
-    costs: &[super::CostLedgerRow],
-    key: &TaskKey,
-    seq: i64,
-    token: &str,
-    local: bool,
-) -> bool {
+fn terminal_proof(costs: &[super::CostLedgerRow], key: &TaskKey, seq: i64, token: &str) -> bool {
     costs.iter().any(|cost| {
         cost.key == *key
-            && ((cost.submission_seq == seq && (!local || cost.batch_job_id == token))
+            && ((cost.submission_seq == seq)
                 || (seq.checked_add(1) == Some(cost.submission_seq)
                     && cost.outcome == super::Outcome::UnknownSettled
                     && cost.batch_job_id == token))
@@ -358,11 +350,6 @@ pub fn reserve_embedding_job(
     if key.is_device() || matches!(binding.members[0].target, EmbeddingTaskTarget::Query { .. }) {
         return Err(invalid(
             "query embeddings require the device claim operation",
-        ));
-    }
-    if binding.local && (candidate_usd != 0.0 || request_kind != super::RequestKind::Sync) {
-        return Err(invalid(
-            "local embedding must have a zero-cost sync reservation",
         ));
     }
     let outcome = db.write(|tx| {
@@ -438,7 +425,6 @@ pub fn claim_device_embedding_job(
         || binding.members.len() != 1
         || !matches!(binding.members[0].target, EmbeddingTaskTarget::Query { .. })
         || binding.members[0].target.input_hash() != key.input_hash
-        || (binding.local && candidate_usd != 0.0)
     {
         return Err(invalid("invalid device query binding"));
     }
@@ -483,8 +469,7 @@ pub(super) fn record_embedding_pending(
     let kio_adapter::types::EmbeddingOutcome::Pending { remote_handle } = outcome else {
         return Err(invalid("expected a Pending embedding outcome"));
     };
-    if job.binding.local
-        || job.key.is_device()
+    if job.key.is_device()
         || matches!(
             job.binding.members.first().map(|member| &member.target),
             Some(EmbeddingTaskTarget::Query { .. })
@@ -492,7 +477,7 @@ pub(super) fn record_embedding_pending(
         || remote_handle.0.trim().is_empty()
     {
         return Err(invalid(
-            "local, query, or malformed execution cannot acquire a remote handle",
+            "query or malformed execution cannot acquire a remote handle",
         ));
     }
     validate_binding(&job.key, &job.binding)?;
@@ -548,6 +533,79 @@ pub(super) fn record_embedding_pending(
             &remote_handle.0,
         )
     })
+}
+
+/// Zero-close only an owned synchronous attempt proven unsent by its caller.
+/// The original frozen binding and live SQLite claim must still agree inside
+/// this transaction; accepted results and provider residue cannot be discarded.
+pub fn reject_unsent_embedding_job(
+    db: &LedgerDb,
+    job: &EmbeddingJob,
+) -> Result<super::ops::TerminalReceipt> {
+    if job.known_result.is_some() {
+        return Err(invalid("unsent rejection requires an unknown paid attempt"));
+    }
+    drain_cleanup(db)?;
+    let receipt = db.write(|tx| {
+        let row = super::ops_sql::get_batch_request(tx.connection(), &job.key)?
+            .ok_or_else(|| invalid("unsent embedding reservation missing"))?;
+        if row.submission_seq != job.submission_seq
+            || row.intent_token.as_deref() != Some(&job.intent_token)
+            || row.state != super::BatchState::Intent
+            || row.request_kind != super::RequestKind::Sync
+            || row.upload_id.is_some()
+            || row.batch_job_id.is_some()
+            || row.provider_scope_id.is_some()
+        {
+            return Err(invalid(
+                "unsent embedding claim changed or acquired provider effects",
+            ));
+        }
+        // Sync phase 1 writes job_create_started_at as its local stale-clock
+        // authority before any provider operation; it is not remote residue.
+        let current = load(tx.fs, tx.ledger_id, tx.era, &row, tx.connection())?
+            .ok_or_else(|| invalid("unsent embedding binding missing"))?;
+        if current.submission_seq != job.submission_seq
+            || current.intent_token != job.intent_token
+            || current.binding != job.binding
+            || current.known_result.is_some()
+        {
+            return Err(invalid(
+                "unsent embedding evidence changed or contains a result",
+            ));
+        }
+        if super::ops_sql::cost_ledger_rows_for_key(tx.connection(), &job.key)?
+            .iter()
+            .any(|cost| cost.submission_seq == job.submission_seq)
+        {
+            return Err(invalid(
+                "unsent embedding attempt already has a terminal audit",
+            ));
+        }
+        let receipt = super::ops_sql::terminal_transaction(
+            tx.connection(),
+            tx.control(),
+            &super::ops::TerminalWrite {
+                key: &job.key,
+                outcome: super::Outcome::SubmitRejected,
+                billed: super::ops::nonbillable_charge(),
+                ledger_batch_job_id: &job.intent_token,
+                next_state: super::BatchState::Terminal,
+                error: Some("before_dispatch"),
+                increment_contract_violation: false,
+                attempts_delta: 0,
+                clear_intent_token: true,
+                intent_token_guard: Some(&job.intent_token),
+                reseat_submission_seq: false,
+            },
+        )?;
+        if receipt.recorded {
+            enqueue_cleanup(tx, &[current])?;
+        }
+        Ok(receipt)
+    })?;
+    drain_cleanup(db)?;
+    Ok(receipt)
 }
 
 fn validate_result(binding: &EmbeddingJobBinding, result: &EmbeddingCompleted) -> Result<()> {
@@ -766,22 +824,42 @@ pub fn pending_embedding_publications_for_scope(
         ));
     }
     db.read_artifacts(|conn, fs, ledger_id, era| {
-        let mut statement = conn.prepare("SELECT scope_id, adapter_kind, input_hash, tool_profile_hash FROM batch_requests WHERE scope_id=?1 AND adapter_kind='embedding' ORDER BY scope_id, adapter_kind, input_hash, tool_profile_hash")?;
-        let keys = statement.query_map([scope_id], |row| Ok(TaskKey::new(
-            row.get::<_,String>(0)?, row.get::<_,String>(1)?, row.get::<_,String>(2)?, row.get::<_,String>(3)?,
-        )))?;
-        let mut jobs = Vec::new();
-        for key in keys {
-            let row = super::ops_sql::get_batch_request(conn, &key?)?
-                .ok_or_else(|| invalid("publication recovery row disappeared"))?;
-            if let Some(job) = load(fs, ledger_id, era, &row, conn)?
-                && job.known_result.is_some() {
-                jobs.push(job);
-                if jobs.len() == 256 { break; }
+        pending_embedding_publications_from_bound_snapshot(conn, fs, ledger_id, era, scope_id, 256)
+    })
+}
+
+/// Shared strict journal validation for live recovery and owned read-only copies.
+pub(crate) fn pending_embedding_publications_from_bound_snapshot(
+    conn: &rusqlite::Connection,
+    fs: &FsSession,
+    ledger_id: &str,
+    era: &str,
+    scope_id: &str,
+    limit: usize,
+) -> Result<Vec<EmbeddingJob>> {
+    let mut statement = conn.prepare("SELECT scope_id, adapter_kind, input_hash, tool_profile_hash FROM batch_requests WHERE scope_id=?1 AND adapter_kind='embedding' ORDER BY scope_id, adapter_kind, input_hash, tool_profile_hash")?;
+    let keys = statement.query_map([scope_id], |row| {
+        Ok(TaskKey::new(
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut jobs = Vec::new();
+    for key in keys {
+        let row = super::ops_sql::get_batch_request(conn, &key?)?
+            .ok_or_else(|| invalid("publication recovery row disappeared"))?;
+        if let Some(job) = load(fs, ledger_id, era, &row, conn)?
+            && job.known_result.is_some()
+        {
+            jobs.push(job);
+            if jobs.len() == limit {
+                break;
             }
         }
-        Ok(jobs)
-    })
+    }
+    Ok(jobs)
 }
 
 /// Durably retain already validated vectors and usage before settlement.
@@ -837,13 +915,7 @@ pub fn finish_embedding_publication(db: &LedgerDb, job: &EmbeddingJob) -> Result
     drain_cleanup(db)?;
     db.read_artifacts(|conn, fs, ledger_id, era| {
         let costs = super::ops_sql::cost_ledger_rows_for_key(conn, &job.key)?;
-        let proof = terminal_proof(
-            &costs,
-            &job.key,
-            job.submission_seq,
-            &job.intent_token,
-            job.binding.local,
-        );
+        let proof = terminal_proof(&costs, &job.key, job.submission_seq, &job.intent_token);
         if !proof {
             return Err(invalid(
                 "embedding publication requires its durable terminal audit",
@@ -897,7 +969,6 @@ pub(super) fn sweep_in_tx(
 ) -> Result<super::ops::SweepReport> {
     let mut filtered = plan.clone();
     let mut cleanup = Vec::new();
-    let mut local_settled = Vec::new();
     for keys in [&mut filtered.own_key_stale, &mut filtered.general_stale] {
         let mut keep = Vec::new();
         for key in keys.drain(..) {
@@ -906,11 +977,6 @@ pub(super) fn sweep_in_tx(
             };
             match load(tx.fs, tx.ledger_id, tx.era, &row, tx.connection())? {
                 Some(job) if job.known_result.is_some() && !job.key.is_device() => {}
-                Some(job) if job.binding.local => {
-                    settle_local_crash_in_tx(tx, &job)?;
-                    local_settled.push(key);
-                    cleanup.push(job);
-                }
                 Some(job) => {
                     cleanup.push(job);
                     keep.push(key);
@@ -937,7 +1003,6 @@ pub(super) fn sweep_in_tx(
     filtered.prune = prune;
     let mut report =
         super::ops_sql::execute_bounded_sweep(tx.connection(), tx.control(), &filtered, now_ms)?;
-    report.settled.extend(local_settled);
     // Keep observable ordering identical to the original deterministic plan.
     report.settled.sort_by_key(|key| {
         plan.own_key_stale
@@ -948,56 +1013,6 @@ pub(super) fn sweep_in_tx(
     cleanup.retain(|job| report.settled.contains(&job.key) || report.pruned.contains(&job.key));
     enqueue_cleanup(tx, &cleanup)?;
     Ok(report)
-}
-
-fn settle_local_crash_in_tx(
-    tx: &LedgerWriteTxn<'_>,
-    job: &EmbeddingJob,
-) -> Result<super::ops::TerminalReceipt> {
-    if !job.binding.local || (job.known_result.is_some() && !job.key.is_device()) {
-        return Err(invalid(
-            "only an unknown local attempt can settle as local crash",
-        ));
-    }
-    super::ops_sql::terminal_transaction(
-        tx.connection(),
-        tx.control(),
-        &super::ops::TerminalWrite {
-            key: &job.key,
-            outcome: super::Outcome::UnknownSettled,
-            billed: super::ops::nonbillable_charge(),
-            ledger_batch_job_id: &job.intent_token,
-            next_state: super::BatchState::Terminal,
-            error: Some("local_crash"),
-            increment_contract_violation: false,
-            attempts_delta: 1,
-            clear_intent_token: true,
-            intent_token_guard: Some(&job.intent_token),
-            reseat_submission_seq: false,
-        },
-    )
-}
-
-pub fn settle_local_embedding_crash(
-    db: &LedgerDb,
-    job: &EmbeddingJob,
-) -> Result<super::ops::TerminalReceipt> {
-    drain_cleanup(db)?;
-    let receipt = db.write(|tx| {
-        let row = super::ops_sql::get_batch_request(tx.connection(), &job.key)?
-            .ok_or_else(|| invalid("local embedding reservation missing"))?;
-        let current = load(tx.fs, tx.ledger_id, tx.era, &row, tx.connection())?
-            .ok_or_else(|| invalid("local embedding binding missing"))?;
-        if current.submission_seq != job.submission_seq || current.intent_token != job.intent_token
-        {
-            return Err(invalid("local embedding attempt changed"));
-        }
-        let receipt = settle_local_crash_in_tx(tx, &current)?;
-        enqueue_cleanup(tx, &[current])?;
-        Ok(receipt)
-    })?;
-    drain_cleanup(db)?;
-    Ok(receipt)
 }
 
 pub(super) fn settle_unknown_with_cleanup(
@@ -1030,24 +1045,19 @@ pub(super) fn settle_unknown_with_cleanup(
                 "a known embedding result must be recovered before unknown settlement",
             ));
         }
-        let local = original.as_ref().is_some_and(|job| job.binding.local);
-        let receipt = if let Some(job) = original.as_ref().filter(|job| job.binding.local) {
-            settle_local_crash_in_tx(tx, job)?
-        } else {
-            super::ops_sql::recovery_settle_unknown(
-                tx.connection(),
-                tx.control(),
-                key,
-                intent_token,
-                estimated_usd,
-                cleanup_complete,
-            )?
-        };
+        let receipt = super::ops_sql::recovery_settle_unknown(
+            tx.connection(),
+            tx.control(),
+            key,
+            intent_token,
+            estimated_usd,
+            cleanup_complete,
+        )?;
         // Sync requests have no remote residue. Capture the original attempt
         // before reseating destroys its live-row locator; OCR/Batch contracts
         // continue to use their existing residue-cleanup state machine.
         if receipt.recorded
-            && (cleanup_complete || local)
+            && cleanup_complete
             && let Some(job) = original
         {
             enqueue_cleanup(tx, &[job])?;
@@ -1064,6 +1074,84 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unsent_rejection_preserves_changed_claims_provider_effects_and_known_results() {
+        for case in ["sequence", "token", "binding", "provider", "known_result"] {
+            let temp = tempfile::tempdir().unwrap();
+            let db = LedgerDb::initialize(temp.path().join("device/cost-ledger.sqlite")).unwrap();
+            let hash = |c: char| format!("sha256:{}", c.to_string().repeat(64));
+            let key = TaskKey::new("scope_unsent", "embedding", hash('a'), hash('b'));
+            let binding = EmbeddingJobBinding {
+                logical_job_id: EmbeddingLogicalJobId("logical_unsent".into()),
+                dimensions: 3,
+                distance: "cosine".into(),
+                modality: "multimodal".into(),
+                members: vec![EmbeddingJobMember {
+                    id: "member1".into(),
+                    target: EmbeddingTaskTarget::Chunk {
+                        chunk_hash: hash('c'),
+                        embedding_hash: hash('a'),
+                        profile_hash: hash('b'),
+                        input_hash: hash('d'),
+                    },
+                }],
+            };
+            let EmbeddingReservationOutcome::Reserved(mut job) = reserve_embedding_job(
+                &db,
+                &EmbeddingReserveRequest {
+                    key: &key,
+                    candidate_usd: 1.0,
+                    caps: &ops::BudgetCapConfig {
+                        device_cap: 100.0,
+                        folder_cap: None,
+                        device_per_adapter_cap: None,
+                    },
+                    request_kind: RequestKind::Sync,
+                    timeout_seconds: Some(300),
+                    bypass_cap_denial: false,
+                    binding: &binding,
+                },
+            )
+            .unwrap() else {
+                panic!("expected paid reservation")
+            };
+            match case {
+                "sequence" => job.submission_seq += 1,
+                "token" => job.intent_token.push('x'),
+                "binding" => job.binding.members[0].id = "forged".into(),
+                "provider" => db.write(|tx| { tx.connection().execute("UPDATE batch_requests SET upload_id='provider-residue' WHERE scope_id=?1", [&key.scope_id])?; Ok(()) }).unwrap(),
+                "known_result" => stage_embedding_result(&db, &job, &EmbeddingCompleted {
+                    members: vec![kio_adapter::types::EmbeddingMemberOutcome { id: "member1".into(), result: EmbeddingMemberResult::Vector { vector: vec![1.0,0.0,0.0] } }],
+                    dimensions: 3, distance: "cosine".into(), modality: "multimodal".into(), embedding_profile_hash: hash('b'), usage: kio_adapter::types::EmbeddingUsage::Estimated,
+                }).unwrap(),
+                _ => unreachable!(),
+            }
+            let before = ops::get_batch_request(&db, &key).unwrap().unwrap();
+            assert!(
+                reject_unsent_embedding_job(&db, &job).is_err(),
+                "{case} must fail closed"
+            );
+            assert_eq!(
+                ops::get_batch_request(&db, &key).unwrap().unwrap(),
+                before,
+                "{case}: live evidence changed"
+            );
+            assert!(
+                ops::cost_ledger_rows_for_key(&db, &key).unwrap().is_empty(),
+                "{case}: no terminal audit may be manufactured"
+            );
+            if case == "known_result" {
+                assert!(
+                    embedding_job(&db, &before)
+                        .unwrap()
+                        .unwrap()
+                        .known_result
+                        .is_some()
+                );
+            }
+        }
+    }
+
+    #[test]
     fn o1_committed_sweep_cleanup_is_rediscovered_after_process_loss() {
         let temp = tempfile::tempdir().unwrap();
         let db = LedgerDb::initialize(temp.path().join("device/cost-ledger.sqlite")).unwrap();
@@ -1071,7 +1159,6 @@ mod tests {
         let key = TaskKey::new("scope_cleanup", "embedding", hash('a'), hash('b'));
         let binding = EmbeddingJobBinding {
             logical_job_id: EmbeddingLogicalJobId("logical_cleanup".to_owned()),
-            local: true,
             dimensions: 3,
             distance: "cosine".to_owned(),
             modality: "multimodal".to_owned(),
@@ -1086,15 +1173,15 @@ mod tests {
             }],
         };
         let caps = ops::BudgetCapConfig {
-            device_cap: 0.0,
+            device_cap: 100.0,
             folder_cap: None,
             device_per_adapter_cap: None,
         };
         let request = EmbeddingReserveRequest {
             key: &key,
-            candidate_usd: 0.0,
+            candidate_usd: 1.0,
             caps: &caps,
-            request_kind: RequestKind::Sync,
+            request_kind: RequestKind::Batch,
             timeout_seconds: Some(300),
             bypass_cap_denial: false,
             binding: &binding,
@@ -1139,12 +1226,21 @@ mod tests {
         })
         .unwrap();
         let reopened = LedgerDb::open_existing(db.path()).unwrap();
+        let costs = ops::cost_ledger_rows_for_key(&reopened, &key).unwrap();
+        assert_eq!(costs.len(), 1);
+        let settled = &costs[0];
+        assert_eq!(settled.outcome, super::super::Outcome::UnknownSettled);
+        assert_eq!(settled.usd, 1.0);
+        assert!(settled.estimated);
+        assert_eq!(settled.batch_job_id, original.intent_token);
+        assert_eq!(settled.submission_seq, original.submission_seq + 1);
         let EmbeddingReservationOutcome::Reserved(next) =
             reserve_embedding_job(&reopened, &request).unwrap()
         else {
             panic!("expected bounded next attempt")
         };
-        assert_eq!(next.submission_seq, original.submission_seq + 1);
+        assert_eq!(next.submission_seq, settled.submission_seq + 1);
+        assert_ne!(next.intent_token, original.intent_token);
         let bindings = std::fs::read_dir(temp.path().join("device"))
             .unwrap()
             .map(|entry| entry.unwrap().path())
@@ -1164,7 +1260,6 @@ mod tests {
         let key = TaskKey::new("scope_orphan", "embedding", hash('a'), hash('b'));
         let binding = EmbeddingJobBinding {
             logical_job_id: EmbeddingLogicalJobId("logical_orphan".to_owned()),
-            local: true,
             dimensions: 3,
             distance: "cosine".to_owned(),
             modality: "multimodal".to_owned(),
@@ -1185,7 +1280,7 @@ mod tests {
                 tx.control(),
                 &key,
                 RequestKind::Sync,
-                0.0,
+                1.0,
                 Some(300),
             )?;
             let row = super::super::ops_sql::get_batch_request(tx.connection(), &key)?.unwrap();
@@ -1199,9 +1294,9 @@ mod tests {
             &db,
             &EmbeddingReserveRequest {
                 key: &key,
-                candidate_usd: 0.0,
+                candidate_usd: 1.0,
                 caps: &ops::BudgetCapConfig {
-                    device_cap: 0.0,
+                    device_cap: 100.0,
                     folder_cap: None,
                     device_per_adapter_cap: None,
                 },
@@ -1211,7 +1306,7 @@ mod tests {
                 binding: &binding,
             },
         )
-        .expect("an uncommitted prepared binding must not block a fresh local attempt");
+        .expect("an uncommitted prepared binding must not block a fresh paid attempt");
         let EmbeddingReservationOutcome::Reserved(fresh) = fresh else {
             panic!("expected a fresh orphan replacement")
         };

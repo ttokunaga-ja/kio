@@ -2903,9 +2903,29 @@ impl SmokeFixture {
     }
 
     fn create_directory_all(&self, relative: &Path) -> Result<PathBuf, ReleaseError> {
-        self.root
-            .create_directory_all(relative)
+        // The selected work root may be shared user storage. Its relative
+        // fixture children are Kio-owned and must be private on the exact
+        // retained handle before another child can be created beneath them.
+        let mut parent = self.root.clone();
+        for component in relative.components() {
+            let Component::Normal(name) = component else {
+                return Err(ReleaseError::Invalid(
+                    "smoke fixture directory must use a relative child path".into(),
+                ));
+            };
+            let leaf = Path::new(name);
+            let child = if parent.contains_entry(leaf).map_err(smoke_fixture_error)? {
+                parent.open_directory(leaf)
+            } else {
+                parent.create_directory(leaf)
+            }
             .map_err(smoke_fixture_error)?;
+            let retained = StoreDirectory::from_retained(child, parent.path().join(name))
+                .map_err(smoke_fixture_error)?;
+            kio_core::private_fs::verify_private_directory_handle(&retained)
+                .map_err(smoke_fixture_error)?;
+            parent = retained;
+        }
         Ok(self.path().join(relative))
     }
 
@@ -3450,19 +3470,44 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn smoke_fixture_rejects_unsafe_work_directory_and_ancestor_without_repair() {
+    fn smoke_fixture_accepts_shared_work_directory_and_ancestor_without_repair() {
         use std::os::unix::fs::PermissionsExt;
         let temp = smoke_test_tempdir();
-        let unsafe_dir = temp.path().canonicalize().unwrap().join("unsafe");
-        fs::create_dir(&unsafe_dir).unwrap();
-        fs::set_permissions(&unsafe_dir, fs::Permissions::from_mode(0o775)).unwrap();
-        assert!(SmokeFixture::prepare(&unsafe_dir).is_err());
-        assert!(SmokeFixture::prepare(&unsafe_dir.join("new-work")).is_err());
-        assert_eq!(
-            fs::metadata(&unsafe_dir).unwrap().permissions().mode() & 0o777,
-            0o775
-        );
-        assert_eq!(fs::read_dir(unsafe_dir).unwrap().count(), 0);
+        let base = temp.path().canonicalize().unwrap();
+        // docs/14: external work directories and ancestors retain their mode;
+        // only the fixture's own created children require owner-only access.
+        for nested in [false, true] {
+            let shared = base.join(if nested {
+                "shared-parent"
+            } else {
+                "shared-work"
+            });
+            fs::create_dir(&shared).unwrap();
+            fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).unwrap();
+            let work = if nested {
+                shared.join("new-work")
+            } else {
+                shared.clone()
+            };
+            let fixture = SmokeFixture::prepare(&work).unwrap();
+            assert_smoke_fixture_directories(&fixture, nested);
+            assert_eq!(
+                fs::metadata(&shared).unwrap().permissions().mode() & 0o777,
+                0o775
+            );
+            // Unsafe Kio-created storage still fails closed without repair.
+            let isolated = fixture.path().join("isolated");
+            fs::set_permissions(&isolated, fs::Permissions::from_mode(0o775)).unwrap();
+            assert!(fixture.prepare_environment().is_err());
+            assert_eq!(
+                fs::metadata(&isolated).unwrap().permissions().mode() & 0o777,
+                0o775
+            );
+            assert_eq!(
+                fs::read(fixture.path().join("candidate/bin/kio")).unwrap(),
+                b"first extraction"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -3534,7 +3579,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn smoke_fixture_rejects_unsafe_prefix_before_parent_component_without_repair() {
+    fn smoke_fixture_accepts_shared_prefix_before_parent_component_without_repair() {
         run_smoke_fixture_path_case("unsafe-parent");
     }
 
@@ -3564,7 +3609,7 @@ mod tests {
                 Some(base.join("private-parent/leaf")),
             ),
             "existing-parent" => ("existing-private/../newleaf", Some(base.join("newleaf"))),
-            "unsafe-parent" => ("unsafe/../newleaf", None),
+            "unsafe-parent" => ("unsafe/../newleaf", Some(base.join("newleaf"))),
             "symlink-parent" => ("linked/../newleaf", None),
             "missing-parent" => ("missing/../work", None),
             _ => panic!("unknown smoke fixture path case"),
@@ -3666,16 +3711,18 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn smoke_fixture_windows_verbatim_cwd_rejects_unsafe_prefix_without_repair() {
+    fn smoke_fixture_windows_verbatim_cwd_accepts_external_acl_without_repair() {
         use std::{
             os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
             ptr,
         };
         use windows_sys::Win32::{
-            Foundation::HANDLE,
+            Foundation::{HANDLE, LocalFree},
             Security::{
-                Authorization::{SE_FILE_OBJECT, SetSecurityInfo},
-                DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+                Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo},
+                DACL_SECURITY_INFORMATION, GROUP_SECURITY_INFORMATION,
+                GetSecurityDescriptorControl, GetSecurityDescriptorLength,
+                OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, SE_DACL_PROTECTED,
             },
             Storage::FileSystem::{
                 FILE_FLAG_BACKUP_SEMANTICS, FILE_READ_ATTRIBUTES, READ_CONTROL, WRITE_DAC,
@@ -3705,16 +3752,54 @@ mod tests {
             )
         };
         assert_eq!(status, 0, "cannot create unsafe DACL fixture");
-        assert!(verify_private_creation_parent(&unsafe_path).is_err());
-        let prepared = SmokeFixture::prepare_at(Path::new("unsafe/../work"), &base);
-        assert!(
-            prepared.is_err(),
-            "unsafe prefix was normalized away before validation"
-        );
-        assert!(verify_private_creation_parent(&unsafe_path).is_err());
-        assert!(!base.join("work").exists());
+        let external_acl = || {
+            let mut dacl = ptr::null_mut();
+            let mut descriptor = ptr::null_mut();
+            // SAFETY: the retained fixture handle and output pointers stay live.
+            let status = unsafe {
+                GetSecurityInfo(
+                    fixture.as_raw_handle() as HANDLE,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION
+                        | OWNER_SECURITY_INFORMATION
+                        | GROUP_SECURITY_INFORMATION,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                    &mut dacl,
+                    ptr::null_mut(),
+                    &mut descriptor,
+                )
+            };
+            assert_eq!(status, 0);
+            let mut control = 0;
+            let mut revision = 0;
+            // SAFETY: GetSecurityInfo returned this owned valid descriptor.
+            let valid =
+                unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) };
+            let null_dacl = dacl.is_null();
+            // SAFETY: the descriptor returned by GetSecurityInfo is valid and
+            // remains allocated while its complete bounded bytes are copied.
+            let bytes = unsafe {
+                let length = GetSecurityDescriptorLength(descriptor) as usize;
+                assert!(length > 0 && length <= 64 * 1024);
+                std::slice::from_raw_parts(descriptor.cast::<u8>(), length).to_vec()
+            };
+            // SAFETY: GetSecurityInfo allocated the descriptor with LocalAlloc.
+            unsafe { LocalFree(descriptor) };
+            assert_ne!(valid, 0);
+            assert!(null_dacl);
+            assert_ne!(control & SE_DACL_PROTECTED, 0);
+            bytes
+        };
+        let before_acl = external_acl();
+        assert!(kio_core::private_fs::verify_private_directory(&unsafe_path).is_err());
+        let prepared = SmokeFixture::prepare_at(Path::new("unsafe/../work"), &base).unwrap();
+        assert_eq!(prepared.path(), base.join("work"));
+        assert_smoke_fixture_directories(&prepared, true);
+        assert_eq!(external_acl(), before_acl);
+        assert!(kio_core::private_fs::verify_private_directory(&unsafe_path).is_err());
         assert_eq!(fs::read_dir(&unsafe_path).unwrap().count(), 0);
-        assert_eq!(fs::read_dir(base).unwrap().count(), 1);
+        assert_eq!(fs::read_dir(base).unwrap().count(), 2);
     }
 
     #[cfg(windows)]

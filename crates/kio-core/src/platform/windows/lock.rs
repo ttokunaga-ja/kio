@@ -4,96 +4,9 @@ use crate::scope::{
     new_lock_token,
 };
 use crate::store_dir::StoreDirectory;
-use serde_json::Value;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Component, Path, PathBuf};
-fn open_windows_lock_parent_kind(
-    path: &Path,
-    create_missing: bool,
-    control: &crate::control::ControlHandle,
-) -> Result<File> {
-    use cap_primitives::{ambient_authority, fs as cap_fs};
-
-    if path
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        return Err(KioError::invalid_usage(
-            "lock path must not contain parent traversal",
-        ));
-    }
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?
-            .join(path)
-    };
-    let parent = absolute
-        .parent()
-        .ok_or_else(|| KioError::invalid_usage("lock path has no parent"))?;
-    let mut root = PathBuf::new();
-    let mut components = Vec::new();
-    for component in parent.components() {
-        match component {
-            Component::Prefix(prefix) => root.push(prefix.as_os_str()),
-            Component::RootDir => root.push(component.as_os_str()),
-            Component::CurDir => {}
-            Component::Normal(component) => components.push(component.to_os_string()),
-            Component::ParentDir => {
-                return Err(KioError::invalid_usage(
-                    "lock path must not contain parent traversal",
-                ));
-            }
-        }
-    }
-    if root.as_os_str().is_empty() {
-        return Err(KioError::invalid_usage("lock path must be rooted"));
-    }
-    let mut directory = cap_fs::open_ambient_dir(&root, ambient_authority())
-        .map_err(|error| KioError::io(error.to_string(), root.display().to_string()))?;
-    if crate::platform::directory_handle_identity(&directory).is_none() {
-        return Err(KioError::locked(path.display().to_string()));
-    }
-    for component in components {
-        directory = match cap_fs::open_dir_nofollow(&directory, Path::new(&component)) {
-            Ok(directory) => directory,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound && create_missing => {
-                // Create only the absent component through its retained parent
-                // with a protected owner-only DACL. Existing ancestors are
-                // neither restricted nor repaired, and the original named
-                // parent handle is consumed rather than kept as an extra alias.
-                let retained = StoreDirectory::from_retained_with_control(
-                    directory,
-                    root.clone(),
-                    control.clone(),
-                )?;
-                match retained.create_directory(Path::new(&component)) {
-                    Ok(created) => created,
-                    Err(error)
-                        if error.error_code() == "KIO-E-STORE-IO-001"
-                            && error.context().get("io_error_kind").and_then(Value::as_str)
-                                == Some("already_exists") =>
-                    {
-                        cap_fs::open_dir_nofollow(&retained.root_handle(), Path::new(&component))
-                            .map_err(|error| {
-                                KioError::io(error.to_string(), path.display().to_string())
-                            })?
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
-        };
-        if crate::platform::directory_handle_identity(&directory).is_none() {
-            return Err(KioError::locked(path.display().to_string()));
-        }
-        root.push(&component);
-    }
-    Ok(directory)
-}
-
+use std::path::Path;
 pub(crate) fn windows_lock_leaf(path: &Path) -> Result<&Path> {
     let leaf = path
         .file_name()
@@ -139,13 +52,13 @@ pub(crate) fn create_windows_lock(
     leaf: &Path,
     bytes: &[u8],
 ) -> std::io::Result<File> {
-    use cap_primitives::fs as cap_fs;
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
-    use windows_sys::Win32::Storage::FileSystem::{DELETE, SYNCHRONIZE};
-
-    let options =
-        windows_lock_open_options(true, GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE);
-    let mut file = cap_fs::open(parent, leaf, &options)?;
+    // Preserve the lock's DELETE rights and read-only sharing while installing
+    // a protected owner-only DACL at creation, before publishing any bytes.
+    let mut file = super::private_fs::create_new_private_at(
+        parent,
+        leaf.as_os_str(),
+        super::private_fs::NewPrivateObjectKind::LockFile,
+    )?;
     let published = (|| -> std::io::Result<()> {
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -178,6 +91,8 @@ pub(crate) fn read_windows_lock(
 ) -> Result<(LockFile, crate::platform::RegularFileHandleIdentity)> {
     let identity = crate::platform::regular_file_handle_identity(file)
         .ok_or_else(|| KioError::locked("Windows lock leaf is not a single-link regular file"))?;
+    super::private_fs::verify_owner_private_handle(file)
+        .map_err(|_| KioError::locked("Windows lock leaf is not owner-private"))?;
     let length = file
         .metadata()
         .map_err(|error| KioError::io(error.to_string(), ".lock"))?
@@ -319,8 +234,15 @@ pub(crate) fn process_is_alive(pid: u32) -> bool {
 }
 
 #[cfg(test)]
+#[cfg(test)]
 pub(crate) fn open_windows_lock_parent(path: &Path) -> Result<File> {
-    open_windows_lock_parent_kind(path, true, &crate::control::ControlHandle::default())
+    let parent = path
+        .parent()
+        .ok_or_else(|| KioError::invalid_usage("lock path has no parent"))?;
+    StoreDirectory::open_or_create_directories(parent)?
+        .root_handle()
+        .try_clone()
+        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))
 }
 
 pub(crate) struct BoundLock {
@@ -432,14 +354,14 @@ impl Drop for PathLock {
 }
 pub(crate) fn acquire_path_lock(
     _session: &crate::scope::LockSession,
-    path: PathBuf,
+    target: crate::scope::locks::NamedLockTarget,
     control: &crate::control::ControlHandle,
     pid: u32,
     store_gate: bool,
     validate_authority: fn(&File, &crate::control::ControlHandle) -> Result<()>,
     _acquire_gate: crate::scope::locks::AcquireLockGate,
 ) -> Result<PathLock> {
-    let parent = open_windows_lock_parent_kind(&path, !store_gate, control)?;
+    let crate::scope::locks::NamedLockTarget { parent, path } = target;
     let gate = if store_gate {
         validate_authority(&parent, control)?;
         Some(super::store_gate::Gate::acquire(&parent, true)?)

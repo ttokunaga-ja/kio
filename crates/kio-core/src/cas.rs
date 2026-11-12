@@ -10,6 +10,9 @@ pub use embedding_metadata::{
 };
 
 mod bound;
+mod image;
+pub use image::ImageStore;
+use image::write_bound_content_at;
 mod store;
 
 mod removal;
@@ -630,7 +633,11 @@ pub(crate) fn ensure_bound_directory(directory: &File, label: &Path) -> Result<(
         ));
     }
     cas_semantics::validate_bound_directory_native(directory, label)?;
-    Ok(())
+    let retained = crate::store_dir::StoreDirectory::from_retained(
+        directory.try_clone().kio_io(label)?,
+        label.to_path_buf(),
+    )?;
+    crate::private_fs::verify_private_directory_handle(&retained)
 }
 
 fn same_bound_directory(current: &File, retained: &File) -> Result<bool> {
@@ -640,6 +647,7 @@ fn same_bound_directory(current: &File, retained: &File) -> Result<bool> {
 }
 
 fn bound_open_dir(parent: &File, leaf: &str) -> Result<File> {
+    ensure_bound_directory(parent, Path::new("CAS parent"))?;
     let name = bound_leaf(leaf, "directory")?;
     let directory = cap_primitives::fs::open_dir_nofollow(parent, name)
         .map_err(|error| bound_io_or_not_found(error, leaf))?;
@@ -674,13 +682,25 @@ fn bound_open_or_create_dir(parent: &File, leaf: &str, create: bool) -> Result<F
         Ok(dir) => Ok(dir),
         Err(error) if create && error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
             let name = bound_leaf(leaf, "directory")?;
-            let options = cap_primitives::fs::DirOptions::new();
-            if let Err(error) = cap_primitives::fs::create_dir(parent, name, &options)
-                && error.kind() != std::io::ErrorKind::AlreadyExists
-            {
-                return Err(KioError::io(error.to_string(), leaf));
+            ensure_bound_directory(parent, Path::new("CAS parent"))?;
+            let retained = crate::store_dir::StoreDirectory::from_retained(
+                parent.try_clone().kio_io(Path::new(leaf))?,
+                PathBuf::from("CAS parent"),
+            )?;
+            match retained.create_directory(name) {
+                Ok(directory) => {
+                    ensure_bound_directory(&directory, Path::new(leaf))?;
+                    cas_semantics::normalize_bound_child(directory, leaf)
+                }
+                Err(error)
+                    if error.error_code() == "KIO-E-STORE-IO-001"
+                        && error.context().get("io_error_kind").and_then(Value::as_str)
+                            == Some("already_exists") =>
+                {
+                    bound_open_dir(parent, leaf)
+                }
+                Err(error) => Err(error),
             }
-            bound_open_dir(parent, leaf)
         }
         Err(error) => Err(error),
     }
@@ -696,6 +716,7 @@ fn bound_stream_regular(
     let mut consumed = 0_u64;
     let result = (|| -> Result<u64> {
         reads.charge(0)?;
+        ensure_bound_directory(parent, Path::new("CAS parent"))?;
         use cap_primitives::fs as cap_fs;
         let name = bound_leaf(leaf, "object")?;
         let label = Path::new(leaf);
@@ -711,6 +732,7 @@ fn bound_stream_regular(
         cas_semantics::configure_bound_read(&mut options);
         let mut file = cap_fs::open(parent, name, &options)
             .map_err(|error| bound_io_or_not_found(error, leaf))?;
+        crate::private_fs::verify_private_regular_file_handle(&file)?;
         let opened = cap_fs::Metadata::from_file(&file).kio_io(label)?;
         let named = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
             .map_err(|error| bound_io_or_not_found(error, leaf))?;
@@ -754,6 +776,7 @@ fn bound_stream_regular(
             }
             consume(&buffer[..count])?;
         }
+        crate::private_fs::verify_private_regular_file_handle(&file)?;
         let finished = cap_fs::Metadata::from_file(&file).kio_io(label)?;
         let named = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
             .map_err(|error| bound_io_or_not_found(error, leaf))?;
@@ -954,11 +977,11 @@ fn bound_verify_content_accounted(
 }
 
 fn bound_create_temp(parent: &File) -> Result<(String, File)> {
-    bound_create_private_temp(parent, ".kio-cas", false, "bound CAS temp")
+    bound_create_private_temp(parent, ".kio-cas", "bound CAS temp")
 }
 
 fn bound_create_ingest_temp(parent: &File) -> Result<(String, File)> {
-    bound_create_private_temp(parent, ".ingest", true, "bound raw stage")
+    bound_create_private_temp(parent, ".ingest", "bound raw stage")
 }
 
 fn bound_remove(parent: &File, leaf: &str) -> Result<()> {
@@ -967,6 +990,7 @@ fn bound_remove(parent: &File, leaf: &str) -> Result<()> {
 }
 
 fn bound_open_regular_handle(parent: &File, leaf: &str) -> Result<File> {
+    ensure_bound_directory(parent, Path::new("CAS parent"))?;
     use cap_primitives::fs as cap_fs;
     let name = bound_leaf(leaf, "object")?;
     let before = cap_fs::stat(parent, name, cap_fs::FollowSymlinks::No)
@@ -992,11 +1016,13 @@ fn bound_open_regular_handle(parent: &File, leaf: &str) -> Result<File> {
     {
         return Err(non_regular_object_error(Path::new(leaf)));
     }
+    crate::private_fs::verify_private_regular_file_handle(&file)?;
     Ok(file)
 }
 
 fn bound_hash_open_regular(reads: &CasReadAccess, file: &mut File, max: u64) -> Result<String> {
     reads.charge(0)?;
+    crate::private_fs::verify_private_regular_file_handle(file)?;
     file.seek(std::io::SeekFrom::Start(0))
         .map_err(|error| KioError::io(error.to_string(), "bound CAS repair source"))?;
     let mut total = 0_u64;
@@ -1052,6 +1078,7 @@ fn bound_visit_chunks_with_limits(
     max_bytes: u64,
     visit: &mut impl FnMut(&str, &ChunkObject) -> Result<()>,
 ) -> Result<()> {
+    ensure_bound_directory(base, Path::new("CAS inventory base"))?;
     let mut entries = 0_usize;
     let mut total_bytes = 0_u64;
     let first_level = cap_primitives::fs::read_base_dir(base)
@@ -1129,6 +1156,7 @@ fn bound_visit_chunks_with_limits(
 fn bound_embedding_hashes(reads: &CasReadAccess, base: &File) -> Result<Vec<String>> {
     const MAX_ENTRIES: usize = 100_000;
     const MAX_BYTES: u64 = 512 * 1024 * 1024;
+    ensure_bound_directory(base, Path::new("CAS inventory base"))?;
     let mut hashes = Vec::new();
     let mut total_bytes = 0_u64;
     let first_level = cap_primitives::fs::read_base_dir(base)
@@ -1324,12 +1352,7 @@ pub(crate) fn bound_io_or_not_found(error: std::io::Error, leaf: &str) -> KioErr
     }
 }
 
-fn bound_create_private_temp(
-    parent: &File,
-    prefix: &str,
-    read_write: bool,
-    label: &str,
-) -> Result<(String, File)> {
+fn bound_create_private_temp(parent: &File, prefix: &str, label: &str) -> Result<(String, File)> {
     for attempt in 0..128_u32 {
         let name = format!(
             "{prefix}-{}-{}-{attempt}",
@@ -1339,24 +1362,24 @@ fn bound_create_private_temp(
                 .map_or(0, |duration| duration.as_nanos()),
         );
         let path = bound_leaf(&name, "temporary leaf")?;
-        let mut options = cap_primitives::fs::OpenOptions::new();
-        options
-            .write(true)
-            .read(read_write)
-            .create_new(true)
-            ._cap_fs_ext_follow(cap_primitives::fs::FollowSymlinks::No);
-        match cap_primitives::fs::open(parent, path, &options) {
+        let retained = crate::store_dir::StoreDirectory::from_retained(
+            parent.try_clone().kio_io(Path::new(label))?,
+            PathBuf::from(label),
+        )?;
+        crate::private_fs::verify_private_directory_handle(&retained)?;
+        match retained.create_private_file(path) {
             Ok(file) => {
-                let safe = cas_semantics::private_bound_temp_is_safe(&file, label)?;
-                if !safe {
-                    drop(file);
-                    let _ = bound_remove(parent, &name);
-                    return Err(non_regular_object_error(Path::new(label)));
-                }
+                crate::private_fs::verify_private_regular_file_handle(&file)?;
                 return Ok((name, file));
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(KioError::io(error.to_string(), label)),
+            Err(error)
+                if error.error_code() == "KIO-E-STORE-IO-001"
+                    && error.context().get("io_error_kind").and_then(Value::as_str)
+                        == Some("already_exists") =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
         }
     }
     Err(KioError::io(
@@ -1385,7 +1408,7 @@ fn read_verified_object_accounted(
     let mut consumed = 0_u64;
     let result = (|| -> Result<(u64, Vec<u8>)> {
         reads.charge(0)?;
-        let mut file = open_regular_nofollow(path)?;
+        let mut file = open_private_cas_file(path)?;
         let metadata = file.metadata().kio_io(path)?;
         let limit = kind.max_bytes();
         if metadata.len() > limit {
@@ -1448,7 +1471,7 @@ fn verify_content_object_path_accounted(
     let mut consumed = 0_u64;
     let result = (|| -> Result<u64> {
         reads.charge(0)?;
-        let mut file = open_regular_nofollow(path)?;
+        let mut file = open_private_cas_file(path)?;
         let metadata = file.metadata().kio_io(path)?;
         let limit = kind.max_bytes();
         if metadata.len() > limit {
@@ -1520,7 +1543,7 @@ fn copy_verified_object<W: Write>(
     writer: &mut W,
 ) -> Result<u64> {
     reads.charge(0)?;
-    let mut file = open_regular_nofollow(path)?;
+    let mut file = open_private_cas_file(path)?;
     let metadata = file.metadata().kio_io(path)?;
     let limit = kind.max_bytes();
     if metadata.len() > limit {
@@ -1564,7 +1587,7 @@ fn copy_verified_object<W: Write>(
 }
 
 fn verify_existing_bytes(path: &Path, expected_hash: &str, expected: &[u8]) -> Result<()> {
-    let mut file = open_regular_nofollow(path)?;
+    let mut file = open_private_cas_file(path)?;
     let metadata = file.metadata().kio_io(path)?;
     if metadata.len() != expected.len() as u64 {
         return Err(corrupt_object_error(
@@ -1610,36 +1633,82 @@ fn verify_existing_bytes(path: &Path, expected_hash: &str, expected: &[u8]) -> R
     Ok(())
 }
 
+fn verify_named_cas_directory(
+    directory: &crate::store_dir::StoreDirectory,
+    path: &Path,
+) -> Result<()> {
+    crate::private_fs::verify_private_directory_handle(directory)?;
+    let named = crate::platform::real_directory_identity(path).kio_io(path)?;
+    if named != crate::platform::directory_handle_identity(&directory.root_handle()) {
+        return Err(bound_stage_corrupt("CAS parent changed during publication"));
+    }
+    Ok(())
+}
+
+fn remove_private_temp(directory: &crate::store_dir::StoreDirectory, path: &Path) -> Result<()> {
+    let leaf = path
+        .file_name()
+        .and_then(|leaf| leaf.to_str())
+        .ok_or_else(|| KioError::invalid_usage("CAS temp has no UTF-8 leaf"))?;
+    // Publication temporarily has two names for this private staged inode.
+    // Removing its owned staging name is distinct from admitting a CAS leaf.
+    bound_remove(&directory.root_handle(), leaf)
+}
+
 fn publish_temp_object(
+    source: &crate::store_dir::StoreDirectory,
     temp_path: &Path,
     destination: &Path,
     expected_hash: &str,
     expected_len: u64,
     expected_bytes: Option<&[u8]>,
 ) -> Result<()> {
-    match fs::hard_link(temp_path, destination) {
-        Ok(()) => {
-            fs::remove_file(temp_path).kio_io(temp_path)?;
-            Ok(())
-        }
+    let source_path = temp_path
+        .parent()
+        .ok_or_else(|| KioError::invalid_usage("CAS temp has no parent"))?;
+    let destination_path = destination
+        .parent()
+        .ok_or_else(|| KioError::invalid_usage("CAS object has no parent"))?;
+    verify_named_cas_directory(source, source_path)?;
+    let target = crate::store_dir::StoreDirectory::open(destination_path)?;
+    crate::private_fs::verify_private_directory_handle(&target)?;
+    verify_named_cas_directory(source, source_path)?;
+    let temp_leaf = temp_path
+        .file_name()
+        .ok_or_else(|| KioError::invalid_usage("CAS temp has no leaf"))?;
+    let leaf = destination
+        .file_name()
+        .ok_or_else(|| KioError::invalid_usage("CAS object has no leaf"))?;
+    match cap_primitives::fs::hard_link(
+        &source.root_handle(),
+        Path::new(temp_leaf),
+        &target.root_handle(),
+        Path::new(leaf),
+    ) {
+        Ok(()) => remove_private_temp(source, temp_path)?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let result = match expected_bytes {
-                Some(bytes) => verify_existing_bytes(destination, expected_hash, bytes),
+            match expected_bytes {
+                Some(bytes) => verify_existing_bytes(destination, expected_hash, bytes)?,
                 None => verify_existing_matches_file(
                     destination,
                     temp_path,
                     expected_hash,
                     expected_len,
-                ),
-            };
-            let _ = fs::remove_file(temp_path);
-            result
+                )?,
+            }
+            remove_private_temp(source, temp_path)?;
         }
-        Err(error) => Err(KioError::io(
-            error.to_string(),
-            destination.display().to_string(),
-        )),
+        Err(error) => {
+            return Err(KioError::io(
+                error.to_string(),
+                destination.display().to_string(),
+            ));
+        }
     }
+    source.sync()?;
+    target.sync()?;
+    verify_named_cas_directory(source, source_path)?;
+    verify_named_cas_directory(&target, destination_path)
 }
 
 fn create_repair_quarantine(path: &Path, opened: &File) -> Result<PathBuf> {
@@ -1680,7 +1749,7 @@ fn verify_existing_matches_file(
     expected_hash: &str,
     expected_len: u64,
 ) -> Result<()> {
-    let mut existing = open_regular_nofollow(destination)?;
+    let mut existing = open_private_cas_file(destination)?;
     if existing.metadata().kio_io(destination)?.len() != expected_len {
         return Err(corrupt_object_error(
             destination,
@@ -1689,7 +1758,7 @@ fn verify_existing_matches_file(
             None,
         ));
     }
-    let mut source_file = open_regular_nofollow(source)?;
+    let mut source_file = open_private_cas_file(source)?;
     let mut existing_buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
     let mut source_buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
     loop {
@@ -1719,7 +1788,7 @@ fn read_embedding_path(
     path: &Path,
     expected_hash: &str,
 ) -> Result<EmbeddingObject> {
-    let bytes = read_bounded_regular_file_inner(path, MAX_EMBEDDING_OBJECT_BYTES, reads)?;
+    let bytes = read_bounded_regular_file_inner(path, MAX_EMBEDDING_OBJECT_BYTES, reads, true)?;
     decode_embedding(&bytes, expected_hash, path)
 }
 
@@ -1757,7 +1826,7 @@ fn read_chunk_path_accounted(
     let mut consumed = 0_u64;
     let result = (|| -> Result<(ChunkObject, Vec<u8>)> {
         reads.charge(0)?;
-        let mut file = open_regular_nofollow(path)?;
+        let mut file = open_private_cas_file(path)?;
         let metadata = file.metadata().kio_io(path)?;
         if metadata.len() > MAX_CHUNK_OBJECT_BYTES {
             return Err(chunk_size_error(metadata.len()));
@@ -1814,26 +1883,12 @@ fn decode_chunk(bytes: &[u8], expected_hash: &str, path: &Path) -> Result<ChunkO
     Ok(object)
 }
 
-fn create_private_temp(parent: &Path) -> Result<(PathBuf, File)> {
-    for attempt in 0..16_u8 {
-        let path = parent.join(format!(
-            ".tmp-{}-{}-{attempt}",
-            std::process::id(),
-            unix_nanos()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        cas_semantics::configure_private_temp(&mut options);
-        match options.open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
-        }
-    }
-    Err(KioError::io(
-        "could not allocate a unique CAS temporary file",
-        parent.display().to_string(),
-    ))
+fn create_private_temp(parent: &Path) -> Result<(PathBuf, File, crate::store_dir::StoreDirectory)> {
+    let directory = crate::store_dir::StoreDirectory::open(parent)?;
+    crate::private_fs::verify_private_directory_handle(&directory)?;
+    let (name, file) =
+        bound_create_private_temp(&directory.root_handle(), ".tmp", "CAS temporary parent")?;
+    Ok((parent.join(name), file, directory))
 }
 
 /// Require a real directory at `path`, optionally creating that one missing
@@ -1842,19 +1897,29 @@ fn create_private_temp(parent: &Path) -> Result<(PathBuf, File)> {
 pub fn ensure_real_directory(path: &Path, create: bool) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_dir() && !metadata.file_type().is_symlink() => {
-            Ok(())
+            let directory = crate::store_dir::StoreDirectory::open(path)?;
+            crate::private_fs::verify_private_directory_handle(&directory)
         }
         Ok(_) => Err(non_regular_object_error(path)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && create => {
-            match fs::create_dir(path) {
-                Ok(()) => Ok(()),
-                Err(create_error) if create_error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let parent = path
+                .parent()
+                .ok_or_else(|| KioError::invalid_usage("CAS directory has no parent"))?;
+            let leaf = path
+                .file_name()
+                .ok_or_else(|| KioError::invalid_usage("CAS directory has no leaf"))?;
+            let directory = crate::store_dir::StoreDirectory::open(parent)?;
+            crate::private_fs::verify_private_directory_handle(&directory)?;
+            match directory.create_directory(Path::new(leaf)) {
+                Ok(created) => ensure_bound_directory(&created, path),
+                Err(error)
+                    if error.error_code() == "KIO-E-STORE-IO-001"
+                        && error.context().get("io_error_kind").and_then(Value::as_str)
+                            == Some("already_exists") =>
+                {
                     ensure_real_directory(path, false)
                 }
-                Err(create_error) => Err(KioError::io(
-                    create_error.to_string(),
-                    path.display().to_string(),
-                )),
+                Err(error) => Err(error),
             }
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1862,6 +1927,19 @@ pub fn ensure_real_directory(path: &Path, create: bool) -> Result<()> {
         }
         Err(error) => Err(KioError::io(error.to_string(), path.display().to_string())),
     }
+}
+
+fn open_private_cas_file(path: &Path) -> Result<File> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| KioError::invalid_usage("CAS object has no parent"))?;
+    let leaf = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| KioError::invalid_usage("CAS object has no UTF-8 leaf"))?;
+    let directory = crate::store_dir::StoreDirectory::open(parent)?;
+    crate::private_fs::verify_private_directory_handle(&directory)?;
+    bound_open_regular_handle(&directory.root_handle(), leaf)
 }
 
 /// Open a real, single-link regular file without following its final symlink
@@ -2101,7 +2179,7 @@ pub fn fanout_path(base: impl AsRef<Path>, hash: &str) -> Result<PathBuf> {
 /// Read a non-CAS metadata record through the same no-follow/single-link boundary
 /// as CAS objects while enforcing a caller-selected byte limit.
 pub fn read_bounded_regular_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>> {
-    read_bounded_regular_file_inner(path, max_bytes, &CasReadAccess::Unmetered)
+    read_bounded_regular_file_inner(path, max_bytes, &CasReadAccess::Unmetered, false)
 }
 
 /// Shared implementation for bounded metadata records and bounded CAS content
@@ -2111,9 +2189,14 @@ fn read_bounded_regular_file_inner(
     path: &Path,
     max_bytes: u64,
     reads: &CasReadAccess,
+    private_cas: bool,
 ) -> Result<Vec<u8>> {
     reads.charge(0)?;
-    let mut file = open_regular_nofollow(path)?;
+    let mut file = if private_cas {
+        open_private_cas_file(path)?
+    } else {
+        open_regular_nofollow(path)?
+    };
     let metadata = file.metadata().kio_io(path)?;
     let initial_stability = observe_regular_file_stability(&metadata, path)?;
     if metadata.len() > max_bytes {
@@ -2157,6 +2240,9 @@ fn read_bounded_regular_file_inner(
     // Rebind it to the path only after the read, then reject a replacement or
     // in-place length change before returning any parsed metadata to a caller.
     validate_open_regular_nofollow(path, &file)?;
+    if private_cas {
+        crate::private_fs::verify_private_regular_file_handle(&file)?;
+    }
     let final_metadata = file.metadata().kio_io(path)?;
     let final_stability = observe_regular_file_stability(&final_metadata, path)?;
     if final_stability != initial_stability || final_metadata.len() != bytes.len() as u64 {
@@ -2186,25 +2272,53 @@ fn occupied_slot(path: PathBuf) -> Result<Option<PathBuf>> {
     }
 }
 
-pub(crate) fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
+/// Admit the owned log directory and any existing live leaf before rotation,
+/// locking, or append. Missing directories are created privately; existing
+/// unsafe directories and files are never restricted or adopted.
+pub(crate) fn private_log_parent(path: &Path) -> Result<crate::store_dir::StoreDirectory> {
     let parent = path
         .parent()
         .ok_or_else(|| KioError::io("path has no parent", path.display().to_string()))?;
-    fs::create_dir_all(parent).kio_io(parent)?;
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .kio_io(path)?;
-    // Serialize the whole record (line + newline) into one buffer and emit it in a
-    // single `write_all` on the O_APPEND handle. A multi-write sequence
-    // (`to_writer` then a separate newline write) can interleave byte-wise with a
-    // concurrent process's record even under O_APPEND, corrupting the JSONL
-    // (M1(b)). One `write_all` of the framed record is atomic per append.
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| KioError::io("path has no leaf", path.display().to_string()))?;
+    let directory = crate::store_dir::StoreDirectory::open_or_create_directories(parent)?;
+    crate::private_fs::verify_private_directory_handle(&directory)?;
+    if directory.contains_entry(Path::new(leaf))? {
+        directory.ensure_owner_private(Path::new(leaf))?;
+    }
+    Ok(directory)
+}
+
+#[cfg(test)]
+fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
+    let directory = private_log_parent(path)?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| KioError::io("path has no leaf", path.display().to_string()))?;
+    append_jsonl_at(&directory, Path::new(leaf), value)
+}
+
+pub(crate) fn append_jsonl_at(
+    directory: &crate::store_dir::StoreDirectory,
+    leaf: &Path,
+    value: &Value,
+) -> Result<()> {
+    let path = directory.path().join(leaf);
+    // Frame the whole record before one O_APPEND write, preserving existing
+    // serialization and avoiding a separate newline write between records.
     let mut line = serde_json::to_string(value)
         .map_err(|err| KioError::io(err.to_string(), path.display().to_string()))?;
     line.push('\n');
-    file.write_all(line.as_bytes()).kio_io(path)?;
+    directory.append_private(leaf, line.as_bytes())?;
+    let named =
+        crate::platform::real_directory_identity(directory.path()).kio_io(directory.path())?;
+    if named != crate::platform::directory_handle_identity(&directory.root_handle()) {
+        return Err(KioError::io(
+            "log parent changed during append",
+            path.display().to_string(),
+        ));
+    }
     Ok(())
 }
 
@@ -2232,11 +2346,318 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    #[test]
+    fn jsonl_append_creates_private_owned_logs_below_external_ancestors() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        #[cfg(unix)]
+        let external_before = {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::metadata(&root).unwrap().permissions().mode()
+        };
+        #[cfg(windows)]
+        let external_acl = || {
+            let output = std::process::Command::new("icacls.exe")
+                .arg(&root)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout
+        };
+        #[cfg(windows)]
+        let external_before = external_acl();
+        let log = root.join("device/kio/logs/events.jsonl");
+        append_jsonl(&log, &serde_json::json!({"event": 1})).unwrap();
+        append_jsonl(&log, &serde_json::json!({"event": 2})).unwrap();
+        for relative in ["device", "device/kio", "device/kio/logs"] {
+            crate::private_fs::verify_private_directory(&root.join(relative)).unwrap();
+        }
+        let bytes = crate::private_fs::read_private_file(&log, 1024).unwrap();
+        assert_eq!(bytes, b"{\"event\":1}\n{\"event\":2}\n");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&root).unwrap().permissions().mode(),
+                external_before
+            );
+        }
+        #[cfg(windows)]
+        assert_eq!(external_acl(), external_before);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn jsonl_append_accepts_platform_var_alias_but_refuses_owned_symlink() {
+        use std::os::unix::fs::symlink;
+        let fixture = tempfile::tempdir_in("/private/var/tmp").unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let alias = Path::new("/var").join(root.strip_prefix("/private/var").unwrap());
+        let log = alias.join("logs/events.jsonl");
+        append_jsonl(&log, &serde_json::json!({"platform_alias": true})).unwrap();
+        let opened = crate::store_dir::StoreDirectory::open(&alias.join("logs")).unwrap();
+        opened
+            .ensure_owner_private(Path::new("events.jsonl"))
+            .unwrap();
+        assert_eq!(
+            crate::private_fs::read_private_file(&root.join("logs/events.jsonl"), 1024).unwrap(),
+            b"{\"platform_alias\":true}\n"
+        );
+        symlink(root.join("logs"), root.join("linked-logs")).unwrap();
+        assert!(
+            append_jsonl(
+                &alias.join("linked-logs/other.jsonl"),
+                &serde_json::json!({})
+            )
+            .is_err()
+        );
+        assert!(!root.join("logs/other.jsonl").exists());
+    }
+
+    #[test]
+    fn jsonl_append_rejects_existing_unsafe_parent_without_adoption() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let parent = root.join("logs");
+        fs::create_dir(&parent).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("icacls.exe")
+                .arg(&parent)
+                .args(["/grant", "*S-1-1-0:(OI)(CI)F"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let identity = crate::platform::real_directory_identity(&parent).unwrap();
+        #[cfg(unix)]
+        let before = {
+            use std::os::unix::fs::PermissionsExt;
+            fs::metadata(&parent).unwrap().permissions().mode()
+        };
+        #[cfg(windows)]
+        let parent_acl = || {
+            std::process::Command::new("icacls.exe")
+                .arg(&parent)
+                .output()
+                .unwrap()
+                .stdout
+        };
+        #[cfg(windows)]
+        let before = parent_acl();
+        let log = parent.join("events.jsonl");
+        assert!(append_jsonl(&log, &serde_json::json!({"must": "fail"})).is_err());
+        assert!(!log.exists());
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 0);
+        assert_eq!(
+            crate::platform::real_directory_identity(&parent).unwrap(),
+            identity
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&parent).unwrap().permissions().mode(), before);
+        }
+        #[cfg(windows)]
+        assert_eq!(parent_acl(), before);
+        assert!(crate::private_fs::verify_private_directory(&parent).is_err());
+    }
+
+    #[test]
+    fn jsonl_append_rejects_existing_unsafe_leaf_without_adoption() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let external = crate::store_dir::StoreDirectory::open(&root).unwrap();
+        external.create_directory(Path::new("logs")).unwrap();
+        let log = root.join("logs/events.jsonl");
+        fs::write(&log, b"preserve unsafe record\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&log, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("icacls.exe")
+                .arg(&log)
+                .args(["/grant", "*S-1-1-0:F"])
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let before = fs::metadata(&log).unwrap();
+        let stability = observe_regular_file_stability(&before, &log).unwrap();
+        assert!(append_jsonl(&log, &serde_json::json!({"must": "fail"})).is_err());
+        assert_eq!(fs::read(&log).unwrap(), b"preserve unsafe record\n");
+        assert_eq!(
+            observe_regular_file_stability(&fs::metadata(&log).unwrap(), &log).unwrap(),
+            stability
+        );
+        assert!(crate::private_fs::read_private_file(&log, 1024).is_err());
+    }
+
+    fn make_cas_object_unsafe(path: &Path, directory: bool) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(
+                path,
+                fs::Permissions::from_mode(if directory { 0o755 } else { 0o644 }),
+            )
+            .unwrap();
+        }
+        #[cfg(windows)]
+        {
+            let grant = if directory {
+                "*S-1-1-0:(OI)(CI)F"
+            } else {
+                "*S-1-1-0:F"
+            };
+            assert!(
+                std::process::Command::new("icacls.exe")
+                    .arg(path)
+                    .args(["/grant", grant])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
+
+    #[test]
+    fn cas_writers_create_private_fanout_and_content() {
+        let (_fixture, store) = object_store();
+        let raw = store.write_raw(b"private raw creation").unwrap();
+        let prepared = store
+            .write_content_object(ContentObjectKind::Prepared, b"private prepared creation")
+            .unwrap();
+        for path in [
+            store.object_path(ObjectKind::Raw, &raw).unwrap(),
+            store
+                .content_path(ContentObjectKind::Prepared, &prepared)
+                .unwrap(),
+        ] {
+            crate::private_fs::read_private_file(&path, 1024).unwrap();
+            let mut parent = path.parent().unwrap();
+            loop {
+                crate::private_fs::verify_private_directory(parent).unwrap();
+                if parent == store.ambient_kio_dir().unwrap() {
+                    break;
+                }
+                parent = parent.parent().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn cas_rejects_unsafe_owned_leaf_for_bound_and_ambient_access() {
+        for bound in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().canonicalize().unwrap();
+            let repo = crate::scope::Repository::init(&root).unwrap();
+            let ambient = ObjectStore::new(repo.kio_dir());
+            let bytes = b"private CAS object";
+            let hash = ambient.write_raw(bytes).unwrap();
+            let path = ambient.object_path(ObjectKind::Raw, &hash).unwrap();
+            let store = if bound {
+                let kio = crate::store_dir::StoreDirectory::open(repo.kio_dir()).unwrap();
+                ObjectStore::from_bound_kio(&kio.root_handle()).unwrap()
+            } else {
+                ambient
+            };
+            make_cas_object_unsafe(&path, false);
+            let before =
+                observe_regular_file_stability(&fs::metadata(&path).unwrap(), &path).unwrap();
+            assert!(store.read_object(ObjectKind::Raw, &hash).is_err());
+            assert!(store.inspect_object(ObjectKind::Raw, &hash).is_err());
+            assert!(store.write_raw(bytes).is_err());
+            assert!(store.remove_raw(&hash).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                observe_regular_file_stability(&fs::metadata(&path).unwrap(), &path).unwrap(),
+                before
+            );
+            assert!(crate::private_fs::read_private_file(&path, 1024).is_err());
+        }
+    }
+
+    #[test]
+    fn cas_rejects_unsafe_owned_fanout_without_repair() {
+        for bound in [false, true] {
+            let fixture = tempfile::tempdir().unwrap();
+            let root = fixture.path().canonicalize().unwrap();
+            let repo = crate::scope::Repository::init(&root).unwrap();
+            let ambient = ObjectStore::new(repo.kio_dir());
+            let bytes = b"private content object";
+            let hash = ambient
+                .write_content_object(ContentObjectKind::Prepared, bytes)
+                .unwrap();
+            let path = ambient
+                .content_path(ContentObjectKind::Prepared, &hash)
+                .unwrap();
+            let parent = path.parent().unwrap();
+            let store = if bound {
+                let kio = crate::store_dir::StoreDirectory::open(repo.kio_dir()).unwrap();
+                ObjectStore::from_bound_kio(&kio.root_handle()).unwrap()
+            } else {
+                ambient
+            };
+            make_cas_object_unsafe(parent, true);
+            let identity = crate::platform::real_directory_identity(parent).unwrap();
+            let names = fs::read_dir(parent)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>();
+            assert!(
+                store
+                    .read_content_object_bytes(ContentObjectKind::Prepared, &hash, 1024)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .write_content_object(ContentObjectKind::Prepared, bytes)
+                    .is_err()
+            );
+            assert!(
+                store
+                    .remove_content(ContentObjectKind::Prepared, &hash)
+                    .is_err()
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                crate::platform::real_directory_identity(parent).unwrap(),
+                identity
+            );
+            assert_eq!(
+                fs::read_dir(parent)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .collect::<Vec<_>>(),
+                names
+            );
+            assert!(crate::private_fs::verify_private_directory(parent).is_err());
+        }
+    }
+
+    fn private_cas_fixture_file(path: &Path) -> File {
+        let directory = crate::store_dir::StoreDirectory::open(path.parent().unwrap()).unwrap();
+        directory
+            .create_private_file(Path::new(path.file_name().unwrap()))
+            .unwrap()
+    }
+
     fn object_store() -> (tempfile::TempDir, ObjectStore) {
         let dir = tempfile::tempdir().unwrap();
-        let kio_dir = dir.path().join(".kio");
-        fs::create_dir(&kio_dir).unwrap();
-        let store = ObjectStore::new(kio_dir);
+        let root = dir.path().canonicalize().unwrap();
+        let external = crate::store_dir::StoreDirectory::open(&root).unwrap();
+        external.create_directory(Path::new(".kio")).unwrap();
+        let store = ObjectStore::new(root.join(".kio"));
         (dir, store)
     }
 
@@ -2691,7 +3112,7 @@ mod tests {
             .ensure_object_parent(ObjectKind::Commit, &hash)
             .unwrap();
         let path = store.object_path(ObjectKind::Commit, &hash).unwrap();
-        let file = File::create(&path).unwrap();
+        let file = private_cas_fixture_file(&path);
         file.set_len(MAX_COMMIT_OBJECT_BYTES + 1).unwrap();
 
         let error = store.read_by_hash(&hash).unwrap_err();
@@ -2704,7 +3125,9 @@ mod tests {
         let hash = hash_bytes(b"expected");
         store.ensure_object_parent(ObjectKind::Raw, &hash).unwrap();
         let path = store.object_path(ObjectKind::Raw, &hash).unwrap();
-        fs::write(&path, b"different").unwrap();
+        private_cas_fixture_file(&path)
+            .write_all(b"different")
+            .unwrap();
 
         let error = store.inspect_by_hash(&hash).unwrap_err();
         assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
@@ -2836,7 +3259,10 @@ mod tests {
         let fixture = tempfile::tempdir().unwrap();
         let kio = fixture.path().join(".kio");
         for kind in ["raw", "trees", "commits"] {
-            fs::create_dir_all(kio.join("objects").join(kind)).unwrap();
+            crate::store_dir::StoreDirectory::open_or_create_directories(
+                &kio.join("objects").join(kind),
+            )
+            .unwrap();
         }
         let handle =
             cap_primitives::fs::open_ambient_dir(&kio, cap_primitives::ambient_authority())
@@ -2935,8 +3361,11 @@ mod tests {
         let image_path = store
             .content_path(ContentObjectKind::Image, &image_hash)
             .unwrap();
-        fs::create_dir_all(image_path.parent().unwrap()).unwrap();
-        fs::write(&image_path, image_bytes).unwrap();
+        crate::store_dir::StoreDirectory::open_or_create_directories(image_path.parent().unwrap())
+            .unwrap();
+        private_cas_fixture_file(&image_path)
+            .write_all(image_bytes)
+            .unwrap();
         assert_eq!(
             store
                 .inspect_content_object(ContentObjectKind::Image, &image_hash)
@@ -3019,8 +3448,9 @@ mod tests {
         let path = store
             .content_path(ContentObjectKind::Manifest, &hash)
             .unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        let file = fs::File::create(&path).unwrap();
+        crate::store_dir::StoreDirectory::open_or_create_directories(path.parent().unwrap())
+            .unwrap();
+        let file = private_cas_fixture_file(&path);
         file.set_len(MAX_MANIFEST_OBJECT_BYTES + 1).unwrap();
 
         let error = store
@@ -3160,8 +3590,9 @@ mod tests {
         let bytes = b"purge image content";
         let hash = hash_bytes(bytes);
         let path = store.content_path(ContentObjectKind::Image, &hash).unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, bytes).unwrap();
+        crate::store_dir::StoreDirectory::open_or_create_directories(path.parent().unwrap())
+            .unwrap();
+        private_cas_fixture_file(&path).write_all(bytes).unwrap();
         assert!(
             store
                 .remove_content(ContentObjectKind::Image, &hash)
@@ -3182,8 +3613,9 @@ mod tests {
         let bytes = b"hardlinked purge image";
         let hash = hash_bytes(bytes);
         let path = store.content_path(ContentObjectKind::Image, &hash).unwrap();
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, bytes).unwrap();
+        crate::store_dir::StoreDirectory::open_or_create_directories(path.parent().unwrap())
+            .unwrap();
+        private_cas_fixture_file(&path).write_all(bytes).unwrap();
         let outside = dir.path().join("outside-image-hardlink");
         fs::hard_link(&path, &outside).unwrap();
         assert_eq!(
@@ -3206,7 +3638,8 @@ mod tests {
         let kio = dir.path().join(".kio");
         let objects = kio.join("objects");
         for kind in ["raw", "trees", "commits"] {
-            fs::create_dir_all(objects.join(kind)).unwrap();
+            crate::store_dir::StoreDirectory::open_or_create_directories(&objects.join(kind))
+                .unwrap();
         }
         let kio_handle = File::open(&kio).unwrap();
         let store = ObjectStore::from_bound_kio(&kio_handle).unwrap();
@@ -3245,7 +3678,8 @@ mod tests {
         let kio = dir.path().join(".kio");
         let objects = kio.join("objects");
         for kind in ["raw", "trees", "commits"] {
-            fs::create_dir_all(objects.join(kind)).unwrap();
+            crate::store_dir::StoreDirectory::open_or_create_directories(&objects.join(kind))
+                .unwrap();
         }
         let kio_handle = File::open(&kio).unwrap();
         let store = ObjectStore::from_bound_kio(&kio_handle).unwrap();
@@ -3281,7 +3715,8 @@ mod tests {
         let kio = dir.path().join(".kio");
         let objects = kio.join("objects");
         for kind in ["raw", "trees", "commits"] {
-            fs::create_dir_all(objects.join(kind)).unwrap();
+            crate::store_dir::StoreDirectory::open_or_create_directories(&objects.join(kind))
+                .unwrap();
         }
         let plain = ObjectStore::new(&kio);
         let kinds = [

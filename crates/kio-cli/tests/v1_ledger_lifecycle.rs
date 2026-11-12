@@ -79,6 +79,7 @@ impl Fixture {
             .env("XDG_DATA_HOME", self.data_root())
             .env("XDG_CONFIG_HOME", self.home.join("config"))
             .env("XDG_CACHE_HOME", self.home.join("cache"))
+            .env("XDG_STATE_HOME", self.home.join("state"))
             .env("TMPDIR", self.home.join("tmp"))
             .env("TEMP", self.home.join("tmp"))
             .env("TMP", self.home.join("tmp"))
@@ -328,7 +329,7 @@ fn repeated_init_refuses_and_preserves_the_original_authority() {
 }
 
 #[test]
-fn partial_ledger_artifacts_refuse_status_and_search_without_resetting_state() {
+fn partial_ledger_artifacts_preserve_local_results_as_unknown_without_resetting_state() {
     let fixture = Fixture::new();
     fixture.initialize_scope_with_text();
     fixture.json_ok(&["ledger", "init"]);
@@ -341,28 +342,69 @@ fn partial_ledger_artifacts_refuse_status_and_search_without_resetting_state() {
         .join("cost-ledger.sqlite.checkpoint.json");
     fs::remove_file(&checkpoint).unwrap();
 
-    let status_error = fixture.json_error(&["ledger", "status"]);
-    let search_error = fixture.json_error(&["search", "needle", "--mode", "text"]);
+    for missing_database in [false, true] {
+        if missing_database {
+            fs::remove_file(fixture.ledger_path()).unwrap();
+        }
+        let before = ledger_artifacts(&fixture);
+        let artifact_times = || {
+            ledger_artifacts(&fixture)
+                .keys()
+                .map(|relative| {
+                    (
+                        relative.clone(),
+                        fs::symlink_metadata(fixture.ledger_dir().join(relative))
+                            .unwrap()
+                            .modified()
+                            .unwrap(),
+                    )
+                })
+                .collect::<BTreeMap<_, _>>()
+        };
+        let times_before = artifact_times();
 
-    assert_ne!(status_error["error_code"], "", "{status_error}");
-    assert_ne!(search_error["error_code"], "", "{search_error}");
-    assert!(
-        !checkpoint.exists(),
-        "observation must not recreate a checkpoint"
-    );
-    assert_eq!(fs::read(&authority_path).unwrap(), authority);
-    assert!(fixture.ledger_path().exists());
+        // Explicit billing status remains strict. Incomplete artifacts are
+        // unsafe authority, not the all-absent uninitialized state.
+        let error = fixture.json_error(&["ledger", "status"]);
+        assert_eq!(
+            error["error_code"], "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001",
+            "{error}"
+        );
+        assert_eq!(ledger_artifacts(&fixture), before);
+        assert_eq!(artifact_times(), times_before);
 
-    fs::remove_file(fixture.ledger_path()).unwrap();
-    let before_missing_db = ledger_artifacts(&fixture);
-    let status_error = fixture.json_error(&["ledger", "status"]);
-    let search_error = fixture.json_error(&["search", "needle", "--mode", "text"]);
-
-    assert_ne!(status_error["error_code"], "", "{status_error}");
-    assert_ne!(search_error["error_code"], "", "{search_error}");
-    assert!(!fixture.ledger_path().exists());
-    assert_eq!(fs::read(&authority_path).unwrap(), authority);
-    assert_eq!(ledger_artifacts(&fixture), before_missing_db);
+        // docs/04 §5.4: budget observation never blocks these local results,
+        // and unavailable billing never becomes zero or paid-send authority.
+        let status = fixture.json_ok(&["status"]);
+        assert!(!status["files"].as_array().unwrap().is_empty(), "{status}");
+        assert_eq!(status["budget"]["budget_status"], "unknown");
+        assert_eq!(
+            status["budget"]["budget_reason"],
+            "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001"
+        );
+        assert_eq!(status["budget"]["device_spent_usd"], Value::Null);
+        assert_eq!(status["budget"]["device_remaining_usd"], Value::Null);
+        let search = fixture.json_ok(&["search", "needle", "--mode", "text"]);
+        assert_eq!(search["resolved_mode"], "text");
+        assert!(
+            !search["results"].as_array().unwrap().is_empty(),
+            "{search}"
+        );
+        assert_eq!(search["index_status"]["budget_status"], "unknown");
+        assert_eq!(
+            search["index_status"]["budget_reason"],
+            "KIO-E-LEDGER-SNAPSHOT-UNSAFE-001"
+        );
+        assert_eq!(search["index_status"]["budget_paused"], Value::Null);
+        assert!(
+            !checkpoint.exists(),
+            "observation must not recreate a checkpoint"
+        );
+        assert_eq!(fs::read(&authority_path).unwrap(), authority);
+        assert_eq!(fixture.ledger_path().exists(), !missing_database);
+        assert_eq!(ledger_artifacts(&fixture), before);
+        assert_eq!(artifact_times(), times_before);
+    }
 }
 
 #[test]
@@ -382,10 +424,10 @@ fn ledger_lifecycle_bypasses_malformed_adapter_configuration() {
     assert_eq!(fixture.json_ok(&["ledger", "status"])["status"], "ready");
 }
 
-/// 04 §5.4: local documents and fresh queries reserve and settle exact zero
-/// in the physical ledger, even when paid budget caps are exhausted.
+/// APP-01 / 04 §5.4: local documents and fresh queries preserve initialized
+/// billing artifacts, including when the paid budget cap is zero.
 #[test]
-fn local_embedding_and_vector_search_record_zero_in_initialized_ledger() {
+fn free_embedding_and_vector_search_leave_initialized_ledger_unchanged() {
     let fixture = Fixture::new();
     fs::write(
         fixture.repo.join("note.md"),
@@ -403,6 +445,7 @@ fn local_embedding_and_vector_search_record_zero_in_initialized_ledger() {
         config_dir.join("config.toml"),
         "[budget]\nmonthly_usd_cap = 0.0\nhard_stop = true\n[budget.per_adapter]\nembedding = 0.0\n",
     ).unwrap();
+    let before = ledger_artifacts(&fixture);
     for args in [
         vec!["index", "--yes", "--offline"],
         vec![
@@ -432,41 +475,10 @@ fn local_embedding_and_vector_search_record_zero_in_initialized_ledger() {
                 "{result}"
             );
         }
-        let conn = support::immutable_sqlite(fixture.ledger_path());
-        let (documents, queries, invalid): (i64, i64, i64) = conn
-            .query_row(
-                "SELECT COALESCE(SUM(scope_id <> 'device'),0),
-                    COALESCE(SUM(scope_id = 'device'),0),
-                    COALESCE(SUM(state <> 2 OR request_kind <> 'sync'
-                        OR estimated_usd <> 0 OR batch_job_id IS NOT NULL),0)
-             FROM batch_requests WHERE adapter_kind='embedding'",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .unwrap();
-        assert!(
-            documents > 0,
-            "local documents need physical scoped intents"
-        );
         assert_eq!(
-            invalid, 0,
-            "local intents must settle at zero without a remote handle"
+            ledger_artifacts(&fixture),
+            before,
+            "APP-01 free execution must not mutate billing"
         );
-        assert_eq!(
-            queries,
-            i64::from(args[0] == "search"),
-            "only the fresh query creates a device-scope intent"
-        );
-        let (settled, invalid): (i64, i64) = conn.query_row(
-            "SELECT COUNT(*), COALESCE(SUM(usd <> 0 OR estimated <> 0 OR outcome <> 'succeeded'),0)
-             FROM cost_ledger WHERE adapter_kind='embedding'",
-            [], |row| Ok((row.get(0)?, row.get(1)?)),
-        ).unwrap();
-        assert_eq!(
-            settled,
-            documents + queries,
-            "every local intent needs one terminal record"
-        );
-        assert_eq!(invalid, 0, "local usage is confirmed zero, never estimated");
     }
 }

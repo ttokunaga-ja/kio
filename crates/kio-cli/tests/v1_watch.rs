@@ -237,19 +237,52 @@ fn read_output(mut pipe: impl Read) -> io::Result<Vec<u8>> {
 #[test]
 fn malformed_adapter_settings_cannot_prevent_watcher_status_or_stop() {
     let fixture = Fixture::new();
+    fs::write(
+        fixture.root.join("local-note.md"),
+        "# Watch control\n\nwatchlocalneedle\n",
+    )
+    .unwrap();
     let process = fixture.start("300");
     fixture.wait(|s| s["last_observation"]["last_success_ms"].is_number());
     let config = fixture.home.join("config/kio");
     fs::create_dir_all(&config).unwrap();
     fs::write(config.join("tools.toml"), "[invalid adapter configuration").unwrap();
 
+    let tools_before = fs::read(config.join("tools.toml")).unwrap();
+    let output = fixture.command(&["index", "--offline"]).output().unwrap();
     assert!(
-        !fixture
-            .command(&["index", "--offline"])
-            .output()
-            .unwrap()
-            .status
-            .success()
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let indexed: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert!(
+        matches!(indexed["status"].as_str(), Some("indexed" | "noop")),
+        "local index must complete: {indexed}"
+    );
+    let readiness = String::from_utf8_lossy(&output.stderr).to_ascii_lowercase();
+    assert!(
+        readiness.contains("adapter")
+            && readiness.contains("readiness: unavailable")
+            && readiness.contains("reason:"),
+        "local result needs separate Adapter readiness: {readiness}"
+    );
+    assert_eq!(fs::read(config.join("tools.toml")).unwrap(), tools_before);
+    assert!(!fixture.home.join("data/kio/cost-ledger.sqlite").exists());
+    assert!(!fixture.home.join("data/kio/ledger.lifecycle.lock").exists());
+    let search = fixture.ok(&["search", "watchlocalneedle", "--mode", "text"]);
+    assert_eq!(search["resolved_mode"], "text");
+    let hits = search["results"].as_array().unwrap();
+    assert!(!hits.is_empty(), "{search}");
+    assert!(
+        hits.iter().any(
+            |row| row["evidence_pointer"]["path_at_commit"] == "local-note.md"
+                && row["evidence_pointer"]["commit"]
+                    .as_str()
+                    .is_some_and(|commit| commit.starts_with("sha256:"))
+        ),
+        "local note must remain durably published: {search}"
     );
     assert_eq!(fixture.status()["status"], "running");
     assert_eq!(fixture.ok(&["watch", "stop"])["status"], "stop_requested");

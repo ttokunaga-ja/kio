@@ -20,6 +20,8 @@ fn assert_projection<T: Serialize>(payload: T, legacy: Value) {
 
 fn uninitialized_budget() -> BudgetStatusResponse {
     BudgetStatusResponse {
+        budget_status: "unknown".to_owned(),
+        budget_reason: Some("KIO-E-LEDGER-UNINITIALIZED-001".to_owned()),
         month: "2026-10".to_owned(),
         device_monthly_usd_cap: 20.0,
         folder_monthly_usd_cap: None,
@@ -38,7 +40,7 @@ fn uninitialized_budget() -> BudgetStatusResponse {
 }
 
 fn legacy_uninitialized_budget() -> Value {
-    json!({"month":"2026-10","device_monthly_usd_cap":20.0,"folder_monthly_usd_cap":null,
+    json!({"budget_status":"unknown","budget_reason":"KIO-E-LEDGER-UNINITIALIZED-001","month":"2026-10","device_monthly_usd_cap":20.0,"folder_monthly_usd_cap":null,
         "device_spent_usd":null,"folder_spent_usd":null,"device_remaining_usd":null,
         "folder_remaining_usd":null,"cap_kind":null,"device_per_adapter":{},"hard_stop":true,
         "warn_at_percent":80,"warned":false,"warning":null,"ledger_status":"uninitialized"})
@@ -119,13 +121,15 @@ fn status_budget_projection_preserves_initialized_caps_warning_and_omitted_ledge
         ),
     ] {
         let per_adapter = BTreeMap::from([("embedding".to_owned(), 3.0)]);
-        let legacy = json!({"month":"2026-10","device_monthly_usd_cap":20.0,
+        let legacy = json!({"budget_status":"known","budget_reason":null,"month":"2026-10","device_monthly_usd_cap":20.0,
             "folder_monthly_usd_cap":folder_cap,"device_spent_usd":18.0,"folder_spent_usd":4.0,
             "device_remaining_usd":2.0,"folder_remaining_usd":folder_remaining,"cap_kind":cap_kind,
             "device_per_adapter":per_adapter,"hard_stop":true,"warn_at_percent":80,
             "warned":warning.is_some(),"warning":warning});
         assert_projection(
             BudgetStatusResponse {
+                budget_status: "known".to_owned(),
+                budget_reason: None,
                 month: "2026-10".to_owned(),
                 device_monthly_usd_cap: 20.0,
                 folder_monthly_usd_cap: folder_cap,

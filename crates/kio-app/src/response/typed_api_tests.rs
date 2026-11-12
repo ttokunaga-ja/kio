@@ -26,6 +26,7 @@ fn c4_public_response_keeps_completion_outside_payload_wire_shape() {
                 repaired: vec![],
                 path: PathBuf::from("scope/日本語"),
                 kio_path: PathBuf::from("scope/日本語/.kio"),
+                independent: None,
             }),
             completion,
         };

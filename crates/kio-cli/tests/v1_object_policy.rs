@@ -21,6 +21,7 @@ fn command(dir: &TempDir, args: &[&str]) -> Command {
         .env("XDG_CONFIG_HOME", dir.path().join("config"))
         .env("XDG_DATA_HOME", dir.path().join("data"))
         .env("XDG_CACHE_HOME", dir.path().join("cache"))
+        .env("XDG_STATE_HOME", dir.path().join("state"))
         .arg("--json")
         .args(args);
     command
@@ -276,4 +277,71 @@ fn ancestor_ignore_denies_a_childs_direct_evidence_uri() {
     fs::write(root.path().join(".kioignore"), "child/\n").unwrap();
     let denied = command(&root, &["open", &uri]).output().unwrap();
     assert!(!denied.status.success());
+}
+
+/// docs/14: ordinary local commands create private scope and device storage,
+/// including CAS, task, source index, registry and search replica surfaces.
+#[test]
+fn local_commands_create_only_private_scope_and_device_storage() {
+    let dir = canonical_tempdir();
+    fs::write(
+        dir.path().join("doc.md"),
+        "# Private store\n\nlocal words\n",
+    )
+    .unwrap();
+    ok(&dir, &["init"]);
+    ok(&dir, &["index", "--offline"]);
+
+    ok(&dir, &["search", "private", "--mode", "text"]);
+    let mut pending = [".kio", "data/kio", "cache/kio", "config/kio", "state/kio"]
+        .into_iter()
+        .map(|name| dir.path().join(name))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    assert!(
+        pending.len() >= 3,
+        "fixture must exercise scope, registry and replica storage"
+    );
+    let mut unsafe_objects = Vec::new();
+    let mut file_count = 0;
+    while let Some(path) = pending.pop() {
+        let directory = kio_core::store_dir::StoreDirectory::open(&path).unwrap();
+        if let Err(error) = kio_core::private_fs::verify_private_directory_handle(&directory) {
+            unsafe_objects.push(format!(
+                "{}: {error}",
+                path.strip_prefix(dir.path()).unwrap().display()
+            ));
+        }
+        for entry in directory.entries(std::path::Path::new("")).unwrap() {
+            let child = path.join(&entry.name);
+            if entry.is_directory {
+                pending.push(child);
+            } else {
+                assert!(
+                    entry.is_regular_file,
+                    "unexpected owned object: {}",
+                    child.display()
+                );
+                file_count += 1;
+                if let Err(error) =
+                    directory.ensure_owner_private(std::path::Path::new(&entry.name))
+                {
+                    unsafe_objects.push(format!(
+                        "{}: {error}",
+                        child.strip_prefix(dir.path()).unwrap().display()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(file_count > 10, "fixture must exercise a populated store");
+    assert!(
+        unsafe_objects.is_empty(),
+        "unsafe Kio-created objects:\n{}",
+        unsafe_objects.join("\n")
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join("doc.md")).unwrap(),
+        "# Private store\n\nlocal words\n"
+    );
 }

@@ -45,6 +45,8 @@ pub enum CommandRequest {
 #[derive(Debug, Clone)]
 pub struct InitArgs {
     pub path: Option<PathBuf>,
+    pub independent: bool,
+    pub yes: bool,
 }
 
 #[derive(Debug, Clone)]

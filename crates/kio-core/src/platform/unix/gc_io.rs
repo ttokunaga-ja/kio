@@ -16,6 +16,7 @@ pub(crate) fn open_gc_tree_writable(
     options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let file =
         cap_fs::open(directory, Path::new(leaf), &options).map_err(|error| ioerr(error, leaf))?;
+    crate::private_fs::verify_private_regular_file_handle(&file)?;
     let metadata = cap_fs::Metadata::from_file(&file).map_err(|error| ioerr(error, leaf))?;
     valid_file(&metadata, MAX_TREE_OBJECT_BYTES)?;
     if id_meta(&metadata)? != expected.identity || metadata.len() != expected.state.len {
@@ -36,6 +37,7 @@ pub(crate) fn open_verified_file_handle(
     options._cap_fs_ext_follow(cap_fs::FollowSymlinks::No);
     let file =
         cap_fs::open(directory, Path::new(leaf), &options).map_err(|error| ioerr(error, leaf))?;
+    crate::private_fs::verify_private_regular_file_handle(&file)?;
     let metadata = cap_fs::Metadata::from_file(&file).map_err(|error| ioerr(error, leaf))?;
     valid_file(&metadata, max)?;
     if id_meta(&metadata)? != expected.identity || metadata.len() != expected.state.len {
@@ -102,9 +104,9 @@ pub(crate) fn publish_staged(
 }
 
 pub(crate) fn verify_retained_receipt_observation(
-    _file: &std::fs::File,
+    file: &std::fs::File,
     _leaf: &str,
     _expected: &FileObservation,
 ) -> Result<()> {
-    Ok(())
+    crate::private_fs::verify_private_regular_file_handle(file)
 }

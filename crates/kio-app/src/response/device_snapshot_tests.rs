@@ -38,6 +38,7 @@ fn init_projection_preserves_status_repair_list_and_native_paths() {
                 repaired,
                 path,
                 kio_path,
+                independent: None,
             },
             legacy,
         );

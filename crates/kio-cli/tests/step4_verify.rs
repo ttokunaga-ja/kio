@@ -3,12 +3,15 @@ mod support;
 use support::canonical_tempdir;
 
 use std::fs;
+use std::io::Write;
+use std::path::Path;
 
 use assert_cmd::Command;
 use kio_core::cas::{ContentObjectKind, ObjectKind, ObjectStore, canonical_json_bytes};
 use kio_core::dag::{CommitObject, CommitStats, CommitType, build_tree};
 use kio_core::gc::ShallowReceipt;
 use kio_core::purge::{PurgeReason, PurgeState, TombstoneMode};
+use kio_core::store_dir::StoreDirectory;
 use kio_index::aggregator::{AggIndexStatus, AggSelector, Aggregator};
 use serde_json::Value;
 use tempfile::TempDir;
@@ -79,12 +82,25 @@ fn write_purged_commit(dir: &TempDir, timestamp: &str, purged_raws: &[String]) -
         .0
 }
 
+// Fixture bytes may model corruption, but their Kio-owned storage is private.
+fn write_private_fixture_file(dir: &TempDir, path: &Path, bytes: &[u8]) {
+    let owned = StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+    let relative = path.strip_prefix(owned.path()).unwrap();
+    let parent = relative.parent().unwrap();
+    let retained = owned.create_directory_all(parent).unwrap();
+    let parent = StoreDirectory::from_retained(retained, owned.path().join(parent)).unwrap();
+    let mut file = parent
+        .create_private_file(Path::new(relative.file_name().unwrap()))
+        .unwrap();
+    file.write_all(bytes).unwrap();
+}
+
 fn tag_commit(dir: &TempDir, name: &str, commit_hash: &str) {
     let tag = dir
         .path()
         .join(".kio/refs/tags-v1")
         .join(kio_core::portable::portable_tag_leaf(name));
-    fs::write(tag, commit_hash).unwrap();
+    write_private_fixture_file(dir, &tag, commit_hash.as_bytes());
 }
 
 fn write_receipt(
@@ -100,10 +116,10 @@ fn write_receipt(
         .join(&digest[0..2])
         .join(&digest[2..4])
         .join(digest);
-    fs::create_dir_all(receipt.parent().unwrap()).unwrap();
-    fs::write(
+    write_private_fixture_file(
+        dir,
         &receipt,
-        serde_json::to_vec(&serde_json::json!({
+        &serde_json::to_vec(&serde_json::json!({
             "schema_version": 2,
             "raw_hash": raw_hash,
             "events": [{
@@ -117,13 +133,7 @@ fn write_receipt(
             }],
         }))
         .unwrap(),
-    )
-    .unwrap();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600)).unwrap();
-    }
+    );
     receipt
 }
 
@@ -140,10 +150,10 @@ fn write_tombstone(
         .join(&digest[0..2])
         .join(&digest[2..4])
         .join(digest);
-    fs::create_dir_all(path.parent().unwrap()).unwrap();
-    fs::write(
+    write_private_fixture_file(
+        dir,
         &path,
-        serde_json::to_vec(&serde_json::json!({
+        &serde_json::to_vec(&serde_json::json!({
             "raw_hash": raw_hash,
             "events": [{
                 "kind": "purged",
@@ -156,8 +166,7 @@ fn write_tombstone(
             }],
         }))
         .unwrap(),
-    )
-    .unwrap();
+    );
     path
 }
 
@@ -348,14 +357,13 @@ fn ct4_verify_genuine_shallow_commit_uses_durable_chunk_cas() {
         .path()
         .join(".kio/gc/shallowed")
         .join(commit_hash.strip_prefix("sha256:").unwrap());
-    fs::create_dir_all(receipt_path.parent().unwrap()).unwrap();
     let receipt = ShallowReceipt::new(
         commit_hash.to_owned(),
         commit.tree.clone(),
         "2026-08-14T00:00:00Z".into(),
     )
     .unwrap();
-    fs::write(receipt_path, receipt.canonical_bytes().unwrap()).unwrap();
+    write_private_fixture_file(&dir, &receipt_path, &receipt.canonical_bytes().unwrap());
     let store = ObjectStore::new(dir.path().join(".kio"));
     fs::remove_file(store.object_path(ObjectKind::Tree, &commit.tree).unwrap()).unwrap();
     let pointer = serde_json::to_string(&pointer).unwrap();

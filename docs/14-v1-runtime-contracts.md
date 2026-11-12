@@ -16,14 +16,29 @@ is tracked in [the implementation record](../tasks/v1-implementation-progress.md
 | Central billing intents, reservations and results | Non-rebuildable operational truth | Authority-bound, create-only backup and explicit reconciliation; absence must not authorize a fresh paid submission |
 | Device configuration and local Adapter trust | Device-specific execution authority | Explicit device enrollment; never import trust from a scope |
 
+### Operation-specific prerequisites
+
+A command validates only the configuration and authority it actually consumes.
+Local status, text search, init, export, restore and local indexing must remain
+usable when an unused Adapter configuration or managed CA is missing, pending,
+invalid or unsafe. An invalid selected dependency is reported for that operation;
+Kio never repairs it or silently substitutes another configured destination.
+Adapter readiness and its reason are reported separately from local results.
+Credential-file protection is checked before credentials are consumed. Managed
+CA acquisition and validation happen only for a selected HTTPS send, retaining
+the trust lock through dispatch as specified below; HTTP and native work do not
+read the CA as a startup prerequisite. Configuration required for local policy,
+content integrity and code execution remains mandatory.
+
 ### Device billing lifecycle
 
 Billing is operational information, not knowledge reconstructed from a folder.
-`ledger init` explicitly creates the central device ledger. As an explicit device setup step,
-`kio model install` also initializes a missing ledger exactly as `ledger init` does. Scope initialization,
-offline indexing and text search do not initialize it. Before initialization,
+`ledger init` explicitly creates the central device ledger. Model install/import,
+scope initialization, offline indexing and text search do not initialize it.
+Model preparation does not inspect or repair billing state. Before initialization,
 budget observations are unknown; absence is never evidence of zero spending or
-permission to submit paid work. `ledger status` reads a private snapshot without
+permission to submit paid work. Free local execution and unavailable budget
+observations follow [04 §5.4](04-pipeline.md#54-cost-guardrail--kill-switch). `ledger status` reads a private snapshot without
 opening the source SQLite database for writing.
 
 An initialized ledger consists of `cost-ledger.sqlite`, its normal SQLite WAL
@@ -40,7 +55,8 @@ connection it uses, performs its SQL transaction, and durably publishes the next
 checkpoint before COMMIT. Failure between checkpoint publication and COMMIT
 leaves a mismatch that blocks subsequent paid work. A stale backup therefore
 cannot silently become a new accounting baseline. Retained directory/file
-handles, owner-private storage and no-follow checks reject unsafe substitutions;
+handles, storage protected under [the Kio-created-object contract](#protection-of-kio-created-objects)
+and no-follow checks reject unsafe substitutions;
 this is not protection from an adversary already controlling the same OS account.
 
 Initialization publishes an explicit pending record before the database. An
@@ -52,7 +68,13 @@ by `ledger init`.
 `ledger backup` captures a WAL-safe SQLite image while holding the lifecycle
 lock, binds it to the authority and checkpoint, records a private exact-proof
 for that generation, and publishes the requested owner-private backup directory
-create-only. `ledger restore` loads that artifact but can recreate only a
+create-only. Snapshot and backup use bounded streaming or SQLite online-backup
+steps under the same lifecycle/identity validation, rather than refusing solely
+at the old fixed database/copy byte limits. A copy is never accepted until its
+complete database, WAL-consistent image, authority and checkpoint are verified.
+Source bytes and permissions remain unchanged; partial backups are not published
+as complete. Resource exhaustion is reported separately from corruption, and
+neither case permits a fresh paid submission. `ledger restore` loads that artifact but can recreate only a
 missing database. Before it publishes either a restore journal or a database,
 the surviving private authority, checkpoint, and backup proof must all bind the
 same exact image. An existing database, a stale generation, a changed backup,
@@ -158,17 +180,29 @@ intent that binds typed physical owner, target, parent-chain, and source-file
 identities using the lossless hexadecimal string encoding above.
 Recovery acts only when those identities and exact bytes still match; otherwise
 it fails closed. On Windows, foreign-owner working-file removal is refused before
-any ACL or name mutation; a current-owner private DACL is validated through its
-retained handle. A working-tree restore names the `.kio` owner permitted to
+any name mutation; removal must not rewrite the ACL of an existing user file.
+A working-tree restore names the `.kio` owner permitted to
 recover its residue. Read-only inspection never creates, locks, or cleans this
 workspace.
 
 An explicit CLI root bootstrap is serialized by `.root-init-journal.json` and a
 permanent `.root-init-gate`. Normal management remains blocked until the exact
-record is verified. Only an empty pre-marker new root may retry. Admission
-authenticates only the immediate parent and holds that parent's lease; it refuses
-to recreate an independent root for the same child when a lost `.kio` remains
-parent-enrolled, while a valid existing Child is idempotent. Existing unknown,
+record is verified. Only an empty pre-marker new root may retry. Default admission authenticates only the immediate parent and holds that parent's
+lease; a valid existing Child remains idempotent. For a new root with no existing
+child store, explicit `init --independent` previews the observed parent relationship,
+including an unreadable/inconsistent parent or uncertain enrollment, and requires
+confirmation before creating an independent boundary. In this new-root operation,
+Kio neither changes nor adopts the parent: it takes no parent mutation authority,
+retires no parent enrollment, and preserves all parent bytes and history. An
+uncertain parent relationship is displayed as uncertainty, not repaired or inferred.
+Normal discovery must respect the confirmed independent boundary and not re-adopt it.
+Detaching an existing valid Child is a separate operation: it requires authenticated
+parent enrollment, the parent's lease and the root registration protocol; it retires
+only that exact enrollment and journals the independent identity. Recovering a lost
+child store likewise requires exact authenticated enrollment before any parent
+change; an unreadable/inconsistent parent or ambiguous enrollment refuses this
+parent-changing detach/recovery and calls for explicit repair. No parent or child
+user data is deleted. Existing unknown,
 old-format, or unmanaged non-empty stores are refused unchanged. The retained
 scope root may contain only the fixed exact transient `.kio-case-probe`; it may
 be resumed, while differing probe residue fails closed. The core unmanaged
@@ -177,24 +211,53 @@ but have no shipped CLI, app, or eval production caller and the core crate is
 not published; this is a low-level storage/testing concern, not an unimplemented
 CLI route.
 
-### Controlled managed roots
+### Protection of Kio-created objects
 
-This current-revision contract remains under validation. Binding, capture, and
-recheck require a managed root and its ancestors to be controlled by the current
-user or a trusted OS administrator under the creation-parent policy. Every
-command, including read-only status, search, and preview, refuses an unsafe
-existing managed root with `KIO-E-MANAGEMENT-ROOT-UNSAFE-001` / exit 4 before
-mutation. Read sharing such as Unix `0755` is permitted; write, delete, or ACL
-mutation by another OS principal is not. Kio never automatically chmods,
-re-owners, or repairs an existing root. `.kio` remains exact current-owner
-private, which is stricter than this shared-read root boundary.
+Kio creates its own storage with owner-only protection and verifies those
+objects whenever it opens them. This contract applies equally on macOS, Linux
+and Windows: scope `.kio` directories and their contents; private credential and
+trust files; device ledger artifacts (including coordination, authority,
+checkpoint, proof and backup artifacts); device data, cache and state roots and
+Kio-created children; and temporary files and directories Kio creates, including
+renderer scratch and query caches. The owner must be the current user. Unix
+modes are owner-only (directories `0700`, private files `0600`); extended ACLs
+must not defeat that protection. Windows objects have a protected owner-only
+DACL. For a confined renderer on Windows, Kio may additionally grant the
+fresh invocation's bound AppContainer SID access only to that invocation's
+scratch objects, for the renderer's lifetime. This does not grant access to
+another user, an unrelated invocation, or other Kio storage. Kio verifies the
+current owner, protected DACL and exact invocation SID before using such an
+object; unknown principals and identity replacements are refused. The renderer
+keeps its network and unrelated-file isolation, and invocation authority is
+retired when the renderer finishes or recovery takes ownership.
+Foreign write, delete or permission-changing access is refused; trusted
+OS administrator authority does not make a foreign-owned Kio object acceptable.
 
-On Windows, `NtCreateFile` creates a new private object with the current owner
-and a protected DACL; existing objects are never adopted. A working-file removal
-keeps its verified handle through move and DACL handling, while read sharing
-blocks a new writer or deleter. Unix does not claim inode-CAS protection against
-a hostile same-account filesystem writer. v1 multi-user ACL mode is outside this
-contract; it does not promise a future local-OS-folder model.
+Kio does not judge the owner, ACL or mode of ancestors it did not create,
+including filesystem/drive roots, profile and AppData directories, `/tmp`, and
+user folders above a scope. A user-selected scope root is the user's folder:
+Kio neither requires nor changes its ACL or mode. Its `.kio` remains private.
+An unrelated tool granting access to an ancestor, or the default permissions of
+a secondary drive, must not by itself prevent Kio from using its own storage.
+Kio never repairs permissions or ownership of objects it did not create, and
+never adopts an unsafe existing object by silently tightening its permissions.
+
+Every command, including read-only status, search and preview, refuses a
+Kio-created object with a foreign owner or unsafe access, a symlink/reparse point
+where its own directory or file is expected, or a detected identity replacement,
+before using it. Scope-root binding, capture and recheck retain the same tree;
+path-swap protection uses retained handles, no-follow opens and identity
+rechecks. A detected replacement stops the operation; Kio never follows the
+replaced path into another tree. Accepting writable ancestors does not promise
+availability against deletion/replacement by someone with access to them, or
+protection against an adversary controlling the same OS account. v1 multi-user
+ACL mode is outside this contract.
+
+The CLI mapping for an unsafe managed store is defined in
+[the CLI specification](06-cli-spec.md#kio-created-object-protection).
+This storage contract does not relax executable trust checks for a scheduled
+service or external renderer; see [watch reconciliation](#watching-defaults)
+and [the Adapter specification](07-adapter-spec.md).
 
 ## Current policy
 
@@ -361,9 +424,18 @@ not a PID. A saved status includes its observation time and is not liveness proo
 Each pass reloads current device settings and validates the retained registered
 root before invoking the same local index operation used manually. No network or
 secret grants are created. The watch path is offline: it performs no provider-job
-polling, download, or cleanup, and it does not use an HTTP Adapter. User-service
+polling, download, or cleanup, and loopback use follows [07 §3](07-adapter-spec.md#3-ネットワーク送信原則と-opt-in-正本). User-service
 registration and lifecycle behavior are implemented as specified there; native
 scheduler lifecycle acceptance remains a separate gate on each OS.
+
+A scheduled service must execute a trusted, non-foreign-writable executable.
+Its installation path must also prevent an untrusted principal from replacing
+that executable through a writable ancestor. Registration and execution refuse
+an unsafe executable or installation path without repairing it. This separate
+persistence/code-execution boundary applies on every OS, even if Kio did not
+create the executable; it imposes no ACL requirement on scope or device-storage
+ancestors. Service manifests, definitions, locks and queue/state files follow
+[the Kio-created-object contract](#protection-of-kio-created-objects).
 
 All generated `.kio` paths, including HEAD, manifest, lock and task files, are
 suppressed as self-events. Management, policy, settings and consent paths still
@@ -383,42 +455,31 @@ does not establish content identity: reconciliation hashes the relevant bytes.
 
 ## Local Adapter and renderer boundaries
 
-Adapter approval is paired authority: `adapter approve`, `revoke`, and `status`
-coordinate the current scope's approval references with device-local grant
-records. A send requires both active records and an exact current binding; a
-scope row or device record alone cannot authorize it. Bindings cover the managed
-scope/membership, execution identity and profile, destination, credential
-binding, trust binding, and operation. Secret transmission, when selected, has
-its own paired grant. Approval publishes resumable pending records across the
-two stores; revocation removes the scope-side active or pending reference and
-revokes matching device grants, so a later approval must establish fresh paired
-authority. `status` reports the records and their effective current match. See
-[the CLI specification](06-cli-spec.md) for command syntax and confirmation
-rules.
-
-Local Adapter windows (Embedding, Markdownize OCR and Rerank) allow HTTP or HTTPS
-loopback with an explicit port. URL rules, paired grants and secret holds follow
-[07-adapter-spec.md §3.1](07-adapter-spec.md). Approval and status identify an HTTP
-peer as unauthenticated. For HTTPS, the CA is a device-local managed snapshot
+Network approval, exact destination binding, lifetime and revocation are defined
+once in [07 §3](07-adapter-spec.md#3-ネットワーク送信原則と-opt-in-正本): external
+sends use paired scope/device authority, while loopback uses device endpoint
+approval. Secret-send authority stays separate. CLI confirmation and status
+forms are defined in [06](06-cli-spec.md). Local Embedding, Markdownize OCR and
+Rerank permit the HTTP/HTTPS endpoints defined there; HTTP status is explicitly
+unauthenticated. For HTTPS, the CA is a device-local managed snapshot
 registered through the Adapter trust lifecycle. The active record carries a
 generation, digest and snapshot identity, never a user-configured source path or
 certificate bytes. The retired `adapter.policy.offline_api.ca_pem_path` setting
 is rejected. Trust registration, rotation, revocation and status are device-local
 operations that do not read a scope. Registration/resume creates a managed
 snapshot, rotation advances the generation and revocation leaves a durable
-tombstone; registration cannot silently replace an active CA. HTTPS admission
+tombstone; registration cannot silently replace an active CA. Managed trust
+records, snapshots and locks follow [the Kio-created-object contract](#protection-of-kio-created-objects).
+HTTPS admission
 acquires the active managed CA and retains the trust-store lock through dispatch,
 so rotation or revocation cannot race an admitted send. Only the managed active
 root is trusted; proxies and redirects are disabled. Certificate validity and
 name verification finish before a body is sent. Authentication errors are
 permanent; connection refusal remains a transport error.
 
-`--offline` blocks every HTTP dispatch for that invocation, including an
-authenticated local Adapter. It does not turn a local endpoint into a
-non-network execution route. Offline behavior and the command-specific flag
-forms are defined in [the Adapter specification](07-adapter-spec.md) and [the
-CLI specification](06-cli-spec.md).
+Offline invocation and watch obey [07 §3](07-adapter-spec.md#3-ネットワーク送信原則と-opt-in-正本).
 
+Renderer scratch follows [the Kio-created-object contract](#protection-of-kio-created-objects).
 Renderer execution uses an explicit environment, private scratch space,
 deadline and process-tree cleanup. OS confinement denies unnecessary network
 access and unrelated private files. Missing confinement is a refusal, not an
@@ -452,8 +513,10 @@ invented current profile.
 The macOS Office invocation creates its own bounded service catalog without the
 native MacSpellChecker component. That component initializes AppKit during
 headless Writer startup and caused a confined conversion to abort. The filter
-must match exactly one expected standalone component and preserve the remaining
-catalog bytes. It neither edits the installed application nor loads the user's
+removes the component only when exactly one structurally valid standalone match
+is present, preserving the remaining catalog bytes. A distribution without that
+component may use its unmodified private catalog if the confined capability probe
+succeeds; malformed or ambiguous catalogs remain a refusal. It neither edits the installed application nor loads the user's
 LibreOffice profile. Its source identity is rechecked before each invocation.
 
 The native Windows/Linux/macOS lanes must execute the real renderer and local

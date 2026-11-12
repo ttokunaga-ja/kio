@@ -108,9 +108,7 @@ pub(crate) fn resolve_inherited_private_root(
         return Ok(None);
     };
     let root = duplicate_inherited_private_root(fd, path)?;
-    // SAFETY: geteuid has no arguments and no memory-safety preconditions.
-    let uid = unsafe { libc::geteuid() };
-    verify_private_parent(&root, uid, path)?;
+    verify_directory(&root, path)?;
     let logical = PathBuf::from(format!("/dev/fd/{fd}"));
     Ok(Some((
         StoreDirectory::from_retained_with_control(root, logical, control)?,
@@ -123,6 +121,47 @@ pub(crate) fn verify_private_directory_handle(directory: &StoreDirectory) -> Res
     let uid = unsafe { libc::geteuid() };
     let handle = directory.root_handle();
     verify_private_parent(&handle, uid, directory.path())
+}
+
+/// The caller has identified this complete path as external ancestry. Resolve
+/// it once, compare the followed name with a strict open of the canonical
+/// directory, and retain that handle for all private-child operations.
+pub(crate) fn retain_external_directory(
+    path: &Path,
+    control: crate::control::ControlHandle,
+) -> Result<StoreDirectory> {
+    if let Some((root, suffix)) = resolve_inherited_private_root(path, control.clone())? {
+        if !suffix.is_empty() {
+            return Err(unsafe_file(
+                "external descriptor root must have no owned suffix",
+                Some(path),
+            ));
+        }
+        return Ok(root);
+    }
+    // The filesystem root is itself a valid external boundary. Other paths
+    // still require ordinary absolute components.
+    if path != Path::new("/") {
+        path_components(path)?;
+    }
+    let followed = File::open(path)
+        .map_err(|_| unsafe_file("cannot retain external directory", Some(path)))?;
+    verify_directory(&followed, path)?;
+    let canonical = path
+        .canonicalize()
+        .map_err(|_| unsafe_file("cannot resolve external directory", Some(path)))?;
+    let physical = crate::platform::store::open(&canonical).map_err(|_| {
+        unsafe_file(
+            "external directory has an unsafe canonical path",
+            Some(path),
+        )
+    })?;
+    let first = metadata(&followed, path)?;
+    let second = metadata(&physical, path)?;
+    if first.dev() != second.dev() || first.ino() != second.ino() {
+        return Err(raced_file(path));
+    }
+    StoreDirectory::from_retained_with_control(followed, path.to_path_buf(), control)
 }
 
 pub(crate) fn verify_private_directory(
@@ -141,18 +180,14 @@ pub(crate) fn verify_private_directory(
             Some(path),
         )
     })?;
-    verify_ancestor(&root, uid, path)?;
     let mut directory = root;
-    for (index, component) in components.iter().enumerate() {
+    for component in &components {
         let next = cap_fs::open_dir_nofollow(&directory, Path::new(component)).map_err(|_| {
             unsafe_file(
                 "private directory has a missing, symlinked, or unsafe component",
                 Some(path),
             )
         })?;
-        if index + 1 < components.len() {
-            verify_ancestor(&next, uid, path)?;
-        }
         directory = next;
     }
     verify_private_parent(&directory, uid, path)?;
@@ -167,15 +202,12 @@ pub(crate) fn verify_private_creation_parent(
         return inherited_private_directory(root, &suffix, path, true);
     }
     let components = path_components(path)?;
-    // SAFETY: geteuid has no arguments and no memory-safety preconditions.
-    let uid = unsafe { libc::geteuid() };
     let root = cap_fs::open_ambient_dir(Path::new("/"), ambient_authority()).map_err(|_| {
         unsafe_file(
             "cannot open filesystem root for private directory creation",
             Some(path),
         )
     })?;
-    verify_ancestor(&root, uid, path)?;
     let mut directory = root;
     for component in &components {
         let next = cap_fs::open_dir_nofollow(&directory, Path::new(component)).map_err(|_| {
@@ -184,13 +216,9 @@ pub(crate) fn verify_private_creation_parent(
                 Some(path),
             )
         })?;
-        // The final creation parent intentionally follows the ancestor
-        // policy: it may be owner-readable (for example 0755), but never
-        // writable by another principal.
-        verify_ancestor(&next, uid, path)?;
         directory = next;
     }
-    verify_creation_parent(&directory, uid, path)?;
+    verify_directory(&directory, path)?;
     StoreDirectory::from_retained_with_control(directory, path.to_path_buf(), control)
 }
 
@@ -211,7 +239,6 @@ pub(crate) fn read_private_file(
             Some(path),
         )
     })?;
-    verify_ancestor(&root, uid, path)?;
 
     let mut parent = root;
     for component in &components[..components.len() - 1] {
@@ -221,10 +248,8 @@ pub(crate) fn read_private_file(
                 Some(path),
             )
         })?;
-        verify_ancestor(&next, uid, path)?;
         parent = next;
     }
-    verify_private_parent(&parent, uid, path)?;
     read_leaf(
         &parent,
         components.last().expect("nonempty components"),
@@ -234,16 +259,16 @@ pub(crate) fn read_private_file(
     )
 }
 
-pub(crate) fn read_private_file_at(
+pub(crate) fn read_private_file_at_path(
     parent: &StoreDirectory,
-    name: &str,
+    name: &Path,
     max_bytes: u64,
 ) -> Result<Vec<u8>> {
     let leaf = direct_leaf(name, parent.path())?;
     // SAFETY: geteuid has no arguments and no memory-safety preconditions.
     let uid = unsafe { libc::geteuid() };
     let handle = parent.root_handle();
-    verify_private_parent(&handle, uid, parent.path())?;
+    verify_directory(&handle, parent.path())?;
     let label = parent.path().join(leaf);
     read_leaf(&handle, leaf, &label, max_bytes, uid)
 }
@@ -264,11 +289,10 @@ fn inherited_private_directory(
                 Some(path),
             )
         })?;
-        verify_ancestor(&next, uid, path)?;
         directory = std::sync::Arc::new(next);
     }
     if creation_parent {
-        verify_creation_parent(&directory, uid, path)?;
+        verify_directory(&directory, path)?;
     } else {
         verify_private_parent(&directory, uid, path)?;
     }
@@ -296,16 +320,13 @@ fn read_inherited_private_file(
                 Some(path),
             )
         })?;
-        verify_ancestor(&next, uid, path)?;
         parent = std::sync::Arc::new(next);
     }
-    verify_private_parent(&parent, uid, path)?;
     read_leaf(&parent, leaf, path, max_bytes, uid)
 }
 
-fn direct_leaf<'a>(name: &'a str, label: &Path) -> Result<&'a std::ffi::OsStr> {
-    let path = Path::new(name);
-    let mut components = path.components();
+fn direct_leaf<'a>(name: &'a Path, label: &Path) -> Result<&'a std::ffi::OsStr> {
+    let mut components = name.components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(leaf)), None) => Ok(leaf),
         _ => Err(unsafe_file(
@@ -320,26 +341,13 @@ fn metadata(file: &File, path: &Path) -> Result<std::fs::Metadata> {
         .map_err(|_| unsafe_file("cannot inspect private trust file component", Some(path)))
 }
 
-fn verify_ancestor(file: &File, uid: u32, path: &Path) -> Result<()> {
-    let meta = metadata(file, path)?;
-    if !meta.is_dir() {
+fn verify_directory(file: &File, path: &Path) -> Result<()> {
+    if !metadata(file, path)?.is_dir() {
         return Err(unsafe_file(
-            "private trust file ancestor is not a directory",
+            "private path component is not a directory",
             Some(path),
         ));
     }
-    let mode = meta.mode();
-    let owner_trusted = meta.uid() == uid || meta.uid() == 0;
-    let writable_by_others = mode & 0o022 != 0;
-    let root_owned_sticky = meta.uid() == 0 && mode & 0o1000 != 0;
-    if !owner_trusted || (writable_by_others && !root_owned_sticky) {
-        return Err(unsafe_file(
-            "private trust file ancestor is not privately controlled",
-            Some(path),
-        ));
-    }
-    #[cfg(target_os = "macos")]
-    macos_acl::verify(file, uid, macos_acl::Scope::PrivateAncestor, path)?;
     Ok(())
 }
 
@@ -353,19 +361,6 @@ fn verify_private_parent(file: &File, uid: u32, path: &Path) -> Result<()> {
     }
     #[cfg(target_os = "macos")]
     macos_acl::verify(file, uid, macos_acl::Scope::PrivateParent, path)?;
-    Ok(())
-}
-
-fn verify_creation_parent(file: &File, uid: u32, path: &Path) -> Result<()> {
-    let meta = metadata(file, path)?;
-    if !meta.is_dir() || (meta.uid() != uid && meta.uid() != 0) || meta.mode() & 0o022 != 0 {
-        return Err(unsafe_file(
-            "private directory creation parent is writable by another user",
-            Some(path),
-        ));
-    }
-    #[cfg(target_os = "macos")]
-    macos_acl::verify(file, uid, macos_acl::Scope::PrivateAncestor, path)?;
     Ok(())
 }
 
@@ -422,6 +417,18 @@ fn read_leaf(
         return Err(raced_file(path));
     }
     Ok(bytes)
+}
+
+pub(crate) fn verify_private_regular_file_handle(file: &File) -> Result<()> {
+    verify_owner_private_regular_handle(file, Path::new("<retained>"))
+}
+
+pub(super) fn verify_owner_private_regular_handle(file: &File, path: &Path) -> Result<()> {
+    let uid = unsafe { libc::geteuid() };
+    verify_private_leaf(&metadata(file, path)?, uid, path)?;
+    #[cfg(target_os = "macos")]
+    macos_acl::verify(file, uid, macos_acl::Scope::PrivateLeaf, path)?;
+    Ok(())
 }
 
 fn verify_private_leaf(meta: &std::fs::Metadata, uid: u32, path: &Path) -> Result<()> {
@@ -558,4 +565,89 @@ fn path_components(path: &Path) -> Result<Vec<&std::ffi::OsStr>> {
         ));
     }
     Ok(components)
+}
+
+#[cfg(test)]
+mod own_objects_host_paths_tests {
+    use super::*;
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    #[test]
+    fn filesystem_root_is_a_valid_external_capability_boundary() {
+        let root =
+            retain_external_directory(Path::new("/"), crate::control::ControlHandle::default())
+                .unwrap();
+        assert!(root.root_handle().metadata().unwrap().is_dir());
+    }
+
+    #[test]
+    fn external_symlinked_ancestor_admits_private_children_without_adoption() {
+        let fixture = tempfile::tempdir().unwrap();
+        let external = fixture.path().canonicalize().unwrap().join("external");
+        fs::create_dir(&external).unwrap();
+        let real = external.join("real");
+        fs::create_dir(&real).unwrap();
+        let alias = external.join("alias");
+        symlink(&real, &alias).unwrap();
+
+        let real_parent = StoreDirectory::open(&real).unwrap();
+        real_parent.create_directory(Path::new("owned")).unwrap();
+        let owned = real.join("owned");
+        let owned_handle = StoreDirectory::open(&owned).unwrap();
+        owned_handle
+            .create_private_file(Path::new("secret"))
+            .unwrap();
+        let before = fs::symlink_metadata(&alias).unwrap();
+
+        let external_boundary =
+            retain_external_directory(&alias, crate::control::ControlHandle::default()).unwrap();
+        let owned_boundary =
+            crate::private_fs::verify_private_directory_at(&external_boundary, Path::new("owned"))
+                .unwrap();
+        assert_eq!(
+            crate::private_fs::read_private_file_at(&owned_boundary, "secret", 16).unwrap(),
+            b""
+        );
+        assert!(
+            fs::symlink_metadata(&alias)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(fs::symlink_metadata(&alias).unwrap().len(), before.len());
+
+        symlink(&owned, real.join("substituted-owned")).unwrap();
+        assert!(
+            crate::private_fs::verify_private_directory_at(
+                &external_boundary,
+                Path::new("substituted-owned"),
+            )
+            .is_err()
+        );
+
+        owned_handle.create_directory(Path::new("nested")).unwrap();
+        symlink(owned.join("nested"), owned.join("linked-nested")).unwrap();
+        assert!(
+            crate::private_fs::verify_private_directory_at(
+                &external_boundary,
+                Path::new("owned/linked-nested/child"),
+            )
+            .is_err()
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn default_system_temp_accepts_private_child_without_rewriting_external_parent() {
+        let fixture = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let external = fixture.path();
+        let before = fs::metadata(external).unwrap();
+        let parent =
+            retain_external_directory(external, crate::control::ControlHandle::default()).unwrap();
+        parent.create_directory(Path::new("owned")).unwrap();
+        crate::private_fs::verify_private_directory_at(&parent, Path::new("owned")).unwrap();
+        let after = fs::metadata(external).unwrap();
+        assert_eq!(before.permissions(), after.permissions());
+    }
 }

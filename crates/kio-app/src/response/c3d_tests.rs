@@ -153,6 +153,7 @@ fn adapter_approval_projection_preserves_branch_owned_nulls_and_absence() {
                 status: "preview".into(),
                 scope_id: "s".into(),
                 adapters: vec![],
+                device_endpoints: vec![],
                 send_secrets: false,
                 resume: resume.clone(),
             }),
@@ -221,7 +222,8 @@ fn adapter_status_projection_preserves_arbitrary_persisted_json_leaves() {
         let rows = vec![json!({"extra":"preserved"}), json!([1, null]), json!(false)];
         assert_projection(
             AdapterResponse::Status(ApprovalStatusResponse {
-                scope_id: "s".into(),
+                scope_id: Some("s".into()),
+                device_endpoints: vec![],
                 grants: vec![],
                 effective: vec![EffectiveApproval {
                     grant_id: "g".into(),
@@ -633,8 +635,8 @@ fn c3d_legacy_projection_keeps_completion_out_of_body_and_preserves_independent_
 }
 #[test]
 fn adapter_projection_reuses_populated_grants_and_retains_domain_omission() {
-    use crate::grants::{GrantBinding, GrantOperation, GrantRecord, GrantState};
-    let binding = GrantBinding {
+    use crate::grants::{GrantOperation, GrantRecord, GrantState, ScopedGrantBinding};
+    let binding = ScopedGrantBinding {
         scope_id: "s".into(),
         canonical_root: "scope/日本語".into(),
         directory_identity: kio_core::management::DirectoryIdentity::Unix {
@@ -660,14 +662,16 @@ fn adapter_projection_reuses_populated_grants_and_retains_domain_omission() {
             status: "preview".into(),
             scope_id: "s".into(),
             adapters: vec![binding.clone()],
+            device_endpoints: vec![],
             send_secrets: true,
             resume: None,
         }),
         json!({"status":"preview","scope_id":"s","adapters":[expected_binding],"send_secrets":true,"resume":null}),
     );
     for activated_at in [None, Some("activated".to_owned())] {
+        let stored_binding = expected_binding.clone();
         let mut grant = json!({"schema_version":1,"grant_id":"g","approval_id":"a","device_instance_id":"d",
-            "state":"active","binding":expected_binding,"created_at":"created"});
+            "state":"active","binding":stored_binding,"created_at":"created"});
         if let Some(date) = &activated_at {
             grant["activated_at"] = json!(date);
         }
@@ -677,14 +681,17 @@ fn adapter_projection_reuses_populated_grants_and_retains_domain_omission() {
             approval_id: "a".into(),
             device_instance_id: "d".into(),
             state: GrantState::Active,
-            binding: binding.clone(),
+            binding: crate::grants::GrantBinding::Scoped(binding.clone()),
+            disclosure: None,
+            parent_network_grant_id: None,
             created_at: "created".into(),
             activated_at,
             revoked_at: None,
         };
         assert_projection(
             ApprovalStatusResponse {
-                scope_id: "s".into(),
+                scope_id: Some("s".into()),
+                device_endpoints: vec![],
                 grants: vec![record],
                 effective: vec![],
                 scope_approvals: vec![],

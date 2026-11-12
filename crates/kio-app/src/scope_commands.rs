@@ -5,7 +5,7 @@ use crate::index::chunk_ledger::ensure_purge_epoch_initialized;
 use crate::index::command::current_unsupported_inputs;
 use crate::invocation::Invocation;
 use crate::ledger_access::ledger_db_path;
-use crate::ledger_access::open_search_budget_snapshot;
+use crate::ledger_access::observe_budget;
 use crate::management::ExplicitRoot;
 use crate::management::initialize_explicit_root_in_session;
 use crate::object_persistence::pipeline_to_kio;
@@ -33,8 +33,30 @@ pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result
     };
     // Management records are created only by the exclusive creation path.
     // Any pre-existing store must already have a valid live chain.
-    let (repo, created) = match initialize_explicit_root_in_session(&path, ctx.control, ctx.locks)?
-    {
+    let independent_plan = if args.independent {
+        let plan = crate::management::preview_independent_root(&path, ctx.control)?;
+        let summary = plan.confirmation_summary();
+        if !args.yes && !ctx.interaction.confirm(&summary)? {
+            return Err(kio_core::KioError::invalid_usage(format!(
+                "{summary} Independent initialization requires confirmation; use init --independent --yes or confirm in an interactive terminal"
+            )));
+        }
+        Some(plan)
+    } else {
+        if args.yes {
+            return Err(kio_core::KioError::invalid_usage(
+                "init --yes requires --independent",
+            ));
+        }
+        None
+    };
+    let initialized = match &independent_plan {
+        Some(plan) => {
+            crate::management::initialize_independent_root_in_session(plan, ctx.control, ctx.locks)?
+        }
+        None => initialize_explicit_root_in_session(&path, ctx.control, ctx.locks)?,
+    };
+    let (repo, created) = match initialized {
         ExplicitRoot::Created(repo) => (repo, true),
         ExplicitRoot::Existing(repo) => (repo, false),
     };
@@ -78,6 +100,7 @@ pub(crate) fn run_init(ctx: &Invocation<'_>, args: commands::InitArgs) -> Result
             repaired,
             path: repo.root().to_path_buf(),
             kio_path: repo.kio_dir().to_path_buf(),
+            independent: independent_plan.map(|plan| plan.response()),
         }),
         completion: Completion::Complete,
     })
@@ -100,7 +123,15 @@ pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<CommandResponse> {
         (current_unsupported_inputs(&repo)?, true)
     };
     let tasks = task_store.all().map_err(pipeline_to_kio)?;
-    let ledger_snapshot = open_search_budget_snapshot(&ledger_db_path(ctx.control), ctx.control)?;
+    let mut budget_observation = observe_budget(&ledger_db_path(ctx.control), ctx.control);
+    let stalled_batch =
+        match stalled_batch_status(budget_observation.snapshot.as_ref(), ctx.control) {
+            Ok(rows) => rows,
+            Err(error) => {
+                budget_observation.invalidate(&error);
+                Vec::new()
+            }
+        };
     Ok(CommandResponse {
         body: ResponseBody::Status(Box::new(StatusResponse {
             scope_path: repo.kio_dir().to_path_buf(),
@@ -115,11 +146,11 @@ pub(crate) fn run_status(ctx: &Invocation<'_>) -> Result<CommandResponse> {
             quarantine: quarantine_status_records(&repo)?,
             unsupported_inputs,
             unsupported_inputs_complete,
-            budget: budget_status(&repo, ledger_snapshot.as_ref())?,
+            budget: budget_status(&repo, &budget_observation)?,
             // CL37/CL68: permanently-stalled (settled but residue-cleanup-
             // pending) cost-ledger.sqlite batch_requests rows, device-global
             // — not scoped to this folder, since the ledger itself is not.
-            stalled_batch: stalled_batch_status(ledger_snapshot.as_ref(), ctx.control)?,
+            stalled_batch,
             // 05 §3.5 / LC51: `status` is the one read command the §I barrier
             // does NOT reject on an active journal — it shows the journal as
             // state instead, for recovery visibility into a crashed purge.

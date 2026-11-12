@@ -29,7 +29,7 @@ Kio は **local-first** な知識アーカイブ。データの主権はあな�
 ```bash
 kio init
 kio index --preview      # ローカル取り込み対象と送信policyを確認
-kio index --offline --yes # ローカル取り込み + ベースライン index。HTTPを禁止
+kio index --offline --yes # ローカル取り込み + ベースライン index。外部ネットワーク禁止 (07 §3)
 kio search "あの PDF"
 kio open <検索結果の pointer>
 ```

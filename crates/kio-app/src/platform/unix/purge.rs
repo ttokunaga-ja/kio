@@ -1,6 +1,6 @@
 use crate::purge::store_corrupt;
-use kio_core::{KioError, Result};
-use std::fs::{self, File, OpenOptions};
+use kio_core::Result;
+use std::fs::{self, File};
 use std::path::Path;
 
 use std::os::unix::fs::MetadataExt;
@@ -10,10 +10,6 @@ pub(crate) struct PurgeRegularObservation {
     ino: u64,
 }
 pub(crate) struct PurgeRemovalObservation {
-    dev: u64,
-    ino: u64,
-}
-pub(crate) struct PurgeParentObservation {
     dev: u64,
     ino: u64,
 }
@@ -76,31 +72,10 @@ pub(crate) fn purge_removal_matches(
     Ok(observed.dev == current.dev() && observed.ino == current.ino())
 }
 
-pub(crate) fn observe_purge_parent(
-    _path: &Path,
-    listed: &fs::Metadata,
-) -> Result<PurgeParentObservation> {
-    Ok(PurgeParentObservation {
-        dev: listed.dev(),
-        ino: listed.ino(),
-    })
-}
-
-pub(crate) fn purge_parent_matches(observed: &PurgeParentObservation, path: &Path) -> Result<bool> {
-    let current = fs::symlink_metadata(path)
-        .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))?;
-    Ok(observed.dev == current.dev() && observed.ino == current.ino())
-}
-
 pub(crate) fn purge_regular_matches_named(
     observed: &PurgeRegularObservation,
     _path: &Path,
     current: &fs::Metadata,
 ) -> Result<bool> {
     Ok(observed.dev == current.dev() && observed.ino == current.ino())
-}
-
-pub(crate) fn configure_purge_private_temp(options: &mut OpenOptions) {
-    use std::os::unix::fs::OpenOptionsExt;
-    options.mode(0o600);
 }

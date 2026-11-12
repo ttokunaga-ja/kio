@@ -6,8 +6,7 @@
 
 pub use super::embedding_job::{
     claim_device_embedding_job, embedding_job, finish_embedding_publication,
-    pending_embedding_publications_for_scope, reserve_embedding_job, settle_local_embedding_crash,
-    stage_embedding_result,
+    pending_embedding_publications_for_scope, reserve_embedding_job, stage_embedding_result,
 };
 use super::{LedgerDb, lifecycle::LedgerWriteTxn};
 use crate::Result;

@@ -30,11 +30,125 @@ struct BootstrapJournal {
     version: u8,
     operation_id: String,
     planned_scope_id: String,
+    independent: bool,
     canonical_root: PathBuf,
     root_identity: DirectoryIdentity,
     kio_identity: DirectoryIdentity,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     case_insensitive: Option<bool>,
+}
+
+/// Read-only observation bound to the root and store shown for confirmation.
+pub(crate) struct IndependentRootPlan {
+    canonical_root: PathBuf,
+    root_identity: DirectoryIdentity,
+    kio_identity: Option<DirectoryIdentity>,
+    parent: Option<PathBuf>,
+    parent_relationship: String,
+}
+
+impl IndependentRootPlan {
+    pub(crate) fn confirmation_summary(&self) -> String {
+        format!(
+            "Create an independent root at {}? Parent: {}; parent relationship: {}. Parent enrollment and history will remain unchanged.",
+            self.canonical_root.display(),
+            self.parent
+                .as_ref()
+                .map_or_else(|| "none".to_owned(), |path| path.display().to_string()),
+            self.parent_relationship,
+        )
+    }
+
+    pub(crate) fn response(self) -> crate::response::device::IndependentInitResponse {
+        crate::response::device::IndependentInitResponse {
+            parent: self.parent,
+            parent_relationship: self.parent_relationship,
+            confirmed: true,
+        }
+    }
+}
+
+pub(crate) fn preview_independent_root(
+    root: &Path,
+    control: &ControlHandle,
+) -> Result<IndependentRootPlan> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| KioError::io(error.to_string(), root.display().to_string()))?;
+    let retained = StoreDirectory::open_with_control(&canonical_root, control.clone())?;
+    validate_controlled_root_with_control(
+        retained.root_handle().as_ref(),
+        &canonical_root,
+        control.clone(),
+    )?;
+    let root_identity = directory_identity_from_handle(retained.root_handle().as_ref())?;
+    let kio_identity = if let Some(handle) = retained_kio(&retained)? {
+        let identity = directory_identity_from_handle(&handle)?;
+        let directory = StoreDirectory::from_retained_with_control(
+            handle,
+            canonical_root.join(".kio"),
+            control.clone(),
+        )?;
+        if let Some(journal) = read_journal(&directory)? {
+            verify_journal(&journal, &canonical_root, &root_identity, &identity)?;
+            if !journal.independent {
+                return Err(KioError::invalid_usage(
+                    "existing bootstrap is not an independent initialization; resume with init",
+                ));
+            }
+        } else {
+            let repo = super::open_existing_bound(&canonical_root, &retained)?;
+            let binding = super::binding_for_repo(&repo)?;
+            validate_live_chain(&binding)?;
+            refuse_independent_child(&binding, true)?;
+        }
+        Some(identity)
+    } else {
+        None
+    };
+    let parent = canonical_root.parent().map(Path::to_path_buf);
+    // This observation never obtains a parent lease or recovers parent residue.
+    // Any failed authentication or existing enrollment is shown as uncertainty.
+    let relationship = (|| -> Result<&str> {
+        let Some(parent_path) = parent.as_ref() else {
+            return Ok("absent");
+        };
+        let directory = StoreDirectory::open_with_control(parent_path, control.clone())?;
+        if !directory.contains_entry(Path::new(".kio"))? {
+            return Ok("absent");
+        }
+        let repo = super::open_existing_bound(parent_path, &directory)?;
+        let binding = super::binding_for_repo(&repo)?;
+        validate_live_chain(&binding)?;
+        let record = read_record(&binding)?;
+        let basename = canonical_root
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| {
+                KioError::invalid_usage("root basename cannot identify parent enrollment")
+            })?;
+        if record.children.contains_key(basename) {
+            return Ok("uncertain");
+        }
+        Ok("authenticated_unenrolled")
+    })()
+    .unwrap_or("uncertain")
+    .to_owned();
+    Ok(IndependentRootPlan {
+        canonical_root,
+        root_identity,
+        kio_identity,
+        parent,
+        parent_relationship: relationship,
+    })
+}
+
+pub(super) fn initialize_confirmed_independent(
+    plan: &IndependentRootPlan,
+    control: &ControlHandle,
+    locks: &kio_core::scope::LockSession,
+) -> Result<ExplicitRoot> {
+    initialize_with_intent(&plan.canonical_root, control, locks, Some(plan))
 }
 
 /// Keeps a direct, authenticated parent's writer lease alive while an
@@ -64,6 +178,15 @@ pub(super) fn initialize_in_session(
     control: &ControlHandle,
     locks: &kio_core::scope::LockSession,
 ) -> Result<ExplicitRoot> {
+    initialize_with_intent(root, control, locks, None)
+}
+
+fn initialize_with_intent(
+    root: &Path,
+    control: &ControlHandle,
+    locks: &kio_core::scope::LockSession,
+    independent: Option<&IndependentRootPlan>,
+) -> Result<ExplicitRoot> {
     let canonical_root = root
         .canonicalize()
         .map_err(|error| KioError::io(error.to_string(), root.display().to_string()))?;
@@ -80,6 +203,18 @@ pub(super) fn initialize_in_session(
     // already-enrolled Child remains a Child; it must not be forced through
     // this new-root admission path.
     let existing_kio = retained_kio(&retained_root)?;
+    if let Some(plan) = independent {
+        let root_identity = directory_identity_from_handle(retained_root.root_handle().as_ref())?;
+        let kio_identity = existing_kio
+            .as_ref()
+            .map(directory_identity_from_handle)
+            .transpose()?;
+        if root_identity != plan.root_identity || kio_identity != plan.kio_identity {
+            return Err(KioError::invalid_usage(
+                "independent root or .kio identity changed after confirmation",
+            ));
+        }
+    }
     let existing_complete = match &existing_kio {
         Some(handle) => {
             let directory = StoreDirectory::from_retained_with_control(
@@ -89,12 +224,19 @@ pub(super) fn initialize_in_session(
                 canonical_root.join(".kio"),
                 control.clone(),
             )?;
+            if let Some(journal) = read_journal(&directory)?
+                && journal.independent != independent.is_some()
+            {
+                return Err(KioError::invalid_usage(
+                    "bootstrap intent differs; resume independent initialization with init --independent and confirmation",
+                ));
+            }
             directory.contains_entry(Path::new("management.json"))?
                 && !directory.contains_entry(Path::new(JOURNAL))?
         }
         None => false,
     };
-    let _parent_admission = if existing_complete {
+    let _parent_admission = if existing_complete || independent.is_some() {
         None
     } else {
         admit_direct_parent(&canonical_root, &retained_root, locks)?
@@ -158,6 +300,7 @@ pub(super) fn initialize_in_session(
     )?;
     if kio.contains_entry(Path::new("management.json"))? && observed_journal.is_none() {
         validate_live_chain(&binding)?;
+        refuse_independent_child(&binding, independent.is_some())?;
         if kio.inspect_atomic()? == AtomicWorkspaceState::Pending {
             // A live, validated root may clean only its own validated atomic
             // residue, serialized by the bootstrap gate.
@@ -192,6 +335,7 @@ pub(super) fn initialize_in_session(
     let after_gate_journal = read_journal(&kio)?;
     if kio.contains_entry(Path::new("management.json"))? && after_gate_journal.is_none() {
         validate_live_chain(&binding)?;
+        refuse_independent_child(&binding, independent.is_some())?;
         let repo = Repository::open_bound_existing_with_control(
             canonical_root,
             clone_root(&retained_root)?,
@@ -209,6 +353,11 @@ pub(super) fn initialize_in_session(
     let mut journal = match after_gate_journal {
         Some(journal) => {
             verify_journal(&journal, &canonical_root, &root_identity, &kio_identity)?;
+            if journal.independent != independent.is_some() {
+                return Err(KioError::invalid_usage(
+                    "bootstrap intent changed after confirmation",
+                ));
+            }
             journal
         }
         None => {
@@ -217,6 +366,7 @@ pub(super) fn initialize_in_session(
                 version: JOURNAL_VERSION,
                 operation_id: new_ulid(&canonical_root),
                 planned_scope_id: new_ulid(&canonical_root),
+                independent: independent.is_some(),
                 canonical_root: canonical_root.clone(),
                 root_identity: root_identity.clone(),
                 kio_identity: kio_identity.clone(),
@@ -311,6 +461,20 @@ pub(super) fn initialize_in_session(
     validate_live_chain(&binding)?;
     verify_parent_admission(_parent_admission.as_ref(), &retained_root)?;
     Ok(ExplicitRoot::Created(repo))
+}
+
+fn refuse_independent_child(binding: &ManagementBinding, independent: bool) -> Result<()> {
+    if independent
+        && matches!(
+            read_record(binding)?.authority,
+            ManagementAuthority::Child { .. }
+        )
+    {
+        return Err(KioError::invalid_usage(
+            "existing Child requires authenticated detachment: use kio root register --preview, then kio root register --yes",
+        ));
+    }
+    Ok(())
 }
 
 fn admit_direct_parent(
@@ -636,14 +800,46 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn unsafe_root_control_is_rejected_before_bootstrap_writes() {
+    fn writable_user_root_initializes_without_chmod_and_keeps_store_private() {
         use std::os::unix::fs::PermissionsExt;
         let root = canonical_tempdir();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap();
-        let before = tree_fingerprint(root.path());
-        assert!(initialize(root.path(), &kio_core::control::ControlHandle::default()).is_err());
-        assert_eq!(tree_fingerprint(root.path()), before);
-        assert!(!root.path().join(".kio").exists());
+        let user_file = root.path().join("user.txt");
+        fs::write(&user_file, b"preserve user bytes").unwrap();
+        fs::set_permissions(&user_file, fs::Permissions::from_mode(0o644)).unwrap();
+        let retained = StoreDirectory::open(root.path()).unwrap();
+        let identity = directory_identity_from_handle(retained.root_handle().as_ref()).unwrap();
+        let ExplicitRoot::Created(repo) =
+            initialize(root.path(), &ControlHandle::default()).unwrap()
+        else {
+            panic!("new root was not initialized")
+        };
+        assert_eq!(
+            read_record(&binding_for_repo(&repo).unwrap())
+                .unwrap()
+                .directory_identity,
+            identity
+        );
+        assert_eq!(
+            fs::metadata(root.path()).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        assert_eq!(fs::read(&user_file).unwrap(), b"preserve user bytes");
+        assert_eq!(
+            fs::metadata(&user_file).unwrap().permissions().mode() & 0o777,
+            0o644
+        );
+        kio_core::private_fs::verify_private_directory(&root.path().join(".kio")).unwrap();
+        assert_eq!(
+            fs::metadata(root.path().join(".kio/management.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert!(!root.path().join(".kio-case-probe").exists());
+        assert!(!root.path().join(".kio-atomic").exists());
     }
 
     #[cfg(unix)]
@@ -853,6 +1049,7 @@ mod tests {
             version: JOURNAL_VERSION,
             operation_id: new_ulid(&canonical),
             planned_scope_id: new_ulid(&canonical),
+            independent: false,
             canonical_root: canonical.clone(),
             root_identity: directory_identity_from_handle(root_dir.root_handle().as_ref()).unwrap(),
             kio_identity: directory_identity_from_handle(kio.root_handle().as_ref()).unwrap(),
@@ -881,7 +1078,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn changed_root_control_refuses_resume_and_preserves_journal() {
+    fn writable_user_root_resumes_pinned_bootstrap_without_chmod() {
         use std::os::unix::fs::PermissionsExt;
         let root = canonical_tempdir();
         let canonical = root.path().canonicalize().unwrap();
@@ -896,6 +1093,7 @@ mod tests {
             version: JOURNAL_VERSION,
             operation_id: new_ulid(&canonical),
             planned_scope_id: new_ulid(&canonical),
+            independent: false,
             canonical_root: canonical.clone(),
             root_identity: directory_identity_from_handle(root_dir.root_handle().as_ref()).unwrap(),
             kio_identity: directory_identity_from_handle(kio.root_handle().as_ref()).unwrap(),
@@ -904,10 +1102,29 @@ mod tests {
         write_journal(&kio, &journal, Publication::CreateOnly).unwrap();
         drop(gate);
         let marker = canonical.join(".kio").join(JOURNAL);
-        let before = fs::read(&marker).unwrap();
         fs::set_permissions(&canonical, fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(initialize(&canonical, &kio_core::control::ControlHandle::default()).is_err());
-        assert_eq!(fs::read(marker).unwrap(), before);
+        let ExplicitRoot::Created(repo) =
+            initialize(&canonical, &ControlHandle::default()).unwrap()
+        else {
+            panic!("pinned bootstrap was not resumed")
+        };
+        let record = read_record(&binding_for_repo(&repo).unwrap()).unwrap();
+        assert_eq!(record.scope_id, journal.planned_scope_id);
+        assert_eq!(record.directory_identity, journal.root_identity);
+        assert!(!marker.exists());
+        assert_eq!(
+            fs::metadata(&canonical).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        kio_core::private_fs::verify_private_directory(&canonical.join(".kio")).unwrap();
+        assert_eq!(
+            fs::metadata(canonical.join(".kio/management.json"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
     }
 
     #[test]
@@ -924,6 +1141,7 @@ mod tests {
             version: JOURNAL_VERSION,
             operation_id: new_ulid(&canonical),
             planned_scope_id: new_ulid(&canonical),
+            independent: false,
             canonical_root: canonical.clone(),
             root_identity: directory_identity_from_handle(root_dir.root_handle().as_ref()).unwrap(),
             kio_identity: directory_identity_from_handle(kio.root_handle().as_ref()).unwrap(),
@@ -1025,5 +1243,54 @@ mod tests {
         assert!(initialize(&child, &kio_core::control::ControlHandle::default()).is_err());
         assert_eq!(tree_fingerprint(&child), before);
         assert!(!child.join(".kio").exists());
+    }
+
+    #[test]
+    fn independent_journal_resumes_without_adopting_an_inconsistent_parent() {
+        let parent = canonical_tempdir();
+        let canonical = parent.path().join("child");
+        fs::create_dir(&canonical).unwrap();
+        fs::write(parent.path().join(".kio"), b"uncertain parent").unwrap();
+        let root_dir = StoreDirectory::open(&canonical).unwrap();
+        let kio = StoreDirectory::from_retained(
+            root_dir.create_directory(Path::new(".kio")).unwrap(),
+            canonical.join(".kio"),
+        )
+        .unwrap();
+        let journal = BootstrapJournal {
+            version: JOURNAL_VERSION,
+            operation_id: new_ulid(&canonical),
+            planned_scope_id: new_ulid(&canonical),
+            independent: true,
+            canonical_root: canonical.clone(),
+            root_identity: directory_identity_from_handle(root_dir.root_handle().as_ref()).unwrap(),
+            kio_identity: directory_identity_from_handle(kio.root_handle().as_ref()).unwrap(),
+            case_insensitive: None,
+        };
+        write_journal(&kio, &journal, Publication::CreateOnly).unwrap();
+        let before = tree_fingerprint(&canonical);
+        let control = ControlHandle::default();
+        assert!(initialize(&canonical, &control).is_err());
+        assert_eq!(tree_fingerprint(&canonical), before);
+        let plan = preview_independent_root(&canonical, &control).unwrap();
+        assert_eq!(plan.parent_relationship, "uncertain");
+        let ExplicitRoot::Created(repo) = initialize_confirmed_independent(
+            &plan,
+            &control,
+            &kio_core::scope::LockSession::default(),
+        )
+        .unwrap() else {
+            panic!("pending bootstrap was not completed")
+        };
+        assert_eq!(
+            read_record(&binding_for_repo(&repo).unwrap())
+                .unwrap()
+                .scope_id,
+            journal.planned_scope_id
+        );
+        assert_eq!(
+            fs::read(parent.path().join(".kio")).unwrap(),
+            b"uncertain parent"
+        );
     }
 }

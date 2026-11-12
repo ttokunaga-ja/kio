@@ -24,19 +24,16 @@ use windows_sys::Win32::{
         CloseHandle, GENERIC_READ, HANDLE, INVALID_HANDLE_VALUE, LocalFree, OBJ_CASE_INSENSITIVE,
         RtlNtStatusToDosError, UNICODE_STRING,
     },
-    Security::Authorization::{
-        ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo,
-    },
+    Security::Authorization::{ConvertStringSidToSidW, GetSecurityInfo, SE_FILE_OBJECT},
     Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION, ACL_SIZE_INFORMATION,
         AddAccessAllowedAce, DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation,
         GetLengthSid, GetSecurityDescriptorControl, GetSecurityDescriptorDacl,
         GetSecurityDescriptorOwner, GetTokenInformation, INHERIT_ONLY_ACE, InitializeAcl,
         InitializeSecurityDescriptor, IsValidSid, IsWellKnownSid, OWNER_SECURITY_INFORMATION,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-        SECURITY_DESCRIPTOR, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-        SetSecurityDescriptorOwner, TOKEN_QUERY, TOKEN_USER, TokenUser,
-        WinBuiltinAdministratorsSid, WinLocalSystemSid,
+        PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorOwner,
+        TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid, WinLocalSystemSid,
     },
     Storage::FileSystem::{
         FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
@@ -78,6 +75,7 @@ const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
 pub(crate) enum NewPrivateObjectKind {
     Directory,
     RegularFile,
+    LockFile,
 }
 
 pub(crate) fn create_new_private_at(
@@ -145,6 +143,16 @@ pub(crate) fn create_new_private_at(
             windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
             FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
         ),
+        NewPrivateObjectKind::LockFile => (
+            GENERIC_READ
+                | GENERIC_WRITE
+                | windows_sys::Win32::Storage::FileSystem::DELETE
+                | SYNCHRONIZE
+                | READ_CONTROL
+                | FILE_READ_ATTRIBUTES,
+            windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
+            FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+        ),
     };
     let mut handle = INVALID_HANDLE_VALUE;
     let mut status_block = IO_STATUS_BLOCK::default();
@@ -159,7 +167,10 @@ pub(crate) fn create_new_private_at(
             &mut status_block,
             ptr::null_mut(),
             file_attributes,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            match kind {
+                NewPrivateObjectKind::LockFile => FILE_SHARE_READ,
+                _ => FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            },
             FILE_CREATE,
             create_options,
             ptr::null_mut(),
@@ -192,7 +203,7 @@ pub(crate) fn create_new_private_at(
         NewPrivateObjectKind::Directory => {
             crate::platform::directory_handle_identity(&file).is_some()
         }
-        NewPrivateObjectKind::RegularFile => {
+        NewPrivateObjectKind::RegularFile | NewPrivateObjectKind::LockFile => {
             crate::platform::regular_file_handle_identity(&file).is_some()
         }
     };
@@ -249,43 +260,41 @@ pub(crate) fn verify_private_directory_handle(directory: &StoreDirectory) -> Res
     verify_owner_only(&handle, &owner, directory.path())
 }
 
-/// Restrict a retained, already-existing object only after proving that the
-/// current user owns it. New objects must use `create_new_private_at` instead.
-pub(crate) fn restrict_existing_private_handle(file: &File) -> Result<()> {
-    let owner = CurrentUserSid::current()
-        .map_err(|_| unsafe_file("cannot determine current Windows user", None))?;
-    let directory = crate::platform::directory_handle_identity(file);
-    let regular = crate::platform::regular_file_handle_identity(file);
-    match (directory, regular) {
-        (Some(_), None) | (None, Some(_)) => {}
-        _ => {
-            return Err(unsafe_file(
-                "private object is not a retained directory or regular file",
-                None,
-            ));
-        }
+/// Follow aliases only in a caller-declared external parent. Pin that exact
+/// directory before examining its canonical spelling; owned children are
+/// subsequently opened relative to this handle without following reparse
+/// points.
+pub(crate) fn retain_external_directory(
+    path: &Path,
+    control: crate::control::ControlHandle,
+) -> Result<StoreDirectory> {
+    windows_absolute_components(path)?;
+    let followed = cap_fs::open_ambient_dir(path, ambient_authority())
+        .map_err(|_| unsafe_file("cannot open external directory", Some(path)))?;
+    let identity = crate::platform::directory_handle_identity(&followed)
+        .ok_or_else(|| unsafe_file("external directory is not a real directory", Some(path)))?;
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|_| unsafe_file("cannot resolve external directory", Some(path)))?;
+    let (root_path, components) = windows_absolute_components(&canonical)?;
+    let mut checked = cap_fs::open_ambient_dir(&root_path, ambient_authority())
+        .map_err(|_| unsafe_file("cannot open canonical external root", Some(path)))?;
+    verify_real_directory(&checked, path)?;
+    for component in components {
+        checked = cap_fs::open_dir_nofollow(&checked, Path::new(component)).map_err(|_| {
+            unsafe_file(
+                "canonical external directory has an unsafe component",
+                Some(path),
+            )
+        })?;
+        verify_real_directory(&checked, path)?;
     }
-    verify_current_owner(file, &owner, Path::new("<retained>"))?;
-    let (_acl, acl_ptr) = private_acl(&owner)
-        .map_err(|_| unsafe_file("cannot construct private Windows ACL", None))?;
-    // SAFETY: `file` is the retained, owner-validated object opened with
-    // READ_CONTROL|WRITE_DAC|FILE_READ_ATTRIBUTES by its caller; no path
-    // is reopened or adopted before this DACL-only update.
-    let status = unsafe {
-        SetSecurityInfo(
-            file.as_raw_handle() as HANDLE,
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            ptr::null_mut(),
-            ptr::null_mut(),
-            acl_ptr,
-            ptr::null_mut(),
-        )
-    };
-    if status != 0 {
-        return Err(unsafe_file("cannot set private Windows ACL", None));
+    if crate::platform::directory_handle_identity(&checked) != Some(identity) {
+        return Err(unsafe_file(
+            "external directory changed during binding",
+            Some(path),
+        ));
     }
-    verify_owner_only(file, &owner, Path::new("<retained>"))
+    StoreDirectory::from_retained_with_control(followed, path.to_path_buf(), control)
 }
 
 pub(crate) fn verify_private_directory(
@@ -298,9 +307,8 @@ pub(crate) fn verify_private_directory(
     let root = cap_fs::open_ambient_dir(&root_path, ambient_authority())
         .map_err(|_| unsafe_file("cannot open Windows filesystem root", Some(path)))?;
     verify_real_directory(&root, path)?;
-    verify_trusted_acl(&root, &owner, path, true)?;
     let mut directory = root;
-    for (index, component) in components.iter().enumerate() {
+    for component in &components {
         let next = cap_fs::open_dir_nofollow(&directory, Path::new(component)).map_err(|_| {
             unsafe_file(
                 "private directory has a missing, reparse, or unsafe component",
@@ -308,9 +316,6 @@ pub(crate) fn verify_private_directory(
             )
         })?;
         verify_real_directory(&next, path)?;
-        if index + 1 < components.len() {
-            verify_trusted_acl(&next, &owner, path, true)?;
-        }
         directory = next;
     }
     verify_owner_only(&directory, &owner, path)?;
@@ -322,12 +327,9 @@ pub(crate) fn verify_private_creation_parent(
     control: crate::control::ControlHandle,
 ) -> Result<StoreDirectory> {
     let (root_path, components) = windows_absolute_components(path)?;
-    let owner = CurrentUserSid::current()
-        .map_err(|_| unsafe_file("cannot determine current Windows user", Some(path)))?;
     let root = cap_fs::open_ambient_dir(&root_path, ambient_authority())
         .map_err(|_| unsafe_file("cannot open Windows filesystem root", Some(path)))?;
     verify_real_directory(&root, path)?;
-    verify_trusted_acl(&root, &owner, path, true)?;
     let mut directory = root;
     for component in &components {
         let next = cap_fs::open_dir_nofollow(&directory, Path::new(component)).map_err(|_| {
@@ -337,7 +339,6 @@ pub(crate) fn verify_private_creation_parent(
             )
         })?;
         verify_real_directory(&next, path)?;
-        verify_trusted_acl(&next, &owner, path, true)?;
         directory = next;
     }
     StoreDirectory::from_retained_with_control(directory, path.to_path_buf(), control)
@@ -354,7 +355,6 @@ pub(crate) fn read_private_file(
     let root = cap_fs::open_ambient_dir(&root_path, ambient_authority())
         .map_err(|_| unsafe_file("cannot open Windows filesystem root", Some(path)))?;
     verify_real_directory(&root, path)?;
-    verify_trusted_acl(&root, &owner, path, true)?;
     let mut parent = root;
     for component in &components[..components.len() - 1] {
         let next = cap_fs::open_dir_nofollow(&parent, Path::new(component)).map_err(|_| {
@@ -364,10 +364,8 @@ pub(crate) fn read_private_file(
             )
         })?;
         verify_real_directory(&next, path)?;
-        verify_trusted_acl(&next, &owner, path, true)?;
         parent = next;
     }
-    verify_owner_only(&parent, &owner, path)?;
     read_private_leaf(
         &parent,
         components.last().expect("nonempty components"),
@@ -377,9 +375,9 @@ pub(crate) fn read_private_file(
     )
 }
 
-pub(crate) fn read_private_file_at(
+pub(crate) fn read_private_file_at_path(
     parent: &StoreDirectory,
-    name: &str,
+    name: &Path,
     max_bytes: u64,
 ) -> Result<Vec<u8>> {
     let leaf = direct_leaf(name, parent.path())?;
@@ -388,7 +386,6 @@ pub(crate) fn read_private_file_at(
     })?;
     let handle = parent.root_handle();
     verify_real_directory(&handle, parent.path())?;
-    verify_owner_only(&handle, &owner, parent.path())?;
     let label = parent.path().join(leaf);
     read_private_leaf(&handle, leaf, &label, max_bytes, &owner)
 }
@@ -453,8 +450,8 @@ fn read_private_leaf(
     Ok(body)
 }
 
-fn direct_leaf<'a>(name: &'a str, label: &Path) -> Result<&'a std::ffi::OsStr> {
-    let mut components = Path::new(name).components();
+fn direct_leaf<'a>(name: &'a Path, label: &Path) -> Result<&'a std::ffi::OsStr> {
+    let mut components = name.components();
     match (components.next(), components.next()) {
         (Some(Component::Normal(leaf)), None) => {
             validate_windows_component(leaf, label)?;
@@ -974,6 +971,10 @@ pub(crate) fn resolve_inherited_private_root(
     Ok(None)
 }
 
+pub(crate) fn verify_private_regular_file_handle(file: &File) -> Result<()> {
+    verify_trusted_owned_regular_file_handle(file)
+}
+
 pub(crate) fn verify_trusted_owned_regular_file_handle(file: &std::fs::File) -> Result<()> {
     if crate::platform::regular_file_handle_identity(file).is_none() {
         return Err(unsafe_file(
@@ -996,5 +997,48 @@ mod acl_vectors {
             true,
         ));
         assert!(untrusted_effective_mutation(0, GENERIC_ALL, true));
+    }
+}
+
+#[cfg(test)]
+mod external_alias_tests {
+    use super::*;
+
+    fn create_junction(link: &Path, target: &Path) {
+        let result = std::process::Command::new("cmd.exe")
+            .args(["/D", "/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "junction creation failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    fn external_reparse_parent_allows_private_child_but_not_linked_owned_child() {
+        let fixture = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+        let real = fixture.path().join("external");
+        std::fs::create_dir(&real).unwrap();
+        let alias = fixture.path().join("alias");
+        create_junction(&alias, &real);
+
+        let external =
+            retain_external_directory(&alias, crate::control::ControlHandle::default()).unwrap();
+        external.create_directory(Path::new("private")).unwrap();
+        crate::private_fs::verify_private_directory_at(&external, Path::new("private")).unwrap();
+
+        let linked_private = real.join("linked-private");
+        create_junction(&linked_private, &real.join("private"));
+        assert!(
+            crate::private_fs::verify_private_directory_at(&external, Path::new("linked-private"),)
+                .is_err()
+        );
+        drop(external);
+        std::fs::remove_dir(linked_private).unwrap();
+        std::fs::remove_dir(alias).unwrap();
     }
 }

@@ -152,6 +152,41 @@ mod tests {
     }
 
     #[test]
+    fn observed_source_conflict_retires_only_owned_prepared_temporary() {
+        let (_temp, session, first) = fixture();
+        let path = session.root.join(".kio").join(SNAPSHOT_AUTO_STATE_LEAF);
+        let concurrent = fs::read(&path).unwrap();
+        let before_head = fs::read(session.root.join(".kio/HEAD")).unwrap();
+        let replacement = "snapshot-auto.competing-closed-writer";
+        // Use canonical checkpoint bytes and an owner-private file, with its
+        // writer closed, so acquisition succeeds before identity rejects CAS.
+        create_new_bound(&session.kio, replacement, &concurrent, MAX_METADATA).unwrap();
+        fs::rename(session.root.join(".kio").join(replacement), &path).unwrap();
+        let expected = first.observation.as_ref().unwrap();
+        let source = open_snapshot_source(&session.kio, expected, session.control()).unwrap();
+        let (state, observation) = crate::platform::gc_snapshot_io::observe(&source).unwrap();
+        assert_eq!(state, parse_snapshot_auto_state(&concurrent).unwrap());
+        assert_ne!(observation.identity, expected.identity);
+        drop(source);
+
+        let temporary = unique_internal_name(".snapshot-auto-state");
+        create_new_bound(&session.kio, &temporary, &concurrent, MAX_METADATA).unwrap();
+        let (_, temporary_observation) =
+            read_regular_observed(&session.kio, &temporary, MAX_METADATA).unwrap();
+        let error = session
+            .replace_snapshot_state(&temporary, &concurrent, expected, &temporary_observation)
+            .unwrap_err();
+        assert_eq!(error.error_code(), "KIO-E-SNAPSHOT-STATE-CHANGED-001");
+        assert_eq!(fs::read(&path).unwrap(), concurrent);
+        assert_eq!(
+            fs::read(session.root.join(".kio/HEAD")).unwrap(),
+            before_head
+        );
+        assert!(!session.root.join(".kio").join(&temporary).exists());
+        assert!(!session.has_pending_snapshot_auto_state_exchange().unwrap());
+    }
+
+    #[test]
     fn pending_exchange_fault_retains_prepared_target_for_recovery() {
         let (_temp, session, first) = fixture();
         interrupt(

@@ -204,6 +204,15 @@ fn read_budget_config(config_path: impl AsRef<Path>) -> Result<ParsedBudgetConfi
     };
     let value: toml::Value =
         toml::from_str(&text).map_err(|err| PipelineError::Schema(err.to_string()))?;
+    // Defaults apply only to absent, valid keys. This reader is also used after
+    // operation-specific startup composition, so it owns the consumed cost
+    // policy validation instead of relying on unrelated command validation.
+    let json_value =
+        serde_json::to_value(&value).map_err(|err| PipelineError::Schema(err.to_string()))?;
+    let projected = kio_core::schema::project_config_sections(&json_value, &["budget"])
+        .map_err(|err| PipelineError::Schema(err.to_string()))?;
+    kio_core::schema::validate_json_schema(kio_core::schema::SchemaKind::Config, &projected)
+        .map_err(|err| PipelineError::Schema(err.to_string()))?;
     let budget = value.get("budget");
     let per_adapter: BTreeMap<String, f64> = budget
         .and_then(|value| value.get("per_adapter"))
@@ -294,6 +303,45 @@ fn read_budget_config(config_path: impl AsRef<Path>) -> Result<ParsedBudgetConfi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn consumed_budget_policy_rejects_invalid_fields_before_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = dir.path().join("device.toml");
+        let folder = dir.path().join("folder.toml");
+        for invalid in [
+            "[budget]\nmonthly_usd_capp = 1\n",
+            "budget = 'bad'\n",
+            "[budget]\nhard_stop = 'bad'\n",
+            "[budget]\nmonthly_usd_cap = 'bad'\n",
+            "[budget]\nwarn_at_percent = 'bad'\n",
+            "[budget.per_adapter]\nembedding = 'bad'\n",
+            "[budegt]\nmonthly_usd_cap = 1\n",
+        ] {
+            for selected in [&device, &folder] {
+                std::fs::write(selected, invalid).unwrap();
+                assert!(
+                    matches!(
+                        read_budget_policy(&device, &folder),
+                        Err(PipelineError::Schema(_))
+                    ),
+                    "consumed policy silently defaulted: {invalid}"
+                );
+                std::fs::remove_file(selected).unwrap();
+            }
+        }
+        std::fs::write(
+            &device,
+            "[budget]\nmonthly_usd_cap = 1\n[search]\ndefault_mode = 'unused-invalid'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            read_budget_policy(&device, &folder)
+                .unwrap()
+                .device_monthly_usd_cap,
+            1.0
+        );
+    }
 
     #[test]
     fn placeholder_budget_cap_kind_serializes() {

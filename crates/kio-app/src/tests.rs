@@ -113,6 +113,54 @@ fn index_reconciles_more_than_legacy_child_cap_and_deep_pages_in_one_run() {
             );
             return;
         }
+        // Observe only this isolated child's descriptor table after exec. The
+        // enumerator is dropped before F_GETFD, and no descriptor is closed or
+        // has its inheritance flags changed by this diagnostic.
+        let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
+        let limits = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            Some((limit.rlim_cur, limit.rlim_max))
+        } else {
+            None
+        };
+        let directory = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        let descriptors = fs::read_dir(directory).map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+                .collect::<Vec<_>>()
+        });
+        let mut open_count = 0_usize;
+        let mut cloexec_count = 0_usize;
+        let mut highest_fd = None;
+        let mut enumeration_error = None;
+        match descriptors {
+            Ok(descriptors) => {
+                for fd in descriptors {
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                    if flags < 0 {
+                        continue;
+                    }
+                    open_count += 1;
+                    cloexec_count += usize::from(flags & libc::FD_CLOEXEC != 0);
+                    highest_fd = Some(highest_fd.map_or(fd, |previous: i32| previous.max(fd)));
+                }
+            }
+            Err(error) => enumeration_error = Some(error.to_string()),
+        }
+        eprintln!(
+            "KIO_CHILD_DISCOVERY_DIAGNOSTIC {}",
+            serde_json::json!({
+                "stage": "child_start_descriptors", "nofile": limits,
+                "open_count": open_count, "cloexec_count": cloexec_count,
+                "non_cloexec_count": open_count.saturating_sub(cloexec_count),
+                "highest_fd": highest_fd, "enumeration_error": enumeration_error,
+                "enumerator_dropped_before_count": true,
+            })
+        );
     }
     let temporary = tempfile::tempdir().unwrap();
     let base = temporary.path().canonicalize().unwrap();
@@ -163,7 +211,69 @@ fn index_reconciles_more_than_legacy_child_cap_and_deep_pages_in_one_run() {
         panic!("expected published Index response");
     };
     let discovery = output.child_scope_discovery.as_ref().unwrap();
-    assert!(!discovery.has_more);
+    if discovery.has_more {
+        let expected = (0..513)
+            .map(|index| root.join(format!("flat-{index:04}")))
+            .chain(deep_scopes.iter().cloned())
+            .collect::<Vec<_>>();
+        let enrolled = expected
+            .iter()
+            .filter(|path| path.join(".kio/scope.json").is_file())
+            .count();
+        let indexed = expected
+            .iter()
+            .filter(|path| path.join(".kio/index/sqlite.db").is_file())
+            .count();
+        let missing_enrollment = expected
+            .iter()
+            .filter(|path| !path.join(".kio/scope.json").is_file())
+            .take(32)
+            .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
+            .collect::<Vec<_>>();
+        let missing_index = expected
+            .iter()
+            .filter(|path| !path.join(".kio/index/sqlite.db").is_file())
+            .take(32)
+            .map(|path| path.strip_prefix(&root).unwrap().display().to_string())
+            .collect::<Vec<_>>();
+        let frontier = root.join(".kio/internal/child-discovery/frontier.json");
+        let frontier = match kio_core::cas::read_bounded_regular_file(&frontier, 1024 * 1024) {
+            Ok(bytes) => {
+                serde_json::json!({ "bytes": bytes.len(), "text": String::from_utf8_lossy(&bytes) })
+            }
+            Err(error) => {
+                serde_json::json!({ "error_code": error.error_code(), "message": error.message() })
+            }
+        };
+        eprintln!(
+            "KIO_CHILD_DISCOVERY_DIAGNOSTIC {}",
+            serde_json::json!({
+                "stage": "incomplete_fixture", "expected": expected.len(), "enrolled": enrolled,
+                "indexed": indexed, "missing_enrollment_first_32": missing_enrollment,
+                "missing_index_first_32": missing_index, "frontier": frontier,
+            })
+        );
+        // Retain only the failed synthetic fixture under this task's tmp-mac.
+        // Ordinary runs and any temporary root outside that exact owner scope
+        // preserve TempDir's existing cleanup behavior.
+        if let Some(run) = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(3)
+            && let Ok(owned_temporary_root) = run.join("tmp-mac").canonicalize()
+            && base.starts_with(&owned_temporary_root)
+        {
+            let retained = temporary.keep();
+            eprintln!(
+                "KIO_CHILD_DISCOVERY_DIAGNOSTIC {}",
+                serde_json::json!({
+                    "stage": "retained_failed_fixture", "path": retained,
+                })
+            );
+        }
+    }
+    assert!(
+        !discovery.has_more,
+        "child discovery incomplete: {}",
+        serde_json::to_string(&output).unwrap()
+    );
     assert_eq!(discovery.rows_total, 578);
     assert_eq!(discovery.rows_omitted, 450);
     assert!((0..513).all(|index| {
@@ -873,25 +983,29 @@ fn embedding_tool_lock_labels_cover_every_execution_mode() {
 }
 
 #[test]
-fn offline_keeps_only_the_in_process_embedding_evaluator_eligible() {
+fn offline_keeps_local_embedding_modes_eligible_and_blocks_external_mode() {
     use kio_adapter::types::ExecutionMode;
 
-    assert!(
-        crate::embedding::admission::embedding_mode_transport_allowed(
-            ExecutionMode::DeterministicLibrary,
-            true,
-        )
-    );
-    assert!(
-        !crate::embedding::admission::embedding_mode_transport_allowed(
-            ExecutionMode::OfflineApi,
-            true,
-        )
-    );
+    for mode in [
+        ExecutionMode::DeterministicLibrary,
+        ExecutionMode::NativeLibrary,
+        ExecutionMode::OfflineApi,
+    ] {
+        assert!(
+            crate::embedding::admission::embedding_mode_transport_allowed(mode, true),
+            "docs07 §3 permits local mode {mode:?} during offline invocation",
+        );
+    }
     assert!(
         !crate::embedding::admission::embedding_mode_transport_allowed(
             ExecutionMode::OnlineApi,
             true,
+        )
+    );
+    assert!(
+        crate::embedding::admission::embedding_mode_transport_allowed(
+            ExecutionMode::OnlineApi,
+            false,
         )
     );
 }
@@ -918,7 +1032,7 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
     use kio_index::fts::SqliteFtsIndex;
 
     for corrupt_cas in [false, true] {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_support::PrivateTempDir::new();
         let root = temp.path().join("scope");
         fs::create_dir(&root).unwrap();
         let repo = match crate::management::initialize_explicit_root(
@@ -930,8 +1044,10 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
             crate::management::ExplicitRoot::Created(repo) => repo,
             crate::management::ExplicitRoot::Existing(_) => panic!("fresh root"),
         };
+        let projection = temp.path().join("projection");
+        crate::test_support::create_private_test_directory(&projection);
         let mut index = SqliteFtsIndex::open(
-            temp.path().join("projection.sqlite"),
+            projection.join("projection.sqlite"),
             FtsSchemaConfig {
                 tokenizer: FtsTokenizer::Trigram,
             },
@@ -968,7 +1084,8 @@ fn embedding_cas_failure_cannot_publish_source_or_replica_vectors() {
             .embedding_path(&group.embedding_hash)
             .unwrap();
         if corrupt_cas {
-            fs::create_dir_all(object_path.parent().unwrap()).unwrap();
+            crate::test_support::create_private_test_directory(object_path.parent().unwrap());
+            drop(crate::test_support::create_private_test_file(&object_path));
             fs::write(&object_path, b"corrupt immutable object").unwrap();
         }
         let mut replica = kio_index::aggregator::ScopeDelta::default();
@@ -1117,7 +1234,7 @@ fn chunk_ledger_parent_symlink_never_reaches_victim_directory() {
 fn replacing_chunk_ledger_never_follows_index_or_ledger_symlink() {
     let temp = tempfile::tempdir().unwrap();
     let kio_dir = temp.path().join(".kio");
-    fs::create_dir_all(&kio_dir).unwrap();
+    crate::test_support::create_private_test_directory(&kio_dir);
     let index_victim = tempfile::tempdir().unwrap();
     let index_ledger = index_victim.path().join("chunks.jsonl");
     fs::write(&index_ledger, b"index victim\n").unwrap();
@@ -1126,7 +1243,7 @@ fn replacing_chunk_ledger_never_follows_index_or_ledger_symlink() {
     assert_eq!(fs::read(&index_ledger).unwrap(), b"index victim\n");
 
     fs::remove_file(kio_dir.join("index")).unwrap();
-    fs::create_dir(kio_dir.join("index")).unwrap();
+    crate::test_support::create_private_test_directory(&kio_dir.join("index"));
     let ledger_victim = temp.path().join("ledger-victim");
     fs::write(&ledger_victim, b"ledger victim\n").unwrap();
     symlink(&ledger_victim, kio_dir.join("index/chunks.jsonl")).unwrap();
@@ -1140,7 +1257,7 @@ fn replacing_chunk_ledger_never_follows_index_or_ledger_symlink() {
 fn held_chunk_ledger_root_survives_kio_replacement_without_touching_victim() {
     let temp = tempfile::tempdir().unwrap();
     let kio_dir = temp.path().join(".kio");
-    fs::create_dir_all(kio_dir.join("index")).unwrap();
+    crate::test_support::create_private_test_directory(&kio_dir.join("index"));
     let directory = crate::index::chunk_ledger::open_chunk_ledger_dir(&kio_dir, false).unwrap();
     let victim = tempfile::tempdir().unwrap();
     let original = temp.path().join(".kio-original");
@@ -1167,7 +1284,7 @@ fn held_chunk_ledger_root_survives_kio_replacement_without_touching_victim() {
 fn publication_event_can_follow_its_newly_durable_creation_and_is_idempotent() {
     let temp = tempfile::tempdir().unwrap();
     let kio_dir = temp.path().join(".kio");
-    fs::create_dir(&kio_dir).unwrap();
+    crate::test_support::create_private_test_directory(&kio_dir);
     let chunk = ledger_test_chunk();
     let event = ChunkPublicationEvent {
         event: "publication".to_owned(),
@@ -1191,7 +1308,7 @@ fn publication_event_can_follow_its_newly_durable_creation_and_is_idempotent() {
 fn publication_event_before_its_creation_is_corrupt_even_if_creation_appears_later() {
     let temp = tempfile::tempdir().unwrap();
     let kio_dir = temp.path().join(".kio");
-    fs::create_dir_all(kio_dir.join("index")).unwrap();
+    crate::test_support::create_private_test_directory(&kio_dir.join("index"));
     let chunk = ledger_test_chunk();
     let event = ChunkPublicationEvent {
         event: "publication".to_owned(),
@@ -1200,6 +1317,9 @@ fn publication_event_before_its_creation_is_corrupt_even_if_creation_appears_lat
         introduction_commit:
             "sha256:1111111111111111111111111111111111111111111111111111111111111111".to_owned(),
     };
+    drop(crate::test_support::create_private_test_file(
+        &kio_dir.join("index/chunks.jsonl"),
+    ));
     fs::write(
         kio_dir.join("index/chunks.jsonl"),
         format!(
@@ -1267,8 +1387,9 @@ fn duplicate_association_without_publication_does_not_read_the_chunk_ledger() {
 fn complete_chunk_ledger_rows_reject_missing_fields_unknown_fields_and_bad_hashes() {
     let temp = tempfile::tempdir().unwrap();
     let kio_dir = temp.path().join(".kio");
-    fs::create_dir_all(kio_dir.join("index")).unwrap();
+    crate::test_support::create_private_test_directory(&kio_dir.join("index"));
     let path = kio_dir.join("index/chunks.jsonl");
+    drop(crate::test_support::create_private_test_file(&path));
     let valid = serde_json::to_value(ledger_test_chunk()).unwrap();
 
     let mut non_current_field = valid.clone();
@@ -1828,7 +1949,8 @@ fn search_index_status_uses_preflight_month() {
             )
             .unwrap();
             assert_eq!(
-                status.budget_paused, paused,
+                status.budget_paused,
+                Some(paused),
                 "device_only={device_only} month={month}"
             );
         }
@@ -3399,7 +3521,12 @@ fn r10_6_open_cache_write_is_atomic_readonly_and_cleans_temp() {
     use crate::open_view::write_open_cache_atomic;
     let dir = tempfile::tempdir().unwrap();
     let cache = dir.path().join("obj").join("doc.md");
-    std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+    crate::private_state::ensure_private_directory(
+        cache.parent().unwrap(),
+        dir.path(),
+        &kio_core::control::ControlHandle::default(),
+    )
+    .unwrap();
     write_open_cache_atomic(&cache, b"evidence bytes").unwrap();
     assert_eq!(std::fs::read(&cache).unwrap(), b"evidence bytes");
     #[cfg(unix)]
@@ -3506,16 +3633,27 @@ fn r10_8_snapshot_tree_entries_insert_is_atomic() {
 
 #[test]
 fn r9_8_atomic_write_cas_object_removes_temp_on_failure() {
-    use crate::object_persistence::atomic_write_cas_object;
-    // R9-8: a torn derived-CAS write must not leave an orphan `.tmp-*` in the
-    // fanout dir. Force the rename to fail deterministically by making the
-    // destination an existing directory after the temp is created + fsynced.
+    use crate::object_persistence::write_canonical_cas_object_or_reuse;
+    use kio_core::cas::ContentObjectKind;
     let dir = tempfile::tempdir().unwrap();
-    let dest = dir.path().join("obj");
-    std::fs::create_dir(&dest).unwrap();
-    let result = atomic_write_cas_object(dir.path(), &dest, b"derived-bytes");
+    let repo = kio_core::scope::Repository::init(dir.path()).unwrap();
+    let bytes = b"derived-bytes";
+    let hash = kio_core::cas::hash_bytes(bytes);
+    let dest = crate::open_view::cas_object_path(repo.kio_dir(), "prepared", &hash).unwrap();
+    let parent =
+        kio_core::store_dir::StoreDirectory::open_or_create_directories(dest.parent().unwrap())
+            .unwrap();
+    parent
+        .create_directory(std::path::Path::new(dest.file_name().unwrap()))
+        .unwrap();
+    let result = write_canonical_cas_object_or_reuse(
+        repo.kio_dir(),
+        ContentObjectKind::Prepared,
+        &hash,
+        bytes,
+    );
     assert!(result.is_err(), "write onto a directory must fail");
-    let stray: Vec<_> = std::fs::read_dir(dir.path())
+    let stray: Vec<_> = std::fs::read_dir(dest.parent().unwrap())
         .unwrap()
         .filter_map(std::result::Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
@@ -3525,16 +3663,32 @@ fn r9_8_atomic_write_cas_object_removes_temp_on_failure() {
         stray.is_empty(),
         "temp not cleaned up on failure: {stray:?}"
     );
+    assert!(
+        dest.is_dir(),
+        "the conflicting directory must remain untouched"
+    );
 }
 
 #[test]
 fn r23_cand_031_existing_prepared_slot_must_match_exact_bytes() {
-    use crate::object_persistence::atomic_write_cas_object;
-
+    use crate::object_persistence::write_canonical_cas_object_or_reuse;
+    use kio_core::cas::ContentObjectKind;
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("prepared-object");
+    let repo = kio_core::scope::Repository::init(dir.path()).unwrap();
+    let bytes = b"secure";
+    let hash = repo
+        .object_store()
+        .write_content_object(ContentObjectKind::Prepared, bytes)
+        .unwrap();
+    let path = crate::open_view::cas_object_path(repo.kio_dir(), "prepared", &hash).unwrap();
     std::fs::write(&path, b"poison").unwrap();
-    let error = atomic_write_cas_object(dir.path(), &path, b"secure").unwrap_err();
+    let error = write_canonical_cas_object_or_reuse(
+        repo.kio_dir(),
+        ContentObjectKind::Prepared,
+        &hash,
+        bytes,
+    )
+    .unwrap_err();
     assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
     assert_eq!(std::fs::read(&path).unwrap(), b"poison");
 }
@@ -3744,7 +3898,8 @@ fn q1_read_stored_chunks_tolerates_torn_tail() {
     let dir = tempfile::tempdir().unwrap();
     let kio_dir = dir.path().join(".kio");
     let path = chunks_jsonl_path(&kio_dir);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    crate::test_support::create_private_test_directory(path.parent().unwrap());
+    drop(crate::test_support::create_private_test_file(&path));
     // Two intact rows, then a torn final line (crash / ENOSPC mid-write_all,
     // no trailing newline).
     let mut contents = format!(
@@ -3769,7 +3924,8 @@ fn q1_read_stored_chunks_flags_mid_file_corruption() {
     let dir = tempfile::tempdir().unwrap();
     let kio_dir = dir.path().join(".kio");
     let path = chunks_jsonl_path(&kio_dir);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    crate::test_support::create_private_test_directory(path.parent().unwrap());
+    drop(crate::test_support::create_private_test_file(&path));
     // A broken NON-final line cannot be a torn tail -> STORE-CORRUPT (exit 4),
     // not the old CONFIG-SCHEMA (exit 2) misclassification.
     let contents = format!(
@@ -3790,7 +3946,8 @@ fn ct4_chunk_ledger_rejects_missing_association_rowid() {
     let dir = tempfile::tempdir().unwrap();
     let kio_dir = dir.path().join(".kio");
     let path = chunks_jsonl_path(&kio_dir);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    crate::test_support::create_private_test_directory(path.parent().unwrap());
+    drop(crate::test_support::create_private_test_file(&path));
     let mut first: serde_json::Value = serde_json::from_str(&stored_chunk_line(42, "c42")).unwrap();
     first.as_object_mut().unwrap().remove("association_rowid");
     std::fs::write(&path, format!("{first}\n")).unwrap();
@@ -3806,7 +3963,8 @@ fn ct4_chunk_ledger_retains_two_configs_for_one_chunk() {
     let dir = tempfile::tempdir().unwrap();
     let kio_dir = dir.path().join(".kio");
     let path = chunks_jsonl_path(&kio_dir);
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    crate::test_support::create_private_test_directory(path.parent().unwrap());
+    drop(crate::test_support::create_private_test_file(&path));
     let mut first: serde_json::Value =
         serde_json::from_str(&stored_chunk_line(7, "shared")).unwrap();
     first["association_rowid"] = serde_json::json!(11);
@@ -3958,13 +4116,23 @@ fn prepared_writer_publishes_new_objects_to_canonical_leaf() {
     use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
-    let kio_dir = dir.path().join(".kio");
-    std::fs::create_dir(&kio_dir).unwrap();
+    let repo = kio_core::scope::Repository::init(dir.path()).unwrap();
+    let kio_dir = repo.kio_dir().to_path_buf();
     let bytes = b"new prepared bytes";
     let hash = hash_bytes(bytes);
-    write_canonical_cas_object_or_reuse(&kio_dir, "prepared", &hash, bytes).unwrap();
+    write_canonical_cas_object_or_reuse(
+        &kio_dir,
+        kio_core::cas::ContentObjectKind::Prepared,
+        &hash,
+        bytes,
+    )
+    .unwrap();
     let canonical = cas_object_path(&kio_dir, "prepared", &hash).unwrap();
-    assert_eq!(std::fs::read(canonical).unwrap(), bytes);
+    assert_eq!(
+        kio_core::private_fs::read_private_file(&canonical, 1024).unwrap(),
+        bytes
+    );
+    kio_core::private_fs::verify_private_directory(canonical.parent().unwrap()).unwrap();
 }
 
 #[cfg(not(windows))]
@@ -3978,15 +4146,28 @@ fn non_current_conflict_cannot_influence_canonical_read_or_write() {
     use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
-    let kio_dir = dir.path().join(".kio");
-    std::fs::create_dir(&kio_dir).unwrap();
+    let repo = kio_core::scope::Repository::init(dir.path()).unwrap();
+    let kio_dir = repo.kio_dir().to_path_buf();
     let bytes = b"canonical prepared bytes";
     let hash = hash_bytes(bytes);
     let non_current = non_current_colon_leaf(&kio_dir, "prepared", &hash);
-    std::fs::create_dir_all(non_current.parent().unwrap()).unwrap();
-    std::fs::write(&non_current, b"conflicting non-current bytes").unwrap();
+    let parent = kio_core::store_dir::StoreDirectory::open_or_create_directories(
+        non_current.parent().unwrap(),
+    )
+    .unwrap();
+    let mut file = parent
+        .create_private_file(std::path::Path::new(non_current.file_name().unwrap()))
+        .unwrap();
+    std::io::Write::write_all(&mut file, b"conflicting non-current bytes").unwrap();
+    drop(file);
 
-    write_canonical_cas_object_or_reuse(&kio_dir, "prepared", &hash, bytes).unwrap();
+    write_canonical_cas_object_or_reuse(
+        &kio_dir,
+        kio_core::cas::ContentObjectKind::Prepared,
+        &hash,
+        bytes,
+    )
+    .unwrap();
     let canonical = cas_object_path(&kio_dir, "prepared", &hash).unwrap();
     let (resolved, loaded) =
         read_cas_byte_object(&kio_dir, "prepared", &hash, MAX_RAW_OBJECT_BYTES)
@@ -4005,7 +4186,7 @@ fn q3_reclaims_orphaned_running_task_to_pending() {
     use crate::batch::command::reclaim_orphaned_running_tasks;
     use kio_pipeline::markdownize::MarkdownizeMode;
     use kio_pipeline::task::{TaskDescriptor, TaskStatus, TaskStore, TaskType};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_support::PrivateTempDir::new();
     let store = TaskStore::new(dir.path());
     let task = TaskDescriptor {
         task_id: "t1".to_owned(),
@@ -4503,3 +4684,12 @@ fn secret_typed_owner_cannot_be_bypassed_by_a_public_same_scope_link() {
         BTreeSet::from([hash])
     );
 }
+
+#[path = "operation_preconditions_tests.rs"]
+mod operation_preconditions_tests;
+
+#[path = "budget_retirement_preconditions_tests.rs"]
+mod budget_retirement_preconditions_tests;
+
+#[path = "caller_ledger_independence_tests.rs"]
+mod caller_ledger_independence_tests;

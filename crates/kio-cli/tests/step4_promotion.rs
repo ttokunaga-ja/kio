@@ -215,6 +215,10 @@ fn ct4_promotion_done_batch_updates_provenance_search_and_is_idempotent() {
     let repo = Repository::open(dir.path()).unwrap();
     let commit = repo.read_commit(&promoted_head).unwrap();
     assert_eq!(
+        commit.message, "online Markdownize promotion",
+        "paid promotion must preserve its established commit message"
+    );
+    assert_eq!(
         commit.parent,
         Some(baseline_head),
         "the two accepted files must promote in one batch commit"

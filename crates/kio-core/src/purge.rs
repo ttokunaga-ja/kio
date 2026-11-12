@@ -1823,9 +1823,10 @@ mod tests {
 
     fn setup() -> (tempfile::TempDir, PurgeState) {
         let dir = tempfile::tempdir().unwrap();
-        let kio_dir = dir.path().join(".kio");
-        fs::create_dir(&kio_dir).unwrap();
-        (dir, PurgeState::open(kio_dir).unwrap())
+        let root = dir.path().canonicalize().unwrap();
+        let external = crate::store_dir::StoreDirectory::open(&root).unwrap();
+        external.create_directory(Path::new(".kio")).unwrap();
+        (dir, PurgeState::open(root.join(".kio")).unwrap())
     }
 
     fn raw() -> String {
@@ -1943,7 +1944,10 @@ mod tests {
             crate::cas::ObjectKind::Tree,
             crate::cas::ObjectKind::Commit,
         ] {
-            fs::create_dir_all(kio_dir.join("objects").join(kind.directory())).unwrap();
+            crate::store_dir::StoreDirectory::open(kio_dir)
+                .unwrap()
+                .create_directory_all(&Path::new("objects").join(kind.directory()))
+                .unwrap();
         }
         crate::cas::ObjectStore::new(kio_dir)
             .write_object_bytes(crate::cas::ObjectKind::Commit, &hash, &bytes)

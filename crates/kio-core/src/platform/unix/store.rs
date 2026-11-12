@@ -21,6 +21,11 @@ static TEMP: AtomicU64 = AtomicU64::new(0);
 fn full(label: &Path, relative: &Path) -> std::path::PathBuf {
     label.join(relative)
 }
+// Recognize only the platform-owned macOS /var spelling. Owned suffixes
+// still traverse real components without following any symlink.
+pub(crate) fn normalize_store_path(path: &Path) -> PathBuf {
+    super::gc_semantics::normalize_gc_scope_path(path)
+}
 pub(crate) fn open(path: &Path) -> Result<File> {
     if !path.is_absolute() {
         return Err(err(path, "store directory path must be absolute"));
@@ -28,7 +33,7 @@ pub(crate) fn open(path: &Path) -> Result<File> {
     let root = cap_fs::open_ambient_dir(Path::new("/"), ambient_authority())
         .map_err(|e| ioerr(path, e))?;
     let mut current = root;
-    for component in path.components() {
+    for component in normalize_store_path(path).components() {
         match component {
             std::path::Component::RootDir => {}
             std::path::Component::Normal(name) => {
@@ -442,6 +447,37 @@ pub(crate) fn append(root: &File, relative: &Path, bytes: &[u8], label: &Path) -
     f.sync_data().map_err(|e| ioerr(&p, e))?;
     Ok(())
 }
+pub(crate) fn append_private(
+    root: &File,
+    relative: &Path,
+    bytes: &[u8],
+    label: &Path,
+) -> Result<()> {
+    let (parent, leaf) = parent(root, relative, label)?;
+    let path = full(label, relative);
+    let expected = match create_private_file_raw(
+        &parent,
+        Path::new(leaf),
+        path.parent().expect("leaf parent"),
+    ) {
+        Ok(file) => file,
+        Err(error) if is_io_kind(&error, "already_exists") => {
+            open_leaf(&parent, leaf, libc::O_RDONLY, 0, &path)?
+        }
+        Err(error) => return Err(error),
+    };
+    super::private_fs::verify_owner_private_regular_handle(&expected, &path)?;
+    let before = safe_regular(&expected, &path)?;
+    let mut file = open_leaf(&parent, leaf, libc::O_WRONLY | libc::O_APPEND, 0, &path)?;
+    super::private_fs::verify_owner_private_regular_handle(&file, &path)?;
+    let opened = safe_regular(&file, &path)?;
+    if before.dev() != opened.dev() || before.ino() != opened.ino() {
+        return Err(err(&path, "private append leaf changed while opening"));
+    }
+    file.write_all(bytes).map_err(|error| ioerr(&path, error))?;
+    file.sync_data().map_err(|error| ioerr(&path, error))?;
+    sync_directory(&parent, label)
+}
 pub(crate) fn remove_file(root: &File, relative: &Path, label: &Path) -> Result<()> {
     let (parent, leaf) = parent(root, relative, label)?;
     let p = full(label, relative);
@@ -770,12 +806,7 @@ pub(crate) fn ensure_owner_private(root: &File, relative: &Path, label: &Path) -
     let (parent, leaf) = parent(root, relative, label)?;
     let p = full(label, relative);
     let f = open_leaf(&parent, leaf, libc::O_RDONLY, 0, &p)?;
-    let m = safe_regular(&f, &p)?;
-    let uid = unsafe { libc::geteuid() };
-    if m.uid() != uid || m.mode() & 0o077 != 0 {
-        return Err(err(&p, "store leaf is not owner-private"));
-    }
-    Ok(())
+    super::private_fs::verify_owner_private_regular_handle(&f, &p)
 }
 pub(crate) fn entries(root: &File, relative: &Path, label: &Path) -> Result<Vec<StoreEntry>> {
     let d = directory(root, relative, label)?;
@@ -877,6 +908,10 @@ fn operation_directory(held: &File, label: &Path) -> Result<File> {
 mod tests {
     use super::same_directory_identity;
     use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::os::fd::AsRawFd;
+    #[cfg(target_os = "linux")]
+    use std::path::Path;
 
     #[test]
     fn directory_identity_ignores_namespace_metadata_but_rejects_other_objects() {
@@ -894,5 +929,41 @@ mod tests {
         fs::write(&file_path, b"regular").unwrap();
         let regular = fs::metadata(file_path).unwrap();
         assert!(!same_directory_identity(&before, &regular));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inherited_directory_descriptor_opens_owned_children_without_resolving_dev_fd() {
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path().canonicalize().unwrap();
+        let owner = crate::store_dir::StoreDirectory::open(&root).unwrap();
+        owner.create_directory(Path::new("owned")).unwrap();
+        let owned = crate::store_dir::StoreDirectory::open(&root.join("owned")).unwrap();
+
+        let inherited = format!("/dev/fd/{}", owned.root_handle().as_raw_fd());
+        let through_descriptor = crate::store_dir::StoreDirectory::open(Path::new(&inherited))
+            .expect("an inherited owned directory remains a retained capability");
+        let child_path = Path::new(&inherited).join("child");
+        let child = crate::store_dir::StoreDirectory::open_or_create_directories(&child_path)
+            .expect("missing owned child is created relative to the retained descriptor");
+        crate::private_fs::verify_private_directory_handle(&child).unwrap();
+        assert!(root.join("owned/child").is_dir());
+        through_descriptor
+            .open_directory(Path::new("child"))
+            .unwrap();
+        assert!(
+            crate::store_dir::StoreDirectory::open(Path::new(&format!(
+                "/dev/fd/0{}",
+                owned.root_handle().as_raw_fd()
+            )))
+            .is_err()
+        );
+        assert!(
+            crate::store_dir::StoreDirectory::open_or_create_directories(Path::new(&format!(
+                "{inherited}/./not-created"
+            ),))
+            .is_err()
+        );
+        assert!(!root.join("owned/not-created").exists());
     }
 }

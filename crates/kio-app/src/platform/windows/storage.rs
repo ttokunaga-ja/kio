@@ -67,10 +67,6 @@ pub(crate) fn configure_chunk_ledger_open(options: &mut cap_fs::OpenOptions) {
     options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
 }
 
-pub(crate) fn configure_chunk_ledger_temp(options: &mut cap_fs::OpenOptions) {
-    configure_cap_no_follow(options);
-}
-
 pub(crate) fn validate_chunk_ledger_links(_metadata: &fs::Metadata) -> std::io::Result<()> {
     Ok(())
 }
@@ -100,13 +96,7 @@ pub(crate) fn sync_chunk_ledger_directory(directory: &File, path: &Path) -> Resu
     Ok(())
 }
 
-pub(crate) fn configure_owner_only_file(_options: &mut fs::OpenOptions) {}
-pub(crate) fn harden_open_cache_hit(_path: &Path) {}
-pub(crate) fn harden_open_cache_subtree(_leaf: &Path, _root: &Path) {}
 pub(crate) fn validate_cached_cas_links(_metadata: &fs::Metadata, _path: &Path) -> Result<()> {
-    Ok(())
-}
-pub(crate) fn validate_exact_cas_links(_metadata: &fs::Metadata, _path: &Path) -> Result<()> {
     Ok(())
 }
 

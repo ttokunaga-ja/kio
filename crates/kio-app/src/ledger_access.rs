@@ -210,6 +210,66 @@ where
     ))
 }
 
+/// Read-only selection of an existing scoped paid dependency. Task stamps
+/// supplement durable jobs, but cannot override missing or unsafe authority.
+/// No month, totals, display observation or send permission is produced here.
+pub(crate) fn incidental_paid_recovery_available(
+    scope_id: &str,
+    has_paid_stamp: bool,
+    control: &ControlHandle,
+) -> std::result::Result<bool, LedgerSnapshotError> {
+    incidental_paid_recovery_at(&ledger_db_path(control), scope_id, has_paid_stamp, control)
+}
+
+fn incidental_paid_recovery_at(
+    path: &Path,
+    scope_id: &str,
+    has_paid_stamp: bool,
+    control: &ControlHandle,
+) -> std::result::Result<bool, LedgerSnapshotError> {
+    let snapshot = LedgerReadSnapshot::open_with_control(path, control.clone())?;
+    let durable_work = snapshot.has_paid_recovery_work_for_scope(scope_id)?;
+    Ok(durable_work || has_paid_stamp)
+}
+
+/// One read-only observation shared by all budget fields of an invocation.
+/// It never grants billing authority, including when a ledger is available.
+pub(crate) struct BudgetObservation {
+    pub(crate) month: String,
+    pub(crate) snapshot: Option<LedgerReadSnapshot>,
+    pub(crate) reason: Option<String>,
+    pub(crate) original_error: Option<KioError>,
+}
+
+impl BudgetObservation {
+    pub(crate) fn invalidate(&mut self, error: &KioError) {
+        self.snapshot = None;
+        self.reason = Some(error.error_code().to_owned());
+    }
+}
+
+pub(crate) fn observe_budget(path: &Path, control: &ControlHandle) -> BudgetObservation {
+    match capture_search_budget_observation(path, control) {
+        Ok((month, snapshot)) => {
+            let reason = snapshot
+                .is_none()
+                .then(|| "KIO-E-LEDGER-UNINITIALIZED-001".to_owned());
+            BudgetObservation {
+                month,
+                snapshot,
+                reason,
+                original_error: None,
+            }
+        }
+        Err(error) => BudgetObservation {
+            month: utc_month(&control.now_utc_seconds()),
+            snapshot: None,
+            reason: Some(error.error_code().to_owned()),
+            original_error: Some(error),
+        },
+    }
+}
+
 pub(crate) fn ledger_snapshot_to_kio(path: &str, error: LedgerSnapshotError) -> KioError {
     match error {
         // A successfully-owned snapshot cannot become Missing while querying.
@@ -712,4 +772,38 @@ pub(crate) fn release_task_charge_if_open(ledger: &LedgerDb, key: &LedgerTaskKey
     )
     .map_err(pipeline_to_kio)?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod recovery_discovery_tests {
+    use super::*;
+
+    #[test]
+    fn incidental_recovery_stamp_never_overrides_unknown_authority() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("device/cost-ledger.sqlite");
+        let control = ControlHandle::default();
+        for stamp in [false, true] {
+            assert!(matches!(
+                incidental_paid_recovery_at(&path, "scope", stamp, &control),
+                Err(LedgerSnapshotError::Missing)
+            ));
+            assert!(!path.exists());
+        }
+        let db = LedgerDb::initialize(&path).unwrap();
+        assert!(!incidental_paid_recovery_at(&path, "scope", false, &control).unwrap());
+        assert!(incidental_paid_recovery_at(&path, "scope", true, &control).unwrap());
+        drop(db);
+        let authority = path.with_file_name("cost-ledger.sqlite.authority.json");
+        std::fs::write(&authority, b"invalid authority").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        for stamp in [false, true] {
+            assert!(matches!(
+                incidental_paid_recovery_at(&path, "scope", stamp, &control),
+                Err(LedgerSnapshotError::UnsafeIntegrity(_))
+            ));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+            assert_eq!(std::fs::read(&authority).unwrap(), b"invalid authority");
+        }
+    }
 }

@@ -15,10 +15,10 @@ use std::{
     time::Duration,
 };
 
-fn sandbox(scratch: &Path) -> (RenderSandbox, OsString) {
+fn sandbox(scratch: &Path) -> (PrivateFixtureSandbox, OsString) {
     let system_root = std::env::var_os("SystemRoot").expect("SystemRoot");
     let program = PathBuf::from(&system_root).join("System32").join("cmd.exe");
-    let sandbox = RenderSandbox::new(
+    let sandbox = PrivateFixtureSandbox::new(
         &program,
         scratch,
         [program.parent().expect("parent").to_owned()],
@@ -27,6 +27,103 @@ fn sandbox(scratch: &Path) -> (RenderSandbox, OsString) {
     .expect("sandbox");
     (sandbox, system_root)
 }
+// These are synthetic, disposable fixtures. Establish the current-revision
+// private scratch precondition immediately before launch, after staging is done.
+// Production admission never repairs existing caller-supplied objects.
+struct PrivateFixtureSandbox {
+    sandbox: RenderSandbox,
+    scratch: PathBuf,
+}
+impl PrivateFixtureSandbox {
+    fn new(
+        program: &Path,
+        scratch: &Path,
+        roots: impl IntoIterator<Item = PathBuf>,
+        limits: RenderResourceLimits,
+    ) -> Result<Self, ConfinementError> {
+        Ok(Self {
+            sandbox: RenderSandbox::new(program, scratch, roots, limits)?,
+            scratch: scratch.to_owned(),
+        })
+    }
+    fn run<I, S>(
+        &self,
+        args: I,
+        environment: &[(OsString, OsString)],
+        options: BoundedProcessOptions,
+    ) -> Result<kio_process::BoundedProcessOutput, ConfinementError>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<std::ffi::OsStr>,
+    {
+        prepare_private_fixture_tree(&self.scratch);
+        self.sandbox.run(args, environment, options)
+    }
+}
+fn prepare_private_fixture_tree(path: &Path) {
+    use windows_sys::Win32::{
+        Security::{
+            Authorization::{
+                EXPLICIT_ACCESS_W, SE_FILE_OBJECT, SET_ACCESS, SetEntriesInAclW,
+                SetNamedSecurityInfoW, TRUSTEE_IS_SID, TRUSTEE_IS_USER,
+            },
+            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION,
+            PROTECTED_DACL_SECURITY_INFORMATION,
+        },
+        Storage::FileSystem::FILE_ALL_ACCESS,
+    };
+    let metadata = std::fs::symlink_metadata(path).unwrap();
+    assert!(
+        !metadata.file_type().is_symlink(),
+        "fixture must not repair a symlink"
+    );
+    if metadata.is_dir() {
+        for child in std::fs::read_dir(path).unwrap() {
+            prepare_private_fixture_tree(&child.unwrap().path());
+        }
+    }
+    let user = current_user_token_buffer();
+    let sid = unsafe {
+        (&*user
+            .as_ptr()
+            .cast::<windows_sys::Win32::Security::TOKEN_USER>())
+            .User
+            .Sid
+    };
+    let mut entry = EXPLICIT_ACCESS_W {
+        grfAccessPermissions: FILE_ALL_ACCESS,
+        grfAccessMode: SET_ACCESS,
+        grfInheritance: 0,
+        ..Default::default()
+    };
+    entry.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    entry.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    entry.Trustee.ptstrName = sid.cast();
+    let mut acl = std::ptr::null_mut();
+    assert_eq!(
+        unsafe { SetEntriesInAclW(1, &entry, std::ptr::null(), &mut acl) },
+        0
+    );
+    let _acl = LocalSecurityAllocation(acl.cast());
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    assert_eq!(
+        unsafe {
+            SetNamedSecurityInfoW(
+                path.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION
+                    | DACL_SECURITY_INFORMATION
+                    | PROTECTED_DACL_SECURITY_INFORMATION,
+                sid,
+                std::ptr::null_mut(),
+                acl,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+}
+
 fn environment(root: OsString, scratch: &Path) -> [(OsString, OsString); 2] {
     [
         (OsString::from("SystemRoot"), root),
@@ -231,8 +328,12 @@ fn assert_current_user_scratch(
     );
     assert_eq!(
         u32::from(ace.Header.AceFlags) & (OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE),
-        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
-        "children must inherit owner access"
+        if full_control {
+            0
+        } else {
+            OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+        },
+        "protected private scratch must have a non-inheriting owner ACE"
     );
     assert_ne!(
         unsafe { EqualSid(std::ptr::addr_of!(ace.SidStart).cast_mut().cast(), sid) },
@@ -309,8 +410,37 @@ fn owner_private_scratch_rejects_junction_without_touching_target_acl() {
     );
 }
 
+fn current_process_default_owner() -> Vec<u8> {
+    use windows_sys::Win32::{
+        Foundation::CloseHandle,
+        Security::{GetLengthSid, GetTokenInformation, TOKEN_OWNER, TOKEN_QUERY, TokenOwner},
+        System::Threading::{GetCurrentProcess, OpenProcessToken},
+    };
+    let mut token = std::ptr::null_mut();
+    assert_ne!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+        0
+    );
+    let mut size = 0;
+    unsafe {
+        GetTokenInformation(token, TokenOwner, std::ptr::null_mut(), 0, &mut size);
+    }
+    assert!(size as usize >= std::mem::size_of::<TOKEN_OWNER>());
+    let mut data = vec![0_usize; (size as usize).div_ceil(std::mem::size_of::<usize>())];
+    let ok = unsafe {
+        GetTokenInformation(token, TokenOwner, data.as_mut_ptr().cast(), size, &mut size)
+    };
+    unsafe {
+        CloseHandle(token);
+    }
+    assert_ne!(ok, 0);
+    let sid = unsafe { (&*data.as_ptr().cast::<TOKEN_OWNER>()).Owner };
+    unsafe { std::slice::from_raw_parts(sid.cast::<u8>(), GetLengthSid(sid) as usize) }.to_vec()
+}
+
 #[test]
 fn appcontainer_writes_its_private_scratch() {
+    let parent_owner_before = current_process_default_owner();
     let scratch = tempfile::tempdir().expect("scratch");
     let (sandbox, root) = sandbox(scratch.path());
     let output = scratch.path().join("output.pdf");
@@ -324,6 +454,20 @@ fn appcontainer_writes_its_private_scratch() {
         .expect("launch");
     assert!(result.status.success());
     assert!(output.is_file());
+    assert_eq!(
+        current_process_default_owner(),
+        parent_owner_before,
+        "renderer default-owner conformance must never mutate the host token"
+    );
+    let user = current_user_token_buffer();
+    let sid = unsafe {
+        (&*user
+            .as_ptr()
+            .cast::<windows_sys::Win32::Security::TOKEN_USER>())
+            .User
+            .Sid
+    };
+    assert_current_user_scratch(&output, sid, true);
 }
 
 #[test]
@@ -364,13 +508,14 @@ fn appcontainer_relative_output_uses_canonical_unicode_space_scratch() {
 
 // Reuse this integration executable so the denial tests make real stdlib OS
 // calls without relying on another interpreter, ambient PATH, or shell output.
-fn denial_actor_sandbox(scratch: &Path) -> (RenderSandbox, Vec<(OsString, OsString)>) {
+fn denial_actor_sandbox(scratch: &Path) -> (PrivateFixtureSandbox, Vec<(OsString, OsString)>) {
     let program = scratch.join("denial-actor.exe");
     std::fs::copy(std::env::current_exe().expect("test executable"), &program)
         .expect("stage denial actor");
     let root = std::env::var_os("SystemRoot").expect("SystemRoot");
-    let sandbox = RenderSandbox::new(&program, scratch, [], RenderResourceLimits::default())
-        .expect("denial actor sandbox");
+    let sandbox =
+        PrivateFixtureSandbox::new(&program, scratch, [], RenderResourceLimits::default())
+            .expect("denial actor sandbox");
     (sandbox, environment(root, scratch).into())
 }
 
@@ -613,7 +758,7 @@ fn timeout_kills_renderer_job_before_delayed_child_can_write() {
     );
     // A surviving child would observe release and write its marker. The child
     // has proved readiness and was never released before whole-Job cleanup.
-    std::fs::write(scratch.path().join("release-child"), b"release").unwrap();
+    write_current_user_runtime_fixture(&scratch.path().join("release-child"), b"release");
     std::thread::sleep(Duration::from_millis(600));
     assert!(!marker.exists(), "child escaped Job Object");
 }
@@ -664,6 +809,63 @@ fn stage_launcher_and_child(scratch: &Path, child_action: &str, redirect_pipes: 
     ).unwrap();
 }
 
+// Host handshakes are created while the invocation ACL is active. Specify
+// TokenUser at creation even under an elevated host; inherit the exact current
+// scratch grant without rewriting any live descriptor or existing object.
+fn write_current_user_runtime_fixture(path: &Path, bytes: &[u8]) {
+    use std::{io::Write as _, os::windows::io::FromRawHandle as _};
+    use windows_sys::Win32::{
+        Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE},
+        Security::{
+            InitializeSecurityDescriptor, SECURITY_ATTRIBUTES, SECURITY_DESCRIPTOR,
+            SetSecurityDescriptorOwner, TOKEN_USER,
+        },
+        Storage::FileSystem::{
+            CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            FILE_SHARE_WRITE,
+        },
+    };
+    let user = current_user_token_buffer();
+    let sid = unsafe { (&*user.as_ptr().cast::<TOKEN_USER>()).User.Sid };
+    let mut descriptor = SECURITY_DESCRIPTOR::default();
+    let descriptor_ptr = (&mut descriptor as *mut SECURITY_DESCRIPTOR).cast();
+    assert_ne!(
+        unsafe { InitializeSecurityDescriptor(descriptor_ptr, 1) },
+        0
+    );
+    assert_ne!(
+        unsafe { SetSecurityDescriptorOwner(descriptor_ptr, sid, 0) },
+        0
+    );
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: descriptor_ptr,
+        bInheritHandle: 0,
+    };
+    let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let raw = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    assert_ne!(
+        raw,
+        INVALID_HANDLE_VALUE,
+        "create current-user runtime handshake: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut output = unsafe { std::fs::File::from_raw_handle(raw) };
+    output
+        .write_all(bytes)
+        .expect("write current-user runtime handshake");
+}
+
 fn wait_ready_child<T>(scratch: &Path, result: &mpsc::Receiver<T>) {
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !scratch.join("child-ready").exists() {
@@ -684,7 +886,7 @@ fn release_ready_child<T>(scratch: &Path, result: &mpsc::Receiver<T>) {
     // The child cannot finish until we release it, even though its launcher
     // exits and redirected pipes can already report EOF to the host.
     let early = result.recv_timeout(Duration::from_millis(250));
-    std::fs::write(scratch.join("release-child"), b"release").unwrap();
+    write_current_user_runtime_fixture(&scratch.join("release-child"), b"release");
     assert!(
         matches!(early, Err(mpsc::RecvTimeoutError::Timeout)),
         "renderer returned while its descendant was waiting for release"
@@ -750,7 +952,7 @@ fn launcher_exit_does_not_stop_descendant_scratch_monitoring() {
     );
     let (_, root) = sandbox(scratch.path());
     let program = PathBuf::from(&root).join("System32").join("cmd.exe");
-    let sandbox = RenderSandbox::new(
+    let sandbox = PrivateFixtureSandbox::new(
         &program,
         scratch.path(),
         [program.parent().unwrap().to_path_buf()],
@@ -777,7 +979,7 @@ fn launcher_exit_does_not_stop_descendant_scratch_monitoring() {
         .unwrap()
         .unwrap_err();
     worker.join().unwrap();
-    std::fs::write(scratch.path().join("cleanup-probe"), b"probe").unwrap();
+    write_current_user_runtime_fixture(&scratch.path().join("cleanup-probe"), b"probe");
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         !scratch.path().join("child-survived").exists(),
@@ -803,7 +1005,7 @@ fn late_oversized_child_output_is_rejected_when_child_exits_immediately() {
     );
     let (_, root) = sandbox(scratch.path());
     let program = PathBuf::from(&root).join("System32").join("cmd.exe");
-    let sandbox = RenderSandbox::new(
+    let sandbox = PrivateFixtureSandbox::new(
         &program,
         scratch.path(),
         [program.parent().unwrap().to_path_buf()],
@@ -863,7 +1065,7 @@ fn launcher_exit_does_not_stop_descendant_output_monitoring() {
         .unwrap()
         .unwrap_err();
     worker.join().unwrap();
-    std::fs::write(scratch.path().join("cleanup-probe"), b"probe").unwrap();
+    write_current_user_runtime_fixture(&scratch.path().join("cleanup-probe"), b"probe");
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         !scratch.path().join("child-survived").exists(),
@@ -912,7 +1114,7 @@ fn launcher_exit_and_pipe_eof_do_not_bypass_descendant_timeout() {
     // If a descendant survived cleanup, releasing its handshake would permit
     // it to create this output. Give asynchronous Job termination a grace only
     // in the assertion, never in the renderer's command deadline.
-    std::fs::write(scratch.path().join("release-child"), b"release").unwrap();
+    write_current_user_runtime_fixture(&scratch.path().join("release-child"), b"release");
     std::thread::sleep(Duration::from_millis(500));
     assert!(!scratch.path().join("child-output").exists());
 }

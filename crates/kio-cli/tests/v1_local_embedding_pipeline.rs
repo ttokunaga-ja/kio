@@ -1,6 +1,6 @@
-//! Local embedding transport must honor `index --offline` even with a current
-//! loopback trust root and explicit adapter grant. The positive control proves
-//! this fixture reaches the real local TLS transport when offline is absent.
+//! docs/07 §3/3.1: approved loopback embedding remains eligible with `--offline`.
+//! Independent offline/default fixtures must reach real TLS, whose EOF precedes
+//! any HTTP body, while local failure/backoff creates no billing or vector.
 
 mod support;
 
@@ -60,14 +60,14 @@ impl ClosingLoopback {
         self.attempts.load(Ordering::SeqCst)
     }
 
-    fn wait_for_attempt(&self) {
+    fn wait_for_attempt_after(&self, before: usize) {
         let deadline = Instant::now() + Duration::from_secs(3);
-        while self.count() == 0 && Instant::now() < deadline {
+        while self.count() <= before && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(5));
         }
         assert!(
-            self.count() > 0,
-            "positive control must reach the loopback TLS transport"
+            self.count() > before,
+            "each fresh fixture must reach the loopback TLS transport"
         );
     }
 }
@@ -94,6 +94,7 @@ fn kio(dir: &TempDir, args: &[&str]) -> Command {
         .env("XDG_CONFIG_HOME", dir.path().join(".test-config"))
         .env("XDG_DATA_HOME", dir.path().join(".test-data"))
         .env("XDG_CACHE_HOME", dir.path().join(".test-cache"))
+        .env("XDG_STATE_HOME", dir.path().join(".test-state"))
         .args(args);
     if let Some(system_root) = std::env::var_os("SystemRoot") {
         command.env("SystemRoot", system_root);
@@ -105,6 +106,7 @@ fn setup(dir: &TempDir, peer: &ClosingLoopback) {
     #[cfg(unix)]
     fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
     fs::create_dir_all(dir.path().join(".home")).unwrap();
+    support::create_private_child_dir(dir.path(), ".test-state");
     fs::create_dir_all(dir.path().join(".tmp")).unwrap();
     let config = dir.path().join(".test-config/kio/tools.toml");
     #[cfg(windows)]
@@ -193,87 +195,69 @@ fn source_embedding_count(dir: &TempDir) -> i64 {
 }
 
 #[test]
-fn offline_index_never_contacts_approved_local_embedding_peer() {
-    let dir = support::canonical_tempdir();
+fn approved_local_embedding_peer_is_attempted_with_and_without_offline() {
     let peer = ClosingLoopback::start();
-    setup(&dir, &peer);
-
-    let offline = kio(&dir, &["--json", "index", "--offline"])
-        .output()
-        .unwrap();
-    thread::sleep(Duration::from_millis(100));
-    assert_eq!(
-        peer.count(),
-        0,
-        "--offline must not attempt local TLS: status={} stdout={} stderr={}",
-        offline.status,
-        String::from_utf8_lossy(&offline.stdout),
-        String::from_utf8_lossy(&offline.stderr),
-    );
-    assert_eq!(
-        offline.status.code(),
-        Some(0),
-        "offline index must complete: stdout={} stderr={}",
-        String::from_utf8_lossy(&offline.stdout),
-        String::from_utf8_lossy(&offline.stderr),
-    );
-    assert_eq!(
-        embedding_rows(&dir),
-        (0, 0),
-        "--offline must not reserve or charge an embedding"
-    );
-    assert_eq!(
-        source_embedding_count(&dir),
-        0,
-        "--offline must not publish a vector"
-    );
-
-    // The same trust root, grant and document are a positive transport control.
-    let normal = kio(&dir, &["--json", "index"]).output().unwrap();
-    peer.wait_for_attempt();
-    assert!(
-        normal.status.success() || [3, 4, 5, 6].contains(&normal.status.code().unwrap_or(-1)),
-        "unexpected local TLS EOF outcome: stdout={} stderr={}",
-        String::from_utf8_lossy(&normal.stdout),
-        String::from_utf8_lossy(&normal.stderr),
-    );
-    let ledger = support::immutable_sqlite(dir.path().join(".test-data/kio/cost-ledger.sqlite"));
-    let (outcome, usd, estimated, state, null_handle): (String, f64, bool, i64, bool) = ledger.query_row(
-        "SELECT l.outcome, l.usd, l.estimated, b.state, b.batch_job_id IS NULL FROM cost_ledger l JOIN batch_requests b USING (scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq) WHERE l.adapter_kind='embedding'",
-        [],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
-    ).unwrap();
-    assert_ne!(outcome, "succeeded", "TLS EOF cannot be a successful send");
-    assert_ne!(
-        outcome, "unknown_settled",
-        "local TLS EOF has no paid remote uncertainty"
-    );
-    assert_eq!(usd, 0.0);
-    assert!(
-        !estimated,
-        "local confirmed-zero failure is not an estimate"
-    );
-    assert_eq!(
-        state, 3,
-        "local transport failure must reach terminal state"
-    );
-    assert!(null_handle, "local execution has no remote job handle");
-    let tasks = fs::read_to_string(dir.path().join(".kio/tasks.jsonl")).unwrap();
-    let embedding = tasks
-        .lines()
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .rfind(|task| task["type"] == "embedding")
-        .expect("local attempt must have a typed embedding task");
-    assert_eq!(embedding["status"], "failed", "{embedding}");
-    assert_ne!(
-        embedding["fallback_reason"], "result_unknown",
-        "{embedding}"
-    );
-    assert!(
-        embedding["fallback_reason"]
+    for args in [
+        &["--json", "index", "--offline"][..],
+        &["--json", "index"][..],
+    ] {
+        // Each posture gets fresh scope, device, grant and local execution state.
+        // A previous failed attempt/backoff cannot satisfy the next control.
+        let dir = support::canonical_tempdir();
+        setup(&dir, &peer);
+        let attempts_before = peer.count();
+        let output = kio(&dir, args).output().unwrap();
+        peer.wait_for_attempt_after(attempts_before);
+        assert!(
+            output.status.success() || [3, 4, 5, 6].contains(&output.status.code().unwrap_or(-1)),
+            "unexpected local TLS EOF outcome for {args:?}: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert!(
+            peer.count() > attempts_before,
+            "{args:?} must attempt its own local TLS connection"
+        );
+        assert_eq!(
+            embedding_rows(&dir),
+            (0, 0),
+            "free local TLS failure must not reserve, journal or settle billing: {args:?}"
+        );
+        let tasks = fs::read_to_string(dir.path().join(".kio/tasks.jsonl")).unwrap();
+        let embedding = tasks
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .rfind(|task| task["type"] == "embedding")
+            .expect("local attempt must have a typed embedding task");
+        assert_eq!(embedding["status"], "failed", "{embedding}");
+        assert_eq!(
+            embedding["attempts"], 1,
+            "one fresh local attempt: {embedding}"
+        );
+        assert_ne!(
+            embedding["fallback_reason"], "result_unknown",
+            "{embedding}"
+        );
+        assert_eq!(
+            embedding["fallback_reason"], "network_error",
+            "TLS EOF has a typed transport failure: {embedding}"
+        );
+        let retry_at = embedding["next_retry_at"]
             .as_str()
-            .is_some_and(|reason| !reason.is_empty()),
-        "failed task needs a concrete reason: {embedding}"
-    );
-    assert_eq!(source_embedding_count(&dir), 0);
+            .expect("TLS EOF must retain retry backoff");
+        let created_at = embedding["created_at"].as_str().unwrap();
+        assert!(
+            kio_core::scope::parse_utc_seconds(retry_at).unwrap()
+                > kio_core::scope::parse_utc_seconds(created_at).unwrap(),
+            "network failure must retain a future retry deadline: {embedding}",
+        );
+        assert!(embedding["reservation_id"].is_null());
+        assert!(embedding["reserved_usd"].is_null());
+        assert!(embedding["reserved_month"].is_null());
+        assert_eq!(
+            source_embedding_count(&dir),
+            0,
+            "failed TLS cannot publish a vector: {args:?}"
+        );
+    }
 }
