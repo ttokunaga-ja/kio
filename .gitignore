@@ -51,3 +51,6 @@ venv/
 /.claude/agent-memory-local
 /.claude/first-run
 /.claude/assistant-daemon-state.json
+
+# Agent work area: temporary outputs and intermediate files (AGENTS.md「エージェント運用」)
+/scratch/
