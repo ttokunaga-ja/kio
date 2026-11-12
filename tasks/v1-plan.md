@@ -29,7 +29,7 @@
 | 番号 | 作業 | 受入条件 |
 |---|---|---|
 | V1 | テストが実際のホームに書き込まないようにする。`XDG_DATA_HOME` だけを差し替えて `XDG_STATE_HOME` や `HOME` を差し替えていないテストが 47 ファイルある | 全テストの実行の前後で、`~/.local/share/kio`、`~/.local/state/kio`、`~/.config/kio`、`~/.cache/kio` に変化がない |
-| V2 | CI の Linux の全テストを 2 つの job に分ける（Windows と同じ形）。全テストだけで 39〜42 分かかり、2026-11-13 に 45 分の制限を一度超えた。制限は 60 分に上げてある | 分けた job がそれぞれ 30 分以内に終わり、全テストを漏れなく実行している |
+| V2 | `kio-cli` のテスト `ci2_replay_history` を軽くする。この 1 本が、CI の Linux の job で 17 分（普通の runner）〜31 分（遅い runner）かかり、job 全体が 38 分〜55 分超になっている。履歴の replay は `synthetic-history-eval` の job が release build で 4〜6 分で実行しているので、重複を除くか、入力を小さくする。当面、job の制限は 90 分に上げてある | Linux の全テストの job が普通の runner で 25 分以内に終わる。W1-ci2 が確かめていること（成功したコマンドの stderr に、仕様で決めた readiness の 1 行だけを許す）のテストは残る。制限を 45 分に戻す |
 
 ### 3.2 制約の緩和の残り（優先度「高」12 件）
 
@@ -124,7 +124,7 @@ ls -d ~/.local/share/kio ~/.local/state/kio ~/.config/kio ~/.cache/kio   # 何�
 
 ### 4.2 CI
 
-push すると通常の CI が動き、50〜100 分かかる。Linux の全テストは 40 分前後で、制限は 60 分である。push は、ローカル検証が通った区切りでまとめて行う。macOS と Windows の結果はここでしか分からないので、OS 固有の変更は小さい単位で push する。
+push すると通常の CI が動き、50〜100 分かかる。Linux の全テストの job は 38 分〜55 分超で、V2 が終わるまで制限は 90 分である。push は、ローカル検証が通った区切りでまとめて行う。macOS と Windows の結果はここでしか分からないので、OS 固有の変更は小さい単位で push する。
 
 ### 4.3 高いコストの検証
 
