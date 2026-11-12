@@ -50,11 +50,12 @@ jobs:
 
   rust:
     runs-on: ubuntu-24.04
-    # Hosted runs took 32:55 and exceeded 35 minutes during workspace tests;
-    # kio-eval's library alone took 18:11 / 18:43. Keep every test and allow
-    # runner variance plus the remaining binaries. With the dependent gate's
-    # ten-minute bound, the dependency critical-path budget is now 55 minutes.
-    timeout-minutes: 45
+    # Workspace tests alone took 39 to 42 minutes on hosted runners after the
+    # 2026-10 relaxation work added tests, and one run exceeded the former
+    # 45-minute bound with no code change. Keep every test and allow runner
+    # variance. With the dependent gate's ten-minute bound, the dependency
+    # critical-path budget is now 70 minutes.
+    timeout-minutes: 60
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
