@@ -1,0 +1,101 @@
+ID	優先度	内容	当時の提案	今回の整理	出典
+APP-03	高	管理CAの異常が無関係なローカルコマンドを止める	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:62
+APP-04	高	Adapterを使わない処理も全体設定の検証で停止する	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:115
+APP-02	高	課金台帳の異常でテキスト検索・状態照会・オフライン索引作成も失敗する	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:157
+AD-01	高	合意済みのloopback HTTPが実装では引き続き拒否される	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:205
+APP-01	高	無料のローカル埋め込みにも課金台帳が必要	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:288
+ST05	高	直下10,000 fileは文書のsoft limitに反するhard stop	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:375
+ST04	高	原本512 MiB・scope合計4 GiBでarchive/statusを停止	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:423
+APP-26	高	前処理出力の変化で通常索引更新と監視が停止する	remove	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:470
+AD-14	高	PDFの固定page/object/展開上限で通常の大きい文書も拒否する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:507
+AD-16	高	XLSXのsheet/row/cell上限とvisual未抽出	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:574
+AD-17	高	Office rendererの配布元・版・path・sandbox前提	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:646
+PROC-01	高	Linux の systemd/cgroup 必須構成が、通常の個人用 PC でも Office 変換を制限する	user decision	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:728
+ST01	高	管理ルート・私有状態に祖先のACL・mode・所有者条件を要求	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:796
+AD-30	高	task/unsupported追記journalの固定寿命上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:883
+AD-29	高	読取専用ledger snapshotとbackupの固定容量上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:954
+ST06	高	管理対象restoreは64 MiB/file・合計512 MiBに限定	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1010
+CLI-01	高	export 先を scope 全域で禁止	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1063
+APP-11	高	自分の監視serviceでも実行ファイル・環境の更新を拒否する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1101
+APP-13	高	直上の管理フォルダが独立rootの明示作成を妨げる	relax	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1154
+APP-05	中	公開CAの入力にも所有者専用権限と絶対パスを要求する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1202
+AD-07	中	秘密情報のファイル名heuristicによるローカル除外とHTTP hold	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1240
+AD-10	中	symlinkディレクトリ・非UTF8名・control pathの除外	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1365
+ST02	中	私有ファイル・スケジューラの祖先symlink/reparseを拒否	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1465
+AD-11	中	子scope探索・continuation・globの固定上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1536
+AD-06	中	HTTP応答上限・identity encoding限定・実効30秒timeout・proxy禁止	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1602
+AD-15	中	OOXML preflightのZIP variant・XML制限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1674
+PROC-02	中	Linux helper の固定配置と root 所有祖先の要求には、実行対象の保護と配置方針が混在する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1741
+PROC-04	中	Windows の AppContainer から読める変換器配置が必要で、通常の利用者別導入にも影響する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1783
+PROC-06	中	scratch の構造・検査時間の固定上限が正当な変換出力も拒否し得る	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1820
+PROC-07	中	変換器の診断出力が UTF-8 でなければ、成功した変換も拒否する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1877
+APP-16	中	予約情報があると台帳障害でpurgeできない	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1919
+APP-17	中	再構築可能な検索用DBの異常でも修復まで検索できない	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:1957
+APP-18	中	再生成reindexは対話端末でもyesフラグが必須	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2010
+APP-23	中	明示的な上書きでもhardlinkされたexport先を拒否する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2042
+ST13	中	履歴・GC走査の固定資源上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2090
+ST15	中	planned-removalの小さい予算がcleanupを停止しうる	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2148
+ST19	中	registry snapshotは64 MiB/leaf・128 MiB合計と有限retry	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2201
+CLI-02	中	export の予約接尾辞と残骸名で復元拒否	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2254
+CLI-03	中	export の大小文字・正規化衝突を全 OS で拒否	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2302
+CLI-04	中	export の総量・宛先走査上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2345
+PROC-12	中	時計の巻戻りで定期 snapshot を全体エラーにする	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2388
+APP-27	中	初回ローカルscanの確認要求が実装から消えた後もCLI文書に残る	remove	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2446
+AD-02	低／対象者限定	ローカルHTTPSのCA固定とprivate file検査	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2494
+AD-03	低／対象者限定	ローカルHTTPにも完全一致のscope/device送信grantを要求する	user decision	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2556
+AD-04	低／対象者限定	tools設定・同梱adapter・cmd/argsの制限	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2661
+AD-05	低／対象者限定	plain認証情報は現在のowner-private toolsファイルを要求する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2733
+AD-09	低／対象者限定	scanのno-follow・同一handle・変更検出	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2790
+AD-12	低／対象者限定	prepare入力bytesとraw hashの一致を要求する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2857
+AD-13	低／対象者限定	非text・弱いPDF textをdeterministic検索本文にしない	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2904
+AD-18	低／対象者限定	Office実行体fingerprintと時間・byte上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:2966
+AD-19	低／対象者限定	大きいunit alignmentは全unit変更へ縮退する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3033
+AD-20	低／対象者限定	normalized応答の完全一致・構造・容量受入検査	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3085
+AD-21	低／対象者限定	OCR・annotationの件数と展開後byte上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3157
+AD-22	低／対象者限定	embeddingのsource/wire上限とvector整合性検査	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3229
+AD-23	低／対象者限定	model aliasとprofile pinの制限	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3306
+AD-24	低／対象者限定	Batch回復の完全なcredential bindingとinventory上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3373
+AD-25	低／対象者限定	有料の結果不明・retry lockが自動重複支出を止める	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3445
+AD-26	低／対象者限定	予算の既定上限と設定schema制約	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3507
+AD-28	低／対象者限定	ledgerのauthority/checkpoint/schema/private storage完全一致gate	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3569
+AD-34	低／対象者限定	embedding回復artifactとcleanup queueにも固定上限がある	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3641
+APP-06	低／対象者限定	CAの変更・回復に明示フラグと厳密な識別子を要求する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3678
+APP-07	低／対象者限定	scopeと端末の両方の送信許可が必要で、実行先などの変更後は再承認になる	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3736
+APP-09	低／対象者限定	オフライン監視はローカルHTTP(S)のAdapterも使わない	user decision	main実装あり（静的確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3794
+APP-10	低／対象者限定	監視は登録済み管理rootと同じ実体だけに限定される	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3847
+APP-14	低／対象者限定	現在の祖先policyが過去のローカル知識にも適用される	user decision	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:3905
+APP-15	低／対象者限定	purge記録と処理中journalが読み取り・取り込み・再構築を止める	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4001
+APP-19	低／対象者限定	結果不明やタスク異常が自動再試行を制限する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4059
+APP-21	低／対象者限定	端末のKio管理状態はロック欠損や危険な置換を拒否する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4117
+APP-22	低／対象者限定	不可逆なKio保守操作には対象を示して確認する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4165
+APP-24	低／対象者限定	固定の資源上限が大きな正常入力や履歴も拒否する	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4223
+APP-25	低／対象者限定	製品要件の受入停止条件は実装済みruntime制約とは区別する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4286
+CLI-05	低／対象者限定	上書き export の追加確認	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4328
+DOC-01	低／対象者限定	抽出 Markdown の直接修正禁止	user decision	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4366
+PROC-03	低／対象者限定	文書変換器のファイル・ネットワーク隔離と、明示した runtime だけの公開は維持する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4404
+PROC-05	低／対象者限定	私有 scratch の作成と retained handle による no-follow 出力検証は維持する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4462
+PROC-08	低／対象者限定	入力・出力・期限の上限と、所有する子プロセスだけの終了処理は維持する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4514
+PROC-09	低／対象者限定	変換器の環境変数初期化は維持し、runtime PATH は対応パッケージに合わせる	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4576
+PROC-10	低／対象者限定	Linux の制御用 filesystem の別名検出は維持し、parser 上限は対応環境の範囲として扱う	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4628
+PROC-11	低／対象者限定	変換器全体の資源・終了権限の確認は維持し、PC 全体の強化として説明しない	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4675
+PROC-13	低／対象者限定	定期実行の opt-in・state 同一性と、限定した一時残骸の回復は維持する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4737
+PROC-14	低／対象者限定	docs05 の常駐・scheduler installer 不在という記述が、実装済み watch service と矛盾する	remove	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4805
+PROC-15	低／対象者限定	対象 OS の build 拒否は対応範囲の明示として維持する	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4873
+SRCH-01	低／対象者限定	更新・policy 変化・cache 消失で cursor を無効化	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4911
+SRCH-02	低／対象者限定	cursor / Evidence の構造・サイズ制限	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:4964
+SRCH-03	低／対象者限定	Evidence batch の件数・scope・累計読取上限	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5017
+SRCH-04	低／対象者限定	読み取り専用の batch 入力に single-link を要求	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5060
+SRCH-05	低／対象者限定	read-only retarget の --at に HEAD/tag を認めない	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5098
+SRCH-06	低／対象者限定	scope検索の既定2秒deadlineと並列数最大4	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5141
+ST03	低／対象者限定	.kio全体と信頼ファイルをowner-onlyに限定	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5194
+ST07	低／対象者限定	hash名で保存する論理tagにもWindows物理名制約を適用	relax	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5242
+ST08	低／対象者限定	Kio store・index内部のsingle-link/nofollow条件	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5290
+ST11	低／対象者限定	子scope登録はvolume跨ぎと移動・identity不整合を拒否	user decision	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5353
+ST12	低／対象者限定	読取専用操作にもformat完全一致と恒久store-gateを要求	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5411
+ST14	低／対象者限定	object・schema・control recordのbytes上限	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5464
+ST16	低／対象者限定	native filesystem primitive不対応時はfallbackせず拒否	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5512
+ST17	低／対象者限定	中断restore/publication/GCと登録pendingが通常操作を停止	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5554
+ST18	低／対象者限定	restore・履歴は現行policy、線形chain、作業bytesを保持	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5607
+ST21	低／対象者限定	不完全projectionとpolicy binding列挙超過を拒否	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5665
+ST22	低／対象者限定	embedding vector・provenance・chunk identityを厳密検証	keep	維持	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5718
+ST23	低／対象者限定	未対応config値とcommand確認無効化を拒否	user decision	残件候補（各項目の完了は個別確認）	/home/ttokunaga-ja/archive/mac-20261112/home/Documents/Codex/2026-10-22/kio-self-constraints/runs/A1/items.json:5771
