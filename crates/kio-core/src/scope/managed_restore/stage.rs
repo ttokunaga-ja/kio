@@ -3,17 +3,34 @@
 //! can be published, and cleanup never derives ownership from their digest.
 
 use super::*;
-use crate::store_dir::{StageIdentity, StageWriter};
+use crate::store_dir::{StageIdentity, StageReservation, StageWriter};
 use std::io::{self, Write};
 
-fn stage_leaf(index: usize) -> String {
-    format!("managed-restore-stage-{index}")
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct RestoreStageCreation {
+    index: usize,
+    leaf: String,
+    reservation: StageReservation,
+}
+impl RestoreStageCreation {
+    pub(super) fn validate(&self, changes: &[ManagedRestoreChange]) -> Result<()> {
+        if self.index >= changes.len()
+            || self.leaf != format!("managed-restore-stage-{}", self.reservation.key())
+        {
+            return Err(restore_incomplete(
+                "invalid restore stage creation reservation",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RestoreStage {
     path: String,
+    leaf: String,
     raw_hash: String,
     length: u64,
     identity: StageIdentity,
@@ -21,17 +38,26 @@ pub(super) struct RestoreStage {
 
 impl RestoreStage {
     pub(super) fn validate(&self, changes: &[ManagedRestoreChange]) -> Result<()> {
-        if !changes.iter().any(|change| {
-            change.path == self.path
-                && (change.old_raw_hash.as_ref() == Some(&self.raw_hash)
-                    || change.new_raw_hash.as_ref() == Some(&self.raw_hash))
-        }) {
+        if !valid_stage_leaf(&self.leaf)
+            || !changes.iter().any(|change| {
+                change.path == self.path
+                    && (change.old_raw_hash.as_ref() == Some(&self.raw_hash)
+                        || change.new_raw_hash.as_ref() == Some(&self.raw_hash))
+            })
+        {
             return Err(restore_incomplete(
                 "restore stage does not match journal changes",
             ));
         }
         Ok(())
     }
+}
+
+fn valid_stage_leaf(leaf: &str) -> bool {
+    leaf.strip_prefix("managed-restore-stage-")
+        .is_some_and(|suffix| {
+            suffix.len() == 64 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 // Preserve the original typed error (especially resource_limit(storage)) when
@@ -61,7 +87,7 @@ impl Repository {
             return Ok(false);
         };
         let owner = self.store_directory()?;
-        let leaf = stage_leaf(journal.active);
+        let leaf = stage.leaf.clone();
         let capture = crate::platform::stage_operations::capture_name(&stage.identity)?;
         let entries =
             owner.inspect_stages(&[(leaf.clone().into(), stage.identity.clone())], &[])?;
@@ -120,20 +146,39 @@ impl Repository {
         self.root_directory()?.remove_hash_verified(
             &self.store_directory()?,
             Path::new(&change.path),
-            raw,
-            length,
+            (raw, length),
+            Some(&stage.identity),
             |file| stage.identity.verify(file),
         )
     }
 
     pub(super) fn discard_restore_stage(&self, journal: &ManagedRestoreJournal) -> Result<()> {
-        for (index, stage) in journal.stages.iter().enumerate() {
-            if let Some(stage) = stage {
-                self.store_directory()?
-                    .discard_stage(Path::new(&stage_leaf(index)), &stage.identity)?;
-            }
+        for stage in journal.stages.iter().flatten() {
+            self.store_directory()?
+                .discard_stage(Path::new(&stage.leaf), &stage.identity)?;
         }
         Ok(())
+    }
+
+    pub(super) fn recover_restore_stage_creation(
+        &self,
+        journal: &mut ManagedRestoreJournal,
+        bytes: &mut Vec<u8>,
+    ) -> Result<()> {
+        let Some(creation) = journal.stage_creation.as_ref() else {
+            return Ok(());
+        };
+        let owner = self.store_directory()?;
+        if let Some(identity) = creation
+            .reservation
+            .identity_if_matches(&owner, Path::new(&creation.leaf))?
+        {
+            owner.discard_stage(Path::new(&creation.leaf), &identity)?;
+        }
+        // No nonce (e.g. crash during initialization) never authorizes cleanup.
+        // A retry always reserves a fresh name and preserves such unknown residue.
+        journal.stage_creation = None;
+        self.persist_restore_progress(journal, bytes)
     }
 
     pub(super) fn write_restore_stage<P: FnMut(&ManagedRestoreStatus) -> Result<()>>(
@@ -144,20 +189,35 @@ impl Repository {
         bytes: &mut Vec<u8>,
         observe: &mut P,
     ) -> Result<()> {
-        if let Some(stage) = &journal.stages[journal.active] {
-            self.store_directory()?
-                .discard_stage(Path::new(&stage_leaf(journal.active)), &stage.identity)?;
-        }
+        self.recover_restore_stage_creation(journal, bytes)?;
         let length = ensure_raw_present(self, raw_hash)?;
         let owner = self.store_directory()?;
-        let leaf = stage_leaf(journal.active);
-        let mut writer = StageWriter::create(&owner, Path::new(&leaf))?;
+        let reservation = StageReservation::new()?;
+        let leaf = format!("managed-restore-stage-{}", reservation.key());
+        journal.stage_creation = Some(RestoreStageCreation {
+            index: journal.active,
+            leaf: leaf.clone(),
+            reservation: reservation.clone(),
+        });
+        // Reserve the nonce and unique name durably before touching either the
+        // previous stage or the new directory entry.
+        self.persist_restore_progress(journal, bytes)?;
+        if let Some(stage) = &journal.stages[journal.active] {
+            owner.discard_stage(Path::new(&stage.leaf), &stage.identity)?;
+        }
+        self.control()
+            .checkpoint(crate::durability::DurabilityPoint::RestoreStageDiscarded)?;
+        let mut writer = reservation.create(&owner, Path::new(&leaf))?;
+        self.control()
+            .checkpoint(crate::durability::DurabilityPoint::RestoreStageCreated)?;
         journal.stages[journal.active] = Some(RestoreStage {
             path: change.path.clone(),
+            leaf: leaf.clone(),
             raw_hash: raw_hash.to_owned(),
             length,
             identity: writer.identity().clone(),
         });
+        journal.stage_creation = None;
         journal.progress[journal.active] = if change.new_raw_hash.as_deref() == Some(raw_hash) {
             RestoreProgress::PublishingNew
         } else {

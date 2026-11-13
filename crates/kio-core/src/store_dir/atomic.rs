@@ -47,6 +47,8 @@ struct RemoveIntent {
     sha256: String,
     length: u64,
     max_bytes: u64,
+    parent_owned: bool,
+    stage_identity: Option<super::StageIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,6 +73,8 @@ pub(crate) struct AtomicRemovalExpectation {
     pub(crate) sha256: String,
     pub(crate) length: u64,
     pub(crate) max_bytes: u64,
+    pub(crate) retain_quarantine: bool,
+    pub(crate) stage_identity: Option<super::StageIdentity>,
 }
 
 pub(crate) fn failure(message: impl Into<String>) -> KioError {
@@ -421,14 +425,16 @@ fn ready_intent_for_owner(
     Ok(Some(intent))
 }
 
-/// Inspect a deletion proof under the existing workspace gate. It must remain
-/// available until the parent journal has recorded the corresponding phase.
-pub(super) fn pending_removal_matches(
+/// Resume a parent-owned deletion or retire its proof after the parent has
+/// durably acknowledged it. An intent alone never proves a missing source was
+/// removed by Kio; unacknowledged recovery requires the source or quarantine.
+pub(super) fn parent_removal(
     owner: &StoreDirectory,
     target: &StoreDirectory,
     relative: &Path,
     hash: &str,
     length: u64,
+    acknowledged: bool,
 ) -> Result<bool> {
     let Some(workspace) = workspace_existing(owner)? else {
         return Ok(false);
@@ -438,11 +444,40 @@ pub(super) fn pending_removal_matches(
         return Ok(false);
     };
     let (_, _, chain) = parent_chain(target, relative)?;
-    Ok(intent.target_root_id == directory_id(target)?
-        && intent.parent_chain_ids == chain
-        && intent.relative == valid_relative(relative)?
-        && Some(intent.sha256.as_str()) == hash.strip_prefix("sha256:")
-        && intent.length == length)
+    if intent.target_root_id != directory_id(target)?
+        || intent.parent_chain_ids != chain
+        || intent.relative != valid_relative(relative)?
+        || Some(intent.sha256.as_str()) != hash.strip_prefix("sha256:")
+        || intent.length != length
+        || !intent.parent_owned
+    {
+        return Err(failure("pending deletion does not match parent journal"));
+    }
+    if !acknowledged {
+        return recover_locked(owner, &workspace, &[target], true);
+    }
+    // Never touch a public destination during acknowledgement. A new external
+    // file may have appeared since quarantine and must remain untouched.
+    if workspace.contains_entry(Path::new(REMOVED))? {
+        let mut file = workspace.open_regular_for_removal(Path::new(REMOVED), intent.max_bytes)?;
+        if let Some(identity) = &intent.stage_identity {
+            identity.verify(&file)?;
+        }
+        if file_id(&file)? != intent.source_id
+            || hash_file(&mut file, intent.max_bytes)? != (intent.sha256, intent.length)
+        {
+            return Err(failure("acknowledged deletion quarantine changed"));
+        }
+        drop(file);
+        remove_if_present(&workspace, REMOVED)?;
+        workspace.sync()?;
+        owner
+            .control()
+            .checkpoint(crate::durability::DurabilityPoint::AtomicRemoveDeleted)?;
+    }
+    remove_if_present(&workspace, REMOVE_READY)?;
+    workspace.sync()?;
+    Ok(true)
 }
 
 /// Read-only workspace validation. It never creates a directory or gate,
@@ -478,7 +513,7 @@ pub(super) fn recover(owner: &StoreDirectory, allowed_targets: &[&StoreDirectory
         return Ok(false);
     };
     let _gate = lock_workspace(&workspace)?;
-    recover_locked(owner, &workspace, allowed_targets)
+    recover_locked(owner, &workspace, allowed_targets, false)
 }
 
 pub(super) fn write(
@@ -544,7 +579,7 @@ fn write_with_readonly(
     same_volume(owner, &preflight_parent)?;
     let workspace = workspace_create(owner)?;
     let _gate = lock_workspace(&workspace)?;
-    let _ = recover_locked(owner, &workspace, &[target])?;
+    let _ = recover_locked(owner, &workspace, &[target], false)?;
     let (parent, leaf, _) = parent_chain(target, relative)?;
     same_volume(&workspace, &parent)?;
     let mut staged = workspace.create_private_file(Path::new(WRITE))?;
@@ -618,22 +653,39 @@ pub(super) fn remove_hash(
         owner,
         target,
         relative,
-        expected_hash,
-        expected_length,
-        max_bytes,
+        RemovalRequest {
+            expected_hash,
+            expected_length,
+            max_bytes,
+            parent_owned: false,
+            stage_identity: None,
+        },
         |_| Ok(()),
     )
+}
+
+pub(super) struct RemovalRequest<'a> {
+    pub expected_hash: &'a str,
+    pub expected_length: u64,
+    pub max_bytes: u64,
+    pub parent_owned: bool,
+    pub stage_identity: Option<super::StageIdentity>,
 }
 
 pub(super) fn remove_hash_checked(
     owner: &StoreDirectory,
     target: &StoreDirectory,
     relative: &Path,
-    expected_hash: &str,
-    expected_length: u64,
-    max_bytes: u64,
-    verify: impl FnOnce(&std::fs::File) -> Result<()>,
+    request: RemovalRequest<'_>,
+    verify: impl FnOnce(&File) -> Result<()>,
 ) -> Result<()> {
+    let RemovalRequest {
+        expected_hash,
+        expected_length,
+        max_bytes,
+        parent_owned,
+        stage_identity,
+    } = request;
     let relative_text = valid_relative(relative)?;
     validate_target_namespace(owner, target, &relative_text)?;
     if expected_length > max_bytes {
@@ -643,7 +695,7 @@ pub(super) fn remove_hash_checked(
     same_volume(owner, &preflight_parent)?;
     let workspace = workspace_create(owner)?;
     let _gate = lock_workspace(&workspace)?;
-    let _ = recover_locked(owner, &workspace, &[target])?;
+    let _ = recover_locked(owner, &workspace, &[target], false)?;
     let (parent, leaf, chain) = parent_chain(target, relative)?;
     same_volume(&workspace, &parent)?;
     let mut source = parent.open_regular_for_removal(Path::new(&leaf), max_bytes)?;
@@ -665,6 +717,8 @@ pub(super) fn remove_hash_checked(
         sha256,
         length,
         max_bytes,
+        parent_owned,
+        stage_identity,
     };
     let bytes = intent_bytes(&intent)?;
     let mut pending = workspace.create_private_file(Path::new(REMOVE_PENDING))?;
@@ -686,7 +740,7 @@ pub(super) fn remove_hash_checked(
     owner
         .control()
         .checkpoint(crate::durability::DurabilityPoint::AtomicRemoveReady)?;
-    let _ = recover_locked(owner, &workspace, &[target])?;
+    let _ = recover_locked(owner, &workspace, &[target], parent_owned)?;
     Ok(())
 }
 
@@ -694,6 +748,7 @@ fn recover_locked(
     owner: &StoreDirectory,
     workspace: &StoreDirectory,
     allowed_targets: &[&StoreDirectory],
+    allow_parent_owned: bool,
 ) -> Result<bool> {
     let names = inventory(workspace)?;
     let ready_intent = ready_intent_for_owner(owner, workspace)?;
@@ -718,6 +773,11 @@ fn recover_locked(
         }
         return Ok(changed);
     };
+    if intent.parent_owned && !allow_parent_owned {
+        return Err(failure(
+            "parent-owned deletion requires its journal recovery",
+        ));
+    }
     // Drop the outer gate only after all recovery paths finish; this nested
     // implementation mirrors `recover` without attempting a second file lock.
     let mut target = None;
@@ -753,6 +813,8 @@ fn recover_locked(
             sha256: intent.sha256,
             length: intent.length,
             max_bytes: intent.max_bytes,
+            retain_quarantine: intent.parent_owned,
+            stage_identity: intent.stage_identity,
         },
     )
 }
@@ -809,6 +871,8 @@ mod tests {
                     sha256: "0".repeat(64),
                     length: 1,
                     max_bytes: 1,
+                    parent_owned: false,
+                    stage_identity: None,
                 };
                 let bytes = intent_bytes(&intent).unwrap();
                 let recovered: RemoveIntent = serde_json::from_slice(&bytes).unwrap();
@@ -883,6 +947,8 @@ mod tests {
             sha256,
             length,
             max_bytes: bytes.len() as u64,
+            parent_owned: false,
+            stage_identity: None,
         };
         private_leaf(
             &workspace,

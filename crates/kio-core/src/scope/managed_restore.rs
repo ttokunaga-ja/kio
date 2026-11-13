@@ -19,7 +19,7 @@ use crate::error::{IoResultExt, KioError, Result};
 use crate::store_dir::{Publication, StoreDirectory};
 
 mod stage;
-use stage::RestoreStage;
+use stage::{RestoreStage, RestoreStageCreation};
 
 const MANAGED_RESTORE_JOURNAL_LEAF: &str = "managed-restore-v1.json";
 const MAX_MANAGED_RESTORE_JOURNAL_BYTES: u64 = 8 * 1024 * 1024;
@@ -170,6 +170,7 @@ struct ManagedRestoreJournal {
     new_lengths: Vec<u64>,
     active: usize,
     stages: Vec<Option<RestoreStage>>,
+    stage_creation: Option<RestoreStageCreation>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,6 +199,7 @@ impl ManagedRestoreJournal {
             new_lengths: plan.new_lengths.clone(),
             active: 0,
             stages: vec![None; plan.changes.len()],
+            stage_creation: None,
         }
     }
 
@@ -214,6 +216,9 @@ impl ManagedRestoreJournal {
             || self.stages.len() != self.changes.len()
         {
             return Err(restore_incomplete("managed restore journal is malformed"));
+        }
+        if let Some(creation) = &self.stage_creation {
+            creation.validate(&self.changes)?;
         }
         for (index, stage) in self.stages.iter().enumerate() {
             if let Some(stage) = stage {
@@ -575,32 +580,50 @@ impl Repository {
             return self.recover_atomic_storage();
         };
         self.validate_restore_journal_authority(&journal)?;
-        // Carry the exact lower-level deletion intent into the parent journal
-        // before generic recovery consumes it. A missing intent never proves
-        // that an absent working file is ours to recreate.
+        self.recover_restore_stage_creation(&mut journal, &mut journal_bytes)?;
+        // Resume deletion only against its retained source/quarantine. Keep the
+        // quarantine until the corresponding parent phase has been synced.
         for index in 0..journal.changes.len() {
-            let (raw, next) = match journal.progress[index] {
+            let (raw, next, incomplete) = match journal.progress[index] {
                 RestoreProgress::RemovingOld => (
-                    journal.changes[index].old_raw_hash.as_ref(),
+                    journal.changes[index].old_raw_hash.clone(),
                     RestoreProgress::OldRemoved,
+                    true,
                 ),
                 RestoreProgress::RollbackRemovingNew => (
-                    journal.changes[index].new_raw_hash.as_ref(),
+                    journal.changes[index].new_raw_hash.clone(),
                     RestoreProgress::RollbackNewRemoved,
+                    true,
+                ),
+                RestoreProgress::OldRemoved => (
+                    journal.changes[index].old_raw_hash.clone(),
+                    RestoreProgress::OldRemoved,
+                    false,
+                ),
+                RestoreProgress::RollbackNewRemoved => (
+                    journal.changes[index].new_raw_hash.clone(),
+                    RestoreProgress::RollbackNewRemoved,
+                    false,
                 ),
                 _ => continue,
             };
             if let Some(raw) = raw {
-                let length = self.store.inspect_object(ObjectKind::Raw, raw)?.size_bytes;
-                if self.store_directory()?.pending_removal_matches(
-                    &self.root_directory()?,
-                    Path::new(&journal.changes[index].path),
-                    raw,
-                    length,
-                )? {
+                let length = self.store.inspect_object(ObjectKind::Raw, &raw)?.size_bytes;
+                let owner = self.store_directory()?;
+                let root = self.root_directory()?;
+                let path = Path::new(&journal.changes[index].path);
+                if incomplete && owner.resume_parent_removal(&root, path, &raw, length)? {
                     journal.active = index;
                     journal.progress[index] = next;
                     self.persist_restore_progress(&journal, &mut journal_bytes)?;
+                }
+                if journal.progress[index] == next {
+                    owner.acknowledge_parent_removal(
+                        &root,
+                        Path::new(&journal.changes[index].path),
+                        &raw,
+                        length,
+                    )?;
                 }
             }
         }
@@ -809,14 +832,8 @@ impl Repository {
 
     #[cfg(test)]
     fn remove_working_raw(&self, relative: &Path, raw_hash: &str) -> Result<()> {
-        let metadata = self.store.inspect_object(ObjectKind::Raw, raw_hash)?;
-        self.root_directory()?.remove_hash_verified(
-            &self.store_directory()?,
-            relative,
-            raw_hash,
-            metadata.size_bytes,
-            |_| Ok(()),
-        )
+        let bytes = self.raw_bytes(raw_hash)?;
+        self.remove_working_atomic(relative, &bytes, bytes.len() as u64)
     }
 
     #[cfg(test)]
@@ -826,6 +843,17 @@ impl Repository {
         self.store
             .copy_object_to(ObjectKind::Raw, raw_hash, &mut bytes)?;
         Ok(bytes)
+    }
+
+    fn acknowledge_restore_removal(&self, change: &ManagedRestoreChange, raw: &str) -> Result<()> {
+        let length = self.store.inspect_object(ObjectKind::Raw, raw)?.size_bytes;
+        self.store_directory()?.acknowledge_parent_removal(
+            &self.root_directory()?,
+            Path::new(&change.path),
+            raw,
+            length,
+        )?;
+        Ok(())
     }
 
     // Keep parent-journal writes independent of the working-file removal
@@ -902,8 +930,8 @@ impl Repository {
             self.root_directory()?.remove_hash_verified(
                 &self.store_directory()?,
                 Path::new(&change.path),
-                old,
-                length,
+                (old, length),
+                None,
                 |file| {
                     if Some(scheduled_source_identity(file)?) != expected_identity {
                         return Err(restore_conflict(
@@ -913,9 +941,12 @@ impl Repository {
                     Ok(())
                 },
             )?;
+            self.control()
+                .checkpoint(crate::durability::DurabilityPoint::RestoreRemovalCompleted)?;
             journal.progress[index] = RestoreProgress::OldRemoved;
             self.persist_restore_progress(journal, bytes)?;
             observe(&journal.status())?;
+            self.acknowledge_restore_removal(change, old)?;
         }
         if let Some(new) = &change.new_raw_hash {
             self.write_restore_stage(change, new, journal, bytes, observe)?;
@@ -965,7 +996,11 @@ impl Repository {
             )
             && self.restore_stage_present(journal)?
         {
+            // This owned unpublished stage proves the operation-owned gap.
+            // Persist that proof before a retry can discard this stage.
             phase = RestoreProgress::OldRemoved;
+            journal.progress[index] = phase;
+            self.persist_restore_progress(journal, bytes)?;
         }
         if matches!(
             phase,
@@ -1026,8 +1061,11 @@ impl Repository {
             journal.progress[index] = RestoreProgress::RollbackRemovingNew;
             self.persist_restore_progress(journal, bytes)?;
             self.remove_restore_destination(journal, change, new)?;
+            self.control()
+                .checkpoint(crate::durability::DurabilityPoint::RestoreRemovalCompleted)?;
             journal.progress[index] = RestoreProgress::RollbackNewRemoved;
             self.persist_restore_progress(journal, bytes)?;
+            self.acknowledge_restore_removal(change, new)?;
         }
         if let Some(old) = &change.old_raw_hash {
             self.write_restore_stage(change, old, journal, bytes, &mut |_| Ok(()))?;
@@ -1586,12 +1624,19 @@ mod tests {
     fn st06_stage_replacement_is_preserved_and_corrupt_payload_is_not_published() {
         for replace in [true, false] {
             let (directory, repo, plan) = restore_fixture();
-            let stage = repo.kio_dir().join("managed-restore-stage-0");
+            let mut stage = std::path::PathBuf::new();
             let result = repo.apply_restore_with_progress(
                 &plan,
                 || Ok(()),
                 |status| {
                     if status.phase == "publishing_new" {
+                        let value: serde_json::Value = serde_json::from_slice(
+                            &fs::read(repo.kio_dir().join(MANAGED_RESTORE_JOURNAL_LEAF)).unwrap(),
+                        )
+                        .unwrap();
+                        stage = repo
+                            .kio_dir()
+                            .join(value["stages"][0]["leaf"].as_str().unwrap());
                         if replace {
                             fs::rename(&stage, repo.kio_dir().join("displaced-stage")).unwrap();
                         }

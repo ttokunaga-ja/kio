@@ -16,6 +16,7 @@ use crate::{ExitCode, KioError, Result, platform::store as platform};
 
 pub(crate) mod atomic;
 mod stage;
+pub(crate) use stage::StageReservation;
 pub use stage::{
     DirectoryStageIdentity, StageEntryState, StageIdentity, StageInspectionEntry, StageWriter,
 };
@@ -423,32 +424,56 @@ impl StoreDirectory {
         atomic::remove(owner, self, relative, expected, max_bytes)
     }
 
-    /// Inspect the existing atomic intent without consuming the recovery proof.
-    pub(crate) fn pending_removal_matches(
+    /// Resume an exact parent-owned deletion while retaining its quarantine.
+    pub(crate) fn resume_parent_removal(
         &self,
         target: &StoreDirectory,
         relative: &Path,
         hash: &str,
         length: u64,
     ) -> Result<bool> {
-        atomic::pending_removal_matches(self, target, relative, hash, length)
+        atomic::parent_removal(self, target, relative, hash, length, false)
     }
 
-    /// Bind an additional caller authority to the exact handle captured by the
-    /// durable removal intent, closing the check/open gap for restore stages.
+    /// Retire the lower-level proof only after the parent phase is durable.
+    pub(crate) fn acknowledge_parent_removal(
+        &self,
+        target: &StoreDirectory,
+        relative: &Path,
+        hash: &str,
+        length: u64,
+    ) -> Result<bool> {
+        atomic::parent_removal(self, target, relative, hash, length, true)
+    }
+
+    /// Bind the verification to the captured handle and retain the quarantine
+    /// until the caller durably records completion and acknowledges it.
     pub(crate) fn remove_hash_verified(
         &self,
         owner: &StoreDirectory,
         relative: &Path,
-        hash: &str,
-        length: u64,
+        content: (&str, u64),
+        stage_identity: Option<&StageIdentity>,
         verify: impl FnOnce(&File) -> Result<()>,
     ) -> Result<()> {
+        let (hash, length) = content;
         let digest = hash
             .strip_prefix("sha256:")
             .filter(|_| crate::cas::is_hash(hash))
             .ok_or_else(|| KioError::invalid_usage("invalid expected removal hash"))?;
-        atomic::remove_hash_checked(owner, self, relative, digest, length, length, verify)
+        atomic::remove_hash_checked(
+            owner,
+            self,
+            relative,
+            atomic::RemovalRequest {
+                expected_hash: digest,
+                expected_length: length,
+                max_bytes: length,
+                parent_owned: true,
+                stage_identity: stage_identity.cloned(),
+            },
+            verify,
+        )
     }
 
     pub fn sync(&self) -> Result<()> {

@@ -153,6 +153,16 @@ fn managed_restore_default_is_policy_filtered_and_explicit_denial_fails() {
 }
 
 #[cfg(debug_assertions)]
+fn restore_stage_path(dir: &TempDir) -> std::path::PathBuf {
+    let journal: Value =
+        serde_json::from_slice(&fs::read(dir.path().join(".kio/managed-restore-v1.json")).unwrap())
+            .unwrap();
+    dir.path()
+        .join(".kio")
+        .join(journal["stages"][0]["leaf"].as_str().unwrap())
+}
+
+#[cfg(debug_assertions)]
 struct StoppedRestore(std::process::Child);
 #[cfg(debug_assertions)]
 impl Drop for StoppedRestore {
@@ -252,7 +262,15 @@ fn st06_process_crashes_at_each_apply_and_publication_phase_recover() {
             "{point}"
         );
         assert!(!dir.path().join(".kio/managed-restore-v1.json").exists());
-        assert!(!dir.path().join(".kio/managed-restore-stage-0").exists());
+        assert!(
+            !fs::read_dir(dir.path().join(".kio"))
+                .unwrap()
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("managed-restore-stage-"))
+        );
     }
 }
 
@@ -379,11 +397,7 @@ fn st06_complete_stage_digest_is_checked_before_publication() {
         &["restore", &source, "--path", "a.md"],
         "restore_stage_ready",
     );
-    fs::write(
-        dir.path().join(".kio/managed-restore-stage-0"),
-        b"tampered stage contents!!",
-    )
-    .unwrap();
+    fs::write(restore_stage_path(&dir), b"tampered stage contents!!").unwrap();
     fs::write(ready.with_extension("release"), b"continue").unwrap();
     assert_eq!(child.0.wait().unwrap().code(), Some(3));
     assert!(!dir.path().join("a.md").exists());
@@ -400,4 +414,204 @@ fn st06_complete_stage_digest_is_checked_before_publication() {
             .as_deref(),
         Some(head.as_str())
     );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn review_p1_completed_removal_before_parent_phase_recovers() {
+    for rollback in [false, true] {
+        let (dir, source, head) = fixture();
+        if rollback {
+            kill_at(
+                &dir,
+                &["restore", &source, "--path", "a.md"],
+                "restore_applied",
+            );
+            kill_at(
+                &dir,
+                &["repair", "recover-restore"],
+                "restore_removal_completed",
+            );
+        } else {
+            kill_at(
+                &dir,
+                &["restore", &source, "--path", "a.md"],
+                "restore_removal_completed",
+            );
+        }
+        assert_eq!(ok(&dir, &["repair", "recover-restore"])["recovered"], true);
+        assert_eq!(
+            fs::read(dir.path().join("a.md")).unwrap(),
+            b"new unique tulip phrase"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join(".kio/HEAD"))
+                .unwrap()
+                .trim(),
+            head
+        );
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn review_p1_stage_created_before_identity_record_recovers() {
+    for point in [
+        "restore_stage_created",
+        "restore_stage_discarded",
+        "stage_file_created",
+    ] {
+        for rollback in [false, true] {
+            let (dir, source, head) = fixture();
+            if rollback {
+                kill_at(
+                    &dir,
+                    &["restore", &source, "--path", "a.md"],
+                    "restore_applied",
+                );
+                kill_at(&dir, &["repair", "recover-restore"], point);
+            } else {
+                kill_at(&dir, &["restore", &source, "--path", "a.md"], point);
+            }
+            let journal: Value = serde_json::from_slice(
+                &fs::read(dir.path().join(".kio/managed-restore-v1.json")).unwrap(),
+            )
+            .unwrap();
+            let reserved = dir
+                .path()
+                .join(".kio")
+                .join(journal["stage_creation"]["leaf"].as_str().unwrap());
+            assert_eq!(ok(&dir, &["repair", "recover-restore"])["recovered"], true);
+            assert_eq!(
+                fs::read(dir.path().join("a.md")).unwrap(),
+                b"new unique tulip phrase"
+            );
+            assert_eq!(
+                fs::read_to_string(dir.path().join(".kio/HEAD"))
+                    .unwrap()
+                    .trim(),
+                head
+            );
+            if point == "stage_file_created" {
+                // No saved nonce on this entry: preserve it as unidentified,
+                // while retrying with a new reservation and a different name.
+                assert!(reserved.exists());
+                assert_eq!(fs::metadata(reserved).unwrap().len(), 0);
+            } else {
+                assert!(!reserved.exists());
+            }
+        }
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn review_p1_ready_intent_does_not_undo_external_deletion() {
+    let (dir, source, head) = fixture();
+    kill_at(
+        &dir,
+        &["restore", &source, "--path", "a.md"],
+        "atomic_remove_ready",
+    );
+    fs::remove_file(dir.path().join("a.md")).unwrap();
+    let output = command(&dir, &["repair", "recover-restore"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "external deletion must remain ambiguous"
+    );
+    assert!(!dir.path().join("a.md").exists());
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".kio/HEAD"))
+            .unwrap()
+            .trim(),
+        head
+    );
+    assert!(dir.path().join(".kio/managed-restore-v1.json").exists());
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn review_p1_resumed_rollback_removal_checks_nonce_with_simulated_id_reuse() {
+    use kio_core::store_dir::{Publication, StageWriter, StoreDirectory};
+    let (dir, source, head) = fixture();
+    kill_at(
+        &dir,
+        &["restore", &source, "--path", "a.md"],
+        "restore_applied",
+    );
+    kill_at(&dir, &["repair", "recover-restore"], "atomic_remove_ready");
+    fs::remove_file(dir.path().join("a.md")).unwrap();
+    let root = StoreDirectory::open(dir.path()).unwrap();
+    let owner = StoreDirectory::open(&dir.path().join(".kio")).unwrap();
+    let mut foreign = StageWriter::create(&owner, std::path::Path::new("foreign-stage")).unwrap();
+    foreign.write_chunk(b"old unique orchid phrase").unwrap();
+    let physical = serde_json::to_value(foreign.identity()).unwrap()["physical"].clone();
+    foreign
+        .publish(&root, std::path::Path::new("a.md"), Publication::CreateOnly)
+        .unwrap();
+    // Model a filesystem reusing the saved physical ID, without altering any
+    // nonce or bytes. The replacement's independently generated nonce differs.
+    let intent_path = dir.path().join(".kio/.kio-atomic/remove.json");
+    let mut intent: Value = serde_json::from_slice(&fs::read(&intent_path).unwrap()).unwrap();
+    intent["source_id"] = physical.clone();
+    if let Some(identity) = intent.get_mut("stage_identity").filter(|v| v.is_object()) {
+        identity["physical"] = physical;
+    }
+    fs::write(&intent_path, serde_jcs::to_vec(&intent).unwrap()).unwrap();
+    let output = command(&dir, &["repair", "recover-restore"])
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "reused physical ID must not authorize deletion"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("nonce"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(dir.path().join("a.md")).unwrap(),
+        b"old unique orchid phrase"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.path().join(".kio/HEAD"))
+            .unwrap()
+            .trim(),
+        head
+    );
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn review_p1_retry_stage_disposal_preserves_the_durable_gap_proof() {
+    for origin in ["restore_publishing_new", "restore_restoring_old"] {
+        for point in ["restore_stage_discarded", "restore_stage_created"] {
+            let (dir, source, head) = fixture();
+            if origin == "restore_restoring_old" {
+                kill_at(
+                    &dir,
+                    &["restore", &source, "--path", "a.md"],
+                    "restore_applied",
+                );
+                kill_at(&dir, &["repair", "recover-restore"], origin);
+            } else {
+                kill_at(&dir, &["restore", &source, "--path", "a.md"], origin);
+            }
+            kill_at(&dir, &["repair", "recover-restore"], point);
+            assert_eq!(ok(&dir, &["repair", "recover-restore"])["recovered"], true);
+            assert_eq!(
+                fs::read(dir.path().join("a.md")).unwrap(),
+                b"new unique tulip phrase"
+            );
+            assert_eq!(
+                fs::read_to_string(dir.path().join(".kio/HEAD"))
+                    .unwrap()
+                    .trim(),
+                head
+            );
+        }
+    }
 }

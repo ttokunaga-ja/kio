@@ -98,6 +98,9 @@ pub(crate) fn finish_remove_retirement(
     let (mut quarantined, contents_already_verified) = match (source, removed) {
         (Some(mut source), false) => {
             super::private_fs::verify_current_owner_handle(&source)?;
+            if let Some(identity) = &intent.stage_identity {
+                identity.verify(&source)?;
+            }
             if file_id(&source)? != intent.source_id
                 || hash_file(&mut source, intent.max_bytes)?
                     != (intent.sha256.clone(), intent.length)
@@ -115,6 +118,8 @@ pub(crate) fn finish_remove_retirement(
                     "moved removal source no longer matches its ready intent",
                 ));
             }
+            parent.sync()?;
+            workspace.sync()?;
             workspace
                 .control()
                 .checkpoint(crate::durability::DurabilityPoint::AtomicRemoveQuarantined)?;
@@ -125,6 +130,11 @@ pub(crate) fn finish_remove_retirement(
             false,
         ),
         (None, false) => {
+            if intent.retain_quarantine {
+                return Err(failure(
+                    "deletion intent has neither source nor quarantine; external deletion is ambiguous",
+                ));
+            }
             remove_if_present(workspace, REMOVE_READY)?;
             return Ok(true);
         }
@@ -132,6 +142,9 @@ pub(crate) fn finish_remove_retirement(
     };
     {
         super::private_fs::verify_current_owner_handle(&quarantined)?;
+        if let Some(identity) = &intent.stage_identity {
+            identity.verify(&quarantined)?;
+        }
         if file_id(&quarantined)? != intent.source_id
             || (!contents_already_verified
                 && hash_file(&mut quarantined, intent.max_bytes)? != (intent.sha256, intent.length))
@@ -139,6 +152,11 @@ pub(crate) fn finish_remove_retirement(
             return Err(failure(
                 "removal quarantine does not match its ready intent",
             ));
+        }
+        parent.sync()?;
+        workspace.sync()?;
+        if intent.retain_quarantine {
+            return Ok(true);
         }
         drop(quarantined);
         remove_if_present(workspace, REMOVED)?;
