@@ -22,7 +22,7 @@
 
 ## 3. 残作業
 
-上から順に進める。番号の付いた行が、Codex（まず Terra）に渡す 1 回分の作業である。受入条件の詳細は、挙げた仕様書の節に従う。
+上から順に進める。番号の付いた行が、Codex に渡す 1 回分の作業である（作業量が「小」の行は Terra、それ以外は Sol。AGENTS.md）。受入条件の詳細は、挙げた仕様書の節に従う。
 
 ### 3.1 検証の土台
 
@@ -102,15 +102,16 @@ cargo +1.98.0 clippy --workspace --all-targets --locked -- -D warnings
 I="$PWD/scratch/validate"; rm -rf "$I"; mkdir -p "$I"/{home,config,data,cache,state,tmp}
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 HOME="$I/home" XDG_CONFIG_HOME="$I/config" XDG_DATA_HOME="$I/data" \
-XDG_CACHE_HOME="$I/cache" XDG_STATE_HOME="$I/state" TMPDIR="$I/tmp" \
+XDG_CACHE_HOME="$I/cache" XDG_STATE_HOME="$I/state" TMPDIR="$I/tmp" CARGO_PROFILE_TEST_OPT_LEVEL=1 \
 systemd-run --user --scope -p Delegate=yes \
   -E HOME -E XDG_CONFIG_HOME -E XDG_DATA_HOME -E XDG_CACHE_HOME -E XDG_STATE_HOME \
-  -E TMPDIR -E RUSTUP_HOME -E CARGO_HOME \
+  -E TMPDIR -E RUSTUP_HOME -E CARGO_HOME -E CARGO_PROFILE_TEST_OPT_LEVEL \
   cargo +1.98.0 test --workspace --all-targets --locked --no-fail-fast
 
 ls -d ~/.local/share/kio ~/.local/state/kio ~/.config/kio ~/.cache/kio   # 何も出ないこと
 ```
 
+- `CARGO_PROFILE_TEST_OPT_LEVEL=1` は CI の 3 つの OS のテストの手順と同じ設定である（debug_assertions は有効のまま）。
 - 作業中は、変更した crate のテストだけを回す。全テストは、作業の区切りと push の前に回す。
 - persona W0 と synthetic-history は、`kio-eval`・検索・索引・履歴に触れた変更の push の前に回す。手順は `.github/workflows/ci.yml` の該当 job のとおり。
 - 最後の `ls` は、テストが実際のホームに書き込んでいないことの確認である。V1 の後は、HOME と XDG を差し替えずに全テストを回しても何も作られない（2026-11-13 に確認）。
