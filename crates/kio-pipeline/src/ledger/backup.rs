@@ -224,7 +224,14 @@ impl LedgerBackup {
         leaf: &Path,
         copy: impl FnOnce(std::fs::File, &mut StageWriter) -> Result<DigestRecord>,
     ) -> Result<()> {
-        let stage_name = format!("{}.backup-stage", leaf.to_string_lossy());
+        // A crash can leave a tagged but unrecorded file. Such a file is not
+        // reclaimable authority; keep it visible to inspect_stages and choose
+        // a fresh name so it cannot block this retry.
+        let mut nonce = [0; 32];
+        getrandom::fill(&mut nonce)
+            .map_err(|e| err("KIO-E-LEDGER-BACKUP-RANDOM-001", e.to_string()))?;
+        let suffix: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+        let stage_name = format!("{}.backup-stage-{suffix}", leaf.to_string_lossy());
         self.retire_copy_stage(target, leaf)?;
         let mut stage = new_stage(target, &stage_name)?;
         let actual = copy(self.image.reader()?, &mut stage)?;
@@ -250,21 +257,41 @@ impl LedgerBackup {
         target.sync().map_err(store_err)
     }
     pub(crate) fn retire_copy_stage(&self, target: &StoreDirectory, leaf: &Path) -> Result<()> {
-        let name = format!("{}.backup-stage", leaf.to_string_lossy());
-        let journal = format!("{name}.json");
-        if let Some(bytes) = target
-            .read_optional(Path::new(&journal), MAX_MANIFEST)
-            .map_err(store_err)?
-        {
+        // Recover the bounded atomic identity-record publication first. This
+        // never adopts a streaming file lacking its saved physical ID/nonce.
+        target.recover_atomic(&[target]).map_err(store_err)?;
+        let prefix = format!("{}.backup-stage-", leaf.to_string_lossy());
+        for entry in target.inspect_stages(&[], &[]).map_err(store_err)? {
+            let Some(journal) = entry.name.to_str() else {
+                continue;
+            };
+            let Some(name) = journal.strip_suffix(".json") else {
+                continue;
+            };
+            let Some(nonce) = name.strip_prefix(&prefix) else {
+                continue;
+            };
+            if nonce.len() != 64 || !nonce.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
             target
-                .ensure_owner_private(Path::new(&journal))
+                .ensure_owner_private(Path::new(journal))
                 .map_err(store_err)?;
+            let bytes = target
+                .read_optional(Path::new(journal), MAX_MANIFEST)
+                .map_err(store_err)?
+                .ok_or_else(|| {
+                    err(
+                        "KIO-E-LEDGER-BACKUP-MANIFEST-001",
+                        "stage record disappeared",
+                    )
+                })?;
             let identity = serde_json::from_slice(&bytes)
                 .map_err(|e| err("KIO-E-LEDGER-BACKUP-MANIFEST-001", e.to_string()))?;
             target
-                .discard_stage(Path::new(&name), &identity)
+                .discard_stage(Path::new(name), &identity)
                 .map_err(store_err)?;
-            target.remove_file(Path::new(&journal)).map_err(store_err)?;
+            target.remove_file(Path::new(journal)).map_err(store_err)?;
             target.sync().map_err(store_err)?;
         }
         Ok(())
@@ -381,10 +408,17 @@ impl LedgerBackup {
     }
 }
 fn new_stage(store: &StoreDirectory, name: &str) -> Result<StageWriter> {
+    new_stage_with_record(store, name, put)
+}
+fn new_stage_with_record(
+    store: &StoreDirectory,
+    name: &str,
+    persist: impl FnOnce(&StoreDirectory, &str, &[u8]) -> Result<()>,
+) -> Result<StageWriter> {
     let stage = StageWriter::create(store, Path::new(name)).map_err(store_err)?;
     let journal = serde_json::to_vec(stage.identity())
         .map_err(|e| err("KIO-E-LEDGER-BACKUP-MANIFEST-001", e.to_string()))?;
-    put(store, &format!("{name}.json"), &journal)?;
+    persist(store, &format!("{name}.json"), &journal)?;
     Ok(stage)
 }
 fn put(s: &StoreDirectory, n: &str, b: &[u8]) -> Result<()> {
@@ -723,23 +757,126 @@ mod tests {
             assert!(!directory.path().join("ledger.sqlite").exists());
             assert!(!directory.path().join("manifest.json").exists());
             assert!(LedgerBackup::load(directory.path()).is_err());
-            assert!(directory.path().join("ledger.sqlite.backup-stage").exists());
+            assert!(store.inspect_stages(&[], &[]).unwrap().iter().any(|e| {
+                e.name
+                    .to_string_lossy()
+                    .starts_with("ledger.sqlite.backup-stage-")
+            }));
             backup
                 .copy_database(&store, Path::new("ledger.sqlite"))
                 .unwrap();
-            assert!(!directory.path().join("ledger.sqlite.backup-stage").exists());
-            assert!(
-                !directory
-                    .path()
-                    .join("ledger.sqlite.backup-stage.json")
-                    .exists()
-            );
+            assert!(!store.inspect_stages(&[], &[]).unwrap().iter().any(|e| {
+                e.name
+                    .to_string_lossy()
+                    .starts_with("ledger.sqlite.backup-stage-")
+            }));
             let copied = digest_reader(
                 fs::File::open(directory.path().join("ledger.sqlite")).unwrap(),
                 None,
             )
             .unwrap();
             assert_eq!(copied.sha256, backup.sqlite_digest().unwrap());
+        }
+    }
+    #[cfg(debug_assertions)]
+    #[test]
+    fn retry_recovers_interruptions_during_identity_record_publication() {
+        use kio_core::{
+            durability::DurabilityPoint,
+            store_dir::StageEntryState,
+            test_control::{CoreTestControl, DebugTestControl, Selector},
+        };
+        let backup = backup();
+        for point in [
+            DurabilityPoint::AtomicWriteStaged,
+            DurabilityPoint::AtomicWritePublished,
+        ] {
+            let directory = private_tempdir();
+            let occupied = directory
+                .path()
+                .parent()
+                .unwrap()
+                .join("occupied-stage-record");
+            fs::write(&occupied, b"occupied").unwrap();
+            let control = ControlHandle::new(DebugTestControl {
+                core: CoreTestControl {
+                    durability_point: Selector::Known(point),
+                    durability_ready: Some(occupied),
+                    ..Default::default()
+                },
+                ..Default::default()
+            });
+            let interrupted = StoreDirectory::open_with_control(directory.path(), control).unwrap();
+            assert!(
+                backup
+                    .copy_database(&interrupted, Path::new("ledger.sqlite"))
+                    .is_err()
+            );
+            assert!(!directory.path().join("ledger.sqlite").exists());
+            let store = StoreDirectory::open(directory.path()).unwrap();
+            let before = store.inspect_stages(&[], &[]).unwrap();
+            let stage = before
+                .iter()
+                .find(|entry| {
+                    let name = entry.name.to_string_lossy();
+                    name.starts_with("ledger.sqlite.backup-stage-") && !name.ends_with(".json")
+                })
+                .unwrap();
+            let stage_name = stage.name.clone();
+            assert!(matches!(stage.state, StageEntryState::Unidentified { .. }));
+            backup
+                .copy_database(&store, Path::new("ledger.sqlite"))
+                .unwrap();
+            let after = store.inspect_stages(&[], &[]).unwrap();
+            if point == DurabilityPoint::AtomicWriteStaged {
+                assert!(after.iter().any(|e| e.name == stage_name
+                    && matches!(e.state, StageEntryState::Unidentified { .. })));
+                assert_eq!(fs::read(directory.path().join(stage_name)).unwrap(), b"");
+            } else {
+                assert!(!after.iter().any(|e| e.name == stage_name));
+            }
+            assert_eq!(
+                digest_reader(
+                    fs::File::open(directory.path().join("ledger.sqlite")).unwrap(),
+                    None
+                )
+                .unwrap()
+                .sha256,
+                backup.sqlite_digest().unwrap()
+            );
+        }
+    }
+    #[test]
+    fn retry_survives_storage_exhaustion_before_or_after_identity_record_save() {
+        let backup = backup();
+        for saved in [false, true] {
+            let directory = private_tempdir();
+            let store = StoreDirectory::open(directory.path()).unwrap();
+            let name = format!("ledger.sqlite.backup-stage-{}", "0".repeat(64));
+            let error = new_stage_with_record(&store, &name, |s, n, bytes| {
+                if saved {
+                    put(s, n, bytes)?;
+                }
+                Err(snapshot_error(super::super::snapshot::snapshot_io_error(
+                    "persist stage identity",
+                    std::io::Error::from(std::io::ErrorKind::StorageFull),
+                )))
+            })
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                PipelineError::ResourceLimit(kio_core::error::ResourceLimit {
+                    resource: kio_core::error::Resource::Storage,
+                    ..
+                })
+            ));
+            assert!(!directory.path().join("ledger.sqlite").exists());
+            assert_eq!(fs::read(directory.path().join(&name)).unwrap(), b"");
+            backup
+                .copy_database(&store, Path::new("ledger.sqlite"))
+                .unwrap();
+            assert_eq!(directory.path().join(&name).exists(), !saved);
+            assert!(!directory.path().join(format!("{name}.json")).exists());
         }
     }
 }

@@ -234,3 +234,56 @@ fn restore_rejects_a_symlinked_backup_manifest() {
     let error = fixture.error(&["ledger", "restore", "--from", backup.to_str().unwrap()]);
     assert_eq!(error["error_code"], "KIO-E-LEDGER-BACKUP-PRIVATE-001");
 }
+
+#[test]
+fn cli_backup_preserves_source_bytes_permissions_and_sidecar_presence() {
+    for state in ["clean", "wal_and_shm", "wal_without_shm"] {
+        let fixture = Fixture::new();
+        fixture.ok(&["ledger", "init"]);
+        let path = fixture.ledger_path();
+        let wal = path.with_file_name("cost-ledger.sqlite-wal");
+        let shm = path.with_file_name("cost-ledger.sqlite-shm");
+        if state != "clean" {
+            let conn = Connection::open(&path).unwrap();
+            conn.set_db_config(
+                rusqlite::config::DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE,
+                true,
+            )
+            .unwrap();
+            conn.execute_batch("PRAGMA wal_autocheckpoint=0;
+                INSERT INTO cost_ledger(scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,estimated,outcome,month,recorded_at)
+                VALUES('scope','embedding','hash','profile',1,'job',1,0,'succeeded','2026-11',0);").unwrap();
+            drop(conn);
+            assert!(fs::metadata(&wal).unwrap().len() > 32);
+            if state == "wal_without_shm" {
+                fs::remove_file(&shm).unwrap();
+            }
+        }
+        let paths = [&path, &wal, &shm];
+        let capture = || {
+            paths
+                .iter()
+                .map(|p| match fs::read(p) {
+                    Ok(bytes) => Some((bytes, fs::metadata(p).unwrap().permissions())),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(e) => panic!("{e}"),
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = capture();
+        let destination = backup_dir(&fixture);
+        fixture.ok(&["ledger", "backup", "--to", destination.to_str().unwrap()]);
+        for ((p, expected), actual) in paths.iter().zip(before).zip(capture()) {
+            assert!(actual == expected, "{state}: {} changed", p.display());
+        }
+        let copied = Connection::open_with_flags(
+            destination.join("ledger.sqlite"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        let rows: i64 = copied
+            .query_row("SELECT count(*) FROM cost_ledger", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(rows, i64::from(state != "clean"));
+    }
+}

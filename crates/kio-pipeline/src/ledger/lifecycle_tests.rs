@@ -596,3 +596,38 @@ fn restore_rejects_stale_proof_before_creating_any_restore_artifact() {
     assert!(!companion(&path, ".restore.pending").exists());
     assert!(!companion(&path, ".backup-stage").exists());
 }
+
+#[test]
+fn restore_retries_after_crash_before_stage_identity_record() {
+    use kio_core::store_dir::{StageEntryState, StageWriter};
+    let (_dir, path) = fixture();
+    let ledger = LedgerDb::initialize(&path).unwrap();
+    let backup = ledger.backup().unwrap();
+    let checkpoint = read_checkpoint(&path);
+    let pending = RestorePending {
+        version: 1,
+        ledger_id: ledger.authority.ledger_id.clone(),
+        era: ledger.authority.era.clone(),
+        sequence: checkpoint.seq,
+        backup_digest: backup.sqlite_digest().unwrap(),
+    };
+    fs::remove_file(&path).unwrap();
+    let session = FsSession::acquire_with_control(&path, false, ControlHandle::default()).unwrap();
+    session
+        .create_only(&session.names().restore_pending, &encode(&pending).unwrap())
+        .unwrap();
+    let orphan = Path::new("cost-ledger.sqlite.backup-stage");
+    let stage = StageWriter::create(session.parent(), orphan).unwrap();
+    drop(stage);
+    let inventory = session.parent().inspect_stages(&[], &[]).unwrap();
+    assert!(
+        inventory
+            .iter()
+            .any(|e| e.name == orphan && matches!(e.state, StageEntryState::Unidentified { .. }))
+    );
+    drop(session);
+    let restored = LedgerDb::restore_missing_database(&path, &backup).unwrap();
+    assert_eq!(restored.integrity_check().unwrap(), "ok");
+    assert!(!companion(&path, ".restore.pending").exists());
+    assert_eq!(fs::read(path.parent().unwrap().join(orphan)).unwrap(), b"");
+}

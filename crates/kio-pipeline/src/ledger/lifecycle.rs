@@ -332,34 +332,18 @@ impl LedgerDb {
     pub fn backup(&self) -> Result<LedgerBackup> {
         let fs = FsSession::acquire_with_control(&self.path, false, self.control.clone())?;
         let (authority, checkpoint) = self.expected_authority(&fs)?;
-        let snapshot = super::snapshot::LedgerReadSnapshot::for_backup(&fs)?;
-        validate_bound_connection(snapshot.connection(), &authority, &checkpoint)?;
-        let backup = LedgerBackup::new(
-            authority.ledger_id.clone(),
-            authority.era.clone(),
-            checkpoint.seq,
-            snapshot.connection(),
-            fs.read_private(&fs.names().authority, MAX_RECORD)?,
-            fs.read_private(&fs.names().checkpoint, MAX_RECORD)?,
-        )?;
-        snapshot.revalidate_source()?;
-        fs.revalidate_boundary()?;
-        let proof = BackupProof {
-            version: 1,
-            ledger_id: authority.ledger_id.clone(),
-            era: authority.era.clone(),
-            sequence: checkpoint.seq,
-            sqlite_sha256: backup.sqlite_digest()?,
-        };
-        let bytes = encode(&proof)?;
-        if fs.contains_leaf(&fs.names().backup_proof)? {
-            fs.replace_existing(&fs.names().backup_proof, &bytes)?;
-        } else {
-            fs.create_only(&fs.names().backup_proof, &bytes)?;
-        }
-        fs.sync_parent()?;
-        durability_checkpoint(fs.control(), DurabilityPoint::LedgerBackupProof)?;
-        Ok(backup)
+        capture_backup(&fs, &authority, &checkpoint)
+    }
+
+    /// Capture from a locator without opening the source SQLite database.
+    /// Ordinary write-capable opens retain their existing lifecycle checks.
+    pub fn backup_existing_with_control(
+        path: impl AsRef<Path>,
+        control: ControlHandle,
+    ) -> Result<LedgerBackup> {
+        let fs = FsSession::acquire_with_control(path.as_ref(), false, control)?;
+        let (authority, checkpoint) = read_authority(&fs)?;
+        capture_backup(&fs, &authority, &checkpoint)
     }
 
     /// Inspect a proposed explicit restore. A backup behind the current
@@ -616,6 +600,41 @@ impl LedgerDb {
         }
         Ok((actual, checkpoint))
     }
+}
+
+fn capture_backup(
+    fs: &FsSession,
+    authority: &Authority,
+    checkpoint: &Checkpoint,
+) -> Result<LedgerBackup> {
+    let snapshot = super::snapshot::LedgerReadSnapshot::for_backup(fs)?;
+    validate_bound_connection(snapshot.connection(), authority, checkpoint)?;
+    let backup = LedgerBackup::new(
+        authority.ledger_id.clone(),
+        authority.era.clone(),
+        checkpoint.seq,
+        snapshot.connection(),
+        fs.read_private(&fs.names().authority, MAX_RECORD)?,
+        fs.read_private(&fs.names().checkpoint, MAX_RECORD)?,
+    )?;
+    snapshot.revalidate_source()?;
+    fs.revalidate_boundary()?;
+    let proof = BackupProof {
+        version: 1,
+        ledger_id: authority.ledger_id.clone(),
+        era: authority.era.clone(),
+        sequence: checkpoint.seq,
+        sqlite_sha256: backup.sqlite_digest()?,
+    };
+    let bytes = encode(&proof)?;
+    if fs.contains_leaf(&fs.names().backup_proof)? {
+        fs.replace_existing(&fs.names().backup_proof, &bytes)?;
+    } else {
+        fs.create_only(&fs.names().backup_proof, &bytes)?;
+    }
+    fs.sync_parent()?;
+    durability_checkpoint(fs.control(), DurabilityPoint::LedgerBackupProof)?;
+    Ok(backup)
 }
 
 fn complete_initialization(
