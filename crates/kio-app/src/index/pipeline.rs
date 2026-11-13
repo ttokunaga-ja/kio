@@ -1416,10 +1416,10 @@ fn latest_normalized_instance(
 }
 
 /// QB41: `Some(new_gen)` when the LATEST existing normalized instance's
-/// per-unit prepared identity disagrees with `fresh_prepared_units` (the
+/// per-unit keys or prepared hashes disagree with `fresh_prepared_units` (the
 /// SAME-pass, already-computed fresh Prepare output for this candidate -- no
 /// extra corpus scan) -- a prepare profile / renderer version change drove a
-/// prepared identity change without any `raw_hash` change at all (03 §2.1:
+/// prepared output change without any `raw_hash` change at all (03 §2.1:
 /// "`gen = 現最大 + 1` の新 instance を作れるのは `kio reindex --force` と、prepare
 /// profile / renderer 変更による `prepared_hash` 変化が駆動する再 Markdownize...
 /// だけ"; 07 §5.1's Office converted-PDF renderer-drift is the motivating
@@ -1480,6 +1480,15 @@ pub(crate) fn prepared_hash_drift_new_gen(
             )
         })
         .collect();
+    // Profiles identify the preparation process, not its output. Relocating
+    // an otherwise identical renderer must preserve the immutable instance.
+    let output_changed = existing
+        .iter()
+        .map(|(key, (hash, _))| (*key, *hash))
+        .ne(fresh.iter().map(|(key, (hash, _))| (*key, *hash)));
+    if !output_changed {
+        return None;
+    }
     let existing_profiles = existing
         .values()
         .map(|(_, profile)| *profile)
@@ -1503,8 +1512,7 @@ pub(crate) fn prepared_hash_drift_new_gen(
     if existing.keys().ne(fresh.keys()) && !preparation_profile_changed && !renderer_prepared {
         return None;
     }
-    (preparation_profile_changed || existing != fresh)
-        .then(|| latest.manifest.r#gen.saturating_add(1))
+    Some(latest.manifest.r#gen.saturating_add(1))
 }
 
 /// QB41 (03 §2.1's second legal gen+1 path): create a FRESH normalized

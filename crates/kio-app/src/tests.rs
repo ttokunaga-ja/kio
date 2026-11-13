@@ -955,6 +955,26 @@ fn preparation_profile_drift_bumps_generation_despite_changed_unit_keys() {
     };
     persist_normalized_instance(&kio_dir, &manifest, &[unit]).unwrap();
 
+    let relocated = PreparedUnit {
+        preparation_profile_hash: new_preparation_profile.clone(),
+        ..old_prepared.clone()
+    };
+    assert_ne!(
+        relocated.preparation_profile_hash,
+        old_prepared.preparation_profile_hash
+    );
+    assert_eq!(
+        crate::index::pipeline::prepared_hash_drift_new_gen(
+            &kio_dir,
+            &raw_hash,
+            &markdown_profile_hash,
+            &[relocated],
+            &ControlHandle::default(),
+        ),
+        None,
+        "a profile change alone cannot create a generation",
+    );
+
     let fresh = PreparedUnit {
         renderer: None,
         unit_key: "page:2".to_owned(),

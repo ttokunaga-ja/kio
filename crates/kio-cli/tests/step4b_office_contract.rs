@@ -773,6 +773,50 @@ fn office_05_watch_renderer_drift_creates_gen1_without_confirmation() {
     assert_renderer_drift(true, true);
 }
 
+/// Relocating the renderer changes its preparation profile, not its output.
+#[test]
+fn office_05_identical_output_at_another_renderer_path_keeps_generation_and_provenance() {
+    let dir = canonical_tempdir();
+    let fixtures = tempfile::tempdir().unwrap();
+    let fixture_a = write_office_fixture_pdf(
+        &fixtures,
+        "renderer_a.pdf",
+        &["same prepared output across renderer paths"],
+    );
+    let fixture_b = fixtures.path().join("renderer_b.pdf");
+    fs::copy(&fixture_a, &fixture_b).unwrap();
+    write_office_input(&dir, "report.docx");
+    init(&dir);
+    let units_root = dir.path().join(".kio/objects/normalized_units");
+    kio(&dir, &["index"])
+        .env(TEST_OFFICE_CONVERT_ENV, &fixture_a)
+        .arg("--json")
+        .assert()
+        .success();
+    let gen0 = gen_dir_with_suffix(&units_root, ".g0");
+    let before = file_snapshot(&gen0);
+    let manifests = dir.path().join(".kio/objects/manifests");
+    let immutable_before = file_snapshot(&manifests);
+    for fixture in [&fixture_b, &fixture_a, &fixture_b] {
+        kio(&dir, &["index"])
+            .env(TEST_OFFICE_CONVERT_ENV, fixture)
+            .arg("--json")
+            .assert()
+            .success();
+        assert_eq!(
+            gen_dir_names_under(&units_root).len(),
+            1,
+            "identical unit keys and prepared hashes must preserve g0"
+        );
+        assert_eq!(
+            file_snapshot(&gen0),
+            before,
+            "the original profile, provenance and units must remain unchanged"
+        );
+        assert_eq!(file_snapshot(&manifests), immutable_before);
+    }
+}
+
 struct WatchChild(std::process::Child);
 impl Drop for WatchChild {
     fn drop(&mut self) {
