@@ -137,25 +137,14 @@ impl StageWriter {
         leaf: &Path,
         initialize: impl FnOnce(&File) -> Result<StageIdentity>,
     ) -> Result<Self> {
-        let file = directory.create_private_file(leaf)?;
-        let physical = file_id(&file)?;
+        let file = crate::platform::stage_operations::create_file(directory, leaf)?;
         let identity = match initialize(&file) {
             Ok(identity) => identity,
             Err(error) => {
-                // Retain the original identity while opening a read handle,
-                // then close the writer before removal (Windows sharing).
-                // Keeping the read handle prevents physical-ID reuse during
-                // cleanup even when nonce initialization itself failed.
-                let current = directory.open_regular_read(leaf, u64::MAX).ok();
-                drop(file);
-                if let Some(current) = current
-                    && file_id(&current).ok().as_ref() == Some(&physical)
-                {
-                    let _ = crate::platform::atomic_semantics::remove_publication_residue(
-                        directory, leaf,
-                    );
-                }
-                return Err(error);
+                return Err(initialization_failure(
+                    error,
+                    crate::platform::stage_operations::discard_file(directory, leaf, &file),
+                ));
             }
         };
         directory.sync()?;
@@ -186,6 +175,9 @@ impl StageWriter {
             .map_err(|e| stage_io("cannot sync private stage", e))
     }
 
+    // Temporarily allow dead code until S1–S3/P0/L2/J1 adopt this method.
+    // Small atomic writes deliberately keep their physical-only implementation.
+    #[allow(dead_code)]
     pub(crate) fn set_readonly(&self) -> Result<()> {
         let mut permissions = self
             .file
@@ -207,6 +199,21 @@ impl StageWriter {
         leaf: &Path,
         publication: Publication,
     ) -> Result<()> {
+        self.publish_with(target, leaf, publication, || Ok(()))
+    }
+
+    fn publish_with(
+        self,
+        target: &StoreDirectory,
+        leaf: &Path,
+        publication: Publication,
+        after_verified: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        if super::relative_components(leaf, false, target.path())?.len() != 1 {
+            return Err(failure(
+                "stage publication destination must be a direct leaf",
+            ));
+        }
         self.sync()?;
         let Self {
             directory,
@@ -214,11 +221,16 @@ impl StageWriter {
             file,
             identity,
         } = self;
-        drop(file);
-        let current = directory.open_regular_read(&source, u64::MAX)?;
-        identity.verify(&current)?;
-        drop(current);
-        directory.rename_regular_between_raw(&source, target, leaf, publication)?;
+        identity.verify(&file)?;
+        after_verified()?;
+        crate::platform::stage_operations::publish(
+            &directory,
+            &source,
+            &file,
+            target,
+            leaf,
+            publication,
+        )?;
         directory.sync()?;
         target.sync()
     }
@@ -231,46 +243,186 @@ impl StoreDirectory {
         &self,
         leaf: &Path,
     ) -> Result<(StoreDirectory, DirectoryStageIdentity)> {
+        self.create_stage_directory_with(leaf, |handle| {
+            let mut nonce = [0; 32];
+            getrandom::fill(&mut nonce)
+                .map_err(|e| failure(format!("cannot generate directory stage nonce: {e}")))?;
+            crate::platform::stage_nonce::create(handle, &nonce).map_err(|e| {
+                nonce_error(
+                    "cannot persist directory stage nonce (xattr/EA required; no fallback)",
+                    e,
+                )
+            })?;
+            Ok(nonce)
+        })
+    }
+
+    fn create_stage_directory_with(
+        &self,
+        leaf: &Path,
+        initialize: impl FnOnce(&File) -> Result<[u8; 32]>,
+    ) -> Result<(StoreDirectory, DirectoryStageIdentity)> {
         if super::relative_components(leaf, false, self.path())?.len() != 1 {
             return Err(failure("stage directory must be a direct leaf"));
         }
         let handle = crate::platform::stage_nonce::create_directory(self, leaf)?;
-        let mut nonce = [0; 32];
-        getrandom::fill(&mut nonce)
-            .map_err(|e| failure(format!("cannot generate directory stage nonce: {e}")))?;
-        crate::platform::stage_nonce::create(&handle, &nonce).map_err(|e| {
-            nonce_error(
-                "cannot persist directory stage nonce (xattr/EA required; no fallback)",
-                e,
-            )
-        })?;
-        let stage = StoreDirectory::from_retained_with_control(
-            handle,
-            self.path().join(leaf),
-            self.control().clone(),
-        )?;
-        let identity = DirectoryStageIdentity::read(&stage)?;
-        if identity.nonce != nonce {
-            return Err(failure("directory stage nonce did not persist"));
+        let result = (|| {
+            let nonce = initialize(&handle)?;
+            let stage = StoreDirectory::from_retained_with_control(
+                handle
+                    .try_clone()
+                    .map_err(|e| stage_io("cannot retain new directory stage", e))?,
+                self.path().join(leaf),
+                self.control().clone(),
+            )?;
+            let identity = DirectoryStageIdentity::read(&stage)?;
+            if identity.nonce != nonce {
+                return Err(failure("directory stage nonce did not persist"));
+            }
+            stage.sync()?;
+            self.sync()?;
+            Ok((stage, identity))
+        })();
+        match result {
+            Ok(stage) => Ok(stage),
+            Err(error) => Err(initialization_failure(
+                error,
+                crate::platform::stage_operations::discard_empty_directory(self, leaf, &handle),
+            )),
         }
-        stage.sync()?;
-        self.sync()?;
-        Ok((stage, identity))
     }
 
     /// Discard a crash residue only when both components of its saved identity
     /// still match. An absent name is idempotent; unknown files are preserved.
     pub fn discard_stage(&self, leaf: &Path, identity: &StageIdentity) -> Result<bool> {
+        self.discard_stage_with(leaf, identity, || Ok(()))
+    }
+
+    fn discard_stage_with(
+        &self,
+        leaf: &Path,
+        identity: &StageIdentity,
+        after_verified: impl FnOnce() -> Result<()>,
+    ) -> Result<bool> {
+        if super::relative_components(leaf, false, self.path())?.len() != 1 {
+            return Err(failure("stage must be a direct leaf"));
+        }
         if !self.contains_entry(leaf)? {
             return Ok(false);
         }
         self.ensure_owner_private(leaf)?;
-        let file = self.open_regular_read(leaf, u64::MAX)?;
+        let file = crate::platform::stage_operations::open_file(self, leaf)?;
         identity.verify(&file)?;
-        drop(file);
-        crate::platform::atomic_semantics::remove_publication_residue(self, leaf)?;
+        after_verified()?;
+        crate::platform::stage_operations::discard_file(self, leaf, &file)?;
         self.sync()?;
         Ok(true)
+    }
+}
+
+fn initialization_failure(error: crate::KioError, cleanup: Result<()>) -> crate::KioError {
+    let Err(cleanup) = cleanup else {
+        return error;
+    };
+    let message = format!(
+        "{}; initialization residue preserved: {}",
+        error.message(),
+        cleanup.message()
+    );
+    if let Some(limit) = error.resource_limit() {
+        return limit.clone().into_error(message);
+    }
+    crate::KioError::new(
+        error.error_code(),
+        message,
+        serde_json::json!({"initialization": error.context(), "cleanup": cleanup.context()}),
+        error.exit_code(),
+    )
+}
+
+/// Inspection is read-only. A tagged file without a saved identity remains
+/// unidentified: nonce presence alone never grants authority to reclaim it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum StageEntryState {
+    Owned,
+    Unidentified { reason: String },
+    Missing,
+}
+#[derive(Debug)]
+pub struct StageInspectionEntry {
+    pub name: std::ffi::OsString,
+    pub state: StageEntryState,
+}
+impl StoreDirectory {
+    /// Inspect a dedicated large-stage directory against the caller's saved
+    /// journal identities. Unknown, unsafe and mismatching entries are reported
+    /// with a reason; missing expected entries are included as well. This API
+    /// never adopts, locks, tags, publishes or removes anything.
+    pub fn inspect_stages(
+        &self,
+        files: &[(PathBuf, StageIdentity)],
+        directories: &[(PathBuf, DirectoryStageIdentity)],
+    ) -> Result<Vec<StageInspectionEntry>> {
+        enum Expected<'a> {
+            File(&'a StageIdentity),
+            Directory(&'a DirectoryStageIdentity),
+        }
+        let mut expected = std::collections::BTreeMap::new();
+        for (name, identity) in files
+            .iter()
+            .map(|(n, i)| (n, Expected::File(i)))
+            .chain(directories.iter().map(|(n, i)| (n, Expected::Directory(i))))
+        {
+            if super::relative_components(name, false, self.path())?.len() != 1
+                || expected
+                    .insert(name.as_os_str().to_owned(), identity)
+                    .is_some()
+            {
+                return Err(failure(
+                    "stage inspection requires unique direct leaf names",
+                ));
+            }
+        }
+        let mut result = Vec::new();
+        // Inventory names without adopting entries or following links. The
+        // general store listing rejects unsafe leaves before naming them;
+        // inspection must instead report each such residue to its caller.
+        let entries = cap_primitives::fs::read_base_dir(&self.root_handle())
+            .map_err(|e| io_failure("cannot enumerate stage residues", e))?;
+        for entry in entries {
+            let name = entry
+                .map_err(|e| io_failure("cannot inspect stage residue name", e))?
+                .file_name();
+            let verification = match expected.remove(&name) {
+                None => Err(failure("no saved stage identity; residue preserved")),
+                Some(Expected::File(identity)) => (|| {
+                    self.ensure_owner_private(Path::new(&name))?;
+                    identity.verify(&self.open_regular_read(Path::new(&name), u64::MAX)?)
+                })(),
+                Some(Expected::Directory(identity)) => (|| {
+                    let directory = StoreDirectory::from_retained_with_control(
+                        self.open_directory(Path::new(&name))?,
+                        self.path().join(&name),
+                        self.control().clone(),
+                    )?;
+                    crate::private_fs::verify_private_directory_handle(&directory)?;
+                    identity.verify(&directory)
+                })(),
+            };
+            let state = match verification {
+                Ok(()) => StageEntryState::Owned,
+                Err(error) => StageEntryState::Unidentified {
+                    reason: error.message().to_owned(),
+                },
+            };
+            result.push(StageInspectionEntry { name, state });
+        }
+        result.extend(expected.into_keys().map(|name| StageInspectionEntry {
+            name,
+            state: StageEntryState::Missing,
+        }));
+        result.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(result)
     }
 }
 
@@ -369,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_nonce_initialization_fails_without_fallback_and_closes_writer_before_cleanup() {
+    fn unsupported_nonce_initialization_fails_without_fallback_and_cleans_created_handle() {
         let (temp, directory) = directory();
         let result = StageWriter::create_with(&directory, Path::new("stage"), |_| {
             Err(nonce_error(
@@ -445,39 +597,229 @@ mod tests {
     }
 
     #[test]
-    fn atomic_stream_callback_failure_preserves_destination_and_recovers_partial_stage() {
+    fn replacement_after_verification_is_never_published_or_deleted() {
+        for publication in [
+            Publication::CreateOnly,
+            Publication::Replace,
+            Publication::Upsert,
+        ] {
+            let (temp, directory) = directory();
+            let mut writer = StageWriter::create(&directory, Path::new("stage")).unwrap();
+            writer.write_chunk(b"ours").unwrap();
+            if publication != Publication::CreateOnly {
+                fs::write(temp.path().join("public"), b"previous").unwrap();
+            }
+            let result = writer.publish_with(&directory, Path::new("public"), publication, || {
+                fs::rename(temp.path().join("stage"), temp.path().join("displaced")).unwrap();
+                let mut foreign = directory.create_private_file(Path::new("stage"))?;
+                foreign.write_all(b"foreign").unwrap();
+                Ok(())
+            });
+            if let Ok(bytes) = fs::read(temp.path().join("public")) {
+                assert_ne!(bytes, b"foreign");
+            }
+            assert_eq!(fs::read(temp.path().join("stage")).unwrap(), b"foreign");
+            if result.is_err() && publication != Publication::CreateOnly {
+                assert_eq!(fs::read(temp.path().join("public")).unwrap(), b"previous");
+            }
+        }
+    }
+
+    #[test]
+    fn replacement_after_verification_is_never_deleted() {
         let (temp, directory) = directory();
-        let error = directory
-            .write_atomic_stream_with_owner(
-                &directory,
-                Path::new("public"),
-                Publication::CreateOnly,
-                |writer| {
-                    writer.write_chunk(b"partial")?;
-                    Err(crate::KioError::invalid_usage("interrupted producer"))
-                },
-            )
-            .unwrap_err();
-        assert_eq!(error.message(), "interrupted producer");
-        assert!(!temp.path().join("public").exists());
-        directory.recover_atomic(&[&directory]).unwrap();
+        let writer = StageWriter::create(&directory, Path::new("stage")).unwrap();
+        let identity = writer.identity().clone();
+        drop(writer);
+        let _ = directory.discard_stage_with(Path::new("stage"), &identity, || {
+            fs::rename(temp.path().join("stage"), temp.path().join("displaced")).unwrap();
+            let mut foreign = directory.create_private_file(Path::new("stage"))?;
+            foreign.write_all(b"foreign").unwrap();
+            Ok(())
+        });
+        assert_eq!(fs::read(temp.path().join("stage")).unwrap(), b"foreign");
+    }
+
+    #[test]
+    fn directory_initialization_error_cleans_only_its_new_empty_directory() {
+        for reason in [
+            "random generation failed",
+            "EA unsupported",
+            "nonce verification failed",
+        ] {
+            let (temp, directory) = directory();
+            let error = directory
+                .create_stage_directory_with(Path::new("stage"), |_| Err(failure(reason)))
+                .unwrap_err();
+            assert_eq!(error.message(), reason);
+            assert!(!temp.path().join("stage").exists());
+            assert!(directory.entries(Path::new("")).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn inspection_reports_untagged_unknown_mismatching_and_missing_residue_without_mutation() {
+        let (temp, directory) = directory();
+        let writer = StageWriter::create(&directory, Path::new("owned")).unwrap();
+        let expected = writer.identity().clone();
+        drop(writer);
         directory
-            .write_atomic_stream_with_owner(
-                &directory,
-                Path::new("public"),
-                Publication::CreateOnly,
-                |writer| {
-                    for _ in 0..3 {
-                        writer.write_chunk(b"chunk")?;
-                    }
-                    Ok(())
-                },
+            .create_private_file(Path::new("unidentified"))
+            .unwrap();
+        for name in ["unknown", "mismatch"] {
+            let mut other = StageWriter::create(&directory, Path::new(name)).unwrap();
+            other.write_chunk(b"preserve").unwrap();
+        }
+        let (_child, child_id) = directory
+            .create_stage_directory(Path::new("directory"))
+            .unwrap();
+        let result = directory
+            .inspect_stages(
+                &[
+                    (PathBuf::from("owned"), expected.clone()),
+                    (PathBuf::from("mismatch"), expected.clone()),
+                    (PathBuf::from("missing"), expected),
+                ],
+                &[(PathBuf::from("directory"), child_id)],
             )
             .unwrap();
-        assert_eq!(
-            fs::read(temp.path().join("public")).unwrap(),
-            b"chunkchunkchunk"
+        assert_eq!(result.len(), 6);
+        for name in ["owned", "directory"] {
+            assert!(
+                result
+                    .iter()
+                    .any(|e| e.name == name && e.state == StageEntryState::Owned)
+            );
+        }
+        for name in ["unidentified", "unknown", "mismatch"] {
+            assert!(result.iter().any(|e| e.name == name && matches!(e.state, StageEntryState::Unidentified { ref reason } if !reason.is_empty())));
+            assert!(temp.path().join(name).exists());
+        }
+        assert!(
+            result
+                .iter()
+                .any(|e| e.name == "missing" && e.state == StageEntryState::Missing)
         );
+        assert_eq!(fs::read(temp.path().join("mismatch")).unwrap(), b"preserve");
+    }
+
+    #[test]
+    fn directory_verification_failure_also_cleans_the_new_empty_directory() {
+        let (temp, directory) = directory();
+        assert!(
+            directory
+                .create_stage_directory_with(Path::new("stage"), |_| Ok([0; 32]))
+                .is_err()
+        );
+        assert!(!temp.path().join("stage").exists());
+    }
+
+    #[test]
+    fn initialization_cleanup_preserves_nonempty_and_replaced_directories() {
+        let (temp, directory) = directory();
+        let error = directory
+            .create_stage_directory_with(Path::new("stage"), |_| {
+                fs::write(temp.path().join("stage/sentinel"), b"keep").unwrap();
+                Err(failure("initialization failed"))
+            })
+            .unwrap_err();
+        assert!(error.message().contains("residue preserved"));
+        assert_eq!(
+            fs::read(temp.path().join("stage/sentinel")).unwrap(),
+            b"keep"
+        );
+
+        let error = directory
+            .create_stage_directory_with(Path::new("other"), |_| {
+                fs::rename(temp.path().join("other"), temp.path().join("displaced")).unwrap();
+                directory.create_directory(Path::new("other"))?;
+                fs::write(temp.path().join("other/foreign"), b"keep").unwrap();
+                Err(failure("initialization failed"))
+            })
+            .unwrap_err();
+        assert!(error.message().contains("initialization failed"));
+        assert_eq!(
+            fs::read(temp.path().join("other/foreign")).unwrap(),
+            b"keep"
+        );
+    }
+
+    #[test]
+    fn inspection_rejects_conflicting_or_nonlocal_expected_names() {
+        let (_temp, directory) = directory();
+        let writer = StageWriter::create(&directory, Path::new("stage")).unwrap();
+        let id = writer.identity().clone();
+        assert!(
+            directory
+                .inspect_stages(
+                    &[
+                        (PathBuf::from("stage"), id.clone()),
+                        (PathBuf::from("stage"), id.clone())
+                    ],
+                    &[]
+                )
+                .is_err()
+        );
+        assert!(
+            directory
+                .inspect_stages(&[(PathBuf::from("../stage"), id)], &[])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn private_readonly_stage_can_be_reclaimed_using_its_verified_handle() {
+        let (temp, directory) = directory();
+        let mut writer = StageWriter::create(&directory, Path::new("stage")).unwrap();
+        writer.write_chunk(b"owned").unwrap();
+        writer.set_readonly().unwrap();
+        writer.sync().unwrap();
+        let expected = writer.identity().clone();
+        drop(writer);
+        assert!(
+            directory
+                .discard_stage(Path::new("stage"), &expected)
+                .unwrap()
+        );
+        assert!(!temp.path().join("stage").exists());
+        assert!(directory.entries(Path::new("")).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_reports_symlinks_without_following_them() {
+        let (temp, directory) = directory();
+        let writer = StageWriter::create(&directory, Path::new("owned")).unwrap();
+        let expected = writer.identity().clone();
+        std::os::unix::fs::symlink(temp.path().join("owned"), temp.path().join("link")).unwrap();
+        let result = directory
+            .inspect_stages(&[(PathBuf::from("link"), expected)], &[])
+            .unwrap();
+        assert!(
+            result.iter().any(
+                |e| e.name == "link" && matches!(e.state, StageEntryState::Unidentified { .. })
+            )
+        );
+        assert!(
+            temp.path()
+                .join("link")
+                .symlink_metadata()
+                .unwrap()
+                .is_symlink()
+        );
+        assert!(temp.path().join("owned").is_file());
+    }
+
+    #[test]
+    fn small_atomic_writes_do_not_require_nonce_metadata() {
+        let (_temp, directory) = directory();
+        directory
+            .write_atomic(Path::new("public"), b"small", Publication::CreateOnly)
+            .unwrap();
+        let file = directory
+            .open_regular_read(Path::new("public"), 64)
+            .unwrap();
+        assert!(crate::platform::stage_nonce::read(&file).is_err());
     }
 
     #[test]

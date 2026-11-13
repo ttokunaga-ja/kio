@@ -61,10 +61,12 @@ directory に到達するまで連鎖してから、当該 subtree 配下の pub
 ない。初回大量取り込みの I/O を規範が強制しない)。**削除 (unlink / rmdir — purge の deleted 相等) も同様に、
 各削除後に包含 directory を fsync してから journal phase / postcondition を前進させる** (fsync 前の
 前進は電源断で削除だけが巻き戻る)。crash が残した temp は次回書き込み系コマンド冒頭で掃除する。
-Kio が作成する一時領域は、物理 ID（Unix は device/inode、Windows は volume serial/file index）と
-256 bit の乱数（Unix は拡張属性、Windows は EA）の組で識別する（D-20261031-01）。
-対応していない filesystem では理由を示して操作を失敗させ、代替方式へ切り替えない。
-回収時に保存済みの識別情報と一致しない、または識別情報の耐久保存前に中断した残骸は削除しない。
+中断後に再開・回収する大きな書き込み（原本・tree・復元・抽出の保存、台帳の backup、journal の整理）の
+一時領域だけを、物理 ID（Unix は device/inode、Windows は volume serial/file index）と
+256 bit の乱数（Unix は拡張属性、Windows は EA）の組で識別する（D-20261031-01、D-20261113-16）。
+対応していない filesystem では、その大きな操作だけを理由を示して失敗させ、代替方式へ切り替えない。
+store の小さな atomic 書き込みと management の child_lifecycle は従来の物理 ID による方式を使う。
+大きな一時領域の回収時は、保存済みの識別情報と一致しない、または識別情報の耐久保存前に中断した残骸を削除しない。
 一般の利用者のファイルへ識別用の乱数を付けない。
 03 §2 / 05 §8.1 の「fsync 規律」参照は本 ¶ を指す。
 **「親 directory fsync」は POSIX でのみ実行可能な手段である。** Windows には対応する操作が無く

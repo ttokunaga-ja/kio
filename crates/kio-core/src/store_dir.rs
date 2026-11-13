@@ -16,7 +16,9 @@ use crate::{ExitCode, KioError, Result, platform::store as platform};
 
 pub(crate) mod atomic;
 mod stage;
-pub use stage::{DirectoryStageIdentity, StageIdentity, StageWriter};
+pub use stage::{
+    DirectoryStageIdentity, StageEntryState, StageIdentity, StageInspectionEntry, StageWriter,
+};
 pub(crate) mod planned_removal;
 pub use atomic::{ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState};
 pub(crate) use planned_removal::require_same_filesystem;
@@ -293,27 +295,6 @@ impl StoreDirectory {
         publication: Publication,
     ) -> Result<()> {
         atomic::write(owner, self, relative, bytes, publication)
-    }
-
-    /// Stream a private file under the owner's durable recovery protocol.
-    /// The callback writes bounded chunks; errors leave an identified stage
-    /// for recovery and never publish a partial destination.
-    pub fn write_atomic_stream_with_owner(
-        &self,
-        owner: &StoreDirectory,
-        relative: &Path,
-        publication: Publication,
-        write_payload: impl FnOnce(&mut StageWriter) -> Result<()>,
-    ) -> Result<()> {
-        atomic::write_stream(
-            owner,
-            self,
-            relative,
-            publication,
-            false,
-            write_payload,
-            |_, _| Ok(()),
-        )
     }
 
     /// Validate only the reserved workspace; this never creates or recovers it.

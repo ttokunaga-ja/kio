@@ -76,6 +76,7 @@ pub(crate) enum NewPrivateObjectKind {
     Directory,
     StageDirectory,
     RegularFile,
+    StageFile,
     LockFile,
 }
 
@@ -130,7 +131,7 @@ pub(crate) fn create_new_private_at(
     let (desired_access, file_attributes, create_options) = match kind {
         NewPrivateObjectKind::Directory | NewPrivateObjectKind::StageDirectory => (
             (if matches!(kind, NewPrivateObjectKind::StageDirectory) {
-                GENERIC_READ | GENERIC_WRITE
+                GENERIC_READ | GENERIC_WRITE | DELETE
             } else {
                 0
             }) | FILE_LIST_DIRECTORY
@@ -143,8 +144,17 @@ pub(crate) fn create_new_private_at(
             windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY,
             FILE_SYNCHRONOUS_IO_NONALERT | FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
         ),
-        NewPrivateObjectKind::RegularFile => (
-            GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE | READ_CONTROL | FILE_READ_ATTRIBUTES,
+        NewPrivateObjectKind::RegularFile | NewPrivateObjectKind::StageFile => (
+            GENERIC_READ
+                | GENERIC_WRITE
+                | SYNCHRONIZE
+                | READ_CONTROL
+                | FILE_READ_ATTRIBUTES
+                | (if matches!(kind, NewPrivateObjectKind::StageFile) {
+                    DELETE
+                } else {
+                    0
+                }),
             windows_sys::Win32::Storage::FileSystem::FILE_ATTRIBUTE_NORMAL,
             FILE_SYNCHRONOUS_IO_NONALERT | FILE_NON_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
         ),
@@ -208,7 +218,9 @@ pub(crate) fn create_new_private_at(
         NewPrivateObjectKind::Directory | NewPrivateObjectKind::StageDirectory => {
             crate::platform::directory_handle_identity(&file).is_some()
         }
-        NewPrivateObjectKind::RegularFile | NewPrivateObjectKind::LockFile => {
+        NewPrivateObjectKind::RegularFile
+        | NewPrivateObjectKind::StageFile
+        | NewPrivateObjectKind::LockFile => {
             crate::platform::regular_file_handle_identity(&file).is_some()
         }
     };

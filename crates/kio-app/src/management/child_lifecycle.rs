@@ -18,7 +18,7 @@ use kio_core::management::{
 };
 use kio_core::scope::{Repository, new_ulid};
 use kio_core::store_dir::{
-    ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, DirectoryStageIdentity, Publication, StoreDirectory,
+    ATOMIC_WORKSPACE_DIR, AtomicWorkspaceState, Publication, StoreDirectory,
 };
 use kio_core::{KioError, Result};
 use serde::{Deserialize, Serialize};
@@ -51,7 +51,7 @@ struct Initialization {
     enrollment_token: String,
     stage_leaf: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    stage_identity: Option<DirectoryStageIdentity>,
+    stage_identity: Option<DirectoryIdentity>,
     management: ManagementRecord,
 }
 
@@ -540,11 +540,9 @@ fn validate_pending_before_policy(
         let repo = super::open_existing_bound(&observed.canonical_root, &child)?
             .in_lock_session(parent.lock_session());
         let child_binding = binding_for_repo(&repo)?;
-        if Some(DirectoryStageIdentity::read(&control(
-            &child_binding,
-            parent.control(),
-        )?)?)
-            != journal.stage_identity
+        if Some(kio_core::management::directory_identity_from_handle(
+            child_binding.kio_handle(),
+        )?) != journal.stage_identity
         {
             return Err(KioError::invalid_usage(
                 "pending published child store differs from journal",
@@ -584,7 +582,8 @@ fn validate_pending_before_policy(
             parent.control().clone(),
         )?;
         kio_core::private_fs::verify_private_directory_handle(&stage)?;
-        let identity = DirectoryStageIdentity::read(&stage)?;
+        let identity =
+            kio_core::management::directory_identity_from_handle(stage.root_handle().as_ref())?;
         if let Some(expected) = &journal.stage_identity {
             if expected != &identity {
                 return Err(KioError::invalid_usage(
@@ -602,9 +601,13 @@ fn validate_pending_before_policy(
                     (STAGE_MARKER, bytes),
                 ],
             )?;
-        } else {
+        } else if !stage
+            .entries_optional(Path::new(""))?
+            .unwrap_or_default()
+            .is_empty()
+        {
             return Err(KioError::invalid_usage(
-                "un-pinned pending child stage is preserved",
+                "un-pinned pending child stage is not empty",
             ));
         }
     } else if journal.stage_identity.is_some() {
@@ -734,11 +737,9 @@ fn resume_initialization(
             .in_lock_session(parent.lock_session());
         let child_binding = binding_for_repo(&repo)?;
         if child_binding.directory_identity() != &journal.retained_child_identity
-            || Some(DirectoryStageIdentity::read(&control(
-                &child_binding,
-                parent.control(),
-            )?)?)
-                != journal.stage_identity
+            || Some(kio_core::management::directory_identity_from_handle(
+                child_binding.kio_handle(),
+            )?) != journal.stage_identity
         {
             return Err(KioError::invalid_usage(
                 "published child store differs from initialization journal",
@@ -800,7 +801,8 @@ fn resume_initialization(
             parent.control().clone(),
         )?;
         kio_core::private_fs::verify_private_directory_handle(&stage)?;
-        let identity = DirectoryStageIdentity::read(&stage)?;
+        let identity =
+            kio_core::management::directory_identity_from_handle(stage.root_handle().as_ref())?;
         match &journal.stage_identity {
             Some(expected) if expected == &identity => {}
             Some(_) => {
@@ -809,9 +811,18 @@ fn resume_initialization(
                 ));
             }
             None => {
-                return Err(KioError::invalid_usage(
-                    "un-pinned child initialization stage is preserved",
-                ));
+                if !stage
+                    .entries_optional(Path::new(""))?
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    return Err(KioError::invalid_usage(
+                        "un-pinned child initialization stage is not empty",
+                    ));
+                }
+                journal.stage_identity = Some(identity);
+                bytes = encode(&journal, "child initialization journal")?;
+                write_initialization(parent_control, &journal, &bytes, Publication::Replace)?;
             }
         }
         stage
@@ -821,9 +832,18 @@ fn resume_initialization(
                 "pinned child initialization stage is absent",
             ));
         }
-        let (stage, identity) =
-            parent_control.create_stage_directory(Path::new(&journal.stage_leaf))?;
-        journal.stage_identity = Some(identity);
+        let stage = StoreDirectory::from_retained_with_control(
+            parent_control.create_directory(Path::new(&journal.stage_leaf))?,
+            parent
+                .canonical_root()
+                .join(".kio")
+                .join(&journal.stage_leaf),
+            parent.control().clone(),
+        )?;
+        kio_core::private_fs::verify_private_directory_handle(&stage)?;
+        journal.stage_identity = Some(kio_core::management::directory_identity_from_handle(
+            stage.root_handle().as_ref(),
+        )?);
         bytes = encode(&journal, "child initialization journal")?;
         write_initialization(parent_control, &journal, &bytes, Publication::Replace)?;
         stage
@@ -1005,11 +1025,19 @@ mod tests {
                 Publication::CreateOnly,
             )
             .unwrap();
-        let (stage, identity) = store
-            .create_stage_directory(std::path::Path::new(&journal.stage_leaf))
-            .unwrap();
+        let stage = StoreDirectory::from_retained(
+            store
+                .create_directory(std::path::Path::new(&journal.stage_leaf))
+                .unwrap(),
+            parent
+                .canonical_root()
+                .join(".kio")
+                .join(&journal.stage_leaf),
+        )
+        .unwrap();
         if pinned {
-            journal.stage_identity = Some(identity);
+            journal.stage_identity =
+                Some(directory_identity_from_handle(stage.root_handle().as_ref()).unwrap());
             bytes = encode(&journal, "child initialization journal").unwrap();
             initialization_directory(&store, false)
                 .unwrap()
@@ -1071,39 +1099,18 @@ mod tests {
     }
 
     #[test]
-    fn empty_unpinned_stage_is_preserved_without_adoption() {
+    fn empty_unpinned_stage_is_adopted_and_completed() {
         let temp = canonical_tempdir();
         let parent = parent(&temp);
         let child = temp.path().join("child");
         fs::create_dir(&child).unwrap();
         interrupted_stage(&parent, &child, false, false);
-        assert!(reconcile_or_initialize_child(&parent, "child").is_err());
-        assert!(!child.join(".kio").exists());
+        assert!(reconcile_or_initialize_child(&parent, "child").is_ok());
+        assert!(child.join(".kio/management.json").is_file());
         assert!(
             !child.join(".kio-atomic").exists(),
             "the child-root case probe must keep its atomic workspace in the private stage"
         );
-    }
-
-    #[test]
-    fn pinned_stage_with_a_different_nonce_is_preserved() {
-        let temp = canonical_tempdir();
-        let parent = parent(&temp);
-        let child = temp.path().join("child");
-        fs::create_dir(&child).unwrap();
-        interrupted_stage(&parent, &child, true, false);
-        let binding = binding_for_repo(&parent).unwrap();
-        let store = control(&binding, parent.control()).unwrap();
-        let (mut journal, _) = test_journal(&store);
-        let mut identity = serde_json::to_value(journal.stage_identity.as_ref().unwrap()).unwrap();
-        let old = identity["nonce"][0].as_u64().unwrap();
-        identity["nonce"][0] = serde_json::json!((old + 1) % 256);
-        journal.stage_identity = Some(serde_json::from_value(identity).unwrap());
-        let bytes = encode(&journal, "child initialization journal").unwrap();
-        super::write_initialization(&store, &journal, &bytes, Publication::Replace).unwrap();
-        assert!(reconcile_or_initialize_child(&parent, "child").is_err());
-        assert!(!child.join(".kio").exists());
-        assert!(store.path().join(journal.stage_leaf).is_dir());
     }
 
     #[test]

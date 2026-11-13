@@ -265,3 +265,10 @@ pub(crate) mod stage_nonce;
 #[cfg(windows)]
 #[path = "windows/stage_nonce.rs"]
 pub(crate) mod stage_nonce;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "unix/stage_operations.rs"]
+pub(crate) mod stage_operations;
+#[cfg(windows)]
+#[path = "windows/stage_operations.rs"]
+pub(crate) mod stage_operations;
