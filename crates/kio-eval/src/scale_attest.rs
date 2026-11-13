@@ -420,6 +420,9 @@ struct NormalizedManifestWire {
     run_id: String,
     units: Vec<NormalizedUnitEntryWire>,
     generated_at: String,
+    // Validated on deserialization; required by 03 §2.1 for every manifest.
+    #[allow(dead_code)]
+    preparation_provenance: kio_core::preparation_provenance::PreparationProvenance,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
