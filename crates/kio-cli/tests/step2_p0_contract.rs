@@ -4304,6 +4304,17 @@ fn resource_limit_embedding_retry_uses_chunk_identity() {
 #[test]
 fn resource_limit_mixed_offline_retry_preserves_hold_and_done_unit() {
     for resource_sibling in [false, true] {
+        exercise_resource_mixed_retry(resource_sibling, 0);
+    }
+}
+
+#[test]
+fn resource_limit_exhausted_network_retry_allows_explicit_unknown_resend() {
+    exercise_resource_mixed_retry(false, 4);
+}
+
+fn exercise_resource_mixed_retry(resource_sibling: bool, initial_attempts: u32) {
+    {
         let dir = scope();
         let raw = fake_pdf(&["first page", "work page", "network page"]);
         fs::write(dir.path().join("document.pdf"), &raw).unwrap();
@@ -4401,7 +4412,7 @@ fn resource_limit_mixed_offline_retry_preserves_hold_and_done_unit() {
             std::slice::from_ref(&unit),
         )
         .unwrap();
-        let task: kio_pipeline::task::TaskDescriptor = serde_json::from_value(json!({"task_id":"task_mixed_resource","type":"markdownize","mode":"full","input_path":"document.pdf","input_hash":raw_hash,"previous_raw_hash":null,"parent_run_id":null,"changed_unit_keys":[],"output_ref":kio_pipeline::task::normalized_task_output_ref(&raw_hash,&profile_hash,0),"unit_keys":null,"status":"partial","attempts":0,"next_retry_at":null,"deadline":null,"heartbeat_at":null,"fallback_reason":"resource_limit","resource_limit":limit,"created_at":"2026-07-03T00:00:00Z","bbox_annotation_enabled":false,"hold_reason":"resource_limit","reserved_usd":null,"reserved_month":null,"reservation_id":null})).unwrap();
+        let task: kio_pipeline::task::TaskDescriptor = serde_json::from_value(json!({"task_id":"task_mixed_resource","type":"markdownize","mode":"full","input_path":"document.pdf","input_hash":raw_hash,"previous_raw_hash":null,"parent_run_id":null,"changed_unit_keys":[],"output_ref":kio_pipeline::task::normalized_task_output_ref(&raw_hash,&profile_hash,0),"unit_keys":null,"status":"partial","attempts":initial_attempts,"next_retry_at":null,"deadline":null,"heartbeat_at":null,"fallback_reason":"resource_limit","resource_limit":limit,"created_at":"2026-07-03T00:00:00Z","bbox_annotation_enabled":false,"hold_reason":"resource_limit","reserved_usd":null,"reserved_month":null,"reservation_id":null})).unwrap();
         let store = TaskStore::new(dir.path().join(".kio"));
         store.replace_all(std::slice::from_ref(&task)).unwrap();
         let error = json_failure(&dir, ["batch", "retry", "--offline"], 3);
@@ -4480,6 +4491,12 @@ fn resource_limit_mixed_offline_retry_preserves_hold_and_done_unit() {
                 .unwrap();
             assert_eq!(fenced.status, TaskStatus::Partial);
             assert_eq!(fenced.resource_limit, task.resource_limit);
+            assert_eq!(
+                fenced.attempts,
+                initial_attempts + 1,
+                "the unknown send reaches the network retry cap"
+            );
+
             let ledger =
                 support::immutable_sqlite(dir.path().join(".test-data/kio/cost-ledger.sqlite"));
             let selector: String = ledger.query_row(
@@ -4489,6 +4506,31 @@ fn resource_limit_mixed_offline_retry_preserves_hold_and_done_unit() {
                 .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row.get(0))
                 .unwrap();
             drop(ledger);
+            if initial_attempts == 4 {
+                // A queued Task projection is not resend authority. Even if a
+                // prior queue survives, only the exact ledger consent may pass
+                // the exhausted automatic budget.
+                store
+                    .update_matching(|candidate| {
+                        if candidate.task_id != task.task_id {
+                            return false;
+                        }
+                        candidate.unit_keys = Some(vec!["page:3".into()]);
+                        true
+                    })
+                    .unwrap();
+                let before_consent = store.all().unwrap();
+                kio(&dir, ["batch", "resume", "--realtime"])
+                    .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+                    .arg("--json")
+                    .assert()
+                    .code(3);
+                assert_eq!(
+                    store.all().unwrap(),
+                    before_consent,
+                    "queue alone must not bypass the retry budget"
+                );
+            }
             kio(&dir, ["batch", "retry", "--realtime"])
                 .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
                 .arg("--json")
@@ -4565,6 +4607,16 @@ fn resource_limit_mixed_offline_retry_preserves_hold_and_done_unit() {
             assert_eq!(queued.status, TaskStatus::Partial);
             assert_eq!(queued.resource_limit, task.resource_limit);
             assert_eq!(queued.unit_keys, Some(vec!["page:3".into()]));
+            assert_eq!(
+                queued.attempts,
+                callwide_held
+                    .iter()
+                    .find(|candidate| candidate.task_id == task.task_id)
+                    .unwrap()
+                    .attempts,
+                "explicit resend does not reset the ordinary retry budget"
+            );
+
             let ledger =
                 support::immutable_sqlite(dir.path().join(".test-data/kio/cost-ledger.sqlite"));
             assert_eq!(
@@ -4662,4 +4714,110 @@ fn resource_limit_edited_original_retires_old_hold() {
     assert!(retired.hold_reason.is_none());
     assert!(retired.resource_limit.is_none());
     assert!(tasks.iter().any(|t| t.input_hash == hash_bytes(&changed)));
+}
+
+#[test]
+fn exhausted_network_retry_without_resource_hold_allows_explicit_unknown_resend() {
+    let dir = scope();
+    fs::write(
+        dir.path().join("document.pdf"),
+        fake_pdf(&["unknown result page"]),
+    )
+    .unwrap();
+    json_success(&dir, ["index", "--yes", "--offline"]);
+    initialize_paid_ledger(&dir);
+    approve_all_adapters(&dir);
+    let store = TaskStore::new(dir.path().join(".kio"));
+    let mut tasks = store.all().unwrap();
+    let task = tasks
+        .iter_mut()
+        .find(|t| t.task_type == TaskType::Markdownize && t.bbox_annotation_enabled.is_some())
+        .expect("real online placeholder");
+    assert!(task.resource_limit.is_none());
+    task.status = TaskStatus::Pending;
+    task.hold_reason = None;
+    task.next_retry_at = None;
+    task.output_ref = format!(
+        "online:{}",
+        standard_online_markdownize_profile().adapter_id
+    );
+    task.bbox_annotation_enabled = Some(false);
+    task.fallback_reason = Some("ready_for_online_adapter".into());
+    task.unit_keys = None;
+    task.attempts = 4;
+    let task_id = task.task_id.clone();
+    store.replace_all(&tasks).unwrap();
+    kio(&dir, ["batch", "resume", "--realtime"])
+        .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "network_error")
+        .arg("--json")
+        .assert()
+        .failure();
+    let unknown = store
+        .all()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.task_id == task_id)
+        .unwrap();
+    assert_eq!(unknown.attempts, 5, "{unknown:?}");
+    assert_eq!(unknown.status, TaskStatus::Failed);
+    assert_eq!(unknown.fallback_reason.as_deref(), Some("result_unknown"));
+    assert!(unknown.resource_limit.is_none());
+    let ledger = support::immutable_sqlite(dir.path().join(".test-data/kio/cost-ledger.sqlite"));
+    let selector: String = ledger.query_row(
+        "SELECT scope_id || '/' || adapter_kind || '/' || input_hash || '/' || tool_profile_hash FROM batch_requests WHERE adapter_kind='markdownize'",
+        [], |row| row.get(0)).unwrap();
+    let charges: i64 = ledger
+        .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row.get(0))
+        .unwrap();
+    drop(ledger);
+    kio(&dir, ["batch", "retry", "--realtime"])
+        .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+        .arg("--json")
+        .assert()
+        .success();
+    kio(
+        &dir,
+        ["batch", "retry", "--resend-unknown", &selector, "--yes"],
+    )
+    .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+    .arg("--json")
+    .assert()
+    .success();
+    let queued = store
+        .all()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.task_id == task_id)
+        .unwrap();
+    assert_eq!(queued.status, TaskStatus::Pending);
+    assert_eq!(queued.attempts, 5);
+    let ledger = support::immutable_sqlite(dir.path().join(".test-data/kio/cost-ledger.sqlite"));
+    assert_eq!(
+        ledger
+            .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        charges
+    );
+    drop(ledger);
+    kio(&dir, ["batch", "resume", "--realtime"])
+        .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+        .arg("--json")
+        .assert()
+        .success();
+    let done = store
+        .all()
+        .unwrap()
+        .into_iter()
+        .find(|t| t.task_id == task_id)
+        .unwrap();
+    assert_eq!(done.status, TaskStatus::Done);
+    let ledger = support::immutable_sqlite(dir.path().join(".test-data/kio/cost-ledger.sqlite"));
+    assert_eq!(
+        ledger
+            .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        charges + 1
+    );
 }

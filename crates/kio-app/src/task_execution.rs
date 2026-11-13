@@ -1,4 +1,5 @@
 use crate::approvals;
+use crate::batch::command::PartialRetryBudget;
 use crate::batch::command::partial_retry_plan_from_instance;
 use crate::batch::command::reclaim_orphaned_running_tasks;
 use crate::egress::SECRETS_TIER_B_HOLD;
@@ -134,7 +135,7 @@ pub(crate) fn known_markdownize_completion(
         ..ExecOutcome::default()
     };
     if matches!(task.status, TaskStatus::Partial | TaskStatus::Failed)
-        && !partial_retry_plan_from_instance(store, &task)?
+        && !partial_retry_plan_from_instance(store, &task, PartialRetryBudget::Automatic)?
             .retryable_units
             .is_empty()
     {
@@ -394,7 +395,36 @@ fn execute_pending_markdownize_tasks(
     }
     let mut queued_held = BTreeSet::new();
     for task in store.all().map_err(pipeline_to_kio)? {
-        if queued_held_markdownize_retry(store, &task)? {
+        let automatic = queued_held_markdownize_retry(store, &task, PartialRetryBudget::Automatic)?;
+        // A resource hold occupies the Task reason. The exact ledger row is
+        // therefore the durable authority for a resend beyond ordinary budgets.
+        let authorized_resend = if !automatic
+            && targets_standard_online_markdownize(store.kio_dir(), &task, &output_ref)
+            && queued_held_markdownize_retry(
+                store,
+                &task,
+                PartialRetryBudget::ExplicitUnknownResend,
+            )? {
+            let ledger = open_ledger_db(ctx.control)?;
+            let key = task_ledger_key(
+                &repo.scope_identity()?.scope_id,
+                markdownize_adapter_kind,
+                &task.input_hash,
+                &markdown_profile_hash,
+            );
+            get_batch_request(&ledger, &key)
+                .map_err(pipeline_to_kio)?
+                .is_some_and(|row| {
+                    row.request_kind == RequestKind::Sync
+                        && row.state == BatchState::Terminal
+                        && row.intent_token.is_none()
+                        && row.error.as_deref()
+                            == Some(crate::ledger_access::SYNC_RESEND_AUTHORIZED_REASON)
+                })
+        } else {
+            false
+        };
+        if automatic || authorized_resend {
             queued_held.insert(task.task_id);
         }
     }
@@ -1891,6 +1921,7 @@ pub(crate) fn persist_resource_error(
 pub(crate) fn queued_held_markdownize_retry(
     store: &TaskStore,
     task: &TaskDescriptor,
+    budget: PartialRetryBudget,
 ) -> Result<bool> {
     if task.task_type != TaskType::Markdownize
         || task.hold_reason != Some(HoldReason::ResourceLimit)
@@ -1901,7 +1932,7 @@ pub(crate) fn queued_held_markdownize_retry(
     let Some(keys) = task.unit_keys.as_ref().filter(|keys| !keys.is_empty()) else {
         return Ok(false);
     };
-    let plan = partial_retry_plan_from_instance(store, task)?;
+    let plan = partial_retry_plan_from_instance(store, task, budget)?;
     if plan.resource_hold.is_none() {
         return Ok(false);
     }

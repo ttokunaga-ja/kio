@@ -1119,7 +1119,11 @@ fn run_batch_resend_unknown(
                                 .as_ref()
                                 .is_some_and(recheck_resource_limit)
                                 || {
-                                    let plan = partial_retry_plan_from_instance(&store, task)?;
+                                    let plan = partial_retry_plan_from_instance(
+                                        &store,
+                                        task,
+                                        PartialRetryBudget::ExplicitUnknownResend,
+                                    )?;
                                     plan.resource_hold.is_some() && !plan.retryable_units.is_empty()
                                 }))
                     && targets_standard_online_markdownize(
@@ -1199,7 +1203,11 @@ fn run_batch_resend_unknown(
     let mut held_retry_units = BTreeMap::new();
     for task in tasks.iter().filter(|task| matching.contains(&task.task_id)) {
         if task.task_type == TaskType::Markdownize && task.resource_limit.is_some() {
-            let plan = partial_retry_plan_from_instance(&store, task)?;
+            let plan = partial_retry_plan_from_instance(
+                &store,
+                task,
+                PartialRetryBudget::ExplicitUnknownResend,
+            )?;
             if plan.resource_hold.is_some() {
                 held_retry_units.insert(task.task_id.clone(), plan.retryable_units);
             }
@@ -1426,7 +1434,8 @@ fn reenqueue_incomplete_markdownize_tasks(store: &TaskStore) -> Result<usize> {
         {
             continue;
         }
-        let mut plan = partial_retry_plan_from_instance(store, &task)?;
+        let mut plan =
+            partial_retry_plan_from_instance(store, &task, PartialRetryBudget::Automatic)?;
         // Gate 1 (R10-4): no retryable Failed unit -> leave the task incomplete.
         if plan.retryable_units.is_empty() {
             continue;
@@ -1445,7 +1454,11 @@ fn reenqueue_incomplete_markdownize_tasks(store: &TaskStore) -> Result<usize> {
             if let Some(current) = task.resource_limit.as_ref() {
                 *limit = current.clone();
             }
-            if crate::task_execution::queued_held_markdownize_retry(store, &task)? {
+            if crate::task_execution::queued_held_markdownize_retry(
+                store,
+                &task,
+                PartialRetryBudget::Automatic,
+            )? {
                 for key in task.unit_keys.iter().flatten() {
                     if !plan.retryable_units.contains(key) {
                         plan.retryable_units.push(key.clone());
@@ -1502,6 +1515,15 @@ pub(crate) struct PartialRetryPlan {
     pub(crate) max_attempts: Option<u32>,
 }
 
+/// Unit selection is separate from authority to send. Explicit unknown-result
+/// resend ignores the ordinary attempt ceiling; its ledger CAS/one-shot marker
+/// remains mandatory before execution.
+#[derive(Clone, Copy)]
+pub(crate) enum PartialRetryBudget {
+    Automatic,
+    ExplicitUnknownResend,
+}
+
 /// Read a normalized instance's manifest (`output_ref/manifest.json`) and build its
 /// [`PartialRetryPlan`]: the still-Failed units filtered to the retryable ones (by
 /// their recorded `error_kind`) and the retry-budget cap. A missing manifest or a
@@ -1509,6 +1531,7 @@ pub(crate) struct PartialRetryPlan {
 pub(crate) fn partial_retry_plan_from_instance(
     task_store: &TaskStore,
     task: &TaskDescriptor,
+    budget: PartialRetryBudget,
 ) -> Result<PartialRetryPlan> {
     let empty = PartialRetryPlan {
         resource_hold: None,
@@ -1534,7 +1557,12 @@ pub(crate) fn partial_retry_plan_from_instance(
     )
     .map_err(pipeline_to_kio)?
     .manifest;
-    Ok(partial_retry_plan_from_manifest(&manifest, task.attempts))
+    Ok(match budget {
+        PartialRetryBudget::Automatic => partial_retry_plan_from_manifest(&manifest, task.attempts),
+        PartialRetryBudget::ExplicitUnknownResend => {
+            partial_retry_plan_with_attempt_limit(&manifest, None)
+        }
+    })
 }
 
 /// Select only units that still have their own retry budget remaining. The task
@@ -1546,6 +1574,13 @@ pub(crate) fn partial_retry_plan_from_manifest(
     manifest: &NormalizedInstanceManifest,
     task_attempts: u32,
 ) -> PartialRetryPlan {
+    partial_retry_plan_with_attempt_limit(manifest, Some(task_attempts))
+}
+
+fn partial_retry_plan_with_attempt_limit(
+    manifest: &NormalizedInstanceManifest,
+    task_attempts: Option<u32>,
+) -> PartialRetryPlan {
     let mut retryable_units = Vec::new();
     let mut finite_max: Option<u32> = None;
     let mut saw_unlimited = false;
@@ -1554,7 +1589,10 @@ pub(crate) fn partial_retry_plan_from_manifest(
             continue;
         }
         let policy = retry_policy(retry_kind_from_reason(entry.error_kind.as_deref()));
-        if !policy.retryable || policy.max_attempts.is_some_and(|max| task_attempts >= max) {
+        if !policy.retryable
+            || task_attempts
+                .is_some_and(|attempts| policy.max_attempts.is_some_and(|max| attempts >= max))
+        {
             continue;
         }
         retryable_units.push(entry.unit_key.clone());

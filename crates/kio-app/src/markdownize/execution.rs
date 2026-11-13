@@ -446,7 +446,11 @@ pub(crate) fn execute_pending_offline_markdownize_tasks(
     for task in store.all().map_err(pipeline_to_kio)? {
         if task.task_type != TaskType::Markdownize
             || !(matches!(task.status, TaskStatus::Pending | TaskStatus::Running)
-                || crate::task_execution::queued_held_markdownize_retry(store, &task)?
+                || crate::task_execution::queued_held_markdownize_retry(
+                    store,
+                    &task,
+                    crate::batch::command::PartialRetryBudget::Automatic,
+                )?
                 || (allow_auth_revive
                     && task.status == TaskStatus::Paused
                     && task.hold_reason == Some(kio_pipeline::task::HoldReason::Auth)))
