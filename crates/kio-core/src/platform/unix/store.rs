@@ -849,8 +849,38 @@ pub(crate) fn entries_optional(
     }
     entries(root, relative, label).map(Some)
 }
+#[cfg(test)]
+thread_local! {
+    static FAILED_DIRECTORY_SYNC: std::cell::Cell<Option<(u64, u64)>> = const { std::cell::Cell::new(None) };
+}
+
+/// Fail every fsync of this directory on this test thread, including calls
+/// made by create_directory and cleanup. The guard restores nested test state.
+#[cfg(test)]
+pub(crate) fn with_failed_directory_sync<T>(directory: &File, action: impl FnOnce() -> T) -> T {
+    struct Reset(Option<(u64, u64)>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            FAILED_DIRECTORY_SYNC.with(|state| state.set(self.0));
+        }
+    }
+    let metadata = directory.metadata().unwrap();
+    let _reset = Reset(
+        FAILED_DIRECTORY_SYNC.with(|state| state.replace(Some((metadata.dev(), metadata.ino())))),
+    );
+    action()
+}
+
 pub(crate) fn sync_directory(d: &File, label: &Path) -> Result<()> {
     let operation = operation_directory(d, label)?;
+    #[cfg(test)]
+    {
+        let metadata = operation.metadata().map_err(|e| ioerr(label, e))?;
+        if FAILED_DIRECTORY_SYNC.with(|state| state.get() == Some((metadata.dev(), metadata.ino())))
+        {
+            return Err(ioerr(label, std::io::Error::from_raw_os_error(libc::EIO)));
+        }
+    }
     operation.sync_all().map_err(|e| ioerr(label, e))
 }
 pub(crate) fn restrict_new_private_directory(d: &File) -> Result<()> {

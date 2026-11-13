@@ -1,7 +1,8 @@
 //! Capture shared names in an exclusively owned private directory before
-//! mutation. A saved stage identity determines its capture name. The small
-//! durable record binds that identity to the directory created for it, so a
-//! restart can recover the payload and cleanup never adopts a replacement root.
+//! publication. A saved stage identity determines its capture name and durable
+//! record. Deletion and initialization cleanup do not allocate a capture: they
+//! compare the retained object with its name and unlink it directly. Owner-private
+//! namespaces are trusted; hostile same-UID namespace/record edits are out of scope.
 use crate::{
     Result,
     management::{DirectoryIdentity, directory_identity_from_handle},
@@ -106,50 +107,16 @@ struct Capture {
     directory: StoreDirectory,
     created_identity: DirectoryIdentity,
     record_file: Option<File>,
-    is_directory: bool,
 }
 impl Capture {
     fn new(
         parent: &StoreDirectory,
         source: &Path,
         held: &File,
-        is_directory: bool,
-        identity: Option<&StageIdentity>,
+        identity: &StageIdentity,
     ) -> Result<Self> {
-        // Initializing a stage can fail before it has a nonce. Such live-handle
-        // cleanup still needs a create-only private directory, without entropy.
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let saved_name = identity.map(capture_name).transpose()?.flatten();
-        let mut reserved = None;
-        for _ in 0..64 {
-            let name = saved_name.clone().unwrap_or_else(|| {
-                PathBuf::from(format!(
-                    ".kio-stage-operation-{}-{}",
-                    std::process::id(),
-                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                ))
-            });
-            match parent.create_directory(&name) {
-                Ok(handle) => {
-                    reserved = Some((name, handle));
-                    break;
-                }
-                Err(error)
-                    if error.context()["io_error_kind"] == "already_exists"
-                        && identity.is_none() =>
-                {
-                    continue;
-                }
-                Err(error) if error.context()["io_error_kind"] == "already_exists" => {
-                    return Err(failure(
-                        "stage capture already exists; recover it with the saved identity first",
-                    ));
-                }
-                Err(error) => return Err(error),
-            }
-        }
-        let (name, handle) =
-            reserved.ok_or_else(|| failure("cannot reserve private stage operation directory"))?;
+        let name = capture_name(identity)?.expect("Unix capture name");
+        let handle = parent.create_directory(&name)?;
         let directory = StoreDirectory::from_retained_with_control(
             handle,
             parent.path().join(&name),
@@ -163,9 +130,8 @@ impl Capture {
             directory,
             created_identity,
             record_file: None,
-            is_directory,
         };
-        if let Some(identity) = identity {
+        {
             let bytes = serde_jcs::to_vec(&CaptureRecord {
                 directory: capture.created_identity.clone(),
                 stage: identity.clone(),
@@ -180,38 +146,22 @@ impl Capture {
             capture.directory.sync()?;
             parent.sync()?;
         }
-        if is_directory {
-            parent.rename_directory_between_create_only(
-                source,
-                &capture.directory,
-                Path::new(ITEM),
-            )?;
-            let current = capture.directory.open_directory(Path::new(ITEM))?;
-            if directory_identity_from_handle(held)? != directory_identity_from_handle(&current)? {
-                return Err(failure("directory stage changed before capture; preserved"));
-            }
-        } else {
-            parent.rename_regular_between_raw(
-                source,
-                &capture.directory,
-                Path::new(ITEM),
-                Publication::CreateOnly,
-            )?;
-            let current = open_file(&capture.directory, Path::new(ITEM))?;
-            if file_id(held)? != file_id(&current)? {
-                return Err(failure("file stage changed before capture; preserved"));
-            }
-            if let Some(identity) = identity {
-                identity.verify(&current)?;
-            }
+        parent.rename_regular_between_raw(
+            source,
+            &capture.directory,
+            Path::new(ITEM),
+            Publication::CreateOnly,
+        )?;
+        let current = open_file(&capture.directory, Path::new(ITEM))?;
+        if file_id(held)? != file_id(&current)? {
+            return Err(failure("file stage changed before capture; preserved"));
         }
+        identity.verify(&current)?;
         // Both the ownership record and the capture rename are durable before
-        // the public destination or payload deletion can be touched.
-        if identity.is_some() {
-            parent
-                .control()
-                .checkpoint(crate::durability::DurabilityPoint::StageCaptured)?;
-        }
+        // the public destination can be touched.
+        parent
+            .control()
+            .checkpoint(crate::durability::DurabilityPoint::StageCaptured)?;
         Ok(capture)
     }
 
@@ -260,20 +210,12 @@ impl Drop for Capture {
             .contains_entry(Path::new(ITEM))
             .unwrap_or(true)
         {
-            if self.is_directory {
-                let _ = self.directory.rename_directory_between_create_only(
-                    Path::new(ITEM),
-                    &self.parent,
-                    &self.source,
-                );
-            } else {
-                let _ = self.directory.rename_regular_between_raw(
-                    Path::new(ITEM),
-                    &self.parent,
-                    &self.source,
-                    Publication::CreateOnly,
-                );
-            }
+            let _ = self.directory.rename_regular_between_raw(
+                Path::new(ITEM),
+                &self.parent,
+                &self.source,
+                Publication::CreateOnly,
+            );
         }
         let _ = self.cleanup();
     }
@@ -288,7 +230,27 @@ pub(crate) fn recover_file(
     if !parent.contains_entry(&name)? {
         return Ok(false);
     }
-    let (directory, record, created_identity) = read_capture(parent, &name, identity)?;
+    let (directory, record, created_identity) = match read_capture(parent, &name, identity) {
+        Ok(capture) => capture,
+        Err(error) => {
+            // A crash before the record was completed, or after it was retired,
+            // can leave an unclaimed directory. Keep reporting it as unidentified
+            // but do not let it block a verified stage at its original name.
+            let directory = StoreDirectory::from_retained_with_control(
+                parent.open_directory(&name)?,
+                parent.path().join(&name),
+                parent.control().clone(),
+            )?;
+            let original_matches =
+                open_file(parent, source).is_ok_and(|file| identity.verify(&file).is_ok());
+            if !directory.contains_entry(Path::new(ITEM))? || original_matches {
+                return Ok(false);
+            }
+            // An unverified capture with a payload and no matching original
+            // remains an error, rather than being mistaken for an absent stage.
+            return Err(error);
+        }
+    };
     let held = if directory.contains_entry(Path::new(ITEM))? {
         directory.ensure_owner_private(Path::new(ITEM))?;
         let held = open_file(&directory, Path::new(ITEM))?;
@@ -304,7 +266,6 @@ pub(crate) fn recover_file(
         directory,
         created_identity,
         record_file: Some(record),
-        is_directory: false,
     };
     if held.is_some() {
         cap_primitives::fs::remove_file(&capture.directory.root_handle(), Path::new(ITEM))
@@ -326,7 +287,7 @@ pub(crate) fn publish(
     publication: Publication,
     identity: &StageIdentity,
 ) -> Result<()> {
-    let capture = Capture::new(directory, source, held, false, Some(identity))?;
+    let capture = Capture::new(directory, source, held, identity)?;
     capture
         .directory
         .rename_regular_between_raw(Path::new(ITEM), target, leaf, publication)?;
@@ -339,25 +300,159 @@ pub(crate) fn discard_file(
     held: &File,
     identity: Option<&StageIdentity>,
 ) -> Result<()> {
-    let capture = Capture::new(directory, source, held, false, identity)?;
-    cap_primitives::fs::remove_file(&capture.directory.root_handle(), Path::new(ITEM))
-        .map_err(|e| io_failure("cannot unlink captured stage", e))?;
-    capture.directory.sync()
+    // No mkdir, rename or fsync is required before unlink. This also works
+    // when parent fsync keeps failing during initialization error cleanup.
+    let current = open_file(directory, source)?;
+    if file_id(held)? != file_id(&current)? {
+        return Err(failure(
+            "stage name no longer matches the retained file; preserved",
+        ));
+    }
+    if let Some(identity) = identity {
+        identity.verify(&current)?;
+    }
+    cap_primitives::fs::remove_file(&directory.root_handle(), source)
+        .map_err(|e| io_failure("cannot unlink verified stage", e))?;
+    directory.sync()
 }
 pub(crate) fn discard_empty_directory(
     parent: &StoreDirectory,
     leaf: &Path,
     held: &File,
 ) -> Result<()> {
-    let capture = Capture::new(parent, leaf, held, true, None)?;
-    cap_primitives::fs::remove_dir(&capture.directory.root_handle(), Path::new(ITEM))
-        .map_err(|e| io_failure("cannot remove empty captured stage directory", e))?;
-    capture.directory.sync()
+    let current = parent.open_directory(leaf)?;
+    if directory_identity_from_handle(held)? != directory_identity_from_handle(&current)? {
+        return Err(failure(
+            "stage directory no longer matches the retained handle; preserved",
+        ));
+    }
+    // rmdir can remove only an empty directory; unexpected contents survive.
+    cap_primitives::fs::remove_dir(&parent.root_handle(), leaf)
+        .map_err(|e| io_failure("cannot remove empty verified stage directory", e))?;
+    parent.sync()
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::{fs, io::Write};
+
+    #[test]
+    fn continuing_parent_fsync_failure_does_not_allocate_cleanup_directories() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let parent = StoreDirectory::open(temp.path()).unwrap();
+        super::super::store::with_failed_directory_sync(&parent.root_handle(), || {
+            assert!(parent.sync().is_err());
+            let error = crate::store_dir::StageWriter::create(&parent, Path::new("source"))
+                .err()
+                .unwrap();
+            assert_eq!(error.error_code(), "KIO-E-STORE-IO-001");
+            assert!(!temp.path().join("source").exists());
+            assert!(parent.entries(Path::new("")).unwrap().is_empty());
+            assert!(
+                parent.sync().is_err(),
+                "fault must remain active during cleanup"
+            );
+        });
+        assert!(crate::store_dir::StageWriter::create(&parent, Path::new("source")).is_ok());
+    }
+
+    #[test]
+    fn missing_and_partial_capture_records_do_not_block_original_stage_cleanup() {
+        for record in [None, Some(b"{".as_slice()), Some(b"".as_slice())] {
+            let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+            let parent = StoreDirectory::open(temp.path()).unwrap();
+            let writer =
+                crate::store_dir::StageWriter::create(&parent, Path::new("source")).unwrap();
+            let identity = writer.identity().clone();
+            drop(writer);
+            let name = capture_name(&identity).unwrap().unwrap();
+            let directory = StoreDirectory::from_retained(
+                parent.create_directory(&name).unwrap(),
+                temp.path().join(&name),
+            )
+            .unwrap();
+            if let Some(bytes) = record {
+                let mut file = directory.create_private_file(Path::new(RECORD)).unwrap();
+                file.write_all(bytes).unwrap();
+                file.sync_all().unwrap();
+            }
+            let expected = [(PathBuf::from("source"), identity.clone())];
+            let inventory = parent.inspect_stages(&expected, &[]).unwrap();
+            assert!(inventory.iter().any(|e| e.name == name
+                && matches!(
+                    e.state,
+                    crate::store_dir::StageEntryState::Unidentified { .. }
+                )));
+            assert!(
+                parent
+                    .discard_stage(Path::new("source"), &identity)
+                    .unwrap()
+            );
+            assert!(!temp.path().join("source").exists());
+            assert!(
+                !parent
+                    .discard_stage(Path::new("source"), &identity)
+                    .unwrap()
+            );
+            assert!(temp.path().join(&name).is_dir());
+            if let Some(bytes) = record {
+                assert_eq!(
+                    fs::read(temp.path().join(&name).join(RECORD)).unwrap(),
+                    bytes
+                );
+            }
+            let inventory = parent.inspect_stages(&expected, &[]).unwrap();
+            assert!(inventory.iter().any(|e| e.name == name
+                && matches!(
+                    e.state,
+                    crate::store_dir::StageEntryState::Unidentified { .. }
+                )));
+        }
+    }
+
+    #[test]
+    fn unknown_capture_payload_does_not_block_a_verified_original() {
+        let temp = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+        let parent = StoreDirectory::open(temp.path()).unwrap();
+        let writer = crate::store_dir::StageWriter::create(&parent, Path::new("source")).unwrap();
+        let identity = writer.identity().clone();
+        drop(writer);
+        let name = capture_name(&identity).unwrap().unwrap();
+        let directory = StoreDirectory::from_retained(
+            parent.create_directory(&name).unwrap(),
+            temp.path().join(&name),
+        )
+        .unwrap();
+        let mut unknown = directory.create_private_file(Path::new(ITEM)).unwrap();
+        unknown.write_all(b"preserve unknown payload").unwrap();
+        assert!(
+            parent
+                .discard_stage(Path::new("source"), &identity)
+                .unwrap()
+        );
+        assert!(!temp.path().join("source").exists());
+        assert_eq!(
+            fs::read(temp.path().join(&name).join(ITEM)).unwrap(),
+            b"preserve unknown payload"
+        );
+        assert!(
+            parent
+                .discard_stage(Path::new("source"), &identity)
+                .is_err()
+        );
+        assert!(
+            parent
+                .inspect_stages(&[(PathBuf::from("source"), identity)], &[])
+                .unwrap()
+                .iter()
+                .any(|e| e.name == name
+                    && matches!(
+                        e.state,
+                        crate::store_dir::StageEntryState::Unidentified { .. }
+                    ))
+        );
+    }
 
     #[test]
     fn interrupted_capture_is_inspected_and_reclaimed_from_saved_stage_identity() {
@@ -370,14 +465,7 @@ mod tests {
         let identity = writer.identity().clone();
         drop(writer);
         let held = open_file(&directory, Path::new("source")).unwrap();
-        let capture = Capture::new(
-            &directory,
-            Path::new("source"),
-            &held,
-            false,
-            Some(&identity),
-        )
-        .unwrap();
+        let capture = Capture::new(&directory, Path::new("source"), &held, &identity).unwrap();
         std::mem::forget(capture); // abrupt exit: no restoring Drop
         let inventory = directory
             .inspect_stages(&[(PathBuf::from("source"), identity.clone())], &[])
@@ -406,14 +494,7 @@ mod tests {
         let directory = StoreDirectory::open(temp.path()).unwrap();
         let held = create_file(&directory, Path::new("source")).unwrap();
         let identity = StageIdentity::initialize(&held).unwrap();
-        let capture = Capture::new(
-            &directory,
-            Path::new("source"),
-            &held,
-            false,
-            Some(&identity),
-        )
-        .unwrap();
+        let capture = Capture::new(&directory, Path::new("source"), &held, &identity).unwrap();
         let original_name = capture.name.clone();
         fs::rename(temp.path().join(&original_name), temp.path().join("moved")).unwrap();
         directory.create_directory(&original_name).unwrap();
@@ -438,14 +519,7 @@ mod tests {
             let mut held = create_file(&directory, Path::new("source")).unwrap();
             held.write_all(b"owned").unwrap();
             let identity = StageIdentity::initialize(&held).unwrap();
-            let capture = Capture::new(
-                &directory,
-                Path::new("source"),
-                &held,
-                false,
-                Some(&identity),
-            )
-            .unwrap();
+            let capture = Capture::new(&directory, Path::new("source"), &held, &identity).unwrap();
             let name = capture.name.clone();
             std::mem::forget(capture);
             let mut foreign = create_file(&directory, Path::new("source")).unwrap();
@@ -487,14 +561,7 @@ mod tests {
         let mut held = create_file(&directory, Path::new("source")).unwrap();
         held.write_all(b"published").unwrap();
         let identity = StageIdentity::initialize(&held).unwrap();
-        let capture = Capture::new(
-            &directory,
-            Path::new("source"),
-            &held,
-            false,
-            Some(&identity),
-        )
-        .unwrap();
+        let capture = Capture::new(&directory, Path::new("source"), &held, &identity).unwrap();
         capture
             .directory
             .rename_regular_between_raw(
@@ -522,8 +589,8 @@ mod tests {
             let directory = StoreDirectory::open(temp.path()).unwrap();
             let mut held = directory.create_private_file(Path::new("source")).unwrap();
             held.write_all(b"owned").unwrap();
-            let capture =
-                Capture::new(&directory, Path::new("source"), &held, false, None).unwrap();
+            let identity = StageIdentity::initialize(&held).unwrap();
+            let capture = Capture::new(&directory, Path::new("source"), &held, &identity).unwrap();
             let mut foreign = directory.create_private_file(Path::new("source")).unwrap();
             foreign.write_all(b"foreign").unwrap();
             fs::write(temp.path().join("public"), b"previous").unwrap();

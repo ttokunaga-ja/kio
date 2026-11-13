@@ -923,6 +923,32 @@ mod tests {
         assert_eq!(fs::read(temp.path().join("stage")).unwrap(), b"foreign");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unremovable_initialization_residue_is_reported_by_inspection() {
+        use std::os::unix::fs::PermissionsExt;
+        let (temp, directory) = directory();
+        let result = StageWriter::create_with_sync(
+            &directory,
+            Path::new("stage"),
+            StageIdentity::initialize,
+            |_| {
+                fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o500)).unwrap();
+                Err(failure("parent sync failed"))
+            },
+        );
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert!(temp.path().join("stage").exists());
+        let inventory = directory.inspect_stages(&[], &[]).unwrap();
+        assert!(
+            inventory
+                .iter()
+                .any(|e| e.name == "stage"
+                    && matches!(e.state, StageEntryState::Unidentified { .. }))
+        );
+    }
+
     #[test]
     fn storage_full_is_typed_resource_exhaustion() {
         let error = stage_io(
