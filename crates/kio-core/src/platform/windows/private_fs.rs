@@ -74,6 +74,7 @@ const FILE_WRITE_ATTRIBUTES: u32 = 0x0000_0100;
 #[derive(Clone, Copy)]
 pub(crate) enum NewPrivateObjectKind {
     Directory,
+    StageDirectory,
     RegularFile,
     LockFile,
 }
@@ -127,8 +128,12 @@ pub(crate) fn create_new_private_at(
         SecurityQualityOfService: ptr::null(),
     };
     let (desired_access, file_attributes, create_options) = match kind {
-        NewPrivateObjectKind::Directory => (
-            FILE_LIST_DIRECTORY
+        NewPrivateObjectKind::Directory | NewPrivateObjectKind::StageDirectory => (
+            (if matches!(kind, NewPrivateObjectKind::StageDirectory) {
+                GENERIC_READ | GENERIC_WRITE
+            } else {
+                0
+            }) | FILE_LIST_DIRECTORY
                 | FILE_TRAVERSE
                 | FILE_ADD_FILE
                 | FILE_ADD_SUBDIRECTORY
@@ -200,7 +205,7 @@ pub(crate) fn create_new_private_at(
     // SAFETY: successful NtCreateFile returned one owned retained handle.
     let file = unsafe { File::from_raw_handle(handle as _) };
     let valid = match kind {
-        NewPrivateObjectKind::Directory => {
+        NewPrivateObjectKind::Directory | NewPrivateObjectKind::StageDirectory => {
             crate::platform::directory_handle_identity(&file).is_some()
         }
         NewPrivateObjectKind::RegularFile | NewPrivateObjectKind::LockFile => {

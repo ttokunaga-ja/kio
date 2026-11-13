@@ -10,6 +10,7 @@ publish.workspace = true
 path = "src/lib.rs"
 
 [dependencies]
+getrandom.workspace = true
 jsonschema.workspace = true
 serde.workspace = true
 serde_jcs.workspace = true

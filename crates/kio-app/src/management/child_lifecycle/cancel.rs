@@ -11,12 +11,13 @@ use crate::management::binding_for_repo;
 use crate::response::repair::*;
 use crate::response::{CommandResponse, Completion, ResponseBody};
 use kio_core::management::{
-    DirectoryIdentity, ManagementBinding, directory_identity_from_handle, observe_direct_child,
-    planned_child_management_record, read_registration_recovery_record,
-    validate_controlled_root_with_control, validate_live_chain,
+    ManagementBinding, observe_direct_child, planned_child_management_record,
+    read_registration_recovery_record, validate_controlled_root_with_control, validate_live_chain,
 };
 use kio_core::scope::{Repository, validate_planned_kio_layout};
-use kio_core::store_dir::{AtomicWorkspaceState, Publication, StoreDirectory};
+use kio_core::store_dir::{
+    AtomicWorkspaceState, DirectoryStageIdentity, Publication, StoreDirectory,
+};
 use kio_core::{KioError, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -37,14 +38,14 @@ struct Cancellation {
     version: u8,
     initialization: Initialization,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    stage_identity: Option<DirectoryIdentity>,
+    stage_identity: Option<DirectoryStageIdentity>,
     quarantine_leaf: String,
     phase: Phase,
 }
 
 struct CheckedInitialization {
     stage: Option<StoreDirectory>,
-    stage_identity: Option<DirectoryIdentity>,
+    stage_identity: Option<DirectoryStageIdentity>,
 }
 
 pub(super) fn run(
@@ -223,9 +224,7 @@ fn validate_cancellation(marker: &Cancellation, journal_bytes: &[u8]) -> Result<
             "child initialization cancellation journal bytes differ",
         ));
     }
-    if let Some(identity) = &journal.stage_identity
-        && marker.stage_identity.as_ref() != Some(identity)
-    {
+    if marker.stage_identity != journal.stage_identity {
         return Err(KioError::invalid_usage(
             "cancellation marker differs from pinned initialization stage",
         ));
@@ -351,7 +350,7 @@ fn stage_from_source(
         control.control().clone(),
     )?;
     kio_core::private_fs::verify_private_directory_handle(&stage)?;
-    let identity = directory_identity_from_handle(stage.root_handle().as_ref())?;
+    let identity = DirectoryStageIdentity::read(&stage)?;
     if let Some(expected) = &journal.stage_identity {
         if expected != &identity {
             return Err(KioError::invalid_usage(
@@ -369,15 +368,12 @@ fn stage_from_source(
                 (STAGE_MARKER, bytes),
             ],
         )?;
-    } else if !stage
-        .entries_optional(Path::new(""))?
-        .unwrap_or_default()
-        .is_empty()
-    {
+    } else {
         return Err(KioError::invalid_usage(
-            "un-pinned child initialization stage is not empty",
+            "un-pinned child initialization stage is preserved",
         ));
     }
+
     Ok(CheckedInitialization {
         stage: Some(stage),
         stage_identity: Some(identity),
@@ -402,7 +398,7 @@ fn open_quarantine(
         control.control().clone(),
     )?;
     kio_core::private_fs::verify_private_directory_handle(&stage)?;
-    let identity = directory_identity_from_handle(stage.root_handle().as_ref())?;
+    let identity = DirectoryStageIdentity::read(&stage)?;
     if marker.stage_identity.as_ref() != Some(&identity) {
         return Err(KioError::invalid_usage("cancelled stage identity changed"));
     }
@@ -459,10 +455,7 @@ fn finish(
                 KioError::invalid_usage("initialization source stage disappeared")
             })?;
             if marker.stage_identity != checked.stage_identity
-                || marker.stage_identity.as_ref()
-                    != Some(&directory_identity_from_handle(
-                        stage.root_handle().as_ref(),
-                    )?)
+                || marker.stage_identity.as_ref() != Some(&DirectoryStageIdentity::read(&stage)?)
             {
                 return Err(KioError::invalid_usage(
                     "stage identity changed before cancellation",
@@ -526,7 +519,7 @@ fn finish(
             ));
         }
         if let Some(stage) = open_quarantine(parent, control, &marker, &journal_bytes)? {
-            let identity = directory_identity_from_handle(stage.root_handle().as_ref())?;
+            let identity = DirectoryStageIdentity::read(&stage)?;
             if marker.stage_identity.as_ref() != Some(&identity) {
                 return Err(KioError::invalid_usage("cancelled stage identity changed"));
             }
@@ -610,19 +603,11 @@ mod tests {
             management,
         };
         let store = control(&binding, parent.control()).unwrap();
-        let stage = StoreDirectory::from_retained(
-            store
-                .create_directory(Path::new(&journal.stage_leaf))
-                .unwrap(),
-            parent
-                .canonical_root()
-                .join(".kio")
-                .join(&journal.stage_leaf),
-        )
-        .unwrap();
+        let (stage, identity) = store
+            .create_stage_directory(Path::new(&journal.stage_leaf))
+            .unwrap();
         if pinned {
-            journal.stage_identity =
-                Some(directory_identity_from_handle(stage.root_handle().as_ref()).unwrap());
+            journal.stage_identity = Some(identity);
         }
         let bytes = encode(&journal, "child initialization journal").unwrap();
         initialization_directory(&store, true)
@@ -643,10 +628,29 @@ mod tests {
     }
 
     #[test]
+    fn cancellation_preserves_an_empty_stage_without_saved_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent = parent(&temp);
+        let operation = interrupted(&parent, "unknown", false, false);
+        assert!(run(&parent, false, Some(&operation)).is_err());
+        assert!(
+            parent
+                .kio_dir()
+                .join(format!(".child-init-{operation}"))
+                .is_dir()
+        );
+        assert_eq!(
+            fs::read(parent.canonical_root().join("unknown/user.txt")).unwrap(),
+            b"keep"
+        );
+        assert!(!parent.kio_dir().join(CANCELLATION).exists());
+    }
+
+    #[test]
     fn preview_is_read_only_and_empty_or_partial_stages_cancel_without_touching_child_files() {
         let temp = tempfile::tempdir().unwrap();
         let parent = parent(&temp);
-        let empty = interrupted(&parent, "empty", false, false);
+        let empty = interrupted(&parent, "empty", true, false);
         let response = run(&parent, true, None).unwrap();
         assert_eq!(response.completion, Completion::Complete);
         let preview =
@@ -848,10 +852,10 @@ mod tests {
     }
 
     #[test]
-    fn quarantined_unpinned_stage_recovers_after_partial_or_completed_deletion() {
+    fn quarantined_stage_recovers_after_partial_or_completed_deletion() {
         let temp = tempfile::tempdir().unwrap();
         let parent = parent(&temp);
-        let operation = interrupted(&parent, "partial-delete", false, false);
+        let operation = interrupted(&parent, "partial-delete", true, false);
         let binding = binding_for_repo(&parent).unwrap();
         let store = control(&binding, &kio_core::control::ControlHandle::default()).unwrap();
         let (journal, bytes) = pending_initializations(&store)
@@ -869,7 +873,7 @@ mod tests {
                 .join(&journal.stage_leaf),
         )
         .unwrap();
-        let stage_identity = directory_identity_from_handle(stage.root_handle().as_ref()).unwrap();
+        let stage_identity = DirectoryStageIdentity::read(&stage).unwrap();
         stage
             .write_atomic(Path::new("HEAD"), b"unborn\n", Publication::CreateOnly)
             .unwrap();

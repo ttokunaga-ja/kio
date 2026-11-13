@@ -135,7 +135,7 @@ fn atomic_crash_child() {
     )
     .expect("retained target");
     let seed = match mode.as_str() {
-        "write" => b"old".as_slice(),
+        "write" | "stream" => b"old".as_slice(),
         "remove" => b"remove".as_slice(),
         other => panic!("unknown crash mode {other}"),
     };
@@ -157,6 +157,22 @@ fn atomic_crash_child() {
                 .write_atomic_with_owner(&owner, Path::new("leaf"), b"new", Publication::Replace)
                 .expect("write operation");
         }
+        "stream" => {
+            target
+                .write_atomic_stream_with_owner(
+                    &owner,
+                    Path::new("leaf"),
+                    Publication::Replace,
+                    |stage| {
+                        stage.write_chunk(b"partial")?;
+                        owner.control().checkpoint(
+                            kio_core::durability::DurabilityPoint::AtomicWriteWriting,
+                        )?;
+                        stage.write_chunk(b"complete")
+                    },
+                )
+                .expect("stream operation");
+        }
         "remove" => {
             // Deliberately ordinary working-file permissions: the quarantined
             // file is evidence and must not be mistaken for a private journal.
@@ -171,6 +187,8 @@ fn atomic_crash_child() {
 #[test]
 fn abrupt_write_staging_and_publication_recover_without_user_artifacts() {
     for (point, expected) in [
+        ("atomic_write_created", b"old".as_slice()),
+        ("atomic_write_writing", b"old".as_slice()),
         ("atomic_write_staged", b"old".as_slice()),
         ("atomic_write_published", b"new".as_slice()),
     ] {
@@ -208,4 +226,27 @@ fn abrupt_remove_ready_quarantine_and_delete_recover_idempotently() {
         assert!(!root.path().join("target/leaf").exists());
         assert!(!root.path().join("target/.kio-atomic").exists());
     }
+}
+
+#[test]
+fn abrupt_creation_before_identity_journal_preserves_ambiguous_residue() {
+    let root = fixture();
+    crash_at(&root, "write", "atomic_write_allocated");
+    let owner = owner(root.path());
+    let target = target(root.path());
+    assert!(owner.recover_atomic(&[&target]).is_err());
+    assert!(root.path().join("owner/.kio-atomic/write").is_file());
+    assert_eq!(fs::read(root.path().join("target/leaf")).unwrap(), b"old");
+}
+
+#[test]
+fn abrupt_stream_between_chunks_discards_partial_bytes_without_publication() {
+    let root = fixture();
+    crash_at(&root, "stream", "atomic_write_writing");
+    assert_eq!(
+        fs::read(root.path().join("owner/.kio-atomic/write")).unwrap(),
+        b"partial"
+    );
+    recover(&root);
+    assert_eq!(fs::read(root.path().join("target/leaf")).unwrap(), b"old");
 }

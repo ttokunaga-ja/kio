@@ -21,6 +21,7 @@ pub const ATOMIC_WORKSPACE_DIR: &str = ".kio-atomic";
 
 const GATE: &str = ".gate";
 const WRITE: &str = "write";
+const WRITE_ID: &str = "write.json";
 const REMOVE_PENDING: &str = "remove.pending";
 pub(crate) const REMOVE_READY: &str = "remove.json";
 pub(crate) const REMOVED: &str = "removed";
@@ -131,13 +132,13 @@ fn workspace_create(owner: &StoreDirectory) -> Result<StoreDirectory> {
 fn known_leaf(name: &std::ffi::OsStr) -> bool {
     matches!(
         name.to_str(),
-        Some(GATE | WRITE | REMOVE_PENDING | REMOVE_READY | REMOVED)
+        Some(GATE | WRITE | WRITE_ID | REMOVE_PENDING | REMOVE_READY | REMOVED)
     )
 }
 
 fn inventory(workspace: &StoreDirectory) -> Result<Vec<String>> {
     let entries = workspace.entries(Path::new(""))?;
-    if entries.len() > 5 {
+    if entries.len() > 6 {
         return Err(failure("atomic workspace exceeds its entry bound"));
     }
     let mut names = Vec::with_capacity(entries.len());
@@ -389,14 +390,7 @@ fn lock_workspace(workspace: &StoreDirectory) -> Result<File> {
 
 pub(crate) fn remove_if_present(workspace: &StoreDirectory, name: &str) -> Result<bool> {
     if workspace.contains_entry(Path::new(name))? {
-        if name == WRITE {
-            crate::platform::atomic_semantics::remove_publication_residue(
-                workspace,
-                Path::new(name),
-            )?;
-        } else {
-            workspace.remove_file(Path::new(name))?;
-        }
+        workspace.remove_file(Path::new(name))?;
         return Ok(true);
     }
     Ok(false)
@@ -427,7 +421,7 @@ pub(super) fn inspect(owner: &StoreDirectory) -> Result<AtomicWorkspaceState> {
     let names = inventory(&workspace)?;
     let ready = ready_intent_for_owner(owner, &workspace)?;
     if ready.is_some()
-        && (names.iter().any(|name| name == WRITE)
+        && (names.iter().any(|name| name == WRITE || name == WRITE_ID)
             || names.iter().any(|name| name == REMOVE_PENDING))
     {
         return Err(failure(
@@ -511,6 +505,34 @@ fn write_with_readonly(
     readonly: bool,
     before_publish: impl FnOnce(&StoreDirectory, &Path) -> Result<()>,
 ) -> Result<()> {
+    write_stream(
+        owner,
+        target,
+        relative,
+        publication,
+        readonly,
+        |staged| {
+            for chunk in bytes.chunks(64 * 1024) {
+                staged.write_chunk(chunk)?;
+                owner
+                    .control()
+                    .checkpoint(crate::durability::DurabilityPoint::AtomicWriteWriting)?;
+            }
+            Ok(())
+        },
+        before_publish,
+    )
+}
+
+pub(super) fn write_stream(
+    owner: &StoreDirectory,
+    target: &StoreDirectory,
+    relative: &Path,
+    publication: Publication,
+    readonly: bool,
+    write_payload: impl FnOnce(&mut super::StageWriter) -> Result<()>,
+    before_publish: impl FnOnce(&StoreDirectory, &Path) -> Result<()>,
+) -> Result<()> {
     let normalized = valid_relative(relative)?;
     validate_target_namespace(owner, target, &normalized)?;
     let (preflight_parent, _, _) = parent_chain(target, relative)?;
@@ -520,46 +542,40 @@ fn write_with_readonly(
     let _ = recover_locked(owner, &workspace, &[target])?;
     let (parent, leaf, _) = parent_chain(target, relative)?;
     same_volume(&workspace, &parent)?;
-    let mut staged = workspace.create_private_file(Path::new(WRITE))?;
-    staged
-        .write_all(bytes)
-        .map_err(|e| io_failure("cannot write atomic publication artifact", e))?;
-    if readonly {
-        let mut permissions = staged
-            .metadata()
-            .map_err(|e| io_failure("cannot inspect atomic publication artifact", e))?
-            .permissions();
-        permissions.set_readonly(true);
-        staged
-            .set_permissions(permissions)
-            .map_err(|e| io_failure("cannot protect read-only publication artifact", e))?;
-    }
-    staged
+    let mut staged = super::StageWriter::create(&workspace, Path::new(WRITE))?;
+    owner
+        .control()
+        .checkpoint(crate::durability::DurabilityPoint::AtomicWriteAllocated)?;
+    let identity_bytes = serde_jcs::to_vec(staged.identity())
+        .map_err(|_| failure("cannot serialize stage identity"))?;
+    let mut identity_file = workspace.create_private_file(Path::new(WRITE_ID))?;
+    identity_file
+        .write_all(&identity_bytes)
+        .map_err(|e| io_failure("cannot write stage identity", e))?;
+    identity_file
         .sync_all()
-        .map_err(|e| io_failure("cannot sync atomic publication artifact", e))?;
-    drop(staged);
+        .map_err(|e| io_failure("cannot sync stage identity", e))?;
+    drop(identity_file);
     workspace.sync()?;
+    owner
+        .control()
+        .checkpoint(crate::durability::DurabilityPoint::AtomicWriteCreated)?;
+    write_payload(&mut staged)?;
+    if readonly {
+        staged.set_readonly()?;
+    }
+    staged.sync()?;
     owner
         .control()
         .checkpoint(crate::durability::DurabilityPoint::AtomicWriteStaged)?;
     before_publish(&parent, Path::new(&leaf))?;
-    if let Err(error) = workspace.rename_regular_between_raw(
-        Path::new(WRITE),
-        &parent,
-        Path::new(&leaf),
-        publication,
-    ) {
-        if readonly {
-            remove_if_present(&workspace, WRITE)?;
-            workspace.sync()?;
-        }
-        return Err(error);
-    }
-    workspace.sync()?;
-    parent.sync()?;
+    staged.publish(&parent, Path::new(&leaf), publication)?;
+
     owner
         .control()
-        .checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)
+        .checkpoint(crate::durability::DurabilityPoint::AtomicWritePublished)?;
+    remove_if_present(&workspace, WRITE_ID)?;
+    workspace.sync()
 }
 
 pub(super) fn remove(
@@ -633,9 +649,10 @@ fn recover_locked(
     let names = inventory(workspace)?;
     let ready_intent = ready_intent_for_owner(owner, workspace)?;
     let has_write = names.iter().any(|name| name == WRITE);
+    let has_write_id = names.iter().any(|name| name == WRITE_ID);
     let has_pending = names.iter().any(|name| name == REMOVE_PENDING);
     let has_removed = names.iter().any(|name| name == REMOVED);
-    if ready_intent.is_some() && (has_write || has_pending) {
+    if ready_intent.is_some() && (has_write || has_write_id || has_pending) {
         return Err(failure(
             "ready removal intent conflicts with unpublishable residue",
         ));
@@ -645,8 +662,17 @@ fn recover_locked(
     }
     let Some(intent) = ready_intent else {
         let mut changed = false;
-        if has_write {
-            changed |= remove_if_present(workspace, WRITE)?;
+        if has_write || has_write_id {
+            let bytes = workspace
+                .read_optional(Path::new(WRITE_ID), MAX_INTENT_BYTES)?
+                .ok_or_else(|| {
+                    failure("publication residue has no saved stage identity; preserved")
+                })?;
+            let identity: super::StageIdentity = serde_json::from_slice(&bytes).map_err(|_| {
+                failure("publication stage identity is malformed; residue preserved")
+            })?;
+            changed |= workspace.discard_stage(Path::new(WRITE), &identity)?;
+            changed |= remove_if_present(workspace, WRITE_ID)?;
         }
         if has_pending {
             changed |= remove_if_present(workspace, REMOVE_PENDING)?;
@@ -983,7 +1009,7 @@ mod tests {
     }
 
     #[test]
-    fn orphan_write_is_discarded_without_replaying_it() {
+    fn unidentified_orphan_write_is_preserved_without_replaying_it() {
         let (_root, owner, target) = directories();
         private_leaf(&target, "leaf", b"old");
         let workspace = workspace_create(&owner).expect("workspace");
@@ -991,14 +1017,18 @@ mod tests {
             .open_private_gate_raw(Path::new(".gate"))
             .expect("gate");
         private_leaf(&workspace, "write", b"new");
-        assert!(recover(&owner, &[&target]).expect("recovery"));
+        assert!(recover(&owner, &[&target]).is_err());
+        assert_eq!(
+            workspace.read_optional(Path::new("write"), 16).unwrap(),
+            Some(b"new".to_vec())
+        );
         assert_eq!(
             target.read_optional(Path::new("leaf"), 16).expect("target"),
             Some(b"old".to_vec())
         );
         assert_eq!(
             inspect(&owner).expect("inspection"),
-            AtomicWorkspaceState::Clean
+            AtomicWorkspaceState::Pending
         );
     }
 
