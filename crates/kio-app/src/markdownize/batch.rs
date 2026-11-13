@@ -1247,6 +1247,9 @@ pub(crate) fn retire_online_task(task: &mut TaskDescriptor) {
     // Paused(auth) row too (QA2/QA3's supersede-on-edit / R18-2 orphan-sweep
     // callers admit Paused), so it must clear `hold_reason` itself.
     task.hold_reason = None;
+    task.resource_limit = None;
+    task.unit_keys = None;
+    task.unit_retry_at.clear();
     task.next_retry_at = None;
     task.heartbeat_at = None;
     task.clear_reservation();

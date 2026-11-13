@@ -1512,3 +1512,106 @@ fn endpoint_revoke_from_other_scope_before_final_query_consent_sends_nothing() {
     );
     fixture.assert_no_billing_artifacts();
 }
+
+/// A local image result that ran out of memory remains recoverable through the
+/// existing explicit operations, with the original typed input and no new send.
+#[test]
+fn resource_limit_image_result_retry_authenticates_input_and_publishes_without_resend() {
+    use kio_pipeline::task::{EmbeddingTaskTarget, HoldReason, TaskStatus, TaskStore};
+    let _env = kio_core::test_control::test_env_lock()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    for forged_path in [false, true] {
+        let f = Fixture::new(false);
+        let before = billing(&f);
+        interrupt_local_result(&f, "image");
+        let store = TaskStore::new(f.scope.join(".kio"));
+        let mut tasks = store.all().unwrap();
+        let image = tasks
+            .iter_mut()
+            .find(|task| {
+                matches!(
+                    task.embedding_target,
+                    Some(EmbeddingTaskTarget::Image { .. })
+                )
+            })
+            .unwrap();
+        image.status = TaskStatus::Paused;
+        image.hold_reason = Some(HoldReason::ResourceLimit);
+        image.fallback_reason = Some("resource_limit".into());
+        image.resource_limit = Some(kio_core::error::ResourceLimit {
+            resource: kio_core::error::Resource::Memory,
+            stage: "local_result".into(),
+            limit: None,
+            observed: Some(1024),
+            resource_tier: None,
+        });
+        image.next_retry_at = None;
+        image.heartbeat_at = None;
+        if forged_path {
+            image.input_path = "unrelated.png".into();
+        }
+        let held = image.clone();
+        store.replace_all(&tasks).unwrap();
+        let ordinary_resume = f
+            .command(&["batch", "resume", "--offline"])
+            .env("KIO_TEST_TASK_EMBED_TRACE", f.home.join("adapter.trace"))
+            .output()
+            .unwrap();
+        assert!(!ordinary_resume.status.success());
+        assert_eq!(
+            store
+                .all()
+                .unwrap()
+                .into_iter()
+                .find(|task| task.task_id == held.task_id)
+                .unwrap(),
+            held,
+            "ordinary resume must preserve the image resource hold"
+        );
+        let output = f
+            .command(&["batch", "retry", "--offline"])
+            .env("KIO_TEST_TASK_EMBED_TRACE", f.home.join("adapter.trace"))
+            .output()
+            .unwrap();
+        let current = store
+            .all()
+            .unwrap()
+            .into_iter()
+            .find(|task| task.task_id == held.task_id)
+            .unwrap();
+        if forged_path {
+            assert!(
+                !output.status.success(),
+                "forged owner path must not release hold"
+            );
+            assert_eq!(current, held);
+        } else {
+            assert!(
+                output.status.success(),
+                "{} {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(current.status, TaskStatus::Done);
+            assert_eq!(current.embedding_target, held.embedding_target);
+            assert_eq!(current.attempts, held.attempts);
+            assert!(current.resource_limit.is_none());
+            let source = support::immutable_sqlite(f.scope.join(".kio/index/sqlite.db"));
+            let count: i64 = source
+                .query_row(
+                    "SELECT COUNT(*) FROM embeddings WHERE target_type='image'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+        assert_eq!(
+            traced_kind(&f, "image"),
+            1,
+            "accepted result must not be resent"
+        );
+        assert_eq!(billing(&f), before);
+    }
+}

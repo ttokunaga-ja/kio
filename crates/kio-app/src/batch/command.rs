@@ -1112,11 +1112,16 @@ fn run_batch_resend_unknown(
                     && task.input_hash == key.input_hash
                     && (task.status == TaskStatus::Failed
                         && task.fallback_reason.as_deref() == Some(RESULT_UNKNOWN_REASON)
-                        || task.status == TaskStatus::Paused
-                            && task
+                        || matches!(task.status, TaskStatus::Paused | TaskStatus::Partial)
+                            && task.resource_limit.is_some()
+                            && (task
                                 .resource_limit
                                 .as_ref()
-                                .is_some_and(recheck_resource_limit))
+                                .is_some_and(recheck_resource_limit)
+                                || {
+                                    let plan = partial_retry_plan_from_instance(&store, task)?;
+                                    plan.resource_hold.is_some() && !plan.retryable_units.is_empty()
+                                }))
                     && targets_standard_online_markdownize(
                         store.kio_dir(),
                         task,
@@ -1191,28 +1196,39 @@ fn run_batch_resend_unknown(
     )?;
     let newly_authorized = authorize_unknown_sync_resend(&ledger, &key).map_err(pipeline_to_kio)?;
     let matching = matching_task_ids.into_iter().collect::<BTreeSet<_>>();
-    let queued = store
-        .update_matching(|task| {
-            if !matching.contains(&task.task_id) {
-                return false;
+    let mut held_retry_units = BTreeMap::new();
+    for task in tasks.iter().filter(|task| matching.contains(&task.task_id)) {
+        if task.task_type == TaskType::Markdownize && task.resource_limit.is_some() {
+            let plan = partial_retry_plan_from_instance(&store, task)?;
+            if plan.resource_hold.is_some() {
+                held_retry_units.insert(task.task_id.clone(), plan.retryable_units);
             }
-            task.status = TaskStatus::Pending;
-            task.fallback_reason = Some(
-                if task.task_type == TaskType::Markdownize {
-                    SYNC_RESEND_AUTHORIZED_REASON
-                } else {
-                    "ready_for_online_adapter"
-                }
-                .to_owned(),
-            );
-            task.hold_reason = None;
-            task.resource_limit = None;
-            task.next_retry_at = None;
-            task.heartbeat_at = None;
-            task.clear_reservation();
-            true
-        })
-        .map_err(pipeline_to_kio)?;
+        }
+    }
+    let queued = crate::task_execution::update_tasks_preserving_resource_holds(&store, |task| {
+        if !matching.contains(&task.task_id) {
+            return false;
+        }
+        task.status = TaskStatus::Pending;
+        if let Some(keys) = held_retry_units.get(&task.task_id) {
+            task.unit_keys = Some(keys.clone());
+        }
+        task.fallback_reason = Some(
+            if task.task_type == TaskType::Markdownize {
+                SYNC_RESEND_AUTHORIZED_REASON
+            } else {
+                "ready_for_online_adapter"
+            }
+            .to_owned(),
+        );
+        task.hold_reason = None;
+        task.resource_limit = None;
+        task.next_retry_at = None;
+        task.heartbeat_at = None;
+        task.clear_reservation();
+        true
+    })
+    .map_err(pipeline_to_kio)?;
     Ok(CommandResponse { body: ResponseBody::Batch(BatchResponse::ResendUnknown(BatchResendResponse::Authorized(BatchResendAuthorizedResponse {
         status: "resend_authorized".to_owned(), authorization_created: newly_authorized, tasks_queued: queued,
         scope_id: key.scope_id, adapter_kind: key.adapter_kind, input_hash: key.input_hash,
@@ -1725,12 +1741,12 @@ fn resource_task_input_matches(repo: &Repository, task: &TaskDescriptor) -> Resu
             .map_err(pipeline_to_kio)?;
         return Ok(input.raw_hash == task.input_hash);
     }
-    let Some(kio_pipeline::task::EmbeddingTaskTarget::Chunk { profile_hash, .. }) =
-        &task.embedding_target
-    else {
-        // Other target kinds require their own verified source, never raw-hash
-        // guesses or an unconditional resource-hold release.
-        return Ok(false);
+    let profile_hash = match &task.embedding_target {
+        Some(
+            kio_pipeline::task::EmbeddingTaskTarget::Chunk { profile_hash, .. }
+            | kio_pipeline::task::EmbeddingTaskTarget::Image { profile_hash, .. },
+        ) => profile_hash,
+        _ => return Ok(false),
     };
     let Some(entry) = crate::settings::rebuild_embedding_entry_from_tool_lock(repo.kio_dir())?
     else {
@@ -1762,6 +1778,15 @@ fn resource_task_input_matches(repo: &Repository, task: &TaskDescriptor) -> Resu
         profile_hash: entry.profile_hash,
     };
     let bound = bind_embedding_work(retained, &profile)?;
+    if matches!(
+        task.embedding_target,
+        Some(kio_pipeline::task::EmbeddingTaskTarget::Image { .. })
+    ) {
+        return crate::embedding::image_executor::resource_image_task_input_matches(
+            repo, task, &profile, &instances, &bound, &policy,
+        );
+    }
+
     Ok(bound.iter().any(|chunk| {
         task.output_ref == chunk.work_key.output_ref()
             && task.input_hash == chunk.text_hash

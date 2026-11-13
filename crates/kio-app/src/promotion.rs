@@ -1,9 +1,9 @@
 //! Validation and deterministic planning for Markdownize promotion.
 //!
-//! The executors own adapter calls and task lifecycle.  This module starts
-//! strictly after a task reached `Done`: it re-opens the typed normalized-instance
-//! reference and verifies that the manifest and every unit form one complete,
-//! immutable identity before the CLI is allowed to bind that identity into HEAD.
+//! The executors own adapter calls and task lifecycle. This module re-opens
+//! typed normalized instances and verifies their immutable unit identities before
+//! binding them into HEAD. Complete tasks and resource-held partial tasks publish
+//! only verified done units.
 use crate::index::command::read_repository_scan_input;
 use crate::index::command::repository_scan_policy_allows_file;
 use crate::index::pipeline::IndexPipelineResult;
@@ -312,14 +312,7 @@ pub(crate) fn validated_online_promotions(
                 .iter()
                 .all(|unit| unit.status == UnitStatus::Done)
             && instance.units.len() == instance.manifest.units.len();
-        let resource_partial = task.status == TaskStatus::Partial
-            && task.resource_limit.is_some()
-            && instance
-                .manifest
-                .units
-                .iter()
-                .any(|u| u.resource_limit == task.resource_limit)
-            && !instance.units.is_empty();
+        let resource_partial = resource_partial_can_publish(task, &instance);
         if !complete && !resource_partial {
             return Err(PipelineError::corrupt(
                 task.output_ref.clone(),
@@ -619,7 +612,20 @@ fn plan_local_markdownize_promotion(
     }))
 }
 
-fn validated_local_normalize_ref(
+// A call-wide interruption has no accepted failed-unit response to persist.
+// Its typed Task hold is sufficient; all published units still come exclusively
+// from the fully verified immutable instance, regardless of the interruption site.
+fn resource_partial_can_publish(
+    task: &TaskDescriptor,
+    instance: &kio_pipeline::markdownize::ValidatedNormalizedInstance,
+) -> bool {
+    task.status == TaskStatus::Partial
+        && task.hold_reason == Some(kio_pipeline::task::HoldReason::ResourceLimit)
+        && task.resource_limit.is_some()
+        && !instance.units.is_empty()
+}
+
+pub(crate) fn validated_local_normalize_ref(
     repo: &Repository,
     task: &TaskDescriptor,
     profile: &AdapterProfile,
@@ -674,14 +680,7 @@ fn validated_local_normalize_ref(
             .iter()
             .all(|u| u.status == UnitStatus::Done)
         && instance.units.len() == instance.manifest.units.len();
-    let resource_partial = task.status == TaskStatus::Partial
-        && task.resource_limit.is_some()
-        && !instance.units.is_empty()
-        && instance
-            .manifest
-            .units
-            .iter()
-            .any(|u| u.resource_limit == task.resource_limit);
+    let resource_partial = resource_partial_can_publish(task, &instance);
     if !(task.status == TaskStatus::Done && complete || resource_partial) {
         return Err(pipeline_to_kio(PipelineError::corrupt(
             task.output_ref.clone(),

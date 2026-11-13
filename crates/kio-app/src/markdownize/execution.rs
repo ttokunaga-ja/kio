@@ -2417,6 +2417,32 @@ mod resource_failure_tests {
                 Some(kio_pipeline::task::HoldReason::ResourceLimit)
             );
             assert_eq!(held.attempts, 2);
+            if done {
+                // The call failed before a new response existed: the old immutable
+                // manifest still records network_error, not this task-level limit.
+                let mut local_profile = kio_adapter::local_ocr_markdownize::profile_for(
+                    kio_adapter::local_ocr_markdownize::LocalOcrExecution::Real,
+                );
+                local_profile.tool_profile_hash = profile.clone();
+                let promoted =
+                    crate::promotion::validated_local_normalize_ref(&repo, &held, &local_profile)
+                        .expect("verified done units survive task-level resource interruption")
+                        .expect("partial local promotion");
+                assert_eq!(promoted.expected_raw_hash, raw_hash);
+                let mut online = held.clone();
+                online.bbox_annotation_enabled = Some(false);
+                assert_eq!(
+                    crate::promotion::validated_online_promotions(
+                        repo.kio_dir(),
+                        &[online],
+                        repo.control()
+                    )
+                    .expect("same acceptance rule for online task-level exhaustion")
+                    .len(),
+                    1
+                );
+            }
+
             mirror_local_ocr_wait(
                 &store,
                 &task.task_id,

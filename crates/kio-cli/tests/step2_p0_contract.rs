@@ -4466,11 +4466,128 @@ fn resource_limit_mixed_offline_retry_preserves_hold_and_done_unit() {
             "a sibling retry must honor its Retry-After while the resource unit stays held"
         );
         drop(ledger);
-        kio(&dir, ["batch", "retry", "--realtime"])
+        if !resource_sibling {
+            kio(&dir, ["batch", "retry", "--realtime"])
+                .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "network_error")
+                .arg("--json")
+                .assert()
+                .code(3);
+            let fenced = store
+                .all()
+                .unwrap()
+                .into_iter()
+                .find(|t| t.task_id == task.task_id)
+                .unwrap();
+            assert_eq!(fenced.status, TaskStatus::Partial);
+            assert_eq!(fenced.resource_limit, task.resource_limit);
+            let ledger =
+                support::immutable_sqlite(dir.path().join(".test-data/kio/cost-ledger.sqlite"));
+            let selector: String = ledger.query_row(
+                "SELECT scope_id || '/' || adapter_kind || '/' || input_hash || '/' || tool_profile_hash FROM batch_requests WHERE adapter_kind='markdownize'",
+                [], |row| row.get(0)).unwrap();
+            let charges: i64 = ledger
+                .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row.get(0))
+                .unwrap();
+            drop(ledger);
+            kio(&dir, ["batch", "retry", "--realtime"])
+                .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+                .arg("--json")
+                .assert()
+                .code(3);
+            let ledger =
+                support::immutable_sqlite(dir.path().join(".test-data/kio/cost-ledger.sqlite"));
+            assert_eq!(
+                ledger
+                    .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                charges
+            );
+            drop(ledger);
+            // Without a per-unit resource partition, the work hold covers the
+            // whole interrupted call and cannot be bypassed by resend consent.
+            let current_instance = kio_pipeline::markdownize::load_validated_normalized_instance(
+                dir.path().join(".kio"),
+                &raw_hash,
+                &profile_hash,
+                0,
+            )
+            .unwrap();
+            let mut callwide_manifest = current_instance.manifest.clone();
+            callwide_manifest.units[1].error_kind = Some("network_error".into());
+            callwide_manifest.units[1].resource_limit = None;
+            kio_pipeline::markdownize::persist_normalized_instance(
+                dir.path().join(".kio"),
+                &callwide_manifest,
+                &current_instance.units,
+            )
+            .unwrap();
+            let callwide_held = store.all().unwrap();
+            let rejected = kio(
+                &dir,
+                ["batch", "retry", "--resend-unknown", &selector, "--yes"],
+            )
             .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
             .arg("--json")
             .assert()
-            .code(3);
+            .code(2)
+            .get_output()
+            .stderr
+            .clone();
+            let rejected: Value = serde_json::from_slice(&rejected).unwrap();
+            assert_eq!(rejected["error_code"], "KIO-E-CONFIG-USAGE-001");
+            assert_eq!(store.all().unwrap(), callwide_held);
+            kio_pipeline::markdownize::persist_normalized_instance(
+                dir.path().join(".kio"),
+                &current_instance.manifest,
+                &current_instance.units,
+            )
+            .unwrap();
+            let authorized = kio(
+                &dir,
+                ["batch", "retry", "--resend-unknown", &selector, "--yes"],
+            )
+            .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+            .arg("--json")
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+            let authorized: Value = serde_json::from_slice(&authorized).unwrap();
+            assert_eq!(authorized["tasks_queued"], 1);
+            let queued = store
+                .all()
+                .unwrap()
+                .into_iter()
+                .find(|t| t.task_id == task.task_id)
+                .unwrap();
+            assert_eq!(queued.status, TaskStatus::Partial);
+            assert_eq!(queued.resource_limit, task.resource_limit);
+            assert_eq!(queued.unit_keys, Some(vec!["page:3".into()]));
+            let ledger =
+                support::immutable_sqlite(dir.path().join(".test-data/kio/cost-ledger.sqlite"));
+            assert_eq!(
+                ledger
+                    .query_row("SELECT COUNT(*) FROM cost_ledger", [], |row| row
+                        .get::<_, i64>(0))
+                    .unwrap(),
+                charges,
+                "resend authorization itself never dispatches or creates a charge"
+            );
+        }
+        kio(
+            &dir,
+            [
+                "batch",
+                if resource_sibling { "retry" } else { "resume" },
+                "--realtime",
+            ],
+        )
+        .env(TEST_STANDARD_ONLINE_MARKDOWNIZE_ENV, "mock")
+        .arg("--json")
+        .assert()
+        .code(3);
         let held = store
             .all()
             .unwrap()
@@ -4515,4 +4632,34 @@ fn resource_limit_mixed_offline_retry_preserves_hold_and_done_unit() {
             charges
         );
     }
+}
+
+#[test]
+fn resource_limit_edited_original_retires_old_hold() {
+    let dir = scope();
+    let old = valid_png();
+    fs::write(dir.path().join("document.png"), &old).unwrap();
+    json_success(&dir, ["index", "--yes", "--offline"]);
+    let task: kio_pipeline::task::TaskDescriptor = serde_json::from_value(json!({
+        "task_id":"task_old_resource", "type":"markdownize", "mode":"full", "input_path":"document.png",
+        "input_hash":hash_bytes(&old),"previous_raw_hash":null,"parent_run_id":null,"changed_unit_keys":[],
+        "output_ref":format!("online:{}",standard_online_markdownize_profile().adapter_id),"unit_keys":null,
+        "status":"paused","attempts":0,"next_retry_at":null,"deadline":null,"heartbeat_at":null,
+        "fallback_reason":"resource_limit","resource_limit":{"resource":"work","stage":"extract","limit":1,"observed":2,"resource_tier":null},
+        "created_at":"2026-07-03T00:00:00Z","bbox_annotation_enabled":false,"hold_reason":"resource_limit",
+        "reserved_usd":null,"reserved_month":null,"reservation_id":null
+    })).unwrap();
+    let store = TaskStore::new(dir.path().join(".kio"));
+    store.replace_all(std::slice::from_ref(&task)).unwrap();
+    let mut changed = old.clone();
+    changed.extend_from_slice(b"changed");
+    fs::write(dir.path().join("document.png"), &changed).unwrap();
+    json_success(&dir, ["index", "--yes", "--offline"]);
+    let tasks = store.all().unwrap();
+    let retired = tasks.iter().find(|t| t.task_id == task.task_id).unwrap();
+    assert_eq!(retired.status, TaskStatus::Failed);
+    assert_eq!(retired.fallback_reason.as_deref(), Some("retired_non_live"));
+    assert!(retired.hold_reason.is_none());
+    assert!(retired.resource_limit.is_none());
+    assert!(tasks.iter().any(|t| t.input_hash == hash_bytes(&changed)));
 }

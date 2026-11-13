@@ -83,6 +83,48 @@ use rusqlite::Connection;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
+/// Authenticate a held image against the same retained ownership, citing path,
+/// codec receipt and embedding profile used by the image executor. This only
+/// proves identity; the normal execution path still checks send authorization.
+pub(crate) fn resource_image_task_input_matches(
+    repo: &kio_core::scope::Repository,
+    task: &TaskDescriptor,
+    profile: &kio_adapter::catalog::DeclaredEmbeddingProfile,
+    retained_instances: &[RetainedNormalizedInstance],
+    eligible_chunks: &[EmbeddableChunk],
+    current_policy: &kio_pipeline::policy::CurrentPolicyEvaluator,
+) -> Result<bool> {
+    let Some(EmbeddingTaskTarget::Image { image_hash, .. }) = &task.embedding_target else {
+        return Ok(false);
+    };
+    let authority =
+        image_authority::retained_image_authority(repo, retained_instances, current_policy)?;
+    let scope_id = repo.scope_identity()?.scope_id;
+    let authorized_owner = eligible_chunks
+        .iter()
+        .filter(|chunk| chunk.raw_path == task.input_path)
+        .any(|chunk| {
+            referenced_authorized_image_hashes_for_chunks(
+                std::slice::from_ref(chunk),
+                &scope_id,
+                &authority,
+                true,
+            )
+            .contains(image_hash)
+        });
+    if !authorized_owner || task.changed_unit_keys != [image_hash.clone()] {
+        return Ok(false);
+    }
+    let (plan, _) = crate::embedding::input::prepare_owned_embedding_image(
+        &repo.object_store(),
+        image_hash,
+        profile,
+    )?;
+    Ok(task.embedding_target.as_ref() == Some(&plan.target)
+        && task.input_hash == plan.target.input_hash()
+        && task.output_ref == plan.target.output_ref())
+}
+
 /// Embed typed-owned image objects cited by live chunks into `image_vec`.
 pub(crate) struct ImageEnrichmentRequest<'a> {
     pub(crate) retained_instances: &'a [RetainedNormalizedInstance],

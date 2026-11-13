@@ -5123,8 +5123,16 @@ fn resource_error_mappings_preserve_context_and_keep_corruption_distinct() {
 
 #[test]
 fn resource_limit_watch_and_preview_keep_hold_until_explicit_index() {
+    let _environment = kio_core::test_control::test_env_lock().lock().unwrap();
     use crate::commands::{CommandRequest, IndexArgs, InitArgs};
     let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    let _home = kio_core::test_control::TestEnvGuard::isolated_home(&home);
+    // Fail before any command can open the real device storage.
+    assert_eq!(
+        std::env::var_os("XDG_DATA_HOME"),
+        Some(home.clone().into_os_string())
+    );
     let context = test_context(root.path());
     crate::execute(
         &context,

@@ -2003,6 +2003,9 @@ pub(crate) fn update_tasks_preserving_resource_holds(
         if !update(task) {
             return false;
         }
+        if task.fallback_reason.as_deref() == Some(RETIRED_NON_LIVE) {
+            return true;
+        }
         if let Some((status, limit)) = holds.get(&task.task_id) {
             if let Some(deadline) = task.next_retry_at.take() {
                 for key in task.unit_keys.iter().flatten() {
