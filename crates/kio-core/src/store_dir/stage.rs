@@ -952,15 +952,6 @@ mod tests {
     }
 
     #[test]
-    fn stage_creation_storage_failure_preserves_resource_type() {
-        let error = crate::store_dir::ioerr(
-            Path::new("stage"),
-            std::io::Error::from(std::io::ErrorKind::StorageFull),
-        );
-        assert_eq!(error.resource_limit().unwrap().resource, Resource::Storage);
-    }
-
-    #[test]
     fn storage_full_is_typed_resource_exhaustion() {
         let error = stage_io(
             "write",

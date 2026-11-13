@@ -8,7 +8,6 @@ pub(crate) struct WindowsFileIdentity {
 pub(crate) struct WindowsFileInformation {
     identity: WindowsFileIdentity,
     file_size: u64,
-    number_of_links: u32,
     last_write_time: u64,
     is_directory: bool,
     is_reparse_point: bool,
@@ -19,7 +18,6 @@ impl WindowsFileInformation {
         volume_serial_number: u32,
         file_index: (u32, u32),
         file_size: (u32, u32),
-        number_of_links: u32,
         last_write_time: (u32, u32),
         is_directory: bool,
         is_reparse_point: bool,
@@ -30,7 +28,6 @@ impl WindowsFileInformation {
                 file_index: join_u32(file_index.0, file_index.1),
             },
             file_size: join_u32(file_size.0, file_size.1),
-            number_of_links,
             last_write_time: join_u32(last_write_time.0, last_write_time.1),
             is_directory,
             is_reparse_point,
@@ -51,16 +48,8 @@ impl WindowsFileInformation {
         self.file_size
     }
 
-    pub(crate) fn has_single_link(self) -> bool {
-        self.number_of_links == 1
-    }
-
     pub(crate) fn is_regular_file(self) -> bool {
         !self.is_directory && !self.is_reparse_point
-    }
-
-    pub(crate) fn is_real_directory(self) -> bool {
-        self.is_directory && !self.is_reparse_point
     }
 }
 
@@ -81,7 +70,6 @@ mod tests {
             7,
             (0, identity_low),
             (0, size_low),
-            1,
             (0, write_low),
             false,
             false,
@@ -95,7 +83,7 @@ mod tests {
         assert!(!base.same_identity(synthetic_information(12, 20, 30)));
 
         let other_volume =
-            WindowsFileInformation::from_components(8, (0, 11), (0, 20), 1, (0, 30), false, false);
+            WindowsFileInformation::from_components(8, (0, 11), (0, 20), (0, 30), false, false);
         assert!(!base.same_identity(other_volume));
     }
 
@@ -109,24 +97,17 @@ mod tests {
     }
 
     #[test]
-    fn type_and_link_checks_fail_closed() {
+    fn type_checks_fail_closed() {
         let regular = synthetic_information(11, 20, 30);
         assert!(regular.is_regular_file());
-        assert!(regular.has_single_link());
 
         let directory =
-            WindowsFileInformation::from_components(7, (0, 11), (0, 0), 1, (0, 30), true, false);
-        assert!(directory.is_real_directory());
+            WindowsFileInformation::from_components(7, (0, 11), (0, 0), (0, 30), true, false);
         assert!(!directory.is_regular_file());
 
         let reparse =
-            WindowsFileInformation::from_components(7, (0, 11), (0, 20), 1, (0, 30), false, true);
+            WindowsFileInformation::from_components(7, (0, 11), (0, 20), (0, 30), false, true);
         assert!(!reparse.is_regular_file());
-        assert!(!reparse.is_real_directory());
-
-        let hard_linked =
-            WindowsFileInformation::from_components(7, (0, 11), (0, 20), 2, (0, 30), false, false);
-        assert!(!hard_linked.has_single_link());
     }
 
     #[test]
@@ -135,7 +116,6 @@ mod tests {
             7,
             (0x0123_4567, 0x89ab_cdef),
             (0x7654_3210, 0xfedc_ba98),
-            1,
             (0x1111_2222, 0x3333_4444),
             false,
             false,
