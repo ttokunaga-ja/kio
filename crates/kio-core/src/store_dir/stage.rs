@@ -137,17 +137,37 @@ impl StageWriter {
         leaf: &Path,
         initialize: impl FnOnce(&File) -> Result<StageIdentity>,
     ) -> Result<Self> {
+        Self::create_with_sync(directory, leaf, initialize, StoreDirectory::sync)
+    }
+
+    fn create_with_sync(
+        directory: &StoreDirectory,
+        leaf: &Path,
+        initialize: impl FnOnce(&File) -> Result<StageIdentity>,
+        sync_parent: impl FnOnce(&StoreDirectory) -> Result<()>,
+    ) -> Result<Self> {
         let file = crate::platform::stage_operations::create_file(directory, leaf)?;
         let identity = match initialize(&file) {
             Ok(identity) => identity,
             Err(error) => {
                 return Err(initialization_failure(
                     error,
-                    crate::platform::stage_operations::discard_file(directory, leaf, &file),
+                    crate::platform::stage_operations::discard_file(directory, leaf, &file, None),
                 ));
             }
         };
-        directory.sync()?;
+        if let Err(error) = sync_parent(directory) {
+            identity.verify(&file)?;
+            return Err(initialization_failure(
+                error,
+                crate::platform::stage_operations::discard_file(
+                    directory,
+                    leaf,
+                    &file,
+                    Some(&identity),
+                ),
+            ));
+        }
         Ok(Self {
             directory: directory.clone(),
             leaf: leaf.to_owned(),
@@ -230,6 +250,7 @@ impl StageWriter {
             target,
             leaf,
             publication,
+            &identity,
         )?;
         directory.sync()?;
         target.sync()
@@ -307,6 +328,9 @@ impl StoreDirectory {
         if super::relative_components(leaf, false, self.path())?.len() != 1 {
             return Err(failure("stage must be a direct leaf"));
         }
+        if crate::platform::stage_operations::recover_file(self, leaf, identity)? {
+            return Ok(true);
+        }
         if !self.contains_entry(leaf)? {
             return Ok(false);
         }
@@ -314,7 +338,7 @@ impl StoreDirectory {
         let file = crate::platform::stage_operations::open_file(self, leaf)?;
         identity.verify(&file)?;
         after_verified()?;
-        crate::platform::stage_operations::discard_file(self, leaf, &file)?;
+        crate::platform::stage_operations::discard_file(self, leaf, &file, Some(identity))?;
         self.sync()?;
         Ok(true)
     }
@@ -345,7 +369,14 @@ fn initialization_failure(error: crate::KioError, cleanup: Result<()>) -> crate:
 #[derive(Debug, PartialEq, Eq)]
 pub enum StageEntryState {
     Owned,
-    Unidentified { reason: String },
+    /// The saved stage is in a durable Unix capture, rather than at its source.
+    Captured {
+        source: PathBuf,
+        payload_present: bool,
+    },
+    Unidentified {
+        reason: String,
+    },
     Missing,
 }
 #[derive(Debug)]
@@ -383,6 +414,12 @@ impl StoreDirectory {
                 ));
             }
         }
+        let mut captures = std::collections::BTreeMap::new();
+        for (source, identity) in files {
+            if let Some(name) = crate::platform::stage_operations::capture_name(identity)? {
+                captures.insert(name.into_os_string(), (source, identity));
+            }
+        }
         let mut result = Vec::new();
         // Inventory names without adopting entries or following links. The
         // general store listing rejects unsafe leaves before naming them;
@@ -393,6 +430,28 @@ impl StoreDirectory {
             let name = entry
                 .map_err(|e| io_failure("cannot inspect stage residue name", e))?
                 .file_name();
+            if let Some((source, identity)) = captures.get(&name) {
+                let state = match crate::platform::stage_operations::inspect_capture(
+                    self,
+                    Path::new(&name),
+                    identity,
+                ) {
+                    Ok(payload_present) => {
+                        if payload_present {
+                            expected.remove(source.as_os_str());
+                        }
+                        StageEntryState::Captured {
+                            source: (*source).clone(),
+                            payload_present,
+                        }
+                    }
+                    Err(error) => StageEntryState::Unidentified {
+                        reason: error.message().to_owned(),
+                    },
+                };
+                result.push(StageInspectionEntry { name, state });
+                continue;
+            }
             let verification = match expected.remove(&name) {
                 None => Err(failure("no saved stage identity; residue preserved")),
                 Some(Expected::File(identity)) => (|| {
@@ -820,6 +879,48 @@ mod tests {
             .open_regular_read(Path::new("public"), 64)
             .unwrap();
         assert!(crate::platform::stage_nonce::read(&file).is_err());
+    }
+
+    #[test]
+    fn parent_sync_failure_cleans_the_initialized_file_before_returning_error() {
+        let (temp, directory) = directory();
+        let result = StageWriter::create_with_sync(
+            &directory,
+            Path::new("stage"),
+            StageIdentity::initialize,
+            |_| Err(failure("injected parent fsync failure")),
+        );
+        assert_eq!(
+            result.err().unwrap().message(),
+            "injected parent fsync failure"
+        );
+        assert!(!temp.path().join("stage").exists());
+        assert!(directory.entries(Path::new("")).unwrap().is_empty());
+        assert!(StageWriter::create(&directory, Path::new("stage")).is_ok());
+    }
+
+    #[test]
+    fn parent_sync_failure_never_cleans_a_replacement_file() {
+        let (temp, directory) = directory();
+        let result = StageWriter::create_with_sync(
+            &directory,
+            Path::new("stage"),
+            StageIdentity::initialize,
+            |_| {
+                fs::rename(temp.path().join("stage"), temp.path().join("displaced")).unwrap();
+                let mut foreign = directory.create_private_file(Path::new("stage"))?;
+                foreign.write_all(b"foreign").unwrap();
+                Err(failure("injected parent fsync failure"))
+            },
+        );
+        assert!(
+            result
+                .err()
+                .unwrap()
+                .message()
+                .contains("injected parent fsync failure")
+        );
+        assert_eq!(fs::read(temp.path().join("stage")).unwrap(), b"foreign");
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Stage mutations retain the verified, delete-capable handle throughout.
 use crate::{
     Result,
-    store_dir::{Publication, StoreDirectory, atomic::io_failure},
+    store_dir::{Publication, StageIdentity, StoreDirectory, atomic::io_failure},
 };
 use cap_primitives::fs::{self as cap_fs, OpenOptionsExt};
 use std::{fs::File, os::windows::io::AsRawHandle, path::Path};
@@ -44,6 +44,7 @@ pub(crate) fn publish(
     target: &StoreDirectory,
     leaf: &Path,
     publication: Publication,
+    _identity: &StageIdentity,
 ) -> Result<()> {
     if publication == Publication::Replace
         || (publication == Publication::Upsert && target.contains_entry(leaf)?)
@@ -87,7 +88,12 @@ fn retire(held: &File) -> Result<()> {
     }
     Ok(())
 }
-pub(crate) fn discard_file(_directory: &StoreDirectory, _source: &Path, held: &File) -> Result<()> {
+pub(crate) fn discard_file(
+    _directory: &StoreDirectory,
+    _source: &Path,
+    held: &File,
+    _identity: Option<&StageIdentity>,
+) -> Result<()> {
     retire(held)
 }
 pub(crate) fn discard_empty_directory(
@@ -96,4 +102,23 @@ pub(crate) fn discard_empty_directory(
     held: &File,
 ) -> Result<()> {
     retire(held)
+}
+
+// Windows mutations use the retained handle directly and create no capture.
+pub(crate) fn capture_name(_identity: &StageIdentity) -> Result<Option<std::path::PathBuf>> {
+    Ok(None)
+}
+pub(crate) fn inspect_capture(
+    _parent: &StoreDirectory,
+    _name: &Path,
+    _identity: &StageIdentity,
+) -> Result<bool> {
+    Ok(false)
+}
+pub(crate) fn recover_file(
+    _parent: &StoreDirectory,
+    _source: &Path,
+    _identity: &StageIdentity,
+) -> Result<bool> {
+    Ok(false)
 }
