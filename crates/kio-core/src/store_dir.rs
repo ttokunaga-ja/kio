@@ -499,6 +499,11 @@ pub(crate) fn err(path: &Path, message: impl Into<String>) -> KioError {
     )
 }
 pub(crate) fn ioerr(path: &Path, error: std::io::Error) -> KioError {
+    if crate::platform::stage_nonce::storage_exhausted(&error) {
+        return stage::stage_io("private storage exhausted", error)
+            .with_context_field("path", json!(path));
+    }
+
     let kind = match error.kind() {
         std::io::ErrorKind::AlreadyExists => "already_exists",
         std::io::ErrorKind::NotFound => "not_found",

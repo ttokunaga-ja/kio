@@ -30,9 +30,7 @@ pub(crate) fn retain_repair_source(source: &mut Option<File>) -> RepairSource<'_
         _borrow: std::marker::PhantomData,
     }
 }
-pub(crate) fn prepare_bound_raw_stage(source: &mut Option<File>) {
-    drop(source.take());
-}
+
 pub(crate) fn validate_bound_directory_native(directory: &File, label: &Path) -> Result<()> {
     if super::cas_identity::directory_handle_identity(directory).is_none() {
         return Err(KioError::io(

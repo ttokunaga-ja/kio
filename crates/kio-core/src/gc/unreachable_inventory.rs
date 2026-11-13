@@ -26,7 +26,7 @@ use crate::scope::{acquire_bound_store_read_guard_with_control, canonical_tool_l
 const CAS_KINDS: [(&str, &str, u64, bool); 10] = [
     ("commit", "commits", MAX_COMMIT_OBJECT_BYTES, true),
     ("tree", "trees", MAX_TREE_OBJECT_BYTES, true),
-    ("raw", "raw", MAX_RAW_OBJECT_BYTES, false),
+    ("raw", "raw", u64::MAX, false),
     ("chunk", "chunks", MAX_CHUNK_OBJECT_BYTES, true),
     ("manifest", "manifests", MAX_MANIFEST_OBJECT_BYTES, true),
     (
@@ -37,8 +37,8 @@ const CAS_KINDS: [(&str, &str, u64, bool); 10] = [
     ),
     ("embedding", "embeddings", MAX_EMBEDDING_OBJECT_BYTES, true),
     ("toollock", "toollocks", MAX_METADATA, true),
-    ("prepared", "prepared", MAX_RAW_OBJECT_BYTES, false),
-    ("image", "image", MAX_RAW_OBJECT_BYTES, false),
+    ("prepared", "prepared", MAX_CONTENT_OBJECT_BYTES, false),
+    ("image", "image", MAX_CONTENT_OBJECT_BYTES, false),
 ];
 
 const NON_CAS_OBJECT_DIRECTORIES: [&str; 2] = ["normalized", "normalized_units"];

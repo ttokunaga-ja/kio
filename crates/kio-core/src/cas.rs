@@ -10,6 +10,8 @@ pub use embedding_metadata::{
 };
 
 mod bound;
+#[cfg(test)]
+pub(crate) use bound::fail_next_raw_write;
 mod image;
 pub use image::ImageStore;
 use image::write_bound_content_at;
@@ -43,7 +45,7 @@ use crate::platform::cas_io::{
 use crate::platform::cas_semantics;
 
 pub const CAS_STREAM_BUFFER_BYTES: usize = 64 * 1024;
-pub const MAX_RAW_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_CONTENT_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_TREE_OBJECT_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_COMMIT_OBJECT_BYTES: u64 = 1024 * 1024;
 /// Semantic chunk objects contain bounded normalized text, never raw file bytes.
@@ -119,7 +121,7 @@ impl ContentObjectKind {
             Self::Embedding => MAX_EMBEDDING_OBJECT_BYTES,
             Self::Manifest => MAX_MANIFEST_OBJECT_BYTES,
             Self::NormalizedUnit => MAX_NORMALIZED_UNIT_OBJECT_BYTES,
-            Self::Prepared | Self::Image | Self::Toollock => MAX_RAW_OBJECT_BYTES,
+            Self::Prepared | Self::Image | Self::Toollock => MAX_CONTENT_OBJECT_BYTES,
         }
     }
 }
@@ -530,7 +532,7 @@ impl ObjectKind {
     #[must_use]
     pub const fn max_bytes(self) -> u64 {
         match self {
-            Self::Raw => MAX_RAW_OBJECT_BYTES,
+            Self::Raw => u64::MAX,
             Self::Tree => MAX_TREE_OBJECT_BYTES,
             Self::Commit => MAX_COMMIT_OBJECT_BYTES,
         }
@@ -584,11 +586,20 @@ struct BoundObjectDirs {
     normalized_units: Arc<Mutex<Option<Arc<File>>>>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct RawStageResidue {
+    pub path: String,
+    pub reason: String,
+}
+
 #[derive(Debug)]
 pub struct BoundRawStage {
     parent: Arc<File>,
+    directory: crate::store_dir::StoreDirectory,
+    journals: crate::store_dir::StoreDirectory,
     name: String,
-    file: Option<File>,
+    writer: Option<crate::store_dir::StageWriter>,
+    identity: crate::store_dir::StageIdentity,
     raw_hash: String,
     size_bytes: u64,
 }
@@ -604,8 +615,14 @@ impl BoundRawStage {
 }
 impl Drop for BoundRawStage {
     fn drop(&mut self) {
-        if !self.name.is_empty() {
-            let _ = bound_remove(&self.parent, &self.name);
+        drop(self.writer.take());
+        if !self.name.is_empty()
+            && self
+                .directory
+                .discard_stage(Path::new(&self.name), &self.identity)
+                .is_ok()
+        {
+            let _ = self.journals.remove_file(Path::new(&self.name));
         }
     }
 }
@@ -654,18 +671,6 @@ fn bound_open_dir(parent: &File, leaf: &str) -> Result<File> {
     ensure_bound_directory(&directory, Path::new(leaf))?;
     let directory = cas_semantics::normalize_bound_child(directory, leaf)?;
     Ok(directory)
-}
-
-fn bound_ingest_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix(".ingest-") else {
-        return false;
-    };
-    let mut fields = rest.split('-');
-    (0..3).all(|_| {
-        fields.next().is_some_and(|field| {
-            !field.is_empty() && field.bytes().all(|byte| byte.is_ascii_digit())
-        })
-    }) && fields.next().is_none()
 }
 
 fn bound_stage_corrupt(message: &str) -> KioError {
@@ -978,10 +983,6 @@ fn bound_verify_content_accounted(
 
 fn bound_create_temp(parent: &File) -> Result<(String, File)> {
     bound_create_private_temp(parent, ".kio-cas", "bound CAS temp")
-}
-
-fn bound_create_ingest_temp(parent: &File) -> Result<(String, File)> {
-    bound_create_private_temp(parent, ".ingest", "bound raw stage")
 }
 
 fn bound_remove(parent: &File, leaf: &str) -> Result<()> {
@@ -2118,6 +2119,17 @@ pub(crate) fn non_regular_object_error(path: &Path) -> KioError {
 }
 
 fn object_size_error(kind: ObjectKind, limit: u64, actual: u64) -> KioError {
+    if kind == ObjectKind::Raw {
+        return crate::error::ResourceLimit {
+            resource: crate::error::Resource::RawBytes,
+            stage: "raw_archive".into(),
+            limit: Some(limit),
+            observed: Some(actual),
+            resource_tier: None,
+        }
+        .into_error("raw archive byte budget exceeded");
+    }
+
     KioError::new(
         "KIO-E-STORE-OBJECT-OVERSIZED-001",
         "CAS object exceeds its byte limit",
@@ -3073,6 +3085,18 @@ mod tests {
     }
 
     #[test]
+    fn st04_keeps_derived_object_limits() {
+        assert_eq!(ObjectKind::Raw.max_bytes(), u64::MAX);
+        for kind in [
+            ContentObjectKind::Prepared,
+            ContentObjectKind::Image,
+            ContentObjectKind::Toollock,
+        ] {
+            assert_eq!(kind.max_bytes(), 512 * 1024 * 1024);
+        }
+    }
+
+    #[test]
     fn cand_019_streaming_raw_writer_enforces_exact_limit_and_cleans_temp() {
         let (_dir, store) = object_store();
         let bytes = vec![b'x'; CAS_STREAM_BUFFER_BYTES];
@@ -3088,7 +3112,7 @@ mod tests {
                 CAS_STREAM_BUFFER_BYTES as u64,
             )
             .unwrap_err();
-        assert_eq!(error.error_code(), "KIO-E-STORE-OBJECT-OVERSIZED-001");
+        assert_eq!(error.error_code(), "KIO-E-RESOURCE-LIMIT-001");
         let raw_base = store.ambient_kio_dir().unwrap().join("objects/raw");
         assert!(stray_temp_files(&raw_base).is_empty());
     }

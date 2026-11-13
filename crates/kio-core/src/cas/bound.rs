@@ -1,4 +1,17 @@
+#[cfg(test)]
+thread_local! { static FAIL_RAW_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+
+#[cfg(test)]
+pub(crate) fn fail_next_raw_write() {
+    FAIL_RAW_WRITE.with(|fault| fault.set(true));
+}
+
 use super::*;
+
+struct RawStageDirectories {
+    stages: crate::store_dir::StoreDirectory,
+    journals: Option<crate::store_dir::StoreDirectory>,
+}
 
 impl BoundObjectDirs {
     pub(super) fn validate_layout(&self) -> Result<()> {
@@ -53,176 +66,254 @@ impl BoundObjectDirs {
         Ok(())
     }
 
+    fn raw_stage_directories(&self, create: bool) -> Result<Option<RawStageDirectories>> {
+        let internal = match bound_open_or_create_dir(&self.kio, "internal", create) {
+            Err(error) if !create && error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
+                return Ok(None);
+            }
+            result => result?,
+        };
+        let open = |name: &str| -> Result<Option<crate::store_dir::StoreDirectory>> {
+            match bound_open_or_create_dir(&internal, name, create) {
+                Ok(handle) => {
+                    crate::store_dir::StoreDirectory::from_retained(handle, PathBuf::from(name))
+                        .map(Some)
+                }
+                Err(error) if !create && error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
+        };
+        // Keep journals separate from payload inventory, and create their
+        // directory first. Missing journals never authorize residue deletion.
+        let journals = open("raw-stage-identities")?;
+        let Some(stages) = open("raw-stages")? else {
+            return Ok(None);
+        };
+        Ok(Some(RawStageDirectories { stages, journals }))
+    }
+
+    pub(super) fn inspect_raw_stages(
+        &self,
+        cleanup: bool,
+    ) -> Result<Vec<crate::cas::RawStageResidue>> {
+        use crate::store_dir::{StageEntryState, StageIdentity};
+        let mut residues = Vec::new();
+        if let Some(RawStageDirectories { stages, journals }) = self.raw_stage_directories(false)? {
+            let mut expected = Vec::new();
+            if let Some(journals) = &journals {
+                if cleanup {
+                    journals.recover_atomic(&[journals])?;
+                }
+                for entry in journals.inspect_stages(&[], &[])? {
+                    if entry.name == crate::store_dir::ATOMIC_WORKSPACE_DIR {
+                        continue;
+                    }
+                    let leaf = PathBuf::from(&entry.name);
+                    match journals.read_optional(&leaf, 4096).and_then(|bytes| {
+                        serde_json::from_slice::<StageIdentity>(&bytes.unwrap_or_default())
+                            .map_err(|error| bound_stage_corrupt(&error.to_string()))
+                    }) {
+                        Ok(identity) => expected.push((leaf, identity)),
+                        Err(error) => residues.push(RawStageResidue {
+                            path: format!("internal/raw-stage-identities/{}", leaf.display()),
+                            reason: error.to_string(),
+                        }),
+                    }
+                }
+            }
+            let mut retired = std::collections::BTreeSet::new();
+            for entry in stages.inspect_stages(&expected, &[])? {
+                let leaf = PathBuf::from(&entry.name);
+                let source = match &entry.state {
+                    StageEntryState::Captured { source, .. } => source,
+                    _ => &leaf,
+                };
+                if retired.contains(source) {
+                    continue;
+                }
+                let identity = expected
+                    .iter()
+                    .find(|(name, _)| name == source)
+                    .map(|(_, id)| id);
+                if cleanup
+                    && let Some(identity) = identity
+                    && !matches!(entry.state, StageEntryState::Unidentified { .. })
+                {
+                    stages.discard_stage(source, identity)?;
+                    journals
+                        .as_ref()
+                        .expect("saved stage journal")
+                        .remove_file(source)?;
+                    retired.insert(source.clone());
+                    continue;
+                }
+                if !matches!(entry.state, StageEntryState::Missing) {
+                    residues.push(RawStageResidue {
+                        path: format!("internal/raw-stages/{}", leaf.display()),
+                        reason: format!("{:?}", entry.state),
+                    });
+                }
+            }
+        }
+        // A name or nonce alone is never deletion authority, including residue
+        // left before a durable identity could be saved.
+        for entry in cap_primitives::fs::read_base_dir(&self.raw)
+            .map_err(|e| KioError::io(e.to_string(), "raw"))?
+        {
+            let name = entry
+                .map_err(|e| KioError::io(e.to_string(), "raw"))?
+                .file_name();
+            if name.as_encoded_bytes().starts_with(b".ingest-") {
+                residues.push(RawStageResidue {
+                    path: format!("objects/raw/{}", name.to_string_lossy()),
+                    reason: "unidentified stage: no saved identity".into(),
+                });
+            }
+        }
+        Ok(residues)
+    }
+
     pub(super) fn stage_raw_from_reader<R: Read>(
         &self,
         reader: &mut R,
         max_bytes: u64,
     ) -> Result<BoundRawStage> {
         ensure_bound_directory(&self.kio, Path::new(".kio"))?;
-        let max_bytes = max_bytes.min(MAX_RAW_OBJECT_BYTES);
-        let (name, mut file) = bound_create_ingest_temp(&self.raw)?;
-        let result = (|| {
-            let mut hasher = Sha256::new();
-            let mut total = 0_u64;
-            let mut buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
-            loop {
-                let cap = max_bytes
-                    .saturating_sub(total)
-                    .saturating_add(1)
-                    .min(buffer.len() as u64) as usize;
-                let count = reader.read(&mut buffer[..cap]).kio_io(Path::new(&name))?;
-                if count == 0 {
-                    break;
-                }
-                total = total
-                    .checked_add(count as u64)
-                    .ok_or_else(|| object_size_error(ObjectKind::Raw, max_bytes, u64::MAX))?;
-                if total > max_bytes {
-                    return Err(object_size_error(ObjectKind::Raw, max_bytes, total));
-                }
-                hasher.update(&buffer[..count]);
-                file.write_all(&buffer[..count]).kio_io(Path::new(&name))?;
+        let RawStageDirectories {
+            stages: directory,
+            journals,
+        } = self
+            .raw_stage_directories(true)?
+            .expect("created stage directories");
+        let journals = journals.expect("created stage journals");
+        let name = format!("raw-{}-{}", std::process::id(), unix_nanos());
+        let writer = crate::store_dir::StageWriter::create(&directory, Path::new(&name))?;
+        let identity = writer.identity().clone();
+        let mut stage = BoundRawStage {
+            parent: Arc::clone(&self.raw),
+            directory,
+            journals,
+            name,
+            writer: Some(writer),
+            identity,
+            raw_hash: String::new(),
+            size_bytes: 0,
+        };
+        stage.journals.write_atomic(
+            Path::new(&stage.name),
+            &serde_json::to_vec(&stage.identity)
+                .map_err(|e| bound_stage_corrupt(&e.to_string()))?,
+            crate::store_dir::Publication::CreateOnly,
+        )?;
+        let mut hasher = Sha256::new();
+        let mut buffer = [0; CAS_STREAM_BUFFER_BYTES];
+        loop {
+            let cap = max_bytes
+                .saturating_sub(stage.size_bytes)
+                .saturating_add(1)
+                .min(buffer.len() as u64) as usize;
+            let count = reader
+                .read(&mut buffer[..cap])
+                .kio_io(Path::new(&stage.name))?;
+            if count == 0 {
+                break;
             }
-            file.sync_all().kio_io(Path::new(&name))?;
-            file.seek(std::io::SeekFrom::Start(0))
-                .kio_io(Path::new(&name))?;
-            Ok((format!("sha256:{}", lower_hex(&hasher.finalize())), total))
-        })();
-        match result {
-            Ok((raw_hash, size_bytes)) => Ok(BoundRawStage {
-                parent: Arc::clone(&self.raw),
-                name,
-                file: Some(file),
-                raw_hash,
-                size_bytes,
-            }),
-            Err(error) => {
-                drop(file);
-                let _ = bound_remove(&self.raw, &name);
-                Err(error)
+            stage.size_bytes = stage
+                .size_bytes
+                .checked_add(count as u64)
+                .ok_or_else(|| object_size_error(ObjectKind::Raw, max_bytes, u64::MAX))?;
+            if stage.size_bytes > max_bytes {
+                return Err(object_size_error(
+                    ObjectKind::Raw,
+                    max_bytes,
+                    stage.size_bytes,
+                ));
             }
+            hasher.update(&buffer[..count]);
+            #[cfg(test)]
+            if FAIL_RAW_WRITE.with(|fault| fault.replace(false)) {
+                return Err(crate::store_dir::ioerr(
+                    Path::new(&stage.name),
+                    std::io::Error::from(std::io::ErrorKind::StorageFull),
+                ));
+            }
+            stage
+                .writer
+                .as_mut()
+                .expect("live stage")
+                .write_chunk(&buffer[..count])?;
         }
+        stage.writer.as_ref().expect("live stage").sync()?;
+        stage.raw_hash = format!("sha256:{}", lower_hex(&hasher.finalize()));
+        Ok(stage)
     }
 
     pub(super) fn publish_raw_stage(&self, mut stage: BoundRawStage) -> Result<(String, u64)> {
-        if !Arc::ptr_eq(&stage.parent, &self.raw) {
+        if !same_bound_directory(&stage.parent, &self.raw)? {
             return Err(KioError::invalid_usage(
-                "bound raw stage belongs to another ObjectStore",
+                "raw stage belongs to another store",
             ));
         }
-        crate::private_fs::verify_private_regular_file_handle(
-            stage
-                .file
-                .as_ref()
-                .ok_or_else(|| bound_stage_corrupt("bound raw stage handle is unavailable"))?,
-        )?;
-        let opened = stage
-            .file
-            .as_ref()
-            .ok_or_else(|| bound_stage_corrupt("bound raw stage handle is unavailable"))?
-            .metadata()
-            .kio_io(Path::new(&stage.name))?;
-        if !opened.is_file() || opened.len() != stage.size_bytes {
-            return Err(corrupt_object_error(
-                Path::new(&stage.name),
-                "bound raw stage changed before publication",
-                &stage.raw_hash,
-                None,
-            ));
+        let mut file = stage
+            .directory
+            .open_regular_read(Path::new(&stage.name), u64::MAX)?;
+        stage.identity.verify(&file)?;
+        if file.metadata().kio_io(Path::new(&stage.name))?.len() != stage.size_bytes
+            || bound_hash_open_regular(&CasReadAccess::Unmetered, &mut file, u64::MAX)?
+                != stage.raw_hash
+        {
+            return Err(bound_stage_corrupt("raw stage changed before publication"));
         }
-        let hash = stage.raw_hash.clone();
-        let size = stage.size_bytes;
-        // Windows may reject linking or unlinking a name while its writer
-        // handle remains open. The exact file was checked above; publication
-        // re-opens it through the retained raw directory and verifies hash,
-        // type and single-link identity before accepting it.
-        cas_semantics::prepare_bound_raw_stage(&mut stage.file);
-        let (parent, leaf) = self.fanout(ObjectKind::Raw, &hash, true)?;
+        drop(file);
+        let (parent, leaf) = self.fanout(ObjectKind::Raw, &stage.raw_hash, true)?;
         match bound_read_verified(
             &CasReadAccess::Unmetered,
             &parent,
             &leaf,
             ObjectKind::Raw,
-            &hash,
-            true,
+            &stage.raw_hash,
+            false,
         ) {
-            Ok((existing_size, existing)) => {
-                let (_, staged) = bound_read_regular(
-                    &CasReadAccess::Unmetered,
-                    &self.raw,
-                    &stage.name,
-                    MAX_RAW_OBJECT_BYTES,
-                )?;
-                if existing_size != size || existing != staged {
-                    return Err(corrupt_object_error(
-                        Path::new(&leaf),
-                        "CAS object bytes do not match existing object",
-                        &hash,
-                        Some(&hash_bytes(&existing)),
-                    ));
-                }
-                bound_remove(&self.raw, &stage.name)?;
+            Ok((size, _)) if size == stage.size_bytes => {
+                drop(stage.writer.take());
+                stage
+                    .directory
+                    .discard_stage(Path::new(&stage.name), &stage.identity)?;
             }
+            Ok(_) => return Err(bound_stage_corrupt("existing raw object size mismatch")),
             Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
-                bound_publish_between(
-                    &self.raw,
-                    &stage.name,
-                    &parent,
-                    &leaf,
-                    ObjectKind::Raw,
-                    &hash,
-                    size,
-                    None,
-                )?
+                let target = crate::store_dir::StoreDirectory::from_retained(
+                    parent.try_clone().kio_io(Path::new(&leaf))?,
+                    PathBuf::from("raw fanout"),
+                )?;
+                stage.writer.take().expect("live stage").publish(
+                    &target,
+                    Path::new(&leaf),
+                    crate::store_dir::Publication::CreateOnly,
+                )?;
             }
             Err(error) => return Err(error),
         }
+        let (size, _) = bound_read_verified(
+            &CasReadAccess::Unmetered,
+            &parent,
+            &leaf,
+            ObjectKind::Raw,
+            &stage.raw_hash,
+            false,
+        )?;
+        if size != stage.size_bytes {
+            return Err(bound_stage_corrupt("published raw object size mismatch"));
+        }
+        stage.journals.remove_file(Path::new(&stage.name))?;
         stage.name.clear();
-        Ok((hash, size))
+        Ok((stage.raw_hash.clone(), size))
     }
 
     pub(super) fn cleanup_raw_ingest_orphans(&self) -> Result<()> {
-        ensure_bound_directory(&self.kio, Path::new(".kio"))?;
-        ensure_bound_directory(&self.raw, Path::new("raw"))?;
-        const MAX_ENTRIES: usize = 100_000;
-        let mut total = 0_u64;
-        let entries = cap_primitives::fs::read_base_dir(&self.raw)
-            .map_err(|e| KioError::io(e.to_string(), "bound raw stage directory"))?;
-        for (n, entry) in entries.enumerate() {
-            if n >= MAX_ENTRIES {
-                return Err(bound_stage_corrupt(
-                    "bound raw stage directory exceeds entry limit",
-                ));
-            }
-            let entry =
-                entry.map_err(|e| KioError::io(e.to_string(), "bound raw stage directory"))?;
-            let file_name = entry.file_name();
-            let Some(name) = file_name.to_str() else {
-                return Err(bound_stage_corrupt("bound raw stage name is not UTF-8"));
-            };
-            if !name.starts_with(".ingest-") {
-                continue;
-            }
-            if !bound_ingest_name(name) {
-                return Err(bound_stage_corrupt("bound raw stage name is malformed"));
-            }
-            let (size, _) = bound_read_regular(
-                &CasReadAccess::Unmetered,
-                &self.raw,
-                name,
-                MAX_RAW_OBJECT_BYTES,
-            )?;
-            total = total
-                .checked_add(size)
-                .ok_or_else(|| bound_stage_corrupt("bound raw stage byte count overflow"))?;
-            if total > MAX_RAW_OBJECT_BYTES {
-                return Err(bound_stage_corrupt(
-                    "bound raw stage cleanup exceeds byte limit",
-                ));
-            }
-            bound_remove(&self.raw, name)?;
-        }
-        sync_bound_directory(&self.raw, Path::new("bound raw stage directory"))
+        self.inspect_raw_stages(true).map(|_| ())
     }
 
     fn dir(&self, kind: ObjectKind) -> &File {
@@ -753,83 +844,86 @@ impl BoundObjectDirs {
         reader: &mut R,
         max_bytes: u64,
     ) -> Result<(String, u64)> {
-        let max_bytes = max_bytes.min(MAX_RAW_OBJECT_BYTES);
-        let (temp_name, mut temp) = bound_create_temp(&self.raw)?;
-        let result = (|| {
-            let mut hasher = Sha256::new();
-            let mut total = 0_u64;
-            let mut buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
-            loop {
-                let cap = max_bytes
-                    .saturating_sub(total)
-                    .saturating_add(1)
-                    .min(buffer.len() as u64) as usize;
-                let count = reader
-                    .read(&mut buffer[..cap])
-                    .kio_io(Path::new(&temp_name))?;
-                if count == 0 {
-                    break;
-                }
-                total = total
-                    .checked_add(count as u64)
-                    .ok_or_else(|| object_size_error(ObjectKind::Raw, max_bytes, u64::MAX))?;
-                if total > max_bytes {
-                    return Err(object_size_error(ObjectKind::Raw, max_bytes, total));
-                }
-                hasher.update(&buffer[..count]);
-                temp.write_all(&buffer[..count])
-                    .kio_io(Path::new(&temp_name))?;
-            }
-            temp.sync_all().kio_io(Path::new(&temp_name))?;
-            drop(temp);
-            let hash = format!("sha256:{}", lower_hex(&hasher.finalize()));
-            let (parent, leaf) = self.fanout(ObjectKind::Raw, &hash, true)?;
-            // A temp in raw's base cannot be linked across a fanout directory
-            // by a path-based fallback; linkat keeps both endpoints capability-bound.
-            match bound_read_verified(
-                &CasReadAccess::Unmetered,
-                &parent,
-                &leaf,
-                ObjectKind::Raw,
-                &hash,
-                true,
-            ) {
-                Ok((_, existing)) => {
-                    let (_, staged) = bound_read_regular(
-                        &CasReadAccess::Unmetered,
-                        &self.raw,
-                        &temp_name,
-                        ObjectKind::Raw.max_bytes(),
-                    )?;
-                    if existing != staged {
-                        return Err(corrupt_object_error(
-                            Path::new(&leaf),
-                            "CAS object bytes do not match existing object",
-                            &hash,
-                            Some(&hash_bytes(&existing)),
-                        ));
-                    }
-                    bound_remove(&self.raw, &temp_name)?;
-                }
-                Err(error) if error.error_code() == "KIO-E-STORE-NOT-FOUND-001" => {
-                    bound_publish_between(
-                        &self.raw,
-                        &temp_name,
-                        &parent,
-                        &leaf,
-                        ObjectKind::Raw,
-                        &hash,
-                        total,
-                        None,
-                    )?;
-                }
-                Err(error) => return Err(error),
-            }
-            Ok((hash, total))
-        })();
-        if result.is_err() {
-            let _ = bound_remove(&self.raw, &temp_name);
+        self.publish_raw_stage(self.stage_raw_from_reader(reader, max_bytes)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn abandoned_stage(
+        repo: &crate::scope::Repository,
+    ) -> (String, crate::store_dir::StageIdentity) {
+        let mut stage = repo
+            .object_store()
+            .stage_raw_from_reader(&mut &b"stage payload"[..], 100)
+            .unwrap();
+        let name = stage.name.clone();
+        let identity = stage.identity.clone();
+        drop(stage.writer.take());
+        stage.name.clear();
+        (name, identity)
+    }
+
+    #[test]
+    fn st04_recovery_uses_saved_identity_and_preserves_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::scope::Repository::init(dir.path()).unwrap();
+        let (name, _) = abandoned_stage(&repo);
+        let stage = repo.kio_dir().join("internal/raw-stages").join(&name);
+        let journal = repo
+            .kio_dir()
+            .join("internal/raw-stage-identities")
+            .join(&name);
+        assert!(
+            repo.object_store()
+                .inspect_raw_stages()
+                .unwrap()
+                .iter()
+                .any(|entry| entry.path.ends_with(&name))
+        );
+        repo.object_store().cleanup_bound_raw_stages().unwrap();
+        assert!(!stage.exists());
+        assert!(!journal.exists());
+        let (name, _) = abandoned_stage(&repo);
+        let stage = repo.kio_dir().join("internal/raw-stages").join(&name);
+        let held = File::open(&stage).unwrap();
+        fs::rename(&stage, stage.with_extension("original")).unwrap();
+        fs::write(&stage, b"replacement").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&stage, fs::Permissions::from_mode(0o600)).unwrap();
         }
-        result
+        repo.object_store().cleanup_bound_raw_stages().unwrap();
+        assert_eq!(fs::read(&stage).unwrap(), b"replacement");
+        let entries = repo.object_store().inspect_raw_stages().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.path.ends_with(&name) && entry.reason.contains("Unidentified"))
+        );
+        drop(held);
+    }
+
+    #[test]
+    fn st04_publication_rejects_changed_stage_and_existing_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = crate::scope::Repository::init(dir.path()).unwrap();
+        let store = repo.object_store();
+        let stage = store
+            .stage_raw_from_reader(&mut &b"first"[..], 100)
+            .unwrap();
+        let path = repo.kio_dir().join("internal/raw-stages").join(&stage.name);
+        fs::write(&path, b"other").unwrap();
+        assert!(store.publish_bound_raw_stage(stage).is_err());
+        let hash = store.write_raw_reader(&mut &b"first"[..], 100).unwrap().0;
+        let stage = store
+            .stage_raw_from_reader(&mut &b"first"[..], 100)
+            .unwrap();
+        let path = crate::cas::fanout_path(repo.kio_dir().join("objects/raw"), &hash).unwrap();
+        fs::write(path, b"other").unwrap();
+        assert!(store.publish_bound_raw_stage(stage).is_err());
     }
 }

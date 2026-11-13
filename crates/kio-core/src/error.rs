@@ -80,6 +80,12 @@ pub struct KioError {
 
 impl KioError {
     #[must_use]
+    pub fn with_context_field(mut self, name: &str, value: Value) -> Self {
+        self.context[name] = value;
+        self
+    }
+
+    #[must_use]
     pub fn new(
         error_code: impl Into<String>,
         message: impl Into<String>,
@@ -253,13 +259,39 @@ pub trait IoResultExt<T> {
 
 impl<T> IoResultExt<T> for std::io::Result<T> {
     fn kio_io(self, path: &std::path::Path) -> Result<T> {
-        self.map_err(|err| KioError::io(err.to_string(), path.display().to_string()))
+        self.map_err(|err| {
+            if crate::platform::stage_nonce::storage_exhausted(&err) {
+                ResourceLimit {
+                    resource: Resource::Storage,
+                    stage: "storage_io".into(),
+                    limit: None,
+                    observed: None,
+                    resource_tier: None,
+                }
+                .into_error(err.to_string())
+                .with_context_field("path", json!(path))
+            } else {
+                KioError::io(err.to_string(), path.display().to_string())
+            }
+        })
     }
 }
 
 #[cfg(test)]
 mod resource_limit_tests {
     use super::*;
+
+    #[test]
+    fn storage_exhaustion_in_small_publication_writes_is_a_resource_limit() {
+        let result: std::io::Result<()> =
+            Err(std::io::Error::from(std::io::ErrorKind::StorageFull));
+        let error = result
+            .kio_io(std::path::Path::new("HEAD stage"))
+            .unwrap_err();
+        assert_eq!(error.resource_limit().unwrap().resource, Resource::Storage);
+        assert_eq!(error.context()["path"], "HEAD stage");
+        assert_eq!(error.exit_code(), ExitCode::PartialFailure);
+    }
 
     #[test]
     fn resource_limit_error_preserves_descriptor() {

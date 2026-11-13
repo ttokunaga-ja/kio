@@ -199,6 +199,8 @@ fn index_reconciles_more_than_legacy_child_cap_and_deep_pages_in_one_run() {
     let output = crate::execute(
         &test_context(&root),
         crate::commands::CommandRequest::Index(IndexArgs {
+            max_file_bytes: None,
+            max_total_bytes: None,
             preview: false,
             yes: false,
             online: false,
@@ -4114,7 +4116,7 @@ fn q2_open_cas_byte_object_rejects_corrupt_object() {
 fn portable_cas_leaf_uses_digest_and_presence_rejects_nonregular_slot() {
     use crate::open_view::cas_object_path;
     use crate::open_view::cas_object_present;
-    use kio_core::cas::MAX_RAW_OBJECT_BYTES;
+    use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
     use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
@@ -4127,7 +4129,7 @@ fn portable_cas_leaf_uses_digest_and_presence_rejects_nonregular_slot() {
     assert!(!path.to_string_lossy().contains("sha256:"));
 
     std::fs::create_dir_all(&path).unwrap();
-    let error = cas_object_present(dir.path(), "raw", &hash, MAX_RAW_OBJECT_BYTES).unwrap_err();
+    let error = cas_object_present(dir.path(), "raw", &hash, MAX_CONTENT_OBJECT_BYTES).unwrap_err();
     assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
 }
 
@@ -4152,7 +4154,7 @@ fn non_current_colon_leaf(
 fn non_current_only_cas_leaf_is_ignored_as_not_found() {
     use crate::open_view::cas_object_present;
     use crate::open_view::read_cas_byte_object;
-    use kio_core::cas::MAX_RAW_OBJECT_BYTES;
+    use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
     use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
@@ -4162,9 +4164,9 @@ fn non_current_only_cas_leaf_is_ignored_as_not_found() {
     std::fs::create_dir_all(non_current.parent().unwrap()).unwrap();
     std::fs::write(non_current, bytes).unwrap();
 
-    assert!(!cas_object_present(dir.path(), "prepared", &hash, MAX_RAW_OBJECT_BYTES).unwrap());
+    assert!(!cas_object_present(dir.path(), "prepared", &hash, MAX_CONTENT_OBJECT_BYTES).unwrap());
     assert!(
-        read_cas_byte_object(dir.path(), "prepared", &hash, MAX_RAW_OBJECT_BYTES)
+        read_cas_byte_object(dir.path(), "prepared", &hash, MAX_CONTENT_OBJECT_BYTES)
             .unwrap()
             .is_none()
     );
@@ -4174,7 +4176,7 @@ fn non_current_only_cas_leaf_is_ignored_as_not_found() {
 fn canonical_cas_read_succeeds_and_hash_mismatch_fails_closed() {
     use crate::open_view::cas_object_path;
     use crate::open_view::read_cas_byte_object;
-    use kio_core::cas::MAX_RAW_OBJECT_BYTES;
+    use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
     use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
@@ -4184,7 +4186,7 @@ fn canonical_cas_read_succeeds_and_hash_mismatch_fails_closed() {
     std::fs::create_dir_all(canonical.parent().unwrap()).unwrap();
     std::fs::write(&canonical, bytes).unwrap();
     let (resolved, loaded) =
-        read_cas_byte_object(dir.path(), "prepared", &hash, MAX_RAW_OBJECT_BYTES)
+        read_cas_byte_object(dir.path(), "prepared", &hash, MAX_CONTENT_OBJECT_BYTES)
             .unwrap()
             .unwrap();
     assert_eq!(resolved, canonical);
@@ -4192,7 +4194,7 @@ fn canonical_cas_read_succeeds_and_hash_mismatch_fails_closed() {
 
     std::fs::write(&canonical, b"hash mismatch").unwrap();
     let error =
-        read_cas_byte_object(dir.path(), "prepared", &hash, MAX_RAW_OBJECT_BYTES).unwrap_err();
+        read_cas_byte_object(dir.path(), "prepared", &hash, MAX_CONTENT_OBJECT_BYTES).unwrap_err();
     assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
 }
 
@@ -4229,7 +4231,7 @@ fn non_current_conflict_cannot_influence_canonical_read_or_write() {
     use crate::object_persistence::write_canonical_cas_object_or_reuse;
     use crate::open_view::cas_object_path;
     use crate::open_view::read_cas_byte_object;
-    use kio_core::cas::MAX_RAW_OBJECT_BYTES;
+    use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
     use kio_pipeline::prepare::hash_bytes;
 
     let dir = tempfile::tempdir().unwrap();
@@ -4257,7 +4259,7 @@ fn non_current_conflict_cannot_influence_canonical_read_or_write() {
     .unwrap();
     let canonical = cas_object_path(&kio_dir, "prepared", &hash).unwrap();
     let (resolved, loaded) =
-        read_cas_byte_object(&kio_dir, "prepared", &hash, MAX_RAW_OBJECT_BYTES)
+        read_cas_byte_object(&kio_dir, "prepared", &hash, MAX_CONTENT_OBJECT_BYTES)
             .unwrap()
             .unwrap();
     assert_eq!(resolved, canonical);
@@ -5185,6 +5187,8 @@ fn resource_limit_watch_and_preview_keep_hold_until_explicit_index() {
     let raw = b"resource test";
     std::fs::write(root.path().join("document.md"), raw).unwrap();
     let args = IndexArgs {
+        max_file_bytes: None,
+        max_total_bytes: None,
         preview: false,
         yes: true,
         online: false,
@@ -5206,6 +5210,8 @@ fn resource_limit_watch_and_preview_keep_hold_until_explicit_index() {
     crate::execute(
         &context,
         CommandRequest::Index(IndexArgs {
+            max_file_bytes: None,
+            max_total_bytes: None,
             preview: true,
             ..args.clone()
         }),
@@ -5235,4 +5241,16 @@ fn resource_limit_watch_and_preview_keep_hold_until_explicit_index() {
     assert_eq!(resumed.attempts, held.attempts);
     assert_eq!(resumed.output_ref, held.output_ref);
     assert!(resumed.resource_limit.is_none());
+}
+
+#[test]
+fn st04_working_tree_lookup_does_not_clamp_large_raw_files() {
+    let size = 512 * 1024 * 1024 + 1;
+    let mut budget = crate::open_view::WorkingTreeScanBudget {
+        remaining_bytes: u64::MAX,
+        remaining_entries: 1,
+    };
+    let attempt = budget.reserve_file(size).unwrap();
+    assert_eq!(attempt.max_bytes, size);
+    assert_eq!(attempt.reserved_bytes, size + 1);
 }

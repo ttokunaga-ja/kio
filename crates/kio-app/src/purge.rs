@@ -34,7 +34,7 @@ use kio_core::purge::{
     BeginOutcome, ClosureItem, EventKind, LifecycleEvent, PurgeClosure, PurgeJournal, PurgePhase,
     PurgeReason, PurgeState, TombstoneMode, canonical_final_event, closure_content_hash,
 };
-use kio_core::scope::{Repository, StoreLock, cleanup_orphan_raw_ingest_temps};
+use kio_core::scope::{Repository, StoreLock};
 #[cfg(debug_assertions)]
 use kio_core::test_control::PurgeFault;
 use kio_core::{ExitCode, KioError, Result};
@@ -117,7 +117,7 @@ pub(crate) fn run(
             // Reject it before even orphan cleanup can remove target bytes.
             state.read_closure()?;
         }
-        cleanup_orphan_raw_ingest_temps(repo.kio_dir())?;
+        repo.object_store().cleanup_bound_raw_stages()?;
     }
     let preview = preflight(&repo, &args)?;
     confirm(ctx, &preview, args.yes)?;
@@ -578,7 +578,7 @@ fn execute_phase_machine(
     let _publication_lock = repo.lock_purge_publication_in_session(repo.lock_session())?;
     // Re-run after reacquiring the store lock: a prior Kio writer could have
     // crashed between preview cleanup and this confirmed phase-machine entry.
-    cleanup_orphan_raw_ingest_temps(repo.kio_dir())?;
+    repo.object_store().cleanup_bound_raw_stages()?;
 
     let state = PurgeState::open_with_control(repo.kio_dir(), repo.control().clone())?;
     let active = state.read_journal()?;

@@ -64,10 +64,6 @@ pub(crate) fn same_scope_file_identity(opened: &File, path: &File) -> bool {
     crate::platform::cas_identity::same_windows_regular_file(opened, path)
 }
 
-pub(crate) fn configure_private_stage(options: &mut OpenOptions) {
-    let _ = options;
-}
-
 pub(crate) fn set_scope_directory_permissions(dir: &Path) -> Result<()> {
     let _ = dir;
     Ok(())

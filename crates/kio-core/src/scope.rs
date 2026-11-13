@@ -1,8 +1,8 @@
 //! Folder-scope repository operations for Step 1.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::{self, File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Component;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -16,8 +16,8 @@ use unicode_normalization::UnicodeNormalization;
 
 use crate::ExitCode;
 use crate::cas::{
-    CAS_STREAM_BUFFER_BYTES, ContentObjectKind, MAX_RAW_OBJECT_BYTES, ObjectKind, ObjectStore,
-    canonical_json_bytes, is_hash, read_bounded_regular_file,
+    CAS_STREAM_BUFFER_BYTES, ContentObjectKind, ObjectKind, ObjectStore, canonical_json_bytes,
+    is_hash, read_bounded_regular_file,
 };
 use crate::dag::{
     CommitObject, CommitStats, CommitType, DEFAULT_CHUNKING_MAX_CHARS, DEFAULT_CHUNKING_STRATEGY,
@@ -29,7 +29,7 @@ use crate::gc::{SnapshotAutoBinding, SnapshotAutoStateBinding};
 #[cfg(all(test, unix))]
 use crate::platform::scope_effective_uid as effective_uid;
 use crate::platform::{
-    BoundMetadataObservation, configure_private_stage, scheduled_source_identity,
+    BoundMetadataObservation, scheduled_source_identity,
     scope_open_bound_nofollow as open_bound_scope_file_nofollow,
     scope_open_nofollow as open_scope_file_nofollow,
     scope_read_bound_regular_text_observed_at as read_bound_regular_text_observed_at,
@@ -92,8 +92,8 @@ pub use managed_restore::{
 
 /// Exact on-disk scope format understood by this pre-stable reader.
 pub const KIO_FORMAT_VERSION: &str = "3.0.0";
-pub const DEFAULT_MAX_ARCHIVE_FILE_BYTES: u64 = MAX_RAW_OBJECT_BYTES;
-pub const DEFAULT_MAX_ARCHIVE_SCOPE_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+pub const DEFAULT_MAX_ARCHIVE_FILE_BYTES: u64 = u64::MAX;
+pub const DEFAULT_MAX_ARCHIVE_SCOPE_BYTES: u64 = u64::MAX;
 pub use crate::dag::MAX_TREE_ENTRIES;
 const MAX_TAG_REF_BYTES: u64 = 128;
 const MAX_TAG_NAMES_BYTES: u64 = 16 * 1024 * 1024;
@@ -122,6 +122,18 @@ pub struct ArchiveLimits {
 }
 
 impl ArchiveLimits {
+    pub fn from_options(file: Option<u64>, total: Option<u64>) -> Result<Self> {
+        if file == Some(0) || total == Some(0) {
+            return Err(KioError::invalid_usage(
+                "archive byte budgets must be positive",
+            ));
+        }
+        Ok(Self::new(
+            file.unwrap_or(u64::MAX),
+            total.unwrap_or(u64::MAX),
+        ))
+    }
+
     #[must_use]
     pub const fn new(max_file_bytes: u64, max_scope_bytes: u64) -> Self {
         Self {
@@ -161,24 +173,10 @@ struct WorkingFileCandidate {
     bound_root: Option<Arc<File>>,
 }
 
-#[derive(Debug)]
-struct StagedWorkingFile {
-    candidate: WorkingFileCandidate,
-    temp_path: PathBuf,
-    file: File,
-    raw_hash: String,
-    size_bytes: u64,
-}
-
-impl Drop for StagedWorkingFile {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.temp_path);
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct Repository {
     lock_session: LockSession,
+    archive_limits: ArchiveLimits,
     root: PathBuf,
     /// Stable public scope identity. Ordinary repositories use the same path
     /// as `root`; bound child indexing keeps it separate from operational I/O.
@@ -195,6 +193,13 @@ pub struct Repository {
 }
 
 impl Repository {
+    /// Apply only to archive publication in this invocation; read-only status
+    /// always uses an independent, unlimited byte budget.
+    pub fn with_archive_limits(mut self, limits: ArchiveLimits) -> Self {
+        self.archive_limits = limits;
+        self
+    }
+
     pub fn with_verified_reads(
         &self,
         reads: &crate::cas::VerifiedCasReadCapability,
@@ -238,6 +243,7 @@ pub struct FileStatus {
 /// scope stays inspectable instead of bricking on a raw `KIO-E-STORE-NOT-FOUND-001`.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusReport {
+    pub stage_residues: Vec<crate::cas::RawStageResidue>,
     pub files: Vec<FileStatus>,
     pub head_shallow: bool,
 }
@@ -1233,193 +1239,6 @@ fn hash_scope_file(
     Ok((format!("sha256:{}", hex_digest(&hasher.finalize())), total))
 }
 
-fn stage_scope_file(
-    kio_dir: &Path,
-    candidate: WorkingFileCandidate,
-    allowed: u64,
-    limits: ArchiveLimits,
-    control: &crate::control::ControlHandle,
-) -> Result<StagedWorkingFile> {
-    let mut source = open_working_file_candidate(&candidate, control)?;
-    let metadata = source.metadata().kio_io(&candidate.path)?;
-    if metadata.len() > allowed {
-        return Err(scope_input_oversized(
-            &candidate.file_name,
-            limits,
-            metadata.len(),
-        ));
-    }
-    let raw_base = kio_dir.join("objects/raw");
-    let (temp_path, mut staged) = create_raw_staging_file(&raw_base)?;
-    let result = (|| -> Result<(String, u64)> {
-        let mut hasher = Sha256::new();
-        let mut buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
-        let mut total = 0_u64;
-        loop {
-            let read_cap = allowed
-                .saturating_sub(total)
-                .saturating_add(1)
-                .min(buffer.len() as u64) as usize;
-            let count = source
-                .read(&mut buffer[..read_cap])
-                .kio_io(&candidate.path)?;
-            if count == 0 {
-                break;
-            }
-            total = total
-                .checked_add(count as u64)
-                .ok_or_else(|| scope_input_oversized(&candidate.file_name, limits, u64::MAX))?;
-            if total > allowed {
-                return Err(scope_input_oversized(&candidate.file_name, limits, total));
-            }
-            hasher.update(&buffer[..count]);
-            staged.write_all(&buffer[..count]).kio_io(&temp_path)?;
-        }
-        if source.metadata().kio_io(&candidate.path)?.len() != total {
-            return Err(scope_file_changed(&candidate.file_name));
-        }
-        staged.sync_all().kio_io(&temp_path)?;
-        Ok((format!("sha256:{}", hex_digest(&hasher.finalize())), total))
-    })();
-    match result {
-        Ok((raw_hash, size_bytes)) => Ok(StagedWorkingFile {
-            candidate,
-            temp_path,
-            file: staged,
-            raw_hash,
-            size_bytes,
-        }),
-        Err(error) => {
-            drop(staged);
-            let _ = fs::remove_file(&temp_path);
-            Err(error)
-        }
-    }
-}
-
-fn create_raw_staging_file(parent: &Path) -> Result<(PathBuf, File)> {
-    for attempt in 0..16_u8 {
-        let path = parent.join(format!(
-            ".ingest-{}-{}-{attempt}",
-            std::process::id(),
-            unix_nanos()
-        ));
-        let mut options = OpenOptions::new();
-        options.write(true).read(true).create_new(true);
-        configure_private_stage(&mut options);
-        match options.open(&path) {
-            Ok(file) => return Ok((path, file)),
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(error) => return Err(KioError::io(error.to_string(), path.display().to_string())),
-        }
-    }
-    Err(KioError::io(
-        "could not allocate a unique raw-ingest staging file",
-        parent.display().to_string(),
-    ))
-}
-
-/// Remove crash-orphaned raw-ingest transaction files while the caller holds
-/// the scope store lock. The namespace walk and aggregate physical bytes are
-/// bounded; every candidate is opened no-follow and must be a single-link,
-/// bounded regular file before unlinking.
-pub fn cleanup_orphan_raw_ingest_temps(kio_dir: &Path) -> Result<u64> {
-    const MAX_RAW_DIRECTORY_ENTRIES: usize = 100_000;
-    const MAX_ORPHAN_BYTES: u64 = DEFAULT_MAX_ARCHIVE_SCOPE_BYTES;
-
-    validate_store_directory(kio_dir)?;
-    let objects = kio_dir.join("objects");
-    let raw_base = objects.join("raw");
-    for directory in [&objects, &raw_base] {
-        validate_ingest_directory(directory)?;
-    }
-
-    let mut visited = 0_usize;
-    let mut total_bytes = 0_u64;
-    let mut removed = 0_u64;
-    let entries = fs::read_dir(&raw_base).kio_io(&raw_base)?;
-    for entry in entries {
-        let entry = entry.kio_io(&raw_base)?;
-        visited = visited.saturating_add(1);
-        if visited > MAX_RAW_DIRECTORY_ENTRIES {
-            return Err(orphan_raw_ingest_error(
-                &raw_base,
-                "raw object directory exceeds the orphan-cleanup entry limit",
-            ));
-        }
-        if !entry
-            .file_name()
-            .as_encoded_bytes()
-            .starts_with(b".ingest-")
-        {
-            continue;
-        }
-
-        let path = entry.path();
-        let listed = fs::symlink_metadata(&path).kio_io(&path)?;
-        if listed.file_type().is_symlink()
-            || !listed.file_type().is_file()
-            || listed.len() > MAX_RAW_OBJECT_BYTES
-        {
-            return Err(orphan_raw_ingest_error(
-                &path,
-                "raw-ingest orphan is not a bounded regular file",
-            ));
-        }
-        crate::platform::scope_semantics::validate_orphan_file_native(&path, &listed)?;
-
-        let opened = open_scope_file_nofollow(&path)?;
-        let opened_metadata = opened.metadata().kio_io(&path)?;
-        if opened_metadata.len() != listed.len() || opened_metadata.len() > MAX_RAW_OBJECT_BYTES {
-            return Err(orphan_raw_ingest_error(
-                &path,
-                "raw-ingest orphan changed while it was opened",
-            ));
-        }
-        total_bytes = total_bytes
-            .checked_add(opened_metadata.len())
-            .ok_or_else(|| {
-                orphan_raw_ingest_error(&raw_base, "raw-ingest orphan byte count overflow")
-            })?;
-        if total_bytes > MAX_ORPHAN_BYTES {
-            return Err(orphan_raw_ingest_error(
-                &raw_base,
-                "raw-ingest orphans exceed the aggregate cleanup byte limit",
-            ));
-        }
-        drop(opened);
-        fs::remove_file(&path).kio_io(&path)?;
-        removed = removed.saturating_add(1);
-    }
-    if removed > 0
-        && let Ok(directory) = File::open(&raw_base)
-    {
-        let _ = directory.sync_all();
-    }
-    Ok(removed)
-}
-
-fn validate_ingest_directory(path: &Path) -> Result<()> {
-    let metadata = fs::symlink_metadata(path).kio_io(path)?;
-    if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
-        return Err(orphan_raw_ingest_error(
-            path,
-            "raw-ingest namespace ancestor is not a real directory",
-        ));
-    }
-    crate::platform::scope_semantics::validate_ingest_directory_native(path)?;
-    Ok(())
-}
-
-pub(crate) fn orphan_raw_ingest_error(path: &Path, message: &str) -> KioError {
-    KioError::new(
-        "KIO-E-STORE-CORRUPT-001",
-        message,
-        json!({ "path": path }),
-        ExitCode::PermanentFailure,
-    )
-}
-
 /// U19/LC22: a public tombstone (or fsck-only erase receipt) no longer
 /// permanently rejects identical-byte re-ingest — that block is reversed into
 /// the resurrection flow (retire-on-republish, see
@@ -1535,17 +1354,41 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn scope_input_oversized(file_name: &str, limits: ArchiveLimits, actual: u64) -> KioError {
-    KioError::new(
-        "KIO-E-SCOPE-INPUT-OVERSIZED-001",
-        "scope input exceeds the core archive byte budget",
-        json!({
-            "path": file_name,
-            "actual_bytes": actual,
-            "max_file_bytes": limits.max_file_bytes,
-            "max_scope_bytes": limits.max_scope_bytes,
-        }),
-        ExitCode::PermanentFailure,
+    archive_budget_error(
+        file_name,
+        crate::error::Resource::RawBytes,
+        limits.max_file_bytes,
+        actual,
     )
+}
+
+fn scope_total_oversized(file_name: &str, limits: ArchiveLimits, actual: u64) -> KioError {
+    archive_budget_error(
+        file_name,
+        crate::error::Resource::AggregateBytes,
+        limits.max_scope_bytes,
+        actual,
+    )
+}
+
+fn archive_budget_error(
+    file_name: &str,
+    resource: crate::error::Resource,
+    limit: u64,
+    actual: u64,
+) -> KioError {
+    crate::error::ResourceLimit {
+        resource,
+        stage: "raw_archive".into(),
+        limit: Some(limit),
+        observed: Some(actual),
+        resource_tier: None,
+    }
+    .into_error(format!(
+        "not saved: {file_name}: archive byte budget exceeded"
+    ))
+    .with_context_field("path", json!(file_name))
+    .with_context_field("saved", json!(false))
 }
 
 fn scope_tree_entries_oversized(observed: usize) -> KioError {
@@ -2077,13 +1920,12 @@ mod tests {
         )
     }
     use super::{
-        ArchiveLimits, DEFAULT_MAX_ARCHIVE_FILE_BYTES, MAX_TREE_ENTRIES, PendingNormalizeRef,
-        RELEASED_LOCK_PID, Repository, StoreLock, append_jsonl_rotating, civil_from_days,
-        format_unix_seconds, format_utc_seconds, open_scope_file_nofollow, parse_utc_seconds,
-        prune_rotated_logs, publish_network_approval, read_adapter_lane, read_logs_retention_days,
-        read_network_approval_pending, read_network_approvals, redact_context,
-        redact_message_paths, revoke_network_approval, rotate_stale_log,
-        write_network_approval_pending,
+        ArchiveLimits, MAX_TREE_ENTRIES, PendingNormalizeRef, RELEASED_LOCK_PID, Repository,
+        StoreLock, append_jsonl_rotating, civil_from_days, format_unix_seconds, format_utc_seconds,
+        open_scope_file_nofollow, parse_utc_seconds, prune_rotated_logs, publish_network_approval,
+        read_adapter_lane, read_logs_retention_days, read_network_approval_pending,
+        read_network_approvals, redact_context, redact_message_paths, revoke_network_approval,
+        rotate_stale_log, write_network_approval_pending,
     };
     use super::{enforce_config_semantics, enforce_scope_config_semantics};
     use crate::cas::canonical_json_bytes;
@@ -4094,105 +3936,108 @@ mod tests {
     }
 
     #[test]
+    fn st04_archive_defaults_have_no_product_byte_ceiling() {
+        assert_eq!(
+            ArchiveLimits::default(),
+            ArchiveLimits::new(u64::MAX, u64::MAX)
+        );
+        assert_eq!(ObjectKind::Raw.max_bytes(), u64::MAX);
+    }
+
+    #[test]
     fn cand_019_archive_limits_accept_exact_and_reject_plus_one_and_aggregate() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
-        let empty_paths = BTreeSet::new();
-        let empty_normalize = BTreeMap::new();
-        let limit = 64 * 1024;
-        fs::write(dir.path().join("exact.bin"), vec![b'x'; limit]).unwrap();
-        repo.build_working_tree_with_limits(
-            false,
-            &empty_paths,
-            &empty_normalize,
-            ArchiveLimits::new(limit as u64, limit as u64),
-        )
-        .unwrap();
-
-        fs::write(dir.path().join("exact.bin"), vec![b'x'; limit + 1]).unwrap();
-        let error = repo
-            .build_working_tree_with_limits(
-                false,
-                &empty_paths,
-                &empty_normalize,
-                ArchiveLimits::new(limit as u64, (2 * limit) as u64),
-            )
-            .unwrap_err();
-        assert_eq!(error.error_code(), "KIO-E-SCOPE-INPUT-OVERSIZED-001");
-
-        fs::write(dir.path().join("exact.bin"), vec![b'x'; 40 * 1024]).unwrap();
-        fs::write(dir.path().join("second.bin"), vec![b'y'; 40 * 1024]).unwrap();
-        let error = repo
-            .build_working_tree_with_limits(
-                false,
-                &empty_paths,
-                &empty_normalize,
-                ArchiveLimits::new(limit as u64, limit as u64),
-            )
-            .unwrap_err();
-        assert_eq!(error.error_code(), "KIO-E-SCOPE-INPUT-OVERSIZED-001");
-    }
-
-    #[test]
-    fn cand_019_oversized_sparse_snapshot_does_not_advance_head_or_write_raw() {
-        let dir = tempfile::tempdir().unwrap();
-        let repo = Repository::init(dir.path()).unwrap();
-        let path = dir.path().join("oversized.bin");
-        let file = fs::File::create(&path).unwrap();
-        file.set_len(DEFAULT_MAX_ARCHIVE_FILE_BYTES + 1).unwrap();
-        drop(file);
-        let head_before = fs::read(repo.kio_dir().join("HEAD")).unwrap();
-
-        let error = repo.snapshot(Some("oversized"), None).unwrap_err();
-        assert_eq!(error.error_code(), "KIO-E-SCOPE-INPUT-OVERSIZED-001");
-        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head_before);
+        fs::write(dir.path().join("exact.bin"), b"abcd").unwrap();
+        let repo = repo.with_archive_limits(ArchiveLimits::new(4, 4));
+        let first = repo.snapshot(Some("exact"), None).unwrap();
+        let head = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+        fs::write(dir.path().join("exact.bin"), b"abcde").unwrap();
+        let error = repo.snapshot(None, None).unwrap_err();
+        assert_eq!(error.resource_limit().unwrap().limit, Some(4));
+        assert_eq!(error.context()["path"], "exact.bin");
+        assert_eq!(error.context()["saved"], false);
+        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head);
+        assert_eq!(repo.status().unwrap().files.len(), 1);
+        fs::write(dir.path().join("exact.bin"), b"ab").unwrap();
+        fs::write(dir.path().join("second.bin"), b"cd").unwrap();
+        repo.snapshot(None, None).unwrap();
+        let head = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+        fs::write(dir.path().join("second.bin"), b"cde").unwrap();
+        let error = repo.snapshot(None, None).unwrap_err();
         assert_eq!(
-            fs::read_dir(repo.kio_dir().join("objects/raw"))
-                .unwrap()
-                .count(),
-            0
+            error.resource_limit().unwrap().resource,
+            crate::error::Resource::AggregateBytes
         );
+        assert_eq!(error.resource_limit().unwrap().observed, Some(5));
+        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head);
+        assert_eq!(repo.status().unwrap().files.len(), 2);
+        assert!(repo.read_tree(&first.tree_hash).is_ok());
     }
 
     #[test]
-    fn ct4_raw_archive_removes_crash_orphans_before_new_staging() {
+    fn st04_storage_exhaustion_preserves_head_and_marks_path_unsaved() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
-        let orphan = repo.kio_dir().join("objects/raw/.ingest-crashed-writer");
-        fs::write(&orphan, b"stale private transaction bytes").unwrap();
-        fs::write(dir.path().join("doc.md"), b"new authoritative bytes").unwrap();
+        fs::write(dir.path().join("doc.md"), b"first").unwrap();
+        repo.snapshot(None, None).unwrap();
+        let head = fs::read(repo.kio_dir().join("HEAD")).unwrap();
+        fs::write(dir.path().join("doc.md"), b"second").unwrap();
+        crate::cas::fail_next_raw_write();
+        let error = repo.snapshot(None, None).unwrap_err();
+        assert_eq!(
+            error.resource_limit().unwrap().resource,
+            crate::error::Resource::Storage
+        );
+        assert_eq!(error.context()["path"], "doc.md");
+        assert_eq!(error.context()["saved"], false);
+        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head);
+        assert!(repo.status().unwrap().stage_residues.is_empty());
+    }
 
-        let outcome = repo.snapshot(Some("cleanup and archive"), None).unwrap();
-        assert!(!orphan.exists());
+    #[test]
+    #[ignore = "streams more than 4 GiB; run explicitly for ST04 acceptance"]
+    fn st04_large_raw_archive_and_existing_cas_are_streamed() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let size = 2 * 1024 * 1024 * 1024 + 1;
+        for name in ["one.bin", "two.bin"] {
+            fs::File::create(dir.path().join(name))
+                .unwrap()
+                .set_len(size)
+                .unwrap();
+        }
+        let outcome = repo.snapshot(None, None).unwrap();
         let tree = repo.read_tree(&outcome.tree_hash).unwrap();
-        let raw_hash = tree
-            .entries
-            .iter()
-            .find(|entry| entry.path == "doc.md")
-            .unwrap()
-            .raw_hash
-            .clone();
-        ObjectStore::new(repo.kio_dir())
-            .inspect_object(ObjectKind::Raw, &raw_hash)
-            .unwrap();
+        assert_eq!(tree.entries.len(), 2);
+        assert_eq!(tree.entries[0].raw_hash, tree.entries[1].raw_hash);
+        assert_eq!(
+            repo.object_store()
+                .inspect_object(ObjectKind::Raw, &tree.entries[0].raw_hash)
+                .unwrap()
+                .size_bytes,
+            size
+        );
+        assert_eq!(repo.status().unwrap().files.len(), 2);
+        assert!(repo.snapshot(None, None).unwrap().noop);
     }
 
     #[test]
-    fn ct4_raw_archive_rejects_oversized_orphan_before_publication() {
+    fn st04_unidentified_stage_is_preserved_and_visible_in_status() {
         let dir = tempfile::tempdir().unwrap();
         let repo = Repository::init(dir.path()).unwrap();
-        let orphan = repo.kio_dir().join("objects/raw/.ingest-oversized");
-        fs::File::create(&orphan)
-            .unwrap()
-            .set_len(crate::cas::MAX_RAW_OBJECT_BYTES + 1)
-            .unwrap();
-        fs::write(dir.path().join("doc.md"), b"must not publish").unwrap();
-        let head_before = fs::read(repo.kio_dir().join("HEAD")).unwrap();
-
-        let error = repo.snapshot(Some("blocked cleanup"), None).unwrap_err();
-        assert_eq!(error.error_code(), "KIO-E-STORE-CORRUPT-001");
-        assert!(orphan.exists());
-        assert_eq!(fs::read(repo.kio_dir().join("HEAD")).unwrap(), head_before);
+        let residue = repo.kio_dir().join("objects/raw/.ingest-unknown");
+        fs::write(&residue, b"not deletion authority").unwrap();
+        fs::write(dir.path().join("doc.md"), b"new raw").unwrap();
+        repo.snapshot(None, None).unwrap();
+        let status = repo.status().unwrap();
+        assert!(residue.exists());
+        assert!(
+            status
+                .stage_residues
+                .iter()
+                .any(|entry| entry.path.ends_with(".ingest-unknown"))
+        );
     }
 
     #[test]

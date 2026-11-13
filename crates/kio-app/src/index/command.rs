@@ -491,6 +491,13 @@ fn run_index_for_repo_inner(
     discover_children: bool,
     invocation_state: &mut IndexInvocationState,
 ) -> Result<IndexExecution> {
+    let archive_repo =
+        repo.clone()
+            .with_archive_limits(kio_core::scope::ArchiveLimits::from_options(
+                args.max_file_bytes,
+                args.max_total_bytes,
+            )?);
+    let repo = &archive_repo;
     let adapter_settings = ctx.settings;
 
     if args.online && args.offline {
@@ -686,6 +693,15 @@ fn run_index_for_repo_inner(
     )
     .map_err(pipeline_to_kio)?;
 
+    let excluded = preview
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.ignored)
+        .map(|candidate| candidate.input_path.clone())
+        .collect::<BTreeSet<_>>();
+    let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&preview);
+    repo.validate_archive_budget(&excluded, &explicitly_allowed_tier_a)?;
+
     // Validated management membership is the continuing local scan grant.
     // External adapter consent is evaluated separately below; absence of a
     // network grant must not prevent local indexing of a newly enrolled child.
@@ -788,13 +804,6 @@ fn run_index_for_repo_inner(
     // index neither demotes the file to the deterministic baseline nor creates a
     // second promotion commit.
     apply_online_promotion_to_index(adapter_settings, repo, &mut index_result)?;
-    let excluded = preview
-        .candidates
-        .iter()
-        .filter(|candidate| candidate.ignored)
-        .map(|candidate| candidate.input_path.clone())
-        .collect::<BTreeSet<_>>();
-    let explicitly_allowed_tier_a = explicitly_allowed_tier_a_paths(&preview);
     let outcome = repo.auto_snapshot_with_bound_normalize(
         Some("kio index auto snapshot"),
         None,

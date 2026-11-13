@@ -120,6 +120,7 @@ pub(crate) fn stage_io(message: &str, error: std::io::Error) -> crate::KioError 
 
 /// One create-only private file, written with bounded caller-supplied chunks.
 /// There is no implicit deletion on Drop and no payload-sized allocation.
+#[derive(Debug)]
 pub struct StageWriter {
     directory: StoreDirectory,
     leaf: PathBuf,
@@ -195,10 +196,7 @@ impl StageWriter {
             .map_err(|e| stage_io("cannot sync private stage", e))
     }
 
-    // Temporarily allow dead code until S1–S3/P0/L2/J1 adopt this method.
-    // Small atomic writes deliberately keep their physical-only implementation.
-    #[allow(dead_code)]
-    pub(crate) fn set_readonly(&self) -> Result<()> {
+    pub fn set_readonly(&self) -> Result<()> {
         let mut permissions = self
             .file
             .metadata()

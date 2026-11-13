@@ -36,8 +36,8 @@ use std::path::{Path, PathBuf};
 use crate::commands::{EvidenceArgs, EvidenceCommand, EvidenceVerifyArgs};
 
 use kio_core::cas::{
-    AccountedReadError, ChunkObject, ContentObjectKind, EmbeddingObject, MAX_RAW_OBJECT_BYTES,
-    ObjectKind, ObjectStore, canonical_json_bytes, hash_bytes, is_hash, read_bounded_regular_file,
+    AccountedReadError, ChunkObject, ContentObjectKind, EmbeddingObject, ObjectKind, ObjectStore,
+    canonical_json_bytes, hash_bytes, is_hash, read_bounded_regular_file,
 };
 use kio_core::dag::{CommitObject, NormalizeRef, TreeObject};
 use kio_core::gc::{GcSweepSession, read_active_marker_with_control, read_shallow_receipts};
@@ -347,6 +347,14 @@ fn verify_objects_with_limits(
         max_verified_bytes: limits.max_verified_bytes,
         ..State::default()
     };
+    for residue in store.inspect_raw_stages()? {
+        state.finding(
+            "raw_stage_residue",
+            "",
+            &format!("{}: {}", residue.path, residue.reason),
+            &[],
+        );
+    }
     match purge.read_journal() {
         Ok(Some(_)) => {
             state.finding("purge_incomplete", "", "active purge journal", &[]);
@@ -2577,7 +2585,7 @@ enum RawRecovery {
 fn recover_raw(path: &Path, expected_hash: &str, remaining_bytes: u64) -> Result<RawRecovery> {
     let bytes = match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.len() > remaining_bytes => return Ok(RawRecovery::LimitExceeded),
-        Ok(_) => match read_bounded_regular_file(path, MAX_RAW_OBJECT_BYTES.min(remaining_bytes)) {
+        Ok(_) => match read_bounded_regular_file(path, remaining_bytes) {
             Ok(bytes) => bytes,
             Err(error) if error.error_code() == "KIO-E-STORE-OBJECT-OVERSIZED-001" => {
                 return Ok(RawRecovery::LimitExceeded);
@@ -2598,6 +2606,24 @@ fn recover_raw(path: &Path, expected_hash: &str, remaining_bytes: u64) -> Result
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn st04_verify_objects_reports_unidentified_stage_without_removing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = Repository::init(dir.path()).unwrap();
+        let path = repo.kio_dir().join("objects/raw/.ingest-unknown");
+        fs::write(&path, b"unidentified residue").unwrap();
+        let report = verify_objects(&repo).unwrap();
+        assert!(
+            report
+                .remaining_findings
+                .iter()
+                .any(|finding| finding.kind == "raw_stage_residue"
+                    && finding.reason.contains(".ingest-unknown"))
+        );
+        assert!(path.exists());
+    }
+
     use kio_core::dag::{
         CommitStats, CommitType, DEFAULT_CHUNKING_MAX_CHARS, DEFAULT_CHUNKING_STRATEGY, TreeEntry,
         chunking_config_hash,

@@ -159,6 +159,10 @@ pub(crate) enum SnapshotAction {
 }
 #[derive(Debug, Args)]
 pub(crate) struct SnapshotCreateArgs {
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) max_file_bytes: Option<u64>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) max_total_bytes: Option<u64>,
     #[arg(short, long)]
     pub(crate) message: Option<String>,
 }
@@ -226,6 +230,10 @@ pub(crate) struct GcArgs {
 }
 #[derive(Debug, Clone, Args)]
 pub(crate) struct IndexArgs {
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) max_file_bytes: Option<u64>,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub(crate) max_total_bytes: Option<u64>,
     #[arg(long)]
     pub(crate) preview: bool,
     #[arg(long)]
@@ -638,7 +646,7 @@ impl From<WatchArgs> for app::WatchArgs {
         }
     }
 }
-plain_from!(SnapshotCreateArgs => SnapshotCreateArgs { message });
+plain_from!(SnapshotCreateArgs => SnapshotCreateArgs { max_file_bytes, max_total_bytes, message });
 plain_from!(LogArgs => LogArgs { at, since });
 plain_from!(DiffArgs => DiffArgs { a, b });
 plain_from!(InspectArgs => InspectArgs { hash });
@@ -646,7 +654,7 @@ plain_from!(TagArgs => TagArgs { name, commit, delete });
 plain_from!(ExportArgs => ExportArgs { source, to, force, yes });
 plain_from!(RestoreArgs => RestoreArgs { source, paths, delete_missing, expected_head, preview, message });
 plain_from!(GcArgs => GcArgs { dry_run, yes, prune_unreachable });
-plain_from!(IndexArgs => IndexArgs { preview, yes, online, offline, realtime, batch });
+plain_from!(IndexArgs => IndexArgs { max_file_bytes, max_total_bytes, preview, yes, online, offline, realtime, batch });
 plain_from!(ResumeArgs => ResumeArgs { recheck_budget, override_budget, online, offline, realtime, batch });
 plain_from!(RetryArgs => RetryArgs { reset_violations, resend_unknown, yes, online, offline, realtime, batch });
 plain_from!(AbandonArgs => AbandonArgs { selector, yes });

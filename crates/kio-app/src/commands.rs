@@ -103,6 +103,8 @@ pub enum SnapshotAction {
 
 #[derive(Debug, Clone)]
 pub struct SnapshotCreateArgs {
+    pub max_file_bytes: Option<u64>,
+    pub max_total_bytes: Option<u64>,
     pub message: Option<String>,
 }
 
@@ -158,6 +160,8 @@ pub struct GcArgs {
 
 #[derive(Debug, Clone)]
 pub struct IndexArgs {
+    pub max_file_bytes: Option<u64>,
+    pub max_total_bytes: Option<u64>,
     pub preview: bool,
     pub yes: bool,
     pub online: bool,

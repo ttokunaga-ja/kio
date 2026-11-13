@@ -20,7 +20,7 @@ pub(crate) fn retain_repair_source(source: &mut Option<File>) -> RepairSource<'_
             .expect("repair source is retained before closure capture"),
     )
 }
-pub(crate) fn prepare_bound_raw_stage(_source: &mut Option<File>) {}
+
 pub(crate) fn validate_bound_directory_native(_directory: &File, _label: &Path) -> Result<()> {
     Ok(())
 }

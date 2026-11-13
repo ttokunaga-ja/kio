@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use cap_primitives::fs as cap_fs;
-use kio_core::cas::{MAX_RAW_OBJECT_BYTES, ObjectKind, ObjectStore, hash_bytes, is_hash};
+use kio_core::cas::{ObjectKind, ObjectStore, hash_bytes, is_hash};
 use kio_core::dag::{CommitType, TreeEntry};
 use kio_core::gc::ensure_no_active_sweep_with_control;
 use kio_core::history::HistoryReader;
@@ -2073,7 +2073,7 @@ fn verify_open_file(
     let metadata = cap_fs::Metadata::from_file(file)
         .map_err(|error| KioError::io(error.to_string(), display.display().to_string()))?;
     validate_replaceable_metadata(display, &metadata)?;
-    if metadata.len() != expected_size || metadata.len() > MAX_RAW_OBJECT_BYTES {
+    if metadata.len() != expected_size {
         return Err(KioError::new(
             "KIO-E-STORE-CORRUPT-001",
             "exported file size does not match its raw identity",
@@ -2099,10 +2099,10 @@ fn verify_open_file(
             break;
         }
         total = total.saturating_add(count as u64);
-        if total > MAX_RAW_OBJECT_BYTES {
+        if total > expected_size {
             return Err(KioError::new(
                 "KIO-E-STORE-CORRUPT-001",
-                "exported file exceeds the raw object limit",
+                "exported file exceeds its expected size",
                 json!({ "path": display }),
                 ExitCode::PermanentFailure,
             ));

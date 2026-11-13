@@ -187,6 +187,18 @@ impl ObjectStore {
             .stage_raw_from_reader(reader, max_bytes)
     }
 
+    pub fn inspect_raw_stages(&self) -> Result<Vec<RawStageResidue>> {
+        if let Some(bound) = &self.bound {
+            return bound.inspect_raw_stages(false);
+        }
+        let directory = crate::store_dir::StoreDirectory::open_with_control(
+            self.ambient_kio_dir()?,
+            self.control.clone(),
+        )?;
+        Self::from_bound_kio_with_control(&directory.root_handle(), self.control.clone())?
+            .inspect_raw_stages()
+    }
+
     pub fn cleanup_bound_raw_stages(&self) -> Result<()> {
         self.bound
             .as_ref()
@@ -879,64 +891,15 @@ impl ObjectStore {
         if let Some(bound) = &self.bound {
             return bound.write_raw_reader(reader, max_bytes);
         }
-        let max_bytes = max_bytes.min(MAX_RAW_OBJECT_BYTES);
-        let raw_base = self
-            .ambient_kio_dir()?
-            .join("objects")
-            .join(ObjectKind::Raw.directory());
-        self.ensure_kind_base(ObjectKind::Raw)?;
-        let (temp_path, mut temp, temp_parent) = create_private_temp(&raw_base)?;
-        let result = (|| -> Result<(String, u64)> {
-            let mut hasher = Sha256::new();
-            let mut buffer = [0_u8; CAS_STREAM_BUFFER_BYTES];
-            let mut total = 0_u64;
-            loop {
-                let read_cap = max_bytes
-                    .saturating_sub(total)
-                    .saturating_add(1)
-                    .min(buffer.len() as u64) as usize;
-                let count = reader.read(&mut buffer[..read_cap]).kio_io(&temp_path)?;
-                if count == 0 {
-                    break;
-                }
-                total = total
-                    .checked_add(count as u64)
-                    .ok_or_else(|| object_size_error(ObjectKind::Raw, max_bytes, u64::MAX))?;
-                if total > max_bytes {
-                    return Err(object_size_error(ObjectKind::Raw, max_bytes, total));
-                }
-                hasher.update(&buffer[..count]);
-                temp.write_all(&buffer[..count]).kio_io(&temp_path)?;
-            }
-            temp.sync_all().kio_io(&temp_path)?;
-            drop(temp);
-
-            let hash = format!("sha256:{}", lower_hex(&hasher.finalize()));
-            let path = self.object_path(ObjectKind::Raw, &hash)?;
-            self.ensure_object_parent(ObjectKind::Raw, &hash)?;
-            if let Some(existing) = self.existing_object_path(ObjectKind::Raw, &hash)? {
-                verify_existing_matches_file(&existing, &temp_path, &hash, total)?;
-                remove_private_temp(&temp_parent, &temp_path)?;
-                return Ok((hash, total));
-            }
-
-            publish_temp_object(&temp_parent, &temp_path, &path, &hash, total, None)?;
-            let Some(published) = self.existing_object_path(ObjectKind::Raw, &hash)? else {
-                return Err(KioError::not_found(&hash));
-            };
-            read_verified_object(
-                &CasReadAccess::Unmetered,
-                &published,
-                ObjectKind::Raw,
-                &hash,
-                false,
-            )?;
-            Ok((hash, total))
-        })();
-        if result.is_err() {
-            let _ = remove_private_temp(&temp_parent, &temp_path);
+        for kind in [ObjectKind::Raw, ObjectKind::Tree, ObjectKind::Commit] {
+            self.ensure_kind_base(kind)?;
         }
-        result
+        let directory = crate::store_dir::StoreDirectory::open_with_control(
+            self.ambient_kio_dir()?,
+            self.control.clone(),
+        )?;
+        Self::from_bound_kio_with_control(&directory.root_handle(), self.control.clone())?
+            .write_raw_reader(reader, max_bytes)
     }
 
     pub fn read_by_hash(&self, hash: &str) -> Result<StoredObject> {

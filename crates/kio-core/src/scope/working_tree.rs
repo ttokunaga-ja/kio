@@ -1,6 +1,22 @@
 use super::*;
 
 impl Repository {
+    /// Check invocation archive budgets before preprocessing can save any raw.
+    /// Publication repeats this check against the final working-tree state.
+    pub fn validate_archive_budget(
+        &self,
+        excluded_paths: &BTreeSet<String>,
+        explicitly_allowed_tier_a_paths: &BTreeSet<String>,
+    ) -> Result<()> {
+        self.working_file_candidates(
+            excluded_paths,
+            explicitly_allowed_tier_a_paths,
+            true,
+            self.archive_limits,
+        )
+        .map(|_| ())
+    }
+
     pub fn build_working_tree(&self, store_raw: bool) -> Result<WorkingTree> {
         self.build_working_tree_filtered(store_raw, &BTreeSet::new())
     }
@@ -61,11 +77,11 @@ impl Repository {
         explicitly_allowed_tier_a_paths: &BTreeSet<String>,
         limits: ArchiveLimits,
     ) -> Result<WorkingTree> {
-        if limits.max_file_bytes > MAX_RAW_OBJECT_BYTES {
-            return Err(KioError::invalid_usage(
-                "archive max_file_bytes exceeds the raw CAS object limit",
-            ));
-        }
+        let limits = if store_raw {
+            limits
+        } else {
+            ArchiveLimits::default()
+        };
         let chunking_config_hash = self.effective_chunking_config_hash()?;
 
         let candidates = self.working_file_candidates(
@@ -102,7 +118,7 @@ impl Repository {
             let remaining = limits
                 .max_scope_bytes
                 .checked_sub(consumed_scope_bytes)
-                .ok_or_else(|| scope_input_oversized(&candidate.file_name, limits, u64::MAX))?;
+                .ok_or_else(|| scope_total_oversized(&candidate.file_name, limits, u64::MAX))?;
             let allowed = limits.max_file_bytes.min(remaining);
             if metadata.len() > allowed {
                 return Err(scope_input_oversized(
@@ -123,7 +139,7 @@ impl Repository {
             }
             consumed_scope_bytes = consumed_scope_bytes
                 .checked_add(consumed)
-                .ok_or_else(|| scope_input_oversized(&candidate.file_name, limits, u64::MAX))?;
+                .ok_or_else(|| scope_total_oversized(&candidate.file_name, limits, u64::MAX))?;
             let mut tree_entry = TreeEntry::raw_file(candidate.file_name.clone(), raw_hash)?;
             if let Some(pending) = normalize_by_path.get(&candidate.file_name) {
                 if pending.expected_raw_hash == tree_entry.raw_hash {
@@ -168,7 +184,7 @@ impl Repository {
                 let remaining = limits
                     .max_scope_bytes
                     .checked_sub(consumed_scope_bytes)
-                    .ok_or_else(|| scope_input_oversized(&candidate.file_name, limits, u64::MAX))?;
+                    .ok_or_else(|| scope_total_oversized(&candidate.file_name, limits, u64::MAX))?;
                 let allowed = limits.max_file_bytes.min(remaining);
                 let mut source = open_working_file_candidate(&candidate, self.control())?;
                 let before = source.metadata().kio_io(&candidate.path)?;
@@ -180,7 +196,14 @@ impl Repository {
                         before.len(),
                     ));
                 }
-                let stage = self.store.stage_raw_from_reader(&mut source, allowed)?;
+                let stage = self
+                    .store
+                    .stage_raw_from_reader(&mut source, allowed)
+                    .map_err(|error| {
+                        error
+                            .with_context_field("path", json!(candidate.file_name))
+                            .with_context_field("saved", json!(false))
+                    })?;
                 let after = source.metadata().kio_io(&candidate.path)?;
                 if after.len() != stage.size_bytes()
                     || before.len() != after.len()
@@ -190,7 +213,7 @@ impl Repository {
                 }
                 consumed_scope_bytes = consumed_scope_bytes
                     .checked_add(stage.size_bytes())
-                    .ok_or_else(|| scope_input_oversized(&candidate.file_name, limits, u64::MAX))?;
+                    .ok_or_else(|| scope_total_oversized(&candidate.file_name, limits, u64::MAX))?;
                 staged.push((candidate, source, before, identity, stage));
             }
             let actual = staged
@@ -260,33 +283,42 @@ impl Repository {
                 tree: build_tree_with_chunking_config(entries, chunking_config_hash.to_owned())?,
             });
         }
-        // The caller holds `.kio/.lock`, so no live Kio writer can own an
-        // `.ingest-*` leaf. Remove crash-orphaned raw bytes before creating any
-        // new staging file; otherwise a tombstoned re-ingest killed before its
-        // authorization check could remain in KIO-managed storage indefinitely.
-        // Scheduled publication has retained object descriptors but must not
-        // follow the ordinary path-based crash-temp scavenger: a same-UID
-        // descendant replacement must be a fail-closed no-op, never a cleanup
-        // of the replacement target. Its bound ObjectStore owns raw CAS writes.
-        if !scheduled_bound {
-            cleanup_orphan_raw_ingest_temps(&self.kio_dir)?;
-        }
+        self.store.cleanup_bound_raw_stages()?;
         let mut staged = Vec::with_capacity(candidates.len());
         let mut consumed_scope_bytes = 0_u64;
         for candidate in candidates {
             let remaining = limits
                 .max_scope_bytes
                 .checked_sub(consumed_scope_bytes)
-                .ok_or_else(|| scope_input_oversized(&candidate.file_name, limits, u64::MAX))?;
+                .ok_or_else(|| scope_total_oversized(&candidate.file_name, limits, u64::MAX))?;
             let allowed = limits.max_file_bytes.min(remaining);
-            let staged_file =
-                stage_scope_file(&self.kio_dir, candidate, allowed, limits, self.control())?;
-            consumed_scope_bytes = consumed_scope_bytes
-                .checked_add(staged_file.size_bytes)
-                .ok_or_else(|| {
-                    scope_input_oversized(&staged_file.candidate.file_name, limits, u64::MAX)
+            let mut source = open_working_file_candidate(&candidate, self.control())?;
+            let before = source.metadata().kio_io(&candidate.path)?;
+            if before.len() > allowed {
+                return Err(scope_input_oversized(
+                    &candidate.file_name,
+                    limits,
+                    before.len(),
+                ));
+            }
+            let identity = scheduled_source_identity(&source)?;
+            let stage = self
+                .store
+                .stage_raw_from_reader(&mut source, allowed)
+                .map_err(|error| {
+                    error
+                        .with_context_field("path", json!(candidate.file_name))
+                        .with_context_field("saved", json!(false))
                 })?;
-            staged.push(staged_file);
+            if source.metadata().kio_io(&candidate.path)?.len() != before.len()
+                || scheduled_source_identity(&source)? != identity
+            {
+                return Err(scope_file_changed(&candidate.file_name));
+            }
+            consumed_scope_bytes = consumed_scope_bytes
+                .checked_add(stage.size_bytes())
+                .ok_or_else(|| scope_total_oversized(&candidate.file_name, limits, u64::MAX))?;
+            staged.push((candidate, stage));
         }
 
         // A scheduled decision is authorized by a descriptor-bound raw-hash
@@ -298,7 +330,7 @@ impl Repository {
         if let Some(expected) = expected_raw_by_path {
             let actual = staged
                 .iter()
-                .map(|file| (file.candidate.file_name.clone(), file.raw_hash.clone()))
+                .map(|(file, stage)| (file.file_name.clone(), stage.raw_hash().to_owned()))
                 .collect::<BTreeMap<_, _>>();
             if &actual != expected {
                 drop(staged);
@@ -359,36 +391,27 @@ impl Repository {
         // remains to block it.
         if !scheduled_bound {
             let purge = self.purge_state()?;
-            for file in &staged {
-                if purge_self_targets.contains(&file.raw_hash) {
+            for (_, stage) in &staged {
+                if purge_self_targets.contains(stage.raw_hash()) {
                     continue;
                 }
-                ensure_raw_publication_allowed(&purge, &file.raw_hash)?;
+                ensure_raw_publication_allowed(&purge, stage.raw_hash())?;
             }
         }
 
         let mut entries = Vec::with_capacity(staged.len());
-        for mut staged_file in staged {
-            if purge_self_targets.contains(&staged_file.raw_hash) {
+        for (candidate, stage) in staged {
+            if purge_self_targets.contains(stage.raw_hash()) {
                 continue;
             }
-            staged_file
-                .file
-                .seek(SeekFrom::Start(0))
-                .kio_io(&staged_file.temp_path)?;
-            let (published_hash, published_size) = self
-                .store
-                .write_raw_reader(&mut staged_file.file, staged_file.size_bytes)?;
-            if published_hash != staged_file.raw_hash || published_size != staged_file.size_bytes {
-                return Err(scope_file_changed(&staged_file.candidate.file_name));
-            }
-            let mut tree_entry =
-                TreeEntry::raw_file(staged_file.candidate.file_name.clone(), published_hash)?;
-            attach_pending_normalize(
-                &mut tree_entry,
-                &staged_file.candidate.file_name,
-                normalize_by_path,
-            );
+            let (published_hash, _) =
+                self.store.publish_bound_raw_stage(stage).map_err(|error| {
+                    error
+                        .with_context_field("path", json!(candidate.file_name))
+                        .with_context_field("saved", json!(false))
+                })?;
+            let mut tree_entry = TreeEntry::raw_file(candidate.file_name.clone(), published_hash)?;
+            attach_pending_normalize(&mut tree_entry, &candidate.file_name, normalize_by_path);
             tree_entry.validate()?;
             entries.push(tree_entry);
         }
@@ -463,9 +486,9 @@ impl Repository {
                 }
                 declared_scope_bytes = declared_scope_bytes
                     .checked_add(metadata.len())
-                    .ok_or_else(|| scope_input_oversized(&file_name, limits, u64::MAX))?;
+                    .ok_or_else(|| scope_total_oversized(&file_name, limits, u64::MAX))?;
                 if declared_scope_bytes > limits.max_scope_bytes {
-                    return Err(scope_input_oversized(
+                    return Err(scope_total_oversized(
                         &file_name,
                         limits,
                         declared_scope_bytes,
@@ -522,9 +545,9 @@ impl Repository {
             }
             declared_scope_bytes = declared_scope_bytes
                 .checked_add(metadata.len())
-                .ok_or_else(|| scope_input_oversized(&file_name, limits, u64::MAX))?;
+                .ok_or_else(|| scope_total_oversized(&file_name, limits, u64::MAX))?;
             if declared_scope_bytes > limits.max_scope_bytes {
-                return Err(scope_input_oversized(
+                return Err(scope_total_oversized(
                     &file_name,
                     limits,
                     declared_scope_bytes,
@@ -588,6 +611,7 @@ impl Repository {
             });
         }
         Ok(StatusReport {
+            stage_residues: self.store.inspect_raw_stages()?,
             files: statuses,
             head_shallow,
         })

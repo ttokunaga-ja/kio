@@ -45,3 +45,21 @@ fn resource_limit_cli_contract_keeps_exit_three_and_exact_context() {
         })
     );
 }
+
+#[test]
+fn st04_cli_archive_budgets_are_optional_positive_u64() {
+    use clap::Parser;
+    for command in [vec!["kio", "index"], vec!["kio", "snapshot", "create"]] {
+        assert!(crate::args::Cli::try_parse_from(&command).is_ok());
+        for value in ["1", "536870913", "4294967297", "18446744073709551615"] {
+            let mut args = command.clone();
+            args.extend(["--max-file-bytes", value, "--max-total-bytes", value]);
+            assert!(crate::args::Cli::try_parse_from(args).is_ok());
+        }
+        for value in ["0", "-1", "18446744073709551616"] {
+            let mut args = command.clone();
+            args.extend(["--max-file-bytes", value]);
+            assert!(crate::args::Cli::try_parse_from(args).is_err());
+        }
+    }
+}

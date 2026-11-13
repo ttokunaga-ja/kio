@@ -152,6 +152,8 @@ fn index(context: &AppContext) {
     execute(
         context,
         CommandRequest::Index(IndexArgs {
+            max_file_bytes: None,
+            max_total_bytes: None,
             preview: false,
             yes: true,
             online: false,
@@ -656,6 +658,8 @@ fn new_chunk_associations_with_cached_contexts_complete_without_execution() {
         execute(
             &context,
             CommandRequest::Index(IndexArgs {
+                max_file_bytes: None,
+                max_total_bytes: None,
                 preview: false,
                 yes: true,
                 online: false,

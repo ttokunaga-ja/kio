@@ -22,6 +22,8 @@ enum Subject {
 
 fn index() -> CommandRequest {
     CommandRequest::Index(IndexArgs {
+        max_file_bytes: None,
+        max_total_bytes: None,
         preview: false,
         yes: false,
         online: false,

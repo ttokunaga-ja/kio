@@ -10,7 +10,6 @@ use std::{
     env,
     ffi::OsString,
     fs,
-    io::Read,
     path::{Path, PathBuf},
     process::Command,
     time::Duration,
@@ -18,10 +17,7 @@ use std::{
 
 use cap_primitives::fs as cap_fs;
 use clap::{Parser, Subcommand};
-use kio_core::{
-    ExitCode,
-    cas::{MAX_RAW_OBJECT_BYTES, hash_bytes, read_bounded_regular_file},
-};
+use kio_core::{ExitCode, cas::read_bounded_regular_file};
 use kio_eval::{
     acceptance::{
         A01Options, A05Options, A06Options, A09Options, AcceptanceCase, AcceptanceLane,
@@ -1673,7 +1669,7 @@ fn verify_logs(
     problems
 }
 
-fn read_bound_regular(scope: &BoundScope, name: &std::ffi::OsStr) -> Result<Vec<u8>, AppError> {
+fn hash_bound_regular(scope: &BoundScope, name: &std::ffi::OsStr) -> Result<String, AppError> {
     let handle = scope
         .try_clone_handle()
         .map_err(|error| AppError::Input(error.to_string()))?;
@@ -1686,9 +1682,9 @@ fn read_bound_regular(scope: &BoundScope, name: &std::ffi::OsStr) -> Result<Vec<
     let metadata = file
         .metadata()
         .map_err(|error| AppError::Input(error.to_string()))?;
-    if !metadata.is_file() || metadata.len() > MAX_RAW_OBJECT_BYTES {
+    if !metadata.is_file() {
         return Err(AppError::Input(format!(
-            "unsafe or oversized corpus file: {}/{}",
+            "unsafe corpus file: {}/{}",
             scope.name(),
             name.to_string_lossy()
         )));
@@ -1704,19 +1700,26 @@ fn read_bound_regular(scope: &BoundScope, name: &std::ffi::OsStr) -> Result<Vec<
             )));
         }
     }
-    let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    file.by_ref()
-        .take(MAX_RAW_OBJECT_BYTES.saturating_add(1))
-        .read_to_end(&mut bytes)
-        .map_err(|error| AppError::Input(error.to_string()))?;
-    if bytes.len() as u64 > MAX_RAW_OBJECT_BYTES {
-        return Err(AppError::Input(format!(
-            "oversized corpus file: {}/{}",
-            scope.name(),
-            name.to_string_lossy()
-        )));
+    hash_eval_reader(&mut file)
+}
+
+fn hash_eval_reader(reader: &mut impl std::io::Read) -> Result<String, AppError> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| AppError::Input(error.to_string()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
     }
-    Ok(bytes)
+    Ok(format!(
+        "sha256:{}",
+        kio_core::cas::lower_hex(&hasher.finalize())
+    ))
 }
 
 fn tree_fingerprint(corpus: &BoundCorpus) -> Result<Vec<(String, String, String)>, AppError> {
@@ -1741,11 +1744,11 @@ fn tree_fingerprint(corpus: &BoundCorpus) -> Result<Vec<(String, String, String)
                 continue;
             }
             let name = entry.file_name();
-            let bytes = read_bound_regular(scope, &name)?;
+            let raw_hash = hash_bound_regular(scope, &name)?;
             rows.push((
                 scope.name().to_owned(),
                 name.to_string_lossy().into_owned(),
-                hash_bytes(&bytes),
+                raw_hash,
             ));
         }
     }
@@ -1854,8 +1857,17 @@ fn verify_restore(
             problems.push(format!("restore count mismatch for {}/{}", scope, file));
             continue;
         }
-        match read_bounded_regular_file(&files[0], MAX_RAW_OBJECT_BYTES)
-            .map(|bytes| hash_bytes(&bytes))
+        match kio_core::store_dir::StoreDirectory::open(
+            files[0].parent().expect("restored file parent"),
+        )
+        .and_then(|directory| {
+            directory.open_regular_read(
+                Path::new(files[0].file_name().expect("restored file leaf")),
+                u64::MAX,
+            )
+        })
+        .map_err(|error| AppError::Input(error.to_string()))
+        .and_then(|mut file| hash_eval_reader(&mut file))
         {
             Ok(actual) if actual == raw => {}
             _ => problems.push(format!("restore hash mismatch for {}/{}", scope, file)),

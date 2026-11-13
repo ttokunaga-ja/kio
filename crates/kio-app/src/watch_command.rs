@@ -263,6 +263,8 @@ impl Reconcile for LocalReconciler {
             crate::execute_watch_index(
                 &context,
                 IndexArgs {
+                    max_file_bytes: None,
+                    max_total_bytes: None,
                     preview: false,
                     yes: false,
                     online: false,

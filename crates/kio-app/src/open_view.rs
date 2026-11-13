@@ -46,7 +46,7 @@ use kio_core::KioError;
 use kio_core::Result;
 use kio_core::cas::ChunkObject;
 use kio_core::cas::ContentObjectKind;
-use kio_core::cas::MAX_RAW_OBJECT_BYTES;
+use kio_core::cas::MAX_CONTENT_OBJECT_BYTES;
 use kio_core::cas::fanout_path;
 use kio_core::cas::is_hash;
 use kio_core::control::ControlHandle;
@@ -370,7 +370,7 @@ fn current_policy_raw_path_for_short_hash(
 /// CAS raw store (08 §2.3 rule 4 raw resolution). Used only for the raw-only
 /// short-hash case (no chunk carries the raw_hash).
 fn raw_object_present(target: &ScopeTarget, raw_hash: &str) -> Result<bool> {
-    if cas_object_present(&target.kio_dir, "raw", raw_hash, MAX_RAW_OBJECT_BYTES)? {
+    if cas_object_present(&target.kio_dir, "raw", raw_hash, u64::MAX)? {
         return Ok(true);
     }
     Ok(find_working_tree_raw(&target.repo_root, raw_hash)?.is_some())
@@ -1270,7 +1270,7 @@ fn open_authorized_raw_object(
         if fs::symlink_metadata(&path)
             .map(|metadata| metadata.file_type().is_file())
             .unwrap_or(false)
-            && hash_verified_scan_input(&target.repo_root, authorized_path, MAX_RAW_OBJECT_BYTES)
+            && hash_verified_scan_input(&target.repo_root, authorized_path, u64::MAX)
                 .map(|identity| identity.raw_hash == raw_hash)
                 .unwrap_or(false)
         {
@@ -1299,8 +1299,11 @@ pub(crate) fn open_cas_byte_object(
     if scan_working_tree && let Some(path) = find_working_tree_raw(&target.repo_root, hash)? {
         return Ok(Some((path, false)));
     }
+    if subdir == "raw" {
+        return open_raw_cache_streamed(target, hash, path_hint, control);
+    }
     let Some((_object_path, bytes)) =
-        read_cas_byte_object(&target.kio_dir, subdir, hash, MAX_RAW_OBJECT_BYTES)?
+        read_cas_byte_object(&target.kio_dir, subdir, hash, MAX_CONTENT_OBJECT_BYTES)?
     else {
         return Ok(None);
     };
@@ -1313,19 +1316,155 @@ pub(crate) fn open_cas_byte_object(
     let leaf = cache
         .file_name()
         .ok_or_else(|| KioError::invalid_usage("cache has no leaf"))?;
-    if let Some(existing) = read_private_cache(&directory, Path::new(leaf), MAX_RAW_OBJECT_BYTES)? {
+    if let Some(existing) =
+        read_private_cache(&directory, Path::new(leaf), MAX_CONTENT_OBJECT_BYTES)?
+    {
         verify_cache_bytes(&cache, &existing, hash)?;
         return Ok(Some((cache, true)));
     }
     // Publish only into an absent name; a concurrent winner must independently
     // pass protection and content verification before its path can be returned.
     if let Err(error) = directory.write_atomic_readonly(Path::new(leaf), &bytes) {
-        let existing =
-            read_private_cache(&directory, Path::new(leaf), MAX_RAW_OBJECT_BYTES)?.ok_or(error)?;
+        let existing = read_private_cache(&directory, Path::new(leaf), MAX_CONTENT_OBJECT_BYTES)?
+            .ok_or(error)?;
         verify_cache_bytes(&cache, &existing, hash)?;
     }
     crate::platform::verify_private_state_named_identity(&directory, directory.path())?;
     Ok(Some((cache, true)))
+}
+
+fn open_raw_cache_streamed(
+    target: &ScopeTarget,
+    hash: &str,
+    path_hint: Option<&str>,
+    control: &ControlHandle,
+) -> Result<Option<(PathBuf, bool)>> {
+    use kio_core::{
+        cas::{ObjectKind, ObjectStore},
+        store_dir::{Publication, StageWriter},
+    };
+    let source =
+        kio_core::store_dir::StoreDirectory::open_with_control(&target.kio_dir, control.clone())?;
+    let store = ObjectStore::from_bound_kio_with_control(&source.root_handle(), control.clone())?;
+    match store.inspect_object(ObjectKind::Raw, hash) {
+        Ok(_) => {}
+        Err(error) if is_store_not_found(&error) => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    let cache = open_cache_path("raw", path_hint.unwrap_or("object"), hash, control);
+    let directory = cache_directory(&cache, control, true)?
+        .ok_or_else(|| KioError::invalid_usage("cache directory disappeared"))?;
+    let leaf = Path::new(
+        cache
+            .file_name()
+            .ok_or_else(|| KioError::invalid_usage("cache has no leaf"))?,
+    );
+    if directory.contains_entry(leaf)? {
+        verify_raw_cache_stream(&directory, leaf, hash)?;
+        return Ok(Some((cache, true)));
+    }
+    let name = format!(
+        ".raw-stage-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    let stage_leaf = Path::new(&name);
+    let journal_name = format!("{name}.identity");
+    let journal = Path::new(&journal_name);
+    let mut stage = StageWriter::create(&directory, stage_leaf)?;
+    let identity = stage.identity().clone();
+    let result = (|| {
+        let bytes = serde_json::to_vec(&identity)
+            .map_err(|error| KioError::invalid_usage(error.to_string()))?;
+        directory.write_atomic(journal, &bytes, Publication::CreateOnly)?;
+        struct Sink<'a> {
+            stage: &'a mut StageWriter,
+            failure: Option<KioError>,
+        }
+        impl std::io::Write for Sink<'_> {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                match self.stage.write_chunk(bytes) {
+                    Ok(()) => Ok(bytes.len()),
+                    Err(error) => {
+                        self.failure = Some(error);
+                        Err(std::io::Error::other("cannot write raw expansion stage"))
+                    }
+                }
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut sink = Sink {
+            stage: &mut stage,
+            failure: None,
+        };
+        let copied = store.copy_object_to(ObjectKind::Raw, hash, &mut sink);
+        if let Some(error) = sink.failure {
+            return Err(error);
+        }
+        copied?;
+        stage.set_readonly()?;
+        stage.publish(&directory, leaf, Publication::CreateOnly)
+    })();
+    // An existing concurrent winner must independently pass the same digest
+    // and protection checks. Only the saved identity authorizes stage cleanup.
+    let cleanup = directory.discard_stage(stage_leaf, &identity);
+    if cleanup.is_ok() && directory.contains_entry(journal)? {
+        directory.remove_file(journal)?;
+    }
+    if let Err(error) = result {
+        if !directory.contains_entry(leaf)? {
+            return Err(error);
+        }
+        // A cache race cannot hide a newly corrupt or missing source object.
+        store.inspect_object(ObjectKind::Raw, hash)?;
+    }
+    verify_raw_cache_stream(&directory, leaf, hash)?;
+    crate::platform::verify_private_state_named_identity(&directory, directory.path())?;
+    Ok(Some((cache, true)))
+}
+
+fn verify_raw_cache_stream(
+    directory: &kio_core::store_dir::StoreDirectory,
+    leaf: &Path,
+    hash: &str,
+) -> Result<()> {
+    let mut file = directory.open_regular_read(leaf, u64::MAX)?;
+    kio_core::private_fs::verify_private_regular_file_handle(&file)?;
+    let before = file
+        .metadata()
+        .map_err(|error| KioError::io(error.to_string(), leaf.display().to_string()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0; 64 * 1024];
+    let mut total = 0u64;
+    loop {
+        let count = file
+            .read(&mut buffer)
+            .map_err(|error| KioError::io(error.to_string(), leaf.display().to_string()))?;
+        if count == 0 {
+            break;
+        }
+        total = total.saturating_add(count as u64);
+        if total > before.len() {
+            return Err(store_corrupt_error(
+                &directory.path().join(leaf),
+                "cache changed while verifying",
+            ));
+        }
+        hasher.update(&buffer[..count]);
+    }
+    let actual = format!("sha256:{}", kio_core::cas::lower_hex(&hasher.finalize()));
+    if actual != hash || total != before.len() {
+        return Err(store_corrupt_error(
+            &directory.path().join(leaf),
+            "cache object hash mismatch",
+        ));
+    }
+    Ok(())
 }
 
 fn read_bounded_cas_object(path: &Path, expected_hash: &str, max_bytes: u64) -> Result<Vec<u8>> {
@@ -1560,9 +1699,7 @@ impl WorkingTreeScanBudget {
         if self.remaining_bytes == 0 {
             return None;
         }
-        let max_bytes = declared_size
-            .min(MAX_RAW_OBJECT_BYTES)
-            .min(self.remaining_bytes.saturating_sub(1));
+        let max_bytes = declared_size.min(self.remaining_bytes.saturating_sub(1));
         let reserved_bytes = max_bytes.saturating_add(1).min(self.remaining_bytes);
         self.remaining_bytes -= reserved_bytes;
         Some(WorkingTreeScanAttempt {
