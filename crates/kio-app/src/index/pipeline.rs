@@ -71,8 +71,6 @@ use kio_adapter::types::PreparedUnitHint;
 use kio_adapter::types::PreviousMarkdownizeContext;
 use kio_adapter::types::RawInput;
 use kio_adapter::types::UnitKind;
-use kio_core::ExitCode;
-use kio_core::KioError;
 use kio_core::Result;
 use kio_core::control::ControlHandle;
 use kio_core::dag::NormalizeRef;
@@ -988,7 +986,7 @@ pub(crate) fn run_index_pipeline(
             // instance's per-unit `prepared_hash`: a prepare profile /
             // renderer version change (the Office converted-PDF path is the
             // motivating case) can change `prepared_hash` without changing
-            // raw_hash at all. Detect and gate it BEFORE the unconditional
+            // raw_hash at all. Detect it BEFORE the unconditional
             // reuse below would otherwise silently keep serving the STALE
             // generation forever.
             if let Some(new_gen) = prepared_hash_drift_new_gen(
@@ -998,26 +996,6 @@ pub(crate) fn run_index_pipeline(
                 &prepare.prepared_units,
                 repo.control(),
             ) {
-                // Mirrors `kio reindex --force`'s confirmation gate exactly
-                // (same error code / exit code / `--yes` flag) -- this
-                // codebase has no real interactive (TTY) confirmation prompt
-                // anywhere yet (`run_index`'s own top-level approval flow
-                // says so explicitly), so non-interactive `--yes` is the only
-                // accepted consent, matching that existing precedent rather
-                // than inventing a new interaction model here.
-                if !args.yes {
-                    return Err(KioError::new(
-                        "KIO-E-CONFIRM-REJECTED-001",
-                        "prepared_hash changed for an unchanged raw_hash (prepare profile / \
-                         renderer drift); re-markdownize at a new generation requires \
-                         confirmation -- pass --yes in non-interactive mode",
-                        json!({
-                            "input_path": candidate.input_path,
-                            "new_gen": new_gen,
-                        }),
-                        ExitCode::ConfirmationRejected,
-                    ));
-                }
                 create_prepared_hash_drift_instance(
                     repo,
                     &task_store,
@@ -1034,16 +1012,26 @@ pub(crate) fn run_index_pipeline(
                 )?;
                 continue;
             }
-            // PB04: this candidate's gen=0 output is already `done`
-            // (verified above), so its manifest.json is hashable now.
-            let manifest_hash = compute_manifest_hash(repo, &raw_hash, &markdown_profile_hash, 0)?;
+            // Keep the latest generation pinned when preparation is unchanged.
+            // Returning to g0 here would undo the preceding drift update.
+            let latest_gen = latest_normalized_instance(
+                repo.kio_dir(),
+                &raw_hash,
+                &markdown_profile_hash,
+                repo.control(),
+            )
+            .map_err(pipeline_to_kio)?
+            .manifest
+            .r#gen;
+            let manifest_hash =
+                compute_manifest_hash(repo, &raw_hash, &markdown_profile_hash, latest_gen)?;
             result.normalize_by_path.insert(
                 candidate.input_path.clone(),
                 PendingNormalizeRef {
                     expected_raw_hash: raw_hash.clone(),
                     normalize: NormalizeRef {
                         tool_profile_hash: markdown_profile_hash.clone(),
-                        r#gen: 0,
+                        r#gen: latest_gen,
                         manifest_hash,
                     },
                 },
@@ -1453,8 +1441,8 @@ pub(crate) fn prepared_hash_drift_new_gen(
     // real-world PDF, including real soffice-converted Office output) while a
     // done ONLINE instance discovered its units from the OCR response —
     // comparing those would flag such files as "drifted" on every `kio index`
-    // (exit 9 without --yes; with --yes an offline gen+1 built from unreadable
-    // input would shadow the OCR content as the latest generation). TODAY this
+    // (an offline gen+1 built from unreadable input would shadow the OCR
+    // content as the latest generation). TODAY this
     // state cannot reach the caller at all — run_index_pipeline's R20-5
     // empty-prepare arm peels these candidates off into the online-enqueue
     // path before the done-instance branch (verified by revert-testing
@@ -1501,20 +1489,18 @@ pub(crate) fn prepared_hash_drift_new_gen(
         .map(|(_, profile)| *profile)
         .collect::<BTreeSet<_>>();
     let preparation_profile_changed = existing_profiles != fresh_profiles;
-    // Guard (b): an identity disagreement on an IDENTICAL unit-key set is a
-    // safe renderer-drift verdict. A key-set difference without a profile
-    // change is indistinguishable
-    // from an OCR-discovered manifest whose unit set never came from the local
-    // prepare basis (OCR-from-scratch discovery mints placeholder prepared
-    // hashes for pages the extractor never produced) — treating that as drift
-    // would re-prompt on every index instead of once. With the current
-    // hint-echoing adapters a key-set mismatch is not end-to-end constructible
-    // (hints round-trip verbatim; OCR-from-scratch implies the empty-prepare
-    // arm), so like guard (a) this enforces the invariant at the mint rather
-    // than trusting adapter topology to keep it true. A renderer update that
-    // changes pagination therefore stays `kio reindex --force` territory
-    // (documented residual, step4b backlog).
-    if existing.keys().ne(fresh.keys()) && !preparation_profile_changed {
+    // OCR-discovered units can differ from the local hint basis. Only a
+    // renderer-backed local preparation (or a changed profile) can establish
+    // that a changed unit set is a real pagination change.
+    let renderer_prepared = latest
+        .manifest
+        .preparation_provenance
+        .renderer_name
+        .is_some()
+        && fresh_prepared_units
+            .iter()
+            .all(|unit| unit.renderer.is_some());
+    if existing.keys().ne(fresh.keys()) && !preparation_profile_changed && !renderer_prepared {
         return None;
     }
     (preparation_profile_changed || existing != fresh)
@@ -1524,8 +1510,7 @@ pub(crate) fn prepared_hash_drift_new_gen(
 /// QB41 (03 §2.1's second legal gen+1 path): create a FRESH normalized
 /// instance at `new_gen` for a `raw_hash` whose prepare output drifted from
 /// the existing instance's (`prepared_hash_drift_new_gen` already confirmed
-/// the drift, and the caller already gated confirmation -- `--yes`, mirroring
-/// `kio reindex --force`'s `KIO-E-CONFIRM-REJECTED-001` pattern). Deliberately
+/// the drift). This local operation needs no additional approval. Deliberately
 /// FULL mode only (no incremental): this is a rare, renderer-drift-driven
 /// event, not a hot path, and the OLD instance's per-unit content has no sound
 /// correspondence to the NEW prepare output for incremental-reuse purposes

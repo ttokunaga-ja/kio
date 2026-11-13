@@ -332,6 +332,7 @@ pub(crate) fn ingest_standalone_image(
         generated_at: generated_at.clone(),
     };
     let manifest = NormalizedInstanceManifest {
+        preparation_provenance: kio_pipeline::markdownize::PreparationProvenance::local(),
         raw_hash: raw_hash.to_owned(),
         tool_profile_hash: native_profile_hash.clone(),
         r#gen: 0,

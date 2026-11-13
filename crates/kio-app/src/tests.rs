@@ -351,6 +351,7 @@ fn materialized_source_image_cas_failure_is_retryable_not_contract_reject() {
     let raw_hash = hash_bytes(PNG);
     let profile_hash = hash_bytes(b"online profile");
     let prepared = PreparedUnit {
+        renderer: None,
         order: 0,
         unit_key: "image:0".to_owned(),
         unit_type: UnitType::Image,
@@ -443,6 +444,7 @@ fn invalid_online_markdown_is_rejected_before_normalized_publication() {
     let raw_hash = hash_bytes(PNG);
     let profile_hash = hash_bytes(b"online profile");
     let prepared = PreparedUnit {
+        renderer: None,
         order: 0,
         unit_key: "image:0".to_owned(),
         unit_type: UnitType::Image,
@@ -520,6 +522,7 @@ fn invalid_online_markdown_is_rejected_before_normalized_publication() {
         &repo,
         &task,
         vec![PreparedUnit {
+            renderer: None,
             order: 0,
             unit_key: "image:0".to_owned(),
             unit_type: UnitType::Image,
@@ -568,6 +571,7 @@ fn valid_partial_online_response_is_materialized() {
     let raw_hash = hash_bytes(raw);
     let profile_hash = hash_bytes(b"online profile");
     let page = |order, key: &str| PreparedUnit {
+        renderer: None,
         order,
         unit_key: key.to_owned(),
         unit_type: UnitType::Page,
@@ -790,6 +794,7 @@ fn unchanged_image_unit_reuses_pinned_markdown_verbatim() {
     let raw_hash = hash_bytes(raw_bytes);
     let profile_hash = hash_bytes(b"profile");
     let prepared = PreparedUnit {
+        renderer: None,
         order: 0,
         unit_key: "image:0".to_owned(),
         unit_type: UnitType::Image,
@@ -806,6 +811,7 @@ fn unchanged_image_unit_reuses_pinned_markdown_verbatim() {
     let previous_markdown = "legacy pinned OCR text\n".to_owned();
     let previous = crate::markdownize::execution::PreviousInstance {
         manifest: NormalizedInstanceManifest {
+            preparation_provenance: kio_pipeline::markdownize::PreparationProvenance::local(),
             raw_hash: raw_hash.clone(),
             tool_profile_hash: profile_hash.clone(),
             r#gen: 0,
@@ -883,6 +889,7 @@ fn preparation_profile_drift_bumps_generation_despite_changed_unit_keys() {
     let old_preparation_profile = hash_bytes(b"old renderer profile");
     let new_preparation_profile = hash_bytes(b"new renderer profile");
     let old_prepared = PreparedUnit {
+        renderer: None,
         order: 0,
         unit_key: "page:1".to_owned(),
         unit_type: UnitType::Page,
@@ -940,6 +947,7 @@ fn preparation_profile_drift_bumps_generation_despite_changed_unit_keys() {
     persist_normalized_instance(&kio_dir, &manifest, &[unit]).unwrap();
 
     let fresh = PreparedUnit {
+        renderer: None,
         unit_key: "page:2".to_owned(),
         preparation_profile_hash: new_preparation_profile,
         page_number: Some(2),
@@ -3425,7 +3433,7 @@ fn r10_4_partial_retry_plan_gates_on_retryability_and_budget() {
                 "raw_hash": format!("sha256:{}", "a".repeat(64)),
                 "tool_profile_hash": format!("sha256:{}", "b".repeat(64)),
                 "gen": 0,
-                "parent_gen": null,
+                "parent_gen": null, "preparation_provenance": {"renderer_name":null,"renderer_version":null,"producer_os":"linux","producer_arch":"x86_64"},
                 "run_id": "run_x",
                 "units": [
                     {"order":0,"unit_key":"page:1","unit_ref":unit_ref("page:1"),"unit_type":"page","status":if first_error.is_some() { "failed" } else { "done" },"prepared_hash":format!("sha256:{}", "c".repeat(64)),"preparation_profile_hash":format!("sha256:{}", "9".repeat(64)),"error_kind":first_error,"unit_object_hash":first_error.is_none().then(|| format!("sha256:{}", "e".repeat(64)))},
@@ -3484,7 +3492,7 @@ fn subset_retry_preserves_unrequested_failed_unit_kind() {
     let manifest: NormalizedInstanceManifest = serde_json::from_value(serde_json::json!({
             "raw_hash": format!("sha256:{}", "a".repeat(64)),
             "tool_profile_hash": format!("sha256:{}", "b".repeat(64)),
-            "gen": 0, "parent_gen": null, "run_id": "prior",
+            "gen": 0, "parent_gen": null, "preparation_provenance": {"renderer_name":null,"renderer_version":null,"producer_os":"linux","producer_arch":"x86_64"}, "run_id": "prior",
             "units": [
                 {"order":0,"unit_key":"page:1","unit_ref":unit_ref("page:1"),"unit_type":"page","status":"failed","prepared_hash":format!("sha256:{}", "c".repeat(64)),"preparation_profile_hash":format!("sha256:{}", "9".repeat(64)),"unit_object_hash":null,"error_kind":"invalid_input"},
                 {"order":1,"unit_key":"page:2","unit_ref":unit_ref("page:2"),"unit_type":"page","status":"failed","prepared_hash":format!("sha256:{}", "d".repeat(64)),"preparation_profile_hash":format!("sha256:{}", "9".repeat(64)),"unit_object_hash":null,"error_kind":"network_error"}
@@ -3759,6 +3767,7 @@ fn r23_prepared_writer_rejects_symlinked_store_ancestor() {
     let bytes = b"outside-write";
     let prepared_hash = hash_bytes(bytes);
     let unit = PreparedUnit {
+        renderer: None,
         order: 0,
         unit_key: "file:0".to_owned(),
         unit_type: UnitType::File,
@@ -4756,6 +4765,7 @@ fn resource_limit_online_response_is_materialized() {
     let raw_hash = hash_bytes(raw);
     let profile_hash = hash_bytes(b"online profile");
     let page = |order, key: &str| PreparedUnit {
+        renderer: None,
         order,
         unit_key: key.to_owned(),
         unit_type: UnitType::Page,

@@ -258,3 +258,9 @@ pub use macos::primitives::atomic_exchange;
 pub use windows::primitives::{
     FileInformation, file_change_time, file_information, open_metadata_nofollow,
 };
+
+/// Build target identity recorded by immutable preparation manifests.
+#[must_use]
+pub fn producer_platform() -> (&'static str, &'static str) {
+    (std::env::consts::OS, std::env::consts::ARCH)
+}

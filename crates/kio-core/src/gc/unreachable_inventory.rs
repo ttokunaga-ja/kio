@@ -191,6 +191,8 @@ struct ManifestIdentity {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InventoryManifest {
+    #[serde(rename = "preparation_provenance")]
+    _preparation_provenance: crate::preparation_provenance::PreparationProvenance,
     raw_hash: String,
     tool_profile_hash: String,
     #[serde(rename = "gen")]
