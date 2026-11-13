@@ -1,7 +1,5 @@
 use crate::ledger::snapshot::{AttemptError, LedgerSnapshotError};
-use crate::ledger::snapshot::{
-    Leaf, MAX_LEAF_BYTES, Manifest, Observed, SNAPSHOT_MAIN, validate_file,
-};
+use crate::ledger::snapshot::{Leaf, Manifest, Observed, SNAPSHOT_MAIN, validate_file};
 use cap_primitives::fs as cap_fs;
 use sha2::{Digest, Sha256};
 use std::io::Read;
@@ -25,21 +23,20 @@ impl PrivateStorage {
         let mut builder = tempfile::Builder::new();
         builder.prefix("kio-ledger-snapshot-");
         builder.permissions(fs::Permissions::from_mode(0o700));
-        builder
-            .tempdir()
-            .map(Self)
-            .map_err(|e| AttemptError::Unstable(format!("create private ledger snapshot dir: {e}")))
+        builder.tempdir().map(Self).map_err(|e| {
+            crate::ledger::snapshot::snapshot_io_error("create private ledger snapshot dir", e)
+        })
     }
     pub(crate) fn path(&self) -> &Path {
         self.0.path()
     }
-    pub(crate) fn create_file(&self, name: &str) -> Result<fs::File, AttemptError> {
-        use std::os::unix::fs::OpenOptionsExt;
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true).mode(0o600);
-        options.open(self.0.path().join(name)).map_err(|e| {
-            AttemptError::Unstable(format!("create private ledger snapshot {name}: {e}"))
-        })
+    pub(crate) fn directory(&self) -> Result<kio_core::store_dir::StoreDirectory, AttemptError> {
+        let handle = cap_fs::open_ambient_dir(self.path(), cap_primitives::ambient_authority())
+            .map_err(|e| {
+                crate::ledger::snapshot::snapshot_io_error("open private ledger directory", e)
+            })?;
+        kio_core::store_dir::StoreDirectory::from_retained(handle, self.path().to_owned())
+            .map_err(|e| AttemptError::Unstable(format!("bind private ledger directory: {e}")))
     }
 }
 pub(crate) fn identity(m: &cap_fs::Metadata) -> Identity {
@@ -138,19 +135,15 @@ pub(crate) fn verify_private_leaf(
     let mut bytes = 0u64;
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 65536];
+    let mut reader = input.by_ref().take(expected.bytes);
     loop {
-        let count = input.read(&mut buffer).map_err(|e| {
-            AttemptError::Unstable(format!("read private ledger snapshot {name}: {e}"))
+        let count = reader.read(&mut buffer).map_err(|e| {
+            crate::ledger::snapshot::snapshot_io_error("read private ledger snapshot", e)
         })?;
         if count == 0 {
             break;
         }
         bytes += count as u64;
-        if bytes > MAX_LEAF_BYTES {
-            return Err(AttemptError::Unsafe(format!(
-                "private ledger snapshot {name} exceeds bound"
-            )));
-        }
         hash.update(&buffer[..count]);
     }
     let after = cap_fs::stat(dir, Path::new(name), cap_fs::FollowSymlinks::No).map_err(|e| {
@@ -162,6 +155,7 @@ pub(crate) fn verify_private_leaf(
     })?;
     validate_file(&after, name)?;
     if !same_identity(&opened, &after)
+        || after.len() != expected.bytes
         || bytes != expected.bytes
         || hash.finalize().as_slice() != expected.sha256
     {
@@ -229,4 +223,19 @@ pub(crate) fn verify_private_storage(
     manifest: &Manifest,
 ) -> Result<(), AttemptError> {
     verify_private_snapshot(storage.path(), manifest)
+}
+
+pub(crate) fn io_resource(error: &std::io::Error) -> Option<kio_core::error::Resource> {
+    use kio_core::error::Resource;
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    ) || error.raw_os_error() == Some(libc::EDQUOT)
+    {
+        Some(Resource::Storage)
+    } else if error.kind() == std::io::ErrorKind::OutOfMemory {
+        Some(Resource::Memory)
+    } else {
+        None
+    }
 }

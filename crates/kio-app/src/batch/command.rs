@@ -176,7 +176,8 @@ pub(crate) fn run_batch(ctx: &Invocation<'_>, args: BatchArgs) -> Result<Command
             | Err(
                 LedgerSnapshotError::Missing
                 | LedgerSnapshotError::UnsafeIntegrity(_)
-                | LedgerSnapshotError::UnstableBusy(_),
+                | LedgerSnapshotError::UnstableBusy(_)
+                | LedgerSnapshotError::ResourceLimit(_),
             ) => None,
         }
     } else {

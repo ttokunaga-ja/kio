@@ -27,12 +27,6 @@ use super::{
     ops_sql::{ledger_month_total, stalled_rows},
 };
 
-// A device ledger is expected to be compact. These streaming bounds prevent a
-// hostile or accidentally enormous device cache from turning a read-only
-// search-status check into unbounded disk I/O; total admits one main plus WAL
-// and SHM-sized observation without allocating any leaf wholesale.
-pub(crate) const MAX_LEAF_BYTES: u64 = 64 * 1024 * 1024;
-const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ATTEMPTS: usize = 8;
 const RETRY_WINDOW: Duration = Duration::from_secs(5);
 pub(crate) const SNAPSHOT_MAIN: &str = "ledger.sqlite";
@@ -40,6 +34,7 @@ pub(crate) const SNAPSHOT_MAIN: &str = "ledger.sqlite";
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LedgerSnapshotError {
     Missing,
+    ResourceLimit(kio_core::error::ResourceLimit),
     UnsafeIntegrity(String),
     UnstableBusy(String),
 }
@@ -47,6 +42,7 @@ pub enum LedgerSnapshotError {
 impl std::fmt::Display for LedgerSnapshotError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::ResourceLimit(limit) => write!(f, "ledger snapshot resource limit: {limit:?}"),
             Self::Missing => f.write_str("cost ledger is absent"),
             Self::UnsafeIntegrity(s) | Self::UnstableBusy(s) => f.write_str(s),
         }
@@ -57,6 +53,7 @@ impl std::error::Error for LedgerSnapshotError {}
 #[derive(Debug)]
 pub(crate) enum AttemptError {
     Missing,
+    ResourceLimit(kio_core::error::ResourceLimit),
     Unsafe(String),
     Unstable(String),
 }
@@ -173,6 +170,7 @@ impl LedgerReadSnapshot {
             AttemptError::Missing => LedgerSnapshotError::UnstableBusy(
                 "ledger disappeared after recovery snapshot capture".into(),
             ),
+            AttemptError::ResourceLimit(limit) => LedgerSnapshotError::ResourceLimit(limit),
             AttemptError::Unsafe(message) => LedgerSnapshotError::UnsafeIntegrity(message),
             AttemptError::Unstable(message) => LedgerSnapshotError::UnstableBusy(message),
         };
@@ -249,6 +247,9 @@ impl LedgerReadSnapshot {
                         None => Err(LedgerSnapshotError::Missing),
                     };
                 }
+                Err(AttemptError::ResourceLimit(limit)) => {
+                    return Err(LedgerSnapshotError::ResourceLimit(limit));
+                }
                 Err(AttemptError::Unsafe(message)) => {
                     return Err(LedgerSnapshotError::UnsafeIntegrity(message));
                 }
@@ -318,6 +319,10 @@ impl LedgerReadSnapshot {
 
 fn snapshot_query_error(error: crate::PipelineError) -> LedgerSnapshotError {
     match error {
+        crate::PipelineError::ResourceLimit(limit) => LedgerSnapshotError::ResourceLimit(limit),
+        crate::PipelineError::Sqlite(ref sql) if sqlite_resource(sql).is_some() => {
+            LedgerSnapshotError::ResourceLimit(sqlite_resource(sql).unwrap())
+        }
         crate::PipelineError::Contract { .. }
         | crate::PipelineError::Corrupt { .. }
         | crate::PipelineError::Schema(_) => {
@@ -334,6 +339,61 @@ fn snapshot_query_error(error: crate::PipelineError) -> LedgerSnapshotError {
             LedgerSnapshotError::UnsafeIntegrity(format!("query ledger snapshot: {code}"))
         }
         error => LedgerSnapshotError::UnstableBusy(format!("query ledger snapshot: {error}")),
+    }
+}
+
+fn resource_limit(resource: kio_core::error::Resource) -> kio_core::error::ResourceLimit {
+    kio_core::error::ResourceLimit {
+        resource,
+        stage: "ledger_snapshot".into(),
+        limit: None,
+        observed: None,
+        resource_tier: None,
+    }
+}
+
+pub(crate) fn snapshot_io_error(operation: &str, error: std::io::Error) -> AttemptError {
+    if let Some(resource) = crate::platform::ledger_snapshot::io_resource(&error) {
+        AttemptError::ResourceLimit(resource_limit(resource))
+    } else {
+        AttemptError::Unstable(format!("{operation}: {error}"))
+    }
+}
+
+fn stage_error(error: kio_core::KioError) -> AttemptError {
+    if let Some(limit) = error.resource_limit() {
+        let mut limit = limit.clone();
+        limit.stage = "ledger_snapshot".into();
+        AttemptError::ResourceLimit(limit)
+    } else {
+        AttemptError::Unstable(format!("private ledger stage: {error}"))
+    }
+}
+
+fn create_private_stage(
+    storage: &PrivateStorage,
+    name: &str,
+) -> Result<kio_core::store_dir::StageWriter, AttemptError> {
+    let directory = storage.directory()?;
+    kio_core::store_dir::StageWriter::create(&directory, Path::new(name)).map_err(stage_error)
+}
+
+fn sqlite_resource(error: &rusqlite::Error) -> Option<kio_core::error::ResourceLimit> {
+    use kio_core::error::Resource;
+    match error {
+        rusqlite::Error::SqliteFailure(code, _) => match code.code {
+            rusqlite::ErrorCode::DiskFull => Some(resource_limit(Resource::Storage)),
+            rusqlite::ErrorCode::OutOfMemory => Some(resource_limit(Resource::Memory)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn private_sqlite_error(operation: &str, error: rusqlite::Error) -> AttemptError {
+    match sqlite_resource(&error) {
+        Some(limit) => AttemptError::ResourceLimit(limit),
+        None => AttemptError::Unstable(format!("{operation}: {error}")),
     }
 }
 
@@ -482,6 +542,7 @@ fn fresh_parent_binding(
 
 pub(crate) fn parent_binding_error(error: LedgerSnapshotError) -> AttemptError {
     match error {
+        LedgerSnapshotError::ResourceLimit(limit) => AttemptError::ResourceLimit(limit),
         LedgerSnapshotError::Missing => AttemptError::Missing,
         LedgerSnapshotError::UnsafeIntegrity(message) => AttemptError::Unsafe(message),
         LedgerSnapshotError::UnstableBusy(message) => AttemptError::Unstable(message),
@@ -501,11 +562,6 @@ pub(crate) fn validate_file(m: &cap_fs::Metadata, label: &str) -> Result<(), Att
     if !m.is_file() || m.file_type().is_symlink() {
         return Err(AttemptError::Unsafe(format!(
             "ledger {label} is not a regular nofollow file"
-        )));
-    }
-    if m.len() > MAX_LEAF_BYTES {
-        return Err(AttemptError::Unsafe(format!(
-            "ledger {label} exceeds bound"
         )));
     }
     validate_file_links(m, label)?;
@@ -540,34 +596,28 @@ fn observe(
         )));
     }
     let mut output = match copy {
-        Some((storage, private_name)) => Some(storage.create_file(private_name)?),
+        Some((storage, private_name)) => Some(create_private_stage(storage, private_name)?),
         None => None,
     };
     let mut hash = Sha256::new();
     let mut total = 0;
     let mut buf = [0; 65536];
+    let mut reader = Read::by_ref(&mut input).take(opened.len());
     loop {
-        let n = input
+        let n = reader
             .read(&mut buf)
-            .map_err(|e| AttemptError::Unstable(format!("read ledger {name}: {e}")))?;
+            .map_err(|e| snapshot_io_error(&format!("read ledger {name}"), e))?;
         if n == 0 {
             break;
         };
         total += n as u64;
-        if total > MAX_LEAF_BYTES {
-            return Err(AttemptError::Unsafe(format!(
-                "ledger {name} exceeds bound while reading"
-            )));
-        };
         hash.update(&buf[..n]);
         if let Some(out) = output.as_mut() {
-            out.write_all(&buf[..n])
-                .map_err(|e| AttemptError::Unstable(format!("copy ledger {name}: {e}")))?;
+            out.write_chunk(&buf[..n]).map_err(stage_error)?;
         }
     }
     if let Some(out) = output.as_mut() {
-        out.flush()
-            .map_err(|e| AttemptError::Unstable(format!("flush ledger snapshot {name}: {e}")))?;
+        out.sync().map_err(stage_error)?;
     }
     let after = cap_fs::stat(parent, Path::new(name), cap_fs::FollowSymlinks::No)
         .map_err(|e| AttemptError::Unstable(format!("restat ledger {name}: {e}")))?;
@@ -623,21 +673,6 @@ fn capture_manifest(
             storage.map(|s| (s, "ledger.sqlite-wal")),
         )?,
         shm: observe(parent, parent_path, &shm, None)?,
-    };
-    let total = [&m.main, &m.wal, &m.shm]
-        .iter()
-        .filter_map(|x| {
-            if let Leaf::Present(o) = x {
-                Some(o.bytes)
-            } else {
-                None
-            }
-        })
-        .sum::<u64>();
-    if total > MAX_TOTAL_BYTES {
-        return Err(AttemptError::Unsafe(
-            "ledger aggregate exceeds bound".into(),
-        ));
     };
     match &m.main {
         Leaf::Absent if matches!(m.wal, Leaf::Absent) && matches!(m.shm, Leaf::Absent) => Ok(m),
@@ -776,6 +811,7 @@ fn classify_lifecycle_failure(
     error: crate::PipelineError,
 ) -> AttemptError {
     match error {
+        crate::PipelineError::ResourceLimit(limit) => AttemptError::ResourceLimit(limit),
         crate::PipelineError::Contract { .. }
         | crate::PipelineError::Corrupt { .. }
         | crate::PipelineError::Schema(_) => match manifest_recheck(parent, parent_path, main) {
@@ -783,6 +819,7 @@ fn classify_lifecycle_failure(
                 "ledger changed while validating private lifecycle snapshot".into(),
             ),
             Ok(_) => AttemptError::Unsafe(format!("validate private ledger snapshot: {error}")),
+            Err(AttemptError::ResourceLimit(limit)) => AttemptError::ResourceLimit(limit),
             Err(AttemptError::Unsafe(message)) => AttemptError::Unsafe(message),
             Err(AttemptError::Missing) | Err(AttemptError::Unstable(_)) => AttemptError::Unstable(
                 "ledger unavailable while validating private lifecycle snapshot".into(),
@@ -808,10 +845,14 @@ fn classify_sqlite_failure(
     error: rusqlite::Error,
     operation: &str,
 ) -> AttemptError {
+    if let Some(limit) = sqlite_resource(&error) {
+        return AttemptError::ResourceLimit(limit);
+    }
     match manifest_recheck(parent, parent_path, main) {
         Ok(current) if current != *initial => {
             AttemptError::Unstable(format!("ledger changed during {operation}"))
         }
+        Err(AttemptError::ResourceLimit(limit)) => AttemptError::ResourceLimit(limit),
         Err(AttemptError::Unsafe(message)) => AttemptError::Unsafe(message),
         Err(_) => AttemptError::Unstable(format!("ledger unavailable during {operation}")),
         Ok(_) => match error {
@@ -946,12 +987,11 @@ fn attempt_snapshot(
     verify_private_storage(&storage, &initial)?;
     let snapshot = storage.path().join(SNAPSHOT_MAIN);
     let conn = Connection::open_with_flags(&snapshot, OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|e| AttemptError::Unstable(format!("open private ledger snapshot: {e}")))?;
+        .map_err(|e| private_sqlite_error("open private ledger snapshot", e))?;
     conn.busy_timeout(Duration::from_secs(5))
-        .map_err(|e| AttemptError::Unstable(format!("configure private ledger snapshot: {e}")))?;
-    conn.pragma_update(None, "query_only", "ON").map_err(|e| {
-        AttemptError::Unstable(format!("make private ledger snapshot query only: {e}"))
-    })?;
+        .map_err(|e| private_sqlite_error("configure private ledger snapshot", e))?;
+    conn.pragma_update(None, "query_only", "ON")
+        .map_err(|e| private_sqlite_error("make private ledger snapshot query only", e))?;
     // Preserve the canonical parent binding before consulting lifecycle
     // sidecars by pathname. This keeps a detached/replaced parent from being
     // mistaken for a stable authority validation failure.
@@ -987,6 +1027,27 @@ fn attempt_snapshot(
     }
     lifecycle_validation
         .map_err(|error| classify_lifecycle_failure(parent, parent_path, main, &initial, error))?;
+    let check: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|e| {
+            classify_sqlite_failure(
+                parent,
+                parent_path,
+                main,
+                &initial,
+                e,
+                "check private ledger snapshot",
+            )
+        })?;
+    if check != "ok" {
+        return Err(classify_lifecycle_failure(
+            parent,
+            parent_path,
+            main,
+            &initial,
+            crate::PipelineError::corrupt("ledger snapshot", check),
+        ));
+    }
     // The real table probe then proves committed WAL visibility before source recheck.
     conn.query_row("SELECT 1 FROM cost_ledger LIMIT 1", [], |r| {
         r.get::<_, i64>(0)
@@ -1756,28 +1817,129 @@ mod tests {
     }
 
     #[test]
-    fn oversized_source_leaf_is_unsafe_before_reading() {
-        let (dir, path, db) = ledger();
-        drop(db);
-        let oversized = dir.path().join("oversized-wal");
-        let wal = PathBuf::from(format!("{}-wal", path.display()));
-        let file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&oversized)
+    fn snapshot_rejects_corrupt_pages_outside_the_total_query_without_source_changes() {
+        use std::io::{Seek, SeekFrom};
+        let (_dir, path, db) = ledger();
+        db.execute_batch("CREATE TABLE extra_payload (data BLOB); INSERT INTO extra_payload VALUES (zeroblob(8192));").unwrap();
+        let page: u64 = db
+            .query_row(
+                "SELECT rootpage FROM sqlite_schema WHERE name='extra_payload'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
-        file.set_len(MAX_LEAF_BYTES + 1).unwrap();
+        let page_size: u64 = db
+            .pragma_query_value(None, "page_size", |r| r.get(0))
+            .unwrap();
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(db);
+        let mut file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.seek(SeekFrom::Start((page - 1) * page_size)).unwrap();
+        file.write_all(&[0xff]).unwrap(); // invalid b-tree page type
         drop(file);
-        if wal.exists() {
-            fs::remove_file(&wal).unwrap();
+        let before = source_bytes(&path);
+        assert!(matches!(
+            LedgerReadSnapshot::open(&path),
+            Err(LedgerSnapshotError::UnsafeIntegrity(_))
+        ));
+        assert_eq!(before, source_bytes(&path));
+    }
+
+    #[test]
+    fn snapshot_resource_failures_are_typed_and_not_retried() {
+        use kio_core::error::Resource;
+        for kind in [
+            std::io::ErrorKind::StorageFull,
+            std::io::ErrorKind::QuotaExceeded,
+            std::io::ErrorKind::OutOfMemory,
+        ] {
+            let (_dir, path, _db) = ledger();
+            let before = source_bytes(&path);
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = calls.clone();
+            let result = LedgerReadSnapshot::open_for_test_with_hooks(
+                &path,
+                8,
+                SnapshotTestHooks {
+                    private_storage_create: Some(std::sync::Arc::new(move || {
+                        count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        Err(snapshot_io_error(
+                            "create private ledger snapshot dir",
+                            kind.into(),
+                        ))
+                    })),
+                    ..SnapshotTestHooks::default()
+                },
+            );
+            let Err(LedgerSnapshotError::ResourceLimit(limit)) = result else {
+                panic!("resource exhaustion must remain typed");
+            };
+            assert_eq!(
+                limit.resource,
+                if kind != std::io::ErrorKind::OutOfMemory {
+                    Resource::Storage
+                } else {
+                    Resource::Memory
+                }
+            );
+            assert_eq!(limit.stage, "ledger_snapshot");
+            assert_eq!(limit.limit, None);
+            assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert_eq!(before, source_bytes(&path));
         }
-        fs::rename(oversized, &wal).unwrap();
-        match LedgerReadSnapshot::open(&path) {
-            Err(LedgerSnapshotError::UnsafeIntegrity(message)) => {
-                assert!(message.contains("ledger cost-ledger.sqlite-wal exceeds bound"));
+        assert!(matches!(
+            snapshot_io_error("read", std::io::ErrorKind::InvalidData.into()),
+            AttemptError::Unstable(_)
+        ));
+        for (code, resource) in [
+            (rusqlite::ffi::SQLITE_FULL, Resource::Storage),
+            (rusqlite::ffi::SQLITE_NOMEM, Resource::Memory),
+        ] {
+            let sql = rusqlite::Error::SqliteFailure(rusqlite::ffi::Error::new(code), None);
+            let LedgerSnapshotError::ResourceLimit(limit) =
+                snapshot_query_error(crate::PipelineError::Sqlite(sql))
+            else {
+                panic!("SQLite resource failures must remain typed");
+            };
+            assert_eq!(limit.resource, resource);
+        }
+    }
+
+    #[test]
+    fn snapshot_reads_main_and_wal_beyond_former_byte_limits_without_source_changes() {
+        for checkpoint in [false, true] {
+            let (_dir, path, db) = ledger();
+            db.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
+            // Use valid ledger rows, with bounded-size SQL allocations. The
+            // payload alone exceeds both the former leaf and aggregate limits.
+            db.execute_batch("BEGIN;").unwrap();
+            for i in 0..130 {
+                db.execute(
+                    "INSERT INTO cost_ledger (scope_id,adapter_kind,input_hash,tool_profile_hash,submission_seq,batch_job_id,usd,estimated,outcome,month,recorded_at)
+                     VALUES ('scope-large','markdownize',hex(zeroblob(524288)),?1,1,?1,1.0,0,'succeeded','2026-08',0)",
+                    [format!("job-{i}")],
+                ).unwrap();
             }
-            Err(error) => panic!("expected size-bound integrity failure, got {error}"),
-            Ok(_) => panic!("oversized WAL must not produce a snapshot"),
+            db.execute_batch("COMMIT;").unwrap();
+            if checkpoint {
+                db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .unwrap();
+                assert!(fs::metadata(&path).unwrap().len() > 128 * 1024 * 1024);
+            } else {
+                assert!(
+                    fs::metadata(path.with_file_name("cost-ledger.sqlite-wal"))
+                        .unwrap()
+                        .len()
+                        > 128 * 1024 * 1024
+                );
+            }
+            let before = source_bytes(&path);
+            let snapshot = LedgerReadSnapshot::open(&path).unwrap();
+            assert_eq!(snapshot.month_total(None, None, "2026-08").unwrap(), 130.0);
+            assert_eq!(before, source_bytes(&path));
+            drop(snapshot);
+            assert_eq!(before, source_bytes(&path));
         }
     }
 
