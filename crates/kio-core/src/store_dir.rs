@@ -559,3 +559,20 @@ pub(crate) fn relative_components<'a>(
     }
     Ok(out)
 }
+
+#[cfg(test)]
+mod journal_resource_tests {
+    #[test]
+    fn j1_storage_exhaustion_stays_distinct_from_corruption() {
+        let make_error = || std::io::Error::from(std::io::ErrorKind::StorageFull);
+        for error in [
+            super::ioerr(std::path::Path::new("tasks.jsonl"), make_error()),
+            super::atomic::io_failure("cannot publish compaction", make_error()),
+        ] {
+            assert_eq!(
+                error.resource_limit().unwrap().resource,
+                crate::error::Resource::Storage
+            );
+        }
+    }
+}

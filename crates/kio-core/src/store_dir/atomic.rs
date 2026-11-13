@@ -86,7 +86,6 @@ pub(crate) fn io_failure(message: impl Into<String>, error: std::io::Error) -> K
     if crate::platform::stage_nonce::storage_exhausted(&error) {
         return super::stage::stage_io(&message.into(), error);
     }
-
     KioError::new(
         "KIO-E-ATOMIC-WORKSPACE-IO-001",
         format!("{}: {error}", message.into()),

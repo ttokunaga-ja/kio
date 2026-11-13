@@ -18,15 +18,19 @@ impl PrivateStorage {
         crate::ledger::snapshot::run_private_storage_create_hook(hooks)?;
         super::snapshot_windows_security::LedgerSnapshotPrivateDir::create()
             .map(Self)
-            .map_err(|e| AttemptError::Unstable(format!("create private ledger snapshot dir: {e}")))
+            .map_err(|e| {
+                crate::ledger::snapshot::snapshot_io_error("create private ledger snapshot dir", e)
+            })
     }
     pub(crate) fn path(&self) -> &Path {
         self.0.path()
     }
-    pub(crate) fn create_file(&self, name: &str) -> Result<fs::File, AttemptError> {
-        self.0.create_file(name).map_err(|e| {
-            AttemptError::Unstable(format!("create private ledger snapshot {name}: {e}"))
-        })
+    pub(crate) fn directory(&self) -> Result<kio_core::store_dir::StoreDirectory, AttemptError> {
+        let handle = self.0.handle().try_clone().map_err(|e| {
+            crate::ledger::snapshot::snapshot_io_error("retain private ledger directory", e)
+        })?;
+        kio_core::store_dir::StoreDirectory::from_retained(handle, self.path().to_owned())
+            .map_err(|e| AttemptError::Unstable(format!("bind private ledger directory: {e}")))
     }
 }
 pub(crate) fn normalized_absolute(path: &Path) -> Result<PathBuf, LedgerSnapshotError> {
@@ -195,4 +199,19 @@ pub(crate) fn verify_private_storage(
                 AttemptError::Unstable(format!("verify owner-private ledger snapshot: {error}"))
             }
         })
+}
+
+pub(crate) fn io_resource(error: &std::io::Error) -> Option<kio_core::error::Resource> {
+    use kio_core::error::Resource;
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+    ) || matches!(error.raw_os_error(), Some(39 | 112 | 1816))
+    {
+        Some(Resource::Storage)
+    } else if error.kind() == std::io::ErrorKind::OutOfMemory {
+        Some(Resource::Memory)
+    } else {
+        None
+    }
 }

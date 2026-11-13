@@ -289,7 +289,10 @@ jobs:
     runs-on: windows-2025
     # Keep the workspace build graph unchanged. The two libtest selections are
     # complements, so every original test remains covered once across the matrix.
-    timeout-minutes: 90
+    # The remaining group took 82-84 minutes on 2026-11-13 (14 min build, 66 min
+    # tests; kio-cli's step3_p0_contract alone 21 min on Windows against 2.5 on
+    # Linux). Keep headroom until that binary is made cheaper on Windows.
+    timeout-minutes: 120
     strategy:
       fail-fast: false
       matrix:

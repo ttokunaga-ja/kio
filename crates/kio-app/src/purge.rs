@@ -51,7 +51,7 @@ use kio_pipeline::markdownize::{
     NormalizedInstanceManifest, NormalizedUnitObject, UnitStatus,
     load_validated_normalized_units_from_manifest,
 };
-use kio_pipeline::task::{EmbeddingWorkKey, MAX_TASK_STORE_BYTES, TaskStore, TaskType};
+use kio_pipeline::task::{EmbeddingWorkKey, TaskStore, TaskType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -1888,7 +1888,7 @@ fn settle_inflight_reservations_for_purge(
     // (a) tasks.jsonl-driven.
     let tasks_path = repo.kio_dir().join("tasks.jsonl");
     if path_exists(&tasks_path)? {
-        validate_existing_regular(&tasks_path, Some(MAX_TASK_STORE_BYTES))?;
+        validate_existing_regular(&tasks_path, None)?;
     }
     for task in TaskStore::new_with_control(repo.kio_dir(), repo.control().clone())
         .all()
@@ -1979,8 +1979,9 @@ fn delete_target_tasks(
     report: &mut PurgeReport,
 ) -> Result<()> {
     let path = repo.kio_dir().join("tasks.jsonl");
-    if path_exists(&path)? {
-        validate_existing_regular(&path, Some(MAX_TASK_STORE_BYTES))?;
+    let journal_exists = path_exists(&path)?;
+    if journal_exists {
+        validate_existing_regular(&path, None)?;
     }
     let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     let tasks = store
@@ -2008,7 +2009,10 @@ fn delete_target_tasks(
     // Ledger reservation settlement already happened in the `prepared` phase
     // (`settle_inflight_reservations_for_purge`, PA40/41) — this is now pure
     // task-row removal.
-    if !removed.is_empty() {
+    // Rewriting also removes superseded records: the current projection may
+    // contain no target even though an older row still names the purged raw or
+    // chunk. Reduce to current state before filtering so old work cannot revive.
+    if journal_exists {
         store
             .replace_all(&kept)
             .map_err(crate::object_persistence::pipeline_to_kio)?;
@@ -2047,12 +2051,22 @@ fn scrub_manifest(kio_dir: &Path, targets: &BTreeSet<&str>) -> Result<u64> {
 }
 
 fn scrub_unsupported(kio_dir: &Path, targets: &BTreeSet<&str>) -> Result<u64> {
-    let path = kio_dir.join("unsupported-inputs.jsonl");
-    rewrite_jsonl_filter(&path, 16 * 1024 * 1024, |row| {
-        row.get("raw_hash")
-            .and_then(Value::as_str)
-            .is_none_or(|hash| !targets.contains(hash))
-    })
+    let store = kio_pipeline::unsupported::UnsupportedInputStore::new(kio_dir);
+    let mut rows = store
+        .latest_by_path()
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
+    let before = rows.len();
+    rows.retain(|row| !targets.contains(row.raw_hash.as_str()));
+    let removed = before.saturating_sub(rows.len());
+    // The current row for a path may have replaced a target raw. Compact every
+    // existing journal, including when no current row was removed, to erase its
+    // historical references without resurrecting an earlier row for the path.
+    if path_exists(store.path())? {
+        store
+            .replace_all(&rows)
+            .map_err(crate::object_persistence::pipeline_to_kio)?;
+    }
+    Ok(removed as u64)
 }
 
 /// PA35 (§I, U32): staging descriptor attribution is enumerated by walking
@@ -2980,16 +2994,8 @@ mod task_retirement_tests {
     use super::*;
     use kio_pipeline::task::{TaskDescriptor, TaskStatus};
 
-    #[test]
-    fn purge_retires_all_embedding_variants_of_target_chunks_and_keeps_other_owners() {
-        let directory = tempfile::tempdir().unwrap();
-        let repo = Repository::init(directory.path()).unwrap();
-        let chunk = hash_bytes(b"target chunk");
-        let other_chunk = hash_bytes(b"surviving chunk");
-        let raw = hash_bytes(b"purged raw");
-        let first_embedding = hash_bytes(b"first profile embedding");
-        let second_embedding = hash_bytes(b"second profile embedding");
-        let task = |id: &str, chunk: &str, embedding: &str| TaskDescriptor {
+    fn task(id: &str, chunk: &str, embedding: &str) -> TaskDescriptor {
+        TaskDescriptor {
             unit_retry_at: Default::default(),
             resource_limit: None,
             task_id: id.to_owned(),
@@ -3022,7 +3028,90 @@ mod task_retirement_tests {
             reserved_usd: None,
             reserved_month: None,
             reservation_id: None,
+        }
+    }
+
+    #[test]
+    fn j1_purge_removes_superseded_unsupported_raw_without_losing_current_path() {
+        use kio_pipeline::unsupported::{UnsupportedInputDisposition, UnsupportedInputStore};
+        let directory = crate::test_support::PrivateTempDir::new();
+        let store = UnsupportedInputStore::new(directory.path());
+        let raw_a = hash_bytes(b"historical raw A");
+        let raw_b = hash_bytes(b"current raw B");
+        let mut row = UnsupportedInputDisposition {
+            path: "same.bin".into(),
+            raw_hash: raw_a.clone(),
+            media_type: "application/octet-stream".into(),
+            size_bytes: 42,
+            reason: "unsupported".into(),
         };
+        store.record(&row).unwrap();
+        row.raw_hash = raw_b.clone();
+        store.record(&row).unwrap();
+        scrub_unsupported(directory.path(), &BTreeSet::from([raw_a.as_str()])).unwrap();
+        let bytes = fs::read_to_string(store.path()).unwrap();
+        assert!(
+            !bytes.contains(&raw_a),
+            "purged raw remains in an old journal row"
+        );
+        assert_eq!(store.latest_by_path().unwrap(), vec![row.clone()]);
+        assert!(bytes.contains(&raw_b));
+        // Re-running purge remains safe; purging the current B must not revive A.
+        scrub_unsupported(directory.path(), &BTreeSet::from([raw_b.as_str()])).unwrap();
+        assert!(store.latest_by_path().unwrap().is_empty());
+        assert!(fs::read(store.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn j1_purge_removes_superseded_task_raw_previous_raw_and_chunk_references() {
+        for reference in ["input", "previous", "chunk"] {
+            let directory = tempfile::tempdir().unwrap();
+            let repo = Repository::init(directory.path()).unwrap();
+            let store = TaskStore::new(repo.kio_dir());
+            let raw = hash_bytes(b"purged historical raw");
+            let chunk = hash_bytes(b"purged historical chunk");
+            let other_chunk = hash_bytes(b"current surviving chunk");
+            let embedding = hash_bytes(b"embedding profile");
+            let current = task("same_task", &other_chunk, &embedding);
+            let mut previous = current.clone();
+            match reference {
+                "input" => previous.input_hash = raw.clone(),
+                "previous" => previous.previous_raw_hash = Some(raw.clone()),
+                "chunk" => previous = task("same_task", &chunk, &embedding),
+                _ => unreachable!(),
+            }
+            store.append(&previous).unwrap();
+            store.append(&current).unwrap();
+            let mut report = PurgeReport::default();
+            delete_target_tasks(
+                &repo,
+                &BTreeSet::from([raw.as_str()]),
+                &BTreeSet::from([chunk.clone()]),
+                &mut report,
+            )
+            .unwrap();
+            let bytes = fs::read_to_string(repo.kio_dir().join("tasks.jsonl")).unwrap();
+            assert!(
+                !bytes.contains(&raw),
+                "historical {reference} raw reference remains"
+            );
+            assert!(
+                !bytes.contains(&chunk),
+                "historical chunk reference remains"
+            );
+            assert_eq!(store.all().unwrap(), vec![current]);
+        }
+    }
+
+    #[test]
+    fn purge_retires_all_embedding_variants_of_target_chunks_and_keeps_other_owners() {
+        let directory = tempfile::tempdir().unwrap();
+        let repo = Repository::init(directory.path()).unwrap();
+        let chunk = hash_bytes(b"target chunk");
+        let other_chunk = hash_bytes(b"surviving chunk");
+        let raw = hash_bytes(b"purged raw");
+        let first_embedding = hash_bytes(b"first profile embedding");
+        let second_embedding = hash_bytes(b"second profile embedding");
         let survivor = task("task_survivor", &other_chunk, &first_embedding);
         let mut direct_raw = task("task_direct_raw", &other_chunk, &second_embedding);
         direct_raw.input_hash = raw.clone();

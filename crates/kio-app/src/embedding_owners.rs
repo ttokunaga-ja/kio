@@ -46,8 +46,8 @@ pub(super) struct RetainedEmbeddingChunk {
     pub(super) is_head_owner: bool,
 }
 
-// Aligned with the durable TaskStore's MAX_TASK_RECORDS. The byte budget
-// accounts string payload, not allocator capacity, Arc headers, or tree nodes.
+// This planning budget is independent of the durable task journal. It accounts
+// string payload, not allocator capacity, Arc headers, or tree nodes.
 const MAX_EMBEDDING_CANDIDATE_PAIRS: usize = 100_000;
 const MAX_EMBEDDING_CANDIDATE_PAYLOAD_BYTES: usize = 128 * 1024 * 1024;
 

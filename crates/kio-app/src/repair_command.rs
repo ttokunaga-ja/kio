@@ -330,7 +330,8 @@ fn run_rebuild_db_locked(
             | Err(
                 LedgerSnapshotError::Missing
                 | LedgerSnapshotError::UnsafeIntegrity(_)
-                | LedgerSnapshotError::UnstableBusy(_),
+                | LedgerSnapshotError::UnstableBusy(_)
+                | LedgerSnapshotError::ResourceLimit(_),
             ) => None,
         }
     } else {

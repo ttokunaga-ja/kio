@@ -747,7 +747,8 @@ fn run_index_for_repo_inner(
             Err(
                 LedgerSnapshotError::Missing
                 | LedgerSnapshotError::UnsafeIntegrity(_)
-                | LedgerSnapshotError::UnstableBusy(_),
+                | LedgerSnapshotError::UnstableBusy(_)
+                | LedgerSnapshotError::ResourceLimit(_),
             ) => None,
         }
     } else {
@@ -1774,7 +1775,8 @@ fn run_reindex_response(ctx: &Invocation<'_>, args: ReindexArgs) -> Result<Reind
             | Err(
                 LedgerSnapshotError::Missing
                 | LedgerSnapshotError::UnsafeIntegrity(_)
-                | LedgerSnapshotError::UnstableBusy(_),
+                | LedgerSnapshotError::UnstableBusy(_)
+                | LedgerSnapshotError::ResourceLimit(_),
             ) => None,
         }
     } else {

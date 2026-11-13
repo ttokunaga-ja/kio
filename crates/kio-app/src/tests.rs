@@ -4294,7 +4294,7 @@ fn q3_reclaims_orphaned_running_task_to_pending() {
         // A task stuck Running is bit-identical to a crash between the
         // Running-persist and the Done-persist.
         status: TaskStatus::Running,
-        attempts: 0,
+        attempts: 2,
         next_retry_at: None,
         deadline: None,
         heartbeat_at: Some("2020-01-01T00:00:00Z".to_owned()),
@@ -4307,10 +4307,12 @@ fn q3_reclaims_orphaned_running_task_to_pending() {
         reservation_id: None,
     };
     store.append(&task).unwrap();
+    store.replace_all(&store.all().unwrap()).unwrap();
     let reclaimed = reclaim_orphaned_running_tasks(&store).unwrap();
     assert_eq!(reclaimed, 1, "the orphaned Running task must be reclaimed");
     let tasks = store.all().unwrap();
     assert_eq!(tasks[0].status, TaskStatus::Pending);
+    assert_eq!(tasks[0].attempts, 2);
     assert!(
         tasks[0].heartbeat_at.is_none(),
         "stale heartbeat must be cleared on reclaim"
@@ -4435,6 +4437,31 @@ fn ledger_snapshot_error_mapping_preserves_typed_exit_and_closed_reason() {
         kio_core::ExitCode::PartialFailure
     );
     assert_eq!(transient_error.context()["reason"], "unstable_or_busy");
+
+    let limit = kio_core::error::ResourceLimit {
+        resource: kio_core::error::Resource::Storage,
+        stage: "ledger_snapshot".into(),
+        limit: None,
+        observed: None,
+        resource_tier: None,
+    };
+    let resource_error =
+        crate::object_persistence::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
+            path,
+            kio_pipeline::ledger::LedgerSnapshotError::ResourceLimit(limit.clone()),
+        ));
+    assert_eq!(resource_error.error_code(), "KIO-E-RESOURCE-LIMIT-001");
+    assert_eq!(
+        resource_error.exit_code(),
+        kio_core::ExitCode::PartialFailure
+    );
+    assert_eq!(resource_error.resource_limit(), Some(&limit));
+    assert_eq!(resource_error.context()["stage"], "ledger_snapshot");
+    assert_eq!(resource_error.context()["resource"], "storage");
+    assert_eq!(
+        resource_error.context()["retry_disposition"],
+        "explicit_after_resource_change"
+    );
 
     let impossible_missing =
         crate::object_persistence::pipeline_to_kio(kio_pipeline::PipelineError::ledger_snapshot(
