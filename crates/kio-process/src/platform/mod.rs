@@ -48,3 +48,6 @@ pub use windows::process::{
 
 #[cfg(target_os = "linux")]
 pub(crate) use linux::monitor::UnixRendererMonitor;
+
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub(crate) use linux::confinement_cgroup::injected_isolation_failure;

@@ -604,7 +604,7 @@ pub fn run_standard_online_markdownize_with_bytes_with_control(
 /// 変換失敗は contract_violation ([04-pipeline.md §5.3] -- 同一入力の再試行 1 回) に
 /// 合流する". Callers that must never enqueue/spend when no converter is
 /// installed at all (the `kio index` enqueue gate) check
-/// `resolve_office_converter_with_control(control).is_none()` THEMSELVES first and never call this
+/// `resolve_office_converter_with_control(control).is_err()` THEMSELVES first and never call this
 /// helper in that case; reaching here with no converter means the precondition
 /// that led to this call (an earlier successful resolve, e.g. at enqueue time)
 /// no longer holds -- a rare race this helper still turns into the same
@@ -618,9 +618,9 @@ pub fn convert_office_to_pdf_with_control(
     media_type: &str,
     control: &ControlHandle,
 ) -> Result<Vec<u8>> {
-    let converter = resolve_office_converter_with_control(control).ok_or_else(|| {
+    let converter = resolve_office_converter_with_control(control).map_err(|error| {
         AdapterError::ContractViolation(format!(
-            "office converter unavailable for {media_type} at execution time"
+            "office converter unavailable for {media_type} at execution time: {error}"
         ))
     })?;
     converter

@@ -80,3 +80,9 @@ pub(crate) fn sync_export_directory(handle: &File, path: &Path) -> Result<()> {
         .sync_all()
         .map_err(|error| KioError::io(error.to_string(), path.display().to_string()))
 }
+
+/// Use the portable case comparison also used for exported file collisions.
+pub(crate) fn export_component_aliases_store(name: &std::ffi::OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| kio_core::portable::portable_collision_key(name) == ".kio")
+}

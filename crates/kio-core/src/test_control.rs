@@ -166,6 +166,7 @@ pub struct AdapterTestControl {
     pub gemini_batch: Selector<String>,
     pub batch_inventory: Option<PathBuf>,
     pub office_convert: Option<PathBuf>,
+    pub office_isolation_failure: Selector<String>,
     pub capture_sent_media: Option<PathBuf>,
 }
 
@@ -290,6 +291,7 @@ impl DebugTestControl {
                 gemini_batch: text("KIO_TEST_GEMINI_BATCH"),
                 batch_inventory: path("KIO_TEST_BATCH_INVENTORY"),
                 office_convert: path("KIO_TEST_OFFICE_CONVERT"),
+                office_isolation_failure: text("KIO_TEST_OFFICE_ISOLATION_FAILURE"),
                 capture_sent_media: path("KIO_TEST_CAPTURE_SENT_MEDIA"),
             },
             core: CoreTestControl {

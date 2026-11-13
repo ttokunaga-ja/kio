@@ -100,3 +100,29 @@ pub(crate) fn sync_export_directory(_handle: &File, _path: &Path) -> Result<()> 
 pub(crate) fn is_platform_root_alias(_path: &Path) -> bool {
     false
 }
+
+/// Win32 resolves trailing dots/spaces and directory-stream suffixes as aliases.
+pub(crate) fn export_component_aliases_store(name: &std::ffi::OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name.split(':')
+            .next()
+            .unwrap_or(name)
+            .trim_end_matches(['.', ' '])
+            .eq_ignore_ascii_case(".kio")
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn store_components_include_win32_aliases() {
+        for name in [".kio", ".KIO", ".kio. ", ".kio::$INDEX_ALLOCATION"] {
+            assert!(super::export_component_aliases_store(std::ffi::OsStr::new(
+                name
+            )));
+        }
+        assert!(!super::export_component_aliases_store(
+            std::ffi::OsStr::new("Recovered")
+        ));
+    }
+}

@@ -54,6 +54,7 @@ fn image_uri() -> String {
 
 fn empty_index_status() -> IndexStatusResponse {
     IndexStatusResponse {
+        office_readiness: None,
         enriched_ratio: 1.0,
         total_enrichment_tasks: 0,
         skipped_enrichment_tasks: 0,
@@ -459,6 +460,7 @@ fn index_status_projection_preserves_empty_and_populated_finite_records() {
         });
         assert_projection(
             IndexStatusResponse {
+                office_readiness: None,
                 enriched_ratio,
                 total_enrichment_tasks: u64::MAX,
                 skipped_enrichment_tasks: 1,

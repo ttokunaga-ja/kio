@@ -157,3 +157,10 @@ fn canonical_directory(path: &Path) -> Option<PathBuf> {
         .then_some(path)
         .filter(|path| path.is_dir())
 }
+
+/// Inject an unavailable Linux isolation component at the diagnostic boundary.
+/// Debug builds only; this always rejects and cannot authorize a renderer.
+#[cfg(all(debug_assertions, target_os = "linux"))]
+pub fn injected_linux_isolation_failure_for_test(selector: &str) -> ConfinementError {
+    crate::platform::injected_isolation_failure(selector)
+}

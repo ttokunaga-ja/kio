@@ -76,11 +76,118 @@ fn path_text(path: &std::path::Path) -> String {
 }
 
 #[test]
+fn export_allows_new_destination_inside_scope() {
+    let dir = canonical_tempdir();
+    init(&dir);
+    fs::write(dir.path().join("doc.md"), b"original").unwrap();
+    let commit = snapshot(&dir, "source");
+    for path in ["Recovered", "Other/deep"] {
+        let destination = dir.path().join(path);
+        let output = json_success(&dir, &["export", &commit, "--to", &path_text(&destination)]);
+        assert_eq!(output["status"], "exported");
+        assert_eq!(fs::read(destination.join("doc.md")).unwrap(), b"original");
+        assert_eq!(fs::read(dir.path().join("doc.md")).unwrap(), b"original");
+    }
+}
+
+#[test]
+fn export_rejects_nested_store_and_tracked_file_even_with_force() {
+    let dir = canonical_tempdir();
+    init(&dir);
+    fs::write(dir.path().join("doc.md"), b"original").unwrap();
+    let commit = snapshot(&dir, "source");
+    let child = dir.path().join("child");
+    fs::create_dir(&child).unwrap();
+    kio(&dir, &["init", &path_text(&child)]).assert().success();
+    for destination in [
+        dir.path().join(".kio/export"),
+        child.join(".kio/export"),
+        child.join("deeper/.kio/export"),
+        dir.path().join(".KIO/export"),
+    ] {
+        let error = json_failure(
+            &dir,
+            &[
+                "export",
+                &commit,
+                "--to",
+                &path_text(&destination),
+                "--force",
+                "--yes",
+            ],
+            2,
+        );
+        assert_eq!(error["error_code"], "KIO-E-CONFIG-USAGE-001");
+        assert!(!destination.exists());
+    }
+    let error = json_failure(
+        &dir,
+        &[
+            "export",
+            &commit,
+            "--to",
+            &path_text(dir.path()),
+            "--force",
+            "--yes",
+        ],
+        2,
+    );
+    assert_eq!(error["error_code"], "KIO-E-CONFIG-USAGE-001");
+    assert_eq!(fs::read(dir.path().join("doc.md")).unwrap(), b"original");
+}
+
+#[test]
+fn export_into_other_scope_allows_untracked_but_protects_deleted_tracked_paths() {
+    let source = canonical_tempdir();
+    init(&source);
+    fs::write(source.path().join("doc.md"), b"historical").unwrap();
+    let commit = snapshot(&source, "source");
+    let destination = canonical_tempdir();
+    init(&destination);
+    json_success(
+        &source,
+        &["export", &commit, "--to", &path_text(destination.path())],
+    );
+    fs::write(destination.path().join("doc.md"), b"managed latest").unwrap();
+    snapshot(&destination, "track destination");
+    for present in [true, false] {
+        if !present {
+            fs::remove_file(destination.path().join("doc.md")).unwrap();
+        }
+        let error = json_failure(
+            &source,
+            &[
+                "export",
+                &commit,
+                "--to",
+                &path_text(destination.path()),
+                "--force",
+                "--yes",
+            ],
+            2,
+        );
+        assert_eq!(error["error_code"], "KIO-E-CONFIG-USAGE-001");
+        assert!(
+            error["message"]
+                .as_str()
+                .unwrap()
+                .contains("managed restore")
+        );
+        if present {
+            assert_eq!(
+                fs::read(destination.path().join("doc.md")).unwrap(),
+                b"managed latest"
+            );
+        } else {
+            assert!(!destination.path().join("doc.md").exists());
+        }
+    }
+}
+
+#[test]
 fn ct4_restore_commit_restores_verified_files_and_empty_commit() {
     let dir = canonical_tempdir();
-    // PA16/17 (§D, U25): `--to` must resolve OUTSIDE the scope root
-    // entirely (not merely outside `.kio`) — a sibling TempDir stands in for
-    // "some other directory on disk" throughout this file.
+    // Exercise an external destination as well as the in-scope case above.
     let out = TempDir::new().unwrap();
     init(&dir);
     fs::write(dir.path().join("a.md"), b"alpha").unwrap();
@@ -342,21 +449,13 @@ fn ct4_restore_rejects_shallow_tombstoned_and_store_destinations() {
     );
     assert_eq!(error["error_code"], "KIO-E-PURGE-TOMBSTONED-001");
 
-    // PA16/17 (§D, U25): the scope-root/`.kio`-descendant destination
-    // rejection now uses `KIO-E-CONFIG-USAGE-001` (exit 2), not the generic
-    // `KIO-E-COMMIT-EXPORT-UNSAFE-001` (exit 1) every other structural
-    // rejection in this test file still uses.
-    for forbidden in [
-        tombstoned.path().to_path_buf(),
-        tombstoned.path().join(".kio/export"),
-    ] {
-        let error = json_failure(
-            &tombstoned,
-            &["export", &commit, "--to", &path_text(&forbidden)],
-            2,
-        );
-        assert_eq!(error["error_code"], "KIO-E-CONFIG-USAGE-001");
-    }
+    let forbidden = tombstoned.path().join(".kio/export");
+    let error = json_failure(
+        &tombstoned,
+        &["export", &commit, "--to", &path_text(&forbidden)],
+        2,
+    );
+    assert_eq!(error["error_code"], "KIO-E-CONFIG-USAGE-001");
 
     let shallow = canonical_tempdir();
     let shallow_out = TempDir::new().unwrap();

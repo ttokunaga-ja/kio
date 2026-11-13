@@ -229,8 +229,8 @@ pub fn prepare_units_from_bytes_with_control(
     // `kio_pipeline::task::task_retry_kind`'s catch-all arm).
     let office_converted_pdf = if is_office {
         match kio_adapter::office_convert::resolve_office_converter_with_control(control) {
-            None => return Ok(empty_prepare_output()),
-            Some(converter) => {
+            Err(_) => return Ok(empty_prepare_output()),
+            Ok(converter) => {
                 preparation_profile_hash = office_preparation_profile_hash(
                     request.tool_profile_hash,
                     &converter.profile_identity(),
