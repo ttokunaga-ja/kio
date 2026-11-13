@@ -499,6 +499,9 @@ pub(crate) fn err(path: &Path, message: impl Into<String>) -> KioError {
     )
 }
 pub(crate) fn ioerr(path: &Path, error: std::io::Error) -> KioError {
+    if crate::platform::stage_nonce::storage_exhausted(&error) {
+        return stage::stage_io(&format!("cannot access store at {}", path.display()), error);
+    }
     let kind = match error.kind() {
         std::io::ErrorKind::AlreadyExists => "already_exists",
         std::io::ErrorKind::NotFound => "not_found",
@@ -537,4 +540,21 @@ pub(crate) fn relative_components<'a>(
         return Err(err(label, "store path requires a leaf"));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod journal_resource_tests {
+    #[test]
+    fn j1_storage_exhaustion_stays_distinct_from_corruption() {
+        let make_error = || std::io::Error::from(std::io::ErrorKind::StorageFull);
+        for error in [
+            super::ioerr(std::path::Path::new("tasks.jsonl"), make_error()),
+            super::atomic::io_failure("cannot publish compaction", make_error()),
+        ] {
+            assert_eq!(
+                error.resource_limit().unwrap().resource,
+                crate::error::Resource::Storage
+            );
+        }
+    }
 }

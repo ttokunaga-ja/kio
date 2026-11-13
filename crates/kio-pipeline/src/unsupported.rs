@@ -1,15 +1,16 @@
 //! Durable dispositions for archived inputs that cannot be enriched.
 
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
-use std::io::{BufRead, Read, Write};
+#[cfg(test)]
+use std::fs;
+#[cfg(test)]
+use std::io::Write;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 
 use kio_core::cas::is_hash;
 use serde::{Deserialize, Serialize};
 
-use crate::platform::configure_no_follow;
-use crate::store_path::{StorePathKind, resolve_existing_store_path};
 use crate::task::is_scope_local_file_name;
 use crate::{IoResultExt, PipelineError, Result};
 
@@ -17,10 +18,9 @@ pub const UNSUPPORTED_INPUTS_FILE: &str = "unsupported-inputs.jsonl";
 pub const UNSUPPORTED_REASON_UNRECOGNIZED_BINARY: &str = "unrecognized_binary_without_local_text";
 pub const UNSUPPORTED_REASON_RESOLVED: &str = "resolved";
 
-/// Hard limits keep an adopted or corrupted store from selecting allocations.
-pub const MAX_UNSUPPORTED_INPUT_STORE_BYTES: u64 = 16 * 1024 * 1024;
+/// A compaction trigger, never a lifetime or projection size limit.
+const UNSUPPORTED_COMPACTION_BYTES: u64 = 16 * 1024 * 1024;
 pub const MAX_UNSUPPORTED_INPUT_RECORD_BYTES: u64 = 16 * 1024;
-pub const MAX_UNSUPPORTED_INPUT_RECORDS: usize = 100_000;
 
 const MAX_PATH_BYTES: usize = 4_096;
 const MAX_MEDIA_TYPE_BYTES: usize = 256;
@@ -38,11 +38,11 @@ pub struct UnsupportedInputDisposition {
     pub reason: String,
 }
 
-/// Append-only owner of the current unsupported-input projection.
+/// Durable owner of the current unsupported-input projection.
 ///
 /// Multiple rows for one path are expected: the final row is authoritative, so
-/// a re-index can bind the path to its newest raw object without rewriting prior
-/// audit history.
+/// a re-index can bind the path to its newest raw object. Compaction retains
+/// exactly that final row, including resolved reasons.
 #[derive(Debug, Clone)]
 pub struct UnsupportedInputStore {
     pub(crate) kio_dir: PathBuf,
@@ -82,42 +82,59 @@ impl UnsupportedInputStore {
             ));
         }
 
-        let mut file = self.open_for_append()?;
-        let current_len = file.metadata().pipeline_io(&self.path)?.len();
+        let directory = self.private_root()?;
+        let leaf = Path::new(UNSUPPORTED_INPUTS_FILE);
+        crate::journal::recover(&directory, leaf)?;
+        let current_len = if directory
+            .contains_entry(leaf)
+            .map_err(|e| crate::journal::error(&self.path, e))?
+        {
+            let file = directory
+                .open_regular_read(leaf, u64::MAX)
+                .map_err(|e| crate::journal::error(&self.path, e))?;
+            kio_core::private_fs::verify_private_regular_file_handle(&file)
+                .map_err(|e| crate::journal::error(&self.path, e))?;
+            file.metadata().pipeline_io(&self.path)?.len()
+        } else {
+            0
+        };
         let projected_len = current_len.saturating_add(line.len() as u64);
-        if projected_len > MAX_UNSUPPORTED_INPUT_STORE_BYTES {
-            return Err(PipelineError::corrupt(
-                self.path.display().to_string(),
-                format!(
-                    "{UNSUPPORTED_INPUTS_FILE} exceeds {MAX_UNSUPPORTED_INPUT_STORE_BYTES} byte limit"
-                ),
-            ));
+        if projected_len > UNSUPPORTED_COMPACTION_BYTES {
+            let mut current = self.latest_bound(&directory)?;
+            current.retain(|row| row.path != disposition.path);
+            current.push(disposition.clone());
+            return self.replace_bound(&directory, &current);
         }
 
-        // One framed write on O_APPEND prevents byte-wise interleaving. The
-        // surrounding repository store lock remains the primary writer lock.
-        file.write_all(&line).pipeline_io(&self.path)?;
-        file.sync_data().pipeline_io(&self.path)
+        directory
+            .append_private(leaf, &line)
+            .map_err(|e| crate::journal::error(&self.path, e))
     }
 
     /// Read the current projection with the last valid row for each path winning.
     /// Returned rows are deterministic (lexicographic path order).
     pub fn latest_by_path(&self) -> Result<Vec<UnsupportedInputDisposition>> {
-        let file = match self.open_for_read()? {
-            Some(file) => file,
-            None => return Ok(Vec::new()),
-        };
-        let file_len = file.metadata().pipeline_io(&self.path)?.len();
-        if file_len > MAX_UNSUPPORTED_INPUT_STORE_BYTES {
-            return Err(self.corrupt(format!(
-                "{UNSUPPORTED_INPUTS_FILE} exceeds {MAX_UNSUPPORTED_INPUT_STORE_BYTES} byte limit: {file_len}"
-            )));
-        }
+        self.latest_bound(&self.private_root()?)
+    }
 
+    fn latest_bound(
+        &self,
+        directory: &kio_core::store_dir::StoreDirectory,
+    ) -> Result<Vec<UnsupportedInputDisposition>> {
+        let leaf = Path::new(UNSUPPORTED_INPUTS_FILE);
+        if !directory
+            .contains_entry(leaf)
+            .map_err(|e| crate::journal::error(&self.path, e))?
+        {
+            return Ok(Vec::new());
+        }
+        let file = directory
+            .open_regular_read(leaf, u64::MAX)
+            .map_err(|e| crate::journal::error(&self.path, e))?;
+        kio_core::private_fs::verify_private_regular_file_handle(&file)
+            .map_err(|e| crate::journal::error(&self.path, e))?;
         let mut reader = std::io::BufReader::new(file);
         let mut line = Vec::new();
-        let mut total_bytes = 0_u64;
-        let mut record_count = 0_usize;
         let mut by_path = BTreeMap::new();
         loop {
             line.clear();
@@ -134,12 +151,6 @@ impl UnsupportedInputStore {
                     "unsupported-input record exceeds {MAX_UNSUPPORTED_INPUT_RECORD_BYTES} byte limit"
                 )));
             }
-            total_bytes = total_bytes.saturating_add(read as u64);
-            if total_bytes > MAX_UNSUPPORTED_INPUT_STORE_BYTES {
-                return Err(self.corrupt(format!(
-                    "{UNSUPPORTED_INPUTS_FILE} exceeds {MAX_UNSUPPORTED_INPUT_STORE_BYTES} byte limit"
-                )));
-            }
             if !line.ends_with(b"\n") {
                 return Err(self.corrupt("unterminated unsupported-input record"));
             }
@@ -147,12 +158,6 @@ impl UnsupportedInputStore {
                 continue;
             }
 
-            record_count = record_count.saturating_add(1);
-            if record_count > MAX_UNSUPPORTED_INPUT_RECORDS {
-                return Err(self.corrupt(format!(
-                    "{UNSUPPORTED_INPUTS_FILE} exceeds {MAX_UNSUPPORTED_INPUT_RECORDS} record limit"
-                )));
-            }
             let disposition: UnsupportedInputDisposition =
                 serde_json::from_slice(&line).map_err(|error| self.corrupt(error.to_string()))?;
             validate_disposition(&disposition).map_err(|message| self.corrupt(message))?;
@@ -162,49 +167,41 @@ impl UnsupportedInputStore {
         Ok(by_path.into_values().collect())
     }
 
-    fn open_for_append(&self) -> Result<fs::File> {
-        let root = self.store_root_snapshot()?;
-        let directory = kio_core::store_dir::StoreDirectory::open(&self.kio_dir)
-            .map_err(|error| self.corrupt(error.to_string()))?;
-        kio_core::private_fs::verify_private_directory_handle(&directory)
-            .map_err(|error| self.corrupt(error.to_string()))?;
-        directory
-            .append_private(Path::new(UNSUPPORTED_INPUTS_FILE), &[])
-            .map_err(|error| self.corrupt(error.to_string()))?;
-        let resolved = resolve_existing_store_path(
-            &self.kio_dir,
-            Path::new(UNSUPPORTED_INPUTS_FILE),
-            StorePathKind::RegularFile,
-        )?;
-        let open_path = resolved.as_deref().unwrap_or(&self.path);
-        let mut options = OpenOptions::new();
-        options.append(true);
-        configure_no_follow(&mut options);
-        let file = options.open(open_path).pipeline_io(open_path)?;
-        self.validate_opened_file(&file, open_path, &root)?;
-        kio_core::private_fs::verify_private_regular_file_handle(&file)
-            .map_err(|error| self.corrupt(error.to_string()))?;
-        Ok(file)
+    /// Replace a validated current projection (also used by purge).
+    pub fn replace_all(&self, dispositions: &[UnsupportedInputDisposition]) -> Result<()> {
+        self.replace_bound(&self.private_root()?, dispositions)
     }
 
-    fn open_for_read(&self) -> Result<Option<fs::File>> {
-        let root = self.store_root_snapshot()?;
-        let Some(resolved) = resolve_existing_store_path(
-            &self.kio_dir,
+    fn replace_bound(
+        &self,
+        directory: &kio_core::store_dir::StoreDirectory,
+        dispositions: &[UnsupportedInputDisposition],
+    ) -> Result<()> {
+        for disposition in dispositions {
+            validate_disposition(disposition)
+                .map_err(|message| PipelineError::contract(INVALID_DISPOSITION_CODE, message))?;
+        }
+        crate::journal::replace(
+            directory,
             Path::new(UNSUPPORTED_INPUTS_FILE),
-            StorePathKind::RegularFile,
-        )?
-        else {
-            return Ok(None);
-        };
-        let mut options = OpenOptions::new();
-        options.read(true);
-        configure_no_follow(&mut options);
-        let file = options.open(&resolved).pipeline_io(&resolved)?;
-        self.validate_opened_file(&file, &resolved, &root)?;
-        kio_core::private_fs::verify_private_regular_file_handle(&file)
-            .map_err(|error| self.corrupt(error.to_string()))?;
-        Ok(Some(file))
+            dispositions.iter().map(|row| {
+                let mut line =
+                    serde_json::to_vec(row).map_err(|e| PipelineError::Schema(e.to_string()))?;
+                line.push(b'\n');
+                if line.len() as u64 > MAX_UNSUPPORTED_INPUT_RECORD_BYTES {
+                    return Err(self.corrupt("unsupported-input record exceeds byte limit"));
+                }
+                Ok(line)
+            }),
+        )
+    }
+
+    fn private_root(&self) -> Result<kio_core::store_dir::StoreDirectory> {
+        let directory = kio_core::store_dir::StoreDirectory::open(&self.kio_dir)
+            .map_err(|e| crate::journal::error(&self.path, e))?;
+        kio_core::private_fs::verify_private_directory_handle(&directory)
+            .map_err(|e| crate::journal::error(&self.path, e))?;
+        Ok(directory)
     }
 
     pub(crate) fn corrupt(&self, message: impl Into<String>) -> PipelineError {
@@ -401,14 +398,58 @@ mod tests {
     }
 
     #[test]
-    fn r23_cand_014_reader_rejects_oversized_store_before_reading() {
+    fn j1_current_unsupported_projection_can_exceed_old_byte_and_record_limits() {
         let directory = crate::test_support::PrivateTempDir::new();
         let store = UnsupportedInputStore::new(directory.path());
-        let file = crate::test_support::create_private_file(store.path());
-        file.set_len(MAX_UNSUPPORTED_INPUT_STORE_BYTES + 1).unwrap();
+        let rows: Vec<_> = (0..100_001)
+            .map(|i| disposition(&format!("input_{i:06}.bmp"), 'a'))
+            .collect();
+        store.replace_all(&rows).unwrap();
+        assert!(fs::metadata(store.path()).unwrap().len() > 16 * 1024 * 1024);
+        assert_eq!(store.latest_by_path().unwrap(), rows);
+        let mut current = rows[0].clone();
+        current.reason = UNSUPPORTED_REASON_RESOLVED.into();
+        store.record(&current).unwrap();
+        let updated = store.latest_by_path().unwrap();
+        assert_eq!(updated.len(), rows.len());
+        assert_eq!(updated[0], current);
+        assert_eq!(&updated[1..], &rows[1..]);
+    }
 
-        let error = store.latest_by_path().unwrap_err().to_string();
-        assert!(error.contains("byte limit"), "unexpected error: {error}");
+    #[test]
+    fn j1_compaction_does_not_hide_a_corrupt_unsupported_record() {
+        let directory = crate::test_support::PrivateTempDir::new();
+        let store = UnsupportedInputStore::new(directory.path());
+        let mut file = crate::test_support::create_private_file(store.path());
+        file.write_all(b"{broken}\n").unwrap();
+        file.set_len(16 * 1024 * 1024 + 1).unwrap();
+        assert!(matches!(
+            store.record(&disposition("photo.bmp", 'a')),
+            Err(PipelineError::Corrupt { .. })
+        ));
+        assert_eq!(file.metadata().unwrap().len(), 16 * 1024 * 1024 + 1);
+    }
+
+    #[test]
+    fn j1_unsupported_journal_outlives_cumulative_limits_and_keeps_latest_path() {
+        let directory = crate::test_support::PrivateTempDir::new();
+        let store = UnsupportedInputStore::new(directory.path());
+        let old = disposition("photo.bmp", 'a');
+        let mut line = serde_json::to_vec(&old).unwrap();
+        line.push(b'\n');
+        let mut writer =
+            std::io::BufWriter::new(crate::test_support::create_private_file(store.path()));
+        for _ in 0..100_001 {
+            writer.write_all(&line).unwrap();
+        }
+        drop(writer);
+        assert!(fs::metadata(store.path()).unwrap().len() > 16 * 1024 * 1024);
+        assert_eq!(store.latest_by_path().unwrap(), vec![old]);
+        let mut current = disposition("photo.bmp", 'b');
+        current.reason = UNSUPPORTED_REASON_RESOLVED.into();
+        store.record(&current).unwrap();
+        assert_eq!(store.latest_by_path().unwrap(), vec![current]);
+        assert!(fs::metadata(store.path()).unwrap().len() < 16 * 1024 * 1024);
     }
 
     #[test]

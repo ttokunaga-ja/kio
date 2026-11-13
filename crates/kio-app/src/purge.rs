@@ -51,7 +51,7 @@ use kio_pipeline::markdownize::{
     NormalizedInstanceManifest, NormalizedUnitObject, UnitStatus,
     load_validated_normalized_units_from_manifest,
 };
-use kio_pipeline::task::{EmbeddingWorkKey, MAX_TASK_STORE_BYTES, TaskStore, TaskType};
+use kio_pipeline::task::{EmbeddingWorkKey, TaskStore, TaskType};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -1888,7 +1888,7 @@ fn settle_inflight_reservations_for_purge(
     // (a) tasks.jsonl-driven.
     let tasks_path = repo.kio_dir().join("tasks.jsonl");
     if path_exists(&tasks_path)? {
-        validate_existing_regular(&tasks_path, Some(MAX_TASK_STORE_BYTES))?;
+        validate_existing_regular(&tasks_path, None)?;
     }
     for task in TaskStore::new_with_control(repo.kio_dir(), repo.control().clone())
         .all()
@@ -1980,7 +1980,7 @@ fn delete_target_tasks(
 ) -> Result<()> {
     let path = repo.kio_dir().join("tasks.jsonl");
     if path_exists(&path)? {
-        validate_existing_regular(&path, Some(MAX_TASK_STORE_BYTES))?;
+        validate_existing_regular(&path, None)?;
     }
     let store = TaskStore::new_with_control(repo.kio_dir(), repo.control().clone());
     let tasks = store
@@ -2047,12 +2047,19 @@ fn scrub_manifest(kio_dir: &Path, targets: &BTreeSet<&str>) -> Result<u64> {
 }
 
 fn scrub_unsupported(kio_dir: &Path, targets: &BTreeSet<&str>) -> Result<u64> {
-    let path = kio_dir.join("unsupported-inputs.jsonl");
-    rewrite_jsonl_filter(&path, 16 * 1024 * 1024, |row| {
-        row.get("raw_hash")
-            .and_then(Value::as_str)
-            .is_none_or(|hash| !targets.contains(hash))
-    })
+    let store = kio_pipeline::unsupported::UnsupportedInputStore::new(kio_dir);
+    let mut rows = store
+        .latest_by_path()
+        .map_err(crate::object_persistence::pipeline_to_kio)?;
+    let before = rows.len();
+    rows.retain(|row| !targets.contains(row.raw_hash.as_str()));
+    let removed = before.saturating_sub(rows.len());
+    if removed != 0 {
+        store
+            .replace_all(&rows)
+            .map_err(crate::object_persistence::pipeline_to_kio)?;
+    }
+    Ok(removed as u64)
 }
 
 /// PA35 (§I, U32): staging descriptor attribution is enumerated by walking

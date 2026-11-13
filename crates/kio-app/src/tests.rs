@@ -4292,7 +4292,7 @@ fn q3_reclaims_orphaned_running_task_to_pending() {
         // A task stuck Running is bit-identical to a crash between the
         // Running-persist and the Done-persist.
         status: TaskStatus::Running,
-        attempts: 0,
+        attempts: 2,
         next_retry_at: None,
         deadline: None,
         heartbeat_at: Some("2020-01-01T00:00:00Z".to_owned()),
@@ -4305,10 +4305,12 @@ fn q3_reclaims_orphaned_running_task_to_pending() {
         reservation_id: None,
     };
     store.append(&task).unwrap();
+    store.replace_all(&store.all().unwrap()).unwrap();
     let reclaimed = reclaim_orphaned_running_tasks(&store).unwrap();
     assert_eq!(reclaimed, 1, "the orphaned Running task must be reclaimed");
     let tasks = store.all().unwrap();
     assert_eq!(tasks[0].status, TaskStatus::Pending);
+    assert_eq!(tasks[0].attempts, 2);
     assert!(
         tasks[0].heartbeat_at.is_none(),
         "stale heartbeat must be cleared on reclaim"
