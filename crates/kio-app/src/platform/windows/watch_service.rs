@@ -8,6 +8,27 @@ use kio_core::Result;
 use std::env;
 use std::path::{Path, PathBuf};
 
+pub(crate) fn native_registration_absent(manifest: &ServiceManifest) -> Result<bool> {
+    let output = run_native_output(
+        schtasks_path()?,
+        [
+            "/query".into(),
+            "/tn".into(),
+            manifest.id.clone(),
+            "/xml".into(),
+        ],
+    )?;
+    if output.status.success() {
+        return Ok(false);
+    }
+    if output.stderr.contains("cannot find") || output.stderr.contains("not exist") {
+        return Ok(true);
+    }
+    Err(service_error(
+        "Task Scheduler could not inspect native watch registration",
+    ))
+}
+
 pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
     native_windows_task_definition_matches(manifest, true)
 }
@@ -52,10 +73,11 @@ pub(crate) fn native_windows_task_definition_matches(
         && output
             .stdout
             .contains("<RunLevel>LeastPrivilege</RunLevel>")
-        && output
-            .stdout
-            .contains(&xml_escape(&manifest.binary.to_string_lossy())?)
-        && output.stdout.contains(&xml_escape(&expected_arguments)?))
+        && crate::platform::watch_service_model::task_action_matches(
+            &output.stdout,
+            &manifest.binary.to_string_lossy(),
+            &expected_arguments,
+        )?)
 }
 
 pub(crate) fn native_definition_path(
@@ -90,6 +112,24 @@ pub(crate) fn render_definition(
 }
 
 pub(crate) fn native_enable(manifest: &ServiceManifest) -> Result<()> {
+    if !native_registration_absent(manifest)? {
+        return if native_windows_task_definition_matches(manifest, false)? {
+            run_native(
+                schtasks_path()?,
+                [
+                    "/change".into(),
+                    "/tn".into(),
+                    manifest.id.clone(),
+                    "/enable".into(),
+                ],
+            )
+            .map(|_| ())
+        } else {
+            Err(service_error(
+                "refusing to replace a foreign Task Scheduler registration",
+            ))
+        };
+    }
     run_native(
         schtasks_path()?,
         [
@@ -121,6 +161,14 @@ pub(crate) fn native_start(manifest: &ServiceManifest) -> Result<()> {
 }
 
 pub(crate) fn native_stop(manifest: &ServiceManifest) -> Result<()> {
+    if native_registration_absent(manifest)? {
+        return Ok(());
+    }
+    if !native_windows_task_definition_matches(manifest, false)? {
+        return Err(service_error(
+            "Task Scheduler registration changed before stop",
+        ));
+    }
     run_native(
         schtasks_path()?,
         [
@@ -133,8 +181,8 @@ pub(crate) fn native_stop(manifest: &ServiceManifest) -> Result<()> {
     run_native(
         schtasks_path()?,
         ["/end".into(), "/tn".into(), manifest.id.clone()],
-    )
-    .map(|_| ())
+    )?;
+    Ok(())
 }
 
 pub(crate) fn native_uninstall(manifest: &ServiceManifest) -> Result<()> {
@@ -152,7 +200,12 @@ pub(crate) fn native_uninstall(manifest: &ServiceManifest) -> Result<()> {
             "Task Scheduler registration changed before uninstall",
         ));
     }
-    let _ = native_stop(manifest);
+    native_stop(manifest)?;
+    if !native_windows_task_definition_matches(manifest, false)? {
+        return Err(service_error(
+            "Task Scheduler registration changed before deletion",
+        ));
+    }
     run_native(
         schtasks_path()?,
         [

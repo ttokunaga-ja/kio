@@ -47,7 +47,8 @@ mod watch_service;
 mod watch_service;
 pub(crate) use watch_service::{
     native_after_remove, native_definition_path, native_enable, native_loaded_definition_matches,
-    native_start, native_state, native_stop, native_uninstall, render_definition,
+    native_registration_absent, native_start, native_state, native_stop, native_uninstall,
+    render_definition,
 };
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]

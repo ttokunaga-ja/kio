@@ -498,7 +498,23 @@ pub(crate) fn err(path: &Path, message: impl Into<String>) -> KioError {
         ExitCode::PermanentFailure,
     )
 }
+pub(crate) fn storage_limit(
+    error: &std::io::Error,
+    stage: &str,
+) -> Option<crate::error::ResourceLimit> {
+    crate::platform::stage_nonce::storage_exhausted(error).then(|| crate::error::ResourceLimit {
+        resource: crate::error::Resource::Storage,
+        stage: stage.into(),
+        limit: None,
+        observed: None,
+        resource_tier: None,
+    })
+}
+
 pub(crate) fn ioerr(path: &Path, error: std::io::Error) -> KioError {
+    if let Some(limit) = storage_limit(&error, "private_store") {
+        return limit.into_error(format!("{}: {error}", path.display()));
+    }
     let kind = match error.kind() {
         std::io::ErrorKind::AlreadyExists => "already_exists",
         std::io::ErrorKind::NotFound => "not_found",
@@ -537,4 +553,45 @@ pub(crate) fn relative_components<'a>(
         return Err(err(label, "store path requires a leaf"));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod resource_tests {
+    use super::*;
+
+    #[test]
+    fn small_private_writes_report_storage_exhaustion_with_the_shared_descriptor() {
+        for error in [
+            ioerr(
+                Path::new("manifest.json"),
+                std::io::ErrorKind::StorageFull.into(),
+            ),
+            atomic::io_failure(
+                "cannot write replacement intent",
+                std::io::ErrorKind::StorageFull.into(),
+            ),
+        ] {
+            assert_eq!(
+                error.resource_limit().unwrap().resource,
+                crate::error::Resource::Storage
+            );
+            assert_eq!(error.exit_code(), ExitCode::PartialFailure);
+        }
+        assert!(
+            ioerr(
+                Path::new("manifest.json"),
+                std::io::ErrorKind::PermissionDenied.into()
+            )
+            .resource_limit()
+            .is_none()
+        );
+        assert!(
+            atomic::io_failure(
+                "cannot write replacement intent",
+                std::io::ErrorKind::PermissionDenied.into()
+            )
+            .resource_limit()
+            .is_none()
+        );
+    }
 }

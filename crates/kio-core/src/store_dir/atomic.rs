@@ -83,9 +83,13 @@ pub(crate) fn failure(message: impl Into<String>) -> KioError {
 }
 
 pub(crate) fn io_failure(message: impl Into<String>, error: std::io::Error) -> KioError {
+    let message = message.into();
+    if let Some(limit) = super::storage_limit(&error, "private_atomic") {
+        return limit.into_error(format!("{message}: {error}"));
+    }
     KioError::new(
         "KIO-E-ATOMIC-WORKSPACE-IO-001",
-        format!("{}: {error}", message.into()),
+        format!("{message}: {error}"),
         serde_json::json!({"workspace": ATOMIC_WORKSPACE_DIR}),
         ExitCode::Failure,
     )

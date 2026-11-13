@@ -7,6 +7,28 @@ use crate::watch_service::{
 use kio_core::Result;
 use std::path::{Path, PathBuf};
 
+pub(crate) fn native_registration_absent(manifest: &ServiceManifest) -> Result<bool> {
+    let output = run_native_output(
+        "/bin/launchctl",
+        [
+            "print".into(),
+            format!("gui/{}/{}", unsafe { libc::geteuid() }, manifest.id),
+        ],
+    )?;
+    if output.status.success() {
+        return Ok(false);
+    }
+    if output.status.code() == Some(113)
+        && (output.stderr.contains("Could not find service")
+            || output.stderr.contains("Bad request"))
+    {
+        return Ok(true);
+    }
+    Err(service_error(
+        "launchctl could not inspect native watch registration",
+    ))
+}
+
 pub(crate) fn native_loaded_definition_matches(manifest: &ServiceManifest) -> Result<bool> {
     let output = run_native_output(
         "/bin/launchctl",
@@ -141,6 +163,12 @@ pub(crate) fn native_start(manifest: &ServiceManifest) -> Result<()> {
 }
 
 pub(crate) fn native_stop(manifest: &ServiceManifest) -> Result<()> {
+    if native_registration_absent(manifest)? {
+        return Ok(());
+    }
+    if !native_loaded_definition_matches(manifest)? {
+        return Err(service_error("launchd registration changed before stop"));
+    }
     run_native(
         "/bin/launchctl",
         [
