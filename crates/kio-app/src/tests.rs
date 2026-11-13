@@ -104,7 +104,16 @@ fn index_reconciles_more_than_legacy_child_cap_and_deep_pages_in_one_run() {
                     Ok(())
                 });
             }
-            let output = command.output().unwrap();
+            let child = command
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            // The child has its own environment after spawn; do not serialize
+            // unrelated tests for the duration of its large discovery fixture.
+            drop(_environment_lock);
+            let output = child.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
                 "descriptor-limited discovery failed:\n{}\n{}",
